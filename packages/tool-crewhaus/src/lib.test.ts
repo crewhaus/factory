@@ -7,7 +7,12 @@
 import { describe, expect, test } from "bun:test";
 import { collectSpecModels } from "@crewhaus/preflight";
 import { parseSpec } from "@crewhaus/spec";
-import { DEFAULT_SCORE_EPSILON, compareEvalRuns, readEvalRun } from "./lib/eval-gate";
+import {
+  DEFAULT_SCORE_EPSILON,
+  compareEvalRuns,
+  datasetBaseName,
+  readEvalRun,
+} from "./lib/eval-gate";
 import { readSpecIdentity } from "./lib/identity";
 import {
   auditPermissions,
@@ -167,6 +172,96 @@ describe("spec diff", () => {
     expect(dropAllow.some((c) => c.kind === "permission-rule-removed" && c.widens)).toBe(false);
   });
 
+  // The engine takes the FIRST matching rule in declaration order, so the
+  // same rules in another order can decide differently: [deny X, allow X]
+  // denies X, [allow X, deny X] allows it. SpecDiff compared rules as a set
+  // and reported no change at all.
+  describe("rule order", () => {
+    const rulesSpec = (...rules: string[]) =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: go",
+        "tools: [runCommand]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        ...rules.map((r) => {
+          const [type, pattern] = r.split(" ");
+          return `    - { type: ${type}, pattern: "${pattern}" }`;
+        }),
+      ].join("\n");
+    const diff = (before: string[], after: string[]) =>
+      diffSpecViews(view(rulesSpec(...before)), view(rulesSpec(...after)));
+
+    test("an allow moved ahead of a deny widens, and says which two rules swapped", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+        ),
+      ).toEqual([
+        {
+          kind: "permission-rules-reordered",
+          path: "permissions.rules",
+          from: "alwaysDeny RunCommand, then alwaysAllow RunCommand",
+          to: "alwaysAllow RunCommand, then alwaysDeny RunCommand",
+          widens: true,
+        },
+      ]);
+      // An ask moved ahead of a deny turns the deny into a question.
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysAsk RunCommand"],
+          ["alwaysAsk RunCommand", "alwaysDeny RunCommand(rm *)"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", true]]);
+    });
+
+    test("a guard moved ahead of an allow is reported and does not widen", () => {
+      expect(
+        diff(
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", false]]);
+    });
+
+    test("a widening swap is reported even beside a narrowing one", () => {
+      const changes = diff(
+        ["alwaysAllow Read", "alwaysDeny Read", "alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ["alwaysDeny Read", "alwaysAllow Read", "alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(changes.map((c) => [c.kind, c.widens, c.to])).toEqual([
+        ["permission-rules-reordered", true, "alwaysAllow RunCommand, then alwaysDeny RunCommand"],
+      ]);
+    });
+
+    test("rules of one type in another order decide the same, and are no change", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysDeny RunCommand(curl *)"],
+          ["alwaysDeny RunCommand(curl *)", "alwaysDeny RunCommand(rm *)"],
+        ),
+      ).toEqual([]);
+    });
+
+    test("an ask ADDED ahead of a deny widens; one added after it does not", () => {
+      const ahead = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysAsk RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(ahead.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", true]]);
+      const behind = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysDeny RunCommand", "alwaysAsk RunCommand"],
+      );
+      expect(behind.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", false]]);
+    });
+  });
+
   test("default → auto widens, default → plan does not", () => {
     const auto = CLI_SPEC.replace("mode: default", "mode: auto");
     const plan = CLI_SPEC.replace("mode: default", "mode: plan");
@@ -240,6 +335,197 @@ describe("spec diff", () => {
     ].join("\n");
     expect(diffSpecViews(view(CLI_SPEC), view(reordered))).toEqual([]);
   });
+
+  // 0.7.1 (security-5#4): an existing server was compared only by its display
+  // string, and any difference was hard-coded widens:false; env/header keys
+  // and tool_flags were never compared at all.
+  describe("an MCP server present on both sides", () => {
+    const server = (lines: readonly string[]): string =>
+      [
+        ...CLI_SPEC.split("\n").slice(0, CLI_SPEC.split("\n").indexOf("mcp_servers:")),
+        ...lines,
+      ].join("\n");
+    const base = server([
+      "mcp_servers:",
+      "  broker:",
+      "    transport: stdio",
+      "    command: bun",
+      "    args: [a.ts, --api-key, sk-live-abc123xyz]",
+      "    env:",
+      "      BROKER_MODE: paper",
+      "    tool_flags:",
+      "      per_tool:",
+      "        place_order: { destructive: true }",
+    ]);
+    const diff = (after: string) => diffSpecViews(view(base), view(after));
+    const edit = (from: string, to: string): string => {
+      expect(base).toContain(from);
+      return base.replace(from, to);
+    };
+
+    test("a command swap widens", () => {
+      const changes = diff(edit("command: bun", "command: npx"));
+      expect(changes).toEqual([
+        {
+          kind: "mcp-server",
+          path: "mcp_servers.broker",
+          from: "stdio:bun a.ts --api-key (redacted)",
+          to: "stdio:npx a.ts --api-key (redacted)",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("an argv change widens, and a changed REDACTED value is reported without it", () => {
+      expect(diff(edit("a.ts,", "b.ts,")).map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server", true],
+      ]);
+      const rotated = diff(edit("sk-live-abc123xyz", "sk-live-zzz999qqq"));
+      expect(rotated.map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server-args-value-changed", true],
+      ]);
+      expect(JSON.stringify(rotated)).not.toContain("sk-live");
+    });
+
+    test("stdio → sse, and an sse endpoint or query change, widen", () => {
+      const sse = server([
+        "mcp_servers:",
+        "  broker:",
+        "    transport: sse",
+        "    url: https://mcp.example.test/v1?token=AAA",
+      ]);
+      const toSse = diffSpecViews(view(base), view(sse));
+      expect(toSse.find((c) => c.kind === "mcp-server")?.widens).toBe(true);
+      const path = diffSpecViews(view(sse), view(sse.replace("/v1?", "/v2?")));
+      expect(path.map((c) => [c.kind, c.widens])).toEqual([["mcp-server", true]]);
+      const query = diffSpecViews(view(sse), view(sse.replace("token=AAA", "token=BBB")));
+      expect(query.map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server-url-value-changed", true],
+      ]);
+      expect(JSON.stringify(query)).not.toContain("AAA");
+    });
+
+    test("an added env key widens and names only the key; a removed one does not widen", () => {
+      const added = diff(
+        edit(
+          "      BROKER_MODE: paper",
+          "      BROKER_MODE: paper\n      ADMIN_KEY: sk-live-abc123",
+        ),
+      );
+      expect(added).toEqual([
+        { kind: "mcp-server-env-added", path: "mcp_servers.broker", to: "ADMIN_KEY", widens: true },
+      ]);
+      expect(JSON.stringify(added)).not.toContain("sk-live-abc123");
+      const removed = diffSpecViews(
+        view(base.replace("      BROKER_MODE: paper", "      BROKER_MODE: paper\n      X: y")),
+        view(base),
+      );
+      expect(removed).toEqual([
+        { kind: "mcp-server-env-removed", path: "mcp_servers.broker", from: "X", widens: false },
+      ]);
+    });
+
+    test("a changed env VALUE widens and is withheld", () => {
+      const live = diff(edit("BROKER_MODE: paper", "BROKER_MODE: live"));
+      expect(live).toEqual([
+        {
+          kind: "mcp-server-env-value-changed",
+          path: "mcp_servers.broker",
+          to: "BROKER_MODE (value withheld)",
+          widens: true,
+        },
+      ]);
+      expect(JSON.stringify(live)).not.toMatch(/paper|live"/);
+    });
+
+    test("an added header key widens", () => {
+      const sse = server([
+        "mcp_servers:",
+        "  s:",
+        "    transport: sse",
+        "    url: https://h.test/x",
+      ]);
+      const withHeader = `${sse}\n    headers:\n      Authorization: Bearer x`;
+      expect(diffSpecViews(view(sse), view(withHeader))).toEqual([
+        {
+          kind: "mcp-server-header-added",
+          path: "mcp_servers.s",
+          to: "Authorization",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("removing a destructive flag widens; adding one does not", () => {
+      const removed = diff(edit("place_order: { destructive: true }", "place_order: {}"));
+      expect(removed).toEqual([
+        {
+          kind: "mcp-tool-flag-removed",
+          path: "mcp_servers.broker.tool_flags.per_tool.place_order",
+          from: "destructive",
+          widens: true,
+        },
+      ]);
+      // Dropping the whole block drops the flag with it.
+      const dropped = diff(base.split("\n").slice(0, -3).join("\n"));
+      expect(dropped.map((c) => [c.kind, c.from, c.widens])).toEqual([
+        ["mcp-tool-flag-removed", "destructive", true],
+      ]);
+      const tightened = diffSpecViews(
+        view(edit("place_order: { destructive: true }", "place_order: {}")),
+        view(base),
+      );
+      expect(tightened.map((c) => [c.kind, c.to, c.widens])).toEqual([
+        ["mcp-tool-flag-added", "destructive", false],
+      ]);
+    });
+
+    test("adding readOnly (which the schema refuses) would widen: plan and auto mode run it unasked", () => {
+      const doc = (flags: Record<string, unknown>) => ({
+        name: "x",
+        target: "cli",
+        mcp_servers: { s: { transport: "stdio", command: "bun", tool_flags: flags } },
+      });
+      const changes = diffSpecViews(
+        buildSpecView(doc({}), []),
+        buildSpecView(doc({ defaults: { readOnly: true } }), []),
+      );
+      expect(changes).toEqual([
+        {
+          kind: "mcp-tool-flag-added",
+          path: "mcp_servers.s.tool_flags.defaults",
+          to: "readOnly",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("optional → required is reported and does not widen", () => {
+      const optional = edit("    command: bun", "    command: bun\n    required: false");
+      expect(diffSpecViews(view(optional), view(base))).toEqual([
+        {
+          kind: "mcp-server-required",
+          path: "mcp_servers.broker",
+          from: "optional",
+          to: "required",
+          widens: false,
+        },
+      ]);
+    });
+
+    test("identical servers, and views that did not come from this process, report nothing extra", () => {
+      expect(diff(base)).toEqual([]);
+      // A view round-tripped through JSON has no withheld digests: only what
+      // it shows is compared, and nothing is invented.
+      const copy = (v: ReturnType<typeof view>) => JSON.parse(JSON.stringify(v));
+      expect(
+        diffSpecViews(
+          copy(view(base)),
+          copy(view(edit("BROKER_MODE: paper", "BROKER_MODE: live"))),
+        ),
+      ).toEqual([]);
+    });
+  });
 });
 
 describe("permission patterns", () => {
@@ -280,6 +566,29 @@ describe("permission patterns", () => {
 });
 
 describe("permission audit", () => {
+  test("a builtin's rule is matched against the name its flags give, not a guess (C032)", () => {
+    const flags = {
+      name: "JavaScript",
+      readOnly: false,
+      destructive: true,
+      scope: "internal",
+      requiresSandbox: false,
+      requireJustification: false,
+    };
+    // `toRegisteredName("javascript")` is "Javascript"; the engine sees
+    // "JavaScript", so the rule below is live and must be reported so.
+    const result = auditPermissions({
+      tools: ["javascript"],
+      mode: "default",
+      askMode: "pause",
+      rules: [{ type: "alwaysAllow", pattern: "JavaScript" }],
+      flagsOf: (tool) => (tool === "javascript" ? flags : undefined),
+    });
+    expect(result.tools[0]?.decision).toBe("allow");
+    expect(result.tools[0]?.rule?.pattern).toBe("JavaScript");
+    expect(result.unusedRules).toEqual([]);
+  });
+
   test("an outward tool with no rule is a finding", () => {
     const result = auditPermissions({
       tools: ["read", "webFetch"],
@@ -546,11 +855,219 @@ describe("eval gate", () => {
     expect(compareEvalRuns(base, cand).inconclusive).toEqual(["b"]);
   });
 
-  test("comparing runs over different datasets is noted, not silently gated", () => {
-    const doc = evalDoc([["a", true, 1]], { config: { datasetName: "other" } });
+  // 0.7.1 (security-5#5): a comparison that never happened used to PASS —
+  // zero shared samples and a dataset mismatch were notes, and a candidate
+  // whose pass rate merely matched cleared "the release gate".
+  test("runs over different datasets FAIL the gate unless the caller allows it", () => {
+    const doc = evalDoc(
+      [
+        ["a", true, 1],
+        ["b", true, 1],
+        ["c", false, 0],
+      ],
+      { config: { datasetName: "other" } },
+    );
     const { base, cand } = run(doc);
-    const result = compareEvalRuns(base, cand, { maxPassRateDrop: 1 });
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons).toEqual([
+      "the runs name different datasets (golden vs other) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+    const allowed = compareEvalRuns(base, cand, { allowDatasetMismatch: true });
+    expect(allowed.verdict).toBe("pass");
+    expect(allowed.notes.some((n) => n.includes("different datasets"))).toBe(true);
+    expect(allowed.thresholds.allowDatasetMismatch).toBe(true);
+  });
+
+  // The first 0.7.1 cut compared the raw names, and `crewhaus eval` records a
+  // registry dataset as `<name>@<version>[#split]`: a routine version bump
+  // (auto-distill registers new versions) or a split selection failed the gate.
+  test("another version or split of the same registry dataset is noted, not failed", () => {
+    const three: Array<[string, boolean, number]> = [
+      ["a", true, 1],
+      ["b", true, 1],
+      ["c", false, 0],
+    ];
+    const at = (datasetName: string, rows = three) => {
+      const read = readEvalRun(evalDoc(rows, { config: { datasetName } }), datasetName);
+      if (!read.ok) throw new Error("fixture did not read");
+      return read.run;
+    };
+    const v3 = at("golden@v3");
+    for (const cand of [at("golden@v4", [...three, ["d", true, 1]]), at("golden@v3#dev")]) {
+      const result = compareEvalRuns(v3, cand);
+      expect({ name: cand.datasetName, verdict: result.verdict, reasons: result.reasons }).toEqual({
+        name: cand.datasetName,
+        verdict: "pass",
+        reasons: [],
+      });
+      expect(
+        result.notes.filter((n) => n.includes("different versions or splits of one dataset")),
+      ).toHaveLength(1);
+    }
+    // A different registry dataset is still a different dataset.
+    const other = compareEvalRuns(v3, at("silver@v3"));
+    expect(other.reasons).toEqual([
+      "the runs name different datasets (golden@v3 vs silver@v3) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+    // The sample rules still decide a version bump that re-keyed everything.
+    expect(
+      compareEvalRuns(v3, at("golden@v4", [["z", true, 1]])).reasons.map((r) => r.slice(0, 30)),
+    ).toEqual(["the two runs share no sample i"]);
+  });
+
+  test("datasetBaseName reads the registry grammar and leaves anything else whole", () => {
+    expect(
+      ["golden@v3", "golden@1.2.0#test", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"].map(
+        datasetBaseName,
+      ),
+    ).toEqual(["golden", "golden", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"]);
+    // The regression-suite union `crewhaus eval` records is set aside first.
+    expect(
+      [
+        "smoke+regressions@v1",
+        "golden@v3+regressions@v1",
+        "golden@v3#dev+regressions@v2",
+        "a+regressions@v1@x",
+      ].map(datasetBaseName),
+    ).toEqual(["smoke", "golden", "golden", "a+regressions@v1@x"]);
+  });
+
+  // The ops review: `crewhaus eval` records `<primary>+regressions@<v>` when
+  // the pinned regression suite (on by default after `crewhaus optimize`)
+  // added samples, and every pair below FAILED as "different datasets"
+  // although 0.7.0 passed it — including the version bump d01ef02a allowed.
+  test("a regression-suite union of the same dataset is noted, not failed", () => {
+    const rows: Array<[string, boolean, number]> = [
+      ["a", true, 1],
+      ["b", true, 1],
+    ];
+    const at = (datasetName: string) => {
+      const read = readEvalRun(evalDoc(rows, { config: { datasetName } }), datasetName);
+      if (!read.ok) throw new Error("fixture did not read");
+      return read.run;
+    };
+    const pairs: Array<[string, string]> = [
+      ["smoke", "smoke+regressions@v1"],
+      ["golden@v3", "golden@v3+regressions@v1"],
+      ["golden@v3+regressions@v1", "golden@v4+regressions@v1"],
+      ["golden@v3#dev+regressions@v1", "golden@v3#dev+regressions@v2"],
+    ];
+    for (const [from, to] of pairs) {
+      const result = compareEvalRuns(at(from), at(to));
+      expect({ from, to, verdict: result.verdict, reasons: result.reasons }).toEqual({
+        from,
+        to,
+        verdict: "pass",
+        reasons: [],
+      });
+      expect(result.notes.filter((n) => n.includes("regression-suite union"))).toHaveLength(1);
+    }
+    // Another dataset with a suite unioned in is still another dataset.
+    expect(compareEvalRuns(at("smoke"), at("other+regressions@v1")).reasons).toEqual([
+      "the runs name different datasets (smoke vs other+regressions@v1) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+  });
+
+  // The ops review: a sample with no `sampleId` got the id `<sample i>`, so
+  // two runs that share no real id matched by POSITION — 50 baseline samples
+  // against 1 unrelated candidate sample came back `shared: 1`, pass.
+  test("a sample with no sampleId is never matched by position", () => {
+    const anonymousDoc = (passes: boolean[], idKey?: string) => ({
+      samples: passes.map((passed, i) => ({
+        ...(idKey !== undefined ? { [idKey]: `${idKey}-${i}` } : {}),
+        grades: { overall: { passed, score: passed ? 1 : 0 } },
+      })),
+    });
+    const read = (doc: unknown) => {
+      const r = readEvalRun(doc, "x");
+      if (!r.ok) throw new Error("fixture did not read");
+      return r.run;
+    };
+    for (const idKey of [undefined, "id"]) {
+      const result = compareEvalRuns(
+        read(
+          anonymousDoc(
+            Array.from({ length: 50 }, () => true),
+            idKey,
+          ),
+        ),
+        read(anonymousDoc([true], idKey)),
+      );
+      expect({
+        idKey,
+        verdict: result.verdict,
+        shared: result.samples.shared,
+        reasons: result.reasons,
+      }).toEqual({
+        idKey,
+        verdict: "fail",
+        shared: 0,
+        reasons: [
+          "the two runs share no sample ids — samples without a sampleId (50 in the baseline and 1 in the candidate) are never matched by position, so nothing was compared sample by sample and the candidate cannot be shown to hold the line",
+        ],
+      });
+    }
+    // Beside real ids, an anonymous sample is left out of the matching and
+    // named in a note; the named samples still decide.
+    const mixed = evalDoc([
+      ["a", true, 1],
+      ["b", true, 1],
+    ]);
+    (mixed["samples"] as unknown[]).push({ grades: { overall: { passed: false, score: 0 } } });
+    const baseRun = read(evalDoc([["a", true, 1]]));
+    const result = compareEvalRuns(baseRun, read(mixed), { maxPassRateDrop: 1 });
+    expect([result.verdict, result.samples]).toEqual([
+      "pass",
+      { shared: 1, baselineOnly: [], candidateOnly: ["b"] },
+    ]);
+    expect(result.notes).toContain(
+      "samples without a sampleId (1 in the candidate) are never matched by position: they were not compared one by one, but they count in the pass rates",
+    );
+  });
+
+  test("runs that share no sample ids FAIL the gate, even with a perfect candidate", () => {
+    const { base, cand } = run(evalDoc([["x", true, 1]]));
+    const result = compareEvalRuns(base, cand);
+    expect(result.samples.shared).toBe(0);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.some((r) => r.includes("share no sample ids"))).toBe(true);
+  });
+
+  test("a smoke run on another dataset with new ids fails for both reasons", () => {
+    const { base, cand } = run(
+      evalDoc([["smoke-0", true, 1]], { config: { datasetName: "smoke" } }),
+    );
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.map((r) => r.slice(0, 30))).toEqual([
+      "the two runs share no sample i",
+      "the runs name different datase",
+    ]);
+  });
+
+  test("a candidate that names no dataset keeps the note and is not failed for it", () => {
+    const { base, cand } = run({
+      ...evalDoc([
+        ["a", true, 1],
+        ["b", true, 1],
+        ["c", false, 0],
+      ]),
+      config: {},
+    });
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("pass");
     expect(result.notes.some((n) => n.includes("different datasets"))).toBe(true);
+  });
+
+  test("minSharedFraction fails a candidate that covers too little of the baseline", () => {
+    const { base, cand } = run(evalDoc([["a", true, 1]]));
+    expect(compareEvalRuns(base, cand).verdict).toBe("pass");
+    const strict = compareEvalRuns(base, cand, { minSharedFraction: 0.5 });
+    expect(strict.verdict).toBe("fail");
+    expect(strict.reasons).toEqual([
+      "the candidate ran 1 of the baseline's 3 samples (0.333333), below the required share 0.5",
+    ]);
   });
 });
 
@@ -836,6 +1353,320 @@ describe("redactArgs", () => {
   test("a long mixed-case run with digits is treated as a token", () => {
     const token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
     expect(redactArgs([token]).args).toEqual(["(redacted)"]);
+  });
+
+  // Every secret below is built from parts (see the xoxb test above), and
+  // none has a vendor prefix or a 32-character run, so the old rules never
+  // saw one: on 0.7.0 each case came back verbatim with `redacted: 0`.
+  const pw = ["Hunter", "2", "Secret"].join("");
+  const tok = ["plain", "secret", "tok"].join("");
+  const hdr = ["abcdef", "0123", "456789"].join("");
+
+  test("a database URL loses its userinfo and keeps what the server is", () => {
+    expect(
+      redactArgs([
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        `postgresql://admin:${pw}@db.internal:5432/prod?sslmode=require`,
+      ]),
+    ).toEqual({
+      args: [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://(redacted)@db.internal:5432/prod?sslmode=require",
+      ],
+      redacted: 1,
+    });
+    expect(redactArgs([`redis://:${pw}@cache:6379`]).args).toEqual([
+      "redis://(redacted)@cache:6379",
+    ]);
+    expect(redactArgs([`mongodb+srv://u:${pw}%40x@c/db?retryWrites=true`]).args).toEqual([
+      "mongodb+srv://(redacted)@c/db?retryWrites=true",
+    ]);
+  });
+
+  test("a credential-named query parameter loses its value, and a header its value", () => {
+    expect(
+      redactArgs([
+        "mcp-remote",
+        `https://mcp.example.com/sse?transport=sse&token=${tok}`,
+        "--header",
+        `Authorization: Bearer ${hdr}`,
+      ]),
+    ).toEqual({
+      args: [
+        "mcp-remote",
+        "https://mcp.example.com/sse?transport=sse&token=(redacted)",
+        "--header",
+        "Authorization: (redacted)",
+      ],
+      redacted: 2,
+    });
+  });
+
+  test("every header-flag spelling withholds the value and keeps the name", () => {
+    expect(redactArgs(["-H", `X-Api-Key: ${hdr}`]).args).toEqual(["-H", "X-Api-Key: (redacted)"]);
+    expect(redactArgs(["--headers", `Cookie: session=${hdr}`]).args).toEqual([
+      "--headers",
+      "Cookie: (redacted)",
+    ]);
+    expect(redactArgs([`--header=Authorization: Bearer ${hdr}`])).toEqual({
+      args: ["--header=Authorization: (redacted)"],
+      redacted: 1,
+    });
+    // Headers are reported by key only, as an `sse` server's are.
+    expect(redactArgs(["--header", `X-Tenant: ${hdr}`]).args).toEqual([
+      "--header",
+      "X-Tenant: (redacted)",
+    ]);
+  });
+
+  test("a credential header written as one entry, and a Bearer token inside any entry", () => {
+    expect(redactArgs([`Authorization: Bearer ${hdr}`]).args).toEqual([
+      "Authorization: (redacted)",
+    ]);
+    expect(redactArgs([`--config={"auth":"Bearer ${hdr}"}`]).args).toEqual([
+      '--config={"auth":"Bearer (redacted)"}',
+    ]);
+  });
+
+  test("the value half of any --flag= is searched for a URL credential", () => {
+    expect(redactArgs([`--url=https://u:${pw}@h/x`])).toEqual({
+      args: ["--url=https://(redacted)@h/x"],
+      redacted: 1,
+    });
+  });
+
+  test("a header's two-entry form keeps the name and withholds the value (mcp-proxy's -H KEY VALUE)", () => {
+    expect(redactArgs(["--headers", "X-Api-Key", hdr, "https://example.io/sse"])).toEqual({
+      args: ["--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"],
+      redacted: 1,
+    });
+    expect(redactArgs(["-H", "Authorization", `Token ${hdr}`]).args).toEqual([
+      "-H",
+      "Authorization",
+      "(redacted)",
+    ]);
+    expect(redactArgs(["-H", "Cookie", `session=${hdr}`]).args).toEqual([
+      "-H",
+      "Cookie",
+      "(redacted)",
+    ]);
+    // Withheld whatever the name, as the one-entry form is.
+    expect(redactArgs(["--header", "X-Tenant", hdr]).args).toEqual([
+      "--header",
+      "X-Tenant",
+      "(redacted)",
+    ]);
+    // An env reference is still a reference.
+    expect(redactArgs(["--headers", "Authorization", "Bearer ${API_TOKEN}"]).redacted).toBe(0);
+  });
+
+  test("a credential flag is found by its last word, in any case convention", () => {
+    for (const flag of [
+      "--oauth2Bearer",
+      "--accessToken",
+      "--client-secret",
+      "--cookie",
+      "--APIKEY",
+    ]) {
+      expect({ flag, args: redactArgs([flag, tok]).args }).toEqual({
+        flag,
+        args: [flag, "(redacted)"],
+      });
+      expect({ flag, args: redactArgs([`${flag}=${tok}`]).args }).toEqual({
+        flag,
+        args: [`${flag}=(redacted)`],
+      });
+    }
+    // A connection string is a credential flag's value too.
+    expect(redactArgs(["--connection-string", `Server=db;Password=${pw}`]).args).toEqual([
+      "--connection-string",
+      "(redacted)",
+    ]);
+    // A URL after a credential flag keeps what it points at.
+    expect(redactArgs(["--dsn", `postgresql://u:${pw}@db/prod`]).args).toEqual([
+      "--dsn",
+      "postgresql://(redacted)@db/prod",
+    ]);
+  });
+
+  test("a flag that only STARTS with a credential word, or negates one, names something else", () => {
+    const args = [
+      "--token-file",
+      "/run/secrets/token",
+      "--key-id",
+      "k1",
+      "--secret-name",
+      "prod",
+      "--password-stdin",
+      "run",
+      "--no-auth",
+      "serve",
+    ];
+    expect(redactArgs(args)).toEqual({ args: [...args], redacted: 0 });
+  });
+
+  test("a credential-named NAME=value, connection-string parameter or JSON member loses its value", () => {
+    expect(redactArgs(["run", "-e", `POSTGRES_PASSWORD=${tok}`, "mcp/postgres"]).args).toEqual([
+      "run",
+      "-e",
+      "POSTGRES_PASSWORD=(redacted)",
+      "mcp/postgres",
+    ]);
+    expect(redactArgs([`jdbc:sqlserver://db:1433;user=sa;password=${pw}`]).args).toEqual([
+      "jdbc:sqlserver://db:1433;user=sa;password=(redacted)",
+    ]);
+    expect(redactArgs(["-c", `export TOKEN=${tok}; exec server`]).args).toEqual([
+      "-c",
+      "export TOKEN=(redacted); exec server",
+    ]);
+    expect(redactArgs(["--config", `{"apiKey":"${tok}","region":"us"}`]).args).toEqual([
+      "--config",
+      '{"apiKey":"(redacted)","region":"us"}',
+    ]);
+    // A passthrough, an env reference and a harmless pair stay as written.
+    const kept = [
+      "-e",
+      "API_KEY",
+      "-e",
+      "API_KEY=$API_KEY",
+      "--label=tier=gold",
+      '{"apiKey":"${KEY}"}',
+    ];
+    expect(redactArgs(kept)).toEqual({ args: [...kept], redacted: 0 });
+  });
+
+  test("docker's -H HOST is not a header: a URL, a host:port or a dotted host stays readable", () => {
+    for (const host of [
+      "tcp://build-host:2375",
+      "unix:///var/run/docker.sock",
+      "localhost:5432",
+      "10.0.0.5",
+    ]) {
+      const args = ["-H", host, "run", "-i", "--rm", "mcp/fetch"];
+      expect({ host, out: redactArgs(args) }).toEqual({ host, out: { args, redacted: 0 } });
+    }
+    // A URL still loses its userinfo, by the embedded rule.
+    expect(redactArgs(["-H", `ssh://deploy:${pw}@build-host`]).args).toEqual([
+      "-H",
+      "ssh://(redacted)@build-host",
+    ]);
+  });
+
+  // The ops review found each of these printed verbatim after the first
+  // 0.7.1 fix-up: a quoted `sh -c` assignment, a wallet seed phrase, a key
+  // in a URL PATH, curl's `-u user:password`, `--pw`/`--pwd`, a bare token
+  // fragment, and a few spellings of forms already caught.
+  test("a quoted assignment, a seed phrase and curl's -u user:password lose their secret", () => {
+    for (const [args, want] of [
+      [
+        ["-c", `API_KEY='${tok}' exec my-mcp-server`],
+        ["-c", "API_KEY='(redacted)' exec my-mcp-server"],
+      ],
+      [
+        ["-c", `API_KEY="${tok}" exec my-mcp-server`],
+        ["-c", 'API_KEY="(redacted)" exec my-mcp-server'],
+      ],
+      [
+        ["--mnemonic", "abandon ability able about above absent"],
+        ["--mnemonic", "(redacted)"],
+      ],
+      [
+        ["--seed-phrase", tok],
+        ["--seed-phrase", "(redacted)"],
+      ],
+      [
+        ["-e", `WALLET_MNEMONIC=${tok}`],
+        ["-e", "WALLET_MNEMONIC=(redacted)"],
+      ],
+      [
+        ["-u", `admin:${pw}`],
+        ["-u", "admin:(redacted)"],
+      ],
+      [[`--user=admin:${pw}`], ["--user=admin:(redacted)"]],
+      [
+        ["--pw", pw],
+        ["--pw", "(redacted)"],
+      ],
+      [
+        ["--pwd", pw],
+        ["--pwd", "(redacted)"],
+      ],
+      [
+        ["-c", `DB_PW=${pw} server`],
+        ["-c", "DB_PW=(redacted) server"],
+      ],
+      [[`admin:${pw}@db.internal:5432/prod`], ["admin:(redacted)@db.internal:5432/prod"]],
+      [[`-HAuthorization: Bearer ${hdr}`], ["-HAuthorization: (redacted)"]],
+      [[`--token:${tok}`], ["--token:(redacted)"]],
+      [
+        ["--config", `{'apiKey':'${tok}'}`],
+        ["--config", "{'apiKey':'(redacted)'}"],
+      ],
+    ] as const) {
+      expect({ args, out: redactArgs(args).args }).toEqual({ args, out: [...want] });
+    }
+  });
+
+  test("a key in a URL's path or a bare token fragment is withheld; the rest of the URL stays", () => {
+    const key = ["Xk9", "q2Lm", "Pz7Rt", "4Wv8"].join("");
+    for (const [arg, want] of [
+      [
+        `https://eth-mainnet.g.alchemy.com/v2/${key}`,
+        "https://eth-mainnet.g.alchemy.com/v2/(redacted)",
+      ],
+      [
+        `https://hooks.slack.com/services/T000/B000/${key}`,
+        "https://hooks.slack.com/services/T000/B000/(redacted)",
+      ],
+      [
+        `https://discord.com/api/webhooks/123/${key}`,
+        "https://discord.com/api/webhooks/123/(redacted)",
+      ],
+      [
+        `--rpc-url=https://mainnet.infura.io/v3/${key}`,
+        "--rpc-url=https://mainnet.infura.io/v3/(redacted)",
+      ],
+      [`https://h.example/sse#${key}`, "https://h.example/sse#(redacted)"],
+    ] as const) {
+      expect({ arg, out: redactArgs([arg]).args }).toEqual({ arg, out: [want] });
+    }
+  });
+
+  test("the new forms leave ordinary argv readable", () => {
+    const kept = [
+      // `-u` is python's unbuffered switch and docker's uid:gid.
+      "python",
+      "-u",
+      "server.py",
+      "-u",
+      "1000:1000",
+      // A pinned image is `name:tag@sha256:…`, not user:password@host.
+      "node:20@sha256:0123abcd",
+      // A version or a word in a URL path is not a key.
+      "https://api.example.com/v1/models/claude-sonnet",
+      "https://github.com/org/repo/blob/main/README.md#usage",
+      // Playwright's variables start with PW; they are not passwords.
+      "PW_TEST_HTML_REPORT_OPEN=never",
+      "RANDOM_SEED=42",
+    ];
+    expect(redactArgs(kept)).toEqual({ args: [...kept], redacted: 0 });
+  });
+
+  test("an env reference in a header, and a URL with nothing to hide, stay as written", () => {
+    const args = [
+      "mcp-remote",
+      "https://mcp.example.com/sse",
+      "--header",
+      "Authorization:${AUTH_HEADER}",
+      "--header",
+      "Authorization: Bearer ${API_TOKEN}",
+      "-H",
+      "0.0.0.0",
+      "--dsn=postgresql://db.internal:5432/prod?sslmode=require",
+    ];
+    expect(redactArgs(args)).toEqual({ args: [...args], redacted: 0 });
   });
 });
 

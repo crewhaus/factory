@@ -2,15 +2,18 @@
  * Wire a new `@crewhaus/tool-*` package into every place the runtime needs to
  * know about it.
  *
- * Adding a builtin tool touches five files that must agree, and a drifting
- * pair fails a test somewhere far from the edit. This script makes the five
- * edits from one declaration so they cannot drift:
+ * Adding a builtin tool touches a handful of files that must agree, and a
+ * drifting pair fails a test somewhere far from the edit. This script makes
+ * the edits from one declaration so they cannot drift:
  *
  *   1. packages/tool-categories/src/registry.ts  — the category it belongs to
- *   2. packages/target-cli/src/index.ts          — BUILTIN_TOOL_MAP, so a spec compiles
- *   3. apps/cli/src/index.ts                     — loadToolMap, so `crewhaus run` resolves it
- *   4. apps/cli/src/tools-cli.ts                 — CLI_RUNTIME_TOOL_KEYS and TOOL_KEYWORDS
- *   5. tsconfig.json + the two package.json files — build refs and deps
+ *   2. packages/tool-categories/src/builtins.ts  — the builtin table row every
+ *      shape, `crewhaus run`, eval and lint read (package, export, the
+ *      registered name, and the io / sandbox facts, read off the tool itself)
+ *   3. apps/cli/src/tool-packages.ts             — a literal loader for a NEW
+ *      package, so the single-binary CLI embeds it
+ *   4. apps/cli/src/tools-cli.ts                 — the `tools suggest` keyword table
+ *   5. tsconfig.json + apps/cli's package.json/tsconfig — build refs and deps
  *
  * Usage:
  *   bun run scripts/wire-tool-package.ts <manifest.json>
@@ -73,13 +76,20 @@ const keys = manifest.tools.map((t) => t.key);
  * edit. `unitConvert` reached that point once: tool-math converts metres,
  * tool-onchain converts token decimals, and the second one won.
  */
+const BUILTINS_FILE = "packages/tool-categories/src/builtins.ts";
 {
-  const registry = readFileSync(join(ROOT, "packages/target-cli/src/index.ts"), "utf-8");
-  const taken = keys.filter((key) => new RegExp(`^  ${key}: \\{`, "m").test(registry));
+  const registry = readFileSync(join(ROOT, BUILTINS_FILE), "utf-8");
+  // A row is `  key: { package: "…", … }` — on one line, or wrapped by biome
+  // with the package on a later line — so take the text up to the row's end.
+  const rowOf = (key: string): string | undefined =>
+    new RegExp(`^  ${key}: \\{[\\s\\S]*?\\},?$`, "m").exec(registry)?.[0];
+  const taken = keys.filter((key) => {
+    const row = rowOf(key);
+    return row !== undefined && !row.includes(`package: "${scope}"`);
+  });
   if (taken.length > 0) {
     const owners = taken.map((key) => {
-      const line = new RegExp(`^  ${key}: \\{[^\\n]*`, "m").exec(registry)?.[0] ?? "";
-      const owner = /@crewhaus\/[a-z0-9-]+/.exec(line)?.[0] ?? "another package";
+      const owner = /@crewhaus\/[a-z0-9-]+/.exec(rowOf(key) ?? "")?.[0] ?? "another package";
       return `  ${key} — already registered by ${owner}`;
     });
     throw new Error(
@@ -184,95 +194,110 @@ edit(
   `category "${manifest.category.name}" with ${keys.length} tools`,
 );
 
-// 2 — the cli emitter's builtin map -------------------------------------------
-edit(
-  "packages/target-cli/src/index.ts",
-  (s) => {
-    // Per-KEY, not per-package: adding tools to a package that is already
-    // wired must still insert the new keys.
-    const absent = keys.filter((k) => !s.includes(`  ${k}: { package: "${scope}"`));
-    if (absent.length === 0) return undefined;
-    const anchor =
-      '  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },';
-    if (!s.includes(anchor)) throw new Error("target-cli BUILTIN_TOOL_MAP anchor moved");
-    const exportOf = (k: string): string => manifest.tools.find((t) => t.key === k)?.export ?? k;
-    const add = absent
-      .map((k) => `  ${k}: { package: "${scope}", export: "${exportOf(k)}" },`)
-      .join("\n");
-    return s.replace(anchor, `${add}\n${anchor}`);
-  },
-  "BUILTIN_TOOL_MAP entries",
-);
-
-// 3 — the CLI's runtime tool map ----------------------------------------------
-edit(
-  "apps/cli/src/index.ts",
-  (s) => {
-    const localName = pkgDir
-      .replace(/^tool-/, "")
-      .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
-    const missing = keys.filter((k) => !s.includes(`    ${k}: ${localName}.`));
-    if (missing.length === 0) return undefined;
-    const alreadyImported = s.includes(`import("${scope}")`);
-    const local = pkgDir
-      .replace(/^tool-/, "")
-      .replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase());
-    // The import goes LAST in the Promise.all array and the binding goes LAST
-    // in the destructuring, so the two lists stay aligned. Inserting the
-    // import near the top while appending the binding at the end silently
-    // pairs every tool package with the wrong module.
-    let out = s;
-    if (!alreadyImported) {
-      out = out.replace(
-        /(\n(\s*)import\("@crewhaus\/tool-code-execution"\),[\s\S]*?)(\n\s*\]\);)/,
-        (_m, body: string, indent: string, close: string) =>
-          `${body}\n${indent}import("${scope}"),${close}`,
-      );
-      // Widen the destructuring that receives those imports, also at the end.
-      out = out.replace(
-        /(const \[[^\]]*?)(\s*\] =\s*await Promise\.all)/,
-        (_m, head: string, tail: string) =>
-          head.trimEnd().endsWith(",")
-            ? `${head}\n    ${local},${tail}`
-            : `${head},\n    ${local},${tail}`,
+// 2 — the builtin table -----------------------------------------------------
+{
+  // The registered name and the io / sandbox / justification facts are read off the tools
+  // themselves, so the row cannot claim something the tool does not do.
+  // (apps/cli/src/tool-registry.test.ts re-reads them on every run.)
+  const mod = (await import(join(ROOT, "packages", pkgDir, "src", "index.ts"))) as Record<
+    string,
+    unknown
+  >;
+  // A package whose every existing row names one boot registrar configures
+  // the whole package through it (tool_config.http), so a new tool in it
+  // names it too — otherwise the package's block would not reach it.
+  const siblings = Object.values(
+    (
+      (await import(join(ROOT, BUILTINS_FILE))) as {
+        BUILTIN_TOOLS: Record<
+          string,
+          { package: string; initSymbol?: string; chainSymbol?: string }
+        >;
+      }
+    ).BUILTIN_TOOLS,
+  ).filter((e) => e.package === scope);
+  const shared = (field: "initSymbol" | "chainSymbol"): string | undefined => {
+    const values = new Set(siblings.map((e) => e[field]));
+    const only = [...values][0];
+    return siblings.length >= 2 && values.size === 1 ? only : undefined;
+  };
+  const initSymbol = shared("initSymbol");
+  const chainSymbol = shared("chainSymbol");
+  const rowFor = (key: string): string => {
+    const exp = manifest.tools.find((t) => t.key === key)?.export ?? key;
+    const tool = mod[exp] as
+      | {
+          name?: unknown;
+          ioCapability?: unknown;
+          requiresSandbox?: unknown;
+          requireJustification?: unknown;
+        }
+      | undefined;
+    if (tool === undefined || typeof tool.name !== "string") {
+      throw new Error(
+        `${scope} does not export a RegisteredTool named "${exp}" (for key "${key}")`,
       );
     }
-    const anchor = "    codegraphImpact: codegraph.codegraphImpact,";
-    if (!out.includes(anchor)) throw new Error("loadToolMap anchor moved");
-    const exportOf = (k: string): string => manifest.tools.find((t) => t.key === k)?.export ?? k;
-    const add = missing.map((k) => `    ${k}: ${local}.${exportOf(k)},`).join("\n");
-    return out.replace(anchor, `${anchor}\n    // ${scope}\n${add}`);
+    const parts = [
+      `package: "${scope}"`,
+      `export: "${exp}"`,
+      `name: ${JSON.stringify(tool.name)}`,
+      ...(initSymbol !== undefined ? [`initSymbol: "${initSymbol}"`] : []),
+      ...(chainSymbol !== undefined ? [`chainSymbol: "${chainSymbol}"`] : []),
+      ...(tool.ioCapability === "process" || tool.ioCapability === "network"
+        ? [`io: "${tool.ioCapability}"`]
+        : []),
+      ...(tool.requiresSandbox === true ? ["sandbox: true"] : []),
+      ...(tool.requireJustification === true ? ["justify: true"] : []),
+    ];
+    return `  ${key}: { ${parts.join(", ")} },`;
+  };
+  edit(
+    BUILTINS_FILE,
+    (s) => {
+      const absent = keys.filter((k) => !new RegExp(`^  ${k}: \\{`, "m").test(s));
+      if (absent.length === 0) return undefined;
+      const anchor =
+        "  // ---- scripts/wire-tool-package.ts inserts new builtins above this line ----";
+      if (!s.includes(anchor)) throw new Error("builtins.ts insertion anchor moved");
+      return s.replace(anchor, `${absent.map(rowFor).join("\n")}\n${anchor}`);
+    },
+    "builtin table rows",
+  );
+}
+
+// 3 — the CLI's literal package loader ----------------------------------------
+edit(
+  "apps/cli/src/tool-packages.ts",
+  (s) => {
+    if (s.includes(`"${scope}": () => import("${scope}"),`)) return undefined;
+    const tableRe =
+      /(export const TOOL_PACKAGE_LOADERS: Readonly<Record<string, \(\) => Promise<ToolModule>>> = \{)([\s\S]*?)(\n\};)/;
+    if (!tableRe.test(s)) throw new Error("TOOL_PACKAGE_LOADERS declaration moved");
+    return s.replace(
+      tableRe,
+      (_m, head: string, body: string, close: string) =>
+        `${head}${body}\n  "${scope}": () => import("${scope}"),${close}`,
+    );
   },
-  "loadToolMap entries",
+  "package loader",
 );
 
-// 4 — the canonical key list and the suggest keyword table --------------------
+// 4 — the suggest keyword table -----------------------------------------------
 edit(
   "apps/cli/src/tools-cli.ts",
   (s) => {
-    const absentKeys = keys.filter((k) => !s.includes(`\n  "${k}",`));
+    const absentKeys = keys.filter((k) => !new RegExp(`^  ${k}: \\[`, "m").test(s));
     if (absentKeys.length === 0) return undefined;
-    // Anchor on the array itself, not on whatever happens to be its last
-    // entry: the previous version keyed off "codegraphImpact" and silently
-    // did nothing once another package had appended below it.
-    const listRe =
-      /(export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object\.freeze\(\[)([\s\S]*?)(\n\]\);)/;
-    if (!listRe.test(s)) throw new Error("CLI_RUNTIME_TOOL_KEYS declaration moved");
-    const out = s.replace(
-      listRe,
-      (_m, head: string, body: string, close: string) =>
-        `${head}${body}\n${absentKeys.map((k) => `  "${k}",`).join("\n")}${close}`,
-    );
-    if (out === s) throw new Error("CLI_RUNTIME_TOOL_KEYS was not updated");
     const anchor = '  todoWrite: ["todo", "task list", "track tasks", "checklist"],';
-    if (!out.includes(anchor)) throw new Error("TOOL_KEYWORDS anchor moved");
+    if (!s.includes(anchor)) throw new Error("TOOL_KEYWORDS anchor moved");
     const add = manifest.tools
       .filter((t) => absentKeys.includes(t.key))
       .map((t) => `  ${t.key}: [${t.keywords.map((w) => JSON.stringify(w)).join(", ")}],`)
       .join("\n");
-    return out.replace(anchor, `${anchor}\n${add}`);
+    return s.replace(anchor, `${anchor}\n${add}`);
   },
-  "CLI_RUNTIME_TOOL_KEYS and TOOL_KEYWORDS entries",
+  "TOOL_KEYWORDS entries",
 );
 
 // 5 — build references and dependencies ---------------------------------------
@@ -289,11 +314,11 @@ edit(
 );
 
 /**
- * Only `apps/cli` needs the package as a dependency. `target-cli` names it
- * too, but as a *string* in BUILTIN_TOOL_MAP — data the emitter writes into
- * a generated bundle's imports, never something target-cli itself resolves.
- * It has no static or dynamic import of any tool package, so adding a
- * dependency and a project reference there would be cargo cult.
+ * Only `apps/cli` needs the package as a dependency. The builtin table names
+ * it too, but as a *string* — data an emitter writes into a generated
+ * bundle's imports, never something `tool-categories` itself resolves. No
+ * emitter imports a tool package, so adding a dependency and a project
+ * reference there would be cargo cult.
  */
 for (const [pj, tc, rel] of [
   ["apps/cli/package.json", "apps/cli/tsconfig.json", `../../packages/${pkgDir}`],

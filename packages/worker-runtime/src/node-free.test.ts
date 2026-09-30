@@ -49,11 +49,37 @@ describe("worker-runtime is node-free", () => {
   });
 
   test("the bundled import graph pulls in no node: builtin", async () => {
+    // Every import the bundler resolves passes through here. A browser build
+    // does not keep a `node:fs` import: it swaps in an empty object (and a
+    // polyfill for `node:path`), so the output check below cannot see one. A
+    // dependency that reached for the filesystem would then compile, and
+    // fail only when it ran on the edge. So the imports are checked as they
+    // are resolved, not after.
+    const NODE_BUILTIN =
+      /^(?:node:.*|fs|fs\/promises|path|os|crypto|events|child_process|stream|http|https|net|tls|util|url|zlib|buffer|worker_threads)$/;
+    const reached: string[] = [];
+    let workspaceImports = 0;
     const built = await Bun.build({
       entrypoints: [join(SRC_DIR, "index.ts")],
       target: "browser",
+      plugins: [
+        {
+          name: "record-node-builtins",
+          setup(build) {
+            build.onResolve({ filter: /.*/ }, (args) => {
+              if (NODE_BUILTIN.test(args.path)) reached.push(`${args.importer} → ${args.path}`);
+              if (args.path.startsWith("@crewhaus/")) workspaceImports++;
+              return undefined;
+            });
+          },
+        },
+      ],
     });
     expect(built.success, JSON.stringify(built.logs)).toBe(true);
+    // The hook saw the graph (a hook that sees nothing proves nothing)…
+    expect(workspaceImports).toBeGreaterThan(5);
+    // …and nothing in it asked for a node builtin.
+    expect(reached).toEqual([]);
     const combined = (await Promise.all(built.outputs.map((o) => o.text()))).join("\n");
     // A quoted `node:` specifier surviving into the browser bundle means a
     // transitive dependency reached for a builtin — exactly the drift this

@@ -220,53 +220,57 @@ describe("ir-passes — redundantMcpServerCollapse (T1)", () => {
 });
 
 describe("ir-passes — permissionRuleCanonicalize (T1)", () => {
-  test("sorts by tier (deny > ask > allow) then alpha within tier", () => {
+  test("keeps the rules in the order the spec wrote them", () => {
+    // First match wins: `alwaysAllow Bash` above the deny decides every Bash
+    // call. Re-sorting deny first (0.7.0) made the deny decide `rm` instead,
+    // so the pass-applied bundle disagreed with `crewhaus compile`'s.
+    const rules = [
+      { type: "alwaysAllow", pattern: "Read" },
+      { type: "alwaysAllow", pattern: "Bash" },
+      { type: "alwaysDeny", pattern: "Bash(rm *)" },
+      { type: "alwaysAsk", pattern: "Edit" },
+      { type: "alwaysDeny", pattern: "Write" },
+    ] as const;
+    const ir = makeCli({ permissions: { rules } });
+    const out = permissionRuleCanonicalize(ir);
+    expect(out).toBe(ir);
+    expect((out as IrV0).permissions.rules).toEqual(rules);
+  });
+
+  test("drops a rule that repeats an earlier one, keeping the first where it stands", () => {
     const ir = makeCli({
       permissions: {
         rules: [
           { type: "alwaysAllow", pattern: "Read" },
           { type: "alwaysDeny", pattern: "Bash(rm *)" },
-          { type: "alwaysAsk", pattern: "Edit" },
+          { type: "alwaysAllow", pattern: "Read" },
           { type: "alwaysAllow", pattern: "Bash" },
-          { type: "alwaysDeny", pattern: "Write" },
+          { type: "alwaysDeny", pattern: "Bash(rm *)" },
+          // Same pattern, another type: not a repeat.
+          { type: "alwaysAsk", pattern: "Read" },
         ],
       },
     });
     const out = permissionRuleCanonicalize(ir) as IrV0;
     expect(out.permissions.rules.map((r) => `${r.type}:${r.pattern}`)).toEqual([
-      "alwaysDeny:Bash(rm *)",
-      "alwaysDeny:Write",
-      "alwaysAsk:Edit",
-      "alwaysAllow:Bash",
       "alwaysAllow:Read",
+      "alwaysDeny:Bash(rm *)",
+      "alwaysAllow:Bash",
+      "alwaysAsk:Read",
     ]);
+    // Idempotent.
+    expect(permissionRuleCanonicalize(out)).toBe(out);
   });
 
-  test("dedups exact duplicates", () => {
-    const ir = makeCli({
-      permissions: {
-        rules: [
-          { type: "alwaysAllow", pattern: "Read" },
-          { type: "alwaysAllow", pattern: "Read" },
-          { type: "alwaysAllow", pattern: "Bash" },
-        ],
-      },
-    });
-    const out = permissionRuleCanonicalize(ir) as IrV0;
-    expect(out.permissions.rules.length).toBe(2);
-  });
-
-  test("returns input unchanged when already canonical", () => {
-    const ir = makeCli({
-      permissions: {
-        rules: [
-          { type: "alwaysDeny", pattern: "Bash(rm *)" },
-          { type: "alwaysAllow", pattern: "Read" },
-        ],
-      },
-    });
-    const out = permissionRuleCanonicalize(ir);
-    expect(out).toBe(ir);
+  test("the channel and managed shapes keep their order too", () => {
+    const rules = [
+      { type: "alwaysAllow", pattern: "Bash" },
+      { type: "alwaysDeny", pattern: "Bash(rm *)" },
+    ] as const;
+    for (const target of ["channel", "managed"] as const) {
+      const ir = { ...makeCli({ permissions: { rules } }), target } as unknown as IrNode;
+      expect(permissionRuleCanonicalize(ir)).toBe(ir);
+    }
   });
 });
 

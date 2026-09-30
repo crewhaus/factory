@@ -11,8 +11,8 @@
  * So the host is vetted before the socket opens, the vetted IP is what gets
  * dialled (resolving here and letting `fetch` re-resolve at connect time is a
  * DNS-rebinding TOCTOU), and the loopback/private ranges are refused unless an
- * OPERATOR opened them — `setRpcEndpointPolicy` is bound at boot by the
- * runtime, exactly like `setEvmAdapterResolver` in `tool-evm`. It is
+ * OPERATOR opened them — `setRpcEndpointPolicy`, bound at boot from the spec's
+ * `tool_config.chainread` block (which can only narrow it), or by a host. It is
  * deliberately not a field in any tool's input schema: a gate a model can open
  * for itself is not a gate.
  *
@@ -50,9 +50,100 @@ export type RpcEndpointPolicy = {
 
 let policy: RpcEndpointPolicy = {};
 
-/** Bind the endpoint policy at boot. Generated daemons call this before registering the tools. */
+/**
+ * Bind the endpoint policy. A compiled bundle, `crewhaus run` and `crewhaus
+ * eval` bind it at boot through {@link registerChainreadConfig}, from the
+ * spec's `tool_config.chainread` block; a host may call it directly.
+ */
 export function setRpcEndpointPolicy(next: RpcEndpointPolicy): void {
   policy = next;
+}
+
+/** The spec's `tool_config.chainread` block — or any chainread tool's own key. */
+export type ChainreadConfigInput = {
+  readonly allowed_origins?: ReadonlyArray<string>;
+  readonly allowedOrigins?: ReadonlyArray<string>;
+};
+
+/**
+ * Deliver the spec's block at boot: `allowed_origins` becomes the ONLY RPC
+ * origins these tools may dial. It can only narrow. Opening loopback and the
+ * private ranges stays out of a spec's reach — a spec may come from a template
+ * or a pull request, and that address is every unauthenticated service on the
+ * box — so a block that tries is refused rather than ignored.
+ */
+export function registerChainreadConfig(input: ChainreadConfigInput): void {
+  const origins = originsOf(input);
+  if (origins === undefined) return;
+  setRpcEndpointPolicy({ ...policy, allowedOrigins: origins });
+}
+
+/**
+ * The RPC origins a model-pool candidate's own `tool_config` block narrows
+ * THIS call to (`ToolExecuteContext.toolConfig`), or `undefined` when it sets
+ * none. It narrows only: an origin must be in this list AND in the list bound
+ * at boot, when there is one. A candidate that lists an origin the agent's
+ * block does not is refused there, not widened — the boot list is the
+ * operator's ceiling for every model in the pool. Before 0.7.1 this block was
+ * accepted by `compile --strict` and never read, so a spec that set the list
+ * only on a candidate dialled any public origin (C029).
+ */
+export function callOrigins(toolConfig: unknown): ReadonlyArray<string> | undefined {
+  if (toolConfig === undefined || toolConfig === null) return undefined;
+  if (typeof toolConfig !== "object" || Array.isArray(toolConfig)) {
+    throw new RpcEndpointError(
+      "this model's tool_config block for the chain readers is not a mapping; write allowed_origins under it.",
+    );
+  }
+  return originsOf(toolConfig as ChainreadConfigInput);
+}
+
+/** A block's allowed_origins, checked and reduced to origins; `undefined` when it sets none. */
+function originsOf(input: ChainreadConfigInput): string[] | undefined {
+  const block = (input ?? {}) as Record<string, unknown>;
+  for (const key of ["allow_private_hosts", "allowPrivateHosts"]) {
+    if (Object.hasOwn(block, key)) {
+      throw new RpcEndpointError(
+        `tool_config.chainread.${key} is not accepted: a spec cannot open loopback or private addresses. Remove it, and list the public RPC origins under allowed_origins.`,
+      );
+    }
+  }
+  if (Object.hasOwn(block, "allowed_origins") && Object.hasOwn(block, "allowedOrigins")) {
+    throw new RpcEndpointError(
+      "tool_config.chainread sets both allowed_origins and allowedOrigins. Write the list once, as allowed_origins.",
+    );
+  }
+  const raw = block["allowed_origins"] ?? block["allowedOrigins"];
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || raw.some((o) => typeof o !== "string")) {
+    throw new RpcEndpointError(
+      'tool_config.chainread.allowed_origins must be a list of origins, for example ["https://mainnet.base.org"].',
+    );
+  }
+  const origins = (raw as string[]).map((o, i) => {
+    let url: URL;
+    try {
+      url = new URL(o);
+    } catch {
+      // Named by position, never by value: an entry that fails to parse is
+      // most often a keyed provider URL written without its scheme, and the
+      // key is in its path — the rule vetEndpoint keeps for rpcUrl.
+      throw new RpcEndpointError(
+        `tool_config.chainread.allowed_origins[${i}] is not an origin — ${
+          /^[a-z][a-z0-9+.-]*:\/\//i.test(o)
+            ? "check the host and the port"
+            : "it must start with https:// (or http://)"
+        }. Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.`,
+      );
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new RpcEndpointError(
+        `tool_config.chainread.allowed_origins has "${url.protocol}//${url.host}", which is not http(s). Write it as https://host[:port].`,
+      );
+    }
+    return url.origin;
+  });
+  return origins;
 }
 
 /** Read the policy back — for `EvmRpcHealth`, which reports the posture it is operating under. */
@@ -267,12 +358,24 @@ export type VettedEndpoint = {
  * the reason in the message, because every one of these is a refusal a model
  * should read and act on rather than retry.
  */
-export async function vetEndpoint(rawUrl: string): Promise<VettedEndpoint> {
+export async function vetEndpoint(
+  rawUrl: string,
+  narrowTo?: ReadonlyArray<string>,
+): Promise<VettedEndpoint> {
   let url: URL;
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new RpcEndpointError(`"${rawUrl}" is not a URL`);
+    // Nothing of the value is repeated: a provider key lives in the path, and
+    // a URL that fails to parse is most often a keyed URL missing its scheme
+    // (rpc.ts, invariant 3). The hint is read from the shape alone.
+    throw new RpcEndpointError(
+      `rpcUrl is not an absolute URL — ${
+        /^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl)
+          ? "check the host and the port"
+          : "it must start with https:// (or http://)"
+      }. The value is not repeated here, because a provider keeps its key in the path.`,
+    );
   }
 
   if (url.protocol !== "https:" && url.protocol !== "http:") {
@@ -292,6 +395,11 @@ export async function vetEndpoint(rawUrl: string): Promise<VettedEndpoint> {
   if (allowed !== undefined && !allowed.includes(url.origin)) {
     throw new RpcEndpointError(
       `refusing "${url.origin}" — the operator's rpc allow-list is ${allowed.length === 0 ? "empty" : allowed.join(", ")}`,
+    );
+  }
+  if (narrowTo !== undefined && !narrowTo.includes(url.origin)) {
+    throw new RpcEndpointError(
+      `refusing "${url.origin}" — this model's rpc allow-list (its own tool_config block) is ${narrowTo.length === 0 ? "empty" : narrowTo.join(", ")}`,
     );
   }
 

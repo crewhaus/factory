@@ -25,6 +25,7 @@
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*"
   },
   "devDependencies": {

@@ -5,7 +5,8 @@
  *   list          — every builtin's name/description/scope/ioCapability/
  *                   readOnly/destructive, from the RegisteredTool metadata
  *                   the runtime already carries.
- *   suggest <spec> — rank builtins against `agent.instructions` by a
+ *   suggest <spec> — rank the builtins the spec's shape runs against its
+ *                   instructions (agent, steps, nodes, roles) by a
  *                   deterministic keyword match (no model — the tool
  *                   implication is the same shape scaffold-evals uses).
  *   audit         — mine `tool_stats` + `tool_use` events across sessions
@@ -29,6 +30,15 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinToolsFor,
+  checkBuiltinTool,
+  nameDistance,
+  registeredToolName,
+  toolConfigHint,
+} from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -44,6 +54,8 @@ export type ToolListRow = {
   readonly scope: string;
   readonly ioCapability?: string;
   readonly requiresSandbox: boolean;
+  /** Every call carries a justification the intent gate judges. */
+  readonly requireJustification: boolean;
 };
 
 /** Project a tool map (key → RegisteredTool) into sorted list rows. */
@@ -58,6 +70,7 @@ export function buildToolList(toolMap: Readonly<Record<string, RegisteredTool>>)
       scope: t.scope,
       ...(t.ioCapability !== undefined ? { ioCapability: t.ioCapability } : {}),
       requiresSandbox: t.requiresSandbox,
+      requireJustification: t.requireJustification === true,
     }))
     .sort((a, b) => a.key.localeCompare(b.key));
 }
@@ -72,6 +85,8 @@ export function formatToolListLines(rows: ReadonlyArray<ToolListRow>): string[] 
       r.scope === "external" ? "external" : undefined,
       r.ioCapability !== undefined ? `io:${r.ioCapability}` : undefined,
       r.requiresSandbox ? "sandbox" : undefined,
+      // docs-claims#12 — `show` printed it and `list` dropped it.
+      r.requireJustification ? "justification-gated" : undefined,
     ].filter((f): f is string => f !== undefined);
     const tags = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
     lines.push(`${r.key} (${r.name})${tags}`);
@@ -1171,9 +1186,39 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
     );
   }
   lines.push(
-    "heuristic: literal keyword match over agent.instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
+    "heuristic: literal keyword match over the spec's instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
   );
   return lines;
+}
+
+/**
+ * The tool keys a spec names LITERALLY in its shape tool lists — the entries
+ * that are neither an `all-<category>` selector nor an `-exclusion`.
+ * Sub-agent and model-profile lists are not grants and are skipped.
+ */
+export function literalToolKeys(spec: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  const visit = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, path);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === "sub_agents" || (path === "" && key === "models")) continue;
+      if (key === "tools" && Array.isArray(value)) {
+        for (const entry of value) {
+          if (typeof entry === "string" && !entry.startsWith("-") && !entry.startsWith("all-")) {
+            out.add(entry);
+          }
+        }
+        continue;
+      }
+      visit(value, path === "" ? key : `${path}.${key}`);
+    }
+  };
+  visit(spec, "");
+  return out;
 }
 
 // -------- tools audit --------
@@ -1225,8 +1270,17 @@ export const DEFAULT_AUDIT_THRESHOLDS: AuditThresholds = Object.freeze({
 });
 
 export type ToolAuditFinding =
-  /** A tool granted in the spec but never called across the mined sessions. */
-  | { readonly kind: "unused"; readonly key: string; readonly name: string }
+  /**
+   * A tool granted in the spec but never called across the mined sessions.
+   * `viaCategory` — granted by an `all-<category>` selector rather than by
+   * name, so the fix is an exclusion (`-key`), not deleting a line.
+   */
+  | {
+      readonly kind: "unused";
+      readonly key: string;
+      readonly name: string;
+      readonly viaCategory?: boolean;
+    }
   /** A granted tool whose error rate crosses the threshold. */
   | {
       readonly kind: "failing";
@@ -1264,7 +1318,14 @@ export type ToolAuditResult = {
  */
 export function auditTools(opts: {
   readonly sessions: ReadonlyArray<SessionEvents>;
+  /** Concrete keys the spec grants — categories expanded, exclusions applied. */
   readonly specTools: ReadonlyArray<string>;
+  /**
+   * The keys the spec names literally. A granted key missing from this set
+   * came from a category; its "unused" advice is to exclude it. Absent: every
+   * key is treated as literal (the pre-0.7.1 behaviour).
+   */
+  readonly literalKeys?: ReadonlySet<string>;
   readonly usage: ReadonlyMap<string, ToolUsageStats>;
   readonly toolMap: Readonly<Record<string, RegisteredTool>>;
   readonly hasExplicitToolList: boolean;
@@ -1275,7 +1336,8 @@ export function auditTools(opts: {
 
   // Index usage by the RegisteredTool `.name` (already the usage key) and
   // build a spec-key → name resolver.
-  const nameFor = (key: string): string => opts.toolMap[key]?.name ?? key;
+  const nameFor = (key: string): string =>
+    opts.toolMap[key]?.name ?? registeredToolName(key) ?? key;
 
   // (a) unused grants — only when the spec declared an explicit list.
   if (opts.hasExplicitToolList) {
@@ -1283,7 +1345,8 @@ export function auditTools(opts: {
       const name = nameFor(key);
       const stats = opts.usage.get(name);
       if (stats === undefined || stats.calls === 0) {
-        findings.push({ kind: "unused", key, name });
+        const viaCategory = opts.literalKeys !== undefined && !opts.literalKeys.has(key);
+        findings.push({ kind: "unused", key, name, ...(viaCategory ? { viaCategory } : {}) });
       }
     }
   }
@@ -1346,7 +1409,9 @@ export function formatAuditLines(result: ToolAuditResult): string[] {
     switch (f.kind) {
       case "unused":
         lines.push(
-          `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
+          f.viaCategory === true
+            ? `[remove?] ${f.key} (${f.name}) — granted by a category but never called in the mined sessions; add -${f.key} to tools: to exclude it, unless it's for a path these sessions didn't exercise`
+            : `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
         );
         break;
       case "failing":
@@ -1367,566 +1432,13 @@ export function formatAuditLines(result: ToolAuditResult): string[] {
 // -------- map-sync guard --------
 
 /**
- * The canonical set of built-in tool KEYS the CLI runtime can resolve at
- * `crewhaus run` time — the exact key set of `loadToolMap()` in
- * `apps/cli/src/index.ts`. It MUST equal `BUILTIN_TOOL_MAP`'s keys in
- * `packages/target-cli/src/index.ts`: that map decides which `tools:` names
- * COMPILE, this one decides which RUN, and a name in one but not the other is
- * a latent break (compiles then crashes, or runs a name the emitter rejects).
- * The sync test in `tools-cli.test.ts` asserts the two are equal; `loadToolMap`
- * is built to cover exactly these keys.
+ * The builtin tool KEYS the CLI runtime resolves at `crewhaus run` time —
+ * exactly the builtins the cli shape compiles. Derived from the one builtin
+ * table in `@crewhaus/tool-categories`, so the set that compiles and the set
+ * that runs cannot drift apart (they were two hand-kept lists until 0.7.1).
  */
 export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
-  "read",
-  "write",
-  "edit",
-  "glob",
-  "grep",
-  "bash",
-  "bashOutput",
-  "killShell",
-  "todoWrite",
-  "webFetch",
-  "webSearch",
-  "readImage",
-  "fetch",
-  "python",
-  "javascript",
-  "shell",
-  "imageGenerate",
-  "ingestDocument",
-  "codegraphSearch",
-  "codegraphCallers",
-  "codegraphCallees",
-  "codegraphImpact",
-  "compactLog",
-  "countTokens",
-  "escapeString",
-  "extractEntities",
-  "extractKeywords",
-  "fuzzyMatch",
-  "glossaryReplace",
-  "markdownOutline",
-  "markdownTable",
-  "normalizeText",
-  "regexExtract",
-  "renderTemplate",
-  "ruleClassify",
-  "sortLines",
-  "textDiff",
-  "textSimilarity",
-  "truncateToBudget",
-  "wrapText",
-  "jsonQuery",
-  "jsonPatch",
-  "jsonMergePatch",
-  "jsonFormat",
-  "dataDiff",
-  "dataConvert",
-  "csvParse",
-  "csvWrite",
-  "tableQuery",
-  "tableAggregate",
-  "tableJoin",
-  "recordsToColumns",
-  "columnsToRecords",
-  "flattenObject",
-  "unflattenObject",
-  "jsonlParse",
-  "jsonlWrite",
-  "xmlParse",
-  "sortRecords",
-  "dedupeRecords",
-  "sampleRecords",
-  "dataShape",
-  "jsonSortKeys",
-  "hash",
-  "hmac",
-  "checksum",
-  "hexEncode",
-  "hexDecode",
-  "urlEncode",
-  "urlDecode",
-  "urlParse",
-  "urlBuild",
-  "urlNormalize",
-  "uuid",
-  "ulid",
-  "nanoId",
-  "slugify",
-  "jwtDecode",
-  "jwtVerify",
-  "dateParse",
-  "dateFormat",
-  "dateConvertTimezone",
-  "dateAdd",
-  "dateDiff",
-  "durationParse",
-  "durationFormat",
-  "businessDays",
-  "dateRange",
-  "cronNext",
-  "cronDescribe",
-  "recurrenceExpand",
-  "weekOfYear",
-  "dayOfYear",
-  "isLeapYear",
-  "quarterOf",
-  "timestampConvert",
-  "jsonSchemaValidate",
-  "jsonSchemaInfer",
-  "validateRecords",
-  "assert",
-  "compareGolden",
-  "deepEqual",
-  "matchSubset",
-  "checkRequiredFields",
-  "validateEnum",
-  "validateFormat",
-  "validateUniqueKeys",
-  "validateReferences",
-  "schemaDiff",
-  "schemaSummarize",
-  "gitStatus",
-  "gitDiff",
-  "gitLog",
-  "gitShow",
-  "gitBlame",
-  "gitBranchList",
-  "gitTagList",
-  "gitRemoteList",
-  "gitMergeBase",
-  "gitRevParse",
-  "gitFileHistory",
-  "gitStashList",
-  "gitConflicts",
-  "gitWorktreeList",
-  "gitAdd",
-  "gitCommit",
-  "gitSwitch",
-  "gitBranchCreate",
-  "gitBranchDelete",
-  "gitStashPush",
-  "gitStashPop",
-  "gitTagCreate",
-  "gitApplyPatch",
-  "gitCherryPick",
-  "gitResetPaths",
-  "gitWorktreeAdd",
-  "gitWorktreeRemove",
-  "stat",
-  "fileHash",
-  "tree",
-  "diskUsage",
-  "findFiles",
-  "readLines",
-  "tailFile",
-  "makeDirectory",
-  "touchFile",
-  "tempDir",
-  "copyPath",
-  "movePath",
-  "removePath",
-  "splitFile",
-  "concatFiles",
-  "archiveList",
-  "archiveCreate",
-  "archiveExtract",
-  "frontmatterRead",
-  "frontmatterWrite",
-  "notebookRead",
-  "notebookEdit",
-  "runCommand",
-  "runPipeline",
-  "retry",
-  "processStart",
-  "processStatus",
-  "processOutput",
-  "processStop",
-  "processList",
-  "waitForPort",
-  "waitForFile",
-  "waitForOutput",
-  "commandExists",
-  "envInspect",
-  "base64Encode",
-  "base64Decode",
-  "httpRequest",
-  "httpPaginate",
-  "graphqlQuery",
-  "httpBatch",
-  "downloadFile",
-  "headRequest",
-  "urlReachable",
-  "linkCheck",
-  "httpWaitFor",
-  "sseRead",
-  "webhookSign",
-  "webhookVerify",
-  "dnsLookup",
-  "tlsInspect",
-  "robotsCheck",
-  "sitemapParse",
-  "feedParse",
-  "kvSet",
-  "kvGet",
-  "kvDelete",
-  "kvList",
-  "counterIncrement",
-  "counterGet",
-  "checkpointSave",
-  "checkpointLoad",
-  "checkpointList",
-  "journalAppend",
-  "journalRead",
-  "blackboardPost",
-  "blackboardRead",
-  "noteWrite",
-  "noteSearch",
-  "indexBuild",
-  "indexSearch",
-  "stateExport",
-  "stateImport",
-  "dedupeMark",
-  "specValidate",
-  "specCompileCheck",
-  "specSummarize",
-  "specDiff",
-  "toolInventory",
-  "permissionAudit",
-  "preflightRun",
-  "harnessInventory",
-  "bundleFreshness",
-  "auditVerify",
-  "evalBaselineCompare",
-  "sessionSummarize",
-  "traceQuery",
-  "costSummarize",
-  "runTests",
-  "testFailureSummary",
-  "runBuild",
-  "typecheck",
-  "lint",
-  "format",
-  "formatCheck",
-  "diagnostics",
-  "astQuery",
-  "symbolOutline",
-  "findReferences",
-  "importGraph",
-  "deadFileScan",
-  "todoScan",
-  "dependencyList",
-  "dependencyOutdated",
-  "packageScripts",
-  "workspacePackages",
-  "coverageSummary",
-  "stackTraceParse",
-  "prList",
-  "prGet",
-  "prFiles",
-  "prComments",
-  "prReviews",
-  "issueList",
-  "issueGet",
-  "checkRuns",
-  "workflowRuns",
-  "workflowRunLogs",
-  "releaseList",
-  "releaseGet",
-  "repoGet",
-  "compareRefs",
-  "searchCode",
-  "searchIssues",
-  "rateLimitStatus",
-  "prCreate",
-  "prUpdate",
-  "prComment",
-  "prReviewSubmit",
-  "issueCreate",
-  "issueUpdate",
-  "issueComment",
-  "releaseCreate",
-  "workflowRunRerun",
-  "sqlQuery",
-  "sqlExec",
-  "sqlTransaction",
-  "sqlExplain",
-  "dbSchemaDiff",
-  "schemaList",
-  "schemaDescribe",
-  "tableStats",
-  "integrityCheck",
-  "importCsv",
-  "importJson",
-  "exportCsv",
-  "exportJson",
-  "databaseBackup",
-  "migrationStatus",
-  "migrationApply",
-  "docxRead",
-  "docxWrite",
-  "xlsxRead",
-  "xlsxWrite",
-  "pptxRead",
-  "pdfInfo",
-  "pdfText",
-  "pdfSplit",
-  "pdfMerge",
-  "emlParse",
-  "mboxSplit",
-  "icsParse",
-  "icsWrite",
-  "vcardParse",
-  "documentText",
-  "documentDiff",
-  "piiScan",
-  "piiRedact",
-  "pseudonymize",
-  "depseudonymize",
-  "secretScan",
-  "entropyScore",
-  "promptInjectionScan",
-  "invisibleCharScan",
-  "homoglyphNormalize",
-  "urlSafetyCheck",
-  "allowlistCheck",
-  "contentPolicyCheck",
-  "hashChainVerify",
-  "signPayload",
-  "verifyPayload",
-  "redactForExport",
-  "evaluate",
-  "statistics",
-  "percentile",
-  "correlation",
-  "linearRegression",
-  "histogram",
-  "outliers",
-  "moneyAdd",
-  "moneyMultiply",
-  "moneyAllocate",
-  "currencyConvert",
-  "unitConvert",
-  "round",
-  "numberFormat",
-  "numberParse",
-  "percent",
-  "amortize",
-  "npv",
-  "irr",
-  "geoDistance",
-  "geoBoundingBox",
-  "geoPointInPolygon",
-  "chatPost",
-  "chatUpdate",
-  "chatDelete",
-  "chatReact",
-  "emailCompose",
-  "emailSend",
-  "webhookPost",
-  "smsSend",
-  "pushNotify",
-  "deliveryCheck",
-  "notifyDigest",
-  "quietHours",
-  "rateLimitGate",
-  "messageTemplate",
-  "eventQuery",
-  "eventCounts",
-  "toolCallStats",
-  "errorCluster",
-  "runTimeline",
-  "costReport",
-  "budgetCheck",
-  "sloEvaluate",
-  "incidentBundle",
-  "metricsQuery",
-  "logsQuery",
-  "alertList",
-  "alertAck",
-  "statusPagePost",
-  "healthProbe",
-  "imageInfo",
-  "imageKind",
-  "pngRead",
-  "pngWrite",
-  "imageResize",
-  "imageCrop",
-  "imageDiff",
-  "exifRead",
-  "exifStrip",
-  "qrEncode",
-  "barcodeEncode",
-  "chartRender",
-  "sparklineRender",
-  "diagramRender",
-  "colorConvert",
-  "colorContrast",
-  "subtitleParse",
-  "subtitleWrite",
-  "mediaProbe",
-  "branch",
-  "consensusVote",
-  "deadlineCheck",
-  "decisionTable",
-  "errorClassify",
-  "ruleScore",
-  "stallDetect",
-  "licenseAggregate",
-  "lockfileDiff",
-  "packagePublishPreflight",
-  "packageTarballInspect",
-  "semverResolve",
-  "costBasisCompute",
-  "glCodeSuggest",
-  "paymentIdentifierValidate",
-  "purchaseOrderMatch",
-  "refundAbuseCheck",
-  "refundAmountCompute",
-  "spendLimitCheck",
-  "statementParse",
-  "taxCalculate",
-  "webhookSignatureVerify",
-  "abiDecode",
-  "abiEncodeCall",
-  "addressCheck",
-  "defiMath",
-  "functionSelector",
-  "typedDataHash",
-  "tokenUnits",
-  "htmlForms",
-  "htmlLinks",
-  "htmlQuery",
-  "htmlRecords",
-  "htmlStructuredData",
-  "htmlTable",
-  "htmlText",
-  "acceptanceCheck",
-  "checksumVerify",
-  "citationLint",
-  "goldenCompare",
-  "goldenUpdate",
-  "markdownLinkCheck",
-  "contactNormalize",
-  "fixedWidthParse",
-  "recordLinkage",
-  "tableDiff",
-  "tableProfile",
-  "tableReshape",
-  "tableShard",
-  "diffParse",
-  "diffLint",
-  "docsSymbolCheck",
-  "bundleSizeCheck",
-  "benchmarkCompare",
-  "flakyTestDetect",
-  "registryPackageInfo",
-  "registrySearch",
-  "registryOutdated",
-  "manifestDependencySet",
-  "dependencyAudit",
-  "ciWorkflowAudit",
-  "containerImageInspect",
-  "containerImageTags",
-  "dataDriftCheck",
-  "evmGetBlock",
-  "evmBlockAtTimestamp",
-  "evmRpcHealth",
-  "evmNonceStatus",
-  "evmWaitForReceipt",
-  "evmTransactionSummary",
-  "evmEventScan",
-  "evmMulticall",
-  "contractInspect",
-  "evmSimulateBundle",
-  "gasMarketRead",
-  "tokenResolve",
-  "erc20Balance",
-  "erc721TokenInfo",
-  "priceQuote",
-  "oraclePriceRead",
-  "defiPositionRead",
-  "portfolioValuation",
-  "ledgerPost",
-  "ledgerQuery",
-  "ledgerReconcile",
-  "invoiceRender",
-  "eInvoiceBuild",
-  "eInvoiceParse",
-  "paymentFileBuild",
-  "vatIdValidate",
-  "entityRegistryLookup",
-  "sanctionsScreen",
-  "objectPresign",
-  "systemInfo",
-  "networkInfo",
-  "portInspect",
-  "secretLookup",
-  "envFileUpsert",
-  "secretRotate",
-  "watchPath",
-  "trashPath",
-  "osIndexSearch",
-  "cronList",
-  "cronDelete",
-  "packageManifestGenerate",
-  "packageManifestVerify",
-  "packageQuery",
-  "packageInstall",
-  "clipboardRead",
-  "clipboardWrite",
-  "desktopNotify",
-  "openExternal",
-  "printDocument",
-  "windowList",
-  "userPresence",
-  "powerAssertion",
-  "specPatchApply",
-  "specUpgrade",
-  "specAdvise",
-  "doctorFix",
-  "evalHistory",
-  "evalAggregate",
-  "evalBaselinePin",
-  "evalCoverage",
-  "graderMetaTest",
-  "datasetPut",
-  "datasetInspect",
-  "datasetLint",
-  "datasetMine",
-  "approvalStatus",
-  "approvalsInbox",
-  "permissionsSuggest",
-  "harnessRetire",
-  "storeMigrate",
-  "retentionEnforce",
-  "knowledgeSync",
-  "harnessRegister",
-  "harnessJobStatus",
-  "compileBundle",
-  "cliVersionPin",
-  "hooksManage",
-  "specPin",
-  "deployRollback",
-  "deployInspect",
-  "routeControl",
-  "experimentLedger",
-  "flywheelStatus",
-  "watchmeReport",
-  "marketplaceSearch",
-  "federationDiscover",
-  "factCrossCheck",
-  "vectorDelete",
-  "emailSendPreflight",
-  "deliverabilityCheck",
-  "emitTraceEvent",
-  "localTime",
-  "leadAssign",
-  "sequenceRun",
-  "onchainTransactionsSync",
-  "seoLint",
-  "toolRegistry",
+  ...builtinToolsFor("cli"),
 ]);
 
 /**
@@ -1968,6 +1480,8 @@ export type CategoryRow = {
   readonly tools: ReadonlyArray<string>;
   /** For a roll-up, the categories it rolls up. */
   readonly includes?: ReadonlyArray<string>;
+  /** What the title cannot say in a line (the network roll-up's gaps). */
+  readonly note?: string;
 };
 
 /**
@@ -1979,7 +1493,12 @@ export function buildCategoryRows(
   categories: Readonly<
     Record<
       string,
-      { title: string; tools?: ReadonlyArray<string>; includes?: ReadonlyArray<string> }
+      {
+        title: string;
+        tools?: ReadonlyArray<string>;
+        includes?: ReadonlyArray<string>;
+        note?: string;
+      }
     >
   >,
   resolve: (name: string) => ReadonlyArray<string>,
@@ -1992,6 +1511,7 @@ export function buildCategoryRows(
       kind: (def.tools !== undefined ? "leaf" : "roll-up") as "leaf" | "roll-up",
       tools: resolve(name),
       ...(def.includes !== undefined ? { includes: [...def.includes] } : {}),
+      ...(def.note !== undefined ? { note: def.note } : {}),
     }))
     .sort((a, b) => {
       // Leaves first, then roll-ups: an operator scanning for "what can I
@@ -2011,6 +1531,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of leaves) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    ${r.tools.join(", ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   if (rollUps.length > 0) {
@@ -2019,6 +1540,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of rollUps) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    = ${(r.includes ?? []).map((c) => `all-${c}`).join(" + ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   lines.push("");
@@ -2041,7 +1563,297 @@ export type ToolDetail = {
   readonly concurrencySafe: boolean;
   /** Top-level input field names, derived from the tool's own JSON Schema. */
   readonly inputFields: ReadonlyArray<string>;
+  /** What a spec writes to configure it (`tool_config.http`), when it takes any. */
+  readonly configure?: string;
+  /**
+   * The shapes whose bundles run it — a shape that carries no tools at all
+   * (pipeline, voice, onchain) is never listed. Empty for a key the builtin
+   * table does not know.
+   */
+  readonly shapes: ReadonlyArray<ToolShape>;
+  /** What a permission rule's argument pattern is checked against, and an example rule. */
+  readonly rules: RuleScope;
 };
+
+/**
+ * The structural subset of `OperativeArg` (`@crewhaus/tool-catalog`) that
+ * `tools show` reads — the same fields the builtin manifest carries.
+ */
+export type OperativeArgLike = {
+  readonly field: string;
+  readonly kind: string;
+  readonly default?: string;
+  readonly within?: string;
+  readonly relocates?: true;
+  readonly env?: string;
+  readonly prefix?: true;
+  readonly beneath?: string;
+  readonly defaultAtRoot?: true;
+  readonly glob?: true;
+  readonly shell?: true;
+};
+
+/** One permission rule, in the shape `permissions.rules` takes it. */
+export type ExampleRule = {
+  readonly type: "alwaysAllow" | "alwaysDeny";
+  readonly pattern: string;
+};
+
+/**
+ * What a scoped permission rule on a tool is checked against.
+ *
+ *  - `args`: the operative arguments the tool declares, each in words, and
+ *    one example rule. `note` says why the example is a deny, when it is.
+ *  - `unscoped`: the tool declares that no argument decides where it acts
+ *    (`operativeArgs: []`) — a pattern is matched against every string in
+ *    the call.
+ *  - `undeclared`: the tool declares nothing — the same string fallback.
+ */
+export type RuleScope =
+  | {
+      readonly kind: "args";
+      readonly args: ReadonlyArray<{ readonly field: string; readonly words: string }>;
+      readonly example: ExampleRule;
+      readonly note?: string;
+    }
+  | { readonly kind: "unscoped"; readonly example: ExampleRule }
+  | { readonly kind: "undeclared"; readonly example: ExampleRule };
+
+const KIND_WORDS: Readonly<Record<string, string>> = {
+  path: "a path",
+  url: "a URL",
+  command: "a command",
+  recipient: "a recipient",
+  id: "an id",
+  text: "text",
+};
+
+/** A left-out value in words: `"."` is a directory, anything else is quoted. */
+function defaultWords(arg: OperativeArgLike): string {
+  const value = arg.default ?? "";
+  if (value === "*") return "left out, it stands for every value";
+  if (arg.defaultAtRoot === true) return "left out, the whole workspace";
+  const where =
+    arg.kind === "path" && value === "."
+      ? arg.within !== undefined
+        ? `the directory in ${arg.within}`
+        : "the workspace root"
+      : `"${value}"`;
+  return arg.relocates === true
+    ? `left out, ${where}; it only moves the tool off its usual place, so an allow need not match it when the call leaves it out`
+    : `left out, ${where}`;
+}
+
+/** One operative argument in words: its kind, what qualifies it, what it stands for. */
+export function operativeArgWords(arg: OperativeArgLike): string {
+  const parts: string[] = [];
+  const kind = KIND_WORDS[arg.kind] ?? arg.kind;
+  if (arg.glob === true) parts.push("a path pattern, which stands for every path it can list");
+  else if (arg.prefix === true) {
+    parts.push(`${kind} prefix, which stands for every value that starts with it`);
+  } else parts.push(kind);
+  if (arg.within !== undefined) {
+    if (arg.kind === "path") parts.push(`read from the directory in ${arg.within}`);
+    else if (arg.kind === "command") {
+      parts.push(
+        `run in the directory in ${arg.within}; a scoped allow covers it only in the workspace root`,
+      );
+    } else parts.push(`matched as ${arg.within}/${arg.field.split(".").pop() ?? arg.field}`);
+  }
+  if (arg.shell === true) {
+    parts.push(
+      "a shell line: an allow must match each command it runs (joined by &&, ||, ;, |, & or a newline), or be written as the same chain (cd ** && make *), and a deny or ask fires on any of them",
+      "a line with $(…), backticks or a here-document is allowed only by the bare tool, (*) or (**)",
+    );
+  }
+  if (arg.env !== undefined) {
+    parts.push(`a call that sets ${arg.env} is covered only by an allow on every command (**)`);
+  }
+  if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
+  if (arg.beneath === "visible") {
+    parts.push("a directory stands for everything beneath it except hidden names");
+  }
+  if (arg.default !== undefined) parts.push(defaultWords(arg));
+  return parts.join("; ");
+}
+
+/** Which argument an example rule is written for, first to last. */
+const PLACE_ORDER: ReadonlyArray<string> = ["path", "url", "command", "recipient", "id", "text"];
+
+/** A value `qualifier` might hold, for an example that names one. */
+const QUALIFIER_SAMPLES: Readonly<Record<string, string>> = {
+  owner: "acme",
+  chainId: "1",
+  channel: "C0123",
+  namespace: "scratch",
+};
+
+/** An argument glob an allow on `arg` could sensibly be written with. */
+function allowGlob(arg: OperativeArgLike): string {
+  const leaf = (arg.field.split(".").pop() ?? arg.field).toLowerCase();
+  switch (arg.kind) {
+    case "path":
+      return arg.relocates === true && arg.default !== undefined && arg.default !== "."
+        ? `${arg.default}/**`
+        : "src/**";
+    case "url":
+      return "https://api.example.com/**";
+    case "command":
+      return "git status";
+    default: {
+      if (arg.within !== undefined) {
+        const qualifier = QUALIFIER_SAMPLES[arg.within] ?? "prod";
+        return arg.prefix === true ? `${qualifier}/**` : `${qualifier}/*`;
+      }
+      // A channel routing key, as SendMessage documents it.
+      if (leaf === "channel") return arg.kind === "id" ? "slack:T0123:C0123:*" : "C0123";
+      if (arg.kind === "recipient") {
+        if (/address|^to$|^cc$|^bcc$|email/.test(leaf)) return "*@example.com";
+        if (/image/.test(leaf)) return "ghcr.io/acme/*";
+        return "*.example.com";
+      }
+      return "nightly-*";
+    }
+  }
+}
+
+/** A glob a deny on `arg` could sensibly be written with. */
+function denyGlob(arg: OperativeArgLike): string {
+  switch (arg.kind) {
+    case "path":
+      return "secrets/**";
+    case "url":
+      return "https://internal.example.com/**";
+    case "command":
+      return arg.field === "code" ? "*subprocess*" : "*rm -rf*";
+    default:
+      return "*password*";
+  }
+}
+
+/**
+ * What a scoped rule on the tool named `name` is checked against, from its
+ * declared `operativeArgs`, with one example rule.
+ *
+ * The example is an allow when one glob can cover every value an allow
+ * reads — the arguments are all of one kind, and that kind names a place (a
+ * path, a URL, a command, a recipient or an id). Otherwise it is a deny:
+ * an allow must match every value at once, so a tool whose arguments are of
+ * different kinds (Grep's path and pattern) or that are free text or code is
+ * scoped by allowing it bare and denying what must stay out.
+ */
+export function ruleScopeFor(
+  name: string,
+  operativeArgs: ReadonlyArray<OperativeArgLike> | undefined,
+): RuleScope {
+  const bare: ExampleRule = { type: "alwaysAllow", pattern: name };
+  if (operativeArgs === undefined) return { kind: "undeclared", example: bare };
+  if (operativeArgs.length === 0) return { kind: "unscoped", example: bare };
+  const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a) }));
+  // An allow skips a relocating field the call leaves out, so the fields it
+  // is about are the others — unless relocating fields are all there is.
+  const active = operativeArgs.filter((a) => a.relocates !== true);
+  const read = active.length > 0 ? active : operativeArgs;
+  const kinds = new Set(read.map((a) => a.kind));
+  // The example names a place when an argument is one: a path before a URL
+  // before a command, a recipient, an id, and text last.
+  const first = [...read].sort(
+    (a, b) => PLACE_ORDER.indexOf(a.kind) - PLACE_ORDER.indexOf(b.kind),
+  )[0] as OperativeArgLike;
+  const oneKind = kinds.size === 1;
+  const placeKind = first.kind !== "text" && !(first.kind === "command" && first.field === "code");
+  if (oneKind && placeKind) {
+    return {
+      kind: "args",
+      args,
+      example: { type: "alwaysAllow", pattern: `${name}(${allowGlob(first)})` },
+    };
+  }
+  return {
+    kind: "args",
+    args,
+    example: { type: "alwaysDeny", pattern: `${name}(${denyGlob(first)})` },
+    note: oneKind
+      ? "a scoped allow on free text or code is rarely what you mean: allow the tool bare and deny what must not run"
+      : "these are of different kinds, so one allow pattern rarely fits them all: allow the tool bare and deny what must stay out",
+  };
+}
+
+/** `tools show`'s lines for a {@link RuleScope}. */
+export function formatRuleScopeLines(scope: RuleScope): string[] {
+  const example = `- { type: ${scope.example.type}, pattern: "${scope.example.pattern}" }`;
+  if (scope.kind !== "args") {
+    const why =
+      scope.kind === "unscoped"
+        ? "no argument (the tool says none decides where it acts)"
+        : "no declared argument";
+    return [
+      ...wrapDetail(
+        "rule checks",
+        `${why}, so a pattern is matched against every string in the call, and an allow needs all of them to match: name the tool bare`,
+      ),
+      `  example     ${example}`,
+    ];
+  }
+  const lines: string[] = [];
+  scope.args.forEach((a, i) => {
+    lines.push(...wrapDetail(i === 0 ? "rule checks" : "", `${a.field}: ${a.words}`));
+  });
+  if (scope.args.length > 1) {
+    lines.push(
+      ...wrapDetail("", "an allow must match every one of these; a deny or ask fires on any one"),
+    );
+  }
+  lines.push(`  example     ${example}`);
+  if (scope.note !== undefined) lines.push(...wrapDetail("", scope.note));
+  return lines;
+}
+
+/** Word-wrap one `tools show` row: a 12-column label, then text at column 15. */
+function wrapDetail(label: string, text: string, width = 96): string[] {
+  const indent = " ".repeat(14);
+  const lines: string[] = [];
+  let line = `  ${label.padEnd(12)}`;
+  let fresh = true;
+  for (const word of text.split(" ")) {
+    if (!fresh && line.length + 1 + word.length > width) {
+      lines.push(line);
+      line = indent;
+      fresh = true;
+    }
+    line += fresh ? word : ` ${word}`;
+    fresh = false;
+  }
+  lines.push(line);
+  return lines;
+}
+
+/**
+ * The shapes that compile `key` into a bundle that runs it: the ones the
+ * compiler accepts it on, less the shapes that register no tools (which
+ * accept any list and ignore it).
+ */
+export function shapesRunning(key: string): ReadonlyArray<ToolShape> {
+  return (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter((shape) => {
+    if (SHAPE_TOOL_PROFILES[shape].runtime === "none") return false;
+    const kind = checkBuiltinTool(key, shape).kind;
+    return kind === "ok" || kind === "inert";
+  });
+}
+
+/** `tools show`'s "runs on" wording for a tool's shapes. */
+function shapesLine(shapes: ReadonlyArray<ToolShape>): string {
+  const host = (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter(
+    (s) => SHAPE_TOOL_PROFILES[s].runtime === "host",
+  );
+  const edge = shapes.includes("cf-worker");
+  if (host.every((s) => shapes.includes(s))) {
+    return edge
+      ? "every shape that runs tools, the cf-worker edge included"
+      : "every shape that runs tools, except the cf-worker edge";
+  }
+  return `${shapes.join(", ")} only`;
+}
 
 /**
  * Project one tool into its detail record. `key` is the camelCase spec key;
@@ -2054,7 +1866,8 @@ export function buildToolDetail(
   toolMap: Readonly<Record<string, ToolLike>>,
   categoriesFor: (key: string) => ReadonlyArray<string>,
 ): ToolDetail | undefined {
-  const tool = toolMap[key];
+  // An own key only: `toolMap.constructor` is Object, which is no tool.
+  const tool = Object.hasOwn(toolMap, key) ? toolMap[key] : undefined;
   if (tool === undefined) return undefined;
   return {
     key,
@@ -2069,6 +1882,9 @@ export function buildToolDetail(
     requireJustification: tool.requireJustification ?? false,
     concurrencySafe: tool.concurrencySafe ?? false,
     inputFields: inputFieldNames(tool),
+    ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
+    shapes: shapesRunning(key),
+    rules: ruleScopeFor(tool.name, tool.operativeArgs),
   };
 }
 
@@ -2088,6 +1904,7 @@ export type ToolLike = {
   readonly concurrencySafe?: boolean;
   readonly inputSchema?: unknown;
   readonly jsonSchema?: unknown;
+  readonly operativeArgs?: ReadonlyArray<OperativeArgLike>;
 };
 
 /**
@@ -2128,6 +1945,11 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     `  flags       ${flags.join(", ")}`,
     `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
     `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
+    ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
+    // shape-reach#10 — say where it runs, rather than implying everywhere.
+    ...(d.shapes.length > 0 ? [`  runs on     ${shapesLine(d.shapes)}`] : []),
+    // 0.7.1 — what a scoped permission rule on it is checked against.
+    ...formatRuleScopeLines(d.rules),
     "",
     `  enable with  tools: [${d.key}]`,
   ];
@@ -2203,8 +2025,48 @@ export function formatSearchLines(query: string, hits: ReadonlyArray<SearchHit>)
 }
 
 /**
+ * The builtin a name means exactly: its spec key (`gitCommit`), or the
+ * registered name session logs and permission rules record (`GitCommit`).
+ * Own keys only, so `constructor` names nothing. Undefined when no builtin,
+ * or more than one, answers to it.
+ */
+export function exactToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  if (Object.hasOwn(tools, query)) return query;
+  const byName = Object.keys(tools).filter((k) => tools[k]?.name === query);
+  return byName.length === 1 ? byName[0] : undefined;
+}
+
+/**
+ * The spec key a `tools show` argument names: the key or the registered
+ * name exactly, or else either one in any case (`gitcommit`), as long as
+ * exactly one builtin answers to it. Undefined otherwise, so the caller can
+ * suggest near misses (docs-claims#12).
+ */
+export function resolveToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  const exact = exactToolKey(query, tools);
+  if (exact !== undefined) return exact;
+  const lower = query.toLowerCase();
+  const hits = Object.keys(tools).filter(
+    (k) => k.toLowerCase() === lower || tools[k]?.name.toLowerCase() === lower,
+  );
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
+/**
  * Suggest near-miss keys for an unknown `tools show` argument, so a typo
- * gets a pointer instead of a bare "not found".
+ * gets a pointer instead of a bare "not found". Ranked before the limit is
+ * applied — a same-letters match, then a key that starts with or contains
+ * the whole query, then a spelling within two edits (closest first:
+ * `gitcomit` → gitCommit, the key compile's own hint names), then a key the
+ * query contains (`gitStats` holds `stat`, but meant gitStatus), then a
+ * shared first three letters; ties alphabetical — so the likely tool is
+ * offered first rather than whichever the table lists first.
  */
 export function nearestToolKeys(
   key: string,
@@ -2212,10 +2074,27 @@ export function nearestToolKeys(
   limit = 3,
 ): ReadonlyArray<string> {
   const k = key.toLowerCase();
+  const rank = (candidate: string): { readonly tier: number; readonly d: number } | undefined => {
+    const c = candidate.toLowerCase();
+    if (c === k) return { tier: 0, d: 0 };
+    if (c.startsWith(k)) return { tier: 1, d: 0 };
+    if (c.includes(k)) return { tier: 2, d: 0 };
+    // The distance is at least the length difference, so only a candidate
+    // within two letters of the query's length is measured.
+    if (Math.abs(c.length - k.length) <= 2) {
+      const d = nameDistance(k, c);
+      if (d <= 2 && d < k.length) return { tier: 3, d };
+    }
+    if (k.includes(c)) return { tier: 4, d: 0 };
+    if (c.startsWith(k.slice(0, 3))) return { tier: 5, d: 0 };
+    return undefined;
+  };
   return known
-    .filter((candidate) => {
-      const c = candidate.toLowerCase();
-      return c.includes(k) || k.includes(c) || c.startsWith(k.slice(0, 3));
+    .flatMap((candidate) => {
+      const r = rank(candidate);
+      return r === undefined ? [] : [{ candidate, ...r }];
     })
-    .slice(0, limit);
+    .sort((a, b) => a.tier - b.tier || a.d - b.d || a.candidate.localeCompare(b.candidate))
+    .slice(0, limit)
+    .map((x) => x.candidate);
 }

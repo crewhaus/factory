@@ -19,6 +19,7 @@
  *     by reading the source.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { APT_POLICY_CURL, WINGET_LIST_GIT, WINGET_VERSION } from "./fixtures";
 import { _resetHostSeams, _setPlatform, _setUid } from "./host";
 import { packageInstall, packageQuery } from "./index";
 import { _setRunner } from "./run";
@@ -119,6 +120,14 @@ test("no schema accepts a password or an escalation flag", () => {
 test("apt refuses to install as an ordinary user and names the command to run", async () => {
   _setPlatform("linux");
   _setUid(1000);
+  // apt must first answer about exactly "curl" (C021), or the install is
+  // refused for that reason before the privilege gate is reached.
+  _setRunner(async (request: { readonly argv: readonly string[] }) => {
+    const [cmd = "", ...args] = request.argv;
+    argvSeen.push({ cmd, args });
+    const stdout = cmd === "apt-cache" ? APT_POLICY_CURL : "";
+    return { code: 0, stdout, stderr: "" } as never;
+  });
   const out = String(await packageInstall.execute({ manager: "apt", name: "curl" } as never));
   console.log(`APT_NONROOT ${out.slice(0, 260)}`);
   // The REASON, not merely a failure: an assertion that only checks "it did
@@ -177,4 +186,73 @@ test("dryRun resolves through the same code the real install uses", async () => 
   expect(dry.length).toBeGreaterThan(0);
   expect(real.slice(0, dry.length)).toEqual(dry);
   expect(real.length).toBeGreaterThanOrEqual(dry.length);
+});
+
+// ---------------------------------------------------------------------------
+// winget: a read never accepts an agreement (C193)
+// ---------------------------------------------------------------------------
+
+/** A Windows host with winget, whose `winget list` answers as told. */
+function wingetHost(list: { code: number; stdout?: string; stderr?: string }): void {
+  _setPlatform("win32");
+  _setRunner(async (request: { readonly argv: readonly string[] }) => {
+    const [cmd = "", ...args] = request.argv;
+    argvSeen.push({ cmd, args });
+    if (cmd === "winget" && args[0] === "--version") {
+      return { code: 0, stdout: WINGET_VERSION, stderr: "" } as never;
+    }
+    if (cmd === "winget" && args[0] === "list") {
+      return { stdout: "", stderr: "", ...list } as never;
+    }
+    return { code: 1, stdout: "", stderr: "", missing: true } as never;
+  });
+}
+
+async function queryJson(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return JSON.parse(String(await packageQuery.execute(input as never))) as Record<string, unknown>;
+}
+
+test("PackageQuery runs winget list without accepting a source agreement", async () => {
+  // 0.7.0 passed --accept-source-agreements: winget records that acceptance
+  // permanently (for msstore, consent to send the machine's region), from a
+  // tool plan mode allows as read-only.
+  wingetHost({ code: 0, stdout: WINGET_LIST_GIT });
+  const out = await queryJson({ name: "Git.Git" });
+  expect(out["status"]).toBe("installed");
+  const list = argvSeen.filter((a) => a.cmd === "winget" && a.args[0] === "list");
+  expect(list.length).toBe(1);
+  const args = list[0]?.args ?? [];
+  expect(args).not.toContain("--accept-source-agreements");
+  expect(args.some((a) => /^--accept-/i.test(a))).toBe(false);
+  // The flag that actually stops winget waiting on a pipe stays.
+  expect(args).toContain("--disable-interactivity");
+});
+
+test("winget refusing over an unaccepted agreement is unknown, never not-installed", async () => {
+  for (const code of [-1978335162, 2316632134]) {
+    // The same HRESULT signed and as the unsigned DWORD a runtime may report.
+    argvSeen = [];
+    wingetHost({ code, stderr: "One or more of the source agreements were not agreed to.\n" });
+    const out = await queryJson({ name: "Git.Git" });
+    expect({ code, status: out["status"] }).toEqual({ code, status: "unknown" });
+    const unknown = out["unknown"] as Array<{ field: string; probe: string; reason: string }>;
+    const status = unknown.find((u) => u.field === "status");
+    expect(status?.reason).toMatch(/source's agreements have not been accepted/);
+    expect(status?.reason).toContain("operator's decision");
+    expect(status?.probe).toContain("winget list --exact --disable-interactivity --query");
+  }
+});
+
+test("winget's no-packages exit code is not-installed, signed or unsigned", async () => {
+  // APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND, 0x8A150014. 0.7.0 compared
+  // against 0x8A15002B (UPDATE_NOT_APPLICABLE), so this came back unknown.
+  for (const code of [-1978335212, 2316632084]) {
+    argvSeen = [];
+    wingetHost({ code, stdout: "No installed package found matching input criteria.\n" });
+    const out = await queryJson({ name: "Git.Git" });
+    expect({ code, status: out["status"] }).toEqual({ code, status: "not-installed" });
+  }
+  // Any other failure stays unknown.
+  wingetHost({ code: -1978335189 });
+  expect((await queryJson({ name: "Git.Git" }))["status"]).toBe("unknown");
 });

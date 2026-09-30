@@ -8,7 +8,9 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
+import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import pkg from "../package.json" with { type: "json" };
 
 export type EmitOptions = {
   /**
@@ -63,10 +65,23 @@ export function emitCfWorkerWorkflow(ir: IrWorkflowV0, opts: EmitOptions = {}): 
     { path: "package.json", content: renderPackageJson(ir, wiring) },
   ];
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir, CF_WORKER_README_OPTS) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        ...CF_WORKER_README_OPTS,
+        unwiredTools: { names: new Set(wiring.unwired), note: CF_WORKER_UNWIRED_NOTE },
+        toolFacts: readmeToolFacts(
+          ir.steps.map((s) => ({ tools: s.tools, toolConfigs: s.toolConfigs })),
+        ),
+      }),
+    });
   }
   return { files };
 }
+
+/** The README note for a tool the worker leaves out. */
+const CF_WORKER_UNWIRED_NOTE =
+  "left out of this worker — the edge runtime does not run it (see the compile warning)";
 
 const CF_WORKER_README_OPTS = {
   usage: {
@@ -111,28 +126,6 @@ function assertAnthropicModel(model: string, where: string): void {
 // Edge-safe tool wiring (Batch F, G12/G83)
 // --------------------------------------------------------------------------
 
-type EdgeToolImport = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-const EDGE_TOOL_IMPORTS: Readonly<Record<string, EdgeToolImport>> = {
-  fetch: { package: "@crewhaus/tool-fetch", export: "fetch", initSymbol: "registerFetchConfig" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  sendMessage: { package: "@crewhaus/tool-message-channel", export: "sendMessage" },
-  imageGenerate: {
-    package: "@crewhaus/tool-image-generation",
-    export: "imageGenerate",
-    initSymbol: "registerImageGenerationConfig",
-  },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-};
-
 export type EdgeToolWiring = {
   readonly imports: string;
   readonly inits: string;
@@ -142,82 +135,31 @@ export type EdgeToolWiring = {
   readonly unwired: readonly string[];
 };
 
-/** Classify one unit's tools: THROW on host tools, return the wireable
- *  edge-safe builtins (order-preserving, deduped) + the permitted-but-unwired
- *  names (custom + MCP). */
-function classifyUnitTools(names: readonly string[]): { wired: string[]; unwired: string[] } {
-  const { rejected, warned, allowed } = partitionEdgeTools(names);
-  if (rejected.length > 0) {
-    const detail = rejected.map((r) => r.reason).join("; ");
-    throw new TargetEmitError(
-      `cf-worker target cannot run ${rejected.length} host tool(s): ${detail}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
-    );
-  }
-  const seen = new Set<string>();
-  const wired: string[] = [];
-  for (const name of names) {
-    if (seen.has(name)) continue;
-    seen.add(name);
-    if (EDGE_TOOL_IMPORTS[name] !== undefined) wired.push(name);
-  }
-  const unwired = [
-    ...allowed.filter((n) => EDGE_TOOL_IMPORTS[n] === undefined),
-    ...warned.map((w) => w.name),
-  ];
-  return { wired, unwired };
-}
-
 /**
  * Resolve edge-safe tool wiring across every step: ONE import block (deduped
  * across steps) + per-step `TOOLS` arrays. Host tools in any step hard-fail the
  * compile. `justify`/MCP/custom tools are permitted but left unwired.
  */
 export function resolveWorkflowTools(steps: readonly IrWorkflowStep[]): EdgeToolWiring {
-  const stepWired: string[][] = [];
-  const allUnwired = new Set<string>();
-  // Global import grouping + first-config-wins init calls.
-  const byPackage = new Map<string, { specs: Set<string>; extras: Set<string> }>();
-  const initEmitted = new Set<string>();
-  const inits: string[] = [];
-
-  for (const step of steps) {
-    const { wired, unwired } = classifyUnitTools(step.tools);
-    stepWired.push(wired);
-    for (const u of unwired) allUnwired.add(u);
-    for (const name of wired) {
-      const entry = EDGE_TOOL_IMPORTS[name];
-      if (entry === undefined) continue;
-      const group = byPackage.get(entry.package) ?? {
-        specs: new Set<string>(),
-        extras: new Set<string>(),
-      };
-      group.specs.add(`${entry.export} as __t_${name}`);
-      if (entry.initSymbol !== undefined) {
-        const cfg = step.toolConfigs[name];
-        if (cfg !== undefined && !initEmitted.has(entry.initSymbol)) {
-          group.extras.add(entry.initSymbol);
-          inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-          initEmitted.add(entry.initSymbol);
-        }
-      }
-      byPackage.set(entry.package, group);
-    }
+  const { rejected } = partitionEdgeTools(steps.flatMap((unit) => unit.tools));
+  if (rejected.length > 0) {
+    const detail = rejected.map((r) => r.reason).join("; ");
+    throw new TargetEmitError(
+      `cf-worker target cannot run ${rejected.length} host tool(s): ${detail}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
+    );
   }
-
-  const importLines: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const group = byPackage.get(pkg);
-    if (group === undefined) continue;
-    const symbols = [...[...group.specs].sort(), ...[...group.extras].sort()].join(", ");
-    importLines.push(`import { ${symbols} } from "${pkg}";`);
-  }
-
+  // The one shared resolver, over every unit at once: ONE import block, the
+  // first configured unit's registrar call, and a per-unit TOOLS array.
+  const resolved = resolveBuiltinTools(
+    "cf-worker",
+    steps.map((unit) => ({ tools: unit.tools, toolConfigs: unit.toolConfigs })),
+  );
   return {
-    imports: importLines.join("\n"),
-    inits: inits.join("\n"),
-    stepTools: stepWired.map((w) => `[${w.map((n) => `__t_${n}`).join(", ")}]`),
-    packages: [...byPackage.keys()].sort(),
-    unwired: [...allUnwired],
+    imports: resolved.imports.join("\n"),
+    inits: resolved.inits.join("\n"),
+    stepTools: resolved.sites.map((ids) => `[${ids.join(", ")}]`),
+    packages: [...resolved.packages],
+    unwired: [...resolved.unwired],
   };
 }
 
@@ -497,12 +439,22 @@ enabled = true
 `;
 }
 
-const RUNTIME_DEP_RANGE = "^0.3.0";
+/**
+ * The version every @crewhaus package the generated worker imports is pinned
+ * to: this emitter's own. The release train stamps every @crewhaus package with
+ * one version (release-prep, lockstep), so it is exactly the runtime and tool
+ * packages this emitter was released with, as the other shapes' manifests pin
+ * the CLI's version. It was a literal "^0.3.0" until 0.7.1: npm has no
+ * @crewhaus/worker-runtime in that range, so `npm install` in an emitted worker
+ * failed, and the tool packages resolved to 0.3.x without any later edge fix.
+ * A static import, so a compiled binary carries the version it was built from.
+ */
+const RUNTIME_DEP_VERSION: string = pkg.version;
 
 function renderPackageJson(ir: IrWorkflowV0, wiring: EdgeToolWiring): string {
   const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
-  const deps: Record<string, string> = { "@crewhaus/worker-runtime": RUNTIME_DEP_RANGE };
-  for (const pkg of wiring.packages) deps[pkg] = RUNTIME_DEP_RANGE;
+  const deps: Record<string, string> = { "@crewhaus/worker-runtime": RUNTIME_DEP_VERSION };
+  for (const pkg of wiring.packages) deps[pkg] = RUNTIME_DEP_VERSION;
   return `${JSON.stringify(
     {
       name: safeName,

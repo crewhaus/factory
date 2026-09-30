@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+import { jsonSyntaxProblem } from "./lib/json-problem";
 import { declaredLicense, isDisjunctive, splitExpression, summarize } from "./lib/license";
 import { classifyBump, diffLocks } from "./lib/lockdiff";
 import { entryPoints, preflight, wouldInclude } from "./lib/preflight";
@@ -42,6 +43,110 @@ describe("resolveRange", () => {
 
   test("a range naming a prerelease opts in by itself", () => {
     expect(resolveRange(">=2.1.0-rc.0", versions).satisfying).toContain("2.1.0-rc.1");
+  });
+
+  test("a prerelease is eligible only on the major.minor.patch the range names, as npm does (security-7#7)", () => {
+    // On 0.7.0 any "-" in the range admitted every prerelease in range.
+    const floor = resolveRange(">=1.0.0-beta.1 <3", ["1.5.0", "2.9.0-alpha.1"]);
+    expect(floor.best).toBe("1.5.0");
+    expect(floor.rejected).toContainEqual({ version: "2.9.0-alpha.1", why: "prerelease" });
+    expect(
+      resolveRange("^1.2.3-beta.2", ["1.2.3-beta.4", "1.5.0", "1.9.0-rc.1"]).satisfying,
+    ).toEqual(["1.2.3-beta.4", "1.5.0"]);
+    const rc = resolveRange("^1.2.0-rc.1", ["1.2.0-rc.2", "1.3.0-alpha.0", "1.2.5"]);
+    expect(rc.best).toBe("1.2.5");
+    expect(rc.satisfying).toEqual(["1.2.0-rc.2", "1.2.5"]);
+    // A prerelease named in one alternative admits nothing in another.
+    expect(
+      resolveRange("1.2.3-beta.1 || ^2.0.0", ["1.2.3-beta.1", "2.0.0", "2.5.0-rc.1"]).best,
+    ).toBe("2.0.0");
+    // includePrerelease still admits every prerelease in range.
+    expect(
+      resolveRange(">=1.0.0-beta.1 <3", ["1.5.0", "2.9.0-alpha.1"], { includePrerelease: true })
+        .best,
+    ).toBe("2.9.0-alpha.1");
+  });
+
+  test("the pick among prereleases orders rc.10 above rc.9, as npm does", () => {
+    // On 0.7.0 the tags compared as whole strings: beta.9 was "newer" than
+    // beta.10, and <=1.2.3-rc.5 admitted rc.10.
+    expect(resolveRange("^1.2.3-beta.2", ["1.2.3-beta.9", "1.2.3-beta.10"]).best).toBe(
+      "1.2.3-beta.10",
+    );
+    const capped = resolveRange("<=1.2.3-rc.5", ["1.2.3-rc.2", "1.2.3-rc.10"]);
+    expect(capped.best).toBe("1.2.3-rc.2");
+    expect(capped.rejected).toContainEqual({ version: "1.2.3-rc.10", why: "out of range" });
+  });
+
+  // npm reads a missing segment as a wildcard: `1.2` is `>=1.2.0 <1.3.0-0`,
+  // `<=1.2` is `<1.3.0-0`, `>1` is `>=2.0.0`, `~1` is `<2.0.0-0`, `^0` is
+  // `<1.0.0-0`. The first 0.7.1 cut read each as a three-segment version and
+  // reported the wrong pick as a definite answer (`1.2` → 1.2.0, `1` →
+  // nothing). Expected values are npm semver 7.7.4's maxSatisfying and
+  // minSatisfying, without and with includePrerelease.
+  test("a partial version is an X-range, and every pick agrees with npm", () => {
+    const versions = [
+      "0.0.1",
+      "0.1.5",
+      "0.9.9",
+      "1.0.0",
+      "1.1.9",
+      "1.2.0",
+      "1.2.4",
+      "1.2.5-rc.1",
+      "1.3.0-rc.1",
+      "1.3.0",
+      "2.0.0-0",
+      "2.0.0",
+    ];
+    type Row = [string, string | null, string | null, string | null, string | null];
+    const npm: Row[] = [
+      ["1", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      ["1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      ["=1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      ["<=1.2", "1.2.4", "0.0.1", "1.2.5-rc.1", "0.0.1"],
+      [">1.2", "2.0.0", "1.3.0", "2.0.0", "1.3.0-rc.1"],
+      ["<1.2", "1.1.9", "0.0.1", "1.1.9", "0.0.1"],
+      [">=1.2", "2.0.0", "1.2.0", "2.0.0", "1.2.0"],
+      [">1", "2.0.0", "2.0.0", "2.0.0", "2.0.0-0"],
+      ["<=1", "1.3.0", "0.0.1", "1.3.0", "0.0.1"],
+      ["~1", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      ["^0", "0.9.9", "0.0.1", "0.9.9", "0.0.1"],
+      ["^0.0", "0.0.1", "0.0.1", "0.0.1", "0.0.1"],
+      ["~0", "0.9.9", "0.0.1", "0.9.9", "0.0.1"],
+      ["^0.1", "0.1.5", "0.1.5", "0.1.5", "0.1.5"],
+      ["~>1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      [">= 1.2", "2.0.0", "1.2.0", "2.0.0", "1.2.0"],
+      ["1.x", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      [">1.x", "2.0.0", "2.0.0", "2.0.0", "2.0.0-0"],
+      ["<=1.x", "1.3.0", "0.0.1", "1.3.0", "0.0.1"],
+      ["*", "2.0.0", "0.0.1", "2.0.0", "0.0.1"],
+      [">*", null, null, null, null],
+      ["1.2 || 0", "1.2.4", "0.0.1", "1.2.5-rc.1", "0.0.1"],
+    ];
+    const ours = npm.map(
+      ([range]): Row => [
+        range,
+        resolveRange(range, versions).best,
+        resolveRange(range, versions, { strategy: "lowest" }).best,
+        resolveRange(range, versions, { includePrerelease: true }).best,
+        resolveRange(range, versions, { includePrerelease: true, strategy: "lowest" }).best,
+      ],
+    );
+    expect(ours).toEqual(npm);
+    for (const [range] of npm)
+      expect({ range, u: resolveRange(range, versions).rangeUnderstood }).toEqual({
+        range,
+        u: true,
+      });
+  });
+
+  test("a valid range over versions that do not parse is understood, and says so", () => {
+    // On 0.7.0 understanding was learned from the versions, so a list with no
+    // parseable version reported "^1.0.0" as a range nobody understood.
+    const result = resolveRange("^1.0.0", ["banana"]);
+    expect(result).toMatchObject({ rangeUnderstood: true, versionsParsed: 0, best: null });
+    expect(resolveRange("workspace:*", ["banana"]).rangeUnderstood).toBe(false);
   });
 
   test("nothing satisfying is not the same as a range nobody understood", () => {
@@ -446,5 +551,26 @@ describe("listTar, against archives real tools produced", () => {
     const listing = listTar(new Uint8Array(readFileSync(join(dir, "real.tgz"))), { maxEntries: 2 });
     expect(listing.capped).toBe(true);
     expect(listing.entries).toHaveLength(2);
+  });
+});
+
+describe("jsonSyntaxProblem", () => {
+  test("keeps the parser's words and drops everything it quotes", () => {
+    const problem = (text: string): string => {
+      try {
+        JSON.parse(text);
+      } catch (err) {
+        return jsonSyntaxProblem(err);
+      }
+      return "parsed";
+    };
+    expect(["", '{"a": 1,}', "secretword"].map(problem)).toEqual([
+      "Unexpected EOF",
+      "Property name must be a string literal",
+      "Unexpected identifier",
+    ]);
+    expect(
+      jsonSyntaxProblem(new SyntaxError(`Unexpected token 's', "secretword" is not valid JSON`)),
+    ).toBe("Unexpected token 's'");
   });
 });

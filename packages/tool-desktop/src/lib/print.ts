@@ -66,10 +66,18 @@ export function planPrinterProbe(
 
 export const WINDOWS_PRINTER_LIST = registerPowerShellScript({
   name: "printer-list",
-  // DOCUMENTED, NOT RECORDED — nobody here has a Windows box. `Get-Printer`
-  // is in the PrintManagement module, present on client Windows since 8.1.
+  // DOCUMENTED, NOT RECORDED on a desktop — `Get-Printer` is in the
+  // PrintManagement module, present on client Windows since 8.1; the
+  // windows-tools CI job logs what a Windows runner prints (see
+  // windows-recording.test.ts). JSON, not prose: the 0.7.0 script printed
+  // `printer <Name> is <Status>` into the lpstat parser, whose `\S+` cut every
+  // Windows name with a space at the first one — every Windows box ships
+  // "Microsoft Print to PDF" (reliability#7). Names and statuses are cast to
+  // strings (an enum would serialise as a number), the list is forced to an
+  // array (ConvertTo-Json unwraps a one-element pipeline), and a failure goes
+  // to stderr with nothing on stdout, so it can never read as "no printers".
   script:
-    "try { Get-Printer | ForEach-Object { [Console]::Out.WriteLine('printer ' + $_.Name + ' is ' + $_.PrinterStatus) } } catch { [Console]::Error.WriteLine($_.Exception.Message) }",
+    "try { $rows = @(Get-Printer -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; status = [string]$_.PrinterStatus } }); $def = $null; try { $def = [string](Get-CimInstance -ClassName Win32_Printer -Filter 'Default=TRUE' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Name) } catch { $def = $null }; [Console]::Out.Write((ConvertTo-Json -InputObject ([pscustomobject]@{ printers = $rows; default = $def }) -Compress -Depth 3)) } catch { [Console]::Error.WriteLine($_.Exception.Message) }",
   reads: [],
 });
 
@@ -132,6 +140,56 @@ export function parseQueues(stdout: string, stderr: string): QueueFacts {
     // field null, which is correct: there is genuinely none.
   }
   return { printers, defaultPrinter, schedulerDown: false, unreadable: null };
+}
+
+/**
+ * Parse the Windows printer probe's JSON: `{"printers":[{"name","status"}],
+ * "default":<name>|null}`. Anything else — no stdout, a PowerShell error, a
+ * shape this parser does not know — is UNREADABLE, never "no printers".
+ * A name is taken whole, spaces, commas and a `\\server\queue` share
+ * included.
+ */
+export function parseWindowsQueues(stdout: string, stderr: string): QueueFacts {
+  const text = stdout.trim();
+  const why = stderr.trim();
+  const unreadable = (detail: string): QueueFacts =>
+    unreadableQueues(
+      `the Windows printer probe ${detail}${why === "" ? "" : `: ${why.slice(0, 300)}`}, so whether this host has printers is unknown — it is NOT that it has none`,
+    );
+  if (text === "") return unreadable("printed nothing");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return unreadable("did not print the JSON it was written to print");
+  }
+  if (typeof parsed !== "object" || parsed === null) return unreadable("printed an unknown shape");
+  const record = parsed as Record<string, unknown>;
+  const rawList = record["printers"];
+  // ConvertTo-Json unwraps a one-element array under some hosts; accept both.
+  const list = Array.isArray(rawList)
+    ? rawList
+    : typeof rawList === "object" && rawList !== null
+      ? [rawList]
+      : rawList === null || rawList === undefined
+        ? []
+        : undefined;
+  if (list === undefined) return unreadable("printed an unknown shape");
+  const printers: Array<{ name: string; state: string }> = [];
+  for (const row of list) {
+    if (typeof row !== "object" || row === null) return unreadable("printed an unknown row");
+    const name = (row as Record<string, unknown>)["name"];
+    const status = (row as Record<string, unknown>)["status"];
+    if (typeof name !== "string" || name === "") return unreadable("printed a row with no name");
+    printers.push({ name, state: typeof status === "string" ? status : "" });
+  }
+  const dflt = record["default"];
+  return {
+    printers,
+    defaultPrinter: typeof dflt === "string" && dflt !== "" ? dflt : null,
+    schedulerDown: false,
+    unreadable: null,
+  };
 }
 
 /** The probe could not answer. Distinct from "it answered, there are none". */

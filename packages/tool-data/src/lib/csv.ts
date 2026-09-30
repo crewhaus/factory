@@ -14,6 +14,8 @@
  * RFC 4180 does not define.
  */
 
+import { OutputLimitError, setOwn } from "./json";
+
 export type CsvParseOptions = {
   delimiter: string;
   quote: string;
@@ -38,12 +40,40 @@ export class CsvError extends Error {
   }
 }
 
+/**
+ * Why a delimiter/quote pair cannot describe a CSV file, or null when it can.
+ *
+ * One check for the reader and the writer, so neither accepts a dialect the
+ * other cannot honour. A line break cannot be the delimiter or the quote:
+ * rows are separated by line breaks, so a `\n` delimiter turns every field
+ * into a row (a writer's output read back as one header line of values and
+ * zero records), and a `\r` one splits CRLF rows into phantom columns. The
+ * quote character cannot be the delimiter, or a quoted field cannot be told
+ * from a field boundary. U+FEFF cannot be either: a reader drops it from the
+ * start of a file as a byte-order mark, so `["", "x"]` written with it as
+ * the delimiter read back as `["x"]`.
+ */
+export function csvDialectError(delimiter: string, quote: string): string | null {
+  if (delimiter.length !== 1) return "delimiter must be a single character";
+  if (quote.length !== 1) return "quote must be a single character";
+  if (delimiter === "\ufeff" || quote === "\ufeff") {
+    return "neither delimiter nor quote can be U+FEFF — a reader drops it from the start of a file as a byte-order mark";
+  }
+  if (delimiter === "\r" || delimiter === "\n") {
+    return "delimiter cannot be a line break (CR or LF) — rows are separated by line breaks";
+  }
+  if (quote === "\r" || quote === "\n") {
+    return "quote cannot be a line break (CR or LF) — rows are separated by line breaks";
+  }
+  if (delimiter === quote) return "delimiter and quote must differ";
+  return null;
+}
+
 /** Split CSV text into rows of raw string fields. Throws `CsvError` on an unterminated quote. */
 export function parseCsv(text: string, options: CsvParseOptions): CsvParseResult {
   const { delimiter, quote } = options;
-  if (delimiter.length !== 1) throw new CsvError("delimiter must be a single character", 0);
-  if (quote.length !== 1) throw new CsvError("quote must be a single character", 0);
-  if (delimiter === quote) throw new CsvError("delimiter and quote must differ", 0);
+  const dialect = csvDialectError(delimiter, quote);
+  if (dialect !== null) throw new CsvError(dialect, 0);
 
   const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const rows: string[][] = [];
@@ -170,10 +200,10 @@ export function rowsToRecords(
     header.forEach((name, j) => {
       const cell = row[j];
       if (cell === undefined) {
-        rec[name] = null;
+        setOwn(rec, name, null);
         return;
       }
-      rec[name] = infer ? inferScalar(cell, nullTokens) : cell;
+      setOwn(rec, name, infer ? inferScalar(cell, nullTokens) : cell);
     });
     records.push(rec);
   });
@@ -213,6 +243,13 @@ export type CsvWriteOptions = {
   /** Quote every field, not only the ones that need it. */
   quoteAll: boolean;
   header: string[] | null;
+  /**
+   * Throw `OutputLimitError` once the text would pass this many characters.
+   * Records with keys that differ make a column for every key and a cell for
+   * every column in every row, so the output can be rows x columns even
+   * when the input was rows + columns.
+   */
+  maxChars?: number;
 };
 
 /** Quote a single field if it contains the delimiter, a quote, or a line break. */
@@ -237,22 +274,51 @@ export function cellToString(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value);
+  // JSON.stringify answers undefined for a function or a symbol, which no
+  // JSON value is; an empty field beats a crash in the quoting step.
+  return JSON.stringify(value) ?? "";
 }
 
-/** Serialize rows of already-stringified cells. */
+/**
+ * Serialize rows of already-stringified cells. Throws `CsvError` for a
+ * dialect `parseCsv` would refuse or misread (see `csvDialectError`), so
+ * nothing is written that this package cannot read back.
+ */
 export function writeCsvRows(
-  rows: ReadonlyArray<ReadonlyArray<unknown>>,
+  rows: Iterable<ReadonlyArray<unknown>>,
   options: CsvWriteOptions,
 ): string {
+  const dialect = csvDialectError(options.delimiter, options.quote);
+  if (dialect !== null) throw new CsvError(dialect, 0);
+  const max = options.maxChars ?? Number.POSITIVE_INFINITY;
   const lines: string[] = [];
-  if (options.header !== null) {
-    lines.push(options.header.map((h) => escapeCsvField(h, options)).join(options.delimiter));
-  }
+  let chars = -options.newline.length;
+  const push = (line: string): void => {
+    chars += line.length + options.newline.length;
+    if (chars > max) throw new OutputLimitError(max, "the CSV");
+    lines.push(line);
+  };
+  const q = options.quote;
+  // Two cases a reader would otherwise misread, so both are quoted: a row
+  // whose only field is empty is a blank line, which a reader skips, and a
+  // leading U+FEFF in the file's first field is taken for a byte-order mark
+  // and dropped.
+  const encode = (cells: ReadonlyArray<string>): string => {
+    if (cells.length === 1 && cells[0] === "") return q + q;
+    return cells
+      .map((cell, i) =>
+        i === 0 && lines.length === 0 && cell.startsWith("\ufeff")
+          ? q + cell.split(q).join(q + q) + q
+          : escapeCsvField(cell, options),
+      )
+      .join(options.delimiter);
+  };
+  if (options.header !== null) push(encode(options.header));
   for (const row of rows) {
-    lines.push(
-      row.map((cell) => escapeCsvField(cellToString(cell), options)).join(options.delimiter),
-    );
+    // A row's cells are delimiter-separated at the least; checked before the
+    // row is built, so one enormous row is not built to be refused.
+    if (chars + row.length > max) throw new OutputLimitError(max, "the CSV");
+    push(encode(row.map(cellToString)));
   }
   return lines.join(options.newline);
 }

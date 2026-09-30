@@ -46,6 +46,7 @@ import {
 import { CrewhausError } from "@crewhaus/errors";
 import { buildRequestParams } from "@crewhaus/model-plan";
 import type { ModelThinking } from "@crewhaus/model-plan";
+import { resolveModel } from "@crewhaus/model-router";
 import type { JustificationJudge, JustificationVerdict } from "@crewhaus/permission-engine";
 import { z } from "zod";
 
@@ -207,4 +208,46 @@ export function createClaudeJustificationJudge(
   opts: ClaudeJustificationJudgeOptions,
 ): JustificationJudge {
   return new ClaudeJustificationJudge(opts).judge;
+}
+
+/**
+ * The judge model `security.justification.judge: claude` runs on when the
+ * spec names no `model`.
+ */
+export const DEFAULT_JUSTIFICATION_JUDGE_MODEL = "claude-haiku-4-5";
+
+/**
+ * A spec's lowered `security.justification` block (`IrSecurity["justification"]`
+ * structurally): which judge, on which model, with which pinned request params.
+ */
+export type JustificationJudgeSlot = {
+  readonly judge?: "rule-based" | "claude";
+  readonly model?: string;
+  readonly params?: ClaudeJustificationJudgeOptions["params"];
+};
+
+/**
+ * The judge a spec's `security.justification` names — the ONE construction
+ * `crewhaus run` and every compiled bundle call, so a bundle judges a
+ * justification exactly as the run path does: the same default model, the
+ * same model-router resolution (any provider the router knows, with its
+ * credentials read from the environment), the same pinned params.
+ *
+ * Returns `undefined` for `rule-based` (and for no judge at all): the caller
+ * leaves `justificationJudge` unset and runtime-core uses its rule-based
+ * default. The model resolves when this is called, so a judge whose provider
+ * has no credentials stops the start-up with the provider's own message,
+ * before any turn runs.
+ */
+export async function createJustificationJudgeFromSlot(
+  slot: JustificationJudgeSlot | undefined,
+): Promise<JustificationJudge | undefined> {
+  if (slot?.judge !== "claude") return undefined;
+  const resolution = await resolveModel(slot.model ?? DEFAULT_JUSTIFICATION_JUDGE_MODEL);
+  return createClaudeJustificationJudge({
+    adapter: resolution.adapter,
+    // The wire id: the router strips its provider prefix and endpoint.
+    model: resolution.modelId,
+    ...(slot.params !== undefined ? { params: slot.params } : {}),
+  });
 }

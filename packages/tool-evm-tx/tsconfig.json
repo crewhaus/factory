@@ -10,6 +10,7 @@
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" },
     { "path": "../chain-adapter-base" },
-    { "path": "../wallet-engine" }
+    { "path": "../wallet-engine" },
+    { "path": "../chain-adapter-evm" }
   ]
 }

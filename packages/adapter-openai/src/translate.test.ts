@@ -90,22 +90,16 @@ describe("toOpenAIChatParams", () => {
       ],
       toolChoice: { type: "tool", name: "Read" },
     });
-    // A plain object schema qualifies for Structured-Outputs strict mode:
-    // `additionalProperties: false`, every property in `required`, and the
-    // (originally optional) `path` made nullable so omission is expressible.
+    // `path` is optional, so the tool stays non-strict: strict mode would
+    // make the model send `path: null` to leave it out, and the tool's
+    // validator refuses null (provider-limits#2). The schema rides as is.
     expect(params.tools).toEqual([
       {
         type: "function",
         function: {
           name: "Read",
           description: "Read a file",
-          parameters: {
-            type: "object",
-            properties: { path: { type: ["string", "null"] } },
-            required: ["path"],
-            additionalProperties: false,
-          },
-          strict: true,
+          parameters: { type: "object", properties: { path: { type: "string" } } },
         },
       },
     ]);
@@ -130,7 +124,7 @@ describe("toOpenAIChatParams", () => {
               target: { $ref: "#/$defs/Endpoint" },
               retries: { type: "integer" },
             },
-            required: ["target"],
+            required: ["target", "retries"],
             $defs: {
               Endpoint: {
                 type: "object",
@@ -149,10 +143,11 @@ describe("toOpenAIChatParams", () => {
     expect(fn.strict).toBe(true);
     const p = fn.parameters as Record<string, unknown>;
     expect(p["additionalProperties"]).toBe(false);
-    // both properties required under strict; the optional one made nullable
     expect(new Set(p["required"] as string[])).toEqual(new Set(["target", "retries"]));
     const props = p["properties"] as Record<string, Record<string, unknown>>;
-    expect(props["retries"]?.["type"]).toEqual(["integer", "null"]);
+    expect(props["retries"]?.["type"]).toBe("integer");
+    // Nothing was made nullable: the model is never forced to send null.
+    expect(JSON.stringify(p)).not.toContain('"null"');
     // ref inlined + nested object also locked down
     const target = props["target"] as Record<string, unknown>;
     expect(target["additionalProperties"]).toBe(false);
@@ -630,5 +625,51 @@ describe("toOpenAIChatParams — temperature (NEW-HUNT-2)", () => {
   test("omits temperature entirely when the request carries none", () => {
     const params = toOpenAIChatParams(baseReq);
     expect("temperature" in params).toBe(false);
+  });
+});
+
+/**
+ * An MCP-style `$ref` DAG: each level references the next twice, so a naive
+ * inline copies the leaf 2^depth times (flag-truth-4#6).
+ */
+function dagSchema(depth: number): Record<string, unknown> {
+  const defs: Record<string, unknown> = { [`d${depth}`]: { type: "string" } };
+  for (let i = 0; i < depth; i++) {
+    defs[`d${i}`] = {
+      type: "object",
+      properties: { a: { $ref: `#/$defs/d${i + 1}` }, b: { $ref: `#/$defs/d${i + 1}` } },
+      required: ["a", "b"],
+    };
+  }
+  return {
+    type: "object",
+    properties: { root: { $ref: "#/$defs/d0" } },
+    required: ["root"],
+    $defs: defs,
+  };
+}
+
+describe("toOpenAIChatParams — a $ref DAG in a tool schema (flag-truth-4#6)", () => {
+  test("a schema too large to inline is sent as written, non-strict", () => {
+    const schema = dagSchema(16);
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [{ name: "deep", description: "deep schema", input_schema: schema }],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean; parameters?: unknown };
+    // The strict upgrade would have been a 5 MB inlined copy; the original
+    // (with its $refs) goes instead, which OpenAI resolves itself.
+    expect(fn.strict).toBeUndefined();
+    expect(fn.parameters).toBe(schema);
+    expect(JSON.stringify(params).length).toBeLessThan(10_000);
+  });
+
+  test("a DAG shallow enough to inline is still upgraded to strict", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [{ name: "shallow", description: "shallow schema", input_schema: dagSchema(3) }],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean };
+    expect(fn.strict).toBe(true);
   });
 });

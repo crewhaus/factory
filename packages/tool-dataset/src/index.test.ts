@@ -595,6 +595,30 @@ describe("DatasetInspect", () => {
     expect(result.sources).toEqual({ human_authored: 1, weird: 1, "(none)": 1 });
     expect(result.offTaxonomySources).toEqual([{ source: "weird", count: 1 }]);
   });
+
+  test("a source named like an Object.prototype member is counted like any other", async () => {
+    const sources = ["__proto__", "__proto__", "constructor", "toString", "human_authored"];
+    await ok(datasetPut, {
+      name: "qa",
+      samples: sources.map((source, i) => ({ id: `s${i}`, input: `x${i}`, metadata: { source } })),
+    });
+    const result = await ok(datasetInspect, { dataset: "qa" });
+    // 0.7.0 lost both __proto__ samples and wrote constructor's count as a
+    // string of function source, so the histogram did not sum to sampleCount.
+    // (Asserted as entries: an object literal with a __proto__ key would set
+    // the literal's prototype instead of naming a key.)
+    expect(Object.entries(result.sources).sort()).toEqual([
+      ["__proto__", 2],
+      ["constructor", 1],
+      ["human_authored", 1],
+      ["toString", 1],
+    ]);
+    const total = Object.values(result.sources as Record<string, number>).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(total).toBe(result.sampleCount);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1114,6 +1138,100 @@ describe("hostile input", () => {
       expect({ name, refused: /rejected|invalid/i.test(out) }).toEqual({ name, refused: true });
     }
     expect(existsSync(path.join(tmp, REGISTRY))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.7.1 — every path under the registry root is contained, not only the root
+// (security-6#7, flag-truth-3#3). Each case checks the OUTSIDE directory
+// afterwards, not only the result.
+// ---------------------------------------------------------------------------
+
+describe("paths under the registry root", () => {
+  const SENTINEL = "SENTINEL_OUTSIDE_SAMPLE";
+  let outside: string;
+  beforeEach(() => {
+    outside = mkdtempSync(path.join(tmpdir(), "crewhaus-dataset-outside-"));
+    mkdirSync(path.join(tmp, REGISTRY), { recursive: true });
+  });
+  afterEach(() => rmSync(outside, { recursive: true, force: true }));
+
+  /** A record the registry would have written, holding the sentinel sample. */
+  function outsideRecord(file: string): void {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        name: "evil",
+        version: "v1",
+        splits: { train: [{ id: SENTINEL, input: "x" }], dev: [] },
+        sampleHashes: { train: ["h"], dev: [] },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+  }
+
+  test("DatasetPut does not write through a dataset directory linked out", async () => {
+    symlinkSync(outside, path.join(tmp, REGISTRY, "evil"));
+    const out = await call(datasetPut, {
+      name: "evil",
+      samples: [{ id: "s1", input: "hi" }],
+      split: "train",
+    });
+    expect(out).not.toContain('"wrote":true');
+    expect(out).toMatch(/outside the workspace/);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("DatasetInspect and DatasetLint do not read an outside dataset directory", async () => {
+    outsideRecord(path.join(outside, "v1.json"));
+    symlinkSync(outside, path.join(tmp, REGISTRY, "evil"));
+    for (const [tool, input] of [
+      [datasetInspect, { dataset: "evil", includeSampleIds: true }],
+      [datasetLint, { dataset: "evil" }],
+    ] as const) {
+      const out = await call(tool, input);
+      expect({ tool: tool.name, leaked: out.includes(SENTINEL) }).toEqual({
+        tool: tool.name,
+        leaked: false,
+      });
+      expect(out).toMatch(/outside the workspace/);
+    }
+    // The sweep names it as refused rather than listing its versions.
+    const all = await ok(datasetInspect, {});
+    expect(all.datasets).toEqual([expect.objectContaining({ name: "evil", status: "refused" })]);
+  });
+
+  test("a version file linked out of a real dataset directory is not read", async () => {
+    outsideRecord(path.join(outside, "rec.json"));
+    mkdirSync(path.join(tmp, REGISTRY, "real"));
+    symlinkSync(path.join(outside, "rec.json"), path.join(tmp, REGISTRY, "real", "v1.json"));
+    const out = await call(datasetInspect, { dataset: "real@v1", includeSampleIds: true });
+    expect(out).not.toContain(SENTINEL);
+    expect(out).toMatch(/outside the workspace/);
+  });
+
+  test("a dataset linked to another place INSIDE the workspace still puts and inspects", async () => {
+    mkdirSync(path.join(tmp, "shared", "golden"), { recursive: true });
+    symlinkSync(path.join("..", "..", "shared", "golden"), path.join(tmp, REGISTRY, "golden"));
+    const put = await ok(datasetPut, {
+      name: "golden",
+      samples: [{ id: "s1", input: "hi" }],
+      split: "train",
+    });
+    expect(put.wrote).toBe(true);
+    expect(readdirSync(path.join(tmp, "shared", "golden"))).toEqual(["v1.json"]);
+    const inspected = await ok(datasetInspect, { dataset: "golden" });
+    expect(inspected.version).toBe("v1");
+  });
+
+  test("a plain put still writes <root>/<name>/v1.json", async () => {
+    const put = await ok(datasetPut, {
+      name: "ok",
+      samples: [{ id: "s1", input: "hi" }],
+      split: "train",
+    });
+    expect(put.wrote).toBe(true);
+    expect(versionFiles("ok")).toEqual(["v1.json"]);
   });
 });
 

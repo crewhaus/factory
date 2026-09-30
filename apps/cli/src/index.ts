@@ -25,7 +25,14 @@ import {
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
 // registry/audit types for its signature.
 import type { AuditLog } from "@crewhaus/audit-log";
-import { SpecParseError, compile, lower } from "@crewhaus/compiler";
+import {
+  type IrNode,
+  SpecParseError,
+  checkShapeTools,
+  compile,
+  lower,
+  toolSitesOf,
+} from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
   type CapabilityRequirement,
@@ -250,7 +257,7 @@ import {
   parseEvalRoutingMode,
   resolveJudgeModelRef,
   resolveRegistryGrader,
-  runEval as runEvalLib,
+  runEval as runEvalCore,
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
@@ -303,8 +310,10 @@ import {
   existingSettingsRules,
   formatSettingsDiff,
   formatSuggestionLines,
+  isArgScoped,
   rankSuggestions,
   readOnlyByName,
+  suggestLookupFromTools,
 } from "@crewhaus/harness-advice/permissions-suggest";
 // 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
 // the primary's routeKey; these read the candidate side apart from the
@@ -410,6 +419,7 @@ import {
   type JustificationJudge,
   PermissionConfigError,
   type PermissionMode,
+  type PermissionRule,
   type RuleSet,
   appendSettingsRule,
   parsePermissionsConfig,
@@ -418,7 +428,7 @@ import {
 // Item 3 (G32) — plugin activation. `crewhaus run` activates the spec's
 // `plugins:` (and the `--plugins` override) in-process exactly like a compiled
 // bundle's boot (`renderPlugins` in @crewhaus/target-cli).
-import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";
+import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
@@ -430,6 +440,7 @@ import {
   resolveSessionRootDir,
   runChatLoop,
 } from "@crewhaus/runtime-core";
+import { resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import {
   type PendingApproval,
   type PendingApprovalStore,
@@ -463,9 +474,21 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 // `crewhaus templates list/search` fall back to when no --registry / env is set.
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
-import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
-import { CATEGORIES, categoriesForTool, toolsInCategory } from "@crewhaus/tool-categories";
+import { type RegisteredTool, ToolCatalog, mcpToolName } from "@crewhaus/tool-catalog";
+import {
+  BUILTIN_TOOLS,
+  CATEGORIES,
+  LOOP_TOOL_NAMES,
+  type SpecChainBlocks,
+  ToolCategoryError,
+  type ToolShape,
+  builtinToolsFor,
+  categoriesForTool,
+  registerToolConfigs,
+  toolsInCategory,
+} from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
+import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // "Watch me" (design/watch-me.md §2) — the durable per-harness digest store,
@@ -620,6 +643,9 @@ import {
 // argv switch on import). The block's exit-rating half lives in the RUNTIME
 // (@crewhaus/runtime-core's exit-rating module) so compiled bundles get it too.
 import { DISTILL_STATE_RELPATH, maybeAutoDistill } from "./autodistill";
+// 0.7.1 — the oldest supported Bun and doctor's check of it, in a module the
+// floor guard (scripts/bun-floor.test.ts) can import.
+import { checkBunVersion } from "./bun-floor";
 // Local-bundle dependency manifest: `compile` writes the same synthesized
 // pin-to-CLI-version package.json that `--check` installs against, so the
 // documented standalone flow (`bun install` + `bun agent.ts` in the out-dir)
@@ -684,6 +710,7 @@ import {
   isCloudDeployTargetShape,
   resolveCloudDeployAppName,
 } from "./cloud-deploy";
+import { INFORMATIONAL_COMPILE_WARNING_CODES, wrapCodes } from "./compile-warnings";
 // Item 34 — scheduling ergonomics for `compliance evidence` (--period current
 // resolution + the empty-evidence gate), side-effect-free for the same reason.
 import { findEmptyControls, resolvePeriodFlag } from "./compliance-schedule";
@@ -1057,12 +1084,11 @@ import {
 // modules so this entry file stays testable.
 import {
   type LintResult,
+  applyLintFixes,
   formatLintJson,
   formatLintText,
-  nearestToolName,
+  permissionRuleWarnings,
   runLint,
-  suggestSafeName,
-  suggestSecretFix,
 } from "./lint";
 // Item 68 — `crewhaus loadtest`: concurrency benchmark + deploy gate for daemon
 // shapes. The runner drives an injected LoadDriver; side-effect-free (this entry
@@ -1119,7 +1145,9 @@ import {
   defaultTemplateWorkspaceDir,
   formatOutdated,
   formatPluginList,
+  installLocationNotice,
   installedVersions,
+  resolveInstallTrustAnchors,
   resolveRegistryRef as resolveMarketplaceRegistryRef,
 } from "./marketplace-cli";
 // Item 38 — `crewhaus mcp doctor` core: per-server health scoring, listTools
@@ -1210,6 +1238,7 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
+import { guardsOverridden, overrideNote } from "./permissions-override";
 // AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
 // redaction-history aggregation → false-positive over-redaction candidates +
 // coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
@@ -1505,6 +1534,7 @@ import {
 // v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
 // through the spec's synthesized/user-declared thredz MCP server).
 import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
+import { importToolPackage, loadBuiltinTools } from "./tool-packages";
 // Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
 // ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -1515,13 +1545,18 @@ import {
   buildToolDetail,
   buildToolList,
   buildToolUsage,
+  exactToolKey,
   formatAuditLines,
   formatCategoryLines,
+  formatRuleScopeLines,
   formatSearchLines,
   formatSuggestLines,
   formatToolDetailLines,
   formatToolListLines,
+  literalToolKeys,
   nearestToolKeys,
+  resolveToolKey,
+  ruleScopeFor,
   searchTools,
   suggestTools,
 } from "./tools-cli";
@@ -1867,10 +1902,28 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "    crewhaus: warning[<code>] <path>: <message>\n" +
         "  Codes today: accepted-but-unwired (a spec key a shape ACCEPTS but\n" +
         "  whose emitter does not wire yet — legal-but-inert config),\n" +
-        "  edge-unsafe-tool (a custom tool whose edge-safety the cf-worker\n" +
-        "  flavour cannot verify offline), channel-reactions-join\n" +
+        "  edge-unsafe-tool (a tool the cf-worker flavour leaves out: a\n" +
+        "  builtin the edge does not run, or a custom tool it cannot verify),\n" +
+        "  tool-unwired (a builtin that compiles but that nothing binds, so\n" +
+        "  every call fails), tool-config-unused (a tool_config block no listed\n" +
+        "  tool reads, so the setting is not in force), sub-agent-tool-ungranted\n" +
+        "  (a sub-agent lists a builtin its parent never registers),\n" +
+        "  provider-tool-cap (informational — a fallback, tier or pool model\n" +
+        "  whose provider refuses that many tools on one request: OpenAI,\n" +
+        "  Azure OpenAI and Groq take 128, Gemini 512; when no model can take\n" +
+        "  them it is an error), provider-tool-cap-unverified (informational —\n" +
+        "  an openai/ model over OpenAI's 128; OPENAI_BASE_URL may send it to a\n" +
+        "  server that takes more, and the run checks at start),\n" +
+        "  permission-rule (a rule that can never fire: a misspelled tool\n" +
+        "  name, or a deny or ask below an allow that always matches first —\n" +
+        "  rules are read top to bottom), permission-rule-note (informational —\n" +
+        "  the same finding where it is not a defect, such as a glob that\n" +
+        "  still reaches a declared MCP server's tools, or plan mode),\n" +
+        "  channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
-        "  only once the outbound-ts join file accumulates), and the 0.6.0\n" +
+        "  only once the outbound-ts join file accumulates),\n" +
+        "  channel-plugins-at-start (informational — a channel daemon skips a\n" +
+        "  plugin it cannot load, with a warning), and the 0.6.0\n" +
         "  model-plan-* / model-sunset / model-capabilities-unknown /\n" +
         "  model-strongest-crosses-provider notices (a `models:` profile\n" +
         "  field the shape or the slot does not serve — model-plan-\n" +
@@ -1878,13 +1931,13 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  or a model fact worth knowing).\n" +
         "  --strict   Escalate compile warnings to errors: any remediable\n" +
         "             warning fails the compile (exit 1) before files are\n" +
-        "             written. Informational codes (channel-reactions-join,\n" +
-        "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
-        "             model-capabilities-unknown, model-sunset,\n" +
-        "             model-strongest-crosses-provider) still print but\n" +
-        "             never fail --strict. (The FR-002 scope\n" +
-        "             gate is on by default regardless of this flag;\n" +
-        "             --allow-unmarked-sinks is its only opt-out.)\n",
+        "             written. Informational codes still print but never fail\n" +
+        "             --strict:\n",
+    );
+    process.stdout.write(wrapCodes(INFORMATIONAL_COMPILE_WARNING_CODES, "               "));
+    process.stdout.write(
+      "             (The FR-002 scope gate is on by default regardless\n" +
+        "             of this flag; --allow-unmarked-sinks is its only opt-out.)\n",
     );
     return;
   }
@@ -2065,7 +2118,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
     try {
       const cfIr = lower(parseSpec(yamlText));
-      bundle = { files: emitCfWorkerBundle(cfIr, { readme }).files, warnings: [] };
+      // Warnings ride along like compile()'s: printed below, and escalated by
+      // --strict before any file is written.
+      bundle = emitCfWorkerBundle(cfIr, { readme });
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
@@ -2099,40 +2154,16 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // `wrote …` stream). With --strict any REMEDIABLE warning fails the
   // compile HERE — before any file is written, so a strict-failed build
   // emits nothing.
-  for (const warning of bundle.warnings) {
+  // 0.7.1 (permission-integration#12) — permission rules that can never do
+  // what they say, the same check `crewhaus lint` runs. Remediable, so
+  // --strict fails on them like any other compile warning.
+  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText, loadToolMap))];
+  for (const warning of warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
-  // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
-  // wired, correctly configured feature (the outbound-ts join file just has
-  // to accumulate at runtime), so no spec edit can ever clear it. Escalating
-  // it would make --strict permanently unusable for every reactions-enabled
-  // channel spec; it still prints above, but only remediable codes
-  // (accepted-but-unwired, edge-unsafe-tool) escalate.
-  //
-  // Item 1 — cli-autodistill-toolchain is informational for the same reason:
-  // `feedback.autoDistill` is honoured by `crewhaus run`, so the only "fix"
-  // would be deleting a working spec key. The heads-up says which half of the
-  // block a compiled bundle carries; it must never fail a strict compile.
-  //
-  // 0.6.0 — four model-plan codes are informational for the same reason:
-  // model-plan-candidate-only fires on a `models:` profile field that a
-  // model_pool CANDIDATE serves and a single-model slot does not (§4.2), so
-  // the spec is legal and the "fix" — moving the profile into a pool — is a
-  // topology change, not a defect repair; model-capabilities-unknown fires on
-  // any model the offline table does not know (a local / new model is not a spec defect);
-  // model-strongest-crosses-provider is a heads-up about a second credential,
-  // not a defect; and model-sunset is a wall-clock notice that would make a
-  // 0.5.x pool that compiled under --strict yesterday fail today (past
-  // `retiresOn` a `models:` profile is already a hard error at lower time).
-  const INFORMATIONAL_WARNING_CODES = new Set([
-    "channel-reactions-join",
-    "cli-autodistill-toolchain",
-    "model-plan-candidate-only",
-    "model-capabilities-unknown",
-    "model-strongest-crosses-provider",
-    "model-sunset",
-  ]);
-  const escalatedWarnings = bundle.warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
+  // Which codes never fail --strict, and why: compile-warnings.ts.
+  const INFORMATIONAL_WARNING_CODES = new Set<string>(INFORMATIONAL_COMPILE_WARNING_CODES);
+  const escalatedWarnings = warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
   if (strictWarnings && escalatedWarnings.length > 0) {
     die(
       `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
@@ -2288,26 +2319,24 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Item 41 — the tool-name resolver shared by `lint` and its `--fix` nearest-
- * match. Returns a `(name) => RegisteredTool | undefined` that resolves BOTH
- * the camelCase spec key (`webSearch`) and the registered PascalCase name
- * (`WebSearch`, used in sub-agent `tools:`), matching the strict-scope gate.
- * The camelCase keys + PascalCase names are also returned as the legal-name
- * candidate set for nearest-match typo suggestions.
+ * Item 41 — the tool-name resolver shared by `lint` (its scope audit) and the
+ * `--fix` capability signal. Returns a `(name) => RegisteredTool | undefined`
+ * that resolves BOTH the camelCase spec key (`webSearch`) and the registered
+ * PascalCase name (`WebSearch`, the spelling session logs and permission
+ * rules use), matching the strict-scope gate. The `--fix` candidates come
+ * from the spec's shape instead (see `applyLintFixes`).
  */
 async function buildToolResolver(): Promise<{
   resolve: (name: string) => RegisteredTool | undefined;
-  candidates: string[];
 }> {
   const toolMap = await loadToolMap();
-  const byRegisteredName: Record<string, RegisteredTool> = {};
-  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  const candidates = [
-    ...new Set([...Object.keys(toolMap), ...Object.keys(byRegisteredName)]),
-  ].sort();
+  // The spec key or the registered name, exactly, and own keys only:
+  // `constructor` is no tool, so lint treats it as the unknown name it is.
   return {
-    resolve: (name) => toolMap[name] ?? byRegisteredName[name],
-    candidates,
+    resolve: (name) => {
+      const key = exactToolKey(name, toolMap);
+      return key === undefined ? undefined : toolMap[key];
+    },
   };
 }
 
@@ -2316,9 +2345,9 @@ async function buildToolResolver(): Promise<{
  * pipeline (`runLint`: parse + ir-passes collect-all + scope audit) over the
  * cwd (or a named) spec WITHOUT emitting, so the §47 chain / graph-crew
  * well-formedness checks that the CLI compile path skips surface for authors.
- * `--fix` applies mechanical corrections (unknown tool → nearest match, `$SECRET`
- * typo → `$UPPER_SNAKE_CASE`, unsafe name → sanitised) then re-lints. Exit 1 on
- * any error finding.
+ * `--fix` applies mechanical corrections (`applyLintFixes`: a tools: list typo
+ * → nearest match, a credential compile rejects → `$UPPER_SNAKE_CASE`, an
+ * unsafe name → sanitised) then re-lints. Exit 1 on any error finding.
  */
 async function runLintCommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
@@ -2330,8 +2359,10 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
         "  --format json   structured {message,path,severity,rule} findings for editors/CI.\n" +
         "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
         "                  independently (collect-all) so one violation doesn't hide others.\n" +
-        "  --fix           apply mechanical fixes: unknown tool name → nearest match,\n" +
-        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n" +
+        "  --fix           apply mechanical fixes: a tools: list typo → nearest match,\n" +
+        "                  a credential compile rejects ($slack_token) → $UPPER_SNAKE_CASE,\n" +
+        "                  an unsafe name → sanitised. Only those fields change; text\n" +
+        "                  such as instructions and a $profile reference stay as written.\n" +
         "                  A typo equidistant from tools of DIFFERENT capability (e.g.\n" +
         "                  read-only vs mutating) is printed as a suggestion instead of\n" +
         "                  auto-applied.\n",
@@ -2353,21 +2384,19 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
 
-  const { resolve: resolveTool, candidates } = await buildToolResolver();
+  const { resolve: resolveTool } = await buildToolResolver();
 
   if (args.flags["fix"] === true) {
-    const {
-      text: fixedYaml,
-      applied,
-      suggested,
-    } = applyLintFixes(yamlText, candidates, resolveTool);
+    const { text: fixedYaml, applied, suggested, skipped } = applyLintFixes(yamlText, resolveTool);
     if (applied.length > 0) {
       writeFileSync(absSpec, fixedYaml);
       for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
       yamlText = fixedYaml;
     }
     for (const line of suggested) process.stdout.write(`suggestion: ${line}\n`);
-    if (applied.length === 0 && suggested.length === 0) {
+    if (skipped !== undefined) {
+      process.stdout.write(`lint --fix: skipped — ${skipped}.\n`);
+    } else if (applied.length === 0 && suggested.length === 0) {
       process.stdout.write("lint --fix: no mechanical fixes applicable.\n");
     }
   }
@@ -2375,88 +2404,6 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
   const result = runLint(yamlText, resolveTool);
   process.stdout.write(format === "json" ? formatLintJson(result) : formatLintText(result));
   process.exit(result.ok ? 0 : 1);
-}
-
-/**
- * Item 41 — apply `lint --fix`'s mechanical corrections to a spec's YAML by
- * scanning the raw text for the three fixable classes and rewriting the token
- * in place. Text-level (not spec-patch) because two of the three classes —
- * an unsafe `name:` and a mistyped tool in a `tools:` list — must be fixed
- * BEFORE the spec can parse, and spec-patch requires a parseable document.
- * Returns the rewritten text + a description of each applied fix.
- *
- * `resolveTool` (same resolver `buildToolResolver` returns) supplies the
- * read-only/mutating capability signal `nearestToolName` uses to detect a
- * cross-capability typo — e.g. `Reit` is Levenshtein-2 from BOTH `Read`
- * (read-only) and `Edit` (mutating). Such a typo is NOT auto-applied (the
- * line is left untouched); it is instead returned in `suggested` as a
- * printed "did you mean X or Y?" line so the author picks, rather than the
- * fixer silently rewriting to whichever tie-break happened to win.
- */
-function applyLintFixes(
-  yamlText: string,
-  toolCandidates: readonly string[],
-  resolveTool: (name: string) => RegisteredTool | undefined,
-): { text: string; applied: string[]; suggested: string[] } {
-  const applied: string[] = [];
-  const suggested: string[] = [];
-  const getReadOnly = (candidateName: string): boolean | undefined =>
-    resolveTool(candidateName)?.readOnly;
-  const lines = yamlText.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) continue;
-
-    // Unsafe `name:` value → sanitised.
-    const nameMatch = /^(\s*name:\s*)(.+?)(\s*)$/.exec(line);
-    if (nameMatch?.[2] !== undefined) {
-      const raw = stripQuotes(nameMatch[2]);
-      const safe = suggestSafeName(raw);
-      if (safe !== undefined) {
-        lines[i] = `${nameMatch[1]}${safe}`;
-        applied.push(`name "${raw}" → "${safe}" (unsafe characters)`);
-        continue;
-      }
-    }
-
-    // A `- toolName` list item that is an unknown tool near a legal name.
-    const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
-    if (toolMatch?.[2] !== undefined) {
-      const nearest = nearestToolName(toolMatch[2], toolCandidates, undefined, getReadOnly);
-      if (nearest?.kind === "match") {
-        lines[i] = `${toolMatch[1]}${nearest.name}`;
-        applied.push(`tool "${toolMatch[2]}" → "${nearest.name}" (nearest match)`);
-        continue;
-      }
-      if (nearest?.kind === "ambiguous") {
-        const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
-        suggested.push(
-          `tool "${toolMatch[2]}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
-        );
-        continue;
-      }
-    }
-
-    // A credential value that looks like a malformed env ref → $UPPER_SNAKE_CASE.
-    const secretMatch = /^(\s*\w+:\s*)(\$\S+)(\s*)$/.exec(line);
-    if (secretMatch?.[2] !== undefined) {
-      const fixed = suggestSecretFix(stripQuotes(secretMatch[2]));
-      if (fixed !== undefined) {
-        lines[i] = `${secretMatch[1]}${fixed}`;
-        applied.push(`secret "${secretMatch[2]}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
-      }
-    }
-  }
-  return { text: lines.join("\n"), applied, suggested };
-}
-
-/** Strip a single pair of surrounding single/double quotes from a scalar. */
-function stripQuotes(s: string): string {
-  const t = s.trim();
-  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
-    return t.slice(1, -1);
-  }
-  return t;
 }
 
 /**
@@ -3610,835 +3557,84 @@ async function detectDefaultModel(): Promise<string | undefined> {
 
 /**
  * Built-in tool name → RegisteredTool, populated lazily so that subcommands
- * which don't need tools (init, doctor) don't pay the import cost. Mirror of
- * `BUILTIN_TOOL_MAP` in packages/target-cli/src/index.ts — keep them in sync.
+ * which don't need tools (init, doctor) don't pay the import cost. The key
+ * set is every builtin the cli shape compiles — the same set
+ * `BUILTIN_TOOL_MAP` projects — read from the one builtin table in
+ * `@crewhaus/tool-categories`, so a spec that compiles also runs.
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [
-    fs,
-    bash,
-    todo,
-    web,
-    image,
-    fetchPkg,
-    imageGen,
-    docIngest,
-    codegraph,
-    codeExec,
-    text,
-    data,
-    encode,
-    datetime,
-    schema,
-    git,
-    fsx,
-    proc,
-    http,
-    state,
-    crewhaus,
-    code,
-    codehost,
-    sql,
-    docs,
-    secure,
-    math,
-    notify,
-    obs,
-    media,
-    flow,
-    pkg,
-    money,
-    onchain,
-    html,
-    verify,
-    table,
-    changeset,
-    buildperf,
-    registry,
-    supplychain,
-    containers,
-    chainread,
-    chaincall,
-    token,
-    defi,
-    ledger,
-    einvoice,
-    kyc,
-    objectstore,
-    host,
-    secrets,
-    hostfs,
-    cron,
-    distribution,
-    pkgmgr,
-    desktop,
-    specops,
-    evalops,
-    dataset,
-    approvals,
-    lifecycle,
-    fleet,
-    deploy,
-    routing,
-    discovery,
-    capability,
-  ] = await Promise.all([
-    import("@crewhaus/tool-fs"),
-    import("@crewhaus/tool-bash"),
-    import("@crewhaus/tool-todo"),
-    import("@crewhaus/tool-web"),
-    import("@crewhaus/tool-image"),
-    import("@crewhaus/tool-fetch"),
-    import("@crewhaus/tool-image-generation"),
-    import("@crewhaus/tool-document-ingest"),
-    import("@crewhaus/tool-codegraph"),
-    import("@crewhaus/tool-code-execution"),
-    import("@crewhaus/tool-text"),
-    import("@crewhaus/tool-data"),
-    import("@crewhaus/tool-encode"),
-    import("@crewhaus/tool-datetime"),
-    import("@crewhaus/tool-schema"),
-    import("@crewhaus/tool-git"),
-    import("@crewhaus/tool-fsx"),
-    import("@crewhaus/tool-proc"),
-    import("@crewhaus/tool-http"),
-    import("@crewhaus/tool-state"),
-    import("@crewhaus/tool-crewhaus"),
-    import("@crewhaus/tool-code"),
-    import("@crewhaus/tool-codehost"),
-    import("@crewhaus/tool-sql"),
-    import("@crewhaus/tool-docs"),
-    import("@crewhaus/tool-secure"),
-    import("@crewhaus/tool-math"),
-    import("@crewhaus/tool-notify"),
-    import("@crewhaus/tool-obs"),
-    import("@crewhaus/tool-media"),
-    import("@crewhaus/tool-flow"),
-    import("@crewhaus/tool-pkg"),
-    import("@crewhaus/tool-money"),
-    import("@crewhaus/tool-onchain"),
-    import("@crewhaus/tool-html"),
-    import("@crewhaus/tool-verify"),
-    import("@crewhaus/tool-table"),
-    import("@crewhaus/tool-changeset"),
-    import("@crewhaus/tool-buildperf"),
-    import("@crewhaus/tool-registry"),
-    import("@crewhaus/tool-supplychain"),
-    import("@crewhaus/tool-containers"),
-    import("@crewhaus/tool-chainread"),
-    import("@crewhaus/tool-chaincall"),
-    import("@crewhaus/tool-token"),
-    import("@crewhaus/tool-defi"),
-    import("@crewhaus/tool-ledger"),
-    import("@crewhaus/tool-einvoice"),
-    import("@crewhaus/tool-kyc"),
-    import("@crewhaus/tool-objectstore"),
-    import("@crewhaus/tool-host"),
-    import("@crewhaus/tool-secrets"),
-    import("@crewhaus/tool-hostfs"),
-    import("@crewhaus/tool-cron"),
-    import("@crewhaus/tool-distribution"),
-    import("@crewhaus/tool-pkgmgr"),
-    import("@crewhaus/tool-desktop"),
-    import("@crewhaus/tool-specops"),
-    import("@crewhaus/tool-evalops"),
-    import("@crewhaus/tool-dataset"),
-    import("@crewhaus/tool-approvals"),
-    import("@crewhaus/tool-lifecycle"),
-    import("@crewhaus/tool-fleet"),
-    import("@crewhaus/tool-deploy"),
-    import("@crewhaus/tool-routing"),
-    import("@crewhaus/tool-discovery"),
-    import("@crewhaus/tool-capability"),
-  ]);
-  const map: Record<string, RegisteredTool> = {
-    read: fs.read,
-    write: fs.write,
-    edit: fs.edit,
-    glob: fs.glob,
-    grep: fs.grep,
-    bash: bash.bash,
-    bashOutput: bash.bashOutput,
-    killShell: bash.killShell,
-    todoWrite: todo.todoWrite,
-    webFetch: web.webFetch,
-    webSearch: web.webSearch,
-    readImage: image.readImage,
-    fetch: fetchPkg.fetch,
-    // Section 18 — sandboxed code execution. These MUST be resolvable at
-    // `crewhaus run` time: `BUILTIN_TOOL_MAP` in target-cli lets a spec's
-    // `tools: [python]` COMPILE, so omitting them here made a compilable CLI
-    // spec crash at run with "unknown tool". The two maps are kept in sync
-    // (guarded by tools-cli's map-sync test).
-    python: codeExec.python,
-    javascript: codeExec.javascript,
-    shell: codeExec.shell,
-    imageGenerate: imageGen.imageGenerate,
-    ingestDocument: docIngest.ingestDocument,
-    // Pillar 2 — AST-aware code intelligence (recipe 54).
-    codegraphSearch: codegraph.codegraphSearch,
-    codegraphCallers: codegraph.codegraphCallers,
-    codegraphCallees: codegraph.codegraphCallees,
-    codegraphImpact: codegraph.codegraphImpact,
-    // @crewhaus/tool-capability
-    toolRegistry: capability.toolRegistry,
-    // @crewhaus/tool-verify
-    seoLint: verify.seoLint,
-    // @crewhaus/tool-chainread
-    onchainTransactionsSync: chainread.onchainTransactionsSync,
-    // @crewhaus/tool-flow
-    leadAssign: flow.leadAssign,
-    sequenceRun: flow.sequenceRun,
-    // @crewhaus/tool-datetime
-    localTime: datetime.localTime,
-    // @crewhaus/tool-obs
-    emitTraceEvent: obs.emitTraceEvent,
-    // @crewhaus/tool-notify
-    emailSendPreflight: notify.emailSendPreflight,
-    deliverabilityCheck: notify.deliverabilityCheck,
-    // @crewhaus/tool-state
-    vectorDelete: state.vectorDelete,
-    // @crewhaus/tool-verify
-    factCrossCheck: verify.factCrossCheck,
-    // @crewhaus/tool-discovery
-    marketplaceSearch: discovery.marketplaceSearch,
-    federationDiscover: discovery.federationDiscover,
-    // @crewhaus/tool-routing
-    routeControl: routing.routeControl,
-    experimentLedger: routing.experimentLedger,
-    flywheelStatus: routing.flywheelStatus,
-    watchmeReport: routing.watchmeReport,
-    // @crewhaus/tool-deploy
-    specPin: deploy.specPin,
-    deployRollback: deploy.deployRollback,
-    deployInspect: deploy.deployInspect,
-    // @crewhaus/tool-fleet
-    harnessRegister: fleet.harnessRegister,
-    harnessJobStatus: fleet.harnessJobStatus,
-    compileBundle: fleet.compileBundle,
-    cliVersionPin: fleet.cliVersionPin,
-    hooksManage: fleet.hooksManage,
-    // @crewhaus/tool-lifecycle
-    harnessRetire: lifecycle.harnessRetire,
-    storeMigrate: lifecycle.storeMigrate,
-    retentionEnforce: lifecycle.retentionEnforce,
-    knowledgeSync: lifecycle.knowledgeSync,
-    // @crewhaus/tool-approvals
-    approvalStatus: approvals.approvalStatus,
-    approvalsInbox: approvals.approvalsInbox,
-    permissionsSuggest: approvals.permissionsSuggest,
-    // @crewhaus/tool-dataset
-    datasetPut: dataset.datasetPut,
-    datasetInspect: dataset.datasetInspect,
-    datasetLint: dataset.datasetLint,
-    datasetMine: dataset.datasetMine,
-    // @crewhaus/tool-evalops
-    evalHistory: evalops.evalHistory,
-    evalAggregate: evalops.evalAggregate,
-    evalBaselinePin: evalops.evalBaselinePin,
-    evalCoverage: evalops.evalCoverage,
-    graderMetaTest: evalops.graderMetaTest,
-    // @crewhaus/tool-specops
-    specPatchApply: specops.specPatchApply,
-    specUpgrade: specops.specUpgrade,
-    specAdvise: specops.specAdvise,
-    doctorFix: specops.doctorFix,
-    // @crewhaus/tool-desktop
-    clipboardRead: desktop.clipboardRead,
-    clipboardWrite: desktop.clipboardWrite,
-    desktopNotify: desktop.desktopNotify,
-    openExternal: desktop.openExternal,
-    printDocument: desktop.printDocument,
-    windowList: desktop.windowList,
-    userPresence: desktop.userPresence,
-    powerAssertion: desktop.powerAssertion,
-    // @crewhaus/tool-pkgmgr
-    packageQuery: pkgmgr.packageQuery,
-    packageInstall: pkgmgr.packageInstall,
-    // @crewhaus/tool-distribution
-    packageManifestGenerate: distribution.packageManifestGenerate,
-    packageManifestVerify: distribution.packageManifestVerify,
-    // @crewhaus/tool-cron
-    cronList: cron.cronList,
-    cronDelete: cron.cronDelete,
-    // @crewhaus/tool-hostfs
-    watchPath: hostfs.watchPath,
-    trashPath: hostfs.trashPath,
-    osIndexSearch: hostfs.osIndexSearch,
-    // @crewhaus/tool-secrets
-    secretLookup: secrets.secretLookup,
-    envFileUpsert: secrets.envFileUpsert,
-    secretRotate: secrets.secretRotate,
-    // @crewhaus/tool-host
-    systemInfo: host.systemInfo,
-    networkInfo: host.networkInfo,
-    portInspect: host.portInspect,
-    // @crewhaus/tool-objectstore
-    objectPresign: objectstore.objectPresign,
-    // @crewhaus/tool-kyc
-    vatIdValidate: kyc.vatIdValidate,
-    entityRegistryLookup: kyc.entityRegistryLookup,
-    sanctionsScreen: kyc.sanctionsScreen,
-    // @crewhaus/tool-einvoice
-    eInvoiceBuild: einvoice.eInvoiceBuild,
-    eInvoiceParse: einvoice.eInvoiceParse,
-    paymentFileBuild: einvoice.paymentFileBuild,
-    // @crewhaus/tool-ledger
-    ledgerPost: ledger.ledgerPost,
-    ledgerQuery: ledger.ledgerQuery,
-    ledgerReconcile: ledger.ledgerReconcile,
-    invoiceRender: ledger.invoiceRender,
-    // @crewhaus/tool-defi
-    priceQuote: defi.priceQuote,
-    oraclePriceRead: defi.oraclePriceRead,
-    defiPositionRead: defi.defiPositionRead,
-    portfolioValuation: defi.portfolioValuation,
-    // @crewhaus/tool-token
-    tokenResolve: token.tokenResolve,
-    erc20Balance: token.erc20Balance,
-    erc721TokenInfo: token.erc721TokenInfo,
-    // @crewhaus/tool-chaincall
-    evmMulticall: chaincall.evmMulticall,
-    contractInspect: chaincall.contractInspect,
-    evmSimulateBundle: chaincall.evmSimulateBundle,
-    gasMarketRead: chaincall.gasMarketRead,
-    // @crewhaus/tool-chainread
-    evmGetBlock: chainread.evmGetBlock,
-    evmBlockAtTimestamp: chainread.evmBlockAtTimestamp,
-    evmRpcHealth: chainread.evmRpcHealth,
-    evmNonceStatus: chainread.evmNonceStatus,
-    evmWaitForReceipt: chainread.evmWaitForReceipt,
-    evmTransactionSummary: chainread.evmTransactionSummary,
-    evmEventScan: chainread.evmEventScan,
-    // @crewhaus/tool-table
-    dataDriftCheck: table.dataDriftCheck,
-    // @crewhaus/tool-containers
-    containerImageInspect: containers.containerImageInspect,
-    containerImageTags: containers.containerImageTags,
-    // @crewhaus/tool-supplychain
-    dependencyAudit: supplychain.dependencyAudit,
-    ciWorkflowAudit: supplychain.ciWorkflowAudit,
-    // @crewhaus/tool-registry
-    registryPackageInfo: registry.registryPackageInfo,
-    registrySearch: registry.registrySearch,
-    registryOutdated: registry.registryOutdated,
-    manifestDependencySet: registry.manifestDependencySet,
-    // @crewhaus/tool-buildperf
-    bundleSizeCheck: buildperf.bundleSizeCheck,
-    benchmarkCompare: buildperf.benchmarkCompare,
-    flakyTestDetect: buildperf.flakyTestDetect,
-    // @crewhaus/tool-changeset
-    diffLint: changeset.diffLint,
-    docsSymbolCheck: changeset.docsSymbolCheck,
-    // @crewhaus/tool-text
-    diffParse: text.diffParse,
-    // @crewhaus/tool-table
-    contactNormalize: table.contactNormalize,
-    fixedWidthParse: table.fixedWidthParse,
-    recordLinkage: table.recordLinkage,
-    tableDiff: table.tableDiff,
-    tableProfile: table.tableProfile,
-    tableReshape: table.tableReshape,
-    tableShard: table.tableShard,
-    // @crewhaus/tool-verify
-    acceptanceCheck: verify.acceptanceCheck,
-    checksumVerify: verify.checksumVerify,
-    citationLint: verify.citationLint,
-    goldenCompare: verify.goldenCompare,
-    goldenUpdate: verify.goldenUpdate,
-    markdownLinkCheck: verify.markdownLinkCheck,
-    // @crewhaus/tool-html
-    htmlForms: html.htmlForms,
-    htmlLinks: html.htmlLinks,
-    htmlQuery: html.htmlQuery,
-    htmlRecords: html.htmlRecords,
-    htmlStructuredData: html.htmlStructuredData,
-    htmlTable: html.htmlTable,
-    htmlText: html.htmlText,
-    // @crewhaus/tool-onchain
-    abiDecode: onchain.abiDecode,
-    abiEncodeCall: onchain.abiEncodeCall,
-    addressCheck: onchain.addressCheck,
-    defiMath: onchain.defiMath,
-    functionSelector: onchain.functionSelector,
-    typedDataHash: onchain.typedDataHash,
-    tokenUnits: onchain.tokenUnits,
-    // @crewhaus/tool-money
-    costBasisCompute: money.costBasisCompute,
-    glCodeSuggest: money.glCodeSuggest,
-    paymentIdentifierValidate: money.paymentIdentifierValidate,
-    purchaseOrderMatch: money.purchaseOrderMatch,
-    refundAbuseCheck: money.refundAbuseCheck,
-    refundAmountCompute: money.refundAmountCompute,
-    spendLimitCheck: money.spendLimitCheck,
-    statementParse: money.statementParse,
-    taxCalculate: money.taxCalculate,
-    webhookSignatureVerify: money.webhookSignatureVerify,
-    // @crewhaus/tool-pkg
-    licenseAggregate: pkg.licenseAggregate,
-    lockfileDiff: pkg.lockfileDiff,
-    packagePublishPreflight: pkg.packagePublishPreflight,
-    packageTarballInspect: pkg.packageTarballInspect,
-    semverResolve: pkg.semverResolve,
-    // @crewhaus/tool-flow
-    branch: flow.branch,
-    consensusVote: flow.consensusVote,
-    deadlineCheck: flow.deadlineCheck,
-    decisionTable: flow.decisionTable,
-    errorClassify: flow.errorClassify,
-    ruleScore: flow.ruleScore,
-    stallDetect: flow.stallDetect,
-    // @crewhaus/tool-media
-    imageInfo: media.imageInfo,
-    imageKind: media.imageKind,
-    pngRead: media.pngRead,
-    pngWrite: media.pngWrite,
-    imageResize: media.imageResize,
-    imageCrop: media.imageCrop,
-    imageDiff: media.imageDiff,
-    exifRead: media.exifRead,
-    exifStrip: media.exifStrip,
-    qrEncode: media.qrEncode,
-    barcodeEncode: media.barcodeEncode,
-    chartRender: media.chartRender,
-    sparklineRender: media.sparklineRender,
-    diagramRender: media.diagramRender,
-    colorConvert: media.colorConvert,
-    colorContrast: media.colorContrast,
-    subtitleParse: media.subtitleParse,
-    subtitleWrite: media.subtitleWrite,
-    mediaProbe: media.mediaProbe,
-    // @crewhaus/tool-obs
-    eventQuery: obs.eventQuery,
-    eventCounts: obs.eventCounts,
-    toolCallStats: obs.toolCallStats,
-    errorCluster: obs.errorCluster,
-    runTimeline: obs.runTimeline,
-    costReport: obs.costReport,
-    budgetCheck: obs.budgetCheck,
-    sloEvaluate: obs.sloEvaluate,
-    incidentBundle: obs.incidentBundle,
-    metricsQuery: obs.metricsQuery,
-    logsQuery: obs.logsQuery,
-    alertList: obs.alertList,
-    alertAck: obs.alertAck,
-    statusPagePost: obs.statusPagePost,
-    healthProbe: obs.healthProbe,
-    // @crewhaus/tool-notify
-    chatPost: notify.chatPost,
-    chatUpdate: notify.chatUpdate,
-    chatDelete: notify.chatDelete,
-    chatReact: notify.chatReact,
-    emailCompose: notify.emailCompose,
-    emailSend: notify.emailSend,
-    webhookPost: notify.webhookPost,
-    smsSend: notify.smsSend,
-    pushNotify: notify.pushNotify,
-    deliveryCheck: notify.deliveryCheck,
-    notifyDigest: notify.notifyDigest,
-    quietHours: notify.quietHours,
-    rateLimitGate: notify.rateLimitGate,
-    messageTemplate: notify.messageTemplate,
-    // @crewhaus/tool-math
-    evaluate: math.evaluate,
-    statistics: math.statistics,
-    percentile: math.percentile,
-    correlation: math.correlation,
-    linearRegression: math.linearRegressionTool,
-    histogram: math.histogram,
-    outliers: math.outliers,
-    moneyAdd: math.moneyAdd,
-    moneyMultiply: math.moneyMultiplyTool,
-    moneyAllocate: math.moneyAllocateTool,
-    currencyConvert: math.currencyConvert,
-    unitConvert: math.unitConvert,
-    round: math.round,
-    numberFormat: math.numberFormat,
-    numberParse: math.numberParse,
-    percent: math.percent,
-    amortize: math.amortize,
-    npv: math.npv,
-    irr: math.irr,
-    geoDistance: math.geoDistance,
-    geoBoundingBox: math.geoBoundingBox,
-    geoPointInPolygon: math.geoPointInPolygon,
-    // @crewhaus/tool-secure
-    piiScan: secure.piiScan,
-    piiRedact: secure.piiRedact,
-    pseudonymize: secure.pseudonymize,
-    depseudonymize: secure.depseudonymize,
-    secretScan: secure.secretScan,
-    entropyScore: secure.entropyScore,
-    promptInjectionScan: secure.promptInjectionScan,
-    invisibleCharScan: secure.invisibleCharScan,
-    homoglyphNormalize: secure.homoglyphNormalize,
-    urlSafetyCheck: secure.urlSafetyCheck,
-    allowlistCheck: secure.allowlistCheck,
-    contentPolicyCheck: secure.contentPolicyCheck,
-    hashChainVerify: secure.hashChainVerify,
-    signPayload: secure.signPayload,
-    verifyPayload: secure.verifyPayload,
-    redactForExport: secure.redactForExport,
-    // @crewhaus/tool-docs
-    docxRead: docs.docxRead,
-    docxWrite: docs.docxWrite,
-    xlsxRead: docs.xlsxRead,
-    xlsxWrite: docs.xlsxWrite,
-    pptxRead: docs.pptxRead,
-    pdfInfo: docs.pdfInfo,
-    pdfText: docs.pdfText,
-    pdfSplit: docs.pdfSplit,
-    pdfMerge: docs.pdfMerge,
-    emlParse: docs.emlParse,
-    mboxSplit: docs.mboxSplit,
-    icsParse: docs.icsParse,
-    icsWrite: docs.icsWrite,
-    vcardParse: docs.vcardParse,
-    documentText: docs.documentTextTool,
-    documentDiff: docs.documentDiff,
-    // @crewhaus/tool-sql
-    sqlQuery: sql.sqlQuery,
-    sqlExec: sql.sqlExec,
-    sqlTransaction: sql.sqlTransaction,
-    sqlExplain: sql.sqlExplain,
-    schemaList: sql.schemaList,
-    schemaDescribe: sql.schemaDescribe,
-    dbSchemaDiff: sql.dbSchemaDiff,
-    tableStats: sql.tableStats,
-    integrityCheck: sql.integrityCheck,
-    importCsv: sql.importCsv,
-    importJson: sql.importJson,
-    exportCsv: sql.exportCsv,
-    exportJson: sql.exportJson,
-    databaseBackup: sql.databaseBackup,
-    migrationStatus: sql.migrationStatus,
-    migrationApply: sql.migrationApply,
-    // @crewhaus/tool-codehost
-    prList: codehost.prList,
-    prGet: codehost.prGet,
-    prFiles: codehost.prFiles,
-    prComments: codehost.prComments,
-    prReviews: codehost.prReviews,
-    issueList: codehost.issueList,
-    issueGet: codehost.issueGet,
-    checkRuns: codehost.checkRuns,
-    workflowRuns: codehost.workflowRuns,
-    workflowRunLogs: codehost.workflowRunLogs,
-    releaseList: codehost.releaseList,
-    releaseGet: codehost.releaseGet,
-    repoGet: codehost.repoGet,
-    compareRefs: codehost.compareRefs,
-    searchCode: codehost.searchCode,
-    searchIssues: codehost.searchIssues,
-    rateLimitStatus: codehost.rateLimitStatus,
-    prCreate: codehost.prCreate,
-    prUpdate: codehost.prUpdate,
-    prComment: codehost.prComment,
-    prReviewSubmit: codehost.prReviewSubmit,
-    issueCreate: codehost.issueCreate,
-    issueUpdate: codehost.issueUpdate,
-    issueComment: codehost.issueComment,
-    releaseCreate: codehost.releaseCreate,
-    workflowRunRerun: codehost.workflowRunRerun,
-    // @crewhaus/tool-code
-    runTests: code.runTests,
-    testFailureSummary: code.testFailureSummary,
-    runBuild: code.runBuild,
-    typecheck: code.typecheck,
-    lint: code.lint,
-    format: code.format,
-    formatCheck: code.formatCheck,
-    diagnostics: code.diagnostics,
-    astQuery: code.astQuery,
-    symbolOutline: code.symbolOutline,
-    findReferences: code.findReferences,
-    importGraph: code.importGraph,
-    deadFileScan: code.deadFileScan,
-    todoScan: code.todoScan,
-    dependencyList: code.dependencyList,
-    dependencyOutdated: code.dependencyOutdated,
-    packageScripts: code.packageScripts,
-    workspacePackages: code.workspacePackages,
-    coverageSummary: code.coverageSummary,
-    stackTraceParse: code.stackTraceParse,
-    // @crewhaus/tool-crewhaus
-    specValidate: crewhaus.specValidate,
-    specCompileCheck: crewhaus.specCompileCheck,
-    specSummarize: crewhaus.specSummarize,
-    specDiff: crewhaus.specDiff,
-    toolInventory: crewhaus.toolInventory,
-    permissionAudit: crewhaus.permissionAudit,
-    preflightRun: crewhaus.preflightRun,
-    harnessInventory: crewhaus.harnessInventory,
-    bundleFreshness: crewhaus.bundleFreshness,
-    auditVerify: crewhaus.auditVerify,
-    evalBaselineCompare: crewhaus.evalBaselineCompare,
-    sessionSummarize: crewhaus.sessionSummarize,
-    traceQuery: crewhaus.traceQuery,
-    costSummarize: crewhaus.costSummarize,
-    // @crewhaus/tool-state
-    kvSet: state.kvSet,
-    kvGet: state.kvGet,
-    kvDelete: state.kvDelete,
-    kvList: state.kvList,
-    counterIncrement: state.counterIncrement,
-    counterGet: state.counterGet,
-    checkpointSave: state.checkpointSave,
-    checkpointLoad: state.checkpointLoad,
-    checkpointList: state.checkpointList,
-    journalAppend: state.journalAppend,
-    journalRead: state.journalRead,
-    blackboardPost: state.blackboardPost,
-    blackboardRead: state.blackboardRead,
-    noteWrite: state.noteWrite,
-    noteSearch: state.noteSearch,
-    indexBuild: state.indexBuild,
-    indexSearch: state.indexSearch,
-    stateExport: state.stateExport,
-    stateImport: state.stateImport,
-    dedupeMark: state.dedupeMark,
-    // @crewhaus/tool-http
-    httpRequest: http.httpRequest,
-    httpPaginate: http.httpPaginate,
-    graphqlQuery: http.graphqlQuery,
-    httpBatch: http.httpBatch,
-    downloadFile: http.downloadFile,
-    headRequest: http.headRequest,
-    urlReachable: http.urlReachable,
-    linkCheck: http.linkCheck,
-    httpWaitFor: http.httpWaitFor,
-    sseRead: http.sseRead,
-    webhookSign: http.webhookSign,
-    webhookVerify: http.webhookVerify,
-    dnsLookup: http.dnsLookup,
-    tlsInspect: http.tlsInspect,
-    robotsCheck: http.robotsCheck,
-    sitemapParse: http.sitemapParse,
-    feedParse: http.feedParse,
-    // @crewhaus/tool-encode
-    base64Encode: encode.base64Encode,
-    base64Decode: encode.base64Decode,
-    // @crewhaus/tool-proc
-    runCommand: proc.runCommand,
-    runPipeline: proc.runPipeline,
-    retry: proc.retry,
-    processStart: proc.processStart,
-    processStatus: proc.processStatus,
-    processOutput: proc.processOutput,
-    processStop: proc.processStop,
-    processList: proc.processList,
-    waitForPort: proc.waitForPort,
-    waitForFile: proc.waitForFile,
-    waitForOutput: proc.waitForOutput,
-    commandExists: proc.commandExists,
-    envInspect: proc.envInspect,
-    // @crewhaus/tool-fsx
-    stat: fsx.stat,
-    fileHash: fsx.fileHash,
-    tree: fsx.tree,
-    diskUsage: fsx.diskUsage,
-    findFiles: fsx.findFiles,
-    readLines: fsx.readLines,
-    tailFile: fsx.tailFile,
-    makeDirectory: fsx.makeDirectory,
-    touchFile: fsx.touchFile,
-    tempDir: fsx.tempDir,
-    copyPath: fsx.copyPath,
-    movePath: fsx.movePath,
-    removePath: fsx.removePath,
-    splitFile: fsx.splitFile,
-    concatFiles: fsx.concatFiles,
-    archiveList: fsx.archiveList,
-    archiveCreate: fsx.archiveCreate,
-    archiveExtract: fsx.archiveExtract,
-    frontmatterRead: fsx.frontmatterRead,
-    frontmatterWrite: fsx.frontmatterWrite,
-    notebookRead: fsx.notebookRead,
-    notebookEdit: fsx.notebookEdit,
-    // @crewhaus/tool-git
-    gitStatus: git.gitStatus,
-    gitDiff: git.gitDiff,
-    gitLog: git.gitLog,
-    gitShow: git.gitShow,
-    gitBlame: git.gitBlame,
-    gitBranchList: git.gitBranchList,
-    gitTagList: git.gitTagList,
-    gitRemoteList: git.gitRemoteList,
-    gitMergeBase: git.gitMergeBase,
-    gitRevParse: git.gitRevParse,
-    gitFileHistory: git.gitFileHistory,
-    gitStashList: git.gitStashList,
-    gitConflicts: git.gitConflicts,
-    gitWorktreeList: git.gitWorktreeList,
-    gitAdd: git.gitAdd,
-    gitCommit: git.gitCommit,
-    gitSwitch: git.gitSwitch,
-    gitBranchCreate: git.gitBranchCreate,
-    gitBranchDelete: git.gitBranchDelete,
-    gitStashPush: git.gitStashPush,
-    gitStashPop: git.gitStashPop,
-    gitTagCreate: git.gitTagCreate,
-    gitApplyPatch: git.gitApplyPatch,
-    gitCherryPick: git.gitCherryPick,
-    gitResetPaths: git.gitResetPaths,
-    gitWorktreeAdd: git.gitWorktreeAdd,
-    gitWorktreeRemove: git.gitWorktreeRemove,
-    // @crewhaus/tool-schema
-    jsonSchemaValidate: schema.jsonSchemaValidate,
-    jsonSchemaInfer: schema.jsonSchemaInfer,
-    validateRecords: schema.validateRecords,
-    assert: schema.assert,
-    compareGolden: schema.compareGolden,
-    deepEqual: schema.deepEqual,
-    matchSubset: schema.matchSubset,
-    checkRequiredFields: schema.checkRequiredFields,
-    validateEnum: schema.validateEnum,
-    validateFormat: schema.validateFormat,
-    validateUniqueKeys: schema.validateUniqueKeys,
-    validateReferences: schema.validateReferences,
-    schemaDiff: schema.schemaDiff,
-    schemaSummarize: schema.schemaSummarize,
-    // @crewhaus/tool-datetime
-    dateParse: datetime.dateParse,
-    dateFormat: datetime.dateFormat,
-    dateConvertTimezone: datetime.dateConvertTimezone,
-    dateAdd: datetime.dateAdd,
-    dateDiff: datetime.dateDiff,
-    durationParse: datetime.durationParse,
-    durationFormat: datetime.durationFormat,
-    businessDays: datetime.businessDays,
-    dateRange: datetime.dateRange,
-    cronNext: datetime.cronNext,
-    cronDescribe: datetime.cronDescribe,
-    recurrenceExpand: datetime.recurrenceExpand,
-    weekOfYear: datetime.weekOfYear,
-    dayOfYear: datetime.dayOfYear,
-    isLeapYear: datetime.isLeapYear,
-    quarterOf: datetime.quarterOf,
-    timestampConvert: datetime.timestampConvert,
-    // @crewhaus/tool-encode
-    hash: encode.hash,
-    hmac: encode.hmac,
-    checksum: encode.checksum,
-    hexEncode: encode.hexEncode,
-    hexDecode: encode.hexDecode,
-    urlEncode: encode.urlEncode,
-    urlDecode: encode.urlDecode,
-    urlParse: encode.urlParse,
-    urlBuild: encode.urlBuild,
-    urlNormalize: encode.urlNormalize,
-    uuid: encode.uuid,
-    ulid: encode.ulid,
-    nanoId: encode.nanoId,
-    slugify: encode.slugify,
-    jwtDecode: encode.jwtDecode,
-    jwtVerify: encode.jwtVerify,
-    // @crewhaus/tool-data
-    jsonQuery: data.jsonQuery,
-    jsonPatch: data.jsonPatch,
-    jsonMergePatch: data.jsonMergePatch,
-    jsonFormat: data.jsonFormat,
-    dataDiff: data.dataDiff,
-    dataConvert: data.dataConvert,
-    csvParse: data.csvParse,
-    csvWrite: data.csvWrite,
-    tableQuery: data.tableQuery,
-    tableAggregate: data.tableAggregate,
-    tableJoin: data.tableJoin,
-    recordsToColumns: data.recordsToColumns,
-    columnsToRecords: data.columnsToRecords,
-    flattenObject: data.flattenObject,
-    unflattenObject: data.unflattenObject,
-    jsonlParse: data.jsonlParse,
-    jsonlWrite: data.jsonlWrite,
-    xmlParse: data.xmlParse,
-    sortRecords: data.sortRecords,
-    dedupeRecords: data.dedupeRecords,
-    sampleRecords: data.sampleRecords,
-    dataShape: data.dataShape,
-    jsonSortKeys: data.jsonSortKeys,
-    // Deterministic text tools (@crewhaus/tool-text) — pure, no I/O.
-    compactLog: text.compactLog,
-    countTokens: text.countTokens,
-    escapeString: text.escapeString,
-    extractEntities: text.extractEntities,
-    extractKeywords: text.extractKeywords,
-    fuzzyMatch: text.fuzzyMatch,
-    glossaryReplace: text.glossaryReplace,
-    markdownOutline: text.markdownOutline,
-    markdownTable: text.markdownTable,
-    normalizeText: text.normalizeText,
-    regexExtract: text.regexExtract,
-    renderTemplate: text.renderTemplate,
-    ruleClassify: text.ruleClassify,
-    sortLines: text.sortLines,
-    textDiff: text.textDiff,
-    textSimilarity: text.textSimilarity,
-    truncateToBudget: text.truncateToBudget,
-    wrapText: text.wrapText,
-  };
-  // Item 18 map-sync floor: this map's keys ARE the canonical runtime tool
-  // list. `CLI_RUNTIME_TOOL_KEYS` mirrors them (so the map-sync test can
-  // compare against target-cli's BUILTIN_TOOL_MAP without importing the whole
-  // entry file), and `tools list`/`tools audit` resolve `.name`/metadata off
-  // this map. Assert the mirror never drifts from the real map.
-  const built = Object.keys(map).sort();
-  const mirror = [...CLI_RUNTIME_TOOL_KEYS].sort();
-  if (built.length !== mirror.length || built.some((k, i) => k !== mirror[i])) {
-    throw new Error(
-      `loadToolMap keys drifted from CLI_RUNTIME_TOOL_KEYS (tools-cli.ts) — update the mirror. built=${built.join(",")} mirror=${mirror.join(",")}`,
-    );
-  }
-  return map;
+  return loadBuiltinTools(CLI_RUNTIME_TOOL_KEYS);
 }
 
 /**
- * Section 14 — apply per-tool config from the IR's `toolConfigs` map by
- * calling each tool's registration function. Mirror of the codegen-emitted
- * init calls in target-cli/target-channel-bot. Keep in sync.
+ * The instruction text a spec's agents run on, for `tools suggest`: the
+ * agent's own, or every step's / node's / role's for the multi-agent shapes.
+ */
+function instructionsOf(ir: IrNode): string {
+  const parts: string[] = [];
+  const agent = (ir as { agent?: { instructions?: unknown } }).agent;
+  if (typeof agent?.instructions === "string") parts.push(agent.instructions);
+  for (const field of ["steps", "nodes", "roles"] as const) {
+    const units = (ir as unknown as Record<string, unknown>)[field];
+    if (!Array.isArray(units)) continue;
+    for (const unit of units) {
+      const text = (unit as { instructions?: unknown }).instructions;
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Every eval this CLI runs — `crewhaus eval`, `optimize`, the advice and
+ * matrix arms — imports tool packages through the CLI's literal loader
+ * table, so a spec's tools wire the same way `crewhaus run` wires them, in a
+ * checkout and in the single-binary build alike.
+ */
+const runEvalLib: typeof runEvalCore = (args) =>
+  runEvalCore({ ...args, opts: { importToolPackage, ...args.opts } });
+
+/**
+ * Section 14 — apply the spec's `tool_config` and chain blocks by calling
+ * each registrar the listed tools need, through the one rule every emitter
+ * renders (`registerToolConfigs` in `@crewhaus/tool-categories`), so `crewhaus
+ * run` makes exactly the registrations the compiled bundle makes. `$VAR`
+ * values are read from this process's environment. A block the registrars
+ * cannot apply — two different blocks for one package, an unset variable, a
+ * malformed origin — stops the run with its message.
  */
 async function applyToolConfigs(
-  toolNames: readonly string[],
-  toolConfigs: Readonly<Record<string, unknown>>,
+  ir: {
+    readonly tools: readonly string[];
+    readonly toolConfigs: Readonly<Record<string, unknown>>;
+  } & SpecChainBlocks,
 ): Promise<void> {
-  const used = new Set(toolNames);
-  if (used.has("fetch") && toolConfigs["fetch"] !== undefined) {
-    const { registerFetchConfig } = await import("@crewhaus/tool-fetch");
-    registerFetchConfig(toolConfigs["fetch"] as Parameters<typeof registerFetchConfig>[0]);
-  }
-  if (used.has("webFetch") && toolConfigs["webFetch"] !== undefined) {
-    const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
-    registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
-  }
-  // Section 18 — code-execution tools (python/javascript/shell) share a single
-  // `registerCodeExecutionConfig`. Mirror target-cli's resolveTools: honor a
-  // per-tool config (first one seen) or the shared `codeExecution`/
-  // `code_execution` alias, register once. Without this the run path ignored
-  // tool_config for code-exec tools that the compiled bundle applies.
-  if (used.has("python") || used.has("javascript") || used.has("shell")) {
-    const cfg =
-      toolConfigs["python"] ??
-      toolConfigs["javascript"] ??
-      toolConfigs["shell"] ??
-      toolConfigs["codeExecution"] ??
-      toolConfigs["code_execution"];
-    if (cfg !== undefined) {
-      const { registerCodeExecutionConfig } = await import("@crewhaus/tool-code-execution");
-      registerCodeExecutionConfig(cfg as Parameters<typeof registerCodeExecutionConfig>[0]);
-    }
+  try {
+    await registerToolConfigs(
+      [{ tools: ir.tools, toolConfigs: ir.toolConfigs }],
+      importToolPackage,
+      {
+        env: process.env,
+        chains: ir,
+      },
+    );
+  } catch (err) {
+    die(err instanceof Error ? err.message : String(err));
   }
 }
 
 /**
  * Section 18 — resolve `sandboxAvailable` for the `run` path from the
- * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
- * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
- * (available); any value whose lowercase is `"noop"` disables the sandbox
- * floor (code-exec tools are then denied by permission-engine's
- * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ * `CREWHAUS_SANDBOX` env var, through the sandbox's own parser — the one the
+ * compiled bundle also calls and `createSandbox` uses — so the floor and the
+ * backend always read the same thing (security-6#1). Unset means docker
+ * (available); `noop`, in any case or spacing, and a value that names no
+ * backend disable the floor (code-exec tools are then denied by
+ * permission-engine's `requiresSandbox` floor). Pure — reads only the passed
+ * env snapshot.
  */
 export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
+  return sandboxAvailableFromEnv(env);
 }
 
 /**
@@ -4698,6 +3894,15 @@ async function runRun(args: ParsedArgs): Promise<void> {
   // bundle stamps at boot (cost-on-by-default; trace printer for pretty/json).
   applyRunObservabilityEnv(args, ir);
 
+  // A tool_config block no listed tool reads is not in force. `compile` says
+  // so; `crewhaus run` says the same, so a restriction written under the
+  // wrong key is not silently missing from a run either.
+  const runnable = ir.target === "cli" || ir.target === "browser";
+  for (const warning of runnable ? checkShapeTools(ir).warnings : []) {
+    if (warning.code !== "tool-config-unused") continue;
+    process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
+  }
+
   if (ir.target === "cli") return runRunCli(args, ir, specPath);
   if (ir.target === "browser") return runRunBrowser(args, ir);
   die(
@@ -4859,6 +4064,32 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Append the activated plugins' tools to `tools`, skipping any a first-party
+ * tool already holds the name of, and any named after a tool the run loop
+ * adds itself (`LOOP_TOOL_NAMES`: ListTools, Consult, Escalate). The loop
+ * keeps a tool it is handed under one of those names instead of its own, so
+ * a plugin's ListTools replaced the loop's, and took its builtin allow. The
+ * compiled bundles skip the same names (target-cli, target-channel-bot).
+ */
+function addPluginTools(tools: RegisteredTool[], pluginTools: ReadonlyArray<RegisteredTool>): void {
+  const loopOwned = new Set(LOOP_TOOL_NAMES);
+  for (const t of pluginTools) {
+    if (loopOwned.has(t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" is the run loop's own — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+}
+/**
  * cli-target run path. Multi-turn interactive REPL, session-store backed,
  * loads hooks/skills/slash-commands/sub-agents from the user's workspace,
  * and wires every spec-declared MCP server.
@@ -4934,7 +4165,7 @@ async function runRunCli(
   if (ir.tools.length > 0) {
     // Section 14 — apply per-tool config (e.g. registerFetchConfig) before
     // loading the tools so first-call execution sees the registered config.
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];
@@ -5007,7 +4238,7 @@ async function runRunCli(
 
     // Item 38 — runtime auto-quarantine. `crewhaus mcp doctor` persists the set
     // of chronically-failing servers to `.crewhaus/mcp/quarantine.json`; here we
-    // withdraw those servers' namespaced (`<server>__<tool>`) tools from the
+    // withdraw those servers' namespaced (`mcp__<server>__<tool>`) tools from the
     // catalog so the model can't call them, and append a synthetic notice to the
     // instructions (mirroring loop-detection's warning injection) so the model
     // routes around them. Opt out with --no-mcp-quarantine. Auto-restore is
@@ -5029,7 +4260,7 @@ async function runRunCli(
         }
       }
       if (quarantinedServers.length > 0) {
-        const prefixes = quarantinedServers.map((s) => `${s}__`);
+        const prefixes = quarantinedServers.map((s) => mcpToolName(s, ""));
         tools = tools.filter((t) => !prefixes.some((p) => t.name.startsWith(p)));
         mcpQuarantineNotice = quarantinedServers
           .map((s) => quarantineNotice(s, "flagged chronically failing by `crewhaus mcp doctor`"))
@@ -5149,16 +4380,13 @@ async function runRunCli(
   if (pluginNames.length > 0) {
     const activated = await activatePlugins({
       names: pluginNames,
-      ...createDefaultPluginRuntime({
-        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
-      }),
+      ...createBootPluginRuntime(),
     });
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
       `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
     );
-    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
   }
 
   // Section 11 — discover hooks, skills, and slash commands from the user's
@@ -5479,15 +4707,7 @@ async function runRunCli(
   // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
   // (first-party wins the collision), mirroring the compiled bundle's
   // register-late boot.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   // Section 18 — wire the sandbox floor for code-execution tools. #18 made
   // python/javascript/shell RESOLVABLE at run time, but the run path never set
@@ -5501,17 +4721,22 @@ async function runRunCli(
   );
   const sandboxAvailable = resolveSandboxAvailable();
   if (hasCodeExecTools) {
-    if (!sandboxAvailable) {
+    const sandbox = resolveSandboxBackend();
+    if (!sandbox.ok) {
+      process.stdout.write(
+        `[sandbox] ${sandbox.reason} Until then python/javascript/shell calls are denied.\n`,
+      );
+    } else if (!sandboxAvailable) {
       process.stdout.write(
         "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
       );
-    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+    } else if (!sandbox.fromEnv) {
       process.stdout.write(
         "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
       );
     } else {
       process.stdout.write(
-        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+        `[sandbox] backend "${sandbox.backend}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
       );
     }
   }
@@ -5720,7 +4945,7 @@ async function runRunBrowser(
 
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];
@@ -5875,17 +5100,6 @@ function emitEvent(event: Record<string, unknown>): void {
 }
 
 type DoctorCheck = { label: string; pass: boolean; reason?: string; warn?: boolean };
-
-function checkBunVersion(version: string): { pass: boolean; reason?: string } {
-  const parts = version.split(".");
-  const major = Number.parseInt(parts[0] ?? "", 10);
-  const minor = Number.parseInt(parts[1] ?? "", 10);
-  if (Number.isNaN(major) || Number.isNaN(minor)) {
-    return { pass: false, reason: `unparseable version "${version}"` };
-  }
-  const ok = major > 1 || (major === 1 && minor >= 2);
-  return ok ? { pass: true } : { pass: false, reason: `bun ${version} is below minimum 1.2.0` };
-}
 
 function runContext(args: ParsedArgs): void {
   if (args.flags["help"]) {
@@ -6505,7 +5719,7 @@ async function buildServeRuntime(
   // Built-in tools (Section 14 per-tool config applied first).
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];
@@ -6526,16 +5740,13 @@ async function buildServeRuntime(
   if (pluginNames.length > 0) {
     const activated = await activatePlugins({
       names: pluginNames,
-      ...createDefaultPluginRuntime({
-        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
-      }),
+      ...createBootPluginRuntime(),
     });
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
     process.stdout.write(
       `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
     );
-    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
   }
 
   // MCP servers — connect + register remote tools (thredz through connectThredz,
@@ -6671,15 +5882,7 @@ async function buildServeRuntime(
 
   // Plugin tools register LAST — a plugin tool named after a built-in / skill /
   // MCP tool is skipped so first-party wins the collision.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   const hasCodeExecTools = ir.tools.some(
     (t) => t === "python" || t === "javascript" || t === "shell",
@@ -15170,10 +14373,15 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       "usage: crewhaus tools <list|categories|show|search|suggest|audit>\n" +
         "\n" +
         "  categories               every tool category + what it turns on\n" +
-        "  show <tool>              one tool in full: flags, categories, inputs\n" +
+        "  show <tool>              one tool in full: flags, categories, inputs,\n" +
+        "                           the shapes that run it, and the argument(s) a\n" +
+        "                           scoped permission rule is checked against, with\n" +
+        "                           an example rule (by spec key or registered name,\n" +
+        "                           in any case)\n" +
         "  search <query>           find a tool by name, description or category\n" +
         "  list [--category NAME]   print every builtin tool + its metadata\n" +
-        "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
+        "  suggest [spec.yaml]      rank the builtins the spec's shape runs against\n" +
+        "                           its instructions — agent, steps, nodes, roles\n" +
         "                           (deterministic keyword match; default spec\n" +
         "                           is ./crewhaus.yaml)\n" +
         "  audit [--sessions N|all] mine tool_stats across sessions vs. the\n" +
@@ -15199,13 +14407,42 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   }
 
   if (action === "show") {
-    const key = args.positional[0];
-    if (key === undefined) die("usage: crewhaus tools show <tool>");
-    const detail = buildToolDetail(key, toolMap, categoriesForTool);
-    if (detail === undefined) {
-      const near = nearestToolKeys(key, Object.keys(toolMap));
+    const query = args.positional[0];
+    if (query === undefined) die("usage: crewhaus tools show <tool>");
+    // docs-claims#12 — the spec key, the registered name session logs and
+    // rules record (`GitCommit`), or either in any case; the detail names
+    // the spec key a tools: list takes.
+    const key = resolveToolKey(query, BUILTIN_TOOLS);
+    if (key === undefined) {
+      const near = nearestToolKeys(query, Object.keys(BUILTIN_TOOLS));
       const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
-      die(`no builtin tool named "${key}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+      die(`no builtin tool named "${query}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+    }
+    const detail = buildToolDetail(key, toolMap, categoriesForTool);
+    const shapeOnly = BUILTIN_TOOLS[key];
+    if (detail === undefined && shapeOnly !== undefined) {
+      // shape-reach#8 — a shape-specific builtin (the evm family,
+      // sendMessage) is not in the cli set this command loads, but it is a
+      // builtin: say which shapes carry it instead of "no builtin named".
+      const shapes = shapeOnly.shapes?.join(", ") ?? "every shape";
+      // What a scoped rule on it reads, from the flags the manifest keeps for
+      // the builtins the cli shape does not carry.
+      const rules = ruleScopeFor(shapeOnly.name, NON_CLI_TOOL_FLAGS[key]?.operativeArgs);
+      const lines = [
+        `${key} (${shapeOnly.name}) — ${shapeOnly.package}`,
+        `  carried by: ${shapes}`,
+        ...(shapeOnly.inert !== undefined ? [`  note: ${shapeOnly.inert}`] : []),
+        ...formatRuleScopeLines(rules),
+      ];
+      if (jsonMode) {
+        process.stdout.write(`${JSON.stringify({ key, ...shapeOnly, rules }, null, 2)}\n`);
+        return;
+      }
+      for (const line of lines) process.stdout.write(`${line}\n`);
+      return;
+    }
+    if (detail === undefined) {
+      die(`no builtin tool named "${query}"\nrun \`crewhaus tools list\` to see them all`);
     }
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
@@ -15233,7 +14470,15 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     const category = args.flags["category"];
     let map = toolMap;
     if (typeof category === "string") {
-      const wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      let wanted: ReadonlySet<string>;
+      try {
+        wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      } catch (err) {
+        // docs-claims#12 — an unknown category is a usage error, said in one
+        // line like every other bad argument here, not a stack trace.
+        if (err instanceof ToolCategoryError) die(err.message);
+        throw err;
+      }
       map = Object.fromEntries(Object.entries(toolMap).filter(([k]) => wanted.has(k)));
     }
     const rows = buildToolList(map);
@@ -15258,13 +14503,27 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     } catch (err) {
       die(`${specPath} did not parse: ${(err as Error).message}`);
     }
-    const specRecord = spec as unknown as Record<string, unknown>;
-    const agent = specRecord["agent"] as Record<string, unknown> | undefined;
-    const instructions = typeof agent?.["instructions"] === "string" ? agent["instructions"] : "";
-    const specTools = Array.isArray(specRecord["tools"])
-      ? (specRecord["tools"] as unknown[]).filter((t): t is string => typeof t === "string")
-      : [];
-    const result = suggestTools(instructions, specTools, CLI_RUNTIME_TOOL_KEYS, toolMap);
+    // docs-claims#1 / shape-reach#10 — read the tools the spec GRANTS, the
+    // way compile does: categories expanded, exclusions applied, from every
+    // site the spec's shape keeps them in (agent.tools, steps, nodes, roles).
+    // And never suggest a tool this shape cannot compile.
+    let ir: IrNode;
+    try {
+      ir = lower(spec);
+    } catch (err) {
+      die(`${specPath} did not lower: ${(err as Error).message}`);
+    }
+    const shape: ToolShape = ir.target;
+    const specTools = [...new Set(toolSitesOf(ir).flatMap((site) => site.tools))];
+    const instructions = instructionsOf(ir);
+    const shapeKeys = builtinToolsFor(shape);
+    if (shapeKeys.length === 0) {
+      process.stdout.write(
+        `the ${shape} shape registers no tool catalog, so there is nothing to suggest for ${specPath}\n`,
+      );
+      return;
+    }
+    const result = suggestTools(instructions, specTools, shapeKeys, toolMap);
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -15284,28 +14543,34 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     // The cwd spec supplies the grant list; without one we still report the
     // failing/read-only findings mined purely from usage.
     let specTools: string[] = [];
+    let literalKeys: ReadonlySet<string> = new Set();
     let hasExplicitToolList = false;
     const specPath = join(process.cwd(), "crewhaus.yaml");
     if (existsSync(specPath)) {
       try {
-        const spec = parseSpec(readFileSync(specPath, "utf-8")) as unknown as Record<
-          string,
-          unknown
-        >;
-        if (Array.isArray(spec["tools"])) {
-          specTools = (spec["tools"] as unknown[]).filter(
-            (t): t is string => typeof t === "string",
-          );
-          hasExplicitToolList = true;
-        }
+        // docs-claims#1 — the grants compile sees: categories expanded,
+        // exclusions applied, from wherever the shape keeps its tools. An
+        // exclusion is never itself reported as an unused grant.
+        const spec = parseSpec(readFileSync(specPath, "utf-8"));
+        const sites = toolSitesOf(lower(spec));
+        specTools = [...new Set(sites.flatMap((site) => site.tools))];
+        literalKeys = literalToolKeys(spec);
+        hasExplicitToolList = sites.some((site) => site.tools.length > 0);
       } catch (err) {
         process.stderr.write(
-          `[tools audit] crewhaus.yaml did not parse (${(err as Error).message}) — auditing usage only\n`,
+          `[tools audit] crewhaus.yaml did not compile (${(err as Error).message}) — auditing usage only\n`,
         );
       }
     }
     const usage = buildToolUsage(sessions);
-    const result = auditTools({ sessions, specTools, usage, toolMap, hasExplicitToolList });
+    const result = auditTools({
+      sessions,
+      specTools,
+      literalKeys,
+      usage,
+      toolMap,
+      hasExplicitToolList,
+    });
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -15372,12 +14637,69 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     );
   }
 
-  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
-  // `.name`, which is what the ask aggregate is keyed by).
+  // Read-only-ness and which argument decides where each tool acts come from
+  // the resolvable tool map (keyed by RegisteredTool `.name`, which is what
+  // the ask aggregate is keyed by). A recorded call is parsed with the tool's
+  // schema before its operative values are read, as the runtime does.
   const toolMap = await loadToolMap();
   const readOnly = readOnlyByName(toolMap);
-  const aggregates = aggregateAsks(sessions);
-  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+  const aggregates = aggregateAsks(sessions, suggestLookupFromTools(toolMap));
+  // Every proposal is checked against the real permission matcher before it
+  // is shown: a rule that would also cover a call nobody approved is refused.
+  const { verifyRule } = await import("@crewhaus/tool-approvals");
+  const suggestions: PermissionSuggestion[] = [];
+  const rejected: Array<{ pattern: string; reason: string }> = [];
+  // An allow written to settings is read before the spec's rules and the
+  // builtin floor, so it takes every call it covers away from their denies
+  // and asks. Each proposal says which ones it would override
+  // (permission-integration#8).
+  const overrideCheck = specGuardRules(process.cwd());
+  for (const suggestion of rankSuggestions(aggregates, readOnly)) {
+    const agg = aggregates.get(suggestion.toolName);
+    const scoped = agg !== undefined && isArgScoped(agg);
+    const verdict = verifyRule(
+      suggestion.rule.pattern,
+      suggestion.toolName,
+      scoped ? agg.argSamples[0] : undefined,
+      scoped ? agg.argKind : undefined,
+    );
+    if (!verdict.ok) {
+      rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+      continue;
+    }
+    if (suggestion.rule.type !== "alwaysAllow") {
+      suggestions.push(suggestion);
+      continue;
+    }
+    const relocatingDefaults = (
+      Object.values(toolMap).find((t) => t.name === suggestion.toolName)?.operativeArgs ?? []
+    ).flatMap((arg) =>
+      arg.relocates === true && arg.default !== undefined
+        ? [{ kind: arg.kind, value: arg.default }]
+        : [],
+    );
+    const overridden = guardsOverridden(
+      {
+        toolName: suggestion.toolName,
+        ...(scoped && agg.argSamples[0] !== undefined ? { scopedValue: agg.argSamples[0] } : {}),
+        ...(scoped && agg.argKind !== undefined ? { valueKind: agg.argKind } : {}),
+        ...(relocatingDefaults.length > 0 ? { relocatingDefaults } : {}),
+      },
+      overrideCheck.rules,
+      process.cwd(),
+    );
+    suggestions.push(
+      overridden.length === 0
+        ? suggestion
+        : {
+            ...suggestion,
+            evidence: [
+              ...suggestion.evidence,
+              ...overridden.map((g) => overrideNote(g, overrideCheck.label)),
+            ],
+          },
+    );
+  }
 
   // Existing settings rules (the exact shape buildRuleSet consumes).
   const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
@@ -15394,17 +14716,38 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
 
   if (args.flags["json"] === true) {
     process.stdout.write(
-      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          sessionIds: sessions.map((s) => s.sessionId),
+          suggestions,
+          rejected,
+          diff,
+          overrideCheck: {
+            spec: overrideCheck.spec ?? null,
+            ...(overrideCheck.unread !== undefined ? { unread: overrideCheck.unread } : {}),
+          },
+        },
+        null,
+        2,
+      )}\n`,
     );
     if (args.flags["apply"] !== true) return;
   } else {
     process.stdout.write(
       `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
     );
+    if (overrideCheck.unread !== undefined) {
+      process.stdout.write(
+        `note: ${overrideCheck.unread} — the proposals were not checked against its deny and ask rules\n`,
+      );
+    }
     if (suggestions.length === 0) {
       process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
     }
     for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    for (const r of rejected) {
+      process.stdout.write(`[refused] ${r.pattern}\n  · ${r.reason}\n`);
+    }
     process.stdout.write("\n");
     for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
   }
@@ -15440,6 +14783,46 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   mkdirSync(dirname(settingsPath), { recursive: true });
   writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
   process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * The deny and ask rules a settings-layer allow is read ahead of: the spec's
+ * (`./crewhaus.yaml`, when there is one) and the builtin floor's. A spec that
+ * exists but cannot be read is reported as unread, never as "no rules".
+ */
+function specGuardRules(cwd: string): {
+  readonly rules: ReadonlyArray<PermissionRule>;
+  readonly label: string;
+  readonly spec?: string;
+  readonly unread?: string;
+} {
+  const specPath = join(cwd, "crewhaus.yaml");
+  if (!existsSync(specPath)) {
+    return { rules: BUILTIN_DEFAULT_RULES, label: "the spec" };
+  }
+  try {
+    const ir = lower(parseSpec(readFileSync(specPath, "utf-8"))) as {
+      readonly permissions?: {
+        readonly rules?: ReadonlyArray<{
+          type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk";
+          pattern: string;
+        }>;
+      };
+    };
+    const yaml = tagRules(ir.permissions?.rules ?? [], "yaml");
+    return {
+      rules: [...yaml, ...BUILTIN_DEFAULT_RULES],
+      label: "crewhaus.yaml",
+      spec: "crewhaus.yaml",
+    };
+  } catch (err) {
+    const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return {
+      rules: BUILTIN_DEFAULT_RULES,
+      label: "the spec",
+      unread: `could not read the permission rules in crewhaus.yaml (${why})`,
+    };
+  }
 }
 
 /**
@@ -18574,8 +17957,8 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
       "usage:\n" +
         "  crewhaus plugins list [--registry <dir|url>]           list the catalog\n" +
         "  crewhaus plugins search -q <text> [--registry <ref>]   search the catalog\n" +
-        "  crewhaus plugins install <name> [--version <v>]        fetch + register a plugin\n" +
-        "       [--allow-unsigned] [--plugins-dir <dir>]\n" +
+        "  crewhaus plugins install <name> [--version <v>]        verify + register a plugin's manifest\n" +
+        "       [--trust-anchor <pem>] [--allow-unsigned] [--plugins-dir <dir>]\n" +
         "  crewhaus plugins uninstall <name>                      unregister a plugin\n" +
         "  crewhaus plugins outdated [--registry <ref>]           installed vs latest report\n" +
         "  crewhaus plugins publish --manifest <plugin.json>      open a publish PR (item 60)\n" +
@@ -18583,9 +17966,11 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
         "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY, then the default\n" +
-        "  public registry (registry.crewhaus.ai/plugins). Install respects plugin-\n" +
-        "  registry's fail-closed signature verification; --allow-unsigned opts out for\n" +
-        "  local development.\n",
+        "  public registry (registry.crewhaus.ai/plugins). Install verifies the manifest\n" +
+        "  against the publisher keys in ~/.crewhaus/plugin-trust, CREWHAUS_PLUGIN_TRUST_\n" +
+        "  ANCHORS and --trust-anchor, and refuses it unsigned or unverified;\n" +
+        "  --allow-unsigned accepts an unsigned manifest for local development. Install\n" +
+        "  writes the manifest only: put the plugin's index.js next to it by hand.\n",
     );
     return;
   }
@@ -18622,17 +18007,41 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
     if (action === "install") {
       const name = args.positional[0];
       if (typeof name !== "string") die("missing <name>");
+      // The keys a boot trusts, plus --trust-anchor. A manifest only the
+      // flag's key verifies installs, but a boot will refuse it, so install
+      // is told the boot's own keys to say so.
+      const trustAnchorFlag = args.flags["trust-anchor"];
+      const trustAnchors = resolveInstallTrustAnchors({
+        allowUnsigned,
+        ...(typeof trustAnchorFlag === "string" ? { trustAnchorFlag } : {}),
+      });
+      const bootTrustAnchors =
+        typeof trustAnchorFlag === "string"
+          ? resolveInstallTrustAnchors({ allowUnsigned: true })
+          : undefined;
+      const verifyingRegistry = createPluginRegistry({ registryPath, allowUnsigned, trustAnchors });
       const source = buildModuleRegistrySource(registryRef);
       const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
-      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const client = createMarketplaceClient({
+        registry: source,
+        pluginRegistry: verifyingRegistry,
+        pluginsDir,
+        ...(bootTrustAnchors !== undefined ? { bootTrustAnchors } : {}),
+      });
       const versionFlag = args.flags["version"];
       const result = await client.install(
         name,
         typeof versionFlag === "string" ? versionFlag : undefined,
       );
+      // A signature that is present was verified (the registry refuses one
+      // that is not); only a missing one, or no key at all, is unverified.
+      const verified = trustAnchors.length > 0 && result.manifest.signature !== undefined;
       process.stdout.write(
-        `installed ${result.manifest.name}@${result.manifest.version} → ${result.manifestPath}\n`,
+        `installed ${result.manifest.name}@${result.manifest.version}${verified ? "" : " (UNVERIFIED: no signature was checked)"} → ${result.manifestPath}\n`,
       );
+      for (const warning of result.warnings) process.stderr.write(`[plugins] ${warning}\n`);
+      const elsewhere = installLocationNotice(pluginsDir, registryPath);
+      if (elsewhere !== undefined) process.stderr.write(`[plugins] ${elsewhere}\n`);
       return;
     }
     if (action === "uninstall") {
@@ -23740,7 +23149,14 @@ switch (subcommand) {
       );
       await runEvalReport(parseFor([aliasVerb, ...rest.slice(1)], EVAL_REPORT_SCHEMA));
     } else {
-      await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+      // A structured failure (an unknown tool, a package that will not load,
+      // a bad grader config) is a one-line error, not a stack trace.
+      try {
+        await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
     }
     break;
   }
@@ -23765,7 +23181,12 @@ switch (subcommand) {
     break;
   }
   case "optimize":
-    await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
+    try {
+      await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "flywheel": {
     const action = rest[0] ?? "";

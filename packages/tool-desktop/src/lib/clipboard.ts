@@ -276,6 +276,7 @@ export function classifyClipboardRead(result: {
   readonly missing: boolean;
   readonly refused?: boolean;
   readonly stdoutTruncated?: boolean;
+  readonly outputIncomplete?: boolean;
 }): ClipboardReadOutcome {
   if (result.refused === true) {
     return { outcome: "failed", reason: result.stderr };
@@ -293,6 +294,15 @@ export function classifyClipboardRead(result: {
     return unavailable(
       "unknown",
       "the clipboard program did not finish within its timeout and was killed - the clipboard could not be read, which is not the same as it being empty",
+    );
+  }
+  if (result.code === 0 && result.stdout.length === 0 && result.outputIncomplete === true) {
+    // Something the reader started held its output open past the drain
+    // grace, and nothing had arrived by then. Nothing arriving is not the
+    // clipboard being empty.
+    return unavailable(
+      "unknown",
+      "the clipboard program's output could not be read to its end, and nothing had arrived - the clipboard could not be read, which is not the same as it being empty",
     );
   }
   if (result.code === 0) {

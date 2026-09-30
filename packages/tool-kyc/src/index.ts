@@ -28,9 +28,9 @@
  * leave the process are a VAT id or a company identifier going to a public
  * register. `index.test.ts` asserts both over every schema in the package.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type EntityRecord,
@@ -70,7 +70,7 @@ import {
   mapViesResponse,
   parseVatId,
 } from "./lib/vat";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 export { _setKycFetch, type KycFetch, ORIGINS } from "./lib/net";
 
@@ -127,6 +127,7 @@ function retryable(kind: FetchFailureKind): boolean {
 
 export const vatIdValidate: RegisteredTool = buildTool({
   name: "VatIdValidate",
+  operativeArgs: [],
   description:
     "Check an EU, Northern Irish or UK VAT number: its country's own format first, then VIES or HMRC for whether it is actually registered, with the consultation number when a requester id is supplied. Use it before zero-rating an intra-community supply or paying an invoice that claims a VAT number. It reports THREE outcomes — registered, not registered, and could-not-check with the reason — because VIES is a proxy to member states' systems that are routinely down, and reading an outage as 'not valid' gets the invoice wrong. A registered number means the number exists, not that it belongs to whoever sent you the invoice.",
   inputSchema: z
@@ -208,12 +209,24 @@ export const vatIdValidate: RegisteredTool = buildTool({
       });
     }
 
-    const requester =
+    const parsedRequester =
       input.requesterVatId === undefined ? undefined : parseVatId(input.requesterVatId);
-    if (requester !== undefined && !requester.ok) {
-      return `VatIdValidate could not read requesterVatId "${input.requesterVatId}": ${requester.reason}`;
+    if (parsedRequester !== undefined && !parsedRequester.ok) {
+      return `VatIdValidate could not read requesterVatId "${input.requesterVatId}": ${parsedRequester.reason}`;
     }
-    if (requester?.ok === true) {
+    // The requester is held to its country's grammar too, before anything is
+    // dialled: it becomes part of HMRC's request path, and an unchecked one
+    // rewrote that path to ask about a different number.
+    const requesterSyntax =
+      parsedRequester === undefined ? undefined : checkSyntax(parsedRequester);
+    if (requesterSyntax !== undefined && !requesterSyntax.wellFormed) {
+      return `VatIdValidate will not use requesterVatId "${input.requesterVatId}": ${requesterSyntax.reason}`;
+    }
+    const requester =
+      requesterSyntax === undefined
+        ? undefined
+        : { country: { code: requesterSyntax.country }, number: requesterSyntax.number };
+    if (requester !== undefined && requesterSyntax !== undefined) {
       // The two registers issue their receipt to their OWN kind of requester:
       // HMRC takes a GB VRN, VIES takes a member state's number. Sending the
       // wrong one means the number part is read as if it belonged to the other
@@ -223,7 +236,7 @@ export const vatIdValidate: RegisteredTool = buildTool({
       const targetIsGb = syntax.country === "GB";
       const requesterIsGb = requester.country.code === "GB";
       if (targetIsGb !== requesterIsGb) {
-        return `VatIdValidate will not use requesterVatId ${requester.canonical} for ${syntax.canonical}: ${
+        return `VatIdValidate will not use requesterVatId ${requesterSyntax.canonical} for ${syntax.canonical}: ${
           targetIsGb
             ? "HMRC issues a consultation number only to a GB requester"
             : "VIES issues a consultation number only to a requester registered in a member state, and GB is no longer one"
@@ -235,17 +248,8 @@ export const vatIdValidate: RegisteredTool = buildTool({
     try {
       const answer =
         syntax.country === "GB"
-          ? await askHmrc(
-              syntax.number,
-              requester?.ok === true ? requester.number : undefined,
-              deadline.signal,
-            )
-          : await askVies(
-              syntax.country,
-              syntax.number,
-              requester?.ok === true ? requester : undefined,
-              deadline.signal,
-            );
+          ? await askHmrc(syntax.number, requester?.number, deadline.signal)
+          : await askVies(syntax.country, syntax.number, requester, deadline.signal);
       return json({
         ...base,
         ...answer.answer,
@@ -287,7 +291,7 @@ async function askVies(
   const twoParty = requester !== undefined;
   const url = twoParty
     ? `${ORIGINS.vies}/taxation_customs/vies/rest-api/check-vat-number`
-    : `${ORIGINS.vies}/taxation_customs/vies/rest-api/ms/${country}/vat/${number}`;
+    : `${ORIGINS.vies}/taxation_customs/vies/rest-api/ms/${encodeURIComponent(country)}/vat/${encodeURIComponent(number)}`;
   const result = await getJson(url, {
     signal,
     ...(twoParty
@@ -316,16 +320,20 @@ async function askHmrc(
   requesterNumber: string | undefined,
   signal: AbortSignal,
 ): Promise<AskResult> {
-  const path =
-    requesterNumber === undefined
-      ? `/organisations/vat/check-vat-number/lookup/${number}`
-      : `/organisations/vat/check-vat-number/lookup/${number}/${requesterNumber}`;
+  // Both numbers passed their country's grammar before this is reached (GB:
+  // digits, or GD/HA and digits); encoding them anyway means no value can
+  // ever be read as more path.
+  const segments = [number, ...(requesterNumber === undefined ? [] : [requesterNumber])];
+  const path = `/organisations/vat/check-vat-number/lookup/${segments.map(encodeURIComponent).join("/")}`;
   const url = `${ORIGINS.hmrc}${path}`;
   // HMRC versions its APIs through the Accept header and answers 406 without
   // one. It is not a credential — every caller sends the same string.
   const result = await getJson(url, { signal, accept: "application/vnd.hmrc.1.0+json" });
   if (!result.ok) {
-    if (result.kind === "notFound") {
+    // A 404 is about the subject only when HMRC's own code says so. Any other
+    // 404 — no code, a body that is not JSON, or a route that matches nothing
+    // — says nothing about whether the number is registered.
+    if (result.kind === "notFound" && result.code === "NOT_FOUND") {
       return {
         answer: {
           outcome: "notFound",
@@ -336,10 +344,22 @@ async function askHmrc(
         sourceUrl: safeLabel(url),
       };
     }
+    if (result.kind === "notFound") {
+      return {
+        answer: {
+          outcome: "unavailable",
+          basis: hmrcErrorMeaning(result.code, result.status),
+          retryable: false,
+          code: result.code ?? `HTTP ${result.status ?? 404}`,
+        },
+        register: "hmrc",
+        sourceUrl: safeLabel(url),
+      };
+    }
     return { answer: unavailableFrom(result, "HMRC"), register: "hmrc", sourceUrl: safeLabel(url) };
   }
   return {
-    answer: mapHmrcResponse(result.value, requesterNumber !== undefined),
+    answer: mapHmrcResponse(result.value, requesterNumber !== undefined, number),
     register: "hmrc",
     sourceUrl: safeLabel(url),
   };
@@ -353,6 +373,7 @@ const REGISTRIES = ["gleif", "sec-edgar"] as const;
 
 export const entityRegistryLookup: RegisteredTool = buildTool({
   name: "EntityRegistryLookup",
+  operativeArgs: [],
   description:
     "Look one company up in GLEIF and SEC EDGAR by LEI, CIK, ticker or name, and return one row per register with its own source URL and retrieval time. Use it to check a counterparty exists and is who the invoice says. The rows are NOT merged into one confident record: the registers disagree about legal names, and GLEIF's two statuses answer different questions — a LAPSED LEI usually means an unpaid renewal, not a dissolved company. The result shows the differences and lets the caller judge them, and a register that could not be read is reported as could-not-check, never as 'no such company'.",
   inputSchema: z
@@ -908,21 +929,25 @@ export const sanctionsScreen: RegisteredTool = buildTool({
 
     for (const file of input.listFiles ?? []) {
       const at = resolveSafe("SanctionsScreen", file);
-      let size: number;
-      try {
-        size = statSync(at.real).size;
-      } catch {
+      // Opened without blocking, and only as a regular file: a FIFO with no
+      // writer blocks an ordinary open for ever, and this read was
+      // synchronous, so a named pipe named as a list stopped the whole
+      // harness (C074). The limit is enforced while reading.
+      const read = openForReadSync(workspaceRoot(), file, { maxBytes: LIMITS.snapshotBytes });
+      if (!read.ok) {
         // A refusal in the package's own words, with the path as the caller
         // wrote it. The raw ENOENT carries an absolute path from this machine,
         // which is both unreadable and more than the caller asked for.
-        return `SanctionsScreen refused ${at.rel}: there is no such file in the workspace`;
+        return read.code === "not-found"
+          ? `SanctionsScreen refused ${at.rel}: there is no such file in the workspace`
+          : `SanctionsScreen refused ${at.rel}: ${read.reason}`;
       }
-      if (size > LIMITS.snapshotBytes) {
-        return `SanctionsScreen refused ${at.rel}: it is ${size} bytes, over the ${LIMITS.snapshotBytes}-byte limit`;
+      if (read.truncated) {
+        return `SanctionsScreen refused ${at.rel}: it is ${read.size} bytes, over the ${LIMITS.snapshotBytes}-byte limit`;
       }
       let document: unknown;
       try {
-        document = JSON.parse(readFileSync(at.real, "utf-8"));
+        document = JSON.parse(read.text);
       } catch (err) {
         return `SanctionsScreen refused ${at.rel}: it is not JSON (${(err as Error).message})`;
       }

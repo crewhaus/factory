@@ -48,7 +48,7 @@ after buffering is not a cap.
 | `AlertList` | The alerts currently firing | read-only |
 | `AlertAck` | Acknowledge one alert | destructive, justification-gated |
 | `StatusPagePost` | Publish an incident update | destructive, justification-gated |
-| `HealthProbe` | Check many endpoints under a concurrency cap and a required deadline | read-only |
+| `HealthProbe` | Check many endpoints under a concurrency cap and a required deadline; one the gate refused is counted as `refused`, not unhealthy | read-only |
 
 The outbound posture is `@crewhaus/tool-http`'s, carried over rather than
 re-derived: fail-closed origin allow-list (empty means deny all — there is no
@@ -65,6 +65,13 @@ belongs to, so the token is scoped separately: it goes only to the origins the
 spec configured as obs surfaces. `HealthProbe` can sweep every allow-listed
 endpoint in a fleet without handing each one's operator the observability
 credential, and says on each probe whether it carried one.
+
+`HealthProbe`'s deadline is required rather than defaulted, and it bounds the
+whole sweep: each probe is additionally bounded by whatever is left of it, so a
+hung endpoint cannot hold the others up. A probe that never got a turn comes
+back as `skipped`, not as a failure it did not have, and one the allow-list or
+the SSRF check refused was never sent and comes back as `refused`, not
+unhealthy — both with `ok: null`.
 
 The token is a spec-declared environment variable **name**. A value that is not
 shaped like a variable name, or that carries a known token prefix, is refused

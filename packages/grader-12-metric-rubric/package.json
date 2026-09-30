@@ -15,7 +15,8 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
-    "@crewhaus/grader-registry": "workspace:*"
+    "@crewhaus/grader-registry": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

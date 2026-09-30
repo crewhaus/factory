@@ -39,20 +39,11 @@
  * string rather than an exception.
  */
 import { Buffer } from "node:buffer";
-import {
-  appendFileSync,
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readSync,
-  readdirSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { appendContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { budgetCheck as budgetCheckFn } from "./lib/budget";
 import { costReport as costReportFn } from "./lib/cost";
@@ -83,7 +74,9 @@ import {
   MAX_MAX_BYTES,
   MAX_TIMEOUT_MS,
   type ObsConfig,
+  ObsCorruptBodyError,
   ObsPermissionError,
+  ObsRefusedError,
   authHeaders,
   configuredOrigins,
   describeFailure,
@@ -99,10 +92,13 @@ import {
   safeUrlLabel,
   startDeadline,
 } from "./net";
-import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "./paths";
+import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 export {
+  ObsCorruptBodyError,
   ObsPermissionError,
+  ObsRefusedError,
+  ObsUnresolvedError,
   _resetObsConfig,
   _setDnsLookup,
   _setRawFetch,
@@ -349,6 +345,7 @@ function filterFrom(input: {
 
 export const eventQuery: RegisteredTool = buildTool({
   name: "EventQuery",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Page through a harness's own JSONL event logs, filtered by kind, time range, run id, session id and one field predicate, returning a bounded page and a cursor to continue from. Use it to pull the handful of lines that matter out of a transcript with tens of thousands, instead of reading whole files into context. Ordering is by session id then line number, which is the order the lines were written and is total, so the cursor is exact rather than approximate: a log that grew between pages appends after the cursor and nothing is skipped or repeated. The ordering ops on the predicate are numeric only, because comparing dates as text is the kind of answer that looks right and is wrong; use sinceTs and untilTs for time.",
   inputSchema: z.object({
@@ -402,6 +399,7 @@ export const eventQuery: RegisteredTool = buildTool({
 
 export const eventCounts: RegisteredTool = buildTool({
   name: "EventCounts",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Tally a harness's own event logs by kind, by tool and by outcome, so one call answers what this harness actually did. Use it before EventQuery to find out which kinds and which tools are worth paging through, rather than reading every line to find out. A call is counted from tool_use lines and its duration and error from the tool_stats mirror, so the two are never double-counted; when a log carries neither, errors are recovered by joining a tool_result's isError back to its tool_use id. MCP tools are tallied separately as server/tool, because an MCP server's Read and the built-in Read are different tools that share a name.",
   inputSchema: z.object({
@@ -428,6 +426,7 @@ export const eventCounts: RegisteredTool = buildTool({
 
 export const toolCallStats: RegisteredTool = buildTool({
   name: "ToolCallStats",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Per-tool call counts, failure counts, mean, p50, p95 and max duration from a harness's own logs, ordered most-failing first. Use it to find which tool is failing or slow without eyeballing a transcript. Percentiles are NEAREST-RANK — the value at index ceil(p/100 × n) − 1 of the ascending sample — so every figure returned is a duration that was actually measured, never an interpolated one that was not; with a single sample every percentile is that sample. Durations come only from the runtime's tool_stats and mcp_stats mirrors, so a harness that ran with advisor events disabled reports counts with latencyUnavailable set rather than an estimate.",
   inputSchema: z.object({
@@ -453,6 +452,7 @@ export const toolCallStats: RegisteredTool = buildTool({
 
 export const errorCluster: RegisteredTool = buildTool({
   name: "ErrorCluster",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Group a harness's errors by a normalised fingerprint — URLs, uuids, timestamps, paths, prefixed ids, hex blobs, quoted strings and numbers all masked — most frequent first, with one verbatim example each. Use it to turn a thousand error lines into the six distinct problems they actually are. Masking is by SHAPE, never by vocabulary, so it needs no knowledge of which platform wrote the message; the example is the first occurrence in log order, which is the only choice that does not change as the log grows. It does not cluster by meaning: two messages that differ only in a number land together even when they are different problems, which is exactly why the example is carried on every group.",
   inputSchema: z.object({
@@ -485,6 +485,7 @@ export const errorCluster: RegisteredTool = buildTool({
 
 export const runTimeline: RegisteredTool = buildTool({
   name: "RunTimeline",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "One run's events in order with the gap before each and the runtime's own measured duration where it recorded one, so a caller can see where the time went. Use it after EventCounts points at a slow or failed run, to find the step that actually cost the time. A gap is the distance from the previous timestamped line and is attributed to the line that ends it, which is not the same as how long that step took — where the runtime measured the step itself, durationMs carries the measured figure and is the one to trust. An event with no timestamp keeps its place in order and carries no gap, because a made-up timestamp reads exactly like a real one.",
   inputSchema: z.object({
@@ -556,6 +557,7 @@ const rateSchema = z
 
 export const costReport: RegisteredTool = buildTool({
   name: "CostReport",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Token and cost totals from a harness's own logs, broken down by model, by UTC day and by run, with the rate table supplied by the caller rather than assumed. Use it to see where a fleet's spend went without a billing API, and to re-price historical tokens at current rates. Both figures come back side by side: recordedUsdMicros is what the runtime computed from whatever price table that process held, computedUsdMicros is what your rates say those tokens cost. Figures are integer micro-USD so the arithmetic is exact; a model with no row in your table is counted under modelsWithoutRate with real tokens and zero computed cost, never silently at zero, and an accrual the runtime itself could not price is counted under unpricedAccruals.",
   inputSchema: z.object({
@@ -710,6 +712,10 @@ function specNameOf(events: readonly ObsEvent[]): string | undefined {
 
 export const incidentBundle: RegisteredTool = buildTool({
   name: "IncidentBundle",
+  operativeArgs: [
+    { field: "out", kind: "path" },
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+  ],
   description:
     "Assemble one failed run's events, clustered errors, tool statistics and spec name into a single contained JSON file a human can be handed. Use it at the end of a triage pass so the findings leave the context window as a durable artefact instead of being re-derived by the next reader. The output path goes through workspace containment like every other path here, and the write refuses an existing file unless overwrite is set, so a second bundle never silently replaces the first. It records no timestamp of its own: pass nowMs if the bundle should say when it was made, because a tool that read the clock would produce a different file from the same log every time.",
   inputSchema: z.object({
@@ -801,25 +807,26 @@ export const incidentBundle: RegisteredTool = buildTool({
     if (bytes > MAX_BUNDLE_BYTES) {
       return `the bundle would be ${bytes} bytes, over the ${MAX_BUNDLE_BYTES} limit — lower maxEntries or maxPayloadChars`;
     }
-    try {
-      // The parent is created because `reports/incident.json` is the obvious
-      // thing to ask for and failing on it teaches nothing. It is created
-      // through the already-validated real path, so the directory that appears
-      // is inside the workspace by the same check the file is.
-      const parent = path.dirname(out.real);
-      if (parent !== out.real) mkdirSync(parent, { recursive: true });
-      // "wx" is an atomic create-or-fail, so the no-clobber promise is kept by
-      // the filesystem rather than by a stat that something could race.
-      writeFileSync(out.real, text, {
-        encoding: "utf8",
-        flag: input.overwrite === true ? "w" : "wx",
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
+    // The parent is created because `reports/incident.json` is the obvious
+    // thing to ask for and failing on it teaches nothing; each directory is
+    // created contained. The bytes go to an exclusive temp that is renamed
+    // into place, so without overwrite an existing name is refused by the
+    // filesystem, and with it a hard link at the name is replaced, never
+    // written through to the file's other names. A link at the name is
+    // followed only while it stays in the workspace, and a FIFO, device or
+    // directory there is refused rather than opened (net attacker review:
+    // `writeFileSync` blocked the event loop on a FIFO, and wrote through a
+    // hard link to a file outside the workspace).
+    const written = writeFileSafe(workspaceRoot(), input.out, text, {
+      overwrite: input.overwrite === true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) {
+      if (written.code === "exists") {
         return `"${renderPath(input.out)}" already exists — pass overwrite: true to replace it`;
       }
-      return `"${renderPath(input.out)}" could not be written${code !== undefined ? ` (${code})` : ""}`;
+      return `${written.reason} — nothing was written`;
     }
     return json({
       wrote: toPosix(out.rel),
@@ -917,6 +924,10 @@ function endsWithoutNewline(real: string, size: number, shown: string): Loaded<b
 
 export const emitTraceEvent: RegisteredTool = buildTool({
   name: "EmitTraceEvent",
+  operativeArgs: [
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    { field: "sessionId", kind: "id" },
+  ],
   description:
     "Append one custom event to a harness's own JSONL session log, so a workflow that never calls a model still leaves a record EventQuery, EventCounts and RunTimeline can read back. Use it to mark what a tool-only run did — a milestone reached, a threshold crossed, a check that passed — at the moment it happened, rather than leaving a human to infer it from side effects. The event is written in the runtime's own wire shape but under the kind custom.<name>, a namespace no runtime event can occupy, and the payload records whether a live run context supplied the attribution or the caller merely claimed it, so a line a tool wrote is never mistaken for a line the runtime wrote. Your own fields are nested one level down where no kind-agnostic reader will read them as the runtime's, control characters and invisible or direction-changing text are refused rather than escaped, and the finished line is capped; it records no time of its own, so pass tsMs for the event to carry one.",
   inputSchema: z.object({
@@ -1092,19 +1103,21 @@ export const emitTraceEvent: RegisteredTool = buildTool({
     // something else.
     if (input.dryRun === true) return json({ dryRun: true, ...report, line: text });
 
-    try {
-      if (size === undefined) {
-        const parent = path.dirname(target.real);
-        if (parent !== target.real) mkdirSync(parent, { recursive: true });
-      }
-      // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
-      // one O_APPEND write per line so a runtime appending to the same log
-      // concurrently cannot end up interleaved with this one.
-      appendFileSync(target.real, text, { mode: 0o600 });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      return `"${shown}" could not be appended to${code !== undefined ? ` (${code})` : ""}`;
-    }
+    // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
+    // one O_APPEND write per line so a runtime appending to the same log
+    // concurrently cannot end up interleaved with this one. The open never
+    // follows a link out of the workspace (a contained one is followed, as
+    // before), refuses a FIFO or any other special file, and refuses a file
+    // with a second name: an append in place would change it under every
+    // name, one of which may be outside the workspace (net attacker review).
+    const appended = appendContained(workspaceRoot(), rel, text, {
+      createParents: size === undefined,
+      create: input.create === true,
+      mode: 0o600,
+      leafSymlink: "follow-contained",
+      hardLinks: "refuse",
+    });
+    if (!appended.ok) return `${appended.reason} — "${shown}" was not appended to`;
     return json({ appended: true, ...report });
   },
 });
@@ -1260,7 +1273,7 @@ async function callRemote(call: RemoteCall): Promise<RemoteResult> {
       cfg: call.cfg,
       credentialHeaders: secretHeaders,
     });
-    const body = await readCapped(opened.res, call.maxBytes);
+    const body = await readCapped(opened.res, call.maxBytes, deadline.signal, [token.token]);
     return {
       ok: true,
       status: opened.res.status,
@@ -1303,6 +1316,7 @@ function httpFailure(surface: string, result: Extract<RemoteResult, { ok: true }
 
 export const metricsQuery: RegisteredTool = buildTool({
   name: "MetricsQuery",
+  operativeArgs: [],
   description:
     "Run a Prometheus-style instant or range query against the allow-listed metrics endpoint and return the matching series with their labels. Use it to answer a question about a live system from its own metrics instead of guessing from logs. It speaks the Prometheus HTTP API, which is a format rather than a product — Thanos, Cortex, Mimir, VictoriaMetrics and Grafana all serve it — and the query goes in a POST form body so it stays out of the URL and out of any proxy's access log. Evaluation time is an input, never the clock: an instant query with no timeSec asks the server for its own now, which is the one value that cannot be made deterministic, and sample values are returned as strings so NaN, +Inf and full float precision all survive.",
   inputSchema: z.object({
@@ -1398,6 +1412,7 @@ export const metricsQuery: RegisteredTool = buildTool({
 
 export const logsQuery: RegisteredTool = buildTool({
   name: "LogsQuery",
+  operativeArgs: [],
   description:
     "Query a log platform through the endpoint, parameter names and result path declared in the obs tool_config block, returning a bounded, field-projected page of records. Use it to search a production log store from a harness without hard-coding a vendor into the tool. Nothing here knows what Loki, Elasticsearch or CloudWatch call their parameters: the spec maps query, start, end and limit to whatever this platform names them, states the time format it wants, and names the dot path to the records inside the response. Every field is stringified and cut to a budget, because one verbose log field repeated across a hundred hits is an entire context window.",
   inputSchema: z.object({
@@ -1501,6 +1516,7 @@ export const logsQuery: RegisteredTool = buildTool({
 
 export const alertList: RegisteredTool = buildTool({
   name: "AlertList",
+  operativeArgs: [],
   description:
     "List the alerts the configured alerting endpoint is currently reporting, bounded and field-projected. Use it to find out what is already firing before opening an incident or acknowledging anything. Like LogsQuery it is vendor-neutral: the endpoint, the path and the dot path to the alert array all come from the obs tool_config block, and any extra query parameters the platform needs are declared there too. It reads only — acknowledging an alert is AlertAck, which is a separate, justification-gated tool.",
   inputSchema: z.object({
@@ -1591,6 +1607,7 @@ export const alertList: RegisteredTool = buildTool({
 
 export const alertAck: RegisteredTool = buildTool({
   name: "AlertAck",
+  operativeArgs: [{ field: "alertId", kind: "id" }],
   description:
     "Acknowledge one alert through the configured acknowledgement endpoint, recording who acknowledged it and why. Use it to silence a page a harness has confirmed it is already handling, never to make a dashboard look quieter. This mutates state on a system other people are watching and can stop a human being paged, so it is destructive and justification-gated; the alert id is substituted into the configured path template and sent as a JSON body alongside any static fields the spec declares. It does not resolve, close or delete an alert, and it does not create a silence rule — those are different operations with different blast radii and none of them are implemented here.",
   inputSchema: z.object({
@@ -1648,6 +1665,7 @@ export const alertAck: RegisteredTool = buildTool({
 
 export const statusPagePost: RegisteredTool = buildTool({
   name: "StatusPagePost",
+  operativeArgs: [{ field: "incidentId", kind: "id" }],
   description:
     "Publish an incident update to the configured status page endpoint. Use it only when a human has decided the incident should be announced, because what this writes is read by customers. It is destructive and justification-gated for that reason: a status page post is public the moment it lands, cannot be unpublished by this tool, and is frequently the first thing anyone outside the team learns about an outage. The endpoint, the path (with {id} substituted when updating an existing incident) and any static fields come from the obs tool_config block, so nothing about a particular status-page vendor is baked in here.",
   inputSchema: z.object({
@@ -1723,8 +1741,9 @@ export const statusPagePost: RegisteredTool = buildTool({
 
 export const healthProbe: RegisteredTool = buildTool({
   name: "HealthProbe",
+  operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; a probe that never got a turn comes back as skipped, and one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, never to somebody else's service, and authenticated says whether a probe carried it. latencyMs is wall-clock and the one field that differs run to run.",
   inputSchema: z.object({
     urls: z
       .array(z.string().min(1))
@@ -1785,10 +1804,13 @@ export const healthProbe: RegisteredTool = buildTool({
 
     type Probe = {
       url: string;
-      ok: boolean;
+      /** null: not determined — the probe was skipped or refused. */
+      ok: boolean | null;
       status?: number;
       latencyMs?: number;
       skipped?: boolean;
+      /** The gate refused it (or the redirect it answered with); see error. */
+      refused?: boolean;
       /** Present only when a token exists: whether this probe carried it. */
       authenticated?: boolean;
       error?: string;
@@ -1801,7 +1823,7 @@ export const healthProbe: RegisteredTool = buildTool({
       if (deadline.expired()) {
         results[index] = {
           url: label,
-          ok: false,
+          ok: null,
           skipped: true,
           error: "the sweep deadline elapsed before this endpoint was probed",
         };
@@ -1824,17 +1846,40 @@ export const healthProbe: RegisteredTool = buildTool({
           credentialHeaders: secretHeaders,
         });
         // Drain under the cap rather than leaving the stream open: a probe
-        // that never reads the body leaks a socket per endpoint.
-        await readCapped(opened.res, maxBytes);
+        // that never reads the body leaks a socket per endpoint. The probe
+        // judges the status, not the body, so a body in codings the reader
+        // will not stack is released rather than reported as the endpoint
+        // failing. A CORRUPT body is the endpoint failing, as 0.7.0 said:
+        // every client reading that reply would fail too.
+        let corrupt: string | undefined;
+        await readCapped(opened.res, maxBytes, deadline.signal).catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") throw err;
+          if (err instanceof ObsCorruptBodyError) corrupt = err.message;
+        });
         const status = opened.res.status;
         results[index] = {
           url: redact(opened.finalUrl),
-          ok: expected !== undefined ? expected.has(status) : status >= 200 && status < 300,
+          ok:
+            corrupt === undefined &&
+            (expected !== undefined ? expected.has(status) : status >= 200 && status < 300),
           status,
           latencyMs: Date.now() - startedAt,
           ...(token.token === "" ? {} : { authenticated: carriesToken }),
+          ...(corrupt !== undefined ? { error: corrupt } : {}),
         };
       } catch (err) {
+        if (err instanceof ObsRefusedError) {
+          // Never probed (or its redirect was not followed), so it is
+          // neither healthy nor unhealthy: say which, and why.
+          results[index] = {
+            url: label,
+            ok: null,
+            refused: true,
+            ...(err.redirectStatus !== undefined ? { status: err.redirectStatus } : {}),
+            error: redact(err.message),
+          };
+          return;
+        }
         results[index] = {
           url: label,
           ok: false,
@@ -1865,9 +1910,10 @@ export const healthProbe: RegisteredTool = buildTool({
     const probes = [...results].sort((a, b) => byString(a.url, b.url));
     return json({
       probed: probes.length,
-      healthy: probes.filter((p) => p.ok).length,
-      unhealthy: probes.filter((p) => !p.ok && p.skipped !== true).length,
+      healthy: probes.filter((p) => p.ok === true).length,
+      unhealthy: probes.filter((p) => p.ok === false).length,
       skipped: probes.filter((p) => p.skipped === true).length,
+      refused: probes.filter((p) => p.refused === true).length,
       deadlineMs: input.deadlineMs,
       probes,
     });

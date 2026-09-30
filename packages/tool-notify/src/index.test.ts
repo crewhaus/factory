@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { type Server, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { executeTool } from "@crewhaus/tool-executor";
 import {
   NOTIFY_TOOLS,
   __setPrivateHostsAllowedForTest,
@@ -320,9 +321,21 @@ beforeEach(() => {
 
   registerNotifyConfig({
     allowed_origins: [origin],
+    // PROVIDER_VAR is deliberately NOT listed: a provider's own auth
+    // variable is operator-written and needs no listing.
+    allowed_secret_envs: [
+      WEBHOOK_VAR,
+      TOKEN_VAR,
+      SECRET_VAR,
+      SMTP_USER_VAR,
+      SMTP_PASS_VAR,
+      "NOT_SET_ANYWHERE",
+    ],
     allowed_recipients: ["ops@example.com", "*@team.test"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_sender_domains: ["example.com"],
+    allowed_sms_recipients: ["+1*"],
+    allowed_push_targets: ["device-token"],
     providers: {
       gateway: {
         endpoint: `${origin}/sms`,
@@ -589,7 +602,8 @@ describe("ChatPost", () => {
   });
 
   test("REFUSAL: an empty allow-list denies everything", async () => {
-    _resetNotifyConfig();
+    // The variable is allowed, so what refuses is the empty origin list.
+    registerNotifyConfig({ allowed_secret_envs: [WEBHOOK_VAR] });
     const result = await chatPost.execute({
       platform: "slack",
       webhookUrlEnv: WEBHOOK_VAR,
@@ -616,7 +630,8 @@ describe("ChatPost", () => {
       }),
     );
     expect(result).not.toContain("xoxb-1234-actual-secret");
-    expect(result).toContain("NAME of an environment variable");
+    expect(result).toContain("must name an environment variable");
+    expect(result).toContain("has not been echoed back");
   });
 
   test("REFUSAL: a webhook path never appears in a failure message", async () => {
@@ -753,6 +768,35 @@ describe("ChatUpdate, ChatDelete and ChatReact", () => {
     });
     expect(requests[0]?.method).toBe("PATCH");
     expect(requests[0]?.pathname).toBe("/api/channels/555/messages/999");
+  });
+
+  test("Discord takes its bot token with the Bot scheme on every API-mode call; Slack keeps Bearer", async () => {
+    const discord = {
+      platform: "discord",
+      apiBaseUrl: `${origin}/api/v10`,
+      tokenEnv: TOKEN_VAR,
+      channel: "555",
+    };
+    const outputs = [
+      await chatPost.execute({ ...discord, text: "hello" }),
+      await chatUpdate.execute({ ...discord, messageId: "999", text: "edited" }),
+      await chatDelete.execute({ ...discord, messageId: "999" }),
+      await chatReact.execute({ ...discord, messageId: "999", emoji: "white_check_mark" }),
+    ].map(String);
+    // 0.7.0 sent "Bearer <token>" here, which Discord reads as an OAuth2 user
+    // token and answers 401 for every one of these calls.
+    expect(requests.map((r) => `${r.method} ${r.pathname} ${r.headers["authorization"]}`)).toEqual([
+      "POST /api/v10/channels/555/messages Bot xoxb-test-token-value-1234",
+      "PATCH /api/v10/channels/555/messages/999 Bot xoxb-test-token-value-1234",
+      "DELETE /api/v10/channels/555/messages/999 Bot xoxb-test-token-value-1234",
+      "PUT /api/v10/channels/555/messages/999/reactions/white_check_mark/@me Bot xoxb-test-token-value-1234",
+    ]);
+    // The scheme changed; the redaction did not.
+    expect(outputs.filter((o) => o.includes("xoxb-test-token-value-1234"))).toEqual([]);
+
+    requests.length = 0;
+    await chatDelete.execute({ platform: "slack", ...api(), messageId: "1758100000.000100" });
+    expect(requests[0]?.headers["authorization"]).toBe("Bearer xoxb-test-token-value-1234");
   });
 
   test("REFUSAL: Teams cannot be edited, and says so instead of reposting", async () => {
@@ -903,6 +947,67 @@ describe("EmailSend", () => {
       expect(log.commands).toContain("RCPT TO:<ops@example.com>");
       expect(log.messages[0]).toContain("Subject: Nightly");
       expect(log.messages[0]).toContain("green");
+    } finally {
+      server.close();
+    }
+  });
+
+  test("net-review C207: a key reused after an attachment changed sends nothing and says so", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const call = {
+        ...base,
+        port,
+        idempotencyKey: "nightly-attachment",
+        attachments: [{ path: "nightly.txt", contentType: "text/plain" }],
+      };
+      writeFileSync(path.join(tmp, "nightly.txt"), "MONDAY: all green");
+      const first = String(await emailSend.execute(call));
+      expect(JSON.parse(first).sent).toBe(true);
+      // The same arguments, so a retry of the same message replays.
+      expect(String(await emailSend.execute(call))).toBe(first);
+      // The path is the same and the bytes are not: a different message.
+      writeFileSync(path.join(tmp, "nightly.txt"), "TUESDAY: DATABASE DOWN");
+      const second = String(await emailSend.execute(call));
+      expect(second).toContain("nothing was sent");
+      expect(second).toContain("attachmentContent");
+      // One DATA in all: the server never saw Tuesday's report, and nothing
+      // claimed it had.
+      expect(log.messages).toHaveLength(1);
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("net regression review: a retry after the attachment was cleaned up replays the send, never 'nothing was sent'", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const call = {
+        ...base,
+        port,
+        idempotencyKey: "nightly-cleaned",
+        attachments: [{ path: "tmp-report.txt", contentType: "text/plain" }],
+      };
+      writeFileSync(path.join(tmp, "tmp-report.txt"), "nightly: all green");
+      const first = JSON.parse(String(await emailSend.execute(call)));
+      expect(first.sent).toBe(true);
+      // A temp report, removed once it was sent.
+      rmSync(path.join(tmp, "tmp-report.txt"));
+      const retry = String(await emailSend.execute(call));
+      expect(retry).not.toContain("nothing was sent");
+      const replayed = JSON.parse(retry);
+      expect(replayed).toMatchObject({ sent: true, messageId: first.messageId });
+      expect(replayed.replayNote).toContain("This call sent nothing");
+      expect(replayed.replayNote).toContain('"tmp-report.txt" could not be read');
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
+      // Without a key, or under a key that sent something else, the build
+      // failure is what it always was.
+      const unkeyed = String(await emailSend.execute({ ...call, idempotencyKey: undefined }));
+      expect(unkeyed).toBe('nothing was sent: "tmp-report.txt" could not be read');
+      const otherSubject = String(await emailSend.execute({ ...call, subject: "Other" }));
+      expect(otherSubject).toBe('nothing was sent: "tmp-report.txt" could not be read');
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
     } finally {
       server.close();
     }
@@ -1540,6 +1645,84 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
     expect(second.retryAt).toBe("2026-09-17T10:00:00.000Z");
   });
 
+  test('RateLimitGate refuses the key "__proto__", which its JSON state could never hold', async () => {
+    const outs: string[] = [];
+    let state: unknown;
+    for (const minute of ["00", "01", "02"]) {
+      const out = String(
+        await executeTool(
+          rateLimitGate,
+          {
+            key: "__proto__",
+            now: `2026-09-17T10:${minute}:00Z`,
+            windowMs: 3_600_000,
+            ...(state !== undefined ? { state } : {}),
+          },
+          { toolUseId: "t" },
+        ).then((r) => r.content),
+      );
+      outs.push(out);
+      try {
+        state = JSON.parse(out).nextState;
+      } catch {
+        state = undefined;
+      }
+    }
+    // 0.7.0 said allowed:true three times: the entry never survived the
+    // state round-trip, so the gate failed open for this one key.
+    expect(outs.filter((o) => o.includes('"allowed":true'))).toEqual([]);
+    expect(outs.every((o) => o.includes('"__proto__" cannot be kept'))).toBe(true);
+
+    // Any other name, including the Object.prototype ones, is limited as
+    // usual through the real input parser.
+    const names: Array<{ key: string; allowed: unknown[] }> = [];
+    for (const key of ["constructor", "toString", "alert:__proto__"]) {
+      const allowed: unknown[] = [];
+      let kept: unknown;
+      for (const minute of ["00", "01", "02"]) {
+        const out = String(
+          await executeTool(
+            rateLimitGate,
+            {
+              key,
+              now: `2026-09-17T10:${minute}:00Z`,
+              windowMs: 3_600_000,
+              ...(kept !== undefined ? { state: kept } : {}),
+            },
+            { toolUseId: "t" },
+          ).then((r) => r.content),
+        );
+        const decision = JSON.parse(out);
+        allowed.push(decision.allowed);
+        kept = JSON.parse(JSON.stringify(decision.nextState));
+      }
+      names.push({ key, allowed });
+    }
+    expect(names).toEqual(
+      ["constructor", "toString", "alert:__proto__"].map((key) => ({
+        key,
+        allowed: [true, false, false],
+      })),
+    );
+  });
+
+  test("MessageTemplate finds only the operator's own templates, not Object.prototype names", async () => {
+    const outs = [];
+    for (const name of ["constructor", "toString", "hasOwnProperty"]) {
+      outs.push(
+        String(
+          await messageTemplate.execute({
+            templates: { deploy: "x" },
+            name,
+            data: {},
+            platform: "slack",
+          }),
+        ),
+      );
+    }
+    expect(outs.filter((o) => !o.includes("no template named"))).toEqual([]);
+  });
+
   test("MessageTemplate renders a named template and escapes every value", async () => {
     const result = await run(messageTemplate, {
       templates: { deploy: "*{{service}}* → {{env}}" },
@@ -1574,6 +1757,25 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
     );
     expect(result).toContain("{{b}}");
     expect(result).toContain("does not supply");
+    // An inherited property is not a value the data supplies (net review):
+    // `{{__proto__}}` rendered Object.prototype as "{}".
+    let checked = 0;
+    for (const placeholder of ["__proto__", "constructor", "toString", "a.__proto__"]) {
+      const inherited = String(
+        await messageTemplate.execute({
+          templates: { t: `x={{${placeholder}}}` },
+          name: "t",
+          data: { a: { b: 1 } },
+          platform: "slack",
+        }),
+      );
+      expect({ placeholder, missing: inherited.includes("does not supply") }).toEqual({
+        placeholder,
+        missing: true,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(4);
   });
 
   test("the pure tools are deterministic — the same call twice gives the same bytes", async () => {
@@ -1582,6 +1784,340 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
       now: "2026-01-15T23:30:00Z",
     };
     expect(await quietHours.execute(args)).toBe(await quietHours.execute(args));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// idempotency
+// ---------------------------------------------------------------------------
+
+describe("an idempotency key names one message", () => {
+  const sms = {
+    provider: "gateway",
+    to: "+15550001111",
+    body: "disk full",
+    idempotencyKey: "daily",
+  };
+
+  test("the same key for a different recipient or body sends nothing and says so", async () => {
+    const first = String(await smsSend.execute(sms));
+    expect(first).toContain('"sent":true');
+    // A true retry still replays the first result, byte for byte.
+    expect(String(await smsSend.execute(sms))).toBe(first);
+    const other = String(
+      await smsSend.execute({ ...sms, to: "+15550002222", body: "CPU melting" }),
+    );
+    // 0.7.0 returned the first call's {"sent":true,…,"messageId":"SM123"}
+    // here, for a message that was never sent to +15550002222.
+    expect({ other, posts: requests.length }).toEqual({
+      other:
+        'nothing was sent: idempotencyKey "daily" already sent a different SmsSend request in this process (it differed in body, to). A key names one message — use a new key for a new message',
+      posts: 1,
+    });
+  });
+
+  test("ChatPost, PushNotify and WebhookPost refuse a changed request under a used key", async () => {
+    const pairs: Array<[string, () => Promise<unknown>, () => Promise<unknown>]> = [
+      [
+        "ChatPost",
+        () =>
+          chatPost.execute({
+            platform: "slack",
+            webhookUrlEnv: WEBHOOK_VAR,
+            text: "a",
+            idempotencyKey: "k",
+          }),
+        () =>
+          chatPost.execute({
+            platform: "slack",
+            webhookUrlEnv: WEBHOOK_VAR,
+            text: "b",
+            idempotencyKey: "k",
+          }),
+      ],
+      [
+        "PushNotify",
+        () =>
+          pushNotify.execute({
+            provider: "gateway",
+            to: "device-token",
+            body: "a",
+            idempotencyKey: "k",
+          }),
+        () =>
+          pushNotify.execute({
+            provider: "gateway",
+            to: "device-token",
+            body: "a",
+            data: { extra: "1" },
+            idempotencyKey: "k",
+          }),
+      ],
+      [
+        "WebhookPost",
+        () =>
+          webhookPost.execute({ url: `${origin}/hook`, payload: { n: 1 }, idempotencyKey: "k" }),
+        () =>
+          webhookPost.execute({ url: `${origin}/hook`, payload: { n: 2 }, idempotencyKey: "k" }),
+      ],
+    ];
+    const seen: Array<{ tool: string; first: boolean; second: string }> = [];
+    for (const [tool, a, b] of pairs) {
+      const before = requests.length;
+      const first = String(await a()).includes('"sent":true');
+      const second = String(await b());
+      seen.push({
+        tool,
+        first,
+        second: `${second.includes(`already sent a different ${tool} request`)} ${requests.length - before}`,
+      });
+    }
+    expect(seen).toEqual([
+      { tool: "ChatPost", first: true, second: "true 1" },
+      { tool: "PushNotify", first: true, second: "true 1" },
+      { tool: "WebhookPost", first: true, second: "true 1" },
+    ]);
+  });
+
+  test("a retry that changes only how it is delivered, or its clock reading, is still a retry", async () => {
+    const chat = {
+      platform: "slack",
+      webhookUrlEnv: WEBHOOK_VAR,
+      text: "once",
+      idempotencyKey: "r1",
+    };
+    const first = String(await chatPost.execute(chat));
+    const retried = String(await chatPost.execute({ ...chat, timeoutMs: 9_000, maxBytes: 4096 }));
+    expect(retried).toBe(first);
+
+    const hook = {
+      url: `${origin}/hook`,
+      payload: { b: 2, a: 1 },
+      signing: { secretEnv: SECRET_VAR, scheme: "timestamped", timestampSeconds: 1758100000 },
+      idempotencyKey: "r2",
+    };
+    const sent = String(await webhookPost.execute(hook));
+    const again = String(
+      await webhookPost.execute({
+        ...hook,
+        // The same object with its keys in another order is the same payload.
+        payload: { a: 1, b: 2 },
+        signing: { ...hook.signing, timestampSeconds: 1758100060 },
+        retries: 2,
+        backoffMs: 10,
+      }),
+    );
+    expect(again).toBe(sent);
+    expect(requests.length).toBe(2);
+
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const mail = {
+        from: { address: "ci@example.com" },
+        to: [{ address: "ops@example.com" }],
+        subject: "Nightly",
+        text: "green",
+        host: "127.0.0.1",
+        port,
+        requireTls: false,
+        idempotencyKey: "r3",
+      };
+      const once = String(await emailSend.execute({ ...mail, date: "2026-09-17T09:30:00Z" }));
+      const twice = String(await emailSend.execute({ ...mail, date: "2026-09-17T09:31:00Z" }));
+      expect(twice).toBe(once);
+      const changed = String(
+        await emailSend.execute({
+          ...mail,
+          to: [{ address: "x@team.test" }],
+          date: "2026-09-17T09:32:00Z",
+        }),
+      );
+      expect(changed).toContain("already sent a different EmailSend request");
+      expect(changed).toContain("(it differed in to)");
+      expect(log.messages.length).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// instants
+// ---------------------------------------------------------------------------
+
+describe("an instant means the same moment on every machine", () => {
+  /**
+   * Run `body` with the process's zone set to `tz`, then put it back. Never
+   * by deleting TZ: in Bun that freezes the zone for the rest of the process.
+   * `bun test` runs in UTC when TZ is unset, so that is what an unset TZ is
+   * restored as.
+   */
+  const inZone = async <T>(tz: string, body: () => Promise<T>): Promise<T> => {
+    const previous = process.env["TZ"];
+    process.env["TZ"] = tz;
+    try {
+      return await body();
+    } finally {
+      process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+    }
+  };
+  const ZONES = ["UTC", "Asia/Tokyo", "America/Los_Angeles"];
+  const QUIET = { timezone: "UTC", quietWindows: [{ start: "22:00", end: "07:00" }] };
+  const MAIL = {
+    from: { address: "ci@example.com" },
+    to: [{ address: "ops@example.com" }],
+    subject: "s",
+    text: "t",
+  };
+
+  test("a time with no offset is refused by every tool that takes one, with the reason", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const seen: Array<{ tool: string; now: string; out: string }> = [];
+      // The last three end in something offset-shaped, and JavaScriptCore's
+      // legacy parser still read them as host time (net review): the whole
+      // string must be a zoned instant, not only its tail.
+      for (const now of [
+        "2026-09-17T23:30:00",
+        "2026-09-17",
+        "2026-09-17 23:30",
+        "Sep 17 2026-23:30",
+        "Sep 17-2026",
+        "17 Sep-0000",
+      ]) {
+        const calls: Array<[string, () => Promise<unknown>]> = [
+          ["QuietHours", () => quietHours.execute({ schedule: QUIET, now })],
+          ["RateLimitGate", () => rateLimitGate.execute({ key: "k", now, windowMs: 3_600_000 })],
+          ["EmailCompose", () => emailCompose.execute({ ...MAIL, date: now })],
+          [
+            "EmailSend",
+            () =>
+              emailSend.execute({ ...MAIL, date: now, host: "127.0.0.1", port, requireTls: false }),
+          ],
+        ];
+        for (const [tool, call] of calls) seen.push({ tool, now, out: String(await call()) });
+      }
+      // 0.7.0 read each of these as the host's local time (or, for the bare
+      // date, UTC midnight) and answered: a decision, a message, a send.
+      expect(seen.filter((s) => !s.out.includes("is not an instant"))).toEqual([]);
+      // With no zone at all, the refusal says the offset is missing. The
+      // offset-shaped tails are refused as a spelling this tool does not read.
+      const zoneless = ["2026-09-17T23:30:00", "2026-09-17", "2026-09-17 23:30"];
+      expect(
+        seen.filter(
+          (s) => zoneless.includes(s.now) && !s.out.includes("not an instant with a UTC offset"),
+        ),
+      ).toEqual([]);
+      expect(seen.filter((s) => s.out.includes('"allowed"') || s.out.includes("Date: "))).toEqual(
+        [],
+      );
+      expect(seen).toHaveLength(24);
+      // Nothing reached the SMTP server: the date is checked before the dial.
+      expect(log.commands).toEqual([]);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("net regression review: every zone-naming spelling 0.7.0 read alike on every host is read again", async () => {
+    // 23:30 UTC on 17 Sep 2026, in each spelling: Date#toString(), RFC 5322's
+    // fixed US zones, long names, month-first, and ISO's 24:00.
+    const spellings = [
+      "Thu Sep 17 2026 23:30:00 GMT+0000 (Coordinated Universal Time)",
+      "Fri Sep 18 2026 08:30:00 GMT+0900 (Japan Standard Time)",
+      "Thu, 17 Sep 2026 18:30:00 EST",
+      "Thu, 17 Sep 2026 19:30:00 EDT",
+      "Thu, 17 Sep 2026 15:30:00 PST",
+      "Thursday, 17 Sep 2026 23:30:00 GMT",
+      "Thu, 17 September 2026 23:30:00 GMT",
+      "Sep 17, 2026 23:30:00 UTC",
+    ];
+    const seen: string[] = [];
+    for (const tz of ZONES) {
+      for (const now of spellings) {
+        seen.push(String(await inZone(tz, () => emailCompose.execute({ ...MAIL, date: now }))));
+      }
+      const midnight = String(
+        await inZone(tz, () =>
+          emailCompose.execute({ ...MAIL, date: "2026-09-17T24:00:00Z", subject: "eod" }),
+        ),
+      );
+      expect(JSON.parse(midnight).message).toContain("Date: Fri, 18 Sep 2026 00:00:00 +0000");
+    }
+    expect(seen).toHaveLength(spellings.length * ZONES.length);
+    let checked = 0;
+    for (const out of seen) {
+      expect(JSON.parse(out).message).toContain("Date: Thu, 17 Sep 2026 23:30:00 +0000");
+      checked++;
+    }
+    expect(checked).toBe(seen.length);
+  });
+
+  test("a spelling that names a zone this tool will not read is refused as that, not as offset-less", async () => {
+    let checked = 0;
+    for (const now of [
+      "Thu, 17 Sep 2026 23:30:00 CET",
+      "2026-09-17T23:30:00+25:00",
+      "Thu, 31 Sep 2026 23:30:00 GMT",
+    ]) {
+      const out = String(await quietHours.execute({ schedule: QUIET, now }));
+      expect({ now, out }).toMatchObject({
+        now,
+        out: expect.stringContaining("is not an instant in a spelling this tool reads"),
+      });
+      expect(out).not.toContain("without an offset");
+      checked++;
+    }
+    expect(checked).toBe(3);
+  });
+
+  test("EmailSendPreflight fails the date check for the same value, as the send would", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, date: "2026-09-17T09:30:00" });
+    const row = check(result, "date");
+    expect(row.status).toBe("fail");
+    expect(row.detail).toContain("not an instant with a UTC offset");
+    expect(result.verdict).not.toBe("ready");
+  });
+
+  test("an offset in any spelling is read, and the answer does not move with the host zone", async () => {
+    const seen = new Map<string, string[]>();
+    for (const tz of ZONES) {
+      // Proves the zone really changed, so the comparison below is not vacuous.
+      const hour = await inZone(tz, async () => new Date(Date.UTC(2026, 8, 17, 23, 30)).getHours());
+      expect({ tz, moved: tz === "UTC" || hour !== 23 }).toEqual({ tz, moved: true });
+      for (const now of [
+        "2026-09-17T23:30:00Z",
+        "2026-09-18T08:30:00+09:00",
+        "2026-09-17T16:30:00-0700",
+        "Thu, 17 Sep 2026 23:30:00 +0000",
+        "17 Sep 2026 23:30 GMT",
+      ]) {
+        const quiet = String(await inZone(tz, () => quietHours.execute({ schedule: QUIET, now })));
+        const gate = String(
+          await inZone(tz, () => rateLimitGate.execute({ key: "k", now, windowMs: 3_600_000 })),
+        );
+        const mail = String(await inZone(tz, () => emailCompose.execute({ ...MAIL, date: now })));
+        for (const [name, out] of [
+          ["QuietHours", quiet],
+          ["RateLimitGate", gate],
+          ["EmailCompose", mail],
+        ] as const) {
+          seen.set(name, [...(seen.get(name) ?? []), out]);
+        }
+      }
+    }
+    for (const [name, outs] of seen) {
+      expect({ name, distinct: new Set(outs).size, runs: outs.length }).toEqual({
+        name,
+        distinct: 1,
+        runs: 15,
+      });
+    }
+    const decision = JSON.parse(seen.get("QuietHours")?.[0] ?? "{}");
+    expect(decision).toMatchObject({ allowed: false, localTime: "23:30" });
+    expect(JSON.parse(seen.get("EmailCompose")?.[0] ?? "{}").message).toContain(
+      "Date: Thu, 17 Sep 2026 23:30:00 +0000",
+    );
   });
 });
 

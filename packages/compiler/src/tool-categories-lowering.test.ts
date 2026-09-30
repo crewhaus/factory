@@ -121,7 +121,9 @@ edges: []
 tools: [read]
 `) as unknown as { subAgents?: Array<{ tools: string[] }> };
     const sub = ir.subAgents?.[0];
-    expect(sub?.tools).toEqual(["glob", "grep", "read"]);
+    // shape-reach#3 — expanded, then mapped to the registered names the
+    // child catalog is filtered by; spec keys here gave the child no tools.
+    expect(sub?.tools).toEqual(["Glob", "Grep", "Read"]);
   });
 });
 
@@ -150,6 +152,26 @@ describe("compile errors", () => {
 
   test("a dead exclusion fails the compile rather than passing silently", () => {
     expect(() => irOf(`${CLI_HEAD}tools: [all-fs, -gitPush]\n`)).toThrow(/nothing includes/);
+    expect(() => irOf(`${CLI_HEAD}tools: [all-fs, -all-chain]\n`)).toThrow(
+      '"-all-chain" excludes a category none of whose tools is included',
+    );
+  });
+
+  // flag-truth-6#10 — on 0.7.0 this failed with "exclude tools that nothing
+  // includes", naming every network tool outside all-code.
+  test("a category exclusion that overlaps the includes only in part compiles", () => {
+    const ir = irOf(`${CLI_HEAD}tools: [all-code, -all-network]\n`);
+    const tools = ir.tools as string[];
+    expect(tools).toContain("read");
+    for (const gone of ["registrySearch", "dependencyAudit", "containerImageInspect"]) {
+      expect(tools).not.toContain(gone);
+    }
+  });
+
+  test("an Object.prototype name is an unknown category, not an empty one", () => {
+    expect(() => irOf(`${CLI_HEAD}tools: [all-constructor]\n`)).toThrow(
+      'unknown tool category "all-constructor"',
+    );
   });
 
   test("the error names the offending path so a big spec is navigable", () => {

@@ -28,7 +28,10 @@
  * Secrets: no tool accepts an inline credential. An `auth` profile names an
  * environment VARIABLE, and inline `Authorization`/`Cookie` headers are
  * refused, because a token a model can put in a tool argument is a token in
- * the transcript, the trace and the eval report.
+ * the transcript, the trace and the eval report. The variable must be one
+ * the operator listed in `tool_config.http.allowed_auth_envs` (optionally
+ * bound to origins): the model chooses among those names, never adds one.
+ * Whatever a server echoes of the credential is scrubbed from the result.
  *
  * Results are compact JSON, and a caller's mistake comes back as a readable
  * string rather than an exception.
@@ -43,12 +46,21 @@ import {
   resolveNs,
   resolveTxt,
 } from "node:dns/promises";
-import { lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import * as path from "node:path";
+import { lstatSync } from "node:fs";
 import { connect as tlsConnect } from "node:tls";
 import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import {
+  type SecretValue,
+  containsKnownSecret,
+  redactKnownSecrets,
+  redactKnownSecretsDeep,
+  secretForms,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { formatDn, summarizeCert } from "./lib/cert";
 import { parseFeed } from "./lib/feed";
@@ -65,6 +77,7 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_TIMEOUT_MS,
   HttpPermissionError,
+  HttpRefusedError,
   MAX_MAX_BYTES,
   MAX_REDIRECTS,
   MAX_TIMEOUT_MS,
@@ -72,8 +85,11 @@ import {
   assertHostAllowed,
   assertNotSsrf,
   authHeaderName,
+  bodyFailure,
   byString,
+  canonicalizeOriginOf,
   describeFailure,
+  isDeadlineAbort,
   json,
   openRequest,
   parseUrl,
@@ -82,22 +98,26 @@ import {
   redactHeaders,
   rejectInlineCredentials,
   resolveHttpConfig,
+  resolveSigningSecret,
   responseHeaders,
   safeUrlLabel,
   sleep,
   startDeadline,
 } from "./net";
 import type { AuthProfile, Deadline, HttpConfig } from "./net";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 export {
   HttpPermissionError,
+  HttpRefusedError,
+  HttpUnresolvedError,
   _resetHttpConfig,
   _setDnsLookup,
   _setRawFetch,
   __setPrivateHostsAllowedForTest,
   canonicalizeOrigin,
   getHttpConfig,
+  guardedGet,
   registerHttpConfig,
 } from "./net";
 export { ToolPermissionError } from "./paths";
@@ -128,7 +148,9 @@ const authSchema = z
     envVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the secret — never the secret itself"),
+      .describe(
+        "NAME of the environment variable holding the secret — never the secret itself; it must be listed in tool_config.http.allowed_auth_envs",
+      ),
     headerName: z.string().min(1).optional().describe('header to set when type is "header"'),
     username: z
       .string()
@@ -187,24 +209,65 @@ type PreparedHeaders =
        * in `Authorization`.
        */
       readonly secretHeaders: ReadonlySet<string>;
+      /** Where the operator allows the credential to go, when it bound it. */
+      readonly credentialOrigins: ReadonlySet<string> | undefined;
     }
   | { readonly ok: false; readonly message: string };
 
-/** Reject inline credentials, then attach the auth profile's secret. */
+/**
+ * Reject inline credentials, then attach the auth profile's secret: only
+ * from a variable `tool_config.http.allowed_auth_envs` lists. Every spelling
+ * of the resolved secret is added to `secrets`, which the tool's
+ * {@link scrubbing} wrapper removes from whatever the call returns.
+ */
 function prepareHeaders(
   raw: Record<string, string> | undefined,
   auth: AuthProfile | undefined,
+  cfg: HttpConfig,
+  secrets: SecretValue[],
 ): PreparedHeaders {
   const headers: Record<string, string> = { ...(raw ?? {}) };
   const inline = rejectInlineCredentials(headers);
   if (inline !== null) return { ok: false, message: inline };
-  const authError = applyAuth(headers, auth);
-  if (authError !== null) return { ok: false, message: authError };
-  const named = authHeaderName(auth);
+  const applied = applyAuth(headers, auth, cfg);
+  if (!applied.ok) return { ok: false, message: applied.message };
+  secrets.push(...applied.secrets);
   return {
     ok: true,
     headers,
-    secretHeaders: named === undefined ? new Set<string>() : new Set([named]),
+    secretHeaders: applied.secretHeaders,
+    credentialOrigins: applied.credentialOrigins,
+  };
+}
+
+/**
+ * The execute of a tool that can carry a credential, with every known
+ * spelling of it scrubbed from what comes back.
+ *
+ * The credential is only ever placed in a header, and the echoed request
+ * headers are redacted by name. But a server that echoes the request (a
+ * debugging endpoint, a JSON page that repeats a header), a 401 that quotes
+ * the rejected key, or a JSON preview of the body would put the secret into
+ * the transcript, the trace and the eval report. `secrets` is filled by
+ * {@link prepareHeaders}; a JSON result is redacted value by value, so it
+ * still parses.
+ */
+function scrubbing<TInput>(
+  run: (
+    input: TInput,
+    ctx: ToolExecuteContext | undefined,
+    secrets: SecretValue[],
+  ) => Promise<string>,
+): (input: TInput, ctx?: ToolExecuteContext) => Promise<string> {
+  return async (input, ctx) => {
+    const secrets: SecretValue[] = [];
+    const out = await run(input, ctx, secrets);
+    if (secrets.length === 0) return out;
+    try {
+      return JSON.stringify(redactKnownSecretsDeep(JSON.parse(out) as unknown, secrets));
+    } catch {
+      return redactKnownSecrets(out, secrets);
+    }
   };
 }
 
@@ -216,19 +279,47 @@ function setDefaultHeader(headers: Record<string, string>, name: string, value: 
   headers[name] = value;
 }
 
-/** Parse a body as JSON, or say why it is not JSON without dumping it all back. */
+/**
+ * Parse a body as JSON, or say why it is not JSON without dumping it all
+ * back. The preview is a cut, and a cut can fall inside a credential the
+ * server echoed (C050): whatever part of one it leaves at the end is
+ * trimmed, so the scrubber, which matches whole forms, is not relied on.
+ */
 function parseJsonBody(
   text: string,
+  secrets: readonly SecretValue[],
 ): { ok: true; value: unknown } | { ok: false; message: string } {
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch (err) {
-    const preview = text.slice(0, 200);
+    const preview = text.length > 200 ? trimSecretTail(text.slice(0, 200), secrets) : text;
     return {
       ok: false,
       message: `response body is not JSON (${(err as Error).message}); first 200 characters: ${preview}`,
     };
   }
+}
+
+/**
+ * Whether `bytes` hold any spelling of a credential this call sent, at the
+ * length the scrubber redacts (six characters and up). A result is
+ * scrubbed on its way out; a file written to the workspace is not, and any
+ * later Read would return it whole (C050).
+ */
+function holdsSecret(bytes: Uint8Array, secrets: readonly SecretValue[]): boolean {
+  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (const value of secrets) {
+    if ((typeof value === "string" ? value : value.secret).trim().length < 6) continue;
+    for (const form of secretForms(value)) {
+      if (form.length >= 6 && buf.includes(form)) return true;
+    }
+  }
+  // A spelling escaped character by character (System.Text.Json's `\u002B`
+  // for `+`, a lower-case `%2f`, an HTML `&#x2F;`) is no whole form; it is
+  // found through the decoded text. Non-UTF-8 bytes decode to U+FFFD and
+  // leave an ASCII credential intact.
+  if (secrets.length === 0) return false;
+  return containsKnownSecret(new TextDecoder("utf-8").decode(bytes), secrets);
 }
 
 /** Run `fn` over `items` with at most `limit` in flight, results in input order. */
@@ -296,7 +387,7 @@ async function fetchText(
     cfg,
     redirect: "follow",
   });
-  const body = await readCapped(opened.res, maxBytes);
+  const body = await readCapped(opened.res, maxBytes, deadline.signal);
   return {
     status: opened.res.status,
     text: body.text,
@@ -311,8 +402,9 @@ async function fetchText(
 
 export const httpRequest: RegisteredTool = buildTool({
   name: "HttpRequest",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
-    "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 301, 302 or 303 answer to a non-GET is followed as a GET with the body dropped, as HTTP requires, so a POST is never replayed at a hop the caller did not ask for.",
+    "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 303 answer, or a 301 or 302 answer to a POST, is followed as a GET with the body dropped, as the Fetch standard and browsers do, so a POST is never replayed at a hop the caller did not ask for; a PUT, PATCH or DELETE keeps its method and body on a 301 or 302, as on a 307 or 308.",
   inputSchema: z.object({
     url: urlSchema,
     method: z
@@ -350,13 +442,12 @@ export const httpRequest: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const method = input.method ?? "GET";
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const retryOn = new Set(input.retryOnStatus ?? []);
@@ -376,6 +467,7 @@ export const httpRequest: RegisteredTool = buildTool({
           redirect: input.redirect ?? "follow",
           maxRedirects: input.maxRedirects ?? MAX_REDIRECTS,
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
         });
         const status = opened.res.status;
         const shouldRetry = attempt < maxRetries && retryOn.has(status);
@@ -399,8 +491,8 @@ export const httpRequest: RegisteredTool = buildTool({
             continue;
           }
         }
-        const body = await readCapped(opened.res, maxBytes);
-        const parsed = input.parseJson === true ? parseJsonBody(body.text) : undefined;
+        const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
+        const parsed = input.parseJson === true ? parseJsonBody(body.text, secrets) : undefined;
         if (parsed !== undefined && !parsed.ok) return parsed.message;
         return json({
           status,
@@ -413,6 +505,8 @@ export const httpRequest: RegisteredTool = buildTool({
           headers: responseHeaders(opened.res),
           bytes: body.bytes,
           truncated: body.truncated,
+          // Only when the server labelled the body with a coding it is not in.
+          ...(body.undecodedEncoding !== null ? { undecodedEncoding: body.undecodedEncoding } : {}),
           requestHeaders: redactHeaders(prepared.headers, prepared.secretHeaders),
           elapsedMs: Date.now() - startedAt,
           ...(parsed !== undefined ? { json: parsed.value } : { body: body.text }),
@@ -423,7 +517,7 @@ export const httpRequest: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -432,6 +526,7 @@ export const httpRequest: RegisteredTool = buildTool({
 
 export const httpPaginate: RegisteredTool = buildTool({
   name: "HttpPaginate",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Walk a paginated API to the end or to a page cap and return the concatenated items, following RFC 5988 Link headers, a cursor field you name, or a page-number parameter. Use it instead of calling Fetch once per page: a seven-page listing becomes one tool call rather than seven model turns. It issues GET only, holds every item in memory, and stops at whichever comes first of the page cap, the item cap, the total-byte budget, an empty page or the deadline — the result says which.",
   inputSchema: z.object({
@@ -494,7 +589,7 @@ export const httpPaginate: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const first = parseUrl(input.url);
     if (typeof first === "string") return first;
     if (
@@ -506,14 +601,18 @@ export const httpPaginate: RegisteredTool = buildTool({
     if (input.style === "page" && input.pageParam === undefined) {
       return 'style "page" needs pageParam — the query parameter holding the page number';
     }
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs, ctx?.signal);
     const maxTotalBytes = input.maxTotalBytes ?? MAX_MAX_BYTES;
     const items: unknown[] = [];
+    // The credential is for the origin the call named. A Link header is the
+    // server's choice of the next URL, so a page on any other origin is
+    // requested without it (C058), as a redirect to one is.
+    const credentialOrigin = canonicalizeOriginOf(first);
+    let credentialsDropped = false;
     let totalBytes = 0;
     let pages = 0;
     let stoppedBy = "end";
@@ -547,8 +646,11 @@ export const httpPaginate: RegisteredTool = buildTool({
           cfg,
           redirect: "follow",
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
+          credentialOrigin,
         });
-        const body = await readCapped(opened.res, maxBytes);
+        if (opened.credentialsDropped) credentialsDropped = true;
+        const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
         pages++;
         totalBytes += body.bytes;
         if (opened.res.status < 200 || opened.res.status >= 300) {
@@ -558,6 +660,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             stoppedBy: "status",
             lastUrl,
             status: opened.res.status,
+            credentialsDropped,
             items,
             note: `page ${pages} returned HTTP ${opened.res.status}; the walk stopped there`,
           });
@@ -568,11 +671,12 @@ export const httpPaginate: RegisteredTool = buildTool({
             itemCount: items.length,
             stoppedBy: "pageTooLarge",
             lastUrl,
+            credentialsDropped,
             items,
             note: `page ${pages} exceeded the ${maxBytes}-byte cap, so it could not be parsed; raise maxBytes or request a smaller page size`,
           });
         }
-        const parsed = parseJsonBody(body.text);
+        const parsed = parseJsonBody(body.text, secrets);
         if (!parsed.ok) return `page ${pages}: ${parsed.message}`;
 
         const rawItems =
@@ -583,6 +687,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             itemCount: items.length,
             stoppedBy: "shape",
             lastUrl,
+            credentialsDropped,
             items,
             note:
               input.itemsPath === undefined
@@ -612,8 +717,10 @@ export const httpPaginate: RegisteredTool = buildTool({
 
         // Where the next page lives, per style.
         if (input.style === "link") {
+          // Relative to the page that carried the header: where the request
+          // ended up after any redirect, not where it started.
           const next = relTarget(opened.res.headers.get("link"), "next");
-          current = next === undefined ? null : (new URL(next, current) as URL);
+          current = next === undefined ? null : (new URL(next, opened.finalUrl) as URL);
         } else if (input.style === "cursor" && input.cursorPath !== undefined) {
           const cursor = readPath(parsed.value, input.cursorPath);
           if (cursor === undefined || cursor === null || cursor === "") {
@@ -636,13 +743,21 @@ export const httpPaginate: RegisteredTool = buildTool({
           current = null;
         }
       }
-      return json({ pages, itemCount: items.length, bytes: totalBytes, stoppedBy, lastUrl, items });
+      return json({
+        pages,
+        itemCount: items.length,
+        bytes: totalBytes,
+        stoppedBy,
+        lastUrl,
+        credentialsDropped,
+        items,
+      });
     } catch (err) {
       return describeFailure(err, deadline);
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -651,6 +766,7 @@ export const httpPaginate: RegisteredTool = buildTool({
 
 export const graphqlQuery: RegisteredTool = buildTool({
   name: "GraphqlQuery",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "POST a GraphQL query or mutation with variables to an allow-listed endpoint and return data and errors as separate fields. Use it so a partial GraphQL response — which arrives as HTTP 200 with a populated errors array — is visible as an error instead of being mistaken for success. It does not validate the query against a schema, does not batch operations, and does not follow @defer or subscription streams.",
   inputSchema: z.object({
@@ -670,17 +786,16 @@ export const graphqlQuery: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
     // Case-insensitively, so a caller that wrote "Content-Type" does not end
     // up with two of them on the wire.
     setDefaultHeader(prepared.headers, "content-type", "application/json");
     setDefaultHeader(prepared.headers, "accept", "application/json");
-
-    const cfg = configFor(ctx);
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const opened = await openRequest({
@@ -696,12 +811,18 @@ export const graphqlQuery: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
-      const body = await readCapped(opened.res, input.maxBytes ?? DEFAULT_MAX_BYTES);
+      const body = await readCapped(
+        opened.res,
+        input.maxBytes ?? DEFAULT_MAX_BYTES,
+        deadline.signal,
+        secrets,
+      );
       if (body.truncated) {
         return `the GraphQL response exceeded the ${input.maxBytes ?? DEFAULT_MAX_BYTES}-byte cap and could not be parsed — narrow the selection set or raise maxBytes`;
       }
-      const parsed = parseJsonBody(body.text);
+      const parsed = parseJsonBody(body.text, secrets);
       if (!parsed.ok) {
         return `HTTP ${opened.res.status}: ${parsed.message}`;
       }
@@ -719,7 +840,7 @@ export const graphqlQuery: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -728,6 +849,7 @@ export const graphqlQuery: RegisteredTool = buildTool({
 
 export const httpBatch: RegisteredTool = buildTool({
   name: "HttpBatch",
+  operativeArgs: [{ field: "requests.url", kind: "url" }],
   description:
     "Issue several independent requests with a concurrency cap and return every result in request order, whether it succeeded or failed. Use it when a step needs a handful of unrelated endpoints — one per resource id, say — and calling them one at a time would spend a model turn each. Requests cannot depend on one another, a failure never cancels the rest, and each response is capped independently. The batch has its own deadline as well as a per-request one, so requests still queued when it elapses come back as skipped rather than running the batch out to the sum of its parts.",
   inputSchema: z.object({
@@ -768,7 +890,7 @@ export const httpBatch: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const cfg = configFor(ctx);
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const perRequestMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -785,7 +907,7 @@ export const httpBatch: RegisteredTool = buildTool({
         async (req, index) => {
           const url = parseUrl(req.url);
           if (typeof url === "string") return { index, url: req.url, ok: false, error: url };
-          const prepared = prepareHeaders(req.headers, input.auth);
+          const prepared = prepareHeaders(req.headers, input.auth, cfg, secrets);
           if (!prepared.ok) return { index, url: req.url, ok: false, error: prepared.message };
           if (overall.expired()) {
             return {
@@ -809,8 +931,9 @@ export const httpBatch: RegisteredTool = buildTool({
               cfg,
               redirect: "follow",
               credentialHeaders: prepared.secretHeaders,
+              credentialOrigins: prepared.credentialOrigins,
             });
-            const body = await readCapped(opened.res, maxBytes);
+            const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
             return {
               index,
               url: req.url,
@@ -838,19 +961,21 @@ export const httpBatch: RegisteredTool = buildTool({
     } finally {
       overall.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
 // download
 // ---------------------------------------------------------------------------
 
-let partCounter = 0;
-
 export const downloadFile: RegisteredTool = buildTool({
   name: "DownloadFile",
+  operativeArgs: [
+    { field: "url", kind: "url" },
+    { field: "path", kind: "path" },
+  ],
   description:
-    "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination.",
+    "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination. A body that contains the credential the call sent (a server echoing it) is refused, because a file is not scrubbed the way a result is.",
   inputSchema: z.object({
     url: urlSchema,
     path: z
@@ -879,10 +1004,18 @@ export const downloadFile: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   destructive: true,
-  execute: async (input, ctx) => {
+  // 0.7.1 (permission-integration#11) — the rule every builtin now follows:
+  // a destructive tool that goes to a place the model chose (a url or
+  // recipient operative argument) is justification-gated. The request goes to
+  // a URL the model picked, carrying whatever it put in it, and what comes
+  // back is written into the workspace — as for HttpRequest, which has
+  // always been gated.
+  requireJustification: true,
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
 
     let target: ReturnType<typeof resolveSafe>;
@@ -901,13 +1034,8 @@ export const downloadFile: RegisteredTool = buildTool({
     ) {
       return `"${target.rel}" already exists — pass overwrite: true to replace it`;
     }
-
-    const cfg = configFor(ctx);
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
-    // A distinct partial name per call so two concurrent downloads into the
-    // same directory cannot clobber each other's in-flight bytes.
-    const partial = `${target.real}.crewhaus-part-${process.pid}-${partCounter++}`;
     try {
       const opened = await openRequest({
         url,
@@ -917,6 +1045,7 @@ export const downloadFile: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       if (opened.res.status < 200 || opened.res.status >= 300) {
         try {
@@ -927,17 +1056,32 @@ export const downloadFile: RegisteredTool = buildTool({
         return `HTTP ${opened.res.status} ${opened.res.statusText} from ${safeUrlLabel(opened.finalUrl)} — nothing was written`;
       }
       // One extra byte past the cap is enough to know it was exceeded.
-      const raw = await readBytesCapped(opened.res, maxBytes + 1);
+      const raw = await readBytesCapped(opened.res, maxBytes + 1, deadline.signal);
       if (raw.truncated || raw.bytes.byteLength > maxBytes) {
         return `the response is larger than the ${maxBytes}-byte cap — nothing was written; raise maxBytes if the file really is that big`;
+      }
+      if (holdsSecret(raw.bytes, secrets)) {
+        return "the response body contains the credential this call sent (the server echoed it back), so nothing was written: a file in the workspace is not scrubbed the way a result is";
       }
       const digest = createHash("sha256").update(raw.bytes).digest("hex");
       if (input.expectedSha256 !== undefined && digest !== input.expectedSha256.toLowerCase()) {
         return `checksum mismatch: expected ${input.expectedSha256.toLowerCase()}, got ${digest} — nothing was written`;
       }
-      mkdirSync(path.dirname(target.real), { recursive: true });
-      writeFileSync(partial, raw.bytes);
-      renameSync(partial, target.real);
+      // The bytes go to a temp created O_EXCL|O_NOFOLLOW under a random name
+      // beside the destination, and are renamed into place. 0.7.0 wrote a
+      // name anyone could predict (`<dest>.crewhaus-part-<pid>-<n>`) with a
+      // plain open, so a link planted there carried the download out of the
+      // workspace, or truncated a file outside through a hard link, while
+      // the result reported the in-workspace path (security-8#13). Parent
+      // directories are created one at a time, each contained; a link at the
+      // leaf is followed only while it stays inside the workspace, and a
+      // FIFO, device or directory there is refused.
+      const written = writeFileSafe(workspaceRoot(), input.path, raw.bytes, {
+        overwrite: input.overwrite === true,
+        createParents: true,
+        leafSymlink: "follow-contained",
+      });
+      if (!written.ok) return `${written.reason} — nothing was written`;
       const contentType = opened.res.headers.get("content-type");
       return json({
         path: target.rel,
@@ -952,9 +1096,8 @@ export const downloadFile: RegisteredTool = buildTool({
       return describeFailure(err, deadline);
     } finally {
       deadline.cancel();
-      rmSync(partial, { force: true });
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -963,6 +1106,7 @@ export const downloadFile: RegisteredTool = buildTool({
 
 export const headRequest: RegisteredTool = buildTool({
   name: "HeadRequest",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Ask for a URL's metadata without its body: status, size, content type, ETag, last-modified and caching headers. Use it to check whether a resource exists, how big it is, or whether a cached copy is still current, without spending the bytes on a download. Some servers refuse HEAD with 405 or 501, so this falls back to a single-byte ranged GET and says so in usedRangedGet.",
   inputSchema: z.object({
@@ -979,13 +1123,12 @@ export const headRequest: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       let opened = await openRequest({
@@ -996,6 +1139,7 @@ export const headRequest: RegisteredTool = buildTool({
         cfg,
         redirect: input.redirect ?? "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       let usedRangedGet = false;
       if (
@@ -1015,6 +1159,7 @@ export const headRequest: RegisteredTool = buildTool({
           cfg,
           redirect: input.redirect ?? "follow",
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
         });
         usedRangedGet = true;
       }
@@ -1050,13 +1195,14 @@ export const headRequest: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 export const urlReachable: RegisteredTool = buildTool({
   name: "UrlReachable",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
-    "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one.",
+    "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one. A probe the allow-list or the SSRF check refuses was never sent, and comes back as reachable null with refused true, not as unreachable.",
   inputSchema: z.object({
     url: urlSchema,
     method: z.enum(["HEAD", "GET"]).optional().describe("default HEAD"),
@@ -1096,6 +1242,22 @@ export const urlReachable: RegisteredTool = buildTool({
         latencyMs,
       });
     } catch (err) {
+      if (err instanceof HttpRefusedError) {
+        // The gate stopped the probe, so it cannot say whether the endpoint
+        // is up. If the endpoint answered with a redirect the gate would not
+        // follow, THAT is a fact, and so is its status.
+        return json(
+          err.redirectStatus === undefined
+            ? { reachable: null, refused: true, error: err.message }
+            : {
+                reachable: true,
+                status: err.redirectStatus,
+                ok: null,
+                redirectRefused: err.message,
+                latencyMs: Date.now() - startedAt,
+              },
+        );
+      }
       return json({
         reachable: false,
         latencyMs: Date.now() - startedAt,
@@ -1109,8 +1271,9 @@ export const urlReachable: RegisteredTool = buildTool({
 
 export const linkCheck: RegisteredTool = buildTool({
   name: "LinkCheck",
+  operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable.",
+    "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable. A URL the allow-list or the SSRF check refuses (or whose redirect it refuses), and one the sweep deadline left unchecked, is reported as refused or skipped with ok null, and counted apart from the broken links.",
   inputSchema: z.object({
     urls: z.array(urlSchema).min(1).max(100),
     method: z.enum(["HEAD", "GET"]).optional().describe("default HEAD"),
@@ -1133,8 +1296,14 @@ export const linkCheck: RegisteredTool = buildTool({
     const perRequest = input.perRequestTimeoutMs ?? 10_000;
     try {
       const results = await mapWithConcurrency(input.urls, input.concurrency ?? 4, async (raw) => {
-        if (overall.expired())
-          return { url: raw, ok: false, error: "skipped: the sweep deadline elapsed" };
+        if (overall.expired()) {
+          return {
+            url: raw,
+            ok: null,
+            skipped: true,
+            error: "skipped: the sweep deadline elapsed before this URL was checked",
+          };
+        }
         const url = parseUrl(raw);
         if (typeof url === "string") return { url: raw, ok: false, error: url };
         const deadline = startDeadline(
@@ -1162,6 +1331,17 @@ export const linkCheck: RegisteredTool = buildTool({
             ...(opened.finalUrl !== raw ? { finalUrl: opened.finalUrl } : {}),
           };
         } catch (err) {
+          if (err instanceof HttpRefusedError) {
+            // Not checked, so neither ok nor broken: the gate refused it
+            // (or refused the redirect it answered with).
+            return {
+              url: raw,
+              ok: null,
+              refused: true,
+              ...(err.redirectStatus !== undefined ? { status: err.redirectStatus } : {}),
+              error: err.message,
+            };
+          }
           return { url: raw, ok: false, error: describeFailure(err, deadline) };
         } finally {
           deadline.cancel();
@@ -1169,8 +1349,10 @@ export const linkCheck: RegisteredTool = buildTool({
       });
       return json({
         checked: results.length,
-        okCount: results.filter((r) => r.ok).length,
-        brokenCount: results.filter((r) => !r.ok).length,
+        okCount: results.filter((r) => r.ok === true).length,
+        brokenCount: results.filter((r) => r.ok === false).length,
+        refusedCount: results.filter((r) => "refused" in r).length,
+        skippedCount: results.filter((r) => "skipped" in r).length,
         results,
       });
     } finally {
@@ -1185,6 +1367,7 @@ export const linkCheck: RegisteredTool = buildTool({
 
 export const httpWaitFor: RegisteredTool = buildTool({
   name: "HttpWaitFor",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Poll a URL until it answers with an expected status or a named JSON field satisfies a predicate, within a required deadline. Use it to wait for a deploy, a migration or an async job to reach a stated condition instead of guessing with a sleep and burning a model turn per check. The deadline is mandatory and the poll never runs past it; the result says whether the condition was met, how many attempts it took and what the last answer was.",
   inputSchema: z.object({
@@ -1223,16 +1406,15 @@ export const httpWaitFor: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
     if (input.expectStatus === undefined && input.expectJson === undefined) {
       return "nothing to wait for — give expectStatus, expectJson, or both";
     }
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const method = input.method ?? "GET";
     if (method === "HEAD" && input.expectJson !== undefined) {
       return "expectJson needs a body, so it cannot be used with method HEAD";
@@ -1265,15 +1447,28 @@ export const httpWaitFor: RegisteredTool = buildTool({
             cfg,
             redirect: "follow",
             credentialHeaders: prepared.secretHeaders,
+            credentialOrigins: prepared.credentialOrigins,
           });
           lastStatus = opened.res.status;
           const statusOk = wantStatus.size === 0 || wantStatus.has(opened.res.status);
           let jsonOk = predicate === undefined;
           if (predicate !== undefined) {
-            const body = await readCapped(opened.res, input.maxBytes ?? DEFAULT_MAX_BYTES);
-            const parsed = parseJsonBody(body.text);
+            const body = await readCapped(
+              opened.res,
+              input.maxBytes ?? DEFAULT_MAX_BYTES,
+              deadline.signal,
+              secrets,
+            );
+            const parsed = parseJsonBody(body.text, secrets);
             if (parsed.ok) {
-              jsonOk = matchesPredicateSafely(parsed.value, predicate);
+              // Judged on the body AS THE CALLER MAY SEE IT, credentials
+              // redacted. On the raw body, `contains` and `equals` against
+              // an echoed header answered met/not-met for a guessed prefix,
+              // so a listed credential could be read out one character per
+              // call from any allow-listed origin that echoes (C050).
+              const visible =
+                secrets.length === 0 ? parsed.value : redactKnownSecretsDeep(parsed.value, secrets);
+              jsonOk = matchesPredicateSafely(visible, predicate);
               lastError = undefined;
             } else {
               jsonOk = false;
@@ -1315,7 +1510,7 @@ export const httpWaitFor: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 /**
@@ -1337,6 +1532,7 @@ function matchesPredicateSafely(body: unknown, predicate: FieldPredicate): boole
 
 export const sseRead: RegisteredTool = buildTool({
   name: "SseRead",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Open a server-sent-events endpoint and collect events until a count, a terminator event name, or a required deadline — whichever comes first. Use it to capture a bounded slice of a streaming endpoint, such as a job's progress feed, in one call. It does not reconnect on Last-Event-ID, does not interpret the data payloads, and always closes the connection before returning. The terminator ends the read where it arrives, so events the server had already queued behind it are not returned.",
   inputSchema: z.object({
@@ -1360,14 +1556,13 @@ export const sseRead: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
     setDefaultHeader(prepared.headers, "accept", "text/event-stream");
-
-    const cfg = configFor(ctx);
     const maxEvents = input.maxEvents ?? 50;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs, ctx?.signal);
@@ -1385,6 +1580,7 @@ export const sseRead: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       status = opened.res.status;
       if (status < 200 || status >= 300 || opened.res.body === null) {
@@ -1396,28 +1592,22 @@ export const sseRead: RegisteredTool = buildTool({
         return json({ status, count: 0, events: [], stoppedBy: "status", bytes: 0 });
       }
 
-      const reader = opened.res.body.getReader();
+      // The stream arrives raw and is decoded here, under the byte cap, so a
+      // compressed stream cannot inflate past it (see net.ts pinnedFetch).
+      const body = decodeBody(opened.res, { maxBytes, signal: deadline.signal });
       const decoder = new TextDecoder("utf-8", { fatal: false });
       const sse = new SseDecoder();
       try {
-        while (true) {
-          if (deadline.expired()) {
-            stoppedBy = "deadline";
-            break;
-          }
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value !== undefined) {
-            bytes += value.byteLength;
-            for (const event of sse.push(decoder.decode(value, { stream: true }))) {
-              collected.push(event);
-              if (input.terminatorEvent !== undefined && event.event === input.terminatorEvent) {
-                // The terminator ends the read. Events the server had already
-                // pushed into the same chunk are dropped rather than returned
-                // after the event that said the stream was finished.
-                stoppedBy = "terminator";
-                break;
-              }
+        for await (const value of body) {
+          bytes += value.byteLength;
+          for (const event of sse.push(decoder.decode(value, { stream: true }))) {
+            collected.push(event);
+            if (input.terminatorEvent !== undefined && event.event === input.terminatorEvent) {
+              // The terminator ends the read. Events the server had already
+              // pushed into the same chunk are dropped rather than returned
+              // after the event that said the stream was finished.
+              stoppedBy = "terminator";
+              break;
             }
           }
           if (stoppedBy === "terminator") break;
@@ -1430,19 +1620,26 @@ export const sseRead: RegisteredTool = buildTool({
             break;
           }
         }
-        if (stoppedBy === "streamEnded") {
-          for (const event of sse.flush()) collected.push(event);
+        const outcome = body.outcome;
+        if (stoppedBy === "streamEnded" && outcome !== undefined) {
+          if (!outcome.ok) {
+            if (outcome.code !== "aborted" && outcome.code !== "stalled") {
+              return describeFailure(bodyFailure(outcome), deadline);
+            }
+            stoppedBy = deadline.timedOut() ? "deadline" : "error";
+          } else if (outcome.truncated) {
+            stoppedBy = "byteCap";
+          } else {
+            for (const event of sse.flush()) collected.push(event);
+          }
         }
       } catch (err) {
-        stoppedBy = deadline.expired() ? "deadline" : "error";
+        // Why the stream stopped is the cause, not the clock: an error that
+        // arrived after the deadline's time but before its timer ran is an
+        // error.
+        stoppedBy = isDeadlineAbort(err, deadline) ? "deadline" : "error";
         if (stoppedBy === "error" && !(err instanceof Error && err.name === "AbortError")) {
           return describeFailure(err, deadline);
-        }
-      } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          // already closed
         }
       }
 
@@ -1458,7 +1655,7 @@ export const sseRead: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -1474,14 +1671,16 @@ const schemeSchema = z
 export const webhookSign: RegisteredTool = buildTool({
   name: "WebhookSign",
   description:
-    "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
+    "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs, and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
   inputSchema: z.object({
     scheme: schemeSchema,
     payload: z.string().describe("the exact body bytes to sign — not a re-serialised object"),
     secretEnvVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the signing secret"),
+      .describe(
+        "NAME of the environment variable holding the signing secret; it must be listed in tool_config.http.allowed_signing_envs",
+      ),
     timestamp: z
       .number()
       .int()
@@ -1496,11 +1695,10 @@ export const webhookSign: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const secret = process.env[input.secretEnvVar];
-    if (secret === undefined || secret === "") {
-      return `environment variable "${input.secretEnvVar}" is unset or empty in this process`;
-    }
+  execute: async (input, ctx) => {
+    const resolved = resolveSigningSecret(input.secretEnvVar, configFor(ctx));
+    if (!resolved.ok) return resolved.message;
+    const secret = resolved.secret;
     if (input.scheme === "timestamped" && input.timestamp === undefined) {
       return 'the timestamped scheme needs an explicit timestamp (unix seconds) — it is not defaulted to "now", so that the same call always produces the same signature';
     }
@@ -1523,7 +1721,7 @@ export const webhookSign: RegisteredTool = buildTool({
 export const webhookVerify: RegisteredTool = buildTool({
   name: "WebhookVerify",
   description:
-    "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
+    "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
   inputSchema: z.object({
     scheme: schemeSchema,
     payload: z
@@ -1535,7 +1733,9 @@ export const webhookVerify: RegisteredTool = buildTool({
     secretEnvVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the signing secret"),
+      .describe(
+        "NAME of the environment variable holding the signing secret; it must be listed in tool_config.http.allowed_signing_envs",
+      ),
     algorithm: z.enum(["sha256", "sha1"]).optional().describe("default sha256"),
     toleranceSeconds: z
       .number()
@@ -1552,11 +1752,10 @@ export const webhookVerify: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const secret = process.env[input.secretEnvVar];
-    if (secret === undefined || secret === "") {
-      return `environment variable "${input.secretEnvVar}" is unset or empty in this process`;
-    }
+  execute: async (input, ctx) => {
+    const resolved = resolveSigningSecret(input.secretEnvVar, configFor(ctx));
+    if (!resolved.ok) return resolved.message;
+    const secret = resolved.secret;
     const result = verifySignature({
       scheme: input.scheme,
       body: input.payload,
@@ -1589,6 +1788,7 @@ const RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS"] as const;
 
 export const dnsLookup: RegisteredTool = buildTool({
   name: "DnsLookup",
+  operativeArgs: [{ field: "name", kind: "recipient" }],
   description:
     "Resolve A, AAAA, CNAME, MX, TXT and NS records for a hostname, reporting each type's answer or the error the resolver gave. Use it to confirm a domain's records line up with what a deployment expects — that a CNAME points where it should, that MX or TXT verification records landed — without a shell. Records are sorted for a stable result, TTLs are not reported, and the host must be named by an allow-listed origin. The timeout is one budget for the whole lookup, not one per record type, so a type that is never reached says so.",
   inputSchema: z.object({
@@ -1706,11 +1906,21 @@ async function resolveOne(type: string, host: string): Promise<unknown> {
 
 export const tlsInspect: RegisteredTool = buildTool({
   name: "TlsInspect",
+  operativeArgs: [
+    { field: "host", kind: "recipient" },
+    { field: "servername", kind: "recipient" },
+  ],
   description:
-    "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock.",
+    "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock. The host must be named by an allow-listed origin; the port is the caller's choice on that host (443 by default), and a service on it that does not speak TLS is reported as such.",
   inputSchema: z.object({
     host: z.string().min(1).describe("hostname; must be named by an allow-listed origin"),
-    port: z.number().int().min(1).max(65_535).optional().describe("default 443"),
+    port: z
+      .number()
+      .int()
+      .min(1)
+      .max(65_535)
+      .optional()
+      .describe("default 443; any port on the allow-listed host, e.g. 465 or 993 for mail"),
     servername: z.string().min(1).optional().describe("SNI name, when it differs from host"),
     timeoutMs: z
       .number()
@@ -1768,6 +1978,26 @@ function inspectCertificate(
       () => {
         try {
           const leaf = socket.getPeerCertificate(true);
+          const cipher = socket.getCipher();
+          // A peer that never spoke TLS still gets here on this runtime: an
+          // SSH banner or an HTTP error page "completes" a handshake with no
+          // certificate, a cipher whose name is null and protocol TLSv1.2.
+          // Reporting that would invent a verdict ("wrong SAN") for a service
+          // that has no certificate at all.
+          if (
+            leaf === null ||
+            leaf === undefined ||
+            leaf.raw === undefined ||
+            Object.keys(leaf).length === 0 ||
+            typeof cipher?.name !== "string"
+          ) {
+            reject(
+              new Error(
+                `no TLS handshake with ${host}:${port}: the service accepted the connection but presented no certificate, so it does not appear to speak TLS on this port`,
+              ),
+            );
+            return;
+          }
           // One clock reading for the whole chain, so two certificates that
           // expire on the same day never report different days remaining.
           const now = Date.now();
@@ -1782,7 +2012,6 @@ function inspectCertificate(
             const issuer: DetailedPeerCertificate | undefined = node.issuerCertificate;
             node = issuer === node ? undefined : issuer;
           }
-          const cipher = socket.getCipher();
           resolve(
             json({
               host,
@@ -1793,7 +2022,7 @@ function inspectCertificate(
                 ? { authorizationError: String(socket.authorizationError) }
                 : {}),
               ...(socket.getProtocol() !== null ? { protocol: socket.getProtocol() } : {}),
-              ...(cipher !== null ? { cipher: cipher.name } : {}),
+              cipher: cipher.name,
               certificate: chain[0] ?? {},
               chainLength: chain.length,
               chain: chain.slice(1),
@@ -1823,6 +2052,7 @@ function inspectCertificate(
 
 export const robotsCheck: RegisteredTool = buildTool({
   name: "RobotsCheck",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Fetch an origin's robots.txt and decide whether a given user-agent may fetch a given path, reporting the rule that decided it. Use it before crawling anything, so a harness does not learn about a site's rules by being blocked. It applies the RFC 9309 matching rules — longest match wins, Allow breaks a tie, and a 5xx on robots.txt means treat the whole site as disallowed — and it reports Crawl-delay without enforcing it, because pacing is the caller's decision.",
   inputSchema: z.object({
@@ -1956,6 +2186,7 @@ async function documentBody(
 
 export const sitemapParse: RegisteredTool = buildTool({
   name: "SitemapParse",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Parse a sitemap into structured entries, either from text you already have or from an allow-listed URL, saying whether it was a urlset or a sitemapindex. Use it to turn a site's own index of itself into a work list without a model reading XML. It reads exactly one document — an index's children are not followed — and refuses a document with entity declarations or an internal DTD subset rather than expanding them.",
   inputSchema: z.object(documentSourceSchema),
@@ -1984,6 +2215,7 @@ export const sitemapParse: RegisteredTool = buildTool({
 
 export const feedParse: RegisteredTool = buildTool({
   name: "FeedParse",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Parse an RSS, RDF or Atom feed into a common entry shape, either from text you already have or from an allow-listed URL. Use it to read a changelog, release feed or blog without a model parsing XML by hand. Entries keep the feed's own order because that order is the signal, dates are returned exactly as the feed wrote them rather than normalised, and HTML inside a summary is left as-is.",
   inputSchema: z.object(documentSourceSchema),

@@ -79,30 +79,35 @@
  *      Nothing here writes a substitute log.
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
 import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
 import { type RegistryAdapter, createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   AUDIT_LOG_UNAVAILABLE,
   DEFAULT_REGISTRY_RELDIR,
   DEPLOY_HISTORY_UNAVAILABLE,
+  HIDDEN_FROM_LISTING,
   MANIFEST_FILENAME,
   type ResolvedName,
+  TENANTS_DIRNAME,
   type TenantOverlayState,
   VERSION_DIFF_UNAVAILABLE,
   type VersionState,
   classifyRegistryError,
   containSpecPaths,
   containTenantPaths,
+  isListedSpecName,
   predictRegistration,
   probeTenantOverlay,
   probeVersion,
   readManifest,
+  reservedRegistryRoot,
   resolveName,
 } from "./lib/registry";
 import {
@@ -119,6 +124,15 @@ import {
   renderStrings,
   sample,
 } from "./lib/result";
+import { workspaceRoot } from "./paths";
+
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed the
+ * spec SpecPin registers, so a spec pinned on 0.7.0 no longer content-matched
+ * its own version (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // ---------------------------------------------------------------------------
 // shared plumbing
@@ -126,6 +140,8 @@ import {
 
 /** Longest actor label accepted, for the same reason paths are bounded. */
 const MAX_ACTOR_CHARS = 200;
+/** The largest spec file SpecPin reads. A spec is configuration, not data. */
+const MAX_SPEC_BYTES = 16 * 1024 * 1024;
 
 /** Ceiling on how many specs one DeployInspect answer enumerates. */
 const DEFAULT_SPEC_LIMIT = 200;
@@ -133,7 +149,9 @@ const DEFAULT_SPEC_LIMIT = 200;
 const registryDirField = z
   .string()
   .optional()
-  .describe(`the file-backed spec registry root (default: ${DEFAULT_REGISTRY_RELDIR})`);
+  .describe(
+    `the file-backed spec registry root (default: ${DEFAULT_REGISTRY_RELDIR}); SpecPin and DeployRollback refuse a root inside a directory another registry reserves (its "_tenants" or any other "_" name)`,
+  );
 
 const tenantField = z
   .string()
@@ -176,6 +194,13 @@ function open(
   // registry on first use. Existence is reported by the caller, not required.
   const root = contain(tool, rootRel);
   if (!root.ok) return root;
+  const reserved = reservedRegistryRoot(root.value, realpathSync(workspaceRoot()));
+  if (reserved !== undefined) {
+    return fail(
+      "refused",
+      `registry root "${render(rootRel)}" is not written to: ${reserved}. Point registryDir at a registry's own root, such as "${DEFAULT_REGISTRY_RELDIR}".`,
+    );
+  }
   const specPaths = containSpecPaths(tool, root.value, name.value.registryName, knownVersions);
   if (specPaths !== undefined) return specPaths;
   if (tenant !== undefined) {
@@ -277,6 +302,7 @@ function nameFields(name: ResolvedName): Record<string, unknown> {
           nameWasMapped: `"${render(name.given)}" is stored as "${render(name.registryName)}" by @crewhaus/spec-changelog's registrySpecName; that mapped name is what every check and every pin below acted on`,
         }
       : {}),
+    ...(name.hiddenFromListing === true ? { hiddenFromListing: HIDDEN_FROM_LISTING } : {}),
   };
 }
 
@@ -375,8 +401,13 @@ function decidePin(current: CurrentPin, target: string, repin: boolean): PinDeci
 
 export const specPin: RegisteredTool = buildTool({
   name: "SpecPin",
+  operativeArgs: [
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
+    { field: "specFile", kind: "path" },
+    { field: "env", kind: "id", within: "name" },
+  ],
   description:
-    "Register a spec file's current content as a version in the local spec registry and pin that version to an environment (or to a tenant's overlay of one). Registration is @crewhaus/spec-changelog's autoRegisterSpecVersion: content-hashed, so re-registering unchanged content is a no-op that reports the version already holding it, and each new version appends a distilled entry to the per-spec CHANGELOG.md beside the manifest. Pinning is @crewhaus/spec-registry's own. It REFUSES to move a pin that already exists unless repin:true (the registry has no unpin and no pin history, so the previous binding would survive nowhere else) — but a tenant's FIRST overlay is not such a move: with no overlay file the version aliasForTenant returned is the global pin showing through its fallback, nothing of the tenant's is replaced, and the global pin is not touched, so it is written rather than refused. It refuses a spec name that maps onto the shared \"spec\" fallback directory, refuses when the manifest cannot be read or is a symlink (an unreadable manifest is never treated as 'no versions'), and refuses when any path the registry would open — the spec directory, its manifest, its changelog, a version file, a tenant overlay — resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change. dryRun changes nothing and previews the same pin decision the real call makes.",
+    'Register a spec file\'s current content as a version in the local spec registry and pin that version to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content is a no-op that reports the version already holding it, and each new version appends an entry to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name that maps onto the shared "spec" fallback directory or a hidden one (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink (never treated as "no versions"), and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed. dryRun changes nothing and previews the same pin decision.',
   inputSchema: z.object({
     name: z
       .string()
@@ -425,17 +456,26 @@ export const specPin: RegisteredTool = buildTool({
     if (fileProbe.kind === "directory") {
       return refusal(tool, "not-a-directory", `"${render(input.specFile)}" is a directory`);
     }
-    let yaml: string;
-    try {
-      yaml = readFileSync(specFile.value.real, "utf8");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
+    // Opened without blocking, and only as a regular file: a FIFO with no
+    // writer blocks an ordinary open for ever, and this read was
+    // synchronous, so a named pipe named as the spec stopped the whole
+    // harness, dry run or not (C074). The limit is enforced while reading.
+    const read = openForReadSync(workspaceRoot(), input.specFile, { maxBytes: MAX_SPEC_BYTES });
+    if (!read.ok) {
       return refusal(
         tool,
         "unreadable",
-        `"${render(input.specFile)}" could not be read (${code ?? (err as Error).message})`,
+        `"${render(input.specFile)}" could not be read: ${read.reason}`,
       );
     }
+    if (read.truncated) {
+      return refusal(
+        tool,
+        "unreadable",
+        `"${render(input.specFile)}" is over the ${MAX_SPEC_BYTES}-byte limit for a spec, so it was not read`,
+      );
+    }
+    const yaml = KEEP_BOM.decode(read.bytes);
 
     // Contain the root and the leaves. The version files are not known yet, so
     // this first pass contains what does not depend on them; the manifest read
@@ -862,8 +902,12 @@ async function planRollback(
 
 export const deployRollback: RegisteredTool = buildTool({
   name: "DeployRollback",
+  operativeArgs: [
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
+    { field: "env", kind: "id", within: "name" },
+  ],
   description:
-    "Repoint an environment (or a tenant's overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller's rollback. DESTRUCTIVE: @crewhaus/spec-registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as \"previous\" (the registry keeps one version per environment with no history; the only record of what an environment used to point at is the @crewhaus/audit-log deployment_action chain, which this package does not depend on — use DeployInspect to pick a version by name), refuses a version this registry has never seen, refuses a version the manifest lists but whose file cannot be fetched (that pin would be written and the environment would resolve to nothing, reading as a successful deploy), refuses when the manifest cannot be read, and refuses when any path the registry would open resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change.",
+    'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry\'s listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched (the environment would resolve to nothing while reading as a successful deploy), a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed.',
   inputSchema: z.object({
     name: z.string().min(1).describe("the spec's name as the spec spells it"),
     env: z.string().min(1).describe("the environment whose pin should be repointed"),
@@ -1041,8 +1085,12 @@ export const deployRollback: RegisteredTool = buildTool({
 
 export const deployInspect: RegisteredTool = buildTool({
   name: "DeployInspect",
+  operativeArgs: [
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
+    { field: "env", kind: "id", within: "name", default: "*" },
+  ],
   description:
-    "Read-only: what is pinned where in the local spec registry. Reports each spec's registered versions, its environment pins, and — for every pin — whether the version it points at can actually be fetched, because @crewhaus/spec-registry's list() reads the manifest and nothing else, so a pin can point at a version whose file is gone. With a tenant, reports the tenant's effective alias per environment with both limits stated: whether an overlay file exists for that spec at all (its name is probed, never parsed), and that the environments listed are the spec's GLOBAL pins, because @crewhaus/spec-registry exposes no way to enumerate the environments a tenant's overlay covers — an environment pinned ONLY for that tenant is not listed unless env names it. The tenant's overlay path is contained before it is read, like every other path these tools open. An environment name outside the registry's own grammar is refused rather than reported as unpinned. A registry root that is absent is reported as absent and a root or manifest that could not be read is reported as unread — neither is ever reported as an empty registry. Two things this build cannot show are named rather than omitted: the deployment history (it lives only in the @crewhaus/audit-log deployment_action chain, which this package does not depend on) and a field-level diff between two versions (that is @crewhaus/spec-patch's diffSpecYaml — use SpecDiff; the per-spec CHANGELOG.md beside the manifest already carries the diff recorded at registration).",
+    "Read-only: what is pinned where in the local spec registry. Use it before a pin or a rollback. Reports each spec's registered versions, its environment pins, and whether the version each pin points at can actually be fetched (a manifest can list a version whose file is gone). With a tenant, reports the tenant's effective version per environment and whether an overlay file exists; the environments listed are the spec's global pins, so one pinned only for that tenant appears only when env names it. Every path is contained before it is read. An environment name outside the registry's grammar is refused, not reported as unpinned; a spec the registry's listing hides (a leading \"_\") is named under hiddenByRegistry; an absent registry is reported absent and an unreadable one unread, never as empty. It cannot show deployment history (only the audit log's deployment_action chain has it) or a field-level diff (use SpecDiff).",
   inputSchema: z.object({
     name: z
       .string()
@@ -1113,8 +1161,9 @@ export const deployInspect: RegisteredTool = buildTool({
     // writers use; otherwise the adapter enumerates.
     let givenNames: string[];
     let named: ResolvedName | undefined;
+    let hidden: Record<string, unknown> | undefined;
     if (input.name !== undefined) {
-      const resolved = resolveName(input.name);
+      const resolved = resolveName(input.name, "read");
       if (!resolved.ok) return refusal(tool, resolved.code, resolved.reason);
       named = resolved.value;
       givenNames = [resolved.value.registryName];
@@ -1126,6 +1175,7 @@ export const deployInspect: RegisteredTool = buildTool({
         // An unlistable root is not an empty one.
         return refusal(tool, f.code, `${f.reason} — this is "could not list", not "no specs".`);
       }
+      hidden = hiddenSpecDirs(root.value.real);
     }
 
     const specs: Array<Record<string, unknown>> = [];
@@ -1263,10 +1313,46 @@ export const deployInspect: RegisteredTool = buildTool({
       registry: { present: true },
       specs: { shown: specs, total: givenNames.length },
       ...(skipped.length > 0 ? { skipped } : {}),
+      ...(hidden !== undefined ? { hiddenByRegistry: hidden } : {}),
       ...unavailable,
     });
   },
 });
+
+/**
+ * The spec directories `listSpecs` skips, by NAME only — nothing in them is
+ * opened. A spec stored under a leading `_` (compile auto-registration keeps
+ * one the spec itself names `_scratch`; 0.7.0's SpecPin wrote one) is
+ * otherwise simply absent from the enumeration, which reads as "no such
+ * spec". `undefined` when there are none; a root that cannot be re-listed is
+ * said to be unknown rather than omitted.
+ */
+function hiddenSpecDirs(rootReal: string): Record<string, unknown> | undefined {
+  let names: string[];
+  try {
+    names = readdirSync(rootReal, { withFileTypes: true })
+      .filter(
+        (d) =>
+          !isListedSpecName(d.name) &&
+          !d.name.startsWith(".") &&
+          d.name !== TENANTS_DIRNAME &&
+          (d.isDirectory() || d.isSymbolicLink()),
+      )
+      .map((d) => d.name)
+      .sort();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "an unidentified error";
+    return {
+      checked: false,
+      reason: `the registry root could not be re-listed (${code}), so whether it holds specs listSpecs hides is unknown`,
+    };
+  }
+  if (names.length === 0) return undefined;
+  return {
+    names: renderAll(names),
+    reason: `${HIDDEN_FROM_LISTING}. They are not in specs above; inspect one with DeployInspect { name }.`,
+  };
+}
 
 /**
  * A tenant's effective alias per environment, with both limits stated.

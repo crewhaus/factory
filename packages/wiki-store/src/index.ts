@@ -74,11 +74,12 @@
  * option), any resolved path outside the tenant's root throws before any
  * IO happens. The default root under a tenant is `<tenantRoot>/wiki`.
  */
-import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstatSync, realpathSync, unlinkSync } from "node:fs";
+import { mkdir, readdir } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import YAML from "yaml";
 import { type AcquireLockOptions, withLock } from "./lock";
 
@@ -104,7 +105,75 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
 /** Slugs are kebab-case AND double as file names — fail-closed on anything
  *  that could traverse (`..`, `/`, uppercase, spaces). */
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,127}$/;
+
+/**
+ * Whether `value` is a wiki slug: kebab-case, 1–128 characters. Every slug
+ * the store returns is one; a caller that prints a slug outside a classified
+ * unit (tool-wiki's redaction notice) checks it again.
+ */
+export function isWikiSlug(value: unknown): value is string {
+  return typeof value === "string" && SLUG_REGEX.test(value);
+}
+
+/**
+ * What an article's `createdAt` / `updatedAt` reads as when the file holds
+ * no timestamp the store can read. It is printed as it stands
+ * (`updated: unknown`), sorts after every real timestamp in `list()`, and
+ * `Date.parse` gives `NaN` for it, so nothing downstream takes it for a date.
+ */
+export const UNKNOWN_TIMESTAMP = "unknown";
+
+/** A calendar date: ECMAScript reads a date-only form as UTC midnight. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * A date-time as `Date#toISOString` writes it, or as RFC 3339 and ISO 8601
+ * allow it by hand: a `T`, `t` or space between date (group 1) and time
+ * (group 2), a `.` or `,` before the fraction, and an offset that is `Z`,
+ * `±hh:mm`, `±hhmm` or `±hh` (groups 3–6), or none. Linear: no quantifier is
+ * nested or overlapping.
+ */
+const DATE_TIME =
+  /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,9})?)?)(?:([Zz])|([+-])(\d{2})(?::?(\d{2}))?)?$/;
+
+/**
+ * `value` as an ISO-8601 timestamp, or {@link UNKNOWN_TIMESTAMP}. A timestamp
+ * is printed in list rows and sorted on, and a file on disk (which any agent
+ * with a write tool can edit) could put any text there, so only a timestamp
+ * is kept, written the one way `Date.parse` reads the same everywhere: `T`,
+ * `.`, and `Z` or `±hh:mm`. A date-time without an offset is read as UTC — a
+ * `Z` is appended — never as the host's local time, which is what
+ * `Date.parse` would do with it. The result is its own normal form.
+ */
+function isoTimestampOr(value: unknown): string {
+  if (typeof value !== "string") return UNKNOWN_TIMESTAMP;
+  let iso: string | undefined;
+  if (ISO_DATE.test(value)) iso = value;
+  else {
+    const m = value.match(DATE_TIME);
+    if (m !== null) {
+      const [, date, time, z, sign, hh, mm] = m;
+      const zone = z !== undefined || sign === undefined ? "Z" : `${sign}${hh}:${mm ?? "00"}`;
+      iso = `${date}T${(time ?? "").replace(",", ".")}${zone}`;
+    }
+  }
+  return iso !== undefined && !Number.isNaN(Date.parse(iso)) ? iso : UNKNOWN_TIMESTAMP;
+}
+
+/** A timestamp's instant for sorting, or `undefined` when it is not known. */
+function instantOf(timestamp: string): number | undefined {
+  const ms = Date.parse(timestamp);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
 const WIKILINK_REGEX = /\[\[([^\]]+)\]\]/g;
+/**
+ * The most of one article file the store reads or writes. Reads are capped
+ * before anything is buffered; a write past it is refused, so the store
+ * never writes an article it would then refuse to read.
+ */
+export const ARTICLE_MAX_BYTES = 16 * 1024 * 1024;
+/** index.json is a derived cache: past this it is rebuilt from the articles instead of read. */
+const INDEX_MAX_BYTES = 64 * 1024 * 1024;
 
 export class WikiStoreError extends CrewhausError {
   override readonly name: string = "WikiStoreError";
@@ -175,7 +244,9 @@ export type WikiFrontmatter = {
   readonly supersedes?: number;
   readonly createdBy?: WikiCreatedBy;
   readonly status: WikiArticleStatus;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the file holds none. */
   readonly createdAt: string;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the file holds none. */
   readonly updatedAt: string;
 };
 
@@ -189,6 +260,7 @@ export type WikiRef = {
   readonly confidence: number;
   readonly verified: boolean;
   readonly version: number;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the article holds none. */
   readonly updatedAt: string;
   /** Out-links extracted from `[[wikilinks]]` in the body (normalized slugs). */
   readonly links: readonly string[];
@@ -264,6 +336,20 @@ export type WikiRelatedRef = WikiRef & {
  */
 export interface WikiEmbedder {
   embed(texts: ReadonlyArray<string>): Promise<number[][]>;
+  /** `@crewhaus/embedder`'s provider id. Only `"mock"` is known to stay in
+   *  the process; see {@link embedderLeavesProcess}. */
+  readonly provider?: string;
+}
+
+/**
+ * Whether calling this embedder sends text out of the process — the rule
+ * `@crewhaus/memory-store` applies, kept identical here (memory-service's
+ * wiring test holds the two stores to the same answer). Only
+ * `@crewhaus/embedder`'s `mock` provider is known not to; an embedder that
+ * does not say what it is counts as one that does.
+ */
+export function embedderLeavesProcess(embedder: WikiEmbedder | undefined): boolean {
+  return embedder !== undefined && embedder.provider !== "mock";
 }
 
 /** The design-§3.1 interface, verbatim (recall/search/get/write/list/related/setSignals/stats). */
@@ -296,6 +382,14 @@ export interface WikiStore {
   semanticSearch?(query: string, k?: number, minScore?: number): Promise<readonly WikiHit[]>;
   /** Diagnostic: where on disk this store lives. */
   path(): string;
+  /**
+   * True when `recall`, `related` and `semanticSearch` send the query and
+   * article text to an embedder outside the process (see
+   * {@link embedderLeavesProcess}). `@crewhaus/tool-wiki` reads it to flag
+   * those tools as network tools. Optional so another backend still
+   * type-checks; tool-wiki then decides from `semanticSearch`'s presence.
+   */
+  readonly embedderLeavesProcess?: boolean;
 }
 
 export type WikiStoreOptions = {
@@ -426,8 +520,8 @@ export function parseArticle(raw: string): WikiArticle {
     ...(typeof v["supersedes"] === "number" ? { supersedes: v["supersedes"] } : {}),
     ...(createdBy !== undefined ? { createdBy } : {}),
     status,
-    createdAt: typeof v["createdAt"] === "string" ? v["createdAt"] : "1970-01-01T00:00:00.000Z",
-    updatedAt: typeof v["updatedAt"] === "string" ? v["updatedAt"] : "1970-01-01T00:00:00.000Z",
+    createdAt: isoTimestampOr(v["createdAt"]),
+    updatedAt: isoTimestampOr(v["updatedAt"]),
     body,
   };
 }
@@ -570,31 +664,107 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
     return fence(join(articlesDir, `${slug}.md`));
   }
 
+  /** A store path as the store names it in messages: `articles/notes.md`. */
+  function storeRel(absPath: string): string {
+    return relative(storeDir, absPath).split("\\").join("/");
+  }
+
+  /**
+   * Write `content` at `absPath` without writing THROUGH anything planted in
+   * the store (security-2#0). The bytes go to an `O_EXCL|O_NOFOLLOW` temp
+   * under a random name in the file's physical directory, which must be
+   * inside the store, and the temp is renamed into place. A fixed temp name
+   * (`<slug>.md.tmp`, `index.json.tmp`) used to be opened with link
+   * following, so a symlink planted there — dangling or not — created or
+   * truncated a file anywhere the process could write. A symlinked article,
+   * a symlinked `versions/<slug>` directory leading out, or a FIFO at the
+   * leaf is refused, naming the store path.
+   */
   async function atomicWrite(absPath: string, content: string): Promise<void> {
     fence(absPath);
-    await mkdir(dirname(absPath), { recursive: true });
-    const tmpPath = `${absPath}.tmp`;
-    await writeFile(tmpPath, content, { mode: 0o600 });
-    await rename(tmpPath, absPath);
+    await mkdir(storeDir, { recursive: true });
+    const rel = storeRel(absPath);
+    const written = writeFileSafe(storeDir, rel, content, {
+      overwrite: true,
+      createParents: true,
+      mode: 0o600,
+    });
+    if (!written.ok) {
+      throw new WikiStoreError(
+        written.code === "escapes-root"
+          ? outsideStoreMessage("write", rel)
+          : `refusing to write ${rel} in the wiki store: ${written.reason}`,
+      );
+    }
+  }
+
+  /**
+   * The refusal for a store path that resolves outside the store: a
+   * symlinked `articles/` or `versions/` directory (or file) leading out.
+   * tool-safety's own reason says "the workspace", which is the store here.
+   */
+  function outsideStoreMessage(op: "read" | "write", rel: string): string {
+    return `refusing to ${op} ${rel}: it resolves outside the wiki store, through a symlinked file or a symlinked articles/ or versions/ directory. Keep articles/ and versions/ as directories inside the store; to keep the wiki somewhere else, link the store's own directory instead.`;
+  }
+
+  /**
+   * Whether an existing store subdirectory resolves outside the store. The
+   * store root itself may be a link (it is resolved first); a subdirectory
+   * leading out is refused for every operation, so list() does not name
+   * articles that get() and search() would refuse to read.
+   */
+  function subdirLeavesStore(dir: string): boolean {
+    let realStore: string;
+    let realDir: string;
+    try {
+      realStore = realpathSync(storeDir);
+      realDir = realpathSync(dir);
+    } catch {
+      return false; // not there (yet): nothing leads anywhere
+    }
+    const rel = relative(realStore, realDir);
+    return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  }
+
+  /**
+   * At most `maxBytes` of a regular file inside the store, never through a
+   * symlink (a planted `articles/<slug>.md -> ~/.ssh/...` is not read), or
+   * `null` when nothing is there.
+   */
+  async function readStoreFile(absPath: string, maxBytes: number): Promise<string | null> {
+    fence(absPath);
+    const rel = storeRel(absPath);
+    const read = await openForRead(storeDir, rel, { maxBytes, followLeafSymlink: false });
+    if (!read.ok) {
+      if (read.code === "not-found") return null;
+      throw new WikiStoreError(
+        read.code === "escapes-root"
+          ? outsideStoreMessage("read", rel)
+          : `refusing to read ${rel} in the wiki store: ${read.reason}`,
+      );
+    }
+    if (read.truncated) {
+      throw new WikiStoreError(
+        `${rel} in the wiki store is larger than ${maxBytes} bytes, so it was not read`,
+      );
+    }
+    return read.text;
   }
 
   async function readArticle(slug: string): Promise<WikiArticle | null> {
-    const p = articlePath(slug);
-    if (!existsSync(p)) return null;
-    let raw: string;
-    try {
-      raw = await readFile(p, "utf8");
-    } catch {
-      return null;
-    }
-    return parseArticle(raw);
+    const raw = await readStoreFile(articlePath(slug), ARTICLE_MAX_BYTES);
+    return raw === null ? null : parseArticle(raw);
   }
 
   async function listArticleSlugs(): Promise<string[]> {
     fence(articlesDir);
     let entries: string[];
     try {
-      entries = await readdir(articlesDir);
+      // Regular files only: a symlink or FIFO named like an article is not
+      // one of the store's articles, and reading it is refused anyway.
+      entries = (await readdir(articlesDir, { withFileTypes: true }))
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
     } catch {
       return [];
     }
@@ -632,28 +802,84 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
     return { version: 1, articles };
   }
 
-  function isIndexFile(value: unknown): value is WikiIndexFile {
+  /**
+   * Whether `value` is an index this store could have written for the
+   * articles in `slugs`. index.json is a file any agent with a write tool
+   * can edit, and its entries become the rows every list tool prints, so
+   * each one is held to what {@link toIndexEntry} produces from a parsed
+   * article: the key is a slug with an article file behind it, the version a
+   * positive whole number, the status one of the four, the title, tags and
+   * links strings (each link a slug), the confidence a number in [0, 1],
+   * `verified` a boolean and `updatedAt` a normalised timestamp. Anything
+   * else — a planted key
+   * carrying text, a string version, an entry for an article that is not
+   * there — sends the load to a rebuild from the articles, which
+   * parseArticle validates.
+   *
+   * An article with no entry is not a reason to rebuild: the rebuild leaves
+   * out a malformed article, and whoever can leave one out of index.json can
+   * as well delete the article itself.
+   */
+  function isIndexFile(value: unknown, slugs: ReadonlyArray<string>): value is WikiIndexFile {
     if (typeof value !== "object" || value === null) return false;
     const v = value as Record<string, unknown>;
-    return v["version"] === 1 && typeof v["articles"] === "object" && v["articles"] !== null;
+    if (v["version"] !== 1 || typeof v["articles"] !== "object" || v["articles"] === null) {
+      return false;
+    }
+    const entries = Object.entries(v["articles"] as Record<string, unknown>);
+    const onDisk = new Set(slugs);
+    const strings = (x: unknown): boolean =>
+      Array.isArray(x) && x.every((s) => typeof s === "string");
+    return entries.every(([slug, raw]) => {
+      if (!onDisk.has(slug) || typeof raw !== "object" || raw === null) return false;
+      const e = raw as Record<string, unknown>;
+      const { version, confidence, updatedAt } = e;
+      return (
+        typeof e["title"] === "string" &&
+        strings(e["tags"]) &&
+        strings(e["links"]) &&
+        (e["links"] as unknown[]).every(isWikiSlug) &&
+        typeof confidence === "number" &&
+        confidence >= 0 &&
+        confidence <= 1 &&
+        typeof e["verified"] === "boolean" &&
+        typeof version === "number" &&
+        Number.isSafeInteger(version) &&
+        version >= 1 &&
+        ARTICLE_STATUSES.includes(e["status"] as WikiArticleStatus) &&
+        isoTimestampOr(updatedAt) === updatedAt
+      );
+    });
   }
 
   /** Load index.json; on a missing/corrupt file, rebuild from the articles
    *  (the crash-safe guarantee: the index is always derivable). */
   async function loadIndex(): Promise<WikiIndexFile> {
     fence(indexPath);
-    if (existsSync(indexPath)) {
-      try {
-        const parsed = JSON.parse(await readFile(indexPath, "utf8")) as unknown;
-        if (isIndexFile(parsed)) return parsed;
-      } catch {
-        // fall through to rebuild
+    if (subdirLeavesStore(articlesDir)) {
+      throw new WikiStoreError(outsideStoreMessage("read", "articles/"));
+    }
+    try {
+      const raw = await readStoreFile(indexPath, INDEX_MAX_BYTES);
+      if (raw !== null) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (isIndexFile(parsed, await listArticleSlugs())) return parsed;
       }
+    } catch {
+      // missing, corrupt, oversized or not a regular file: fall through to rebuild
     }
     return rebuildIndex();
   }
 
   async function persistIndex(index: WikiIndexFile): Promise<void> {
+    // index.json is a derived cache, so a symlink planted in its place is
+    // removed (unlink never follows a link) rather than left to fail every
+    // write; the rebuilt index then lands as a regular file.
+    try {
+      if (lstatSync(fence(indexPath)).isSymbolicLink()) unlinkSync(indexPath);
+    } catch {
+      // nothing there yet
+    }
     await atomicWrite(indexPath, `${JSON.stringify(index, null, 2)}\n`);
   }
 
@@ -736,6 +962,8 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
   }
 
   return {
+    embedderLeavesProcess: embedderLeavesProcess(embedder),
+
     async recall(query: string, k = 6): Promise<readonly WikiHit[]> {
       if (typeof query !== "string" || query.length === 0) {
         throw new WikiStoreError("recall(): query must be a non-empty string");
@@ -880,7 +1108,13 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
             body: input.body,
           };
         }
-        await atomicWrite(articlePath(slug), serializeArticle(next));
+        const serialized = serializeArticle(next);
+        if (Buffer.byteLength(serialized, "utf8") > ARTICLE_MAX_BYTES) {
+          throw new WikiStoreError(
+            `write(): article "${slug}" would be larger than ${ARTICLE_MAX_BYTES} bytes; split it into linked articles`,
+          );
+        }
+        await atomicWrite(articlePath(slug), serialized);
         // The index is a derived cache — rebuild from the authoritative
         // article scan so a previously stale/corrupt index self-heals on
         // the next mutation.
@@ -900,10 +1134,17 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
         refs = refs.filter((r) => wanted.every((t) => r.tags.includes(t)));
       }
       const dir = listOpts.staleFirst === true ? 1 : -1;
-      refs.sort(
-        (a, b) =>
-          dir * (Date.parse(a.updatedAt) - Date.parse(b.updatedAt)) || a.slug.localeCompare(b.slug),
-      );
+      // An article whose timestamp is unknown sorts last in either order:
+      // it is neither the stalest nor the freshest, it is undated.
+      refs.sort((a, b) => {
+        const at = instantOf(a.updatedAt);
+        const bt = instantOf(b.updatedAt);
+        if (at === undefined || bt === undefined) {
+          if (at !== bt) return at === undefined ? 1 : -1;
+          return a.slug.localeCompare(b.slug);
+        }
+        return dir * (at - bt) || a.slug.localeCompare(b.slug);
+      });
       return refs;
     },
 
@@ -999,13 +1240,16 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
       let priorVersions = 0;
       fence(versionsDir);
       try {
-        for (const slugDir of await readdir(versionsDir)) {
+        // Real directories and regular files only: a `versions/<slug>` link
+        // leading out of the store is not listed through.
+        for (const slugDir of await readdir(versionsDir, { withFileTypes: true })) {
+          if (!slugDir.isDirectory()) continue;
           try {
-            priorVersions += (await readdir(join(versionsDir, slugDir))).filter((f) =>
-              f.endsWith(".md"),
-            ).length;
+            priorVersions += (
+              await readdir(join(versionsDir, slugDir.name), { withFileTypes: true })
+            ).filter((f) => f.isFile() && f.name.endsWith(".md")).length;
           } catch {
-            // not a directory / raced away — skip
+            // raced away — skip
           }
         }
       } catch {

@@ -25,7 +25,8 @@
  * instance of its format. They still do not prove the account exists.
  */
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
 import { z } from "zod";
 import {
   DEFAULT_ENTROPY_THRESHOLDS,
@@ -62,7 +63,12 @@ import {
   canonicalPiiValue,
   scanPii,
 } from "./lib/pii";
-import { MAX_POLICY_RULES, POLICY_RULE_KINDS, evaluatePolicy } from "./lib/policy";
+import {
+  MAX_POLICY_RULES,
+  POLICY_RULE_KINDS,
+  type PolicyRunContext,
+  evaluatePolicy,
+} from "./lib/policy";
 import {
   MAX_MAPPING_ENTRIES,
   TOKEN_SHAPE,
@@ -137,25 +143,99 @@ function countBy<T>(items: ReadonlyArray<T>, key: (item: T) => string): Record<s
 const DETECTION_NOTE =
   "Heuristic. These rules found what they match; an empty or short result does not mean the input is clean. Check rulesRun to see what was actually looked for.";
 
+/** The tool_config key an operator edits to allow a signing-key variable. */
+export const KEY_ENV_VARS_CONFIG_KEY = "tool_config.secure.key_env_vars";
+
+/** What `tool_config.secure` (or a keyed tool's own block) may set. */
+export type SecureConfig = {
+  /** The ONLY environment variables the keyed tools may read a key from. */
+  readonly key_env_vars?: ReadonlyArray<string>;
+  /** The same list, camelCase. Setting both spellings is refused. */
+  readonly keyEnvVars?: ReadonlyArray<string>;
+};
+
+/** The operator's list from the boot block; empty until one is registered. */
+let registeredKeyEnvVars: ReadonlyArray<string> = [];
+
 /**
- * Fetch a signing key by env-var name. The key itself never enters a result,
- * an argument or an error message — only the variable's name does.
+ * The key-variable list a `tool_config` block allows. Throws, naming where
+ * the block sits, when the list is not a list of variable names. An entry is
+ * never quoted back: one that is not a name is most often a pasted key.
  */
-function keyFromEnv(name: string): { ok: true; key: string } | { ok: false; message: string } {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    return {
-      ok: false,
-      message: `"${name}" is not a valid environment variable name`,
-    };
+function keyEnvVarsOf(config: unknown, where: string): ReadonlyArray<string> {
+  if (config === undefined || config === null) return [];
+  if (typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`${where} must be a mapping, such as { key_env_vars: [AUDIT_SIGNING_KEY] }`);
   }
-  const value = process.env[name];
-  if (value === undefined || value === "") {
-    return {
-      ok: false,
-      message: `environment variable ${name} is unset or empty — set it in the harness environment; the key is never passed as an argument, so it cannot end up in a transcript`,
-    };
+  const block = config as Record<string, unknown>;
+  const snake = block["key_env_vars"];
+  const camel = block["keyEnvVars"];
+  if (snake !== undefined && camel !== undefined) {
+    throw new Error(`${where} sets both key_env_vars and keyEnvVars; keep one`);
   }
-  return { ok: true, key: value };
+  const list = snake ?? camel;
+  if (list === undefined) return [];
+  if (!Array.isArray(list)) {
+    throw new Error(`${where}.key_env_vars must be a list of environment variable names`);
+  }
+  return list.map((entry, i) => {
+    // A pasted token can be a legal name (`ghp_…`), and a listed name is
+    // repeated in every refusal, so one that looks like a key is refused too.
+    const pasted = typeof entry === "string" && looksLikePastedSecret(entry);
+    if (typeof entry !== "string" || !isEnvName(entry) || pasted) {
+      throw new Error(
+        `${where}.key_env_vars[${i}] is not an environment variable name${pasted ? "; it looks like a key itself, which has not been echoed back — list the NAME of the variable that holds it, and treat the value as exposed" : ""}`,
+      );
+    }
+    return entry;
+  });
+}
+
+/**
+ * Boot seam: the `tool_config.secure` block (or SignPayload's, VerifyPayload's,
+ * Pseudonymize's, PiiRedact's or RedactForExport's own block). Its
+ * `key_env_vars` is the only set of environment variables those tools may
+ * read an HMAC key from (flag-truth-2#0).
+ */
+export function registerSecureConfig(config: unknown): void {
+  registeredKeyEnvVars = keyEnvVarsOf(config, "tool_config.secure");
+}
+
+/**
+ * Fetch a signing key by env-var name — only a name the operator listed.
+ *
+ * 0.7.0 read ANY variable the call named, so these read-only, auto-allowed
+ * tools were an HMAC oracle over every secret in the process: a signature
+ * under DB_PASSWORD over a known payload is checkable offline, which recovers
+ * a weak one by dictionary, and forges a webhook or token for any service
+ * keyed by an env secret (flag-truth-2#0). The model may pick among the
+ * listed names and never add one; an unlisted name gets the same refusal
+ * whether or not it is set. The key never enters a result, an argument or an
+ * error — only the variable's name does.
+ *
+ * A model-pool candidate's own block (`ctx.toolConfig`) replaces the boot
+ * block for its calls, as every tool_config block does.
+ */
+function keyFromEnv(
+  tool: string,
+  name: string,
+  ctx: ToolExecuteContext | undefined,
+): { ok: true; key: string } | { ok: false; message: string } {
+  let allowed: ReadonlyArray<string>;
+  try {
+    allowed =
+      typeof ctx?.toolConfig === "object" && ctx.toolConfig !== null
+        ? keyEnvVarsOf(ctx.toolConfig, `the tool_config block for ${tool}`)
+        : registeredKeyEnvVars;
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
+  const found = resolveCredentialEnv(name, {
+    allowed,
+    purpose: `${tool}'s HMAC key`,
+    configKey: KEY_ENV_VARS_CONFIG_KEY,
+  });
+  return found.ok ? { ok: true, key: found.value } : { ok: false, message: found.reason };
 }
 
 const piiTypeSchema = z.enum(PII_TYPES);
@@ -249,7 +329,7 @@ export const piiScan: RegisteredTool = buildTool({
 export const piiRedact: RegisteredTool = buildTool({
   name: "PiiRedact",
   description:
-    "Replace detected personal data with a stable token — either a plain type placeholder or an HMAC pseudonym keyed from a named environment variable, so the same value redacts identically across documents without being reversible. Use it when a document has to leave the system but the records still need to line up afterwards; it returns the redacted text plus counts by type, never the values it removed.",
+    "Replace detected personal data with a stable token — either a plain type placeholder or an HMAC pseudonym keyed from a named environment variable the operator allowed, so the same value redacts identically across documents without being reversible. Use it when a document has to leave the system but the records still need to line up afterwards; it returns the redacted text plus counts by type, never the values it removed.",
   inputSchema: z.object({
     text: z.string().describe("the text to redact"),
     mode: z
@@ -261,7 +341,9 @@ export const piiRedact: RegisteredTool = buildTool({
     keyEnvVar: z
       .string()
       .optional()
-      .describe("name of the env var holding the HMAC key; required for pseudonym mode"),
+      .describe(
+        "NAME of the environment variable holding the HMAC key, one the operator listed in tool_config.secure.key_env_vars; required for pseudonym mode",
+      ),
     tokenLength: z
       .number()
       .int()
@@ -273,7 +355,7 @@ export const piiRedact: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.text, "text");
       const mode = input.mode ?? "placeholder";
@@ -282,7 +364,7 @@ export const piiRedact: RegisteredTool = buildTool({
         if (input.keyEnvVar === undefined) {
           return "PiiRedact: pseudonym mode needs keyEnvVar, the NAME of an environment variable holding the HMAC key. Without a key the tokens would be plain hashes, which an attacker can reverse by hashing every candidate value.";
         }
-        const found = keyFromEnv(input.keyEnvVar);
+        const found = keyFromEnv("PiiRedact", input.keyEnvVar, ctx);
         if (!found.ok) return `PiiRedact: ${found.message}`;
         key = found.key;
       }
@@ -334,7 +416,7 @@ export const pseudonymize: RegisteredTool = buildTool({
           .string()
           .optional()
           .describe(
-            "env var holding an HMAC key; without it, tokens are plain hashes and reversible by enumeration",
+            "NAME of the environment variable holding an HMAC key, one the operator listed in tool_config.secure.key_env_vars; without it, tokens are plain hashes and reversible by enumeration",
           ),
         tokenLength: z.number().int().min(4).max(64).optional(),
       })
@@ -343,7 +425,7 @@ export const pseudonymize: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.text, "text");
       const mapping: Record<string, string> = { ...input.mapping };
@@ -352,7 +434,7 @@ export const pseudonymize: RegisteredTool = buildTool({
         const tokenLength = input.mint.tokenLength ?? 12;
         let key: string | undefined;
         if (input.mint.keyEnvVar !== undefined) {
-          const found = keyFromEnv(input.mint.keyEnvVar);
+          const found = keyFromEnv("Pseudonymize", input.mint.keyEnvVar, ctx);
           if (!found.ok) return `Pseudonymize: ${found.message}`;
           key = found.key;
         } else {
@@ -824,6 +906,15 @@ export const allowlistCheck: RegisteredTool = buildTool({
   },
 });
 
+/** The ctx fields a tool's `execute` receives that a pattern run uses. */
+function policyRunContext(ctx: unknown): PolicyRunContext {
+  const c = ctx as { signal?: AbortSignal; runContext?: { sessionId?: string } } | undefined;
+  return {
+    ...(c?.signal === undefined ? {} : { signal: c.signal }),
+    ...(typeof c?.runContext?.sessionId === "string" ? { runawayKey: c.runContext.sessionId } : {}),
+  };
+}
+
 export const contentPolicyCheck: RegisteredTool = buildTool({
   name: "ContentPolicyCheck",
   description:
@@ -848,15 +939,15 @@ export const contentPolicyCheck: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.text, "text");
-      const result = evaluatePolicy(input.text, input.rules);
+      const result = await evaluatePolicy(input.text, input.rules, policyRunContext(ctx));
       return json({
         pass: result.pass,
         counts: result.counts,
         outcomes: result.outcomes,
-        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check. A rule whose pattern does not compile is reported as error and DOES fail the check, because an unevaluated rule is not a passed one. Matching is case-insensitive unless caseSensitive is set.",
+        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check. A rule whose pattern does not compile, is refused as one that could run away, or could not be run to the end of the text is reported as error and DOES fail the check, because an unevaluated rule is not a passed one. Matching is case-insensitive unless caseSensitive is set.",
       });
     } catch (err) {
       return `ContentPolicyCheck could not run: ${asMessage(err)}`;
@@ -920,19 +1011,24 @@ export const hashChainVerify: RegisteredTool = buildTool({
 export const signPayload: RegisteredTool = buildTool({
   name: "SignPayload",
   description:
-    "Produce an HMAC over a payload using a key read from a named environment variable. Use it to stamp a record so a later reader can tell it was not altered; the key is named, never passed, so it cannot end up in a transcript, and it never appears in the result.",
+    "Produce an HMAC over a payload using a key read from a named environment variable, one the operator listed in tool_config.secure.key_env_vars (no other variable is read). Use it to stamp a record so a later reader can tell it was not altered; the key is named, never passed, so it cannot end up in a transcript, and it never appears in the result.",
   inputSchema: z.object({
     payload: z.string().describe("exactly the bytes to sign; canonicalize before calling"),
-    keyEnvVar: z.string().min(1).describe("NAME of the environment variable holding the key"),
+    keyEnvVar: z
+      .string()
+      .min(1)
+      .describe(
+        "NAME of the environment variable holding the key, one the operator listed in tool_config.secure.key_env_vars",
+      ),
     algorithm: algorithmSchema.optional().describe("defaults to sha256"),
     encoding: encodingSchema.optional().describe("hex or base64url; defaults to hex"),
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.payload, "payload");
-      const found = keyFromEnv(input.keyEnvVar);
+      const found = keyFromEnv("SignPayload", input.keyEnvVar, ctx);
       if (!found.ok) return `SignPayload: ${found.message}`;
       const algorithm = (input.algorithm ?? "sha256") as HashAlgorithm;
       const encoding = (input.encoding ?? "hex") as SignatureEncoding;
@@ -954,20 +1050,25 @@ export const signPayload: RegisteredTool = buildTool({
 export const verifyPayload: RegisteredTool = buildTool({
   name: "VerifyPayload",
   description:
-    "Check an HMAC against a payload in constant time, with the key read from a named environment variable. Use it before trusting a record that claims to be unaltered; the comparison is a double HMAC, so a wrong-length or malformed signature returns false rather than leaking timing.",
+    "Check an HMAC against a payload in constant time, with the key read from a named environment variable, one the operator listed in tool_config.secure.key_env_vars (no other variable is read). Use it before trusting a record that claims to be unaltered; the comparison is a double HMAC, so a wrong-length or malformed signature returns false rather than leaking timing.",
   inputSchema: z.object({
     payload: z.string().describe("the bytes that were signed"),
     signature: z.string().min(1).describe("the signature to check"),
-    keyEnvVar: z.string().min(1).describe("NAME of the environment variable holding the key"),
+    keyEnvVar: z
+      .string()
+      .min(1)
+      .describe(
+        "NAME of the environment variable holding the key, one the operator listed in tool_config.secure.key_env_vars",
+      ),
     algorithm: algorithmSchema.optional().describe("defaults to sha256"),
     encoding: encodingSchema.optional().describe("hex or base64url; defaults to hex"),
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.payload, "payload");
-      const found = keyFromEnv(input.keyEnvVar);
+      const found = keyFromEnv("VerifyPayload", input.keyEnvVar, ctx);
       if (!found.ok) return `VerifyPayload: ${found.message}`;
       const algorithm = (input.algorithm ?? "sha256") as HashAlgorithm;
       const encoding = (input.encoding ?? "hex") as SignatureEncoding;
@@ -1003,14 +1104,16 @@ export const redactForExport: RegisteredTool = buildTool({
     keyEnvVar: z
       .string()
       .optional()
-      .describe("env var with the HMAC key; required for pseudonym mode"),
+      .describe(
+        "NAME of the environment variable holding the HMAC key, one the operator listed in tool_config.secure.key_env_vars; required for pseudonym mode",
+      ),
     tokenLength: z.number().int().min(4).max(64).optional(),
     ...piiSelectionShape,
     ...secretOptionsShape,
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       if ((input.text === undefined) === (input.path === undefined)) {
         return "RedactForExport needs exactly one of text or path.";
@@ -1040,7 +1143,7 @@ export const redactForExport: RegisteredTool = buildTool({
         if (input.keyEnvVar === undefined) {
           return "RedactForExport: pseudonym mode needs keyEnvVar, the NAME of an environment variable holding the HMAC key.";
         }
-        const found = keyFromEnv(input.keyEnvVar);
+        const found = keyFromEnv("RedactForExport", input.keyEnvVar, ctx);
         if (!found.ok) return `RedactForExport: ${found.message}`;
         key = found.key;
       }

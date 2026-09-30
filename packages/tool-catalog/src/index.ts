@@ -156,6 +156,248 @@ export type ModelFeatureRequirement = {
   readonly web_search?: boolean;
 };
 
+/**
+ * The version of the tool contract this package defines: the
+ * `ToolDefinition` an author writes, and the `RegisteredTool` the runtime
+ * holds. A tool package published outside this repo can compare it against
+ * the version it was written for before it relies on a field.
+ *
+ * Semver: a new OPTIONAL field is a minor bump, a field that changes meaning
+ * or becomes required is a major one.
+ *
+ * - `1.0.0` — the contract as released in crewhaus 0.7.0.
+ * - `1.1.0` — adds `operativeArgs` (crewhaus 0.7.1).
+ */
+export const TOOL_CONTRACT_VERSION = "1.1.0";
+
+/**
+ * What an operative argument holds, which decides how a permission rule's
+ * argument glob is compared with it:
+ *
+ * - `"path"` — a filesystem path. It is resolved against the workspace root
+ *   before matching: `..` collapsed and symlinked directories followed, so a
+ *   rule is checked against the file the tool will actually touch. A path
+ *   that lands outside the workspace never satisfies an allow rule and always
+ *   satisfies a deny or ask rule. (The edge worker has no filesystem to ask:
+ *   there `..` is collapsed as text and a path that climbs above its start
+ *   counts as outside.) A deny or ask rule also compares it in Unicode
+ *   normal form C, and ignoring letter case where the filesystem does.
+ * - `"url"` — a URL, compared in its parsed (WHATWG `href`) form, so
+ *   `HTTP://Example.COM` and `http://example.com/` are one value. A deny or
+ *   ask rule also compares it as the request really made — without
+ *   userinfo, a root dot, a fragment or percent-escapes, in lower case — and,
+ *   when the rule names a host, on any port and over http and https.
+ * - `"command"` — a command line. An array (an argv) is joined with single
+ *   spaces, so `Tool(git status)` matches `["git", "status"]`.
+ *   An allow rule must match the whole command; a deny or ask rule also fires
+ *   on any single word of an argv, so `RunCommand(rm)` catches
+ *   `["rm", "-rf", "src"]`, and compares it ignoring letter case (a program
+ *   named `RM` runs `rm` on a filesystem that ignores case).
+ * - `"recipient"` — who or where the tool delivers to, when that is not
+ *   written as a URL: an email address, a phone number, a host name, a
+ *   repository. An allow rule compares it as written. A deny or ask rule
+ *   also compares it in lower case, without a root dot on a host or domain,
+ *   without a `+tag` on an address, without a display name around one, and
+ *   as a phone number's digits alone.
+ * - `"id"` — an identifier: an owner, a chain, an address, a hash. An allow
+ *   rule compares it as written; a deny or ask rule also ignores letter case.
+ *   An `"id"` field may also hold a number, which is compared as its decimal
+ *   string.
+ * - `"text"` — compared as written, except that a `0x` hex value (in any
+ *   kind but a path or URL) is compared by a deny or ask rule ignoring
+ *   letter case, which is at most an EIP-55 checksum.
+ *
+ * `"url"` and `"recipient"` are the destination kinds: an external tool that
+ * declares one sends to a place the model chooses (see
+ * {@link hasModelChosenDestination}).
+ */
+export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text" | "id";
+
+/**
+ * One input field a permission rule's argument glob constrains — the rule
+ * `Write(src/**)` is about Write's `path`, not its `content`.
+ *
+ * `field` names the field in the tool's input schema. Use dots for a nested
+ * field (`target.path`). An array anywhere on the way is walked element by
+ * element, so `requests.url` covers the `url` of every request.
+ *
+ * `default` is the value the tool uses when the field is omitted, for a tool
+ * that fills the default in `execute` rather than in its schema. Without it,
+ * a call that leaves the field out would carry no value for a deny rule to
+ * catch, while the tool still acts on the default. A default of `*` means
+ * "every value" (EvmGetLogs without an `address` reads every contract's
+ * logs), whatever the kind: a deny or ask naming any one value there fires,
+ * and an allow grants it only when its pattern matches EVERY value there
+ * (`EvmGetLogs(1/*)` does; `EvmGetLogs(1/0x…)` and `EvmGetLogs(1/?)` do not).
+ * A path left out this way is every path under its `within` directory, or
+ * under the workspace root; a URL or a command is any at all.
+ *
+ * `within` names a second, top-level field that qualifies this one. Its value
+ * is written in front, with a `/` between: `{ field: "repo", kind:
+ * "recipient", within: "owner" }` is matched as `crewhaus/factory`, so one rule
+ * can say `IssueCreate(crewhaus/*)`. An allow must match that qualified
+ * form; a deny or ask also fires on the value alone and on the qualifier
+ * alone, so `alwaysDeny IssueCreate(factory)` or `IssueCreate(*)`, written
+ * the way 0.7.0 matched every string in a call, is not silently dead.
+ *
+ * For a `path`, `within` names the
+ * directory the path is relative to (`{ field: "paths", kind: "path", within:
+ * "cwd" }`), and the joined path is what gets resolved; an absolute path is
+ * left as it is. When the call leaves the qualifying field out, the value is
+ * matched on its own. A `url` cannot be qualified.
+ *
+ * For a `command`, `within` names the directory it runs in (`{ field: "argv",
+ * kind: "command", within: "cwd" }`), because the same words are another
+ * program elsewhere: `./build.sh` in `src/` runs `src/build.sh`. A command
+ * that runs in the workspace root — the field left out, or naming the root —
+ * is matched as usual. One that runs anywhere else is not covered by a
+ * scoped allow (`RunCommand(./build.sh)` asks) unless it names every command
+ * (`RunCommand(**)`), while a deny or ask reads
+ * the command as written and each word that may name a file as that file
+ * from the workspace root, so `alwaysDeny RunCommand(*src/build.sh*)` fires
+ * on `./build.sh` run in `src/`. A bare program name (`git`) is not joined:
+ * PATH finds it, not the directory. A command inside an array of objects
+ * (`steps.argv`) runs in its own object's field of that name when it has
+ * one, else the top-level one. A command tool whose input has a working
+ * directory declares it this way; without it, the directory is invisible to
+ * every rule.
+ *
+ * `relocates: true` marks a `path` field that only moves the tool off its
+ * usual place: the store its other operative fields name a record in
+ * (`stateDir`, `registryDir`, `evalsDir`), or the repository a branch
+ * operation runs in (`cwd`) — or a `url` field that only moves it off the
+ * fixed service it is built to use (DependencyAudit's `endpoint`, the
+ * public OSV database). It needs a `default`. A deny or ask rule sees
+ * that default when the call leaves the field out, so
+ * `alwaysDeny KvDelete(.crewhaus/state/**)` fires on the ordinary call. An
+ * allow rule is about the record: when the call leaves the field out AND
+ * carries another operative value, the default does not have to match as
+ * well, so `alwaysAllow KvSet(scratch/*)` still covers the ordinary call.
+ * A call that names the field is matched like any other: an allow must cover
+ * the place it names too. Without `relocates`, a default is one more value
+ * every rule reads — right for a field that IS where the tool acts
+ * (`EnvFileUpsert`'s `.env`, a harness directory it deletes).
+ *
+ * `env`, for a `command` only, names a top-level field holding the
+ * variables the call sets in the child's environment, a map of names to
+ * values (`{ field: "argv", kind: "command", within: "cwd", env: "envSet"
+ * }`). The environment can run another program than the command's words
+ * say — PATH decides what a bare program name is, and BASH_ENV,
+ * NODE_OPTIONS, LD_PRELOAD and the like load code of their own — so a call
+ * that sets any variable is not covered by a scoped allow that names a
+ * command (it asks, as a command run outside the root does; `RunCommand(**)`
+ * still covers it), and a deny or ask also reads a bare
+ * program as it is found on each PATH entry the call sets, and every value
+ * the call sets, each word that may name a file also as that file:
+ * `alwaysDeny RunCommand(*scripts/release.sh*)` fires on `[release.sh]`
+ * with `PATH: scripts`, and on `[bash, -c, true]` with `BASH_ENV:
+ * scripts/release.sh`. A command inside an array of objects reads its own
+ * object's field of that name when it has one, else the top-level one. A
+ * command tool that lets the call set its child's environment declares it
+ * this way; without it, the environment is invisible to every rule.
+ *
+ * `prefix: true`, for an `id`, `recipient` or `text` field, says its value
+ * is a prefix: the tool acts on every value that starts with it (KvList's
+ * `prefix` lists every key that begins with it). It needs `default: "*"` —
+ * a prefix left out filters nothing. The value stands for every value that
+ * begins with it, and what follows may hold `/`: a deny or ask naming any
+ * one of them fires (`alwaysDeny KvGet(secrets/apikey)` fires on a listing
+ * of `secrets` with prefix `""`, `api` or `apikey`, not `b`), and an allow
+ * must cover every one (`KvList(secrets/**)` grants prefix `api`;
+ * `KvList(secrets/*)` does not, since a key may hold `/`, and nor does
+ * `KvList(secrets/api)`). A deny written without the qualifier still fires
+ * on the value alone, as for any `within` field.
+ *
+ * `beneath`, for a `path`, says the tool also acts on what lies beneath the
+ * path when it names a directory: it walks it, and reads, lists, writes,
+ * moves or deletes what is inside (RemovePath, CopyPath, Grep, a git
+ * pathspec). A deny or ask naming anything there then fires on the
+ * directory: `alwaysDeny RemovePath(src/prod/**)` on `RemovePath src`, and
+ * `alwaysDeny Grep(secrets/**)` on a Grep of the whole workspace. An allow
+ * still reads the path alone (`RemovePath(build/**)` covers `RemovePath
+ * build`). `"all"` is everything beneath; `"visible"` everything whose names
+ * below the directory do not start with `.`, for a walk that skips hidden
+ * entries (Grep's), so `alwaysDeny Grep(.env)` does not fire on a search
+ * that never opens it. The runtime asks the filesystem: a path that names
+ * an existing file, or a link to one, stands for itself alone; one it
+ * cannot ask about (the edge worker) stands for what could be beneath it.
+ *
+ * `glob: true`, for a `path`, says the value is a pattern the tool lists
+ * the paths of (the Glob tool's `pattern`, whose wildcards never list a
+ * name that starts with `.`, though a name it writes literally is listed):
+ * it stands for every path it can list. A deny or ask
+ * fires when it can list a path the rule names — `alwaysDeny
+ * Glob(secrets/**)` on the pattern `**` + `/*`, not on `src/**` + `/*.ts` —
+ * and an allow grants it only when every path it can list is one the allow
+ * names (`Glob(src/**)` grants `src/**` + `/*.ts`; `Glob(src/*)` does not
+ * grant `src/**`).
+ *
+ * `defaultAtRoot: true`, for a `path` declared `within` another field with
+ * a `default`, says the default is read from the workspace root rather
+ * than joined to the `within` directory. A git command given no path acts
+ * on the whole repository wherever it runs: `GitDiff` with `cwd: "src"` and
+ * no `paths` diffs secrets/ too, so its left-out paths are the root.
+ *
+ * `shell: true`, for a `command` held as a string, says a shell parses it
+ * (`sh -c`, as the Bash tool runs its `command`). A shell line runs one
+ * program per simple command, joined by `&&`, `||`, `;`, `|`, `&`, newlines
+ * and parentheses, so an allow must match every simple command in it —
+ * `alwaysAllow Bash(git *)` does not grant `git status && rm -rf build` —
+ * or be the exact line (a pattern with no wildcard). A line whose commands
+ * cannot be read out of its text (a `$(…)`, backticks, a here-document, an
+ * unterminated quote, …) is granted by no scoped allow; `Bash(*)` and
+ * `Bash(**)` still grant what they did. A deny or ask fires on the whole line
+ * and on any simple command in it, also read without the variables it sets,
+ * unquoted, through wrappers such as `env`, `sudo` and `xargs`, and inside an
+ * `eval`, a `sh -c` or a substitution; every deny or ask fires on a command
+ * whose program its text does not name (`$(…) -rf x`, `read x; $x`), which
+ * no scoped allow grants. A command held as an argv array runs
+ * without a shell and is never split; a deny or ask still reads the line an
+ * argv hands to a shell (`["sh", "-c", "a && b"]`).
+ *
+ * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
+ * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
+ * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
+ * whose dangerous mode hangs on a flag should gate that mode itself — for
+ * example with `requireJustification` — rather than rely on a scoped rule.
+ */
+export type OperativeArg = {
+  readonly field: string;
+  readonly kind: OperativeArgKind;
+  readonly default?: string;
+  readonly within?: string;
+  readonly relocates?: true;
+  readonly env?: string;
+  readonly prefix?: true;
+  readonly beneath?: "all" | "visible";
+  readonly defaultAtRoot?: true;
+  readonly glob?: true;
+  readonly shell?: true;
+};
+
+/** The kinds that name where a tool sends: see {@link OperativeArgKind}. */
+export const DESTINATION_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set(["url", "recipient"]);
+
+/**
+ * True when the tool sends to a destination the model picks: it is
+ * `scope: "external"` and one of its `operativeArgs` is a URL or a
+ * recipient. Such a tool can carry whatever the model puts in the call to
+ * wherever the model points it, so the egress fabric treats it as a dynamic
+ * sink.
+ *
+ * Taken structurally, so a data-only description of a tool (the builtin
+ * manifest) answers the same way as the live one.
+ */
+export function hasModelChosenDestination(tool: {
+  readonly scope: string;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+}): boolean {
+  return (
+    tool.scope === "external" &&
+    (tool.operativeArgs ?? []).some((a) => DESTINATION_ARG_KINDS.has(a.kind as OperativeArgKind))
+  );
+}
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -218,12 +460,23 @@ export interface ToolDefinition<TInput = unknown> {
    * never see a field their own schema doesn't allow. A tool that declares
    * the field itself keeps receiving it verbatim.
    *
-   * Default at normalization is `false`. Recommended `true` for any tool
-   * with destructive or external side effects (evm-tx, message-channel,
-   * federation outbound). Independent of `scope` — a tool can be
-   * `internal` and still require justification (e.g. a destructive fs
-   * delete), and a tool can be `external` without requiring justification
-   * (e.g. a read-only public-data fetch).
+   * Default at normalization is `false`.
+   *
+   * THE RULE (0.7.1): a `destructive` tool that goes to a place the model
+   * chose — `scope: "external"` with a `url` or `recipient` operative
+   * argument ({@link hasModelChosenDestination}) — MUST set this: it changes
+   * or delivers something where the model pointed it (a message, a post, an
+   * HTTP call, a download). Other tools MAY set it when their effect deserves
+   * an intent check (a fleet mutation, a secret rotation). A destructive tool
+   * that acts only inside the workspace (Write, RemovePath, Bash) is not
+   * required to: the permission gate already asks, and without an LLM judge
+   * a justification fails closed in production, so gating every write would
+   * stop every write. That includes workspace loss that cannot be undone
+   * (RemovePath with `recursive`, GitWorktreeRemove and GitBranchDelete with
+   * `force`) and standing automation (HooksManage): reviewed and left ungated
+   * in 0.7.x, and an 0.8 decision. apps/cli/src/flag-rules.test.ts holds the
+   * rule over every builtin and lists the gated set and those four, so a
+   * change either way is deliberate.
    */
   requireJustification?: boolean;
   /**
@@ -264,6 +517,38 @@ export interface ToolDefinition<TInput = unknown> {
    * or returning `false` routes the call serial.
    */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /**
+   * The input field(s) a permission rule's argument glob is checked against —
+   * see {@link OperativeArg}. `buildTool` refuses a declaration that names a
+   * field the input schema does not have.
+   *
+   * How a rule reads them:
+   *
+   * - an `alwaysAllow` rule matches only when EVERY operative value in the
+   *   call matches its glob, so one in-scope value cannot carry an
+   *   out-of-scope one;
+   * - an `alwaysDeny` or `alwaysAsk` rule matches when ANY operative value
+   *   does.
+   *
+   * Values are read from the input AFTER the tool's schema has parsed it: the
+   * same object `execute` receives, with unknown keys stripped.
+   *
+   * Omitted ⇒ the rule falls back to the tool's string values: an allow needs
+   * every one of them to match, a deny or ask fires on any. That is safe but
+   * blunt: a tool with a message or a note field can rarely be given a scoped
+   * allow. Declaring the operative field is what makes a scoped allow usable.
+   *
+   * `[]` says, deliberately, that no argument decides where the tool acts —
+   * it writes to the clipboard, or stops a process by a handle only this
+   * session has. A rule with an argument pattern is then matched against the
+   * call's string values, exactly as for a tool that declares nothing, and
+   * `crewhaus lint` points out that such a rule scopes nothing.
+   *
+   * Every builtin that is not read-only, or is `scope: "external"`, declares
+   * this (an empty array included); `apps/cli/src/operative-args.test.ts`
+   * holds that.
+   */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -309,6 +594,9 @@ export interface RegisteredTool {
   /** See ToolDefinition.concurrencyClassifier. Optional; when absent the
    *  orchestrator partitions on the static concurrency flags alone. */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /** See ToolDefinition.operativeArgs. Optional and passed through verbatim
+   *  by `buildTool` after it has checked every field against the schema. */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 export class ToolCatalogError extends CrewhausError {
@@ -398,7 +686,7 @@ export class ToolCatalog {
    * `crewhaus run` quarantine path (apps/cli `runRunCli`) does NOT use it. It
    * reads the failing-server set from `.crewhaus/mcp/quarantine.json` (written
    * by `crewhaus mcp doctor`), filters the plain tools array by the
-   * `<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
+   * `mcp__<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
    * `quarantineNotice()` to the agent instructions. This method + `restore()`
    * + `quarantinedNames()` are a catalog-level API awaiting a caller.
    */
@@ -546,6 +834,48 @@ export function stripJustificationField(input: unknown): unknown {
   if (!isPlainObject(input) || !(JUSTIFICATION_INPUT_FIELD in input)) return input;
   const { [JUSTIFICATION_INPUT_FIELD]: _stripped, ...rest } = input;
   return rest;
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool names
+// ---------------------------------------------------------------------------
+
+/**
+ * The prefix every tool from an MCP server carries: a remote tool `echo` on
+ * the server `everything` is registered as `mcp__everything__echo`. This is
+ * the spelling the docs, the spec's model-profile `tools:` selectors, the
+ * egress fabric and the scope audit all key on.
+ */
+export const MCP_TOOL_NAME_PREFIX = "mcp__";
+
+/** The registered name of the remote tool `tool` on the MCP server `server`. */
+export function mcpToolName(server: string, tool: string): string {
+  return `${MCP_TOOL_NAME_PREFIX}${server}__${tool}`;
+}
+
+/**
+ * The spelling an MCP tool name had before crewhaus 0.7.1, `<server>__<tool>`,
+ * or `undefined` when `name` is not an MCP tool name. Rules, allow-lists and
+ * rate limits written against the old spelling keep matching through it.
+ */
+export function legacyMcpToolName(name: string): string | undefined {
+  if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return undefined;
+  const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
+  // The separator after a server of at least one character. An
+  // `mcp_servers` key may itself contain `__` or start with `_` (0.7.0 ran
+  // such keys), and the old spelling is still everything after `mcp__`.
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
+
+/**
+ * Does a name written in a tool list (a skill's or sub-agent's `tools`, a
+ * rate-limit key) refer to the registered tool `name`? Exact match, or the
+ * pre-0.7.1 spelling of an MCP tool name.
+ */
+export function toolListEntryNames(entry: string, name: string): boolean {
+  return entry === name || (entry.length > 0 && legacyMcpToolName(name) === entry);
 }
 
 export const defaultCatalog = new ToolCatalog();

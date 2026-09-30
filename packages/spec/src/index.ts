@@ -1,4 +1,10 @@
 import { SpecParseError } from "@crewhaus/errors";
+import {
+  expandToolSelectors,
+  parseSelector,
+  toolConfigKeysReaching,
+  toolsInCategory,
+} from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -135,29 +141,44 @@ const permissionsBlock = z
 const mcpRequiredField = z.boolean().optional();
 
 /**
- * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. Every MCP tool is
- * `readOnly: false` today and therefore asks in default mode; `tool_flags`
- * lets a spec tighten what the runtime knows about a server's tools
- * (`defaults` for every tool on the server, `per_tool` for named ones).
+ * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. `tool_flags` lets a spec
+ * tighten what the runtime knows about a server's tools (`defaults` for every
+ * tool on the server, `per_tool` keyed by the server's own tool name). Since
+ * 0.7.1 it is lowered and enforced: `destructive: true` makes auto mode ask,
+ * `requireJustification: true` puts the tool behind the intent gate. The
+ * server's own `destructiveHint: true` / `readOnlyHint: false` annotations
+ * tighten the same way; the loosening hints are ignored.
  *
- * SECURITY: the enumerated key set is `{readOnly: true, destructive: true,
+ * SECURITY: the enumerated key set is `{destructive: true,
  * requireJustification: true}` and each value is the literal `true` — a spec
  * may never clear `requireJustification`, never set `scope: internal` on an
  * `mcp__*` tool and never touch `ioCapability`. Loosening any of those would
  * punch straight through the egress chokepoint, which keys on
  * `scope === "external"`, so the schema rejects the loosening direction at
  * parse time (defense in depth, mirroring `permissions.mode: bypass`).
+ *
+ * `readOnly` is NOT a tightening, and is refused: a read-only tool is one
+ * plan mode and auto mode run WITHOUT asking, so marking a remote tool
+ * read-only grants it. 0.6.0 accepted the key (and refused to compile any
+ * `tool_flags` at all), so no spec that compiled relied on it.
  */
 const MCP_TOOL_FLAG_FORBIDDEN_KEYS = ["scope", "ioCapability", "classifyOutput"] as const;
 
 const mcpToolFlagsEntrySchema = z
   .object({
-    readOnly: z.literal(true).optional(),
+    readOnly: z
+      .never({
+        errorMap: () => ({
+          message:
+            "mcp_servers.<name>.tool_flags cannot set readOnly: read-only is a grant, not a restriction — plan and auto mode run a read-only tool without asking. Remove it; to tighten a tool, set destructive: true or requireJustification: true",
+        }),
+      })
+      .optional(),
     destructive: z.literal(true).optional(),
     requireJustification: z.literal(true).optional(),
   })
   .strict(
-    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (readOnly: true, destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
+    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
   );
 
 const mcpToolFlagsBlock = z
@@ -191,7 +212,86 @@ const sseMcpConfig = z
 
 const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig, sseMcpConfig]);
 
-const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
+/**
+ * An `mcp_servers` key becomes part of every tool name the server contributes
+ * (`mcp__<server>__<tool>`), and model providers accept only letters, digits,
+ * `_` and `-` there, so any other character fails the spec. Mirrors
+ * `MCP_SERVER_NAME_PATTERN` in `@crewhaus/tool-mcp`, which refuses the same
+ * names at registration; apps/cli checks the two agree.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The names {@link mcpServerNameWarning} is quiet about: no `__`, and no `_`
+ * at either end.
+ */
+const CLEAR_MCP_SERVER_NAME_RE = /^(?!_)(?:[A-Za-z0-9-]|_(?!_))+(?<!_)$/;
+
+function mcpServerNameSuggestion(name: string): string {
+  const cleaned = name
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/_{2,}/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  return cleaned === "" ? "my-server" : cleaned;
+}
+
+/**
+ * Why an `mcp_servers` key that works should still be renamed, or undefined
+ * when there is nothing to say. `__` is the separator in
+ * `mcp__<server>__<tool>`, and a key containing it, or starting or ending
+ * with `_`, makes that split ambiguous: server `a` + tool `b__c` and
+ * server `a__b` + tool `c` are the same tool name.
+ */
+function mcpServerNameWarning(name: string): string | undefined {
+  if (!MCP_SERVER_NAME_RE.test(name) || CLEAR_MCP_SERVER_NAME_RE.test(name)) return undefined;
+  const suggestion = mcpServerNameSuggestion(name);
+  const why = name.includes("__")
+    ? 'contains "__", which also separates the server from the tool in mcp__<server>__<tool>'
+    : 'starts or ends with "_", which blurs where mcp__<server>__<tool> splits';
+  return `mcp_servers key "${name}" ${why}, so two servers' tool names can collide. Rename it, e.g. "${suggestion}", and rename the permission rules, hooks and rate_limits that name ${name}__… or mcp__${name}__… to match.`;
+}
+
+/**
+ * The `mcp_servers` keys in a parsed spec that work but should be renamed
+ * (see {@link mcpServerNameWarning}), wherever the shape nests the block.
+ * crewhaus 0.7.0 ran such keys, so `compile` and `lint` warn about them
+ * rather than fail.
+ */
+export function mcpServerNameWarnings(
+  spec: unknown,
+): Array<{ readonly path: string; readonly message: string }> {
+  const out: Array<{ path: string; message: string }> = [];
+  const visit = (node: unknown, at: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => visit(item, `${at}[${i}]`));
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      const path = at === "" ? key : `${at}.${key}`;
+      if (key !== "mcp_servers" || value === null || typeof value !== "object") {
+        visit(value, path);
+        continue;
+      }
+      for (const name of Object.keys(value)) {
+        const message = mcpServerNameWarning(name);
+        if (message !== undefined) out.push({ path: `${path}.${name}`, message });
+      }
+    }
+  };
+  visit(spec, "");
+  return out;
+}
+
+const mcpServerNameKey = z.string().superRefine((name, ctx) => {
+  if (MCP_SERVER_NAME_RE.test(name)) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message: `mcp_servers key "${name}" can only use letters, digits, "-" and "_". Rename it, e.g. "${mcpServerNameSuggestion(name)}", and rename the permission rules, hooks and rate_limits that name it to match.`,
+  });
+});
+
+const mcpServersBlock = z.record(mcpServerNameKey, mcpServerConfigSchema).optional();
 
 // Section 13 — sub-agent definitions (`subAgentDefinitionSchema` /
 // `subAgentsBlock`) are declared below the model-profile section: from
@@ -219,12 +319,14 @@ const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optio
  * knobs; any sandbox-override key is rejected at parse time (defense in
  * depth, mirroring `permissions.mode: bypass`).
  *
- * The code-execution config can arrive under any of the keys whose
- * BUILTIN_TOOL_MAP entry maps to `registerCodeExecutionConfig` — the
- * `codeExecution`/`code_execution` aliases AND the per-tool keys
- * `python`/`javascript`/`shell` (target-cli `resolveTools` reads the
- * per-tool key first, then the aliases). All of them must be constrained,
- * or the guard is trivially bypassed by nesting the blob under `python`.
+ * The code-execution config can arrive under any key the builtin table's boot
+ * rule sends to `registerCodeExecutionConfig` — the `codeExecution` /
+ * `code_execution` aliases, the per-tool keys `python` / `javascript` /
+ * `shell`, and their registered names (`Python`), compared without case. The
+ * set is read from `@crewhaus/tool-categories` rather than written here, so a
+ * spelling the boot rule accepts cannot slip past this guard: all of them
+ * must be constrained, or the guard is bypassed by nesting the blob under
+ * `Python`.
  */
 const SANDBOX_OVERRIDE_KEYS = [
   "sandbox",
@@ -237,13 +339,7 @@ const SANDBOX_OVERRIDE_KEYS = [
   "mounts",
 ] as const;
 
-const CODE_EXECUTION_CONFIG_KEYS = [
-  "codeExecution",
-  "code_execution",
-  "python",
-  "javascript",
-  "shell",
-] as const;
+const CODE_EXECUTION_CONFIG_KEYS = toolConfigKeysReaching("registerCodeExecutionConfig");
 
 const codeExecutionConfigSchema = z
   .object({
@@ -252,19 +348,23 @@ const codeExecutionConfigSchema = z
     // trusted operator config and is intentionally NOT settable from a spec.
     defaultTimeoutMs: z.number().int().positive().optional(),
     default_timeout_ms: z.number().int().positive().optional(),
+    // The longest timeout any call may run with — the model's `timeout`
+    // included (security-6#15). It can only narrow what a spec could already
+    // allow, so a spec may set it; 600 000 is the model's own limit.
+    maxTimeoutMs: z.number().int().positive().max(600_000).optional(),
+    max_timeout_ms: z.number().int().positive().max(600_000).optional(),
     warmPoolSize: z.number().int().nonnegative().optional(),
     warm_pool_size: z.number().int().nonnegative().optional(),
   })
   .strict(
-    `code-execution config may only set non-security knobs (defaultTimeoutMs, warmPoolSize); sandbox-boundary keys (${SANDBOX_OVERRIDE_KEYS.join(", ")}) are owned by trusted operator config and rejected from specs`,
+    `code-execution config may only set non-security knobs (defaultTimeoutMs, maxTimeoutMs, warmPoolSize); sandbox-boundary keys (${SANDBOX_OVERRIDE_KEYS.join(", ")}) are owned by trusted operator config and rejected from specs`,
   );
 
 const toolConfigBlock = z
   .record(z.string().min(1), z.unknown())
   .superRefine((cfg, ctx) => {
-    for (const key of CODE_EXECUTION_CONFIG_KEYS) {
-      const value = cfg[key];
-      if (value === undefined) continue;
+    for (const [key, value] of Object.entries(cfg)) {
+      if (value === undefined || !CODE_EXECUTION_CONFIG_KEYS.has(key.toLowerCase())) continue;
       const parsed = codeExecutionConfigSchema.safeParse(value);
       if (!parsed.success) {
         for (const issue of parsed.error.issues) {
@@ -496,12 +596,13 @@ const compactionBlock = z
  * `spec-patch`'s `OPTIMIZABLE_PATHS`, so this block MUST be named
  * `security` with a `justification` sub-field to honour it.
  *
- * `justification.judge` selects which `JustificationJudge` the cli run
- * path wires: `"rule-based"` (the deterministic default for tests/offline
- * runs) or `"claude"` (the model-backed `@crewhaus/justification-judge-claude`,
- * the documented production recommendation). `model` is the judge model
- * id for the claude judge; the consumer defaults it to a haiku-class
- * model when omitted.
+ * `justification.judge` selects which `JustificationJudge` the cli shape
+ * wires — `crewhaus run` and, since 0.7.1, the compiled bundle, through the
+ * same construction: `"rule-based"` (the deterministic default for
+ * tests/offline runs) or `"claude"` (the model-backed
+ * `@crewhaus/justification-judge-claude`, the documented production
+ * recommendation). `model` is the judge model id for the claude judge; the
+ * consumer defaults it to a haiku-class model when omitted.
  *
  * NOTE: `egressPolicy` is reserved — `OPTIMIZABLE_PATHS` also lists
  * `["security", "egressPolicy"]`, owned by the egress-fabric FRs
@@ -4045,17 +4146,71 @@ type SpecRoutedBlock = {
  *   - `committee` — `strategy.committee` is legal on single-turn hosts ONLY
  *     (workflow steps, graph nodes, crew roles): every REPL / per-message
  *     turn is one the user is waiting on (§7.6).
- *   - `shapeTools` — the tool list a profile/candidate `tools` must be a
- *     subset of; `undefined` when the block declares none (the default
- *     toolset is resolved by the emitter, so the subset check waits for the
- *     ir-pass) — EXCEPT on a tool-less shape (`toolLess`), where any profile
- *     `tools` is an error.
+ *   - `shapeTools` — the tool lists, as written, whose grant a
+ *     profile/candidate `tools` must be a subset of (one list per step, node
+ *     or role on the multi-agent shapes, whose grant is their union);
+ *     `undefined` when the block declares none (the default toolset is
+ *     resolved by the emitter, so the subset check waits for the ir-pass) —
+ *     EXCEPT on a tool-less shape (`toolLess`), where any profile `tools` is
+ *     an error. A list is compared by what it GRANTS, with its `all-<category>`
+ *     and `-<tool>` selectors expanded, so a profile may name `csvParse` on a
+ *     shape that lists `all-data`.
  */
 type SpecRoutedHost = {
   readonly committee: boolean;
-  readonly shapeTools: readonly string[] | undefined;
+  readonly shapeTools: ReadonlyArray<readonly string[]> | undefined;
   readonly toolLess: boolean;
 };
+
+/** The declared lists a host grants from, or undefined when none is declared. */
+function declaredToolLists(
+  lists: ReadonlyArray<readonly string[] | undefined>,
+): ReadonlyArray<readonly string[]> | undefined {
+  const declared = lists.filter((l): l is readonly string[] => l !== undefined);
+  return declared.length > 0 ? declared : undefined;
+}
+
+/**
+ * Every tool key the lists grant, categories expanded and exclusions applied
+ * per list, as the compiler expands them before lowering. Undefined when a
+ * list does not expand (an unknown category, an exclusion that removes
+ * nothing): the compiler reports that list, and a subset check against a
+ * grant nobody can read would only add a second, wrong error.
+ */
+function grantOf(lists: ReadonlyArray<readonly string[]>): ReadonlySet<string> | undefined {
+  const granted = new Set<string>();
+  for (const list of lists) {
+    try {
+      for (const key of expandToolSelectors(list).tools) granted.add(key);
+    } catch {
+      return undefined;
+    }
+  }
+  return granted;
+}
+
+/**
+ * The keys a profile list's own `-<tool>` / `-all-<category>` exclusions
+ * remove, so an `all-<category>` include is judged by what it keeps. An
+ * unknown category adds nothing here; the compiler reports it.
+ */
+function profileExclusions(tools: readonly string[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const raw of tools) {
+    const sel = parseSelector(raw);
+    if (!sel.exclude) continue;
+    if (sel.kind === "tool") {
+      out.add(sel.key);
+      continue;
+    }
+    try {
+      for (const key of toolsInCategory(sel.name)) out.add(key);
+    } catch {
+      // reported by the compiler
+    }
+  }
+  return out;
+}
 
 type SpecModelCheckContext = {
   readonly custom: SpecAddIssue;
@@ -4069,6 +4224,15 @@ type SpecModelCheckContext = {
 
 const MODEL_DIRECTED_TOOLS = new Set(["Consult", "Escalate"]);
 const MCP_TOOL_SELECTOR_RE = /^mcp__([^_].*?)__(.+)$/;
+
+/** Does `selector` (`mcp__<server>__<tool or glob>`) start with a declared server? */
+function namesDeclaredMcpServer(selector: string, servers: ReadonlySet<string>): boolean {
+  for (const server of servers) {
+    const prefix = `mcp__${server}__`;
+    if (selector.startsWith(prefix) && selector.length > prefix.length) return true;
+  }
+  return false;
+}
 
 /** Levenshtein distance — the did-you-mean helper for unknown `$refs` / tags. */
 function editDistance(a: string, b: string): number {
@@ -4220,8 +4384,15 @@ function checkProfileTools(
     );
     return;
   }
+  const declared = host.shapeTools?.flat();
+  const granted = host.shapeTools !== undefined ? grantOf(host.shapeTools) : undefined;
+  const excluded = profileExclusions(tools);
   for (const [i, tool] of tools.entries()) {
+    // An exclusion only narrows the profile's own list.
+    if (tool.startsWith("-")) continue;
     if (tool.startsWith("mcp__")) {
+      // A declared key may itself contain `__`, so match the keys first.
+      if (namesDeclaredMcpServer(tool, ctx.mcpServers)) continue;
       const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
       if (server === undefined) {
         ctx.custom(
@@ -4245,10 +4416,35 @@ function checkProfileTools(
       }
       continue;
     }
-    if (host.shapeTools !== undefined && !host.shapeTools.includes(tool)) {
+    if (declared === undefined || granted === undefined) continue;
+    const sel = parseSelector(tool);
+    if (sel.kind === "category") {
+      // A category the shape's own list names is accepted here as 0.7.0
+      // accepted it, whatever that list excludes. A profile a pool serves is
+      // checked again once both lists are expanded (the ir-pass names each
+      // tool the shape leaves out); one nothing serves narrows nothing.
+      if (declared.includes(tool)) continue;
+      let keys: ReadonlyArray<string>;
+      try {
+        keys = toolsInCategory(sel.name);
+      } catch {
+        continue; // an unknown category: the compiler reports it
+      }
+      const strays = keys.filter((k) => !excluded.has(k) && !granted.has(k));
+      if (strays.length > 0) {
+        const shown = strays.slice(0, 5).join(", ");
+        const more = strays.length > 5 ? ` and ${strays.length - 5} more` : "";
+        ctx.custom(
+          [...path, i],
+          `${path.join(".")}[${i}]: "${tool}" includes tools the shape's tools (${declared.join(", ")}) do not grant: ${shown}${more} — a per-model tools list can only narrow the shape's toolset, never add to it; exclude them (-<tool>) or name the tools you mean`,
+        );
+      }
+      continue;
+    }
+    if (!granted.has(tool)) {
       ctx.custom(
         [...path, i],
-        `${path.join(".")}[${i}]: "${tool}" is not one of the shape's tools (${host.shapeTools.join(", ")}) — a per-model tools list can only narrow the shape's toolset, never add to it`,
+        `${path.join(".")}[${i}]: "${tool}" is not one of the shape's tools (${declared.join(", ")}) — a per-model tools list can only narrow the shape's toolset, never add to it`,
       );
     }
   }
@@ -4452,7 +4648,7 @@ function checkSubAgent(
   }
   checkRoutedBlock(ctx, path, def, {
     committee: false,
-    shapeTools: def.tools,
+    shapeTools: declaredToolLists([def.tools]),
     toolLess: false,
   });
 }
@@ -4564,7 +4760,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: data.evaluation !== undefined,
       };
-      const shapeTools = data.target === "cli" ? data.tools : data.agent.tools;
+      const shapeTools = declaredToolLists([data.target === "cli" ? data.tools : data.agent.tools]);
       const host: SpecRoutedHost = { committee: false, shapeTools, toolLess: false };
       checkProfiles(ctx, host);
       checkRoutedBlock(ctx, ["agent"], data.agent, host);
@@ -4579,11 +4775,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: data.steps.some((s) => "kind" in s && s.kind === "judge"),
       };
-      const declaredTools = data.steps.flatMap((s) => ("tools" in s ? (s.tools ?? []) : []));
-      const anyStepDeclaresTools = data.steps.some((s) => "tools" in s && s.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyStepDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(data.steps.map((s) => ("tools" in s ? s.tools : undefined))),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4607,7 +4801,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         }
         checkRoutedBlock(ctx, ["steps", i], step, {
           committee: true,
-          shapeTools: step.tools,
+          shapeTools: declaredToolLists([step.tools]),
           toolLess: false,
         });
       }
@@ -4622,11 +4816,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: nodes.some(([, n]) => "kind" in n && n.kind === "judge"),
       };
-      const declaredTools = nodes.flatMap(([, n]) => ("tools" in n ? (n.tools ?? []) : []));
-      const anyNodeDeclaresTools = nodes.some(([, n]) => "tools" in n && n.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyNodeDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(nodes.map(([, n]) => ("tools" in n ? n.tools : undefined))),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4649,7 +4841,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         }
         checkRoutedBlock(ctx, ["nodes", name], node, {
           committee: true,
-          shapeTools: node.tools,
+          shapeTools: declaredToolLists([node.tools]),
           toolLess: false,
         });
       }
@@ -4664,11 +4856,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         gradedInLoop: false,
       };
       const roles = Object.entries(data.roles);
-      const declaredTools = roles.flatMap(([, r]) => r.tools ?? []);
-      const anyRoleDeclaresTools = roles.some(([, r]) => r.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyRoleDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(roles.map(([, r]) => r.tools)),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4676,7 +4866,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       for (const [name, role] of roles) {
         checkRoutedBlock(ctx, ["roles", name], role, {
           committee: true,
-          shapeTools: role.tools,
+          shapeTools: declaredToolLists([role.tools]),
           toolLess: false,
         });
       }
@@ -4705,7 +4895,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       const toolLess = data.target === "pipeline";
       const host: SpecRoutedHost = {
         committee: false,
-        shapeTools: toolLess ? undefined : data.tools,
+        shapeTools: toolLess ? undefined : declaredToolLists([data.tools]),
         toolLess,
       };
       checkProfiles(ctx, host);
@@ -4731,7 +4921,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       };
       checkProfiles(ctx, {
         committee: false,
-        shapeTools: data.target === "eval" ? data.agent.tools : data.tools,
+        shapeTools: declaredToolLists([data.target === "eval" ? data.agent.tools : data.tools]),
         toolLess: false,
       });
       checkModelSlot(ctx, ["agent", "model"], data.agent.model);

@@ -466,6 +466,53 @@ describe("Pillar 3 — ruleBasedJustificationJudge", () => {
     }
   });
 
+  // 0.7.1 review: NODE_ENV=test is ambient. A compiled bundle, or `crewhaus
+  // run`, started under it is not the test runner, and its rule-based
+  // judge's `allow` must not stand. A child process whose entry is not a
+  // test file stands in for the bundle.
+  test("NODE_ENV=test outside the test runner opens nothing: the allow still fails closed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pe-node-env-"));
+    try {
+      const script = join(dir, "agent.ts");
+      writeFileSync(
+        script,
+        [
+          `import { evaluateJustification } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          `const v = await evaluateJustification(${JSON.stringify(OVERLAPPING)});`,
+          "process.stdout.write(JSON.stringify(v));",
+        ].join("\n"),
+      );
+      const verdict = (env: Record<string, string>) => {
+        const out = Bun.spawnSync([process.execPath, script], {
+          env: { PATH: process.env["PATH"] ?? "", ...env },
+          stderr: "pipe",
+        });
+        return JSON.parse(out.stdout.toString()) as { allow: boolean; reason: string };
+      };
+      const underTestEnv = verdict({ NODE_ENV: "test" });
+      expect(underTestEnv.allow).toBe(false);
+      expect(underTestEnv.reason).toMatch(/fail-closed/);
+      // The operator's explicit opt-in is the one way to accept it.
+      expect(
+        verdict({ NODE_ENV: "test", CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION: "1" }).allow,
+      ).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("under the test runner the rule-based judge still answers for itself", async () => {
+    // This file is the runner's entry, and Bun set NODE_ENV=test.
+    expect(process.env.NODE_ENV).toBe("test");
+    const prevOptIn = process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"];
+    process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = "";
+    try {
+      expect((await evaluateJustification({ ...OVERLAPPING })).allow).toBe(true);
+    } finally {
+      process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] = prevOptIn ?? "";
+    }
+  });
+
   test("CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1 restores the rule-based allow in production", async () => {
     const prevEnv = process.env.NODE_ENV;
     const prevOptIn = process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"];

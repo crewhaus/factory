@@ -117,6 +117,7 @@ import {
 } from "./store";
 import {
   MAX_VECTOR_IDS,
+  VECTOR_DELETE_EXAMPLE,
   applyVectorDeletes,
   capList,
   checkCollection,
@@ -367,6 +368,10 @@ function readLog(toolName: string, root: SafePath, dir: string, name: string): L
 
 export const kvSet: RegisteredTool = stateTool({
   name: "KvSet",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "key", kind: "id", within: "namespace" },
+  ],
   description:
     "Store a JSON value under a key in a namespace, with an optional TTL and an optional compare-and-set on the current version. Use it to remember something across turns, runs or agents; pass `expectedVersion` when another agent might be writing the same key and the write is refused rather than clobbering theirs.",
   inputSchema: z.object({
@@ -452,8 +457,16 @@ export const kvSet: RegisteredTool = stateTool({
   },
 });
 
+// The readers declare the store and the record as the writers do (C004): a
+// deny on the store — `alwaysDeny *(.crewhaus/state/**)` — reads the default
+// when the call leaves stateDir out, and a listing that names no record
+// stands for every record (`*`), so a deny naming one fires on it.
 export const kvGet: RegisteredTool = stateTool({
   name: "KvGet",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "key", kind: "id", within: "namespace" },
+  ],
   description:
     "Read one key back, with its version and expiry. Use it before a compare-and-set write, or to recover a value a previous turn stored; expiry is evaluated only when you pass `now`, and the result says whether it was checked.",
   inputSchema: z.object({
@@ -517,6 +530,10 @@ export const kvGet: RegisteredTool = stateTool({
 
 export const kvDelete: RegisteredTool = stateTool({
   name: "KvDelete",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "key", kind: "id", within: "namespace" },
+  ],
   description:
     "Delete a key, optionally only while it is still at the version you read. Use it to release a claim or drop state you are finished with; deleting a key that is not there is reported, not an error.",
   inputSchema: z.object({
@@ -574,6 +591,11 @@ export const kvDelete: RegisteredTool = stateTool({
 
 export const kvList: RegisteredTool = stateTool({
   name: "KvList",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    // A prefix: the listing holds every key that starts with it, `/` and all.
+    { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+  ],
   description:
     "List the keys in a namespace, sorted, with their versions and optionally their values. Use it to see what a previous run left behind; records whose files are corrupt are listed separately instead of failing the whole call.",
   inputSchema: z.object({
@@ -660,6 +682,10 @@ function isCounter(value: unknown): value is CounterRecord {
 
 export const counterIncrement: RegisteredTool = stateTool({
   name: "CounterIncrement",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Add to a durable named counter and return the new value, optionally refusing to cross a limit. Use it for attempt counts, quotas and budgets that must survive a restart; the read-modify-write runs under a lock, so two agents incrementing at once both count.",
   inputSchema: z.object({
@@ -741,6 +767,10 @@ export const counterIncrement: RegisteredTool = stateTool({
 
 export const counterGet: RegisteredTool = stateTool({
   name: "CounterGet",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id", default: "*" },
+  ],
   description:
     "Read one counter, or every counter when you name none. Use it to check a budget before spending it; a counter that has never been incremented reads as 0 rather than as an error.",
   inputSchema: z.object({
@@ -822,6 +852,10 @@ function versionFileName(version: number): string {
 
 export const checkpointSave: RegisteredTool = stateTool({
   name: "CheckpointSave",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Save a named JSON checkpoint as a new numbered version, so a long flow can be resumed after a crash or a restart. Use it at each stage boundary; earlier versions are kept unless you set `keep`, and `expectedVersion` refuses the save when somebody else checkpointed in the meantime.",
   inputSchema: z.object({
@@ -913,6 +947,10 @@ export const checkpointSave: RegisteredTool = stateTool({
 
 export const checkpointLoad: RegisteredTool = stateTool({
   name: "CheckpointLoad",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Load a checkpoint back — the newest version, or an earlier one by number. Use it when resuming: load, see how far the last run got, and carry on from there instead of starting again.",
   inputSchema: z.object({
@@ -964,6 +1002,10 @@ export const checkpointLoad: RegisteredTool = stateTool({
 
 export const checkpointList: RegisteredTool = stateTool({
   name: "CheckpointList",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id", default: "*" },
+  ],
   description:
     "List the saved checkpoints with their version counts and newest label. Use it to find out what a previous run left to resume from before loading anything.",
   inputSchema: z.object({
@@ -1020,6 +1062,10 @@ export const checkpointList: RegisteredTool = stateTool({
 
 export const journalAppend: RegisteredTool = stateTool({
   name: "JournalAppend",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "stream", kind: "id" },
+  ],
   description:
     "Append one entry to an append-only JSONL stream and return its monotonic sequence number. Use it to record what happened, in order, so a later run or a reviewer can replay it; the sequence is allocated under a lock and the line written with O_APPEND, so concurrent writers never interleave.",
   inputSchema: z.object({
@@ -1068,6 +1114,10 @@ export const journalAppend: RegisteredTool = stateTool({
 
 export const journalRead: RegisteredTool = stateTool({
   name: "JournalRead",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "stream", kind: "id", default: "*" },
+  ],
   description:
     "Read a journal stream back, filtered by sequence range, kind or substring — or list the streams when you name none. Use `sinceSeq` with the last sequence you handled to read only what is new; corrupt lines are reported with their line numbers and the rest of the stream is still returned.",
   inputSchema: z.object({
@@ -1131,6 +1181,10 @@ export const journalRead: RegisteredTool = stateTool({
 
 export const blackboardPost: RegisteredTool = stateTool({
   name: "BlackboardPost",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "topic", kind: "id" },
+  ],
   description:
     "Post a note to a shared topic that other crew members can read. Use it to leave findings, claims or warnings for agents working the same problem — it is a durable pinboard, not a delivery mechanism, so nobody is notified and nobody is guaranteed to read it.",
   inputSchema: z.object({
@@ -1179,6 +1233,10 @@ export const blackboardPost: RegisteredTool = stateTool({
 
 export const blackboardRead: RegisteredTool = stateTool({
   name: "BlackboardRead",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "topic", kind: "id", default: "*" },
+  ],
   description:
     "Read a topic's posts, filtered by author, tag or sequence — or list the topics when you name none. Use `latestPerAuthor` to get each crew member's most recent word without wading through the whole thread.",
   inputSchema: z.object({
@@ -1276,6 +1334,10 @@ function isNote(value: unknown): value is NoteRecord {
 
 export const noteWrite: RegisteredTool = stateTool({
   name: "NoteWrite",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "id", kind: "id" },
+  ],
   description:
     "Write or overwrite a durable note under an id, with an optional title and tags. Use it to keep what the crew learned — a convention, a workaround, an answer worth not deriving twice — somewhere NoteSearch can find it again.",
   inputSchema: z.object({
@@ -1336,6 +1398,7 @@ export const noteWrite: RegisteredTool = stateTool({
 
 export const noteSearch: RegisteredTool = stateTool({
   name: "NoteSearch",
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true }],
   description:
     "Search the stored notes with BM25 ranking over their titles, tags and text. Use it to recall what the crew already worked out; the matching is LEXICAL ONLY — no embeddings, no synonyms, no stemming — so a note about 'automobiles' will not answer a query about 'cars'.",
   inputSchema: z.object({
@@ -1446,6 +1509,10 @@ export const noteSearch: RegisteredTool = stateTool({
 
 export const indexBuild: RegisteredTool = stateTool({
   name: "IndexBuild",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Build a named inverted index over a list of workspace text files, so they can be searched without a model reading them. Use it once per corpus and re-run it when the files change — the index is a snapshot and watches nothing; binary and over-large files are skipped and reported rather than mangled.",
   inputSchema: z.object({
@@ -1536,6 +1603,10 @@ export const indexBuild: RegisteredTool = stateTool({
 
 export const indexSearch: RegisteredTool = stateTool({
   name: "IndexSearch",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Query an index built by IndexBuild and get the ranked files back, with optional snippets. Use it to narrow a large corpus to the two or three files worth reading; ranking is BM25 over literal terms, and a file whose size or mtime no longer matches the index is flagged stale rather than silently trusted.",
   inputSchema: z.object({
@@ -1667,6 +1738,7 @@ function replaceRefusal(root: SafePath): string | undefined {
 
 export const stateExport: RegisteredTool = stateTool({
   name: "StateExport",
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true }],
   description:
     "Dump the whole state directory as one JSON document, with a digest per file. Use it to back state up, move it to another machine, or attach it to a bug report; text files are carried as text and anything else as base64, and symlinks are skipped rather than followed.",
   inputSchema: z.object({
@@ -1738,6 +1810,7 @@ export const stateExport: RegisteredTool = stateTool({
 
 export const stateImport: RegisteredTool = stateTool({
   name: "StateImport",
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, beneath: "all" }],
   description:
     "Restore a state directory from a StateExport document, merging into what is there or replacing it. Use it to seed a fresh workspace or roll state back; `dryRun` reports exactly what would be written first, every entry path is checked for escapes before anything is created, and 'replace' refuses any directory holding anything this package did not put there, so it can never be pointed at a source tree.",
   inputSchema: z.object({
@@ -1843,6 +1916,10 @@ export const stateImport: RegisteredTool = stateTool({
 
 export const dedupeMark: RegisteredTool = stateTool({
   name: "DedupeMark",
+  operativeArgs: [
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
+    { field: "scope", kind: "id" },
+  ],
   description:
     "Record that an external id has been handled, and say whether it had been seen before. Use it as the guard in front of anything that must not happen twice — sending a mail, charging a card, filing a ticket — because a retried run marks the same id and gets `alreadySeen: true` instead of doing it again.",
   inputSchema: z.object({
@@ -1917,6 +1994,7 @@ export const dedupeMark: RegisteredTool = stateTool({
 
 export const vectorDelete: RegisteredTool = stateTool({
   name: "VectorDelete",
+  operativeArgs: [{ field: "ids", kind: "id" }],
   description:
     "Delete entries from the registered vector store by id, reporting how many deletes were ATTEMPTED and what the store's count was before and after. Use it to erase indexed content on request, and read the result exactly as it is worded: the store offers no way to ask whether an id exists, so nothing here can tell you an id was present or is now gone, and on an eventually-consistent backend `countAfter` is one indicative observation rather than proof.",
   inputSchema: z.object({
@@ -1959,7 +2037,7 @@ export const vectorDelete: RegisteredTool = stateTool({
   execute: async (input, ctx) => {
     const target = getVectorTarget();
     if (target === undefined) {
-      return "VectorDelete has no vector store registered, and will not invent one — the host registers the store it already built with registerVectorTarget({ store, collection }). Nothing was deleted.";
+      return `VectorDelete has no vector store registered, and will not invent one. Name the store in the spec — ${VECTOR_DELETE_EXAMPLE} — or have the host call registerVectorTarget({ store, collection }). Nothing was deleted.`;
     }
 
     const policy = readVectorToolConfig(ctx?.toolConfig);
@@ -2103,10 +2181,12 @@ export {
   countIsIndicative,
   getVectorTarget,
   parseChunkId,
+  registerVectorDeleteConfig,
   registerVectorTarget,
   selectVectorIds,
   type ChunkId,
   type VectorCountConsistency,
+  type VectorDeleteConfigInput,
   type VectorDeleteTarget,
   type VectorSelection,
   type VectorTargetRegistration,

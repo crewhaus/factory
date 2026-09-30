@@ -73,7 +73,11 @@ export function slugify(text: string, options: SlugifyOptions = {}): SlugifyResu
   let working = text;
   const replacements = options.replacements ?? {};
   for (const key of Object.keys(replacements).sort((a, b) => b.length - a.length)) {
-    working = working.replace(new RegExp(escapeRegex(key), "g"), ` ${replacements[key] ?? ""} `);
+    // A function replacer, never a replacement STRING: the caller's value is
+    // text, and as a string `$&`, `$'` and `` $` `` would expand to pieces of
+    // the input, so `{"&": "$`"}` turned "Tom & Jerry" into "tom-tom-jerry".
+    const value = ` ${replacements[key] ?? ""} `;
+    working = working.replace(new RegExp(escapeRegex(key), "g"), () => value);
   }
   working = [...working].map((character) => CHAR_MAP[character] ?? character).join("");
   // NFKD splits "é" into "e" + a combining acute, which the next step removes.
@@ -81,12 +85,16 @@ export function slugify(text: string, options: SlugifyOptions = {}): SlugifyResu
   if (lowercase) working = working.toLowerCase();
 
   const keep = allowUnicode ? /[^\p{L}\p{N}]+/gu : /[^a-zA-Z0-9]+/g;
-  let slug = working.replace(keep, separator);
+  // The separator is inserted by a function replacer for the same reason: as
+  // a replacement string, a separator of `$&` put back the very punctuation
+  // (`/`, `..`) the slug exists to remove.
+  const insertSeparator = (): string => separator;
+  let slug = working.replace(keep, insertSeparator);
 
   if (separator !== "") {
     const escaped = escapeRegex(separator);
     slug = slug
-      .replace(new RegExp(`(?:${escaped}){2,}`, "g"), separator)
+      .replace(new RegExp(`(?:${escaped}){2,}`, "g"), insertSeparator)
       .replace(new RegExp(`^(?:${escaped})|(?:${escaped})$`, "g"), "");
   }
 

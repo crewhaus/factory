@@ -34,10 +34,15 @@
  * version is the caller's.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
-import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolExecuteResult,
+  legacyMcpToolName,
+} from "@crewhaus/tool-catalog";
+import { appendContained, openForReadFd } from "@crewhaus/tool-safety/fs";
 import { RunnerError } from "./errors";
 
 /** The single JSONL file a recording directory holds. */
@@ -124,10 +129,18 @@ export type ToolRecorderOptions = {
 };
 
 /**
- * Append-only writer for a recording directory. `appendFileSync` per record:
- * an eval run is one process and JS is single-threaded, so concurrent samples
- * cannot interleave a partial line (each append completes before the next
- * statement runs).
+ * Append-only writer for a recording directory. One synchronous append per
+ * record: an eval run is one process and JS is single-threaded, so concurrent
+ * samples cannot interleave a partial line (each append completes before the
+ * next statement runs).
+ *
+ * 0.7.1: the append goes through @crewhaus/tool-safety's `appendContained`,
+ * rooted at the recording directory, so a link, FIFO or directory at
+ * `tools.jsonl` is refused instead of followed. The agent under evaluation runs
+ * its tools while the cassette is being written; with GitApplyPatch it could
+ * plant `tools.jsonl -> <outside>` in a recording directory inside the
+ * workspace, and every later record (verbatim tool arguments and results)
+ * was appended to that file.
  */
 export class ToolRecorder {
   readonly dir: string;
@@ -139,7 +152,18 @@ export class ToolRecorder {
     this.dir = opts.dir;
     this.path = join(opts.dir, TOOL_RECORDING_FILENAME);
     this.now = opts.now ?? (() => new Date());
-    this.appendLine = opts.append ?? ((path, line) => appendFileSync(path, line, { mode: 0o600 }));
+    this.appendLine =
+      opts.append ??
+      ((path, line) => {
+        const appended = appendContained(this.dir, TOOL_RECORDING_FILENAME, line, {
+          mode: 0o600,
+        });
+        if (!appended.ok) {
+          throw new RunnerError(
+            `tool recording: refusing to append to ${path}: ${appended.reason} (code ${appended.code})`,
+          );
+        }
+      });
     // 0700 to match the 0600 file: the cassette holds verbatim tool args and
     // results (module docstring), so the directory must not be world-readable
     // just because the caller's umask is loose.
@@ -167,6 +191,27 @@ export type LoadedToolRecording = {
 };
 
 /**
+ * The cassette's text, or undefined when it does not exist. 0.7.1: read
+ * without following a link at `tools.jsonl`, since a replay serves its lines
+ * to the model as tool results; a link, FIFO or directory there is refused.
+ */
+function readRecording(dir: string, path: string): string | undefined {
+  if (!existsSync(dir)) return undefined;
+  const opened = openForReadFd(dir, TOOL_RECORDING_FILENAME, { followLeafSymlink: false });
+  if (!opened.ok) {
+    if (opened.code === "not-found") return undefined;
+    throw new RunnerError(
+      `tool recording: refusing to read ${path}: ${opened.reason} (code ${opened.code})`,
+    );
+  }
+  try {
+    return readFileSync(opened.fd, "utf-8");
+  } finally {
+    closeSync(opened.fd);
+  }
+}
+
+/**
  * Read a recording directory. A missing/unreadable file is a loud
  * `RunnerError` at run start (never a silent all-miss replay); a torn or
  * malformed LINE is skipped with the same posture as the run-history index —
@@ -177,7 +222,7 @@ export function loadToolRecording(
   read?: (path: string) => string | undefined,
 ): LoadedToolRecording {
   const path = join(dir, TOOL_RECORDING_FILENAME);
-  const readFile = read ?? ((p: string) => (existsSync(p) ? readFileSync(p, "utf-8") : undefined));
+  const readFile = read ?? ((p: string) => readRecording(dir, p));
   const text = readFile(path);
   if (text === undefined) {
     throw new RunnerError(
@@ -252,9 +297,18 @@ export class ToolReplayer {
     return this.reused;
   }
 
-  /** The next recorded entry for the key, or undefined on a MISS. */
+  /**
+   * The next recorded entry for the key, or undefined on a MISS. An MCP tool
+   * recorded before 0.7.1 is filed under its old name `<server>__<tool>`; a
+   * call to `mcp__<server>__<tool>` that has no entry of its own finds it
+   * there, so a cassette recorded on 0.7.0 still replays.
+   */
   take(sampleId: string, toolName: string, argsHash: string): ToolRecord | undefined {
-    const key = toolRecordKey(sampleId, toolName, argsHash);
+    let key = toolRecordKey(sampleId, toolName, argsHash);
+    const legacy = legacyMcpToolName(toolName);
+    if (!this.byKey.has(key) && legacy !== undefined) {
+      key = toolRecordKey(sampleId, legacy, argsHash);
+    }
     const list = this.byKey.get(key);
     if (list === undefined || list.length === 0) return undefined;
     const at = this.cursor.get(key) ?? 0;

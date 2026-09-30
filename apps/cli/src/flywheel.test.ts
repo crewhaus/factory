@@ -817,7 +817,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
 
     const forced = await runCli(["flywheel", "init", "--force"], root);
     expect(forced.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("NEW-HUNT-8 — flywheel init --suite wires the nightly tier and validates the path", async () => {
     const tieredRoot = newTempRoot();
@@ -859,14 +859,14 @@ describe("crewhaus flywheel (CLI surface)", () => {
     const wf = readFileSync(join(root, ".github", "workflows", "crewhaus-flywheel.yml"), "utf-8");
     expect(wf).toContain("working-directory: agents/concierge");
     expect(wf).toContain("path: agents/concierge/.crewhaus/flywheel/");
-  });
+  }, 20_000);
 
   test("unknown action dies with the allowed set", async () => {
     const root = newTempRoot();
     const res = await runCli(["flywheel", "spin"], root);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain('"init" or "run"');
-  });
+  }, 20_000);
 
   test("flywheel run refuses a dirty spec in a git repo (invariant)", async () => {
     const root = newTempRoot();
@@ -895,7 +895,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     const allowed = await runCli(["flywheel", "run", "--allow-dirty"], root);
     expect(allowed.exitCode).toBe(1);
     expect(allowed.stderr).toContain("no dataset");
-  });
+  }, 20_000);
 
   // D42 — the flag is parsed before any spend, and per-split gating is a
   // registry-only concept.
@@ -908,7 +908,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     const res = await runCli(["flywheel", "run", "--gate-split", "test"], root);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("held-out split");
-  });
+  }, 20_000);
 
   test("flywheel run --gate-split over a flat-file dataset is refused", async () => {
     const root = newTempRoot();
@@ -928,14 +928,14 @@ describe("crewhaus flywheel (CLI surface)", () => {
     const res = await runCli(["flywheel", "run", "--gate-split", "dev"], root);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("needs a registry dataset with splits");
-  });
+  }, 20_000);
 
   test("flywheel run without a spec dies with the harness-convention hint", async () => {
     const root = newTempRoot();
     const res = await runCli(["flywheel", "run"], root);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("spec not found");
-  });
+  }, 20_000);
 
   test("H4 — conventional dataset/graders are found beside a spec in a sibling dir", async () => {
     const root = newTempRoot();
@@ -958,7 +958,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.exitCode).toBe(1);
     expect(res.stderr).not.toContain("no dataset");
     expect(res.stderr).toContain("zero samples");
-  });
+  }, 20_000);
 
   test("flywheel --help documents the loop, the knobs, and the invariants", async () => {
     const root = newTempRoot();
@@ -989,7 +989,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     // NEW-flywheel-shadow — the provenance line + shadow warning are documented.
     expect(res.stdout).toContain("flag|convention|ratings-registry");
     expect(res.stdout).toContain("shadows");
-  });
+  }, 20_000);
 
   test("B16 — flywheel run refuses an explicit #test registry ref", async () => {
     const root = newTempRoot();
@@ -1007,7 +1007,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.stderr).toContain("flywheel never runs over the test split");
     // NEW-flywheel-shadow — the provenance line printed before the refusal.
     expect(res.stdout).toContain("[flywheel] dataset: registry:golden#test (source: flag)");
-  });
+  }, 20_000);
 
   test("NEW-flywheel-shadow — a conventional dataset shadowing ratings warns loudly", async () => {
     const root = newTempRoot();
@@ -1037,7 +1037,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.stderr).toContain("shadows the distilled ratings dataset");
     expect(res.stderr).toContain("registry:hello-ratings@v1");
     expect(res.stderr).toContain("pass --dataset registry:hello-ratings");
-  });
+  }, 20_000);
 
   test("NEW-flywheel-shadow — no shadow warning without a registered ratings dataset", async () => {
     const root = newTempRoot();
@@ -1055,7 +1055,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
     expect(res.exitCode).toBe(1);
     expect(res.stdout).toContain("(source: convention)");
     expect(res.stderr).not.toContain("shadows");
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------

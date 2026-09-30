@@ -25,7 +25,13 @@
  * ran it.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { LPSTAT_STDOUT, PS_CAFFEINATE_STDOUT, PS_REUSED_PID_STDOUT } from "./fixtures";
+import { isAbsolute, sep } from "node:path";
+import {
+  LPSTAT_STDOUT,
+  PS_CAFFEINATE_STDOUT,
+  PS_REUSED_PID_STDOUT,
+  WINDOWS_PRINTER_LIST_STDOUT,
+} from "./fixtures";
 import {
   HEADLESS_ENV,
   type SessionEnv,
@@ -46,6 +52,7 @@ import {
 } from "./index";
 import { POWERSHELL_FLAGS, osascriptProgramText, registeredPowerShellSources } from "./lib/escape";
 import { type HostFs, type PathFacts, _setFs } from "./lib/fsseam";
+import { extensionOf } from "./lib/open";
 import { type RunRequest, type RunResult, _resetRunSeams, _setDetacher, _setRunner } from "./run";
 
 type Recorded = { argv: readonly string[]; env?: Readonly<Record<string, string>>; stdin?: string };
@@ -179,6 +186,20 @@ const INJECTION_SITES: ReadonlyArray<[string, (v: string) => Promise<unknown>]> 
 const BENIGN = "benignvalue";
 
 /**
+ * {@link sameTemplate}, where a value that became part of a PATH may also be
+ * spelled with the host's separators. A target is resolved against the
+ * workspace with node:path, and on Windows that turns each `/` in the value
+ * into `\\`: `</toast>` becomes `<\\toast>` inside one path element, which is
+ * still the value in its one slot, not a changed command.
+ */
+function sameSlot(hostile: string, control: string, value: string): boolean {
+  if (sameTemplate(hostile, control, value)) return true;
+  return (
+    sep !== "/" && value.includes("/") && sameTemplate(hostile, control, value.replaceAll("/", sep))
+  );
+}
+
+/**
  * Are these two argv elements the same template with the caller's value
  * substituted for the benign one?
  *
@@ -288,7 +309,7 @@ test(
             }
             for (let k = 0; k < h.length; k += 1) {
               elementsCompared += 1;
-              if (!sameTemplate(h[k] ?? "", c[k] ?? "", value)) {
+              if (!sameSlot(h[k] ?? "", c[k] ?? "", value)) {
                 leaked.push(
                   `${site} ${JSON.stringify(value)} -> ELEMENT ${k} ${JSON.stringify(h[k])} vs ${JSON.stringify(c[k])}`,
                 );
@@ -519,6 +540,10 @@ test("every state-changing tool declares itself and every read-only one is marke
   expect(clipboardWrite.destructive).toBe(true);
   expect(printDocument.destructive).toBe(true);
   expect(powerAssertion.destructive).toBe(true);
+  // flag-truth-5#6: what OpenExternal opens acts in the operator's session
+  // and outlives the call, so auto mode asks and every call is justified.
+  expect(openExternal.destructive).toBe(true);
+  expect(openExternal.requireJustification).toBe(true);
   expect(windowList.readOnly).toBe(true);
   expect(userPresence.readOnly).toBe(true);
   // Every tool here spawns a process, so every one must lower external or the
@@ -896,8 +921,9 @@ test("a real print probes the queue first and passes options as separate argv el
     "sides=two-sided-long-edge",
   ]);
   // The document is the LAST element and is absolute, so it can never be read
-  // as an option by a program that has no `--`.
-  expect(lp[9]).toMatch(/^\/.*package\.json$/);
+  // as an option by a program that has no `--` (`/…` here, `D:\\…` on Windows).
+  expect(isAbsolute(lp[9] ?? "")).toBe(true);
+  expect(lp[9]).toMatch(/[\\/]package\.json$/);
   expect(lp.length).toBe(10);
   expect(out["outcome"]).toBe("queued");
   expect(out["jobId"]).toBe("Canon_MX490_series-34");
@@ -1162,6 +1188,95 @@ test("OpenExternal refuses what a desktop would RUN, mode bit or no mode bit", a
     expect(argvSeen).toEqual([]);
   }
 
+  // flag-truth-5#6 / security-10#4: the rest of the location-file family,
+  // and what installs or runs on open with no execute bit. Each was
+  // "handedOff" in 0.7.0. Checked on every platform, dry run or not, and
+  // the runner must never be reached.
+  const RUN_ON_OPEN = [
+    "loc.fileloc",
+    "net.afploc",
+    "x.ftploc",
+    "app.jnlp",
+    "p.mobileconfig",
+    "p.configprofile",
+    "i.mpkg",
+    "s.py",
+    "s.pyw",
+    "c.msc",
+    "h.chm",
+    "a.appref-ms",
+    "a.application",
+    "s.settingcontent-ms",
+    "l.library-ms",
+    "s.search-ms",
+    "x.searchConnector-ms",
+    "e.scf",
+    "w.website",
+    "m.msix",
+    "r.rdp",
+    "t.theme",
+    "d.iso",
+    "x.prefPane",
+    "x.service",
+    "x.action",
+    "x.wflow",
+    "x.shortcut",
+    "p.appimage",
+    // 0.7.1 review (C122 residual): a Terminal session file, the shells and
+    // interpreters beside the ones already refused, and the rest of
+    // Microsoft's Level-1 list that runs, installs or configures on open.
+    "x.term",
+    "x.pyo",
+    "x.pl",
+    "x.rb",
+    "x.ksh",
+    "x.csh",
+    "x.tcsh",
+    "x.msu",
+    "x.mst",
+    "x.cab",
+    "x.ins",
+    "x.isp",
+    "x.hlp",
+    "x.xbap",
+    "x.vb",
+    "x.wsb",
+    "x.psc1",
+    "x.ps1xml",
+    "x.msh",
+    "x.accde",
+    "x.accdb",
+    "x.mdb",
+    "x.mde",
+    "x.ade",
+    "x.adp",
+    "x.mam",
+    // Windows drops trailing dots and spaces when it opens a path.
+    "deploy.bat.",
+    "deploy.bat. .",
+  ];
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    _setPlatform(platform);
+    _setSessionEnv(platform === "linux" ? X11 : HEADLESS_ENV);
+    for (const name of RUN_ON_OPEN) {
+      for (const dryRun of [true, false]) {
+        argvSeen = [];
+        const out = JSON.parse(
+          String(await openExternal.execute({ target: name, dryRun } as never)),
+        ) as Record<string, unknown>;
+        expect({ name, platform, outcome: out["outcome"] }).toEqual({
+          name,
+          platform,
+          outcome: "refused",
+        });
+        expect(String(out["reason"])).toContain(`".${extensionOf(name)}"`);
+        expect(argvSeen).toEqual([]);
+      }
+    }
+  }
+  _setPlatform("darwin");
+  _setSessionEnv(HEADLESS_ENV);
+
   // ...and an ordinary document still opens.
   argvSeen = [];
   const doc = JSON.parse(
@@ -1170,6 +1285,55 @@ test("OpenExternal refuses what a desktop would RUN, mode bit or no mode bit", a
   console.log(`OPEN_DOC ${JSON.stringify(doc)}`);
   expect(doc["outcome"]).toBe("handedOff");
   expect(argvSeen[0]?.argv?.[0]).toBe("open");
+});
+
+// C122 residual (attacker review): the commit claimed disk images that mount
+// on open and "the rest of Microsoft's Level-1 list", but .sparseimage,
+// .sparsebundle, .cdr, .sysprefex, .udl, .cer and more were still handed
+// off. These lists are the sources, not this file's own deny-list:
+// Microsoft's published Level-1 attachment list, and the document types
+// macOS's DiskImageMounter, System Settings, Keychain Access and Screen
+// Sharing register (their Info.plist files on macOS 26).
+const MICROSOFT_LEVEL_1 = `ade adp app appcontent-ms application appref-ms asp aspx asx bas bat bgi
+  cab cer chm cmd cnt com cpl crt csh der diagcab exe fxp gadget grp hlp hpj hta htc inf ins iso
+  isp its jar jnlp js jse ksh lnk mad maf mag mam maq mar mas mat mau mav maw mcf mda mdb mde mdt
+  mdw mdz msc msh msh1 msh2 mshxml msh1xml msh2xml msi msp mst msu ops osd pcd pif pl plg prf prg
+  printerexport ps1 ps1xml ps2 ps2xml psc1 psc2 psd1 psdm1 pst py pyc pyo pyw pyz pyzw reg scf
+  scr sct shb shs theme tmp udl url vb vbe vbp vbs vhd vhdx vsmacros vsw webpnp website ws wsb
+  wsc wsf wsh xbap xll xnk`
+  .split(/\s+/)
+  .filter((e) => e !== "");
+const MACOS_HANDLERS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  DiskImageMounter: `dmg udif img toast dvdr cdr dmgpart iso sparseimage asif sparsebundle
+    backupbundle`.split(/\s+/),
+  "System Settings": ["prefpane", "saver", "sysprefex", "internetconnect", "networkconnect"],
+  "Keychain Access": `cer cert crt der keychain keychain-db p10 p12 p7 p7b p7c p7m p7r p7s pem pfx
+    pkcs12`.split(/\s+/),
+  "Screen Sharing": ["vncloc"],
+  Installer: ["pkg", "mpkg"],
+  Themes: ["themepack", "deskthemepack"],
+};
+
+test("OpenExternal refuses Microsoft's Level-1 list in full and what macOS mounts, installs or imports on open", async () => {
+  const names = [...MICROSOFT_LEVEL_1, ...Object.values(MACOS_HANDLERS).flat()];
+  expect(MICROSOFT_LEVEL_1).toHaveLength(123);
+  expect(new Set(names).size).toBeGreaterThan(150);
+  _setFs(memoryFs(() => PLAIN_FILE));
+  const handedOff: string[] = [];
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    _setPlatform(platform);
+    _setSessionEnv(platform === "linux" ? X11 : HEADLESS_ENV);
+    for (const ext of new Set(names)) {
+      argvSeen = [];
+      const out = JSON.parse(
+        String(await openExternal.execute({ target: `payload.${ext}` } as never)),
+      ) as Record<string, unknown>;
+      if (out["outcome"] !== "refused" || argvSeen.length > 0) handedOff.push(`${platform}:${ext}`);
+    }
+  }
+  expect(handedOff).toEqual([]);
+  _setPlatform("darwin");
+  _setSessionEnv(HEADLESS_ENV);
 });
 
 test("the Windows print path that DOES work carries its values in the environment", async () => {
@@ -1192,6 +1356,32 @@ test("the Windows print path that DOES work carries its values in the environmen
   }
   expect(print?.env?.["CREWHAUS_PRINT_DEST"]).toBe("Front_Desk");
   expect(String(print?.env?.["CREWHAUS_PRINT_PATH"])).toMatch(/notes\.txt$/);
+});
+
+test("a Windows queue is read whole, and an unreadable one is never 'no printers'", async () => {
+  // reliability#7: 0.7.0 fed `printer <Name> is <Status>` to the lpstat
+  // parser, so "Microsoft Print to PDF" came back as a printer "Microsoft".
+  _setPlatform("win32");
+  answers["powershell.exe"] = { code: 0, stdout: WINDOWS_PRINTER_LIST_STDOUT };
+  const out = JSON.parse(
+    String(await printDocument.execute({ path: "notes.txt", dryRun: true } as never)),
+  ) as Record<string, unknown>;
+  const queue = out["queue"] as Record<string, unknown>;
+  expect((queue["printers"] as Array<{ name: string }>).map((p) => p.name)).toEqual([
+    "Microsoft Print to PDF",
+    "\\\\print-01\\Front Desk, 2F",
+  ]);
+  expect(queue["defaultPrinter"]).toBe("Microsoft Print to PDF");
+
+  // Get-Printer failed: stderr and no JSON. 0.7.0 answered printers: [] with
+  // nothing to say the list was not read.
+  answers["powershell.exe"] = { code: 0, stdout: "", stderr: "The spooler is not running.\r\n" };
+  const failed = JSON.parse(
+    String(await printDocument.execute({ path: "notes.txt", dryRun: true } as never)),
+  ) as Record<string, unknown>;
+  const failedQueue = failed["queue"] as Record<string, unknown>;
+  expect(failedQueue["printers"]).toEqual([]);
+  expect(String(failedQueue["queueUnreadable"])).toContain("NOT that it has none");
 });
 
 test("a hold refuses when it cannot tell whether the last holder is still running", async () => {

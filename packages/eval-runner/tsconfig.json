@@ -52,6 +52,9 @@
       "path": "../runtime-core"
     },
     {
+      "path": "../sandbox"
+    },
+    {
       "path": "../skills-registry"
     },
     {
@@ -73,6 +76,9 @@
       "path": "../tool-catalog"
     },
     {
+      "path": "../tool-categories"
+    },
+    {
       "path": "../tool-fetch"
     },
     {
@@ -83,6 +89,9 @@
     },
     {
       "path": "../tool-mcp"
+    },
+    {
+      "path": "../tool-safety"
     },
     {
       "path": "../tool-task"

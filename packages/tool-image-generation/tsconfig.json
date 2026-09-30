@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../tool-fetch" },
     { "path": "../errors" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" }

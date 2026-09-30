@@ -647,8 +647,13 @@ test("FederationDiscover reports a cancelled sweep as undetermined, not as a fle
   _setFetch(async (req, pinnedIp) => {
     dialed.push({ url: req.url, pinnedIp });
     served += 1;
-    // Cancel the run the moment the first peer has been answered.
-    ctrl.abort(new Error("operator stopped the run"));
+    // Cancel the run while the SECOND peer is being dialled, once the first
+    // has answered in full. (The body read honours the cancellation too, so
+    // a cancel before a peer's body is read leaves that peer undetermined.)
+    if (served === 2) {
+      ctrl.abort(new Error("operator stopped the run"));
+      throw new DOMException("the operation was aborted", "AbortError");
+    }
     return new Response(wellKnown(), { status: 200 });
   });
 
@@ -657,7 +662,7 @@ test("FederationDiscover reports a cancelled sweep as undetermined, not as a fle
     { peers: ["first.example", "second.example", "third.example"] },
     { signal: ctrl.signal },
   );
-  expect(served).toBe(1);
+  expect(served).toBe(2);
   expect(r["summary"]).toEqual({
     healthy: 1,
     unhealthy: 0,
@@ -667,8 +672,9 @@ test("FederationDiscover reports a cancelled sweep as undetermined, not as a fle
     total: 3,
   });
   const peers = r["peers"] as Json[];
-  expect(peers[1]?.["code"]).toBe("undetermined:not-attempted");
-  expect(String(peers[1]?.["reason"])).toContain("cancelled");
+  expect(peers[1]?.["code"]).toBe("undetermined:cancelled");
+  expect(peers[2]?.["code"]).toBe("undetermined:not-attempted");
+  expect(String(peers[2]?.["reason"])).toContain("cancelled");
 });
 
 // An explicit 15s budget: bun's default is 5000ms and CI is a loaded two-core
@@ -705,10 +711,12 @@ test("every null a tool returns is explained", async () => {
     const unexplained: string[] = [];
     const walk = (value: unknown, dotted: string): void => {
       if (value === null) {
-        // `filters.*` and `posture.allowList` are "the caller did not ask" and
-        // "the operator configured none" — absence of an input, not a fact
-        // this tool failed to establish.
-        if (!dotted.startsWith("filters.") && dotted !== "posture.allowList") {
+        // `filters.*`, `posture.allowList` and `posture.modelAllowList` are
+        // "the caller did not ask", "the operator configured none" and "no
+        // model-pool candidate narrowed this call" — absence of an input, not
+        // a fact this tool failed to establish.
+        const configured = dotted === "posture.allowList" || dotted === "posture.modelAllowList";
+        if (!dotted.startsWith("filters.") && !configured) {
           if (!explained.has(dotted)) unexplained.push(dotted);
         }
         return;

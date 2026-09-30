@@ -20,8 +20,11 @@ import {
   type Bundle,
   type EmitReadmeOptions,
   type IrEvalV0,
+  type IrPermissionRule,
+  type IrToolConfigs,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import type { EvalBridge } from "./runtime";
 
 /**
@@ -49,10 +52,69 @@ export type EmitEvalOptions = EmitReadmeOptions & {
   readonly cliVersion?: string;
 };
 
-export function emitEval(ir: IrEvalV0, opts: EmitEvalOptions = {}): Bundle {
+/**
+ * 0.7.1 (C002) — what an eval BRIDGE of a single-agent shape carries from its
+ * source spec besides the agent block: the spec's `tool_config` and its
+ * permission rules. A plain `target: eval` spec declares neither (its schema
+ * has no such keys), so both are absent there and the bundle keeps 0.7.0's
+ * bytes. The bridge's runner applies them exactly as `crewhaus eval` applies a
+ * cli spec's: the tool_config registrations first, then the rules, in the
+ * runner's auto mode. Without them the eval graded an agent with different
+ * tool settings and none of the spec's deny rules.
+ */
+export type EvalBundleIr = IrEvalV0 & {
+  readonly toolConfigs?: IrToolConfigs;
+  readonly permissions?: { readonly rules: readonly IrPermissionRule[] };
+};
+
+export function emitEval(ir: EvalBundleIr, opts: EmitEvalOptions = {}): Bundle {
   const bridge = opts.bridge;
   const seedLine = ir.seed !== undefined ? `  seed: ${ir.seed},\n` : "";
   const toolsLine = ir.agent.tools.length > 0 ? `  // Tools: ${ir.agent.tools.join(", ")}\n` : "";
+  // shape-reach#1 — the default invoker wires AGENT_TOOLS through the shared
+  // builtin table. The bundle imports each tool's package statically (so its
+  // manifest pins it and `bun install` fetches it) and hands the modules to
+  // the runner, instead of the runner guessing at a dynamic import. A bridge
+  // with a compiled entry runs its own tools, so it needs none of this.
+  const drivesOwnTools = bridge?.entryImport !== undefined;
+  let toolPackages: ReadonlyArray<string> = [];
+  if (!drivesOwnTools && ir.agent.tools.length > 0) {
+    // A name the eval shape cannot run throws BuiltinToolError (a
+    // CrewhausError, so the CLI prints it as a one-line error).
+    toolPackages = resolveBuiltinTools("eval", [{ tools: ir.agent.tools }]).packages;
+  }
+  const toolPackageImports = toolPackages
+    .map((pkg, i) => `import * as __toolPackage${i} from ${escapeJsonString(pkg)};\n`)
+    .join("");
+  // Carries its own newline, so a tool-less bundle keeps 0.7.0's bytes.
+  const toolPackagesConst =
+    toolPackages.length > 0
+      ? `const TOOL_PACKAGES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {\n${toolPackages
+          .map((pkg, i) => `  ${escapeJsonString(pkg)}: __toolPackage${i},\n`)
+          .join("")}};\n`
+      : "";
+  const importToolPackageLine =
+    toolPackages.length > 0
+      ? "      importToolPackage: async (pkg: string) => TOOL_PACKAGES[pkg] ?? import(pkg),\n"
+      : "";
+  // C002 — the spec's tool_config and permission rules reach the runner. A
+  // bridge that drives a compiled entry runs that entry's own config and
+  // rules, so it takes neither. Empty values keep 0.7.0's literal bytes.
+  const toolConfigs = drivesOwnTools ? {} : (ir.toolConfigs ?? {});
+  const permissionRules = drivesOwnTools ? [] : (ir.permissions?.rules ?? []);
+  const hasToolConfigs = Object.keys(toolConfigs).length > 0;
+  const hasPermissionRules = permissionRules.length > 0;
+  const policyConsts =
+    (hasToolConfigs
+      ? `// The spec's tool_config, applied through the same registrations the\n// compiled agent makes (\`$VAR\` values are read from this process).\nconst TOOL_CONFIGS = ${JSON.stringify(toolConfigs)};\n`
+      : "") +
+    (hasPermissionRules
+      ? `// The spec's permission rules. The runner runs in auto mode, as \`crewhaus\n// eval\` does, so these rules decide what the agent may do.\nconst PERMISSION_RULES = ${JSON.stringify(
+          permissionRules.map((r) => ({ type: r.type, pattern: r.pattern })),
+        )} as const;\n`
+      : "");
+  const toolConfigsExpr = hasToolConfigs ? "TOOL_CONFIGS" : "{}";
+  const permissionRulesExpr = hasPermissionRules ? "PERMISSION_RULES" : "[]";
   // A spec that DECLARES `split: test` is the explicit release-gate opt-in,
   // so the emitted bundle passes the registry's allowTestSplit escape hatch
   // (without it the guarded get() throws at runtime with no way out). Other
@@ -123,14 +185,14 @@ import { createFileBackedRegistry, overallDatasetHash } from "@crewhaus/dataset-
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { recordEvalRun } from "@crewhaus/eval-report";
 import { runEval } from "@crewhaus/eval-runner";
-${bridgeImports}
+${bridgeImports}${toolPackageImports}
 const SPEC_NAME = ${escapeJsonString(ir.name)};
 const MODEL = ${escapeJsonString(ir.agent.model)};
 const INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
 const DATASET = ${JSON.stringify(ir.dataset)} as const;
 const GRADER_CONFIGS = ${JSON.stringify(ir.graders)};
 const AGENT_TOOLS = ${JSON.stringify(ir.agent.tools)};
-const CONCURRENCY = ${ir.concurrency};
+${toolPackagesConst}${policyConsts}const CONCURRENCY = ${ir.concurrency};
 ${taxonomyConst}${bridgeConsts}${toolsLine}
 async function main(): Promise<void> {
   const registry = createFileBackedRegistry({
@@ -159,9 +221,9 @@ async function main(): Promise<void> {
     target: "cli" as const,
     agent: { model: MODEL, instructions: INSTRUCTIONS },
     tools: AGENT_TOOLS,
-    toolConfigs: {},
+    toolConfigs: ${toolConfigsExpr},
     mcp_servers: {},
-    permissions: { rules: [] },
+    permissions: { rules: ${permissionRulesExpr} },
     subAgents: [],
     compaction: {},${taxonomyIrLine}
   };
@@ -178,7 +240,7 @@ async function main(): Promise<void> {
       // so a bundle run pinned as a baseline still has the dataset identity
       // \`eval --sentinel\` compares against.
       datasetHash,
-${cliVersionLine}${invokerLine}${seedLine}    },
+${cliVersionLine}${invokerLine}${importToolPackageLine}${seedLine}    },
   });
   // Run history — the same \`.crewhaus/evals/index.jsonl\` \`crewhaus eval\`
   // appends to, so \`crewhaus eval-report history\`, \`baseline set\` and the
@@ -229,9 +291,9 @@ main().catch((err) => {
     const bridged = bridge !== undefined && bridge.entryImport !== undefined;
     files.push({
       path: "README.md",
-      content: renderBundleReadme(
-        ir,
-        bridged
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.agent.tools }]),
+        ...(bridged
           ? {
               usage: {
                 heading: "Run",
@@ -246,8 +308,8 @@ main().catch((err) => {
                 ].join("\n"),
               },
             }
-          : {},
-      ),
+          : {}),
+      }),
     });
   }
   return { files };

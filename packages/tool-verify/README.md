@@ -35,6 +35,24 @@ not a hash.
 Absolute paths are replaced first, because a temporary directory carries
 digits a later rule would mask, leaving the path unrecognisable.
 
+## A caller's pattern never runs on the harness thread
+
+A `replace` rule's pattern and an `AcceptanceCheck` `fileMatches` pattern
+are screened for the shapes that backtrack exponentially (`(a+)+`, `(a|a)*`)
+and refused with the reason, then run in a worker that is stopped at a
+deadline (5 s). A pattern that is slow in a way no screen can see (`a*a*a*b`
+over a long file) is stopped too. A check that could not be answered fails
+closed with `undetermined: true` and "could not verify", never "does not
+match"; a replace rule that could not be applied makes GoldenCompare say it
+could not compare, and GoldenUpdate write nothing. A `fileMatches` pattern
+runs over at most 16 Mi characters of a file. The `with` of a replace rule
+is literal text, as it always was.
+
+The Markdown readers behind `MarkdownLinkCheck`, `CitationLint` and
+`FactCrossCheck` are linear in the document, whatever it holds. Headings are
+read as CommonMark reads them, through the same reader as `MarkdownOutline`:
+the `#` run must be followed by a space or tab on the same line.
+
 ## Failure modes are kept apart
 
 A tool that collapses distinct problems into one boolean makes the caller
@@ -43,7 +61,26 @@ re-derive them:
 - `ChecksumVerify` reports **missing**, **changed** and **unexpected** files
   separately. An unexpected extra file is how something ships that nobody
   meant to ship, and it is invisible in a simple "does everything listed
-  still match".
+  still match". So it walks EVERY entry of the directory: dotfiles, `.git`,
+  `node_modules`, `dist` and the rest included, unless you name them in
+  `exclude` (they come back as `excluded`). Walking the workspace root
+  (no `directory`, or `"."`) with no `exclude`, it leaves out the root's
+  `.git` and `node_modules` — nearly every entry of a project, and not what
+  "has this changed" means — and says so in `excluded`; `exclude: []` walks
+  all of it. A symlink is listed under `symlinks` and is never followed out
+  of the workspace: one that leads to a file inside is hashed through to it,
+  as `sha256sum` does. Any other link (to a directory, out of the workspace,
+  or to nothing), and a FIFO, socket or device, is never opened: the
+  manifest records it by kind and link text on a `#` line, which
+  `sha256sum -c` skips as a comment (macOS's BSD `sha256sum` warns about it
+  and still passes, unless `--strict`), so an unchanged tree verifies
+  against its own manifest and a retargeted link or a pipe swapped for a
+  file is a change. A manifest that sits inside the directory it describes
+  is left out of it. Anything unreadable, and a walk that stopped at its cap
+  (`truncated`), make the answer not `ok`, and `write: true` refuses to emit
+  a partial manifest; a walk that stops at its cap is refused before anything
+  is hashed. `files` must name at least one entry. `GoldenCompare` walks a
+  tree the same way, and compares links by where they point.
 - `AcceptanceCheck` reports every check's own verdict, so one failure does
   not hide the others and a pass is a list of things that were actually
   checked rather than an opinion.
@@ -185,4 +222,8 @@ another). And the only word-ending rule is a plural `s`, never stemming —
 baseline, so it is destructive and justification-gated, and it writes through
 a temporary file and a rename — an interrupted run leaves the old golden
 intact rather than a truncated one, which passes nothing and is easy to
-mistake for a real diff.
+mistake for a real diff. The temporary file gets a random name and is created
+exclusively, so a link waiting at a temporary name is never written through.
+A golden that is itself a link inside the workspace is written through and
+stays a link; a link out of the workspace, a FIFO or a directory at the
+golden's name is refused, and so is a golden whose directory does not exist.

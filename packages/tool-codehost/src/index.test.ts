@@ -15,6 +15,7 @@
  * is proved with the flag in its production position.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { classifyText } from "@crewhaus/prompt-injection-detector";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -96,6 +97,8 @@ let seen: Array<{
   auth: string | null;
   body: string;
   host: string | null;
+  /** The search query the request carried, when it carried one. */
+  q?: string | null;
 }> = [];
 /** Whether the second origin ever received a credential header. */
 let otherSawCredential = false;
@@ -158,7 +161,14 @@ async function mainHandler(req: Request): Promise<Response> {
   const p = url.pathname;
   const auth = req.headers.get("authorization") ?? req.headers.get("private-token");
   const body = req.method === "GET" ? "" : await req.text();
-  seen.push({ method: req.method, path: p, auth, body, host: req.headers.get("host") });
+  seen.push({
+    method: req.method,
+    path: p,
+    auth,
+    body,
+    host: req.headers.get("host"),
+    q: url.searchParams.get("q"),
+  });
 
   // --- GitLab dialect -----------------------------------------------------
   if (p.startsWith("/api/v4/")) return gitlabHandler(req, p, body);
@@ -400,6 +410,9 @@ async function mainHandler(req: Request): Promise<Response> {
   }
   if (p === "/repos/acme/widget/actions/runs/43/jobs") {
     return jsonRes({ jobs: [{ id: 504, name: "test", conclusion: "failure", steps: [] }] });
+  }
+  if (p === "/repos/acme/widget/actions/runs/45/jobs") {
+    return jsonRes({ jobs: [{ name: "test", conclusion: "failure", steps: [] }] });
   }
   if (p === "/repos/acme/widget/actions/runs/44/jobs") {
     return jsonRes({ jobs: [{ id: 505, name: "test", conclusion: "failure", steps: [] }] });
@@ -722,7 +735,7 @@ describe("the token never leaves in a result", () => {
       [releaseGet, gh({})],
       [releaseList, gh({})],
       [repoGet, gh({ repo: "leaky" })],
-      [searchCode, { query: "repo:acme/widget x" }],
+      [searchCode, gh({ query: "repo:acme/widget x" })],
       [searchIssues, { query: "is:open" }],
       [workflowRunRerun, gh({ runId: 42 })],
       [workflowRunLogs, gh({ runId: 42 })],
@@ -1059,6 +1072,19 @@ describe("checks and CI", () => {
     expect(result.excerpt.firstError.text).toContain("expected 3 to be 4");
   });
 
+  test("WorkflowRunLogs' answer for a run with no readable job is not read as an order", async () => {
+    // A result that starts with "run …" is what the prompt-injection
+    // detector's trailing-imperative rule flags, so 0.7.0's wording was
+    // classified suspicious and spent the session's one console warning.
+    const result = String(await workflowRunLogs.execute(gh({ runId: 45 })));
+    expect(result).toStartWith("workflow run 45 reported");
+    expect((await classifyText(result)).classification).toBe("clean");
+    // The detector is live: the 0.7.0 wording is still flagged.
+    expect((await classifyText(result.replace(/^workflow /, ""))).classification).toBe(
+      "suspicious",
+    );
+  });
+
   test("WorkflowRunLogs honours an explicit jobId", async () => {
     const result = await run(workflowRunLogs, gh({ runId: 42, jobId: 503 }));
     expect(seen).toHaveLength(1);
@@ -1103,6 +1129,44 @@ describe("releases, repository, comparison, search, quota", () => {
     ]);
     const sorted = await run(searchCode, { query: "x", order: "path" });
     expect(sorted.matches.map((m: { path: string }) => m.path)).toEqual(["src/a.ts", "src/b.ts"]);
+  });
+
+  test("a scope the query names must be the scope owner and repo name (C004)", async () => {
+    // The dodge: a permission rule reads owner/repo, so a scope written only
+    // in the query was invisible to `alwaysDeny SearchCode(acme/secret)`.
+    for (const tool of [searchCode, searchIssues]) {
+      const dodge = String(await tool.execute({ query: "password repo:acme/secret" }));
+      expect(dodge).toContain('the query searches "repo:acme/secret"');
+      expect(dodge).toContain('owner "acme" and repo "secret"');
+      const elsewhere = String(await tool.execute(gh({ query: "password repo:other/secret" })));
+      expect(elsewhere).toContain("do not cover");
+      const orgWide = String(await tool.execute(gh({ query: "password org:acme" })));
+      expect(orgWide).toContain('owner "acme" and no repo');
+    }
+    // Nothing was searched for any of them.
+    expect(seen.filter((r) => r.path.startsWith("/search/"))).toEqual([]);
+  });
+
+  test("owner and repo scope the search they name (C004)", async () => {
+    await run(searchCode, gh({ query: "password" }));
+    await run(searchIssues, gh({ query: "is:open" }));
+    // Written into the query, so what is searched is what a rule saw.
+    await run(searchIssues, { owner: "acme", query: "is:open org:acme" });
+    // An exclusion only narrows, and a scope the fields cover is kept as written.
+    await run(searchCode, gh({ query: "x repo:acme/widget -repo:acme/old" }));
+    expect(seen.map((r) => r.q)).toEqual([
+      "password repo:acme/widget",
+      "is:open repo:acme/widget",
+      "is:open org:acme",
+      "x repo:acme/widget -repo:acme/old",
+    ]);
+    // An owner alone must say which kind of account it is.
+    const bare = String(await searchIssues.execute({ owner: "acme", query: "is:open" }));
+    expect(bare).toContain("add org:acme or user:acme");
+    // And a name is checked before it is written into a query.
+    const injected = String(await searchCode.execute(gh({ repo: "widget org:evil", query: "x" })));
+    expect(injected).toContain("is not a GitHub name");
+    expect(seen).toHaveLength(4);
   });
 
   test("SearchIssues marks which results are pull requests", async () => {
@@ -1293,6 +1357,19 @@ describe("the GitLab dialect", () => {
     expect(result).toContain("project-scoped");
     const scoped = await run(searchCode, gl({ query: "x" }));
     expect(scoped.matches[0]).toMatchObject({ path: "src/a.ts", startLine: 12 });
+  });
+
+  test("SearchIssues refuses an owner without a repo rather than searching the instance (C004)", async () => {
+    const result = String(
+      await searchIssues.execute({
+        host: "gitlab",
+        baseUrl: `${origin}/api/v4`,
+        owner: "acme",
+        query: "bug",
+      }),
+    );
+    expect(result).toContain("pass owner and repo together, or neither");
+    expect(seen.filter((r) => r.path.includes("search"))).toEqual([]);
   });
 
   test("CompareRefs derives the line counts GitLab does not state", async () => {

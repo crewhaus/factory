@@ -232,6 +232,37 @@ describe("toolCallSequence (T1)", () => {
     expect(r.passed).toBe(false);
     expect(r.rationale).toContain("missing");
   });
+
+  test("an MCP tool written with its pre-0.7.1 name still matches, in every mode", async () => {
+    // graders.yaml pinned on 0.7.0 says `srv__echo`; the call is recorded as
+    // `mcp__srv__echo` now. A baseline gated with --gate must keep passing.
+    const mcpRun: RunResult = {
+      ...baseRun,
+      toolCalls: [
+        { toolName: "bash", toolUseId: "t1", isError: false },
+        { toolName: "mcp__srv__echo", toolUseId: "t2", isError: false },
+      ],
+    };
+    for (const mode of ["exact", "subseq", "set"] as const) {
+      for (const spelling of ["srv__echo", "mcp__srv__echo"]) {
+        const r = await toolCallSequence({ expected: ["bash", spelling], mode })(sample, mcpRun);
+        expect({ mode, spelling, passed: r.passed }).toEqual({ mode, spelling, passed: true });
+      }
+      // The alias runs one way: an mcp__ spelling never names a non-MCP call,
+      // and a different server is still a different tool.
+      const plain: RunResult = {
+        ...baseRun,
+        toolCalls: [{ toolName: "srv__echo", toolUseId: "t1", isError: false }],
+      };
+      expect(
+        (await toolCallSequence({ expected: ["mcp__srv__echo"], mode })(sample, plain)).passed,
+      ).toBe(false);
+      expect(
+        (await toolCallSequence({ expected: ["bash", "other__echo"], mode })(sample, mcpRun))
+          .passed,
+      ).toBe(false);
+    }
+  });
 });
 
 describe("composers (T9 — table-driven property checks)", () => {

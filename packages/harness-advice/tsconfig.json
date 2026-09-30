@@ -30,6 +30,9 @@
       "path": "../tool-catalog"
     },
     {
+      "path": "../tool-executor"
+    },
+    {
       "path": "../tool-permission-matcher"
     }
   ],

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY_VERSION, TOOL_REGISTRY, projectRegistryEntry } from "./index";
+import { REGISTRY_VERSION, TOOL_REGISTRY, projectRegistryEntry, projectToolFlags } from "./index";
 
 /**
  * What this file can check, and what it cannot.
@@ -163,5 +163,72 @@ describe("projectRegistryEntry round-trips every row", () => {
       keywords: [],
     });
     expect("ioCapability" in projected).toBe(false);
+  });
+});
+
+describe("the flags table is the manifest without its prose", () => {
+  test("one row per manifest row, each the projection of its row", async () => {
+    const { TOOL_FLAGS, TOOL_FLAGS_BY_NAME } = await import("./flags");
+    const keys = Object.keys(TOOL_FLAGS);
+    // The hit count first: an emptied flags.ts must not pass by agreeing with nothing.
+    expect(keys.length).toBe(entries.length);
+    const drifted = entries
+      .filter(
+        ([key, entry]) =>
+          JSON.stringify(TOOL_FLAGS[key]) !== JSON.stringify(projectToolFlags(entry)),
+      )
+      .map(([key]) => key);
+    expect(drifted).toEqual([]);
+    expect(TOOL_FLAGS_BY_NAME.size).toBe(entries.length);
+    expect(TOOL_FLAGS_BY_NAME.get("HttpRequest")?.key).toBe("httpRequest");
+  });
+
+  test("operativeArgs are carried, including an empty declaration", () => {
+    expect(TOOL_REGISTRY["write"]?.operativeArgs).toEqual([{ field: "path", kind: "path" }]);
+    expect(TOOL_REGISTRY["clipboardWrite"]?.operativeArgs).toEqual([]);
+    expect(TOOL_REGISTRY["issueCreate"]?.operativeArgs).toEqual([
+      { field: "repo", kind: "recipient", within: "owner" },
+    ]);
+    // A relocating store directory, so an offline reader matches it the way
+    // the runtime does: its default is read by a deny or ask only (C004).
+    expect(TOOL_REGISTRY["kvDelete"]?.operativeArgs?.[0]).toEqual({
+      field: "stateDir",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    });
+  });
+});
+
+/**
+ * OpenAI and Azure OpenAI refuse a request whose tool list carries a
+ * `function.description` longer than 1024 characters. The refusal is for the
+ * whole request, not the one tool: a spec that grants a single over-long
+ * builtin, or any `all-<category>` roll-up that reaches it, gets a 400 on
+ * every turn (C014). Seventeen builtins shipped over the limit in 0.7.0 and
+ * five more crossed it while other fixes lengthened their text, so the limit
+ * is held here, over the data every bundle carries.
+ *
+ * Measured in UTF-16 code units (`.length`), which is never fewer than the
+ * code points a provider might count instead — the stricter reading. Detail
+ * that does not fit belongs in the package README.
+ */
+const PROVIDER_DESCRIPTION_LIMIT = 1024;
+
+describe("every description fits every provider", () => {
+  test("no description is longer than OpenAI's 1024-character limit", () => {
+    const over = entries
+      .filter(([, entry]) => entry.description.length > PROVIDER_DESCRIPTION_LIMIT)
+      .map(([key, entry]) => `${key}: ${entry.description.length}`);
+    // The sweep's hit count: an emptied manifest must not pass by agreeing with nothing.
+    expect(entries.length).toBeGreaterThanOrEqual(500);
+    expect(over).toEqual([]);
+  });
+
+  test("the measure counts what a provider counts", () => {
+    // An astral character is two UTF-16 units and one code point: the check
+    // above can only over-count, never let a long description through.
+    expect("\u{1F600}".length).toBe(2);
+    expect([..."\u{1F600}"].length).toBe(1);
   });
 });

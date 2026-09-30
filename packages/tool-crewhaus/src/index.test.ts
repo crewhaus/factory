@@ -8,6 +8,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -319,6 +320,16 @@ describe("SpecDiff", () => {
     expect(result.changes.map((c) => c.kind)).toEqual(["tool-added"]);
   });
 
+  test("swapping an existing MCP server's command widens (0.7.1)", async () => {
+    const withServer = `${CLI_SPEC}\nmcp_servers:\n  thredz:\n    transport: stdio\n    command: bunx\n    args: ["thredz-mcp@0.3.0"]`;
+    const result = await callJson<{ widens: boolean; changes: Array<{ kind: string }> }>(specDiff, {
+      before: { spec: withServer },
+      after: { spec: withServer.replace("command: bunx", "command: npx") },
+    });
+    expect(result.widens).toBe(true);
+    expect(result.changes.map((c) => c.kind)).toEqual(["mcp-server"]);
+  });
+
   test("an unchanged pair reports no changes", async () => {
     const result = await callJson<{ changed: boolean }>(specDiff, {
       before: { spec: CLI_SPEC },
@@ -398,6 +409,120 @@ describe("ToolInventory", () => {
     expect(result.note).toBeUndefined();
   });
 
+  // C001 (wave III): the check read the cli set whatever the spec's shape, so
+  // a graph node's `evmCall`, which compiles there, came back unknown.
+  test("builtins are checked for the spec's own shape", async () => {
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, jsonQuery]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+      shape: string;
+    }>(toolInventory, { spec: graph });
+    expect([onGraph.shape, onGraph.unknown, onGraph.notOnShape]).toEqual(["graph", [], []]);
+    const cli = CLI_SPEC.replace("tools: [read, write, bash]", "tools: [read, evmCall]");
+    const onCli = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+    }>(toolInventory, { spec: cli });
+    expect(onCli.unknown).toEqual([]);
+    expect(onCli.notOnShape.map((n) => n.tool)).toEqual(["evmCall"]);
+    expect(onCli.notOnShape[0]?.reason).toContain(
+      "only the graph, workflow and crew shapes carry it",
+    );
+  });
+
+  test("a sub-agent's registered names and the runtime's own tools are real", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: go",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, CodeGraphSearch, Skill, NoSuchThing]",
+      "tools: [read, codegraphSearch]",
+    ].join("\n");
+    const result = await callJson<{ unknown: string[] }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["NoSuchThing"]);
+  });
+
+  // wave III review: cf09645e accepted any registered name, runtime name or
+  // thredz name anywhere, so a site list compile rejects (`tools: [Read,
+  // Skill, goal_list]`) came back with nothing unknown.
+  test("a site list takes spec keys, as compile reads it; a narrowing list also takes the rest", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "thredz: true",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [Read, Skill] }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong], tools: [Read, goal_list] }",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, Skill, goal_list, EvmGetLogs]",
+      "tools: [Read, goal_list, Skill, evmCall, WebFetch, read]",
+    ].join("\n");
+    const result = await callJson<{
+      unknown: string[];
+      unknownAt: Array<{ tool: string; site: string; reason?: string }>;
+      notOnShape: Array<{ tool: string; site: string }>;
+    }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["Read", "Skill", "WebFetch", "goal_list"]);
+    expect(result.unknownAt.map((u) => `${u.site}: ${u.tool}`)).toEqual([
+      "<root>: Read",
+      "<root>: goal_list",
+      "<root>: Skill",
+      "<root>: WebFetch",
+    ]);
+    // With compile's own words.
+    expect(result.unknownAt[0]?.reason).toContain('write "read"');
+    expect(result.notOnShape.map((n) => `${n.site}: ${n.tool}`)).toEqual([
+      "<root>: evmCall",
+      "agent.sub_agents.helper: EvmGetLogs",
+    ]);
+    // A graph node's list is a site list too.
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, EvmGetLogs, sendMessage]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{ unknown: string[]; notOnShape: Array<{ tool: string }> }>(
+      toolInventory,
+      { spec: graph },
+    );
+    expect([onGraph.unknown, onGraph.notOnShape.map((n) => n.tool)]).toEqual([
+      ["EvmGetLogs"],
+      ["sendMessage"],
+    ]);
+  });
+
   test("a spec of real tools reports nothing unknown", async () => {
     const result = await callJson<{ unknown: string[] }>(toolInventory, { spec: CLI_SPEC });
     expect(result.unknown).toEqual([]);
@@ -420,6 +545,62 @@ describe("ToolInventory", () => {
 });
 
 describe("PermissionAudit", () => {
+  // C032 / C146 residue: the builtins whose registered name is not the
+  // key with its first letter upper-cased, and `all-<category>` selectors.
+  test("rules name JavaScript and CodeGraph* as the engine does", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [javascript, codegraphCallers, codegraphSearch]",
+      "permissions:",
+      "  mode: default",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: JavaScript }",
+      "    - { type: alwaysAllow, pattern: CodeGraphCallers }",
+      "    - { type: alwaysAllow, pattern: CodeGraphSearch }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string; rule?: { pattern: string } }>;
+      unusedRules: unknown[];
+      ruleProblems: unknown[];
+    }>(permissionAudit, { spec });
+    expect(result.unusedRules).toEqual([]);
+    expect(result.ruleProblems).toEqual([]);
+    expect(result.tools.map((t) => [t.tool, t.decision, t.rule?.pattern ?? null])).toEqual([
+      ["codegraphCallers", "allow", "CodeGraphCallers"],
+      ["codegraphSearch", "allow", "CodeGraphSearch"],
+      ["javascript", "deny", "JavaScript"],
+    ]);
+  });
+
+  test("an all-<category> selector is audited as the tools it expands to", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [all-http]",
+      "permissions:",
+      "  mode: auto",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: HttpRequest }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string }>;
+      unusedRules: unknown[];
+      categoryError?: string;
+    }>(permissionAudit, { spec });
+    expect(result.categoryError).toBeUndefined();
+    expect(result.tools.some((t) => t.tool === "all-http")).toBe(false);
+    expect(result.tools.length).toBeGreaterThan(1);
+    expect(result.tools.find((t) => t.tool === "httpRequest")?.decision).toBe("deny");
+    expect(result.unusedRules).toEqual([]);
+  });
+
   test("an outward tool with no rule is a finding", async () => {
     const spec = CLI_SPEC.replace("[read, write, bash]", "[read, webFetch]");
     const result = await callJson<{ findings: Array<{ tool: string }>; fallback: string }>(
@@ -452,6 +633,281 @@ describe("PermissionAudit", () => {
       { spec },
     );
     expect(result.tools[0]?.destructive).toBe(true);
+  });
+
+  // back-compat (wave III): the trader starter's `alwaysAllow goal_list`
+  // is live with a `thredz:` block (the runtime registers goal_list under
+  // that name), and was reported as a near miss of GoalList.
+  test("a thredz: block's tool names are known; without the block they are near misses", async () => {
+    const spec = (thredz: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        ...(thredz === "" ? [] : [thredz]),
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [read]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        "    - { type: alwaysAllow, pattern: goal_list }",
+        "    - { type: alwaysAllow, pattern: goal_write }",
+        "    - { type: alwaysAllow, pattern: agent_list }",
+      ].join("\n");
+    const problems = async (thredz: string) =>
+      (
+        await callJson<{ ruleProblems: Array<{ pattern: string; code: string }> }>(
+          permissionAudit,
+          { spec: spec(thredz) },
+        )
+      ).ruleProblems.map((p) => [p.pattern, p.code]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, goals: true }")).toEqual([
+      ["agent_list", "tool-not-known"],
+    ]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, messaging: true }")).toEqual([]);
+    expect(await problems("")).toEqual([
+      ["goal_list", "unknown-tool"],
+      ["goal_write", "unknown-tool"],
+      ["agent_list", "tool-not-known"],
+    ]);
+  });
+
+  // wave III review (C146): lint and compile --strict read the model
+  // profiles' and sub-agents' lists; PermissionAudit read only
+  // `permissions.rules`, so it reported none of the dead rules below and
+  // presented those deny lists as if they worked.
+  test("every rule list the spec carries is checked, and each problem names its list", async () => {
+    const cli = [
+      "name: demo",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, permissions: { deny: ['removePath(src/**)', 'REMOVEPATH', 'fetch'] } }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong], permissions: { ask: ['webfetch'] } }",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: help",
+      "      tools: [RemovePath, Fetch]",
+      "      permissions:",
+      "        allow: ['Fetch']",
+      "        deny: ['removePath(src/**)', 'fetch(https://evil.example/**)']",
+      "tools: [removePath, fetch, webFetch]",
+      "permissions:",
+      "  mode: auto",
+    ].join("\n");
+    const crew = [
+      "name: hello-crew",
+      "target: crew",
+      "model: claude-sonnet-5",
+      "entry: researcher",
+      "permissions:",
+      "  mode: auto",
+      "roles:",
+      "  researcher:",
+      "    instructions: research",
+      "    tools: [read, fetch]",
+      "    sub_agents:",
+      "      digger:",
+      "        description: digs",
+      "        instructions: dig",
+      "        tools: [Read, Fetch]",
+      "        permissions:",
+      "          allow: ['Read']",
+      "          deny: ['fetch(https://evil.example/**)', 'removePath']",
+      "  writer:",
+      "    instructions: write",
+    ].join("\n");
+    const problems = async (spec: string) =>
+      (
+        await callJson<{ ruleProblems: Array<{ list: string; pattern: string; code: string }> }>(
+          permissionAudit,
+          { spec },
+        )
+      ).ruleProblems.map((p) => `${p.list}: ${p.code} ${p.pattern}`);
+    expect(await problems(cli)).toEqual([
+      "models.fast.permissions.deny: tool-key-not-name removePath(src/**)",
+      "models.fast.permissions.deny: unknown-tool REMOVEPATH",
+      "models.fast.permissions.deny: tool-key-not-name fetch",
+      "agent.model_pool.candidates[1].permissions.ask: unknown-tool webfetch",
+      "agent.sub_agents.helper.permissions.deny: tool-key-not-name removePath(src/**)",
+      "agent.sub_agents.helper.permissions.deny: tool-key-not-name fetch(https://evil.example/**)",
+    ]);
+    expect(await problems(crew)).toEqual([
+      "roles.researcher.sub_agents.digger.permissions.deny: tool-key-not-name fetch(https://evil.example/**)",
+      "roles.researcher.sub_agents.digger.permissions.deny: tool-key-not-name removePath",
+    ]);
+    // The shape's own rules carry their list too.
+    expect(
+      await problems(
+        cli.replace(
+          "  mode: auto",
+          "  mode: auto\n  rules:\n    - { type: alwaysDeny, pattern: fetch }",
+        ),
+      ),
+    ).toContain("permissions.rules: tool-key-not-name fetch");
+  });
+
+  // wave III review: with a `thredz:` block the runtime registers goal_list,
+  // message_send, … under those names, so the trader starter's allows are
+  // live — and were listed under unusedRules, "the rules that match
+  // nothing". So were its `broker__*` rules, which fire on the declared
+  // broker server's tools.
+  test("rules on a thredz: block's tools, or a declared MCP server's, are not reported as matching nothing", async () => {
+    const spec = (thredz: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        ...(thredz === "" ? [] : [thredz]),
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [read]",
+        "mcp_servers:",
+        "  broker: { transport: stdio, command: bunx }",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        "    - { type: alwaysAllow, pattern: goal_list }",
+        "    - { type: alwaysAllow, pattern: message_send }",
+        "    - { type: alwaysAllow, pattern: broker__paper_buy }",
+        "    - { type: alwaysAllow, pattern: mcp__broker__quote }",
+        "    - { type: alwaysAllow, pattern: other__thing }",
+      ].join("\n");
+    type Audit = {
+      tools: Array<{ tool: string; decision: string; rule?: { pattern: string } }>;
+      unusedRules: Array<{ pattern: string }>;
+      mcpServerRules: Array<{ pattern: string; servers: string[] }>;
+    };
+    const audit = async (thredz: string) =>
+      callJson<Audit>(permissionAudit, { spec: spec(thredz) });
+    const withMessaging = await audit("thredz: { api_key: $THREDZ_API_KEY, messaging: true }");
+    expect(withMessaging.unusedRules.map((r) => r.pattern)).toEqual(["other__thing"]);
+    expect(withMessaging.mcpServerRules).toEqual([
+      { type: "alwaysAllow", pattern: "broker__paper_buy", servers: ["broker"] },
+      { type: "alwaysAllow", pattern: "mcp__broker__quote", servers: ["broker"] },
+    ] as never);
+    // The thredz tools are granted, under their own names, and ruled.
+    const row = (a: Audit, tool: string) => a.tools.find((t) => t.tool === tool);
+    expect(row(withMessaging, "goal_list")).toMatchObject({
+      decision: "allow",
+      rule: { pattern: "goal_list" },
+    });
+    expect(row(withMessaging, "message_send")?.decision).toBe("allow");
+    // Without messaging, message_send is not registered; without a block,
+    // neither is goal_list.
+    const memoryOnly = await audit("thredz: { api_key: $THREDZ_API_KEY }");
+    expect(memoryOnly.unusedRules.map((r) => r.pattern)).toEqual(["message_send", "other__thing"]);
+    const none = await audit("");
+    expect(row(none, "goal_list")).toBeUndefined();
+    expect(none.unusedRules.map((r) => r.pattern)).toEqual([
+      "goal_list",
+      "message_send",
+      "other__thing",
+    ]);
+  });
+
+  // A rule that speaks to only some calls of a tool leaves the rules after
+  // it reachable: the trader's `Edit(eval/**)` after `Edit(curriculum.md)`
+  // was listed as matching nothing.
+  test("a rule after an argument-scoped one for the same tool is reachable; one after a bare rule is not", async () => {
+    const spec = (first: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [edit]",
+        "permissions:",
+        "  rules:",
+        `    - { type: alwaysAllow, pattern: "${first}" }`,
+        '    - { type: alwaysAllow, pattern: "Edit(eval/**)" }',
+      ].join("\n");
+    const unused = async (first: string) =>
+      (
+        await callJson<{ unusedRules: Array<{ pattern: string }> }>(permissionAudit, {
+          spec: spec(first),
+        })
+      ).unusedRules.map((r) => r.pattern);
+    expect(await unused("Edit(curriculum.md)")).toEqual([]);
+    expect(await unused("Edit")).toEqual(["Edit(eval/**)"]);
+  });
+
+  // wave III fix-up: with `learning.exam` the cli runtime registers
+  // `run_exam` (the trader starter's bundle wires createExamRunner), yet its
+  // `alwaysAllow run_exam` was listed under unusedRules, "the rules that
+  // match nothing" — as was `alwaysAllow Skill`, which the same audit had
+  // just said names a real tool. Whether the runtime adds such a tool
+  // depends on wiring the audit does not model, so it says that instead.
+  test("a rule naming a tool the runtime may add is reported as such, not as matching nothing", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "learning:",
+      "  domain: trading",
+      "  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }",
+      "tools: [read]",
+      "permissions:",
+      "  rules:",
+      "    - { type: alwaysAllow, pattern: run_exam }",
+      "    - { type: alwaysAllow, pattern: Skill }",
+      "    - { type: alwaysAsk, pattern: 'Evm*' }",
+      "    - { type: alwaysAllow, pattern: Nonexistent }",
+      "    - { type: alwaysAllow, pattern: skill }",
+    ].join("\n");
+    const result = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ type: string; pattern: string; tools: string[] }>;
+      tools: Array<{ tool: string }>;
+    }>(permissionAudit, { spec });
+    expect(result.runtimeToolRules.map((r) => [r.pattern, r.tools.length])).toEqual([
+      ["Evm*", 8],
+      ["Skill", 1],
+      ["run_exam", 1],
+    ]);
+    expect(result.runtimeToolRules.find((r) => r.pattern === "run_exam")?.tools).toEqual([
+      "run_exam",
+    ]);
+    // A name no tool has is still unused, and so is a near miss the rule
+    // checker calls dead (`skill` is not `Skill`: the engine matches case).
+    expect(result.unusedRules.map((r) => r.pattern)).toEqual(["Nonexistent", "skill"]);
+    // Nothing is granted on the audit's say-so: no row for a tool it cannot
+    // confirm the runtime adds.
+    expect(result.tools.map((t) => t.tool)).toEqual(["read"]);
+    // Plan mode ignores every allow, so those match nothing whatever the
+    // runtime adds — nor does an allow on a declared server's tools; an ask
+    // still names the tools it would gate.
+    const plan = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ pattern: string }>;
+      mcpServerRules: Array<{ pattern: string }>;
+    }>(permissionAudit, {
+      spec: spec
+        .replace(
+          "permissions:",
+          "mcp_servers:\n  broker: { transport: stdio, command: bunx }\npermissions:\n  mode: plan",
+        )
+        .concat("\n    - { type: alwaysAllow, pattern: broker__quote }"),
+    });
+    expect(plan.runtimeToolRules.map((r) => r.pattern)).toEqual(["Evm*"]);
+    expect(plan.mcpServerRules).toEqual([]);
+    expect(plan.unusedRules.map((r) => r.pattern)).toEqual([
+      "Nonexistent",
+      "Skill",
+      "broker__quote",
+      "run_exam",
+      "skill",
+    ]);
   });
 
   test("a rule that names nothing granted is reported as unused", async () => {
@@ -605,6 +1061,47 @@ describe("HarnessInventory", () => {
   });
 });
 
+describe("a bundle that cannot be examined (flag-truth-3#10)", () => {
+  const canRevoke = process.platform !== "win32" && process.getuid?.() !== 0;
+
+  test.skipIf(!canRevoke)(
+    "is unreadable with the reason in BundleFreshness and HarnessInventory, never missing",
+    async () => {
+      write("h/crewhaus.yaml", CLI_SPEC);
+      write("h/dist/index.js", "// compiled");
+      const dist = path.join(tmp, "h", "dist");
+      chmodSync(dist, 0o000);
+      try {
+        const fresh = await callJson<{
+          counts: { missingBundle: number; unreadable: number };
+          bundles: Array<{ dir: string; state: string; detail?: string; remediation?: string }>;
+        }>(bundleFreshness, { dirs: ["h"] });
+        // On 0.7.0: state "missing-bundle" with "crewhaus compile" as the fix.
+        expect(fresh.bundles[0]?.state).toBe("unreadable");
+        expect(fresh.bundles[0]?.detail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(fresh.bundles[0]?.remediation).toBeUndefined();
+        expect(fresh.counts).toMatchObject({ missingBundle: 0, unreadable: 1 });
+        // The caller must act on it, so staleOnly keeps it.
+        const needsWork = await callJson<{ bundles: Array<{ dir: string }> }>(bundleFreshness, {
+          dirs: ["h"],
+          staleOnly: true,
+        });
+        expect(needsWork.bundles.map((b) => b.dir)).toEqual(["h"]);
+
+        const inventory = await callJson<{
+          counts: { missingBundles: number; unreadableBundles: number };
+          harnesses: Array<{ bundle: string; bundleDetail?: string }>;
+        }>(harnessInventory, {});
+        expect(inventory.harnesses[0]?.bundle).toBe("unreadable");
+        expect(inventory.harnesses[0]?.bundleDetail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(inventory.counts).toMatchObject({ missingBundles: 0, unreadableBundles: 1 });
+      } finally {
+        chmodSync(dist, 0o755);
+      }
+    },
+  );
+});
+
 describe("BundleFreshness", () => {
   function seed(dir: string, specMtime: number, bundleMtime?: number): void {
     const spec = write(`${dir}/crewhaus.yaml`, CLI_SPEC);
@@ -696,6 +1193,88 @@ describe("AuditVerify", () => {
   test("a missing audit directory is a readable refusal", async () => {
     expect(await call(auditVerify, {})).toContain("does not exist");
   });
+
+  // 0.7.1 (security-5#2, flag-truth-3#6): only the directory was contained,
+  // and every *.jsonl in it was stat'ed and read through links.
+  test("a chain file linked out of the workspace is the break, and is never read", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const token = ["gh", "p_", "AUDITLEAK".repeat(4)].join("");
+    writeFileSync(path.join(secretDir, "secret.txt"), `${token} rest\n`);
+    symlinkSync(
+      path.join(secretDir, "secret.txt"),
+      path.join(tmp, ".crewhaus", "audit", "0001.jsonl"),
+    );
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain(token);
+    expect(raw).not.toContain(secretDir);
+    const result = JSON.parse(raw) as { ok: boolean; break: { file: string; reason: string } };
+    expect(result.ok).toBe(false);
+    expect(result.break.file).toBe("0001.jsonl");
+    expect(result.break.reason).toMatch(/not a regular file/);
+  });
+
+  test("a _chain-tail.json linked out is the break, and its hash is not quoted", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const anchor = path.join(tmp, ".crewhaus", "audit", "_chain-tail.json");
+    rmSync(anchor);
+    writeFileSync(
+      path.join(secretDir, "tail.json"),
+      JSON.stringify({ day: "d", hash: "LEAKED_HASH_SENTINEL", seq: 0 }),
+    );
+    symlinkSync(path.join(secretDir, "tail.json"), anchor);
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain("LEAKED_HASH_SENTINEL");
+    expect(JSON.parse(raw).ok).toBe(false);
+  });
+
+  // The ops review: a chain file this user cannot read came back as
+  // `{ ok: false, break }`, a tamper finding; 0.7.0 threw. Root reads a
+  // 0o000 file anyway, so the case means nothing there.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a chain file that cannot be read is 'could not verify', not a break",
+    async () => {
+      await seedAudit();
+      const file = auditFiles()[0] as string;
+      chmodSync(file, 0o000);
+      let raw: string;
+      try {
+        raw = await call(auditVerify, {});
+      } finally {
+        chmodSync(file, 0o600);
+      }
+      expect(raw).toContain("could not be verified, which is not a tamper finding");
+      expect(raw).toContain("cannot be read");
+      expect(raw).not.toContain('"break"');
+      expect(raw).not.toContain(tmp);
+    },
+  );
+
+  // In a child process: before the fix a FIFO blocked the walk for ever, even
+  // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
+  test.skipIf(process.platform === "win32")(
+    "a FIFO chain file is refused promptly, before the walk",
+    async () => {
+      await seedAudit();
+      const fifo = path.join(tmp, ".crewhaus", "audit", "0001.jsonl");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      const script = `
+        process.chdir(${JSON.stringify(tmp)});
+        const { auditVerify } = await import(${JSON.stringify(path.join(import.meta.dir, "index.ts"))});
+        console.log(await auditVerify.execute({ maxBytes: 1_000_000 }));
+      `;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const text = await new Response(child.stdout).text();
+      clearTimeout(killer);
+      expect(await child.exited).toBe(0);
+      const result = JSON.parse(text) as { ok: boolean; break: { reason: string } };
+      expect(result.ok).toBe(false);
+      expect(result.break.reason).toMatch(/is a fifo, not a regular file/);
+    },
+    20_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -758,6 +1337,21 @@ describe("EvalBaselineCompare", () => {
         candidate: evalDoc([["a", true, 1]]),
       }),
     ).toContain("baseline");
+  });
+
+  test("a one-sample smoke run on another dataset does not pass a 50-sample gate (0.7.1)", async () => {
+    const baseline = evalDoc(
+      Array.from({ length: 50 }, (_, i): [string, boolean, number] => [`s${i}`, i % 10 !== 0, 1]),
+    );
+    const candidate = { ...evalDoc([["other-0", true, 1]]), config: { datasetName: "smoke" } };
+    const result = await callJson<{
+      verdict: string;
+      reasons: string[];
+      samples: { shared: number };
+    }>(evalBaselineCompare, { baseline, candidate });
+    expect(result.samples.shared).toBe(0);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.length).toBe(2);
   });
 
   test("passing both a document and a path for one side is refused", async () => {
@@ -1061,6 +1655,168 @@ describe("secret hygiene", () => {
     expect(raw).not.toContain("ghp_ABCDEFGH0123456789abcdefghijklmnop");
   });
 
+  test("a credential in a stdio URL or header argv reaches neither SpecSummarize nor SpecDiff", async () => {
+    // Built from parts: no secret-shaped literal in the source.
+    const pw = ["Hunter", "2", "Secret"].join("");
+    const tok = ["plain", "secret", "tok"].join("");
+    const hdr = ["abcdef", "0123", "456789"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  pg:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "-y"',
+      '      - "@modelcontextprotocol/server-postgres"',
+      `      - "postgresql://admin:${pw}@db.internal:5432/prod"`,
+      "  remote:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "mcp-remote"',
+      `      - "https://mcp.example.com/sse?token=${tok}"`,
+      '      - "--header"',
+      `      - "Authorization: Bearer ${hdr}"`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, {
+      before: { spec: base.join("\n") },
+      after: { spec },
+    });
+    for (const [label, raw] of [
+      ["SpecSummarize", summary],
+      ["SpecDiff", diff],
+    ] as const) {
+      expect({
+        label,
+        pw: raw.includes(pw),
+        tok: raw.includes(tok),
+        hdr: raw.includes(hdr),
+      }).toEqual({ label, pw: false, tok: false, hdr: false });
+    }
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.redactedArgs])).toEqual([
+      ["pg", 1],
+      ["remote", 2],
+    ]);
+    // What the server IS still shows.
+    expect(summary).toContain("db.internal:5432/prod");
+    expect(diff).toContain("https://mcp.example.com/sse?token=(redacted)");
+  });
+
+  test("a header in mcp-proxy's two-entry form, or after supergateway's --oauth2Bearer, reaches neither tool", async () => {
+    // On the first 0.7.1 cut both tools printed these argv verbatim: only a
+    // one-entry `Name: value` header and a separator-then-word credential
+    // flag were recognised. Built from parts: no secret-shaped literal.
+    const secret = ["S3CRET", "value", "42"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  proxy:",
+      "    transport: stdio",
+      "    command: uvx",
+      `    args: [mcp-proxy, --headers, X-Api-Key, "${secret}", "https://example.io/sse"]`,
+      "  gw:",
+      "    transport: stdio",
+      "    command: npx",
+      `    args: [-y, supergateway, --sse, "https://example.io/sse", --oauth2Bearer, "${secret}"]`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, { before: { spec: base.join("\n") }, after: { spec } });
+    expect({ summary: summary.includes(secret), diff: diff.includes(secret) }).toEqual({
+      summary: false,
+      diff: false,
+    });
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.args, s.redactedArgs])).toEqual([
+      [
+        "gw",
+        ["-y", "supergateway", "--sse", "https://example.io/sse", "--oauth2Bearer", "(redacted)"],
+        1,
+      ],
+      ["proxy", ["mcp-proxy", "--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"], 1],
+    ]);
+  });
+
+  test("a quoted sh -c assignment, a seed phrase and a key in a URL path reach neither tool", async () => {
+    // Printed verbatim by both tools after the first 0.7.1 fix-up (the ops
+    // review's e2e and sse proofs). Built from parts: no secret-shaped literal.
+    const secret = ["Hunter", "2", "Secret", "Q9"].join("");
+    const key = ["Xk9", "q2Lm", "Pz7Rt", "4Wv8"].join("");
+    const seed = "abandon ability able about above absent";
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const servers = (zapierKey: string) =>
+      [
+        ...base,
+        "mcp_servers:",
+        "  shell:",
+        "    transport: stdio",
+        "    command: sh",
+        `    args: ["-c", "API_KEY='${secret}' exec my-mcp-server"]`,
+        "  wallet:",
+        "    transport: stdio",
+        "    command: npx",
+        `    args: [evm-mcp-server, --mnemonic, "${seed}", --rpc-url, "https://eth-mainnet.g.alchemy.com/v2/${key}"]`,
+        "  zap:",
+        "    transport: sse",
+        `    url: "https://actions.zapier.com/mcp/sk-ak-${zapierKey}/sse"`,
+      ].join("\n");
+    const spec = servers(key);
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, { before: { spec: base.join("\n") }, after: { spec } });
+    const leaks = (text: string) => [secret, key, seed].filter((s) => text.includes(s)).length;
+    expect({ summary: leaks(summary), diff: leaks(diff) }).toEqual({ summary: 0, diff: 0 });
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; endpoint?: string }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.args ?? s.endpoint])).toEqual([
+      ["shell", ["-c", "API_KEY='(redacted)' exec my-mcp-server"]],
+      [
+        "wallet",
+        [
+          "evm-mcp-server",
+          "--mnemonic",
+          "(redacted)",
+          "--rpc-url",
+          "https://eth-mainnet.g.alchemy.com/v2/(redacted)",
+        ],
+      ],
+      ["zap", "https://actions.zapier.com/mcp/(redacted)/sse"],
+    ]);
+    // A rotated key in the path is still a change, reported without the key.
+    const rotated = await call(specDiff, {
+      before: { spec },
+      after: { spec: servers(key.split("").reverse().join("")) },
+    });
+    expect(rotated).toContain("mcp-server-url-value-changed");
+    expect(leaks(rotated)).toBe(0);
+  });
+
   test("an sse endpoint keeps neither its query string nor its userinfo", async () => {
     const spec = [
       "name: remote",
@@ -1125,26 +1881,206 @@ describe("permission reporting matches the engine", () => {
     expect(result.tools.every((t) => t.decision !== "allow")).toBe(true);
   });
 
-  test("plan mode says the rules are not reached", async () => {
+  test("plan mode reports what plan mode does: allows ignored, deny and ask deny (0.7.1)", async () => {
     const spec = [
       "name: demo",
       "target: cli",
       "agent:",
       "  model: claude-sonnet-4-6",
       "  instructions: x",
-      "tools: [read]",
+      "tools: [read, webFetch, grep]",
       "permissions:",
       "  mode: plan",
       "  rules:",
       "    - type: alwaysAllow",
       "      pattern: Read",
+      "    - type: alwaysDeny",
+      "      pattern: WebFetch",
+      "    - type: alwaysAsk",
+      "      pattern: Grep",
     ].join("\n");
     const result = await callJson<{
       modeOverridesRules: boolean;
+      tools: Array<{ tool: string; decision: string }>;
       findings: Array<{ reason: string }>;
     }>(permissionAudit, { spec });
     expect(result.modeOverridesRules).toBe(true);
-    expect(result.findings.some((f) => f.reason.includes("consulting a single rule"))).toBe(true);
+    const decisions = Object.fromEntries(result.tools.map((t) => [t.tool, t.decision]));
+    expect(decisions).toEqual({
+      grep: "deny",
+      // Read's own flags are known (it is read-only), so the fallback is
+      // reported as the answer for Read, not as the mode's general rule.
+      read: "allow",
+      webFetch: "deny",
+    });
+    expect(
+      result.findings.some((f) => f.reason.includes("the engine ignores every allow rule")),
+    ).toBe(true);
+  });
+
+  test("every builtin reports its real flags, so its unguarded sinks are found (permission-integration#9)", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [webFetch, httpRequest, emailSend, runCommand, removePath, webhookPost, chatPost, packageInstall, read]",
+      "permissions:",
+      "  mode: auto",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{
+        tool: string;
+        decision: string;
+        external: boolean;
+        destructive?: boolean;
+        readOnly?: boolean;
+        requireJustification?: boolean;
+        flagsFrom: string;
+      }>;
+      findings: Array<{ tool: string; reason: string }>;
+    }>(permissionAudit, { spec });
+    const row = (tool: string) => result.tools.find((t) => t.tool === tool);
+    // The audit's evidence: these reported external:false and never destructive.
+    for (const tool of [
+      "httpRequest",
+      "emailSend",
+      "runCommand",
+      "webhookPost",
+      "chatPost",
+      "packageInstall",
+    ]) {
+      expect({ tool, external: row(tool)?.external, destructive: row(tool)?.destructive }).toEqual({
+        tool,
+        external: true,
+        destructive: true,
+      });
+    }
+    expect(row("removePath")).toMatchObject({
+      external: false,
+      destructive: true,
+      decision: "ask",
+    });
+    expect(row("read")).toMatchObject({ readOnly: true, decision: "allow", flagsFrom: "builtin" });
+    // Auto mode asks for a destructive tool and allows the rest.
+    expect(row("httpRequest")?.decision).toBe("ask");
+    expect(row("webFetch")?.decision).toBe("allow");
+    const unguarded = new Set(
+      result.findings
+        .filter((f) => f.reason.includes("reaches outside the process"))
+        .map((f) => f.tool),
+    );
+    for (const tool of [
+      "webFetch",
+      "httpRequest",
+      "emailSend",
+      "runCommand",
+      "webhookPost",
+      "chatPost",
+      "packageInstall",
+    ]) {
+      expect(unguarded.has(tool)).toBe(true);
+    }
+    expect(
+      result.findings.some((f) => f.tool === "removePath" && f.reason.includes("is destructive")),
+    ).toBe(true);
+    // An intent-gated tool with no LLM judge is denied outside tests; the audit says so.
+    expect(row("emailSend")?.requireJustification).toBe(true);
+    expect(
+      result.findings.some(
+        (f) => f.tool === "emailSend" && f.reason.includes("security.justification.judge"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a rule that can never fire covers nothing and is listed with its fix (permission-integration#12)", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [removePath, httpRequest, runCommand]",
+      "permissions:",
+      "  rules:",
+      '    - { type: alwaysAllow, pattern: "HttpRequest(GET https://api.example.com/**)" }',
+      '    - { type: alwaysAllow, pattern: "RunCommand(git status)" }',
+      '    - { type: alwaysDeny, pattern: "removePath(tmp/**)" }',
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; rule?: { pattern: string }; conditional: boolean }>;
+      ruleProblems: Array<{ pattern: string; code: string; suggestion?: string }>;
+      unusedRules: Array<{ pattern: string }>;
+    }>(permissionAudit, { spec });
+    expect(result.ruleProblems.map((p) => [p.code, p.suggestion])).toEqual([
+      ["argument-cannot-match", "HttpRequest(https://api.example.com/**)"],
+      ["tool-key-not-name", "RemovePath(tmp/**)"],
+    ]);
+    const row = (tool: string) => result.tools.find((t) => t.tool === tool);
+    // No longer reported as conditional cover for HttpRequest.
+    expect(row("httpRequest")?.rule).toBeUndefined();
+    // RunCommand declares its argv, so `RunCommand(git status)` is real cover.
+    expect(row("runCommand")).toMatchObject({
+      rule: { pattern: "RunCommand(git status)" },
+      conditional: true,
+    });
+    expect(result.unusedRules.map((r) => r.pattern).sort()).toEqual([
+      "HttpRequest(GET https://api.example.com/**)",
+      "removePath(tmp/**)",
+    ]);
+  });
+
+  test("a rule naming a tool the runtime adds on its own is not a dead rule", async () => {
+    // procode's `alwaysAllow Skill` and the browser starter's `alwaysAllow
+    // Type` were listed as covering nothing, with "Write Shell" / "Write Tree".
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [read, shell, tree]",
+      "permissions:",
+      "  rules:",
+      "    - { type: alwaysAllow, pattern: Skill }",
+      "    - { type: alwaysAllow, pattern: Type }",
+      "    - { type: alwaysAllow, pattern: Shel }",
+    ].join("\n");
+    const result = await callJson<{
+      ruleProblems: Array<{ pattern: string; code: string; suggestion?: string }>;
+    }>(permissionAudit, { spec });
+    // Only the real typo is reported — and not "corrected" into allowing Shell.
+    expect(result.ruleProblems.map((p) => [p.pattern, p.code, p.suggestion])).toEqual([
+      ["Shel", "unknown-tool", undefined],
+    ]);
+  });
+
+  test("a rule in the pre-0.7.1 MCP spelling still names an mcp__ tool", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [mcp__github__create_issue]",
+      "mcp_servers:",
+      "  github:",
+      "    transport: stdio",
+      "    command: npx",
+      "permissions:",
+      "  rules:",
+      "    - type: alwaysDeny",
+      "      pattern: github__create_issue",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string }>;
+      unusedRules: unknown[];
+    }>(permissionAudit, { spec });
+    expect(result.tools).toContainEqual(
+      expect.objectContaining({ tool: "mcp__github__create_issue", decision: "deny" }),
+    );
+    expect(result.unusedRules).toEqual([]);
   });
 });
 

@@ -9,7 +9,11 @@
  * look like npm ranges, and feeding one to the other produces a confident
  * wrong answer rather than an error.
  *
- *   - `1.2` means `=1.2.0` to npm and `^1.2.0` to Cargo.
+ *   - `1.2.3` means exactly 1.2.3 to npm and `^1.2.3` to Cargo.
+ *   - `1.2` means `1.2.x` to npm (a missing segment is a wildcard, as in
+ *     `<=1.2`, which is `<1.3.0`) and exactly 1.2.0 to PEP 440 and Poetry,
+ *     so a PEP 440 or Poetry version is padded to three segments before it
+ *     reaches the npm grammar.
  *   - `~=1.4.2` means `>=1.4.2 <1.5.0` to pip and nothing at all to npm.
  *   - `1.0rc1` is a PyPI version that `parseSemver` reads as `1.0.0`, because
  *     its pattern is unanchored — so `1.0rc1` and `1.0` compare EQUAL, and a
@@ -27,7 +31,13 @@
  * and anything that does not translate exactly comes back as a refusal with a
  * reason. "Cannot tell" is a row in the table; a wrong answer is a bad upgrade.
  */
-import { type SemVer, compareSemver, parseSemver, satisfies } from "@crewhaus/tool-code";
+import {
+  type SemVer,
+  compareSemver,
+  parseSemver,
+  satisfies,
+  satisfiesInstallable,
+} from "@crewhaus/tool-code";
 import type { Ecosystem } from "./net";
 
 export type RangeTranslation =
@@ -59,6 +69,21 @@ export const DIALECT_BY_ECOSYSTEM: Readonly<Record<Ecosystem, RangeDialect>> = O
  */
 export function isSemverShaped(raw: string): boolean {
   return /^v?\d+(\.\d+){0,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(raw.trim());
+}
+
+/**
+ * A semver-shaped version with all three segments written: `1.4` → `1.4.0`,
+ * `2` → `2.0.0`, `1.4-rc.1` → `1.4.0-rc.1`. PEP 440 and Poetry read a
+ * missing segment as zero (`==1.4` is 1.4.0), npm reads it as a wildcard
+ * (`=1.4` is any 1.4.x, `>1.4` is `>=1.5.0`), so every version those
+ * dialects write is padded before it becomes an npm comparator.
+ */
+function padded(version: string): string {
+  const m = /^(v?)(\d+(?:\.\d+)*)(.*)$/.exec(version.trim());
+  if (m === null) return version;
+  const segments = (m[2] as string).split(".");
+  while (segments.length < 3) segments.push("0");
+  return `${m[1]}${segments.join(".")}${m[3]}`;
 }
 
 /** Specifier prefixes that are a location, not a version. */
@@ -93,12 +118,8 @@ export function toNpmRangeIn(dialect: RangeDialect, rawSpec: string): RangeTrans
 }
 
 function translateNpm(spec: string): RangeTranslation {
-  if (spec.includes(" - ")) {
-    // `1.2.3 - 2.3.4` is a hyphen range, which the shared evaluator does not
-    // implement; it would otherwise be split on whitespace into comparators
-    // that mean something else entirely.
-    return { ok: false, reason: `hyphen ranges ("${spec}") are not evaluated here` };
-  }
+  // A hyphen range (`1.2.3 - 2.3.4`) is npm grammar the shared evaluator
+  // reads as npm does, so it passes through like any other npm range.
   if (/^[a-zA-Z][\w./-]*$/.test(spec) && spec !== "x") {
     return { ok: false, reason: `"${spec}" is a dist-tag or an alias, not a version range` };
   }
@@ -194,7 +215,7 @@ function translatePep440(spec: string): RangeTranslation {
       if (!isSemverShaped(version)) {
         return { ok: false, reason: `"${version}" is not a version this package can order` };
       }
-      out.push(`=${version}`);
+      out.push(`=${padded(version)}`);
       continue;
     }
     if (op === "~=") {
@@ -215,13 +236,13 @@ function translatePep440(spec: string): RangeTranslation {
       }
       upper[upper.length - 1] = String(lastKept + 1);
       while (upper.length < 3) upper.push("0");
-      out.push(`>=${version}`, `<${upper.join(".")}`);
+      out.push(`>=${padded(version)}`, `<${upper.join(".")}`);
       continue;
     }
     if (!isSemverShaped(version)) {
       return { ok: false, reason: `"${version}" is not a version this package can order` };
     }
-    out.push(`${op}${version}`);
+    out.push(`${op}${padded(version)}`);
   }
   return { ok: true, range: out.join(" ") };
 }
@@ -261,11 +282,11 @@ function bumpedBound(segments: readonly number[], index: number): string {
  * One Poetry constraint, as the comparators `satisfies` evaluates.
  *
  * Poetry's caret and tilde are expanded to explicit bounds rather than handed
- * to the shared `^`/`~` comparators, because those read the version as three
- * segments: `^0` would arrive as `^0.0.0` and pin the patch, and `~1` as
- * `~1.0.0` and pin the minor. Poetry documents both as widening to the next
- * whole segment the author wrote, so the bound is computed from the segments
- * that are actually there.
+ * to the shared `^`/`~` comparators. Those now read a missing segment the way
+ * npm does (`^0` is `<1.0.0`, `~1` is `<2.0.0`, as Poetry documents too), but
+ * Poetry's documentation is the contract here, not npm's, so the bound is
+ * computed from the segments the author actually wrote and every version is
+ * padded to three segments before it becomes a comparator.
  */
 function poetryClause(part: string): RangeTranslation {
   if (part === "*") return { ok: true, range: "*" };
@@ -305,18 +326,18 @@ function poetryClause(part: string): RangeTranslation {
     // no such segment, so the last one written moves: `^0` → <1.0.0.
     const firstNonZero = segments.findIndex((n) => n !== 0);
     const pivot = firstNonZero === -1 ? segments.length - 1 : firstNonZero;
-    return { ok: true, range: `>=${version} <${bumpedBound(segments, pivot)}` };
+    return { ok: true, range: `>=${padded(version)} <${bumpedBound(segments, pivot)}` };
   }
   if (op === "~") {
     // `~1.2.3` and `~1.2` allow patch-level change; `~1` allows minor-level.
     const pivot = segments.length >= 2 ? 1 : 0;
-    return { ok: true, range: `>=${version} <${bumpedBound(segments, pivot)}` };
+    return { ok: true, range: `>=${padded(version)} <${bumpedBound(segments, pivot)}` };
   }
   if (op === "" || op === "=" || op === "==") {
     // A bare version in a Poetry table is an exact pin, not a floor.
-    return { ok: true, range: `=${version}` };
+    return { ok: true, range: `=${padded(version)}` };
   }
-  return { ok: true, range: `${op}${version}` };
+  return { ok: true, range: `${op}${padded(version)}` };
 }
 
 /**
@@ -365,23 +386,22 @@ export function versionSatisfies(version: string, npmRange: string): Satisfactio
  * The highest published version the declared range allows — what an install
  * into this manifest would pick, as opposed to what the registry calls latest.
  *
- * Prereleases are skipped unless the caller asks for them or the range itself
- * names one, which is npm's rule and the least surprising of the available
- * ones.
+ * Prereleases are skipped unless the caller asks for them or the range names
+ * a prerelease of the SAME major.minor.patch in the same `||` alternative,
+ * which is npm's rule: `^1.2.3-beta.2` may pick 1.2.3-beta.4, never
+ * 1.9.0-rc.1. The rule lives beside `satisfies` in @crewhaus/tool-code.
  */
 export function highestSatisfying(
   versions: readonly string[],
   npmRange: string,
   includePrerelease = false,
 ): string | undefined {
-  const rangeNamesPrerelease = /\d-[0-9A-Za-z]/.test(npmRange);
   let best: { raw: string; parsed: SemVer } | undefined;
   for (const raw of versions) {
     if (!isSemverShaped(raw)) continue;
     const parsed = parseSemver(raw);
     if (parsed === undefined) continue;
-    if (parsed.prerelease !== "" && !includePrerelease && !rangeNamesPrerelease) continue;
-    if (satisfies(raw, npmRange) !== true) continue;
+    if (satisfiesInstallable(raw, npmRange, { includePrerelease }) !== true) continue;
     if (best === undefined || compareSemver(parsed, best.parsed) > 0) best = { raw, parsed };
   }
   return best?.raw;

@@ -19,6 +19,9 @@
     },
     {
       "path": "../model-service"
+    },
+    {
+      "path": "../tool-categories"
     }
   ],
   "include": ["src/**/*"]

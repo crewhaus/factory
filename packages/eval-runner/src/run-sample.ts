@@ -12,6 +12,7 @@ import {
 } from "@crewhaus/eval-grader";
 import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { toolListEntryNames } from "@crewhaus/tool-catalog";
 import type {
   ModelResponseEvent,
   PermissionDecisionEvent,
@@ -382,9 +383,10 @@ function computeMetrics(
   const expected = sample.expected_tools;
   if (expected !== undefined && expected.length > 0) {
     const expectedSet = new Set(expected);
-    const called = new Set(toolCalls.map((c) => c.toolName));
+    const called = [...new Set(toolCalls.map((c) => c.toolName))];
     let hit = 0;
-    for (const name of expectedSet) if (called.has(name)) hit += 1;
+    // An MCP tool answers to its pre-0.7.1 spelling too (`<server>__<tool>`).
+    for (const name of expectedSet) if (called.some((c) => toolListEntryNames(name, c))) hit += 1;
     toolCallAccuracy = hit / expectedSet.size;
   }
 

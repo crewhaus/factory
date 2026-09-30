@@ -45,9 +45,11 @@ export function validateAddress(raw: string): AddressResult {
       valid: false,
       checksummed: "",
       hadChecksum: false,
-      reason: /^0x/i.test(text)
-        ? `an address is 0x followed by 40 hex characters; this has ${body.length}`
-        : "an address starts with 0x",
+      reason: text.startsWith("0X")
+        ? "an address starts with a lowercase 0x; this starts with 0X"
+        : text.startsWith("0x")
+          ? `an address is 0x followed by 40 hex characters; this has ${body.length}`
+          : "an address starts with 0x",
     };
   }
 
@@ -74,6 +76,22 @@ export function validateAddress(raw: string): AddressResult {
       ? ""
       : "this address carries no EIP-55 checksum, so only its shape was checked; a typo in an all-lowercase address cannot be detected",
   };
+}
+
+/**
+ * An address a coder may put into calldata or a digest: 0x and 40 hex
+ * characters, whose EIP-55 checksum holds when it carries one. Returns the
+ * checksummed form; throws the reason otherwise.
+ *
+ * Every path that writes an address goes through this, not only
+ * `AddressCheck`: the encoder is the last point where a re-typed character
+ * can still be caught, and ethers and viem refuse the same input.
+ */
+export function checkedAddress(raw: unknown, what: string): string {
+  if (typeof raw !== "string") throw new Error(`${what}: an address is a 0x hex string`);
+  const result = validateAddress(raw);
+  if (!result.valid) throw new Error(`${what}: ${result.reason}`);
+  return result.checksummed;
 }
 
 /**

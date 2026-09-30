@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
  * since a money tool that guesses is worse than one that stops.
  */
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -176,6 +176,42 @@ describe("TaxCalculate", () => {
   });
 });
 
+describe("amounts past 2^53 − 1 minor units are refused at the schema (C218)", () => {
+  test("every minor-unit field takes a safe integer and nothing larger", () => {
+    const tax = taxCalculate.inputSchema.safeParse({
+      lines: [{ id: "a", amountMinor: 2 ** 53, taxCodes: ["Z"] }],
+      rates: [{ code: "Z", bps: 0 }],
+    });
+    expect(tax.success).toBe(false);
+    expect(JSON.stringify(tax.error?.issues)).toContain("express it in a larger unit");
+    expect(
+      costBasisCompute.inputSchema.safeParse({
+        lots: [{ id: "l", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1e18 }],
+        disposals: [],
+        method: "fifo",
+      }).success,
+    ).toBe(false);
+    expect(
+      taxCalculate.inputSchema.safeParse({
+        lines: [{ id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] }],
+        rates: [{ code: "Z", bps: 0 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  test("a total past it is an error naming the figure, not JSON one unit off", async () => {
+    await expect(
+      raw(taxCalculate, {
+        lines: [
+          { id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] },
+          { id: "b", amountMinor: 2, taxCodes: ["Z"] },
+        ],
+        rates: [{ code: "Z", bps: 0 }],
+      }),
+    ).rejects.toThrow(/cannot be reported exactly/);
+  });
+});
+
 describe("RefundAmountCompute", () => {
   test("a full return refunds what was charged", async () => {
     const result = await call<{ totalMinor: number; fullReturn: boolean }>(refundAmountCompute, {
@@ -207,6 +243,24 @@ describe("PurchaseOrderMatch", () => {
     );
     expect(result.ok).toBe(false);
     expect(result.pairs[0]?.status).toBe("over-receipt");
+  });
+
+  test("a fractional quantityAbsolute on whole quantities is a verdict, not a crash", async () => {
+    const input = (quantityAbsolute: number) => ({
+      invoiceLines: [{ id: "inv-1", poLineId: "po-1", quantity: 10, unitPriceMinor: 1250 }],
+      poLines: [{ id: "po-1", quantity: 11, unitPriceMinor: 1250 }],
+      tolerance: { quantityAbsolute, pricePercentBps: 100 },
+    });
+    const matched = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(1.5),
+    );
+    expect(matched.pairs[0]?.status).toBe("matched");
+    const variance = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(0.5),
+    );
+    expect(variance.pairs[0]?.status).toBe("quantity-variance");
   });
 });
 
@@ -247,6 +301,50 @@ describe("SpendLimitCheck", () => {
     });
     expect(result.allowed).toBe(false);
     expect(result.headroomMinor).toBe(20_000);
+  });
+
+  test("it claims to compute a verdict, not to be a gate its caller cannot pass (C145)", () => {
+    // The history, the limits and the clock are all inputs, so a model that
+    // supplies them can pass any payment. 0.7.0 called this "the gate an
+    // unattended harness actually consults" and said its result "is a limit".
+    const text = spendLimitCheck.description;
+    expect({
+      consults: text.includes("actually consults"),
+      isALimit: text.includes("is a limit"),
+    }).toEqual({
+      consults: false,
+      isALimit: false,
+    });
+    expect(text).toContain("enforces nothing by itself");
+    expect(text).toContain("passed in");
+  });
+
+  test("the result says which clock the verdict used", async () => {
+    const input = {
+      proposed: { amountMinor: 1 },
+      history: [],
+      limits: { perDayMinor: 100 },
+    };
+    const live = await call<{ clock: string; basis: string }>(spendLimitCheck, input);
+    expect(live.clock).toBe("runtime");
+    expect(live.basis).toContain("passed in this call");
+    const replay = await call<{ clock: string }>(spendLimitCheck, {
+      ...input,
+      now: "2026-01-01T11:00:00Z",
+    });
+    expect(replay.clock).toBe("caller-supplied");
+  });
+
+  test("every tool's `now` says it is for tests and replays, not live decisions", () => {
+    for (const tool of [spendLimitCheck, refundAbuseCheck, webhookSignatureVerify]) {
+      const shape = (
+        tool.inputSchema as unknown as { shape: Record<string, { description?: string }> }
+      ).shape;
+      expect({ tool: tool.name, now: shape["now"]?.description }).toEqual({
+        tool: tool.name,
+        now: expect.stringContaining("omit it for a live decision"),
+      });
+    }
   });
 });
 
@@ -322,9 +420,82 @@ describe("StatementParse", () => {
     expect(result.transactions[0]?.date).toBe("2026-04-03");
   });
 
+  test("the rejected list is capped like the transactions, and says how many there were (C092)", async () => {
+    writeFileSync(join(workspace, "s.ofx"), `<OFX>${"<STMTTRN>junk</STMTTRN>".repeat(1_000)}`);
+    const result = await call<{
+      rejected: unknown[];
+      rejectedCount: number;
+      rejectedTruncated: boolean;
+    }>(statementParse, { file: "s.ofx", limit: 10 });
+    expect(result.rejected.length).toBe(10);
+    expect(result.rejectedCount).toBe(1_000);
+    expect(result.rejectedTruncated).toBe(true);
+  });
+
+  test("an amount or a total past 2^53 − 1 comes back refused by name, never rounded (C218)", async () => {
+    writeFileSync(
+      join(workspace, "big.ofx"),
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>90071992547409.93<FITID>A</STMTTRN>\n",
+    );
+    const one = await call<{ count: number; rejectedCount: number; rejected: unknown[] }>(
+      statementParse,
+      { file: "big.ofx" },
+    );
+    expect(one.count).toBe(0);
+    expect(one.rejectedCount).toBe(1);
+    expect(JSON.stringify(one.rejected)).toContain("is more than 2^53 − 1");
+    writeFileSync(
+      join(workspace, "sum.csv"),
+      "date,amount\n2024-01-01,90071992547409.91\n2024-01-02,0.01\n2024-01-03,0.01\n",
+    );
+    const sum = await call<{
+      totalMinor: number | null;
+      creditMinor: number | null;
+      totalsUnavailable?: string;
+    }>(statementParse, { file: "sum.csv" });
+    expect(sum.totalMinor).toBeNull();
+    expect(sum.creditMinor).toBeNull();
+    expect(sum.totalsUnavailable).toContain("total comes to 9007199254740993 minor units");
+  });
+
   test("a path outside the workspace is refused", async () => {
     await expect(raw(statementParse, { file: "../outside.csv" })).rejects.toThrow(
       /escapes the workspace/,
+    );
+  });
+
+  test("a FIFO is refused without being opened, so the harness does not stall", async () => {
+    // With no writer, opening a FIFO blocks for ever, and the read was
+    // synchronous: the whole process stopped. A writer is kept waiting on
+    // the pipe here so the test stays bounded even against that code — an
+    // open would complete, and the writer would exit.
+    const fifo = join(workspace, "statement.ofx");
+    expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+    const writer = Bun.spawn(["sh", "-c", `printf x > '${fifo}'`], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      await Bun.sleep(100);
+      await expect(raw(statementParse, { file: "statement.ofx" })).rejects.toThrow(
+        '"statement.ofx" is a fifo, not a regular file',
+      );
+      await Bun.sleep(200);
+      // Still blocked in its open: nothing opened the pipe.
+      expect(writer.exitCode).toBeNull();
+    } finally {
+      writer.kill("SIGKILL");
+      await writer.exited;
+    }
+  }, 10_000);
+
+  test("a file past the byte limit is refused, not cut short", async () => {
+    // The limit is enforced while reading: 64 MiB of sparse file, one byte over.
+    const path = join(workspace, "huge.csv");
+    writeFileSync(path, "Date,Amount\n");
+    truncateSync(path, 64 * 1024 * 1024 + 1);
+    await expect(raw(statementParse, { file: "huge.csv" })).rejects.toThrow(
+      /over the 67108864-byte limit/,
     );
   });
 });
@@ -341,6 +512,138 @@ describe("GlCodeSuggest", () => {
       ],
     });
     expect(result).toMatchObject({ coded: 1, needsReview: 1 });
+  });
+
+  // C073: a higher-priority rule whose pattern could not be evaluated was
+  // read as "did not match", so a lower-priority rule coded the line.
+  const capexFirst = (expected: string) => [
+    {
+      id: "capex",
+      priority: 10,
+      when: [{ path: "vendor", op: "matches" as const, expected }],
+      account: "1500",
+    },
+    {
+      id: "opex",
+      priority: 1,
+      when: [{ path: "vendor", op: "contains" as const, expected: "AWS" }],
+      account: "6500",
+    },
+  ];
+  type Coded = {
+    coded: number;
+    needsReview: number;
+    lines: Array<{
+      account: string | null;
+      needsReview: boolean;
+      reason: string;
+      undetermined?: string[];
+      matched: string[];
+    }>;
+  };
+
+  test("a refused higher-priority pattern sends the line to review, not to a lower rule", async () => {
+    for (const evil of ["(a+)+!$|capex", "(a|aa)+!$|capex"]) {
+      const result = await call<Coded>(glCodeSuggest, {
+        lines: [{ id: "l1", vendor: `${"a".repeat(30)} AWS capex` }],
+        rules: capexFirst(evil),
+      });
+      expect(result.coded).toBe(0);
+      expect(result.lines[0]).toMatchObject({
+        account: null,
+        needsReview: true,
+        undetermined: ["capex"],
+        matched: ["opex"],
+      });
+      expect(result.lines[0]?.reason).toContain('"capex"');
+      expect(result.lines[0]?.reason).toContain("invalid regex");
+    }
+  });
+
+  test("a benign higher-priority pattern still codes, and a lower-priority undetermined rule does not block", async () => {
+    const coded = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS capex" }],
+      rules: capexFirst("capex"),
+    });
+    expect(coded.lines[0]).toMatchObject({ account: "1500", needsReview: false });
+    // The refused rule is BELOW the one that matched: it could not win.
+    const below = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS" }],
+      rules: [
+        {
+          id: "cloud",
+          priority: 5,
+          when: [{ path: "vendor", op: "equals", expected: "AWS" }],
+          account: "6500",
+        },
+        {
+          id: "bad",
+          priority: 1,
+          when: [{ path: "vendor", op: "matches", expected: "(a+)+$" }],
+          account: "1",
+        },
+      ],
+    });
+    expect(below.lines[0]).toMatchObject({ account: "6500", needsReview: false });
+    expect(below.lines[0]?.undetermined).toBeUndefined();
+  });
+
+  test("an unevaluated rule that ties the matching one also sends the line to review", async () => {
+    // At the same priority it might have matched and disagreed: ambiguous.
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS" }],
+      rules: [
+        {
+          id: "cloud",
+          priority: 5,
+          when: [{ path: "vendor", op: "equals", expected: "AWS" }],
+          account: "6500",
+        },
+        {
+          id: "bad",
+          priority: 5,
+          when: [{ path: "vendor", op: "matches", expected: "(a+)+$" }],
+          account: "1",
+        },
+      ],
+    });
+    expect(result.lines[0]).toMatchObject({
+      account: null,
+      needsReview: true,
+      undetermined: ["bad"],
+    });
+  });
+
+  test("a rule whose other condition definitely failed is a miss, whatever its pattern", async () => {
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS", amount: 5 }],
+      rules: [
+        {
+          id: "big-capex",
+          priority: 10,
+          when: [
+            { path: "amount", op: "greaterThan", expected: 1000 },
+            { path: "vendor", op: "matches", expected: "(a+)+$" },
+          ],
+          account: "1500",
+        },
+        { id: "opex", when: [{ path: "vendor", op: "equals", expected: "AWS" }], account: "6500" },
+      ],
+    });
+    expect(result.lines[0]).toMatchObject({ account: "6500", needsReview: false });
+  });
+
+  test("a rule set with no refused pattern answers exactly as before", async () => {
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "Mystery" }],
+      rules: capexFirst("^capex$"),
+      defaultAccount: "9999",
+    });
+    expect(result.lines[0]).toMatchObject({
+      account: "9999",
+      needsReview: true,
+      reason: "no rule matched",
+    });
   });
 
   test("a rule with no conditions is rejected by the schema", () => {

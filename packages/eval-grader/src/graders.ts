@@ -1,3 +1,4 @@
+import { toolListEntryNames } from "@crewhaus/tool-catalog";
 import type { z } from "zod";
 import { GraderError } from "./errors";
 import { evalJsonPath } from "./json-path";
@@ -164,7 +165,11 @@ export function schema(zodSchema: z.ZodTypeAny): Grader {
 // -------- toolCallSequence --------
 
 export type ToolCallSequenceOptions = {
-  /** Names of tools the agent should have called, in order. */
+  /**
+   * Names of tools the agent should have called, in order. An MCP tool may be
+   * written as `mcp__<server>__<tool>`, the name it is registered under, or as
+   * `<server>__<tool>`, the name it had before crewhaus 0.7.1.
+   */
   readonly expected: ReadonlyArray<string>;
   /**
    * "exact": tool sequence must equal `expected` (length and order both matter).
@@ -177,12 +182,15 @@ export type ToolCallSequenceOptions = {
 
 export function toolCallSequence(opts: ToolCallSequenceOptions): Grader {
   const mode = opts.mode ?? "subseq";
+  // A graders.yaml written before MCP tools were renamed still passes.
+  const names = (expected: string | undefined, actual: string): boolean =>
+    expected !== undefined && toolListEntryNames(expected, actual);
   return async (_sample, run) => {
     const actual = run.toolCalls.map((c) => c.toolName);
     if (mode === "exact") {
       if (
         actual.length === opts.expected.length &&
-        actual.every((name, i) => name === opts.expected[i])
+        actual.every((name, i) => names(opts.expected[i], name))
       ) {
         return pass(`tool sequence matched: ${actual.join(" → ")}`);
       }
@@ -191,15 +199,14 @@ export function toolCallSequence(opts: ToolCallSequenceOptions): Grader {
       );
     }
     if (mode === "set") {
-      const actualSet = new Set(actual);
-      const missing = opts.expected.filter((n) => !actualSet.has(n));
+      const missing = opts.expected.filter((n) => !actual.some((a) => names(n, a)));
       if (missing.length === 0) return pass(`all expected tools present: ${actual.join(", ")}`);
       return fail(`missing tools: ${missing.join(", ")} (saw: ${actual.join(", ")})`);
     }
     // "subseq"
     let i = 0;
     for (const name of actual) {
-      if (i < opts.expected.length && name === opts.expected[i]) i += 1;
+      if (i < opts.expected.length && names(opts.expected[i], name)) i += 1;
     }
     if (i === opts.expected.length) {
       return pass(`tool subsequence matched: ${opts.expected.join(" → ")}`);

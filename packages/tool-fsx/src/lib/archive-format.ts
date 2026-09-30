@@ -14,8 +14,12 @@
  * Both parsers are pure: bytes in, entries out. Nothing here touches the
  * filesystem or spawns anything.
  */
+import { gunzipSync } from "node:zlib";
 
 export type ArchiveEntryKind = "file" | "dir" | "symlink" | "hardlink" | "other";
+
+/** A member an extractor would create as something other than a file, directory or link. */
+export type ArchiveSpecialKind = "fifo" | "character-device" | "block-device" | "socket";
 
 export type ArchiveEntry = {
   readonly name: string;
@@ -23,6 +27,13 @@ export type ArchiveEntry = {
   readonly kind: ArchiveEntryKind;
   /** For a symlink or hard link member, the target recorded in the archive. */
   readonly linkTarget?: string;
+  /**
+   * Set when the member is a FIFO, device or socket. `tar` makes a FIFO
+   * member as a real FIFO (no privilege needed), and opening one blocks
+   * until a writer appears: a planted `data.csv` FIFO freezes the next tool
+   * that reads it.
+   */
+  readonly special?: ArchiveSpecialKind;
 };
 
 export class ArchiveFormatError extends Error {
@@ -65,6 +76,23 @@ function tarNumber(bytes: Uint8Array): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+function specialFromTypeflag(flag: string): ArchiveSpecialKind | undefined {
+  if (flag === "6") return "fifo";
+  if (flag === "3") return "character-device";
+  if (flag === "4") return "block-device";
+  return undefined;
+}
+
+/** The special kind a zip member's unix mode (the high half of its external attributes) names. */
+function specialFromUnixMode(mode: number): ArchiveSpecialKind | undefined {
+  const type = mode & 0xf000;
+  if (type === 0x1000) return "fifo";
+  if (type === 0x2000) return "character-device";
+  if (type === 0x6000) return "block-device";
+  if (type === 0xc000) return "socket";
+  return undefined;
+}
+
 function kindFromTypeflag(flag: string): ArchiveEntryKind {
   if (flag === "5") return "dir";
   if (flag === "2") return "symlink";
@@ -73,10 +101,19 @@ function kindFromTypeflag(flag: string): ArchiveEntryKind {
   return "other";
 }
 
-/** Pull `path` / `linkpath` out of a pax extended header's record stream. */
+/**
+ * Pull `path` / `linkpath` out of a pax extended header's record stream.
+ *
+ * `GNU.sparse.name` names the member too, and wins over `path`: GNU's sparse
+ * format stores a placeholder in `path` and the real name there, and both
+ * GNU tar and libarchive (bsdtar) extract under it. A listing that ignored it
+ * showed `decoy.txt` while bsdtar wrote `evil.txt` (or `.git`), past every
+ * check made on the name.
+ */
 function parsePaxRecords(data: Uint8Array): { path?: string; linkpath?: string } {
   const text = TEXT.decode(data);
   const out: { path?: string; linkpath?: string } = {};
+  let sparseName: string | undefined;
   let offset = 0;
   while (offset < text.length) {
     const space = text.indexOf(" ", offset);
@@ -90,9 +127,11 @@ function parsePaxRecords(data: Uint8Array): { path?: string; linkpath?: string }
       const value = record.slice(eq + 1);
       if (key === "path") out.path = value;
       if (key === "linkpath") out.linkpath = value;
+      if (key === "GNU.sparse.name") sparseName = value;
     }
     offset += length;
   }
+  if (sparseName !== undefined) out.path = sparseName;
   return out;
 }
 
@@ -159,11 +198,13 @@ export function readTarEntries(data: Uint8Array): ArchiveEntry[] {
       const name = pendingName ?? (prefix === "" ? shortName : `${prefix}/${shortName}`);
       const linkTarget = pendingLink ?? cString(header.subarray(157, 257));
       const kind = kindFromTypeflag(typeflag);
+      const special = specialFromTypeflag(typeflag);
       entries.push({
         name,
         size: kind === "dir" ? 0 : size,
         kind,
         ...(linkTarget !== "" ? { linkTarget } : {}),
+        ...(special !== undefined ? { special } : {}),
       });
       pendingName = undefined;
       pendingLink = undefined;
@@ -279,11 +320,13 @@ export function readZipEntries(data: Uint8Array): ArchiveEntry[] {
     const linkTarget = isSymlink
       ? readZipLinkTarget(data, view, localOffset, compressedSize, method)
       : undefined;
+    const special = specialFromUnixMode(unixMode);
     entries.push({
       name,
       size: kind === "dir" ? 0 : size,
       kind,
       ...(linkTarget !== undefined ? { linkTarget } : {}),
+      ...(special !== undefined ? { special } : {}),
     });
     offset = nameStart + nameLength + extraLength + commentLength;
   }
@@ -330,6 +373,14 @@ export function gzipDeclaredSize(data: Uint8Array): number | undefined {
  * kilobytes expands to hundreds of megabytes of zeros, so capping the file
  * on disk caps nothing: without this the tool allocates whatever the archive
  * asks it to, and a 100 MiB bomb is enough to take the process down.
+ *
+ * The listing has to be the one the extractor will act on. `tar -xz` decodes
+ * EVERY gzip member of a concatenated file, while `Bun.gunzipSync` stops
+ * after the first, so a second member could carry entries no gate had seen
+ * (a hidden `.git/config`, a top-level name that replaces an existing
+ * directory). `node:zlib`'s `gunzipSync` decodes them all, as gzip(1) does,
+ * and `maxOutputLength` makes it throw before it allocates past the cap —
+ * the ISIZE trailer is only a fast path, since an archive can forge it.
  */
 export function readArchiveEntries(
   data: Uint8Array,
@@ -344,12 +395,20 @@ export function readArchiveEntries(
       `this .tar.gz declares ${declared} bytes of content, over the ${maxDecompressedBytes}-byte limit for reading one in memory`,
     );
   }
-  // The cast narrows ArrayBufferLike to ArrayBuffer for Bun's signature; the
-  // bytes come from a file read, never from a SharedArrayBuffer.
-  const tarBytes = Bun.gunzipSync(data as Uint8Array<ArrayBuffer>);
-  if (tarBytes.length > maxDecompressedBytes) {
+  let tarBytes: Uint8Array;
+  try {
+    tarBytes = gunzipSync(data, {
+      ...(Number.isFinite(maxDecompressedBytes) ? { maxOutputLength: maxDecompressedBytes } : {}),
+    });
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "ERR_BUFFER_TOO_LARGE" || err instanceof RangeError) {
+      throw new ArchiveFormatError(
+        `this .tar.gz expands to more than ${maxDecompressedBytes} bytes, over the limit for reading one in memory`,
+      );
+    }
     throw new ArchiveFormatError(
-      `this .tar.gz expands to ${tarBytes.length} bytes, over the ${maxDecompressedBytes}-byte limit for reading one in memory`,
+      `this .tar.gz could not be decompressed (${typeof code === "string" ? code : (err as Error).message})`,
     );
   }
   return readTarEntries(tarBytes);

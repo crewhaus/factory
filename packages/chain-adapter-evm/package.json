@@ -14,7 +14,8 @@
   "dependencies": {
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/chain-adapter-base": "workspace:*",
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

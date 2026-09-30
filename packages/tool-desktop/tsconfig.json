@@ -18,6 +18,9 @@
       "path": "../tool-proc"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

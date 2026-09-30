@@ -10,6 +10,8 @@
  * sum to the total, exactly, whatever the weights.
  */
 
+import { big, toNumber } from "./exact";
+
 /**
  * Split `totalMinor` across `weights` so the parts sum to it exactly.
  *
@@ -20,36 +22,50 @@
  */
 export function allocateProportional(totalMinor: number, weights: ReadonlyArray<number>): number[] {
   if (!Number.isInteger(totalMinor)) throw new Error("totalMinor must be an integer");
-  if (weights.length === 0) return [];
   if (weights.some((w) => w < 0)) throw new Error("weights must not be negative");
+  return allocateExact(
+    big(totalMinor, "totalMinor"),
+    weights.map((w, i) => big(w, `weight ${i}`)),
+  ).map((part, i) => toNumber(part, `share ${i}`));
+}
 
-  const sum = weights.reduce((a, b) => a + b, 0);
-  const negative = totalMinor < 0;
-  const magnitude = Math.abs(totalMinor);
+/**
+ * {@link allocateProportional} in exact integers. Each share's exact value is
+ * a quotient and a remainder over the weights' sum, so the largest remainders
+ * are compared exactly: a double's `magnitude × weight` passes 2^53 on an
+ * ordinary invoice's cents times its lines' values.
+ */
+export function allocateExact(total: bigint, weights: ReadonlyArray<bigint>): bigint[] {
+  if (weights.length === 0) return [];
+  if (weights.some((w) => w < 0n)) throw new Error("weights must not be negative");
 
-  if (sum === 0) {
+  const sum = weights.reduce((a, b) => a + b, 0n);
+  const negative = total < 0n;
+  const magnitude = negative ? -total : total;
+  const count = BigInt(weights.length);
+
+  if (sum === 0n) {
     // Nothing to weigh by. Spread evenly rather than returning zeros, which
     // would drop the amount entirely.
-    const base = Math.floor(magnitude / weights.length);
-    const parts = weights.map(() => base);
-    let leftover = magnitude - base * weights.length;
-    for (let i = 0; leftover > 0; i = (i + 1) % weights.length, leftover--) {
-      parts[i] = (parts[i] as number) + 1;
-    }
+    const base = magnitude / count;
+    const leftover = magnitude - base * count;
+    const parts = weights.map((_, i) => (BigInt(i) < leftover ? base + 1n : base));
     return negative ? parts.map((p) => -p) : parts;
   }
 
-  const exact = weights.map((w) => (magnitude * w) / sum);
-  const parts = exact.map((value) => Math.floor(value));
-  let leftover = magnitude - parts.reduce((a, b) => a + b, 0);
+  const parts = weights.map((w) => (magnitude * w) / sum);
+  const leftover = magnitude - parts.reduce((a, b) => a + b, 0n);
 
-  const order = exact
-    .map((value, index) => ({ index, remainder: value - Math.floor(value) }))
-    .sort((a, b) => b.remainder - a.remainder || a.index - b.index);
-
-  for (let i = 0; leftover > 0; i++, leftover--) {
-    const target = order[i % order.length]?.index as number;
-    parts[target] = (parts[target] as number) + 1;
+  // The leftover is smaller than the number of shares, so it goes one unit
+  // each to the largest remainders, ties broken by position.
+  const order = weights
+    .map((w, index) => ({ index, remainder: (magnitude * w) % sum }))
+    .sort((a, b) =>
+      a.remainder === b.remainder ? a.index - b.index : a.remainder > b.remainder ? -1 : 1,
+    );
+  for (let i = 0n; i < leftover; i++) {
+    const target = order[Number(i) % order.length]?.index as number;
+    parts[target] = (parts[target] as bigint) + 1n;
   }
   return negative ? parts.map((p) => -p) : parts;
 }
@@ -127,31 +143,49 @@ export function computeRefund(
     }
   }
 
+  // Exact throughout (see ./exact): a line's value is quantity × price, and
+  // the allocations multiply amounts by values again.
+  const unitPrice = (l: OrderLine): bigint =>
+    big(l.unitPriceMinor, `line "${l.id}" unitPriceMinor`);
+  const lineGross = (l: OrderLine): bigint =>
+    big(l.quantity, `line "${l.id}" quantity`) * unitPrice(l);
+
   // The order discount is spread over ALL lines by their net value, then the
   // returned fraction of each line's share comes back. Spreading it over the
   // returned lines only would refund the whole discount on a partial return.
-  const lineNet = lines.map((l) => l.quantity * l.unitPriceMinor - (l.discountMinor ?? 0));
-  const orderDiscountShares = allocateProportional(options.orderDiscountMinor ?? 0, lineNet);
-  const shareByLine = new Map(lines.map((l, i) => [l.id, orderDiscountShares[i] as number]));
+  const lineNet = lines.map(
+    (l) => lineGross(l) - big(l.discountMinor ?? 0, `line "${l.id}" discountMinor`),
+  );
+  if (lineNet.some((net) => net < 0n)) throw new Error("weights must not be negative");
+  const orderDiscountShares = allocateExact(
+    big(options.orderDiscountMinor ?? 0, "orderDiscountMinor"),
+    lineNet,
+  );
+  const shareByLine = new Map(lines.map((l, i) => [l.id, orderDiscountShares[i] as bigint]));
 
   const results: RefundLineResult[] = [];
+  let subtotal = 0n;
+  let taxTotal = 0n;
   for (const item of returned) {
     const line = index.get(item.lineId) as OrderLine;
-    const fraction = [item.quantity, line.quantity] as const;
-    const gross = line.unitPriceMinor * item.quantity;
+    const fraction = [BigInt(item.quantity), BigInt(line.quantity)] as const;
+    const gross = unitPrice(line) * BigInt(item.quantity);
 
-    const lineDiscount = splitByQuantity(line.discountMinor ?? 0, fraction);
-    const orderDiscount = splitByQuantity(shareByLine.get(line.id) ?? 0, fraction);
-    const tax = splitByQuantity(line.taxMinor ?? 0, fraction);
+    const lineDiscount = splitByQuantity(big(line.discountMinor ?? 0, "discountMinor"), fraction);
+    const orderDiscount = splitByQuantity(shareByLine.get(line.id) ?? 0n, fraction);
+    const tax = splitByQuantity(big(line.taxMinor ?? 0, "taxMinor"), fraction);
+    subtotal += gross - lineDiscount - orderDiscount;
+    taxTotal += tax;
 
+    const what = `returned line "${line.id}"`;
     results.push({
       lineId: line.id,
       quantity: item.quantity,
-      grossMinor: gross,
-      lineDiscountMinor: lineDiscount,
-      orderDiscountMinor: orderDiscount,
-      taxMinor: tax,
-      refundMinor: gross - lineDiscount - orderDiscount + tax,
+      grossMinor: toNumber(gross, `${what} gross`),
+      lineDiscountMinor: toNumber(lineDiscount, `${what} line discount`),
+      orderDiscountMinor: toNumber(orderDiscount, `${what} order discount`),
+      taxMinor: toNumber(tax, `${what} tax`),
+      refundMinor: toNumber(gross - lineDiscount - orderDiscount + tax, `${what} refund`),
     });
   }
 
@@ -159,41 +193,36 @@ export function computeRefund(
     (l) => (returned.find((r) => r.lineId === l.id)?.quantity ?? 0) === l.quantity,
   );
   const policy = options.shippingPolicy ?? "none";
-  const shippingTotal = options.shippingMinor ?? 0;
-  let shippingMinor = 0;
+  const shippingTotal = big(options.shippingMinor ?? 0, "shippingMinor");
+  let shipping = 0n;
   if (policy === "full" || (policy === "proportional" && fullReturn)) {
-    shippingMinor = shippingTotal;
+    shipping = shippingTotal;
   } else if (policy === "proportional") {
     // Spread the shipping over EVERY line by its value, then take only the
     // returned fraction of each share. Allocating across the returned lines
     // and summing the parts gives back the whole amount every time — an
     // allocation's parts always sum to what was allocated — so a one-item
     // return refunded the entire shipping charge.
-    const shares = allocateProportional(
-      shippingTotal,
-      lines.map((l) => l.quantity * l.unitPriceMinor),
-    );
-    shippingMinor = lines.reduce((total, line, i) => {
+    const shares = allocateExact(shippingTotal, lines.map(lineGross));
+    lines.forEach((line, i) => {
       const returnedQuantity = returned.find((r) => r.lineId === line.id)?.quantity ?? 0;
-      if (returnedQuantity === 0) return total;
-      return total + splitByQuantity(shares[i] as number, [returnedQuantity, line.quantity]);
-    }, 0);
+      if (returnedQuantity === 0) return;
+      shipping += splitByQuantity(shares[i] as bigint, [
+        BigInt(returnedQuantity),
+        BigInt(line.quantity),
+      ]);
+    });
   }
 
-  const subtotalMinor = results.reduce(
-    (s, r) => s + r.grossMinor - r.lineDiscountMinor - r.orderDiscountMinor,
-    0,
-  );
-  const taxMinor = results.reduce((s, r) => s + r.taxMinor, 0);
-  const restockingFeeMinor = options.restockingFeeMinor ?? 0;
+  const restocking = big(options.restockingFeeMinor ?? 0, "restockingFeeMinor");
 
   return {
     lines: results,
-    shippingMinor,
-    restockingFeeMinor,
-    subtotalMinor,
-    taxMinor,
-    totalMinor: subtotalMinor + taxMinor + shippingMinor - restockingFeeMinor,
+    shippingMinor: toNumber(shipping, "the refunded shipping"),
+    restockingFeeMinor: toNumber(restocking, "the restocking fee"),
+    subtotalMinor: toNumber(subtotal, "the refund subtotal"),
+    taxMinor: toNumber(taxTotal, "the refunded tax"),
+    totalMinor: toNumber(subtotal + taxTotal + shipping - restocking, "the refund total"),
     fullReturn,
   };
 }
@@ -205,11 +234,17 @@ export function computeRefund(
  * than multiplying by a fraction and rounding — is what makes the parts of a
  * fully returned line add back up to the whole.
  */
-function splitByQuantity(
-  amountMinor: number,
-  [returned, total]: readonly [number, number],
-): number {
-  if (total <= 0 || amountMinor === 0) return 0;
-  const perUnit = allocateProportional(amountMinor, new Array(total).fill(1));
-  return perUnit.slice(0, returned).reduce((a, b) => a + b, 0);
+function splitByQuantity(amount: bigint, [returned, total]: readonly [bigint, bigint]): bigint {
+  if (total <= 0n || amount === 0n) return 0n;
+  // The per-unit allocation of `amount` over `total` equal units, summed over
+  // the first `returned` of them — in closed form. Every unit gets the same
+  // floor share and the leftover goes one unit each to the first ones (equal
+  // remainders break ties by position). 0.7.0 built that array of `total`
+  // units, so a line with a quantity in the millions allocated millions.
+  const negative = amount < 0n;
+  const magnitude = negative ? -amount : amount;
+  const base = magnitude / total;
+  const leftover = magnitude - base * total;
+  const part = returned * base + (returned < leftover ? returned : leftover);
+  return negative ? -part : part;
 }

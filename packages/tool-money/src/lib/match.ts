@@ -8,6 +8,20 @@
  * get it wrong on an invoice nobody re-reads.
  */
 
+import {
+  type Decimal,
+  addDecimal,
+  addExact,
+  atScale,
+  big,
+  compareDecimal,
+  decimalNumber,
+  decimalOf,
+  roundHalfAwayFromZero,
+  sumExact,
+  toNumber,
+} from "./exact";
+
 export type MatchLine = {
   readonly id: string;
   /** Explicit link to a PO line, when the document carries one. */
@@ -49,7 +63,11 @@ export type MatchPair = {
   readonly poQuantity: number;
   readonly receivedQuantity: number | null;
   readonly quantityDelta: number;
-  /** What the variance costs, positive when the invoice asks for more. */
+  /**
+   * What the variance costs, positive when the invoice asks for more. With a
+   * fractional quantity (kilograms, hours) the figure is rounded to whole
+   * minor units, half away from zero.
+   */
   readonly exposureMinor: number;
   readonly reasons: ReadonlyArray<string>;
 };
@@ -74,18 +92,48 @@ function normalizeDescription(text: string): string {
     .trim();
 }
 
+const abs = (v: bigint): bigint => (v < 0n ? -v : v);
+
+/**
+ * Whether `actual` is within tolerance of `expected`, decided exactly.
+ *
+ * Prices are integers whose products with a rate pass 2^53 on ordinary
+ * amounts, and quantities are decimals a double cannot hold (0.33 against
+ * 0.3 at 10% is exactly on the bound, and 0.7.0's float arithmetic put it
+ * just outside). So every figure — the two values, the rate and the absolute
+ * bound — is compared as the exact decimal it was written as.
+ */
 function withinTolerance(
-  actual: number,
-  expected: number,
+  actual: Decimal,
+  expected: Decimal,
   percentBps: number | undefined,
   absolute: number | undefined,
+  what: string,
 ): boolean {
-  const delta = Math.abs(actual - expected);
-  if (delta === 0) return true;
+  if (compareDecimal(actual, expected) === 0) return true;
   // Either bound may pass. A percentage alone is useless on a cheap line and
   // an absolute alone is useless on an expensive one.
-  const byPercent = percentBps !== undefined && Math.abs(expected) * percentBps >= delta * 10_000;
-  const byAbsolute = absolute !== undefined && delta <= absolute;
+  const scale = Math.max(actual.scale, expected.scale);
+  const delta = abs(atScale(actual, scale) - atScale(expected, scale));
+  const base = abs(atScale(expected, scale));
+  let byPercent = false;
+  if (percentBps !== undefined && !Number.isNaN(percentBps)) {
+    if (percentBps === Number.POSITIVE_INFINITY) byPercent = true;
+    else {
+      // |expected| × bps / 10 000 >= delta, on one scale: bps is b / 10^s.
+      const bps = decimalOf(percentBps, `${what} percentage tolerance`);
+      byPercent = base * bps.units >= delta * 10_000n * 10n ** BigInt(bps.scale);
+    }
+  }
+  let byAbsolute = false;
+  if (absolute !== undefined && !Number.isNaN(absolute)) {
+    if (absolute === Number.POSITIVE_INFINITY) byAbsolute = true;
+    else {
+      // delta / 10^scale <= a / 10^s.
+      const bound = decimalOf(absolute, `${what} absolute tolerance`);
+      byAbsolute = delta * 10n ** BigInt(bound.scale) <= bound.units * 10n ** BigInt(scale);
+    }
+  }
   return byPercent || byAbsolute;
 }
 
@@ -106,9 +154,13 @@ export function matchInvoiceToPurchaseOrder(
     }
   }
 
-  const received = new Map<string, number>();
+  // Receipts against one line are summed exactly: 0.1 + 0.2 received is 0.3,
+  // not a float a hair over it that an invoice for 0.3 is then "within".
+  const received = new Map<string, Decimal>();
   for (const entry of receiptLines) {
-    received.set(entry.poLineId, (received.get(entry.poLineId) ?? 0) + entry.quantity);
+    const quantity = decimalOf(entry.quantity, `receipt for "${entry.poLineId}" quantity`);
+    const before = received.get(entry.poLineId);
+    received.set(entry.poLineId, before === undefined ? quantity : addDecimal(before, quantity));
   }
 
   const remainingPo = new Map(poLines.map((l) => [l.id, l]));
@@ -139,17 +191,24 @@ export function matchInvoiceToPurchaseOrder(
     remainingPo.delete(po.id);
 
     const reasons: string[] = [];
+    const line = `invoice line "${invoice.id}"`;
+    const invoicePrice = big(invoice.unitPriceMinor, `${line} unitPriceMinor`);
+    const poPrice = big(po.unitPriceMinor, `order line "${po.id}" unitPriceMinor`);
+    const invoiceQuantity = decimalOf(invoice.quantity, `${line} quantity`);
+    const poQuantity = decimalOf(po.quantity, `order line "${po.id}" quantity`);
     const priceOk = withinTolerance(
-      invoice.unitPriceMinor,
-      po.unitPriceMinor,
+      { units: invoicePrice, scale: 0 },
+      { units: poPrice, scale: 0 },
       tolerance.pricePercentBps,
       tolerance.priceAbsoluteMinor,
+      `${line} price`,
     );
     const quantityOk = withinTolerance(
-      invoice.quantity,
-      po.quantity,
+      invoiceQuantity,
+      poQuantity,
       tolerance.quantityPercentBps,
       tolerance.quantityAbsolute,
+      `${line} quantity`,
     );
     if (!priceOk) {
       reasons.push(
@@ -160,7 +219,11 @@ export function matchInvoiceToPurchaseOrder(
       reasons.push(`quantity ${invoice.quantity} against ${po.quantity} on the order`);
     }
 
-    const receivedQuantity = received.has(po.id) ? (received.get(po.id) as number) : null;
+    const receivedExact = received.get(po.id);
+    const receivedQuantity =
+      receivedExact === undefined
+        ? null
+        : decimalNumber(receivedExact, `the quantity received against order line "${po.id}"`);
     let status: MatchStatus =
       !priceOk && !quantityOk
         ? "both-variance"
@@ -174,19 +237,37 @@ export function matchInvoiceToPurchaseOrder(
     // failure this control exists to catch, and it is invisible in a two-way
     // match however well price and quantity agree with the order.
     if (receiptLines.length > 0) {
-      if (receivedQuantity === null || receivedQuantity === 0) {
+      if (receivedExact === undefined || receivedExact.units === 0n) {
         status = "not-received";
         reasons.push("nothing has been received against this order line");
-      } else if (invoice.quantity > receivedQuantity) {
+      } else if (compareDecimal(invoiceQuantity, receivedExact) > 0) {
         status = "over-receipt";
         reasons.push(`invoiced ${invoice.quantity} but only ${receivedQuantity} received`);
       }
     }
 
-    const billable = Math.min(invoice.quantity, receivedQuantity ?? invoice.quantity);
+    // What the variance costs: the invoice's quantity at its price, less what
+    // was billable (no more than arrived) at the lower of the two prices.
+    // Counted exactly — decimal quantities times integer prices, as bigints
+    // on one decimal scale — then rounded to whole minor units, a half away
+    // from zero, and refused past 2^53 rather than reported units off.
+    const billable =
+      receivedExact !== undefined && compareDecimal(receivedExact, invoiceQuantity) < 0
+        ? receivedExact
+        : invoiceQuantity;
+    const scale = Math.max(invoiceQuantity.scale, billable.scale);
+    const lowerPrice = invoicePrice < poPrice ? invoicePrice : poPrice;
     const exposureMinor =
-      invoice.quantity * invoice.unitPriceMinor -
-      billable * Math.min(invoice.unitPriceMinor, po.unitPriceMinor);
+      status === "matched"
+        ? 0
+        : toNumber(
+            roundHalfAwayFromZero(
+              atScale(invoiceQuantity, scale) * invoicePrice -
+                atScale(billable, scale) * lowerPrice,
+              10n ** BigInt(scale),
+            ),
+            `${line} exposure`,
+          );
 
     pairs.push({
       invoiceLineId: invoice.id,
@@ -195,12 +276,15 @@ export function matchInvoiceToPurchaseOrder(
       status,
       invoiceUnitPriceMinor: invoice.unitPriceMinor,
       poUnitPriceMinor: po.unitPriceMinor,
-      priceDeltaMinor: invoice.unitPriceMinor - po.unitPriceMinor,
+      priceDeltaMinor: addExact(invoice.unitPriceMinor, -po.unitPriceMinor, `${line} price delta`),
       invoiceQuantity: invoice.quantity,
       poQuantity: po.quantity,
       receivedQuantity,
-      quantityDelta: invoice.quantity - po.quantity,
-      exposureMinor: status === "matched" ? 0 : exposureMinor,
+      quantityDelta: decimalNumber(
+        addDecimal(invoiceQuantity, poQuantity, -1n),
+        `${line} quantity delta`,
+      ),
+      exposureMinor,
       reasons,
     });
   }
@@ -212,7 +296,10 @@ export function matchInvoiceToPurchaseOrder(
     unmatchedPoLines: [...remainingPo.keys()],
     ok: exceptions === 0 && unmatchedInvoiceLines.length === 0,
     exceptions,
-    totalExposureMinor: pairs.reduce((s, p) => s + p.exposureMinor, 0),
+    totalExposureMinor: sumExact(
+      pairs.map((p) => p.exposureMinor),
+      "the total exposure",
+    ),
     threeWay: receiptLines.length > 0,
   };
 }

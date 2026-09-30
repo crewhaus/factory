@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bundleFreshnessItem, compareBundleFreshnessByMtime } from "./bundle";
@@ -47,6 +47,103 @@ describe("compareBundleFreshnessByMtime", () => {
     touch(join(dir, "dist", "old.ts"), 1_000_000_000);
     touch(join(dir, "dist", "new.ts"), 3_000_000_000);
     expect(compareBundleFreshnessByMtime(dir).state).toBe("fresh");
+  });
+});
+
+/**
+ * A permission bit cannot stop root, and Windows has no mode bits: on either
+ * the chmod below would not make anything unreadable, and the test would be
+ * asserting nothing.
+ */
+const canRevoke = process.platform !== "win32" && process.getuid?.() !== 0;
+
+/** Run `body` with `path` at `mode`, restoring 0o755 so the tree can be removed. */
+function withMode(path: string, mode: number, body: () => void): void {
+  chmodSync(path, mode);
+  try {
+    body();
+  } finally {
+    chmodSync(path, 0o755);
+  }
+}
+
+describe("an answer that could not be determined is not a verdict (flag-truth-3#10)", () => {
+  function compiled(): string {
+    const dir = makeHarness();
+    writeFileSync(join(dir, "crewhaus.yaml"), "name: t\n");
+    mkdirSync(join(dir, "dist", "sub"), { recursive: true });
+    writeFileSync(join(dir, "dist", "index.js"), "// compiled\n");
+    writeFileSync(join(dir, "dist", "sub", "agent.js"), "// compiled\n");
+    return dir;
+  }
+
+  test.skipIf(!canRevoke)("a dist/ that cannot be listed is unreadable, not missing", () => {
+    const dir = compiled();
+    try {
+      withMode(join(dir, "dist"), 0o000, () => {
+        const r = compareBundleFreshnessByMtime(dir);
+        // On 0.7.0: "missing-bundle", with a recompile as the remedy.
+        expect(r.state).toBe("unreadable");
+        expect(r.reason).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(r.specMtimeMs).toBeGreaterThan(0);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(!canRevoke)("a subdirectory that cannot be listed is unreadable, not fresh", () => {
+    // The unreadable subdirectory could hold the one file newer than the
+    // spec: skipping it, as 0.7.0 did, turns "stale" into "fresh".
+    const dir = compiled();
+    try {
+      utimesSync(join(dir, "crewhaus.yaml"), 1_000_000_000, 1_000_000_000);
+      withMode(join(dir, "dist", "sub"), 0o000, () => {
+        const r = compareBundleFreshnessByMtime(dir);
+        expect(r.state).toBe("unreadable");
+        expect(r.reason).toMatch(/^(EACCES|EPERM) listing dist\/sub\/$/);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(!canRevoke)("a spec that cannot be examined is unreadable, not missing-spec", () => {
+    const dir = compiled();
+    try {
+      // Read without search: the directory lists, but nothing in it can be
+      // statted.
+      withMode(dir, 0o600, () => {
+        const r = compareBundleFreshnessByMtime(dir);
+        expect(r.state).toBe("unreadable");
+        expect(r.reason).toMatch(/^(EACCES|EPERM) examining crewhaus\.yaml$/);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("absent and empty dist/ are still missing-bundle; dist/ as a file too", () => {
+    const dir = makeHarness();
+    try {
+      writeFileSync(join(dir, "crewhaus.yaml"), "name: t\n");
+      expect(compareBundleFreshnessByMtime(dir).state).toBe("missing-bundle");
+      mkdirSync(join(dir, "dist"));
+      expect(compareBundleFreshnessByMtime(dir).state).toBe("missing-bundle");
+      rmSync(join(dir, "dist"), { recursive: true });
+      writeFileSync(join(dir, "dist"), "");
+      expect(compareBundleFreshnessByMtime(dir).state).toBe("missing-bundle");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the report item says unknown and does not prescribe a recompile", () => {
+    const item = bundleFreshnessItem({ state: "unreadable", reason: "EACCES listing dist/" });
+    expect(item?.id).toBe("bundle.unreadable");
+    expect(item?.level).toBe("warn");
+    expect(item?.message).toContain("EACCES listing dist/");
+    expect(item?.remediation).not.toContain("compile");
   });
 });
 

@@ -326,18 +326,20 @@ test("CliVersionPin says when the cap stopped it, so the roll-up is not read as 
   expect(small["truncated"]).toBe(false);
 }, 120_000);
 
-test("the two readOnly tools leave the machine registry's bytes alone", async () => {
+test("the two reporting tools leave the machine registry's bytes alone", async () => {
   // `list()` PERSISTS a `missingSince` stamp for a row whose directory has
-  // vanished. That is right for the manager and wrong for a tool that
-  // declares `readOnly: true`: reporting the fleet would edit a machine-wide
-  // file. The library's own `CREWHAUS_NO_REGISTRY` switch is what keeps the
-  // computed view identical while the write becomes a no-op.
+  // vanished. That is right for the manager and wrong for a tool that only
+  // reports: reporting the fleet would edit a machine-wide file. The
+  // library's own `CREWHAUS_NO_REGISTRY` switch is what keeps the computed
+  // view identical while the write becomes a no-op. (CliVersionPin is not
+  // `readOnly` since 0.7.1 — it can run a harness's own CLI binary — but it
+  // is still not destructive, and writes nothing.)
   write("here/crewhaus.yaml", SPEC);
   const before = writeRegistry([
     row(1, path.join(tmp, "here")),
     row(2, path.join(tmp, "vanished")), // no such directory: a stamp is due
   ]);
-  expect(cliVersionPin.readOnly).toBe(true);
+  expect(cliVersionPin.destructive).toBe(false);
 
   const versions = await call(cliVersionPin, {});
   expect(versions["status"]).toBe("ok");

@@ -25,9 +25,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import {
-  type Dirent,
   closeSync,
-  copyFileSync,
   existsSync,
   constants as fsConstants,
   fstatSync,
@@ -40,7 +38,6 @@ import {
   realpathSync,
   renameSync,
   rmSync,
-  symlinkSync,
   unlinkSync,
   utimesSync,
   writeSync,
@@ -48,6 +45,18 @@ import {
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type CopyResult,
+  RELOCATE_DEFAULTS,
+  type SafeFsFailure,
+  beginAtomicWrite,
+  checkRelocatedLinks,
+  copyTreeSafe,
+  ensureDirContained,
+  resolveContained,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
+import { openRegularFile } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import {
   type ArchiveEntry,
@@ -56,6 +65,7 @@ import {
   detectArchiveFormat,
   readArchiveEntries,
 } from "./lib/archive-format";
+import { type UnsafeLink, memberComponents, unsafeArchiveLinks } from "./lib/archive-links";
 import {
   type TreeNode,
   formatBytes,
@@ -66,6 +76,7 @@ import {
   renderTree,
 } from "./lib/format";
 import {
+  FRONTMATTER_KEY,
   type FrontmatterData,
   FrontmatterError,
   type FrontmatterValue,
@@ -74,7 +85,7 @@ import {
   serializeFrontmatter,
   splitFrontmatter,
 } from "./lib/frontmatter";
-import { matchGlob } from "./lib/glob";
+import { compileGlob } from "./lib/glob";
 import {
   NotebookError,
   applyNotebookEdit,
@@ -97,6 +108,7 @@ import {
   describeFailure,
   runProcess,
 } from "./proc";
+import { scanStagedTree, watchTreeSize } from "./staging";
 import { type WalkNode, type WalkOptions, compareStrings, rollUpSizes, walkTree } from "./walk";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -114,18 +126,34 @@ const CHUNK_BYTES = 256 * 1024;
 // ---------------------------------------------------------------------------
 
 /**
- * Open a validated path with `O_NOFOLLOW`. `resolveSafe` already proved the
- * path is inside the workspace, but the leaf could be swapped for a symlink
- * afterwards (CWE-367); refusing to follow it at open closes that window.
+ * Open a validated regular file for reading, never following a link at the
+ * leaf. `resolveSafe` already proved the path is inside the workspace, but
+ * the leaf could be swapped afterwards (CWE-367), so the open itself refuses
+ * a link (`O_NOFOLLOW`). It also refuses a FIFO, socket or device BEFORE
+ * opening it, and opens with `O_NONBLOCK`: a plain open of a FIFO blocks the
+ * event loop until a writer appears, and no timeout or abort signal reaches
+ * a blocked open (C074). tool-safety's openRegularFile makes both checks and
+ * compares the descriptor with what was checked. The caller closes the fd.
  */
-function openNoFollow(toolName: string, abs: string): number {
-  try {
-    return openSync(abs, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
-      throw new ToolPermissionError(toolName, abs);
-    }
-    throw err;
+function openNoFollow(toolName: string, target: { real: string; rel: string }): number {
+  const opened = openRegularFile(target.real, { followSymlinks: false });
+  if (opened.ok) return opened.fd;
+  const shown = target.rel === "" ? "." : target.rel;
+  switch (opened.code) {
+    case "symlink-refused":
+      throw new ToolPermissionError(toolName, shown);
+    case "not-regular-file":
+      throw new Error(
+        `${shown} is a ${opened.kind ?? "special file"}, not a regular file; it was not opened`,
+      );
+    case "changed-while-opening":
+      throw new Error(`${shown} was replaced while it was being opened; it was not read`);
+    case "not-found":
+      throw new Error(`no such file: ${shown}`);
+    case "permission-denied":
+      throw new Error(`${shown} cannot be read: permission denied`);
+    default:
+      throw new Error(`${shown} could not be read`);
   }
 }
 
@@ -145,11 +173,11 @@ function streamFile(fd: number, onChunk: (chunk: Buffer, length: number) => void
 /** Hash a file without loading it: fixed-size chunks into the digest. */
 function hashFile(
   toolName: string,
-  abs: string,
+  target: SafePath,
   algorithm: string,
 ): { hex: string; bytes: number } {
   const hasher = createHash(algorithm);
-  const fd = openNoFollow(toolName, abs);
+  const fd = openNoFollow(toolName, target);
   try {
     const bytes = streamFile(fd, (chunk, length) => {
       hasher.update(chunk.subarray(0, length));
@@ -161,13 +189,13 @@ function hashFile(
 }
 
 /** Read a whole file, refusing anything over `limit`. */
-function readWholeFile(toolName: string, abs: string, limit: number): Buffer {
-  const fd = openNoFollow(toolName, abs);
+function readWholeFile(toolName: string, target: SafePath, limit: number): Buffer {
+  const fd = openNoFollow(toolName, target);
   try {
     const { size } = fstatSync(fd);
     if (size > limit) {
       throw new Error(
-        `"${abs}" is ${formatBytes(size)}, over this tool's ${formatBytes(limit)} limit`,
+        `"${target.rel}" is ${formatBytes(size)}, over this tool's ${formatBytes(limit)} limit`,
       );
     }
     const buffer = Buffer.allocUnsafe(size);
@@ -183,30 +211,26 @@ function readWholeFile(toolName: string, abs: string, limit: number): Buffer {
   }
 }
 
-/** Replace a file's contents atomically: write a sibling, then rename over it. */
-function writeAtomic(abs: string, contents: string | Uint8Array): void {
-  const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-  try {
-    const fd = openSync(tmp, "w", 0o600);
-    try {
-      const bytes =
-        typeof contents === "string" ? Buffer.from(contents, "utf8") : Buffer.from(contents);
-      let written = 0;
-      while (written < bytes.length) {
-        written += writeSync(fd, bytes, written, bytes.length - written);
-      }
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, abs);
-  } catch (err) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw err;
-  }
+/**
+ * Replace (or create) a workspace file's contents through tool-safety's
+ * writeFileSafe: a temp created with O_EXCL|O_NOFOLLOW under a random name
+ * beside it, 0600 until complete, then renamed into place. An existing
+ * file keeps its permission bits. The copy that lived here always left the
+ * file at 0600, so FrontmatterWrite and NotebookEdit made a 0644 document
+ * private and a 0755 file lose its execute bit (C213). Missing parents are
+ * created one at a time, never through a link. Returns the refusal reason,
+ * or undefined when the bytes are in place.
+ */
+function writeAtomic(
+  target: SafePath,
+  contents: string,
+  options: { createParents: boolean },
+): string | undefined {
+  const written = writeFileSafe(workspaceRoot(), relArg(target), contents, {
+    overwrite: true,
+    createParents: options.createParents,
+  });
+  return written.ok ? undefined : written.reason;
 }
 
 type Existing = { kind: "file" | "dir" | "symlink" | "other"; size: number; mtimeMs: number };
@@ -326,7 +350,7 @@ export const stat: RegisteredTool = buildTool({
         base["sha256"] = null;
         base["sha256Note"] = "skipped: file is over 256 MiB — call FileHash explicitly to hash it";
       } else {
-        base["sha256"] = hashFile("Stat", target.real, "sha256").hex;
+        base["sha256"] = hashFile("Stat", target, "sha256").hex;
       }
     }
     return json(base);
@@ -349,7 +373,7 @@ export const fileHash: RegisteredTool = buildTool({
     if (info === undefined) return `no such file: ${target.rel}`;
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     const algorithm = input.algorithm ?? "sha256";
-    const result = hashFile("FileHash", target.real, algorithm);
+    const result = hashFile("FileHash", target, algorithm);
     return json({ path: target.rel, algorithm, hash: result.hex, bytes: result.bytes });
   },
 });
@@ -551,12 +575,12 @@ export const findFiles: RegisteredTool = buildTool({
 
     const wantType = input.type ?? "file";
     const namePattern = input.name;
+    // Compiled once for the whole walk, not once per entry.
+    const nameTest = namePattern === undefined ? undefined : compileGlob(namePattern);
+    const byPath = namePattern?.includes("/") === true;
     const matches = result.entries.filter((entry) => {
       if (wantType !== "any" && entry.kind !== wantType) return false;
-      if (namePattern !== undefined) {
-        const subject = namePattern.includes("/") ? entry.rel : entry.name;
-        if (!matchGlob(namePattern, subject)) return false;
-      }
+      if (nameTest !== undefined && !nameTest(byPath ? entry.rel : entry.name)) return false;
       if (input.minSize !== undefined && entry.size < input.minSize) return false;
       if (input.maxSize !== undefined && entry.size > input.maxSize) return false;
       if (after !== undefined && entry.mtimeMs < after) return false;
@@ -583,10 +607,32 @@ export const findFiles: RegisteredTool = buildTool({
 // reading part of a file
 // ---------------------------------------------------------------------------
 
+/** Characters of line text ReadLines returns by default, across all the lines. */
+export const READ_LINES_DEFAULT_MAX_CHARS = 256 * 1024;
+/** The most a caller may raise that budget to. */
+export const READ_LINES_MAX_CHARS = 4 * 1024 * 1024;
+/**
+ * How far past a cut ReadLines keeps reading to measure the cut line's full
+ * length. Only reading, never storing; past this the length is a lower bound.
+ */
+const READ_LINES_MEASURE_BYTES = 64 * 1024 * 1024;
+
+type CutLine = { line: number; chars: number } | { line: number; charsAtLeast: number };
+
+/**
+ * The first `take` UTF-16 units of `text`, never ending inside a surrogate
+ * pair, so a cut line is still valid text.
+ */
+function cutAt(text: string, take: number): string {
+  if (take <= 0) return "";
+  const last = text.charCodeAt(take - 1);
+  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, take - 1) : text.slice(0, take);
+}
+
 export const readLines: RegisteredTool = buildTool({
   name: "ReadLines",
   description:
-    "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context.",
+    "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context. The lines returned share a character budget (maxChars, default 262144): a line that would pass it is cut and reported with its full length, and the range stops there.",
   inputSchema: z.object({
     path: z.string().min(1),
     start: z.number().int().min(1).optional().describe("first line, 1-based (default 1)"),
@@ -598,6 +644,15 @@ export const readLines: RegisteredTool = buildTool({
       .max(20_000)
       .optional()
       .describe("cap on lines returned (default 500)"),
+    maxChars: z
+      .number()
+      .int()
+      .min(1024)
+      .max(READ_LINES_MAX_CHARS)
+      .optional()
+      .describe(
+        `budget for the text of all returned lines (default ${READ_LINES_DEFAULT_MAX_CHARS})`,
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -612,41 +667,127 @@ export const readLines: RegisteredTool = buildTool({
     const end = Math.min(input.end ?? start + maxLines - 1, start + maxLines - 1);
     if (end < start) return `end (${end}) is before start (${start})`;
 
-    const fd = openNoFollow("ReadLines", target.real);
+    // A line was held whole until its newline, and lines before `start` were
+    // accumulated too, so `maxLines: 1` on a minified bundle or a JSON file
+    // with no newline returned (and held) the whole file (C164). Now:
+    //  - lines before `start` are counted on the raw bytes (0x0a never occurs
+    //    inside a UTF-8 sequence) and never decoded or kept;
+    //  - the returned text shares one character budget; the line that would
+    //    pass it is cut on a code-point boundary, its full length measured by
+    //    reading on without storing (up to READ_LINES_MEASURE_BYTES), and the
+    //    range stops after it.
+    const budget = input.maxChars ?? READ_LINES_DEFAULT_MAX_CHARS;
+    let budgetLeft = budget;
+    const fd = openNoFollow("ReadLines", target);
     const lines: string[] = [];
-    let lineNo = 0;
-    let carry = "";
-    let reachedEnd = false;
+    let cutLine: CutLine | undefined;
+    let lineNo = 1; // the line the next byte belongs to
+    let current = ""; // kept text of the in-range line being read
+    let currentChars = 0; // its full length so far
+    let cut = false; // it passed the budget
+    let measured = 0; // bytes read past the cut
+    let reachedEnd = false; // the last requested line was completed
+    let stoppedAtBudget = false;
+    let endOfFile = false;
+    // ignoreBOM: the decoder is flushed at every line end, and a flushed
+    // decoder would otherwise strip U+FEFF from the start of the next line.
+    // The file's own BOM is dropped by hand below, as 0.7.0 did.
+    const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+
+    const take = (text: string): void => {
+      currentChars += text.length;
+      if (cut) return;
+      if (text.length <= budgetLeft) {
+        current += text;
+        budgetLeft -= text.length;
+        return;
+      }
+      current += cutAt(text, budgetLeft);
+      budgetLeft = 0;
+      cut = true;
+    };
+    const finishLine = (complete: boolean): void => {
+      lines.push(current);
+      if (cut) {
+        cutLine = complete
+          ? { line: lineNo, chars: currentChars }
+          : { line: lineNo, charsAtLeast: currentChars };
+      }
+      current = "";
+      currentChars = 0;
+      cut = false;
+    };
+
     try {
-      const decoder = new TextDecoder("utf-8");
       const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
       let position = 0;
-      for (;;) {
+      scan: for (;;) {
         const read = readSync(fd, buffer, 0, CHUNK_BYTES, position);
-        if (read <= 0) break;
-        position += read;
-        // `stream: true` keeps a multi-byte character split across a chunk
-        // boundary intact instead of decoding it into replacement characters.
-        carry += decoder.decode(buffer.subarray(0, read), { stream: true });
-        let cut = carry.indexOf("\n");
-        while (cut !== -1) {
-          lineNo += 1;
-          const line = carry.slice(0, cut);
-          carry = carry.slice(cut + 1);
-          if (lineNo >= start && lineNo <= end) lines.push(line);
-          if (lineNo >= end) {
-            reachedEnd = true;
-            break;
-          }
-          cut = carry.indexOf("\n");
+        if (read <= 0) {
+          endOfFile = true;
+          break;
         }
-        if (reachedEnd) break;
-      }
-      if (!reachedEnd) {
-        carry += decoder.decode();
-        if (carry !== "") {
+        const chunkStart = position;
+        position += read;
+        let at = 0;
+        while (at < read) {
+          const newline = buffer.indexOf(0x0a, at);
+          const stop = newline === -1 || newline >= read ? read : newline;
+          if (lineNo >= start) {
+            let from = at;
+            // The file's byte-order mark is not part of line 1, as before.
+            if (
+              chunkStart + at === 0 &&
+              read >= 3 &&
+              buffer[0] === 0xef &&
+              buffer[1] === 0xbb &&
+              buffer[2] === 0xbf
+            ) {
+              from = 3;
+            }
+            if (cut) measured += stop - from;
+            take(decoder.decode(buffer.subarray(from, stop), { stream: true }));
+          }
+          if (stop === read) break; // the line goes on into the next chunk
+          // A newline ends line `lineNo`.
+          if (lineNo >= start) {
+            take(decoder.decode());
+            finishLine(true);
+            if (lineNo >= end) {
+              reachedEnd = true;
+              break scan;
+            }
+            if (budgetLeft === 0) {
+              // Out of budget with lines still wanted: stopped by the budget
+              // only if there IS another line; at the end of the file the
+              // answer is complete.
+              const more = stop + 1 < read || readSync(fd, buffer, 0, 1, chunkStart + read) > 0;
+              if (more) stoppedAtBudget = true;
+              else endOfFile = true;
+              break scan;
+            }
+          }
           lineNo += 1;
-          if (lineNo >= start && lineNo <= end) lines.push(carry);
+          at = stop + 1;
+        }
+        if (cut && measured >= READ_LINES_MEASURE_BYTES) {
+          // Stop measuring: the cut line's length is a lower bound.
+          take(decoder.decode());
+          finishLine(false);
+          stoppedAtBudget = lineNo < end;
+          reachedEnd = lineNo >= end;
+          break;
+        }
+      }
+      if (endOfFile && lineNo >= start && (currentChars > 0 || cut)) {
+        // A last line with no newline after it.
+        take(decoder.decode());
+        finishLine(true);
+      } else if (endOfFile && lineNo >= start) {
+        const rest = decoder.decode();
+        if (rest !== "") {
+          take(rest);
+          finishLine(true);
         }
       }
     } finally {
@@ -661,7 +802,17 @@ export const readLines: RegisteredTool = buildTool({
       returned: lines.length,
       // True when the file ran out before the requested end — the caller
       // knows there is nothing more to ask for.
-      endOfFile: !reachedEnd,
+      endOfFile: endOfFile && !reachedEnd,
+      // Present only when the budget cut the answer short, so an answer
+      // that fits is byte-for-byte what 0.7.0 returned.
+      ...(cutLine !== undefined || stoppedAtBudget
+        ? {
+            truncated: true,
+            maxChars: budget,
+            ...(cutLine !== undefined ? { truncatedLines: [cutLine] } : {}),
+            ...(stoppedAtBudget ? { stoppedAtBudget: true } : {}),
+          }
+        : {}),
     });
   },
 });
@@ -691,7 +842,7 @@ export const tailFile: RegisteredTool = buildTool({
 
     const wanted = input.lines ?? 50;
     const scanLimit = input.maxBytes ?? 1024 * 1024;
-    const fd = openNoFollow("TailFile", target.real);
+    const fd = openNoFollow("TailFile", target);
     let text: string;
     let scanned = 0;
     let hitStart = false;
@@ -740,6 +891,7 @@ export const tailFile: RegisteredTool = buildTool({
 
 export const makeDirectory: RegisteredTool = buildTool({
   name: "MakeDirectory",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create a directory inside the workspace, with its parents when asked. Use it before writing output rather than discovering the parent is missing when the write fails.",
   inputSchema: z.object({
@@ -765,6 +917,7 @@ export const makeDirectory: RegisteredTool = buildTool({
 
 export const touchFile: RegisteredTool = buildTool({
   name: "TouchFile",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create an empty file if it is missing, and set its timestamps when you supply one. Use it to make a marker or placeholder file; with no `mtime` an existing file is left exactly as it is, because bumping it from the clock would make this call's result differ every run.",
   inputSchema: z.object({
@@ -816,6 +969,7 @@ const TEMP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export const tempDir: RegisteredTool = buildTool({
   name: "TempDir",
+  operativeArgs: [{ field: "base", kind: "path", default: ".tmp" }],
   description:
     "Create a scratch directory inside the workspace under a name you choose, and report its path. Use it as somewhere to stage intermediate files; the name comes from you rather than a random suffix so the same call twice gives the same directory instead of littering.",
   inputSchema: z.object({
@@ -857,97 +1011,33 @@ export const tempDir: RegisteredTool = buildTool({
 // moving bytes about
 // ---------------------------------------------------------------------------
 
-type PlanEntry = {
-  readonly rel: string;
-  readonly kind: WalkNode["kind"];
-  readonly size: number;
-  readonly sourceAbs: string;
-  readonly destAbs: string;
-};
-
-type CopyPlan = {
-  readonly entries: PlanEntry[];
-  readonly bytes: number;
-  readonly truncated: boolean;
-  /** Destination paths that already exist and would be replaced. */
-  readonly conflicts: string[];
-};
-
-/**
- * Enumerate exactly what a copy or move would touch, before touching any of
- * it. Having the plan first is what makes `dryRun` truthful and what lets an
- * overwrite conflict be refused before half the tree has been written.
- */
-function buildPlan(source: SafePath, destination: SafePath, maxEntries: number): CopyPlan | string {
-  const info = peek(source.abs);
-  if (info === undefined) return `no such path: ${source.rel}`;
-  const entries: PlanEntry[] = [];
-  let bytes = 0;
-  let truncated = false;
-
-  if (info.kind === "dir") {
-    const walked = walkTree(source.real, exhaustiveWalk(maxEntries));
-    truncated = walked.truncated;
-    entries.push({
-      rel: "",
-      kind: "dir",
-      size: 0,
-      sourceAbs: source.abs,
-      destAbs: destination.abs,
-    });
-    for (const node of walked.entries) {
-      const destAbs = path.join(destination.abs, ...node.rel.split("/"));
-      // Belt and braces: a walked relative path can never contain `..`, but
-      // the destination is caller-supplied, so re-assert containment.
-      if (!isInside(destination.abs, destAbs)) {
-        return `refusing to write outside the destination: ${node.rel}`;
-      }
-      entries.push({
-        rel: node.rel,
-        kind: node.kind,
-        size: node.size,
-        sourceAbs: node.abs,
-        destAbs,
-      });
-      bytes += node.kind === "file" ? node.size : 0;
-    }
-  } else {
-    entries.push({
-      rel: "",
-      kind: info.kind,
-      size: info.size,
-      sourceAbs: source.abs,
-      destAbs: destination.abs,
-    });
-    bytes = info.size;
-  }
-
-  const conflicts = entries
-    .filter((entry) => entry.kind !== "dir" && peek(entry.destAbs) !== undefined)
-    .map((entry) => path.relative(workspaceRoot(), entry.destAbs))
-    .sort(compareStrings);
-  return { entries, bytes, truncated, conflicts };
+/** A workspace-relative path as `@crewhaus/tool-safety/fs` takes it: "." for the root. */
+function relArg(target: SafePath): string {
+  return target.rel === "" ? "." : target.rel;
 }
 
-function applyPlan(plan: CopyPlan): void {
-  for (const entry of plan.entries) {
-    if (entry.kind === "dir") {
-      mkdirSync(entry.destAbs, { recursive: true });
-      continue;
-    }
-    mkdirSync(path.dirname(entry.destAbs), { recursive: true });
-    const existing = peek(entry.destAbs);
-    if (existing !== undefined) {
-      rmSync(entry.destAbs, { recursive: true, force: true });
-    }
-    if (entry.kind === "symlink") {
-      // Copy the LINK, not what it points at. Dereferencing here would let a
-      // link that points outside the workspace pull outside content in.
-      symlinkSync(readlinkSync(entry.sourceAbs), entry.destAbs);
-      continue;
-    }
-    copyFileSync(entry.sourceAbs, entry.destAbs);
-  }
+/**
+ * A refusal from `@crewhaus/tool-safety/fs`, answered as JSON. `reason`
+ * names the caller's path and why; it never names where an escaping path
+ * led.
+ */
+function refusal(flag: "copied" | "moved", failure: SafeFsFailure, note = ""): string {
+  return json({ [flag]: false, code: failure.code, reason: `${failure.reason}${note}` });
+}
+
+/**
+ * Links a copy or move leaves leading outside the workspace, each exactly
+ * where the original led (a virtualenv's interpreter, say), so the caller
+ * is told rather than left to find them. Empty when there are none.
+ */
+function outsideLinkFields(paths: readonly string[]): Record<string, unknown> {
+  if (paths.length === 0) return {};
+  const sorted = [...paths].sort(compareStrings);
+  return {
+    outsideLinks: sorted.slice(0, 50),
+    outsideLinkCount: sorted.length,
+    outsideLinkNote: "these symlinks lead outside the workspace, exactly where the originals do",
+  };
 }
 
 const copyMoveSchema = {
@@ -964,10 +1054,50 @@ const copyMoveSchema = {
     .describe("cap on entries touched (default 50000)"),
 };
 
+/**
+ * The copy both tools share (CopyPath, and MovePath across a filesystem
+ * boundary): `copyTreeSafe`, which plans every entry before writing one.
+ * Every destination path is checked, not only the destination root: an
+ * existing symlink anywhere under it is refused, whatever it points at, so
+ * a planted `dst/sub -> ~/.ssh` is never written through. Links in the
+ * source are copied as links only when, from their NEW place, they lead
+ * inside the workspace (`a/b/up -> ../..` copied one level up would lead
+ * out) or exactly where the original leads (an absolute link out, such as
+ * a virtualenv's interpreter: the copy reaches nothing the source did not). Files are created with `O_EXCL|O_NOFOLLOW`, and a
+ * replaced file goes through a temp and a rename. FIFOs, sockets and
+ * devices are refused, since opening one to copy it can block for ever.
+ *
+ * Every copied file gets the source's permission bits, replaced or new, as
+ * 0.7.0's `copyFileSync` gave them: a 0600 secret copied over a 0644 file
+ * stays 0600, and a script keeps its execute bits. Keeping the replaced
+ * file's bits (the helper's default, as `cp` does) made the secret readable
+ * by all (0.7.1 review). Set-id and sticky bits are not copied.
+ */
+function copyContained(
+  source: SafePath,
+  destination: SafePath,
+  options: { maxEntries: number; overwrite: boolean; dryRun: boolean },
+): CopyResult {
+  const root = workspaceRoot();
+  return copyTreeSafe(root, relArg(source), root, relArg(destination), {
+    symlinks: "copy-no-new-reach",
+    specials: "refuse",
+    fileModes: "source",
+    maxEntries: options.maxEntries,
+    overwrite: options.overwrite,
+    createParents: true,
+    dryRun: options.dryRun,
+  });
+}
+
 export const copyPath: RegisteredTool = buildTool({
   name: "CopyPath",
+  operativeArgs: [
+    { field: "source", kind: "path", beneath: "all" },
+    { field: "destination", kind: "path", beneath: "all" },
+  ],
   description:
-    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists.",
+    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when, from where the copy puts them, they point inside the workspace or exactly where the original points; an existing symlink under the destination is never written through.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -977,47 +1107,184 @@ export const copyPath: RegisteredTool = buildTool({
       return `refusing to copy ${source.rel} into itself (${destination.rel})`;
     }
     if (source.abs === destination.abs) return "source and destination are the same path";
-    const plan = buildPlan(source, destination, input.maxEntries ?? 50_000);
-    if (typeof plan === "string") return plan;
-    if (plan.truncated) {
-      return `${source.rel} has more entries than the cap allows — raise maxEntries or copy a subdirectory at a time`;
+    if (peek(source.abs) === undefined) return `no such path: ${source.rel}`;
+    const maxEntries = input.maxEntries ?? 50_000;
+    const result = copyContained(source, destination, {
+      maxEntries,
+      overwrite: input.overwrite === true,
+      dryRun: input.dryRun === true,
+    });
+    if (!result.ok) {
+      if (result.code === "exists" && result.conflicts !== undefined) {
+        const conflicts = [...result.conflicts].sort(compareStrings);
+        return json({
+          copied: false,
+          reason: "destination exists",
+          conflicts: conflicts.slice(0, 50),
+          conflictCount: conflicts.length,
+          hint: "pass overwrite: true to replace them",
+        });
+      }
+      if (result.code === "too-large") {
+        return `${source.rel} has more entries than the cap allows — raise maxEntries or copy a subdirectory at a time`;
+      }
+      return refusal("copied", result);
     }
-    if (plan.conflicts.length > 0 && input.overwrite !== true) {
-      return json({
-        copied: false,
-        reason: "destination exists",
-        conflicts: plan.conflicts.slice(0, 50),
-        conflictCount: plan.conflicts.length,
-        hint: "pass overwrite: true to replace them",
-      });
-    }
+    const replaced = [...result.replaced].sort(compareStrings);
     const summary = {
       source: source.rel,
       destination: destination.rel,
-      files: plan.entries.filter((e) => e.kind === "file").length,
-      directories: plan.entries.filter((e) => e.kind === "dir").length,
-      symlinks: plan.entries.filter((e) => e.kind === "symlink").length,
-      bytes: plan.bytes,
-      size: formatBytes(plan.bytes),
-      overwrites: plan.conflicts.length,
+      files: result.files,
+      directories: result.directories,
+      symlinks: result.symlinks,
+      bytes: result.bytes,
+      size: formatBytes(result.bytes),
+      overwrites: replaced.length,
+      ...outsideLinkFields(result.outsideLinks),
     };
-    if (input.dryRun === true) {
+    if (result.dryRun) {
       return json({
         ...summary,
         dryRun: true,
         copied: false,
-        wouldOverwrite: plan.conflicts.slice(0, 50),
+        wouldOverwrite: replaced.slice(0, 50),
       });
     }
-    applyPlan(plan);
     return json({ ...summary, dryRun: false, copied: true });
   },
 });
 
+let renameForMove: (from: string, to: string) => void = renameSync;
+
+/**
+ * Test seam: the rename MovePath tries first, so a test can make it fail
+ * with `EXDEV` and exercise the copy-then-delete fallback without a second
+ * filesystem. Pass `undefined` to restore.
+ */
+export function _setMoveRenameForTest(fn: ((from: string, to: string) => void) | undefined): void {
+  renameForMove = fn ?? renameSync;
+}
+
+/**
+ * Whether renaming `srcTop` into the directory `dstDir` (or, when that does
+ * not exist yet, its nearest existing ancestor) crosses a filesystem: the
+ * device numbers differ, which is when rename(2) answers EXDEV.
+ */
+function defaultCrossesFilesystem(srcTop: string, dstDir: string): boolean {
+  try {
+    const src = lstatSync(srcTop).dev;
+    let dir = dstDir;
+    for (;;) {
+      try {
+        return lstatSync(dir).dev !== src;
+      } catch {
+        const up = path.dirname(dir);
+        if (up === dir) return false;
+        dir = up;
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
+let crossesFilesystem: (srcTop: string, dstDir: string) => boolean = defaultCrossesFilesystem;
+
+/**
+ * Test seam: whether MovePath predicts that its rename will cross a
+ * filesystem, so a dry run can be shown to plan the copy it would fall back
+ * to. Pass `undefined` to restore.
+ */
+export function _setMoveCrossesFilesystemForTest(
+  fn: ((srcTop: string, dstDir: string) => boolean) | undefined,
+): void {
+  crossesFilesystem = fn ?? defaultCrossesFilesystem;
+}
+
+/**
+ * The name MovePath parks an existing destination under while it moves:
+ * beside it, so on its filesystem, and short, so it fits whatever the
+ * destination's own name is.
+ */
+function asideBase(): string {
+  return `.crewhaus-move-${randomBytes(6).toString("hex")}`;
+}
+
+/** An errno failure, by the caller's path, never the absolute one. */
+function errnoOf(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? "an error";
+}
+
+const MOVE_LINK_CAP_BASE = {
+  maxLinks: RELOCATE_DEFAULTS.maxLinks,
+  maxVisited: RELOCATE_DEFAULTS.maxVisited,
+};
+let moveLinkCapBase: { maxLinks: number; maxVisited: number } = MOVE_LINK_CAP_BASE;
+
+/**
+ * Test seam: the link check's base caps, so the way maxEntries raises them
+ * is exercised without a tree of 100 000 links. `undefined` restores.
+ */
+export function _setMoveLinkCapsForTest(
+  caps: { maxLinks: number; maxVisited: number } | undefined,
+): void {
+  moveLinkCapBase = caps ?? MOVE_LINK_CAP_BASE;
+}
+
+/**
+ * The caps on MovePath's link check: tool-safety's defaults (which bound a
+ * walk that reads nothing but link text), raised by the caller's maxEntries.
+ */
+function moveLinkCaps(maxEntries: number | undefined): { maxLinks: number; maxVisited: number } {
+  return {
+    maxLinks: Math.max(moveLinkCapBase.maxLinks, maxEntries ?? 0),
+    maxVisited: Math.max(moveLinkCapBase.maxVisited, (maxEntries ?? 0) * 20),
+  };
+}
+
+const MOVE_TOO_LARGE_HINT = "raise maxEntries (up to 500000), or move subdirectories one at a time";
+
+/** Whether `a` and `b` are one directory, however each is spelled. */
+function sameDirectory(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    const x = lstatSync(a);
+    const y = lstatSync(b);
+    return x.isDirectory() && y.isDirectory() && x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `a` and `b` (physical paths, leaves not followed) are ONE
+ * directory entry spelled two ways: `README.md` and `readme.md` on a
+ * filesystem that folds case (APFS and NTFS by default), or two Unicode
+ * normalisations of one name. Same inode in the same directory, and not two
+ * entries of their own there: two hard links to one file are both listed,
+ * and a move between them is an ordinary overwrite.
+ */
+function sameEntryRespelled(a: string, b: string): boolean {
+  try {
+    const x = lstatSync(a);
+    const y = lstatSync(b);
+    if (x.dev !== y.dev || x.ino !== y.ino) return false;
+    if (!sameDirectory(path.dirname(a), path.dirname(b))) return false;
+    const names = new Set(readdirSync(path.dirname(a)));
+    return !(names.has(path.basename(a)) && names.has(path.basename(b)));
+  } catch {
+    return false;
+  }
+}
+
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
+  operativeArgs: [
+    { field: "source", kind: "path", beneath: "all" },
+    { field: "destination", kind: "path", beneath: "all" },
+  ],
   description:
-    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone.",
+    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move is refused when it would leave a symlink pointing outside the workspace somewhere it did not point before.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -1029,7 +1296,38 @@ export const movePath: RegisteredTool = buildTool({
     }
     const existing = peek(source.abs);
     if (existing === undefined) return `no such path: ${source.rel}`;
-    const destExisting = peek(destination.abs);
+    const root = workspaceRoot();
+    // Where each really is: its directory resolved, its own name not
+    // followed (a link is moved as the link). The lexical checks above miss
+    // a symlinked spelling, and the one that matters here is the reverse
+    // overlap: a destination that holds the source. With overwrite, 0.7.0
+    // deleted the destination first — and the source with it, since it was
+    // inside — and then failed ENOENT (`MovePath proj/src -> proj`, or
+    // `pl/q -> p` with `pl -> p`). CopyPath refuses the same pair.
+    const srcAt = resolveContained(root, relArg(source), { followLeaf: false });
+    const dstAt = resolveContained(root, relArg(destination), { followLeaf: false });
+    if (!srcAt.ok) return refusal("moved", srcAt, "; nothing was moved");
+    if (!dstAt.ok) return refusal("moved", dstAt, "; nothing was moved");
+    const srcTop = srcAt.real;
+    const dstTop = dstAt.real;
+    if (srcTop === dstTop) return "source and destination are the same path";
+    // The workspace root holds everything; the link check below names that
+    // case ("names the workspace root") better than an overlap would.
+    if (destination.rel !== "" && isInside(dstTop, srcTop)) {
+      return json({
+        moved: false,
+        code: "overlaps-source",
+        reason: `${JSON.stringify(destination.rel)} holds ${JSON.stringify(source.rel)}: moving onto it would delete the source with it; nothing was moved`,
+      });
+    }
+    // One entry spelled two ways, such as a case-only rename (README.md ->
+    // readme.md) where the filesystem folds case, as APFS and NTFS do by
+    // default: the destination is the source, not an entry in the way. 0.7.1
+    // before this said "destination exists", and with overwrite it set the
+    // entry aside, failed ENOENT and put it back under the new spelling
+    // while reporting failure; 0.7.0 deleted it.
+    const respelled = sameEntryRespelled(srcTop, dstTop);
+    const destExisting = respelled ? undefined : peek(dstTop);
     if (destExisting !== undefined && input.overwrite !== true) {
       return json({
         moved: false,
@@ -1039,6 +1337,59 @@ export const movePath: RegisteredTool = buildTool({
         hint: "pass overwrite: true to replace it",
       });
     }
+    const maxEntries = input.maxEntries ?? 50_000;
+    const dstDir = path.dirname(dstTop);
+    const crossing = crossesFilesystem(srcTop, dstDir);
+    // A rename moves every link in the tree to a new depth, where a relative
+    // target means something else: `a/b/up -> ../..` is the workspace root
+    // where it is, and the workspace's parent once `a/b` moves one level up.
+    // Judged before anything moves, so dryRun gives the same verdict. A link
+    // that leads out exactly where it led before (an absolute link to an
+    // interpreter) is moved as 0.7.0 moved it: the move adds no reach. The
+    // walk reads only link text, so its caps are far above a copy's; the
+    // caller's maxEntries raises them for a tree with more links still
+    // (a large pnpm node_modules), where fixed caps refused a rename 0.7.0
+    // made with no way through.
+    //
+    // A rename within one directory moves nothing to a new depth: every link
+    // keeps its text and its depth, so it leads where it led. The walk is
+    // skipped there, since it blocks the thread (735 ms for a 67 000-entry
+    // node_modules renamed in place, 0.7.1 review). The one thing such a
+    // rename can change is a dangling link whose text passes through the new
+    // name; creating that name any other way (MakeDirectory, Write) changes
+    // it the same, so the walk was never what guarded it.
+    let outsideLinks: readonly string[] = [];
+    if (crossing || !(respelled || sameDirectory(path.dirname(srcTop), dstDir))) {
+      const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination), {
+        outsideLinks: "keep-unchanged",
+        ...moveLinkCaps(input.maxEntries),
+      });
+      if (!relocated.ok) {
+        const hint = relocated.code === "too-large" ? `; ${MOVE_TOO_LARGE_HINT}` : "";
+        return refusal("moved", relocated, `; nothing was moved${hint}`);
+      }
+      outsideLinks = relocated.outsideLinks;
+    }
+
+    // A rename that will cross a filesystem becomes a copy, and a copy can
+    // refuse what a rename would not (a FIFO, an unreadable file, more
+    // entries than maxEntries). Planned now, before anything is touched, so
+    // a dry run gives the verdict the real call will: 0.7.1 before this said
+    // "wouldOverwrite" and then refused mid-move. The plan is made against a
+    // name beside the destination when the destination exists, because the
+    // real copy goes into a destination the move has set aside.
+    const copyOptions = (dryRun: boolean) => ({ maxEntries, overwrite: false, dryRun });
+    if (crossing) {
+      const planTarget =
+        destExisting === undefined
+          ? destination
+          : resolveSafe(
+              "MovePath",
+              path.posix.join(path.posix.dirname(relArg(destination)), asideBase()),
+            );
+      const plan = copyContained(source, planTarget, copyOptions(true));
+      if (!plan.ok) return crossRefusal(source, plan);
+    }
     if (input.dryRun === true) {
       return json({
         source: source.rel,
@@ -1046,38 +1397,84 @@ export const movePath: RegisteredTool = buildTool({
         dryRun: true,
         moved: false,
         wouldOverwrite: destExisting !== undefined,
+        ...(crossing ? { crossesFilesystem: true } : {}),
+        ...outsideLinkFields(outsideLinks),
       });
     }
-    mkdirSync(path.dirname(destination.abs), { recursive: true });
-    if (destExisting !== undefined) rmSync(destination.abs, { recursive: true, force: true });
+    const parent = ensureDirContained(root, path.posix.dirname(relArg(destination)));
+    if (!parent.ok) return refusal("moved", parent, "; nothing was moved");
+
+    // An existing destination is set aside, not deleted, until the move has
+    // succeeded: a copy that refuses, or a rename that fails, puts it back.
+    // 0.7.0 deleted it first, so a move that then failed lost it.
+    let aside: string | undefined;
+    if (destExisting !== undefined) {
+      aside = path.join(dstDir, asideBase());
+      try {
+        renameSync(dstTop, aside);
+      } catch (err) {
+        return `could not move ${source.rel}: the existing ${destination.rel} could not be set aside (${errnoOf(err)}); nothing was moved`;
+      }
+    }
+    const putBack = (): string => {
+      if (aside === undefined) return "";
+      try {
+        renameSync(aside, dstTop);
+        return `; ${destination.rel} was left as it was`;
+      } catch (err) {
+        return `; the existing ${destination.rel} could not be put back (${errnoOf(err)}) and is at ${path.posix.join(path.posix.dirname(relArg(destination)), path.basename(aside))}`;
+      }
+    };
     try {
-      renameSync(source.abs, destination.abs);
+      renameForMove(srcTop, dstTop);
     } catch (err) {
       // A workspace can straddle mount points (a bind-mounted cache, a
       // container volume), and rename(2) cannot cross one. Fall back to
       // copy-then-delete, which is what `mv` does in the same situation.
-      if ((err as NodeJS.ErrnoException).code !== "EXDEV") {
-        return `could not move ${source.rel}: ${(err as Error).message}`;
+      if (errnoOf(err) !== "EXDEV") {
+        return `could not move ${source.rel} to ${destination.rel}: ${errnoOf(err)}${putBack()}`;
       }
-      const plan = buildPlan(source, destination, input.maxEntries ?? 50_000);
-      if (typeof plan === "string") return plan;
-      if (plan.truncated) {
-        // The copy half of copy-then-delete would be partial, and the delete
-        // half would then destroy the only complete copy. Stop before either.
-        return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — raise maxEntries, or move subdirectories one at a time`;
+      const copied = copyContained(source, destination, copyOptions(false));
+      if (!copied.ok) {
+        // Whatever the copy wrote before it failed is its own: the
+        // destination was set aside (or absent), and a copy that found
+        // something there refuses as "exists" without writing.
+        if (copied.code !== "exists" && peek(dstTop) !== undefined) {
+          rmSync(dstTop, { recursive: true, force: true });
+        }
+        const restored = putBack();
+        return crossRefusal(source, copied, restored);
       }
-      applyPlan(plan);
-      rmSync(source.abs, { recursive: true, force: true });
+      // The copy judged every link from its new place itself: its list is
+      // what this move left behind.
+      outsideLinks = copied.outsideLinks;
+      rmSync(srcTop, { recursive: true, force: true });
     }
+    if (aside !== undefined) rmSync(aside, { recursive: true, force: true });
     return json({
       source: source.rel,
       destination: destination.rel,
       dryRun: false,
       moved: true,
       overwrote: destExisting !== undefined,
+      ...outsideLinkFields(outsideLinks),
     });
   },
 });
+
+/** A copy MovePath had to fall back to (or planned) refused: nothing moved, nothing lost. */
+function crossRefusal(source: SafePath, copied: SafeFsFailure, restored = ""): string {
+  if (copied.code === "too-large") {
+    // The copy half of copy-then-delete would be partial, and the delete
+    // half would then destroy the only complete copy.
+    return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — ${MOVE_TOO_LARGE_HINT}${restored}`;
+  }
+  return refusal(
+    "moved",
+    copied,
+    `; the move has to cross a filesystem boundary, and ${source.rel} was left where it is${restored}`,
+  );
+}
 
 export const removePath: RegisteredTool = buildTool({
   name: "RemovePath",
@@ -1091,6 +1488,9 @@ export const removePath: RegisteredTool = buildTool({
     maxEntries: z.number().int().min(1).max(500_000).optional(),
   }),
   destructive: true,
+  // A `RemovePath(build/**)` rule is about `path`, resolved the way this tool
+  // resolves it: through a symlinked directory, `build/link/x` is `src/x`.
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   execute: async (input) => {
     const target = resolveSafe("RemovePath", input.path);
     if (target.abs === workspaceRoot()) return "refusing to delete the workspace root";
@@ -1152,6 +1552,10 @@ function partName(prefix: string, index: number): string {
 
 export const splitFile: RegisteredTool = buildTool({
   name: "SplitFile",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "outputDir", kind: "path", beneath: "all" },
+  ],
   description:
     "Split a file into numbered parts by byte size or by line count, streaming rather than loading it. Use it to get a file under a size limit, or to hand a huge log to something that processes one chunk at a time.",
   inputSchema: z
@@ -1191,7 +1595,7 @@ export const splitFile: RegisteredTool = buildTool({
 
     // Plan first so an existing part can be refused before anything is written.
     const planned: { name: string; bytes: number; lines?: number }[] = [];
-    const fd = openNoFollow("SplitFile", target.real);
+    const fd = openNoFollow("SplitFile", target);
     try {
       if (input.maxBytes !== undefined) {
         const size = fstatSync(fd).size;
@@ -1253,6 +1657,16 @@ export const splitFile: RegisteredTool = buildTool({
       abs: path.join(outDir.abs, part.name),
       rel: path.posix.join(outDir.rel === "" ? "." : outDir.rel, part.name),
     }));
+    // A part name that is a symlink (dangling or not), a directory or a FIFO
+    // is refused whether or not `overwrite` is set, and named as what it is:
+    // listing it as an ordinary conflict would invite `overwrite: true`,
+    // which on 0.7.0 wrote the part THROUGH the link, outside the workspace.
+    for (const part of parts) {
+      const leaf = peek(part.abs);
+      if (leaf !== undefined && leaf.kind !== "file") {
+        return `${part.rel} is a ${leaf.kind}, not a regular file; no part was written`;
+      }
+    }
     const conflicts = parts.filter((part) => peek(part.abs) !== undefined).map((part) => part.rel);
     if (conflicts.length > 0 && input.overwrite !== true) {
       return json({
@@ -1273,26 +1687,42 @@ export const splitFile: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, split: false });
 
-    mkdirSync(outDir.abs, { recursive: true });
-    const source = openNoFollow("SplitFile", target.real);
+    const root = workspaceRoot();
+    const dir = ensureDirContained(root, relArg(outDir));
+    if (!dir.ok) return json({ split: false, code: dir.code, reason: dir.reason });
+    // Each part goes through `beginAtomicWrite`: a temp made with
+    // O_CREAT|O_EXCL|O_NOFOLLOW beside the part, renamed into place. A link
+    // swapped in at a part name after the check above is replaced as a name,
+    // never written through, and a dangling one never creates its target.
+    const written: string[] = [];
+    const source = openNoFollow("SplitFile", target);
     try {
       let position = 0;
       for (const part of parts) {
-        const out = openSync(part.abs, "w");
+        const begun = beginAtomicWrite(root, part.rel, { overwrite: input.overwrite === true });
+        if (!begun.ok) {
+          return json({ split: false, code: begun.code, reason: begun.reason, written });
+        }
+        const { writer } = begun;
         try {
           let remaining = part.bytes;
           const buffer = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, Math.max(remaining, 1)));
           while (remaining > 0) {
             const read = readSync(source, buffer, 0, Math.min(buffer.length, remaining), position);
             if (read <= 0) break;
-            let written = 0;
-            while (written < read) written += writeSync(out, buffer, written, read - written);
+            writer.write(buffer.subarray(0, read));
             position += read;
             remaining -= read;
           }
-        } finally {
-          closeSync(out);
+        } catch (err) {
+          writer.abort();
+          throw err;
         }
+        const committed = writer.commit();
+        if (!committed.ok) {
+          return json({ split: false, code: committed.code, reason: committed.reason, written });
+        }
+        written.push(part.rel);
       }
     } finally {
       closeSync(source);
@@ -1303,6 +1733,10 @@ export const splitFile: RegisteredTool = buildTool({
 
 export const concatFiles: RegisteredTool = buildTool({
   name: "ConcatFiles",
+  operativeArgs: [
+    { field: "paths", kind: "path" },
+    { field: "destination", kind: "path" },
+  ],
   description:
     "Join files, in the order you give them, into one output file, streaming rather than buffering. Use it to reassemble SplitFile parts or to merge shards back into a single artifact.",
   inputSchema: z.object({
@@ -1354,29 +1788,35 @@ export const concatFiles: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, concatenated: false });
 
-    mkdirSync(path.dirname(destination.abs), { recursive: true });
+    // Through a temp beside the destination, renamed into place: a link
+    // swapped in at the destination after the check above is replaced, never
+    // written through, and a half-written join never replaces a good file.
+    const begun = beginAtomicWrite(workspaceRoot(), relArg(destination), {
+      overwrite: input.overwrite === true,
+      createParents: true,
+    });
+    if (!begun.ok) return json({ concatenated: false, code: begun.code, reason: begun.reason });
+    const { writer } = begun;
     const separatorBytes = Buffer.from(separator, "utf8");
-    const out = openSync(destination.abs, "w");
     try {
       for (const [index, source] of sources.entries()) {
-        if (index > 0 && separatorBytes.length > 0) {
-          let written = 0;
-          while (written < separatorBytes.length) {
-            written += writeSync(out, separatorBytes, written, separatorBytes.length - written);
-          }
-        }
-        const fd = openNoFollow("ConcatFiles", source.real);
+        if (index > 0 && separatorBytes.length > 0) writer.write(separatorBytes);
+        const fd = openNoFollow("ConcatFiles", source);
         try {
           streamFile(fd, (chunk, length) => {
-            let written = 0;
-            while (written < length) written += writeSync(out, chunk, written, length - written);
+            writer.write(chunk.subarray(0, length));
           });
         } finally {
           closeSync(fd);
         }
       }
-    } finally {
-      closeSync(out);
+    } catch (err) {
+      writer.abort();
+      throw err;
+    }
+    const committed = writer.commit();
+    if (!committed.ok) {
+      return json({ concatenated: false, code: committed.code, reason: committed.reason });
     }
     return json({ ...summary, dryRun: false, concatenated: true });
   },
@@ -1406,7 +1846,7 @@ function inspectArchive(
   if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not an archive file`;
   let bytes: Buffer;
   try {
-    bytes = readWholeFile(toolName, target.real, MAX_ARCHIVE_BYTES);
+    bytes = readWholeFile(toolName, target, MAX_ARCHIVE_BYTES);
   } catch (err) {
     return (err as Error).message;
   }
@@ -1422,10 +1862,32 @@ function inspectArchive(
   }
 }
 
+/** Declared bytes of an archive's regular-file members, from its own index. */
+function declaredBytes(entries: ReadonlyArray<ArchiveEntry>): number {
+  let total = 0;
+  for (const entry of entries) if (entry.kind === "file") total += entry.size;
+  return total;
+}
+
+/**
+ * `name (fifo)` for a member that would be made as a FIFO, device or
+ * socket; nothing for any other.
+ */
+function describeSpecial(entry: ArchiveEntry): string[] {
+  return entry.special === undefined ? [] : [`${entry.name} (${entry.special})`];
+}
+
+/** `name -> target (why)`, the form every link refusal takes. */
+function describeUnsafeLink(link: UnsafeLink): string {
+  return link.linkTarget === ""
+    ? `${link.name} (${link.why})`
+    : `${link.name} -> ${link.linkTarget} (${link.why})`;
+}
+
 export const archiveList: RegisteredTool = buildTool({
   name: "ArchiveList",
   description:
-    "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
+    "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path or link would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
   inputSchema: z.object({
     path: z.string().min(1),
     limit: z
@@ -1444,18 +1906,27 @@ export const archiveList: RegisteredTool = buildTool({
     if (typeof read === "string") return read;
     const sorted = [...read.entries].sort((a, b) => compareStrings(a.name, b.name));
     const unsafe = sorted.filter((entry) => archiveEntryEscapes(entry.name)).map((e) => e.name);
+    const unsafeLinks = unsafeArchiveLinks(sorted).map(describeUnsafeLink);
+    const special = sorted.flatMap(describeSpecial);
     const limit = input.limit ?? 500;
     return json({
       path: target.rel,
       format: read.format,
       count: sorted.length,
+      // Declared by the archive's index. For a zip it is a claim: ArchiveExtract
+      // measures what was really written before it accepts anything.
+      totalBytes: declaredBytes(sorted),
       truncated: sorted.length > limit,
       unsafeEntries: unsafe.slice(0, 50),
+      unsafeLinks: unsafeLinks.slice(0, 50),
+      // FIFOs, devices and sockets: ArchiveExtract refuses an archive that has any.
+      ...(special.length > 0 ? { specialEntries: special.slice(0, 50) } : {}),
       entries: sorted.slice(0, limit).map((entry) => ({
         name: entry.name,
         kind: entry.kind,
         size: entry.size,
         ...(entry.linkTarget !== undefined ? { linkTarget: entry.linkTarget } : {}),
+        ...(entry.special !== undefined ? { special: entry.special } : {}),
       })),
     });
   },
@@ -1471,6 +1942,10 @@ const timeoutField = z
 
 export const archiveCreate: RegisteredTool = buildTool({
   name: "ArchiveCreate",
+  operativeArgs: [
+    { field: "source", kind: "path", beneath: "all" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Pack a file or directory into a tar, tar.gz or zip archive, then read the result back to report what it contains. Use it to bundle build output or a working directory; the format comes from the output name unless you say otherwise.",
   inputSchema: z.object({
@@ -1525,7 +2000,11 @@ export const archiveCreate: RegisteredTool = buildTool({
       format === "zip"
         ? // -X drops the extra attribute blocks (uid/gid, resource forks), which
           // are host state rather than content; -r recurses; -q stays quiet.
-          ["zip", "-q", "-r", "-X", output.abs, "--", name]
+          // -y stores a symlink AS a link, as tar does. Without it zip follows
+          // the link: a file link packed the outside file's bytes, and a
+          // directory link (`dirlink -> ~/.ssh`) made it recurse into and
+          // pack the whole outside directory.
+          ["zip", "-q", "-r", "-X", "-y", output.abs, "--", name]
         : format === "tar.gz"
           ? ["tar", "-c", "-z", "-f", output.abs, "-C", parent, "--", name]
           : ["tar", "-c", "-f", output.abs, "-C", parent, "--", name];
@@ -1539,6 +2018,11 @@ export const archiveCreate: RegisteredTool = buildTool({
     }
     const read = inspectArchive("ArchiveCreate", resolveSafe("ArchiveCreate", output.rel));
     const size = peek(output.abs)?.size ?? 0;
+    // Links are stored as links in every format. One that leads outside the
+    // archive's own tree is harmless here, but ArchiveExtract will refuse the
+    // archive for it, so the caller hears about it now.
+    const linksLeaving =
+      typeof read === "string" ? [] : unsafeArchiveLinks(read.entries).map(describeUnsafeLink);
     return json({
       created: true,
       output: output.rel,
@@ -1547,6 +2031,13 @@ export const archiveCreate: RegisteredTool = buildTool({
       size: formatBytes(size),
       entries: typeof read === "string" ? null : read.entries.length,
       ...(typeof read === "string" ? { verifyNote: read } : {}),
+      ...(linksLeaving.length > 0
+        ? {
+            linksLeavingArchive: linksLeaving.slice(0, 50),
+            linksNote:
+              "these symlinks were stored as links; they lead outside the archived tree, so ArchiveExtract will refuse to extract this archive",
+          }
+        : {}),
     });
   },
 });
@@ -1554,83 +2045,55 @@ export const archiveCreate: RegisteredTool = buildTool({
 /** The staging directory an extraction lands in before anything is accepted. */
 const STAGING_NAME = ".crewhaus-extract";
 
-/** How many staged entries the post-extraction scan will look at. */
-const STAGING_SCAN_BUDGET = 500_000;
+/**
+ * Default cap on the bytes an extraction may write: eight times the largest
+ * archive this tool reads. tar and tar.gz are already bounded by that read
+ * (their content is parsed in memory); a zip is not, since deflate reaches
+ * about 1000:1.
+ */
+const DEFAULT_EXTRACT_BYTES = 8 * MAX_ARCHIVE_BYTES;
+/** The most a caller may raise `maxBytes` to. */
+const MAX_EXTRACT_BYTES = 16 * 1024 * 1024 * 1024;
 
-type StagingScan = {
-  /** Every symlink under the staged root whose target resolves outside it. */
-  readonly escaping: string[];
-  /**
-   * True when some part of the staged tree was NOT inspected — the budget ran
-   * out, a directory would not open, or a link would not read. The caller
-   * must treat this as a failure: "we did not look" is not "nothing is there".
-   */
-  readonly incomplete: boolean;
-};
+let extractCommandForTest:
+  | ((argv: ReadonlyArray<string>, staging: string) => string[] | undefined)
+  | undefined;
 
 /**
- * Inspect every entry of a just-extracted tree for a symlink aimed out of it.
- *
- * This deliberately does NOT use `walkTree`. That walker is built for the
- * listing tools and skips `.git` unconditionally and stops at depth 64 —
- * reasonable when the question is "what is in this project", fatal when the
- * question is "did anything hostile land here". An archive member called
- * `pkg/.git/pwn -> /etc/passwd` is invisible to it, so the link is accepted
- * and planted inside the workspace. A plain readdir walk skips nothing.
- *
- * It is iterative rather than recursive so a pathologically deep archive
- * cannot overflow the stack half-way through the check, and it never
- * descends THROUGH a symlink, so there are no cycles to terminate.
+ * Test seam: rewrite the extractor's argv, so a test can stand in for an
+ * extractor that reads the archive differently from this tool's own index
+ * (writes a name it does not list, links a file from outside) and prove the
+ * post-extraction gate catches it. Pass `undefined` to restore.
  */
-function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): StagingScan {
-  const escaping: string[] = [];
-  let incomplete = false;
-  let remaining = budget;
-  const stack: Array<{ abs: string; rel: string }> = [{ abs: root, rel: "" }];
-  while (stack.length > 0) {
-    const dir = stack.pop() as { abs: string; rel: string };
-    let dirents: Dirent[];
-    try {
-      dirents = readdirSync(dir.abs, { withFileTypes: true });
-    } catch {
-      incomplete = true;
-      continue;
-    }
-    for (const dirent of dirents) {
-      if (remaining <= 0) {
-        incomplete = true;
-        break;
-      }
-      remaining -= 1;
-      const abs = path.join(dir.abs, dirent.name);
-      const rel = dir.rel === "" ? dirent.name : `${dir.rel}/${dirent.name}`;
-      if (dirent.isSymbolicLink()) {
-        let target: string;
-        try {
-          target = readlinkSync(abs);
-        } catch {
-          incomplete = true;
-          continue;
-        }
-        if (!isInside(root, path.resolve(dir.abs, target))) escaping.push(`${rel} -> ${target}`);
-        continue;
-      }
-      if (dirent.isDirectory()) stack.push({ abs, rel });
-    }
-  }
-  return { escaping: escaping.sort(compareStrings), incomplete };
+export function _setExtractCommandForTest(
+  fn: ((argv: ReadonlyArray<string>, staging: string) => string[] | undefined) | undefined,
+): void {
+  extractCommandForTest = fn;
 }
 
 export const archiveExtract: RegisteredTool = buildTool({
   name: "ArchiveExtract",
+  operativeArgs: [
+    { field: "archive", kind: "path" },
+    { field: "destination", kind: "path", beneath: "all" },
+  ],
   description:
-    "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped.",
+    "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list, the total size and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped and no more than `maxBytes` was written.",
   inputSchema: z.object({
     archive: z.string().min(1),
     destination: z.string().min(1),
     overwrite: z.boolean().optional().describe("replace top-level entries that already exist"),
     dryRun: z.boolean().optional(),
     maxEntries: z.number().int().min(1).max(200_000).optional().describe("default 20000"),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_EXTRACT_BYTES)
+      .optional()
+      .describe(
+        `most bytes of file content the extraction may write (default ${formatBytes(DEFAULT_EXTRACT_BYTES)})`,
+      ),
     timeout: timeoutField,
   }),
   destructive: true,
@@ -1650,12 +2113,16 @@ export const archiveExtract: RegisteredTool = buildTool({
     if (entries.length > maxEntries) {
       return `${archive.rel} holds ${entries.length} members, over the ${maxEntries} cap`;
     }
+    const maxBytes = input.maxBytes ?? DEFAULT_EXTRACT_BYTES;
+    const totalBytes = declaredBytes(entries);
 
     // ZIP-SLIP GATE. Every member name is checked against the destination
     // BEFORE the extractor runs, using the archive's own index rather than a
     // printed listing. A member with a `..` segment, an absolute path or a
-    // drive prefix is refused, and so is a symlink member whose recorded
-    // target points out of the destination.
+    // drive prefix is refused, and so is a link member that leads out of the
+    // destination once extracted: resolved over the archive's own tree, one
+    // component at a time, so a chain through another link member is seen
+    // (`x -> a/b/y/../f` with `a/b/y -> ../..`).
     const refusals: string[] = [];
     for (const entry of entries) {
       if (archiveEntryEscapes(entry.name)) {
@@ -1667,7 +2134,7 @@ export const archiveExtract: RegisteredTool = buildTool({
         refusals.push(`${entry.name} (resolves outside the destination)`);
         continue;
       }
-      if ((entry.name.split("/")[0] ?? "") === STAGING_NAME) {
+      if ((memberComponents(entry.name)[0] ?? "") === STAGING_NAME) {
         // The staging directory lives at `<destination>/<STAGING_NAME>`, so a
         // member of that name would be promoted onto the directory it is
         // being promoted out of — which fails mid-loop and takes the rest of
@@ -1675,38 +2142,49 @@ export const archiveExtract: RegisteredTool = buildTool({
         refusals.push(
           `${entry.name} (collides with the staging directory this tool extracts into)`,
         );
-        continue;
-      }
-      if (entry.kind === "symlink" || entry.kind === "hardlink") {
-        if (entry.linkTarget === undefined || entry.linkTarget === "") {
-          // An unreadable target is refused rather than waved through: a
-          // link this gate cannot evaluate is precisely what a crafted
-          // archive would present to get past it.
-          refusals.push(`${entry.name} (a link whose target this archive does not state)`);
-          continue;
-        }
-        const linkTarget = path.resolve(path.dirname(landing), entry.linkTarget);
-        if (!isInside(destination.abs, linkTarget)) {
-          refusals.push(`${entry.name} -> ${entry.linkTarget} (link points outside)`);
-        }
       }
     }
-    if (refusals.length > 0) {
+    for (const link of unsafeArchiveLinks(entries)) refusals.push(describeUnsafeLink(link));
+    // A FIFO, device or socket member: tar makes a FIFO without privilege,
+    // and the next tool to open it (a table reader on `data.csv`) blocks
+    // until a writer appears. Refused here, so ArchiveList and dryRun show
+    // it, and again in the staged tree below in case an extractor makes one
+    // the index did not describe.
+    const special = entries.flatMap(describeSpecial);
+    if (refusals.length > 0 || special.length > 0) {
+      const all = [
+        ...refusals,
+        ...special.map((s) => `${s}: only files, directories and links are extracted`),
+      ];
       return json({
         extracted: false,
         reason: "unsafe archive",
         archive: archive.rel,
         detail:
-          "one or more members would be written outside the destination; nothing was extracted",
-        refused: refusals.slice(0, 50),
-        refusedCount: refusals.length,
+          refusals.length > 0
+            ? "one or more members would be written outside the destination; nothing was extracted"
+            : "one or more members are FIFOs, devices or sockets, which are never extracted; nothing was extracted",
+        refused: all.slice(0, 50),
+        refusedCount: all.length,
+      });
+    }
+    if (totalBytes > maxBytes) {
+      return json({
+        extracted: false,
+        reason: "too large",
+        archive: archive.rel,
+        totalBytes,
+        maxBytes,
+        detail: `the archive declares ${formatBytes(totalBytes)} of content, over the ${formatBytes(maxBytes)} limit; pass a larger maxBytes to extract it`,
       });
     }
 
-    const topLevel = [
-      ...new Set(entries.map((entry) => (entry.name.split("/")[0] ?? "").replace(/\/$/, ""))),
-    ]
-      .filter((name) => name !== "" && name !== ".")
+    // Top-level names from normalized components: a tar made with
+    // `tar -C dir .` names its members `./a`, and taking the text before the
+    // first `/` gave "." — no top-level names at all, so no conflicts were
+    // reported and existing entries were replaced without `overwrite`.
+    const topLevel = [...new Set(entries.map((entry) => memberComponents(entry.name)[0] ?? ""))]
+      .filter((name) => name !== "")
       .sort(compareStrings);
     const conflicts = topLevel.filter(
       (name) => peek(path.join(destination.abs, name)) !== undefined,
@@ -1717,6 +2195,7 @@ export const archiveExtract: RegisteredTool = buildTool({
       destination: destination.rel,
       format,
       members: entries.length,
+      totalBytes,
       topLevel,
     };
     if (input.dryRun === true) {
@@ -1732,7 +2211,8 @@ export const archiveExtract: RegisteredTool = buildTool({
       });
     }
 
-    mkdirSync(destination.abs, { recursive: true });
+    const made = ensureDirContained(workspaceRoot(), relArg(destination));
+    if (!made.ok) return json({ extracted: false, code: made.code, reason: made.reason });
     const staging = path.join(destination.abs, STAGING_NAME);
     if (peek(staging) !== undefined) {
       return `${path.posix.join(destination.rel === "" ? "." : destination.rel, STAGING_NAME)} already exists — remove it, it is left over from an interrupted extraction`;
@@ -1745,23 +2225,60 @@ export const archiveExtract: RegisteredTool = buildTool({
         : format === "tar.gz"
           ? ["tar", "-x", "-z", "-f", archive.abs, "-C", staging]
           : ["tar", "-x", "-f", archive.abs, "-C", staging];
-    const result = await runProcess(argv, {
-      cwd: workspaceRoot(),
-      timeoutMs: input.timeout ?? DEFAULT_PROCESS_TIMEOUT_MS,
-      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-    });
+    const command = extractCommandForTest?.(argv, staging) ?? argv;
+    // A zip's declared sizes are not what unzip writes, so the staging tree
+    // is watched while it grows and the extractor is killed once it passes
+    // the cap, rather than being left to fill the disk until its timeout.
+    const watch = watchTreeSize(staging, maxBytes);
+    const signal =
+      ctx?.signal !== undefined ? AbortSignal.any([ctx.signal, watch.signal]) : watch.signal;
+    let result: Awaited<ReturnType<typeof runProcess>>;
+    try {
+      result = await runProcess(command, {
+        cwd: workspaceRoot(),
+        timeoutMs: input.timeout ?? DEFAULT_PROCESS_TIMEOUT_MS,
+        signal,
+      });
+    } finally {
+      watch.stop();
+    }
+    const tooLarge = (written: string): string =>
+      json({
+        extracted: false,
+        reason: "too large",
+        archive: archive.rel,
+        totalBytes,
+        maxBytes,
+        detail: `${written}; the extracted tree was discarded`,
+      });
+    if (watch.exceeded()) {
+      rmSync(staging, { recursive: true, force: true });
+      return tooLarge(
+        `the extractor wrote more than ${formatBytes(maxBytes)} and was stopped (the archive declares ${formatBytes(totalBytes)})`,
+      );
+    }
     if (result.code !== 0 || result.missing) {
       rmSync(staging, { recursive: true, force: true });
       return `could not extract ${archive.rel}: ${describeFailure(argv, result)}`;
     }
 
-    // Second gate, after the extractor has had its say: a link that ended up
-    // pointing out of the staging tree means something got past the name
-    // check, so nothing is accepted. An INCOMPLETE scan is refused on the
-    // same terms — a gate that could not read part of the tree has not
-    // cleared it.
+    // Second gate, after the extractor has had its say: the staged tree is
+    // what gets promoted, so it is what is checked. A link that leads out of
+    // it, a file hard-linked from outside it, content beyond the cap or
+    // beyond what the index declared, or a top-level name the index did not
+    // list means something got past the first gate, and nothing is accepted.
+    // An INCOMPLETE scan is refused on the same terms — a gate that could not
+    // read part of the tree has not cleared it.
     const scan = scanStagedTree(staging);
-    if (scan.escaping.length > 0 || scan.incomplete) {
+    const unlisted = readdirSorted(staging).filter((name) => !topLevel.includes(name));
+    const understated = format === "zip" && scan.bytes > totalBytes;
+    if (
+      scan.escaping.length > 0 ||
+      scan.linkedOut.length > 0 ||
+      scan.special.length > 0 ||
+      scan.incomplete ||
+      unlisted.length > 0
+    ) {
       rmSync(staging, { recursive: true, force: true });
       return json({
         extracted: false,
@@ -1770,9 +2287,23 @@ export const archiveExtract: RegisteredTool = buildTool({
         detail:
           scan.escaping.length > 0
             ? "the extracted tree contains symlinks pointing outside it; it was discarded"
-            : "the extracted tree could not be fully checked for escaping symlinks; it was discarded",
-        refused: scan.escaping.slice(0, 50),
+            : scan.linkedOut.length > 0
+              ? "the extracted tree contains files hard-linked to something outside it; it was discarded"
+              : scan.special.length > 0
+                ? "the extracted tree contains FIFOs, devices or sockets, which are never extracted; it was discarded"
+                : unlisted.length > 0
+                  ? "the extractor produced top-level entries the archive's index does not list; it was discarded"
+                  : "the extracted tree could not be fully checked; it was discarded",
+        refused: [...scan.escaping, ...scan.linkedOut, ...scan.special, ...unlisted].slice(0, 50),
       });
+    }
+    if (scan.bytes > maxBytes || understated) {
+      rmSync(staging, { recursive: true, force: true });
+      return tooLarge(
+        understated
+          ? `the archive declares ${formatBytes(totalBytes)} but extracted to ${formatBytes(scan.bytes)}, so its index understates its content`
+          : `the extraction wrote ${formatBytes(scan.bytes)}, over the ${formatBytes(maxBytes)} limit`,
+      );
     }
 
     const moved: string[] = [];
@@ -1787,7 +2318,7 @@ export const archiveExtract: RegisteredTool = buildTool({
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
-    return json({ ...summary, dryRun: false, extracted: true, entries: moved });
+    return json({ ...summary, dryRun: false, extracted: true, bytes: scan.bytes, entries: moved });
   },
 });
 
@@ -1826,7 +2357,7 @@ export const frontmatterRead: RegisteredTool = buildTool({
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     let text: string;
     try {
-      text = readWholeFile("FrontmatterRead", target.real, MAX_WHOLE_FILE_BYTES).toString("utf8");
+      text = readWholeFile("FrontmatterRead", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
     } catch (err) {
       return (err as Error).message;
     }
@@ -1854,13 +2385,32 @@ export const frontmatterRead: RegisteredTool = buildTool({
 
 const frontmatterScalar = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
+/**
+ * A key FrontmatterWrite may set: one the subset can read back. A key with a
+ * space or a colon was written verbatim and left a block FrontmatterRead then
+ * refused. `__proto__` is refused by name: the input parser builds a plain
+ * object, where that key sets the prototype and silently disappears, so the
+ * call reported `written: true` without it. Removing one (`removeKeys`)
+ * still works.
+ */
+const frontmatterKey = z
+  .string()
+  .regex(
+    FRONTMATTER_KEY,
+    "a front matter key is letters, digits and _ . - (starting with a letter, digit or _)",
+  )
+  .refine((key) => key !== "__proto__", {
+    message: 'the key "__proto__" cannot be set through this tool',
+  });
+
 export const frontmatterWrite: RegisteredTool = buildTool({
   name: "FrontmatterWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description: `Set or remove keys in a markdown file's YAML front matter, leaving the body untouched. Use it to update a document's status or tags without rewriting the file by hand; existing keys keep their position and new ones are appended in sorted order. ${FRONTMATTER_SUBSET}`,
   inputSchema: z.object({
     path: z.string().min(1),
     data: z
-      .record(z.union([frontmatterScalar, z.array(frontmatterScalar).max(1000)]))
+      .record(frontmatterKey, z.union([frontmatterScalar, z.array(frontmatterScalar).max(1000)]))
       .describe("keys to set"),
     removeKeys: z.array(z.string().min(1)).max(200).optional(),
     merge: z
@@ -1879,9 +2429,7 @@ export const frontmatterWrite: RegisteredTool = buildTool({
     let text = "";
     if (info !== undefined) {
       try {
-        text = readWholeFile("FrontmatterWrite", target.real, MAX_WHOLE_FILE_BYTES).toString(
-          "utf8",
-        );
+        text = readWholeFile("FrontmatterWrite", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       } catch (err) {
         return (err as Error).message;
       }
@@ -1923,8 +2471,8 @@ export const frontmatterWrite: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, written: false });
     if (next === text) return json({ ...summary, dryRun: false, written: false });
-    mkdirSync(path.dirname(target.abs), { recursive: true });
-    writeAtomic(target.abs, next);
+    const refused = writeAtomic(target, next, { createParents: true });
+    if (refused !== undefined) return refused;
     return json({ ...summary, dryRun: false, written: true });
   },
 });
@@ -1963,9 +2511,7 @@ export const notebookRead: RegisteredTool = buildTool({
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     let notebook: ReturnType<typeof parseNotebook>;
     try {
-      const text = readWholeFile("NotebookRead", target.real, MAX_WHOLE_FILE_BYTES).toString(
-        "utf8",
-      );
+      const text = readWholeFile("NotebookRead", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       notebook = parseNotebook(text);
     } catch (err) {
       if (err instanceof NotebookError) return `${target.rel}: ${err.message}`;
@@ -2001,6 +2547,7 @@ export const notebookRead: RegisteredTool = buildTool({
 
 export const notebookEdit: RegisteredTool = buildTool({
   name: "NotebookEdit",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Replace, insert or delete one cell in a Jupyter .ipynb file, rewriting it the way Jupyter would. Use it rather than editing the JSON by hand; replacing a code cell's source also clears its stale outputs and execution count.",
   inputSchema: z.object({
@@ -2030,7 +2577,7 @@ export const notebookEdit: RegisteredTool = buildTool({
     let notebook: ReturnType<typeof parseNotebook>;
     let original: string;
     try {
-      original = readWholeFile("NotebookEdit", target.real, MAX_WHOLE_FILE_BYTES).toString("utf8");
+      original = readWholeFile("NotebookEdit", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       notebook = parseNotebook(original);
     } catch (err) {
       if (err instanceof NotebookError) return `${target.rel}: ${err.message}`;
@@ -2064,7 +2611,8 @@ export const notebookEdit: RegisteredTool = buildTool({
       changed: next !== original,
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, written: false });
-    writeAtomic(target.abs, next);
+    const refused = writeAtomic(target, next, { createParents: false });
+    if (refused !== undefined) return refused;
     return json({ ...summary, dryRun: false, written: true });
   },
 });
@@ -2098,3 +2646,8 @@ export const FSX_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
 ]);
 
 export { ToolPermissionError } from "./paths";
+/**
+ * The package's glob matcher, for other tool packages that match paths:
+ * segment-aware and linear, where a pattern compiled to a RegExp backtracks.
+ */
+export { compileGlob, matchGlob } from "./lib/glob";

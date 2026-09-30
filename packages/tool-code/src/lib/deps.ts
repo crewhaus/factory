@@ -865,14 +865,27 @@ function tomlSections(text: string): Array<[string, string]> {
   return out;
 }
 
+/**
+ * A line with its trailing `# comment` cut: from the first `#` that follows
+ * whitespace. A scan, where `/\s+#.*$/` retried a long run of spaces from
+ * every position of it.
+ */
+function withoutTomlComment(line: string): string {
+  let from = 0;
+  for (;;) {
+    const hash = line.indexOf("#", from);
+    if (hash < 0) return line;
+    const before = line[hash - 1];
+    if (hash > 0 && (before === " " || before === "\t")) return line.slice(0, hash);
+    from = hash + 1;
+  }
+}
+
 /** `key = "value"` and `key = { version = "value", … }` pairs in a section body. */
 function tomlKeyValues(body: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   for (const raw of body.split("\n")) {
-    const line = raw
-      .replace(/\r$/, "")
-      .replace(/\s+#.*$/, "")
-      .trim();
+    const line = withoutTomlComment(raw.replace(/\r$/, "")).trim();
     if (line === "" || line.startsWith("#")) continue;
     const m = /^(?<key>[A-Za-z0-9._-]+)\s*=\s*(?<value>.+)$/.exec(line);
     if (m === null) continue;
@@ -901,37 +914,97 @@ function tomlKeyValues(body: string): Array<[string, string]> {
   return out;
 }
 
-/** A `key = ["a", "b"]` array, possibly spanning lines. */
-function tomlStringArray(body: string, key: string): string[] {
-  const start = new RegExp(`^\\s*${key}\\s*=\\s*\\[`, "m").exec(body);
-  if (start === null) return [];
-  const from = (start.index as number) + start[0].length - 1;
+/**
+ * The `key = [` lines of a section body, in order, with the offset of each
+ * `[`. One line at a time, each matched anchored: the 0.7.0 patterns ran
+ * `^\s*` in multiline mode, which spans newlines and retried a run of blank
+ * lines from every line start (quadratic in a file the repository supplies),
+ * and built a pattern from the key unescaped.
+ */
+function tomlArrayStarts(body: string): Array<{ readonly key: string; readonly open: number }> {
+  const out: Array<{ key: string; open: number }> = [];
+  let lineStart = 0;
+  while (lineStart <= body.length) {
+    const nl = body.indexOf("\n", lineStart);
+    const lineEnd = nl < 0 ? body.length : nl;
+    const m = /^[ \t]*([A-Za-z0-9._-]+)[ \t]*=[ \t]*\[/.exec(body.slice(lineStart, lineEnd));
+    if (m !== null) out.push({ key: m[1] as string, open: lineStart + m[0].length - 1 });
+    if (nl < 0) break;
+    lineStart = nl + 1;
+  }
+  return out;
+}
+
+/** The index of the `]` closing the `[` at `open`, or undefined when none does. */
+function closingBracket(body: string, open: number): number | undefined {
   let depth = 0;
-  let end = from;
-  for (let i = from; i < body.length; i++) {
+  for (let i = open; i < body.length; i++) {
     if (body[i] === "[") depth += 1;
     else if (body[i] === "]") {
       depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
+      if (depth === 0) return i;
     }
   }
-  const inner = body.slice(from + 1, end);
+  return undefined;
+}
+
+/** The quoted strings between `open` and `close`. */
+function tomlQuotedItems(body: string, open: number, close: number): string[] {
   const out: string[] = [];
-  for (const m of inner.matchAll(/"([^"]*)"|'([^']*)'/g)) {
+  for (const m of body.slice(open + 1, close).matchAll(/"([^"]*)"|'([^']*)'/g)) {
     out.push((m[1] ?? m[2] ?? "").trim());
   }
   return out;
 }
 
-/** Every `key = [...]` array in a section body, for optional-dependency groups. */
+/** A `key = ["a", "b"]` array, possibly spanning lines. Unclosed reads as empty. */
+function tomlStringArray(body: string, key: string): string[] {
+  const start = tomlArrayStarts(body).find((s) => s.key === key);
+  if (start === undefined) return [];
+  const close = closingBracket(body, start.open);
+  return close === undefined ? [] : tomlQuotedItems(body, start.open, close);
+}
+
+/**
+ * For each offset in `opens`, the `]` that closes the `[` there, found in one
+ * pass with a stack: the same answer a depth count from each `[` gives, since
+ * brackets before it are matched or stay below it on the stack.
+ */
+function closingBrackets(body: string, opens: ReadonlySet<number>): Map<number, number> {
+  const out = new Map<number, number>();
+  const stack: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "[") stack.push(i);
+    else if (c === "]") {
+      const o = stack.pop();
+      if (o !== undefined && opens.has(o)) out.set(o, i);
+    }
+  }
+  return out;
+}
+
+/**
+ * Every `key = [...]` array in a section body, for optional-dependency
+ * groups. Each `[` is closed from one shared pass, and a `key = [` line
+ * inside an array already read is part of that array, not a key of its own,
+ * so the work is linear however the arrays nest or fail to close. An
+ * unclosed array reads as empty.
+ */
 function tomlAllStringArrays(body: string): Array<[string, string[]]> {
+  const starts = tomlArrayStarts(body);
+  const closes = closingBrackets(body, new Set(starts.map((s) => s.open)));
   const out: Array<[string, string[]]> = [];
-  for (const m of body.matchAll(/^\s*([A-Za-z0-9._-]+)\s*=\s*\[/gm)) {
-    const key = m[1] as string;
-    out.push([key, tomlStringArray(body, key)]);
+  let readUpTo = -1;
+  for (const { key, open } of starts) {
+    if (open <= readUpTo) continue;
+    const close = closes.get(open);
+    if (close === undefined) {
+      out.push([key, []]);
+      continue;
+    }
+    out.push([key, tomlQuotedItems(body, open, close)]);
+    readUpTo = close;
   }
   return out;
 }
@@ -961,7 +1034,15 @@ export function parseSemver(raw: string): SemVer | undefined {
   };
 }
 
-/** Compare two versions, prereleases ordering below their release. */
+/**
+ * Compare two versions, prereleases ordering below their release.
+ *
+ * Prereleases compare identifier by identifier, as SemVer 2.0.0 §11 and npm
+ * do: numeric identifiers numerically and below alphanumeric ones, and a
+ * longer list above a prefix of it. Compared as whole strings, `rc.10`
+ * sorted below `rc.9`, so a range, a pick or an advisory's bounds could
+ * land on the wrong side of a release candidate.
+ */
 export function compareSemver(a: SemVer, b: SemVer): number {
   if (a.major !== b.major) return a.major - b.major;
   if (a.minor !== b.minor) return a.minor - b.minor;
@@ -969,111 +1050,491 @@ export function compareSemver(a: SemVer, b: SemVer): number {
   if (a.prerelease === b.prerelease) return 0;
   if (a.prerelease === "") return 1;
   if (b.prerelease === "") return -1;
-  return a.prerelease < b.prerelease ? -1 : 1;
+  return comparePrerelease(a.prerelease, b.prerelease);
 }
 
-function satisfiesComparator(version: SemVer, comparator: string): boolean | undefined {
-  const text = comparator.trim();
-  if (text === "" || text === "*" || text === "x" || text === "latest") return true;
-  const m = /^(?<op>\^|~|>=|<=|>|<|=)?\s*(?<rest>.+)$/.exec(text);
-  if (m === null) return undefined;
-  const op = m.groups?.["op"] ?? "";
-  const restRaw = (m.groups?.["rest"] as string).trim();
-  if (/^(workspace|path|file|link|npm|git|https?|latest)/.test(restRaw)) return undefined;
-  const wildcard = /^(?<major>\d+)(?:\.(?<minor>\d+))?\.(?:x|\*)$/.exec(restRaw);
-  if (wildcard !== null && op === "") {
-    const major = Number(wildcard.groups?.["major"]);
-    const minor = wildcard.groups?.["minor"];
-    if (version.major !== major) return false;
-    return minor === undefined ? true : version.minor === Number(minor);
+const NUMERIC_IDENTIFIER_RE = /^\d+$/;
+
+function comparePrerelease(a: string, b: string): number {
+  const as = a.split(".");
+  const bs = b.split(".");
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    const x = as[i];
+    const y = bs[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNum = NUMERIC_IDENTIFIER_RE.test(x);
+    const yNum = NUMERIC_IDENTIFIER_RE.test(y);
+    if (xNum && yNum) {
+      const diff = Number(x) - Number(y);
+      if (diff !== 0) return diff < 0 ? -1 : 1;
+      continue;
+    }
+    if (xNum) return -1;
+    if (yNum) return 1;
+    return x < y ? -1 : 1;
   }
-  const target = parseSemver(restRaw);
-  if (target === undefined) return undefined;
-  const cmp = compareSemver(version, target);
+  return 0;
+}
+
+/** One comparator: an optional operator, then the version or wildcard it applies to. */
+const COMPARATOR_RE = /^(?<op>\^|~>?|>=|<=|>|<|=)?\s*(?<rest>.+)$/;
+
+/**
+ * A comparator's version, as node-semver's XRANGEPLAIN reads it: each of
+ * major, minor and patch a number or `x`/`X`/`*`, minor and patch optional,
+ * a prerelease only after a patch, build metadata ignored. Every class is
+ * disjoint from the delimiter after it, so a match is linear.
+ */
+const COMPARATOR_VERSION_RE =
+  /^[v=\s]*(?<major>\d+|[xX*])(?:\.(?<minor>\d+|[xX*])(?:\.(?<patch>\d+|[xX*])(?:-(?<pre>[0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
+
+/** A bound a desugared comparator puts on a version. */
+type Bound = { readonly op: ">=" | ">" | "<" | "<=" | "="; readonly at: SemVer };
+
+const sv = (major: number, minor: number, patch: number, prerelease = ""): SemVer => ({
+  major,
+  minor,
+  patch,
+  prerelease,
+});
+
+/**
+ * One comparator as the bounds npm desugars it to (node-semver's
+ * replaceXRange, replaceTilde and replaceCaret), or "any"/"none", or
+ * undefined when it is not a comparator npm would read. A missing or `x`
+ * part is a wildcard: `1.2` is `>=1.2.0 <1.3.0-0`, `<=1.2` is `<1.3.0-0`,
+ * `>1` is `>=2.0.0`, `~1` is `>=1.0.0 <2.0.0-0`, `^0` is `>=0.0.0 <1.0.0-0`.
+ * The `-0` upper bounds keep a prerelease of the next tuple out.
+ * `includePrerelease` lowers a wildcard's floor to its `-0`, as npm does.
+ */
+function desugarComparator(
+  op: string,
+  rest: string,
+  includePrerelease: boolean,
+): readonly Bound[] | "any" | "none" | undefined {
+  const m = COMPARATOR_VERSION_RE.exec(rest);
+  if (m === null) return undefined;
+  const part = (raw: string | undefined): number | undefined =>
+    raw === undefined || raw === "x" || raw === "X" || raw === "*" ? undefined : Number(raw);
+  const M = part(m.groups?.["major"]);
+  const xM = M === undefined;
+  const mi = xM ? undefined : part(m.groups?.["minor"]);
+  const xm = mi === undefined;
+  const pa = xm ? undefined : part(m.groups?.["patch"]);
+  const xp = pa === undefined;
+  const pre = xp ? "" : (m.groups?.["pre"] ?? "");
+  const z = includePrerelease ? "0" : "";
+  const major = M ?? 0;
+  const minor = mi ?? 0;
+  const patch = pa ?? 0;
   switch (op) {
-    case ">=":
-      return cmp >= 0;
-    case ">":
-      return cmp > 0;
-    case "<=":
-      return cmp <= 0;
-    case "<":
-      return cmp < 0;
-    case "=":
     case "":
-      return cmp === 0;
-    case "^": {
-      if (cmp < 0) return false;
-      if (target.major > 0) return version.major === target.major;
-      if (target.minor > 0) return version.major === 0 && version.minor === target.minor;
-      return version.major === 0 && version.minor === 0 && version.patch === target.patch;
+    case "=": {
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0, z) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      if (xp) {
+        return [
+          { op: ">=", at: sv(major, minor, 0, z) },
+          { op: "<", at: sv(major, minor + 1, 0, "0") },
+        ];
+      }
+      return [{ op: "=", at: sv(major, minor, patch, pre) }];
+    }
+    case ">":
+    case ">=":
+    case "<":
+    case "<=": {
+      if (xM) return op === ">" || op === "<" ? "none" : "any";
+      if (!xp) return [{ op, at: sv(major, minor, patch, pre) }];
+      if (op === ">") {
+        return [{ op: ">=", at: xm ? sv(major + 1, 0, 0, z) : sv(major, minor + 1, 0, z) }];
+      }
+      if (op === "<=") {
+        return [{ op: "<", at: xm ? sv(major + 1, 0, 0, "0") : sv(major, minor + 1, 0, "0") }];
+      }
+      if (op === "<") return [{ op: "<", at: sv(major, minor, 0, "0") }];
+      return [{ op: ">=", at: sv(major, minor, 0, z) }];
     }
     case "~": {
-      if (cmp < 0) return false;
-      return version.major === target.major && version.minor === target.minor;
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      return [
+        { op: ">=", at: sv(major, minor, patch, pre) },
+        { op: "<", at: sv(major, minor + 1, 0, "0") },
+      ];
+    }
+    case "^": {
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0, z) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      const floor = sv(major, minor, patch, xp ? z : pre === "" && major === 0 ? z : pre);
+      const ceiling =
+        major > 0
+          ? sv(major + 1, 0, 0, "0")
+          : xp || minor > 0
+            ? sv(0, minor + 1, 0, "0")
+            : sv(0, 0, patch + 1, "0");
+      return [
+        { op: ">=", at: floor },
+        { op: "<", at: ceiling },
+      ];
     }
     default:
       return undefined;
   }
 }
 
+function holds(version: SemVer, bound: Bound): boolean {
+  const cmp = compareSemver(version, bound.at);
+  switch (bound.op) {
+    case ">=":
+      return cmp >= 0;
+    case ">":
+      return cmp > 0;
+    case "<":
+      return cmp < 0;
+    case "<=":
+      return cmp <= 0;
+    default:
+      return cmp === 0;
+  }
+}
+
+function satisfiesComparator(
+  version: SemVer,
+  comparator: string,
+  includePrerelease: boolean,
+): boolean | undefined {
+  const text = comparator.trim();
+  if (text === "" || text === "latest") return true;
+  const m = COMPARATOR_RE.exec(text);
+  if (m === null) return undefined;
+  // `~>` is npm's other spelling of `~`.
+  const op = m.groups?.["op"] === "~>" ? "~" : (m.groups?.["op"] ?? "");
+  const restRaw = (m.groups?.["rest"] as string).trim();
+  if (/^(workspace|path|file|link|npm|git|https?|latest)/.test(restRaw)) return undefined;
+  const bounds = desugarComparator(op, restRaw, includePrerelease);
+  if (bounds === undefined) return undefined;
+  if (bounds === "any") return true;
+  if (bounds === "none") return false;
+  return bounds.every((bound) => holds(version, bound));
+}
+
+/** `A - B`: one whole `||` alternative that is a hyphen range. Linear: each class is disjoint from the next. */
+const HYPHEN_RANGE_RE = /^\s*(\S+)\s+-\s+(\S+)\s*$/;
+
+/**
+ * A hyphen range as the comparators npm desugars it to (node-semver's
+ * hyphenReplace): `1.2.3 - 2.3.4` is `>=1.2.3 <=2.3.4`; a partial FROM is
+ * its floor (`1.2 - 2.3.4` is `>=1.2.0 <=2.3.4`) and a partial TO its
+ * ceiling (`1.2.3 - 2.3` is `>=1.2.3 <2.4.0-0`); an `x` side is unbounded.
+ * `includePrerelease` lowers the floor to `-0`, as npm does (npm also
+ * writes an inclusive release ceiling as `<` the next patch's `-0`, which
+ * admits exactly the same versions). The
+ * alternative unchanged when it is not a hyphen range, or when either side
+ * is not a version npm reads (then it stays "cannot tell").
+ */
+function expandHyphenRange(alternative: string, includePrerelease: boolean): string {
+  const m = HYPHEN_RANGE_RE.exec(alternative);
+  if (m === null) return alternative;
+  const sides = [m[1] as string, m[2] as string].map((raw) => {
+    const v = COMPARATOR_VERSION_RE.exec(raw);
+    if (v === null) return undefined;
+    const x = (part: string | undefined) =>
+      part === undefined || part === "x" || part === "X" || part === "*";
+    return {
+      M: v.groups?.["major"] as string,
+      m: v.groups?.["minor"],
+      p: v.groups?.["patch"],
+      pre: v.groups?.["pre"],
+      xM: x(v.groups?.["major"]),
+      xm: x(v.groups?.["major"]) || x(v.groups?.["minor"]),
+      xp: x(v.groups?.["major"]) || x(v.groups?.["minor"]) || x(v.groups?.["patch"]),
+    };
+  });
+  const [from, to] = sides;
+  if (from === undefined || to === undefined) return alternative;
+  const z = includePrerelease ? "-0" : "";
+  const floor = from.xM
+    ? ""
+    : from.xm
+      ? `>=${from.M}.0.0${z}`
+      : from.xp
+        ? `>=${from.M}.${from.m}.0${z}`
+        : from.pre !== undefined
+          ? `>=${from.M}.${from.m}.${from.p}-${from.pre}`
+          : `>=${from.M}.${from.m}.${from.p}${z}`;
+  const ceiling = to.xM
+    ? ""
+    : to.xm
+      ? `<${Number(to.M) + 1}.0.0-0`
+      : to.xp
+        ? `<${to.M}.${Number(to.m) + 1}.0-0`
+        : to.pre !== undefined
+          ? `<=${to.M}.${to.m}.${to.p}-${to.pre}`
+          : `<=${to.M}.${to.m}.${to.p}`;
+  return `${floor} ${ceiling}`.trim();
+}
+
+/**
+ * The comparators of one `||` alternative. An operator may be written apart
+ * from its version (`>= 1.2`), which npm joins before splitting on
+ * whitespace; without the join `>=` alone was a comparator nobody understood.
+ */
+function comparatorsOf(alternative: string): string[] {
+  return alternative
+    .replace(/(\^|~>?|>=|<=|>|<|=)\s+/g, "$1")
+    .trim()
+    .split(/\s+/)
+    .filter((c) => c !== "");
+}
+
 /**
  * Does `version` satisfy `range`?
  *
  * `undefined` means "cannot tell" — a `workspace:*` protocol, a git URL, a
- * hyphen range — and every caller treats that as unchecked rather than as
- * false. This is a deliberately small subset of node-semver: caret, tilde,
- * the four inequalities, exact, `x`-wildcards, whitespace-joined AND and
- * `||`-joined OR. Enough for the ranges real manifests hold, and honest about
- * the rest.
+ * typo — and every caller treats that as unchecked rather than as false.
+ * This is a deliberately small subset of node-semver: caret, tilde (`~` and
+ * `~>`), the four inequalities, exact, partial versions and `x`-wildcards
+ * read as npm reads them (a missing segment is a wildcard), hyphen ranges,
+ * whitespace-joined AND and `||`-joined OR. Enough for the ranges real
+ * manifests hold, and honest about the rest: when one `||` alternative
+ * cannot be read and no other matched, the answer is "cannot tell", never
+ * a definite no (the unread alternative might have matched).
+ * `includePrerelease` lowers a wildcard's floor to its `-0`, as npm's option
+ * does; the prerelease INSTALL rule is {@link satisfiesInstallable}'s.
  */
-export function satisfies(versionRaw: string, range: string): boolean | undefined {
+export function satisfies(
+  versionRaw: string,
+  range: string,
+  options: { readonly includePrerelease?: boolean } = {},
+): boolean | undefined {
   const version = parseSemver(versionRaw);
   if (version === undefined) return undefined;
   const alternatives = range.split("||");
-  let anyKnown = false;
+  let anyUnknown = false;
   for (const alternative of alternatives) {
-    const comparators = alternative
-      .trim()
-      .split(/\s+/)
-      .filter((c) => c !== "");
+    const comparators = comparatorsOf(
+      expandHyphenRange(alternative, options.includePrerelease === true),
+    );
     if (comparators.length === 0) return true;
     let all = true;
     let known = true;
     for (const comparator of comparators) {
-      const result = satisfiesComparator(version, comparator);
+      const result = satisfiesComparator(version, comparator, options.includePrerelease === true);
       if (result === undefined) {
         known = false;
         break;
       }
       if (!result) all = false;
     }
-    if (!known) continue;
-    anyKnown = true;
+    if (!known) {
+      anyUnknown = true;
+      continue;
+    }
     if (all) return true;
   }
-  return anyKnown ? false : undefined;
+  return anyUnknown ? undefined : false;
+}
+
+/**
+ * `satisfies`, plus the rule an npm install applies to prereleases: a version
+ * with a prerelease tag counts only when a comparator in the SAME `||`
+ * alternative names a prerelease of the same major.minor.patch, or when
+ * `includePrerelease` is set. So `^1.2.3-beta.2` admits 1.2.3-beta.4 and
+ * 1.5.0 but never 1.9.0-rc.1, and a prerelease named in one alternative
+ * admits nothing in another. `satisfies` itself answers the plain range
+ * question (DependencyOutdated asks that one); this answers "would an
+ * install pick it". `undefined` exactly when `satisfies` is.
+ */
+export function satisfiesInstallable(
+  versionRaw: string,
+  range: string,
+  options: { readonly includePrerelease?: boolean } = {},
+): boolean | undefined {
+  const version = parseSemver(versionRaw);
+  if (version === undefined) return undefined;
+  if (version.prerelease === "" || options.includePrerelease === true) {
+    return satisfies(versionRaw, range, options);
+  }
+  let anyUnknown = false;
+  for (const alternative of range.split("||")) {
+    const result = satisfies(versionRaw, alternative);
+    if (result === undefined) {
+      anyUnknown = true;
+      continue;
+    }
+    if (result && namesPrereleaseOf(expandHyphenRange(alternative, false), version)) return true;
+  }
+  return anyUnknown ? undefined : false;
+}
+
+/** Whether a comparator in `alternative` targets a prerelease on `version`'s tuple. */
+function namesPrereleaseOf(alternative: string, version: SemVer): boolean {
+  for (const comparator of comparatorsOf(alternative)) {
+    const rest = COMPARATOR_RE.exec(comparator)?.groups?.["rest"];
+    const target = rest === undefined ? undefined : parseSemver(rest);
+    if (
+      target !== undefined &&
+      target.prerelease !== "" &&
+      target.major === version.major &&
+      target.minor === version.minor &&
+      target.patch === version.patch
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
 // workspace globs
 
 /**
- * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-*`) against
- * a directory path relative to the workspace root.
+ * The `packages:` list of a pnpm-workspace.yaml — the block form pnpm writes,
+ * one `- glob` per line, quotes and trailing comments dropped.
  *
- * Only the two wildcards npm, bun, pnpm and yarn workspaces actually use are
- * supported: `*` within one segment and `**` across segments. Negations
- * (`!packages/private`) are not, and a caller passing one gets no match rather
- * than a wrong one.
+ * Read line by line rather than with one multi-line pattern: the file is the
+ * repository's, and `^\s*-\s*["']?([^"'\n]+)["']?\s*$` over it backtracked
+ * quadratically (a line of spaces before a stray quote, or a run of blank
+ * lines). Only items under the top-level `packages:` key count: another
+ * list in the same file (`onlyBuiltDependencies:`) names packages, not
+ * directories.
+ */
+export function parsePnpmWorkspacePackages(text: string): string[] {
+  const globs: string[] = [];
+  let inPackages = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (line[0] !== " " && line[0] !== "\t" && line[0] !== "-") {
+      // A top-level key starts (or ends) the block.
+      inPackages = /^packages:[ \t]*(?:#.*)?$/.test(trimmed);
+      continue;
+    }
+    if (!inPackages || !trimmed.startsWith("-")) continue;
+    let item = trimmed.slice(1).trim();
+    const quote = item[0];
+    if (quote === '"' || quote === "'") {
+      const close = item.indexOf(quote, 1);
+      item = close === -1 ? item.slice(1) : item.slice(1, close);
+    } else {
+      const comment = item.search(/\s#/);
+      if (comment !== -1) item = item.slice(0, comment);
+      item = item.trim();
+    }
+    if (item !== "") globs.push(item);
+  }
+  return globs;
+}
+
+/** Split a workspace-relative path or glob into its segments, `./` and trailing `/` dropped. */
+function globSegments(text: string): string[] {
+  return text.split("/").filter((segment) => segment !== "" && segment !== ".");
+}
+
+/**
+ * Why a workspace glob cannot be evaluated here, or undefined when it can.
+ *
+ * Character classes (`[ab]`) and brace sets (`{a,b}`) are real glob syntax in
+ * npm, pnpm and yarn workspaces, and reading them as literal text would drop
+ * the packages they name without a word. A caller is told instead.
+ */
+export function unsupportedWorkspaceGlob(pattern: string): string | undefined {
+  const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+  if (/[[\]{}]/.test(body)) {
+    return "character classes ([...]) and brace sets ({a,b}) are not evaluated by this tool";
+  }
+  return undefined;
+}
+
+/**
+ * One path segment against one glob segment: `*` is any run of characters,
+ * `?` exactly one. The classic two-pointer walk that backs up only to the
+ * last `*` — at most length × length steps, whatever the pattern, so a
+ * repository's glob cannot make it backtrack exponentially the way a
+ * translated regular expression could.
+ */
+function matchSegment(name: string, glob: string): boolean {
+  let n = 0;
+  let g = 0;
+  let starAt = -1;
+  let resumeAt = 0;
+  while (n < name.length) {
+    const want = glob[g];
+    if (want === "*") {
+      starAt = g++;
+      resumeAt = n;
+    } else if (want !== undefined && (want === "?" || want === name[n])) {
+      g++;
+      n++;
+    } else if (starAt !== -1) {
+      g = starAt + 1;
+      n = ++resumeAt;
+    } else {
+      return false;
+    }
+  }
+  while (glob[g] === "*") g++;
+  return g === glob.length;
+}
+
+/**
+ * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-?`) against
+ * a directory path relative to the workspace root, the way npm, bun, pnpm and
+ * yarn read it:
+ *
+ * - `*` is any run of characters within one segment, `?` exactly one
+ *   character within one segment — never a `/`;
+ * - `**` as a whole segment is any number of segments, including none;
+ *   anywhere else it is just `*`;
+ * - a leading `./` and a trailing `/` are ignored;
+ * - every other character is itself.
+ *
+ * It is matched segment by segment, not compiled to a regular expression:
+ * the glob comes from the repository, and a translated `**` / `**` / `**`
+ * chain was a polynomial backtracker. Negations (`!packages/private`) are the
+ * caller's to apply — here they match nothing — and a glob
+ * `unsupportedWorkspaceGlob` names matches nothing either.
  */
 export function matchWorkspaceGlob(dir: string, pattern: string): boolean {
   if (pattern.startsWith("!")) return false;
-  const cleaned = pattern.replace(/\/+$/, "");
-  const escaped = cleaned.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const body = escaped
-    .replace(/\*\*/g, "@@GLOBSTAR@@")
-    .replace(/\*/g, "[^/]*")
-    .replace(/@@GLOBSTAR@@/g, ".*");
-  return new RegExp(`^${body}$`).test(dir.replace(/\/+$/, ""));
+  if (unsupportedWorkspaceGlob(pattern) !== undefined) return false;
+  const globs = globSegments(pattern);
+  const names = globSegments(dir);
+  if (globs.length === 0) return false;
+  // reach[j]: the glob segments so far match the first j path segments.
+  let reach = new Array<boolean>(names.length + 1).fill(false);
+  reach[0] = true;
+  for (const glob of globs) {
+    const next = new Array<boolean>(names.length + 1).fill(false);
+    if (glob === "**") {
+      let seen = false;
+      for (let j = 0; j <= names.length; j++) {
+        seen = seen || (reach[j] as boolean);
+        next[j] = seen;
+      }
+    } else {
+      const segment = glob.replace(/\*{2,}/g, "*");
+      for (let j = 0; j < names.length; j++) {
+        if (reach[j] === true && matchSegment(names[j] as string, segment)) next[j + 1] = true;
+      }
+    }
+    reach = next;
+  }
+  return reach[names.length] === true;
 }

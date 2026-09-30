@@ -14,9 +14,10 @@
  *  - `redundantMcpServerCollapse` — dedup `mcp_servers` map entries by
  *    `(transport, command, args)` signature so two specs that import the
  *    same server under different keys collapse into one boot per process.
- *  - `permissionRuleCanonicalize` — sort + dedup `permissions.rules` by
- *    canonical (type, pattern) tuples; preserves source priority order
- *    (alwaysDeny > alwaysAsk > alwaysAllow) but de-dupes identical entries.
+ *  - `permissionRuleCanonicalize` — drop a `permissions.rules` entry that
+ *    repeats an earlier one (same type and pattern), keeping the first and
+ *    the order. The engine decides by the FIRST matching rule in a list, so
+ *    the order is the meaning and is never changed.
  *  - `transactionPolicyEnforcement` — §47 validating pass: checks the
  *    blockchain blocks (wallets/contracts/chains/transaction_policy) for
  *    referential integrity and throws `IrPassError` on a mismatch.
@@ -217,9 +218,16 @@ function secretMapSignature(map: Readonly<Record<string, IrSecretRef>> | undefin
 }
 
 /**
- * Pass 3 — sort + dedup permission rules. Within each precedence tier
- * (alwaysDeny > alwaysAsk > alwaysAllow), rules are sorted alphabetically
- * by pattern and exact duplicates dropped.
+ * Pass 3 — drop repeated permission rules, keeping the order.
+ *
+ * The engine reads a rule list top to bottom and the FIRST rule that matches
+ * a call decides it (an allow above a deny wins; see crewhaus/demos
+ * walkthrough 29). Up to 0.7.0 this pass re-sorted the rules deny, then ask,
+ * then allow, so a bundle compiled with `applyIrPasses` (the compiler
+ * worker's `POST /compile`) decided differently from one `crewhaus compile`
+ * built from the same spec. It now keeps the order, and only drops a rule
+ * that repeats an earlier one exactly: the earlier copy matches every call
+ * the later one would, first, so dropping it changes no decision.
  */
 export function permissionRuleCanonicalize(ir: IrNode): IrNode {
   const carriesPerms = (n: IrNode): n is IrV0 | IrChannelV0 | IrManagedV0 =>
@@ -227,36 +235,17 @@ export function permissionRuleCanonicalize(ir: IrNode): IrNode {
   if (!carriesPerms(ir)) return ir;
   const perms = (ir as { permissions?: IrPermissions }).permissions;
   if (!perms) return ir;
-  const tier = (t: IrPermissionRule["type"]): number =>
-    t === "alwaysDeny" ? 0 : t === "alwaysAsk" ? 1 : 2;
   const seen = new Set<string>();
-  const sorted = [...perms.rules]
-    .map((r) => ({ r, key: `${r.type}:${r.pattern}` }))
-    .filter(({ key }) => {
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => {
-      const ta = tier(a.r.type);
-      const tb = tier(b.r.type);
-      if (ta !== tb) return ta - tb;
-      return a.r.pattern.localeCompare(b.r.pattern);
-    })
-    .map(({ r }) => r);
-  if (sorted.length === perms.rules.length) {
-    let identical = true;
-    for (let i = 0; i < sorted.length; i++) {
-      if (sorted[i] !== perms.rules[i]) {
-        identical = false;
-        break;
-      }
-    }
-    if (identical) return ir;
-  }
+  const kept = perms.rules.filter((r) => {
+    const key = `${r.type}\u0000${r.pattern}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (kept.length === perms.rules.length) return ir;
   const newPerms: IrPermissions = {
     ...perms,
-    rules: Object.freeze(sorted),
+    rules: Object.freeze(kept),
   };
   return { ...ir, permissions: newPerms } as IrNode;
 }
@@ -840,6 +829,12 @@ function checkCandidateTools(
   const blockTools = new Set((block.tools ?? []).map((t) => t.toLowerCase()));
   for (const [i, tool] of tools.entries()) {
     if (tool.startsWith("mcp__")) {
+      // A declared key may itself contain `__`, so match the keys first.
+      if (
+        [...mcpServers].some((s) => tool.startsWith(`mcp__${s}__`) && tool.length > s.length + 7)
+      ) {
+        continue;
+      }
       const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
       if (server === undefined) {
         throw new IrPassError(

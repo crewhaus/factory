@@ -68,8 +68,8 @@
  * `l`/`c`/`q`/`pf` — so a 0.5.x reader and this package's own reader both
  * fold a promoted line exactly as they fold any other line.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { readRouteFreeze } from "./freeze.js";
 import {
   QUALITY_LANE_PREFIX,
@@ -77,6 +77,8 @@ import {
   SHADOW_LANE_PRIMARY_ARM,
   isObserveOnlyLane,
 } from "./lanes.js";
+import { ARMS_REL } from "./scoreboard.js";
+import { writeStoreFile } from "./store-io.js";
 
 /** The marker stamped on a lane line once it has been folded into a live arm. */
 export const PROMOTED_MARKER = "pm";
@@ -190,7 +192,7 @@ function laneObservationsOf(rec: Record<string, unknown>): number {
  * `frozenPolicyVersion`.
  */
 export function promoteLanes(rootDir: string, opts: PromoteOptions = {}): PromoteResult {
-  const path = join(rootDir, "routing", "arms.jsonl");
+  const path = join(rootDir, ARMS_REL);
   const now = opts.now ?? Date.now;
   const dryRun = opts.dryRun ?? false;
   const empty: PromoteResult = {
@@ -309,13 +311,10 @@ export function promoteLanes(rootDir: string, opts: PromoteOptions = {}): Promot
   }
 
   if (touched > 0 && !dryRun) {
-    const dir = dirname(path);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
     // Write-then-rename, the `compact()` contract: a concurrent reader sees
-    // either the old file or the new one, never a half-written fold.
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, `${out.join("\n")}\n`, { mode: 0o600 });
-    renameSync(tmp, path);
+    // either the old file or the new one, never a half-written fold. The temp
+    // is random and never followed through a planted link (0.7.1).
+    writeStoreFile(rootDir, ARMS_REL, `${out.join("\n")}\n`);
   }
 
   const promotions = [...accs.values()]

@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { type AbiItem, generateContractTools } from "./index";
+import { auditToolScopes } from "@crewhaus/tool-builder";
+import { JUSTIFICATION_INPUT_FIELD, ToolCatalog } from "@crewhaus/tool-catalog";
+import { evmCall } from "@crewhaus/tool-evm";
+import { evmSendTransaction } from "@crewhaus/tool-evm-tx";
+import { canonicalFunction } from "@crewhaus/tool-onchain";
+import {
+  type AbiItem,
+  ContractToolError,
+  type SkippedFunction,
+  type WriteExecutor,
+  generateContractTools,
+} from "./index";
 
 const ERC20_ABI: ReadonlyArray<AbiItem> = [
   {
@@ -237,5 +248,453 @@ describe("generateContractTools", () => {
     await expect(transfer.execute({ to: "0xrecipient", amount: "0x64" })).rejects.toThrow(
       /walletId is required/,
     );
+  });
+});
+
+describe("generated tools say they cross the network, and writes are intent-gated (C151)", () => {
+  const tools = generateContractTools({
+    contract: CONTRACT,
+    abi: [
+      ...ERC20_ABI,
+      {
+        type: "function",
+        name: "deposit",
+        inputs: [],
+        outputs: [],
+        stateMutability: "payable",
+      },
+    ],
+    readExecutor: async () => "0x0",
+    writeExecutor: async () => "{}",
+  });
+  const flags = (name: string) => {
+    const t = tools.find((tool) => tool.name === name);
+    if (t === undefined) throw new Error(`${name} not generated`);
+    return {
+      scope: t.scope,
+      ioCapability: t.ioCapability,
+      requireJustification: t.requireJustification,
+      destructive: t.destructive,
+      readOnly: t.readOnly,
+    };
+  };
+
+  test("a view read is an eth_call over the network, as EvmCall is", () => {
+    expect(flags("usdc__balanceOf")).toEqual({
+      scope: "external",
+      ioCapability: "network",
+      requireJustification: false,
+      destructive: false,
+      readOnly: true,
+    });
+  });
+
+  test("nonpayable and payable writes carry EvmSendTransaction's flags", () => {
+    // EvmSendTransaction (tool-evm-tx) is destructive, external, network and
+    // justification-gated; a generated write signs through the same engine.
+    const send = {
+      scope: "external",
+      ioCapability: "network",
+      requireJustification: true,
+      destructive: true,
+      readOnly: false,
+    };
+    expect(flags("usdc__transfer")).toEqual(send);
+    expect(flags("usdc__deposit")).toEqual(send);
+  });
+
+  test("the flags stay those of EvmCall and EvmSendTransaction, the tools they stand in for", () => {
+    // Read from the tools themselves, not restated: if either builtin's flags
+    // move, the generated tools must move with them.
+    const of = (t: {
+      scope?: string;
+      ioCapability?: string;
+      requireJustification?: boolean;
+      destructive?: boolean;
+      readOnly?: boolean;
+    }) => ({
+      scope: t.scope,
+      ioCapability: t.ioCapability,
+      requireJustification: t.requireJustification,
+      destructive: t.destructive,
+      readOnly: t.readOnly,
+    });
+    expect(flags("usdc__balanceOf")).toEqual(of(evmCall));
+    expect(flags("usdc__transfer")).toEqual(of(evmSendTransaction));
+    expect(flags("usdc__deposit")).toEqual(of(evmSendTransaction));
+  });
+
+  test("the strict scope audit has nothing to report", () => {
+    expect(auditToolScopes(tools)).toEqual([]);
+    // The audit reads the flags: a network tool left internal is reported.
+    const internal = tools.map((t) => ({ ...t, scope: "internal" as const }));
+    expect(auditToolScopes(internal).length).toBe(tools.length);
+  });
+});
+
+describe("an ABI either becomes tools that each mean one thing, or is refused (C197)", () => {
+  const SAFE_TRANSFER_3 = {
+    type: "function",
+    name: "safeTransferFrom",
+    inputs: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "tokenId", type: "uint256" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  } as const;
+  const SAFE_TRANSFER_4 = {
+    ...SAFE_TRANSFER_3,
+    inputs: [...SAFE_TRANSFER_3.inputs, { name: "data", type: "bytes" }],
+  } as const;
+  const NFT = { id: "nft", chainId: "1", address: "0xnft" };
+
+  function recordingWrites(): {
+    calls: Array<Parameters<WriteExecutor>[0]>;
+    writeExecutor: WriteExecutor;
+  } {
+    const calls: Array<Parameters<WriteExecutor>[0]> = [];
+    return {
+      calls,
+      writeExecutor: async (args) => {
+        calls.push(args);
+        return "{}";
+      },
+    };
+  }
+
+  test("ERC-721's two safeTransferFrom overloads are two tools, each naming its overload", async () => {
+    const { calls, writeExecutor } = recordingWrites();
+    const tools = generateContractTools({
+      contract: NFT,
+      abi: [SAFE_TRANSFER_3, SAFE_TRANSFER_4],
+      readExecutor: async () => "0x",
+      writeExecutor,
+    });
+    const three = canonicalFunction("safeTransferFrom(address,address,uint256)");
+    const four = canonicalFunction("safeTransferFrom(address,address,uint256,bytes)");
+    // The selectors every explorer shows for these two.
+    expect([three.selector, four.selector]).toEqual(["0x42842e0e", "0xb88d4fde"]);
+    expect(tools.map((t) => t.name)).toEqual([
+      "nft__safeTransferFrom_42842e0e",
+      "nft__safeTransferFrom_b88d4fde",
+    ]);
+    // 0.7.0 named both nft__safeTransferFrom, and the second registration threw.
+    const catalog = new ToolCatalog();
+    for (const t of tools) catalog.register(t);
+
+    await tools[1]?.execute({ walletId: "w", from: "0xa", to: "0xb", tokenId: "1", data: "0x" });
+    expect(calls.at(-1)).toMatchObject({
+      methodName: "safeTransferFrom",
+      signature: "safeTransferFrom(address,address,uint256,bytes)",
+      selector: "0xb88d4fde",
+      inputs: ["0xa", "0xb", "1", "0x"],
+    });
+    expect(tools[1]?.description).toContain(
+      "the overload safeTransferFrom(address,address,uint256,bytes)",
+    );
+  });
+
+  test("a name the ABI declares once keeps its plain tool name, and reads get the signature too", async () => {
+    const seen: Array<{ signature: string; selector: string }> = [];
+    const tools = generateContractTools({
+      contract: CONTRACT,
+      abi: ERC20_ABI,
+      readExecutor: async (args) => {
+        seen.push({ signature: args.signature, selector: args.selector });
+        return "0x";
+      },
+      writeExecutor: async () => "{}",
+    });
+    expect(tools.map((t) => t.name)).toEqual([
+      "usdc__balanceOf",
+      "usdc__allowance",
+      "usdc__transfer",
+      "usdc__approve",
+    ]);
+    await tools[0]?.execute({ owner: "0xo" });
+    expect(seen).toEqual([{ signature: "balanceOf(address)", selector: "0x70a08231" }]);
+  });
+
+  test("a nonpayable input named value is an ABI argument, never native value", async () => {
+    // OpenZeppelin v5's ERC-20: transfer(address to, uint256 value).
+    const { calls, writeExecutor } = recordingWrites();
+    const [transfer] = generateContractTools({
+      contract: CONTRACT,
+      abi: [
+        {
+          type: "function",
+          name: "transfer",
+          inputs: [
+            { name: "to", type: "address" },
+            { name: "value", type: "uint256" },
+          ],
+          outputs: [{ name: "", type: "bool" }],
+          stateMutability: "nonpayable",
+        },
+      ],
+      readExecutor: async () => "0x",
+      writeExecutor,
+    });
+    await transfer?.execute({ walletId: "w", to: "0xr", value: "1000" });
+    expect(calls.at(-1)?.inputs).toEqual(["0xr", "1000"]);
+    // 0.7.0 also sent "1000" as the transaction's native value.
+    expect(calls.at(-1) !== undefined && "value" in (calls.at(-1) as object)).toBe(false);
+  });
+
+  test("an input a write tool already uses for its own field is refused at generation", () => {
+    const refuse = (item: AbiItem) => () =>
+      generateContractTools({
+        contract: CONTRACT,
+        abi: [item],
+        readExecutor: async () => "0x",
+        writeExecutor: async () => "{}",
+      });
+    expect(
+      refuse({
+        type: "function",
+        name: "buy",
+        inputs: [{ name: "value", type: "uint256" }],
+        outputs: [],
+        stateMutability: "payable",
+      }),
+    ).toThrow(
+      'usdc: buy(uint256): input 0 is named "value", which the generated write tool already takes as the native-token amount to send',
+    );
+    expect(
+      refuse({
+        type: "function",
+        name: "bind",
+        inputs: [{ name: "walletId", type: "bytes32" }],
+        outputs: [],
+        stateMutability: "nonpayable",
+      }),
+    ).toThrow(
+      /input 0 is named "walletId", which the generated write tool already takes as the signing wallet's id/,
+    );
+    // A write tool is justification-gated, and the gate reads the call's own
+    // `justification`: as an ABI input it would be judged AND broadcast.
+    for (const stateMutability of ["nonpayable", "payable"] as const) {
+      expect(
+        refuse({
+          type: "function",
+          name: "record",
+          inputs: [{ name: JUSTIFICATION_INPUT_FIELD, type: "string" }],
+          outputs: [],
+          stateMutability,
+        }),
+      ).toThrow(
+        'usdc: record(string): input 0 is named "justification", which the generated write tool already takes as the reason the intent gate judges before it runs, so one field would carry both',
+      );
+    }
+    // A view function has no injected fields, so the same names are fine there.
+    for (const name of ["value", "walletId", JUSTIFICATION_INPUT_FIELD]) {
+      expect(
+        refuse({
+          type: "function",
+          name: "quote",
+          inputs: [{ name, type: "uint256" }],
+          outputs: [{ name: "", type: "uint256" }],
+          stateMutability: "view",
+        })(),
+      ).toHaveLength(1);
+    }
+  });
+
+  test("an unnamed input and an input named for its position do not share a key", () => {
+    expect(() =>
+      generateContractTools({
+        contract: CONTRACT,
+        abi: [
+          {
+            type: "function",
+            name: "f",
+            inputs: [
+              { name: "arg1", type: "uint256" },
+              { name: "", type: "uint256" },
+            ],
+            outputs: [],
+            stateMutability: "view",
+          },
+        ],
+        readExecutor: async () => "0x",
+        writeExecutor: async () => "{}",
+      }),
+    ).toThrow(
+      new ContractToolError(
+        'usdc: f(uint256,uint256): inputs 0 and 1 would both be read from the key "arg1"',
+      ),
+    );
+  });
+
+  test("a function listed twice alike is one function; twice differently, neither", () => {
+    const generate = (abi: ReadonlyArray<AbiItem>) => () =>
+      generateContractTools({
+        contract: NFT,
+        abi,
+        readExecutor: async () => "0x",
+        writeExecutor: async () => "{}",
+      });
+    // A merged ABI repeats an entry: it is one function, not an overload.
+    const once = generate([SAFE_TRANSFER_3, { ...SAFE_TRANSFER_3 }])();
+    expect(once.map((t) => t.name)).toEqual(["nft__safeTransferFrom"]);
+    // The same signature as a view and as a write: which is true cannot be told.
+    expect(generate([SAFE_TRANSFER_3, { ...SAFE_TRANSFER_3, stateMutability: "view" }])).toThrow(
+      "nft: the ABI lists safeTransferFrom(address,address,uint256) 2 times, not all alike, so which one is true cannot be told",
+    );
+  });
+
+  test("a type no encoder knows is refused by name", () => {
+    const generate = (abi: ReadonlyArray<AbiItem>) => () =>
+      generateContractTools({
+        contract: NFT,
+        abi,
+        readExecutor: async () => "0x",
+        writeExecutor: async () => "{}",
+      });
+    expect(
+      generate([
+        {
+          type: "function",
+          name: "g",
+          inputs: [{ name: "x", type: "widget" }],
+          outputs: [],
+          stateMutability: "view",
+        },
+      ]),
+    ).toThrow(/nft: the ABI's function g\(widget\) cannot be encoded/);
+  });
+
+  test("a tuple input is written out as its components in the signature", async () => {
+    const { calls, writeExecutor } = recordingWrites();
+    const [tool] = generateContractTools({
+      contract: CONTRACT,
+      abi: [
+        {
+          type: "function",
+          name: "settle",
+          inputs: [
+            {
+              name: "orders",
+              type: "tuple[]",
+              components: [
+                { name: "maker", type: "address" },
+                { name: "amount", type: "uint" },
+              ],
+            },
+          ],
+          outputs: [],
+          stateMutability: "nonpayable",
+        },
+      ],
+      readExecutor: async () => "0x",
+      writeExecutor,
+    });
+    await tool?.execute({ walletId: "w", orders: [] });
+    expect(calls.at(-1)?.signature).toBe("settle((address,uint256)[])");
+  });
+});
+
+describe("one function that cannot be a tool leaves the rest of the ABI alone", () => {
+  const SAFE = { id: "safe", chainId: "1", address: "0xsafe" };
+  // The Safe's ABI, cut down: two reads, and execTransaction, which is
+  // payable and names its second input `value` — the key a payable write
+  // tool already uses for the native-token amount.
+  const SAFE_ABI: ReadonlyArray<AbiItem> = [
+    {
+      type: "function",
+      name: "getOwners",
+      inputs: [],
+      outputs: [{ name: "", type: "address[]" }],
+      stateMutability: "view",
+    },
+    {
+      type: "function",
+      name: "nonce",
+      inputs: [],
+      outputs: [{ name: "", type: "uint256" }],
+      stateMutability: "view",
+    },
+    {
+      type: "function",
+      name: "execTransaction",
+      inputs: [
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "data", type: "bytes" },
+      ],
+      outputs: [{ name: "success", type: "bool" }],
+      stateMutability: "payable",
+    },
+  ];
+  const generate = (contract: typeof SAFE, abi: ReadonlyArray<AbiItem>) => {
+    const skipped: SkippedFunction[] = [];
+    const tools = generateContractTools({
+      contract,
+      abi,
+      readExecutor: async () => "0x",
+      writeExecutor: async () => "{}",
+      onSkipped: (s) => skipped.push(s),
+    });
+    return { names: tools.map((t) => t.name), skipped };
+  };
+
+  test("the Safe's reads are generated, and execTransaction is named as left out", () => {
+    // 0.7.1's first cut refused the whole ABI, so the reads were lost too.
+    const { names, skipped } = generate(SAFE, SAFE_ABI);
+    expect(names).toEqual(["safe__getOwners", "safe__nonce"]);
+    expect(skipped).toEqual([
+      {
+        signature: "execTransaction(address,uint256,bytes)",
+        reason: expect.stringContaining(
+          'safe: execTransaction(address,uint256,bytes): input 1 is named "value", which the generated write tool already takes as the native-token amount to send',
+        ),
+      },
+    ]);
+  });
+
+  test("a function-typed input leaves only that function out", () => {
+    const { names, skipped } = generate(SAFE, [
+      ...SAFE_ABI.slice(0, 1),
+      {
+        type: "function",
+        name: "onCallback",
+        inputs: [{ name: "cb", type: "function" }],
+        outputs: [],
+        stateMutability: "nonpayable",
+      },
+    ]);
+    expect(names).toEqual(["safe__getOwners"]);
+    expect(skipped.map((s) => s.signature)).toEqual(["onCallback(function)"]);
+    expect(skipped[0]?.reason).toContain("cannot be encoded");
+  });
+
+  test("an input named like something every object inherits is left out, not read from the prototype", async () => {
+    // The input parser reads `toString` as present in a call that leaves it
+    // out, and the executor was handed Object.prototype.toString.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty"]) {
+      const label: AbiItem = {
+        type: "function",
+        name: "setLabel",
+        inputs: [{ name, type: "string" }],
+        outputs: [],
+        stateMutability: "nonpayable",
+      };
+      const { names, skipped } = generate(SAFE, [...SAFE_ABI.slice(0, 1), label]);
+      expect({ name, names }).toEqual({ name, names: ["safe__getOwners"] });
+      expect(skipped[0]?.reason).toContain(
+        `input 0 is named "${name}", a name every object inherits`,
+      );
+      // Alone, nothing is left to generate, and the ABI is refused by name.
+      expect(() =>
+        generateContractTools({
+          contract: SAFE,
+          abi: [label],
+          readExecutor: async () => "0x",
+          writeExecutor: async () => "{}",
+        }),
+      ).toThrow(new RegExp(`input 0 is named "${name}", a name every object inherits`));
+    }
   });
 });

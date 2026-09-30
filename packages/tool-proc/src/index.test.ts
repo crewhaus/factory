@@ -26,6 +26,9 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   PROC_TOOLS,
   __resetRegistryForTest,
+  __stopAllForTest,
+  _resetProcConfig,
+  _setDnsLookup,
   commandExists,
   envInspect,
   processList,
@@ -33,6 +36,7 @@ import {
   processStart,
   processStatus,
   processStop,
+  registerProcConfig,
   retry,
   runCommand,
   runPipeline,
@@ -40,6 +44,8 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
+import { unspecifiedDial } from "./lib/addr";
+import { _setPlatform, searchPath } from "./lib/which";
 
 let originalCwd: string;
 let tmp: string;
@@ -55,8 +61,8 @@ beforeEach(() => {
   __resetRegistryForTest();
 });
 
-afterEach(() => {
-  __resetRegistryForTest();
+afterEach(async () => {
+  await __stopAllForTest();
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
@@ -73,6 +79,15 @@ async function call(tool: RegisteredTool, input: unknown): Promise<any> {
     return out;
   }
 }
+
+/**
+ * A test that runs a {@link script} file as the program. Windows cannot
+ * execute a `#!/bin/sh` file (CreateProcess knows no shebang), so these run on
+ * macOS and Linux only; on Windows the spawn, deadline and kill paths are
+ * still exercised by the tests that run `sh -c`, `sleep`, `cat` and `echo`
+ * from PATH.
+ */
+const testScript = test.skipIf(process.platform === "win32");
 
 /** Write an executable shell script into the temp workspace. */
 function script(name: string, body: string): string {
@@ -323,7 +338,7 @@ describe("RunCommand", () => {
     expect(out.stdout).toBe("");
   });
 
-  test("stderr is captured separately", async () => {
+  testScript("stderr is captured separately", async () => {
     const path = script("noisy.sh", "echo out; echo err >&2; exit 2");
     const out = await call(runCommand, { argv: [path] });
     expect(out.stdout.trim()).toBe("out");
@@ -345,26 +360,30 @@ describe("RunCommand", () => {
    * it must still die. This asserts the SIGKILL escalation really happens, by
    * running a script that ignores TERM and would otherwise loop forever.
    */
-  test("a command that ignores SIGTERM is SIGKILLed after the grace period", async () => {
-    const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
-    const started = Date.now();
-    const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
-    const elapsed = Date.now() - started;
-    expect(out.timedOut).toBe(true);
-    expect(out.exitCode).not.toBe(0);
-    // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
-    // emphatically not run to the end of a `while true`.
-    expect(elapsed).toBeGreaterThanOrEqual(200);
-    expect(elapsed).toBeLessThan(8_000);
-    // Waits out a real SIGTERM grace period before the SIGKILL.
-  }, 20_000);
+  testScript(
+    "a command that ignores SIGTERM is SIGKILLed after the grace period",
+    async () => {
+      const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
+      const started = Date.now();
+      const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
+      const elapsed = Date.now() - started;
+      expect(out.timedOut).toBe(true);
+      expect(out.exitCode).not.toBe(0);
+      // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
+      // emphatically not run to the end of a `while true`.
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(8_000);
+      // Waits out a real SIGTERM grace period before the SIGKILL.
+    },
+    20_000,
+  );
 
   /**
    * A grandchild inherits the pipe, so reading stdout to EOF can outlive the
    * process that was actually being run. The drain window is what stops that
    * from becoming an unbounded wait.
    */
-  test("a grandchild holding the pipe open does not hold the call open", async () => {
+  testScript("a grandchild holding the pipe open does not hold the call open", async () => {
     const path = script("forker.sh", "sleep 20 &\necho parent done");
     const started = Date.now();
     const out = await call(runCommand, { argv: [path], timeoutMs: 30_000 });
@@ -374,12 +393,70 @@ describe("RunCommand", () => {
     // The grandchild sleeps 20s; returning in anything under that proves the
     // drain gave up rather than waiting for EOF.
     expect(elapsed).toBeLessThan(10_000);
+    // C078: what arrived before the drain gave up is kept, and the result
+    // says it may be incomplete — it used to come back as "" with ok:true.
+    expect(out.stdout).toContain("parent done");
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.ok).toBe(true);
   });
+
+  test("a timed-out command still returns what it printed before the deadline", async () => {
+    // `sh -c`, not a fresh script file: macOS may scan a new executable for
+    // longer than this deadline before running a line of it.
+    const out = await call(runCommand, {
+      // No `exec`: the shell's own child is what used to hold the pipe open
+      // after the deadline's signal killed only the shell.
+      argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
+      timeoutMs: 1_000,
+    });
+    expect(out.timedOut).toBe(true);
+    expect(out.stdout).toContain("error: port in use");
+  });
+
+  test("output past the cap is discarded as it arrives, not buffered first", async () => {
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    let peak = before;
+    const sampler = setInterval(() => {
+      peak = Math.max(peak, process.memoryUsage().rss);
+    }, 5);
+    let out: { stdoutTruncated: boolean; stdout: string };
+    try {
+      out = await call(runCommand, {
+        argv: ["head", "-c", "200000000", "/dev/zero"],
+        maxOutputChars: 100,
+      });
+    } finally {
+      clearInterval(sampler);
+    }
+    // 0.7.0 held the whole 200 MB (and more) as a string before capping.
+    expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+    expect(out.stdoutTruncated).toBe(true);
+    // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
+    expect(out.stdout).toContain("[199999900 bytes dropped]");
+  }, 20_000);
+
+  test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
+    const out = await call(runCommand, {
+      // The grandchild starts writing only after the drain grace is over.
+      argv: ["sh", "-c", "(sleep 0.9; head -c 50000000 /dev/zero) &\necho started"],
+      maxOutputChars: 100,
+    });
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.stdout).toContain("started");
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    await Bun.sleep(1_500);
+    Bun.gc(true);
+    // The stream was cancelled at the drain grace: the 50 MB the
+    // grandchild writes afterwards never reaches this process.
+    expect(process.memoryUsage().rss - before).toBeLessThan(40 * 1024 * 1024);
+  }, 20_000);
 
   test("output over the cap is truncated at both ends rather than dropped or unbounded", async () => {
     const out = await call(runCommand, { argv: ["seq", "1", "5000"], maxOutputChars: 200 });
     expect(out.stdoutTruncated).toBe(true);
-    expect(out.stdout).toContain("chars dropped");
+    expect(out.stdout).toContain("bytes dropped");
     expect(out.stdout.startsWith("1\n2\n")).toBe(true);
     expect(out.stdout.trimEnd().endsWith("5000")).toBe(true);
   });
@@ -594,22 +671,25 @@ describe("Retry", () => {
     ]);
   });
 
-  test("a command that only works on the second attempt succeeds there, and every attempt is reported", async () => {
-    const path = script(
-      "flaky.sh",
-      'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
-    );
-    const out = await call(retry, {
-      argv: [path],
-      maxAttempts: 4,
-      backoff: { kind: "exponential", baseMs: 10 },
-    });
-    expect(out.succeeded).toBe(true);
-    expect(out.attemptsUsed).toBe(2);
-    expect(out.attempts[0].ok).toBe(false);
-    expect(out.attempts[1].ok).toBe(true);
-    expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
-  });
+  testScript(
+    "a command that only works on the second attempt succeeds there, and every attempt is reported",
+    async () => {
+      const path = script(
+        "flaky.sh",
+        'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
+      );
+      const out = await call(retry, {
+        argv: [path],
+        maxAttempts: 4,
+        backoff: { kind: "exponential", baseMs: 10 },
+      });
+      expect(out.succeeded).toBe(true);
+      expect(out.attemptsUsed).toBe(2);
+      expect(out.attempts[0].ok).toBe(false);
+      expect(out.attempts[1].ok).toBe(true);
+      expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
+    },
+  );
 
   test("successExitCodes lets a caller define success", async () => {
     const out = await call(retry, {
@@ -680,7 +760,7 @@ describe("background processes", () => {
     expect(second.id).toBe("proc_2");
   });
 
-  test("output is returned once: a second poll sees only what is new", async () => {
+  testScript("output is returned once: a second poll sees only what is new", async () => {
     // The second line must not be written until the first poll has happened,
     // and a `sleep` cannot promise that: on a loaded machine the wait loop's
     // own tick outlasts the sleep, both lines land in one read, and the test
@@ -721,14 +801,20 @@ describe("background processes", () => {
     expect(await call(processStatus, { id: started.id })).toContain("no background process");
   });
 
-  test("a process that ignores SIGTERM is escalated to SIGKILL within the grace period", async () => {
-    const path = script("stubborn.sh", 'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done');
-    const started = await call(processStart, { argv: [path] });
-    await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
-    const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
-    expect(stopped.stopped).toBe(true);
-    expect(stopped.escalatedToSigkill).toBe(true);
-  });
+  testScript(
+    "a process that ignores SIGTERM is escalated to SIGKILL within the grace period",
+    async () => {
+      const path = script(
+        "stubborn.sh",
+        'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done',
+      );
+      const started = await call(processStart, { argv: [path] });
+      await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
+      const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
+      expect(stopped.stopped).toBe(true);
+      expect(stopped.escalatedToSigkill).toBe(true);
+    },
+  );
 
   test("an unknown id is a readable message listing what is known", async () => {
     await call(processStart, { argv: ["true"] });
@@ -751,7 +837,7 @@ describe("background processes", () => {
 // ---------------------------------------------------------------------------
 
 describe("WaitForOutput", () => {
-  test("returns as soon as the pattern appears", async () => {
+  testScript("returns as soon as the pattern appears", async () => {
     const path = script("server.sh", 'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5');
     const started = await call(processStart, { argv: [path] });
     const out = await call(waitForOutput, {
@@ -763,7 +849,7 @@ describe("WaitForOutput", () => {
     expect(out.match).toBe("Listening on 4321");
   });
 
-  test("a failure pattern ends the wait early instead of burning the deadline", async () => {
+  testScript("a failure pattern ends the wait early instead of burning the deadline", async () => {
     const path = script(
       "broken.sh",
       'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
@@ -779,6 +865,59 @@ describe("WaitForOutput", () => {
     expect(out.matchedFailure).toBe(true);
     expect(out.match).toBe("FATAL");
   });
+
+  test("a brace-quantified nested pattern is refused at once, not run to the deadline (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", "echo deadbeefcafe0123456789abcdef0123456789ab; sleep 5"],
+    });
+    // 0.7.0's scanner took `{1,}` for a literal and ran this: ~6.7 s of a
+    // blocked event loop and a false reason "deadline".
+    const out = await call(waitForOutput, {
+      id: started.id,
+      pattern: "(\\w{1,})*$",
+      timeoutMs: 3_000,
+    });
+    expect(String(out)).toContain("[WaitForOutput error]");
+    expect(String(out)).toContain("exponentially");
+  });
+
+  test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
+    // One process, not `sh -c "printf …; sleep 5"`: that left `sleep` behind
+    // when the registry killed `sh`, and on Windows a live process whose cwd
+    // is the workspace keeps it from being removed (EBUSY in afterEach).
+    const started = await call(processStart, {
+      argv: [
+        process.execPath,
+        "-e",
+        `process.stdout.write("${"a".repeat(300)}"); setTimeout(() => {}, 5000);`,
+      ],
+    });
+    // Wait for the output itself, not a fixed 200 ms a slow start outlasts.
+    let seen = "";
+    const until = Date.now() + 10_000;
+    while (seen.length < 300 && Date.now() < until) {
+      seen += String((await call(processOutput, { id: started.id })).stdout ?? "");
+      if (seen.length < 300) await Bun.sleep(20);
+    }
+    expect(seen).toBe("a".repeat(300));
+    try {
+      // Screened as safe (star height 1) but cubic: ~1 s on 300 characters,
+      // past this call's budget. Bounded: the abandoned worker stops within
+      // about a second.
+      const out = await call(waitForOutput, {
+        id: started.id,
+        pattern: "\\w*\\w*\\w*!",
+        timeoutMs: 250,
+      });
+      expect({ matched: out.matched, reason: out.reason }).toEqual({
+        matched: null,
+        reason: "undetermined",
+      });
+      expect(String(out.detail)).toContain("pattern could not be evaluated");
+    } finally {
+      await call(processStop, { id: started.id, signal: "SIGKILL" });
+    }
+  }, 20_000);
 
   test("the deadline is honoured when the pattern never appears", async () => {
     const started = await call(processStart, { argv: ["sleep", "30"] });
@@ -823,26 +962,29 @@ describe("WaitForOutput", () => {
    * therefore happen before the first match, and it must cover the
    * overlapping-alternation shape that star height alone does not see.
    */
-  test("an overlapping alternation is refused before it is ever matched, not at the deadline", async () => {
-    const path = script(
-      "many-a.sh",
-      'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
-    );
-    const started = await call(processStart, { argv: [path] });
-    const at = Date.now();
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(a|a)*$",
-      timeoutMs: 1_000,
-    });
-    expect(typeof out).toBe("string");
-    expect(out).toContain("alternation");
-    // Refused up front: it never even reached the deadline, let alone the
-    // match that would have outlived the process.
-    expect(Date.now() - at).toBeLessThan(1_000);
-  });
+  testScript(
+    "an overlapping alternation is refused before it is ever matched, not at the deadline",
+    async () => {
+      const path = script(
+        "many-a.sh",
+        'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const at = Date.now();
+      const out = await call(waitForOutput, {
+        id: started.id,
+        pattern: "(a|a)*$",
+        timeoutMs: 1_000,
+      });
+      expect(typeof out).toBe("string");
+      expect(out).toContain("alternation");
+      // Refused up front: it never even reached the deadline, let alone the
+      // match that would have outlived the process.
+      expect(Date.now() - at).toBeLessThan(1_000);
+    },
+  );
 
-  test("a wait for a line, with an unquantified alternation, still works", async () => {
+  testScript("a wait for a line, with an unquantified alternation, still works", async () => {
     const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
     const started = await call(processStart, { argv: [path] });
     const out = await call(waitForOutput, {
@@ -891,9 +1033,237 @@ describe("WaitForPort", () => {
     const out = await call(waitForPort, { port: 80, host: "not a host", timeoutMs: 50 });
     expect(out).toContain("is not a hostname");
   });
+
+  /**
+   * C144: WaitForPort is read-only, so plan and auto mode run it unasked. It
+   * probes loopback; any other host needs the operator's
+   * tool_config.proc.wait_for_port_hosts, and is refused before a DNS query
+   * or a socket.
+   */
+  describe("what it may probe (C144)", () => {
+    let lookups: string[] = [];
+    let answers: Record<string, string[]> = {};
+    let server: ReturnType<typeof createServer>;
+    let port = 0;
+    beforeEach(async () => {
+      lookups = [];
+      answers = {};
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        return answers[host] ?? [];
+      });
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+    });
+    afterEach(async () => {
+      _setDnsLookup(undefined);
+      _resetProcConfig();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
+      for (const host of [
+        "169.254.169.254",
+        "10.0.0.5",
+        "0xa9.0xfe.0xa9.0xfe",
+        "x.attacker.test",
+      ]) {
+        const out = await call(waitForPort, { host, port: 80, timeoutMs: 100 });
+        expect({ host, refused: String(out).includes("is not a loopback address") }).toEqual({
+          host,
+          refused: true,
+        });
+        // A refusal is a sentence: no probe ran, so no `attempts`.
+        expect(String(out)).not.toContain('"attempts"');
+      }
+      // Not even a DNS query for the unlisted name.
+      expect(lookups).toEqual([]);
+    });
+
+    test("loopback in any spelling still works, with no configuration", async () => {
+      for (const host of ["127.0.0.1", "0x7f.1", "2130706433", "127.1", "localhost"]) {
+        const out = await call(waitForPort, { host, port, timeoutMs: 3_000 });
+        expect({ host, satisfied: out.satisfied }).toEqual({ host, satisfied: true });
+      }
+      expect(lookups).toEqual([]);
+    });
+
+    test("a listed name is resolved once and its address dialled for every probe", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["db.internal"] });
+      answers["db.internal"] = ["127.0.0.1"];
+      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      // A closed wait polls several times; the name is still looked up once.
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      lookups = [];
+      const closed = await call(waitForPort, {
+        host: "db.internal",
+        port,
+        state: "open",
+        timeoutMs: 300,
+        intervalMs: 50,
+      });
+      expect(closed.attempts).toBeGreaterThan(1);
+      expect(lookups).toEqual(["db.internal"]);
+    });
+
+    test("a listed name that does not resolve yet is waited for, then pinned", async () => {
+      // A compose service's name exists only once its container does: the
+      // wait must keep looking it up, not give up on the first empty answer
+      // (regression review). Once it answers, that address is dialled on.
+      registerProcConfig({ wait_for_port_hosts: ["db"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 3 ? ["127.0.0.1"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "db",
+        port,
+        timeoutMs: 5_000,
+        intervalMs: 20,
+      });
+      expect({ satisfied: out.satisfied, attempts: out.attempts, note: out.note }).toEqual({
+        satisfied: true,
+        attempts: 3,
+        note: undefined,
+      });
+      expect(lookups).toEqual(["db", "db", "db"]);
+    });
+
+    test("a listed name that never resolves is closed: a closed wait is met, an open one is not", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["gone.invalid"] });
+      const closed = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        state: "closed",
+        timeoutMs: 2_000,
+      });
+      expect({ satisfied: closed.satisfied, state: closed.state }).toEqual({
+        satisfied: true,
+        state: "closed",
+      });
+      expect(String(closed.note)).toContain("did not resolve");
+      const open = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        timeoutMs: 200,
+        intervalMs: 50,
+      });
+      expect({ satisfied: open.satisfied, reason: open.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(open.attempts).toBeGreaterThan(1);
+      expect(String(open.note)).toContain("did not resolve");
+    });
+
+    test("a listed name that later resolves to link-local is refused mid-wait", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["flaky.example"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 2 ? ["169.254.169.254"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "flaky.example",
+        port: 80,
+        timeoutMs: 2_000,
+        intervalMs: 20,
+      });
+      expect(String(out)).toContain("link-local");
+    });
+
+    test("0.0.0.0 and :: — what a dev server prints — are probed as loopback", async () => {
+      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      expect(unspecifiedDial("0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("::")).toBe("::1");
+      expect(unspecifiedDial("0:0:0:0:0:0:0:0")).toBe("::1");
+      expect(unspecifiedDial("::ffff:0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("10.0.0.1")).toBeNull();
+      expect(lookups).toEqual([]);
+    });
+
+    test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
+      answers["meta.example"] = ["169.254.169.254"];
+      const meta = await call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 });
+      expect(String(meta)).toContain("link-local");
+      const listed = await call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 });
+      expect(listed.attempts).toBeGreaterThanOrEqual(1);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["10.255.255.1"] });
+      const out = await waitForPort.execute(
+        { host: "10.255.255.1", port: 80, timeoutMs: 50 },
+        { toolConfig: { wait_for_port_hosts: [] } },
+      );
+      expect(String(out)).toContain("is not a loopback address");
+    });
+
+    test("the registrar refuses a malformed host list, naming the key", () => {
+      expect(() => registerProcConfig({ wait_for_port_hosts: "db" })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+      expect(() => registerProcConfig({ wait_for_port_hosts: ["has space"] })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
+
+/**
+ * Regression review: RunCommand's child is spawned detached (setsid), so it
+ * has no controlling terminal — sudo, ssh and gpg prompts fail instead of
+ * waiting. That is the chosen behaviour (a model-run command must not read or
+ * inject into the operator's terminal), so it is pinned here under a real
+ * pty: the same shell run directly under `script` opens /dev/tty, and run
+ * through RunCommand inside that same pty it cannot.
+ */
+describe("RunCommand runs without a terminal", () => {
+  const script = ["/usr/bin/script", "/bin/script"].find((p) => existsSync(p));
+  const probe = "if (exec 3</dev/tty) 2>/dev/null; then echo TTY-OK; else echo TTY-NONE; fi";
+  const underPty = (argv: string[]): string => {
+    const quoted = argv.map((a) => `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+    const cmd =
+      process.platform === "darwin"
+        ? [script as string, "-q", "/dev/null", ...argv]
+        : [script as string, "-qec", quoted, "/dev/null"];
+    const r = Bun.spawnSync(cmd, { cwd: tmp, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    return r.stdout.toString().replaceAll("\r", "");
+  };
+
+  test.skipIf(process.platform === "win32" || script === undefined)(
+    "a child of RunCommand cannot open the terminal its harness runs in",
+    () => {
+      // The pty is live: a shell started in it opens /dev/tty.
+      expect(underPty(["/bin/sh", "-c", probe])).toContain("TTY-OK");
+      const child = join(tmp, "run-in-pty.ts");
+      writeFileSync(
+        child,
+        [
+          `import { runCommand } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          `const out = await runCommand.execute({ argv: ["/bin/sh", "-c", ${JSON.stringify(probe)}], timeoutMs: 10000 });`,
+          'console.log("RESULT", String(out));',
+        ].join("\n"),
+      );
+      const out = underPty([process.execPath, child]);
+      const line = out.split("\n").find((l) => l.includes("RESULT {")) ?? "";
+      const result = JSON.parse(line.slice(line.indexOf("{"))) as { ok: boolean; stdout: string };
+      expect({ ok: result.ok, stdout: result.stdout }).toEqual({ ok: true, stdout: "TTY-NONE\n" });
+    },
+    30_000,
+  );
+});
 
 describe("WaitForFile", () => {
   test("returns once the file appears", async () => {
@@ -1040,7 +1410,8 @@ describe("CommandExists", () => {
   test("finds a program that is on PATH and resolves it", async () => {
     const out = await call(commandExists, { name: "sh" });
     expect(out.found).toBe(true);
-    expect(out.path.endsWith("/sh")).toBe(true);
+    // `…/bin/sh` on POSIX; on Windows the PATHEXT match, e.g. `…\\usr\\bin\\sh.exe`.
+    expect(out.path).toMatch(process.platform === "win32" ? /\\sh(\.exe)?$/i : /\/sh$/);
   });
 
   test("reports a missing program as an answer, not an error", async () => {
@@ -1052,6 +1423,56 @@ describe("CommandExists", () => {
   test("a path is refused: this looks up names, it does not stat wherever it is pointed", async () => {
     expect(await call(commandExists, { name: "/etc/passwd" })).toContain("is a path");
     expect(await call(commandExists, { name: "../sh" })).toContain("is a path");
+  });
+
+  describe("on Windows (C125)", () => {
+    const saved = { path: process.env["PATH"], pathext: process.env["PATHEXT"] };
+    afterEach(() => {
+      _setPlatform(undefined);
+      for (const [key, value] of [
+        ["PATH", saved.path],
+        ["PATHEXT", saved.pathext],
+      ] as const) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    });
+
+    test("a bare name finds the program through PATHEXT, as RunCommand's spawn would", async () => {
+      const dir = join(tmp, "bin");
+      mkdirSync(dir);
+      // No execute bit: Windows has none, and the POSIX check must not apply.
+      writeFileSync(join(dir, "tool.exe"), "");
+      process.env["PATH"] = dir;
+      process.env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD";
+      _setPlatform("win32");
+      const out = await call(commandExists, { name: "tool" });
+      expect({ found: out.found, path: out.path }).toEqual({
+        found: true,
+        path: join(dir, "tool.exe"),
+      });
+      // Control: the same directory on POSIX has no program called "tool".
+      _setPlatform("linux");
+      expect((await call(commandExists, { name: "tool" })).found).toBe(false);
+    });
+
+    test("PATHEXT order, PATH order, a spelled-out extension and an extensionless file", () => {
+      const a = join(tmp, "a");
+      const b = join(tmp, "b");
+      mkdirSync(a);
+      mkdirSync(b);
+      writeFileSync(join(a, "git"), "");
+      writeFileSync(join(b, "git.exe"), "");
+      writeFileSync(join(b, "git.com"), "");
+      writeFileSync(join(a, "npm.cmd"), "");
+      const win = { pathValue: `"${a}";${b}`, platform: "win32" as const, pathext: ".COM;.EXE" };
+      // An extensionless `git` in an earlier directory is not a program there.
+      expect(searchPath("git", win)).toEqual({ path: join(b, "git.com"), searchedDirs: 2 });
+      expect(searchPath("git.exe", win).path).toBe(join(b, "git.exe"));
+      // .CMD is not in this PATHEXT, so npm is not found; with the default it is.
+      expect(searchPath("npm", win).path).toBeNull();
+      expect(searchPath("npm", { ...win, pathext: undefined }).path).toBe(join(a, "npm.cmd"));
+    });
   });
 
   test("the answer is stable across calls", async () => {
@@ -1077,12 +1498,104 @@ describe("EnvInspect", () => {
     expect(JSON.stringify(out)).not.toContain("sk-0123456789");
   });
 
-  test("reveals only what the caller names", async () => {
-    const out = await call(envInspect, {
-      names: ["TOOL_PROC_TOKEN"],
-      reveal: ["TOOL_PROC_TOKEN"],
+  // C052: before 0.7.1 the CALL chose what to reveal, so a model could read
+  // any key into its own context from a read-only tool plan mode runs unasked.
+  describe("a value is shown only where the operator allowed it", () => {
+    const KEY = ["sk-ant-api03-", "0123456789abcdef", "ABCDEFGH"].join("");
+    beforeEach(() => {
+      process.env["TOOL_PROC_API_KEY"] = KEY;
+      process.env["TOOL_PROC_MODE"] = "staging";
+      process.env["TOOL_PROC_PGPASSWORD"] = "hunter2";
+      process.env["TOOL_PROC_DATABASE_URL"] = "postgres://u:p@h/db";
+      process.env["TOOL_PROC_GITHUB_PAT"] = "ghp-lookalike-value";
     });
-    expect(out.variables[0].value).toBe("sk-0123456789");
+    afterEach(() => {
+      _resetProcConfig();
+      for (const n of [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_MODE",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ]) {
+        Reflect.deleteProperty(process.env, n);
+      }
+    });
+
+    test("with no tool_config, a reveal shows nothing and says why", async () => {
+      const out = await call(envInspect, {
+        names: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+        reveal: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+      });
+      expect(JSON.stringify(out)).not.toContain(KEY);
+      expect(JSON.stringify(out)).not.toContain("staging");
+      expect(out.variables).toEqual([
+        {
+          name: "TOOL_PROC_API_KEY",
+          present: true,
+          chars: KEY.length,
+          withheld: "credential-shaped",
+        },
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, withheld: "not-allowed" },
+      ]);
+      expect(out.note).toContain("tool_config.proc.env_reveal");
+    });
+
+    test("a listed, ordinary name is shown", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const out = await call(envInspect, { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] });
+      expect(out.variables).toEqual([
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, value: "staging" },
+      ]);
+    });
+
+    test("a credential-shaped name is never shown, and cannot be listed", async () => {
+      // Names the old suffix-only heuristics missed are caught too.
+      const secretNames = [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ];
+      for (const name of secretNames) {
+        expect(() => registerProcConfig({ env_reveal: [name] })).toThrow("looks like a credential");
+      }
+      const out = await call(envInspect, { names: secretNames, reveal: secretNames });
+      for (const secret of [KEY, "hunter2", "postgres://u:p@h/db", "ghp-lookalike-value"]) {
+        expect(JSON.stringify(out)).not.toContain(secret);
+      }
+      expect(out.variables.map((v: { withheld?: string }) => v.withheld)).toEqual([
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+      ]);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const input = { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] };
+      const narrowed = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: [] } } as never)),
+      );
+      expect(narrowed.variables[0].withheld).toBe("not-allowed");
+      const broken = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: "x" } } as never)),
+      );
+      expect(broken.variables[0].withheld).toBe("not-allowed");
+    });
+
+    test("the registrar refuses a block it cannot read, naming the key", () => {
+      expect(() => registerProcConfig({ env_reveal: "NODE_ENV" })).toThrow(
+        "tool_config.proc.env_reveal",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["not a name"] })).toThrow(
+        "not an environment",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["A"], envReveal: ["B"] })).toThrow("both");
+      expect(() => registerProcConfig({})).not.toThrow();
+      expect(() => registerProcConfig({ allowed_origins: ["https://a.example"] })).not.toThrow();
+    });
   });
 
   test("revealing something that was not inspected is refused", async () => {

@@ -20,6 +20,7 @@ class StubSandbox implements Sandbox {
   async exec(o: SandboxExecOptions): Promise<SandboxExecResult> {
     void o;
     return {
+      ...this.result,
       stdout: this.result.stdout ?? "",
       stderr: this.result.stderr ?? "",
       exitCode: this.result.exitCode ?? 0,
@@ -97,5 +98,22 @@ describe("program_output publication", () => {
     await python.execute({ code: "print('é')" }, { runContext });
     const ev = events.find((e): e is ProgramOutputEvent => e.kind === "program_output");
     expect(ev?.stdoutBytes).toBe(2);
+  });
+
+  test("byte counts are what the program wrote, not what the output cap kept", async () => {
+    registerCodeExecutionConfig({
+      sandbox: new StubSandbox({
+        stdout: "a\n[stdout truncated: 2999998 bytes dropped]\nb",
+        stdoutBytes: 3_000_000,
+        stdoutDroppedBytes: 2_999_998,
+        stderr: "",
+        stderrBytes: 0,
+      }),
+    });
+    const { runContext, events } = captureBus();
+    await shell.execute({ code: "flood" }, { runContext });
+    const ev = events.find((e): e is ProgramOutputEvent => e.kind === "program_output");
+    expect(ev?.stdoutBytes).toBe(3_000_000);
+    expect(ev?.stderrBytes).toBe(0);
   });
 });

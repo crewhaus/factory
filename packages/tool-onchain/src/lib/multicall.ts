@@ -27,7 +27,7 @@
  * or submits a transaction.
  */
 import { type AbiValue, type Decoded, decodeData, encodeCall } from "./abi";
-import { validateAddress } from "./address";
+import { checkedAddress } from "./address";
 
 /**
  * Where Multicall3 is deployed on most chains, via a deterministic deploy.
@@ -38,6 +38,28 @@ import { validateAddress } from "./address";
  * Every entry point here takes the address as an argument.
  */
 export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+/**
+ * An operator's own Multicall3 deployments, from a tool_config block:
+ * `{ "<chainId>": "0x…" }`, for a chain where the deterministic deploy is not
+ * at {@link MULTICALL3_ADDRESS}. Every value must be an address whose
+ * checksum holds — an aggregator answers every read in a batch, so a typo
+ * here is every answer wrong. Returns chain id → EIP-55 address; `undefined`
+ * is an empty map.
+ */
+export function parseMulticallMap(input: unknown, what: string): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  if (input === undefined) return out;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error(
+      `${what} must map a chain id to its Multicall3 address, for example { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd963" }`,
+    );
+  }
+  for (const [chainId, address] of Object.entries(input)) {
+    out.set(chainId.trim(), checkedAddress(address, `${what}["${chainId}"]`));
+  }
+  return out;
+}
 
 /** The canonical signature, which is what the selector is hashed over. */
 export const AGGREGATE3_SIGNATURE = "aggregate3((address,bool,bytes)[])";
@@ -124,12 +146,6 @@ export type Aggregate3Result = {
   /** The revert, decoded, when this call failed. Null when it succeeded. */
   readonly revert: RevertReason | null;
 };
-
-function checkedAddress(raw: string, what: string): string {
-  const result = validateAddress(raw);
-  if (!result.valid) throw new Error(`${what}: ${result.reason}`);
-  return result.checksummed;
-}
 
 function checkedBytes(raw: string, what: string): string {
   const text = raw.trim();

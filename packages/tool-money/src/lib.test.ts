@@ -7,9 +7,11 @@ import { describe, expect, test } from "bun:test";
  * always sum to the whole — are properties this is the right level to pin.
  */
 import { createHmac } from "node:crypto";
+import { RegexAnswers, askCheckPatterns } from "@crewhaus/tool-schema";
 import { allocateProportional, computeRefund } from "./lib/allocate";
 import { codeLines } from "./lib/coding";
 import { checkSpendLimit, refundAbuseSignals } from "./lib/controls";
+import { InexactAmountError } from "./lib/exact";
 import {
   detectKind,
   luhnOk,
@@ -349,6 +351,24 @@ describe("three-way match", () => {
     ).toBe("matched");
   });
 
+  test("a fractional quantity tolerance applies to whole quantities, without throwing", () => {
+    // 10 invoiced against 11 ordered: the exact comparison for whole numbers
+    // made BigInt(1.5) and threw "Not an integer".
+    const order = [{ id: "p", sku: "S", quantity: 11, unitPriceMinor: 1250 }];
+    const invoice = [{ id: "i", poLineId: "p", quantity: 10, unitPriceMinor: 1250 }];
+    const status = (quantityAbsolute: number) =>
+      matchInvoiceToPurchaseOrder(invoice, order, [], { quantityAbsolute }).pairs[0]?.status;
+    expect(status(1.5)).toBe("matched");
+    expect(status(1)).toBe("matched");
+    expect(status(0.5)).toBe("quantity-variance");
+    expect(status(0.999_999)).toBe("quantity-variance");
+    // Fractional quantities keep the float comparison they always had.
+    const kilos = [{ id: "i", poLineId: "p", quantity: 10.25, unitPriceMinor: 1250 }];
+    expect(
+      matchInvoiceToPurchaseOrder(kilos, order, [], { quantityAbsolute: 0.75 }).pairs[0]?.status,
+    ).toBe("matched");
+  });
+
   test("billing for more than arrived is caught only by the third leg", () => {
     const invoice = [{ id: "i1", poLineId: "po1", quantity: 100, unitPriceMinor: 4750 }];
     expect(matchInvoiceToPurchaseOrder(invoice, po).pairs[0]?.status).toBe("matched");
@@ -490,6 +510,62 @@ describe("cost basis", () => {
       ),
     ).toThrow(/names no lots/);
   });
+
+  test("HIFO re-ranks a lot a disposal took part of", () => {
+    // B costs 333.5 a unit and A 333.33, so B goes first. Taking one unit of
+    // B costs 334 (333.5 rounded), which leaves B at 333 a unit — now BELOW A,
+    // so the next disposal must take A.
+    const result = computeCostBasis(
+      [
+        { id: "A", acquiredAt: "2024-01-01T00:00:00Z", quantity: 3, costMinor: 1000 },
+        { id: "B", acquiredAt: "2024-01-02T00:00:00Z", quantity: 2, costMinor: 667 },
+      ],
+      [1, 2].map((n) => ({
+        id: `d${n}`,
+        disposedAt: `2025-06-0${n}T00:00:00Z`,
+        quantity: 1,
+        proceedsMinor: 0,
+      })),
+      "hifo",
+    );
+    expect(result.disposals.map((d) => d.consumed.map((c) => [c.lotId, c.costMinor]))).toEqual([
+      [["B", 334]],
+      [["A", 333]],
+    ]);
+  });
+
+  test("HIFO costs about what FIFO does at thousands of lots, not a sort per disposal", () => {
+    // Every open lot was re-sorted, with bigint products, for every
+    // disposal: 3000 lots and disposals took seconds where FIFO took
+    // milliseconds, and the schema allows ten thousand of each.
+    const n = 3000;
+    const many = Array.from({ length: n }, (_, i) => ({
+      id: `l${i}`,
+      acquiredAt: new Date(Date.UTC(2020, 0, 1) + i * 3_600_000).toISOString(),
+      quantity: [0.5, 1.25, 2, 0.001][i % 4] as number,
+      costMinor: 1000 + ((i * 7919) % 100_000),
+    }));
+    const sells = Array.from({ length: n }, (_, i) => ({
+      id: `d${i}`,
+      disposedAt: new Date(Date.UTC(2025, 0, 1) + i * 60_000).toISOString(),
+      quantity: 0.25,
+      proceedsMinor: 5000,
+    }));
+    const fastest = (method: "fifo" | "hifo"): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let run = 0; run < 3; run++) {
+        const start = performance.now();
+        expect(computeCostBasis(many, sells, method).disposals).toHaveLength(n);
+        best = Math.min(best, performance.now() - start);
+      }
+      return best;
+    };
+    const fifo = fastest("fifo");
+    const hifo = fastest("hifo");
+    expect({ fifo, hifo, withinBudget: hifo <= 5 * fifo + 250 }).toMatchObject({
+      withinBudget: true,
+    });
+  }, 60_000);
 });
 
 describe("spend limits", () => {
@@ -759,6 +835,59 @@ describe("statement parsing", () => {
     });
   });
 
+  test("unclosed <STMTTRN> blocks are each accounted for, in one pass (C092)", () => {
+    // A lazy block regex rescanned to the end of the file from every unclosed
+    // tag: 0.7.0 took about 37 s over this and returned no transactions and
+    // no rejections at all.
+    const result = parseStatement(`<OFX>\n${"<STMTTRN>\n".repeat(64_000)}`);
+    expect(result.count).toBe(0);
+    expect(result.rejected.length).toBe(64_000);
+    expect(result.rejected[63_999]).toEqual({
+      row: 64_000,
+      reason: "the transaction has no readable date or amount",
+    });
+  }, 20_000);
+
+  test("an unclosed block ends where the next begins, and does not swallow it (C092)", () => {
+    const result = parseStatement(
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>-1.00<FITID>A\n<STMTTRN><DTPOSTED>20240102<TRNAMT>-2.00<FITID>B</STMTTRN>\n",
+    );
+    expect(result.transactions.map((t) => [t.id, t.amountMinor])).toEqual([
+      ["A", -100],
+      ["B", -200],
+    ]);
+    expect(result.rejected).toEqual([]);
+  });
+
+  test("SGML-style blocks with no end tags end at the transaction list's close (C092)", () => {
+    const sgml = [
+      "OFXHEADER:100",
+      "<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>",
+      "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260110<TRNAMT>-1.00<FITID>1<NAME>One",
+      "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260111<TRNAMT>-2.00<FITID>2<NAME>Two",
+      // No NAME: a block that ran on past the list would take the balance's.
+      "<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20260112<TRNAMT>3.00<FITID>3",
+      "</BANKTRANLIST><LEDGERBAL><BALAMT>100.00<DTASOF>20260131<NAME>not a transaction",
+      "</STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>",
+    ].join("\n");
+    const result = parseStatement(sgml);
+    expect(result.transactions.map((t) => [t.id, t.description, t.amountMinor])).toEqual([
+      ["1", "One", -100],
+      ["2", "Two", -200],
+      ["3", "", 300],
+    ]);
+  });
+
+  test("closed blocks read exactly as before, in any case, and a stray end tag is ignored", () => {
+    const closed = "<STMTTRN><DTPOSTED>20260101<TRNAMT>-1.00<FITID>x</STMTTRN>".repeat(20_000);
+    expect(parseStatement(`<OFX>${closed}</OFX>`).count).toBe(20_000);
+    const lower = parseStatement(
+      "<ofx></stmttrn><stmttrn><dtposted>20260102<trnamt>5.00<fitid>y</stmttrn></ofx>",
+    );
+    expect(lower.transactions.map((t) => t.id)).toEqual(["y"]);
+    expect(lower.rejected).toEqual([]);
+  });
+
   test("an unreadable row is reported with its reason, and the rest still parse", () => {
     const result = parseStatement(
       "Date,Description,Amount\n2026-01-01,ok,1.00\nnotadate,bad,2.00\n",
@@ -781,6 +910,85 @@ describe("statement parsing", () => {
 
   test("the CSV reader handles a trailing newline and blank lines", () => {
     expect(parseCsvRows("a,b\n1,2\n\n").length).toBe(2);
+  });
+
+  test("an amount past 2^53 − 1 minor units is refused, not rounded (C218)", () => {
+    expect(parseMoneyMinor("90071992547409.91", 2, false)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(parseMoneyMinor("-90071992547409.91", 2, false)).toBe(-Number.MAX_SAFE_INTEGER);
+    expect(parseMoneyMinor("0000000000000000000001.00", 2, false)).toBe(100);
+    // 9007199254740993 cents: 0.7.1's first cut read it as ...992.
+    expect(() => parseMoneyMinor("90071992547409.93", 2, false)).toThrow(InexactAmountError);
+    expect(() => parseMoneyMinor("90,071,992,547,409.92", 2, false)).toThrow(
+      /"90,071,992,547,409.92" is more than 2\^53 − 1 \(9007199254740991\) minor units/,
+    );
+    // A megabyte of digits is refused by its length, and not echoed back.
+    const huge = "9".repeat(1_000_000);
+    expect(() => parseMoneyMinor(huge, 2, false)).toThrow(/^"9{40}…" is more than/);
+  });
+
+  test("a row whose amount is past 2^53 − 1 is rejected by name, in OFX and CSV (C218)", () => {
+    const ofx = parseStatement(
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>90071992547409.93<FITID>A</STMTTRN>\n<STMTTRN><DTPOSTED>20240102<TRNAMT>1.00<FITID>B</STMTTRN>\n",
+    );
+    expect(ofx.transactions.map((t) => t.id)).toEqual(["B"]);
+    expect(ofx.rejectedCount).toBe(1);
+    expect(ofx.rejected[0]?.row).toBe(1);
+    expect(ofx.rejected[0]?.reason).toStartWith(
+      'the amount "90071992547409.93" is more than 2^53 − 1',
+    );
+    const csv = parseStatement(
+      "Date,Amount,Balance\n2024-01-01,1.00,90071992547409.93\n2024-01-02,2.00,3.00\n",
+    );
+    expect(csv.transactions.map((t) => t.amountMinor)).toEqual([200]);
+    expect(csv.rejected).toEqual([
+      {
+        row: 2,
+        reason:
+          'the balance "90071992547409.93" is more than 2^53 − 1 (9007199254740991) minor units, the largest amount this reads exactly, so it is left out rather than rounded',
+      },
+    ]);
+  });
+
+  test("a total that crosses 2^53 − 1 is left out by name, not rounded (C218)", () => {
+    const result = parseStatement(
+      "Date,Amount\n2024-01-01,90071992547409.91\n2024-01-02,0.01\n2024-01-03,0.01\n2024-01-04,-5.00\n",
+    );
+    expect(result.transactions.map((t) => t.amountMinor)).toEqual([
+      Number.MAX_SAFE_INTEGER,
+      1,
+      1,
+      -500,
+    ]);
+    // The debit total fits and is reported; the other two do not.
+    expect(result.debitMinor).toBe(-500);
+    expect(result.creditMinor).toBeNull();
+    expect(result.totalMinor).toBe(Number.MAX_SAFE_INTEGER - 498);
+    expect(result.totalsUnavailable).toBe(
+      "the statement's credit total comes to 9007199254740993 minor units, past ±2^53 − 1 (9007199254740991), so it is left out rather than rounded; every transaction's own amount is exact",
+    );
+    const fits = parseStatement("Date,Amount\n2024-01-01,1.00\n2024-01-02,-0.25\n");
+    expect([fits.totalMinor, fits.debitMinor, fits.creditMinor]).toEqual([75, -25, 100]);
+    expect(fits.totalsUnavailable).toBeNull();
+  });
+
+  test("keep holds only what will be shown; the counts and totals still cover every row (C092)", () => {
+    const blocks = 50_000;
+    const ofx = `<OFX>\n${"<STMTTRN>\n".repeat(blocks)}<STMTTRN><DTPOSTED>20240101<TRNAMT>1.00</STMTTRN><STMTTRN><DTPOSTED>20240102<TRNAMT>2.00</STMTTRN>`;
+    const result = parseStatement(ofx, { keep: { transactions: 1, rejected: 3 } });
+    expect(result.rejected.length).toBe(3);
+    expect(result.rejectedCount).toBe(blocks);
+    expect(result.transactions.map((t) => t.amountMinor)).toEqual([100]);
+    expect(result.count).toBe(2);
+    expect(result.totalMinor).toBe(300);
+    // Held in file order: the first rows, not a sample.
+    expect(result.rejected.map((r) => r.row)).toEqual([1, 2, 3]);
+    const csv = parseStatement("Date,Amount\n2024-01-01,1.00\nbad,2.00\n2024-01-03,4.00\n", {
+      keep: { transactions: 0, rejected: 0 },
+    });
+    expect([csv.transactions.length, csv.count, csv.rejected.length, csv.rejectedCount]).toEqual([
+      0, 2, 0, 1,
+    ]);
+    expect(csv.totalMinor).toBe(500);
   });
 });
 
@@ -816,6 +1024,42 @@ describe("GL coding", () => {
       account: "9999",
       needsReview: true,
       reason: "no rule matched",
+    });
+  });
+
+  test("a pattern the worker could not answer leaves the line uncoded, with the reason", async () => {
+    // A deadline of 0 settles every question as undetermined, deterministically.
+    const regex = new RegexAnswers();
+    const line = { id: "l1", vendor: "AWS capex" };
+    const ordered = [
+      {
+        id: "capex",
+        priority: 10,
+        when: [{ path: "vendor", op: "matches" as const, expected: "capex" }],
+        account: "1500",
+      },
+      {
+        id: "opex",
+        when: [{ path: "vendor", op: "contains" as const, expected: "AWS" }],
+        account: "6500",
+      },
+    ];
+    for (const rule of ordered) askCheckPatterns(line, rule.when, regex);
+    await regex.resolve({}, { deadlineMs: 0 });
+    const result = codeLines([line], ordered, { regex });
+    expect(result.lines[0]).toMatchObject({
+      account: null,
+      needsReview: true,
+      undetermined: ["capex"],
+    });
+    expect(result.lines[0]?.reason).toContain("ran out");
+    // Answered, the same rules code the line.
+    const answered = new RegexAnswers();
+    for (const rule of ordered) askCheckPatterns(line, rule.when, answered);
+    await answered.resolve({});
+    expect(codeLines([line], ordered, { regex: answered }).lines[0]).toMatchObject({
+      account: "1500",
+      needsReview: false,
     });
   });
 
@@ -855,5 +1099,379 @@ describe("GL coding", () => {
     expect(codeLines([{ id: "l1", vendor: "AWS" }], rules, { version: "2026-Q3" }).version).toBe(
       "2026-Q3",
     );
+  });
+});
+
+describe("amounts are exact, or refused — never silently rounded (C218)", () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  test("a tax whose product passes 2^53 is still exact", () => {
+    // amount × bps = 3.19e18: past 2^53, though the amount and the tax are not.
+    const amount = 1_595_908_809_793_069;
+    const exact = (BigInt(amount) * 1999n + 5000n) / 10_000n;
+    const result = calculateTax(
+      [{ id: "a", amountMinor: amount, taxCodes: ["V"] }],
+      [{ code: "V", bps: 1999 }],
+    );
+    expect(result.taxMinor).toBe(Number(exact));
+    // What 0.7.0 answered.
+    expect(result.taxMinor).not.toBe(319_022_171_077_635);
+    expect(result.taxMinor).toBe(319_022_171_077_634);
+    // Tax-inclusive recovery multiplies by 10,000 first: exact too.
+    const inclusive = calculateTax(
+      [{ id: "a", amountMinor: amount, taxCodes: ["V"] }],
+      [{ code: "V", bps: 1999 }],
+      { pricesIncludeTax: true },
+    );
+    expect(inclusive.netMinor).toBe(
+      Number((BigInt(amount) * 10_000n * 2n + 11_999n) / (11_999n * 2n)),
+    );
+  });
+
+  test("a total past 2^53 is refused by name, not reported one unit off", () => {
+    expect(() =>
+      calculateTax(
+        [
+          { id: "a", amountMinor: MAX, taxCodes: ["Z"] },
+          { id: "b", amountMinor: 2, taxCodes: ["Z"] },
+        ],
+        [{ code: "Z", bps: 0 }],
+      ),
+    ).toThrow("the invoice's net comes to 9007199254740993, past ±2^53 − 1");
+    expect(() =>
+      computeCostBasis(
+        [
+          { id: "a", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1 },
+          { id: "b", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: MAX },
+        ],
+        [],
+        "fifo",
+      ),
+    ).toThrow(/the remaining cost comes to 9007199254740992/);
+    expect(() =>
+      checkSpendLimit(
+        { amountMinor: 1 },
+        [
+          { id: "h1", at: "2026-01-01T00:00:00Z", amountMinor: MAX },
+          { id: "h2", at: "2026-01-01T00:00:01Z", amountMinor: 1 },
+        ],
+        { perDayMinor: MAX },
+        Date.parse("2026-01-01T01:00:00Z"),
+      ),
+    ).toThrow(/the spend in the last day comes to 9007199254740992/);
+  });
+
+  test("an unsafe amount handed to the library is refused, not computed with", () => {
+    expect(() =>
+      calculateTax([{ id: "a", amountMinor: 2 ** 53, taxCodes: ["Z"] }], [{ code: "Z", bps: 0 }]),
+    ).toThrow(/line "a" amountMinor \(9007199254740992\) is not an integer within/);
+  });
+
+  test("a fractional quantity's exposure is whole minor units, with no float noise", () => {
+    const report = matchInvoiceToPurchaseOrder(
+      [
+        { id: "i1", poLineId: "p1", quantity: 1.2, unitPriceMinor: 1001 },
+        { id: "i2", poLineId: "p2", quantity: 2.3, unitPriceMinor: 1001 },
+      ],
+      [
+        { id: "p1", quantity: 1, unitPriceMinor: 1000 },
+        { id: "p2", quantity: 2.3, unitPriceMinor: 1001 },
+      ],
+      [
+        { poLineId: "p1", quantity: 1.2 },
+        { poLineId: "p2", quantity: 2.1 },
+      ],
+    );
+    const [first, second] = report.pairs;
+    // 1.2 × 1001 − 1.2 × 1000 = 1.2 (0.7.0: 1.2000000000000455).
+    expect(first?.exposureMinor).toBe(1);
+    // 2.3 × 1001 − 2.1 × 1001 = 200.2 (0.7.0: 200.19999999999982).
+    expect(second?.exposureMinor).toBe(200);
+    expect(report.totalExposureMinor).toBe(201);
+    for (const pair of report.pairs) expect(Number.isInteger(pair.exposureMinor)).toBe(true);
+    const delta = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+    ).pairs[0]?.quantityDelta;
+    expect(delta).toBe(0.2);
+    // A true half is a half: 0.145 × 100 is 14.499999999999998 in binary,
+    // and rounds to 15 (half away from zero), not 14.
+    const half = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.145, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.145, unitPriceMinor: 100 }],
+      [{ poLineId: "p", quantity: 0 }],
+    ).pairs[0];
+    expect(half?.status).toBe("not-received");
+    expect(half?.exposureMinor).toBe(15);
+  });
+
+  test("every exposure is an integer, for any fractional quantity", () => {
+    let seed = 7;
+    const next = (): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+      return seed / 2 ** 31;
+    };
+    for (let i = 0; i < 500; i++) {
+      const invoiceQuantity = Math.round(next() * 1000) / 100;
+      const report = matchInvoiceToPurchaseOrder(
+        [
+          {
+            id: "i",
+            poLineId: "p",
+            quantity: invoiceQuantity,
+            unitPriceMinor: 1 + Math.floor(next() * 99_999),
+          },
+        ],
+        [
+          {
+            id: "p",
+            quantity: Math.round(next() * 1000) / 100,
+            unitPriceMinor: 1 + Math.floor(next() * 99_999),
+          },
+        ],
+        [{ poLineId: "p", quantity: Math.round(next() * 1000) / 100 }],
+      );
+      const pair = report.pairs[0];
+      expect({ invoiceQuantity, integer: Number.isInteger(pair?.exposureMinor) }).toEqual({
+        invoiceQuantity,
+        integer: true,
+      });
+    }
+  });
+
+  test("a safe-integer exposure is exact to the unit, not rounded to fifteen digits", () => {
+    // The review's cases: every input a safe integer and every quantity whole,
+    // and the exposure came back 1234567890123460 and 6004799503160660 —
+    // `toPrecision(15)` dropped the digits a double still held exactly.
+    const a = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1, unitPriceMinor: 1_234_567_890_123_457 }],
+      [{ id: "p", quantity: 1, unitPriceMinor: 1 }],
+    );
+    expect(a.pairs[0]?.exposureMinor).toBe(1_234_567_890_123_456);
+    expect(a.totalExposureMinor).toBe(1_234_567_890_123_456);
+    const b = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 3_002_399_751_580_331 }],
+      [{ id: "p", quantity: 3, unitPriceMinor: 3_002_399_751_580_331 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(b.pairs[0]?.status).toBe("over-receipt");
+    expect(b.pairs[0]?.exposureMinor).toBe(6_004_799_503_160_662);
+    const c = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 1_000_000_000_000_001 }],
+      [{ id: "p", quantity: 3, unitPriceMinor: 1_000_000_000_000_001 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(c.pairs[0]?.exposureMinor).toBe(2_000_000_000_000_002);
+    // The quantity delta too: 1234567890123457 − 1 is 1234567890123456.
+    const d = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1_234_567_890_123_457, unitPriceMinor: 1 }],
+      [{ id: "p", quantity: 1, unitPriceMinor: 1 }],
+    );
+    expect(d.pairs[0]?.quantityDelta).toBe(1_234_567_890_123_456);
+    // A fractional quantity whose exposure has sixteen digits is exact too:
+    // 1.5 × 1200000000000001 − 1 × 1 = 1800000000000000.5, a half, rounded
+    // away from zero (fifteen digits made it 1800000000000000).
+    const e = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1.5, unitPriceMinor: 1_200_000_000_000_001 }],
+      [{ id: "p", quantity: 1.5, unitPriceMinor: 1 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(e.pairs[0]?.exposureMinor).toBe(1_800_000_000_000_001);
+  });
+
+  test("an exposure or a quantity no number holds exactly is refused, by name", () => {
+    expect(() =>
+      matchInvoiceToPurchaseOrder(
+        [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 4_000_000_000_000_000 }],
+        [{ id: "p", quantity: 3, unitPriceMinor: 1 }],
+      ),
+    ).toThrow(/invoice line "i" exposure comes to 11999999999999997, past/);
+    // 5000000000000001 − 0.5 is 5000000000000000.5; past 2^52 no double is.
+    expect(() =>
+      matchInvoiceToPurchaseOrder(
+        [{ id: "i", poLineId: "p", quantity: 5_000_000_000_000_001, unitPriceMinor: 1 }],
+        [{ id: "p", quantity: 0.5, unitPriceMinor: 1 }],
+      ),
+    ).toThrow(
+      /invoice line "i" quantity delta comes to 5000000000000000\.5, which a JSON number cannot hold exactly/,
+    );
+  });
+
+  test("receipts and tolerances are compared as the decimals written", () => {
+    // 0.1 + 0.2 received is 0.3 received, so an invoice for 0.3 is not an
+    // over-receipt (in doubles the receipts come to 0.30000000000000004).
+    const received = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [
+        { poLineId: "p", quantity: 0.1 },
+        { poLineId: "p", quantity: 0.2 },
+      ],
+    ).pairs[0];
+    expect(received?.receivedQuantity).toBe(0.3);
+    expect(received?.status).toBe("matched");
+    // 0.33 against 0.3 at 10% is exactly on the bound: within. In doubles
+    // 0.3 × 1000 is 300 and |0.33 − 0.3| × 10 000 is 300.00000000000027.
+    const onBound = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.33, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [],
+      { quantityPercentBps: 1000 },
+    ).pairs[0];
+    expect(onBound?.status).toBe("matched");
+    // And the absolute bound: 0.3 − 0.1 is within 0.2.
+    const absolute = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+      [],
+      { quantityAbsolute: 0.2 },
+    ).pairs[0];
+    expect(absolute?.status).toBe("matched");
+    const outside = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.31, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+      [],
+      { quantityAbsolute: 0.2 },
+    ).pairs[0];
+    expect(outside?.status).toBe("quantity-variance");
+  });
+
+  test("ten disposals of 0.1 consume a lot of 1 completely, and its cost to the unit", () => {
+    const disposals = Array.from({ length: 10 }, (_, i) => ({
+      id: `d${i}`,
+      disposedAt: `2026-02-01T00:00:0${i}Z`,
+      quantity: 0.1,
+      proceedsMinor: 100,
+    }));
+    const result = computeCostBasis(
+      [{ id: "lot", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1001 }],
+      disposals,
+      "fifo",
+    );
+    // 0.7.0 left 1.39e-16 of the lot open.
+    expect(result.remainingLots).toEqual([]);
+    expect(result.remainingQuantity).toBe(0);
+    expect(result.remainingCostMinor).toBe(0);
+    expect(result.disposals.reduce((s, d) => s + d.costMinor, 0)).toBe(1001);
+    // Each take is the decimal asked for, not a binary remainder.
+    expect(result.disposals.map((d) => d.consumed[0]?.quantity)).toEqual(new Array(10).fill(0.1));
+  });
+
+  test("whole units left of a large lot stay open (a share-of-lot dust rule ate them)", () => {
+    const lot = {
+      id: "pepe-buy",
+      acquiredAt: "2024-01-01T00:00:00Z",
+      quantity: 10_000_000_000,
+      costMinor: 1_000_000,
+    };
+    const most = {
+      id: "sell-most",
+      disposedAt: "2024-03-01T00:00:00Z",
+      quantity: 9_999_999_995,
+      proceedsMinor: 2_000_000,
+    };
+    const after = computeCostBasis([lot], [most], "fifo");
+    expect(after.remainingQuantity).toBe(5);
+    expect(after.remainingLots).toEqual([
+      { id: "pepe-buy", acquiredAt: "2024-01-01T00:00:00Z", quantity: 5, costMinor: 0 },
+    ]);
+    const both = computeCostBasis(
+      [lot],
+      [
+        most,
+        { id: "sell-rest", disposedAt: "2024-04-01T00:00:00Z", quantity: 5, proceedsMinor: 1 },
+      ],
+      "fifo",
+    );
+    expect(both.disposals.map((d) => d.consumed.map((c) => c.quantity))).toEqual([
+      [9_999_999_995],
+      [5],
+    ]);
+    expect(both.remainingLots).toEqual([]);
+  });
+
+  test("a remaining quantity is exact where doubles are not, and a real shortfall is refused", () => {
+    // 0.1 + 0.2 lots, a disposal of 0.3: in doubles the second lot kept 2.8e-17.
+    const lots = [
+      { id: "a", acquiredAt: "2024-01-01T00:00:00Z", quantity: 0.1, costMinor: 100 },
+      { id: "b", acquiredAt: "2024-01-02T00:00:00Z", quantity: 0.2, costMinor: 200 },
+    ];
+    const exact = computeCostBasis(
+      lots,
+      [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.3, proceedsMinor: 0 }],
+      "fifo",
+    );
+    expect(exact.remainingLots).toEqual([]);
+    expect(exact.disposals[0]?.costMinor).toBe(300);
+    // A caller's own float sum is not a claim to more than was bought ...
+    const floatSum = computeCostBasis(
+      lots,
+      [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.1 + 0.2, proceedsMinor: 0 }],
+      "fifo",
+    );
+    expect(floatSum.remainingLots).toEqual([]);
+    // ... but a real shortfall is, and the message says what was open.
+    expect(() =>
+      computeCostBasis(
+        lots,
+        [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.3001, proceedsMinor: 0 }],
+        "fifo",
+      ),
+    ).toThrow('disposal "d" needs 0.3001 but only 0.3 was open');
+    // A take's cost is rounded from the exact share: 477981 × 0.0375 / 0.225 is
+    // 79663.5, which rounds up, where the double came to 79663.49999999999.
+    const tie = computeCostBasis(
+      [{ id: "l", acquiredAt: "2023-03-12T00:00:00Z", quantity: 0.3, costMinor: 637308 }],
+      [1, 2, 3].map((n) => ({
+        id: `d${n}`,
+        disposedAt: `2024-02-1${n}T00:00:00Z`,
+        quantity: 0.0375,
+        proceedsMinor: 0,
+      })),
+      "fifo",
+    );
+    expect(tie.disposals.map((d) => d.costMinor)).toEqual([79664, 79663, 79664]);
+  });
+
+  test("a refund's per-unit split is computed, not allocated unit by unit", () => {
+    // 0.7.0 built an array of one entry per unit: this line has 2^40.
+    const refund = computeRefund(
+      [{ id: "a", quantity: 2 ** 40, unitPriceMinor: 1, taxMinor: 7 }],
+      [{ lineId: "a", quantity: 3 }],
+    );
+    expect(refund.lines[0]).toMatchObject({ grossMinor: 3, taxMinor: 3 });
+  });
+
+  test("the computed split is the unit-by-unit allocation, for every small case", () => {
+    for (let total = 1; total <= 12; total++) {
+      for (const amount of [-17, -1, 0, 1, 5, 12, 13, 100]) {
+        const perUnit = allocateProportional(amount, new Array(total).fill(1));
+        for (let returned = 1; returned <= total; returned++) {
+          const refund = computeRefund(
+            [{ id: "a", quantity: total, unitPriceMinor: 10, taxMinor: amount }],
+            [{ lineId: "a", quantity: returned }],
+          );
+          const expected = perUnit.slice(0, returned).reduce((s, p) => s + p, 0);
+          expect({ total, amount, returned, tax: refund.lines[0]?.taxMinor }).toEqual({
+            total,
+            amount,
+            returned,
+            tax: expected,
+          });
+        }
+      }
+    }
+  });
+
+  test("an allocation whose products pass 2^53 is exact and still sums to the total", () => {
+    const weights = [2 ** 52, 3, 2 ** 51 + 1];
+    const parts = allocateProportional(MAX, weights);
+    expect(parts.reduce((s, p) => s + p, 0)).toBe(MAX);
+    const sum = weights.reduce((s, w) => s + BigInt(w), 0n);
+    parts.forEach((part, i) => {
+      const floor = (BigInt(MAX) * BigInt(weights[i] as number)) / sum;
+      expect(BigInt(part) - floor).toBeGreaterThanOrEqual(0n);
+      expect(BigInt(part) - floor).toBeLessThanOrEqual(1n);
+    });
   });
 });

@@ -76,6 +76,11 @@ export async function* translateOpenAIStream(
   let messageStarted = false;
   let stopReason: string | undefined;
   let latestUsage: ChatChunk["usage"] | undefined;
+  // A compat server that sends no tool-call id gets one synthesised from the
+  // slot index, which restarts on every response: `call_0` in every turn
+  // would give two calls in one run the same id (and the same saved-result
+  // file). A per-stream nonce keeps them apart.
+  const idNonce = crypto.getRandomValues(new Uint32Array(1))[0]?.toString(16).padStart(8, "0");
 
   function* closeThinkingBlock(): Generator<StreamEvent> {
     if (thinkingOpen) {
@@ -206,7 +211,7 @@ export async function* translateOpenAIStream(
             const hasId = tcId != null && tcId.length > 0;
             state = {
               canonicalIndex: -1,
-              id: hasId ? tcId : `call_${oaiIndex}`,
+              id: hasId ? tcId : `call_${idNonce}_${oaiIndex}`,
               idProvided: hasId,
               name: tc.function?.name ?? "",
               started: false,

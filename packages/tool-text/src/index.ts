@@ -31,8 +31,15 @@ import {
   normalizeText as normalizeTextFn,
   sortLines as sortLinesFn,
 } from "./lib/normalize";
-import { regexExtractAll } from "./lib/regex";
-import { extractKeywords as extractKeywordsFn, fuzzyRank, similarity } from "./lib/similarity";
+import { answerPatterns, regexExtractAll, regexRunContext } from "./lib/regex";
+import {
+  MAX_SIMILARITY_WORK,
+  type SimilarityMethod,
+  extractKeywords as extractKeywordsFn,
+  fuzzyRank,
+  similarity,
+  similarityCost,
+} from "./lib/similarity";
 import { classifyByRules, renderTemplateString } from "./lib/template";
 
 /** Compact JSON — no indentation, since the reader is a model, not a person. */
@@ -44,6 +51,11 @@ const json = (value: unknown): string => JSON.stringify(value);
  * memory. Callers hitting it should narrow the input rather than raise it.
  */
 const MAX_INPUT_CHARS = 2_000_000;
+/**
+ * The most cells TextDiff's LCS table may hold: a memory bound (the table
+ * is built whole), the ceiling it has had since 0.7.0.
+ */
+const MAX_DIFF_CELLS = 25_000_000;
 
 function assertSize(text: string, field: string): void {
   if (text.length > MAX_INPUT_CHARS) {
@@ -58,7 +70,7 @@ function assertSize(text: string, field: string): void {
 export const regexExtract: RegisteredTool = buildTool({
   name: "RegexExtract",
   description:
-    "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context.",
+    "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context. The pattern runs under a time limit; a pattern that backtracks exponentially is refused, and a run that cannot finish says so rather than reporting the matches it found as all of them.",
   inputSchema: z.object({
     text: z.string().describe("the text to search"),
     pattern: z.string().min(1).describe("a JavaScript regular expression source"),
@@ -71,32 +83,36 @@ export const regexExtract: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     assertSize(input.text, "text");
-    let result: ReturnType<typeof regexExtractAll>;
-    try {
-      result = regexExtractAll(
-        input.text,
-        input.pattern,
-        input.flags ?? "",
-        input.maxMatches ?? 500,
-      );
-    } catch (err) {
-      // An invalid pattern is a caller mistake, not a crash: say which part.
-      return `invalid regex /${input.pattern}/${input.flags ?? ""}: ${(err as Error).message}`;
+    const flags = input.flags ?? "";
+    // The match runs in the regex worker under a deadline, never on this
+    // thread (C073): `a*a*a*a*b` over 400 characters held the process 108 s.
+    const result = await regexExtractAll(
+      input.text,
+      input.pattern,
+      flags,
+      input.maxMatches ?? 500,
+      regexRunContext(ctx),
+    );
+    if (!result.ok) {
+      // An invalid or refused pattern is a caller mistake, not a crash: say why.
+      return `invalid regex /${input.pattern}/${flags}: ${result.invalid}`;
     }
-    if (input.valuesOnly) {
-      return json({
-        count: result.matches.length,
-        truncated: result.truncated,
-        values: result.matches.map((m) => m.match),
-      });
-    }
-    return json({
+    const head = {
       count: result.matches.length,
       truncated: result.truncated,
-      matches: result.matches,
-    });
+      ...(result.truncatedBy === undefined ? {} : { truncatedBy: result.truncatedBy }),
+      ...(result.undetermined === undefined
+        ? {}
+        : {
+            undetermined: `the pattern could not be run to the end of the text, so there may be more matches: ${result.undetermined}`,
+          }),
+    };
+    if (input.valuesOnly) {
+      return json({ ...head, values: result.matches.map((m) => m.match) });
+    }
+    return json({ ...head, matches: result.matches });
   },
 });
 
@@ -126,7 +142,7 @@ export const textDiff: RegisteredTool = buildTool({
     const bLines = prep(input.b);
     // The LCS table is O(n*m) cells; refuse rather than exhaust memory.
     const cells = (aLines.length + 1) * (bLines.length + 1);
-    if (cells > 25_000_000) {
+    if (cells > MAX_DIFF_CELLS) {
       return `inputs too large to diff (${aLines.length} x ${bLines.length} lines) — diff a narrower region`;
     }
     const ops = diffLines(aLines, bLines);
@@ -353,19 +369,27 @@ export const ruleClassify: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    try {
-      return json(
-        classifyByRules(
-          input.text,
-          input.rules.map((r) => ({ ...r, weight: r.weight ?? 1, regex: r.regex ?? false })),
-          input.threshold ?? 1,
-          input.defaultLabel ?? null,
-        ),
-      );
-    } catch (err) {
-      return `invalid rule pattern: ${(err as Error).message}`;
-    }
+  execute: async (input, ctx) => {
+    assertSize(input.text, "text");
+    const rules = input.rules.map((r) => ({
+      ...r,
+      weight: r.weight ?? 1,
+      regex: r.regex ?? false,
+    }));
+    // Regex rules are answered in the worker, all at once, before scoring;
+    // one with no answer leaves the label undetermined, never the default.
+    const regexPatterns = rules.filter((r) => r.regex).flatMap((r) => r.patterns);
+    const answered = await answerPatterns(input.text, regexPatterns, "i", regexRunContext(ctx));
+    if (!answered.ok) return `invalid rule pattern: ${answered.invalid}`;
+    return json(
+      classifyByRules(
+        input.text,
+        rules,
+        input.threshold ?? 1,
+        input.defaultLabel ?? null,
+        answered.answers,
+      ),
+    );
   },
 });
 
@@ -476,6 +500,22 @@ export const extractEntities: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * The most quadratic work one FuzzyMatch call may do, summed over its
+ * candidates, in Levenshtein cells: two single comparisons' worth, about
+ * two seconds of one thread. tool-kyc's SanctionsScreen sends up to 10,000
+ * list names per call; at the name lengths a sanctions list holds (tens of
+ * characters) that is a few million cells, far inside it.
+ */
+const MAX_FUZZY_WORK = 2 * MAX_SIMILARITY_WORK;
+
+/** Why comparing a and b by `method` is too much work for one call, or null. */
+function tooCostly(a: string, b: string, method: SimilarityMethod): string | null {
+  const cells = similarityCost(a, b, method);
+  if (cells <= MAX_SIMILARITY_WORK) return null;
+  return `inputs too large for ${method} (${a.length} x ${b.length} characters) — use trigram or tokenJaccard, or compare a narrower region`;
+}
+
 export const fuzzyMatch: RegisteredTool = buildTool({
   name: "FuzzyMatch",
   description:
@@ -489,16 +529,31 @@ export const fuzzyMatch: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) =>
-    json({
+  execute: async (input) => {
+    const method = input.method ?? "jaro";
+    assertSize(input.query, "query");
+    // Refused before any comparison runs, never part-way through: a ranking
+    // that silently skipped the costly candidates would read as "no match".
+    let total = 0;
+    for (const [i, candidate] of input.candidates.entries()) {
+      assertSize(candidate, `candidates[${i}]`);
+      const single = tooCostly(input.query, candidate, method);
+      if (single !== null) return `candidates[${i}]: ${single}`;
+      total += similarityCost(input.query, candidate, method);
+    }
+    if (total > MAX_FUZZY_WORK) {
+      return `candidates too large for ${method}: ${input.candidates.length} comparisons against a ${input.query.length}-character query need about ${total} cells, over the ${MAX_FUZZY_WORK} one call may take — use trigram or tokenJaccard, or send fewer or shorter candidates`;
+    }
+    return json({
       hits: fuzzyRank(
         input.query,
         input.candidates,
-        input.method ?? "jaro",
+        method,
         input.minScore ?? 0.5,
         input.limit ?? 10,
       ),
-    }),
+    });
+  },
 });
 
 export const textSimilarity: RegisteredTool = buildTool({
@@ -515,9 +570,12 @@ export const textSimilarity: RegisteredTool = buildTool({
   execute: async (input) => {
     assertSize(input.a, "a");
     assertSize(input.b, "b");
+    const method = input.method ?? "trigram";
+    const refused = tooCostly(input.a, input.b, method);
+    if (refused !== null) return refused;
     return json({
-      score: Number(similarity(input.a, input.b, input.method ?? "trigram").toFixed(6)),
-      method: input.method ?? "trigram",
+      score: Number(similarity(input.a, input.b, method).toFixed(6)),
+      method,
     });
   },
 });
@@ -655,6 +713,14 @@ export const TEXT_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
  * parsers means two numberings, one of which is wrong. This is the same
  * reason `@crewhaus/tool-code` exports its lockfile readers beside its tools.
  */
+/**
+ * The ATX heading reader and the offset-to-line index, re-exported so a
+ * package that reports "line 12" of a Markdown file, or reads its headings,
+ * asks the same code this one does (`@crewhaus/tool-verify` does both).
+ */
+export { parseAtxHeading } from "./lib/markdown";
+export { lineStarts, offsetToLineCol } from "./lib/locate";
+
 export {
   type DiffFileStatus,
   type DiffLineKind,

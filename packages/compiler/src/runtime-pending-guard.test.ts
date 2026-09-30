@@ -23,9 +23,8 @@
  * `models.fast: { tools: [] }` behind `agent.model: $fast` would serve with
  * the shape's full toolset. The refusal names the pool-candidate route as the
  * fix; `lower()` with `allowRuntimePendingKeys` carries the key into the IR
- * with a `model-plan-candidate-only` warning instead. The one genuinely
- * unlowered key is `mcp_servers.<n>.tool_flags`: 0.6.0 ships no IR + emit
- * wiring for it.
+ * with a `model-plan-candidate-only` warning instead. `mcp_servers.<n>.tool_flags`,
+ * refused through 0.7.0, is lowered since 0.7.1 (extension-path#16).
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -408,16 +407,42 @@ describe("0.6.0 — the by-design refusals, and the bypass that warns instead", 
     expect(() => compile(yaml)).not.toThrow(/0\.6\.0 row|lands with|does not enforce it yet/);
   });
 
-  test("mcp_servers.<n>.tool_flags stays refused (0.6.0 lowers it nowhere)", () => {
+  test("mcp_servers.<n>.tool_flags is lowered into the IR and the emitted server config (0.7.1)", () => {
     const yaml = cli(
       "mcp_servers:",
-      "  fs:",
+      "  gh:",
       "    transport: stdio",
       "    command: npx",
-      "    tool_flags: { defaults: { readOnly: true } }",
+      "    tool_flags: { defaults: { destructive: true }, per_tool: { delete_repo: { requireJustification: true } } }",
     );
     expect(parseSpecIssues(yaml)).toEqual([]);
-    expect(() => compile(yaml)).toThrow(/^mcp_servers\.fs\.tool_flags/);
+    const ir = lower(parseSpec(yaml));
+    if (ir.target !== "cli") expect.unreachable();
+    expect(ir.mcp_servers["gh"]).toEqual({
+      transport: "stdio",
+      command: "npx",
+      args: [],
+      toolFlags: {
+        defaults: { destructive: true },
+        perTool: { delete_repo: { requireJustification: true } },
+      },
+    });
+    // The bundle hands the flags to resolveMcpServerConfig with the rest of
+    // the config, which is where tool-mcp reads them.
+    const result = compile(yaml);
+    expect(result.warnings).toEqual([]);
+    const emitted = result.files.map((f) => f.content).join("\n");
+    expect(emitted).toContain(
+      '"toolFlags":{"defaults":{"destructive":true},"perTool":{"delete_repo":{"requireJustification":true}}}',
+    );
+  });
+
+  test("a spec without tool_flags lowers byte-identically to 0.7.0", () => {
+    const ir = lower(
+      parseSpec(cli("mcp_servers:", "  fs:", "    transport: stdio", "    command: npx")),
+    );
+    if (ir.target !== "cli") expect.unreachable();
+    expect(Object.keys(ir.mcp_servers["fs"] ?? {})).toEqual(["transport", "command", "args"]);
   });
 
   test("a narrowing profile referenced from an AUXILIARY slot is not refused — the fields are meaningless there and warned", () => {

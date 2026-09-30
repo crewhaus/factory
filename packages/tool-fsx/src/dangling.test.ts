@@ -118,3 +118,20 @@ test("a relative dangling link under an outward directory link is refused", asyn
   symlinkSync("../pending.txt", join(dir, "sub", "rel-in.txt"));
   expect(resolveSafe("Probe", "sub/rel-in.txt").real).toBe(join(workspaceRoot(), "pending.txt"));
 });
+
+test("a dangling link's target is walked as the kernel walks it, not folded as text (C068)", () => {
+  // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's PARENT.
+  // Folded as text, `a/y/../newfile.txt` reads as `a/newfile.txt`, inside.
+  mkdirSync(join(dir, "a"));
+  symlinkSync("..", join(dir, "a", "y"));
+  symlinkSync("a/y/../newfile.txt", join(dir, "evil"));
+  expect(() => resolveSafe("Probe", "evil")).toThrow(ToolPermissionError);
+  expect(() => resolveSafe("Probe", "evil/deeper.txt")).toThrow(ToolPermissionError);
+  // The control: the same shape one level lower stays inside, and resolves
+  // to where the kernel would create it (`b/c/y` is `b`, so `b/c/y/..` is the
+  // workspace root), not to the `b/made.txt` the text reads as.
+  mkdirSync(join(dir, "b", "c"), { recursive: true });
+  symlinkSync("..", join(dir, "b", "c", "y"));
+  symlinkSync("c/y/../made.txt", join(dir, "b", "ok"));
+  expect(resolveSafe("Probe", "b/ok").real).toBe(join(workspaceRoot(), "made.txt"));
+});

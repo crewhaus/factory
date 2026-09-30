@@ -27,16 +27,23 @@ import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { blameIgnoreRevs } from "./blame-ignore";
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   checkPathspecs,
   checkRefArgs,
+  conflictedPatchPaths,
   failure,
   json,
+  neutralisedNote,
   openRepo,
   resolveInsideRoot,
+  skippedPatchPaths,
+  symlinksCreatedByPatch,
   truncationNote,
+  unmergedApplyPaths,
+  withoutApplyProgress,
 } from "./git-run";
 import {
   COMMIT_FORMAT,
@@ -56,6 +63,7 @@ import {
   parseWorktrees,
   splitNul,
 } from "./lib/parse";
+import { isInside, realOrUndefined } from "./repo-bounds";
 
 // ---------------------------------------------------------------------------
 // shared schema fragments and flag sets
@@ -77,13 +85,19 @@ const pathsField = z
   .array(z.string().min(1))
   .max(256)
   .optional()
-  .describe("limit to these paths, relative to `cwd`");
+  .describe(
+    "limit to these paths, relative to `cwd`: files, or directories with everything under them; literal, never wildcards",
+  );
 
 /**
  * Safety flags for a tool that only interrogates the repository. Reading still
- * spawns a process, so `scope`/`ioCapability` say so; `concurrencySafe` is
- * honest because these runs also set GIT_OPTIONAL_LOCKS=0 and so never contend
- * for the index lock with a sibling.
+ * spawns a process, so `scope`/`ioCapability` say so. `concurrencySafe` holds
+ * because a read never FAILS on a sibling's lock: these runs set
+ * GIT_OPTIONAL_LOCKS=0, so status takes no lock, and the one read that can
+ * write the index — `git diff` refreshing stat data it found stale — skips
+ * that write when the lock is held. Concurrency-safe tools run only beside
+ * each other, never beside a write. No read runs a hook on that write
+ * (`./hardening`, core.hooksPath).
  */
 const READ_FLAGS = {
   readOnly: true,
@@ -104,6 +118,18 @@ const WRITE_FLAGS = {
   ioCapability: "process",
 } as const;
 
+/**
+ * `repoConfigNote`, when a read switched off filter drivers the repository's
+ * own config names (see `./hardening`): the tools whose answer a filter
+ * could change say so, and say nothing for every other repository.
+ */
+function repoConfigNote(repo: { readonly neutralised: readonly string[] }): {
+  repoConfigNote?: string;
+} {
+  const note = neutralisedNote(repo.neutralised);
+  return note === undefined ? {} : { repoConfigNote: note };
+}
+
 /** Largest patch `GitApplyPatch` will accept, so one call cannot be unbounded. */
 const MAX_PATCH_CHARS = 4_000_000;
 /** Largest conflicted file `GitConflicts` will read looking for markers. */
@@ -114,6 +140,7 @@ const MAX_CONFLICT_FILE_BYTES = 2_000_000;
 
 export const gitStatus: RegisteredTool = buildTool({
   name: "GitStatus",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Report the working tree's state as structured JSON: branch, upstream, ahead/behind counts, and the staged, unstaged, untracked and conflicted paths. Use it instead of reading `git status` prose, and instead of guessing whether there is anything to commit.",
   inputSchema: z.object({
@@ -141,12 +168,22 @@ export const gitStatus: RegisteredTool = buildTool({
       { readOnly: true },
     );
     if (run.code !== 0) return failure("GitStatus", run);
-    return json(parseStatusV2(run.stdout));
+    return json({ ...parseStatusV2(run.stdout), ...repoConfigNote(opened.value) });
   },
 });
 
 export const gitDiff: RegisteredTool = buildTool({
   name: "GitDiff",
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Diff the working tree, the index, a ref or a commit range, as a summary, per-file line counts, a name list or a full patch. Use it to see exactly what a change touched before staging, committing or reviewing it.",
   inputSchema: z.object({
@@ -195,29 +232,46 @@ export const gitDiff: RegisteredTool = buildTool({
       ...(input.staged === true ? ["--cached"] : []),
       ...(input.range !== undefined ? [input.range] : []),
       ...(input.ref !== undefined ? [input.ref] : []),
-      ...(paths.length > 0 ? ["--", ...paths] : []),
+      ...(paths.length > 0 ? ["--", ...checked.value] : []),
     ];
     const run = await repo.run(args, { readOnly: true });
     if (run.code !== 0) return failure("GitDiff", run);
     const note = truncationNote(run);
+    const config = repoConfigNote(repo);
 
     if (mode === "numstat") {
       const files = parseNumstat(run.stdout);
       const added = files.reduce((sum, f) => sum + (f.added ?? 0), 0);
       const removed = files.reduce((sum, f) => sum + (f.removed ?? 0), 0);
-      return json({ mode, files: files.length, added, removed, changes: files, note });
+      return json({ mode, files: files.length, added, removed, changes: files, note, ...config });
     }
     if (mode === "nameOnly") {
       const files = splitNul(run.stdout).sort();
-      return json({ mode, files: files.length, paths: files, note });
+      return json({ mode, files: files.length, paths: files, note, ...config });
     }
     const body = run.stdout.replace(/\n+$/, "");
-    return json({ mode, empty: body === "", [mode === "patch" ? "patch" : "stat"]: body, note });
+    return json({
+      mode,
+      empty: body === "",
+      [mode === "patch" ? "patch" : "stat"]: body,
+      note,
+      ...config,
+    });
   },
 });
 
 export const gitLog: RegisteredTool = buildTool({
   name: "GitLog",
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "List commits as structured records — sha, author, ISO dates, subject and body — filtered by range, path, author or count. Use it to answer what changed and when without parsing `git log`'s free-form text.",
   inputSchema: z.object({
@@ -253,7 +307,7 @@ export const gitLog: RegisteredTool = buildTool({
         ...(merges === "only" ? ["--merges"] : merges === "exclude" ? ["--no-merges"] : []),
         ...(input.author !== undefined ? [`--author=${input.author}`] : []),
         ...(input.range !== undefined ? [input.range] : []),
-        ...(paths.length > 0 ? ["--", ...paths] : []),
+        ...(paths.length > 0 ? ["--", ...checked.value] : []),
       ],
       { readOnly: true },
     );
@@ -265,6 +319,16 @@ export const gitLog: RegisteredTool = buildTool({
 
 export const gitShow: RegisteredTool = buildTool({
   name: "GitShow",
+  operativeArgs: [
+    {
+      field: "path",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Return one file's contents at a ref, or one commit's metadata and patch. Use it to read a file as it was on another branch without checking that branch out.",
   inputSchema: z.object({
@@ -325,6 +389,7 @@ export const gitShow: RegisteredTool = buildTool({
 
 export const gitBlame: RegisteredTool = buildTool({
   name: "GitBlame",
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd" }],
   description:
     "Attribute each line of a file to the commit that last touched it, as structured records rather than blame's column-aligned text. Use it to find who and what introduced a specific line before changing or reverting it.",
   inputSchema: z.object({
@@ -356,32 +421,44 @@ export const gitBlame: RegisteredTool = buildTool({
       input.startLine === undefined
         ? []
         : ["-L", `${input.startLine},${input.endLine ?? input.startLine}`];
-    const run = await repo.run(
-      [
-        "blame",
-        "--line-porcelain",
-        ...range,
-        ...(input.ref !== undefined ? [input.ref] : []),
-        "--",
-        input.path,
-      ],
-      { readOnly: true },
-    );
-    if (run.code !== 0) return failure("GitBlame", run);
-    const all = parseBlamePorcelain(run.stdout);
-    const max = input.maxLines ?? 500;
-    const lines = all.slice(0, max);
-    return json({
-      path: input.path,
-      count: lines.length,
-      truncated: all.length > max || run.truncated,
-      lines,
-    });
+    // blame.ignoreRevsFile, read under containment and handed to git as a
+    // private copy (see ./blame-ignore); git itself never opens the path.
+    const ignore = await blameIgnoreRevs(repo);
+    try {
+      const run = await repo.run(
+        [
+          "blame",
+          "--line-porcelain",
+          ...ignore.args,
+          ...range,
+          ...(input.ref !== undefined ? [input.ref] : []),
+          "--",
+          input.path,
+        ],
+        { readOnly: true },
+      );
+      if (run.code !== 0) return failure("GitBlame", run);
+      const all = parseBlamePorcelain(run.stdout);
+      const max = input.maxLines ?? 500;
+      const lines = all.slice(0, max);
+      return json({
+        path: input.path,
+        count: lines.length,
+        truncated: all.length > max || run.truncated,
+        lines,
+        ...(ignore.honoured.length > 0 ? { ignoringRevisionsFrom: ignore.honoured } : {}),
+        ...(ignore.notHonoured.length > 0 ? { ignoreRevsNote: ignore.notHonoured.join(" ") } : {}),
+        ...repoConfigNote(repo),
+      });
+    } finally {
+      ignore.cleanup();
+    }
   },
 });
 
 export const gitBranchList: RegisteredTool = buildTool({
   name: "GitBranchList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List branches with their tip sha, upstream, last-commit date and subject, sorted by refname. Use it to find the right branch name before switching, diffing or deleting.",
   inputSchema: z.object({
@@ -426,6 +503,7 @@ export const gitBranchList: RegisteredTool = buildTool({
 
 export const gitTagList: RegisteredTool = buildTool({
   name: "GitTagList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List tags with the commit each points at, whether it is annotated, its date and its message subject. Use it to find the previous release tag before generating notes or diffing two versions.",
   inputSchema: z.object({
@@ -462,8 +540,9 @@ export const gitTagList: RegisteredTool = buildTool({
 
 export const gitRemoteList: RegisteredTool = buildTool({
   name: "GitRemoteList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote.",
+    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote. Everything before the @ in an http(s) URL (a user name, token or password: a bare token often sits in the user name) and a token query parameter are replaced with ***, an ssh URL keeps its login and loses only a password or token, and that remote is marked credentialsRedacted, so a masked URL is not usable as-is.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
   ...READ_FLAGS,
   execute: async (input, ctx) => {
@@ -478,6 +557,7 @@ export const gitRemoteList: RegisteredTool = buildTool({
 
 export const gitMergeBase: RegisteredTool = buildTool({
   name: "GitMergeBase",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Find the best common ancestor of two refs, or the fork point of a branch from its upstream. Use it to scope a review or a diff to only the commits a branch actually added.",
   inputSchema: z.object({
@@ -522,6 +602,7 @@ export const gitMergeBase: RegisteredTool = buildTool({
 
 export const gitRevParse: RegisteredTool = buildTool({
   name: "GitRevParse",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Resolve refs to object shas and types, and report the repository's root, git directory and current HEAD. Use it to turn a name like 'HEAD~3' or 'v1.2' into a stable sha before passing it to another tool.",
   inputSchema: z.object({
@@ -569,6 +650,7 @@ export const gitRevParse: RegisteredTool = buildTool({
 
 export const gitFileHistory: RegisteredTool = buildTool({
   name: "GitFileHistory",
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd", beneath: "all" }],
   description:
     "List the commits that touched one path, following it across renames, with the per-commit change status. Use it to trace how a single file reached its current shape, including what it used to be called.",
   inputSchema: z.object({
@@ -592,7 +674,7 @@ export const gitFileHistory: RegisteredTool = buildTool({
         `--format=${COMMIT_FORMAT}`,
         `--max-count=${input.maxCount ?? 20}`,
         "--",
-        input.path,
+        ...checked.value,
       ],
       { readOnly: true },
     );
@@ -617,6 +699,7 @@ export const gitFileHistory: RegisteredTool = buildTool({
 
 export const gitStashList: RegisteredTool = buildTool({
   name: "GitStashList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the stash entries with their ref, sha, message and date. Use it to see what is parked before popping anything, since a stash stack is shared across every worktree of a repository.",
   inputSchema: z.object({
@@ -640,6 +723,7 @@ export const gitStashList: RegisteredTool = buildTool({
 
 export const gitConflicts: RegisteredTool = buildTool({
   name: "GitConflicts",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the currently conflicted paths and locate the conflict markers inside each one, by line number. Use it after a merge, rebase or cherry-pick stops, to go straight to the regions that need a decision.",
   inputSchema: z.object({
@@ -687,12 +771,14 @@ export const gitConflicts: RegisteredTool = buildTool({
       truncated: paths.length > max,
       clean: paths.length === 0,
       files,
+      ...repoConfigNote(repo),
     });
   },
 });
 
 export const gitWorktreeList: RegisteredTool = buildTool({
   name: "GitWorktreeList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the repository's worktrees with their path, HEAD, branch and locked or prunable state, sorted by path. Use it before adding or removing one, since git refuses to check the same branch out twice.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
@@ -712,8 +798,9 @@ export const gitWorktreeList: RegisteredTool = buildTool({
 
 export const gitAdd: RegisteredTool = buildTool({
   name: "GitAdd",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" }],
   description:
-    "Stage the named paths. Use it to build a commit deliberately, one path at a time; there is no way to stage the whole tree blindly, which is the point.",
+    "Stage the named paths, a directory with everything under it. Use it to build a commit deliberately, one path at a time; paths are literal, never wildcards, so a call stages exactly what it names.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -721,7 +808,9 @@ export const gitAdd: RegisteredTool = buildTool({
       .array(z.string().min(1))
       .min(1)
       .max(256)
-      .describe("paths relative to `cwd`; directories are staged recursively"),
+      .describe(
+        "paths relative to `cwd`; directories are staged recursively; literal, never wildcards",
+      ),
     update: z.boolean().optional().describe("stage only paths git already tracks, never new files"),
   }),
   ...WRITE_FLAGS,
@@ -735,7 +824,7 @@ export const gitAdd: RegisteredTool = buildTool({
       "add",
       ...(input.update === true ? ["--update"] : []),
       "--",
-      ...input.paths,
+      ...checked.value,
     ]);
     if (run.code !== 0) return failure("GitAdd", run);
     const staged = await repo.run(["diff", "--cached", "--numstat", "-z"], { readOnly: true });
@@ -748,6 +837,16 @@ export const gitAdd: RegisteredTool = buildTool({
 
 export const gitCommit: RegisteredTool = buildTool({
   name: "GitCommit",
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Commit what is staged, or only the named paths, with a message and an optional author and date. Use it to record a change; it never amends unless `amend` is set explicitly, so an existing commit is never rewritten by accident.",
   inputSchema: z.object({
@@ -796,7 +895,7 @@ export const gitCommit: RegisteredTool = buildTool({
         ...(input.amend === true ? ["--amend", "--no-edit"] : []),
         ...(input.allowEmpty === true ? ["--allow-empty"] : []),
         ...(input.author !== undefined ? [`--author=${input.author}`] : []),
-        ...(paths.length > 0 ? ["--", ...paths] : []),
+        ...(paths.length > 0 ? ["--", ...checked.value] : []),
       ],
       { env },
     );
@@ -809,6 +908,10 @@ export const gitCommit: RegisteredTool = buildTool({
 
 export const gitSwitch: RegisteredTool = buildTool({
   name: "GitSwitch",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "branch", kind: "id" },
+  ],
   description:
     "Switch the worktree to another branch, optionally creating it or detaching HEAD at a ref. Use it to move between branches; git refuses and changes nothing when the switch would discard uncommitted work.",
   inputSchema: z.object({
@@ -851,6 +954,10 @@ export const gitSwitch: RegisteredTool = buildTool({
 
 export const gitBranchCreate: RegisteredTool = buildTool({
   name: "GitBranchCreate",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Create a branch at HEAD or at a given start point, without switching to it. Use it to mark a base or open a line of work while staying where you are.",
   inputSchema: z.object({
@@ -885,6 +992,10 @@ export const gitBranchCreate: RegisteredTool = buildTool({
 
 export const gitBranchDelete: RegisteredTool = buildTool({
   name: "GitBranchDelete",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Delete a local branch, refusing by default if it holds commits that are not merged anywhere. Use `force` only when you mean to discard those commits, since nothing but the reflog will remember them.",
   inputSchema: z.object({
@@ -920,6 +1031,16 @@ export const gitBranchDelete: RegisteredTool = buildTool({
 
 export const gitStashPush: RegisteredTool = buildTool({
   name: "GitStashPush",
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Park the current changes on the stash stack with a message. Use a message always: the stack is shared by every worktree of the repository, so an unlabelled entry is hard to claim later.",
   inputSchema: z.object({
@@ -944,7 +1065,7 @@ export const gitStashPush: RegisteredTool = buildTool({
       ...(input.includeUntracked === true ? ["--include-untracked"] : []),
       ...(input.keepIndex === true ? ["--keep-index"] : []),
       ...(input.message !== undefined ? ["-m", input.message] : []),
-      ...(paths.length > 0 ? ["--", ...paths] : []),
+      ...(paths.length > 0 ? ["--", ...checked.value] : []),
     ]);
     if (run.code !== 0) return failure("GitStashPush", run);
     const list = await repo.run(["stash", "list", `--format=${STASH_FORMAT}`, "--max-count=1"], {
@@ -960,6 +1081,7 @@ export const gitStashPush: RegisteredTool = buildTool({
 
 export const gitStashPop: RegisteredTool = buildTool({
   name: "GitStashPop",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Restore a stash entry onto the working tree, dropping it unless `apply` is set. Use an explicit `stash` ref whenever other worktrees share this repository, so you never take an entry that is not yours.",
   inputSchema: z.object({
@@ -998,6 +1120,10 @@ export const gitStashPop: RegisteredTool = buildTool({
 
 export const gitTagCreate: RegisteredTool = buildTool({
   name: "GitTagCreate",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Create a lightweight or annotated tag at HEAD or a given ref. Use an annotated tag (pass `message`) for anything a release refers to, since only those carry a date and an author.",
   inputSchema: z.object({
@@ -1032,10 +1158,58 @@ export const gitTagCreate: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A name `git apply -R -v` printed, put back the way the patch wrote it:
+ * git shows a rename or copy as `old => new`, and reversed that is the
+ * patch's `new => old`.
+ */
+function unreverseRename(shown: string): string {
+  const parts = shown.split(" => ");
+  return parts.length === 2 ? `${parts[1]} => ${parts[0]}` : shown;
+}
+
+/**
+ * The first symbolic link a patch would create whose target leaves the
+ * WORKSPACE, as the link's own path, or undefined. git applies paths relative
+ * to the directory it runs in (`repo.cwd`), so the link lands at
+ * `cwd/<path>`; a relative target resolves against the link's own directory,
+ * an absolute one stands as written. The parent directory is realpath'd (it
+ * is inside the tree), the target joined onto it and normalised, and the
+ * result must be inside the workspace root. A target that cannot be resolved
+ * is treated as leading out — git would still create the link.
+ *
+ * The bound is the workspace root (the directory the harness runs from), NOT
+ * `repo.root`: the workspace may hold sibling repositories, so a link from
+ * one into another (`app/vendor-lib -> ../lib`) points inside the workspace
+ * and is fine — matching every other containment check in these tools, which
+ * measure against the workspace, not the repository. Checking against
+ * `repo.root` refused that legitimate link and, worse, said it "points
+ * outside the workspace" when it did not.
+ */
+function escapingSymlink(
+  patchText: string,
+  repo: { readonly cwd: string },
+  strip: number,
+): string | undefined {
+  const rootReal = realOrUndefined(process.cwd());
+  if (rootReal === undefined) return undefined;
+  for (const link of symlinksCreatedByPatch(patchText, strip)) {
+    if (link.target === "") continue; // a rename with no hunk keeps the target
+    const linkAbs = nodePath.resolve(repo.cwd, link.path);
+    const parentReal = realOrUndefined(nodePath.dirname(linkAbs)) ?? nodePath.dirname(linkAbs);
+    const resolved = nodePath.isAbsolute(link.target)
+      ? nodePath.resolve(link.target)
+      : nodePath.resolve(parentReal, link.target);
+    if (!isInside(rootReal, resolved)) return link.path;
+  }
+  return undefined;
+}
+
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   description:
-    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
+    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -1051,33 +1225,128 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     if (!opened.ok) return opened.message;
     const repo = opened.value;
     // `--unsafe-paths` is deliberately never passed: without it git refuses a
-    // patch whose paths leave the working tree, which is the containment rule
-    // of this package enforced by git itself.
+    // patch whose paths leave the working tree. openRepo has proved that
+    // working tree lies inside the workspace (C071), so git's rule keeps the
+    // patch inside it too.
     // A unified diff must end in a newline; a patch that reached us through a
     // model or a JSON field very often has had it stripped, and git answers
     // that with "corrupt patch at line N" rather than anything actionable.
     const patchText = input.patch.endsWith("\n") ? input.patch : `${input.patch}\n`;
-    const run = await repo.run(
-      [
-        "apply",
-        ...(input.check === true ? ["--check"] : []),
-        ...(input.index === true ? ["--index"] : []),
-        ...(input.threeWay === true ? ["--3way"] : []),
-        ...(input.strip !== undefined ? [`-p${input.strip}`] : []),
-        "-",
-      ],
-      { stdin: patchText },
-    );
-    if (run.code !== 0) {
+    const checkedOnly = input.check === true;
+    const strip = input.strip !== undefined ? [`-p${input.strip}`] : [];
+    // git applies only the paths under the directory it runs in and skips
+    // the rest in silence, exit 0 (C219). Which paths it skips depends on
+    // nothing but the path and `-p`, so a plain `--check -v` names them
+    // before anything is written — and a patch with any is refused whole,
+    // never half-applied. Running from the repository root with
+    // `--directory` instead would move the patch, not report it.
+    const preflight = await repo.run(["apply", "--check", "-v", ...strip, "-"], {
+      stdin: patchText,
+    });
+    const refuseSkipped = (skipped: readonly string[]): string => {
+      const here = nodePath.relative(repo.root, realOrUndefined(repo.cwd) ?? repo.cwd) || ".";
       return json({
         applied: false,
-        checkedOnly: input.check === true,
-        reason: failure("GitApplyPatch", run),
+        checkedOnly,
+        wouldApply: false,
+        skipped,
+        reason: `GitApplyPatch: ${skipped.length} path(s) in the patch lie outside "${here}", the directory git runs in, and git would skip them without a word. Nothing was applied. Paths in a patch with \`diff --git\` headers are relative to the repository root: run it with cwd at the repository root (or at a directory holding every path), or drop those files from the patch.`,
+      });
+    };
+    const skippedFirst = skippedPatchPaths(preflight.stderr);
+    if (skippedFirst.length > 0) return refuseSkipped(skippedFirst);
+    // git decides "outside cwd" on a file's NEW name only, so a rename or
+    // copy whose SOURCE lies outside is never skipped: renaming `top.txt`
+    // into cwd deleted `top.txt`. Reversed, a patch's old names are its new
+    // ones, so the same parse run with `-R` makes git name every source
+    // outside cwd the same way. `--numstat` only parses; it reads no file.
+    const sources = await repo.run(["apply", "--numstat", "-R", "-v", ...strip, "-"], {
+      stdin: patchText,
+      readOnly: true,
+    });
+    if (sources.code !== 0) {
+      return json({
+        applied: false,
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(sources)),
+      });
+    }
+    const skippedSources = skippedPatchPaths(sources.stderr).map(unreverseRename);
+    if (skippedSources.length > 0) return refuseSkipped(skippedSources);
+
+    // A symlink git creates inside the working tree may still point OUT of it:
+    // git stores the target as the file's content and never rejects one, so
+    // `new file mode 120000` with a `/etc/…` or `../…` target plants a link a
+    // later write follows out of the workspace (C070's model-only enabler).
+    // git's own path rule contains the link's LOCATION, not its target, so
+    // this refuses the patch whole before anything is written.
+    const escaping = escapingSymlink(input.patch, repo, input.strip ?? 1);
+    if (escaping !== undefined) {
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        reason: `GitApplyPatch: the patch would create a symbolic link (${escaping}) whose target points outside the workspace. git stores a link's target as its content and applies it without a word, so a later write through the link would leave the workspace. Nothing was applied. Remove that link from the patch, or point it inside the workspace.`,
+      });
+    }
+
+    const args = [
+      "apply",
+      ...(checkedOnly ? ["--check"] : []),
+      ...(input.index === true ? ["--index"] : []),
+      ...(input.threeWay === true ? ["--3way"] : []),
+      ...strip,
+      "-v",
+      "-",
+    ];
+    const run = await repo.run(args, { stdin: patchText });
+    if (run.code !== 0) {
+      // A three-way apply that merged WITH CONFLICTS exits 1 after writing:
+      // the files hold conflict markers and the index holds them unmerged.
+      // "applied: false" would say nothing changed.
+      const unmerged = checkedOnly ? [] : unmergedApplyPaths(run.stderr);
+      if (unmerged.length > 0) {
+        return json({
+          applied: true,
+          checkedOnly,
+          conflicted: true,
+          conflicts: unmerged,
+          reason: `GitApplyPatch: the patch was applied as a three-way merge WITH CONFLICTS in ${unmerged.length} file(s). Conflict markers were written into them and the index holds them unmerged; resolve them as after a merge (GitConflicts lists them), then stage the result.`,
+        });
+      }
+      return json({
+        applied: false,
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(run)),
+      });
+    }
+    const skipped = skippedPatchPaths(run.stderr);
+    if (skipped.length > 0) {
+      // Only if the tree moved between the two runs; say exactly what landed.
+      if (checkedOnly) return refuseSkipped(skipped);
+      return json({
+        applied: true,
+        partial: true,
+        checkedOnly,
+        skipped,
+        reason: `GitApplyPatch: git skipped ${skipped.length} path(s) that lie outside the directory it ran in; the rest of the patch was applied.`,
+      });
+    }
+    const conflicted = checkedOnly ? conflictedPatchPaths(run.stderr) : [];
+    if (conflicted.length > 0) {
+      // `--check --3way` exits 0 here; the real apply would leave conflict
+      // markers and fail, so "would apply" is not the answer.
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        conflicts: conflicted,
+        reason: `GitApplyPatch: the patch applies only as a three-way merge WITH CONFLICTS in ${conflicted.length} file(s); a real apply would leave conflict markers there.`,
       });
     }
     return json({
-      applied: input.check !== true,
-      checkedOnly: input.check === true,
+      applied: !checkedOnly,
+      checkedOnly,
       wouldApply: true,
     });
   },
@@ -1085,6 +1354,7 @@ export const gitApplyPatch: RegisteredTool = buildTool({
 
 export const gitCherryPick: RegisteredTool = buildTool({
   name: "GitCherryPick",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Replay one or more commits onto the current branch. Use `noCommit` to stage the change without committing, and GitConflicts when the pick stops partway.",
   inputSchema: z.object({
@@ -1135,6 +1405,7 @@ export const gitCherryPick: RegisteredTool = buildTool({
 
 export const gitResetPaths: RegisteredTool = buildTool({
   name: "GitResetPaths",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", beneath: "all" }],
   description:
     "Unstage the named paths, restoring their index entries from a ref without touching the files on disk. Use it to undo a GitAdd; this package has no whole-tree reset, so no call here can discard your edits.",
   inputSchema: z.object({
@@ -1160,7 +1431,7 @@ export const gitResetPaths: RegisteredTool = buildTool({
     // rewrites index entries. `--hard` is not reachable from this schema at
     // all: there is no flag for it and no branch that could add it, which is
     // why unstaging here can never cost a caller their working-tree changes.
-    const run = await repo.run(["reset", "--quiet", input.ref ?? "HEAD", "--", ...input.paths]);
+    const run = await repo.run(["reset", "--quiet", input.ref ?? "HEAD", "--", ...checked.value]);
     if (run.code !== 0) return failure("GitResetPaths", run);
     return json({ unstaged: input.paths, from: input.ref ?? "HEAD", worktreeUntouched: true });
   },
@@ -1168,6 +1439,7 @@ export const gitResetPaths: RegisteredTool = buildTool({
 
 export const gitWorktreeAdd: RegisteredTool = buildTool({
   name: "GitWorktreeAdd",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create an additional worktree inside the workspace, checked out at a ref or on a new branch. Use it to work on two branches at once without stashing; the path must be inside the working directory.",
   inputSchema: z.object({
@@ -1209,6 +1481,7 @@ export const gitWorktreeAdd: RegisteredTool = buildTool({
 
 export const gitWorktreeRemove: RegisteredTool = buildTool({
   name: "GitWorktreeRemove",
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   description:
     "Remove a worktree and its administrative entry. Use `force` only when you accept losing whatever is uncommitted there, because git otherwise refuses a dirty worktree for exactly that reason.",
   inputSchema: z.object({

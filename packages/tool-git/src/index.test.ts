@@ -18,6 +18,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -26,7 +28,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { MAX_OUTPUT_CHARS, runGit } from "./git-run";
+import {
+  MAX_OUTPUT_CHARS,
+  failure,
+  runGit,
+  skippedPatchPaths,
+  symlinksCreatedByPatch,
+  unquoteGitPath,
+} from "./git-run";
 import {
   GIT_TOOLS,
   gitAdd,
@@ -79,9 +88,33 @@ function git(args: string[], cwd: string, env: Record<string, string> = {}): Ran
   };
 }
 
+/**
+ * The identity every fixture commit is made under. The suite points git's
+ * global and system config at /dev/null, so a repository made with a bare
+ * `git init` has no user.name/user.email, and git then guesses one from the
+ * host. macOS hostnames (`name.local`) pass its check; a CI runner's does not
+ * ("unable to auto-detect email address"), so the commit failed there and
+ * the test went on against a repository with no commits.
+ */
+const FIXTURE_IDENTITY = {
+  GIT_AUTHOR_NAME: "A U Thor",
+  GIT_AUTHOR_EMAIL: "author@example.com",
+  GIT_COMMITTER_NAME: "A U Thor",
+  GIT_COMMITTER_EMAIL: "author@example.com",
+};
+
 function commitAll(dir: string, message: string, date: string): void {
   git(["add", "-A"], dir);
-  git(["commit", "-m", message], dir, { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+  const committed = git(["commit", "-m", message], dir, {
+    ...FIXTURE_IDENTITY,
+    GIT_AUTHOR_DATE: date,
+    GIT_COMMITTER_DATE: date,
+  });
+  // A fixture that silently failed to commit is not the repository the test
+  // describes: say so here, not as a confusing failure further down.
+  if (committed.code !== 0) {
+    throw new Error(`fixture commit in ${dir} failed: ${committed.stderr.trim()}`);
+  }
 }
 
 function initRepo(dir: string): void {
@@ -299,6 +332,426 @@ describe("containment", () => {
   test("a worktree cannot be created outside the workspace root", async () => {
     const out = await gitWorktreeAdd.execute({ cwd: "repo", path: "../escape-wt" });
     expect(String(out)).toContain("outside the workspace root");
+  });
+});
+
+/**
+ * C071: containing the `cwd` is not containing the repository. git works on
+ * the repository it DISCOVERS from the cwd — an enclosing checkout, the one a
+ * planted `.git` file names, or one whose history a `.git` directory borrows
+ * from outside — so each test builds that layout, proves the tool is refused,
+ * and asserts the outside repository was neither read nor changed. The
+ * controls prove the layouts git builds itself (a linked worktree, a
+ * submodule) still open when the workspace is one.
+ */
+describe("containment of the repository git discovers", () => {
+  const extra: string[] = [];
+  /** A fresh real temp dir outside the fixture workspace, removed after the test. */
+  const outsideDir = (tag: string): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), `crewhaus-tool-git-${tag}-`)));
+    extra.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    process.chdir(originalCwd);
+    for (const dir of extra.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A repository with a committed file outside the workspace. */
+  function victimRepo(tag: string): string {
+    const victim = outsideDir(tag);
+    initRepo(victim);
+    writeFileSync(join(victim, "creds.txt"), "victim-secret\n");
+    commitAll(victim, "victim commit", D3);
+    return victim;
+  }
+
+  const REFUSED = "outside the workspace";
+
+  test("a workspace nested in a larger repository: reads and writes are refused, the enclosing checkout untouched", async () => {
+    const parent = outsideDir("parent");
+    initRepo(parent);
+    writeFileSync(join(parent, "outside.txt"), "main\n");
+    commitAll(parent, "outside file", D3);
+    git(["branch", "other"], parent);
+    git(["switch", "-q", "other"], parent);
+    writeFileSync(join(parent, "outside.txt"), "other\n");
+    commitAll(parent, "other side", D3);
+    git(["switch", "-q", "main"], parent);
+    mkdirSync(join(parent, "harness"));
+    writeFileSync(join(parent, "outside.txt"), "user edit\n");
+    process.chdir(join(parent, "harness"));
+
+    const cases: Array<[RegisteredTool, Record<string, unknown>]> = [
+      [gitStatus, {}],
+      [gitDiff, { mode: "patch" }],
+      [gitLog, {}],
+      [gitShow, { ref: "HEAD", path: "outside.txt" }],
+      [gitStashPush, { message: "x" }],
+      [gitSwitch, { branch: "other" }],
+    ];
+    for (const [tool, input] of cases) {
+      const out = String(await tool.execute({ cwd: ".", ...input }));
+      expect({
+        name: tool.name,
+        refused: out.includes(REFUSED),
+        leaked: out.includes("user edit"),
+      }).toEqual({
+        name: tool.name,
+        refused: true,
+        leaked: false,
+      });
+    }
+    // The remedy is one a harness that runs from its own directory can follow.
+    const said = String(await gitStatus.execute({ cwd: "." }));
+    expect(said).toContain("the directory the harness runs from");
+    expect(said).not.toContain("run the harness from the repository's top level");
+    expect(readFileSync(join(parent, "outside.txt"), "utf8")).toBe("user edit\n");
+    expect(git(["stash", "list"], parent).stdout).toBe("");
+    expect(git(["branch", "--show-current"], parent).stdout.trim()).toBe("main");
+  });
+
+  test("a planted .git file naming another repository is refused for reads and writes", async () => {
+    const victim = victimRepo("victim");
+    mkdirSync(join(workspace, "sub"));
+    writeFileSync(join(workspace, "sub", ".git"), `gitdir: ${victim}/.git\n`);
+    // Plain git follows the file: that is the door.
+    expect(git(["show", "HEAD:creds.txt"], join(workspace, "sub")).stdout).toContain(
+      "victim-secret",
+    );
+
+    const shown = String(await gitShow.execute({ cwd: "sub", ref: "HEAD", path: "creds.txt" }));
+    expect(shown).toContain(REFUSED);
+    expect(shown).not.toContain("victim-secret");
+    // The refusal names the caller's cwd, never where the file led.
+    expect(shown).not.toContain(victim);
+    const created = String(await gitBranchCreate.execute({ cwd: "sub", name: "planted-ref" }));
+    expect(created).toContain(REFUSED);
+    expect(existsSync(join(victim, ".git", "refs", "heads", "planted-ref"))).toBe(false);
+  });
+
+  test("a planted .git directory whose core.worktree points outside is refused", async () => {
+    const target = outsideDir("wt-target");
+    writeFileSync(join(target, "notes.txt"), "keep me\n");
+    mkdirSync(join(workspace, "sub2"));
+    git(["init", "-q", "-b", "main"], join(workspace, "sub2"));
+    git(["config", "core.worktree", target], join(workspace, "sub2"));
+    expect(git(["status", "--porcelain"], join(workspace, "sub2")).stdout).toContain("notes.txt");
+
+    const status = String(await gitStatus.execute({ cwd: "sub2" }));
+    expect(status).toContain(REFUSED);
+    expect(status).not.toContain("notes.txt");
+    const added = String(await gitAdd.execute({ cwd: "sub2", paths: ["notes.txt"] }));
+    expect(added).toContain(REFUSED);
+    const stashed = String(await gitStashPush.execute({ cwd: "sub2", includeUntracked: true }));
+    expect(stashed).toContain(REFUSED);
+    expect(readFileSync(join(target, "notes.txt"), "utf8")).toBe("keep me\n");
+  });
+
+  test("a .git directory that takes its history from outside is refused: commondir, a linked objects dir, alternates", async () => {
+    const victim = victimRepo("history");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+
+    // (a) a hand-made worktree git dir whose `commondir` names the victim's.
+    const a = join(workspace, "redirect", ".git");
+    mkdirSync(a, { recursive: true });
+    writeFileSync(join(a, "commondir"), `${victim}/.git\n`);
+    writeFileSync(join(a, "gitdir"), `${a}\n`);
+    writeFileSync(join(a, "HEAD"), "ref: refs/heads/main\n");
+    // (b) the workspace's own .git with the victim's objects and refs linked in.
+    const b = join(workspace, "linked");
+    mkdirSync(b);
+    git(["init", "-q", "-b", "main"], b);
+    rmSync(join(b, ".git", "objects"), { recursive: true, force: true });
+    rmSync(join(b, ".git", "refs"), { recursive: true, force: true });
+    symlinkSync(join(victim, ".git", "objects"), join(b, ".git", "objects"));
+    symlinkSync(join(victim, ".git", "refs"), join(b, ".git", "refs"));
+    // (c) a clone that borrows the victim's object store.
+    git(["clone", "-q", "--shared", victim, join(workspace, "shared")], workspace);
+
+    for (const dir of ["redirect", "linked", "shared"]) {
+      // Plain git reads the victim's history in every one of them.
+      expect({
+        dir,
+        plain: git(["log", "-1", "--format=%H"], join(workspace, dir)).stdout.trim(),
+      }).toEqual({
+        dir,
+        plain: victimHead,
+      });
+      const out = String(await gitLog.execute({ cwd: dir }));
+      expect({ dir, refused: out.includes(REFUSED), leaked: out.includes(victimHead) }).toEqual({
+        dir,
+        refused: true,
+        leaked: false,
+      });
+    }
+  });
+
+  test("chained alternates are followed: an in-workspace alternate whose own alternates name the victim is refused", async () => {
+    // C071 bypass: the first `info/alternates` names an in-workspace object
+    // dir (which passes a first-level check), and THAT dir's own alternates
+    // name the victim's store. git follows the chain; the check must too.
+    const victim = victimRepo("chain");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const mid = join(workspace, "mid");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(victim, ".git", "objects")}\n`);
+    const c = join(workspace, "c");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    // Plain git reads the victim's committed file through the chain.
+    expect(git(["show", `${victimHead}:creds.txt`], c).stdout).toContain("victim-secret");
+
+    const shown = String(await gitShow.execute({ cwd: "c", ref: victimHead, path: "creds.txt" }));
+    expect(shown).toContain("borrows from a repository outside the workspace");
+    // The refusal names the file that actually holds the outward entry —
+    // mid/info/alternates — not the repository's own objects/info/alternates,
+    // which in this layout names only the in-workspace `mid`.
+    expect(shown).toContain("mid/info/alternates");
+    expect(shown).not.toContain("(objects/info/alternates)");
+    expect(shown).not.toContain("victim-secret");
+    expect(shown).not.toContain(victim);
+  });
+
+  test("a chain of in-workspace alternates that never leaves the workspace still opens", async () => {
+    // The recursion refuses only a store that leads OUT: a legitimate chain
+    // of in-workspace alternates (a shared object cache linked twice) opens.
+    const cache = join(workspace, "cache");
+    mkdirSync(cache);
+    git(["init", "-q", "-b", "main", "--bare"], cache);
+    const mid = join(workspace, "mid2");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(cache, "objects")}\n`);
+    const c = join(workspace, "c2");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    writeFileSync(join(c, "f.txt"), "in-workspace\n");
+    commitAll(c, "c commit", D3);
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "c2" })));
+    expect(out.commits[0].subject).toBe("c commit");
+  });
+
+  test("a link deep under refs/ or objects/pack/ is refused, not only one at depth one", async () => {
+    // C071 bypass: linkLeadingOut scanned <gitdir>/<sub>/<name> only, so a
+    // link at refs/remotes/v (depth 3) or objects/pack/<file> (depth 3) went
+    // unseen while git read the victim's refs and packs through it.
+    const victim = victimRepo("deep");
+    git(["gc", "-q"], victim);
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+
+    // (a) a directory link deep under refs/: refs/remotes/v -> victim heads.
+    const refsRepo = join(workspace, "refs-repo");
+    mkdirSync(refsRepo);
+    git(["init", "-q", "-b", "main"], refsRepo);
+    mkdirSync(join(refsRepo, ".git", "refs", "remotes"), { recursive: true });
+    symlinkSync(
+      join(victim, ".git", "refs", "heads"),
+      join(refsRepo, ".git", "refs", "remotes", "v"),
+    );
+    const bySha = String(await gitShow.execute({ cwd: "refs-repo", ref: victimHead }));
+    expect(bySha).toContain("holds a link (refs/remotes/v)");
+    expect(bySha).not.toContain("victim-secret");
+    const byRef = String(
+      await gitShow.execute({ cwd: "refs-repo", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).not.toContain("victim-secret");
+
+    // (b) a file link deep under objects/pack/: the victim's pack files.
+    const packRepo = join(workspace, "pack-repo");
+    mkdirSync(packRepo);
+    git(["init", "-q", "-b", "main"], packRepo);
+    const victimPack = join(victim, ".git", "objects", "pack");
+    for (const f of readdirSync(victimPack)) {
+      symlinkSync(join(victimPack, f), join(packRepo, ".git", "objects", "pack", f));
+    }
+    const packShown = String(await gitShow.execute({ cwd: "pack-repo", ref: victimHead }));
+    expect(packShown).toContain("objects/pack/");
+    expect(packShown).not.toContain("victim-secret");
+  });
+
+  test("a loose-object leaf link is refused: objects/<fanout>/<rest> leading out (C071)", async () => {
+    // C071 residual: the deep scan walked objects/pack and objects/info but
+    // left the loose fan-out at depth one, so a symlink planted at a real
+    // fan-out dir's leaf — objects/ab/cdef… -> the victim's loose object —
+    // was never seen, and git read the borrowed object by hash. A fresh,
+    // un-gc'd repository keeps every object loose, so this is the common case.
+    const victim = victimRepo("loose");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const fanout = victimHead.slice(0, 2);
+    const rest = victimHead.slice(2);
+    // The victim's commit object is loose (no gc): confirm the fixture.
+    expect(existsSync(join(victim, ".git", "objects", fanout, rest))).toBe(true);
+
+    const looseRepo = join(workspace, "loose-repo");
+    mkdirSync(looseRepo);
+    git(["init", "-q", "-b", "main"], looseRepo);
+    const dir = join(looseRepo, ".git", "objects", fanout);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(victim, ".git", "objects", fanout, rest), join(dir, rest));
+
+    const shown = String(await gitShow.execute({ cwd: "loose-repo", ref: victimHead }));
+    expect(shown).toContain(`holds a link (objects/${fanout}/${rest})`);
+    expect(shown).toContain("outside the workspace");
+    expect(shown).not.toContain("victim-secret");
+  });
+
+  test("a link at objects/info/<file> leading out is refused (objects/info stays covered)", async () => {
+    // Kills a mutant that drops objects/info from the deep scan: git reads
+    // objects/info/{packs,commit-graph,…} by name, so a link there leaks the
+    // file it names just as objects/pack does.
+    const out = outsideDir("info-target");
+    writeFileSync(join(out, "borrowed"), "x\n");
+    const infoRepo = join(workspace, "info-repo");
+    mkdirSync(infoRepo);
+    git(["init", "-q", "-b", "main"], infoRepo);
+    mkdirSync(join(infoRepo, ".git", "objects", "info"), { recursive: true });
+    symlinkSync(join(out, "borrowed"), join(infoRepo, ".git", "objects", "info", "commit-graph"));
+
+    const shown = String(await gitLog.execute({ cwd: "info-repo" }));
+    expect(shown).toContain("holds a link (objects/info/commit-graph)");
+    expect(shown).toContain("outside the workspace");
+  });
+
+  test("an inside-staying refs/ directory link whose child leads out is refused (C071)", async () => {
+    // C071 residual: deepLinkLeadingOut `continue`d on any link staying inside
+    // the workspace, so it never looked beneath an in-workspace directory
+    // link. refs/remotes -> ws/stage (inside) with ws/stage/v -> the victim's
+    // heads (outside) let git resolve refs/remotes/v/main to the victim's ref
+    // file, and bootstrapped the victim tip SHA from GitBranchList's error.
+    const victim = victimRepo("refs-double");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const stage = join(workspace, "stage");
+    mkdirSync(stage);
+    const double = join(workspace, "double");
+    mkdirSync(double);
+    git(["init", "-q", "-b", "main"], double);
+    symlinkSync(stage, join(double, ".git", "refs", "remotes"));
+    symlinkSync(join(victim, ".git", "refs", "heads"), join(stage, "v"));
+    // Plain git resolves the victim's ref through the two links.
+    expect(git(["rev-parse", "refs/remotes/v/main"], double).stdout.trim()).toBe(victimHead);
+
+    const byRef = String(
+      await gitShow.execute({ cwd: "double", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).toContain("outside the workspace");
+    expect(byRef).not.toContain("victim-secret");
+    // The branch listing must not disclose the victim tip SHA in its error.
+    const branches = String(await gitBranchList.execute({ cwd: "double", remote: true }));
+    expect(branches).toContain("outside the workspace");
+    expect(branches).not.toContain(victimHead);
+  });
+
+  test("an inside-staying refs/ link that points at an ancestor does not loop the scan", async () => {
+    // The descent into inside-staying directory links is realpath-guarded, so
+    // a link pointing back up (refs/loop -> the git dir) terminates instead of
+    // recursing forever; a normal repository still opens.
+    const loopRepo = join(workspace, "loop-repo");
+    mkdirSync(loopRepo);
+    git(["init", "-q", "-b", "main"], loopRepo);
+    writeFileSync(join(loopRepo, "f.txt"), "in-workspace\n");
+    commitAll(loopRepo, "loop commit", D3);
+    symlinkSync(join(loopRepo, ".git"), join(loopRepo, ".git", "refs", "loop"));
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "loop-repo" })));
+    expect(out.commits[0].subject).toBe("loop commit");
+  });
+
+  test("a .git/hooks, .git/lfs or info/exclude linked outside is not history: the repository still works", async () => {
+    // Sharing hooks by symlinking .git/hooks predates core.hooksPath, and
+    // relocating .git/lfs to another disk is common. Neither moves the
+    // working tree, refs or objects.
+    const shared = outsideDir("shared-hooks");
+    const lfs = outsideDir("shared-lfs");
+    const exclude = join(outsideDir("shared-info"), "exclude");
+    writeFileSync(exclude, "*.log\n");
+    rmSync(join(repo, ".git", "hooks"), { recursive: true, force: true });
+    symlinkSync(shared, join(repo, ".git", "hooks"));
+    symlinkSync(lfs, join(repo, ".git", "lfs"));
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    rmSync(join(repo, ".git", "info", "exclude"), { force: true });
+    symlinkSync(exclude, join(repo, ".git", "info", "exclude"));
+    writeFileSync(join(repo, "noise.log"), "x\n");
+    const status = await call(gitStatus);
+    expect(status.branch).toBe("main");
+    // The linked exclude file is honoured.
+    expect(JSON.stringify(status)).not.toContain("noise.log");
+    const branch = await call(gitBranchCreate, { name: "with-shared-hooks" });
+    expect(branch.created).toBe("with-shared-hooks");
+
+    // A link that does carry history (reflogs a write appends to) still
+    // refuses the repository.
+    rmSync(join(repo, ".git", "logs"), { recursive: true, force: true });
+    symlinkSync(outsideDir("logs-out"), join(repo, ".git", "logs"));
+    const refused = String(await gitStatus.execute({ cwd: "repo" }));
+    expect(refused).toContain("holds a link (logs) leading outside");
+  });
+
+  test("an inherited GIT_DIR or GIT_WORK_TREE never redirects a tool", async () => {
+    const victim = victimRepo("env");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const saved = { dir: process.env["GIT_DIR"], tree: process.env["GIT_WORK_TREE"] };
+    process.env["GIT_DIR"] = join(victim, ".git");
+    process.env["GIT_WORK_TREE"] = victim;
+    try {
+      const out = await call(gitLog);
+      expect(JSON.stringify(out)).not.toContain(victimHead);
+      expect(out.commits[0].subject).toBe("second commit");
+    } finally {
+      if (saved.dir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
+      else process.env["GIT_DIR"] = saved.dir;
+      if (saved.tree === undefined) Reflect.deleteProperty(process.env, "GIT_WORK_TREE");
+      else process.env["GIT_WORK_TREE"] = saved.tree;
+    }
+  });
+
+  test("every run carries a discovery ceiling at the workspace root", async () => {
+    const parent = outsideDir("ceiling");
+    initRepo(parent);
+    mkdirSync(join(parent, "harness"));
+    process.chdir(join(parent, "harness"));
+    // Without the ceiling this finds the enclosing repository.
+    expect(git(["rev-parse", "--show-toplevel"], join(parent, "harness")).code).toBe(0);
+    const run = await runGit(["rev-parse", "--show-toplevel"], {
+      cwd: join(parent, "harness"),
+      timeoutMs: 10_000,
+      readOnly: true,
+    });
+    expect({ code: run.code, notRepo: /not a git repository/i.test(run.stderr) }).toEqual({
+      code: 128,
+      notRepo: true,
+    });
+  });
+
+  test("control: a workspace that is a linked worktree of an outside repository still opens", async () => {
+    const main = victimRepo("wt-main");
+    const base = outsideDir("wt-base");
+    const wt = join(base, "wt");
+    expect(git(["worktree", "add", "-q", "-b", "wtb", wt], main).code).toBe(0);
+    process.chdir(wt);
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "." })));
+    expect(out.branch).toBe("wtb");
+  });
+
+  test("control: a workspace that is a submodule checkout still opens", async () => {
+    const sub = victimRepo("sm-sub");
+    const sup = outsideDir("sm-super");
+    initRepo(sup);
+    expect(
+      git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "mod"], sup).code,
+    ).toBe(0);
+    process.chdir(join(sup, "mod"));
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "." })));
+    expect(out.clean).toBe(true);
+  });
+
+  test("control: a worktree GitWorktreeAdd made inside the workspace opens", async () => {
+    const added = await call(gitWorktreeAdd, { path: "inner-wt", createBranch: "inner" });
+    expect(String(JSON.stringify(added))).not.toContain(REFUSED);
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "inner-wt" })));
+    expect(out.branch).toBe("inner");
   });
 });
 
@@ -651,6 +1104,45 @@ describe("GitBranchList, GitTagList, GitRemoteList", () => {
     expect(out.tags.map((t: { name: string }) => t.name)).toEqual(["v1.0"]);
   });
 
+  test("a token in a remote's URL, or in an insteadOf rewrite, is masked (C051)", async () => {
+    const tok = ["gh", "p_", "FAKE", "0123456789abcdefABCDEF0123456789ab"].join("");
+    git(["remote", "add", "origin", `https://x-access-token:${tok}@example.invalid/x.git`], repo);
+    // The CI pattern: a clean remote, and a repo-local rewrite that adds a token.
+    git(["remote", "add", "deps", "https://deps.invalid/y.git"], repo);
+    git(["config", `url.https://${tok}@deps.invalid/.insteadOf`, "https://deps.invalid/"], repo);
+    const text = await gitRemoteList.execute({ cwd: "repo" });
+    expect(String(text)).not.toContain(tok);
+    const out = JSON.parse(String(text)) as { remotes: Array<Record<string, unknown>> };
+    expect(out.remotes).toEqual([
+      {
+        name: "deps",
+        fetch: "https://***@deps.invalid/y.git",
+        push: "https://***@deps.invalid/y.git",
+        credentialsRedacted: true,
+      },
+      {
+        name: "origin",
+        fetch: "https://***@example.invalid/x.git",
+        push: "https://***@example.invalid/x.git",
+        credentialsRedacted: true,
+      },
+    ]);
+  });
+
+  test("an error that quotes a remote's URL does not quote its credential", () => {
+    const tok = ["gh", "p_", "FAKE", "0123456789abcdefABCDEF0123456789ab"].join("");
+    const message = failure("GitRemoteList", {
+      code: 128,
+      stdout: "",
+      stderr: `fatal: repository 'https://x-access-token:${tok}@example.invalid/x.git/' not found`,
+      timedOut: false,
+      truncated: false,
+      args: ["remote", "-v"],
+    });
+    expect(message).not.toContain(tok);
+    expect(message).toContain("example.invalid/x.git");
+  });
+
   test("remotes are read from config, never contacted", async () => {
     git(["remote", "add", "origin", "https://example.invalid/x.git"], repo);
     const out = await call(gitRemoteList);
@@ -954,6 +1446,16 @@ describe("GitTagCreate", () => {
 });
 
 describe("GitApplyPatch", () => {
+  const linkOutsideDirs: string[] = [];
+  const outsideForLinks = (): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-tool-git-link-")));
+    linkOutsideDirs.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of linkOutsideDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   test("checks a patch without changing anything, then applies it", async () => {
     writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
     const diff = await call(gitDiff, { mode: "patch" });
@@ -999,6 +1501,359 @@ describe("GitApplyPatch", () => {
     // The refusal is only worth anything if the file really is not there.
     expect(existsSync(join(workspace, "escape.txt"))).toBe(false);
     expect(existsSync(join(repo, "escape.txt"))).toBe(false);
+  });
+
+  describe("a patch creating a symbolic link out of the workspace is refused (C070 enabler)", () => {
+    const linkPatch = (path: string, target: string): string =>
+      [
+        `diff --git a/${path} b/${path}`,
+        "new file mode 120000",
+        "index 0000000..1111111",
+        "--- /dev/null",
+        `+++ b/${path}`,
+        "@@ -0,0 +1 @@",
+        `+${target}`,
+        "\\ No newline at end of file",
+        "",
+      ].join("\n");
+
+    test("an absolute target outside the workspace is refused, nothing planted", async () => {
+      const outside = join(outsideForLinks(), "planted.rc");
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("evil", outside) });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (evil)");
+      expect(out.reason).toContain("outside the workspace");
+      expect(existsSync(join(repo, "evil"))).toBe(false);
+      expect(existsSync(outside)).toBe(false);
+    });
+
+    test("a ../ target that climbs out of the workspace is refused", async () => {
+      // repo is one level under the workspace root, so `../../x` leaves it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("up", "../../outside.rc"),
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (up)");
+      expect(existsSync(join(repo, "up"))).toBe(false);
+    });
+
+    test("check mode refuses too, so it never reports 'would apply' for an escaping link", async () => {
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("evil2", "/etc/passwd"),
+        check: true,
+      });
+      expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+      expect(existsSync(join(repo, "evil2"))).toBe(false);
+    });
+
+    test("a link that stays inside the workspace still applies", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("good", "README.md") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "good")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "good"))).toBe("README.md");
+    });
+
+    test("a link into a sibling directory of the repo applies: target inside the workspace, outside the repo", async () => {
+      // The workspace holds sibling directories (here `repo` and `plain`); a
+      // link from one into another points INSIDE the workspace and is
+      // legitimate — a vendored dependency, a shared asset. It was wrongly
+      // refused, and mislabelled "outside the workspace", when the bound was
+      // the repository's top level instead of the workspace root.
+      expect(existsSync(join(workspace, "plain"))).toBe(true);
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("sib", "../plain") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "sib")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "sib"))).toBe("../plain");
+    });
+
+    test("the escaping-link check honours strip, not a fixed -p1", async () => {
+      // Kills a mutant that always passes strip 1: the patch header carries an
+      // extra component, so only strip 2 gives the real link path `deep/link`
+      // and resolves `../../../outside` out of the workspace. Read with strip
+      // 1 the path and its `..` climb land back inside, and the escape is
+      // missed while git (run with -p2) still creates it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("x/deep/link", "../../../outside"),
+        strip: 2,
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (deep/link)");
+      expect(existsSync(join(repo, "deep", "link"))).toBe(false);
+    });
+  });
+
+  test("symlinksCreatedByPatch reads targets and honours -p; a deletion contributes none", () => {
+    const patch = [
+      "diff --git a/dir/link b/dir/link",
+      "new file mode 120000",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      "+++ b/dir/link",
+      "@@ -0,0 +1 @@",
+      "+/etc/passwd",
+      "\\ No newline at end of file",
+      "diff --git a/gone b/gone",
+      "deleted file mode 120000",
+      "index 1111111..0000000",
+      "--- a/gone",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-/was/here",
+      "diff --git a/plain.txt b/plain.txt",
+      "new file mode 100644",
+      "index 0000000..2222222",
+      "--- /dev/null",
+      "+++ b/plain.txt",
+      "@@ -0,0 +1 @@",
+      "+not a link",
+      "",
+    ].join("\n");
+    // -p1 (git's default) drops the a/ or b/ prefix.
+    expect(symlinksCreatedByPatch(patch, 1)).toEqual([{ path: "dir/link", target: "/etc/passwd" }]);
+    // -p2 drops one more component.
+    expect(symlinksCreatedByPatch(patch, 2)).toEqual([{ path: "link", target: "/etc/passwd" }]);
+  });
+
+  test("git's quoted path names are read back to the file they name", () => {
+    expect(unquoteGitPath("plain.txt")).toBe("plain.txt");
+    expect(unquoteGitPath('"tab\\tname.txt"')).toBe("tab\tname.txt");
+    expect(unquoteGitPath('"say \\"hi\\".txt"')).toBe('say "hi".txt');
+    expect(unquoteGitPath('"back\\\\slash"')).toBe("back\\slash");
+    // An octal escape is a UTF-8 byte, whatever core.quotepath says.
+    expect(unquoteGitPath('"caf\\303\\251.txt"')).toBe("café.txt");
+    // Something git would never write is left as written, not guessed at.
+    expect(unquoteGitPath('"odd\\q"')).toBe('"odd\\q"');
+    expect(
+      skippedPatchPaths("Skipped patch 'a.txt'.\nChecking patch b...\nSkipped patch 'it'.'.\n"),
+    ).toEqual(["a.txt", "it'."]);
+  });
+
+  describe("a patch path outside cwd (C219)", () => {
+    // git applies only what lies under the directory it runs in, skips the
+    // rest in silence and exits 0. 0.7.0 read exit 0 as "applied".
+    const change = (file: string, from: string, to: string): string =>
+      [
+        `diff --git a/${file} b/${file}`,
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        "@@ -1 +1 @@",
+        `-${from}`,
+        `+${to}`,
+        "",
+      ].join("\n");
+    const outside = change("outside.txt", "one", "two");
+    const inside = change("pkg/inside.txt", "alpha", "beta");
+    const read = (rel: string): string => readFileSync(join(repo, rel), "utf8");
+
+    beforeEach(() => {
+      mkdirSync(join(repo, "pkg"));
+      writeFileSync(join(repo, "pkg/inside.txt"), "alpha\n");
+      writeFileSync(join(repo, "outside.txt"), "one\n");
+      commitAll(repo, "pkg and outside", D3);
+    });
+
+    test("check: a skipped path is not 'would apply'", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: outside, check: true });
+      expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+      expect(out.skipped).toEqual(["outside.txt"]);
+      expect(out.reason).toContain('outside "pkg"');
+    });
+
+    test("apply: a skipped path is not 'applied', and nothing changes", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: outside });
+      expect(out).toMatchObject({ applied: false, wouldApply: false, skipped: ["outside.txt"] });
+      expect(out.reason).toContain("Nothing was applied");
+      expect(read("outside.txt")).toBe("one\n");
+    });
+
+    test("a patch half in scope is refused whole, never half-applied", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: `${outside}${inside}` });
+      expect(out).toMatchObject({ applied: false, skipped: ["outside.txt"] });
+      expect(read("outside.txt")).toBe("one\n");
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+    });
+
+    test("a git-header patch written relative to cwd is refused, not a silent no-op", async () => {
+      // `diff --git` paths are relative to the repository root, so from
+      // cwd "pkg" this names repo/inside.txt — which git skips.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo/pkg",
+        patch: change("inside.txt", "alpha", "beta"),
+      });
+      expect(out).toMatchObject({ applied: false, skipped: ["inside.txt"] });
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+    });
+
+    test("a quoted path is reported as the file it names", async () => {
+      writeFileSync(join(repo, "tab\tname.txt"), "one\n");
+      commitAll(repo, "an awkward name", D3);
+      const patch = [
+        'diff --git "a/tab\\tname.txt" "b/tab\\tname.txt"',
+        '--- "a/tab\\tname.txt"',
+        '+++ "b/tab\\tname.txt"',
+        "@@ -1 +1 @@",
+        "-one",
+        "+two",
+        "",
+      ].join("\n");
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch, check: true });
+      expect(out.skipped).toEqual(["tab\tname.txt"]);
+    });
+
+    test("a rename or copy whose SOURCE lies outside cwd is refused, and moves nothing", async () => {
+      // git checks only a renamed file's new name against cwd, so this patch
+      // was applied from "pkg" and deleted outside.txt.
+      const rename = [
+        "diff --git a/outside.txt b/pkg/outside.txt",
+        "similarity index 100%",
+        "rename from outside.txt",
+        "rename to pkg/outside.txt",
+        "",
+      ].join("\n");
+      for (const check of [true, false]) {
+        const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename, check });
+        expect(out).toMatchObject({ applied: false, wouldApply: false });
+        expect(out.skipped).toEqual(["outside.txt => pkg/outside.txt"]);
+        expect(out.reason).toContain('outside "pkg"');
+      }
+      expect(read("outside.txt")).toBe("one\n");
+      expect(existsSync(join(repo, "pkg", "outside.txt"))).toBe(false);
+
+      const copy = rename.replace("rename from", "copy from").replace("rename to", "copy to");
+      const copied = await call(gitApplyPatch, { cwd: "repo/pkg", patch: copy });
+      expect(copied).toMatchObject({ applied: false, skipped: ["outside.txt => pkg/outside.txt"] });
+      expect(existsSync(join(repo, "pkg", "outside.txt"))).toBe(false);
+    });
+
+    test("a rename whose TARGET lies outside cwd is refused before anything runs", async () => {
+      // The mirror of the case above: reversed, this patch's new name is
+      // pkg/inside.txt, inside cwd, so only the forward preflight names it.
+      // Without that preflight the real apply skipped it and came back as a
+      // "partial" apply of a patch that changed nothing.
+      const rename = [
+        "diff --git a/pkg/inside.txt b/moved-out.txt",
+        "similarity index 100%",
+        "rename from pkg/inside.txt",
+        "rename to moved-out.txt",
+        "",
+      ].join("\n");
+      for (const check of [true, false]) {
+        const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename, check });
+        expect(out).toMatchObject({ applied: false, wouldApply: false });
+        expect(out.partial).toBeUndefined();
+        expect(out.skipped).toEqual(["pkg/inside.txt => moved-out.txt"]);
+        expect(out.reason).toContain("Nothing was applied");
+      }
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+      expect(existsSync(join(repo, "moved-out.txt"))).toBe(false);
+    });
+
+    test("a rename wholly inside cwd still applies from there", async () => {
+      const rename = [
+        "diff --git a/pkg/inside.txt b/pkg/moved.txt",
+        "similarity index 100%",
+        "rename from pkg/inside.txt",
+        "rename to pkg/moved.txt",
+        "",
+      ].join("\n");
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename });
+      expect(out).toMatchObject({ applied: true });
+      expect(read("pkg/moved.txt")).toBe("alpha\n");
+      expect(existsSync(join(repo, "pkg", "inside.txt"))).toBe(false);
+    });
+
+    test("from the repository root the same patch applies whole", async () => {
+      const checked = await call(gitApplyPatch, { patch: `${outside}${inside}`, check: true });
+      expect(checked).toMatchObject({ checkedOnly: true, wouldApply: true });
+      expect(checked.skipped).toBeUndefined();
+      const out = await call(gitApplyPatch, { patch: `${outside}${inside}` });
+      expect(out).toMatchObject({ applied: true, wouldApply: true });
+      expect(read("outside.txt")).toBe("two\n");
+      expect(read("pkg/inside.txt")).toBe("beta\n");
+    });
+
+    test("a header-less patch from a subdirectory still applies there", async () => {
+      // Without `diff --git`, git reads the paths relative to cwd.
+      const plain = ["--- a/inside.txt", "+++ b/inside.txt", "@@ -1 +1 @@", "-alpha", "+beta", ""];
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: plain.join("\n") });
+      expect(out).toMatchObject({ applied: true });
+      expect(read("pkg/inside.txt")).toBe("beta\n");
+    });
+
+    test("a failure still leads with git's own error, not -v's progress lines", async () => {
+      const out = await call(gitApplyPatch, { patch: change("pkg/inside.txt", "WRONG", "beta") });
+      expect(out.applied).toBe(false);
+      expect(out.reason).toMatch(/^GitApplyPatch failed \(git exit 1\): error: /);
+      expect(out.reason).not.toContain("Checking patch");
+    });
+  });
+
+  test("check with threeWay says a conflicting merge would not apply cleanly", async () => {
+    // `git apply --check --3way` exits 0 here while the real apply leaves
+    // conflict markers and exits 1; the check has to agree with the apply.
+    writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
+    const diff = await call(gitDiff, { mode: "patch" });
+    git(["checkout", "--", "README.md"], repo);
+    writeFileSync(join(repo, "README.md"), "hello\nworld\nsomething else\n");
+    commitAll(repo, "diverge", D3);
+    const out = await call(gitApplyPatch, { patch: diff.patch, check: true, threeWay: true });
+    expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+    expect(out.conflicts).toEqual(["README.md"]);
+    expect(readFileSync(join(repo, "README.md"), "utf8")).toBe("hello\nworld\nsomething else\n");
+  });
+
+  test("a real threeWay apply that leaves conflicts says it applied, and names them", async () => {
+    // git writes the merge — conflict markers in the file, unmerged stages in
+    // the index — and exits 1. `applied: false` would say nothing changed.
+    writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
+    const diff = await call(gitDiff, { mode: "patch" });
+    git(["checkout", "--", "README.md"], repo);
+    writeFileSync(join(repo, "README.md"), "hello\nworld\nsomething else\n");
+    commitAll(repo, "diverge", D3);
+    const real = await call(gitApplyPatch, { patch: diff.patch, threeWay: true, index: true });
+    const content = readFileSync(join(repo, "README.md"), "utf8");
+    const unmergedStages = git(["ls-files", "-u", "--", "README.md"], repo)
+      .stdout.trim()
+      .split("\n");
+    expect({
+      applied: real.applied,
+      conflicted: real.conflicted,
+      conflicts: real.conflicts,
+      markers: content.includes("<<<<<<<") && content.includes(">>>>>>>"),
+      unmergedStages: unmergedStages.length,
+    }).toEqual({
+      applied: true,
+      conflicted: true,
+      conflicts: ["README.md"],
+      markers: true,
+      unmergedStages: 3,
+    });
+    expect(String(real.reason)).toContain("WITH CONFLICTS");
+  });
+
+  test("a threeWay apply that fails outright still says nothing was applied", async () => {
+    // A patch whose preimage blob this repository lacks cannot fall back to a
+    // merge: git writes nothing, prints no `U` line, and the answer is false.
+    const patch = [
+      "diff --git a/README.md b/README.md",
+      "index 0123456..89abcde 100644",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1 +1 @@",
+      "-not what the file says",
+      "+changed",
+      "",
+    ].join("\n");
+    const before = readFileSync(join(repo, "README.md"), "utf8");
+    const out = await call(gitApplyPatch, { patch, threeWay: true });
+    expect({ applied: out.applied, conflicted: out.conflicted }).toEqual({
+      applied: false,
+      conflicted: undefined,
+    });
+    expect(readFileSync(join(repo, "README.md"), "utf8")).toBe(before);
   });
 
   test("a conflicted file past the size cap is reported, not read into memory", async () => {
@@ -1173,6 +2028,149 @@ describe("boundedness", () => {
  * `apps/cli/src/tool-registry.test.ts` skipped it and the unsafe probe
  * survived here after being fixed everywhere else.
  */
+/**
+ * Final review (0.7.1): a pathspec is a glob to git, where `*` crosses `/`,
+ * while a permission rule reads the same value as the literal path it
+ * spells. `secret*` met no `alwaysDeny GitDiff(secrets/**)` and diffed,
+ * staged or committed everything under secrets/. Every tool that hands a
+ * caller's path to git as a pathspec now hands it over literal.
+ */
+describe("a caller's pathspec is literal, never a glob", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  /** The spellings a glob pathspec would widen to secrets/. */
+  const GLOBS = ["secret*", "secret?/*", "[s]ecrets", "*"];
+  const on = (args: string[]) => git(args, repo).stdout;
+  const staged = () => on(["diff", "--cached", "--name-only"]).split("\n").filter(Boolean);
+  beforeEach(() => {
+    mkdirSync(join(repo, "secrets"));
+    mkdirSync(join(repo, "app", "[id]"), { recursive: true });
+    writeFileSync(join(repo, "secrets", "key.txt"), "old\n");
+    writeFileSync(join(repo, "app", "[id]", "page.tsx"), "page\n");
+    commitAll(repo, "add secrets and a route", D3);
+    writeFileSync(join(repo, "secrets", "key.txt"), `${SECRET}\n`);
+    writeFileSync(join(repo, "secrets", "new.txt"), "untracked\n");
+    writeFileSync(join(repo, "app", "[id]", "page.tsx"), "page two\n");
+  });
+
+  /**
+   * Each tool that passes caller paths to git as pathspecs, with a call that
+   * would act on secrets/ were the path a glob, and what it must show
+   * instead. `hits` counts the tools the sweep ran, and the static count
+   * below ties it to the tools that check pathspecs at all.
+   */
+  const PATHSPEC_TOOLS = [
+    "GitDiff",
+    "GitLog",
+    "GitFileHistory",
+    "GitAdd",
+    "GitCommit",
+    "GitStashPush",
+    "GitResetPaths",
+  ];
+
+  test("no glob spelling reaches secrets/ through any tool that takes pathspecs", async () => {
+    const hits = new Set<string>();
+    for (const glob of GLOBS) {
+      // Reads: nothing under secrets/ comes back.
+      const diff = String(await gitDiff.execute({ cwd: "repo", mode: "patch", paths: [glob] }));
+      expect({ glob, diff: diff.includes(SECRET) }).toEqual({ glob, diff: false });
+      hits.add("GitDiff");
+      const log = await call(gitLog, { paths: [glob] });
+      expect({ glob, log: log.count ?? log }).toEqual({ glob, log: 0 });
+      hits.add("GitLog");
+      const history = await call(gitFileHistory, { path: glob });
+      expect({ glob, history: history.count ?? history }).toEqual({ glob, history: 0 });
+      hits.add("GitFileHistory");
+      // Writes: nothing under secrets/ is staged, committed or stashed.
+      await gitAdd.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, staged: staged() }).toEqual({ glob, staged: [] });
+      hits.add("GitAdd");
+      const head = on(["rev-parse", "HEAD"]);
+      await gitCommit.execute({ cwd: "repo", message: "sneak", paths: [glob] });
+      expect({ glob, head: on(["rev-parse", "HEAD"]) }).toEqual({ glob, head });
+      hits.add("GitCommit");
+      await gitStashPush.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, stashes: on(["stash", "list"]) }).toEqual({ glob, stashes: "" });
+      expect(readFileSync(join(repo, "secrets", "key.txt"), "utf8")).toContain(SECRET);
+      hits.add("GitStashPush");
+      git(["add", "--", "secrets/key.txt"], repo);
+      await gitResetPaths.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, staged: staged() }).toEqual({ glob, staged: ["secrets/key.txt"] });
+      git(["reset", "--quiet", "--", "secrets/key.txt"], repo);
+      hits.add("GitResetPaths");
+    }
+    expect([...hits].sort()).toEqual([...PATHSPEC_TOOLS].sort());
+  }, 60_000);
+
+  test("a literal path still works: a directory with everything under it, and a name with [ ]", async () => {
+    const diff = await call(gitDiff, { mode: "nameOnly", paths: ["secrets"] });
+    expect(diff.paths).toEqual(["secrets/key.txt"]);
+    const route = await call(gitDiff, { mode: "nameOnly", paths: ["app/[id]/page.tsx"] });
+    expect(route.paths).toEqual(["app/[id]/page.tsx"]);
+    expect((await call(gitLog, { paths: ["secrets"] })).count).toBe(1);
+    expect((await call(gitFileHistory, { path: "app/[id]/page.tsx" })).count).toBe(1);
+    const added = await call(gitAdd, { paths: ["app/[id]/page.tsx"] });
+    expect(added.staged).toEqual(["app/[id]/page.tsx"]);
+    expect(staged()).toEqual(["app/[id]/page.tsx"]);
+    await call(gitResetPaths, { paths: ["app/[id]/page.tsx"] });
+    expect(staged()).toEqual([]);
+    const pushed = await call(gitStashPush, { paths: ["app/[id]/page.tsx"] });
+    expect(pushed.pushed).toBe(true);
+    expect(readFileSync(join(repo, "app", "[id]", "page.tsx"), "utf8")).toBe("page\n");
+    const committed = await call(gitCommit, { message: "route", paths: ["secrets/key.txt"] });
+    expect(committed.committed).toBe(true);
+    expect(on(["show", "--name-only", "--format=", "HEAD"]).trim()).toBe("secrets/key.txt");
+  }, 30_000);
+
+  test("a pathspec that matches nothing reads as the caller wrote it", async () => {
+    const out = String(await gitAdd.execute({ cwd: "repo", paths: ["secret*"] }));
+    expect(out).toContain("GitAdd failed");
+    expect(out).toContain("'secret*' did not match any files");
+    expect(out).not.toContain(":(literal)");
+  });
+
+  test("an inherited GIT_ICASE_PATHSPECS or GIT_LITERAL_PATHSPECS changes nothing", async () => {
+    for (const [name, value] of [
+      ["GIT_ICASE_PATHSPECS", "1"],
+      ["GIT_GLOB_PATHSPECS", "1"],
+      ["GIT_LITERAL_PATHSPECS", "1"],
+    ] as const) {
+      const saved = process.env[name];
+      process.env[name] = value;
+      try {
+        // Folded case would reach secrets/ where a rule on `SECRETS` reads
+        // another directory (Linux); literal-mode magic would make every
+        // checked pathspec match nothing at all.
+        const upper = String(
+          await gitDiff.execute({ cwd: "repo", mode: "patch", paths: ["SECRETS"] }),
+        );
+        expect({ name, leaked: upper.includes(SECRET) }).toEqual({ name, leaked: false });
+        const glob = String(
+          await gitDiff.execute({ cwd: "repo", mode: "patch", paths: ["secret*"] }),
+        );
+        expect({ name, leaked: glob.includes(SECRET) }).toEqual({ name, leaked: false });
+        const exact = await call(gitDiff, { mode: "nameOnly", paths: ["secrets"] });
+        expect({ name, paths: exact.paths }).toEqual({ name, paths: ["secrets/key.txt"] });
+      } finally {
+        if (saved === undefined) Reflect.deleteProperty(process.env, name);
+        else process.env[name] = saved;
+      }
+    }
+  }, 30_000);
+
+  test("every call site that checks a pathspec is a pathspec tool above or reads one named file", () => {
+    // GitShow reads `<ref>:./<path>` and GitBlame one file: neither is a
+    // pathspec, and git reads both literally already. Every other caller of
+    // checkPathspecs is in PATHSPEC_TOOLS, so a new one fails here until it
+    // is added to the sweep above.
+    const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const callers = [...source.matchAll(/checkPathspecs\("(\w+)"/g)].map((m) => m[1]).sort();
+    expect(callers).toEqual([...PATHSPEC_TOOLS, "GitShow", "GitBlame"].sort());
+    // And each pathspec tool hands git the checked value, not its input.
+    expect(source.match(/\.\.\.checked\.value/g)?.length).toBe(PATHSPEC_TOOLS.length);
+  });
+});
+
 describe("containment of a dangling symlink", () => {
   test("a worktree path that is a dangling symlink out of the workspace is refused", async () => {
     const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-git-outside-")));

@@ -12,7 +12,7 @@ contract says is worse than no answer.
 
 ```yaml
 tools:
-  - all-docs        # every tool below
+  - all-documents   # every tool below
   - -pdfMerge       # ...except this one
 ```
 

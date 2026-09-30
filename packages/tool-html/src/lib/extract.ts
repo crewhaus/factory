@@ -5,17 +5,79 @@
  * context window: what are the rows, where do the links go, what fields does
  * this form want, what does the page say about itself.
  */
-import { type Element, normalizeText, textOf, walk } from "./parse";
-import { queryAll } from "./select";
+import {
+  type Element,
+  type TextWork,
+  attrOf,
+  boundedText,
+  normalizeText,
+  textOf,
+  walk,
+} from "./parse";
+import { type MatchContext, createMatchContext, firstMatchIn, queryAll } from "./select";
 
-const cellText = (node: Element): string => normalizeText(textOf(node));
+/**
+ * What one call may spend on element text: characters it may return, and
+ * text and nodes it may read to find them. Shared by every value the call
+ * takes, because a value's text is its whole subtree's: nested matches each
+ * carry every deeper one, so 1 MB of nested `<div>`s answered 500 MB.
+ */
+export type TextBudget = {
+  /** Characters still to return. */
+  chars: number;
+  readonly work: TextWork;
+  /** Set once a value came back cut, or none could be read. */
+  cut: boolean;
+};
+
+export function createTextBudget(chars: number, work: number): TextBudget {
+  return { chars, work: { units: work }, cut: false };
+}
+
+/** An element's normalized text, within what the budget has left. */
+export function textWithin(node: Element, budget: TextBudget): string {
+  const { text, complete } = boundedText(node, budget.chars, budget.work);
+  budget.chars -= text.length;
+  if (!complete) budget.cut = true;
+  return text;
+}
+
+/** A budget nothing reaches, for the library functions' default. */
+const unbounded = (): TextBudget =>
+  createTextBudget(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
 
 export type Table = {
   readonly headers: ReadonlyArray<string>;
   readonly rows: ReadonlyArray<ReadonlyArray<string>>;
+  /** Body rows the table has, whether or not all of them were returned. */
   readonly rowCount: number;
+  /** The widest row returned (header included). */
   readonly columnCount: number;
   readonly caption: string;
+  /** True when `rows`/`headers` are not the whole table; `truncatedBy` says why. */
+  readonly truncated: boolean;
+  readonly truncatedBy: ReadonlyArray<"rows" | "columns" | "chars">;
+};
+
+/**
+ * A budget several tables can share, so many small ones cannot add up past
+ * it: characters of result, and (optionally) text a call may read to build
+ * them, which nested tables otherwise read once per level.
+ */
+export type TableBudget = { chars: number; work?: TextWork };
+
+/** What one returned row costs in the result before its cells: `[]` and a comma. */
+export const ROW_ENVELOPE_CHARS = 3;
+
+export type TableLimits = {
+  /** Body rows to build; the rest are counted, never expanded. */
+  readonly maxRows?: number;
+  /** Columns per row; cells past it are dropped from every row. */
+  readonly maxColumns?: number;
+  /** Characters of cell and caption text (plus JSON overhead) to spend, shared across calls. */
+  readonly budget?: TableBudget;
+  /** The call's matching budget, shared with its other queries. */
+  readonly match?: MatchContext;
 };
 
 /**
@@ -24,50 +86,32 @@ export type Table = {
  * `colspan` and `rowspan` are expanded, because a table that uses them reads
  * as ragged rows otherwise and every column after the span is off by one —
  * which is invisible in the output and wrong in every row after it.
+ *
+ * Expansion is where a table's size stops being its markup's size: one cell
+ * with `colspan=1000 rowspan=1000` is a million cells, and each copy carries
+ * the cell's whole text. So the grid is built under limits and stops at
+ * them, rather than being built whole and sliced: at most `maxRows` body
+ * rows, `maxColumns` per row, and a character `budget` spent per cell
+ * written, carried copies included. Hitting any of them sets `truncated`
+ * and names it in `truncatedBy`; a row cut by the budget is dropped whole
+ * rather than returned short.
  */
-export function extractTable(table: Element): Table {
-  const rows = queryAll(table, "tr");
-  const grid: string[][] = [];
-  // Cells a rowspan above is still occupying, by column index.
-  const carry = new Map<number, { text: string; remaining: number }>();
-
-  for (const [rowIndex, row] of rows.entries()) {
-    const out: string[] = [];
-    let column = 0;
-    const drainCarried = (): void => {
-      while (carry.has(column)) {
-        const held = carry.get(column) as { text: string; remaining: number };
-        out[column] = held.text;
-        if (held.remaining <= 1) carry.delete(column);
-        else carry.set(column, { text: held.text, remaining: held.remaining - 1 });
-        column++;
-      }
-    };
-
-    for (const cell of row.children) {
-      if (cell.type !== "element" || (cell.tag !== "td" && cell.tag !== "th")) continue;
-      const text = cellText(cell);
-      const colspan = Math.max(
-        1,
-        Math.min(1000, Number.parseInt(cell.attrs["colspan"] ?? "1", 10) || 1),
-      );
-      const rowspan = Math.max(
-        1,
-        Math.min(1000, Number.parseInt(cell.attrs["rowspan"] ?? "1", 10) || 1),
-      );
-      for (let c = 0; c < colspan; c++) {
-        drainCarried();
-        const at = column;
-        out[column] = text;
-        column++;
-        if (rowspan > 1) carry.set(at, { text, remaining: rowspan - 1 });
-      }
-    }
-    drainCarried();
-    grid[rowIndex] = out.map((v) => v ?? "");
-  }
+export function extractTable(table: Element, limits: TableLimits = {}): Table {
+  const rows = queryAll(table, "tr", Number.POSITIVE_INFINITY, limits.match);
+  const maxColumns = limits.maxColumns ?? Number.POSITIVE_INFINITY;
+  const budget = limits.budget ?? { chars: Number.POSITIVE_INFINITY };
+  const work = budget.work ?? { units: Number.POSITIVE_INFINITY };
+  // The text of one cell (or the caption), and whether all of it fit what
+  // the budget has left to give. A cell read in part is never written: its
+  // row is dropped whole.
+  const readCell = (node: Element): { text: string; whole: boolean } => {
+    const { text, complete } = boundedText(node, Math.max(0, budget.chars), work);
+    return { text, whole: complete };
+  };
 
   // A header row is one whose cells are all `th`, and only if it is first.
+  // It depends only on the first row's own children, so it is known before
+  // anything is expanded.
   const firstRow = rows[0];
   const cellsIn = (node: Element | undefined, tags: ReadonlyArray<string>): number =>
     node === undefined
@@ -75,16 +119,133 @@ export function extractTable(table: Element): Table {
       : node.children.filter((c) => c.type === "element" && tags.includes(c.tag)).length;
   const headerCount = cellsIn(firstRow, ["th"]);
   const hasHeader = headerCount > 0 && headerCount === cellsIn(firstRow, ["td", "th"]);
+  const bodyRows = rows.length - (hasHeader ? 1 : 0);
+  // Rowspans only ever carry downward, so stopping early loses nothing above.
+  const rowsToBuild = Math.min(
+    rows.length,
+    (hasHeader ? 1 : 0) + Math.min(bodyRows, limits.maxRows ?? bodyRows),
+  );
+
+  const grid: string[][] = [];
+  // Cells a rowspan above is still occupying, by column index.
+  const carry = new Map<number, { text: string; cost: number; remaining: number }>();
+  let columnsTruncated = false;
+  let charsTruncated = false;
+
+  // The caption first, as it comes first: it is charged like a cell, and a
+  // caption's text holds every table nested inside it, so it is cut rather
+  // than returned whole.
+  const captionNode = table.children.find((c) => c.type === "element" && c.tag === "caption");
+  let caption = "";
+  if (captionNode !== undefined) {
+    const read = readCell(captionNode as Element);
+    caption = read.text;
+    const allowed = Math.max(0, budget.chars);
+    // Escaping can make the JSON longer than the text; cut until it fits.
+    while (caption.length > 0 && JSON.stringify(caption).length > allowed) {
+      caption = caption.slice(0, Math.floor(caption.length / 2));
+    }
+    budget.chars -= JSON.stringify(caption).length;
+    if (!read.whole || caption.length < read.text.length || budget.chars < 0) {
+      charsTruncated = true;
+    }
+  }
+
+  for (let rowIndex = 0; rowIndex < rowsToBuild && !charsTruncated; rowIndex++) {
+    const row = rows[rowIndex] as Element;
+    const out: string[] = [];
+    let column = 0;
+    // Spend the budget for one written cell; false once it is gone.
+    const spend = (cost: number): boolean => {
+      budget.chars -= cost;
+      if (budget.chars >= 0) return true;
+      charsTruncated = true;
+      return false;
+    };
+    // The row itself costs its brackets and separator, whatever it holds.
+    // 0.7.0 charged cells only, so rows with none (`<tr></tr>`, or a `<tr>`
+    // holding a nested table directly) were free, and nested tables' rows,
+    // which every enclosing table lists again, cost nothing at any depth:
+    // 231 KB of markup came back as 9.5 M characters (C167).
+    if (!spend(ROW_ENVELOPE_CHARS)) break;
+    const drainCarried = (): boolean => {
+      while (carry.has(column)) {
+        const held = carry.get(column) as { text: string; cost: number; remaining: number };
+        if (!spend(held.cost)) return false;
+        out[column] = held.text;
+        if (held.remaining <= 1) carry.delete(column);
+        else carry.set(column, { ...held, remaining: held.remaining - 1 });
+        column++;
+      }
+      return true;
+    };
+
+    cells: for (const cell of row.children) {
+      if (cell.type !== "element" || (cell.tag !== "td" && cell.tag !== "th")) continue;
+      if (column >= maxColumns) {
+        columnsTruncated = true;
+        break;
+      }
+      const read = readCell(cell);
+      if (!read.whole) {
+        charsTruncated = true;
+        break;
+      }
+      const text = read.text;
+      // What one copy of this cell costs in the result: its JSON string and
+      // a separator.
+      const cost = JSON.stringify(text).length + 1;
+      const colspan = Math.max(
+        1,
+        Math.min(1000, Number.parseInt(attrOf(cell, "colspan") ?? "1", 10) || 1),
+      );
+      // A span past the last row would only park entries nothing reads.
+      const rowspan = Math.max(
+        1,
+        Math.min(
+          1000,
+          rows.length - rowIndex,
+          Number.parseInt(attrOf(cell, "rowspan") ?? "1", 10) || 1,
+        ),
+      );
+      for (let c = 0; c < colspan; c++) {
+        if (!drainCarried()) break cells;
+        if (column >= maxColumns) {
+          columnsTruncated = true;
+          break cells;
+        }
+        if (!spend(cost)) break cells;
+        const at = column;
+        out[column] = text;
+        column++;
+        if (rowspan > 1) carry.set(at, { text, cost, remaining: rowspan - 1 });
+      }
+    }
+    if (charsTruncated || !drainCarried()) {
+      charsTruncated = true;
+      break;
+    }
+    const filled: string[] = [];
+    for (let i = 0; i < out.length; i++) filled.push(out[i] ?? "");
+    grid.push(filled);
+  }
 
   const headers = hasHeader ? (grid[0] ?? []) : [];
   const body = hasHeader ? grid.slice(1) : grid;
-  const captionNode = table.children.find((c) => c.type === "element" && c.tag === "caption");
+  let columnCount = 0;
+  for (const r of grid) if (r.length > columnCount) columnCount = r.length;
+  const truncatedBy: Array<"rows" | "columns" | "chars"> = [];
+  if (body.length < bodyRows && !charsTruncated) truncatedBy.push("rows");
+  if (columnsTruncated) truncatedBy.push("columns");
+  if (charsTruncated) truncatedBy.push("chars");
   return {
     headers,
     rows: body,
-    rowCount: body.length,
-    columnCount: grid.length === 0 ? 0 : Math.max(...grid.map((r) => r.length)),
-    caption: captionNode === undefined ? "" : cellText(captionNode as Element),
+    rowCount: bodyRows,
+    columnCount,
+    caption,
+    truncated: truncatedBy.length > 0,
+    truncatedBy,
   };
 }
 
@@ -104,8 +265,13 @@ export type Link = {
  * page that declares `<base href>` overrides the supplied base, which is
  * what a browser does.
  */
-export function extractLinks(root: Element, baseUrl?: string): Link[] {
-  const declared = queryAll(root, "base[href]")[0]?.attrs["href"];
+export function extractLinks(
+  root: Element,
+  baseUrl?: string,
+  budget: TextBudget = unbounded(),
+  match: MatchContext = createMatchContext(),
+): Link[] {
+  const declared = queryAll(root, "base[href]", 1, match)[0]?.attrs["href"];
   let base: URL | undefined;
   for (const candidate of [baseUrl, declared]) {
     if (candidate === undefined || candidate === "") continue;
@@ -119,7 +285,10 @@ export function extractLinks(root: Element, baseUrl?: string): Link[] {
 
   const seen = new Set<string>();
   const links: Link[] = [];
-  for (const anchor of queryAll(root, "a[href]")) {
+  for (const anchor of queryAll(root, "a[href]", Number.POSITIVE_INFINITY, match)) {
+    // A link's text is its subtree's, so nested anchors each carry the
+    // deeper ones: once the budget has cut one, the rest are not read.
+    if (budget.cut) break;
     const raw = (anchor.attrs["href"] ?? "").trim();
     if (raw === "" || raw.startsWith("#")) continue;
     let href = raw;
@@ -133,7 +302,19 @@ export function extractLinks(root: Element, baseUrl?: string): Link[] {
         // Keep the raw value; `javascript:` and `mailto:` land here.
       }
     }
-    const text = normalizeText(textOf(anchor));
+    // Resolving copies the base into every href, so what it adds is charged
+    // like text: a 40 KB <base href> and 2,000 `<a href=?>` turned 75 KB of
+    // markup into an 80 MB answer, untruncated. The page's own attribute
+    // text is not multiplied, and costs nothing here.
+    const added = href.length - raw.length;
+    if (added > 0) {
+      if (added > budget.chars) {
+        budget.cut = true;
+        break;
+      }
+      budget.chars -= added;
+    }
+    const text = textWithin(anchor, budget);
     // A JSON pair rather than a joined key: link text is arbitrary page
     // content, and any separator could occur inside it and collide.
     const key = JSON.stringify([href, text]);
@@ -172,22 +353,37 @@ export type Form = {
 };
 
 /** The label text for a control: a `for=` label, a wrapping one, or aria. */
-function labelFor(root: Element, control: Element): string {
-  const id = control.attrs["id"];
+function labelFor(
+  labels: ReadonlyMap<string, Element>,
+  control: Element,
+  budget: TextBudget,
+): string {
+  const id = attrOf(control, "id");
   if (id !== undefined && id !== "" && /^[\w:.-]+$/.test(id)) {
-    const explicit = queryAll(root, `label[for="${id}"]`)[0];
-    if (explicit !== undefined) return normalizeText(textOf(explicit));
+    const explicit = labels.get(id);
+    if (explicit !== undefined) return textWithin(explicit, budget);
   }
   let ancestor = control.parent;
   while (ancestor !== null) {
-    if (ancestor.tag === "label") return normalizeText(textOf(ancestor));
+    if (ancestor.tag === "label") return textWithin(ancestor, budget);
     ancestor = ancestor.parent;
   }
-  return control.attrs["aria-label"] ?? control.attrs["placeholder"] ?? "";
+  return attrOf(control, "aria-label") ?? attrOf(control, "placeholder") ?? "";
 }
 
-export function extractForms(root: Element): Form[] {
-  return queryAll(root, "form").map((form) => {
+export function extractForms(
+  root: Element,
+  budget: TextBudget = unbounded(),
+  match: MatchContext = createMatchContext(),
+): Form[] {
+  // Every `label[for]`, first in document order winning, as the query per
+  // control answered; that query walked the whole page once per control.
+  const labels = new Map<string, Element>();
+  for (const label of queryAll(root, "label[for]", Number.POSITIVE_INFINITY, match)) {
+    const target = attrOf(label, "for") as string;
+    if (!labels.has(target)) labels.set(target, label);
+  }
+  return queryAll(root, "form", Number.POSITIVE_INFINITY, match).map((form) => {
     const fields: FormField[] = [];
     for (const control of walk(form)) {
       if (!["input", "select", "textarea", "button"].includes(control.tag)) continue;
@@ -197,20 +393,21 @@ export function extractForms(root: Element): Form[] {
       // a described form unsubmittable.
       const options =
         control.tag === "select"
-          ? queryAll(control, "option").map((option) => ({
-              value: option.attrs["value"] ?? normalizeText(textOf(option)),
-              label: normalizeText(textOf(option)),
-              selected: "selected" in option.attrs,
-            }))
+          ? queryAll(control, "option", Number.POSITIVE_INFINITY, match).map((option) => {
+              const label = textWithin(option, budget);
+              return {
+                value: option.attrs["value"] ?? label,
+                label,
+                selected: "selected" in option.attrs,
+              };
+            })
           : [];
       fields.push({
         name: control.attrs["name"] ?? "",
         type,
         value:
-          control.tag === "textarea"
-            ? normalizeText(textOf(control))
-            : (control.attrs["value"] ?? ""),
-        label: labelFor(root, control),
+          control.tag === "textarea" ? textWithin(control, budget) : (control.attrs["value"] ?? ""),
+        label: labelFor(labels, control, budget),
         required: "required" in control.attrs,
         options,
       });
@@ -251,9 +448,12 @@ export function extractStructuredData(root: Element): StructuredData {
     }
   }
 
-  const openGraph: Record<string, string> = {};
-  const twitter: Record<string, string> = {};
-  const meta: Record<string, string> = {};
+  // Null prototypes: the keys are the page's meta names. On `{}` a
+  // `<meta name="__proto__">` set the map's prototype instead of an entry and
+  // vanished from the result.
+  const openGraph: Record<string, string> = Object.create(null);
+  const twitter: Record<string, string> = Object.create(null);
+  const meta: Record<string, string> = Object.create(null);
   for (const tag of queryAll(root, "meta")) {
     const key = (tag.attrs["property"] ?? tag.attrs["name"] ?? "").toLowerCase();
     const content = tag.attrs["content"];
@@ -263,14 +463,14 @@ export function extractStructuredData(root: Element): StructuredData {
     else meta[key] = content;
   }
 
-  const titleNode = queryAll(root, "title")[0];
+  const titleNode = queryAll(root, "title", 1)[0];
   return {
     jsonLd,
     openGraph,
     twitter,
     meta,
     title: titleNode === undefined ? "" : normalizeText(textOf(titleNode)),
-    canonical: queryAll(root, 'link[rel="canonical"]')[0]?.attrs["href"] ?? "",
+    canonical: queryAll(root, 'link[rel="canonical"]', 1)[0]?.attrs["href"] ?? "",
     invalid,
   };
 }
@@ -293,42 +493,68 @@ export function extractRecords(
   root: Element,
   recipe: RecordRecipe,
   limit = 1000,
-): { records: Array<Record<string, string>>; missing: Record<string, number>; containers: number } {
-  const containers = queryAll(root, recipe.container, limit);
-  const missing: Record<string, number> = {};
-  const records = containers.map((container) => {
-    const row: Record<string, string> = {};
-    for (const [field, spec] of Object.entries(recipe.fields)) {
-      const at = spec.lastIndexOf("@");
-      const selector = at === -1 ? spec : spec.slice(0, at);
-      const attribute = at === -1 ? null : spec.slice(at + 1);
-      const found = selector.trim() === "" ? container : queryAll(container, selector, 1)[0];
-      if (found === undefined) {
+  budget: TextBudget = unbounded(),
+  ctx: MatchContext = createMatchContext(),
+): {
+  records: Array<Record<string, string>>;
+  missing: Record<string, number>;
+  containers: number;
+  /** True when the text budget stopped the records short; the last one may be cut. */
+  truncated: boolean;
+} {
+  const containers = queryAll(root, recipe.container, limit, ctx);
+  // Null prototypes: the keys are the caller's field names, and on `{}` a
+  // field called `constructor` counted its misses as "function Object()…1".
+  const missing: Record<string, number> = Object.create(null);
+  if (containers.length === 0) return { records: [], missing, containers: 0, truncated: false };
+  // Each field's first match in every container, from one pass per field
+  // rather than one query per container per field.
+  const fields = Object.entries(recipe.fields).map(([field, spec]) => {
+    const at = spec.lastIndexOf("@");
+    const selector = at === -1 ? spec : spec.slice(0, at);
+    const attribute = at === -1 ? null : spec.slice(at + 1);
+    const found =
+      selector.trim() === "" ? containers : firstMatchIn(root, containers, selector, ctx);
+    return { field, attribute, found };
+  });
+  const records: Array<Record<string, string>> = [];
+  for (let c = 0; c < containers.length && !budget.cut; c++) {
+    const row: Record<string, string> = Object.create(null);
+    for (const { field, attribute, found } of fields) {
+      const node = found[c];
+      if (node === undefined) {
         row[field] = "";
         missing[field] = (missing[field] ?? 0) + 1;
         continue;
       }
       const value =
         attribute === null || attribute === "text"
-          ? normalizeText(textOf(found))
-          : (found.attrs[attribute.toLowerCase()] ?? "");
+          ? textWithin(node, budget)
+          : (attrOf(node, attribute.toLowerCase()) ?? "");
       if (value === "") missing[field] = (missing[field] ?? 0) + 1;
       row[field] = value;
     }
-    return row;
-  });
-  return { records, missing, containers: containers.length };
+    records.push(row);
+  }
+  return { records, missing, containers: containers.length, truncated: budget.cut };
 }
 
-/** A compact outline of the headings, which is often all a caller needs. */
-export function outline(root: Element): Array<{ level: number; text: string; id: string }> {
+/**
+ * A compact outline of the headings, which is often all a caller needs.
+ * Headings nest, and each one's text holds the ones inside it, so the text
+ * comes out of `budget`; once it has cut a heading, the outline stops there.
+ */
+export function outline(
+  root: Element,
+  budget: TextBudget = unbounded(),
+): Array<{ level: number; text: string; id: string }> {
   const out: Array<{ level: number; text: string; id: string }> = [];
   for (const node of walk(root)) {
     const m = /^h([1-6])$/.exec(node.tag);
     if (m === null) continue;
-    const text = normalizeText(textOf(node));
-    if (text === "") continue;
-    out.push({ level: Number(m[1]), text, id: node.attrs["id"] ?? "" });
+    const text = textWithin(node, budget);
+    if (text !== "") out.push({ level: Number(m[1]), text, id: attrOf(node, "id") ?? "" });
+    if (budget.cut) break;
   }
   return out;
 }

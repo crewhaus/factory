@@ -124,6 +124,7 @@ export {
   rowsToJsonl,
 } from "./export";
 export { ReportError } from "./errors";
+export { jsonSyntaxProblem } from "./json-problem";
 export {
   BASELINE_KEY_V2_PREFIX,
   BASELINES_FILENAME,
@@ -137,13 +138,19 @@ export {
   type RecordEvalRunOptions,
   type RunIndexEntry,
   appendRunIndex,
+  HistoryWriteError,
   baselineKey,
   baselineKeyFor,
   baselineKeyV2,
+  clearBaseline,
   getBaseline,
   hashDatasetFile,
   isLegacyLineage,
+  latestRunIndexEntries,
   lineageOfEntry,
+  lookupBaseline,
+  parseBaselines,
+  parseRunIndex,
   readBaselines,
   readRunIndex,
   readRunIndexLatest,
@@ -152,4 +159,5 @@ export {
   routingColumnsFromSummary,
   runIndexEntryFromSummary,
   setBaseline,
+  writeBaselines,
 } from "./history";

@@ -2,7 +2,7 @@
   "name": "@crewhaus/tool-builder",
   "version": "0.7.0",
   "type": "module",
-  "description": "buildTool() factory with fail-closed safety defaults",
+  "description": "buildTool() factory: a tool definition plus documented defaults for every safety flag",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

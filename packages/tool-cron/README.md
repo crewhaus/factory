@@ -13,6 +13,20 @@ follows the platform; naming them explicitly is allowed, and a scheduler the
 host does not have comes back as unavailable with the reason rather than as
 an empty list.
 
+A listing is an answer only when something was read. `determined: true` means
+at least one scheduler answered (a note names any that did not). When none
+could be read, `CronList` returns `ok: false`, `determined: false`, an
+`outcome` — `unsupported` when this platform has no reader (Windows),
+`unavailable` when every scheduler asked for failed — and a `reason`, with no
+`count` or `entries`: "nothing is scheduled" is never inferred from "could not
+look".
+
+`now` sets the reference instant for the next-firing walk. A value with a `Z`
+or `±hh:mm` offset is that instant. A value without one is read on the wall
+clock of `timeZone` (UTC unless you name another) — exactly as `CronNext`
+reads its `after` — and never on the host's own clock, so the same call
+answers the same way on every machine.
+
 ## Three schedulers, three shapes — and the seams stay visible
 
 Flattening them into one row per job reads well and cannot be acted on. Each
@@ -110,10 +124,13 @@ before anything is touched.
 
 Every field a caller acts on distinguishes "no" from "could not tell":
 
-- `crontab -l` that was killed at its deadline, or whose output hit the
-  output cap and came back as a PREFIX, makes the source `available: false`
-  with the reason — and `CronDelete` refuses, because a rewrite built from
-  half a listing deletes the half it never saw.
+- `crontab -l` that was killed at its deadline, whose output hit the
+  output cap and came back as a PREFIX, or whose output a process it started
+  still held open after it exited (so reading stopped with what had arrived),
+  makes the source `available: false` with the reason — and `CronDelete`
+  refuses, because a rewrite built from half a listing deletes the half it
+  never saw. The cap is applied as the output is read, so a runaway command
+  costs bounded memory.
 - `launchctl list` failing makes every agent's `state` **`unknown`**, not
   `not-loaded`: no rows because nothing is loaded and no rows because the
   command failed are opposite facts.
@@ -183,13 +200,14 @@ separate `TimersCalendar=` lines, so last-one-wins parsing loses half the
 schedule; and the real user-bus error is "Failed to connect to **user scope**
 bus", which a pattern matching "Failed to connect to bus" never sees.
 
-The seams are `_setRunner`, `_setFs` and `_setClock`.
+The seams are `_setRunner`, `_setFs`, `_setClock` and `_setPlatform`.
 
 ## What this package does not do
 
 - **Windows Task Scheduler.** `schtasks` is a fourth model with localised CSV
   column headers; a half-built reader for it would be worse than its absence.
-  On Windows, `CronList` reads nothing and says so.
+  On Windows, `CronList` reads nothing and says so: `ok: false`,
+  `outcome: "unsupported"`.
 - **`/etc/crontab` and `/etc/cron.d`.** Different grammar (the extra user
   field), and changing them needs root.
 - **Creating or editing a job.** This package inspects and removes.

@@ -44,6 +44,7 @@ import {
   encodeAggregate3,
 } from "@crewhaus/tool-onchain";
 import { z } from "zod";
+import { resolveAggregator } from "./lib/aggregator";
 import { type Call3, chunk, runAggregate3 } from "./lib/batch";
 import {
   SELECTORS,
@@ -106,10 +107,16 @@ export {
   type ChainRpc,
   type ChainRpcResolver,
   _setRpc,
+  bindChainCallChains,
   chainRpcFromAdapter,
   setChainRpcResolver,
 } from "./lib/rpc";
 export { MULTICALL3_ADDRESS } from "@crewhaus/tool-onchain";
+export {
+  type Aggregator,
+  type ChaincallConfigInput,
+  registerChaincallConfig,
+} from "./lib/aggregator";
 export {
   EIP1822_SLOT,
   EIP1967_ADMIN_SLOT,
@@ -176,7 +183,9 @@ const multicallAddressField = z
   .string()
   .regex(/^0x[0-9a-fA-F]{40}$/)
   .optional()
-  .describe(`Multicall3 on this chain; default ${MULTICALL3_ADDRESS}`);
+  .describe(
+    `leave it out: batches go to the canonical Multicall3 (${MULTICALL3_ADDRESS}) or the one the operator configured for the chain, and any other address is refused`,
+  );
 
 type BlockChoice = { readonly blockNumber?: string; readonly blockTag?: string };
 
@@ -243,6 +252,7 @@ async function calldataFor(call: MulticallCallInput, index: number): Promise<str
 
 export const evmMulticall: RegisteredTool = buildTool({
   name: "EvmMulticall",
+  operativeArgs: [{ field: "calls.target", kind: "id", within: "chainId" }],
   description:
     "Run many view calls against a chain in one request through Multicall3, returning one decoded row per call at a SINGLE block height. Use it for any question that reads more than one contract — a hundred balances, a token's whole metadata, a pool's reserves plus its fee — because a hundred separate reads land at a hundred different block heights and the answers do not add up. A sub-call that reverts is a row with its revert reason, not a failed request, so one bad token does not lose the other ninety-nine. When a batch is too large for one request it is split, and the block is PINNED from the first batch so every row still answers at the same height. A call that succeeds with empty return data is flagged rather than decoded: in the EVM, calling an address with no code succeeds and returns nothing, which is how a missing contract becomes a zero balance. It reads only, and nothing here signs or submits anything.",
   inputSchema: z
@@ -267,7 +277,15 @@ export const evmMulticall: RegisteredTool = buildTool({
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const rpc = resolveRpc(input.chainId, "EvmMulticall");
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      // Resolved before any read: an aggregator the operator did not name
+      // is refused, not asked.
+      const aggregator = resolveAggregator(
+        input.chainId,
+        input.multicall3Address,
+        ctx?.toolConfig,
+        "EvmMulticall",
+      );
+      const multicall3 = aggregator.address;
       const { param, pinnedByCaller } = blockOf(input);
 
       const calls: Call3[] = [];
@@ -396,6 +414,8 @@ export const evmMulticall: RegisteredTool = buildTool({
       return json({
         chainId: input.chainId,
         multicall3,
+        // Who answered every row, since each one is its word.
+        aggregator,
         block: {
           requested: param,
           number: pinned === undefined ? null : pinned.toString(),
@@ -547,8 +567,9 @@ function addressResult(row: ViewRow | undefined, what: string): string | undefin
 
 export const contractInspect: RegisteredTool = buildTool({
   name: "ContractInspect",
+  operativeArgs: [{ field: "address", kind: "id", within: "chainId" }],
   description:
-    "Ask an address what it is before calling it: whether there is code there at all, how big it is, whether it is a proxy and what it delegates to, and which ERC-165 interfaces it claims. Use it whenever an address arrives from somewhere you did not write — a proxy's ABI is the implementation's, not the proxy's, and calling the wrong ABI produces calldata a node accepts and a contract misreads. The answer is split into what was VERIFIED and what the contract CLAIMS, because those are different kinds of fact: a proxy's implementation slot is storage, read with eth_getStorageAt, while supportsInterface is the contract answering a question about itself and a contract can lie. Contracts that claim to support the reserved 0xffffffff interface id are reported as non-compliant and their claims are dropped entirely rather than listed. A proxy whose mechanisms disagree, and a diamond that has no single implementation, come back unresolved with the reason instead of a guessed address. Read-only: it never signs, sends or deploys.",
+    "Ask an address what it is before calling it: whether there is code there, how big it is, whether it is a proxy and what it delegates to, and which ERC-165 interfaces it claims. Use it whenever an address arrives from somewhere you did not write: a proxy's ABI is the implementation's, and calling the wrong ABI produces calldata a node accepts and a contract misreads. The answer separates what was VERIFIED from what the contract CLAIMS: a proxy's implementation slot is storage, read with eth_getStorageAt, while supportsInterface is the contract answering about itself, and a contract can lie. A contract claiming the reserved 0xffffffff interface id is reported as non-compliant and its claims are dropped. A proxy whose mechanisms disagree, or a diamond with no single implementation, comes back unresolved with the reason instead of a guessed address. Read-only: it never signs, sends or deploys.",
   inputSchema: z
     .object({
       chainId: chainIdField,
@@ -573,9 +594,15 @@ export const contractInspect: RegisteredTool = buildTool({
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const rpc = resolveRpc(input.chainId, "ContractInspect");
+      const aggregator = resolveAggregator(
+        input.chainId,
+        input.multicall3Address,
+        ctx?.toolConfig,
+        "ContractInspect",
+      );
       const target = await checkAddress(input.address, "address");
       const { param } = blockOf(input);
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      const multicall3 = aggregator.address;
       const caveats: string[] = [];
 
       const code = asData(
@@ -795,6 +822,8 @@ export const contractInspect: RegisteredTool = buildTool({
         address: target.address,
         checksumVerified: target.checksumVerified,
         block: { requested: param },
+        // Who answered the batched view calls, when they were batched.
+        aggregator: mode === "multicall3" ? aggregator : null,
         verified: {
           isContract: true,
           codeSize,
@@ -915,8 +944,9 @@ function readProbeBlob(returnData: string, count: number): Array<bigint | null> 
 
 export const evmSimulateBundle: RegisteredTool = buildTool({
   name: "EvmSimulateBundle",
+  operativeArgs: [{ field: "calls.to", kind: "id", within: "chainId" }],
   description:
-    "Simulate an ordered sequence of calls against a block and report what each one would do — status, gas, return data, revert reason, logs — without submitting anything. Use it to check a plan before approving it: an approve followed by a swap, a multi-step position change, a governance execution. The point is that state CHAINS, so the second call sees what the first one did. That needs eth_simulateV1, which many endpoints do not implement; when one does not, this falls back to independent eth_calls and says so in `mode`, sets `chained: false`, and OMITS logs and balance deltas entirely rather than reporting the half that survives — a partially-true effects summary is precisely what a policy gate would trust and be wrong about. A timeout or a rejected parameter is never degraded into a fallback, because neither says the node cannot answer the real question. Optional balance tracking brackets the bundle with Multicall3 balance reads, so native and ERC-20 deltas come from the chain's own accounting rather than from summing Transfer logs, which miss fee-on-transfer and rebasing tokens. It simulates only: no key is accepted, nothing is signed, and nothing is broadcast.",
+    "Simulate an ordered sequence of calls against a block and report what each would do (status, gas, return data, revert reason, logs) without submitting anything. Use it to check a plan before approving it: an approve then a swap, a multi-step position change, a governance execution. State CHAINS, so each call sees what the one before it did, and that needs eth_simulateV1. When the endpoint lacks it, this falls back to independent eth_calls, says so in `mode`, sets `chained: false`, and OMITS logs and balance deltas rather than report a half-true effects summary a policy gate would trust. A timeout or a rejected parameter is never degraded into that fallback. Optional balance tracking brackets the bundle with Multicall3 balance reads, so native and ERC-20 deltas come from the chain's own accounting rather than from summing Transfer logs. It simulates only: no key is accepted, nothing is signed, and nothing is broadcast.",
   inputSchema: z
     .object({
       chainId: chainIdField,
@@ -967,7 +997,18 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
     try {
       const rpc = resolveRpc(input.chainId, "EvmSimulateBundle");
       const { param } = blockOf(input);
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      // Multicall3 reads the tracked balances, and nothing else here; without
+      // trackBalances a multicall3Address is ignored, as it always was.
+      const aggregator =
+        input.trackBalances === undefined
+          ? undefined
+          : resolveAggregator(
+              input.chainId,
+              input.multicall3Address,
+              ctx?.toolConfig,
+              "EvmSimulateBundle",
+            );
+      const multicall3 = aggregator?.address ?? MULTICALL3_ADDRESS;
       const traceTransfers = input.traceTransfers ?? true;
 
       const userCalls = input.calls.map((call, index) => toWireCall(call, index));
@@ -1050,6 +1091,19 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
       const calls = inner.map((call, index) => ({ ...call, index }));
 
       const limitations: string[] = [];
+      const overridden = Object.keys(input.stateOverrides ?? {});
+      if (overridden.length > 0) {
+        const aggregatorOverridden =
+          aggregator !== undefined &&
+          overridden.some((a) => a.toLowerCase() === aggregator.address.toLowerCase());
+        limitations.push(
+          `stateOverrides rewrote ${overridden.length} address(es) for this simulation, so every result describes the chain as overridden, not as it is${
+            aggregatorOverridden
+              ? ` — including the Multicall3 (${aggregator.address}) that read the tracked balances, so balanceChanges are whatever the override's code returns`
+              : ""
+          }.`,
+        );
+      }
       if (traceTransfers) {
         limitations.push(
           "traceTransfers is on, so native value movements appear as synthetic ERC-20-shaped Transfer logs emitted by the zero address. They are not events any contract actually emitted.",
@@ -1084,7 +1138,7 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
         callCount: calls.length,
         reverted: calls.filter((c) => c.status === "reverted").length,
         calls,
-        ...(balanceChanges !== undefined ? { balanceChanges } : {}),
+        ...(balanceChanges !== undefined ? { balanceChanges, aggregator } : {}),
         ...(limitations.length > 0 ? { limitations } : {}),
       });
     } finally {
@@ -1258,8 +1312,9 @@ const OP_GAS_PRICE_ORACLE = "0x420000000000000000000000000000000000000F";
 
 export const gasMarketRead: RegisteredTool = buildTool({
   name: "GasMarketRead",
+  operativeArgs: [{ field: "chainId", kind: "id" }],
   description:
-    "Read a chain's fee market: the current base fee, priority-fee percentiles from eth_feeHistory over a window of blocks, and the next block's base fee computed by the EIP-1559 rule. Use it to decide when to send and what to pay, instead of a model recalling a gwei figure. It reports WHICH mechanism the chain is running rather than assuming one — a chain with no baseFeePerGas has no 1559 market and is reported as legacy, a node without eth_feeHistory is reported as such instead of being filled in, and a base fee that never moves across the window is flagged rather than trended. The projection is computed from the block's integer gasUsed and gasLimit, never from feeHistory's floating-point gasUsedRatio, and is compared against the node's own next-block figure so a chain with a non-standard elasticity shows up as a disagreement rather than as a confident wrong number. It does not price rollup L1 data fees, and says so — on an OP-stack chain it checks whether the GasPriceOracle predeploy is there and warns that the cost it does not report is often the larger one.",
+    "Read a chain's fee market: the current base fee, priority-fee percentiles from eth_feeHistory over a window of blocks, and the next block's base fee by the EIP-1559 rule. Use it to decide when to send and what to pay, instead of a model recalling a gwei figure. It reports which mechanism the chain runs rather than assuming one: a chain with no baseFeePerGas is reported as legacy, a node without eth_feeHistory is reported as such rather than filled in, and a base fee that never moves is flagged rather than trended. The projection uses the block's integer gasUsed and gasLimit, never feeHistory's floating-point ratio, and is compared with the node's own next-block figure, so a non-standard elasticity shows as a disagreement. It does not price rollup L1 data fees, and says so: on an OP-stack chain it checks for the GasPriceOracle predeploy and warns that the unreported cost is often the larger one.",
   inputSchema: z
     .object({
       chainId: chainIdField,

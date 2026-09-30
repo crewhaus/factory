@@ -15,6 +15,7 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/vector-store": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {

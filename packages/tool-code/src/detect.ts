@@ -15,8 +15,9 @@
  * because there is nowhere else for them to come from.
  */
 import * as path from "node:path";
+import { mypyCacheDir, typecheckBuildInfoFile } from "./lib/checker-cache";
 import { parsePackageJson } from "./lib/deps";
-import { fileExists, readTextFile } from "./walk";
+import { type SkippedFile, fileExists, readTextFile } from "./walk";
 
 export type Toolchain = {
   readonly argv: readonly string[];
@@ -82,13 +83,27 @@ export function localBinary(dir: string, root: string, name: string): string | u
 
 type Manifest = NonNullable<ReturnType<typeof parsePackageJson>>;
 
-/** Read the nearest `package.json` at or above `dir`. */
+/**
+ * Read the nearest `package.json` at or above `dir`.
+ *
+ * A `package.json` that exists but may not be read (a link leading out of
+ * the workspace, a FIFO) STOPS the search, and is listed in `skipped` when
+ * given: climbing past it would answer with an ancestor's manifest as if it
+ * were this directory's.
+ */
 export function nearestManifest(
   dir: string,
   root: string,
+  skipped?: SkippedFile[],
 ): { manifest: Manifest; dir: string } | undefined {
   for (const candidate of ancestors(dir, root)) {
-    const text = readTextFile(path.join(candidate, "package.json"));
+    const refused: SkippedFile[] = [];
+    const text = readTextFile(path.join(candidate, "package.json"), undefined, refused);
+    if (refused.length > 0) {
+      skipped?.push(...refused);
+      return undefined;
+    }
+
     if (text === undefined) continue;
     const manifest = parsePackageJson(text);
     if (manifest !== undefined) return { manifest, dir: candidate };
@@ -237,10 +252,18 @@ export function detectBuild(
 /**
  * The project's type checker.
  *
- * `--noEmit` is not optional here and is not a caller's choice: `tsc -b` writes
- * `.tsbuildinfo` and, for a project without `noEmit`, a whole `dist`. A tool
- * that advertises itself as a read gets to stay one. `RunBuild` is where
- * emitting belongs.
+ * `--noEmit` is not optional here and is not a caller's choice: emitting
+ * belongs to `RunBuild`. And no-emit is not no-write: tsc still writes
+ * `.tsbuildinfo` for an incremental or composite project — next to the
+ * tsconfig, into a `dist/` it creates, or wherever a committed
+ * `tsBuildInfoFile` points, even outside the workspace. So the build info
+ * is sent to a per-user temp file keyed by the project (./lib/checker-cache,
+ * C150) with `--incremental --tsBuildInfoFile`, which the command line lets
+ * override the tsconfig — on TypeScript 4.0 and later; 3.x rejects the pair
+ * and writes no build info under `--noEmit`. mypy gets `--cache-dir=` a
+ * per-user temp directory keyed by the project, so it stays incremental
+ * without writing `.mypy_cache` into the project (or wherever its config's
+ * `cache_dir` points); ruff gets `--no-cache`, for the same reason.
  */
 export function detectTypecheck(
   dir: string,
@@ -250,8 +273,19 @@ export function detectTypecheck(
   if (tsconfig !== undefined) {
     const binary = localBinary(dir, root, "tsc");
     if (binary === undefined) return { missing: "typescript" };
+    const config = path.join(dir, tsconfig);
+    // TypeScript before 4.0 rejects `--incremental` with `--noEmit` (TS5053)
+    // and replaced every diagnostic with that error; under `--noEmit` it
+    // never wrote a .tsbuildinfo either, so it keeps 0.7.0's argv. A version
+    // that cannot be read gets the flags: a failed check is loud, a build
+    // info file written into the project is not.
+    const major = typescriptMajor(binary);
+    const buildInfo =
+      major !== undefined && major < 4
+        ? []
+        : ["--incremental", "--tsBuildInfoFile", typecheckBuildInfoFile(config)];
     return {
-      argv: [binary, "--noEmit", "--pretty", "false", "-p", path.join(dir, tsconfig)],
+      argv: [binary, "--noEmit", ...buildInfo, "--pretty", "false", "-p", config],
       tool: "tsc",
       reason: tsconfig,
     };
@@ -259,7 +293,7 @@ export function detectTypecheck(
   const mypy = localBinary(dir, root, "mypy");
   if (mypy !== undefined && fileExists(path.join(dir, "pyproject.toml"))) {
     return {
-      argv: [mypy, "--no-color-output", "--no-error-summary"],
+      argv: [mypy, "--no-color-output", "--no-error-summary", `--cache-dir=${mypyCacheDir(dir)}`],
       tool: "mypy",
       reason: "mypy installed",
     };
@@ -268,6 +302,26 @@ export function detectTypecheck(
     return { argv: ["go", "vet", "./..."], tool: "go-vet", reason: "go.mod" };
   }
   return undefined;
+}
+
+/**
+ * The major version of the `typescript` package a `node_modules/.bin/tsc`
+ * belongs to, from `node_modules/typescript/package.json` beside it, or
+ * undefined when that cannot be read. The read is the package's contained
+ * one: a manifest linked out of the workspace is not read.
+ */
+export function typescriptMajor(binary: string): number | undefined {
+  const manifest = path.join(path.dirname(path.dirname(binary)), "typescript", "package.json");
+  const text = readTextFile(manifest, 1_000_000);
+  if (text === undefined) return undefined;
+  let version: unknown;
+  try {
+    version = (JSON.parse(text) as { version?: unknown }).version;
+  } catch {
+    return undefined;
+  }
+  const m = typeof version === "string" ? /^(\d{1,4})\./.exec(version) : null;
+  return m === null ? undefined : Number(m[1]);
 }
 
 /** The project's linter. */
@@ -291,7 +345,7 @@ export function detectLint(dir: string, root: string): Toolchain | { missing: st
   ) {
     const binary = localBinary(dir, root, "ruff") ?? "ruff";
     return {
-      argv: [binary, "check", "--output-format", "json"],
+      argv: [binary, "check", "--no-cache", "--output-format", "json"],
       tool: "ruff",
       reason: "ruff configuration",
     };
@@ -357,7 +411,7 @@ export function detectFormat(
   ) {
     const binary = localBinary(dir, root, "ruff") ?? "ruff";
     return {
-      argv: write ? [binary, "format"] : [binary, "format", "--check"],
+      argv: write ? [binary, "format"] : [binary, "format", "--check", "--no-cache"],
       tool: "ruff",
       reason: "ruff configuration",
     };

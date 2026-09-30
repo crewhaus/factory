@@ -16,6 +16,7 @@ import {
   filterApprovals,
   foldApprovals,
   isApprovalId,
+  isOffsetlessDateTime,
   operativeOf,
   orderApprovals,
   parseInstant,
@@ -57,6 +58,18 @@ describe("readTailCapped / readJsonlCapped", () => {
   test("a file that could not be examined reports an UNMEASURED size, not zero", () => {
     mkdirSync(at("dir.jsonl"));
     expect(readJsonlCapped(at("dir.jsonl")).bytes).toBeNull();
+  });
+
+  test("a link at the leaf is not followed: every caller resolved and checked its path already", () => {
+    writeFileSync(at("real.jsonl"), '{"id":1}\n');
+    symlinkSync(at("real.jsonl"), at("link.jsonl"));
+    const read = readTailCapped(at("link.jsonl"), 1024);
+    expect(read.state).toEqual({
+      kind: "unreadable",
+      reason: "the path is a symbolic link, which is not followed here",
+    });
+    expect(read.text).toBe("");
+    expect(readTailCapped(at("real.jsonl"), 1024).state.kind).toBe("read");
   });
 
   test("a directory in the file's place reads as UNREADABLE with a reason — never as empty", () => {
@@ -233,6 +246,66 @@ describe("parseInstant", () => {
     expect(parseInstant("2026-13-45T99:99:99Z")).toBeNull();
   });
 
+  test("a time without an offset is refused, never read in the host's zone (security-2#5)", () => {
+    // On 0.7.0 each of these parsed, as HOST-local time: a different number
+    // on every machine, and a negative age on one east of the writer.
+    expect(parseInstant("2026-09-19T14:00:00")).toBeNull();
+    expect(parseInstant("2026-09-19T14:00")).toBeNull();
+    expect(parseInstant("2026-09-19 14:00")).toBeNull();
+    expect(parseInstant("2026-09-19T14:00:00.250")).toBeNull();
+    expect(isOffsetlessDateTime("2026-09-19T14:00:00")).toBe(true);
+    expect(isOffsetlessDateTime("2026-09-19 14:00")).toBe(true);
+    expect(isOffsetlessDateTime("2026-09-19T14:00:00Z")).toBe(false);
+    expect(isOffsetlessDateTime("2026-09-19")).toBe(false);
+  });
+
+  test("every accepted spelling is the instant it names; a bare date is 00:00:00Z", () => {
+    const twoPmUtc = Date.UTC(2026, 8, 19, 14);
+    expect(parseInstant("2026-09-19T14:00:00Z")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T16:00:00+02:00")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T16:00:00+0200")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19 14:00Z")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T09:30-04:30")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19")).toBe(Date.UTC(2026, 8, 19));
+  });
+
+  test("the same inputs parse to the same numbers under every host zone", () => {
+    // The property the package states (DETERMINISM), measured where it
+    // breaks: in processes whose TZ differs. An offset-less time is in the
+    // list on purpose — it must come back null everywhere, not as three
+    // different instants.
+    const inputs = [
+      "2026-09-19T14:00:00",
+      "2026-09-19 14:00",
+      "2026-09-19T14:00:00Z",
+      "2026-09-19T16:00:00+02:00",
+      "2026-09-19",
+    ];
+    const module = path.join(import.meta.dir, "lib", "approvals.ts");
+    const script = `const { parseInstant } = await import(${JSON.stringify(module)}); console.log(JSON.stringify(${JSON.stringify(inputs)}.map(parseInstant)));`;
+    const outputs = ["UTC", "America/Los_Angeles", "Asia/Tokyo"].map((TZ) => {
+      const run = Bun.spawnSync([process.execPath, "-e", script], {
+        env: { ...process.env, TZ },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect({ TZ, exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({
+        TZ,
+        exit: 0,
+        stderr: "",
+      });
+      return run.stdout.toString().trim();
+    });
+    const expected = JSON.stringify([
+      null,
+      null,
+      Date.UTC(2026, 8, 19, 14),
+      Date.UTC(2026, 8, 19, 14),
+      Date.UTC(2026, 8, 19),
+    ]);
+    expect(outputs).toEqual([expected, expected, expected]);
+  }, 20_000);
+
   test("an offset instant compares by INSTANT, which a string compare gets backwards", () => {
     const withOffset = "2026-09-19T00:30:00+02:00"; // 22:30Z on the 18th
     const utc = "2026-09-18T23:00:00Z";
@@ -365,12 +438,61 @@ describe("orderApprovals", () => {
 // ---------------------------------------------------------------------------
 
 describe("toRow", () => {
-  test("the operative field comes from the matcher's own table", () => {
-    expect(operativeOf("Read", { file_path: "/etc/hosts", content: "x" })).toEqual({
-      field: "file_path",
+  test("the operative field is the one the tool declares", () => {
+    expect(operativeOf("Read", { path: "/etc/hosts", content: "x" })).toEqual({
+      field: "path",
       value: "/etc/hosts",
     });
     expect(operativeOf("Bash", { command: "ls" })).toEqual({ field: "command", value: "ls" });
+    // 0.7.1 builtins beyond the legacy name table: the URL, not the method…
+    expect(operativeOf("HttpRequest", { method: "DELETE", url: "https://x.test/a" })).toEqual({
+      field: "url",
+      value: "https://x.test/a",
+    });
+    // …a repository read in the light of its owner…
+    expect(operativeOf("IssueCreate", { owner: "crewhaus", repo: "factory", title: "t" })).toEqual({
+      field: "repo",
+      value: "crewhaus/factory",
+    });
+    // …and the default a tool acts on when the call leaves the field out.
+    expect(operativeOf("EnvFileUpsert", { entries: {} })).toEqual({ field: "path", value: ".env" });
+  });
+
+  test("a store or repository the call leaves out does not stand in for the record it acts on", () => {
+    // The approver deciding on these needs the branch, the key, the pin —
+    // not the directory each lives in (a relocating field's default).
+    expect(operativeOf("GitBranchDelete", { name: "main", force: true })).toEqual({
+      field: "name",
+      value: "main",
+    });
+    expect(operativeOf("KvDelete", { namespace: "prod", key: "api-credentials" })).toEqual({
+      field: "key",
+      value: "prod/api-credentials",
+    });
+    expect(
+      operativeOf("DeployRollback", { name: "billing", env: "production", toVersion: 3 }),
+    ).toMatchObject({ value: "billing/production" });
+    expect(operativeOf("EvalBaselinePin", { spec: "billing", dataset: "golden" })).toMatchObject({
+      value: "billing/golden",
+    });
+    // Named by the call, the place is shown like any value…
+    expect(operativeOf("KvDelete", { stateDir: "elsewhere", namespace: "p", key: "k" })).toEqual({
+      field: "stateDir",
+      value: "elsewhere",
+    });
+    // …and with nothing else to show, the default is where the call acts.
+    expect(operativeOf("EmitTraceEvent", { name: "deploy_started" })).toEqual({
+      field: "dir",
+      value: ".crewhaus/sessions",
+    });
+    const row = toRow(
+      approval({ toolName: "GitBranchDelete", input: { name: "main", force: true } }) as never,
+    );
+    expect([row.operativeField, row.operativeValue]).toEqual(["name", "main"]);
+  });
+
+  test("a builtin with no scoping argument shows none, even when a table name would match", () => {
+    expect(operativeOf("ClipboardWrite", { text: "x" })).toEqual({ field: null, value: null });
   });
 
   test("a tool with no entry in that table gets NO operative value — there is no field a rule could constrain", () => {
@@ -381,14 +503,14 @@ describe("toRow", () => {
     const row = toRow(
       approval({
         toolName: "Write",
-        input: { file_path: "notes.md", content: "sk-live-abcdefghijklmnop" },
+        input: { path: "notes.md", content: "sk-live-abcdefghijklmnop" },
       }) as never,
     );
-    expect(row.operativeField).toBe("file_path");
+    expect(row.operativeField).toBe("path");
     expect(row.operativeValue).toBe("notes.md");
     expect(row.inputFields).toEqual([
       { key: "content", type: "string", chars: 24 },
-      { key: "file_path", type: "string", chars: 8 },
+      { key: "path", type: "string", chars: 8 },
     ]);
     // The whole row, serialized, must not carry the secret's TEXT anywhere.
     expect(JSON.stringify(row)).not.toContain("sk-live-abcdefghijklmnop");
@@ -597,6 +719,33 @@ describe("readRecentSessions", () => {
     expect(read.tornLines).toBe(1);
     expect(read.sessions[0]?.objects).toHaveLength(2);
   });
+
+  test("a log that is a link OUT of the workspace is refused and never opened (security-2#2)", () => {
+    // The workspace is tmp/ws; the planted link points at tmp/outside.
+    const ws = path.join(tmp, "ws");
+    const dir = path.join(ws, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(path.join(tmp, "outside"));
+    const secret = path.join(tmp, "outside", "other-project.jsonl");
+    writeFileSync(secret, '{"kind":"tool_use","payload":{"input":{"command":"sk-OUTSIDE"}}}\n');
+    symlinkSync(secret, path.join(dir, "sess_planted.jsonl"));
+    writeFileSync(path.join(dir, "sess_own.jsonl"), '{"kind":"x"}\n');
+    // A link that stays inside the workspace is followed.
+    writeFileSync(path.join(ws, "shared.jsonl"), '{"kind":"y"}\n');
+    symlinkSync(path.join(ws, "shared.jsonl"), path.join(dir, "sess_shared.jsonl"));
+
+    const read = readRecentSessions(dir, "all", ws);
+    expect(read.sessions.map((s) => s.sessionId).sort()).toEqual(["sess_own", "sess_shared"]);
+    expect(read.failures).toEqual([
+      {
+        file: "sess_planted.jsonl",
+        reason: "is a symbolic link that leads outside the workspace, so it was not read",
+      },
+    ]);
+    expect(JSON.stringify(read)).not.toContain("sk-OUTSIDE");
+    // Counted as seen, so the caller can say a log went unread.
+    expect(read.available).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -671,5 +820,25 @@ describe("sessionRootRelocation", () => {
     expect(sessionRootRelocation(path.join(tmp, "other"), { CREWHAUS_SESSION_DIR: "  " })).toBe(
       undefined,
     );
+  });
+
+  test("an env file linked from OUTSIDE the workspace is not read, and the answer says unknown", () => {
+    const ws = path.join(tmp, "ws");
+    const dir = path.join(ws, "h");
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(path.join(tmp, "outside"));
+    // The outside file does NOT assign the variable: if it were read, the
+    // probe would answer "no evidence" — the one-bit leak the audit found.
+    writeFileSync(path.join(tmp, "outside", ".env"), "UNRELATED=1\n");
+    symlinkSync(path.join(tmp, "outside", ".env"), path.join(dir, ".env"));
+    const said = sessionRootRelocation(dir, {}, ws);
+    expect(said).toContain("outside the workspace, which is not read here");
+    expect(said).toContain("unknown");
+
+    // A link that stays inside the workspace is followed.
+    rmSync(path.join(dir, ".env"));
+    writeFileSync(path.join(ws, "shared.env"), "CREWHAUS_SESSION_DIR=/var/x\n");
+    symlinkSync(path.join(ws, "shared.env"), path.join(dir, ".env"));
+    expect(sessionRootRelocation(dir, {}, ws)).toContain("assigns CREWHAUS_SESSION_DIR");
   });
 });

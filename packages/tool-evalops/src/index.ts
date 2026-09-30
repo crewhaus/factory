@@ -44,14 +44,18 @@ import {
  *   4. CONTAINMENT. Every caller-supplied path goes through the same resolver
  *      the other filesystem packages use, and an absolute `outDir` recorded by
  *      whichever machine ran the eval is re-contained before it is opened.
+ *      So is every file NAMED UNDER one: `index.jsonl`, `baselines.json` and
+ *      `results.json` are read only when their own physical location is in
+ *      the workspace, and a FIFO or device there is refused unopened.
  *
- * Only `EvalBaselinePin` writes anything, and only to `baselines.json`.
+ * Only `EvalBaselinePin` writes anything, and only to `baselines.json` — as a
+ * regular file, never through a symbolic link at that name.
  */
 import {
   type BaselineLineage,
   DEFAULT_EVALS_DIR,
   type RunIndexEntry,
-  resolveBaseline,
+  lookupBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode } from "@crewhaus/eval-runner";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -253,6 +257,7 @@ const evalHistorySchema = z.object({
 
 export const evalHistory: RegisteredTool = buildTool({
   name: "EvalHistory",
+  operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true }],
   description:
     "Read the recorded eval runs and return each lineage's trend, CUT wherever the measuring instrument changed. Use before quoting an eval trend or deciding a suite is improving: runs record the dataset, graders and judge they were measured with, and a first-to-last delta drawn across a graders rewrite compares numbers that were never comparable. Every segment reports its own delta in percentage points, every cut says which hash changed, and a join whose comparability could not be verified is marked instead of assumed. Reads only; runs nothing.",
   inputSchema: evalHistorySchema,
@@ -459,6 +464,10 @@ const evalAggregateSchema = z.object({
 
 export const evalAggregate: RegisteredTool = buildTool({
   name: "EvalAggregate",
+  operativeArgs: [
+    { field: "run", kind: "path" },
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
+  ],
   description:
     "Recompute an eval run's aggregates from its own samples — pass rate, mean score, latency percentiles, pass@k and pass^k — and add the interval a small sample deserves. Use to check a run's published numbers against its samples, or to get the figures for one slice of it (by sample id or metadata). The fold is the eval runner's own, so the answer matches what a re-run would report; pass@k and pass^k carry Wilson intervals because 3 of 5 is not 60%. Any sample the fold could not use is named, never dropped.",
   inputSchema: evalAggregateSchema,
@@ -602,6 +611,11 @@ const evalBaselinePinSchema = z.object({
 
 export const evalBaselinePin: RegisteredTool = buildTool({
   name: "EvalBaselinePin",
+  operativeArgs: [
+    // DEFAULT_EVALS_DIR, spelled with "/" so a rule reads it the same on every OS.
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
+    { field: "dataset", kind: "id", within: "spec" },
+  ],
   description:
     "Show, move or clear the pinned baseline run a lineage's regression gate compares against. Use when a gate needs re-baselining after a deliberate change, or to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
   inputSchema: evalBaselinePinSchema,
@@ -627,7 +641,9 @@ export const evalBaselinePin: RegisteredTool = buildTool({
       // named. Reading it is also how `show` knows what is pinned.
       return refusal(pins);
     }
-    const lookup = resolveBaseline(lineage, index.value.dir.real);
+    // The map this call already read, with its leaf contained — not the
+    // file re-opened by a path eval-report would join.
+    const lookup = lookupBaseline(pins.value.file, lineage);
     const row =
       input.runId === undefined
         ? undefined
@@ -646,12 +662,16 @@ export const evalBaselinePin: RegisteredTool = buildTool({
       baselines: pins.value.file,
       ...(row !== undefined ? { row } : {}),
       evalsDir: index.value.dir,
+      pinsLinked: pins.value.linked,
     });
     if (!plan.ok) return refusal(plan);
 
     const dryRun = input.dryRun === true;
     const committed = plan.value.changes && !dryRun && input.action !== "show";
-    if (committed) commitPin(plan.value, pins.value.file, index.value.dir.real);
+    if (committed) {
+      const wrote = commitPin("EvalBaselinePin", plan.value, index.value.dir, dirRel);
+      if (!wrote.ok) return refusal(wrote);
+    }
 
     const lineageRuns = index.value.entries.filter((e) => keyOf(e) === plan.value.key);
     // What this lineage is pinned to once the call returns — the state the
@@ -727,6 +747,11 @@ const evalCoverageSchema = z.object({
 
 export const evalCoverage: RegisteredTool = buildTool({
   name: "EvalCoverage",
+  operativeArgs: [
+    { field: "dataset", kind: "path" },
+    { field: "sessionsDir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
+  ],
   description:
     "Compare what production actually does against what the eval dataset exercises, and rank what is missing. Use before trusting a green eval: it builds tool-call, tool-sequence and compaction frequencies from the harness's session logs, intersects them with the dataset's expected_tools (plus the tools the last recorded run really called), and returns the gaps ranked by how much of production they cover — each with a confidence interval, because a gap seen in 3 of 5 sessions is not a 60% gap. Reading zero sessions is reported as a refusal, never as 'no gaps'.",
   inputSchema: evalCoverageSchema,

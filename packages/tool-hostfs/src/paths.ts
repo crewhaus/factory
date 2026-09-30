@@ -8,9 +8,9 @@
  * The workspace root is `process.cwd()`, matching tool-fs, so a harness that
  * trusts one tool's boundary gets the same boundary here.
  */
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { resolveContained } from "@crewhaus/tool-safety/fs";
 
 /** Raised when a caller-supplied path resolves outside the workspace root. */
 export class ToolPermissionError extends CrewhausError {
@@ -54,74 +54,13 @@ export function workspaceRoot(): string {
 /**
  * Resolve `rel` inside the workspace, or throw `ToolPermissionError`.
  *
- * The leaf is allowed not to exist — every tool here that creates something
- * needs to validate a destination before it is made — so the deepest
- * EXISTING ancestor is realpath'd and the missing tail re-appended. Any
- * failure other than that walk fails closed.
+ * The leaf is allowed not to exist. Where the path really lands is
+ * tool-safety's `resolveContained`: one component at a time, the way the
+ * kernel walks it, dangling links followed, and `..` inside a link's target
+ * climbing from where the previous link really led. The copy that lived
+ * here resolved a dangling link's target as TEXT (the C068 resolver
+ * defect). Any failure fails closed.
  */
-
-/**
- * True when the NAME exists, whether or not it leads anywhere.
- *
- * `existsSync` FOLLOWS symlinks, so it answers false for a link whose target
- * is missing — and that is exactly the case that matters: a dangling link is
- * still a door, because `open(…, "w")` through `evil -> /outside/x` CREATES
- * `/outside/x`. Probing with `lstat` keeps the link's name in the part of the
- * path that gets resolved, rather than in the "does not exist yet" tail that
- * is re-appended to the root verbatim and so passes the containment check.
- */
-function nameExists(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Where `target` would actually land, with every symlink on the way already
- * followed — including one whose own target does not exist yet.
- *
- * `realpathSync` gives up with ENOENT on a dangling link, which would leave
- * that link unresolved and let it stand in for a plain missing file. So the
- * deepest ancestor that exists as a NAME is resolved, a dangling one is
- * followed a hop by hand, and the components that do not exist are appended.
- * The result is the path an `open` would create, which is the only path worth
- * checking containment against.
- */
-function resolveLocation(target: string, depth = 0): string {
-  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break; // reached the filesystem root
-    probe = parent;
-  }
-  let probeReal: string;
-  try {
-    probeReal = realpathSync(probe);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    // The name is there but `realpath` cannot finish it: a symlink with a
-    // missing target. `readlinkSync` throws EINVAL on anything else, which
-    // fails closed.
-    const link = readlinkSync(probe);
-    // A RELATIVE target resolves against the directory that actually CONTAINS
-    // the link, which is not the link's lexical parent when that parent is
-    // itself reached through a symlink. `<root>/dirlink/x -> ../y` with
-    // `dirlink` pointing out of the root really lands at `<elsewhere>/y`, but
-    // measured from the lexical parent it reads as `<root>/y` — an in-root
-    // path the caller's path does not lead to. So the parent is made real
-    // first. An absolute target ignores the base.
-    const base = realpathSync(path.dirname(probe));
-    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
-  }
-  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
-}
-
 export function resolveSafe(toolName: string, rel: string, root = workspaceRoot()): SafePath {
   const rootResolved = path.resolve(root);
   const abs = path.resolve(rootResolved, rel);
@@ -130,19 +69,11 @@ export function resolveSafe(toolName: string, rel: string, root = workspaceRoot(
   if (abs !== rootResolved && !abs.startsWith(`${rootResolved}${path.sep}`)) {
     throw new ToolPermissionError(toolName, rel);
   }
-  let real: string;
-  try {
-    const rootReal = realpathSync(rootResolved);
-    real = resolveLocation(abs);
-    // 2) Symlink-aware containment. The real path must land inside the real
-    //    root, so an in-workspace symlink pointing at /etc is refused here.
-    if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
-      throw new ToolPermissionError(toolName, rel);
-    }
-  } catch (err) {
-    if (err instanceof ToolPermissionError) throw err;
-    throw new ToolPermissionError(toolName, rel);
-  }
+  // 2) Symlink-aware containment. The real path must land inside the real
+  //    root, so an in-workspace symlink pointing at /etc is refused here.
+  const resolved = resolveContained(rootResolved, abs);
+  if (!resolved.ok) throw new ToolPermissionError(toolName, rel);
+  const real = resolved.real;
   return {
     abs,
     real,

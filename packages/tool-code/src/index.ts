@@ -34,6 +34,7 @@ import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { describeRegexOutcome, runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
 import {
   detectBuild,
@@ -56,9 +57,11 @@ import {
   parseGoMod,
   parseLockfileDetailed,
   parsePackageJson,
+  parsePnpmWorkspacePackages,
   parsePyproject,
   parseRequirementsTxt,
   satisfies,
+  unsupportedWorkspaceGlob,
 } from "./lib/deps";
 import {
   type Diagnostic,
@@ -105,6 +108,7 @@ import {
   DEFAULT_MAX_FILES,
   MAX_FILE_BYTES,
   SOURCE_EXTENSIONS,
+  type SkippedFile,
   fileExists,
   readTextFile,
   walkFiles,
@@ -131,9 +135,10 @@ const timeoutField = z
  *
  * It appears ONLY on the tools marked `destructive` (`RunTests`, `RunBuild`,
  * `Format`). Spawning a program the caller names is arbitrary execution, and
- * the permission engine auto-allows a `readOnly` tool in auto mode and allows
- * it outright in plan mode — so `Typecheck`, `Lint` and `FormatCheck` do not
- * take one, and stay reads that a permission engine can believe.
+ * the permission engine runs a tool that is not destructive without asking in
+ * auto mode — so `Typecheck`, `Lint`, `FormatCheck` and `Diagnostics` do not
+ * take one: an auto-allowed checker that took an argv would be an unreviewed
+ * `sh -c`.
  */
 const commandField = z
   .array(z.string().min(1))
@@ -157,22 +162,29 @@ const extensionsField = z
   .describe("file extensions to scan, with the dot; defaults to the JS/TS family");
 
 /**
- * Safety flags for a tool that spawns a program but asks it only to report:
- * a type check with `--noEmit`, a linter without `--fix`. Spawning is still
- * crossing a process boundary, so `scope`/`ioCapability` say so. Never
- * concurrency-safe: two type checks racing on one `.tsbuildinfo` is exactly
- * the contention the flag exists to prevent.
+ * Safety flags for a tool that runs the project's own checker and asks it
+ * only to report: a type check with `--noEmit`, a linter without `--fix`.
+ * Spawning is crossing a process boundary, so `scope`/`ioCapability` say so.
+ * Never concurrency-safe: two type checks racing on one `.tsbuildinfo` is
+ * exactly the contention the flag exists to prevent.
  *
- * `readOnly` here is a promise about WHICH program runs, not only about the
- * flags it is given: every tool carrying these flags spawns a command worked
- * out from the project's own files by `./detect`, and none of them accepts a
- * caller-supplied `command`. The flag is what the permission engine decides
- * on — auto mode allows a read without asking, plan mode allows only reads —
- * so a read-only tool that let a caller name the program would be an
- * unreviewed `sh -c` wearing a checker's badge.
+ * NOT `readOnly` (0.7.1, permission-integration#7). None of these accepts a
+ * caller-supplied `command` — the program is worked out from the project's
+ * own files by `./detect` — but that program IS the project's:
+ * `node_modules/.bin/eslint`, an `eslint.config.js`, a TypeScript plugin. All
+ * of it is code the workspace supplies, and plan mode runs every read-only
+ * tool without asking, so a read-only checker was a way to run a cloned
+ * repository's code during a plan. The rule for the whole registry is in
+ * apps/cli/src/flag-rules.test.ts: a read-only tool may spawn only a program
+ * the tool itself fixes. Not `destructive` either: a checker is not expected
+ * to change anything, so auto mode still runs it without asking, as before.
+ * Because auto mode runs it unasked and the program is the project's, each
+ * of these spawns WITHOUT the harness's credentials in its environment (see
+ * `runProcess`'s `withoutCredentials`): a checker has no business with a
+ * provider key, and an `eslint.config.js` would otherwise be handed one.
  */
-const READ_SPAWN = {
-  readOnly: true,
+const CHECK_SPAWN = {
+  readOnly: false,
   concurrencySafe: false,
   scope: "external",
   ioCapability: "process",
@@ -212,14 +224,14 @@ const RAW_TAIL_LINES = 25;
 /**
  * What to tell a caller who has nowhere left to go.
  *
- * The three read-only checkers take no `command`, so pointing them at one
- * would be advice that cannot be followed; they are pointed at the
- * destructive tool that does take one instead.
+ * The four checkers take no `command`, so pointing them at one would be
+ * advice that cannot be followed; they are pointed at the destructive tool
+ * that does take one instead.
  */
 const escapeHatch = (toolName: string): string =>
   TAKES_COMMAND.has(toolName)
     ? "Pass `command` with an explicit argv."
-    : `${toolName} deliberately takes no explicit command — it is marked read-only, and a read-only tool that spawned a caller-named program would be auto-allowed by the permission engine. Install the tool, or use RunBuild with \`command\`, which is marked destructive for exactly this reason.`;
+    : `${toolName} deliberately takes no explicit command — it is not destructive, so auto mode runs it without asking, and a tool that ran a caller-named program unasked would be an unreviewed shell. Install the tool, or use RunBuild with \`command\`, which is marked destructive for exactly this reason.`;
 
 /** The tools that accept a caller-supplied argv. Every one is `destructive`. */
 const TAKES_COMMAND: ReadonlySet<string> = new Set(["RunTests", "RunBuild", "Format"]);
@@ -258,14 +270,14 @@ function resolveToolchain(
   requested: string,
 ): Resolution {
   if (explicit !== undefined) {
-    // Belt and braces: the schema of a read-only tool has no `command` field,
-    // so this is unreachable through the runtime's validator. It is here so a
+    // Belt and braces: the schema of a checker has no `command` field, so
+    // this is unreachable through the runtime's validator. It is here so a
     // future edit that adds the field back fails loudly instead of quietly
-    // reopening arbitrary execution behind a `readOnly` flag.
+    // reopening arbitrary execution behind a tool auto mode runs unasked.
     if (!TAKES_COMMAND.has(toolName)) {
       return {
         ok: false,
-        message: `${toolName} does not accept an explicit command: it is marked read-only, and a read-only tool that spawned a caller-named program would be auto-allowed by the permission engine.`,
+        message: `${toolName} does not accept an explicit command: it is not destructive, so auto mode runs it without asking, and a tool that ran a caller-named program unasked would be an unreviewed shell.`,
       };
     }
     const bad = checkArgv(toolName, explicit);
@@ -413,6 +425,15 @@ function workspaceRoots(): string[] {
 
 export const runTests: RegisteredTool = buildTool({
   name: "RunTests",
+  // `cwd` only moves the run inside the workspace, as for RunCommand: a deny
+  // or ask on a directory reads the root when the call leaves it out, and
+  // `alwaysAllow RunTests(bun test)` is not also asked to match ".". The
+  // command is read as run in `cwd` (`within`), so a deny naming a script by
+  // its workspace path holds when the call runs it from its own directory.
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "command", kind: "command", within: "cwd" },
+  ],
   description:
     "Run the project's test suite and return only what failed, as structured JSON: the test name, the failing assertion, its file and line, and a trimmed stack. Use it instead of running a test command and reading the output, because a green run comes back as three counts rather than thousands of lines. The runner is detected from the project (bun, vitest, jest, pytest, go, cargo) or given explicitly, and each one is asked for its machine-readable form. Running tests executes the project's own code, so it is not a read-only operation.",
   inputSchema: z.object({
@@ -656,6 +677,11 @@ function diagnosticsBody(diagnostics: readonly Diagnostic[]): Record<string, unk
 
 export const runBuild: RegisteredTool = buildTool({
   name: "RunBuild",
+  // `cwd` relocates the run, as on RunTests above.
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: ".", relocates: true },
+    { field: "command", kind: "command", within: "cwd" },
+  ],
   description:
     "Build the project and return structured diagnostics instead of the build log: file, line, column, severity, rule and message. Use it to find out whether a change compiles and, when it does not, exactly where — without a model reading a compiler's output. The command comes from the project (a build script, cargo, go, tsc) or is given explicitly. A build writes its own output, so this is not a read-only operation.",
   inputSchema: z.object({
@@ -703,13 +729,14 @@ export const runBuild: RegisteredTool = buildTool({
 
 export const typecheck: RegisteredTool = buildTool({
   name: "Typecheck",
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   description:
-    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
+    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode with its incremental cache in a temp directory rather than the project, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Typecheck", input.cwd);
     if (!dir.ok) return dir.message;
@@ -726,6 +753,7 @@ export const typecheck: RegisteredTool = buildTool({
     const run = await runProcess(resolution.argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("Typecheck", run);
@@ -746,8 +774,9 @@ export const typecheck: RegisteredTool = buildTool({
 
 export const lint: RegisteredTool = buildTool({
   name: "Lint",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" }],
   description:
-    "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
+    "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, and no caller can substitute another program — Format is the tool that rewrites files. The linter and its config (an eslint.config.js, a cargo build script) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     paths: z
@@ -757,7 +786,7 @@ export const lint: RegisteredTool = buildTool({
       .describe("limit to these files or directories, relative to `cwd`"),
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Lint", input.cwd);
     if (!dir.ok) return dir.message;
@@ -782,6 +811,7 @@ export const lint: RegisteredTool = buildTool({
     const run = await runProcess(argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("Lint", run);
@@ -798,8 +828,12 @@ export const lint: RegisteredTool = buildTool({
 
 export const format: RegisteredTool = buildTool({
   name: "Format",
+  operativeArgs: [
+    { field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" },
+    { field: "command", kind: "command", within: "cwd" },
+  ],
   description:
-    "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the read-only counterpart.",
+    "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the counterpart that only reports.",
   inputSchema: z.object({
     cwd: cwdField,
     command: commandField,
@@ -889,13 +923,14 @@ function unformattedFiles(tool: string, run: RunResult, root: string): string[] 
 
 export const formatCheck: RegisteredTool = buildTool({
   name: "FormatCheck",
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   description:
-    "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
+    "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program. The formatter and its config (a prettier.config.js and its plugins) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("FormatCheck", input.cwd);
     if (!dir.ok) return dir.message;
@@ -913,6 +948,7 @@ export const formatCheck: RegisteredTool = buildTool({
     const run = await runProcess(argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("FormatCheck", run);
@@ -935,8 +971,9 @@ export const formatCheck: RegisteredTool = buildTool({
 
 export const diagnostics: RegisteredTool = buildTool({
   name: "Diagnostics",
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   description:
-    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
+    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten; tsc's, mypy's and ruff's caches are kept out of the project. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     include: z
@@ -947,7 +984,7 @@ export const diagnostics: RegisteredTool = buildTool({
       .describe("which checks to run; all three when omitted"),
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Diagnostics", input.cwd);
     if (!dir.ok) return dir.message;
@@ -992,6 +1029,7 @@ export const diagnostics: RegisteredTool = buildTool({
       const run = await runProcess(argv, {
         cwd: dir.value,
         timeoutMs: remaining,
+        withoutCredentials: true,
         ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
       });
       const failed = spawnFailure("Diagnostics", run);
@@ -1102,10 +1140,13 @@ const declarationKinds = z.enum([
   "accessor",
 ]);
 
+/** Longest declaration name AstQuery's `pattern` is run against. */
+const MAX_PATTERN_NAME_CHARS = 1_024;
+
 export const astQuery: RegisteredTool = buildTool({
   name: "AstQuery",
   description:
-    "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run.",
+    "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run, and a name the pattern could not be checked against is listed as unchecked, never dropped as a non-match.",
   inputSchema: z.object({
     cwd: cwdField,
     kinds: z.array(declarationKinds).max(10).optional().describe("only these kinds"),
@@ -1118,22 +1159,18 @@ export const astQuery: RegisteredTool = buildTool({
     maxResults: z.number().int().positive().max(5_000).optional(),
   }),
   ...READ_FILES,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const dir = resolveDir("AstQuery", input.cwd);
     if (!dir.ok) return dir.message;
-    let matcher: RegExp | undefined;
     if (input.pattern !== undefined) {
-      // Refused before it is compiled: this pattern is run against every
-      // declaration name in the tree, and a JavaScript regular expression
-      // cannot be interrupted once it has started, so there is no deadline to
-      // fall back on. See `hasNestedRepetition`.
+      // Refused before anything runs: this pattern is tried against every
+      // declaration name in the tree. See `hasNestedRepetition`.
       if (hasNestedRepetition(input.pattern)) {
-        return `AstQuery refused the pattern /${input.pattern}/: it repeats a group that itself repeats or branches (\`(a+)+\`, \`(a|a)*\`), which can take exponential time on an ordinary identifier and cannot be interrupted once it starts. Rewrite it without the nested repetition — \`^(get|set)\` rather than \`^(get|set)+\`.`;
+        return `AstQuery refused the pattern /${input.pattern}/: it repeats a group whose passes can match the same text more than one way (\`(a+)+\`, \`(a|a)*\`, \`(\\w+){2,64}\`), which can take exponential time on an ordinary identifier. Rewrite it without the nested repetition — \`^(get|set)\` rather than \`^(get|set)+\`.`;
       }
-      try {
-        matcher = new RegExp(input.pattern);
-      } catch (err) {
-        return `AstQuery could not use the pattern /${input.pattern}/: ${(err as Error).message}`;
+      const verdict = screenUserRegex(input.pattern);
+      if (!verdict.ok) {
+        return `AstQuery could not use the pattern /${input.pattern}/: ${verdict.reason}`;
       }
     }
     const collected = collectSources(
@@ -1143,25 +1180,77 @@ export const astQuery: RegisteredTool = buildTool({
     );
     const kinds = input.kinds === undefined ? undefined : new Set<string>(input.kinds);
     const includeMembers = input.includeMembers ?? true;
-    const results: Array<Record<string, unknown>> = [];
+    type Found = {
+      file: { workspacePath: string };
+      decl: ReturnType<typeof scanDeclarations>[number];
+    };
+    const candidates: Found[] = [];
     for (const file of collected.files) {
       for (const decl of scanDeclarations(file.text)) {
         if (!includeMembers && decl.parent !== undefined) continue;
         if (kinds !== undefined && !kinds.has(decl.kind)) continue;
         if (input.name !== undefined && decl.name !== input.name) continue;
-        if (matcher !== undefined && !matcher.test(decl.name)) continue;
         if (input.exportedOnly === true && !decl.exported) continue;
-        results.push({
-          file: file.workspacePath,
-          kind: decl.kind,
-          name: decl.name,
-          ...(decl.parent === undefined ? {} : { parent: decl.parent }),
-          startLine: decl.startLine,
-          endLine: decl.endLine,
-          exported: decl.exported,
-          signature: decl.signature,
-        });
+        candidates.push({ file, decl });
       }
+    }
+    // The pattern runs over the candidates' names in @crewhaus/tool-safety's
+    // regex worker, once per distinct name, under a deadline (C079). A name
+    // it could not answer for is listed, never taken for a non-match.
+    let unchecked: string[] = [];
+    let uncheckedWhy: string | undefined;
+    let keep: (name: string) => boolean = () => true;
+    if (input.pattern !== undefined && candidates.length > 0) {
+      const names = [...new Set(candidates.map((c) => c.decl.name))];
+      const outcome = await runRegex({
+        op: "testEach",
+        pattern: input.pattern,
+        inputs: names,
+        maxMatches: names.length,
+        onGiveUp: "skip",
+        // No identifier is this long; one that is gets listed as unchecked
+        // rather than run, which also bounds what a runaway match can cost.
+        maxItemChars: MAX_PATTERN_NAME_CHARS,
+        deadlineMs: 5_000,
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+      });
+      let matched: ReadonlyArray<number>;
+      let unknown: ReadonlyArray<number>;
+      if (outcome.status === "ok") {
+        matched = outcome.result.matched;
+        unknown = outcome.result.undetermined;
+      } else if (
+        (outcome.status === "timeout" || outcome.status === "gave-up") &&
+        outcome.partial !== undefined
+      ) {
+        // Answers before the stop stand; every name after it is unchecked.
+        matched = outcome.partial.matched;
+        const answered = new Set(outcome.partial.undetermined);
+        const upTo = outcome.partial.scanned;
+        unknown = names.map((_, i) => i).filter((i) => i >= upTo || answered.has(i));
+        uncheckedWhy = describeRegexOutcome(outcome);
+      } else {
+        return `AstQuery could not evaluate the pattern /${input.pattern}/ against the declaration names: ${describeRegexOutcome(outcome)}. No declarations are reported, rather than a list that silently leaves some out.`;
+      }
+      const hit = new Set(matched.map((i) => names[i] as string));
+      const skip = new Set(unknown.map((i) => names[i] as string));
+      unchecked = [...skip].sort();
+      keep = (name) => hit.has(name) && !skip.has(name);
+    }
+    const results: Array<Record<string, unknown>> = [];
+    for (const { file, decl } of candidates) {
+      if (!keep(decl.name)) continue;
+      results.push({
+        file: file.workspacePath,
+        kind: decl.kind,
+        name: decl.name,
+        ...(decl.parent === undefined ? {} : { parent: decl.parent }),
+        startLine: decl.startLine,
+        endLine: decl.endLine,
+        exported: decl.exported,
+        signature: decl.signature,
+      });
     }
     const capped = capList(results, input.maxResults ?? 1_000);
     return json({
@@ -1171,6 +1260,15 @@ export const astQuery: RegisteredTool = buildTool({
       ...(capped.truncated ? { resultsTruncated: true } : {}),
       ...(collected.truncated ? { scanTruncated: true } : {}),
       ...(collected.skipped.length === 0 ? {} : { skippedFiles: collected.skipped.length }),
+      ...(unchecked.length === 0
+        ? {}
+        : {
+            uncheckedNames: unchecked.slice(0, 50),
+            uncheckedCount: unchecked.length,
+            uncheckedReason:
+              uncheckedWhy ??
+              "the pattern engine gave up on these names; they may or may not match, and are not in `declarations`",
+          }),
       method: "lexical scan, not a parser",
     });
   },
@@ -1465,12 +1563,13 @@ export const todoScan: RegisteredTool = buildTool({
 
 type LockSource = { readonly file: string; readonly locked: readonly LockedVersion[] };
 
-/** Read whichever lockfiles are present, plus a note for the unreadable one. */
+/** Read whichever lockfiles are present, plus a note for each unreadable one. */
 function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   const sources: LockSource[] = [];
   const notes: string[] = [];
+  const skipped: SkippedFile[] = [];
   const add = (name: string): void => {
-    const text = readTextFile(path.join(dirAbs, name));
+    const text = readTextFile(path.join(dirAbs, name), MAX_FILE_BYTES, skipped);
     if (text === undefined) return;
     // The filename-to-reader mapping lives in `deps.ts` and only there, so a
     // format cannot end up half-added — read by one caller and invisible to
@@ -1485,6 +1584,7 @@ function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   add("yarn.lock");
   add("pnpm-lock.yaml");
   add("Cargo.lock");
+  for (const s of skipped) notes.push(`${s.file}: ${s.reason}`);
   if (fileExists(path.join(dirAbs, "bun.lockb"))) {
     notes.push(
       "bun.lockb is bun's BINARY lockfile and cannot be read here; run `bun install --save-text-lockfile` to get a bun.lock this tool can read",
@@ -1493,11 +1593,23 @@ function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   return { sources, notes };
 }
 
-/** Every manifest present in a directory, read into one dependency list. */
-function readManifests(dirAbs: string): { dependencies: Dependency[]; manifests: string[] } {
+/**
+ * Every manifest present in a directory, read into one dependency list, and
+ * the ones that exist but were not read (a link leading out of the
+ * workspace, a FIFO, an oversized file), so "no manifest" is never the answer
+ * for a manifest that was refused.
+ */
+function readManifests(dirAbs: string): {
+  dependencies: Dependency[];
+  manifests: string[];
+  skipped: SkippedFile[];
+} {
   const dependencies: Dependency[] = [];
   const manifests: string[] = [];
-  const pkg = readTextFile(path.join(dirAbs, "package.json"));
+  const skipped: SkippedFile[] = [];
+  const read = (name: string): string | undefined =>
+    readTextFile(path.join(dirAbs, name), MAX_FILE_BYTES, skipped);
+  const pkg = read("package.json");
   if (pkg !== undefined) {
     const parsed = parsePackageJson(pkg);
     if (parsed !== undefined) {
@@ -1506,27 +1618,33 @@ function readManifests(dirAbs: string): { dependencies: Dependency[]; manifests:
     }
   }
   for (const name of ["requirements.txt", "requirements-dev.txt"]) {
-    const text = readTextFile(path.join(dirAbs, name));
+    const text = read(name);
     if (text === undefined) continue;
     dependencies.push(...parseRequirementsTxt(text, name));
     manifests.push(name);
   }
-  const pyproject = readTextFile(path.join(dirAbs, "pyproject.toml"));
+  const pyproject = read("pyproject.toml");
   if (pyproject !== undefined) {
     dependencies.push(...parsePyproject(pyproject));
     manifests.push("pyproject.toml");
   }
-  const gomod = readTextFile(path.join(dirAbs, "go.mod"));
+  const gomod = read("go.mod");
   if (gomod !== undefined) {
     dependencies.push(...parseGoMod(gomod));
     manifests.push("go.mod");
   }
-  const cargo = readTextFile(path.join(dirAbs, "Cargo.toml"));
+  const cargo = read("Cargo.toml");
   if (cargo !== undefined) {
     dependencies.push(...parseCargoToml(cargo));
     manifests.push("Cargo.toml");
   }
-  return { dependencies, manifests: manifests.sort() };
+  return { dependencies, manifests: manifests.sort(), skipped };
+}
+
+/** " (not read: a — why; b — why)", or "" when nothing was skipped. */
+function skippedClause(skipped: readonly SkippedFile[]): string {
+  if (skipped.length === 0) return "";
+  return ` (not read: ${skipped.map((s) => `${s.file} — ${s.reason}`).join("; ")})`;
 }
 
 export const dependencyList: RegisteredTool = buildTool({
@@ -1551,9 +1669,9 @@ export const dependencyList: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("DependencyList", input.cwd);
     if (!dir.ok) return dir.message;
-    const { dependencies, manifests } = readManifests(dir.value);
+    const { dependencies, manifests, skipped } = readManifests(dir.value);
     if (manifests.length === 0) {
-      return `DependencyList found no manifest in "${input.cwd ?? "."}" — no package.json, requirements.txt, pyproject.toml, go.mod or Cargo.toml.`;
+      return `DependencyList found no readable manifest in "${input.cwd ?? "."}" — no package.json, requirements.txt, pyproject.toml, go.mod or Cargo.toml${skippedClause(skipped)}.`;
     }
     const scopes = input.scopes === undefined ? undefined : new Set<string>(input.scopes);
     const ecosystems =
@@ -1588,6 +1706,7 @@ export const dependencyList: RegisteredTool = buildTool({
         ...(lockIndex.has(d.name) ? { locked: (lockIndex.get(d.name) as string[]).sort() } : {}),
       })),
       ...(capped.truncated ? { resultsTruncated: true } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
       ...(locks !== undefined && locks.notes.length > 0 ? { notes: locks.notes } : {}),
     });
   },
@@ -1609,9 +1728,9 @@ export const dependencyOutdated: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("DependencyOutdated", input.cwd);
     if (!dir.ok) return dir.message;
-    const { dependencies, manifests } = readManifests(dir.value);
+    const { dependencies, manifests, skipped } = readManifests(dir.value);
     if (manifests.length === 0) {
-      return `DependencyOutdated found no manifest in "${input.cwd ?? "."}".`;
+      return `DependencyOutdated found no readable manifest in "${input.cwd ?? "."}"${skippedClause(skipped)}.`;
     }
     const { sources, notes } = readLocks(dir.value);
     if (sources.length === 0) {
@@ -1683,6 +1802,7 @@ export const dependencyOutdated: RegisteredTool = buildTool({
         ? { uncheckable: uncheckable.slice(0, limit) }
         : { uncheckableCount: uncheckable.length }),
       ...(notes.length > 0 ? { notes } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
       // Said in the result, not only in the description: a caller who sees
       // `ok: true` must not read it as "every dependency checked out".
       ecosystemsCompared: ["npm", "cargo"],
@@ -1706,9 +1826,10 @@ export const packageScripts: RegisteredTool = buildTool({
     const dir = resolveDir("PackageScripts", input.cwd);
     if (!dir.ok) return dir.message;
     const root = path.resolve(process.cwd());
-    const found = nearestManifest(dir.value, root);
+    const skipped: SkippedFile[] = [];
+    const found = nearestManifest(dir.value, root, skipped);
     if (found === undefined) {
-      return `PackageScripts found no package.json at or above "${input.cwd ?? "."}".`;
+      return `PackageScripts found no readable package.json at or above "${input.cwd ?? "."}"${skippedClause(skipped)}.`;
     }
     const manager = detectPackageManager(found.dir, root);
     const entries = Object.entries(found.manifest.scripts)
@@ -1744,24 +1865,38 @@ export const workspacePackages: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("WorkspacePackages", input.cwd);
     if (!dir.ok) return dir.message;
-    const rootManifestText = readTextFile(path.join(dir.value, "package.json"));
+    const skipped: SkippedFile[] = [];
+    const rootManifestText = readTextFile(
+      path.join(dir.value, "package.json"),
+      MAX_FILE_BYTES,
+      skipped,
+    );
     const rootManifest =
       rootManifestText === undefined ? undefined : parsePackageJson(rootManifestText);
     let globs = rootManifest?.workspaces ?? [];
     if (globs.length === 0) {
       // pnpm keeps the same list in its own file; only the `packages:` list is
       // read, which is all this needs and all a partial YAML read can promise.
-      const pnpm = readTextFile(path.join(dir.value, "pnpm-workspace.yaml"));
-      if (pnpm !== undefined) {
-        globs = [...pnpm.matchAll(/^\s*-\s*["']?([^"'\n]+)["']?\s*$/gm)].map((m) =>
-          (m[1] as string).trim(),
-        );
-      }
+      const pnpm = readTextFile(
+        path.join(dir.value, "pnpm-workspace.yaml"),
+        MAX_FILE_BYTES,
+        skipped,
+      );
+      if (pnpm !== undefined) globs = parsePnpmWorkspacePackages(pnpm);
     }
     if (globs.length === 0) {
-      return `WorkspacePackages found no workspaces in "${input.cwd ?? "."}" — the root package.json declares none and there is no pnpm-workspace.yaml. This does not look like a monorepo root.`;
+      return `WorkspacePackages found no workspaces in "${input.cwd ?? "."}" — the root package.json declares none and there is no pnpm-workspace.yaml${skippedClause(skipped)}. This does not look like a monorepo root.`;
     }
 
+    // A `!` glob removes what the others include (npm, pnpm and yarn all read
+    // it so); a glob whose syntax is not evaluated here is reported, because
+    // the packages it names — or, negated, excludes — would otherwise be
+    // wrong without a word.
+    const unsupportedGlobs = globs
+      .map((glob) => ({ glob, reason: unsupportedWorkspaceGlob(glob) }))
+      .filter((entry): entry is { glob: string; reason: string } => entry.reason !== undefined);
+    const including = globs.filter((glob) => !glob.startsWith("!"));
+    const excluding = globs.filter((glob) => glob.startsWith("!")).map((glob) => glob.slice(1));
     const walked = walkFiles({
       root: dir.value,
       extensions: [".json"],
@@ -1772,8 +1907,9 @@ export const workspacePackages: RegisteredTool = buildTool({
     for (const rel of walked.files) {
       if (!rel.endsWith("package.json") || rel === "package.json") continue;
       const memberDir = rel.slice(0, rel.length - "/package.json".length);
-      if (!globs.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
-      const text = readTextFile(path.join(dir.value, rel));
+      if (!including.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
+      if (excluding.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
+      const text = readTextFile(path.join(dir.value, rel), MAX_FILE_BYTES, skipped);
       if (text === undefined) continue;
       const manifest = parsePackageJson(text);
       if (manifest?.name === undefined) continue;
@@ -1804,6 +1940,14 @@ export const workspacePackages: RegisteredTool = buildTool({
         ...(input.includeDependencies === false ? {} : { dependsOn: adjacency.get(m.name) ?? [] }),
       })),
       ...(capped.truncated ? { resultsTruncated: true } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(unsupportedGlobs.length > 0
+        ? {
+            unsupportedGlobs,
+            complete: false,
+            note: "some workspace globs use syntax this tool does not evaluate, so the packages they include or exclude are not reflected here — the list may be missing members, or hold ones a negated glob removes",
+          }
+        : {}),
       cycles: stronglyConnected(
         members.map((m) => m.name),
         adjacency,
@@ -1863,7 +2007,15 @@ export const coverageSummary: RegisteredTool = buildTool({
     } else {
       for (const candidate of COVERAGE_CANDIDATES) {
         if (fileExists(path.join(dir.value, candidate))) {
-          reportRel = relPosix(root, path.join(dir.value, candidate));
+          // The found candidate is contained exactly like an explicit `file`:
+          // `fileExists` follows a link, and one leading out of the
+          // workspace is refused by name, never read (C072).
+          const resolved = resolveFile(
+            "CoverageSummary",
+            relPosix(root, path.join(dir.value, candidate)),
+          );
+          if (!resolved.ok) return resolved.message;
+          reportRel = relPosix(root, resolved.value);
           break;
         }
       }
@@ -1871,9 +2023,10 @@ export const coverageSummary: RegisteredTool = buildTool({
     if (reportRel === undefined) {
       return `CoverageSummary found no coverage report under "${input.cwd ?? "."}" (looked for ${COVERAGE_CANDIDATES.join(", ")}). Run the tests with coverage enabled first, or pass \`file\`.`;
     }
-    const text = readTextFile(path.join(root, reportRel), 20_000_000);
+    const unread: SkippedFile[] = [];
+    const text = readTextFile(path.join(root, reportRel), 20_000_000, unread);
     if (text === undefined) {
-      return `CoverageSummary could not read "${reportRel}": it is not a text file, or it is larger than 20MB.`;
+      return `CoverageSummary could not read "${reportRel}": ${unread[0]?.reason ?? "it is not a text file, or it is larger than 20MB"}.`;
     }
     const istanbul = text.trimStart().startsWith("{") ? parseIstanbulSummary(text) : undefined;
     const files = istanbul !== undefined ? [...istanbul.files] : parseLcov(text);
@@ -2003,4 +2156,5 @@ export {
   parseYarnLock,
   parseYarnLockDetailed,
   satisfies,
+  satisfiesInstallable,
 } from "./lib/deps";

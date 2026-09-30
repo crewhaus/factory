@@ -50,13 +50,15 @@ import {
   DEFAULT_SUGGEST_THRESHOLDS,
   type PermissionSuggestion,
   type SettingsPermissionRule,
+  type SuggestToolLookup,
   aggregateAsks,
   diffPermissions,
+  isArgScoped,
   rankSuggestions,
 } from "@crewhaus/harness-advice";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
+import type { OperativeArg, RegisteredTool } from "@crewhaus/tool-catalog";
+import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import { z } from "zod";
 import {
   APPROVALS_FILENAME,
@@ -70,6 +72,7 @@ import {
   filterApprovals,
   foldApprovals,
   isApprovalId,
+  isOffsetlessDateTime,
   orderApprovals,
   parseInstant,
   toRow,
@@ -145,6 +148,12 @@ function containedChild(toolName: string, dirWsRel: string, child: string): Load
 function parseInstantArg(label: string, text: string | undefined): Loaded<number | undefined> {
   if (text === undefined) return { ok: true, value: undefined };
   const ms = parseInstant(text);
+  if (ms === null && isOffsetlessDateTime(text)) {
+    return {
+      ok: false,
+      message: `"${label}" (${JSON.stringify(text)}) has a time but no UTC offset — write it as e.g. 2026-09-19T14:00:00Z or with ±HH:MM. This tool never reads a time in the host's zone, which would select a different window on another machine`,
+    };
+  }
   if (ms === null) {
     return {
       ok: false,
@@ -155,6 +164,10 @@ function parseInstantArg(label: string, text: string | undefined): Loaded<number
 }
 
 const statusEnum = z.enum(["pending", "granted", "granted-always", "denied", "consumed"]);
+
+/** How every instant input is written, said once so the three fields agree. */
+const INSTANT_FORMAT =
+  "an ISO-8601 instant with Z or ±HH:MM (a time without an offset is refused; a bare date means 00:00:00Z at the START of that day)";
 
 const listingFields = {
   status: z
@@ -168,11 +181,11 @@ const listingFields = {
   since: z
     .string()
     .optional()
-    .describe("keep only parks created at or after this ISO-8601 instant"),
+    .describe(`keep only parks created at or after this instant: ${INSTANT_FORMAT}`),
   until: z
     .string()
     .optional()
-    .describe("keep only parks created at or before this ISO-8601 instant"),
+    .describe(`keep only parks created at or before this instant: ${INSTANT_FORMAT}`),
   order: z
     .enum(["operator", "oldest", "newest"])
     .optional()
@@ -190,7 +203,7 @@ const listingFields = {
     .string()
     .optional()
     .describe(
-      "an ISO-8601 instant to measure parked time against; omitted, rows carry no age, because this tool never reads the host clock",
+      `the instant to measure parked time against: ${INSTANT_FORMAT}. Omitted, rows carry no age, because this tool never reads the host clock`,
     ),
 };
 
@@ -326,6 +339,7 @@ function noteStoreHealth(unknowns: Unknowns, store: StoreRead, probe: string): v
 
 export const approvalStatus: RegisteredTool = buildTool({
   name: "ApprovalStatus",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Read one harness's tool-approval ledger: what is parked waiting for a human right now, what was decided, when and by whom. Use to answer 'is this harness blocked on me?' before assuming a quiet run is a finished one — a run under `permissions.ask_mode: pause` stops silently and waits. Pass `approvalId` for one record in full. This is a pure read: it never grants, denies, expires or compacts anything, so polling it is free of side effects. An approvals log that cannot be read is reported as UNKNOWN, never as an empty inbox.",
   inputSchema: z.object({
@@ -459,7 +473,7 @@ export const approvalStatus: RegisteredTool = buildTool({
       unknowns.add(
         "approvals",
         `parsed createdAt on ${filtered.undatedIds.length} record(s)`,
-        `these records carry an unparseable createdAt and could not be placed in the requested time window, so they were KEPT rather than dropped: ${filtered.undatedIds.slice(0, 10).join(", ")}`,
+        `these records carry a createdAt that is not an ISO-8601 instant with an offset (a time without one is not placed in the host's zone) and could not be placed in the requested time window, so they were KEPT rather than dropped: ${filtered.undatedIds.slice(0, 10).join(", ")}`,
       );
     }
     const ordered = orderApprovals(filtered.kept, listing.value.order);
@@ -730,7 +744,7 @@ export const approvalsInbox: RegisteredTool = buildTool({
       unknowns.add(
         "approvals",
         `parsed createdAt on ${undatedIds.length} record(s)`,
-        `these records carry an unparseable createdAt and could not be placed in the requested time window, so they were KEPT rather than dropped: ${undatedIds.slice(0, 10).join(", ")}`,
+        `these records carry a createdAt that is not an ISO-8601 instant with an offset (a time without one is not placed in the host's zone) and could not be placed in the requested time window, so they were KEPT rather than dropped: ${undatedIds.slice(0, 10).join(", ")}`,
       );
     }
 
@@ -758,76 +772,55 @@ export const approvalsInbox: RegisteredTool = buildTool({
 });
 
 /**
- * Say out loud when a proposal is a BLANKET grant for a tool rather than a
- * grant for the call that was approved.
+ * Formerly: the `BLANKET GRANT` line for a proposal that covers the whole
+ * tool rather than the approved call. Since 0.7.1 `rankSuggestions` writes
+ * that line itself, for every reason a proposal can be bare (the tool
+ * declares no scoping argument, the calls varied, a value no rule can name),
+ * and this tool reports it from there. Its old wording also claimed no rule
+ * could constrain an undeclared tool, which was not true.
  *
- * `rankSuggestions` explains itself for one of the three ways that happens
- * ("inputs varied (N distinct)") and is silent about the other two, which are
- * the two a reviewer is most likely to be surprised by:
+ * Kept, returning nothing, so a caller written against 0.7.0 keeps compiling.
  *
- *   - THE APPROVED VALUE CONTAINS A PARENTHESIS. `patternFor` cannot represent
- *     it — the matcher's `Tool(arg)` split is not escape-aware — so it drops
- *     the argument constraint and proposes the bare tool. One approved
- *     `Bash(npm run build --workspace=(x))` therefore reads as "allow Bash".
- *   - THE TOOL HAS NO OPERATIVE-ARGUMENT FIELD. Every MCP tool and every
- *     custom tool is in this position: `OPERATIVE_ARG_FIELDS` has no entry, so
- *     no rule about it can constrain arguments at all, and the matcher would
- *     not check one if it did.
- *
- * Both are correct behaviour. Neither is obvious from the pattern, and the
- * whole value of a suggestion is that a human can see what they are agreeing
- * to, so each gets a line.
+ * @deprecated Always returns `[]`; read the suggestion's `evidence`.
  */
 export function blastRadiusNotes(
-  toolName: string,
-  argSamples: ReadonlyArray<string>,
-  argConstrained: boolean,
+  _toolName: string,
+  _argSamples: ReadonlyArray<string>,
+  _argConstrained: boolean,
 ): string[] {
-  if (argConstrained) return [];
-  if (OPERATIVE_ARG_FIELDS[toolName] === undefined) {
-    return [
-      `BLANKET GRANT: "${toolName}" has no operative-argument field in the permission matcher's table, so no rule can constrain what it is called with — this covers every call of the tool, not the one that was approved`,
-    ];
-  }
-  if (argSamples.length === 1) {
-    return [
-      `BLANKET GRANT: the single approved input contains a parenthesis, which the Tool(arg) pattern grammar cannot escape, so the argument constraint was dropped — this covers every ${toolName} call, not that input`,
-    ];
-  }
   return [];
 }
 
 /**
- * Say out loud that an argument-constrained rule is still wider than the one
- * call it was derived from, whenever the tool has MORE THAN ONE operative field.
- *
- * `matchesPattern` collects the value of EVERY operative field the input
- * carries and accepts the call when ANY of them matches (`vals.some`) — the
- * shape of the #145 fix, which was about stopping a DECOY field outside the
- * table from authorising a call. The consequence for a suggestion is that
- * `Read(notes/a.md)` also covers `{ file_path: "notes/a.md", path: "/etc/shadow" }`:
- * the approved value sits in one alias, something else sits in the other, and
- * which of them the tool acts on is the tool's business, not the rule's. Four
- * built-ins are in this position — Read, Write, Edit and Grep.
- *
- * REFUSING IS NOT THE ANSWER. The refusal would fire for every argument-
- * constrained rule about those four tools, which is the package's main case,
- * and the aliases exist precisely because they are two spellings of one
- * argument. The matcher's rule is also the ENGINE's rule, so narrowing it is an
- * upstream change to `@crewhaus/tool-permission-matcher` with its own blast
- * radius — not something a suggestion tool may decide by proposing a different
- * pattern, because the grammar has no way to say "this field only".
- *
- * So it is disclosed, like the blanket grants above: the human approving the
- * rule is told what it actually covers.
+ * Which argument of a builtin decides where it acts, from the builtin
+ * manifest — the compiled bundle this runs in carries only the tools its spec
+ * granted, and a session log names tools it may not have. A tool the manifest
+ * does not describe (MCP, custom) is unknown here, and its proposals are bare.
  */
-export function aliasFieldNotes(toolName: string, argConstrained: boolean): string[] {
-  if (!argConstrained) return [];
-  const fields = OPERATIVE_ARG_FIELDS[toolName];
-  if (fields === undefined || fields.length < 2) return [];
-  return [
-    `WIDER THAN THE APPROVED CALL: the permission matcher accepts this argument in ANY of ${toolName}'s operative fields (${fields.join(", ")}), so the rule also covers a call that puts the approved value in one of them and an unapproved value in another`,
-  ];
+const builtinLookup: SuggestToolLookup = (toolName) => {
+  const row = TOOL_FLAGS_BY_NAME.get(toolName);
+  if (row === undefined) return undefined;
+  return row.operativeArgs !== undefined
+    ? { operativeArgs: row.operativeArgs as ReadonlyArray<OperativeArg> }
+    : {};
+};
+
+/**
+ * Formerly: say out loud that an argument-constrained rule for a tool with
+ * more than one operative field (Read, Write, Edit, Grep) was wider than the
+ * call it came from, because the matcher accepted the argument in ANY of the
+ * fields — so `Read(notes/a.md)` also covered
+ * `{ file_path: "notes/a.md", path: "/etc/shadow" }`.
+ *
+ * Since 0.7.1 an allow rule needs EVERY operative value of the call to match,
+ * and the file tools declare the one field they read, so that call is not
+ * covered and there is nothing to disclose. Kept, returning nothing, so a
+ * caller written against 0.7.0 keeps compiling.
+ *
+ * @deprecated Always returns `[]`.
+ */
+export function aliasFieldNotes(_toolName: string, _argConstrained: boolean): string[] {
+  return [];
 }
 
 /** An inbox row back in record shape, so the SAME ordering code runs over the
@@ -863,6 +856,7 @@ function rowAsRecord(row: InboxRow): ApprovalRecord & { readonly harness: string
 
 export const permissionsSuggest: RegisteredTool = buildTool({
   name: "PermissionsSuggest",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Mine a harness's own ask/deny history into permission rules that would stop the re-asking, each verified to match ONLY the call it was derived from. Recurring asks a human always approved become an `alwaysAllow` proposal; recurring DENIED asks become an `alwaysAsk` tightening, never a blanket deny. This tool PROPOSES and writes nothing — applying a rule is `crewhaus permissions suggest --apply`, which is always an interactive human confirm, because an agent must never widen its own permissions. Rules built from observed values are glob-escaped and then checked against the real permission matcher; any rule that would also match a value the human never approved is refused and reported in `rejected`, not suggested.",
   inputSchema: z.object({
@@ -880,7 +874,7 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       .array(z.string())
       .optional()
       .describe(
-        "tool names known to be read-only, e.g. from ToolInventory. A CALLER'S CLAIM, never verified here; omitted, read-only-ness is reported as unknown and no suggestion claims it",
+        "names of NON-builtin tools (MCP, custom) known to be read-only. A CALLER'S CLAIM, never verified here. A builtin's own flag is always used instead; a tool that is neither is reported as unknown",
       ),
     minAsks: z
       .number()
@@ -953,18 +947,17 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       );
     }
 
-    const aggregates = aggregateAsks(read.sessions);
-    const readOnlyKnown = input.readOnlyTools !== undefined;
-    const readOnly = new Map<string, boolean>(
-      (input.readOnlyTools ?? []).map((name) => [name, true] as const),
-    );
-    if (!readOnlyKnown) {
-      unknowns.add(
-        "suggestions[].readOnly",
-        "no readOnlyTools were supplied",
-        "read-only-ness is a property of the TOOL REGISTRY, which is in the compiled bundle and not in any log this tool reads; pass readOnlyTools (e.g. from ToolInventory) to have grants ranked lowest-blast-radius first",
-      );
+    const aggregates = aggregateAsks(read.sessions, builtinLookup);
+    // A builtin's read-only flag is known from the manifest; anything else
+    // only from the caller's claim, and otherwise not at all.
+    const claimed = input.readOnlyTools;
+    const readOnly = new Map<string, boolean>();
+    for (const name of aggregates.keys()) {
+      const row = TOOL_FLAGS_BY_NAME.get(name);
+      if (row !== undefined) readOnly.set(name, row.readOnly);
+      else if (claimed !== undefined) readOnly.set(name, claimed.includes(name));
     }
+    const readOnlyKnown = (name: string): boolean => readOnly.has(name);
 
     const thresholds = {
       minAsks: input.minAsks ?? DEFAULT_SUGGEST_THRESHOLDS.minAsks,
@@ -972,6 +965,16 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       denyRate: input.denyRate ?? DEFAULT_SUGGEST_THRESHOLDS.denyRate,
     };
     const ranked = rankSuggestions(aggregates, readOnly, thresholds);
+    const unknownReadOnly = [
+      ...new Set(ranked.map((r) => r.toolName).filter((n) => !readOnlyKnown(n))),
+    ].sort(compareStrings);
+    if (unknownReadOnly.length > 0) {
+      unknowns.add(
+        "suggestions[].readOnly",
+        "looked each suggested tool up among the builtins",
+        `${unknownReadOnly.slice(0, 5).join(", ")} ${unknownReadOnly.length === 1 ? "is not a builtin" : "are not builtins"}, so whether ${unknownReadOnly.length === 1 ? "it is" : "they are"} read-only is not known here; pass readOnlyTools to say so`,
+      );
+    }
 
     // ---- the security gate -------------------------------------------------
     // Every proposal is checked against the real matcher before it is named.
@@ -981,16 +984,17 @@ export const permissionsSuggest: RegisteredTool = buildTool({
     const verifiedJson: Array<Record<string, unknown>> = [];
     for (const suggestion of ranked) {
       const agg = aggregates.get(suggestion.toolName);
-      // The value `patternFor` embeds is the single recurring operative-arg
-      // sample, and only when the tool HAS an operative field. Anything else
-      // yields a bare tool glob with no argument to verify.
-      const embedded =
-        agg !== undefined &&
-        agg.argSamples.length === 1 &&
-        OPERATIVE_ARG_FIELDS[suggestion.toolName] !== undefined
-          ? agg.argSamples[0]
-          : undefined;
-      const verdict = verifyRule(suggestion.rule.pattern, suggestion.toolName, embedded);
+      // The value `patternFor` embeds is the single place every recorded call
+      // acted on, and only when there is one. Anything else yields a bare tool
+      // glob with no argument to verify.
+      const scoped = agg !== undefined && isArgScoped(agg);
+      const embedded = scoped ? agg.argSamples[0] : undefined;
+      const verdict = verifyRule(
+        suggestion.rule.pattern,
+        suggestion.toolName,
+        embedded,
+        scoped ? agg.argKind : undefined,
+      );
       if (!verdict.ok) {
         rejected.push({
           toolName: suggestion.toolName,
@@ -1001,21 +1005,17 @@ export const permissionsSuggest: RegisteredTool = buildTool({
         continue;
       }
       verified.push(suggestion);
-      const notes = [
-        ...blastRadiusNotes(suggestion.toolName, agg?.argSamples ?? [], verdict.argConstrained),
-        ...aliasFieldNotes(suggestion.toolName, verdict.argConstrained),
-        ...(readOnlyKnown
-          ? []
-          : [
-              "read-only-ness was NOT supplied for this call, so any line above calling this tool not-read-only is the fail-closed default rather than an observation",
-            ]),
-      ];
+      const notes = readOnlyKnown(suggestion.toolName)
+        ? []
+        : [
+            "whether this tool is read-only is not known here, so any line above calling it not-read-only is the fail-closed default rather than an observation",
+          ];
       verifiedJson.push({
         type: suggestion.rule.type,
         pattern: suggestion.rule.pattern,
         reason: suggestion.reason,
         toolName: suggestion.toolName,
-        readOnly: readOnlyKnown ? suggestion.readOnly : null,
+        readOnly: readOnlyKnown(suggestion.toolName) ? suggestion.readOnly : null,
         weight: suggestion.weight,
         // The single fact that separates "allow this one call" from "allow this
         // tool for anything": whether the rule constrains an argument at all.

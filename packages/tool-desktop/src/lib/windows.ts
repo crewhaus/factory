@@ -105,9 +105,12 @@ export const WINDOWS_WINDOW_LIST = registerPowerShellScript({
   // window per process and no geometry; real bounds need EnumWindows +
   // GetWindowRect through a P/Invoke shim, which is a compile step this
   // package will not take (house rule 8). So the Windows rows report bounds
-  // as UNKNOWN rather than as zeros, and say why.
+  // as UNKNOWN rather than as zeros, and say why. Focus too: the 0.7.0 script
+  // printed a literal `false` for every window, a definite "nothing has
+  // focus" from a probe that never asked (GetForegroundWindow is the same
+  // P/Invoke step), so focused is `?` → null like the bounds.
   script:
-    "$fs = [char]31; $rs = [char]30; Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [Console]::Out.Write($_.ProcessName + $fs + $_.MainWindowTitle + $fs + '?' + $fs + '?' + $fs + '?' + $fs + '?' + $fs + 'false' + $fs + '?' + $rs) }",
+    "$fs = [char]31; $rs = [char]30; Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [Console]::Out.Write($_.ProcessName + $fs + $_.MainWindowTitle + $fs + '?' + $fs + '?' + $fs + '?' + $fs + '?' + $fs + '?' + $fs + '?' + $rs) }",
   reads: [],
 });
 

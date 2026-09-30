@@ -31,6 +31,12 @@ export type EvalSampleView = {
   readonly abstained?: boolean;
   /** The invoker failed, so the sample never produced an answer to grade. */
   readonly errored?: boolean;
+  /**
+   * The document gave this sample no `sampleId`; `sampleId` is a positional
+   * placeholder (`<sample 3>`) for messages, and is never matched against
+   * the other run: two runs' third samples need not be the same question.
+   */
+  readonly anonymous?: boolean;
 };
 
 export type EvalRunView = {
@@ -97,7 +103,8 @@ export function readEvalRun(doc: unknown, label: string): ReadEvalRunResult {
   for (const [i, raw] of rawSamples.entries()) {
     const sample = asRecord(raw);
     if (sample === undefined) continue;
-    const sampleId = asString(sample["sampleId"]) ?? `<sample ${i}>`;
+    const realId = asString(sample["sampleId"]);
+    const sampleId = realId ?? `<sample ${i}>`;
     const overall = asRecord(asRecord(sample["grades"])?.["overall"]);
     const passed = overall?.["passed"] === true;
     const score = asNumber(overall?.["score"]) ?? 0;
@@ -107,6 +114,7 @@ export function readEvalRun(doc: unknown, label: string): ReadEvalRunResult {
       score,
       ...(overall?.["abstained"] === true ? { abstained: true } : {}),
       ...(asString(sample["error"]) !== undefined ? { errored: true } : {}),
+      ...(realId === undefined ? { anonymous: true } : {}),
     });
   }
   if (samples.length === 0) {
@@ -115,6 +123,7 @@ export function readEvalRun(doc: unknown, label: string): ReadEvalRunResult {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
   for (const sample of samples) {
+    if (sample.anonymous === true) continue;
     if (seen.has(sample.sampleId)) duplicates.add(sample.sampleId);
     seen.add(sample.sampleId);
   }
@@ -177,6 +186,16 @@ export type EvalGateThresholds = {
   readonly maxRegressions?: number;
   /** Verdict-preserving score moves smaller than this are not reported. */
   readonly scoreEpsilon?: number;
+  /**
+   * Let two runs that NAME different datasets be gated against each other.
+   * Off by default: their scores are not comparable, so the gate fails.
+   */
+  readonly allowDatasetMismatch?: boolean;
+  /**
+   * The share of the baseline's samples the candidate must also have run
+   * (0..1). Unset: any overlap will do, but none at all still fails.
+   */
+  readonly minSharedFraction?: number;
 };
 
 export type EvalGateResult = {
@@ -207,10 +226,44 @@ export type EvalGateResult = {
     readonly maxPassRateDrop: number;
     readonly maxRegressions: number;
     readonly scoreEpsilon: number;
+    readonly allowDatasetMismatch?: boolean;
+    readonly minSharedFraction?: number;
   };
   /** Set when either side's pass rate had to be recomputed from samples. */
   readonly notes: readonly string[];
 };
+
+/**
+ * `<name>@<version>[#split]` — how `crewhaus eval` records a registry
+ * dataset in a run (dataset-ops' `registryDatasetName`). A registry name
+ * and version never contain `@` or `#`, so the split is unambiguous; each
+ * class is disjoint from the delimiter after it, so a match is linear.
+ */
+const REGISTRY_DATASET_RE = /^([^@#]+)@([^@#]+)(?:#([^@#]+))?$/;
+
+/**
+ * The suffix `crewhaus eval` appends when a pinned regression suite added
+ * samples to the run: `<primary>+regressions@<suite version>`
+ * (apps/cli regression-pin). The suite is on by default after
+ * `crewhaus optimize`, so a baseline and a candidate routinely differ in it.
+ */
+const REGRESSION_UNION = "+regressions@";
+
+/**
+ * The dataset a run names, without its registry version or split, and
+ * without the regression-suite union `crewhaus eval` records
+ * (`golden@v3#dev+regressions@v2` is `golden`). Linear: one search from the
+ * end and one anchored match.
+ */
+export function datasetBaseName(name: string): string {
+  const union = name.lastIndexOf(REGRESSION_UNION);
+  const primary =
+    union > 0 && !/[@#+]/.test(name.slice(union + REGRESSION_UNION.length))
+      ? name.slice(0, union)
+      : name;
+  const match = REGISTRY_DATASET_RE.exec(primary);
+  return match === null ? primary : (match[1] as string);
+}
 
 /** Round to 6 decimals so a float artefact never shows up as a "change". */
 function round(n: number): number {
@@ -227,6 +280,20 @@ function round(n: number): number {
  * INCONCLUSIVE and still counted in the pass rate (that is what the runner's
  * own aggregate does) — the list exists so a gate failure caused by judge
  * noise is visible as such.
+ *
+ * A comparison that never happened is not a pass (0.7.1, security-5#5): two
+ * runs that share no sample ids, or that both name a dataset and name
+ * different ones, FAIL the gate with a reason, because a candidate whose pass
+ * rate merely matches a baseline measured on something else has not been
+ * shown to hold the line. Another version or split of the same registry
+ * dataset (`golden@v3` → `golden@v4`, `golden@v3#dev`), or the same dataset
+ * with a regression suite unioned in (`golden@v3+regressions@v1`), is the
+ * same dataset: it is noted, and the shared-sample rules above decide. A
+ * sample the document gives no `sampleId` is never matched by position: it
+ * counts in its run's pass rate, and it is named in a note, or in the reason
+ * when no sample could be matched at all. The verdict stays
+ * `pass | fail`: a third value would be read as "not fail" by every caller
+ * written `verdict === "fail"`.
  */
 export function compareEvalRuns(
   baseline: EvalRunView,
@@ -237,8 +304,15 @@ export function compareEvalRuns(
   const maxRegressions = thresholds.maxRegressions ?? 0;
   const scoreEpsilon = thresholds.scoreEpsilon ?? DEFAULT_SCORE_EPSILON;
 
-  const baseById = new Map(baseline.samples.map((s) => [s.sampleId, s]));
-  const candById = new Map(candidate.samples.map((s) => [s.sampleId, s]));
+  // A sample with no id of its own is never matched: pairing two runs'
+  // samples by POSITION compares whatever happens to sit at the same index.
+  const named = (run: EvalRunView) => run.samples.filter((s) => s.anonymous !== true);
+  const baseById = new Map(named(baseline).map((s) => [s.sampleId, s]));
+  const candById = new Map(named(candidate).map((s) => [s.sampleId, s]));
+  const anonymous = {
+    baseline: baseline.samples.length - named(baseline).length,
+    candidate: candidate.samples.length - named(candidate).length,
+  };
 
   const regressions: SampleDelta[] = [];
   const recoveries: SampleDelta[] = [];
@@ -284,8 +358,44 @@ export function compareEvalRuns(
       `pass rate ${round(candidate.passRate)} is below the declared floor ${thresholds.minPassRate}`,
     );
   }
+  const unnamed =
+    anonymous.baseline + anonymous.candidate > 0
+      ? `samples without a sampleId (${[
+          anonymous.baseline > 0 ? `${anonymous.baseline} in the baseline` : "",
+          anonymous.candidate > 0 ? `${anonymous.candidate} in the candidate` : "",
+        ]
+          .filter((part) => part !== "")
+          .join(" and ")}) are never matched by position`
+      : undefined;
+  if (shared === 0) {
+    reasons.push(
+      unnamed !== undefined
+        ? `the two runs share no sample ids — ${unnamed}, so nothing was compared sample by sample and the candidate cannot be shown to hold the line`
+        : "the two runs share no sample ids — nothing was compared sample by sample, so the candidate cannot be shown to hold the line (a smoke run, a different dataset, or re-keyed sample ids)",
+    );
+  } else if (
+    thresholds.minSharedFraction !== undefined &&
+    baseById.size > 0 &&
+    shared / baseById.size < thresholds.minSharedFraction
+  ) {
+    reasons.push(
+      `the candidate ran ${shared} of the baseline's ${baseById.size} samples (${round(shared / baseById.size)}), below the required share ${thresholds.minSharedFraction}`,
+    );
+  }
+  const datasetsDiffer =
+    baseline.datasetName !== undefined &&
+    candidate.datasetName !== undefined &&
+    datasetBaseName(baseline.datasetName) !== datasetBaseName(candidate.datasetName);
+  if (datasetsDiffer && thresholds.allowDatasetMismatch !== true) {
+    reasons.push(
+      `the runs name different datasets (${baseline.datasetName} vs ${candidate.datasetName}) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway`,
+    );
+  }
 
   const notes: string[] = [];
+  if (shared > 0 && unnamed !== undefined) {
+    notes.push(`${unnamed}: they were not compared one by one, but they count in the pass rates`);
+  }
   for (const [label, run] of [
     ["baseline", baseline],
     ["candidate", candidate],
@@ -314,11 +424,10 @@ export function compareEvalRuns(
   }
   if (baseline.datasetName !== candidate.datasetName) {
     notes.push(
-      `the two runs name different datasets (${baseline.datasetName ?? "unknown"} vs ${candidate.datasetName ?? "unknown"}) — scores from different datasets are not comparable`,
+      baseline.datasetName !== undefined && candidate.datasetName !== undefined && !datasetsDiffer
+        ? `the two runs use different versions or splits of one dataset, or a different regression-suite union of it (${baseline.datasetName} vs ${candidate.datasetName}) — only the samples they share were compared one by one, and the pass rates cover different sample sets`
+        : `the two runs name different datasets (${baseline.datasetName ?? "unknown"} vs ${candidate.datasetName ?? "unknown"}) — scores from different datasets are not comparable`,
     );
-  }
-  if (shared === 0) {
-    notes.push("the two runs share no sample ids, so no per-sample comparison was possible");
   }
 
   return {
@@ -348,6 +457,12 @@ export function compareEvalRuns(
       maxPassRateDrop,
       maxRegressions,
       scoreEpsilon,
+      ...(thresholds.allowDatasetMismatch !== undefined
+        ? { allowDatasetMismatch: thresholds.allowDatasetMismatch }
+        : {}),
+      ...(thresholds.minSharedFraction !== undefined
+        ? { minSharedFraction: thresholds.minSharedFraction }
+        : {}),
     },
     notes,
   };

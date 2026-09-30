@@ -5,8 +5,12 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../tool-safety" },
     {
       "path": "../errors"
+    },
+    {
+      "path": "../egress-classifier"
     },
     {
       "path": "../tool-builder"

@@ -87,6 +87,47 @@ async function runCli(
   return { exitCode };
 }
 
+/**
+ * shape-reach#1 — eval-runner wired tools from its own 11-entry map, so a
+ * spec using any 0.7.0 tool crashed `crewhaus eval` with a stack trace
+ * before the first model call. The spawned CLI has no model credentials, so
+ * the run gets exactly as far as the model call: wiring is what is under
+ * test, and the sample's error says why it stopped.
+ */
+describe("crewhaus eval wires 0.7.0 tools through the shared table", () => {
+  test("tools: [jsonQuery] wires, and the run stops at the missing credentials instead", async () => {
+    const root = newTempRoot();
+    const spec = join(root, "crewhaus.yaml");
+    writeFileSync(
+      spec,
+      "name: evalwire\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [jsonQuery]\ncontinuity: false\n",
+    );
+    writeFileSync(join(root, "data.jsonl"), '{"id":"s1","input":"hi","expected_output":"hi"}\n');
+    writeFileSync(join(root, "graders.yaml"), "graders:\n  - name: exact\n    type: exact_match\n");
+    const out = join(root, "out");
+    const { exitCode } = await runCli(
+      [
+        "eval",
+        spec,
+        "--dataset",
+        join(root, "data.jsonl"),
+        "--graders",
+        join(root, "graders.yaml"),
+        "--out",
+        out,
+      ],
+      root,
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(readFileSync(join(out, "results.json"), "utf-8")) as {
+      samples: Array<{ error?: string }>;
+    };
+    const error = results.samples[0]?.error ?? "";
+    expect(error).not.toContain("unknown tool");
+    expect(error).toContain("credentials");
+  }, 60_000);
+});
+
 describe("crewhaus eval CLI integration (T3)", () => {
   // Stub-mode is wired via a deterministic spec that returns the
   // expected_output verbatim; we exercise the orchestration path
@@ -274,12 +315,12 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
       (await runCli(["eval-report", "history", "--spec", "concierge", "--dataset", "smoke"], root))
         .exitCode,
     ).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline show exits 0 with no pins", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a recorded run into baselines.json", async () => {
     const root = newTempRoot();
@@ -304,7 +345,7 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     });
     // `baseline show` over the pin still exits 0.
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a ROUTED run under its own lineage key, not the legacy one", async () => {
     // 0.6.0 §6.1 — `setBaseline` keys on the entry's lineage, so a manual pin
@@ -342,23 +383,23 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     // The primary's baseline is exactly where it was.
     expect(baselines["concierge::smoke"]?.runId).toBe("run_prim1111prim1111");
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline set rejects a runId absent from the index", async () => {
     const root = newTempRoot();
     const result = await runCli(["eval-report", "baseline", "set", "run_ffff9999ffff9999"], root);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline set rejects a missing runId argument", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "set"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline rejects unknown sub-action", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "bogus"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", () => {

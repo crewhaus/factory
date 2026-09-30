@@ -263,6 +263,12 @@ function renderReadme(
       body: "Drop this directory under `~/.claude/plugins/` or your project's `.claude/plugins/`.",
     },
     includeWorkspaceNote: false,
+    // A Claude Code plugin carries instructions, MCP servers and assets — not
+    // CrewHaus's builtin tools; Claude Code supplies its own.
+    unwiredTools: {
+      names: "all",
+      note: "not carried — a Claude Code plugin ships no CrewHaus tools; Claude Code uses its own",
+    },
     extraSections: [
       ...(assetsSection !== undefined ? [assetsSection] : []),
       {

@@ -228,18 +228,140 @@ export function deepEqual(a: unknown, b: unknown): boolean {
   return false;
 }
 
-/** A single-line, length-capped rendering of a value, for error messages. */
-export function preview(value: unknown, maxChars = 120): string {
-  let text: string;
-  if (value === undefined) {
-    text = "undefined";
-  } else {
-    try {
-      text = JSON.stringify(value) ?? String(value);
-    } catch {
-      text = String(value);
+/** Thrown by `jsonPrefix` for a value JSON.stringify would treat specially. */
+class NotPlainJson extends Error {}
+
+/**
+ * The first `cap` characters of `JSON.stringify(value)`, built without
+ * serializing the rest: a 2 MB string or a 100,000-key object costs what the
+ * prefix costs. `cut` is true when the text stops short of the whole.
+ * Throws NotPlainJson for anything but plain JSON data (a `toJSON` method, a
+ * class instance, a BigInt), which the caller serializes the old way.
+ */
+function jsonPrefix(value: unknown, cap: number): { text: string; cut: boolean } {
+  const parts: string[] = [];
+  let length = 0;
+  let cut = false;
+  const push = (piece: string): boolean => {
+    if (length + piece.length > cap) {
+      parts.push(piece.slice(0, cap - length));
+      length = cap;
+      cut = true;
+      return false;
     }
+    parts.push(piece);
+    length += piece.length;
+    return true;
+  };
+  // A string is escaped from a slice no longer than the room left, so its
+  // cost is the room, not its length.
+  const pushString = (text: string): boolean => {
+    const room = cap - length;
+    if (text.length <= room) return push(JSON.stringify(text));
+    push(JSON.stringify(text.slice(0, room)).slice(0, -1));
+    cut = true;
+    return false;
+  };
+  const emit = (item: unknown): boolean => {
+    if (item === null) return push("null");
+    switch (typeof item) {
+      case "string":
+        return pushString(item);
+      case "number":
+        return push(Number.isFinite(item) ? JSON.stringify(item) : "null");
+      case "boolean":
+        return push(item ? "true" : "false");
+      case "undefined":
+      case "function":
+      case "symbol":
+        // Reached only inside an array; an object property skips these.
+        return push("null");
+      case "object": {
+        if (typeof (item as { toJSON?: unknown }).toJSON === "function") throw new NotPlainJson();
+        if (Array.isArray(item)) {
+          if (!push("[")) return false;
+          for (let i = 0; i < item.length; i++) {
+            if (i > 0 && !push(",")) return false;
+            if (!emit(item[i])) return false;
+          }
+          return push("]");
+        }
+        const proto = Object.getPrototypeOf(item);
+        if (proto !== Object.prototype && proto !== null) throw new NotPlainJson();
+        if (!push("{")) return false;
+        let first = true;
+        // `for...in` with an own check, not Object.keys: it stops when the
+        // prefix is full instead of listing every key first.
+        for (const key in item) {
+          if (!Object.hasOwn(item, key)) continue;
+          const member = (item as Record<string, unknown>)[key];
+          if (member === undefined || typeof member === "function" || typeof member === "symbol") {
+            continue;
+          }
+          if (!first && !push(",")) return false;
+          first = false;
+          if (!pushString(key) || !push(":")) return false;
+          if (!emit(member)) return false;
+        }
+        return push("}");
+      }
+      default:
+        throw new NotPlainJson();
+    }
+  };
+  emit(value);
+  return { text: parts.join(""), cut };
+}
+
+/**
+ * A single-line, length-capped rendering of a value, for error messages.
+ *
+ * It reads only as much of the value as the rendering can show: a validator
+ * previews the failing value once per failed check, and serializing the
+ * whole of a 2 MB value to keep 60 characters of it made each check cost
+ * the value's size (a 794-character schema took 81 s). A run of whitespace
+ * folds to one space, so up to eight times `maxChars` is read before the
+ * rendering is called cut. Listing an object's keys costs all of them in
+ * this engine however few are shown, so a caller that previews the same
+ * objects many times (the validator) passes a cache that lives as long as
+ * its walk.
+ */
+export function preview(value: unknown, maxChars = 120, cache?: PreviewCache): string {
+  const limit = Math.max(0, maxChars);
+  if (cache === undefined || value === null || typeof value !== "object") {
+    return renderPreview(value, limit);
   }
-  text = text.replace(/\s+/g, " ");
-  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+  let byLimit = cache.get(value);
+  if (byLimit === undefined) {
+    byLimit = new Map();
+    cache.set(value, byLimit);
+  }
+  let text = byLimit.get(limit);
+  if (text === undefined) {
+    text = renderPreview(value, limit);
+    byLimit.set(limit, text);
+  }
+  return text;
+}
+
+/** Renderings already made, by object and length; see `preview`. */
+export type PreviewCache = WeakMap<object, Map<number, string>>;
+
+function renderPreview(value: unknown, limit: number): string {
+  const clipped = (text: string, cut: boolean): string =>
+    !cut && text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 3))}...`;
+  if (value === undefined) return clipped("undefined", false);
+  try {
+    const { text, cut } = jsonPrefix(value, limit * 8 + 64);
+    return clipped(text.replace(/\s+/g, " "), cut);
+  } catch (err) {
+    if (!(err instanceof NotPlainJson) && !(err instanceof RangeError)) throw err;
+  }
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch {
+    text = String(value);
+  }
+  return clipped(text.replace(/\s+/g, " "), false);
 }

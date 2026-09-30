@@ -84,6 +84,12 @@ export const sendMessage: RegisteredTool = buildTool({
   description:
     'Send a message to a channel/thread/DM identified by a routing key (e.g. "slack:T123:C456:1700000000.000"). Permission-gated.',
   inputSchema: sendMessageSchema,
+  // A rule is about the routing key: `SendMessage(slack:T123:C456:*)` allows
+  // one channel. It is an `id`, not a `recipient`: the key only picks a
+  // conversation inside an adapter the operator configured, so the egress
+  // fabric keeps treating this as a configured sink (warn, not block) —
+  // blocking would stop a channel bot from replying with what it looked up.
+  operativeArgs: [{ field: "channel", kind: "id" }],
   destructive: true,
   // Pillar 3 sink-side: channel send is the textbook lateral-comm sink.
   // egress-classifier scans the `text` payload for cross-origin lineage.

@@ -8,7 +8,10 @@
     { "path": "../errors" },
     { "path": "../plugin-registry" },
     { "path": "../plugin-sdk" },
-    { "path": "../tool-builder" }
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-registry-manifest" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

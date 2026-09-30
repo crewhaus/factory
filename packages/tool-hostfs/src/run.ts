@@ -13,6 +13,11 @@
  *   - EVERY RUN HAS A DEADLINE. SIGTERM at the deadline, SIGKILL after a
  *     grace period, and a bounded drain so a child that forked a grandchild
  *     cannot hold the pipe open past its own death.
+ *   - OUTPUT IS CAPPED AS IT ARRIVES. tool-safety's `spawnBounded` keeps at
+ *     most the cap and drains the rest without storing it, so the child
+ *     never blocks on a full pipe and its exit code stays truthful. 0.7.0
+ *     read each pipe to EOF into memory and cut it afterwards, so memory
+ *     was bounded by the child's output, not by the cap (C163).
  *   - THE ENVIRONMENT IS PINNED. A child inherits `PATH` and a C locale and
  *     nothing else, so the harness's secrets are not in `mdfind`'s
  *     environment and a machine's locale cannot change a parsed message.
@@ -22,6 +27,8 @@
  * the real host — passes on the author's macOS and means something else
  * entirely on a Linux CI box.
  */
+import { constants as osConstants } from "node:os";
+import { spawnBounded } from "@crewhaus/tool-safety/streams";
 import { FALLBACK_PATH } from "./host";
 
 export type RunRequest = {
@@ -46,6 +53,14 @@ export type RunResult = {
    */
   readonly stdoutTruncated?: boolean;
   readonly stderrTruncated?: boolean;
+  /**
+   * The output could not be read to its end: the child exited but something
+   * it started kept the pipe open past the drain grace. What arrived is
+   * returned, and `stdoutTruncated` is set too, since the listing may be
+   * missing its tail. 0.7.0 replaced such output with "", a definite-looking
+   * empty answer built from nothing.
+   */
+  readonly outputIncomplete?: boolean;
 };
 
 /** Default cap per stream. A whole-volume `mdfind` can print megabytes. */
@@ -108,82 +123,46 @@ export async function runHostCommand(request: RunRequest): Promise<RunResult> {
   }
   if (runnerOverride !== undefined) return runnerOverride(request);
 
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn([...request.argv], {
-      // stdin is `ignore`, so a program that would read a terminal gets EOF
-      // immediately instead of blocking until the deadline.
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: childEnv(),
-      ...(request.signal !== undefined ? { signal: request.signal } : {}),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { code: 127, stdout: "", stderr: message, timedOut: false, missing: true };
+  const cap = request.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+  const run = await spawnBounded({
+    cmd: request.argv,
+    env: childEnv(),
+    timeoutMs: request.timeoutMs,
+    // A cap in characters, collected in bytes: no UTF-16 unit takes more
+    // than three bytes of UTF-8, so three bytes a character never cuts a
+    // listing the character cap would have kept.
+    maxStdoutBytes: cap * 3,
+    maxStderrBytes: cap * 3,
+    killGraceMs: KILL_GRACE_MS,
+    drainGraceMs: DRAIN_GRACE_MS,
+    ...(request.signal !== undefined ? { signal: request.signal } : {}),
+  });
+  if (run.spawnError !== undefined) {
+    return { code: 127, stdout: "", stderr: run.spawnError, timedOut: false, missing: true };
   }
+  const out = capText(run.stdout, cap);
+  const err = capText(run.stderr, cap);
+  const incomplete = !run.outputComplete;
+  return {
+    code: exitCodeOf(run.exitCode, run.signal),
+    stdout: out.text,
+    stderr: err.text,
+    timedOut: run.timedOut,
+    missing: false,
+    ...(out.truncated || run.stdoutTruncated || incomplete ? { stdoutTruncated: true } : {}),
+    ...(err.truncated || run.stderrTruncated ? { stderrTruncated: true } : {}),
+    ...(incomplete ? { outputIncomplete: true } : {}),
+  };
+}
 
-  let timedOut = false;
-  const term = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Already gone between the timer firing and the signal.
-    }
-  }, request.timeoutMs);
-  const hardKill = setTimeout(() => {
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }, request.timeoutMs + KILL_GRACE_MS);
-
-  try {
-    // `.catch` is attached HERE and not after the race below: the loser of
-    // the race stays pending, and a stream torn down with a killed process
-    // rejects with nobody listening — an unhandled rejection that takes down
-    // the harness rather than the command that caused it.
-    const stdoutText = new Response(proc.stdout as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const stderrText = new Response(proc.stderr as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const code = await proc.exited;
-    let drainTimer: ReturnType<typeof setTimeout> | undefined;
-    const drainFallback = new Promise<string>((resolve) => {
-      drainTimer = setTimeout(() => resolve(""), DRAIN_GRACE_MS);
-    });
-    try {
-      const [rawOut, rawErr] = await Promise.all([
-        Promise.race([stdoutText, drainFallback]),
-        Promise.race([stderrText, drainFallback]),
-      ]);
-      const cap = request.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
-      const out = capText(rawOut, cap);
-      const err = capText(rawErr, cap);
-      return {
-        code,
-        stdout: out.text,
-        stderr: err.text,
-        timedOut,
-        missing: false,
-        ...(out.truncated ? { stdoutTruncated: true } : {}),
-        ...(err.truncated ? { stderrTruncated: true } : {}),
-      };
-    } finally {
-      // One shared timer, cleared as soon as the race settles: a fresh
-      // `setTimeout` per stream that nobody cancels keeps the event loop
-      // awake for the full grace period after every spawn.
-      if (drainTimer !== undefined) clearTimeout(drainTimer);
-    }
-  } finally {
-    clearTimeout(term);
-    clearTimeout(hardKill);
-  }
+/** The code `Bun.spawn`'s `exited` gave: the exit status, or 128 + the signal's number. */
+function exitCodeOf(exitCode: number | null, signal: string | null): number {
+  if (exitCode !== null) return exitCode;
+  const number =
+    signal === null
+      ? undefined
+      : (osConstants.signals as Record<string, number | undefined>)[signal];
+  return number === undefined ? -1 : 128 + number;
 }
 
 /**

@@ -27,18 +27,16 @@ describe("cf-worker edge-safety tool policy", () => {
   });
 
   test("known network / KV builtins are edge-safe", () => {
-    for (const name of [
-      "fetch",
-      "webFetch",
-      "webSearch",
-      "sendMessage",
-      "imageGenerate",
-      "todoWrite",
-    ]) {
+    for (const name of ["fetch", "webFetch", "webSearch", "imageGenerate", "todoWrite"]) {
       const verdict = classifyEdgeTool(name);
       expect(verdict).toEqual({ safe: true, kind: "known" });
       expect(isEdgeSafeTool(name)).toBe(true);
     }
+  });
+
+  test("sendMessage is not an edge tool: a Worker registers no channel adapter for it", () => {
+    expect(EDGE_SAFE_TOOLS.has("sendMessage")).toBe(false);
+    expect(classifyEdgeTool("sendMessage")).not.toEqual({ safe: true, kind: "known" });
   });
 
   test("mcp__* tools are edge-safe (remote MCP over SSE/HTTP)", () => {

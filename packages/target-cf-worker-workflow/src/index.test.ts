@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IrWorkflowStep, IrWorkflowV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitCfWorkerWorkflow, resolveWorkflowTools } from "./index";
@@ -292,6 +292,14 @@ describe("resolveWorkflowTools — the cf-worker tool gate (G12/G83)", () => {
     expect(() => emitCfWorkerWorkflow(ir)).toThrow(/cf-worker target cannot run 1 host tool/);
   });
 
+  test("imports keep 0.7.0's bytes: a workflow worker sorts its tool imports", () => {
+    const wiring = resolveWorkflowTools([step({ tools: ["webSearch", "webFetch"] })]);
+    expect(wiring.imports).toBe(
+      'import { webFetch as __t_webFetch, webSearch as __t_webSearch } from "@crewhaus/tool-web";',
+    );
+    expect(wiring.stepTools).toEqual(["[__t_webSearch, __t_webFetch]"]);
+  });
+
   test("edge-safe tools wire per step; imports dedupe across steps", () => {
     const wiring = resolveWorkflowTools([
       step({ name: "a", tools: ["webSearch", "todoWrite"] }),
@@ -334,6 +342,15 @@ describe("emitCfWorkerWorkflow — package.json + gates", () => {
     // the runtime dep is present, but the injected typosquat is not.
     expect(parsed.dependencies["evil-typosquat"]).toBeUndefined();
     expect(parsed.dependencies["@crewhaus/worker-runtime"]).toBeDefined();
+  });
+
+  test("every @crewhaus dependency is pinned to the version this workspace publishes (0.7.1)", () => {
+    const ir: IrWorkflowV0 = { ...baseIr, steps: [step({ tools: ["webFetch", "todoWrite"] })] };
+    const { checked, stale } = stalePins(
+      emitCfWorkerWorkflow(ir).files.find((f) => f.path === "package.json")?.content ?? "",
+    );
+    expect(stale).toEqual([]);
+    expect(checked).toBe(3);
   });
 
   test("edge-safe tool packages are declared in package.json", () => {
@@ -533,3 +550,42 @@ describe("emitCfWorkerWorkflow — /chat SSE through the shared runtime", () => 
     expect(workerCode(withObs("json"))).toContain("trace: true");
   });
 });
+
+/**
+ * 0.7.1 — the version each workspace package would publish at, by name. The
+ * release train stamps them all in lockstep, so a pin that differs from these
+ * is a pin to some other release.
+ */
+function workspaceVersions(): Map<string, string> {
+  const root = join(import.meta.dir, "..", "..", "..");
+  const out = new Map<string, string>();
+  for (const entry of readdirSync(join(root, "packages"), { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    let manifest: { name?: unknown; version?: unknown };
+    try {
+      manifest = JSON.parse(
+        readFileSync(join(root, "packages", entry.name, "package.json"), "utf8"),
+      );
+    } catch {
+      continue;
+    }
+    if (typeof manifest.name === "string" && typeof manifest.version === "string") {
+      out.set(manifest.name, manifest.version);
+    }
+  }
+  return out;
+}
+
+/** Deps of an emitted package.json whose pin is not the workspace's version. */
+function stalePins(pkgJson: string): { checked: number; stale: string[] } {
+  const deps = (JSON.parse(pkgJson) as { dependencies: Record<string, string> }).dependencies;
+  const versions = workspaceVersions();
+  const stale: string[] = [];
+  let checked = 0;
+  for (const [name, pin] of Object.entries(deps)) {
+    if (!name.startsWith("@crewhaus/")) continue;
+    checked += 1;
+    if (pin !== versions.get(name)) stale.push(`${name}@${pin} (workspace: ${versions.get(name)})`);
+  }
+  return { checked, stale };
+}

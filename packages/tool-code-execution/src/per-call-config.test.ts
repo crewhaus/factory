@@ -6,7 +6,7 @@
  * process-global by design.
  */
 import { describe, expect, test } from "bun:test";
-import { resolveCallTimeoutMs } from "./index";
+import { resolveCallMaxTimeoutMs, resolveCallTimeoutMs } from "./index";
 
 describe("resolveCallTimeoutMs (per-call tool_config override)", () => {
   test("reads default_timeout_ms / defaultTimeoutMs off an object override", () => {
@@ -26,5 +26,20 @@ describe("resolveCallTimeoutMs (per-call tool_config override)", () => {
     expect(resolveCallTimeoutMs({ defaultTimeoutMs: Number.NaN })).toBeUndefined();
     // Sandbox-override keys are never read here (and the spec rejects them).
     expect(resolveCallTimeoutMs({ backend: "noop", images: { python: "x" } })).toBeUndefined();
+  });
+});
+
+describe("resolveCallMaxTimeoutMs (a candidate's own cap)", () => {
+  test("reads max_timeout_ms / maxTimeoutMs, and nothing else", () => {
+    expect(resolveCallMaxTimeoutMs({ max_timeout_ms: 2000 })).toBe(2000);
+    expect(resolveCallMaxTimeoutMs({ maxTimeoutMs: 3000 })).toBe(3000);
+    // Both spellings: the smaller holds, since a cap only narrows (C169).
+    expect(resolveCallMaxTimeoutMs({ maxTimeoutMs: 3000, max_timeout_ms: 9 })).toBe(9);
+    expect(resolveCallMaxTimeoutMs({ maxTimeoutMs: 9, max_timeout_ms: 3000 })).toBe(9);
+    // One spelling that cannot be read does not hide the other.
+    expect(resolveCallMaxTimeoutMs({ maxTimeoutMs: 0, max_timeout_ms: 3000 })).toBe(3000);
+    expect(resolveCallMaxTimeoutMs({ default_timeout_ms: 2000 })).toBeUndefined();
+    expect(resolveCallMaxTimeoutMs({ maxTimeoutMs: 0 })).toBeUndefined();
+    expect(resolveCallMaxTimeoutMs("2000")).toBeUndefined();
   });
 });

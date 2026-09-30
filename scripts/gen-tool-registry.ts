@@ -5,8 +5,9 @@
  * Why this has to be generated rather than written:
  *
  *   Nothing already in the tree lets a compiled bundle say "here is a tool
- *   you are not running, and this is what it does". `BUILTIN_TOOL_MAP`
- *   (packages/target-cli) carries a package and an export name and no prose.
+ *   you are not running, and this is what it does". The builtin table
+ *   (`BUILTIN_TOOLS` in packages/tool-categories) carries a package, an
+ *   export and a name, and no prose.
  *   `@crewhaus/tool-categories` is forbidden from importing a tool package,
  *   because the compiler imports it and codegen must stay offline, so it
  *   carries one title per CATEGORY and nothing per tool. The descriptions and
@@ -18,9 +19,9 @@
  * `scripts/gen-dockerfile-bodies.ts` bakes the Dockerfile bodies, and for the
  * same reason: one artifact every path can read identically.
  *
- * The KEY SET is derived from `BUILTIN_TOOL_MAP`, never hand-written. That is
- * what keeps this from becoming a sixth list to keep in sync — it is a
- * projection of the fifth. `apps/cli/src/tool-registry.test.ts` re-runs this
+ * The KEY SET is every builtin the cli shape compiles, read from the builtin
+ * table — never hand-written. That is what keeps this from becoming another
+ * list to keep in sync: it is a projection of the table. `apps/cli/src/tool-registry.test.ts` re-runs this
  * projection and fails when the checked-in data no longer matches, so adding
  * or reworded a builtin without re-running this script fails CI rather than
  * silently shipping a stale answer to "what am I missing".
@@ -33,13 +34,26 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CLI_RUNTIME_TOOL_KEYS, TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
-import { BUILTIN_TOOL_MAP } from "../packages/target-cli/src/index";
-import { categoriesForTool } from "../packages/tool-categories/src/index";
-import { projectRegistryEntry } from "../packages/tool-registry-manifest/src/types";
+import { runtimeToolNames } from "../apps/cli/src/runtime-tool-names";
+import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
+import {
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
+} from "../packages/memory-service/src/thredz";
+import {
+  BUILTIN_TOOLS,
+  builtinToolsFor,
+  categoriesForTool,
+} from "../packages/tool-categories/src/index";
+import {
+  type RegistryOperativeArg,
+  projectRegistryEntry,
+  projectToolFlags,
+} from "../packages/tool-registry-manifest/src/types";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(REPO_ROOT, "packages", "tool-registry-manifest", "src", "generated.ts");
+const FLAGS_OUT = join(REPO_ROOT, "packages", "tool-registry-manifest", "src", "flags.ts");
 
 /** The version stamped into the manifest: the `crewhaus` CLI's own. */
 const version = (
@@ -48,27 +62,18 @@ const version = (
   }
 ).version;
 
-const keys = Object.keys(BUILTIN_TOOL_MAP).sort();
+const keys = [...builtinToolsFor("cli")].sort();
 if (keys.length === 0)
-  throw new Error("BUILTIN_TOOL_MAP is empty — refusing to write an empty manifest");
+  throw new Error("the builtin table has no cli tools — refusing to write an empty manifest");
 
 // The generated file says MCP tools "cannot be added". Make that true of the
 // generator rather than only of the tests that read its output: nothing about
-// `Record<string, BuiltinToolEntry>` stops an `mcp__` key being put there, and
-// one such row would turn "this is the builtin set" into "this is the set".
+// the table's type stops an `mcp__` key being put there, and one such row
+// would turn "this is the builtin set" into "this is the set".
 const mcpKeys = keys.filter((k) => k.startsWith("mcp__"));
 if (mcpKeys.length > 0) {
   throw new Error(
-    `BUILTIN_TOOL_MAP has mcp__ keys, which this manifest cannot describe — a spec declares an MCP server, not its tools: ${mcpKeys.join(", ")}`,
-  );
-}
-
-// Both halves of the wiring, checked here rather than left to a later test:
-// this script's whole claim is that the manifest covers the builtin set.
-const onlyInRuntime = CLI_RUNTIME_TOOL_KEYS.filter((k) => !(k in BUILTIN_TOOL_MAP));
-if (onlyInRuntime.length > 0) {
-  throw new Error(
-    `these keys run but do not compile, so the manifest cannot describe them: ${onlyInRuntime.join(", ")}`,
+    `the builtin table has mcp__ keys, which this manifest cannot describe — a spec declares an MCP server, not its tools: ${mcpKeys.join(", ")}`,
   );
 }
 
@@ -81,12 +86,16 @@ type ToolLike = {
   readonly ioCapability?: string;
   readonly requiresSandbox: boolean;
   readonly requireJustification: boolean;
+  readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
 };
 
-const rows: string[] = [];
-for (const key of keys) {
-  const entry = BUILTIN_TOOL_MAP[key];
-  if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
+/** The manifest row of one builtin, read off the tool the table says exports it. */
+async function projectBuiltin(key: string): Promise<{
+  readonly tool: ToolLike;
+  readonly projected: ReturnType<typeof projectRegistryEntry>;
+}> {
+  const entry = BUILTIN_TOOLS[key];
+  if (entry === undefined) throw new Error(`no builtin table entry for ${key}`);
   // Workspace deps are linked per package, not hoisted to the root, so a
   // bare `@crewhaus/tool-fs` specifier does not resolve from `scripts/`.
   // Resolve to the checkout instead — the same module either way.
@@ -109,7 +118,29 @@ for (const key of keys) {
     package: entry.package,
     keywords: TOOL_KEYWORDS[key] ?? [],
   });
+  return { tool, projected };
+}
+
+const rows: string[] = [];
+const flagRows: string[] = [];
+const builtinNames = new Set<string>();
+for (const key of keys) {
+  const { tool, projected } = await projectBuiltin(key);
+  builtinNames.add(tool.name);
   rows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projected)},`);
+  flagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
+}
+
+// The builtins no cli bundle carries — the evm tools of the graph, workflow
+// and crew shapes, the channel shape's SendMessage — get flag rows of their
+// own, so a check of a spec of THOSE shapes (the compile --strict scope gate,
+// the rule checker) reads their real flags instead of skipping them.
+const cliKeys = new Set(keys);
+const nonCliFlagRows: string[] = [];
+for (const key of Object.keys(BUILTIN_TOOLS).sort()) {
+  if (cliKeys.has(key)) continue;
+  const { projected } = await projectBuiltin(key);
+  nonCliFlagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
 }
 
 writeFileSync(
@@ -146,9 +177,77 @@ ${rows.join("\n")}
 `,
 );
 
-// Biome formats this file like any other source file, so format it here
+writeFileSync(
+  FLAGS_OUT,
+  `// GENERATED by scripts/gen-tool-registry.ts — do not edit by hand.
+// The same projection as generated.ts, less the prose: see ToolFlags in
+// types.ts. apps/cli/src/tool-registry.test.ts checks the two agree.
+/**
+ * How every builtin tool is gated, as data: its spec key, its registered
+ * name, its safety flags and the field(s) a permission rule's argument
+ * pattern is about.
+ *
+ * Import it from \`@crewhaus/tool-registry-manifest/flags\`, which does not
+ * pull in the descriptions — a bundle that reasons about permissions does not
+ * need to carry every tool's prose.
+ */
+import type { ToolFlags } from "./types";
+
+export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+${flagRows.join("\n")}
+};
+
+/** {@link TOOL_FLAGS} keyed by registered name (\`HttpRequest\`) instead of spec key. */
+export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
+  Object.values(TOOL_FLAGS).map((flags) => [flags.name, flags]),
+);
+
+/**
+ * How the builtins that no cli bundle carries are gated: the evm tools of the
+ * graph, workflow and crew shapes, and the channel shape's SendMessage.
+ * {@link TOOL_FLAGS} mirrors the cli manifest (\`TOOL_REGISTRY\`, what
+ * \`crewhaus tools\` offers a cli spec), so these are kept apart; a check of a
+ * spec of another shape reads them from here rather than skip the tool.
+ */
+export const NON_CLI_TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+${nonCliFlagRows.join("\n")}
+};
+
+/**
+ * The other tools this release defines: ones the runtime registers without a
+ * spec listing them (\`Skill\`, \`ListTools\`, \`Task\`, the browser shape's
+ * \`Type\`, the memory and plan tools, \`Consult\`, …). Names only — how
+ * each is gated depends on how the runtime builds it. A permission rule
+ * naming one of these names a real tool, even though no builtin has the name.
+ *
+ * Read from the source by \`apps/cli/src/runtime-tool-names.ts\`, not written
+ * out; \`apps/cli/src/tool-registry.test.ts\` fails when it is stale.
+ */
+export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = ${JSON.stringify(runtimeToolNames(REPO_ROOT, builtinNames))};
+
+/**
+ * The bare names a \`thredz:\` block registers from the Thredz MCP server
+ * (\`goal_list\`, \`task_complete\`, \`wiki_space_create\`, …): \`memory\` always,
+ * \`messaging\` too when the block says \`messaging: true\`. A permission rule
+ * naming one of them is a real rule in a spec with that block, and a near
+ * miss of a builtin (\`goal_list\` of GoalList) in a spec without one.
+ *
+ * Copied from \`@crewhaus/memory-service\` (\`THREDZ_ALIAS_TOOL_NAMES\`,
+ * \`THREDZ_MESSAGING_TOOL_NAMES\`) so a bundle that checks rules need not
+ * import it; \`apps/cli/src/runtime-tool-names.test.ts\` fails when it is stale.
+ */
+export const THREDZ_TOOL_NAMES: {
+  readonly memory: ReadonlyArray<string>;
+  readonly messaging: ReadonlyArray<string>;
+} = ${JSON.stringify({ memory: [...THREDZ_ALIAS_TOOL_NAMES], messaging: [...THREDZ_MESSAGING_TOOL_NAMES] })};
+`,
+);
+
+// Biome formats these files like any other source file, so format them here
 // rather than leaving `bun run lint` to fail on a freshly generated tree.
-const fmt = Bun.spawnSync(["bunx", "biome", "format", "--write", OUT], { cwd: REPO_ROOT });
+const fmt = Bun.spawnSync(["bunx", "biome", "format", "--write", OUT, FLAGS_OUT], {
+  cwd: REPO_ROOT,
+});
 if (fmt.exitCode !== 0) {
   throw new Error(`biome format failed on ${OUT}: ${new TextDecoder().decode(fmt.stderr)}`);
 }

@@ -117,17 +117,36 @@ describe("emitCli — tool wiring (Section 2)", () => {
     expect(content).toContain('import { todoWrite } from "@crewhaus/tool-todo"');
   });
 
-  test("an unknown tool name throws TargetEmitError listing known names", () => {
+  test("an unknown tool name throws TargetEmitError naming it and the next step", () => {
     expect(() => emitCli(baseIr({ tools: ["unknownTool"] }))).toThrow(TargetEmitError);
     try {
       emitCli(baseIr({ tools: ["unknownTool"] }));
     } catch (e) {
       expect(e).toBeInstanceOf(TargetEmitError);
       expect((e as Error).message).toContain('unknown tool "unknownTool"');
-      expect((e as Error).message).toContain("known tools:");
-      // proves the error is helpful — names a real builtin
-      expect((e as Error).message).toContain("read");
+      // One next step, not a dump of every builtin's name.
+      expect((e as Error).message).toContain("crewhaus tools search");
+      expect((e as Error).message.length).toBeLessThan(300);
     }
+  });
+
+  test("a typo gets the nearest builtin as a hint", () => {
+    expect(() => emitCli(baseIr({ tools: ["raed"] }))).toThrow(
+      /unknown tool "raed" — Did you mean "read"/,
+    );
+  });
+
+  test("a capitalised name is pointed at its spec key", () => {
+    expect(() => emitCli(baseIr({ tools: ["Read"] }))).toThrow(
+      /unknown tool "Read" — write "read"/,
+    );
+  });
+
+  test("a 0.7.0 builtin compiles: its package is imported and registered", () => {
+    const code = emitCli(baseIr({ tools: ["jsonQuery", "gitStatus"] })).files[0]?.content ?? "";
+    expect(code).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(code).toContain('import { gitStatus } from "@crewhaus/tool-git";');
+    expect(code).toContain("defaultCatalog.register(jsonQuery);");
   });
 });
 
@@ -560,6 +579,89 @@ describe("emitCli — egress matcher (Pillar 3 sink-side, FR-006)", () => {
     expect(tryIdx).toBeGreaterThan(constructIdx);
     // And the field is still threaded into the (wrapped) runChatLoop options.
     expect(content).toContain("egressMatcher: __egressMatcher");
+  });
+});
+
+describe("emitCli — security.justification (0.7.1: the bundle wires the judge the spec names)", () => {
+  const agentOf = (ir: IrV0): string => emitCli(ir).files[0]?.content ?? "";
+
+  test("no justification block → the bundle is byte-identical to one with no security block", () => {
+    const bare = agentOf(baseIr());
+    expect(bare).not.toContain("justification");
+    expect(bare).not.toContain("audit");
+    // A security block that names only the egress matcher's default is still
+    // the bare bundle: only a justification block adds the gate's wiring.
+    expect(agentOf(baseIr({ security: { egressMatcher: "substring" } }))).toBe(bare);
+  });
+
+  test("judge: claude builds the named judge through the shared construction and threads it", () => {
+    const content = agentOf(
+      baseIr({
+        security: {
+          justification: {
+            judge: "claude",
+            model: "claude-sonnet-4-6",
+            modelProfile: "checker",
+            params: { maxTokens: 512, thinking: { effort: "low" } },
+          },
+        },
+      }),
+    );
+    expect(content).toContain(
+      'import { createJustificationJudgeFromSlot } from "@crewhaus/justification-judge-claude";',
+    );
+    // The lowered slot, as data: judge, model and the profile's params — not
+    // the provenance label, which the construction does not read.
+    expect(content).toContain(
+      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude","model":"claude-sonnet-4-6","params":{"maxTokens":512,"thinking":{"effort":"low"}}}).catch(',
+    );
+    expect(content).toContain(
+      "...(__justificationJudge !== undefined ? { justificationJudge: __justificationJudge } : {}),",
+    );
+  });
+
+  test("any justification block opens the run path's audit log and hands it to both gates", () => {
+    for (const judge of ["claude", "rule-based"] as const) {
+      const content = agentOf(baseIr({ security: { justification: { judge } } }));
+      expect(content).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
+      expect(content).toContain(
+        'const __securityAuditDir = __joinPath(__cwd, ".crewhaus", "audit");',
+      );
+      // One that cannot be opened is reported and skipped, never a raw stack.
+      expect(content).toContain(
+        "await openAuditLog({ rootDir: __securityAuditDir }).catch((__err: unknown) => {",
+      );
+      expect(content).toContain("crewhaus: running without the security audit log:");
+      expect(content).toContain('process.env["CREWHAUS_SECURITY_AUDIT"] === "0"');
+      expect(content).toContain(
+        "? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }",
+      );
+    }
+  });
+
+  test("judge: rule-based constructs no judge: runtime-core's default is that judge", () => {
+    const content = agentOf(baseIr({ security: { justification: { judge: "rule-based" } } }));
+    expect(content).not.toContain("@crewhaus/justification-judge-claude");
+    expect(content).not.toContain("justificationJudge:");
+  });
+
+  test("the judge and the log exist after __cwd and before runChatLoop, MCP wrapper or not", () => {
+    for (const mcp_servers of [
+      {},
+      { things: { transport: "stdio" as const, command: "node", args: ["server.js"] } },
+    ]) {
+      const content = agentOf(
+        baseIr({ security: { justification: { judge: "claude" } }, mcp_servers }),
+      );
+      const cwd = content.indexOf("const __cwd = process.cwd();");
+      const judge = content.indexOf("const __justificationJudge =");
+      const audit = content.indexOf("const __securityAudit =");
+      const loop = content.indexOf("await runChatLoop({");
+      expect(cwd).toBeGreaterThanOrEqual(0);
+      expect(judge).toBeGreaterThan(cwd);
+      expect(audit).toBeGreaterThan(judge);
+      expect(loop).toBeGreaterThan(audit);
+    }
   });
 });
 
@@ -1528,16 +1630,46 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
   test("plugins: list → activates them and registers contributed tools on the catalog", () => {
     const c = emitCli(baseIr({ plugins: ["acme-tools", "beta-pack"] })).files[0]?.content ?? "";
     expect(c).toContain(
-      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+      'import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";',
     );
     // Names are emitted verbatim, in load order.
     expect(c).toContain('names: ["acme-tools","beta-pack"]');
-    // Fail-closed loader, dev opt-out via env.
-    expect(c).toContain('allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1"');
+    // The operator's trust anchors and the announced dev opt-in both come from
+    // the one boot runtime `crewhaus run` uses too (extension-path#0).
+    expect(c).toContain("...createBootPluginRuntime(),");
+    expect(c).not.toContain("allowUnsigned");
     // Contributed tools land on the shared catalog, first-party wins collisions.
     expect(c).toContain("for (const __t of __plugins.tools)");
     expect(c).toContain("defaultCatalog.register(__t);");
     expect(c).toContain("if (defaultCatalog.get(__t.name) !== undefined)");
+  });
+
+  // C016 — the run loop adds ListTools (and a pool's Consult / Escalate)
+  // AFTER plugin tools register, and keeps a tool it is handed under one of
+  // those names. The emitted block is run here against a stand-in catalog.
+  test("plugin registration skips the names the run loop adds itself, and says so", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    const start = c.indexOf("const __loopOwned = ");
+    const end = c.indexOf("defaultCatalog.register(__t);\n}", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = c.slice(start, end + "defaultCatalog.register(__t);\n}".length);
+    const registered: string[] = [];
+    const lines: string[] = [];
+    const catalog = {
+      get: (name: string) => (name === "Read" ? {} : undefined),
+      register: (t: { name: string }) => registered.push(t.name),
+    };
+    const proc = { stderr: { write: (line: string) => lines.push(line) } };
+    const plugins = {
+      tools: ["ListTools", "Consult", "Escalate", "Read", "PluginOnly"].map((name) => ({ name })),
+    };
+    new Function("__plugins", "defaultCatalog", "process", block)(plugins, catalog, proc);
+    expect(registered).toEqual(["PluginOnly"]);
+    expect(lines.filter((l) => l.includes("is the run loop's own"))).toHaveLength(3);
+    expect(lines.filter((l) => l.includes("already registered"))).toEqual([
+      '[plugins] tool "Read" already registered — plugin contribution skipped\n',
+    ]);
   });
 
   test("plugins feed their skill dirs into discoverSkills (non-continuity path)", () => {
@@ -1566,6 +1698,84 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
     expect(c).toContain("const __plugins = await activatePlugins(");
     expect(c).toContain("defaultCatalog.register(__t);");
     expect(c).not.toContain("pluginDirs: __plugins.skillDirs");
+  });
+
+  // extension-path#1 — 0.7.0 registered plugin tools right after the extension
+  // boot, BEFORE Task, wireMemory (FocusRead, PlanRead, … and the continuity
+  // Skill tool), MCP and Retrieve. A plugin tool named after any of those made
+  // the later first-party register throw "already registered" and the bundle
+  // exit 1, while `crewhaus run` skipped the plugin tool as documented.
+  describe("plugin tools register after every first-party registration (extension-path#1)", () => {
+    const everything = (continuity: boolean): string =>
+      emitCli(
+        baseIr({
+          plugins: ["acme-tools"],
+          tools: ["read"],
+          ...(continuity
+            ? {
+                continuity: {
+                  plan: true,
+                  proof: "ladder",
+                  ledger: true,
+                  handoff: true,
+                  scope: "spec",
+                },
+              }
+            : {}),
+          subAgents: [
+            {
+              name: "summarizer",
+              description: "summarize text",
+              instructions: "Summarize.",
+              tools: [],
+              permissions: "scoped",
+              inheritBypass: false,
+            },
+          ],
+          mcp_servers: {
+            things: { transport: "stdio", command: "node", args: ["server.js"] },
+            maybe: { transport: "stdio", command: "node", args: ["m.js"], required: false },
+          },
+          knowledge: {
+            vectorBackend: "in-memory",
+            defaultK: 5,
+            chunkSize: 400,
+            chunkOverlap: 0,
+            sources: [{ kind: "path", path: "docs/manual.md" }],
+          },
+        }),
+      ).files[0]?.content ?? "";
+
+    for (const continuity of [true, false]) {
+      test(`continuity ${continuity ? "on" : "off"}`, () => {
+        const c = everything(continuity);
+        const register = c.indexOf("for (const __t of __plugins.tools)");
+        // Every first-party registration the bundle makes, each present.
+        const firstParty = [
+          "defaultCatalog.register(read);",
+          "defaultCatalog.register(createSkillTool(__skills));",
+          "createTaskTool({ subAgents: __subAgents })",
+          "registerMcpServer(mcpHost,",
+          "registerOptionalMcpServer(",
+          "defaultCatalog.register(__knowledgeTool);",
+          ...(continuity ? ["await wireMemory("] : []),
+        ];
+        const positions = firstParty.map((needle) => ({ needle, at: c.lastIndexOf(needle) }));
+        expect(positions.filter((p) => p.at < 0)).toEqual([]);
+        expect(register).toBeGreaterThan(-1);
+        expect(positions.filter((p) => p.at > register)).toEqual([]);
+        // …and still before the loop reads the catalog.
+        expect(register).toBeLessThan(c.indexOf("await runChatLoop("));
+        // Activation stays early: its skill dirs feed discovery.
+        const activate = c.indexOf("const __plugins = await activatePlugins(");
+        expect(activate).toBeGreaterThan(-1);
+        expect(activate).toBeLessThan(
+          continuity
+            ? c.indexOf("await wireMemory(")
+            : c.indexOf("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })"),
+        );
+      });
+    }
   });
 });
 
@@ -1654,5 +1864,24 @@ describe("emitCli — the pool's runtime closures reach the bundle (0.6.0 PR 9e)
     expect(c).toContain('modelPool: {"candidates":');
     expect(c).not.toContain("wireHybrid");
     expect(c).not.toContain("@crewhaus/model-service");
+  });
+});
+
+describe("the sandbox floor reads CREWHAUS_SANDBOX through the sandbox's own parser (security-6#1)", () => {
+  test("a bundle with a code-execution tool decides the floor with sandboxAvailableFromEnv", () => {
+    const content = emitCli(baseIr({ tools: ["python"] })).files[0]?.content ?? "";
+    // The parser rides the import of the code-execution package itself.
+    expect(content).toMatch(
+      /import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/,
+    );
+    expect(content).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    // The old inline reading compared the raw value, so `noop ` passed as a sandbox.
+    expect(content).not.toContain("process.env.CREWHAUS_SANDBOX");
+  });
+
+  test("a bundle without one is unchanged: no import, no field", () => {
+    const content = emitCli(baseIr({ tools: ["bash"] })).files[0]?.content ?? "";
+    expect(content).not.toContain("sandboxAvailableFromEnv");
+    expect(content).not.toContain("sandboxAvailable:");
   });
 });

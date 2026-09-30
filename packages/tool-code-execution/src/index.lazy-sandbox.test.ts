@@ -42,18 +42,22 @@ const runStub = async (opts: SandboxExecOptions): Promise<SandboxExecResult> => 
   durationMs: 1,
 });
 
-function stubSandbox(): Sandbox {
+// Reports the backend the real factory would pick for these options
+// (docker unless asked otherwise), so the noop refusal sees what it would
+// see in production.
+function stubSandbox(opts: SandboxOptions): Sandbox {
   return {
-    backend: "noop" as const,
+    backend: opts.backend ?? "docker",
     exec: runStub,
     close: async (): Promise<void> => {},
   };
 }
 
 mock.module("@crewhaus/sandbox", () => ({
+  ...realSandboxModule,
   createSandbox: (opts: SandboxOptions = {}): Sandbox => {
     createCalls.push(opts);
-    return stubSandbox();
+    return stubSandbox(opts);
   },
 }));
 

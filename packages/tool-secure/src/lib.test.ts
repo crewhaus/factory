@@ -701,56 +701,58 @@ describe("allow-lists", () => {
 describe("policy", () => {
   const text = "Results may vary. Past performance is not a guarantee.";
 
-  test("a required phrase that is present passes", () => {
-    const result = evaluatePolicy(text, [
+  test("a required phrase that is present passes", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "disclaimer", kind: "required_phrase", value: "Results may vary" },
     ]);
     expect(result.outcomes[0]?.status).toBe("pass");
     expect(result.pass).toBe(true);
   });
 
-  test("a required phrase that is absent fails", () => {
-    const result = evaluatePolicy(text, [
+  test("a required phrase that is absent fails", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "disclaimer", kind: "required_phrase", value: "FDIC insured" },
     ]);
     expect(result.outcomes[0]?.status).toBe("fail");
     expect(result.pass).toBe(false);
   });
 
-  test("a forbidden phrase that is present fails, with locations", () => {
-    const result = evaluatePolicy(text, [
+  test("a forbidden phrase that is present fails, with locations", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "guarantee", kind: "forbidden_phrase", value: "guarantee" },
     ]);
     expect(result.outcomes[0]?.status).toBe("fail");
     expect(result.outcomes[0]?.matches[0]?.line).toBe(1);
   });
 
-  test("a review pattern queues rather than fails", () => {
-    const result = evaluatePolicy(text, [
+  test("a review pattern queues rather than fails", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "claims", kind: "review_pattern", value: "performance" },
     ]);
     expect(result.outcomes[0]?.status).toBe("review");
     expect(result.pass).toBe(true);
   });
 
-  test("matching is case-insensitive unless the rule says otherwise", () => {
-    const loose = evaluatePolicy(text, [{ id: "r", kind: "forbidden_phrase", value: "RESULTS" }]);
-    const strict = evaluatePolicy(text, [
+  test("matching is case-insensitive unless the rule says otherwise", async () => {
+    const loose = await evaluatePolicy(text, [
+      { id: "r", kind: "forbidden_phrase", value: "RESULTS" },
+    ]);
+    const strict = await evaluatePolicy(text, [
       { id: "r", kind: "forbidden_phrase", value: "RESULTS", caseSensitive: true },
     ]);
     expect(loose.outcomes[0]?.status).toBe("fail");
     expect(strict.outcomes[0]?.status).toBe("pass");
   });
 
-  test("a phrase rule treats its value as a literal, not a pattern", () => {
-    const result = evaluatePolicy("costs $1.00 (net)", [
+  test("a phrase rule treats its value as a literal, not a pattern", async () => {
+    const result = await evaluatePolicy("costs $1.00 (net)", [
       { id: "r", kind: "forbidden_phrase", value: "$1.00 (net)" },
     ]);
     expect(result.outcomes[0]?.status).toBe("fail");
   });
 
-  test("an invalid pattern errors for that rule alone and fails the check", () => {
-    const result = evaluatePolicy(text, [
+  test("an invalid pattern errors for that rule alone and fails the check", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "ok", kind: "forbidden_phrase", value: "nothing here" },
       { id: "broken", kind: "forbidden_pattern", value: "(" },
     ]);
@@ -759,17 +761,17 @@ describe("policy", () => {
     expect(result.pass).toBe(false);
   });
 
-  test("a duplicate rule id is refused, because ids identify outcomes", () => {
-    expect(() =>
+  test("a duplicate rule id is refused, because ids identify outcomes", async () => {
+    await expect(
       evaluatePolicy(text, [
         { id: "same", kind: "forbidden_phrase", value: "a" },
         { id: "same", kind: "forbidden_phrase", value: "b" },
       ]),
-    ).toThrow(PolicyError);
+    ).rejects.toThrow(PolicyError);
   });
 
-  test("outcomes are sorted by id, so the result is stable", () => {
-    const result = evaluatePolicy(text, [
+  test("outcomes are sorted by id, so the result is stable", async () => {
+    const result = await evaluatePolicy(text, [
       { id: "z", kind: "forbidden_phrase", value: "zzz" },
       { id: "a", kind: "forbidden_phrase", value: "aaa" },
     ]);

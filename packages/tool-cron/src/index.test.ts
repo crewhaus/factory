@@ -35,7 +35,15 @@ import {
   MACOS_PLIST_INTERVAL,
   MACOS_PLUTIL_ERROR_STDERR,
 } from "./__fixtures__/host-output";
-import { _setClock, _setFs, _setRunner, cronDelete, cronList, defaultSources } from "./index";
+import {
+  _setClock,
+  _setFs,
+  _setPlatform,
+  _setRunner,
+  cronDelete,
+  cronList,
+  defaultSources,
+} from "./index";
 import type { HostCommand, HostResult } from "./lib/run";
 
 // ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ function installRunner(handler: Handler): void {
       ...(reply.stdoutTruncated === true ? { stdoutTruncated: true } : {}),
       ...(reply.stderrTruncated === true ? { stderrTruncated: true } : {}),
       ...(reply.abandoned === true ? { abandoned: true } : {}),
+      ...(reply.outputIncomplete === true ? { outputIncomplete: true } : {}),
       ...(reply.spawnError !== undefined ? { spawnError: reply.spawnError } : {}),
     };
   });
@@ -123,6 +132,7 @@ afterEach(() => {
   _setRunner(undefined);
   _setFs(undefined);
   _setClock(undefined);
+  _setPlatform(undefined);
 });
 
 /** The shapes the two tools return, so the assertions below read as documentation. */
@@ -152,6 +162,11 @@ type Entry = {
 
 type ListOut = {
   ok: boolean;
+  /** false when no scheduler could be read: then there is no `count` and no `entries`. */
+  determined: boolean;
+  outcome?: "unsupported" | "unavailable";
+  reason?: string;
+  count?: number;
   platform: string;
   now: string;
   timeZone: string;
@@ -335,6 +350,58 @@ describe("CronList over a crontab", () => {
     expect(await cronList.execute({ sources: ["crontab"], now: "half past tuesday" })).toContain(
       "could not read 'now'",
     );
+  });
+
+  test("an offset-less 'now' does not depend on the host's zone (C189)", async () => {
+    // 0.7.0 read it with Date.parse, i.e. on the HOST's clock: 16:30Z in Los
+    // Angeles, 23:30Z the day before in Tokyo — while claiming timeZone UTC.
+    // Bun honours a TZ change at runtime, so one process shows both hosts.
+    installRunner(crontabHost("0 9 * * * /usr/bin/backup\n"));
+    const savedTz = process.env["TZ"];
+    try {
+      process.env["TZ"] = "America/Los_Angeles";
+      const a = await cronList.execute({ sources: ["crontab"], now: "2026-01-01T08:30:00" });
+      process.env["TZ"] = "Asia/Tokyo";
+      const b = await cronList.execute({ sources: ["crontab"], now: "2026-01-01T08:30:00" });
+      expect(a).toBe(b);
+      const out = JSON.parse(a as string) as ListOut;
+      // Read in timeZone, which defaults to UTC.
+      expect(out.now).toBe("2026-01-01T08:30:00.000Z");
+      expect(out.entries[0]?.nextRun).toEqual({
+        at: "2026-01-01T09:00:00.000Z",
+        source: "computed",
+      });
+      // The zone the caller names is the zone the wall clock is read in,
+      // exactly as CronNext reads its `after`.
+      const ny = await list({
+        sources: ["crontab"],
+        now: "2026-01-01T08:30:00",
+        timeZone: "America/New_York",
+      });
+      expect(ny.now).toBe("2026-01-01T13:30:00.000Z");
+      expect(ny.entries[0]?.nextRun?.at).toBe("2026-01-01T14:00:00.000Z");
+      // An explicit offset names one instant whatever the zones.
+      const zulu = await list({ sources: ["crontab"], now: "2026-01-01T08:30:00Z" });
+      expect(zulu.now).toBe("2026-01-01T08:30:00.000Z");
+      const offset = await list({
+        sources: ["crontab"],
+        now: "2026-01-01T08:30:00+02:00",
+        timeZone: "Asia/Tokyo",
+      });
+      expect(offset.now).toBe("2026-01-01T06:30:00.000Z");
+    } finally {
+      if (savedTz === undefined) Reflect.deleteProperty(process.env, "TZ");
+      else process.env["TZ"] = savedTz;
+    }
+  });
+
+  test("a 'now' the date grammar reads two ways is refused with both readings (C189)", async () => {
+    installRunner(crontabHost(LINUX_CRONTAB_L));
+    const out = await cronList.execute({ sources: ["crontab"], now: "03/04/2026 10:00" });
+    expect(out).toContain("could not read 'now'");
+    expect(out).toContain("MDY");
+    expect(out).toContain("DMY");
+    expect(calls).toEqual([]);
   });
 
   test("no command is ever a shell string", async () => {
@@ -531,6 +598,58 @@ describe("CronList platform defaults", () => {
     expect(defaultSources("freebsd")).toEqual(["crontab", "systemd"]);
     expect(defaultSources("win32")).toEqual([]);
   });
+
+  test("a platform with no reader says it could not look (C196)", async () => {
+    // 0.7.0 answered ok:true, count:0 — "nothing is scheduled" — having
+    // looked at nothing.
+    installRunner(() => ({ exitCode: 127, spawnError: "ENOENT" }));
+    _setPlatform("win32");
+    const out = await list({});
+    expect(out.ok).toBe(false);
+    expect(out.determined).toBe(false);
+    expect(out.outcome).toBe("unsupported");
+    expect(out.reason).toContain("Windows Task Scheduler");
+    expect(out.count).toBeUndefined();
+    expect(out.entries).toBeUndefined();
+    expect(out.sources).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  test("every requested reader unavailable is not an empty answer (C196)", async () => {
+    installRunner(() => ({ exitCode: 127, spawnError: "ENOENT" }));
+    _setPlatform("linux");
+    const out = await list({ sources: ["crontab", "systemd"] });
+    expect(out.ok).toBe(false);
+    expect(out.determined).toBe(false);
+    expect(out.outcome).toBe("unavailable");
+    expect(out.reason).toContain("no requested scheduler could be read (crontab, systemd)");
+    expect(out.count).toBeUndefined();
+    expect(out.entries).toBeUndefined();
+    // Each source still says why.
+    expect(out.sources.map((report) => report.available)).toEqual([false, false]);
+    expect(out.sources.every((report) => typeof report.reason === "string")).toBe(true);
+  });
+
+  test("one reader unavailable is a partial answer that names what is missing (C196)", async () => {
+    installRunner((argv) =>
+      argv[0] === "systemctl" ? { stdout: "" } : { exitCode: 127, spawnError: "ENOENT" },
+    );
+    const out = await list({ sources: ["crontab", "systemd"] });
+    expect(out.ok).toBe(true);
+    expect(out.determined).toBe(true);
+    expect(out.outcome).toBeUndefined();
+    expect(out.count).toBe(0);
+    expect(out.notes?.join(" ")).toContain("crontab could not be read");
+  });
+
+  test("a normal read is determined and carries no outcome", async () => {
+    installRunner(crontabHost(LINUX_CRONTAB_L));
+    const out = await list({ sources: ["crontab"] });
+    expect(out.ok).toBe(true);
+    expect(out.determined).toBe(true);
+    expect(out.outcome).toBeUndefined();
+    expect(out.count).toBe(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -698,7 +817,18 @@ describe("CronDelete on a crontab", () => {
   });
 });
 
-describe("CronDelete on launchd", () => {
+/**
+ * A launchd delete addresses `gui/<uid>/<label>`, and with no uid to build
+ * that from the tool refuses before it looks at anything else (see
+ * currentUid in lib/host.ts). Windows has no uid, and it lays the agents
+ * directory out with its own separators, so the delete tests run where a uid
+ * exists; the listing tests, which need neither, run everywhere.
+ */
+const hasUid = typeof process.getuid === "function";
+const describeLaunchdDelete = describe.skipIf(!hasUid);
+const testLaunchdDelete = test.skipIf(!hasUid);
+
+describeLaunchdDelete("CronDelete on launchd", () => {
   const uid = process.getuid?.() ?? 0;
 
   function launchdHost(extra: Handler = () => undefined): Handler {
@@ -875,21 +1005,24 @@ describe("a label is data, not syntax", () => {
     });
   });
 
-  test("a label containing a slash is refused, because it would re-target the domain", async () => {
-    // `launchctl bootout gui/501/<label>` is a PATH into launchd's domain
-    // tree. A label with a slash in it addresses a different domain than the
-    // one that was listed.
-    installRunner(hostWithLabel("com.example/../../system/com.apple.something"));
-    const out = await remove({
-      source: "launchd",
-      id: "com.example/../../system/com.apple.something",
-      dryRun: true,
-    });
-    expect(out["error"]).toContain("refusing a launchd label containing");
-    expect(calls.some((argv) => argv[1] === "bootout")).toBe(false);
-  });
+  testLaunchdDelete(
+    "a label containing a slash is refused, because it would re-target the domain",
+    async () => {
+      // `launchctl bootout gui/501/<label>` is a PATH into launchd's domain
+      // tree. A label with a slash in it addresses a different domain than the
+      // one that was listed.
+      installRunner(hostWithLabel("com.example/../../system/com.apple.something"));
+      const out = await remove({
+        source: "launchd",
+        id: "com.example/../../system/com.apple.something",
+        dryRun: true,
+      });
+      expect(out["error"]).toContain("refusing a launchd label containing");
+      expect(calls.some((argv) => argv[1] === "bootout")).toBe(false);
+    },
+  );
 
-  test("a label that would be read as a flag is refused", async () => {
+  testLaunchdDelete("a label that would be read as a flag is refused", async () => {
     installRunner(hostWithLabel("-w"));
     const out = await remove({ source: "launchd", id: "-w", dryRun: true });
     expect(out["error"]).toContain("starts with");
@@ -955,7 +1088,25 @@ describe("what the tools say when a probe FAILED", () => {
     const out = await list({ sources: ["crontab"], nextRuns: 0 });
     expect(out["sources"][0]?.available).toBe(false);
     expect(out["sources"][0]?.reason).toContain("PREFIX");
-    expect(out["entries"]).toEqual([]);
+    // Not even an empty listing: nothing was read, so nothing is claimed (C196).
+    expect(out["determined"]).toBe(false);
+    expect(out["entries"]).toBeUndefined();
+  });
+
+  test("a listing whose output a leftover process held open is not a crontab (C078)", async () => {
+    // The command exited, but a child it started kept the pipe open past the
+    // drain grace. 0.7.0 returned "" here, which read as "no jobs".
+    installRunner((argv) =>
+      argv[1] === "-l" ? { stdout: "0 3 * * * /usr/local/bin/a.sh\n", outputIncomplete: true } : {},
+    );
+    const out = await list({ sources: ["crontab"], nextRuns: 0 });
+    expect(out["sources"][0]?.available).toBe(false);
+    expect(out["sources"][0]?.reason).toContain("incomplete");
+    expect(out["determined"]).toBe(false);
+    expect(out["entries"]).toBeUndefined();
+    const removed = await remove({ source: "crontab", id: "line:1" });
+    expect(removed).toMatchObject({ ok: false, deleted: false });
+    expect(fsLog.written).toEqual([]);
   });
 
   test("a delete REFUSES to rewrite a crontab it only half read", async () => {
@@ -1070,44 +1221,47 @@ describe("what the tools say when a probe FAILED", () => {
     expect(out["note"]).not.toContain("did not produce the same set");
   });
 
-  test("a half-finished multi-step delete does not report that nothing happened", async () => {
-    installFs({
-      home: "/home/alice",
-      dirs: { "/home/alice/Library/LaunchAgents": ["one.plist", "two.plist"] },
-    });
-    let plists = 0;
-    installRunner((argv) => {
-      if (argv[0] === "launchctl" && argv[1] === "list") return { stdout: MACOS_LAUNCHCTL_LIST };
-      if (argv[0] === "plutil") {
-        plists += 1;
-        return {
-          stdout: JSON.stringify({
-            Label: plists === 1 ? "com.example.batch.one" : "com.example.batch.two",
-            StartCalendarInterval: { Hour: 3 },
-            ProgramArguments: ["/usr/local/bin/batch"],
-          }),
-        };
-      }
-      // The FIRST bootout succeeds; the second one fails.
-      if (argv[1] === "bootout") {
-        return argv[2]?.endsWith("two") === true
-          ? { exitCode: 1, stderr: "Boot-out failed: 5: Input/output error" }
-          : {};
-      }
-      return {};
-    });
-    const out = await remove({
-      source: "launchd",
-      match: "com.example.batch",
-      allowMultiple: true,
-    });
-    expect(out["ok"]).toBe(false);
-    // The first agent really was unloaded. "deleted: false" alone is a claim
-    // the machine contradicts.
-    expect(out["partial"]).toBe(true);
-    expect(out["completed"]).toEqual(["unload com.example.batch.one"]);
-    expect(out["error"]).toContain("HAD already taken effect");
-  });
+  testLaunchdDelete(
+    "a half-finished multi-step delete does not report that nothing happened",
+    async () => {
+      installFs({
+        home: "/home/alice",
+        dirs: { "/home/alice/Library/LaunchAgents": ["one.plist", "two.plist"] },
+      });
+      let plists = 0;
+      installRunner((argv) => {
+        if (argv[0] === "launchctl" && argv[1] === "list") return { stdout: MACOS_LAUNCHCTL_LIST };
+        if (argv[0] === "plutil") {
+          plists += 1;
+          return {
+            stdout: JSON.stringify({
+              Label: plists === 1 ? "com.example.batch.one" : "com.example.batch.two",
+              StartCalendarInterval: { Hour: 3 },
+              ProgramArguments: ["/usr/local/bin/batch"],
+            }),
+          };
+        }
+        // The FIRST bootout succeeds; the second one fails.
+        if (argv[1] === "bootout") {
+          return argv[2]?.endsWith("two") === true
+            ? { exitCode: 1, stderr: "Boot-out failed: 5: Input/output error" }
+            : {};
+        }
+        return {};
+      });
+      const out = await remove({
+        source: "launchd",
+        match: "com.example.batch",
+        allowMultiple: true,
+      });
+      expect(out["ok"]).toBe(false);
+      // The first agent really was unloaded. "deleted: false" alone is a claim
+      // the machine contradicts.
+      expect(out["partial"]).toBe(true);
+      expect(out["completed"]).toEqual(["unload com.example.batch.one"]);
+      expect(out["error"]).toContain("HAD already taken effect");
+    },
+  );
 
   test("a systemd fingerprint from CronList still works after the timer has fired", async () => {
     // The round trip the tool documents: list, then delete pinned to the

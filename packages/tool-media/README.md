@@ -14,8 +14,9 @@ not.
 
 ```yaml
 tools:
-  - all-media       # every tool below
-  - -MediaProbe     # ...except the one that shells out
+  - all-media       # every tool below, plus ReadImage and ImageGenerate
+  - -mediaProbe     # ...except the one that shells out
+  - -imageGenerate  # ...and the one that bills a remote model
 ```
 
 | Tool | What it does |
@@ -104,10 +105,18 @@ reported in `backEdges`.
 
 **They will not re-encode a photograph.** `ExifStrip` rewrites the segment
 list and copies the entropy-coded scan data verbatim, so the picture is
-bit-for-bit what it was. It keeps the ICC colour profile by default,
-because a profile is not metadata about the photographer: it is what tells
-a display how to interpret the colours, and dropping it visibly shifts the
-image.
+bit-for-bit what it was. It walks the whole file: metadata segments between
+the scans of a progressive JPEG are dropped too, and so is everything after
+the end-of-image marker (an appended preview, second view, HDR gain map or
+motion-photo video, each of which can carry its own EXIF and location). The
+result says how many trailing bytes went and what they looked like. A file
+that breaks off after its first scan (a partial download) is stripped up to
+the break and the rest kept as it was, as 0.7.0 did; a cut-off metadata
+segment there is dropped, and unframed bytes that look like metadata are
+refused rather than written into a file that claims to be clean. It keeps
+the ICC colour profile by default, because a profile is not metadata about
+the photographer: it is what tells a display how to interpret the colours,
+and dropping it visibly shifts the image.
 
 **They will not guess.** A 16-bit or interlaced PNG is refused by name
 rather than truncated or de-interlaced badly. A payload past a QR code's
@@ -140,8 +149,9 @@ too. No EAN-8, and no 2- or 5-digit add-ons. Bars only — the
 human-readable digits underneath would need a font.
 
 **EXIF.** IFD0, the Exif sub-IFD and the GPS sub-IFD of an `APP1` segment,
-both byte orders. Not MakerNotes, IFD1 thumbnails, XMP, IPTC, or EXIF in a
-TIFF or HEIC.
+both byte orders. Not MakerNotes, IFD1 thumbnails, or EXIF in a TIFF or HEIC.
+XMP (Extended XMP reassembled) and a Photoshop `APP13` block are searched for
+a location, not parsed field by field.
 
 **Subtitles.** SRT and WebVTT, through a BOM and either line ending, with
 cue ids and cue settings preserved. Not WebVTT chapter or metadata tracks.
@@ -154,3 +164,19 @@ A photograph taken on a phone usually records where it was taken.
 `ExifRead` reports that as `hasGps: true` with a `privacyWarning`, rather
 than burying the coordinates in a field list, because publishing the file
 publishes the location. `ExifStrip` is the tool that removes it.
+
+`ExifRead` reads the whole file, not just its first megabyte, and counts
+GPS found anywhere: before the first scan, between scans, in a JPEG appended
+after the main one, or in an EXIF block sitting in bytes no walk accounts
+for (a video, data it does not recognise, an image that would not walk). It
+reports `trailingBytes`, `interScanMetadataSegments` and every EXIF block
+found outside the main image's own. When it cannot tell and found no GPS
+elsewhere, `hasGps` is `null` with the reason in `gpsUndetermined`, never
+`false`: an EXIF block that does not parse, more appended images than it
+walks, bytes after the image that no walk accounts for (padding aside), a
+file that breaks off after its first scan, a file past 64 MiB, which is
+read that far and answered from what was read, or a metadata segment it does
+not read (a C2PA manifest in `APP11`, a vendor `APPn`), which it names. GPS
+written only in XMP, or in the EXIF or XMP a Photoshop `APP13` block keeps,
+is a definite `true`, listed in `gpsInOtherMetadata`; JFIF, ICC, MPF, Adobe
+and Ducky segments and an IPTC record have no place for coordinates.

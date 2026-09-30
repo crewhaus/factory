@@ -13,10 +13,12 @@
  *     from walking the tool out of it.
  *   - `.git` is always skipped: it is machine state, not the user's content.
  */
-import { type Dirent, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { type Dirent, lstatSync, readdirSync } from "node:fs";
 import * as path from "node:path";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { type IgnoreLayer, type IgnoreRule, isIgnored, parseGitignore } from "./lib/gitignore";
-import { matchGlob } from "./lib/glob";
+import { compileGlob } from "./lib/glob";
+import { workspaceRoot } from "./paths";
 
 export type NodeKind = "file" | "dir" | "symlink" | "other";
 
@@ -71,23 +73,42 @@ export function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function excluded(patterns: ReadonlyArray<string>, rel: string, name: string): boolean {
-  for (const pattern of patterns) {
-    if (matchGlob(pattern, name) || matchGlob(pattern, rel)) return true;
+function excluded(
+  patterns: ReadonlyArray<(subject: string) => boolean>,
+  rel: string,
+  name: string,
+): boolean {
+  for (const test of patterns) {
+    if (test(name) || test(rel)) return true;
   }
   return false;
 }
 
-/** Read and compile one `.gitignore`, or undefined when there is none. */
+/** A `.gitignore` larger than this contributes no rules, like an unreadable one. */
+export const GITIGNORE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Read and compile one `.gitignore`, or undefined when there is none.
+ *
+ * Read through tool-safety's contained open: a `.gitignore` that is a FIFO
+ * is refused BEFORE it is opened (a plain read blocked the event loop until
+ * a writer appeared, so one planted FIFO hung Tree, which plan mode runs
+ * unasked: C074), one linked out of the workspace is not read, and at most
+ * GITIGNORE_MAX_BYTES are. Any of those, like a missing or unreadable
+ * file, contributes no rules.
+ */
 export function loadIgnoreRules(file: string): IgnoreRule[] | undefined {
-  try {
-    return parseGitignore(readFileSync(file, "utf8"));
-  } catch {
-    return undefined; // missing or unreadable: contributes no rules
-  }
+  const r = openForReadSync(workspaceRoot(), file, { maxBytes: GITIGNORE_MAX_BYTES });
+  if (!r.ok || r.truncated) return undefined;
+  return parseGitignore(r.text);
 }
 
-type WalkState = { remaining: number; truncated: boolean };
+type WalkState = {
+  remaining: number;
+  truncated: boolean;
+  /** `options.exclude`, compiled once per walk rather than once per entry. */
+  readonly exclude: ReadonlyArray<(subject: string) => boolean>;
+};
 
 /**
  * Walk `rootAbs`, which must already have passed the containment check.
@@ -104,7 +125,11 @@ export function walkTree(rootAbs: string, options: WalkOptions): WalkResult {
     mtimeMs: Math.floor(rootStat.mtimeMs),
   };
   const entries: WalkNode[] = [];
-  const state: WalkState = { remaining: options.maxEntries, truncated: false };
+  const state: WalkState = {
+    remaining: options.maxEntries,
+    truncated: false,
+    exclude: options.exclude.map(compileGlob),
+  };
   if (root.kind === "dir") {
     root.children = [];
     const layers: IgnoreLayer[] = [];
@@ -140,7 +165,7 @@ function descend(
     if (!options.includeHidden && name.startsWith(".")) continue;
 
     const rel = parent.rel === "" ? name : `${parent.rel}/${name}`;
-    if (excluded(options.exclude, rel, name)) continue;
+    if (excluded(state.exclude, rel, name)) continue;
 
     const kind = kindOf(dirent);
     const isDir = kind === "dir";

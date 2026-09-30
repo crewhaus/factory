@@ -221,7 +221,14 @@ export async function runHooks(
     if (h.event !== event) return false;
     if (h.matcher === undefined || h.matcher === "" || h.matcher === "*") return true;
     if (matchTarget === undefined) return false;
-    return globToRegex(h.matcher).test(matchTarget);
+    const re = globToRegex(h.matcher);
+    if (re.test(matchTarget)) return true;
+    // 0.7.1 — MCP tools are registered as `mcp__<server>__<tool>`. A hook
+    // written against the pre-0.7.1 spelling (`everything__*`) keeps firing:
+    // a pre-tool hook that stopped matching would be a guard that silently
+    // stopped guarding.
+    const legacy = legacyMcpName(matchTarget);
+    return legacy !== undefined && re.test(legacy);
   });
   if (filtered.length === 0) return [];
   const logger = opts.logger;
@@ -418,9 +425,23 @@ export function buildHookEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.Pr
 }
 
 /**
+ * `<server>__<tool>` for an `mcp__<server>__<tool>` name, else undefined. The
+ * same rule as `legacyMcpToolName` in `@crewhaus/tool-permission-matcher`,
+ * copied because extension packages must not depend on tool packages;
+ * apps/cli's `mcp-names.test.ts` checks the copies agree.
+ */
+function legacyMcpName(name: string): string | undefined {
+  if (!name.startsWith("mcp__")) return undefined;
+  const rest = name.slice("mcp__".length);
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
+
+/**
  * Tokenizing glob → regex. Adapted from `@crewhaus/tool-permission-matcher`
  * with the parenthesized-arg-glob portion removed (hook matchers only need
- * to test simple names like `Bash`, `everything__*`, `tool-fs/*`).
+ * to test simple names like `Bash`, `mcp__everything__*`, `tool-fs/*`).
  */
 function globToRegex(glob: string): RegExp {
   let re = "";

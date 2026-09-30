@@ -16,6 +16,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -23,8 +24,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type RuleSet, evaluate } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { detectFormat, detectLint, detectPackageManager, detectTests, isMissing } from "./detect";
+import {
+  detectFormat,
+  detectLint,
+  detectPackageManager,
+  detectTests,
+  detectTypecheck,
+  isMissing,
+} from "./detect";
 import {
   CODE_TOOLS,
   astQuery,
@@ -48,6 +57,7 @@ import {
   typecheck,
   workspacePackages,
 } from "./index";
+import { displayCommand } from "./run";
 
 let workspace: string;
 let outside: string;
@@ -80,8 +90,8 @@ function write(relative: string, contents: string): void {
  * Install a stand-in for a toolchain binary in the project's own
  * `node_modules/.bin`, where `detect` looks for it.
  *
- * The read-only checkers take no `command`, deliberately — a tool the
- * permission engine auto-allows must not let a caller name the program — so
+ * The checkers take no `command`, deliberately — a tool the permission
+ * engine auto-allows must not let a caller name the program — so
  * the only honest way to test their parsing against a real process is to give
  * detection a real binary to find. That also exercises the half of the code a
  * caller-supplied argv used to skip: the config sniffing, the local-install
@@ -294,6 +304,10 @@ describe("diagnostic tools against the project's own toolchain", () => {
     // wherever it is checked out.
     expect(result["command"]).toContain("node_modules/.bin/tsc --noEmit");
     expect(String(result["command"]).startsWith("/")).toBe(false);
+    // The temp build-info file is shown as a placeholder, so the command
+    // still names no path on this machine (C150).
+    expect(result["command"]).toContain("--tsBuildInfoFile <tmp>/crewhaus-typecheck.tsbuildinfo");
+    expect(String(result["command"])).not.toContain(tmpdir());
   }, 20_000);
 
   test("Typecheck on a clean run returns zero errors and no noise", async () => {
@@ -449,29 +463,71 @@ describe("diagnostic tools against the project's own toolchain", () => {
   }, 60_000);
 });
 
-describe("the read-only checkers cannot be pointed at another program", () => {
-  // A readOnly tool is allowed without asking in auto mode and is the ONLY
-  // thing allowed in plan mode (permission-engine `evaluateWithReason`). A
-  // read-only tool that accepted a caller's argv would therefore be an
-  // unreviewed `sh -c`, which is why these three take no `command`.
+describe("the checkers cannot be pointed at another program", () => {
+  // They are allowed without asking in auto mode (not destructive), which is
+  // why they take no `command`: a checker that accepted a caller's argv would
+  // be an unreviewed `sh -c`. They are NOT read-only (0.7.1): the program they
+  // run comes from the workspace (node_modules/.bin, a JS config), and plan
+  // mode runs every read-only tool without asking.
   const checkers: ReadonlyArray<[string, RegisteredTool]> = [
     ["Typecheck", typecheck],
     ["Lint", lint],
     ["FormatCheck", formatCheck],
   ];
+  /** The three above plus Diagnostics, which runs all three. */
+  const allCheckers: ReadonlyArray<[string, RegisteredTool]> = [
+    ...checkers,
+    ["Diagnostics", diagnostics],
+  ];
+  const noRules: RuleSet = { flag: [], settings: [], yaml: [], hooks: [], builtin: [] };
 
-  test("each one declares readOnly and is therefore auto-allowed", () => {
-    for (const [name, tool] of checkers) {
-      expect({ name, readOnly: tool.readOnly, destructive: tool.destructive }).toEqual({
+  test("each one is auto-allowed, asks in default mode, and is denied in plan mode", () => {
+    // C006: the program each runs is the project's (node_modules/.bin, an
+    // eslint.config.js, a cargo build script), so plan mode must not run it.
+    for (const [name, tool] of allCheckers) {
+      const call = {
+        toolName: name,
+        input: {},
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+      };
+      expect({
         name,
-        readOnly: true,
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+        plan: evaluate(call, "plan", noRules),
+        auto: evaluate(call, "auto", noRules),
+        default: evaluate(call, "default", noRules),
+      }).toEqual({
+        name,
+        readOnly: false,
         destructive: false,
+        plan: "deny",
+        auto: "allow",
+        default: "ask",
       });
     }
   });
 
+  test("every process-spawning tool here is either destructive or not read-only", () => {
+    // The package-level form of the registry rule in apps/cli's
+    // flag-rules.test.ts: nothing in tool-code spawns a fixed system program,
+    // so no spawning tool here may be read-only.
+    const spawning = CODE_TOOLS.filter((t) => t.ioCapability === "process");
+    expect(spawning.map((t) => t.name).sort()).toEqual([
+      "Diagnostics",
+      "Format",
+      "FormatCheck",
+      "Lint",
+      "RunBuild",
+      "RunTests",
+      "Typecheck",
+    ]);
+    expect(spawning.filter((t) => t.readOnly === true).map((t) => t.name)).toEqual([]);
+  });
+
   test("none of them advertises a `command` field", () => {
-    for (const [name, tool] of checkers) {
+    for (const [name, tool] of allCheckers) {
       const shape = (tool.inputSchema as unknown as { shape: Record<string, unknown> }).shape;
       expect({ name, hasCommand: Object.hasOwn(shape, "command") }).toEqual({
         name,
@@ -500,8 +556,8 @@ describe("the read-only checkers cannot be pointed at another program", () => {
     }
   }, 20_000);
 
-  test("no read-only checker ever runs a package.json script", async () => {
-    // A script is whatever the project wrote in it, so a read-only tool that
+  test("no checker ever runs a package.json script", async () => {
+    // A script is whatever the project wrote in it, so a checker that
     // could reach one would be the same hole as an explicit `command` by
     // another route. `detect` deliberately routes scripts to RunBuild and
     // RunTests only; this is the guard on that.
@@ -525,6 +581,78 @@ describe("the read-only checkers cannot be pointed at another program", () => {
       });
     }
   }, 20_000);
+
+  test("a checker's child gets no credential from the harness's environment", async () => {
+    // C006: the checker is the project's own code, and auto mode runs it
+    // unasked. Each stand-in records the environment it was given.
+    const envFile = (tool: string) => join(workspace, `child-env.${tool}.txt`);
+    for (const bin of ["tsc", "biome"]) {
+      installBinary(bin, `env > ${JSON.stringify(envFile(bin))}\nexit 0`);
+    }
+    write("tsconfig.json", "{}");
+    write("biome.json", "{}");
+    const key = ["sk-ant-api03-", "C".repeat(24), "anary000"].join("");
+    const saved = {
+      key: process.env["CREWHAUS_TEST_API_KEY"],
+      odd: process.env["CREWHAUS_TEST_ODD_NAME"],
+      cargo: process.env["CARGO_HOME"],
+    };
+    process.env["CREWHAUS_TEST_API_KEY"] = key; // credential-shaped name
+    process.env["CREWHAUS_TEST_ODD_NAME"] = key; // innocuous name, secret value
+    process.env["CARGO_HOME"] = "/opt/cargo-for-this-test";
+    try {
+      const seen: Record<string, { key: boolean; path: boolean; cargo: boolean; ci: boolean }> = {};
+      for (const [name, tool] of allCheckers) {
+        rmSync(envFile("tsc"), { force: true });
+        rmSync(envFile("biome"), { force: true });
+        await call(tool, {});
+        for (const bin of ["tsc", "biome"]) {
+          if (!existsSync(envFile(bin))) continue;
+          const env = readFileSync(envFile(bin), "utf8");
+          seen[`${name}/${bin}`] = {
+            key: env.includes(key),
+            path: /^PATH=/m.test(env),
+            cargo: env.includes("CARGO_HOME=/opt/cargo-for-this-test"),
+            ci: /^CI=1$/m.test(env),
+          };
+        }
+      }
+      // Hit count: Typecheck and Diagnostics ran tsc; Lint, FormatCheck and
+      // Diagnostics (twice, lint and format, the second overwriting) ran biome.
+      expect(Object.keys(seen).sort()).toEqual([
+        "Diagnostics/biome",
+        "Diagnostics/tsc",
+        "FormatCheck/biome",
+        "Lint/biome",
+        "Typecheck/tsc",
+      ]);
+      for (const [where, facts] of Object.entries(seen)) {
+        expect({ where, ...facts }).toEqual({
+          where,
+          key: false,
+          path: true,
+          cargo: true,
+          ci: true,
+        });
+      }
+
+      // The destructive runners keep the full environment: a person approved
+      // them, and a test suite may need a DATABASE_URL. Pinned so the
+      // difference is a decision, not an accident.
+      const out = join(workspace, "child-env.runtests.txt");
+      await call(runTests, { command: ["sh", "-c", `env > ${JSON.stringify(out)}`] });
+      expect(readFileSync(out, "utf8").includes(key)).toBe(true);
+    } finally {
+      for (const [name, value] of [
+        ["CREWHAUS_TEST_API_KEY", saved.key],
+        ["CREWHAUS_TEST_ODD_NAME", saved.odd],
+        ["CARGO_HOME", saved.cargo],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }, 30_000);
 
   test("the tools that DO take a command are the destructive ones", () => {
     for (const [name, tool] of [
@@ -588,6 +716,33 @@ describe("code intelligence over a real tree", () => {
   test("AstQuery refuses an unusable pattern with the regex error", async () => {
     const message = await call(astQuery, { cwd: "src", pattern: "([" });
     expect(message).toContain("could not use the pattern");
+  });
+
+  test("AstQuery refuses a nested repetition hidden behind a bounded count (C079)", async () => {
+    const message = await call(astQuery, { cwd: "src", pattern: "^(\\w|[a-zA-Z]){1,64}Z$" });
+    expect(message).toContain("refused the pattern");
+  });
+
+  test("AstQuery never drops a name the pattern could not be checked against (C079)", async () => {
+    // A name longer than AstQuery runs its pattern on is undetermined for
+    // the pattern: listed as unchecked, not silently filtered out.
+    write("src/long.ts", `export const ${"a".repeat(2_000)} = 1;\n`);
+    const result = await callJson(astQuery, { cwd: "src", pattern: "^[a-z]" });
+    const names = (result["declarations"] as Array<Record<string, unknown>>).map((d) => d["name"]);
+    expect(names).toContain("helper");
+    expect(names.some((n) => String(n).length > 1_024)).toBe(false);
+    expect(result["uncheckedCount"]).toBe(1);
+    expect(String((result["uncheckedNames"] as string[])[0]).length).toBe(2_000);
+  });
+
+  test("AstQuery whose pattern run could not finish reports that, not an empty list (C079)", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const message = String(
+      await astQuery.execute({ cwd: "src", pattern: "^help" }, { signal: controller.signal }),
+    );
+    expect(message).toContain("could not evaluate the pattern");
+    expect(message).not.toContain('"declarations"');
   });
 
   test("SymbolOutline gives line ranges for one file", async () => {
@@ -763,6 +918,119 @@ describe("containment", () => {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * C072: the tools contain the directory a caller names, then look for FIXED
+ * names in it. A planted `requirements.txt -> <outside>/credentials` sits
+ * exactly there, and so does a FIFO. Each test plants one, asserts the
+ * outside bytes never reach the result, and that the result says which file
+ * was not read and why, instead of "no manifest".
+ */
+describe("containment of the fixed-name files a tool looks for", () => {
+  const SENTINEL = "SENTINEL_OUTSIDE_7f3a";
+
+  test("DependencyList does not read a requirements.txt linked out, and says so", async () => {
+    writeFileSync(join(outside, "credentials"), `api_key = ${SENTINEL}\n`);
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync(join(outside, "credentials"), join(workspace, "proj", "requirements.txt"));
+    const message = await call(dependencyList, { cwd: "proj" });
+    expect(message).not.toContain(SENTINEL);
+    expect(message).toContain("proj/requirements.txt");
+    expect(message).toContain("outside the workspace");
+    // The refusal names the caller's file, never where the link led.
+    expect(message).not.toContain(outside);
+  });
+
+  test("a refused manifest is listed beside the ones that were read", async () => {
+    writeFileSync(join(outside, "pkg.json"), JSON.stringify({ dependencies: { [SENTINEL]: "1" } }));
+    write("proj/go.mod", "module example.com/x\n\ngo 1.22\n\nrequire golang.org/x/text v0.3.0\n");
+    symlinkSync(join(outside, "pkg.json"), join(workspace, "proj", "package.json"));
+    const out = await callJson(dependencyList, { cwd: "proj" });
+    expect(JSON.stringify(out)).not.toContain(SENTINEL);
+    expect(out["manifests"]).toEqual(["go.mod"]);
+    expect(out["skipped"]).toEqual([
+      { file: "proj/package.json", reason: expect.stringContaining("outside the workspace") },
+    ]);
+  });
+
+  test("PackageScripts neither reads a package.json linked out nor climbs past it", async () => {
+    write("package.json", JSON.stringify({ scripts: { root: "echo root" } }));
+    writeFileSync(join(outside, "package.json"), JSON.stringify({ scripts: { go: SENTINEL } }));
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync(join(outside, "package.json"), join(workspace, "proj", "package.json"));
+    const message = await call(packageScripts, { cwd: "proj" });
+    expect(message).not.toContain(SENTINEL);
+    // The workspace root's own scripts are not passed off as proj's.
+    expect(message).not.toContain("echo root");
+    expect(message).toContain("proj/package.json");
+  });
+
+  test("WorkspacePackages does not read a root package.json linked out", async () => {
+    writeFileSync(
+      join(outside, "package.json"),
+      JSON.stringify({ name: SENTINEL, workspaces: ["packages/*"] }),
+    );
+    write("packages/a/package.json", JSON.stringify({ name: "a" }));
+    symlinkSync(join(outside, "package.json"), join(workspace, "package.json"));
+    const message = await call(workspacePackages, {});
+    expect(message).not.toContain(SENTINEL);
+    expect(message).toContain("outside the workspace");
+  });
+
+  test("CoverageSummary refuses a found report linked out, as it refuses one passed as `file`", async () => {
+    writeFileSync(join(outside, "lcov.info"), `SF:/${SENTINEL}.ts\nLF:1\nLH:1\nend_of_record\n`);
+    mkdirSync(join(workspace, "coverage"));
+    symlinkSync(join(outside, "lcov.info"), join(workspace, "coverage", "lcov.info"));
+    const found = await call(coverageSummary, {});
+    const named = await call(coverageSummary, { file: "coverage/lcov.info" });
+    for (const message of [found, named]) {
+      expect(message).not.toContain(SENTINEL);
+      expect(message).toContain("outside the workspace root");
+    }
+    // A whole coverage directory linked out is refused the same way.
+    rmSync(join(workspace, "coverage"), { recursive: true });
+    mkdirSync(join(outside, "covdir"));
+    writeFileSync(join(outside, "covdir", "lcov.info"), `SF:/${SENTINEL}.ts\nend_of_record\n`);
+    symlinkSync(join(outside, "covdir"), join(workspace, "coverage"));
+    const viaDir = await call(coverageSummary, {});
+    expect(viaDir).not.toContain(SENTINEL);
+    expect(viaDir).toContain("outside the workspace root");
+  });
+
+  test("control: a manifest linked to another file INSIDE the workspace is still read", async () => {
+    write("shared/requirements.txt", "requests==2.0\n");
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync("../shared/requirements.txt", join(workspace, "proj", "requirements.txt"));
+    const out = await callJson(dependencyList, { cwd: "proj" });
+    expect(out["manifests"]).toEqual(["requirements.txt"]);
+    expect(JSON.stringify(out["dependencies"])).toContain("requests");
+    expect(out["skipped"]).toBeUndefined();
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO named requirements.txt is refused without being opened, so nothing blocks",
+    async () => {
+      mkdirSync(join(workspace, "proj"));
+      expect(Bun.spawnSync(["mkfifo", join(workspace, "proj", "requirements.txt")]).exitCode).toBe(
+        0,
+      );
+      // In a child: before the fix readFileSync on the FIFO blocked the event
+      // loop for good, which no in-process timeout could interrupt.
+      const script = `process.chdir(${JSON.stringify(workspace)});
+const m = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+console.log(await m.dependencyList.execute({ cwd: "proj" }));`;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      const code = await child.exited;
+      clearTimeout(killer);
+      const stdout = await new Response(child.stdout).text();
+      expect({ code, signal: child.signalCode }).toEqual({ code: 0, signal: null });
+      expect(stdout).toContain("proj/requirements.txt");
+      expect(stdout).toContain("fifo");
+    },
+    20_000,
+  );
+});
+
 describe("project and dependency tools", () => {
   beforeEach(() => {
     write(
@@ -857,6 +1125,64 @@ describe("project and dependency tools", () => {
     expect(packages.map((p) => p["name"])).toEqual(["@demo/app", "@demo/core"]);
     expect(packages[0]?.["dependsOn"]).toEqual(["@demo/core"]);
     expect(result["cycles"]).toEqual([]);
+  });
+
+  test("WorkspacePackages reads ? in a glob as one character (C220)", async () => {
+    write("package.json", JSON.stringify({ name: "root", private: true, workspaces: ["pkg-?"] }));
+    write("pkg/package.json", JSON.stringify({ name: "not-a-member" }));
+    write("pkg-a/package.json", JSON.stringify({ name: "member-a" }));
+    write("pkg-b/package.json", JSON.stringify({ name: "member-b" }));
+    write("pkg-ab/package.json", JSON.stringify({ name: "not-a-member-either" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["member-a", "member-b"]);
+    expect(result["unsupportedGlobs"]).toBeUndefined();
+  });
+
+  test("WorkspacePackages applies a negated glob instead of ignoring it", async () => {
+    write(
+      "package.json",
+      JSON.stringify({
+        name: "root",
+        private: true,
+        workspaces: ["packages/*", "!packages/private"],
+      }),
+    );
+    write("packages/public/package.json", JSON.stringify({ name: "@demo/public" }));
+    write("packages/private/package.json", JSON.stringify({ name: "@demo/private" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/public"]);
+  });
+
+  test("WorkspacePackages names a glob it cannot evaluate rather than dropping its packages", async () => {
+    write(
+      "package.json",
+      JSON.stringify({ name: "root", private: true, workspaces: ["apps/*", "packages/{a,b}"] }),
+    );
+    write("apps/web/package.json", JSON.stringify({ name: "@demo/web" }));
+    write("packages/a/package.json", JSON.stringify({ name: "@demo/a" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/web"]);
+    expect(result["complete"]).toBe(false);
+    expect(result["unsupportedGlobs"]).toEqual([
+      { glob: "packages/{a,b}", reason: expect.stringContaining("brace sets") },
+    ]);
+  });
+
+  test("WorkspacePackages takes pnpm's globs from the packages: list only", async () => {
+    write("package.json", JSON.stringify({ name: "root", private: true }));
+    write(
+      "pnpm-workspace.yaml",
+      "packages:\n  - 'packages/*'\nonlyBuiltDependencies:\n  - esbuild\n",
+    );
+    write("packages/core/package.json", JSON.stringify({ name: "@demo/core" }));
+    write("esbuild/package.json", JSON.stringify({ name: "not-a-member" }));
+    const result = await callJson(workspacePackages, {});
+    expect(result["workspaces"]).toEqual(["packages/*"]);
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/core"]);
   });
 
   test("WorkspacePackages says when a directory is not a monorepo root", async () => {
@@ -954,6 +1280,66 @@ describe("toolchain detection", () => {
     const formatter = detectFormat(workspace, workspace, true);
     expect(formatter).toMatchObject({ tool: "gofmt" });
     expect((formatter as { argv: string[] }).argv).toEqual(["gofmt", "-w"]);
+  });
+
+  test("no checker is told to keep its cache in the project (C150)", () => {
+    write("tsconfig.json", "{}");
+    installBinary("tsc", "exit 0");
+    const tsc = (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    const at = tsc.indexOf("--tsBuildInfoFile");
+    expect(at).toBeGreaterThan(0);
+    expect(tsc).toContain("--incremental");
+    expect(tsc).toContain("--noEmit");
+    const info = tsc[at + 1] as string;
+    expect(info.startsWith(realpathSync(tmpdir())) || info.startsWith(tmpdir())).toBe(true);
+    expect(info.startsWith(workspace)).toBe(false);
+    rmSync(join(workspace, "tsconfig.json"));
+
+    write("pyproject.toml", "[tool.ruff]\n");
+    installBinary("mypy", "exit 0");
+    installBinary("ruff", "exit 0");
+    const mypy = (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    // A cache kept BETWEEN runs (regression review: /dev/null made every run
+    // cold), in the per-user temp directory, keyed by the project.
+    const cacheArg = mypy.find((a) => a.startsWith("--cache-dir=")) as string;
+    const cacheDir = cacheArg.slice("--cache-dir=".length);
+    expect(cacheDir).not.toBe("/dev/null");
+    expect(cacheDir.startsWith(realpathSync(tmpdir())) || cacheDir.startsWith(tmpdir())).toBe(true);
+    expect(cacheDir.startsWith(workspace)).toBe(false);
+    // The same project gets the same directory on the next run; another gets its own.
+    expect((detectTypecheck(workspace, workspace) as { argv: string[] }).argv).toContain(cacheArg);
+    write("other/pyproject.toml", "[tool.mypy]\n");
+    const other = (detectTypecheck(join(workspace, "other"), workspace) as { argv: string[] }).argv;
+    expect(other).not.toContain(cacheArg);
+    expect(displayCommand(mypy, workspace)).toContain("--cache-dir=<tmp>/crewhaus-mypy-cache");
+    expect(displayCommand(mypy, workspace)).not.toContain(cacheDir);
+    expect((detectLint(workspace, workspace) as { argv: string[] }).argv).toContain("--no-cache");
+    expect((detectFormat(workspace, workspace, false) as { argv: string[] }).argv).toContain(
+      "--no-cache",
+    );
+  });
+
+  test("TypeScript 3.x keeps 0.7.0's typecheck argv: it rejects --incremental with --noEmit", () => {
+    write("tsconfig.json", "{}");
+    installBinary("tsc", "exit 0");
+    const argvFor = (version: string | undefined): string[] => {
+      rmSync(join(workspace, "node_modules", "typescript"), { recursive: true, force: true });
+      if (version !== undefined)
+        write("node_modules/typescript/package.json", JSON.stringify({ version }));
+      return (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    };
+    // 3.9 answered every run with TS5053 and none of the project's errors.
+    const old = argvFor("3.9.10");
+    expect(old).toContain("--noEmit");
+    expect(old).not.toContain("--incremental");
+    expect(old).not.toContain("--tsBuildInfoFile");
+    for (const version of ["4.0.2", "5.9.3", undefined, "not-a-version"]) {
+      const argv = argvFor(version);
+      expect({ version, incremental: argv.includes("--incremental") }).toEqual({
+        version,
+        incremental: true,
+      });
+    }
   });
 
   test("a configured node tool with no local install is reported as missing", () => {

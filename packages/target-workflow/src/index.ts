@@ -17,6 +17,15 @@ import {
   renderModelWiringFields,
   scopedModelWiringFragment,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  type SpecChainBlocks,
+  type ToolSite,
+  readmeToolFacts,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 /**
  * Emit a self-contained workflow agent bundle. The generated agent.ts
@@ -90,7 +99,10 @@ export function emitWorkflow(ir: IrWorkflowV0, opts: EmitWorkflowOptions = {}): 
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, { toolFacts: readmeToolFacts(stepSites(ir.steps), ir) }),
+    });
   }
   return { files };
 }
@@ -102,65 +114,45 @@ export class TargetEmitError extends CrewhausError {
   }
 }
 
-/**
- * Built-in tool name → package + export. Mirrors the same map in
- * @crewhaus/target-cli; intentionally duplicated for this PR. Follow-up
- * will extract a shared @crewhaus/tool-resolver package.
- */
-const BUILTIN_TOOL_MAP: Record<string, { package: string; export: string }> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  // §47 read-only EVM tools (slice 0).
-  evmCall: { package: "@crewhaus/tool-evm", export: "evmCall" },
-  evmGetLogs: { package: "@crewhaus/tool-evm", export: "evmGetLogs" },
-  evmGetTransaction: { package: "@crewhaus/tool-evm", export: "evmGetTransaction" },
-  evmGetTransactionReceipt: {
-    package: "@crewhaus/tool-evm",
-    export: "evmGetTransactionReceipt",
-  },
-  evmGetBalance: { package: "@crewhaus/tool-evm", export: "evmGetBalance" },
-  evmBlockNumber: { package: "@crewhaus/tool-evm", export: "evmBlockNumber" },
-  // §47 destructive EVM tools (slice 1) — gated by permission-engine
-  // (destructive: true) and wallet-engine (two-gate model).
-  evmSendTransaction: { package: "@crewhaus/tool-evm-tx", export: "evmSendTransaction" },
-  evmSimulate: { package: "@crewhaus/tool-evm-tx", export: "evmSimulate" },
-};
+/** Each step's tool list and block, with the spec path a message names. */
+function stepSites(steps: readonly IrWorkflowStep[]): ReadonlyArray<ToolSite> {
+  return steps.map((step, i) => ({
+    tools: step.tools,
+    toolConfigs: step.toolConfigs,
+    path: `steps[${i}].tool_config`,
+  }));
+}
 
 /**
- * Compute the union of every tool referenced across all steps and resolve
- * to grouped imports (sorted, one per package). Throws TargetEmitError if
- * any step references an unknown tool name.
+ * Resolve every step's `tools` through the one shared builtin table
+ * (`@crewhaus/tool-categories`): ONE grouped import block for the file, the
+ * `tool_config` registrations, and per step the identifiers its runChatLoop
+ * receives. A name the workflow shape cannot run throws `TargetEmitError`
+ * with the shared message.
  */
-function resolveAllTools(steps: readonly IrWorkflowStep[]): string[] {
-  const seen = new Set<string>();
-  for (const step of steps) {
-    for (const t of step.tools) seen.add(t);
+function resolveStepTools(
+  steps: readonly IrWorkflowStep[],
+  chains?: SpecChainBlocks,
+): {
+  readonly imports: ReadonlyArray<string>;
+  readonly inits: ReadonlyArray<string>;
+  /** Per step (same index as `steps`), the identifiers to pass as tools. */
+  readonly byStep: ReadonlyArray<ReadonlyArray<string>>;
+  readonly sandbox: boolean;
+} {
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("workflow", stepSites(steps), chains);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-  if (seen.size === 0) return [];
-
-  const byPackage = new Map<string, string[]>();
-  for (const name of seen) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const list = byPackage.get(entry.package) ?? [];
-    list.push(entry.export);
-    byPackage.set(entry.package, list);
-  }
-
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const exports = (byPackage.get(pkg) ?? []).slice().sort();
-    imports.push(`import { ${exports.join(", ")} } from "${pkg}";`);
-  }
-  return imports;
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    byStep: resolved.sites,
+    sandbox: resolved.sandbox,
+  };
 }
 
 /**
@@ -203,6 +195,10 @@ function gatedStepIndex(steps: readonly IrWorkflowStep[], judgeIdx: number): num
  * bundles stay byte-identical.
  */
 type StepShared = {
+  /** Per step index, the resolved tool identifiers (see resolveStepTools). */
+  readonly stepTools: ReadonlyArray<ReadonlyArray<string>>;
+  /** `sandboxAvailable` when some step registers a code-execution tool; "" otherwise. */
+  readonly sandboxField: string;
   readonly permFields: string;
   /** G11 — `askMode` + the module-scope `__approvals` store. Separate from
    *  `permFields` because it is UNCONDITIONAL: a spec with no `permissions:`
@@ -239,7 +235,7 @@ type StepShared = {
 function renderStep(step: IrWorkflowStep, idx: number, total: number, shared: StepShared): string {
   const isFirst = idx === 0;
   const stepNum = idx + 1;
-  const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
+  const toolsField = renderStepToolsField(shared.stepTools[idx] ?? [], shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
   // Loop contract 0.4 (Batch G, item 9 / G37) — the step's model-routing
   // quartet, rendered by `@crewhaus/model-service`'s `renderModelWiringFields`
@@ -306,7 +302,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write("\\n[step ${stepNum}/${to
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)},
     singleTurn: true,
-    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: ${userContent} }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}${shared.sandboxField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -340,7 +336,7 @@ function renderGatedStep(
       ? "\n    ...(__force !== undefined ? { forcedCandidate: __force } : {}),"
       : "";
   const stepNum = idx + 1;
-  const toolsField = renderStepToolsField(step.tools, shared.mcpWired);
+  const toolsField = renderStepToolsField(shared.stepTools[idx] ?? [], shared.mcpWired);
   const stepTuningFields = renderStepTuningFields(step);
   const modelFailoverFields = renderModelWiringFields(
     scopedModelWiringFragment(step, step.name),
@@ -377,7 +373,7 @@ ${deadlineGuard}${stdinReadLine}  process.stdout.write(${escapeJsonString(`\n[st
     model: ${escapeJsonString(step.model)},
     instructions: ${escapeJsonString(step.instructions)} + __nudge,
     singleTurn: true,
-    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}
+    seedMessages: [{ role: "user", content: __step${stepNum}Input }],${toolsField}${stepTuningFields}${modelFailoverFields}${hybridFields}${forceField}${shared.limitsFields}${shared.budgetField}${shared.permFields}${shared.approvalFields}${shared.failureTaxonomyField}${shared.sandboxField}
     hooks: ${shared.hooksExpr},
     skills: __skills,
     slashCommands: __slashCommands,${shared.runContextLine}${shared.evalFields}
@@ -530,10 +526,7 @@ ${scoringPass("    ")}
  * tools. Steps WITHOUT tools stay tool-free — they receive neither the
  * built-ins nor the MCP tools (only the Section 11 skill weave).
  */
-function renderStepToolsField(tools: readonly string[], mcpWired: boolean): string {
-  const exports = tools
-    .map((t) => BUILTIN_TOOL_MAP[t]?.export)
-    .filter((e): e is string => typeof e === "string");
+function renderStepToolsField(exports: ReadonlyArray<string>, mcpWired: boolean): string {
   if (exports.length === 0) {
     return "\n    tools: __skillTool ? [__skillTool] : [],";
   }
@@ -970,8 +963,10 @@ const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"]
 `;
 
 function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
-  const importLines = resolveAllTools(ir.steps);
-  const importBlock = importLines.length > 0 ? `${importLines.join("\n")}\n` : "";
+  const tools = resolveStepTools(ir.steps, ir);
+  const importBlock = tools.imports.length > 0 ? `${tools.imports.join("\n")}\n` : "";
+  // `tool_config` registrations run once, at module load, before any step.
+  const toolInitBlock = tools.inits.length > 0 ? `${tools.inits.join("\n")}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
   const permImport = hasRules
     ? `import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";\n`
@@ -1013,6 +1008,10 @@ function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
   const hasPlainStep = ir.steps.some((s, i) => !isJudgeStep(s) && !gatedIdx.has(i));
   const durable = ir.steps.length > 1 && hasPlainStep;
   const shared: StepShared = {
+    stepTools: tools.byStep,
+    // A code-execution tool on any step needs the sandbox floor wired, with
+    // the same CREWHAUS_SANDBOX grammar the cli bundle and `crewhaus run` use.
+    sandboxField: tools.sandbox ? `\n    sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},` : "",
     permFields,
     approvalFields,
     failureTaxonomyField,
@@ -1319,7 +1318,7 @@ ${runBody}}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: workflow, ir version: ${ir.version}, ${ir.steps.length} step(s))
 ${mcp.note}${continuityWarning}import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-${judgeImports}${evalEntryImports}${budgetMeterImport}${hybridImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${APPROVAL_STORE_BOOT}
+${judgeImports}${evalEntryImports}${budgetMeterImport}${hybridImport}${permImport}${durableImport}${extensionImports}${importBlock}${mcpImportBlock}${toolInitBlock}${APPROVAL_STORE_BOOT}
 async function readStdinToEnd(): Promise<string> {
   // No piped input — don't block waiting on an interactive TTY.
   if (process.stdin.isTTY) return "";

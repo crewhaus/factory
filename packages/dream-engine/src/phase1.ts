@@ -271,9 +271,12 @@ export async function runDreamPhase1(opts: DreamPhase1Options): Promise<DreamPha
 
       if (proofs.length > 0) {
         // Mechanism (a): pin every cited session before the TTL can evict it.
+        // Contain retention.json within .crewhaus (a link out is refused; a
+        // link that stays inside is followed).
         const { added } = await appendRetentionPins(
           proofs.map((p) => p.sessionId),
           join(opts.crewhausDir, "retention.json"),
+          opts.crewhausDir,
         );
         sessionsPinned = added.length;
 

@@ -253,6 +253,7 @@ const ROUTE_ACTIONS = ["status", "freeze", "unfreeze", "promote", "compact"] as 
 
 export const routeControl: RegisteredTool = buildTool({
   name: "RouteControl",
+  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   description:
     "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean carries its n, because an arm with three observations is not a better arm than one with three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one, and `promoteLanes`'s own freeze check reads it as absent. A real promotion additionally needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is deliberately not offered; use `crewhaus route reset`. dryRun defaults to true and changes nothing; the promotion preview is promoteLanes' own dryRun, running the same fold.",
   inputSchema: z.object({
@@ -670,6 +671,16 @@ const LEDGER_ACTIONS = ["list", "tally", "assign", "record"] as const;
 
 export const experimentLedger: RegisteredTool = buildTool({
   name: "ExperimentLedger",
+  // The ledger lives in `experimentsDir`, which defaults to
+  // `<dir>/.crewhaus/experiments`. A declared default cannot follow `dir`
+  // (and `within: "dir"` would misread an explicit experimentsDir, which is
+  // relative to the working directory), so a call that sets `dir` alone is
+  // read as `dir` plus the root default: a deny or ask on either fires.
+  operativeArgs: [
+    { field: "dir", kind: "path", default: ".", relocates: true },
+    { field: "experimentsDir", kind: "path", default: ".crewhaus/experiments", relocates: true },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Assign a stable request key to a spec-version variant, record outcomes, and fold the ledger into per-version tallies with an explicit winner or an explicit 'undecided'. The assignment hash is @crewhaus/canary-controller's own, so a two-version canary and an N-variant experiment can never disagree about which side of the split a key is on. Repeat eval measurements of the same (version, sample) are collapsed BEFORE the tally, because re-running an eval otherwise inflates n and narrows the interval enough to name a winner that does not exist. Every success rate carries a Wilson interval; the comparison between versions is a Mann-Whitney rank test over the per-observation scores, Bonferroni-corrected for the number of pairs, never a difference of means. Nothing here intercepts a live request: selection is a decision function and this is accounting. `record` writes; dryRun defaults to true.",
   inputSchema: z.object({
@@ -1053,6 +1064,10 @@ export const experimentLedger: RegisteredTool = buildTool({
 
 export const flywheelStatus: RegisteredTool = buildTool({
   name: "FlywheelStatus",
+  operativeArgs: [
+    { field: "dir", kind: "path", default: ".", relocates: true },
+    { field: "specDir", kind: "path" },
+  ],
   description:
     "Report what a harness's self-improvement loop has left on disk: the scaffolded CI workflows, the per-run artifact directories under .crewhaus/flywheel, and which dataset rungs the loop would resolve if it ran with no --dataset. It deliberately does NOT name 'the source the last run used': the top precedence rung is the --dataset FLAG, which is an argument and not a file, so no reader of a directory can know whether it was passed. It reports the rungs that are observable, flags the case where a conventional eval/dataset.jsonl would shadow distilled user ratings, and names apps/cli's resolveFlywheelData as the owner of the rule rather than carrying a second copy of it. Three facts it cannot obtain are reported as unknown with the package that holds them: whether a ratings dataset is registered, whether the optimizer's write-back landed in the spec, and the acceptance verdict inside a run's eval artifacts. Read-only.",
   inputSchema: z.object({
@@ -1170,6 +1185,7 @@ export const flywheelStatus: RegisteredTool = buildTool({
 
 export const watchmeReport: RegisteredTool = buildTool({
   name: "WatchmeReport",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Read a harness's observational-learning ledger: whether it is watching, the per-window report outcomes, the per-spec/target quality and cost roll-up, the judge verdicts, and how much of that quality has actually reached the routing scoreboard's observe-only `q:` lane. Report-window outcomes are kept apart — `model_refused_unpriced` is a configuration error that consumed its window, `model_failed` is transient and retries, and collapsing them into one failure state hides the first as the second. A state.json that exists but cannot be parsed is reported as unreadable, never as a harness that has never watched: the store falls back to its default there, which reads as the opposite of the truth. The routing half degrades explicitly — an absent or unreadable scoreboard is reported as such, never as 'no quality signal'. Every rate carries a Wilson interval. Read-only: it never runs the phase-2 judge, never synthesizes, and never feeds routing.",
   inputSchema: z.object({

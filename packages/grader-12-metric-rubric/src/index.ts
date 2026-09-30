@@ -36,6 +36,7 @@
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import type { GraderRegistry } from "@crewhaus/grader-registry";
+import { toolListEntryNames } from "@crewhaus/tool-catalog";
 import { answerFaithfulness, answerRelevance, hallucinationRate } from "./faithfulness";
 
 /**
@@ -224,7 +225,8 @@ export const toolSelectionAccuracy: Grader = async (sample, run) => {
       rationale: `expected first tool "${expected}", agent made no tool calls`,
     };
   }
-  const matched = first.toolName === expected;
+  // An MCP tool answers to its pre-0.7.1 spelling too (`<server>__<tool>`).
+  const matched = toolListEntryNames(expected, first.toolName);
   return {
     passed: matched,
     score: matched ? 1 : 0,

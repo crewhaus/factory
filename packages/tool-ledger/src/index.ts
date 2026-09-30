@@ -29,11 +29,10 @@
  * `_setClock`, so a test can fix `postedAt` — which is inside the hash chain,
  * so a wall-clock read would make the same posting hash differently twice.
  */
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { type Transaction, parseStatement } from "@crewhaus/tool-money";
+import { joinRel, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   LedgerError,
@@ -71,7 +70,7 @@ import {
 import { POST_LIMITS, ensureAccounts, postBatch } from "./lib/post";
 import { FORMATS, VIEWS, renderRows, runQuery } from "./lib/query";
 import { RECONCILE_LIMITS, reconcile } from "./lib/reconcile";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 // ---------------------------------------------------------------------------
 // the one seam
@@ -250,6 +249,7 @@ const entrySchema = z
 
 export const ledgerPost: RegisteredTool = buildTool({
   name: "LedgerPost",
+  operativeArgs: [{ field: "dbPath", kind: "path", default: DEFAULT_DB_PATH }],
   description:
     "Append balanced double-entry journal entries to a local, hash-chained SQLite ledger, refusing anything that would corrupt it. Use it instead of having a model track what has been booked: debits must equal credits or the entry is rejected with the difference named, a (source system, id) pair can only post once, a closed period stays closed, and the rows, the chain's new head and the idempotency claim all commit in ONE transaction — so a crash mid-batch leaves the book exactly as it was rather than a ledger that verifies while its duplicate suppression has forgotten the entry. Amounts are decimal strings or integer minor units, never floats. Nothing is transmitted anywhere; this writes a file.",
   inputSchema: z
@@ -446,6 +446,8 @@ export const ledgerQuery: RegisteredTool = buildTool({
 // ---------------------------------------------------------------------------
 
 const MAX_STATEMENT_BYTES = 64 * 1024 * 1024;
+/** A template file, like an inline `template`, is at most 256 KiB. */
+const MAX_TEMPLATE_BYTES = 256 * 1024;
 
 /** The row shape is `@crewhaus/tool-money`'s, so the schema mirrors it exactly. */
 const transactionSchema = z
@@ -485,51 +487,89 @@ const sideSchema = z
 
 type Side = z.infer<typeof sideSchema>;
 
+/** How many of a statement's unreadable rows a reconciliation lists by name. */
+const UNREADABLE_ROWS_SHOWN = 50;
+
+/** One side's rows, and — for a statement — the rows the file had that could not be read. */
+type LoadedSide = {
+  readonly rows: ReadonlyArray<Transaction>;
+  readonly unreadable?: {
+    readonly count: number;
+    readonly rows: ReadonlyArray<{ readonly row: number; readonly reason: string }>;
+  };
+};
+
 function loadSide(
   side: Side,
   label: string,
   input: { dbPath?: string; busyTimeoutMs?: number },
-): Transaction[] {
+): LoadedSide {
   if (side.kind === "lines") {
     if (side.lines === undefined)
       throw new LedgerError(`${label}.kind is "lines" but no lines were given`);
-    return side.lines;
+    return { rows: side.lines };
   }
   if (side.kind === "statement") {
     if (side.file === undefined)
       throw new LedgerError(`${label}.kind is "statement" but no file was given`);
-    const at = resolveSafe("LedgerReconcile", side.file);
-    const size = statSync(at.real).size;
-    if (size > MAX_STATEMENT_BYTES) {
-      throw new LedgerError(
-        `${at.rel} is ${size} bytes, over the ${MAX_STATEMENT_BYTES}-byte limit`,
-      );
-    }
     // tool-money's parser, not a second one: it is the thing that refuses a
     // file whose dates could be day-first or month-first, and a reconciliation
-    // run on months guessed the wrong way balances to twice the error.
-    return [
-      ...parseStatement(readTextFile(at.real), {
-        dateOrder: side.dateOrder,
-        decimalComma: side.decimalComma,
-        decimals: side.decimals,
-      }).transactions,
-    ];
+    // run on months guessed the wrong way balances to twice the error. It
+    // holds one row past the side limit, so an over-long file is refused by
+    // its true count without every row of it in memory first.
+    const parsed = parseStatement(readTextFile("LedgerReconcile", side.file, MAX_STATEMENT_BYTES), {
+      dateOrder: side.dateOrder,
+      decimalComma: side.decimalComma,
+      decimals: side.decimals,
+      keep: { transactions: RECONCILE_LIMITS.rowsPerSide + 1, rejected: UNREADABLE_ROWS_SHOWN },
+    });
+    if (parsed.count > RECONCILE_LIMITS.rowsPerSide) {
+      throw new LedgerError(
+        `the ${label} side has ${parsed.count} rows, over the ${RECONCILE_LIMITS.rowsPerSide} limit`,
+      );
+    }
+    // A row the parser could not read is not in the reconciliation, so it is
+    // named beside it rather than silently missing from both sides.
+    return {
+      rows: parsed.transactions,
+      ...(parsed.rejectedCount === 0
+        ? {}
+        : { unreadable: { count: parsed.rejectedCount, rows: parsed.rejected } }),
+    };
   }
   if (side.account === undefined) {
     throw new LedgerError(`${label}.kind is "ledger" but no account was given`);
   }
   const opened = open("LedgerReconcile", input, "read");
   try {
-    return ledgerAsTransactions(opened.db, side.account, side.from, side.to);
+    return { rows: ledgerAsTransactions(opened.db, side.account, side.from, side.to) };
   } finally {
     opened.db.close();
   }
 }
 
-/** One place that reads a file, so one place decides how much of it is held. */
-function readTextFile(path: string): string {
-  return readFileSync(path, "utf-8");
+/**
+ * One place that reads a caller-named file, so one place decides where it
+ * may be, what kind of file it may be and how much of it is held.
+ *
+ * The path is contained first, with the refusal every path here gives. The
+ * file is then opened without blocking and must be a regular file: a FIFO
+ * with no writer blocks an ordinary open for ever, and this read is
+ * synchronous, so a named pipe planted in the workspace used to stop the
+ * whole harness, heartbeats and other sessions included. And the byte limit
+ * is enforced while reading, not by a size the file reported before it was
+ * opened.
+ */
+function readTextFile(toolName: string, given: string, maxBytes: number): string {
+  resolveSafe(toolName, given);
+  const read = openForReadSync(workspaceRoot(), given, { maxBytes });
+  if (!read.ok) throw new LedgerError(`${toolName}: ${read.reason}`);
+  if (read.truncated) {
+    throw new LedgerError(
+      `${toolName}: ${JSON.stringify(given)} is over the ${maxBytes}-byte limit, so it was not read`,
+    );
+  }
+  return read.text;
 }
 
 /**
@@ -658,23 +698,35 @@ export const ledgerReconcile: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const currency = (input.currency ?? "USD").toUpperCase();
-    const result = reconcile(
-      loadSide(input.left, "left", input),
-      loadSide(input.right, "right", input),
-      {
-        toleranceMinor: BigInt(input.toleranceMinor ?? 0),
-        windowDays: input.windowDays ?? 3,
-        allowManyToOne: input.allowManyToOne !== false,
-        maxSubsetSize: input.maxSubsetSize ?? 6,
-        maxCombinations: RECONCILE_LIMITS.maxCombinations,
-        feeToleranceMinor: BigInt(input.feeToleranceMinor ?? 0),
-        requireReferenceMatch: input.requireReferenceMatch === true,
-        exponent: exponentFor(currency, input.exponent),
-        currency,
-        propose: input.propose,
-      },
+    const left = loadSide(input.left, "left", input);
+    const right = loadSide(input.right, "right", input);
+    const result = reconcile(left.rows, right.rows, {
+      toleranceMinor: BigInt(input.toleranceMinor ?? 0),
+      windowDays: input.windowDays ?? 3,
+      allowManyToOne: input.allowManyToOne !== false,
+      maxSubsetSize: input.maxSubsetSize ?? 6,
+      maxCombinations: RECONCILE_LIMITS.maxCombinations,
+      feeToleranceMinor: BigInt(input.feeToleranceMinor ?? 0),
+      requireReferenceMatch: input.requireReferenceMatch === true,
+      exponent: exponentFor(currency, input.exponent),
+      currency,
+      propose: input.propose,
+    });
+    const unreadable = {
+      ...(left.unreadable === undefined ? {} : { left: left.unreadable }),
+      ...(right.unreadable === undefined ? {} : { right: right.unreadable }),
+    };
+    return json(
+      Object.keys(unreadable).length === 0
+        ? result
+        : {
+            ...result,
+            // Statement rows that could not be read, and so are in neither
+            // the matched nor the unmatched lists: the reconciliation does
+            // not cover them.
+            unreadableStatementRows: unreadable,
+          },
     );
-    return json(result);
   },
 });
 
@@ -694,6 +746,10 @@ const partySchema = z
 
 export const invoiceRender: RegisteredTool = buildTool({
   name: "InvoiceRender",
+  operativeArgs: [
+    { field: "dbPath", kind: "path", default: DEFAULT_DB_PATH },
+    { field: "outDir", kind: "path", beneath: "all" },
+  ],
   description:
     "Render an invoice, receipt, credit note or quote to HTML, Markdown and JSON with a gap-free document number and totals computed rather than supplied. Use it instead of a model emitting invoice HTML: the number and the document record are allocated in ONE transaction, so a crash cannot burn a number out of a legally required sequence, and repeating the call with the same idempotency key returns the same number and the same bytes. Nothing is formatted through Intl, so the output does not move with an ICU upgrade; the yearly reset takes its year from the issue date, not the clock. Files are written under the workspace. It submits nothing and asks for no payment credentials.",
   inputSchema: z
@@ -833,7 +889,7 @@ export const invoiceRender: RegisteredTool = buildTool({
     const custom =
       input.templateFile === undefined
         ? input.template
-        : readTextFile(resolveSafe("InvoiceRender", input.templateFile).real);
+        : readTextFile("InvoiceRender", input.templateFile, MAX_TEMPLATE_BYTES);
 
     // The hash covers everything that determines the rendered bytes, so a
     // replay under the same key can be checked for being the same document —
@@ -954,21 +1010,38 @@ export const invoiceRender: RegisteredTool = buildTool({
     const files: string[] = [];
     if (outDir !== null) {
       const dir = outDir;
-      mkdirSync(dir.real, { recursive: true });
       for (const [format, text] of Object.entries(rendered).sort()) {
         const name = `${allocation.number}.${format === "markdown" ? "md" : format}`;
-        // Belt and braces over the check above: the composed path goes back
-        // through the workspace resolver, so containment is enforced by the
-        // resolver every other path in this package uses and not only by the
-        // character rule that produced this name.
-        const target = resolveSafe("InvoiceRender", `${dir.rel}/${name}`).abs;
-        // Written to a temporary name and renamed: a rename within one
-        // directory is atomic, so a reader never sees half an invoice, and a
-        // crash mid-write leaves the previous file rather than a truncated one.
-        const temp = `${target}.${payloadHash.slice(0, 8)}.tmp`;
-        mkdirSync(dirname(temp), { recursive: true });
-        writeFileSync(temp, text, "utf-8");
-        renameSync(temp, target);
+        const rel = joinRel(dir.rel, name);
+        // Belt and braces over the check above: the composed path is contained
+        // again where it is written, by the physical location of its directory
+        // and its leaf, not only by the character rule that produced the name.
+        // writeFileSafe writes a temp under a RANDOM name, created
+        // O_EXCL|O_NOFOLLOW beside the target, and renames it into place: a
+        // reader never sees half an invoice, a crash leaves the previous file,
+        // and nothing is written through a link that LEAVES the workspace. The
+        // old temp name (`<target>.<hash8>.tmp`) was predictable from the
+        // caller's own input, so a link planted there wrote the invoice
+        // outside the workspace and left the target linked out. Missing
+        // directories under outDir are created one at a time, each checked. A
+        // link at the target that stays inside the workspace is followed (an
+        // operator who archives invoices behind a link keeps working, as on
+        // 0.7.0); a link OUT of the workspace, or a FIFO or other special
+        // file, is refused.
+        const written = writeFileSafe(workspaceRoot(), rel, text, {
+          overwrite: true,
+          createParents: true,
+          leafSymlink: "follow-contained",
+        });
+        if (!written.ok) {
+          // The number is already allocated and recorded with this payload, so
+          // it is not lost: a replay under the same key re-renders these bytes.
+          // written.reason already states nothing was written, so it is not
+          // repeated here.
+          throw new LedgerError(
+            `InvoiceRender: ${allocation.number} is allocated and recorded, but its file could not be written — ${written.reason}. Fix the destination (a link out of the workspace, or a special file at the target: move it aside, or choose another outDir) and repeat the call with the same idempotencyKey to write the same files.`,
+          );
+        }
         files.push(`${dir.rel}/${name}`);
       }
     }

@@ -95,7 +95,7 @@ describe("ABI encoding, against real calldata", () => {
     expect(() => encodeCall("f(uint8)", [256n])).toThrow(/does not fit in a uint8/);
     expect(() => encodeCall("f(uint256)", [-1n])).toThrow(/negative/);
     expect(() => encodeCall("f(int8)", [128n])).toThrow(/does not fit in an int8/);
-    expect(() => encodeCall("f(address)", ["0x1234"])).toThrow(/20 bytes/);
+    expect(() => encodeCall("f(address)", ["0x1234"])).toThrow(/0x followed by 40 hex characters/);
     expect(() => encodeCall("f(bytes4)", ["0xdead"])).toThrow(/needs 4 bytes/);
   });
 
@@ -113,6 +113,84 @@ describe("ABI encoding, against real calldata", () => {
 
   test("an argument count mismatch is caught before anything is encoded", () => {
     expect(() => encodeCall("transfer(address,uint256)", [VITALIK])).toThrow(/takes 2 argument/);
+  });
+});
+
+describe("an address is checked where it is encoded, not only by AddressCheck (C132)", () => {
+  // EIP-55's own vector, and the same address with its last letter's case flipped.
+  const GOOD = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+  const TYPO = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD";
+
+  test("a mixed-case address whose checksum fails is refused, not encoded", () => {
+    expect(validateAddress(TYPO).valid).toBe(false);
+    expect(() => encodeCall("transfer(address,uint256)", [TYPO, 1n])).toThrow(
+      "argument[0]: the EIP-55 checksum does not match — at least one character is wrong",
+    );
+    // Nested: an address inside a tuple inside an array.
+    expect(() =>
+      encodeCall("f((address,uint256)[])", [
+        [
+          [GOOD, 1n],
+          [TYPO, 2n],
+        ],
+      ]),
+    ).toThrow(/argument\[0\]\[1\]\[0\]: the EIP-55 checksum does not match/);
+  });
+
+  test("an address without its 0x, or with 0X, is refused as AddressCheck refuses it", () => {
+    expect(() => encodeCall("f(address)", [GOOD.slice(2)])).toThrow(/an address starts with 0x/);
+    expect(() => encodeCall("f(address)", [`0X${GOOD.slice(2)}`])).toThrow(
+      /starts with a lowercase 0x; this starts with 0X/,
+    );
+    expect(() => encodeCall("f(address)", [42])).toThrow(/an address is a 0x hex string/);
+  });
+
+  test("a good checksum, all-lowercase and all-uppercase hex encode to the same calldata", () => {
+    const want = encodeCall("f(address)", [GOOD]);
+    expect(encodeCall("f(address)", [GOOD.toLowerCase()])).toBe(want);
+    expect(encodeCall("f(address)", [`0x${GOOD.slice(2).toUpperCase()}`])).toBe(want);
+  });
+
+  test("TypedDataHash refuses the typo in a message field and in verifyingContract", () => {
+    const types = { Mail: [{ name: "to", type: "address" }] };
+    const digest = (domain: Record<string, unknown>, to: string) =>
+      typedDataDigest({ name: "T", chainId: 1, ...domain }, types, "Mail", { to }).digest;
+    expect(() => digest({}, TYPO)).toThrow(/Mail\.to\[0\]: the EIP-55 checksum does not match/);
+    expect(() => digest({ verifyingContract: TYPO }, GOOD)).toThrow(
+      /EIP712Domain\.verifyingContract\[0\]: the EIP-55 checksum does not match/,
+    );
+    // The refusal is about the value, not reported as an unknown type.
+    expect(() => digest({}, TYPO)).not.toThrow(/neither a struct/);
+    expect(digest({ verifyingContract: GOOD.toLowerCase() }, GOOD)).toBe(
+      digest({ verifyingContract: GOOD }, GOOD.toLowerCase()),
+    );
+  });
+});
+
+describe("EIP-712 bytes are read by the coder's strict decoder (C133)", () => {
+  const types = { Blob: [{ name: "data", type: "bytes" }] };
+  const digest = (data: unknown) =>
+    typedDataDigest({ name: "T", chainId: 1 }, types, "Blob", { data }).digest;
+
+  test("an odd number of hex digits is refused, not hashed without its last nibble", () => {
+    // 0.7.0: 0xabc, 0xabd and 0xab all gave one digest, and 0xa hashed as 0x.
+    expect(() => digest("0xabc")).toThrow("Blob.data has an odd number of hex digits");
+    expect(() => digest("0xa")).toThrow(/odd number of hex digits/);
+    expect(() => digest("0xzz")).toThrow(/is not hex/);
+  });
+
+  test("a number is refused rather than read as hex digits", () => {
+    expect(() => digest(4660)).toThrow("Blob.data: bytes are a 0x hex string, not a number");
+    expect(() => digest([1, 2])).toThrow(/not a object/);
+    // The ABI coder refuses the same, for bytes and bytesN.
+    expect(() => encodeCall("f(bytes)", [4660])).toThrow(/bytes are a 0x hex string/);
+    expect(() => encodeCall("f(bytes2)", [4660])).toThrow(/bytes are a 0x hex string/);
+  });
+
+  test("well-formed bytes still hash, case-insensitively, and distinctly", () => {
+    expect(digest("0xab")).toBe(digest("0xAB"));
+    expect(digest("0xab")).not.toBe(digest("0xabcd"));
+    expect(digest("0x")).not.toBe(digest("0x00"));
   });
 });
 
@@ -147,6 +225,225 @@ describe("ABI decoding", () => {
   test("odd-length or non-hex data is rejected", () => {
     expect(() => decodeData(["uint256"], "0xabc")).toThrow(/odd number of hex/);
     expect(() => decodeData(["uint256"], "0xzz")).toThrow(/not hex/);
+  });
+});
+
+describe("a word that is not the encoding of its type is refused (C209)", () => {
+  /** One word from hex digits, left-padded to 64. */
+  const w = (hex: string): string => `0x${hex.padStart(64, "0")}`;
+
+  test("a uint word must fit its width", () => {
+    expect(() => decodeData(["uint8"], w("100"))).toThrow(
+      "value[0]: a uint8 word holds 256, which does not fit in 8 bits",
+    );
+    // The common mistake the check exists for: a uint256 slot read as uint8.
+    expect(() => decodeData(["uint8"], w((10n ** 18n).toString(16)))).toThrow(/uint8/);
+    expect(decodeData(["uint8"], w("ff"))).toEqual(["255"]);
+    expect(decodeData(["uint64"], w("f".repeat(16)))).toEqual([(2n ** 64n - 1n).toString()]);
+    expect(() => decodeData(["uint64"], w(`1${"0".repeat(16)}`))).toThrow(/uint64/);
+  });
+
+  test("an int word must be the sign extension of its low bits", () => {
+    expect(() => decodeData(["int8"], w("80"))).toThrow(
+      "value[0]: the word is not a sign-extended int8",
+    );
+    expect(() => decodeData(["int8"], w("100"))).toThrow(/sign-extended int8/);
+    expect(() => decodeData(["int8"], `0x${"f".repeat(60)}0080`)).toThrow(/sign-extended/);
+    expect(decodeData(["int8"], `0x${"f".repeat(62)}80`)).toEqual(["-128"]);
+    expect(decodeData(["int8"], w("7f"))).toEqual(["127"]);
+    expect(decodeData(["int8"], `0x${"f".repeat(64)}`)).toEqual(["-1"]);
+  });
+
+  test("an address word must have zero upper bytes", () => {
+    expect(() => decodeData(["address"], `0x${"ff".repeat(12)}${"11".repeat(20)}`)).toThrow(
+      "value[0]: an address word has non-zero upper bytes (0xffffffffffffffffffffffff)",
+    );
+    expect(decodeData(["address"], `0x${"00".repeat(12)}${"11".repeat(20)}`)).toEqual([
+      `0x${"11".repeat(20)}`,
+    ]);
+  });
+
+  test("a bytesN word must have zero padding after its bytes", () => {
+    expect(() => decodeData(["bytes4"], `0xdeadbeef${"ab".repeat(28)}`)).toThrow(
+      "value[0]: a bytes4 word has non-zero padding after its 4 bytes",
+    );
+    expect(decodeData(["bytes4"], `0xdeadbeef${"00".repeat(28)}`)).toEqual(["0xdeadbeef"]);
+    expect(decodeData(["bytes32"], `0x${"ab".repeat(32)}`)).toEqual([`0x${"ab".repeat(32)}`]);
+  });
+
+  test("the check reaches inside arrays and tuples, and names the element", () => {
+    const pad = (hex: string): string => hex.padStart(64, "0");
+    expect(() => decodeData(["uint8[2]"], `0x${pad("1")}${pad("10000")}`)).toThrow(
+      /^value\[0\]\[1\]: a uint8 word/,
+    );
+    expect(() => decodeData(["(uint256,address)"], `0x${pad("1")}${"ff".repeat(32)}`)).toThrow(
+      /^value\[0\]\[1\]: an address word/,
+    );
+  });
+
+  test("the widest types take every word, at their extremes", () => {
+    const max = (2n ** 256n - 1n).toString(16);
+    expect(decodeData(["uint256"], w(max))).toEqual([(2n ** 256n - 1n).toString()]);
+    expect(decodeData(["int256"], w(`8${"0".repeat(63)}`))).toEqual([(-(2n ** 255n)).toString()]);
+    expect(decodeData(["int256"], w(`7${"f".repeat(63)}`))).toEqual([(2n ** 255n - 1n).toString()]);
+  });
+
+  test("whatever the encoder writes, the decoder reads back", () => {
+    const cases: Array<[string, unknown]> = [
+      ["uint8", 255n],
+      ["uint16", 65535n],
+      ["uint64", 2n ** 64n - 1n],
+      ["uint256", 2n ** 256n - 1n],
+      ["int8", -128n],
+      ["int8", 127n],
+      ["int64", -(2n ** 63n)],
+      ["int256", -1n],
+      ["int256", 2n ** 255n - 1n],
+      ["address", VITALIK],
+      ["bytes1", "0xab"],
+      ["bytes4", "0xdeadbeef"],
+      ["bytes32", `0x${"cd".repeat(32)}`],
+      ["bool", true],
+      ["bool", false],
+    ];
+    for (const [type, value] of cases) {
+      const data = `0x${encodeCall(`f(${type})`, [value as never]).slice(10)}`;
+      const expected =
+        typeof value === "bigint"
+          ? value.toString()
+          : typeof value === "string"
+            ? value.toLowerCase()
+            : value;
+      expect({ type, decoded: decodeData([type], data)[0] }).toEqual({ type, decoded: expected });
+    }
+  });
+});
+
+/** One ABI word holding `n`. */
+const word = (n: number | bigint): string => BigInt(n).toString(16).padStart(64, "0");
+
+/**
+ * `uint256` nested `depth` arrays deep, where every level's `w` heads point at
+ * ONE shared child: `w^depth` values from about `depth * (w + 1)` words. No
+ * encoder writes this; a hostile contract's return data can.
+ */
+function sharedOffsets(depth: number, w: number): string {
+  let hex = word(32);
+  for (let level = 1; level < depth; level++) hex += word(w) + word(w * 32).repeat(w);
+  return `0x${hex}${word(w)}${word(7).repeat(w)}`;
+}
+
+describe("ABI decoding cannot be made to inflate (C085)", () => {
+  test("heads that share one tail are refused, not decoded again and again", () => {
+    // 196 words that decode to 262,144 values on 0.7.0.
+    const data = sharedOffsets(3, 64);
+    expect(data.length).toBeLessThan(13_000);
+    expect(() => decodeData(["uint256[][][]"], data)).toThrow(
+      /decodes to more than 4 times its own size — its offsets point at the same bytes/,
+    );
+  });
+
+  test("a hundred strings sharing one 10,000-byte tail are refused", () => {
+    const text = `${word(10_000)}${"61".repeat(10_000)}${"00".repeat(16)}`;
+    const data = `0x${word(32)}${word(100)}${word(100 * 32).repeat(100)}${text}`;
+    expect(() => decodeData(["string[]"], data)).toThrow(/decodes to more than 4 times/);
+  });
+
+  test("a batch whose rows share one revert blob is a batch-level refusal", () => {
+    // (bool,bytes)[] with 1,000 rows: every row's head points at one row,
+    // whose bytes point at one 4 KB blob.
+    const rows = 1_000;
+    const row = `${word(1)}${word(64)}${word(4096)}${"ab".repeat(4096)}`;
+    const data = `0x${word(32)}${word(rows)}${word(rows * 32).repeat(rows)}${row}`;
+    expect(() => decodeAggregate3(data, rows)).toThrow(
+      /^the batch's own return data is not \(bool,bytes\)\[\].*decodes to more than 4 times/,
+    );
+  });
+
+  test("a length the data cannot hold is refused before anything is allocated", () => {
+    // 0.7.0 built a 20,000,000-slot array from the type string first, then
+    // failed on the empty data.
+    expect(() => decodeData(["uint256[20000000]"], "0x")).toThrow(
+      "value[0]: claims 20000000 items, more than the data could hold",
+    );
+    expect(() => decodeData(["uint256[4294967295]"], "0x")).toThrow(/claims 4294967295 items/);
+    // A dynamic length is checked against what follows its own offset, not
+    // against the whole blob.
+    const data = `0x${word(64)}${word(0)}${word(3)}${word(1)}${word(2)}`;
+    expect(() => decodeData(["uint256[]"], data)).toThrow(/claims 3 items/);
+    expect(() => decodeData(["(uint256[1000000])[1000000]"], "0x")).toThrow(/claims 1000000 items/);
+  });
+
+  test("an array of a type that takes no bytes cannot claim a length", () => {
+    expect(() => decodeData(["()[]"], `0x${word(32)}${word(1_000_000_000)}`)).toThrow(
+      /an array of \(\) holds nothing the data can back/,
+    );
+  });
+
+  test("an empty tuple is refused, so a type string cannot multiply the data (C085)", () => {
+    // Each item is ONE word of data, but the type gives it 2,700 components
+    // that read nothing: 0.7.1's first cut decoded 2,000 words to 5.4M values.
+    const type = `(${"(),".repeat(2_700)}uint256)[]`;
+    expect(type.length).toBeLessThan(8192);
+    const items = 250;
+    const data = `0x${word(32)}${word(items)}${word(1).repeat(items)}`;
+    expect(() => decodeData([type], data)).toThrow(
+      "value[0][0][0]: () is an empty tuple — no Solidity type is one, and it decodes from no bytes, so nothing in the data can back it",
+    );
+    expect(() => decodeData(["()"], "0x")).toThrow(/\(\) is an empty tuple/);
+    expect(() => decodeData(["(uint256,())"], `0x${word(1)}`)).toThrow(/\(\) is an empty tuple/);
+  });
+
+  test("a decode yields at most as many values as its words could hold for its types", () => {
+    // Every head of an outer array points at ONE inner array of two
+    // `uint256[1]` items. That reads three words per item (within the word
+    // budget) but yields five values per item from a single word of heads.
+    const heads = 400;
+    const data = `0x${word(32)}${word(heads)}${word(heads * 32).repeat(heads)}${word(2)}${word(7)}${word(8)}`;
+    expect(() => decodeData(["uint256[1][][]"], data)).toThrow(
+      /^value\[0\]\[\d+\]\[\d+\]\[0\]: the data decodes to more than 1620 values, more than its size can hold for these types when each word is read once .* Refusing to inflate it\.$/,
+    );
+    // The same shape with each head pointing at its own inner array decodes.
+    const honest = [
+      Array.from({ length: heads }, (_, i) => [[String(i)], [String(i + 1)]]),
+    ] as const;
+    const hex = `0x${encodeCall("f(uint256[1][][])", [...honest]).slice(10)}`;
+    expect(decodeData(["uint256[1][][]"], hex)).toEqual([...honest]);
+  });
+
+  // Slow by construction (it decodes the largest honest encodings; 2.3 s on CI's loaded runner).
+  test("honest encodings, however large, still decode exactly", () => {
+    const square = Array.from({ length: 200 }, (_, i) =>
+      Array.from({ length: 200 }, (_, j) => String(i * 200 + j)),
+    );
+    const t = parseType("uint256[][]");
+    const hex = `0x${encodeCall("f(uint256[][])", [square]).slice(10)}`;
+    expect(decodeData([t.canonical], hex)).toEqual([square]);
+    const strings = Array.from({ length: 300 }, (_, i) => "x".repeat(i));
+    const packed = `0x${encodeCall("f(string[],bytes[2])", [strings, ["0xabcd", "0x"]]).slice(10)}`;
+    expect(decodeData(["string[]", "bytes[2]"], packed)).toEqual([strings, ["0xabcd", "0x"]]);
+  }, 20_000);
+});
+
+describe("type strings are parsed in linear time (C085)", () => {
+  test("nesting past the depth limit is refused, at any length", () => {
+    expect(() => parseType(`uint256${"[1]".repeat(33)}`)).toThrow(/more than 32 levels deep/);
+    expect(() => parseType(`${"(".repeat(40)}uint256${")".repeat(40)}`)).toThrow(
+      /more than 32 levels deep/,
+    );
+    expect(parseType(`uint256${"[1]".repeat(32)}`).canonical).toEndWith("[1]");
+  });
+
+  test("a type or signature longer than the cap is refused before it is scanned", () => {
+    const long = `(${Array.from({ length: 1200 }, () => "uint256").join(",")})`;
+    expect(long.length).toBeGreaterThan(8192);
+    expect(() => parseType(long)).toThrow(/characters is longer than the 8192 this reads/);
+    expect(() => parseSignature(`f${long}`)).toThrow(/signature of \d+ characters/);
+  });
+
+  test("a fixed length past the safe-integer range is refused", () => {
+    expect(() => parseType("uint256[99999999999999999999]")).toThrow(/too large to lay out/);
+    expect(() => parseType("uint256[4294967295][4294967295]")).toThrow(/too large to lay out/);
   });
 });
 
@@ -239,6 +536,165 @@ describe("EIP-712, against the specification's own example", () => {
     const a = typedDataDigest(domain, types, "Mail", message);
     const b = typedDataDigest(domain, types, "Mail", { ...message, contents: "Hello, Bob?" });
     expect(a.digest).not.toBe(b.digest);
+  });
+});
+
+describe("EIP-712 types are checked once, before anything is hashed", () => {
+  const domain = { name: "T", chainId: 1 };
+
+  test("a struct referenced but never instantiated still has its field types checked", () => {
+    // Q only appears inside an empty array, so no Q is ever hashed; its type
+    // string went into the encoded type unexamined, and the digest came back.
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [{ name: "qs", type: "Q[]" }],
+      Q: [{ name: "z", type: "[1][1]x" }],
+    };
+    expect(() => typedDataDigest(domain, types, "M", { ps: [{ qs: [] }] })).toThrow(
+      /^Q\.z: "\[1\]\[1\]x" is neither a struct defined in types nor an ABI type/,
+    );
+  });
+
+  test("a long type string is refused by its length, not scanned in the square of it", () => {
+    // `(\[\d*\])+$` backtracked quadratically on this, once per struct
+    // instance: about 120 KB of request blocked the event loop for 30 s.
+    const long = `${"[1]".repeat(3_000)}x`;
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [{ name: "qs", type: "Q[]" }],
+      Q: [{ name: "z", type: long }],
+    };
+    const message = { ps: Array.from({ length: 6 }, () => ({ qs: [] })) };
+    expect(() => typedDataDigest(domain, types, "M", message)).toThrow(
+      /^Q\.z: "\[1\]\[1\].*… \(9001 characters\)" is neither a struct .* longer than the 8192 this reads/,
+    );
+  });
+
+  test("a struct array may nest no deeper than an ABI type", () => {
+    const types = {
+      M: [{ name: "p", type: `P${"[]".repeat(33)}` }],
+      P: [{ name: "a", type: "uint8" }],
+    };
+    expect(() => typedDataDigest(domain, types, "M", { p: [] })).toThrow(
+      /^M\.p: "P\[\]\[\].*" nests arrays more than 32 levels deep/,
+    );
+    const ok = {
+      M: [{ name: "p", type: `P${"[]".repeat(32)}` }],
+      P: [{ name: "a", type: "uint8" }],
+    };
+    expect(typedDataDigest(domain, ok, "M", { p: [] }).digest).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  test("a struct's type hash is computed once per digest, not once per instance", () => {
+    // Every P re-encoded every struct P refers to, so a message of many small
+    // instances cost its count times the size of the types. Counting the
+    // reads of Q's field list shows the work does not grow with the count.
+    let reads = 0;
+    const qFields = new Proxy([{ name: "a", type: "uint256" }], {
+      get(target, key, receiver) {
+        if (key === "length") reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [
+        { name: "x", type: "uint8" },
+        { name: "qs", type: "Q[]" },
+      ],
+      Q: qFields,
+    };
+    const readsFor = (count: number): number => {
+      reads = 0;
+      const message = { ps: Array.from({ length: count }, () => ({ x: 1, qs: [] })) };
+      expect(typedDataDigest(domain, types, "M", message).digest).toMatch(/^0x[0-9a-f]{64}$/);
+      return reads;
+    };
+    const one = readsFor(1);
+    expect(one).toBeGreaterThan(0);
+    expect(readsFor(50)).toBe(one);
+  });
+
+  test("array suffixes are read the same way the digest always read them", () => {
+    // EIP-712's own example, with a fixed and a nested array added: the
+    // encoded type is unchanged by the linear reader.
+    const types = {
+      Mail: [
+        { name: "to", type: "Person[2]" },
+        { name: "ids", type: "uint256[][1]" },
+      ],
+      Person: [{ name: "name", type: "string" }],
+    };
+    expect(encodeType("Mail", types)).toBe(
+      "Mail(Person[2] to,uint256[][1] ids)Person(string name)",
+    );
+    const digest = typedDataDigest(domain, types, "Mail", {
+      to: [{ name: "a" }, { name: "b" }],
+      ids: [[1, 2]],
+    });
+    expect(digest.encodedType).toBe("Mail(Person[2] to,uint256[][1] ids)Person(string name)");
+    expect(() =>
+      typedDataDigest(domain, types, "Mail", { to: [{ name: "a" }], ids: [[1]] }),
+    ).toThrow("Mail.to: expected 2 items, got 1");
+  });
+});
+
+describe("EIP-712 reads only what the message and the types define (C210)", () => {
+  const domain = { name: "X", version: "1", chainId: 1 };
+  const INHERITED = ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"];
+
+  test("a field every object inherits is still a missing field", () => {
+    // 0.7.0 hashed Object.prototype.toString's source text for "toString".
+    for (const name of INHERITED) {
+      expect(() => typedDataDigest(domain, { M: [{ name, type: "string" }] }, "M", {})).toThrow(
+        `"M" requires the field "${name}", which the message does not have`,
+      );
+    }
+  });
+
+  test("the same field, present in the message, is hashed as written", () => {
+    const own = typedDataDigest(domain, { M: [{ name: "toString", type: "string" }] }, "M", {
+      toString: "hi",
+    });
+    const plain = typedDataDigest(domain, { M: [{ name: "note", type: "string" }] }, "M", {
+      note: "hi",
+    });
+    expect(own.digest).toMatch(/^0x[0-9a-f]{64}$/);
+    // Same value, different field name: the type hash differs, so the digest does.
+    expect(own.digest).not.toBe(plain.digest);
+  });
+
+  test("a type name every object inherits is not a struct nobody defined", () => {
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "a", type: "constructor" }] }, "M", { a: {} }),
+    ).toThrow(/M\.a: "constructor" is neither a struct defined in types nor an ABI type/);
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "a", type: "string" }] }, "toString", {}),
+    ).toThrow('the type "toString" is not defined');
+  });
+
+  test("a struct field whose value is not an object is refused by name", () => {
+    const nested = {
+      M: [{ name: "a", type: "P" }],
+      P: [{ name: "b", type: "string" }],
+    };
+    expect(() => typedDataDigest(domain, nested, "M", { a: "str" })).toThrow(
+      '"P" expects an object for its fields, got a string',
+    );
+    expect(() => typedDataDigest(domain, nested, "M", { a: null })).toThrow(/got null/);
+    expect(() => typedDataDigest(domain, nested, "M", { a: [] })).toThrow(/got an array/);
+  });
+
+  test("a string field takes text, not an object printed as [object Object]", () => {
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: { x: 1 } }),
+    ).toThrow("M.s: a string field takes text, not an object");
+    // A number still reads as the text it prints as.
+    expect(
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: 42 }).digest,
+    ).toBe(
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: "42" }).digest,
+    );
   });
 });
 

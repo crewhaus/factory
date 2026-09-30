@@ -22,7 +22,7 @@
  * blocks. `getBlockNumber()` rides along in the same batch so the answer says
  * which block it is a snapshot of.
  */
-import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
+import { CHAINS_BLOCK_EXAMPLE, type ChainAdapter } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   MULTICALL3_ADDRESS,
@@ -60,7 +60,7 @@ export type ChainReader = (read: ChainRead) => Promise<unknown>;
 
 const unbound: ChainReader = async (read) => {
   throw new TokenError(
-    `no chain reader is bound, so chain ${read.chainId} cannot be read. This package contains no RPC client of its own: the runtime binds one with _setChainReader(), and chainReaderFromAdapters() wires it from the spec's chains[] block in one line.`,
+    `no chain is configured, so chain ${read.chainId} cannot be read. Declare it in the spec — ${CHAINS_BLOCK_EXAMPLE}.`,
   );
 };
 
@@ -96,13 +96,21 @@ export function assertReadMethod(method: string): asserts method is ChainReadMet
  */
 export function chainReaderFromAdapters(
   resolve: (chainId: string) => ChainAdapter | undefined,
+  declared?: ReadonlyArray<string>,
 ): ChainReader {
   return async (read) => {
     assertReadMethod(read.method);
     const adapter = resolve(String(read.chainId));
     if (adapter === undefined) {
+      // These tools name a chain by its EIP-155 id, and look it up as that
+      // number written in decimal. A chain declared as "mainnet" is there,
+      // just not under the id asked for — so say which ids ARE declared.
+      const known =
+        declared === undefined || declared.length === 0
+          ? ""
+          : ` The spec declares ${declared.map((id) => `"${id}"`).join(", ")}; the token tools look a chain up by its EIP-155 chain id in decimal, so declare it as id: "${read.chainId}".`;
       throw new TokenError(
-        `no chain adapter is registered for chain ${read.chainId}; declare it in the spec's chains[] block`,
+        `no chain is declared with id "${read.chainId}", so chain ${read.chainId} cannot be read.${known === "" ? " Declare it in the spec's chains[] block." : known}`,
       );
     }
     return adapter.rpcRead(read.method, read.params);
@@ -252,7 +260,7 @@ export async function readCalls(opts: {
     rows = decodeAggregate3(asHex(answer, "the Multicall3 batch"), request.callCount);
   } catch (err) {
     throw new TokenError(
-      `the Multicall3 batch at ${request.to} did not answer with results: ${(err as Error).message}. If this chain has no Multicall3 deployment at that address, pass multicall3Address, or batch:false to read the calls one at a time.`,
+      `the Multicall3 batch at ${request.to} did not answer with results: ${(err as Error).message}. If this chain's Multicall3 is deployed elsewhere, the operator names it in tool_config.token.multicall3; or pass batch:false to read the calls one at a time.`,
     );
   }
 

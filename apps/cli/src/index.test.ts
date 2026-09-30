@@ -125,7 +125,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stdout).toContain("compiled bundle");
-  });
+  }, 20_000);
 
   test("emits a pinned package.json so the bundle runs standalone", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
@@ -145,7 +145,7 @@ describe("crewhaus compile", () => {
     for (const dep of imports) expect(manifest.dependencies[dep]).toBeDefined();
     expect(cliVersion()).toBeDefined();
     for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
-  });
+  }, 20_000);
 
   test("a user-authored package.json in the out-dir is kept on plain compile", async () => {
     const manifestPath = join(tmp, "package.json");
@@ -159,7 +159,7 @@ describe("crewhaus compile", () => {
     // no signal (e.g. after an --emit-as cf-worker compile into this dir).
     expect(result.stdout).toContain(`kept ${manifestPath}`);
     expect(result.stdout).toContain("pinned @crewhaus manifest was NOT written");
-  });
+  }, 20_000);
 
   test("--with-eval-harness emits a pinned manifest for the eval bridge too", async () => {
     const result = await runCli(["compile", CHANNEL_SPEC, "--with-eval-harness", "-o", tmp]);
@@ -172,7 +172,7 @@ describe("crewhaus compile", () => {
       expect(Object.keys(manifest.dependencies).length).toBeGreaterThan(0);
       for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
     }
-  });
+  }, 20_000);
 
   // Item 42 — generated bundle README, DEFAULT-ON.
   test("emits a generated README.md into the bundle by default (item 42)", async () => {
@@ -184,14 +184,14 @@ describe("crewhaus compile", () => {
     expect(md).toContain("<!-- crewhaus:generated-readme -->");
     expect(md).toContain("| Target | `cli` |");
     expect(md).toContain("bun agent.ts");
-  });
+  }, 20_000);
 
   test("--no-readme skips the generated README.md (item 42 opt-out)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--no-readme", "-o", tmp]);
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(existsSync(join(tmp, "README.md"))).toBe(false);
-  });
+  }, 20_000);
 
   test("a user-authored README.md in the out-dir is kept, with a notice (item 42)", async () => {
     const readmePath = join(tmp, "README.md");
@@ -201,7 +201,7 @@ describe("crewhaus compile", () => {
     expect(readFileSync(readmePath, "utf-8")).toBe("# my notes\n\nhand-written\n");
     expect(result.stdout).toContain("kept");
     expect(result.stdout).toContain("--no-readme");
-  });
+  }, 20_000);
 
   test("a previously GENERATED README.md is refreshed on recompile (item 42)", async () => {
     const first = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
@@ -212,7 +212,7 @@ describe("crewhaus compile", () => {
     expect(second.exitCode).toBe(0);
     expect(second.stdout).toContain(`wrote ${readmePath}`);
     expect(readFileSync(readmePath, "utf-8")).toBe(generated);
-  });
+  }, 20_000);
 
   test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
@@ -222,12 +222,12 @@ describe("crewhaus compile", () => {
     const ir = JSON.parse(readFileSync(join(tmp, "ir.json"), "utf-8"));
     expect(ir.target).toBe("cli");
     expect(ir.agent).toBeDefined();
-  });
+  }, 20_000);
 
   test("--emit-ir without -o exits 0 (stdout-streaming covered by manual usage; the\nspawn-pipe capture in this harness is racy on stdout — see other compile tests)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: projectLoop() of the
   // lowered IR, the wire contract shared with the studio /builder and the
@@ -254,17 +254,17 @@ describe("crewhaus compile", () => {
     // CLI, the worker endpoint, and the studio must render the same object.
     const projection = JSON.parse(readFileSync(loopPath, "utf-8"));
     expect(JSON.stringify(projection)).toBe(JSON.stringify(golden["cli"]));
-  });
+  }, 20_000);
 
   test("--emit-loop without -o exits 0 (human render; stdout capture is racy — see --emit-ir note)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-loop"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("--emit-loop --json without -o exits 0", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--json"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("--emit-loop is a read-only view: the FR-002 scope gate does NOT run (POST /loop parity)", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -279,7 +279,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "loop.json"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--emit-loop rejects --check and --emit-ir combinations", async () => {
     const withCheck = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--check"]);
@@ -288,7 +288,7 @@ describe("crewhaus compile", () => {
     const withEmitIr = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--emit-ir"]);
     expect(withEmitIr.exitCode).toBe(1);
     expect(withEmitIr.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   // FR-002 — compile-time external-sink scope gate, now DEFAULT-ON.
   const MCP_SINK_SPEC =
@@ -304,7 +304,7 @@ describe("crewhaus compile", () => {
     // Item 42 — README emission and its opt-out are documented too.
     expect(result.stdout).toContain("README.md");
     expect(result.stdout).toContain("--no-readme");
-  });
+  }, 20_000);
 
   // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
   // sink the offline tool map cannot resolve to a scope:"external" tool must
@@ -324,7 +324,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("unverifiable offline");
     // refused to emit
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // (a') Isolation: on --emit-ir there is NO target emitter in the path, so the
   // spec lowers cleanly and the ONLY thing that can produce exit 1 is the scope
@@ -339,7 +339,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(existsSync(join(outDir, "ir.json"))).toBe(false);
-  });
+  }, 20_000);
 
   // (b) OPT-OUT — the same unmarked sink passes the compile when the user
   // explicitly bypasses the gate. We assert against the --emit-ir path because
@@ -364,7 +364,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "ir.json"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--no-strict-scope is an accepted alias that also bypasses the gate", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -381,7 +381,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "ir.json"))).toBe(true);
-  });
+  }, 20_000);
 
   // (b') OPT-OUT, BUNDLE MODE — emitter errors must exit cleanly, not crash.
   // Once --allow-unmarked-sinks bypasses the scope gate, the same unresolvable
@@ -397,7 +397,9 @@ describe("crewhaus compile", () => {
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
     // Clean die() output: prefixed "crewhaus: " and names the offending tool.
-    expect(result.stderr).toContain('crewhaus: unknown tool "mcp__evil__exfiltrate"');
+    // The compiler names the site (`tools:`) and where MCP tools come from.
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "mcp__evil__exfiltrate"');
+    expect(result.stderr).toContain("mcp_servers");
     // The gate was bypassed — it is NOT the source of this failure…
     expect(result.stderr).not.toContain("[strict]");
     // …and the emitter error did NOT escape as an uncaught crash: neither the
@@ -406,7 +408,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     // Nothing was emitted.
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // The report's literal repro: a plain non-outward unknown tool name (one the
   // gate never flags, so it reaches the emitter with or without the opt-out)
@@ -420,11 +422,11 @@ describe("crewhaus compile", () => {
     const outDir = join(tmp, "out");
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('crewhaus: unknown tool "not-a-real-tool"');
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "not-a-real-tool"');
     expect(result.stderr).not.toContain("TargetEmitError");
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // A malformed credential env-ref (`$lowercase` on a Slack token) is a hard
   // compile error from lowerCredential(). It must render as a clean die()
@@ -461,7 +463,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   test("compile (no flag) passes when an outward tool (fetch) is correctly external", async () => {
     // Exercises the full resolve path: collectToolNames → loadToolMap →
@@ -478,7 +480,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Back-compat: `--strict` is still accepted (now a no-op since the gate is
   // default-on) so existing invocations and CI scripts keep working unchanged.
@@ -491,14 +493,14 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   test("--strict on a clean (toolless) spec still emits and exits 0", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--strict", "-o", tmp]);
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Regression: a sub-agent `tools:` list names tools by their REGISTERED name
   // (PascalCase, e.g. `WebSearch`) — that is the contract the runtime
@@ -520,7 +522,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch A) — compile warnings (accepted-but-unwired
   // spec keys) always print, one line per warning, code + path + message;
@@ -546,7 +548,7 @@ describe("crewhaus compile", () => {
     // Warnings do not fail the build without --strict.
     expect(result.stdout).toContain("compiled bundle");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   test("compile --strict escalates warnings to errors and writes NOTHING", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -561,7 +563,153 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
     // A strict-failed build must not emit — the out dir is never created.
     expect(existsSync(outDir)).toBe(false);
-  });
+  }, 20_000);
+
+  // 0.7.1 (permission-integration#12) — a rule written with the spec key
+  // (`removePath`) never matches the tool's name (`RemovePath`); compile says
+  // so and --strict refuses it, like any remediable warning.
+  test("compile warns on a permission rule that can never fire, and --strict refuses it", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      'name: deadrule\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\ntools: [removePath]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "removePath(tmp/**)" }\n',
+    );
+    const outDir = join(tmp, "out");
+    const loose = await runCli(["compile", specPath, "--no-register", "-o", outDir], { cwd: tmp });
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain(
+      'crewhaus: warning[permission-rule] permissions.rules: rule "removePath(tmp/**)" names removePath',
+    );
+    expect(loose.stderr).toContain('Write "RemovePath(tmp/**)"');
+    const strictOut = join(tmp, "strict-out");
+    const strict = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
+      { cwd: tmp },
+    );
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    expect(existsSync(strictOut)).toBe(false);
+  }, 30_000);
+
+  // C146 and the review of 89df527f: a deny spelled another way than the
+  // tool's name never fires, so --strict refuses it; a glob that still fires
+  // on a declared MCP server's tools is a note --strict does not escalate.
+  test("compile --strict refuses a misspelled deny, and only notes a glob that reaches MCP tools", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "agent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\n";
+    writeFileSync(
+      specPath,
+      `name: spelled\ntarget: cli\n${head}tools: [codegraphSearch]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "Codegraph*" }\n`,
+    );
+    const dead = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "a")],
+      {
+        cwd: tmp,
+      },
+    );
+    expect(dead.exitCode).toBe(1);
+    expect(dead.stderr).toContain('warning[permission-rule] permissions.rules: rule "Codegraph*"');
+    expect(dead.stderr).toContain('Write "CodeGraph*"');
+    writeFileSync(
+      specPath,
+      `name: mcpdeny\ntarget: cli\n${head}tools: [read, write]\nmcp_servers:\n  fs:\n    transport: stdio\n    command: npx\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "*write*" }\n`,
+    );
+    const noted = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "b")],
+      { cwd: tmp },
+    );
+    expect(noted.stderr).toContain(
+      'warning[permission-rule-note] permissions.rules: rule "*write*"',
+    );
+    expect(noted.stderr).not.toContain("never fires");
+    expect(noted.stderr).not.toContain("escalated to errors");
+    expect(noted.exitCode).toBe(0);
+  }, 60_000);
+
+  // C146 / back-compat (wave III): a model profile's deny and a sub-agent's
+  // deny are checked like the shape's rules, so --strict refuses a dead one;
+  // the trader starter's `alwaysAllow goal_list` is live with a thredz:
+  // block and passes --strict as it did on 0.7.0; a name nothing knows is a
+  // note --strict does not escalate.
+  test("compile --strict reads every rule list, and knows a thredz: block's tools", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "agent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\n";
+    writeFileSync(
+      specPath,
+      `name: lists\ntarget: cli\nmodels:\n  fast: { model: claude-haiku-4-5, permissions: { deny: [fetch] } }\n${head}  model_pool:\n    candidates:\n      - { model: $fast, tags: [cheap] }\n      - { model: claude-opus-4-8, tags: [strong] }\n  sub_agents:\n    helper:\n      description: d\n      instructions: help\n      tools: [RemovePath]\n      permissions: { allow: [], deny: ["removePath(src/**)"] }\ntools: [removePath, fetch]\n`,
+    );
+    const dead = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "a")],
+      { cwd: tmp },
+    );
+    expect(dead.exitCode).toBe(1);
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] models.fast.permissions.deny: rule "fetch"',
+    );
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] agent.sub_agents.helper.permissions.deny: rule "removePath(src/**)"',
+    );
+    writeFileSync(
+      specPath,
+      `name: goals\ntarget: cli\nthredz: { api_key: $THREDZ_API_KEY, goals: true }\n${head}tools: [read]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: goal_list }\n    - { type: alwaysAllow, pattern: goal_write }\n    - { type: alwaysAllow, pattern: goal_update }\n    - { type: alwaysAllow, pattern: "NoSuchTool(**)" }\n`,
+    );
+    const live = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "b")],
+      { cwd: tmp },
+    );
+    expect(live.stderr).not.toContain("goal_");
+    expect(live.stderr).toContain(
+      'warning[permission-rule-note] permissions.rules: rule "NoSuchTool(**)" names NoSuchTool',
+    );
+    expect(live.stderr).not.toContain("escalated to errors");
+    expect(live.exitCode).toBe(0);
+  }, 60_000);
+
+  // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on a 128-tool
+  // provider (even under --strict) and every call then failed with the
+  // provider's 400. A site no model can serve is now refused. The warnings
+  // are informational: an over-limit fallback beside a model that serves
+  // passed --strict on 0.7.0, and an `openai/` model may be sent by
+  // OPENAI_BASE_URL to a gateway with no such limit — both must still pass.
+  test("compile refuses a tool list no model can take; the over-limit warnings never fail --strict", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "name: wide\ntarget: cli\nagent:\n  instructions: i\n";
+    writeFileSync(specPath, `${head}  model: azure/big\ntools: [all-code]\n`);
+    const outDir = join(tmp, "out");
+    const refused = await runCli(["compile", specPath, "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toMatch(
+      /^crewhaus: tools: \d+ tools \(from tools:\) exceed the 128-tool limit Azure OpenAI puts on one request, so every call to model "azure\/big" is refused\./,
+    );
+    expect(refused.stderr).not.toContain("    at ");
+    expect(existsSync(outDir)).toBe(false);
+
+    const strictPasses = async (label: string, code: string, env: Record<string, string> = {}) => {
+      const strictOut = join(tmp, `strict-${label}`);
+      const strict = await runCli(
+        ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
+        { cwd: tmp, env },
+      );
+      expect({ label, exit: strict.exitCode }).toEqual({ label, exit: 0 });
+      expect(strict.stderr).toContain(`crewhaus: warning[${code}] agent.model`);
+      expect(strict.stderr).not.toContain("--strict:");
+      expect(existsSync(join(strictOut, "agent.ts"))).toBe(true);
+    };
+
+    writeFileSync(
+      specPath,
+      `${head}  model: claude-sonnet-4-6\n  model_fallbacks: [azure/big]\ntools: [all-code]\n`,
+    );
+    await strictPasses("fallback", "provider-tool-cap");
+
+    writeFileSync(specPath, `${head}  model: openai/meta-llama/Llama-3.3-70B\ntools: [all-code]\n`);
+    await strictPasses("gateway", "provider-tool-cap-unverified", {
+      OPENAI_BASE_URL: "http://localhost:4000/v1",
+    });
+    await strictPasses("openai", "provider-tool-cap-unverified");
+  }, 60_000);
 
   test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
     const outDir = join(tmp, "out");
@@ -574,7 +722,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("warning[");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
   // wired, correctly configured feature (the outbound-ts join file just has
@@ -600,7 +748,24 @@ describe("crewhaus compile", () => {
     // …but never escalates, and the bundle is written.
     expect(result.stderr).not.toContain("escalated to errors");
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
-  });
+  }, 20_000);
+
+  // 0.7.0 accepted plugins: on channel and ignored it, and passed --strict;
+  // the notice that the daemon now loads them must not fail --strict.
+  test("compile --strict does NOT escalate the informational channel-plugins-at-start notice", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: plugged\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: reply kindly\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\nplugins: [acme-helpers]\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.stderr).toContain("crewhaus: warning[channel-plugins-at-start] plugins:");
+    expect(result.stderr).not.toContain("escalated to errors");
+    expect(result.exitCode).toBe(0);
+  }, 20_000);
 
   // 0.6.0 — the model-plan notices that no spec edit can properly clear are
   // informational too: model-plan-candidate-only fires on a `models:` profile
@@ -661,7 +826,7 @@ describe("crewhaus compile", () => {
     );
     expect(result.stderr).not.toContain("escalated to errors");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   // Item 1 — the cli emitter used to DROP the spec's `feedback:` block, so a
   // compiled bundle had no rating prompt and no user_feedback capture at all
@@ -686,7 +851,7 @@ describe("crewhaus compile", () => {
       "crewhaus: warning[cli-autodistill-toolchain] feedback.autoDistill:",
     );
     expect(result.stderr).not.toContain("escalated to errors");
-  });
+  }, 20_000);
 
   test("compile --help documents the warning line shape and --strict escalation", async () => {
     const result = await runCli(["compile", "--help"]);
@@ -699,7 +864,7 @@ describe("crewhaus compile", () => {
     expect(result.stdout).not.toContain("model-plan-pending-runtime");
     expect(result.stdout).toContain("--strict");
     expect(result.stdout).toContain("Escalate compile warnings to errors");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus init", () => {
@@ -1325,7 +1490,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
   test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     const original =
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reit\n";
     writeFileSync(specPath, original);
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
@@ -1334,12 +1499,13 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(readFileSync(specPath, "utf-8")).toBe(original);
     // A suggestion is printed naming both candidates, not a silent rewrite.
     expect(result.stdout).toContain("suggestion:");
+    // Candidates are the spec keys a tools: list takes (shape-reach#6).
     expect(result.stdout).toContain("Reit");
-    expect(result.stdout).toContain("Read");
-    expect(result.stdout).toContain("Edit");
+    expect(result.stdout).toContain('"read"');
+    expect(result.stdout).toContain('"edit"');
     expect(result.stdout).toContain("ambiguous");
     expect(result.stdout).not.toContain("fixed: tool");
-  });
+  }, 30_000);
 
   test("an unambiguous tool-name typo still auto-fixes", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1347,15 +1513,161 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     // ambiguity, so --fix should still rewrite it in place.
     writeFileSync(
       specPath,
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reed\n",
     );
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
     });
-    expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
-    expect(readFileSync(specPath, "utf-8")).toContain("- Read");
+    // The spec key, which compile accepts — not the registered name "Read",
+    // which a top-level tools: list rejects (shape-reach#6).
+    expect(result.stdout).toContain('fixed: tool "Reed" → "read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toContain("- read");
     expect(readFileSync(specPath, "utf-8")).not.toContain("Reed");
-  });
+    const compiled = await runCli(["compile", specPath, "-o", join(tmp, "fixed-out")], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(compiled.exitCode).toBe(0);
+  }, 30_000);
+
+  test("a sub-agent's registered names are left alone, and its typo keeps their spelling", async () => {
+    // `tools: [Read, Grep]` is how 0.7.0 documented a sub-agent's list, and it
+    // compiles; lint --fix must not churn it or call it a typo.
+    const specPath = join(tmp, "crewhaus.yaml");
+    const spec = (reviewer: string, explorer: string): string =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "  sub_agents:",
+        "    reviewer:",
+        "      description: Reviews code.",
+        "      instructions: Review the diff.",
+        `      tools: [${reviewer}]`,
+        "    explorer:",
+        "      description: Explores.",
+        "      instructions: Explore.",
+        "      tools:",
+        `        - ${explorer}`,
+        "tools: [read, grep, webFetch]",
+        "",
+      ].join("\n");
+    writeFileSync(specPath, spec("Read, Grep, WebFetch", "Grep"));
+    const clean = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(clean.stdout).not.toContain("fixed: tool");
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+    writeFileSync(specPath, spec("Reed, Grep, WebFetch", "Grpe"));
+    const typo = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(typo.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+  }, 30_000);
+
+  test("a bare word in a list that is not tools: is left alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original =
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ncli:\n  banner:\n    taglineMode: random\n    taglines:\n      - Reed\ntools:\n  - read\n";
+    writeFileSync(specPath, original);
+    await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+  }, 30_000);
+
+  test("an MCP server's args are not tool names, and a flow tools: list is fixed to spec keys", async () => {
+    // shape-reach#6 — the fixer used to rewrite any bare-word list item within
+    // three edits of a tool name: files→PrFiles, logs→Glob, build→Uuid in an
+    // MCP server's argv, which then compiled clean.
+    const specPath = join(tmp, "crewhaus.yaml");
+    const mcp = [
+      "mcp_servers:",
+      "  files:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      "      - files",
+      "      - logs",
+      "      - build",
+      "      - reports",
+      "  more:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args: [files, logs, build, reports]",
+    ].join("\n");
+    const spec = (tools: string): string =>
+      `name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n${mcp}\ntools: [${tools}]\n`;
+    writeFileSync(specPath, spec("raed, webfetch"));
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    // Exactly the two tool typos, each to the spec key a tools: list takes.
+    expect(result.stdout.split("\n").filter((l) => l.startsWith("fixed:"))).toEqual([
+      'fixed: tool "raed" → "read" (nearest match)',
+      'fixed: tool "webfetch" → "webFetch" (nearest match)',
+    ]);
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("read, webFetch"));
+  }, 30_000);
+
+  // C025 (wave III): the per-line fixer rewrote a `tools:` example inside
+  // `instructions: |` and turned the profile reference `$fast` into `$FAST`,
+  // after which the spec no longer compiled.
+  test("lint --fix leaves prompt text and a profile reference alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original = [
+      "name: t",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5 }",
+      "agent:",
+      "  model: $fast",
+      "  instructions: |",
+      "    Always emit this block exactly:",
+      "    tools:",
+      "      - files",
+      "      - reports",
+      "    tools: [logs, draft]",
+      "tools: [read]",
+      "",
+    ].join("\n");
+    writeFileSync(specPath, original);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toContain("lint --fix: no mechanical fixes applicable.");
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+    const compiled = await runCli(
+      ["compile", specPath, "--no-register", "-o", join(tmp, "profile-out")],
+      { env: { ANTHROPIC_API_KEY: "test" } },
+    );
+    expect(compiled.exitCode).toBe(0);
+  }, 30_000);
+
+  // wave III review: a file --fix could not parse got "no mechanical fixes
+  // applicable", a definite answer about a file it never read.
+  test("lint --fix says it skipped a file that is not valid YAML", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const broken =
+      "name: my agent: v2\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [raed]\n";
+    writeFileSync(specPath, broken);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toMatch(/lint --fix: skipped — the file is not valid YAML \(.+\)\./);
+    expect(result.stdout).not.toContain("no mechanical fixes applicable");
+    expect(readFileSync(specPath, "utf-8")).toBe(broken);
+  }, 30_000);
+
+  test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [evmCall, nosuchtool]\n",
+    );
+    const result = await runCli(["lint", specPath], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain(
+      '[tool] tools: tool "evmCall" is a builtin, but the cli shape cannot run it',
+    );
+    expect(result.stdout).toContain('[tool] tools: unknown tool "nosuchtool"');
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2847,13 +3159,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     const result = await runCli(["--help"]);
     expect(result.stdout).toContain("channel provision <spec.yaml>");
     expect(result.stdout).toContain("channel verify <spec.yaml>");
-  });
+  }, 20_000);
 
   test("unknown channel action exits 1 with the allowed set", async () => {
     const result = await runCli(["channel", "frobnicate"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('channel action must be "provision" or "verify"');
-  });
+  }, 20_000);
 
   test("a non-channel spec is refused", async () => {
     const result = await runCli([
@@ -2866,13 +3178,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("requires a channel-target spec");
     expect(result.stderr).toContain('"cli"');
-  });
+  }, 20_000);
 
   test("provision requires --base-url", async () => {
     const result = await runCli(["channel", "provision", CHANNEL_SPEC]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("missing --base-url");
-  });
+  }, 20_000);
 
   test("provision --dry-run prints every platform call with secrets redacted", async () => {
     const result = await runCli([
@@ -2904,7 +3216,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("permissions=274877910016");
     // dry-run writes nothing.
     expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(false);
-  });
+  }, 20_000);
 
   test("provision --platform slack writes the manifest file (no network involved)", async () => {
     const result = await runCli([
@@ -2929,7 +3241,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     // The instructions point the operator at the spec's env refs.
     expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
     expect(result.stdout).toContain("$SLACK_SIGNING_SECRET");
-  });
+  }, 20_000);
 
   test("verify --dry-run prints redacted probes and performs nothing", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--dry-run"]);
@@ -2939,7 +3251,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
       "would GET https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo",
     );
     expect(result.stdout).toContain("would GET https://discord.com/api/v10/applications/@me");
-  });
+  }, 20_000);
 
   test("verify without the secret env exits 1 on env-ref checks (no probes fire)", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
@@ -2949,13 +3261,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("$TELEGRAM_BOT_TOKEN");
     expect(result.stdout).toContain("$DISCORD_BOT_TOKEN");
     expect(result.stdout).toMatch(/\d+ check\(s\), \d+ failed/);
-  });
+  }, 20_000);
 
   test("--platform must be configured in the spec", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--platform", "matrix"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
-  });
+  }, 20_000);
 
   // Demo-driver audit: `verify` named 5 of the 8 env vars the emitted daemon
   // refuses to boot without, so fixing exactly what it listed still produced
@@ -2987,7 +3299,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     // …plus the provider credential group the daemon also gates on.
     expect(result.stdout).toContain("ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY");
     expect(result.stdout).toContain("8 check(s), 8 failed");
-  });
+  }, 20_000);
 
   // Demo-driver audit: with a token present, verify made a live auth.test, so
   // its exit code depended on the network. --offline is the deterministic
@@ -3012,13 +3324,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("(offline)");
     expect(result.stdout).toContain("offline: no platform probes ran");
     expect(result.stdout).not.toContain("auth.test");
-  });
+  }, 20_000);
 
   test("verify --offline and --dry-run are mutually exclusive", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--offline", "--dry-run"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   // Demo-driver audit: provision wrote slack-app-manifest.yaml into the cwd
   // and only THEN validated telegram/discord env, leaving a stray file (and a
@@ -3048,7 +3360,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     );
     expect(slackOnly.exitCode).toBe(0);
     expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(true);
-  });
+  }, 20_000);
 });
 
 // F2 (pre-merge fix) — `onchain tune`'s add-vs-replace op must be decided
@@ -3670,5 +3982,184 @@ describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// docs-claims#1 / shape-reach#10 — `tools suggest` reads the tools a spec
+// GRANTS the way compile does: from the shape's own site (agent.tools on
+// channel), with categories expanded. Before, it read the top-level
+// `tools:` raw, so a channel spec was told to add the tools it already had
+// and a category grant was invisible.
+describe("crewhaus tools suggest — reads grants the way compile does", () => {
+  const CHANNEL =
+    "name: ch\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use the Read filesystem tool and the Bash shell tool to ground answers.\n  tools:\n    - read\n    - bash\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\n";
+
+  test("a channel spec's agent.tools count as granted", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, CHANNEL);
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      present: Array<{ key: string }>;
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("read");
+    expect(out.missing.map((m) => m.key)).not.toContain("bash");
+    expect(out.present.map((m) => m.key)).toContain("bash");
+  });
+
+  test("a category grant covers the tools it expands to", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: v\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: Check the citations and the coverage report.\ntools: [all-verify, all-toolchain]\n",
+    );
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      unimplied: string[];
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("citationLint");
+    expect(out.missing.map((m) => m.key)).not.toContain("coverageSummary");
+    // …and they were implied, so the check above is not vacuous.
+    const present = (JSON.parse(result.stdout) as { present: Array<{ key: string }> }).present;
+    expect(present.map((m) => m.key)).toEqual(
+      expect.arrayContaining(["citationLint", "coverageSummary"]),
+    );
+    // The grant is reported per concrete key, never as the selector.
+    expect(out.unimplied).not.toContain("all-verify");
+  });
+});
+
+// docs-claims#12 / security-12#14 — the discovery commands on the paths the
+// tools reference recommends: `show` took only the camelCase key (a session
+// log's `GitCommit` was "no builtin tool named"), and `list --category` with a
+// bad name threw a ToolCategoryError with a stack trace — or, for
+// `constructor`, printed "0 builtin tool(s)".
+describe("crewhaus tools show / list — names and bad categories", () => {
+  test("show takes the registered name and any casing, and names the spec key", async () => {
+    for (const spelling of ["GitCommit", "gitcommit"]) {
+      const r = await runCli(["tools", "show", spelling]);
+      expect({ spelling, exit: r.exitCode }).toEqual({ spelling, exit: 0 });
+      expect(r.stdout.split("\n")[0]).toBe("gitCommit  (GitCommit)");
+      expect(r.stdout).toContain("enable with  tools: [gitCommit]");
+    }
+  }, 30_000);
+
+  test("show prints what a scoped rule is checked against, and one example rule (0.7.1)", async () => {
+    const http = await runCli(["tools", "show", "httpRequest"]);
+    expect(http.exitCode).toBe(0);
+    expect(http.stdout).toContain("  rule checks url: a URL\n");
+    expect(http.stdout).toContain(
+      '  example     - { type: alwaysAllow, pattern: "HttpRequest(https://api.example.com/**)" }',
+    );
+    // A tool only other shapes carry answers too, from the manifest.
+    const logs = await runCli(["tools", "show", "evmGetLogs"]);
+    expect(logs.exitCode).toBe(0);
+    expect(logs.stdout).toContain(
+      "  rule checks address: an id; matched as chainId/address; left out, it stands for every value",
+    );
+    expect(logs.stdout).toContain('pattern: "EvmGetLogs(1/*)"');
+    // --json carries the same answer as data.
+    const json = await runCli(["tools", "show", "issueCreate", "--json"]);
+    expect(JSON.parse(json.stdout).rules).toEqual({
+      kind: "args",
+      args: [{ field: "repo", words: "a recipient; matched as owner/repo" }],
+      example: { type: "alwaysAllow", pattern: "IssueCreate(acme/*)" },
+    });
+  }, 30_000);
+
+  test("show refuses a prototype member instead of printing a fake tool", async () => {
+    const r = await runCli(["tools", "show", "constructor"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toStartWith('crewhaus: no builtin tool named "constructor"');
+    expect(r.stdout).toBe("");
+  }, 20_000);
+
+  test("list --category with an unknown name exits 1 with one line, no stack", async () => {
+    for (const args of [
+      ["--category", "nope"],
+      ["--category", "nope", "--json"],
+      ["--category", "constructor"],
+    ]) {
+      const r = await runCli(["tools", "list", ...args]);
+      const name = args[1];
+      expect({ args, exit: r.exitCode }).toEqual({ args, exit: 1 });
+      expect(r.stderr).toStartWith(`crewhaus: unknown tool category "all-${name}"`);
+      expect(r.stderr).not.toContain("ToolCategoryError");
+      expect(r.stderr).not.toMatch(/\n\s+at /);
+      expect(r.stdout).toBe("");
+    }
+  }, 40_000);
+
+  test("list prints the justification gate", async () => {
+    const r = await runCli(["tools", "list", "--category", "pkgmgr"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "packageInstall (PackageInstall) [destructive, external, io:process, justification-gated]",
+    );
+  }, 20_000);
+});
+
+// C123 (docs-claims#1) — `tools audit` read the top-level `tools:` raw, so on
+// `[all-git, -gitCommit]` it called both entries "never called ... drop it
+// from tools:" although GitStatus (in all-git) was called, and dropping the
+// exclusion re-grants the destructive gitCommit. The grant is now the one
+// compile sees, credited per concrete key.
+describe("crewhaus tools audit — reads grants the way compile does", () => {
+  function seedAudit(root: string, tools: string, toolName = "GitStatus"): void {
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      `name: x\ntarget: cli\nagent:\n  model: claude-haiku-4-5-20251001\n  instructions: Report status.\ntools: ${tools}\n`,
+    );
+    const dir = join(root, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const stat = JSON.stringify({
+      ts: 1,
+      version: 1,
+      kind: "tool_stats",
+      payload: { toolName, durationMs: 5, isError: false },
+    });
+    writeFileSync(join(dir, "sess_0123456789abcdef.jsonl"), `${stat}\n${stat}\n${stat}\n`);
+  }
+  type Finding = { kind: string; key: string; viaCategory?: boolean };
+
+  test("an exclusion and a selector are never findings, and a called tool is credited", async () => {
+    seedAudit(sandboxCwd, "[all-git, -gitCommit]");
+    const result = await runCli(["tools", "audit", "--json"]);
+    expect(result.exitCode).toBe(0);
+    const findings = (JSON.parse(result.stdout) as { findings: Finding[] }).findings;
+    const keys = findings.map((f) => f.key);
+    for (const never of ["-gitCommit", "all-git", "gitStatus", "gitCommit"]) {
+      expect(keys).not.toContain(never);
+    }
+    // The rest of all-git went unused, and every one of those is advised as
+    // an exclusion (it was never written, so it cannot be dropped).
+    const unused = findings.filter((f) => f.kind === "unused");
+    expect(unused.length).toBeGreaterThan(5);
+    expect(unused.every((f) => f.viaCategory === true)).toBe(true);
+    const text = await runCli(["tools", "audit"]);
+    expect(text.stdout).toContain("add -gitLog to tools: to exclude it");
+    expect(text.stdout).not.toContain("drop it from tools:");
+  }, 20_000);
+
+  test("a spec that names its tools literally keeps the 0.7.0 advice", async () => {
+    seedAudit(sandboxCwd, "[gitStatus, gitLog]");
+    const result = await runCli(["tools", "audit"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[remove?] gitLog (GitLog)");
+    expect(result.stdout).toContain("drop it from tools:");
+    expect(result.stdout).not.toContain("gitStatus (");
+  });
+
+  test("a spec that does not compile says so and audits usage only", async () => {
+    seedAudit(sandboxCwd, "[all-nosuchcategory]");
+    const result = await runCli(["tools", "audit", "--json"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("crewhaus.yaml did not compile");
+    expect(result.stderr).toContain("auditing usage only");
+    const findings = (JSON.parse(result.stdout) as { findings: Finding[] }).findings;
+    expect(findings.filter((f) => f.kind === "unused")).toEqual([]);
   });
 });

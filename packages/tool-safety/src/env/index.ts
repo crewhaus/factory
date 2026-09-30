@@ -1,0 +1,62 @@
+/**
+ * `@crewhaus/tool-safety/env` — credential and environment discipline for
+ * tools that read a secret out of the environment or report on it.
+ *
+ * - {@link resolveCredentialEnv}: read a credential only from a variable
+ *   the operator listed in tool_config; the model may choose among the
+ *   listed names and never add one.
+ * - {@link checkEnvReveal}: whether a variable's VALUE may be shown; never
+ *   for a credential-shaped name, listed or not.
+ * - {@link isCredentialShapedName} / {@link credentialShapeOf}: the one
+ *   heuristic for "this name holds a credential".
+ * - {@link looksLikePastedSecret}: a "variable name" that is really a token,
+ *   and must not be quoted back.
+ * - {@link redactKnownSecrets} / {@link createSecretRedactor} /
+ *   {@link redactKnownSecretsDeep}: known secret values out of text and
+ *   results, in their encoded spellings too, and the part of one a cut
+ *   left at a string's edge, and a secret escaped character by character
+ *   (`\u002B`, `%2f`, `&#x2F;`). {@link trimSecretTail}: for a caller that
+ *   cut a text itself, the start of a secret removed from its end.
+ *   {@link containsKnownSecret}: whether text holds one, for text that
+ *   leaves where no redactor sees it (a file written to the workspace).
+ * - {@link redactUrlCredentials} / {@link redactUrlCredentialsInText}:
+ *   userinfo and credential-named parameters out of URLs.
+ * - {@link withoutCredentials}: a child process's environment without the
+ *   variables that hold a credential, for a child that runs code the
+ *   workspace supplies.
+ */
+export { type CredentialFreeEnv, withoutCredentials } from "./child";
+export {
+  type CredentialEnvOptions,
+  type CredentialEnvRefusal,
+  type CredentialEnvResult,
+  type EnvRevealDecision,
+  type EnvRevealOptions,
+  checkEnvReveal,
+  resolveCredentialEnv,
+} from "./credential";
+export {
+  ENV_NAME_RE,
+  MAX_ENV_NAME_LENGTH,
+  credentialShapeOf,
+  isCredentialShapedName,
+  isEnvName,
+  looksLikePastedSecret,
+  nameWords,
+} from "./names";
+export {
+  REDACTED,
+  REDACTED_URL_PART,
+  type ComposedSecret,
+  type RedactOptions,
+  type SecretValue,
+  containsKnownSecret,
+  createSecretRedactor,
+  isCredentialParam,
+  redactKnownSecrets,
+  redactKnownSecretsDeep,
+  redactUrlCredentials,
+  redactUrlCredentialsInText,
+  secretForms,
+  trimSecretTail,
+} from "./redact";

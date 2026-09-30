@@ -9,7 +9,15 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isRunFailedError } from "@crewhaus/errors";
@@ -361,5 +369,73 @@ describe("replayingTools", () => {
     const [wrapped] = replayingTools([tool], "s1", new ToolReplayer(recorded("r")), "live");
     expect(await wrapped?.execute({ path: "unrecorded" })).toBe('live:{"path":"unrecorded"}');
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("a 0.7.0 cassette with MCP tools still replays after the rename", () => {
+  test("mcp__<server>__<tool> finds an entry recorded as <server>__<tool>", () => {
+    const replayer = new ToolReplayer({
+      dir: "/x",
+      path: "/x/tools.jsonl",
+      hash: "0",
+      records: [
+        {
+          sampleId: "s1",
+          toolName: "github__create_issue",
+          argsHash: "h",
+          args: {},
+          result: "old",
+          ts: "t1",
+        },
+      ],
+    });
+    expect(replayer.take("s1", "mcp__github__create_issue", "h")?.result).toBe("old");
+    // A non-MCP name gets no alias.
+    expect(replayer.take("s1", "create_issue", "h")).toBeUndefined();
+  });
+});
+
+describe("the cassette never goes through a link planted at tools.jsonl (0.7.1)", () => {
+  // The agent under evaluation runs its tools while the cassette is written;
+  // a GitApplyPatch patch can plant `tools.jsonl -> <outside>` in a recording
+  // directory inside the workspace.
+  test("recording refuses a link at tools.jsonl, and the outside file is untouched", () => {
+    const base = newTempRoot();
+    const dir = join(base, "ws", "rec");
+    mkdirSync(dir, { recursive: true });
+    const victim = join(base, "victim");
+    writeFileSync(victim, "ORIGINAL\n");
+    const recorder = new ToolRecorder({ dir });
+    symlinkSync(victim, join(dir, TOOL_RECORDING_FILENAME));
+    expect(() =>
+      recorder.record({ sampleId: "s1", toolName: "Echo", argsHash: "h", args: {}, result: "r" }),
+    ).toThrow(/refusing to append to .*tools\.jsonl: .*\(code is-symlink\)/);
+    expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
+  });
+
+  test("a dangling link at tools.jsonl creates nothing where it points", () => {
+    const base = newTempRoot();
+    const dir = join(base, "rec");
+    mkdirSync(dir);
+    const planted = join(base, "planted.sh");
+    const recorder = new ToolRecorder({ dir });
+    symlinkSync(planted, join(dir, TOOL_RECORDING_FILENAME));
+    expect(() =>
+      recorder.record({ sampleId: "s1", toolName: "Echo", argsHash: "h", args: {}, result: "r" }),
+    ).toThrow(/\(code is-symlink\)/);
+    expect(existsSync(planted)).toBe(false);
+  });
+
+  test("a replay refuses a cassette that is a link, so another file is never served as tool results", () => {
+    const base = newTempRoot();
+    const dir = join(base, "rec");
+    mkdirSync(dir);
+    const other = join(base, "other.jsonl");
+    writeFileSync(
+      other,
+      `${JSON.stringify({ sampleId: "s1", toolName: "Echo", argsHash: "h", args: {}, result: "INJECTED", ts: "t" })}\n`,
+    );
+    symlinkSync(other, join(dir, TOOL_RECORDING_FILENAME));
+    expect(() => loadToolRecording(dir)).toThrow(/refusing to read .*\(code is-symlink\)/);
   });
 });

@@ -49,7 +49,9 @@ import {
 import { checkPackageName, checkVersionSyntax } from "./lib/names";
 import {
   dpkgStatusIsInstalled,
+  matchAptPolicy,
   parseAptCachePolicy,
+  parseAptPolicyStanzas,
   parseAptSimulate,
   parseBrewInfoJson,
   parseBrewListVersions,
@@ -158,6 +160,21 @@ describe("checkPackageName", () => {
   test("refuses a name past the length limit", () => {
     expect(checkPackageName("apt", "a".repeat(201))).toContain("over the 200-character limit");
   });
+
+  test("refuses an apt name or architecture ending in '-', apt-get's REMOVE modifier (C021)", () => {
+    for (const name of ["tzdata-", "tzdata:all-", "tzdata:amd64-", "a-"]) {
+      expect({ name, why: checkPackageName("apt", name) }).toEqual({
+        name,
+        why: expect.stringContaining("remove this package"),
+      });
+    }
+    // Over-tightening guard: '+' at the end, '-' inside, and qualified names.
+    for (const name of ["g++", "libstdc++6", "python3.11", "libc6:i386", "x-y", "a", "0ad"]) {
+      expect({ name, why: checkPackageName("apt", name) }).toEqual({ name, why: undefined });
+    }
+    // The other managers keep their own grammars: dnf NEVRAs are not apt operands.
+    expect(checkPackageName("dnf", "tree-")).toBeUndefined();
+  });
 });
 
 describe("checkVersionSyntax", () => {
@@ -165,6 +182,14 @@ describe("checkVersionSyntax", () => {
     expect(checkVersionSyntax("7.88.1-10+deb12u5")).toBeUndefined();
     expect(checkVersionSyntax("1:2.39.5-1")).toBeUndefined();
     expect(checkVersionSyntax("1.0~rc1-1")).toBeUndefined();
+  });
+
+  test("refuses a version ending in '-', never a Debian version and apt-get's REMOVE modifier (C021)", () => {
+    expect(checkVersionSyntax("2026b-0+deb12u1-")).toContain("remove this package");
+    expect(checkVersionSyntax("1.0-1-")).toContain("remove this package");
+    // A trailing '+' is legal syntax; whether apt lists it is checked at install.
+    expect(checkVersionSyntax("1.0+")).toBeUndefined();
+    expect(checkVersionSyntax("1:2.3~rc1-4")).toBeUndefined();
   });
 
   test("refuses a version containing '=', which would change which package apt reads", () => {
@@ -202,6 +227,27 @@ describe("the manager table", () => {
         expect(forbidden.test(element), `"${element}" is an escalation program`).toBe(false);
       }
     }
+  });
+
+  test("no query command accepts an agreement or licence on the operator's behalf (C193)", () => {
+    let checked = 0;
+    for (const [key, argv] of Object.entries(PKGMGR_COMMANDS)) {
+      if (key.endsWith("Install")) continue;
+      checked++;
+      for (const element of argv) {
+        expect({ key, element, accepts: /^--accept-/i.test(element) }).toEqual({
+          key,
+          element,
+          accepts: false,
+        });
+      }
+    }
+    // The scan covered the whole query side of the table, not a slice of it.
+    expect(checked).toBe(
+      Object.keys(PKGMGR_COMMANDS).filter((key) => !key.endsWith("Install")).length,
+    );
+    expect(checked).toBeGreaterThan(20);
+    expect(PKGMGR_COMMANDS.wingetList).toContain("--disable-interactivity");
   });
 
   test("no command anywhere in the table is a shell", () => {
@@ -453,6 +499,45 @@ describe("parseAptCachePolicy", () => {
     // "apt has never heard of this" and "apt has it and it is not installed"
     // are different answers and must not collapse into one.
     expect(parseAptCachePolicy("")).toBeUndefined();
+  });
+
+  test("more than one stanza is an answer about a pattern, not a package (C021)", () => {
+    const two =
+      "libfoo:\n  Installed: (none)\n  Candidate: 1.0-1\n  Version table:\n     1.0-1 500\n" +
+      "libbar:\n  Installed: (none)\n  Candidate: 2.0-1\n  Version table:\n     2.0-1 500\n";
+    expect(parseAptPolicyStanzas(two).map((st) => [st.header, st.candidate, st.versions])).toEqual([
+      ["libfoo", "1.0-1", ["1.0-1"]],
+      ["libbar", "2.0-1", ["2.0-1"]],
+    ]);
+    // The old parser answered with the LAST stanza's candidate.
+    expect(parseAptCachePolicy(two)).toBeUndefined();
+    expect(parseAptCachePolicy(two, "lib.+")).toBeUndefined();
+    expect(matchAptPolicy(two, "lib.+")).toEqual({
+      kind: "not-exact",
+      headers: ["libfoo", "libbar"],
+    });
+    // One stanza for a different name is not an answer about this one either.
+    expect(matchAptPolicy(APT_POLICY_HTOP, "hto.")).toEqual({
+      kind: "not-exact",
+      headers: ["htop"],
+    });
+    expect(parseAptCachePolicy(APT_POLICY_CURL, "curl")).toEqual({
+      installed: "7.88.1-10+deb12u5",
+      candidate: "7.88.1-10+deb12u7",
+    });
+  });
+
+  test("the version table is read, installed marker and all; source lines are not versions", () => {
+    const match = matchAptPolicy(APT_POLICY_CURL, "curl");
+    expect(match.kind === "exact" && match.stanza.versions).toEqual([
+      "7.88.1-10+deb12u5",
+      "7.88.1-10+deb12u7",
+    ]);
+    // apt prints the native architecture's stanza under the bare name.
+    const native =
+      "libc6:\n  Installed: 2.36-9\n  Candidate: 2.36-9\n  Version table:\n *** 2.36-9 100\n";
+    expect(matchAptPolicy(native, "libc6:amd64").kind).toBe("exact");
+    expect(matchAptPolicy("", "curl")).toEqual({ kind: "none" });
   });
 
   test("finds nothing in localised output — which is why LC_ALL=C is pinned", () => {

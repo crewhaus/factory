@@ -10,8 +10,9 @@ it was killed, and what the other agent found out an hour ago. These twenty
 tools are that memory, and a model spends no tokens deciding any of it.
 
 The package exports each tool and the frozen `STATE_TOOLS` list a catalog
-registers. There is **no `all-state` category yet** — `@crewhaus/tool-categories`
-does not know this package, so a spec names the tools it wants:
+registers. `all-state` turns on the twenty tools below, and the `all-memory`
+and `all-data-stores` roll-ups include it. `VectorDelete` is not in it (see
+below). A spec can also name just the tools it wants:
 
 ```yaml
 tools:
@@ -167,9 +168,28 @@ pinecone or weaviate collection over HTTP, so this one is labelled
 `scope: "external"` with `ioCapability: "network"`, takes a justification, and
 is kept out of a list whose meaning it would quietly dilute.
 
-**It needs a store handed to it.** This package does not depend on
-`@crewhaus/vector-store` and cannot build a store from a backend name; the host
-registers the one it already built, the way `@crewhaus/tool-retrieve` is wired:
+The categories follow the same line: `VectorDelete` is only in `all-vector`.
+No roll-up includes it — not `all-state`, `all-memory` or `all-data-stores`,
+and not `all-network` either, on purpose: a spec that wrote `all-network` on
+0.7.0 did not get a destructive delete, and upgrading should not hand it one.
+Grant it with `tools: [all-vector]`, or by name: `tools: [vectorDelete]`.
+
+**It needs a store.** Name it in the spec, and a compiled bundle, `crewhaus run`
+and `crewhaus eval` build it at boot:
+
+```yaml
+tool_config:
+  vectorDelete:
+    backend: qdrant                 # qdrant, pinecone, weaviate or lance
+    url: https://qdrant.example:6333
+    collection: chunks
+    api_key: $QDRANT_API_KEY        # read from the environment, never compiled in
+    protected_collections: [audit]
+```
+
+`in-memory` is refused: a store that starts empty in every process has nothing
+in it to erase. A host that already built its store registers it instead, the
+way `@crewhaus/tool-retrieve` is wired:
 
 ```ts
 import { registerVectorTarget } from "@crewhaus/tool-state";

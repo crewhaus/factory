@@ -219,6 +219,131 @@ export type AptPolicy = {
   readonly candidate: string | null;
 };
 
+/** One `<name>:` stanza of `apt-cache policy` output. */
+export type AptPolicyStanza = AptPolicy & {
+  /** The header without its trailing colon: `curl`, `libc6:i386`. */
+  readonly header: string;
+  /** Every version the version table lists, in apt's order. */
+  readonly versions: readonly string[];
+  /** Whether the Installed or Candidate label was found at all. */
+  readonly labelled: boolean;
+};
+
+/** The value after an indented `Label:`, trimmed; undefined if the line is not that label. */
+function labelValue(line: string, label: string): string | undefined {
+  if (line.length === 0 || (line[0] !== " " && line[0] !== "\t")) return undefined;
+  const trimmed = line.trim();
+  if (!trimmed.startsWith(`${label}:`)) return undefined;
+  return trimmed.slice(label.length + 1).trim();
+}
+
+/**
+ * A version-table entry: ` *** <version> <priority>` for the installed one,
+ * `     <version> <priority>` for the others. The source lines under each
+ * are indented further (8 spaces) and are not versions.
+ */
+function versionEntry(line: string): string | undefined {
+  let rest: string;
+  if (line.startsWith(" *** ")) rest = line.slice(5);
+  else if (line.startsWith("     ") && line.length > 5 && line[5] !== " ") rest = line.slice(5);
+  else return undefined;
+  const parts = rest.split(" ");
+  if (parts.length !== 2) return undefined;
+  const [version, priority] = parts as [string, string];
+  return version !== "" && /^-?[0-9]+$/.test(priority) ? version : undefined;
+}
+
+/**
+ * Split `apt-cache policy` output into its stanzas. A stanza starts at an
+ * unindented `<name>:` line. apt prints one per package the operand matched,
+ * and an operand it read as a pattern matches many: `apt-cache policy
+ * 'lib.+'` printed 116 on a Debian 12 image.
+ */
+export function parseAptPolicyStanzas(stdout: string): AptPolicyStanza[] {
+  type Draft = {
+    header: string;
+    installed: string | null | undefined;
+    candidate: string | null | undefined;
+    versions: string[];
+    inTable: boolean;
+  };
+  const drafts: Draft[] = [];
+  let current: Draft | undefined;
+  for (const line of lines(stdout)) {
+    if (
+      line.length > 1 &&
+      line[0] !== " " &&
+      line[0] !== "\t" &&
+      line.endsWith(":") &&
+      !/\s/.test(line)
+    ) {
+      current = {
+        header: line.slice(0, -1),
+        installed: undefined,
+        candidate: undefined,
+        versions: [],
+        inTable: false,
+      };
+      drafts.push(current);
+      continue;
+    }
+    if (current === undefined) continue;
+    const installed = labelValue(line, "Installed");
+    if (installed !== undefined) {
+      current.installed = installed === "(none)" ? null : installed;
+      continue;
+    }
+    const candidate = labelValue(line, "Candidate");
+    if (candidate !== undefined) {
+      current.candidate = candidate === "(none)" ? null : candidate;
+      continue;
+    }
+    if (labelValue(line, "Version table") !== undefined) {
+      current.inTable = true;
+      continue;
+    }
+    if (current.inTable) {
+      const version = versionEntry(line);
+      if (version !== undefined) current.versions.push(version);
+    }
+  }
+  return drafts.map((d) => ({
+    header: d.header,
+    installed: d.installed ?? null,
+    candidate: d.candidate ?? null,
+    versions: d.versions,
+    labelled: d.installed !== undefined || d.candidate !== undefined,
+  }));
+}
+
+/** What `apt-cache policy <name>` said about exactly `name`. */
+export type AptPolicyMatch =
+  /** One stanza, headed by exactly this name. */
+  | { readonly kind: "exact"; readonly stanza: AptPolicyStanza }
+  /** Nothing at all: apt has no package of this name (it prints nothing). */
+  | { readonly kind: "none" }
+  /** Stanzas, but not one headed by exactly this name: apt read it as a pattern. */
+  | { readonly kind: "not-exact"; readonly headers: readonly string[] }
+  /** A stanza for this name, but neither label: localised or changed output. */
+  | { readonly kind: "unlabelled" };
+
+/**
+ * The stanza for exactly `name`, or why there is none. `name:arch` also
+ * matches a lone stanza headed by the bare name, which is how apt prints the
+ * native architecture (`libc6:amd64` on amd64 prints `libc6:`). More than one
+ * stanza is never an answer about `name`, whatever their headers say.
+ */
+export function matchAptPolicy(stdout: string, name: string): AptPolicyMatch {
+  const stanzas = parseAptPolicyStanzas(stdout);
+  if (stanzas.length === 0) return { kind: "none" };
+  const only = stanzas.length === 1 ? stanzas[0] : undefined;
+  const bare = name.includes(":") ? name.slice(0, name.indexOf(":")) : undefined;
+  if (only !== undefined && (only.header === name || only.header === bare)) {
+    return only.labelled ? { kind: "exact", stanza: only } : { kind: "unlabelled" };
+  }
+  return { kind: "not-exact", headers: stanzas.map((st) => st.header) };
+}
+
 /**
  * `apt-cache policy <name>` under `LC_ALL=C`.
  *
@@ -234,23 +359,21 @@ export type AptPolicy = {
  * An unknown package produces an empty document (apt-cache prints nothing and
  * exits 0), which parses to `undefined` rather than to two nulls, so "apt has
  * never heard of this" cannot be confused with "apt has it, not installed".
+ * So does output with more than one stanza, or (given `name`) a stanza for a
+ * different name: that is apt answering about a PATTERN, and reading its last
+ * stanza as the answer reported another package's version (C021).
  */
-export function parseAptCachePolicy(stdout: string): AptPolicy | undefined {
-  let installed: string | null | undefined;
-  let candidate: string | null | undefined;
-  for (const line of lines(stdout)) {
-    const installedMatch = line.match(/^\s+Installed:\s*(.+?)\s*$/);
-    if (installedMatch?.[1] !== undefined) {
-      installed = installedMatch[1] === "(none)" ? null : installedMatch[1];
-      continue;
-    }
-    const candidateMatch = line.match(/^\s+Candidate:\s*(.+?)\s*$/);
-    if (candidateMatch?.[1] !== undefined) {
-      candidate = candidateMatch[1] === "(none)" ? null : candidateMatch[1];
-    }
+export function parseAptCachePolicy(stdout: string, name?: string): AptPolicy | undefined {
+  const stanzas = parseAptPolicyStanzas(stdout);
+  if (name !== undefined) {
+    const match = matchAptPolicy(stdout, name);
+    return match.kind === "exact"
+      ? { installed: match.stanza.installed, candidate: match.stanza.candidate }
+      : undefined;
   }
-  if (installed === undefined && candidate === undefined) return undefined;
-  return { installed: installed ?? null, candidate: candidate ?? null };
+  const only = stanzas.length === 1 ? stanzas[0] : undefined;
+  if (only === undefined || !only.labelled) return undefined;
+  return { installed: only.installed, candidate: only.candidate };
 }
 
 export type AptSimulatedChange = {
@@ -634,14 +757,25 @@ export function parseWingetList(stdout: string): WingetRow[] {
 }
 
 /**
- * winget's "no installed package matched" exit code, 0x8A15002B as a signed
+ * winget's "no installed package matched" exit code:
+ * APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND, 0x8A150014, as a signed
  * 32-bit integer.
  *
  * `winget list` exits with this rather than 0-and-empty, which makes presence
  * decidable from the EXIT CODE alone — the one part of winget's answer that
- * is neither localised nor column-aligned.
+ * is neither localised nor column-aligned. 0.7.0 had 0x8A15002B here, which
+ * is APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (`winget upgrade` with
+ * nothing to do), so a package that was not installed came back unknown.
+ * Compare against `code | 0`: a runtime may report the DWORD unsigned.
  */
-export const WINGET_NO_PACKAGES_FOUND = -1978335189;
+export const WINGET_NO_PACKAGES_FOUND = -1978335212;
+
+/**
+ * APPINSTALLER_CLI_ERROR_SOURCE_AGREEMENTS_NOT_ACCEPTED, 0x8A150046: with
+ * `--disable-interactivity`, a configured source whose agreement nobody has
+ * accepted makes `winget list` refuse outright instead of prompting.
+ */
+export const WINGET_SOURCE_AGREEMENTS_NOT_ACCEPTED = -1978335162;
 
 // ---------------------------------------------------------------------------
 // chocolatey

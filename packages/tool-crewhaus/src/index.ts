@@ -38,7 +38,13 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { type VerifyResult, verify as verifyAuditChain } from "@crewhaus/audit-log";
+import {
+  AuditLogError,
+  type ChainFiles,
+  type VerifyResult,
+  listChainFiles,
+  verify as verifyAuditChain,
+} from "@crewhaus/audit-log";
 import { type CompileWarning, compile, expandSpecToolCategories } from "@crewhaus/compiler";
 import {
   type PreflightItem,
@@ -47,9 +53,23 @@ import {
   runPreflight,
 } from "@crewhaus/preflight";
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
-import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  BUILTIN_TOOLS,
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinKeyForName,
+  checkBuiltinTool,
+} from "@crewhaus/tool-categories";
+import { specPermissionRuleLists } from "@crewhaus/tool-permission-matcher";
+import {
+  NON_CLI_TOOL_FLAGS,
+  RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
+  TOOL_FLAGS,
+  TOOL_FLAGS_BY_NAME,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -435,7 +455,7 @@ export const specCompileCheck: RegisteredTool = buildTool({
 export const specSummarize: RegisteredTool = buildTool({
   name: "SpecSummarize",
   description:
-    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credential-shaped entries redacted, so a credential pasted into a spec is not echoed into the report.",
+    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path with any key in the path withheld, and a stdio server's argv has its credentials redacted (a credential flag's value, a header value, a URL's userinfo, token parameters and path keys, a credential-named assignment), so a credential pasted into a spec is not echoed into the report.",
   inputSchema: specSourceSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -451,7 +471,7 @@ export const specSummarize: RegisteredTool = buildTool({
 export const specDiff: RegisteredTool = buildTool({
   name: "SpecDiff",
   description:
-    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
+    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. Permission rules are compared in order, because the first rule that matches decides: moving an allow ahead of a deny or an ask widens. An existing MCP server counts too: a different command, argv, transport or endpoint, an added env or header key, a changed env, header or redacted-argv value (reported without the value) and a removed destructive or requireJustification trust flag all widen. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
   inputSchema: z.object({
     before: specSourceSchema.describe("the spec as it was"),
     after: specSourceSchema.describe("the spec as it is now"),
@@ -517,34 +537,70 @@ export const toolInventory: RegisteredTool = buildTool({
     // checked against a runtime that is not this one — a bundle compiled from
     // another release has a different builtin set.
     //
-    // The set comes from `BUILTIN_TOOL_MAP` and NOT from
-    // `@crewhaus/tool-registry-manifest`, although the manifest has the same
-    // keys. This tool needs the key SET; the manifest is 455 KB of key set
-    // plus description prose, and `collectCrewhausDeps` pins whole packages,
-    // so importing it here would put that prose into every bundle granting
-    // any tool-crewhaus tool — and `crewhaus` sits inside the `all-operations`
-    // roll-up, so a plain `all-operations` grant would pay it too. `target-cli`
-    // is already in this package's dependency closure via `@crewhaus/compiler`,
-    // so this costs nothing. That the two key sets are identical is not an
-    // assumption: `apps/cli/src/tool-registry.test.ts` asserts it in both
-    // directions on every run.
+    // By default each name is checked the way the compiler checks it, for the
+    // spec's own shape, from the one builtin table (`@crewhaus/tool-categories`,
+    // data only): a graph spec's `evmCall` is a real tool, not `unknown` as it
+    // was when the check read the cli set (C001); a builtin this shape cannot
+    // run is `notOnShape`, with compile's reason. A narrowing list may name a
+    // builtin by its registered name (`Read`), and a tool the runtime adds
+    // itself (`Skill`, a thredz: block's `goal_list`) is real too.
     const usedCallerList = input.knownTools !== undefined;
-    const known = usedCallerList
-      ? new Set(input.knownTools)
-      : new Set(Object.keys(BUILTIN_TOOL_MAP));
+    const callerKnown = new Set(input.knownTools ?? []);
+    const target = asRecord(parsed.value)?.["target"];
+    const shape: ToolShape =
+      typeof target === "string" && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
+        ? (target as ToolShape)
+        : "cli";
+    const runtimeKnown = new Set([...RUNTIME_TOOL_NAMES, ...thredzToolNamesOfSpec(parsed.value)]);
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
-    const unknown: string[] = [];
+    const unknown = new Set<string>();
+    const unknownAt: Array<{ tool: string; site: string; reason?: string }> = [];
+    const notOnShape: Array<{ tool: string; site: string; reason: string }> = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
-        const server = tool.slice("mcp__".length).split("__")[0] ?? "";
+        const server = mcpServerOf(tool, servers);
         mcp.push({ tool, server, declared: servers.has(server) });
-        continue;
+      } else {
+        builtin.push(tool);
       }
-      builtin.push(tool);
-      if (!known.has(tool) && !known.has(toRegisteredName(tool))) {
-        unknown.push(tool);
+    }
+    // Each name is judged where it is listed, as compile judges it: a site's
+    // list registers tools and takes the spec key (`read`), so a registered
+    // name (`Read`), a tool the runtime adds itself (`Skill`) or a thredz
+    // name there is refused; a list that narrows one (a sub-agent's, a model
+    // profile's, a pool candidate's) also takes the registered name, and a
+    // tool the runtime or a thredz: block adds is real there.
+    for (const site of resolved.toolSites) {
+      const narrowing = isNarrowingToolSite(site.path);
+      for (const tool of new Set(site.tools)) {
+        if (tool.startsWith("mcp__")) continue;
+        const miss = (reason?: string) => {
+          unknown.add(tool);
+          unknownAt.push({ tool, site: site.path, ...(reason !== undefined ? { reason } : {}) });
+        };
+        if (usedCallerList) {
+          if (!callerKnown.has(tool) && !callerKnown.has(toRegisteredName(tool))) miss();
+          continue;
+        }
+        if (!narrowing) {
+          const verdict = checkBuiltinTool(tool, shape);
+          if (verdict.kind === "unknown") miss(verdict.message);
+          else if (verdict.kind === "refused") {
+            notOnShape.push({ tool, site: site.path, reason: verdict.message });
+          }
+          continue;
+        }
+        const key = Object.hasOwn(BUILTIN_TOOLS, tool) ? tool : builtinKeyForName(tool);
+        if (key === undefined) {
+          if (!runtimeKnown.has(tool)) miss();
+          continue;
+        }
+        const verdict = checkBuiltinTool(key, shape);
+        if (verdict.kind === "refused") {
+          notOnShape.push({ tool, site: site.path, reason: verdict.message });
+        }
       }
     }
 
@@ -555,7 +611,9 @@ export const toolInventory: RegisteredTool = buildTool({
       builtin,
       mcp,
       dangling: mcp.filter((m) => !m.declared).map((m) => m.tool),
-      unknown,
+      unknown: [...unknown].sort(compareStrings),
+      unknownAt,
+      ...(usedCallerList ? {} : { shape, notOnShape }),
       checkedAgainst: usedCallerList ? "the knownTools you passed" : "this release's builtins",
       sites: resolved.toolSites,
       declaredSelectors: declared.toolSites,
@@ -563,17 +621,66 @@ export const toolInventory: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * Does the `tools:` list at this site (a `collectToolSites` path) narrow
+ * what a site registers — a sub-agent's, a model profile's or a pool
+ * candidate's — rather than register tools itself?
+ */
+function isNarrowingToolSite(sitePath: string): boolean {
+  return (
+    sitePath.startsWith("models.") ||
+    /(^|\.)sub_agents\./.test(sitePath) ||
+    /(^|\.)model_pool(\.|$)/.test(sitePath)
+  );
+}
+
+/**
+ * The bare tool names a spec's `thredz:` block registers (the goal, task,
+ * wiki and space tools; the messaging tools too when the block, or one of a
+ * crew's per-role blocks, says `messaging: true`), or none without a block.
+ */
+function thredzToolNamesOfSpec(spec: unknown): readonly string[] {
+  const block = asRecord(spec)?.["thredz"];
+  if (block === undefined || block === false || block === null) return [];
+  const record = asRecord(block);
+  const messaging =
+    record?.["messaging"] === true ||
+    Object.values(asRecord(record?.["roles"]) ?? {}).some(
+      (role) => asRecord(role)?.["messaging"] === true,
+    );
+  return messaging
+    ? [...THREDZ_TOOL_NAMES.memory, ...THREDZ_TOOL_NAMES.messaging]
+    : THREDZ_TOOL_NAMES.memory;
+}
+
+/**
+ * The server an `mcp__<server>__<tool>` name belongs to: the longest declared
+ * `mcp_servers` key it starts with, because a key may itself contain `__`
+ * (0.7.0 ran such keys). With no declared key, the text up to the first
+ * `__` after the prefix.
+ */
+function mcpServerOf(tool: string, servers: ReadonlySet<string>): string {
+  const rest = tool.slice("mcp__".length);
+  let best: string | undefined;
+  for (const server of servers) {
+    if (rest.startsWith(`${server}__`) && (best === undefined || server.length > best.length)) {
+      best = server;
+    }
+  }
+  return best ?? rest.split("__")[0] ?? "";
+}
+
 export const permissionAudit: RegisteredTool = buildTool({
   name: "PermissionAudit",
   description:
-    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped), and under `mode: plan` it says so, because there the engine decides on the tool's readOnly flag and reads no rule at all.",
+    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use it as the \"what can this harness really do\" review before deploying. It sees the spec's own rules only: CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time. An argument-scoped rule like `Bash(git *)` is reported as conditional cover, not evaluated. A rule that cannot compile is listed under `malformedRules` and treated as the engine treats it (a broken deny or ask gates everything; a broken allow is dropped); a rule that can never fire as written is listed under `ruleProblems` with its fix and covers nothing. Builtins are judged by their own flags, so an unruled call gets the engine's decision. Under `mode: plan`, allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
   inputSchema: z.object({
     ...specSourceFields,
     destructiveTools: z
       .array(z.string())
       .optional()
       .describe(
-        "tools the target runtime marks destructive; the spec cannot know this for builtins, so pass it to get them flagged",
+        "extra tools to treat as destructive, e.g. a custom tool; builtins are already read from their own flags",
       ),
   }),
   readOnly: true,
@@ -581,34 +688,79 @@ export const permissionAudit: RegisteredTool = buildTool({
   execute: async (input) => {
     const text = loadSpecText("PermissionAudit", input);
     if (!text.ok) return text.message;
-    const view = specView(text.value);
-    if (!view.ok) return view.message;
+    const parsed = parseOrExplain(text.value);
+    if (!parsed.ok) return parsed.message;
+    // `all-<category>` selectors are expanded the way the compiler expands
+    // them, as ToolInventory does: audited unexpanded, `tools: [all-http]`
+    // was one pseudo-tool named "all-http", and a live `alwaysDeny
+    // HttpRequest` was listed as a rule that matches nothing (C032).
+    let expanded: Spec = parsed.value;
+    let categoryError: string | undefined;
+    try {
+      expanded = expandSpecToolCategories(parsed.value);
+    } catch (err) {
+      categoryError = (err as Error).message;
+    }
+    const view = buildSpecView(expanded, collectSpecModels(expanded));
 
     // The one destructive signal a spec carries on its own: an MCP server's
     // narrowing `tool_flags`.
     const destructive = new Set(input.destructiveTools ?? []);
     const flaggedDefaults: string[] = [];
-    const parsed = parseOrExplain(text.value);
-    if (parsed.ok) {
-      const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
-      for (const [server, raw] of Object.entries(servers)) {
-        const flags = asRecord(asRecord(raw)?.["tool_flags"]);
-        if (flags === undefined) continue;
-        if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
-        for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
-          if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
-        }
+    const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
+    for (const [server, raw] of Object.entries(servers)) {
+      const flags = asRecord(asRecord(raw)?.["tool_flags"]);
+      if (flags === undefined) continue;
+      if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
+      for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
+        if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
       }
     }
 
+    const judge = asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.[
+      "judge"
+    ];
     const result = auditPermissions({
-      tools: view.value.tools,
-      mode: view.value.permissions.mode,
-      askMode: view.value.permissions.askMode,
-      rules: view.value.permissions.rules,
+      tools: view.tools,
+      // A `thredz:` block registers its tools under their bare names
+      // (`goal_list`, `message_send`, …) with no `tools:` entry, so they are
+      // granted too, and a rule naming one covers it.
+      runtimeTools: thredzToolNamesOfSpec(parsed.value),
+      mode: view.permissions.mode,
+      askMode: view.permissions.askMode,
+      rules: view.permissions.rules,
       destructiveTools: destructive,
+      // permission-integration#9 / flag-truth-3#4 — a builtin's real flags,
+      // from the manifest generated off the tools themselves, instead of
+      // "external" read off six legacy names and "destructive" read off
+      // nothing.
+      flagsOf: (tool) =>
+        TOOL_FLAGS[tool] ??
+        TOOL_FLAGS_BY_NAME.get(tool) ??
+        NON_CLI_TOOL_FLAGS[tool] ??
+        Object.values(NON_CLI_TOOL_FLAGS).find((flags) => flags.name === tool),
+      // The builtins, and the tools the runtime registers without a spec
+      // listing them — `alwaysAllow Skill` names a real tool, and so does
+      // `alwaysAllow goal_list` in a spec with a `thredz:` block.
+      knownTools: [
+        ...Object.values(TOOL_FLAGS),
+        ...Object.values(NON_CLI_TOOL_FLAGS),
+        ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
+        ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
+      ],
+      mcpServers: view.mcpServers.map((s) => s.name),
+      // `alwaysAllow run_exam` on a spec with `learning.exam`, or `alwaysAllow
+      // Skill`, names a tool the runtime adds when it is wired: not dead.
+      mayRegisterTools: RUNTIME_TOOL_NAMES,
+      // The model profiles', pool candidates' and sub-agents' lists, checked
+      // for rules that never fire, as lint and compile check them (C146).
+      otherRuleLists: specPermissionRuleLists(expanded).filter(
+        (list) => list.path !== "permissions.rules",
+      ),
+      ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({
+      ...(categoryError !== undefined ? { categoryError } : {}),
       ...result,
       ...(flaggedDefaults.length > 0
         ? {
@@ -626,6 +778,7 @@ export const permissionAudit: RegisteredTool = buildTool({
 
 export const preflightRun: RegisteredTool = buildTool({
   name: "PreflightRun",
+  operativeArgs: [{ field: "harnessDir", kind: "path", default: "." }],
   description:
     "Run the full preflight over a harness directory against an EXPLICITLY supplied environment, returning the blocking items, the warnings and the remediation for each. Use before spawning a harness, to turn the stack trace the spawn would die with into a list of things to fix. The environment is an input and is never read from this process, so pass the merged env the spawn would actually receive. It binds each declared port briefly to see whether it is free, and it reaches no network beyond that.",
   inputSchema: z.object({
@@ -721,7 +874,7 @@ export const preflightRun: RegisteredTool = buildTool({
 export const harnessInventory: RegisteredTool = buildTool({
   name: "HarnessInventory",
   description:
-    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec. Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
+    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec (`unreadable`, with the reason, when that cannot be determined). Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
   inputSchema: z.object({
     root: z.string().optional().describe("where to look; defaults to the working directory"),
     maxDepth: z.number().int().min(0).max(12).optional().describe("walk depth cap (default 6)"),
@@ -760,6 +913,8 @@ export const harnessInventory: RegisteredTool = buildTool({
         specValid: identity.valid,
         ...(identity.firstIssue !== undefined ? { firstIssue: identity.firstIssue } : {}),
         bundle: freshness.state,
+        // `unreadable` is "could not determine", never "missing": say why.
+        ...(freshness.reason !== undefined ? { bundleDetail: freshness.reason } : {}),
       };
     });
 
@@ -771,6 +926,7 @@ export const harnessInventory: RegisteredTool = buildTool({
         invalidSpecs: harnesses.filter((h) => !h.specValid).length,
         staleBundles: harnesses.filter((h) => h.bundle === "stale").length,
         missingBundles: harnesses.filter((h) => h.bundle === "missing-bundle").length,
+        unreadableBundles: harnesses.filter((h) => h.bundle === "unreadable").length,
       },
       harnesses,
       ...(found.unreadable.length > 0 ? { unreadable: found.unreadable } : {}),
@@ -781,7 +937,7 @@ export const harnessInventory: RegisteredTool = buildTool({
 export const bundleFreshness: RegisteredTool = buildTool({
   name: "BundleFreshness",
   description:
-    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different".',
+    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different". A bundle or spec that exists but cannot be examined is `unreadable`, with the reason, never reported as missing.',
   inputSchema: z.object({
     dirs: z
       .array(z.string())
@@ -791,7 +947,12 @@ export const bundleFreshness: RegisteredTool = buildTool({
       .string()
       .optional()
       .describe("where to discover harnesses (default: working directory)"),
-    staleOnly: z.boolean().optional().describe("return only the bundles that need a recompile"),
+    staleOnly: z
+      .boolean()
+      .optional()
+      .describe(
+        "return only the bundles that need attention: stale or missing (recompile) and unreadable (the answer is unknown)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -819,12 +980,20 @@ export const bundleFreshness: RegisteredTool = buildTool({
       rows.push({
         dir: dir.value.rel === "" ? "." : dir.value.rel,
         state: freshness.state,
+        // A recompile is the fix for a stale or absent bundle only. An
+        // unreadable one is UNKNOWN, and compiling over it fixes nothing.
         ...(freshness.state === "stale" || freshness.state === "missing-bundle"
           ? { remediation: "crewhaus compile crewhaus.yaml" }
           : {}),
+        ...(freshness.reason !== undefined ? { detail: freshness.reason } : {}),
       });
     }
-    const needsWork = rows.filter((r) => r["state"] === "stale" || r["state"] === "missing-bundle");
+    // Everything the caller must act on: a recompile, or a look at why the
+    // answer could not be determined.
+    const needsWork = rows.filter(
+      (r) =>
+        r["state"] === "stale" || r["state"] === "missing-bundle" || r["state"] === "unreadable",
+    );
     return json({
       checked: rows.length,
       counts: {
@@ -832,6 +1001,7 @@ export const bundleFreshness: RegisteredTool = buildTool({
         stale: rows.filter((r) => r["state"] === "stale").length,
         missingBundle: rows.filter((r) => r["state"] === "missing-bundle").length,
         missingSpec: rows.filter((r) => r["state"] === "missing-spec").length,
+        unreadable: rows.filter((r) => r["state"] === "unreadable").length,
       },
       method: "mtime heuristic (approximate — mtimes lie across checkouts and copies)",
       bundles: input.staleOnly === true ? needsWork : rows,
@@ -839,32 +1009,9 @@ export const bundleFreshness: RegisteredTool = buildTool({
   },
 });
 
-/**
- * Total bytes of the `*.jsonl` files directly under an audit directory, or
- * `undefined` when the directory cannot be listed. Not recursive, because
- * `verify` is not: it reads exactly this set.
- */
-function chainBytes(dirReal: string): number | undefined {
-  let total = 0;
-  let names: string[];
-  try {
-    names = readdirSync(dirReal);
-  } catch {
-    return undefined;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".jsonl")) continue;
-    try {
-      total += statSync(path.join(dirReal, name)).size;
-    } catch {
-      // Raced deletion — `verify` will skip it too.
-    }
-  }
-  return total;
-}
-
 export const auditVerify: RegisteredTool = buildTool({
   name: "AuditVerify",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_AUDIT_DIR, relocates: true }],
   description:
     "Re-walk a harness's audit log hash chain and report whether it is intact, plus the file and line of the first break. Use to check that the tamper-evident record has not been edited or truncated. Read the two caveats it returns: `anchorChecked: false` means tail truncation could not be ruled out, and even a matching on-host anchor is rewritable by anything running as the same user — only an off-host anchor store settles that, and this tool does not have one. The walk cannot be interrupted once it starts, so a chain larger than `maxBytes` is refused before it begins rather than run without a deadline.",
   inputSchema: z.object({
@@ -888,23 +1035,47 @@ export const auditVerify: RegisteredTool = buildTool({
     const dir = resolveDir("AuditVerify", rel);
     if (!dir.ok) return dir.message;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_AUDIT_BYTES;
-    const size = chainBytes(dir.value.real);
-    if (size === undefined) {
-      return `audit log at "${renderPath(rel)}" could not be listed`;
+    // The same list `verify` walks, each entry checked (without opening it)
+    // to be a regular file: a chain file linked out of the directory, or a
+    // FIFO, is tamper evidence and is reported as the break — never read,
+    // never counted as zero bytes (security-5#2, flag-truth-3#6).
+    // "Could not verify" (a chain file this user cannot read: they are
+    // created 0600) is its own answer, never a break: a break is tamper
+    // evidence. audit-log's message names the chain file only, never a path.
+    const couldNot = (err: unknown, fallback: string): string =>
+      err instanceof AuditLogError
+        ? `audit log at "${renderPath(rel)}": ${err.message}`
+        : `audit log at "${renderPath(rel)}" ${fallback}`;
+    let chain: ChainFiles;
+    try {
+      chain = listChainFiles(dir.value.real);
+    } catch (err) {
+      return couldNot(err, "could not be listed");
     }
+    const dirShown = dir.value.rel === "" ? "." : dir.value.rel;
+    if (!chain.ok) {
+      return json({
+        ok: false,
+        dir: dirShown,
+        recordsChecked: 0,
+        break: { file: chain.file, line: 0, reason: chain.reason },
+      });
+    }
+    const size = chain.bytes + chain.tailBytes;
     if (size > maxBytes) {
-      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
+      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files and anchor, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
     }
     let result: VerifyResult;
     try {
       result = await verifyAuditChain(dir.value.real);
     } catch (err) {
-      return `audit log at "${renderPath(rel)}" could not be verified: ${(err as Error).message}`;
+      // Not a node error's text: it carries the absolute path.
+      return couldNot(err, "could not be verified (an entry could not be read)");
     }
     if (result.ok) {
       return json({
         ok: true,
-        dir: dir.value.rel === "" ? "." : dir.value.rel,
+        dir: dirShown,
         recordsChecked: result.recordsChecked,
         anchorChecked: result.anchorChecked,
         externalAnchorChecked: result.externalAnchorChecked,
@@ -923,7 +1094,7 @@ export const auditVerify: RegisteredTool = buildTool({
       : result.file;
     return json({
       ok: false,
-      dir: dir.value.rel === "" ? "." : dir.value.rel,
+      dir: dirShown,
       recordsChecked: result.recordsChecked,
       break: { file: broken, line: result.line, reason: result.reason },
     });
@@ -986,7 +1157,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail or recovered, and whether the declared thresholds hold. Use it as the release gate after an eval; the verdict is a pure function of the two result documents, needing no runner or model. Samples are matched by id, never by position: one on only one side is reported, never counted as a regression; one with no sampleId counts in its run's pass rate and is named in a note; a candidate sample whose judge abstained or invoker errored is inconclusive. A comparison that never happened fails: runs sharing no sample ids, or naming different datasets (unless allowDatasetMismatch); minSharedFraction can demand more overlap. Another version or split of one registry dataset, or it with a regression suite unioned in, is the same dataset and only noted. A repeated sample id and a declared pass rate its samples do not support are noted; a declared rate outside 0..1 is refused and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),
@@ -1016,6 +1187,20 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       .max(1)
       .optional()
       .describe("verdict-preserving score moves smaller than this are not reported (default 0.1)"),
+    allowDatasetMismatch: z
+      .boolean()
+      .optional()
+      .describe(
+        "gate two runs that name different datasets anyway (default false: their scores are not comparable, so the gate fails). Another version or split of one registry dataset is not a different dataset",
+      ),
+    minSharedFraction: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe(
+        "the share of the baseline's samples the candidate must also have run, e.g. 1 for all of them (default: any overlap; none at all always fails)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -1039,6 +1224,12 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       ...(input.maxPassRateDrop !== undefined ? { maxPassRateDrop: input.maxPassRateDrop } : {}),
       ...(input.maxRegressions !== undefined ? { maxRegressions: input.maxRegressions } : {}),
       ...(input.scoreEpsilon !== undefined ? { scoreEpsilon: input.scoreEpsilon } : {}),
+      ...(input.allowDatasetMismatch !== undefined
+        ? { allowDatasetMismatch: input.allowDatasetMismatch }
+        : {}),
+      ...(input.minSharedFraction !== undefined
+        ? { minSharedFraction: input.minSharedFraction }
+        : {}),
     };
     return json({
       ...compareEvalRuns(baseline.value, candidate.value, thresholds),
@@ -1067,6 +1258,7 @@ const sessionSourceFields = {
 
 export const sessionSummarize: RegisteredTool = buildTool({
   name: "SessionSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Summarize a harness's session transcripts: event counts by kind, a per-tool call and error tally, MCP call health and the errors that were recorded. Use to see what a harness has actually been doing without reading a JSONL file into context. Malformed lines are counted rather than thrown on, because a transcript truncated by a killed process is the normal case; a tool call is counted from its `tool_use` record, with the `tool_stats` mirror supplying durations and errors so nothing is counted twice.",
   inputSchema: z.object(sessionSourceFields),
@@ -1092,6 +1284,7 @@ export const sessionSummarize: RegisteredTool = buildTool({
 
 export const traceQuery: RegisteredTool = buildTool({
   name: "TraceQuery",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Return a filtered slice of a harness's session events — by kind, by timestamp range, by a substring of the payload — in log order. Use to pull the few events that matter out of a long transcript: the permission decisions, the model failovers, the calls to one tool. Payloads are truncated to keep a result readable, so treat this as a window onto the log rather than a copy of it.",
   inputSchema: z.object({
@@ -1168,6 +1361,7 @@ export const traceQuery: RegisteredTool = buildTool({
 
 export const costSummarize: RegisteredTool = buildTool({
   name: "CostSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Total the cost and token accruals in a harness's session logs, broken down by model, by provider and by UTC day. Use to see where a fleet's spend went without a billing API. Figures come from the `cost_accrual` records the runtime writes when cost tracking is on, so a harness that ran without it reports zero accruals rather than an estimate; costs stay in integer USD micros, the unit the records carry, and an accrual for a model with no pricing row is counted under `unpriced` with its real token counts and no cost.",
   inputSchema: z.object(sessionSourceFields),

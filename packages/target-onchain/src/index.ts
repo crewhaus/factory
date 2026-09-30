@@ -247,7 +247,17 @@ export async function acceptOrRedact(payload: string): Promise<{ accept: boolean
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    // The onchain shape registers no tool catalog, so no tool is wired; the
+    // compiler warns (accepted-but-unwired) and the README says so too.
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        unwiredTools: {
+          names: "all",
+          note: "not wired — the onchain daemon runs no agent loop yet",
+        },
+      }),
+    });
   }
   return { files };
 }

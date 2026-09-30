@@ -24,7 +24,15 @@ import {
   timingSafeEqualHex,
   verifySignature,
 } from "./lib/webhook";
-import { XmlParseError, childrenNamed, decodeXmlText, parseXml, textOf } from "./lib/xml";
+import {
+  XmlParseError,
+  childrenNamed,
+  decodeXmlText,
+  hasInternalSubset,
+  parseAttrs,
+  parseXml,
+  textOf,
+} from "./lib/xml";
 import {
   HttpPermissionError,
   applyAuth,
@@ -266,34 +274,44 @@ describe("credentials", () => {
     expect(rejectInlineCredentials({ accept: "application/json" })).toBeNull();
   });
 
-  test("bearer, basic and header profiles read the named variable", () => {
+  test("bearer, basic and header profiles read a variable the operator listed", () => {
     const env = { TOKEN: "s3cret", PASS: "pw" };
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["TOKEN", "PASS"] });
     const bearer: Record<string, string> = {};
-    expect(applyAuth(bearer, { type: "bearer", envVar: "TOKEN" }, env)).toBeNull();
+    expect(applyAuth(bearer, { type: "bearer", envVar: "TOKEN" }, cfg, env)).toMatchObject({
+      ok: true,
+      secrets: ["s3cret"],
+    });
     expect(bearer["Authorization"]).toBe("Bearer s3cret");
 
     const basic: Record<string, string> = {};
-    expect(applyAuth(basic, { type: "basic", envVar: "PASS", username: "ada" }, env)).toBeNull();
-    expect(basic["Authorization"]).toBe(`Basic ${Buffer.from("ada:pw").toString("base64")}`);
+    const encoded = Buffer.from("ada:pw").toString("base64");
+    expect(
+      applyAuth(basic, { type: "basic", envVar: "PASS", username: "ada" }, cfg, env),
+    ).toMatchObject({ ok: true, secrets: ["pw", { publicPrefix: "ada:", secret: "pw" }] });
+    expect(basic["Authorization"]).toBe(`Basic ${encoded}`);
 
     const custom: Record<string, string> = {};
     expect(
-      applyAuth(custom, { type: "header", envVar: "TOKEN", headerName: "X-Api-Key" }, env),
-    ).toBeNull();
+      applyAuth(custom, { type: "header", envVar: "TOKEN", headerName: "X-Api-Key" }, cfg, env),
+    ).toMatchObject({ ok: true, secretHeaders: new Set(["x-api-key"]) });
     expect(custom["X-Api-Key"]).toBe("s3cret");
   });
 
-  test("an unset variable is a readable refusal that never names the value", () => {
-    const message = applyAuth({}, { type: "bearer", envVar: "MISSING_TOKEN" }, {});
+  test("an unset listed variable is a readable refusal that never names the value", () => {
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["MISSING_TOKEN"] });
+    const applied = applyAuth({}, { type: "bearer", envVar: "MISSING_TOKEN" }, cfg, {});
+    expect(applied.ok).toBe(false);
+    const message = applied.ok ? "" : applied.message;
     expect(message).toContain("MISSING_TOKEN");
     expect(message).toContain("unset or empty");
   });
 
   test("a basic profile without a username is refused rather than half-applied", () => {
     const headers: Record<string, string> = {};
-    expect(applyAuth(headers, { type: "basic", envVar: "PASS" }, { PASS: "pw" })).toContain(
-      "username",
-    );
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["PASS"] });
+    const applied = applyAuth(headers, { type: "basic", envVar: "PASS" }, cfg, { PASS: "pw" });
+    expect(applied.ok ? "" : applied.message).toContain("username");
     expect(Object.keys(headers)).toEqual([]);
   });
 
@@ -440,6 +458,69 @@ describe("retry arithmetic", () => {
     expect(parseRetryAfterMs(new Date(at).toUTCString(), at + 10_000)).toBe(0);
     expect(parseRetryAfterMs(null, 0)).toBeNull();
     expect(parseRetryAfterMs("soon", 0)).toBeNull();
+  });
+
+  test("a Retry-After date is the GMT instant it names, whatever the host zone", () => {
+    const now = Date.parse("2026-09-23T09:00:00Z");
+    /**
+     * Run `body` with the process's zone set to `tz`, then put it back. Never
+     * by deleting TZ: in Bun that freezes the zone for the rest of the
+     * process. `bun test` runs in UTC when TZ is unset.
+     */
+    const inZone = <T>(tz: string, body: () => T): T => {
+      const previous = process.env["TZ"];
+      process.env["TZ"] = tz;
+      try {
+        return body();
+      } finally {
+        process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+      }
+    };
+    const read = [
+      "Wed, 23 Sep 2026 10:00:00 GMT", // IMF-fixdate
+      "Wednesday, 23-Sep-26 10:00:00 GMT", // rfc850-date
+      "Wed Sep 23 10:00:00 2026", // asctime-date: GMT, with no zone written
+      "2026-09-23T10:00:00Z", // not an HTTP-date, but it carries its offset
+      "2026-09-23T19:00:00+09:00",
+      // Not strict IMF-fixdate, but each names its zone, and 0.7.0 read it
+      // (net review): the first 0.7.1 cut returned null and retried early.
+      "Wed, 23 Sep 2026 10:00:00 +0000",
+      "Wed, 23 Sep 2026 10:00:00 UTC",
+      "Wed, 23 Sep 2026 19:00:00 +09:00",
+      "Wed, 23 Sep 2026 10:00 GMT",
+      "23 Sep 2026 10:00:00 GMT",
+      "Wed, 23-Sep-2026 10:00:00 GMT",
+      // Each names its zone and 0.7.0 read it on every host alike (net
+      // regression review): RFC 5322's fixed US zones, long names, the
+      // month-first spelling, and JavaScript's own Date#toString().
+      "Wed, 23 Sep 2026 03:00:00 PDT",
+      "Wed, 23 Sep 2026 02:00:00 PST",
+      "Wednesday, 23 September 2026 10:00:00 GMT",
+      "Sep 23, 2026 10:00:00 UTC",
+      "Wed Sep 23 2026 19:00:00 GMT+0900 (Japan Standard Time)",
+    ];
+    const unread = [
+      "2026-09-23T10:00:00", // offset-less ISO: host-local per ECMAScript
+      "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
+      "Wed, 23 Sep 2026 10:00:00 CET", // an abbreviation RFC 5322 does not define
+      "Wed, 31 Sep 2026 10:00:00 GMT", // a day September does not have
+      "Sep 23 2026-10:00", // offset-shaped tail, host time to Date.parse
+      "Wed, 23 Sep 2026 10:00:00", // no zone at all
+    ];
+    const seen: Array<{ tz: string; text: string; ms: number | null }> = [];
+    for (const tz of ["UTC", "Asia/Tokyo", "America/Los_Angeles"]) {
+      // Proves the zone really changed, so the assertions are not vacuous.
+      const hour = inZone(tz, () => new Date(now).getHours());
+      expect({ tz, moved: tz === "UTC" || hour !== 9 }).toEqual({ tz, moved: true });
+      for (const text of [...read, ...unread]) {
+        seen.push({ tz, text, ms: inZone(tz, () => parseRetryAfterMs(text, now)) });
+      }
+    }
+    // 0.7.0 handed these to Date.parse: the asctime form waited 0 under
+    // Asia/Tokyo and eight hours under America/Los_Angeles.
+    expect(seen.filter((s) => read.includes(s.text) && s.ms !== 3_600_000)).toEqual([]);
+    expect(seen.filter((s) => unread.includes(s.text) && s.ms !== null)).toEqual([]);
+    expect(seen).toHaveLength(66);
   });
 
   test("the server's Retry-After wins over the curve", () => {
@@ -685,6 +766,102 @@ describe("xml", () => {
   test("comments and processing instructions are skipped", () => {
     const root = parseXml("<r><!-- note --><a>1</a></r>");
     expect(textOf(root, "a")).toBe("1");
+  });
+});
+
+// SitemapParse and FeedParse parse after the fetch's deadline is cancelled,
+// synchronously, and `text` input is capped only at MAX_XML_BYTES: a
+// super-linear step here held the event loop for as long as it liked.
+// 400 000 characters took the 0.7.0 attribute pattern minutes; the sizes
+// below fail it in seconds instead of hanging, and parse in milliseconds now.
+describe("xml on hostile documents (C091)", () => {
+  test("a long attribute token with no '=' is scanned once", () => {
+    const t0 = performance.now();
+    const root = parseXml(
+      `<urlset x${"y".repeat(40_000)} a="1"><url><loc>https://e.x/</loc></url></urlset>`,
+    );
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(root.name).toBe("urlset");
+    expect(root.attrs).toEqual({ a: "1" });
+    expect(root.children[0]?.children[0]?.text).toBe("https://e.x/");
+  }, 20_000);
+
+  test("many <!DOCTYPE openers before one '>' are checked once", () => {
+    const t0 = performance.now();
+    expect(parseXml(`${"<!DOCTYPE ".repeat(12_000)}><urlset/>`).name).toBe("urlset");
+    expect(() => parseXml(`${"<!DOCTYPE ".repeat(12_000)}[<!-- -->]><urlset/>`)).toThrow(
+      /internal DTD subset/,
+    );
+    expect(performance.now() - t0).toBeLessThan(500);
+  }, 20_000);
+
+  test("one '[' after many closed openers is looked for once, not once per opener", () => {
+    // 1.5 MB: a search for the `[` per opener costs seconds here.
+    const t0 = performance.now();
+    expect(parseXml(`<r>${"<!DOCTYPE>".repeat(150_000)}</r><!-- [ -->`).name).toBe("r");
+    expect(performance.now() - t0).toBeLessThan(500);
+  }, 20_000);
+
+  test.each([
+    ["bare a=b=c", { a: "b=c" }],
+    [`x:a = "q" b='r' c=s/t`, { a: "q", b: "r", c: "s/t" }],
+    ['a="1" a="2"', { a: "2" }],
+    ["=a=1", { a: "1" }],
+    ["a= >", {}],
+    [`a="unclosed b='2'`, { b: "2" }],
+    ["a\u00a0=\u00a0'nbsp'", { a: "nbsp" }],
+  ])("attributes %p read as %p", (source, expected) => {
+    expect(parseAttrs(source)).toEqual(expected);
+  });
+
+  // The 0.7.0 spellings, kept here only as the oracle for the rewrite.
+  const OLD_ATTR = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  const oldAttrs = (source: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const m of source.matchAll(OLD_ATTR)) {
+      const raw = m[1] as string;
+      const colon = raw.lastIndexOf(":");
+      out[(colon === -1 ? raw : raw.slice(colon + 1)).toLowerCase()] = decodeXmlText(
+        m[2] ?? m[3] ?? m[4] ?? "",
+      );
+    }
+    return out;
+  };
+  const OLD_SUBSET = /<!DOCTYPE[^>]*\[/i;
+
+  test("on random short tags, attributes and the subset check agree with 0.7.0 exactly", () => {
+    const alphabet = [
+      "a",
+      "B",
+      ":",
+      "=",
+      " ",
+      "\t",
+      '"',
+      "'",
+      "/",
+      ">",
+      "[",
+      "&amp;",
+      "<!DOCTYPE",
+      "<!doctype",
+      "x",
+    ];
+    let seed = 11;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let i = 0; i < 30_000; i++) {
+      let source = "";
+      const len = next(14);
+      for (let j = 0; j < len; j++) source += alphabet[next(alphabet.length)];
+      expect(parseAttrs(source)).toEqual(oldAttrs(source));
+      expect(hasInternalSubset(source)).toBe(OLD_SUBSET.test(source));
+      compared++;
+    }
+    expect(compared).toBe(30_000);
   });
 });
 

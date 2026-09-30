@@ -1,3 +1,4 @@
+import { redactKnownSecretsDeep } from "@crewhaus/tool-safety/env";
 import { type NextPage, nextPageFrom } from "./lib/page";
 import { buildQuery } from "./lib/refs";
 /**
@@ -29,6 +30,8 @@ export type CallCtx = {
   /** Absolute API root, e.g. `https://api.github.com`, without a trailing slash. */
   readonly baseUrl: string;
   readonly token: string;
+  /** The canonical origin of `baseUrl`: the only origin the token is sent to. */
+  readonly tokenOrigin: string;
   readonly deadline: Deadline;
   readonly maxBytes: number;
   /** Scrubs the token out of anything on its way to the caller. */
@@ -159,14 +162,17 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
     body,
     signal: c.deadline.signal,
     cfg: c.cfg,
+    credentialOrigin: c.tokenOrigin,
   });
-  const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes);
+  const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes, c.deadline.signal, [
+    c.token,
+  ]);
   const map = headerMap(opened.res);
   const contentType = map["content-type"] ?? "";
   let parsed: unknown;
   if (contentType.includes("json") && drained.text.trim() !== "" && !drained.truncated) {
     try {
-      parsed = JSON.parse(drained.text);
+      parsed = redactKnownSecretsDeep(JSON.parse(drained.text) as unknown, [c.token]);
     } catch {
       parsed = undefined;
     }
@@ -174,8 +180,12 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
   return {
     status: opened.res.status,
     ok: opened.res.status >= 200 && opened.res.status < 300,
+    // Scrubbed here, before any tool clips a field or an error excerpt: a
+    // clip through an echoed token would leave a prefix that the redactor,
+    // which runs on the finished result, matches only at a string's end
+    // (net attacker review).
     json: parsed,
-    text: drained.text,
+    text: c.redact(drained.text),
     bytes: drained.bytes,
     truncated: drained.truncated,
     headers: map,

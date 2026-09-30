@@ -35,9 +35,14 @@ thing it asked.
 the filesystem, and the tool only makes it when the index behind the answer
 was confirmed: on macOS that means `mdutil` said the volume is indexed. When
 `mdutil` is absent, times out, or reports "unknown indexing state" — and when
-the backend's own output was cut off at this package's capture ceiling — the
-search came back empty and nobody checked why. That is not evidence the file
-is absent, and it is not the same instruction to a caller.
+the backend's own output was cut off at this package's capture ceiling, or
+could not be read to its end — the search came back empty and nobody checked
+why. That is not evidence the file is absent, and it is not the same
+instruction to a caller.
+
+The capture ceiling bounds memory as well as the answer: a backend's output
+is kept up to the ceiling as it arrives and the rest is drained unstored, so a
+whole-volume listing costs the ceiling, not the listing.
 
 ## WatchPath
 
@@ -47,7 +52,10 @@ is absent, and it is not the same instruction to a caller.
 
 **Bounded twice.** `timeoutMs` is required and `maxEvents` defaults to 100.
 Whichever bound ends the watch is reported. `maxEvents: 1` is the common
-shape — "come back as soon as something settles".
+shape — "come back as soon as something settles". The `match` glob (like
+`OsIndexSearch`'s `exclude`) is matched segment by segment, never compiled to
+a backtracking RegExp, so no pattern can stall the event loop the deadline
+runs on.
 
 **One save is one event.** Events for the same path inside a settle window
 (`settleMs`, default 200ms) fold into one, which reports the `rawCount` it
@@ -97,6 +105,15 @@ byte-for-byte what this session last saw is therefore dropped and counted. The
 timestamps are compared at nanosecond resolution and include ctime, because a
 `chmod` moves ctime and not mtime, and on APFS a chmod microseconds after a
 write lands in the same millisecond.
+
+Equal timestamps are only as good as the filesystem's clock, though. Linux
+stamps inodes from the coarse kernel clock (one tick is 1–10 ms before kernel
+6.13), HFS+ keeps whole seconds and FAT two, so a same-size rewrite within a
+tick of the last look keeps identical stamps. For a file written within two
+seconds of the last look, the content decides: its sha256 is taken then (files
+up to 1 MiB, 16 MiB per snapshot) and compared when an equal-stamp
+notification arrives. A recent file too large to hash is counted, and a note
+says so, rather than being called unchanged.
 
 **Two platform limits are reported rather than hidden.** On Linux a file
 created inside a directory that was itself created during the watch may never
@@ -151,6 +168,20 @@ security checks — a symlink points anywhere, and without the sticky bit any
 user can replace another user's trashed files), and `$topdir/.Trash-$uid`
 otherwise. When neither can be used the call is **refused with the reason**
 and the file is left alone. `gio trash` refuses in the same situation.
+
+Every directory the move writes through is checked, not just `.Trash`: the
+trash directory itself (for a top-directory trash), `files/` and `info/`
+must each be a real directory, not a symlink, owned by the user, as GLib
+requires (`st_uid == getuid()`). A `$topdir/.Trash/$uid` that fails falls
+back to `.Trash-$uid`; a `.Trash-$uid` that fails is refused. Missing
+directories are created one at a time, 0700, never with a `mkdir -p` that
+would follow a link, and the checks run again after creation and just
+before the rename. A name is claimed only when both `info/<name>.trashinfo`
+and `files/<name>` are free, so the move never replaces anything already in
+the trash, and the real call stores the file under the name the dry run
+predicted. When the workspace itself is a mount point (a devcontainer bind
+mount), its `.Trash-$uid` sits inside the workspace; it is used when it
+passes these checks, since refusing it would disable the tool there.
 Copy-then-unlink would break hard links, change the inode, double the space
 used by a large tree, and — on a failure halfway — leave a half-written copy
 beside an original the caller believes is in the trash.

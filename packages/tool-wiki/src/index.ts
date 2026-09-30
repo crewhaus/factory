@@ -28,19 +28,40 @@
  *                                       justification; logging a gap is the
  *                                       honest low-friction path, §7.4)
  *
- * All tools are `scope: "internal"` — local files, no network.
+ * The tools read and write local files and are `scope: "internal"`, with
+ * one exception. When the store has an embedder that leaves the process
+ * (`memory.wiki.embedder` naming anything but `mock/…`), `wiki_recall`,
+ * `wiki_semantic_search` and `wiki_related` POST the query and article text
+ * to that provider, so they are built `scope: "external"` with
+ * `ioCapability: "network"`: the query goes through the egress classifier
+ * and `compile --strict` counts them. They stay `readOnly`, and the
+ * destination is the operator's configured embedder, never one the model
+ * picks. `wiki_search`, `wiki_get`, `wiki_list` and the writers never call
+ * the embedder.
  *
  * ## Pillar 3 — the `memory` TrustOrigin (two-site pattern)
  *
- * Article bodies returned by the read tools (`wiki_recall`, `wiki_get`)
- * are classified at the new `"memory"` TrustOrigin BEFORE they reach the
- * model: a wiki article written in an earlier session may have absorbed
- * attacker text (a poisoned page STUDYed into an article), and recall
- * re-injects it across a session boundary. On a malicious verdict the body
- * is replaced by the redaction notice; on a non-blocked verdict the body
- * is `tagContent`-ed into `RunContext.dataLineage` under origin `"memory"`
- * (the skills-registry two-site pattern) so the sink-side egress fabric
- * can attribute a later exfiltration to the memory boundary.
+ * Everything the read tools render from an article is classified at the
+ * `"memory"` TrustOrigin BEFORE it reaches the model: a wiki article written
+ * in an earlier session may have absorbed attacker text (a poisoned page
+ * STUDYed into an article), and recall re-injects it across a session
+ * boundary. That is the body, and also the title, the tags and the sources
+ * line, which are free text too (0.7.1; only the slug is validated).
+ *
+ * The unit is one article: `wiki_get` and `wiki_recall` classify each
+ * article's header and body together, and the list-style tools (`wiki_search`,
+ * `wiki_semantic_search`, `wiki_list`, `wiki_related`) classify each row. On
+ * a malicious verdict that article or row is replaced by its slug, version
+ * and the redaction notice (the slug stays, so a REFLECT pass can still find
+ * and fix it), and the others render normally. Per-article classification
+ * also keeps each unit inside the classifier's window, which a whole large
+ * result would not be. List rows are checked by the local layers one by one,
+ * but go to a model-backed classifier (Layer 3) in chunks of rows, so a long
+ * list costs a few model calls rather than one per row; see `classifyRows`.
+ * A non-blocked unit is `tagContent`-ed into
+ * `RunContext.dataLineage` under origin `"memory"` (the skills-registry
+ * two-site pattern) so the sink-side egress fabric can attribute a later
+ * exfiltration to the memory boundary.
  *
  * ## Write-path governance (design §3.3)
  *
@@ -75,6 +96,7 @@ import {
   type WikiStore,
   WikiVersionConflictError,
   createWikiStore,
+  isWikiSlug,
 } from "@crewhaus/wiki-store";
 import { z } from "zod";
 
@@ -304,26 +326,183 @@ function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | un
   return bridge?.runContext;
 }
 
+type Classified =
+  | { readonly safe: true; readonly text: string }
+  | { readonly safe: false; readonly notice: string };
+
 /**
- * Pillar 3 source side, applied to ONE article body: classify at origin
- * `"memory"`, return the redaction notice on a malicious verdict, tag the
- * lineage otherwise. The caller splices the result into its rendering.
+ * Pillar 3 source side, applied to ONE rendered unit (an article with its
+ * header, or one list row): classify at origin `"memory"`, return the
+ * redaction notice on a malicious verdict, tag the lineage otherwise.
  */
-async function classifyBody(body: string, rc: RunContext | undefined): Promise<string> {
-  const boundary = await classifyBoundary(body, { origin: "memory" });
+async function classifyMemory(text: string, rc: RunContext | undefined): Promise<Classified> {
+  const boundary = await classifyBoundary(text, { origin: "memory" });
   if (boundary.action === "redact") {
-    return boundary.redacted ?? buildRedactionNotice(boundary.verdict.hits);
+    return {
+      safe: false,
+      notice: boundary.redacted ?? buildRedactionNotice(boundary.verdict.hits),
+    };
   }
   if (rc !== undefined) {
-    tagContent(rc, body, "memory");
+    tagContent(rc, text, "memory");
   }
-  return body;
+  return { safe: true, text };
 }
 
 function refLine(ref: WikiRef): string {
   const tagSuffix = ref.tags.length > 0 ? ` [${ref.tags.join(", ")}]` : "";
   const verifiedSuffix = ref.verified ? " ✓verified" : "";
   return `${ref.slug} (v${ref.version}, ${ref.status}, conf ${ref.confidence.toFixed(2)}${verifiedSuffix}) — ${ref.title}${tagSuffix}`;
+}
+
+/**
+ * What a redacted article or row is still named by: its slug and version,
+ * the only parts printed OUTSIDE the classified unit. The store validates
+ * both, but a store from another backend (or a planted index.json read by an
+ * older store) may not, so each is printed only when it is a slug and a
+ * positive whole number, and a fixed placeholder otherwise.
+ */
+function redactedName(ref: { readonly slug: unknown; readonly version: unknown }): {
+  readonly slug: string;
+  readonly version: string;
+} {
+  return {
+    slug: isWikiSlug(ref.slug) ? ref.slug : "(an article with an invalid slug)",
+    version:
+      typeof ref.version === "number" && Number.isSafeInteger(ref.version) && ref.version > 0
+        ? `v${ref.version}`
+        : "v?",
+  };
+}
+
+/** `slug (vN)`, from {@link redactedName}. */
+function named(ref: { readonly slug: unknown; readonly version: unknown }): string {
+  const name = redactedName(ref);
+  return `${name.slug} (${name.version})`;
+}
+
+/**
+ * The most row text one classification sees at once: well inside the
+ * classifier's window (64 KiB), so every row in a chunk is analysed in full.
+ */
+const ROW_CHUNK_CHARS = 16 * 1024;
+
+/** How many chunk or row classifications run at once. */
+const ROW_CLASSIFY_CONCURRENCY = 8;
+
+/**
+ * A Layer-3 stand-in that answers nothing: passed per call, it makes a
+ * classification run only the local layers (regex and structural).
+ */
+const LOCAL_LAYERS_ONLY = async (): Promise<undefined> => undefined;
+
+/** Run `fn` over `items` in order, at most {@link ROW_CLASSIFY_CONCURRENCY} at a time. */
+async function mapPooled<T, R>(items: ReadonlyArray<T>, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i] as T);
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, items.length) }, () => worker()),
+  );
+  return out;
+}
+
+/**
+ * Classify many list rows at origin `"memory"`, each row its own unit for
+ * the verdict, without paying one model call per row.
+ *
+ *  1. The local layers (regex, structural, decoded variants) run on each row
+ *     alone, so a row's encoded payload is decoded however many rows sit
+ *     beside it. A malicious verdict there is final: the model layer can
+ *     raise a verdict but never lower one. This pass bypasses the verdict
+ *     cache, so a local-only verdict never stands in for a full one.
+ *  2. The rows that pass are joined into chunks of at most
+ *     {@link ROW_CHUNK_CHARS} and each chunk is classified in full, Layer 3
+ *     included when the runtime registered one: one model call per chunk,
+ *     not per row (a 400-row wiki_search used to make 400).
+ *  3. Only inside a chunk that comes back malicious is each row classified
+ *     in full on its own, so only the row that carries the injection is
+ *     redacted, never its neighbours.
+ *
+ * A row that passes is tagged into the run's data lineage at `"memory"`.
+ */
+async function classifyRows(
+  rows: ReadonlyArray<string>,
+  rc: RunContext | undefined,
+): Promise<Classified[]> {
+  const out = new Array<Classified | undefined>(rows.length);
+  const local = await mapPooled(rows, (row) =>
+    classifyBoundary(row, {
+      origin: "memory",
+      llmClassifier: LOCAL_LAYERS_ONLY,
+      bypassCache: true,
+    }),
+  );
+  const chunks: number[][] = [];
+  let chunk: number[] = [];
+  let chunkChars = 0;
+  local.forEach((result, i) => {
+    if (result.action === "redact") {
+      out[i] = {
+        safe: false,
+        notice: result.redacted ?? buildRedactionNotice(result.verdict.hits),
+      };
+      return;
+    }
+    const length = (rows[i] as string).length + 1;
+    if (chunk.length > 0 && chunkChars + length > ROW_CHUNK_CHARS) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkChars = 0;
+    }
+    chunk.push(i);
+    chunkChars += length;
+  });
+  if (chunk.length > 0) chunks.push(chunk);
+  const flagged: number[] = [];
+  await mapPooled(chunks, async (members) => {
+    const whole = await classifyBoundary(members.map((i) => rows[i]).join("\n"), {
+      origin: "memory",
+    });
+    if (whole.action === "redact") flagged.push(...members);
+    else for (const i of members) out[i] = { safe: true, text: rows[i] as string };
+  });
+  const each = await mapPooled(flagged, (i) => classifyMemory(rows[i] as string, undefined));
+  flagged.forEach((i, j) => {
+    out[i] = each[j];
+  });
+  return out.map((c) => {
+    const result = c as Classified;
+    if (result.safe && rc !== undefined) tagContent(rc, result.text, "memory");
+    return result;
+  });
+}
+
+/**
+ * Many list rows, classified by {@link classifyRows}: each row is `prefix`
+ * (text from the article that the row shows before the ref line, e.g.
+ * wiki_list's `updatedAt`) and the ref line, as one unit. A row that carries
+ * an injection anywhere in it becomes its slug and version with the notice.
+ * `updatedAt` used to be printed outside the unit, so a planted article's
+ * timestamp reached the model unredacted while wiki_get redacted the same
+ * article.
+ */
+async function safeRefLines<R extends WikiRef>(
+  refs: ReadonlyArray<R>,
+  rc: RunContext | undefined,
+  render: (ref: R, line: string) => string = (_ref, line) => line,
+  prefix: (ref: R) => string = () => "",
+): Promise<string[]> {
+  const verdicts = await classifyRows(
+    refs.map((ref) => `${prefix(ref)}${refLine(ref)}`),
+    rc,
+  );
+  return refs.map((ref, i) => {
+    const c = verdicts[i] as Classified;
+    return render(ref, c.safe ? c.text : `${named(ref)} — ${c.notice}`);
+  });
 }
 
 function hitHeader(hit: WikiHit): string {
@@ -349,6 +528,13 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       now,
     });
   const requireSources = opts.requireSources === true;
+  // The ranking tools send the query and article text to the embedder. A
+  // store that does not say where its embedder is, but can rank
+  // semantically, is taken to reach one.
+  const networked = store.embedderLeavesProcess ?? typeof store.semanticSearch === "function";
+  const embedderScope = networked
+    ? ({ scope: "external", ioCapability: "network" } as const)
+    : ({ scope: "internal" } as const);
 
   function createdByFrom(ctx: ToolExecuteContext | undefined): WikiCreatedBy | undefined {
     const rc = resolveRunContext(ctx);
@@ -372,7 +558,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "PRIMARY RECALL. Fetch the most relevant slice of the expert's own wiki for a query — a combined keyword + semantic-vector context bundle. Call this FIRST on every user question before answering.",
     inputSchema: recallSchema,
     readOnly: true,
-    scope: "internal",
+    ...embedderScope,
     execute: async (input, ctx) => {
       const rc = resolveRunContext(ctx);
       const hits = await store.recall(input.query, input.limit ?? 6);
@@ -381,7 +567,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       const lines = [`${hits.length} wiki hit(s) for "${input.query}":`];
       for (const hit of hits) {
-        lines.push("", hitHeader(hit), await classifyBody(hit.body, rc));
+        // Header and body are one unit: the title and tags are free text too.
+        const c = await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, rc);
+        lines.push(
+          "",
+          ...(c.safe ? [c.text] : [`--- ${named(hit.ref)} — [article redacted]`, c.notice]),
+        );
       }
       return lines.join("\n");
     },
@@ -393,8 +584,9 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "Vector/semantic search over the wiki. Use when a query is conceptual and keyword search would miss paraphrases.",
     inputSchema: semanticSearchSchema,
     readOnly: true,
-    scope: "internal",
-    execute: async (input) => {
+    ...embedderScope,
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const k = input.limit ?? 6;
       if (store.semanticSearch === undefined) {
         // Thredz-parity degradation: keyword-only plans fall back too.
@@ -402,7 +594,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         const lines = [
           "no embedder configured — degraded to keyword search (configure memory.wiki.embedder for semantic ranking):",
         ];
-        for (const ref of refs.slice(0, k)) lines.push(`  • ${refLine(ref)}`);
+        for (const row of await safeRefLines(refs.slice(0, k), rc)) lines.push(`  • ${row}`);
         if (refs.length === 0) lines.push(`  (no keyword matches for "${input.query}")`);
         return lines.join("\n");
       }
@@ -411,9 +603,13 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         return `no semantic matches ≥ ${(input.minScore ?? 0.05).toFixed(2)} for "${input.query}"`;
       }
       const lines = [`${hits.length} semantic match(es) for "${input.query}":`];
-      for (const hit of hits) {
-        lines.push(`  • (${hit.score.toFixed(3)}) ${refLine(hit.ref)}`);
-      }
+      const rows = await safeRefLines(
+        hits.map((hit) => hit.ref),
+        rc,
+      );
+      hits.forEach((hit, i) => {
+        lines.push(`  • (${hit.score.toFixed(3)}) ${rows[i]}`);
+      });
       return lines.join("\n");
     },
   });
@@ -425,11 +621,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: searchSchema,
     readOnly: true,
     scope: "internal",
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const refs = await store.search(input.query);
       if (refs.length === 0) return `no wiki articles matched "${input.query}"`;
       const lines = [`${refs.length} keyword match(es) for "${input.query}":`];
-      for (const ref of refs) lines.push(`  • ${refLine(ref)}`);
+      for (const row of await safeRefLines(refs, rc)) lines.push(`  • ${row}`);
       return lines.join("\n");
     },
   });
@@ -447,11 +644,6 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       const rc = resolveRunContext(ctx);
       const article = await store.get(input.slug);
       if (article === null) return `no wiki article with slug "${input.slug}"`;
-      const safeBody = await classifyBody(article.body, rc);
-      const body =
-        input.concise === true && safeBody.length > CONCISE_CHARS
-          ? `${safeBody.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
-          : safeBody;
       const header = [
         `# ${article.title}`,
         `slug: ${article.slug} · v${article.version} · ${article.status} · confidence ${article.confidence.toFixed(2)}${article.verified ? " · ✓verified" : ""}`,
@@ -459,6 +651,17 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         article.sources.length > 0 ? `sources: ${article.sources.join(" · ")}` : "",
         `updated: ${article.updatedAt}${article.supersedes !== undefined ? ` (supersedes v${article.supersedes})` : ""}`,
       ].filter((l) => l !== "");
+      // The title, tags and sources are free text too: the whole article is
+      // one unit, classified before anything is rendered.
+      const c = await classifyMemory(`${header.join("\n")}\n\n${article.body}`, rc);
+      if (!c.safe) {
+        const name = redactedName(article);
+        return `slug: ${name.slug} · ${name.version} — [article redacted]\n\n${c.notice}`;
+      }
+      const body =
+        input.concise === true && article.body.length > CONCISE_CHARS
+          ? `${article.body.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
+          : article.body;
       return `${header.join("\n")}\n\n${body}`;
     },
   });
@@ -531,7 +734,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: listSchema,
     readOnly: true,
     scope: "internal",
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const limit = input.limit ?? 25;
       const sort = input.sort ?? "updated";
       const order = input.order ?? "asc"; // thredz default: stalest first
@@ -568,7 +772,11 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         `${rows.length}/${refs.length} article(s) (sort ${sort === "title" ? "title" : "updated"} ${order}):`,
         ...notes,
       ];
-      for (const ref of rows) lines.push(`  • ${ref.updatedAt}  ${refLine(ref)}`);
+      // The timestamp is article text too (a planted file sets it), so it is
+      // classified with the row it heads.
+      for (const row of await safeRefLines(rows, rc, undefined, (ref) => `${ref.updatedAt}  `)) {
+        lines.push(`  • ${row}`);
+      }
       if (rows.length === 0) lines.push("  (none)");
       return lines.join("\n");
     },
@@ -580,8 +788,9 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "Find articles related to a slug by tags + semantic similarity. Use in reflection to detect duplicates or contradictions to reconcile.",
     inputSchema: relatedSchema,
     readOnly: true,
-    scope: "internal",
-    execute: async (input) => {
+    ...embedderScope,
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       let refs: Awaited<ReturnType<WikiStore["related"]>>;
       try {
         refs = await store.related(input.slug);
@@ -590,7 +799,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       if (refs.length === 0) return `no articles related to "${input.slug}"`;
       const lines = [`${refs.length} article(s) related to "${input.slug}":`];
-      for (const ref of refs) lines.push(`  • (${ref.relatedScore.toFixed(2)}) ${refLine(ref)}`);
+      const rows = await safeRefLines(
+        refs,
+        rc,
+        (ref, row) => `(${ref.relatedScore.toFixed(2)}) ${row}`,
+      );
+      for (const row of rows) lines.push(`  • ${row}`);
       return lines.join("\n");
     },
   });

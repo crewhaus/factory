@@ -17,19 +17,25 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import {
+  BUILTIN_TOOLS,
   CATEGORIES,
   allRegisteredTools,
+  builtinToolsFor,
   categoriesForTool,
   leafCategories,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
 import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { TOOL_REGISTRY, projectRegistryEntry } from "@crewhaus/tool-registry-manifest";
+import { TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
+import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
+import { TOOL_PACKAGE_LOADERS, loadBuiltinTools } from "./tool-packages";
 import {
   CLI_RUNTIME_TOOL_KEYS,
   TOOL_KEYWORDS,
   buildCategoryRows,
   diffToolMapKeys,
+  formatCategoryLines,
 } from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
@@ -70,6 +76,88 @@ describe("category registry vs. the real builtin set", () => {
   });
 });
 
+/**
+ * The builtin table (`@crewhaus/tool-categories`) is data only, so it cannot
+ * check its own `name` / `io` / `sandbox` columns against the tools. This
+ * file can import every tool, so it does — for every row, shape-specific
+ * ones included. A row that says a tool does not start a process when it
+ * does would let the cf-worker check call a host tool "not wired yet".
+ */
+describe("the builtin table's facts match the tools themselves", () => {
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+  test("name, io, sandbox, justification and scope agree with every RegisteredTool", async () => {
+    const wrong: string[] = [];
+    let checked = 0;
+    for (const [key, entry] of Object.entries(BUILTIN_TOOLS)) {
+      // By file, not by specifier: apps/cli does not depend on the
+      // shape-specific packages, and workspace deps are linked per package.
+      const file = join(
+        repoRoot,
+        "packages",
+        entry.package.replace("@crewhaus/", ""),
+        "src/index.ts",
+      );
+      const mod = (await import(file)) as Record<string, unknown>;
+      const tool = mod[entry.export] as
+        | {
+            name: string;
+            ioCapability?: string;
+            requiresSandbox: boolean;
+            requireJustification: boolean;
+            scope: string;
+          }
+        | undefined;
+      checked += 1;
+      if (tool === undefined) {
+        wrong.push(`${key}: ${entry.package} exports no "${entry.export}"`);
+        continue;
+      }
+      if (tool.name !== entry.name) wrong.push(`${key}: name ${entry.name} vs ${tool.name}`);
+      const io =
+        tool.ioCapability === "process" || tool.ioCapability === "network"
+          ? tool.ioCapability
+          : undefined;
+      if (io !== entry.io) wrong.push(`${key}: io ${entry.io} vs ${io}`);
+      if ((tool.requiresSandbox === true) !== (entry.sandbox === true)) {
+        wrong.push(`${key}: sandbox ${entry.sandbox} vs ${tool.requiresSandbox}`);
+      }
+      if ((tool.requireJustification === true) !== (entry.justify === true)) {
+        wrong.push(`${key}: justify ${entry.justify} vs ${tool.requireJustification}`);
+      }
+      // A bundle README prints "external" for a row with an io fact, so the
+      // two must be the same fact on every tool.
+      if ((tool.scope === "external") !== (entry.io !== undefined)) {
+        wrong.push(`${key}: scope ${tool.scope} but io ${entry.io}`);
+      }
+    }
+    expect(checked).toBe(Object.keys(BUILTIN_TOOLS).length);
+    expect(checked).toBeGreaterThanOrEqual(550);
+    expect(wrong).toEqual([]);
+  }, 60_000);
+
+  test("the cf-worker policy lists agree with the table's edge column", async () => {
+    // By file: apps/cli does not depend on the edge runtime package.
+    const { EDGE_SAFE_TOOLS, HOST_ONLY_TOOLS } = (await import(
+      join(repoRoot, "packages/worker-runtime/src/tool-policy.ts")
+    )) as {
+      EDGE_SAFE_TOOLS: ReadonlySet<string>;
+      HOST_ONLY_TOOLS: ReadonlyMap<string, string>;
+    };
+    const edge = Object.entries(BUILTIN_TOOLS)
+      .filter(([, e]) => e.edge === true)
+      .map(([k]) => k)
+      .sort();
+    expect(edge.length).toBeGreaterThan(0);
+    expect([...EDGE_SAFE_TOOLS].sort()).toEqual(edge);
+    // Every host-only name the edge hard-rejects is a builtin the edge does
+    // not wire (the policy also lists perception tools that are not builtins).
+    for (const name of HOST_ONLY_TOOLS.keys()) {
+      expect(BUILTIN_TOOLS[name]?.edge).not.toBe(true);
+    }
+  });
+});
+
 describe("buildCategoryRows", () => {
   test("rows carry the all- selector an operator writes", () => {
     const rows = buildCategoryRows(CATEGORIES, toolsInCategory);
@@ -101,6 +189,22 @@ describe("buildCategoryRows", () => {
       expect(row.title.length).toBeGreaterThan(0);
       expect(row.tools.length).toBeGreaterThan(0);
     }
+  });
+
+  // C038 — `tools categories` is where an operator reads what all-network
+  // holds, so the network tools it leaves out are printed under it.
+  test("the network roll-up prints the network tools it leaves out", () => {
+    const rows = buildCategoryRows(CATEGORIES, toolsInCategory);
+    const network = rows.find((r) => r.name === "network");
+    expect(network?.note).toContain("all-codehost");
+    const lines = formatCategoryLines(rows);
+    const at = lines.findIndex((l) => l.startsWith("  all-network  "));
+    expect(at).toBeGreaterThan(-1);
+    expect(lines[at + 2]).toBe(`    note: ${network?.note}`);
+    // Only the rows that carry a note print one.
+    expect(lines.filter((l) => l.startsWith("    note: "))).toHaveLength(
+      rows.filter((r) => r.note !== undefined).length,
+    );
   });
 });
 
@@ -159,73 +263,42 @@ describe("every exported tool is reachable from a spec", () => {
   });
 
   /**
-   * The packages a spec reaches through a different target, not through
-   * `target-cli`'s builtin map.
+   * The packages whose tools are not in the builtin table at all.
    *
-   * Four of the 92 export a `RegisteredTool` that is deliberately absent from
-   * `BUILTIN_TOOL_MAP`: the chain-call pair and the message channel are
-   * emitted by `target-graph`, `target-crew`, `target-workflow` and the
-   * cf-worker targets, and `Retrieve` is registered programmatically per
-   * corpus by `apps/cli/src/knowledge-ingest.ts`. Naming them is unavoidable;
-   * leaving the name unchecked is not, so the test below re-derives the reason
-   * each one is here. An exemption whose justification stops being true fails
-   * rather than going on exempting.
+   * Every other `RegisteredTool` a tool package exports must be a row of the
+   * table — including the shape-specific ones (the evm pair and
+   * `sendMessage`), which the table carries with the shapes that wire them.
+   * `Retrieve` is the one exception: `apps/cli/src/knowledge-ingest.ts`
+   * builds it per corpus from a spec's `knowledge:` block, so it has no
+   * `tools:` key. The test below re-derives that reason, so an exemption
+   * whose justification stops being true fails rather than going on
+   * exempting.
    */
-  const REACHED_BY_ANOTHER_TARGET: Readonly<Record<string, string>> = {
-    "tool-evm": "target-graph, target-crew and target-workflow emit it",
-    "tool-evm-tx": "target-graph, target-crew and target-workflow emit it",
-    "tool-message-channel": "the channel-bot and cf-worker targets emit it",
+  const REACHED_OUTSIDE_THE_TABLE: Readonly<Record<string, string>> = {
     "tool-retrieve": "apps/cli/src/knowledge-ingest.ts registers it per corpus",
   };
 
-  const exportNames = new Set(
-    Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-  );
+  const exportNames = new Set(Object.values(BUILTIN_TOOLS).map((entry) => entry.export));
 
   test("every exemption still has the reason it was granted for", () => {
-    const targets = readdirSync(join(repoRoot, "packages")).filter((n) => n.startsWith("target-"));
-    expect(targets.length).toBeGreaterThanOrEqual(5);
-    for (const pkg of Object.keys(REACHED_BY_ANOTHER_TARGET)) {
-      // Still a package, and still exporting something — an exemption for a
-      // package that has been deleted or emptied is dead weight.
+    for (const pkg of Object.keys(REACHED_OUTSIDE_THE_TABLE)) {
       const entry = join(repoRoot, "packages", pkg, "src", "index.ts");
       expect(existsSync(entry)).toBe(true);
       expect(PACKAGES).toContain(pkg);
-
-      // And still reached: some OTHER package that emits or registers tools
-      // imports it by name. `tool-retrieve` is the one reached from the CLI
-      // itself rather than from a target, so both places are searched.
-      const importers: string[] = [];
-      for (const other of [...targets.map((t) => join("packages", t, "src")), "apps/cli/src"]) {
-        const dir = join(repoRoot, other);
-        if (!existsSync(dir)) continue;
-        for (const file of readdirSync(dir)) {
-          if (!file.endsWith(".ts") || file.includes(".test.")) continue;
-          if (readFileSync(join(dir, file), "utf-8").includes(`@crewhaus/${pkg}`)) {
-            importers.push(join(other, file));
-          }
-        }
-      }
+      // Still reached from the CLI by name.
+      const cliDir = join(repoRoot, "apps/cli/src");
+      const importers = readdirSync(cliDir)
+        .filter((f) => f.endsWith(".ts") && !f.includes(".test."))
+        .filter((f) => readFileSync(join(cliDir, f), "utf-8").includes(`@crewhaus/${pkg}`));
       expect(
         importers.length,
-        `${pkg} is exempt because ${REACHED_BY_ANOTHER_TARGET[pkg]}, and nothing imports it any more`,
+        `${pkg} is exempt because ${REACHED_OUTSIDE_THE_TABLE[pkg]}, and nothing imports it any more`,
       ).toBeGreaterThan(0);
-
-      // And still NEEDS the exemption. "Some target imports it" is true of
-      // nearly every tool package, so on its own it would let a name sit here
-      // for ever. This is the tight half: an exempt package's tools must
-      // actually be absent from the builtin map. The moment one is wired
-      // properly, the exemption is dead weight and this says so — which is
-      // also what stops a package being parked here to silence the sweep.
-      const wiredHere = [
-        ...readFileSync(entry, "utf-8").matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm),
-      ]
-        .map((m) => m[1] as string)
-        .filter((name) => CLI_RUNTIME_TOOL_KEYS.includes(name) || exportNames.has(name));
-      expect(wiredHere.length).toBeGreaterThanOrEqual(0);
+      // And still NEEDS the exemption: none of its tools is in the table.
+      const inTable = Object.values(BUILTIN_TOOLS).filter((e) => e.package === `@crewhaus/${pkg}`);
       expect(
-        wiredHere,
-        `${pkg} is listed as reached by another target, but ${wiredHere.join(", ")} is wired into the builtin map — drop it from REACHED_BY_ANOTHER_TARGET so the sweep covers this package`,
+        inTable.map((e) => e.export),
+        `${pkg} is exempt, but the builtin table carries its tools — drop the exemption`,
       ).toEqual([]);
     }
   });
@@ -237,15 +310,12 @@ describe("every exported tool is reachable from a spec", () => {
     // module is exported under a suffix, so the spec key and the export name
     // can differ; resolve through the emitter map rather than assuming they
     // match, and treat an export no key points at as unreachable.
-    const exportsWired = new Set(
-      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-    );
     for (const pkg of PACKAGES) {
-      if (pkg in REACHED_BY_ANOTHER_TARGET) continue;
+      if (pkg in REACHED_OUTSIDE_THE_TABLE) continue;
       const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
       for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
         const name = m[1] as string;
-        if (!CLI_RUNTIME_TOOL_KEYS.includes(name) && !exportsWired.has(name)) {
+        if (BUILTIN_TOOLS[name] === undefined && !exportNames.has(name)) {
           unreachable.push({ pkg, tool: name });
         }
       }
@@ -349,31 +419,70 @@ describe("every copy of the path resolver probes with lstat, not existsSync", ()
     expect(copies.length).toBeGreaterThanOrEqual(17);
     // The ones that do NOT use the conventional paths.ts filename are the
     // ones a filename-based sweep loses, so name them explicitly.
-    for (const pkg of [
-      "tool-fs",
-      "tool-image",
-      "tool-document-ingest",
-      "tool-proc",
-      "tool-git",
-      "crawler",
-    ]) {
+    for (const pkg of ["tool-proc", "tool-git", "crawler"]) {
       expect(pkgs).toContain(pkg);
     }
+  });
+
+  test("a package that retired its copy resolves through tool-safety instead", () => {
+    // 0.7.1: these five dropped their copy for tool-safety's resolveContained,
+    // which walks a dangling link's target one component at a time (the
+    // copies folded it as text: `evil -> a/y/../x` with `a/y -> ..` read as
+    // inside). A copy that leaves the sweep must have been REPLACED, not
+    // deleted, or the floor above is all that notices.
+    const repoRoot = join(import.meta.dir, "..", "..", "..");
+    const retired = [
+      ["tool-fs", "index.ts"],
+      ["tool-fsx", "paths.ts"],
+      ["tool-hostfs", "paths.ts"],
+      ["tool-image", "index.ts"],
+      ["tool-document-ingest", "index.ts"],
+    ] as const;
+    const copies = new Set(resolverFiles().map((c) => c.pkg));
+    let checked = 0;
+    for (const [pkg, file] of retired) {
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", file), "utf-8");
+      expect({ pkg, copy: copies.has(pkg) }).toEqual({ pkg, copy: false });
+      expect({ pkg, delegates: /resolveContained\(/.test(text) }).toEqual({
+        pkg,
+        delegates: true,
+      });
+      expect({ pkg, imports: text.includes('from "@crewhaus/tool-safety/fs"') }).toEqual({
+        pkg,
+        imports: true,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
   });
 });
 
 describe("the CLI can actually load every tool package it names", () => {
   const REPO = join(import.meta.dir, "..", "..", "..");
 
-  /** Every `@crewhaus/tool-*` the CLI dynamically imports in loadToolMap. */
-  function importedPackages(): string[] {
-    const text = readFileSync(join(REPO, "apps/cli/src/index.ts"), "utf-8");
-    const found = text.matchAll(/import\("(@crewhaus\/tool-[a-z0-9-]+)"\)/g);
-    return [...new Set([...found].map((m) => m[1] as string))].sort();
+  /**
+   * Every package `apps/cli/src/tool-packages.ts` has a literal loader for,
+   * read from the SOURCE — a literal `import("…")` is what `bun build
+   * --compile` embeds, so the text is what matters.
+   */
+  function loaderPackages(): string[] {
+    const text = readFileSync(join(REPO, "apps/cli/src/tool-packages.ts"), "utf-8");
+    const found = [
+      ...text.matchAll(/"(@crewhaus\/tool-[a-z0-9-]+)": \(\) => import\("([^"]+)"\)/g),
+    ];
+    // Each loader imports the package it is keyed by, not a neighbour.
+    for (const m of found) expect(m[2]).toBe(m[1]);
+    return [...new Set(found.map((m) => m[1] as string))].sort();
   }
 
-  test("the sweep finds the imports it is meant to guard", () => {
-    expect(importedPackages().length).toBeGreaterThanOrEqual(20);
+  /** Every package a builtin the cli shape compiles lives in, from the table. */
+  const cliPackages = [
+    ...new Set(builtinToolsFor("cli").map((k) => BUILTIN_TOOLS[k]?.package as string)),
+  ].sort();
+
+  test("the sweep finds the loaders it is meant to guard", () => {
+    expect(loaderPackages().length).toBeGreaterThanOrEqual(60);
+    expect(Object.keys(TOOL_PACKAGE_LOADERS).sort()).toEqual(loaderPackages());
   });
 
   test("each one is a declared dependency of apps/cli", () => {
@@ -386,41 +495,43 @@ describe("the CLI can actually load every tool package it names", () => {
       dependencies?: Record<string, string>;
     };
     const declared = new Set(Object.keys(pkg.dependencies ?? {}));
-    const missing = importedPackages().filter((name) => !declared.has(name));
+    const missing = loaderPackages().filter((name) => !declared.has(name));
     expect(missing).toEqual([]);
   });
 
   test("each one has a project reference, so tsc builds it first", () => {
     const text = readFileSync(join(REPO, "apps/cli/tsconfig.json"), "utf-8");
-    const missing = importedPackages().filter(
+    const missing = loaderPackages().filter(
       (name) => !text.includes(`../../packages/${name.replace("@crewhaus/", "")}"`),
     );
     expect(missing).toEqual([]);
   });
 
-  test("every builtin's package is one the CLI imports", () => {
-    // BUILTIN_TOOL_MAP is what a compiled bundle imports; loadToolMap is what
-    // `crewhaus run` imports. A package in the first but not the second is a
-    // tool that compiles into a spec and then cannot be run.
-    const imported = new Set(importedPackages());
-    const referenced = new Set(
-      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { package: string }).package),
-    );
-    const unrunnable = [...referenced].filter(
-      (p) => p.startsWith("@crewhaus/tool-") && !imported.has(p),
-    );
-    expect(unrunnable).toEqual([]);
+  test("the loaders are exactly the packages the cli shape's builtins live in", () => {
+    // A package with a builtin and no loader is a tool that compiles into a
+    // spec and then cannot be run; a loader for no builtin is dead weight.
+    expect(cliPackages.length).toBeGreaterThanOrEqual(60);
+    expect(loaderPackages()).toEqual(cliPackages);
   });
+
+  test("loadBuiltinTools resolves every cli builtin to a tool with the table's name", async () => {
+    const map = await loadBuiltinTools(builtinToolsFor("cli"));
+    const keys = Object.keys(map);
+    expect(keys.length).toBe(builtinToolsFor("cli").length);
+    const wrong = keys.filter((k) => map[k]?.name !== BUILTIN_TOOLS[k]?.name);
+    expect(wrong).toEqual([]);
+  }, 30_000);
 });
 
 describe("every copy of the private-address classifier is the same classifier", () => {
   /**
-   * Ten packages guard an outbound request against a private destination, and
-   * each carries the classifier as a byte-identical block rather than importing
-   * it — these are otherwise independent per-package networking layers, and a
-   * guard proving the copies are identical is cheaper than the import graph a
-   * shared package would need across `crawler`, `computer-use-driver` and eight
-   * tools.
+   * The packages in CLASSIFIER_PACKAGES guard an outbound request against a
+   * private destination, and each carries the classifier as a byte-identical
+   * block rather than importing it — these are otherwise independent
+   * per-package networking layers, and a guard proving the copies are
+   * identical is cheaper than the import graph a shared package would need
+   * across `crawler`, `computer-use-driver` and the tools (FederationDiscover's
+   * peer dialing among them).
    *
    * That only works if something checks. On 2026-09-18 an audit of the copies
    * found SIX confirmed exploitable — each with a runnable proof — because they
@@ -435,15 +546,32 @@ describe("every copy of the private-address classifier is the same classifier", 
   const MARKER_END = "// END SYNCHRONISED BLOCK";
 
   /**
-   * RECURSIVE on purpose. The sibling resolver guard above walks only
-   * `packages/<pkg>/src/*.ts`, and this block also lives at
-   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
-   * stops at the first level would miss it and still report green, which is
-   * how the resolver guard went vacuous twice.
+   * Every package that carries a copy, exactly. A copy lost (markers renamed,
+   * file moved), a copy added, or a second copy in one package each fails
+   * until this list is edited. tool-discovery's copy arrived after the list
+   * was first written and was missing from it, so its markers could vanish
+   * with every assertion here still green (security-7#10).
    */
-  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+  const CLASSIFIER_PACKAGES = [
+    "computer-use-driver",
+    "crawler",
+    "tool-chainread",
+    "tool-codehost",
+    "tool-discovery",
+    "tool-fetch",
+    "tool-http",
+    "tool-navigate",
+    "tool-notify",
+    "tool-obs",
+    // 0.7.1 C144: WaitForPort classifies the host it may probe.
+    "tool-proc",
+    "tool-web",
+  ];
+
+  /** Every non-test `.ts` under `packages/<pkg>/src`, at any depth. */
+  function sourceFiles(): Array<{ pkg: string; file: string; text: string }> {
     const pkgDir = join(import.meta.dir, "..", "..", "..", "packages");
-    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    const out: Array<{ pkg: string; file: string; text: string }> = [];
     const walk = (pkg: string, dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === "node_modules" || entry.name === "dist") continue;
@@ -453,45 +581,62 @@ describe("every copy of the private-address classifier is the same classifier", 
           continue;
         }
         if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
-        const text = readFileSync(full, "utf-8");
-        const from = text.indexOf(MARKER_START);
-        if (from === -1) continue;
-        const to = text.indexOf(MARKER_END, from);
-        // A start marker with no end is a truncated block, not an absent one.
-        expect(to).toBeGreaterThan(from);
-        found.push({ pkg, file: full, block: text.slice(from, to + MARKER_END.length) });
+        out.push({ pkg, file: full, text: readFileSync(full, "utf-8") });
       }
     };
     for (const pkg of readdirSync(pkgDir)) {
       const src = join(pkgDir, pkg, "src");
       if (existsSync(src)) walk(pkg, src);
     }
+    return out;
+  }
+
+  /**
+   * RECURSIVE on purpose. The sibling resolver guard above walks only
+   * `packages/<pkg>/src/*.ts`, and this block also lives at
+   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
+   * stops at the first level would miss it and still report green, which is
+   * how the resolver guard went vacuous twice.
+   */
+  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    for (const { pkg, file, text } of sourceFiles()) {
+      const from = text.indexOf(MARKER_START);
+      if (from === -1) continue;
+      const to = text.indexOf(MARKER_END, from);
+      // A start marker with no end is a truncated block, not an absent one.
+      expect(to).toBeGreaterThan(from);
+      found.push({ pkg, file, block: text.slice(from, to + MARKER_END.length) });
+    }
     return found;
   }
 
-  test("the sweep finds every copy it is meant to guard", () => {
+  test("the sweep finds every copy it is meant to guard, and no other", () => {
     const copies = classifierCopies();
-    // The count assertion is the line that turns "passed" into "actually
-    // looked". Without it, a rename or a moved file silently shrinks the sweep
-    // to nothing and this whole describe reports green over an empty set.
-    expect(copies.length).toBeGreaterThanOrEqual(10);
-    // And the specific packages, because a count alone survives one copy
-    // disappearing while an unrelated one is added.
-    const pkgs = new Set(copies.map((c) => c.pkg));
-    for (const required of [
-      "computer-use-driver",
-      "crawler",
-      "tool-chainread",
-      "tool-codehost",
-      "tool-fetch",
-      "tool-http",
-      "tool-navigate",
-      "tool-notify",
-      "tool-obs",
-      "tool-web",
-    ]) {
-      expect({ required, present: pkgs.has(required) }).toEqual({ required, present: true });
-    }
+    // Exact, both ways: the package list, and one copy per package. Without
+    // the count a rename or a moved file silently shrinks the sweep, and the
+    // byte-identical test below then reports green over fewer copies.
+    expect(copies.map((c) => c.pkg).sort()).toEqual(CLASSIFIER_PACKAGES);
+    expect(copies.length).toBe(CLASSIFIER_PACKAGES.length);
+  });
+
+  test("no classifier lives outside the markers", () => {
+    // The NAT64 arm (`g[1] === 0xff9b`) is the classifier's fingerprint. A
+    // package that pastes the classifier without the markers, or a file that
+    // keeps a second copy beside its marked one, is invisible to the sweep
+    // above; this finds it by the arm instead.
+    const nat64 = /0xff9b/i;
+    const carriers = sourceFiles().filter(({ text }) => nat64.test(text));
+    expect(carriers.map((c) => c.pkg).sort()).toEqual(CLASSIFIER_PACKAGES);
+    const outside = carriers
+      .filter(({ text }) => {
+        const from = text.indexOf(MARKER_START);
+        const to = text.indexOf(MARKER_END, from);
+        if (from === -1 || to === -1) return true;
+        return nat64.test(text.slice(0, from) + text.slice(to));
+      })
+      .map((c) => c.file);
+    expect(outside).toEqual([]);
   });
 
   test("every copy is byte-identical", () => {
@@ -516,8 +661,8 @@ describe("every copy of the private-address classifier is the same classifier", 
    * it showed that was worthless: narrowing the NAT64 arm to
    * `g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0` — which reopens the
    * `64:ff9b:1::/48` hole that shipped exploitable — STILL CONTAINS that
-   * substring, so the assertion passed over a broken classifier in all ten
-   * copies at once. Matching on text was the original bug; asserting on text
+   * substring, so the assertion passed over a broken classifier in every
+   * copy at once. Matching on text was the original bug; asserting on text
    * reproduced it in the guard.
    *
    * Executing one copy plus proving the copies identical covers all of them.
@@ -660,6 +805,65 @@ describe("the generated tool manifest matches the tools it describes", () => {
     ).toEqual([]);
   }, 60_000);
 
+  /**
+   * The projection test above compares a row with a fresh PROJECTION, and the
+   * projection drops every `OperativeArg` key it does not know on both sides,
+   * so a key the projection forgets passes it. Removing `env` from
+   * `projectOperativeArg` and regenerating once passed every test (final
+   * review, mutation MU08r): ApprovalStatus and `permissions suggest`, which
+   * read the manifest offline, silently lost the environment spellings the
+   * runtime deny reads. So each row's operativeArgs are compared with the
+   * live tool's own declaration, key for key.
+   */
+  test("every row carries its tool's operativeArgs whole, every key of every field", async () => {
+    let compared = 0;
+    let keysSeen = new Set<string>();
+    const lost: Array<{ key: string; live: unknown; manifest: unknown; flags: unknown }> = [];
+    for (const key of emitterKeys) {
+      const entry = BUILTIN_TOOL_MAP[key];
+      if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
+      const mod = (await import(entry.package)) as Record<string, unknown>;
+      const tool = mod[entry.export] as { operativeArgs?: ReadonlyArray<object> } | undefined;
+      if (tool === undefined) throw new Error(`${entry.package} has no export ${entry.export}`);
+      const live = tool.operativeArgs?.map((arg) => ({ ...arg }));
+      const manifest = TOOL_REGISTRY[key]?.operativeArgs;
+      const flags = TOOL_FLAGS[key]?.operativeArgs;
+      compared += 1;
+      for (const arg of live ?? []) keysSeen = new Set([...keysSeen, ...Object.keys(arg)]);
+      if (JSON.stringify(sortKeys(live)) !== JSON.stringify(sortKeys(manifest))) {
+        lost.push({ key, live, manifest, flags });
+      } else if (JSON.stringify(sortKeys(live)) !== JSON.stringify(sortKeys(flags))) {
+        lost.push({ key, live, manifest, flags });
+      }
+    }
+    expect(compared).toBe(emitterKeys.length);
+    expect(
+      lost.map((l) => l.key),
+      "re-run `bun run scripts/gen-tool-registry.ts`, and carry every OperativeArg key in projectOperativeArg",
+    ).toEqual([]);
+    // Every key an OperativeArg can have is in use by some builtin, so the
+    // comparison above has really looked at each of them.
+    expect([...keysSeen].sort()).toEqual(
+      [
+        "beneath",
+        "default",
+        "defaultAtRoot",
+        "env",
+        "field",
+        "glob",
+        "kind",
+        "prefix",
+        "relocates",
+        "shell",
+        "within",
+      ].sort(),
+    );
+    // The environment a command's call sets, by name.
+    expect(TOOL_FLAGS["runCommand"]?.operativeArgs).toEqual([
+      { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+    ]);
+  }, 60_000);
+
   test("no row describes an MCP tool", () => {
     // A spec declares an MCP SERVER and the server's tool list only exists
     // once it is connected, so this manifest can never cover MCP. One
@@ -670,28 +874,63 @@ describe("the generated tool manifest matches the tools it describes", () => {
 });
 
 /**
- * The 455 KB stays where it was declared.
+ * OpenAI and Azure OpenAI refuse the WHOLE request when any tool's
+ * `function.description` is longer than 1024 characters, so one over-long
+ * builtin breaks every turn of a spec that grants it (C014).
+ * `@crewhaus/tool-registry-manifest`'s own test holds the limit over the
+ * manifest; this holds it over the live tools, which includes the builtins the
+ * manifest cannot carry — the chain readers and signers other shapes emit,
+ * `SendMessage` and the pipeline's `Retrieve`. `.length` counts UTF-16 units,
+ * never fewer than the code points a provider might count.
+ */
+describe("every builtin description fits every provider", () => {
+  test("no live builtin's description is longer than 1024 characters", async () => {
+    const { tools, fromMap } = await loadAllBuiltinTools();
+    const over = tools
+      .filter((tool) => tool.description.length > 1024)
+      .map((tool) => `${tool.name}: ${tool.description.length}`);
+    // The sweep's hit count: the emitter map and the package scan both ran,
+    // and the scan found the builtins the map leaves out.
+    expect(fromMap).toBeGreaterThanOrEqual(500);
+    expect(tools.length).toBeGreaterThan(fromMap);
+    expect(over).toEqual([]);
+  }, 60_000);
+});
+
+/**
+ * The 455 KB of descriptions stays where it was declared.
  *
  * `collectCrewhausDeps` pins whole PACKAGES into a bundle's `package.json`, so
  * a package that imports the manifest hands the manifest to every bundle that
- * grants any of its tools — importing one small export does not help, because
- * nothing tree-shakes at that boundary. That is why `capability` was given no
- * roll-up: a broad `all-<category>` grant must not drag the description prose
- * into a harness that never asked for it.
+ * grants any of its tools. That is why `capability` was given no roll-up: a
+ * broad `all-<category>` grant must not drag the description prose into a
+ * harness that never asked for it.
  *
  * `toolInventory` defeated that once already. It needs the builtin KEY SET,
  * took it from the manifest, and `@crewhaus/tool-crewhaus` sits in the
- * `crewhaus` leaf — which IS inside the `all-operations` roll-up. So a plain
- * `all-operations` grant paid the 455 KB through the back door, for prose it
- * never reads. It reads `BUILTIN_TOOL_MAP` instead: the same keys, already in
- * its dependency closure, no prose. The key sets being identical is asserted
- * above, in both directions, on every run.
+ * `crewhaus` leaf — which IS inside the `all-operations` roll-up. It reads
+ * `BUILTIN_TOOL_MAP` instead: the same keys, already in its dependency
+ * closure, no prose. The key sets being identical is asserted above.
  *
- * This is the test that keeps the next import from re-opening the door.
+ * 0.7.1 moved the line. `PermissionAudit` (tool-crewhaus) and
+ * `PermissionsSuggest` / `ApprovalStatus` (tool-approvals) need every
+ * builtin's FLAGS — read-only, destructive, external, justification, the
+ * operative arguments — to tell the truth about a spec
+ * (permission-integration#9, #8). Those come from the manifest's `/flags`
+ * entry, a table with no descriptions. A bundle granting those tools now
+ * INSTALLS the manifest package, but never LOADS its prose, and a compiled
+ * single binary embeds only the flags table. The package split that would
+ * avoid the install is a new npm package, which a patch release cannot
+ * first-publish through the trusted-publishing pipeline; it is left to 0.8.
+ *
+ * So the rule held here is about what is loaded: only tool-capability imports
+ * the descriptions, every other carrier imports `/flags` and nothing else,
+ * and the carriers are exactly the reviewed ones.
  */
-describe("the tool manifest is carried only by bundles that asked for it", () => {
+describe("the tool manifest's descriptions are loaded only by bundles that asked for them", () => {
   const ROOT = join(import.meta.dir, "..", "..", "..");
   const MANIFEST = "@crewhaus/tool-registry-manifest";
+  const FLAGS_ONLY = `${MANIFEST}/flags`;
 
   function deps(pkg: string): ReadonlyArray<string> {
     const file = join(ROOT, "packages", pkg.replace("@crewhaus/", ""), "package.json");
@@ -715,25 +954,79 @@ describe("the tool manifest is carried only by bundles that asked for it", () =>
     return seen;
   }
 
-  test("only @crewhaus/tool-capability pulls it in", () => {
+  /** The manifest specifiers a package's non-test sources import. */
+  function manifestImports(pkg: string): string[] {
+    const src = join(ROOT, "packages", pkg.replace("@crewhaus/", ""), "src");
+    if (!existsSync(src)) return [];
+    const out: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(".ts") && !entry.name.includes(".test.")) {
+          const text = readFileSync(full, "utf-8");
+          for (const m of text.matchAll(/from "(@crewhaus\/tool-registry-manifest[^"]*)"/g)) {
+            out.push(m[1] as string);
+          }
+        }
+      }
+    };
+    walk(src);
+    return out;
+  }
+
+  /** The packages that depend on the manifest, each with why. */
+  const CARRIERS: Readonly<Record<string, string>> = {
+    "tool-approvals":
+      "PermissionsSuggest and ApprovalStatus read each builtin's operativeArgs and readOnly flag",
+    "tool-capability": "ToolRegistry describes the tools a harness lacks — the prose is its answer",
+    "tool-crewhaus": "PermissionAudit reports each builtin's real flags",
+  };
+
+  test("the carriers are exactly the reviewed ones", () => {
     const carriers = readdirSync(join(ROOT, "packages"))
       .filter((name) => name.startsWith("tool-") && name !== "tool-registry-manifest")
       .filter((name) => deps(`@crewhaus/${name}`).includes(MANIFEST));
-    // The sweep found tool packages to look at, and the one legitimate carrier.
+    // The sweep found tool packages to look at.
     expect(carriers.length).toBeGreaterThan(0);
-    expect(carriers).toEqual(["tool-capability"]);
+    expect(carriers.sort()).toEqual(Object.keys(CARRIERS).sort());
   });
 
-  test("a tool-crewhaus bundle does not install it", () => {
+  test("only tool-capability imports the descriptions; every other carrier imports /flags alone", () => {
+    for (const pkg of Object.keys(CARRIERS)) {
+      const imports = manifestImports(`@crewhaus/${pkg}`);
+      // The carrier really imports it — an exemption for a dependency nothing
+      // reads is dead weight.
+      expect({ pkg, imports: imports.length > 0 }).toEqual({ pkg, imports: true });
+      if (pkg === "tool-capability") continue;
+      expect({ pkg, imports: [...new Set(imports)] }).toEqual({ pkg, imports: [FLAGS_ONLY] });
+    }
+  });
+
+  test("a tool-crewhaus bundle loads no description", () => {
     const reach = closure("@crewhaus/tool-crewhaus");
     // `target-cli` is what it reads the key set from, and it was already there.
     expect(reach.has("@crewhaus/target-cli")).toBe(true);
-    expect(reach.has(MANIFEST)).toBe(false);
     // And the closure was really walked, not empty.
     expect(reach.size).toBeGreaterThan(20);
+    const prose = [...reach].filter(
+      (pkg) => pkg !== MANIFEST && manifestImports(pkg).some((spec) => spec !== FLAGS_ONLY),
+    );
+    expect(prose).toEqual([]);
   });
 
   test("a tool-capability bundle does install it, so the check can fail", () => {
     expect(closure("@crewhaus/tool-capability").has(MANIFEST)).toBe(true);
   });
 });
+
+/** The value with every object's keys in one order, so two JSON spellings compare. */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, sortKeys(v)]),
+  );
+}

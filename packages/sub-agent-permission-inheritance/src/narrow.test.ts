@@ -101,9 +101,13 @@ describe("narrowRuleSet — the decision-level meet", () => {
     expect(evaluate(call("Bash", { command: "ls" }), "default", base)).toBe("allow");
   });
 
-  test("mode semantics are untouched: plan stays readOnly-only, bypass stays bypass", () => {
+  test("plan mode: a profile deny now narrows it too (0.7.1); bypass stays bypass", () => {
     const narrowed = narrowRuleSet(BASE, ["Read"], []);
-    expect(evaluate(call("Read", {}, true), "plan", narrowed)).toBe("allow");
+    // permission-integration#6 — plan mode reads deny rules, so the profile's
+    // deny on Read holds there as well. It still never widens: a tool the
+    // profile does not deny keeps plan mode's readOnly-only answer.
+    expect(evaluate(call("Read", {}, true), "plan", narrowed)).toBe("deny");
+    expect(evaluate(call("Glob", {}, true), "plan", narrowed)).toBe("allow");
     expect(evaluate(call("Bash", {}, false), "plan", narrowed)).toBe("deny");
     expect(evaluate(call("Read", {}, true), "bypass", narrowed)).toBe("allow");
   });

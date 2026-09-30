@@ -13,6 +13,7 @@
  * ether.
  */
 import { keccak256, toHex } from "@crewhaus/tool-encode";
+import { checkedAddress } from "./address";
 
 const WORD = 32;
 
@@ -53,18 +54,47 @@ function splitTop(text: string): string[] {
   return parts;
 }
 
+/**
+ * The longest type string, and the deepest nesting of arrays and tuples,
+ * this parses. Each level rescans the text beneath it, so an unbounded one
+ * costs time in the square of its length; real ABI types are a few hundred
+ * characters and a handful of levels deep.
+ */
+export const MAX_TYPE_CHARS = 8192;
+export const MAX_TYPE_DEPTH = 32;
+
 export function parseType(raw: string): AbiType {
+  if (raw.length > MAX_TYPE_CHARS) {
+    throw new Error(
+      `a type of ${raw.length} characters is longer than the ${MAX_TYPE_CHARS} this reads`,
+    );
+  }
+  return parseTypeAt(raw, 0);
+}
+
+function parseTypeAt(raw: string, depth: number): AbiType {
   const text = raw.trim();
   if (text === "") throw new Error("an empty string is not an ABI type");
+  if (depth > MAX_TYPE_DEPTH) {
+    throw new Error(`the type nests arrays and tuples more than ${MAX_TYPE_DEPTH} levels deep`);
+  }
 
   // Array suffix, innermost last: `uint256[2][]` is a dynamic array of
   // fixed-length-2 arrays, so the LAST suffix is the outer type.
   const arrayMatch = /^(.*)\[(\d*)\]$/.exec(text);
   if (arrayMatch) {
-    const child = parseType(arrayMatch[1] as string);
+    const child = parseTypeAt(arrayMatch[1] as string, depth + 1);
     const length = arrayMatch[2] === "" ? -1 : Number.parseInt(arrayMatch[2] as string, 10);
     if (length === 0)
       throw new Error(`"${text}" has a zero-length array, which cannot hold a value`);
+    // A fixed length is laid out inline, so its size must be a number this
+    // can count in: a type string is not a reason to believe in 2^64 items.
+    if (
+      length !== -1 &&
+      !Number.isSafeInteger(length * (child.dynamic ? WORD : staticSize(child)))
+    ) {
+      throw new Error(`"${text}" is a fixed array too large to lay out`);
+    }
     return {
       base: "array",
       bits: 0,
@@ -77,7 +107,7 @@ export function parseType(raw: string): AbiType {
   }
 
   if (text.startsWith("(") && text.endsWith(")")) {
-    const components = splitTop(text.slice(1, -1)).map(parseType);
+    const components = splitTop(text.slice(1, -1)).map((c) => parseTypeAt(c, depth + 1));
     return {
       base: "tuple",
       bits: 0,
@@ -174,13 +204,30 @@ export function parseType(raw: string): AbiType {
   throw new Error(`"${text}" is not an ABI type this understands`);
 }
 
-function hexToBytes(raw: string, what: string): Uint8Array {
+/**
+ * Hex to bytes, strictly: an odd number of digits or a non-hex character is
+ * refused, never truncated or skipped. The one hex decoder the coder and the
+ * EIP-712 hasher share, so they cannot disagree about what a value is.
+ */
+export function hexToBytes(raw: string, what: string): Uint8Array {
   const text = raw.startsWith("0x") || raw.startsWith("0X") ? raw.slice(2) : raw;
   if (text.length % 2 !== 0) throw new Error(`${what} has an odd number of hex digits`);
   if (!/^[0-9a-fA-F]*$/.test(text)) throw new Error(`${what} is not hex`);
   const out = new Uint8Array(text.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(text.slice(i * 2, i * 2 + 2), 16);
   return out;
+}
+
+/**
+ * A `bytes` or `bytesN` value: a hex string. A number is refused rather than
+ * read as its decimal digits reinterpreted as hex, which is how 4660 would
+ * become 0x4660.
+ */
+export function bytesArg(value: unknown, what: string): Uint8Array {
+  if (typeof value !== "string") {
+    throw new Error(`${what}: bytes are a 0x hex string, not a ${typeof value}`);
+  }
+  return hexToBytes(value, what);
 }
 
 /** Two's complement into a 32-byte word, big-endian. */
@@ -288,9 +335,7 @@ function encodeValue(
 
   if (type.base === "string" || type.base === "bytes") {
     const bytes =
-      type.base === "string"
-        ? new TextEncoder().encode(String(value))
-        : hexToBytes(String(value), what);
+      type.base === "string" ? new TextEncoder().encode(String(value)) : bytesArg(value, what);
     return {
       head: none,
       tail: concat([wordFromBigInt(BigInt(bytes.length), false, 256, what), padRight(bytes)]),
@@ -298,9 +343,9 @@ function encodeValue(
   }
 
   if (type.base === "address") {
-    const bytes = hexToBytes(String(value), what);
-    if (bytes.length !== 20)
-      throw new Error(`${what}: an address is 20 bytes, got ${bytes.length}`);
+    // Shape AND checksum: a mixed-case address that fails EIP-55 has a wrong
+    // character in it, and encoding it anyway sends to that wrong address.
+    const bytes = hexToBytes(checkedAddress(value, what), what);
     const word = new Uint8Array(WORD);
     word.set(bytes, 12);
     return { head: word, tail: none };
@@ -312,7 +357,7 @@ function encodeValue(
   }
 
   if (type.base === "bytesN") {
-    const bytes = hexToBytes(String(value), what);
+    const bytes = bytesArg(value, what);
     const size = type.bits / 8;
     if (bytes.length !== size)
       throw new Error(`${what}: bytes${size} needs ${size} bytes, got ${bytes.length}`);
@@ -371,6 +416,11 @@ export function selectorOf(signature: string): string {
 
 /** Split `transfer(address,uint256)` into its name and parsed argument types. */
 export function parseSignature(signature: string): { name: string; types: AbiType[] } {
+  if (signature.length > MAX_TYPE_CHARS) {
+    throw new Error(
+      `a signature of ${signature.length} characters is longer than the ${MAX_TYPE_CHARS} this reads`,
+    );
+  }
   const open = signature.indexOf("(");
   if (open === -1 || !signature.trim().endsWith(")")) {
     throw new Error(`"${signature}" is not a function signature — expected name(type,type)`);
@@ -397,64 +447,260 @@ export function encodeCall(signature: string, args: ReadonlyArray<AbiValue>): st
 /** Decoded values use strings for integers, so a uint256 survives JSON. */
 export type Decoded = string | boolean | Decoded[];
 
-function wordAt(data: Uint8Array, offset: number, what: string): Uint8Array {
+/**
+ * How far a decode may inflate its input.
+ *
+ * An ABI encoding points at its dynamic values with offsets, and nothing in
+ * the format stops two offsets pointing at the same bytes. No encoder writes
+ * that — the compilers, ethers and viem each write every tail once — but a
+ * hostile contract or a crafted blob can: n heads sharing one tail decode it
+ * n times, at every level of nesting, so a few kilobytes decode to millions
+ * of values, and one call pins a core and fills the heap.
+ *
+ * So a decode is metered twice:
+ *
+ * - Every word read and every word of string or bytes payload costs one
+ *   unit, and a decode may spend {@link MAX_INFLATION} units per word of
+ *   input (and at least {@link BUDGET_FLOOR}). An honest encoding reads each
+ *   word about once and never comes near the limit.
+ * - Every value decoded — a tuple and an array included, not only the words
+ *   in them — is counted, and a decode may produce at most `1 + n` values
+ *   per word of input, where `n` is how deeply the types nest. A value either
+ *   reads a word of its own or is a tuple or an array holding at least one
+ *   value, so an encoding that reads each word once never produces more.
+ *   Without this count a type string could multiply its data on its own:
+ *   `((),(),…,uint256)[]` read one word per item and returned thousands of
+ *   values for it.
+ *
+ * An empty tuple `()` is refused outright: no Solidity type is one, and it
+ * decodes from no bytes at all, so nothing in the data could back it.
+ */
+export const MAX_INFLATION = 4;
+const BUDGET_FLOOR = 1024;
+
+type DecodeBudget = { remaining: number; values: number; readonly maxValues: number };
+
+/** How many tuples and arrays deep a type goes: 0 for a word, 1 for `uint256[]`. */
+function nesting(type: AbiType): number {
+  if (type.base === "array") return 1 + nesting(type.child as AbiType);
+  if (type.base === "tuple") {
+    return 1 + type.components.reduce((deepest, c) => Math.max(deepest, nesting(c)), 0);
+  }
+  return 0;
+}
+
+function budgetFor(data: Uint8Array, types: ReadonlyArray<AbiType>): DecodeBudget {
+  const words = Math.ceil(data.length / WORD);
+  const perWord = 1 + types.reduce((deepest, t) => Math.max(deepest, nesting(t)), 0);
+  const maxValues = Math.max(BUDGET_FLOOR, words * perWord);
+  return {
+    remaining: Math.max(BUDGET_FLOOR, words * MAX_INFLATION),
+    values: maxValues,
+    maxValues,
+  };
+}
+
+function charge(budget: DecodeBudget, units: number, what: string): void {
+  budget.remaining -= units;
+  if (budget.remaining < 0) {
+    throw new Error(
+      `${what}: the data decodes to more than ${MAX_INFLATION} times its own size — its offsets point at the same bytes again and again, which no ABI encoder writes. Refusing to inflate it.`,
+    );
+  }
+}
+
+/** One decoded value, counted against the decode's value budget. */
+function chargeValue(budget: DecodeBudget, what: string): void {
+  budget.values -= 1;
+  if (budget.values < 0) {
+    throw new Error(
+      `${what}: the data decodes to more than ${budget.maxValues} values, more than its size can hold for these types when each word is read once — its offsets point at the same bytes again and again, or the types multiply it. Refusing to inflate it.`,
+    );
+  }
+}
+
+function wordAt(data: Uint8Array, offset: number, what: string, budget: DecodeBudget): Uint8Array {
   if (offset + WORD > data.length) {
     throw new Error(
       `${what}: the data ends before offset ${offset}, so it is truncated or mistyped`,
     );
   }
+  charge(budget, 1, what);
   return data.subarray(offset, offset + WORD);
 }
 
-function bigIntFromWord(word: Uint8Array, signed: boolean, bits: number): bigint {
+/** A word read as an unsigned 256-bit integer: an offset, a length, or a value to check. */
+function uintFromWord(word: Uint8Array): bigint {
   let value = 0n;
   for (const byte of word) value = (value << 8n) | BigInt(byte);
-  if (!signed) return value;
-  const limit = 1n << BigInt(bits);
-  const half = limit >> 1n;
-  const truncated = value & (limit - 1n);
-  return truncated >= half ? truncated - limit : truncated;
+  return value;
 }
 
-function decodeValue(type: AbiType, data: Uint8Array, offset: number, what: string): Decoded {
+/** How many bytes one element of this type takes where its parent lays it out. */
+function headSize(type: AbiType): number {
+  return type.dynamic ? WORD : staticSize(type);
+}
+
+/**
+ * Decode `count` elements of one type laid out from `start` — an array's
+ * items. The data must be able to hold them BEFORE anything is decoded or
+ * allocated: a length is a claim the data makes about itself, and a fixed
+ * length is a claim the caller's type string makes.
+ */
+function decodeRepeated(
+  count: number,
+  child: AbiType,
+  data: Uint8Array,
+  start: number,
+  what: string,
+  budget: DecodeBudget,
+): Decoded[] {
+  const each = headSize(child);
+  // A zero-size element (an empty tuple) takes no bytes, so no length the
+  // data claims for it is backed by anything.
+  if (each === 0 && count > 0) {
+    throw new Error(`${what}: an array of ${child.canonical} holds nothing the data can back`);
+  }
+  const need = count * each;
+  if (!Number.isSafeInteger(need) || start + need > data.length) {
+    throw new Error(`${what}: claims ${count} items, more than the data could hold`);
+  }
+  return decodeSequence(count, () => child, data, start, what, budget);
+}
+
+function decodeValue(
+  type: AbiType,
+  data: Uint8Array,
+  offset: number,
+  what: string,
+  budget: DecodeBudget,
+): Decoded {
+  chargeValue(budget, what);
   if (type.base === "array") {
     const child = type.child as AbiType;
     if (type.arrayLength === -1) {
-      const length = Number(bigIntFromWord(wordAt(data, offset, what), false, 256));
-      if (length * WORD > data.length) {
-        throw new Error(`${what}: claims ${length} items, more than the data could hold`);
-      }
-      return decodeTuple(new Array<AbiType>(length).fill(child), data, offset + WORD, what);
+      const length = Number(uintFromWord(wordAt(data, offset, what, budget)));
+      return decodeRepeated(length, child, data, offset + WORD, what, budget);
     }
-    return decodeTuple(
-      new Array<AbiType>(type.arrayLength as number).fill(child),
+    return decodeRepeated(type.arrayLength as number, child, data, offset, what, budget);
+  }
+  if (type.base === "tuple") {
+    const components = type.components;
+    if (components.length === 0) {
+      throw new Error(
+        `${what}: () is an empty tuple — no Solidity type is one, and it decodes from no bytes, so nothing in the data can back it`,
+      );
+    }
+    return decodeSequence(
+      components.length,
+      (i) => components[i] as AbiType,
       data,
       offset,
       what,
+      budget,
     );
   }
-  if (type.base === "tuple") return decodeTuple(type.components, data, offset, what);
 
   if (type.base === "string" || type.base === "bytes") {
-    const length = Number(bigIntFromWord(wordAt(data, offset, what), false, 256));
+    const length = Number(uintFromWord(wordAt(data, offset, what, budget)));
     const start = offset + WORD;
     if (start + length > data.length) {
       throw new Error(`${what}: declares ${length} bytes, past the end of the data`);
     }
+    charge(budget, Math.ceil(length / WORD), what);
     const bytes = data.subarray(start, start + length);
     return type.base === "string" ? new TextDecoder().decode(bytes) : `0x${toHex(bytes)}`;
   }
 
-  const word = wordAt(data, offset, what);
-  if (type.base === "address") return `0x${toHex(word.subarray(12))}`;
+  return decodeStaticWord(type, wordAt(data, offset, what, budget), what);
+}
+
+/** True when every byte in the slice is zero. */
+function allZero(bytes: Uint8Array): boolean {
+  return bytes.every((b) => b === 0);
+}
+
+/**
+ * One static word, read as its type — and refused unless it is the ONE word
+ * an encoder writes for a value of that type.
+ *
+ * A 32-byte word holds more than an address, a uint8 or a bytes4 can, and the
+ * ABI says what the rest must be: zero padding, or a sign extension. Solidity's
+ * decoder reverts on a word that breaks that; reading it anyway returns a value
+ * the named type cannot hold — a uint8 of 2^256−1, an "address" read from the
+ * low bytes of a balance — which is what naming the wrong types looks like,
+ * and a plausible answer to a question nobody asked. So it is an error, as a
+ * bool word of 2 always was.
+ */
+function decodeStaticWord(type: AbiType, word: Uint8Array, what: string): Decoded {
+  const value = uintFromWord(word);
+  if (type.base === "address") {
+    if (!allZero(word.subarray(0, 12))) {
+      throw new Error(
+        `${what}: an address word has non-zero upper bytes (0x${toHex(word.subarray(0, 12))}), so it is not an address — the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return `0x${toHex(word.subarray(12))}`;
+  }
   if (type.base === "bool") {
-    const value = bigIntFromWord(word, false, 256);
     if (value > 1n)
       throw new Error(`${what}: a bool word holds ${value}, which is neither true nor false`);
     return value === 1n;
   }
-  if (type.base === "bytesN") return `0x${toHex(word.subarray(0, type.bits / 8))}`;
-  return bigIntFromWord(word, type.base === "int", type.bits).toString();
+  if (type.base === "bytesN") {
+    const size = type.bits / 8;
+    if (!allZero(word.subarray(size))) {
+      throw new Error(
+        `${what}: a bytes${size} word has non-zero padding after its ${size} bytes — the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return `0x${toHex(word.subarray(0, size))}`;
+  }
+  if (type.base === "int") {
+    const signed = BigInt.asIntN(type.bits, value);
+    // A canonical intN word is the sign extension of its low N bits: every
+    // bit above them equals the sign bit.
+    if (BigInt.asUintN(256, signed) !== value) {
+      throw new Error(
+        `${what}: the word is not a sign-extended int${type.bits} — its upper bits are neither all zero nor all one — so the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return signed.toString();
+  }
+  if (value >> BigInt(type.bits) !== 0n) {
+    throw new Error(
+      `${what}: a uint${type.bits} word holds ${value}, which does not fit in ${type.bits} bits — the data is mistyped or was not ABI-encoded`,
+    );
+  }
+  return value.toString();
+}
+
+/** Head/tail decoding of `count` values laid out from `base`: a tuple, or an array's items. */
+function decodeSequence(
+  count: number,
+  typeAt: (index: number) => AbiType,
+  data: Uint8Array,
+  base: number,
+  what: string,
+  budget: DecodeBudget,
+): Decoded[] {
+  const out: Decoded[] = [];
+  let head = base;
+  for (let i = 0; i < count; i++) {
+    const type = typeAt(i);
+    const label = `${what}[${i}]`;
+    if (type.dynamic) {
+      const offset = Number(uintFromWord(wordAt(data, head, label, budget)));
+      // An offset is relative to the start of the enclosing tuple. Treating
+      // it as absolute reads the wrong bytes and usually still "works".
+      out.push(decodeValue(type, data, base + offset, label, budget));
+      head += WORD;
+    } else {
+      out.push(decodeValue(type, data, head, label, budget));
+      head += staticSize(type);
+    }
+  }
+  return out;
 }
 
 export function decodeTuple(
@@ -463,22 +709,14 @@ export function decodeTuple(
   base = 0,
   what = "value",
 ): Decoded[] {
-  const out: Decoded[] = [];
-  let head = base;
-  for (const [i, type] of types.entries()) {
-    const label = `${what}[${i}]`;
-    if (type.dynamic) {
-      const offset = Number(bigIntFromWord(wordAt(data, head, label), false, 256));
-      // An offset is relative to the start of the enclosing tuple. Treating
-      // it as absolute reads the wrong bytes and usually still "works".
-      out.push(decodeValue(type, data, base + offset, label));
-      head += WORD;
-    } else {
-      out.push(decodeValue(type, data, head, label));
-      head += staticSize(type);
-    }
-  }
-  return out;
+  return decodeSequence(
+    types.length,
+    (i) => types[i] as AbiType,
+    data,
+    base,
+    what,
+    budgetFor(data, types),
+  );
 }
 
 /** How many bytes a static type occupies in a head. */

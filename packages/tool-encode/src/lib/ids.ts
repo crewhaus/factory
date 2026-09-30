@@ -222,8 +222,19 @@ export function nanoId(seed: string, size: number, alphabet: string): string {
  * any machine, forever. This is the right identifier for "one row per URL"
  * or "one id per (tenant, external key)".
  */
+/**
+ * The UUID a namespace argument names: one of UUID_NAMESPACES by name, or
+ * the argument itself. Own entries only: `constructor` read Object and
+ * crashed inside parseUuid instead of being refused as not a UUID.
+ */
+export function namespaceUuid(namespace: string): string {
+  return Object.hasOwn(UUID_NAMESPACES, namespace)
+    ? (UUID_NAMESPACES[namespace] as string)
+    : namespace;
+}
+
 export async function uuidNamed(version: 3 | 5, namespace: string, name: string): Promise<string> {
-  const namespaceBytes = parseUuid(UUID_NAMESPACES[namespace] ?? namespace);
+  const namespaceBytes = parseUuid(namespaceUuid(namespace));
   if (!namespaceBytes) {
     throw new Error(
       `namespace "${namespace}" is neither a UUID nor one of ${Object.keys(UUID_NAMESPACES).join(", ")}`,

@@ -34,6 +34,7 @@ import { BROKEN_FOR_SECURITY, digest, digestLength, hmac as hmacBytes } from "./
 import {
   NANOID_ALPHABET,
   UUID_NAMESPACES,
+  namespaceUuid,
   nanoId as nanoIdFrom,
   ulid as ulidFrom,
   uuidNamed,
@@ -580,7 +581,7 @@ export const uuid: RegisteredTool = buildTool({
       return json({
         version,
         deterministic: true,
-        namespace: UUID_NAMESPACES[input.namespace] ?? input.namespace,
+        namespace: namespaceUuid(input.namespace),
         uuids: ids,
         ...(version === "v3"
           ? { note: "v3 uses MD5; prefer v5 unless something else already uses v3" }

@@ -12,12 +12,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -28,6 +31,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { buildTar, buildZip } from "./archive-fixtures";
 import {
   FSX_TOOLS,
+  READ_LINES_DEFAULT_MAX_CHARS,
   ToolPermissionError,
   archiveCreate,
   archiveExtract,
@@ -53,6 +57,7 @@ import {
   tree,
 } from "./index";
 import { describeFailure, runProcess } from "./proc";
+import { GITIGNORE_MAX_BYTES } from "./walk";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -347,6 +352,34 @@ describe("Stat and FileHash", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("a hostile glob cannot hang a listing (C081)", () => {
+  // Each of these took about four seconds per entry when a pattern compiled
+  // to a backtracking RegExp, and a 255-character name took hours: a
+  // committed .gitignore line was enough to freeze Tree, which plan mode
+  // runs without asking.
+  const hostile = "*a*a*a*a*a*a*b";
+  const longName = "a".repeat(80);
+
+  test("Tree with a many-star .gitignore rule and a long name", async () => {
+    write(".gitignore", `${hostile}\n`);
+    write(longName, "x");
+    const started = performance.now();
+    const out = await run(tree, { path: "." });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(out).toContain(longName);
+  }, 20_000);
+
+  test("FindFiles with a many-star name pattern, and as an exclude", async () => {
+    write(longName, "x");
+    const started = performance.now();
+    const found = await run(findFiles, { name: hostile, respectGitignore: false });
+    const kept = await run(findFiles, { exclude: [hostile] });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(found.count).toBe(0);
+    expect(kept.matches.map((m: { path: string }) => m.path)).toEqual([longName]);
+  }, 20_000);
+});
+
 describe("Tree", () => {
   beforeEach(() => {
     write("src/b.ts", "b");
@@ -613,6 +646,249 @@ describe("ReadLines and TailFile", () => {
   });
 });
 
+describe("ReadLines keeps to a character budget (C164)", () => {
+  test("one 1,000,000-character line with maxLines 1 comes back cut, flagged, with its length", async () => {
+    write("big.min.js", "x".repeat(1_000_000));
+    const raw = await readLines.execute({ path: "big.min.js", maxLines: 1 });
+    const out = JSON.parse(String(raw));
+    expect(READ_LINES_DEFAULT_MAX_CHARS).toBe(262_144);
+    expect(out.lines[0].length).toBe(262_144);
+    expect(out.truncated).toBe(true);
+    expect(out.truncatedLines).toEqual([{ line: 1, chars: 1_000_000 }]);
+    expect(out.maxChars).toBe(262_144);
+    expect(out.end).toBe(1);
+    // The answer is the budget plus a little JSON, not the file.
+    expect(String(raw).length).toBeLessThan(262_144 + 1024);
+  });
+
+  test("many long lines stop at the budget, and say where to resume", async () => {
+    write("wide.txt", Array.from({ length: 20 }, () => "y".repeat(100_000)).join("\n"));
+    const out = await run(readLines, { path: "wide.txt", maxLines: 20 });
+    const total = out.lines.reduce((n: number, l: string) => n + l.length, 0);
+    expect(total).toBe(262_144);
+    expect(out.returned).toBe(3);
+    expect(out.end).toBe(out.start + out.returned - 1);
+    expect(out.truncated).toBe(true);
+    expect(out.stoppedAtBudget).toBe(true);
+    expect(out.truncatedLines).toEqual([{ line: 3, chars: 100_000 }]);
+    expect(out.endOfFile).toBe(false);
+  });
+
+  test("a line that fills the budget exactly is whole, and the range stops after it", async () => {
+    write("exact.txt", `${"z".repeat(1024)}\nnext\n`);
+    const out = await run(readLines, { path: "exact.txt", maxChars: 1024 });
+    expect(out.lines).toEqual(["z".repeat(1024)]);
+    expect(out.truncatedLines).toBeUndefined();
+    expect(out).toMatchObject({ truncated: true, stoppedAtBudget: true, end: 1 });
+  });
+
+  test("a budget used up exactly by the file's last line is a complete answer, not a cut one", async () => {
+    write("last.txt", `${"z".repeat(1024)}\n`);
+    const out = await run(readLines, { path: "last.txt", maxChars: 1024 });
+    expect(out).toEqual({
+      path: "last.txt",
+      start: 1,
+      end: 1,
+      requestedEnd: 500,
+      lines: ["z".repeat(1024)],
+      returned: 1,
+      endOfFile: true,
+    });
+  });
+
+  test("an overlong line before start is skipped without breaking the numbering", async () => {
+    write("skip.txt", `head\n${"q".repeat(1_000_000)}\nok\n`);
+    const out = await run(readLines, { path: "skip.txt", start: 3, maxLines: 1 });
+    expect(out.lines).toEqual(["ok"]);
+    expect(out.start).toBe(3);
+    expect(out.truncated).toBeUndefined();
+    const second = await run(readLines, { path: "skip.txt", start: 2, maxLines: 1 });
+    expect(second.lines[0].length).toBe(262_144);
+    expect(second.truncatedLines).toEqual([{ line: 2, chars: 1_000_000 }]);
+  });
+
+  test("a cut never splits a surrogate pair", async () => {
+    write("emoji.txt", `${"a".repeat(1023)}🎉tail\n`);
+    const out = await run(readLines, { path: "emoji.txt", maxChars: 1024 });
+    expect(out.lines[0]).toBe("a".repeat(1023));
+    expect(out.truncatedLines).toEqual([{ line: 1, chars: 1023 + 2 + 4 }]);
+    expect(out.lines[0].isWellFormed()).toBe(true);
+  });
+
+  test("an answer inside the budget is exactly what 0.7.0 returned", async () => {
+    write("small.txt", "\uFEFFone\ntwo\r\nthree");
+    expect(await run(readLines, { path: "small.txt" })).toEqual({
+      path: "small.txt",
+      start: 1,
+      end: 3,
+      requestedEnd: 500,
+      lines: ["one", "two\r", "three"],
+      returned: 3,
+      endOfFile: true,
+    });
+    // A U+FEFF that starts a later line is text, not a byte-order mark.
+    write("mid.txt", "one\n\uFEFFtwo\n");
+    expect((await run(readLines, { path: "mid.txt", start: 2 })).lines).toEqual(["\uFEFFtwo"]);
+  });
+
+  test("a sparse file with no newline is cut, and its length is a lower bound past the measuring window", async () => {
+    write("sparse.bin", "");
+    truncateSync(path.join(tmp, "sparse.bin"), 80 * 1024 * 1024);
+    const out = await run(readLines, { path: "sparse.bin", maxLines: 1, maxChars: 1024 });
+    expect(out.lines[0].length).toBe(1024);
+    expect(out.truncatedLines).toHaveLength(1);
+    expect(out.truncatedLines[0].line).toBe(1);
+    expect(out.truncatedLines[0].chars).toBeUndefined();
+    expect(out.truncatedLines[0].charsAtLeast).toBeGreaterThanOrEqual(64 * 1024 * 1024);
+    expect(out.endOfFile).toBe(false);
+  }, 20_000);
+});
+
+describe("the listing tools read .gitignore only as a contained regular file (C074)", () => {
+  test.if(process.platform !== "win32")(
+    "a .gitignore that is a FIFO contributes no rules, and the walk returns",
+    async () => {
+      write("dir/keep.txt", "k");
+      const fifo = path.join(tmp, "dir", ".gitignore");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      // Blocked in open() until someone opens the FIFO to read; if the walk
+      // wrongly did, this writer would unblock it (a regression fails here
+      // rather than hanging) and would then exit.
+      const writer = Bun.spawn(["sh", "-c", `printf 'keep.txt\n' > '${fifo}'`], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      try {
+        await Bun.sleep(100);
+        const out = await run(findFiles, { path: "dir", name: "*.txt" });
+        expect(out.matches.map((m: { path: string }) => m.path)).toEqual(["keep.txt"]);
+        await Bun.sleep(200);
+        expect(writer.exitCode).toBeNull();
+      } finally {
+        writer.kill("SIGKILL");
+        await writer.exited;
+      }
+    },
+    10_000,
+  );
+
+  test("a .gitignore up to the cap is honoured; one byte over contributes no rules", async () => {
+    // 0.7.1 caps what one .gitignore may cost (0.7.0 read any size, a
+    // multi-gigabyte one included). The rule sits at the END, after a
+    // padding comment, so it is only seen when the whole file is.
+    expect(GITIGNORE_MAX_BYTES).toBe(1024 * 1024);
+    write("dir/secret.txt", "s");
+    write("dir/keep.txt", "k");
+    const rule = "secret.txt\n";
+    const sized = (bytes: number): string => `#${"x".repeat(bytes - rule.length - 2)}\n${rule}`;
+    const ignore = path.join(tmp, "dir", ".gitignore");
+    writeFileSync(ignore, sized(GITIGNORE_MAX_BYTES));
+    expect(statSync(ignore).size).toBe(GITIGNORE_MAX_BYTES);
+    const atCap = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(atCap.matches.map((m: { path: string }) => m.path)).toEqual(["keep.txt"]);
+    writeFileSync(ignore, sized(GITIGNORE_MAX_BYTES + 1));
+    expect(statSync(ignore).size).toBe(GITIGNORE_MAX_BYTES + 1);
+    const over = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(over.matches.map((m: { path: string }) => m.path)).toEqual(["keep.txt", "secret.txt"]);
+  });
+
+  test("a .gitignore linked out of the workspace is not read", async () => {
+    const out = outside();
+    writeFileSync(path.join(out, "rules"), "secret.txt\n");
+    write("dir/secret.txt", "s");
+    symlinkSync(path.join(out, "rules"), path.join(tmp, "dir", ".gitignore"));
+    const found = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(found.matches.map((m: { path: string }) => m.path)).toEqual(["secret.txt"]);
+    // One linked inside the workspace is still honoured, as before.
+    write("rules.txt", "secret.txt\n");
+    rmSync(path.join(tmp, "dir", ".gitignore"));
+    symlinkSync(path.join(tmp, "rules.txt"), path.join(tmp, "dir", ".gitignore"));
+    const hidden = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(hidden.matches).toEqual([]);
+  });
+});
+
+describe("FrontmatterWrite and NotebookEdit keep the file's mode (C213)", () => {
+  const posixOnly = process.platform !== "win32";
+
+  test.if(posixOnly)("a 0644 document stays 0644", async () => {
+    write("doc.md", "---\ntitle: t\n---\nbody\n");
+    chmodSync(path.join(tmp, "doc.md"), 0o644);
+    expect(await run(frontmatterWrite, { path: "doc.md", data: { status: "done" } })).toMatchObject(
+      {
+        written: true,
+      },
+    );
+    expect(statSync(path.join(tmp, "doc.md")).mode & 0o777).toBe(0o644);
+  });
+
+  test.if(posixOnly)("a 0755 notebook stays 0755", async () => {
+    write(
+      "nb.ipynb",
+      JSON.stringify({
+        cells: [{ cell_type: "code", source: "1", metadata: {} }],
+        metadata: {},
+        nbformat: 4,
+        nbformat_minor: 5,
+      }),
+    );
+    chmodSync(path.join(tmp, "nb.ipynb"), 0o755);
+    expect(
+      await run(notebookEdit, { path: "nb.ipynb", mode: "replace", index: 0, source: "2" }),
+    ).toMatchObject({ written: true });
+    expect(statSync(path.join(tmp, "nb.ipynb")).mode & 0o777).toBe(0o755);
+  });
+
+  test.if(posixOnly)("a new document gets 0666 minus the umask, and parents are made", async () => {
+    expect(
+      await run(frontmatterWrite, { path: "new/dir/doc.md", data: { title: "x" } }),
+    ).toMatchObject({ written: true });
+    const umask = process.umask();
+    expect(statSync(path.join(tmp, "new/dir/doc.md")).mode & 0o777).toBe(0o666 & ~umask);
+    expect(readdirSync(path.join(tmp, "new/dir"))).toEqual(["doc.md"]);
+  });
+});
+
+describe("a __proto__ front matter key round-trips (C199)", () => {
+  test("FrontmatterWrite keeps a __proto__ line it was not asked to touch", async () => {
+    write("doc.md", "---\n__proto__: keepme\ntitle: t\n---\nbody\n");
+    expect(await run(frontmatterWrite, { path: "doc.md", data: { status: "done" } })).toMatchObject(
+      {
+        written: true,
+      },
+    );
+    expect(readFileSync(path.join(tmp, "doc.md"), "utf8")).toBe(
+      "---\n__proto__: keepme\ntitle: t\nstatus: done\n---\nbody\n",
+    );
+  });
+
+  test("FrontmatterRead reports it", async () => {
+    write("doc.md", "---\n__proto__: keepme\ntitle: t\n---\nbody\n");
+    const out = await run(frontmatterRead, { path: "doc.md" });
+    expect(out.keys).toEqual(["__proto__", "title"]);
+    expect(Object.getOwnPropertyDescriptor(out.data, "__proto__")?.value).toBe("keepme");
+  });
+
+  test("removeKeys can delete it", async () => {
+    write("doc.md", "---\n__proto__: keepme\ntitle: t\n---\nbody\n");
+    await run(frontmatterWrite, { path: "doc.md", data: {}, removeKeys: ["__proto__"] });
+    expect(readFileSync(path.join(tmp, "doc.md"), "utf8")).toBe("---\ntitle: t\n---\nbody\n");
+  });
+
+  test("setting it, or a key the subset cannot read back, is refused, not silently dropped", () => {
+    const schema = frontmatterWrite.inputSchema;
+    const proto = schema.safeParse(JSON.parse('{"path":"doc.md","data":{"__proto__":"x"}}'));
+    expect(proto.success).toBe(false);
+    if (!proto.success)
+      expect(proto.error.message).toContain('the key \\"__proto__\\" cannot be set');
+    expect(schema.safeParse({ path: "doc.md", data: { "my key": 1 } }).success).toBe(false);
+    expect(schema.safeParse({ path: "doc.md", data: { "a:b": 1 } }).success).toBe(false);
+    expect(schema.safeParse({ path: "doc.md", data: { ok_key: 1, "v1.2-x": 2 } }).success).toBe(
+      true,
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 
 describe("MakeDirectory, TouchFile and TempDir", () => {
@@ -870,6 +1146,51 @@ describe("SplitFile and ConcatFiles", () => {
     expect(await run(concatFiles, { paths: ["a.txt"], destination: "a.txt" })).toContain(
       "also one of the sources",
     );
+  });
+
+  test("SplitFile never writes through a symlink at a part name, even with overwrite", async () => {
+    write("data.log", "l1\nl2\nl3\n");
+    const o = outside();
+    writeFileSync(path.join(o, "victim.txt"), "victim-original");
+    symlinkSync(path.join(o, "victim.txt"), path.join(tmp, "data.log.part0001"));
+    // Dangling: on 0.7.0 `open(…, "w")` through it CREATED the outside file.
+    symlinkSync(path.join(o, "created.txt"), path.join(tmp, "data.log.part0002"));
+    for (const overwrite of [false, true]) {
+      const refused = await run(splitFile, { path: "data.log", maxLines: 1, overwrite });
+      // Named as a link, not listed as a conflict that `overwrite` would fix.
+      expect(refused).toContain("data.log.part0001 is a symlink, not a regular file");
+      expect(readFileSync(path.join(o, "victim.txt"), "utf8")).toBe("victim-original");
+      expect(existsSync(path.join(o, "created.txt"))).toBe(false);
+    }
+    // Nothing else was written either: the refusal comes before the first part.
+    expect(existsSync(path.join(tmp, "data.log.part0003"))).toBe(false);
+  });
+
+  test("SplitFile with overwrite replaces an ordinary part's bytes", async () => {
+    write("data.log", "l1\nl2\n");
+    write("data.log.part0001", "stale contents\n");
+    const done = await run(splitFile, { path: "data.log", maxLines: 1, overwrite: true });
+    expect(done.split).toBe(true);
+    expect(readFileSync(path.join(tmp, "data.log.part0001"), "utf8")).toBe("l1\n");
+    expect(readFileSync(path.join(tmp, "data.log.part0002"), "utf8")).toBe("l2\n");
+    // No temp is left beside the parts.
+    expect(readdirSync(tmp).sort()).toEqual(["data.log", "data.log.part0001", "data.log.part0002"]);
+  });
+
+  test("ConcatFiles replaces an existing destination through a temp, keeping its mode", async () => {
+    write("a.txt", "A");
+    write("b.txt", "B");
+    const dest = write("joined.sh", "old");
+    chmodSync(dest, 0o750);
+    const done = await run(concatFiles, {
+      paths: ["a.txt", "b.txt"],
+      destination: "joined.sh",
+      overwrite: true,
+    });
+    expect(done.concatenated).toBe(true);
+    expect(readFileSync(dest, "utf8")).toBe("AB");
+    expect(lstatSync(dest).mode & 0o777).toBe(0o750);
+    expect(readdirSync(tmp).sort()).toEqual(["a.txt", "b.txt", "joined.sh"]);
   });
 });
 

@@ -19,7 +19,12 @@
 import { type Dirent, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import {
+  describeRegexOutcome,
+  openRegexSession,
+  screenUserRegex,
+} from "@crewhaus/tool-safety/regex";
 import { parseUnifiedDiff } from "@crewhaus/tool-text";
 import { z } from "zod";
 import { MAX_DIFF_CHARS, MAX_TIMEOUT_MS, collectDiff } from "./git";
@@ -31,7 +36,13 @@ import {
   checkRefs,
   extractDocRefs,
 } from "./lib/docs";
-import { RULE_IDS, type RuleId, lintParsedDiff } from "./lib/rules";
+import {
+  type PatternAnswer,
+  RULE_IDS,
+  type RuleId,
+  callerPatternSubjects,
+  lintParsedDiff,
+} from "./lib/rules";
 import { ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 /** Compact JSON — the reader is a model, not a person, so no indentation. */
@@ -65,10 +76,138 @@ const SKIP_DIRS: ReadonlySet<string> = new Set([
 // ---------------------------------------------------------------------------
 // DiffLint
 
+/** A zod refine that refuses a caller regex the screen refuses, with its reason. */
+function refusePattern(pattern: string, ctx: z.RefinementCtx): void {
+  const verdict = screenUserRegex(pattern);
+  if (!verdict.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: verdict.reason });
+}
+
+/** Total subject text the caller's patterns may run over in one call. */
+const MAX_PATTERN_SUBJECT_CHARS = MAX_DIFF_CHARS * 2;
+
+/**
+ * Run the caller's ticket and machine-path patterns over every subject the
+ * lint will ask about, in @crewhaus/tool-safety's regex worker under a
+ * deadline (C073), and hand back synchronous lookups. A subject the worker
+ * could not answer — the engine gave up on it, or the deadline passed — is
+ * undefined, which the lint reports as undetermined, never as "no ticket"
+ * or "no machine path".
+ */
+async function answerCallerPatterns(
+  parsed: ReturnType<typeof parseUnifiedDiff>,
+  ruleEdits: { enable?: ReadonlyArray<RuleId>; disable?: ReadonlyArray<RuleId> },
+  ticketPattern: string | undefined,
+  machinePatterns: ReadonlyArray<string>,
+  ctx: ToolExecuteContext | undefined,
+): Promise<{
+  ticketTest?: { source: string; test: PatternAnswer };
+  machinePathTests: Array<{ source: string; test: PatternAnswer }>;
+  warnings: string[];
+}> {
+  const warnings: string[] = [];
+  if (ticketPattern === undefined && machinePatterns.length === 0) {
+    return { machinePathTests: [], warnings };
+  }
+  const { todoBodies, lines } = callerPatternSubjects(parsed, ruleEdits);
+  const common = {
+    onGiveUp: "skip" as const,
+    deadlineMs: 5_000,
+    maxInputChars: MAX_PATTERN_SUBJECT_CHARS,
+    ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+    ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+  };
+  /** Answers for `subjects` from the matched and undetermined index lists. */
+  const lookup = (
+    subjects: ReadonlyArray<string>,
+    matched: ReadonlyArray<number> | undefined,
+    undetermined: ReadonlyArray<number> | undefined,
+  ): PatternAnswer => {
+    if (matched === undefined) return () => undefined;
+    const answers = new Map<string, boolean | undefined>();
+    const hit = new Set(matched);
+    const unknown = new Set(undetermined ?? []);
+    // `subjects` is deduplicated, so each one has exactly one answer.
+    for (const [i, subject] of subjects.entries()) {
+      answers.set(subject, unknown.has(i) ? undefined : hit.has(i));
+    }
+    return (subject) => answers.get(subject);
+  };
+
+  const session = openRegexSession();
+  try {
+    let ticketTest: { source: string; test: PatternAnswer } | undefined;
+    if (ticketPattern !== undefined) {
+      const subjects = [...new Set(todoBodies)];
+      const outcome =
+        subjects.length === 0
+          ? undefined
+          : await session.run({
+              op: "testEach",
+              pattern: ticketPattern,
+              inputs: subjects,
+              maxMatches: subjects.length,
+              ...common,
+            });
+      if (outcome !== undefined && outcome.status !== "ok") {
+        warnings.push(`ticketPattern /${ticketPattern}/: ${describeRegexOutcome(outcome)}`);
+      }
+      ticketTest = {
+        source: ticketPattern,
+        test:
+          outcome === undefined
+            ? () => undefined
+            : outcome.status === "ok" && !outcome.result.truncated
+              ? lookup(subjects, outcome.result.matched, outcome.result.undetermined)
+              : () => undefined,
+      };
+    }
+    const machinePathTests: Array<{ source: string; test: PatternAnswer }> = [];
+    if (machinePatterns.length > 0) {
+      const subjects = [...new Set(lines)];
+      const outcome =
+        subjects.length === 0
+          ? undefined
+          : await session.run({
+              op: "testMatrix",
+              patterns: machinePatterns.map((pattern) => ({ pattern })),
+              inputs: subjects,
+              ...common,
+            });
+      if (outcome !== undefined && outcome.status !== "ok") {
+        warnings.push(`machinePathPatterns: ${describeRegexOutcome(outcome)}`);
+      }
+      for (const [i, source] of machinePatterns.entries()) {
+        machinePathTests.push({
+          source,
+          test:
+            outcome === undefined
+              ? () => undefined
+              : outcome.status === "ok"
+                ? lookup(subjects, outcome.result.matched[i], outcome.result.undetermined[i])
+                : () => undefined,
+        });
+      }
+    }
+    return { ...(ticketTest !== undefined ? { ticketTest } : {}), machinePathTests, warnings };
+  } finally {
+    session.close();
+  }
+}
+
 const ruleIdField = z.enum(RULE_IDS);
 
 export const diffLint: RegisteredTool = buildTool({
   name: "DiffLint",
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Run a policy pass over ONLY the added lines of a change set: focused tests, debugger statements, console.log, committed merge-conflict markers, new @ts-ignore, TODOs with no ticket, machine-specific absolute paths, CRLF, and files that added more than they should. Use it before committing or opening a pull request, in place of reading a diff and hoping to notice. Every finding carries the line number in the NEW file, so it can be fixed without re-reading anything. Give it `diff` text if you already have the patch; otherwise it runs `git diff` for you. The commented-out-code rule is a heuristic and is off unless you enable it.",
   inputSchema: z.object({
@@ -81,17 +220,24 @@ export const diffLint: RegisteredTool = buildTool({
     ref: z.string().min(1).optional().describe("diff against this single ref"),
     range: z.string().min(1).optional().describe("a commit range such as 'main...HEAD'"),
     staged: z.boolean().optional().describe("diff the index against HEAD instead of the worktree"),
-    paths: z.array(z.string().min(1)).max(256).optional().describe("limit to these paths"),
+    paths: z
+      .array(z.string().min(1))
+      .max(256)
+      .optional()
+      .describe(
+        "limit to these paths: files, or directories with everything under them; literal, never wildcards",
+      ),
     timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
     enable: z.array(ruleIdField).max(RULE_IDS.length).optional().describe("turn opt-in rules on"),
     disable: z.array(ruleIdField).max(RULE_IDS.length).optional(),
     ticketPattern: z
       .string()
       .max(400)
+      .superRefine(refusePattern)
       .optional()
       .describe("regex a TODO must match to count as ticketed; default 'ABC-123', '#123' or a URL"),
     machinePathPatterns: z
-      .array(z.string().max(400))
+      .array(z.string().max(400).superRefine(refusePattern))
       .max(32)
       .optional()
       .describe("extra machine-specific path shapes, as regex sources"),
@@ -117,29 +263,27 @@ export const diffLint: RegisteredTool = buildTool({
       return "DiffLint takes either `diff` text or a git selector (cwd/ref/range/staged/paths), not both — with the text in hand there is nothing for git to do.";
     }
 
-    // Compiling the caller's patterns before anything else: a bad regex is a
+    // Screening the caller's patterns before anything else: a bad regex is a
     // caller mistake, and it should be reported as one rather than as an
-    // empty result that looks like a clean change set.
-    let ticket: RegExp | undefined;
+    // empty result that looks like a clean change set. The screen also
+    // refuses the shapes that backtrack catastrophically (C073).
     if (input.ticketPattern !== undefined) {
-      try {
-        ticket = new RegExp(input.ticketPattern);
-      } catch (err) {
-        return `DiffLint could not use ticketPattern /${input.ticketPattern}/: ${(err as Error).message}`;
+      const verdict = screenUserRegex(input.ticketPattern);
+      if (!verdict.ok) {
+        return `DiffLint could not use ticketPattern /${input.ticketPattern}/: ${verdict.reason}`;
       }
     }
-    const machinePatterns: RegExp[] = [];
     for (const source of input.machinePathPatterns ?? []) {
-      try {
-        machinePatterns.push(new RegExp(source));
-      } catch (err) {
-        return `DiffLint could not use the machine-path pattern /${source}/: ${(err as Error).message}`;
+      const verdict = screenUserRegex(source);
+      if (!verdict.ok) {
+        return `DiffLint could not use the machine-path pattern /${source}/: ${verdict.reason}`;
       }
     }
 
     let diffText: string;
     let source: string;
     let spawnTruncated = false;
+    let repoConfigNote: string | undefined;
     if (input.diff !== undefined) {
       diffText = input.diff;
       source = "caller-supplied diff";
@@ -160,6 +304,7 @@ export const diffLint: RegisteredTool = buildTool({
       diffText = collected.value.diff;
       source = collected.value.command;
       spawnTruncated = collected.value.truncated;
+      repoConfigNote = collected.value.repoConfigNote;
     }
 
     if (diffText.length > MAX_DIFF_CHARS) {
@@ -167,11 +312,23 @@ export const diffLint: RegisteredTool = buildTool({
     }
 
     const parsed = parseUnifiedDiff(diffText);
-    const result = lintParsedDiff(parsed, {
+    const ruleEdits = {
       ...(input.enable !== undefined ? { enable: input.enable as ReadonlyArray<RuleId> } : {}),
       ...(input.disable !== undefined ? { disable: input.disable as ReadonlyArray<RuleId> } : {}),
-      ...(ticket !== undefined ? { ticketPattern: ticket } : {}),
-      ...(machinePatterns.length > 0 ? { machinePathPatterns: machinePatterns } : {}),
+    };
+    const answered = await answerCallerPatterns(
+      parsed,
+      ruleEdits,
+      input.ticketPattern,
+      input.machinePathPatterns ?? [],
+      ctx,
+    );
+    const result = lintParsedDiff(parsed, {
+      ...ruleEdits,
+      ...(answered.ticketTest !== undefined ? { ticketTest: answered.ticketTest } : {}),
+      ...(answered.machinePathTests.length > 0
+        ? { machinePathTests: answered.machinePathTests }
+        : {}),
       ...(input.maxLineChars !== undefined ? { maxLineChars: input.maxLineChars } : {}),
       ...(input.maxAddedLinesPerFile !== undefined
         ? { maxAddedLinesPerFile: input.maxAddedLinesPerFile }
@@ -182,7 +339,12 @@ export const diffLint: RegisteredTool = buildTool({
     // A patch that could not be parsed whole is reported as such rather than
     // as a clean bill of health: the parser's warnings are the only thing
     // standing between "no findings" and "no findings in the part I read".
-    const warnings = [...parsed.warnings];
+    const warnings = [...parsed.warnings, ...answered.warnings];
+    if (result.undeterminedCount > 0) {
+      warnings.push(
+        `${result.undeterminedCount} added line(s) could not be checked against your ticketPattern or machinePathPatterns (listed in \`undetermined\`); they are neither findings nor clean`,
+      );
+    }
     if (spawnTruncated) {
       warnings.push(
         `git's output hit the ${MAX_DIFF_CHARS}-character cap and the tail of the change set was not linted — narrow it with \`paths\``,
@@ -197,7 +359,11 @@ export const diffLint: RegisteredTool = buildTool({
       counts: result.counts,
       ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
       ...(result.truncated ? { findingsTruncated: true } : {}),
+      ...(result.undeterminedCount > 0
+        ? { undetermined: result.undetermined, undeterminedCount: result.undeterminedCount }
+        : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
+      ...(repoConfigNote !== undefined ? { repoConfigNote } : {}),
       ...(result.findings.length === 0 && warnings.length === 0 ? { clean: true } : {}),
     });
   },

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import type { RegisteredTool, ToolDefinition, ToolIoCapability } from "@crewhaus/tool-catalog";
+import type {
+  OperativeArg,
+  RegisteredTool,
+  ToolDefinition,
+  ToolIoCapability,
+} from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { OUTWARD_TOOL_NAMES, auditToolScopes, buildTool, isOutwardName } from "./index";
 
@@ -13,7 +18,7 @@ const echoDef: ToolDefinition<EchoInput> = {
   execute: async (input) => input.message,
 };
 
-describe("buildTool — fail-closed defaults", () => {
+describe("buildTool — defaults for unset flags", () => {
   test("concurrencySafe defaults to false", () => {
     const tool = buildTool(echoDef);
     expect(tool.concurrencySafe).toBe(false);
@@ -53,7 +58,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.destructive).toBe(false);
   });
 
-  test("requiresSandbox defaults to false (fail-closed)", () => {
+  test("requiresSandbox defaults to false (the sandbox floor is opt-in)", () => {
     const tool = buildTool(echoDef);
     expect(tool.requiresSandbox).toBe(false);
   });
@@ -73,7 +78,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.classifyOutput).toBe(false);
   });
 
-  test("scope defaults to 'internal' (Pillar 3 sink-side, fail-closed)", () => {
+  test("scope defaults to 'internal' (Pillar 3 sink-side: not scanned)", () => {
     const tool = buildTool(echoDef);
     expect(tool.scope).toBe("internal");
   });
@@ -83,7 +88,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.scope).toBe("external");
   });
 
-  test("requireJustification defaults to false (Pillar 3 intent gate, fail-closed)", () => {
+  test("requireJustification defaults to false (Pillar 3 intent gate is opt-in)", () => {
     const tool = buildTool(echoDef);
     expect(tool.requireJustification).toBe(false);
   });
@@ -116,7 +121,7 @@ describe("buildTool — fail-closed defaults", () => {
     // ioCapability is the *fact*; scope is the *policy*. buildTool does not
     // infer scope from ioCapability — the compile-time audit is what couples
     // them. A custom io-capable tool that forgets scope still defaults to
-    // "internal" here (fail-closed), which is exactly what --strict then flags.
+    // "internal" here (unscanned), which is exactly what --strict then flags.
     const tool = buildTool({ ...echoDef, name: "CustomSocket", ioCapability: "network" });
     expect(tool.scope).toBe("internal");
   });
@@ -216,7 +221,7 @@ describe("auditToolScopes — FR-002 pure scope gate", () => {
   // auditToolScopes reads `.name`, `.scope`, and `.ioCapability` only; minimal
   // doubles let us express the exact triples under audit — including the
   // dangerous "outward name / io-capable but forced internal" cases that the
-  // fail-closed buildTool default plus an explicit scope override can produce.
+  // "internal" buildTool default plus an explicit scope override can produce.
   function mkTool(
     name: string,
     scope: "internal" | "external",
@@ -294,5 +299,327 @@ describe("buildTool — execute delegation", () => {
     };
     const tool = buildTool(failDef);
     expect(tool.execute({ message: "x" })).rejects.toThrow("boom");
+  });
+});
+
+describe("buildTool — operativeArgs (0.7.1)", () => {
+  const exec = async () => "ok";
+  const nested = z.object({
+    path: z.string().optional(),
+    content: z.string(),
+    argv: z.array(z.string()),
+    target: z.object({ url: z.string() }).strict(),
+    requests: z.array(z.object({ url: z.string(), method: z.enum(["GET", "POST"]) })),
+    issue: z.number().int(),
+    mode: z.union([z.literal("fast"), z.literal("slow")]),
+    refined: z.string().refine((s) => s.length > 0),
+  });
+
+  test("passes a valid declaration through, frozen", () => {
+    const tool = buildTool({
+      name: "Nested",
+      description: "d",
+      inputSchema: nested,
+      execute: exec,
+      operativeArgs: [
+        { field: "path", kind: "path", default: "." },
+        { field: "argv", kind: "command" },
+        { field: "target.url", kind: "url" },
+        { field: "requests.url", kind: "url" },
+        { field: "issue", kind: "id" },
+        { field: "mode", kind: "text" },
+        { field: "refined", kind: "text" },
+      ],
+    });
+    expect(tool.operativeArgs?.map((a) => a.field)).toEqual([
+      "path",
+      "argv",
+      "target.url",
+      "requests.url",
+      "issue",
+      "mode",
+      "refined",
+    ]);
+    expect(tool.operativeArgs?.[0]).toEqual({ field: "path", kind: "path", default: "." });
+    expect(Object.isFrozen(tool.operativeArgs)).toBe(true);
+  });
+
+  test("omitted on the definition ⇒ omitted on the tool", () => {
+    expect("operativeArgs" in buildTool(echoDef)).toBe(false);
+  });
+
+  test("relocates is carried on a path with a default, and refused anywhere else (C004)", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Nested",
+        description: "d",
+        inputSchema: nested,
+        execute: exec,
+        operativeArgs: [arg as unknown as OperativeArg],
+      });
+    const tool = build({
+      field: "path",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    })();
+    expect(tool.operativeArgs?.[0]).toEqual({
+      field: "path",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    });
+    // A url that only moves the tool off its fixed service relocates too.
+    expect(
+      build({
+        field: "target.url",
+        kind: "url",
+        default: "https://api.osv.dev",
+        relocates: true,
+      })().operativeArgs?.[0]?.relocates,
+    ).toBe(true);
+    // A relocating field without a default would leave a deny nothing to read.
+    expect(build({ field: "path", kind: "path", relocates: true })).toThrow(
+      /relocates needs a default/,
+    );
+    expect(build({ field: "mode", kind: "text", default: "fast", relocates: true })).toThrow(
+      /only a "path" or "url" field can relocate/,
+    );
+    expect(build({ field: "path", kind: "path", default: ".", relocates: "yes" })).toThrow(
+      /relocates is either true or left out/,
+    );
+  });
+
+  test("shell is carried on a command, and refused anywhere else", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Sh",
+        description: "d",
+        inputSchema: z.object({ command: z.string(), path: z.string() }),
+        execute: exec,
+        operativeArgs: [arg as unknown as OperativeArg],
+      });
+    expect(build({ field: "command", kind: "command", shell: true })().operativeArgs).toEqual([
+      { field: "command", kind: "command", shell: true },
+    ]);
+    expect(build({ field: "path", kind: "path", shell: true })).toThrow(
+      /only a "command" is a line a shell parses/,
+    );
+    expect(build({ field: "command", kind: "command", shell: "sh" })).toThrow(
+      /shell is either true or left out/,
+    );
+  });
+
+  test("a field the schema does not have throws at build time, naming what is there", () => {
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "file_path", kind: "path" }] }),
+    ).toThrow(
+      /tool "Echo": operativeArgs \[0\]: the input schema has no field "file_path" \(it has: message\)/,
+    );
+  });
+
+  test("an unknown nested field throws too", () => {
+    expect(() =>
+      buildTool({
+        name: "Nested",
+        description: "d",
+        inputSchema: nested,
+        execute: exec,
+        operativeArgs: [{ field: "target.host", kind: "url" }],
+      }),
+    ).toThrow(/has no field "target.host"/);
+  });
+
+  test("descending into a string throws", () => {
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "message.inner", kind: "text" }] }),
+    ).toThrow(/"message" is not an object/);
+  });
+
+  test("a non-string field is refused unless the kind is id", () => {
+    const def = {
+      name: "Nested",
+      description: "d",
+      inputSchema: nested,
+      execute: exec,
+    };
+    expect(() => buildTool({ ...def, operativeArgs: [{ field: "issue", kind: "text" }] })).toThrow(
+      /"issue" is a number; only kind "id"/,
+    );
+    expect(() =>
+      buildTool({
+        name: "Obj",
+        description: "d",
+        inputSchema: z.object({ target: z.object({ url: z.string() }) }),
+        execute: exec,
+        operativeArgs: [{ field: "target", kind: "url" }],
+      }),
+    ).toThrow(/is a object, not a string/);
+  });
+
+  test("an unknown kind, an empty segment and a duplicate field are refused", () => {
+    expect(() =>
+      buildTool({
+        ...echoDef,
+        operativeArgs: [{ field: "message", kind: "glob" as unknown as "text" }],
+      }),
+    ).toThrow(/kind "glob" is not one of path, url, command, recipient, text, id/);
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "message.", kind: "text" }] }),
+    ).toThrow(/empty segment/);
+    expect(() =>
+      buildTool({
+        ...echoDef,
+        operativeArgs: [
+          { field: "message", kind: "text" },
+          { field: "message", kind: "text" },
+        ],
+      }),
+    ).toThrow(/names "message" twice/);
+  });
+
+  test("an empty declaration is kept: the tool says no argument scopes it", () => {
+    const tool = buildTool({ ...echoDef, operativeArgs: [] });
+    expect(tool.operativeArgs).toEqual([]);
+  });
+
+  describe("within — one field qualified by another", () => {
+    const repoSchema = z.object({
+      owner: z.string(),
+      repo: z.string(),
+      chainId: z.number().int(),
+      tags: z.array(z.string()),
+      path: z.string(),
+      nested: z.object({ org: z.string() }),
+    });
+    const def = { name: "Repo", description: "d", inputSchema: repoSchema, execute: exec };
+
+    test("a recipient, text or id field can name a top-level string or number", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [
+          { field: "repo", kind: "recipient", within: "owner" },
+          { field: "owner", kind: "id", within: "chainId" },
+        ],
+      });
+      expect(tool.operativeArgs?.[0]).toEqual({
+        field: "repo",
+        kind: "recipient",
+        within: "owner",
+      });
+    });
+
+    test("each way a qualifier can be wrong is refused, saying why", () => {
+      const bad =
+        (within: string, kind: "recipient" | "path" = "recipient") =>
+        () =>
+          buildTool({
+            ...def,
+            operativeArgs: [{ field: kind === "path" ? "path" : "repo", kind, within }],
+          });
+      expect(() =>
+        buildTool({ ...def, operativeArgs: [{ field: "owner", kind: "url", within: "repo" }] }),
+      ).toThrow(/a "url" value cannot be qualified/);
+      expect(bad("owner", "path")).not.toThrow();
+      // A command names the directory it runs in (C033).
+      expect(() =>
+        buildTool({
+          ...def,
+          operativeArgs: [{ field: "path", kind: "command", within: "owner" }],
+        }),
+      ).not.toThrow();
+      expect(bad("missing")).toThrow(/has no top-level field "missing"/);
+      expect(bad("tags")).toThrow(/field "tags" is a list/);
+      expect(bad("nested")).toThrow(/field "nested" is not a string or a number/);
+      expect(bad("nested.org")).toThrow(/must name one top-level input field/);
+      expect(bad("repo")).toThrow(/names "repo" itself/);
+    });
+  });
+
+  describe("env — the environment a command's call sets for its child", () => {
+    const runSchema = z.object({
+      argv: z.array(z.string()),
+      cwd: z.string().optional(),
+      envSet: z.record(z.string()).optional(),
+      counts: z.record(z.number()).optional(),
+      names: z.array(z.string()).optional(),
+      label: z.string().optional(),
+    });
+    const def = { name: "Run", description: "d", inputSchema: runSchema, execute: exec };
+
+    test("a command names a top-level map of variable names to values", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+      });
+      expect(tool.operativeArgs).toEqual([
+        { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+      ]);
+    });
+
+    test("each way an env declaration can be wrong is refused, saying why", () => {
+      const bad = (env: string, kind: "command" | "text" = "command") => {
+        try {
+          buildTool({ ...def, operativeArgs: [{ field: "argv", kind, within: "cwd", env }] });
+          return "accepted";
+        } catch (err) {
+          return (err as Error).message;
+        }
+      };
+      // Every refusal, and why — a missed one would let a declaration name a
+      // field the subject builder then reads as no environment at all.
+      expect({
+        text: bad("envSet", "text"),
+        missing: bad("missing"),
+        list: bad("names"),
+        scalar: bad("label"),
+        numbers: bad("counts"),
+        nested: bad("envSet.PATH"),
+        self: bad("argv"),
+        within: bad("cwd"),
+      }).toEqual({
+        text: expect.stringMatching(/only a "command" runs in an environment/),
+        missing: expect.stringMatching(/has no top-level field "missing"/),
+        list: expect.stringMatching(/field "names" is not a map of variable names to values/),
+        scalar: expect.stringMatching(/field "label" is not a map of variable names to values/),
+        numbers: expect.stringMatching(/field "counts" does not map names to string values/),
+        nested: expect.stringMatching(/must name one top-level input field/),
+        self: expect.stringMatching(/names "argv", which is already used/),
+        within: expect.stringMatching(/names "cwd", which is already used/),
+      });
+    });
+  });
+
+  test("an opaque schema (an MCP tool's z.unknown()) accepts any field", () => {
+    const tool = buildTool({
+      name: "Opaque",
+      description: "d",
+      inputSchema: z.unknown(),
+      execute: exec,
+      operativeArgs: [{ field: "anything.at.all", kind: "text" }],
+    });
+    expect(tool.operativeArgs).toHaveLength(1);
+  });
+});
+
+describe("buildTool — the documented defaults (security-7#11)", () => {
+  test("an unannotated tool is neither read-only nor destructive, which auto mode allows", () => {
+    // The docstring says so; this pins the facts it describes.
+    const tool = buildTool(echoDef);
+    expect({
+      readOnly: tool.readOnly,
+      destructive: tool.destructive,
+      requiresSandbox: tool.requiresSandbox,
+      requireJustification: tool.requireJustification,
+      scope: tool.scope,
+      classifyOutput: tool.classifyOutput,
+    }).toEqual({
+      readOnly: false,
+      destructive: false,
+      requiresSandbox: false,
+      requireJustification: false,
+      scope: "internal",
+      classifyOutput: true,
+    });
   });
 });

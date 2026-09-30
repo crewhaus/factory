@@ -4,7 +4,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 1: deps (cached layer for node_modules)
 # ──────────────────────────────────────────────────────────────────────────────
-FROM oven/bun:1.2-alpine AS deps
+FROM oven/bun:1.3-alpine AS deps
 WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
@@ -23,7 +23,7 @@ RUN bun build apps/cli/src/index.ts --target=bun --outfile=/app/dist/crewhaus.js
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 3: runtime (minimal — only what the CLI needs at boot)
 # ──────────────────────────────────────────────────────────────────────────────
-FROM oven/bun:1.2-alpine AS runtime
+FROM oven/bun:1.3-alpine AS runtime
 RUN addgroup -S crewhaus && adduser -S crewhaus -G crewhaus -u 10001
 WORKDIR /app
 COPY --from=build --chown=crewhaus:crewhaus /app/dist/crewhaus.js /app/crewhaus.js

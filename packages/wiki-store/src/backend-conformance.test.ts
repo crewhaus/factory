@@ -43,6 +43,7 @@ describe("WikiStore backend conformance — file backend", () => {
     // Runs the whole contract suite against a real backend.
   }, 20_000);
 
+  // Slow by construction (the whole conformance suite against a second backend; 2.9 s on CI's loaded runner).
   test("negative control: a last-write-wins backend fails the version-conflict check", async () => {
     const cheatingFactory: WikiBackendFactory = ({ specName, now }) => {
       const rootDir = mkdtempSync(join(tmpdir(), `wiki-conformance-cheat-${specName}-`));
@@ -68,5 +69,5 @@ describe("WikiStore backend conformance — file backend", () => {
     const conflict = report.checks.find((c) => c.name === "upsert.version-conflict");
     expect(conflict?.passed).toBe(false);
     expect(conflict?.detail).toContain("stale");
-  });
+  }, 20_000);
 });

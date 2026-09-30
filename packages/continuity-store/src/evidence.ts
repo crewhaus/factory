@@ -18,11 +18,11 @@
  * `.crewhaus/retention.json` (see `appendRetentionPins`).
  */
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { dirname, relative } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { openEventLog } from "@crewhaus/event-log";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_SESSION_ROOT_DIR = ".crewhaus/sessions";
 const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
@@ -30,6 +30,8 @@ const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const DEFAULT_MAX_DEPTH = 8;
 /** Frozen `resultDigest` excerpt length (chars). */
 const RESULT_DIGEST_MAX_CHARS = 240;
+/** Largest retention.json read back before it is rewritten. */
+const RETENTION_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
 export type EvidenceRef = {
   readonly toolUseId: string;
@@ -271,25 +273,47 @@ export async function verifyEvidence(
  * live `proven` record is never TTL-evicted out from under it. Read-modify-
  * write preserves every other key in the file verbatim; the write is
  * tmp+rename atomic. Absent file → created with `{version: 1, pins: […]}`.
+ *
+ * The file is contained inside `containmentRoot` (C070): the temp is an
+ * `O_EXCL|O_NOFOLLOW` file under a random name, so a link planted at the old
+ * fixed `retention.json.tmp` is never written through. `retention.json`
+ * itself is treated as the operator config it is — a link to it that stays
+ * inside the root is followed (an operator who keeps their policy in
+ * `config/retention.json` and links `.crewhaus/retention.json` to it keeps
+ * working); only a link that leaves the root is refused. The caller passes
+ * the workspace (or, under a tenant, the tenant root) as `containmentRoot`.
  */
 export async function appendRetentionPins(
   sessionIds: readonly string[],
   retentionPath: string,
+  containmentRoot: string,
 ): Promise<{ readonly added: readonly string[] }> {
   const valid = [...new Set(sessionIds.filter((id) => SESSION_ID_REGEX.test(id)))];
   if (valid.length === 0) return { added: [] };
 
+  const given = relative(containmentRoot, retentionPath);
   let config: Record<string, unknown> = { version: 1 };
-  if (existsSync(retentionPath)) {
-    let raw: string;
-    try {
-      raw = await readFile(retentionPath, "utf8");
-    } catch (err) {
-      throw new CrewhausError("config", `continuity-store: cannot read ${retentionPath}`, err);
+  const read = await openForRead(containmentRoot, given, {
+    maxBytes: RETENTION_FILE_MAX_BYTES,
+  });
+  if (!read.ok && read.code !== "not-found") {
+    throw new CrewhausError(
+      "config",
+      read.code === "escapes-root"
+        ? `continuity-store: ${retentionPath} links outside the workspace, so proof sessions cannot be pinned. Point it inside the workspace, or replace the link with the file itself.`
+        : `continuity-store: cannot read ${retentionPath}: ${read.reason}`,
+    );
+  }
+  if (read.ok) {
+    if (read.truncated) {
+      throw new CrewhausError(
+        "config",
+        `continuity-store: ${retentionPath} is larger than ${RETENTION_FILE_MAX_BYTES} bytes — fix it before pinning proof sessions (a half-read retention policy must not be rewritten).`,
+      );
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(read.text);
     } catch (err) {
       throw new CrewhausError(
         "config",
@@ -314,8 +338,19 @@ export async function appendRetentionPins(
 
   config["pins"] = [...existing, ...added];
   await mkdir(dirname(retentionPath), { recursive: true });
-  const tmpPath = `${retentionPath}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmpPath, retentionPath);
+  const written = writeFileSafe(containmentRoot, given, `${JSON.stringify(config, null, 2)}\n`, {
+    overwrite: true,
+    createParents: true,
+    mode: 0o600,
+    leafSymlink: "follow-contained",
+  });
+  if (!written.ok) {
+    throw new CrewhausError(
+      "config",
+      written.code === "escapes-root"
+        ? `continuity-store: ${retentionPath} links outside the workspace, so proof sessions cannot be pinned. Point it inside the workspace, or replace the link with the file itself.`
+        : `continuity-store: cannot write ${retentionPath}: ${written.reason}`,
+    );
+  }
   return { added };
 }

@@ -19,12 +19,15 @@
  *      exactly this, and no tool here opts out of it.
  *   2. **The gate is tool-http's gate.** Allow-list, SSRF refusal, IP
  *      pinning, credential stripping and byte caps all live in `./net` and
- *      every outbound byte passes through them. Recipients and SMTP hosts
- *      have their own allow-lists, equally fail-closed. See that file's
- *      header.
- *   3. **Credentials are environment variable NAMES.** A Slack or Discord
- *      incoming-webhook URL is itself a credential, so it is named rather
- *      than passed, and no refusal ever prints a webhook path.
+ *      every outbound byte passes through them. Email recipients, SMTP
+ *      hosts, SMS numbers and push targets have their own allow-lists,
+ *      equally fail-closed. See that file's header.
+ *   3. **Credentials are environment variable NAMES**, and only names the
+ *      operator listed in `allowed_secret_envs` (or a provider's own
+ *      `auth.envVar`, for that provider): a call chooses among them and can
+ *      never add one. A Slack or Discord incoming-webhook URL is itself a
+ *      credential, so it is named rather than passed, and no refusal ever
+ *      prints a webhook path.
  *   4. **Determinism, and no clock.** Listings sort, comparisons are
  *      locale-free, nothing is random — MIME boundaries are derived from the
  *      message's own content — and anything that needs "now" takes it as an
@@ -34,13 +37,16 @@
  * The one deliberate exception to "same input, same output" is the
  * idempotency ledger in `./net`: a second call carrying an
  * `idempotencyKey` that already succeeded returns the first result and posts
- * nothing. That is the point of an idempotency key, and it is the only
- * hidden state in the package.
+ * nothing — when it is the same request; the same key with a different
+ * destination or content is refused. That is the point of an idempotency
+ * key, and it is the only hidden state in the package.
  */
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { SecretValue } from "@crewhaus/tool-safety/env";
 import { z } from "zod";
 import type { Block, Platform } from "./lib/blocks";
 import {
@@ -60,6 +66,7 @@ import {
   parseDmarc,
   parseSpf,
 } from "./lib/dns-records";
+import { parseOffsetInstant } from "./lib/instant";
 import type { Attachment, Mailbox } from "./lib/mime";
 import { composeMessage, isValidAddress } from "./lib/mime";
 import type { Check, CheckStatus } from "./lib/preflight";
@@ -83,6 +90,9 @@ import {
   assertSmtpHostAllowed,
   byString,
   describeFailure,
+  destinationRefusal,
+  excerptOf,
+  isDotSegment,
   json,
   ledgerLookup,
   ledgerRecord,
@@ -94,13 +104,23 @@ import {
   recipientAllowed,
   redactorFor,
   rejectInlineCredentials,
+  requestFingerprint,
   resolveNotifyConfig,
   resolveSecret,
   safeUrlLabel,
   sleep,
   startDeadline,
+  substituteIntoUrl,
 } from "./net";
-import type { AuthProfile, Deadline, NotifyConfig, ProviderProfile, TxtAnswer } from "./net";
+import type {
+  AuthProfile,
+  Deadline,
+  DestinationKind,
+  NotifyConfig,
+  ProviderProfile,
+  RequestFingerprint,
+  TxtAnswer,
+} from "./net";
 import { resolveSafe } from "./paths";
 import { sendMail } from "./smtp";
 
@@ -156,7 +176,9 @@ const envVarSchema = (what: string) =>
     .string()
     .min(1)
     .max(64)
-    .describe(`NAME of the environment variable holding ${what} — never the value itself`);
+    .describe(
+      `NAME of the environment variable holding ${what} — never the value itself; it must be listed in tool_config.notify.allowed_secret_envs`,
+    );
 
 const timeoutSchema = z
   .number()
@@ -182,7 +204,7 @@ const idempotencySchema = z
   .max(200)
   .optional()
   .describe(
-    "a key that makes a retry safe: the first call under this key is sent and recorded for the life of the process, and a later call with the same key returns that result without sending again. It is also passed to the provider where the provider honours one",
+    "a key that makes a retry safe: the first call under this key is sent and recorded for the life of the process, and a later call with the same key and the same request returns that result without sending again. The same key with a different destination or content is refused and sends nothing — a key names one message. It is also passed to the provider where the provider honours one",
   );
 
 const authSchema = z
@@ -220,11 +242,13 @@ type Prepared = {
   readonly cfg: NotifyConfig;
   readonly deadline: Deadline;
   readonly redact: (text: string) => string;
+  /** The call's credential values: a cut of a reply is trimmed of any part of one. */
+  readonly secrets: readonly SecretValue[];
 };
 
 /** Everything that echoes out of this package passes through the redactor. */
 function withRedaction(
-  secrets: readonly (string | undefined)[],
+  secrets: readonly SecretValue[],
   timeoutMs: number | undefined,
   ctx: ToolExecuteContext | undefined,
 ): Prepared {
@@ -232,6 +256,7 @@ function withRedaction(
     cfg: resolveNotifyConfig(ctx?.toolConfig),
     deadline: startDeadline(timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal),
     redact: redactorFor(secrets),
+    secrets,
   };
 }
 
@@ -240,19 +265,32 @@ type PreparedRequest =
       readonly ok: true;
       readonly headers: Record<string, string>;
       readonly secretHeaders: ReadonlySet<string>;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
     }
   | { readonly ok: false; readonly message: string };
 
-/** Reject inline credentials, then attach the auth profile's secret. */
+/**
+ * The variable a provider's operator-written auth profile names: allowed for
+ * that provider's own calls without being listed in allowed_secret_envs, and
+ * for nothing else.
+ */
+function providerAuthEnvs(profile: ProviderProfile): readonly string[] {
+  return profile.auth === undefined ? [] : [profile.auth.envVar];
+}
+
+/**
+ * Reject inline credentials, then attach the auth profile's secret, read
+ * only from a variable `allowed` (the operator's allowed_secret_envs) lists.
+ */
 function prepareHeaders(
   raw: Record<string, string> | undefined,
   auth: AuthProfile | undefined,
+  allowed: readonly string[],
 ): PreparedRequest {
   const headers: Record<string, string> = { ...(raw ?? {}) };
   const inline = rejectInlineCredentials(headers);
   if (inline !== null) return { ok: false, message: inline };
-  const applied = applyAuth(headers, auth);
+  const applied = applyAuth(headers, auth, allowed);
   if (!applied.ok) return { ok: false, message: applied.message };
   return {
     ok: true,
@@ -266,11 +304,33 @@ type SendOutcome = {
   readonly status: number;
   readonly ok: boolean;
   readonly body: string;
+  /** The start of `body` an error message quotes, trimmed of any part of a credential. */
+  readonly excerpt: string;
   readonly truncated: boolean;
   readonly parsed: unknown;
+  /**
+   * The request was delivered and answered (`status` is real), but the
+   * reply body could not be read: why. A send that got this far was SENT;
+   * only what the reply said is unknown.
+   */
+  readonly replyUnreadable?: string;
 };
 
-/** POST (or whatever verb) to an allow-listed URL and read a capped reply. */
+/** The `replyUnreadable` field for a result, when there is one. */
+function unreadableField(outcome: SendOutcome): { replyUnreadable?: string } {
+  return outcome.replyUnreadable !== undefined ? { replyUnreadable: outcome.replyUnreadable } : {};
+}
+
+/**
+ * POST (or whatever verb) to an allow-listed URL and read a capped reply.
+ *
+ * Once `openRequest` returns, the request has been delivered and answered.
+ * A failure to READ the reply (a coding this reader will not decode, a
+ * corrupt body, the deadline while it streams) does not un-send it, so it is
+ * returned as `replyUnreadable` rather than thrown: 0.7.1's first cut threw
+ * it, the tools reported "nothing was sent" for a delivered message, and a
+ * retry under the same idempotency key delivered it again (net review).
+ */
 async function send(
   url: URL,
   method: string,
@@ -290,7 +350,21 @@ async function send(
     redirect: "refuse",
     credentialHeaders: secretHeaders,
   });
-  const capped = await readCapped(opened.res, maxBytes);
+  const status = opened.res.status;
+  let capped: Awaited<ReturnType<typeof readCapped>>;
+  try {
+    capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal, prepared.secrets);
+  } catch (err) {
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      body: "",
+      excerpt: "",
+      truncated: false,
+      parsed: undefined,
+      replyUnreadable: describeFailure(err, prepared.deadline),
+    };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(capped.text);
@@ -301,6 +375,7 @@ async function send(
     status: opened.res.status,
     ok: opened.res.status >= 200 && opened.res.status < 300,
     body: capped.text,
+    excerpt: excerptOf(capped.text, prepared.secrets),
     truncated: capped.truncated,
     parsed,
   };
@@ -313,7 +388,9 @@ async function send(
  */
 function platformFailure(platform: Platform, outcome: SendOutcome): string | null {
   if (!outcome.ok) {
-    return `the service answered ${outcome.status}: ${outcome.body.slice(0, 500)}`;
+    return outcome.replyUnreadable !== undefined
+      ? `the service answered ${outcome.status}, and its reply could not be read: ${outcome.replyUnreadable}`
+      : `the service answered ${outcome.status}: ${outcome.excerpt}`;
   }
   if (platform === "slack" && typeof outcome.parsed === "object" && outcome.parsed !== null) {
     const record = outcome.parsed as Record<string, unknown>;
@@ -324,6 +401,35 @@ function platformFailure(platform: Platform, outcome: SendOutcome): string | nul
   return null;
 }
 
+/**
+ * Slack's Web API keeps its verdict in the reply body (`ok:false` on a
+ * 200). When that verdict cannot be read, the request was delivered but
+ * whether Slack took it is unknown: said so, never "sent" and never "not
+ * sent". It cannot be read when the body could not be read at all, or, in
+ * API mode, when the body is not a JSON object: most often because it was
+ * longer than maxBytes and was cut (net attacker review: a 680-byte
+ * `{"ok":false,"error":"invalid_blocks",...}` cut at 256 bytes was reported
+ * `sent: true`, and ledgered). An incoming webhook answers with its status
+ * and a plain `ok`, and other platforms answer with the status, which is
+ * known.
+ */
+function unknownVerdict(
+  platform: Platform,
+  outcome: SendOutcome,
+  mode: "api" | "webhook",
+): string | null {
+  if (platform !== "slack" || !outcome.ok) return null;
+  if (outcome.replyUnreadable !== undefined) {
+    return `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, could not be read (${outcome.replyUnreadable}); check before trying again`;
+  }
+  if (mode !== "api" || (typeof outcome.parsed === "object" && outcome.parsed !== null)) {
+    return null;
+  }
+  return outcome.truncated
+    ? `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, was longer than maxBytes and was cut before it could be read; check before trying again, and raise maxBytes`
+    : `Slack answered ${outcome.status}, but its reply is not the JSON object that says whether it accepted the request; check before trying again`;
+}
+
 /** Where a platform keeps the id of the message just posted. */
 function postedMessageId(platform: Platform, outcome: SendOutcome): string | undefined {
   if (typeof outcome.parsed !== "object" || outcome.parsed === null) return undefined;
@@ -332,9 +438,12 @@ function postedMessageId(platform: Platform, outcome: SendOutcome): string | und
   return typeof raw === "string" ? raw : undefined;
 }
 
-/** Resolve a webhook URL held in an environment variable. */
-function webhookUrlFrom(envVar: string): { url: URL; secret: string } | string {
-  const resolved = resolveSecret(envVar, "the webhook URL");
+/** Resolve a webhook URL held in an environment variable `allowed` lists. */
+function webhookUrlFrom(
+  envVar: string,
+  allowed: readonly string[],
+): { url: URL; secret: string } | string {
+  const resolved = resolveSecret(envVar, "the webhook URL", allowed);
   if (!resolved.ok) return resolved.message;
   const parsed = parseUrl(resolved.value);
   if (typeof parsed === "string") {
@@ -366,6 +475,24 @@ function inlineWebhookCredential(url: URL): string | null {
 
 const notSentBecause = (reason: string): string => `nothing was sent: ${reason}`;
 
+/**
+ * What the idempotency ledger already says about this call, or undefined
+ * when it should go ahead: the first call's result for a retry of the same
+ * request, and a refusal for a different request under a key already used.
+ */
+function ledgerAnswer(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+): string | undefined {
+  const answer = ledgerLookup(tool, key, fingerprint);
+  if (answer === undefined) return undefined;
+  if (answer.kind === "replay") return answer.result;
+  return notSentBecause(
+    `idempotencyKey "${key}" already sent a different ${tool} request in this process (it differed in ${answer.differs.join(", ")}). A key names one message — use a new key for a new message`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // chat
 // ---------------------------------------------------------------------------
@@ -378,7 +505,7 @@ const chatTargetShape = {
     .max(64)
     .optional()
     .describe(
-      "NAME of the environment variable holding the incoming-webhook URL. The URL is the credential — a Slack /services/… or Discord /api/webhooks/… path grants posting rights to anyone holding it — so it is named, never passed, and never printed in an error",
+      "NAME of the environment variable holding the incoming-webhook URL, listed in tool_config.notify.allowed_secret_envs. The URL is the credential — a Slack /services/… or Discord /api/webhooks/… path grants posting rights to anyone holding it — so it is named, never passed, and never printed in an error",
     ),
   apiBaseUrl: z
     .string()
@@ -392,7 +519,9 @@ const chatTargetShape = {
     .min(1)
     .max(64)
     .optional()
-    .describe("NAME of the environment variable holding the bot token, for API mode"),
+    .describe(
+      "NAME of the environment variable holding the bot token, for API mode; it must be listed in tool_config.notify.allowed_secret_envs. It is sent as `Authorization: Bot <token>` to Discord and `Authorization: Bearer <token>` to Slack",
+    ),
   channel: z
     .string()
     .min(1)
@@ -416,7 +545,7 @@ type ChatRoute =
       readonly ok: true;
       readonly url: URL;
       readonly headers: Record<string, string>;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
       readonly secretHeaders: ReadonlySet<string>;
       readonly mode: "webhook" | "api";
     }
@@ -432,7 +561,12 @@ type ChatRoute =
  * configuration mistake rather than a preference, so it is refused instead
  * of resolved by precedence.
  */
-function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): ChatRoute {
+function routeChat(
+  target: ChatTarget,
+  apiPath: string,
+  allowWebhook: boolean,
+  allowed: readonly string[],
+): ChatRoute {
   const hasWebhook = target.webhookUrlEnv !== undefined;
   const hasApi = target.apiBaseUrl !== undefined || target.tokenEnv !== undefined;
   if (hasWebhook && hasApi) {
@@ -450,7 +584,7 @@ function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): 
           "an incoming webhook can only create messages; editing, deleting and reacting need apiBaseUrl and tokenEnv",
       };
     }
-    const resolved = webhookUrlFrom(target.webhookUrlEnv as string);
+    const resolved = webhookUrlFrom(target.webhookUrlEnv as string, allowed);
     if (typeof resolved === "string") return { ok: false, message: resolved };
     return {
       ok: true,
@@ -469,15 +603,30 @@ function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): 
   }
   const base = parseUrl(target.apiBaseUrl);
   if (typeof base === "string") return { ok: false, message: base };
-  const token = resolveSecret(target.tokenEnv, "the bot token");
+  const token = resolveSecret(target.tokenEnv, "the bot token", allowed);
   if (!token.ok) return { ok: false, message: token.message };
-  const url = new URL(`${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`, base);
+  const literal = `${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`;
+  const url = new URL(literal, base);
+  // The path requested must be the path built: a segment the parser would
+  // resolve (a `..` channel, message id or emoji) addresses another endpoint.
+  if (url.pathname !== literal) {
+    return {
+      ok: false,
+      message:
+        "a channel, message id or emoji in this call would change which API endpoint is requested, not just name the item",
+    };
+  }
+  // Discord authenticates a bot token with the `Bot` scheme; `Bearer` there
+  // means an OAuth2 user token, which cannot post, edit, delete or react as
+  // the bot, so every Discord API-mode call answered 401. Slack's bot token
+  // is a Bearer token.
+  const scheme = target.platform === "discord" ? "Bot" : "Bearer";
   return {
     ok: true,
     url,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      Authorization: `Bearer ${token.value}`,
+      Authorization: `${scheme} ${token.value}`,
     },
     secrets: [token.value],
     secretHeaders: new Set(["authorization"]),
@@ -504,6 +653,14 @@ function apiPathFor(
     return { path: "reactions.add", method: "POST" };
   }
   if (channel === undefined) return "discord addresses messages by channel id — set channel";
+  const dotted = [
+    ["channel", channel],
+    ["messageId", messageId],
+    ["emoji", emoji],
+  ].find(([, v]) => v !== undefined && isDotSegment(v));
+  if (dotted !== undefined) {
+    return `${dotted[0]} "${dotted[1]}" is a relative path segment, not a discord ${dotted[0] === "emoji" ? "emoji" : "id"} — substituted into the API path it would walk the request up to a different endpoint, such as the channel itself`;
+  }
   const base = `channels/${encodeURIComponent(channel)}/messages`;
   if (operation === "post") return { path: base, method: "POST" };
   if (messageId === undefined) return "set messageId — discord identifies a message by its id";
@@ -534,6 +691,7 @@ function renderMessage(
 
 export const chatPost: RegisteredTool = buildTool({
   name: "ChatPost",
+  operativeArgs: [{ field: "channel", kind: "recipient" }],
   description:
     "Post a message to Slack, Discord, Microsoft Teams or a generic incoming webhook, with optional heading/paragraph/fields/divider/link blocks and a thread id where the platform threads. Use it when a harness needs to tell a room something rather than reply where it was spoken to — a nightly result, an alert, a hand-off. Every value is escaped for the platform before it is sent, so text carrying <!channel>, @everyone or a code fence can change what the message SAYS but never what it DOES; mentions are additionally suppressed at the API level. One tool covers four platforms because the payload differs and the intent does not. It takes an idempotency key so a retried call returns the first result instead of posting twice, and it will not follow a redirect — a webhook URL that moved is a configuration change, not something to chase at send time.",
   inputSchema: z.object({
@@ -572,8 +730,9 @@ export const chatPost: RegisteredTool = buildTool({
       timeoutMs?: number;
       maxBytes?: number;
     };
-    const cached = ledgerLookup("ChatPost", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
+    const fingerprint = requestFingerprint(args);
+    const cached = ledgerAnswer("ChatPost", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     const rendered = renderMessage(args.platform, args.text, args.blocks);
     if (typeof rendered === "string") return notSentBecause(rendered);
@@ -590,7 +749,12 @@ export const chatPost: RegisteredTool = buildTool({
       apiPath = pathSpec.path;
       method = pathSpec.method;
     }
-    const route = routeChat(args, apiPath, true);
+    const route = routeChat(
+      args,
+      apiPath,
+      true,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (route.mode === "api" && args.channel === undefined) {
       return notSentBecause("API mode addresses a channel — set channel");
@@ -631,12 +795,29 @@ export const chatPost: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
+      const unknown = unknownVerdict(args.platform, outcome, route.mode);
+      if (unknown !== null) {
+        // Recorded like a success: the request was delivered, so a retry
+        // under the same key must not deliver it again.
+        const result = prepared.redact(
+          json({
+            sent: null,
+            platform: args.platform,
+            mode: route.mode,
+            status: outcome.status,
+            reason: unknown,
+          }),
+        );
+        ledgerRecord("ChatPost", args.idempotencyKey, fingerprint, result);
+        return result;
+      }
       const result = prepared.redact(
         json({
           sent: true,
           platform: args.platform,
           mode: route.mode,
           status: outcome.status,
+          ...unreadableField(outcome),
           characters: rendered.text.length,
           ...(postedMessageId(args.platform, outcome) !== undefined
             ? { messageId: postedMessageId(args.platform, outcome) }
@@ -644,7 +825,7 @@ export const chatPost: RegisteredTool = buildTool({
           ...(warnings.length > 0 ? { warnings: warnings.sort(byString) } : {}),
         }),
       );
-      ledgerRecord("ChatPost", args.idempotencyKey, result);
+      ledgerRecord("ChatPost", args.idempotencyKey, fingerprint, result);
       return result;
     } catch (err) {
       return prepared.redact(notSentBecause(describeFailure(err, prepared.deadline)));
@@ -656,6 +837,7 @@ export const chatPost: RegisteredTool = buildTool({
 
 export const chatUpdate: RegisteredTool = buildTool({
   name: "ChatUpdate",
+  operativeArgs: [{ field: "channel", kind: "recipient" }],
   description:
     "Edit a message this harness already posted, by its id, on a platform that allows it. Use it to keep one status message current instead of adding a new one every cycle — a deploy that goes queued → running → done reads better as one edited line than as three. It needs a bot token: an incoming webhook cannot edit, and Teams and generic webhooks cannot edit at all, so both are refused rather than silently reposted. An edit still notifies nobody, but the message is in front of people, so it carries the same gate as posting. The previous text is not returned, because the platform does not give it back.",
   inputSchema: z.object({
@@ -692,7 +874,12 @@ export const chatUpdate: RegisteredTool = buildTool({
 
     const pathSpec = apiPathFor(args.platform, "update", args.channel, args.messageId, undefined);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -721,12 +908,25 @@ export const chatUpdate: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
+      const unknown = unknownVerdict(args.platform, outcome, "api");
+      if (unknown !== null) {
+        return prepared.redact(
+          json({
+            updated: null,
+            platform: args.platform,
+            messageId: args.messageId,
+            status: outcome.status,
+            reason: unknown,
+          }),
+        );
+      }
       return prepared.redact(
         json({
           updated: true,
           platform: args.platform,
           messageId: args.messageId,
           status: outcome.status,
+          ...unreadableField(outcome),
           characters: rendered.text.length,
           ...(rendered.truncated
             ? { warnings: ["the message was cut to the platform limit"] }
@@ -743,6 +943,7 @@ export const chatUpdate: RegisteredTool = buildTool({
 
 export const chatDelete: RegisteredTool = buildTool({
   name: "ChatDelete",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
   description:
     "Remove a message this harness posted, by its id. Use it to retract something that was wrong, or to tidy a transient status line once the run is over. Deleting does not unsend: anyone watching the channel has already seen it, and on most platforms a tombstone or an audit entry remains, so this is a cleanup tool and not a way to take something back. It needs a bot token, works only where the platform supports deletion, and cannot delete a message this harness did not post unless the token's own permissions allow it.",
   inputSchema: z.object({
@@ -762,7 +963,12 @@ export const chatDelete: RegisteredTool = buildTool({
     }
     const pathSpec = apiPathFor(args.platform, "delete", args.channel, args.messageId, undefined);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -785,12 +991,14 @@ export const chatDelete: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the message was not deleted: ${failure}`);
+      const unknown = unknownVerdict(args.platform, outcome, "api");
       return prepared.redact(
         json({
-          deleted: true,
+          deleted: unknown === null ? true : null,
           platform: args.platform,
           messageId: args.messageId,
           status: outcome.status,
+          ...(unknown === null ? unreadableField(outcome) : { reason: unknown }),
         }),
       );
     } catch (err) {
@@ -805,6 +1013,7 @@ export const chatDelete: RegisteredTool = buildTool({
 
 export const chatReact: RegisteredTool = buildTool({
   name: "ChatReact",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
   description:
     "Add an emoji reaction to a message, as the token's own user. Use it to acknowledge something cheaply — a ✅ on the alert that has been handled says as much as a reply and adds no noise. A reaction is visible to the room and shows who left it, so it counts as putting something in front of people and takes the same gate as a post. Give the emoji by name without colons on Slack, and as the literal character or name:id on Discord; an emoji the workspace does not have is refused by the platform, not invented here.",
   inputSchema: z.object({
@@ -836,7 +1045,12 @@ export const chatReact: RegisteredTool = buildTool({
     }
     const pathSpec = apiPathFor(args.platform, "react", args.channel, args.messageId, args.emoji);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -863,13 +1077,15 @@ export const chatReact: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the reaction was not added: ${failure}`);
+      const unknown = unknownVerdict(args.platform, outcome, "api");
       return prepared.redact(
         json({
-          reacted: true,
+          reacted: unknown === null ? true : null,
           platform: args.platform,
           messageId: args.messageId,
           emoji: args.emoji,
           status: outcome.status,
+          ...(unknown === null ? unreadableField(outcome) : { reason: unknown }),
         }),
       );
     } catch (err) {
@@ -1069,15 +1285,19 @@ function buildMessage(
   toolName: string,
   args: ComposeArgs,
 ):
-  | { ok: true; message: string; messageId: string; bytes: number; envelopeTo: readonly string[] }
+  | {
+      ok: true;
+      message: string;
+      messageId: string;
+      bytes: number;
+      envelopeTo: readonly string[];
+      /** sha256 of each attachment's bytes, in order: what the message carries, not its path. */
+      attachmentDigests: readonly string[];
+    }
   | { ok: false; message: string } {
-  const when = new Date(args.date);
-  if (Number.isNaN(when.getTime())) {
-    return {
-      ok: false,
-      message: `"${args.date}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T09:30:00Z`,
-    };
-  }
+  const instant = parseOffsetInstant(args.date);
+  if (!instant.ok) return { ok: false, message: instant.message };
+  const when = new Date(instant.ms);
   const loaded = loadAttachments(toolName, args.attachments);
   if (!loaded.ok) return { ok: false, message: loaded.message };
 
@@ -1109,6 +1329,9 @@ function buildMessage(
     messageId: composed.messageId,
     bytes: composed.bytes,
     envelopeTo: composed.envelopeTo,
+    attachmentDigests: loaded.attachments.map((a) =>
+      createHash("sha256").update(a.content).digest("hex"),
+    ),
   };
 }
 
@@ -1133,8 +1356,46 @@ export const emailCompose: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A retry of an EmailSend whose message can no longer be built — most often
+ * because an attachment was a temp file cleaned up after the first send —
+ * under a key that already sent a message agreeing on everything but the
+ * attachments' bytes. Answering "nothing was sent" there would read as the
+ * FIRST message being unsent, and invite a second send (net regression
+ * review). So the recorded answer is given, with a note that this call sent
+ * nothing and could not confirm the attachments are the same. Undefined when
+ * the key recorded nothing like it.
+ */
+function unconfirmedEmailReplay(
+  args: ComposeArgs & { idempotencyKey?: string },
+  reason: string,
+): string | undefined {
+  const answer = ledgerLookup(
+    "EmailSend",
+    args.idempotencyKey,
+    requestFingerprint({ ...args, date: undefined }),
+    ["attachmentContent"],
+  );
+  if (answer?.kind !== "replay") return undefined;
+  const note = `idempotencyKey "${args.idempotencyKey}" already sent this message, and this is what that send returned. This call sent nothing: its message could not be built again (${reason}), so whether its attachments are the same as the ones sent is not known`;
+  try {
+    const recorded = JSON.parse(answer.result) as unknown;
+    if (typeof recorded === "object" && recorded !== null && !Array.isArray(recorded)) {
+      return json({ ...(recorded as Record<string, unknown>), replayNote: note });
+    }
+  } catch {
+    // not JSON: the note goes on a line of its own
+  }
+  return `${answer.result}\n${note}`;
+}
+
 export const emailSend: RegisteredTool = buildTool({
   name: "EmailSend",
+  operativeArgs: [
+    { field: "to.address", kind: "recipient" },
+    { field: "cc.address", kind: "recipient" },
+    { field: "bcc.address", kind: "recipient" },
+  ],
   description:
     "Send a message over SMTP: EHLO, STARTTLS, AUTH, MAIL FROM, RCPT TO, DATA, written out rather than delegated. Use it when the thing to report belongs in somebody's inbox rather than in a chat room. STARTTLS is required by default and the session ends before the password is written if the server does not offer it; the credential is an environment variable NAME and the transcript records the AUTH line as redacted. Every recipient must match the operator's allow-list and the SMTP host must be one an operator named, both of which deny everything when unset. The whole session is deadline-bounded and the server's replies are byte-capped. It does not queue, retry, or track bounces — a refused recipient comes back named, and re-sending is the caller's decision.",
   inputSchema: z.object({
@@ -1158,13 +1419,17 @@ export const emailSend: RegisteredTool = buildTool({
       .min(1)
       .max(64)
       .optional()
-      .describe("NAME of the environment variable holding the SMTP username"),
+      .describe(
+        "NAME of the environment variable holding the SMTP username, listed in tool_config.notify.allowed_secret_envs",
+      ),
     passwordEnv: z
       .string()
       .min(1)
       .max(64)
       .optional()
-      .describe("NAME of the environment variable holding the SMTP password"),
+      .describe(
+        "NAME of the environment variable holding the SMTP password, listed in tool_config.notify.allowed_secret_envs",
+      ),
     authMethod: z
       .enum(["plain", "login", "auto"])
       .optional()
@@ -1196,9 +1461,6 @@ export const emailSend: RegisteredTool = buildTool({
       idempotencyKey?: string;
       timeoutMs?: number;
     };
-    const cached = ledgerLookup("EmailSend", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
-
     const cfg = resolveNotifyConfig(ctx?.toolConfig);
     const everyone = [...(args.to ?? []), ...(args.cc ?? []), ...(args.bcc ?? [])];
     if (everyone.length === 0) return notSentBecause("no recipients");
@@ -1221,18 +1483,38 @@ export const emailSend: RegisteredTool = buildTool({
       if (args.usernameEnv === undefined || args.passwordEnv === undefined) {
         return notSentBecause("set both usernameEnv and passwordEnv, or neither");
       }
-      const user = resolveSecret(args.usernameEnv, "the SMTP username");
+      const user = resolveSecret(args.usernameEnv, "the SMTP username", cfg.allowedSecretEnvs);
       if (!user.ok) return notSentBecause(user.message);
-      const pass = resolveSecret(args.passwordEnv, "the SMTP password");
+      const pass = resolveSecret(args.passwordEnv, "the SMTP password", cfg.allowedSecretEnvs);
       if (!pass.ok) return notSentBecause(pass.message);
       username = user.value;
       password = pass.value;
     }
 
     const built = buildMessage("EmailSend", args);
-    if (!built.ok) return notSentBecause(built.message);
+    if (!built.ok) {
+      const replay = unconfirmedEmailReplay(args, built.message);
+      return replay ?? notSentBecause(built.message);
+    }
 
-    const redact = redactorFor([username, password]);
+    // The ledger is asked about the message that would be SENT, so it is
+    // consulted after the build. `date` only stamps the message, so a retry
+    // that re-reads its clock is still the same message; everything that
+    // says who gets what is compared, and an attachment by its bytes: a key
+    // reused after report.txt was rewritten is a different message, not a
+    // retry of the first (net review, C207). Consulting it before the build
+    // replayed the first `sent: true` for a body that was never sent.
+    const fingerprint = requestFingerprint({
+      ...args,
+      date: undefined,
+      attachmentContent: built.attachmentDigests.length > 0 ? built.attachmentDigests : undefined,
+    });
+    const cached = ledgerAnswer("EmailSend", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
+
+    // The username is an identifier, redacted whole as 0.7.0 did; only the
+    // password is a secret whose cut start is caught.
+    const redact = redactorFor([password], [username]);
     const deadline = startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       assertSmtpHostAllowed(args.host, cfg);
@@ -1272,7 +1554,7 @@ export const emailSend: RegisteredTool = buildTool({
           queued: outcome.queued,
         }),
       );
-      ledgerRecord("EmailSend", args.idempotencyKey, result);
+      ledgerRecord("EmailSend", args.idempotencyKey, fingerprint, result);
       return result;
     } catch (err) {
       return redact(notSentBecause(describeFailure(err, deadline)));
@@ -1588,6 +1870,7 @@ export const emailSendPreflight: RegisteredTool = buildTool({
 
 export const webhookPost: RegisteredTool = buildTool({
   name: "WebhookPost",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "POST a JSON payload to an allow-listed URL, optionally HMAC-signed, retrying only on 5xx and only on a backoff the call declares. Use it to hand an event to something that is not a chat platform — a pager, an internal receiver, a partner endpoint. Signing runs over the exact bytes transmitted, in either the timestamped (Stripe-style) or body-only (GitHub-style) scheme, and the timestamp is an argument rather than a clock reading so the same call signs the same way twice. The backoff is exponential with no jitter, because unseeded randomness makes a run unreproducible, and it never sleeps past the deadline. An idempotency key makes a retry safe end to end: the key travels to the receiver and a repeat call returns the first result instead of delivering again.",
   inputSchema: z.object({
@@ -1604,7 +1887,7 @@ export const webhookPost: RegisteredTool = buildTool({
       .max(64)
       .optional()
       .describe(
-        "NAME of an environment variable holding the URL, for an endpoint whose path is itself a secret",
+        "NAME of an environment variable holding the URL, for an endpoint whose path is itself a secret; it must be listed in tool_config.notify.allowed_secret_envs",
       ),
     payload: z
       .union([z.record(z.unknown()), z.array(z.unknown()), z.string()])
@@ -1689,16 +1972,24 @@ export const webhookPost: RegisteredTool = buildTool({
       timeoutMs?: number;
       maxBytes?: number;
     };
-    const cached = ledgerLookup("WebhookPost", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
+    // A signature's timestamp only stamps the delivery; the payload and the
+    // destination are what make it a different request.
+    const fingerprint = requestFingerprint({
+      ...args,
+      signing:
+        args.signing === undefined ? undefined : { ...args.signing, timestampSeconds: undefined },
+    });
+    const cached = ledgerAnswer("WebhookPost", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     if ((args.url === undefined) === (args.urlEnv === undefined)) {
       return notSentBecause("give exactly one of url or urlEnv");
     }
-    const urlSecrets: string[] = [];
+    const allowedEnvs = resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs;
+    const urlSecrets: SecretValue[] = [];
     let url: URL;
     if (args.urlEnv !== undefined) {
-      const resolved = webhookUrlFrom(args.urlEnv);
+      const resolved = webhookUrlFrom(args.urlEnv, allowedEnvs);
       if (typeof resolved === "string") return notSentBecause(resolved);
       url = resolved.url;
       urlSecrets.push(resolved.secret, resolved.url.pathname);
@@ -1714,13 +2005,14 @@ export const webhookPost: RegisteredTool = buildTool({
     const headerPrep = prepareHeaders(
       { "content-type": "application/json", ...(args.headers ?? {}) },
       args.auth,
+      allowedEnvs,
     );
     if (!headerPrep.ok) return notSentBecause(headerPrep.message);
     const headers = headerPrep.headers;
     const secrets = [...urlSecrets, ...headerPrep.secrets];
 
     if (args.signing !== undefined) {
-      const secret = resolveSecret(args.signing.secretEnv, "the signing secret");
+      const secret = resolveSecret(args.signing.secretEnv, "the signing secret", allowedEnvs);
       if (!secret.ok) return notSentBecause(secret.message);
       secrets.push(secret.value);
       if (args.signing.scheme === "timestamped" && args.signing.timestampSeconds === undefined) {
@@ -1774,9 +2066,10 @@ export const webhookPost: RegisteredTool = buildTool({
               signed: args.signing !== undefined,
               ...(attempts.length > 0 ? { earlierAttempts: attempts } : {}),
               ...(outcome.body !== "" ? { response: outcome.body } : {}),
+              ...unreadableField(outcome),
             }),
           );
-          ledgerRecord("WebhookPost", args.idempotencyKey, result);
+          ledgerRecord("WebhookPost", args.idempotencyKey, fingerprint, result);
           return result;
         }
 
@@ -1789,7 +2082,7 @@ export const webhookPost: RegisteredTool = buildTool({
         if (!retryable) {
           return prepared.redact(
             notSentBecause(
-              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).body.slice(0, 500)}`,
+              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).replyUnreadable ?? (outcome as SendOutcome).excerpt}`,
             ),
           );
         }
@@ -1825,7 +2118,7 @@ type ProviderCall =
       readonly method: string;
       readonly headers: Record<string, string>;
       readonly body: string;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
       readonly secretHeaders: ReadonlySet<string>;
     }
   | { readonly ok: false; readonly message: string };
@@ -1861,7 +2154,7 @@ function buildProviderCall(
     return { ok: false, message: `provider "${providerName}" has an unusable endpoint` };
 
   const headers: Record<string, string> = {};
-  const applied = applyAuth(headers, profile.auth);
+  const applied = applyAuth(headers, profile.auth, providerAuthEnvs(profile));
   if (!applied.ok) return { ok: false, message: applied.message };
   if (idempotencyKey !== undefined && profile.idempotencyHeader !== undefined) {
     headers[profile.idempotencyHeader] = idempotencyKey;
@@ -1901,15 +2194,26 @@ function buildProviderCall(
 /** The shared execute body for SmsSend and PushNotify. */
 async function runProviderSend(
   toolName: string,
+  kind: DestinationKind,
   providerName: string,
   values: Readonly<Record<string, string>>,
   args: { idempotencyKey?: string; timeoutMs?: number; maxBytes?: number },
   ctx: ToolExecuteContext | undefined,
 ): Promise<string> {
-  const cached = ledgerLookup(toolName, args.idempotencyKey);
-  if (cached !== undefined) return cached.result;
-
   const cfg = resolveNotifyConfig(ctx?.toolConfig);
+  // The destination is checked first, before the ledger: a key reused for a
+  // number the list no longer admits is refused, not answered from memory.
+  // A provider that maps no `to` never sends the caller's value, so its
+  // destination is whatever the operator pinned in staticFields.
+  const profile = cfg.providers.get(providerName);
+  if (profile?.fields?.["to"] !== undefined) {
+    const refused = destinationRefusal(values["to"] ?? "", kind, cfg);
+    if (refused !== null) return notSentBecause(refused);
+  }
+  const fingerprint = requestFingerprint({ provider: providerName, ...values });
+  const cached = ledgerAnswer(toolName, args.idempotencyKey, fingerprint);
+  if (cached !== undefined) return cached;
+
   const call = buildProviderCall(cfg, providerName, values, args.idempotencyKey);
   if (!call.ok) return notSentBecause(call.message);
 
@@ -1917,6 +2221,7 @@ async function runProviderSend(
     cfg,
     deadline: startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal),
     redact: redactorFor(call.secrets),
+    secrets: call.secrets,
   };
   try {
     const outcome = await send(
@@ -1931,7 +2236,7 @@ async function runProviderSend(
     if (!outcome.ok) {
       return prepared.redact(
         notSentBecause(
-          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.body.slice(0, 500)}`,
+          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.replyUnreadable ?? outcome.excerpt}`,
         ),
       );
     }
@@ -1946,9 +2251,10 @@ async function runProviderSend(
         status: outcome.status,
         ...(typeof id === "string" || typeof id === "number" ? { messageId: String(id) } : {}),
         ...(typeof status === "string" ? { deliveryStatus: status } : {}),
+        ...unreadableField(outcome),
       }),
     );
-    ledgerRecord(toolName, args.idempotencyKey, result);
+    ledgerRecord(toolName, args.idempotencyKey, fingerprint, result);
     return result;
   } catch (err) {
     return prepared.redact(notSentBecause(describeFailure(err, prepared.deadline)));
@@ -1959,6 +2265,7 @@ async function runProviderSend(
 
 export const smsSend: RegisteredTool = buildTool({
   name: "SmsSend",
+  operativeArgs: [{ field: "to", kind: "recipient" }],
   description:
     "Send an SMS through a REST gateway the operator described in tool_config, rather than through a vendor this tool picked. Use it for the small number of notifications that must reach somebody who is not looking at a screen. The provider block names the endpoint, the auth environment variable and how the canonical fields to, body and from map onto that vendor's own names, so changing gateway is a config diff and not a release. An SMS costs money, arrives on a phone and cannot be recalled, so it is destructive, takes a justification, and takes an idempotency key that makes a retried call return the first result instead of sending a second message. It does not split a long message into parts or tell you what the carrier charged.",
   inputSchema: z.object({
@@ -1967,7 +2274,9 @@ export const smsSend: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(100)
-      .describe("the destination number, in the format the provider expects (E.164 for most)"),
+      .describe(
+        "the destination number; it must be in tool_config.notify.allowed_sms_recipients, which is matched in E.164 form (+ and digits; spaces, dashes and parentheses are ignored)",
+      ),
     body: z
       .string()
       .min(1)
@@ -1999,6 +2308,7 @@ export const smsSend: RegisteredTool = buildTool({
     };
     return runProviderSend(
       "SmsSend",
+      "sms",
       args.provider,
       { to: args.to, body: args.body, from: args.from ?? "" },
       args,
@@ -2009,6 +2319,7 @@ export const smsSend: RegisteredTool = buildTool({
 
 export const pushNotify: RegisteredTool = buildTool({
   name: "PushNotify",
+  operativeArgs: [{ field: "to", kind: "recipient" }],
   description:
     "Send a push notification through a REST provider the operator described in tool_config. Use it to reach an app or a device when a chat message would not be seen in time. It works exactly as SmsSend does — the provider block maps the canonical fields to, title, body and data onto the vendor's names — so one configuration style covers both, and a provider with no title concept simply never receives one. A push lands on a lock screen, so it is destructive and takes a justification; the idempotency key makes a retry safe. It does not manage device tokens, topics or subscriptions, and it reports what the provider answered rather than whether anyone read it.",
   inputSchema: z.object({
@@ -2017,7 +2328,9 @@ export const pushNotify: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(500)
-      .describe("device token, topic or whatever the provider addresses"),
+      .describe(
+        "device token, topic or whatever the provider addresses; it must be in tool_config.notify.allowed_push_targets",
+      ),
     title: z.string().max(200).optional(),
     body: z.string().min(1).max(4000),
     data: z
@@ -2049,6 +2362,7 @@ export const pushNotify: RegisteredTool = buildTool({
     }
     return runProviderSend(
       "PushNotify",
+      "push",
       args.provider,
       {
         to: args.to,
@@ -2064,6 +2378,7 @@ export const pushNotify: RegisteredTool = buildTool({
 
 export const deliveryCheck: RegisteredTool = buildTool({
   name: "DeliveryCheck",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "provider" }],
   description:
     "Ask a provider what became of a message it accepted earlier, where its API answers that question. Use it after SmsSend or PushNotify to tell 'the gateway took it' apart from 'the handset got it', which are not the same thing and are reported hours apart. It reads the statusEndpoint and statusPath the operator configured for that provider, substituting the message id into the URL, and it only reads — this is the one outbound tool here that is readOnly and needs no justification. A provider with no status endpoint configured is reported as such rather than guessed at, and an unknown id is whatever the provider says it is.",
   inputSchema: z.object({
@@ -2100,14 +2415,19 @@ export const deliveryCheck: RegisteredTool = buildTool({
     if (!/^[A-Za-z0-9_.:-]+$/.test(args.messageId)) {
       return "messageId must be a plain identifier (letters, digits, dot, underscore, colon or hyphen) — anything else could rewrite the URL it is substituted into";
     }
-    const parsed = parseUrl(
-      profile.statusEndpoint.split("{id}").join(encodeURIComponent(args.messageId)),
-    );
-    if (typeof parsed === "string")
-      return `provider "${args.provider}" has an unusable statusEndpoint`;
+    if (isDotSegment(args.messageId)) {
+      return `messageId "${args.messageId}" is a relative path segment, not an id — substituted into the status URL it would read a different endpoint (a message list, or the API root), so nothing was sent`;
+    }
+    const substituted = substituteIntoUrl(profile.statusEndpoint, "{id}", args.messageId);
+    if (!substituted.ok) {
+      return substituted.why === "invalid"
+        ? `provider "${args.provider}" has an unusable statusEndpoint`
+        : `messageId "${args.messageId}" would change which endpoint the status URL addresses, not just name the message — nothing was sent`;
+    }
+    const parsed = substituted.url;
 
     const headers: Record<string, string> = {};
-    const applied = applyAuth(headers, profile.auth);
+    const applied = applyAuth(headers, profile.auth, providerAuthEnvs(profile));
     if (!applied.ok) return applied.message;
 
     const cfgForCall: NotifyConfig = cfg;
@@ -2124,7 +2444,12 @@ export const deliveryCheck: RegisteredTool = buildTool({
         redirect: "follow",
         credentialHeaders: applied.secretHeaders,
       });
-      const capped = await readCapped(opened.res, args.maxBytes ?? DEFAULT_MAX_BYTES);
+      const capped = await readCapped(
+        opened.res,
+        args.maxBytes ?? DEFAULT_MAX_BYTES,
+        deadline.signal,
+        applied.secrets,
+      );
       let parsedBody: unknown;
       try {
         parsedBody = JSON.parse(capped.text);
@@ -2306,6 +2631,7 @@ function describeDkim(answer: DkimAnswer): Record<string, unknown> {
 
 export const deliverabilityCheck: RegisteredTool = buildTool({
   name: "DeliverabilityCheck",
+  operativeArgs: [{ field: "domain", kind: "recipient" }],
   description:
     "Read what a sending domain publishes about itself in public DNS — its SPF record, its DMARC policy, and the DKIM key record at each selector you name — and report what each one says. Use it to answer why mail from a domain is being refused or filtered, or to check a domain before a campaign leans on it. It reports facts rather than a score, because the facts differ in what you do next: no DMARC record at all and a DMARC record with p=none are the same score and completely different situations, and a lookup that failed is a third thing again — reported as unknown with its reason, never as 'nothing published'. It does NOT verify a message's DKIM signature: that needs canonicalisation this package does not implement, and a partial check that can answer 'pass' is worse than no check. Only domains an operator put in allowed_sender_domains are looked up.",
   inputSchema: z.object({
@@ -2565,11 +2891,9 @@ export const quietHours: RegisteredTool = buildTool({
       };
       now: string;
     };
-    const now = new Date(args.now);
-    if (Number.isNaN(now.getTime())) {
-      return `"${args.now}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T03:14:00Z`;
-    }
-    const decision = quietDecision(args.schedule as QuietSchedule, now.getTime());
+    const now = parseOffsetInstant(args.now, "2026-09-17T03:14:00Z");
+    if (!now.ok) return now.message;
+    const decision = quietDecision(args.schedule as QuietSchedule, now.ms);
     if ("error" in decision) return decision.error;
     return json(decision);
   },
@@ -2584,7 +2908,9 @@ export const rateLimitGate: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(500)
-      .describe("what is being rate-limited: an alert name, a host, a customer id"),
+      .describe(
+        'what is being rate-limited: an alert name, a host, a customer id (any string except "__proto__", which a JSON state record cannot hold)',
+      ),
     now: z
       .string()
       .min(1)
@@ -2625,14 +2951,19 @@ export const rateLimitGate: RegisteredTool = buildTool({
       mode?: "consume" | "peek";
       state?: RateState;
     };
-    const now = new Date(args.now);
-    if (Number.isNaN(now.getTime())) {
-      return `"${args.now}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T03:14:00Z`;
+    const now = parseOffsetInstant(args.now, "2026-09-17T03:14:00Z");
+    if (!now.ok) return now.message;
+    // The state is a JSON record, and a JSON record cannot carry this one
+    // key back: the input parser drops an own "__proto__" key, so the entry
+    // this call wrote would be gone on the next call and the gate would say
+    // "allowed" every time. Refused, so the gate never fails open.
+    if (args.key === "__proto__") {
+      return 'the key "__proto__" cannot be kept in a JSON state record, so it could never be limited — choose another, e.g. prefix it as "alert:__proto__"';
     }
     return json(
       evaluateRateLimit({
         key: args.key,
-        nowMs: now.getTime(),
+        nowMs: now.ms,
         windowMs: args.windowMs,
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(args.mode !== undefined ? { mode: args.mode } : {}),
@@ -2674,7 +3005,10 @@ export const messageTemplate: RegisteredTool = buildTool({
       platform: Platform;
       maxLength?: number;
     };
-    const template = args.templates[args.name];
+    // Own names only: "constructor" or "toString" is not a template.
+    const template = Object.hasOwn(args.templates, args.name)
+      ? args.templates[args.name]
+      : undefined;
     if (template === undefined) {
       const known = Object.keys(args.templates).sort(byString);
       return known.length === 0

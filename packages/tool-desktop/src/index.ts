@@ -47,7 +47,10 @@
  * drives all of them, and the un-injected platform is deliberately a platform
  * no backend serves — see `./host.ts`.
  */
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -60,7 +63,7 @@ import {
   planClipboardWrite,
 } from "./lib/clipboard";
 import { osascriptProgramText } from "./lib/escape";
-import { fs } from "./lib/fsseam";
+import { fs, StateFileError } from "./lib/fsseam";
 import { type NotifyUrgency, classifyNotify, planNotify } from "./lib/notify";
 import {
   OPENABLE_SCHEMES,
@@ -75,12 +78,13 @@ import {
   type AssertionScope,
   type AssertionState,
   DEFAULT_HOLD_MINUTES,
+  LEGACY_STATE_RELATIVE_PATH,
   MAX_HOLD_MINUTES,
   SAFE_REASON,
-  STATE_RELATIVE_PATH,
   boundedSeconds,
   classifyLiveness,
   isAssertionState,
+  isHolderCommand,
   planHold,
   planProcessProbe,
   planRelease,
@@ -100,6 +104,7 @@ import {
   MAX_COPIES,
   classifyPrint,
   parseQueues,
+  parseWindowsQueues,
   planPrint,
   planPrinterProbe,
   refusePrintOptions,
@@ -195,8 +200,9 @@ const MAX_CLIPBOARD_MAX_CHARS = 1_000_000;
 
 export const clipboardRead: RegisteredTool = buildTool({
   name: "ClipboardRead",
+  operativeArgs: [],
   description:
-    'Read the operator\'s system clipboard as text. WHAT THE CALLER TAKES ON: the clipboard is where people put a password, a recovery code or an API key for the seconds between copying and pasting it, and whatever is on it when this runs is returned verbatim into the model\'s context, from there into the conversation transcript, and from there into any log or trace the harness keeps. This tool does NOT scan for or redact secrets: a heuristic that catches some patterns and misses others earns trust it cannot honour, and the caller who relied on it pastes the one it missed into a ticket. Ask only when the operator has been told to copy something for you, and treat the result as sensitive for the rest of the run. Four distinct outcomes, never conflated: "read" with the text, "empty" (the clipboard was reachable and holds nothing), "noTextFlavour" (it holds something — an image, a file — that has no text form), and "unavailable" with a reason when there was no clipboard to ask (no desktop session, no backend program, an unsupported platform). An empty clipboard and an unreadable one are never reported as the same thing.',
+    'Read the operator\'s system clipboard as text. Use it only when the operator has been told to copy something for you. WHAT THE CALLER TAKES ON: the clipboard is where people keep a password, a recovery code or an API key for the seconds between copying and pasting it, and whatever is on it is returned verbatim into the model\'s context, the transcript, and any log or trace the harness keeps. This tool does NOT scan for or redact secrets: a heuristic that catches some and misses others earns trust it cannot honour. Treat the result as sensitive for the rest of the run. Four outcomes, never conflated: "read" with the text; "empty" (reachable, holds nothing); "noTextFlavour" (it holds something with no text form, such as an image or a file); and "unavailable" with a reason when there was no clipboard to ask (no desktop session, no backend program, an unsupported platform).',
   inputSchema: z.object({
     format: z
       .enum(["text", "html"])
@@ -305,6 +311,7 @@ export const clipboardRead: RegisteredTool = buildTool({
 
 export const clipboardWrite: RegisteredTool = buildTool({
   name: "ClipboardWrite",
+  operativeArgs: [],
   description:
     "Put text on the operator's system clipboard, replacing whatever was there. Declared destructive because that replacement cannot be undone: the thing the operator had copied a moment ago is gone, and there is no clipboard history to restore it from. The payload is piped to the backend on STDIN and never appears as a command argument, because argv is world-readable through a process listing on every platform here. Use dryRun to see which backend and argument list would be used without writing anything. On X11 the writing process owns the selection and must outlive this call, which xclip handles by forking its own resident holder — so on Linux the content survives this tool returning, but not the X session ending.",
   inputSchema: z.object({
@@ -392,6 +399,7 @@ const MAX_NOTIFY_FIELD = 2_000;
 
 export const desktopNotify: RegisteredTool = buildTool({
   name: "DesktopNotify",
+  operativeArgs: [],
   description:
     'Show a notification on the operator\'s desktop — a macOS notification, a FreeDesktop notification on Linux, a toast on Windows. The title, body and subtitle may contain anything at all: on macOS they travel as argv items that the AppleScript reads with `item N of argv`, so a body containing quotes or semicolons is displayed rather than executed, and on Windows they are XML-escaped into a document that crosses to PowerShell through the environment rather than as source. The result says "dispatched", not "shown": every one of these APIs accepts a notification and returns, and whether a human saw it depends on Do Not Disturb, a Focus mode and whether the screen is on — none of which is observable from here. A host with no notification daemon, no display session or no notifier installed is reported as unavailable with the reason.',
   inputSchema: z.object({
@@ -477,7 +485,8 @@ export const desktopNotify: RegisteredTool = buildTool({
 
 export const openExternal: RegisteredTool = buildTool({
   name: "OpenExternal",
-  description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop. The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did.`,
+  operativeArgs: [{ field: "target", kind: "url" }],
+  description: `Ask the operating system to open a URL or a workspace file with its registered handler. Use it to show the operator a page or a file. Only ${OPENABLE_SCHEMES.join(", ")} are accepted, and allowSchemes can only narrow that; file:, smb:, nfs:, javascript:, data: and the Windows ms-* handlers are refused by name. An http(s) URL is handed off normalised; one with a backslash or credentials before the "@" is refused, and a mailto: may carry only RFC 6068's safe headers (attach= is refused). A target with no scheme is a path, resolved inside the workspace with symlinks followed and refused outside it; an executable file is refused, and so is a type the desktop runs, installs or follows (scripts, installers, configuration profiles, shortcut and location files). The result says "handedOff", not "opened": no opener reports what the handler did. What opens acts in the operator's desktop session, with their cookies, and outlives this call, so every call is gated like a change and carries a justification.`,
   inputSchema: z.object({
     target: z
       .string()
@@ -497,6 +506,21 @@ export const openExternal: RegisteredTool = buildTool({
     timeoutMs: timeoutSchema,
   }),
   readOnly: false,
+  // The effect outlives the call and the process — the package's own test for
+  // "destructive" (see PowerAssertion): an app is launched, a tab opens with
+  // the operator's cookies. As destructive:false it ran with no rule at all
+  // in auto mode, so a workspace .fileloc could launch any app unasked
+  // (flag-truth-5#6). A destructive tool that goes where the model points
+  // also carries a justification (apps/cli/src/flag-rules.test.ts, rule 1):
+  // opening `https://host/?q=<secret>` in the operator's browser is an
+  // outbound request like HttpRequest's. The justification gate runs AFTER
+  // the permission decision, so an `alwaysAllow` OpenExternal rule no longer
+  // skips it: every call is scored by `security.justification.judge`, or,
+  // when a spec sets none, by the rule-based judge (with its one-time
+  // stderr warning), which denies a justification that shares no salient
+  // word with the instructions.
+  destructive: true,
+  requireJustification: true,
   concurrencySafe: false,
   scope: "external",
   ioCapability: "process",
@@ -591,6 +615,7 @@ export const openExternal: RegisteredTool = buildTool({
 
 export const printDocument: RegisteredTool = buildTool({
   name: "PrintDocument",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     'Send a local file to a printer through CUPS (macOS and Linux) or to a Windows queue. The queue is probed with lpstat FIRST, on both the dry run and the real print, so the two resolve through the same code and a dry run is a prefix of the real thing rather than a separate prediction. That probe is also what keeps the answers apart: a host whose scheduler is not running prints nothing and lists nothing, which looks exactly like a host with no printers, and the two are reported differently. Declared destructive because paper and toner do not come back. On Windows the honest scope is narrow and stated rather than papered over: Out-Printer sends TEXT to a queue and cannot rasterise a PDF or an image, and it has no copies, duplex or page-range option — asking for one there is refused by name instead of silently dropped. Printer names and page ranges are matched against closed patterns and refused if they do not fit, because lp documents no "--" and a destination beginning with "-" would become an option.',
   inputSchema: z.object({
@@ -678,12 +703,14 @@ export const printDocument: RegisteredTool = buildTool({
       probe.refused === true || probe.missing || probe.timedOut
         ? unreadableQueues(
             probe.missing
-              ? "lpstat is not installed on this host, so the queue could not be read"
+              ? `${platform === "win32" ? "PowerShell" : "lpstat"} is not installed on this host, so the queue could not be read`
               : probe.timedOut
                 ? "the queue probe did not finish within its timeout and was killed, so whether this host has printers is unknown — it is NOT that it has none"
                 : probe.stderr,
           )
-        : parseQueues(probe.stdout, probe.stderr);
+        : platform === "win32"
+          ? parseWindowsQueues(probe.stdout, probe.stderr)
+          : parseQueues(probe.stdout, probe.stderr);
 
     const queueJson = {
       printers: queues.printers,
@@ -736,6 +763,7 @@ export const printDocument: RegisteredTool = buildTool({
 
 export const windowList: RegisteredTool = buildTool({
   name: "WindowList",
+  operativeArgs: [],
   description:
     "List the windows open on the operator's desktop, with the app, title and — where the backend can supply them — position and size. It never answers an empty list for a failure: a macOS host that has not granted Accessibility comes back as unavailable naming that grant in System Settings, a Wayland session comes back as unavailable explaining that Wayland provides no protocol for one client to enumerate another's windows (there is nothing to install that would fix it), a missing wmctrl comes back as unavailable naming the package, and a stream cut at the output cap is reported as truncated so the list is read as a prefix rather than as the whole desktop. Fields a backend cannot supply are null rather than zero or false — wmctrl reports no focus state, so every window's focused is null rather than a claim that nothing has focus.",
   inputSchema: z.object({ timeoutMs: timeoutSchema }),
@@ -788,6 +816,7 @@ const DEFAULT_IDLE_THRESHOLD_SECONDS = 300;
 
 export const userPresence: RegisteredTool = buildTool({
   name: "UserPresence",
+  operativeArgs: [],
   description:
     "Report whether a human is likely at this machine: seconds since the last input, whether the screen is locked, and what kind of session this is (console, ssh or headless). Every field is separately nullable and a null always carries an entry in `unknown` naming the probe that failed, because the tempting fallbacks here invert the tool's purpose — reporting idle:false when nothing could be asked tells a workflow the operator is at the keyboard, and reporting idle:true tells it the opposite and sends it off to act unattended. macOS reads idle time out of the IOKit registry, in nanoseconds, and lock state from the same dump; Linux needs xprintidle (usually not installed, and unavailable under Wayland, which exposes no idle query at all) and reads logind's LockedHint, which is a HINT a screen locker has to set and some do not; Windows uses GetLastInputInfo and the presence of LogonUI. An ssh session reports sessionKind \"ssh\" and does not pretend the far end's idle time says anything about the person typing.",
   inputSchema: z.object({
@@ -910,8 +939,37 @@ export const userPresence: RegisteredTool = buildTool({
 // PowerAssertion
 // ---------------------------------------------------------------------------
 
+/**
+ * Where the held assertion is remembered: a file only this user can write,
+ * OUTSIDE the workspace, keyed by the workspace.
+ *
+ * 0.7.0 kept it at `.crewhaus/power-assertion.json` in the workspace, where
+ * the agent the tool serves can write, and `release` SIGTERMs the pid the
+ * record names (security-10#1). The directory is `$XDG_RUNTIME_DIR/crewhaus`
+ * when the session has one (Linux: per-user, 0700, cleared at logout), else
+ * `crewhaus-<uid>` under the OS temp directory (per-user on macOS and
+ * Windows), created 0700 and refused if another user owns it. The file name
+ * carries a hash of the workspace root, so two workspaces never share one.
+ */
+export function powerStateFile(): string {
+  const runtime = process.env["XDG_RUNTIME_DIR"];
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const dir =
+    runtime !== undefined && runtime !== "" && isAbsolute(runtime)
+      ? join(runtime, "crewhaus")
+      : join(tmpdir(), uid === undefined ? "crewhaus" : `crewhaus-${uid}`);
+  let root = workspaceRoot();
+  try {
+    root = realpathSync(root);
+  } catch {
+    // keep the lexical root
+  }
+  const key = createHash("sha256").update(root).digest("hex").slice(0, 16);
+  return join(dir, `power-assertion-${key}.json`);
+}
+
 function statePath(): string {
-  return join(workspaceRoot(), STATE_RELATIVE_PATH);
+  return powerStateFile();
 }
 
 /**
@@ -928,7 +986,13 @@ type StateRead =
   | { readonly kind: "unreadable"; readonly reason: string };
 
 function readState(): StateRead {
-  const text = fs().readText(statePath());
+  let text: string | undefined;
+  try {
+    text = fs().readText(statePath());
+  } catch (err) {
+    if (!(err instanceof StateFileError)) throw err;
+    return { kind: "unreadable", reason: err.message };
+  }
   if (text === undefined) return { kind: "none" };
   let parsed: unknown;
   try {
@@ -952,6 +1016,7 @@ function readState(): StateRead {
 
 export const powerAssertion: RegisteredTool = buildTool({
   name: "PowerAssertion",
+  operativeArgs: [],
   description: `Hold a BOUNDED sleep inhibitor around a long step, release it, or report on one. The deadline is mandatory and is not enforced by this process: caffeinate exits at its own -t, systemd-inhibit releases when its sleep returns, and the Windows holder parks for a fixed Start-Sleep — so killing the whole harness still ends the assertion on time, which an in-process reaper could not promise. Every result says when the assertion expires. The maximum is ${MAX_HOLD_MINUTES} minutes and the default is ${DEFAULT_HOLD_MINUTES}. A held assertion is remembered in a state file, and release verifies that the recorded pid is still running THIS package's holder before signalling anything: pids are reused, and a stale file must never become a SIGTERM to whatever now owns that number. A probe that could not run at all leaves the state alone and reports "unknown" rather than assuming the holder is gone.`,
   inputSchema: z.object({
     action: z
@@ -1008,7 +1073,7 @@ export const powerAssertion: RegisteredTool = buildTool({
         ...head,
         outcome: "unreadableState",
         reason: `${stateRead.reason} — so this package cannot say whether an inhibitor it started is still running. Nothing was signalled and nothing was started; any holder recorded there still ends at its own deadline. Delete the file to start again.`,
-        statePath: STATE_RELATIVE_PATH,
+        statePath: statePath(),
       });
     }
     const state = stateRead.kind === "state" ? stateRead.state : undefined;
@@ -1016,11 +1081,33 @@ export const powerAssertion: RegisteredTool = buildTool({
     const liveness = async (
       recorded: AssertionState,
     ): Promise<{ verdict: ReturnType<typeof classifyLiveness>; argv: readonly string[] }> => {
+      // A record made on another platform cannot name a holder of ours here:
+      // it is somebody else's pid, whatever that process is running.
+      if (recorded.platform !== platform) return { verdict: "reused", argv: [] };
       const probeRequest = planProcessProbe(platform, recorded.pid);
       if (probeRequest === undefined) return { verdict: "unknown", argv: [] };
       const probe = await run(probeRequest, timeoutMs, context?.signal);
-      return { verdict: classifyLiveness(recorded.marker, probe), argv: probeRequest.argv };
+      // The live command line is checked against what THIS package starts on
+      // this platform, never against the record's own `marker` field: the
+      // record supplies the pid, so it must not also choose what that pid is
+      // checked against (security-10#1).
+      return {
+        verdict: classifyLiveness((line) => isHolderCommand(platform, line), probe),
+        argv: probeRequest.argv,
+      };
     };
+
+    // 0.7.0's record in the workspace is never read (the agent could have
+    // written it), only mentioned, so an operator who upgraded mid-hold knows
+    // why release finds nothing and that the holder ends on its own.
+    const legacyNote = (): Record<string, unknown> =>
+      fs().stat(join(workspaceRoot(), LEGACY_STATE_RELATIVE_PATH))?.exists === true
+        ? {
+            legacyStateFile: LEGACY_STATE_RELATIVE_PATH,
+            legacyNote:
+              "a record from an earlier version is in the workspace. It is not read, because the agent can write files there; nothing it names is signalled, and any holder it recorded ends at its own deadline. Delete the file.",
+          }
+        : {};
 
     const stateJson = (recorded: AssertionState): Record<string, unknown> => ({
       pid: recorded.pid,
@@ -1034,7 +1121,12 @@ export const powerAssertion: RegisteredTool = buildTool({
 
     if (input.action === "status") {
       if (state === undefined) {
-        return json({ ...head, outcome: "none", reason: "this package is holding no assertion" });
+        return json({
+          ...head,
+          outcome: "none",
+          reason: "this package is holding no assertion",
+          ...legacyNote(),
+        });
       }
       const { verdict, argv } = await liveness(state);
       const expired = now() >= state.expiresAt;
@@ -1068,7 +1160,12 @@ export const powerAssertion: RegisteredTool = buildTool({
 
     if (input.action === "release") {
       if (state === undefined) {
-        return json({ ...head, outcome: "none", reason: "this package is holding no assertion" });
+        return json({
+          ...head,
+          outcome: "none",
+          reason: "this package is holding no assertion",
+          ...legacyNote(),
+        });
       }
       const { verdict, argv } = await liveness(state);
       if (verdict === "unknown") {
@@ -1084,23 +1181,30 @@ export const powerAssertion: RegisteredTool = buildTool({
           probe: argv.join(" "),
         });
       }
+      // A dry run changes nothing, the record included.
+      const dry = input.dryRun === true;
       if (verdict === "gone") {
-        fs().remove(statePath());
+        if (!dry) fs().remove(statePath());
         return json({
           ...head,
           outcome: "expired",
           ...stateJson(state),
-          reason: "the holder had already ended; the recorded assertion was cleared",
+          reason: dry
+            ? "the holder has already ended; a real release would clear the recorded assertion"
+            : "the holder had already ended; the recorded assertion was cleared",
         });
       }
       if (verdict === "reused") {
-        fs().remove(statePath());
+        if (!dry) fs().remove(statePath());
         return json({
           ...head,
           outcome: "stale",
           ...stateJson(state),
-          reason:
-            "a process with the recorded pid exists but is not this package's holder, so the pid was reused — NOTHING was signalled and the recorded assertion was cleared",
+          reason: `${
+            state.platform !== platform
+              ? `the record was made on ${state.platform}, not ${platform}, so its pid is not a holder of this package's`
+              : "a process with the recorded pid exists but is not this package's holder, so the pid was reused"
+          } — NOTHING was signalled and the recorded assertion ${dry ? "would be" : "was"} cleared`,
         });
       }
       const killRequest = planRelease(platform, state.pid);
@@ -1208,7 +1312,23 @@ export const powerAssertion: RegisteredTool = buildTool({
       expiresAt,
       reason: input.reason ?? null,
     };
-    fs().writeTextAtomic(statePath(), JSON.stringify(recorded));
+    try {
+      fs().writeTextAtomic(statePath(), JSON.stringify(recorded));
+    } catch (err) {
+      if (!(err instanceof StateFileError)) throw err;
+      // The holder is running and bounded; only the record is missing.
+      return json({
+        ...head,
+        outcome: "heldUnrecorded",
+        backend: plan.backend,
+        scope,
+        pid: detached.pid,
+        seconds: bounded.seconds,
+        startedAt: new Date(startedAt).toISOString(),
+        expiresAt: new Date(expiresAt).toISOString(),
+        reason: `${err.message} — the inhibitor is held and still ends at its own deadline, but release cannot end it sooner`,
+      });
+    }
     return json({
       ...head,
       outcome: "held",

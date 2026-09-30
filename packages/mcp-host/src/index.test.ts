@@ -224,6 +224,45 @@ describe("McpClient — happy path with in-process server", () => {
     expect(client.getState().kind).toBe("closed");
   });
 
+  test("a tool's trust hints come through as booleans; the rest of its annotations do not (0.7.1)", async () => {
+    const fixture = createInProcessServer({
+      tools: [
+        {
+          name: "delete_repo",
+          inputSchema: { type: "object" },
+          annotations: { title: "Delete", destructiveHint: true, openWorldHint: true },
+        } as { name: string; inputSchema: unknown },
+        {
+          name: "list_repos",
+          inputSchema: { type: "object" },
+          annotations: { readOnlyHint: true, idempotentHint: true },
+        } as { name: string; inputSchema: unknown },
+        { name: "plain", inputSchema: { type: "object" } },
+      ],
+    });
+    const client = new McpClient("t", cfg, {
+      transportFactory: () => fixture.transport,
+      clientFactory: (info) => new Client(info, { capabilities: {} }),
+    });
+    await client.connect();
+    const tools = await client.listTools();
+    expect(tools.map((t) => [t.name, t.annotations])).toEqual([
+      ["delete_repo", { destructiveHint: true }],
+      ["list_repos", { readOnlyHint: true }],
+      ["plain", undefined],
+    ]);
+    // A tool without hints carries no `annotations` key at all.
+    expect(Object.keys(tools[2] ?? {})).not.toContain("annotations");
+    await client.disconnect();
+  });
+
+  test("the spec's tool_flags ride on the config, and the client exposes them (0.7.1)", () => {
+    const toolFlags = { defaults: { destructive: true as const } };
+    const client = new McpClient("t", { ...cfg, toolFlags });
+    expect(client.toolFlags).toEqual(toolFlags);
+    expect(new McpClient("u", cfg).toolFlags).toBeUndefined();
+  });
+
   test("isError result surfaces as { isError: true, content }", async () => {
     const fixture = createInProcessServer({
       tools: [{ name: "broken", inputSchema: { type: "object" } }],

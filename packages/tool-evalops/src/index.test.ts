@@ -178,7 +178,9 @@ test("an unreadable baselines file does not stop a history, and no run is marked
   expect(out["ok"]).toBe(true);
   // Without this line the absence of a pinned mark would read as "nothing is
   // pinned" rather than "the pins could not be read".
-  expect(String(out["baselinesUnreadable"])).toMatch(/could not be parsed/);
+  expect(String(out["baselinesUnreadable"])).toMatch(
+    /could not be parsed \(it is not valid JSON: Expected '}'\)/,
+  );
   const points = ((out["lineages"] as Json[])[0]?.["segments"] as Json[])[0]?.["points"] as Json[];
   expect(points[0]?.["pinned"]).toBeUndefined();
 });

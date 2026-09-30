@@ -109,6 +109,20 @@ describe("eligibleCandidates", () => {
     expect(r.excluded.map((e) => e.reason)).toEqual(["disabled", "breaker-open", "cost-cap-spent"]);
   });
 
+  test("a candidate sent more tools than its provider accepts sits out on every turn (provider-limits#0)", () => {
+    const roster: EligibilityCandidate[] = [
+      { armId: "over", toolLimit: { toolCount: 129, maxTools: 128 } },
+      { armId: "at", toolLimit: { toolCount: 128, maxTools: 128 } },
+      { armId: "unlimited" },
+    ];
+    // Whatever the turn needs, the over-limit arm cannot be sent its tools.
+    for (const turn of [{}, { toolsInPlay: false }, { hasImages: false }]) {
+      const r = eligibleCandidates(roster, turn);
+      expect(r.eligible).toEqual(["at", "unlimited"]);
+      expect(r.excluded).toEqual([{ armId: "over", reason: "tool-limit" }]);
+    }
+  });
+
   test("a profile whose own requires its model cannot meet is ineligible", () => {
     const r = eligibleCandidates(
       [{ armId: "x", capabilities: { features: LOCAL }, requires: { vision: true } }],
