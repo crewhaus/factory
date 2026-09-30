@@ -62,7 +62,8 @@ built it.
   is just that file, and Grep skips hidden names, so `alwaysDeny Grep(.env)`
   still leaves everyday searches alone.
 - **A rule reads everything a call can reach.** A Glob pattern stands for
-  every path it can list (`alwaysDeny Glob(secrets/**)` stops `**/*`). A path
+  every path it can list, including a hidden name it spells out
+  (`alwaysDeny Glob(secrets/**)` stops `**/*` and `*/.env`). A path
   given to a git tool is literal, so `secret*` cannot reach around a deny on
   `secrets/**`. A KvList prefix stands for every key that starts with it. A
   GitHub or GitLab search is scoped by its `owner` and `repo`, and a deny on a
@@ -316,7 +317,8 @@ built it.
   the cli shape and failed elsewhere with `unknown tool`. Every shape now
   reads one builtin table. cf-worker runs its edge-safe set and says which
   tools it leaves out (`edge-unsafe-tool`). Voice, onchain and onchain-game
-  accept `tools:` but do not wire it yet, and say so (`accepted-but-unwired`).
+  accept `tools:` and `tool_config:` but do not wire them yet, and say so
+  (`accepted-but-unwired`, an error under `--strict`).
 - **`crewhaus eval` and `crewhaus optimize` run specs that use the new
   tools**, with the tools and `tool_config` the compiled bundle uses, instead
   of stopping with a stack trace. A bridged eval of a channel spec with
@@ -356,7 +358,10 @@ built it.
   tools, `erc20Balance`, `erc721TokenInfo`, TokenResolve's on-chain check,
   and on graph, workflow and crew the `evm*` readers and `evmSimulate`, take
   their RPC from the spec's `chains` block. Without one they refuse and name
-  the block to write, and compile warns (`tool-unwired`).
+  the block to write, and compile warns (`tool-unwired`). A graph, workflow
+  or crew bundle that lists an EVM tool reads the `chains` block's `$VAR`s
+  when it starts, and stops if one is unset; on 0.7.0 it started, and those
+  tools failed on every call.
 - **VectorDelete deletes from the store `tool_config.vectorDelete` names**,
   and `erc721TokenInfo` reads metadata from the origins
   `tool_config.token.metadata_origins` allows. Both refused every call.
@@ -491,7 +496,8 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   plugin may register it) gets a note, never a fix, and an allow is never
   "corrected" into a tool that can change or delete things.
 - **`crewhaus lint` agrees with `compile` about tools**, and knows the tools
-  a `thredz:` block adds. `lint --fix` edits only the fields it fixes, inside
+  a `thredz:` block adds. It also reports a key the spec's shape accepts but
+  does not wire (`accepted-but-unwired`), which it used to call clean. `lint --fix` edits only the fields it fixes, inside
   `tools:` lists compile reads, never prompt text or a `$profile` reference,
   and says when it skipped a file that is not valid YAML.
 - **`crewhaus permissions suggest` proposes rules scoped to what was
@@ -612,9 +618,13 @@ deny, warn or fail `--strict`; each says what to write instead.
   tools still register.
 - **`tool_config` is now applied, so it is now checked.** Two different
   blocks for one package are an error. A key no listed tool reads is
-  `tool-config-unused` (an error under `--strict`). An allow-list entry that
-  is not an origin, or a key the tool refuses, is reported at compile, and
-  anything else a tool refuses stops the harness at start. A value written
+  `tool-config-unused` (an error under `--strict`); for a `tool_config.mcp`
+  block, which never did anything, the warning says where its `destructive`
+  and `requireJustification` flags go:
+  `mcp_servers.<server>.tool_flags.per_tool.<tool>`. An allow-list entry that
+  is not an origin, or a key the tool refuses, is reported at compile, with
+  `--emit-as cf-worker` too, where it used to emit a worker that failed to
+  load. Anything else a tool refuses stops the harness at start. A value written
   `$UPPER_SNAKE` is read from the environment: set the variable, or a spec
   that meant the text literally stops at start. A credential written
   `${API_KEY}` or `$api_key` is refused (write `$API_KEY`), and cf-worker
@@ -622,14 +632,14 @@ deny, warn or fail `--strict`; each says what to write instead.
   JavaScript and Shell; give Fetch, WebFetch and ImageGenerate their own
   blocks.
 - **A tool list longer than every model in the spec can take fails
-  compile.** Azure OpenAI and Groq accept 128 tools per request and Gemini
-  512; `tools: [all-code]` is over 128. Narrow it with smaller
-  `all-<category>` roll-ups or `-tool` exclusions. For an `openai/` model it
-  is a note, since `OPENAI_BASE_URL` may point at a server that takes more,
-  and the run stops at start, before any model call, if the list goes to
-  api.openai.com. When only a fallback, tier or pool model is over its limit,
-  compile notes it and a pool never routes a turn to that model. On 0.7.0
-  every call of such a spec failed.
+  compile.** Azure OpenAI and Groq accept 128 tools per request, and Gemini
+  (on Vertex AI too) 512; `tools: [all-code]` is over 128. Narrow it with
+  smaller `all-<category>` roll-ups or `-tool` exclusions. For an `openai/`
+  model it is a note, since `OPENAI_BASE_URL` may point at a server that
+  takes more, and the run stops at start, before any model call, if the list
+  goes to api.openai.com. When only a fallback, tier or pool model is over
+  its limit, compile notes it and a pool never routes a turn to that model.
+  Neither note fails `--strict`. On 0.7.0 every call of such a spec failed.
 - **`evmSendTransaction` warns `tool-unwired`** (an error under `--strict`):
   no custody provider that can sign ships in this release, so every call
   failed. Remove it; `evmSimulate` runs the same transaction without signing.
@@ -641,8 +651,9 @@ deny, warn or fail `--strict`; each says what to write instead.
     remove it from the sub-agent.
   - `edge-unsafe-tool`: `compile --emit-as cf-worker` names each builtin the
     edge leaves out. Remove it, or compile for Bun.
-  - `accepted-but-unwired` on onchain and onchain-game, as on voice: their
-    `tools:` and `tool_config:` are not wired yet. Remove them.
+  - `accepted-but-unwired` for `tools:` and `tool_config:` on onchain and
+    onchain-game, and for `tool_config:` on voice: none of them is wired yet.
+    Remove them. `crewhaus lint` reports these too.
 - **A `tools:` entry named after a JavaScript built-in** (`constructor`,
   `all-toString`) is refused as unknown. It compiled to a bundle with no tools
   or a broken import.
@@ -656,6 +667,9 @@ deny, warn or fail `--strict`; each says what to write instead.
   `notAfter`. Write `2026-09-17T23:30:00Z` or `2026-09-17T23:30:00+01:00`.
   CronList reads an offset-less `now` in the `timeZone` you give, UTC by
   default, and HarnessJobStatus reads an offset-less `since` as UTC.
+- **A bundle that reads a chain needs its RPC variables at start.** A graph,
+  workflow or crew bundle that lists an EVM tool stops at start when a
+  `$VAR` in the `chains` block is unset. Set it where the bundle runs.
 - **Git tools need the harness to own its repository.** Run the harness from
   the repository's top level, or give it its own repository.
 - **Some edits are for people, not tools.** SpecPatchApply refuses prompts,
