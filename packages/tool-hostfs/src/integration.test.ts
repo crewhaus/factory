@@ -128,7 +128,10 @@ describe("dispatch through executeTool", () => {
   }, 15_000);
 });
 
-describe("the loop the package closes", () => {
+// The loop trashes through the FreeDesktop backend, which never runs on
+// Windows and whose checks (uid, modes, the sticky bit) mean nothing on NTFS;
+// see describePosixBackend in index.test.ts.
+describe.skipIf(process.platform === "win32")("the loop the package closes", () => {
   test("watch a directory, trash the file, and see the deletion reported", async () => {
     _setPlatform("linux");
     _setClock(() => FIXED_NOW);

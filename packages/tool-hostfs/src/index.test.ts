@@ -72,6 +72,17 @@ import type { RunRequest, RunResult } from "./run";
  * files these tests create, not an invented one.
  */
 const UID = typeof process.getuid === "function" ? process.getuid() : 1000;
+/**
+ * The macOS and Linux backends, driven through their seams against a REAL
+ * temporary directory. On Windows that directory is `D:\\...`: mdfind and
+ * plocate refuse a search root that is not a POSIX path, and the FreeDesktop
+ * trash's checks (the owner's uid, 0700 modes, the sticky bit, a symlinked
+ * trash) have no meaning on NTFS. Neither backend runs on Windows — TrashPath
+ * and OsIndexSearch refuse the platform, which "platforms it refuses" and
+ * "input and other platforms" test everywhere — so these suites run on macOS
+ * and Linux, and the Windows job runs the rest of the file.
+ */
+const describePosixBackend = describe.skipIf(process.platform === "win32");
 /** Running as root defeats a mode-based unwritable directory; such tests are skipped, not faked. */
 const canTestUnwritable = (process.getuid?.() ?? 0) !== 0;
 const originalCwd = process.cwd();
@@ -909,19 +920,25 @@ describe("WatchPath: what it reports", () => {
     // Which is why ctime is compared too: a permission change moves ctime
     // and nothing else, and a watcher that only looked at mtime would call
     // it nothing.
+    // Read-only, so the change is a real one on Windows too, where a mode
+    // is only the read-only attribute and 0600 would change nothing at all.
     writeFileSync(join(workspace, "perm.txt"), "x");
     scriptedWatcher((emit) => {
-      chmodSync(join(workspace, "perm.txt"), 0o600);
+      chmodSync(join(workspace, "perm.txt"), 0o444);
       emit("rename", "perm.txt");
     });
-    const result = await callJson(watchPath, {
-      path: ".",
-      timeoutMs: 5_000,
-      maxEvents: 1,
-      settleMs: 20,
-    });
-    expect(result["eventCount"]).toBe(1);
-    expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+    try {
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 1,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(1);
+      expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+    } finally {
+      chmodSync(join(workspace, "perm.txt"), 0o644);
+    }
   }, 20_000);
 
   test("a notification naming a path outside the tree is ignored", async () => {
@@ -1074,7 +1091,7 @@ describe("TrashPath: platforms it refuses", () => {
   });
 });
 
-describe("TrashPath: the FreeDesktop move", () => {
+describePosixBackend("TrashPath: the FreeDesktop move", () => {
   test("a file is MOVED into the trash, with a record beside it", async () => {
     const trash = linuxHost();
     writeFileSync(join(workspace, "simple.txt"), "hello\n");
@@ -1173,7 +1190,7 @@ describe("TrashPath: the FreeDesktop move", () => {
   });
 });
 
-describe("TrashPath: the dry run is the same plan", () => {
+describePosixBackend("TrashPath: the dry run is the same plan", () => {
   test("dryRun moves nothing and writes nothing", async () => {
     const trash = linuxHost();
     writeFileSync(join(workspace, "a.txt"), "x");
@@ -1211,7 +1228,7 @@ describe("TrashPath: the dry run is the same plan", () => {
   });
 });
 
-describe("TrashPath: what it refuses to guess", () => {
+describePosixBackend("TrashPath: what it refuses to guess", () => {
   test("the same path twice is refused rather than counted twice", async () => {
     linuxHost();
     writeFileSync(join(workspace, "a.txt"), "x");
@@ -1285,7 +1302,7 @@ describe("TrashPath: what it refuses to guess", () => {
   });
 });
 
-describe("TrashPath: the same-filesystem rule", () => {
+describePosixBackend("TrashPath: the same-filesystem rule", () => {
   /**
    * Report everything under `otherRoot` as living on a different device.
    *
@@ -1635,7 +1652,7 @@ describe("TrashPath: it cannot delete by accident", () => {
 // OsIndexSearch
 // ===========================================================================
 
-describe("OsIndexSearch: macOS", () => {
+describePosixBackend("OsIndexSearch: macOS", () => {
   beforeEach(() => {
     _setPlatform("darwin");
   });
@@ -1774,7 +1791,7 @@ describe("OsIndexSearch: macOS", () => {
   });
 });
 
-describe("OsIndexSearch: Linux", () => {
+describePosixBackend("OsIndexSearch: Linux", () => {
   beforeEach(() => {
     _setPlatform("linux");
   });
@@ -2003,7 +2020,7 @@ describe("the tool contracts", () => {
 // evidence behind it
 // ===========================================================================
 
-describe("TrashPath: the dry run predicts the destination the real call uses", () => {
+describePosixBackend("TrashPath: the dry run predicts the destination the real call uses", () => {
   test("two files with the SAME name in one call get two different destinations", async () => {
     // The preview is the only thing a caller sees before an irreversible
     // move, and it used to promise both of these `files/notes.txt` — because
@@ -2071,7 +2088,7 @@ describe("TrashPath: the dry run predicts the destination the real call uses", (
   });
 });
 
-describe("OsIndexSearch: an answer cut off by the output cap is not a listing", () => {
+describePosixBackend("OsIndexSearch: an answer cut off by the output cap is not a listing", () => {
   test("mdfind: the half path left by the cap is not reported as a match", async () => {
     // A `-0` listing is NUL-SEPARATED. Cut it at the capture ceiling and the
     // last element is whatever fitted of a path — which is inside the root,
@@ -2111,7 +2128,7 @@ describe("OsIndexSearch: an answer cut off by the output cap is not a listing", 
   });
 });
 
-describe("OsIndexSearch: an index state that could not be read is not a miss", () => {
+describePosixBackend("OsIndexSearch: an index state that could not be read is not a miss", () => {
   test("mdutil could not say, so an empty answer says it could not say", async () => {
     // `mdutil -s` answers "Error: unknown indexing state" for anything it
     // cannot report on, and `mdfind` prints nothing and exits 0 for a miss,

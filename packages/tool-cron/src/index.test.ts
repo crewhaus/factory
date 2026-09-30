@@ -817,7 +817,18 @@ describe("CronDelete on a crontab", () => {
   });
 });
 
-describe("CronDelete on launchd", () => {
+/**
+ * A launchd delete addresses `gui/<uid>/<label>`, and with no uid to build
+ * that from the tool refuses before it looks at anything else (see
+ * currentUid in lib/host.ts). Windows has no uid, and it lays the agents
+ * directory out with its own separators, so the delete tests run where a uid
+ * exists; the listing tests, which need neither, run everywhere.
+ */
+const hasUid = typeof process.getuid === "function";
+const describeLaunchdDelete = describe.skipIf(!hasUid);
+const testLaunchdDelete = test.skipIf(!hasUid);
+
+describeLaunchdDelete("CronDelete on launchd", () => {
   const uid = process.getuid?.() ?? 0;
 
   function launchdHost(extra: Handler = () => undefined): Handler {
@@ -994,21 +1005,24 @@ describe("a label is data, not syntax", () => {
     });
   });
 
-  test("a label containing a slash is refused, because it would re-target the domain", async () => {
-    // `launchctl bootout gui/501/<label>` is a PATH into launchd's domain
-    // tree. A label with a slash in it addresses a different domain than the
-    // one that was listed.
-    installRunner(hostWithLabel("com.example/../../system/com.apple.something"));
-    const out = await remove({
-      source: "launchd",
-      id: "com.example/../../system/com.apple.something",
-      dryRun: true,
-    });
-    expect(out["error"]).toContain("refusing a launchd label containing");
-    expect(calls.some((argv) => argv[1] === "bootout")).toBe(false);
-  });
+  testLaunchdDelete(
+    "a label containing a slash is refused, because it would re-target the domain",
+    async () => {
+      // `launchctl bootout gui/501/<label>` is a PATH into launchd's domain
+      // tree. A label with a slash in it addresses a different domain than the
+      // one that was listed.
+      installRunner(hostWithLabel("com.example/../../system/com.apple.something"));
+      const out = await remove({
+        source: "launchd",
+        id: "com.example/../../system/com.apple.something",
+        dryRun: true,
+      });
+      expect(out["error"]).toContain("refusing a launchd label containing");
+      expect(calls.some((argv) => argv[1] === "bootout")).toBe(false);
+    },
+  );
 
-  test("a label that would be read as a flag is refused", async () => {
+  testLaunchdDelete("a label that would be read as a flag is refused", async () => {
     installRunner(hostWithLabel("-w"));
     const out = await remove({ source: "launchd", id: "-w", dryRun: true });
     expect(out["error"]).toContain("starts with");
@@ -1207,44 +1221,47 @@ describe("what the tools say when a probe FAILED", () => {
     expect(out["note"]).not.toContain("did not produce the same set");
   });
 
-  test("a half-finished multi-step delete does not report that nothing happened", async () => {
-    installFs({
-      home: "/home/alice",
-      dirs: { "/home/alice/Library/LaunchAgents": ["one.plist", "two.plist"] },
-    });
-    let plists = 0;
-    installRunner((argv) => {
-      if (argv[0] === "launchctl" && argv[1] === "list") return { stdout: MACOS_LAUNCHCTL_LIST };
-      if (argv[0] === "plutil") {
-        plists += 1;
-        return {
-          stdout: JSON.stringify({
-            Label: plists === 1 ? "com.example.batch.one" : "com.example.batch.two",
-            StartCalendarInterval: { Hour: 3 },
-            ProgramArguments: ["/usr/local/bin/batch"],
-          }),
-        };
-      }
-      // The FIRST bootout succeeds; the second one fails.
-      if (argv[1] === "bootout") {
-        return argv[2]?.endsWith("two") === true
-          ? { exitCode: 1, stderr: "Boot-out failed: 5: Input/output error" }
-          : {};
-      }
-      return {};
-    });
-    const out = await remove({
-      source: "launchd",
-      match: "com.example.batch",
-      allowMultiple: true,
-    });
-    expect(out["ok"]).toBe(false);
-    // The first agent really was unloaded. "deleted: false" alone is a claim
-    // the machine contradicts.
-    expect(out["partial"]).toBe(true);
-    expect(out["completed"]).toEqual(["unload com.example.batch.one"]);
-    expect(out["error"]).toContain("HAD already taken effect");
-  });
+  testLaunchdDelete(
+    "a half-finished multi-step delete does not report that nothing happened",
+    async () => {
+      installFs({
+        home: "/home/alice",
+        dirs: { "/home/alice/Library/LaunchAgents": ["one.plist", "two.plist"] },
+      });
+      let plists = 0;
+      installRunner((argv) => {
+        if (argv[0] === "launchctl" && argv[1] === "list") return { stdout: MACOS_LAUNCHCTL_LIST };
+        if (argv[0] === "plutil") {
+          plists += 1;
+          return {
+            stdout: JSON.stringify({
+              Label: plists === 1 ? "com.example.batch.one" : "com.example.batch.two",
+              StartCalendarInterval: { Hour: 3 },
+              ProgramArguments: ["/usr/local/bin/batch"],
+            }),
+          };
+        }
+        // The FIRST bootout succeeds; the second one fails.
+        if (argv[1] === "bootout") {
+          return argv[2]?.endsWith("two") === true
+            ? { exitCode: 1, stderr: "Boot-out failed: 5: Input/output error" }
+            : {};
+        }
+        return {};
+      });
+      const out = await remove({
+        source: "launchd",
+        match: "com.example.batch",
+        allowMultiple: true,
+      });
+      expect(out["ok"]).toBe(false);
+      // The first agent really was unloaded. "deleted: false" alone is a claim
+      // the machine contradicts.
+      expect(out["partial"]).toBe(true);
+      expect(out["completed"]).toEqual(["unload com.example.batch.one"]);
+      expect(out["error"]).toContain("HAD already taken effect");
+    },
+  );
 
   test("a systemd fingerprint from CronList still works after the timer has fired", async () => {
     // The round trip the tool documents: list, then delete pinned to the

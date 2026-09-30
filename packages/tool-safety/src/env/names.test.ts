@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import {
   credentialShapeOf,
   isCredentialShapedName,
@@ -181,6 +181,8 @@ describe("looksLikePastedSecret", () => {
  */
 describe("isCredentialShapedName covers every other copy in the repo", () => {
   const repoRoot = join(import.meta.dir, "..", "..", "..", "..");
+  /** A file's path from the repo root, with "/" on every platform (Windows's relative() uses "\\"). */
+  const repoPath = (file: string): string => relative(repoRoot, file).split(sep).join("/");
 
   function sourceFiles(dir: string, out: string[] = []): string[] {
     for (const name of readdirSync(dir)) {
@@ -225,9 +227,9 @@ describe("isCredentialShapedName covers every other copy in the repo", () => {
             const source = m[1] as string;
             if (/KEY/i.test(source) && /TOKEN|SECRET|PASSWORD/i.test(source)) {
               if (source.endsWith("$")) {
-                regexes.push({ file: relative(repoRoot, file), re: new RegExp(source, m[2]) });
+                regexes.push({ file: repoPath(file), re: new RegExp(source, m[2]) });
               } else {
-                scanners.push(relative(repoRoot, file));
+                scanners.push(repoPath(file));
               }
             }
           }

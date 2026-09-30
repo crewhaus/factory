@@ -25,6 +25,7 @@
  * ran it.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { isAbsolute, sep } from "node:path";
 import {
   LPSTAT_STDOUT,
   PS_CAFFEINATE_STDOUT,
@@ -185,6 +186,20 @@ const INJECTION_SITES: ReadonlyArray<[string, (v: string) => Promise<unknown>]> 
 const BENIGN = "benignvalue";
 
 /**
+ * {@link sameTemplate}, where a value that became part of a PATH may also be
+ * spelled with the host's separators. A target is resolved against the
+ * workspace with node:path, and on Windows that turns each `/` in the value
+ * into `\\`: `</toast>` becomes `<\\toast>` inside one path element, which is
+ * still the value in its one slot, not a changed command.
+ */
+function sameSlot(hostile: string, control: string, value: string): boolean {
+  if (sameTemplate(hostile, control, value)) return true;
+  return (
+    sep !== "/" && value.includes("/") && sameTemplate(hostile, control, value.replaceAll("/", sep))
+  );
+}
+
+/**
  * Are these two argv elements the same template with the caller's value
  * substituted for the benign one?
  *
@@ -294,7 +309,7 @@ test(
             }
             for (let k = 0; k < h.length; k += 1) {
               elementsCompared += 1;
-              if (!sameTemplate(h[k] ?? "", c[k] ?? "", value)) {
+              if (!sameSlot(h[k] ?? "", c[k] ?? "", value)) {
                 leaked.push(
                   `${site} ${JSON.stringify(value)} -> ELEMENT ${k} ${JSON.stringify(h[k])} vs ${JSON.stringify(c[k])}`,
                 );
@@ -906,8 +921,9 @@ test("a real print probes the queue first and passes options as separate argv el
     "sides=two-sided-long-edge",
   ]);
   // The document is the LAST element and is absolute, so it can never be read
-  // as an option by a program that has no `--`.
-  expect(lp[9]).toMatch(/^\/.*package\.json$/);
+  // as an option by a program that has no `--` (`/…` here, `D:\\…` on Windows).
+  expect(isAbsolute(lp[9] ?? "")).toBe(true);
+  expect(lp[9]).toMatch(/[\\/]package\.json$/);
   expect(lp.length).toBe(10);
   expect(out["outcome"]).toBe("queued");
   expect(out["jobId"]).toBe("Canon_MX490_series-34");

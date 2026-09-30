@@ -53,7 +53,8 @@ describe("writeFileSafe", () => {
 
   test("an explicit mode applies to a new file", () => {
     writeFileSafe(f.ws, "private.txt", "p", { overwrite: false, mode: 0o600 });
-    expect(mode(join(f.ws, "private.txt"))).toBe(0o600);
+    // Windows keeps no permission bits beyond read-only (every writable file reads 0o666).
+    if (posix) expect(mode(join(f.ws, "private.txt"))).toBe(0o600);
   });
 
   test("an existing file is refused without overwrite and replaced with it", () => {

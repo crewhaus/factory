@@ -23,6 +23,12 @@ const f = fixture("copy");
 afterAll(() => f.cleanup());
 afterEach(() => _setBeforeCopyEntryForTest(undefined));
 
+/**
+ * A file's permission bits. Windows keeps none beyond read-only, so every
+ * writable file there reads back 0o666 whatever it was given: the mode
+ * assertions below are made where `posix`, and the copy around them is
+ * asserted everywhere.
+ */
 const mode = (p: string): number => statSync(p).mode & 0o777;
 const opts = { symlinks: "copy-contained", maxEntries: 1000 } as const;
 
@@ -40,7 +46,7 @@ describe("copyTreeSafe", () => {
     expect(r).toMatchObject({ ok: true, dryRun: false, files: 3, directories: 3, symlinks: 0 });
     if (r.ok) expect(r.bytes).toBe(5 + 10 + 7);
     expect(readFileSync(join(f.ws, "copy1", "sub", "file.txt"), "utf8")).toBe("payload");
-    expect(mode(join(f.ws, "copy1", "bin", "run.sh")) & 0o111).not.toBe(0);
+    if (posix) expect(mode(join(f.ws, "copy1", "bin", "run.sh")) & 0o111).not.toBe(0);
   });
 
   test("a single file copies to exactly the destination name", () => {
@@ -74,7 +80,7 @@ describe("copyTreeSafe", () => {
     });
     expect(readFileSync(join(f.ws, "copy1", "a.txt"), "utf8")).toBe("alpha");
     // The replaced file keeps ITS mode, as an overwrite by cp would.
-    expect(mode(join(f.ws, "copy1", "a.txt"))).toBe(0o640);
+    if (posix) expect(mode(join(f.ws, "copy1", "a.txt"))).toBe(0o640);
     expect(readdirSync(join(f.ws, "copy1")).some((n) => n.endsWith(".tmp"))).toBe(false);
   });
 
@@ -116,7 +122,7 @@ describe("copyTreeSafe", () => {
       ok: true,
     });
     expect(readFileSync(join(f.ws, "bigdst", "blob.bin")).length).toBe(1000);
-    expect(mode(join(f.ws, "bigdst", "blob.bin"))).toBe(0o600);
+    if (posix) expect(mode(join(f.ws, "bigdst", "blob.bin"))).toBe(0o600);
   });
 
   test('fileModes "source" gives every copied file the source\'s bits, new or replaced', () => {
@@ -154,7 +160,7 @@ describe("copyTreeSafe", () => {
       expect(r).toMatchObject({ ok: true, files: 4 });
       if (r.ok) expect([...r.replaced].sort()).toHaveLength(3);
       for (const [name, srcMode] of cases) {
-        expect([name, mode(join(f.ws, "modes-dst", name))]).toEqual([name, srcMode]);
+        if (posix) expect([name, mode(join(f.ws, "modes-dst", name))]).toEqual([name, srcMode]);
         expect(statSync(join(f.ws, "modes-dst", name)).mode & 0o7000).toBe(0);
         expect(readFileSync(join(f.ws, "modes-dst", name), "utf8")).toBe(`new ${name}`);
       }

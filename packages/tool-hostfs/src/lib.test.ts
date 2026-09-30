@@ -10,6 +10,7 @@
  * the one case it is least likely to get wrong.
  */
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
   GIO_COLLISION_NAMES,
   GIO_CROSS_DEVICE_STDERR,
@@ -1402,7 +1403,9 @@ describe("scope: the glob matcher cannot be made to backtrack (C162)", () => {
     // In a child process, so a regression fails at the timeout instead of
     // wedging the suite: a synchronous RegExp cannot be interrupted, and on
     // 0.7.0 these three took minutes. The old translation is not run here.
-    const scope = new URL("./lib/scope.ts", import.meta.url).pathname;
+    // A file path, not a URL's pathname: on Windows the pathname is
+    // "/D:/..." and the child's import of it failed before it ran anything.
+    const scope = fileURLToPath(new URL("./lib/scope.ts", import.meta.url));
     const script = `
       const { compileGlob } = await import(${JSON.stringify(scope)});
       console.log(JSON.stringify([

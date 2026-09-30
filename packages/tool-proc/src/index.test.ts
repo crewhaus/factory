@@ -79,6 +79,15 @@ async function call(tool: RegisteredTool, input: unknown): Promise<any> {
   }
 }
 
+/**
+ * A test that runs a {@link script} file as the program. Windows cannot
+ * execute a `#!/bin/sh` file (CreateProcess knows no shebang), so these run on
+ * macOS and Linux only; on Windows the spawn, deadline and kill paths are
+ * still exercised by the tests that run `sh -c`, `sleep`, `cat` and `echo`
+ * from PATH.
+ */
+const testScript = test.skipIf(process.platform === "win32");
+
 /** Write an executable shell script into the temp workspace. */
 function script(name: string, body: string): string {
   const file = join(tmp, name);
@@ -328,7 +337,7 @@ describe("RunCommand", () => {
     expect(out.stdout).toBe("");
   });
 
-  test("stderr is captured separately", async () => {
+  testScript("stderr is captured separately", async () => {
     const path = script("noisy.sh", "echo out; echo err >&2; exit 2");
     const out = await call(runCommand, { argv: [path] });
     expect(out.stdout.trim()).toBe("out");
@@ -350,26 +359,30 @@ describe("RunCommand", () => {
    * it must still die. This asserts the SIGKILL escalation really happens, by
    * running a script that ignores TERM and would otherwise loop forever.
    */
-  test("a command that ignores SIGTERM is SIGKILLed after the grace period", async () => {
-    const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
-    const started = Date.now();
-    const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
-    const elapsed = Date.now() - started;
-    expect(out.timedOut).toBe(true);
-    expect(out.exitCode).not.toBe(0);
-    // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
-    // emphatically not run to the end of a `while true`.
-    expect(elapsed).toBeGreaterThanOrEqual(200);
-    expect(elapsed).toBeLessThan(8_000);
-    // Waits out a real SIGTERM grace period before the SIGKILL.
-  }, 20_000);
+  testScript(
+    "a command that ignores SIGTERM is SIGKILLed after the grace period",
+    async () => {
+      const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
+      const started = Date.now();
+      const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
+      const elapsed = Date.now() - started;
+      expect(out.timedOut).toBe(true);
+      expect(out.exitCode).not.toBe(0);
+      // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
+      // emphatically not run to the end of a `while true`.
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(8_000);
+      // Waits out a real SIGTERM grace period before the SIGKILL.
+    },
+    20_000,
+  );
 
   /**
    * A grandchild inherits the pipe, so reading stdout to EOF can outlive the
    * process that was actually being run. The drain window is what stops that
    * from becoming an unbounded wait.
    */
-  test("a grandchild holding the pipe open does not hold the call open", async () => {
+  testScript("a grandchild holding the pipe open does not hold the call open", async () => {
     const path = script("forker.sh", "sleep 20 &\necho parent done");
     const started = Date.now();
     const out = await call(runCommand, { argv: [path], timeoutMs: 30_000 });
@@ -657,22 +670,25 @@ describe("Retry", () => {
     ]);
   });
 
-  test("a command that only works on the second attempt succeeds there, and every attempt is reported", async () => {
-    const path = script(
-      "flaky.sh",
-      'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
-    );
-    const out = await call(retry, {
-      argv: [path],
-      maxAttempts: 4,
-      backoff: { kind: "exponential", baseMs: 10 },
-    });
-    expect(out.succeeded).toBe(true);
-    expect(out.attemptsUsed).toBe(2);
-    expect(out.attempts[0].ok).toBe(false);
-    expect(out.attempts[1].ok).toBe(true);
-    expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
-  });
+  testScript(
+    "a command that only works on the second attempt succeeds there, and every attempt is reported",
+    async () => {
+      const path = script(
+        "flaky.sh",
+        'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
+      );
+      const out = await call(retry, {
+        argv: [path],
+        maxAttempts: 4,
+        backoff: { kind: "exponential", baseMs: 10 },
+      });
+      expect(out.succeeded).toBe(true);
+      expect(out.attemptsUsed).toBe(2);
+      expect(out.attempts[0].ok).toBe(false);
+      expect(out.attempts[1].ok).toBe(true);
+      expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
+    },
+  );
 
   test("successExitCodes lets a caller define success", async () => {
     const out = await call(retry, {
@@ -743,7 +759,7 @@ describe("background processes", () => {
     expect(second.id).toBe("proc_2");
   });
 
-  test("output is returned once: a second poll sees only what is new", async () => {
+  testScript("output is returned once: a second poll sees only what is new", async () => {
     // The second line must not be written until the first poll has happened,
     // and a `sleep` cannot promise that: on a loaded machine the wait loop's
     // own tick outlasts the sleep, both lines land in one read, and the test
@@ -784,14 +800,20 @@ describe("background processes", () => {
     expect(await call(processStatus, { id: started.id })).toContain("no background process");
   });
 
-  test("a process that ignores SIGTERM is escalated to SIGKILL within the grace period", async () => {
-    const path = script("stubborn.sh", 'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done');
-    const started = await call(processStart, { argv: [path] });
-    await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
-    const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
-    expect(stopped.stopped).toBe(true);
-    expect(stopped.escalatedToSigkill).toBe(true);
-  });
+  testScript(
+    "a process that ignores SIGTERM is escalated to SIGKILL within the grace period",
+    async () => {
+      const path = script(
+        "stubborn.sh",
+        'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done',
+      );
+      const started = await call(processStart, { argv: [path] });
+      await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
+      const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
+      expect(stopped.stopped).toBe(true);
+      expect(stopped.escalatedToSigkill).toBe(true);
+    },
+  );
 
   test("an unknown id is a readable message listing what is known", async () => {
     await call(processStart, { argv: ["true"] });
@@ -814,7 +836,7 @@ describe("background processes", () => {
 // ---------------------------------------------------------------------------
 
 describe("WaitForOutput", () => {
-  test("returns as soon as the pattern appears", async () => {
+  testScript("returns as soon as the pattern appears", async () => {
     const path = script("server.sh", 'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5');
     const started = await call(processStart, { argv: [path] });
     const out = await call(waitForOutput, {
@@ -826,7 +848,7 @@ describe("WaitForOutput", () => {
     expect(out.match).toBe("Listening on 4321");
   });
 
-  test("a failure pattern ends the wait early instead of burning the deadline", async () => {
+  testScript("a failure pattern ends the wait early instead of burning the deadline", async () => {
     const path = script(
       "broken.sh",
       'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
@@ -921,26 +943,29 @@ describe("WaitForOutput", () => {
    * therefore happen before the first match, and it must cover the
    * overlapping-alternation shape that star height alone does not see.
    */
-  test("an overlapping alternation is refused before it is ever matched, not at the deadline", async () => {
-    const path = script(
-      "many-a.sh",
-      'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
-    );
-    const started = await call(processStart, { argv: [path] });
-    const at = Date.now();
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(a|a)*$",
-      timeoutMs: 1_000,
-    });
-    expect(typeof out).toBe("string");
-    expect(out).toContain("alternation");
-    // Refused up front: it never even reached the deadline, let alone the
-    // match that would have outlived the process.
-    expect(Date.now() - at).toBeLessThan(1_000);
-  });
+  testScript(
+    "an overlapping alternation is refused before it is ever matched, not at the deadline",
+    async () => {
+      const path = script(
+        "many-a.sh",
+        'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const at = Date.now();
+      const out = await call(waitForOutput, {
+        id: started.id,
+        pattern: "(a|a)*$",
+        timeoutMs: 1_000,
+      });
+      expect(typeof out).toBe("string");
+      expect(out).toContain("alternation");
+      // Refused up front: it never even reached the deadline, let alone the
+      // match that would have outlived the process.
+      expect(Date.now() - at).toBeLessThan(1_000);
+    },
+  );
 
-  test("a wait for a line, with an unquantified alternation, still works", async () => {
+  testScript("a wait for a line, with an unquantified alternation, still works", async () => {
     const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
     const started = await call(processStart, { argv: [path] });
     const out = await call(waitForOutput, {
@@ -1366,7 +1391,8 @@ describe("CommandExists", () => {
   test("finds a program that is on PATH and resolves it", async () => {
     const out = await call(commandExists, { name: "sh" });
     expect(out.found).toBe(true);
-    expect(out.path.endsWith("/sh")).toBe(true);
+    // `…/bin/sh` on POSIX; on Windows the PATHEXT match, e.g. `…\\usr\\bin\\sh.exe`.
+    expect(out.path).toMatch(process.platform === "win32" ? /\\sh(\.exe)?$/i : /\/sh$/);
   });
 
   test("reports a missing program as an answer, not an error", async () => {
