@@ -1571,7 +1571,255 @@ export type ToolDetail = {
    * table does not know.
    */
   readonly shapes: ReadonlyArray<ToolShape>;
+  /** What a permission rule's argument pattern is checked against, and an example rule. */
+  readonly rules: RuleScope;
 };
+
+/**
+ * The structural subset of `OperativeArg` (`@crewhaus/tool-catalog`) that
+ * `tools show` reads — the same fields the builtin manifest carries.
+ */
+export type OperativeArgLike = {
+  readonly field: string;
+  readonly kind: string;
+  readonly default?: string;
+  readonly within?: string;
+  readonly relocates?: true;
+  readonly env?: string;
+  readonly prefix?: true;
+  readonly beneath?: string;
+  readonly defaultAtRoot?: true;
+  readonly glob?: true;
+};
+
+/** One permission rule, in the shape `permissions.rules` takes it. */
+export type ExampleRule = {
+  readonly type: "alwaysAllow" | "alwaysDeny";
+  readonly pattern: string;
+};
+
+/**
+ * What a scoped permission rule on a tool is checked against.
+ *
+ *  - `args`: the operative arguments the tool declares, each in words, and
+ *    one example rule. `note` says why the example is a deny, when it is.
+ *  - `unscoped`: the tool declares that no argument decides where it acts
+ *    (`operativeArgs: []`) — a pattern is matched against every string in
+ *    the call.
+ *  - `undeclared`: the tool declares nothing — the same string fallback.
+ */
+export type RuleScope =
+  | {
+      readonly kind: "args";
+      readonly args: ReadonlyArray<{ readonly field: string; readonly words: string }>;
+      readonly example: ExampleRule;
+      readonly note?: string;
+    }
+  | { readonly kind: "unscoped"; readonly example: ExampleRule }
+  | { readonly kind: "undeclared"; readonly example: ExampleRule };
+
+const KIND_WORDS: Readonly<Record<string, string>> = {
+  path: "a path",
+  url: "a URL",
+  command: "a command",
+  recipient: "a recipient",
+  id: "an id",
+  text: "text",
+};
+
+/** A left-out value in words: `"."` is a directory, anything else is quoted. */
+function defaultWords(arg: OperativeArgLike): string {
+  const value = arg.default ?? "";
+  if (value === "*") return "left out, it stands for every value";
+  if (arg.defaultAtRoot === true) return "left out, the whole workspace";
+  const where =
+    arg.kind === "path" && value === "."
+      ? arg.within !== undefined
+        ? `the directory in ${arg.within}`
+        : "the workspace root"
+      : `"${value}"`;
+  return arg.relocates === true
+    ? `left out, ${where}; it only moves the tool off its usual place, so an allow need not match it when the call leaves it out`
+    : `left out, ${where}`;
+}
+
+/** One operative argument in words: its kind, what qualifies it, what it stands for. */
+export function operativeArgWords(arg: OperativeArgLike): string {
+  const parts: string[] = [];
+  const kind = KIND_WORDS[arg.kind] ?? arg.kind;
+  if (arg.glob === true) parts.push("a path pattern, which stands for every path it can list");
+  else if (arg.prefix === true) {
+    parts.push(`${kind} prefix, which stands for every value that starts with it`);
+  } else parts.push(kind);
+  if (arg.within !== undefined) {
+    if (arg.kind === "path") parts.push(`read from the directory in ${arg.within}`);
+    else if (arg.kind === "command") {
+      parts.push(
+        `run in the directory in ${arg.within}; a scoped allow covers it only in the workspace root`,
+      );
+    } else parts.push(`matched as ${arg.within}/${arg.field.split(".").pop() ?? arg.field}`);
+  }
+  if (arg.env !== undefined) {
+    parts.push(`a call that sets ${arg.env} is covered only by an allow on every command (**)`);
+  }
+  if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
+  if (arg.beneath === "visible") {
+    parts.push("a directory stands for everything beneath it except hidden names");
+  }
+  if (arg.default !== undefined) parts.push(defaultWords(arg));
+  return parts.join("; ");
+}
+
+/** Which argument an example rule is written for, first to last. */
+const PLACE_ORDER: ReadonlyArray<string> = ["path", "url", "command", "recipient", "id", "text"];
+
+/** A value `qualifier` might hold, for an example that names one. */
+const QUALIFIER_SAMPLES: Readonly<Record<string, string>> = {
+  owner: "acme",
+  chainId: "1",
+  channel: "C0123",
+  namespace: "scratch",
+};
+
+/** An argument glob an allow on `arg` could sensibly be written with. */
+function allowGlob(arg: OperativeArgLike): string {
+  const leaf = (arg.field.split(".").pop() ?? arg.field).toLowerCase();
+  switch (arg.kind) {
+    case "path":
+      return arg.relocates === true && arg.default !== undefined && arg.default !== "."
+        ? `${arg.default}/**`
+        : "src/**";
+    case "url":
+      return "https://api.example.com/**";
+    case "command":
+      return "git status";
+    default: {
+      if (arg.within !== undefined) {
+        const qualifier = QUALIFIER_SAMPLES[arg.within] ?? "prod";
+        return arg.prefix === true ? `${qualifier}/**` : `${qualifier}/*`;
+      }
+      // A channel routing key, as SendMessage documents it.
+      if (leaf === "channel") return arg.kind === "id" ? "slack:T0123:C0123:*" : "C0123";
+      if (arg.kind === "recipient") {
+        if (/address|^to$|^cc$|^bcc$|email/.test(leaf)) return "*@example.com";
+        if (/image/.test(leaf)) return "ghcr.io/acme/*";
+        return "*.example.com";
+      }
+      return "nightly-*";
+    }
+  }
+}
+
+/** A glob a deny on `arg` could sensibly be written with. */
+function denyGlob(arg: OperativeArgLike): string {
+  switch (arg.kind) {
+    case "path":
+      return "secrets/**";
+    case "url":
+      return "https://internal.example.com/**";
+    case "command":
+      return arg.field === "code" ? "*subprocess*" : "*rm -rf*";
+    default:
+      return "*password*";
+  }
+}
+
+/**
+ * What a scoped rule on the tool named `name` is checked against, from its
+ * declared `operativeArgs`, with one example rule.
+ *
+ * The example is an allow when one glob can cover every value an allow
+ * reads — the arguments are all of one kind, and that kind names a place (a
+ * path, a URL, a command, a recipient or an id). Otherwise it is a deny:
+ * an allow must match every value at once, so a tool whose arguments are of
+ * different kinds (Grep's path and pattern) or that are free text or code is
+ * scoped by allowing it bare and denying what must stay out.
+ */
+export function ruleScopeFor(
+  name: string,
+  operativeArgs: ReadonlyArray<OperativeArgLike> | undefined,
+): RuleScope {
+  const bare: ExampleRule = { type: "alwaysAllow", pattern: name };
+  if (operativeArgs === undefined) return { kind: "undeclared", example: bare };
+  if (operativeArgs.length === 0) return { kind: "unscoped", example: bare };
+  const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a) }));
+  // An allow skips a relocating field the call leaves out, so the fields it
+  // is about are the others — unless relocating fields are all there is.
+  const active = operativeArgs.filter((a) => a.relocates !== true);
+  const read = active.length > 0 ? active : operativeArgs;
+  const kinds = new Set(read.map((a) => a.kind));
+  // The example names a place when an argument is one: a path before a URL
+  // before a command, a recipient, an id, and text last.
+  const first = [...read].sort(
+    (a, b) => PLACE_ORDER.indexOf(a.kind) - PLACE_ORDER.indexOf(b.kind),
+  )[0] as OperativeArgLike;
+  const oneKind = kinds.size === 1;
+  const placeKind = first.kind !== "text" && !(first.kind === "command" && first.field === "code");
+  if (oneKind && placeKind) {
+    return {
+      kind: "args",
+      args,
+      example: { type: "alwaysAllow", pattern: `${name}(${allowGlob(first)})` },
+    };
+  }
+  return {
+    kind: "args",
+    args,
+    example: { type: "alwaysDeny", pattern: `${name}(${denyGlob(first)})` },
+    note: oneKind
+      ? "a scoped allow on free text or code is rarely what you mean: allow the tool bare and deny what must not run"
+      : "these are of different kinds, so one allow pattern rarely fits them all: allow the tool bare and deny what must stay out",
+  };
+}
+
+/** `tools show`'s lines for a {@link RuleScope}. */
+export function formatRuleScopeLines(scope: RuleScope): string[] {
+  const example = `- { type: ${scope.example.type}, pattern: "${scope.example.pattern}" }`;
+  if (scope.kind !== "args") {
+    const why =
+      scope.kind === "unscoped"
+        ? "no argument (the tool says none decides where it acts)"
+        : "no declared argument";
+    return [
+      ...wrapDetail(
+        "rule checks",
+        `${why}, so a pattern is matched against every string in the call, and an allow needs all of them to match: name the tool bare`,
+      ),
+      `  example     ${example}`,
+    ];
+  }
+  const lines: string[] = [];
+  scope.args.forEach((a, i) => {
+    lines.push(...wrapDetail(i === 0 ? "rule checks" : "", `${a.field}: ${a.words}`));
+  });
+  if (scope.args.length > 1) {
+    lines.push(
+      ...wrapDetail("", "an allow must match every one of these; a deny or ask fires on any one"),
+    );
+  }
+  lines.push(`  example     ${example}`);
+  if (scope.note !== undefined) lines.push(...wrapDetail("", scope.note));
+  return lines;
+}
+
+/** Word-wrap one `tools show` row: a 12-column label, then text at column 15. */
+function wrapDetail(label: string, text: string, width = 96): string[] {
+  const indent = " ".repeat(14);
+  const lines: string[] = [];
+  let line = `  ${label.padEnd(12)}`;
+  let fresh = true;
+  for (const word of text.split(" ")) {
+    if (!fresh && line.length + 1 + word.length > width) {
+      lines.push(line);
+      line = indent;
+      fresh = true;
+    }
+    line += fresh ? word : ` ${word}`;
+    fresh = false;
+  }
+  lines.push(line);
+  return lines;
+}
 
 /**
  * The shapes that compile `key` into a bundle that runs it: the ones the
@@ -1629,6 +1877,7 @@ export function buildToolDetail(
     inputFields: inputFieldNames(tool),
     ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
     shapes: shapesRunning(key),
+    rules: ruleScopeFor(tool.name, tool.operativeArgs),
   };
 }
 
@@ -1648,6 +1897,7 @@ export type ToolLike = {
   readonly concurrencySafe?: boolean;
   readonly inputSchema?: unknown;
   readonly jsonSchema?: unknown;
+  readonly operativeArgs?: ReadonlyArray<OperativeArgLike>;
 };
 
 /**
@@ -1691,6 +1941,8 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
     // shape-reach#10 — say where it runs, rather than implying everywhere.
     ...(d.shapes.length > 0 ? [`  runs on     ${shapesLine(d.shapes)}`] : []),
+    // 0.7.1 — what a scoped permission rule on it is checked against.
+    ...formatRuleScopeLines(d.rules),
     "",
     `  enable with  tools: [${d.key}]`,
   ];
