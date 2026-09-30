@@ -16,6 +16,7 @@ import {
   linesRunBy,
   matchesPattern,
   readShellLine,
+  shellRestrictReading,
   shellRestrictSpellings,
 } from "./index";
 
@@ -119,6 +120,15 @@ describe("shellRestrictSpellings: what a deny or ask also reads", () => {
     ["echo $'a\\';rm -rf build;'", "rm -rf build"],
     ["echo 'x\nrm -rf build", "rm -rf build"],
     ['eval "eval \'sh -c \\"rm -rf build\\"\'"', "rm -rf build"],
+    // The variables the line sets to plain text are put in.
+    ["x=rm; $x -rf build", "rm -rf build"],
+    ["x=r; y=m; ${x}$y -rf build", "rm -rf build"],
+    ["x=build; rm -rf $x", "rm -rf build"],
+    ["export X='rm -rf build'; eval \"$X\"", "rm -rf build"],
+    ['x=rm; sh -c "$x -rf build"', "rm -rf build"],
+    // Bash spreads a brace list.
+    ["{rm,-rf,build}", "rm -rf build"],
+    ["{env,rm} -rf build", "rm -rf build"],
   ];
 
   test("each simple command, from its program on, unquoted, through wrappers and nesting", () => {
@@ -128,7 +138,49 @@ describe("shellRestrictSpellings: what a deny or ask also reads", () => {
         reads: true,
       });
     }
-    expect(READS.length).toBe(24);
+    expect(READS.length).toBe(31);
+  });
+
+  test("a program the text does not name is unknown, and every deny then fires", () => {
+    const unread = "a program named by a variable the line sets from something it cannot read";
+    const UNKNOWN: ReadonlyArray<readonly [string, string]> = [
+      ["$(echo rm) -rf build", "a program named by a command substitution"],
+      ["`echo rm` -rf build", "a program named by a command substitution"],
+      ["x=$(cat f); $x -rf build", unread],
+      ["read x <<< rm; $x -rf build", unread],
+      ['set -- rm -rf build; "$@"', unread],
+      ["for x in rm; do $x -rf build; done", unread],
+      ["printf -v x rm; $x -rf build", unread],
+      [
+        "${x:-rm} -rf build",
+        "a program named by a parameter expansion with a default, a trim or a length",
+      ],
+      ["IFS=,; x=rm,-rf,build; $x", "a program named by a variable split on an IFS the line sets"],
+      ["/bin/r? -rf build", "a program named by a pathname pattern"],
+      ["eval '$(echo rm) -rf build'", "a program named by a command substitution"],
+    ];
+    for (const [line, why] of UNKNOWN) {
+      expect({ line, why: shellRestrictReading(line).unknownProgram }).toEqual({ line, why });
+    }
+    expect(UNKNOWN.length).toBe(11);
+    // Expanded, the line would be far longer than written: read no further.
+    expect(shellRestrictReading(`x=${"a".repeat(1000)}; ${"$x ".repeat(300)}`).unknownProgram).toBe(
+      "a line whose variables expand past what is read",
+    );
+    // The harness's own variables, a test and a quoted pattern are known.
+    for (const line of [
+      "$HOME/bin/tool x",
+      '"$PYTHON" script.py',
+      "[ -f x ] && rm x",
+      "echo *.ts",
+      "'/bin/r?' x",
+      "x=$(pwd); unset x; git status",
+    ]) {
+      expect({ line, why: shellRestrictReading(line).unknownProgram }).toEqual({
+        line,
+        why: undefined,
+      });
+    }
   });
 
   test("an ordinary command is not read as another program", () => {
@@ -171,6 +223,9 @@ describe("the reader costs the length of the line", () => {
     ["eval chain", (k) => `${"eval ".repeat(k)}x`],
     ["wrapper chain", (k) => `${"env ".repeat(k)}x`],
     ["quoted substitutions", (k) => '"$(echo ")")"; '.repeat(k)],
+    ["one variable used often", (k) => `x=${"a".repeat(k)}; ${"$x ".repeat(k)}`],
+    ["a long brace list", (k) => `{${"a,".repeat(k)}`],
+    ["many assignments", (k) => `${"x=$x$x; ".repeat(k)}$x`],
   ];
 
   test("readShellLine and shellRestrictSpellings are linear on crafted lines", () => {
@@ -219,7 +274,14 @@ afterAll(() => {
   if (stubDir !== "") rmSync(stubDir, { recursive: true, force: true });
 });
 
-function programsRun(shell: string, line: string, log: string): string[] {
+/**
+ * The programs one run of `line` started. Each run logs to a file of its
+ * own: a program a line leaves running in the background (`p1 &` in dash)
+ * may write after the shell exits, and must not land in the next run's log.
+ */
+let runs = 0;
+function programsRun(shell: string, line: string): string[] {
+  const log = join(stubDir, `log-${runs++}`);
   writeFileSync(log, "");
   Bun.spawnSync([shell, "-c", line], {
     cwd: stubDir,
@@ -298,18 +360,26 @@ describe.skipIf(SHELLS.length === 0)("what a real shell runs", () => {
     "p\\1",
     "/usr/bin/nohup p1 >/dev/null 2>&1",
     "X=1 /usr/bin/env p1",
+    "x=p1; $x",
+    "x=p; ${x}1 a",
+    'x=p1; eval "$x"',
+    "{p1,a}",
+    'set -- p1; "$@"',
+    "read x <<EOF\np1\nEOF\n$x",
+    "IFS=,; x=p1,a; $x",
+    "$(printf p1)",
+    "${x:-p1}",
     "X=\"a b\" Y='c' p1",
   ];
 
   test("every program a splittable line runs is the program of one of its commands", () => {
-    const log = join(stubDir, "log");
     let chains = 0;
     for (const shell of SHELLS) {
       for (const line of SPLITTABLE) {
         const reading = readShellLine(line);
         expect({ line, opaque: reading.opaque }).toEqual({ line, opaque: undefined });
         const programs = new Set(reading.commands.map(programOf));
-        const ran = programsRun(shell, line, log);
+        const ran = programsRun(shell, line);
         if (new Set(ran).size > 1) chains++;
         for (const program of ran) {
           expect({ shell, line, program, named: programs.has(program) }).toEqual({
@@ -327,14 +397,17 @@ describe.skipIf(SHELLS.length === 0)("what a real shell runs", () => {
   }, 60_000);
 
   test("every program any line runs is read by a deny", () => {
-    const log = join(stubDir, "log");
     let seen = 0;
     for (const shell of SHELLS) {
       for (const line of [...SPLITTABLE, ...OPAQUE, ...WRAPPED]) {
-        const spellings = [line, ...shellRestrictSpellings(line)];
-        for (const program of programsRun(shell, line, log)) {
+        const reading = shellRestrictReading(line);
+        const spellings = [line, ...reading.spellings];
+        for (const program of programsRun(shell, line)) {
           seen++;
-          const read = spellings.some((s) => s === program || s.startsWith(`${program} `));
+          // An unknown program fires every deny.
+          const read =
+            reading.unknownProgram !== undefined ||
+            spellings.some((s) => s === program || s.startsWith(`${program} `));
           expect({ shell, line, program, read }).toEqual({ shell, line, program, read: true });
         }
       }
@@ -411,6 +484,20 @@ describe("a shell value: an allow covers every command, a deny fires on any", ()
     expect(fires("Bash(git status && rm*)", "git status && rm -rf build")).toBe(true);
     // And one naming the first command still fires.
     expect(fires("Bash(git status)", "git status && ls")).toBe(true);
+    // Through the variables the line sets.
+    expect(fires("Bash(rm -rf **)", "x=rm; $x -rf build")).toBe(true);
+    expect(fires("Bash(rm -rf build)", "x=build; rm -rf $x")).toBe(true);
+    // A program the text does not name fires every deny and ask; no allow
+    // but one that names every command grants it.
+    expect(fires("Bash(curl **)", "$(echo rm) -rf build")).toBe(true);
+    expect(fires("Bash(curl **)", "read x <<< rm; $x -rf build")).toBe(true);
+    expect(allowed("Bash(* *)", "read x; $x -rf build")).toBe(false);
+    expect(allowed("Bash(* *)", "x=rm; $x -rf build")).toBe(false);
+    expect(allowed("Bash(ls *)", "ls src/*.ts")).toBe(false);
+    expect(allowed("Bash(ls **)", "ls src/*.ts")).toBe(true);
+    expect(allowed("Bash(* *)", "/bin/r? -rf build")).toBe(false);
+    expect(allowed("Bash(**)", "read x; $x -rf build")).toBe(true);
+    expect(fires("Bash(curl **)", '"$PYTHON" script.py')).toBe(false);
     expect(fires("Bash(rm -rf **)", "git rm -rf build")).toBe(false);
     expect(fires("Bash(rm -rf **)", 'echo "rm -rf build"')).toBe(false);
   });

@@ -349,7 +349,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `Bash(**)` still grant what they did. A deny or ask fires on the whole line
  * and on any simple command in it, also read without the variables it sets,
  * unquoted, through wrappers such as `env`, `sudo` and `xargs`, and inside an
- * `eval`, a `sh -c` or a substitution. A command held as an argv array runs
+ * `eval`, a `sh -c` or a substitution; every deny or ask fires on a command
+ * whose program its text does not name (`$(…) -rf x`, `read x; $x`), which
+ * no scoped allow grants. A command held as an argv array runs
  * without a shell and is never split; a deny or ask still reads the line an
  * argv hands to a shell (`["sh", "-c", "a && b"]`).
  *

@@ -26,13 +26,20 @@
  * What a deny or ask reads of each simple command, beyond the command as
  * written: the command without the variables it sets and the redirections
  * it opens first (`FOO=1 rm -rf x`, `2>/dev/null rm x`), its words with the
- * quoting taken off (`"r"m -rf x` runs `rm`), the command a wrapper runs
- * (`env`, `command`, `exec`, `builtin`, `nohup`, `time`, `nice`, `timeout`,
- * `sudo`, `doas`, `xargs`, `setsid`, `stdbuf`, `busybox`), and the line an
- * `eval`, an `env -S` or a shell's `-c` runs, read the same way. A program
- * that runs another from its own arguments in some other way (`find -exec`,
- * `git -c alias.x=!…`, `make`) is not read: an allow list is the way to be
- * sure of those.
+ * quoting taken off (`"r"m -rf x` runs `rm`), with the variables the line
+ * itself sets to plain text put in (`x=rm; $x -rf build`) and bash's brace
+ * lists spread (`{rm,-rf,x}`), the command a wrapper runs (`env`,
+ * `command`, `exec`, `builtin`, `nohup`, `time`, `nice`, `timeout`, `sudo`,
+ * `doas`, `xargs`, `setsid`, `stdbuf`, `busybox`), and the line an `eval`,
+ * an `env -S` or a shell's `-c` runs, read the same way. When the program a
+ * command runs is not named in the text at all — a substitution, a
+ * pathname pattern, a variable the line fills from input (`read x; $x`) —
+ * every deny or ask fires, and no scoped allow grants it; the same when the
+ * program is a variable the line sets. A variable the line never sets is
+ * the harness's own (`$PYTHON script.py`), and is read as written. A
+ * program that runs another from its own arguments in some other way
+ * (`find -exec`, `git -c alias.x=!…`, `make`) is not read: an allow list is
+ * the way to be sure of those.
  *
  * Linear in the length of the line, per level of nesting; nesting is read
  * {@link MAX_SHELL_NESTING} levels deep.
@@ -814,20 +821,284 @@ export function linesRunBy(words: ReadonlyArray<string>): string[] {
   return followWrappers(words, 0).lines;
 }
 
+/** How a deny or ask reads a shell line, beyond the line itself. */
+export type ShellRestrictReading = {
+  /**
+   * Each simple command as written, from its program on, and with its
+   * quoting taken off; with the variables the line itself sets to plain text
+   * put in (`x=rm; $x -rf build` is `rm -rf build`) and bash's brace lists
+   * spread (`{rm,-rf,build}`); the command each wrapper runs; and, read the
+   * same way, the lines an `eval`, an `env -S`, a shell's `-c` or a
+   * substitution runs — {@link MAX_SHELL_NESTING} levels deep. Both readings
+   * of a line with a `$'…'` string.
+   */
+  readonly spellings: ReadonlyArray<string>;
+  /**
+   * Why the program one of its commands runs cannot be told from the text,
+   * when it cannot: a program named by a command substitution, by a pathname
+   * pattern (`/bin/r?`), by a variable the line sets from something it
+   * cannot read (`read`, `set --`, `for`, `$(…)`), or split on an `IFS` the
+   * line sets; or a line whose variables expand past what is read. Every
+   * deny or ask then fires, as for a command whose environment is too large
+   * to read.
+   */
+  readonly unknownProgram?: string;
+  /**
+   * A program named by a variable the line itself sets, to text this reader
+   * could put in (`x=rm; $x -rf build`), when one is. A deny reads it with
+   * the text put in; no scoped allow grants it, since the allow would be
+   * matched against the variable's name and not the program.
+   */
+  readonly programSetByLine?: string;
+};
+
 /**
- * Every spelling of a shell line a deny or ask reads, beyond the line
- * itself: each simple command as written, from its program on, and with
- * its quoting taken off; the command each wrapper runs; and, read the same
- * way, the lines an `eval`, an `env -S`, a shell's `-c` or a substitution
- * runs — {@link MAX_SHELL_NESTING} levels deep. Both readings of a line
- * with a `$'…'` string.
+ * Read a shell line the way a deny or ask does: see
+ * {@link ShellRestrictReading}.
  */
-export function shellRestrictSpellings(line: string, work: ShellWork = { steps: 0 }): string[] {
+export function shellRestrictReading(
+  line: string,
+  work: ShellWork = { steps: 0 },
+): ShellRestrictReading {
   const out = new Set<string>();
-  collectRestrictSpellings(line, 0, out, work);
+  const state: RestrictState = {
+    work,
+    unknown: undefined,
+    setByLine: undefined,
+    budget: Math.max(EXPANSION_BUDGET_CHARS, 4 * line.length),
+  };
+  collectRestrictSpellings(line, 0, out, work, new Map(), state);
   out.delete(line);
   out.delete("");
-  return [...out];
+  const spellings = [...out];
+  return {
+    spellings,
+    ...(state.unknown !== undefined ? { unknownProgram: state.unknown } : {}),
+    ...(state.setByLine !== undefined ? { programSetByLine: state.setByLine } : {}),
+  };
+}
+
+/** The spellings alone; see {@link shellRestrictReading}. */
+export function shellRestrictSpellings(line: string, work: ShellWork = { steps: 0 }): string[] {
+  return [...shellRestrictReading(line, work).spellings];
+}
+
+/**
+ * How many characters the variables of one line may expand to, at least,
+ * before the line is read as running an unknown program: a few variables
+ * used many times would otherwise multiply the text a deny reads.
+ */
+const EXPANSION_BUDGET_CHARS = 65_536;
+
+type RestrictState = {
+  unknown: string | undefined;
+  setByLine: string | undefined;
+  budget: number;
+  readonly work: ShellWork;
+};
+
+/**
+ * What the line has set each variable to so far: its text, or `null` when
+ * that cannot be read (`read x`, `x=$(…)`). `@` stands for the positional
+ * parameters once `set` changes them.
+ */
+type Known = Map<string, string | null>;
+
+/** `$name`, `${name}`, and the special parameters, as they appear in a word. */
+const VARIABLE_REFERENCE =
+  /\$(?:\{([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])\}|([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]))/g;
+
+/** `${` followed by anything but a plain name and `}`: a default, a trim, a length. */
+const PARAMETER_OPERATION = /\$\{(?![A-Za-z_][A-Za-z0-9_]*\}|[0-9@*#?$!-]\})/;
+
+/**
+ * `text` with each variable the line set to plain text put in. `unresolved`
+ * when it refers to one the line set from something unreadable, or to a
+ * positional parameter; a variable the line never set is the harness's
+ * own, and is left as written.
+ */
+function substitute(
+  text: string,
+  known: Known,
+  state: RestrictState,
+): { readonly text: string; readonly unresolved: boolean } {
+  if (!text.includes("$")) return { text, unresolved: false };
+  let unresolved = false;
+  const replaced = text.replace(VARIABLE_REFERENCE, (ref, braced?: string, bare?: string) => {
+    const name = (braced ?? bare) as string;
+    if (/^[0-9@*]$/.test(name)) {
+      unresolved = true;
+      return ref;
+    }
+    if (!known.has(name)) return ref;
+    const value = known.get(name);
+    if (value === null || value === undefined) {
+      unresolved = true;
+      return ref;
+    }
+    if (value.length > state.budget) {
+      state.unknown ??= "a line whose variables expand past what is read";
+      unresolved = true;
+      return ref;
+    }
+    state.budget -= value.length;
+    state.work.steps += value.length;
+    return value;
+  });
+  return { text: replaced, unresolved };
+}
+
+/**
+ * A word's source with its quoted parts and escapes taken out: what the
+ * shell expands as a pattern. One pass; an unterminated quote runs to the
+ * end.
+ */
+function unquotedParts(source: string): string {
+  let out = "";
+  for (let i = 0; i < source.length; i++) {
+    const c = source.charAt(i);
+    if (c === "\\") {
+      i++;
+    } else if (c === "'") {
+      const close = source.indexOf("'", i + 1);
+      i = close === -1 ? source.length : close;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < source.length && source.charAt(j) !== '"') j += source.charAt(j) === "\\" ? 2 : 1;
+      i = j;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+/**
+ * Bash spreads an unquoted `pre{a,b}post` into `prea preb`. One list, not
+ * nested; anything else is left as written. Found by position, not by a
+ * pattern, so a long word of commas costs its length.
+ */
+function braceSpread(token: Token, value: string): string[] {
+  if (token.quoted) return [value];
+  const open = value.indexOf("{");
+  if (open === -1) return [value];
+  const close = value.indexOf("}", open + 1);
+  if (close === -1) return [value];
+  if (value.indexOf("{", open + 1) !== -1 || value.indexOf("}", close + 1) !== -1) return [value];
+  const items = value.slice(open + 1, close);
+  if (!items.includes(",")) return [value];
+  const pre = value.slice(0, open);
+  const post = value.slice(close + 1);
+  return items.split(",").map((item) => `${pre}${item}${post}`);
+}
+
+/** Builtins whose arguments set variables: how each one names them. */
+function recordBuiltin(
+  values: ReadonlyArray<string>,
+  k: number,
+  known: Known,
+  state: RestrictState,
+): void {
+  const program = programName(values[k] as string);
+  const args = values.slice(k + 1);
+  const unknown = (name: string): void => {
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) known.set(name, null);
+  };
+  switch (program) {
+    case "export":
+    case "readonly":
+    case "declare":
+    case "typeset":
+    case "local":
+      for (const arg of args) {
+        const eq = arg.indexOf("=");
+        if (arg.startsWith("-") || eq <= 0) continue;
+        recordAssignment(
+          arg.slice(0, eq),
+          arg.slice(eq + 1),
+          arg.includes("$(") || arg.includes("`"),
+          known,
+          state,
+        );
+      }
+      return;
+    case "read":
+    case "mapfile":
+    case "readarray":
+      // Every operand is a name the command fills from its input.
+      for (const arg of args) if (!arg.startsWith("-")) unknown(arg);
+      if (program !== "read") known.set("MAPFILE", null);
+      else known.set("REPLY", null);
+      return;
+    case "printf": {
+      const v = args.indexOf("-v");
+      if (v !== -1 && args[v + 1] !== undefined) unknown(args[v + 1] as string);
+      return;
+    }
+    case "getopts":
+      if (args[1] !== undefined) unknown(args[1]);
+      return;
+    case "set":
+      if (args.some((a) => a === "--" || !/^[-+]/.test(a))) known.set("@", null);
+      return;
+    case "unset":
+      for (const arg of args) if (!arg.startsWith("-")) known.delete(arg);
+      return;
+    case "for":
+    case "select":
+      if (args[0] !== undefined) unknown(args[0]);
+      return;
+    default:
+      return;
+  }
+}
+
+/** Record `name=value` (its unquoted value): plain text, or `null` when it cannot be read. */
+function recordAssignment(
+  name: string,
+  value: string,
+  substituted: boolean,
+  known: Known,
+  state: RestrictState,
+): void {
+  if (name.endsWith("+")) {
+    known.set(name.slice(0, -1), null);
+    return;
+  }
+  const bare = name.replace(/\[.*$/, "");
+  if (substituted || PARAMETER_OPERATION.test(value)) {
+    known.set(bare, null);
+    return;
+  }
+  const read = substitute(value, known, state);
+  known.set(bare, read.unresolved ? null : read.text);
+}
+
+/** Why the program a command runs, at `k`, cannot be told from its text, if it cannot. */
+function unknownProgram(
+  line: string,
+  token: Token | undefined,
+  value: string,
+  unresolved: boolean,
+  known: Known,
+): string | undefined {
+  const source = token !== undefined ? line.slice(token.start, token.end) : value;
+  if (source.includes("$(") || source.includes("`")) {
+    return "a program named by a command substitution";
+  }
+  if (unresolved) {
+    return "a program named by a variable the line sets from something it cannot read";
+  }
+  if (PARAMETER_OPERATION.test(source)) {
+    return "a program named by a parameter expansion with a default, a trim or a length";
+  }
+  if (known.has("IFS") && source.includes("$")) {
+    return "a program named by a variable split on an IFS the line sets";
+  }
+  if (value !== "[" && /[*?[]/.test(unquotedParts(source))) {
+    return "a program named by a pathname pattern";
+  }
+  return undefined;
 }
 
 function collectRestrictSpellings(
@@ -835,12 +1106,15 @@ function collectRestrictSpellings(
   level: number,
   out: Set<string>,
   work: ShellWork,
+  inherited: Known,
+  state: RestrictState,
 ): void {
   const scans = line.includes("$'")
     ? [scan(line, false, work), scan(line, true, work)]
     : [scan(line, false, work)];
-  const nested: string[] = [];
+  const nested: Array<readonly [string, Known]> = [];
   for (const scanned of scans) {
+    const known: Known = new Map(inherited);
     for (const { tokens } of scanned.commands) {
       out.add(spanOf(line, tokens));
       // From the program on: the variables it sets and the redirections it
@@ -853,21 +1127,61 @@ function collectRestrictSpellings(
         if (!ASSIGNMENT.test(line.slice(w.start, w.end))) break;
         first++;
       }
-      if (first >= words.length) continue;
+      if (first >= words.length) {
+        // Only assignments: they stay set for the commands after it.
+        for (const w of words) {
+          const source = line.slice(w.start, w.end);
+          const eq = w.value.indexOf("=");
+          recordAssignment(
+            w.value.slice(0, eq),
+            w.value.slice(eq + 1),
+            source.includes("$(") || source.includes("`"),
+            known,
+            state,
+          );
+        }
+        continue;
+      }
       const end = (tokens[tokens.length - 1] as Token).end;
-      const values = words.map((t) => t.value);
+      const readings = words.map((t) => substitute(t.value, known, state));
+      const values = readings.map((r) => r.text);
       const followed = followWrappers(values, first);
+      const program = followed.starts.at(-1) ?? first;
+      const why = unknownProgram(
+        line,
+        words[program],
+        values[program] as string,
+        (readings[program] as { unresolved: boolean }).unresolved,
+        known,
+      );
+      if (why !== undefined) state.unknown ??= why;
+      else if (values[program] !== (words[program] as Token).value) {
+        state.setByLine ??= "a program named by a variable the line sets";
+      }
       for (const from of [first, ...followed.starts]) {
         out.add(line.slice((words[from] as Token).start, end).trim());
         out.add(values.slice(from).join(" "));
       }
-      nested.push(...followed.lines);
+      for (const inner of followed.lines) nested.push([inner, known]);
+      // Bash's brace lists, spread, and read the same way.
+      const spread = words
+        .slice(first)
+        .flatMap((t, i) => braceSpread(t, values[first + i] as string));
+      if (spread.length !== words.length - first) {
+        const again = followWrappers(spread, 0);
+        for (const from of [0, ...again.starts]) out.add(spread.slice(from).join(" "));
+        for (const inner of again.lines) nested.push([inner, known]);
+      }
+      recordBuiltin(values, program, known, state);
     }
-    nested.push(...scanned.nested);
+    for (const inner of scanned.nested) nested.push([inner, known]);
   }
   if (level + 1 >= MAX_SHELL_NESTING) return;
-  for (const inner of new Set(nested)) {
+  const seen = new Set<string>();
+  for (const [inner, known] of nested) {
+    if (seen.has(inner)) continue;
+    seen.add(inner);
     out.add(inner.trim());
-    collectRestrictSpellings(inner, level + 1, out, work);
+    collectRestrictSpellings(inner, level + 1, out, work, known, state);
   }
 }
