@@ -54,6 +54,9 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  *   destination, several recipients), which one rule value cannot cover;
  * - `not-representable` — a value cannot be written as a rule value: a path
  *   outside the workspace, text that is not a URL, or a parenthesis;
+ * - `every-value` — a call acted on every value at once (a listing by prefix
+ *   or with none, a query with no filter), which only a wildcard rule
+ *   covers, and a proposal never writes one;
  * - `varied` — the calls acted on different places.
  */
 export type UnscopedReason =
@@ -63,6 +66,7 @@ export type UnscopedReason =
   | "no-value"
   | "several-places"
   | "not-representable"
+  | "every-value"
   | "varied";
 
 export type AskAggregate = {
@@ -174,6 +178,10 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   const only = values[0] as OperativeValue;
   const value = only.canonical[0];
   if (only.outsideWorkspace === true || value === undefined) return unscoped("not-representable");
+  // `KvList {namespace: "scratch", prefix: "a"}` lists every key starting
+  // with `a`: its canonical `scratch/a*` is not a literal, and the escaped
+  // rule `KvList(scratch/a\*)` would never fire for the call it came from.
+  if (only.standsForAny !== undefined) return unscoped("every-value");
   return representable(value, only.kind);
 }
 
@@ -344,6 +352,8 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     "not-parsed": "a recorded call no longer fits the tool's input, so what it acted on is unknown",
     "not-representable":
       "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, or containing a parenthesis)",
+    "every-value":
+      "an approved call acted on every value at once (a listing by prefix, a query with no filter), which only a wildcard rule covers, and a proposal never widens what was approved",
     "several-places":
       "an approved call acted on more than one place (a source and a destination, several recipients), and one rule value cannot cover them",
     "no-value": "an approved call carried none of the arguments a rule is checked against",
@@ -354,6 +364,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     "no-scoping-argument",
     "not-parsed",
     "not-representable",
+    "every-value",
     "several-places",
     "no-value",
     "varied",

@@ -228,6 +228,41 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     }
   });
 
+  it("a call that stands for every value is not proposed as a literal rule (final review)", () => {
+    // KvList's prefix lists every key that starts with it. Escaped as a
+    // literal, `KvList(scratch/a\*)` would never fire for the call it came
+    // from, so the proposal is a bare grant that says why.
+    const list = declared(
+      "KvList",
+      [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+      ],
+      { namespace: z.string(), prefix: z.string().optional(), stateDir: z.string().optional() },
+    );
+    const logs = declared(
+      "EvmGetLogs",
+      [{ field: "address", kind: "id", within: "chainId", default: "*" }],
+      { chainId: z.string(), address: z.string().optional() },
+    );
+    const withLists = suggestLookupFromTools({ ...TOOLS, kvList: list, evmGetLogs: logs });
+    for (const [name, input] of [
+      ["KvList", { namespace: "scratch", prefix: "a" }],
+      ["KvList", { namespace: "scratch" }],
+      ["EvmGetLogs", { chainId: "1" }],
+    ] as const) {
+      const agg = aggregateAsks([asked(name, input)], withLists).get(name) as AskAggregate;
+      expect({ name, input, pattern: patternFor(agg) }).toEqual({ name, input, pattern: name });
+      expect(blanketGrantNote(agg)).toContain("every value at once");
+    }
+    // One named value is still scoped.
+    const one = aggregateAsks(
+      [asked("EvmGetLogs", { chainId: "1", address: "0xab" })],
+      withLists,
+    ).get("EvmGetLogs") as AskAggregate;
+    expect(patternFor(one)).toBe("EvmGetLogs(1/0xab)");
+  });
+
   it("rankSuggestions carries the BLANKET GRANT line into a bare allow's evidence", () => {
     const aggs = aggregateAsks([asked("ClipboardWrite", { text: "x" })], lookup);
     const [grant] = rankSuggestions(aggs, new Map());
