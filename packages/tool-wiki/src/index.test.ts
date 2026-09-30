@@ -418,6 +418,14 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
   // 400-row wiki_search made 400 model calls.
   describe("list rows and the model-backed classifier", () => {
     const TITLE_PAD = "a steady walk through brewing ratios and water temperature ".repeat(10);
+    /**
+     * Seeding is slow by construction: every store write rebuilds the index
+     * from a contained read of every article, so sixty writes are some 1,800
+     * article reads and parses. About 0.6 s here, and 4.6 s to past 5 s on
+     * CI's loaded ubuntu runner (runs 36615945808, 36643160622). 0.7.0 took
+     * about 0.4 s here: the difference is the containment checks on each read.
+     */
+    const SEEDED_BUDGET_MS = 20_000;
 
     async function seedWidgets(bundle: ReturnType<typeof makeBundle>, n: number): Promise<void> {
       for (let i = 0; i < n; i++) {
@@ -448,68 +456,76 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
       return { classifier, seen, most: () => most };
     }
 
-    test("one model call per chunk of rows, not per row, and the rows keep their order", async () => {
-      const bundle = makeBundle();
-      await seedWidgets(bundle, 60);
-      const stub = counting();
-      setDefaultBoundaryLlmClassifier(stub.classifier);
-      try {
-        const out = String(await bundle.search.execute({ query: "widget" }));
-        const rows = out.split("\n").slice(1);
-        const rowChars = rows.reduce((n, r) => n + r.length, 0);
-        // Every row reached the model, inside a chunk no larger than the
-        // classifier analyses in full...
-        expect(stub.seen.every((t) => t.length <= 16 * 1024)).toBe(true);
-        for (const r of rows) {
-          const slug = /widget-\d\d/.exec(r)?.[0] ?? "?";
-          expect(`${slug}:${stub.seen.some((t) => t.includes(`${slug} (v1`))}`).toBe(
-            `${slug}:true`,
-          );
+    test(
+      "one model call per chunk of rows, not per row, and the rows keep their order",
+      async () => {
+        const bundle = makeBundle();
+        await seedWidgets(bundle, 60);
+        const stub = counting();
+        setDefaultBoundaryLlmClassifier(stub.classifier);
+        try {
+          const out = String(await bundle.search.execute({ query: "widget" }));
+          const rows = out.split("\n").slice(1);
+          const rowChars = rows.reduce((n, r) => n + r.length, 0);
+          // Every row reached the model, inside a chunk no larger than the
+          // classifier analyses in full...
+          expect(stub.seen.every((t) => t.length <= 16 * 1024)).toBe(true);
+          for (const r of rows) {
+            const slug = /widget-\d\d/.exec(r)?.[0] ?? "?";
+            expect(`${slug}:${stub.seen.some((t) => t.includes(`${slug} (v1`))}`).toBe(
+              `${slug}:true`,
+            );
+          }
+          // ...in a handful of calls rather than sixty.
+          expect(stub.seen.length).toBeLessThanOrEqual(Math.ceil(rowChars / (16 * 1024)) + 1);
+          expect(stub.seen.length).toBeLessThan(10);
+          expect(stub.most()).toBeLessThanOrEqual(8);
+          const slugs = rows.map((l) => /widget-\d\d/.exec(l)?.[0]);
+          expect(slugs).toHaveLength(60);
+          const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
+          expect(slugs).toEqual(ranked);
+        } finally {
+          setDefaultBoundaryLlmClassifier(undefined);
         }
-        // ...in a handful of calls rather than sixty.
-        expect(stub.seen.length).toBeLessThanOrEqual(Math.ceil(rowChars / (16 * 1024)) + 1);
-        expect(stub.seen.length).toBeLessThan(10);
-        expect(stub.most()).toBeLessThanOrEqual(8);
-        const slugs = rows.map((l) => /widget-\d\d/.exec(l)?.[0]);
-        expect(slugs).toHaveLength(60);
-        const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
-        expect(slugs).toEqual(ranked);
-      } finally {
-        setDefaultBoundaryLlmClassifier(undefined);
-      }
-    });
+      },
+      SEEDED_BUDGET_MS,
+    );
 
-    test("a row only the model flags is redacted alone; its chunk-mates render", async () => {
-      const bundle = makeBundle();
-      await seedWidgets(bundle, 60);
-      const marker = "zebra quartz lantern";
-      await bundle.store.write({
-        slug: "widget-flagged",
-        title: `Widget flagged ${marker}`,
-        body: "widget flagged",
-        tags: ["widget"],
-      });
-      const stub = counting(marker);
-      setDefaultBoundaryLlmClassifier(stub.classifier);
-      try {
-        const out = String(await bundle.search.execute({ query: "widget" }));
-        expect(out).not.toContain(marker);
-        expect(out).toMatch(/widget-flagged \(v1\) — \[tool output redacted/);
-        // Every other row still renders in full.
-        const rendered = out.split("\n").filter((l) => l.includes("brewing ratios"));
-        expect(rendered).toHaveLength(60);
-        // Chunks, plus one call per row of the one flagged chunk only.
-        const chunkCalls = stub.seen.filter((t) => t.split("\n").length > 1).length;
-        const rowCalls = stub.seen.length - chunkCalls;
-        expect(chunkCalls).toBeGreaterThan(1);
-        expect(rowCalls).toBeGreaterThan(0);
-        expect(rowCalls).toBeLessThan(61);
-        expect(stub.seen.length).toBeLessThan(40);
-        expect(stub.most()).toBeLessThanOrEqual(8);
-      } finally {
-        setDefaultBoundaryLlmClassifier(undefined);
-      }
-    });
+    test(
+      "a row only the model flags is redacted alone; its chunk-mates render",
+      async () => {
+        const bundle = makeBundle();
+        await seedWidgets(bundle, 60);
+        const marker = "zebra quartz lantern";
+        await bundle.store.write({
+          slug: "widget-flagged",
+          title: `Widget flagged ${marker}`,
+          body: "widget flagged",
+          tags: ["widget"],
+        });
+        const stub = counting(marker);
+        setDefaultBoundaryLlmClassifier(stub.classifier);
+        try {
+          const out = String(await bundle.search.execute({ query: "widget" }));
+          expect(out).not.toContain(marker);
+          expect(out).toMatch(/widget-flagged \(v1\) — \[tool output redacted/);
+          // Every other row still renders in full.
+          const rendered = out.split("\n").filter((l) => l.includes("brewing ratios"));
+          expect(rendered).toHaveLength(60);
+          // Chunks, plus one call per row of the one flagged chunk only.
+          const chunkCalls = stub.seen.filter((t) => t.split("\n").length > 1).length;
+          const rowCalls = stub.seen.length - chunkCalls;
+          expect(chunkCalls).toBeGreaterThan(1);
+          expect(rowCalls).toBeGreaterThan(0);
+          expect(rowCalls).toBeLessThan(61);
+          expect(stub.seen.length).toBeLessThan(40);
+          expect(stub.most()).toBeLessThanOrEqual(8);
+        } finally {
+          setDefaultBoundaryLlmClassifier(undefined);
+        }
+      },
+      SEEDED_BUDGET_MS,
+    );
 
     test("an encoded payload is decoded on its own row, however many encoded neighbours it has", async () => {
       const bundle = makeBundle();

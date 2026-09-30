@@ -373,6 +373,9 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
 
   test("patternProperties compiles once per map and charges every (key, pattern) test", () => {
     // 8,000 keys under 8,000 patterns ran 64 million tests and answered valid.
+    // Now it runs until the value's budget (about 8.2 million evaluations) is
+    // spent and answers undetermined: slow by construction, about 1.7 s here
+    // and 3.9 to 6.2 s on CI's loaded ubuntu runner.
     const wide = (n: number) => ({
       value: Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 1])),
       schema: {
@@ -406,7 +409,7 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
       true,
     );
     expect(listed).toBeLessThanOrEqual(3);
-  });
+  }, 20_000);
 
   test("an object with no keys does no work per pattern", () => {
     // The compiled list was copied into a fresh array for every object, so
