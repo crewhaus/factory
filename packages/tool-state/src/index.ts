@@ -593,7 +593,8 @@ export const kvList: RegisteredTool = stateTool({
   name: "KvList",
   operativeArgs: [
     { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
-    { field: "prefix", kind: "id", within: "namespace", default: "*" },
+    // A prefix: the listing holds every key that starts with it, `/` and all.
+    { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
   ],
   description:
     "List the keys in a namespace, sorted, with their versions and optionally their values. Use it to see what a previous run left behind; records whose files are corrupt are listed separately instead of failing the whole call.",

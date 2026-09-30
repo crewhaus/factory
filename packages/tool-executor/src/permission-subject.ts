@@ -77,6 +77,12 @@
  *      that the call leaves out as well, it stands for every
  *      `<qualifier>/<value>` (`anyQualifier`): a code search naming no owner
  *      reaches every repository.
+ *    - a field declared `prefix` (KvList's `prefix`) stands for every value
+ *      that starts with it, whether the call gives it or leaves it out (the
+ *      empty prefix): `<qualifier>/<prefix>` followed by any run, since a
+ *      key may hold `/`, and the prefix alone for a deny written without
+ *      the qualifier (read one segment on, so a deny naming another
+ *      namespace's key does not fire on every listing).
  *    - a `relocates` field left out stands in with its default, which a
  *      deny or ask reads; when the call carries another operative value an
  *      allow skips it (`restrictOnly`), because the grant is about the
@@ -193,6 +199,7 @@ export function operativeValuesOf(
       anyAfter,
       defaulted,
       anyQualifier,
+      prefixOf,
     } of readField(parsedInput, arg)) {
       if (arg.relocates === true && defaulted === true) {
         if (arg.kind === "url") relocated.push(canonicalUrl(raw));
@@ -259,7 +266,23 @@ export function operativeValuesOf(
             ...(HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
             ...(anyQualifier === true ? { anyQualifier: true } : {}),
+            // A prefix stands for every value that starts with it, and a
+            // key may hold `/`: what follows is any run, not one segment.
+            ...(prefixOf !== undefined ? { standsForAnyRun: true } : {}),
           });
+          // The prefix alone, for a deny or ask written without the
+          // qualifier (`alwaysDeny KvGet(apikey)`, as for any `within`
+          // field). Read one segment on: with a run, a deny naming another
+          // namespace's key (`secrets/apikey`) would fire on every listing
+          // with no prefix, whatever namespace it lists.
+          if (prefixOf?.unqualified !== undefined) {
+            values.push({
+              kind: arg.kind,
+              canonical: [],
+              standsForAny: [prefixOf.unqualified],
+              restrictOnly: true,
+            });
+          }
         }
       }
     }
@@ -305,6 +328,11 @@ type FieldReading = {
   readonly defaulted?: true;
   /** With `anyAfter`: the `within` qualifier was left out too. */
   readonly anyQualifier?: true;
+  /**
+   * A field declared `prefix`: `anyAfter` is followed by any run, and
+   * `unqualified` is the prefix alone when the value was qualified.
+   */
+  readonly prefixOf?: { readonly unqualified?: string };
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -371,6 +399,9 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     walk((value as Record<string, unknown>)[key], i + 1, depth + 1, value);
   };
   walk(input, 0, 0, input);
+  if (arg.prefix === true && arg.kind !== "path" && arg.kind !== "url" && arg.kind !== "command") {
+    return prefixReadings(out, arg, topQualifier);
+  }
   // A default of `*` is "every value": EvmGetLogs without an `address`
   // reads every contract's logs.
   const every = out.length === 0 && arg.default === ANY_VALUE;
@@ -407,6 +438,43 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
 
 /** The declared default that stands for every value of its field. */
 const ANY_VALUE = "*";
+
+/**
+ * The readings of a field declared `prefix` (KvList's `prefix`): each value
+ * `p` stands for every value that starts with it, and one left out is the
+ * empty prefix — every value. Qualified, `<qualifier>/<p>` is followed by any
+ * run (a key may hold `/`), and `<p>` alone is kept for a deny written
+ * without the qualifier. With the qualifier left out too, the value stands
+ * for every `<qualifier>/<value>` there is: an allow must name every value.
+ */
+function prefixReadings(
+  out: ReadonlyArray<FieldReading>,
+  arg: OperativeArg,
+  qualifier: string | undefined,
+): FieldReading[] {
+  const prefixes = out.length > 0 ? out.map((r) => r.value) : [""];
+  return prefixes.map((p): FieldReading => {
+    if (qualifier === undefined) {
+      const anyQualifier = arg.within !== undefined;
+      const start = anyQualifier ? "" : p;
+      return {
+        value: `${start}${ANY_VALUE}`,
+        every: true,
+        anyAfter: [start],
+        prefixOf: {},
+        ...(out.length === 0 ? { defaulted: true } : {}),
+      };
+    }
+    return {
+      value: `${qualifier}/${p}${ANY_VALUE}`,
+      unqualified: [`${p}${ANY_VALUE}`, qualifier],
+      every: true,
+      anyAfter: [`${qualifier}/${p}`],
+      prefixOf: { unqualified: p },
+      ...(out.length === 0 ? { defaulted: true } : {}),
+    };
+  });
+}
 
 /**
  * Every path under `dir` — a path field left out whose default is `*` — as

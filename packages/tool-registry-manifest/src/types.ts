@@ -23,6 +23,8 @@ export type RegistryOperativeArg = {
   readonly relocates?: true;
   /** For a `command`: the field holding the environment its call sets. */
   readonly env?: string;
+  /** The value is a prefix: it stands for every value that starts with it. */
+  readonly prefix?: true;
 };
 
 export type RegistryEntry = {
@@ -117,6 +119,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.within !== undefined ? { within: arg.within } : {}),
     ...(arg.relocates === true ? { relocates: true as const } : {}),
     ...(arg.env !== undefined ? { env: arg.env } : {}),
+    ...(arg.prefix === true ? { prefix: true as const } : {}),
   };
 }
 

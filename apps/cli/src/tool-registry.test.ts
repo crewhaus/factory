@@ -844,7 +844,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
     // Every key an OperativeArg can have is in use by some builtin, so the
     // comparison above has really looked at each of them.
     expect([...keysSeen].sort()).toEqual(
-      ["default", "env", "field", "kind", "relocates", "within"].sort(),
+      ["default", "env", "field", "kind", "prefix", "relocates", "within"].sort(),
     );
     // The environment a command's call sets, by name.
     expect(TOOL_FLAGS["runCommand"]?.operativeArgs).toEqual([

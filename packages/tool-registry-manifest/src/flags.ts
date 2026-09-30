@@ -3106,7 +3106,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
-      { field: "prefix", kind: "id", default: "*", within: "namespace" },
+      { field: "prefix", kind: "id", default: "*", within: "namespace", prefix: true },
     ],
   },
   kvSet: {

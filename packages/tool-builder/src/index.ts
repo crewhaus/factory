@@ -359,6 +359,20 @@ function checkOperativeArgs(
       const qualifier = scalarFieldShape(inputSchema, within);
       if (qualifier !== undefined) fail(`${at}.within: the input schema ${qualifier}`);
     }
+    const { prefix } = arg;
+    if (prefix !== undefined) {
+      if (prefix !== true) fail(`${at}.prefix is either true or left out`);
+      if (kind !== "id" && kind !== "recipient" && kind !== "text") {
+        fail(
+          `${at}.prefix: only an "id", "recipient" or "text" value can be a prefix; a "${kind}" value is read whole`,
+        );
+      }
+      if (arg.default !== "*") {
+        fail(
+          `${at}.prefix needs default "*": a prefix left out filters nothing, so the call acts on every value`,
+        );
+      }
+    }
     const { env } = arg;
     if (env !== undefined) {
       if (kind !== "command") {
@@ -379,6 +393,7 @@ function checkOperativeArgs(
         ...(within !== undefined ? { within } : {}),
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
+        ...(prefix === true ? { prefix } : {}),
       }),
     );
   }

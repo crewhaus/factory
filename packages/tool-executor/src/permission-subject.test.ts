@@ -314,6 +314,97 @@ describe("url, command and id values", () => {
     expect(operativeValuesFor(dot, {})).toEqual([{ kind: "id", canonical: ["main"] }]);
   });
 
+  test("a field declared `prefix` stands for every value that starts with it (final review)", () => {
+    // KvList's `prefix` lists every key that begins with it. Read as one key,
+    // `prefix: ""` (the same unfiltered listing as leaving it out) and
+    // `prefix: "api"` dodged `alwaysDeny KvGet(secrets/apikey)` and returned
+    // the value.
+    const list = buildTool({
+      name: "List",
+      description: "d",
+      inputSchema: z.object({ namespace: z.string(), prefix: z.string().optional() }),
+      operativeArgs: [
+        { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+      ],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(list.operativeArgs?.[0]?.prefix).toBe(true);
+    expect(operativeValuesFor(list, { namespace: "secrets", prefix: "api" })).toEqual([
+      {
+        kind: "id",
+        canonical: ["secrets/api*"],
+        spellings: ["api*", "secrets"],
+        standsForAny: ["secrets/api"],
+        standsForAnyRun: true,
+      },
+      { kind: "id", canonical: [], standsForAny: ["api"], restrictOnly: true },
+    ]);
+    // Left out, or empty, it is the empty prefix: every key.
+    const omitted = operativeValuesFor(list, { namespace: "secrets" });
+    expect(operativeValuesFor(list, { namespace: "secrets", prefix: "" })).toEqual(omitted);
+    expect(omitted?.[0]?.standsForAny).toEqual(["secrets/"]);
+    const on =
+      (polarity: "allow" | "restrict", input: Record<string, unknown>) => (pattern: string) =>
+        matchesPattern(compilePattern(pattern), "List", input, {
+          polarity,
+          operativeValues: operativeValuesFor(list, input) ?? [],
+        });
+    const keyDeny = "List(secrets/apikey)";
+    for (const prefix of [undefined, "", "a", "api", "apikey"]) {
+      const input = { namespace: "secrets", ...(prefix !== undefined ? { prefix } : {}) };
+      expect({ prefix, fires: on("restrict", input)(keyDeny) }).toEqual({ prefix, fires: true });
+    }
+    expect(on("restrict", { namespace: "secrets", prefix: "b" })(keyDeny)).toBe(false);
+    expect(on("restrict", { namespace: "public" })(keyDeny)).toBe(false);
+    // A key may hold `/`, and a listing reaches it.
+    expect(
+      on("restrict", { namespace: "cache", prefix: "https:" })("List(cache/https://x/**)"),
+    ).toBe(true);
+    // A deny written without the namespace fires on the key in any listing,
+    // and one naming another namespace's key does not fire on an unrelated one.
+    expect(on("restrict", { namespace: "public" })("List(apikey)")).toBe(true);
+    expect(on("restrict", { namespace: "public", prefix: "b" })("List(apikey)")).toBe(false);
+    // An allow must cover every key the listing can return.
+    const grants = on("allow", { namespace: "secrets", prefix: "api" });
+    expect(["List(secrets/**)", "List(secrets/api**)", "List(**)"].filter(grants)).toHaveLength(3);
+    expect(
+      ["List(secrets/api)", "List(secrets/*)", "List(secrets/api*)", "List(secrets/apikey)"].filter(
+        grants,
+      ),
+    ).toEqual([]);
+    // With its qualifier left out, it stands for every value there is.
+    const loose = buildTool({
+      name: "Loose",
+      description: "d",
+      inputSchema: z.object({ namespace: z.string().optional(), prefix: z.string().optional() }),
+      operativeArgs: [
+        { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+      ],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(loose, { prefix: "api" })).toEqual([
+      { kind: "id", canonical: ["*"], standsForAny: [""], standsForAnyRun: true },
+    ]);
+  });
+
+  test("buildTool refuses a prefix on a kind read whole, or without a `*` default", () => {
+    const make = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({ p: z.string().optional() }),
+        operativeArgs: [{ field: "p", ...arg } as never],
+        readOnly: true,
+        execute: async () => "ok",
+      });
+    expect(make({ kind: "path", default: "*", prefix: true })).toThrow(/prefix/);
+    expect(make({ kind: "id", prefix: true })).toThrow(/default "\*"/);
+    expect(make({ kind: "id", default: "*", prefix: false })).toThrow(/prefix/);
+    expect(make({ kind: "id", default: "*", prefix: true })).not.toThrow();
+  });
+
   test("a path within a directory field is resolved from that directory", () => {
     const tool = buildTool({
       name: "Stage",

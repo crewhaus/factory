@@ -635,13 +635,20 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   glob covers every value AND every `<qualifier>/<value>`:
  *   `SearchCode(**)` does, `SearchCode(*)` does not (it covers no
  *   `acme/app`, which a search of one repository would need).
- * - `restrictOnly` — the declared default of a field that only relocates
- *   the tool (a store directory, the repository a branch operation runs
- *   in), standing in for a field the call left out while it carries another
- *   operative value. A deny or ask rule reads it like any value, so
- *   `alwaysDeny KvDelete(.crewhaus/state/**)` fires on a call that omits
- *   `stateDir`; an allow rule skips it, because the grant is about the
- *   record the call names (`alwaysAllow KvSet(scratch/*)`).
+ * - `standsForAnyRun` — with `standsForAny`: what follows each prefix is
+ *   any run of characters, `/` included, whatever the kind. A prefix filter
+ *   over keys that may hold `/` (KvList's `prefix`): `secrets/api` stands
+ *   for `secrets/api/v2` too, so an allow must cover that as well
+ *   (`KvList(secrets/**)` does, `KvList(secrets/*)` does not).
+ * - `restrictOnly` — a value only a deny or ask reads. The declared default
+ *   of a field that only relocates the tool (a store directory, the
+ *   repository a branch operation runs in), standing in for a field the
+ *   call left out while it carries another operative value: a deny or ask
+ *   rule reads it like any value, so `alwaysDeny
+ *   KvDelete(.crewhaus/state/**)` fires on a call that omits `stateDir`; an
+ *   allow rule skips it, because the grant is about the record the call
+ *   names (`alwaysAllow KvSet(scratch/*)`). Also a prefix read without its
+ *   qualifier, for a deny written that way (`alwaysDeny KvGet(apikey)`).
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -669,6 +676,7 @@ export type OperativeValue = {
   readonly caseInsensitive?: boolean;
   readonly standsForAny?: ReadonlyArray<string>;
   readonly anyQualifier?: boolean;
+  readonly standsForAnyRun?: boolean;
   readonly restrictOnly?: boolean;
 };
 
@@ -1068,7 +1076,7 @@ function valueMatches(
   // turns out to be is one it names — even when the environment was too
   // large to read (`outsideWorkspace`), which only decides WHICH program.
   if (polarity === "allow" && value.kind === "command" && value.canonical.length === 0) {
-    return argRe.matchesEveryAfter("", anyValueTail(value.kind));
+    return argRe.matchesEveryAfter("", anyValueTail(value));
   }
   if (value.outsideWorkspace === true) return polarity === "restrict";
   // A value that stands for every value (a field left out whose default is
@@ -1076,7 +1084,7 @@ function valueMatches(
   // canonical spelling `<prefix>*` is not a literal `*`, so `EvmGetLogs(1/?)`
   // cannot stand in for `EvmGetLogs(1/*)`.
   if (polarity === "allow" && value.standsForAny !== undefined) {
-    const tail = anyValueTail(value.kind);
+    const tail = anyValueTail(value);
     // A value whose qualifier was left out too stands for every
     // `<qualifier>/<value>` as well (a search naming no owner reaches every
     // repository), so an allow must cover both widths: `SearchIssues(*)`
@@ -1181,9 +1189,12 @@ const ANY_VALUE = "*";
  * What follows a prefix in a value that stands for every value. An id, a
  * recipient or a text value is one segment after its qualifier (the address
  * after `<chainId>/`), so `EvmGetLogs(137/…)` does not fire on chain 1's
- * every-contract query; a path, a URL or a command may hold `/` anywhere.
+ * every-contract query; a path, a URL or a command may hold `/` anywhere,
+ * and so may a value marked `standsForAnyRun` (a prefix of a key).
  */
-function anyValueTail(kind: OperativeValueKind): AnyValueTail {
+function anyValueTail(value: OperativeValue): AnyValueTail {
+  if (value.standsForAnyRun === true) return "run";
+  const kind = value.kind;
   return kind === "path" || kind === "url" || kind === "command" ? "run" : "segment";
 }
 
@@ -1197,7 +1208,7 @@ function standsForAnyFires(
   argRe: GlobMatcher,
   absoluteGlob: boolean,
 ): boolean {
-  const tail = anyValueTail(value.kind);
+  const tail = anyValueTail(value);
   // One segment after the prefix — or, when the qualifier was left out too
   // (`anyQualifier`), also `<qualifier>/<value>`: two. A run already holds
   // any number of `/`.

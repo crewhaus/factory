@@ -296,6 +296,18 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * command tool that lets the call set its child's environment declares it
  * this way; without it, the environment is invisible to every rule.
  *
+ * `prefix: true`, for an `id`, `recipient` or `text` field, says its value
+ * is a prefix: the tool acts on every value that starts with it (KvList's
+ * `prefix` lists every key that begins with it). It needs `default: "*"` —
+ * a prefix left out filters nothing. The value stands for every value that
+ * begins with it, and what follows may hold `/`: a deny or ask naming any
+ * one of them fires (`alwaysDeny KvGet(secrets/apikey)` fires on a listing
+ * of `secrets` with prefix `""`, `api` or `apikey`, not `b`), and an allow
+ * must cover every one (`KvList(secrets/**)` grants prefix `api`;
+ * `KvList(secrets/*)` does not, since a key may hold `/`, and nor does
+ * `KvList(secrets/api)`). A deny written without the qualifier still fires
+ * on the value alone, as for any `within` field.
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -309,6 +321,7 @@ export type OperativeArg = {
   readonly within?: string;
   readonly relocates?: true;
   readonly env?: string;
+  readonly prefix?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

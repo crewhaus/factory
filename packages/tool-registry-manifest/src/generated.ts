@@ -4679,7 +4679,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
-      { field: "prefix", kind: "id", default: "*", within: "namespace" },
+      { field: "prefix", kind: "id", default: "*", within: "namespace", prefix: true },
     ],
     categories: ["state", "data-stores", "memory"],
     package: "@crewhaus/tool-state",

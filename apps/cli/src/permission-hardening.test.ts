@@ -433,6 +433,63 @@ describe("C004 — the readers beside the store writers read their default store
   });
 });
 
+describe("final review — KvList's prefix stands for every key that starts with it", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  beforeEach(async () => {
+    const out = await builtin("KvSet").execute({
+      namespace: "secrets",
+      key: "apikey",
+      value: SECRET,
+    });
+    expect(String(out)).toContain('"key":"apikey"');
+  });
+
+  test("a deny on one key fires on every listing that can return it, in every mode", async () => {
+    // The prefix used to be read as one more key: `prefix: ""` (the same
+    // unfiltered listing as leaving it out) and `prefix: "api"` met no deny
+    // on secrets/apikey, and the listing returned its value.
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "Kv*(secrets/apikey)"], ["alwaysAllow", "Kv*"])
+          : rules(["alwaysDeny", "Kv*(secrets/apikey)"]);
+      for (const prefix of [undefined, "", "a", "api", "apikey"]) {
+        const input = {
+          namespace: "secrets",
+          includeValues: true,
+          ...(prefix !== undefined ? { prefix } : {}),
+        };
+        const got = await gate("KvList", input, rs, mode);
+        expect({ mode, prefix, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+          mode,
+          prefix,
+          got: "deny",
+          leaked: false,
+        });
+      }
+      // A listing that cannot return the key is not this rule's business.
+      const other = { namespace: "secrets", prefix: "b", includeValues: true };
+      expect({ mode, got: await gate("KvList", other, rs, mode) }).toEqual({ mode, got: "allow" });
+    }
+  }, 60_000);
+
+  test("an allow grants a prefix only when it covers every key the listing can return", async () => {
+    const input = { namespace: "secrets", prefix: "api" };
+    for (const [pattern, want] of [
+      ["KvList(secrets/**)", "allow"],
+      ["KvList(secrets/api**)", "allow"],
+      // A key may hold `/`, so `*` does not cover every key under a prefix.
+      ["KvList(secrets/*)", "ask"],
+      // One key is not every key that starts with it.
+      ["KvList(secrets/api)", "ask"],
+      ["KvList(secrets/apikey)", "ask"],
+    ] as const) {
+      const got = await gate("KvList", input, rules(["alwaysAllow", pattern]));
+      expect({ pattern, got }).toEqual({ pattern, got: want });
+    }
+  }, 30_000);
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as
