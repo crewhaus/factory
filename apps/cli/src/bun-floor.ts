@@ -10,14 +10,18 @@
  *   came back "busy"; the test suite cannot run there at all
  *   (`beforeAll(fn, timeout)` is rejected).
  * - On 1.3.11, Linux x64 (CI run 36615945808), tool-safety's own tests fail:
- *   a terminated batch kept its thread for the whole batch, and
- *   String.prototype.replace split a surrogate pair against the spec. The
+ *   a terminated batch kept its thread for the whole batch, and the built-in
+ *   String.prototype.replace, after an empty match without the `u` flag,
+ *   stepped over a whole surrogate pair where the spec steps one code unit
+ *   (tool-safety's replace follows the spec, so the two disagreed). The
  *   first 0.7.1 floor was 1.3.11, which promised the guarantee exactly where
  *   CI refuted it.
  * - On 1.3.13 and 1.3.14 both pass on Linux arm64, and on 1.3.14 on macOS,
  *   where this whole tree is developed and tested. They also pass with the
  *   x64 builds of 1.3.13 and 1.3.14 (macOS, under Rosetta), so the x64 code
  *   generator is not what failed; the Bun version is the difference we can see.
+ * - On 1.3.14, Linux x64, CI confirms both (runs 36661296227 and 36661300003):
+ *   the terminated batch's thread is gone in about 0.1 s, and replace agrees.
  *
  * So the floor is 1.3.14, and CI's and the release jobs' Bun pins EQUAL it
  * (scripts/bun-floor.test.ts): the gating ubuntu x64 `ci` job is what proves
