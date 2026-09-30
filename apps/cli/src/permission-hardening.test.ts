@@ -666,6 +666,20 @@ describe("final review — a directory the tool walks is read with everything be
         });
       }
     }
+    // A deny on the hidden name, whatever directory it sits in: a brace list
+    // or class spelling it lists it too.
+    const key = rules(["alwaysDeny", "Glob(**/.deploy-key)"], ["alwaysAllow", "Glob"]);
+    for (const pattern of ["*/.deploy-key", "{secrets,x}/.deploy-key", "[s]ecrets/.deploy-key"]) {
+      await gate("Glob", { pattern }, rules(["alwaysAllow", "Glob"]));
+      const listedUnruledHere = leaks();
+      const got = await gate("Glob", { pattern }, key);
+      expect({ pattern, listedUnruledHere, got, listed: leaks() }).toEqual({
+        pattern,
+        listedUnruledHere: true,
+        got: "deny",
+        listed: false,
+      });
+    }
     // A scoped allow names none of these, so it grants none of them.
     const src = rules(["alwaysAllow", "Glob(src/*)"]);
     for (const pattern of [".env", "secrets/.deploy-key", "*/.deploy-key", "secrets/*"]) {

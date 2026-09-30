@@ -468,11 +468,22 @@ export const MAX_GLOB_PATTERN_CHARS = 1024;
 const LISTING_ONLY = /[[\]{}!\\]/;
 
 /**
+ * Whether a pattern {@link listingGlob} rewrites may spell a name that starts
+ * with `.`: a `.` at the start or after anything but a name character or a
+ * wildcard (a separator, a brace, a comma, a class, a negation, an escape),
+ * or a `.` inside a class. Bun.Glob lists such a name (`{a,b}` + `/.env`,
+ * `[s]ecrets` + `/.key`), so the rewrite's reading must hold hidden names
+ * too. After a letter, a digit or a wildcard (`*.ts`) a `.` starts no name.
+ */
+const SPELLS_HIDDEN = /(?:^|[^\p{L}\p{N}_~*?-])\.|\[[^\]]*\.[^\]]*\]/u;
+
+/**
  * A Glob pattern in this module's glob grammar, reading at least every path
  * the Glob tool can list with it. `*`, `**` and `?` mean the same in both. A
  * pattern with a bracket class, a brace list, a negation or an escape is
  * read as everything under its literal directory part (`src/{a,b}/*.ts` as
- * `src/**`), which only ever reads more.
+ * `src/**`), which only ever reads more; hidden names included when it may
+ * spell one ({@link SPELLS_HIDDEN}).
  */
 function listingGlob(pattern: string): string {
   if (!LISTING_ONLY.test(pattern)) return pattern;
@@ -1529,9 +1540,11 @@ function globPatternMatches(
   ).filter((c) => isAbsoluteSpelling(c) === absoluteGlob);
   if (candidates.some((c) => c.length > MAX_GLOB_PATTERN_CHARS)) return polarity === "restrict";
   // Below the workspace root the tool lists a hidden name only where the
-  // pattern writes it. A leading `./` is the root itself, not a hidden
-  // segment.
-  const visible = (c: string): boolean => !isAbsoluteSpelling(c);
+  // pattern writes it; a pattern read as everything under its literal
+  // directory that may write one is read with hidden names. A leading `./`
+  // is the root itself, not a hidden segment.
+  const visible = (c: string): boolean =>
+    !isAbsoluteSpelling(c) && !(LISTING_ONLY.test(c) && SPELLS_HIDDEN.test(c));
   const startsSegment = (c: string): boolean => !c.startsWith("./");
   const argGlob = compiled.argGlob ?? "";
   if (polarity === "allow") {

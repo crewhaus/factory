@@ -1539,8 +1539,14 @@ describe("a Glob pattern stands for every path it can list", () => {
     expect(fires("**/*.pem", "**/*.ts")).toBe(false);
     expect(fires("**/*.pem", "**/*")).toBe(true);
     // The tool's wildcards never read a hidden name...
-    for (const p of ["**/*", "*", "*.env", "?env", ".git/**", "{.env,x}", "[.]env"]) {
+    for (const p of ["**/*", "*", "*.env", "?env", ".git/**", "{a,b}/*", "src/{a,b}/*.ts"]) {
       expect({ p, fires: fires(".env", p) }).toEqual({ p, fires: false });
+      expect({ p, fires: fires("**/.env", p) }).toEqual({ p, fires: false });
+    }
+    // A brace list or class that may spell a hidden name is read as listing
+    // it: Bun.Glob lists `secrets/.key` for `{secrets,x}` + `/.key`.
+    for (const p of ["{secrets,x}/.env", "[s]ecrets/.env", "!(x)/.env", "{.env,x}", "[.]env"]) {
+      expect({ p, fires: fires("**/.env", p) }).toEqual({ p, fires: true });
     }
     // ...but it lists one the pattern writes (closeout review).
     for (const p of [".env", "**/.env", ".e*"]) {
@@ -1744,6 +1750,40 @@ describe("a Glob pattern stands for every path it can list", () => {
           });
         }
       }
+      // A brace list, a class or a negation is read as everything under the
+      // pattern's literal directory part; Bun.Glob lists a hidden name one of
+      // them spells out (`{a,b}` + `/.aa`), so that reading must include it.
+      let braceHidden = 0;
+      for (const raw of [
+        "{a,b}/.aa",
+        "[a]/.aa",
+        "!(b)/.aa",
+        "a*/[.]aa",
+        "{a,b}/*/.a",
+        "{.aaaa,b}",
+        "a/{.aa,b}",
+        "[.]aaaa",
+        "{,a}.aaa",
+        "{a,b}/*",
+        "[a]/*",
+      ]) {
+        const listed: string[] = [];
+        for await (const rel of new Bun.Glob(raw).scan({ cwd: root, onlyFiles: true })) {
+          listed.push(lexical(rel));
+        }
+        for (const v of listed) {
+          expect({ raw, v, fires: fires(v, raw) }).toEqual({ raw, v, fires: true });
+          if (hidden(v)) braceHidden++;
+        }
+        const rule = "**/.aa";
+        if (grants(rule, raw)) {
+          expect({ raw, unnamed: listed.filter((v) => !oracleGlobToRegex(rule).test(v)) }).toEqual({
+            raw,
+            unnamed: [],
+          });
+        }
+      }
+      expect(braceHidden).toBeGreaterThan(3);
       expect(files.length).toBeGreaterThan(900);
       expect(tally.patterns).toBeGreaterThan(250);
       expect(tally.listing).toBeGreaterThan(100);
