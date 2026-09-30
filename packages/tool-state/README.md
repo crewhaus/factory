@@ -168,9 +168,11 @@ pinecone or weaviate collection over HTTP, so this one is labelled
 `scope: "external"` with `ioCapability: "network"`, takes a justification, and
 is kept out of a list whose meaning it would quietly dilute.
 
-The categories follow the same line: `VectorDelete` is in `all-vector` and
-`all-network`, not in `all-state`, `all-memory` or `all-data-stores`. Grant it
-with one of those, or by name: `tools: [vectorDelete]`.
+The categories follow the same line: `VectorDelete` is only in `all-vector`.
+No roll-up includes it — not `all-state`, `all-memory` or `all-data-stores`,
+and not `all-network` either, on purpose: a spec that wrote `all-network` on
+0.7.0 did not get a destructive delete, and upgrading should not hand it one.
+Grant it with `tools: [all-vector]`, or by name: `tools: [vectorDelete]`.
 
 **It needs a store.** Name it in the spec, and a compiled bundle, `crewhaus run`
 and `crewhaus eval` build it at boot:

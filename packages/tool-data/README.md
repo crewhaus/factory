@@ -13,7 +13,7 @@ needs it.
 ```yaml
 tools:
   - all-data          # every tool below
-  - -DataConvert      # ...except this one
+  - -dataConvert      # ...except this one
 ```
 
 | Tool | What it does |
