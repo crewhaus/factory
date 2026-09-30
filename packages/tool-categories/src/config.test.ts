@@ -262,12 +262,41 @@ describe("keys nothing reads", () => {
   });
 
   test("an mcp block is not pointed at a builtin", () => {
-    // What hello-expert's snapshot wrote: MCP tool flags under tool_config.
-    const flags = { thredz: { wiki_write: { destructive: true } } };
     const expected =
       "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. Remove the block.";
-    expect(unused(["read", "fetch"], { mcp: flags })).toEqual([expected]);
+    expect(unused(["read", "fetch"], { mcp: { thredz: { wiki_write: {} } } })).toEqual([expected]);
     expect(unused(["fetch"], { mcp__thredz__wiki_write: {} })).toEqual([expected]);
+    // A flag tool_flags does not take (it only tightens) is not moved.
+    expect(
+      unused(["fetch"], { mcp: { thredz: { t: { destructive: false, readOnly: true } } } }),
+    ).toEqual([expected]);
+  });
+
+  test("an mcp block's trust flags are moved to the server's tool_flags, not deleted", () => {
+    // What hello-expert's snapshot wrote: MCP tool flags under tool_config,
+    // meant for the permission and audit layers. 0.7.1 reads them under
+    // mcp_servers.<server>.tool_flags; "remove the block" lost them.
+    const flags = {
+      thredz: {
+        wiki_write: { destructive: true },
+        wiki_set_signals: { destructive: true },
+        log_knowledge_gap: { sideEffect: "audit-and-allow" },
+      },
+    };
+    expect(unused(["read", "fetch"], { mcp: flags })).toEqual([
+      "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. To mark those tools, move the flags to the server's tool_flags (mcp_servers.thredz.tool_flags.per_tool.wiki_write: { destructive: true }; mcp_servers.thredz.tool_flags.per_tool.wiki_set_signals: { destructive: true }), then remove the block.",
+    ]);
+    expect(
+      unused(["fetch"], {
+        mcp__github__delete_repo: { destructive: true, requireJustification: true },
+      }),
+    ).toEqual([
+      "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. To mark those tools, move the flags to the server's tool_flags (mcp_servers.github.tool_flags.per_tool.delete_repo: { destructive: true, requireJustification: true }), then remove the block.",
+    ]);
+    // A flag on the server itself is its tool_flags' defaults.
+    expect(unused(["fetch"], { mcp: { github: { requireJustification: true } } })).toEqual([
+      "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. To mark those tools, move the flags to the server's tool_flags (mcp_servers.github.tool_flags.defaults: { requireJustification: true }), then remove the block.",
+    ]);
   });
 
   test("a misspelled key is pointed at the key this site reads", () => {

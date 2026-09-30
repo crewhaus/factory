@@ -198,9 +198,9 @@ export function checkToolConfigs(sites: ReadonlyArray<ToolSite>): ToolConfigChec
         });
       }
     }
-    for (const [key] of entries) {
+    for (const [key, value] of entries) {
       if (consumed.has(key)) continue;
-      unused.push({ path: `${base}.${key}`, message: unusedMessage(key, site) });
+      unused.push({ path: `${base}.${key}`, message: unusedMessage(key, site, value) });
     }
   }
   return { inits, conflicts, unused };
@@ -210,7 +210,7 @@ export function checkToolConfigs(sites: ReadonlyArray<ToolSite>): ToolConfigChec
  * Why a key is ignored and what to write instead. The path is not repeated:
  * every caller prints it in front of the message.
  */
-function unusedMessage(key: string, site: ToolSite): string {
+function unusedMessage(key: string, site: ToolSite, value?: unknown): string {
   const tools = site.tools;
   const named = builtinFor(key);
   if (named !== undefined) {
@@ -234,13 +234,59 @@ function unusedMessage(key: string, site: ToolSite): string {
     return `ignored, because no builtin reads this key. Did you mean ${sitePath(site)}.${near}?`;
   }
   if (key.toLowerCase() === "mcp" || key.startsWith("mcp__")) {
-    return "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. Remove the block.";
+    const ignored =
+      "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server.";
+    const moves = mcpToolFlagMoves(key, value);
+    if (moves.length === 0) return `${ignored} Remove the block.`;
+    return `${ignored} To mark those tools, move the flags to the server's tool_flags (${moves.join("; ")}), then remove the block.`;
   }
   const readable = consumableKeys(site);
   if (readable.length === 0) {
     return `ignored, because no builtin is called ${key}, and no tool in tools takes a tool_config block. Remove the block.`;
   }
   return `ignored, because no builtin is called ${key}. The tools here read ${readable.join(", ")}: write the block under one of those, or remove it.`;
+}
+
+/** The trust flags `mcp_servers.<server>.tool_flags` accepts: it only tightens. */
+const MCP_TOOL_FLAG_KEYS = ["destructive", "requireJustification"] as const;
+
+/** `{ destructive: true }` for the flags in `value` that tool_flags accepts. */
+function mcpToolFlagsIn(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const set = MCP_TOOL_FLAG_KEYS.filter((k) => (value as Record<string, unknown>)[k] === true);
+  return set.length === 0 ? undefined : `{ ${set.map((k) => `${k}: true`).join(", ")} }`;
+}
+
+/**
+ * Where each MCP trust flag written under `tool_config` belongs: a spec that
+ * marked `tool_config.mcp.<server>.<tool>` destructive meant
+ * `mcp_servers.<server>.tool_flags.per_tool.<tool>`, which 0.7.1 reads.
+ * Deleting the block, as the plain advice says, would lose that intent.
+ */
+function mcpToolFlagMoves(key: string, value: unknown): ReadonlyArray<string> {
+  const moves: string[] = [];
+  const perTool = (server: string, tool: string, flags: unknown) => {
+    const set = mcpToolFlagsIn(flags);
+    if (set !== undefined) moves.push(`mcp_servers.${server}.tool_flags.per_tool.${tool}: ${set}`);
+  };
+  if (key.startsWith("mcp__")) {
+    const rest = key.slice("mcp__".length);
+    const at = rest.indexOf("__");
+    if (at > 0 && at + 2 < rest.length) perTool(rest.slice(0, at), rest.slice(at + 2), value);
+    return moves;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return moves;
+  for (const [server, tools] of Object.entries(value as Record<string, unknown>)) {
+    const defaults = mcpToolFlagsIn(tools);
+    if (defaults !== undefined)
+      moves.push(`mcp_servers.${server}.tool_flags.defaults: ${defaults}`);
+    if (typeof tools !== "object" || tools === null || Array.isArray(tools)) continue;
+    for (const [tool, flags] of Object.entries(tools as Record<string, unknown>)) {
+      if (!(MCP_TOOL_FLAG_KEYS as ReadonlyArray<string>).includes(tool))
+        perTool(server, tool, flags);
+    }
+  }
+  return moves;
 }
 
 /** The documented key of each registrar this site's tools name, sorted. */
