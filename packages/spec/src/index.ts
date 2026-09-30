@@ -4419,6 +4419,11 @@ function checkProfileTools(
     if (declared === undefined || granted === undefined) continue;
     const sel = parseSelector(tool);
     if (sel.kind === "category") {
+      // A category the shape's own list names is accepted here as 0.7.0
+      // accepted it, whatever that list excludes. A profile a pool serves is
+      // checked again once both lists are expanded (the ir-pass names each
+      // tool the shape leaves out); one nothing serves narrows nothing.
+      if (declared.includes(tool)) continue;
       let keys: ReadonlyArray<string>;
       try {
         keys = toolsInCategory(sel.name);

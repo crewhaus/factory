@@ -138,6 +138,21 @@ describe("a model profile narrows to a tool the shape grants through a category 
     expect(agent).toContain('"profile":"cheap","tools":["csvParse"]');
     expect(agent).toContain("defaultCatalog.register(csvParse);");
   });
+
+  test("a profile naming the shape's own category compiles as on 0.7.0; a served one is checked expanded", () => {
+    const shape = "[read, all-data, -csvWrite]";
+    const profile =
+      "models:\n  fast: { model: claude-haiku-4-5, tags: [cheap], tools: [read, all-data] }\n";
+    // Declared and not served: 0.7.0 compiled it, and so does 0.7.1.
+    expect(agentTs(cli(shape, profile))).not.toContain("register(csvWrite)");
+    // Served by a pool: both lists expanded, the tool the shape leaves out is
+    // named — the refusal 0.7.0 gave this spec too.
+    const served = cli(shape, profile).replace(
+      "  instructions: i\n",
+      "  instructions: i\n  model_pool:\n    candidates:\n      - { model: $fast }\n      - { model: claude-sonnet-4-6, tags: [strong] }\n",
+    );
+    expect(() => compile(served)).toThrow(/"csvWrite" is not one of the block's tools/);
+  });
 });
 
 describe("toolSitesOf", () => {

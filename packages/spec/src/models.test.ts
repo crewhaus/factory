@@ -687,6 +687,38 @@ describe("profile tools are subset-only (0.6.0 §5.2)", () => {
     ).toEqual([]);
   });
 
+  test("a profile naming a category the shape's list names is accepted as on 0.7.0, exclusions or not", () => {
+    // 0.7.0 compared the literal selector: `all-data` under
+    // `[read, all-data, -csvWrite]` was valid, and stays valid.
+    expect(
+      issuePaths(
+        cli(
+          "tools: [read, all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [read, all-data] }",
+        ),
+      ),
+    ).toEqual([]);
+    expect(
+      issuePaths(
+        workflow(
+          "    tools: [read, all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [all-data] }",
+        ),
+      ),
+    ).toEqual([]);
+    // A category the shape's lists do not name is still judged by what it adds.
+    const wider = parseSpecIssues(
+      cli(
+        "tools: [read, all-data, -csvWrite]",
+        "models:",
+        "  fast: { model: m, tools: [all-git] }",
+      ),
+    );
+    expect(wider.map((i) => i.path.join("."))).toEqual(["models.fast.tools.0"]);
+  });
+
   test("a step's, node's or role's category grants to the shape's profiles and to its own pool", () => {
     for (const yaml of [
       workflow("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
