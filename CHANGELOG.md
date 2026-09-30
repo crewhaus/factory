@@ -540,6 +540,9 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   is reported. In a spec whose mode is `plan`, which reads no allow, the deny
   does fire: it is a note that it would stop in another mode, and `--strict`
   does not fail on it.
+- **`crewhaus compile --help` lists every warning that never fails
+  `--strict`.** It is now built from the same list `--strict` reads; the
+  hand-written copy had left out `mcp-server-name` and `permission-rule-note`.
 - **A bundle built with the optional IR passes decides as `crewhaus compile`'s
   does.** The passes (`applyIrPasses`, which the compiler worker's
   `POST /compile` accepts) re-sorted `permissions.rules` deny-first, so an
@@ -890,8 +893,8 @@ deny, warn or fail `--strict`; each says what to write instead.
   `federationDiscover.allowed_origins`, which can only narrow;
   `token.metadata_origins`; `token.multicall3` and `chaincall.multicall3`.
 - **New compile warnings.** `tool-config-unused`, `tool-unwired`,
-  `edge-unsafe-tool`, `sub-agent-tool-ungranted`, `tool-config-partial-cap`
-  and `model-plan-tool-config-unreachable` fail `--strict`.
+  `edge-unsafe-tool`, `sub-agent-tool-ungranted`, `tool-config-partial-cap`,
+  `model-plan-tool-config-unreachable` and `permission-rule` fail `--strict`.
   `provider-tool-cap`, `provider-tool-cap-unverified`,
   `channel-plugins-at-start`, `model-plan-tool-config-widens`,
   `model-plan-tool-config-narrowed`, `permission-rule-note` and
