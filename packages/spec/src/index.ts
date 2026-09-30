@@ -1,5 +1,10 @@
 import { SpecParseError } from "@crewhaus/errors";
-import { toolConfigKeysReaching } from "@crewhaus/tool-categories";
+import {
+  expandToolSelectors,
+  parseSelector,
+  toolConfigKeysReaching,
+  toolsInCategory,
+} from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -4141,17 +4146,71 @@ type SpecRoutedBlock = {
  *   - `committee` — `strategy.committee` is legal on single-turn hosts ONLY
  *     (workflow steps, graph nodes, crew roles): every REPL / per-message
  *     turn is one the user is waiting on (§7.6).
- *   - `shapeTools` — the tool list a profile/candidate `tools` must be a
- *     subset of; `undefined` when the block declares none (the default
- *     toolset is resolved by the emitter, so the subset check waits for the
- *     ir-pass) — EXCEPT on a tool-less shape (`toolLess`), where any profile
- *     `tools` is an error.
+ *   - `shapeTools` — the tool lists, as written, whose grant a
+ *     profile/candidate `tools` must be a subset of (one list per step, node
+ *     or role on the multi-agent shapes, whose grant is their union);
+ *     `undefined` when the block declares none (the default toolset is
+ *     resolved by the emitter, so the subset check waits for the ir-pass) —
+ *     EXCEPT on a tool-less shape (`toolLess`), where any profile `tools` is
+ *     an error. A list is compared by what it GRANTS, with its `all-<category>`
+ *     and `-<tool>` selectors expanded, so a profile may name `csvParse` on a
+ *     shape that lists `all-data`.
  */
 type SpecRoutedHost = {
   readonly committee: boolean;
-  readonly shapeTools: readonly string[] | undefined;
+  readonly shapeTools: ReadonlyArray<readonly string[]> | undefined;
   readonly toolLess: boolean;
 };
+
+/** The declared lists a host grants from, or undefined when none is declared. */
+function declaredToolLists(
+  lists: ReadonlyArray<readonly string[] | undefined>,
+): ReadonlyArray<readonly string[]> | undefined {
+  const declared = lists.filter((l): l is readonly string[] => l !== undefined);
+  return declared.length > 0 ? declared : undefined;
+}
+
+/**
+ * Every tool key the lists grant, categories expanded and exclusions applied
+ * per list, as the compiler expands them before lowering. Undefined when a
+ * list does not expand (an unknown category, an exclusion that removes
+ * nothing): the compiler reports that list, and a subset check against a
+ * grant nobody can read would only add a second, wrong error.
+ */
+function grantOf(lists: ReadonlyArray<readonly string[]>): ReadonlySet<string> | undefined {
+  const granted = new Set<string>();
+  for (const list of lists) {
+    try {
+      for (const key of expandToolSelectors(list).tools) granted.add(key);
+    } catch {
+      return undefined;
+    }
+  }
+  return granted;
+}
+
+/**
+ * The keys a profile list's own `-<tool>` / `-all-<category>` exclusions
+ * remove, so an `all-<category>` include is judged by what it keeps. An
+ * unknown category adds nothing here; the compiler reports it.
+ */
+function profileExclusions(tools: readonly string[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const raw of tools) {
+    const sel = parseSelector(raw);
+    if (!sel.exclude) continue;
+    if (sel.kind === "tool") {
+      out.add(sel.key);
+      continue;
+    }
+    try {
+      for (const key of toolsInCategory(sel.name)) out.add(key);
+    } catch {
+      // reported by the compiler
+    }
+  }
+  return out;
+}
 
 type SpecModelCheckContext = {
   readonly custom: SpecAddIssue;
@@ -4325,7 +4384,12 @@ function checkProfileTools(
     );
     return;
   }
+  const declared = host.shapeTools?.flat();
+  const granted = host.shapeTools !== undefined ? grantOf(host.shapeTools) : undefined;
+  const excluded = profileExclusions(tools);
   for (const [i, tool] of tools.entries()) {
+    // An exclusion only narrows the profile's own list.
+    if (tool.startsWith("-")) continue;
     if (tool.startsWith("mcp__")) {
       // A declared key may itself contain `__`, so match the keys first.
       if (namesDeclaredMcpServer(tool, ctx.mcpServers)) continue;
@@ -4352,10 +4416,30 @@ function checkProfileTools(
       }
       continue;
     }
-    if (host.shapeTools !== undefined && !host.shapeTools.includes(tool)) {
+    if (declared === undefined || granted === undefined) continue;
+    const sel = parseSelector(tool);
+    if (sel.kind === "category") {
+      let keys: ReadonlyArray<string>;
+      try {
+        keys = toolsInCategory(sel.name);
+      } catch {
+        continue; // an unknown category: the compiler reports it
+      }
+      const strays = keys.filter((k) => !excluded.has(k) && !granted.has(k));
+      if (strays.length > 0) {
+        const shown = strays.slice(0, 5).join(", ");
+        const more = strays.length > 5 ? ` and ${strays.length - 5} more` : "";
+        ctx.custom(
+          [...path, i],
+          `${path.join(".")}[${i}]: "${tool}" includes tools the shape's tools (${declared.join(", ")}) do not grant: ${shown}${more} — a per-model tools list can only narrow the shape's toolset, never add to it; exclude them (-<tool>) or name the tools you mean`,
+        );
+      }
+      continue;
+    }
+    if (!granted.has(tool)) {
       ctx.custom(
         [...path, i],
-        `${path.join(".")}[${i}]: "${tool}" is not one of the shape's tools (${host.shapeTools.join(", ")}) — a per-model tools list can only narrow the shape's toolset, never add to it`,
+        `${path.join(".")}[${i}]: "${tool}" is not one of the shape's tools (${declared.join(", ")}) — a per-model tools list can only narrow the shape's toolset, never add to it`,
       );
     }
   }
@@ -4559,7 +4643,7 @@ function checkSubAgent(
   }
   checkRoutedBlock(ctx, path, def, {
     committee: false,
-    shapeTools: def.tools,
+    shapeTools: declaredToolLists([def.tools]),
     toolLess: false,
   });
 }
@@ -4671,7 +4755,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: data.evaluation !== undefined,
       };
-      const shapeTools = data.target === "cli" ? data.tools : data.agent.tools;
+      const shapeTools = declaredToolLists([data.target === "cli" ? data.tools : data.agent.tools]);
       const host: SpecRoutedHost = { committee: false, shapeTools, toolLess: false };
       checkProfiles(ctx, host);
       checkRoutedBlock(ctx, ["agent"], data.agent, host);
@@ -4686,11 +4770,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: data.steps.some((s) => "kind" in s && s.kind === "judge"),
       };
-      const declaredTools = data.steps.flatMap((s) => ("tools" in s ? (s.tools ?? []) : []));
-      const anyStepDeclaresTools = data.steps.some((s) => "tools" in s && s.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyStepDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(data.steps.map((s) => ("tools" in s ? s.tools : undefined))),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4714,7 +4796,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         }
         checkRoutedBlock(ctx, ["steps", i], step, {
           committee: true,
-          shapeTools: step.tools,
+          shapeTools: declaredToolLists([step.tools]),
           toolLess: false,
         });
       }
@@ -4729,11 +4811,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         modelDirected,
         gradedInLoop: nodes.some(([, n]) => "kind" in n && n.kind === "judge"),
       };
-      const declaredTools = nodes.flatMap(([, n]) => ("tools" in n ? (n.tools ?? []) : []));
-      const anyNodeDeclaresTools = nodes.some(([, n]) => "tools" in n && n.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyNodeDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(nodes.map(([, n]) => ("tools" in n ? n.tools : undefined))),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4756,7 +4836,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         }
         checkRoutedBlock(ctx, ["nodes", name], node, {
           committee: true,
-          shapeTools: node.tools,
+          shapeTools: declaredToolLists([node.tools]),
           toolLess: false,
         });
       }
@@ -4771,11 +4851,9 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
         gradedInLoop: false,
       };
       const roles = Object.entries(data.roles);
-      const declaredTools = roles.flatMap(([, r]) => r.tools ?? []);
-      const anyRoleDeclaresTools = roles.some(([, r]) => r.tools !== undefined);
       checkProfiles(ctx, {
         committee: true,
-        shapeTools: anyRoleDeclaresTools ? declaredTools : undefined,
+        shapeTools: declaredToolLists(roles.map(([, r]) => r.tools)),
         toolLess: false,
       });
       checkModelSlot(ctx, ["model"], data.model);
@@ -4783,7 +4861,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       for (const [name, role] of roles) {
         checkRoutedBlock(ctx, ["roles", name], role, {
           committee: true,
-          shapeTools: role.tools,
+          shapeTools: declaredToolLists([role.tools]),
           toolLess: false,
         });
       }
@@ -4812,7 +4890,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       const toolLess = data.target === "pipeline";
       const host: SpecRoutedHost = {
         committee: false,
-        shapeTools: toolLess ? undefined : data.tools,
+        shapeTools: toolLess ? undefined : declaredToolLists([data.tools]),
         toolLess,
       };
       checkProfiles(ctx, host);
@@ -4838,7 +4916,7 @@ function modelSurfaceIssues(data: Spec, custom: SpecAddIssue): void {
       };
       checkProfiles(ctx, {
         committee: false,
-        shapeTools: data.target === "eval" ? data.agent.tools : data.tools,
+        shapeTools: declaredToolLists([data.target === "eval" ? data.agent.tools : data.tools]),
         toolLess: false,
       });
       checkModelSlot(ctx, ["agent", "model"], data.agent.model);

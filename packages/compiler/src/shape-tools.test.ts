@@ -121,6 +121,25 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
   });
 });
 
+describe("a model profile narrows to a tool the shape grants through a category (0.7.1)", () => {
+  test("csvParse under all-data compiles, and the candidate is advertised only it", () => {
+    const yaml = cli(
+      "[all-data]",
+      [
+        "models:",
+        "  cheap: { model: claude-haiku-4-5, tags: [cheap], tools: [csvParse] }",
+        "",
+      ].join("\n"),
+    ).replace(
+      "  instructions: i\n",
+      "  instructions: i\n  model_pool:\n    candidates:\n      - { model: $cheap }\n      - { model: claude-sonnet-4-6, tags: [strong] }\n",
+    );
+    const agent = agentTs(yaml);
+    expect(agent).toContain('"profile":"cheap","tools":["csvParse"]');
+    expect(agent).toContain("defaultCatalog.register(csvParse);");
+  });
+});
+
 describe("toolSitesOf", () => {
   test("names each site the way the spec author wrote it", () => {
     const ir = lower(parseSpec(graph("[read]")));
