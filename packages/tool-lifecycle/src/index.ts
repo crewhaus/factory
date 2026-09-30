@@ -237,8 +237,8 @@ function probeStateDir(abs: string): Loaded<"directory" | "absent"> {
 export const harnessRetire: RegisteredTool = buildTool({
   name: "HarnessRetire",
   operativeArgs: [
-    { field: "dir", kind: "path", default: "." },
-    { field: "archiveDir", kind: "path" },
+    { field: "dir", kind: "path", default: ".", beneath: "all" },
+    { field: "archiveDir", kind: "path", beneath: "all" },
     { field: "registryDir", kind: "path" },
   ],
   description:
@@ -545,8 +545,8 @@ export const harnessRetire: RegisteredTool = buildTool({
 export const storeMigrate: RegisteredTool = buildTool({
   name: "StoreMigrate",
   operativeArgs: [
-    { field: "dir", kind: "path", default: "." },
-    { field: "to", kind: "path" },
+    { field: "dir", kind: "path", default: ".", beneath: "all" },
+    { field: "to", kind: "path", beneath: "all" },
   ],
   description:
     "Migrate a harness's durable store to another store root: sessions and audit day files copied VERBATIM by @crewhaus/harness-lifecycle's own export path, every copied file then re-hashed at the destination, and a store-migration.json receipt written recording each file with its sha256. The source is not modified (beyond the audit evidence record the export appends), so the rollback is the source itself and re-running is safe: a second run reports what was already there. It REFUSES a destination that overlaps a live store, a destination already holding a receipt from a DIFFERENT source, and an overwrite of existing files unless overwrite is set. It also refuses a version-CHANGING migration outright rather than quietly copying records unchanged: the record transforms live in apps/cli, not here. What the export path does not carry — memories, prompts, graders, the registry, the policy files — is listed under notMigrated instead of being left silent. dryRun defaults to true.",
@@ -892,7 +892,7 @@ export const storeMigrate: RegisteredTool = buildTool({
 
 export const retentionEnforce: RegisteredTool = buildTool({
   name: "RetentionEnforce",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", beneath: "all" }],
   description:
     "Run a retention sweep or purge over a harness's stores: delete sessions past the age rule in .crewhaus/retention.json, honouring its pins and audit windows, and append a retention_enforcement record to the audit chain on a real run. The age rule, the pins, the windows and the audit-chain exclusion are all @crewhaus/harness-lifecycle's. dryRun defaults to true and reports the selection by COUNT and by the oldest and newest timestamps in it, so a misconfigured window is visible before it runs rather than after. It REFUSES a selection that covers every session in the store (unless allowDeleteAll says that is the intent), a purge cutoff in the future, a selection over maxDeletions, and — with no override at all — a selection containing a record whose timestamp is at or before 1971, because a timestamp that low is a broken clock rather than data that old and every age rule reads it as infinitely old. Audit data is never deleted. A store that cannot be enumerated is reported as unreadable, never as empty.",
   inputSchema: z.object({
@@ -1126,8 +1126,8 @@ export const retentionEnforce: RegisteredTool = buildTool({
 export const knowledgeSync: RegisteredTool = buildTool({
   name: "KnowledgeSync",
   operativeArgs: [
-    { field: "dir", kind: "path", default: "." },
-    { field: "sharedDir", kind: "path", default: SHARED_DIR_DEFAULT },
+    { field: "dir", kind: "path", default: ".", beneath: "all" },
+    { field: "sharedDir", kind: "path", default: SHARED_DIR_DEFAULT, beneath: "all" },
   ],
   description:
     "Push a harness's memories, grader and prompt fragments into a shared knowledge store, or pull the store's into the harness. Deduped by content hash and redacted by @crewhaus/harness-lifecycle, which drops any artifact still carrying a credential-shaped token after masking. A push requires the harness to have opted in (a .crewhaus/knowledge.json marker) and requires allowWithoutPiiRedaction, because @crewhaus/pii-redactor is not a dependency here: credential masking runs, but names, emails and phone numbers are NOT removed. Shared records that failed validation — a forged content hash, an oversized body — are COUNTED and reported rather than silently skipped, because a poisoned shared store is untrusted input, and a sync that moves more than maxArtifacts is refused. The text of artifacts dropped for still looking secret is never echoed back. dryRun defaults to true.",

@@ -308,6 +308,26 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `KvList(secrets/api)`). A deny written without the qualifier still fires
  * on the value alone, as for any `within` field.
  *
+ * `beneath`, for a `path`, says the tool also acts on what lies beneath the
+ * path when it names a directory: it walks it, and reads, lists, writes,
+ * moves or deletes what is inside (RemovePath, CopyPath, Grep, a git
+ * pathspec). A deny or ask naming anything there then fires on the
+ * directory: `alwaysDeny RemovePath(src/prod/**)` on `RemovePath src`, and
+ * `alwaysDeny Grep(secrets/**)` on a Grep of the whole workspace. An allow
+ * still reads the path alone (`RemovePath(build/**)` covers `RemovePath
+ * build`). `"all"` is everything beneath; `"visible"` everything whose names
+ * below the directory do not start with `.`, for a walk that skips hidden
+ * entries (Grep's), so `alwaysDeny Grep(.env)` does not fire on a search
+ * that never opens it. The runtime asks the filesystem: a path that names
+ * an existing file, or a link to one, stands for itself alone; one it
+ * cannot ask about (the edge worker) stands for what could be beneath it.
+ *
+ * `defaultAtRoot: true`, for a `path` declared `within` another field with
+ * a `default`, says the default is read from the workspace root rather
+ * than joined to the `within` directory. A git command given no path acts
+ * on the whole repository wherever it runs: `GitDiff` with `cwd: "src"` and
+ * no `paths` diffs secrets/ too, so its left-out paths are the root.
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -322,6 +342,8 @@ export type OperativeArg = {
   readonly relocates?: true;
   readonly env?: string;
   readonly prefix?: true;
+  readonly beneath?: "all" | "visible";
+  readonly defaultAtRoot?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

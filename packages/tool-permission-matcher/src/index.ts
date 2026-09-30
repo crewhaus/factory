@@ -80,6 +80,21 @@ type GlobToken =
   | { readonly k: "qmark" | "star" | "any" | "optPrefix" | "mid" | "optSuffix" };
 
 const SLASH = 0x2f;
+const DOT = 0x2e;
+
+/**
+ * Does `rest`, read after `prefix`, start a segment with `.` anywhere — a
+ * name a walk that skips hidden entries never reaches?
+ */
+function startsHiddenSegment(prefix: string, rest: string): boolean {
+  let atStart = prefix === "" || prefix.endsWith("/");
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest.charCodeAt(i);
+    if (atStart && c === DOT) return true;
+    atStart = c === SLASH;
+  }
+  return false;
+}
 
 function tokenizeGlob(glob: string): GlobToken[] {
   const tokens: GlobToken[] = [];
@@ -179,7 +194,8 @@ export type GlobMatcher = {
   /**
    * Whether the glob matches `prefix` followed by SOME continuation (possibly
    * none): a run without a `/` when `tail` is `"segment"`, any run at all
-   * when it is `"run"`.
+   * when it is `"run"`, and a run in which no segment starts with `.` when
+   * it is `"visible"`.
    */
   readonly matchesSomeAfter: (prefix: string, tail: AnyValueTail) => boolean;
   /**
@@ -198,9 +214,13 @@ export type GlobMatcher = {
 /**
  * What follows the prefix of a value that stands for every value: one path
  * segment (an address after `<chainId>/`), or any run of characters (a path,
- * a URL or a command, which may hold `/`).
+ * a URL or a command, which may hold `/`). `"visible"` is a run in which no
+ * segment starts with `.`: what a walk that skips hidden entries reaches
+ * beneath a directory (see `OperativeValue.beneath`). {@link
+ * GlobMatcher.matchesEveryAfter} reads it as `"run"`, which only asks more
+ * of an allow.
  */
-export type AnyValueTail = "segment" | "run";
+export type AnyValueTail = "segment" | "run" | "visible";
 
 /**
  * How many sets of automaton states {@link GlobMatcher.matchesEveryAfter}
@@ -217,8 +237,13 @@ function compileGlob(glob: string): GlobMatcher {
   if (tokens.every((t) => t.k === "lit")) {
     let literal = "";
     for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
-    const someAfter = (prefix: string, tail: AnyValueTail): boolean =>
-      literal.startsWith(prefix) && (tail === "run" || !literal.slice(prefix.length).includes("/"));
+    const someAfter = (prefix: string, tail: AnyValueTail): boolean => {
+      if (!literal.startsWith(prefix)) return false;
+      const rest = literal.slice(prefix.length);
+      if (tail === "run") return true;
+      if (tail === "segment") return !rest.includes("/");
+      return !startsHiddenSegment(prefix, rest);
+    };
     return {
       test: (value: string, work?: { steps: number }) => {
         if (work !== undefined) work.steps += value.length;
@@ -320,8 +345,42 @@ function compileGlob(glob: string): GlobMatcher {
     return current;
   }
 
+  /**
+   * Whether the accepting state is reachable after the prefix reading a
+   * `"visible"` run: the search carries whether the next character starts a
+   * segment, where a `.` may not be read.
+   */
+  function someVisibleAfter(prefix: string): boolean {
+    const startsSegment = prefix === "" || prefix.endsWith("/");
+    const seen = new Uint8Array(count * 2);
+    const stack: Array<readonly [number, boolean]> = afterPrefix(prefix).map(
+      (s) => [s, startsSegment] as const,
+    );
+    while (stack.length > 0) {
+      const [s, atStart] = stack.pop() as readonly [number, boolean];
+      const key = s * 2 + (atStart ? 1 : 0);
+      if (seen[key] === 1) continue;
+      seen[key] = 1;
+      const st = states[s] as GlobState;
+      if (st.t === "accept") return true;
+      if (st.t === "split") {
+        stack.push([st.b, atStart], [st.a, atStart]);
+      } else if (st.t === "lit") {
+        if (st.c === SLASH) stack.push([st.out, true]);
+        else if (!(atStart && st.c === DOT)) stack.push([st.out, false]);
+      } else if (st.t === "notSlash" || st.t === "anyChar") {
+        // Some character that is neither `/` nor `.` is allowed anywhere and
+        // leaves the segment open. Reading `/` here would only restrict what
+        // comes next, so it never reaches an accepting state this cannot.
+        stack.push([st.out, false]);
+      }
+    }
+    return false;
+  }
+
   /** Whether the accepting state is reachable after the prefix, reading `tail` characters. */
   function someAfter(prefix: string, tail: AnyValueTail): boolean {
+    if (tail === "visible") return someVisibleAfter(prefix);
     const seen = new Uint8Array(count);
     const stack = afterPrefix(prefix);
     while (stack.length > 0) {
@@ -437,8 +496,9 @@ function compileGlob(glob: string): GlobMatcher {
       // segment tail, one fewer than the segments it may have. Each set is
       // explored once per count of `/` read so far, so a glob that covers
       // `acme` but not `acme/app` is caught at the second segment.
-      const slashes = tail === "run" ? 0 : Math.max(1, segments) - 1;
-      const readsSlash = tail === "run" || slashes > 0;
+      const run = tail !== "segment";
+      const slashes = run ? 0 : Math.max(1, segments) - 1;
+      const readsSlash = run || slashes > 0;
       const alphabet = new Set<number>();
       for (const st of states) {
         if (st.t === "lit" && (readsSlash || st.c !== SLASH)) alphabet.add(st.c);
@@ -640,6 +700,16 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   over keys that may hold `/` (KvList's `prefix`): `secrets/api` stands
  *   for `secrets/api/v2` too, so an allow must cover that as well
  *   (`KvList(secrets/**)` does, `KvList(secrets/*)` does not).
+ * - `beneath` — a path the tool walks when it names a directory (see
+ *   `beneath` on `OperativeArg`): the directory's spellings as prefixes
+ *   (`src/`, `/abs/ws/src/`; the workspace root is the empty prefix). A deny
+ *   or ask also fires when its glob names anything after one of them —
+ *   `alwaysDeny RemovePath(src/prod/**)` on `RemovePath src` — skipping
+ *   names that start with `.` below the directory when `beneathSkipsHidden`
+ *   is set (Grep's walk never opens them). An allow never reads it.
+ * - `notDirectory` — the path names an existing entry that is not a
+ *   directory (nor a link to one), so nothing lies beneath it: the runtime's
+ *   canonicaliser sets it, and a `beneath` field then stands for itself.
  * - `restrictOnly` — a value only a deny or ask reads. The declared default
  *   of a field that only relocates the tool (a store directory, the
  *   repository a branch operation runs in), standing in for a field the
@@ -677,6 +747,9 @@ export type OperativeValue = {
   readonly standsForAny?: ReadonlyArray<string>;
   readonly anyQualifier?: boolean;
   readonly standsForAnyRun?: boolean;
+  readonly beneath?: ReadonlyArray<string>;
+  readonly beneathSkipsHidden?: boolean;
+  readonly notDirectory?: boolean;
   readonly restrictOnly?: boolean;
 };
 
@@ -1116,6 +1189,11 @@ function valueMatches(
   if (value.standsForAny !== undefined && standsForAnyFires(value, compiled, argRe, absoluteGlob)) {
     return true;
   }
+  // A directory the tool walks: a deny or ask naming anything beneath it
+  // fires on it, so `RemovePath src` meets `alwaysDeny RemovePath(src/prod/**)`.
+  if (value.beneath !== undefined && beneathFires(value, compiled, argRe, absoluteGlob)) {
+    return true;
+  }
   // A deny or ask on a path is not dodged by spelling the name another way
   // the filesystem treats as the same: another Unicode normal form always,
   // and another letter case where the filesystem ignores case.
@@ -1234,6 +1312,28 @@ function standsForAnyFires(
   if (!foldsCase) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   return prefixes.some((prefix) => someAfter(folded, prefix.normalize("NFC").toLowerCase()));
+}
+
+/**
+ * Does a deny or ask glob name something beneath a directory the tool walks
+ * (`OperativeValue.beneath`)? What follows a prefix is any run, or a run
+ * with no hidden name when the walk skips them; a path is folded like any
+ * path (NFC, and letter case where its filesystem ignores it).
+ */
+function beneathFires(
+  value: OperativeValue,
+  compiled: CompiledPattern,
+  argRe: GlobMatcher,
+  absoluteGlob: boolean,
+): boolean {
+  const tail: AnyValueTail = value.beneathSkipsHidden === true ? "visible" : "run";
+  const prefixes = (value.beneath ?? []).filter(
+    (prefix) => isAbsoluteSpelling(prefix) === absoluteGlob,
+  );
+  if (prefixes.some((prefix) => argRe.matchesSomeAfter(prefix, tail))) return true;
+  const ignoreCase = value.caseInsensitive === true;
+  const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
+  return prefixes.some((prefix) => folded.matchesSomeAfter(foldPath(prefix, ignoreCase), tail));
 }
 
 /**

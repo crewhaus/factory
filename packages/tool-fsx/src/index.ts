@@ -1093,8 +1093,8 @@ function copyContained(
 export const copyPath: RegisteredTool = buildTool({
   name: "CopyPath",
   operativeArgs: [
-    { field: "source", kind: "path" },
-    { field: "destination", kind: "path" },
+    { field: "source", kind: "path", beneath: "all" },
+    { field: "destination", kind: "path", beneath: "all" },
   ],
   description:
     "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when, from where the copy puts them, they point inside the workspace or exactly where the original points; an existing symlink under the destination is never written through.",
@@ -1280,8 +1280,8 @@ function sameEntryRespelled(a: string, b: string): boolean {
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
   operativeArgs: [
-    { field: "source", kind: "path" },
-    { field: "destination", kind: "path" },
+    { field: "source", kind: "path", beneath: "all" },
+    { field: "destination", kind: "path", beneath: "all" },
   ],
   description:
     "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move is refused when it would leave a symlink pointing outside the workspace somewhere it did not point before.",
@@ -1490,7 +1490,7 @@ export const removePath: RegisteredTool = buildTool({
   destructive: true,
   // A `RemovePath(build/**)` rule is about `path`, resolved the way this tool
   // resolves it: through a symlinked directory, `build/link/x` is `src/x`.
-  operativeArgs: [{ field: "path", kind: "path" }],
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   execute: async (input) => {
     const target = resolveSafe("RemovePath", input.path);
     if (target.abs === workspaceRoot()) return "refusing to delete the workspace root";
@@ -1554,7 +1554,7 @@ export const splitFile: RegisteredTool = buildTool({
   name: "SplitFile",
   operativeArgs: [
     { field: "path", kind: "path" },
-    { field: "outputDir", kind: "path" },
+    { field: "outputDir", kind: "path", beneath: "all" },
   ],
   description:
     "Split a file into numbered parts by byte size or by line count, streaming rather than loading it. Use it to get a file under a size limit, or to hand a huge log to something that processes one chunk at a time.",
@@ -1943,7 +1943,7 @@ const timeoutField = z
 export const archiveCreate: RegisteredTool = buildTool({
   name: "ArchiveCreate",
   operativeArgs: [
-    { field: "source", kind: "path" },
+    { field: "source", kind: "path", beneath: "all" },
     { field: "output", kind: "path" },
   ],
   description:
@@ -2075,7 +2075,7 @@ export const archiveExtract: RegisteredTool = buildTool({
   name: "ArchiveExtract",
   operativeArgs: [
     { field: "archive", kind: "path" },
-    { field: "destination", kind: "path" },
+    { field: "destination", kind: "path", beneath: "all" },
   ],
   description:
     "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list, the total size and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped and no more than `maxBytes` was written.",

@@ -83,6 +83,12 @@
  *      key may hold `/`, and the prefix alone for a deny written without
  *      the qualifier (read one segment on, so a deny naming another
  *      namespace's key does not fire on every listing).
+ *    - a `path` declared `beneath` (a directory the tool walks: RemovePath,
+ *      Grep, a git pathspec) also carries its spellings as `beneath`
+ *      prefixes, so a deny or ask naming anything under it fires —
+ *      unless the canonicaliser marked it `notDirectory`. One declared
+ *      `defaultAtRoot` and left out is the workspace root, not its `within`
+ *      directory: a git command given no path acts on the whole repository.
  *    - a `relocates` field left out stands in with its default, which a
  *      deny or ask reads; when the call carries another operative value an
  *      allow skips it (`restrictOnly`), because the grant is about the
@@ -207,13 +213,16 @@ export function operativeValuesOf(
         continue;
       }
       switch (arg.kind) {
-        case "path":
-          values.push(
-            ...(every === true
-              ? everyPathValues(dir ?? ".", canonicalizePath)
-              : canonicalizePath(raw)),
-          );
+        case "path": {
+          if (every === true) {
+            values.push(...everyPathValues(dir ?? ".", canonicalizePath));
+            break;
+          }
+          const read = canonicalizePath(raw);
+          const { beneath } = arg;
+          values.push(...(beneath !== undefined ? read.map((v) => withBeneath(v, beneath)) : read));
           break;
+        }
         case "url":
           values.push(
             every === true
@@ -425,6 +434,9 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     // A path relative to a directory field; an absolute one ignores it.
     if (arg.kind === "path") {
       if (every) return { ...r, value: `${qualifier}/${r.value}`, dir: qualifier, every: true };
+      // A git command given no path acts on the whole repository, wherever
+      // it runs: its default is the workspace root, not the directory.
+      if (r.defaulted === true && arg.defaultAtRoot === true) return r;
       return isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` };
     }
     return {
@@ -495,6 +507,23 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
       ...(v.caseInsensitive === true ? { caseInsensitive: true } : {}),
     };
   });
+}
+
+/**
+ * A path the tool walks when it names a directory (`beneath` on its
+ * OperativeArg): each of its spellings as a prefix a deny or ask reads with
+ * anything after it. A path the canonicaliser found to be an existing
+ * non-directory stands for itself alone, and one outside the workspace
+ * already fires every deny.
+ */
+function withBeneath(value: OperativeValue, mode: "all" | "visible"): OperativeValue {
+  if (value.outsideWorkspace === true || value.notDirectory === true) return value;
+  const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
+  return {
+    ...value,
+    beneath: [...new Set([...value.canonical, ...(value.spellings ?? [])].map(under))],
+    ...(mode === "visible" ? { beneathSkipsHidden: true } : {}),
+  };
 }
 
 /**

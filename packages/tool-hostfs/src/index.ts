@@ -354,7 +354,7 @@ function platformRefusal(platform: HostPlatform): string | undefined {
 
 export const trashPath: RegisteredTool = buildTool({
   name: "TrashPath",
-  operativeArgs: [{ field: "paths", kind: "path" }],
+  operativeArgs: [{ field: "paths", kind: "path", beneath: "all" }],
   description:
     "Move paths into the operating system's trash, where they can be restored, instead of unlinking them. Use it wherever a harness would otherwise delete something it might want back. LINUX ONLY: it implements the FreeDesktop trash specification — a .trashinfo record naming the original location and the deletion time, the name claimed atomically, and the file MOVED, never copied. It refuses on macOS and Windows rather than approximating, because the only honest implementations there need an OS API this package cannot reach, and a 'trash' that quietly unlinks is worse than no trash at all. A path on a different filesystem from its trash is refused with that reason unless the volume's own top-level trash can be used, because a rename cannot cross a filesystem and a copy is not a trash. Ambiguous input — the same path twice, or a path nested inside another path in the same call — is refused rather than guessed at. Pass dryRun to see exactly what would move, planned by the same code that performs the move.",
   inputSchema: z.object({
@@ -473,7 +473,7 @@ type IndexReport = {
 
 export const osIndexSearch: RegisteredTool = buildTool({
   name: "OsIndexSearch",
-  operativeArgs: [{ field: "roots", kind: "path", default: "." }],
+  operativeArgs: [{ field: "roots", kind: "path", default: ".", beneath: "all" }],
   description:
     "Search the file index the operating system already keeps (Spotlight on macOS, plocate/locate on Linux) for paths inside the workspace. Use it to find a file by name, or on macOS by content, across a large tree without walking it. It is not IndexSearch, which is BM25 retrieval over an index a harness builds; this queries the machine's index and builds nothing. A stale, disabled or missing index is its own outcome, never 'no matches', and an empty answer the tool could not check (the index's state was unknown, or the backend's output was cut off) is 'noMatchesUnverified', which is not evidence the file is absent. Results are filtered to the search roots after the backend answers, and the limit applies after that filter. Content search is refused on Linux, whose index holds names only. The query is matched as a substring; * and ? are wildcards on both backends.",
   inputSchema: z.object({

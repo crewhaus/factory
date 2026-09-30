@@ -103,6 +103,25 @@ describe("canonicalWorkspacePath", () => {
     expect(values(".")[0]?.canonical[0]).toBe(".");
     expect(values("")[0]?.canonical[0]).toBe(".");
   });
+
+  test("a path naming an existing file, or a link to one, is marked notDirectory", () => {
+    // A tool that walks a directory (RemovePath, Grep) finds nothing beneath
+    // a file, so a deny naming something under the name cannot concern it
+    // (final review, 0.7.1). Anything that is, or may become, a directory
+    // stays unmarked.
+    symlinkSync("app.ts", path.join(ws, "src", "to-file"));
+    symlinkSync("../src", path.join(ws, "build", "to-dir"));
+    symlinkSync("missing", path.join(ws, "src", "dangling"));
+    const marked = (p: string) => values(p).map((v) => v.notDirectory === true);
+    expect(marked("src/app.ts")).toEqual([true]);
+    // The link and its target: both lead to the file.
+    expect(marked("src/to-file")).toEqual([true, true]);
+    expect(marked("src")).toEqual([false]);
+    expect(marked(".")).toEqual([false]);
+    expect(marked("build/to-dir")).toEqual([false, false]);
+    expect(marked("src/not-yet")).toEqual([false]);
+    expect(marked("src/dangling")).toEqual([false, false]);
+  });
 });
 
 // The workspace can be reached through a symlinked spelling of its root —

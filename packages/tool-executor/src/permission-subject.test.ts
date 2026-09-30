@@ -405,6 +405,111 @@ describe("url, command and id values", () => {
     expect(make({ kind: "id", default: "*", prefix: true })).not.toThrow();
   });
 
+  test("a path declared `beneath` carries its prefixes, unless it names a file (final review)", () => {
+    const remove = buildTool({
+      name: "Remove",
+      description: "d",
+      inputSchema: z.object({ path: z.string() }),
+      operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
+      destructive: true,
+      execute: async () => "ok",
+    });
+    // No filesystem to ask: whatever it names may be a directory.
+    expect(operativeValuesFor(remove, { path: "src" })).toEqual([
+      {
+        kind: "path",
+        canonical: ["src", "./src"],
+        spellings: ["src"],
+        beneath: ["src/", "./src/"],
+      },
+    ]);
+    const fires = (pattern: string, value: unknown) =>
+      matchesPattern(compilePattern(pattern), "Remove", value, {
+        polarity: "restrict",
+        operativeValues: operativeValuesFor(remove, value) ?? [],
+      });
+    expect(fires("Remove(src/prod/**)", { path: "src" })).toBe(true);
+    expect(fires("Remove(src/prod/**)", { path: "src/other" })).toBe(false);
+    // A canonicaliser that knows it is a file: nothing beneath it.
+    const file: PathCanonicalizer = (raw) => [
+      { kind: "path", canonical: [raw], notDirectory: true },
+    ];
+    expect(operativeValuesFor(remove, { path: "src/a.ts" }, { canonicalizePath: file })).toEqual([
+      { kind: "path", canonical: ["src/a.ts"], notDirectory: true },
+    ]);
+    // The workspace root is the empty prefix, and `visible` skips hidden names.
+    const grep = buildTool({
+      name: "Search",
+      description: "d",
+      inputSchema: z.object({ path: z.string().optional() }),
+      operativeArgs: [{ field: "path", kind: "path", default: ".", beneath: "visible" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(grep, {})).toEqual([
+      { kind: "path", canonical: ["."], spellings: ["."], beneath: [""], beneathSkipsHidden: true },
+    ]);
+    // Outside the workspace it already fires every deny; no prefix is added.
+    expect(operativeValuesFor(grep, { path: "../x" })?.[0]?.beneath).toBe(undefined);
+  });
+
+  test("a default declared `defaultAtRoot` is the workspace root, wherever the call runs", () => {
+    // A git command given no path acts on the whole repository: GitDiff with
+    // cwd `src` and no paths diffs secrets/ too.
+    const diff = buildTool({
+      name: "Diff",
+      description: "d",
+      inputSchema: z.object({ cwd: z.string().optional(), paths: z.array(z.string()).optional() }),
+      operativeArgs: [
+        {
+          field: "paths",
+          kind: "path",
+          within: "cwd",
+          default: ".",
+          beneath: "all",
+          defaultAtRoot: true,
+        },
+      ],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(diff, { cwd: "src" })?.[0]?.canonical).toEqual(["."]);
+    // A path the call names is still read from its directory.
+    expect(operativeValuesFor(diff, { cwd: "src", paths: ["a"] })?.[0]?.canonical).toEqual([
+      "src/a",
+      "./src/a",
+    ]);
+    const fires = (value: unknown) =>
+      matchesPattern(compilePattern("Diff(secrets/**)"), "Diff", value, {
+        polarity: "restrict",
+        operativeValues: operativeValuesFor(diff, value) ?? [],
+      });
+    expect(fires({ cwd: "src" })).toBe(true);
+    expect(fires({ cwd: "src", paths: ["a"] })).toBe(false);
+  });
+
+  test("buildTool refuses beneath or defaultAtRoot where they mean nothing", () => {
+    const make = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({ p: z.string().optional(), cwd: z.string().optional() }),
+        operativeArgs: [{ field: "p", ...arg } as never],
+        readOnly: true,
+        execute: async () => "ok",
+      });
+    expect(make({ kind: "url", beneath: "all" })).toThrow(/beneath/);
+    expect(make({ kind: "path", beneath: "some" })).toThrow(/beneath/);
+    expect(make({ kind: "path", default: ".", relocates: true, beneath: "all" })).toThrow(
+      /beneath/,
+    );
+    expect(make({ kind: "path", defaultAtRoot: true })).toThrow(/defaultAtRoot/);
+    expect(make({ kind: "path", within: "cwd", defaultAtRoot: true })).toThrow(/defaultAtRoot/);
+    expect(
+      make({ kind: "path", within: "cwd", default: ".", defaultAtRoot: true, beneath: "all" }),
+    ).not.toThrow();
+  });
+
   test("a path within a directory field is resolved from that directory", () => {
     const tool = buildTool({
       name: "Stage",

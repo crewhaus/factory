@@ -1838,7 +1838,7 @@ export const migrationApply: RegisteredTool = buildTool({
   name: "MigrationApply",
   operativeArgs: [
     { field: "database", kind: "path" },
-    { field: "directory", kind: "path" },
+    { field: "directory", kind: "path", beneath: "all" },
   ],
   description:
     "Apply the pending .sql migrations from a directory in filename order, recording each one and stopping at the first failure. Use to bring a database up to date: a migration already recorded is skipped, each one runs inside its own transaction so a failure leaves that file unapplied, and migrations applied before the failure stay applied. It refuses to start when an applied file has since been edited or when a pending file sorts before an applied one, and a file containing its own BEGIN or COMMIT is refused because it would fight the wrapping transaction.",

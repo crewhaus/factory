@@ -20,7 +20,9 @@
  * lets it satisfy an allow rule and always lets it satisfy a deny or ask.
  * A path on a filesystem that ignores case (or where that cannot be told) is
  * marked `caseInsensitive`, so a deny or ask compares it ignoring case — the
- * name a tool is about to CREATE has no stored spelling to read.
+ * name a tool is about to CREATE has no stored spelling to read. A path that
+ * names an existing file (or a link to one) is marked `notDirectory`: a tool
+ * that walks what a directory holds finds nothing beneath it.
  *
  * The workspace root can itself be reached another way — the shell's `$PWD`
  * through a symlinked directory, or a top-level symlink such as macOS's
@@ -31,7 +33,7 @@
  * path. (A spelling, not a canonical value: it widens what a deny or ask
  * catches, never what an allow grants.)
  */
-import { lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { PathCanonicalizer } from "@crewhaus/tool-executor";
 
@@ -109,6 +111,20 @@ function nameExists(p: string): boolean {
   try {
     lstatSync(p);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when `p` names an existing entry that is not a directory, following a
+ * symlink: nothing lies beneath it. A dangling link, or a name that is not
+ * there, is not known to be a file, so a tool that walks directories may
+ * still find something beneath it by the time it runs.
+ */
+function isNonDirectory(p: string): boolean {
+  try {
+    return !statSync(p).isDirectory();
   } catch {
     return false;
   }
@@ -263,6 +279,9 @@ export function canonicalWorkspacePath(
         relPosix === "." ? [".", toPosix(real)] : [relPosix, `./${relPosix}`, toPosix(real)],
       spellings: underAliases.length === 0 ? spellings : [...spellings, ...underAliases],
       ...(caseInsensitive ? { caseInsensitive: true } : {}),
+      // A tool that walks a directory (`beneath`) acts on nothing beneath a
+      // file, so a deny naming something under this name cannot concern it.
+      ...(isNonDirectory(real) ? { notDirectory: true } : {}),
     };
   };
   if (climbsOut(lexicalRel)) return [outside];

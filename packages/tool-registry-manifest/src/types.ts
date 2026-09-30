@@ -25,6 +25,10 @@ export type RegistryOperativeArg = {
   readonly env?: string;
   /** The value is a prefix: it stands for every value that starts with it. */
   readonly prefix?: true;
+  /** For a `path`: the tool also acts beneath a directory it names (`all` or `visible`). */
+  readonly beneath?: string;
+  /** For a `path` declared `within` a field: its default is read from the workspace root. */
+  readonly defaultAtRoot?: true;
 };
 
 export type RegistryEntry = {
@@ -120,6 +124,8 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.relocates === true ? { relocates: true as const } : {}),
     ...(arg.env !== undefined ? { env: arg.env } : {}),
     ...(arg.prefix === true ? { prefix: true as const } : {}),
+    ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
+    ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),
   };
 }
 

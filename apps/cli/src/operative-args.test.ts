@@ -368,3 +368,186 @@ describe("an optional operative field says what leaving it out means (C004)", ()
     expect(plain.sort()).toEqual([]);
   });
 });
+
+/**
+ * Final review (0.7.1): a path naming a directory was one point to a deny
+ * and a whole subtree to the tool, so `alwaysDeny RemovePath(src/prod/**)`
+ * missed `RemovePath src` and `alwaysDeny Grep(secrets/**)` missed a Grep
+ * of the whole workspace. A path field on a tool that walks a directory it
+ * is given — reads, lists, writes, moves or deletes what is inside —
+ * declares `beneath`, and the runtime reads it with everything under it.
+ *
+ * Every path field a builtin declares is classified here, so a new one fails
+ * until somebody says which it is. A relocating field (a store or the
+ * repository the tool works in) is out of scope by construction: a rule is
+ * about the record it names.
+ */
+describe("every path a builtin walks is read with what lies beneath it", () => {
+  /** `Tool.field` → why the field names one place, not a tree the tool walks. */
+  const ONE_PLACE: Readonly<Record<string, string>> = {
+    // A file: a directory there is refused or is an error.
+    ...Object.fromEntries(
+      [
+        "ArchiveCreate.output",
+        "ArchiveExtract.archive",
+        "BarcodeEncode.path",
+        "ChartRender.path",
+        "ConcatFiles.destination",
+        "ConcatFiles.paths",
+        "DatabaseBackup.database",
+        "DatabaseBackup.out",
+        "DatasetLint.leakScanPaths",
+        "DatasetLint.path",
+        "DiagramRender.path",
+        "DoctorFix.envPath",
+        "DoctorFix.specPath",
+        "DocxWrite.path",
+        "DownloadFile.path",
+        "EInvoiceBuild.outFile",
+        "Edit.path",
+        "EnvFileUpsert.path",
+        "EvalCoverage.dataset",
+        "ExifStrip.output",
+        "ExifStrip.path",
+        "ExportCsv.database",
+        "ExportCsv.out",
+        "ExportJson.database",
+        "ExportJson.out",
+        "FrontmatterWrite.path",
+        "GitBlame.path",
+        "GoldenUpdate.golden",
+        "IcsWrite.path",
+        "ImageCrop.output",
+        "ImageCrop.path",
+        "ImageResize.output",
+        "ImageResize.path",
+        "ImportCsv.database",
+        "ImportCsv.file",
+        "ImportJson.database",
+        "ImportJson.file",
+        "IncidentBundle.out",
+        "InvoiceRender.dbPath",
+        "LedgerPost.dbPath",
+        "ManifestDependencySet.manifest",
+        "MediaProbe.path",
+        "MigrationApply.database",
+        "NotebookEdit.path",
+        "PackageManifestVerify.paths",
+        "PaymentFileBuild.outFile",
+        "PdfMerge.inputs.path",
+        "PdfMerge.output",
+        "PdfSplit.output",
+        "PdfSplit.path",
+        "PngWrite.path",
+        "PrintDocument.path",
+        "QrEncode.path",
+        "Read.path",
+        "SpecAdvise.path",
+        "SpecPatchApply.path",
+        "SpecPin.specFile",
+        "SplitFile.path",
+        "SqlExec.database",
+        "SqlTransaction.database",
+        "SubtitleWrite.path",
+        "Write.path",
+        "XlsxWrite.path",
+      ].map((k) => [k, "a file"]),
+    ),
+    // A directory whose fixed, named files the tool reads or writes.
+    ...Object.fromEntries(
+      [
+        "CliVersionPin.dirs",
+        "DependencyAudit.cwd",
+        "DoctorFix.crewhausDir",
+        "EvalAggregate.run",
+        "FlywheelStatus.specDir",
+        "HarnessJobStatus.dir",
+        "HarnessRegister.dir",
+        "HarnessRegister.from",
+        "HarnessRetire.registryDir",
+        "HooksManage.dir",
+        "PreflightRun.harnessDir",
+        "RegistryOutdated.manifest",
+        "RouteControl.dir",
+      ].map((k) => [k, "fixed files in it"]),
+    ),
+    // The tool creates this entry, or a named one in it, and touches nothing
+    // already beneath it.
+    ...Object.fromEntries(
+      ["GitWorktreeAdd.path", "MakeDirectory.path", "TempDir.base", "TouchFile.path"].map((k) => [
+        k,
+        "created",
+      ]),
+    ),
+    // Where git runs. These act on the repository's refs, or on its whole
+    // working tree as a commit or a stash names it, which no path argument
+    // bounds: gate the tool itself (documented 0.7.1 limit).
+    ...Object.fromEntries(
+      [
+        "GitBranchList.cwd",
+        "GitCherryPick.cwd",
+        "GitConflicts.cwd",
+        "GitMergeBase.cwd",
+        "GitRemoteList.cwd",
+        "GitRevParse.cwd",
+        "GitStashList.cwd",
+        "GitStashPop.cwd",
+        "GitStatus.cwd",
+        "GitTagList.cwd",
+        "GitWorktreeList.cwd",
+      ].map((k) => [k, "a repository"]),
+    ),
+    // A glob pattern, matched as written; its directory part is not a
+    // directory argument (documented 0.7.1 limit).
+    "Glob.pattern": "a pattern",
+  };
+
+  /** Every declared path field that is not a relocating store or repository. */
+  const pathFields = () =>
+    builtins.flatMap((t) =>
+      (t.operativeArgs ?? [])
+        .filter((a) => a.kind === "path" && a.relocates !== true)
+        .map((a) => ({ key: `${t.name}.${a.field}`, arg: a })),
+    );
+
+  test("each path field is declared beneath or is a reviewed single place", () => {
+    const fields = pathFields();
+    // The sweep's hit count, so an empty load cannot pass.
+    expect(fields.length).toBeGreaterThanOrEqual(130);
+    const walked = fields.filter((f) => f.arg.beneath !== undefined).map((f) => f.key);
+    const single = fields.filter((f) => f.arg.beneath === undefined).map((f) => f.key);
+    expect(single.filter((k) => ONE_PLACE[k] === undefined).sort()).toEqual([]);
+    // A reviewed entry that now declares beneath, or no longer exists, is stale.
+    const known = new Set(fields.map((f) => f.key));
+    expect(Object.keys(ONE_PLACE).filter((k) => !known.has(k) || walked.includes(k))).toEqual([]);
+    expect(walked.length).toBe(39);
+    expect(walked).toContain("Grep.path");
+    expect(walked).toContain("RemovePath.path");
+    expect(walked).toContain("GitDiff.paths");
+  });
+
+  test("only Grep's walk skips hidden entries", () => {
+    const visible = pathFields().filter((f) => f.arg.beneath === "visible");
+    expect(visible.map((f) => f.key)).toEqual(["Grep.path"]);
+  });
+
+  test("a git command given no path is read as the whole repository", () => {
+    // Without pathspecs these act on the whole repository wherever they run
+    // (the index, every change, the commit's whole patch), so the default
+    // they leave out is the workspace root, not the `cwd` they run in.
+    const atRoot = pathFields()
+      .filter((f) => f.arg.defaultAtRoot === true)
+      .map((f) => f.key)
+      .sort();
+    expect(atRoot).toEqual(
+      [
+        "DiffLint.paths",
+        "GitCommit.paths",
+        "GitDiff.paths",
+        "GitLog.paths",
+        "GitShow.path",
+        "GitStashPush.paths",
+      ].sort(),
+    );
+  });
+});

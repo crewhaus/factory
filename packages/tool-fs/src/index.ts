@@ -643,10 +643,13 @@ export const grep: RegisteredTool = buildTool({
   // Both fields are operative: a `Grep(src/**)` allow needs `path` in src/
   // AND the regex to match, so a regex cannot carry an out-of-scope path;
   // a `Grep(*password*)` deny fires on the regex alone. Leaving `path` out
-  // searches the whole workspace, so a rule reads it as ".".
+  // searches the whole workspace, so a rule reads it as ".". The search walks
+  // what is beneath its path, skipping names that start with `.`, so a deny
+  // on anything it can reach there fires: `Grep(secrets/**)` on a search of
+  // the whole workspace, but not `Grep(.env)`, which the walk never opens.
   operativeArgs: [
     { field: "pattern", kind: "text" },
-    { field: "path", kind: "path", default: "." },
+    { field: "path", kind: "path", default: ".", beneath: "visible" },
   ],
   execute: async (input, ctx) => {
     const root = process.cwd();

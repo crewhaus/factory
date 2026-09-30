@@ -63,6 +63,35 @@ function valueAt(kind: OperativeValueKind, value: string, cwd: string): Operativ
 }
 
 /**
+ * How a builtin walks a directory one of its path fields names (`beneath`
+ * in the manifest): the widest walk any of them declares, since the scoped
+ * value may come from any. `undefined` when none walks.
+ */
+function builtinWalk(toolName: string): "all" | "visible" | undefined {
+  const walks = (TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs ?? [])
+    .filter((arg) => arg.kind === "path" && arg.beneath !== undefined)
+    .map((arg) => arg.beneath);
+  if (walks.length === 0) return undefined;
+  return walks.includes("all") ? "all" : "visible";
+}
+
+/**
+ * A path value the tool walks, read with what lies beneath it as the runtime
+ * reads it: a scoped `alwaysAllow RemovePath(build)` covers `RemovePath build`
+ * recursive, on which `alwaysDeny RemovePath(build/keep/**)` fires, so the
+ * allow overrides that deny too. Offline, the path may be a directory.
+ */
+function withWalk(value: OperativeValue, walk: "all" | "visible" | undefined): OperativeValue {
+  if (walk === undefined || value.kind !== "path") return value;
+  const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
+  return {
+    ...value,
+    beneath: value.canonical.map(under),
+    ...(walk === "visible" ? { beneathSkipsHidden: true } : {}),
+  };
+}
+
+/**
  * The deny and ask rules in `lower` that a settings-layer allow would decide
  * ahead of, for some call it covers. A bare allow covers every call, so any
  * guard naming the tool is overridden. A scoped allow covers the calls that
@@ -97,7 +126,7 @@ export function guardsOverridden(
       allow.valueKind === undefined
         ? undefined
         : [
-            valueAt(allow.valueKind, value, cwd),
+            withWalk(valueAt(allow.valueKind, value, cwd), builtinWalk(allow.toolName)),
             ...(allow.relocatingDefaults ?? builtinRelocatingDefaults(allow.toolName)).map((d) =>
               valueAt(d.kind, d.value, cwd),
             ),

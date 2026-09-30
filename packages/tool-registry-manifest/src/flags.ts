@@ -118,7 +118,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path" },
+      { field: "source", kind: "path", beneath: "all" },
       { field: "output", kind: "path" },
     ],
   },
@@ -133,7 +133,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "archive", kind: "path" },
-      { field: "destination", kind: "path" },
+      { field: "destination", kind: "path", beneath: "all" },
     ],
   },
   archiveList: {
@@ -594,7 +594,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".", beneath: "all" }],
   },
   concatFiles: {
     key: "concatFiles",
@@ -678,8 +678,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path" },
-      { field: "destination", kind: "path" },
+      { field: "source", kind: "path", beneath: "all" },
+      { field: "destination", kind: "path", beneath: "all" },
     ],
   },
   correlation: {
@@ -1199,7 +1199,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
+    operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   },
   diagramRender: {
     key: "diagramRender",
@@ -1220,7 +1220,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "paths",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   diffParse: {
     key: "diffParse",
@@ -1911,7 +1920,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "paths", kind: "path", default: ".", within: "cwd" },
+      { field: "paths", kind: "path", default: ".", within: "cwd", beneath: "all" },
       { field: "command", kind: "command", within: "cwd" },
     ],
   },
@@ -1924,7 +1933,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
+    operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   },
   frontmatterRead: {
     key: "frontmatterRead",
@@ -2010,7 +2019,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd", beneath: "all" }],
   },
   gitApplyPatch: {
     key: "gitApplyPatch",
@@ -2021,7 +2030,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
+    operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   },
   gitBlame: {
     key: "gitBlame",
@@ -2093,7 +2102,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "paths",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   gitConflicts: {
     key: "gitConflicts",
@@ -2115,7 +2133,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "paths",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   gitFileHistory: {
     key: "gitFileHistory",
@@ -2126,7 +2153,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path", within: "cwd" }],
+    operativeArgs: [{ field: "path", kind: "path", within: "cwd", beneath: "all" }],
   },
   gitLog: {
     key: "gitLog",
@@ -2137,7 +2164,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "paths",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   gitMergeBase: {
     key: "gitMergeBase",
@@ -2170,7 +2206,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", within: "cwd" }],
+    operativeArgs: [{ field: "paths", kind: "path", within: "cwd", beneath: "all" }],
   },
   gitRevParse: {
     key: "gitRevParse",
@@ -2192,7 +2228,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "path",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   gitStashList: {
     key: "gitStashList",
@@ -2225,7 +2270,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [
+      {
+        field: "paths",
+        kind: "path",
+        default: ".",
+        within: "cwd",
+        beneath: "all",
+        defaultAtRoot: true,
+      },
+    ],
   },
   gitStatus: {
     key: "gitStatus",
@@ -2308,7 +2362,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path" }],
+    operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   },
   glCodeSuggest: {
     key: "glCodeSuggest",
@@ -2387,7 +2441,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "pattern", kind: "text" },
-      { field: "path", kind: "path", default: "." },
+      { field: "path", kind: "path", default: ".", beneath: "visible" },
     ],
   },
   harnessInventory: {
@@ -2432,8 +2486,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "dir", kind: "path", default: "." },
-      { field: "archiveDir", kind: "path" },
+      { field: "dir", kind: "path", default: ".", beneath: "all" },
+      { field: "archiveDir", kind: "path", beneath: "all" },
       { field: "registryDir", kind: "path" },
     ],
   },
@@ -2836,7 +2890,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "dbPath", kind: "path", default: ".crewhaus/ledger.sqlite" },
-      { field: "outDir", kind: "path" },
+      { field: "outDir", kind: "path", beneath: "all" },
     ],
   },
   irr: {
@@ -3066,8 +3120,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "dir", kind: "path", default: "." },
-      { field: "sharedDir", kind: "path", default: ".crewhaus-shared" },
+      { field: "dir", kind: "path", default: ".", beneath: "all" },
+      { field: "sharedDir", kind: "path", default: ".crewhaus-shared", beneath: "all" },
     ],
   },
   kvDelete: {
@@ -3197,7 +3251,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd" }],
+    operativeArgs: [{ field: "paths", kind: "path", default: ".", within: "cwd", beneath: "all" }],
   },
   localTime: {
     key: "localTime",
@@ -3283,7 +3337,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "registryDir", kind: "path" }],
+    operativeArgs: [{ field: "registryDir", kind: "path", beneath: "all" }],
   },
   matchSubset: {
     key: "matchSubset",
@@ -3344,7 +3398,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "database", kind: "path" },
-      { field: "directory", kind: "path" },
+      { field: "directory", kind: "path", beneath: "all" },
     ],
   },
   migrationStatus: {
@@ -3392,8 +3446,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path" },
-      { field: "destination", kind: "path" },
+      { field: "source", kind: "path", beneath: "all" },
+      { field: "destination", kind: "path", beneath: "all" },
     ],
   },
   nanoId: {
@@ -3559,7 +3613,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "roots", kind: "path", default: "." }],
+    operativeArgs: [{ field: "roots", kind: "path", default: ".", beneath: "all" }],
   },
   outliers: {
     key: "outliers",
@@ -4261,7 +4315,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path" }],
+    operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   },
   renderTemplate: {
     key: "renderTemplate",
@@ -4291,7 +4345,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".", beneath: "all" }],
   },
   retry: {
     key: "retry",
@@ -4744,7 +4798,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "path", kind: "path" },
-      { field: "outputDir", kind: "path" },
+      { field: "outputDir", kind: "path", beneath: "all" },
     ],
   },
   sqlExec: {
@@ -4843,7 +4897,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "stateDir", kind: "path", default: ".crewhaus/state" }],
+    operativeArgs: [
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", beneath: "all" },
+    ],
   },
   statementParse: {
     key: "statementParse",
@@ -4883,8 +4939,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "dir", kind: "path", default: "." },
-      { field: "to", kind: "path" },
+      { field: "dir", kind: "path", default: ".", beneath: "all" },
+      { field: "to", kind: "path", beneath: "all" },
     ],
   },
   subtitleParse: {
@@ -5171,7 +5227,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path" }],
+    operativeArgs: [{ field: "paths", kind: "path", beneath: "all" }],
   },
   tree: {
     key: "tree",
@@ -5200,7 +5256,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
+    operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   },
   typedDataHash: {
     key: "typedDataHash",

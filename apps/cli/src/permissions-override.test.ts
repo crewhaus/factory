@@ -40,3 +40,28 @@ describe("a key-scoped allow and a guard on the store the key lives in", () => {
     expect(guardsOverridden(keyAllow, [absolute], "/ws")).toEqual([absolute]);
   });
 });
+
+describe("a path allow on a tool that walks directories (final review)", () => {
+  test("a guard beneath the allowed directory is overridden too", () => {
+    // Settings `alwaysAllow RemovePath(build)` decides `RemovePath build`
+    // (recursive) ahead of the spec, and the runtime reads that call with
+    // everything under build/, so the spec's deny on build/keep/** is one it
+    // overrides.
+    const beneath = yaml("alwaysDeny", "RemovePath(build/keep/**)");
+    const beside = yaml("alwaysDeny", "RemovePath(src/**)");
+    const allow = { toolName: "RemovePath", scopedValue: "build", valueKind: "path" as const };
+    expect(guardsOverridden(allow, [beneath, beside], "/ws")).toEqual([beneath]);
+    // A tool that reads one file has nothing beneath it.
+    const read = { toolName: "Read", scopedValue: "build", valueKind: "path" as const };
+    expect(guardsOverridden(read, [yaml("alwaysDeny", "Read(build/keep/**)")], "/ws")).toEqual([]);
+    // Grep's walk skips hidden names: a deny on one is not overridden.
+    const grep = { toolName: "Grep", scopedValue: "src", valueKind: "path" as const };
+    expect(
+      guardsOverridden(
+        grep,
+        [yaml("alwaysDeny", "Grep(src/.env)"), yaml("alwaysDeny", "Grep(src/secrets/**)")],
+        "/ws",
+      ).map((g) => g.pattern),
+    ).toEqual(["Grep(src/secrets/**)"]);
+  });
+});

@@ -490,6 +490,141 @@ describe("final review — KvList's prefix stands for every key that starts with
   }, 30_000);
 });
 
+describe("final review — a directory the tool walks is read with everything beneath it", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+
+  test("Grep: a deny on a directory fires on a search of the whole workspace, in every mode", async () => {
+    // The CHANGELOG's advice: keep the bare Grep allow and deny what must
+    // stay out. A search with no path, or `.`, walked into secrets/ while
+    // the deny read only `.`.
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.yml"), `api_key: ${SECRET}\n`);
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "Grep(secrets/**)"], ["alwaysAllow", "Grep"])
+          : rules(["alwaysDeny", "Grep(secrets/**)"]);
+      for (const input of [
+        { pattern: "api_key" },
+        { pattern: "api_key", path: "." },
+        { pattern: "api_key", path: "secrets" },
+      ]) {
+        const got = await gate("Grep", input, rs, mode);
+        expect({ mode, input, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+          mode,
+          input,
+          got: "deny",
+          leaked: false,
+        });
+      }
+      // A search that cannot reach secrets/ is not the rule's business.
+      const beside = await gate("Grep", { pattern: "api_key", path: "src" }, rs, mode);
+      expect({ mode, beside }).toEqual({ mode, beside: "allow" });
+    }
+  }, 60_000);
+
+  test("Grep: a deny on a hidden file does not stop a search that never opens it", async () => {
+    // Grep's walk skips names starting with `.`, so the CHANGELOG's own
+    // example, `alwaysDeny Grep(.env)`, leaves the everyday search allowed.
+    const rs = rules(["alwaysDeny", "Grep(.env)"], ["alwaysAllow", "Grep"]);
+    for (const input of [{ pattern: "API_KEY" }, { pattern: "API_KEY", path: "." }]) {
+      expect(await gate("Grep", input, rs)).toBe("allow");
+      expect(lastResult ?? "").not.toContain("API_KEY=original");
+    }
+    expect(await gate("Grep", { pattern: "API_KEY", path: ".env" }, rs)).toBe("deny");
+  }, 30_000);
+
+  test("RemovePath: a deny beneath a directory stops removing the directory; a sibling is removed", async () => {
+    mkdirSync(join(ws, "src", "prod"));
+    mkdirSync(join(ws, "src", "other"));
+    writeFileSync(join(ws, "src", "prod", "keep.ts"), "prod");
+    writeFileSync(join(ws, "src", "other", "x.ts"), "x");
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "RemovePath(src/prod/**)"], ["alwaysAllow", "RemovePath"])
+          : rules(["alwaysDeny", "RemovePath(src/prod/**)"]);
+      const got = await gate("RemovePath", { path: "src", recursive: true }, rs, mode);
+      expect({ mode, got }).toEqual({ mode, got: "deny" });
+      expect(existsSync(join(ws, "src", "prod", "keep.ts"))).toBe(true);
+    }
+    const rs = rules(["alwaysDeny", "RemovePath(src/prod/**)"], ["alwaysAllow", "RemovePath"]);
+    expect(await gate("RemovePath", { path: "src/other", recursive: true }, rs)).toBe("allow");
+    expect(existsSync(join(ws, "src", "other"))).toBe(false);
+    expect(existsSync(join(ws, "src", "prod", "keep.ts"))).toBe(true);
+  }, 60_000);
+
+  test("RemovePath: a file has nothing beneath it, so a deny about subtrees leaves it alone", async () => {
+    const rs = rules(["alwaysDeny", "RemovePath(**/.git/**)"], ["alwaysAllow", "RemovePath"]);
+    expect(await gate("RemovePath", { path: "src/app.ts" }, rs)).toBe("allow");
+    expect(existsSync(join(ws, "src", "app.ts"))).toBe(false);
+    // A directory may hold a .git of its own, and the gate cannot see inside.
+    mkdirSync(join(ws, "vendor"));
+    expect(await gate("RemovePath", { path: "vendor", recursive: true }, rs)).toBe("deny");
+    expect(existsSync(join(ws, "vendor"))).toBe(true);
+  }, 30_000);
+
+  test("a git command given no path is read as the whole repository, wherever it runs", async () => {
+    // GitDiff with `cwd: "src"` and no paths diffs the whole repository,
+    // secrets/ included; its left-out paths used to be read as `src`.
+    const repo = join(ws, "repo");
+    const sh = (...argv: string[]) => {
+      const run = Bun.spawnSync(["git", ...argv], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+      if (run.exitCode !== 0) throw new Error(`git ${argv.join(" ")}: ${run.stderr.toString()}`);
+      return run.stdout.toString();
+    };
+    mkdirSync(join(repo, "secrets"), { recursive: true });
+    mkdirSync(join(repo, "src"));
+    sh("init", "-q", "-b", "main");
+    sh("config", "user.email", "a@b.c");
+    sh("config", "user.name", "t");
+    sh("config", "commit.gpgsign", "false");
+    writeFileSync(join(repo, "secrets", "key.txt"), "old\n");
+    writeFileSync(join(repo, "src", "a.ts"), "a\n");
+    sh("add", "-A");
+    sh("commit", "-q", "-m", "init");
+    writeFileSync(join(repo, "secrets", "key.txt"), `${SECRET}\n`);
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const deny: Array<[PermissionRule["type"], string]> = [
+        ["alwaysDeny", "GitDiff(repo/secrets/**)"],
+      ];
+      const rs = rules(
+        ...deny,
+        ...(mode === "default" ? [["alwaysAllow", "GitDiff"] as const] : []),
+      );
+      for (const input of [
+        { cwd: "repo/src", mode: "patch" },
+        { cwd: "repo", mode: "patch" },
+        { mode: "patch", paths: ["repo"] },
+      ]) {
+        const got = await gate("GitDiff", input, rs, mode);
+        expect({ mode, input, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+          mode,
+          input,
+          got: "deny",
+          leaked: false,
+        });
+      }
+      const beside = await gate(
+        "GitDiff",
+        { cwd: "repo", mode: "patch", paths: ["src"] },
+        rs,
+        mode,
+      );
+      expect({ mode, beside }).toEqual({ mode, beside: "allow" });
+    }
+    // A write the same way: GitCommit with no paths commits the whole index.
+    const commit = rules(
+      ["alwaysDeny", "GitCommit(repo/secrets/**)"],
+      ["alwaysAllow", "GitCommit"],
+    );
+    sh("add", "secrets/key.txt");
+    const head = sh("rev-parse", "HEAD");
+    expect(await gate("GitCommit", { cwd: "repo/src", message: "x" }, commit)).toBe("deny");
+    expect(sh("rev-parse", "HEAD")).toBe(head);
+  }, 60_000);
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as

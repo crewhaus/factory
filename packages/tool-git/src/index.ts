@@ -174,7 +174,16 @@ export const gitStatus: RegisteredTool = buildTool({
 
 export const gitDiff: RegisteredTool = buildTool({
   name: "GitDiff",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Diff the working tree, the index, a ref or a commit range, as a summary, per-file line counts, a name list or a full patch. Use it to see exactly what a change touched before staging, committing or reviewing it.",
   inputSchema: z.object({
@@ -253,7 +262,16 @@ export const gitDiff: RegisteredTool = buildTool({
 
 export const gitLog: RegisteredTool = buildTool({
   name: "GitLog",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "List commits as structured records — sha, author, ISO dates, subject and body — filtered by range, path, author or count. Use it to answer what changed and when without parsing `git log`'s free-form text.",
   inputSchema: z.object({
@@ -301,7 +319,16 @@ export const gitLog: RegisteredTool = buildTool({
 
 export const gitShow: RegisteredTool = buildTool({
   name: "GitShow",
-  operativeArgs: [{ field: "path", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [
+    {
+      field: "path",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Return one file's contents at a ref, or one commit's metadata and patch. Use it to read a file as it was on another branch without checking that branch out.",
   inputSchema: z.object({
@@ -623,7 +650,7 @@ export const gitRevParse: RegisteredTool = buildTool({
 
 export const gitFileHistory: RegisteredTool = buildTool({
   name: "GitFileHistory",
-  operativeArgs: [{ field: "path", kind: "path", within: "cwd" }],
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd", beneath: "all" }],
   description:
     "List the commits that touched one path, following it across renames, with the per-commit change status. Use it to trace how a single file reached its current shape, including what it used to be called.",
   inputSchema: z.object({
@@ -771,7 +798,7 @@ export const gitWorktreeList: RegisteredTool = buildTool({
 
 export const gitAdd: RegisteredTool = buildTool({
   name: "GitAdd",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" }],
   description:
     "Stage the named paths, a directory with everything under it. Use it to build a commit deliberately, one path at a time; paths are literal, never wildcards, so a call stages exactly what it names.",
   inputSchema: z.object({
@@ -810,7 +837,16 @@ export const gitAdd: RegisteredTool = buildTool({
 
 export const gitCommit: RegisteredTool = buildTool({
   name: "GitCommit",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Commit what is staged, or only the named paths, with a message and an optional author and date. Use it to record a change; it never amends unless `amend` is set explicitly, so an existing commit is never rewritten by accident.",
   inputSchema: z.object({
@@ -995,7 +1031,16 @@ export const gitBranchDelete: RegisteredTool = buildTool({
 
 export const gitStashPush: RegisteredTool = buildTool({
   name: "GitStashPush",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+  operativeArgs: [
+    {
+      field: "paths",
+      kind: "path",
+      within: "cwd",
+      default: ".",
+      beneath: "all",
+      defaultAtRoot: true,
+    },
+  ],
   description:
     "Park the current changes on the stash stack with a message. Use a message always: the stack is shared by every worktree of the repository, so an unlabelled entry is hard to claim later.",
   inputSchema: z.object({
@@ -1162,7 +1207,7 @@ function escapingSymlink(
 
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
-  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
   description:
     "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
   inputSchema: z.object({
@@ -1360,7 +1405,7 @@ export const gitCherryPick: RegisteredTool = buildTool({
 
 export const gitResetPaths: RegisteredTool = buildTool({
   name: "GitResetPaths",
-  operativeArgs: [{ field: "paths", kind: "path", within: "cwd" }],
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", beneath: "all" }],
   description:
     "Unstage the named paths, restoring their index entries from a ref without touching the files on disk. Use it to undo a GitAdd; this package has no whole-tree reset, so no call here can discard your edits.",
   inputSchema: z.object({
@@ -1436,7 +1481,7 @@ export const gitWorktreeAdd: RegisteredTool = buildTool({
 
 export const gitWorktreeRemove: RegisteredTool = buildTool({
   name: "GitWorktreeRemove",
-  operativeArgs: [{ field: "path", kind: "path" }],
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   description:
     "Remove a worktree and its administrative entry. Use `force` only when you accept losing whatever is uncommitted there, because git otherwise refuses a dirty worktree for exactly that reason.",
   inputSchema: z.object({

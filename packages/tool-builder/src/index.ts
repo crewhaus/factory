@@ -373,6 +373,28 @@ function checkOperativeArgs(
         );
       }
     }
+    const { beneath, defaultAtRoot } = arg;
+    if (beneath !== undefined) {
+      if (beneath !== "all" && beneath !== "visible") {
+        fail(`${at}.beneath is "all", "visible" or left out`);
+      }
+      if (kind !== "path") {
+        fail(`${at}.beneath: only a "path" can name a directory with things beneath it`);
+      }
+      if (relocates === true) {
+        fail(
+          `${at}.beneath: a relocating field names the store the tool works in, and a rule is about the record there`,
+        );
+      }
+    }
+    if (defaultAtRoot !== undefined) {
+      if (defaultAtRoot !== true) fail(`${at}.defaultAtRoot is either true or left out`);
+      if (kind !== "path" || within === undefined || arg.default === undefined) {
+        fail(
+          `${at}.defaultAtRoot: only a "path" declared \`within\` another field, with a default, has a default to read from the root`,
+        );
+      }
+    }
     const { env } = arg;
     if (env !== undefined) {
       if (kind !== "command") {
@@ -394,6 +416,8 @@ function checkOperativeArgs(
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
         ...(prefix === true ? { prefix } : {}),
+        ...(beneath !== undefined ? { beneath } : {}),
+        ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
       }),
     );
   }

@@ -914,7 +914,7 @@ export const harnessJobStatus: RegisteredTool = buildTool({
 
 export const compileBundle: RegisteredTool = buildTool({
   name: "CompileBundle",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", beneath: "all" }],
   description:
     "Compare a harness's compiled bundle against its spec using @crewhaus/harness-supervisor's spec-hash stamp — the check the manager gates a start on — and recompile it when stale, running the same `crewhaus compile` (and `bun install` in the bundle) as `daemon start --compile`. Three verdicts: fresh, stale and UNDETERMINED (no stamp and no usable mtimes, or a spec that cannot be read or parsed). The supervisor treats undetermined as not stale; this tool says so, and refuses a real run on it with the command that fixes it. The compile runs with a minimal environment (no .env chain), and freshness is re-read afterwards: a compile that exited 0 and left the bundle stale says so. Every file it opens is contained, so a crewhaus.yaml or bundle directory a symlink puts outside the workspace is refused, in the preview and the real call alike. dryRun defaults to true.",
   inputSchema: z.object({

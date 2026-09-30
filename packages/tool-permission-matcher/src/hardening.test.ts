@@ -284,6 +284,72 @@ describe("matchesSomeAfter / matchesEveryAfter: a glob against a prefix and some
     // bun's 5 s default.
   }, 60_000);
 
+  test("a visible run and a two-segment every agree with the 0.7.0 compiler (final review)", () => {
+    // `"visible"`: some continuation in which no segment starts with `.`,
+    // what a walk that skips hidden entries reaches beneath a directory
+    // (Grep). Two segments: every `<value>` and every `<qualifier>/<value>`,
+    // what an allow must cover for a search that names no owner.
+    const continuations = (alphabet: readonly string[], maxSlashes: number): string[] => {
+      const out = [""];
+      for (let len = 1; len <= 5; len++) {
+        for (const base of out.filter((x) => x.length === len - 1)) {
+          for (const c of alphabet) out.push(base + c);
+        }
+      }
+      return out.filter((t) => t.split("/").length - 1 <= maxSlashes);
+    };
+    const runs = continuations(["a", "b", ".", "*", "/"], 5);
+    const pairs = continuations(["a", ".", "*", "/"], 1);
+    /** Independent of the matcher: a `.` that starts a segment is hidden. */
+    const visibleAfter = (prefix: string, t: string): boolean => {
+      for (let i = 0; i < t.length; i++) {
+        const startsSegment = i === 0 ? prefix === "" || prefix.endsWith("/") : t[i - 1] === "/";
+        if (startsSegment && t[i] === ".") return false;
+      }
+      return true;
+    };
+    const rand = prng(0xd07);
+    const globAlphabet = ["a", ".", "/", "*", "**", "?", ".a", "/."];
+    const prefixes = ["", "a", "a/", ".", "a/.", "/"];
+    const tally = { compared: 0, some: 0, every: 0 };
+    for (let g = 0; g < 300; g++) {
+      let glob = "";
+      const glen = 1 + Math.floor(rand() * 4);
+      for (let i = 0; i < glen; i++) {
+        glob += globAlphabet[Math.floor(rand() * globAlphabet.length)];
+      }
+      const oracle = oracleGlobToRegex(glob);
+      const argRe = compilePattern(`T(${glob})`)._argRe;
+      if (argRe === null) throw new Error("expected an arg glob");
+      for (const prefix of prefixes) {
+        const wantSome = runs.some((t) => visibleAfter(prefix, t) && oracle.test(prefix + t));
+        const wantEvery = pairs.every((t) => oracle.test(prefix + t));
+        const gotSome = argRe.matchesSomeAfter(prefix, "visible");
+        const gotEvery = argRe.matchesEveryAfter(prefix, "segment", 2);
+        if (gotSome !== wantSome || gotEvery !== wantEvery) {
+          throw new Error(
+            `glob ${JSON.stringify(glob)} after ${JSON.stringify(prefix)}: oracle visible=${wantSome} every2=${wantEvery}, got visible=${gotSome} every2=${gotEvery}`,
+          );
+        }
+        tally.compared++;
+        if (wantSome) tally.some++;
+        if (wantEvery) tally.every++;
+      }
+    }
+    expect(tally.compared).toBe(300 * 6);
+    expect(tally.some).toBeGreaterThan(200);
+    expect(tally.compared - tally.some).toBeGreaterThan(200);
+    expect(tally.every).toBeGreaterThan(20);
+    expect(tally.compared - tally.every).toBeGreaterThan(200);
+    // The literal fast path reads a visible run the same way.
+    const literal = (glob: string) => compilePattern(`T(${glob})`)._argRe;
+    expect(literal("src/.env")?.matchesSomeAfter("src/", "visible")).toBe(false);
+    expect(literal("src/.env")?.matchesSomeAfter("src/", "run")).toBe(true);
+    expect(literal("src/a.env")?.matchesSomeAfter("src/", "visible")).toBe(true);
+    expect(literal(".github/workflows/ci.yml")?.matchesSomeAfter(".github/", "visible")).toBe(true);
+    expect(literal("a/.b/c")?.matchesSomeAfter("", "visible")).toBe(false);
+  }, 60_000);
+
   test("matchesSegmentAfter is matchesSomeAfter with a segment tail", () => {
     for (const glob of ["1/*", "1/**", "**x", "1/a/b", "?", "1/?"]) {
       const argRe = compilePattern(`T(${glob})`)._argRe;
@@ -1279,6 +1345,82 @@ describe("MCP tool names", () => {
 // ---------------------------------------------------------------------------
 // C004 — a relocating field's default, and a call with no operative value
 // ---------------------------------------------------------------------------
+
+// Final review (0.7.1): a path naming a directory was one point to a rule and
+// a whole subtree to the tool, so `alwaysDeny RemovePath(src/prod/**)` did
+// not fire on `RemovePath src` (recursive), and `alwaysDeny Grep(secrets/**)`
+// not on a Grep of the whole workspace. A tool that walks what a directory
+// holds declares `beneath`, and the runtime hands its prefixes over.
+describe("a directory the tool walks: a deny or ask naming anything beneath it fires", () => {
+  const src: OperativeValue = {
+    kind: "path",
+    canonical: ["src", "./src", "/ws/src"],
+    spellings: ["src"],
+    beneath: ["src/", "./src/", "/ws/src/"],
+  };
+  const on = (value: OperativeValue, polarity: typeof allow | typeof restrict) => (p: string) =>
+    matchesPattern(compilePattern(p), "T", {}, { ...polarity, operativeValues: [value] });
+
+  test("a deny naming a path beneath fires; one beside it does not", () => {
+    const fires = on(src, restrict);
+    const beneath = [
+      "T(src/prod/**)",
+      "T(src/prod/keep.ts)",
+      "T(**/.git/**)",
+      "T(/ws/src/prod/**)",
+    ];
+    expect(beneath.filter(fires)).toEqual(beneath);
+    expect(
+      ["T(other/**)", "T(srcx/**)", "T(sr)", "T(/other/**)", "T(src2/a)"].filter(fires),
+    ).toEqual([]);
+    // The same value without the mark is one point, as it was.
+    const point: OperativeValue = { ...src, beneath: undefined };
+    expect(on(point, restrict)("T(src/prod/**)")).toBe(false);
+    expect(on(point, restrict)("T(src/**)")).toBe(true);
+  });
+
+  test("an allow reads the path alone", () => {
+    const grants = on(src, allow);
+    expect(["T(src)", "T(src/**)", "T(/ws/src)"].filter(grants)).toHaveLength(3);
+    expect(["T(src/prod/**)", "T(src/*)", "T(other/**)"].filter(grants)).toEqual([]);
+  });
+
+  test("a walk that skips hidden entries is not read as reaching them", () => {
+    // Grep with no path: the workspace root, walked by a glob that never
+    // opens a name starting with `.` below it.
+    const root: OperativeValue = {
+      kind: "path",
+      canonical: [".", "/ws"],
+      spellings: ["."],
+      beneath: ["", "/ws/"],
+      beneathSkipsHidden: true,
+    };
+    const fires = on(root, restrict);
+    expect(
+      ["T(secrets/**)", "T(**/*.pem)", "T(/ws/secrets/prod.yml)", "T(src/.hidden.ts)"].filter(
+        fires,
+      ),
+    ).toEqual(["T(secrets/**)", "T(**/*.pem)", "T(/ws/secrets/prod.yml)"]);
+    expect(
+      ["T(.env)", "T(**/.env)", "T(.git/**)", "T(a/.ssh/**)", "T(/etc/**)"].filter(fires),
+    ).toEqual([]);
+    // A hidden directory the call names is walked: only what is below it is
+    // held to the rule.
+    const github: OperativeValue = {
+      kind: "path",
+      canonical: [".github"],
+      beneath: [".github/"],
+      beneathSkipsHidden: true,
+    };
+    expect(on(github, restrict)("T(.github/workflows/**)")).toBe(true);
+    expect(on(github, restrict)("T(.github/.secret)")).toBe(false);
+  });
+
+  test("letter case is folded only where the filesystem ignores it", () => {
+    expect(on(src, restrict)("T(SRC/Prod/**)")).toBe(false);
+    expect(on({ ...src, caseInsensitive: true }, restrict)("T(SRC/Prod/**)")).toBe(true);
+  });
+});
 
 describe("a relocating field's default is read by a deny or ask, and skipped by an allow", () => {
   // KvDelete {namespace: "ns", key: "k"} with stateDir left out: the key it
