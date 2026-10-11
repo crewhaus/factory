@@ -20,7 +20,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { type AddressInfo, createServer } from "node:net";
+import { type AddressInfo, Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -1304,6 +1304,44 @@ describe("WaitForPort", () => {
       }
     }
 
+    /**
+     * Runs `body` with each probe's own timers held: the socket's idle timer
+     * is never armed, and the hard stop behind it, armed for exactly
+     * `hardStopMs`, is never scheduled. A probe then ends only on connect,
+     * refusal or close, never because the runner took longer than a timer to
+     * report the connect; the test's budget bounds one that never ends.
+     * Counts what it held, so a test can show that every probe's timers were.
+     */
+    async function withProbeTimersHeld<T>(
+      hardStopMs: number,
+      body: () => Promise<T>,
+    ): Promise<{ result: T; idleTimers: number; hardStops: number }> {
+      const held = { idleTimers: 0, hardStops: 0 };
+      const realSetTimeout = globalThis.setTimeout;
+      const idle = spyOn(Socket.prototype, "setTimeout").mockImplementation(function (
+        this: Socket,
+      ) {
+        held.idleTimers += 1;
+        return this;
+      } as Socket["setTimeout"]);
+      const hardStop = spyOn(globalThis, "setTimeout").mockImplementation(((
+        fn: (...args: unknown[]) => void,
+        delay?: number,
+        ...rest: unknown[]
+      ) => {
+        if (delay !== hardStopMs) return realSetTimeout(fn, delay, ...rest);
+        held.hardStops += 1;
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout);
+      try {
+        const result = await body();
+        return { result, ...held };
+      } finally {
+        idle.mockRestore();
+        hardStop.mockRestore();
+      }
+    }
+
     test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
       for (const host of [
         "169.254.169.254",
@@ -1345,6 +1383,11 @@ describe("WaitForPort", () => {
       // The deadline passes once it has counted three; the name is still
       // looked up once. (An open wait on the closed port raced a real 300 ms
       // deadline for two probes, on a port another process could take.)
+      // A probe that times out before it sees its connect reads as closed and
+      // meets this wait, so each probe's timers are held. With the clock
+      // frozen, timeoutMs only sizes them: the socket timeout is the deadline
+      // capped at 1 s, and the hard stop 1 s more. (A 300 ms deadline gave
+      // each probe a real 300 ms, which a runner held that long lost.)
       await new Promise<void>((resolve) => server.close(() => resolve()));
       let dialled = 0;
       server = createServer((socket) => {
@@ -1354,22 +1397,34 @@ describe("WaitForPort", () => {
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
       port = (server.address() as AddressInfo).port;
       lookups = [];
-      const closed = await withClockUntil(
-        () => dialled >= 3,
-        () =>
-          call(waitForPort, {
-            host: "db.internal",
-            port,
-            state: "closed",
-            timeoutMs: 300,
-            intervalMs: 10,
-          }),
+      const PROBE_HARD_STOP_MS = 1_000 + 1_000;
+      const {
+        result: closed,
+        idleTimers,
+        hardStops,
+      } = await withProbeTimersHeld(PROBE_HARD_STOP_MS, () =>
+        withClockUntil(
+          () => dialled >= 3,
+          () =>
+            call(waitForPort, {
+              host: "db.internal",
+              port,
+              state: "closed",
+              timeoutMs: 10_000,
+              intervalMs: 10,
+            }),
+        ),
       );
       expect({ satisfied: closed.satisfied, reason: closed.reason }).toEqual({
         satisfied: false,
         reason: "deadline",
       });
       expect(closed.attempts).toBeGreaterThanOrEqual(3);
+      // Every probe's timers were held, so none could end it early.
+      expect({ idleTimers, hardStops }).toEqual({
+        idleTimers: closed.attempts,
+        hardStops: closed.attempts,
+      });
       expect(lookups).toEqual(["db.internal"]);
     }, 30_000);
 
