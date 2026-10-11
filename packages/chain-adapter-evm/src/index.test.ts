@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { clearBoundaryCache } from "@crewhaus/boundary-classifier";
 import { ChainAdapterError } from "@crewhaus/chain-adapter-base";
 import { createEvmAdapter } from "./index";
@@ -255,18 +255,16 @@ describe("a read is bounded in time and in bytes (C041)", () => {
   }
 
   /**
-   * How a read ended, or "still pending" if it had not after two seconds —
-   * far past the 50-100 ms the reads below are given, so the sentinel only
-   * wins when nothing ends the read at all (0.7.0 waited forever).
+   * How a read ended: "resolved", or what it was rejected with. No timer of
+   * the test's own races the read: a read that nothing ends (0.7.0 waited
+   * forever) fails at the test's budget instead, which a slow runner's
+   * 50-300 ms deadlines and cancels do not come near.
    */
-  async function settle(read: Promise<unknown>): Promise<unknown> {
-    return Promise.race([
-      read.then(
-        () => "resolved",
-        (err: unknown) => err,
-      ),
-      Bun.sleep(2_000).then(() => "still pending"),
-    ]);
+  function settle(read: Promise<unknown>): Promise<unknown> {
+    return read.then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
   }
 
   test("every dispatch carries a signal and keeps the body raw, with no caller signal at all", async () => {
@@ -350,9 +348,63 @@ describe("a read is bounded in time and in bytes (C041)", () => {
   }
   const never = (): Promise<string> => new Promise(() => {});
 
+  /**
+   * Run `body` with the clock (`Date.now`) standing still and every timer of
+   * a second or more held: armed, never scheduled. The test reads the delays
+   * they were armed with and fires them itself, so a fallback hedge goes off
+   * when the test says, not when a runner's clock gets there. Shorter timers
+   * run as usual; a held timer that is cleared is dropped, as a real one
+   * would be.
+   */
+  async function withHedgesHeld<T>(
+    body: (hedges: { readonly armed: readonly number[]; fire: () => void }) => Promise<T>,
+  ): Promise<T> {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const armed: number[] = [];
+    const held = new Map<object, () => void>();
+    const ours = new WeakSet<object>();
+    const frozen = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(frozen);
+    const arm = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (delay === undefined || delay < 1_000) return realSetTimeout(fn, delay, ...rest);
+      const handle = {};
+      ours.add(handle);
+      armed.push(delay);
+      held.set(handle, () => fn(...rest));
+      return handle as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const disarm = spyOn(globalThis, "clearTimeout").mockImplementation(((handle?: unknown) => {
+      if (typeof handle === "object" && handle !== null && ours.has(handle)) held.delete(handle);
+      else realClearTimeout(handle as Parameters<typeof clearTimeout>[0]);
+    }) as typeof clearTimeout);
+    try {
+      return await body({
+        armed,
+        fire: () => {
+          const due = [...held.values()];
+          held.clear();
+          for (const run of due) run();
+        },
+      });
+    } finally {
+      disarm.mockRestore();
+      arm.mockRestore();
+      clock.mockRestore();
+    }
+  }
+
   test("fallback: a stalled primary gets its share of the deadline, then the secondary answers", async () => {
     // 0.7.1's first cut gave the primary the whole deadline and never asked
     // the secondary; a primary that stalls past it cost the whole read.
+    // The test fires the hedge itself, under a deadline no test reaches.
+    // With a real 500 ms hedge against a real 1 s deadline, timer order
+    // decided: a wall clock 1.2 s behind the deadline's timer failed it, and
+    // asking every URL at once (no share at all) passed it.
     const { fetchImpl, asked, signals } = scriptedFetch({
       "https://primary.test": never,
       "https://secondary.test": async () => "0x1234",
@@ -365,13 +417,20 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       },
       fetchImpl,
     );
-    const outcome = await settle(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 1_000 }));
-    expect(outcome).toBe("resolved");
+    await withHedgesHeld(async (hedges) => {
+      const read = adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 60_000 });
+      // The primary alone, with its share (what is left, split between it
+      // and the one URL after it) before the secondary is asked.
+      expect(asked).toEqual(["https://primary.test"]);
+      expect(hedges.armed).toEqual([30_000]);
+      hedges.fire();
+      expect(await read).toBe("0x1234");
+    });
     expect(asked).toEqual(["https://primary.test", "https://secondary.test"]);
     // The stalled primary is closed once the secondary has answered.
     expect(signals.get("https://primary.test")?.aborted).toBe(true);
     expect(signals.get("https://secondary.test")?.aborted).toBe(false);
-  }, 10_000);
+  });
 
   test("fallback: a slow primary that answers after the secondary was asked still wins", async () => {
     // The secondary is asked at the primary's share, and the primary answers
@@ -380,7 +439,7 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     const primary = new Promise<string>((r) => {
       release = r;
     });
-    const { fetchImpl, signals } = scriptedFetch({
+    const { fetchImpl, asked, signals } = scriptedFetch({
       "https://primary.test": () => primary,
       "https://secondary.test": () => {
         release("0xslow");
@@ -395,9 +454,18 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       },
       fetchImpl,
     );
-    expect(await adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 1_000 })).toBe("0xslow");
+    // The hedge is the test's to fire, as above.
+    await withHedgesHeld(async (hedges) => {
+      const read = adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 60_000 });
+      expect(hedges.armed).toEqual([30_000]);
+      hedges.fire();
+      expect(await read).toBe("0xslow");
+    });
+    expect(asked).toEqual(["https://primary.test", "https://secondary.test"]);
     expect(signals.get("https://secondary.test")?.aborted).toBe(true);
-  }, 10_000);
+    // Asking the secondary did not close the slow primary.
+    expect(signals.get("https://primary.test")?.aborted).toBe(false);
+  });
 
   test("quorum: two agreeing voters decide without waiting for a stalled third", async () => {
     // 0.7.1's first cut waited for every voter, then threw the agreed answer
@@ -422,6 +490,9 @@ describe("a read is bounded in time and in bytes (C041)", () => {
   });
 
   test("quorum: at the deadline, the voters that answered decide, and too few is a failure that says so", async () => {
+    // The real 300 ms deadline only stops the read. a.test's scripted answer
+    // needs no I/O, so it is counted before any timer can run, however late
+    // the deadline fires.
     const { fetchImpl } = scriptedFetch({
       "https://a.test": async () => "0x1234",
       "https://b.test": never,
@@ -448,7 +519,8 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     const stopped = (await settle(cancelled)) as ChainAdapterError;
     expect(stopped.message).toContain("the read was cancelled");
     expect(stopped.timedOut).toBe(false);
-  });
+    // Waits out its 300 ms deadline; a read nothing ends fails at this budget.
+  }, 10_000);
 
   test("a body past the cap is refused, not parsed from a prefix", async () => {
     const huge = `{"jsonrpc":"2.0","id":1,"result":"0x${"0".repeat(17 * 1024 * 1024)}"}`;

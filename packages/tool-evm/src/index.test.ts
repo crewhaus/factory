@@ -102,17 +102,14 @@ describe("tool-evm: a call's cancellation reaches the adapter (C041)", () => {
       });
       const cancel = new AbortController();
       setTimeout(() => cancel.abort(), 50);
-      // A two-second sentinel, far past the 50 ms cancel: it wins only when
-      // nothing ends the read (0.7.0 had no signal to end it with).
-      const outcome = await Promise.race([
-        EVM_TOOL_MAP.evmGetLogs
-          .execute(inputs["evmGetLogs"] as never, { signal: cancel.signal })
-          .then(
-            () => "resolved",
-            (err: unknown) => err,
-          ),
-        Bun.sleep(2_000).then(() => "still pending"),
-      ]);
+      // No timer of the test's own races the read: one that nothing ends
+      // (0.7.0 had no signal to end it with) fails at the test's budget.
+      const outcome = await EVM_TOOL_MAP.evmGetLogs
+        .execute(inputs["evmGetLogs"] as never, { signal: cancel.signal })
+        .then(
+          () => "resolved",
+          (err: unknown) => err,
+        );
       expect(String(outcome)).toContain("the read was cancelled");
     } finally {
       server.stop(true);
