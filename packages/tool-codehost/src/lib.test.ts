@@ -669,33 +669,59 @@ describe("excerptLog", () => {
 type Matcher =
   | { readonly kind: "char"; readonly test: (c: string) => boolean }
   | { readonly kind: "start" | "end" }
+  | {
+      readonly kind: "boundary";
+      /** `\b` wants a word boundary here, `\B` wants none. */
+      readonly wanted: boolean;
+      readonly word: (c: string) => boolean;
+    }
   | { readonly kind: "seq"; readonly items: readonly Matcher[] }
   | { readonly kind: "alt"; readonly options: readonly Matcher[] }
   | { readonly kind: "repeat"; readonly body: Matcher; readonly min: number; readonly max: number };
 
 /**
  * The structure of `re`, for {@link backtrackSteps}. Only the syntax the log
- * line patterns use is modelled — anchors, groups, alternation, greedy `*`
- * `+` `?`, and one-character atoms, whose membership the engine itself
- * decides — and anything else is refused rather than guessed at.
+ * patterns use is modelled — anchors, `\b` and `\B`, groups, alternation,
+ * greedy `*` `+` `?` `{n}` `{n,}` `{n,m}`, and one-character atoms, whose
+ * membership the engine itself decides — and anything else is refused rather
+ * than guessed at.
  */
 function parseMatcher(re: RegExp): Matcher {
-  if (/[muvy]/.test(re.flags)) throw new Error(`/${re.source}/${re.flags}: flags not modelled`);
-  const flags = re.flags.replace("g", "");
+  const flags = [...re.flags];
+  if (flags.some((flag) => "muv".includes(flag))) {
+    throw new Error(`/${re.source}/${re.flags}: flags not modelled`);
+  }
+  // Only `i` and `s` change what one character matches; `g` and `y` move
+  // where a match starts, which backtrackSteps does itself.
+  const charFlags = flags.filter((flag) => "is".includes(flag)).join("");
   const source = re.source;
   let at = 0;
   const refuse = (): never => {
     throw new Error(`/${source}/: the syntax at ${at} is not modelled`);
   };
-  const oneChar = (text: string): Matcher => {
-    const single = new RegExp(`^(?:${text})$`, flags);
-    return { kind: "char", test: (c) => single.test(c) };
+  const oneChar = (text: string): ((c: string) => boolean) => {
+    const single = new RegExp(`^(?:${text})$`, charFlags);
+    // The engine decides each character once: the answer cannot change.
+    const known = new Map<string, boolean>();
+    return (c) => {
+      let answer = known.get(c);
+      if (answer === undefined) {
+        answer = single.test(c);
+        known.set(c, answer);
+      }
+      return answer;
+    };
   };
   const term = (): Matcher => {
     const c = source[at] as string;
     if (c === "^" || c === "$") {
       at++;
       return { kind: c === "^" ? "start" : "end" };
+    }
+    if (c === "\\" && (source[at + 1] === "b" || source[at + 1] === "B")) {
+      const wanted = source[at + 1] === "b";
+      at += 2;
+      return { kind: "boundary", wanted, word: oneChar("\\w") };
     }
     const from = at;
     let atom: Matcher;
@@ -709,24 +735,49 @@ function parseMatcher(re: RegExp): Matcher {
         if (at >= source.length) refuse();
       }
       at++;
-      atom = oneChar(source.slice(from, at));
+      atom = { kind: "char", test: oneChar(source.slice(from, at)) };
     } else if (c === "\\") {
-      // An assertion or a back-reference is not one character.
-      if (/[bBk0-9]/.test(source[at + 1] ?? "")) refuse();
-      at += 2;
-      atom = oneChar(source.slice(from, at));
+      // `\x1b` and `\u2717` are one character spelled in four and six, and
+      // Bun's transpiler spells a non-ASCII character in a pattern literal
+      // the second way (`✗` in logs.ts). A back-reference is not one
+      // character, and `\cA` is not modelled.
+      const next = source[at + 1] ?? "";
+      const width = next === "x" ? 4 : next === "u" ? 6 : 2;
+      const spelled = source.slice(at, at + width);
+      const hex = spelled.slice(2);
+      if ("k0123456789c".includes(next)) refuse();
+      if (width > 2 && (hex.length !== width - 2 || Number.isNaN(Number(`0x${hex}`)))) refuse();
+      at += width;
+      atom = { kind: "char", test: oneChar(spelled) };
     } else {
       if ("*+?{}".includes(c)) refuse();
       at++;
-      atom = oneChar(c);
+      atom = { kind: "char", test: oneChar(c) };
     }
+    let min: number;
+    let max: number;
     const q = source[at];
-    if (q === "{") refuse();
-    if (q !== "*" && q !== "+" && q !== "?") return atom;
-    at++;
+    if (q === "*" || q === "+" || q === "?") {
+      at++;
+      min = q === "+" ? 1 : 0;
+      max = q === "?" ? 1 : Number.POSITIVE_INFINITY;
+    } else if (q === "{") {
+      const bounds = source.slice(at).match(/^\{(\d+)(,(\d*))?\}/);
+      if (bounds === null) return refuse();
+      at += bounds[0].length;
+      min = Number(bounds[1]);
+      max =
+        bounds[2] === undefined
+          ? min
+          : bounds[3] === ""
+            ? Number.POSITIVE_INFINITY
+            : Number(bounds[3]);
+    } else {
+      return atom;
+    }
+    // A lazy quantifier tries things in the other order.
     if (source[at] === "?") refuse();
-    const max = q === "?" ? 1 : Number.POSITIVE_INFINITY;
-    return { kind: "repeat", body: atom, min: q === "+" ? 1 : 0, max };
+    return { kind: "repeat", body: atom, min, max };
   };
   const alternative = (): Matcher => {
     const items: Matcher[] = [];
@@ -746,20 +797,26 @@ function parseMatcher(re: RegExp): Matcher {
   return root;
 }
 
+/** Parsed once per pattern: `/\r/g` in a function body is a new object every call. */
+const matchers = new Map<string, Matcher>();
+
 const OVER_BUDGET = Symbol("over budget");
 
 /**
  * The steps a backtracking matcher takes to decide `re` on `input`, trying
  * things in ECMAScript's order (JavaScriptCore's), or Infinity once past
  * `budget`. One step is one node entered, one character taken by a repeat,
- * or one character a repeat gives back.
+ * or one character a repeat gives back. A `g` or `y` pattern starts at its
+ * `lastIndex`, as the engine's does, and a `y` one tries only there.
  */
 function backtrackSteps(
   re: RegExp,
   input: string,
   budget: number,
-): { matched: boolean; steps: number } {
-  const root = parseMatcher(re);
+): { matched: boolean; start: number; end: number; steps: number } {
+  const key = `/${re.source}/${re.flags}`;
+  const root = matchers.get(key) ?? parseMatcher(re);
+  matchers.set(key, root);
   let steps = 0;
   const step = (): void => {
     if (++steps > budget) throw OVER_BUDGET;
@@ -773,6 +830,11 @@ function backtrackSteps(
         return i === 0 && then(i);
       case "end":
         return i === input.length && then(i);
+      case "boundary": {
+        const before = i > 0 && node.word(input[i - 1] as string);
+        const after = i < input.length && node.word(input[i] as string);
+        return (before !== after) === node.wanted && then(i);
+      }
       case "seq": {
         const from = (n: number, j: number): boolean =>
           n === node.items.length
@@ -806,58 +868,95 @@ function backtrackSteps(
       }
     }
   };
+  const first = re.global || re.sticky ? re.lastIndex : 0;
+  const last = re.sticky ? first : input.length;
+  let end = -1;
+  const found = (j: number): boolean => {
+    end = j;
+    return true;
+  };
   try {
-    for (let start = 0; start <= input.length; start++) {
-      if (match(root, start, () => true)) return { matched: true, steps };
+    for (let start = first; start <= last && start <= input.length; start++) {
+      if (match(root, start, found)) return { matched: true, start, end, steps };
     }
-    return { matched: false, steps };
+    return { matched: false, start: -1, end: -1, steps };
   } catch (err) {
-    if (err === OVER_BUDGET) return { matched: false, steps: Number.POSITIVE_INFINITY };
+    if (err === OVER_BUDGET) {
+      return { matched: false, start: -1, end: -1, steps: Number.POSITIVE_INFINITY };
+    }
     throw err;
   }
 }
 
-/** Steps per character a line pattern may take on one line: linear, with room. */
+/** Steps per character a pattern may take on one line: linear, with room. */
 const STEPS_PER_CHAR = 16;
 
 type PatternRun = {
+  /** `/source/flags`. */
   readonly pattern: string;
   readonly chars: number;
+  /** Infinity once past the budget; NaN when the syntax is not modelled. */
   readonly steps: number;
-  /** The count's verdict is the engine's, so the count is of the real match. */
+  /** The count found the engine's own match, so it is the count of the real search. */
   readonly agrees: boolean;
+  readonly refused?: string;
 };
 
+/** The runs a linear pattern does not make: over budget, not modelled, or not the engine's match. */
+const unbounded = (runs: readonly PatternRun[]): PatternRun[] =>
+  runs.filter((run) => !run.agrees || !(run.steps <= STEPS_PER_CHAR * run.chars + 64));
+
 /**
- * Runs `fn` with the line patterns counting their steps on every line
- * `excerptLog` hands them. A pattern over its budget answers "no match"
- * instead of running, so a quadratic one fails the test at once rather than
- * after the match it would freeze on.
+ * Runs `fn` with every RegExp it runs counting its steps on the exact text it
+ * was handed. `.test()`, `String#match` and `String#replace` all reach a
+ * pattern through `RegExp.prototype.exec`, so wrapping that one method counts
+ * every pattern `excerptLog` runs — one added later included — rather than a
+ * list of them that can fall behind. A pattern over its budget, or one whose
+ * syntax is not modelled, answers "no match" instead of running, so a
+ * quadratic one fails the test at once rather than after the match it would
+ * freeze on.
  */
-function countLinePatterns<T>(fn: () => T): { result: T; runs: PatternRun[] } {
+function countPatternSteps<T>(fn: () => T): { result: T; runs: PatternRun[] } {
   const runs: PatternRun[] = [];
-  const patterns = [RUNNER_MARKER, WORKFLOW_COMMAND, GITLAB_SECTION];
-  for (const pattern of patterns) {
-    Object.defineProperty(pattern, Symbol.match, {
-      configurable: true,
-      value: (text: string) => {
-        const counted = backtrackSteps(pattern, text, STEPS_PER_CHAR * text.length + 64);
-        const over = counted.steps === Number.POSITIVE_INFINITY;
-        const real = over ? null : RegExp.prototype[Symbol.match].call(pattern, text);
-        runs.push({
-          pattern: pattern.source,
-          chars: text.length,
-          steps: counted.steps,
-          agrees: over || (real !== null) === counted.matched,
-        });
-        return real;
-      },
-    });
-  }
+  const native = RegExp.prototype.exec;
+  let counting = false;
+  RegExp.prototype.exec = function (this: RegExp, input: string): RegExpExecArray | null {
+    // The counter's own one-character tests, and the real match, go uncounted.
+    if (counting) return native.call(this, input);
+    counting = true;
+    try {
+      const text = String(input);
+      const run = { pattern: `/${this.source}/${this.flags}`, chars: text.length };
+      let counted: ReturnType<typeof backtrackSteps>;
+      try {
+        counted = backtrackSteps(this, text, STEPS_PER_CHAR * text.length + 64);
+      } catch (err) {
+        runs.push({ ...run, steps: Number.NaN, agrees: false, refused: (err as Error).message });
+        if (this.global || this.sticky) this.lastIndex = 0;
+        return null;
+      }
+      if (counted.steps === Number.POSITIVE_INFINITY) {
+        runs.push({ ...run, steps: counted.steps, agrees: true });
+        if (this.global || this.sticky) this.lastIndex = 0;
+        return null;
+      }
+      const real = native.call(this, text);
+      const agrees =
+        real === null
+          ? !counted.matched
+          : counted.matched &&
+            real.index === counted.start &&
+            real.index + real[0].length === counted.end;
+      runs.push({ ...run, steps: counted.steps, agrees });
+      return real;
+    } finally {
+      counting = false;
+    }
+  };
   try {
     return { result: fn(), runs };
   } finally {
-    for (const pattern of patterns) Reflect.deleteProperty(pattern, Symbol.match);
+    RegExp.prototype.exec = native;
   }
 }
 
@@ -866,9 +965,11 @@ function countLinePatterns<T>(fn: () => T): { result: T; runs: PatternRun[] } {
 // quadratic pattern froze the whole process for as long as the match took.
 // 60 000 characters is deliberate: the 0.7.0 patterns took about 2 s on it
 // locally. The work is counted, not timed, because a time limit a loaded CI
-// runner always meets is too loose to be sure of catching that: the linear
-// patterns decide each of these lines in at most five steps a character,
-// while 0.7.0's grew with the run, to about 90 000 a character here.
+// runner always meets is too loose to be sure of catching that. Every pattern
+// excerptLog runs on the line is counted — the error rules, the exit-code
+// reader and the decoration it strips, not only the three it exports — and
+// the linear ones decide each of these lines in at most five steps a
+// character, while 0.7.0's grew with the run, to about 90 000 a character here.
 describe("excerptLog on hostile lines (C011)", () => {
   const N = 60_000;
   const hostile: Array<[string, string]> = [
@@ -883,22 +984,44 @@ describe("excerptLog on hostile lines (C011)", () => {
   ];
   for (const [name, line] of hostile) {
     test(`${name} is matched in linear time`, () => {
-      const { result: excerpt, runs } = countLinePatterns(() => excerptLog(line));
+      const { result: excerpt, runs } = countPatternSteps(() => excerptLog(line));
       expect(runs.length).toBeGreaterThan(0);
-      expect(
-        runs.filter((run) => !run.agrees || run.steps > STEPS_PER_CHAR * run.chars + 64),
-      ).toEqual([]);
+      expect(unbounded(runs)).toEqual([]);
       expect(excerpt.totalLines).toBe(1);
     }, 20_000);
   }
 
+  test("the counter sees a pattern however excerptLog runs it", () => {
+    // A runtime that skipped a replaced `exec` on one of these paths would
+    // leave its patterns uncounted, and the tests above would pass blind.
+    const { runs } = countPatternSteps(() => {
+      /a/.test("a");
+      "b".match(/b/);
+      "cc".replace(/c/g, "");
+      "d".replace(/d/, "");
+    });
+    expect(runs.map((run) => run.pattern)).toEqual(["/a/", "/b/", "/c/g", "/c/g", "/c/g", "/d/"]);
+    expect(unbounded(runs)).toEqual([]);
+  });
+
   test("a line past the match window costs one window, and what is kept is still cut by maxLineChars", () => {
     const line = `##[error]${"y".repeat(MATCH_WINDOW_CHARS * 4)}`;
-    const excerpt = excerptLog(line, { maxLineChars: 100 });
+    const { result: excerpt, runs } = countPatternSteps(() =>
+      excerptLog(line, { maxLineChars: 100 }),
+    );
+    // Stripping the runner's decoration reads the whole line, once and in
+    // linear steps; every pattern after that reads one window of it.
+    const decoration = new Set(
+      countPatternSteps(() => normalizeLogLine(line)).runs.map((run) => run.pattern),
+    );
+    const windowed = runs.filter((run) => !decoration.has(run.pattern));
+    expect(windowed.length).toBeGreaterThan(0);
+    expect(windowed.filter((run) => run.chars > MATCH_WINDOW_CHARS)).toEqual([]);
+    expect(unbounded(runs)).toEqual([]);
     expect(excerpt.annotations).toHaveLength(1);
     expect(excerpt.annotations[0]?.text).toBe(`${"y".repeat(100)}…`);
     expect(excerpt.tail[0]).toBe(`##[error]${"y".repeat(91)}…`);
-  });
+  }, 20_000);
 
   test("a payload is taken from the whole line, not the match window", () => {
     const long = "z".repeat(MATCH_WINDOW_CHARS + 10);
