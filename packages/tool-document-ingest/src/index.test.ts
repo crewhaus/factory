@@ -8,7 +8,8 @@
  * sandboxed to `process.cwd()` — tests address files by workspace-
  * relative path.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import {
   existsSync,
   lstatSync,
@@ -246,16 +247,53 @@ describe("ingestDocument — maxBytes bounds what is READ (C077)", () => {
     expect(Buffer.byteLength(bodyOf(result))).toBe(1000);
   });
 
-  test("memory stays bounded by maxBytes, not by the file", async () => {
+  test("the bytes read, and the buffer they fill, are bounded by maxBytes, not by the file", async () => {
+    // Counts what is read, not the process's RSS: RSS moves with the
+    // allocator and with every other test in the process, and the same
+    // measurement elsewhere read 61 MB against a 40 MB bound on a loaded CI
+    // runner. 0.7.0 allocated a buffer the size of the file and read all of
+    // it (64 MiB here), then decoded and counted it: some 190 MiB of RSS.
     writeFileSync(join(tmp, "big.log"), "");
     truncateSync(join(tmp, "big.log"), 64 * 1024 ** 2);
-    Bun.gc(true);
-    const before = process.memoryUsage().rss;
-    const result = await ingestDocument.execute({ path: "big.log", maxBytes: 1000 });
-    const grew = process.memoryUsage().rss - before;
+    const realReadSync = nodeFs.readSync;
+    const realReadFileSync = nodeFs.readFileSync;
+    let bytesRead = 0;
+    let largestBuffer = 0;
+    const reads = spyOn(nodeFs, "readSync").mockImplementation(((
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      ...rest: unknown[]
+    ): number => {
+      largestBuffer = Math.max(largestBuffer, buffer.byteLength);
+      const n = (realReadSync as (...args: unknown[]) => number)(fd, buffer, ...rest);
+      bytesRead += n;
+      return n;
+    }) as unknown as typeof nodeFs.readSync);
+    // A read of the whole file is counted too, however it is spelled.
+    const wholeReads = spyOn(nodeFs, "readFileSync").mockImplementation(((
+      ...args: unknown[]
+    ): string | Buffer => {
+      const out = (realReadFileSync as (...a: unknown[]) => string | Buffer)(...args);
+      const bytes = typeof out === "string" ? Buffer.byteLength(out) : out.byteLength;
+      largestBuffer = Math.max(largestBuffer, bytes);
+      bytesRead += bytes;
+      return out;
+    }) as unknown as typeof nodeFs.readFileSync);
+    let result: unknown;
+    try {
+      result = await ingestDocument.execute({ path: "big.log", maxBytes: 1000 });
+    } finally {
+      reads.mockRestore();
+      wholeReads.mockRestore();
+    }
     expect(result).toContain("TRUNCATED to 1000 bytes");
-    // 0.7.0: about three times the file, some 190 MiB here.
-    expect(grew).toBeLessThan(32 * 1024 ** 2);
+    // The 1000 bytes returned were read through a counted call, plus at most
+    // the one byte that tells a longer file from one that fits.
+    expect(bytesRead).toBeGreaterThanOrEqual(1000);
+    expect(bytesRead).toBeLessThanOrEqual(1001);
+    expect(largestBuffer).toBeLessThanOrEqual(1001);
+    // 0.7.0 read, decoded and counted all 64 MiB, which on a loaded runner
+    // takes seconds: the budget lets it fail on the counts above.
   }, 20_000);
 
   test("the cut never splits a character, and never exceeds maxBytes", async () => {
