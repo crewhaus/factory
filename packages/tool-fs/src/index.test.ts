@@ -574,7 +574,7 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
           const sent = linesOf(request);
           const answered = outcome.result as TestEachResult;
           const undetermined = sent.flatMap((line, i) => (line === slow ? [i] : []));
-          return { status: "ok", result: { ...answered, undetermined } as ResultOf<R> };
+          return { ...outcome, result: { ...answered, undetermined } as unknown as ResultOf<R> };
         },
         close: () => real.close(),
       };
