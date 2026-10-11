@@ -361,6 +361,9 @@ function randomSelector(rand: () => number): string {
 }
 
 describe("the matcher gives the 0.7.0 matcher's answers", () => {
+  // Slow by construction (2,000 selectors on 400 random trees, each compared
+  // with the oracle per element and per container, about 195,000 checks;
+  // 1.1 s here, 22 s on CI's loaded runner).
   test("random trees and selectors over all four combinators and the pseudo-classes", () => {
     let compared = 0;
     let nonEmpty = 0;
@@ -421,7 +424,7 @@ describe("the matcher gives the 0.7.0 matcher's answers", () => {
     expect(nonEmpty).toBeGreaterThan(500);
     expect(underContainer).toBeGreaterThan(2_000);
     expect(containerHits).toBeGreaterThan(300);
-  }, 30_000);
+  }, 120_000);
 
   test("attribute tests give 0.7.0's answers, with every operator and case flag", () => {
     type Attr = { name: string; op: string; value: string; i: boolean };

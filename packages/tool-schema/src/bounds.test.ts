@@ -167,6 +167,8 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(validateValue("x", chain(8, "allOf")).valid).toBe(true);
   });
 
+  // Slow by construction (each 16-level union spends about 410,000 of its
+  // 500,000 evaluations; 0.4 s here, 10.4 s on CI's loaded runner).
   test("anyOf and oneOf failures carry a bounded message", async () => {
     for (const kw of ["anyOf", "oneOf"] as const) {
       const out = await jsonSchemaValidate.execute(
@@ -179,7 +181,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
       expect(parsed.valid).toBe(false);
       for (const error of parsed.errors) expect(error.message.length).toBeLessThanOrEqual(1_000);
     }
-  }, 20_000);
+  }, 60_000);
 
   test("an ordinary anyOf failure still names each alternative", () => {
     const result = validateValue(true, { anyOf: [{ type: "string" }, { type: "number" }] });
@@ -266,6 +268,8 @@ describe("the default budget answers honest wide and nested unions", () => {
   // Through JSON, as a tool receives it: the shared `source` becomes ten copies.
   const nested = JSON.parse(JSON.stringify(message)) as Schema;
 
+  // Slow by construction (every block of 1,000 rows is tried against ten block
+  // and ten source kinds, twice; 0.9 s here, 12.3 s on CI's loaded runner).
   test("a 10 x 10 nested oneOf over 1,000 valid rows", async () => {
     const records = await call(validateRecords as typeof jsonSchemaValidate, {
       records: rows,
@@ -279,7 +283,7 @@ describe("the default budget answers honest wide and nested unions", () => {
       schema: { type: "array", items: nested },
     });
     expect(whole).toMatchObject({ valid: true });
-  }, 30_000);
+  }, 60_000);
 
   test("a flat 64- and 100-way discriminated union over 2,000 valid rows", async () => {
     for (const width of [64, 100]) {
@@ -569,6 +573,8 @@ describe("work that follows the value's size is charged, and messages are built 
     expect(validateValue("y".repeat(5_000_000), { maxLength: 5_000_000 }).valid).toBe(true);
   });
 
+  // Slow by construction (it spends a 50,000-member value's budget of about
+  // 3.2 million units three times; 2 to 5 s here, 14.7 s on CI's loaded runner).
   test("uniqueItems, an object's keys and enum comparisons are charged per member", () => {
     const array = Array.from({ length: 50_000 }, (_, i) => i);
     expect(
@@ -584,7 +590,7 @@ describe("work that follows the value's size is charged, and messages are built 
     // Each checked once, all well inside the budget.
     expect(validateValue(array, { uniqueItems: true }).valid).toBe(true);
     expect(validateValue(object, { enum: [object] }).valid).toBe(true);
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("depth is the value's, not the schema's", () => {
