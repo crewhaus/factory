@@ -428,9 +428,29 @@ describe("preflight", () => {
   test("a pathological files entry finishes instead of hanging", () => {
     // As a regex — each `*` becoming `[^/]*` — this never returns. A
     // preflight check that hangs on a typo is not a preflight check.
-    const started = performance.now();
-    expect(wouldInclude([`${"*".repeat(30)}z`], "a".repeat(40))).toBe(false);
-    expect(performance.now() - started).toBeLessThan(100);
+    // A clock cannot catch that (the call never returns to be timed, and
+    // bun cannot stop a synchronous body), so the test refuses, and records,
+    // any pattern built while matching: the regex form fails at once.
+    const built: string[] = [];
+    const RealRegExp = globalThis.RegExp;
+    const refuse = (args: ArrayLike<unknown>): never => {
+      built.push(String(args[0]));
+      throw new Error("a pattern was built from the files entry");
+    };
+    globalThis.RegExp = new Proxy(RealRegExp, {
+      construct: (_target, args) => refuse(args),
+      apply: (_target, _this, args) => refuse(args),
+    });
+    let included: unknown;
+    try {
+      included = wouldInclude([`${"*".repeat(30)}z`], "a".repeat(40));
+    } catch (err) {
+      included = err;
+    } finally {
+      globalThis.RegExp = RealRegExp;
+    }
+    expect(built).toEqual([]);
+    expect(included).toBe(false);
   });
 
   test("wouldInclude follows a directory entry and a simple glob", () => {
