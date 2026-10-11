@@ -725,15 +725,42 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
     return `${lines.join("\n")}\n`;
   }
 
+  /** Runs the real worker, counting the batches Grep sends it and the lines in them. */
+  function countingSession(): { batches: number; lines: number; open: () => RegexSession } {
+    const sent = {
+      batches: 0,
+      lines: 0,
+      open: (): RegexSession => {
+        const real = openRegexSession();
+        return {
+          run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
+            if (request.op === "testEach") {
+              sent.batches++;
+              sent.lines += linesOf(request).length;
+            }
+            return real.run(request);
+          },
+          close: () => real.close(),
+        };
+      },
+    };
+    return sent;
+  }
+
   test("a file over the worker's input limit is searched to its end, and so are the files after it", async () => {
     // 0.7.1 before this fix sent each file to the worker whole: this one
     // came back input-too-large and ENDED the scan, so neither it nor
-    // src/main.ts was searched ("no matches in the lines searched").
+    // src/main.ts was searched ("no matches in the lines searched"). Every
+    // line of app.log holds "request ", a literal the pattern requires, so
+    // the pre-filter skips none of them and all 1.2 M characters go to the
+    // worker. (The next test sends them with no literal to filter on.)
     await writeFile(path.join(tmp, "app.log"), bigLog());
     expect(readFileSync(path.join(tmp, "app.log"), "utf8").length).toBeGreaterThan(1_000_000);
     await mkdir(path.join(tmp, "src"));
     await writeFile(path.join(tmp, "src", "main.ts"), "export const x = 'NEEDLE';\n");
-    const result = String(await grep.execute({ pattern: "NEEDLE" }));
+    const sent = countingSession();
+    holdGrepClock({ openSession: sent.open });
+    const result = String(await grep.execute({ pattern: "request \\d+ failed|NEEDLE" }));
     expect(result.split("\n").sort()).toEqual(
       [
         "app.log:2:the NEEDLE is on line 2",
@@ -741,6 +768,10 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
         "src/main.ts:1:export const x = 'NEEDLE';",
       ].sort(),
     );
+    // All 24 001 lines of app.log and main.ts's one went to the worker, in
+    // more than one batch.
+    expect(sent.lines).toBe(24_002);
+    expect(sent.batches).toBeGreaterThan(1);
   });
 
   test("with no literal to pre-filter on, every line goes to the worker, in batches", async () => {
@@ -759,12 +790,33 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
   });
 
   test("a hit past a batch boundary keeps its own file and line number", async () => {
-    await writeFile(path.join(tmp, "a.txt"), `${"filler line\n".repeat(90_000)}NEEDLE a\n`);
+    // Batches of 60 characters (a line costs its length plus one), so a.txt
+    // crosses four boundaries before its hit on line 21, and b.txt shares a
+    // batch with part of it, whichever file is read first. Both ways lines
+    // are batched are checked: as runs of a file's text when the pattern
+    // has no literal, and line by line after the pre-filter ("filler line"
+    // is a literal the second pattern requires, so no filler line is
+    // skipped). Counting the lines sent shows none is lost at a boundary:
+    // 25 with no literal, which also sends the empty line after each file's
+    // last newline, and 23 after the pre-filter, which skips those two.
+    await writeFile(
+      path.join(tmp, "a.txt"),
+      `${"filler line\n".repeat(20)}NEEDLE a\nfiller line\n`,
+    );
     await writeFile(path.join(tmp, "b.txt"), "NEEDLE b\n");
-    const lines = String(await grep.execute({ pattern: "[N]EEDLE" })).split("\n");
-    expect(lines).toHaveLength(2);
-    expect(new Set(lines)).toEqual(new Set(["a.txt:90001:NEEDLE a", "b.txt:1:NEEDLE b"]));
+    for (const [pattern, linesSent] of [
+      ["[N][E][E][D][L][E]", 25],
+      ["filler line\\d|NEEDLE", 23],
+    ] as const) {
+      const sent = countingSession();
+      holdGrepClock({ batchChars: 60, workerInputChars: 60, openSession: sent.open });
+      const lines = String(await grep.execute({ pattern })).split("\n");
+      expect(lines.sort()).toEqual(["a.txt:21:NEEDLE a", "b.txt:1:NEEDLE b"]);
+      expect(sent.lines).toBe(linesSent);
+      expect(sent.batches).toBeGreaterThanOrEqual(5);
+    }
   });
+
   test("a batch the worker refuses is named as unsearched, and the scan goes on", async () => {
     // Unreachable with the real limits (the batch size IS the worker's
     // limit); held apart here to prove a refusal never ends the scan.
