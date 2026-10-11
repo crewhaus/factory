@@ -1112,10 +1112,17 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       writeFileSync(
         script,
         [
-          `import { readdirSync, readFileSync } from "node:fs";`,
+          `import { appendFileSync, readdirSync, readFileSync } from "node:fs";`,
           `import { createSandbox } from ${JSON.stringify(sandboxModule)};`,
           `const dir = ${JSON.stringify(dir)};`,
           `const mode = ${JSON.stringify(mode)};`,
+          // Every call the host waits for, one JSON line each: its argv and
+          // the timeout it was given (see spawnSyncCalls).
+          "const spawnSync = Bun.spawnSync.bind(Bun);",
+          "Bun.spawnSync = ((argv: string[], options: Record<string, unknown> = {}) => {",
+          "  appendFileSync(`${dir}/spawn-sync`, `${JSON.stringify({ argv, timeout: options['timeout'] ?? null })}\\n`);",
+          "  return spawnSync(argv, options);",
+          "}) as typeof Bun.spawnSync;",
           `if (mode === "once") process.once("SIGINT", () => console.log("host handled SIGINT"));`,
           "const controller = new AbortController();",
           "const run = createSandbox({ backend: 'docker' }).exec({",
@@ -1149,6 +1156,16 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
 
     function hostContainer(): string {
       return nameOf(log().find((l) => l.startsWith("create ")));
+    }
+
+    /** What the host handed `Bun.spawnSync`, in order: each call's argv and timeout. */
+    function spawnSyncCalls(): Array<{ argv: string[]; timeout: number | null }> {
+      const file = join(dir, "spawn-sync");
+      if (!existsSync(file)) return [];
+      return readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => JSON.parse(l) as { argv: string[]; timeout: number | null });
     }
 
     /** Resolves once the CLI log has `line`, within `budgetMs`. */
@@ -1186,9 +1203,11 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
 
     // The exit path waits for `kill` within one budget and does not wait
     // for `rm -f` at all: a daemon that never answers held process.exit for
-    // two full control timeouts (6 s). Read from what each hung command was
-    // doing when the host was gone, not from a clock: `kill` had been cut
-    // off unanswered, and `rm -f` was still running.
+    // two full control timeouts (6 s). Read from what the host handed
+    // Bun.spawnSync and from what each hung command was doing when the host
+    // was gone, not from a clock: the one call waited for was `kill`, given
+    // the 2 s budget (HOST_EXIT_KILL_BUDGET_MS) as its timeout; it had been
+    // cut off unanswered, and `rm -f` was still running.
     test("a daemon that never answers holds the exit for at most the kill budget", async () => {
       const h = startHost("exit", { FAKE_CLI_HANG_CONTROL: "1" });
       await h.exited;
@@ -1198,11 +1217,15 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
         return { running: alive(pid), answered: existsSync(join(dir, `answered-${verb}`)) };
       };
       expect(h.exitCode).toBe(0);
+      const name = hostContainer();
+      const waited = spawnSyncCalls();
+      expect(waited.map((c) => c.argv.slice(1))).toEqual([["kill", name]]);
+      expect(waited[0]?.timeout).toBeGreaterThan(0);
+      expect(waited[0]?.timeout).toBeLessThanOrEqual(2_000);
       expect({ kill: await hung("kill"), rm: await hung("rm") }).toEqual({
         kill: { running: false, answered: false },
         rm: { running: true, answered: false },
       });
-      const name = hostContainer();
       expect(cliLog()).toContain(`kill ${name}`);
       expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
     }, 30_000);
