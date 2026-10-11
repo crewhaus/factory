@@ -7,6 +7,9 @@
  */
 import { heapSize } from "bun:jsc";
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runHostCommand } from "./run";
 
 const posix = process.platform !== "win32";
@@ -78,6 +81,24 @@ function countHeldPieces(): {
   return { seen, restore: () => spy.mockRestore() };
 }
 
+/**
+ * A pipe holder the test lets go of: `loop` is shell that runs while the file
+ * named by its `$1` exists, and `release` removes that file. The loop also
+ * gives up after 1 200 turns of 50 ms, at least a minute and past every
+ * budget here, so a run that never returns cannot leave it behind; that cap
+ * never decides a result.
+ */
+function holdPipe(): { file: string; loop: string; release: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "hostfs-run-hold-"));
+  const file = join(dir, "hold");
+  writeFileSync(file, "");
+  return {
+    file,
+    loop: 'i=0; while [ -e "$1" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done',
+    release: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
 describe("runHostCommand caps output as it arrives (C163)", () => {
   test.if(posix)(
     "256 MiB of output with a 1024-character cap is cut, flagged, and never held",
@@ -118,17 +139,24 @@ describe("runHostCommand caps output as it arrives (C163)", () => {
   test.if(posix)(
     "output a background process kept open is returned as what arrived, and marked incomplete",
     async () => {
-      // The shell exits at once; `sleep` inherits its stdout and holds the
-      // pipe open past the drain grace. 0.7.0 answered "" here, which reads
-      // as a complete, empty listing.
-      const r = await runHostCommand({
-        argv: ["/bin/sh", "-c", "printf '/w/a\\000/w/b\\000'; sleep 3 &"],
-        timeoutMs: 20_000,
-      });
-      expect(r.code).toBe(0);
-      expect(r.stdout).toBe("/w/a\u0000/w/b\u0000");
-      expect(r.outputIncomplete).toBe(true);
-      expect(r.stdoutTruncated).toBe(true);
+      // The shell exits at once; the loop it leaves behind inherits its
+      // stdout and holds the pipe open until this test lets it go, so the
+      // drain grace ends the read however long this machine takes to reach
+      // it (a `sleep 3` raced the grace). 0.7.0 answered "" here, which
+      // reads as a complete, empty listing.
+      const held = holdPipe();
+      try {
+        const r = await runHostCommand({
+          argv: ["/bin/sh", "-c", `printf '/w/a\\000/w/b\\000'; (${held.loop}) &`, "sh", held.file],
+          timeoutMs: 20_000,
+        });
+        expect(r.code).toBe(0);
+        expect(r.stdout).toBe("/w/a\u0000/w/b\u0000");
+        expect(r.outputIncomplete).toBe(true);
+        expect(r.stdoutTruncated).toBe(true);
+      } finally {
+        held.release();
+      }
     },
     20_000,
   );

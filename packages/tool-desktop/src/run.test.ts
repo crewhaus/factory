@@ -4,13 +4,16 @@
  *
  * The rest of the package drives recorded output through `_setRunner`. These
  * tests spawn, because the property is about the spawn, but they touch no
- * desktop state: every child is `head` or this Bun binary, never a
- * clipboard, notifier, opener or printer, so house rule 4 (one real-DESKTOP
- * test, in integration.test.ts) is unaffected. The gate is opened per test
- * and shut again after.
+ * desktop state: every child is `head` or this Bun binary (one starts a
+ * shell loop), never a clipboard, notifier, opener or printer, so house
+ * rule 4 (one real-DESKTOP test, in integration.test.ts) is unaffected. The
+ * gate is opened per test and shut again after.
  */
 import { heapSize } from "bun:jsc";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { _allowRealHost, _resetRunSeams, runHostCommand } from "./run";
 
 const posix = process.platform !== "win32";
@@ -83,6 +86,24 @@ function countHeldPieces(): {
   return { seen, restore: () => spy.mockRestore() };
 }
 
+/**
+ * A pipe holder the test lets go of: `loop` is shell that runs while the file
+ * named by its `$1` exists, and `release` removes that file. The loop also
+ * gives up after 1 200 turns of 50 ms, at least a minute and past every
+ * budget here, so a run that never returns cannot leave it behind; that cap
+ * never decides a result.
+ */
+function holdPipe(): { file: string; loop: string; release: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "desktop-run-hold-"));
+  const file = join(dir, "hold");
+  writeFileSync(file, "");
+  return {
+    file,
+    loop: 'i=0; while [ -e "$1" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done',
+    release: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
 beforeEach(() => _allowRealHost(true));
 afterEach(() => _resetRunSeams());
 
@@ -126,21 +147,29 @@ describe("runHostCommand caps output as it arrives (C163)", () => {
   test.if(posix)(
     "output a background process kept open is returned as what arrived, and marked incomplete",
     async () => {
-      // The child exits at once; the `sleep` it started inherits its stdout
-      // and holds the pipe open past the drain grace, as `xclip -i`'s holder
-      // does. 0.7.0 answered "" here.
-      const r = await runHostCommand({
-        argv: [
-          bun,
-          "-e",
-          'Bun.spawn(["sleep", "3"], { stdout: "inherit", stderr: "ignore" }).unref(); process.stdout.write("win-a\\nwin-b\\n");',
-        ],
-        timeoutMs: 20_000,
-      });
-      expect(r.code).toBe(0);
-      expect(r.stdout).toBe("win-a\nwin-b\n");
-      expect(r.outputIncomplete).toBe(true);
-      expect(r.stdoutTruncated).toBe(true);
+      // The child exits at once; the shell loop it started inherits its
+      // stdout and holds the pipe open, as `xclip -i`'s holder does, until
+      // this test lets it go: the drain grace ends the read however long
+      // this machine takes to reach it (a `sleep 3` raced the grace). 0.7.0
+      // answered "" here.
+      const held = holdPipe();
+      try {
+        const holder = JSON.stringify(["/bin/sh", "-c", held.loop, "sh", held.file]);
+        const r = await runHostCommand({
+          argv: [
+            bun,
+            "-e",
+            `Bun.spawn(${holder}, { stdout: "inherit", stderr: "ignore" }).unref(); process.stdout.write("win-a\\nwin-b\\n");`,
+          ],
+          timeoutMs: 20_000,
+        });
+        expect(r.code).toBe(0);
+        expect(r.stdout).toBe("win-a\nwin-b\n");
+        expect(r.outputIncomplete).toBe(true);
+        expect(r.stdoutTruncated).toBe(true);
+      } finally {
+        held.release();
+      }
     },
     20_000,
   );
