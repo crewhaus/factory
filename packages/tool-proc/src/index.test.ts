@@ -8,7 +8,7 @@
  * is also what gives the containment assertions something to escape from —
  * and removes it afterwards. Nothing is ever written into the repo.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   lstatSync,
@@ -94,6 +94,74 @@ function script(name: string, body: string): string {
   const file = join(tmp, name);
   writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return file;
+}
+
+/** What {@link watchStdout} saw of the children's stdout. */
+type StdoutWatch = {
+  /** 64 KiB pieces handed to the code under test. */
+  delivered: number;
+  /** Bytes read from the children. */
+  bytes: number;
+  /** The code under test cancelled a stream. */
+  cancelled: boolean;
+  /** Pieces (and copies made of them) still alive when a stream ended; -1 before one did. */
+  heldAtEnd: number;
+};
+
+const PIECE_BYTES = 64 * 1024;
+
+/**
+ * Spies on `Bun.spawn` so each child's stdout reaches the code under test in
+ * 64 KiB pieces of a Uint8Array subclass, each one (and each `slice()` or
+ * `subarray()` made of one) kept as a WeakRef. When a stream ends, after a
+ * full collection, it counts the pieces still alive: code that keeps only
+ * its cap holds a handful, code that reads to the end before capping holds
+ * every one. It also counts the bytes read and sees a cancel. Counts, not
+ * the process's RSS, which moves with the allocator, with Bun's own pipe
+ * buffering and with every other test in the process.
+ */
+function watchStdout(): { seen: StdoutWatch; restore: () => void } {
+  const real = Bun.spawn.bind(Bun);
+  const pieces: WeakRef<Uint8Array>[] = [];
+  class Piece extends Uint8Array {
+    constructor(...args: unknown[]) {
+      super(...(args as [ArrayBuffer]));
+      pieces.push(new WeakRef(this));
+    }
+  }
+  const seen: StdoutWatch = { delivered: 0, bytes: 0, cancelled: false, heldAtEnd: -1 };
+  const spy = spyOn(Bun, "spawn").mockImplementation(((...args: Parameters<typeof Bun.spawn>) => {
+    const proc = real(...args);
+    const source = proc.stdout;
+    if (!(source instanceof ReadableStream)) return proc;
+    const reader = (source as ReadableStream<Uint8Array>).getReader();
+    const counted = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await reader.read();
+        if (seen.cancelled) return;
+        if (next.done) {
+          // A WeakRef keeps its target until the job that made it ends.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          Bun.gc(true);
+          seen.heldAtEnd = pieces.filter((ref) => ref.deref() !== undefined).length;
+          controller.close();
+          return;
+        }
+        seen.bytes += next.value.length;
+        for (let at = 0; at < next.value.length; at += PIECE_BYTES) {
+          controller.enqueue(new Piece(next.value.subarray(at, at + PIECE_BYTES)));
+          seen.delivered += 1;
+        }
+      },
+      cancel(reason) {
+        seen.cancelled = true;
+        return reader.cancel(reason);
+      },
+    });
+    Object.defineProperty(proc, "stdout", { value: counted });
+    return proc;
+  }) as typeof Bun.spawn);
+  return { seen, restore: () => spy.mockRestore() };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +482,7 @@ describe("RunCommand", () => {
   });
 
   test("output past the cap is discarded as it arrives, not buffered first", async () => {
-    Bun.gc(true);
-    const before = process.memoryUsage().rss;
-    let peak = before;
-    const sampler = setInterval(() => {
-      peak = Math.max(peak, process.memoryUsage().rss);
-    }, 5);
+    const { seen, restore } = watchStdout();
     let out: { stdoutTruncated: boolean; stdout: string };
     try {
       out = await call(runCommand, {
@@ -427,30 +490,53 @@ describe("RunCommand", () => {
         maxOutputChars: 100,
       });
     } finally {
-      clearInterval(sampler);
+      restore();
     }
-    // 0.7.0 held the whole 200 MB (and more) as a string before capping.
-    expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+    // 0.7.0 held the whole 200 MB (and more) as a string before capping:
+    // every one of the 3 000-odd pieces was still alive at the end.
+    expect(seen.delivered).toBeGreaterThanOrEqual(3_000);
+    expect(seen.heldAtEnd).toBeGreaterThanOrEqual(0);
+    expect(seen.heldAtEnd).toBeLessThanOrEqual(64);
     expect(out.stdoutTruncated).toBe(true);
     // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
     expect(out.stdout).toContain("[199999900 bytes dropped]");
-  }, 20_000);
+  }, 30_000);
 
   test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
-    const out = await call(runCommand, {
-      // The grandchild starts writing only after the drain grace is over.
-      argv: ["sh", "-c", "(sleep 0.9; head -c 50000000 /dev/zero) &\necho started"],
-      maxOutputChars: 100,
-    });
-    expect(out.outputIncomplete).toBe(true);
-    expect(out.stdout).toContain("started");
-    Bun.gc(true);
-    const before = process.memoryUsage().rss;
-    await Bun.sleep(1_500);
-    Bun.gc(true);
-    // The stream was cancelled at the drain grace: the 50 MB the
-    // grandchild writes afterwards never reaches this process.
-    expect(process.memoryUsage().rss - before).toBeLessThan(40 * 1024 * 1024);
+    // The grandchild writes only once this test says so, after the call
+    // has returned, and says when it is done (or was refused).
+    const go = join(tmp, "go");
+    const done = join(tmp, "done");
+    const { seen, restore } = watchStdout();
+    try {
+      const out = await call(runCommand, {
+        argv: [
+          "sh",
+          "-c",
+          '(while [ ! -e "$1" ]; do sleep 0.05; done; head -c 50000000 /dev/zero; : > "$2") &\necho started',
+          "sh",
+          go,
+          done,
+        ],
+        maxOutputChars: 100,
+      });
+      expect(out.outputIncomplete).toBe(true);
+      expect(out.stdout).toContain("started");
+      const atReturn = seen.bytes;
+      writeFileSync(go, "");
+      // The cut-off pipe refuses the write at once. The wait is bounded so
+      // that a platform where the write blocks instead still gets an answer.
+      for (let n = 0; n < 500 && !existsSync(done); n++) await Bun.sleep(20);
+      // The stream was cancelled at the drain grace: of the 50 MB the
+      // grandchild writes afterwards, not a byte reaches this process.
+      expect({ cancelled: seen.cancelled, readAfterReturn: seen.bytes - atReturn }).toEqual({
+        cancelled: true,
+        readAfterReturn: 0,
+      });
+    } finally {
+      restore();
+      writeFileSync(go, "");
+    }
   }, 20_000);
 
   test("output over the cap is truncated at both ends rather than dropped or unbounded", async () => {
