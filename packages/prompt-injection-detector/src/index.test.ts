@@ -389,26 +389,29 @@ describe("tool-definition rules (0.7.1, C102)", () => {
     expect(lifted.score).toBe(0.5);
   });
 
-  test("stay linear on hostile input", () => {
-    // Counted, not timed: a model walks every pattern the rules and the match
-    // views run and counts its backtracking steps (__test__/regex-work.ts).
-    // Twelve rules over three views take 181 to 408 steps a character here.
-    // A gap a rule can rescan from every word, such as a tool name that may
-    // hold spaces after "the" or "a", or one that may start anywhere, takes
-    // thousands a character on these texts, and more the longer they are.
-    for (const text of [
-      `send ${"a ".repeat(30_000)}`,
-      `${"the x tool ".repeat(5_000)}`,
-      `before using this tool ${"z".repeat(60_000)}`,
-    ]) {
+  // Counted, not timed: a model walks every pattern the rules and the match
+  // views run and counts its backtracking steps (__test__/regex-work.ts).
+  // Twelve rules over three views take 181 to 408 steps a character on these
+  // texts, at any length. A gap a rule can rescan from every word, such as a
+  // tool name that may hold spaces after "the" or "a", or one that may start
+  // anywhere, takes over ten thousand a character at these lengths, and more
+  // the longer the text. A count past the bound stops the rules and reads as
+  // Infinity, so such a rule fails at once.
+  for (const [input, text] of [
+    ["a verb and a run of words", `send ${"a ".repeat(15_000)}`],
+    ["a tool named over and over", "the x tool ".repeat(2_500)],
+    ["an opener and one long word", `before using this tool ${"z".repeat(30_000)}`],
+  ] as const) {
+    test(`stay linear on hostile input: ${input}`, () => {
       const bound = 1024 * text.length;
       const counted = regexWork(bound, () => toolDefinitionHits(text));
       expect(counted.unmodelled).toEqual([]);
       expect(counted.steps).toBeLessThanOrEqual(bound);
       expect(counted.value).toEqual([]);
-    }
-    // Three 60 KB texts through a step-counting model: about a second here.
-  }, 30_000);
+      // Up to 30 KB through the step-counting model: at most 0.21 s here,
+      // and this package's tests ran up to 39 times slower on CI.
+    }, 30_000);
+  }
 });
 
 describe("layer 3 LLM classifier", () => {
