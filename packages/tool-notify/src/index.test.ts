@@ -219,7 +219,12 @@ async function run(tool: (typeof NOTIFY_TOOLS)[number], input: unknown): Promise
 beforeEach(() => {
   tmp = mkdtempSync(path.join(tmpdir(), "crewhaus-notify-"));
   process.chdir(tmp);
-  requests = [];
+  // This test's server records into this test's log only. A request whose
+  // deadline gave up on it (/slow) can reach its handler after the next
+  // test's beforeEach has run; through the shared binding, it landed in that
+  // test's log (an idempotency test then counted two posts, not one).
+  const log: HttpLog = [];
+  requests = log;
   failuresLeft = 0;
   dnsAsked = [];
   dnsFixtures = new Map<string, TxtFixture>([
@@ -253,7 +258,7 @@ beforeEach(() => {
       const body = await req.text();
       const headers: Record<string, string> = {};
       for (const [key, value] of req.headers.entries()) headers[key.toLowerCase()] = value;
-      requests.push({ method: req.method, pathname: url.pathname, headers, body });
+      log.push({ method: req.method, pathname: url.pathname, headers, body });
 
       if (url.pathname === "/slow") {
         await new Promise((resolve) => setTimeout(resolve, 5000));
