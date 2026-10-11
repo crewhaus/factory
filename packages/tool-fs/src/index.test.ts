@@ -57,6 +57,28 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+type GrepLimits = NonNullable<Parameters<typeof _setGrepLimitsForTest>[0]>;
+
+/**
+ * Grep's limits for a test that expects a complete answer, so that no clock
+ * decides it. Grep's own clock stands still, so its 2 s deadline never
+ * passes: it runs from before the regex worker starts, and on CI a slow
+ * start left lines unsearched (run 38162665244). The worker gets a deadline
+ * and a give-up threshold no runner reaches: at the real 100 ms, a no-match
+ * on a worker thread that got no core for 100 ms reads as "could not be
+ * evaluated". The worker still runs every match. A test about the deadline
+ * or the give-up sets its own limits.
+ */
+function holdGrepClock(limits: GrepLimits = {}): void {
+  _setGrepLimitsForTest({ now: () => 0, deadlineMs: 60_000, giveUpMs: 60_000, ...limits });
+}
+
+/** The lines a testEach request asks the worker to run. */
+function linesOf(request: RegexRequest): readonly string[] {
+  const inputs = (request as { inputs: { lines: string } | readonly string[] }).inputs;
+  return "lines" in inputs ? inputs.lines.split("\n") : inputs;
+}
+
 describe("ToolPermissionError", () => {
   test("is a CrewhausError with code 'tool'", () => {
     const err = new ToolPermissionError("Read", "../../escape");
@@ -525,15 +547,39 @@ describe("hasNestedQuantifier (ReDoS guard)", () => {
 });
 
 describe("Grep never reports what it did not search as a miss (C089)", () => {
+  beforeEach(() => holdGrepClock());
+
   test("a line the engine gave up on is undetermined, not a non-match", async () => {
-    // JavaScriptCore gives up silently, as a slow "no match". With the
-    // give-up threshold at 1 ms, a cubic pattern's no-match on 70 digits (a
-    // few ms) takes that path, bounded, with no pathological pattern needed.
-    // The " x" keeps the line past the literal pre-filter (every match
-    // holds an "x"), so it really goes to the engine.
+    // JavaScriptCore gives up silently, as a slow "no match", and the worker
+    // reports a no-match that slow as undetermined. Making a real one slow
+    // enough raced the clock: with the give-up threshold at 1 ms, this cubic
+    // no-match on 70 digits took 1.3 ms on an Apple-silicon Mac, so a faster
+    // machine would have answered it. So this session answers every line
+    // with the real worker, then hands back what the worker reports when the
+    // engine gave up on the 70-digit lines (the worker's side of that is
+    // tool-safety's test). What is under test is what Grep does with that
+    // answer, and that it asks the worker to go on past a give-up. The " x"
+    // keeps the line past the literal pre-filter (every match holds an "x"),
+    // so it really goes to the engine.
     const slow = `${"1".repeat(70)} x`;
     await writeFile(path.join(tmp, "f.txt"), `${slow}\nbeta\n${slow}\n`);
-    _setGrepLimitsForTest({ giveUpMs: 1 });
+    const onGiveUp: unknown[] = [];
+    const gaveUpOnTheSlowLines = (): RegexSession => {
+      const real = openRegexSession();
+      return {
+        async run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
+          const outcome = await real.run(request);
+          if (request.op !== "testEach" || outcome.status !== "ok") return outcome;
+          onGiveUp.push((request as { onGiveUp?: unknown }).onGiveUp);
+          const sent = linesOf(request);
+          const answered = outcome.result as TestEachResult;
+          const undetermined = sent.flatMap((line, i) => (line === slow ? [i] : []));
+          return { status: "ok", result: { ...answered, undetermined } as ResultOf<R> };
+        },
+        close: () => real.close(),
+      };
+    };
+    holdGrepClock({ openSession: gaveUpOnTheSlowLines });
     const hit = String(await grep.execute({ pattern: "\\d+\\d+\\d+x|beta" }));
     expect(hit.split("\n")[0]).toBe("f.txt:2:beta");
     expect(hit).toContain("[grep: 2 line(s) could not be evaluated");
@@ -541,6 +587,8 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
     const miss = String(await grep.execute({ pattern: "\\d+\\d+\\d+x" }));
     expect(miss).not.toBe("no matches");
     expect(miss.startsWith("no matches in the lines searched")).toBe(true);
+    // A give-up ends nothing: the worker is asked to go on to the next line.
+    expect(onGiveUp).toEqual(["skip", "skip"]);
   });
 
   test("the pattern that fooled 0.7.0 is refused before it runs", async () => {
@@ -660,6 +708,8 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
 });
 
 describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
+  beforeEach(() => holdGrepClock());
+
   /** About 1.2 M characters of ordinary log lines: over the regex worker's 1 M input limit. */
   function bigLog(): string {
     const lines = Array.from(
@@ -716,7 +766,7 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
     // limit); held apart here to prove a refusal never ends the scan.
     // Line 1 fills a batch the worker refuses; line 2 is the next batch.
     await writeFile(path.join(tmp, "f.txt"), `${"x".repeat(45)}\nNEEDLE\n`);
-    _setGrepLimitsForTest({ batchChars: 50, workerInputChars: 30 });
+    holdGrepClock({ batchChars: 50, workerInputChars: 30 });
     const result = String(await grep.execute({ pattern: "[N]EEDLE|x" }));
     expect(result.split("\n")[0]).toBe("f.txt:2:NEEDLE");
     expect(result).toContain("[grep: 1 line(s) were not searched: the input is 46 characters");
@@ -775,7 +825,7 @@ describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review
     const total = await sourceTree(dir, 12, 400);
     const batchChars = 50_000;
     const sent: { lines: unknown; chars: number; count: number }[] = [];
-    _setGrepLimitsForTest({
+    holdGrepClock({
       batchChars,
       workerInputChars: batchChars,
       openSession: () =>
@@ -805,17 +855,17 @@ describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review
     // file, and asks the clock there, as it does before each file. The
     // session holds each answer until the scan has done that, or until
     // 10 000 event-loop turns have passed without it — which is what
-    // happens if the scan waits for each answer before reading on.
+    // happens if the scan waits for each answer before reading on. The
+    // clock is only counted: it stands still, so no deadline decides this.
     const dir = path.join(tmp, "src");
     await sourceTree(dir, 6, 400);
     let clockReads = 0;
     let readsAtSend = 0;
     const overlapped: boolean[] = [];
-    _setGrepLimitsForTest({
-      deadlineMs: 120_000,
+    holdGrepClock({
       now: () => {
         clockReads++;
-        return Date.now();
+        return 0;
       },
       batchChars: 40_000,
       workerInputChars: 40_000,
@@ -844,14 +894,44 @@ describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review
 });
 
 describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 review)", () => {
+  beforeEach(() => holdGrepClock());
+
+  /**
+   * Runs the real worker and keeps the length of the longest line Grep asks
+   * it to run. The worker is told to run none longer than `cap`, so a line a
+   * broken cap lets through is counted here (and comes back undetermined)
+   * instead of keeping a worker busy for minutes. With no deadline that can
+   * fire, what was sent is what shows a line was or was not run.
+   */
+  function linesSentUpTo(cap: number): { longest: () => number; open: () => RegexSession } {
+    let longest = 0;
+    return {
+      longest: () => longest,
+      open: () => {
+        const real = openRegexSession();
+        return {
+          run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
+            if (request.op !== "testEach") return real.run(request);
+            for (const line of linesOf(request)) longest = Math.max(longest, line.length);
+            return real.run({ ...request, maxItemChars: cap });
+          },
+          close: () => real.close(),
+        };
+      },
+    };
+  }
+
   test("a line a chained pattern could take minutes on is named, and leaves no worker spinning", async () => {
     // Six repeats that can split one run of word characters: on the
     // 9 000-character line that is C(9 006, 6) ways from each of 9 000
     // places. 0.7.1 first ran it and left two workers spinning for minutes
     // (the session's next Grep answered "busy"), then refused the pattern
-    // outright. Now the line is not run, and the short one is.
+    // outright. Now the line is not run, and the short one is: no line over
+    // the cap ever reaches a worker, so none is left spinning.
     await writeFile(path.join(tmp, "a.txt"), `${"a".repeat(9_000)} zzz\nab!\n`);
     await writeFile(path.join(tmp, "b.txt"), "has NEEDLE\n");
+    const sent = linesSentUpTo(64);
+    holdGrepClock({ openSession: sent.open });
     const ctx = { runContext: { sessionId: "grep-runaway" } } as never;
     const before = regexWorkerCounts().runaway;
     for (let i = 0; i < 2; i++) {
@@ -861,6 +941,7 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
         "[grep: 1 line(s) longer than 64 characters were not searched — this pattern has 6 repeats or optional parts that can split the same text one after another, and these lines give them too many ways to do it",
       );
     }
+    expect(sent.longest()).toBeLessThanOrEqual(64);
     expect(regexWorkerCounts().runaway).toBe(before);
     expect(String(await grep.execute({ pattern: "NEEDLE" }, ctx))).toBe("b.txt:1:has NEEDLE");
   });
@@ -870,9 +951,9 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
     // one, its two repeats split the rest some 18 million ways, about
     // 20 ms. From every place on a line of word characters, `\w*\w*!`
     // would take minutes, so that line is not run. Line 1 is a no-match
-    // that takes real time, so the give-up threshold and the deadline are
-    // raised: a loaded machine must not turn "run" into "gave up".
-    _setGrepLimitsForTest({ giveUpMs: 30_000, deadlineMs: 60_000 });
+    // that takes real time, so it matters that no deadline or give-up
+    // threshold here can be reached (see holdGrepClock): a loaded machine
+    // must not turn "run" into "gave up".
     await writeFile(
       path.join(tmp, "f.txt"),
       `z${"a".repeat(6_000)}\nzab!\nz${"a".repeat(2_500)}!\n`,
@@ -1022,6 +1103,8 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
     // at all and ran on lines up to 10 000 characters: 13 s on 1 000
     // characters of `abab…`, hours on 10 000. The line is now named.
     await writeFile(path.join(tmp, "f.txt"), `${"ab".repeat(500)}\nab ab x\n`);
+    const sent = linesSentUpTo(420);
+    holdGrepClock({ openSession: sent.open });
     const ctx = { runContext: { sessionId: "grep-separator-chain" } } as never;
     const before = regexWorkerCounts().runaway;
     const result = String(await grep.execute({ pattern: ".*ab.*ab.*x" }, ctx));
@@ -1029,6 +1112,7 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
     expect(result).toContain(
       "[grep: 1 line(s) longer than 420 characters were not searched — this pattern has 3 repeats",
     );
+    expect(sent.longest()).toBeLessThanOrEqual(420);
     expect(regexWorkerCounts().runaway).toBe(before);
   });
 });
