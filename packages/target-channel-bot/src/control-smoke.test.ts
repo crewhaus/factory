@@ -10,8 +10,12 @@
  * synthetic-tick session marker and the 409-while-in-flight rule.
  *
  * No credential here is real: every value is assembled from parts at runtime,
- * and the model endpoint points at a closed loopback port so the poked tick
- * fails instantly instead of reaching the network.
+ * and the model endpoint is a loopback server the test owns, so nothing
+ * reaches the network. That server holds the poked tick's model call until
+ * the test releases it. The 409 and the mid-drain 503 and healthz all need
+ * the tick still in flight. Without the hold, the tick would end when the
+ * SDK's retries ran out (1.1-1.5 s against a closed port), and a slow runner
+ * could get there first.
  */
 import { afterAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from "node:fs";
@@ -113,12 +117,40 @@ test(
   async () => {
     const root = makeHarness();
     // Fake credentials, assembled from parts so no realistic-shaped secret
-    // literal is ever committed. The model endpoint is a closed loopback port:
-    // the poked tick fails immediately, with no network egress.
+    // literal is ever committed.
     const fakeSlackBot = ["xo", "xb", "-", "0".repeat(12)].join("");
     const fakeSlackSigning = ["sig", "-", "0".repeat(16)].join("");
     const fakeAnthropic = ["sk", "-", "ant", "-", "0".repeat(16)].join("");
     const controlToken = ["ctl", "-", "0".repeat(24)].join("");
+
+    // The model endpoint. Every request waits for `release()`, then gets a
+    // 400 the SDK does not retry, so after the release the tick fails and the
+    // drain can finish.
+    let modelCalls = 0;
+    let reached!: () => void;
+    const modelReached = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const model = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch() {
+        modelCalls += 1;
+        reached();
+        await held;
+        return Response.json(
+          {
+            type: "error",
+            error: { type: "invalid_request_error", message: "held, then refused" },
+          },
+          { status: 400 },
+        );
+      },
+    });
 
     const proc = Bun.spawn({
       cmd: ["bun", join(root, "dist", "daemon.ts")],
@@ -130,7 +162,7 @@ test(
         SLACK_BOT_TOKEN: fakeSlackBot,
         SLACK_SIGNING_SECRET: fakeSlackSigning,
         ANTHROPIC_API_KEY: fakeAnthropic,
-        ANTHROPIC_BASE_URL: "http://127.0.0.1:1",
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${model.port}`,
         // 0 asks the kernel for an ephemeral port — the daemon must REPORT it,
         // which is how a supervisor that passed 0 learns where to connect.
         CREWHAUS_CONTROL_PORT: "0",
@@ -230,16 +262,12 @@ test(
       expect(((await noLane.json()) as { code: string }).code).toBe("lane_not_armed");
 
       // --- the synthetic marker ---------------------------------------------
+      // The marker is written BEFORE the turn, so a tick that dies mid-flight
+      // is still attributable: once the turn has asked the model, it is on
+      // disk. One model call, for the one accepted poke.
+      await modelReached;
+      expect(modelCalls).toBe(1);
       const logPath = join(root, ".crewhaus", "sessions", `${sessionId}.jsonl`);
-      const deadline = Date.now() + 10_000;
-      while (Date.now() < deadline) {
-        try {
-          readFileSync(logPath, "utf-8");
-          break;
-        } catch {
-          await Bun.sleep(50);
-        }
-      }
       const marker = JSON.parse(readFileSync(logPath, "utf-8").split("\n")[0] as string) as {
         kind: string;
         payload: Record<string, unknown>;
@@ -276,6 +304,9 @@ test(
       // …while liveness keeps answering, or a PaaS reaps the process mid-drain.
       expect((await fetch(`${publicBase}/healthz`)).status).toBe(200);
 
+      // The drain waits for the tick, so the daemon exits only once the
+      // model call it is holding is answered.
+      release();
       expect(await proc.exited).toBe(0);
 
       // --- the audit trail ---------------------------------------------------
@@ -295,8 +326,10 @@ test(
       // The bearer is never part of the record.
       expect(audit).not.toContain(controlToken);
     } finally {
+      release();
       proc.kill();
       await proc.exited;
+      model.stop(true);
     }
   },
   BOOT_TIMEOUT_MS + 30_000,
