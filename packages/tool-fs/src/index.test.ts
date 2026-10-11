@@ -1182,10 +1182,37 @@ describe("repeatChainLength", () => {
     expect(repeatChainLength("\\w+\\s*\\w+$")).toBe(2);
   });
 
-  test("a 1 000-character pattern is analysed in bounded time", () => {
-    const started = performance.now();
-    expect(repeatChainLength(`${"a*".repeat(499)}!`)).toBe(499);
-    expect(performance.now() - started).toBeLessThan(1_000);
+  test("a 1 000-character pattern is analysed in steps quadratic in its repeats, not more", () => {
+    // Counted, not timed. A 1 000 ms bound took 423-564 ms on CI's loaded
+    // runner, and passed a cubic analysis at 959 ms on a fast Mac. Each step
+    // of the analysis (a choice point checked against a later element)
+    // builds one bit set, a Uint32Array, so counting those counts the steps.
+    // Twice the repeats must cost about four times the steps: a cubic
+    // analysis costs eight, and an exponential one never returns.
+    const Real = Uint32Array;
+    let built = 0;
+    class Counted extends Real {
+      constructor(length: number) {
+        super(length);
+        built++;
+      }
+    }
+    const stepsFor = (repeats: number): number => {
+      built = 0;
+      (globalThis as { Uint32Array: unknown }).Uint32Array = Counted;
+      try {
+        expect(repeatChainLength(`${"a*".repeat(repeats)}!`)).toBe(repeats);
+      } finally {
+        (globalThis as { Uint32Array: unknown }).Uint32Array = Real;
+      }
+      return built;
+    };
+    const half = stepsFor(249);
+    const full = stepsFor(499);
+    // The count sees the analysis's steps: more than one per repeat.
+    expect(half).toBeGreaterThan(249);
+    expect(full / half).toBeLessThan(5);
+    expect(full).toBeLessThan(4 * 499 * 499);
   });
 });
 
