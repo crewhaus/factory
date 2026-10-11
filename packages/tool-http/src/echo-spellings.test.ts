@@ -210,11 +210,13 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
 /**
  * Run `call`, and each time a text of a million characters or more is
  * searched for `needle` (the scrubber looks for the credential in the text
- * and in each decoded view of it), count the plain objects still alive
- * after a full collection. `peak` is the most seen, less those alive before
- * the call. A count, not the process's RSS: RSS moves with the allocator
- * and with every other test in the process, and the 512 MiB bound this
- * test had sat only 1.6x above what a quiet machine measured.
+ * and in each decoded view of it), count the heap cells of every type
+ * still alive after a full collection: a record per escape shows up
+ * whether it is a plain object, an array, a map or a closure. `peak` is the
+ * most seen, less those alive before the call. A count, not the process's
+ * RSS: RSS moves with the allocator and with every other test in the
+ * process, and the 512 MiB bound this test had sat only 1.6x above what a
+ * quiet machine measured.
  */
 async function liveObjectsWhileSearched<T>(
   needle: string,
@@ -222,7 +224,9 @@ async function liveObjectsWhileSearched<T>(
 ): Promise<{ value: T; peak: number; searches: number }> {
   const liveObjects = (): number => {
     Bun.gc(true);
-    return heapStats().objectTypeCounts["Object"] ?? 0;
+    let cells = 0;
+    for (const count of Object.values(heapStats().objectTypeCounts)) cells += count;
+    return cells;
   };
   const realIndexOf = String.prototype.indexOf;
   const realIncludes = String.prototype.includes;
@@ -273,7 +277,8 @@ describe("scrubbing a large escaped body costs about its size (bounds review)", 
     expect(value.download.includes('"path":"escapes.bin"')).toBe(true);
     // The body was searched for the credential, so the count saw the scrub.
     expect(searches).toBeGreaterThan(0);
-    // One object per escape would be millions; a handful is the call itself.
+    // A record per escape is about 8.7 million cells, of whatever type; the
+    // call itself leaves a few thousand.
     expect(peak).toBeLessThan(100_000);
   }, 60_000);
 });
