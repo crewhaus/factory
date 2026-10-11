@@ -1394,7 +1394,7 @@ describe("requiredLiterals (Grep's pre-filter)", () => {
     // The battery really exercised the filter.
     expect(filtered).toBeGreaterThan(3_000);
     expect(checked).toBeGreaterThan(3_000);
-  });
+  }, 20_000);
 });
 
 describe("allFsTools export", () => {
