@@ -580,13 +580,17 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
     // "no matches". So this session answers every line with the real worker,
     // then hands back what a worker stopped by the deadline after its third
     // line reports: how far it got, and the hits among the lines it answered.
-    // What is under test is what Grep does with that answer.
+    // What is under test is what Grep does with that answer. No real time
+    // decides anything: Grep's clock stands still, and the real worker gets
+    // a deadline and give-up threshold no runner reaches (with Grep's own
+    // 100 ms, a slow worker start on CI timed out for real, so the scripted
+    // answer was never reached).
     await writeFile(path.join(tmp, "a.txt"), "111x\nabx\n333x\ncdx\n555x\n");
     const real = openRegexSession();
     let testEachRuns = 0;
     const stoppedAfterThree: RegexSession = {
       async run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
-        const outcome = await real.run(request);
+        const outcome = await real.run({ ...request, deadlineMs: 60_000, giveUpMs: 60_000 });
         if (request.op !== "testEach" || outcome.status !== "ok") return outcome;
         testEachRuns++;
         const answered = outcome.result as TestEachResult;
@@ -607,7 +611,7 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
       },
       close: () => real.close(),
     };
-    _setGrepLimitsForTest({ deadlineMs: 100, openSession: () => stoppedAfterThree });
+    _setGrepLimitsForTest({ deadlineMs: 100, now: () => 0, openSession: () => stoppedAfterThree });
     const result = String(await grep.execute({ pattern: "\\d+x" }));
     expect(testEachRuns).toBe(1);
     expect(result.split("\n").slice(0, 2)).toEqual(["a.txt:1:111x", "a.txt:3:333x"]);
