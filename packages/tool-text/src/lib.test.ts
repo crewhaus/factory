@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { regexWork } from "./__test__/regex-work";
 import {
   type ParsedDiff,
   type ParsedDiffFile,
@@ -848,12 +849,18 @@ describe("markdown", () => {
   });
 
   test("a heading with a long run of spaces is read in linear time", () => {
-    // 0.7.0's `/^(#{1,6})\s+(.+?)\s*#*\s*$/` took 1.5 s at 2,000 spaces.
-    const t0 = performance.now();
-    const h = parseHeadings(`# a${" ".repeat(20_000)}b ##`);
-    expect(performance.now() - t0).toBeLessThan(1_000);
-    expect(h[0]?.title).toBe(`a${" ".repeat(20_000)}b`);
-  }, 60_000);
+    // Counted, not timed: every pattern the reader runs is walked by a model
+    // that counts its backtracking steps (__test__/regex-work.ts). The reader
+    // takes 5 steps a character here. 0.7.0's `/^(#{1,6})\s+(.+?)\s*#*\s*$/`
+    // is cubic: 125,752 steps a character at 500 spaces, and 1.5 s of wall
+    // time at 2,000. A count past the bound stops the read and is Infinity.
+    const line = `# a${" ".repeat(20_000)}b ##`;
+    const bound = 64 * line.length;
+    const counted = regexWork(bound, () => parseHeadings(line));
+    expect(counted.unmodelled).toEqual([]);
+    expect(counted.steps).toBeLessThanOrEqual(bound);
+    expect(counted.value?.[0]?.title).toBe(`a${" ".repeat(20_000)}b`);
+  });
 
   test("slugify matches the GitHub anchor shape", () => {
     expect(slugify("Hello, World!")).toBe("hello-world");

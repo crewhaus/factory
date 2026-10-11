@@ -4,11 +4,13 @@
  * Three entity patterns rescanned a long run from every position in it, and
  * edit distance and Jaro-Winkler compared inputs of any size, all
  * synchronously on the harness thread. The scans are now linear — proved
- * here by input sizes the 0.7.0 code took seconds on, with a wide margin —
- * and the matches are held to the plain patterns by a differential fuzz.
- * The comparisons are refused above a cell budget, before any work.
+ * here by counting their patterns' backtracking steps on inputs the 0.7.0
+ * code took seconds on — and the matches are held to the plain patterns by a
+ * differential fuzz. The comparisons are refused above a cell budget, before
+ * any work.
  */
 import { describe, expect, test } from "bun:test";
+import { regexWork } from "./__test__/regex-work";
 import { fuzzyMatch, textDiff, textSimilarity } from "./index";
 import { ENTITY_PATTERNS, extractEntities, matchesOf } from "./lib/entities";
 import { MAX_SIMILARITY_WORK, jaroWinkler, levenshtein, similarityCost } from "./lib/similarity";
@@ -48,23 +50,31 @@ const scanned = (text: string, kind: string): Array<[number, string]> =>
 
 describe("entity scans are linear", () => {
   test("a 100 K run that never completes a match is scanned once, not once per character", () => {
-    // 0.7.0 took ~10 s on the email run alone; each is a few ms now.
+    // Counted, not timed: every pattern the scan runs is walked by a model
+    // that counts its backtracking steps (__test__/regex-work.ts). The scans
+    // take 4 to 21 steps a character on these runs. 0.7.0's global patterns
+    // retried the run from every character in it: 377 to 5,016 steps a
+    // character on runs of only a thousand, growing with the run, and about
+    // ten seconds for the email run alone. A count past the bound stops the
+    // scan there and reads as Infinity.
     const runs: Array<[string, string]> = [
       ["email", "a".repeat(100_000)],
       ["money", "1,".repeat(50_000)],
       ["jwt", "-eyJ".repeat(25_000)],
       ["email", `${"=".repeat(50_000)}@`],
     ];
-    const slow: Array<{ kind: string; ms: number }> = [];
+    const STEPS_PER_CHARACTER = 64;
+    const over: Array<{ kind: string; steps: number }> = [];
     let checked = 0;
     for (const [kind, text] of runs) {
-      const t0 = performance.now();
-      expect({ kind, found: extractEntities(text, [kind], true) }).toEqual({ kind, found: {} });
-      const ms = performance.now() - t0;
-      if (ms >= 1_500) slow.push({ kind, ms });
+      const bound = STEPS_PER_CHARACTER * text.length;
+      const counted = regexWork(bound, () => extractEntities(text, [kind], true));
+      expect({ kind, unmodelled: counted.unmodelled }).toEqual({ kind, unmodelled: [] });
+      if (counted.steps > bound) over.push({ kind, steps: counted.steps });
+      else expect({ kind, found: counted.value }).toEqual({ kind, found: {} });
       checked += 1;
     }
-    expect(slow).toEqual([]);
+    expect(over).toEqual([]);
     expect(checked).toBe(4);
   }, 60_000);
 
