@@ -992,28 +992,38 @@ describe("WaitForOutput", () => {
   });
 
   test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
-    // One process, not `sh -c "printf …; sleep 5"`: that left `sleep` behind
-    // when the registry killed `sh`, and on Windows a live process whose cwd
-    // is the workspace keeps it from being removed (EBUSY in afterEach).
+    // One process, not `sh -c "…; sleep 5"`: that left `sleep` behind when
+    // the registry killed `sh`, and on Windows a live process whose cwd is
+    // the workspace keeps it from being removed (EBUSY in afterEach).
     const started = await call(processStart, {
-      argv: [
-        process.execPath,
-        "-e",
-        `process.stdout.write("${"a".repeat(300)}"); setTimeout(() => {}, 5000);`,
-      ],
+      argv: [process.execPath, "-e", "setTimeout(() => {}, 5000);"],
     });
-    // Wait for the output itself, not a fixed 200 ms a slow start outlasts.
-    let seen = "";
-    const until = Date.now() + 10_000;
-    while (seen.length < 300 && Date.now() < until) {
-      seen += String((await call(processOutput, { id: started.id })).stdout ?? "");
-      if (seen.length < 300) await Bun.sleep(20);
+    // The regex worker is one that says it is ready and never answers, so
+    // every match ends at the run's own deadline on any machine. A real
+    // runaway pattern (cubic, ~0.4 s on 300 characters) raced the engine's
+    // speed against a 250 ms deadline: an engine 4x faster answered "no
+    // match" in time and the wait ended as "deadline".
+    const Real = globalThis.Worker;
+    const asked: Array<Record<string, unknown>> = [];
+    let stopped = 0;
+    class Silent extends EventTarget {
+      constructor(_url: string | URL) {
+        super();
+        setTimeout(() => {
+          this.dispatchEvent(new MessageEvent("message", { data: { kind: "ready" } }));
+        }, 0);
+      }
+      postMessage(message: Record<string, unknown>): void {
+        asked.push(message);
+      }
+      terminate(): void {
+        stopped += 1;
+        setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+      }
+      unref(): void {}
     }
-    expect(seen).toBe("a".repeat(300));
+    (globalThis as { Worker: unknown }).Worker = Silent;
     try {
-      // Screened as safe (star height 1) but cubic: ~1 s on 300 characters,
-      // past this call's budget. Bounded: the abandoned worker stops within
-      // about a second.
       const out = await call(waitForOutput, {
         id: started.id,
         pattern: "\\w*\\w*\\w*!",
@@ -1024,7 +1034,14 @@ describe("WaitForOutput", () => {
         reason: "undetermined",
       });
       expect(String(out.detail)).toContain("pattern could not be evaluated");
+      // The pattern was asked of the worker once, and the worker that sat
+      // on it was stopped; the first unanswered match ended the wait.
+      expect({
+        asked: asked.map((m) => [m["op"], m["pattern"]]),
+        stopped,
+      }).toEqual({ asked: [["matchAll", "\\w*\\w*\\w*!"]], stopped: 1 });
     } finally {
+      (globalThis as { Worker: unknown }).Worker = Real;
       await call(processStop, { id: started.id, signal: "SIGKILL" });
     }
   }, 20_000);
