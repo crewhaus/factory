@@ -203,7 +203,10 @@ describe("runDreamPhase1 — determinism", () => {
       tmp = keep;
       rmSync(tmp2, { recursive: true, force: true });
     }
-  });
+    // Two seeded fixtures and two full phase-1 runs are slow by construction:
+    // well under 0.1 s here but 1.8 s on a loaded CI runner, too close to
+    // bun's default of 5 s.
+  }, 20_000);
 
   test("second run against the mutated stores is a no-op (zero new mutations)", async () => {
     const stores = await seedFixture();
