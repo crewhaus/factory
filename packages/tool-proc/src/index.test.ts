@@ -8,6 +8,7 @@
  * is also what gives the containment assertions something to escape from —
  * and removes it afterwards. Nothing is ever written into the repo.
  */
+import { heapSize } from "bun:jsc";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
@@ -106,6 +107,11 @@ type StdoutWatch = {
   cancelled: boolean;
   /** Pieces (and copies made of them) still alive when a stream ended; -1 before one did. */
   heldAtEnd: number;
+  /**
+   * Bytes of live JS objects gained from the spawn to the stream's end, each
+   * read after a full collection; NaN before a stream ended.
+   */
+  heapGainAtEnd: number;
 };
 
 const PIECE_BYTES = 64 * 1024;
@@ -116,9 +122,14 @@ const PIECE_BYTES = 64 * 1024;
  * `subarray()` made of one) kept as a WeakRef. When a stream ends, after a
  * full collection, it counts the pieces still alive: code that keeps only
  * its cap holds a handful, code that reads to the end before capping holds
- * every one. It also counts the bytes read and sees a cancel. Counts, not
- * the process's RSS, which moves with the allocator, with Bun's own pipe
- * buffering and with every other test in the process.
+ * every one. Code that copies the bytes out of the pieces first (into one
+ * growing buffer, or a decoded string) lets every piece go but holds the
+ * whole stream all the same, so it also reads the bytes of live JS objects
+ * gained since the spawn, both after a full collection: what is still
+ * reachable, not the process's RSS, which moves with the allocator, with
+ * Bun's own pipe buffering and with every other test in the process.
+ * Neither sees bytes held outside the JS heap (a `Bun.ArrayBufferSink`). It
+ * also counts the bytes read and sees a cancel.
  */
 function watchStdout(): { seen: StdoutWatch; restore: () => void } {
   const real = Bun.spawn.bind(Bun);
@@ -129,8 +140,16 @@ function watchStdout(): { seen: StdoutWatch; restore: () => void } {
       pieces.push(new WeakRef(this));
     }
   }
-  const seen: StdoutWatch = { delivered: 0, bytes: 0, cancelled: false, heldAtEnd: -1 };
+  const seen: StdoutWatch = {
+    delivered: 0,
+    bytes: 0,
+    cancelled: false,
+    heldAtEnd: -1,
+    heapGainAtEnd: Number.NaN,
+  };
   const spy = spyOn(Bun, "spawn").mockImplementation(((...args: Parameters<typeof Bun.spawn>) => {
+    Bun.gc(true);
+    const heapAtSpawn = heapSize();
     const proc = real(...args);
     const source = proc.stdout;
     if (!(source instanceof ReadableStream)) return proc;
@@ -144,6 +163,7 @@ function watchStdout(): { seen: StdoutWatch; restore: () => void } {
           await new Promise((resolve) => setTimeout(resolve, 0));
           Bun.gc(true);
           seen.heldAtEnd = pieces.filter((ref) => ref.deref() !== undefined).length;
+          seen.heapGainAtEnd = heapSize() - heapAtSpawn;
           controller.close();
           return;
         }
@@ -497,6 +517,10 @@ describe("RunCommand", () => {
     expect(seen.delivered).toBeGreaterThanOrEqual(3_000);
     expect(seen.heldAtEnd).toBeGreaterThanOrEqual(0);
     expect(seen.heldAtEnd).toBeLessThanOrEqual(64);
+    // Copying the bytes out of the pieces into one buffer, or decoding them
+    // into a string, before capping lets every piece go and still holds the
+    // 200 MB: live objects gain about 1 MB here, any read-everything 190 MB+.
+    expect(seen.heapGainAtEnd).toBeLessThan(32 * 1024 * 1024);
     expect(out.stdoutTruncated).toBe(true);
     // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
     expect(out.stdout).toContain("[199999900 bytes dropped]");

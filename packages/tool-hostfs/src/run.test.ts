@@ -5,6 +5,7 @@
  * The rest of the package drives recorded output through `_setRunner`; these
  * are the only tests that spawn, because the property is about the spawn.
  */
+import { heapSize } from "bun:jsc";
 import { describe, expect, spyOn, test } from "bun:test";
 import { runHostCommand } from "./run";
 
@@ -18,11 +19,16 @@ const PIECE_BYTES = 64 * 1024;
  * `subarray()` made of one) kept as a WeakRef. When the stream ends, after a
  * full collection, it counts the pieces still alive: code that keeps only
  * its cap holds a handful, code that reads to the end before capping holds
- * every one. A count, not the process's RSS, which moves with the
+ * every one. Code that copies the bytes out of the pieces first (into one
+ * growing buffer, or a decoded string) lets every piece go but holds the
+ * whole stream all the same, so it also reads the bytes of live JS objects
+ * gained since the spawn (`heapGainAtEnd`), both after a full collection:
+ * what is still reachable, not the process's RSS, which moves with the
  * allocator, with Bun's own pipe buffering and with every other test.
+ * Neither sees bytes held outside the JS heap (a `Bun.ArrayBufferSink`).
  */
 function countHeldPieces(): {
-  seen: { delivered: number; heldAtEnd: number };
+  seen: { delivered: number; heldAtEnd: number; heapGainAtEnd: number };
   restore: () => void;
 } {
   const real = Bun.spawn.bind(Bun);
@@ -33,8 +39,11 @@ function countHeldPieces(): {
       pieces.push(new WeakRef(this));
     }
   }
-  const seen = { delivered: 0, heldAtEnd: -1 };
+  // Both -1/NaN until the stream ends.
+  const seen = { delivered: 0, heldAtEnd: -1, heapGainAtEnd: Number.NaN };
   const spy = spyOn(Bun, "spawn").mockImplementation(((...args: Parameters<typeof Bun.spawn>) => {
+    Bun.gc(true);
+    const heapAtSpawn = heapSize();
     const proc = real(...args);
     const source = proc.stdout;
     if (!(source instanceof ReadableStream)) return proc;
@@ -49,6 +58,7 @@ function countHeldPieces(): {
           await new Promise((resolve) => setTimeout(resolve, 0));
           Bun.gc(true);
           seen.heldAtEnd = pieces.filter((ref) => ref.deref() !== undefined).length;
+          seen.heapGainAtEnd = heapSize() - heapAtSpawn;
           controller.close();
           return;
         }
@@ -96,6 +106,11 @@ describe("runHostCommand caps output as it arrives (C163)", () => {
       expect(seen.delivered).toBeGreaterThanOrEqual(4_096);
       expect(seen.heldAtEnd).toBeGreaterThanOrEqual(0);
       expect(seen.heldAtEnd).toBeLessThanOrEqual(64);
+      // Copying the bytes out of the pieces into one buffer, or decoding them
+      // into a string, before cutting lets every piece go and still holds
+      // the 256 MiB: live objects gain about 1 MB here, a read-everything
+      // 256 MB or more.
+      expect(seen.heapGainAtEnd).toBeLessThan(32 * 1024 * 1024);
     },
     60_000,
   );
