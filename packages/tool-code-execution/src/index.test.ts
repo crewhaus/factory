@@ -258,14 +258,16 @@ describe("a run that did not finish on its own says so", () => {
 
   test("trailing newlines are trimmed in linear time", async () => {
     // `/\n+$/` backtracks over every run of newlines: 120 000 of them before
-    // a final character took seconds. The loop takes microseconds.
-    const stub = new StubSandbox({ stdout: `${"\n".repeat(120_000)}x\n\n`, stderr: "e\n" });
+    // a final character took seconds, and the 320 000 here about a minute.
+    // The loop takes microseconds, so the bound catches only a hang: the
+    // work is inside the regex engine, where there is no step to count.
+    const stub = new StubSandbox({ stdout: `${"\n".repeat(320_000)}x\n\n`, stderr: "e\n" });
     registerCodeExecutionConfig({ sandbox: stub });
     const t0 = performance.now();
     const out = (await shell.execute({ code: "x" })) as string;
-    expect(performance.now() - t0).toBeLessThan(1_500);
-    expect(out.startsWith("\n".repeat(120_000))).toBe(true);
-    expect(out.slice(120_000)).toBe("x\n[stderr]\ne\n[exit] 0 (1ms)");
+    expect(performance.now() - t0).toBeLessThan(5_000);
+    expect(out.startsWith("\n".repeat(320_000))).toBe(true);
+    expect(out.slice(320_000)).toBe("x\n[stderr]\ne\n[exit] 0 (1ms)");
   }, 20_000);
 });
 
