@@ -289,3 +289,19 @@ describe("a leaf joined onto a directory that is the root itself", () => {
     });
   });
 });
+
+describe("a contained read's text (bounds review)", () => {
+  for (const [name, read] of readers) {
+    test(`${name}: the text is made from the bytes when it is asked for, whatever decodes it`, async () => {
+      // BundleSizeCheck needs only the bytes: decoding a 64 MiB binary it
+      // never reads as text cost 64 MiB of string. A text made before it was
+      // asked for, by TextDecoder, Buffer#toString or anything else, cannot
+      // show bytes the caller changed after the read.
+      writeFileSync(join(f.ws, `lazy-${name}.txt`), "before");
+      const r = await read(f.ws, `lazy-${name}.txt`, { maxBytes: 100 });
+      if (!r.ok) throw new Error(r.reason);
+      r.bytes.set(new TextEncoder().encode("after!"));
+      expect(r.text).toBe("after!");
+    });
+  }
+});

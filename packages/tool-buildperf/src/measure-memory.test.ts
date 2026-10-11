@@ -10,7 +10,10 @@
  *
  * The test counts that work, the bytes decoded as text and the bytes copied
  * out of a typed array, rather than the process's RSS: RSS moves with the
- * allocator and with every other test in the process.
+ * allocator and with every other test in the process. It counts the two
+ * decoders a caller reaches for, TextDecoder and Buffer#toString; that the
+ * reader decodes nothing before `text` is asked for, by any API, is
+ * tool-safety's own test (streams/file.test.ts, fs/read.test.ts).
  */
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -49,6 +52,10 @@ test("a 64 MiB binary is weighed without decoding or copying it", async () => {
     slice(start?: number, end?: number): Uint8Array;
   };
   const decode = spyOn(TextDecoder.prototype, "decode");
+  // Buffer#toString is native in Bun and does not go through TextDecoder:
+  // an eager `Buffer.from(bytes.buffer, ...).toString("utf8")` decoded all
+  // 64 MiB unseen by the spy above.
+  const bufferText = spyOn(Buffer.prototype, "toString");
   const slice = spyOn(typedArray, "slice");
   let decoded = 0;
   let copied = 0;
@@ -62,11 +69,15 @@ test("a 64 MiB binary is weighed without decoding or copying it", async () => {
     for (const [input] of decode.mock.calls) {
       decoded += (input as { byteLength?: number } | undefined)?.byteLength ?? 0;
     }
+    for (const buffer of bufferText.mock.contexts) {
+      decoded += (buffer as { byteLength?: number } | undefined)?.byteLength ?? 0;
+    }
     for (const result of slice.mock.results) {
       copied += (result.value as Uint8Array | undefined)?.byteLength ?? 0;
     }
   } finally {
     decode.mockRestore();
+    bufferText.mockRestore();
     slice.mockRestore();
   }
   expect(out.entries[0]?.bytes).toBe(64 * MIB);

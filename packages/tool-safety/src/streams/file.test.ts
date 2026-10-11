@@ -295,6 +295,21 @@ describe("a read's cost (bounds review)", () => {
     }
   });
 
+  test("the text is made from the bytes when it is asked for, whatever decodes it", async () => {
+    // The spy above sees only TextDecoder; Buffer#toString, utf8Slice and
+    // StringDecoder each decode without it. A text made before it was asked
+    // for cannot show bytes the caller changed after the read, so this
+    // holds for every decoder.
+    const file = join(dir, "lazy-any.txt");
+    writeFileSync(file, "before");
+    for (const [, read] of readers) {
+      const r = await read(file, { maxBytes: 1024 });
+      if (!r.ok) throw new Error(r.reason);
+      r.bytes.set(new TextEncoder().encode("after!"));
+      expect(r.text).toBe("after!");
+    }
+  });
+
   test("a capped read of a large file holds no more than the cap", async () => {
     const file = join(dir, "small.txt");
     writeFileSync(file, "x".repeat(100_000));
