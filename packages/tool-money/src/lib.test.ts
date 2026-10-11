@@ -424,6 +424,47 @@ describe("three-way match", () => {
   });
 });
 
+/**
+ * How many elements `Array.prototype.sort` and `toSorted` were handed while
+ * `body` ran, and how many comparisons they made. Past `limit` elements the
+ * next sort throws instead of running, so a sort per disposal fails at once.
+ * Both originals are put back before this returns.
+ */
+function sortWork<T>(
+  limit: number,
+  body: () => T,
+): { value: T | undefined; lots: number; comparisons: number } {
+  const OVER = Symbol("over the sort limit");
+  const proto = Array.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const saved = { sort: proto["sort"], toSorted: proto["toSorted"] };
+  let lots = 0;
+  let comparisons = 0;
+  for (const name of ["sort", "toSorted"] as const) {
+    const real = saved[name] as (...args: unknown[]) => unknown;
+    proto[name] = function (this: unknown[], compare?: unknown) {
+      lots += this.length;
+      if (lots > limit) throw OVER;
+      const counted =
+        typeof compare === "function"
+          ? (a: unknown, b: unknown) => {
+              comparisons += 1;
+              return (compare as (a: unknown, b: unknown) => number)(a, b);
+            }
+          : compare;
+      return real.call(this, counted);
+    };
+  }
+  try {
+    return { value: body(), lots, comparisons };
+  } catch (err) {
+    if (err !== OVER) throw err;
+    return { value: undefined, lots: Number.POSITIVE_INFINITY, comparisons };
+  } finally {
+    proto["sort"] = saved.sort as (...args: unknown[]) => unknown;
+    proto["toSorted"] = saved.toSorted as (...args: unknown[]) => unknown;
+  }
+}
+
 describe("cost basis", () => {
   const lots = [
     { id: "L1", acquiredAt: "2024-01-10T00:00:00Z", quantity: 10, costMinor: 10_000 },
@@ -537,7 +578,9 @@ describe("cost basis", () => {
   test("HIFO costs about what FIFO does at thousands of lots, not a sort per disposal", () => {
     // Every open lot was re-sorted, with bigint products, for every
     // disposal: 3000 lots and disposals took seconds where FIFO took
-    // milliseconds, and the schema allows ten thousand of each.
+    // milliseconds, and the schema allows ten thousand of each. Counted, not
+    // timed: every method sorts the 3000 lots once, about 31 000 comparisons
+    // for HIFO. A sort per disposal hands the sorts millions of lots.
     const n = 3000;
     const many = Array.from({ length: n }, (_, i) => ({
       id: `l${i}`,
@@ -551,21 +594,16 @@ describe("cost basis", () => {
       quantity: 0.25,
       proceedsMinor: 5000,
     }));
-    const fastest = (method: "fifo" | "hifo"): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let run = 0; run < 3; run++) {
-        const start = performance.now();
-        expect(computeCostBasis(many, sells, method).disposals).toHaveLength(n);
-        best = Math.min(best, performance.now() - start);
-      }
-      return best;
-    };
-    const fifo = fastest("fifo");
-    const hifo = fastest("hifo");
-    expect({ fifo, hifo, withinBudget: hifo <= 5 * fifo + 250 }).toMatchObject({
-      withinBudget: true,
-    });
-  }, 60_000);
+    const fifo = sortWork(2 * n, () => computeCostBasis(many, sells, "fifo"));
+    const hifo = sortWork(2 * n, () => computeCostBasis(many, sells, "hifo"));
+    // Lots handed to a sort over the whole call: the 3000, once. Past twice
+    // that the sort is stopped and the count reads as Infinity.
+    expect({ fifo: fifo.lots, hifo: hifo.lots }).toEqual({ fifo: n, hifo: n });
+    // One sort's comparisons, n log n, not one sort's per disposal.
+    expect(hifo.comparisons).toBeLessThanOrEqual(2 * n * Math.ceil(Math.log2(n)));
+    expect(fifo.value?.disposals).toHaveLength(n);
+    expect(hifo.value?.disposals).toHaveLength(n);
+  });
 });
 
 describe("spend limits", () => {
