@@ -14,7 +14,8 @@
  * The server is on loopback, which the SSRF guard refuses, so the test
  * resolves a public-looking name to a public-looking address and a wrapper
  * around globalThis.fetch dials loopback instead, passing the init through
- * untouched — which is also how it sees what the tool asked for.
+ * untouched — which is also how it sees what the tool asked for, and how it
+ * counts what the runtime delivered for the bomb.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -51,16 +52,13 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(parts));
 }
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
-
 describe("a compressed reply costs at most the cap, through the production fetcher (C093)", () => {
   let bomb: Uint8Array;
   let server: ReturnType<typeof Bun.serve>;
   let acceptEncodings: Array<string | null> = [];
   let inits: Array<Record<string, unknown> | undefined> = [];
+  /** Bytes the runtime delivered for each /bomb response, read to its end. */
+  let delivered: number[] = [];
   const realFetch = globalThis.fetch;
 
   beforeAll(async () => {
@@ -91,6 +89,7 @@ describe("a compressed reply costs at most the cap, through the production fetch
   beforeEach(() => {
     acceptEncodings = [];
     inits = [];
+    delivered = [];
     _resetFetchConfig();
     _setRawFetch(undefined);
     _setDnsLookup(async () => ({ address: PUBLIC_IP, family: 4 }));
@@ -98,11 +97,23 @@ describe("a compressed reply costs at most the cap, through the production fetch
     // the tool's init through as it was given.
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       inits.push(init as Record<string, unknown> | undefined);
-      if (input instanceof Request) {
-        const url = input.url.replace(PUBLIC_IP, "127.0.0.1");
-        return realFetch(new Request(url, input), init);
-      }
-      return realFetch(String(input).replace(PUBLIC_IP, "127.0.0.1"), init);
+      const url = (input instanceof Request ? input.url : String(input)).replace(
+        PUBLIC_IP,
+        "127.0.0.1",
+      );
+      const res = await realFetch(input instanceof Request ? new Request(url, input) : url, init);
+      if (new URL(url).pathname !== "/bomb") return res;
+      // Read to the end before the tool sees it, and count: the body as sent
+      // when the tool asked for it raw, the whole inflated body when it did
+      // not. A constructed Response is never decoded, so the tool reads
+      // exactly these bytes.
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      delivered.push(bytes.byteLength);
+      return new Response(bytes, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
     }) as typeof globalThis.fetch;
   });
 
@@ -119,13 +130,13 @@ describe("a compressed reply costs at most the cap, through the production fetch
     test(`through ${branch}, a 256 MiB gzip reply is refused at the cap without being inflated`, async () => {
       const origin = `http://${host}:${server.port}`;
       registerFetchConfig({ allowed_origins: [origin] });
-      const before = rssNow();
       await expect(fetch.execute({ url: `${origin}/bomb` }, {} as never)).rejects.toThrow(
         /exceeded 5242880 bytes/,
       );
-      const grew = rssNow() - before;
-      // Inflating the reply costs about 1 GB; the cap costs a few MB.
-      expect(grew).toBeLessThan(64 * 1024 * 1024);
+      // What the runtime delivered is the reply as sent, about 260 KB.
+      // Inflated, it is 256 MiB, and about 1 GB of RSS: a count of bytes,
+      // not the process's RSS, which moves with every other test.
+      expect(delivered).toEqual([bomb.byteLength]);
       // Because the body was asked for raw, and as it is.
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);
