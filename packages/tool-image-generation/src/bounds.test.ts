@@ -148,13 +148,21 @@ describe("ImageGenerate is bounded", () => {
   test("the caller's AbortSignal.timeout stays armed after a call that listened to it", async () => {
     // On Bun, removing the last listener from an AbortSignal.timeout() signal
     // cancels its timer; the turn's deadline must survive a finished call.
+    // However slow the runner, the 100 ms cannot fire inside the call: the
+    // fetch answers in-process and the call never reaches the event loop,
+    // the only place a timer runs. The immediate queued first checks that.
+    let loopTurned = false;
+    setImmediate(() => {
+      loopTurned = true;
+    });
     const deadline = AbortSignal.timeout(100);
     const ok = (async () =>
-      Response.json({ data: [{ url: "https://img.example/1.png" }] })) as typeof fetch;
+      Response.json({ data: [{ url: "https://img.example/1.png" }] })) as unknown as typeof fetch;
     const out = await imageGenerate.execute({ prompt: "a cat" }, {
       signal: deadline,
       toolConfig: { provider: "openai", fetch: ok },
     } as unknown as Ctx);
+    expect(loopTurned).toBe(false);
     expect(out).toContain("https://img.example/1.png");
     for (let waited = 0; !deadline.aborted && waited < 5000; waited += 25) await Bun.sleep(25);
     expect(deadline.aborted).toBe(true);
