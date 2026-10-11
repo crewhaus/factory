@@ -359,6 +359,24 @@ async function waitGone(pid: number, budgetMs: number): Promise<boolean> {
   return !alive(pid);
 }
 
+/**
+ * Waits for `done`, checking every `stepMs`, until it holds or `ceilingMs`
+ * have passed since `began` (a `performance.now()` reading from the start of
+ * the test). The ceiling sits just under the test's budget and only bounds
+ * the wait: a stop that never comes then fails on the assertion after it,
+ * which names what was left, instead of as a timed-out test whose loop
+ * outlives it and reads a directory afterEach has removed. It never decides
+ * a pass.
+ */
+async function waitUntil(
+  done: () => boolean,
+  began: number,
+  ceilingMs: number,
+  stepMs = 100,
+): Promise<void> {
+  while (!done() && performance.now() - began < ceilingMs) await Bun.sleep(stepMs);
+}
+
 /** The pids of the detached reapers (watchdogs, retries) started for `names`. */
 function reapersFor(names: ReadonlyArray<string>): number[] {
   if (names.length === 0) return [];
@@ -976,6 +994,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
   }, 30_000);
 
   test("a create that never answers is cut off after the grace, and the result names what may be left", async () => {
+    const began = performance.now();
     setFakeEnv({ FAKE_CLI_CREATE_DELAY: "60" });
     const sandbox = createSandbox({ backend: "docker" });
     const controller = new AbortController();
@@ -996,13 +1015,15 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(cliCalls()[0]?.proc.exitCode).toBeNull();
     // The daemon commits it after the sandbox's `rm -f`; the detached retry
     // removes it (5 s later), and it never runs. Waited for, however long
-    // that takes here: the test's budget is the bound.
+    // that takes here, up to just under the test's budget.
     const retry = reaperCalls().find((c) => c.argv[6] === "5");
     expect(retry?.argv.slice(4)).toEqual(["docker", name, "5", "30"]);
     expect(retry?.options["detached"]).toBe(true);
-    while (records().length > 0 || !log().includes(`committed ${name}`)) {
-      await Bun.sleep(100);
-    }
+    await waitUntil(
+      () => records().length === 0 && log().includes(`committed ${name}`),
+      began,
+      35_000,
+    );
     expect(log()).toContain(`committed ${name}`);
     expect({ records: records(), running: running() }).toEqual({ records: [], running: [] });
   }, 40_000);
@@ -1271,6 +1292,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     // the run can: 10 s after the run's timeout it stops the container,
     // whatever the program inside does.
     test("a host killed outright: the watchdog stops the container after its timeout", async () => {
+      const began = performance.now();
       const h = startHost("watchdog");
       await containerStarted(15_000);
       const name = hostContainer();
@@ -1279,8 +1301,9 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       expect(alive(containerPid(name))).toBe(true);
       // Timeout 4 s → the watchdog fires 14 s after the run began. Nothing
       // else is left to stop it, so its `kill` is waited for as long as the
-      // machine takes to get there: the test's budget is the bound.
-      while (!cliLog().includes(`kill ${name}`)) await Bun.sleep(100);
+      // machine takes to get there, up to just under the test's budget.
+      await waitUntil(() => cliLog().includes(`kill ${name}`), began, 45_000);
+      expect(cliLog()).toContain(`kill ${name}`);
       expect(await waitGone(containerPid(name), 10_000)).toBe(true);
       expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
       expect(records()).toEqual([]);
@@ -1732,6 +1755,7 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
   // forking new processes ends as surely as one busy loop (a per-process
   // CPU limit let this one run on).
   test("a host killed outright: the watchdog stops a forking loop after the timeout", async () => {
+    const began = performance.now();
     const token = `sigkill-${randomUUID()}`;
     const forking =
       'while :; do sh -c "i=0; while [ \\$i -lt 200000 ]; do i=\\$((i+1)); done"; done';
@@ -1744,9 +1768,10 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
       expect(withToken(token)).toEqual([name]);
       // Timeout 2 s → the watchdog fires 12 s after the run began, runs
       // `docker kill` and `docker rm -f`, and exits. Waited for as long as
-      // that takes here (the test's budget is the bound); then nothing is left.
+      // that takes here, up to just under the test's budget; then nothing
+      // is left.
       expect(reapersFor([name])).toHaveLength(1);
-      while (reapersFor([name]).length > 0) await Bun.sleep(500);
+      await waitUntil(() => reapersFor([name]).length === 0, began, 55_000, 500);
       expect(withToken(token)).toEqual([]);
     } finally {
       for (const leftover of withToken(token)) names.push(leftover);
