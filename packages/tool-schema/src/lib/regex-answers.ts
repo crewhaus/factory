@@ -29,6 +29,7 @@
 import {
   type RegexOutcome,
   type RegexRejectCode,
+  type RegexSession,
   type TestEachResult,
   compileUserRegex,
   describeRegexOutcome,
@@ -65,6 +66,21 @@ export const SYNC_PATTERN_MAX_INPUT_CHARS = 65_536;
  * genuine no-matches in microseconds to milliseconds).
  */
 const GIVE_UP_MS = 100;
+
+const realSession = (real: RegexSession): RegexSession => real;
+let wrapSession: (real: RegexSession) => RegexSession = realSession;
+
+/**
+ * Test seam: {@link RegexAnswers.resolve} runs its questions in what `wrap`
+ * returns for the worker session it opens, so a test can script an answer
+ * the real engine gives only when it is slow enough (a give-up) instead of
+ * depending on how fast the machine is. Pass `undefined` to restore.
+ */
+export function _setRegexAnswersSessionForTest(
+  wrap: ((real: RegexSession) => RegexSession) | undefined,
+): void {
+  wrapSession = wrap ?? realSession;
+}
 
 /** The ctx fields a tool's `execute` receives that a regex run uses. */
 export function regexRunContext(ctx: unknown): RegexRunContext {
@@ -156,7 +172,7 @@ export class RegexAnswers {
     this.#pending.clear();
     if (groups.length === 0) return;
     const started = performance.now();
-    const session = openRegexSession();
+    const session = wrapSession(openRegexSession());
     try {
       for (const group of groups) {
         const inputs = [...group.inputs];

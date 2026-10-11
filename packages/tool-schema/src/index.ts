@@ -795,6 +795,7 @@ export {
  * then read (see `./lib/regex-answers`).
  */
 export {
+  _setRegexAnswersSessionForTest,
   CALLER_PATTERN_DEADLINE_MS,
   MAX_PATTERN_QUESTIONS,
   type RegexAnswer,

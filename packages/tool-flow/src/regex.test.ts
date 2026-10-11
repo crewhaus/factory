@@ -9,7 +9,8 @@
  * the next arm or `otherwise`, a scorer left the rule's points out, and a
  * classifier fell back to its builtin packs.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { _setRegexAnswersSessionForTest } from "@crewhaus/tool-schema";
 import {
   type FLOW_TOOLS,
   branch,
@@ -20,42 +21,93 @@ import {
   sequenceRun,
 } from "./index";
 
-// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
-async function call(tool: (typeof FLOW_TOOLS)[number], input: unknown): Promise<any> {
-  return JSON.parse(await tool.execute(tool.inputSchema.parse(input), {} as never));
-}
-
-/** How many times a 5 ms timer fired while `body` ran: 0 means the thread was held. */
-async function ticksDuring<T>(body: () => Promise<T>): Promise<{ result: T; ticks: number }> {
-  let ticks = 0;
-  const timer = setInterval(() => {
-    ticks += 1;
-  }, 5);
-  try {
-    return { result: await body(), ticks };
-  } finally {
-    clearInterval(timer);
-  }
-}
-
 /**
- * ~0.3 s of backtracking locally; polynomial, so the screen lets it through,
- * and a no-match that slow is read as the engine giving up: undetermined.
+ * Polynomial, so the screen lets it through, and about 0.3 s of backtracking
+ * over this text here: the worker reads a no-match that slow as the engine
+ * giving up, so the answer is undetermined. On an engine three times faster
+ * it is a definite "no" instead, and every undecided case below would decide.
+ * So the worker session the tools open in this file answers SLOW over this
+ * text as the worker answers an input the engine gave up on, without running
+ * it, and sends every other question to the real worker. No clock decides an
+ * answer here.
  */
 const SLOW = { pattern: "a*a*a*a*b", text: "a".repeat(120) };
 /** Exponential: refused by the screen before it runs. */
 const CATASTROPHIC = "(a+)+!$|refund";
 
+/** SLOW questions sent to the worker session. */
+let askedWorker = 0;
+/** SLOW runs over its text on the caller's thread, where nothing can stop them. */
+let onThisThread = 0;
+
+type RegexSession = ReturnType<NonNullable<Parameters<typeof _setRegexAnswersSessionForTest>[0]>>;
+
+function givesUpOnSlow(real: RegexSession): RegexSession {
+  return {
+    run: (request) => {
+      const asked = request as { op: string; pattern?: string; inputs?: unknown };
+      if (asked.op !== "testEach" || asked.pattern !== SLOW.pattern) return real.run(request);
+      askedWorker += 1;
+      const inputs = asked.inputs as ReadonlyArray<string>;
+      // The one other input this file asks SLOW about is ErrorClassify's
+      // empty `code`, which it cannot match: it needs a "b".
+      if (inputs.some((input) => input !== SLOW.text && input !== "")) {
+        throw new Error("SLOW was asked about an input this script does not answer");
+      }
+      // A testEach run with onGiveUp "skip" lists an input the engine gave
+      // up on as undetermined, and goes on.
+      return Promise.resolve({
+        status: "ok",
+        result: {
+          matched: [],
+          scanned: inputs.length,
+          truncated: false,
+          undetermined: inputs.flatMap((input, i) => (input === SLOW.text ? [i] : [])),
+        },
+      } as never);
+    },
+    close: () => real.close(),
+  };
+}
+
+beforeEach(() => {
+  askedWorker = 0;
+  onThisThread = 0;
+  _setRegexAnswersSessionForTest(givesUpOnSlow);
+});
+
+afterEach(() => {
+  _setRegexAnswersSessionForTest(undefined);
+});
+
+/** Run a tool. A run of SLOW over its text on this thread, as in 0.7.0, is counted and refused. */
+// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+async function call(tool: (typeof FLOW_TOOLS)[number], input: unknown): Promise<any> {
+  const realExec = RegExp.prototype.exec;
+  RegExp.prototype.exec = function (this: RegExp, text: string) {
+    if (this.source === SLOW.pattern && text === SLOW.text) {
+      onThisThread += 1;
+      throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
+    }
+    return realExec.call(this, text);
+  };
+  try {
+    return JSON.parse(await tool.execute(tool.inputSchema.parse(input), {} as never));
+  } finally {
+    RegExp.prototype.exec = realExec;
+  }
+}
+
 describe("ErrorClassify", () => {
   test("a caller rule's pattern runs off the caller's thread, and an undecided one decides nothing", async () => {
-    const { result, ticks } = await ticksDuring(() =>
-      call(errorClassify, {
-        status: 503,
-        message: SLOW.text,
-        rules: [{ id: "slow", matches: SLOW.pattern, class: "bug", action: "fail" }],
-      }),
-    );
-    expect(ticks).toBeGreaterThan(0);
+    const result = await call(errorClassify, {
+      status: 503,
+      message: SLOW.text,
+      rules: [{ id: "slow", matches: SLOW.pattern, class: "bug", action: "fail" }],
+    });
+    // Asked of the worker, and never run here.
+    expect(askedWorker).toBe(1);
+    expect(onThisThread).toBe(0);
     // 0.7.0 skipped the rule as "no match" and answered from the status pack:
     // transient / retry. The rule might have said "bug / fail".
     expect(result).toMatchObject({
@@ -100,17 +152,16 @@ describe("the routers and scorers read the answers three ways", () => {
   const yes = [{ op: "matches", expected: "^a+$" }];
 
   test("Branch takes no arm past one it could not decide, and not otherwise either", async () => {
-    const { result, ticks } = await ticksDuring(() =>
-      call(branch, {
-        value: SLOW.text,
-        arms: [
-          { name: "slow", when: slow, result: 1 },
-          { name: "later", when: yes, result: 2 },
-        ],
-        otherwise: { name: "default" },
-      }),
-    );
-    expect(ticks).toBeGreaterThan(0);
+    const result = await call(branch, {
+      value: SLOW.text,
+      arms: [
+        { name: "slow", when: slow, result: 1 },
+        { name: "later", when: yes, result: 2 },
+      ],
+      otherwise: { name: "default" },
+    });
+    expect(askedWorker).toBe(1);
+    expect(onThisThread).toBe(0);
     // 0.7.0: the slow arm read as a miss, so "later" won.
     expect(result).toMatchObject({ matched: false, name: null, fallback: false });
     expect(result.undetermined).toMatch(/arm "slow" could not be decided/);
