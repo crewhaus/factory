@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import { markdownOutline } from "@crewhaus/tool-text";
 import { type JsWork, jsWork, jsWorkAsync } from "./__test__/js-work";
 import { type RegexWork, regexWork, regexWorkAsync } from "./__test__/regex-work";
@@ -90,6 +91,24 @@ function linearIn<T>(size: number, counted: RegexWork<JsWork<T>>): T {
   expect(counted.steps).toBeLessThanOrEqual(STEPS_PER_CHARACTER * size);
   expect(counted.value?.work).toBeLessThanOrEqual(WORK_PER_CHARACTER * size);
   return counted.value?.value as T;
+}
+
+/**
+ * Run `body` with the regex worker's give-up threshold out of any runner's
+ * reach. The worker reports a failing `exec` that took 100 ms as the engine
+ * giving up, never as "no match", so a worker thread a loaded runner stalls
+ * that long inside one turns "does not match" into "could not verify". The
+ * 5 s deadline still stops a pattern that hangs.
+ */
+async function withoutGiveUp<T>(body: () => Promise<T>): Promise<T> {
+  const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
+  const giveUpMs = defaults.giveUpMs;
+  defaults.giveUpMs = 60_000;
+  try {
+    return await body();
+  } finally {
+    defaults.giveUpMs = giveUpMs;
+  }
 }
 
 /** 0.7.0's heading reader, as the parity oracle. */
@@ -258,14 +277,16 @@ describe("a caller's pattern runs in a worker, and an unanswerable check fails c
   test("AcceptanceCheck refuses an exponential pattern, naming why", async () => {
     writeFileSync(join(workspace, "out.txt"), `${"a".repeat(40)}!`);
     const out = JSON.parse(
-      await raw(acceptanceCheck, {
-        checks: [
-          { kind: "fileMatches", path: "out.txt", pattern: "^(a+)+$" },
-          { kind: "fileMatches", path: "out.txt", pattern: "(a|a)*$" },
-          { kind: "fileMatches", path: "out.txt", pattern: "a{40}!" },
-          { kind: "fileMatches", path: "out.txt", pattern: "b" },
-        ],
-      }),
+      await withoutGiveUp(() =>
+        raw(acceptanceCheck, {
+          checks: [
+            { kind: "fileMatches", path: "out.txt", pattern: "^(a+)+$" },
+            { kind: "fileMatches", path: "out.txt", pattern: "(a|a)*$" },
+            { kind: "fileMatches", path: "out.txt", pattern: "a{40}!" },
+            { kind: "fileMatches", path: "out.txt", pattern: "b" },
+          ],
+        }),
+      ),
     );
     expect(out.results.map((r: { ok: boolean }) => r.ok)).toEqual([false, false, true, false]);
     expect(out.results[0].detail).toMatch(/^invalid pattern: .*exponential/);
@@ -310,10 +331,12 @@ describe("a caller's pattern runs in a worker, and an unanswerable check fails c
   });
 
   test("a replace rule's `with` is literal text, as before", async () => {
-    const out = await normalizeOutput("port 8080", {
-      apply: [],
-      replace: [{ pattern: "\\d+", with: "$1 $& $$" }],
-    });
+    const out = await withoutGiveUp(() =>
+      normalizeOutput("port 8080", {
+        apply: [],
+        replace: [{ pattern: "\\d+", with: "$1 $& $$" }],
+      }),
+    );
     expect(out.text).toBe("port $1 $& $$");
     expect(out.applied).toEqual({ "replace[0]": 1 });
   });
