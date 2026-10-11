@@ -69,7 +69,9 @@ describe("the method a redirect keeps", () => {
       }
     }
     expect(checked).toBe(6);
-  });
+    // Twelve loopback round trips in turn. With each reply 375 ms late, as
+    // CI has shown, they take 4.5 s of bun's default 5 s.
+  }, 20_000);
 
   test("a POST becomes a GET without its body on a 301, 302 or 303, and a 303 does so to any method", async () => {
     let checked = 0;
@@ -88,5 +90,6 @@ describe("the method a redirect keeps", () => {
       checked += 1;
     }
     expect(checked).toBe(5);
-  });
+    // Ten loopback round trips in turn: 3.8 s of the default 5 s at 375 ms each.
+  }, 20_000);
 });

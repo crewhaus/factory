@@ -858,7 +858,9 @@ describe("HttpRequest", () => {
       parseJson: true,
     });
     expect(post.json).toMatchObject({ method: "GET", body: "" });
-  });
+    // Fourteen loopback round trips in turn. With each reply 375 ms late, as
+    // CI has shown, bun's default 5 s ran out before the last.
+  }, 20_000);
 
   test("a same-origin redirect keeps the credential", async () => {
     const result = await run(httpRequest, {
