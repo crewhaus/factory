@@ -14,6 +14,7 @@
  *   met:true for the right prefix and met:false for a wrong one, so the
  *   secret could be read out a character per call.
  */
+import { heapStats } from "bun:jsc";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -206,30 +207,73 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
   });
 });
 
+/**
+ * Run `call`, and each time a text of a million characters or more is
+ * searched for `needle` (the scrubber looks for the credential in the text
+ * and in each decoded view of it), count the plain objects still alive
+ * after a full collection. `peak` is the most seen, less those alive before
+ * the call. A count, not the process's RSS: RSS moves with the allocator
+ * and with every other test in the process, and the 512 MiB bound this
+ * test had sat only 1.6x above what a quiet machine measured.
+ */
+async function liveObjectsWhileSearched<T>(
+  needle: string,
+  call: () => Promise<T>,
+): Promise<{ value: T; peak: number; searches: number }> {
+  const liveObjects = (): number => {
+    Bun.gc(true);
+    return heapStats().objectTypeCounts["Object"] ?? 0;
+  };
+  const realIndexOf = String.prototype.indexOf;
+  const realIncludes = String.prototype.includes;
+  let searches = 0;
+  let most = 0;
+  const sample = (text: string, search: unknown): void => {
+    if (search !== needle || text.length < 1_000_000) return;
+    searches += 1;
+    most = Math.max(most, liveObjects());
+  };
+  const before = liveObjects();
+  String.prototype.indexOf = function (this: string, search: string, position?: number) {
+    sample(this, search);
+    return realIndexOf.call(this, search, position);
+  };
+  String.prototype.includes = function (this: string, search: string, position?: number) {
+    sample(this, search);
+    return realIncludes.call(this, search, position);
+  };
+  try {
+    const value = await call();
+    return { value, peak: Math.max(0, most - before), searches };
+  } finally {
+    String.prototype.indexOf = realIndexOf;
+    String.prototype.includes = realIncludes;
+  }
+}
+
 describe("scrubbing a large escaped body costs about its size (bounds review)", () => {
   // 0.7.1's first cut of the escaped-spelling scrubber built an object per
-  // escape: +1.1 GiB of RSS for this body in either tool, where the same
-  // call without a credential grew about 150 MiB. One test, both tools:
-  // RSS rarely falls back, so a second test would start above a first's
-  // high-water mark and prove nothing.
+  // escape, about 8.7 million for this body, and held them all while it
+  // searched the decoded view: +1.1 GiB of RSS in either tool. Now a pass
+  // builds only the decoded text. One test, both tools.
   test("HttpRequest and DownloadFile with a credential, on 25 MiB of escapes", async () => {
     const maxBytes = 25 * 1024 * 1024;
-    Bun.gc(true);
-    const before = process.memoryUsage().rss;
-    const request = String(
-      await httpRequest.execute({ url: `${origin}/escapes`, auth, maxBytes }, {}),
-    );
-    const download = String(
-      await downloadFile.execute(
-        { url: `${origin}/escapes`, path: "escapes.bin", auth, maxBytes },
-        {},
+    const { value, peak, searches } = await liveObjectsWhileSearched(SECRET, async () => ({
+      request: String(await httpRequest.execute({ url: `${origin}/escapes`, auth, maxBytes }, {})),
+      download: String(
+        await downloadFile.execute(
+          { url: `${origin}/escapes`, path: "escapes.bin", auth, maxBytes },
+          {},
+        ),
       ),
-    );
-    const grew = process.memoryUsage().rss - before;
+    }));
     // Booleans, not the text: a failure must not print 25 MiB.
-    expect(request.startsWith('{"status":200')).toBe(true);
-    expect(request.includes("<redacted>%41")).toBe(false);
-    expect(download.includes('"path":"escapes.bin"')).toBe(true);
-    expect(grew).toBeLessThan(512 * 1024 * 1024);
+    expect(value.request.startsWith('{"status":200')).toBe(true);
+    expect(value.request.includes("<redacted>%41")).toBe(false);
+    expect(value.download.includes('"path":"escapes.bin"')).toBe(true);
+    // The body was searched for the credential, so the count saw the scrub.
+    expect(searches).toBeGreaterThan(0);
+    // One object per escape would be millions; a handful is the call itself.
+    expect(peak).toBeLessThan(100_000);
   }, 60_000);
 });

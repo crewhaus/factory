@@ -126,10 +126,36 @@ afterEach(() => {
   _resetHttpConfig();
 });
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
+/**
+ * Run `call` with each response read to its end before the tool sees it,
+ * and say how many bytes the runtime delivered for each: the body as sent
+ * when the request said `decompress: false`, the whole inflated body when
+ * it did not, however little of it the tool then read. The tool gets the
+ * same bytes in a constructed Response, which the runtime never decodes.
+ * This counts what the runtime inflated rather than the process's RSS,
+ * which moves with the allocator and with every other test in the process.
+ */
+async function countDelivered<T>(
+  call: () => Promise<T>,
+): Promise<{ value: T; delivered: number[] }> {
+  const realFetch = globalThis.fetch;
+  const delivered: number[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await realFetch(input, init);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    delivered.push(bytes.byteLength);
+    return new Response(bytes, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
+  }) as typeof globalThis.fetch;
+  try {
+    return { value: await call(), delivered };
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
 
 describe("a compressed body costs at most its cap", () => {
   for (const [branch, host] of [
@@ -140,16 +166,20 @@ describe("a compressed body costs at most its cap", () => {
       if (host !== "127.0.0.1") _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
       const origin = `http://${host}:${port}`;
       registerHttpConfig({ allowed_origins: [origin] });
-      const before = rssNow();
-      const out = JSON.parse(
-        String(await httpRequest.execute({ url: `${origin}/bomb`, maxBytes: 1024 })),
-      ) as { body: string; truncated?: boolean; status: number };
-      const grew = rssNow() - before;
+      const { value, delivered } = await countDelivered(() =>
+        httpRequest.execute({ url: `${origin}/bomb`, maxBytes: 1024 }),
+      );
+      const out = JSON.parse(String(value)) as {
+        body: string;
+        truncated?: boolean;
+        status: number;
+      };
       expect(out.status).toBe(200);
       expect(out.truncated).toBe(true);
       expect(out.body).toBe("\u0000".repeat(1024));
       expect(acceptEncodings).toEqual(["identity"]);
-      expect(grew).toBeLessThan(64 * 1024 * 1024);
+      // The body as sent, about 260 KB: inflated by the runtime it is 256 MiB.
+      expect(delivered).toEqual([bomb.byteLength]);
     }, 20_000);
   }
 
@@ -173,11 +203,11 @@ describe("a compressed body costs at most its cap", () => {
   test("SseRead stops a compressed bomb at its byte cap", async () => {
     const origin = `http://127.0.0.1:${port}`;
     registerHttpConfig({ allowed_origins: [origin] });
-    const before = rssNow();
-    const out = JSON.parse(
-      String(await sseRead.execute({ url: `${origin}/bomb`, maxBytes: 4096, timeoutMs: 5_000 })),
+    const { value, delivered } = await countDelivered(() =>
+      sseRead.execute({ url: `${origin}/bomb`, maxBytes: 4096, timeoutMs: 5_000 }),
     );
-    expect(rssNow() - before).toBeLessThan(64 * 1024 * 1024);
+    const out = JSON.parse(String(value));
+    expect(delivered).toEqual([bomb.byteLength]);
     expect(out.stoppedBy).toBe("byteCap");
     expect(out.bytes).toBeLessThanOrEqual(4096);
   }, 20_000);
