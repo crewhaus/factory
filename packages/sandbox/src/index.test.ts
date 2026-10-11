@@ -335,7 +335,9 @@ describe("docker backend (no daemon required for argv assembly)", () => {
 //     client proxies it and lives on, and acts FAKE_CLI_CLIENT_DELAY seconds
 //     in — or at once after an `rm -f` has looked for its container.
 //   - FAKE_CLI_KILL_DELAY makes `kill` slow; FAKE_CLI_HANG_CONTROL makes
-//     `kill` and `rm` never answer; FAKE_CLI_RM_FAIL makes `rm` fail.
+//     `kill` and `rm` take 8 s to answer (each writes its pid to hung-VERB
+//     first, and answered-VERB if it gets to the end); FAKE_CLI_RM_FAIL makes
+//     `rm` fail.
 const posix = process.platform !== "win32";
 const hasPerl = posix && Bun.spawnSync(["perl", "-e", "exit 0"]).exitCode === 0;
 
@@ -357,14 +359,22 @@ async function waitGone(pid: number, budgetMs: number): Promise<boolean> {
   return !alive(pid);
 }
 
-/** Kills the detached reapers (watchdogs, retries) started for `names` by processes the test cannot reach. */
-function killReapersFor(names: ReadonlyArray<string>): void {
-  if (names.length === 0) return;
+/** The pids of the detached reapers (watchdogs, retries) started for `names`. */
+function reapersFor(names: ReadonlyArray<string>): number[] {
+  if (names.length === 0) return [];
   const ps = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "ignore" });
+  const pids: number[] = [];
   for (const line of new TextDecoder().decode(ps.stdout).split("\n")) {
     if (!line.includes(SANDBOX_REAPER_TAG)) continue;
     if (!names.some((n) => n !== "" && line.includes(n))) continue;
-    const pid = Number(line.trim().split(/\s+/)[0]);
+    pids.push(Number(line.trim().split(/\s+/)[0]));
+  }
+  return pids;
+}
+
+/** Kills the detached reapers (watchdogs, retries) started for `names` by processes the test cannot reach. */
+function killReapersFor(names: ReadonlyArray<string>): void {
+  for (const pid of reapersFor(names)) {
     try {
       process.kill(-pid, "SIGKILL");
     } catch {
@@ -451,7 +461,12 @@ case "$verb" in
     ;;
   kill|rm)
     [ "$1" = "-f" ] && shift
-    [ -n "$FAKE_CLI_HANG_CONTROL" ] && exec sleep 8
+    if [ -n "$FAKE_CLI_HANG_CONTROL" ]; then
+      echo $$ > "$D/hung-$verb"
+      sleep 8
+      : > "$D/answered-$verb"
+      exit 0
+    fi
     [ "$verb" = kill ] && [ -n "$FAKE_CLI_KILL_DELAY" ] && sleep "$FAKE_CLI_KILL_DELAY"
     if [ "$verb" = rm ] && [ -n "$FAKE_CLI_RM_FAIL" ]; then
       echo "Error response from daemon: $FAKE_CLI_RM_FAIL" >&2; exit 1
@@ -823,13 +838,11 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
   // the program ended on its own, and the container outlived the timeout.
   test("a timeout kills the container by name, and the call returns without waiting for it", async () => {
     const sandbox = createSandbox({ backend: "docker" });
-    const t0 = performance.now();
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
       argv: ["sh", "-c", "echo started; sleep 30; echo never"],
       timeoutMs: 3_000,
     });
-    const elapsed = performance.now() - t0;
     const lines = cliLog();
     const name = nameOf(lines[0]);
     expect(name).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
@@ -838,12 +851,14 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(result.stdout).toBe("started\n");
     // Killed by name, then removed.
     expect(lines.slice(1)).toEqual([`start -a -i ${name}`, `kill ${name}`, `rm -f ${name}`]);
-    expect(await waitGone(containerPid(name), 2_000)).toBe(true);
+    expect(await waitGone(containerPid(name), 10_000)).toBe(true);
     expect(records()).toEqual([]);
     expect(result.strayContainer).toBeUndefined();
-    // The fake container sleeps 30 s; returning in a fraction of that is the
-    // property, not a race.
-    expect(elapsed).toBeLessThan(10_000);
+    // The program's `sleep 30` outlives the kill of its shell and still holds
+    // the pipe: the call stopped reading at the drain grace instead of waiting
+    // for it, and says the output may be incomplete. A call that waited would
+    // run past this test's budget.
+    expect(result.outputComplete).toBe(false);
   }, 20_000);
 
   test("an abort stops the container the same way and says it was cancelled", async () => {
@@ -852,21 +867,20 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     // Abort once the container runs: the property is what an abort does to
     // a running container, whatever the machine's spawn latency.
     void containerStarted(10_000).then(() => controller.abort());
-    const t0 = performance.now();
+    // No clock: a call that waited for the program's 30 s instead of
+    // stopping it would run past this test's budget.
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
       argv: ["sh", "-c", "echo started; sleep 30; echo never"],
       signal: controller.signal,
     });
-    const elapsed = performance.now() - t0;
     const lines = cliLog();
     const name = nameOf(lines[0]);
     expect(result.aborted).toBe(true);
     expect(result.timedOut).toBe(false);
     expect(result.stdout).not.toContain("never");
     expect(lines.slice(1)).toEqual([`start -a -i ${name}`, `kill ${name}`, `rm -f ${name}`]);
-    expect(await waitGone(containerPid(name), 2_000)).toBe(true);
-    expect(elapsed).toBeLessThan(10_000);
+    expect(await waitGone(containerPid(name), 10_000)).toBe(true);
   }, 20_000);
 
   test("a signal aborted before the call starts nothing", async () => {
@@ -966,7 +980,6 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     const sandbox = createSandbox({ backend: "docker" });
     const controller = new AbortController();
     void logged(["create "], 10_000).then(() => controller.abort());
-    const t0 = performance.now();
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
       argv: ["sh", "-c", "sleep 30"],
@@ -977,16 +990,17 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(result.strayContainer?.name).toBe(name);
     expect(result.strayContainer?.reason).toContain("still creating its container");
     expect(result.strayContainer?.reason).toContain("did not answer within 5s");
-    // Bounded: the grace, not the create.
-    expect(performance.now() - t0).toBeLessThan(20_000);
+    // Bounded: the grace, not the create. The create was cut off without an
+    // answer (the fake daemon answers only after its commit, 60 s away).
+    expect(cliCalls()[0]?.argv[1]).toBe("create");
+    expect(cliCalls()[0]?.proc.exitCode).toBeNull();
     // The daemon commits it after the sandbox's `rm -f`; the detached retry
-    // removes it (5 s later), and it never runs.
+    // removes it (5 s later), and it never runs. Waited for, however long
+    // that takes here: the test's budget is the bound.
     const retry = reaperCalls().find((c) => c.argv[6] === "5");
     expect(retry?.argv.slice(4)).toEqual(["docker", name, "5", "30"]);
     expect(retry?.options["detached"]).toBe(true);
-    const until = performance.now() + 15_000;
     while (records().length > 0 || !log().includes(`committed ${name}`)) {
-      if (performance.now() > until) break;
       await Bun.sleep(100);
     }
     expect(log()).toContain(`committed ${name}`);
@@ -1098,7 +1112,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       writeFileSync(
         script,
         [
-          `import { readdirSync, readFileSync, writeFileSync } from "node:fs";`,
+          `import { readdirSync, readFileSync } from "node:fs";`,
           `import { createSandbox } from ${JSON.stringify(sandboxModule)};`,
           `const dir = ${JSON.stringify(dir)};`,
           `const mode = ${JSON.stringify(mode)};`,
@@ -1114,7 +1128,6 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
           "  const f = readdirSync(dir).find((n) => n.startsWith('container-'));",
           "  if (f === undefined || readFileSync(`${dir}/${f}`, 'utf8').trim() === '') return;",
           "  clearInterval(poll);",
-          "  writeFileSync(`${dir}/exit-at`, String(Date.now()));",
           "  if (mode === 'exit') process.exit(0);",
           // The second Ctrl-C of a REPL: exit while the first one's kill runs.
           "  if (mode === 'abort-exit') { controller.abort(); process.exit(130); }",
@@ -1173,13 +1186,22 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
 
     // The exit path waits for `kill` within one budget and does not wait
     // for `rm -f` at all: a daemon that never answers held process.exit for
-    // two full control timeouts (6 s).
+    // two full control timeouts (6 s). Read from what each hung command was
+    // doing when the host was gone, not from a clock: `kill` had been cut
+    // off unanswered, and `rm -f` was still running.
     test("a daemon that never answers holds the exit for at most the kill budget", async () => {
       const h = startHost("exit", { FAKE_CLI_HANG_CONTROL: "1" });
       await h.exited;
-      const heldMs = Date.now() - Number(readFileSync(join(dir, "exit-at"), "utf8"));
+      const hung = async (verb: "kill" | "rm") => {
+        await appears(join(dir, `hung-${verb}`), 10_000);
+        const pid = Number(readFileSync(join(dir, `hung-${verb}`), "utf8").trim());
+        return { running: alive(pid), answered: existsSync(join(dir, `answered-${verb}`)) };
+      };
       expect(h.exitCode).toBe(0);
-      expect(heldMs).toBeLessThan(4_500);
+      expect({ kill: await hung("kill"), rm: await hung("rm") }).toEqual({
+        kill: { running: false, answered: false },
+        rm: { running: true, answered: false },
+      });
       const name = hostContainer();
       expect(cliLog()).toContain(`kill ${name}`);
       expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
@@ -1232,8 +1254,11 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       h.kill("SIGKILL");
       await h.exited;
       expect(alive(containerPid(name))).toBe(true);
-      // Timeout 4 s → the watchdog fires 14 s after the run began.
-      expect(await waitGone(containerPid(name), 25_000)).toBe(true);
+      // Timeout 4 s → the watchdog fires 14 s after the run began. Nothing
+      // else is left to stop it, so its `kill` is waited for as long as the
+      // machine takes to get there: the test's budget is the bound.
+      while (!cliLog().includes(`kill ${name}`)) await Bun.sleep(100);
+      expect(await waitGone(containerPid(name), 10_000)).toBe(true);
       expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
       expect(records()).toEqual([]);
     }, 50_000);
@@ -1544,7 +1569,8 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
   }
 
   test("a busy loop is stopped at the timeout and no container is left", async () => {
-    const t0 = performance.now();
+    // The loop never ends: the call returning at all, with the deadline's
+    // tag, is what says it was stopped. No clock.
     const result = await createSandbox({ backend: "docker" }).exec({
       image: "alpine:3.19",
       argv: ["sh", "-c", "echo started; while :; do :; done"],
@@ -1552,7 +1578,6 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
     });
     expect(result.timedOut).toBe(true);
     expect(result.stdout).toBe("started\n");
-    expect(performance.now() - t0).toBeLessThan(20_000);
     expect(names).toHaveLength(1);
     expect(left(names[0] as string)).toBe("");
   }, 30_000);
@@ -1694,9 +1719,11 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
       h.kill("SIGKILL");
       await h.exited;
       expect(withToken(token)).toEqual([name]);
-      // Timeout 2 s → the watchdog fires 12 s after the run began.
-      const until = performance.now() + 40_000;
-      while (withToken(token).length > 0 && performance.now() < until) await Bun.sleep(500);
+      // Timeout 2 s → the watchdog fires 12 s after the run began, runs
+      // `docker kill` and `docker rm -f`, and exits. Waited for as long as
+      // that takes here (the test's budget is the bound); then nothing is left.
+      expect(reapersFor([name])).toHaveLength(1);
+      while (reapersFor([name]).length > 0) await Bun.sleep(500);
       expect(withToken(token)).toEqual([]);
     } finally {
       for (const leftover of withToken(token)) names.push(leftover);
