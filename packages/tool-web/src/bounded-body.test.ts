@@ -24,6 +24,7 @@ import {
   spyOn,
   test,
 } from "bun:test";
+import * as zlib from "node:zlib";
 import { createGzip, gzipSync } from "node:zlib";
 import {
   _resetWebFetchConfig,
@@ -35,6 +36,73 @@ import {
 } from "./index";
 
 const PUBLIC_IP = "93.184.216.34";
+const CAP = 5 * 1024 * 1024;
+
+type Decompressor = (...args: unknown[]) => unknown;
+
+/** Every synchronous decompressor a decoder could be spelled with. */
+const DECOMPRESSORS: ReadonlyArray<readonly [Record<string, Decompressor>, readonly string[]]> = [
+  [
+    // The namespace, as @crewhaus/tool-fetch/body imports it: a spy on it
+    // is what the decoder calls.
+    zlib as unknown as Record<string, Decompressor>,
+    [
+      "inflateSync",
+      "inflateRawSync",
+      "gunzipSync",
+      "unzipSync",
+      "brotliDecompressSync",
+      "zstdDecompressSync",
+    ],
+  ],
+  [
+    Bun as unknown as Record<string, Decompressor>,
+    ["gunzipSync", "inflateSync", "zstdDecompressSync"],
+  ],
+];
+
+/**
+ * Run `call`, and count the calls to every synchronous decompressor in
+ * node:zlib and Bun meanwhile and the bytes they returned: the work the
+ * tool's own decoder did, rather than the process's RSS, which moves with
+ * the allocator and with every other test in the process. A decoder told
+ * the cap (`maxOutputLength`) throws there and returns nothing; one that
+ * inflates the whole body before checking its size returns all of it.
+ * Every spy is restored before this returns.
+ */
+async function countDecoded<T>(
+  call: () => Promise<T>,
+): Promise<{ value: T; calls: number; produced: number }> {
+  let calls = 0;
+  let produced = 0;
+  const sizeOf = (out: unknown): number => {
+    if (out instanceof Uint8Array) return out.byteLength;
+    // `{ info: true }` returns `{ buffer, engine }`.
+    const buffer = (out as { buffer?: unknown } | null)?.buffer;
+    return buffer instanceof Uint8Array ? buffer.byteLength : 0;
+  };
+  const spies: Array<{ mockRestore(): void }> = [];
+  try {
+    for (const [owner, names] of DECOMPRESSORS) {
+      for (const name of names) {
+        const real = owner[name];
+        if (typeof real !== "function") continue;
+        spies.push(
+          spyOn(owner, name).mockImplementation((...args: unknown[]) => {
+            calls += 1;
+            const out = Reflect.apply(real, owner, args);
+            produced += sizeOf(out);
+            return out;
+          }),
+        );
+      }
+    }
+    const value = await call();
+    return { value, calls, produced };
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
+}
 
 async function gzipBomb(mib: number): Promise<Uint8Array> {
   const gz = createGzip({ level: 9 });
@@ -146,11 +214,18 @@ describe("WebFetch through the production fetcher (C093)", () => {
     ["an IP-literal URL", PUBLIC_IP],
   ] as const) {
     test(`through ${branch}, a 256 MiB gzip page is refused at the cap without being inflated`, async () => {
-      await expect(
-        webFetch.execute({ url: `http://${host}:${server.port}/bomb` }, {} as never),
-      ).rejects.toThrow(/exceeded 5242880 bytes/);
+      const decoded = await countDecoded(() =>
+        expect(
+          webFetch.execute({ url: `http://${host}:${server.port}/bomb` }, {} as never),
+        ).rejects.toThrow(/exceeded 5242880 bytes/),
+      );
       // The page as sent, about 260 KB; inflated by the runtime, 256 MiB.
       expect(delivered).toEqual([bomb.byteLength]);
+      // And the tool's own decoder stopped at the cap: told the most it may
+      // produce, it throws there. Decoding it all first returns 256 MiB. A
+      // decoder these spies cannot see fails the first check, not passes.
+      expect(decoded.calls).toBeGreaterThan(0);
+      expect(decoded.produced).toBeLessThanOrEqual(CAP);
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);
       expect(acceptEncodings).toEqual(["identity"]);

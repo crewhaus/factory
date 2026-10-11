@@ -126,32 +126,60 @@ afterEach(() => {
   _resetHttpConfig();
 });
 
+/** The size of each read the tool is handed in {@link countDelivered}. */
+const PULL_CHUNK = 4096;
+
 /**
  * Run `call` with each response read to its end before the tool sees it,
- * and say how many bytes the runtime delivered for each: the body as sent
- * when the request said `decompress: false`, the whole inflated body when
- * it did not, however little of it the tool then read. The tool gets the
- * same bytes in a constructed Response, which the runtime never decodes.
- * This counts what the runtime inflated rather than the process's RSS,
- * which moves with the allocator and with every other test in the process.
+ * and count two things for each, in bytes, rather than read the process's
+ * RSS, which moves with the allocator and with every other test in the
+ * process.
+ *
+ * `delivered`: what the runtime delivered. The body as sent when the
+ * request said `decompress: false`; the whole inflated body when it did
+ * not, however little of it the tool then read.
+ *
+ * `pulled`: how much of that the tool took. It gets the same bytes in a
+ * constructed Response, which the runtime never decodes, through a stream
+ * that hands over {@link PULL_CHUNK} bytes per read and never reads ahead.
+ * A tool that decodes under its cap stops after a chunk or two; one that
+ * inflates the whole body itself and only then cuts it pulls all of it.
  */
 async function countDelivered<T>(
   call: () => Promise<T>,
-): Promise<{ value: T; delivered: number[] }> {
+): Promise<{ value: T; delivered: number[]; pulled: number[] }> {
   const realFetch = globalThis.fetch;
   const delivered: number[] = [];
+  const pulled: number[] = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const res = await realFetch(input, init);
     const bytes = new Uint8Array(await res.arrayBuffer());
     delivered.push(bytes.byteLength);
-    return new Response(bytes, {
+    const at = pulled.push(0) - 1;
+    let offset = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          if (offset >= bytes.byteLength) {
+            controller.close();
+            return;
+          }
+          const chunk = bytes.slice(offset, offset + PULL_CHUNK);
+          offset += chunk.byteLength;
+          pulled[at] = offset;
+          controller.enqueue(chunk);
+        },
+      },
+      new CountQueuingStrategy({ highWaterMark: 0 }),
+    );
+    return new Response(body, {
       status: res.status,
       statusText: res.statusText,
       headers: res.headers,
     });
   }) as typeof globalThis.fetch;
   try {
-    return { value: await call(), delivered };
+    return { value: await call(), delivered, pulled };
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -166,7 +194,7 @@ describe("a compressed body costs at most its cap", () => {
       if (host !== "127.0.0.1") _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
       const origin = `http://${host}:${port}`;
       registerHttpConfig({ allowed_origins: [origin] });
-      const { value, delivered } = await countDelivered(() =>
+      const { value, delivered, pulled } = await countDelivered(() =>
         httpRequest.execute({ url: `${origin}/bomb`, maxBytes: 1024 }),
       );
       const out = JSON.parse(String(value)) as {
@@ -180,6 +208,10 @@ describe("a compressed body costs at most its cap", () => {
       expect(acceptEncodings).toEqual(["identity"]);
       // The body as sent, about 260 KB: inflated by the runtime it is 256 MiB.
       expect(delivered).toEqual([bomb.byteLength]);
+      // And the tool's own decoder stopped at the cap: one chunk of the
+      // 260 KB inflates past 1 KiB. Inflating it all first pulls all of it.
+      expect(pulled).toHaveLength(1);
+      expect(pulled[0]).toBeLessThan(64 * 1024);
     }, 20_000);
   }
 
@@ -203,11 +235,14 @@ describe("a compressed body costs at most its cap", () => {
   test("SseRead stops a compressed bomb at its byte cap", async () => {
     const origin = `http://127.0.0.1:${port}`;
     registerHttpConfig({ allowed_origins: [origin] });
-    const { value, delivered } = await countDelivered(() =>
+    const { value, delivered, pulled } = await countDelivered(() =>
       sseRead.execute({ url: `${origin}/bomb`, maxBytes: 4096, timeoutMs: 5_000 }),
     );
     const out = JSON.parse(String(value));
     expect(delivered).toEqual([bomb.byteLength]);
+    // The stream was decoded under the cap, not inflated whole and then cut.
+    expect(pulled).toHaveLength(1);
+    expect(pulled[0]).toBeLessThan(64 * 1024);
     expect(out.stoppedBy).toBe("byteCap");
     expect(out.bytes).toBeLessThanOrEqual(4096);
   }, 20_000);

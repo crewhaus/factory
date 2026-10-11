@@ -17,7 +17,17 @@
  * untouched — which is also how it sees what the tool asked for, and how it
  * counts what the runtime delivered for the bomb.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
+import * as zlib from "node:zlib";
 import {
   brotliCompressSync,
   createGzip,
@@ -36,6 +46,71 @@ import {
 
 const PUBLIC_IP = "93.184.216.34";
 const CAP = 5 * 1024 * 1024;
+
+type Decompressor = (...args: unknown[]) => unknown;
+
+/** Every synchronous decompressor a decoder here could be spelled with. */
+const DECOMPRESSORS: ReadonlyArray<readonly [Record<string, Decompressor>, readonly string[]]> = [
+  [
+    // The namespace, as body.ts imports it: a spy on it is what body.ts calls.
+    zlib as unknown as Record<string, Decompressor>,
+    [
+      "inflateSync",
+      "inflateRawSync",
+      "gunzipSync",
+      "unzipSync",
+      "brotliDecompressSync",
+      "zstdDecompressSync",
+    ],
+  ],
+  [
+    Bun as unknown as Record<string, Decompressor>,
+    ["gunzipSync", "inflateSync", "zstdDecompressSync"],
+  ],
+];
+
+/**
+ * Run `call`, and count the calls to every synchronous decompressor in
+ * node:zlib and Bun meanwhile and the bytes they returned: the work the
+ * tool's own decoder did, rather than the process's RSS, which moves with
+ * the allocator and with every other test in the process. A decoder told
+ * the cap (`maxOutputLength`) throws there and returns nothing; one that
+ * inflates the whole body before checking its size returns all of it.
+ * Every spy is restored before this returns.
+ */
+async function countDecoded<T>(
+  call: () => Promise<T>,
+): Promise<{ value: T; calls: number; produced: number }> {
+  let calls = 0;
+  let produced = 0;
+  const sizeOf = (out: unknown): number => {
+    if (out instanceof Uint8Array) return out.byteLength;
+    // `{ info: true }` returns `{ buffer, engine }`.
+    const buffer = (out as { buffer?: unknown } | null)?.buffer;
+    return buffer instanceof Uint8Array ? buffer.byteLength : 0;
+  };
+  const spies: Array<{ mockRestore(): void }> = [];
+  try {
+    for (const [owner, names] of DECOMPRESSORS) {
+      for (const name of names) {
+        const real = owner[name];
+        if (typeof real !== "function") continue;
+        spies.push(
+          spyOn(owner, name).mockImplementation((...args: unknown[]) => {
+            calls += 1;
+            const out = Reflect.apply(real, owner, args);
+            produced += sizeOf(out);
+            return out;
+          }),
+        );
+      }
+    }
+    const value = await call();
+    return { value, calls, produced };
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
+}
 
 /** `mib` MiB of zeros as gzip, built in 1 MiB steps so building it is cheap too. */
 async function gzipBomb(mib: number): Promise<Uint8Array> {
@@ -130,13 +205,20 @@ describe("a compressed reply costs at most the cap, through the production fetch
     test(`through ${branch}, a 256 MiB gzip reply is refused at the cap without being inflated`, async () => {
       const origin = `http://${host}:${server.port}`;
       registerFetchConfig({ allowed_origins: [origin] });
-      await expect(fetch.execute({ url: `${origin}/bomb` }, {} as never)).rejects.toThrow(
-        /exceeded 5242880 bytes/,
+      const decoded = await countDecoded(() =>
+        expect(fetch.execute({ url: `${origin}/bomb` }, {} as never)).rejects.toThrow(
+          /exceeded 5242880 bytes/,
+        ),
       );
       // What the runtime delivered is the reply as sent, about 260 KB.
       // Inflated, it is 256 MiB, and about 1 GB of RSS: a count of bytes,
       // not the process's RSS, which moves with every other test.
       expect(delivered).toEqual([bomb.byteLength]);
+      // And the tool's own decoder stopped at the cap: told the most it may
+      // produce, it throws there. Decoding it all first returns 256 MiB. A
+      // decoder these spies cannot see fails the first check, not passes.
+      expect(decoded.calls).toBeGreaterThan(0);
+      expect(decoded.produced).toBeLessThanOrEqual(CAP);
       // Because the body was asked for raw, and as it is.
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);

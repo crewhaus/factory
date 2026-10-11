@@ -25,6 +25,8 @@ import { createCitationTracker } from "@crewhaus/citation-tracker";
 import { _setDnsLookup, createCrawler } from "./index";
 
 const PUBLIC_IP = "93.184.216.34";
+/** The size of each read the crawler is handed for the bomb. */
+const PULL_CHUNK = 4096;
 
 /** `mib` MiB of zeros as gzip, built in 1 MiB steps so building it is cheap too. */
 async function gzipBomb(mib: number): Promise<Uint8Array> {
@@ -47,6 +49,8 @@ describe("a compressed reply costs at most the cap (C093)", () => {
   let inits: Array<Record<string, unknown> | undefined> = [];
   /** Bytes the runtime delivered for each /bomb response, read to its end. */
   let delivered: number[] = [];
+  /** Bytes of each /bomb response the crawler then pulled from the stream it was given. */
+  let pulled: number[] = [];
   let root: string;
   const realFetch = globalThis.fetch;
 
@@ -79,6 +83,7 @@ describe("a compressed reply costs at most the cap (C093)", () => {
   beforeEach(() => {
     inits = [];
     delivered = [];
+    pulled = [];
     root = realpathSync(mkdtempSync(join(tmpdir(), "crawler-bomb-")));
     _setDnsLookup(async () => ({ address: PUBLIC_IP, family: 4 }));
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -91,11 +96,31 @@ describe("a compressed reply costs at most the cap (C093)", () => {
       if (new URL(url).pathname !== "/bomb") return res;
       // Read to the end before the crawler sees it, and count: the reply as
       // sent when the crawler asked for it raw, the whole inflated reply when
-      // it did not. A constructed Response is never decoded, so the crawler
-      // reads exactly these bytes.
+      // it did not.
       const bytes = new Uint8Array(await res.arrayBuffer());
       delivered.push(bytes.byteLength);
-      return new Response(bytes, {
+      // Then hand the crawler those bytes, which a constructed Response never
+      // decodes, PULL_CHUNK per read and never ahead of one, and count what it
+      // takes: a decoder stopped at the cap takes a chunk or two, a crawler
+      // that inflates the whole reply itself before checking takes it all.
+      const at = pulled.push(0) - 1;
+      let offset = 0;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            if (offset >= bytes.byteLength) {
+              controller.close();
+              return;
+            }
+            const chunk = bytes.slice(offset, offset + PULL_CHUNK);
+            offset += chunk.byteLength;
+            pulled[at] = offset;
+            controller.enqueue(chunk);
+          },
+        },
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, {
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
@@ -128,6 +153,10 @@ describe("a compressed reply costs at most the cap (C093)", () => {
       // 256 MiB, about 1 GB of RSS: counted in bytes, not read off the
       // process's RSS, which moves with every other test.
       expect(delivered).toEqual([bomb.byteLength]);
+      // And the crawler's own decoder stopped at the cap: two chunks of the
+      // 260 KB inflate past 5 MiB. Inflating it all first pulls all of it.
+      expect(pulled).toHaveLength(1);
+      expect(pulled[0]).toBeLessThan(64 * 1024);
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);
     }, 30_000);
