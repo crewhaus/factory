@@ -15,7 +15,16 @@
  *   secret could be read out a character per call.
  */
 import { heapStats } from "bun:jsc";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -93,6 +102,29 @@ afterEach(() => {
   _resetHttpConfig();
 });
 
+/**
+ * Run `body` with every timer of exactly `ms` milliseconds held: scheduled
+ * never, so a deadline of that length cannot fire however slow the runner
+ * is, while its clock (`expired()`) still runs. Other timers run as usual.
+ * The same helper as index.test.ts's.
+ */
+async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) =>
+    delay === ms
+      ? (0 as unknown as ReturnType<typeof setTimeout>)
+      : realSetTimeout(fn, delay, ...rest)) as typeof setTimeout);
+  try {
+    return await body();
+  } finally {
+    held.mockRestore();
+  }
+}
+
 const visiblePieces = (text: string): string[] =>
   PIECES.filter((p) => text.replaceAll("\u0000", "").includes(p));
 
@@ -166,27 +198,46 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
   });
 
   test("an echo nested as a JSON string in a JSON string is no oracle either (bounds review)", async () => {
-    const ask = async (value: string): Promise<boolean> =>
+    // The 300ms deadline's timer is held, so it cannot abort a poll however
+    // slow the runner; its clock still ends the loop between polls. So every
+    // answer below is judged on a body the poll really read. With the timer
+    // armed, a loopback as slow as CI's (300-375ms) was cut off: the `true`
+    // answer came back false, and the `false` ones held only vacuously.
+    const ask = async (
+      value: string,
+    ): Promise<{ met: boolean; lastStatus?: number; lastError?: string }> =>
       JSON.parse(
         String(
-          await httpWaitFor.execute(
-            {
-              url: `${origin}/nestedecho`,
-              auth,
-              expectJson: { path: "outer", op: "contains", value },
-              intervalMs: 50,
-              timeoutMs: 300,
-            },
-            {},
+          await withTimersHeld(300, () =>
+            httpWaitFor.execute(
+              {
+                url: `${origin}/nestedecho`,
+                auth,
+                expectJson: { path: "outer", op: "contains", value },
+                intervalMs: 50,
+                timeoutMs: 300,
+              },
+              {},
+            ),
           ),
         ),
-      ).met;
-    expect(await ask(SECRET.slice(0, 10))).toBe(false);
-    expect(await ask("ZZZZZZZZZZ")).toBe(false);
-    expect(await ask(SECRET.slice(0, 14))).toBe(false);
+      );
+    const guesses = [SECRET.slice(0, 10), "ZZZZZZZZZZ", SECRET.slice(0, 14)];
+    for (const [guess, value] of guesses.entries()) {
+      const { met, lastStatus, lastError } = await ask(value);
+      // Labelled by index: a failure must not print the guess. A 200 with no
+      // error is a body that was read, parsed and judged.
+      expect({ guess, met, lastStatus, lastError }).toEqual({
+        guess,
+        met: false,
+        lastStatus: 200,
+        lastError: undefined,
+      });
+    }
     // The field's other text is still judged.
-    expect(await ask('"raw"')).toBe(true);
-  });
+    expect((await ask('"raw"')).met).toBe(true);
+    // Three asks wait out their 300ms, and a slow runner's polls add to that.
+  }, 20_000);
 
   test("a condition on a field that holds no credential still works", async () => {
     const out = JSON.parse(
