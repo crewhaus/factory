@@ -7,8 +7,12 @@
  * 472 MiB and took 823 ms, where 0.7.0 took 101 MiB and 20 ms. LIMITS allows
  * 512 MiB a file, so a container harness could be pushed out of memory. The
  * reader now decodes on first use and hands back its buffer uncopied.
+ *
+ * The test counts that work, the bytes decoded as text and the bytes copied
+ * out of a typed array, rather than the process's RSS: RSS moves with the
+ * allocator and with every other test in the process.
  */
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,13 +41,35 @@ afterAll(() => {
   rmSync(workspace, { recursive: true, force: true });
 });
 
-test("a 64 MiB binary is weighed in less than twice its size", async () => {
-  Bun.gc(true);
-  const before = process.memoryUsage().rss;
-  const out = JSON.parse(
-    String(await bundleSizeCheck.execute({ files: ["app.wasm"], algorithm: "none" }, {} as never)),
-  );
-  const grew = process.memoryUsage().rss - before;
-  expect(out.entries[0].bytes).toBe(64 * MIB);
-  expect(grew).toBeLessThan(2 * 64 * MIB);
+test("a 64 MiB binary is weighed without decoding or copying it", async () => {
+  // The first cut decoded all 64 MiB and copied all 64 MiB (RSS grew about
+  // 290 MiB); the reader now does neither for a caller that needs only the
+  // bytes. A Uint8Array's slice (the copy) is %TypedArray%.prototype.slice.
+  const typedArray = Object.getPrototypeOf(Uint8Array.prototype) as {
+    slice(start?: number, end?: number): Uint8Array;
+  };
+  const decode = spyOn(TextDecoder.prototype, "decode");
+  const slice = spyOn(typedArray, "slice");
+  let decoded = 0;
+  let copied = 0;
+  let out: { entries: Array<{ bytes: number }> };
+  try {
+    out = JSON.parse(
+      String(
+        await bundleSizeCheck.execute({ files: ["app.wasm"], algorithm: "none" }, {} as never),
+      ),
+    );
+    for (const [input] of decode.mock.calls) {
+      decoded += (input as { byteLength?: number } | undefined)?.byteLength ?? 0;
+    }
+    for (const result of slice.mock.results) {
+      copied += (result.value as Uint8Array | undefined)?.byteLength ?? 0;
+    }
+  } finally {
+    decode.mockRestore();
+    slice.mockRestore();
+  }
+  expect(out.entries[0]?.bytes).toBe(64 * MIB);
+  expect(decoded).toBeLessThan(MIB);
+  expect(copied).toBeLessThan(MIB);
 }, 30_000);
