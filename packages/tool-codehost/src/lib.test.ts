@@ -665,12 +665,210 @@ describe("excerptLog", () => {
   });
 });
 
+/** A regular expression as a backtracking matcher walks it. */
+type Matcher =
+  | { readonly kind: "char"; readonly test: (c: string) => boolean }
+  | { readonly kind: "start" | "end" }
+  | { readonly kind: "seq"; readonly items: readonly Matcher[] }
+  | { readonly kind: "alt"; readonly options: readonly Matcher[] }
+  | { readonly kind: "repeat"; readonly body: Matcher; readonly min: number; readonly max: number };
+
+/**
+ * The structure of `re`, for {@link backtrackSteps}. Only the syntax the log
+ * line patterns use is modelled — anchors, groups, alternation, greedy `*`
+ * `+` `?`, and one-character atoms, whose membership the engine itself
+ * decides — and anything else is refused rather than guessed at.
+ */
+function parseMatcher(re: RegExp): Matcher {
+  if (/[muvy]/.test(re.flags)) throw new Error(`/${re.source}/${re.flags}: flags not modelled`);
+  const flags = re.flags.replace("g", "");
+  const source = re.source;
+  let at = 0;
+  const refuse = (): never => {
+    throw new Error(`/${source}/: the syntax at ${at} is not modelled`);
+  };
+  const oneChar = (text: string): Matcher => {
+    const single = new RegExp(`^(?:${text})$`, flags);
+    return { kind: "char", test: (c) => single.test(c) };
+  };
+  const term = (): Matcher => {
+    const c = source[at] as string;
+    if (c === "^" || c === "$") {
+      at++;
+      return { kind: c === "^" ? "start" : "end" };
+    }
+    const from = at;
+    let atom: Matcher;
+    if (c === "(") {
+      if (source.startsWith("(?", at) && !source.startsWith("(?:", at)) refuse();
+      at += source.startsWith("(?:", at) ? 3 : 1;
+      atom = disjunction();
+      if (source[at++] !== ")") refuse();
+    } else if (c === "[") {
+      for (at++; source[at] !== "]"; at += source[at] === "\\" ? 2 : 1) {
+        if (at >= source.length) refuse();
+      }
+      at++;
+      atom = oneChar(source.slice(from, at));
+    } else if (c === "\\") {
+      // An assertion or a back-reference is not one character.
+      if (/[bBk0-9]/.test(source[at + 1] ?? "")) refuse();
+      at += 2;
+      atom = oneChar(source.slice(from, at));
+    } else {
+      if ("*+?{}".includes(c)) refuse();
+      at++;
+      atom = oneChar(c);
+    }
+    const q = source[at];
+    if (q === "{") refuse();
+    if (q !== "*" && q !== "+" && q !== "?") return atom;
+    at++;
+    if (source[at] === "?") refuse();
+    const max = q === "?" ? 1 : Number.POSITIVE_INFINITY;
+    return { kind: "repeat", body: atom, min: q === "+" ? 1 : 0, max };
+  };
+  const alternative = (): Matcher => {
+    const items: Matcher[] = [];
+    while (at < source.length && source[at] !== "|" && source[at] !== ")") items.push(term());
+    return { kind: "seq", items };
+  };
+  const disjunction = (): Matcher => {
+    const options = [alternative()];
+    while (source[at] === "|") {
+      at++;
+      options.push(alternative());
+    }
+    return options.length === 1 ? (options[0] as Matcher) : { kind: "alt", options };
+  };
+  const root = disjunction();
+  if (at !== source.length) refuse();
+  return root;
+}
+
+const OVER_BUDGET = Symbol("over budget");
+
+/**
+ * The steps a backtracking matcher takes to decide `re` on `input`, trying
+ * things in ECMAScript's order (JavaScriptCore's), or Infinity once past
+ * `budget`. One step is one node entered, one character taken by a repeat,
+ * or one character a repeat gives back.
+ */
+function backtrackSteps(
+  re: RegExp,
+  input: string,
+  budget: number,
+): { matched: boolean; steps: number } {
+  const root = parseMatcher(re);
+  let steps = 0;
+  const step = (): void => {
+    if (++steps > budget) throw OVER_BUDGET;
+  };
+  const match = (node: Matcher, i: number, then: (j: number) => boolean): boolean => {
+    step();
+    switch (node.kind) {
+      case "char":
+        return i < input.length && node.test(input[i] as string) && then(i + 1);
+      case "start":
+        return i === 0 && then(i);
+      case "end":
+        return i === input.length && then(i);
+      case "seq": {
+        const from = (n: number, j: number): boolean =>
+          n === node.items.length
+            ? then(j)
+            : match(node.items[n] as Matcher, j, (next) => from(n + 1, next));
+        return from(0, i);
+      }
+      case "alt":
+        return node.options.some((option) => match(option, i, then));
+      case "repeat": {
+        const { body, min, max } = node;
+        if (body.kind === "char") {
+          // A run of one-character atoms, taken greedily and given back one
+          // at a time; a loop, so a long run cannot overflow the stack.
+          let j = i;
+          while (j - i < max && j < input.length && body.test(input[j] as string)) {
+            j++;
+            step();
+          }
+          for (; j - i >= min; j--) {
+            if (then(j)) return true;
+            step();
+          }
+          return false;
+        }
+        const again = (count: number, j: number): boolean =>
+          (count < max &&
+            match(body, j, (next) => !(next === j && count >= min) && again(count + 1, next))) ||
+          (count >= min && then(j));
+        return again(0, i);
+      }
+    }
+  };
+  try {
+    for (let start = 0; start <= input.length; start++) {
+      if (match(root, start, () => true)) return { matched: true, steps };
+    }
+    return { matched: false, steps };
+  } catch (err) {
+    if (err === OVER_BUDGET) return { matched: false, steps: Number.POSITIVE_INFINITY };
+    throw err;
+  }
+}
+
+/** Steps per character a line pattern may take on one line: linear, with room. */
+const STEPS_PER_CHAR = 16;
+
+type PatternRun = {
+  readonly pattern: string;
+  readonly chars: number;
+  readonly steps: number;
+  /** The count's verdict is the engine's, so the count is of the real match. */
+  readonly agrees: boolean;
+};
+
+/**
+ * Runs `fn` with the line patterns counting their steps on every line
+ * `excerptLog` hands them. A pattern over its budget answers "no match"
+ * instead of running, so a quadratic one fails the test at once rather than
+ * after the match it would freeze on.
+ */
+function countLinePatterns<T>(fn: () => T): { result: T; runs: PatternRun[] } {
+  const runs: PatternRun[] = [];
+  const patterns = [RUNNER_MARKER, WORKFLOW_COMMAND, GITLAB_SECTION];
+  for (const pattern of patterns) {
+    Object.defineProperty(pattern, Symbol.match, {
+      configurable: true,
+      value: (text: string) => {
+        const counted = backtrackSteps(pattern, text, STEPS_PER_CHAR * text.length + 64);
+        const over = counted.steps === Number.POSITIVE_INFINITY;
+        const real = over ? null : RegExp.prototype[Symbol.match].call(pattern, text);
+        runs.push({
+          pattern: pattern.source,
+          chars: text.length,
+          steps: counted.steps,
+          agrees: over || (real !== null) === counted.matched,
+        });
+        return real;
+      },
+    });
+  }
+  try {
+    return { result: fn(), runs };
+  } finally {
+    for (const pattern of patterns) Reflect.deleteProperty(pattern, Symbol.match);
+  }
+}
+
 // A CI log line is written by whoever's pull request ran the job, and a
 // synchronous RegExp cannot be interrupted by the call's deadline: one
 // quadratic pattern froze the whole process for as long as the match took.
-// 60 000 characters is deliberate. The 0.7.0 patterns took about 2 s on it
-// locally (so a regression fails here instead of hanging CI, as a megabyte
-// line would), and the linear ones take well under a millisecond.
+// 60 000 characters is deliberate: the 0.7.0 patterns took about 2 s on it
+// locally. The work is counted, not timed, because a time limit a loaded CI
+// runner always meets is too loose to be sure of catching that: the linear
+// patterns decide each of these lines in at most five steps a character,
+// while 0.7.0's grew with the run, to about 90 000 a character here.
 describe("excerptLog on hostile lines (C011)", () => {
   const N = 60_000;
   const hostile: Array<[string, string]> = [
@@ -685,9 +883,11 @@ describe("excerptLog on hostile lines (C011)", () => {
   ];
   for (const [name, line] of hostile) {
     test(`${name} is matched in linear time`, () => {
-      const t0 = performance.now();
-      const excerpt = excerptLog(line);
-      expect(performance.now() - t0).toBeLessThan(500);
+      const { result: excerpt, runs } = countLinePatterns(() => excerptLog(line));
+      expect(runs.length).toBeGreaterThan(0);
+      expect(
+        runs.filter((run) => !run.agrees || run.steps > STEPS_PER_CHAR * run.chars + 64),
+      ).toEqual([]);
       expect(excerpt.totalLines).toBe(1);
     }, 20_000);
   }
