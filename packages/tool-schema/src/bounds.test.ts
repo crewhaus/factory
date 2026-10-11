@@ -379,8 +379,8 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
   test("patternProperties compiles once per map and charges every (key, pattern) test", () => {
     // 8,000 keys under 8,000 patterns ran 64 million tests and answered valid.
     // Now it runs until the value's budget (about 8.2 million evaluations) is
-    // spent and answers undetermined: slow by construction, about 1.7 s here
-    // and 3.9 to 6.2 s on CI's loaded ubuntu runner.
+    // spent and answers undetermined: slow by construction, about 2 s here
+    // and 6.7 to 7.2 s on CI's loaded ubuntu runner.
     const wide = (n: number) => ({
       value: Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 1])),
       schema: {
@@ -414,7 +414,7 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
       true,
     );
     expect(listed).toBeLessThanOrEqual(3);
-  }, 20_000);
+  }, 60_000);
 
   test("an object with no keys does no work per pattern", () => {
     // The compiled list was copied into a fresh array for every object, so
@@ -564,14 +564,19 @@ describe("work that follows the value's size is charged, and messages are built 
     expect(result.undetermined).toMatch(/more than 500000 subschema evaluations/);
     // A value that size checked once is well inside its budget. Its pattern
     // runs in the worker, as the tool runs it: the fallback on this thread
-    // does not run a pattern over more than 64 KiB.
-    const once = await withRegexAnswers((regex) =>
-      validateValue(value, { type: "string", minLength: 1, pattern: "x$" }, { regex }),
+    // does not run a pattern over more than 64 KiB. The worker gets a deadline
+    // no runner reaches, and the test a budget above it: under the tool's
+    // 5 s, a worker slow to start on a loaded runner could turn the answer
+    // undetermined and fail the check for the machine's speed.
+    const once = await withRegexAnswers(
+      (regex) => validateValue(value, { type: "string", minLength: 1, pattern: "x$" }, { regex }),
+      {},
+      { deadlineMs: 60_000 },
     );
     expect("value" in once && once.value.valid).toBe(true);
     // And the budget grows with the string, so a larger one checked once still passes.
     expect(validateValue("y".repeat(5_000_000), { maxLength: 5_000_000 }).valid).toBe(true);
-  });
+  }, 90_000);
 
   // Slow by construction (it spends a 50,000-member value's budget of about
   // 3.2 million units three times; 2 to 5 s here, 14.7 s on CI's loaded runner).
