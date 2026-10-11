@@ -1692,13 +1692,15 @@ describe("compileToolGlob mirrors the runtime matcher", () => {
   });
 
   test("a run of stars does not backtrack exponentially", () => {
-    // `.*.*.*.*…a` against a long name with no `a` is the classic blow-up;
-    // folding the run to one `.*` keeps it linear. A wall-clock bound is the
-    // only honest assertion here, and it is three orders of magnitude clear.
-    const pattern = `${"*".repeat(40)}Z`;
-    const name = "M".repeat(200);
-    const started = Date.now();
-    expect(compileToolGlob(pattern).test(name)).toBe(false);
-    expect(Date.now() - started).toBeLessThan(500);
+    // `.*.*.*.*…Z` against a long name with no `Z` is the classic blow-up;
+    // folding the run to one `.*` keeps it linear. So count the `.*`s rather
+    // than time the match: unfolded, the match below never returns, and bun
+    // cannot stop a synchronous test at its budget, so a timed bound hung
+    // instead of failing. An odd run ends in a lone `*` after a `**`, which
+    // adds nothing either.
+    for (const stars of [40, 41]) {
+      expect(compileToolGlob(`${"*".repeat(stars)}Z`).source).toBe("^.*Z$");
+    }
+    expect(compileToolGlob(`${"*".repeat(40)}Z`).test("M".repeat(200))).toBe(false);
   });
 });
