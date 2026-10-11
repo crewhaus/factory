@@ -98,10 +98,71 @@ afterEach(() => {
   _setDnsLookup(undefined);
 });
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
+/** One body a tool fetched, as the runtime handed it over. */
+type Metered = { handed: number; pulled: number };
+
+/**
+ * Counts what the runtime hands JavaScript for each body fetched during
+ * `run`, instead of reading the process's RSS, which moves with the
+ * allocator and with every other test in the process (a loaded CI runner
+ * read 61 MB where tool-notify's formatter test allowed 40 MB).
+ *
+ * The tool's reader gets each body in 4 KiB pieces, one per read, so
+ * `pulled` is how much of it the tool read before it stopped, whatever sizes
+ * the socket delivered. After `run` the rest is drained, so `handed` is the
+ * whole body as the runtime gave it: its size on the wire when it was
+ * fetched raw, and every decoded byte when the runtime inflated it natively,
+ * as 0.7.0's requests let it (256 MiB here).
+ */
+async function meterBodies<T>(run: () => Promise<T>): Promise<{ result: T; metered: Metered[] }> {
+  const previous = globalThis.fetch;
+  const bodies: Array<{ count: Metered; drain: () => Promise<void> }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await previous(input as Request, init);
+    if (res.body === null) return res;
+    const source = res.body.getReader();
+    const count: Metered = { handed: 0, pulled: 0 };
+    bodies.push({
+      count,
+      drain: async () => {
+        for (let next = await source.read(); !next.done; next = await source.read()) {
+          count.handed += next.value.byteLength;
+        }
+      },
+    });
+    let left: Uint8Array = new Uint8Array(0);
+    const pieces = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          while (left.byteLength === 0) {
+            const next = await source.read();
+            if (next.done) {
+              controller.close();
+              return;
+            }
+            count.handed += next.value.byteLength;
+            left = next.value;
+          }
+          const piece = left.subarray(0, 4096);
+          left = left.subarray(piece.byteLength);
+          count.pulled += piece.byteLength;
+          controller.enqueue(piece);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    Object.defineProperty(res, "body", { value: pieces });
+    return res;
+  }) as typeof globalThis.fetch;
+  let result: T;
+  try {
+    result = await run();
+  } finally {
+    globalThis.fetch = previous;
+  }
+  for (const { drain } of bodies) await drain();
+  return { result, metered: bodies.map(({ count }) => count) };
+}
 
 async function get(origin: string, path: string, maxBytes: number) {
   const deadline = AbortSignal.timeout(10_000);
@@ -122,12 +183,16 @@ describe("a compressed body costs at most its cap", () => {
   ] as const) {
     test(`through ${branch}, 1 KiB of a 256 MiB gzip body is held, not the body`, async () => {
       if (host !== "127.0.0.1") _setDnsLookup(async () => ({ address: "127.0.0.1", family: 4 }));
-      const before = rssNow();
-      const body = await get(`http://${host}:${port}`, "/bomb", 1024);
-      const grew = rssNow() - before;
+      const { result: body, metered } = await meterBodies(() =>
+        get(`http://${host}:${port}`, "/bomb", 1024),
+      );
       expect(body).toEqual({ text: "\u0000".repeat(1024), bytes: 1024, truncated: true });
       expect(acceptEncodings).toEqual(["identity"]);
-      expect(grew).toBeLessThan(64 * 1024 * 1024);
+      // The runtime handed the body over as it is on the wire, so it inflated
+      // none of it, and the tool read a decoder step or two of it, not all.
+      expect(metered).toHaveLength(1);
+      expect(metered[0]?.handed).toBe(bomb.byteLength);
+      expect(metered[0]?.pulled).toBeLessThanOrEqual(64 * 1024);
     }, 20_000);
   }
 
