@@ -270,10 +270,26 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
 
   test("the deadline holds while the caller's event loop keeps running", async () => {
     await settleWorkers(60_000);
+    // Every message a regex worker posts, in the order this thread receives
+    // them. The listener is added in the constructor, before the session's
+    // own, so a message is recorded before the session acts on it.
+    const RealWorker = globalThis.Worker;
+    const received: string[] = [];
+    class Watched extends RealWorker {
+      constructor(...args: ConstructorParameters<typeof RealWorker>) {
+        super(...args);
+        this.addEventListener("message", (event) => {
+          received.push(String((event.data as { kind?: unknown } | null)?.kind));
+        });
+      }
+    }
+    (globalThis as { Worker: unknown }).Worker = Watched;
     const session = openRegexSession();
     try {
       // Warm the worker so start-up is not part of the run.
       expect((await session.run({ op: "test", pattern: "a", input: "a" })).status).toBe("ok");
+      const doneBefore = received.filter((kind) => kind === "done").length;
+      expect(doneBefore).toBe(1);
       let ticks = 0;
       const tick = setInterval(() => {
         ticks += 1;
@@ -286,13 +302,17 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
         input: `${" ".repeat(40_000)}x`,
         deadlineMs: 50,
       });
-      // Read before anything else runs: the abandoned thread is still inside
-      // its exec, so the answer came at the deadline, not when the thread
-      // got out. Waiting for it would have answered with none left running.
+      // Read before anything else runs. The answer came at the deadline,
+      // with the worker's own answer not yet received: one that waited for
+      // it (and then called the run a timeout) is told apart by order, not
+      // by how long it took. And the abandoned thread had not yet exited:
+      // waiting for it would have answered with none left running.
+      const doneByAnswer = received.filter((kind) => kind === "done").length - doneBefore;
       const stillRunning = regexWorkerCounts().runaway;
       clearInterval(tick);
       expect(outcome.status).toBe("timeout");
       expect(regexVerdict(outcome as RegexOutcome<TestResult>)).toBe("undetermined");
+      expect(doneByAnswer).toBe(0);
       expect(stillRunning).toBe(1);
       expect(ticks).toBeGreaterThan(0);
       // The same session recovers with a fresh worker.
@@ -301,6 +321,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
         result: { matched: true },
       });
     } finally {
+      (globalThis as { Worker: unknown }).Worker = RealWorker;
       session.close();
     }
     const settled = await settleWorkers(60_000);
