@@ -529,6 +529,10 @@ describe("storeAndPreview — a repeated tool_use_id", () => {
     expect(preview).toContain("run_o/tu_o.txt");
   });
 
+  // Slow by construction: MAX_NAME_ATTEMPTS taken names, each a contained
+  // compare-read. 0.25-0.4 s here, and 5.3 to 7.8 s on CI's loaded ubuntu
+  // runner (runs 38162665244, 36686088447), 39% of the 20 s it had. An
+  // unbounded search fails on `persisted`, in the same time, not on the budget.
   test("the name search is bounded", async () => {
     const rootDir = newTempRoot();
     const dir = join(rootDir, "run_b");
@@ -544,7 +548,7 @@ describe("storeAndPreview — a repeated tool_use_id", () => {
     expect(out.persisted).toBe(false);
     expect(out.unsaved).toContain("is taken");
     expect(existsSync(join(dir, `tu_b.${MAX_NAME_ATTEMPTS + 1}.txt`))).toBe(false);
-  }, 20_000);
+  }, 30_000);
 });
 
 describe("storeAndPreview — path traversal guard", () => {
