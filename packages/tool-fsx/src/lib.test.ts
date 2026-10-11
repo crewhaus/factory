@@ -576,9 +576,15 @@ describe("glob compilation is bounded", () => {
     // segments would never have come back at all.
     const pattern = `${"**/".repeat(12)}zzz`;
     const subject = `${Array.from({ length: 24 }, (_, i) => `seg${i}`).join("/")}/nope`;
-    const started = Date.now();
-    expect(matchGlob(pattern, subject)).toBe(false);
-    expect(Date.now() - started).toBeLessThan(250);
+    // Counted, not timed, as the C081 tests below count it.
+    const most = productOf(pattern, subject);
+    const { value, subjectRuns, reads } = globWork([subject], most, () =>
+      matchGlob(pattern, subject),
+    );
+    expect(value).toBe(false);
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    expect(reads).toBeGreaterThan(0);
   });
 
   test("collapsing does not change what the pattern means", () => {
@@ -669,37 +675,41 @@ function referenceGlob(pattern: string): RegExp {
 }
 
 /**
- * The work a glob match does, counted rather than timed. Every regular
- * expression run is counted, and one over a subject is refused on the spot:
- * 0.7.0 compiled each glob to a RegExp, whose backtracking is the hang, so a
- * return to it fails at once instead of running for hours. The matcher's own
+ * The work a glob match does, counted rather than timed. A regular
+ * expression run over a subject is counted and refused on the spot: 0.7.0
+ * compiled each glob to a RegExp, whose backtracking is the hang, so a return
+ * to it fails at once instead of running for hours. A run over anything else
+ * is not the match, and is neither counted nor refused. The matcher's own
  * work is the characters it reads with `charCodeAt`, which the segment walk
- * keeps within the product of the pattern's and the subject's lengths. Both
- * originals are put back before this returns.
+ * keeps within the product of the pattern's and the subject's lengths. A read
+ * past `maxReads` throws, so a walk that blows up without a RegExp fails at
+ * once too. Both originals are put back before this returns.
  */
 function globWork<T>(
   subjects: readonly string[],
+  maxReads: number,
   body: () => T,
-): { value: T; regexRuns: number; reads: number } {
+): { value: T; subjectRuns: number; reads: number } {
   const realExec = RegExp.prototype.exec;
   const realCharCodeAt = String.prototype.charCodeAt;
-  let regexRuns = 0;
+  let subjectRuns = 0;
   let reads = 0;
   RegExp.prototype.exec = function (this: RegExp, input: string) {
-    regexRuns += 1;
     const text = String(input);
     if (subjects.some((subject) => text.includes(subject))) {
+      subjectRuns += 1;
       throw new Error(`/${this.source}/ ran over a ${text.length}-character subject`);
     }
     return realExec.call(this, text);
   };
   String.prototype.charCodeAt = function (this: string, index: number) {
     reads += 1;
+    if (reads > maxReads) throw new Error(`the match read more than ${maxReads} characters`);
     return realCharCodeAt.call(this, index);
   };
   try {
     const value = body();
-    return { value, regexRuns, reads };
+    return { value, subjectRuns, reads };
   } finally {
     RegExp.prototype.exec = realExec;
     String.prototype.charCodeAt = realCharCodeAt;
@@ -707,8 +717,9 @@ function globWork<T>(
 }
 
 /** What the segment walk may read for one match: the product of the lengths. */
-const productOf = (pattern: string, subject: string): number =>
-  (pattern.length + 1) * (subject.length + 1);
+function productOf(pattern: string, subject: string): number {
+  return (pattern.length + 1) * (subject.length + 1);
+}
 
 describe("the glob matcher cannot be made to backtrack (C081)", () => {
   test("many-star patterns answer in linear time", () => {
@@ -722,9 +733,15 @@ describe("the glob matcher cannot be made to backtrack (C081)", () => {
       ["*a*a*a*a*a*a*a*a*b", "a".repeat(255), false],
     ];
     for (const [pattern, subject, matches] of cases) {
-      const { value, regexRuns, reads } = globWork([subject], () => matchGlob(pattern, subject));
-      expect({ pattern, value, regexRuns }).toEqual({ pattern, value: matches, regexRuns: 0 });
-      expect(reads).toBeLessThanOrEqual(productOf(pattern, subject));
+      const most = productOf(pattern, subject);
+      const { value, subjectRuns, reads } = globWork([subject], most, () =>
+        matchGlob(pattern, subject),
+      );
+      expect({ pattern, value, subjectRuns }).toEqual({ pattern, value: matches, subjectRuns: 0 });
+      expect(reads).toBeLessThanOrEqual(most);
+      // The walk reads every subject character. Fewer reads means it reads
+      // them some other way, and the count above no longer sees it.
+      expect(reads).toBeGreaterThanOrEqual(subject.length);
     }
   });
 
@@ -732,23 +749,30 @@ describe("the glob matcher cannot be made to backtrack (C081)", () => {
     const rule = compileIgnoreRule("*a*a*a*a*a*a*b");
     if (rule === undefined) throw new Error("the rule should compile");
     const name = "a".repeat(255);
-    const { value, regexRuns, reads } = globWork([name], () => [
+    // Two matches of the rule against the name.
+    const most = 2 * productOf("*a*a*a*a*a*a*b", name);
+    const { value, subjectRuns, reads } = globWork([name], most, () => [
       rule.test(name),
       isIgnored([{ base: "", rules: [rule] }], `x/${name}`, false),
     ]);
     expect(value).toEqual([false, false]);
-    expect(regexRuns).toBe(0);
-    // Two matches of the rule against the name.
-    expect(reads).toBeLessThanOrEqual(2 * productOf("*a*a*a*a*a*a*b", name));
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    expect(reads).toBeGreaterThanOrEqual(name.length);
   });
 
   test("globstars across many segments stay polynomial", () => {
     const subject = Array.from({ length: 200 }, () => "a").join("/");
     const pattern = `${"**/a/".repeat(60)}b`;
-    const { value, regexRuns, reads } = globWork([subject], () => matchGlob(pattern, subject));
+    const most = productOf(pattern, subject);
+    const { value, subjectRuns, reads } = globWork([subject], most, () =>
+      matchGlob(pattern, subject),
+    );
     expect(value).toBe(false);
-    expect(regexRuns).toBe(0);
-    expect(reads).toBeLessThanOrEqual(productOf(pattern, subject));
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    // One read: only the last segment can meet `b`, and it does not.
+    expect(reads).toBeGreaterThan(0);
   });
 
   test("it agrees with the RegExp translation on every short input", () => {
@@ -781,5 +805,6 @@ describe("the glob matcher cannot be made to backtrack (C081)", () => {
     }
     // The guard's hit count: nearly every generated pair was compared.
     expect(compared).toBeGreaterThan(18_000);
-  });
+    // Slow by construction: 20 000 comparisons took up to 1.1 s on CI.
+  }, 20_000);
 });
