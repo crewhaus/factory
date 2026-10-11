@@ -719,9 +719,22 @@ describe("ContentPolicyCheck", () => {
       kind: "forbidden_pattern" as const,
       value: `(a+)+!$|guaranteed returns${i === 0 ? "" : `|x{${i}}`}`,
     }));
-    const started = performance.now();
-    const out = await run(contentPolicyCheck, { text, rules });
-    expect(performance.now() - started).toBeLessThan(5_000);
+    // Counted, not timed: no regex ran over the text on this thread, where
+    // nothing can stop it. 0.7.0 ran all ten here, each until the engine gave
+    // up; this test refuses such a run on the spot rather than wait it out.
+    let onThisThread = 0;
+    const realExec = RegExp.prototype.exec;
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      if (input === text) {
+        onThisThread += 1;
+        throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
+      }
+      return realExec.call(this, input);
+    };
+    const out = await run(contentPolicyCheck, { text, rules }).finally(() => {
+      RegExp.prototype.exec = realExec;
+    });
+    expect(onThisThread).toBe(0);
     expect(out.pass).toBe(false);
     expect(out.counts).toMatchObject({ error: 10, pass: 0 });
     expect(out.outcomes[0].message).toContain("nested-quantifier");
