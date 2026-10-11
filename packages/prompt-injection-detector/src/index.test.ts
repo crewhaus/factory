@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { regexWork } from "./__test__/regex-work";
 import {
   REGEX_RULES,
   TOOL_DEFINITION_RULES,
@@ -299,11 +300,18 @@ describe("override-safety: turning off safety, not overriding a header (0.7.1)",
   test("stays linear on a long run of whitespace after the verb", () => {
     const pattern = REGEX_RULES.find((r) => r.id === "override-safety")?.pattern;
     expect(pattern).toBeDefined();
-    // 64 KiB is MAX_CLASSIFY_LEN; a super-linear pattern would take seconds.
-    const t0 = performance.now();
-    pattern?.test(`bypass${" ".repeat(64 * 1024)}x`);
-    pattern?.test("bypass ".repeat(9000));
-    expect(performance.now() - t0).toBeLessThan(1000);
+    // 64 KiB is MAX_CLASSIFY_LEN. Counted, not timed: a model walks the
+    // pattern and counts its backtracking steps (__test__/regex-work.ts). It
+    // takes 26 and 9 steps a character on these. A super-linear spelling,
+    // such as a second whitespace run after the verb's, or a verb run that
+    // also takes words, goes past the bound at once and reads as Infinity.
+    for (const text of [`bypass${" ".repeat(64 * 1024)}x`, "bypass ".repeat(9000)]) {
+      const bound = 64 * text.length;
+      const counted = regexWork(bound, () => pattern?.test(text));
+      expect(counted.unmodelled).toEqual([]);
+      expect(counted.steps).toBeLessThanOrEqual(bound);
+      expect(counted.value).toBe(false);
+    }
   });
 });
 
@@ -382,12 +390,25 @@ describe("tool-definition rules (0.7.1, C102)", () => {
   });
 
   test("stay linear on hostile input", () => {
-    const t0 = performance.now();
-    toolDefinitionHits(`send ${"a ".repeat(30_000)}`);
-    toolDefinitionHits(`${"the x tool ".repeat(5_000)}`);
-    toolDefinitionHits(`before using this tool ${"z".repeat(60_000)}`);
-    expect(performance.now() - t0).toBeLessThan(2000);
-  });
+    // Counted, not timed: a model walks every pattern the rules and the match
+    // views run and counts its backtracking steps (__test__/regex-work.ts).
+    // Twelve rules over three views take 181 to 408 steps a character here.
+    // A gap a rule can rescan from every word, such as a tool name that may
+    // hold spaces after "the" or "a", or one that may start anywhere, takes
+    // thousands a character on these texts, and more the longer they are.
+    for (const text of [
+      `send ${"a ".repeat(30_000)}`,
+      `${"the x tool ".repeat(5_000)}`,
+      `before using this tool ${"z".repeat(60_000)}`,
+    ]) {
+      const bound = 1024 * text.length;
+      const counted = regexWork(bound, () => toolDefinitionHits(text));
+      expect(counted.unmodelled).toEqual([]);
+      expect(counted.steps).toBeLessThanOrEqual(bound);
+      expect(counted.value).toEqual([]);
+    }
+    // Three 60 KB texts through a step-counting model: about a second here.
+  }, 30_000);
 });
 
 describe("layer 3 LLM classifier", () => {
