@@ -425,25 +425,32 @@ describe("three-way match", () => {
 });
 
 /**
- * How many elements `Array.prototype.sort` and `toSorted` were handed while
- * `body` ran, and how many comparisons they made. Past `limit` elements the
- * next sort throws instead of running, so a sort per disposal fails at once.
- * Both originals are put back before this returns.
+ * The array work `body` did: how many elements `Array.prototype.sort` and
+ * `toSorted` were handed and how many comparisons they made, and how many
+ * elements an array iterator handed out, which is what a `for…of`, a spread,
+ * `Array.from` or a destructuring visits. Past its limit the next sort or
+ * element throws instead of running, so a sort or a scan per disposal fails
+ * at once, and that count reads as Infinity. Every original is put back
+ * before this returns. A loop that reads `lots[i]` by hand is not seen.
  */
-function sortWork<T>(
-  limit: number,
+function arrayWork<T>(
+  limits: { readonly sorted: number; readonly iterated: number },
   body: () => T,
-): { value: T | undefined; lots: number; comparisons: number } {
-  const OVER = Symbol("over the sort limit");
+): { value: T | undefined; sorted: number; comparisons: number; iterated: number } {
+  const OVER = Symbol("over the limit");
   const proto = Array.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
-  const saved = { sort: proto["sort"], toSorted: proto["toSorted"] };
-  let lots = 0;
+  const iterator = Object.getPrototypeOf([][Symbol.iterator]()) as {
+    next: (this: unknown) => IteratorResult<unknown>;
+  };
+  const saved = { sort: proto["sort"], toSorted: proto["toSorted"], next: iterator.next };
+  let sorted = 0;
   let comparisons = 0;
+  let iterated = 0;
   for (const name of ["sort", "toSorted"] as const) {
     const real = saved[name] as (...args: unknown[]) => unknown;
     proto[name] = function (this: unknown[], compare?: unknown) {
-      lots += this.length;
-      if (lots > limit) throw OVER;
+      sorted += this.length;
+      if (sorted > limits.sorted) throw OVER;
       const counted =
         typeof compare === "function"
           ? (a: unknown, b: unknown) => {
@@ -454,12 +461,26 @@ function sortWork<T>(
       return real.call(this, counted);
     };
   }
+  // Last, so the loop above is not counted.
+  iterator.next = function (this: unknown) {
+    const out = saved.next.call(this);
+    if (out.done !== true && ++iterated > limits.iterated) throw OVER;
+    return out;
+  };
   try {
-    return { value: body(), lots, comparisons };
+    return { value: body(), sorted, comparisons, iterated };
   } catch (err) {
     if (err !== OVER) throw err;
-    return { value: undefined, lots: Number.POSITIVE_INFINITY, comparisons };
+    const over = (count: number, limit: number) =>
+      count > limit ? Number.POSITIVE_INFINITY : count;
+    return {
+      value: undefined,
+      sorted: over(sorted, limits.sorted),
+      comparisons,
+      iterated: over(iterated, limits.iterated),
+    };
   } finally {
+    iterator.next = saved.next;
     proto["sort"] = saved.sort as (...args: unknown[]) => unknown;
     proto["toSorted"] = saved.toSorted as (...args: unknown[]) => unknown;
   }
@@ -580,7 +601,9 @@ describe("cost basis", () => {
     // disposal: 3000 lots and disposals took seconds where FIFO took
     // milliseconds, and the schema allows ten thousand of each. Counted, not
     // timed: every method sorts the 3000 lots once, about 31 000 comparisons
-    // for HIFO. A sort per disposal hands the sorts millions of lots.
+    // for HIFO, and its loops visit about 13 elements a lot. A sort per
+    // disposal hands the sorts millions of lots, and a scan of the open lots
+    // per disposal makes the loops visit thousands a lot.
     const n = 3000;
     const many = Array.from({ length: n }, (_, i) => ({
       id: `l${i}`,
@@ -594,13 +617,17 @@ describe("cost basis", () => {
       quantity: 0.25,
       proceedsMinor: 5000,
     }));
-    const fifo = sortWork(2 * n, () => computeCostBasis(many, sells, "fifo"));
-    const hifo = sortWork(2 * n, () => computeCostBasis(many, sells, "hifo"));
-    // Lots handed to a sort over the whole call: the 3000, once. Past twice
-    // that the sort is stopped and the count reads as Infinity.
-    expect({ fifo: fifo.lots, hifo: hifo.lots }).toEqual({ fifo: n, hifo: n });
+    const limits = { sorted: 2 * n, iterated: 32 * n };
+    const fifo = arrayWork(limits, () => computeCostBasis(many, sells, "fifo"));
+    const hifo = arrayWork(limits, () => computeCostBasis(many, sells, "hifo"));
+    // Lots handed to a sort over the whole call: the 3000, once.
+    expect({ fifo: fifo.sorted, hifo: hifo.sorted }).toEqual({ fifo: n, hifo: n });
     // One sort's comparisons, n log n, not one sort's per disposal.
     expect(hifo.comparisons).toBeLessThanOrEqual(2 * n * Math.ceil(Math.log2(n)));
+    // Elements the loops visited: a bounded number a lot, not the open lots
+    // once per disposal.
+    expect(fifo.iterated).toBeLessThanOrEqual(limits.iterated);
+    expect(hifo.iterated).toBeLessThanOrEqual(limits.iterated);
     expect(fifo.value?.disposals).toHaveLength(n);
     expect(hifo.value?.disposals).toHaveLength(n);
   });
