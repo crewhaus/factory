@@ -176,26 +176,49 @@ describe("DownloadFile does not write an escaped echo (C050)", () => {
 });
 
 describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)", () => {
-  const waitFor = (value: string): Promise<unknown> =>
-    httpWaitFor.execute(
-      {
-        url: `${origin}/echo`,
-        auth,
-        expectJson: { path: "headers.x-api-key", op: "contains", value },
-        intervalMs: 50,
-        timeoutMs: 300,
-      },
-      {},
+  // The 300ms deadline's timer is held, so it cannot abort a poll however
+  // slow the runner; its clock still ends the loop between polls. So every
+  // answer is judged on a body the poll really read. With the timer armed,
+  // /echo answering 350ms late (CI has taken 300-375ms for one loopback)
+  // cut every poll off, and the `false` answers held only vacuously: judging
+  // the raw body, the 0.7.0 defect, passed.
+  const waitFor = async (
+    value: string,
+  ): Promise<{ met: boolean; lastStatus?: number; lastError?: string }> =>
+    JSON.parse(
+      String(
+        await withTimersHeld(300, () =>
+          httpWaitFor.execute(
+            {
+              url: `${origin}/echo`,
+              auth,
+              expectJson: { path: "headers.x-api-key", op: "contains", value },
+              intervalMs: 50,
+              timeoutMs: 300,
+            },
+            {},
+          ),
+        ),
+      ),
     );
 
   test("a correct prefix and a wrong one get the same answer", async () => {
-    const right = JSON.parse(String(await waitFor(SECRET.slice(0, 10))));
-    const wrong = JSON.parse(String(await waitFor("ZZZZZZZZZZ")));
-    expect(right.met).toBe(false);
-    expect(wrong.met).toBe(false);
-    // The whole secret is not "found" either.
-    expect(JSON.parse(String(await waitFor(SECRET))).met).toBe(false);
-  });
+    // The right prefix, a wrong one, and the whole secret, which is not
+    // "found" either.
+    const guesses = [SECRET.slice(0, 10), "ZZZZZZZZZZ", SECRET];
+    for (const [guess, value] of guesses.entries()) {
+      const { met, lastStatus, lastError } = await waitFor(value);
+      // Labelled by index: a failure must not print the guess. A 200 with no
+      // error is a body that was read, parsed and judged.
+      expect({ guess, met, lastStatus, lastError }).toEqual({
+        guess,
+        met: false,
+        lastStatus: 200,
+        lastError: undefined,
+      });
+    }
+    // Three asks wait out their 300ms, and a slow runner's polls add to that.
+  }, 20_000);
 
   test("an echo nested as a JSON string in a JSON string is no oracle either (bounds review)", async () => {
     // The 300ms deadline's timer is held, so it cannot abort a poll however
@@ -240,21 +263,29 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
   }, 20_000);
 
   test("a condition on a field that holds no credential still works", async () => {
+    // The 2s timer is held, so it cannot cut the read however slow the
+    // runner: /echo is ready at once, so the first body read meets the
+    // condition. Armed, a reply later than 2s came back `met: false`.
     const out = JSON.parse(
       String(
-        await httpWaitFor.execute(
-          {
-            url: `${origin}/echo`,
-            auth,
-            expectJson: { path: "status", op: "equals", value: "ready" },
-            intervalMs: 50,
-            timeoutMs: 2_000,
-          },
-          {},
+        await withTimersHeld(2_000, () =>
+          httpWaitFor.execute(
+            {
+              url: `${origin}/echo`,
+              auth,
+              expectJson: { path: "status", op: "equals", value: "ready" },
+              intervalMs: 50,
+              timeoutMs: 2_000,
+            },
+            {},
+          ),
         ),
       ),
     );
-    expect(out.met).toBe(true);
+    expect({ met: out.met, stoppedBy: out.stoppedBy }).toEqual({
+      met: true,
+      stoppedBy: "condition",
+    });
   });
 });
 
