@@ -13,7 +13,8 @@
  * ignores Accept-Encoding. The server is on loopback, which the SSRF guard
  * refuses, so the test resolves the name to a public-looking address and a
  * wrapper around globalThis.fetch dials loopback instead, passing the init
- * through untouched — which is also how it sees what the crawler asked for.
+ * through untouched — which is also how it sees what the crawler asked for,
+ * and how it counts what the runtime delivered for the bomb.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -40,15 +41,12 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(parts));
 }
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
-
 describe("a compressed reply costs at most the cap (C093)", () => {
   let bomb: Uint8Array;
   let server: ReturnType<typeof Bun.serve>;
   let inits: Array<Record<string, unknown> | undefined> = [];
+  /** Bytes the runtime delivered for each /bomb response, read to its end. */
+  let delivered: number[] = [];
   let root: string;
   const realFetch = globalThis.fetch;
 
@@ -80,6 +78,7 @@ describe("a compressed reply costs at most the cap (C093)", () => {
 
   beforeEach(() => {
     inits = [];
+    delivered = [];
     root = realpathSync(mkdtempSync(join(tmpdir(), "crawler-bomb-")));
     _setDnsLookup(async () => ({ address: PUBLIC_IP, family: 4 }));
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -88,7 +87,19 @@ describe("a compressed reply costs at most the cap (C093)", () => {
         PUBLIC_IP,
         "127.0.0.1",
       );
-      return realFetch(url, init);
+      const res = await realFetch(url, init);
+      if (new URL(url).pathname !== "/bomb") return res;
+      // Read to the end before the crawler sees it, and count: the reply as
+      // sent when the crawler asked for it raw, the whole inflated reply when
+      // it did not. A constructed Response is never decoded, so the crawler
+      // reads exactly these bytes.
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      delivered.push(bytes.byteLength);
+      return new Response(bytes, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
     }) as typeof globalThis.fetch;
   });
 
@@ -110,12 +121,13 @@ describe("a compressed reply costs at most the cap (C093)", () => {
   ] as const) {
     test(`through ${branch}, a 256 MiB gzip reply is refused at the cap without being inflated`, async () => {
       const origin = `http://${host}:${server.port}`;
-      const before = rssNow();
       await expect(crawlerFor(origin).fetch(`${origin}/bomb`)).rejects.toThrow(
         /exceeds 5242880 bytes/,
       );
-      // Inflating the reply costs about 1 GB; the cap costs a few MB.
-      expect(rssNow() - before).toBeLessThan(96 * 1024 * 1024);
+      // The reply as sent, about 260 KB. Inflated by the runtime it is
+      // 256 MiB, about 1 GB of RSS: counted in bytes, not read off the
+      // process's RSS, which moves with every other test.
+      expect(delivered).toEqual([bomb.byteLength]);
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);
     }, 30_000);
