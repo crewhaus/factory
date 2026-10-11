@@ -80,6 +80,16 @@ import {
   splitMessageAndStack,
 } from "./lib/tests";
 
+/**
+ * The linear-time tests below time a parse only to catch a hang. Each
+ * hostile input is sized so that the 0.7.0 code it guards against runs for
+ * about a minute on a fast Mac, where the fixed code takes milliseconds
+ * (tens on a loaded CI runner): no runner is slow enough to cross the bound
+ * with the fix in place. The work is backtracking inside the regex engine,
+ * so there is no step a test could count instead.
+ */
+const HANG_MS = 5_000;
+
 // ---------------------------------------------------------------------------
 
 describe("maskSource", () => {
@@ -513,24 +523,26 @@ describe("test output parsers", () => {
 
   test("bun: a status line is parsed in linear time, whatever its spacing (C079)", () => {
     // 0.7.0's status pattern retried a long run of spaces from every split
-    // point: this line took about eight seconds.
+    // point: 100,000 spaces took about eight seconds, and 280,000 about a
+    // minute.
     const started = performance.now();
-    const outcome = parseBunTest(`a.test.ts:\n(fail) x${" ".repeat(100_000)}y\n`);
-    expect(performance.now() - started).toBeLessThan(2_000);
+    const outcome = parseBunTest(`a.test.ts:\n(fail) x${" ".repeat(280_000)}y\n`);
+    expect(performance.now() - started).toBeLessThan(HANG_MS);
     expect(outcome.failed).toBe(1);
-    expect(outcome.failures[0]?.name.length).toBe(100_002);
+    expect(outcome.failures[0]?.name.length).toBe(280_002);
   });
 
   test("pytest: the summary line is read in linear time, and its counts unchanged (C079)", () => {
     // 0.7.0's two lazy groups and trailing `\s+` retried a run of spaces
-    // from every position: quadratic in a line the caller supplies.
-    const run = " ".repeat(60_000);
-    const digits = "1".repeat(60_000);
+    // from every position: quadratic in a line the caller supplies (60,000
+    // spaces took about two seconds, 300,000 about a minute).
+    const run = " ".repeat(300_000);
+    const digits = "1".repeat(300_000);
     const started = performance.now();
     const hostile = parsePytest(
       `short test summary info\npassed${run}x\n${digits}a passed${run}in 1s\n`,
     );
-    expect(performance.now() - started).toBeLessThan(1_500);
+    expect(performance.now() - started).toBeLessThan(HANG_MS);
     expect(hostile.passed).toBe(0);
     // The same scan still reads every summary pytest prints.
     const summary = parsePytest(
@@ -584,16 +596,17 @@ describe("test output parsers", () => {
 
   test("go: a failed test's output is searched in linear time, blank lines or not (C079)", () => {
     // The location search was one multiline pattern whose `^\s*` spanned
-    // newlines: 160k characters of blank output took over five seconds.
+    // newlines: 160k characters of blank output took over five seconds, and
+    // the 260k blank lines here about a minute.
     const event = (e: Record<string, unknown>) => JSON.stringify({ Package: "p", Test: "T", ...e });
     const blank = [
       event({ Action: "run" }),
-      event({ Action: "output", Output: "\n".repeat(120_000) }),
+      event({ Action: "output", Output: "\n".repeat(260_000) }),
       event({ Action: "fail" }),
     ].join("\n");
     const started = performance.now();
     const outcome = parseGoTestJson(blank);
-    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(performance.now() - started).toBeLessThan(HANG_MS);
     expect(outcome.failed).toBe(1);
     // …and a location after leading space and blank lines is still found.
     const located = parseGoTestJson(
@@ -617,10 +630,15 @@ describe("test output parsers", () => {
     );
     expect(trailing.failures[0]).toMatchObject({ file: "sum_test.go", line: 9 });
     expect(trailing.failures[0]?.message).toBeUndefined();
-    // Runner detection samples both ends, and a run of blank lines there is linear too.
+    // Runner detection samples both ends, and a run of blank lines there is
+    // linear too. The sample is capped at 40,000 characters, on which 0.7.0's
+    // `^\s*` took about a second, so the bound is on sixty detections.
+    const sample = "\n".repeat(40_000);
     const detectStarted = performance.now();
-    expect(detectRunnerFromOutput("\n".repeat(40_000))).toBeUndefined();
-    expect(performance.now() - detectStarted).toBeLessThan(500);
+    const guesses = new Set<string | undefined>();
+    for (let i = 0; i < 60; i++) guesses.add(detectRunnerFromOutput(sample));
+    expect(performance.now() - detectStarted).toBeLessThan(HANG_MS);
+    expect([...guesses]).toEqual([undefined]);
   });
 
   test("bun: the timing suffix is cut, and any other bracket is part of the name", () => {
@@ -1234,22 +1252,22 @@ describe("dependency manifests", () => {
     // 0.7.0 ran `^\s*` in multiline mode (it spans newlines), stripped
     // comments with `\s+#.*$`, and re-scanned the body once per array key:
     // each quadratic in a file up to the read cap, about two seconds each at
-    // these sizes.
+    // roughly a fifth of these sizes and about a minute each at these.
     const cases: ReadonlyArray<[string, string, string[]]> = [
-      ["blank lines", `[project.optional-dependencies]\n${"\n".repeat(50_000)}x\n`, []],
+      ["blank lines", `[project.optional-dependencies]\n${"\n".repeat(240_000)}x\n`, []],
       [
         "spaces before no comment",
-        `[tool.poetry.dependencies]\nhttpx = "1"${" ".repeat(60_000)}x\n`,
+        `[tool.poetry.dependencies]\nhttpx = "1"${" ".repeat(280_000)}x\n`,
         ["httpx"],
       ],
-      ["unclosed arrays", `[project.optional-dependencies]\n${"k = [\n".repeat(15_000)}`, []],
+      ["unclosed arrays", `[project.optional-dependencies]\n${"k = [\n".repeat(70_000)}`, []],
     ];
     let timed = 0;
     for (const [label, text, names] of cases) {
       const started = performance.now();
       const deps = parsePyproject(text);
       const ms = performance.now() - started;
-      expect({ label, fast: ms < 1_000, names: deps.map((d) => d.name) }).toEqual({
+      expect({ label, fast: ms < HANG_MS, names: deps.map((d) => d.name) }).toEqual({
         label,
         fast: true,
         names,
@@ -1336,14 +1354,15 @@ describe("dependency manifests", () => {
 
   test("a many-star glob is matched in bounded time, not by a backtracking regex", () => {
     // 0.7.0 compiled this to /^packages\/[^/]*a[^/]*a…b$/, a polynomial
-    // backtracker: ~2s on a 100-character name here, minutes at 250. The glob
-    // is the repository's, so WorkspacePackages hung on it.
-    const dir = `packages/${"a".repeat(100)}`;
+    // backtracker: ~2s on a 100-character name, about a minute on the 180
+    // here, minutes at 250. The glob is the repository's, so WorkspacePackages
+    // hung on it.
+    const dir = `packages/${"a".repeat(180)}`;
     const started = performance.now();
     expect(matchWorkspaceGlob(dir, "packages/*a*a*a*a*a*b")).toBe(false);
     expect(matchWorkspaceGlob(`${dir}b`, "packages/*a*a*a*a*a*b")).toBe(true);
     expect(matchWorkspaceGlob(`${dir}/a/a/a/a`, "**/**/**/**/**/x")).toBe(false);
-    expect(performance.now() - started).toBeLessThan(500);
+    expect(performance.now() - started).toBeLessThan(HANG_MS);
   });
 
   test("syntax the matcher does not evaluate is named, not read as literal text", () => {
@@ -1377,13 +1396,14 @@ describe("dependency manifests", () => {
 
   test("pnpm-workspace.yaml is read in linear time, whatever the repository wrote", () => {
     // The 0.7.0 pattern grew with the square of a run of spaces before a
-    // stray quote, and of a run of blank lines: ~2s each at these sizes,
-    // and a 2 MB file (the read cap) was a hang.
-    const spaces = " ".repeat(40_000);
-    const hostile = `packages:\n  - a${spaces}"x\n${" \n".repeat(20_000)}`;
+    // stray quote, and of a run of blank lines: ~3s at 40,000 spaces and
+    // 20,000 blank lines, about a minute at these sizes, and a 2 MB file
+    // (the read cap) was a hang.
+    const spaces = " ".repeat(180_000);
+    const hostile = `packages:\n  - a${spaces}"x\n${" \n".repeat(90_000)}`;
     const started = performance.now();
     expect(parsePnpmWorkspacePackages(hostile)).toEqual([`a${spaces}"x`]);
-    expect(performance.now() - started).toBeLessThan(500);
+    expect(performance.now() - started).toBeLessThan(HANG_MS);
   });
 });
 
