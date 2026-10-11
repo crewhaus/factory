@@ -770,23 +770,55 @@ describe("xml", () => {
 });
 
 /**
- * How many characters `String.prototype.indexOf` read while `body` ran:
- * from where each search started to where it stopped.
+ * How many characters the string searches read while `body` ran: from where
+ * each search started to where it stopped. It counts `indexOf`, `includes`
+ * and `lastIndexOf`, and `RegExp.prototype.exec`, which `search`, `match`,
+ * `matchAll`, `replace`, `split` and `test` all run through once it is
+ * replaced, so a search counts however it is spelled. Every original is put
+ * back before this returns.
  */
 function charactersSearched<T>(body: () => T): { value: T; searched: number } {
   const realIndexOf = String.prototype.indexOf;
+  const realIncludes = String.prototype.includes;
+  const realLastIndexOf = String.prototype.lastIndexOf;
+  const realExec = RegExp.prototype.exec;
   let searched = 0;
-  String.prototype.indexOf = function (this: string, search: string, position?: number) {
-    const at = realIndexOf.call(this, search, position);
-    const from = Math.min(Math.max(Math.trunc(Number(position ?? 0)) || 0, 0), this.length);
-    searched += (at === -1 ? this.length : at + search.length) - from;
+  const startAt = (position: unknown, length: number): number =>
+    Math.min(Math.max(Math.trunc(Number(position ?? 0)) || 0, 0), length);
+  const forward = (text: string, search: string, position: unknown): number => {
+    const at = realIndexOf.call(text, search, position as number | undefined);
+    searched += (at === -1 ? text.length : at + search.length) - startAt(position, text.length);
     return at;
+  };
+  String.prototype.indexOf = function (this: string, search: string, position?: number) {
+    return forward(this, String(search), position);
+  };
+  String.prototype.includes = function (this: string, search: string, position?: number) {
+    return forward(this, String(search), position) !== -1;
+  };
+  String.prototype.lastIndexOf = function (this: string, search: string, position?: number) {
+    const at = realLastIndexOf.call(this, search, position);
+    const from = position === undefined ? this.length : startAt(position, this.length);
+    searched += from - (at === -1 ? 0 : at);
+    return at;
+  };
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    const text = String(input);
+    const from = this.global || this.sticky ? startAt(this.lastIndex, text.length) : 0;
+    const m = realExec.call(this, text);
+    // A sticky miss tried one position; any other miss read to the end.
+    if (m === null) searched += this.sticky ? 1 : text.length - from;
+    else searched += m.index + m[0].length - from;
+    return m;
   };
   try {
     const value = body();
     return { value, searched };
   } finally {
     String.prototype.indexOf = realIndexOf;
+    String.prototype.includes = realIncludes;
+    String.prototype.lastIndexOf = realLastIndexOf;
+    RegExp.prototype.exec = realExec;
   }
 }
 
@@ -820,12 +852,13 @@ describe("xml on hostile documents (C091)", () => {
 
   test("one '[' after many closed openers is looked for once, not once per opener", () => {
     // 1.5 MB. A search for the `[` from every opener reads about 10^11
-    // characters here; looked for once, the searches read about the
-    // document's length.
+    // characters here, whatever it is spelled with; looked for once, all
+    // the parser's searches, its own regular-expression scans included,
+    // read about three times the document's length.
     const doc = `<r>${"<!DOCTYPE>".repeat(150_000)}</r><!-- [ -->`;
     const { value, searched } = charactersSearched(() => parseXml(doc));
     expect(value.name).toBe("r");
-    expect(searched).toBeLessThan(4 * doc.length);
+    expect(searched).toBeLessThan(10 * doc.length);
   }, 20_000);
 
   test.each([
