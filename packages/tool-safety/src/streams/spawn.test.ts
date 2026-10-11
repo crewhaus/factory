@@ -129,8 +129,10 @@ describe.if(posix)("spawnBounded", () => {
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toBe("line the caller needs\n");
       // Not "ok with empty output": the text is there, and it says it may not be all.
+      // That is also what shows the call did not wait for the grandchild, not a
+      // clock: waiting would have read its pipe to the end, and called it complete.
       expect(r.outputComplete).toBe(false);
-      expect(r.durationMs).toBeLessThan(4_000);
+      expect(r.timedOut).toBe(false);
     } finally {
       killGroup(r.pid);
     }
