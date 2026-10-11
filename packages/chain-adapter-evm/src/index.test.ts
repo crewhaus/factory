@@ -349,23 +349,32 @@ describe("a read is bounded in time and in bytes (C041)", () => {
   const never = (): Promise<string> => new Promise(() => {});
 
   /**
-   * Run `body` with the clock (`Date.now`) standing still and every timer of
-   * a second or more held: armed, never scheduled. The test reads the delays
+   * Run `body` with both clocks a hedge's share could be measured on
+   * (`Date.now` and `performance.now`) standing still, and every timer of a
+   * second or more held: armed, never scheduled. The test reads the delays
    * they were armed with and fires them itself, so a fallback hedge goes off
    * when the test says, not when a runner's clock gets there. Shorter timers
    * run as usual; a held timer that is cleared is dropped, as a real one
    * would be.
+   *
+   * `body` and this helper are synchronous, so every global is restored
+   * before the test awaits anything: the body returns the read in a box,
+   * and the test awaits it after. A body that returns a promise (an async
+   * one) is refused. A read awaited in here that never settles would leave
+   * the clocks frozen and the timers held for every later test in the
+   * process, because bun abandons a test that runs past its budget and this
+   * `finally` never runs.
    */
-  async function withHedgesHeld<T>(
-    body: (hedges: { readonly armed: readonly number[]; fire: () => void }) => Promise<T>,
-  ): Promise<T> {
+  function withHedgesHeld<T>(
+    body: (hedges: { readonly armed: readonly number[]; fire: () => void }) => T,
+  ): T {
     const realSetTimeout = globalThis.setTimeout;
     const realClearTimeout = globalThis.clearTimeout;
     const armed: number[] = [];
     const held = new Map<object, () => void>();
     const ours = new WeakSet<object>();
-    const frozen = Date.now();
-    const clock = spyOn(Date, "now").mockReturnValue(frozen);
+    const clock = spyOn(Date, "now").mockReturnValue(Date.now());
+    const monotonic = spyOn(performance, "now").mockReturnValue(performance.now());
     const arm = spyOn(globalThis, "setTimeout").mockImplementation(((
       fn: (...args: unknown[]) => void,
       delay?: number,
@@ -383,7 +392,7 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       else realClearTimeout(handle as Parameters<typeof clearTimeout>[0]);
     }) as typeof clearTimeout);
     try {
-      return await body({
+      const boxed = body({
         armed,
         fire: () => {
           const due = [...held.values()];
@@ -391,9 +400,14 @@ describe("a read is bounded in time and in bytes (C041)", () => {
           for (const run of due) run();
         },
       });
+      if (typeof (boxed as { then?: unknown } | undefined)?.then === "function") {
+        throw new TypeError("withHedgesHeld: return the read in a box and await it after");
+      }
+      return boxed;
     } finally {
       disarm.mockRestore();
       arm.mockRestore();
+      monotonic.mockRestore();
       clock.mockRestore();
     }
   }
@@ -417,15 +431,16 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       },
       fetchImpl,
     );
-    await withHedgesHeld(async (hedges) => {
+    const { read } = withHedgesHeld((hedges) => {
       const read = adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 60_000 });
       // The primary alone, with its share (what is left, split between it
       // and the one URL after it) before the secondary is asked.
       expect(asked).toEqual(["https://primary.test"]);
       expect(hedges.armed).toEqual([30_000]);
       hedges.fire();
-      expect(await read).toBe("0x1234");
+      return { read };
     });
+    expect(await read).toBe("0x1234");
     expect(asked).toEqual(["https://primary.test", "https://secondary.test"]);
     // The stalled primary is closed once the secondary has answered.
     expect(signals.get("https://primary.test")?.aborted).toBe(true);
@@ -455,15 +470,18 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       fetchImpl,
     );
     // The hedge is the test's to fire, as above.
-    await withHedgesHeld(async (hedges) => {
+    const { read } = withHedgesHeld((hedges) => {
       const read = adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 60_000 });
       expect(hedges.armed).toEqual([30_000]);
       hedges.fire();
-      expect(await read).toBe("0xslow");
+      // Asking the secondary did not close the slow primary.
+      expect(signals.get("https://primary.test")?.aborted).toBe(false);
+      return { read };
     });
+    expect(await read).toBe("0xslow");
     expect(asked).toEqual(["https://primary.test", "https://secondary.test"]);
+    // The answer closes the secondary, not the primary that gave it.
     expect(signals.get("https://secondary.test")?.aborted).toBe(true);
-    // Asking the secondary did not close the slow primary.
     expect(signals.get("https://primary.test")?.aborted).toBe(false);
   });
 
