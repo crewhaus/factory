@@ -11,9 +11,19 @@
  * The production fetcher is driven against a real local server. It is on
  * loopback, which the SSRF guard refuses, so a public-looking name resolves
  * to a public-looking address and a wrapper around globalThis.fetch dials
- * loopback instead, passing the tool's init through untouched.
+ * loopback instead, passing the tool's init through untouched, and counts
+ * what the runtime delivered for the bomb.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import { createGzip, gzipSync } from "node:zlib";
 import {
   _resetWebFetchConfig,
@@ -40,16 +50,13 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(parts));
 }
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
-
 describe("WebFetch through the production fetcher (C093)", () => {
   let bomb: Uint8Array;
   let server: ReturnType<typeof Bun.serve>;
   let acceptEncodings: Array<string | null> = [];
   let inits: Array<Record<string, unknown> | undefined> = [];
+  /** Bytes the runtime delivered for each /bomb response, read to its end. */
+  let delivered: number[] = [];
   const realFetch = globalThis.fetch;
 
   beforeAll(async () => {
@@ -102,15 +109,29 @@ describe("WebFetch through the production fetcher (C093)", () => {
   beforeEach(() => {
     acceptEncodings = [];
     inits = [];
+    delivered = [];
     _resetWebFetchConfig();
     _setRawFetch(undefined);
     _setDnsLookup(async () => ({ address: PUBLIC_IP, family: 4 }));
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       inits.push(init as Record<string, unknown> | undefined);
-      if (input instanceof Request) {
-        return realFetch(new Request(input.url.replace(PUBLIC_IP, "127.0.0.1"), input), init);
-      }
-      return realFetch(String(input).replace(PUBLIC_IP, "127.0.0.1"), init);
+      const url = (input instanceof Request ? input.url : String(input)).replace(
+        PUBLIC_IP,
+        "127.0.0.1",
+      );
+      const res = await realFetch(input instanceof Request ? new Request(url, input) : url, init);
+      if (new URL(url).pathname !== "/bomb") return res;
+      // Read to the end before the tool sees it, and count: the page as sent
+      // when the tool asked for it raw, the whole inflated page when it did
+      // not. A constructed Response is never decoded, so the tool reads
+      // exactly these bytes.
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      delivered.push(bytes.byteLength);
+      return new Response(bytes, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
     }) as typeof globalThis.fetch;
   });
 
@@ -125,11 +146,11 @@ describe("WebFetch through the production fetcher (C093)", () => {
     ["an IP-literal URL", PUBLIC_IP],
   ] as const) {
     test(`through ${branch}, a 256 MiB gzip page is refused at the cap without being inflated`, async () => {
-      const before = rssNow();
       await expect(
         webFetch.execute({ url: `http://${host}:${server.port}/bomb` }, {} as never),
       ).rejects.toThrow(/exceeded 5242880 bytes/);
-      expect(rssNow() - before).toBeLessThan(64 * 1024 * 1024);
+      // The page as sent, about 260 KB; inflated by the runtime, 256 MiB.
+      expect(delivered).toEqual([bomb.byteLength]);
       expect(inits).toHaveLength(1);
       expect(inits[0]?.["decompress"]).toBe(false);
       expect(acceptEncodings).toEqual(["identity"]);
@@ -161,15 +182,74 @@ describe("WebFetch through the production fetcher (C093)", () => {
   });
 
   test("the deadline covers the body: a server that sends the head and stalls is stopped", async () => {
-    // Generous next to a loopback head (milliseconds), and far short of the
-    // test's budget; 0.7.0 cleared the deadline once the head arrived, so
-    // the read waited for ever.
-    _setTimeoutMsForTest(2_000);
-    const started = performance.now();
-    await expect(
-      webFetch.execute({ url: `http://site.example.test:${server.port}/drip` }, {} as never),
-    ).rejects.toThrow();
-    expect(performance.now() - started).toBeLessThan(10_000);
+    // The call's deadline timer is held, and fired by hand at the moment the
+    // tool, holding the head and the first chunk, asks for more body than
+    // the server sends: so it lands in the body however fast or slow the
+    // runner, and the test does not wait it out. 0.7.0 cleared the deadline
+    // once the head arrived and the read waited for ever; a cleared timer
+    // is not fired, the call is ended through its own signal instead, and
+    // the test fails on the reason rather than on its budget.
+    const DEADLINE_MS = 2_345; // a delay nothing else here schedules
+    _setTimeoutMsForTest(DEADLINE_MS);
+    const HELD = Symbol("held") as unknown as ReturnType<typeof setTimeout>;
+    const timer: { fire?: () => void; cleared: boolean } = { cleared: false };
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (delay !== DEADLINE_MS) return realSetTimeout(fn, delay, ...rest);
+      timer.fire = () => fn(...rest);
+      return HELD;
+    }) as typeof setTimeout);
+    const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      if (id === HELD) timer.cleared = true;
+      else realClearTimeout(id);
+    }) as typeof clearTimeout);
+    const runtime = new AbortController();
+    let stalls = 0;
+    const dial = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await dial(input, init);
+      if (res.body === null) return res;
+      const source = res.body.getReader();
+      let reads = 0;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            reads += 1;
+            if (reads > 1 && stalls === 0) {
+              // The server sent one chunk and will send nothing more.
+              stalls += 1;
+              if (timer.fire !== undefined && !timer.cleared) timer.fire();
+              else runtime.abort(new Error("the deadline was cleared before the body was read"));
+            }
+            const next = await source.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          },
+          cancel: (reason) => source.cancel(reason),
+        },
+        // Pulled only when the tool reads, so the second pull is the stall.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { status: res.status, headers: res.headers });
+    }) as typeof globalThis.fetch;
+    try {
+      await expect(
+        webFetch.execute({ url: `http://site.example.test:${server.port}/drip` }, {
+          signal: runtime.signal,
+        } as never),
+      ).rejects.toThrow(`the request timed out after ${DEADLINE_MS}ms`);
+      expect(stalls).toBe(1);
+    } finally {
+      held.mockRestore();
+      cleared.mockRestore();
+    }
   }, 20_000);
 });
 
