@@ -315,23 +315,69 @@ describe("ArchiveExtract has a byte ceiling, and the listing is the extractor's 
     expect(existsSync(path.join(ws, "out/zeros.bin"))).toBe(false);
   });
 
-  test("the size watch fires once a tree passes its budget", async () => {
+  /**
+   * Run `body` with setTimeout and clearTimeout held: a timer it arms is
+   * recorded, never scheduled, so the test fires each check itself and no
+   * runner's speed decides how many ran. Both are put back before this
+   * returns.
+   */
+  function holdingTimers<T>(body: () => T): {
+    value: T;
+    armed: Array<{ fire: () => void; delay: number | undefined }>;
+    cleared: number;
+  } {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const armed: Array<{ fire: () => void; delay: number | undefined }> = [];
+    let cleared = 0;
+    globalThis.setTimeout = ((fire: () => void, delay?: number) => {
+      armed.push({ fire, delay });
+      return { held: armed.length } as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = (() => {
+      cleared += 1;
+    }) as typeof clearTimeout;
+    try {
+      const value = body();
+      return { value, armed, cleared };
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  }
+
+  test("the size watch fires once a tree passes its budget", () => {
+    // Its checks are fired from here, not waited for. Waiting 40 ms for
+    // "several intervals" counted none on a runner too slow to fit one in,
+    // and then "quiet" held vacuously.
     const dir = path.join(ws, "growing");
     mkdirSync(dir);
     writeFileSync(path.join(dir, "a"), "x".repeat(600));
     expect(measureTree(dir)).toBe(600);
-    const watch = watchTreeSize(dir, 500, 5);
-    await new Promise<void>((resolve) => {
-      if (watch.signal.aborted) resolve();
-      else watch.signal.addEventListener("abort", () => resolve());
-    });
-    watch.stop();
+    const over = holdingTimers(() => watchTreeSize(dir, 500, 5));
+    const watch = over.value;
+    expect(over.armed.map((t) => t.delay)).toEqual([5]);
+    expect(watch.signal.aborted).toBe(false);
+    const fired = holdingTimers(() => over.armed[0]?.fire());
+    expect(watch.signal.aborted).toBe(true);
     expect(watch.exceeded()).toBe(true);
-    // Under budget, it stays quiet for several intervals.
-    const quiet = watchTreeSize(dir, 10_000, 5);
-    await Bun.sleep(40);
-    quiet.stop();
-    expect(quiet.exceeded()).toBe(false);
+    expect(fired.armed).toEqual([]); // once fired, it checks no more
+    holdingTimers(() => watch.stop());
+    // Under budget, it stays quiet for several intervals: each check finds
+    // 600 bytes and arms exactly one more.
+    const quiet = holdingTimers(() => watchTreeSize(dir, 10_000, 5));
+    let next = quiet.armed;
+    for (let check = 0; check < 5; check++) {
+      expect(next).toHaveLength(1);
+      next = holdingTimers(() => next[0]?.fire()).armed;
+    }
+    expect(next).toHaveLength(1);
+    expect(quiet.value.exceeded()).toBe(false);
+    expect(quiet.value.signal.aborted).toBe(false);
+    // Stopping clears the pending check, and one that fires anyway is a no-op.
+    expect(holdingTimers(() => quiet.value.stop()).cleared).toBe(1);
+    expect(holdingTimers(() => next[0]?.fire()).armed).toEqual([]);
+    expect(quiet.value.exceeded()).toBe(false);
   });
 
   // gzip(tar[a.txt] without its end marker) + gzip(tar[keep/other.txt]):
