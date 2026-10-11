@@ -9,15 +9,23 @@
  * the line and code-span lookups rescanned per hit. AcceptanceCheck and the
  * Golden tools ran the caller's own regex with a plain `RegExp`.
  *
- * The timed tests use inputs 0.7.0 needed seconds for and the new code needs
- * milliseconds for, and allow a second: that holds on a runner twenty times
- * slower. Each carries a budget, because on 0.7.0 they run long.
+ * The linear tests count the readers' work instead of timing it: every
+ * pattern's backtracking steps (__test__/regex-work.ts), and the characters
+ * the string methods copy or search and the elements the array searches
+ * visit (__test__/js-work.ts). The readers take at most 45 steps, and under
+ * 3 of the rest, a character of input. 0.7.0's work per character grew with
+ * the input, so most inputs here are a tenth of the size it needed seconds
+ * for, which still leaves each of its defects more than ten times over the
+ * bound. A count past its bound stops the reader there and reads as
+ * Infinity, so a quadratic reader fails at once rather than in minutes.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { markdownOutline } from "@crewhaus/tool-text";
+import { type JsWork, jsWork, jsWorkAsync } from "./__test__/js-work";
+import { type RegexWork, regexWork, regexWorkAsync } from "./__test__/regex-work";
 import {
   type VERIFY_TOOLS,
   acceptanceCheck,
@@ -55,11 +63,33 @@ afterEach(() => {
   rmSync(workspace, { recursive: true, force: true });
 });
 
-function within<T>(ms: number, run: () => T): T {
-  const t0 = performance.now();
-  const out = run();
-  expect(performance.now() - t0).toBeLessThan(ms);
-  return out;
+/** Backtracking steps a reader may take per character of input; 45 at most here. */
+const STEPS_PER_CHARACTER = 128;
+/** Characters copied or searched, and elements visited, per character; under 3 here. */
+const WORK_PER_CHARACTER = 8;
+
+/** What `run` returns, once its work on `size` characters of input is shown linear. */
+function linear<T>(size: number, run: () => T): T {
+  return linearIn(
+    size,
+    regexWork(STEPS_PER_CHARACTER * size, () => jsWork(WORK_PER_CHARACTER * size, run)),
+  );
+}
+
+async function linearAsync<T>(size: number, run: () => Promise<T>): Promise<T> {
+  return linearIn(
+    size,
+    await regexWorkAsync(STEPS_PER_CHARACTER * size, () =>
+      jsWorkAsync(WORK_PER_CHARACTER * size, run),
+    ),
+  );
+}
+
+function linearIn<T>(size: number, counted: RegexWork<JsWork<T>>): T {
+  expect(counted.unmodelled).toEqual([]);
+  expect(counted.steps).toBeLessThanOrEqual(STEPS_PER_CHARACTER * size);
+  expect(counted.value?.work).toBeLessThanOrEqual(WORK_PER_CHARACTER * size);
+  return counted.value?.value as T;
 }
 
 /** 0.7.0's heading reader, as the parity oracle. */
@@ -79,7 +109,8 @@ function oldAnchors(text: string): string[] {
 describe("the Markdown readers do linear work", () => {
   test("a heading with a long run of spaces", () => {
     // 0.7.0: 6.7 s for this one line.
-    const anchors = within(1_000, () => headingAnchors(`# a${" ".repeat(3_000)}b\n`));
+    const line = `# a${" ".repeat(3_000)}b\n`;
+    const anchors = linear(line.length, () => headingAnchors(line));
     expect(anchors.has("a-b")).toBe(true);
   }, 60_000);
 
@@ -110,33 +141,41 @@ describe("the Markdown readers do linear work", () => {
   });
 
   test("splitting sentences, and a run of punctuation", () => {
-    // 0.7.0: 6.3 s for the first, and quadratic in the run for the second.
-    const text = "ab. ".repeat(30_000).trimEnd();
-    expect(within(1_000, () => splitSentences(text))).toHaveLength(30_000);
-    within(1_000, () => splitSentences(`${"!".repeat(60_000)}x`));
-    within(1_000, () => splitSentences(`${".".repeat(60_000)}x`));
+    // 0.7.0: 6.3 s for ten times as many sentences, and quadratic in the run.
+    const text = "ab. ".repeat(3_000).trimEnd();
+    expect(linear(text.length, () => splitSentences(text))).toHaveLength(3_000);
+    for (const run of [`${"!".repeat(6_000)}x`, `${".".repeat(6_000)}x`]) {
+      expect(linear(run.length, () => splitSentences(run))).toEqual([
+        { start: 0, end: run.length },
+      ]);
+    }
     // The abbreviation and initial rules still hold.
     const parts = splitSentences("See e.g. the list. J. Smith agreed. Done.");
     expect(parts).toHaveLength(3);
   }, 60_000);
 
   test("many links, many code spans, many markers", () => {
-    // 0.7.0: 9.3 s for the links, from a line lookup that rescanned the text.
-    const links = within(1_000, () => extractMarkdownLinks("[a](x)\n".repeat(40_000)));
-    expect(links).toHaveLength(40_000);
-    expect(links.at(-1)?.line).toBe(40_000);
-    const spanned = within(1_000, () => extractMarkdownLinks("`c` [a](x)\n".repeat(20_000)));
-    expect(spanned).toHaveLength(20_000);
-    const claims = within(1_000, () => citedClaims("Claim [1]. ".repeat(20_000)));
-    expect(claims).toHaveLength(20_000);
+    // 0.7.0: 9.3 s for ten times as many links, from a line lookup that
+    // rescanned the text; each hit was also tested against every code span.
+    const many = "[a](x)\n".repeat(4_000);
+    const links = linear(many.length, () => extractMarkdownLinks(many));
+    expect(links).toHaveLength(4_000);
+    expect(links.at(-1)?.line).toBe(4_000);
+    const coded = "`c` [a](x)\n".repeat(2_000);
+    const spanned = linear(coded.length, () => extractMarkdownLinks(coded));
+    expect(spanned).toHaveLength(2_000);
+    const cited = "Claim [1]. ".repeat(2_000);
+    const claims = linear(cited.length, () => citedClaims(cited));
+    expect(claims).toHaveLength(2_000);
     expect(lintCitations("A [1].\n\n[1]: ./x.md\n").ok).toBe(true);
   }, 60_000);
 
   test("runs of openers do not make every opener rescan to the end", () => {
-    within(1_000, () => extractMarkdownLinks("[".repeat(400_000)));
-    within(1_000, () => extractMarkdownLinks("<a".repeat(200_000)));
-    within(1_000, () => headingAnchors("<a".repeat(200_000)));
-    within(1_000, () => extractMarkdownLinks("[x\n".repeat(100_000)));
+    for (const text of ["[".repeat(40_000), "<a".repeat(20_000), "[x\n".repeat(10_000)]) {
+      expect(linear(text.length, () => extractMarkdownLinks(text))).toEqual([]);
+    }
+    const openers = "<a".repeat(20_000);
+    expect(linear(openers.length, () => headingAnchors(openers)).size).toBe(0);
     // Link text holding a bracket still yields its link.
     expect(extractMarkdownLinks("[a [b](url)")[0]?.href).toBe("url");
   }, 60_000);
@@ -144,64 +183,66 @@ describe("the Markdown readers do linear work", () => {
   test("a link opener followed by a long run of spaces, or by more openers", () => {
     // Whitespace before the destination, before the title and before the `)`
     // competed for one run of spaces: 40 000 took 2.2 s on the fix round's
-    // pattern, and 100 000 about fourteen.
-    expect(within(1_000, () => extractMarkdownLinks(`[](${" ".repeat(100_000)}`))).toEqual([]);
-    expect(within(1_000, () => extractMarkdownLinks(`[](${" ".repeat(100_000)}x)`))).toHaveLength(
-      1,
-    );
+    // pattern, and 100 000 (ten times the run here) about fourteen.
+    const unclosed = `[](${" ".repeat(10_000)}`;
+    expect(linear(unclosed.length, () => extractMarkdownLinks(unclosed))).toEqual([]);
+    const closed = `[](${" ".repeat(10_000)}x)`;
+    expect(linear(closed.length, () => extractMarkdownLinks(closed))).toHaveLength(1);
     // A destination run that reaches into the next opener, from every opener.
-    within(1_000, () => extractMarkdownLinks("[](x".repeat(100_000)));
-    within(1_000, () => extractMarkdownLinks(`[](${"x".repeat(100_000)}`));
-    within(1_000, () => extractMarkdownLinks('[](x "'.repeat(50_000)));
+    for (const text of [
+      "[](x".repeat(10_000),
+      `[](${"x".repeat(10_000)}`,
+      '[](x "'.repeat(5_000),
+    ]) {
+      expect(linear(text.length, () => extractMarkdownLinks(text))).toEqual([]);
+    }
     // Each claim sentence loses its links by the same reader, not a pattern
     // that let every `[](` read to the end of the line.
-    const claims = within(1_000, () => citedClaims(`Claim [^1] ${"[](".repeat(60_000)}\n`));
+    const sentence = `Claim [^1] ${"[](".repeat(6_000)}\n`;
+    const claims = linear(sentence.length, () => citedClaims(sentence));
     expect(claims).toHaveLength(1);
   }, 60_000);
 
   test("MarkdownLinkCheck and FactCrossCheck over openers and spaces", async () => {
-    // 4.8 s on 0.7.0 and 6.7 s on the fix round for this README.
-    writeFileSync(join(workspace, "README.md"), `# Title\n\nSee [](${" ".repeat(60_000)}\n`);
-    let t0 = performance.now();
-    const links = JSON.parse(await raw(markdownLinkCheck, {}));
-    expect(performance.now() - t0).toBeLessThan(2_000);
+    // 4.8 s on 0.7.0 and 6.7 s on the fix round for this README with ten
+    // times the spaces.
+    const readme = `# Title\n\nSee [](${" ".repeat(6_000)}\n`;
+    writeFileSync(join(workspace, "README.md"), readme);
+    const links = JSON.parse(await linearAsync(readme.length, () => raw(markdownLinkCheck, {})));
     expect(links).toMatchObject({ ok: true, documents: 1, linksChecked: 0 });
-    // 9 s on the fix round: 180 KB of `[](` in one cited sentence.
+    // 9 s on the fix round: 180 KB of `[](` in one cited sentence (18 KB here).
     writeFileSync(join(workspace, "src.md"), "Claim\n");
-    t0 = performance.now();
-    const facts = JSON.parse(
-      await raw(factCrossCheck, {
-        text: `Claim [^1] ${"[](".repeat(60_000)}\n\n[^1]: src.md\n`,
-      }),
-    );
-    expect(performance.now() - t0).toBeLessThan(2_000);
+    const text = `Claim [^1] ${"[](".repeat(6_000)}\n\n[^1]: src.md\n`;
+    const facts = JSON.parse(await linearAsync(text.length, () => raw(factCrossCheck, { text })));
     expect(facts).toMatchObject({ checked: 1, claimsFound: 1 });
   }, 60_000);
 
   test("trailing whitespace is found without retrying every space", async () => {
-    const t0 = performance.now();
-    const out = await normalizeOutput(`${" ".repeat(100_000)}x  \nb`, {
-      apply: ["trailingWhitespace"],
-    });
-    expect(performance.now() - t0).toBeLessThan(1_000);
+    const text = `${" ".repeat(100_000)}x  \nb`;
+    const out = await linearAsync(text.length, () =>
+      normalizeOutput(text, { apply: ["trailingWhitespace"] }),
+    );
     expect(out.text).toBe(`${" ".repeat(100_000)}x\nb`);
   }, 60_000);
 
   test("MarkdownLinkCheck with anchors over a README with a long heading", async () => {
-    writeFileSync(join(workspace, "README.md"), `# x\n\n## a${" ".repeat(2_000)}b\n`);
-    writeFileSync(join(workspace, "index.md"), "[r](README.md#x)\n".repeat(50));
-    const t0 = performance.now();
-    const out = JSON.parse(await raw(markdownLinkCheck, { path: ".", checkAnchors: true }));
-    expect(performance.now() - t0).toBeLessThan(2_000);
+    const readme = `# x\n\n## a${" ".repeat(2_000)}b\n`;
+    const index = "[r](README.md#x)\n".repeat(50);
+    writeFileSync(join(workspace, "README.md"), readme);
+    writeFileSync(join(workspace, "index.md"), index);
+    const out = JSON.parse(
+      await linearAsync(readme.length + index.length, () =>
+        raw(markdownLinkCheck, { path: ".", checkAnchors: true }),
+      ),
+    );
     expect(out).toMatchObject({ ok: true, linksChecked: 50 });
   }, 60_000);
 
   test("MarkdownOutline reads the same headings, linearly", async () => {
-    const t0 = performance.now();
+    const text = `# a${" ".repeat(3_000)}b`;
     const out = JSON.parse(
-      (await markdownOutline.execute({ text: `# a${" ".repeat(3_000)}b` }, ctx)) as string,
+      (await linearAsync(text.length, () => markdownOutline.execute({ text }, ctx))) as string,
     );
-    expect(performance.now() - t0).toBeLessThan(1_000);
     expect(out.headings[0].title).toMatch(/^a +b$/);
     const titles = JSON.parse(
       (await markdownOutline.execute(
