@@ -28,7 +28,8 @@ import { parseToUnicodeCMap } from "./lib/pdf-text";
  * or longer on every hostile input here, on a fast Mac, while the scans take
  * at most about 10 ms an input (CI, under the whole suite, has taken
  * 17-620 ms for a whole test): no runner is slow enough to reach the bound
- * with the fix in place, and 0.7.0 cannot get under it.
+ * with the fix in place, and 0.7.0 cannot get under it. Each of these tests
+ * declares a 20 s budget, so this bound decides, not bun's 5 s default.
  */
 const HANG_MS = 5_000;
 
@@ -138,7 +139,8 @@ describe("stripHtml", () => {
       compared += 1;
     }
     expect(compared).toBe(5_000);
-  });
+    // Slow by construction: 5 000 comparisons took up to 436 ms on CI.
+  }, 20_000);
 
   test("keeps the documented cases", () => {
     expect(stripHtml("<p>one</p><p>two &amp; three</p>")).toBe("one\ntwo & three");
@@ -157,6 +159,10 @@ describe("stripHtml", () => {
     // sizes, so the old code would take minutes to hours on each. Each input
     // is timed on its own: one bound covers one input, not the seven, and
     // the budget keeps bun's 5 s default from bounding all seven at once.
+    // That is a deliberate trade: the seven together may now take up to the
+    // 20 s budget, where they had 5 s, so a slowdown spread thinly across
+    // them is caught later. A quadratic scan is not thin: it takes a minute
+    // or more on any one of them.
     const inputs = [
       "<".repeat(400_000),
       "<style".repeat(200_000),
@@ -188,7 +194,7 @@ describe("stripHtml", () => {
     expect(performance.now() - started).toBeLessThan(HANG_MS);
     // No `>` anywhere, so no tag: the text is the text.
     expect(out.startsWith("<style<style")).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("tidyLines", () => {
@@ -227,7 +233,7 @@ describe("parseAddressList", () => {
     const started = performance.now();
     parseAddressList("<".repeat(400_000), new Set());
     expect(performance.now() - started).toBeLessThan(HANG_MS);
-  });
+  }, 20_000);
 });
 
 describe("parseMailDate's comment strip (bounds review)", () => {
@@ -255,7 +261,7 @@ describe("parseMailDate's comment strip (bounds review)", () => {
     const out = JSON.parse(String(await emlParse.execute({ content: message }, {} as never)));
     expect(out.date).toBeUndefined();
     expect(performance.now() - started).toBeLessThan(HANG_MS);
-  });
+  }, 20_000);
 });
 
 describe("parseToUnicodeCMap", () => {
@@ -282,7 +288,7 @@ describe("parseToUnicodeCMap", () => {
     parseToUnicodeCMap("beginbfrange ".repeat(400_000));
     parseToUnicodeCMap(`beginbfrange ${"<1> <2> [".repeat(200_000)} endbfrange`);
     expect(performance.now() - started).toBeLessThan(HANG_MS);
-  });
+  }, 20_000);
 
   test("refuses ranges that expand past sixteen 2-byte code spaces", () => {
     // 8 KB of full-width ranges was 0.8 s of map writes; 1 MB was minutes.
@@ -295,5 +301,5 @@ describe("parseToUnicodeCMap", () => {
     // Slow by construction: the cap is sixteen full code spaces, so each
     // call writes 1 048 576 map entries before it answers. That is about
     // 75 ms here and took up to 2.9 s on CI, over half bun's 5 s default.
-  }, 10_000);
+  }, 20_000);
 });
