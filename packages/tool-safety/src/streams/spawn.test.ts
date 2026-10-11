@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,9 @@ afterAll(() => {
 const posix = process.platform !== "win32";
 
 function alive(pid: number): boolean {
+  // 0 and negative numbers name process groups: alive(0) asked about the
+  // runner's own group, which always answered "alive".
+  if (!Number.isInteger(pid) || pid <= 0) throw new RangeError(`not a pid: ${pid}`);
   try {
     process.kill(pid, 0);
     return true;
@@ -42,6 +45,77 @@ async function firesWithin(signal: AbortSignal, ms: number): Promise<boolean> {
     await Bun.sleep(20);
   }
   return signal.aborted;
+}
+
+/**
+ * Runs `run` with spawnBounded's deadline held: the first timer armed for
+ * exactly `ms` milliseconds is never scheduled, and fires only when the test
+ * calls `fire` — once the child has printed what the test checks (its pid, a
+ * line, a flood past the cap). Every other timer runs as usual. So the kill
+ * lands after the child started on any runner. A real 300-500 ms deadline
+ * raced the start instead: a child that took 300 ms to start was killed
+ * before its first line. `fire` hands the timer's callback to a microtask,
+ * outside the chunk hook, where a throw would be swallowed.
+ */
+async function withHeldDeadline<T>(
+  ms: number,
+  run: (fire: () => void) => Promise<T>,
+): Promise<{ r: T; fired: boolean; problem?: string }> {
+  const HELD = Symbol("held deadline") as unknown as ReturnType<typeof setTimeout>;
+  const deadline: { callback?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+    cleared: false,
+    fired: false,
+  };
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== ms || deadline.callback !== undefined) return realSetTimeout(fn, delay, ...rest);
+    deadline.callback = () => fn(...rest);
+    return HELD;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (id === HELD) deadline.cleared = true;
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const fire = (): void => {
+    if (deadline.fired) return;
+    deadline.fired = true;
+    const callback = deadline.callback;
+    if (callback === undefined || deadline.cleared) {
+      deadline.problem = "the deadline was not armed while the child ran";
+      return;
+    }
+    queueMicrotask(callback);
+  };
+  try {
+    const r = await run(fire);
+    return {
+      r,
+      fired: deadline.fired,
+      ...(deadline.problem === undefined ? {} : { problem: deadline.problem }),
+    };
+  } finally {
+    held.mockRestore();
+    cleared.mockRestore();
+  }
+}
+
+/** Collects a stream's text; `push` says whether a whole line has arrived yet. */
+function lineWatch(): { push: (chunk: Uint8Array) => boolean } {
+  let text = "";
+  const decoder = new TextDecoder();
+  return {
+    push: (chunk) => {
+      text += decoder.decode(chunk, { stream: true });
+      return text.includes("\n");
+    },
+  };
 }
 
 function killGroup(pid: number | undefined): void {
@@ -74,17 +148,28 @@ describe.if(posix)("spawnBounded", () => {
   }, 20_000);
 
   test("security-8#7: a flood is capped as it arrives and reported truncated, not empty", async () => {
-    const r = await spawnBounded({
-      cmd: ["yes"],
-      timeoutMs: 300,
-      maxStdoutBytes: 64 * 1024,
-      maxStderrBytes: 1_024,
-    });
+    // The deadline fires once 1 MiB, 16 times the cap, has arrived: the
+    // flood has passed the cap many times over before the kill, on any
+    // runner. A real 300 ms raced `yes`'s start and could land before the cap.
+    const CAP = 64 * 1024;
+    const FLOOD = 1024 * 1024;
+    const { r, fired, problem } = await withHeldDeadline(300, (fire) =>
+      spawnBounded({
+        cmd: ["yes"],
+        timeoutMs: 300,
+        maxStdoutBytes: CAP,
+        maxStderrBytes: 1_024,
+        onStdoutChunk: (_chunk, total) => {
+          if (total >= FLOOD) fire();
+        },
+      }),
+    );
+    expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
     expect(r.timedOut).toBe(true);
     expect(r.stdoutTruncated).toBe(true);
-    expect(r.stdout.length).toBe(64 * 1024);
+    expect(r.stdout.length).toBe(CAP);
     expect(r.stdout.startsWith("y\ny\n")).toBe(true);
-    expect(r.stdoutBytes).toBeGreaterThan(64 * 1024);
+    expect(r.stdoutBytes).toBeGreaterThanOrEqual(FLOOD);
     expect(r.exitCode).toBeNull();
     expect(r.signal).not.toBeNull();
   }, 30_000);
@@ -139,15 +224,23 @@ describe.if(posix)("spawnBounded", () => {
   }, 30_000);
 
   test("a timeout kills the whole process group, not just the child", async () => {
-    const r = await spawnBounded({
-      cmd: ["sh", "-c", "sleep 30 & echo $!; wait"],
-      timeoutMs: 500,
-      maxStdoutBytes: 1_000,
-      maxStderrBytes: 1_000,
-      killGraceMs: 500,
-    });
+    // The deadline fires once the shell has printed its grandchild's pid.
+    const printed = lineWatch();
+    const { r, fired, problem } = await withHeldDeadline(500, (fire) =>
+      spawnBounded({
+        cmd: ["sh", "-c", "sleep 30 & echo $!; wait"],
+        timeoutMs: 500,
+        maxStdoutBytes: 1_000,
+        maxStderrBytes: 1_000,
+        killGraceMs: 500,
+        onStdoutChunk: (chunk) => {
+          if (printed.push(chunk)) fire();
+        },
+      }),
+    );
     const grandchild = Number(r.stdout.trim());
     try {
+      expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
       expect(r.timedOut).toBe(true);
       expect(Number.isInteger(grandchild) && grandchild > 0).toBe(true);
       expect(await waitGone(grandchild, 10_000)).toBe(true);
@@ -212,17 +305,30 @@ describe.if(posix)("spawnBounded", () => {
   test("a SIGTERM-ignoring member of the group still gets SIGKILL after the child itself exits", async () => {
     // The child execs `sleep`, which dies of the SIGTERM at once; the helper
     // it started ignores SIGTERM and holds stdout. SIGKILL used to be
-    // cancelled the moment the child exited, and the helper lived on.
-    const r = await spawnBounded({
-      cmd: ["sh", "-c", `sh -c 'trap "" TERM; echo $$; while :; do sleep 1; done' & exec sleep 60`],
-      timeoutMs: 300,
-      maxStdoutBytes: 1_000,
-      maxStderrBytes: 1_000,
-      killGraceMs: 2_000,
-      drainGraceMs: 200,
-    });
+    // cancelled the moment the child exited, and the helper lived on. The
+    // deadline fires once the helper has printed its pid, which it does
+    // after it has started ignoring SIGTERM.
+    const printed = lineWatch();
+    const { r, fired, problem } = await withHeldDeadline(300, (fire) =>
+      spawnBounded({
+        cmd: [
+          "sh",
+          "-c",
+          `sh -c 'trap "" TERM; echo $$; while :; do sleep 1; done' & exec sleep 60`,
+        ],
+        timeoutMs: 300,
+        maxStdoutBytes: 1_000,
+        maxStderrBytes: 1_000,
+        killGraceMs: 2_000,
+        drainGraceMs: 200,
+        onStdoutChunk: (chunk) => {
+          if (printed.push(chunk)) fire();
+        },
+      }),
+    );
     const helper = Number(r.stdout.trim());
     try {
+      expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
       expect(r.timedOut).toBe(true);
       expect(r.signal).toBe("SIGTERM");
       expect(Number.isInteger(helper) && helper > 0).toBe(true);
@@ -315,42 +421,58 @@ describe.if(posix)("spawnBounded hooks", () => {
   /** A child that prints its pid first, so the chunk hook learns it. */
   const PID_THEN = (rest: string) => ["sh", "-c", `echo $$; ${rest}`];
 
+  /**
+   * With `deadlineMs`, that is the run's timeout, held and fired once the
+   * child's pid has arrived (see {@link withHeldDeadline}): the kill always
+   * finds a child the test knows. Without it, the run has 60 s.
+   */
   async function runWithHooks(
     extra: Partial<Parameters<typeof spawnBounded>[0]>,
     rest = "exec sleep 30",
+    deadlineMs?: number,
   ): Promise<{
     r: Awaited<ReturnType<typeof spawnBounded>>;
     reasons: string[];
     aliveAtKill: boolean[];
     pid: number;
+    fired: boolean;
+    problem?: string;
   }> {
     const reasons: string[] = [];
     const aliveAtKill: boolean[] = [];
     let pid = 0;
     let firstLine = "";
-    const r = await spawnBounded({
-      cmd: PID_THEN(rest),
-      timeoutMs: 60_000,
-      maxStdoutBytes: 1_000,
-      maxStderrBytes: 1_000,
-      killGraceMs: 500,
-      onStdoutChunk: (chunk) => {
-        if (pid !== 0) return;
-        firstLine += new TextDecoder().decode(chunk);
-        if (firstLine.includes("\n")) pid = Number(firstLine.split("\n")[0]);
-      },
-      onKill: (why) => {
-        reasons.push(why);
-        aliveAtKill.push(pid > 0 && alive(pid));
-      },
-      ...extra,
-    });
-    return { r, reasons, aliveAtKill, pid };
+    const run = (fire?: () => void) =>
+      spawnBounded({
+        cmd: PID_THEN(rest),
+        timeoutMs: deadlineMs ?? 60_000,
+        maxStdoutBytes: 1_000,
+        maxStderrBytes: 1_000,
+        killGraceMs: 500,
+        onStdoutChunk: (chunk) => {
+          if (pid !== 0) return;
+          firstLine += new TextDecoder().decode(chunk);
+          if (!firstLine.includes("\n")) return;
+          pid = Number(firstLine.split("\n")[0]);
+          fire?.();
+        },
+        onKill: (why) => {
+          reasons.push(why);
+          aliveAtKill.push(pid > 0 && alive(pid));
+        },
+        ...extra,
+      });
+    if (deadlineMs === undefined) {
+      return { r: await run(), reasons, aliveAtKill, pid, fired: false };
+    }
+    const { r, fired, problem } = await withHeldDeadline(deadlineMs, run);
+    return { r, reasons, aliveAtKill, pid, fired, ...(problem === undefined ? {} : { problem }) };
   }
 
   test("onKill is told the reason once, while the child is still there to stop", async () => {
-    const { r, reasons, aliveAtKill, pid } = await runWithHooks({ timeoutMs: 500 });
+    const { r, reasons, aliveAtKill, pid, fired, problem } = await runWithHooks({}, undefined, 500);
     try {
+      expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
       expect(r.timedOut).toBe(true);
       expect(reasons).toEqual(["timeout"]);
       expect(aliveAtKill).toEqual([true]);
@@ -387,13 +509,17 @@ describe.if(posix)("spawnBounded hooks", () => {
 
   test("an onKill that throws does not stop the kill", async () => {
     const t0 = performance.now();
-    const { r, pid } = await runWithHooks({
-      timeoutMs: 300,
-      onKill: () => {
-        throw new Error("hook broke");
+    const { r, pid, fired, problem } = await runWithHooks(
+      {
+        onKill: () => {
+          throw new Error("hook broke");
+        },
       },
-    });
+      undefined,
+      300,
+    );
     try {
+      expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
       expect(r.timedOut).toBe(true);
       expect(await waitGone(pid, 10_000)).toBe(true);
       expect(performance.now() - t0).toBeLessThan(20_000);
