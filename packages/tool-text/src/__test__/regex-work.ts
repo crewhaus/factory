@@ -22,12 +22,15 @@
  * Modelled: alternation, groups, lookahead, fixed-width lookbehind, greedy
  * and lazy `* + ? {n} {n,} {n,m}`, `^ $` (with `m`), `\b \B`, and any
  * one-character atom (`.`, a class, an escape, `\p{…}`) under `g i m s u y`.
- * A pattern using anything else (a back-reference, `v`), or a group
- * repeated so many times that the walk outgrows the stack, runs uncounted
- * and is listed in `unmodelled`, which a test asserts is empty. Where
- * JavaScriptCore departs from the specification (an empty iteration of a
- * nested quantified group, an anchor inside one, a lone surrogate under
- * `u`), the agreement check throws rather than count something else.
+ * A pattern using anything else (a back-reference, `v`) runs uncounted and
+ * is listed in `unmodelled`, which a test asserts is empty. A group repeated
+ * so many times that the walk outgrows the stack is listed there too, but
+ * is not run: that can be the exponential pattern a test is there to catch,
+ * which the engine takes seconds to give up on. The body stops there, as it
+ * does past `limit`. Where JavaScriptCore departs from the specification
+ * (an empty iteration of a nested quantified group, an anchor inside one, a
+ * lone surrogate under `u`), the agreement check throws rather than count
+ * something else.
  *
  * The same file is in tool-text, tool-verify and prompt-injection-detector;
  * keep the copies in step.
@@ -453,9 +456,12 @@ const matched: K = (j) => {
 };
 
 export type RegexWork<T> = {
-  /** What `body` returned; undefined when it was stopped past the limit. */
+  /** What `body` returned; undefined when it was stopped. */
   readonly value: T | undefined;
-  /** The steps the model took over every exec; Infinity once past the limit. */
+  /**
+   * The steps the model took over every exec; Infinity once stopped, past
+   * the limit or at a pattern too deep to walk (listed in `unmodelled`).
+   */
   readonly steps: number;
   /** How many times exec ran. */
   readonly execs: number;
@@ -505,11 +511,13 @@ function install(limit: number, meter: Meter): () => void {
       meter.steps = walk.steps;
       walk.input = "";
     }
-    const real = realExec.call(this, input);
     if (tooDeep) {
+      // Not run uncounted: see the header. The body stops here.
       meter.unmodelled.add(`/${this.source}/${this.flags}: nested deeper than the walk's stack`);
-      return real;
+      meter.over = true;
+      throw OVER;
     }
+    const real = realExec.call(this, input);
     const agrees =
       real === null
         ? found === null
