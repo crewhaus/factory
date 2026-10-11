@@ -414,6 +414,8 @@ describe("Glob tool", () => {
 });
 
 describe("Grep tool", () => {
+  beforeEach(() => holdGrepClock());
+
   test("returns path:line:match for hits", async () => {
     await writeFile(path.join(tmp, "f.txt"), "alpha\nbeta\ngamma\n");
     const result = await grep.execute({ pattern: "beta" });
@@ -431,8 +433,8 @@ describe("Grep tool", () => {
     await writeFile(path.join(tmp, "sub", "x.txt"), "needle\n");
     await writeFile(path.join(tmp, "outside.txt"), "needle\n");
     const result = await grep.execute({ pattern: "needle", path: "sub" });
-    expect(result).toContain("sub/x.txt");
-    expect(result).not.toContain("outside.txt");
+    // The hit itself: a scan stopped before sub/x.txt names it too.
+    expect(result).toBe("sub/x.txt:1:needle");
   });
 
   test("rejects path traversal in path argument", async () => {
@@ -467,6 +469,8 @@ describe("Grep tool", () => {
 // `**/*.ts` Glob in a starter returned ~4,400 vendored files around 30 real
 // ones, and Grep burned its scan budget on them.
 describe("vendored-directory defaults (node_modules)", () => {
+  beforeEach(() => holdGrepClock());
+
   async function plantBundle(): Promise<void> {
     await mkdir(path.join(tmp, "dist", "node_modules", "@crewhaus", "crawler"), {
       recursive: true,
