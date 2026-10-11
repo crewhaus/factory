@@ -95,6 +95,66 @@ async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T>
   }
 }
 
+/**
+ * Run `start` on a clock this test drives: every `setTimeout` it schedules
+ * is queued, not armed, and `Date.now()` reads the clock's time. Whenever
+ * the call has nothing left to do but wait, the earliest queued timer fires
+ * and the clock jumps to its due time; nothing else moves it. `settledAt`
+ * is the clock's time when the call settled, so a test reads WHEN a call
+ * ended by the timers that ended it, in the order they fall due, and not by
+ * how long a runner took to service them. For calls that wait only on
+ * timers and promises, never on I/O. Every spy is restored before this
+ * returns.
+ */
+async function onTestClock<T>(start: () => Promise<T>): Promise<{ value: T; settledAt: number }> {
+  const realClearTimeout = globalThis.clearTimeout;
+  const epoch = Date.now();
+  let now = 0;
+  let made = 0;
+  const queued = new Map<number, { due: number; fire: () => void }>();
+  const scheduled = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    made += 1;
+    queued.set(made, { due: now + Math.max(0, Number(delay) || 0), fire: () => fn(...rest) });
+    return made as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (!queued.delete(id as unknown as number)) realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const clock = spyOn(Date, "now").mockImplementation(() => epoch + now);
+  // The call has done all it can once a macrotask turn finds nothing more.
+  const idle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  try {
+    let settledAt: number | undefined;
+    const pending = start().finally(() => {
+      settledAt = now;
+    });
+    for (;;) {
+      await idle();
+      if (settledAt !== undefined) break;
+      let next: [number, { due: number; fire: () => void }] | undefined;
+      for (const entry of queued) {
+        // Due order; among timers due together, the order they were set.
+        if (next === undefined || entry[1].due < next[1].due) next = entry;
+      }
+      if (next === undefined) throw new Error("the call waits on nothing the test clock can fire");
+      queued.delete(next[0]);
+      now = next[1].due;
+      next[1].fire();
+    }
+    return { value: await pending, settledAt: settledAt as number };
+  } finally {
+    scheduled.mockRestore();
+    cleared.mockRestore();
+    clock.mockRestore();
+  }
+}
+
 /** Hold the event loop for `ms`, so that the clock moves and nothing else runs. */
 function busy(ms: number): void {
   const started = performance.now();
@@ -1878,9 +1938,11 @@ describe("DnsLookup / TlsInspect", () => {
   test("DnsLookup gives a type issued late only what is left of the budget", async () => {
     // A answers at 100ms of a 150ms budget, and AAAA never answers. One shared
     // budget ends the lookup at 150ms; a fresh budget per type would let AAAA
-    // run until 250ms. The sentinel at 200ms tells the two apart without
-    // reading a clock: timers in one heap fire in the order they fall due, so
-    // this holds however late a loaded runner services them.
+    // run until 250ms. Both timers run on the test's clock, which fires them
+    // in the order they fall due and moves only when it fires one, so the
+    // lookup ends at 150 however late a loaded runner would have serviced
+    // real ones. (Real timers raced here: a runner 50ms late to schedule A's
+    // answer let the budget fire first.)
     registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
     const issued: string[] = [];
     _setDnsRecordResolver(async (type) => {
@@ -1888,22 +1950,14 @@ describe("DnsLookup / TlsInspect", () => {
       if (type !== "A") return await new Promise(() => {});
       return await new Promise((resolve) => setTimeout(() => resolve(["192.0.2.1"]), 100));
     });
-    let settled = false;
-    const pending = run(dnsLookup, {
-      name: "dns-budget.invalid",
-      types: ["A", "AAAA", "MX"],
-      timeoutMs: 150,
-    })
-      .then((r) => {
-        settled = true;
-        return r;
-      })
-      .finally(() => _setDnsRecordResolver(undefined));
-    const settledBySentinel = await new Promise<boolean>((resolve) =>
-      setTimeout(() => resolve(settled), 200),
-    );
-    const result = await pending;
-    expect(settledBySentinel).toBe(true);
+    const { value: result, settledAt } = await onTestClock(() =>
+      run(dnsLookup, {
+        name: "dns-budget.invalid",
+        types: ["A", "AAAA", "MX"],
+        timeoutMs: 150,
+      }),
+    ).finally(() => _setDnsRecordResolver(undefined));
+    expect(settledAt).toBe(150);
     expect(issued).toEqual(["A", "AAAA"]);
     expect(result.records).toEqual({ A: ["192.0.2.1"] });
     expect(result.errors).toEqual({
