@@ -1189,6 +1189,28 @@ describe("WaitForPort", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     });
 
+    /**
+     * Runs `body` with Date.now, WaitForPort's clock, standing still until
+     * `reached()` says the work the test counts is done; then the clock is a
+     * minute on, past any deadline here. So how many probes fit before the
+     * deadline is decided by that count, not by the runner's speed: a real
+     * 200-300 ms deadline had to fit two probes. Should the work never come,
+     * the clock moves after 10 s anyway, so a broken wait fails on the
+     * assertions after it instead of hanging with the clock frozen.
+     */
+    async function withClockUntil<T>(reached: () => boolean, body: () => Promise<T>): Promise<T> {
+      const frozen = Date.now();
+      const began = performance.now();
+      const clock = spyOn(Date, "now").mockImplementation(() =>
+        reached() || performance.now() - began > 10_000 ? frozen + 60_000 : frozen,
+      );
+      try {
+        return await body();
+      } finally {
+        clock.mockRestore();
+      }
+    }
+
     test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
       for (const host of [
         "169.254.169.254",
@@ -1208,34 +1230,55 @@ describe("WaitForPort", () => {
       expect(lookups).toEqual([]);
     });
 
+    // Each wait is met by its first probe: the 10 s deadline only bounds a
+    // probe that never connects, and fails on the assertion before the
+    // test's budget.
     test("loopback in any spelling still works, with no configuration", async () => {
       for (const host of ["127.0.0.1", "0x7f.1", "2130706433", "127.1", "localhost"]) {
-        const out = await call(waitForPort, { host, port, timeoutMs: 3_000 });
+        const out = await call(waitForPort, { host, port, timeoutMs: 10_000 });
         expect({ host, satisfied: out.satisfied }).toEqual({ host, satisfied: true });
       }
       expect(lookups).toEqual([]);
-    });
+    }, 20_000);
 
     test("a listed name is resolved once and its address dialled for every probe", async () => {
       registerProcConfig({ wait_for_port_hosts: ["db.internal"] });
       answers["db.internal"] = ["127.0.0.1"];
-      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 3_000 });
+      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 10_000 });
       expect(out.satisfied).toBe(true);
-      // A closed wait polls several times; the name is still looked up once.
+      // A closed wait on a listener of this test's own polls until its
+      // deadline, and the listener counts every probe that reaches it (a
+      // fresh one: the first wait's probe may still be arriving at the old).
+      // The deadline passes once it has counted three; the name is still
+      // looked up once. (An open wait on the closed port raced a real 300 ms
+      // deadline for two probes, on a port another process could take.)
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      server = createServer();
-      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
-      lookups = [];
-      const closed = await call(waitForPort, {
-        host: "db.internal",
-        port,
-        state: "open",
-        timeoutMs: 300,
-        intervalMs: 50,
+      let dialled = 0;
+      server = createServer((socket) => {
+        dialled += 1;
+        socket.destroy();
       });
-      expect(closed.attempts).toBeGreaterThan(1);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+      lookups = [];
+      const closed = await withClockUntil(
+        () => dialled >= 3,
+        () =>
+          call(waitForPort, {
+            host: "db.internal",
+            port,
+            state: "closed",
+            timeoutMs: 300,
+            intervalMs: 10,
+          }),
+      );
+      expect({ satisfied: closed.satisfied, reason: closed.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(closed.attempts).toBeGreaterThanOrEqual(3);
       expect(lookups).toEqual(["db.internal"]);
-    });
+    }, 30_000);
 
     test("a listed name that does not resolve yet is waited for, then pinned", async () => {
       // A compose service's name exists only once its container does: the
@@ -1275,19 +1318,27 @@ describe("WaitForPort", () => {
         state: "closed",
       });
       expect(String(closed.note)).toContain("did not resolve");
-      const open = await call(waitForPort, {
-        host: "gone.invalid",
-        port,
-        timeoutMs: 200,
-        intervalMs: 50,
-      });
+      // The open wait looks the name up at every probe, and its deadline
+      // passes at the third lookup.
+      lookups = [];
+      const open = await withClockUntil(
+        () => lookups.length >= 3,
+        () =>
+          call(waitForPort, {
+            host: "gone.invalid",
+            port,
+            timeoutMs: 200,
+            intervalMs: 10,
+          }),
+      );
       expect({ satisfied: open.satisfied, reason: open.reason }).toEqual({
         satisfied: false,
         reason: "deadline",
       });
-      expect(open.attempts).toBeGreaterThan(1);
+      expect(open.attempts).toBe(3);
+      expect(lookups).toEqual(["gone.invalid", "gone.invalid", "gone.invalid"]);
       expect(String(open.note)).toContain("did not resolve");
-    });
+    }, 20_000);
 
     test("a listed name that later resolves to link-local is refused mid-wait", async () => {
       registerProcConfig({ wait_for_port_hosts: ["flaky.example"] });
@@ -1297,17 +1348,19 @@ describe("WaitForPort", () => {
         asked += 1;
         return asked >= 2 ? ["169.254.169.254"] : [];
       });
+      // The refusal comes at the second lookup; the 10 s deadline only
+      // bounds a wait that never makes one.
       const out = await call(waitForPort, {
         host: "flaky.example",
         port: 80,
-        timeoutMs: 2_000,
+        timeoutMs: 10_000,
         intervalMs: 20,
       });
       expect(String(out)).toContain("link-local");
-    });
+    }, 20_000);
 
     test("0.0.0.0 and :: — what a dev server prints — are probed as loopback", async () => {
-      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 3_000 });
+      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 10_000 });
       expect(out.satisfied).toBe(true);
       expect(unspecifiedDial("0.0.0.0")).toBe("127.0.0.1");
       expect(unspecifiedDial("::")).toBe("::1");
@@ -1315,7 +1368,7 @@ describe("WaitForPort", () => {
       expect(unspecifiedDial("::ffff:0.0.0.0")).toBe("127.0.0.1");
       expect(unspecifiedDial("10.0.0.1")).toBeNull();
       expect(lookups).toEqual([]);
-    });
+    }, 20_000);
 
     test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
       registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
