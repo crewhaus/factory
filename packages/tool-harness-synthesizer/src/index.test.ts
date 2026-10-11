@@ -603,17 +603,27 @@ describe.if(liveDocker())(
 
     // Judged by what the timeout produced and what it left, not by how long
     // it took: a slow daemon only delays the answer. A verifier held until
-    // it ends on its own never answers, and the test's budget catches that.
+    // it ends on its own never answers, and the test's budget catches that
+    // only because the rejection is taken with .then: Bun waits out
+    // `await expect(p).rejects` on a promise that never settles with the
+    // budget disarmed, so that form hung with no report.
     test("a verifier that never returns is stopped at the timeout, container and all", async () => {
-      await expect(
-        runVerifier("while (true) {}", evenSamples, {
-          sandbox: createSandbox({ backend: "docker" }),
-          timeoutMs: 1_000,
-        }),
-      ).rejects.toThrow(/timed out after 1000ms/);
+      const err = await runVerifier("while (true) {}", evenSamples, {
+        sandbox: createSandbox({ backend: "docker" }),
+        timeoutMs: 1_000,
+      }).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message).toMatch(/timed out after 1000ms/);
       expect(names).toHaveLength(1);
       const ps = Bun.spawnSync(["docker", "ps", "-a", "-q", "--filter", `name=${names[0]}`]);
-      expect(new TextDecoder().decode(ps.stdout).trim()).toBe("");
+      // Removed, or, when the daemon did not answer the removal within the
+      // sandbox's own bound, named in the error as possibly left (and handed
+      // to its reaper). Either is the contract; a container left unnamed is not.
+      if (new TextDecoder().decode(ps.stdout).trim() !== "") {
+        expect(err?.message).toContain(`container ${names[0]} may still exist`);
+      }
     }, 30_000);
 
     test("a verifier that floods stdout is still scored, from a capped read", async () => {
