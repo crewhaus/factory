@@ -825,10 +825,13 @@ function charactersSearched<T>(body: () => T): { value: T; searched: number } {
 // SitemapParse and FeedParse parse after the fetch's deadline is cancelled,
 // synchronously, and `text` input is capped only at MAX_XML_BYTES: a
 // super-linear step here held the event loop for as long as it liked.
-// A regular expression's backtracking cannot be counted from outside it, so
-// the two 0.7.0 patterns are caught by time, as the hang they are: at these
-// sizes each took about a minute, and the one-pass scans take milliseconds,
-// so a 5 s bound leaves a slow runner a thousandfold margin.
+// The '['-per-opener search is counted, below. A regular expression's
+// backtracking cannot be counted from outside it, so the first two tests
+// here, and FeedParse's in index.test.ts, are hang detectors kept on time:
+// at these sizes each 0.7.0 pattern took about a minute, over ten times the
+// 5 s bound. The one-pass scans take a few milliseconds on a laptop; CI has
+// run these parses up to about forty times slower, which still leaves the
+// bound tens of times above them.
 describe("xml on hostile documents (C091)", () => {
   test("a long attribute token with no '=' is scanned once", () => {
     const t0 = performance.now();
