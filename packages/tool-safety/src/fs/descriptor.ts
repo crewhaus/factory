@@ -28,6 +28,12 @@ import { isWithin } from "./resolve";
  * 1.3.14; Linux is how CI runs. Checking that path against the root after
  * the open closes the race for reads, whatever the directories did.
  *
+ * A file with more than one name (a hard link) has no single path. Linux
+ * names the one it was opened by; macOS answers with whichever it last
+ * looked up, which can be another of its names, in another directory. A
+ * check that does not need the path (appendContained's hard-link refusal)
+ * is made before it.
+ *
  * Where the descriptor cannot be asked (Windows, a Linux without `/proc`),
  * the fallback re-checks the identity of every directory on the path after
  * the open. That narrows the window but cannot close it; the README says so.

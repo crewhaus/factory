@@ -630,24 +630,30 @@ export function appendContained(
             `the directory of ${quote(given)} changed while it was being created; nothing was appended`,
           );
         }
-      } else if (
-        !opened.isFile() ||
-        opened.dev !== existing.dev ||
-        opened.ino !== existing.ino ||
-        !openedInDir(fd, found.dir, found.root.physical)
-      ) {
+      } else if (!opened.isFile() || opened.dev !== existing.dev || opened.ino !== existing.ino) {
         return fail(
           "changed",
           given,
           `${quote(given)} changed while it was being opened; nothing was appended`,
         );
       }
-      // Asked of the descriptor, so it is the file that will be written.
+      // Asked of the descriptor, so it is the file that will be written. And
+      // asked before the descriptor's path: for a file with more than one
+      // name macOS answers that with any of them, so the directory check
+      // below could see the other name and refuse it as changed, sometimes,
+      // instead of always as a hard link.
       if (existing !== undefined && options.hardLinks === "refuse" && opened.nlink > 1) {
         return fail(
           "escapes-root",
           given,
           `${quote(given)} is a hard link (the file has ${opened.nlink} names); an append would change it under every name, and they need not be inside the workspace, so nothing was appended`,
+        );
+      }
+      if (existing !== undefined && !openedInDir(fd, found.dir, found.root.physical)) {
+        return fail(
+          "changed",
+          given,
+          `${quote(given)} changed while it was being opened; nothing was appended`,
         );
       }
       const bytes = writeAll(fd, data);

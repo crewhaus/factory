@@ -1,4 +1,5 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import {
   chmodSync,
   closeSync,
@@ -9,6 +10,7 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -40,6 +42,33 @@ afterEach(() => {
 
 const mode = (p: string): number => statSync(p).mode & 0o7777;
 const noTemps = (dir: string): boolean => !readdirSync(dir).some((n) => n.endsWith(".tmp"));
+
+/**
+ * Run `body` with the kernel naming the file at `inside` by its other name,
+ * `other`, wherever a path is resolved to it: `realpath` of the name, and
+ * `realpath` of `/dev/fd/<n>` for a descriptor open on it. macOS keeps one
+ * name per file, the one it last looked up, so for a file with two names it
+ * gives either answer; Linux names the one the file was reached by. Here
+ * the answer is `other` every time. Restored before this returns.
+ */
+function withOtherNameAnswered<T>(inside: string, other: string, body: () => T): T {
+  const realRealpath = nodeFs.realpathSync;
+  const realNative = nodeFs.realpathSync.native;
+  const named = <A>(answer: A): A => (answer === inside ? (other as A) : answer);
+  const resolved = spyOn(nodeFs, "realpathSync").mockImplementation(((
+    p: nodeFs.PathLike,
+    o?: nodeFs.EncodingOption,
+  ) => named(realRealpath(p, o))) as typeof nodeFs.realpathSync);
+  // A descriptor is asked through `realpathSync.native` (descriptor.ts).
+  Object.assign(nodeFs.realpathSync, {
+    native: (p: nodeFs.PathLike, o?: nodeFs.EncodingOption) => named(realNative(p, o)),
+  });
+  try {
+    return body();
+  } finally {
+    resolved.mockRestore();
+  }
+}
 
 describe("writeFileSafe", () => {
   test("creates a new file with the mode a plain write would give it", () => {
@@ -548,6 +577,22 @@ describe.if(posix)("appendContained", () => {
     // The default is unchanged: an append in place reaches every name.
     expect(appendContained(f.ws, "hard.log", "+", {})).toMatchObject({ ok: true });
     expect(readFileSync(join(f.outside, "victim3.log"), "utf8")).toBe("victim+");
+  });
+
+  test("with hardLinks refuse, it is refused as a hard link whichever of its names the kernel answers", () => {
+    writeFileSync(join(f.outside, "victim4.log"), "victim");
+    linkSync(join(f.outside, "victim4.log"), join(f.ws, "hard4.log"));
+    // The descriptor's path names the file outside, as macOS sometimes does.
+    // Asked first, that answer made the refusal "changed while it was being
+    // opened"; the link count, from the descriptor too, decides it now.
+    const refused = withOtherNameAnswered(
+      join(realpathSync(f.ws), "hard4.log"),
+      join(realpathSync(f.outside), "victim4.log"),
+      () => appendContained(f.ws, "hard4.log", "INJECTED", { hardLinks: "refuse" }),
+    );
+    expect(refused).toMatchObject({ ok: false, code: "escapes-root" });
+    expect(refused.ok ? "" : refused.reason).toContain("hard link");
+    expect(readFileSync(join(f.outside, "victim4.log"), "utf8")).toBe("victim");
   });
 
   test("a FIFO is refused, not blocked on", () => {

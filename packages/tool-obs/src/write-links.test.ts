@@ -10,7 +10,8 @@
  * it. And `writeFileSync` on a FIFO blocks the whole event loop until a
  * reader appears, which a tar-extracted fixture can arrange never happens.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import {
   existsSync,
   linkSync,
@@ -69,16 +70,73 @@ function fifoWithReader(at: string): { stop: () => void } {
   return { stop: () => reader.kill() };
 }
 
+/**
+ * Run `body` with the kernel naming the file at `inside` by its other name,
+ * `other`, whenever a path is resolved to it: `realpath` of the name, and
+ * `realpath` of `/dev/fd/<n>` for a descriptor open on it. macOS keeps one
+ * name per file, the one it last looked up, so for a file with two names it
+ * gives either answer; in sequential runs of the tests below the outside
+ * one came back now and then (the containment check then refused the
+ * bundle, and the append was refused as "changed" rather than as a hard
+ * link). Linux, where CI runs, names the one the file was reached by. Here
+ * that answer is the outside one every time. Restored before this returns.
+ */
+async function withOtherNameAnswered<T>(
+  inside: string,
+  other: string,
+  body: () => Promise<T>,
+): Promise<T> {
+  const realRealpath = nodeFs.realpathSync;
+  const realNative = nodeFs.realpathSync.native;
+  const named = <A>(answer: A): A => (answer === inside ? (other as A) : answer);
+  const resolved = spyOn(nodeFs, "realpathSync").mockImplementation(((
+    p: nodeFs.PathLike,
+    o?: nodeFs.EncodingOption,
+  ) => named(realRealpath(p, o))) as typeof nodeFs.realpathSync);
+  // tool-safety asks a descriptor through `realpathSync.native`.
+  Object.assign(nodeFs.realpathSync, {
+    native: (p: nodeFs.PathLike, o?: nodeFs.EncodingOption) => named(realNative(p, o)),
+  });
+  try {
+    return await body();
+  } finally {
+    resolved.mockRestore();
+  }
+}
+
+/** IncidentBundle overwrites `bundle.json`, the second name of a file outside. */
+async function overwriteHardLinkedBundle(): Promise<void> {
+  const out = JSON.parse(
+    await run(incidentBundle, { sessionId: SESSION, out: "bundle.json", overwrite: true }),
+  );
+  expect(out.wrote).toBe("bundle.json");
+  expect(readFileSync(path.join(outside, "victim.json"), "utf8")).toBe("VICTIM");
+  expect(JSON.parse(readFileSync(path.join(tmp, "bundle.json"), "utf8")).counts).toBeDefined();
+}
+
+/** EmitTraceEvent appends to a session log that is the second name of a file outside. */
+async function appendToHardLinkedLog(): Promise<void> {
+  const out = await run(emitTraceEvent, { sessionId: "sess_hard", name: "x", tsMs: 1 });
+  expect(out).toContain("hard link");
+  expect(out).toContain("was not appended to");
+  expect(readFileSync(path.join(outside, "victim.log"), "utf8")).toBe("VICTIM\n");
+}
+
 describe.if(posix)("IncidentBundle's write", () => {
   test("overwrite replaces a hard-linked name, and the file's other name, outside, is untouched", async () => {
     writeFileSync(path.join(outside, "victim.json"), "VICTIM");
     linkSync(path.join(outside, "victim.json"), path.join(tmp, "bundle.json"));
-    const out = JSON.parse(
-      await run(incidentBundle, { sessionId: SESSION, out: "bundle.json", overwrite: true }),
+    await overwriteHardLinkedBundle();
+  });
+
+  test("overwrite replaces a hard-linked name when the kernel names the file by its outside name", async () => {
+    writeFileSync(path.join(outside, "victim.json"), "VICTIM");
+    linkSync(path.join(outside, "victim.json"), path.join(tmp, "bundle.json"));
+    await withOtherNameAnswered(
+      path.join(tmp, "bundle.json"),
+      path.join(outside, "victim.json"),
+      overwriteHardLinkedBundle,
     );
-    expect(out.wrote).toBe("bundle.json");
-    expect(readFileSync(path.join(outside, "victim.json"), "utf8")).toBe("VICTIM");
-    expect(JSON.parse(readFileSync(path.join(tmp, "bundle.json"), "utf8")).counts).toBeDefined();
   });
 
   test("a FIFO at the name is refused, not opened", async () => {
@@ -102,10 +160,17 @@ describe.if(posix)("EmitTraceEvent's append", () => {
   test("a hard-linked session log is refused, and the file's other name, outside, is untouched", async () => {
     writeFileSync(path.join(outside, "victim.log"), "VICTIM\n");
     linkSync(path.join(outside, "victim.log"), path.join(sessions, "sess_hard.jsonl"));
-    const out = await run(emitTraceEvent, { sessionId: "sess_hard", name: "x", tsMs: 1 });
-    expect(out).toContain("hard link");
-    expect(out).toContain("was not appended to");
-    expect(readFileSync(path.join(outside, "victim.log"), "utf8")).toBe("VICTIM\n");
+    await appendToHardLinkedLog();
+  });
+
+  test("a hard-linked session log is refused as one when the kernel names the file by its outside name", async () => {
+    writeFileSync(path.join(outside, "victim.log"), "VICTIM\n");
+    linkSync(path.join(outside, "victim.log"), path.join(sessions, "sess_hard.jsonl"));
+    await withOtherNameAnswered(
+      path.join(sessions, "sess_hard.jsonl"),
+      path.join(outside, "victim.log"),
+      appendToHardLinkedLog,
+    );
   });
 
   test("a FIFO named as a session log is refused, not opened", async () => {

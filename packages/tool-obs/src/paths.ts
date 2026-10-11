@@ -102,7 +102,7 @@ function resolveLocation(target: string, depth = 0): string {
   }
   let probeReal: string;
   try {
-    probeReal = realpathSync(probe);
+    probeReal = physicalName(probe);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     // The name is there but `realpath` cannot finish it: a symlink with a
@@ -120,6 +120,22 @@ function resolveLocation(target: string, depth = 0): string {
     probeReal = resolveLocation(path.resolve(base, link), depth + 1);
   }
   return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
+}
+
+/**
+ * The physical path of existing name `p`. A name that is neither a link nor
+ * a directory is never followed, so only its directory is resolved and the
+ * name appended as it stands, as tool-safety's leaf walk does. Resolving such
+ * a name asks the kernel for "the" path of its file, and a file with a second
+ * name (a hard link) has none: macOS answers with whichever name it last
+ * looked up, which can be the other one, outside the workspace. Then the
+ * containment check refused an in-workspace name, now and then, for where
+ * the file's other name sits.
+ */
+function physicalName(p: string): string {
+  const st = lstatSync(p);
+  if (st.isSymbolicLink() || st.isDirectory()) return realpathSync(p);
+  return path.join(realpathSync(path.dirname(p)), path.basename(p));
 }
 
 export function resolveSafe(toolName: string, rel: string, root = workspaceRoot()): SafePath {
