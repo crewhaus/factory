@@ -184,6 +184,92 @@ function watchStdout(): { seen: StdoutWatch; restore: () => void } {
   return { seen, restore: () => spy.mockRestore() };
 }
 
+/**
+ * Runs `body` with the command's deadline held: the first timer armed for
+ * exactly `ms` milliseconds is never scheduled, and fires once a whole line
+ * of the child's stdout has reached the code under test (`Bun.spawn` is
+ * spied on to see it). Every other timer runs as usual. So the deadline
+ * lands after the child printed, on any runner; a real one raced the
+ * child's start, and a child that took longer to start than the deadline
+ * was killed before its first line. The timer's callback runs in a
+ * microtask, as it would from the event loop.
+ */
+async function withDeadlineAfterFirstLine<T>(
+  ms: number,
+  body: () => Promise<T>,
+): Promise<{ result: T; fired: boolean; problem?: string }> {
+  const HELD = Symbol("held deadline") as unknown as ReturnType<typeof setTimeout>;
+  const deadline: { callback?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+    cleared: false,
+    fired: false,
+  };
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const realSpawn = Bun.spawn.bind(Bun);
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== ms || deadline.callback !== undefined) return realSetTimeout(fn, delay, ...rest);
+    deadline.callback = () => fn(...rest);
+    return HELD;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (id === HELD) deadline.cleared = true;
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const fire = (): void => {
+    if (deadline.fired) return;
+    deadline.fired = true;
+    const callback = deadline.callback;
+    if (callback === undefined || deadline.cleared) {
+      deadline.problem = "the deadline was not armed while the child ran";
+      return;
+    }
+    queueMicrotask(callback);
+  };
+  const spawned = spyOn(Bun, "spawn").mockImplementation(((
+    ...args: Parameters<typeof Bun.spawn>
+  ) => {
+    const proc = realSpawn(...args);
+    const source = proc.stdout;
+    if (!(source instanceof ReadableStream)) return proc;
+    const reader = (source as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const watched = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await reader.read();
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+        text += decoder.decode(next.value, { stream: true });
+        if (text.includes("\n")) fire();
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+    Object.defineProperty(proc, "stdout", { value: watched });
+    return proc;
+  }) as typeof Bun.spawn);
+  try {
+    const result = await body();
+    return {
+      result,
+      fired: deadline.fired,
+      ...(deadline.problem === undefined ? {} : { problem: deadline.problem }),
+    };
+  } finally {
+    spawned.mockRestore();
+    held.mockRestore();
+    cleared.mockRestore();
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 describe("package-wide contract", () => {
@@ -489,14 +575,21 @@ describe("RunCommand", () => {
   });
 
   test("a timed-out command still returns what it printed before the deadline", async () => {
-    // `sh -c`, not a fresh script file: macOS may scan a new executable for
-    // longer than this deadline before running a line of it.
-    const out = await call(runCommand, {
-      // No `exec`: the shell's own child is what used to hold the pipe open
-      // after the deadline's signal killed only the shell.
-      argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
-      timeoutMs: 1_000,
-    });
+    // The 1 s deadline fires once the line is out: a real one raced the
+    // shell's start, and a runner a second slow to start it lost the line.
+    const {
+      result: out,
+      fired,
+      problem,
+    } = await withDeadlineAfterFirstLine(1_000, () =>
+      call(runCommand, {
+        // No `exec`: the shell's own child is what used to hold the pipe open
+        // after the deadline's signal killed only the shell.
+        argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
+        timeoutMs: 1_000,
+      }),
+    );
+    expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
     expect(out.timedOut).toBe(true);
     expect(out.stdout).toContain("error: port in use");
   });
