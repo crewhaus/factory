@@ -1253,6 +1253,9 @@ describe("AuditVerify", () => {
 
   // In a child process: before the fix a FIFO blocked the walk for ever, even
   // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
+  // The killer is there only to end that hang, so it sits far past a slow
+  // runner: the child takes under 0.3 s here and 1.6 s at worst on CI. What
+  // decides the test is the exit code and the reason.
   test.skipIf(process.platform === "win32")(
     "a FIFO chain file is refused promptly, before the walk",
     async () => {
@@ -1265,7 +1268,7 @@ describe("AuditVerify", () => {
         console.log(await auditVerify.execute({ maxBytes: 1_000_000 }));
       `;
       const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
-      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
       const text = await new Response(child.stdout).text();
       clearTimeout(killer);
       expect(await child.exited).toBe(0);
@@ -1273,7 +1276,7 @@ describe("AuditVerify", () => {
       expect(result.ok).toBe(false);
       expect(result.break.reason).toMatch(/is a fifo, not a regular file/);
     },
-    20_000,
+    90_000,
   );
 });
 
