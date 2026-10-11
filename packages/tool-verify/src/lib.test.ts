@@ -6,6 +6,7 @@
  * so each one is pinned to what it should and should not touch.
  */
 import { describe, expect, test } from "bun:test";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   citationDefinitions,
   citedClaims,
@@ -112,10 +113,14 @@ describe("normalization", () => {
   });
 
   test("caller rules run after the builtins and are counted separately", async () => {
-    const result = await normalizeOutput("build 42 in 3s", {
-      apply: ["durations"],
-      replace: [{ pattern: "\\d+", with: "<n>" }],
-    });
+    // A caller rule runs in the regex worker, whose last exec fails: without
+    // this, a worker a loaded runner stalls 100 ms there reads as giving up.
+    const result = await withoutGiveUp(() =>
+      normalizeOutput("build 42 in 3s", {
+        apply: ["durations"],
+        replace: [{ pattern: "\\d+", with: "<n>" }],
+      }),
+    );
     expect(result.text).toBe("build <n> in <duration>");
     expect(result.applied).toEqual({ durations: 1, "replace[0]": 1 });
   });

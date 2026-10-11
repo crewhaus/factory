@@ -10,6 +10,7 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   MONEY_TOOLS,
   costBasisCompute,
@@ -634,11 +635,15 @@ describe("GlCodeSuggest", () => {
   });
 
   test("a rule set with no refused pattern answers exactly as before", async () => {
-    const result = await call<Coded>(glCodeSuggest, {
-      lines: [{ id: "l1", vendor: "Mystery" }],
-      rules: capexFirst("^capex$"),
-      defaultAccount: "9999",
-    });
+    // "^capex$" fails on "Mystery" in the regex worker: without this, a worker
+    // a loaded runner stalls 100 ms there reads as giving up, not a miss.
+    const result = await withoutGiveUp(() =>
+      call<Coded>(glCodeSuggest, {
+        lines: [{ id: "l1", vendor: "Mystery" }],
+        rules: capexFirst("^capex$"),
+        defaultAccount: "9999",
+      }),
+    );
     expect(result.lines[0]).toMatchObject({
       account: "9999",
       needsReview: true,

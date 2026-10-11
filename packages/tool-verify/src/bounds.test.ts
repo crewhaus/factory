@@ -29,10 +29,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import { markdownOutline } from "@crewhaus/tool-text";
 import { type JsWork, jsWork, jsWorkAsync } from "./__test__/js-work";
 import { type RegexWork, regexWork, regexWorkAsync } from "./__test__/regex-work";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   type VERIFY_TOOLS,
   acceptanceCheck,
@@ -97,24 +97,6 @@ function linearIn<T>(size: number, counted: RegexWork<JsWork<T>>): T {
   expect(counted.steps).toBeLessThanOrEqual(STEPS_PER_CHARACTER * size);
   expect(counted.value?.work).toBeLessThanOrEqual(WORK_PER_CHARACTER * size);
   return counted.value?.value as T;
-}
-
-/**
- * Run `body` with the regex worker's give-up threshold out of any runner's
- * reach. The worker reports a failing `exec` that took 100 ms as the engine
- * giving up, never as "no match", so a worker thread a loaded runner stalls
- * that long inside one turns "does not match" into "could not verify". The
- * 5 s deadline still stops a pattern that hangs.
- */
-async function withoutGiveUp<T>(body: () => Promise<T>): Promise<T> {
-  const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
-  const giveUpMs = defaults.giveUpMs;
-  defaults.giveUpMs = 60_000;
-  try {
-    return await body();
-  } finally {
-    defaults.giveUpMs = giveUpMs;
-  }
 }
 
 /** 0.7.0's heading reader, as the parity oracle. */

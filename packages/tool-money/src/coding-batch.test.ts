@@ -11,6 +11,7 @@
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { type Check, MAX_PATTERN_QUESTIONS, RegexAnswers } from "@crewhaus/tool-schema";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import { glCodeSuggest } from "./index";
 import { type CodingRule, codeLines, codeLinesAnsweringPatterns } from "./lib/coding";
 
@@ -56,10 +57,11 @@ describe("a batch is asked about in chunks no larger than the question cap", () 
     const { lines, rules } = batch(40, 5);
     const w = watchResolves();
     watch = w;
-    const chunked = await codeLinesAnsweringPatterns(lines, rules, {
-      maxQuestions: 50,
-      deadlineMs: 60_000,
-    });
+    // Most patterns fail on most lines in the regex worker: without this, a
+    // worker a loaded runner stalls 100 ms on one reads as giving up there.
+    const chunked = await withoutGiveUp(() =>
+      codeLinesAnsweringPatterns(lines, rules, { maxQuestions: 50, deadlineMs: 60_000 }),
+    );
     // 40 lines x 5 questions = 200, in chunks of at most 50.
     expect(w.pending.length).toBe(4);
     for (const n of w.pending) expect(n).toBeLessThanOrEqual(50);
@@ -83,8 +85,11 @@ describe("a batch is asked about in chunks no larger than the question cap", () 
     }));
     const w = watchResolves();
     watch = w;
-    // A budget no host misses, so this measures the cap and not the clock.
-    const out = await codeLinesAnsweringPatterns(lines, rules, { deadlineMs: 600_000 });
+    // A budget no host misses, and no give-up a stalled worker can reach, so
+    // this measures the cap and not the clock.
+    const out = await withoutGiveUp(() =>
+      codeLinesAnsweringPatterns(lines, rules, { deadlineMs: 600_000 }),
+    );
     expect(w.pending.length).toBe(2);
     for (const n of w.pending) expect(n).toBeLessThanOrEqual(MAX_PATTERN_QUESTIONS);
     expect(w.pending.reduce((a, b) => a + b, 0)).toBe(980 * 16 * 64);
