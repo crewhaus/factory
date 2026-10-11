@@ -411,11 +411,12 @@ let grepLimits: GrepLimits = GREP_DEFAULT_LIMITS;
 
 /**
  * Test seam: the deadline, the regex worker's give-up threshold (a no-match
- * slower than this is undetermined; 0 makes every no-match undetermined, to
- * exercise that path without a pathological pattern), the clock, the
- * batch size and worker input limit (set apart only to exercise a refusal
- * that cannot otherwise happen), and the regex session (so a test can hand
- * back a worker's timeout at a chosen line instead of racing a real deadline).
+ * slower than this is undetermined; it must be at least 1, and a test that
+ * needs an undetermined line scripts it through the session instead of
+ * racing a slow pattern against it), the clock, the batch size and worker
+ * input limit (set apart only to exercise a refusal that cannot otherwise
+ * happen), and the regex session (so a test can hand back a worker's
+ * timeout or give-up at a chosen line instead of racing a real deadline).
  * Pass `undefined` to restore.
  */
 export function _setGrepLimitsForTest(limits: Partial<GrepLimits> | undefined): void {
