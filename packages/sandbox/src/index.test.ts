@@ -1365,6 +1365,64 @@ describe("a Sandbox written against 0.7.0 still type-checks", () => {
   }, 60_000);
 });
 
+/**
+ * Runs `run` with the run's deadline held: the first timer armed for exactly
+ * `ms` milliseconds is never scheduled, and fires only when the test calls
+ * `fire` — once the program has printed what the test checks. Every other
+ * timer runs as usual. A real 300 ms deadline raced the program's start
+ * instead: one that took 300 ms to start was killed before its first line.
+ * `fire` hands the timer's callback to a microtask, outside the chunk hook,
+ * where a throw would be swallowed.
+ */
+async function withHeldDeadline<T>(
+  ms: number,
+  run: (fire: () => void) => Promise<T>,
+): Promise<{ result: T; fired: boolean; problem?: string }> {
+  const HELD = Symbol("held deadline") as unknown as ReturnType<typeof setTimeout>;
+  const deadline: { callback?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+    cleared: false,
+    fired: false,
+  };
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== ms || deadline.callback !== undefined) return realSetTimeout(fn, delay, ...rest);
+    deadline.callback = () => fn(...rest);
+    return HELD;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (id === HELD) deadline.cleared = true;
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const fire = (): void => {
+    if (deadline.fired) return;
+    deadline.fired = true;
+    const callback = deadline.callback;
+    if (callback === undefined || deadline.cleared) {
+      deadline.problem = "the deadline was not armed while the program ran";
+      return;
+    }
+    queueMicrotask(callback);
+  };
+  try {
+    const result = await run(fire);
+    return {
+      result,
+      fired: deadline.fired,
+      ...(deadline.problem === undefined ? {} : { problem: deadline.problem }),
+    };
+  } finally {
+    held.mockRestore();
+    cleared.mockRestore();
+  }
+}
+
 describe.if(posix)("noop backend: a timeout or abort takes down what the program started", () => {
   beforeEach(() => {
     resetEnv();
@@ -1374,15 +1432,26 @@ describe.if(posix)("noop backend: a timeout or abort takes down what the program
   });
 
   // The timeout used to SIGKILL only the direct child; a grandchild holding
-  // the pipe kept the call waiting until it finished on its own.
+  // the pipe kept the call waiting until it finished on its own. The shell
+  // starts its `sleep 30` before it prints, and the 300 ms deadline fires
+  // once that line is in: the grandchild holds the pipe at the timeout on
+  // any runner.
   test("a grandchild holding the pipe does not hold the call past the timeout", async () => {
     const sandbox = createSandbox({ backend: "noop" });
     const t0 = performance.now();
-    const result = await sandbox.exec({
-      image: "alpine:3.19",
-      argv: ["sh", "-c", "echo started; sleep 30; echo never"],
-      timeoutMs: 300,
-    });
+    let printed = "";
+    const { result, fired, problem } = await withHeldDeadline(300, (fire) =>
+      sandbox.exec({
+        image: "alpine:3.19",
+        argv: ["sh", "-c", "sleep 30 & echo started; wait; echo never"],
+        timeoutMs: 300,
+        onStdoutChunk: (chunk) => {
+          printed += chunk;
+          if (printed.includes("\n")) fire();
+        },
+      }),
+    );
+    expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
     expect(result.timedOut).toBe(true);
     expect(result.stdout).toBe("started\n");
     expect(result.exitCode).not.toBe(0);
