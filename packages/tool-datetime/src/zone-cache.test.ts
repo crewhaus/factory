@@ -66,9 +66,23 @@ describe("the timezone formatter cache (C084)", () => {
     expect(__zoneCacheSizesForTest()).toEqual(before);
   });
 
-  test("thousands of spellings through the tool do not accumulate memory", async () => {
-    const batch = async (from: number): Promise<void> => {
-      for (let n = from; n < from + 3_000; n++) {
+  test("thousands of spellings through the tool keep no formatter beyond the cache", async () => {
+    // Counts the formatters still alive after a full collection, not the
+    // process's RSS: RSS moves with the allocator and with every other test
+    // in the process, and on a loaded CI runner the same measurement in
+    // tool-notify read 61 MB where 40 MB was allowed. 0.7.0 kept every
+    // formatter, so 3 000 spellings left 3 000.
+    const Real = Intl.DateTimeFormat;
+    const made: WeakRef<Intl.DateTimeFormat>[] = [];
+    class Counted extends Real {
+      constructor(...args: ConstructorParameters<typeof Real>) {
+        super(...args);
+        made.push(new WeakRef(this));
+      }
+    }
+    (Intl as { DateTimeFormat: unknown }).DateTimeFormat = Counted;
+    try {
+      for (let n = 0; n < 3_000; n++) {
         const out = String(
           await dateConvertTimezone.execute(
             {
@@ -80,17 +94,17 @@ describe("the timezone formatter cache (C084)", () => {
         );
         if (!out.includes('"offset":"-03:00"')) throw new Error(`unexpected answer: ${out}`);
       }
-      Bun.gc(true);
-    };
-    // The first batch lets the allocator reach its working size (a new
-    // spelling still builds, and drops, one small formatter to learn the
-    // canonical name). A second batch of NEW spellings must then fit in that
-    // memory: 0.7.0 kept every formatter, so each batch added about 150 MB.
-    await batch(0);
-    const before = process.memoryUsage().rss;
-    await batch(3_000);
-    expect(process.memoryUsage().rss - before).toBeLessThan(40 * 1024 * 1024);
+    } finally {
+      (Intl as { DateTimeFormat: unknown }).DateTimeFormat = Real;
+    }
+    // A WeakRef keeps its target until the job that made it ends.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    Bun.gc(true);
+    const alive = made.filter((ref) => ref.deref() !== undefined).length;
+    expect(made.length).toBeGreaterThanOrEqual(3_000);
+    expect(alive).toBeLessThanOrEqual(64);
     expect(__zoneCacheSizesForTest().formatters).toBeLessThanOrEqual(64);
+    expect(__zoneCacheSizesForTest().spellings).toBeLessThanOrEqual(256);
   }, 30_000);
 
   test("month and weekday names for many locale spellings stay capped", () => {
