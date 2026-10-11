@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import { regexWork } from "./__test__/regex-work";
 import {
   type ParsedDiff,
@@ -70,8 +71,21 @@ describe("locate", () => {
 });
 
 describe("regexExtractAll", () => {
+  // The worker reports a failing `exec` that took 100 ms as the engine giving
+  // up, never as "no match". A worker thread a loaded runner stalls that long
+  // in a scan's last, failing `exec` turns "no more matches" into
+  // "undetermined", which reads as truncated. So these scans run with a
+  // give-up threshold no runner reaches; the 5 s deadline still stops a hang.
   const extract = async (text: string, pattern: string, flags: string, max: number) => {
-    const result = await regexExtractAll(text, pattern, flags, max);
+    const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
+    const giveUpMs = defaults.giveUpMs;
+    defaults.giveUpMs = 60_000;
+    let result: Awaited<ReturnType<typeof regexExtractAll>>;
+    try {
+      result = await regexExtractAll(text, pattern, flags, max);
+    } finally {
+      defaults.giveUpMs = giveUpMs;
+    }
     if (!result.ok) throw new Error(result.invalid);
     return result;
   };
