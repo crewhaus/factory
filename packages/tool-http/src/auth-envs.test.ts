@@ -314,7 +314,9 @@ describe("what a server echoes of a listed credential is scrubbed", () => {
     }
     // A redacted JSON result still parses.
     expect(JSON.parse(outs[0] as string).body).toContain("<redacted>");
-  });
+    // Seven loopback round trips in turn. With each reply 375 ms late, as
+    // CI has shown, they take 2.7 s of bun's default 5 s; at 800 ms it ran out.
+  }, 20_000);
 
   test("a basic profile's user:secret pair and its base64 are scrubbed too", async () => {
     registerHttpConfig({ allowed_origins: [originA], allowed_auth_envs: [LISTED] });
