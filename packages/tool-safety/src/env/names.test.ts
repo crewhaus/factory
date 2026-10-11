@@ -113,15 +113,18 @@ describe("isCredentialShapedName", () => {
     // The first version read the last character of a string built with
     // `+=`, which flattens it each time: quadratic in the longest word. That
     // cost is inside JavaScriptCore, where no count can reach, so this test
-    // still times the scan, with an input that puts the two far apart: 3M
-    // characters with a 2.5M-character word take about 0.2 s here when
-    // linear and about 170 s the first way (a 750K word took 13 s). The
-    // bound sits about 100x above the linear time and far below the other.
-    const name = `${"9".repeat(500_000)}a${"A".repeat(2_500_000)}`;
+    // still times the scan, with an input that puts the two far apart: 2M
+    // characters with a 1.6M-character word take about 0.1 s here when
+    // linear and about 63 s the first way. The bound sits near 100x above
+    // the one and 6x below the other. A longer word parts them further but
+    // makes a returning defect slower to report: bun does not stop a
+    // synchronous test at its budget, and CI, 10 to 20 times slower than
+    // this, runs it inside a 60-minute job (a 2.5M word took 144 s here).
+    const name = `${"9".repeat(400_000)}a${"A".repeat(1_600_000)}`;
     const started = performance.now();
     isCredentialShapedName(name);
     looksLikePastedSecret(name);
-    expect(performance.now() - started).toBeLessThan(20_000);
+    expect(performance.now() - started).toBeLessThan(10_000);
   }, 60_000);
 });
 
