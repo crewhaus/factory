@@ -15,7 +15,16 @@
  * bound to origins); anything else is refused before a socket opens, and
  * every spelling of a resolved secret is scrubbed from what comes back.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -132,6 +141,49 @@ async function call(tool: RegisteredTool, input: unknown, ctx?: unknown): Promis
   return out;
 }
 
+/**
+ * Run `body` with every timer of exactly `ms` milliseconds held: scheduled
+ * never, so a deadline of that length cannot cut a read however slow the
+ * runner is. Other timers run as usual. The same helper as index.test.ts's.
+ */
+async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) =>
+    delay === ms
+      ? (0 as unknown as ReturnType<typeof setTimeout>)
+      : realSetTimeout(fn, delay, ...rest)) as typeof setTimeout);
+  try {
+    return await body();
+  } finally {
+    held.mockRestore();
+  }
+}
+
+/**
+ * Run `body` with its `ms` deadline's timer held, and the clock moved `ms`
+ * on once `reached()` holds. So the deadline cannot cut a request however
+ * slow the runner is, and the call still ends as its deadline ends it, at
+ * the first point it reads the clock after `reached()`, without waiting the
+ * deadline out. Every spy is restored before this returns.
+ */
+async function withDeadlineAt<T>(
+  ms: number,
+  reached: () => boolean,
+  body: () => Promise<T>,
+): Promise<T> {
+  const realNow = Date.now.bind(Date);
+  const clock = spyOn(Date, "now").mockImplementation(() => realNow() + (reached() ? ms : 0));
+  try {
+    return await withTimersHeld(ms, body);
+  } finally {
+    clock.mockRestore();
+  }
+}
+
 /** Every auth-capable tool, with the smallest input that reaches its request. */
 const AUTH_TOOLS: ReadonlyArray<[RegisteredTool, (url: string) => Record<string, unknown>]> = [
   [httpRequest, (url) => ({ url })],
@@ -245,7 +297,13 @@ describe("what a server echoes of a listed credential is scrubbed", () => {
       }),
       await call(graphqlQuery, { url: `${originA}/echo`, query: "{ x }", auth }),
       await call(httpBatch, { requests: [{ url: `${originA}/echo` }], auth }),
-      await call(sseRead, { url: `${originA}/sse`, auth, timeoutMs: 2_000 }),
+      // The read's 2 s timer is held, so it cannot cut the read before the
+      // event arrives however slow the runner; /sse ends the stream itself.
+      // Armed, a reply later than 2 s came back as "deadline elapsed", with
+      // nothing read to scrub.
+      await withTimersHeld(2_000, () =>
+        call(sseRead, { url: `${originA}/sse`, auth, timeoutMs: 2_000 }),
+      ),
     ];
     // The credential really went out, every time.
     expect(seen.length).toBe(outs.length);
@@ -308,22 +366,52 @@ describe("a credential echoed with '/' written as '\\/' is scrubbed (net attacke
   test("HttpRequest and the read-only HttpWaitFor return none of it", async () => {
     registerHttpConfig({ allowed_origins: [originA], allowed_auth_envs: [LISTED] });
     const request = await call(httpRequest, { url: `${originA}/php`, auth });
-    const waited = await call(httpWaitFor, {
-      url: `${originA}/php.html`,
-      auth,
-      expectJson: { path: "x", op: "exists" },
-      timeoutMs: 1_000,
-      intervalMs: 5_000,
-    });
+    // The poll's 1 s timer is held, so it cannot cut the read however slow
+    // the runner, and the clock reaches the deadline as the server answers:
+    // the poll ends after that one attempt, judged on the body it read,
+    // without waiting the second out. With the timer armed, a reply later
+    // than 1 s came back as "deadline elapsed before the request completed",
+    // which holds no body: "<redacted>" was missing, and the two
+    // not.toContain checks held only vacuously.
+    const waited = await withDeadlineAt(
+      1_000,
+      () => seen.some((s) => s.path === "/php.html"),
+      () =>
+        call(httpWaitFor, {
+          url: `${originA}/php.html`,
+          auth,
+          expectJson: { path: "x", op: "exists" },
+          timeoutMs: 1_000,
+          intervalMs: 5_000,
+        }),
+    );
     expect(seen.length).toBe(2);
-    let checked = 0;
-    for (const out of [request, waited]) {
-      expect(out).not.toContain(escaped);
-      expect(out).not.toContain(escaped.replaceAll("\\", "\\\\"));
-      expect(out).toContain("<redacted>");
-      checked += 1;
-    }
-    expect(checked).toBe(2);
+    // A 200 whose body was read and found not to be JSON: lastError quotes it.
+    const poll = JSON.parse(waited);
+    expect({
+      met: poll.met,
+      attempts: poll.attempts,
+      lastStatus: poll.lastStatus,
+      stoppedBy: poll.stoppedBy,
+    }).toEqual({ met: false, attempts: 1, lastStatus: 200, stoppedBy: "deadline" });
+    expect(poll.lastError).toStartWith("response body is not JSON");
+    // Each result judged on its own, so a failure names the tool that leaked.
+    const results = { HttpRequest: request, HttpWaitFor: waited };
+    expect(
+      Object.entries(results).map(([tool, out]) => ({
+        tool,
+        escaped: out.includes(escaped),
+        escapedTwice: out.includes(escaped.replaceAll("\\", "\\\\")),
+        redacted: out.includes("<redacted>"),
+      })),
+    ).toEqual(
+      Object.keys(results).map((tool) => ({
+        tool,
+        escaped: false,
+        escapedTwice: false,
+        redacted: true,
+      })),
+    );
   });
 
   test("DownloadFile refuses to write it", async () => {
