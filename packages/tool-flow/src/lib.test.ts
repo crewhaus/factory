@@ -385,13 +385,15 @@ describe("classifyError", () => {
 
   test("a huge hostile message does not become a hang", () => {
     // The builtin packs are substrings, not patterns, precisely because this
-    // text comes from a remote server.
-    const message = `${"a(".repeat(200_000)}rate limit`;
-    const started = performance.now();
-    const result = classifyError({ message });
-    expect(performance.now() - started).toBeLessThan(500);
-    // Truncated well before the signature, so it lands in the default class.
-    expect(result.class).toBe("unknown");
+    // text comes from a remote server. The cut to MAX_MESSAGE_CHARS is what
+    // bounds the work, so that is what this checks, not the time: a signature
+    // 400 000 characters in is never seen, and the same one inside the cut
+    // is. A hang could not be timed anyway: bun cannot stop a synchronous
+    // test at its budget.
+    expect(classifyError({ message: `${"a(".repeat(200_000)}rate limit` }).class).toBe("unknown");
+    expect(classifyError({ message: `${"a(".repeat(1_000)}rate limit` }).class).toBe(
+      "rate_limited",
+    );
   });
 
   test("parseRetryAfter handles both legal forms and rejects the rest", () => {
