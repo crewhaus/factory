@@ -11,13 +11,19 @@
  *
  * The linear tests count the readers' work instead of timing it: every
  * pattern's backtracking steps (__test__/regex-work.ts), and the characters
- * the string methods copy or search and the elements the array searches
- * visit (__test__/js-work.ts). The readers take at most 45 steps, and under
- * 3 of the rest, a character of input. 0.7.0's work per character grew with
- * the input, so most inputs here are a tenth of the size it needed seconds
- * for, which still leaves each of its defects more than ten times over the
- * bound. A count past its bound stops the reader there and reads as
- * Infinity, so a quadratic reader fails at once rather than in minutes.
+ * the string methods copy, search or read and the elements the array
+ * searches and iterators visit (__test__/js-work.ts). The readers take at
+ * most 45 steps, and under 4 of the rest, a character of input. 0.7.0's
+ * work per character grew with the input, so most inputs here are a tenth of
+ * the size it needed seconds for, which still leaves each of its defects
+ * more than ten times over the bound. A count past its bound stops the
+ * reader there and reads as Infinity, so a quadratic reader fails at once
+ * rather than in minutes.
+ *
+ * What a count cannot see is a loop that reads `text[i]` or `items[i]` by
+ * hand: a quadratic one passes here, where a timed test would have caught
+ * it once it ran long enough. A loop over `charCodeAt`, `for…of`, or a
+ * search method is counted.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -66,7 +72,7 @@ afterEach(() => {
 
 /** Backtracking steps a reader may take per character of input; 45 at most here. */
 const STEPS_PER_CHARACTER = 128;
-/** Characters copied or searched, and elements visited, per character; under 3 here. */
+/** Characters copied, searched or read, and elements visited, per character; under 4 here. */
 const WORK_PER_CHARACTER = 8;
 
 /** What `run` returns, once its work on `size` characters of input is shown linear. */

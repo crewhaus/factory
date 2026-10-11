@@ -56,10 +56,21 @@ type Node =
 class Unmodelled extends Error {}
 
 /*
- * While installed, the model must not call a regex method itself: each would
- * come back through the replaced `exec`. It calls the engine's own.
+ * While installed, the model must not call a method a meter replaces: a
+ * regex method would come back through the replaced `exec`, and a string or
+ * array method, or an array's iterator, would be counted as the code's own
+ * work by a meter running alongside (tool-verify's js-work). So it calls the
+ * engine's own string methods and loops over arrays by index.
  */
 const realExec = RegExp.prototype.exec;
+const realCharCodeAt = String.prototype.charCodeAt;
+const realCodePointAt = String.prototype.codePointAt;
+const realSlice = String.prototype.slice;
+const realIndexOf = String.prototype.indexOf;
+const codeUnit = (s: string, i: number): number => realCharCodeAt.call(s, i);
+const codePoint = (s: string, i: number): number => realCodePointAt.call(s, i) ?? 0;
+const cut = (s: string, from: number, to?: number): string => realSlice.call(s, from, to);
+const find = (s: string, what: string, from = 0): number => realIndexOf.call(s, what, from);
 const QUANTIFIER = /^\{(\d+)(?:(,)(\d*))?\}/;
 
 const isAsciiLetter = (code: number): boolean =>
@@ -67,7 +78,7 @@ const isAsciiLetter = (code: number): boolean =>
 
 function hexDigits(text: string, from: number, count: number): boolean {
   for (let i = from; i < from + count; i++) {
-    const c = text.charCodeAt(i);
+    const c = codeUnit(text, i);
     if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) return false;
   }
   return true;
@@ -75,8 +86,8 @@ function hexDigits(text: string, from: number, count: number): boolean {
 
 /** The structure of a pattern; Unmodelled for syntax the model does not cover. */
 function parse(source: string, flags: string): Node {
-  if (flags.includes("v")) throw new Unmodelled("the v flag");
-  const unicode = flags.includes("u");
+  if (find(flags, "v") >= 0) throw new Unmodelled("the v flag");
+  const unicode = find(flags, "u") >= 0;
   let at = 0;
   const refuse = (what: string): never => {
     throw new Unmodelled(`${what} at ${at}`);
@@ -97,7 +108,7 @@ function parse(source: string, flags: string): Node {
       return simple;
     }
     if (c !== "{") return null;
-    const m = realExec.call(QUANTIFIER, source.slice(at));
+    const m = realExec.call(QUANTIFIER, cut(source, at));
     if (m === null) return null; // a literal `{` (Annex B)
     at += m[0].length;
     const min = Number(m[1]);
@@ -108,13 +119,13 @@ function parse(source: string, flags: string): Node {
     const next = source[at + 1] ?? refuse("a trailing backslash");
     if ((next >= "1" && next <= "9") || next === "k") refuse("a back-reference");
     let end = at + 2;
-    if ((next === "p" || next === "P") && unicode) end = source.indexOf("}", at) + 1;
-    else if (next === "u" && unicode && source[at + 2] === "{") end = source.indexOf("}", at) + 1;
+    if ((next === "p" || next === "P") && unicode) end = find(source, "}", at) + 1;
+    else if (next === "u" && unicode && source[at + 2] === "{") end = find(source, "}", at) + 1;
     else if (next === "u" && hexDigits(source, at + 2, 4)) end = at + 6;
     else if (next === "x" && hexDigits(source, at + 2, 2)) end = at + 4;
-    else if (next === "c" && isAsciiLetter(source.charCodeAt(at + 2))) end = at + 3;
+    else if (next === "c" && isAsciiLetter(codeUnit(source, at + 2))) end = at + 3;
     if (end <= at) refuse("an unterminated escape");
-    const text = source.slice(at, end);
+    const text = cut(source, at, end);
     at = end;
     return { t: "char", text };
   };
@@ -126,7 +137,7 @@ function parse(source: string, flags: string): Node {
       at += source[at] === "\\" ? 2 : 1;
     }
     at += 1;
-    return { t: "char", text: source.slice(from, at) };
+    return { t: "char", text: cut(source, from, at) };
   };
   const term = (): Node => {
     const c = source[at] as string;
@@ -151,7 +162,7 @@ function parse(source: string, flags: string): Node {
       } else if (source.startsWith("(?:", at)) {
         at += 3;
       } else if (source.startsWith("(?<", at)) {
-        const close = source.indexOf(">", at);
+        const close = find(source, ">", at);
         if (close < 0) refuse("an unterminated group name");
         at = close + 1;
       } else if (source.startsWith("(?", at)) {
@@ -174,8 +185,8 @@ function parse(source: string, flags: string): Node {
       atom = escapeAtom();
     } else {
       if (c === "*" || c === "+" || c === "?") refuse("a quantifier with nothing to repeat");
-      const width = unicode && (source.codePointAt(at) ?? 0) > 0xffff ? 2 : 1;
-      atom = { t: "char", text: source.slice(at, at + width) };
+      const width = unicode && codePoint(source, at) > 0xffff ? 2 : 1;
+      atom = { t: "char", text: cut(source, at, at + width) };
       at += width;
     }
     const q = quantifier();
@@ -216,9 +227,13 @@ function fixedWidth(node: Node): number {
     case "seq":
       return node.items.reduce((sum, item) => sum + fixedWidth(item), 0);
     case "alt": {
-      const widths = new Set(node.options.map(fixedWidth));
-      if (widths.size !== 1) throw new Unmodelled("a lookbehind of varying width");
-      return [...widths][0] as number;
+      const width = fixedWidth(node.options[0] as Node);
+      for (let n = 1; n < node.options.length; n++) {
+        if (fixedWidth(node.options[n] as Node) !== width) {
+          throw new Unmodelled("a lookbehind of varying width");
+        }
+      }
+      return width;
     }
     case "rep":
       if (node.min !== node.max) throw new Unmodelled("a lookbehind of varying width");
@@ -238,7 +253,10 @@ function step(): void {
 
 /** A one-character atom's verdict, decided by the engine under the pattern's flags. */
 function oneChar(text: string, flags: string): (c: string) => boolean {
-  const atomFlags = [...flags].filter((f) => f === "i" || f === "s" || f === "u").join("");
+  const atomFlags =
+    (find(flags, "i") >= 0 ? "i" : "") +
+    (find(flags, "s") >= 0 ? "s" : "") +
+    (find(flags, "u") >= 0 ? "u" : "");
   let single: RegExp;
   try {
     single = new RegExp(`^(?:${text})$`, atomFlags);
@@ -248,7 +266,7 @@ function oneChar(text: string, flags: string): (c: string) => boolean {
   const ascii = new Int8Array(128);
   const other = new Map<string, boolean>();
   return (c) => {
-    const code = c.charCodeAt(0);
+    const code = codeUnit(c, 0);
     if (c.length === 1 && code < 128) {
       const known = ascii[code] as number;
       if (known !== 0) return known === 1;
@@ -283,8 +301,8 @@ type Compiled = {
 };
 
 function compile(source: string, flags: string): Compiled {
-  const unicode = flags.includes("u");
-  const multiline = flags.includes("m");
+  const unicode = find(flags, "u") >= 0;
+  const multiline = find(flags, "m") >= 0;
   const word = oneChar("\\w", flags);
   const isWord = (k: number): boolean =>
     k >= 0 && k < walk.input.length && word(walk.input[k] as string);
@@ -292,10 +310,10 @@ function compile(source: string, flags: string): Compiled {
   const charAt = (i: number): string => {
     const input = walk.input;
     if (i >= input.length) return "";
-    const code = input.charCodeAt(i);
+    const code = codeUnit(input, i);
     if (unicode && code >= 0xd800 && code <= 0xdbff && i + 1 < input.length) {
-      const low = input.charCodeAt(i + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) return input.slice(i, i + 2);
+      const low = codeUnit(input, i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) return cut(input, i, i + 2);
     }
     return input[i] as string;
   };
@@ -312,14 +330,14 @@ function compile(source: string, flags: string): Compiled {
       case "bol":
         return (i, k) => {
           step();
-          const at = i === 0 || (multiline && isLineTerminator(walk.input.charCodeAt(i - 1)));
+          const at = i === 0 || (multiline && isLineTerminator(codeUnit(walk.input, i - 1)));
           return at && k(i);
         };
       case "eol":
         return (i, k) => {
           step();
           const at =
-            i === walk.input.length || (multiline && isLineTerminator(walk.input.charCodeAt(i)));
+            i === walk.input.length || (multiline && isLineTerminator(codeUnit(walk.input, i)));
           return at && k(i);
         };
       case "wordb":
@@ -343,7 +361,7 @@ function compile(source: string, flags: string): Compiled {
         const options = node.options.map(build);
         return (i, k) => {
           step();
-          for (const option of options) if (option(i, k)) return true;
+          for (let n = 0; n < options.length; n++) if ((options[n] as M)(i, k)) return true;
           return false;
         };
       }
@@ -421,7 +439,7 @@ function compile(source: string, flags: string): Compiled {
   }
   if (head?.t === "bol") {
     const failsAtOnce = (i: number): boolean =>
-      !(i === 0 || (multiline && isLineTerminator(walk.input.charCodeAt(i - 1))));
+      !(i === 0 || (multiline && isLineTerminator(codeUnit(walk.input, i - 1))));
     return { run: build(root), unicode, failsAtOnce, stepsToFail };
   }
   return { run: build(root), unicode, stepsToFail };
@@ -500,7 +518,7 @@ function install(limit: number, meter: Meter): () => void {
           break;
         }
         if (sticky) break;
-        from += compiled.unicode && (input.codePointAt(from) ?? 0) > 0xffff ? 2 : 1;
+        from += compiled.unicode && codePoint(input, from) > 0xffff ? 2 : 1;
       }
     } catch (err) {
       if (err === OVER) meter.over = true;
