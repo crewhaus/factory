@@ -30,10 +30,71 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(parts));
 }
 
-const rssNow = (): number => {
-  Bun.gc(true);
-  return process.memoryUsage().rss;
-};
+/** One body a tool fetched, as the runtime handed it over. */
+type Metered = { handed: number; pulled: number };
+
+/**
+ * Counts what the runtime hands JavaScript for each body fetched during
+ * `run`, instead of reading the process's RSS, which moves with the
+ * allocator and with every other test in the process (a loaded CI runner
+ * read 61 MB where tool-notify's formatter test allowed 40 MB).
+ *
+ * The tool's reader gets each body in 4 KiB pieces, one per read, so
+ * `pulled` is how much of it the tool read before it stopped, whatever sizes
+ * the socket delivered. After `run` the rest is drained, so `handed` is the
+ * whole body as the runtime gave it: its size on the wire when it was
+ * fetched raw, and every decoded byte when the runtime inflated it natively,
+ * as 0.7.0's dialler let it (256 MiB or 64 MiB here).
+ */
+async function meterBodies<T>(run: () => Promise<T>): Promise<{ result: T; metered: Metered[] }> {
+  const previous = globalThis.fetch;
+  const bodies: Array<{ count: Metered; drain: () => Promise<void> }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await previous(input as Request, init);
+    if (res.body === null) return res;
+    const source = res.body.getReader();
+    const count: Metered = { handed: 0, pulled: 0 };
+    bodies.push({
+      count,
+      drain: async () => {
+        for (let next = await source.read(); !next.done; next = await source.read()) {
+          count.handed += next.value.byteLength;
+        }
+      },
+    });
+    let left: Uint8Array = new Uint8Array(0);
+    const pieces = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          while (left.byteLength === 0) {
+            const next = await source.read();
+            if (next.done) {
+              controller.close();
+              return;
+            }
+            count.handed += next.value.byteLength;
+            left = next.value;
+          }
+          const piece = left.subarray(0, 4096);
+          left = left.subarray(piece.byteLength);
+          count.pulled += piece.byteLength;
+          controller.enqueue(piece);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    Object.defineProperty(res, "body", { value: pieces });
+    return res;
+  }) as typeof globalThis.fetch;
+  let result: T;
+  try {
+    result = await run();
+  } finally {
+    globalThis.fetch = previous;
+  }
+  for (const { drain } of bodies) await drain();
+  return { result, metered: bodies.map(({ count }) => count) };
+}
 
 describe("a peer's compressed reply costs at most the cap (C093)", () => {
   let gzip: Uint8Array;
@@ -85,11 +146,21 @@ describe("a peer's compressed reply costs at most the cap (C093)", () => {
 
   for (const path of ["/gzip", "/br"]) {
     test(`a ${path.slice(1)} bomb is cut at the cap without being inflated`, async () => {
-      const before = rssNow();
-      const { attempt, body } = await fetchOnce(`http://127.0.0.1:${server.port}${path}`, {
-        timeoutMs: 20_000,
-      });
-      expect(rssNow() - before).toBeLessThan(96 * 1024 * 1024);
+      const { result, metered } = await meterBodies(() =>
+        fetchOnce(`http://127.0.0.1:${server.port}${path}`, { timeoutMs: 20_000 }),
+      );
+      const { attempt, body } = result;
+      // The runtime handed the body over as it is on the wire, so it inflated
+      // none of it, and the reader stopped within a few decoder steps (the
+      // whole gzip is 255 KiB on the wire; the brotli is smaller than a step).
+      expect(metered).toHaveLength(1);
+      expect(metered[0]?.handed).toBe((path === "/br" ? brotli : gzip).byteLength);
+      expect(metered[0]?.pulled).toBeLessThanOrEqual(64 * 1024);
+      // `bytes` is what the decoder produced: it stopped a chunk past the cap,
+      // so the brotli, read whole in one piece, was not inflated here either.
+      expect(attempt.kind === "answered" ? attempt.bytes : Number.NaN).toBeLessThanOrEqual(
+        320 * 1024,
+      );
       expect(attempt).toMatchObject({ kind: "answered", status: 200, truncated: true });
       expect(body?.length ?? 0).toBeLessThanOrEqual(256 * 1024);
       expect(inits).toHaveLength(1);
