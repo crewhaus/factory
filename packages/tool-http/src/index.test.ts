@@ -1534,45 +1534,105 @@ describe("SseRead", () => {
     expect(result.stoppedBy).toBe("eventCap");
   });
 
-  test("the deadline stops a stream that never terminates", async () => {
-    // The budget has to cover connecting, the response head AND the first
-    // event on a contended runner, and fall far short of the stream (one
-    // event per 5 ms or more, for at least 50 s). CI has taken 300-375 ms
-    // for a single loopback request, so 300 ms raced the runner: a deadline
-    // before the head came back as a plain failure string, one before the
-    // first event as count 0 (C117; #481 fixed the same race in HttpBatch).
-    // 2 s is far above the first and far below the second. maxEvents is the
-    // schema's maximum, and at 5 ms an event it cannot pre-empt the deadline.
-    const started = performance.now();
-    const result = await run(sseRead, {
-      url: `${origin}/sse-forever`,
-      maxEvents: 1_000,
-      timeoutMs: 2_000,
-    });
-    expect(result.stoppedBy).toBe("deadline");
-    expect(result.count).toBeGreaterThan(0);
-    // It stopped because of the budget, not because the stream ran out.
-    expect(performance.now() - started).toBeLessThan(10_000);
-  }, 20_000);
-
-  test("half a second of connect latency still leaves the deadline to end the read", async () => {
-    // The latency CI has shown, and more, injected in front of the real
-    // fetch: the 300 ms budget this test file used to give failed here.
+  /**
+   * SseRead on /sse-forever, which never terminates, with the read's own
+   * 2 s deadline held and fired from the stream: on the first read the tool
+   * asks for once a whole event has reached it. So the deadline lands after
+   * the head and the first event on any runner, and nothing else can end
+   * the read first (maxEvents is the schema's maximum, and the stream sends
+   * one event per 5 ms or more for 50 s). A real 2 s deadline raced the
+   * runner instead, which CI has seen take 300-375 ms for one loopback
+   * request (C117; #481 fixed the same race in HttpBatch). `latencyMs` is
+   * real latency in front of the real fetch.
+   */
+  async function readUntilDeadlineFired(latencyMs: number) {
+    const DEADLINE_MS = 2_000;
+    const HELD = Symbol("held") as unknown as ReturnType<typeof setTimeout>;
+    const deadline: { fire?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+      cleared: false,
+      fired: false,
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (delay !== DEADLINE_MS) return realSetTimeout(fn, delay, ...rest);
+      deadline.fire = () => fn(...rest);
+      return HELD;
+    }) as typeof setTimeout);
+    const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      if (id === HELD) deadline.cleared = true;
+      else realClearTimeout(id);
+    }) as typeof clearTimeout);
     _setRawFetch(async (req) => {
-      await Bun.sleep(500);
-      return fetch(req, { decompress: false } as RequestInit);
+      if (latencyMs > 0) await Bun.sleep(latencyMs);
+      const res = await fetch(req, { decompress: false } as RequestInit);
+      if (res.body === null) return res;
+      const source = res.body.getReader();
+      let passed = "";
+      const body = new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            if (passed.includes("\n\n") && !deadline.fired) {
+              // A whole event has been taken and the tool asks for more.
+              deadline.fired = true;
+              if (deadline.fire === undefined || deadline.cleared) {
+                deadline.problem = "the read's deadline was not armed while the body was read";
+                await source.cancel().catch(() => undefined);
+                throw new Error(deadline.problem);
+              }
+              deadline.fire();
+            }
+            const next = await source.read();
+            if (next.done) {
+              controller.close();
+              return;
+            }
+            passed += new TextDecoder().decode(next.value);
+            controller.enqueue(next.value);
+          },
+          cancel: (reason) => source.cancel(reason),
+        },
+        // Pulled only when the tool reads.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { status: res.status, headers: res.headers });
     });
     try {
       const result = await run(sseRead, {
         url: `${origin}/sse-forever`,
         maxEvents: 1_000,
-        timeoutMs: 2_000,
+        timeoutMs: DEADLINE_MS,
       });
-      expect(result.stoppedBy).toBe("deadline");
-      expect(result.count).toBeGreaterThan(0);
+      return { result, fired: deadline.fired, problem: deadline.problem };
     } finally {
       _setRawFetch(undefined);
+      held.mockRestore();
+      cleared.mockRestore();
     }
+  }
+
+  test("the deadline stops a stream that never terminates", async () => {
+    const { result, fired, problem } = await readUntilDeadlineFired(0);
+    expect(problem).toBeUndefined();
+    expect(fired).toBe(true);
+    expect(result.stoppedBy).toBe("deadline");
+    expect(result.count).toBeGreaterThan(0);
+  }, 20_000);
+
+  test("half a second of connect latency still leaves the deadline to end the read", async () => {
+    // The latency CI has shown, and more, in front of the real fetch: the
+    // 300 ms budget this test file used to give failed here.
+    const { result, fired, problem } = await readUntilDeadlineFired(500);
+    expect(problem).toBeUndefined();
+    expect(fired).toBe(true);
+    expect(result.stoppedBy).toBe("deadline");
+    expect(result.count).toBeGreaterThan(0);
   }, 20_000);
 
   test("a cancel that lands after the deadline's time, before its timer, is not a deadline", async () => {
