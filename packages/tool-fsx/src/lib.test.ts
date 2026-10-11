@@ -668,33 +668,87 @@ function referenceGlob(pattern: string): RegExp {
   return new RegExp(`^${out}$`);
 }
 
+/**
+ * The work a glob match does, counted rather than timed. Every regular
+ * expression run is counted, and one over a subject is refused on the spot:
+ * 0.7.0 compiled each glob to a RegExp, whose backtracking is the hang, so a
+ * return to it fails at once instead of running for hours. The matcher's own
+ * work is the characters it reads with `charCodeAt`, which the segment walk
+ * keeps within the product of the pattern's and the subject's lengths. Both
+ * originals are put back before this returns.
+ */
+function globWork<T>(
+  subjects: readonly string[],
+  body: () => T,
+): { value: T; regexRuns: number; reads: number } {
+  const realExec = RegExp.prototype.exec;
+  const realCharCodeAt = String.prototype.charCodeAt;
+  let regexRuns = 0;
+  let reads = 0;
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    regexRuns += 1;
+    const text = String(input);
+    if (subjects.some((subject) => text.includes(subject))) {
+      throw new Error(`/${this.source}/ ran over a ${text.length}-character subject`);
+    }
+    return realExec.call(this, text);
+  };
+  String.prototype.charCodeAt = function (this: string, index: number) {
+    reads += 1;
+    return realCharCodeAt.call(this, index);
+  };
+  try {
+    const value = body();
+    return { value, regexRuns, reads };
+  } finally {
+    RegExp.prototype.exec = realExec;
+    String.prototype.charCodeAt = realCharCodeAt;
+  }
+}
+
+/** What the segment walk may read for one match: the product of the lengths. */
+const productOf = (pattern: string, subject: string): number =>
+  (pattern.length + 1) * (subject.length + 1);
+
 describe("the glob matcher cannot be made to backtrack (C081)", () => {
   test("many-star patterns answer in linear time", () => {
-    const started = performance.now();
-    // Each took seconds as a RegExp: about 4 s and 3.6 s.
-    expect(matchGlob("*a*a*a*a*a*a*b", "a".repeat(80))).toBe(false);
-    expect(matchGlob("*****b", "a".repeat(200))).toBe(false);
-    expect(matchGlob("*a*a*a*a*a*a*b", `${"a".repeat(80)}b`)).toBe(true);
-    expect(performance.now() - started).toBeLessThan(250);
-    // Only safe to ask once the matcher is linear: hours as a RegExp.
-    expect(matchGlob("*a*a*a*a*a*a*a*a*b", "a".repeat(255))).toBe(false);
-    expect(performance.now() - started).toBeLessThan(500);
+    // Counted, not timed. As a RegExp the first two took about 4 s and
+    // 3.6 s, and the last one hours; the walk reads each subject character
+    // about once.
+    const cases: ReadonlyArray<readonly [string, string, boolean]> = [
+      ["*a*a*a*a*a*a*b", "a".repeat(80), false],
+      ["*****b", "a".repeat(200), false],
+      ["*a*a*a*a*a*a*b", `${"a".repeat(80)}b`, true],
+      ["*a*a*a*a*a*a*a*a*b", "a".repeat(255), false],
+    ];
+    for (const [pattern, subject, matches] of cases) {
+      const { value, regexRuns, reads } = globWork([subject], () => matchGlob(pattern, subject));
+      expect({ pattern, value, regexRuns }).toEqual({ pattern, value: matches, regexRuns: 0 });
+      expect(reads).toBeLessThanOrEqual(productOf(pattern, subject));
+    }
   });
 
   test("so do .gitignore rules", () => {
     const rule = compileIgnoreRule("*a*a*a*a*a*a*b");
     if (rule === undefined) throw new Error("the rule should compile");
-    const started = performance.now();
-    expect(rule.test("a".repeat(255))).toBe(false);
-    expect(isIgnored([{ base: "", rules: [rule] }], `x/${"a".repeat(255)}`, false)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(250);
+    const name = "a".repeat(255);
+    const { value, regexRuns, reads } = globWork([name], () => [
+      rule.test(name),
+      isIgnored([{ base: "", rules: [rule] }], `x/${name}`, false),
+    ]);
+    expect(value).toEqual([false, false]);
+    expect(regexRuns).toBe(0);
+    // Two matches of the rule against the name.
+    expect(reads).toBeLessThanOrEqual(2 * productOf("*a*a*a*a*a*a*b", name));
   });
 
   test("globstars across many segments stay polynomial", () => {
     const subject = Array.from({ length: 200 }, () => "a").join("/");
-    const started = performance.now();
-    expect(matchGlob(`${"**/a/".repeat(60)}b`, subject)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(250);
+    const pattern = `${"**/a/".repeat(60)}b`;
+    const { value, regexRuns, reads } = globWork([subject], () => matchGlob(pattern, subject));
+    expect(value).toBe(false);
+    expect(regexRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(productOf(pattern, subject));
   });
 
   test("it agrees with the RegExp translation on every short input", () => {

@@ -360,23 +360,62 @@ describe("a hostile glob cannot hang a listing (C081)", () => {
   const hostile = "*a*a*a*a*a*a*b";
   const longName = "a".repeat(80);
 
+  /**
+   * The work one listing does, counted rather than timed: every regular
+   * expression run (one over the long name is refused on the spot, so a
+   * return to the RegExp fails at once instead of hanging), and every
+   * character read with `charCodeAt`. lib.test.ts counts the matcher the
+   * same way. Both originals are put back before this returns.
+   */
+  async function listingWork<T>(
+    body: () => Promise<T>,
+  ): Promise<{ value: T; regexRuns: number; reads: number }> {
+    const realExec = RegExp.prototype.exec;
+    const realCharCodeAt = String.prototype.charCodeAt;
+    let regexRuns = 0;
+    let reads = 0;
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      regexRuns += 1;
+      const text = String(input);
+      if (text.includes(longName)) throw new Error(`/${this.source}/ ran over the long name`);
+      return realExec.call(this, text);
+    };
+    String.prototype.charCodeAt = function (this: string, index: number) {
+      reads += 1;
+      return realCharCodeAt.call(this, index);
+    };
+    try {
+      const value = await body();
+      return { value, regexRuns, reads };
+    } finally {
+      RegExp.prototype.exec = realExec;
+      String.prototype.charCodeAt = realCharCodeAt;
+    }
+  }
+  // A listing matches the pattern against an entry's name and, at most, its
+  // path: each match reads within the product of the two lengths.
+  const bound = 2 * (hostile.length + 1) * (longName.length + 1);
+
   test("Tree with a many-star .gitignore rule and a long name", async () => {
     write(".gitignore", `${hostile}\n`);
     write(longName, "x");
-    const started = performance.now();
-    const out = await run(tree, { path: "." });
-    expect(performance.now() - started).toBeLessThan(1000);
+    const { value: out, regexRuns, reads } = await listingWork(() => run(tree, { path: "." }));
+    expect(regexRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(bound);
     expect(out).toContain(longName);
   }, 20_000);
 
   test("FindFiles with a many-star name pattern, and as an exclude", async () => {
     write(longName, "x");
-    const started = performance.now();
-    const found = await run(findFiles, { name: hostile, respectGitignore: false });
-    const kept = await run(findFiles, { exclude: [hostile] });
-    expect(performance.now() - started).toBeLessThan(1000);
-    expect(found.count).toBe(0);
-    expect(kept.matches.map((m: { path: string }) => m.path)).toEqual([longName]);
+    const found = await listingWork(() =>
+      run(findFiles, { name: hostile, respectGitignore: false }),
+    );
+    const kept = await listingWork(() => run(findFiles, { exclude: [hostile] }));
+    expect([found.regexRuns, kept.regexRuns]).toEqual([0, 0]);
+    expect(found.reads).toBeLessThanOrEqual(bound);
+    expect(kept.reads).toBeLessThanOrEqual(bound);
+    expect(found.value.count).toBe(0);
+    expect(kept.value.matches.map((m: { path: string }) => m.path)).toEqual([longName]);
   }, 20_000);
 });
 
