@@ -269,7 +269,10 @@ describe("ingestDocument — maxBytes bounds what is READ (C077)", () => {
       bytesRead += n;
       return n;
     }) as unknown as typeof nodeFs.readSync);
-    // A read of the whole file is counted too, however it is spelled.
+    // A whole-file readSync or readFileSync is counted too, however it is
+    // imported. A read through another API (Bun.file, node:fs/promises, a
+    // stream) is not seen here. The 5 GiB test above catches one that holds
+    // the whole file, since Bun will not allocate a buffer over 4 GiB.
     const wholeReads = spyOn(nodeFs, "readFileSync").mockImplementation(((
       ...args: unknown[]
     ): string | Buffer => {
