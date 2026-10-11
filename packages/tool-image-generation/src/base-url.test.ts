@@ -14,6 +14,31 @@ import {
 
 const KEY = "sk-canary-OPENAI-1234567890";
 
+/**
+ * Runs `body` with every regular expression run over a text that contains
+ * `run` refused on the spot and recorded. Replacing `RegExp.prototype.exec`
+ * routes every String and RegExp method that runs a pattern through it
+ * (the test's control checks that for `String#replace`); restored after.
+ */
+function regexRunsOver<T>(run: string, body: () => T): { runs: string[]; outcome: T | Error } {
+  const runs: string[] = [];
+  const realExec = RegExp.prototype.exec;
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    if (typeof input === "string" && input.includes(run)) {
+      runs.push(`/${this.source}/ over ${input.length} characters`);
+      throw new Error(`/${this.source}/ ran over the run of slashes`);
+    }
+    return realExec.call(this, input);
+  };
+  try {
+    return { runs, outcome: body() };
+  } catch (err) {
+    return { runs, outcome: err as Error };
+  } finally {
+    RegExp.prototype.exec = realExec;
+  }
+}
+
 describe("resolveOpenAIBaseUrl", () => {
   test("the default, and api.openai.com under any path, need no approval", () => {
     expect(resolveOpenAIBaseUrl({}, {})).toBe("https://api.openai.com/v1");
@@ -96,24 +121,36 @@ describe("resolveOpenAIBaseUrl", () => {
   });
 
   // Attacker review: `/\/+$/` rescanned a run of slashes from every start,
-  // quadratic in its length (about 80 s for 400k slashes, at boot). A
-  // bounded proof: 100k slashes took seconds with the regex and take
-  // milliseconds with the loop.
+  // quadratic in its length (about 5 s a scan for 100k slashes, 80 s for
+  // 400k, at boot). Counted, not timed: URL parsing is native and linear,
+  // so the only place that work can hide is a regular expression run over
+  // the slashes. Each such run is refused on the spot and counted, so a
+  // quadratic pattern fails at once instead of being waited out; the fix
+  // strips with a loop from the end, and runs none.
   test("trailing slashes are stripped in linear time", () => {
     expect(resolveOpenAIBaseUrl({ openaiBaseUrl: "https://api.openai.com/v1///" }, {})).toBe(
       "https://api.openai.com/v1",
     );
     const slashes = "/".repeat(100_000);
-    const started = performance.now();
-    const result = resolveOpenAIBaseUrl(
-      { openaiBaseUrl: `https://api.openai.com/${slashes}v1` },
-      {},
+    // Control: the count sees a pattern String#replace runs over the slashes.
+    expect(regexRunsOver(slashes, () => `x${slashes}v1`.replace(/\/+$/, "")).runs).toEqual([
+      `/\\/+$/ over ${slashes.length + 3} characters`,
+    ]);
+    const accepted = regexRunsOver(slashes, () =>
+      resolveOpenAIBaseUrl({ openaiBaseUrl: `https://api.openai.com/${slashes}v1` }, {}),
     );
-    expect(performance.now() - started).toBeLessThan(1000);
-    expect(result.endsWith(`${slashes}v1`)).toBe(true);
-    expect(() =>
+    expect(accepted.runs).toEqual([]);
+    expect(String(accepted.outcome).endsWith(`${slashes}v1`)).toBe(true);
+    // The refusal builds its approval hint from the parsed path: no pattern
+    // runs over that either.
+    const refused = regexRunsOver(slashes, () =>
       resolveOpenAIBaseUrl({ openaiBaseUrl: `https://proxy.example/${slashes}v1` }, {}),
-    ).toThrow("set OPENAI_BASE_URL=https://proxy.example/");
+    );
+    expect(refused.runs).toEqual([]);
+    expect(refused.outcome).toBeInstanceOf(ImageGenerationError);
+    expect((refused.outcome as Error).message).toContain(
+      "set OPENAI_BASE_URL=https://proxy.example/",
+    );
   });
 
   test("userinfo in the URL is refused", () => {
