@@ -1632,10 +1632,13 @@ describe("RobotsCheck / SitemapParse / FeedParse", () => {
   });
 
   test("FeedParse on a hostile tag parses in milliseconds rather than holding the loop (C091)", async () => {
-    const hostile = `<rss version="2.0"><channel x${"y".repeat(40_000)}><title>T</title><item><title>a</title></item></channel></rss>`;
+    // 0.7.0's attribute pattern took about a minute on this tag and the
+    // one-pass scan takes milliseconds: the bound catches that hang, with a
+    // thousandfold margin for a slow runner (lib.test.ts says why by time).
+    const hostile = `<rss version="2.0"><channel x${"y".repeat(240_000)}><title>T</title><item><title>a</title></item></channel></rss>`;
     const t0 = performance.now();
     const result = await run(feedParse, { text: hostile });
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(performance.now() - t0).toBeLessThan(5_000);
     expect(result.kind).toBe("rss");
     expect(result.title).toBe("T");
     expect(result.entries.map((e: { title: string }) => e.title)).toEqual(["a"]);

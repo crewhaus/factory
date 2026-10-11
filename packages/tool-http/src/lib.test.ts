@@ -769,18 +769,41 @@ describe("xml", () => {
   });
 });
 
+/**
+ * How many characters `String.prototype.indexOf` read while `body` ran:
+ * from where each search started to where it stopped.
+ */
+function charactersSearched<T>(body: () => T): { value: T; searched: number } {
+  const realIndexOf = String.prototype.indexOf;
+  let searched = 0;
+  String.prototype.indexOf = function (this: string, search: string, position?: number) {
+    const at = realIndexOf.call(this, search, position);
+    const from = Math.min(Math.max(Math.trunc(Number(position ?? 0)) || 0, 0), this.length);
+    searched += (at === -1 ? this.length : at + search.length) - from;
+    return at;
+  };
+  try {
+    const value = body();
+    return { value, searched };
+  } finally {
+    String.prototype.indexOf = realIndexOf;
+  }
+}
+
 // SitemapParse and FeedParse parse after the fetch's deadline is cancelled,
 // synchronously, and `text` input is capped only at MAX_XML_BYTES: a
 // super-linear step here held the event loop for as long as it liked.
-// 400 000 characters took the 0.7.0 attribute pattern minutes; the sizes
-// below fail it in seconds instead of hanging, and parse in milliseconds now.
+// A regular expression's backtracking cannot be counted from outside it, so
+// the two 0.7.0 patterns are caught by time, as the hang they are: at these
+// sizes each took about a minute, and the one-pass scans take milliseconds,
+// so a 5 s bound leaves a slow runner a thousandfold margin.
 describe("xml on hostile documents (C091)", () => {
   test("a long attribute token with no '=' is scanned once", () => {
     const t0 = performance.now();
     const root = parseXml(
-      `<urlset x${"y".repeat(40_000)} a="1"><url><loc>https://e.x/</loc></url></urlset>`,
+      `<urlset x${"y".repeat(240_000)} a="1"><url><loc>https://e.x/</loc></url></urlset>`,
     );
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(performance.now() - t0).toBeLessThan(5_000);
     expect(root.name).toBe("urlset");
     expect(root.attrs).toEqual({ a: "1" });
     expect(root.children[0]?.children[0]?.text).toBe("https://e.x/");
@@ -788,18 +811,21 @@ describe("xml on hostile documents (C091)", () => {
 
   test("many <!DOCTYPE openers before one '>' are checked once", () => {
     const t0 = performance.now();
-    expect(parseXml(`${"<!DOCTYPE ".repeat(12_000)}><urlset/>`).name).toBe("urlset");
-    expect(() => parseXml(`${"<!DOCTYPE ".repeat(12_000)}[<!-- -->]><urlset/>`)).toThrow(
+    expect(parseXml(`${"<!DOCTYPE ".repeat(100_000)}><urlset/>`).name).toBe("urlset");
+    expect(() => parseXml(`${"<!DOCTYPE ".repeat(100_000)}[<!-- -->]><urlset/>`)).toThrow(
       /internal DTD subset/,
     );
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(performance.now() - t0).toBeLessThan(5_000);
   }, 20_000);
 
   test("one '[' after many closed openers is looked for once, not once per opener", () => {
-    // 1.5 MB: a search for the `[` per opener costs seconds here.
-    const t0 = performance.now();
-    expect(parseXml(`<r>${"<!DOCTYPE>".repeat(150_000)}</r><!-- [ -->`).name).toBe("r");
-    expect(performance.now() - t0).toBeLessThan(500);
+    // 1.5 MB. A search for the `[` from every opener reads about 10^11
+    // characters here; looked for once, the searches read about the
+    // document's length.
+    const doc = `<r>${"<!DOCTYPE>".repeat(150_000)}</r><!-- [ -->`;
+    const { value, searched } = charactersSearched(() => parseXml(doc));
+    expect(value.name).toBe("r");
+    expect(searched).toBeLessThan(4 * doc.length);
   }, 20_000);
 
   test.each([
