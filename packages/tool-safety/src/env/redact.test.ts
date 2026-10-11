@@ -362,18 +362,26 @@ describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, boun
     // 0.7.1's first cut built one segment object and one string per escape,
     // and kept them while it searched the decoded view: about 1.1 GiB of RSS
     // for this body, on every authenticated HttpRequest or DownloadFile that
-    // returned it. Counted as the objects alive while a long string is
-    // searched, after a full collection, not as RSS, which moves with the
-    // allocator and with every other test in the process.
+    // returned it. Counted while a long string is searched, after a full
+    // collection, not as RSS, which moves with the allocator and with every
+    // other test in the process: the objects alive, and the bytes the
+    // collector holds live. Both, because a map kept as flat arrays of
+    // numbers, one entry per escape, is a handful of objects and still about
+    // fourteen times the body.
     const text = "%41".repeat(Math.floor((25 * 1024 * 1024) / 3));
+    // `repeat` makes a rope; a body read off the network arrives flat, and
+    // flattening it is not the redactor's cost.
+    expect(text.includes("\n")).toBe(false);
     const escapes = text.length / 3;
-    const live = (): number => {
+    const live = (): { objects: number; bytes: number } => {
       Bun.gc(true);
-      return heapStats().objectCount;
+      const stats = heapStats();
+      // heapSize already holds strings' out-of-line characters (extraMemorySize).
+      return { objects: stats.objectCount, bytes: stats.heapSize };
     };
     const proto = String.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
     const real = { includes: proto.includes, indexOf: proto.indexOf };
-    let peak = 0;
+    const peak = { objects: 0, bytes: 0 };
     let viewSearches = 0;
     const baseline = live();
     for (const name of ["includes", "indexOf"] as const) {
@@ -382,7 +390,9 @@ describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, boun
         if (this.length >= escapes) {
           // The decoded view is one `A` per escape.
           if (this.length === escapes) viewSearches += 1;
-          peak = Math.max(peak, live());
+          const now = live();
+          peak.objects = Math.max(peak.objects, now.objects);
+          peak.bytes = Math.max(peak.bytes, now.bytes);
         }
         return search.apply(this, args);
       };
@@ -398,7 +408,11 @@ describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, boun
     expect(viewSearches).toBeGreaterThan(0);
     // A few thousand more than before the call here; the first cut kept one
     // per escape, over 8.7 million.
-    expect(peak - baseline).toBeLessThan(escapes / 100);
+    expect(peak.objects - baseline.objects).toBeLessThan(escapes / 100);
+    // The decoded view and its chunks: about two thirds of the body's size
+    // here. One number per escape kept beside it: nearly four times; the
+    // flat-array map: about fourteen.
+    expect(peak.bytes - baseline.bytes).toBeLessThan(2 * text.length);
   }, 60_000);
 });
 
