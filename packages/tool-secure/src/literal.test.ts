@@ -175,10 +175,55 @@ describe("ContentPolicyCheck's phrase rules are linear in the text (C073 residua
       { id: "required", kind: "required_phrase" as const, value: `${"A".repeat(49_999)}Ab` },
       { id: "present", kind: "forbidden_phrase" as const, value: "A".repeat(50_000) },
     ];
-    // 0.7.0 took 16.6 s for the first four alone, holding the event loop.
-    const started = performance.now();
-    const out = JSON.parse(String(await contentPolicyCheck.execute({ text, rules }, {} as never)));
-    expect(performance.now() - started).toBeLessThan(5_000);
+    // Counted, not timed. 0.7.0 ran each phrase as a case-insensitive regex
+    // over the text on this thread: 16.6 s for the first four alone, holding
+    // the event loop. So a regex run over the text, or over its case-folded
+    // copy, is refused on the spot and counted. And the characters read from
+    // either (each charCodeAt, and the stretch each indexOf passes) must stay
+    // a few per character per rule, whatever the phrase's length: a search
+    // that starts the phrase over at every position is stopped past that.
+    const budget = 4 * text.length * rules.length;
+    let reads = 0;
+    let regexRuns = 0;
+    const isLong = (s: string): boolean => s.length >= text.length;
+    const read = (n: number): void => {
+      reads += n;
+      if (reads > budget) throw new Error(`the search read over ${budget} characters`);
+    };
+    const realExec = RegExp.prototype.exec;
+    const realIndexOf = String.prototype.indexOf;
+    const realCharCodeAt = String.prototype.charCodeAt;
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      if (typeof input === "string" && isLong(input)) {
+        regexRuns += 1;
+        throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
+      }
+      return realExec.call(this, input);
+    };
+    String.prototype.indexOf = function (this: string, search: string, position?: number) {
+      const at = realIndexOf.call(this, search, position);
+      if (isLong(this)) {
+        const from = Math.min(this.length, Math.max(0, Math.trunc(Number(position ?? 0)) || 0));
+        read((at === -1 ? this.length : at + String(search).length) - from);
+      }
+      return at;
+    };
+    String.prototype.charCodeAt = function (this: string, index: number) {
+      if (isLong(this)) read(1);
+      return realCharCodeAt.call(this, index);
+    };
+    let raw: unknown;
+    try {
+      raw = await contentPolicyCheck.execute({ text, rules }, {} as never);
+    } finally {
+      RegExp.prototype.exec = realExec;
+      String.prototype.indexOf = realIndexOf;
+      String.prototype.charCodeAt = realCharCodeAt;
+    }
+    expect(regexRuns).toBe(0);
+    // About 1.3 per character per rule here.
+    expect(reads).toBeLessThanOrEqual(budget);
+    const out = JSON.parse(String(raw));
     const byId = Object.fromEntries(
       (out.outcomes as { id: string; status: string; matchCount: number }[]).map((o) => [o.id, o]),
     );
@@ -188,7 +233,7 @@ describe("ContentPolicyCheck's phrase rules are linear in the text (C073 residua
     expect(byId.required).toMatchObject({ status: "fail", matchCount: 0 });
     // Case-insensitive, and not overlapping: 2 000 000 / 50 000.
     expect(byId.present).toMatchObject({ status: "fail", matchCount: 40 });
-  });
+  }, 20_000);
 
   test("the first matches are located on their lines, spelled as the text spells them", async () => {
     const out = await evaluatePolicy("Guaranteed.\nnot GUARANTEED, guaranteed", [
