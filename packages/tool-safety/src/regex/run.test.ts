@@ -1,5 +1,6 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import {
+  REGEX_RUN_DEFAULTS,
   type RegexOutcome,
   type TestResult,
   describeRegexOutcome,
@@ -268,15 +269,15 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
   }, 90_000);
 
   test("the deadline holds while the caller's event loop keeps running", async () => {
+    await settleWorkers(60_000);
     const session = openRegexSession();
     try {
-      // Warm the worker so start-up is not inside the measurement.
+      // Warm the worker so start-up is not part of the run.
       expect((await session.run({ op: "test", pattern: "a", input: "a" })).status).toBe("ok");
       let ticks = 0;
       const tick = setInterval(() => {
         ticks += 1;
       }, 10);
-      const started = performance.now();
       // Quadratic and uninterruptible from inside: ≈1 s of one core here,
       // far longer on a slow runner. It matches — the `x` is there.
       const outcome = await session.run({
@@ -285,11 +286,14 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
         input: `${" ".repeat(40_000)}x`,
         deadlineMs: 50,
       });
-      const took = performance.now() - started;
+      // Read before anything else runs: the abandoned thread is still inside
+      // its exec, so the answer came at the deadline, not when the thread
+      // got out. Waiting for it would have answered with none left running.
+      const stillRunning = regexWorkerCounts().runaway;
       clearInterval(tick);
       expect(outcome.status).toBe("timeout");
       expect(regexVerdict(outcome as RegexOutcome<TestResult>)).toBe("undetermined");
-      expect(took).toBeLessThan(2_000);
+      expect(stillRunning).toBe(1);
       expect(ticks).toBeGreaterThan(0);
       // The same session recovers with a fresh worker.
       expect(await session.run({ op: "test", pattern: "b", input: "abc" })).toMatchObject({
@@ -373,32 +377,52 @@ describe("screening many patterns", () => {
 
   test("yields to the event loop, and counts against the deadline", async () => {
     await settleWorkers(60_000);
-    const rules = Array.from({ length: 600 }, (_, i) => ({ pattern: heavyPattern(i), flags: "i" }));
-    let last = performance.now();
-    let maxGap = 0;
-    const tick = setInterval(() => {
-      const now = performance.now();
-      maxGap = Math.max(maxGap, now - last);
-      last = now;
-    }, 1);
-    last = performance.now();
+    // Counted on a fake performance.now(), not timed: each rule's screen
+    // costs 1 ms of it, and the rules screened between two turns of the event
+    // loop are counted. Before, screening held the event loop for the whole
+    // list (36 s at 1000 rules) and only then found the deadline gone.
+    let now = 0;
+    let screened = 0;
+    let sinceTurn = 0;
+    let mostBetweenTurns = 0;
+    const rules = Array.from({ length: 600 }, (_, i) => ({
+      pattern: heavyPattern(i),
+      // Read once per rule, as it is screened.
+      get flags(): string {
+        screened += 1;
+        sinceTurn += 1;
+        mostBetweenTurns = Math.max(mostBetweenTurns, sinceTurn);
+        now += 1;
+        return "i";
+      },
+    }));
+    let probing = true;
+    const probe = (): void => {
+      sinceTurn = 0;
+      if (probing) setImmediate(probe);
+    };
+    setImmediate(probe);
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
     const before = regexWorkerCounts().live;
-    const outcome = await runRegex({
-      op: "firstMatchingRule",
-      rules,
-      inputs: ["x"],
-      deadlineMs: 50,
-      maxTotalPatternChars: 1_000_000,
-    });
-    // The stretch since the last tick counts too: a continuation runs
-    // before the interval can fire again.
-    maxGap = Math.max(maxGap, performance.now() - last);
-    clearInterval(tick);
-    // Screening all 600 takes far longer than 50 ms; it stopped at the deadline.
+    let outcome: RegexOutcome<unknown>;
+    try {
+      outcome = await runRegex({
+        op: "firstMatchingRule",
+        rules,
+        inputs: ["x"],
+        deadlineMs: 50,
+        maxTotalPatternChars: 1_000_000,
+      });
+    } finally {
+      clock.mockRestore();
+      probing = false;
+    }
+    // It stopped at the deadline, about 50 rules in, not after all 600.
     expect(outcome).toMatchObject({ status: "timeout", completed: 0 });
     if (outcome.status === "timeout") expect(outcome.reason).toContain("screening");
-    // Before, this held the event loop for the whole screen (36 s at 1000 rules).
-    expect(maxGap).toBeLessThan(500);
+    expect(screened).toBeLessThan(rules.length / 10);
+    // The event loop ran at least every screenSliceMs of screening.
+    expect(mostBetweenTurns).toBeLessThanOrEqual(2 * REGEX_RUN_DEFAULTS.screenSliceMs);
     // Nothing was run, so no worker was started.
     expect(regexWorkerCounts().live).toBe(before);
   }, 60_000);

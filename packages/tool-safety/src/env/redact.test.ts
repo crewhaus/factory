@@ -1,3 +1,4 @@
+import { heapStats } from "bun:jsc";
 import { describe, expect, test } from "bun:test";
 import {
   REDACTED,
@@ -12,6 +13,71 @@ import {
 } from "./redact";
 
 const SECRET = "sk-ant-CANARY-000111222333";
+
+/**
+ * The work `run` does on `text`, counted rather than timed: `looks` is the
+ * characters of `text` it examined (one per `charCodeAt`, the span an
+ * `indexOf` or `includes` searched, the length of a `slice`), over every
+ * call. Past `budget` looks the scan is stopped. A regex run over `text` is
+ * refused outright: its work is invisible to this count, and a backtracking
+ * pattern over a long run would not finish. The prototypes are restored
+ * before this returns.
+ */
+function countLooks<T>(
+  text: string,
+  budget: number,
+  run: () => T,
+): { value: T; looks: number; regexRuns: number } {
+  const proto = String.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const realIndexOf = String.prototype.indexOf;
+  const realExec = RegExp.prototype.exec;
+  const saved: Array<[string, (...args: unknown[]) => unknown]> = [];
+  let looks = 0;
+  let regexRuns = 0;
+  const charge = (n: number): void => {
+    looks += n;
+    if (looks > budget) throw new Error(`the scan looked at more than ${budget} characters`);
+  };
+  const searched = (s: string, args: unknown[]): number => {
+    const from = Math.min(s.length, Math.max(0, Math.trunc(Number(args[1] ?? 0)) || 0));
+    const at = realIndexOf.call(s, String(args[0]), from);
+    return (at === -1 ? s.length : at + String(args[0]).length) - from;
+  };
+  const cost: Record<string, (s: string, args: unknown[], out: unknown) => number> = {
+    charCodeAt: () => 1,
+    codePointAt: () => 1,
+    charAt: () => 1,
+    at: () => 1,
+    indexOf: searched,
+    includes: searched,
+    startsWith: (_s, args) => String(args[0]).length,
+    endsWith: (_s, args) => String(args[0]).length,
+    slice: (_s, _args, out) => (out as string).length,
+    substring: (_s, _args, out) => (out as string).length,
+  };
+  for (const [name, price] of Object.entries(cost)) {
+    const real = proto[name] as (...args: unknown[]) => unknown;
+    saved.push([name, real]);
+    proto[name] = function (this: string, ...args: unknown[]) {
+      const out = real.apply(this, args);
+      if (this === text) charge(price(this, args, out));
+      return out;
+    };
+  }
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    if (input === text) {
+      regexRuns += 1;
+      throw new Error(`a regex (/${this.source.slice(0, 40)}/) ran over the caller's text`);
+    }
+    return realExec.call(this, input);
+  };
+  try {
+    return { value: run(), looks, regexRuns };
+  } finally {
+    for (const [name, real] of saved) proto[name] = real;
+    RegExp.prototype.exec = realExec;
+  }
+}
 
 describe("a secret a cut left at a string's edge (C050, net review)", () => {
   test("the start of a secret at the end of a string is replaced, down to minLength characters", () => {
@@ -178,12 +244,20 @@ describe("a secret escaped character by character (C050 residual)", () => {
   });
 
   test("the decoded view is linear: many '&', '%' and '\\' with nothing to decode", () => {
+    // Counted, not timed. A search for each `&`'s `;` that is not cut off
+    // at the longest reference reads to the end of the text from every `&`:
+    // 300 000 searches of up to 1.2 million characters.
     const hostile = `${"&".repeat(300_000)}${"%".repeat(300_000)}${"\\x".repeat(150_000)}`;
-    const started = performance.now();
-    expect(redactKnownSecrets(hostile, [KEY])).toBe(hostile);
-    expect(containsKnownSecret(hostile, [KEY])).toBe(false);
-    expect(performance.now() - started).toBeLessThan(5_000);
-  });
+    const budget = 64 * hostile.length;
+    const { value, looks, regexRuns } = countLooks(hostile, budget, () => ({
+      redacted: redactKnownSecrets(hostile, [KEY]),
+      contains: containsKnownSecret(hostile, [KEY]),
+    }));
+    expect(value.redacted).toBe(hostile);
+    expect(value.contains).toBe(false);
+    expect(regexRuns).toBe(0);
+    expect(looks).toBeLessThanOrEqual(budget);
+  }, 20_000);
 });
 
 describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, bounds review)", () => {
@@ -285,17 +359,46 @@ describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, boun
   });
 
   test("a 25 MiB body of escapes costs about its size, not an object per escape (bounds review)", () => {
-    // 0.7.1's first cut built one segment object and one string per escape:
-    // about 1.1 GiB of RSS for this body, on every authenticated HttpRequest
-    // or DownloadFile that returned it.
+    // 0.7.1's first cut built one segment object and one string per escape,
+    // and kept them while it searched the decoded view: about 1.1 GiB of RSS
+    // for this body, on every authenticated HttpRequest or DownloadFile that
+    // returned it. Counted as the objects alive while a long string is
+    // searched, after a full collection, not as RSS, which moves with the
+    // allocator and with every other test in the process.
     const text = "%41".repeat(Math.floor((25 * 1024 * 1024) / 3));
-    Bun.gc(true);
-    const before = process.memoryUsage().rss;
-    expect(containsKnownSecret(text, [KEY])).toBe(false);
-    expect(redactKnownSecrets(text, [KEY]).length).toBe(text.length);
-    expect(redactKnownSecretsDeep({ body: text }, [KEY]).body.length).toBe(text.length);
-    const grew = process.memoryUsage().rss - before;
-    expect(grew).toBeLessThan(256 * 1024 * 1024);
+    const escapes = text.length / 3;
+    const live = (): number => {
+      Bun.gc(true);
+      return heapStats().objectCount;
+    };
+    const proto = String.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+    const real = { includes: proto.includes, indexOf: proto.indexOf };
+    let peak = 0;
+    let viewSearches = 0;
+    const baseline = live();
+    for (const name of ["includes", "indexOf"] as const) {
+      const search = real[name] as (...args: unknown[]) => unknown;
+      proto[name] = function (this: string, ...args: unknown[]) {
+        if (this.length >= escapes) {
+          // The decoded view is one `A` per escape.
+          if (this.length === escapes) viewSearches += 1;
+          peak = Math.max(peak, live());
+        }
+        return search.apply(this, args);
+      };
+    }
+    try {
+      expect(containsKnownSecret(text, [KEY])).toBe(false);
+      expect(redactKnownSecrets(text, [KEY]).length).toBe(text.length);
+      expect(redactKnownSecretsDeep({ body: text }, [KEY]).body.length).toBe(text.length);
+    } finally {
+      proto.includes = real.includes as (...args: unknown[]) => unknown;
+      proto.indexOf = real.indexOf as (...args: unknown[]) => unknown;
+    }
+    expect(viewSearches).toBeGreaterThan(0);
+    // A few thousand more than before the call here; the first cut kept one
+    // per escape, over 8.7 million.
+    expect(peak - baseline).toBeLessThan(escapes / 100);
   }, 60_000);
 });
 
@@ -463,10 +566,12 @@ describe("redactUrlCredentialsInText", () => {
 
   test("a scan of caller-sized text is linear", () => {
     // A pattern like /[a-z][a-z0-9+.-]*:\/\//g backtracks through every
-    // long run of letters; the scan here never does.
+    // long run of letters; the scan here never runs one. Counted, not timed:
+    // no regex over the text, and a few looks per character.
     const text = `${"a".repeat(1_000_000)} ${"://x ".repeat(100_000)}`;
-    const started = performance.now();
-    redactUrlCredentialsInText(text);
-    expect(performance.now() - started).toBeLessThan(3_000);
+    const budget = 8 * text.length;
+    const { looks, regexRuns } = countLooks(text, budget, () => redactUrlCredentialsInText(text));
+    expect(regexRuns).toBe(0);
+    expect(looks).toBeLessThanOrEqual(budget);
   }, 20_000);
 });

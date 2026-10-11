@@ -110,15 +110,19 @@ describe("isCredentialShapedName", () => {
   });
 
   test("a caller-sized name costs linear time", () => {
-    // 1.5M characters: about 60 ms when linear on a laptop. The first
-    // version read the last character of a string built with `+=`, which
-    // flattens it each time, and took about 13 s here.
-    const name = `${"9".repeat(750_000)}a${"A".repeat(750_000)}`;
+    // The first version read the last character of a string built with
+    // `+=`, which flattens it each time: quadratic in the longest word. That
+    // cost is inside JavaScriptCore, where no count can reach, so this test
+    // still times the scan, with an input that puts the two far apart: 3M
+    // characters with a 2.5M-character word take about 0.2 s here when
+    // linear and about 170 s the first way (a 750K word took 13 s). The
+    // bound sits about 100x above the linear time and far below the other.
+    const name = `${"9".repeat(500_000)}a${"A".repeat(2_500_000)}`;
     const started = performance.now();
     isCredentialShapedName(name);
     looksLikePastedSecret(name);
-    expect(performance.now() - started).toBeLessThan(3_000);
-  }, 20_000);
+    expect(performance.now() - started).toBeLessThan(20_000);
+  }, 60_000);
 });
 
 describe("looksLikePastedSecret", () => {

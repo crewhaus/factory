@@ -2,6 +2,63 @@ import { describe, expect, test } from "bun:test";
 import { type RegexRejectCode, compileUserRegex, screenUserRegex } from "./screen";
 
 /**
+ * The steps `run` takes through arrays, maps and sets: each step of an
+ * iterator (`for…of`, spread) and each callback of `some`, `every`, `map`
+ * and the like. A count of work that does not move with the machine. The
+ * prototypes are restored before this returns.
+ */
+function countSteps(run: () => unknown): number {
+  let steps = 0;
+  const restore: Array<() => void> = [];
+  const iterators = [[], new Map(), new Set()].map(
+    (c) => Object.getPrototypeOf(c[Symbol.iterator]()) as { next: (...a: unknown[]) => unknown },
+  );
+  for (const proto of iterators) {
+    const next = proto.next;
+    proto.next = function (this: unknown, ...args: unknown[]) {
+      steps += 1;
+      return next.apply(this, args);
+    };
+    restore.push(() => {
+      proto.next = next;
+    });
+  }
+  const array = Array.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+  for (const name of [
+    "some",
+    "every",
+    "find",
+    "findIndex",
+    "forEach",
+    "map",
+    "filter",
+    "flatMap",
+  ]) {
+    const real = array[name] as (...args: unknown[]) => unknown;
+    array[name] = function (
+      this: unknown,
+      callback: (...a: unknown[]) => unknown,
+      ...rest: unknown[]
+    ) {
+      const counted = function (this: unknown, ...args: unknown[]) {
+        steps += 1;
+        return callback.apply(this, args);
+      };
+      return real.call(this, counted, ...rest);
+    };
+    restore.push(() => {
+      array[name] = real;
+    });
+  }
+  try {
+    run();
+  } finally {
+    for (const undo of restore) undo();
+  }
+  return steps;
+}
+
+/**
  * Every catastrophic pattern an audit finding reproduced, with the finding
  * that reproduced it. The screen must refuse each with the named reason —
  * these are the patterns that froze the event loop, and the ones on which
@@ -372,7 +429,12 @@ describe("the screen's own cost", () => {
   });
 
   test("stays small for the patterns that made it take seconds under the i flag", () => {
-    // Before the fold index these took 0.4-4.4 s each, on the caller's thread.
+    // Before the fold index these took 0.4-4.4 s each, on the caller's
+    // thread: every literal walked every case class in the BMP. Counted, not
+    // timed: the screen's steps through arrays, maps and sets. Each takes a
+    // few thousand here; walking the classes per literal takes millions.
+    // The index itself is built once per process, on first use.
+    screenUserRegex("(?:k)", "i");
     let tower = "x";
     let cp = 0x100;
     while (tower.length + 8 < 1000) {
@@ -385,13 +447,14 @@ describe("the screen's own cost", () => {
       ["[a-z0-9]".repeat(120), "i"],
       [tower, "i"],
     ];
+    const over: Array<{ pattern: string; steps: number }> = [];
     for (const [pattern, flags] of cases) {
       // A fresh prefix keeps the verdict cache from answering.
       const fresh = `(?:q${Math.random().toString(36).slice(2)})?${pattern}`.slice(0, 1000);
-      const started = performance.now();
-      screenUserRegex(fresh, flags);
-      expect(performance.now() - started).toBeLessThan(250);
+      const steps = countSteps(() => screenUserRegex(fresh, flags));
+      if (steps > 20 * fresh.length) over.push({ pattern: pattern.slice(0, 24), steps });
     }
+    expect(over).toEqual([]);
   });
 
   test("remembers verdicts per pattern, flags and limits", () => {
