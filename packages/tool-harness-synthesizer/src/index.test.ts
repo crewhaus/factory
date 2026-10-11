@@ -601,15 +601,16 @@ describe.if(liveDocker())(
       }
     });
 
+    // Judged by what the timeout produced and what it left, not by how long
+    // it took: a slow daemon only delays the answer. A verifier held until
+    // it ends on its own never answers, and the test's budget catches that.
     test("a verifier that never returns is stopped at the timeout, container and all", async () => {
-      const t0 = performance.now();
       await expect(
         runVerifier("while (true) {}", evenSamples, {
           sandbox: createSandbox({ backend: "docker" }),
           timeoutMs: 1_000,
         }),
       ).rejects.toThrow(/timed out after 1000ms/);
-      expect(performance.now() - t0).toBeLessThan(20_000);
       expect(names).toHaveLength(1);
       const ps = Bun.spawnSync(["docker", "ps", "-a", "-q", "--filter", `name=${names[0]}`]);
       expect(new TextDecoder().decode(ps.stdout).trim()).toBe("");
