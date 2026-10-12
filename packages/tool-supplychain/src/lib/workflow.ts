@@ -401,9 +401,32 @@ const BASE_REF_EXPRESSIONS = [
   /github\.(?:sha|ref|ref_name|base_ref)\b/,
 ];
 
+/**
+ * What is inside each `${{ … }}` in the text, in order: from each `${{` to
+ * the first `}}` after it, the next search starting past that `}}`.
+ *
+ * This is what `/\$\{\{([\s\S]*?)\}\}/g` captured, read in one pass. That
+ * pattern ran from every `${{` to the end of the text when no `}}` followed,
+ * so a value with many unclosed openers was quadratic in its length, and the
+ * text is a workflow from the repository under audit. Once one opener has no
+ * `}}` after it, no later opener does either, so the scan stops there.
+ */
+export function expressionBodies(text: string): string[] {
+  const bodies: string[] = [];
+  let from = 0;
+  for (;;) {
+    const open = text.indexOf("${{", from);
+    if (open === -1) return bodies;
+    const close = text.indexOf("}}", open + 3);
+    if (close === -1) return bodies;
+    bodies.push(text.slice(open + 3, close));
+    from = close + 2;
+  }
+}
+
 /** True when every `${{ … }}` in the text names base-repository code. */
 function allExpressionsAreBaseRefs(text: string): boolean {
-  const expressions = [...text.matchAll(/\$\{\{([\s\S]*?)\}\}/g)].map((m) => m[1] ?? "");
+  const expressions = expressionBodies(text);
   if (expressions.length === 0) return false;
   return expressions.every((expr) => BASE_REF_EXPRESSIONS.some((re) => re.test(expr)));
 }
