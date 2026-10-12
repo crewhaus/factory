@@ -196,7 +196,7 @@ describe("each reader captures what its pattern did", () => {
     const r = disagreements(inputs, prettierWarnPath, (s) => OLD_WARN.exec(s)?.[1]);
     expect(r.differ).toEqual([]);
     expect(r.matched).toBeGreaterThan(500);
-  });
+  }, 20_000);
 });
 
 describe("a long run of blanks before a line break is read once", () => {

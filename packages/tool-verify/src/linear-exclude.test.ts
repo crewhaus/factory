@@ -7,7 +7,9 @@
  * characters a call, which was about 100 million steps. `excludeKey` gives
  * what the replace gave, checked here on every short entry, and its work is
  * counted with the model in __test__/regex-work.ts: it runs no pattern, and
- * the old replace goes past the same bound.
+ * the old replace goes past the same bound. Both walk many inputs, so each
+ * declares a 20 s budget, as the house does for a test that is slow by
+ * construction.
  */
 import { describe, expect, test } from "bun:test";
 import { regexWork } from "./__test__/regex-work";
@@ -32,7 +34,7 @@ describe("excludeKey", () => {
       (p) => excludeKey(p) !== p.replace(OLD, ""),
     );
     expect(differ).toEqual([]);
-  });
+  }, 20_000);
 
   test("reads a run of slashes once", () => {
     const entries = Array.from({ length: 64 }, (_, i) => `${"/".repeat(1_023)}${i}`);
@@ -44,5 +46,5 @@ describe("excludeKey", () => {
     expect(regexWork(bound, () => entries.map((p) => p.replace(OLD, ""))).steps).toBe(
       Number.POSITIVE_INFINITY,
     );
-  });
+  }, 20_000);
 });
