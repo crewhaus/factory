@@ -141,8 +141,8 @@ describe("buildImportGraph lists a file's targets in one pass", () => {
 });
 
 describe("DependencyList lists a name's locked versions in one pass", () => {
-  // About 39 a locked version here, most of it reading the lockfile.
-  const WORK_PER_VERSION = 100;
+  // About 113 a locked version here, most of it reading the two lockfiles.
+  const WORK_PER_VERSION = 300;
   const originalCwd = process.cwd();
   const dirs = { workspace: "" };
 
@@ -156,17 +156,26 @@ describe("DependencyList lists a name's locked versions in one pass", () => {
     rmSync(dirs.workspace, { recursive: true, force: true });
   });
 
-  test("one name locked at thousands of versions, some twice", async () => {
+  test("one name locked at thousands of versions, in two lockfiles", async () => {
     writeFileSync("package.json", JSON.stringify({ name: "w", dependencies: { a: "*" } }));
     const rows: Array<{ k: number; work: number; out: string }> = [];
     for (const k of [2_000, 4_000]) {
       const packages: Record<string, unknown> = { "": { name: "w" } };
       for (const i of range(k))
         packages[`node_modules/x${i}/node_modules/a`] = { version: `1.0.${i}` };
-      // The same versions again under other paths: listed once.
+      // The same versions again under other paths: listed once. The reader
+      // already drops these within one lockfile.
       for (const i of range(k / 4))
         packages[`node_modules/y${i}/node_modules/a`] = { version: `1.0.${i}` };
       writeFileSync("package-lock.json", JSON.stringify({ lockfileVersion: 3, packages }));
+      // A second lockfile locking every version again, and one more: the
+      // repeats across lockfiles are the ones the index itself must drop.
+      writeFileSync(
+        "yarn.lock",
+        [...range(k).map((i) => `1.0.${i}`), "2.0.0"]
+          .map((v) => `"a@${v}":\n  version "${v}"\n`)
+          .join("\n"),
+      );
       const input = dependencyList.inputSchema.parse({ includeLocked: true });
       const run = await jsWorkAsync(
         WORK_PER_VERSION * k,
@@ -178,11 +187,7 @@ describe("DependencyList lists a name's locked versions in one pass", () => {
       expect(work).toBeLessThanOrEqual(WORK_PER_VERSION * k);
       const locked = (JSON.parse(out) as { dependencies: Array<{ locked?: string[] }> })
         .dependencies[0]?.locked;
-      expect(locked).toEqual(
-        range(k)
-          .map((i) => `1.0.${i}`)
-          .sort(),
-      );
+      expect(locked).toEqual([...range(k).map((i) => `1.0.${i}`), "2.0.0"].sort());
     }
     const [small, large] = rows as [(typeof rows)[0], (typeof rows)[0]];
     expect(large.work / small.work).toBeLessThan(2.4);
