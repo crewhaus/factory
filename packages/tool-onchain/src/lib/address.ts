@@ -95,6 +95,25 @@ export function checkedAddress(raw: unknown, what: string): string {
 }
 
 /**
+ * Whether `text` is an optional `-`, digits, an optional `.` and digits: what
+ * `/^-?\d*\.?\d*$/.test(text)` answered, in one pass. That pattern gave
+ * every digit back to the second run in turn when the text did not end where
+ * it should, so a long run of digits before a stray character was quadratic
+ * in its length, and the amount is the model's.
+ */
+export function isDecimalText(text: string): boolean {
+  const digit = (i: number): boolean => {
+    const c = text.charCodeAt(i);
+    return c >= 0x30 && c <= 0x39;
+  };
+  let i = text.charCodeAt(0) === 0x2d ? 1 : 0;
+  while (i < text.length && digit(i)) i++;
+  if (text.charCodeAt(i) === 0x2e) i++;
+  while (i < text.length && digit(i)) i++;
+  return i === text.length;
+}
+
+/**
  * Parse a decimal amount into base units, exactly.
  *
  * `parseFloat("0.1") * 1e18` is not 10^17, and the difference is real money.
@@ -102,7 +121,7 @@ export function checkedAddress(raw: unknown, what: string): string {
  */
 export function parseUnits(amount: string, decimals: number): bigint {
   const text = amount.trim();
-  if (!/^-?\d*\.?\d*$/.test(text) || text === "" || text === "." || text === "-") {
+  if (!isDecimalText(text) || text === "" || text === "." || text === "-") {
     throw new Error(`"${amount}" is not a decimal amount`);
   }
   const negative = text.startsWith("-");
