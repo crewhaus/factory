@@ -40,6 +40,8 @@ import {
   harnessRegister,
   hooksManage,
 } from "./index";
+import { contain, containUnder, containWritePaths } from "./lib/result";
+import { MAX_PATH_CHARS } from "./paths";
 
 const SPEC = "name: demo\ntarget: cli\nagent:\n  model: claude-sonnet-4-5\n  instructions: hi\n";
 
@@ -300,6 +302,37 @@ test("HooksManage refuses when the hook run log leads out of the workspace", asy
 // ---------------------------------------------------------------------------
 // numbers people act on
 // ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — a name past MAX_PATH_CHARS leads nowhere, so it is no
+ * escape, and a refusal of it says so rather than blaming a symlink. The
+ * tools hand these helpers an existing harness directory, under which a
+ * fixed leaf passes the limit only in a workspace whose own path is shorter
+ * than the leaf; so the helpers are held to it here, under a directory that
+ * is contained but sits just inside the limit.
+ */
+test("a leaf past the path limit is skipped as a write and refused for its length when opened", () => {
+  // Resolved against the real root, as the containment check resolves it.
+  const prefix = `${tmp}/h/`;
+  const tail = MAX_PATH_CHARS - 5 - prefix.length;
+  const pairs = Math.floor((tail - 1) / 2);
+  const dir = `h/${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  const root = contain("HooksManage", dir);
+  if (!root.ok) throw new Error(`a directory inside the limit was refused: ${root.reason}`);
+  const leaf = ".crewhaus/settings.json";
+  const past = path.resolve(dir, leaf).length;
+  expect(past).toBeGreaterThan(MAX_PATH_CHARS);
+  // Written: it cannot be created, so there is nothing to contain.
+  expect(containWritePaths("HooksManage", root.value, [leaf])).toBeUndefined();
+  // Opened: refused, for its length and the limit.
+  const opened = containUnder("HooksManage", root.value, leaf);
+  expect(opened.ok ? undefined : { code: opened.code, why: opened.reason.split('": ')[1] }).toEqual(
+    {
+      code: "refused",
+      why: `it is ${past} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    },
+  );
+});
 
 test("CliVersionPin says when the cap stopped it, so the roll-up is not read as the fleet", async () => {
   // 500 is the cap. A silent stop means `mixedFleet: false` for a fleet

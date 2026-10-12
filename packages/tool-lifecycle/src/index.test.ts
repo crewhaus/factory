@@ -34,6 +34,7 @@ import * as path from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { harnessRetire, knowledgeSync, retentionEnforce, storeMigrate } from "./index";
 import { ARCHIVED_STATE_DIRNAME, STATE_MANIFEST_FILENAME } from "./lib/retire";
+import { MAX_PATH_CHARS } from "./paths";
 
 const TOOLS = [harnessRetire, storeMigrate, retentionEnforce, knowledgeSync];
 const DAY_MS = 86_400_000;
@@ -1004,6 +1005,34 @@ test("StoreMigrate refuses a destination path that is a symlink out of the works
   // overwrite replaces FILES; it is not consent to write through a link that
   // leaves the workspace, so there is no flag that gets past this.
   expect(existsSync(victim)).toBe(false);
+});
+
+/**
+ * 0.7.1 review — a write path too long to be a path leads nowhere, so it is
+ * no escape. A destination just inside MAX_PATH_CHARS is contained; what the
+ * migration writes beneath it (`manifest.json`, `sessions/…`) is past it, and
+ * the per-file containment skips those names rather than calling them a
+ * symlink out of the workspace. The call then meets the filesystem's own
+ * refusal: the name is too long.
+ */
+test("StoreMigrate under a destination at the path limit says the name is too long, not that a link leads out", async () => {
+  store();
+  // Resolved against the real root, as the containment check resolves it.
+  const prefix = `${process.cwd()}/moved/`;
+  const tail = MAX_PATH_CHARS - 5 - prefix.length;
+  const pairs = Math.floor((tail - 1) / 2);
+  const to = `moved/${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  expect(path.resolve(to).length).toBe(MAX_PATH_CHARS - 5);
+  for (const dryRun of [true, false]) {
+    const r = await callJson(storeMigrate, { to, dryRun });
+    expect({ dryRun, status: r["status"], code: r["code"], reason: r["reason"] }).toEqual({
+      dryRun,
+      status: "refused",
+      code: "unreadable",
+      reason: "the destination could not be read (ENAMETOOLONG)",
+    });
+  }
+  expect(existsSync(path.join(tmp, "moved"))).toBe(false);
 });
 
 test("KnowledgeSync refuses to push through a shared file that leaves the workspace", async () => {

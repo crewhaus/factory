@@ -29,6 +29,7 @@ import {
   seoLint,
 } from "./index";
 import { _setIntegrityLimitsForTest, integrityWalk } from "./integrity";
+import { MAX_PATH_CHARS } from "./paths";
 
 const originalCwd = process.cwd();
 let workspace: string;
@@ -904,6 +905,23 @@ describe("MarkdownLinkCheck", () => {
     );
   });
 
+  /**
+   * 0.7.1 review — a link longer than any path can be is refused before it
+   * is walked, and reported for what it is: too long, not outside.
+   */
+  test("a link longer than any path can be is reported as too long, not as outside", async () => {
+    const href = `${"c/".repeat(MAX_PATH_CHARS / 2)}d.md`;
+    writeFileSync(join(workspace, "docs/long.md"), `[long](${href})\n`);
+    const result = await call<{ broken: Array<{ href: string; reason: string }> }>(
+      markdownLinkCheck,
+      { path: "docs" },
+    );
+    const length = `${process.cwd()}/docs/${href}`.length;
+    expect(result.broken.find((b) => b.href === href)?.reason).toBe(
+      `it is ${length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
+  });
+
   test("a link that leaves the workspace through a symlink is reported, not opened", async () => {
     // `resolve` does not follow symlinks and `statSync` does, so a lexical
     // containment check calls this link fine and then opens the file it
@@ -1068,6 +1086,21 @@ describe("FactCrossCheck", () => {
     const claim = await one("A further point.", ["Smith, J. (2024). Something Printed."]);
     expect(claim.verdict).toBe("unchecked");
     expect(claim.reason).toContain("not a file in the workspace");
+  });
+
+  /**
+   * 0.7.1 review — a cited source longer than any path can be is refused
+   * before it is walked, and reported for what it is: too long, not outside.
+   */
+  test("a source longer than any path can be is unreadable for its length, not outside", async () => {
+    const source = `sources/${"c/".repeat(MAX_PATH_CHARS / 2)}r.md`;
+    const claim = await one("Revenue rose 4.5% in the second quarter.", [source]);
+    expect(claim.verdict).toBe("unreadable");
+    const length = `${process.cwd()}/${source}`.length;
+    expect(claim.reason).toContain(
+      `it is ${length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
+    expect(claim.reason).not.toContain("outside the workspace");
   });
 
   test("a source reached through a symlink out of the workspace is refused", async () => {
