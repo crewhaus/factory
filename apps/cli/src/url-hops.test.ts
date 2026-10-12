@@ -6,17 +6,19 @@
  * against its own allow-list in `tool_config` and the private-address guard,
  * not against permission rules: a tool has no way to ask the runtime's gate
  * about a URL in the middle of a call. That is a known limitation of 0.7.1,
- * planned for 0.8 with the extracted tool guard. The first two describes PIN
- * it, so the fix shows up here as a deliberate change, and hold the boundary
- * that does apply at every hop: an origin off the tool's allow-list.
+ * planned for 0.8 with the extracted tool guard. The first three describes
+ * PIN it (tool-http, HealthProbe, Fetch, WebFetch; an origin-wide rule and a
+ * rule on part of an allowed origin), so the fix shows up here as a
+ * deliberate change, and hold the boundary that does apply at every hop: an
+ * origin off the tool's allow-list.
  *
  * The rest are fixes. DependencyAudit (whose mirror is checked against
  * `tool_config.fetch`) and the chain reads (whose nodes the spec's `chains`
  * block names) sent their requests with the platform's `fetch`, which follows
  * a redirect anywhere. Both now refuse every redirect, even one to the same
- * address, and say where it pointed. And a chain read that fails on
- * every node is judged on what each node said, not on the words of whichever
- * node failed last: that is what decides whether EvmSimulateBundle and
+ * address, and say where it pointed. And a chain read that fails on every
+ * node is judged on what each node said, not on the words of whichever node
+ * failed last: that is what decides whether EvmSimulateBundle and
  * GasMarketRead fall back and whether ContractInspect reads a revert.
  *
  * Everything runs through runChatLoop's real gate and the real tools, against
@@ -63,6 +65,12 @@ import {
   httpRequest,
   registerHttpConfig,
 } from "@crewhaus/tool-http";
+import {
+  __setPrivateHostsAllowedForTest as __setObsPrivateHostsAllowedForTest,
+  _resetObsConfig,
+  healthProbe,
+  registerObsConfig,
+} from "@crewhaus/tool-obs";
 import { _setFetch as _setOsvFetch, dependencyAudit } from "@crewhaus/tool-supplychain";
 import {
   _resetWebFetchConfig,
@@ -240,7 +248,7 @@ const resolvePublic = async () => ({ address: "203.0.113.7", family: 4 });
 // PINNED — tool-http: rules read the call's URL; later hops meet the allow-list
 // ---------------------------------------------------------------------------
 
-describe("tool-http: a URL rule is read on the call's URL, not on later hops (known limitation, pinned)", () => {
+describe("tool-http and HealthProbe: a URL rule is read on the call's URL, not on later hops (known limitation, pinned)", () => {
   // A is the origin calls name; B is on the tool's allow-list and the origin a
   // rule denies; C is on no list at all.
   const b = server((_req, url) =>
@@ -273,10 +281,14 @@ describe("tool-http: a URL rule is read on the call's URL, not on later hops (kn
   beforeAll(() => {
     registerHttpConfig({ allowed_origins: [a.origin, b.origin] });
     __setPrivateHostsAllowedForTest(true);
+    registerObsConfig({ allowed_origins: [a.origin, b.origin] });
+    __setObsPrivateHostsAllowedForTest(true);
   });
   afterAll(() => {
     _resetHttpConfig();
     __setPrivateHostsAllowedForTest(false);
+    _resetObsConfig();
+    __setObsPrivateHostsAllowedForTest(false);
     for (const s of [a, b, c]) s.stop();
   });
   beforeEach(() => {
@@ -297,6 +309,15 @@ describe("tool-http: a URL rule is read on the call's URL, not on later hops (kn
     expect((await call(httpPaginate, direct, deny("HttpPaginate"))).decision).toBe("deny");
     expect(
       (await call(headRequest, { url: `${b.origin}/admin` }, deny("HeadRequest"))).decision,
+    ).toBe("deny");
+    expect(
+      (
+        await call(
+          healthProbe,
+          { urls: [`${b.origin}/admin`], deadlineMs: 30_000 },
+          deny("HealthProbe"),
+        )
+      ).decision,
     ).toBe("deny");
     expect(b.got).toEqual([]);
   }, 60_000);
@@ -359,6 +380,23 @@ describe("tool-http: a URL rule is read on the call's URL, not on later hops (kn
     });
   }, 60_000);
 
+  test("PINNED: HealthProbe follows a redirect to the origin a deny names", async () => {
+    const out = await call(
+      healthProbe,
+      { urls: [`${a.origin}/to-b`], deadlineMs: 30_000 },
+      rules(["alwaysDeny", `HealthProbe(${b.origin}/**)`], ["alwaysAllow", "HealthProbe"]),
+    );
+    expect({
+      decision: out.decision,
+      bGot: b.got,
+      healthy: out.result.includes('"healthy":1'),
+    }).toEqual({
+      decision: "allow",
+      bGot: ["GET /admin"],
+      healthy: true,
+    });
+  }, 60_000);
+
   test("PINNED: a justification judge that allows is not a URL check (HttpRequest)", async () => {
     const out = await call(
       httpRequest,
@@ -381,10 +419,103 @@ describe("tool-http: a URL rule is read on the call's URL, not on later hops (kn
     const allow = (tool: string) => rules(["alwaysAllow", tool]);
     const next = await call(httpPaginate, paginate("/page1-off"), allow("HttpPaginate"));
     const hop = await call(headRequest, { url: `${a.origin}/to-c` }, allow("HeadRequest"));
-    expect({ next: next.result, hop: hop.result, cGot: c.got }).toEqual({
+    const probe = await call(
+      healthProbe,
+      { urls: [`${a.origin}/to-c`], deadlineMs: 30_000 },
+      allow("HealthProbe"),
+    );
+    expect({ next: next.result, hop: hop.result, probe: probe.result, cGot: c.got }).toEqual({
       next: `denied: origin "${c.origin}" is not in allowed_origins`,
       hop: expect.stringContaining(`denied: origin "${c.origin}" is not in allowed_origins`),
+      probe: expect.stringContaining('"refused":1'),
       cGot: [],
+    });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// PINNED — a rule on PART of an allowed origin is not read on the same origin's hops
+// ---------------------------------------------------------------------------
+
+describe("a URL rule on part of an allowed origin is not read on a same-origin redirect or next page (known limitation, pinned)", () => {
+  // A must stay on the allow-list, so leaving it off is no workaround here:
+  // the remaining one is to deny the tool.
+  const a = server((_req, url) => {
+    if (url.pathname === "/public") {
+      return new Response(null, { status: 307, headers: { location: "/admin/secret" } });
+    }
+    if (url.pathname === "/list") {
+      return Response.json([{ a: 1 }], { headers: { link: `</admin/page2>; rel="next"` } });
+    }
+    return Response.json(url.pathname.startsWith("/admin/") ? [{ secret: "admin-only" }] : {});
+  });
+  const deny = (tool: string) =>
+    rules(["alwaysDeny", `${tool}(${a.origin}/admin/**)`], ["alwaysAllow", tool]);
+  const list = (path: string) => ({
+    url: `${a.origin}${path}`,
+    style: "link",
+    maxPages: 2,
+    timeoutMs: 30_000,
+  });
+
+  beforeAll(() => {
+    registerHttpConfig({ allowed_origins: [a.origin] });
+    __setPrivateHostsAllowedForTest(true);
+    registerObsConfig({ allowed_origins: [a.origin] });
+    __setObsPrivateHostsAllowedForTest(true);
+  });
+  afterAll(() => {
+    _resetHttpConfig();
+    __setPrivateHostsAllowedForTest(false);
+    _resetObsConfig();
+    __setObsPrivateHostsAllowedForTest(false);
+    a.stop();
+  });
+  beforeEach(() => {
+    a.got.length = 0;
+  });
+
+  test("control: a call that names the denied path is denied, and nothing is sent", async () => {
+    const decisions = [
+      (await call(headRequest, { url: `${a.origin}/admin/secret` }, deny("HeadRequest"))).decision,
+      (await call(httpPaginate, list("/admin/page2"), deny("HttpPaginate"))).decision,
+      (
+        await call(
+          healthProbe,
+          { urls: [`${a.origin}/admin/secret`], deadlineMs: 30_000 },
+          deny("HealthProbe"),
+        )
+      ).decision,
+    ];
+    expect({ decisions, aGot: a.got }).toEqual({ decisions: ["deny", "deny", "deny"], aGot: [] });
+  }, 60_000);
+
+  test("PINNED: a same-origin 307 and a same-origin next page reach the denied path", async () => {
+    const out: Record<string, unknown> = {};
+    const head = await call(headRequest, { url: `${a.origin}/public` }, deny("HeadRequest"));
+    out["HeadRequest"] = { decision: head.decision, aGot: [...a.got] };
+    a.got.length = 0;
+    const page = await call(httpPaginate, list("/list"), deny("HttpPaginate"));
+    out["HttpPaginate"] = {
+      decision: page.decision,
+      aGot: [...a.got],
+      carriesAdmin: page.result.includes("admin-only"),
+    };
+    a.got.length = 0;
+    const probe = await call(
+      healthProbe,
+      { urls: [`${a.origin}/public`], deadlineMs: 30_000 },
+      deny("HealthProbe"),
+    );
+    out["HealthProbe"] = { decision: probe.decision, aGot: [...a.got] };
+    expect(out).toEqual({
+      HeadRequest: { decision: "allow", aGot: ["HEAD /public", "HEAD /admin/secret"] },
+      HttpPaginate: {
+        decision: "allow",
+        aGot: ["GET /list", "GET /admin/page2"],
+        carriesAdmin: true,
+      },
+      HealthProbe: { decision: "allow", aGot: ["GET /public", "GET /admin/secret"] },
     });
   }, 60_000);
 });

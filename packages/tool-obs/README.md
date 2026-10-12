@@ -60,6 +60,12 @@ minted for, and a deadline and byte cap on every request — including the DNS
 step, which takes no signal of its own and would otherwise outlive the deadline
 by the resolver's own timeout.
 
+A URL rule, such as `alwaysDeny HealthProbe(https://admin.example/**)`, is
+checked only on the URLs a call names. A redirect hop is checked against
+`allowed_origins`, not your rules, and a rule on part of an origin, such as a
+path, is not checked on it at all, even on the same origin. To be sure a place
+is not probed: keep its origin out of `allowed_origins`, or deny the tool.
+
 The allow-list is a *reachability* list and is wider than the platform the token
 belongs to, so the token is scoped separately: it goes only to the origins the
 spec configured as obs surfaces. `HealthProbe` can sweep every allow-listed

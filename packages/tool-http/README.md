@@ -94,14 +94,14 @@ second HTTP surface with a weaker gate would be the same hole twice.
 9. `Cookie`, `Set-Cookie` and `Authorization` are stripped from response
    headers before anything reaches a model.
 
-**What a permission rule covers.** A URL rule such as
-`alwaysDeny HttpPaginate(https://admin.example/**)` is checked against the URL
-the call names. The requests the tool makes after that — each redirect hop,
-and each next page `HttpPaginate` follows — are checked against
-`allowed_origins` (points 3–5), not against your rules. So an origin you deny
-is reached if an allowed origin redirects there or names it as the next page.
-Keep an origin you deny out of `allowed_origins`, and list an origin only if
-every place it can send these tools is one you trust.
+**What a permission rule covers.** A URL rule, such as
+`alwaysDeny HttpPaginate(https://admin.example/**)`, is checked only on the
+URL a call names. Redirect hops, and the next pages `HttpPaginate` follows, are
+checked against the tool's allow-list (points 3–5), not your rules. This
+covers the tools here, `Fetch`, `WebFetch` and `HealthProbe`. A rule on part
+of an origin, such as a path, is not checked on those requests at all, even on
+the same origin. To be sure a place is not reached: keep its origin out of
+`allowed_origins` (for `WebFetch`, set `allowed_domains`), or deny the tool.
 
 ## Secrets
 
