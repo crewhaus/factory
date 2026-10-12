@@ -82,6 +82,7 @@ import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/ten
 import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import YAML from "yaml";
 import { type AcquireLockOptions, withLock } from "./lock";
+import { wikilinkInners } from "./wikilinks";
 
 export {
   type AcquireLockOptions,
@@ -165,7 +166,6 @@ function instantOf(timestamp: string): number | undefined {
   return Number.isNaN(ms) ? undefined : ms;
 }
 
-const WIKILINK_REGEX = /\[\[([^\]]+)\]\]/g;
 /**
  * The most of one article file the store reads or writes. Reads are capped
  * before anything is buffered; a write past it is refused, so the store
@@ -417,8 +417,7 @@ export type WikiStoreOptions = {
 export function extractWikilinks(body: string, self?: string): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const match of body.matchAll(WIKILINK_REGEX)) {
-    const inner = match[1] ?? "";
+  for (const inner of wikilinkInners(body)) {
     const target = (inner.split("|")[0] ?? "").trim().toLowerCase().replace(/\s+/g, "-");
     if (!SLUG_REGEX.test(target)) continue;
     if (target === self) continue;
@@ -456,7 +455,7 @@ export function serializeArticle(article: WikiArticle): string {
     updatedAt: frontmatter.updatedAt,
   };
   const yamlText = YAML.stringify(fm).trimEnd();
-  return `---\n${yamlText}\n---\n\n${body.replace(/\s+$/, "")}\n`;
+  return `---\n${yamlText}\n---\n\n${body.trimEnd()}\n`;
 }
 
 /** Parse an article file. Throws `WikiStoreError` on a malformed file. */
@@ -470,7 +469,7 @@ export function parseArticle(raw: string): WikiArticle {
   }
   const yamlText = raw.slice(4, end + 1);
   const rest = raw.slice(end + 4);
-  const body = rest.replace(/^\r?\n+/, "").replace(/\s+$/, "");
+  const body = rest.replace(/^\r?\n+/, "").trimEnd();
   let fm: unknown;
   try {
     fm = YAML.parse(yamlText);
