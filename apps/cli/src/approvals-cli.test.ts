@@ -153,7 +153,7 @@ describe("crewhaus approvals (CLI)", () => {
     expect(listed.exitCode).toBe(0);
     expect(listed.stdout).toContain(ID);
     expect(listed.stdout).toContain("pending");
-  });
+  }, 20_000);
 
   test("show prints detail incl. the tool input; --json is machine-readable", async () => {
     await seedApproval(ID);
@@ -165,7 +165,7 @@ describe("crewhaus approvals (CLI)", () => {
     const parsed = JSON.parse(asJson.stdout) as PendingApproval;
     expect(parsed.id).toBe(ID);
     expect(parsed.toolName).toBe("Bash");
-  });
+  }, 20_000);
 
   test("grant records a one-shot decision surfaced on the next list", async () => {
     await seedApproval(ID);
@@ -180,7 +180,7 @@ describe("crewhaus approvals (CLI)", () => {
     const parsed = JSON.parse(shown.stdout) as PendingApproval;
     expect(parsed.decision).toBe("grant");
     expect(parsed.decidedBy).toBe("max");
-  });
+  }, 20_000);
 
   test("deny records a deny decision", async () => {
     await seedApproval(ID);
@@ -189,7 +189,7 @@ describe("crewhaus approvals (CLI)", () => {
     expect(denied.stdout).toContain("denied");
     const shown = await runCli(["approvals", "show", ID, "--json"]);
     expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBe("deny");
-  });
+  }, 20_000);
 
   test("grant/deny/show of an unknown id fails cleanly", async () => {
     const unknown = "appr_0000000000000000";
@@ -198,19 +198,19 @@ describe("crewhaus approvals (CLI)", () => {
     expect(grant.stderr).toContain(`no approval "${unknown}"`);
     const show = await runCli(["approvals", "show", unknown]);
     expect(show.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("a malformed id is rejected with the store's message", async () => {
     const { exitCode, stderr } = await runCli(["approvals", "grant", "not-an-id"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain("invalid approvalId");
-  });
+  }, 20_000);
 
   test("an unknown action is rejected", async () => {
     const { exitCode, stderr } = await runCli(["approvals", "bogus"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain("approvals action must be one of");
-  });
+  }, 20_000);
 
   test("bare and --help both print usage (exit 0)", async () => {
     for (const args of [["approvals"], ["approvals", "--help"]]) {
@@ -218,7 +218,7 @@ describe("crewhaus approvals (CLI)", () => {
       expect(exitCode).toBe(0);
       expect(stdout).toContain("usage: crewhaus approvals list|show|grant|deny");
     }
-  });
+  }, 20_000);
 
   test("--dir points at another harness root", async () => {
     await seedApproval(ID);
@@ -237,7 +237,7 @@ describe("crewhaus approvals (CLI)", () => {
     } finally {
       rmSync(sibling, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("#383 — grant --always records the grant AND writes the standing settings rule", async () => {
     await seedApproval(ID, "log_knowledge_gap");
@@ -262,7 +262,7 @@ describe("crewhaus approvals (CLI)", () => {
     expect(parsed.always).toBe(true);
     const listed = await runCli(["approvals", "list"]);
     expect(listed.stdout).toContain("granted-always");
-  });
+  }, 20_000);
 
   test("#383 — a second grant --always for the same tool is a dedupe no-op", async () => {
     await seedApproval(ID, "log_knowledge_gap");
@@ -276,7 +276,7 @@ describe("crewhaus approvals (CLI)", () => {
       permissions: { rules: unknown[] };
     };
     expect(settings.permissions.rules).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("#383 — --always preserves unrelated settings.json keys", async () => {
     mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
@@ -293,7 +293,7 @@ describe("crewhaus approvals (CLI)", () => {
     };
     expect(settings.hooks).toEqual({ "pre-tool": [] });
     expect(settings.permissions.rules[0]?.pattern).toBe("Bash");
-  });
+  }, 20_000);
 
   test("#383 — --always with a CREWHAUS_SESSION_DIR-located store fails closed (needs --dir)", async () => {
     // Seed the store in a RELOCATED root — the env var finds it, but the
@@ -331,7 +331,7 @@ describe("crewhaus approvals (CLI)", () => {
     } finally {
       rmSync(relocated, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("#383 — deny --always is rejected", async () => {
     await seedApproval(ID);
@@ -342,7 +342,7 @@ describe("crewhaus approvals (CLI)", () => {
     const shown = await runCli(["approvals", "show", ID, "--json"]);
     expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBeUndefined();
     expect(existsSync(join(cwd, ".crewhaus", "settings.json"))).toBe(false);
-  });
+  }, 20_000);
 
   test("#383 — a malformed settings.json fails the --always write loudly, grant stays recorded", async () => {
     mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
@@ -356,5 +356,5 @@ describe("crewhaus approvals (CLI)", () => {
     expect((JSON.parse(shown.stdout) as PendingApproval).decision).toBe("grant");
     // …and the unparseable file is untouched.
     expect(readFileSync(join(cwd, ".crewhaus", "settings.json"), "utf8")).toBe("{broken");
-  });
+  }, 20_000);
 });

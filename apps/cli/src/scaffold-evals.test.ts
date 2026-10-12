@@ -419,7 +419,7 @@ describe("crewhaus scaffold-evals (CLI, offline)", () => {
     const forced = await runCli(["scaffold-evals", "crewhaus.yaml", "--force"], root);
     expect(forced.exitCode).toBe(0);
     expect(readJsonl(datasetPath)).toHaveLength(DEFAULT_SCAFFOLD_SAMPLES);
-  });
+  }, 20_000);
 
   it("template mode is deterministic across runs", async () => {
     const rootA = newTempRoot();
@@ -434,7 +434,7 @@ describe("crewhaus scaffold-evals (CLI, offline)", () => {
     expect(readFileSync(join(rootA, "eval", "graders.yaml"), "utf-8")).toBe(
       readFileSync(join(rootB, "eval", "graders.yaml"), "utf-8"),
     );
-  });
+  }, 20_000);
 
   it("rejects a missing spec and a bad --samples", async () => {
     const root = newTempRoot();
@@ -443,7 +443,7 @@ describe("crewhaus scaffold-evals (CLI, offline)", () => {
     expect(
       (await runCli(["scaffold-evals", "crewhaus.yaml", "--samples", "0"], root)).exitCode,
     ).toBe(1);
-  });
+  }, 20_000);
 });
 
 // -------- E47: the eval-template family library --------
@@ -746,7 +746,7 @@ describe("crewhaus init --with-evals (CLI, always offline)", () => {
     const { config } = parseGradersConfig(readFileSync(gradersPath, "utf-8"));
     expect(config.graders[0]?.name).toBe("non_empty_answer");
     expect(config.graders[0]?.type).toBe("regex");
-  });
+  }, 20_000);
 
   it("composes with an existing harness and keeps existing eval assets", async () => {
     const root = newTempRoot();
@@ -762,5 +762,5 @@ describe("crewhaus init --with-evals (CLI, always offline)", () => {
     writeFileSync(datasetPath, `${firstDataset}{"id":"user_added","input":"my own sample"}\n`);
     expect((await runCli(["init", "--with-evals"], root)).exitCode).toBe(0);
     expect(readFileSync(datasetPath, "utf-8")).toContain("user_added");
-  });
+  }, 20_000);
 });

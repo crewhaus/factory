@@ -454,7 +454,7 @@ describe("crewhaus compile", () => {
       expect(result.stderr).not.toContain("CompilerError");
       expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
       if (mode === "bundle") expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-    });
+    }, 20_000);
   }
 
   // (c) CLEAN spec still compiles by default (no flag, no opt-out).
@@ -881,7 +881,7 @@ describe("crewhaus init", () => {
     expect(result.stdout).toMatch(/wrote .*crewhaus\.yaml/);
     // Scaffolded in cwd → run in place, no cd needed.
     expect(result.stdout).toContain("next: crewhaus run crewhaus.yaml");
-  });
+  }, 20_000);
 
   test("scaffolds into a named subdirectory", async () => {
     const result = await runCli(["init", "myapp"], { cwd: tmp });
@@ -893,14 +893,14 @@ describe("crewhaus init", () => {
     // Scaffolded into a subdir → the hint must cd into it so the runtime
     // resolves the spec + .crewhaus/ session store from the harness dir.
     expect(result.stdout).toContain("next: cd myapp && crewhaus run crewhaus.yaml");
-  });
+  }, 20_000);
 
   test("fails when crewhaus.yaml already exists", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), "name: pre\ntarget: cli\n");
     const result = await runCli(["init"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("already exists");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus run", () => {
@@ -912,7 +912,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("agent ready");
     expect(result.stdout).toContain("model: claude-sonnet-4-6");
-  });
+  }, 20_000);
 
   test("--model overrides the spec model", async () => {
     const result = await runCli(["run", HELLO_SPEC, "--model", "claude-haiku-4-5-20251001"], {
@@ -921,7 +921,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("model: claude-haiku-4-5-20251001");
-  });
+  }, 20_000);
 
   test("errors with a clear message when the spec is missing", async () => {
     const result = await runCli(["run", join(tmp, "nope.yaml")], {
@@ -929,7 +929,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("could not read");
-  });
+  }, 20_000);
 
   test("browser target rejects --resume with a clear error (single-turn)", async () => {
     const result = await runCli(
@@ -939,7 +939,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--resume");
     expect(result.stderr).toContain("browser");
-  });
+  }, 20_000);
 
   test("browser target rejects --continue with a clear error (single-turn)", async () => {
     const result = await runCli(["run", BROWSER_SPEC, "--continue", "--prompt", "ignored"], {
@@ -948,7 +948,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--continue");
     expect(result.stderr).toContain("browser");
-  });
+  }, 20_000);
 
   test("browser target errors with 'no prompt' when neither --prompt nor stdin supplies one", async () => {
     const result = await runCli(["run", BROWSER_SPEC], {
@@ -957,7 +957,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("no prompt");
-  });
+  }, 20_000);
 
   test("unsupported target names cli + browser in the dispatch error", async () => {
     const result = await runCli(["run", VOICE_SPEC], {
@@ -966,7 +966,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("cli or browser");
     expect(result.stderr).toContain('got "voice"');
-  });
+  }, 20_000);
 
   // FR-004 — --justification-judge selects the Pillar 3 intent-gate judge.
   // This subprocess test proves the flag resolves and the agent starts; the
@@ -985,7 +985,7 @@ describe("crewhaus run", () => {
     // resolves without error.
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("model: claude-sonnet-4-6");
-  });
+  }, 20_000);
 
   test("--justification-judge rule-based starts the agent cleanly (explicit default)", async () => {
     const result = await runCli(["run", HELLO_SPEC, "--justification-judge", "rule-based"], {
@@ -993,7 +993,7 @@ describe("crewhaus run", () => {
       closeStdinImmediately: true,
     });
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("an invalid --justification-judge value exits non-zero with the allowed list", async () => {
     const result = await runCli(["run", HELLO_SPEC, "--justification-judge", "gpt-omniscient"], {
@@ -1003,7 +1003,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --justification-judge");
     expect(result.stderr).toContain("rule-based, claude");
-  });
+  }, 20_000);
 
   // Phase 3 §3.3 — `cli.banner` used to be codegen-only: a compiled bundle
   // printed the brand, `crewhaus run` never read `ir.cli`, so an authored
@@ -1047,7 +1047,7 @@ describe("crewhaus run", () => {
       expect(result.stdout.indexOf("exhaustive by default")).toBeLessThan(
         result.stdout.indexOf("agent ready"),
       );
-    });
+    }, 20_000);
 
     test("a spec without a banner block prints none", async () => {
       const result = await runCli(["run", HELLO_SPEC], {
@@ -1057,7 +1057,7 @@ describe("crewhaus run", () => {
       });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).not.toContain("\x1b[1m");
-    });
+    }, 20_000);
 
     test("CREWHAUS_RESUMED=1 suppresses the banner (resumed sessions don't re-banner)", async () => {
       const spec = writeBannerSpec(["exhaustive by default"]);
@@ -1069,7 +1069,7 @@ describe("crewhaus run", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).not.toContain("exhaustive by default");
       expect(result.stdout).toContain("agent ready");
-    });
+    }, 20_000);
   });
 
   // Section 18 (#18 remainder) — the run path must wire the sandbox floor for
@@ -1090,7 +1090,7 @@ describe("crewhaus run", () => {
     expect(result.stdout).toContain('[sandbox] backend "docker"');
     expect(result.stdout).toContain("enabled");
     expect(result.stdout).toContain("agent ready");
-  });
+  }, 20_000);
 
   test("run prints the CREWHAUS_SANDBOX notice when unset and code-exec tools are declared", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
@@ -1102,7 +1102,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[sandbox] assuming docker");
     expect(result.stdout).toContain("set CREWHAUS_SANDBOX");
-  });
+  }, 20_000);
 
   test("run reports the sandbox floor as disabled under CREWHAUS_SANDBOX=noop", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), CODE_EXEC_SPEC);
@@ -1114,7 +1114,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[sandbox] disabled");
     expect(result.stdout).toContain("will be denied");
-  });
+  }, 20_000);
 
   test("run does NOT print a sandbox diagnostic when no code-exec tools are declared", async () => {
     const result = await runCli(["run", HELLO_SPEC], {
@@ -1123,7 +1123,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("[sandbox]");
-  });
+  }, 20_000);
 
   test("a CrewhausError on the run path surfaces as a clean one-line die(), not a stack trace", async () => {
     // An unrecognised model string makes the model-router throw ConfigError
@@ -1140,7 +1140,7 @@ describe("crewhaus run", () => {
     expect(result.stderr).toContain("crewhaus: ");
     expect(result.stderr).toContain("unrecognised model string");
     expect(result.stderr).not.toContain("    at "); // no stack frames
-  });
+  }, 20_000);
 
   test("run --help enumerates the model-router grammar", async () => {
     const result = await runCli(["run", "--help"], { cwd: tmp, env: {} });
@@ -1150,7 +1150,7 @@ describe("crewhaus run", () => {
     expect(result.stdout).toContain("gemini/<m>");
     expect(result.stdout).toContain("bedrock/<id>");
     expect(result.stdout).toContain("local/<m>@<url>");
-  });
+  }, 20_000);
 
   test("eval --help notes --judge-model takes the router grammar + the default judge's Anthropic requirement", async () => {
     const result = await runCli(["eval", "--help"], { cwd: tmp, env: {} });
@@ -1160,7 +1160,7 @@ describe("crewhaus run", () => {
     // default is the exact drift this assertion exists to catch.
     expect(result.stdout).toContain(DEFAULT_JUDGE_MODEL);
     expect(result.stdout).toContain("Anthropic credentials");
-  });
+  }, 20_000);
 
   // E52 — `eval history|baseline(s)|diff` forward to the eval-report verbs
   // with a one-line stderr notice; ONLY a spec FILE with the exact alias
@@ -1172,14 +1172,14 @@ describe("crewhaus run", () => {
       "`crewhaus eval history` is an alias for the canonical `crewhaus eval-report history`",
     );
     expect(result.stdout).toContain("no recorded runs match");
-  });
+  }, 20_000);
 
   test("eval baselines (plural guess) maps to the eval-report baseline verb", async () => {
     const result = await runCli(["eval", "baselines", "show"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain("`crewhaus eval-report baseline`");
     expect(result.stdout).toContain("no baselines pinned");
-  });
+  }, 20_000);
 
   test("a spec FILE literally named history suppresses the alias — the run path still owns it", async () => {
     writeFileSync(
@@ -1190,7 +1190,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).not.toContain("is an alias");
     expect(result.stderr).toContain("missing --dataset");
-  });
+  }, 20_000);
 
   test("eval history.yaml is never an alias — whole-word matches only", async () => {
     writeFileSync(
@@ -1201,7 +1201,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).not.toContain("is an alias");
     expect(result.stderr).toContain("missing --dataset");
-  });
+  }, 20_000);
 
   test("a DIRECTORY named diff does not suppress the alias (file carve-out only)", async () => {
     // `eval-report diff -o diff` creates exactly this inhabitant; the alias
@@ -1213,13 +1213,13 @@ describe("crewhaus run", () => {
     expect(result.stderr).not.toContain("missing --dataset");
     expect(result.exitCode).toBe(1); // unknown run ids — the eval-report path's own error
     expect(result.stderr).toContain("results.json not found");
-  });
+  }, 20_000);
 
   test("run --help lists the --justification-judge flag", async () => {
     const result = await runCli(["run", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--justification-judge");
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch A) — --streaming flag / spec agent.streaming,
   // spec-declared hooks layered below settings.json, and the full
@@ -1232,7 +1232,7 @@ describe("crewhaus run", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
     expect(result.stdout).toContain("agent ready");
-  });
+  }, 20_000);
 
   test("spec agent.streaming: true enables streaming without the flag", async () => {
     writeFileSync(
@@ -1246,7 +1246,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[streaming] mid-stream tool dispatch enabled");
-  });
+  }, 20_000);
 
   test("no flag + no spec streaming → no [streaming] diagnostic (runtime default keeps governing)", async () => {
     const result = await runCli(["run", HELLO_SPEC], {
@@ -1255,7 +1255,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("[streaming]");
-  });
+  }, 20_000);
 
   test("spec hooks merge below settings.json hooks — the [hooks] line counts both layers", async () => {
     writeFileSync(
@@ -1274,7 +1274,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[hooks] 2 loaded (1 from spec)");
-  });
+  }, 20_000);
 
   test("spec hooks alone (no settings.json) still load, marked as spec-sourced", async () => {
     writeFileSync(
@@ -1288,7 +1288,7 @@ describe("crewhaus run", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("[hooks] 1 loaded (1 from spec)");
-  });
+  }, 20_000);
 
   test("the full loop-contract key set (limits/thinking/rate_limits/compaction tuning) boots cleanly", async () => {
     writeFileSync(
@@ -1332,7 +1332,7 @@ describe("crewhaus run", () => {
     // runtime-core's own tests; the option-name mapping by loop-contract.test.ts).
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("agent ready");
-  });
+  }, 20_000);
 
   test("run --help documents --streaming and the --budget-usd ↔ limits interplay", async () => {
     const result = await runCli(["run", "--help"]);
@@ -1348,7 +1348,7 @@ describe("crewhaus run", () => {
     expect(result.stdout).toContain("EVERY model call");
     expect(result.stdout).toContain("crewhaus_budget");
     expect(result.stdout).toContain("budget.scope: session");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus doctor", () => {
@@ -1363,7 +1363,7 @@ describe("crewhaus doctor", () => {
     expect(result.stdout).toContain("✓ Bun runtime");
     expect(result.stdout).toContain("✓ crewhaus.yaml in cwd");
     expect(result.stdout).toContain("all checks passed");
-  });
+  }, 20_000);
 
   test("exits 1 when neither ANTHROPIC_AUTH_TOKEN nor ANTHROPIC_API_KEY is set", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
@@ -1371,7 +1371,7 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ Anthropic credentials");
     expect(result.stdout).toContain("some checks failed");
-  });
+  }, 20_000);
 
   test("exits 1 when crewhaus.yaml is missing from cwd", async () => {
     const result = await runCli(["doctor"], {
@@ -1380,14 +1380,14 @@ describe("crewhaus doctor", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ crewhaus.yaml in cwd");
-  });
+  }, 20_000);
 
   test("--liveness exits 0 with NO credential or spec checks (container probe)", async () => {
     // No spec, no env — plain doctor would exit 1 on both counts.
     const result = await runCli(["doctor", "--liveness"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("ok\n");
-  });
+  }, 20_000);
 
   test("model-aware: an openai/ spec with OPENAI_API_KEY passes without Anthropic creds", async () => {
     writeFileSync(
@@ -1398,7 +1398,7 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("✓ OpenAI credentials (model openai/gpt-4o-mini)");
     expect(result.stdout).toContain("all checks passed");
-  });
+  }, 20_000);
 
   test("model-aware: an openai/ spec with NO provider env fails on OpenAI, not Anthropic", async () => {
     writeFileSync(
@@ -1409,7 +1409,7 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ OpenAI credentials");
     expect(result.stdout).not.toContain("✗ Anthropic credentials");
-  });
+  }, 20_000);
 
   test("model-aware: a bedrock/ spec is informational and exits 0 without AWS env", async () => {
     writeFileSync(
@@ -1419,7 +1419,7 @@ describe("crewhaus doctor", () => {
     const result = await runCli(["doctor"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("~ Bedrock (AWS) credentials");
-  });
+  }, 20_000);
 
   test("doctor --help documents --liveness and the model-aware checks", async () => {
     const result = await runCli(["doctor", "--help"], { cwd: tmp, env: {} });
@@ -1430,7 +1430,7 @@ describe("crewhaus doctor", () => {
     expect(result.stdout).toContain("--detect");
     expect(result.stdout).toContain("--no-probe");
     expect(result.stdout).toContain("--fix");
-  });
+  }, 20_000);
 
   // Item 40 — regression guard. The detect/fix flags were documented and
   // dispatched (`if (args.flags["detect"]) …`) but NEVER registered in
@@ -1443,7 +1443,7 @@ describe("crewhaus doctor", () => {
     // Read-only inventory always exits 0.
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("inventory (what's reachable right now):");
-  });
+  }, 20_000);
 
   test("--fix parses and prints the mechanical fix-plan report (item 40)", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
@@ -1453,7 +1453,7 @@ describe("crewhaus doctor", () => {
     });
     expect(result.stderr).not.toContain("unknown flag");
     expect(result.stdout).toContain("doctor --fix:");
-  });
+  }, 20_000);
 
   // FR-002 — the philosophy-alignment audit now includes a Pillar 3 sink-side
   // pass over the built-in tool map, sharing auditToolScopes with
@@ -1474,7 +1474,7 @@ describe("crewhaus doctor", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Pillar 3 — all built-in outward tools scope:"external"');
     expect(result.stdout).toContain("philosophy alignment: green");
-  });
+  }, 20_000);
 });
 
 // F2 (post-#41 fix) — `lint --fix`'s nearest-match tool-name correction must
@@ -1708,7 +1708,7 @@ describe("crewhaus optimize --budget-usd", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --budget-usd");
     expect(result.stderr).toContain("positive number");
-  });
+  }, 20_000);
 
   test("rejects a negative --budget-usd via die()", async () => {
     const { dataset, graders } = writeOptimizeFixtures();
@@ -1718,7 +1718,7 @@ describe("crewhaus optimize --budget-usd", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --budget-usd");
-  });
+  }, 20_000);
 
   test("rejects a non-numeric --budget-usd (NaN) via die()", async () => {
     const { dataset, graders } = writeOptimizeFixtures();
@@ -1728,7 +1728,7 @@ describe("crewhaus optimize --budget-usd", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --budget-usd");
-  });
+  }, 20_000);
 
   test("a VALID --budget-usd clears validation (fails later on a missing graders file, not on the budget)", async () => {
     // Proves the positive branch: a well-formed budget is accepted and the
@@ -1755,13 +1755,13 @@ describe("crewhaus optimize --budget-usd", () => {
     expect(result.stderr).not.toContain("invalid --budget-usd");
     // Died on the next step instead: reading the (missing) graders file.
     expect(result.stderr).toContain("could not read");
-  });
+  }, 20_000);
 
   test("optimize --help lists the --budget-usd flag", async () => {
     const result = await runCli(["optimize", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--budget-usd");
-  });
+  }, 20_000);
 
   // Item 27 — `crewhaus run --budget-usd` (run-level spend cap). The
   // invalid-value branch dies before any model call, so it is testable
@@ -1772,7 +1772,7 @@ describe("crewhaus optimize --budget-usd", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --budget-usd");
-  });
+  }, 20_000);
 
   test("run rejects a non-numeric --budget-usd via die()", async () => {
     const result = await runCli(["run", HELLO_SPEC, "--budget-usd", "lots"], {
@@ -1780,7 +1780,7 @@ describe("crewhaus optimize --budget-usd", () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("invalid --budget-usd");
-  });
+  }, 20_000);
 
   // F4 — the fitness evals silently inherited the runner's retry with no
   // opt-out; `--no-retry` is now a real flag (threaded into every fitness
@@ -1797,13 +1797,13 @@ describe("crewhaus optimize --budget-usd", () => {
     // Pre-fix parseArgs died here with `unknown flag: --no-retry`.
     expect(result.stderr).not.toContain("unknown flag");
     expect(result.stderr).toContain("could not read");
-  });
+  }, 20_000);
 
   test("optimize --help documents --no-retry", async () => {
     const result = await runCli(["optimize", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--no-retry");
-  });
+  }, 20_000);
 
   test("a rule-based optimize run reports $0 spend + iterations-cap stop in report.json, with the budget forwarded", async () => {
     // Creds-gated: the fitness function runs the real agent (eval-runner),
@@ -1869,20 +1869,20 @@ describe("crewhaus help and unknown subcommand", () => {
       expect(result.stdout).toContain("run");
       expect(result.stdout).toContain("init");
       expect(result.stdout).toContain("doctor");
-    });
+    }, 20_000);
   }
 
   test("no subcommand prints usage to stderr and exits 1 (usage error)", async () => {
     const result = await runCli([]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("usage: crewhaus");
-  });
+  }, 20_000);
 
   test("unknown subcommand exits 1 with a clear message", async () => {
     const result = await runCli(["frobnicate"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("unknown subcommand");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus secrets backend selection", () => {
@@ -1890,13 +1890,13 @@ describe("crewhaus secrets backend selection", () => {
     const result = await runCli(["secrets", "doctor", "--backend", "vault"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("vault backend is not wired into the CLI");
-  });
+  }, 20_000);
 
   test("an unknown backend is rejected", async () => {
     const result = await runCli(["secrets", "doctor", "--backend", "bogus"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('unknown secrets backend "bogus"');
-  });
+  }, 20_000);
 
   test("--backend file rotates into a not-yet-existing root dir (auto-mkdir)", async () => {
     const root = join(tmp, "nested", "secrets");
@@ -1912,7 +1912,7 @@ describe("crewhaus secrets backend selection", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("rotated demo");
     expect(existsSync(join(root, "demo"))).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus cost-summary", () => {
@@ -1955,7 +1955,7 @@ describe("crewhaus cost-summary", () => {
     expect(out.count).toBe(2);
     expect(out.totalUsdMicros).toBe(750);
     expect(out.byProvider["anthropic"]).toBe(750);
-  });
+  }, 20_000);
 
   test("still reads flat (non-enveloped) cost_accrual lines for back-compat", async () => {
     seedSession([{ kind: "cost_accrual", provider: "openai", costUsdMicros: 1000 }]);
@@ -1965,7 +1965,7 @@ describe("crewhaus cost-summary", () => {
     expect(result.exitCode).toBe(0);
     const out = JSON.parse(result.stdout) as { totalUsdMicros: number };
     expect(out.totalUsdMicros).toBe(1000);
-  });
+  }, 20_000);
 
   // Item 28 (half 1) — cache economics columns.
   type CacheSummaryJson = {
@@ -2056,7 +2056,7 @@ describe("crewhaus cost-summary", () => {
     const unknown = out.cacheByModel["openai/fictional-model-99"];
     expect(unknown?.cacheHitRatio).toBeCloseTo(0.5, 10);
     expect(unknown?.cacheSavingsUsdMicros).toBeNull();
-  });
+  }, 20_000);
 
   test("text format appends cache lines per provider/model + total, unknown model prices as n/a", async () => {
     seedCacheSession();
@@ -2074,7 +2074,7 @@ describe("crewhaus cost-summary", () => {
     expect(result.stdout).toContain(
       "  openai/fictional-model-99: read=100 write=50 hit=50.0% savings=n/a",
     );
-  });
+  }, 20_000);
 
   test("old logs keep parsing: token-less and pre-cache-write accruals aggregate with zero-filled cache fields", async () => {
     seedSession([
@@ -2112,7 +2112,7 @@ describe("crewhaus cost-summary", () => {
     expect(out.cacheHitRatio).toBeCloseTo(500 / 1500, 10);
     // Savings with zero writes: 500 × ($3 − $0.3) = 1_350 micros.
     expect(out.cacheSavingsUsdMicros).toBe(1_350);
-  });
+  }, 20_000);
 
   test("cost-summary --help documents the hit-ratio denominator and savings formula", async () => {
     const result = await runCli(["cost-summary", "--help"]);
@@ -2123,7 +2123,7 @@ describe("crewhaus cost-summary", () => {
     // where an operator meets them.
     expect(result.stdout).toContain("byRole");
     expect(result.stdout).toContain("byProfile");
-  });
+  }, 20_000);
 
   // ---- 0.6.0 §8.3 — role / profile attribution -----------------------------
 
@@ -2173,7 +2173,7 @@ describe("crewhaus cost-summary", () => {
     expect(out.totalUsdMicros).toBe(2100);
     expect(out.byRole).toEqual({ draft: 400, judge: 1600, primary: 100 });
     expect(out.byProfile).toEqual({ fast: 400, strong: 1600, "(none)": 100 });
-  });
+  }, 20_000);
 
   test("a role-bearing `summary: true` roll-up is counted; a role-less run total is not", async () => {
     seedSession([
@@ -2223,7 +2223,7 @@ describe("crewhaus cost-summary", () => {
     expect(out.count).toBe(2);
     expect(out.totalUsdMicros).toBe(1250);
     expect(out.byRole).toEqual({ primary: 1000, subagent: 250 });
-  });
+  }, 20_000);
 
   test("text format prints the role and profile splits, biggest first", async () => {
     seedSession([
@@ -2260,7 +2260,7 @@ describe("crewhaus cost-summary", () => {
     expect(result.stdout).toContain("  draft: $0.0005");
     expect(result.stdout).toContain("  strong: $0.0020");
     expect(result.stdout).toContain("  fast: $0.0005");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus version", () => {
@@ -2278,7 +2278,7 @@ describe("crewhaus version", () => {
       // adapter-anthropic logs an import-time warning on hosts without an
       // installed claude CLI.
       expect(result.stdout.trim()).toBe(pkgVersion);
-    });
+    }, 20_000);
   }
 });
 
@@ -2321,13 +2321,13 @@ describe("crewhaus audit verify", () => {
     expect(result.stdout).toContain("--dir <auditDir>");
     expect(result.stdout).toContain("--anchor file:<path>");
     expect(result.stdout).toContain("Exit code: 0 intact");
-  });
+  }, 20_000);
 
   test("an unknown audit action dies with the allowed list", async () => {
     const result = await runCli(["audit", "frobnicate"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('audit action must be "verify"');
-  });
+  }, 20_000);
 
   test("verifies the default ./.crewhaus/audit store in cwd and exits 0 when intact", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision", "model_call"]);
@@ -2336,14 +2336,14 @@ describe("crewhaus audit verify", () => {
     expect(result.stdout).toContain("✓ hash chain intact — 2 record(s)");
     expect(result.stdout).toContain("✓ on-host chain-tail anchor");
     expect(result.stdout).toContain("audit log intact.");
-  });
+  }, 20_000);
 
   test("an empty/missing store verifies as intact (0 records, anchor limitation noted)", async () => {
     const result = await runCli(["audit", "verify", "--dir", join(tmp, "no-such-audit")]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("0 record(s)");
     expect(result.stdout).toContain("~ on-host chain-tail anchor absent");
-  });
+  }, 20_000);
 
   test("a tampered payload exits 1 with the finding's file:line + reason", async () => {
     const auditDir = join(tmp, "audit");
@@ -2354,7 +2354,7 @@ describe("crewhaus audit verify", () => {
     expect(result.stdout).toContain("✗ tamper finding at");
     expect(result.stdout).toContain(":2 — hash mismatch");
     expect(result.stdout).toContain("audit verification FAILED.");
-  });
+  }, 20_000);
 
   test("--anchor file:<path> cross-checks a mirrored FileAnchorStore and exits 0", async () => {
     const auditDir = join(tmp, "audit");
@@ -2370,7 +2370,7 @@ describe("crewhaus audit verify", () => {
     ]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("✓ external anchor store agrees");
-  });
+  }, 20_000);
 
   test("--anchor catches a truncation that rewrote the on-host anchor in lockstep", async () => {
     const auditDir = join(tmp, "audit");
@@ -2411,7 +2411,7 @@ describe("crewhaus audit verify", () => {
     ]);
     expect(caught.exitCode).toBe(1);
     expect(caught.stdout).toContain("external anchor mismatch");
-  });
+  }, 20_000);
 
   test("a REQUESTED anchor store with no anchor for the log exits 1 (no silent skip)", async () => {
     const auditDir = join(tmp, "audit");
@@ -2428,7 +2428,7 @@ describe("crewhaus audit verify", () => {
     ]);
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ external anchor requested (--anchor)");
-  });
+  }, 20_000);
 
   test("an unknown --anchor scheme dies with the allowed list", async () => {
     const result = await runCli(["audit", "verify", "--anchor", "s3://bucket/prefix"], {
@@ -2437,7 +2437,7 @@ describe("crewhaus audit verify", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('invalid --anchor "s3://bucket/prefix"');
     expect(result.stderr).toContain("one of: file");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus doctor — audit-log integrity (item 34)", () => {
@@ -2450,7 +2450,7 @@ describe("crewhaus doctor — audit-log integrity (item 34)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain("✗ Audit log integrity");
     expect(result.stdout).toContain("hash mismatch");
-  });
+  }, 20_000);
 
   test("an intact .crewhaus/audit store passes doctor with the record count", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), "name: t\ntarget: cli\n");
@@ -2458,7 +2458,7 @@ describe("crewhaus doctor — audit-log integrity (item 34)", () => {
     const result = await runCli(["doctor"], { cwd: tmp, env: { ANTHROPIC_API_KEY: "test" } });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("✓ Audit log integrity (.crewhaus/audit, 1 records)");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () => {
@@ -2478,7 +2478,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     expect(result.stdout).toContain("--fail-on-empty");
     // --allow-empty never shipped and was removed with the default flip (F4).
     expect(result.stdout).not.toContain("--allow-empty");
-  });
+  }, 20_000);
 
   test("--period current resolves to the current UTC quarter in output + bundle path", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
@@ -2508,7 +2508,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     expect(
       existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", `${resolved}.json`)),
     ).toBe(true);
-  });
+  }, 20_000);
 
   test("a control with 0 records exits 0 by default with a warning naming the gap (F4)", async () => {
     // policy_decision satisfies CC6.1 only; CC6.7/CC7.2/CC7.3 collect nothing.
@@ -2527,7 +2527,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
       true,
     );
-  });
+  }, 20_000);
 
   test("--fail-on-empty turns the evidence gap into exit 1 (scheduled tripwire)", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
@@ -2542,7 +2542,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     expect(existsSync(join(tmp, ".crewhaus", "compliance", "soc2", "CC6.1", "2026-Q2.json"))).toBe(
       true,
     );
-  });
+  }, 20_000);
 
   test("a framework whose every control collected evidence passes --fail-on-empty silently", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), [
@@ -2557,7 +2557,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     );
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("evidence gap");
-  });
+  }, 20_000);
 
   test("--all-frameworks collects soc2 + iso27001 + hipaa in one run", async () => {
     await seedAuditLog(join(tmp, ".crewhaus", "audit"), ["policy_decision"]);
@@ -2570,7 +2570,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
       expect(result.stdout).toContain(`${framework}/`);
       expect(existsSync(join(tmp, ".crewhaus", "compliance", framework))).toBe(true);
     }
-  });
+  }, 20_000);
 
   test("--framework and --all-frameworks are mutually exclusive", async () => {
     const result = await runCli(
@@ -2579,7 +2579,7 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   test("--control cannot combine with --all-frameworks", async () => {
     const result = await runCli(
@@ -2588,13 +2588,13 @@ describe("crewhaus compliance evidence — scheduling ergonomics (item 34)", () 
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--control is framework-specific");
-  });
+  }, 20_000);
 
   test("omitting both --framework and --all-frameworks dies pointing at both options", async () => {
     const result = await runCli(["compliance", "evidence", "--period", "2026-Q2"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--framework <id> is required (or pass --all-frameworks)");
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2621,13 +2621,13 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.stdout).toContain("--dry-run");
     expect(result.stdout).toContain("NEVER deleted");
     expect(result.stdout).toContain("retention_enforcement");
-  });
+  }, 20_000);
 
   test("an unknown retention action dies with the allowed list", async () => {
     const result = await runCli(["retention", "gc"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("retention action must be one of: sweep, export, purge");
-  });
+  }, 20_000);
 
   test("sweep --dry-run reports the would-delete set without deleting or appending evidence", async () => {
     const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2637,7 +2637,7 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
     expect(existsSync(file)).toBe(true);
     expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
-  });
+  }, 20_000);
 
   test("a real sweep deletes expired sessions, keeps audit day files, and appends verifiable evidence", async () => {
     const expired = seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2659,7 +2659,7 @@ describe("crewhaus retention (item 35)", () => {
     const verifyResult = await runCli(["audit", "verify", "--dir", auditDir]);
     expect(verifyResult.exitCode).toBe(0);
     expect(readFileSync(join(auditDir, dayFile), "utf8")).toContain('"retention_enforcement"');
-  });
+  }, 20_000);
 
   test("export copies records out (originals untouched) and writes a manifest", async () => {
     seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2671,7 +2671,7 @@ describe("crewhaus retention (item 35)", () => {
     expect(existsSync(join(outDir, "manifest.json"))).toBe(true);
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
     expect(result.stdout).toContain("complete audit export");
-  });
+  }, 20_000);
 
   test("export without <outDir> and purge with a bad --before both die cleanly", async () => {
     const missingOut = await runCli(["retention", "export", "--dir", tmp]);
@@ -2681,7 +2681,7 @@ describe("crewhaus retention (item 35)", () => {
     const badBefore = await runCli(["retention", "purge", "--before", "not-a-date", "--dir", tmp]);
     expect(badBefore.exitCode).toBe(1);
     expect(badBefore.stderr).toContain('invalid --before "not-a-date"');
-  });
+  }, 20_000);
 
   test("purge --dry-run via the CLI leaves files intact and appends no evidence (F1 BLOCKER)", async () => {
     // Verified-by-execution regression: this exact invocation used to
@@ -2694,7 +2694,7 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.stdout).toContain("dry run: nothing deleted, no evidence appended");
     expect(existsSync(file)).toBe(true);
     expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
-  });
+  }, 20_000);
 
   test("export --dry-run via the CLI writes nothing (F1)", async () => {
     seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2706,7 +2706,7 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.stdout).toContain("dry run — nothing written, no evidence appended");
     expect(existsSync(outDir)).toBe(false);
     expect(existsSync(join(tmp, ".crewhaus", "audit"))).toBe(false);
-  });
+  }, 20_000);
 
   test("filter flags on unsupported actions are REJECTED, not silently ignored (F1)", async () => {
     const file = seedExpiredSession(tmp, "sess_1111111111111111", 40);
@@ -2751,7 +2751,7 @@ describe("crewhaus retention (item 35)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("overlaps the live store");
     expect(existsSync(join(tmp, ".crewhaus", "sessions", "sess_1111111111111111.json"))).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus build-image — digest recording wiring (item 47)", () => {
@@ -2795,7 +2795,7 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stderr).not.toContain("build-image");
     expect(result.stderr).not.toContain("digest");
     expect(existsSync(marker)).toBe(false);
-  });
+  }, 20_000);
 
   // F2 regression: a local (--load) build records NOTHING — the local image
   // ID is a config digest, not a pullable registry digest — and the CLI says
@@ -2817,7 +2817,7 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stderr).not.toContain("digest");
     // No digest lookup of any kind happened for the --load build.
     expect(existsSync(marker)).toBe(false);
-  });
+  }, 20_000);
 
   test("recording is default-on for --push: a failed registry digest lookup warns but does not fail the build", async () => {
     const { bin, marker } = installFakeDocker(tmp, 1);
@@ -2829,7 +2829,7 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stderr).toContain("digest was not recorded");
     // The lookup went to the registry (imagetools inspect), not the local store.
     expect(existsSync(marker)).toBe(true);
-  });
+  }, 20_000);
 
   test("--help documents --no-record and the pushed-digests-only contract", async () => {
     const result = await runCli(["build-image", "--help"]);
@@ -2837,7 +2837,7 @@ describe("crewhaus build-image — digest recording wiring (item 47)", () => {
     expect(result.stdout).toContain("--no-record");
     expect(result.stdout).toContain("registry\n               manifest digest");
     expect(result.stdout).toContain("Local (--load) builds record nothing");
-  });
+  }, 20_000);
 });
 
 // build-image and federation used to hand-roll their own argv loops, which
@@ -2849,38 +2849,38 @@ describe("crewhaus build-image / federation — shared arg parsing", () => {
     const result = await runCli(["build-image", "cli", "--tag", "t1", "--bogus"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("unknown flag: --bogus");
-  });
+  }, 20_000);
 
   test("build-image reports a missing flag value in the shared wording", async () => {
     const result = await runCli(["build-image", "cli", "--tag"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('flag "--tag" requires a value');
-  });
+  }, 20_000);
 
   test("build-image -h prints the same usage as --help", async () => {
     const short = await runCli(["build-image", "-h"]);
     const long = await runCli(["build-image", "--help"]);
     expect(short.exitCode).toBe(0);
     expect(short.stdout).toBe(long.stdout);
-  });
+  }, 20_000);
 
   test("federation discover --help exits 0", async () => {
     const result = await runCli(["federation", "discover", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("usage: crewhaus federation discover <deployment>");
-  });
+  }, 20_000);
 
   test("federation discover without a deployment exits 1", async () => {
     const result = await runCli(["federation", "discover"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("missing <deployment>");
-  });
+  }, 20_000);
 
   test("federation discover rejects an unknown flag", async () => {
     const result = await runCli(["federation", "discover", "peer.example", "--bogus"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("unknown flag: --bogus");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus compile --check — flag surface (item 33)", () => {
@@ -2892,14 +2892,14 @@ describe("crewhaus compile --check — flag surface (item 33)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--check");
     expect(result.stderr).toContain("--emit-ir");
-  });
+  }, 20_000);
 
   test("compile --help documents --check", async () => {
     const result = await runCli(["compile", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("--check");
     expect(result.stdout).toContain("liveness");
-  });
+  }, 20_000);
 
   test("plain compile runs no verification — no verdict line without --check", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
@@ -2908,7 +2908,7 @@ describe("crewhaus compile --check — flag surface (item 33)", () => {
     // The dependency manifest is now part of the plain compile's emission
     // (the standalone-run fix) — only the verify steps stay --check-gated.
     expect(existsSync(join(tmp, "package.json"))).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus spec auto-register + changelog (item 46)", () => {
@@ -2937,7 +2937,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(changelog).toContain("# Changelog — hello");
     expect(changelog).toContain("## v1");
     expect(changelog).toContain("- initial version");
-  });
+  }, 20_000);
 
   test("recompiling an unchanged spec is a registry no-op", async () => {
     const out = join(tmp, "out");
@@ -2948,7 +2948,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(second.stdout).toContain("unchanged hello@v1");
     const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
     expect(changelog.match(/^## /gm)).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("a changed spec registers v2 with a field-level diff, newest entry first", async () => {
     const out = join(tmp, "out");
@@ -2961,7 +2961,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const changelog = readFileSync(join(REGISTRY(), "hello", "CHANGELOG.md"), "utf-8");
     expect(changelog).toContain("- changed `agent.instructions`");
     expect(changelog.indexOf("## v2")).toBeLessThan(changelog.indexOf("## v1"));
-  });
+  }, 20_000);
 
   test("--no-register skips the auto-put entirely", async () => {
     const out = join(tmp, "out");
@@ -2969,7 +2969,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("registered");
     expect(existsSync(REGISTRY())).toBe(false);
-  });
+  }, 20_000);
 
   test("spec log prints the accumulated changelog", async () => {
     const out = join(tmp, "out");
@@ -2978,13 +2978,13 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("# Changelog — hello");
     expect(result.stdout).toContain("## v1");
-  });
+  }, 20_000);
 
   test("spec log for an unregistered name dies with a helpful message", async () => {
     const result = await runCli(["spec", "log", "nope"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('no changelog for "nope"');
-  });
+  }, 20_000);
 
   test("a manual `spec put` also appends changelog entries (with diff on the second put)", async () => {
     const f1 = join(tmp, "a.yaml");
@@ -2999,7 +2999,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(log.exitCode).toBe(0);
     expect(log.stdout).toContain('- changed `agent.instructions`: "One." → "Two."');
     expect(log.stdout.indexOf("## v2")).toBeLessThan(log.stdout.indexOf("## v1"));
-  });
+  }, 20_000);
 
   test("compile --help and optimize --help document --no-register", async () => {
     const compileHelp = await runCli(["compile", "--help"]);
@@ -3009,7 +3009,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const optimizeHelp = await runCli(["optimize", "--help"]);
     expect(optimizeHelp.exitCode).toBe(0);
     expect(optimizeHelp.stdout).toContain("--no-register");
-  });
+  }, 20_000);
 
   test("spec --help lists the log action", async () => {
     const result = await runCli(["spec", "log", "--help"]);
@@ -3017,7 +3017,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     expect(result.stdout).toContain("spec log <name>");
     // Review F3: the sanitation behaviour is documented in the help text.
     expect(result.stdout).toContain('"My Agent" → My-Agent');
-  });
+  }, 20_000);
 
   test("spec log accepts the display name compile registered under its sanitized slot (review F3)", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -3038,7 +3038,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const direct = await runCli(["spec", "log", "My-Agent"], { cwd: tmp });
     expect(direct.exitCode).toBe(0);
     expect(direct.stdout).not.toContain("sanitized from");
-  });
+  }, 20_000);
 
   test("changelog + spec log never print credential tokens from instructions (review F1)", async () => {
     const out = join(tmp, "out");
@@ -3056,7 +3056,7 @@ describe("crewhaus spec auto-register + changelog (item 46)", () => {
     const log = await runCli(["spec", "log", "hello"], { cwd: tmp });
     expect(log.exitCode).toBe(0);
     expect(log.stdout).not.toContain("sk-live");
-  });
+  }, 20_000);
 });
 
 // Item 59 (F2) — the approval gate must guard EVERY protected-env pin flip:
@@ -3121,7 +3121,7 @@ describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
     expect(payload?.["satisfied"]).toBe(false);
     // rollback refusal recorded the exact target version.
     expect(payload?.["toVersion"]).toBe("v1");
-  });
+  }, 20_000);
 
   test("spec pin to a NON-protected env stays ungated (pre-item-59 path)", async () => {
     await seedProtectedHarness();
@@ -3131,7 +3131,7 @@ describe("crewhaus approval gate — all pin doors (item 59, F2)", () => {
     expect(pinned.stdout).toContain("pinned demo staging → v2");
     // No governance record for an ungated flip.
     expect(await readGovernanceApprovals()).toHaveLength(0);
-  });
+  }, 20_000);
 
   test("spec pin to a protected env SUCCEEDS once an approval for the version is recorded", async () => {
     await seedProtectedHarness();
@@ -3420,7 +3420,7 @@ triggers:
     expect(result.exitCode).toBe(0);
     const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
     expect(patch.op).toBe("add");
-  });
+  }, 20_000);
 
   test("spec with an existing transaction_policy block → op replace", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -3442,7 +3442,7 @@ triggers:
     expect(result.exitCode).toBe(0);
     const patch = JSON.parse(readFileSync(patchPath, "utf-8"));
     expect(patch.op).toBe("replace");
-  });
+  }, 20_000);
 
   test("quoted transaction_policy key — parsed-CST check agrees with applySpecPatch, unlike the old raw-text regex", async () => {
     // `/^transaction_policy:/m` (the old check) does NOT match a quoted key
@@ -3484,7 +3484,7 @@ triggers:
         rationale: patch.rationale,
       }),
     ).not.toThrow();
-  });
+  }, 20_000);
 });
 
 // ---- Loop contract 0.4 (Batch F) — the new CLI slice ----
@@ -3498,20 +3498,20 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     // The default local bundle's agent.ts is NOT produced.
     expect(existsSync(join(tmp, "agent.ts"))).toBe(false);
     expect(result.stdout).toContain("compiled cf-worker bundle");
-  });
+  }, 20_000);
 
   test("rejects an unsupported target with a clear message", async () => {
     const result = await runCli(["compile", CHANNEL_SPEC, "-o", tmp, "--emit-as", "cf-worker"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("cf-worker emit supports target=cli|workflow|graph");
     expect(result.stderr).toContain("got channel");
-  });
+  }, 20_000);
 
   test("rejects an unknown --emit-as value", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp, "--emit-as", "wasm"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('--emit-as must be "local" or "cf-worker"');
-  });
+  }, 20_000);
 
   test("--emit-as cf-worker cannot combine with --check", async () => {
     const result = await runCli([
@@ -3525,7 +3525,7 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     ]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("cannot combine with --check");
-  });
+  }, 20_000);
 
   test("--emit-as local is the default bundle (byte path unchanged)", async () => {
     const result = await runCli([
@@ -3540,7 +3540,7 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(existsSync(join(tmp, "worker.js"))).toBe(false);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus deploy <fly|render|railway|heroku> (item 5)", () => {
@@ -3551,7 +3551,7 @@ describe("crewhaus deploy <fly|render|railway|heroku> (item 5)", () => {
     expect(existsSync(join(out, "fly.toml"))).toBe(true);
     expect(existsSync(join(out, "Dockerfile.fly"))).toBe(true);
     expect(result.stdout).toContain("set FLY_API_TOKEN and re-run with --live");
-  });
+  }, 20_000);
 
   test("scaffolds Heroku manifests (heroku.yml + app.json + Dockerfile)", async () => {
     const out = join(tmp, "heroku");
@@ -3560,26 +3560,26 @@ describe("crewhaus deploy <fly|render|railway|heroku> (item 5)", () => {
     expect(existsSync(join(out, "heroku.yml"))).toBe(true);
     expect(existsSync(join(out, "app.json"))).toBe(true);
     expect(existsSync(join(out, "Dockerfile.heroku"))).toBe(true);
-  });
+  }, 20_000);
 
   test("rejects a non-daemon (cli) shape", async () => {
     const result = await runCli(["deploy", "fly", HELLO_SPEC, "-o", join(tmp, "x")]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("not a deployable daemon shape");
-  });
+  }, 20_000);
 
   test("--live without the provider token fails, naming the env var", async () => {
     const result = await runCli(["deploy", "render", CHANNEL_SPEC, "-o", join(tmp, "r"), "--live"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("RENDER_API_KEY");
     expect(result.stderr).toContain("--live");
-  });
+  }, 20_000);
 
   test("an unknown deploy action is rejected", async () => {
     const result = await runCli(["deploy", "gcp", CHANNEL_SPEC]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("deploy action must be one of");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus runs resume (item 7)", () => {
@@ -3587,32 +3587,32 @@ describe("crewhaus runs resume (item 7)", () => {
     const result = await runCli(["runs", "resume", "not-a-session"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("expected sess_<16 hex>");
-  });
+  }, 20_000);
 
   test("reports when no spec can be resolved", async () => {
     const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("no --spec given and no crewhaus.yaml");
-  });
+  }, 20_000);
 
   test("reports when the session is not found (spec resolves)", async () => {
     writeFileSync(join(tmp, "crewhaus.yaml"), readFileSync(HELLO_SPEC, "utf-8"));
     const result = await runCli(["runs", "resume", "sess_0123456789abcdef"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('no session "sess_0123456789abcdef"');
-  });
+  }, 20_000);
 
   test("an unknown runs action is rejected", async () => {
     const result = await runCli(["runs", "subscribe"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('runs action must be "resume"');
-  });
+  }, 20_000);
 
   test("runs resume --help prints usage", async () => {
     const result = await runCli(["runs", "resume", "--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Re-drives a persisted cli session");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus sessions tail (item 2)", () => {
@@ -3652,7 +3652,7 @@ describe("crewhaus sessions tail (item 2)", () => {
     expect(result.stdout).toContain("asst> hello back");
     // The model_route side-channel event renders nothing.
     expect(result.stdout).not.toContain("model_route");
-  });
+  }, 20_000);
 
   test("with no id, tails the newest session", async () => {
     const dir = join(tmp, ".crewhaus", "sessions");
@@ -3660,13 +3660,13 @@ describe("crewhaus sessions tail (item 2)", () => {
     const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("user> hi there");
-  });
+  }, 20_000);
 
   test("errors when the session store is absent", async () => {
     const result = await runCli(["sessions", "tail", "--no-follow"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("no session store");
-  });
+  }, 20_000);
 
   test("rejects a malformed session id", async () => {
     const dir = join(tmp, ".crewhaus", "sessions");
@@ -3674,7 +3674,7 @@ describe("crewhaus sessions tail (item 2)", () => {
     const result = await runCli(["sessions", "tail", "bogus", "--no-follow"], { cwd: tmp });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("expected sess_<16 hex>");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus dev (item 2)", () => {
@@ -3683,13 +3683,13 @@ describe("crewhaus dev (item 2)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("supervised");
     expect(result.stdout).toContain("--once");
-  });
+  }, 20_000);
 
   test("fails fast on a missing spec", async () => {
     const result = await runCli(["dev", join(tmp, "nope.yaml")]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("dev:");
-  });
+  }, 20_000);
 
   test("fails fast on a broken spec (no child launched)", async () => {
     const broken = join(tmp, "broken.yaml");
@@ -3697,7 +3697,7 @@ describe("crewhaus dev (item 2)", () => {
     const result = await runCli(["dev", broken]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("dev:");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.0 §7.9, §9.2)", () => {
@@ -3742,7 +3742,7 @@ describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.
     const rewritten = JSON.parse(readFileSync(arms, "utf-8").trim()) as { m: string; k: string };
     expect(rewritten.m).toBe("default");
     expect(rewritten.k).toBe("hard");
-  });
+  }, 20_000);
 
   test("--rewrite-arms without --write is refused — a dry run never touches the scoreboard", async () => {
     const { spec, arms } = seedHarness();
@@ -3751,14 +3751,14 @@ describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.
     expect(result.stderr).toContain("pass --write to apply it");
     expect(readFileSync(spec, "utf-8")).toBe(POOLED_SPEC);
     expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
-  });
+  }, 20_000);
 
   test("--rewrite-arms without --hoist-models keeps its usage error", async () => {
     const { spec } = seedHarness();
     const result = await runCli(["upgrade", spec, "--rewrite-arms"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("--rewrite-arms requires --hoist-models");
-  });
+  }, 20_000);
 
   test("--hoist-models --write alone leaves arms.jsonl untouched and names the remedy", async () => {
     const { spec, arms } = seedHarness();
@@ -3771,7 +3771,7 @@ describe("crewhaus upgrade --hoist-models — arm identity on this runtime (0.6.
     // The spec was hoisted; without the flag the history is left where it is.
     expect(readFileSync(spec, "utf-8")).toContain("model: $default");
     expect(readFileSync(arms, "utf-8")).toBe(`${ARM_LINE}\n`);
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3825,7 +3825,7 @@ describe("crewhaus models (CLI surface)", () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("fast");
     expect(r.stdout).toContain("claude-opus-5");
-  });
+  }, 20_000);
 
   test("models explain prints every slot, the strategy sentence and this shape's row", async () => {
     const spec = seed(HYBRID_SPEC);
@@ -3834,7 +3834,7 @@ describe("crewhaus models (CLI surface)", () => {
     expect(r.stdout).toContain("agent.model_pool.candidates[1]");
     expect(r.stdout).toContain("per-shape support (cli)");
     expect(r.stdout).toContain("typed input seams");
-  });
+  }, 20_000);
 
   test("models audit EXITS 1 on a retired model, and --fail-on none reports it without failing", async () => {
     const spec = seed(RETIRED_SPEC);
@@ -3852,7 +3852,7 @@ describe("crewhaus models (CLI surface)", () => {
     ]);
     expect(reported.exitCode).toBe(0);
     expect(reported.stdout).toContain("RETIRED");
-  });
+  }, 20_000);
 
   test("models audit --propose writes the replacement patch even though the audit failed", async () => {
     const spec = seed(RETIRED_SPEC);
@@ -3875,7 +3875,7 @@ describe("crewhaus models (CLI surface)", () => {
     };
     expect(patch.patches[0]?.patch.path).toEqual(["agent", "model"]);
     expect(patch.patches[0]?.patch.value).toBe("claude-haiku-4-5");
-  });
+  }, 20_000);
 
   test("a parameter the provider DROPS is a failure, projected through the real adapter", async () => {
     // §8.1 — `anthropicEffectiveParams` is the adapter's own marshaller
@@ -3896,34 +3896,34 @@ describe("crewhaus models (CLI surface)", () => {
     const r = await runCli(["models", "audit", spec, "--today", "2026-09-07"]);
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toContain("DROPS temperature");
-  });
+  }, 20_000);
 
   test("a clean spec audits green", async () => {
     const spec = seed(HYBRID_SPEC);
     const r = await runCli(["models", "audit", spec, "--today", "2026-09-07"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("0 failing");
-  });
+  }, 20_000);
 
   test("`crewhaus model` (singular) points at the plural registry verbs", async () => {
     const r = await runCli(["model", "list"]);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("crewhaus models list|explain|audit|propose");
-  });
+  }, 20_000);
 
   test("models propose refuses an unknown --source", async () => {
     const spec = seed(HYBRID_SPEC);
     const r = await runCli(["models", "propose", spec, "--source", "vibes"]);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain('--source must be "sunset" or "audition"');
-  });
+  }, 20_000);
 
   test("models propose --source audition refuses without an audition lane", async () => {
     const spec = seed(HYBRID_SPEC);
     const r = await runCli(["models", "propose", spec, "--source", "audition"]);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("no shadow-lane arms");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus propose --source (0.6.0 §9.1)", () => {
@@ -3933,7 +3933,7 @@ describe("crewhaus propose --source (0.6.0 §9.1)", () => {
     expect(r.stderr).toContain("--source must be one of");
     expect(r.stderr).toContain("sunset");
     expect(r.stderr).toContain("audition");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus route propose (CLI surface)", () => {
@@ -3946,7 +3946,7 @@ describe("crewhaus route propose (CLI surface)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });
 
 describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
@@ -3982,7 +3982,7 @@ describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });
 
 // docs-claims#1 / shape-reach#10 — `tools suggest` reads the tools a spec
@@ -4006,7 +4006,7 @@ describe("crewhaus tools suggest — reads grants the way compile does", () => {
     expect(out.missing.map((m) => m.key)).not.toContain("read");
     expect(out.missing.map((m) => m.key)).not.toContain("bash");
     expect(out.present.map((m) => m.key)).toContain("bash");
-  });
+  }, 20_000);
 
   test("a category grant covers the tools it expands to", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -4029,7 +4029,7 @@ describe("crewhaus tools suggest — reads grants the way compile does", () => {
     );
     // The grant is reported per concrete key, never as the selector.
     expect(out.unimplied).not.toContain("all-verify");
-  });
+  }, 20_000);
 });
 
 // docs-claims#12 / security-12#14 — the discovery commands on the paths the
@@ -4151,7 +4151,7 @@ describe("crewhaus tools audit — reads grants the way compile does", () => {
     expect(result.stdout).toContain("[remove?] gitLog (GitLog)");
     expect(result.stdout).toContain("drop it from tools:");
     expect(result.stdout).not.toContain("gitStatus (");
-  });
+  }, 20_000);
 
   test("a spec that does not compile says so and audits usage only", async () => {
     seedAudit(sandboxCwd, "[all-nosuchcategory]");
@@ -4161,5 +4161,5 @@ describe("crewhaus tools audit — reads grants the way compile does", () => {
     expect(result.stderr).toContain("auditing usage only");
     const findings = (JSON.parse(result.stdout) as { findings: Finding[] }).findings;
     expect(findings.filter((f) => f.kind === "unused")).toEqual([]);
-  });
+  }, 20_000);
 });

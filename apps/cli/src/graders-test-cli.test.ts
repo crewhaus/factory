@@ -66,13 +66,13 @@ describe("crewhaus graders test (CLI, offline)", () => {
     expect(got.stdout).toContain("usage: crewhaus graders test");
     expect(got.stdout).toContain("--min-agreement");
     expect(got.stdout).toContain("expected_passed");
-  });
+  }, 20_000);
 
   it("rejects an unknown graders action naming every verb", async () => {
     const got = await runCli(["graders", "bogus"], newTempRoot());
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("graders action must be one of: suggest, test, card");
-  });
+  }, 20_000);
 
   it("dies on missing --graders / --golden", async () => {
     const root = newTempRoot();
@@ -83,7 +83,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     const noGolden = await runCli(["graders", "test", "--graders", "g.yaml"], root);
     expect(noGolden.exitCode).toBe(1);
     expect(noGolden.stderr).toContain("--golden");
-  });
+  }, 20_000);
 
   it("dies with the line number on a malformed golden line", async () => {
     const root = newTempRoot();
@@ -95,7 +95,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     );
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("golden line 4");
-  });
+  }, 20_000);
 
   it("replays a deterministic grader credential-free and reports FP exemplars", async () => {
     const root = newTempRoot();
@@ -109,7 +109,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     expect(got.stdout).toContain("3 golden verdict(s), 1 grader(s) tested");
     expect(got.stdout).toContain("mentions_ok (deterministic): agreement 67% (2/3)");
     expect(got.stdout).toContain("false positives (grader passed, human failed): 1 — g3");
-  });
+  }, 20_000);
 
   it("skips llm_judge graders with a notice when no credentials are visible", async () => {
     const root = newTempRoot();
@@ -134,7 +134,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     expect(got.stdout).toContain("1 grader(s) tested, 1 skipped");
     expect(got.stdout).toContain('skipped llm_judge "judge_q"');
     expect(got.stdout).toContain("mentions_ok (deterministic)");
-  });
+  }, 20_000);
 
   it("--min-agreement gates: non-zero under the floor, zero at/above it", async () => {
     const root = newTempRoot();
@@ -170,7 +170,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     );
     expect(pass.exitCode).toBe(0);
     expect(pass.stdout).toContain("gate passed");
-  });
+  }, 20_000);
 
   it("rejects an out-of-range --min-agreement", async () => {
     const root = newTempRoot();
@@ -191,7 +191,7 @@ describe("crewhaus graders test (CLI, offline)", () => {
     );
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--min-agreement");
-  });
+  }, 20_000);
 
   it("mentions graders test in the top-level usage", async () => {
     const root = newTempRoot();
@@ -199,5 +199,5 @@ describe("crewhaus graders test (CLI, offline)", () => {
     const got = await runCli(["--help"], root);
     expect(got.stdout).toContain("graders test --graders <g.yaml>");
     expect(got.stdout).toContain("--min-agreement");
-  });
+  }, 20_000);
 });

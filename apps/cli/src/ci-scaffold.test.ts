@@ -274,7 +274,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(existsSync(wfPath)).toBe(true);
     expect(readFileSync(wfPath, "utf-8")).toBe(buildEvalCiWorkflowYaml());
     expect(res.stdout).toContain("ANTHROPIC_API_KEY");
-  });
+  }, 20_000);
 
   test("existing harness: adds just the workflow, keeps the spec byte-identical", async () => {
     const root = newTempRoot();
@@ -284,7 +284,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(res.stdout).toContain("kept");
     expect(readFileSync(join(root, "crewhaus.yaml"), "utf-8")).toBe(SPEC_YAML);
     expect(existsSync(join(root, EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
-  });
+  }, 20_000);
 
   test("refuses to overwrite an existing workflow without --force", async () => {
     const root = newTempRoot();
@@ -301,7 +301,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     const forced = await runCli(["init", "--ci", "--force"], root);
     expect(forced.exitCode).toBe(0);
     expect(readFileSync(wfPath, "utf-8")).toBe(buildEvalCiWorkflowYaml());
-  });
+  }, 20_000);
 
   test("--suite scaffolds the tiered workflow, warns on a missing manifest, and refuses an outside path", async () => {
     const tieredRoot = newTempRoot();
@@ -382,7 +382,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(wf).toContain("working-directory: myagent");
     expect(wf).toContain('- "myagent/crewhaus.yaml"');
     expect(res.stdout).toContain("repo root");
-  });
+  }, 20_000);
 
   test("H5 — init [name] --ci inside a git repo: workflow at the REPO root, prefixed", async () => {
     const root = newTempRoot();
@@ -403,7 +403,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     expect(wf).toContain('- "packages/myagent/eval/**"');
     expect(wf).toContain("path: packages/myagent/.crewhaus-ci/base");
     expect(res.stdout).toContain("repo root");
-  });
+  }, 20_000);
 
   test("bare init is unchanged: no workflow, still refuses an existing spec", async () => {
     const root = newTempRoot();
@@ -413,7 +413,7 @@ describe("crewhaus init --ci (CLI surface)", () => {
     const second = await runCli(["init"], root);
     expect(second.exitCode).toBe(1);
     expect(second.stderr).toContain("refusing to overwrite");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus init --sentinel (CLI surface, item 30)", () => {

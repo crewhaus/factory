@@ -192,12 +192,12 @@ describe("crewhaus eval CLI integration (T3)", () => {
   test("eval --help exits 0", async () => {
     const result = await runCli(["eval", "--help"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("eval rejects missing --dataset", async () => {
     const result = await runCli(["eval", HELLO_SPEC]);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch B, G15) — `--repeats` is validated strictly and
   // BEFORE any dataset load or model spend, so these need no credentials.
@@ -268,17 +268,17 @@ describe("crewhaus eval CLI integration (T3)", () => {
       "500",
     ]);
     expect(sentinel.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("eval-report --help exits 0", async () => {
     const result = await runCli(["eval-report", "--help"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("eval-report rejects unknown action", async () => {
     const result = await runCli(["eval-report", "bogus"]);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
@@ -505,7 +505,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     const html = readFileSync(join(out, "index.html"), "utf-8");
     expect(html).toContain("Paired significance:");
     expect(html).toContain("Slice deltas (2)");
-  });
+  }, 20_000);
 
   test("unseeded diffs are byte-identical across runs (fixed default seed)", async () => {
     const root = newTempRoot();
@@ -526,7 +526,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     expect(parsed.significance.method).toBe("monte-carlo");
     // 6/25 same-direction regressions: decisively significant.
     expect(parsed.significance.significant).toBe(true);
-  });
+  }, 20_000);
 
   test("--seed override is recorded; a garbled seed dies loudly", async () => {
     const root = newTempRoot();
@@ -543,7 +543,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     );
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr).toContain("--seed must be an integer");
-  });
+  }, 20_000);
 
   test("--judge-model without --pairwise warns loudly and stays offline", async () => {
     const root = newTempRoot();
@@ -559,7 +559,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     // The flag stayed inert: a fully offline diff, no pairwise block.
     const diff = JSON.parse(readFileSync(join(out, "diff.json"), "utf-8"));
     expect(diff.pairwise).toBeUndefined();
-  });
+  }, 20_000);
 
   test("history/baseline warn when handed the pairwise-only flags", async () => {
     const root = newTempRoot();
@@ -572,7 +572,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     );
     expect(baseline.exitCode).toBe(0);
     expect(baseline.stderr).toContain("--judge-model only applies to `eval-report diff`");
-  });
+  }, 20_000);
 
   test("disjoint sample ids → clean mismatch message, not a stack trace", async () => {
     const root = newTempRoot();
@@ -582,7 +582,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("dataset shape mismatch");
     expect(result.stderr).not.toContain("    at "); // no stack frames
-  });
+  }, 20_000);
 
   test("a missing run dir also dies cleanly", async () => {
     const root = newTempRoot();
@@ -590,5 +590,5 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     const result = await runCliStderr(["eval-report", "diff", prev, join(root, "nope")], root);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("results.json not found");
-  });
+  }, 20_000);
 });

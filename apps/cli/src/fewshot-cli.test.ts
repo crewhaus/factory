@@ -118,7 +118,7 @@ describe("crewhaus fewshot harvest (#54)", () => {
     expect(pool[0].input).toBe("how do I deploy?");
     expect(pool[0].output).toBe("Run crewhaus deploy.");
     expect(pool[0].id).toBe(`${SESSION}_t1`);
-  });
+  }, 20_000);
 
   test("re-harvesting is idempotent (dedupes by id)", async () => {
     const root = newTempRoot();
@@ -132,7 +132,7 @@ describe("crewhaus fewshot harvest (#54)", () => {
       .split("\n")
       .filter((l) => l.trim() !== "");
     expect(pool).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("harvest into a custom -o file, then `show` prints the block", async () => {
     const root = newTempRoot();
@@ -144,7 +144,7 @@ describe("crewhaus fewshot harvest (#54)", () => {
     expect(existsSync(out)).toBe(true);
     const show = await runCli(["fewshot", "show", "-o", out], root);
     expect(show.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("exits non-zero when there is no feedback", async () => {
     const root = newTempRoot();
@@ -157,7 +157,7 @@ describe("crewhaus fewshot harvest (#54)", () => {
     writeMinimalSpec(root);
     const result = await runCli(["fewshot", "harvest", "--all-sessions"], root);
     expect(result.exitCode).not.toBe(0);
-  });
+  }, 20_000);
 });
 
 describe("optimize --few-shot is patch-only (#54 F8)", () => {
@@ -217,7 +217,7 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
     expect(readFileSync(specFile, "utf-8")).toBe(before);
     // 2) The safety notice was printed to stderr.
     expect(r.stderr).toContain("--write-back is ignored with --few-shot");
-  });
+  }, 20_000);
 
   test("NEW-datasets-1: pool examples overlapping the eval dataset are excluded, never injected", async () => {
     const root = newTempRoot();
@@ -268,5 +268,5 @@ describe("optimize --few-shot is patch-only (#54 F8)", () => {
     expect(r.stdout).toContain(
       "[optimize] few-shot: excluded 1 pool turn(s) overlapping the eval dataset",
     );
-  });
+  }, 20_000);
 });

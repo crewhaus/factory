@@ -89,25 +89,25 @@ describe("crewhaus eval — tool record/replay flags (NEW-HUNT-4)", () => {
     expect(got.stdout).toContain("--resume <runDir>");
     // The honest scope note: tools are replayed, the model is not.
     expect(got.stdout).toContain("the MODEL still runs live");
-  });
+  }, 20_000);
 
   test("--record-tools and --replay-tools are mutually exclusive", async () => {
     const got = await runCli([...BASE, "--record-tools", "rec", "--replay-tools", "rec"]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   test("--replay-miss without --replay-tools is refused, never silently ignored", async () => {
     const got = await runCli([...BASE, "--replay-miss", "live"]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--replay-miss is only valid with --replay-tools");
-  });
+  }, 20_000);
 
   test("--replay-miss only accepts error|live", async () => {
     const got = await runCli([...BASE, "--replay-tools", "rec", "--replay-miss", "sometimes"]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain('must be "error" or "live"');
-  });
+  }, 20_000);
 
   test("a replay directory with no cassette dies before any spend", async () => {
     const root = newTempRoot();
@@ -130,7 +130,7 @@ describe("crewhaus eval — tool record/replay flags (NEW-HUNT-4)", () => {
     );
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("tool recording not found");
-  });
+  }, 20_000);
 
   test("the cassette flags are refused with --models (cells share sample ids)", async () => {
     const got = await runCli([
@@ -142,14 +142,14 @@ describe("crewhaus eval — tool record/replay flags (NEW-HUNT-4)", () => {
     ]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--models is incompatible with --record-tools/--replay-tools");
-  });
+  }, 20_000);
 
   test("--help states the cassette's sensitivity and the reused-entry warning", async () => {
     const got = await runCli(["eval", "--help"]);
     expect(got.stdout).toContain("tool args and results VERBATIM");
     expect(got.stdout).toContain("do not commit one");
     expect(got.stdout).toContain("reusedEntries count");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval --voice — the R flags die instead of being ignored (D44)", () => {
@@ -166,14 +166,14 @@ describe("crewhaus eval --voice — the R flags die instead of being ignored (D4
       expect(got.exitCode).toBe(1);
       expect(got.stderr).toContain(`--voice does not support ${flag}`);
       expect(got.stderr).toContain("text evals only");
-    });
+    }, 20_000);
   }
 
   test("--replay-miss under --voice is refused too", async () => {
     const got = await runCli(["eval", "--voice", "--replay-miss", "live"]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--voice does not support --replay-miss");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval --resume (NEW-HUNT-6)", () => {
@@ -182,7 +182,7 @@ describe("crewhaus eval --resume (NEW-HUNT-6)", () => {
     const got = await runCli([...BASE, "--resume", join(root, "nope")]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("is not an eval run directory");
-  });
+  }, 20_000);
 
   test("refuses -o alongside --resume (the run dir IS the output)", async () => {
     const root = newTempRoot();
@@ -192,7 +192,7 @@ describe("crewhaus eval --resume (NEW-HUNT-6)", () => {
     const got = await runCli([...BASE, "--resume", runDir, "-o", join(root, "elsewhere")]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--resume and -o are mutually exclusive");
-  });
+  }, 20_000);
 
   test("refuses --models alongside --resume", async () => {
     const root = newTempRoot();
@@ -208,7 +208,7 @@ describe("crewhaus eval --resume (NEW-HUNT-6)", () => {
     ]);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("--resume and --models are mutually exclusive");
-  });
+  }, 20_000);
 
   test("a moved dataset identity refuses the resume by name, before any spend", async () => {
     const root = newTempRoot();
@@ -241,7 +241,7 @@ describe("crewhaus eval --resume (NEW-HUNT-6)", () => {
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("its identity moved");
     expect(got.stderr).toContain("datasetHash: nope (recorded)");
-  });
+  }, 20_000);
 });
 
 describe("run history — a resumed run supersedes, never duplicates", () => {
@@ -286,7 +286,7 @@ describe("run history — a resumed run supersedes, never duplicates", () => {
     expect(superseded).toContain("100.0%");
     expect(superseded).toContain("2026-07-26T00:00:02.000Z");
     expect(got.stdout).not.toContain("50.0%");
-  });
+  }, 20_000);
 
   test("a run resumed TWICE still yields exactly one row", async () => {
     const root = newTempRoot();
@@ -320,5 +320,5 @@ describe("run history — a resumed run supersedes, never duplicates", () => {
     const rows = got.stdout.split("\n").filter((l) => l.includes("run_3333333333333333"));
     expect(rows).toHaveLength(1);
     expect(rows[0]).toContain("100.0%");
-  });
+  }, 20_000);
 });

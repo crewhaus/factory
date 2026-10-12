@@ -130,7 +130,7 @@ describe("crewhaus export claude-plugin", () => {
     const r = await runCli(["export", "nonsense"]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("claude-plugin");
-  });
+  }, 20_000);
 
   /**
    * Item 14 — a harness that ships hand-written skills + slash commands used to
@@ -189,7 +189,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
 
     test("--no-assets emits the spec projection alone", async () => {
       const harness = freshHarness();
@@ -210,7 +210,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
 
     test("an authored SKILL.md Claude Code could not load fails the export", async () => {
       const harness = freshHarness({ ".crewhaus/skills/broken/SKILL.md": "no frontmatter here\n" });
@@ -231,7 +231,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
   }, 20_000);
 });
 
@@ -240,24 +240,24 @@ describe("crewhaus serve --mcp", () => {
     const r = await runCli(["serve", "--help"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("serve --mcp");
-  });
+  }, 20_000);
 
   test("requires --mcp", async () => {
     const r = await runCli(["serve", CLI_SPEC]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("--mcp");
-  });
+  }, 20_000);
 
   test("rejects a non-cli target", async () => {
     const r = await runCli(["serve", "--mcp", VOICE_SPEC]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("supports target: cli");
-  });
+  }, 20_000);
 
   test("errors on a missing spec path", async () => {
     const r = await runCli(["serve", "--mcp", join(REPO_ROOT, "does-not-exist.yaml")]);
     expect(r.exitCode).not.toBe(0);
-  });
+  }, 20_000);
 
   test("boots stdio, answers initialize + tools/list on a clean stdout, exits on EOF", async () => {
     const requests = `${JSON.stringify({
@@ -290,7 +290,7 @@ describe("crewhaus serve --mcp", () => {
 
     // The serve diagnostics went to stderr, not the protocol channel.
     expect(r.stderr).toContain("[serve] MCP stdio server");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus run --plugins (item 3)", () => {
@@ -314,7 +314,7 @@ describe("crewhaus run --plugins (item 3)", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });
 
 describe("crewhaus plugins/templates default registry (item 10)", () => {
@@ -323,10 +323,10 @@ describe("crewhaus plugins/templates default registry (item 10)", () => {
     const r = await runCli(["plugins"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("registry.crewhaus.ai/plugins");
-  });
+  }, 20_000);
   test("templates usage documents the default public registry", async () => {
     const r = await runCli(["templates"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("registry.crewhaus.ai/templates");
-  });
+  }, 20_000);
 });

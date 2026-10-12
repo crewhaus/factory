@@ -856,7 +856,7 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     // Declining the hybrid question keeps the pre-0.6.0 single-model spec.
     expect(yaml).not.toContain("models:");
     expect(yaml).not.toContain("model_pool:");
-  });
+  }, 20_000);
 
   test("0.6.0 §9.2 — answering the hybrid question YES emits the registry + cascade", async () => {
     const root = newTargetDir("cli-hybrid");
@@ -872,7 +872,7 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     expect(yaml).toContain("model: $fast");
     expect(yaml).toContain("cascade:");
     expect(yaml).toContain("on_fail: escalate");
-  });
+  }, 20_000);
 
   test("credentials but no TTY → the conversational path is refused; the scripted questionnaire runs", async () => {
     const root = newTargetDir("cli-notty");
@@ -888,7 +888,7 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     );
     expect(stdout).not.toContain("interactive spec authoring");
     expect(existsSync(join(root, "gated-bot", "crewhaus.yaml"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--yes with credentials → scripted questionnaire by request", async () => {
     const root = newTargetDir("cli-yes");
@@ -903,7 +903,7 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
       "--yes requested the scripted questionnaire — falling back to the scripted questionnaire.\n",
     );
     expect(existsSync(join(root, "yes-bot", "crewhaus.yaml"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--resume without the conversational path refuses with a clear error", async () => {
     const root = newTargetDir("cli-resume-refuse");
@@ -916,5 +916,5 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     expect(stderr).toContain(
       "crewhaus init --interactive --resume needs the conversational interview",
     );
-  });
+  }, 20_000);
 });

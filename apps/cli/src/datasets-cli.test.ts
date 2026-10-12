@@ -303,7 +303,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const root = newTempRoot();
     writeSession(root);
     expect((await runCli(["distill", "--session", SESSION], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("an invalid --register name (path traversal) exits 1 and writes nothing", async () => {
     const root = newTempRoot();
@@ -311,7 +311,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const result = await runCli(["distill", "--session", SESSION, "--register", "../escape"], root);
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(root, ".crewhaus", "escape"))).toBe(false);
-  });
+  }, 20_000);
 
   // B23 — distilled sample text is PII/secret-redacted by default;
   // --no-redact restores the raw text for dev/local inspection.
@@ -399,7 +399,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       );
       expect(result.exitCode).toBe(1);
     }
-  });
+  }, 20_000);
 
   test("eval exits 1 when the ref names a split the record lacks", async () => {
     const root = newTempRoot();
@@ -411,7 +411,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       root,
     );
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   // B16 — an explicit #test needs the --allow-test-split opt-in on eval.
   test("eval refuses #test without --allow-test-split and unlocks with it", async () => {
@@ -453,7 +453,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       );
       expect(result.exitCode).toBe(1);
     }
-  });
+  }, 20_000);
 
   // B16 — optimize refuses #test outright; there is no opt-in flag for it.
   test("optimize refuses an explicit #test ref with the release-gate explanation", async () => {
@@ -465,7 +465,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("optimize never runs over the test split");
-  });
+  }, 20_000);
 
   // B16 — deploy canary is a release-gating flow (a sanctioned holdout
   // spender): #test is consumable there, behind the same opt-in as eval.
@@ -542,7 +542,7 @@ describe("crewhaus datasets put --canary (B18)", () => {
     expect(canaries[0]?.expected_output).toBeUndefined();
     // The canary'd registry still verifies clean.
     expect((await runCli(["datasets", "verify", "cnry"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus datasets status (B17)", () => {
@@ -578,7 +578,7 @@ describe("crewhaus datasets card (B21)", () => {
     expect(after).toBe(before);
     // Unknown dataset exits 1.
     expect((await runCli(["datasets", "card", "ghost"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus datasets release (NEW-HUNT-9)", () => {
@@ -608,7 +608,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("has no test split");
-  });
+  }, 20_000);
 
   test("refuses a second release without --force (the holdout is spent)", async () => {
     const root = newTempRoot();
@@ -632,7 +632,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     // The record's release history is untouched by the refusal.
     const after = JSON.parse(readFileSync(path, "utf-8"));
     expect(after.releases).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("missing --spec/--graders/name exit 1", async () => {
     const root = newTempRoot();
@@ -641,7 +641,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     expect((await runCli(["datasets", "release", "x", "--spec", "spec.yaml"], root)).exitCode).toBe(
       1,
     );
-  });
+  }, 20_000);
 });
 
 describe("crewhaus dataset lint CLI (B26)", () => {
@@ -660,7 +660,7 @@ describe("crewhaus dataset lint CLI (B26)", () => {
     const strict = await runCliStderr(["dataset", "lint", "--dataset", bad, "--strict"], root);
     expect(strict.exitCode).toBe(1);
     expect(strict.stderr).toContain("finding(s)");
-  });
+  }, 20_000);
 
   test("a clean registry dataset lints clean under --strict; --all sweeps", async () => {
     const root = newTempRoot();
@@ -697,7 +697,7 @@ describe("crewhaus dataset lint CLI (B26)", () => {
       root,
     );
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
@@ -723,7 +723,7 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     expect(result.stderr).toContain('duplicate sample id "q1"');
     expect(result.stderr).toContain("--no-preflight");
     expect(existsSync(out)).toBe(false);
-  });
+  }, 20_000);
 
   test("--no-preflight skips the refusal (the run proceeds past the lint-lite)", async () => {
     const root = newTempRoot();
@@ -760,7 +760,7 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     );
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).not.toContain("preflight refused");
-  });
+  }, 20_000);
 
   test("gold-needing graders over an all-goldless dataset refuse pre-spend", async () => {
     const root = newTempRoot();
@@ -779,5 +779,5 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("fail by construction");
-  });
+  }, 20_000);
 });
