@@ -28,6 +28,22 @@ function alive(pid: number): boolean {
   }
 }
 
+/**
+ * Alive and not a zombie. A killed child its parent has not reaped yet
+ * still answers `kill(pid, 0)`, and a host reaps its command's child on its
+ * own event loop, so right after a group kill that child can be dead and
+ * still pass for alive.
+ */
+function running(pid: number): boolean {
+  if (!alive(pid)) return false;
+  const ps = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const stat = new TextDecoder().decode(ps.stdout).trim();
+  return stat !== "" && !stat.startsWith("Z");
+}
+
 async function waitGone(pid: number, budgetMs: number): Promise<boolean> {
   const until = performance.now() + budgetMs;
   while (performance.now() < until) {
@@ -567,6 +583,30 @@ describe.if(posix)("when the host goes away", () => {
   /** The marker an `addHostExitHook` hook writes, synchronously. */
   const hookMarker = (mode: Mode): string => join(scratch, `${mode}.hook-ran`);
 
+  /**
+   * The marker a host's own SIGINT handler writes once every SIGINT listener
+   * has run (`setImmediate`). spawnBounded's listener runs in the same emit:
+   * when it takes the host for handler-less, it has killed the command's
+   * group and re-raised the signal before the marker is written.
+   */
+  const carriedOn = (mode: Mode): string => join(scratch, `${mode}.carried-on`);
+  const handler = (mode: Mode, line: string): string =>
+    `() => { console.log(${JSON.stringify(line)}); setImmediate(() => require("node:fs").writeFileSync(${JSON.stringify(carriedOn(mode))}, "ran")); }`;
+
+  /**
+   * Resolves once the host has run past its SIGINT handler or has exited,
+   * whichever comes first. The bound only ends a hang: a host writes the
+   * marker within milliseconds of handling the signal. A fixed sleep here
+   * instead let a host that had not been scheduled yet pass for alive.
+   */
+  async function carriedOnOrExited(h: ReturnType<typeof Bun.spawn>, mode: Mode): Promise<void> {
+    const until = performance.now() + 15_000;
+    while (!existsSync(carriedOn(mode)) && h.exitCode === null && h.signalCode === null) {
+      if (performance.now() > until) throw new Error("the host neither handled SIGINT nor exited");
+      await Bun.sleep(20);
+    }
+  }
+
   async function host(mode: Mode): Promise<{
     host: ReturnType<typeof Bun.spawn>;
     sleeper: number;
@@ -578,9 +618,9 @@ describe.if(posix)("when the host goes away", () => {
       script,
       [
         `import { addHostExitHook, spawnBounded } from ${JSON.stringify(spawnModule)};`,
-        mode === "own-handler" ? `process.on("SIGINT", () => console.log("host handles it"));` : "",
+        mode === "own-handler" ? `process.on("SIGINT", ${handler(mode, "host handles it")});` : "",
         mode === "once-handler"
-          ? `process.once("SIGINT", () => console.log("host handles it once"));`
+          ? `process.once("SIGINT", ${handler(mode, "host handles it once")});`
           : "",
         mode.startsWith("hook-")
           ? `addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(hookMarker(mode))}, "ran"));`
@@ -633,19 +673,20 @@ describe.if(posix)("when the host goes away", () => {
     try {
       await Bun.sleep(100);
       h.kill("SIGINT");
-      await Bun.sleep(500);
-      expect({ exitCode: h.exitCode, signal: h.signalCode }).toEqual({
-        exitCode: null,
-        signal: null,
-      });
-      expect(alive(sleeper)).toBe(true);
+      await carriedOnOrExited(h, "once-handler");
+      expect({
+        exitCode: h.exitCode,
+        signal: h.signalCode,
+        carriedOn: existsSync(carriedOn("once-handler")),
+      }).toEqual({ exitCode: null, signal: null, carriedOn: true });
+      expect(running(sleeper)).toBe(true);
     } finally {
       h.kill("SIGKILL");
       await h.exited;
       if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
     }
     expect(await new Response(h.stdout).text()).toContain("host handles it once");
-  }, 30_000);
+  }, 60_000);
 
   test("addHostExitHook: process.exit runs the hook, after the group is killed", async () => {
     const { host: h, sleeper } = await host("hook-exit");
@@ -697,15 +738,22 @@ describe.if(posix)("when the host goes away", () => {
     try {
       await Bun.sleep(100);
       h.kill("SIGINT");
-      await Bun.sleep(500);
-      expect(h.exitCode).toBeNull();
-      expect(alive(sleeper)).toBe(true);
+      // Checked once the handler has run: before it, the host is alive
+      // whatever the policy.
+      await carriedOnOrExited(h, "own-handler");
+      expect({
+        exitCode: h.exitCode,
+        signal: h.signalCode,
+        carriedOn: existsSync(carriedOn("own-handler")),
+      }).toEqual({ exitCode: null, signal: null, carriedOn: true });
+      expect(running(sleeper)).toBe(true);
     } finally {
       h.kill("SIGKILL");
       await h.exited;
       if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
     }
-  }, 30_000);
+    expect(await new Response(h.stdout).text()).toContain("host handles it");
+  }, 60_000);
 });
 
 /**
