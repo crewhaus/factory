@@ -681,6 +681,89 @@ export function parseLockfileDetailed(
 // ---------------------------------------------------------------------------
 // python
 
+/** A code unit `[A-Za-z0-9._-]` matches: a package name or a TOML bare key. */
+function isNameUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    c === 0x2e ||
+    c === 0x5f ||
+    c === 0x2d
+  );
+}
+
+/** The end of the run of `\s` code units that starts at `from`. */
+function spacesEnd(line: string, from: number): number {
+  let i = from;
+  while (i < line.length && isRegExpSpace(line.charCodeAt(i))) i++;
+  return i;
+}
+
+/** Whether `line` holds a code unit `.` refuses at or after `from`. */
+function breakFrom(line: string, from: number): boolean {
+  for (let i = from; i < line.length; i++) if (isLineBreak(line.charCodeAt(i))) return true;
+  return false;
+}
+
+/**
+ * A requirement's name, `[extras]` and the rest: what
+ * `/^(?<name>[A-Za-z0-9._-]+)\s*(?:\[(?<extras>[^\]]*)\])?\s*(?<range>.*)$/`
+ * captured, read in one pass. The name, the whitespace after it, the extras
+ * (up to the first `]`) and the whitespace after them are each taken whole,
+ * and the rest must hold no line break (`.` stops at \n, \r, U+2028 and
+ * U+2029): that is the only way the pattern matched, since every shorter take
+ * leaves a rest holding the same break. It tried each one and rescanned the
+ * rest from each, so a run of whitespace before a stray \r or U+2028 was
+ * cubic in the run's length, in a file the workspace supplies.
+ */
+export function requirementParts(
+  line: string,
+): { name: string; extras: string | undefined; range: string } | null {
+  let at = 0;
+  while (at < line.length && isNameUnit(line.charCodeAt(at))) at++;
+  if (at === 0) return null;
+  const name = line.slice(0, at);
+  at = spacesEnd(line, at);
+  let extras: string | undefined;
+  if (line.charCodeAt(at) === 0x5b) {
+    const close = line.indexOf("]", at + 1);
+    if (close !== -1) {
+      extras = line.slice(at + 1, close);
+      at = close + 1;
+    }
+  }
+  at = spacesEnd(line, at);
+  return breakFrom(line, at) ? null : { name, extras, range: line.slice(at) };
+}
+
+/**
+ * A `key = value` line's key and value: what
+ * `/^(?<key>[A-Za-z0-9._-]+)\s*=\s*(?<value>.+)$/` captured, read in one
+ * pass. The key and the whitespace on each side of `=` are taken whole, and
+ * the value must hold no line break; when nothing follows the whitespace
+ * after `=`, the pattern took that whitespace's last character, unless it is
+ * a line break. It tried each shorter run of whitespace and rescanned the
+ * rest from each, so a run before a stray \r was quadratic in its length.
+ */
+export function tomlKeyValue(line: string): { key: string; value: string } | null {
+  let at = 0;
+  while (at < line.length && isNameUnit(line.charCodeAt(at))) at++;
+  if (at === 0) return null;
+  const key = line.slice(0, at);
+  at = spacesEnd(line, at);
+  if (line.charCodeAt(at) !== 0x3d) return null;
+  const valueFrom = at + 1;
+  at = spacesEnd(line, valueFrom);
+  if (at === line.length) {
+    const last = at - 1;
+    return last >= valueFrom && !isLineBreak(line.charCodeAt(last))
+      ? { key, value: line.charAt(last) }
+      : null;
+  }
+  return breakFrom(line, at) ? null : { key, value: line.slice(at) };
+}
+
 /** `requirements.txt`: one requirement per line, markers and extras stripped. */
 export function parseRequirementsTxt(text: string, source = "requirements.txt"): Dependency[] {
   const out: Dependency[] = [];
@@ -694,11 +777,11 @@ export function parseRequirementsTxt(text: string, source = "requirements.txt"):
     const marker = line.indexOf(";");
     if (marker !== -1) line = line.slice(0, marker).trim();
     if (line.includes("://") || line.startsWith(".")) continue;
-    const m = /^(?<name>[A-Za-z0-9._-]+)\s*(?:\[(?<extras>[^\]]*)\])?\s*(?<range>.*)$/.exec(line);
-    if (m === null) continue;
+    const parts = requirementParts(line);
+    if (parts === null) continue;
     out.push({
-      name: (m.groups?.["name"] as string).trim(),
-      range: (m.groups?.["range"] ?? "").trim(),
+      name: parts.name.trim(),
+      range: parts.range.trim(),
       scope: "prod",
       ecosystem: "pypi",
       source,
@@ -711,9 +794,9 @@ export function parseRequirementsTxt(text: string, source = "requirements.txt"):
 function splitPep508(spec: string): { name: string; range: string } | undefined {
   const cleaned = spec.split(";")[0]?.trim() ?? "";
   if (cleaned === "") return undefined;
-  const m = /^(?<name>[A-Za-z0-9._-]+)\s*(?:\[[^\]]*\])?\s*(?<range>.*)$/.exec(cleaned);
-  if (m === null) return undefined;
-  return { name: m.groups?.["name"] as string, range: (m.groups?.["range"] ?? "").trim() };
+  const parts = requirementParts(cleaned);
+  if (parts === null) return undefined;
+  return { name: parts.name, range: parts.range.trim() };
 }
 
 /**
@@ -952,10 +1035,10 @@ function tomlKeyValues(body: string): Array<[string, string]> {
   for (const raw of body.split("\n")) {
     const line = withoutTomlComment(raw.replace(/\r$/, "")).trim();
     if (line === "" || line.startsWith("#")) continue;
-    const m = /^(?<key>[A-Za-z0-9._-]+)\s*=\s*(?<value>.+)$/.exec(line);
-    if (m === null) continue;
-    const key = m.groups?.["key"] as string;
-    const rawValue = (m.groups?.["value"] as string).trim();
+    const pair = tomlKeyValue(line);
+    if (pair === null) continue;
+    const key = pair.key;
+    const rawValue = pair.value.trim();
     if (rawValue.startsWith('"')) {
       out.push([key, rawValue.replace(/^"/, "").replace(/"$/, "")]);
       continue;
