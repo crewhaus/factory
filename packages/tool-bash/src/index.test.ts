@@ -48,12 +48,13 @@ describe("Bash tool execution", () => {
   });
 
   test("kills the process and reports timeout when exceeded", async () => {
-    const start = Date.now();
-    const out = await bash.execute({ command: "sleep 10", timeout: 150 });
-    const elapsed = Date.now() - start;
+    // The command outlasts this test's budget, so only the kill at the
+    // timeout can end the call in time; a call that waited for it fails here
+    // at the budget. Nothing is timed: a 2 s bound on the call (about 0.65 s
+    // on CI) raced the runner. `exec`, so the kill reaches the sleep itself.
+    const out = await bash.execute({ command: "exec sleep 120", timeout: 150 });
     expect(out).toContain("timed out after 150ms");
-    expect(elapsed).toBeLessThan(2000);
-  });
+  }, 20_000);
 
   test("does not time out when command finishes within budget", async () => {
     const out = await bash.execute({ command: "echo fast", timeout: 5000 });
@@ -110,12 +111,32 @@ describe("background Bash + BashOutput + KillShell", () => {
   });
 
   test("background:true returns a bash_id immediately without blocking", async () => {
-    const started = Date.now();
-    const out = await bash.execute({ command: "sleep 2; echo done", background: true });
-    expect(Date.now() - started).toBeLessThan(1000); // did NOT wait for sleep 2
-    expect(out).toContain("[background] started bash_");
-    expect(out).toMatch(/bash_[0-9a-f]{12}/);
-  });
+    // The command waits for a file this test creates only after the call has
+    // returned, so a call that waited for the command would never return (the
+    // budget stops it), and it is still running once the call has. Nothing is
+    // timed: "under 1 s, against a 2 s sleep" raced the runner.
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-bash-gate-"));
+    const gate = join(dir, "release");
+    try {
+      const out = await bash.execute({
+        command: `while [ ! -f '${gate}' ]; do sleep 0.01; done; echo done`,
+        background: true,
+      });
+      expect(out).toContain("[background] started bash_");
+      expect(out).toMatch(/bash_[0-9a-f]{12}/);
+      const id = out.match(/bash_[0-9a-f]{12}/)?.[0] as string;
+      expect(await bashOutput.execute({ bash_id: id })).toContain("[status] running");
+      writeFileSync(gate, "");
+      const after = await pollUntil(
+        id,
+        (seen) => seen.includes("done") && seen.includes("[status] exited"),
+      );
+      expect(after).toContain("done");
+      expect(after).toContain("[status] exited 0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("BashOutput streams incremental output then reports the exit code", async () => {
     const start = await bash.execute({ command: "echo one; echo two", background: true });
