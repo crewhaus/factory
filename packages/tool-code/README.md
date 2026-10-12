@@ -152,6 +152,11 @@ expression, so a repository's glob cannot make the match backtrack.
   result lists it under `skipped` with the reason, so a refused manifest is
   never reported as a missing one. A link to another file inside the
   workspace is followed as before.
+  Lint, Format and RunTests hand each `paths` entry to the project's own
+  program as written, and that program resolves it from `cwd` itself,
+  following a link before any `..` after it. So an entry must name a place
+  below `cwd`: one that is absolute or has a `..` segment is refused, naming
+  the entry. Set `cwd` to reach another directory.
 - **Arguments.** Nothing reaches a shell; argv is always an array. That stops
   a caller reaching `sh`, not a program's own option parser, so every caller
   value that lands in argv as a bare word is refused when it begins with `-`,

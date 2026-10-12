@@ -93,6 +93,7 @@ import {
   MAX_TIMEOUT_MS,
   type RunResult,
   checkArgv,
+  checkBelowCwd,
   checkOptionSafe,
   displayCommand,
   json,
@@ -446,7 +447,7 @@ export const runTests: RegisteredTool = buildTool({
       .array(z.string().min(1))
       .max(64)
       .optional()
-      .describe("limit the run to these test files, relative to `cwd`"),
+      .describe("limit the run to these test files below `cwd`, written relative to it (no `..`)"),
     maxFailures: z.number().int().positive().max(500).optional(),
     includeRawOutput: z
       .boolean()
@@ -461,7 +462,9 @@ export const runTests: RegisteredTool = buildTool({
     const root = path.resolve(process.cwd());
 
     const paths = input.paths ?? [];
-    const bad = checkOptionSafe("RunTests", [input.namePattern, ...paths], "filter");
+    const bad =
+      checkOptionSafe("RunTests", [input.namePattern, ...paths], "filter") ??
+      checkBelowCwd("RunTests", paths);
     if (bad !== undefined) return bad.message;
     for (const candidate of paths) {
       const inside = resolveFile("RunTests", path.join(relPosix(root, dir.value), candidate));
@@ -784,7 +787,9 @@ export const lint: RegisteredTool = buildTool({
       .array(z.string().min(1))
       .max(64)
       .optional()
-      .describe("limit to these files or directories, relative to `cwd`"),
+      .describe(
+        "limit to these files or directories below `cwd`, written relative to it (no `..`)",
+      ),
     timeout: timeoutField,
   }),
   ...CHECK_SPAWN,
@@ -793,7 +798,7 @@ export const lint: RegisteredTool = buildTool({
     if (!dir.ok) return dir.message;
     const root = path.resolve(process.cwd());
     const paths = input.paths ?? [];
-    const bad = checkOptionSafe("Lint", paths, "path");
+    const bad = checkOptionSafe("Lint", paths, "path") ?? checkBelowCwd("Lint", paths);
     if (bad !== undefined) return bad.message;
     for (const candidate of paths) {
       const inside = resolveDirOrFile("Lint", path.join(relPosix(root, dir.value), candidate));
@@ -842,7 +847,9 @@ export const format: RegisteredTool = buildTool({
       .array(z.string().min(1))
       .max(64)
       .optional()
-      .describe("limit to these files or directories, relative to `cwd`"),
+      .describe(
+        "limit to these files or directories below `cwd`, written relative to it (no `..`)",
+      ),
     timeout: timeoutField,
   }),
   ...WRITE_SPAWN,
@@ -851,7 +858,7 @@ export const format: RegisteredTool = buildTool({
     if (!dir.ok) return dir.message;
     const root = path.resolve(process.cwd());
     const paths = input.paths ?? [];
-    const bad = checkOptionSafe("Format", paths, "path");
+    const bad = checkOptionSafe("Format", paths, "path") ?? checkBelowCwd("Format", paths);
     if (bad !== undefined) return bad.message;
     for (const candidate of paths) {
       const inside = resolveDirOrFile("Format", path.join(relPosix(root, dir.value), candidate));

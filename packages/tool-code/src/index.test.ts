@@ -920,6 +920,104 @@ describe("containment", () => {
   });
 });
 
+// critic7 (0.7.1): these three hand each `paths` entry, as written, to a
+// program run in the real `cwd`, which follows a link before the `..` after
+// it — while the check collapsed `..` first, and joined an absolute entry to
+// `cwd`. With `link -> secrets/deep`, Format rewrote secrets/x.ts for
+// `{cwd: "link", paths: ["../x.ts"]}`, and an absolute entry rewrote a file
+// outside the workspace whose in-workspace mirror the check had looked at.
+describe("paths below cwd: `..` and absolute entries are refused before anything runs", () => {
+  const SECRET = "export const key = 1;\n";
+  /** A formatter/runner stand-in that logs its call and appends to every path after `--`. */
+  function installAppender(name: string, log: string): void {
+    installBinary(
+      name,
+      [
+        `echo "$(pwd -P) $*" >> "${log}"`,
+        "seen=0",
+        'for a in "$@"; do',
+        '  [ "$seen" = 1 ] && echo "// touched" >> "$a"',
+        '  [ "$a" = "--" ] && seen=1',
+        "done",
+        "exit 0",
+      ].join("\n"),
+    );
+  }
+  let stubLog: string;
+  beforeEach(() => {
+    stubLog = join(outside, "stub.log");
+    writeFileSync(stubLog, "");
+    for (const dir of ["", "src/", "secrets/deep/"]) {
+      write(`${dir}biome.json`, "{}");
+      write(`${dir}vitest.config.ts`, "export default {};\n");
+    }
+    write("secrets/x.ts", SECRET);
+    write("src/x.ts", "export const a = 1;\n");
+    writeFileSync(join(outside, "victim.ts"), SECRET);
+    // The mirror an absolute entry used to be checked as.
+    write(`src${join(outside, "victim.ts")}`, "mirror\n");
+    symlinkSync("secrets/deep", join(workspace, "link"));
+    symlinkSync("../secrets/deep", join(workspace, "src", "lnk"));
+    installAppender("biome", stubLog);
+    installAppender("vitest", stubLog);
+  });
+
+  test("Lint, Format and RunTests refuse each, naming the entry and why", async () => {
+    const victim = join(outside, "victim.ts");
+    for (const tool of [lint, format, runTests]) {
+      for (const [input, entry, why] of [
+        [{ cwd: "link", paths: ["../x.ts"] }, "../x.ts", 'it has a ".." segment'],
+        [{ paths: ["link/../x.ts"] }, "link/../x.ts", 'it has a ".." segment'],
+        [{ cwd: "src", paths: ["lnk/../x.ts"] }, "lnk/../x.ts", 'it has a ".." segment'],
+        [{ cwd: "src", paths: ["x.ts", "a\\..\\x.ts"] }, "a\\..\\x.ts", 'it has a ".." segment'],
+        [{ cwd: "src", paths: [victim] }, victim, "it is absolute"],
+      ] as const) {
+        const message = await call(tool, input);
+        expect({
+          tool: tool.name,
+          input,
+          refused: message.startsWith(`${tool.name} refused`),
+        }).toEqual({
+          tool: tool.name,
+          input,
+          refused: true,
+        });
+        expect(message).toContain(`the path "${entry.length > 80 ? entry.slice(0, 80) : entry}`);
+        expect(message).toContain(why);
+        expect(message).toContain("Pass a path below `cwd`");
+      }
+    }
+    // Nothing ran, and nothing was written.
+    expect(readFileSync(stubLog, "utf8")).toBe("");
+    expect(readFileSync(join(workspace, "secrets", "x.ts"), "utf8")).toBe(SECRET);
+    expect(readFileSync(victim, "utf8")).toBe(SECRET);
+  }, 30_000);
+
+  test("an entry below cwd still reaches the program as written, after --", async () => {
+    for (const [tool, verb] of [
+      [format, "format --write"],
+      [lint, "lint --reporter=json"],
+    ] as const) {
+      const result = await callJson(tool, { cwd: "src", paths: ["x.ts", "./x.ts"] });
+      expect({ tool: tool.name, command: result["command"] }).toEqual({
+        tool: tool.name,
+        command: `node_modules/.bin/biome ${verb} -- x.ts ./x.ts`,
+      });
+    }
+    // A dot-name is not `..`, and a link that is `cwd` itself is followed
+    // by the check and the program alike.
+    write("secrets/deep/..x.ts", "");
+    write("secrets/deep/x...ts", "");
+    const tests = await callJson(runTests, { cwd: "link", paths: ["..x.ts", "x...ts"] });
+    expect(String(tests["command"])).toContain("-- ..x.ts x...ts");
+    expect(readFileSync(stubLog, "utf8").split("\n").filter(Boolean)).toEqual([
+      `${workspace}/src format --write -- x.ts ./x.ts`,
+      `${workspace}/src lint --reporter=json -- x.ts ./x.ts`,
+      `${workspace}/secrets/deep run --reporter=json --silent -- ..x.ts x...ts`,
+    ]);
+  }, 120_000);
+});
+
 // ---------------------------------------------------------------------------
 
 /**

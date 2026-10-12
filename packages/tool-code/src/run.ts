@@ -171,6 +171,42 @@ export function checkOptionSafe(
 }
 
 /**
+ * Refuse a caller path that is absolute or has a `..` segment, for a tool
+ * that hands its paths, as written, to a program it runs in `cwd`.
+ *
+ * That program resolves each path itself, from the directory it runs in, and
+ * the OS follows every symlink BEFORE it applies the `..` after it. The
+ * containment check here (and the permission gate) collapse `..` first, so
+ * `../x.ts` run in a symlinked `cwd` — an ordinary workspace link such as
+ * `node_modules/@acme/pkg` will do — or `lnk/../x.ts` named one file to them
+ * and another to the formatter. An absolute path ignores `cwd` for the
+ * program, while the check joined it to `cwd` and looked at a file inside
+ * the workspace. With both refused, a path names the same file to the
+ * check, the gate and the program: one below `cwd`. tool-git's
+ * `checkPathspecs` refuses the same shapes.
+ */
+export function checkBelowCwd(
+  toolName: string,
+  paths: readonly string[],
+  what = "path",
+): Refusal | undefined {
+  const instead = "Pass a path below `cwd`, or set `cwd` to the directory you mean.";
+  for (const value of paths) {
+    if (path.isAbsolute(value)) {
+      return refuse(
+        `${toolName} refused the ${what} "${echo(value)}": it is absolute, and paths here are read from \`cwd\`. ${instead}`,
+      );
+    }
+    if (value.split(/[\\/]/).includes("..")) {
+      return refuse(
+        `${toolName} refused the ${what} "${echo(value)}": it has a ".." segment, which the program resolves after following any link on the way, so it may land somewhere other than it reads. ${instead}`,
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
  * Validate an explicit command a caller supplied in place of detection.
  *
  * The program name itself is the one value that may not be refused for
