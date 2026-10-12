@@ -1543,7 +1543,7 @@ export const indexBuild: RegisteredTool = stateTool({
         safe = resolveSafe("IndexBuild", given);
       } catch (err) {
         if (err instanceof ToolPermissionError) {
-          skipped.push({ path: given, reason: "resolves outside the workspace" });
+          skipped.push({ path: given, reason: err.reason ?? "resolves outside the workspace" });
           continue;
         }
         throw err;

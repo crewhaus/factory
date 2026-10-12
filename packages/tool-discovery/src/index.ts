@@ -90,6 +90,7 @@ import {
   contain,
   errText,
   json,
+  pastPathLimit,
   refusal,
   renderPath,
 } from "./lib/result";
@@ -227,7 +228,9 @@ async function signatureOf(
       unknowns.add(
         field,
         probe,
-        `the manifest file resolves outside the workspace root, so it was not read: ${contained.reason}`,
+        pastPathLimit(leaf)
+          ? `the manifest file was not read: ${contained.reason}`
+          : `the manifest file resolves outside the workspace root, so it was not read: ${contained.reason}`,
       );
       return null;
     }

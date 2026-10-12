@@ -35,6 +35,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { z } from "zod";
 import { DEPLOY_TOOLS, deployInspect, deployRollback, specPin } from "./index";
 import { MANIFEST_FILENAME, versionFilename } from "./lib/registry";
+import { MAX_PATH_CHARS } from "./paths";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -1097,6 +1098,34 @@ test("a manifest's own strings reach the result bounded and printable, like a ca
   expect(String(badEnv["reason"])).toContain("invalid environment");
   expect(String(badEnv["reason"])).not.toContain(esc);
   expect(String(badEnv["reason"])).not.toContain("D".repeat(300));
+});
+
+/**
+ * 0.7.1 review — a manifest version too long to be a path leads nowhere, so
+ * it is no escape: the per-version containment skips it (a read of it meets
+ * the filesystem's own refusal), and a rollback to another version goes
+ * ahead, as it did before the resolver refused paths past MAX_PATH_CHARS.
+ */
+test("a manifest version too long to be a path does not block a rollback to another", async () => {
+  await seed("name: demo\nv: 1\n");
+  writeFileSync(path.join(tmp, "spec.yaml"), "name: demo\nv: 2\n");
+  await call(specPin, { name: "demo", specFile: "spec.yaml", env: "prod", repin: true });
+  const manifest = JSON.parse(readFileSync(manifestPath(), "utf8")) as { versions: string[] };
+  manifest.versions.push("B".repeat(MAX_PATH_CHARS));
+  writeFileSync(manifestPath(), JSON.stringify(manifest));
+
+  const rolled = await call(deployRollback, {
+    name: "demo",
+    env: "prod",
+    toVersion: "v1",
+    actor: "ops",
+    dryRun: false,
+  });
+  expect({ status: rolled["status"], reason: rolled["reason"] }).toEqual({
+    status: "rolled-back",
+    reason: undefined,
+  });
+  expect(pinsOnDisk()).toEqual({ prod: "v1" });
 });
 
 test("DeployInspect refuses an environment name the registry could never pin", async () => {

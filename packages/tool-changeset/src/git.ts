@@ -107,7 +107,10 @@ export function checkPathspecs(
       // An absolute path is fine here: `resolveSafe` resolves it as written
       // and then decides containment, which is exactly the question.
       resolveSafe(toolName, path.join(cwdAbs, spec));
-    } catch {
+    } catch (err) {
+      if (err instanceof ToolPermissionError && err.reason !== undefined) {
+        return refuse(`${toolName} refused the path filter "${echo(spec)}": ${err.reason}.`);
+      }
       return refuse(
         `${toolName} refused the path filter "${echo(spec)}": it resolves outside the workspace root.`,
       );
@@ -169,7 +172,9 @@ export async function collectDiff(
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the directory "${request.cwd ?? "."}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the directory "${request.cwd ?? "."}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;

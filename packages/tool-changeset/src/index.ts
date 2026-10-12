@@ -586,6 +586,7 @@ export const docsSymbolCheck: RegisteredTool = buildTool({
       sourceDir = resolveSafe("DocsSymbolCheck", input.source ?? ".").real;
     } catch (err) {
       if (err instanceof ToolPermissionError) {
+        if (err.reason !== undefined) return err.message;
         return `DocsSymbolCheck refused the source path "${input.source ?? "."}": it resolves outside the workspace root.`;
       }
       throw err;
@@ -652,6 +653,7 @@ export const docsSymbolCheck: RegisteredTool = buildTool({
         target = resolveSafe("DocsSymbolCheck", given).real;
       } catch (err) {
         if (err instanceof ToolPermissionError) {
+          if (err.reason !== undefined) return err.message;
           return `DocsSymbolCheck refused the document path "${given}": it resolves outside the workspace root.`;
         }
         throw err;

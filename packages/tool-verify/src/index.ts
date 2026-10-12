@@ -863,7 +863,11 @@ export const acceptanceCheck: RegisteredTool = buildTool({
           body = readCapped(at.real, check.path).toString("utf-8");
         }
       } catch (err) {
-        if (err instanceof Error && /escapes the workspace/.test(err.message)) {
+        if (
+          err instanceof Error &&
+          (/escapes the workspace/.test(err.message) ||
+            (err instanceof ToolPermissionError && err.reason !== undefined))
+        ) {
           return { index, check: label, ok: false, detail: err.message };
         }
         exists = false;
@@ -1030,7 +1034,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
             href: link.href,
             reason:
               err instanceof ToolPermissionError
-                ? "the target is outside the workspace"
+                ? (err.reason ?? "the target is outside the workspace")
                 : `the target could not be resolved: ${(err as Error).message}`,
           });
           continue;
@@ -1229,7 +1233,7 @@ function loadSource(
     if (err instanceof ToolPermissionError) {
       return {
         label: written,
-        outcome: { kind: "unreadable", reason: "it is outside the workspace" },
+        outcome: { kind: "unreadable", reason: err.reason ?? "it is outside the workspace" },
       };
     }
     return { label: written, outcome: { kind: "unreadable", reason: (err as Error).message } };
@@ -2043,7 +2047,9 @@ function readCorpus(given: string, pageReal: string | undefined): CorpusRead {
       kind: "unusable",
       reason:
         err instanceof ToolPermissionError
-          ? `the corpus path "${given}" is outside the workspace`
+          ? err.reason !== undefined
+            ? err.message
+            : `the corpus path "${given}" is outside the workspace`
           : `the corpus path "${given}" could not be resolved: ${(err as Error).message}`,
     };
   }

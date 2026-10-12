@@ -1777,3 +1777,118 @@ describe("0.7.1 — a Bash line is read as the commands it runs", () => {
     expect(existsSync(join(ws, "build"))).toBe(true);
   }, 60_000);
 });
+
+// ---------------------------------------------------------------------------
+// A path longer than any path can be
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — a path past MAX_PATH_CHARS is never walked: the gate reads
+ * it as outside the workspace (every deny and ask fires, no allow grants it),
+ * and the tool refuses it, naming the path and the limit.
+ *
+ * The walk to a path's deepest existing name used to read the rest of the
+ * path once per missing name, the square of a count the model picks, on the
+ * runtime's thread before any rule was read. MAX_PATH_CHARS is twice the
+ * longest path any platform opens (every resolver copy declares the same
+ * value; tool-registry.test.ts holds them together), so nothing refused here
+ * could have been opened or created.
+ */
+describe("a path longer than any path can be is outside to the gate and refused by the tool", () => {
+  const MAX =
+    2 * (process.platform === "darwin" ? 1_024 : process.platform === "win32" ? 32_767 : 4_096);
+  /** A path below `secrets/prod.db` whose absolute form is exactly `abs` characters. */
+  const deepTo = (abs: number): string => {
+    const prefix = "secrets/prod.db/";
+    const tail = abs - (ws.length + 1 + prefix.length);
+    const pairs = Math.floor((tail - 1) / 2);
+    return `${prefix}${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  };
+  const why = (abs: number) =>
+    `${abs} characters once resolved, over the ${MAX}-character limit: no path that long can be opened or created`;
+  const seedProd = () => {
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.db"), "precious");
+  };
+
+  test("DatabaseBackup: at the limit a scoped allow grants it and the tool resolves it; one past it is outside", async () => {
+    seedProd();
+    const at = deepTo(MAX);
+    const over = `${at}b`;
+    const call = (out: string) => ({ database: "secrets/app.db", out });
+    // At the limit: walked, named whole, and inside secrets/.
+    expect(
+      await gate("DatabaseBackup", call(at), rules(["alwaysAllow", "DatabaseBackup(secrets/**)"])),
+    ).toBe("allow");
+    // The tool resolved it too (and then found no directory to write into).
+    expect(lastResult).toStartWith('DatabaseBackup found no directory "secrets/prod.db/a/a/');
+    // One past it: no allow grants it, and any deny fires.
+    expect(
+      await gate(
+        "DatabaseBackup",
+        call(over),
+        rules(["alwaysAllow", "DatabaseBackup(secrets/**)"]),
+      ),
+    ).toBe("ask");
+    expect(
+      await gate(
+        "DatabaseBackup",
+        call(over),
+        rules(["alwaysDeny", "DatabaseBackup(elsewhere/**)"], ["alwaysAllow", "DatabaseBackup"]),
+      ),
+    ).toBe("deny");
+    // A bare allow still lets it through (as it lets every call): the tool
+    // itself refuses, before any walk, and says why.
+    expect(await gate("DatabaseBackup", call(over), rules(["alwaysAllow", "DatabaseBackup"]))).toBe(
+      "allow",
+    );
+    expect(lastResult).toBe(`tool "DatabaseBackup" rejected path "${over}": it is ${why(MAX + 1)}`);
+    expect(readFileSync(join(ws, "secrets", "prod.db"), "utf8")).toBe("precious");
+  }, 60_000);
+
+  test("every tool that rewords a refusal says this one for what it is", async () => {
+    seedProd();
+    const long = `secrets/${"a/".repeat(MAX / 2)}x`;
+    const abs = ws.length + 1 + long.length;
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["DatabaseBackup", { database: "app.db", out: long }],
+      ["SqlQuery", { database: long, sql: "select 1" }],
+      ["CiWorkflowAudit", { path: long }],
+      ["Typecheck", { cwd: long }],
+      ["Lint", { paths: [long] }],
+      ["SymbolOutline", { file: long }],
+      ["DocsSymbolCheck", { source: long, docsText: "`x`" }],
+      ["DocsSymbolCheck", { docs: [long] }],
+      ["DiffLint", { cwd: long }],
+      ["DiffLint", { paths: [long] }],
+      ["SystemInfo", { diskPath: long }],
+      ["IndexBuild", { name: "i", paths: [long] }],
+      [
+        "RouteControl",
+        { action: "status", dir: long, justification: "permission hardening: a refused path" },
+      ],
+      [
+        "SpecPin",
+        { name: "x", specFile: long, justification: "permission hardening: a refused path" },
+      ],
+      ["MarketplaceSearch", { registryDir: long }],
+      ["HarnessJobStatus", { dir: long }],
+      ["StoreMigrate", { to: long, justification: "permission hardening: a refused path" }],
+      ["AcceptanceCheck", { checks: [{ kind: "fileExists", path: long }] }],
+      ["SeoLint", { html: "<html><head><title>t</title></head></html>", corpus: long }],
+    ];
+    const wrong: Array<{ tool: string; input: string; said: string | undefined }> = [];
+    for (const [tool, input] of cases) {
+      const decision = await gate(tool, input, rules(), "bypass");
+      const said = lastResult ?? "";
+      if (
+        decision !== "allow" ||
+        !said.includes(why(abs)) ||
+        /outside the|escapes the/.test(said)
+      ) {
+        wrong.push({ tool, input: Object.keys(input).join(","), said: said.slice(0, 160) });
+      }
+    }
+    expect(wrong).toEqual([]);
+  }, 120_000);
+});

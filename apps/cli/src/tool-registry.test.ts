@@ -13,8 +13,9 @@ import { describe, expect, test } from "bun:test";
  * Adding a builtin without categorizing it fails (2). Listing a tool that
  * does not exist fails (1). Either way the failure names the key.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, posix, win32 } from "node:path";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import {
   BUILTIN_TOOLS,
@@ -455,6 +456,307 @@ describe("every copy of the path resolver probes with lstat, not existsSync", ()
     }
     expect(checked).toBe(5);
   });
+});
+
+/**
+ * 0.7.1 review — the walk every copy of the resolver makes to a path's
+ * deepest existing name is linear, and a path no filesystem can hold is
+ * refused before it starts.
+ *
+ * Each step of the old walk took one name off and handed the whole rest of
+ * the path to `path.dirname` and `path.basename` (and `tail.unshift` moved
+ * every name already found): about 2·d² characters for d missing names, a
+ * count the model picks, and 4·d² in the permission gate, which walked twice
+ * on the runtime's thread before any rule was read. The copies now share one
+ * `deepestName`, worked by index on the path, and refuse a path past
+ * MAX_PATH_CHARS (twice the longest any platform opens) before walking.
+ *
+ * Copies are found by what they contain, at any depth, and counted, so one
+ * that drifts back or leaves the sweep fails here. Nothing is timed: the
+ * work is counted.
+ */
+describe("every copy of the resolver climbs by index and refuses a path no filesystem holds", () => {
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+  /** Every non-test source that defines the resolver's walk. */
+  function walkCopies(): Array<{ file: string; text: string }> {
+    const found: Array<{ file: string; text: string }> = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name === "dist") continue;
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+          const text = readFileSync(full, "utf-8");
+          if (text.includes("function resolveLocation(")) {
+            found.push({ file: full.slice(repoRoot.length + 1), text });
+          }
+        }
+      }
+    };
+    for (const pkg of readdirSync(join(repoRoot, "packages"))) {
+      const src = join(repoRoot, "packages", pkg, "src");
+      if (existsSync(src)) walk(src);
+    }
+    return found.sort((a, b) => a.file.localeCompare(b.file));
+  }
+
+  /** `function deepestName(…) {…}`, with `path.` dropped (crawler imports the names). */
+  function climbOf(text: string): string | undefined {
+    const from = text.indexOf("function deepestName(");
+    if (from === -1) return undefined;
+    const to = text.indexOf("\n}\n", from);
+    return text.slice(from, to + 2).replace(/\bpath\.(parse|sep)\b/g, "$1");
+  }
+
+  function limitOf(text: string): string | undefined {
+    const from = text.indexOf("export const MAX_PATH_CHARS =");
+    return from === -1 ? undefined : text.slice(from, text.indexOf(";\n", from) + 1);
+  }
+
+  test("the sweep finds every copy, and each carries the same climb and the same limit", () => {
+    const found = walkCopies();
+    // 37 paths.ts, tool-git's git-run.ts, tool-proc's safe-path.ts, crawler,
+    // and the permission gate (runtime-core path-canonical.ts).
+    expect(found.length).toBe(41);
+    const climbs = new Set(found.map((c) => climbOf(c.text)));
+    const limits = new Set(found.map((c) => limitOf(c.text)));
+    expect(climbs.size).toBe(1);
+    expect(limits.size).toBe(1);
+    expect([...climbs][0]).toBeDefined();
+    expect([...limits][0]).toBeDefined();
+    const drifted = found
+      .filter(
+        (c) =>
+          !c.text.includes("const { probe, tail } = deepestName(target);") ||
+          c.text.includes("tail.unshift(") ||
+          !/[aA]bs\.length > MAX_PATH_CHARS\)/.test(c.text),
+      )
+      .map((c) => c.file);
+    expect(drifted).toEqual([]);
+  });
+
+  test("the climb is path.dirname and path.basename, on POSIX and Windows paths alike", () => {
+    const text = climbOf(walkCopies()[0]?.text ?? "") ?? "";
+    const js = new Bun.Transpiler({ loader: "ts" }).transformSync(text);
+    type Impl = typeof posix;
+    type Climb = (t: string) => { probe: string; tail: string };
+    const shipped = (impl: Impl, exists: (p: string) => boolean): Climb =>
+      new Function("parse", "sep", "nameExists", `${js}\nreturn deepestName;`)(
+        impl.parse,
+        impl.sep,
+        exists,
+      ) as Climb;
+    // The walk this replaced, verbatim but for the platform's path module.
+    const oldClimb = (impl: Impl, exists: (p: string) => boolean, target: string) => {
+      let probe = target;
+      const tail: string[] = [];
+      while (!exists(probe)) {
+        tail.unshift(impl.basename(probe));
+        const parent = impl.dirname(probe);
+        if (parent === probe) break;
+        probe = parent;
+      }
+      return { probe, tail };
+    };
+    let state = 20_251_012;
+    // A 32-bit LCG, multiplied in integers (a float product loses the low
+    // bits, and `% n` then picks the same few values every time).
+    const next = (n: number) => {
+      state = (Math.imul(state, 1_103_515_245) + 12_345) & 0x7fffffff;
+      return (state >>> 8) % n;
+    };
+    const cases: Array<{ impl: Impl; roots: string[]; names: string[] }> = [
+      { impl: posix, roots: ["/", "/r/"], names: ["a", "B", "é", ".", "..", "", "a/", "b//"] },
+      {
+        impl: win32,
+        roots: ["C:\\", "c:/", "\\\\srv\\share\\"],
+        names: ["a", "B", ".", "..", "", "a\\", "b/", "c\\\\"],
+      },
+    ];
+    const wrong: string[] = [];
+    let checked = 0;
+    // Enough of each shape, so the comparison does not pass for want of cases.
+    let trailing = 0;
+    let climbed = 0;
+    for (const { impl, roots, names } of cases) {
+      for (let k = 0; k < 20_000; k++) {
+        const parts = Array.from({ length: next(9) }, () => names[next(names.length)] as string);
+        const root = roots[next(roots.length)] as string;
+        // What the callers hand over: path.resolve's output, or path.join's
+        // (which keeps a trailing separator).
+        const target =
+          k % 2 === 0 ? impl.resolve(root, ...parts) : impl.join(root, parts.join(impl.sep));
+        const probes: string[] = [];
+        oldClimb(
+          impl,
+          (q) => {
+            probes.push(q);
+            return false;
+          },
+          target,
+        );
+        // Some prefix exists — the filesystem root at least — and nothing below it.
+        const exists = new Set(probes.slice(Math.min(next(probes.length + 1), probes.length - 1)));
+        const seenBefore: string[] = [];
+        const seenNow: string[] = [];
+        const was = oldClimb(
+          impl,
+          (q) => {
+            seenBefore.push(q);
+            return exists.has(q);
+          },
+          target,
+        );
+        const now = shipped(impl, (q) => {
+          seenNow.push(q);
+          return exists.has(q);
+        })(target);
+        const at = impl === posix ? "/R" : "C:\\R";
+        const joinedBefore = was.tail.length > 0 ? impl.join(at, was.tail.join(impl.sep)) : at;
+        const joinedNow = now.tail.length > 0 ? impl.join(at, now.tail) : at;
+        checked++;
+        if (/[\\/]$/.test(target) && target !== impl.parse(target).root) trailing++;
+        if (seenBefore.length >= 3) climbed++;
+        if (
+          JSON.stringify(seenBefore) !== JSON.stringify(seenNow) ||
+          was.probe !== now.probe ||
+          joinedBefore !== joinedNow
+        ) {
+          if (wrong.length < 5)
+            wrong.push(JSON.stringify({ target, was, now, seenBefore, seenNow }));
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(checked).toBe(40_000);
+    expect(Math.min(trailing, climbed)).toBeGreaterThan(2_000);
+  });
+
+  test("counted: linear at d and 2d names, the whole path up to the limit, refused one past it", () => {
+    const files = walkCopies().map((c) => join(repoRoot, c.file));
+    const dir = mkdtempSync(join(tmpdir(), "walk-count-"));
+    const script = join(dir, "count.ts");
+    // In a process of its own, so node:path is wrapped before any copy (or
+    // anything else) imports it: Bun's namespace takes the module's functions
+    // as they are at the first import.
+    writeFileSync(
+      script,
+      `const req = require("node:path");
+let chars = 0;
+for (const k of Object.keys(req)) {
+  const f = req[k];
+  if (typeof f !== "function") continue;
+  req[k] = (...a) => { for (const x of a) if (typeof x === "string") chars += x.length; return f(...a); };
+}
+const fs = require("node:fs");
+const files = ${JSON.stringify(files)};
+const root = fs.realpathSync(fs.mkdtempSync(require("node:os").tmpdir() + "/count-"));
+fs.writeFileSync(root + "/f.db", "x");
+const tracker = { runId: "run_0123456789abcdef", hasFetched: () => false, getFetchedContent: () => undefined, getFetchRecord: () => undefined, recordFetch: () => ({}), recordCitation: () => ({}), listCitationsOrdered: () => [], listFetches: () => [] };
+const rows = [];
+let MAX = 0;
+for (const file of files) {
+  const mod = await import(file);
+  MAX = mod.MAX_PATH_CHARS;
+  // "whole": resolved to root/raw; "refused": text of the refusal; else what came back.
+  let run;
+  if (typeof mod.canonicalWorkspacePath === "function") {
+    run = async (raw) => {
+      const v = mod.canonicalWorkspacePath(raw, root, { pwd: undefined, topLevelLinks: [] });
+      if (v.length === 1 && v[0].outsideWorkspace === true) return { refused: "outside" };
+      return v.length === 1 && v[0].canonical[2] === root + "/" + raw ? { whole: true } : { got: JSON.stringify(v).slice(0, 200) };
+    };
+  } else if (typeof mod.resolveInsideRoot === "function") {
+    run = async (raw) => {
+      const r = mod.resolveInsideRoot("Count", raw, root);
+      return r.ok ? (r.value === root + "/" + raw ? { whole: true } : { got: r.value.slice(-40) }) : { refused: r.message };
+    };
+  } else if (typeof mod.createCrawler === "function") {
+    const crawler = mod.createCrawler({ tracker, config: { allowedFileRoots: [root] } });
+    run = async (raw) => {
+      try { await crawler.fetch("file://" + root + "/" + raw); return { got: "read" }; }
+      catch (e) { return /character limit/.test(e.message) ? { refused: e.message } : { whole: true, read: e.message.slice(0, 30) }; }
+    };
+  } else if (typeof mod.resolveSafe === "function") {
+    run = async (raw) => {
+      try {
+        const r = mod.resolveSafe("Count", raw, root);
+        if (r.ok === false) return { refused: r.message };
+        const at = r.real ?? r.path;
+        return at === root + "/" + raw ? { whole: true } : { got: at.slice(-40) };
+      } catch (e) { return { refused: e.message }; }
+    };
+  } else { rows.push({ file, cannotDrive: true }); continue; }
+  const deepTo = (abs) => {
+    const tail = abs - (root.length + 1 + "f.db/".length);
+    const pairs = Math.floor((tail - 1) / 2);
+    return "f.db/" + "a/".repeat(pairs) + "b".repeat(tail - 2 * pairs);
+  };
+  const d = Math.floor((MAX - root.length - 16) / 4);
+  const ask = [["d", "f.db/" + Array.from({ length: d }, () => "a").join("/")], ["2d", "f.db/" + Array.from({ length: 2 * d }, () => "a").join("/")], ["limit", deepTo(MAX)], ["past", deepTo(MAX + 1)]];
+  for (const [at, raw] of ask) {
+    chars = 0;
+    const out = await run(raw);
+    rows.push({ file: file.slice(file.indexOf("packages/")), at, abs: root.length + 1 + raw.length, chars, ...out });
+  }
+}
+fs.rmSync(root, { recursive: true, force: true });
+console.log(JSON.stringify({ MAX, rows }));
+`,
+    );
+    let report: {
+      MAX: number;
+      rows: Array<{
+        file: string;
+        at: string;
+        abs: number;
+        chars: number;
+        whole?: boolean;
+        refused?: string;
+        cannotDrive?: boolean;
+      }>;
+    };
+    try {
+      const run = Bun.spawnSync([process.execPath, script], { stderr: "pipe" });
+      expect(run.stderr.toString()).toBe("");
+      report = JSON.parse(run.stdout.toString());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const { MAX, rows } = report;
+    expect(rows.filter((r) => r.cannotDrive).map((r) => r.file)).toEqual([]);
+    expect(rows.length).toBe(41 * 4);
+    const by = (at: string) => rows.filter((r) => r.at === at);
+    // Up to the limit every copy resolves the whole path.
+    for (const at of ["d", "2d", "limit"]) {
+      expect({ at, notWhole: by(at).filter((r) => r.whole !== true) }).toEqual({
+        at,
+        notWhole: [],
+      });
+    }
+    // One character past it, every copy refuses, naming the length and the limit.
+    const why = `${MAX + 1} characters once resolved, over the ${MAX}-character limit`;
+    expect(
+      by("past")
+        .filter((r) => !(r.refused === "outside" || r.refused?.includes(why)))
+        .map((r) => ({ file: r.file, refused: r.refused })),
+    ).toEqual([]);
+    // Linear: a bounded number of characters handed to node:path per character
+    // of path at every size (the old walk read ~900 per character at d = 400,
+    // and four times as much at 2d), and doubling d no more than doubles it.
+    const overBound = rows
+      .filter((r) => r.chars > 40 * r.abs)
+      .map((r) => ({ file: r.file, at: r.at, perChar: Math.round(r.chars / r.abs) }));
+    expect(overBound).toEqual([]);
+    const notLinear = by("d")
+      .map((r) => ({
+        file: r.file,
+        ratio: (by("2d").find((x) => x.file === r.file)?.chars ?? 0) / r.chars,
+      }))
+      .filter((r) => !(r.ratio < 2.5));
+    expect(notLinear).toEqual([]);
+  }, 120_000);
 });
 
 describe("the CLI can actually load every tool package it names", () => {

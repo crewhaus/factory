@@ -73,7 +73,9 @@ export function resolveDir(toolName: string, rel: string | undefined): Resolved<
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${requested}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${requested}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;
@@ -96,7 +98,9 @@ export function resolveFile(toolName: string, rel: string): Resolved<string> {
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;
@@ -119,7 +123,9 @@ export function resolveDirOrFile(toolName: string, rel: string): Resolved<string
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;

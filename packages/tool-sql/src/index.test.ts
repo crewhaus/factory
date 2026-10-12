@@ -45,7 +45,7 @@ import {
   tableStats,
 } from "./index";
 import { namedParameters, positionalParameterCount } from "./lib/sql-text";
-import { resolveSafe } from "./paths";
+import { MAX_PATH_CHARS, ToolPermissionError, resolveSafe } from "./paths";
 
 let workspace = "";
 let originalCwd = "";
@@ -1340,34 +1340,63 @@ describe("containment: a relative dangling link under an outward directory link"
 // ---------------------------------------------------------------------------
 
 /**
- * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
- * its arguments, and `resolveLocation` joined the names below the deepest
- * existing ancestor one argument apiece. With 65,536 names below an existing
- * file the location came back as that file: `DatabaseBackup` with
- * `overwrite: true` replaced it, though the call named a path far below it
- * (and the permission gate, whose walk is one name shorter, saw yet another
- * path). The location must be the whole path at every count.
+ * 0.7.1 review — a destination no filesystem can hold is refused before it
+ * is walked, naming the path and the limit.
  *
- * Each size is one walk over 131 KB of path, so each test declares a budget
- * (house rule); nothing here is timed.
+ * The walk to the deepest existing name read the rest of the path once per
+ * missing name (the square of a count the model picks), and Bun's
+ * `path.join` keeps only (argument count mod 65,536) arguments, so 65,536
+ * names below an existing file once made DatabaseBackup replace that file.
+ * MAX_PATH_CHARS is twice the longest path any platform opens: up to it the
+ * location is the whole path; past it the call is refused, with the file
+ * above left alone.
  */
-describe("a destination 65,535 to 65,537 names below an existing file", () => {
+describe("a destination longer than any path can be", () => {
+  /** A path below `secrets/prod.db` whose absolute form is exactly `abs` characters. */
+  const deepTo = (abs: number): string => {
+    const prefix = "secrets/prod.db/";
+    const tail = abs - (workspace.length + 1 + prefix.length);
+    const pairs = Math.floor((tail - 1) / 2);
+    return `${prefix}${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  };
   const deep = (n: number) => `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
-  // A failure prints this, not two 131 KB strings.
-  const brief = (s: string) => ({ length: s.length, head: s.slice(0, 20), end: s.slice(-12) });
 
-  for (const n of [65_535, 65_536, 65_537]) {
-    test(`${n} names: the tool acts on the whole path`, () => {
-      mkdirSync(join(workspace, "secrets"));
-      writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+  test("at the limit the location is the whole path; one more character is refused, naming the limit", () => {
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    const at = deepTo(MAX_PATH_CHARS);
+    expect(resolveSafe("DatabaseBackup", at).real === join(workspace, at)).toBe(true);
+    let refused: unknown;
+    try {
+      resolveSafe("DatabaseBackup", `${at}b`);
+    } catch (err) {
+      refused = err;
+    }
+    expect(refused).toBeInstanceOf(ToolPermissionError);
+    expect((refused as Error).message).toBe(
+      `tool "DatabaseBackup" rejected path "${at}b": it is ${MAX_PATH_CHARS + 1} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
+  });
+
+  test("65,535 to 65,537 names (where Bun's path.join wraps) are refused, quoting the start of the path", () => {
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    for (const n of [65_535, 65_536, 65_537]) {
       const raw = deep(n);
-      const at = resolveSafe("DatabaseBackup", raw);
-      expect(brief(at.real)).toEqual(brief(join(workspace, raw)));
-      expect(at.real === join(workspace, raw)).toBe(true);
-    }, 120_000);
-  }
+      let message = "";
+      try {
+        resolveSafe("DatabaseBackup", raw);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect({ n, message }).toEqual({
+        n,
+        message: `tool "DatabaseBackup" rejected path "${raw.slice(0, 64)}…": it is ${workspace.length + 1 + raw.length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+      });
+    }
+  });
 
-  test("DatabaseBackup with overwrite leaves the file above it alone", async () => {
+  test("DatabaseBackup with overwrite says why, and leaves the file above it alone", async () => {
     seedDatabase();
     mkdirSync(join(workspace, "secrets"));
     writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
@@ -1377,9 +1406,10 @@ describe("a destination 65,535 to 65,537 names below an existing file", () => {
       overwrite: true,
     });
     expect(typeof out).toBe("string");
-    expect(
-      (out as string).startsWith('DatabaseBackup found no directory "secrets/prod.db/a/a/'),
-    ).toBe(true);
+    expect(out as string).toStartWith('tool "DatabaseBackup" rejected path "secrets/prod.db/a/a/');
+    expect(out as string).toEndWith(
+      `over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
     expect(readFileSync(join(workspace, "secrets", "prod.db"), "utf8")).toBe("precious");
-  }, 120_000);
+  });
 });

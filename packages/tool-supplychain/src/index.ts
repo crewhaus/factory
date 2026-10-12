@@ -88,7 +88,10 @@ function resolveInside(toolName: string, rel: string): Resolved<string> {
     if (err instanceof ToolPermissionError) {
       return {
         ok: false,
-        message: `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        message:
+          err.reason !== undefined
+            ? err.message
+            : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       };
     }
     throw err;

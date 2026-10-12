@@ -27,7 +27,7 @@
  */
 import { lookup as nodeDnsLookup } from "node:dns/promises";
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, join as joinPath, resolve as resolvePath, sep } from "node:path";
+import { dirname, join as joinPath, parse, resolve as resolvePath, sep } from "node:path";
 import type { CitationTracker } from "@crewhaus/citation-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -390,6 +390,29 @@ async function readBodyCapped(
 }
 
 /**
+ * The longest path this resolves, in UTF-16 code units; a longer one is
+ * refused before it is walked. Nothing that long can be opened or created:
+ * PATH_MAX is 1,024 bytes on macOS and 4,096 on Linux, Windows stops at
+ * 32,767 UTF-16 units, and a path's UTF-8 form is never shorter than its
+ * UTF-16 one. The limit is twice that because the part of a path that exists
+ * is itself under PATH_MAX, so the part that does not is over PATH_MAX on its
+ * own: no spelling of the place reaches it, not even one through a symlink
+ * that shortens the part that exists.
+ */
+export const MAX_PATH_CHARS =
+  2 * (process.platform === "darwin" ? 1_024 : process.platform === "win32" ? 32_767 : 4_096);
+
+/** A path as a refusal quotes it: whole, unless it is past {@link MAX_PATH_CHARS}. */
+function shownPath(given: string): string {
+  return given.length > MAX_PATH_CHARS ? `${given.slice(0, 64)}…` : given;
+}
+
+/** Why a path past {@link MAX_PATH_CHARS} is refused: its length and the limit. */
+function tooLong(abs: string): string {
+  return `it is ${abs.length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`;
+}
+
+/**
  * True when the NAME exists, whether or not it leads anywhere.
  *
  * `existsSync` follows symlinks, so it answers false for a link whose target
@@ -420,14 +443,7 @@ function nameExists(p: string): boolean {
  */
 function resolveLocation(target: string, depth = 0): string {
   if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(basename(probe));
-    const parent = dirname(probe);
-    if (parent === probe) break; // reached filesystem root
-    probe = parent;
-  }
+  const { probe, tail } = deepestName(target);
   let probeReal: string;
   try {
     probeReal = realpathSync(probe);
@@ -445,7 +461,36 @@ function resolveLocation(target: string, depth = 0): string {
   }
   // One string, not one argument per name: Bun's `path.join` keeps only
   // (argument count mod 65,536) of its arguments.
-  return tail.length > 0 ? joinPath(probeReal, tail.join(sep)) : probeReal;
+  return tail.length > 0 ? joinPath(probeReal, tail) : probeReal;
+}
+
+/**
+ * `target`, an absolute path, split where its deepest prefix that exists as
+ * a NAME ends: that prefix, and the names below it, which do not exist, as
+ * one string ("" when `target` itself exists). This is `path.dirname` and
+ * `path.basename` worked by index on `target` itself: handing them each
+ * shorter prefix in turn copied the rest of the path once per missing name,
+ * the square of a count the caller picks.
+ */
+function deepestName(target: string): { readonly probe: string; readonly tail: string } {
+  const top = parse(target).root.length;
+  const isSep = (i: number): boolean => target[i] === "/" || target[i] === sep;
+  let probe = target;
+  let start = target.length;
+  let stop = -1;
+  while (!nameExists(probe)) {
+    // `path.basename(probe)` is `target.slice(start, end)`, and
+    // `path.dirname(probe)` is `target.slice(0, up)`.
+    let end = probe.length;
+    while (end > top && isSep(end - 1)) end--;
+    if (stop < 0) stop = end;
+    start = end;
+    while (start > top && !isSep(start - 1)) start--;
+    const up = start > top ? start - 1 : top;
+    if (up === probe.length) break; // reached the filesystem root
+    probe = target.slice(0, up);
+  }
+  return { probe, tail: stop < 0 ? "" : target.slice(start, stop) };
 }
 
 export function createCrawler(opts: {
@@ -576,6 +621,10 @@ export function createCrawler(opts: {
       throw new CrawlerError(
         `file path "${abs}" is outside the configured crawler roots (got ${allowedFileRoots.length} roots)`,
       );
+    }
+    // Longer than any path can be: refused before the walk below reads it.
+    if (abs.length > MAX_PATH_CHARS) {
+      throw new CrawlerError(`file path "${shownPath(abs)}" is refused: ${tooLong(abs)}`);
     }
     // 2) Symlink-aware containment (CWE-59). The lexical check is fooled by an
     //    in-root symlink whose real target lies outside a root, so re-check the

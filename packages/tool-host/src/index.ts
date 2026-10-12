@@ -538,6 +538,7 @@ function collectDisk(path: string, unknown: Unknowns): Record<string, unknown> |
     resolved = resolveSafe("SystemInfo", path).real;
   } catch (err) {
     if (err instanceof ToolPermissionError) {
+      if (err.reason !== undefined) return `[SystemInfo error] ${err.message}.`;
       return `[SystemInfo error] refused path "${path}": it resolves outside the workspace root.`;
     }
     throw err;

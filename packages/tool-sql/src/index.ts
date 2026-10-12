@@ -198,7 +198,9 @@ function safePath(toolName: string, given: string): SafePath | Refusal {
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${describePath(given)}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${describePath(given)}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     return refuse(`${toolName} could not resolve "${describePath(given)}": ${errorText(err)}`);

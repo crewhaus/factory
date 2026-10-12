@@ -78,7 +78,7 @@ import {
 import { type Resolution, _setEnv, reasonOf, resolveChain, resolveOne } from "./lib/resolve";
 import { _setRunner, runCommand } from "./lib/run";
 import { writeFileAtomic } from "./lib/write";
-import { resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** The seams. Every test in this package drives these instead of the host. */
 export { _setRunner, _setEnv, _setClock };
@@ -432,7 +432,8 @@ function readDocForEdit(toolName: string, path: string): Resolved<OpenedDoc> {
   let real: string;
   try {
     real = resolveSafe(toolName, path).real;
-  } catch {
+  } catch (err) {
+    if (err instanceof ToolPermissionError && err.reason !== undefined) return refuse(err.message);
     return refuse(
       `refused "${path}": it resolves outside the workspace root. A .env is written inside the workspace only.`,
     );
@@ -628,7 +629,10 @@ async function writeValue(
     let real: string;
     try {
       real = resolveSafe(options.toolName, ref.path).real;
-    } catch {
+    } catch (err) {
+      if (err instanceof ToolPermissionError && err.reason !== undefined) {
+        return { ok: false, message: err.message };
+      }
       return { ok: false, message: `"${ref.path}" resolves outside the workspace root.` };
     }
     if (options.dry) return { ok: true, detail: `would write ${ref.path} (0600)` };
