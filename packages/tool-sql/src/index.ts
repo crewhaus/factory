@@ -98,12 +98,14 @@ import {
 import { csvCell, formatCsvRow, parseCsv } from "./lib/csv";
 import {
   type InferredType,
+  JsonColumns,
   affinityOf,
   checkTypeFor,
   coerceCsvCell,
   coerceJsonValue,
-  inferTypeFromJson,
-  inferTypeFromStrings,
+  inferCsvColumnTypes,
+  inferJsonColumnTypes,
+  jsonRecordRejection,
   unionKeys,
 } from "./lib/infer";
 import {
@@ -918,10 +920,16 @@ function prepareTarget(
       return refuse(`${toolName} refused the column name "${clip(column, 60)}".`);
     }
   }
-  const lowered = columns.map((c) => c.toLowerCase());
-  const duplicate = lowered.find((name, index) => lowered.indexOf(name) !== index);
-  if (duplicate !== undefined) {
-    return refuse(`${toolName} refused a duplicate column name "${duplicate}".`);
+  // A set, not a search of the list for each name: the names are a CSV
+  // header or a file's keys, and checking each against all the others was
+  // quadratic in how many there are.
+  const lowered = new Set<string>();
+  for (const column of columns) {
+    const name = column.toLowerCase();
+    if (lowered.has(name)) {
+      return refuse(`${toolName} refused a duplicate column name "${name}".`);
+    }
+    lowered.add(name);
   }
   const existing = findObjectName(db, table, ["table"]);
   if (existing === undefined) {
@@ -1130,12 +1138,7 @@ export const importCsv: RegisteredTool = buildTool({
     }
     if (columns.length === 0) return `ImportCsv found no columns in "${at.rel}".`;
 
-    const inferred = columns.map((_, index) =>
-      inferTypeFromStrings(
-        records.map((record) => record.values[index] ?? ""),
-        emptyIsNull,
-      ),
-    );
+    const inferred = inferCsvColumnTypes(columns.length, records, emptyIsNull);
     const deadline = startDeadline(input.timeout);
     return useDatabase(
       "ImportCsv",
@@ -1270,9 +1273,7 @@ export const importJson: RegisteredTool = buildTool({
     if (records.length === 0) return `ImportJson found no records in ${source}.`;
     const columns = input.columns === undefined ? unionKeys(records) : [...input.columns];
     if (columns.length === 0) return `ImportJson found no fields in the records from ${source}.`;
-    const inferred = columns.map((column) =>
-      inferTypeFromJson(records.map((record) => record[column])),
-    );
+    const inferred = inferJsonColumnTypes(columns, records);
     const deadline = startDeadline(input.timeout);
     return useDatabase(
       "ImportJson",
@@ -1295,6 +1296,32 @@ export const importJson: RegisteredTool = buildTool({
         if (isRefusal(target)) return target.message;
         const accepted: Array<{ row: number; values: Array<string | number | null> }> = [];
         const rejections: Rejection[] = [];
+        if (input.dryRun === true) {
+          // A dry run binds nothing, so it asks each record only for the
+          // fields it holds. Every column of every record is C × R, and a
+          // table that will not be created is not held to SQLite's column
+          // limit: records that each bring one new key made that quadratic
+          // in the file. A real insert below binds every column of every
+          // row, which is the table's own width, created or matched above.
+          const reader = new JsonColumns(columns);
+          let wouldInsert = 0;
+          for (const [index, record] of records.entries()) {
+            const bad = jsonRecordRejection(reader, record, target.types);
+            if (bad !== undefined) rejections.push({ row: index + 1, reason: bad });
+            else wouldInsert += 1;
+          }
+          rejections.sort((a, b) => a.row - b.row);
+          return json({
+            dryRun: true,
+            table: target.name,
+            wouldCreateTable: target.created,
+            columns: target.columns,
+            inferredTypes: target.created ? inferred : target.types,
+            wouldInsert,
+            rejected: rejections.length,
+            rejections: rejections.slice(0, MAX_REPORTED_REJECTIONS),
+          });
+        }
         for (const [index, record] of records.entries()) {
           const values: Array<string | number | null> = [];
           let bad: string | undefined;
@@ -1312,19 +1339,6 @@ export const importJson: RegisteredTool = buildTool({
           // identifier an inline array has.
           if (bad !== undefined) rejections.push({ row: index + 1, reason: bad });
           else accepted.push({ row: index + 1, values });
-        }
-        if (input.dryRun === true) {
-          rejections.sort((a, b) => a.row - b.row);
-          return json({
-            dryRun: true,
-            table: target.name,
-            wouldCreateTable: target.created,
-            columns: target.columns,
-            inferredTypes: target.created ? inferred : target.types,
-            wouldInsert: accepted.length,
-            rejected: rejections.length,
-            rejections: rejections.slice(0, MAX_REPORTED_REJECTIONS),
-          });
         }
         const outcome = insertRows(db, target, accepted, rejections, input.onRowError === "abort");
         if (isRefusal(outcome)) return `ImportJson: ${outcome.message}`;

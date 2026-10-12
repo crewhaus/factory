@@ -313,11 +313,15 @@ export function bindParams(
     );
   }
   const record = params as Readonly<Record<string, ParamValue>>;
+  // Sets, not a search of the names for each key: a statement can declare
+  // thousands of names and the params name as many, both as the model wrote
+  // them, and that search was the product of the two.
+  const declared = new Set(named);
   const bySuffix = new Map<string, string>();
   for (const name of named) bySuffix.set(name.slice(1), name);
   const bound: Record<string, ParamValue> = {};
   for (const [key, value] of Object.entries(record)) {
-    const target = named.includes(key) ? key : bySuffix.get(key);
+    const target = declared.has(key) ? key : bySuffix.get(key);
     if (target === undefined) {
       return refuse(
         `${toolName} was given a param "${key}" that this statement never uses. Its parameters are: ${named.length === 0 ? "(none)" : named.join(", ")}.`,
