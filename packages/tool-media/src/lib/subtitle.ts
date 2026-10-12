@@ -45,18 +45,27 @@ export type ParseResult = {
   readonly skipped: ReadonlyArray<{ block: number; reason: string }>;
 };
 
+/** The line breaks a regular expression's `.` does not take. */
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
+
 /**
- * A timing line: the text before its first `-->`, the arrow, then the rest.
- * `.` stops at a line break, so a line that holds one is not a timing line;
- * `\r\n` folding leaves U+2028 and U+2029 inside a line.
+ * A timing line's two sides: the text before its first `-->`, and the text
+ * after it. Null when the line has no `-->`, or holds a line break: `\r\n`
+ * folding leaves U+2028 and U+2029 inside a line.
  *
- * This was `/^(.*?)-->(.*?)$/`, which splits the same way. Its lazy start
- * tried every `-->` on the line and ran from each to the break that `$`
- * cannot pass: quadratic in a line of arrows. The start now takes only
- * characters before the first `-->`, so a failed try gives each back in a
- * step.
+ * This is what `/^(.*?)-->(.*?)$/` captured, read with one search for the
+ * arrow and one for a break. That pattern's lazy start tried every `-->` on
+ * the line and ran from each to the break that `$` cannot pass: quadratic in
+ * a line of arrows. No pattern here repeats a group either, because
+ * JavaScriptCore silently stops matching one that repeats a group a million
+ * times or so, and a line can be as long as the file.
  */
-export const TIMING = /^((?:(?!-->).)*)-->(.*)$/;
+export function timingParts(line: string): readonly [start: string, rest: string] | null {
+  const arrow = line.indexOf("-->");
+  if (arrow === -1 || LINE_BREAK.test(line)) return null;
+  return [line.slice(0, arrow), line.slice(arrow + 3)];
+}
+
 const TIMESTAMP = /^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})$/;
 
 /** `HH:MM:SS,mmm`, `MM:SS.mmm` and the other legal spellings, to millis. */
@@ -115,17 +124,18 @@ export function parseSubtitles(input: string, format?: SubtitleFormat): ParseRes
     }
     let at = 0;
     let id: string | undefined;
-    if (!TIMING.test(first)) {
+    let timing = timingParts(first);
+    if (timing === null) {
       id = first.trim();
       at = 1;
+      const next = lines[1];
+      timing = next === undefined ? null : timingParts(next);
     }
-    const timingLine = lines[at];
-    if (timingLine === undefined || !TIMING.test(timingLine)) {
+    if (timing === null) {
       skipped.push({ block: b, reason: "no timing line" });
       continue;
     }
-    const match = TIMING.exec(timingLine) as RegExpExecArray;
-    const rightSide = (match[2] as string).trim();
+    const rightSide = timing[1].trim();
     // Cue settings follow the end timestamp, separated by whitespace.
     const spaceAt = rightSide.search(/\s/);
     const endText = spaceAt === -1 ? rightSide : rightSide.slice(0, spaceAt);
@@ -133,7 +143,7 @@ export function parseSubtitles(input: string, format?: SubtitleFormat): ParseRes
     let startMs: number;
     let endMs: number;
     try {
-      startMs = parseTimestamp(match[1] as string);
+      startMs = parseTimestamp(timing[0]);
       endMs = parseTimestamp(endText);
     } catch (err) {
       skipped.push({ block: b, reason: (err as Error).message });
