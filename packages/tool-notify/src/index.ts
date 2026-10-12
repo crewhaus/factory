@@ -552,6 +552,19 @@ type ChatRoute =
   | { readonly ok: false; readonly message: string };
 
 /**
+ * `text` without its trailing slashes: what `text.replace(/\/+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of slashes that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and an API base URL is
+ * the model's.
+ */
+function withoutTrailingSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x2f) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
+/**
  * Work out which of the two ways to reach a platform this call is using, and
  * build the request that goes with it.
  *
@@ -605,7 +618,7 @@ function routeChat(
   if (typeof base === "string") return { ok: false, message: base };
   const token = resolveSecret(target.tokenEnv, "the bot token", allowed);
   if (!token.ok) return { ok: false, message: token.message };
-  const literal = `${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`;
+  const literal = `${withoutTrailingSlashes(base.pathname)}/${apiPath.replace(/^\/+/, "")}`;
   const url = new URL(literal, base);
   // The path requested must be the path built: a segment the parser would
   // resolve (a `..` channel, message id or emoji) addresses another endpoint.
