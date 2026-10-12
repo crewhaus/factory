@@ -24,9 +24,48 @@ export function looksInteger(raw: string): boolean {
   return n >= -(2n ** 63n) && n <= 2n ** 63n - 1n;
 }
 
+/**
+ * Whether `raw` is written as a decimal number: an optional sign, digits with
+ * an optional point and fraction (or a point and a fraction), and an optional
+ * exponent. What `/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(raw)`
+ * answered, in one pass. That pattern gave every digit of a run back to its
+ * fraction in turn when the text did not end where it should, so a long run
+ * of digits before a stray character was quadratic in its length, and a cell
+ * is whatever the file holds.
+ */
+export function isDecimalNumberText(raw: string): boolean {
+  const digitsFrom = (start: number): number => {
+    let i = start;
+    for (; i < raw.length; i++) {
+      const c = raw.charCodeAt(i);
+      if (c < 0x30 || c > 0x39) break;
+    }
+    return i;
+  };
+  let i = raw.charCodeAt(0) === 0x2b || raw.charCodeAt(0) === 0x2d ? 1 : 0;
+  const whole = digitsFrom(i);
+  if (whole > i) {
+    i = whole;
+    if (raw.charCodeAt(i) === 0x2e) i = digitsFrom(i + 1);
+  } else {
+    if (raw.charCodeAt(i) !== 0x2e) return false;
+    const fraction = digitsFrom(i + 1);
+    if (fraction === i + 1) return false;
+    i = fraction;
+  }
+  if (raw.charCodeAt(i) === 0x65 || raw.charCodeAt(i) === 0x45) {
+    let at = i + 1;
+    if (raw.charCodeAt(at) === 0x2b || raw.charCodeAt(at) === 0x2d) at++;
+    const exponent = digitsFrom(at);
+    if (exponent === at) return false;
+    i = exponent;
+  }
+  return i === raw.length;
+}
+
 /** True for a value SQLite will store as REAL. Excludes Inf and NaN. */
 export function looksReal(raw: string): boolean {
-  if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return false;
+  if (!isDecimalNumberText(raw)) return false;
   return Number.isFinite(Number(raw));
 }
 
