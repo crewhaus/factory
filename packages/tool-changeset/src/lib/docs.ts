@@ -24,6 +24,7 @@
  *     wrong document, not as thirty findings (see `checkRefs`).
  */
 
+import { namedImports } from "./import-scan";
 import { beforeAs, fenceOpening } from "./scan-text";
 
 /** How a reference was written, which is how much it is trusted. */
@@ -207,11 +208,7 @@ function importedNames(line: string, localPrefixes: ReadonlyArray<string>): stri
     spec.startsWith("/") ||
     localPrefixes.some((prefix) => spec === prefix || spec.startsWith(prefix));
 
-  for (const m of line.matchAll(
-    /import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*(['"])([^'"]+)\2|(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*(['"])([^'"]+)\5\s*\)/g,
-  )) {
-    const body = m[1] ?? m[4] ?? "";
-    const spec = m[3] ?? m[6] ?? "";
+  for (const { body, spec } of namedImports(line)) {
     if (!isLocal(spec)) continue;
     for (const piece of body.split(",")) {
       const cleaned = piece.replace(/\btype\s+/g, "").trim();
