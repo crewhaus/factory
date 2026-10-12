@@ -139,11 +139,17 @@ function chunkMarkdown(doc: Document, opts: ChunkOptions): Chunk[] {
   const headerRe = /(^|\n)(#{1,6}\s)/g;
   const sectionRanges: Array<{ start: number; end: number }> = [];
   const matches: number[] = [0];
+  // The starts already in `matches`: searching the list for each header was
+  // quadratic in the headers of a document anyone can supply.
+  const listed = new Set<number>(matches);
   let m: RegExpExecArray | null;
   // biome-ignore lint/suspicious/noAssignInExpressions: classical regex iter
   while ((m = headerRe.exec(doc.text)) !== null) {
     const headerStart = m[1] === "\n" ? m.index + 1 : m.index;
-    if (headerStart !== 0 && !matches.includes(headerStart)) matches.push(headerStart);
+    if (headerStart !== 0 && !listed.has(headerStart)) {
+      listed.add(headerStart);
+      matches.push(headerStart);
+    }
   }
   matches.push(doc.text.length);
   for (let i = 0; i < matches.length - 1; i += 1) {
