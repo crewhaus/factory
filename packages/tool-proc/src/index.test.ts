@@ -23,7 +23,7 @@ import {
 import { type AddressInfo, Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import {
   PROC_TOOLS,
@@ -73,8 +73,8 @@ afterEach(async () => {
 
 /** Tools return compact JSON on success and a plain string on a refusal. */
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
-async function call(tool: RegisteredTool, input: unknown): Promise<any> {
-  const out = await tool.execute(input);
+async function call(tool: RegisteredTool, input: unknown, ctx?: ToolExecuteContext): Promise<any> {
+  const out = await tool.execute(input, ctx);
   if (typeof out !== "string") throw new Error("expected a string result");
   try {
     return JSON.parse(out);
@@ -310,14 +310,16 @@ type HeldWait<T> = {
  * deadline. With `deadlinePassesAfter`, the clock moves a minute on, past
  * the deadline, once the wait has slept that many times between polls
  * (sleeps of exactly `interval` ms), so how many polls fit before the
- * deadline is a count. Should the call not end, after 10 s the clock moves
- * anyway and every held timer fires, so a broken wait fails on the
- * assertions after it instead of hanging with the clocks held. It counts the
- * matches asked of the worker and the timers it held, so a test can show
- * that every match's deadline was held. With `beforeMatch`, a match is sent
- * to the worker only once the promise it returns for that match (counted
- * from 1) settles: the wait has taken that look, and has no answer yet.
- * Every spy is restored before this returns.
+ * deadline is a count. Should the call not end, after 10 s a valve puts
+ * every clock back at once, fires the held timers and aborts the signal
+ * `body` hands the call, which the wait honours while matching and between
+ * polls. So a broken wait ends "aborted" and fails on the assertions after
+ * it, even one that ignores its deadline, and the next test starts on the
+ * real clocks. It counts the matches asked of the worker and the timers it
+ * held, so a test can show that every match's deadline was held. With
+ * `beforeMatch`, a match is sent to the worker only once the promise it
+ * returns for that match (counted from 1) settles: the wait has taken that
+ * look, and has no answer yet. Every spy is restored before this returns.
  */
 async function withWaitClocksHeld<T>(
   options: {
@@ -325,7 +327,7 @@ async function withWaitClocksHeld<T>(
     readonly deadlinePassesAfter?: { readonly sleeps: number; readonly interval: number };
     readonly beforeMatch?: (run: number) => Promise<void> | undefined;
   },
-  body: () => Promise<T>,
+  body: (signal: AbortSignal) => Promise<T>,
 ): Promise<HeldWait<T>> {
   const counted = { runs: 0, held: 0, sleeps: 0, valveFired: false };
   const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
@@ -364,13 +366,6 @@ async function withWaitClocksHeld<T>(
       });
     }
   }
-  const valve = realSetTimeout(() => {
-    counted.valveFired = true;
-    released = true;
-    passed = true;
-    for (const fire of heldTimers.values()) queueMicrotask(fire);
-    heldTimers.clear();
-  }, 10_000);
   const frozen = Date.now();
   const still = performance.now();
   const clock = spyOn(Date, "now").mockImplementation(() => (passed ? frozen + 60_000 : frozen));
@@ -403,17 +398,33 @@ async function withWaitClocksHeld<T>(
   }) as typeof clearTimeout);
   (globalThis as { Worker: unknown }).Worker = CountingWorker;
   defaults.giveUpMs = 60_000;
-  try {
-    const result = await body();
-    return { result, ...counted };
-  } finally {
+  let restored = false;
+  const restore = (): void => {
+    if (restored) return;
+    restored = true;
     defaults.giveUpMs = giveUpMs;
     (globalThis as { Worker: unknown }).Worker = RealWorker;
     cleared.mockRestore();
     armed.mockRestore();
     thread.mockRestore();
     clock.mockRestore();
+  };
+  const stop = new AbortController();
+  const valve = realSetTimeout(() => {
+    counted.valveFired = true;
+    released = true;
+    passed = true;
+    restore();
+    for (const fire of heldTimers.values()) queueMicrotask(fire);
+    heldTimers.clear();
+    stop.abort();
+  }, 10_000);
+  try {
+    const result = await body(stop.signal);
+    return { result, ...counted };
+  } finally {
     realClearTimeout(valve);
+    restore();
   }
 }
 
@@ -427,7 +438,7 @@ async function withWaitClocksHeld<T>(
 async function waitDefinitely(input: Record<string, unknown>): Promise<any> {
   const { result, runs, held, valveFired } = await withWaitClocksHeld(
     { matchDeadlines: [MATCH_DEADLINE_MS] },
-    () => call(waitForOutput, input),
+    (signal) => call(waitForOutput, input, { signal }),
   );
   expect({ valveFired, ran: runs > 0, held }).toEqual({
     valveFired: false,
@@ -1363,13 +1374,12 @@ describe("WaitForOutput", () => {
       valveFired,
     } = await withWaitClocksHeld(
       { matchDeadlines: [250, LAST_LOOK_MS], deadlinePassesAfter: { sleeps: 3, interval: 10 } },
-      () =>
-        call(waitForOutput, {
-          id: started.id,
-          pattern: "never-appears",
-          timeoutMs: 250,
-          intervalMs: 10,
-        }),
+      (signal) =>
+        call(
+          waitForOutput,
+          { id: started.id, pattern: "never-appears", timeoutMs: 250, intervalMs: 10 },
+          { signal },
+        ),
     );
     expect(out.matched).toBe(false);
     expect(out.reason).toBe("deadline");
@@ -1422,7 +1432,8 @@ describe("WaitForOutput", () => {
           matchDeadlines: [MATCH_DEADLINE_MS],
           beforeMatch: (run) => (run === 1 ? printedAndExited() : undefined),
         },
-        () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+        (signal) =>
+          call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
       );
       expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
         matched: true,
@@ -1488,7 +1499,8 @@ describe("WaitForOutput", () => {
               return undefined;
             },
           },
-          () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+          (signal) =>
+            call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
         );
         expect({ matched: result.matched, match: result.match, reason: result.reason }).toEqual({
           matched: true,
@@ -1533,7 +1545,8 @@ describe("WaitForOutput", () => {
               return undefined;
             },
           },
-          () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+          (signal) =>
+            call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
         );
         expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
           matched: true,
