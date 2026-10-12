@@ -36,7 +36,15 @@ import {
   roundBits,
   shannonEntropy,
 } from "./entropy";
-import { type Finding, groupSpan, maskValue, matchAll, sortFindings, withPositions } from "./text";
+import {
+  type Finding,
+  groupSpan,
+  maskValue,
+  matchAll,
+  matchAllSkipping,
+  sortFindings,
+  withPositions,
+} from "./text";
 
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -48,7 +56,49 @@ export type SecretRule = {
   readonly pattern: RegExp;
   /** Which capture group holds the secret itself. 0 = the whole match. */
   readonly group?: number;
+  /**
+   * The pattern's matches when a plain global search would rescan a run;
+   * the same matches as `matchAll(text, pattern)`.
+   */
+  readonly matches?: (text: string) => Iterable<{ index: number; match: RegExpExecArray }>;
 };
+
+const JWT_COMPACT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+
+/** A code unit `\w` matches. */
+function isWordUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f
+  );
+}
+
+/**
+ * JWT_COMPACT's matches. Its first segment reads to the end of a run of
+ * `[A-Za-z0-9_-]` and needs a `.` there, so a run with `eyJ` at many word
+ * boundaries (`eyJ-eyJ-…`) was read to its end again from every one:
+ * quadratic in the run, on the megabytes `SecretScan` and `RedactForExport`
+ * take. A later start in the same run meets the same end, with a shorter
+ * first segment and the same text after it, so a try that fails rules out
+ * the rest of the run.
+ */
+function jwtCompactMatches(text: string): Iterable<{ index: number; match: RegExpExecArray }> {
+  return matchAllSkipping(
+    text,
+    JWT_COMPACT,
+    (t, at) =>
+      t.charCodeAt(at) === 0x65 &&
+      t.charCodeAt(at + 1) === 0x79 &&
+      t.charCodeAt(at + 2) === 0x4a &&
+      (at === 0 || !isWordUnit(t.charCodeAt(at - 1))),
+    (t, at) => {
+      let end = at;
+      while (end < t.length && (isWordUnit(t.charCodeAt(end)) || t.charCodeAt(end) === 0x2d)) {
+        end++;
+      }
+      return end;
+    },
+  );
+}
 
 /**
  * The rule table, in scan order. Ids are stable: an operator's allow-list of
@@ -181,7 +231,8 @@ export const SECRET_RULES: ReadonlyArray<SecretRule> = [
     kind: "structural",
     description: "JWT in compact serialization; a bearer token unless it is a public id token",
     severity: "medium",
-    pattern: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+    pattern: JWT_COMPACT,
+    matches: jwtCompactMatches,
   },
   {
     id: "url.credentials",
@@ -298,7 +349,7 @@ export function secretFindings(text: string, options: SecretScanOptions = {}): F
   const raw: Array<Omit<Finding, "line" | "column">> = [];
 
   for (const rule of rules) {
-    for (const { match } of matchAll(text, rule.pattern)) {
+    for (const { match } of rule.matches?.(text) ?? matchAll(text, rule.pattern)) {
       const group = rule.group ?? 0;
       const value = match[group];
       if (value === undefined || value.length === 0) continue;
