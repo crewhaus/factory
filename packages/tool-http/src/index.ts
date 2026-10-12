@@ -63,6 +63,7 @@ import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { formatDn, summarizeCert } from "./lib/cert";
+import { cursorPageUrl } from "./lib/cursor-page";
 import { parseFeed } from "./lib/feed";
 import { matchesPredicate, readPath } from "./lib/jsonpath";
 import type { FieldPredicate } from "./lib/jsonpath";
@@ -728,11 +729,7 @@ export const httpPaginate: RegisteredTool = buildTool({
           } else if (typeof cursor !== "string" && typeof cursor !== "number") {
             return `cursorPath "${input.cursorPath}" resolved to a ${typeof cursor}; a cursor must be a string or a number`;
           } else {
-            const next: URL = new URL(first.toString());
-            for (const [key, value] of current.searchParams.entries())
-              next.searchParams.set(key, value);
-            next.searchParams.set(input.cursorParam as string, String(cursor));
-            current = next;
+            current = cursorPageUrl(first, current, input.cursorParam as string, String(cursor));
           }
         } else if (input.pageParam !== undefined) {
           pageNumber++;

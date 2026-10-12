@@ -1,18 +1,27 @@
 /**
- * HttpWaitFor's `contains` compared every item of a response array with the
- * predicate's value, and sorted that value's keys again for each item: the
- * items times the model's predicate, on every poll. The predicate's keys are
- * sorted once per check now, and an item with a different number of keys is
- * no match before anything is sorted.
+ * Two checks that took the product of two inputs, one of them remote.
  *
- * Checked against the code it replaced, restated here, on generated inputs.
- * The work is counted, never timed: `keyWork` counts the keys read and
- * sorted and the callbacks run.
+ *   - HttpWaitFor's `contains` compared every item of a response array with
+ *     the predicate's value, and sorted that value's keys again for each
+ *     item: the items times the model's predicate, on every poll. The
+ *     predicate's keys are sorted once per check now, and an item with a
+ *     different number of keys is no match before anything is sorted.
+ *   - HttpPaginate's cursor style copied the current page's query onto the
+ *     first URL one `URLSearchParams#set` at a time, and each `set` searches
+ *     the list and writes the whole query back into the URL: the parameters
+ *     times the query, for every page. The query is worked out in one pass
+ *     and written once.
+ *
+ * Both are checked against the code they replaced, restated here, on
+ * generated inputs. The work is counted, never timed: `keyWork` counts
+ * the keys read and sorted and the callbacks run, and `urlWork` charges each
+ * `URLSearchParams` call what the WHATWG URL standard has it do.
  *
  * A test that walks many generated inputs declares a budget, as the house
  * does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
+import { cursorPageUrl } from "./lib/cursor-page";
 import { type FieldPredicate, matchesPredicate, readPath } from "./lib/jsonpath";
 
 /** Seeded, so a failure names the same input every run. */
@@ -106,6 +115,98 @@ function keyWork<T>(body: () => T): { value: T; work: number } {
   }
 }
 
+/**
+ * The work `body` does in `URLSearchParams`, as the WHATWG URL standard
+ * lays it out. `set` and `delete` walk the list for the name and `append`
+ * adds to its end; on the parameters of a URL each then runs the update
+ * steps, which serialize the whole list into the URL's query. Iterating
+ * the list visits each parameter, `toString` writes the list out, and
+ * setting a URL's `search` parses the text it is given.
+ */
+function urlWork<T>(body: () => T): { value: T; work: number } {
+  const tally = { work: 0 };
+  const saved: Saved = [];
+  const params = URLSearchParams.prototype as unknown as Methods;
+  const realToString = URLSearchParams.prototype.toString;
+  const ofUrl = new WeakSet<object>();
+  const serialized = (list: unknown): number =>
+    ofUrl.has(list as object) ? realToString.call(list as URLSearchParams).length : 0;
+  const size = (list: unknown): number => (list as URLSearchParams).size;
+  const urls = URL.prototype as unknown as object;
+  const searchParams = Object.getOwnPropertyDescriptor(urls, "searchParams") as PropertyDescriptor;
+  const search = Object.getOwnPropertyDescriptor(urls, "search") as PropertyDescriptor;
+  Object.defineProperty(urls, "searchParams", {
+    ...searchParams,
+    get(this: URL) {
+      const list = (searchParams.get as () => URLSearchParams).call(this);
+      ofUrl.add(list);
+      return list;
+    },
+  });
+  Object.defineProperty(urls, "search", {
+    ...search,
+    set(this: URL, text: string) {
+      tally.work += String(text).length;
+      (search.set as (text: string) => void).call(this, text);
+    },
+  });
+  for (const name of ["set", "delete"]) {
+    wrap(
+      saved,
+      params,
+      name,
+      (real) =>
+        function (this: unknown, ...args: unknown[]) {
+          tally.work += size(this);
+          const out = real.apply(this, args);
+          tally.work += serialized(this);
+          return out;
+        },
+    );
+  }
+  wrap(
+    saved,
+    params,
+    "append",
+    (real) =>
+      function (this: unknown, ...args: unknown[]) {
+        const out = real.apply(this, args);
+        tally.work += 1 + serialized(this);
+        return out;
+      },
+  );
+  for (const name of ["entries", Symbol.iterator as unknown as string]) {
+    wrap(
+      saved,
+      params,
+      name,
+      (real) =>
+        function (this: unknown, ...args: unknown[]) {
+          tally.work += size(this);
+          return real.apply(this, args);
+        },
+    );
+  }
+  wrap(
+    saved,
+    params,
+    "toString",
+    (real) =>
+      function (this: unknown, ...args: unknown[]) {
+        const out = real.apply(this, args) as string;
+        tally.work += out.length;
+        return out;
+      },
+  );
+  try {
+    return { value: body(), work: tally.work };
+  } finally {
+    restore(saved);
+    Object.defineProperty(urls, "searchParams", searchParams);
+    Object.defineProperty(urls, "search", search);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The code as it was.
 
@@ -153,6 +254,13 @@ function oldMatchesPredicate(body: unknown, predicate: FieldPredicate): boolean 
     default:
       return false;
   }
+}
+
+function oldCursorPageUrl(first: URL, current: URL, cursorParam: string, cursor: string): URL {
+  const next: URL = new URL(first.toString());
+  for (const [key, value] of current.searchParams.entries()) next.searchParams.set(key, value);
+  next.searchParams.set(cursorParam, cursor);
+  return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,4 +370,97 @@ describe("a predicate's value is compared with each item at the item's own cost"
     expect(Math.min(seen.true, seen.false)).toBeGreaterThan(1_000);
     expect(seen.containsTrue).toBeGreaterThan(300);
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// HttpPaginate's cursor style.
+
+describe("the next cursor page's query is written once", () => {
+  test("a first URL of P parameters, P doubling", () => {
+    const measured = [2_000, 4_000].map((count) => {
+      const first = new URL(
+        `https://api.example.test/items?${Array.from({ length: count }, (_, i) => `k${i}=v`).join("&")}`,
+      );
+      const run = urlWork(() => cursorPageUrl(first, first, "cursor", "abc"));
+      expect(run.value.search).toBe(`${first.search}&cursor=abc`);
+      // Each list read once, each parameter added once, the query written
+      // and parsed once.
+      expect(run.work).toBeLessThanOrEqual(8 * first.href.length);
+      return run.work;
+    });
+    expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
+  });
+
+  test("cursorPageUrl leaves the URL the set() loop left, over generated queries", () => {
+    const next = rng(0x5eed2002);
+    const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(next() * xs.length)] as T;
+    const names = [
+      "a",
+      "b",
+      "cursor",
+      "page",
+      "",
+      "a b",
+      "a+b",
+      "%61",
+      "%2B",
+      "x%26y",
+      "%3D",
+      "é",
+      "%E2%82%AC",
+      "%FF",
+      "%EF%BF%BD",
+      "%",
+      "%zz",
+    ];
+    const values = ["", "1", "v", "a b", "%20", "+", "=", "==", "%26", "€", "%FF", "x?y"];
+    const query = (): string =>
+      Array.from({ length: Math.floor(next() * 7) }, () => {
+        const r = next();
+        if (r < 0.08) return "";
+        if (r < 0.16) return pick(names);
+        return `${pick(names)}=${pick(values)}`;
+      }).join(pick(["&", "&", "&", "&&"]));
+    const url = (): URL =>
+      new URL(`https://api.example.test/items?${query()}${next() < 0.2 ? "#frag" : ""}`);
+    const cursors = ["c2", "", "a b", "+", "%41", "é", "\ud800", "1e+21", "x&y=z"];
+    const params = ["cursor", "a", "", "a b", "é", "�", "\ud800", "%61", "page"];
+    const differ: string[] = [];
+    const seen = { replaced: 0, appended: 0, collapsed: 0 };
+    for (let n = 0; n < 6_000; n++) {
+      const first = url();
+      let oldCurrent = next() < 0.5 ? first : url();
+      let newCurrent = oldCurrent;
+      for (let page = 0; page < 3; page++) {
+        const param = pick(params);
+        const cursor = pick(cursors);
+        if (first.searchParams.has(param.toWellFormed())) seen.replaced++;
+        else seen.appended++;
+        const names = [...first.searchParams.keys()];
+        if (names.length !== new Set(names).size) seen.collapsed++;
+        const was = oldCursorPageUrl(first, oldCurrent, param, cursor);
+        const now = cursorPageUrl(first, newCurrent, param, cursor);
+        if (
+          now.href !== was.href ||
+          JSON.stringify([...now.searchParams]) !== JSON.stringify([...was.searchParams])
+        ) {
+          differ.push(
+            JSON.stringify({
+              first: first.href,
+              current: oldCurrent.href,
+              param,
+              cursor,
+              was: was.href,
+              now: now.href,
+            }),
+          );
+          break;
+        }
+        oldCurrent = was;
+        newCurrent = now;
+      }
+    }
+    expect(differ.slice(0, 3)).toEqual([]);
+    expect(Math.min(seen.replaced, seen.appended, seen.collapsed)).toBeGreaterThan(1_000);
+  }, 30_000);
 });
