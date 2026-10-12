@@ -105,6 +105,8 @@ type Ctx = {
   /** The paths in `ignored`, for the "listed already?" test. */
   ignoredSeen: Set<string>;
   orderedFallbacks: string[];
+  /** The paths in `orderedFallbacks`, for the same test. */
+  orderedFallbacksSeen: Set<string>;
 };
 
 /**
@@ -115,6 +117,17 @@ function noteIgnored(ctx: Ctx, path: string): void {
   if (ctx.ignoredSeen.has(path)) return;
   ctx.ignoredSeen.add(path);
   ctx.ignored.push(path);
+}
+
+/**
+ * Note an array compared positionally because it was too long, once. As for
+ * `noteIgnored`, a set answers "listed already?": searching the list made a
+ * value with many long arrays quadratic in them.
+ */
+function noteOrderedFallback(ctx: Ctx, path: string): void {
+  if (ctx.orderedFallbacksSeen.has(path)) return;
+  ctx.orderedFallbacksSeen.add(path);
+  ctx.orderedFallbacks.push(path);
 }
 
 function record(ctx: Ctx, diff: Difference): void {
@@ -141,6 +154,7 @@ function equalUnder(actual: unknown, expected: unknown, ctx: Ctx, path: string):
     ignored: [],
     ignoredSeen: new Set(),
     orderedFallbacks: [],
+    orderedFallbacksSeen: new Set(),
   };
   walk(actual, expected, path, probe);
   return probe.differences.length === 0;
@@ -207,9 +221,7 @@ function walk(actual: unknown, expected: unknown, path: string, ctx: Ctx): void 
 
 function compareArrays(actual: unknown[], expected: unknown[], path: string, ctx: Ctx): void {
   const tooLong = actual.length > UNORDERED_ARRAY_LIMIT || expected.length > UNORDERED_ARRAY_LIMIT;
-  if (ctx.opts.ignoreArrayOrder && tooLong && !ctx.orderedFallbacks.includes(path)) {
-    ctx.orderedFallbacks.push(path);
-  }
+  if (ctx.opts.ignoreArrayOrder && tooLong) noteOrderedFallback(ctx, path);
   if (ctx.opts.ignoreArrayOrder && !tooLong) {
     compareArraysUnordered(actual, expected, path, ctx);
     return;
@@ -346,6 +358,7 @@ export function compareValues(
     ignored: [],
     ignoredSeen: new Set(),
     orderedFallbacks: [],
+    orderedFallbacksSeen: new Set(),
   };
   walk(actual, expected, "", ctx);
   return {

@@ -1,18 +1,21 @@
 /**
- * The paths `ignorePaths` matched are listed in one pass.
+ * The paths `ignorePaths` matched, and the arrays compared positionally, are
+ * listed in one pass.
  *
  * `compareValues` checked each ignored path against every path it had listed
  * so far: quadratic in the ignored paths of one comparison. CompareGolden
  * takes the model's JSON with no size cap, and `/*` over an object of many
- * keys is the ordinary way to ignore them. A set now answers "listed
- * already?", and `ignored` comes back in the same order.
+ * keys is the ordinary way to ignore them. With `ignoreArrayOrder`, each
+ * array too long to match unordered was checked the same way against the
+ * ones listed before it. A set now answers "listed already?" for both, and
+ * each list comes back in the same order.
  *
  * The work is counted with tool-code's __test__/js-work.ts, which charges an
  * array's `includes` for the whole array, never timed.
  */
 import { describe, expect, test } from "bun:test";
 import { jsWork } from "../../tool-code/src/__test__/js-work";
-import { compareValues } from "./lib/compare";
+import { UNORDERED_ARRAY_LIMIT, compareValues } from "./lib/compare";
 
 /** Elements visited and characters copied per ignored path; about 12 here. */
 const WORK_PER_PATH = 32;
@@ -80,5 +83,33 @@ describe("compareValues lists ignored paths in one pass", () => {
       expect(new Set(ignored).size).toBe(ignored.length);
     }
     expect(listed).toBeGreaterThan(1_000);
+  }, 20_000);
+});
+
+describe("compareValues lists ordered fallbacks in one pass", () => {
+  // About 8 an array here.
+  const WORK_PER_ARRAY = 24;
+
+  test("thousands of arrays too long to match unordered", () => {
+    const measured = [2_000, 4_000].map((m) => {
+      const actual = Array.from({ length: m }, () =>
+        new Array<number>(UNORDERED_ARRAY_LIMIT + 1).fill(0),
+      );
+      const expected = Array.from({ length: m }, () => []);
+      const run = jsWork(WORK_PER_ARRAY * m, () =>
+        compareValues(actual, expected, { ignoreArrayOrder: true, maxDifferences: 1 }),
+      );
+      return { m, run };
+    });
+    for (const { m, run } of measured) {
+      expect(run.work).toBeLessThanOrEqual(WORK_PER_ARRAY * m);
+      // The outer array is too long as well, and listed first.
+      expect(run.value?.orderedFallbacks).toEqual([
+        "",
+        ...Array.from({ length: m }, (_, i) => `/${i}`),
+      ]);
+    }
+    const [small, large] = measured as [(typeof measured)[0], (typeof measured)[0]];
+    expect(large.run.work / small.run.work).toBeLessThan(2.4);
   }, 20_000);
 });
