@@ -154,6 +154,12 @@
  *      allow skips it (`restrictOnly`), because the grant is about the
  *      record the call names, not the store it lives in. One declared
  *      `beneath` too (a store the tool reads whole) carries its prefixes.
+ *    - an `id` declared `secretRef` is a secret reference, trimmed as the
+ *      tool trims it; a `file:` or `envfile:` one is matched with the file
+ *      it names canonicalised in it, and the file is also a value only a
+ *      deny or ask reads (see {@link secretRefValues}).
+ *    - a field declared `source` (where the tool takes a value from) is read
+ *      by a deny or ask only.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash — `0x` or `0X`, both of which a node accepts) is marked
  *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
@@ -318,6 +324,7 @@ export function operativeValuesOf(
   // last (see `relocates` on OperativeArg).
   const relocated: OperativeValue[] = [];
   for (const arg of operativeArgs) {
+    const from = values.length;
     for (const {
       value: raw,
       words,
@@ -499,6 +506,10 @@ export function operativeValuesOf(
           break;
         }
         default: {
+          if (arg.secretRef === true) {
+            values.push(...secretRefValues(raw, canonicalizePath));
+            break;
+          }
           const spellings = [...(words ?? []), ...(unqualified ?? [])];
           values.push({
             kind: arg.kind,
@@ -525,6 +536,13 @@ export function operativeValuesOf(
             });
           }
         }
+      }
+    }
+    // Where the tool takes a value from: a deny or ask reads it, an allow
+    // is about where the tool acts (`source` on OperativeArg).
+    if (arg.source === true) {
+      for (let i = from; i < values.length; i++) {
+        values[i] = { ...(values[i] as OperativeValue), restrictOnly: true };
       }
     }
   }
@@ -578,6 +596,47 @@ function programPlaceValues(
       globPattern: true,
       restrictOnly: true,
     });
+  }
+  return out;
+}
+
+/**
+ * A secret reference (`secretRef` on its OperativeArg), read the way
+ * `@crewhaus/tool-secrets`' `parseRef` reads it: with the whitespace around
+ * it trimmed, and its `file:` and `envfile:` forms naming a workspace file.
+ * Such a reference is matched with the file's canonical path in it — where
+ * it lands, `./`, `..` and links resolved — so `file:./secrets/token`,
+ * `file:pub/../secrets/token` and `file:pub/lnk/token` (a link to
+ * `../secrets`) are all `file:secrets/token`, which an allow must name and a
+ * deny on `file:secrets/**` names. The reference as written and trimmed is
+ * a spelling a deny or ask also reads, and the file is a path value only a
+ * deny or ask reads (`alwaysDeny *(secrets/**)`). A file outside the
+ * workspace is outside: every deny or ask fires, no allow grants it. Any
+ * other form (`env:NAME`, `keychain:…`, `op://…`, a bare NAME) is an id.
+ */
+function secretRefValues(raw: string, canonicalizePath: PathCanonicalizer): OperativeValue[] {
+  const ref = raw.trim();
+  const place = secretRefPlace(ref);
+  if (place === undefined) {
+    return [
+      {
+        kind: "id",
+        canonical: [ref],
+        ...(ref !== raw ? { spellings: [raw] } : {}),
+        ...(HEX_ID.test(ref) ? { caseInsensitive: true } : {}),
+      },
+    ];
+  }
+  const named = (path: string): string => `${place.scheme}:${path}${place.key}`;
+  const out: OperativeValue[] = [];
+  for (const file of canonicalizePath(place.path)) {
+    const spellings = [...new Set([raw, ref, ...(file.spellings ?? []).map(named)])];
+    out.push(
+      file.outsideWorkspace === true
+        ? { kind: "id", canonical: [], spellings, outsideWorkspace: true }
+        : { kind: "id", canonical: file.canonical.map(named), spellings },
+    );
+    out.push({ ...file, restrictOnly: true });
   }
   return out;
 }
@@ -1010,6 +1069,32 @@ function placeForms(
 /** `./` or `.\\` at the start: a word the call wrote relative to its directory. */
 function startsWithDotSlash(word: string): boolean {
   return word.startsWith("./") || word.startsWith(".\\");
+}
+
+/**
+ * The file a trimmed `file:<path>` or `envfile:<path>#KEY` reference opens,
+ * split as `parseRef` splits it (an `envfile:` at its LAST `#`), with the
+ * rest of the reference around it; `undefined` for any other form, and for
+ * one the tool refuses whole (an empty path, no `#KEY`, a newline or NUL).
+ */
+function secretRefPlace(
+  ref: string,
+):
+  | { readonly scheme: "file" | "envfile"; readonly path: string; readonly key: string }
+  | undefined {
+  if (/[\0\n\r]/.test(ref)) return undefined;
+  if (ref.startsWith("file:")) {
+    const path = ref.slice("file:".length);
+    return path === "" ? undefined : { scheme: "file", path, key: "" };
+  }
+  if (ref.startsWith("envfile:")) {
+    const rest = ref.slice("envfile:".length);
+    const hash = rest.lastIndexOf("#");
+    return hash <= 0
+      ? undefined
+      : { scheme: "envfile", path: rest.slice(0, hash), key: rest.slice(hash) };
+  }
+  return undefined;
 }
 
 /** A value that ends in a `0x` (or `0X`) hex id, after any `<qualifier>/`. */

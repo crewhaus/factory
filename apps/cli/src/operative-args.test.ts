@@ -230,6 +230,7 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "SecretScan.path": "the text is passed inline; nothing is read",
   "SeoLint.corpus": "the near-duplicate check is reported NOT CHECKED; nothing is read",
   "SeoLint.file": "the page is passed inline as html; nothing is read",
+  "SecretRotate.newValueFrom": "the new value is generated here; nothing is read",
   "SitemapParse.url": "the sitemap is passed inline; nothing is fetched",
   "SpecAdvise.path":
     "the spec is passed inline, or not at all; the log directories declare defaults",

@@ -1343,6 +1343,127 @@ describe("url, command and id values", () => {
   });
 });
 
+describe("a secret reference (critic8)", () => {
+  const lookup = () =>
+    buildTool({
+      name: "LookupLike",
+      description: "check references",
+      inputSchema: z.object({ refs: z.array(z.string()) }),
+      readOnly: true,
+      operativeArgs: [{ field: "refs", kind: "id", secretRef: true }],
+      execute: async () => "ok",
+    });
+  const on = (ref: string, pattern: string, polarity: "allow" | "restrict") =>
+    matchesPattern(
+      compilePattern(pattern),
+      "LookupLike",
+      {},
+      { polarity, operativeValues: operativeValuesFor(lookup(), { refs: [ref] }) ?? [] },
+    );
+
+  test("a file: reference is matched with its file collapsed, and trimmed as the tool trims it", () => {
+    for (const ref of [
+      "file:secrets/token",
+      "file:./secrets/token",
+      "file:secrets//token",
+      "file:pub/../secrets/token",
+      " file:secrets/token",
+      "\tfile:./secrets/token\u00a0",
+    ]) {
+      expect({ ref, deny: on(ref, "LookupLike(file:secrets/**)", "restrict") }).toEqual({
+        ref,
+        deny: true,
+      });
+      // The file itself, for a deny written as a path.
+      expect({ ref, deny: on(ref, "LookupLike(secrets/**)", "restrict") }).toEqual({
+        ref,
+        deny: true,
+      });
+      // An allow names where it lands.
+      expect({ ref, allow: on(ref, "LookupLike(file:secrets/token)", "allow") }).toEqual({
+        ref,
+        allow: true,
+      });
+      expect({ ref, allow: on(ref, "LookupLike(file:pub/**)", "allow") }).toEqual({
+        ref,
+        allow: false,
+      });
+    }
+    // A path value is never granted by an allow written as a path.
+    expect(on("file:pub/token", "LookupLike(pub/**)", "allow")).toBe(false);
+  });
+
+  test("an envfile: reference names the file before its last #", () => {
+    const values = operativeValuesFor(lookup(), { refs: ["envfile:./a#b/.env#KEY"] }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical[0], v.restrictOnly === true])).toEqual([
+      ["id", "envfile:a#b/.env#KEY", false],
+      ["path", "a#b/.env", true],
+    ]);
+  });
+
+  test("a file outside the workspace is outside: every deny fires, no allow grants it", () => {
+    expect(on("file:../outside", "LookupLike(env:NEVER)", "restrict")).toBe(true);
+    expect(on("file:../outside", "LookupLike(**)", "allow")).toBe(false);
+  });
+
+  test("every other form is an id, trimmed; one the tool refuses names no file", () => {
+    for (const [ref, id] of [
+      ["env:HOME", "env:HOME"],
+      [" env:HOME ", "env:HOME"],
+      ["keychain:acme#deploy", "keychain:acme#deploy"],
+      ["op://vault/item/field", "op://vault/item/field"],
+      ["SLACK_TOKEN", "SLACK_TOKEN"],
+      ["File:secrets/token", "File:secrets/token"],
+      ["file:", "file:"],
+      ["envfile:secrets/.env", "envfile:secrets/.env"],
+      ["envfile:#KEY", "envfile:#KEY"],
+      ["file:secrets/token\nx", "file:secrets/token\nx"],
+    ] as const) {
+      const values = operativeValuesFor(lookup(), { refs: [ref] }) ?? [];
+      expect({ ref, values: values.map((v) => [v.kind, v.canonical]) }).toEqual({
+        ref,
+        values: [["id", [id]]],
+      });
+    }
+    expect(on(" env:HOME", "LookupLike(env:HOME)", "allow")).toBe(true);
+  });
+
+  test("a source field is read by a deny or ask only", () => {
+    const upsert = buildTool({
+      name: "UpsertLike",
+      description: "copy a secret into a file",
+      inputSchema: z.object({
+        path: z.string().optional(),
+        entries: z.array(z.object({ key: z.string(), valueFrom: z.string().optional() })),
+      }),
+      destructive: true,
+      operativeArgs: [
+        { field: "path", kind: "path", default: ".env" },
+        { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+      ],
+      execute: async () => "ok",
+    });
+    const values =
+      operativeValuesFor(upsert, { entries: [{ key: "A", valueFrom: "file:pub/../secrets/t" }] }) ??
+      [];
+    expect(values.map((v) => [v.kind, v.canonical[0], v.restrictOnly === true])).toEqual([
+      ["path", ".env", false],
+      ["id", "file:secrets/t", true],
+      ["path", "secrets/t", true],
+    ]);
+    const match = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "UpsertLike",
+        {},
+        { polarity, operativeValues: values },
+      );
+    expect(match("UpsertLike(file:secrets/**)", "restrict")).toBe(true);
+    expect(match("UpsertLike(secrets/**)", "restrict")).toBe(true);
+    expect(match("UpsertLike(.env)", "allow")).toBe(true);
+  });
+});
+
 describe("a relocating field's default (C004)", () => {
   // The tool-state shape: a store directory the tool defaults in execute, and
   // the record inside it that the call names.

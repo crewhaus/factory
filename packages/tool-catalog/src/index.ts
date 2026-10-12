@@ -391,11 +391,33 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * as an argv array runs without a shell and is never split; a deny or ask
  * still reads the line an argv hands to a shell (`["sh", "-c", "a && b"]`).
  *
+ * `secretRef: true`, for an `id`, says the value is a secret reference in
+ * the grammar `@crewhaus/tool-secrets` reads (`env:NAME`, `file:<path>`,
+ * `envfile:<path>#KEY`, `keychain:…`, `op://…`, a bare NAME). It is read as
+ * that package reads it, with the whitespace around it trimmed, and its
+ * `file:` and `envfile:` forms name a workspace file the tool opens: the
+ * reference is matched with that file's canonical path in it, so
+ * `alwaysDeny SecretLookup(file:secrets/**)` fires on `file:./secrets/token`,
+ * `file:pub/../secrets/token` and `file:pub/lnk/token` (`pub/lnk` a link to
+ * `../secrets`), and `alwaysAllow SecretLookup(file:pub/**)` grants none of
+ * them. A deny or ask also reads the file as a path (`alwaysDeny
+ * *(secrets/**)`). Other forms are ids, as written but trimmed.
+ *
+ * `source: true` marks a field holding where the tool takes a value from,
+ * not where it acts: the reference EnvFileUpsert copies a secret from
+ * (`entries.valueFrom`). A deny or ask reads it like any value, so
+ * `alwaysDeny EnvFileUpsert(file:secrets/**)` stops a copy out of secrets/;
+ * an allow is about where the tool acts, and does not have to name it
+ * (`alwaysAllow EnvFileUpsert(.env)` still covers `valueFrom: env:TOKEN`).
+ * A tool needs one operative field that is not a source.
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
  * whose dangerous mode hangs on a flag should gate that mode itself — for
  * example with `requireJustification` — rather than rely on a scoped rule.
+ * (`hiddenWhen` is the one switch a rule reads: it widens what a walk
+ * stands for, never what an allow grants.)
  */
 export type OperativeArg = {
   readonly field: string;
@@ -411,6 +433,8 @@ export type OperativeArg = {
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;
+  readonly secretRef?: true;
+  readonly source?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

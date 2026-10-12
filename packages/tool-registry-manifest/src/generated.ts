@@ -2280,7 +2280,10 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path", default: ".env" }],
+    operativeArgs: [
+      { field: "path", kind: "path", default: ".env" },
+      { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+    ],
     categories: ["secrets", "safety"],
     package: "@crewhaus/tool-secrets",
     keywords: ["env file", ".env", "set env var", "update dotenv", "env upsert"],
@@ -6975,7 +6978,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "refs", kind: "id" }],
+    operativeArgs: [{ field: "refs", kind: "id", secretRef: true }],
     categories: ["secrets", "safety"],
     package: "@crewhaus/tool-secrets",
     keywords: [
@@ -6997,7 +7000,10 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "ref", kind: "id" }],
+    operativeArgs: [
+      { field: "ref", kind: "id", secretRef: true },
+      { field: "newValueFrom", kind: "id", secretRef: true, source: true },
+    ],
     categories: ["secrets", "safety"],
     package: "@crewhaus/tool-secrets",
     keywords: ["rotate a secret", "credential rotation", "replace a key", "retire old credential"],

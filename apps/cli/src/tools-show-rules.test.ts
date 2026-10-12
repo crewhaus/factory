@@ -47,6 +47,14 @@ describe("operativeArgWords — a declaration in words", () => {
         "a path; read from the directory in cwd; a directory stands for everything beneath it; left out, the whole workspace",
       ],
       [
+        { field: "refs", kind: "id", secretRef: true },
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path",
+      ],
+      [
+        { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path; where the value is taken from: a deny or ask reads it, an allow need not name it",
+      ],
+      [
         { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
         "an id prefix, which stands for every value that starts with it; matched as namespace/prefix; left out, it stands for every value",
       ],
@@ -247,6 +255,13 @@ describe("the printed example works, through the real matcher", () => {
       "sendMessage",
       { channel: "slack:T0123:C0123:1700000000.1", text: "hi" },
       { channel: "slack:T0123:C9999", text: "hi" },
+    ],
+    // A secret reference, named where it lives (critic8).
+    ["secretLookup", { refs: ["envfile:.env#DEPLOY_TOKEN"] }, { refs: ["env:HOME"] }],
+    [
+      "envFileUpsert",
+      { path: "src/.env", entries: [{ key: "A", valueFrom: "env:A" }] },
+      { path: ".env", entries: [{ key: "A", valueFrom: "env:A" }] },
     ],
     // Deny examples: they fire on the call named, and not on another.
     ["grep", { pattern: "key", path: "secrets/prod" }, { pattern: "key", path: "src" }],

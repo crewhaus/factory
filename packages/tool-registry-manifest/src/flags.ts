@@ -1505,7 +1505,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path", default: ".env" }],
+    operativeArgs: [
+      { field: "path", kind: "path", default: ".env" },
+      { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+    ],
   },
   envInspect: {
     key: "envInspect",
@@ -4633,7 +4636,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "refs", kind: "id" }],
+    operativeArgs: [{ field: "refs", kind: "id", secretRef: true }],
   },
   secretRotate: {
     key: "secretRotate",
@@ -4644,7 +4647,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "ref", kind: "id" }],
+    operativeArgs: [
+      { field: "ref", kind: "id", secretRef: true },
+      { field: "newValueFrom", kind: "id", secretRef: true, source: true },
+    ],
   },
   secretScan: {
     key: "secretScan",

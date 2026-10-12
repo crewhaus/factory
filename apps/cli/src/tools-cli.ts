@@ -1593,6 +1593,8 @@ export type OperativeArgLike = {
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;
+  readonly secretRef?: true;
+  readonly source?: true;
 };
 
 /** One permission rule, in the shape `permissions.rules` takes it. */
@@ -1676,6 +1678,14 @@ export function operativeArgWords(arg: OperativeArgLike): string {
       `a shell handed ${arg.stdin} with no script runs it as a line, and a deny or ask reads each command in it`,
     );
   }
+  if (arg.secretRef === true) {
+    parts.push(
+      "a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path",
+    );
+  }
+  if (arg.source === true) {
+    parts.push("where the value is taken from: a deny or ask reads it, an allow need not name it");
+  }
   if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
   if (arg.beneath === "visible") {
     parts.push(
@@ -1717,6 +1727,8 @@ function allowGlob(arg: OperativeArgLike): string {
     case "command":
       return "git status";
     default: {
+      // A secret reference, named where it lives.
+      if (arg.secretRef === true) return "envfile:.env#DEPLOY_*";
       if (arg.within !== undefined) {
         const qualifier = QUALIFIER_SAMPLES[arg.within] ?? "prod";
         return arg.prefix === true ? `${qualifier}/**` : `${qualifier}/*`;
@@ -1766,9 +1778,9 @@ export function ruleScopeFor(
   if (operativeArgs === undefined) return { kind: "undeclared", example: bare };
   if (operativeArgs.length === 0) return { kind: "unscoped", example: bare };
   const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a) }));
-  // An allow skips a relocating field the call leaves out, so the fields it
-  // is about are the others — unless relocating fields are all there is.
-  const active = operativeArgs.filter((a) => a.relocates !== true);
+  // An allow skips a relocating field the call leaves out, and a source, so
+  // the fields it is about are the others — unless those are all there is.
+  const active = operativeArgs.filter((a) => a.relocates !== true && a.source !== true);
   const read = active.length > 0 ? active : operativeArgs;
   const kinds = new Set(read.map((a) => a.kind));
   // The example names a place when an argument is one: a path before a URL

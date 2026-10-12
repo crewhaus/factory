@@ -485,6 +485,52 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     );
   });
 
+  test("secretRef is carried on a plain id, and source beside a field that says where the tool acts", () => {
+    const schema = z.object({
+      ref: z.string(),
+      from: z.string().optional(),
+      owner: z.string().optional(),
+      path: z.string().optional(),
+    });
+    const build = (operativeArgs: ReadonlyArray<Record<string, unknown>>) => () =>
+      buildTool({
+        name: "Secret",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: operativeArgs as unknown as OperativeArg[],
+      });
+    expect(
+      build([
+        { field: "ref", kind: "id", secretRef: true },
+        { field: "from", kind: "id", secretRef: true, source: true },
+      ])().operativeArgs,
+    ).toEqual([
+      { field: "ref", kind: "id", secretRef: true },
+      { field: "from", kind: "id", secretRef: true, source: true },
+    ]);
+    expect(build([{ field: "path", kind: "path", secretRef: true }])).toThrow(
+      /secretRef: only a plain "id"/,
+    );
+    expect(build([{ field: "ref", kind: "id", within: "owner", secretRef: true }])).toThrow(
+      /secretRef: only a plain "id"/,
+    );
+    expect(build([{ field: "ref", kind: "id", secretRef: "yes" }])).toThrow(
+      /secretRef is either true or left out/,
+    );
+    // A tool whose every field is a source says nowhere it acts.
+    expect(build([{ field: "from", kind: "id", source: true }])).toThrow(
+      /"from" is where the tool takes a value from, and no other operative field says where it acts/,
+    );
+    // Nor is a source the record a relocating store is about.
+    expect(
+      build([
+        { field: "path", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "from", kind: "id", source: true },
+      ]),
+    ).toThrow(/"path" is the only place this tool names/);
+  });
+
   test("shell is carried on a command, and refused anywhere else", () => {
     const build = (arg: Record<string, unknown>) => () =>
       buildTool({

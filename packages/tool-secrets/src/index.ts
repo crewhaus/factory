@@ -273,7 +273,9 @@ async function lookupOne(
 
 export const secretLookup: RegisteredTool = buildTool({
   name: "SecretLookup",
-  operativeArgs: [{ field: "refs", kind: "id" }],
+  // A reference, read as parseRef reads it: a `file:` or `envfile:` one is
+  // matched with the workspace file it opens, where that lands.
+  operativeArgs: [{ field: "refs", kind: "id", secretRef: true }],
   description:
     "Check whether a secret reference resolves, and report where it resolves FROM — without returning the secret. Use it to preflight credentials before a run, to find out which of several definitions of the same variable actually wins, or to confirm a rotation took. Each reference comes back with the backend that answered, the source, and a truncated SHA-256 fingerprint that lets you compare two secrets or detect a change without ever seeing either value; a bare NAME is searched across the environment, the .env chain and the secrets directory, and a shadowing definition with a different value is reported as a warning. It deliberately has no option to reveal a value.",
   inputSchema: z.object({
@@ -497,8 +499,13 @@ export const envFileUpsert: RegisteredTool = buildTool({
   ioCapability: "process",
   // The file a rule is about. Leaving `path` out writes `.env`, so a rule
   // sees `.env` too — `alwaysDeny EnvFileUpsert(.env)` cannot be dodged by
-  // omitting the field.
-  operativeArgs: [{ field: "path", kind: "path", default: ".env" }],
+  // omitting the field. A `valueFrom` reference is where a value is copied
+  // from: a deny or ask reads it (`alwaysDeny EnvFileUpsert(file:secrets/**)`),
+  // an allow on the file does not have to name it.
+  operativeArgs: [
+    { field: "path", kind: "path", default: ".env" },
+    { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+  ],
   execute: async (input, ctx?: ToolExecuteContext) => {
     const path = input.path ?? ".env";
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
@@ -708,7 +715,12 @@ function previousRef(ref: SecretRef): SecretRef | undefined {
 
 export const secretRotate: RegisteredTool = buildTool({
   name: "SecretRotate",
-  operativeArgs: [{ field: "ref", kind: "id" }],
+  // The secret it rewrites, and the one it may copy the new value from,
+  // which only a deny or ask reads.
+  operativeArgs: [
+    { field: "ref", kind: "id", secretRef: true },
+    { field: "newValueFrom", kind: "id", secretRef: true, source: true },
+  ],
   description:
     "Replace a stored secret with a new value and prove the new one reads back, without either value appearing in the result. The new value is generated here or taken from another reference; it is written first, verified by re-reading it, and only then is the previous copy retired — so a failure at any step leaves the old secret working, and the result names the step that failed. A rotation takes an exclusive lock, so two callers cannot rotate the same secret at once and invalidate each other. It rotates the STORED value only: a credential issued by a provider stays valid there until you revoke it. dryRun walks the same steps and reports what each one would do.",
   inputSchema: z.object({

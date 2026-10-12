@@ -428,6 +428,17 @@ function checkOperativeArgs(
         );
       }
     }
+    const { secretRef } = arg;
+    if (secretRef !== undefined) {
+      if (secretRef !== true) fail(`${at}.secretRef is either true or left out`);
+      if (kind !== "id" || within !== undefined || prefix !== undefined) {
+        fail(
+          `${at}.secretRef: only a plain "id" (no within or prefix) holds a secret reference such as env:NAME or file:<path>`,
+        );
+      }
+    }
+    const { source } = arg;
+    if (source !== undefined && source !== true) fail(`${at}.source is either true or left out`);
     const { shell } = arg;
     if (shell !== undefined) {
       if (shell !== true) fail(`${at}.shell is either true or left out`);
@@ -484,7 +495,16 @@ function checkOperativeArgs(
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
         ...(glob === true ? { glob } : {}),
         ...(shell === true ? { shell } : {}),
+        ...(secretRef === true ? { secretRef } : {}),
+        ...(source === true ? { source } : {}),
       }),
+    );
+  }
+  // A source is where the tool takes a value from; something else must say
+  // where it acts, or no scoped allow could ever grant the tool.
+  if (out.length > 0 && out.every((arg) => arg.source === true)) {
+    fail(
+      `[0].source: "${(out[0] as OperativeArg).field}" is where the tool takes a value from, and no other operative field says where it acts; declare that field, or this one without source`,
     );
   }
   // A relocating field moves the tool off the store its OTHER operative
@@ -493,7 +513,11 @@ function checkOperativeArgs(
   // it, and a tool that reads or writes what is inside it (StateExport's
   // whole state directory) must say so with `beneath`, which a relocating
   // field cannot carry.
-  if (out.length > 0 && out.every((arg) => arg.relocates === true)) {
+  if (
+    out.length > 0 &&
+    out.some((arg) => arg.relocates === true) &&
+    out.every((arg) => arg.relocates === true || arg.source === true)
+  ) {
     const first = out[0] as OperativeArg;
     fail(
       `[0].relocates: "${first.field}" is the only place this tool names — no other operative field names a record in it — so a rule is about "${first.field}" itself. Declare it without relocates, and with beneath: "all" if the tool reads or writes what is inside it`,

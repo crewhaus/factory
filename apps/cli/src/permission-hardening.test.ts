@@ -999,6 +999,144 @@ describe("critic8 — the read-only walkers that declared nothing read their dir
   }, 60_000);
 });
 
+// critic8 (0.7.1): SecretLookup's `refs` and SecretRotate's `ref` were
+// declared plain ids, read as the text written, while the tool trims a
+// reference and opens a `file:` or `envfile:` one wherever it lands. Four
+// spellings of secrets/token dodged `alwaysDeny SecretLookup(file:secrets/**)`
+// and the tool fingerprinted the file. EnvFileUpsert's `valueFrom` and
+// SecretRotate's `newValueFrom` were not read by any rule at all, though they
+// copy a secret's VALUE into the file the tool writes.
+describe("critic8 — a secret reference is read where its file lands", () => {
+  beforeEach(() => {
+    mkdirSync(join(ws, "secrets"));
+    mkdirSync(join(ws, "pub"));
+    writeFileSync(join(ws, "secrets", "token"), "s3cr3t-value");
+    writeFileSync(join(ws, "secrets", ".env"), "KEY=secret-env\n");
+    // No newline: EnvFileUpsert refuses a value it cannot write in a .env.
+    writeFileSync(join(ws, "pub", "token"), "public-value");
+    symlinkSync("../secrets", join(ws, "pub", "lnk"));
+  });
+  const resolved = () => (lastResult ?? "").includes('"status":"resolved"');
+
+  test("SecretLookup: every spelling of a denied file meets the deny, in every mode", async () => {
+    const dodges = [
+      "file:secrets/token",
+      "file:./secrets/token",
+      "file:secrets//token",
+      "file:pub/../secrets/token",
+      "file:pub/lnk/token",
+      " file:secrets/token",
+      "\tfile:./secrets/token ",
+    ];
+    for (const deny of ["SecretLookup(file:secrets/**)", "*(secrets/**)"]) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        const rs =
+          mode === "default"
+            ? rules(["alwaysDeny", deny], ["alwaysAllow", "SecretLookup"])
+            : rules(["alwaysDeny", deny]);
+        for (const ref of dodges) {
+          const got = await gate("SecretLookup", { refs: [ref] }, rs, mode);
+          expect({ deny, mode, ref, got, resolved: resolved() }).toEqual({
+            deny,
+            mode,
+            ref,
+            got: "deny",
+            resolved: false,
+          });
+        }
+      }
+    }
+    // An envfile: reference names its file the same way.
+    const envDeny = rules(
+      ["alwaysDeny", "SecretLookup(envfile:secrets/**)"],
+      ["alwaysAllow", "SecretLookup"],
+    );
+    for (const ref of ["envfile:./secrets/.env#KEY", "envfile:pub/lnk/.env#KEY"]) {
+      expect({ ref, got: await gate("SecretLookup", { refs: [ref] }, envDeny) }).toEqual({
+        ref,
+        got: "deny",
+      });
+    }
+    // Control: a reference beside the denied place resolves as before.
+    const rs = rules(
+      ["alwaysDeny", "SecretLookup(file:secrets/**)"],
+      ["alwaysAllow", "SecretLookup"],
+    );
+    for (const ref of ["file:pub/token", " file:./pub/token", "env:PATH"]) {
+      expect({
+        ref,
+        got: await gate("SecretLookup", { refs: [ref] }, rs),
+        resolved: resolved(),
+      }).toEqual({
+        ref,
+        got: "allow",
+        resolved: true,
+      });
+    }
+  }, 120_000);
+
+  test("SecretLookup: an allow names where the file lands, and a reference trimmed as the tool trims it", async () => {
+    const pub = rules(["alwaysAllow", "SecretLookup(file:pub/**)"]);
+    for (const [ref, want] of [
+      ["file:pub/token", "allow"],
+      ["file:./pub/token", "allow"],
+      ["file:pub/lnk/token", "ask"],
+      ["file:pub/../secrets/token", "ask"],
+      ["file:../outside", "ask"],
+    ] as const) {
+      expect({ ref, got: await gate("SecretLookup", { refs: [ref] }, pub) }).toEqual({
+        ref,
+        got: want,
+      });
+    }
+    // Written with a space the tool trims, a reference an allow names is granted.
+    const env = rules(["alwaysAllow", "SecretLookup(env:PATH)"]);
+    expect(await gate("SecretLookup", { refs: [" env:PATH"] }, env)).toBe("allow");
+  }, 60_000);
+
+  test("EnvFileUpsert: a deny reads where valueFrom copies a secret from; .env is untouched", async () => {
+    const before = readFileSync(join(ws, ".env"), "utf8");
+    const copy = (valueFrom: string) => ({ entries: [{ key: "COPIED", valueFrom }] });
+    for (const deny of ["EnvFileUpsert(file:secrets/**)", "*(secrets/**)"]) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "EnvFileUpsert(.env)"]);
+      for (const ref of ["file:secrets/token", "file:pub/lnk/token", " file:./secrets/token"]) {
+        expect({ deny, ref, got: await gate("EnvFileUpsert", copy(ref), rs) }).toEqual({
+          deny,
+          ref,
+          got: "deny",
+        });
+        expect(readFileSync(join(ws, ".env"), "utf8")).toBe(before);
+      }
+    }
+    // Control: the allow on the file still covers a copy from anywhere else.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "EnvFileUpsert(.env)"]);
+    expect(await gate("EnvFileUpsert", copy("file:pub/token"), rs)).toBe("allow");
+    expect(readFileSync(join(ws, ".env"), "utf8")).toContain("COPIED=public-value");
+  }, 60_000);
+
+  test("SecretRotate: a deny reads the reference it rewrites and the one it copies from", async () => {
+    const generate = { bytes: 16, encoding: "hex" };
+    const rs = rules(
+      ["alwaysDeny", "SecretRotate(file:secrets/**)"],
+      ["alwaysAllow", "SecretRotate"],
+    );
+    const cases = [
+      { ref: "file:./secrets/token", generate },
+      { ref: "file:pub/lnk/token", generate },
+      { ref: "file:pub/token", newValueFrom: "file:pub/lnk/token" },
+    ];
+    for (const input of cases) {
+      const got = await gate("SecretRotate", { ...input, justification: "rotate a token" }, rs);
+      expect({ input, got }).toEqual({ input, got: "deny" });
+    }
+    expect(readFileSync(join(ws, "secrets", "token"), "utf8")).toBe("s3cr3t-value");
+    expect(readFileSync(join(ws, "pub", "token"), "utf8")).toBe("public-value");
+    // Control: a rotation that touches nothing under secrets/ is allowed.
+    const own = { ref: "file:pub/token", generate, dryRun: true, justification: "rotate a token" };
+    expect(await gate("SecretRotate", own, rs)).toBe("allow");
+  }, 60_000);
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as

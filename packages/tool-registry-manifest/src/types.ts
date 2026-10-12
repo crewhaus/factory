@@ -37,6 +37,10 @@ export type RegistryOperativeArg = {
   readonly glob?: true;
   /** For a `command`: a shell parses it, so a rule reads each simple command in it. */
   readonly shell?: true;
+  /** For an `id`: a secret reference, whose `file:` and `envfile:` forms name a workspace file. */
+  readonly secretRef?: true;
+  /** Where the tool takes a value from: a deny or ask reads it, an allow need not. */
+  readonly source?: true;
 };
 
 export type RegistryEntry = {
@@ -138,6 +142,8 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),
     ...(arg.glob === true ? { glob: true as const } : {}),
     ...(arg.shell === true ? { shell: true as const } : {}),
+    ...(arg.secretRef === true ? { secretRef: true as const } : {}),
+    ...(arg.source === true ? { source: true as const } : {}),
   };
 }
 
