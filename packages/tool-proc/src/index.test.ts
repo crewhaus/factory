@@ -1235,9 +1235,12 @@ describe("WaitForOutput", () => {
   testScript(
     "returns as soon as the pattern appears",
     async () => {
+      // The script stays alive after its line (the afterEach kills it), so
+      // with the wait's clocks held only the line can end the wait; the exit
+      // has tests of its own.
       const path = script(
         "server.sh",
-        'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5',
+        'echo booting\nsleep 0.1\necho "Listening on 4321"\nexec sleep 30',
       );
       const started = await call(processStart, { argv: [path] });
       const out = await waitDefinitely({
@@ -1254,9 +1257,10 @@ describe("WaitForOutput", () => {
   testScript(
     "a failure pattern ends the wait early instead of burning the deadline",
     async () => {
+      // Alive after its line, so only a line can end the wait.
       const path = script(
         "broken.sh",
-        'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
+        'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nexec sleep 30',
       );
       const started = await call(processStart, { argv: [path] });
       const out = await waitDefinitely({
@@ -1590,7 +1594,8 @@ describe("WaitForOutput", () => {
   testScript(
     "a wait for a line, with an unquantified alternation, still works",
     async () => {
-      const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
+      // Alive after its line, so only the line can end the wait.
+      const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nexec sleep 30');
       const started = await call(processStart, { argv: [path] });
       const out = await waitDefinitely({
         id: started.id,
