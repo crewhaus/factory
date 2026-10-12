@@ -113,7 +113,9 @@ describe("a cut through an echoed credential leaves none of it (C050)", () => {
     // deadline here is long, and the test owns the clock the poll schedules
     // by: once the server has answered, Date.now reads an hour later, so the
     // poll finishes reading that answer (its abort timer is real and far
-    // off) and then finds its time up instead of polling again.
+    // off) and then finds its time up instead of polling again. The test's
+    // budget sits above the three calls' deadlines, so a stalled answer
+    // fails here rather than as an orphaned assertion after it.
     let checked = 0;
     const realNow = Date.now.bind(Date);
     let answered = false;
@@ -131,7 +133,7 @@ describe("a cut through an echoed credential leaves none of it (C050)", () => {
             url: `${origin}${pathCutAt(200, missing)}`,
             auth,
             expectJson: { path: "x", op: "exists" },
-            timeoutMs: 60_000,
+            timeoutMs: 20_000,
             intervalMs: 60_000,
           }),
         );
@@ -149,8 +151,10 @@ describe("a cut through an echoed credential leaves none of it (C050)", () => {
       served.onRequest = undefined;
     }
     expect(checked).toBe(3);
-  });
+  }, 90_000);
 
+  // A deadline no runner reaches and a budget above it, so a stalled walk
+  // fails inside this test rather than as an orphaned assertion after it.
   test("HttpPaginate's preview, cut inside the secret, carries none of it", async () => {
     const out = String(
       await httpPaginate.execute({
@@ -158,12 +162,12 @@ describe("a cut through an echoed credential leaves none of it (C050)", () => {
         auth,
         style: "link",
         maxPages: 1,
-        timeoutMs: 5_000,
+        timeoutMs: 20_000,
       }),
     );
     expect(out).toContain("first 200 characters");
     expect(leakedPrefixes(out)).toBe(0);
-  });
+  }, 30_000);
 
   test("HttpRequest's maxBytes cut inside the secret carries none of it, and says it cut", async () => {
     let checked = 0;

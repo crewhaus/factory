@@ -944,6 +944,13 @@ describe("HttpRequest", () => {
 
 // ---------------------------------------------------------------------------
 
+// Each call below is a few loopback round trips that take milliseconds. Its
+// deadline is one no runner reaches, and its test's budget sits above it: a
+// deadline equal to the default 5 s budget turned one stalled request into a
+// budget timeout plus an orphaned "Expected 3, Received undefined" after it.
+// A call that does stall now fails inside its own test, on its own
+// assertions. The same holds for LinkCheck, HttpWaitFor, SseRead and
+// TlsInspect below.
 describe("HttpPaginate", () => {
   test("follows Link rel=next to the end and concatenates the items", async () => {
     const result = await run(httpPaginate, {
@@ -951,12 +958,12 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(2);
     expect(result.items).toEqual([1, 2, 3]);
     expect(result.stoppedBy).toBe("end");
-  });
+  }, 30_000);
 
   test("the page cap stops the walk and says so", async () => {
     const result = await run(httpPaginate, {
@@ -964,12 +971,12 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 1,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(1);
     expect(result.stoppedBy).toBe("pageCap");
     expect(result.items).toEqual([1, 2]);
-  });
+  }, 30_000);
 
   test("cursor style reads the named field and stops when it goes null", async () => {
     const result = await run(httpPaginate, {
@@ -979,18 +986,13 @@ describe("HttpPaginate", () => {
       cursorParam: "cursor",
       itemsPath: "items",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(2);
     expect(result.items).toEqual(["a", "b", "c"]);
     expect(result.stoppedBy).toBe("end");
-  });
+  }, 30_000);
 
-  // Three loopback round trips take milliseconds. The walk's deadline is one
-  // no runner reaches, and the test's budget sits above it: a walk deadline
-  // equal to the default 5 s budget turned one stalled request into a budget
-  // timeout plus an orphaned "Expected 3, Received undefined" after it. A
-  // walk that does stall now fails here, with the tool's own message.
   test("page style increments the parameter and stops on the first empty page", async () => {
     const result = await run(httpPaginate, {
       url: `${origin}/pages`,
@@ -1015,22 +1017,22 @@ describe("HttpPaginate", () => {
       itemsPath: "items",
       maxPages: 10,
       maxItems: 1,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.items).toEqual([1]);
     expect(result.stoppedBy).toBe("itemCap");
-  });
+  }, 30_000);
 
   test("a non-2xx page stops the walk and keeps what was already collected", async () => {
     const result = await run(httpPaginate, {
       url: `${origin}/status/500`,
       style: "link",
       maxPages: 3,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("status");
     expect(result.status).toBe(500);
-  });
+  }, 30_000);
 
   test("a body that is not an array says how to point at the items", async () => {
     const result = await run(httpPaginate, {
@@ -1038,11 +1040,11 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 3,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("shape");
     expect(result.note).toContain("itemsPath");
-  });
+  }, 30_000);
 
   test("an aggregate byte budget stops a walk that would otherwise fill memory", async () => {
     // Each page fits well inside maxBytes, so the per-page cap never fires —
@@ -1060,7 +1062,7 @@ describe("HttpPaginate", () => {
     expect(result.bytes).toBeGreaterThanOrEqual(100_000);
     expect(result.pages).toBeLessThan(100);
     expect(result.pages).toBeGreaterThan(1);
-  });
+  }, 30_000);
 
   test("a cursor style missing its parameters is a readable refusal, not a request", async () => {
     const result = await run(httpPaginate, {
@@ -1477,7 +1479,7 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
   test("LinkCheck returns one row per URL in input order, with a per-URL status", async () => {
     const result = await run(linkCheck, {
       urls: [`${origin}/json`, `${origin}/status/404`, "http://example.com/off"],
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
       concurrency: 2,
     });
     expect(result.checked).toBe(3);
@@ -1491,7 +1493,7 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
       "http://example.com/off",
     ]);
     expect(result.results[2].error).toContain("not in allowed_origins");
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1502,12 +1504,12 @@ describe("HttpWaitFor", () => {
       url: `${origin}/job`,
       expectJson: { path: "state", op: "equals", value: "ready" },
       intervalMs: 20,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.met).toBe(true);
     expect(result.attempts).toBe(3);
     expect(result.stoppedBy).toBe("condition");
-  });
+  }, 30_000);
 
   test("stops at the deadline when the condition never holds", async () => {
     const result = await run(httpWaitFor, {
@@ -1537,16 +1539,18 @@ describe("HttpWaitFor", () => {
   });
 
   test("a permission refusal stops the poll immediately instead of retrying it", async () => {
-    const started = Date.now();
     const result = await run(httpWaitFor, {
       url: "http://example.com/x",
       expectStatus: [200],
       timeoutMs: 5_000,
       intervalMs: 1_000,
     });
+    // The refusal itself, not a poll report: a poll that retried it would end
+    // at the 5 s deadline as { met: false, attempts, lastError }, and fail
+    // here inside the budget rather than racing a wall-clock bound.
+    expect(typeof result).toBe("string");
     expect(result).toContain("not in allowed_origins");
-    expect(Date.now() - started).toBeLessThan(2_000);
-  });
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1557,18 +1561,18 @@ describe("SseRead", () => {
       url: `${origin}/sse`,
       terminatorEvent: "done",
       maxEvents: 20,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("terminator");
     expect(result.count).toBe(4);
     expect(result.events.map((e: { data: string }) => e.data)).toEqual(["1", "2", "3", "bye"]);
-  });
+  }, 30_000);
 
   test("the event cap stops the read early", async () => {
-    const result = await run(sseRead, { url: `${origin}/sse`, maxEvents: 2, timeoutMs: 5_000 });
+    const result = await run(sseRead, { url: `${origin}/sse`, maxEvents: 2, timeoutMs: 20_000 });
     expect(result.count).toBe(2);
     expect(result.stoppedBy).toBe("eventCap");
-  });
+  }, 30_000);
 
   /**
    * SseRead on /sse-forever, which never terminates, with the read's own
@@ -2094,7 +2098,8 @@ describe("DnsLookup / TlsInspect", () => {
     // Two services that answer a ClientHello with something other than TLS.
     // On this runtime the handshake callback still fires, with an empty
     // certificate, a cipher named null and "TLSv1.2" — which 0.7.0 reported
-    // as a certificate with the wrong name.
+    // as a certificate with the wrong name. Two calls of 10 s deadline each,
+    // so the budget sits above both: a slow handshake fails here, not later.
     const speakers = [
       (socket: import("node:net").Socket) => socket.write("SSH-2.0-OpenSSH_9.6\r\n"),
       (socket: import("node:net").Socket) =>
@@ -2125,7 +2130,7 @@ describe("DnsLookup / TlsInspect", () => {
     }
     expect(outs.filter((o) => !o.includes("no TLS handshake with 127.0.0.1:"))).toEqual([]);
     expect(outs.filter((o) => o.includes('"protocol"') || o.includes('"certificate"'))).toEqual([]);
-  });
+  }, 30_000);
 
   test.skipIf(!hasOpenssl())(
     "TlsInspect reads a real certificate chain from a local TLS server",

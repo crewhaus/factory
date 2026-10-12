@@ -108,10 +108,12 @@ describe("UrlReachable (C119)", () => {
 });
 
 describe("LinkCheck (C119)", () => {
+  // A deadline no runner reaches and a budget above it, so a stalled check
+  // fails inside this test rather than as an orphaned assertion after it.
   test("a refused URL is counted as refused, not broken", async () => {
     const result = await run(linkCheck, {
       urls: [`${origin}/fine`, "http://example.com/off", `${origin}/away`],
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result).toMatchObject({
       checked: 3,
@@ -124,7 +126,7 @@ describe("LinkCheck (C119)", () => {
     expect(result.results[2]).toMatchObject({ ok: null, refused: true, status: 302 });
     // The refused URL was never requested; the redirecting one was, once.
     expect(hits.sort()).toEqual(["/away", "/fine"]);
-  });
+  }, 30_000);
 
   test("a name that does not resolve is still a broken link", async () => {
     registerHttpConfig({ allowed_origins: ["https://nx.example.test"] });

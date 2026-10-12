@@ -222,15 +222,17 @@ describe("a compressed body costs at most its cap", () => {
     expect(out.body).toBe("hello br");
   });
 
+  // A deadline no runner reaches and a budget above it, so a stalled read
+  // fails inside this test rather than as an orphaned assertion after it.
   test("SseRead decodes a compressed stream under its cap", async () => {
     const origin = `http://127.0.0.1:${port}`;
     registerHttpConfig({ allowed_origins: [origin] });
     const out = JSON.parse(
-      String(await sseRead.execute({ url: `${origin}/sse`, timeoutMs: 5_000 })),
+      String(await sseRead.execute({ url: `${origin}/sse`, timeoutMs: 20_000 })),
     );
     expect(out.events.map((e: { data: string }) => e.data)).toEqual(["one", "two"]);
     expect(out.stoppedBy).toBe("streamEnded");
-  });
+  }, 30_000);
 
   test("SseRead stops a compressed bomb at its byte cap", async () => {
     const origin = `http://127.0.0.1:${port}`;
