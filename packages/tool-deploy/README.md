@@ -88,13 +88,13 @@ these tools pin to is *fetched* first, and a version the manifest lists but
 whose bytes are gone is refused by name. `lib.test.ts` demonstrates the gap
 against the real controller.
 
-**Parse, then act on the parsed value.** A caller names a spec the way the spec
-does; the registry stores it under `registrySpecName`'s mapping. Every
-containment check, refusal and result field is built on the *mapped* name, and
-every result carries both (`spec`, `registryName`, and `nameWasMapped` when
-they differ). The mapping is many-to-one, so acting on the caller's spelling
-while the store acts on the mapped one is not cosmetic: `"a b"` and `"a-b"`
-land in the same directory. A name that maps onto the constant `"spec"`
+**Act on the name that was checked.** The registry stores a spec under
+`registrySpecName`'s mapping (`"Brewbird Support"` becomes
+`"Brewbird-Support"`), and a permission rule reads the name as the call wrote
+it. So a name the mapping would change is refused, naming the stored one to
+send instead: acted on, `".billing"` would be checked as one spec and read or
+pin `"billing"`, and since the mapping is many-to-one, `"a b"` and `"a-b"`
+would land in the same directory. A name that maps onto the constant `"spec"`
 fallback — `"."`, `".."`, `"..."` — is refused rather than filed in a bucket
 shared with every other unmappable name. So is a name the registry's own
 `listSpecs` hides, one starting with `"_"` (`"_tenants"` is the tenant-overlay

@@ -34,6 +34,7 @@ import {
 } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createNavigateTool } from "@crewhaus/tool-navigate";
@@ -1172,6 +1173,49 @@ describe("critic7 — `..` and absolute entries in Lint, Format and RunTests pat
     expect(stubRan()).toBe("cwd=<ws>/src\n  x.test.ts -> <ws>/src/x.test.ts\n");
     expect(untouched()).toEqual({ secret: true, outside: true });
   }, 120_000);
+});
+
+// critic8 (0.7.1): the gate reads tool-deploy's `env` within `name` as
+// `<name>/<env>`, as the call wrote it, while the registry stores a spec under
+// spec-changelog's registrySpecName. `.billing` is `billing` on disk, so
+// `alwaysDeny DeployInspect(billing/**)` did not fire on `{name: ".billing"}`
+// and the call read billing's versions and pins. DeployInspect has no
+// justification judge behind the gate.
+describe("critic8 — a spec name the registry stores under another spelling", () => {
+  beforeEach(async () => {
+    const registry = createFileBackedRegistry({ rootDir: join(ws, ".crewhaus", "specs") });
+    for (const name of ["billing", "docs"]) {
+      await registry.put(name, "v1", `name: ${name}\n`);
+      await registry.pin(name, "prod", "v1");
+    }
+  });
+  const pinsShown = () => (lastResult ?? "").includes('"pins"');
+
+  test("is refused by DeployInspect where the gate lets it through, naming the stored name", async () => {
+    const rs = rules(["alwaysDeny", "DeployInspect(billing/**)"], ["alwaysAllow", "DeployInspect"]);
+    expect(await gate("DeployInspect", { name: "billing", env: "prod" }, rs)).toBe("deny");
+    for (const [name, stored] of [
+      [".billing", "billing"],
+      ["..billing", "billing"],
+      ["...billing", "billing"],
+      ["bill ing", "bill-ing"],
+    ] as const) {
+      const got = await gate("DeployInspect", { name, env: "prod" }, rs);
+      const result = JSON.parse(lastResult ?? "{}") as Record<string, unknown>;
+      expect({ name, got, status: result["status"], pins: pinsShown() }).toEqual({
+        name,
+        got: "allow",
+        status: "refused",
+        pins: false,
+      });
+      expect(String(result["reason"])).toContain(
+        `spec name "${name}" is stored by the registry as "${stored}". Name it "${stored}"`,
+      );
+    }
+    // Control: a name the registry stores as written runs, and shows its pins.
+    expect(await gate("DeployInspect", { name: "docs", env: "prod" }, rs)).toBe("allow");
+    expect(pinsShown()).toBe(true);
+  }, 30_000);
 });
 
 describe("p12/security-8#0 — argv and extra fields in front of a deny", () => {

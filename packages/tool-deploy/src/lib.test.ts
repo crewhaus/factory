@@ -103,11 +103,35 @@ test("the mirrored on-disk names are the ones the real registry and changelog wr
 // ---------------------------------------------------------------------------
 
 test("a spec name is resolved to the name the registry will really use", () => {
-  const mapped = named("Brewbird Support");
-  expect(mapped.registryName).toBe("Brewbird-Support");
-  expect(mapped.mapped).toBe(true);
-  const plain = named("demo");
-  expect(plain).toEqual({ given: "demo", registryName: "demo", mapped: false });
+  expect(named("demo")).toEqual({ given: "demo", registryName: "demo" });
+  expect(named("Brewbird-Support.v2")).toEqual({
+    given: "Brewbird-Support.v2",
+    registryName: "Brewbird-Support.v2",
+  });
+});
+
+test("a name the registry would store under another spelling is refused, naming the stored one", () => {
+  // The permission gate reads `<name>/<env>` as the call wrote it. Mapped,
+  // ".billing" was checked as one spec and acted on as "billing": past
+  // `alwaysDeny DeployInspect(billing/**)`, with no judge behind the gate.
+  for (const [given, stored] of [
+    [".billing", "billing"],
+    ["..billing", "billing"],
+    ["billing/", "billing-"],
+    ["bill ing", "bill-ing"],
+    ["Brewbird Support", "Brewbird-Support"],
+    ["._hidden", "_hidden"],
+    ["///", "-"],
+  ] as const) {
+    for (const access of ["write", "read"] as const) {
+      const r = resolveName(given, access);
+      expect({ given, access, ok: r.ok }).toEqual({ given, access, ok: false });
+      if (r.ok) throw new Error("unreachable");
+      expect(r.code).toBe("bad-input");
+      expect(r.reason).toContain(`spec name "${given}" is stored by the registry as "${stored}"`);
+      expect(r.reason).toContain(`Name it "${stored}"`);
+    }
+  }
 });
 
 test("a name that maps onto the shared fallback directory is refused, not mapped", () => {
@@ -124,19 +148,12 @@ test("a name that maps onto the shared fallback directory is refused, not mapped
     // telling the caller their two specs would share one directory.
     expect(r.reason).toContain('fallback "spec"');
   }
-  // A name that maps to something usable is NOT refused, even when the
-  // mapping changed it beyond recognition: that is reported, not blocked.
-  const odd = resolveName("///");
-  expect(odd.ok).toBe(true);
-  if (!odd.ok) throw new Error("unreachable");
-  expect(odd.value.registryName).toBe("-");
-  expect(odd.value.mapped).toBe(true);
 });
 
 test("a name the registry's listing hides is refused for a write, and marked for a read (security-11#9)", () => {
   // On 0.7.0 all four resolved: SpecPin pinned "_hidden" where DeployInspect's
   // enumeration never showed it, and wrote a manifest into "_tenants".
-  for (const given of ["_hidden", "_tenants", "._hidden", "__x"]) {
+  for (const given of ["_hidden", "_tenants", "__x"]) {
     const r = resolveName(given);
     expect({ given, ok: r.ok }).toEqual({ given, ok: false });
     if (r.ok) throw new Error("unreachable");
@@ -149,7 +166,7 @@ test("a name the registry's listing hides is refused for a write, and marked for
     expect(read.value.hiddenFromListing).toBe(true);
   }
   // A leading "-", or an "_" anywhere but first, is listed and stays usable.
-  for (const given of ["-dash", "demo_1", "My Agent"]) {
+  for (const given of ["-dash", "demo_1", "My-Agent"]) {
     const r = resolveName(given);
     expect({ given, ok: r.ok }).toEqual({ given, ok: true });
     if (!r.ok) throw new Error("unreachable");

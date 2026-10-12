@@ -292,16 +292,11 @@ function scopeNote(current: CurrentPin): string | undefined {
   }
 }
 
-/** The name fields every result carries, so the mapping is never invisible. */
+/** The name fields every result carries. */
 function nameFields(name: ResolvedName): Record<string, unknown> {
   return {
     spec: render(name.given),
     registryName: render(name.registryName),
-    ...(name.mapped
-      ? {
-          nameWasMapped: `"${render(name.given)}" is stored as "${render(name.registryName)}" by @crewhaus/spec-changelog's registrySpecName; that mapped name is what every check and every pin below acted on`,
-        }
-      : {}),
     ...(name.hiddenFromListing === true ? { hiddenFromListing: HIDDEN_FROM_LISTING } : {}),
   };
 }
@@ -407,13 +402,13 @@ export const specPin: RegisteredTool = buildTool({
     { field: "env", kind: "id", within: "name" },
   ],
   description:
-    'Register a spec file\'s current content as a version in the local spec registry and pin that version to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content is a no-op that reports the version already holding it, and each new version appends an entry to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name that maps onto the shared "spec" fallback directory or a hidden one (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink (never treated as "no versions"), and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed. dryRun changes nothing and previews the same pin decision.',
+    'Register a spec file\'s current content as a version in the local spec registry and pin that version to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content is a no-op that reports the version already holding it, and each new version appends an entry to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name the registry would store under another spelling, map to its shared "spec" fallback, or hide (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink (never treated as "no versions"), and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed. dryRun changes nothing and previews the same pin decision.',
   inputSchema: z.object({
     name: z
       .string()
       .min(1)
       .describe(
-        "the spec's name as the spec spells it; it is mapped onto the registry's grammar and the result reports the mapped name",
+        'the spec\'s name as the registry stores it: letters, digits, "_", "." and "-", not starting with "." or "_". Any other name is refused, naming the one to use',
       ),
     specFile: z
       .string()
@@ -768,10 +763,9 @@ async function register(
     const result = await autoRegisterSpecVersion({
       registry,
       registryRootDir: rootAbs,
-      // The DISPLAY name: autoRegisterSpecVersion applies registrySpecName
-      // itself, and handing it the already-mapped name would map twice. The
-      // mapping is idempotent today, but relying on that is exactly the kind
-      // of coupling that breaks quietly.
+      // The caller's name: autoRegisterSpecVersion applies registrySpecName
+      // itself. resolveName has refused any name that mapping would change,
+      // so this is the registry name as well.
       specName: name.given,
       yaml,
     });
@@ -907,9 +901,9 @@ export const deployRollback: RegisteredTool = buildTool({
     { field: "env", kind: "id", within: "name" },
   ],
   description:
-    'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry\'s listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched (the environment would resolve to nothing while reading as a successful deploy), a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed.',
+    'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry would store under another spelling (naming the stored one) or its listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched (the environment would resolve to nothing while reading as a successful deploy), a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed.',
   inputSchema: z.object({
-    name: z.string().min(1).describe("the spec's name as the spec spells it"),
+    name: z.string().min(1).describe("the spec's name as the registry stores it"),
     env: z.string().min(1).describe("the environment whose pin should be repointed"),
     toVersion: z
       .string()
@@ -1095,7 +1089,9 @@ export const deployInspect: RegisteredTool = buildTool({
     name: z
       .string()
       .optional()
-      .describe("a single spec to inspect; omit to enumerate every spec in the registry"),
+      .describe(
+        "a single spec to inspect, as the registry stores it (a name it would store under another spelling is refused, naming the stored one); omit to enumerate every spec in the registry",
+      ),
     env: z
       .string()
       .optional()
@@ -1114,6 +1110,15 @@ export const deployInspect: RegisteredTool = buildTool({
   execute: async (input) => {
     const tool = "DeployInspect";
     const limit = input.limit ?? DEFAULT_SPEC_LIMIT;
+    // A named spec is resolved through the same mapping the writers use, and
+    // refused first: a name the registry stores under another spelling is
+    // refused whatever the registry holds.
+    let named: ResolvedName | undefined;
+    if (input.name !== undefined) {
+      const resolved = resolveName(input.name, "read");
+      if (!resolved.ok) return refusal(tool, resolved.code, resolved.reason);
+      named = resolved.value;
+    }
     const rootRel = input.registryDir ?? DEFAULT_REGISTRY_RELDIR;
     const root = contain(tool, rootRel);
     if (!root.ok) return refusal(tool, root.code, root.reason);
@@ -1157,16 +1162,11 @@ export const deployInspect: RegisteredTool = buildTool({
 
     const registry = createFileBackedRegistry({ rootDir: root.value.real });
 
-    // Which specs. A named one is resolved through the same mapping the
-    // writers use; otherwise the adapter enumerates.
+    // Which specs: the named one, or what the adapter enumerates.
     let givenNames: string[];
-    let named: ResolvedName | undefined;
     let hidden: Record<string, unknown> | undefined;
-    if (input.name !== undefined) {
-      const resolved = resolveName(input.name, "read");
-      if (!resolved.ok) return refusal(tool, resolved.code, resolved.reason);
-      named = resolved.value;
-      givenNames = [resolved.value.registryName];
+    if (named !== undefined) {
+      givenNames = [named.registryName];
     } else {
       try {
         givenNames = [...(await registry.listSpecs())].sort();
@@ -1193,7 +1193,6 @@ export const deployInspect: RegisteredTool = buildTool({
       const name: ResolvedName = named ?? {
         given: registryName,
         registryName,
-        mapped: false,
       };
       const state = await readManifest(registry, root.value.real, name);
       if (state.state === "unknown") {

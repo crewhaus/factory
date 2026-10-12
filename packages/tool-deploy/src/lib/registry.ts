@@ -13,15 +13,15 @@
  *
  * WHAT IS HERE, AND WHY EACH PIECE HAD TO BE.
  *
- *   1. THE NAME THE REGISTRY WILL ACTUALLY USE. A caller names a spec the way
- *      the spec does ("Brewbird Support"); the registry stores it under
- *      `registrySpecName`'s mapping ("Brewbird-Support"). Every containment
- *      check, every refusal message and every result field below is built on
- *      the MAPPED name, because that is the one the filesystem sees. Acting
- *      on the caller's spelling while the store acts on the mapped one is the
- *      parse-then-act-on-the-original defect, and here it is worse than
- *      cosmetic: the mapping is many-to-one, so "a b" and "a-b" land in the
- *      same directory and a rollback aimed at one can repoint the other.
+ *   1. THE NAME THE REGISTRY WILL ACTUALLY USE. The registry stores a spec
+ *      under `registrySpecName`'s mapping ("Brewbird Support" becomes
+ *      "Brewbird-Support"), and a name the mapping would change is REFUSED,
+ *      naming the stored one. Acting on the mapped name while the caller's
+ *      spelling is what was checked is the parse-then-act-on-the-original
+ *      defect twice over: the mapping is many-to-one, so "a b" and "a-b"
+ *      land in the same directory and a rollback aimed at one can repoint
+ *      the other; and a permission rule reads the name as the call wrote it,
+ *      so `.billing` would be checked as one spec and act on `billing`.
  *   2. THE PATHS THE REGISTRY OPENS. `spec-registry` does not export its
  *      filenames, so they are mirrored here — and asserted against the real
  *      adapter in `lib.test.ts` rather than trusted, so a rename upstream
@@ -94,14 +94,15 @@ export const VERSION_DIFF_UNAVAILABLE =
 // names
 // ---------------------------------------------------------------------------
 
-/** A caller's spec name and the name the registry will really use for it. */
+/**
+ * A caller's spec name and the name the registry will really use for it —
+ * the same string, since {@link resolveName} refuses one the mapping changes.
+ */
 export type ResolvedName = {
   /** As the caller wrote it. */
   readonly given: string;
   /** `registrySpecName(given)` — the directory component, and what we act on. */
   readonly registryName: string;
-  /** True when the mapping changed the name, so the result can say so. */
-  readonly mapped: boolean;
   /**
    * Present (read access only) when `listSpecs` hides this name. A writer
    * never gets one: {@link resolveName} refuses such a name for a write.
@@ -132,7 +133,7 @@ export type NameAccess = "write" | "read";
 
 /**
  * Put a caller's spec name through `@crewhaus/spec-changelog`'s own mapping —
- * the one `autoRegisterSpecVersion` uses — and refuse the two results a
+ * the one `autoRegisterSpecVersion` uses — and refuse the three results a
  * caller must never get silently.
  *
  * The `"spec"` fallback is the dangerous one. `registrySpecName` returns it
@@ -141,7 +142,14 @@ export type NameAccess = "write" | "read";
  * repoints another. That is a collision the caller cannot see from their own
  * input, so it is refused rather than mapped.
  *
- * The second is a name `listSpecs` hides (a leading `_`, `_tenants`
+ * The second is any other name the mapping changes (".billing", "bill ing",
+ * "billing/"). The permission gate reads `<name>/<env>` as the call wrote it,
+ * so acting on the mapped name would act on a spec no rule was checked
+ * against: `alwaysDeny DeployInspect(billing/**)` did not fire on ".billing"
+ * — and DeployInspect has no justification judge behind the gate. It is
+ * refused, naming the stored name for the caller to send instead.
+ *
+ * The third is a name `listSpecs` hides (a leading `_`, `_tenants`
  * included; a leading `.` cannot survive the mapping). A WRITE under it is
  * refused (security-11#9); a READ is allowed and marked, so what an earlier
  * build pinned there can still be inspected.
@@ -160,6 +168,12 @@ export function resolveName(given: string, access: NameAccess = "write"): Loaded
       `spec name "${render(given)}" has nothing the registry can use, so @crewhaus/spec-changelog's registrySpecName maps it to the shared fallback "spec" — where it would share a directory, a manifest and every environment pin with every other unmappable name. Give the spec a name containing letters, digits, "_", "." or "-".`,
     );
   }
+  if (registryName !== given) {
+    return fail(
+      "bad-input",
+      `spec name "${render(given)}" is stored by the registry as "${render(registryName)}". Name it "${render(registryName)}": permission rules read the name as written, so a name the registry changes would be checked as one spec and acted on as another.`,
+    );
+  }
   const hidden = !isListedSpecName(registryName);
   if (hidden && access === "write") {
     // A pin written here would exist on disk and be absent from every
@@ -168,7 +182,7 @@ export function resolveName(given: string, access: NameAccess = "write"): Loaded
     // such a name can still be inspected by name.
     return fail(
       "bad-input",
-      `spec name "${render(given)}" is stored as "${render(registryName)}", and ${HIDDEN_FROM_LISTING}. Give the spec a name that starts with a letter, a digit or "-".`,
+      `spec name "${render(given)}" starts with "_", and ${HIDDEN_FROM_LISTING}. Give the spec a name that starts with a letter, a digit or "-".`,
     );
   }
   return {
@@ -176,7 +190,6 @@ export function resolveName(given: string, access: NameAccess = "write"): Loaded
     value: {
       given,
       registryName,
-      mapped: registryName !== given,
       ...(hidden ? { hiddenFromListing: true as const } : {}),
     },
   };

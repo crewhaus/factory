@@ -242,19 +242,34 @@ test("SpecPin without an env registers and moves no pin", async () => {
   expect(versionsOnDisk()).toEqual(["v1"]);
 });
 
-test("SpecPin acts on the mapped registry name, and says which name it used", async () => {
+test("a spec name the registry would store under another spelling is refused by all three tools, naming the stored one", async () => {
+  // The permission gate reads `<name>/<env>` as written; the registry would
+  // act on the mapped name. Refused before anything is read or written.
   writeFileSync(path.join(tmp, "spec.yaml"), "name: Brewbird Support\n");
-  const r = await call(specPin, {
-    name: "Brewbird Support",
-    specFile: "spec.yaml",
-    env: "prod",
-  });
-  expect(r["spec"]).toBe("Brewbird Support");
-  expect(r["registryName"]).toBe("Brewbird-Support");
-  expect(String(r["nameWasMapped"])).toContain("Brewbird-Support");
-  // The directory the filesystem really got.
-  expect(existsSync(specDir("Brewbird-Support"))).toBe(true);
-  expect(existsSync(specDir("Brewbird Support"))).toBe(false);
+  const given = "Brewbird Support";
+  for (const [tool, input] of [
+    [specPin, { name: given, specFile: "spec.yaml", env: "prod" }],
+    [deployRollback, { name: given, env: "prod", toVersion: "v1", dryRun: false }],
+    [deployInspect, { name: given, env: "prod" }],
+  ] as const) {
+    const r = await call(tool, input);
+    expect({ tool: tool.name, status: r["status"], code: r["code"] }).toEqual({
+      tool: tool.name,
+      status: "refused",
+      code: "bad-input",
+    });
+    expect(String(r["reason"])).toContain(
+      'spec name "Brewbird Support" is stored by the registry as "Brewbird-Support"',
+    );
+  }
+  expect(existsSync(path.join(tmp, ROOT_REL))).toBe(false);
+  // Sent as the registry stores it, the same call runs.
+  const r = await call(specPin, { name: "Brewbird-Support", specFile: "spec.yaml", env: "prod" });
+  expect([r["spec"], r["registryName"], r["nameWasMapped"]]).toEqual([
+    "Brewbird-Support",
+    "Brewbird-Support",
+    undefined,
+  ]);
   expect(pinsOnDisk("Brewbird-Support")).toEqual({ prod: "v1" });
 });
 
