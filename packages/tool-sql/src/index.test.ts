@@ -45,6 +45,7 @@ import {
   tableStats,
 } from "./index";
 import { namedParameters, positionalParameterCount } from "./lib/sql-text";
+import { resolveSafe } from "./paths";
 
 let workspace = "";
 let originalCwd = "";
@@ -1334,4 +1335,51 @@ describe("containment: a relative dangling link under an outward directory link"
     // Nor quietly redirected to the in-root path the lexical reading names.
     expect(await Bun.file(join(workspace, "escape.db")).exists()).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
+ * its arguments, and `resolveLocation` joined the names below the deepest
+ * existing ancestor one argument apiece. With 65,536 names below an existing
+ * file the location came back as that file: `DatabaseBackup` with
+ * `overwrite: true` replaced it, though the call named a path far below it
+ * (and the permission gate, whose walk is one name shorter, saw yet another
+ * path). The location must be the whole path at every count.
+ *
+ * Each size is one walk over 131 KB of path, so each test declares a budget
+ * (house rule); nothing here is timed.
+ */
+describe("a destination 65,535 to 65,537 names below an existing file", () => {
+  const deep = (n: number) => `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
+  // A failure prints this, not two 131 KB strings.
+  const brief = (s: string) => ({ length: s.length, head: s.slice(0, 20), end: s.slice(-12) });
+
+  for (const n of [65_535, 65_536, 65_537]) {
+    test(`${n} names: the tool acts on the whole path`, () => {
+      mkdirSync(join(workspace, "secrets"));
+      writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+      const raw = deep(n);
+      const at = resolveSafe("DatabaseBackup", raw);
+      expect(brief(at.real)).toEqual(brief(join(workspace, raw)));
+      expect(at.real === join(workspace, raw)).toBe(true);
+    }, 120_000);
+  }
+
+  test("DatabaseBackup with overwrite leaves the file above it alone", async () => {
+    seedDatabase();
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    const out = await run(databaseBackup, {
+      database: "app.db",
+      out: deep(65_536),
+      overwrite: true,
+    });
+    expect(typeof out).toBe("string");
+    expect(
+      (out as string).startsWith('DatabaseBackup found no directory "secrets/prod.db/a/a/'),
+    ).toBe(true);
+    expect(readFileSync(join(workspace, "secrets", "prod.db"), "utf8")).toBe("precious");
+  }, 120_000);
 });

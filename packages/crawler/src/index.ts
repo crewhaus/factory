@@ -443,7 +443,9 @@ function resolveLocation(target: string, depth = 0): string {
     const base = realpathSync(dirname(probe));
     probeReal = resolveLocation(resolvePath(base, link), depth + 1);
   }
-  return tail.length > 0 ? joinPath(probeReal, ...tail) : probeReal;
+  // One string, not one argument per name: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments.
+  return tail.length > 0 ? joinPath(probeReal, tail.join(sep)) : probeReal;
 }
 
 export function createCrawler(opts: {

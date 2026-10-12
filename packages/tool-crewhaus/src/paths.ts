@@ -142,7 +142,9 @@ function resolveLocation(target: string, depth = 0): string {
     const base = realpathSync(path.dirname(probe));
     probeReal = resolveLocation(path.resolve(base, link), depth + 1);
   }
-  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
+  // One string, not one argument per name: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments.
+  return tail.length > 0 ? path.join(probeReal, tail.join(path.sep)) : probeReal;
 }
 
 export function resolveSafe(toolName: string, rel: string, root = workspaceRoot()): SafePath {
