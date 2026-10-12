@@ -424,9 +424,10 @@ describe("rpc — reading a node's refusal", () => {
         message: "the method eth_simulateV1 does not exist/is not available",
       },
       params: { code: -32602, message: "invalid params: bundle rejected" },
+      reverts: { code: 3, message: "execution reverted" },
     } as const;
     const fetchImpl = (async (url: string, init: RequestInit) => {
-      const host = new URL(url).hostname.split(".")[0] as "missing" | "params" | "down";
+      const host = new URL(url).hostname.split(".")[0] as keyof typeof said | "down";
       if (host === "down") return new Response("upstream down", { status: 503 });
       const { id } = JSON.parse(String(init.body)) as { id: number };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: said[host] }));
@@ -455,6 +456,7 @@ describe("rpc — reading a node's refusal", () => {
       ["rejects the params, then lacks it", ["params", "missing"], "fallback"],
       ["lacks it, then rejects the params", ["missing", "params"], "fallback"],
       ["lacks it, then cannot be reached", ["missing", "down"], "fallback"],
+      ["rejects the params, then reverts", ["params", "reverts"], "fallback"],
       ["two voters lacking it, one never heard", ["missing", "missing"], "quorum"],
     ];
     const out: Record<string, unknown> = {};
@@ -474,6 +476,11 @@ describe("rpc — reading a node's refusal", () => {
         refusal: "invalid params: bundle rejected (code -32602)",
       },
       "lacks it, then cannot be reached": { unsupported: false, refusal: undefined },
+      // The refusal quoted is the first node's in the chain's order, not the last to fail.
+      "rejects the params, then reverts": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
       "two voters lacking it, one never heard": { unsupported: false, refusal: undefined },
     });
   });
