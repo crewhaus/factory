@@ -516,16 +516,15 @@ function walkFrom(dir: string, rel: string): string {
  * it is a symlink, where it leads is the program the kernel runs, and a
  * second place.
  */
-function readProgramPlace(word: string, runsIn: string | undefined, root: string): ProgramPlace {
-  const rootAbs = path.resolve(root);
-  let rootReal: string;
-  try {
-    rootReal = realpathSync(rootAbs);
-  } catch {
-    rootReal = rootAbs;
-  }
+function readProgramPlace(
+  word: string,
+  runsIn: string | undefined,
+  rootReal: string,
+  prefix: string,
+  walked: Map<string, string | null>,
+): ProgramPlace {
   const dirLexical = path.resolve(rootReal, runsIn ?? ".");
-  const lexical = path.resolve(dirLexical, word);
+  const lexical = path.resolve(dirLexical, prefix, word);
   const asWritten = toPosix(lexical);
   const unresolved: ProgramPlace = {
     reading: undefined,
@@ -533,7 +532,13 @@ function readProgramPlace(word: string, runsIn: string | undefined, root: string
     asWritten,
   };
   // Longer than any path can be: the kernel refuses to run it.
-  if (word.length > MAX_PATH_CHARS || dirLexical.length > MAX_PATH_CHARS) return unresolved;
+  if (
+    word.length > MAX_PATH_CHARS ||
+    dirLexical.length > MAX_PATH_CHARS ||
+    prefix.length > MAX_PATH_CHARS
+  ) {
+    return unresolved;
+  }
   const inWorkspace = (p: string): string | undefined => {
     const rel = path.relative(rootReal, p);
     return climbsOut(rel) ? undefined : rel === "" ? "." : toPosix(rel);
@@ -548,9 +553,33 @@ function readProgramPlace(word: string, runsIn: string | undefined, root: string
   const known = { lexical: rootReal, physical: rootReal };
   let at: string;
   let target: string | undefined;
+  const absolute = path.isAbsolute(word);
+  // The directory a relative word is walked from: the one the command runs
+  // in, then where a wrapper moved it. Walked once per call for every word
+  // read there, so a deep directory and many words cost their sum.
+  let start: string;
+  if (absolute) start = path.parse(word).root;
+  else {
+    const key = `${dirLexical}\u0000${prefix}`;
+    let dir = walked.get(key);
+    if (dir === undefined) {
+      try {
+        const base = physicalPath(dirLexical, { known });
+        dir =
+          prefix === ""
+            ? base
+            : path.isAbsolute(prefix)
+              ? physicalPath(prefix, { known })
+              : walkFrom(base, prefix);
+      } catch {
+        dir = null;
+      }
+      walked.set(key, dir);
+    }
+    if (dir === null) return unresolved;
+    start = dir;
+  }
   try {
-    const absolute = path.isAbsolute(word);
-    const start = absolute ? path.parse(word).root : physicalPath(dirLexical, { known });
     const from = (rel: string): string =>
       absolute ? physicalPath(`${start}${rel}`, { known }) : walkFrom(start, rel);
     const relHead = absolute ? head.slice(start.length) : head;
@@ -627,6 +656,21 @@ export function placeRecordingCanonicalizer(root: string = process.cwd()): {
 } {
   const seen = new Map<string, WorkspacePathReading>();
   const programs = new Map<string, ProgramPlace>();
+  // The root as the kernel finds it, and each directory a word was read
+  // from, walked once (see readProgramPlace).
+  let rootReal: string | undefined;
+  const realRoot = (): string => {
+    if (rootReal === undefined) {
+      const rootAbs = path.resolve(root);
+      try {
+        rootReal = realpathSync(rootAbs);
+      } catch {
+        rootReal = rootAbs;
+      }
+    }
+    return rootReal;
+  };
+  const walked = new Map<string, string | null>();
   const byKey = <T>(entries: Iterable<[string, T]>): Array<[string, T]> =>
     [...entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return {
@@ -636,7 +680,8 @@ export function placeRecordingCanonicalizer(root: string = process.cwd()): {
       return reading.values;
     },
     readProgramPath: (word, runsIn, opts) => {
-      const place = readProgramPlace(word, runsIn, root);
+      const prefix = opts?.prefix ?? "";
+      const place = readProgramPlace(word, runsIn, realRoot(), prefix, walked);
       // A bare word an interpreter is handed may be a subcommand or a module
       // (`bun run build`, `python -m pytest`): it is a place only where it
       // names an entry, or a card would list files that are not there.
@@ -654,8 +699,11 @@ export function placeRecordingCanonicalizer(root: string = process.cwd()): {
       if (opts?.argument === true && (onItsFace || place.reading === undefined)) {
         return place.reading;
       }
-      const dir = runsIn !== undefined ? withoutTrailingSeparators(runsIn) : "";
-      const key = dir === "" || dir === "." || path.isAbsolute(word) ? word : `${dir}/${word}`;
+      const dir = [runsIn, prefix]
+        .map((d) => (d !== undefined ? withoutTrailingSeparators(d) : ""))
+        .filter((d) => d !== "" && d !== ".")
+        .join("/");
+      const key = dir === "" || path.isAbsolute(word) ? word : `${dir}/${word}`;
       programs.set(key, place);
       return place.reading;
     },

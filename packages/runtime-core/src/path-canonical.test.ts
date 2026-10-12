@@ -771,3 +771,41 @@ describe("placeRecordingCanonicalizer — command words read where the kernel fi
     ]);
   });
 });
+
+// command-dotdot review (0.7.1): words read after a `cd` or an `env -C`
+// are each walked from that directory. Walked again for every word, a deep
+// directory and many words cost their product; it is walked once per call.
+describe("placeRecordingCanonicalizer — a directory many words are read from is walked once", () => {
+  test("each extra word costs the same few steps, however deep the directory", () => {
+    const child = Bun.spawnSync(
+      [process.execPath, path.join(import.meta.dir, "__test__", "program-dir-walk.ts")],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    expect({ exitCode: child.exitCode, stderr: child.stderr.toString().slice(-2_000) }).toEqual({
+      exitCode: 0,
+      stderr: expect.any(String),
+    });
+    type Reading = { depth: number; words: number; joins: number };
+    const rows: Reading[] = child.stdout
+      .toString()
+      .split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line) as Reading);
+    expect(rows.map((r) => [r.depth, r.words])).toEqual([
+      [64, 1],
+      [64, 65],
+      [128, 1],
+      [128, 65],
+    ]);
+    const perWord = (depth: number) => {
+      const one = rows.find((r) => r.depth === depth && r.words === 1) as Reading;
+      const many = rows.find((r) => r.depth === depth && r.words === 65) as Reading;
+      // Two readings per word: after a `cd`, and after an `env -C`.
+      return (many.joins - one.joins) / (2 * 64);
+    };
+    // The directory is walked once: a word costs a step or two of its own,
+    // not one per name of the directory.
+    expect(perWord(64)).toBeLessThanOrEqual(4);
+    expect(perWord(128)).toBe(perWord(64));
+  }, 60_000);
+});

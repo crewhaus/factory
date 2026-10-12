@@ -1610,8 +1610,12 @@ describe("a command word that names a file is read where the kernel finds it", (
       ws: string,
       entries: Record<string, Omit<ProgramPathReading, "asWritten" | "writtenInWorkspace">>,
     ) =>
-    (word: string, runsIn: string | undefined): ProgramPathReading | undefined => {
-      const key = runsIn === undefined ? word : `${runsIn}/${word}`;
+    (
+      word: string,
+      runsIn: string | undefined,
+      opts?: { readonly prefix?: string },
+    ): ProgramPathReading | undefined => {
+      const key = [runsIn, opts?.prefix, word].filter((p) => p !== undefined).join("/");
       const got = entries[key];
       if (got === undefined) return undefined;
       const lexical = key.startsWith("/") ? key : `${ws}/${key.replace(/^\.\//, "")}`;

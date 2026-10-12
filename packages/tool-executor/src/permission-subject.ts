@@ -212,6 +212,13 @@ export type ProgramPathReaderOptions = {
    * when the word lands elsewhere than it reads, or is a symlink.
    */
   readonly argument?: boolean;
+  /**
+   * Where the command moved from `runsIn` before the word is opened,
+   * walked as the kernel walks it: a wrapper's directory (`env -C dir`), a
+   * `cd -P`. The word is read from there; `asWritten` joins all three as
+   * text.
+   */
+  readonly prefix?: string;
 };
 
 /** One word read by a {@link ProgramPathReader}. */
@@ -733,7 +740,10 @@ function readCommand(
         !(opts.shell && word.startsWith("~"));
       const climbs = climbsAfterName(word);
       const elsewhere = dir === undefined || dir.runsIn !== where.runsIn || prefix !== "";
-      if (role === "argument" && !/[\\/]/.test(word) && !elsewhere) return;
+      // A bare argument names no directory of its own: on an argv, read it
+      // where a wrapper moved the command; in a shell line, where only an
+      // approval would be bound to it, not at all.
+      if (role === "argument" && !/[\\/]/.test(word) && (opts.shell || !elsewhere)) return;
       if (!known) {
         if (role !== "argument" && climbs) unplaceable = true;
         return;
@@ -744,7 +754,6 @@ function readCommand(
         return;
       }
       const absolute = isAbsolutePath(word);
-      const read = absolute || prefix === "" ? word : joinedDir(prefix as string, word);
       if (where.readProgramPath === undefined) {
         const anyDotDot = word.split(/[\\/]/).includes("..");
         if (role !== "argument" && (climbs || (elsewhere && !absolute && anyDotDot))) {
@@ -752,11 +761,10 @@ function readCommand(
         }
         return;
       }
-      const place = where.readProgramPath(
-        read,
-        dir.runsIn,
-        role === "argument" || lookup ? { argument: true } : undefined,
-      );
+      const place = where.readProgramPath(word, dir.runsIn, {
+        ...(role === "argument" || lookup ? { argument: true } : {}),
+        ...(prefix !== "" && !absolute ? { prefix } : {}),
+      });
       if (place === undefined) {
         if (role !== "argument") unplaceable = true;
         return;
