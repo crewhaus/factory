@@ -2038,58 +2038,101 @@ describe("RunCommand runs without a terminal", () => {
   );
 });
 
+/**
+ * Runs one WaitForFile call on a clock that moves only when the wait sleeps
+ * between polls, by exactly the time it asked for, and the sleep ends on the
+ * next turn of the event loop, with no timer. `between(n)` runs as the wait
+ * starts its nth sleep, after its nth poll, so a file appears, goes or grows
+ * between two counted polls instead of on a real timer racing the wait's
+ * real deadline: a runner whose timers ran late made the change land after
+ * it. The deadline is a number of polls too. Should a broken wait run on
+ * past twice its deadline, the clocks are put back and the call's signal is
+ * aborted, which the wait honours, so it fails on its own assertions and the
+ * next test starts on the real clocks.
+ */
+async function waitForFileBetweenPolls(
+  input: { readonly timeoutMs: number; readonly intervalMs: number } & Record<string, unknown>,
+  between: (sleep: number) => void,
+  // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+): Promise<any> {
+  const realSetTimeout = globalThis.setTimeout;
+  const frozen = Date.now();
+  let elapsed = 0;
+  let sleeps = 0;
+  const stop = new AbortController();
+  const clock = spyOn(Date, "now").mockImplementation(() => frozen + elapsed);
+  const asleep = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay === undefined || delay > input.intervalMs) return realSetTimeout(fn, delay, ...rest);
+    sleeps += 1;
+    elapsed += delay;
+    between(sleeps);
+    if (elapsed > 2 * input.timeoutMs) {
+      restore();
+      stop.abort();
+    }
+    return setImmediate(() => fn(...rest)) as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  let restored = false;
+  function restore(): void {
+    if (restored) return;
+    restored = true;
+    asleep.mockRestore();
+    clock.mockRestore();
+  }
+  try {
+    return await call(waitForFile, input, { signal: stop.signal });
+  } finally {
+    restore();
+  }
+}
+
 describe("WaitForFile", () => {
   test("returns once the file appears", async () => {
     const target = join(tmp, "artifact.bin");
-    const timer = setTimeout(() => writeFileSync(target, "built"), 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "artifact.bin",
-        timeoutMs: 3_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(5);
-    } finally {
-      clearTimeout(timer);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "artifact.bin", timeoutMs: 3_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(target, "built");
+      },
+    );
+    // The first poll found nothing; the one after the file appeared returned.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 5, attempts: 2 });
   });
 
   test("waits for a file to disappear", async () => {
     const target = join(tmp, "lock");
     writeFileSync(target, "held");
-    const timer = setTimeout(() => rmSync(target, { force: true }), 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "lock",
-        condition: "absent",
-        timeoutMs: 3_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.exists).toBe(false);
-    } finally {
-      clearTimeout(timer);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "lock", condition: "absent", timeoutMs: 3_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) rmSync(target, { force: true });
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, exists: false, attempts: 2 });
   });
 
   test("'stable' waits for the size to stop moving", async () => {
     const target = join(tmp, "growing.log");
     writeFileSync(target, "a");
-    const grow = setTimeout(() => writeFileSync(target, "aaaaaa"), 60);
-    try {
-      const out = await call(waitForFile, {
+    const out = await waitForFileBetweenPolls(
+      {
         path: "growing.log",
         condition: "stable",
         stableForMs: 150,
         timeoutMs: 5_000,
         intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(6);
-    } finally {
-      clearTimeout(grow);
-    }
+      },
+      (sleep) => {
+        if (sleep === 3) writeFileSync(target, "aaaaaa");
+      },
+    );
+    // The size moved at the 4th poll (60 ms in), and the wait returned at the
+    // first poll 150 ms after that: 11 sleeps of 20 ms.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 6, attempts: 12, waitedMs: 220 });
   });
 
   test("a file that never appears fails at the deadline", async () => {
@@ -2144,36 +2187,28 @@ describe("WaitForFile", () => {
   });
 
   test("a symlink swapped in mid-wait cannot escape either", async () => {
-    const swap = setTimeout(() => {
-      writeFileSync(join(outside, "late.txt"), "secret");
-      symlinkSync(join(outside, "late.txt"), join(tmp, "swapped.txt"));
-    }, 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "swapped.txt",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out).toContain("refused path");
-    } finally {
-      clearTimeout(swap);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "swapped.txt", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep !== 1) return;
+        writeFileSync(join(outside, "late.txt"), "secret");
+        symlinkSync(join(outside, "late.txt"), join(tmp, "swapped.txt"));
+      },
+    );
+    expect(out).toContain("refused path");
+    // Refused by the per-poll recheck, at the poll after the swap.
+    expect(out).toContain("now resolves outside");
   });
 
   test("a dangling symlink to a path INSIDE the workspace still works normally", async () => {
     symlinkSync(join(tmp, "built-later.txt"), join(tmp, "link-to-artifact"));
-    const build = setTimeout(() => writeFileSync(join(tmp, "built-later.txt"), "ok!"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "link-to-artifact",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "link-to-artifact", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(join(tmp, "built-later.txt"), "ok!");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 });
 
@@ -2464,18 +2499,14 @@ describe("dangling-symlink containment in resolveSafe", () => {
     mkdirSync(join(tmp, "sub"));
     const realTarget = join(tmp, "sub", "built-later.bin");
     symlinkSync(realTarget, join(tmp, "inside-link.bin"));
-    const build = setTimeout(() => writeFileSync(realTarget, "built"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "inside-link.bin",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(5);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "inside-link.bin", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "built");
+      },
+    );
+    // Admitted and polled while it dangled, then found.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 5, attempts: 2 });
   });
 
   test("an in-workspace target NAMED through an outside path is honoured, not refused", async () => {
@@ -2494,18 +2525,13 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(tmp, join(outside, "alias"));
     const realTarget = join(tmp, "sub", "via-alias.bin");
     symlinkSync(join(outside, "alias", "sub", "via-alias.bin"), join(tmp, "aliased-link.bin"));
-    const build = setTimeout(() => writeFileSync(realTarget, "ok!"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "aliased-link.bin",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "aliased-link.bin", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "ok!");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 
   test("a RELATIVE dangling target is measured from where the link really lives", async () => {
@@ -2543,13 +2569,12 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(join(tmp, "deep", "inner"), join(tmp, "inlink"));
     symlinkSync("../../legit.bin", join(tmp, "deep", "inner", "m"));
     const realTarget = join(tmp, "legit.bin");
-    const build = setTimeout(() => writeFileSync(realTarget, "yes"), 80);
-    try {
-      const out = await call(waitForFile, { path: "inlink/m", timeoutMs: 2_000, intervalMs: 20 });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "inlink/m", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "yes");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 });
