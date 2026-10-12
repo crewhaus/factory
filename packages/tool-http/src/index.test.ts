@@ -986,6 +986,11 @@ describe("HttpPaginate", () => {
     expect(result.stoppedBy).toBe("end");
   });
 
+  // Three loopback round trips take milliseconds. The walk's deadline is one
+  // no runner reaches, and the test's budget sits above it: a walk deadline
+  // equal to the default 5 s budget turned one stalled request into a budget
+  // timeout plus an orphaned "Expected 3, Received undefined" after it. A
+  // walk that does stall now fails here, with the tool's own message.
   test("page style increments the parameter and stops on the first empty page", async () => {
     const result = await run(httpPaginate, {
       url: `${origin}/pages`,
@@ -995,13 +1000,13 @@ describe("HttpPaginate", () => {
       pageSize: 50,
       itemsPath: "rows",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
-    expect(result.pages).toBe(3);
-    expect(result.items).toEqual(["p1", "p2"]);
-    expect(result.stoppedBy).toBe("emptyPage");
+    expect(result).toEqual(
+      expect.objectContaining({ pages: 3, items: ["p1", "p2"], stoppedBy: "emptyPage" }),
+    );
     expect(result.lastUrl).toContain("size=50");
-  });
+  }, 30_000);
 
   test("the item cap stops mid-walk", async () => {
     const result = await run(httpPaginate, {
