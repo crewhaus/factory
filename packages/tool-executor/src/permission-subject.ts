@@ -150,6 +150,17 @@
  *      key may hold `/`, and the prefix alone for a deny written without
  *      the qualifier (read one segment on, so a deny naming another
  *      namespace's key does not fire on every listing).
+ *    - an `id` or `recipient` declared with a `service` field (codehost's
+ *      `baseUrl`, a Chat tool's `apiBaseUrl`), on a call that names the
+ *      service, is matched with the URL's origin in front
+ *      (`https://ghe.example.com/acme/app`): an allow must name it, and one
+ *      that names none covers only a call that leaves the field out. A deny
+ *      or ask also reads the value without the origin, after the origin's
+ *      other spellings (no root dot, no port, the other of http and https)
+ *      and after its host alone (`ghe.example.com/acme/app`), and the URL
+ *      itself as a URL. A URL with no http or https origin, or with a user
+ *      name or password, cannot be placed: the value is flagged
+ *      `outsideWorkspace` (see {@link servedValue}).
  *    - a `path` declared `beneath` (a directory the tool walks: RemovePath,
  *      Grep, a git pathspec) also carries its spellings as `beneath`
  *      prefixes, so a deny or ask naming anything under it fires —
@@ -358,6 +369,7 @@ export function operativeValuesOf(
       defaulted,
       anyQualifier,
       prefixOf,
+      service,
     } of readField(parsedInput, arg)) {
       if (arg.relocates === true && defaulted === true) {
         if (arg.kind === "url") relocated.push(canonicalUrl(raw));
@@ -538,7 +550,7 @@ export function operativeValuesOf(
             break;
           }
           const spellings = [...(words ?? []), ...(unqualified ?? [])];
-          values.push({
+          const value: OperativeValue = {
             kind: arg.kind,
             canonical: [raw],
             ...(spellings.length > 0 ? { spellings } : {}),
@@ -548,7 +560,15 @@ export function operativeValuesOf(
             // A prefix stands for every value that starts with it, and a
             // key may hold `/`: what follows is any run, not one segment.
             ...(prefixOf !== undefined ? { standsForAnyRun: true } : {}),
-          });
+          };
+          // A value on a service the call names is that service's: an
+          // allow names its origin, a deny also reads the URL as a URL.
+          if (service !== undefined) {
+            values.push(servedValue(value, service), {
+              ...canonicalUrl(service.url),
+              restrictOnly: true,
+            });
+          } else values.push(value);
           // The prefix alone, for a deny or ask written without the
           // qualifier (`alwaysDeny KvGet(apikey)`, as for any `within`
           // field). Read one segment on: with a run, a deny naming another
@@ -1321,6 +1341,23 @@ type FieldReading = {
    * `unqualified` is the prefix alone when the value was qualified.
    */
   readonly prefixOf?: { readonly unqualified?: string };
+  /** A field declared `service`, when the call names the service's URL. */
+  readonly service?: ServiceReading;
+};
+
+/**
+ * The API a call names in the field its operative value declares `service`:
+ * the URL as written, and its origin when it has one a request can go to —
+ * http or https, a host, and no user name or password. `otherOrigins` are
+ * the same origin without a root dot, without its port and over the other
+ * of http and https, and `hosts` its host written each of those ways with no
+ * scheme: a deny or ask also reads the value after each of them.
+ */
+type ServiceReading = {
+  readonly url: string;
+  readonly origin?: string;
+  readonly otherOrigins: ReadonlyArray<string>;
+  readonly hosts: ReadonlyArray<string>;
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -1339,10 +1376,106 @@ function namesWorkspaceRoot(values: ReadonlyArray<OperativeValue>): boolean {
  * absolute path as it is.
  */
 export function readOperativeField(input: unknown, arg: OperativeArg): string[] {
-  return readField(input, arg).map((r) => r.value);
+  return readField(input, arg).map((r) =>
+    r.service?.origin !== undefined ? `${r.service.origin}/${r.value}` : r.value,
+  );
 }
 
+/**
+ * {@link readValues}, with the API the call names in a `service` field: the
+ * same for every value of the field, since it is a top-level one.
+ */
 function readField(input: unknown, arg: OperativeArg): FieldReading[] {
+  const read = readValues(input, arg);
+  if (arg.service === undefined) return read;
+  const url = qualifierOf(input, arg.service);
+  if (url === undefined) return read;
+  const service = serviceOf(url);
+  return read.map((r) => ({ ...r, service }));
+}
+
+/** How a rule reads the service URL a call names: see {@link ServiceReading}. */
+function serviceOf(raw: string): ServiceReading {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { url: raw, otherOrigins: [], hosts: [] };
+  }
+  if (
+    (url.protocol !== "https:" && url.protocol !== "http:") ||
+    url.hostname === "" ||
+    url.username !== "" ||
+    url.password !== ""
+  ) {
+    return { url: raw, otherOrigins: [], hosts: [] };
+  }
+  const names = new Set([url.hostname, withoutTrailingDots(url.hostname)]);
+  names.delete("");
+  const hosts = new Set<string>();
+  for (const name of names) {
+    for (const port of new Set([url.port, ""])) hosts.add(port !== "" ? `${name}:${port}` : name);
+  }
+  const schemes = url.protocol === "https:" ? ["https:", "http:"] : ["http:", "https:"];
+  const others = new Set<string>();
+  for (const scheme of schemes) {
+    for (const host of hosts) {
+      const origin = `${scheme}//${host}`;
+      if (origin !== url.origin) others.add(origin);
+    }
+  }
+  return { url: raw, origin: url.origin, otherOrigins: [...others], hosts: [...hosts] };
+}
+
+/** `host` without the root dots at its end, in one pass from the end. */
+function withoutTrailingDots(host: string): string {
+  let end = host.length;
+  while (end > 0 && host.charCodeAt(end - 1) === 0x2e) end--;
+  return host.slice(0, end);
+}
+
+/**
+ * A value of a field declared `service`, read for a call that names the
+ * service: matched with the service's origin in front, so an allow must name
+ * it; a deny or ask also reads it without the origin (what a call naming no
+ * service is read as) and with the origin's other spellings. A URL that
+ * cannot be placed leaves nothing an allow could grant, and every deny or ask
+ * fires.
+ */
+function servedValue(value: OperativeValue, service: ServiceReading): OperativeValue {
+  const own = [...value.canonical, ...(value.spellings ?? [])];
+  const { origin } = service;
+  if (origin === undefined) {
+    return {
+      kind: value.kind,
+      canonical: [],
+      spellings: [...own, service.url],
+      outsideWorkspace: true,
+    };
+  }
+  const at = (o: string, v: string): string => `${o}/${v}`;
+  const others = [...service.otherOrigins, ...service.hosts];
+  const { standsForAny } = value;
+  return {
+    ...value,
+    canonical: value.canonical.map((c) => at(origin, c)),
+    spellings: [
+      ...new Set([...others.flatMap((o) => value.canonical.map((c) => at(o, c))), ...own]),
+    ],
+    ...(standsForAny !== undefined
+      ? {
+          standsForAny: [
+            ...new Set([
+              ...[origin, ...others].flatMap((o) => standsForAny.map((p) => at(o, p))),
+              ...standsForAny,
+            ]),
+          ],
+        }
+      : {}),
+  };
+}
+
+function readValues(input: unknown, arg: OperativeArg): FieldReading[] {
   const segments = arg.field.split(".");
   const out: FieldReading[] = [];
   const topQualifier = arg.within !== undefined ? qualifierOf(input, arg.within) : undefined;

@@ -395,7 +395,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   checkpointList: {
     key: "checkpointList",
@@ -609,7 +609,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   compileBundle: {
     key: "compileBundle",
@@ -3007,7 +3007,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   issueCreate: {
     key: "issueCreate",
@@ -3018,7 +3018,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   issueGet: {
     key: "issueGet",
@@ -3029,7 +3029,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   issueList: {
     key: "issueList",
@@ -3040,7 +3040,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   issueUpdate: {
     key: "issueUpdate",
@@ -3051,7 +3051,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   javascript: {
     key: "javascript",
@@ -3986,7 +3986,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   prComments: {
     key: "prComments",
@@ -3997,7 +3997,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   prCreate: {
     key: "prCreate",
@@ -4008,7 +4008,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   prFiles: {
     key: "prFiles",
@@ -4019,7 +4019,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   prGet: {
     key: "prGet",
@@ -4030,7 +4030,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   prList: {
     key: "prList",
@@ -4041,7 +4041,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   prReviewSubmit: {
     key: "prReviewSubmit",
@@ -4052,7 +4052,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   prReviews: {
     key: "prReviews",
@@ -4063,7 +4063,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   prUpdate: {
     key: "prUpdate",
@@ -4074,7 +4074,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   preflightRun: {
     key: "preflightRun",
@@ -4390,7 +4390,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   },
   releaseGet: {
     key: "releaseGet",
@@ -4401,7 +4401,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   releaseList: {
     key: "releaseList",
@@ -4412,7 +4412,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   removePath: {
     key: "removePath",
@@ -4442,7 +4442,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   retentionEnforce: {
     key: "retentionEnforce",
@@ -4650,7 +4650,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", default: "*", within: "owner" }],
+    operativeArgs: [
+      { field: "repo", kind: "id", default: "*", within: "owner", service: "baseUrl" },
+    ],
   },
   searchIssues: {
     key: "searchIssues",
@@ -4661,7 +4663,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", default: "*", within: "owner" }],
+    operativeArgs: [
+      { field: "repo", kind: "id", default: "*", within: "owner", service: "baseUrl" },
+    ],
   },
   secretLookup: {
     key: "secretLookup",
@@ -5765,7 +5769,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   workflowRunRerun: {
     key: "workflowRunRerun",
@@ -5776,7 +5780,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   workflowRuns: {
     key: "workflowRuns",
@@ -5787,7 +5791,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   },
   workspacePackages: {
     key: "workspacePackages",

@@ -2446,3 +2446,184 @@ describe("the fixed places a tool opens inside its directory (opens)", () => {
     ).not.toThrow();
   });
 });
+
+describe("a value on the service a call names (service)", () => {
+  // codehost's shape: a repository within an owner, on the API in baseUrl
+  // when the call names one, else on the API the tool is set up for.
+  const repoTool = (fieldDefault?: "*") =>
+    buildTool({
+      name: "Repo",
+      description: "d",
+      inputSchema: z.object({
+        owner: fieldDefault === undefined ? z.string() : z.string().optional(),
+        repo: fieldDefault === undefined ? z.string() : z.string().optional(),
+        baseUrl: z.string().optional(),
+        title: z.string().optional(),
+      }),
+      operativeArgs: [
+        {
+          field: "repo",
+          kind: "recipient",
+          within: "owner",
+          service: "baseUrl",
+          ...(fieldDefault !== undefined ? { default: fieldDefault } : {}),
+        },
+      ],
+      destructive: true,
+      execute: async () => "ok",
+    });
+  const decide = (tool: ReturnType<typeof repoTool>, input: unknown) => {
+    const values = operativeValuesFor(tool, input) ?? [];
+    return (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Repo", input, { polarity, operativeValues: values });
+  };
+
+  test("a call that names no service is read as before: an allow names the repository alone", () => {
+    const tool = repoTool();
+    const input = { owner: "acme", repo: "app" };
+    expect(operativeValuesFor(tool, input)).toEqual([
+      { kind: "recipient", canonical: ["acme/app"], spellings: ["app", "acme"] },
+    ]);
+    const match = decide(tool, input);
+    expect(match("Repo(acme/app)", "allow")).toBe(true);
+    expect(match("Repo(**/acme/app)", "allow")).toBe(true);
+    expect(match("Repo(https://ghe.example.com/acme/app)", "allow")).toBe(false);
+    expect(match("Repo(https://ghe.example.com/**)", "restrict")).toBe(false);
+  });
+
+  test("a call that names one is matched with its origin: an allow must name it", () => {
+    const tool = repoTool();
+    const input = { owner: "acme", repo: "app", baseUrl: "https://ghe.example.com/api/v3" };
+    const values = operativeValuesFor(tool, input);
+    expect(values?.[0]?.canonical).toEqual(["https://ghe.example.com/acme/app"]);
+    expect(values?.[1]).toEqual({
+      kind: "url",
+      canonical: ["https://ghe.example.com/api/v3"],
+      spellings: ["https://ghe.example.com/api/v3"],
+      restrictOnly: true,
+    });
+    expect(readOperativeField(input, tool.operativeArgs?.[0] as never)).toEqual([
+      "https://ghe.example.com/acme/app",
+    ]);
+    const match = decide(tool, input);
+    for (const [pattern, allow] of [
+      ["Repo(acme/app)", false],
+      ["Repo(acme/*)", false],
+      ["Repo(*)", false],
+      ["Repo(https://ghe.example.com/acme/app)", true],
+      ["Repo(https://ghe.example.com/acme/*)", true],
+      ["Repo(https://ghe.example.com/**)", true],
+      ["Repo(**/acme/app)", true],
+      ["Repo(**)", true],
+      ["Repo(https://api.github.com/acme/app)", false],
+      ["Repo(http://ghe.example.com/acme/app)", false],
+      ["Repo(ghe.example.com/acme/app)", false],
+    ] as const) {
+      expect({ pattern, allow: match(pattern, "allow") }).toEqual({ pattern, allow });
+    }
+  });
+
+  test("a deny or ask reads the repository on every service, the host and the URL", () => {
+    const tool = repoTool();
+    const input = { owner: "acme", repo: "app", baseUrl: "http://GHE.example.com.:8443/api/v3/" };
+    const match = decide(tool, input);
+    for (const [pattern, fires] of [
+      // the repository written without a host: every service
+      ["Repo(acme/app)", true],
+      ["Repo(app)", true],
+      ["Repo(acme)", true],
+      ["Repo(*)", true],
+      // the host, as a URL, a bare host, another scheme, no port, no root dot
+      ["Repo(https://ghe.example.com/**)", true],
+      ["Repo(http://ghe.example.com:8443/**)", true],
+      ["Repo(ghe.example.com/**)", true],
+      ["Repo(https://ghe.example.com/acme/app)", true],
+      ["Repo(HTTPS://GHE.EXAMPLE.COM/ACME/APP)", true],
+      // the API root itself
+      ["Repo(http://ghe.example.com.:8443/api/v3/**)", true],
+      // somewhere else
+      ["Repo(https://ghe.example.com/other/**)", false],
+      ["Repo(https://evil.example.com/**)", false],
+      ["Repo(other/app)", false],
+    ] as const) {
+      expect({ pattern, fires: match(pattern, "restrict") }).toEqual({ pattern, fires });
+    }
+    // An allow reads the origin as the URL parser writes it, and nothing else.
+    expect(match("Repo(http://ghe.example.com.:8443/acme/app)", "allow")).toBe(true);
+    expect(match("Repo(http://ghe.example.com:8443/acme/app)", "allow")).toBe(false);
+    expect(match("Repo(https://ghe.example.com/acme/app)", "allow")).toBe(false);
+  });
+
+  test("a URL that names no origin a request can go to cannot be placed", () => {
+    const tool = repoTool();
+    for (const baseUrl of [
+      "not a url",
+      "ftp://ghe.example.com/api",
+      "https://user:secret@ghe.example.com/api/v3",
+      "file:///etc/passwd",
+    ]) {
+      const match = decide(tool, { owner: "acme", repo: "app", baseUrl });
+      expect({ baseUrl, allow: match("Repo(**)", "allow") }).toEqual({ baseUrl, allow: false });
+      expect({ baseUrl, deny: match("Repo(nothing-like-it)", "restrict") }).toEqual({
+        baseUrl,
+        deny: true,
+      });
+    }
+  });
+
+  test("a search that names an owner, or nobody, on a service stands for every repository there", () => {
+    const tool = repoTool("*");
+    const ghe = "https://ghe.example.com/api/v3";
+    const owner = decide(tool, { owner: "acme", baseUrl: ghe });
+    expect(owner("Repo(https://ghe.example.com/acme/*)", "allow")).toBe(true);
+    expect(owner("Repo(acme/*)", "allow")).toBe(false);
+    expect(owner("Repo(https://ghe.example.com/acme/secret)", "restrict")).toBe(true);
+    expect(owner("Repo(acme/secret)", "restrict")).toBe(true);
+    expect(owner("Repo(ghe.example.com/acme/secret)", "restrict")).toBe(true);
+    expect(owner("Repo(https://ghe.example.com/other/secret)", "restrict")).toBe(false);
+    const nobody = decide(tool, { baseUrl: ghe });
+    expect(nobody("Repo(https://ghe.example.com/**)", "allow")).toBe(true);
+    expect(nobody("Repo(https://ghe.example.com/*)", "allow")).toBe(false);
+    expect(nobody("Repo(https://ghe.example.com/acme/secret)", "restrict")).toBe(true);
+    expect(nobody("Repo(acme/secret)", "restrict")).toBe(true);
+    expect(nobody("Repo(https://evil.example.com/acme/secret)", "restrict")).toBe(false);
+  });
+
+  test("buildTool refuses a service field it cannot read as a URL", () => {
+    const build =
+      (arg: Record<string, unknown>, extra: Record<string, z.ZodTypeAny> = {}) =>
+      () =>
+        buildTool({
+          name: "Bad",
+          description: "d",
+          inputSchema: z.object({
+            owner: z.string(),
+            repo: z.string(),
+            baseUrl: z.string().optional(),
+            path: z.string().optional(),
+            ...extra,
+          }),
+          operativeArgs: [arg as never],
+          execute: async () => "ok",
+        });
+    expect(build({ field: "path", kind: "path", service: "baseUrl" })).toThrow(
+      /only an "id" or a "recipient"/,
+    );
+    expect(build({ field: "repo", kind: "id", service: "apiRoot" })).toThrow(
+      /has no top-level field "apiRoot"/,
+    );
+    expect(build({ field: "repo", kind: "id", service: "port" }, { port: z.number() })).toThrow(
+      /is not a string/,
+    );
+    expect(
+      build({ field: "repo", kind: "id", service: "roots" }, { roots: z.array(z.string()) }),
+    ).toThrow(/is a list/);
+    expect(build({ field: "repo", kind: "id", within: "owner", service: "owner" })).toThrow(
+      /already used/,
+    );
+    expect(
+      build({ field: "repo", kind: "id", prefix: true, default: "*", service: "baseUrl" }),
+    ).toThrow(/cannot be combined/);
+    expect(build({ field: "repo", kind: "id", within: "owner", service: "baseUrl" })).not.toThrow();
+  });
+});

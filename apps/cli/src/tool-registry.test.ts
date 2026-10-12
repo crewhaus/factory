@@ -1173,6 +1173,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "prefix",
         "relocates",
         "secretRef",
+        "service",
         "shell",
         "source",
         "stdin",
@@ -1183,6 +1184,10 @@ describe("the generated tool manifest matches the tools it describes", () => {
     // command on its input, by name.
     expect(TOOL_FLAGS["runCommand"]?.operativeArgs).toEqual([
       { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ]);
+    // The API a code-host call may name instead of the configured one.
+    expect(TOOL_FLAGS["issueCreate"]?.operativeArgs).toEqual([
+      { field: "repo", kind: "recipient", within: "owner", service: "baseUrl" },
     ]);
   }, 60_000);
 

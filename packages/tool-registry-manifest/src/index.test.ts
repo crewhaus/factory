@@ -186,8 +186,9 @@ describe("the flags table is the manifest without its prose", () => {
   test("operativeArgs are carried, including an empty declaration", () => {
     expect(TOOL_REGISTRY["write"]?.operativeArgs).toEqual([{ field: "path", kind: "path" }]);
     expect(TOOL_REGISTRY["clipboardWrite"]?.operativeArgs).toEqual([]);
+    // The repository, on the API a call names in baseUrl when it names one.
     expect(TOOL_REGISTRY["issueCreate"]?.operativeArgs).toEqual([
-      { field: "repo", kind: "recipient", within: "owner" },
+      { field: "repo", kind: "recipient", within: "owner", service: "baseUrl" },
     ]);
     // A relocating store directory, so an offline reader matches it the way
     // the runtime does: its default is read by a deny or ask only (C004).

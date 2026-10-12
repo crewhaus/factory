@@ -429,7 +429,7 @@ function gitlabState(state: string): string {
 
 export const prList: RegisteredTool = readTool({
   name: "PrList",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'List pull requests (GitLab: merge requests) with author, branches, labels, reviewers and state, filtered by state and branch. Use it to see what is open against a repository without spending a model turn per page, or to find the PR for a branch before acting on it. It returns the normalised record, not the host\'s full payload, and it does not fetch mergeability or check status — PrGet does that for one PR. On GitHub a state of "merged" is not a server-side filter, so the tool asks for closed PRs and keeps the merged ones, which means the page cap applies before the filter.',
   inputSchema: z.object({
@@ -502,7 +502,7 @@ export const prList: RegisteredTool = readTool({
 
 export const prGet: RegisteredTool = readTool({
   name: "PrGet",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'Fetch one pull request in full: state, author, branches, labels, reviewers, mergeability and, unless turned off, a summary of the checks on its head commit. Use it before deciding whether a PR is ready to merge, or to see in one call why it is not. GitHub reports mergeability as null while it computes the merge commit, and that is returned as "computing" rather than folded into false, because treating the two alike closes perfectly mergeable PRs. The check summary is counts plus the failing names; WorkflowRunLogs is what names the failing step.',
   inputSchema: z.object({
@@ -577,7 +577,7 @@ async function checkSummaryFor(
 
 export const prFiles: RegisteredTool = readTool({
   name: "PrFiles",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "List the files a pull request touches, each with its status, added and removed line counts and a length-capped patch. Use it to review a change, or to decide whether a PR is in scope, without fetching the whole diff into context. Files come back sorted by path and the patch of each is clipped to maxPatchChars. Two host limits are passed through rather than hidden: GitHub lists at most 300 files per PR and omits the patch for very large files, and GitLab states no line counts at all, so for GitLab they are counted from the diff and marked countsDerived.",
   inputSchema: z.object({
@@ -641,7 +641,7 @@ export const prFiles: RegisteredTool = readTool({
 
 export const prComments: RegisteredTool = readTool({
   name: "PrComments",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'Read the conversation comments on a pull request, oldest first, with author, timestamp and a length-capped body. Use it to catch up on what has already been said before replying or acting. These are the discussion-thread comments only: the inline comments attached to lines of the diff belong to reviews and come back from PrReviews. On GitLab the endpoint also carries system notes ("changed the description", "added a label"), which are dropped unless includeSystem is set.',
   inputSchema: z.object({
@@ -694,7 +694,7 @@ export const prComments: RegisteredTool = readTool({
 
 export const prReviews: RegisteredTool = readTool({
   name: "PrReviews",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'Read the reviews on a pull request — who approved, who requested changes, and the inline comment threads against the diff. Use it to find out what a reviewer actually objected to before pushing another commit. On GitHub the reviews and their line comments are both returned, threads grouped by their root comment and sorted by path. GitLab has no review object: approvals are reported as approved reviews and discussions as threads, and it has no "changes requested" state at all, so that state never appears for a GitLab project.',
   inputSchema: z.object({
@@ -864,7 +864,7 @@ function gitlabThreads(discussions: readonly unknown[], maxBodyChars: number): R
 
 export const issueList: RegisteredTool = readTool({
   name: "IssueList",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "List issues with their labels, assignees, milestone and comment counts, filtered by state, label and assignee. Use it to triage a backlog or to check whether something has already been reported before opening a duplicate. GitHub's issues endpoint also returns pull requests, which are filtered out here so a count of issues is a count of issues. Bodies are not included — IssueGet returns one issue with its body and comments. Both hosts take the label filter as one comma-separated string, so a label whose own name contains a comma is refused rather than silently filtered as two.",
   inputSchema: z.object({
@@ -927,7 +927,7 @@ export const issueList: RegisteredTool = readTool({
 
 export const issueGet: RegisteredTool = readTool({
   name: "IssueGet",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "Fetch one issue with its body, labels, assignees and, unless turned off, its comments oldest first. Use it to get the full context of a report in a single call rather than a list call followed by a comments call. Bodies and comments are clipped to maxBodyChars, which is stated in the result when it bites. On GitHub the same number addresses a pull request, and asking for one here returns the issue view of it, without the diff or the reviews.",
   inputSchema: z.object({
@@ -990,7 +990,7 @@ export const issueGet: RegisteredTool = readTool({
 
 export const checkRuns: RegisteredTool = readTool({
   name: "CheckRuns",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "List the check runs and commit statuses for a ref, with counts by conclusion and the failing ones named. Use it as the first call when a branch is red, to find out what failed before fetching any logs. For a failing GitHub Actions check the tool then asks for that job and names the step that failed, capped at a few jobs so one red commit cannot become dozens of requests. Non-Actions checks report only what their app published, and on GitLab this returns commit statuses and pipeline jobs, which carry no step list at all.",
   inputSchema: z.object({
@@ -1090,7 +1090,7 @@ export const checkRuns: RegisteredTool = readTool({
 
 export const workflowRuns: RegisteredTool = readTool({
   name: "WorkflowRuns",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "List CI runs for a branch or commit — GitHub Actions workflow runs, or GitLab pipelines — with status, conclusion, event and run number. Use it to find the run id that WorkflowRunLogs needs, or to see whether a branch has ever gone green. Runs come back newest id first and the listing is bounded by the page cap. It reports what the host recorded about each run and does not open any of them; a run's jobs and steps come from CheckRuns or WorkflowRunLogs.",
   inputSchema: z.object({
@@ -1161,7 +1161,7 @@ export const workflowRuns: RegisteredTool = readTool({
 
 export const workflowRunLogs: RegisteredTool = readTool({
   name: "WorkflowRunLogs",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "Read a failed CI run's log and return the actionable part of it: the failing step, the first error line, the host's own error annotations and the tail. Use it instead of downloading a job log, which is routinely tens of thousands of lines of which a handful matter. Without a jobId the tool picks the run's first failed job. Two limits are worth knowing: GitHub serves job logs by redirecting to a storage origin, so that origin has to be allow-listed as well or the call is refused by name, and the log is read under a byte cap, so on a very long job the excerpt is drawn from the capped prefix.",
   inputSchema: z.object({
@@ -1262,7 +1262,7 @@ export const workflowRunLogs: RegisteredTool = readTool({
 
 export const releaseList: RegisteredTool = readTool({
   name: "ReleaseList",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'List a repository\'s releases with their tag, draft and prerelease flags and their assets. Use it to find what has shipped, or to check whether a version was ever published before cutting it again. Releases come back newest first by publication date and each asset carries its name, size and download URL. Drafts are only visible to a token that may see them, so an empty list can mean "none" or "none you can see".',
   inputSchema: z.object({
@@ -1300,7 +1300,7 @@ export const releaseList: RegisteredTool = readTool({
 
 export const releaseGet: RegisteredTool = readTool({
   name: "ReleaseGet",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     'Fetch one release by tag, or the latest one, with its notes and its assets. Use it to read what a version shipped with, or to get an asset\'s download URL. Release notes are clipped to maxBodyChars. GitHub has a real "latest" endpoint, which skips drafts and prereleases; GitLab has none, so with no tag the tool takes the first entry of the release listing instead and says so in the result.',
   inputSchema: z.object({
@@ -1364,7 +1364,7 @@ export const releaseGet: RegisteredTool = readTool({
 
 export const repoGet: RegisteredTool = readTool({
   name: "RepoGet",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "Fetch a repository's default branch, visibility, topics, size, archive state and counts. Use it before any other call that needs the default branch, or to check visibility before writing something a PrComment would publish. Topics come back sorted so the record is stable between calls. The size field is what the host reports — kilobytes on GitHub, bytes on GitLab when statistics are readable — and it is named accordingly rather than converted.",
   inputSchema: z.object({
@@ -1395,7 +1395,7 @@ export const repoGet: RegisteredTool = readTool({
 
 export const compareRefs: RegisteredTool = readTool({
   name: "CompareRefs",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "Compare two refs and return the commits and files between them. Use it to see what a release tag adds over the last one, or what a branch has that main does not, without cloning anything. Commits come back oldest first and files sorted by path, with patches clipped to maxPatchChars. GitHub's compare endpoint returns at most 250 commits and 300 files and states ahead/behind counts; GitLab states neither count, so those fields are simply absent for a GitLab project rather than guessed.",
   inputSchema: z.object({
@@ -1469,7 +1469,7 @@ export const searchCode: RegisteredTool = readTool({
   // Left out, the repository is every one the search reaches: an owner-wide
   // search is read as `owner/*`, so a deny naming any repository of that
   // owner fires on it. See lib/search-scope.ts for how the query is held to it.
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*", service: "baseUrl" }],
   description:
     "Search the host's code index and return the matching paths, paginated. Use it to find where a symbol or string lives across repositories before reading any file. Results are in the host's relevance order by default, which is the answer being asked for; pass order \"path\" to sort them instead. owner and repo are the search's scope, and what a permission rule reads: on GitHub they are added to the query as repo:owner/repo, and a repo:, org: or user: qualifier already in the query must name the same scope in owner (and repo) or the search is refused. Two host limits: GitHub's code search covers the default branch of indexed repositories only and needs a qualifier such as repo: or org:, and GitLab's blob search is per-project here, so it requires owner and repo.",
   inputSchema: z.object({
@@ -1561,7 +1561,7 @@ export const searchCode: RegisteredTool = readTool({
 
 export const searchIssues: RegisteredTool = readTool({
   name: "SearchIssues",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*", service: "baseUrl" }],
   description:
     'Search issues and pull requests across repositories and return them as normalised records. Use it to answer "has anyone reported this" or "what is assigned to me across the org" in one call. Results are in the host\'s relevance order by default; pass order "number" to sort them. GitHub\'s search syntax (is:open, label:) goes in the query verbatim, so a malformed query comes back as the host\'s own 422. owner and repo are the search\'s scope, and what a permission rule reads: on GitHub they are added to the query as repo:owner/repo, and a repo:, org: or user: qualifier already in the query must name the same scope in owner (and repo) or the search is refused. On GitLab the search covers one project when owner and repo are given and the whole instance when neither is.',
   inputSchema: z.object({
@@ -1690,7 +1690,7 @@ export const rateLimitStatus: RegisteredTool = readTool({
 
 export const prCreate: RegisteredTool = writeTool({
   name: "PrCreate",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Open a pull request (GitLab: merge request) from one branch to another. Use it to propose a change the agent has already pushed. This is publicly visible under the token owner's name and it notifies subscribers, so it takes a justification and is not something to retry blindly: a second call with the same branches usually fails as a duplicate rather than creating a second PR. It does not push anything — the source branch must already exist on the host — and it cannot merge.",
   inputSchema: z.object({
@@ -1750,7 +1750,7 @@ export const prCreate: RegisteredTool = writeTool({
 
 export const prUpdate: RegisteredTool = writeTool({
   name: "PrUpdate",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Change an open pull request: its title, body, target branch, state, labels or requested reviewers. Use it to retitle a PR, close one, or put the right labels and reviewers on it. Labels REPLACE the existing set rather than adding to it, which is the host's own semantics and the easy way to wipe labels by accident. Requested reviewers are GitHub-only here, because GitLab's API takes numeric user ids rather than handles; asking for them on a GitLab project is refused rather than silently skipped. Reopening a merged PR is not possible on either host, and this tool never merges one. On GitLab a label name containing a comma is refused, because the host reads the list as one comma-separated string.",
   inputSchema: z.object({
@@ -1869,7 +1869,7 @@ export const prUpdate: RegisteredTool = writeTool({
 
 export const prComment: RegisteredTool = writeTool({
   name: "PrComment",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Post a comment on a pull request's conversation. Use it to report what an automated run found, or to answer a reviewer. The comment is publicly visible under the token owner's name and notifies everyone subscribed to the PR, so it takes a justification; there is no dry-run and no edit-or-create, so calling it twice posts twice. It cannot comment on a specific line of the diff — that is a review comment, which this package does not write.",
   inputSchema: z.object({
@@ -1900,7 +1900,7 @@ export const prComment: RegisteredTool = writeTool({
 
 export const prReviewSubmit: RegisteredTool = writeTool({
   name: "PrReviewSubmit",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Submit a review on a pull request: approve, request changes, or comment. Use it to record an automated verdict where the team already looks for one. This is the most visible write in the package — an approval carries weight in branch protection — so it takes a justification and refuses anything it cannot do faithfully. On GitLab, approve maps to the approval endpoint and comment posts a note, but request-changes has no equivalent and is refused rather than downgraded to a comment that nobody would treat as blocking.",
   inputSchema: z.object({
@@ -1964,7 +1964,7 @@ export const prReviewSubmit: RegisteredTool = writeTool({
 
 export const issueCreate: RegisteredTool = writeTool({
   name: "IssueCreate",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Open an issue with a title, body, labels and assignees. Use it to file what an automated run found somewhere the team will see it. The issue is publicly visible under the token owner's name and notifies watchers, so it takes a justification and has no deduplication: search first with SearchIssues if a repeat run could file the same thing twice. Labels that do not exist are created by GitHub and rejected by GitLab, which is the host's behaviour, not this tool's; on GitLab, where labels travel as one comma-separated string, a label name containing a comma is refused rather than split in two.",
   inputSchema: z.object({
@@ -2010,7 +2010,7 @@ export const issueCreate: RegisteredTool = writeTool({
 
 export const issueUpdate: RegisteredTool = writeTool({
   name: "IssueUpdate",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     'Change an issue: its title, body, state, labels or assignees. Use it to close what has been fixed or to relabel a triaged backlog. Labels REPLACE the existing set rather than adding to it, so a call that means to add one must send the whole list. Closing is as far as it goes: this package does not delete issues, and a closed issue can be reopened with state "open". On GitLab a label name containing a comma is refused, because the host reads the list as one comma-separated string.',
   inputSchema: z.object({
@@ -2076,7 +2076,7 @@ export const issueUpdate: RegisteredTool = writeTool({
 
 export const issueComment: RegisteredTool = writeTool({
   name: "IssueComment",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Post a comment on an issue. Use it to add a finding or a status update to an existing report. The comment is publicly visible under the token owner's name and notifies subscribers, so it takes a justification; it always creates a new comment, so a loop that calls it on every run will produce one comment per run. On GitHub an issue number and a PR number share a namespace, so this will comment on a pull request too — PrComment says so in its name.",
   inputSchema: z.object({
@@ -2107,7 +2107,7 @@ export const issueComment: RegisteredTool = writeTool({
 
 export const releaseCreate: RegisteredTool = writeTool({
   name: "ReleaseCreate",
-  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
   description:
     "Publish a release for an existing tag, with a name and notes. Use it as the last step of a release job once the tag is pushed. A published release is visible immediately and, on GitHub, notifies everyone watching releases, so it takes a justification; publishing over an existing tag fails rather than overwriting it. It does not create the tag and it does not upload assets — GitHub takes those on a separate upload origin that this package deliberately does not reach.",
   inputSchema: z.object({
@@ -2151,7 +2151,7 @@ export const releaseCreate: RegisteredTool = writeTool({
 
 export const workflowRunRerun: RegisteredTool = writeTool({
   name: "WorkflowRunRerun",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }],
   description:
     "Re-run a CI run, or just its failed jobs. Use it when a run failed for a reason already fixed elsewhere, or on a flake that a second attempt settles. It spends the repository's CI minutes and posts a new run under the token owner's name, so it takes a justification and is not a retry loop to leave unattended. failedOnly is GitHub's rerun-failed-jobs endpoint; GitLab's retry always re-runs the failed jobs of a pipeline, so the flag makes no difference there and the result says which behaviour applied.",
   inputSchema: z.object({

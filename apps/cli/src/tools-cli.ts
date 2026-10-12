@@ -1584,6 +1584,7 @@ export type OperativeArgLike = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  readonly service?: string;
   readonly relocates?: true;
   readonly env?: string;
   readonly stdin?: string;
@@ -1664,6 +1665,13 @@ export function operativeArgWords(arg: OperativeArgLike): string {
         `run in the directory in ${arg.within}; a scoped allow covers it only in the workspace root`,
       );
     } else parts.push(`matched as ${arg.within}/${arg.field.split(".").pop() ?? arg.field}`);
+  }
+  if (arg.service !== undefined) {
+    const leaf = arg.field.split(".").pop() ?? arg.field;
+    const value = arg.within !== undefined ? `${arg.within}/${leaf}` : leaf;
+    parts.push(
+      `on a call that names ${arg.service}, matched as https://host/${value} with that URL's origin, and a deny or ask also reads the URL`,
+    );
   }
   if (arg.shell === true) {
     parts.push(

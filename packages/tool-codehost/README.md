@@ -76,6 +76,28 @@ One caveat worth knowing before a CI-log call: GitHub serves job logs by redirec
 origin. That origin has to be allow-listed too, or `WorkflowRunLogs` is refused by name — which is
 the correct outcome, just one that is easier to fix when you were expecting it.
 
+## What a permission rule reads
+
+A rule names a repository: `alwaysAllow IssueCreate(acme/app)`, `PrList(acme/*)`. That covers a
+call that names no `baseUrl`, which goes to the API this `tool_config` is set up for, so a spec
+with one host writes its rules this way.
+
+A call that names its own `baseUrl` is matched with that URL's origin in front:
+`https://ghe.example.com/acme/app` for `https://ghe.example.com/api/v3` (on github.com, whose API is
+`api.github.com`, that is `https://api.github.com/acme/app`). In a spec that allow-lists more than
+one host:
+
+- an allow names the host it means: `IssueCreate(https://ghe.example.com/acme/*)`, or
+  `IssueCreate(**/acme/app)` for that repository on any host;
+- a deny on a host fires on every call to it: `alwaysDeny IssueCreate(https://ghe.example.com/**)`,
+  also written `ghe.example.com/**`, or with the other scheme or another port;
+- a deny that names no host, `alwaysDeny IssueCreate(acme/secret)`, fires on every host.
+
+A call's `host` picks the dialect, and with `base_url` set it does not move the call. Without
+`base_url`, `host: "gitlab"` sends a call to gitlab.com, which a rule reads as naming no
+`baseUrl`. So a spec that allow-lists both github.com and gitlab.com should set `base_url`: the
+other host is then reached only by naming its `baseUrl`.
+
 ## The tools
 
 ### Read — `readOnly`, `scope: "external"`, `ioCapability: "network"`

@@ -273,6 +273,12 @@ function scalarFieldShape(inputSchema: unknown, name: string): string | undefine
     : `field "${name}" is not a string or a number`;
 }
 
+/** The schema of top-level field `name` (callers have checked it exists). */
+function fieldOf(inputSchema: unknown, name: string): unknown {
+  const shape = (zodDef(unwrapZod(inputSchema))["shape"] as () => Record<string, unknown>)();
+  return shape[name];
+}
+
 /**
  * Why `name` cannot switch a walk into hidden names, or `undefined` when it
  * can: it must be a top-level boolean field.
@@ -483,6 +489,29 @@ function checkOperativeArgs(
         );
       }
     }
+    const { service } = arg;
+    if (service !== undefined) {
+      if (kind !== "id" && kind !== "recipient") {
+        fail(
+          `${at}.service: only an "id" or a "recipient" lives on a service a call can name; a "${kind}" value is read as it is`,
+        );
+      }
+      if (prefix !== undefined || secretRef !== undefined || relocates !== undefined) {
+        fail(`${at}.service cannot be combined with prefix, secretRef or relocates`);
+      }
+      if (typeof service !== "string" || !/^[A-Za-z_$][\w$]*$/.test(service)) {
+        fail(`${at}.service must name one top-level input field, e.g. "baseUrl"`);
+      }
+      if (service === field || service === within) {
+        fail(`${at}.service names "${service}", which is already used`);
+      }
+      const holds = scalarFieldShape(inputSchema, service);
+      if (holds !== undefined || leafShape(fieldOf(inputSchema, service)) !== "string") {
+        fail(
+          `${at}.service: the input schema ${holds ?? `field "${service}" is not a string`}; it must hold the URL of the API the call is sent to`,
+        );
+      }
+    }
     const { source } = arg;
     if (source !== undefined && source !== true) fail(`${at}.source is either true or left out`);
     const { shell } = arg;
@@ -532,6 +561,7 @@ function checkOperativeArgs(
         kind,
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
+        ...(service !== undefined ? { service } : {}),
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
         ...(stdin !== undefined ? { stdin } : {}),

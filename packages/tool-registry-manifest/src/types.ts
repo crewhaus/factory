@@ -19,6 +19,8 @@ export type RegistryOperativeArg = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  /** For an `id` or `recipient`: the field holding the URL of the API a call may name instead of the tool's own. */
+  readonly service?: string;
   /** The field only moves the tool; its default is read by a deny or ask. */
   readonly relocates?: true;
   /** For a `command`: the field holding the environment its call sets. */
@@ -135,6 +137,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     kind: arg.kind,
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
+    ...(arg.service !== undefined ? { service: arg.service } : {}),
     ...(arg.relocates === true ? { relocates: true as const } : {}),
     ...(arg.env !== undefined ? { env: arg.env } : {}),
     ...(arg.stdin !== undefined ? { stdin: arg.stdin } : {}),

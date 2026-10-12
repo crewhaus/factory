@@ -4065,7 +4065,13 @@ describe("crewhaus tools show / list — names and bad categories", () => {
     const json = await runCli(["tools", "show", "issueCreate", "--json"]);
     expect(JSON.parse(json.stdout).rules).toEqual({
       kind: "args",
-      args: [{ field: "repo", words: "a recipient; matched as owner/repo" }],
+      args: [
+        {
+          field: "repo",
+          words:
+            "a recipient; matched as owner/repo; on a call that names baseUrl, matched as https://host/owner/repo with that URL's origin, and a deny or ask also reads the URL",
+        },
+      ],
       example: { type: "alwaysAllow", pattern: "IssueCreate(acme/*)" },
     });
   }, 30_000);

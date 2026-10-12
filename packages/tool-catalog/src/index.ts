@@ -266,6 +266,26 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * directory declares it this way; without it, the directory is invisible to
  * every rule.
  *
+ * `service`, for an `id` or `recipient`, names a top-level field holding the
+ * root URL of the API the tool sends the call to, for a tool that reaches
+ * the service it is set up for unless the call names another (codehost's
+ * `baseUrl`, a Chat tool's `apiBaseUrl`). A call that names one acts on the
+ * value on THAT service, so the value is matched with the URL's origin in
+ * front: `{ field: "repo", kind: "recipient", within: "owner", service:
+ * "baseUrl" }` is matched as `https://ghe.example.com/acme/app` for a call
+ * to `https://ghe.example.com/api/v3`. An allow must then name the origin
+ * (`IssueCreate(https://ghe.example.com/acme/*)`, or `IssueCreate(**` +
+ * `/acme/app)` for any), and one that names none (`IssueCreate(acme/app)`)
+ * covers only a call that leaves the field out, which goes to the service
+ * the tool is set up for. A deny or ask also reads the URL as a URL
+ * (`alwaysDeny IssueCreate(https://ghe.example.com/**)`), and the value
+ * without the origin, so `alwaysDeny IssueCreate(acme/app)` fires on every
+ * service, and after the host alone (`IssueCreate(ghe.example.com/**)`), the
+ * origin without a root dot, without its port and over the other of http
+ * and https. A URL that names no http or https origin, or carries a user
+ * name or password, cannot be placed: no allow grants the call, and every
+ * deny or ask fires.
+ *
  * `relocates: true` marks a `path` field that only moves the tool off its
  * usual place: the store its other operative fields name a record in
  * (`stateDir`, `registryDir`, `evalsDir`), or the repository a branch
@@ -442,6 +462,7 @@ export type OperativeArg = {
   readonly kind: OperativeArgKind;
   readonly default?: string;
   readonly within?: string;
+  readonly service?: string;
   readonly relocates?: true;
   readonly env?: string;
   readonly stdin?: string;
