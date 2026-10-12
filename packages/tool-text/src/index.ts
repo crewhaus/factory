@@ -658,6 +658,8 @@ export const glossaryReplace: RegisteredTool = buildTool({
       input.mapping,
       input.wholeWord ?? true,
       input.caseSensitive ?? false,
+      // What the mapping may grow the text to: the limit for the text itself.
+      MAX_INPUT_CHARS,
     );
     return json({ text: out.text, replacements: out.replacements });
   },

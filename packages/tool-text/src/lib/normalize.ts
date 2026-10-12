@@ -132,27 +132,69 @@ export function sortLines(text: string, opts: SortOptions): string[] {
   return opts.order === "desc" ? sorted.reverse() : sorted;
 }
 
+/** GlossaryReplace's limit for its text: the default for what the mapping may grow it to. */
+const GLOSSARY_LIMIT = 2_000_000;
+
+/**
+ * Each term is one pass over the whole text, so the passes together may
+ * read this many times the limit: thousands of terms over a long document,
+ * or a hundred over the longest text.
+ */
+const GLOSSARY_PASSES_PER_LIMIT = 100;
+
 /**
  * Replace terms using operator-supplied mappings, longest term first so a
  * multi-word entry wins over a substring of itself. Whole-word by default,
  * which is what stops "AI" rewriting the middle of "CHAIN".
+ *
+ * Each term's pass also runs over what earlier terms put in, so a
+ * replacement that holds the next term many times multiplied the text once
+ * per term: a 382-byte call grew it to 639,999 characters, and a fifth term
+ * to 12.8 million. The text may grow to `limit`, and the passes together may
+ * read {@link GLOSSARY_PASSES_PER_LIMIT} times it; past either this throws
+ * a sentence that says which, never a cut text.
  */
 export function glossaryReplace(
   text: string,
   mapping: Readonly<Record<string, string>>,
   wholeWord: boolean,
   caseSensitive: boolean,
+  limit: number = GLOSSARY_LIMIT,
 ): { text: string; replacements: Record<string, number> } {
   const replacements: Record<string, number> = {};
+  const terms = Object.keys(mapping).sort((a, b) => b.length - a.length);
+  const budget = GLOSSARY_PASSES_PER_LIMIT * limit;
   let out = text;
-  for (const term of Object.keys(mapping).sort((a, b) => b.length - a.length)) {
+  let read = 0;
+  for (const term of terms) {
+    if (read + out.length > budget) {
+      throw new Error(
+        `${terms.length} glossary terms over ${out.length} characters of text would read more than ${budget} characters, since each term is a pass over the whole text; send fewer terms or a shorter text`,
+      );
+    }
+    read += out.length;
     const escaped = escapeFor(term, "regex");
     const source = wholeWord ? `(?<![\\w-])${escaped}(?![\\w-])` : escaped;
     const re = new RegExp(source, caseSensitive ? "g" : "gi");
+    // What the replacer returned before: a missing value reads "undefined".
+    const value = String(mapping[term]);
+    const before = out.length;
     let count = 0;
-    out = out.replace(re, () => {
+    let grown = 0;
+    out = out.replace(re, (match: string) => {
       count++;
-      return mapping[term] as string;
+      // Every match of one term is as long as the term (a pattern of
+      // literal units matches one unit each, case folded or not), so the
+      // growth only rises or only falls: once past the limit, the whole
+      // pass ends past it. Throwing here stops the replace before it
+      // builds that text.
+      grown += value.length - match.length;
+      if (grown > 0 && before + grown > limit) {
+        throw new Error(
+          `the glossary would make the text longer than ${limit} characters, the limit for text; terms apply longest first, each to the text the ones before produced, so a replacement that holds a later term is replaced again`,
+        );
+      }
+      return value;
     });
     if (count > 0) replacements[term] = count;
   }
