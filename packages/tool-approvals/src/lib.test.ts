@@ -491,6 +491,34 @@ describe("toRow", () => {
     expect([row.operativeField, row.operativeValue]).toEqual(["name", "main"]);
   });
 
+  // A path that leaves the directory it is relative to (a formatter's or
+  // git's `paths` under `cwd`) is read as outside the workspace, but shown
+  // joined to that directory: `../x.ts` alone does not say what it climbs
+  // from, and with `link -> secrets/deep` that is the whole question.
+  test("a path that leaves its directory is shown with the directory it climbs from", () => {
+    expect(operativeOf("Format", { cwd: "link", paths: ["../x.ts"] })).toEqual({
+      field: "paths",
+      value: "link/../x.ts",
+    });
+    expect(operativeOf("GitAdd", { cwd: "packages/a", paths: ["../b/x.ts"] })).toEqual({
+      field: "paths",
+      value: "packages/a/../b/x.ts",
+    });
+    // An absolute one is shown as written, and an ordinary one as before.
+    expect(operativeOf("Format", { cwd: "src", paths: ["/etc/hosts"] })).toEqual({
+      field: "paths",
+      value: "/etc/hosts",
+    });
+    expect(operativeOf("Format", { cwd: "src", paths: ["x.ts"] })).toEqual({
+      field: "paths",
+      value: "src/x.ts",
+    });
+    const row = toRow(
+      approval({ toolName: "Lint", input: { cwd: "link", paths: ["../x.ts"] } }) as never,
+    );
+    expect([row.operativeField, row.operativeValue]).toEqual(["paths", "link/../x.ts"]);
+  });
+
   test("a builtin with no scoping argument shows none, even when a table name would match", () => {
     expect(operativeOf("ClipboardWrite", { text: "x" })).toEqual({ field: null, value: null });
   });

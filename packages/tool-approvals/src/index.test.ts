@@ -218,6 +218,24 @@ describe("ApprovalStatus", () => {
     });
   });
 
+  test("a parked path that leaves its directory shows the directory it climbs from", async () => {
+    // With `link -> secrets/deep`, the formatter run in `link` reads `../x.ts`
+    // as secrets/x.ts: `../x.ts` alone hides exactly what the approver needs.
+    writeApprovals(tmp, [
+      approval({
+        id: approvalId(1),
+        toolName: "Format",
+        input: { cwd: "link", paths: ["../x.ts"] },
+      }),
+    ]);
+    const out = await callJson(approvalStatus, { approvalId: approvalId(1) });
+    expect(out["approval"]).toMatchObject({
+      toolName: "Format",
+      operativeField: "paths",
+      operativeValue: "link/../x.ts",
+    });
+  });
+
   test("an id the ledger does not hold is a clean false — the ledger WAS read", async () => {
     writeApprovals(tmp, [approval({ id: approvalId(1) })]);
     const out = await callJson(approvalStatus, { approvalId: approvalId(2) });

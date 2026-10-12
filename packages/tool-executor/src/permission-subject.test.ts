@@ -710,6 +710,16 @@ describe("url, command and id values", () => {
         outsideWorkspace: true,
       },
     ]);
+    // Shown (an approval row, a card) joined to its directory all the same,
+    // so an approver sees what the `..` climbs from; an absolute path as is.
+    const paths = { field: "paths", kind: "path", within: "cwd" } as const;
+    expect(readOperativeField({ cwd: "link", paths: ["../x.ts"] }, paths)).toEqual([
+      "link/../x.ts",
+    ]);
+    expect(readOperativeField({ cwd: "src", paths: ["/etc/passwd"] }, paths)).toEqual([
+      "/etc/passwd",
+    ]);
+    expect(readOperativeField({ paths: ["link/../x.ts"] }, paths)).toEqual(["link/../x.ts"]);
     // One such entry flags only itself: its neighbour is read as before.
     expect(vals({ cwd: "src", paths: ["a.ts", "../b.ts"] }).map((v) => v.canonical[0])).toEqual([
       "src/a.ts",

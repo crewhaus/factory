@@ -237,8 +237,8 @@ export function operativeValuesOf(
             values.push(...everyPathValues(dir ?? ".", canonicalizePath));
             break;
           }
-          if (leavesDir === true) {
-            values.push(leavingValue(raw, dir));
+          if (leavesDir !== undefined) {
+            values.push(leavingValue(raw, leavesDir.written));
             break;
           }
           const read = canonicalizePath(raw);
@@ -383,9 +383,11 @@ type FieldReading = {
   /**
    * A `path` declared `within` a directory whose value is absolute or has a
    * `..` segment: where it lands cannot be read off the directory's values.
-   * See {@link leavesItsDirectory}.
+   * `written` is the path as the call wrote it; `value` stays joined to the
+   * directory, as for any other path, so a row shows where the `..` climbs
+   * from. See {@link leavesItsDirectory}.
    */
-  readonly leavesDir?: true;
+  readonly leavesDir?: { readonly written: string };
   readonly unqualified?: ReadonlyArray<string>;
   /** The field was left out and its default `*` stands for every value. */
   readonly every?: true;
@@ -412,7 +414,9 @@ function namesWorkspaceRoot(values: ReadonlyArray<OperativeValue>): boolean {
  * Every value of one declared field. Dots descend into objects; an array
  * anywhere on the way is walked element by element — except a `command`
  * field that IS an array of strings, which is one argv and is joined. A
- * field declared `within` another comes back as `<qualifier>/<value>`.
+ * field declared `within` another comes back as `<qualifier>/<value>` — a
+ * `..` path too, so a row shows the directory it climbs from — and an
+ * absolute path as it is.
  */
 export function readOperativeField(input: unknown, arg: OperativeArg): string[] {
   return readField(input, arg).map((r) => r.value);
@@ -483,7 +487,9 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     // A path within a directory the call left out is relative to the root,
     // and handed on as written all the same.
     if (arg.kind === "path" && arg.within !== undefined && !every) {
-      return out.map((r) => (leavesItsDirectory(r.value) ? { ...r, leavesDir: true } : r));
+      return out.map((r) =>
+        leavesItsDirectory(r.value) ? { ...r, leavesDir: { written: r.value } } : r,
+      );
     }
     // The qualifier is left out as well: a code search with no owner reaches
     // every repository, so the value stands for every `<owner>/<repo>` too.
@@ -499,7 +505,12 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
       // A git command given no path acts on the whole repository, wherever
       // it runs: its default is the workspace root, not the directory.
       if (r.defaulted === true && arg.defaultAtRoot === true) return r;
-      if (leavesItsDirectory(r.value)) return { ...r, leavesDir: true, dir: qualifier };
+      // One that leaves it is still shown joined to it — an approver needs to
+      // see what `..` climbs from — but not read that way (`leavingValue`).
+      if (leavesItsDirectory(r.value)) {
+        const value = isAbsolutePath(r.value) ? r.value : `${qualifier}/${r.value}`;
+        return { ...r, value, leavesDir: { written: r.value } };
+      }
       return { ...r, value: `${qualifier}/${r.value}` };
     }
     return {
@@ -602,11 +613,12 @@ function leavesItsDirectory(value: string): boolean {
  * on it. Every builtin that declares such a field refuses the path itself;
  * this keeps a rule about another place from granting it to a tool that does
  * not. The spellings are the path as written, and joined to the directory as
- * written.
+ * written (`joined`, the reading's value; the same string when the call gave
+ * no directory or the path is absolute).
  */
-function leavingValue(raw: string, dir: string | undefined): OperativeValue {
-  const joined = dir === undefined || isAbsolutePath(raw) ? [] : [`${dir}/${raw}`];
-  return { kind: "path", canonical: [], spellings: [raw, ...joined], outsideWorkspace: true };
+function leavingValue(joined: string, written: string): OperativeValue {
+  const spellings = joined === written ? [written] : [written, joined];
+  return { kind: "path", canonical: [], spellings, outsideWorkspace: true };
 }
 
 /**
