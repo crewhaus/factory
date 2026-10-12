@@ -1169,6 +1169,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "glob",
         "hiddenWhen",
         "kind",
+        "opens",
         "prefix",
         "relocates",
         "secretRef",

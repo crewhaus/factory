@@ -48,11 +48,11 @@ describe("operativeArgWords — a declaration in words", () => {
       ],
       [
         { field: "refs", kind: "id", secretRef: true },
-        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in",
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, the .env files and secrets directory a bare NAME is looked up in, and the .env files an env: one's environment is loaded from",
       ],
       [
         { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
-        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in; where the value is taken from: a deny or ask reads it, an allow need not name it",
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, the .env files and secrets directory a bare NAME is looked up in, and the .env files an env: one's environment is loaded from; where the value is taken from: a deny or ask reads it, an allow need not name it",
       ],
       [
         { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
@@ -69,6 +69,18 @@ describe("operativeArgWords — a declaration in words", () => {
       [
         { field: "pattern", kind: "path", glob: true },
         "a path pattern, which stands for every path it can list",
+      ],
+      [
+        {
+          field: "dir",
+          kind: "path",
+          default: ".",
+          opens: [
+            { path: ".crewhaus/sessions", beneath: "all" },
+            { path: ".crewhaus/settings.json" },
+          ],
+        },
+        "a path; a deny or ask also reads what it opens inside: .crewhaus/sessions/**, .crewhaus/settings.json; left out, the workspace root",
       ],
       [
         { field: "path", kind: "path", default: ".", beneath: "visible" },

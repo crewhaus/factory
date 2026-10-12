@@ -337,9 +337,21 @@ function noteStoreHealth(unknowns: Unknowns, store: StoreRead, probe: string): v
 // ApprovalStatus — one harness
 // ---------------------------------------------------------------------------
 
+/**
+ * The ledger an approvals reader opens inside a harness directory. A deny
+ * naming it (or the sessions directory around it) fires on a call that
+ * reads it. The `.env` files a missing ledger sends the reader to are left
+ * out: it reads them only for whether they move the session root, and says
+ * no more about them than that.
+ */
+const LEDGER_OPENED = [{ path: `${SESSIONS_SUBDIR}/${APPROVALS_FILENAME}` }] as const;
+
+/** The harness's own permission rules, which PermissionsSuggest diffs against. */
+const SETTINGS_RELPATH = ".crewhaus/settings.json";
+
 export const approvalStatus: RegisteredTool = buildTool({
   name: "ApprovalStatus",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", opens: LEDGER_OPENED }],
   description:
     "Read one harness's tool-approval ledger: what is parked waiting for a human right now, what was decided, when and by whom. Use to answer 'is this harness blocked on me?' before assuming a quiet run is a finished one — a run under `permissions.ask_mode: pause` stops silently and waits. Pass `approvalId` for one record in full. This is a pure read: it never grants, denies, expires or compacts anything, so polling it is free of side effects. An approvals log that cannot be read is reported as UNKNOWN, never as an empty inbox.",
   inputSchema: z.object({
@@ -501,7 +513,7 @@ export const approvalsInbox: RegisteredTool = buildTool({
   name: "ApprovalsInbox",
   // The harnesses named, or the directory walked for them.
   operativeArgs: [
-    { field: "harnesses", kind: "path" },
+    { field: "harnesses", kind: "path", opens: LEDGER_OPENED },
     { field: "root", kind: "path", default: ".", beneath: "all" },
   ],
   description:
@@ -861,7 +873,15 @@ function rowAsRecord(row: InboxRow): ApprovalRecord & { readonly harness: string
 
 export const permissionsSuggest: RegisteredTool = buildTool({
   name: "PermissionsSuggest",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  // Every session log under the harness, and the rules already in force.
+  operativeArgs: [
+    {
+      field: "dir",
+      kind: "path",
+      default: ".",
+      opens: [{ path: SESSIONS_SUBDIR, beneath: "all" }, { path: SETTINGS_RELPATH }],
+    },
+  ],
   description:
     "Mine a harness's own ask/deny history into permission rules that would stop the re-asking, each verified to match ONLY the call it was derived from. Recurring asks a human always approved become an `alwaysAllow` proposal; recurring DENIED asks become an `alwaysAsk` tightening, never a blanket deny. This tool PROPOSES and writes nothing — applying a rule is `crewhaus permissions suggest --apply`, which is always an interactive human confirm, because an agent must never widen its own permissions. Rules built from observed values are glob-escaped and then checked against the real permission matcher; any rule that would also match a value the human never approved is refused and reported in `rejected`, not suggested.",
   inputSchema: z.object({
@@ -913,11 +933,7 @@ export const permissionsSuggest: RegisteredTool = buildTool({
     if (!dir.ok) return dir.message;
     const sessionsDir = containedChild("PermissionsSuggest", dir.value.rel, SESSIONS_SUBDIR);
     if (!sessionsDir.ok) return sessionsDir.message;
-    const settingsPath = containedChild(
-      "PermissionsSuggest",
-      dir.value.rel,
-      ".crewhaus/settings.json",
-    );
+    const settingsPath = containedChild("PermissionsSuggest", dir.value.rel, SETTINGS_RELPATH);
     if (!settingsPath.ok) return settingsPath.message;
 
     const unknowns = new Unknowns();

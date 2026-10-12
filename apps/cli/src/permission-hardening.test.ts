@@ -1167,6 +1167,492 @@ describe("critic8 — a secret reference is read where its file lands", () => {
   }, 60_000);
 });
 
+// critic9 (0.7.1): tools that open fixed files inside the directory they are
+// given declared the directory alone, as one point. PermissionsSuggest mined
+// every session log, and ApprovalStatus returned what parked calls carried,
+// under `alwaysDeny *(.crewhaus/sessions/**)`, while EventQuery under the same
+// rule was denied. They declare what they open (`opens`).
+describe("critic9 — a harness's own records a tool opens inside its directory", () => {
+  const MARK = "PRIVATE-PLAN-zq9";
+  beforeEach(async () => {
+    const sessions = join(ws, ".crewhaus", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(join(ws, "secrets"));
+    const lines: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      lines.push(
+        JSON.stringify({
+          kind: "tool_use",
+          payload: { name: "Read", input: { path: `${MARK}.md` } },
+        }),
+        JSON.stringify({
+          kind: "permission",
+          payload: { toolName: "Read", decision: "ask", askOutcome: "approved" },
+        }),
+      );
+    }
+    writeFileSync(join(sessions, "sess_private.jsonl"), `${lines.join("\n")}\n`);
+    const input = { path: `${MARK}.md` };
+    await createPendingApprovalStore({ rootDir: sessions }).persist({
+      id: "appr_0123456789abcdef",
+      toolName: "Read",
+      inputHash: hashApprovalInput("Read", input),
+      input,
+      runId: "run_private",
+      sessionId: "sess_private",
+      surface: "single-turn",
+      createdAt: new Date().toISOString(),
+    });
+  });
+  const leaked = () => (lastResult ?? "").includes(MARK);
+
+  /** [tool, its ordinary call, the files it opens there] */
+  const readers: ReadonlyArray<readonly [string, Record<string, unknown>, ReadonlyArray<string>]> =
+    [
+      [
+        "PermissionsSuggest",
+        {},
+        [".crewhaus/sessions/sess_private.jsonl", ".crewhaus/settings.json"],
+      ],
+      ["ApprovalStatus", {}, [".crewhaus/sessions/approvals.jsonl"]],
+      ["ApprovalsInbox", { harnesses: ["."] }, [".crewhaus/sessions/approvals.jsonl"]],
+      ["EvalHistory", {}, [".crewhaus/evals/index.jsonl", ".crewhaus/evals/baselines.json"]],
+      [
+        "WatchmeReport",
+        {},
+        [".crewhaus/watchme/observations.jsonl", ".crewhaus/routing/arms.jsonl"],
+      ],
+      [
+        "RouteControl",
+        { action: "status", justification: "permission hardening: read the routing store" },
+        [".crewhaus/routing/arms.jsonl", ".crewhaus/routing/freeze.json"],
+      ],
+      ["HooksManage", { action: "list" }, [".crewhaus/settings.json"]],
+    ];
+
+  test("a deny on a file the tool opens fires on its ordinary call; one elsewhere does not", async () => {
+    for (const [name, input, files] of readers) {
+      for (const file of files) {
+        const rs = rules(["alwaysDeny", `${name}(${file})`], ["alwaysAllow", name]);
+        const got = await gate(name, input, rs);
+        expect({ name, file, got, leaked: leaked() }).toEqual({
+          name,
+          file,
+          got: "deny",
+          leaked: false,
+        });
+      }
+      // Control: a deny about a place it does not open stays quiet, and it
+      // runs. ApprovalsInbox reads its `root` default whatever harnesses the
+      // call names, a walk of the workspace a deny anywhere in it meets.
+      if (name === "ApprovalsInbox") continue;
+      const elsewhere = rules(["alwaysDeny", `${name}(secrets/**)`], ["alwaysAllow", name]);
+      const got = await gate(name, input, elsewhere);
+      expect({ name, got, ran: lastResult !== undefined }).toEqual({
+        name,
+        got: "allow",
+        ran: true,
+      });
+    }
+    // The two that carried the parked call's argument back said so unruled.
+    await gate("ApprovalStatus", {}, rules(["alwaysAllow", "ApprovalStatus"]));
+    expect(leaked()).toBe(true);
+    await gate("PermissionsSuggest", {}, rules(["alwaysAllow", "PermissionsSuggest"]));
+    expect(leaked()).toBe(true);
+  }, 120_000);
+
+  test("a deny on the session store holds in every mode, as it does for EventQuery", async () => {
+    for (const mode of ["default", "auto", "plan"] as const) {
+      for (const name of ["PermissionsSuggest", "ApprovalStatus", "EventQuery"]) {
+        const deny = "*(.crewhaus/sessions/**)";
+        const rs =
+          mode === "default"
+            ? rules(["alwaysDeny", deny], ["alwaysAllow", name])
+            : rules(["alwaysDeny", deny]);
+        const got = await gate(name, {}, rs, mode);
+        expect({ mode, name, got, leaked: leaked() }).toEqual({
+          mode,
+          name,
+          got: "deny",
+          leaked: false,
+        });
+      }
+    }
+    // A harness named by a path that climbs back to it is read the same way.
+    const rs = rules(
+      ["alwaysDeny", "ApprovalStatus(.crewhaus/sessions/**)"],
+      ["alwaysAllow", "ApprovalStatus"],
+    );
+    expect(await gate("ApprovalStatus", { dir: "src/.." }, rs)).toBe("deny");
+    // An allow on the harness directory still covers the ordinary call.
+    expect(
+      await gate("PermissionsSuggest", {}, rules(["alwaysAllow", "PermissionsSuggest(.)"])),
+    ).toBe("allow");
+    expect(
+      await gate("ApprovalStatus", { dir: "src" }, rules(["alwaysAllow", "ApprovalStatus(src)"])),
+    ).toBe("allow");
+  }, 60_000);
+});
+
+// critic9 (0.7.1): three tools copied a file's content somewhere a rule never
+// looked. IndexBuild's `paths`, DatasetPut's `path`, EmailSend's attachments
+// (and InvoiceRender's templateFile, RunTests' paths) were declared by no
+// rule, beside fields that were, so under `alwaysDeny *(secrets/**)`
+// IndexBuild indexed secrets/prod.env for IndexSearch to return, DatasetPut
+// wrote it into the registry, and EmailSend's rule layer allowed attaching it.
+describe("critic9 — a file a tool copies content from is read by a deny", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  beforeEach(() => {
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.env"), `API_KEY=${SECRET}\n`);
+    writeFileSync(
+      join(ws, "secrets", "golden.jsonl"),
+      `${JSON.stringify({ id: "s1", input: SECRET, expected: "x" })}\n`,
+    );
+    writeFileSync(join(ws, "secrets", "t.html"), `<p>${SECRET}</p>\n`);
+    writeFileSync(
+      join(ws, "src", "golden.jsonl"),
+      `${JSON.stringify({ id: "s1", input: "public", expected: "x" })}\n`,
+    );
+    writeFileSync(join(ws, "src", "t.html"), "<p>{{number}}</p>\n");
+    writeFileSync(join(ws, "README.md"), "hello\n");
+  });
+  const denies = (name: string) => [
+    "*(secrets/**)",
+    `${name}(secrets/**)`,
+    `${name}(secrets/prod.env)`,
+  ];
+
+  test("IndexBuild: a denied file is not indexed, so IndexSearch cannot return it", async () => {
+    for (const deny of denies("IndexBuild")) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "IndexBuild"]);
+      const input = { name: "corpus", paths: ["src/app.ts", "secrets/prod.env"] };
+      expect({ deny, got: await gate("IndexBuild", input, rs) }).toEqual({ deny, got: "deny" });
+    }
+    await gate(
+      "IndexSearch",
+      { name: "corpus", query: "API_KEY", snippetChars: 80 },
+      rules(["alwaysAllow", "IndexSearch"]),
+    );
+    expect(lastResult ?? "").not.toContain(SECRET);
+    // Control: a corpus beside it is built, and an allow on the index name
+    // still covers a call whose files it does not name.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "IndexBuild(corpus)"]);
+    expect(
+      await gate("IndexBuild", { name: "corpus", paths: ["src/app.ts", "README.md"] }, rs),
+    ).toBe("allow");
+    expect(lastResult ?? "").toContain('"documents":2');
+  }, 60_000);
+
+  test("DatasetPut: a version is never written from a denied file", async () => {
+    for (const deny of denies("DatasetPut").map((d) => d.replace("prod.env", "golden.jsonl"))) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "DatasetPut"]);
+      const input = { name: "golden", path: "secrets/golden.jsonl" };
+      expect({ deny, got: await gate("DatasetPut", input, rs) }).toEqual({ deny, got: "deny" });
+    }
+    expect(existsSync(join(ws, ".crewhaus", "datasets"))).toBe(false);
+    // Control: the same put from a file beside it is written.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "DatasetPut(golden)"]);
+    expect(await gate("DatasetPut", { name: "golden", path: "src/golden.jsonl" }, rs)).toBe(
+      "allow",
+    );
+    expect(lastResult ?? "").toContain('"wrote":true');
+  }, 60_000);
+
+  test("EmailSend: a denied file is not attached; the rule layer says so before any judge", async () => {
+    const mail = {
+      from: { address: "bot@example.com" },
+      to: [{ address: "ops@example.com" }],
+      subject: "config",
+      text: "attached",
+      date: "2026-10-12T00:00:00Z",
+      host: "smtp.example.com",
+      justification: "send ops the config they asked for",
+    };
+    for (const deny of denies("EmailSend")) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "EmailSend(*@example.com)"]);
+      // The first decision is the rule layer's; the justification judge
+      // would only follow an allow.
+      const got = await gate(
+        "EmailSend",
+        { ...mail, attachments: [{ path: "secrets/prod.env" }] },
+        rs,
+      );
+      expect({ deny, got }).toEqual({ deny, got: "deny" });
+    }
+    // Control: the allow on the recipients still covers a file beside it.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "EmailSend(*@example.com)"]);
+    expect(await gate("EmailSend", { ...mail, attachments: [{ path: "README.md" }] }, rs)).toBe(
+      "allow",
+    );
+  }, 60_000);
+
+  test("InvoiceRender: a denied template is not rendered", async () => {
+    const invoice = {
+      kind: "invoice",
+      idempotencyKey: "k1",
+      seller: { name: "Acme" },
+      buyer: { name: "Bob" },
+      lines: [{ description: "work", unitAmount: "10.00" }],
+      currency: "USD",
+      issueDate: "2026-10-01",
+      outputs: ["html"],
+    };
+    for (const deny of denies("InvoiceRender").map((d) => d.replace("prod.env", "t.html"))) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "InvoiceRender"]);
+      const got = await gate("InvoiceRender", { ...invoice, templateFile: "secrets/t.html" }, rs);
+      expect({ deny, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+        deny,
+        got: "deny",
+        leaked: false,
+      });
+    }
+    // Control: a template beside it renders.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "InvoiceRender"]);
+    expect(await gate("InvoiceRender", { ...invoice, templateFile: "src/t.html" }, rs)).toBe(
+      "allow",
+    );
+    expect(lastResult ?? "").not.toContain(SECRET);
+  }, 60_000);
+});
+
+// critic9 (0.7.1): a deny written with a leading `./` (`Tree(./secrets/**)`)
+// fired on `Tree ./` and not on `Tree .`, `Tree {}` or `Tree src/..`, which
+// walk the same place: a direct path carries its `./` spelling, a walk of the
+// root did not.
+describe("critic9 — a deny written `./dir/**` holds on every spelling of a walk of the root", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  beforeEach(() => {
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.env"), `API_KEY=${SECRET}\n`);
+    writeFileSync(join(ws, "secrets", "notes.ts"), `// TODO(ops): rotate ${SECRET}\n`);
+  });
+
+  test("every walker of the root meets it, in every mode; a walk beside it runs", async () => {
+    const walks: ReadonlyArray<
+      readonly [string, Record<string, unknown>, Record<string, unknown>]
+    > = [
+      ["Tree", {}, { path: "src" }],
+      ["Tree", { path: "." }, { path: "./src" }],
+      ["Tree", { path: "src/.." }, { path: "src" }],
+      ["Grep", { pattern: "sk-live" }, { pattern: "sk-live", path: "src" }],
+      ["TodoScan", { extensions: [".ts"] }, { cwd: "src" }],
+      ["FindFiles", { path: "." }, { path: "src" }],
+      ["DiskUsage", {}, { path: "src" }],
+      ["SecretScan", { path: "." }, { path: "src" }],
+      ["StateExport", { stateDir: "." }, { stateDir: "src" }],
+    ];
+    for (const [name, walk, beside] of walks) {
+      const rs = rules(["alwaysDeny", `${name}(./secrets/**)`], ["alwaysAllow", name]);
+      const got = await gate(name, walk, rs);
+      expect({ name, walk, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+        name,
+        walk,
+        got: "deny",
+        leaked: false,
+      });
+      const control = await gate(name, beside, rs);
+      expect({ name, beside, control, ran: lastResult !== undefined }).toEqual({
+        name,
+        beside,
+        control: "allow",
+        ran: true,
+      });
+    }
+    for (const mode of ["auto", "plan"] as const) {
+      for (const [name, walk] of [
+        ["Tree", {}],
+        ["Grep", { pattern: "sk-live" }],
+      ] as const) {
+        const got = await gate(name, walk, rules(["alwaysDeny", "*(./secrets/**)"]), mode);
+        expect({ mode, name, got }).toEqual({ mode, name, got: "deny" });
+      }
+    }
+  }, 120_000);
+
+  test("a walk that skips hidden names still skips them under a `./` deny", async () => {
+    const rs = rules(["alwaysDeny", "Tree(./.env)"], ["alwaysAllow", "Tree"]);
+    expect(await gate("Tree", { path: "." }, rs)).toBe("allow");
+    expect(await gate("Tree", { path: ".", includeHidden: true }, rs)).toBe("deny");
+    // Only `includeHidden: true` opens hidden names; written false, it is the
+    // plain walk.
+    const plain = rules(["alwaysDeny", "Tree(.env)"], ["alwaysAllow", "Tree"]);
+    expect(await gate("Tree", { path: ".", includeHidden: false }, plain)).toBe("allow");
+    expect(lastResult ?? "").not.toContain("API_KEY=original");
+  }, 60_000);
+});
+
+// critic9 (0.7.1): an `env:NAME` reference reads the process environment,
+// which in every harness holds its `.env` — the supervisor merges the harness
+// `.env` chain into the environment it spawns with, and Bun loads `.env` on
+// start. The gate read `env:` as a plain id, so `alwaysDeny *(.env)` stopped
+// `valueFrom: API_KEY` (critic8's fix) and not `valueFrom: env:API_KEY`.
+describe("critic9 — an env: reference is read with the .env its environment is loaded from", () => {
+  const VALUE = "dotenv-secret-zq9";
+  let saved: { key: string | undefined; rotated: string | undefined };
+  beforeEach(async () => {
+    writeFileSync(join(ws, ".env"), `API_KEY=original\nZQ9_API_KEY=${VALUE}\n`);
+    mkdirSync(join(ws, "pub"));
+    writeFileSync(join(ws, "pub", "token"), "public-value");
+    // What the supervisor hands a harness it spawns from here.
+    const { buildSpawnEnv } = await import("@crewhaus/harness-supervisor");
+    const spawned = buildSpawnEnv({ harnessRoot: ws, processEnv: {} });
+    saved = { key: process.env["ZQ9_API_KEY"], rotated: process.env["ZQ9_NEW"] };
+    process.env["ZQ9_API_KEY"] = spawned.env["ZQ9_API_KEY"];
+    process.env["ZQ9_NEW"] = "new-value-from-env";
+  });
+  afterEach(() => {
+    for (const [name, value] of [
+      ["ZQ9_API_KEY", saved.key],
+      ["ZQ9_NEW", saved.rotated],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  const resolved = () => (lastResult ?? "").includes('"status":"resolved"');
+
+  test("a deny on .env stops a copy or a lookup through env:, in every mode", async () => {
+    expect(process.env["ZQ9_API_KEY"]).toBe(VALUE);
+    const copy = { path: "public.env", entries: [{ key: "COPIED", valueFrom: "env:ZQ9_API_KEY" }] };
+    for (const deny of ["*(.env)", "EnvFileUpsert(envfile:.env#**)", "EnvFileUpsert(.env.local)"]) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "EnvFileUpsert(public.env)"]);
+      expect({ deny, got: await gate("EnvFileUpsert", copy, rs) }).toEqual({ deny, got: "deny" });
+      expect(existsSync(join(ws, "public.env"))).toBe(false);
+    }
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "*(.env)"], ["alwaysAllow", "SecretLookup"])
+          : rules(["alwaysDeny", "*(.env)"]);
+      const got = await gate("SecretLookup", { refs: [" env:ZQ9_API_KEY"] }, rs, mode);
+      expect({ mode, got, resolved: resolved() }).toEqual({ mode, got: "deny", resolved: false });
+    }
+    // Control: an allow by name still grants it, a deny on the secrets
+    // directory (which only a bare NAME looks in) stays quiet, and the copy
+    // runs unruled.
+    expect(
+      await gate(
+        "SecretLookup",
+        { refs: ["env:ZQ9_API_KEY"] },
+        rules(["alwaysAllow", "SecretLookup(env:ZQ9_API_KEY)"]),
+      ),
+    ).toBe("allow");
+    expect(resolved()).toBe(true);
+    expect(
+      await gate(
+        "SecretLookup",
+        { refs: ["env:ZQ9_API_KEY"] },
+        rules(["alwaysDeny", "*(.crewhaus/secrets/**)"], ["alwaysAllow", "SecretLookup"]),
+      ),
+    ).toBe("allow");
+    expect(
+      await gate("EnvFileUpsert", copy, rules(["alwaysAllow", "EnvFileUpsert(public.env)"])),
+    ).toBe("allow");
+    expect(readFileSync(join(ws, "public.env"), "utf8")).toContain(`COPIED=${VALUE}`);
+  }, 60_000);
+
+  test("controls: an allow on where a rotation writes covers its env: source; a file outside is outside", async () => {
+    // SecretRotate's newValueFrom is a source: the allow on the reference it
+    // rewrites does not have to name it.
+    const rotate = {
+      ref: "file:pub/token",
+      newValueFrom: "env:ZQ9_NEW",
+      dryRun: true,
+      justification: "rotate the public token",
+    };
+    expect(
+      await gate("SecretRotate", rotate, rules(["alwaysAllow", "SecretRotate(file:pub/**)"])),
+    ).toBe("allow");
+    // A file: reference that leaves the workspace: every deny fires, and an
+    // allow on every file: reference does not grant it.
+    const outside = { refs: ["file:../outside-zq9"] };
+    expect(
+      await gate(
+        "SecretLookup",
+        outside,
+        rules(["alwaysDeny", "SecretLookup(file:**)"], ["alwaysAllow", "SecretLookup"]),
+      ),
+    ).toBe("deny");
+    expect(
+      await gate("SecretLookup", outside, rules(["alwaysAllow", "SecretLookup(file:**)"])),
+    ).toBe("ask");
+    expect(
+      await gate(
+        "SecretLookup",
+        { refs: ["file:pub/token"] },
+        rules(["alwaysAllow", "SecretLookup(file:**)"]),
+      ),
+    ).toBe("allow");
+  }, 60_000);
+});
+
+// critic9 (0.7.1): MarkdownLinkCheck resolved every relative link in the
+// documents it checked, anywhere in the workspace, and with checkAnchors READ
+// the target to collect its headings. A probe document under docs/ could ask
+// whether a file a deny names carries a given heading, and the broken/ok
+// answer told it. It now reads headings only in the documents the call reads.
+describe("critic9 — MarkdownLinkCheck reads headings only in the documents it checks", () => {
+  beforeEach(() => {
+    mkdirSync(join(ws, "docs"));
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "plan.md"), "# Launch on 2026-11-03\n");
+    writeFileSync(
+      join(ws, "docs", "probe.md"),
+      [
+        "# Probe",
+        "[a](../secrets/plan.md#launch-on-2026-11-02)",
+        "[b](../secrets/plan.md#launch-on-2026-11-03)",
+        "[c](#probe)",
+        "[d](#missing)",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("a denied file's headings never decide a link's answer; the docs' own anchors still do", async () => {
+    for (const deny of [
+      "MarkdownLinkCheck(secrets/**)",
+      "MarkdownLinkCheck(secrets/plan.md)",
+      "*(secrets/**)",
+    ]) {
+      const rs = rules(["alwaysDeny", deny], ["alwaysAllow", "MarkdownLinkCheck"]);
+      expect(await gate("MarkdownLinkCheck", { path: "docs", checkAnchors: true }, rs)).toBe(
+        "allow",
+      );
+      const report = JSON.parse(lastResult ?? "{}") as {
+        broken: Array<{ href: string; reason: string }>;
+        anchorsUnchecked?: Array<{ href: string; reason: string }>;
+      };
+      // Neither guess is reported either way; both are listed as unchecked,
+      // naming the file and why.
+      expect(report.broken.map((b) => b.href)).toEqual(["#missing"]);
+      expect((report.anchorsUnchecked ?? []).map((u) => u.href)).toEqual([
+        "../secrets/plan.md#launch-on-2026-11-02",
+        "../secrets/plan.md#launch-on-2026-11-03",
+      ]);
+      expect(report.anchorsUnchecked?.[0]?.reason).toContain(
+        '"secrets/plan.md" is not one of the documents this call reads',
+      );
+      // The direct call on the file is denied.
+      expect(await gate("MarkdownLinkCheck", { path: "secrets/plan.md" }, rs)).toBe("deny");
+    }
+    // Control: checked from a path that holds the target, its headings are read.
+    await gate(
+      "MarkdownLinkCheck",
+      { path: ".", checkAnchors: true },
+      rules(["alwaysAllow", "MarkdownLinkCheck"]),
+    );
+    const whole = JSON.parse(lastResult ?? "{}") as {
+      broken: Array<{ href: string; reason: string }>;
+    };
+    expect(whole.broken.map((b) => [b.href, b.reason])).toEqual([
+      ["../secrets/plan.md#launch-on-2026-11-02", "the target has no such heading"],
+      ["#missing", "no heading with that anchor"],
+    ]);
+  }, 60_000);
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as
@@ -1587,6 +2073,26 @@ describe("critic7 — `..` and absolute entries in Lint, Format and RunTests pat
     expect(stubRan()).toBe("cwd=<ws>/src\n  x.test.ts -> <ws>/src/x.test.ts\n");
     expect(untouched()).toEqual({ secret: true, outside: true });
   }, 120_000);
+
+  // critic9: RunTests' `paths` were read by no rule, beside a declared
+  // command and directory, so `alwaysDeny RunTests(secrets/**)` let a run of
+  // a test file in secrets/ through.
+  test("critic9: a deny reads the test files a run is limited to; the runner's allow still covers it", async () => {
+    const rs = rules(["alwaysDeny", "RunTests(secrets/**)"], ["alwaysAllow", "RunTests"]);
+    for (const input of [
+      { paths: ["secrets/x.ts"] },
+      { paths: ["link/x.ts"] },
+      { cwd: "src", paths: ["lnk/x.ts"] },
+    ]) {
+      writeFileSync(stubLog, "");
+      const got = await gate("RunTests", input, rs);
+      expect({ input, got, ran: stubRan() }).toEqual({ input, got: "deny", ran: "" });
+    }
+    // Control: a test file beside it runs under the same rules.
+    writeFileSync(stubLog, "");
+    expect(await gate("RunTests", { cwd: "src", paths: ["x.test.ts"] }, rs)).toBe("allow");
+    expect(stubRan()).toBe("cwd=<ws>/src\n  x.test.ts -> <ws>/src/x.test.ts\n");
+  }, 60_000);
 });
 
 // critic8 (0.7.1): the gate reads tool-deploy's `env` within `name` as

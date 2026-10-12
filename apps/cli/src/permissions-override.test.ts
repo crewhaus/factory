@@ -80,6 +80,50 @@ describe("a path allow on a tool that walks directories (final review)", () => {
       ),
     ).toEqual(["StateExport(secrets/**)"]);
   });
+
+  test("a deny written with a leading ./ is read as the runtime reads it (critic9)", () => {
+    const grep = { toolName: "Grep", scopedValue: "src", valueKind: "path" as const };
+    expect(
+      guardsOverridden(
+        grep,
+        [yaml("alwaysDeny", "Grep(./src/secrets/**)"), yaml("alwaysDeny", "Grep(./lib/**)")],
+        "/ws",
+      ).map((g) => g.pattern),
+    ).toEqual(["Grep(./src/secrets/**)"]);
+  });
+
+  test("the fixed files a tool opens in the directory are read too (critic9)", () => {
+    // Settings `alwaysAllow ApprovalStatus(.)` covers the ordinary call,
+    // which reads the approvals ledger; a spec deny on it is overridden.
+    const status = { toolName: "ApprovalStatus", scopedValue: ".", valueKind: "path" as const };
+    expect(
+      guardsOverridden(
+        status,
+        [
+          yaml("alwaysDeny", "ApprovalStatus(.crewhaus/sessions/approvals.jsonl)"),
+          yaml("alwaysAsk", "ApprovalStatus(.crewhaus/sessions/**)"),
+          yaml("alwaysDeny", "ApprovalStatus(secrets/**)"),
+        ],
+        "/ws",
+      ).map((g) => g.pattern),
+    ).toEqual([
+      "ApprovalStatus(.crewhaus/sessions/approvals.jsonl)",
+      "ApprovalStatus(.crewhaus/sessions/**)",
+    ]);
+    // PermissionsSuggest reads every session log under its harness.
+    const suggest = {
+      toolName: "PermissionsSuggest",
+      scopedValue: "h",
+      valueKind: "path" as const,
+    };
+    expect(
+      guardsOverridden(
+        suggest,
+        [yaml("alwaysDeny", "PermissionsSuggest(h/.crewhaus/sessions/sess_1.jsonl)")],
+        "/ws",
+      ).map((g) => g.pattern),
+    ).toEqual(["PermissionsSuggest(h/.crewhaus/sessions/sess_1.jsonl)"]);
+  });
 });
 
 describe("an allow of a shell line (0.7.1)", () => {

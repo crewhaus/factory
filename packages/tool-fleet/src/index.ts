@@ -1504,7 +1504,8 @@ export const cliVersionPin: RegisteredTool = buildTool({
 export const hooksManage: RegisteredTool = buildTool({
   name: "HooksManage",
   operativeArgs: [
-    { field: "dir", kind: "path", default: "." },
+    // The harness's settings file, which it reads and rewrites.
+    { field: "dir", kind: "path", default: ".", opens: [{ path: ".crewhaus/settings.json" }] },
     // The supervisor runs the hook from the harness root, and resolves a
     // `./prep.sh` there: the command is another program in another `dir`.
     { field: "command", kind: "command", within: "dir" },

@@ -185,10 +185,12 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
     "no file is scanned for canary phrases, and the result says the check did not run",
   "DatasetLint.path": "the samples come from the registry (dataset) or inline; no file is read",
   "DatasetMine.dedupeAgainst": "no dedupe and no registry dataset is read, and the result says so",
+  "DatasetPut.path": "the samples are passed inline; no file is read",
   "DiagramRender.path": "the SVG comes back inline; nothing is written",
   "DocsSymbolCheck.docs":
     "the document is passed inline as docsText; its source tree declares a default",
   "EInvoiceBuild.outFile": "the document comes back inline; nothing is written",
+  "EmailSend.attachments.path": "no attachments; no file is read",
   "EmailSend.bcc.address": "no Bcc recipients; nothing is sent without one recipient somewhere",
   "EmailSend.cc.address": "no Cc recipients; nothing is sent without one recipient somewhere",
   "EmailSend.to.address": "no To recipients; nothing is sent without one recipient somewhere",
@@ -215,6 +217,7 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "HooksManage.command": "only `set` carries a command, and refuses without one",
   "ImportJson.file": "the records are passed inline; nothing is read from disk",
   "InvoiceRender.outDir": "the rendered text comes back inline; nothing is written",
+  "InvoiceRender.templateFile": "the built-in template, or one passed inline; no file is read",
   "MarketplaceSearch.registryDir":
     "the built-in first-party gallery is searched; nothing on disk is read",
   "OraclePriceRead.address": "the feed is a pinned one named by feed, which is declared",
@@ -227,6 +230,8 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
     "the build the project declares, detected at run time; its directory declares a default",
   "RunTests.command":
     "the test command the project declares, detected at run time; its directory declares a default",
+  "RunTests.paths":
+    "every test the runner finds under cwd: a runner runs the project's own code, which no path rule confines; a deny naming a test file fires when the call names it",
   "SecretScan.path": "the text is passed inline; nothing is read",
   "SeoLint.corpus": "the near-duplicate check is reported NOT CHECKED; nothing is read",
   "SeoLint.file": "the page is passed inline as html; nothing is read",
@@ -401,6 +406,52 @@ describe("an optional operative field says what leaving it out means (C004)", ()
  * through, and `{stateDir: "."}` returned secrets/prod.env under
  * `alwaysDeny StateExport(secrets/**)`.
  */
+/**
+ * `Tool.field` → the harness's own records the tool opens inside the
+ * directory the field names, which it declares with `opens`. Critic9: these
+ * were classified "fixed files in it" and declared nothing more, so a deny
+ * naming the file never fired — PermissionsSuggest mined every session log,
+ * and ApprovalStatus read the approvals ledger, under
+ * `alwaysDeny *(.crewhaus/sessions/**)`, while EventQuery under the same
+ * rule was denied.
+ */
+const OPENS_ITS_RECORDS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  "ApprovalsInbox.harnesses": [".crewhaus/sessions/approvals.jsonl"],
+  "ApprovalStatus.dir": [".crewhaus/sessions/approvals.jsonl"],
+  "EvalHistory.evalsDir": ["index.jsonl", "baselines.json"],
+  "HooksManage.dir": [".crewhaus/settings.json"],
+  "PermissionsSuggest.dir": [".crewhaus/sessions/**", ".crewhaus/settings.json"],
+  "RouteControl.dir": [".crewhaus/routing/**"],
+  "WatchmeReport.dir": [".crewhaus/watchme/**", ".crewhaus/routing/arms.jsonl"],
+};
+
+/**
+ * `Tool.field` → the fixed files the tool opens there, left undeclared and
+ * why: project manifests and a harness's own spec, bundle and registry
+ * entry, read by name. A deny naming one of them does not fire on these
+ * (a 0.7.1 known limitation); a new entry is one more such decision.
+ */
+const FIXED_FILES_UNDECLARED: Readonly<Record<string, string>> = {
+  "BundleFreshness.dirs": "each named harness's spec and bundle",
+  "CliVersionPin.dirs": "each named harness's spec, bundle and CLI package.json",
+  "DependencyAudit.cwd": "the project's lockfiles",
+  "DependencyList.cwd": "the project's manifests and lockfiles",
+  "DependencyOutdated.cwd": "the project's manifests and lockfiles",
+  "DoctorFix.crewhausDir": "the subdirectories it scaffolds there, by name",
+  "EvalAggregate.run": "the run's results.json",
+  "FlywheelStatus.specDir": "the harness's spec",
+  "HarnessJobStatus.dir": "a filter on the manager's ledger, whose place the operator sets",
+  "HarnessRegister.dir": "the harness's spec, and the registry entry it writes",
+  "HarnessRegister.from": "the spec it copies",
+  "HarnessRetire.registryDir": "the registry entry it removes",
+  "LicenseAggregate.directory": "each installed package's package.json",
+  "PackagePublishPreflight.directory":
+    "the package's package.json, and whether the files it names exist",
+  "PackageScripts.cwd": "the manifest and lockfile at or above it",
+  "PreflightRun.harnessDir": "the harness's spec and bundle",
+  "RegistryOutdated.manifest": "the project's manifest",
+};
+
 describe("every path a builtin walks is read with what lies beneath it", () => {
   /** `Tool.field` → why the field names one place, not a tree the tool walks. */
   const ONE_PLACE: Readonly<Record<string, string>> = {
@@ -422,6 +473,8 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
         "DatabaseBackup.out",
         "DatasetLint.leakScanPaths",
         "DatasetLint.path",
+        // The samples a new version is copied from.
+        "DatasetPut.path",
         "DiagramRender.path",
         "DoctorFix.envPath",
         "DoctorFix.specPath",
@@ -429,6 +482,8 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
         "DownloadFile.path",
         "EInvoiceBuild.outFile",
         "Edit.path",
+        // A file sent with the message.
+        "EmailSend.attachments.path",
         "EnvFileUpsert.path",
         "EvalCoverage.dataset",
         "ExifStrip.output",
@@ -450,7 +505,10 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
         "ImportJson.database",
         "ImportJson.file",
         "IncidentBundle.out",
+        // The files whose text the index holds; a directory there is skipped.
+        "IndexBuild.paths",
         "InvoiceRender.dbPath",
+        "InvoiceRender.templateFile",
         "LedgerPost.dbPath",
         "ManifestDependencySet.manifest",
         "MediaProbe.path",
@@ -479,42 +537,13 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
         "XlsxWrite.path",
       ].map((k) => [k, "a file"]),
     ),
-    // A directory whose fixed, named files the tool reads or writes.
+    // A directory whose fixed, named files the tool reads or writes. The
+    // harness's own records there are declared (`opens`), so a deny naming
+    // one fires on the call that reads it; the test below holds that.
+    ...Object.fromEntries(Object.keys(OPENS_ITS_RECORDS).map((k) => [k, "fixed files in it"])),
+    // Project and fleet files by name, not declared: see FIXED_FILES_UNDECLARED.
     ...Object.fromEntries(
-      [
-        // Each named harness's approvals ledger.
-        "ApprovalsInbox.harnesses",
-        // `.crewhaus/sessions/approvals.jsonl` under the harness directory.
-        "ApprovalStatus.dir",
-        // Each named harness's spec and bundle.
-        "BundleFreshness.dirs",
-        "CliVersionPin.dirs",
-        "DependencyAudit.cwd",
-        // The manifests and lockfiles there, by name (PackageScripts: at or above).
-        "DependencyList.cwd",
-        "DependencyOutdated.cwd",
-        "DoctorFix.crewhausDir",
-        "EvalAggregate.run",
-        // `index.jsonl` and `baselines.json`.
-        "EvalHistory.evalsDir",
-        "FlywheelStatus.specDir",
-        "HarnessJobStatus.dir",
-        "HarnessRegister.dir",
-        "HarnessRegister.from",
-        "HarnessRetire.registryDir",
-        "HooksManage.dir",
-        // `node_modules/<package>/package.json` under it.
-        "LicenseAggregate.directory",
-        "PackagePublishPreflight.directory",
-        "PackageScripts.cwd",
-        // The harness's own session logs and `.crewhaus/settings.json`.
-        "PermissionsSuggest.dir",
-        "PreflightRun.harnessDir",
-        "RegistryOutdated.manifest",
-        "RouteControl.dir",
-        // The watch-me store under `.crewhaus/state/watchme`.
-        "WatchmeReport.dir",
-      ].map((k) => [k, "fixed files in it"]),
+      Object.keys(FIXED_FILES_UNDECLARED).map((k) => [k, "fixed files in it, undeclared"]),
     ),
     // The tool creates this entry, or a named one in it, and touches nothing
     // already beneath it.
@@ -685,7 +714,7 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // A reviewed entry that now declares beneath, or no longer exists, is stale.
     const known = new Set(fields.map((f) => f.key));
     expect(Object.keys(ONE_PLACE).filter((k) => !known.has(k) || walked.includes(k))).toEqual([]);
-    expect(walked.length).toBe(75);
+    expect(walked.length).toBe(76);
     expect(walked).toContain("Grep.path");
     // Critic8: the store dump and the readers of every log in a directory.
     expect(walked).toContain("StateExport.stateDir");
@@ -696,6 +725,26 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     }
     expect(walked).toContain("RemovePath.path");
     expect(walked).toContain("GitDiff.paths");
+  });
+
+  test("a directory whose own records the tool opens declares each of them (opens)", () => {
+    const fields = pathFields();
+    const declared = fields
+      .filter((f) => f.arg.opens !== undefined)
+      .map((f) => [
+        f.key,
+        (f.arg.opens ?? []).map((o) => (o.beneath !== undefined ? `${o.path}/**` : o.path)),
+      ]);
+    expect(Object.fromEntries(declared)).toEqual(OPENS_ITS_RECORDS);
+    // Each is classified as fixed files in a directory, and not walked whole.
+    for (const key of Object.keys(OPENS_ITS_RECORDS)) {
+      expect({ key, as: ONE_PLACE[key] }).toEqual({ key, as: "fixed files in it" });
+    }
+    // The undeclared ones are the reviewed list, and declare nothing.
+    const undeclared = Object.entries(ONE_PLACE)
+      .filter(([, why]) => why === "fixed files in it, undeclared")
+      .map(([k]) => k);
+    expect(undeclared.sort()).toEqual(Object.keys(FIXED_FILES_UNDECLARED).sort());
   });
 
   test("the walks that skip hidden entries are exactly the reviewed ones", () => {
@@ -828,6 +877,123 @@ describe("a field that names a directory is a place a rule reads", () => {
       expect(found).toContain(key);
     }
     expect(undeclared.sort()).toEqual(Object.keys(NOT_A_PLACE).sort());
+  });
+});
+
+/**
+ * Critic9: a tool that declares where it acts but not a field naming a file
+ * it takes content from hides that file from every rule — a tool that
+ * declares some fields does not get the text fallback. IndexBuild's `paths`,
+ * DatasetPut's `path` and EmailSend's attachments were read by no rule, so
+ * under `alwaysDeny *(secrets/**)` IndexBuild indexed secrets/prod.env,
+ * DatasetPut copied it into the registry and EmailSend attached it. The
+ * class EnvFileUpsert's `valueFrom` was fixed for in critic8.
+ *
+ * Every string field, nested ones included, of a builtin that declares
+ * operativeArgs, that is named as a path or file (`path`, `paths`, `file`,
+ * `…Path`, `…File`) or described as one in the workspace, is declared — as a
+ * field, or as the `within` directory of one — or is a reviewed exception.
+ */
+describe("a field that names a workspace file is a place a rule reads", () => {
+  /** `Tool.field` → why the field names no file the tool opens. */
+  const NOT_A_FILE: Readonly<Record<string, string>> = {
+    "BundleSizeCheck.baseline.entries.path":
+      "an artifact's name in a baseline passed inline; it is compared, never opened",
+    "EventCounts.where.path": "a dotted path inside an event's payload",
+    "EventQuery.where.path": "a dotted path inside an event's payload",
+    "GitWorktreeAdd.cwd":
+      "where git runs; the worktree it creates is `path`, read from the workspace root",
+    "GitWorktreeRemove.cwd":
+      "where git runs; the worktree it removes is `path`, read from the workspace root",
+    "HttpPaginate.cursorPath": "a dotted path into the response body",
+    "HttpPaginate.itemsPath": "a dotted path into the response body",
+    "HttpWaitFor.expectJson.path": "a dotted path into the response body",
+    "SpecPatchApply.patches.path": "a key chain inside the spec",
+    "StateImport.document.files.path":
+      "an entry inside stateDir, which is read with everything beneath it",
+    "ToolCallStats.where.path": "a dotted path inside an event's payload",
+  };
+  const NAMES_A_FILE = /^(path|paths|file|files)$|(Path|File|Paths|Files)$/;
+  const SAYS_WORKSPACE_FILE =
+    /workspace-relative|relative to the working directory|inside the workspace/i;
+
+  type Node = { description?: string; _def?: Record<string, unknown>; shape?: unknown };
+  /** Each string leaf under `schema`, by dotted field, with its description. */
+  function stringLeaves(schema: unknown, at: string, out: Map<string, string>, depth = 0): void {
+    if (depth > 12) return;
+    let node = schema as Node | undefined;
+    let description = "";
+    for (let i = 0; i < 16 && node !== undefined; i++) {
+      if (description === "" && typeof node.description === "string") {
+        description = node.description;
+      }
+      const def = node._def ?? {};
+      const inner = def["innerType"] ?? def["schema"] ?? def["in"];
+      if (inner === undefined) break;
+      node = inner as Node;
+    }
+    const def = node?._def ?? {};
+    switch (def["typeName"]) {
+      case "ZodString":
+        out.set(at, out.get(at) || description);
+        return;
+      case "ZodArray":
+        stringLeaves(def["type"], at, out, depth + 1);
+        if (out.has(at) && out.get(at) === "") out.set(at, description);
+        return;
+      case "ZodUnion":
+      case "ZodDiscriminatedUnion":
+        for (const option of def["options"] as unknown[]) stringLeaves(option, at, out, depth + 1);
+        return;
+      case "ZodObject": {
+        const shape = (def["shape"] as () => Record<string, unknown>)();
+        for (const [key, field] of Object.entries(shape)) {
+          stringLeaves(field, at === "" ? key : `${at}.${key}`, out, depth + 1);
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  test("each is declared, or is a reviewed exception", () => {
+    const found: string[] = [];
+    const undeclared: string[] = [];
+    let tools = 0;
+    for (const tool of builtins) {
+      const args = tool.operativeArgs ?? [];
+      if (args.length === 0) continue;
+      tools++;
+      const declared = new Set<string>();
+      for (const arg of args) {
+        declared.add(arg.field);
+        if (arg.within !== undefined) declared.add(arg.within);
+      }
+      const leaves = new Map<string, string>();
+      stringLeaves(tool.inputSchema, "", leaves);
+      for (const [field, description] of leaves) {
+        const leaf = field.split(".").pop() ?? field;
+        if (!NAMES_A_FILE.test(leaf) && !SAYS_WORKSPACE_FILE.test(description)) continue;
+        const key = `${tool.name}.${field}`;
+        found.push(key);
+        if (!declared.has(field)) undeclared.push(key);
+      }
+    }
+    // The sweep's hit counts: a scan that could not read the schemas finds nothing.
+    expect(tools).toBeGreaterThanOrEqual(250);
+    expect(found.length).toBeGreaterThanOrEqual(150);
+    for (const key of [
+      "Read.path",
+      "IndexBuild.paths",
+      "DatasetPut.path",
+      "EmailSend.attachments.path",
+      "InvoiceRender.templateFile",
+      "RunTests.paths",
+    ]) {
+      expect(found).toContain(key);
+    }
+    expect(undeclared.sort()).toEqual(Object.keys(NOT_A_FILE).sort());
   });
 });
 

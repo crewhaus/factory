@@ -151,7 +151,14 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }],
+      },
+    ],
     categories: ["approvals", "safety"],
     package: "@crewhaus/tool-approvals",
     keywords: ["approval status", "what is parked", "waiting for approval"],
@@ -167,7 +174,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "harnesses", kind: "path" },
+      { field: "harnesses", kind: "path", opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }] },
       { field: "root", kind: "path", default: ".", beneath: "all" },
     ],
     categories: ["approvals", "safety"],
@@ -1468,6 +1475,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/datasets", relocates: true },
       { field: "name", kind: "id" },
+      { field: "path", kind: "path", source: true },
     ],
     categories: ["dataset", "operations"],
     package: "@crewhaus/tool-dataset",
@@ -2188,6 +2196,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
       { field: "to.address", kind: "recipient" },
       { field: "cc.address", kind: "recipient" },
       { field: "bcc.address", kind: "recipient" },
+      { field: "attachments.path", kind: "path", source: true },
     ],
     categories: ["notify", "outreach"],
     package: "@crewhaus/tool-notify",
@@ -2465,7 +2474,14 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals" }],
+    operativeArgs: [
+      {
+        field: "evalsDir",
+        kind: "path",
+        default: ".crewhaus/evals",
+        opens: [{ path: "index.jsonl" }, { path: "baselines.json" }],
+      },
+    ],
     categories: ["evalops", "operations"],
     package: "@crewhaus/tool-evalops",
     keywords: ["eval history", "trend", "runs over time", "score history"],
@@ -3928,7 +3944,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "dir", kind: "path", default: "." },
+      { field: "dir", kind: "path", default: ".", opens: [{ path: ".crewhaus/settings.json" }] },
       { field: "command", kind: "command", within: "dir" },
     ],
     categories: ["fleet", "operations"],
@@ -4308,6 +4324,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
+      { field: "paths", kind: "path", source: true },
     ],
     categories: ["state", "data-stores", "memory"],
     package: "@crewhaus/tool-state",
@@ -4386,6 +4403,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "dbPath", kind: "path", default: ".crewhaus/ledger.sqlite" },
       { field: "outDir", kind: "path", beneath: "all" },
+      { field: "templateFile", kind: "path", source: true },
     ],
     categories: ["ledger", "operations"],
     package: "@crewhaus/tool-ledger",
@@ -5042,7 +5060,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "markdownLinkCheck",
     name: "MarkdownLinkCheck",
     description:
-      "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed.",
+      "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed. A heading anchor is checked only in the documents this call reads — the file given, or the Markdown its directory walk finds; an anchor into any other file is listed in anchorsUnchecked, its headings never read, so check a path that includes it.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -5817,7 +5835,17 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [
+          { path: ".crewhaus/sessions", beneath: "all" },
+          { path: ".crewhaus/settings.json" },
+        ],
+      },
+    ],
     categories: ["approvals", "safety"],
     package: "@crewhaus/tool-approvals",
     keywords: ["suggest permissions", "permission rules", "stop the prompts", "allow rule"],
@@ -6729,7 +6757,14 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [{ path: ".crewhaus/routing", beneath: "all" }],
+      },
+    ],
     categories: ["routing", "operations"],
     package: "@crewhaus/tool-routing",
     keywords: ["routing", "promote lane", "model routing", "route policy"],
@@ -6831,6 +6866,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command", within: "cwd" },
+      { field: "paths", kind: "path", within: "cwd", beneath: "all", source: true },
     ],
     categories: ["toolchain", "code"],
     package: "@crewhaus/tool-code",
@@ -8483,7 +8519,17 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [
+          { path: ".crewhaus/watchme", beneath: "all" },
+          { path: ".crewhaus/routing/arms.jsonl" },
+        ],
+      },
+    ],
     categories: ["routing", "operations"],
     package: "@crewhaus/tool-routing",
     keywords: ["watchme", "observational learning", "co-learning", "recall"],

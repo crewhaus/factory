@@ -6,7 +6,11 @@
  * `envfile:` reference opens with its own copy of the split. This holds the
  * two together: over a fixed corpus and a seeded generator, every file the
  * tool would open is a file the gate read, and the gate reads no other file
- * for a reference the tool accepts — a bare NAME's local chain included.
+ * for a reference the tool accepts — a bare NAME's local chain included, and
+ * the env files an `env:` reference's environment is loaded from (critic9:
+ * the supervisor merges `.env.local` and `.env` into every harness it
+ * spawns, and Bun loads them on start, so `env:API_KEY` read `.env`'s value
+ * under `alwaysDeny *(.env)`).
  *
  * The canonicaliser here only records what it is handed; where the file
  * lands is runtime-core's business and has its own tests.
@@ -29,12 +33,22 @@ function gateReads(tool: typeof secretLookup, input: unknown): string[] {
   return seen;
 }
 
-/** The file the tool opens for a reference, as parseRef reads it; none when it refuses. */
+/**
+ * The files a reference reads, as parseRef reads it; none when it refuses.
+ * An `env:` one reads the environment, which in a harness holds the chain's
+ * env files.
+ */
 function toolOpens(raw: string): { readonly paths: string[]; readonly refused: boolean } {
   const parsed = parseRef(raw);
   if (!parsed.ok) return { paths: [], refused: true };
   // A bare NAME is looked up in every file of the local chain.
-  const steps = parsed.value.kind === "auto" ? chainRefs(parsed.value.name) : [parsed.value];
+  const ref = parsed.value;
+  const steps =
+    ref.kind === "auto"
+      ? chainRefs(ref.name)
+      : ref.kind === "env"
+        ? chainRefs(ref.name).filter((step) => step.kind === "envfile")
+        : [ref];
   const paths = steps.flatMap((ref) =>
     ref.kind === "file" || ref.kind === "envfile" ? [ref.path] : [],
   );
@@ -72,6 +86,9 @@ const CORPUS = [
   "envfile:#KEY",
   "envfile:secrets/.env#bad-key",
   "env:HOME",
+  " env:API_KEY\t",
+  "env:9_LIVES",
+  "env:",
   "keychain:acme#deploy",
   "op://vault/item/field",
   "SLACK_TOKEN",
@@ -128,12 +145,13 @@ function generated(count: number, seed: number): string[] {
 describe("the gate reads a secret reference as parseRef reads it", () => {
   test("every file the tool opens is a file the gate read, and no other for an accepted reference", () => {
     const refs = [...CORPUS, ...generated(20_000, 0x0c8)];
-    const tally = { opens: 0, refused: 0, ids: 0, bare: 0 };
+    const tally = { opens: 0, refused: 0, ids: 0, bare: 0, env: 0 };
     const mismatches: Array<{ ref: string; tool: string[]; gate: string[] }> = [];
     for (const ref of refs) {
       const tool = toolOpens(ref);
       const gate = gateReads(secretLookup, { refs: [ref] });
       if (!tool.refused && parseRef(ref).ok && !ref.includes(":")) tally.bare++;
+      if (!tool.refused && /^env:/.test(ref.trim())) tally.env++;
       if (tool.refused) tally.refused++;
       else if (tool.paths.length > 0) tally.opens++;
       else tally.ids++;
@@ -151,6 +169,7 @@ describe("the gate reads a secret reference as parseRef reads it", () => {
     expect(tally.refused).toBeGreaterThan(2_000);
     expect(tally.ids).toBeGreaterThan(500);
     expect(tally.bare).toBeGreaterThan(50);
+    expect(tally.env).toBeGreaterThan(30);
   });
 
   test("each tool that takes a reference routes it through the same reading", () => {

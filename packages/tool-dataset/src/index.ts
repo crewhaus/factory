@@ -399,9 +399,13 @@ export const datasetPut: RegisteredTool = buildTool({
   // registry with CREWHAUS_DATASETS_DIR writes a rule about that directory,
   // and a call that leaves registryDir out is still read as this one: the
   // permission subject is computed without the process environment.
+  //
+  // `path` is the file the samples are copied from: a deny or ask reads it,
+  // an allow on the dataset name need not.
   operativeArgs: [
     { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
     { field: "name", kind: "id" },
+    { field: "path", kind: "path", source: true },
   ],
   description:
     "Write samples to the dataset registry as a new, auto-bumped, immutable version, keeping every existing row in the split it is already in. Use it to grow an eval dataset without invalidating the baselines keyed on it: the result names every row that changed split (none, in the default mode) and every row the previous version had that this one drops. It never overwrites a version and never deletes one; it reports PII/secret hit counts in what it wrote without ever echoing a match, and dryRun resolves the same version, splits and content hash the real call would write.",

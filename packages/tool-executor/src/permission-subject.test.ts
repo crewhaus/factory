@@ -517,14 +517,24 @@ describe("url, command and id values", () => {
       readOnly: true,
       execute: async () => "ok",
     });
+    // The root is also `./`, as a direct path is also `./secrets/x`: a deny
+    // written `./secrets/**` names what a walk of `.` reaches.
     expect(operativeValuesFor(grep, {})).toEqual([
-      { kind: "path", canonical: ["."], spellings: ["."], beneath: [""], beneathSkipsHidden: true },
+      {
+        kind: "path",
+        canonical: ["."],
+        spellings: ["."],
+        beneath: ["", "./"],
+        beneathSkipsHidden: true,
+      },
     ]);
     // Outside the workspace it already fires every deny; no prefix is added.
     expect(operativeValuesFor(grep, { path: "../x" })?.[0]?.beneath).toBe(undefined);
     // An empty path is the root: the empty prefix, never `/`, which an
     // absolute deny (`Search(/etc/**)`) would read as the filesystem root.
-    expect(operativeValuesFor(grep, { path: "" })?.[0]?.beneath).toEqual([""]);
+    expect(operativeValuesFor(grep, { path: "" })?.[0]?.beneath).toEqual(["", "./"]);
+    // A directory below the root carries both spellings already.
+    expect(operativeValuesFor(grep, { path: "src" })?.[0]?.beneath).toEqual(["src/", "./src/"]);
     expect(
       matchesPattern(
         compilePattern("Search(/etc/**)"),
@@ -1404,6 +1414,45 @@ describe("a secret reference (critic8)", () => {
   test("a file outside the workspace is outside: every deny fires, no allow grants it", () => {
     expect(on("file:../outside", "LookupLike(env:NEVER)", "restrict")).toBe(true);
     expect(on("file:../outside", "LookupLike(**)", "allow")).toBe(false);
+    expect(on("file:../outside", "LookupLike(file:**)", "allow")).toBe(false);
+    // The reference itself is flagged outside, not only the file beside it:
+    // an allow is never shown a place to name.
+    const values = operativeValuesFor(lookup(), { refs: ["file:../outside"] }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical, v.outsideWorkspace === true])).toEqual([
+      ["id", [], true],
+      ["path", [], true],
+    ]);
+  });
+
+  test("an env: reference is granted by name, and a deny on an env file it is loaded from fires", () => {
+    // The environment `env:NAME` reads holds `.env.local` and `.env` in every
+    // harness (the supervisor merges them in; Bun loads them on start), so
+    // a deny or ask reads those two as for a bare NAME — not the secrets
+    // directory, which only the bare NAME's chain looks in.
+    const values = operativeValuesFor(lookup(), { refs: [" env:API_KEY"] }) ?? [];
+    expect(values.filter((v) => v.restrictOnly !== true).map((v) => v.canonical)).toEqual([
+      ["env:API_KEY"],
+    ]);
+    expect(values.filter((v) => v.restrictOnly === true).map((v) => v.canonical[0])).toEqual([
+      "envfile:.env.local#API_KEY",
+      ".env.local",
+      "envfile:.env#API_KEY",
+      ".env",
+    ]);
+    expect(on("env:API_KEY", "LookupLike(env:API_KEY)", "allow")).toBe(true);
+    for (const deny of [
+      "LookupLike(.env)",
+      "LookupLike(.env.local)",
+      "LookupLike(envfile:.env#**)",
+    ]) {
+      expect({ deny, fires: on("env:API_KEY", deny, "restrict") }).toEqual({ deny, fires: true });
+    }
+    // Control: a deny about the secrets directory, or another variable's
+    // envfile reference, stays quiet; so does a name the tool refuses.
+    for (const deny of ["LookupLike(.crewhaus/secrets/**)", "LookupLike(envfile:.env#OTHER)"]) {
+      expect({ deny, fires: on("env:API_KEY", deny, "restrict") }).toEqual({ deny, fires: false });
+    }
+    expect(on("env:9_LIVES", "LookupLike(.env)", "restrict")).toBe(false);
   });
 
   test("every other form is an id, trimmed; one the tool refuses names no file", () => {
@@ -1418,7 +1467,10 @@ describe("a secret reference (critic8)", () => {
       ["envfile:#KEY", "envfile:#KEY"],
       ["file:secrets/token\nx", "file:secrets/token\nx"],
     ] as const) {
-      const values = operativeValuesFor(lookup(), { refs: [ref] }) ?? [];
+      // What an allow reads; an env: one's env files are read by a deny alone.
+      const values = (operativeValuesFor(lookup(), { refs: [ref] }) ?? []).filter(
+        (v) => v.restrictOnly !== true,
+      );
       expect({ ref, values: values.map((v) => [v.kind, v.canonical]) }).toEqual({
         ref,
         values: [["id", [id]]],
@@ -2026,5 +2078,123 @@ describe("a command's stdin field: the line a shell given no script runs", () =>
     );
     expect(at("restrict", "Run(rm *)", { argv: ["cat"], stdin: "rm -f x" })).toBe(false);
     expect(at("restrict", "Run(rm *)", { argv: ["python3"], stdin: "rm -f x" })).toBe(false);
+  });
+});
+
+/**
+ * Critic9: a tool that opens fixed files inside the directory it is given —
+ * ApprovalStatus's ledger, PermissionsSuggest's session logs — declares them
+ * (`opens`), so a deny naming one fires on the call that reads it.
+ */
+describe("the fixed places a tool opens inside its directory (opens)", () => {
+  const suggestLike = () =>
+    buildTool({
+      name: "SuggestLike",
+      description: "mine a harness's logs",
+      inputSchema: z.object({ dir: z.string().optional() }),
+      readOnly: true,
+      operativeArgs: [
+        {
+          field: "dir",
+          kind: "path",
+          default: ".",
+          opens: [
+            { path: ".crewhaus/sessions", beneath: "all" },
+            { path: ".crewhaus/settings.json" },
+          ],
+        },
+      ],
+      execute: async () => "ok",
+    });
+  const on = (input: unknown, pattern: string, polarity: "allow" | "restrict") =>
+    matchesPattern(compilePattern(pattern), "SuggestLike", input, {
+      polarity,
+      operativeValues: operativeValuesFor(suggestLike(), input) ?? [],
+    });
+
+  test("each is read by a deny or ask where it lands below the directory, never by an allow", () => {
+    const values = operativeValuesFor(suggestLike(), {}) ?? [];
+    expect(values.map((v) => [v.canonical[0], v.restrictOnly === true, v.beneath])).toEqual([
+      [".", false, undefined],
+      [".crewhaus/sessions", true, [".crewhaus/sessions/", "./.crewhaus/sessions/"]],
+      [".crewhaus/settings.json", true, undefined],
+    ]);
+    for (const deny of [
+      "SuggestLike(.crewhaus/sessions/sess_1.jsonl)",
+      "SuggestLike(.crewhaus/sessions/**)",
+      "SuggestLike(./.crewhaus/settings.json)",
+      "SuggestLike(.crewhaus/**)",
+    ]) {
+      expect({ deny, fires: on({}, deny, "restrict") }).toEqual({ deny, fires: true });
+    }
+    // A directory the call names carries them below it.
+    for (const deny of [
+      "SuggestLike(h/.crewhaus/sessions/**)",
+      "SuggestLike(h/.crewhaus/settings.json)",
+    ]) {
+      expect({ deny, fires: on({ dir: "h/" }, deny, "restrict") }).toEqual({ deny, fires: true });
+    }
+    // Control: a deny about a place it does not open stays quiet, and an
+    // allow on the directory still grants it.
+    for (const deny of ["SuggestLike(secrets/**)", "SuggestLike(.env)", "SuggestLike(h/**)"]) {
+      expect({ deny, fires: on({}, deny, "restrict") }).toEqual({ deny, fires: false });
+    }
+    expect(on({}, "SuggestLike(.)", "allow")).toBe(true);
+    expect(on({ dir: "h" }, "SuggestLike(h)", "allow")).toBe(true);
+    expect(on({ dir: "h" }, "SuggestLike(.crewhaus/**)", "allow")).toBe(false);
+  });
+
+  test("a `..` or a link on the way is read where it lands", () => {
+    // `pub/..` is the root; with a canonicaliser that follows `lnk` to
+    // `secrets`, `lnk/.crewhaus/settings.json` is `secrets/.crewhaus/settings.json`.
+    expect(on({ dir: "pub/.." }, "SuggestLike(.crewhaus/settings.json)", "restrict")).toBe(true);
+    const followLink: PathCanonicalizer = (raw) => {
+      const lexical = lexicalPathValues(raw)[0];
+      if (lexical === undefined || lexical.outsideWorkspace === true) return lexicalPathValues(raw);
+      const at = (lexical.canonical[0] as string).replace(/^lnk(\/|$)/, "secrets$1");
+      return [{ kind: "path", canonical: [at, `./${at}`], spellings: [raw] }];
+    };
+    const values = operativeValuesFor(
+      suggestLike(),
+      { dir: "lnk" },
+      { canonicalizePath: followLink },
+    );
+    expect(
+      matchesPattern(
+        compilePattern("SuggestLike(secrets/.crewhaus/settings.json)"),
+        "SuggestLike",
+        {},
+        {
+          polarity: "restrict",
+          operativeValues: values ?? [],
+        },
+      ),
+    ).toBe(true);
+  });
+
+  test("buildTool refuses an opening that is not a place below a path's directory", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({ dir: z.string().optional(), q: z.string().optional() }),
+        readOnly: true,
+        operativeArgs: [arg as never],
+        execute: async () => "ok",
+      });
+    for (const [arg, says] of [
+      [{ field: "dir", kind: "path", opens: [{ path: "../x" }] }, "stay below it"],
+      [{ field: "dir", kind: "path", opens: [{ path: "/etc/x" }] }, "stay below it"],
+      [{ field: "dir", kind: "path", opens: [{ path: "a//b" }] }, "stay below it"],
+      [{ field: "dir", kind: "path", opens: [] }, "one or more"],
+      [{ field: "dir", kind: "path", opens: [{ path: "x", beneath: "some" }] }, "beneath"],
+      [{ field: "q", kind: "id", opens: [{ path: "x" }] }, 'only a "path"'],
+      [{ field: "dir", kind: "path", glob: true, opens: [{ path: "x" }] }, "glob pattern"],
+    ] as const) {
+      expect(build(arg)).toThrow(says);
+    }
+    expect(
+      build({ field: "dir", kind: "path", opens: [{ path: ".crewhaus/a.json" }] }),
+    ).not.toThrow();
   });
 });

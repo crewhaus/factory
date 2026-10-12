@@ -147,6 +147,12 @@
  *      `hiddenWhen` names (Tree's `includeHidden`). One declared
  *      `defaultAtRoot` and left out is the workspace root, not its `within`
  *      directory: a git command given no path acts on the whole repository.
+ *      Each relative prefix is also read with a leading `./`, as a direct
+ *      path is, so `alwaysDeny Tree(./secrets/**)` fires on `Tree .`.
+ *    - a `path` declaring `opens` (the fixed files a tool opens inside the
+ *      directory it names: ApprovalStatus's ledger) also carries each of
+ *      them, joined to the directory and canonicalised, as a value only a
+ *      deny or ask reads.
  *    - a `path` declared `glob` (the Glob tool's pattern) is marked
  *      `globPattern`: the matcher reads it as every path it can list.
  *    - a `relocates` field left out stands in with its default, which a
@@ -157,7 +163,9 @@
  *    - an `id` declared `secretRef` is a secret reference, trimmed as the
  *      tool trims it; a `file:` or `envfile:` one is matched with the file
  *      it names canonicalised in it, and the file is also a value only a
- *      deny or ask reads (see {@link secretRefValues}).
+ *      deny or ask reads; a bare NAME and an `env:NAME` are also read, by a
+ *      deny or ask only, as the env files they are looked up in or loaded
+ *      from (see {@link secretRefValues}).
  *    - a field declared `source` (where the tool takes a value from) is read
  *      by a deny or ask only.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
@@ -349,6 +357,7 @@ export function operativeValuesOf(
           const read = canonicalizePath(raw);
           relocated.push(
             ...(beneath !== undefined ? read.map((v) => withBeneath(v, beneath)) : read),
+            ...openedValues(raw, arg, canonicalizePath),
           );
         }
         continue;
@@ -382,6 +391,7 @@ export function operativeValuesOf(
               ? "all"
               : beneath;
           values.push(...(walk !== undefined ? read.map((v) => withBeneath(v, walk)) : read));
+          values.push(...openedValues(raw, arg, canonicalizePath));
           break;
         }
         case "url":
@@ -616,6 +626,11 @@ function programPlaceValues(
  * an id an allow names as written; it is also looked up in the files of the
  * local chain ({@link secretChain}), which a deny or ask reads as those
  * references and those files, so `alwaysDeny *(.env)` fires on `API_KEY`.
+ * An `env:NAME` is an id an allow names as written too, but the environment
+ * it reads holds the chain's env files in every harness — the supervisor
+ * merges `.env.local` and `.env` into the environment it spawns a harness
+ * with, and Bun loads them from the directory it starts in — so a deny or ask
+ * reads those two the same way: `alwaysDeny *(.env)` fires on `env:API_KEY`.
  */
 function secretRefValues(raw: string, canonicalizePath: PathCanonicalizer): OperativeValue[] {
   const ref = raw.trim();
@@ -627,10 +642,15 @@ function secretRefValues(raw: string, canonicalizePath: PathCanonicalizer): Oper
       ...(ref !== raw ? { spellings: [raw] } : {}),
       ...(HEX_ID.test(ref) ? { caseInsensitive: true } : {}),
     };
-    if (!BARE_SECRET_NAME.test(ref)) return [id];
+    const envName = ENV_SECRET_REF.exec(ref)?.[1];
+    const steps = BARE_SECRET_NAME.test(ref)
+      ? secretChain(ref)
+      : envName !== undefined
+        ? secretChain(envName).filter((step) => step.scheme === "envfile")
+        : [];
     return [
       id,
-      ...secretChain(ref).flatMap((step) =>
+      ...steps.flatMap((step) =>
         placeValues(step, canonicalizePath).map((v) => ({ ...v, restrictOnly: true })),
       ),
     ];
@@ -1097,6 +1117,9 @@ function startsWithDotSlash(word: string): boolean {
 /** A bare reference: an environment-variable name, which the local chain looks up. */
 const BARE_SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** An `env:NAME` reference, as `parseRef` accepts it; the name is group 1. */
+const ENV_SECRET_REF = /^env:([A-Za-z_][A-Za-z0-9_]*)$/;
+
 /**
  * The files a bare NAME is looked up in after the environment, highest
  * precedence first: `@crewhaus/tool-secrets`' `chainRefs` (the harness
@@ -1356,10 +1379,10 @@ function prefixReadings(
 /**
  * Every path under `dir` — a path field left out whose default is `*` — as
  * the values a rule reads: for each place `dir` resolves to, its spellings
- * as prefixes (`sub/`, `/abs/ws/sub/`; the workspace root is the empty
- * prefix) and `<prefix>*` as the canonical spelling an allow must cover
- * whole. A directory outside the workspace stays outside: every deny or ask
- * fires on it, and no allow does.
+ * as prefixes (`sub/`, `./sub/`, `/abs/ws/sub/`; the workspace root is the
+ * empty prefix and `./`) and `<prefix>*` as the canonical spelling an allow
+ * must cover whole. A directory outside the workspace stays outside: every
+ * deny or ask fires on it, and no allow does.
  */
 function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): OperativeValue[] {
   const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
@@ -1368,7 +1391,7 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
     return {
       kind: "path",
       canonical: v.canonical.map((c) => `${under(c)}${ANY_VALUE}`),
-      standsForAny: [...new Set([...v.canonical, ...(v.spellings ?? [])].map(under))],
+      standsForAny: underPrefixes([...v.canonical, ...(v.spellings ?? [])]),
       ...(v.caseInsensitive === true ? { caseInsensitive: true } : {}),
     };
   });
@@ -1421,14 +1444,60 @@ function leavingValue(joined: string, written: string): OperativeValue {
  */
 function withBeneath(value: OperativeValue, mode: "all" | "visible"): OperativeValue {
   if (value.outsideWorkspace === true || value.notDirectory === true) return value;
-  // The root — `.`, or the empty path a call may write for it — is the empty
-  // prefix, never `/`, which would read as the filesystem root.
-  const under = (p: string): string => (p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`);
   return {
     ...value,
-    beneath: [...new Set([...value.canonical, ...(value.spellings ?? [])].map(under))],
+    beneath: underPrefixes([...value.canonical, ...(value.spellings ?? [])]),
     ...(mode === "visible" ? { beneathSkipsHidden: true } : {}),
   };
+}
+
+/**
+ * The prefixes what lies under each of these directory spellings starts
+ * with. The root — `.`, or the empty path a call may write for it — is the
+ * empty prefix, never `/`, which would read as the filesystem root. A
+ * relative prefix is also given its `./` spelling, as a direct path value
+ * carries one (`secrets/x` is also `./secrets/x`): without it a deny written
+ * `./secrets/**` fired on `Tree ./` but not on `Tree .`, `Tree {}` or
+ * `Tree src/..`, which walk the same place.
+ */
+function underPrefixes(spellings: ReadonlyArray<string>): string[] {
+  const out = new Set<string>();
+  for (const p of spellings) {
+    const under = p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`;
+    out.add(under);
+    if (!isAbsolutePath(under) && !under.startsWith("./")) out.add(`./${under}`);
+  }
+  return [...out];
+}
+
+/**
+ * The fixed places a tool opens inside the directory a `path` names (`opens`
+ * on its OperativeArg — ApprovalStatus's ledger, PermissionsSuggest's
+ * session logs), as values only a deny or ask reads: each joined to the
+ * directory as the call wrote it and canonicalised like any path, so a link
+ * or a `..` on the way is followed, and read with what is beneath it when the
+ * tool reads it whole. An allow reads the directory alone.
+ */
+function openedValues(
+  dir: string,
+  arg: OperativeArg,
+  canonicalizePath: PathCanonicalizer,
+): OperativeValue[] {
+  const out: OperativeValue[] = [];
+  for (const opening of arg.opens ?? []) {
+    for (const v of canonicalizePath(joinBelow(dir, opening.path))) {
+      const read = opening.beneath !== undefined ? withBeneath(v, opening.beneath) : v;
+      out.push({ ...read, restrictOnly: true });
+    }
+  }
+  return out;
+}
+
+/** `rel` inside `dir`: the root (`.`, `./`, the empty path) adds nothing in front. */
+function joinBelow(dir: string, rel: string): string {
+  const trimmed = withoutTrailingSeparators(dir);
+  if (trimmed === "") return dir === "" ? rel : `/${rel}`;
+  return trimmed === "." ? rel : `${trimmed}/${rel}`;
 }
 
 /**

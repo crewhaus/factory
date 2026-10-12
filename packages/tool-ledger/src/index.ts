@@ -746,9 +746,12 @@ const partySchema = z
 
 export const invoiceRender: RegisteredTool = buildTool({
   name: "InvoiceRender",
+  // `templateFile` is read into the rendered document: a deny or ask reads
+  // it, an allow on where the tool writes need not.
   operativeArgs: [
     { field: "dbPath", kind: "path", default: DEFAULT_DB_PATH },
     { field: "outDir", kind: "path", beneath: "all" },
+    { field: "templateFile", kind: "path", source: true },
   ],
   description:
     "Render an invoice, receipt, credit note or quote to HTML, Markdown and JSON with a gap-free document number and totals computed rather than supplied. Use it instead of a model emitting invoice HTML: the number and the document record are allocated in ONE transaction, so a crash cannot burn a number out of a legally required sequence, and repeating the call with the same idempotency key returns the same number and the same bytes. Nothing is formatted through Intl, so the output does not move with an ICU upgrade; the yearly reset takes its year from the issue date, not the clock. Files are written under the workspace. It submits nothing and asks for no payment credentials.",

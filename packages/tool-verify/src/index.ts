@@ -969,7 +969,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
   // The file, or the directory whose Markdown it reads; the walk skips hidden names.
   operativeArgs: [{ field: "path", kind: "path", default: ".", beneath: "visible" }],
   description:
-    "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed.",
+    "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed. A heading anchor is checked only in the documents this call reads — the file given, or the Markdown its directory walk finds; an anchor into any other file is listed in anchorsUnchecked, its headings never read, so check a path that includes it.",
   inputSchema: z
     .object({
       path: z.string().optional().describe("a file or directory; defaults to the workspace root"),
@@ -990,6 +990,13 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
     const isDir = statSync(at.real).isDirectory();
     const docs = isDir ? filesUnder(at.real).filter((f) => /\.(md|mdx|markdown)$/i.test(f)) : [""];
     const root = isDir ? at.real : dirname(at.real);
+    // The documents this call reads, which the permission rule read too: the
+    // file given, or what the walk found (no hidden name, no link). A target
+    // anywhere else is checked for existence, but its headings are not read —
+    // reading them answered whether a file a rule denies carries a heading.
+    const checkedDocs = new Set(isDir ? docs.map((doc) => join(root, doc)) : [at.real]);
+    const anchorsUnchecked: Array<{ file: string; line: number; href: string; reason: string }> =
+      [];
 
     const broken: Array<{ file: string; line: number; href: string; reason: string }> = [];
     // Anchors of each target document, computed once however many links
@@ -1068,6 +1075,17 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           continue;
         }
         if (input.checkAnchors && fragment !== undefined && /\.(md|mdx|markdown)$/i.test(target)) {
+          if (!checkedDocs.has(targetAt.real)) {
+            if (anchorsUnchecked.length < limit) {
+              anchorsUnchecked.push({
+                file: label,
+                line: link.line,
+                href: link.href,
+                reason: `"${targetAt.rel}" is not one of the documents this call reads, so its headings were not opened; check a path that includes it`,
+              });
+            }
+            continue;
+          }
           let targetAnchors = anchorsOf.get(targetAt.real);
           if (targetAnchors === undefined) {
             try {
@@ -1105,6 +1123,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
       ok: broken.length === 0,
       broken: broken.slice(0, limit),
       truncated: broken.length >= limit,
+      ...(anchorsUnchecked.length > 0 ? { anchorsUnchecked } : {}),
       note: "external links are listed as unchecked, never fetched",
     });
   },

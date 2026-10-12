@@ -353,6 +353,16 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * on its default as well, and an allow still skips the default beside a
  * record.
  *
+ * `opens`, for a `path` naming a directory, lists the fixed places inside it
+ * the tool opens, relative to it: a file (`{ path:
+ * ".crewhaus/sessions/approvals.jsonl" }`), or a store it reads whole, with
+ * its own `beneath` (`{ path: ".crewhaus/sessions", beneath: "all" }`). A
+ * deny or ask reads each one where it lands below the directory the call
+ * names, so `alwaysDeny ApprovalStatus(.crewhaus/sessions/**)` fires on the
+ * ordinary call; an allow reads the directory alone. A tool that opens
+ * named files in a directory, rather than walking it, declares them this
+ * way: without it, a deny naming one of them never fires.
+ *
  * `glob: true`, for a `path`, says the value is a pattern the tool lists
  * the paths of (the Glob tool's `pattern`, whose wildcards never list a
  * name that starts with `.`, though a name it writes literally is listed):
@@ -405,7 +415,11 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * is also looked up in the local chain's files (`.env.local`, `.env`,
  * `.crewhaus/secrets/NAME`), which a deny or ask reads too, so
  * `alwaysDeny *(.env)` fires on `API_KEY` while `alwaysAllow
- * SecretLookup(API_KEY)` still grants it.
+ * SecretLookup(API_KEY)` still grants it. An `env:NAME` reads the process
+ * environment, which in a harness holds `.env.local` and `.env` (the
+ * supervisor merges them in, and Bun loads them on start), so a deny or ask
+ * reads those two for it as well: `alwaysDeny *(.env)` fires on
+ * `env:API_KEY`.
  *
  * `source: true` marks a field holding where the tool takes a value from,
  * not where it acts: the reference EnvFileUpsert copies a secret from
@@ -434,11 +448,22 @@ export type OperativeArg = {
   readonly prefix?: true;
   readonly beneath?: "all" | "visible";
   readonly hiddenWhen?: string;
+  readonly opens?: ReadonlyArray<OperativeOpening>;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;
   readonly secretRef?: true;
   readonly source?: true;
+};
+
+/**
+ * One fixed place inside a directory a `path` operative field names, which
+ * the tool opens (`opens` on {@link OperativeArg}): `path` is relative to the
+ * directory, and `beneath` says the tool reads what is inside it too.
+ */
+export type OperativeOpening = {
+  readonly path: string;
+  readonly beneath?: "all" | "visible";
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

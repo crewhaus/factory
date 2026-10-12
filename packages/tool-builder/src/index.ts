@@ -1,6 +1,7 @@
 import {
   type OperativeArg,
   type OperativeArgKind,
+  type OperativeOpening,
   type RegisteredTool,
   ToolCatalogError,
   type ToolDefinition,
@@ -305,6 +306,47 @@ function mapFieldShape(inputSchema: unknown, name: string): string | undefined {
 }
 
 /**
+ * Check a `path` field's `opens` (the fixed places inside the directory it
+ * names that the tool opens), and return it frozen. Each is a relative path
+ * that stays below the directory — no `..` segment, not absolute — since a
+ * deny reads it joined to whatever directory the call names.
+ */
+function checkOpenings(
+  at: string,
+  kind: OperativeArgKind,
+  opens: OperativeArg["opens"],
+  fail: (what: string) => never,
+): OperativeArg["opens"] {
+  if (opens === undefined) return undefined;
+  if (kind !== "path") fail(`${at}.opens: only a "path" names a directory with files in it`);
+  if (!Array.isArray(opens) || opens.length === 0) {
+    fail(`${at}.opens must list one or more { path } inside the directory, or be left out`);
+  }
+  const out: OperativeOpening[] = [];
+  for (const [j, opening] of opens.entries()) {
+    const where = `${at}.opens[${j}]`;
+    if (opening === null || typeof opening !== "object") {
+      fail(`${where} must be an object like { path: ".crewhaus/settings.json" }`);
+    }
+    const { path, beneath } = opening;
+    if (typeof path !== "string" || path === "") fail(`${where}.path must name a file or store`);
+    if (
+      /^([\\/]|[A-Za-z]:)/.test(path) ||
+      path.split(/[\\/]/).some((s) => s === ".." || s === "")
+    ) {
+      fail(
+        `${where}.path "${path}" must be relative to the directory and stay below it: no leading "/", no ".." or empty segment`,
+      );
+    }
+    if (beneath !== undefined && beneath !== "all" && beneath !== "visible") {
+      fail(`${where}.beneath is "all", "visible" or left out`);
+    }
+    out.push(Object.freeze({ path, ...(beneath !== undefined ? { beneath } : {}) }));
+  }
+  return Object.freeze(out);
+}
+
+/**
  * Check a tool's `operativeArgs` against its input schema. A declaration that
  * names a field the schema does not have would make every scoped rule for the
  * tool silently miss, so it is refused when the tool is built, not discovered
@@ -411,6 +453,10 @@ function checkOperativeArgs(
       const switched = booleanFieldShape(inputSchema, hiddenWhen);
       if (switched !== undefined) fail(`${at}.hiddenWhen: the input schema ${switched}`);
     }
+    const opens = checkOpenings(at, kind, arg.opens, fail);
+    if (opens !== undefined && arg.glob === true) {
+      fail(`${at}.opens: a glob pattern is not a directory with fixed files in it`);
+    }
     if (defaultAtRoot !== undefined) {
       if (defaultAtRoot !== true) fail(`${at}.defaultAtRoot is either true or left out`);
       if (kind !== "path" || within === undefined || arg.default === undefined) {
@@ -492,6 +538,7 @@ function checkOperativeArgs(
         ...(prefix === true ? { prefix } : {}),
         ...(beneath !== undefined ? { beneath } : {}),
         ...(hiddenWhen !== undefined ? { hiddenWhen } : {}),
+        ...(opens !== undefined ? { opens } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
         ...(glob === true ? { glob } : {}),
         ...(shell === true ? { shell } : {}),

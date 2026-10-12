@@ -922,6 +922,55 @@ describe("MarkdownLinkCheck", () => {
     );
   });
 
+  /**
+   * Critic9 — with checkAnchors, a link's target was read for its headings
+   * wherever it lay in the workspace, so a probe document could ask whether
+   * a file a permission rule denies carries a given heading. Headings are
+   * read only in the documents the call itself reads.
+   */
+  test("an anchor into a file outside the checked path is listed unchecked, its headings never read", async () => {
+    mkdirSync(join(workspace, "private"));
+    writeFileSync(join(workspace, "private/plan.md"), "# Launch on 2026-11-03\n");
+    writeFileSync(
+      join(workspace, "docs/probe.md"),
+      "[a](../private/plan.md#launch-on-2026-11-02)\n[b](../private/plan.md)\n[c](./b.md#b)\n[d](./b.md#nope)\n",
+    );
+    type Report = {
+      broken: Array<{ file: string; href: string; reason: string }>;
+      anchorsUnchecked?: Array<{ file: string; line: number; href: string; reason: string }>;
+    };
+    const result = await call<Report>(markdownLinkCheck, { path: "docs", checkAnchors: true });
+    // The target is still checked for existence; inside the checked path,
+    // anchors are checked as before.
+    expect(result.broken.map((b) => b.href).sort()).toEqual(["#nope", "./b.md#nope", "./nope.md"]);
+    expect(result.anchorsUnchecked).toEqual([
+      {
+        file: "probe.md",
+        line: 1,
+        href: "../private/plan.md#launch-on-2026-11-02",
+        reason:
+          '"private/plan.md" is not one of the documents this call reads, so its headings were not opened; check a path that includes it',
+      },
+    ]);
+    // Checked from a path that holds it, the target's headings are read.
+    const whole = await call<Report>(markdownLinkCheck, { path: ".", checkAnchors: true });
+    expect(whole.broken.find((b) => b.href.includes("2026-11-02"))?.reason).toBe(
+      "the target has no such heading",
+    );
+    expect(whole.anchorsUnchecked).toBeUndefined();
+    // One file: its own anchors are read, another file's are not.
+    const one = await call<Report>(markdownLinkCheck, {
+      path: "docs/probe.md",
+      checkAnchors: true,
+    });
+    expect((one.anchorsUnchecked ?? []).map((u) => u.href)).toEqual([
+      "../private/plan.md#launch-on-2026-11-02",
+      "./b.md#b",
+      "./b.md#nope",
+    ]);
+    expect(one.broken).toEqual([]);
+  });
+
   test("a link that leaves the workspace through a symlink is reported, not opened", async () => {
     // `resolve` does not follow symlinks and `statSync` does, so a lexical
     // containment check calls this link fine and then opens the file it

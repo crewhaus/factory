@@ -52,8 +52,10 @@ import {
  * regular file, never through a symbolic link at that name.
  */
 import {
+  BASELINES_FILENAME,
   type BaselineLineage,
   DEFAULT_EVALS_DIR,
+  INDEX_FILENAME,
   type RunIndexEntry,
   lookupBaseline,
 } from "@crewhaus/eval-report";
@@ -257,7 +259,15 @@ const evalHistorySchema = z.object({
 
 export const evalHistory: RegisteredTool = buildTool({
   name: "EvalHistory",
-  operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals" }],
+  // The run index and the pinned baselines, by name.
+  operativeArgs: [
+    {
+      field: "evalsDir",
+      kind: "path",
+      default: ".crewhaus/evals",
+      opens: [{ path: INDEX_FILENAME }, { path: BASELINES_FILENAME }],
+    },
+  ],
   description:
     "Read the recorded eval runs and return each lineage's trend, CUT wherever the measuring instrument changed. Use before quoting an eval trend or deciding a suite is improving: runs record the dataset, graders and judge they were measured with, and a first-to-last delta drawn across a graders rewrite compares numbers that were never comparable. Every segment reports its own delta in percentage points, every cut says which hash changed, and a join whose comparability could not be verified is marked instead of assumed. Reads only; runs nothing.",
   inputSchema: evalHistorySchema,

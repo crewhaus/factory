@@ -126,6 +126,7 @@ import {
 import {
   WATCHME_MODEL_SURFACE_UNAVAILABLE,
   WATCHME_READ_RELPATHS,
+  WATCHME_RELDIR,
   countLines,
   fedRoutingKeyStrings,
   parseFedKey,
@@ -253,7 +254,16 @@ const ROUTE_ACTIONS = ["status", "freeze", "unfreeze", "promote", "compact"] as 
 
 export const routeControl: RegisteredTool = buildTool({
   name: "RouteControl",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  // The routing store under the harness: the scoreboard, the freeze marker
+  // and the priors, read and (promote, compact) rewritten.
+  operativeArgs: [
+    {
+      field: "dir",
+      kind: "path",
+      default: ".",
+      opens: [{ path: `${STATE_RELDIR}/routing`, beneath: "all" }],
+    },
+  ],
   description:
     "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean carries its n, because an arm with three observations is not a better arm than one with three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one, and `promoteLanes`'s own freeze check reads it as absent. A real promotion additionally needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is deliberately not offered; use `crewhaus route reset`. dryRun defaults to true and changes nothing; the promotion preview is promoteLanes' own dryRun, running the same fold.",
   inputSchema: z.object({
@@ -1185,7 +1195,18 @@ export const flywheelStatus: RegisteredTool = buildTool({
 
 export const watchmeReport: RegisteredTool = buildTool({
   name: "WatchmeReport",
-  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+  // The watch-me store, and the routing scoreboard its `q:` lane reached.
+  operativeArgs: [
+    {
+      field: "dir",
+      kind: "path",
+      default: ".",
+      opens: [
+        { path: `${STATE_RELDIR}/${WATCHME_RELDIR}`, beneath: "all" },
+        { path: `${STATE_RELDIR}/routing/arms.jsonl` },
+      ],
+    },
+  ],
   description:
     "Read a harness's observational-learning ledger: whether it is watching, the per-window report outcomes, the per-spec/target quality and cost roll-up, the judge verdicts, and how much of that quality has actually reached the routing scoreboard's observe-only `q:` lane. Report-window outcomes are kept apart — `model_refused_unpriced` is a configuration error that consumed its window, `model_failed` is transient and retries, and collapsing them into one failure state hides the first as the second. A state.json that exists but cannot be parsed is reported as unreadable, never as a harness that has never watched: the store falls back to its default there, which reads as the opposite of the truth. The routing half degrades explicitly — an absent or unreadable scoreboard is reported as such, never as 'no quality signal'. Every rate carries a Wilson interval. Read-only: it never runs the phase-2 judge, never synthesizes, and never feeds routing.",
   inputSchema: z.object({

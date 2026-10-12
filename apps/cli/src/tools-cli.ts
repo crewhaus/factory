@@ -1590,6 +1590,7 @@ export type OperativeArgLike = {
   readonly prefix?: true;
   readonly beneath?: string;
   readonly hiddenWhen?: string;
+  readonly opens?: ReadonlyArray<{ readonly path: string; readonly beneath?: string }>;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;
@@ -1680,7 +1681,7 @@ export function operativeArgWords(arg: OperativeArgLike): string {
   }
   if (arg.secretRef === true) {
     parts.push(
-      "a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in",
+      "a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, the .env files and secrets directory a bare NAME is looked up in, and the .env files an env: one's environment is loaded from",
     );
   }
   if (arg.source === true) {
@@ -1693,6 +1694,10 @@ export function operativeArgWords(arg: OperativeArgLike): string {
         ? `a directory stands for everything beneath it except hidden names, and for those too when ${arg.hiddenWhen} is true`
         : "a directory stands for everything beneath it except hidden names",
     );
+  }
+  if (arg.opens !== undefined && arg.opens.length > 0) {
+    const named = arg.opens.map((o) => (o.beneath !== undefined ? `${o.path}/**` : o.path));
+    parts.push(`a deny or ask also reads what it opens inside: ${named.join(", ")}`);
   }
   if (arg.default !== undefined) parts.push(defaultWords(arg));
   return parts.join("; ");

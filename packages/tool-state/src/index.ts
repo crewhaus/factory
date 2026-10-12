@@ -1509,9 +1509,12 @@ export const noteSearch: RegisteredTool = stateTool({
 
 export const indexBuild: RegisteredTool = stateTool({
   name: "IndexBuild",
+  // `paths` are the files whose text goes into the index: a deny or ask reads
+  // them, an allow on the index name need not.
   operativeArgs: [
     { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "name", kind: "id" },
+    { field: "paths", kind: "path", source: true },
   ],
   description:
     "Build a named inverted index over a list of workspace text files, so they can be searched without a model reading them. Use it once per corpus and re-run it when the files change — the index is a snapshot and watches nothing; binary and over-large files are skipped and reported rather than mangled.",

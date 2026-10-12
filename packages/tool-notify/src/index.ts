@@ -1409,10 +1409,13 @@ function unconfirmedEmailReplay(
 
 export const emailSend: RegisteredTool = buildTool({
   name: "EmailSend",
+  // The files attached are sent with the message: a deny or ask reads them,
+  // an allow on the recipients need not.
   operativeArgs: [
     { field: "to.address", kind: "recipient" },
     { field: "cc.address", kind: "recipient" },
     { field: "bcc.address", kind: "recipient" },
+    { field: "attachments.path", kind: "path", source: true },
   ],
   description:
     "Send a message over SMTP: EHLO, STARTTLS, AUTH, MAIL FROM, RCPT TO, DATA, written out rather than delegated. Use it when the thing to report belongs in somebody's inbox rather than in a chat room. STARTTLS is required by default and the session ends before the password is written if the server does not offer it; the credential is an environment variable NAME and the transcript records the AUTH line as redacted. Every recipient must match the operator's allow-list and the SMTP host must be one an operator named, both of which deny everything when unset. The whole session is deadline-bounded and the server's replies are byte-capped. It does not queue, retry, or track bounces — a refused recipient comes back named, and re-sending is the caller's decision.",

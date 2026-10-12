@@ -90,6 +90,34 @@ function builtinShell(toolName: string): boolean {
 }
 
 /**
+ * The fixed places a builtin opens inside the directory a path field names
+ * (`opens` in the manifest), from every path field that declares them, since
+ * the scoped value may come from any.
+ */
+function builtinOpenings(
+  toolName: string,
+): ReadonlyArray<{ readonly path: string; readonly beneath?: string }> {
+  return (TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs ?? []).flatMap((arg) =>
+    arg.kind === "path" ? (arg.opens ?? []) : [],
+  );
+}
+
+/**
+ * The prefixes beneath a directory's spellings, as the runtime reads them:
+ * the root is the empty prefix, and a relative prefix is also read with a
+ * leading `./` (a deny written `./build/keep/**`).
+ */
+function underPrefixes(spellings: ReadonlyArray<string>): string[] {
+  const out = new Set<string>();
+  for (const p of spellings) {
+    const under = p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`;
+    out.add(under);
+    if (!under.startsWith("/") && !under.startsWith("./")) out.add(`./${under}`);
+  }
+  return [...out];
+}
+
+/**
  * A path value the tool walks, read with what lies beneath it as the runtime
  * reads it: a scoped `alwaysAllow RemovePath(build)` covers `RemovePath build`
  * recursive, on which `alwaysDeny RemovePath(build/keep/**)` fires, so the
@@ -97,12 +125,28 @@ function builtinShell(toolName: string): boolean {
  */
 function withWalk(value: OperativeValue, walk: "all" | "visible" | undefined): OperativeValue {
   if (walk === undefined || value.kind !== "path") return value;
-  const under = (p: string): string => (p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`);
   return {
     ...value,
-    beneath: value.canonical.map(under),
+    beneath: underPrefixes(value.canonical),
     ...(walk === "visible" ? { beneathSkipsHidden: true } : {}),
   };
+}
+
+/**
+ * The fixed places the tool opens inside a path value (`opens`): a scoped
+ * `alwaysAllow ApprovalStatus(.)` covers the call that reads
+ * `.crewhaus/sessions/approvals.jsonl`, on which a deny naming that ledger
+ * fires, so the allow overrides that deny too.
+ */
+function openedAt(value: OperativeValue, toolName: string, cwd: string): OperativeValue[] {
+  if (value.kind !== "path") return [];
+  const dir = value.canonical[0] ?? ".";
+  return builtinOpenings(toolName).map((opening) => {
+    const at = valueAt("path", dir === "." ? opening.path : join(dir, opening.path), cwd);
+    return opening.beneath !== undefined
+      ? withWalk(at, opening.beneath === "visible" ? "visible" : "all")
+      : at;
+  });
 }
 
 /** A command value marked as a shell line, when the tool's command is one. */
@@ -141,14 +185,13 @@ export function guardsOverridden(
       continue;
     }
     const value = allow.scopedValue;
+    const scoped = allow.valueKind === undefined ? undefined : valueAt(allow.valueKind, value, cwd);
     const operative: OperativeValue[] | undefined =
-      allow.valueKind === undefined
+      scoped === undefined
         ? undefined
         : [
-            withShell(
-              withWalk(valueAt(allow.valueKind, value, cwd), builtinWalk(allow.toolName)),
-              builtinShell(allow.toolName),
-            ),
+            withShell(withWalk(scoped, builtinWalk(allow.toolName)), builtinShell(allow.toolName)),
+            ...openedAt(scoped, allow.toolName, cwd),
             ...(allow.relocatingDefaults ?? builtinRelocatingDefaults(allow.toolName)).map((d) =>
               valueAt(d.kind, d.value, cwd),
             ),

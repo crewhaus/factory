@@ -97,7 +97,14 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }],
+      },
+    ],
   },
   approvalsInbox: {
     key: "approvalsInbox",
@@ -108,7 +115,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "harnesses", kind: "path" },
+      { field: "harnesses", kind: "path", opens: [{ path: ".crewhaus/sessions/approvals.jsonl" }] },
       { field: "root", kind: "path", default: ".", beneath: "all" },
     ],
   },
@@ -970,6 +977,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/datasets", relocates: true },
       { field: "name", kind: "id" },
+      { field: "path", kind: "path", source: true },
     ],
   },
   dateAdd: {
@@ -1443,6 +1451,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
       { field: "to.address", kind: "recipient" },
       { field: "cc.address", kind: "recipient" },
       { field: "bcc.address", kind: "recipient" },
+      { field: "attachments.path", kind: "path", source: true },
     ],
   },
   emailSendPreflight: {
@@ -1635,7 +1644,14 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals" }],
+    operativeArgs: [
+      {
+        field: "evalsDir",
+        kind: "path",
+        default: ".crewhaus/evals",
+        opens: [{ path: "index.jsonl" }, { path: "baselines.json" }],
+      },
+    ],
   },
   evaluate: {
     key: "evaluate",
@@ -2647,7 +2663,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "dir", kind: "path", default: "." },
+      { field: "dir", kind: "path", default: ".", opens: [{ path: ".crewhaus/settings.json" }] },
       { field: "command", kind: "command", within: "dir" },
     ],
   },
@@ -2907,6 +2923,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
+      { field: "paths", kind: "path", source: true },
     ],
   },
   indexSearch: {
@@ -2960,6 +2977,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "dbPath", kind: "path", default: ".crewhaus/ledger.sqlite" },
       { field: "outDir", kind: "path", beneath: "all" },
+      { field: "templateFile", kind: "path", source: true },
     ],
   },
   irr: {
@@ -3868,7 +3886,17 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [
+          { path: ".crewhaus/sessions", beneath: "all" },
+          { path: ".crewhaus/settings.json" },
+        ],
+      },
+    ],
   },
   piiRedact: {
     key: "piiRedact",
@@ -4467,7 +4495,14 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [{ path: ".crewhaus/routing", beneath: "all" }],
+      },
+    ],
   },
   ruleClassify: {
     key: "ruleClassify",
@@ -4539,6 +4574,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command", within: "cwd" },
+      { field: "paths", kind: "path", within: "cwd", beneath: "all", source: true },
     ],
   },
   runTimeline: {
@@ -5628,7 +5664,17 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
+    operativeArgs: [
+      {
+        field: "dir",
+        kind: "path",
+        default: ".",
+        opens: [
+          { path: ".crewhaus/watchme", beneath: "all" },
+          { path: ".crewhaus/routing/arms.jsonl" },
+        ],
+      },
+    ],
   },
   webFetch: {
     key: "webFetch",

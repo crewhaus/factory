@@ -432,9 +432,13 @@ export const runTests: RegisteredTool = buildTool({
   // `alwaysAllow RunTests(bun test)` is not also asked to match ".". The
   // command is read as run in `cwd` (`within`), so a deny naming a script by
   // its workspace path holds when the call runs it from its own directory.
+  // `paths` are the test files (or directories of them) the run is limited
+  // to, below `cwd`: a deny or ask reads them, and `alwaysAllow
+  // RunTests(bun test)` need not name them.
   operativeArgs: [
     { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "command", kind: "command", within: "cwd" },
+    { field: "paths", kind: "path", within: "cwd", beneath: "all", source: true },
   ],
   description:
     "Run the project's test suite and return only what failed, as structured JSON: the test name, the failing assertion, its file and line, and a trimmed stack. Use it instead of running a test command and reading the output, because a green run comes back as three counts rather than thousands of lines. The runner is detected from the project (bun, vitest, jest, pytest, go, cargo) or given explicitly, and each one is asked for its machine-readable form. Running tests executes the project's own code, so it is not a read-only operation.",
