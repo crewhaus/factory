@@ -31,18 +31,66 @@ export type SpecIdentity = {
   readonly lenient: boolean;
 };
 
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** A code unit `.` does not match. */
+const isLineBreak = (c: number): boolean =>
+  c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+
+/**
+ * `text` without a ` # comment` running to its end: what
+ * `text.replace(/\s+#.*$/, "")` returned, found in two scans. That pattern
+ * tries every start inside a run of whitespace and, where no `#` follows the
+ * run, rescans the rest of it from each before giving the start up, so a
+ * long run inside a value was quadratic in its length; a spec is the
+ * workspace's.
+ */
+export function withoutTrailingComment(text: string): string {
+  // `.*$` cannot cross a line break, so the `#` comes after the last one.
+  let lastBreak = -1;
+  for (let i = text.length - 1; i >= 0; i--) {
+    if (isLineBreak(text.charCodeAt(i))) {
+      lastBreak = i;
+      break;
+    }
+  }
+  let runStart = -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (isRegExpSpace(c)) {
+      if (runStart < 0) runStart = i;
+      continue;
+    }
+    if (c === 0x23 && runStart >= 0 && i > lastBreak) return text.slice(0, runStart);
+    runStart = -1;
+  }
+  return text;
+}
+
 /** Strip a scalar's quotes and trailing comment — enough for the fallback. */
 function scalar(raw: string): string | undefined {
-  const value = raw
-    .trim()
-    .replace(/\s+#.*$/, "")
-    .trim();
+  const value = withoutTrailingComment(raw.trim()).trim();
   const unquoted = /^(['"])(.*)\1$/.exec(value);
   const out = unquoted?.[2] ?? value;
   return out === "" ? undefined : out;
 }
 
-function lineScan(text: string): { name?: string; target?: string; model?: string } {
+export function lineScan(text: string): { name?: string; target?: string; model?: string } {
   let name: string | undefined;
   let target: string | undefined;
   let model: string | undefined;
