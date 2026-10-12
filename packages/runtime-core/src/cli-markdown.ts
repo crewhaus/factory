@@ -26,6 +26,8 @@
  *   auto-linkify URLs).
  */
 
+import { bulletParts, fenceParts, headingParts, numberedParts } from "./cli-markdown-lines";
+
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 const DIM = "\x1b[2m";
@@ -82,41 +84,42 @@ export function createCliMarkdownRenderer(opts: RendererOptions = {}): StreamRen
   }
 
   function renderLine(line: string): string {
-    // Code-fence delimiter — toggles state, dims the fence itself.
-    const fence = /^(\s*)```\s*(\S*)\s*$/.exec(line);
+    // Code-fence delimiter — toggles state, dims the fence itself. The line
+    // parts are read by cli-markdown-lines.ts, which returns what each
+    // pattern noted there captured, in linear time.
+    const fence = fenceParts(line);
     if (fence) {
       if (!inCodeFence) {
         inCodeFence = true;
-        codeFenceLang = fence[2] ?? "";
-        return `${fence[1] ?? ""}${DIM}${GREEN}\`\`\`${codeFenceLang}${RESET}`;
+        codeFenceLang = fence[1];
+        return `${fence[0]}${DIM}${GREEN}\`\`\`${codeFenceLang}${RESET}`;
       }
       inCodeFence = false;
       const langSuffix = codeFenceLang ? ` (${codeFenceLang})` : "";
       codeFenceLang = "";
-      return `${fence[1] ?? ""}${DIM}${GREEN}\`\`\`${langSuffix}${RESET}`;
+      return `${fence[0]}${DIM}${GREEN}\`\`\`${langSuffix}${RESET}`;
     }
     if (inCodeFence) {
       // Inside a fenced block — dim everything; preserve indentation.
       return `${DIM}${line}${RESET}`;
     }
     // Headings
-    const heading = /^(\s*)(#{1,6})\s+(.*)$/.exec(line);
+    const heading = headingParts(line);
     if (heading) {
-      const indent = heading[1] ?? "";
-      const level = (heading[2] ?? "").length;
-      const text = heading[3] ?? "";
+      const [indent, hashes, text] = heading;
+      const level = hashes.length;
       const color = HEADING_COLORS[level] ?? BOLD;
       return `${indent}${color}${renderInline(text)}${RESET}`;
     }
     // Unordered list bullets — replace marker with a pretty bullet.
-    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    const bullet = bulletParts(line);
     if (bullet) {
-      return `${bullet[1] ?? ""}${CYAN}•${RESET} ${renderInline(bullet[2] ?? "")}`;
+      return `${bullet[0]}${CYAN}•${RESET} ${renderInline(bullet[1])}`;
     }
     // Ordered list — keep the number, color it.
-    const numbered = /^(\s*)(\d+)\.\s+(.*)$/.exec(line);
+    const numbered = numberedParts(line);
     if (numbered) {
-      return `${numbered[1] ?? ""}${CYAN}${numbered[2]}.${RESET} ${renderInline(numbered[3] ?? "")}`;
+      return `${numbered[0]}${CYAN}${numbered[1]}.${RESET} ${renderInline(numbered[2])}`;
     }
     // Blockquote
     const quote = /^(\s*)>\s?(.*)$/.exec(line);
