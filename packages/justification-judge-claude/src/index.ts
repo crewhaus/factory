@@ -49,6 +49,7 @@ import type { ModelThinking } from "@crewhaus/model-plan";
 import { resolveModel } from "@crewhaus/model-router";
 import type { JustificationJudge, JustificationVerdict } from "@crewhaus/permission-engine";
 import { z } from "zod";
+import { firstObjectSpan } from "./json-span";
 
 export class ClaudeJustificationJudgeError extends CrewhausError {
   override readonly name = "ClaudeJustificationJudgeError";
@@ -148,13 +149,13 @@ export class ClaudeJustificationJudge {
       if (rawText === undefined) {
         return this.failClosed("model returned no text block");
       }
-      // Extract JSON: tolerate ```json fences and leading prose. Search for
-      // the first balanced `{...}` substring (mirrors the sibling).
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (jsonMatch === null) {
+      // Extract JSON: tolerate ```json fences and leading prose. Take the
+      // first `{` through the last `}` (mirrors the sibling).
+      const json = firstObjectSpan(rawText);
+      if (json === null) {
         return this.failClosed("model response did not contain a JSON object");
       }
-      const parsed = VERDICT_SCHEMA.parse(JSON.parse(jsonMatch[0]));
+      const parsed = VERDICT_SCHEMA.parse(JSON.parse(json));
       return {
         allow: parsed.allow,
         reason: parsed.reason,
