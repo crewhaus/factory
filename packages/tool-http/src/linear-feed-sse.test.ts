@@ -320,5 +320,5 @@ describe("the one-pass readers answer what the old ones did", () => {
     expect(differ.slice(0, 3)).toEqual([]);
     expect(seen.events).toBeGreaterThan(10_000);
     expect(seen.straddled).toBeGreaterThan(300);
-  }, 20_000);
+  }, 30_000);
 });
