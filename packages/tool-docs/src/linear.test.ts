@@ -12,7 +12,9 @@
  *
  * Each old regex is kept here as an ORACLE and run on small inputs only, so
  * the equivalence is checked without ever pinning a core; the hostile inputs
- * run through the new code alone, and their work is counted, not timed.
+ * run through the new code alone. Their work is counted, and a hang backstop
+ * at the end of this file runs them again at full size, uncounted, for the
+ * work the counts cannot see.
  */
 import { describe, expect, test } from "bun:test";
 import { type RegexWork, regexWork, regexWorkAsync } from "./__test__/regex-work";
@@ -32,7 +34,14 @@ import { parseToUnicodeCMap } from "./lib/pdf-text";
  * with the input's length: these inputs are about the sizes that took it a
  * second to half a minute, where it takes 600 to 1 900 times the bound. A
  * count past its bound stops the parse there and reads as Infinity, so a
- * quadratic parse fails at once, however fast or slow the machine.
+ * parse that rereads its input through a regex or a counted string method
+ * fails at once, however fast or slow the machine.
+ *
+ * The counts see nothing else. A scan that looks for its closer with
+ * indexed reads (`text[j]`), or with a method scan-work.ts does not wrap
+ * (`startsWith`, `trim`, `join`, an array's `indexOf`), is charged nothing
+ * however often it rereads its input, and passes them. The hang backstop
+ * at the end of this file is what catches it.
  */
 const STEPS_PER_CHARACTER = 64;
 const SCAN_PER_CHARACTER = 32;
@@ -387,5 +396,76 @@ describe("parseToUnicodeCMap", () => {
     // Slow by construction: the cap is sixteen full code spaces, so each
     // call writes 1 048 576 map entries before it answers. That is about
     // 75 ms here and took up to 2.9 s on CI, over half bun's 5 s default.
+  }, 20_000);
+});
+
+/**
+ * The hang backstop: each hostile input again, at full size and uncounted,
+ * must finish inside HANG_MS. It catches a quadratic scan however it is
+ * written, the ones the counts cannot see included. It is a pure hang
+ * detector, with one bound for each input. The scans take at most about
+ * 20 ms an input here, after the counted tests, and this package's tests
+ * have run up to 27 times slower on CI, so the bound is more than 20 times
+ * any input's passing time there. A scan that looks for its closer again
+ * after every opener, by indexed reads, takes a minute and a half to many
+ * minutes here on each of these inputs, and longer on a slower runner.
+ */
+const HANG_MS = 15_000;
+
+/** `run` finishes on `input` inside HANG_MS. */
+async function finishes(input: string, run: () => unknown): Promise<void> {
+  const started = performance.now();
+  await run();
+  const hung = performance.now() - started >= HANG_MS;
+  expect({ input, hung }).toEqual({ input, hung: false });
+}
+
+describe("the hang backstop: every hostile input finishes at full size", () => {
+  test("stripHtml", async () => {
+    const inputs: Array<[string, string]> = [
+      ["'<'", "<".repeat(400_000)],
+      ["'<style'", "<style".repeat(200_000)],
+      ["'<SCRIPT'", "<SCRIPT".repeat(200_000)],
+      ["spaces then x", `${" ".repeat(800_000)}x`],
+      ["tabs and spaces then x", `${"\t ".repeat(400_000)}x\n`],
+      ["'</'", "</".repeat(400_000)],
+      ["'</styl' in a style", `<style>${"</styl".repeat(150_000)}`],
+    ];
+    for (const [input, text] of inputs) await finishes(input, () => stripHtml(text));
+  }, 20_000);
+
+  test("EmlParse on an HTML-only message", async () => {
+    // A body part is cut to maxBodyChars before it is stripped, so this asks
+    // for the most a caller may, and the HTML stripped is 1 MB.
+    const message = [
+      "From: a@x.test",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      "<style".repeat(200_000),
+    ].join("\r\n");
+    await finishes("an HTML-only message", () =>
+      emlParse.execute({ content: message, asText: true, maxBodyChars: 1_000_000 }, {} as never),
+    );
+  }, 20_000);
+
+  test("parseAddressList", async () => {
+    const piece = "<".repeat(400_000);
+    await finishes("'<'", () => parseAddressList(piece, new Set()));
+  }, 20_000);
+
+  test("parseMailDate, in a message and alone", async () => {
+    const message = `From: a@x.test\r\nDate: ${"(".repeat(400_000)}\r\n\r\nbody\r\n`;
+    await finishes("a message's Date", () => emlParse.execute({ content: message }, {} as never));
+    const date = "(".repeat(800_000);
+    await finishes("a Date", () => parseMailDate(date));
+  }, 20_000);
+
+  test("parseToUnicodeCMap", async () => {
+    const inputs: Array<[string, string]> = [
+      ["unclosed bfchar sections", "beginbfchar ".repeat(400_000)],
+      ["unclosed bfrange sections", "beginbfrange ".repeat(400_000)],
+      ["'[' lists with no ']'", `beginbfrange ${"<1> <2> [".repeat(200_000)} endbfrange`],
+    ];
+    for (const [input, text] of inputs) await finishes(input, () => parseToUnicodeCMap(text));
   }, 20_000);
 });

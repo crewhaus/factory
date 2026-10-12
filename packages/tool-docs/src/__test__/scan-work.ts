@@ -21,7 +21,11 @@
  * would take. Every original is put back before this returns.
  *
  * What it cannot see is a property read (`text[i]`), a `Map`, or the work
- * inside a method it does not wrap (`trim`, `join`). A regular expression's
+ * inside a method it does not wrap (`startsWith`, `trim`, `toLowerCase`,
+ * `join`, `replace` with a string, an array's `indexOf`). A scan that
+ * rereads its input that way is charged nothing, and passes any bound set
+ * on this count; linear.test.ts's hang backstop, which runs each input again
+ * at full size and uncounted, is what catches it. A regular expression's
  * backtracking is regex-work.ts's to count.
  */
 
