@@ -1,0 +1,95 @@
+/**
+ * line-parts.ts reads a `## heading` without `/^##\s+(.*)$/`, which gave back
+ * the spaces after `##` one at a time when the line ended in a `\r`.
+ */
+import { describe, expect, test } from "bun:test";
+import { handoffCueLines } from "./index";
+import { h2Text } from "./line-parts";
+
+const H2 = /^##\s+(.*)$/;
+
+/** Every concatenation of up to `depth` of `pieces`, `visit`ed; returns how many. */
+function everyText(pieces: readonly string[], depth: number, visit: (t: string) => void): number {
+  let count = 0;
+  const walk = (text: string, d: number): void => {
+    visit(text);
+    count++;
+    if (d === depth) return;
+    for (const p of pieces) walk(text + p, d + 1);
+  };
+  walk("", 0);
+  return count;
+}
+
+/** `n` seeded pseudo-random concatenations of 1 to `maxPieces` of `pieces`. */
+function randomTexts(pieces: readonly string[], n: number, maxPieces: number): string[] {
+  let seed = 0x7f4a7c15;
+  const next = (bound: number): number => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return (seed >>> 0) % bound;
+  };
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    let text = "";
+    const length = 1 + next(maxPieces);
+    for (let k = 0; k < length; k++) text += pieces[next(pieces.length)];
+    out.push(text);
+  }
+  return out;
+}
+
+/**
+ * Runs `body` with every regular expression run over a text holding `run`
+ * refused on the spot and recorded. Replacing `RegExp.prototype.exec` routes
+ * every String and RegExp method that runs a pattern through it (the control
+ * below checks that); restored after.
+ */
+function patternsOver<T>(run: string, body: () => T): { refused: string[]; outcome: T | Error } {
+  const refused: string[] = [];
+  const realExec = RegExp.prototype.exec;
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    if (typeof input === "string" && input.includes(run)) {
+      refused.push(`/${this.source}/`);
+      throw new Error(`/${this.source}/ ran over the run`);
+    }
+    return realExec.call(this, input);
+  };
+  try {
+    return { refused, outcome: body() };
+  } catch (err) {
+    return { refused, outcome: err as Error };
+  } finally {
+    RegExp.prototype.exec = realExec;
+  }
+}
+
+describe("h2Text", () => {
+  test("returns what the pattern captured", () => {
+    const pieces = ["##", "#", " ", "\t", "\r", "\u2028", "a", "Next actions", "\n"];
+    const differ: string[] = [];
+    let matched = 0;
+    const visit = (line: string): void => {
+      const want = H2.exec(line)?.[1];
+      if (want !== undefined) matched++;
+      if (h2Text(line) !== want) differ.push(line);
+    };
+    const checked = everyText(pieces, 5, visit);
+    for (const line of randomTexts(pieces, 20_000, 10)) visit(line);
+    expect(differ).toEqual([]);
+    expect(checked).toBe((9 ** 6 - 1) / 8);
+    expect(matched).toBeGreaterThan(1_000);
+  }, 20_000);
+
+  // Counted, not timed: no pattern runs over the run of spaces.
+  test("a CRLF handoff with a long run of spaces after ## runs no pattern over it", () => {
+    const run = " ".repeat(10_000);
+    // Control: the hook sees the pattern RegExp#exec runs.
+    expect(patternsOver(run, () => H2.exec(`##${run}x\r`)).refused).toEqual([`/${H2.source}/`]);
+    const handoff = `## Next actions\r\n1. ship it\r\n##${" ".repeat(200_000)}x\r\n1. not a cue`;
+    const cues = patternsOver(run, () => handoffCueLines(handoff));
+    expect(cues.refused).toEqual([]);
+    expect(cues.outcome).toEqual([]);
+  });
+});
