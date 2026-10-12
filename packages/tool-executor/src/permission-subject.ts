@@ -599,7 +599,7 @@ type CommandReading = {
 function runDirSpellings(runsIn: string, dirValues: ReadonlyArray<OperativeValue>): string[] {
   const out = new Set<string>();
   const add = (d: string): void => {
-    const trimmed = d.replace(/[\\/]+$/, "");
+    const trimmed = withoutTrailingSeparators(d);
     if (trimmed !== "" && trimmed !== ".") out.add(trimmed);
   };
   add(runsIn);
@@ -610,6 +610,22 @@ function runDirSpellings(runsIn: string, dirValues: ReadonlyArray<OperativeValue
     }
   }
   return [...out];
+}
+
+/**
+ * `text` without its trailing `/` and `\`: what `text.replace(/[\\/]+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of separators that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and a directory or a
+ * PATH entry is whatever the call wrote.
+ */
+export function withoutTrailingSeparators(text: string): string {
+  let end = text.length;
+  for (; end > 0; end--) {
+    const c = text.charCodeAt(end - 1);
+    if (c !== 0x2f && c !== 0x5c) break;
+  }
+  return end === text.length ? text : text.slice(0, end);
 }
 
 /**
@@ -708,7 +724,7 @@ function commandSpellings(
     const pathEntries = value.split(":");
     if (pathEntries.length > MAX_ENV_WORDS) unreadable = true;
     for (const raw of pathEntries.slice(0, MAX_ENV_WORDS)) {
-      const entry = raw === "" ? "." : raw.replace(/[\\/]+$/, "") || "/";
+      const entry = raw === "" ? "." : withoutTrailingSeparators(raw) || "/";
       const found = new Set<string>();
       if (isAbsolutePath(entry)) {
         found.add(`${entry === "/" ? "" : entry}/${program}`);
