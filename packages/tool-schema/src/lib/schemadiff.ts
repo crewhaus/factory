@@ -475,10 +475,61 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
 }
 
 /**
+ * The deepest a schema may nest, counting every object and array, for it to
+ * be diffed. Each level is a level of recursion here, and the stack's own
+ * limit moves with the platform and with how warm the code is: a schema
+ * near it came back answered in one process and as a crash in another. A
+ * fixed limit answers the same everywhere. It also bounds the pointers: every
+ * change carries its full path, so a schema differing at every level made a
+ * result the square of its depth. The same limit tool-data puts on a
+ * document.
+ */
+export const MAX_SCHEMA_DEPTH = 256;
+
+/**
+ * Whether `value` nests deeper than `limit` objects and arrays, read with an
+ * explicit stack and abandoned as soon as it does. An object reached again
+ * (only a caller's own value can share one) is walked again only when it is
+ * reached deeper, so a cycle is too deep rather than endless.
+ */
+export function nestsDeeperThan(value: unknown, limit: number): boolean {
+  const deepest = new Map<object, number>();
+  const stack: Array<{ readonly node: unknown; readonly depth: number }> = [
+    { node: value, depth: 1 },
+  ];
+  for (let top = stack.pop(); top !== undefined; top = stack.pop()) {
+    const { node, depth } = top;
+    if (typeof node !== "object" || node === null) continue;
+    if (depth > limit) return true;
+    const before = deepest.get(node);
+    if (before !== undefined && before >= depth) continue;
+    deepest.set(node, depth);
+    const children: ReadonlyArray<unknown> = Array.isArray(node) ? node : Object.values(node);
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      if (typeof child === "object" && child !== null)
+        stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+  return false;
+}
+
+/**
  * Diff two schemas and classify each change. See the module comment for what
  * "compatible" means here and for the cases deliberately left `unknown`.
+ * Refuses a schema nested past {@link MAX_SCHEMA_DEPTH}, before reading it.
  */
 export function diffSchemas(before: unknown, after: unknown): SchemaDiffResult {
+  for (const [side, schema] of [
+    ["before", before],
+    ["after", after],
+  ] as const) {
+    if (nestsDeeperThan(schema, MAX_SCHEMA_DEPTH)) {
+      throw new Error(
+        `\`${side}\` nests deeper than ${MAX_SCHEMA_DEPTH} levels, the most SchemaDiff compares — diff the nested part on its own`,
+      );
+    }
+  }
   // Every subtree of both schemas numbered once, so the comparisons below at
   // each level of nesting, and the enum diffs, are lookups rather than walks.
   const ctx: Ctx = { changes: [], same: indexShapes([before, after]) };

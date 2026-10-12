@@ -682,6 +682,9 @@ export const validateReferences: RegisteredTool = buildTool({
   },
 });
 
+/** The most characters the paths of the changes SchemaDiff lists may add up to. */
+export const MAX_LISTED_PATH_CHARS = 1_000_000;
+
 export const schemaDiff: RegisteredTool = buildTool({
   name: "SchemaDiff",
   description:
@@ -702,12 +705,31 @@ export const schemaDiff: RegisteredTool = buildTool({
       input.breakingOnly === true
         ? result.changes.filter((c) => c.compat !== "compatible")
         : result.changes;
+    // Every change carries its full path, so one long name high in a schema
+    // is repeated in every change below it: a result the square of the
+    // input. The changes are listed until their paths reach the cap, and
+    // the rest are counted; the verdict and the counts cover them all.
+    const listed: typeof changes = [];
+    let pathChars = 0;
+    for (const change of changes) {
+      pathChars += change.path.length;
+      if (pathChars > MAX_LISTED_PATH_CHARS) break;
+      listed.push(change);
+    }
+    const omitted = changes.length - listed.length;
     return json({
       identical: result.identical,
       verdict: result.verdict,
       backwardCompatible: result.backwardCompatible,
       counts: result.counts,
-      changes,
+      changes: listed,
+      ...(omitted > 0
+        ? {
+            truncated: true,
+            omitted,
+            detail: `${omitted} of the ${changes.length} changes are not listed: their paths would pass ${MAX_LISTED_PATH_CHARS} characters. The verdict and counts cover every change; diff a nested part on its own to list the rest`,
+          }
+        : {}),
       note: "backward compatible means every value valid under `before` is still valid under `after`",
     });
   },
