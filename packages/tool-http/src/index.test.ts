@@ -76,18 +76,25 @@ async function run(tool: RegisteredTool, input: unknown): Promise<any> {
  * never, so a deadline of that length cannot fire however slow the runner
  * is, while its clock (`expired()`) still runs. Other timers run as usual.
  * For tests about what a failure is CALLED once the clock has run out,
- * which must not depend on whether the deadline's timer won a race.
+ * which must not depend on whether the deadline's timer won a race. Each
+ * held timer's callback is appended to `fire`, when given, in the order
+ * they were set, for a test that fires one itself.
  */
-async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T> {
+async function withTimersHeld<T>(
+  ms: number,
+  body: () => Promise<T>,
+  fire?: Array<() => void>,
+): Promise<T> {
   const realSetTimeout = globalThis.setTimeout;
   const held = spyOn(globalThis, "setTimeout").mockImplementation(((
     fn: (...args: unknown[]) => void,
     delay?: number,
     ...rest: unknown[]
-  ) =>
-    delay === ms
-      ? (0 as unknown as ReturnType<typeof setTimeout>)
-      : realSetTimeout(fn, delay, ...rest)) as typeof setTimeout);
+  ) => {
+    if (delay !== ms) return realSetTimeout(fn, delay, ...rest);
+    fire?.push(() => fn(...rest));
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
   try {
     return await body();
   } finally {
@@ -184,6 +191,8 @@ let flakyCalls = 0;
  */
 let echoSeen: Array<{ authorization: string | null; apiKey: string | null }> = [];
 let jobCalls = 0;
+/** Called as `/slow` begins its sleep, so a test can act while it is in flight. */
+let onSlow: (() => void) | undefined;
 
 const FEED_XML = `<?xml version="1.0"?><rss version="2.0"><channel>
   <title>Releases</title><link>http://x.test</link>
@@ -235,6 +244,7 @@ async function mainHandler(req: Request): Promise<Response> {
   }
 
   if (p === "/slow") {
+    onSlow?.();
     await Bun.sleep(2_000);
     return new Response("late");
   }
@@ -388,6 +398,7 @@ async function mainHandler(req: Request): Promise<Response> {
 beforeEach(() => {
   flakyCalls = 0;
   jobCalls = 0;
+  onSlow = undefined;
   echoSeen = [];
   main = Bun.serve({ port: 0, fetch: mainHandler });
   other = Bun.serve({
@@ -1156,14 +1167,32 @@ describe("HttpBatch", () => {
   test("one request's deadline does not leak into the requests after it", async () => {
     // One at a time, so /json is issued only after /slow's deadline has fired.
     // If that abort reached the batch's own signal, /json would start already
-    // cancelled. /slow cannot win the race: its 2s sleep and this 1s deadline
-    // share one event loop, and the deadline expires first however late both
-    // run.
-    const result = await run(httpBatch, {
-      requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
-      timeoutMs: 1_000,
-      concurrency: 1,
+    // cancelled. Each request's 1 s deadline timer is held: /slow's is fired
+    // from here once /slow is in flight, and /json's never fires, so neither
+    // the runner's speed nor /slow's 2 s sleep decides the outcome.
+    const deadlines: Array<() => void> = [];
+    const slowInFlight = new Promise<"in flight">((resolve) => {
+      onSlow = () => resolve("in flight");
     });
+    const result = await withTimersHeld(
+      1_000,
+      async () => {
+        const pending = run(httpBatch, {
+          requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
+          timeoutMs: 1_000,
+          concurrency: 1,
+        });
+        const first = await Promise.race([slowInFlight, pending.then(() => "settled")]);
+        expect(first).toBe("in flight");
+        // Only /slow's deadline is armed yet; it fires now, mid-request.
+        expect(deadlines).toHaveLength(1);
+        deadlines[0]?.();
+        return pending;
+      },
+      deadlines,
+    );
+    // /json was given a deadline of its own, which never fired.
+    expect(deadlines).toHaveLength(2);
     expect(result.results[0].ok).toBe(false);
     // The reason, not just the failure: a batch-wide abort is `ok: false` too.
     expect(result.results[0].error).toContain("deadline");
