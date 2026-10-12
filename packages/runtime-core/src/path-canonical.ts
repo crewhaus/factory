@@ -411,9 +411,6 @@ function readWorkspacePath(
       ...(isNonDirectory(real) ? { notDirectory: true } : {}),
     };
   };
-  // Longer than any path can be: no tool acts on it, and it is not walked —
-  // not even for an approval's place.
-  if (lexicalAbs.length > MAX_PATH_CHARS) return read([outside], [unresolved]);
   if (climbsOut(lexicalRel)) {
     // A rule needs only the flag. The place is walked for only when an
     // approval asks, so a grant made for one place outside is not spent on
@@ -422,6 +419,8 @@ function readWorkspacePath(
     // name, the square of a length the model chooses.
     return read([outside], () => [walked(lexicalAbs) ?? unresolved]);
   }
+  // Longer than any path can be: no tool acts on it, and it is not walked.
+  if (lexicalAbs.length > MAX_PATH_CHARS) return read([outside], [unresolved]);
   if (lexicalAbs === rootAbs) {
     caseInsensitive = ignoresCase(rootReal) !== false;
     return read([located(rootReal)], [toPosix(rootReal)]);
