@@ -4377,3 +4377,49 @@ describe("interp review — the words a shell's options take", () => {
     expect({ got, ran: ran() }).toEqual({ got: "allow", ran: "safe/ok.sh" });
   }, 60_000);
 });
+
+describe("critic9 — a deny that fired in 0.7.0 still fires", () => {
+  // 0.7.0 knew no field of these tools and read a rule against every string
+  // in the call: a session read that names only its session matched
+  // `alwaysDeny EventQuery(sess-prod-*)`. The tool now declares its store
+  // directory (left out here, so its default stands in), and a deny on the
+  // session id was read against that alone, and went quiet.
+  const MARKER = "PROD-MARKER-42";
+  beforeEach(() => {
+    mkdirSync(join(ws, ".crewhaus", "sessions"), { recursive: true });
+    const line = (text: string) =>
+      `${JSON.stringify({ kind: "tool_use", ts: "2026-01-01T00:00:00.000Z", toolName: "Bash", input: { command: `echo ${text}` } })}\n`;
+    writeFileSync(join(ws, ".crewhaus", "sessions", "sess-prod-1.jsonl"), line(MARKER));
+    writeFileSync(join(ws, ".crewhaus", "sessions", "sess-dev-1.jsonl"), line("dev"));
+  });
+
+  test("a deny or ask on the call's only string holds in every mode; the log stays unread", async () => {
+    for (const name of ["EventQuery", "RunTimeline", "EventCounts"]) {
+      for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+        for (const mode of ["default", "auto", "plan"] as const) {
+          const rs = rules([type, `${name}(sess-prod-*)`], ["alwaysAllow", name]);
+          const got = await gate(name, { sessionId: "sess-prod-1" }, rs, mode);
+          const want = type === "alwaysDeny" || mode === "plan" ? "deny" : "ask";
+          expect({
+            name,
+            type,
+            mode,
+            got,
+            read: (lastResult ?? "").includes(MARKER),
+          }).toEqual({ name, type, mode, got: want, read: false });
+        }
+      }
+    }
+  }, 60_000);
+
+  test("control: another session runs, and an allow is not widened by the 0.7.0 reading", async () => {
+    const deny = rules(["alwaysDeny", "EventQuery(sess-prod-*)"], ["alwaysAllow", "EventQuery"]);
+    expect(await gate("EventQuery", { sessionId: "sess-dev-1" }, deny)).toBe("allow");
+    expect(lastResult ?? "").toContain("echo dev");
+    // A second string the deny does not name stops it, as it did in 0.7.0.
+    expect(await gate("EventQuery", { sessionId: "sess-prod-1", runId: "r1" }, deny)).toBe("allow");
+    // An allow reads the declared store only: naming the session grants nothing.
+    const allow = rules(["alwaysAllow", "EventQuery(sess-prod-*)"]);
+    expect(await gate("EventQuery", { sessionId: "sess-prod-1" }, allow)).toBe("ask");
+  }, 30_000);
+});

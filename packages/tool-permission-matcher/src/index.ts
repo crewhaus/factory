@@ -1008,10 +1008,16 @@ export type MatchOptions = {
    * Present but empty ⇒ the tool declares operative fields and this call
    * carries none of them (and no default stands in): no argument-scoped
    * allow can match it, and a deny or ask fires when EVERY string value of
-   * the call matches (0.7.0's reading of a tool it knew no field of) —
-   * `alwaysDeny WebhookPost(**)` still fires on a call that names its URL
-   * through `urlEnv`, and `WebhookPost(http://**)` is not set off by a link
-   * in its payload.
+   * the call matches (0.7.0's reading of a tool it knew no field of): a
+   * call that leaves out every field the tool declares still meets
+   * `alwaysDeny T(**)`, and a link in its text does not set off
+   * `alwaysDeny T(http://**)`.
+   *
+   * Present and not empty ⇒ an allow reads the values alone. A deny or ask
+   * fires on any of them, and still also when every string value of the
+   * call matches, as it did in 0.7.0: a rule naming what the tool now
+   * reads as a filter or a label (`alwaysDeny RunTimeline(<session id>)`,
+   * the call's only string) keeps firing.
    */
   readonly operativeValues?: ReadonlyArray<OperativeValue>;
 };
@@ -1788,14 +1794,12 @@ function beneathFires(
  *
  * An allow skips a `restrictOnly` value (a relocating field's default). A
  * call with no operative value an allow can read matches no
- * argument-scoped allow. A deny or ask on a call that carries none of its
- * tool's declared operative fields is matched against the call's string
- * values instead, the way 0.7.0 matched a tool it knew no field of: EVERY
- * string must match, and a call with none matches nothing. So leaving
- * every optional operative field out does not dodge `alwaysDeny Tool(**)`,
- * while a deny about a destination (`WebhookPost(http://**)`) is not set
- * off by a link inside the payload of a call that names its destination
- * through `urlEnv`.
+ * argument-scoped allow. A deny or ask is also matched against the call's
+ * string values the way 0.7.0 matched a tool it knew no field of: EVERY
+ * string must match, and a call with none matches nothing. So a deny that
+ * fired in 0.7.0 still fires, leaving every optional operative field out
+ * does not dodge `alwaysDeny Tool(**)`, and a deny about a destination
+ * (`Tool(http://**)`) is not set off by a link inside a payload.
  */
 export function matchesPattern(
   compiled: CompiledPattern,
@@ -1823,7 +1827,16 @@ export function matchesPattern(
       strings.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
     );
   }
-  return values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
+  if (values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))) return true;
+  // A deny or ask that fired in 0.7.0 still fires. 0.7.0 read a tool it
+  // knew no field of by every string in the call, so a rule naming a value
+  // the tool now reads as a filter or a label (`alwaysDeny
+  // EventQuery(<session id>)`, the call's only string while its directory
+  // is left out) fired on it. The declared values decide on their own for
+  // an allow; for a deny or ask that reading is kept beside them.
+  if (options.operativeValues === undefined) return false;
+  const strings = stringValues(input);
+  return strings.length > 0 && strings.every((s) => argRe.test(s));
 }
 
 export {

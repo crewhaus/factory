@@ -1857,49 +1857,49 @@ describe("a relocating field's default is read by a deny or ask, and skipped by 
 });
 
 describe("a deny or ask on a call that carries none of its declared operative fields", () => {
-  // WebhookPost {urlEnv, payload}: the destination is named through an
-  // operator-listed environment variable, so the declared `url` is absent.
-  const input = { urlEnv: "HOOK_URL", payload: { note: "hello" } };
+  // A tool whose declared destination fields are all optional, called with
+  // none of them: what it carries is a handle and a payload.
+  const input = { handle: "HOOK_URL", payload: { note: "hello" } };
   const fires = (pattern: string) =>
-    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+    matchesPattern(compilePattern(pattern), "PostAlert", input, {
       ...restrict,
       operativeValues: [],
     });
   const grants = (pattern: string) =>
-    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+    matchesPattern(compilePattern(pattern), "PostAlert", input, {
       ...allow,
       operativeValues: [],
     });
 
   test("fires when every string value of the call matches, as 0.7.0 read such a call", () => {
-    expect(fires("WebhookPost(**)")).toBe(true);
+    expect(fires("PostAlert(**)")).toBe(true);
     // One string matching is not enough: 0.7.0 needed every one, and a
     // deny about one value would otherwise fire on unrelated payload text.
-    expect(fires("WebhookPost(HOOK_URL)")).toBe(false);
+    expect(fires("PostAlert(HOOK_URL)")).toBe(false);
     // A deny about a place the call does not name still does not fire.
-    expect(fires("WebhookPost(https://evil.example/**)")).toBe(false);
+    expect(fires("PostAlert(https://evil.example/**)")).toBe(false);
   });
 
   test("a destination deny is not set off by a link inside the payload", () => {
-    // An ordinary alert whose destination is named through urlEnv, with a
-    // link in its text: `WebhookPost(http://**)` is about where the post
-    // goes, which this call does not say, and 0.7.0 allowed it.
+    // An ordinary alert that does not name its destination, with a link in
+    // its text: `PostAlert(http://**)` is about where the post goes, which
+    // this call does not say, and 0.7.0 allowed it.
     const alert = {
-      urlEnv: "ALERT_WEBHOOK_URL",
+      handle: "ALERT_WEBHOOK_URL",
       payload: { text: "Deploy failed", link: "http://status.internal/incident/42" },
     };
     const deny = (pattern: string, input: unknown) =>
-      matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+      matchesPattern(compilePattern(pattern), "PostAlert", input, {
         ...restrict,
         operativeValues: [],
       });
-    expect(deny("WebhookPost(http://**)", alert)).toBe(false);
-    expect(deny("WebhookPost(**)", alert)).toBe(true);
+    expect(deny("PostAlert(http://**)", alert)).toBe(false);
+    expect(deny("PostAlert(**)", alert)).toBe(true);
   });
 
   test("no argument-scoped allow can match it", () => {
-    expect(grants("WebhookPost(**)")).toBe(false);
-    expect(grants("WebhookPost(HOOK_URL)")).toBe(false);
+    expect(grants("PostAlert(**)")).toBe(false);
+    expect(grants("PostAlert(HOOK_URL)")).toBe(false);
   });
 
   test("a call with no string at all still matches no argument-scoped deny", () => {
@@ -1913,5 +1913,37 @@ describe("a deny or ask on a call that carries none of its declared operative fi
       },
     );
     expect(empty).toBe(false);
+  });
+});
+
+describe("a deny or ask that fired in 0.7.0 still fires beside the declared values", () => {
+  // EventQuery's shape: its directory is left out (the default stands in),
+  // and the call's only string is the session it filters by — what 0.7.0,
+  // knowing no field of the tool, matched every rule against.
+  const input = { sessionId: "sess-prod-1" };
+  const store: OperativeValue = { kind: "path", canonical: [".crewhaus/sessions"] };
+  const read = (pattern: string, polarity: "allow" | "restrict", strings: unknown = input) =>
+    matchesPattern(compilePattern(pattern), "EventQuery", strings, {
+      polarity,
+      operativeValues: [store],
+    });
+
+  test("a deny written on the call's only string fires, as it did in 0.7.0", () => {
+    expect(read("EventQuery(sess-prod-*)", "restrict")).toBe(true);
+    expect(read("EventQuery(*)", "restrict")).toBe(true);
+    // ... and the declared value is still read on its own.
+    expect(read("EventQuery(.crewhaus/**)", "restrict")).toBe(true);
+    expect(read("EventQuery(sess-dev-*)", "restrict")).toBe(false);
+  });
+
+  test("0.7.0 needed every string: one more that does not match stops it, as then", () => {
+    const two = { sessionId: "sess-prod-1", kind: "tool_call_end" };
+    expect(read("EventQuery(sess-prod-*)", "restrict", two)).toBe(false);
+    expect(read("EventQuery(*)", "restrict", two)).toBe(true);
+  });
+
+  test("an allow still reads the declared values alone", () => {
+    expect(read("EventQuery(sess-prod-*)", "allow")).toBe(false);
+    expect(read("EventQuery(.crewhaus/**)", "allow")).toBe(true);
   });
 });
