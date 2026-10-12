@@ -9,7 +9,8 @@
  * `notMatches` passed a value it should have stopped and `not: {pattern}`
  * called a forbidden value valid (C073, C089).
  */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, test as bunTest, describe, expect, spyOn } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { assert, jsonSchemaValidate, validateRecords } from "./index";
 import { runChecks } from "./lib/assert";
 import { checkSchemaShape, validateValue } from "./lib/jsonschema";
@@ -47,19 +48,44 @@ const SLOW = { pattern: "a*a*a*a*b", input: "a".repeat(120) };
 /** Exponential: the screen refuses it, and JSC would give up and say "no match". */
 const CATASTROPHIC = "(a+)+!$|refund";
 
-/** Worker sessions opened, and the testEach questions put to them, in order. */
-let sessions = 0;
-let asked: Array<{ pattern: string; inputs: string[] }> = [];
-/** SLOW runs over its input on the caller's thread, where nothing can stop them. */
-let onThisThread = 0;
+/**
+ * What one test body's calls did: the worker sessions they opened, the
+ * testEach questions put to those, in order, and the runs of SLOW over its
+ * input on the caller's thread, where nothing can stop them.
+ */
+type Seen = {
+  sessions: number;
+  asked: Array<{ pattern: string; inputs: string[] }>;
+  onThisThread: number;
+};
 
-function givesUpOnSlow(real: RegexSession): RegexSession {
-  sessions += 1;
+/**
+ * Each test body runs with a {@link Seen} of its own, and what a call does is
+ * recorded in the one of the body that made it. A body abandoned at its
+ * budget keeps running into the tests after it, and its sessions open under
+ * whatever those tests installed; it must not write into their record.
+ */
+const seenBy = new AsyncLocalStorage<Seen>();
+
+/** What the running test body's calls have done so far. */
+function seen(): Seen {
+  const mine = seenBy.getStore();
+  if (mine === undefined) throw new Error("asked outside a test body of this file");
+  return mine;
+}
+
+/** bun's `test`, with the body run under a {@link Seen} of its own. */
+function test(name: string, body: () => void | Promise<void>): void {
+  bunTest(name, () => seenBy.run({ sessions: 0, asked: [], onThisThread: 0 }, body));
+}
+
+function givesUpOnSlow(real: RegexSession, mine: Seen): RegexSession {
+  mine.sessions += 1;
   return {
     run: (request) => {
       const r = request as Asked;
       if (r.op === "testEach") {
-        asked.push({ pattern: String(r.pattern), inputs: [...(r.inputs as string[])] });
+        mine.asked.push({ pattern: String(r.pattern), inputs: [...(r.inputs as string[])] });
       }
       if (r.op !== "testEach" || r.pattern !== SLOW.pattern) {
         return real.run({ ...request, giveUpMs: 60_000 });
@@ -84,37 +110,35 @@ function givesUpOnSlow(real: RegexSession): RegexSession {
   };
 }
 
+/** Taken before any test replaces it. */
+const NATIVE_EXEC = RegExp.prototype.exec;
+
+/** A run of SLOW over its input on this thread, as in 0.7.0, is counted and refused. */
+function refuseSlowHere(this: RegExp, text: string): RegExpExecArray | null {
+  if (this.source === SLOW.pattern && text === SLOW.input) {
+    const mine = seenBy.getStore();
+    if (mine !== undefined) mine.onThisThread += 1;
+    throw new Error(`/${this.source}/ ran over the input on the caller's thread`);
+  }
+  return NATIVE_EXEC.call(this, text);
+}
+
+// Installed and put back around every test, never around a call: a call
+// that outlives its test would otherwise restore what it found, after the
+// next test had installed its own.
 beforeEach(() => {
-  sessions = 0;
-  asked = [];
-  onThisThread = 0;
-  _setRegexAnswersSessionForTest(givesUpOnSlow);
+  _setRegexAnswersSessionForTest((real) => givesUpOnSlow(real, seen()));
+  RegExp.prototype.exec = refuseSlowHere;
 });
 
 afterEach(() => {
   _setRegexAnswersSessionForTest(undefined);
+  RegExp.prototype.exec = NATIVE_EXEC;
 });
-
-/** Run `body`. A run of SLOW over its input on this thread, as in 0.7.0, is counted and refused. */
-async function offThisThread<T>(body: () => Promise<T>): Promise<T> {
-  const realExec = RegExp.prototype.exec;
-  RegExp.prototype.exec = function (this: RegExp, text: string) {
-    if (this.source === SLOW.pattern && text === SLOW.input) {
-      onThisThread += 1;
-      throw new Error(`/${this.source}/ ran over the input on the caller's thread`);
-    }
-    return realExec.call(this, text);
-  };
-  try {
-    return await body();
-  } finally {
-    RegExp.prototype.exec = realExec;
-  }
-}
 
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
 async function call(tool: Tool, input: unknown): Promise<any> {
-  const out = await offThisThread(() => tool.execute(tool.inputSchema.parse(input) as never, {}));
+  const out = await tool.execute(tool.inputSchema.parse(input) as never, {});
   return JSON.parse(out as string);
 }
 
@@ -131,8 +155,8 @@ describe("RegexAnswers", () => {
       false,
       true,
     ]);
-    expect(sessions).toBe(1);
-    expect(asked).toEqual([{ pattern: "^\\d+$", inputs: ["1", "x", "22"] }]);
+    expect(seen().sessions).toBe(1);
+    expect(seen().asked).toEqual([{ pattern: "^\\d+$", inputs: ["1", "x", "22"] }]);
   });
 
   test("a pattern still running at the deadline is undetermined, and the thread stays free", async () => {
@@ -143,43 +167,48 @@ describe("RegexAnswers", () => {
     // run its deadline. The caller's clock stands still while resolve reads
     // it, so all 60 ms reach the run, never "ran out before this one could
     // run".
+    const mine = seen();
     const deadlines: number[] = [];
-    _setRegexAnswersSessionForTest((real) => ({
-      run: (request) => {
-        const r = request as Asked & { deadlineMs: number };
-        if (r.op !== "testEach" || r.pattern !== SLOW.pattern) {
-          throw new Error("this script answers SLOW only");
-        }
-        asked.push({ pattern: r.pattern, inputs: [...(r.inputs as string[])] });
-        deadlines.push(r.deadlineMs);
-        return Promise.resolve({
-          status: "timeout",
-          reason: "the deadline passed",
-          deadlineMs: r.deadlineMs,
-          completed: 0,
-          partial: { matched: [], scanned: 0, truncated: false, undetermined: [] },
-        } as never);
-      },
-      close: () => real.close(),
-    }));
-    const answers = new RegexAnswers();
-    await offThisThread(() => {
-      answers.lookup(SLOW.pattern, "", SLOW.input);
-      // resolve reads the clock and hands the run what is left before its
-      // first await, so the clock is back before anything is awaited.
-      const clock = spyOn(performance, "now").mockReturnValue(0);
-      try {
-        return answers.resolve({}, { deadlineMs: 60 });
-      } finally {
-        clock.mockRestore();
-      }
+    _setRegexAnswersSessionForTest((real) => {
+      // A body an earlier test abandoned gets the file's usual session.
+      if (seen() !== mine) return givesUpOnSlow(real, seen());
+      return {
+        run: (request) => {
+          const r = request as Asked & { deadlineMs: number };
+          if (r.op !== "testEach" || r.pattern !== SLOW.pattern) {
+            throw new Error("this script answers SLOW only");
+          }
+          mine.asked.push({ pattern: r.pattern, inputs: [...(r.inputs as string[])] });
+          deadlines.push(r.deadlineMs);
+          return Promise.resolve({
+            status: "timeout",
+            reason: "the deadline passed",
+            deadlineMs: r.deadlineMs,
+            completed: 0,
+            partial: { matched: [], scanned: 0, truncated: false, undetermined: [] },
+          } as never);
+        },
+        close: () => real.close(),
+      };
     });
+    const answers = new RegexAnswers();
+    answers.lookup(SLOW.pattern, "", SLOW.input);
+    // resolve reads the clock and hands the run what is left before its
+    // first await, so the clock is back before anything is awaited.
+    const clock = spyOn(performance, "now").mockReturnValue(0);
+    let resolving: Promise<void>;
+    try {
+      resolving = answers.resolve({}, { deadlineMs: 60 });
+    } finally {
+      clock.mockRestore();
+    }
+    await resolving;
     const answer = answers.lookup(SLOW.pattern, "", SLOW.input);
     expect(answer).toEqual({ undetermined: expect.stringMatching(/timeout/) });
     // Asked of the worker with the whole deadline, and never run here.
-    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(mine.asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
     expect(deadlines).toEqual([60]);
-    expect(onThisThread).toBe(0);
+    expect(mine.onThisThread).toBe(0);
   });
 
   test("a pattern the screen refuses is refused with its reason, not run", async () => {
@@ -241,8 +270,8 @@ describe("Assert", () => {
     });
     // Asked of the worker, and never run here: 0.7.0 held the thread for the
     // whole match.
-    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
-    expect(onThisThread).toBe(0);
+    expect(seen().asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(seen().onThisThread).toBe(0);
     expect(result).toMatchObject({ ok: false, undetermined: 1 });
     expect(result.results[0].reason).toMatch(/could not evaluate \/a\*a\*a\*a\*b\//);
   });
@@ -312,8 +341,8 @@ describe("JsonSchemaValidate and ValidateRecords", () => {
       value: SLOW.input,
       schema: { type: "string", pattern: SLOW.pattern },
     });
-    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
-    expect(onThisThread).toBe(0);
+    expect(seen().asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(seen().onThisThread).toBe(0);
     expect(result).toMatchObject({ valid: null, undetermined: true });
     expect(result.reason).toMatch(/pattern \/a\*a\*a\*a\*b\/ at \/pattern could not be run/);
   });
@@ -344,6 +373,8 @@ describe("JsonSchemaValidate and ValidateRecords", () => {
       summaryOnly: true,
     });
     expect(out).toMatchObject({ ok: false, total: 3, passed: 2, failed: 1 });
-    expect(asked).toEqual([{ pattern: "^[A-Z]{2}-\\d+$", inputs: ["AB-1", "ab-2", "CD-33"] }]);
+    expect(seen().asked).toEqual([
+      { pattern: "^[A-Z]{2}-\\d+$", inputs: ["AB-1", "ab-2", "CD-33"] },
+    ]);
   });
 });
