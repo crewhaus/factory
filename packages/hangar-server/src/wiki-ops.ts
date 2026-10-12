@@ -72,6 +72,7 @@ import {
 import { MAX_TEXT_BYTES } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
+import { headingText } from "./line-parts";
 import type { M3Context, M3Handler } from "./m3";
 import { requireBoolean, requireString } from "./m3";
 import { maskText } from "./mask";
@@ -183,11 +184,11 @@ export type ArticleRead = {
   readonly truncated: boolean;
 };
 
-/** The first `# heading` in a body, as a fallback title. */
-function headingTitle(body: string, fallback: string): string {
+/** The first `# heading` in a body, as a fallback title. Exported for tests. */
+export function headingTitle(body: string, fallback: string): string {
   for (const line of body.split("\n")) {
-    const m = line.match(/^#{1,3}\s+(.*)$/);
-    if (m !== null) return (m[1] ?? "").trim() || fallback;
+    const text = headingText(line);
+    if (text !== undefined) return text.trim() || fallback;
   }
   return fallback;
 }

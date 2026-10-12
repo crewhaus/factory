@@ -66,6 +66,7 @@ import { createMemoryStore } from "@crewhaus/memory-store";
 import { MAX_MEMORY_ITEMS, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readJsonlCapped, readTextCapped } from "./jsonl";
+import { checkboxParts } from "./line-parts";
 import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, requireBoolean, requireString, requireTypedConfirm } from "./m3";
 import { maskDeep, maskText } from "./mask";
@@ -1147,9 +1148,9 @@ function latestExamRun(ctx: M3Context, dataset: string): ExamRun | null {
 export function curriculumRungs(text: string): Array<{ text: string; done: boolean }> {
   const out: Array<{ text: string; done: boolean }> = [];
   for (const line of text.split("\n")) {
-    const m = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.*)$/);
-    if (m === null) continue;
-    out.push({ done: (m[1] ?? " ").toLowerCase() === "x", text: maskText((m[2] ?? "").trim()) });
+    const parts = checkboxParts(line);
+    if (parts === null) continue;
+    out.push({ done: parts[0].toLowerCase() === "x", text: maskText(parts[1].trim()) });
   }
   return out;
 }
