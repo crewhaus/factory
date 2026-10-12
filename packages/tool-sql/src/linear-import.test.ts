@@ -18,8 +18,10 @@
  *
  * Every rewrite is checked against the code it replaced, restated here, on
  * generated inputs: short and long records, empty cells, numbers at and past
- * the 64-bit bounds, duplicate columns, and records whose prototype answers
- * for a column (`constructor`, `toString`, `__proto__`). The work is
+ * the 64-bit bounds, duplicate columns, records whose prototype answers for
+ * a column (`constructor`, `toString`, `__proto__`), and values that throw
+ * when a TEXT column stringifies them, so a record's columns are checked in
+ * the order the old loop checked them. The work is
  * counted, never timed: tool-code's __test__/js-work.ts counts the array
  * searches, iterators and string copies, `Array#map` callbacks are counted
  * here because it does not, and BigInt is counted by the characters it is
@@ -28,6 +30,7 @@
  * A test that walks many generated inputs declares a budget, as the house
  * does for a test that is slow by construction.
  */
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -139,6 +142,24 @@ async function fieldsAsked<T>(
     return { value, calls: tally.calls, fields: tally.fields };
   } finally {
     proto.fields = real;
+  }
+}
+
+/** What `body` returned, or the name of what it threw: a tag two runs can be compared by. */
+function outcome(body: () => unknown): string {
+  try {
+    return `returned ${String(body())}`;
+  } catch (err) {
+    return `threw ${(err as Error).name}`;
+  }
+}
+
+/** JSON for a failure message, or a note when the value will not stringify. */
+function shown(value: unknown): string {
+  try {
+    return JSON.stringify(value, (_, v) => (typeof v === "bigint" ? `${v}n` : v));
+  } catch (err) {
+    return `(unprintable: ${(err as Error).name})`;
   }
 }
 
@@ -469,7 +490,14 @@ describe("the one-pass readers answer what the loops answered", () => {
     const next = rng(0x5eed1003);
     const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(next() * xs.length)] as T;
     const names = ["a", "b", "constructor", "toString", "__proto__", "valueOf", "1", "x y", ""];
+    // Values JSON.stringify throws on, as it does on one nested too deep:
+    // coercing them into a TEXT column throws, so the order the columns are
+    // checked in decides between a rejection and a throw.
+    const cyclic: Record<string, unknown> = {};
+    cyclic["self"] = cyclic;
+    const throwers: unknown[] = [[1n], cyclic];
     const values: unknown[] = [
+      ...throwers,
       null,
       undefined,
       1,
@@ -517,7 +545,7 @@ describe("the one-pass readers answer what the loops answered", () => {
       return out;
     };
     const differ: string[] = [];
-    const seen = { inherited: 0, rejected: 0, integer: 0 };
+    const seen = { inherited: 0, rejected: 0, integer: 0, threw: 0, spared: 0 };
     for (let n = 0; n < 6_000; n++) {
       const columns = Array.from({ length: Math.floor(next() * 6) }, () => pick(names));
       if (next() < 0.4) columns.push(...columns.slice(0, 2));
@@ -525,21 +553,28 @@ describe("the one-pass readers answer what the loops answered", () => {
       const old = columns.map((c) => oldInferTypeFromJson(records.map((r) => r[c])));
       if (old.includes("INTEGER")) seen.integer++;
       if (JSON.stringify(inferJsonColumnTypes(columns, records)) !== JSON.stringify(old)) {
-        differ.push(`types ${JSON.stringify({ columns, records })}`);
+        differ.push(`types ${shown({ columns, records })}`);
       }
       const typed = columns.map(() => pick(types));
       const reader = new JsonColumns(columns);
       for (const r of records) {
         if (columns.some((c) => !Object.hasOwn(r, c) && r[c] !== undefined)) seen.inherited++;
-        const was = oldRejection(columns, r, typed);
-        if (was !== undefined) seen.rejected++;
-        if (jsonRecordRejection(reader, r, typed) !== was) {
-          differ.push(`rejection ${JSON.stringify({ columns, typed, r })}`);
+        const was = outcome(() => oldRejection(columns, r, typed));
+        if (was.startsWith("threw")) seen.threw++;
+        else if (was !== "returned undefined") {
+          seen.rejected++;
+          // A rejection from a record that also holds a value that throws:
+          // the check stopped before it reached that column.
+          if (columns.some((c) => throwers.includes(r[c]))) seen.spared++;
+        }
+        if (outcome(() => jsonRecordRejection(reader, r, typed)) !== was) {
+          differ.push(`rejection ${shown({ columns, typed, r, keys: Object.keys(r) })} ${was}`);
         }
       }
     }
     expect(differ.slice(0, 3)).toEqual([]);
     expect(Math.min(seen.inherited, seen.rejected, seen.integer)).toBeGreaterThan(500);
+    expect(Math.min(seen.threw, seen.spared)).toBeGreaterThan(100);
   }, 20_000);
 
   test("ImportJson's dry run reports what the real import does", async () => {
@@ -547,21 +582,24 @@ describe("the one-pass readers answer what the loops answered", () => {
     const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(next() * xs.length)] as T;
     const keys = ["id", "name", "age", "score", "constructor", "toString"];
     const differ: string[] = [];
-    const seen = { inserted: 0, rejected: 0 };
+    const seen = { inserted: 0, rejected: 0, failed: 0 };
     for (let n = 0; n < 150; n++) {
-      const lines = Array.from({ length: Math.floor(next() * 8) }, () =>
-        JSON.stringify(
-          Object.fromEntries(
-            Array.from({ length: Math.floor(next() * 4) }, () => [
-              pick(keys),
-              pick([1, 2.5, -3, "x", "7", null, true, { a: 1 }, [2]]),
-            ]),
-          ),
+      // Every third run passes its records inline, where a value can be one
+      // JSON.stringify throws on, as on one nested too deep: the import then
+      // fails, or rejects the record first, by the order it checks columns.
+      const inline = n % 3 === 0;
+      const records = Array.from({ length: Math.floor(next() * 8) }, () =>
+        Object.fromEntries(
+          Array.from({ length: Math.floor(next() * 4) }, () => [
+            pick(keys),
+            pick([1, 2.5, -3, "x", "7", null, true, { a: 1 }, [2], ...(inline ? [[1n]] : [])]),
+          ]),
         ),
       );
-      writeFileSync(`in${n}.ndjson`, lines.join("\n"));
+      const from = inline ? { records } : { file: `in${n}.ndjson` };
+      if (!inline) writeFileSync(`in${n}.ndjson`, records.map((r) => JSON.stringify(r)).join("\n"));
       const columns = next() < 0.3 ? { columns: [pick(keys), pick(keys)] } : {};
-      const common = { create: true, file: `in${n}.ndjson`, table: "t", createTable: true };
+      const common = { create: true, ...from, table: "t", createTable: true };
       const dry = parsed(
         await importJson.execute({ ...common, ...columns, database: `dry${n}.db`, dryRun: true }),
       );
@@ -569,7 +607,8 @@ describe("the one-pass readers answer what the loops answered", () => {
         await importJson.execute({ ...common, ...columns, database: `real${n}.db` }),
       );
       if (typeof dry === "string" || typeof real === "string") {
-        if (dry !== real) differ.push(`${JSON.stringify(lines)} :: ${dry} :: ${real}`);
+        if (String(real).startsWith("ImportJson failed:")) seen.failed++;
+        if (dry !== real) differ.push(`${shown(records)} :: ${dry} :: ${real}`);
         continue;
       }
       seen.inserted += real.inserted;
@@ -579,9 +618,67 @@ describe("the one-pass readers answer what the loops answered", () => {
         dry.rejected === real.rejected &&
         JSON.stringify(dry.rejections) === JSON.stringify(real.rejections) &&
         JSON.stringify(dry.columns) === JSON.stringify(real.columns);
-      if (!same) differ.push(`${JSON.stringify(lines)} :: ${JSON.stringify({ dry, real })}`);
+      if (!same) differ.push(`${shown(records)} :: ${JSON.stringify({ dry, real })}`);
     }
     expect(differ.slice(0, 3)).toEqual([]);
     expect(Math.min(seen.inserted, seen.rejected)).toBeGreaterThan(50);
+    expect(seen.failed).toBeGreaterThan(5);
   }, 30_000);
+
+  test("a value too deep to stringify, after a column that fails, is never reached", async () => {
+    // JSON.parse takes a nesting JSON.stringify cannot write back: coercing
+    // it into a TEXT column throws. The real import checks a record's
+    // columns in order and stops at the first that fails, so a record whose
+    // key order puts the deep value first is still a rejection, and the dry
+    // run has to say the same. On a platform whose stack holds this depth
+    // nothing throws, and the rejection is the answer all the same.
+    const depth = 120_000;
+    const deep = `${"[".repeat(depth)}${"]".repeat(depth)}`;
+    const cases = [
+      {
+        // An existing table: column a fails before column b is read.
+        lines: ['{"a":1,"b":"y"}', `{"b":${deep},"a":"x"}`],
+        setup: "CREATE TABLE t (a INTEGER, b TEXT)",
+        columns: undefined,
+        reason: 'field "a": "x" is not an integer',
+      },
+      {
+        // A created table whose first column the record's prototype answers
+        // for: Object.prototype.toString, which no type can store.
+        lines: ['{"toString":"1","deep":"y"}', `{"deep":${deep}}`],
+        setup: undefined,
+        columns: ["toString", "deep"],
+        reason: 'field "toString": values of type function cannot be stored',
+      },
+    ];
+    for (const [index, c] of cases.entries()) {
+      writeFileSync(`deep${index}.ndjson`, c.lines.join("\n"));
+      const answers = [];
+      for (const dryRun of [true, false]) {
+        const database = `deep${index}-${dryRun}.db`;
+        if (c.setup !== undefined) {
+          const db = new Database(database, { create: true });
+          db.run(c.setup);
+          db.close();
+        }
+        answers.push(
+          parsed(
+            await importJson.execute({
+              database,
+              create: true,
+              file: `deep${index}.ndjson`,
+              table: "t",
+              createTable: true,
+              dryRun,
+              ...(c.columns === undefined ? {} : { columns: c.columns }),
+            }),
+          ),
+        );
+      }
+      const [dry, real] = answers;
+      expect(dry.rejections).toEqual([{ row: 2, reason: c.reason }]);
+      expect(real.rejections).toEqual(dry.rejections);
+      expect([dry.wouldInsert, real.inserted]).toEqual([1, 1]);
+    }
+  }, 20_000);
 });

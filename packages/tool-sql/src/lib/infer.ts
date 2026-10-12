@@ -280,21 +280,23 @@ export function inferJsonColumnTypes(
  * each column in order, and stopping at the first failure, reported. A
  * column the record does not hold reads as undefined, which every type
  * accepts as NULL, so only the fields that are there can fail.
+ *
+ * The fields are coerced in column order, not the record's own key order,
+ * and nothing past the first failure is touched: coercing can throw (a
+ * TEXT value nested too deep for JSON.stringify), and a value the real
+ * import never reaches must not fail the dry run.
  */
 export function jsonRecordRejection(
   reader: JsonColumns,
   record: object,
   types: readonly InferredType[],
 ): string | undefined {
-  let first: { column: number; reason: string } | undefined;
-  for (const { column, value } of reader.fields(record)) {
-    if (first !== undefined && column > first.column) continue;
+  const fields = reader.fields(record).sort((a, b) => a.column - b.column);
+  for (const { column, value } of fields) {
     const coerced = coerceJsonValue(value, types[column] ?? "TEXT");
-    if (!coerced.ok) {
-      first = { column, reason: `field "${reader.columns[column]}": ${coerced.reason}` };
-    }
+    if (!coerced.ok) return `field "${reader.columns[column]}": ${coerced.reason}`;
   }
-  return first?.reason;
+  return undefined;
 }
 
 /** A value ready to bind, or the reason the cell could not be used. */
