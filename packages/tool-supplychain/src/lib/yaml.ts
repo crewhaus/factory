@@ -454,6 +454,7 @@ function parseMap(ctx: Ctx, indent: number, depth: number): YamlMap {
   const startLine = ctx.i + 1;
   const entries: YamlEntry[] = [];
   const seen = new Set<string>();
+  const slot = new Map<string, number>();
   while (ctx.i < ctx.lines.length) {
     skipIgnorable(ctx);
     if (ctx.i >= ctx.lines.length) break;
@@ -497,10 +498,14 @@ function parseMap(ctx: Ctx, indent: number, depth: number): YamlMap {
     ctx.i += 1;
     const value = parseValue(ctx, split.rest, indent, keyLine, depth);
     // Last-wins, matching a real loader, so a rule reads the value the runner
-    // would actually use rather than the one written first.
-    const at = entries.findIndex((e) => e.key === split.key);
-    if (at === -1) entries.push({ key: split.key, line: keyLine, value });
-    else entries[at] = { key: split.key, line: keyLine, value };
+    // would actually use rather than the one written first. `slot` says where
+    // a key already sits: finding it by searching the entries made a mapping
+    // quadratic in its keys.
+    const at = slot.get(split.key);
+    if (at === undefined) {
+      slot.set(split.key, entries.length);
+      entries.push({ key: split.key, line: keyLine, value });
+    } else entries[at] = { key: split.key, line: keyLine, value };
   }
   return { kind: "map", line: startLine, entries };
 }
@@ -569,6 +574,7 @@ function parseInlineMap(
   const value = parseValue(ctx, first.rest, indent, keyLine, depth);
   const entries: YamlEntry[] = [{ key: first.key, line: keyLine, value }];
   const seen = new Set<string>([first.key]);
+  const slot = new Map<string, number>([[first.key, 0]]);
   while (ctx.i < ctx.lines.length) {
     skipIgnorable(ctx);
     if (ctx.i >= ctx.lines.length) break;
@@ -591,9 +597,11 @@ function parseInlineMap(
     seen.add(split.key);
     ctx.i += 1;
     const v = parseValue(ctx, split.rest, indent, line, depth);
-    const at = entries.findIndex((e) => e.key === split.key);
-    if (at === -1) entries.push({ key: split.key, line, value: v });
-    else entries[at] = { key: split.key, line, value: v };
+    const at = slot.get(split.key);
+    if (at === undefined) {
+      slot.set(split.key, entries.length);
+      entries.push({ key: split.key, line, value: v });
+    } else entries[at] = { key: split.key, line, value: v };
   }
   return { kind: "map", line: keyLine, entries };
 }
