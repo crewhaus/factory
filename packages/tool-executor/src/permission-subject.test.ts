@@ -24,6 +24,7 @@ import {
   preparePermissionSubject,
   readOperativeField,
 } from "./index";
+import { foldedAsText } from "./permission-subject";
 
 const writeLike = () =>
   buildTool({
@@ -1876,6 +1877,11 @@ describe("a command word that names a file is read where the kernel finds it", (
         },
         "/sys/bin/sh": { at: "/sys/usr/bin/sh" },
         "/sys/bin/../../ws/evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
+        // The same words with their `..` folded as text (node reads them so).
+        "./evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
+        "./deploy.sh": { at: "/ws/deploy.sh", inWorkspace: "deploy.sh" },
+        "./run.sh": { at: "/ws/run.sh", inWorkspace: "run.sh" },
+        "/ws/evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
       }),
     );
     const argv = (...a: string[]) => ({ argv: a });
@@ -1922,6 +1928,7 @@ describe("a command word that names a file is read where the kernel finds it", (
       // Outside the workspace, a `..` after a name moves an absolute program.
       "/out/tools/../evil.sh": { at: "/out/evil.sh" },
       "/out/tools/ok.sh": { at: "/out/tools/ok.sh" },
+      "/out/evil.sh": { at: "/out/evil.sh" },
       // A command after `cd`: read from where it moved (sub → secrets/).
       "sub/./run.sh": { at: "/ws/secrets/run.sh", inWorkspace: "secrets/run.sh" },
       "pkg/app/../../tool": { at: "/ws/tool", inWorkspace: "tool" },
@@ -1935,6 +1942,9 @@ describe("a command word that names a file is read where the kernel finds it", (
       // A data operand with a `..` after a name.
       "gen.sh": { at: "/ws/gen.sh", inWorkspace: "gen.sh" },
       "src/../lib": { at: "/ws/lib", inWorkspace: "lib" },
+      // Words with a `..` after a name, folded as text (node reads them so).
+      "./run.sh": { at: "/ws/run.sh", inWorkspace: "run.sh" },
+      "./lib": { at: "/ws/lib", inWorkspace: "lib" },
       "./node_modules/tool/cli.sh": {
         at: "/ws/node_modules/.pnpm/tool/cli.sh",
         inWorkspace: "node_modules/.pnpm/tool/cli.sh",
@@ -2034,6 +2044,207 @@ describe("a command word that names a file is read where the kernel finds it", (
     expect(at("restrict", "Sh(nothing-like-it)", line("echo rm -f x | sh"))).toBe(true);
     expect(at("allow", "Sh(echo ** | sh)", line("echo rm -f x | sh"))).toBe(false);
     expect(at("restrict", "Sh(nothing-like-it)", line("echo y | sh gen.sh"))).toBe(false);
+  });
+
+  // critic9 (0.7.1): node, `bun run` and a `#!/usr/bin/env node` script fold
+  // a `..` as text before they open their script (`path.resolve`, then its
+  // links followed), so `node lnk/../evil.mjs` with lnk → safe/sub runs
+  // ./evil.mjs while the kernel walks to safe/evil.mjs. A reader answers for
+  // both spellings of each word here: as written, and folded as text.
+  describe("a word with a `..` after a name is also read with it folded as text", () => {
+    const at = decide(
+      table(ws, {
+        "lnk/../evil.mjs": { at: "/ws/safe/evil.mjs", inWorkspace: "safe/evil.mjs" },
+        "safe/x/../../evil.mjs": { at: "/ws/safe/evil.mjs", inWorkspace: "safe/evil.mjs" },
+        "./evil.mjs": { at: "/ws/evil.mjs", inWorkspace: "evil.mjs" },
+        "node_modules/pkg/../dep/cli.mjs": {
+          at: "/ws/packages/dep/cli.mjs",
+          inWorkspace: "packages/dep/cli.mjs",
+        },
+        "node_modules/dep/cli.mjs": {
+          at: "/ws/node_modules/dep/cli.mjs",
+          inWorkspace: "node_modules/dep/cli.mjs",
+        },
+        "./lnk/../nb.mjs": { at: "/ws/safe/nb.mjs", inWorkspace: "safe/nb.mjs" },
+        "lnk/../nb.mjs": { at: "/ws/safe/nb.mjs", inWorkspace: "safe/nb.mjs" },
+        "./nb.mjs": { at: "/ws/nb.mjs", inWorkspace: "nb.mjs" },
+        "./lnk/../h.mjs": { at: "/ws/safe/h.mjs", inWorkspace: "safe/h.mjs" },
+        "./h.mjs": { at: "/ws/h.mjs", inWorkspace: "h.mjs" },
+        // Folded, it goes through another link: dl → secrets.
+        "lnk/../dl/x.mjs": { at: "/ws/safe/dl/x.mjs", inWorkspace: "safe/dl/x.mjs" },
+        "dl/x.mjs": { at: "/ws/secrets/x.mjs", inWorkspace: "secrets/x.mjs" },
+        "lnk/../dl/x.sh": { at: "/ws/safe/dl/x.sh", inWorkspace: "safe/dl/x.sh" },
+        "dl/x.sh": { at: "/ws/secrets/x.sh", inWorkspace: "secrets/x.sh" },
+        "lnk/../dl/nb.mjs": { at: "/ws/safe/dl/nb.mjs", inWorkspace: "safe/dl/nb.mjs" },
+        "dl/nb.mjs": { at: "/ws/secrets/nb.mjs", inWorkspace: "secrets/nb.mjs" },
+        // Kernel-opened scripts.
+        "lnk/../evil.sh": { at: "/ws/safe/evil.sh", inWorkspace: "safe/evil.sh" },
+        "safe/x/../../evil.sh": { at: "/ws/safe/evil.sh", inWorkspace: "safe/evil.sh" },
+        "./evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
+        "lnk/../evil.py": { at: "/ws/safe/evil.py", inWorkspace: "safe/evil.py" },
+        "./evil.py": { at: "/ws/evil.py", inWorkspace: "evil.py" },
+        // No link before the `..`: both readings land in one place.
+        "safe/a/../ok.mjs": { at: "/ws/safe/ok.mjs", inWorkspace: "safe/ok.mjs" },
+        "safe/ok.mjs": { at: "/ws/safe/ok.mjs", inWorkspace: "safe/ok.mjs" },
+        // Walked, but not once folded (a loop of links there).
+        "lnk/../loop.mjs": { at: "/ws/safe/loop.mjs", inWorkspace: "safe/loop.mjs" },
+        // `bun run`'s subcommand is an operand too, read where it would be a file.
+        run: { at: "/ws/run", inWorkspace: "run" },
+      }),
+    );
+
+    test("folded as text the way path.resolve folds it", () => {
+      for (const [word, folded] of [
+        ["lnk/../evil.mjs", "./evil.mjs"],
+        ["./lnk/../evil.mjs", "./evil.mjs"],
+        ["a/b/../c/x", "a/c/x"],
+        ["a//b/./../c", "a/c"],
+        ["a/../../x", "../x"],
+        ["../a/b/../x", "../a/x"],
+        ["a/../..", ".."],
+        ["a/..", "."],
+        ["/out/tools/../evil.sh", "/out/evil.sh"],
+        ["/../x", "/x"],
+        ["C:\\a\\..\\b", "C:/b"],
+      ] as const) {
+        expect({ word, folded: foldedAsText(word) }).toEqual({ word, folded });
+      }
+    });
+
+    test("an allow on where the kernel lands does not grant what node opens", () => {
+      for (const input of [
+        argv("node", "lnk/../evil.mjs"),
+        argv("node", "safe/x/../../evil.mjs"),
+        argv("env", "node", "lnk/../evil.mjs"),
+        argv("bun", "run", "lnk/../evil.mjs"),
+        line("node safe/x/../../evil.mjs"),
+      ]) {
+        const head = "argv" in input ? "Run" : "Sh";
+        const prefix = (input.argv?.slice(0, -1) ?? ["node"]).join(" ");
+        expect({
+          input,
+          physical: at("allow", `${head}(${prefix} safe/**)`, input),
+          both: at("allow", `${head}(${prefix} **evil.mjs)`, input),
+          every: at("allow", `${head}(**)`, input),
+        }).toEqual({ input, physical: false, both: true, every: true });
+      }
+      // The monorepo layout: a dependency's script, through a linked package.
+      const dep = argv("node", "node_modules/pkg/../dep/cli.mjs");
+      expect(at("allow", "Run(node packages/**)", dep)).toBe(false);
+      expect(at("allow", "Run(node node_modules/**)", dep)).toBe(false);
+      expect(at("allow", "Run(node **/dep/cli.mjs)", dep)).toBe(true);
+      // A program run by its path: its `#!` line may name node.
+      const nb = argv("./lnk/../nb.mjs");
+      expect(at("allow", "Run(./safe/**)", nb)).toBe(false);
+      expect(at("allow", "Run(./*nb.mjs)", nb)).toBe(false);
+      expect(at("allow", "Run(./**)", nb)).toBe(true);
+      expect(at("allow", "Sh(./**)", line("./lnk/../nb.mjs"))).toBe(true);
+    });
+
+    test("a deny or ask reads both places, whichever program opens the word", () => {
+      const node = argv("node", "lnk/../evil.mjs");
+      expect(at("restrict", "Run(node evil.mjs)", node)).toBe(true);
+      expect(at("restrict", "Run(node ./evil.mjs)", node)).toBe(false);
+      expect(at("restrict", "Run(node safe/evil.mjs)", node)).toBe(true);
+      // Folded, it lands through another link: a deny on where that leads fires.
+      for (const input of [
+        argv("node", "lnk/../dl/x.mjs"),
+        argv("sh", "lnk/../dl/x.sh"),
+        line("node lnk/../dl/x.mjs"),
+        line("sh lnk/../dl/x.sh"),
+        // An argument another program may run is read the same way.
+        argv("find", ".", "-exec", "lnk/../dl/x.mjs", ";"),
+        line("PATH=lnk/../dl nb.mjs"),
+        argv("env", "PATH=lnk/../dl", "nb.mjs"),
+        { argv: ["nb.mjs"], envSet: { PATH: "lnk/../dl" } },
+      ]) {
+        const head = "argv" in input ? "Run" : "Sh";
+        expect({ input, denied: at("restrict", `${head}(**secrets/**)`, input) }).toEqual({
+          input,
+          denied: true,
+        });
+        expect({ input, unrelated: at("restrict", `${head}(nothing-like-it)`, input) }).toEqual({
+          input,
+          unrelated: false,
+        });
+      }
+    });
+
+    test("a script a shell, Python 3, Perl or Ruby opens is read where the kernel lands", () => {
+      expect(at("allow", "Run(sh safe/**)", argv("sh", "lnk/../evil.sh"))).toBe(true);
+      expect(at("allow", "Run(python3 safe/**)", argv("python3", "lnk/../evil.py"))).toBe(true);
+      expect(at("allow", "Sh(sh safe/**)", line("sh safe/x/../../evil.sh"))).toBe(true);
+      // So is a script on an interpreter's input: the shell running the line opens it.
+      expect(at("allow", "Sh(node < safe/**)", line("node < safe/x/../../evil.mjs"))).toBe(true);
+      // An operand after the script is the script's to read: both places.
+      expect(
+        at("allow", "Run(sh safe/** safe/**)", argv("sh", "lnk/../evil.sh", "lnk/../evil.mjs")),
+      ).toBe(false);
+      // A deny still reads where the text folds to.
+      expect(at("restrict", "Run(sh evil.sh)", argv("sh", "lnk/../evil.sh"))).toBe(true);
+    });
+
+    test("control: a `..` with no link before it is one place, and an allow on it grants", () => {
+      expect(at("allow", "Run(node safe/**)", argv("node", "safe/a/../ok.mjs"))).toBe(true);
+      expect(at("allow", "Sh(node safe/**)", line("node safe/a/../ok.mjs"))).toBe(true);
+      expect(at("restrict", "Run(nothing-like-it)", argv("node", "safe/a/../ok.mjs"))).toBe(false);
+    });
+
+    test("two words read apart, or one that cannot be walked folded: no scoped allow", () => {
+      const two = argv("node", "-r", "./lnk/../h.mjs", "lnk/../evil.mjs");
+      expect(at("allow", "Run(node -r ** **)", two)).toBe(false);
+      expect(at("allow", "Run(**)", two)).toBe(true);
+      expect(at("allow", "Sh(node -r ** **)", line("node -r ./lnk/../h.mjs lnk/../evil.mjs"))).toBe(
+        false,
+      );
+      const loop = argv("node", "lnk/../loop.mjs");
+      expect(at("allow", "Run(node **)", loop)).toBe(false);
+      expect(at("restrict", "Run(nothing-like-it)", loop)).toBe(true);
+    });
+
+    test("`$PWD` is the text of where the shell runs, a link's name and all", () => {
+      const pwd = decide(
+        table(ws, {
+          // After `cd lnk` (lnk → safe/sub) the kernel walks out of the target…
+          "lnk/./../dl/x.mjs": { at: "/ws/safe/dl/x.mjs", inWorkspace: "safe/dl/x.mjs" },
+          "lnk/./../evil.mjs": { at: "/ws/safe/evil.mjs", inWorkspace: "safe/evil.mjs" },
+          "lnk/./x.mjs": { at: "/ws/safe/sub/x.mjs", inWorkspace: "safe/sub/x.mjs" },
+          "lnk/./../x.mjs": { at: "/ws/safe/x.mjs", inWorkspace: "safe/x.mjs" },
+          // …node folds `$PWD/..` back to the root.
+          "dl/x.mjs": { at: "/ws/secrets/x.mjs", inWorkspace: "secrets/x.mjs" },
+          "./evil.mjs": { at: "/ws/evil.mjs", inWorkspace: "evil.mjs" },
+          "./x.mjs": { at: "/ws/x.mjs", inWorkspace: "x.mjs" },
+          // Folded from the root, as if `$PWD` were still the root's text,
+          // or from where the wrapper or the `cd -P` moved.
+          "../x.mjs": { at: "/x.mjs" },
+          "lnk/../x.mjs": { at: "/ws/safe/x.mjs", inWorkspace: "safe/x.mjs" },
+        }),
+      );
+      for (const command of [
+        "cd lnk && node $PWD/../dl/x.mjs",
+        'cd lnk && node "${PWD}"/../dl/x.mjs',
+      ]) {
+        expect({ command, denied: pwd("restrict", "Sh(**secrets/**)", line(command)) }).toEqual({
+          command,
+          denied: true,
+        });
+      }
+      expect(pwd("restrict", "Sh(node ./evil.mjs)", line("cd lnk && node $PWD/../evil.mjs"))).toBe(
+        true,
+      );
+      // Not climbing out of `$PWD`, the text and the walk agree.
+      const inside = line("cd lnk && node $PWD/x.mjs");
+      expect(pwd("restrict", "Sh(nothing-like-it)", inside)).toBe(false);
+      expect(pwd("restrict", "Sh(**secrets/**)", inside)).toBe(false);
+      // Where the text of `$PWD` cannot be told — a wrapper moved the command
+      // but not the shell's PWD, or a `cd -P` came first — it cannot be placed.
+      for (const command of ["env -C lnk node $PWD/../x.mjs", "cd -P lnk && node $PWD/../x.mjs"]) {
+        expect({ command, every: pwd("restrict", "Sh(nothing-like-it)", line(command)) }).toEqual({
+          command,
+          every: true,
+        });
+      }
+    });
   });
 });
 

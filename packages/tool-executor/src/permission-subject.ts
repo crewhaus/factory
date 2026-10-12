@@ -44,7 +44,13 @@
  *      allow: `./scripts/../evil.sh` is `./evil.sh`, which
  *      `RunCommand(./scripts/**)` does not grant, and a deny or ask reads
  *      that place too — `link/../run.sh` with `link → secrets/deep` is
- *      `secrets/run.sh`. A program reached through a symlink to it
+ *      `secrets/run.sh`. Such a word is also read with its `..` folded as
+ *      text first, the way node, `bun run` and a `#!/usr/bin/env node`
+ *      script open it — `node lnk/../x.mjs` with `lnk → safe/sub` runs
+ *      `./x.mjs` — and where the two readings land apart, a deny or ask reads
+ *      both and an allow must name both, unless the word is the script of
+ *      a shell, Python 3, Perl or Ruby, which open it where the kernel walks.
+ *      A program reached through a symlink to it
  *      (`node_modules/.bin/eslint`) is named by the link; a deny or ask also
  *      reads where the link leads. A program named by an absolute path
  *      outside the workspace is read as written unless it has a `..` after
@@ -64,7 +70,11 @@
  *      with them put in: `Bash(./scripts/**)` does not grant
  *      `./scripts/lnk/run.sh` (`lnk → ../evil`), and `Bash(node **)` still
  *      grants a script reached through a linked package directory. `$PWD`
- *      is the directory the command runs in. A word read from a directory
+ *      is the directory the command runs in; folded as text, it is the
+ *      `cd`s the shell joined, a link's name and all, so after `cd lnk` node
+ *      runs `$PWD/../x.mjs` as `./x.mjs` (where that text cannot be told —
+ *      after a wrapper's or a `cd -P`'s move — one that climbs out of it
+ *      cannot be placed). A word read from a directory
  *      that cannot be told (`cd "$X"`, `cd -`, a `cd` in a loop), or that a
  *      variable the line does not set or a `~` starts, is read as written;
  *      with a `..` after a name it cannot be placed. A pattern the shell
@@ -494,6 +504,12 @@ export function operativeValuesOf(
               ...shell,
               ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
             });
+            // A word node would open elsewhere than the kernel walks to is
+            // read in both places: `RunCommand(node safe/**)` does not grant
+            // `node lnk/../x.mjs` (lnk → safe/sub), which runs `./x.mjs`.
+            if (own.rewrittenAsText !== undefined) {
+              values.push({ kind: "command", canonical: [own.rewrittenAsText.join(" ")] });
+            }
             // A line a shell parses cannot have a word put in its place, so
             // an allow reads each command whose words moved, with them put
             // in, as well as the line: `Bash(./scripts/**)` does not grant
@@ -707,6 +723,12 @@ type ProgramsReading = {
    * place (see {@link placeForms}); absent when none does.
    */
   readonly rewritten?: ReadonlyArray<string>;
+  /**
+   * {@link rewritten} with the one word that two programs may read apart
+   * put where it lands with its `..` folded as text first (see
+   * {@link readCommand}): an allow must name both.
+   */
+  readonly rewrittenAsText?: ReadonlyArray<string>;
   /** Some word lands elsewhere than it reads. */
   readonly moved: boolean;
   /**
@@ -726,8 +748,9 @@ type ProgramsReading = {
   readonly patterns: ReadonlyArray<string>;
   /**
    * Each simple command of a line a shell parses with every word that lands
-   * elsewhere than it reads put in its place: an allow must name it as well
-   * as the line.
+   * elsewhere than it reads put in its place — and again with a word read
+   * apart put where it lands folded as text: an allow must name each as
+   * well as the line.
    */
   readonly placed: ReadonlyArray<string>;
 };
@@ -786,6 +809,21 @@ const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * own links (`/bin → usr/bin`) are not the call's to move, and an allow
  * written `/bin/sh` still reads `/bin/sh`.
  *
+ * Not every program opens a word the way the kernel walks it. node, `bun
+ * run` and a script whose `#!` line names node fold its `..` as text first
+ * (`path.resolve`, then its links followed), so `node lnk/../x.mjs` with
+ * `lnk → safe/sub` runs `./x.mjs`, not the `safe/x.mjs` the kernel walks to.
+ * So a word with a `..` after a name is also read that way
+ * ({@link foldedAsText}), and where the two readings land apart a deny or
+ * ask reads both. An allow must name both too — the command with the word in
+ * each place — unless the word is the script of an interpreter measured to
+ * open it through the kernel (`kernelScript`: a shell, Python 3, Perl,
+ * Ruby). A program run by its path is always read both ways: the
+ * interpreter its `#!` line names may be node. A command with more than one
+ * word read apart may run them in any mix of places, and no scoped allow
+ * grants it. A word a shell started with `$PWD` that climbs out of it is
+ * folded against the text of `$PWD` (see the module doc).
+ *
  * A word cannot be placed — every deny or ask fires, and only an allow
  * naming every command grants it — when it has a `..` after a name and no
  * reader can follow the links before it (the edge worker), or it is read
@@ -805,6 +843,7 @@ function readCommand(
   const patterns = new Set<string>();
   const placed = new Set<string>();
   let rewritten: string[] | undefined;
+  let rewrittenAsText: string[] | undefined;
   let moved = false;
   let unplaceable = false;
   let ungrantable = false;
@@ -836,12 +875,16 @@ function readCommand(
     let movedHere = false;
     // A bare program found on a PATH entry that moved: one line each.
     const lookups: Array<readonly [number, string]> = [];
+    // Each word an allow reads in two places, with where it lands folded as
+    // text: the command with it there is one more an allow must name.
+    const apart: Array<readonly [number, string]> = [];
     /** Read one word, or one PATH candidate for word `i`; see above. */
     const readWord = (
       i: number,
       word: string,
       role: "program" | "script" | "argument",
       lookup: boolean,
+      fromPwd = false,
     ): void => {
       const runs = role === "program";
       const pattern = opts.shell && opts.patterns?.has(i) === true && !lookup;
@@ -882,11 +925,34 @@ function readCommand(
         }
         return;
       }
-      const place = where.readProgramPath(word, dir.runsIn, {
+      const readOpts = {
         ...(role === "argument" || lookup ? { argument: true } : {}),
         ...(prefix !== "" && !absolute ? { prefix } : {}),
-      });
-      if (place === undefined) {
+      };
+      const place = where.readProgramPath(word, dir.runsIn, readOpts);
+      // And with its `..` folded as text first, as node and `bun run` read
+      // it. `$PWD` is the text of where the shell runs, the name of each
+      // link a `cd` went through and all, so one that climbs out of it is
+      // folded against that text: after `cd lnk`, node runs `$PWD/../x.mjs`
+      // as `./x.mjs`. That text is the root and the `cd`s the shell joined;
+      // after a wrapper's or a `cd -P`'s move, or in a call's directory
+      // field, it cannot be told.
+      const asText = foldedAsText(word);
+      const abovePwd = fromPwd && (asText === ".." || asText.startsWith("../"));
+      const pwdKnown = where.runsIn === undefined && prefix === "";
+      const folded = abovePwd
+        ? pwdKnown
+          ? where.readProgramPath(
+              foldedAsText(joinedDir(dir.runsIn ?? "", word)),
+              undefined,
+              readOpts,
+            )
+          : undefined
+        : climbs
+          ? where.readProgramPath(asText, dir.runsIn, readOpts)
+          : undefined;
+      const readsAsText = climbs || abovePwd;
+      if (place === undefined || (readsAsText && folded === undefined && role !== "argument")) {
         if (role !== "argument") unplaceable = true;
         return;
       }
@@ -897,6 +963,20 @@ function readCommand(
         place.target !== undefined
           ? placeForms(place.target.at, place.target.inWorkspace, word, runs)
           : [];
+      // Where the two readings land apart, the folded one in its forms.
+      const split = folded !== undefined && folded.at !== place.at ? folded : undefined;
+      const textForms =
+        split !== undefined ? placeForms(split.at, split.inWorkspace, word, runs) : undefined;
+      const asTextLed =
+        split?.target !== undefined
+          ? placeForms(split.target.at, split.target.inWorkspace, word, runs)
+          : [];
+      // An allow names both unless the word is a script its interpreter
+      // opens through the kernel.
+      if (textForms !== undefined && role !== "argument" && (runs || i !== found.kernelScript)) {
+        if (lookup) lookups.push([i, textForms[0]]);
+        else apart.push([i, textForms[0]]);
+      }
       if (role === "argument") {
         // An argv's words are spellings a deny reads; where one lands is too.
         if (opts.shell || !(lands || led.length > 0 || elsewhere)) return;
@@ -916,14 +996,17 @@ function readCommand(
         }
       }
       forms.forEach((form, k) => put(k, i, form, pattern));
-      led.forEach((form, k) => put(forms.length + k, i, form, pattern));
+      led.forEach((form, k) => put(2 + k, i, form, pattern));
+      textForms?.forEach((form, k) => put(4 + k, i, form, pattern));
+      asTextLed.forEach((form, k) => put(6 + k, i, form, pattern));
     };
     for (let i = 0; i < words.length; i++) {
       const raw = words[i] as string;
       if (raw === "" || raw.includes("://")) continue;
       const word = opts.shell ? withShellPwd(raw) : raw;
+      const fromPwd = word !== raw;
       if (programs.has(i)) {
-        if (/[\\/]/.test(word)) readWord(i, word, "program", false);
+        if (/[\\/]/.test(word)) readWord(i, word, "program", false, fromPwd);
         else {
           const lookUp = (candidate: string) => readWord(i, candidate, "program", true);
           if (!readLookups(i, word, found, opts, lookUp)) unplaceable = true;
@@ -931,24 +1014,33 @@ function readCommand(
         continue;
       }
       if (operands.has(i)) {
-        readWord(i, word, "script", false);
+        readWord(i, word, "script", false, fromPwd);
         continue;
       }
       if (word.startsWith("-") || ASSIGNMENT_WORD.test(word)) continue;
-      readWord(i, word, "argument", false);
+      readWord(i, word, "argument", false, fromPwd);
     }
     for (const line of lines.values()) {
       (line.pattern ? patterns : spellings).add(line.words.join(" "));
     }
     if (movedHere) placed.add(inPlace.join(" "));
-    for (const [i, form] of lookups) {
+    for (const [i, form] of [...lookups, ...apart.slice(0, 1)]) {
       const line = [...inPlace];
       line[i] = form;
       placed.add(line.join(" "));
     }
+    // Two words read apart may be read in any mix of their places, which no
+    // list of commands an allow must name can cover.
+    if (apart.length > 1) ungrantable = true;
+    const [one] = apart;
+    if (one !== undefined && opts.rewrite && rewritten !== undefined) {
+      rewrittenAsText = [...rewritten];
+      rewrittenAsText[one[0]] = one[1];
+    }
   }
   return {
     ...(rewritten !== undefined ? { rewritten } : {}),
+    ...(rewrittenAsText !== undefined ? { rewrittenAsText } : {}),
     moved,
     unplaceable,
     ungrantable,
@@ -1058,14 +1150,19 @@ function readShellPrograms(
   for (const line of lines) {
     for (const command of shellProgramWords(line)) {
       // A script an interpreter reads on its input (`sh < x.sh`) is read as
-      // the one it is handed, and the `<` kept in front of it.
+      // the one it is handed, and the `<` kept in front of it. The shell that
+      // runs the line opens it, through the kernel, whatever reads it.
       const words =
         command.stdinScript !== undefined
           ? [...command.words, "<", command.stdinScript]
           : command.words;
       const found =
         command.stdinScript !== undefined
-          ? { ...command.programs, operands: [...command.programs.operands, words.length - 1] }
+          ? {
+              ...command.programs,
+              operands: [...command.programs.operands, words.length - 1],
+              kernelScript: words.length - 1,
+            }
           : command.programs;
       const read = readCommand(words, found, wordDirsOf(command.dirs, where, prefix), where, {
         rewrite: false,
@@ -1586,6 +1683,32 @@ function collapsedWords(word: string): string[] {
 }
 
 /**
+ * A command word with its `.` and `..` folded as text, as `path.resolve`
+ * folds them before anything is opened — the way node and `bun run` read
+ * the script they are handed, and a `#!/usr/bin/env node` script the path it
+ * was run by. A `..` after a name takes the name off; one at the start of a
+ * relative word stays, climbing from the directory the command runs in; one
+ * at the root of an absolute word stays at the root. A relative result
+ * without a `/` keeps a `./`, so it still names a file in that directory,
+ * not a program to look up.
+ */
+export function foldedAsText(word: string): string {
+  const drive = /^[A-Za-z]:[\\/]/.test(word) ? word.slice(0, 2) : "";
+  const absolute = drive !== "" || word.startsWith("/") || word.startsWith("\\");
+  const names: string[] = [];
+  for (const segment of word.slice(drive.length).split(/[\\/]/)) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") names.push(segment);
+    else if (names.length > 0 && names[names.length - 1] !== "..") names.pop();
+    else if (!absolute) names.push("..");
+  }
+  const joined = names.join("/");
+  if (absolute) return `${drive}/${joined}`;
+  if (joined === "") return ".";
+  return joined.includes("/") || joined === ".." ? joined : `./${joined}`;
+}
+
+/**
  * The spellings a deny or ask reads for one command beyond the words as
  * written. Every spelling only widens what a deny or ask catches; none is
  * canonical, so no allow reads them.
@@ -1680,16 +1803,23 @@ function commandSpellings(
       }
       // And where the kernel finds it there, each link followed before the
       // `..` after it: `PATH=link/..` is the directory above link's target.
+      // A script found there whose `#!` line names node is opened again by
+      // node, with the `..` folded as text: read there too.
       if (where.readProgramPath !== undefined) {
         const candidate = `${entry === "/" ? "" : entry}/${program}`;
         const from = isAbsolutePath(entry) ? [undefined] : [undefined, where.runsIn];
+        const asRead = climbsAfterName(candidate)
+          ? [candidate, foldedAsText(candidate)]
+          : [candidate];
         for (const runsIn of new Set(from)) {
-          const place = where.readProgramPath(candidate, runsIn);
-          if (place === undefined) continue;
-          for (const f of placeForms(place.at, place.inWorkspace, candidate, true)) found.add(f);
-          if (place.target === undefined) continue;
-          const { at, inWorkspace } = place.target;
-          for (const f of placeForms(at, inWorkspace, candidate, true)) found.add(f);
+          for (const word of asRead) {
+            const place = where.readProgramPath(word, runsIn);
+            if (place === undefined) continue;
+            for (const f of placeForms(place.at, place.inWorkspace, candidate, true)) found.add(f);
+            if (place.target === undefined) continue;
+            const { at, inWorkspace } = place.target;
+            for (const f of placeForms(at, inWorkspace, candidate, true)) found.add(f);
+          }
         }
       }
       for (const f of found) {

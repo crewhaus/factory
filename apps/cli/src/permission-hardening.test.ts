@@ -3913,3 +3913,249 @@ describe("command-dotdot review — a program read where it lands, however the c
     }, 120_000);
   });
 });
+
+// critic9 (0.7.1): the gate read every script an interpreter is handed where
+// the kernel walks to, each `..` after the link before it. node, `bun run` and
+// a `#!/usr/bin/env node` script fold the `..` as text first (`path.resolve`,
+// then links followed), so with `lnk → safe/sub` an allow on `node safe/**`
+// granted `node lnk/../evil.mjs`, and node ran ./evil.mjs. Every script below
+// appends its own name to a marker outside the workspace, so what ran is read
+// from disk.
+describe("critic9 — a script node opens with its `..` folded as text", () => {
+  const hasNode = Bun.which("node") !== null;
+  let marker: string;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    for (const d of ["safe/sub", "safe/a/b", "secrets", "packages/pkg", "node_modules/dep"]) {
+      mkdirSync(join(ws, d), { recursive: true });
+    }
+    symlinkSync("safe/sub", join(ws, "lnk"));
+    symlinkSync("a/b", join(ws, "safe", "x"));
+    symlinkSync("secrets", join(ws, "dl"));
+    symlinkSync("../packages/pkg", join(ws, "node_modules", "pkg"));
+    const mjs = (p: string, shebang = "") =>
+      writeFileSync(
+        join(ws, p),
+        `${shebang}import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(marker)}, ${JSON.stringify(`${p}\n`)});\n`,
+        { mode: 0o755 },
+      );
+    for (const p of [
+      "evil.mjs",
+      "safe/ok.mjs",
+      "safe/evil.mjs",
+      "secrets/x.mjs",
+      "node_modules/dep/cli.mjs",
+      "packages/pkg/main.mjs",
+    ]) {
+      mjs(p);
+    }
+    for (const p of ["nb.mjs", "safe/nb.mjs"]) mjs(p, "#!/usr/bin/env node\n");
+    for (const p of ["evil.sh", "safe/evil.sh", "secrets/x.sh"]) {
+      writeFileSync(join(ws, p), `#!/bin/sh\necho ${p} >> "${marker}"\n`, { mode: 0o755 });
+    }
+  });
+  const ran = () => readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).join(",");
+  const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+  /** The same argv on each tool that runs one, from the workspace root. */
+  const onEvery = (argv: string[]): Array<[string, Record<string, unknown>]> => [
+    ["RunCommand", { argv }],
+    ["Retry", { argv, ...retry }],
+    ["ProcessStart", { argv }],
+    ["RunPipeline", { steps: [{ argv }] }],
+    ["RunTests", { command: argv }],
+    ["RunBuild", { command: argv }],
+    ["Bash", { command: argv.join(" ") }],
+  ];
+  /** Each call's first decision under `rule(tool)`, and what ran. */
+  async function decide(
+    calls: ReadonlyArray<[string, Record<string, unknown>]>,
+    rule: (tool: string) => RuleSet,
+  ) {
+    const rows: Array<{ tool: string; input: Record<string, unknown>; got?: string; ran: string }> =
+      [];
+    for (const [tool, input] of calls) {
+      writeFileSync(marker, "");
+      const got = await gate(tool, input, rule(tool));
+      rows.push({ tool, input, ...(got !== undefined ? { got } : {}), ran: ran() });
+    }
+    return rows;
+  }
+  const allowOn = (glob: string) => (tool: string) => rules(["alwaysAllow", `${tool}(${glob})`]);
+
+  test("an allow on where the kernel walks does not grant the script node or `bun run` opens", async () => {
+    const cases: Array<[string[], string]> = [
+      [["node", "lnk/../evil.mjs"], "node safe/**"],
+      [["node", "safe/x/../../evil.mjs"], "node safe/**"],
+      [["env", "node", "lnk/../evil.mjs"], "env node safe/**"],
+      [["bun", "run", "lnk/../evil.mjs"], "bun run safe/**"],
+      // The monorepo layout: node_modules/pkg → ../packages/pkg.
+      [["node", "node_modules/pkg/../dep/cli.mjs"], "node packages/**"],
+      // A program whose `#!` line names node: node opens the path it was run by.
+      [["./lnk/../nb.mjs"], "./safe/**"],
+      [["node", "-r", "./lnk/../evil.mjs", "safe/ok.mjs"], "node -r ./safe/** safe/**"],
+    ];
+    for (const [argv, glob] of cases) {
+      const rows = await decide(onEvery(argv), allowOn(glob));
+      expect(rows).toEqual(rows.map((r) => ({ ...r, got: "ask", ran: "" })));
+    }
+  }, 120_000);
+
+  test("a deny or ask reads both places, and nothing runs", async () => {
+    for (const [argv, glob] of [
+      [["node", "lnk/../evil.mjs"], "node evil.mjs"],
+      [["node", "lnk/../evil.mjs"], "node safe/evil.mjs"],
+      // Folded as text it goes through dl → secrets, where node runs it.
+      [["node", "lnk/../dl/x.mjs"], "**secrets/**"],
+      [["bun", "run", "lnk/../dl/x.mjs"], "**secrets/**"],
+      // A shell opens its script where the kernel walks (safe/dl/x.sh, not
+      // there), and a deny still reads where the text folds to.
+      [["sh", "lnk/../dl/x.sh"], "**secrets/**"],
+    ] as const) {
+      for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+        const rows = await decide(onEvery([...argv]), (tool) =>
+          rules([type, `${tool}(${glob})`], ["alwaysAllow", tool]),
+        );
+        const got = type === "alwaysDeny" ? "deny" : "ask";
+        expect(rows).toEqual(rows.map((r) => ({ ...r, got, ran: "" })));
+      }
+    }
+  }, 120_000);
+
+  test("`$PWD` after a `cd` through a link: a deny reads where node folds `..` back to", async () => {
+    // The shell's PWD keeps lnk's name, and node runs `$PWD/../dl/x.mjs` as
+    // dl/x.mjs, which is secrets/x.mjs; the kernel would walk to safe/dl/.
+    for (const command of [
+      "cd lnk && node $PWD/../dl/x.mjs",
+      'cd lnk && node "${PWD}"/../dl/x.mjs',
+    ]) {
+      for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+        const rows = await decide([["Bash", { command }]], (tool) =>
+          rules([type, `${tool}(**secrets/**)`], ["alwaysAllow", tool]),
+        );
+        const got = type === "alwaysDeny" ? "deny" : "ask";
+        expect(rows).toEqual(rows.map((r) => ({ ...r, got, ran: "" })));
+      }
+    }
+    // Control: folded back to ./evil.sh, nothing a deny on secrets/ names,
+    // and sh runs the safe/evil.sh the kernel walks to.
+    const control = await decide([["Bash", { command: "cd lnk && sh $PWD/../evil.sh" }]], (tool) =>
+      rules(["alwaysDeny", `${tool}(**secrets/**)`], ["alwaysAllow", tool]),
+    );
+    expect(control.map((r) => [r.got, r.ran])).toEqual([["allow", "safe/evil.sh"]]);
+  }, 60_000);
+
+  test("a script a shell opens through the kernel: an allow on where it lands still grants it", async () => {
+    const rows = await decide(
+      onEvery(["sh", "lnk/../evil.sh"]).filter(([t]) => t !== "ProcessStart"),
+      allowOn("sh safe/**"),
+    );
+    // A Bash line is also read as written, which `sh safe/**` does not name.
+    expect(rows.map((r) => [r.tool, r.got, r.ran])).toEqual([
+      ["RunCommand", "allow", "safe/evil.sh"],
+      ["Retry", "allow", "safe/evil.sh"],
+      ["RunPipeline", "allow", "safe/evil.sh"],
+      ["RunTests", "allow", "safe/evil.sh"],
+      ["RunBuild", "allow", "safe/evil.sh"],
+      ["Bash", "ask", ""],
+    ]);
+  }, 60_000);
+
+  test.skipIf(!hasNode)(
+    "control: ordinary node scripts, `bun run`, and an allow that names both places",
+    async () => {
+      const cases: Array<[string[], string, string]> = [
+        [["node", "safe/ok.mjs"], "node safe/**", "safe/ok.mjs"],
+        [["node", "./safe/ok.mjs"], "node ./safe/*", "safe/ok.mjs"],
+        [["bun", "run", "safe/ok.mjs"], "bun run safe/**", "safe/ok.mjs"],
+        // No link before the `..`: one place, which the allow names.
+        [["node", "safe/a/../ok.mjs"], "node safe/**", "safe/ok.mjs"],
+        [["node", "lnk/../evil.mjs"], "node **", "evil.mjs"],
+        [["node", "node_modules/pkg/main.mjs"], "node **", "packages/pkg/main.mjs"],
+      ];
+      // The argv tools share one reading (the cases above ask on each), so
+      // an argv tool and a Bash line run each: twelve node processes.
+      for (const [argv, glob, runs] of cases) {
+        const rows = await decide(
+          onEvery(argv).filter(([t]) => t === "RunCommand" || t === "Bash"),
+          allowOn(glob),
+        );
+        expect(rows).toEqual(rows.map((r) => ({ ...r, got: "allow", ran: runs })));
+      }
+    },
+    120_000,
+  );
+
+  describe("a headless grant covers both places", () => {
+    const sessionId = "sess_0123456789abcdef";
+    const call = { argv: ["node", "lnk/../evil.mjs"] };
+    let store: ReturnType<typeof createPendingApprovalStore>;
+    async function turn(): Promise<string | undefined> {
+      const where = relative(ws, process.cwd());
+      if (where.startsWith("..") || isAbsolute(where) || !existsSync(ws)) {
+        throw new Error(`turn outlived its test's workspace; refusing to run in ${process.cwd()}`);
+      }
+      let parked: string | undefined;
+      await runChatLoop({
+        model: "test-model",
+        instructions: "approval places",
+        runContext: createRunContext({ sessionId }),
+        sessionRootDir: mkdtempSync(join(state, "sess-")),
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        permissionMode: "default",
+        permissionRules: rules(),
+        tools: [builtin("RunCommand")],
+        approvals: { store },
+        _adapter: scripted([{ name: "RunCommand", input: call }]),
+      }).catch((err: { report?: { class?: string; detail?: string } }) => {
+        if (err.report?.class !== "approval_pending") throw err;
+        parked = err.report.detail;
+      });
+      return /parked as approval (appr_[0-9a-f]{16})/.exec(parked ?? "")?.[1];
+    }
+    /** Park the call, grant it, then (maybe) make ./evil.mjs a link to secrets/x.mjs. */
+    async function grantThen(retarget: boolean) {
+      store = createPendingApprovalStore({ rootDir: mkdtempSync(join(state, "approvals-")) });
+      const id = await turn();
+      if (id === undefined) throw new Error("the RunCommand did not park");
+      const places = (await store.list()).find((a) => a.id === id)?.places;
+      await store.resolve(id, "grant", "operator");
+      if (retarget) {
+        rmSync(join(ws, "evil.mjs"));
+        symlinkSync("secrets/x.mjs", join(ws, "evil.mjs"));
+      }
+      writeFileSync(marker, "");
+      const again = await turn();
+      const consumed = (await store.list()).find((a) => a.id === id)?.consumedAt !== undefined;
+      return { places, parkedAgain: again !== undefined, consumed, ran: ran() };
+    }
+
+    test("the card shows where node opens the script, and a link moved there asks again", async () => {
+      const got = await grantThen(true);
+      expect(got).toEqual({
+        places: [
+          { path: "./evil.mjs", at: [`${ws}/evil.mjs`] },
+          { path: "lnk/../evil.mjs", at: [`${ws}/safe/evil.mjs`] },
+        ],
+        parkedAgain: true,
+        consumed: false,
+        ran: "",
+      });
+    }, 60_000);
+
+    test.skipIf(!hasNode)(
+      "control: left where it was, the grant runs ./evil.mjs once",
+      async () => {
+        const got = await grantThen(false);
+        expect({ ...got, places: got.places?.length }).toEqual({
+          places: 2,
+          parkedAgain: false,
+          consumed: true,
+          ran: "evil.mjs",
+        });
+      },
+      60_000,
+    );
+  });
+});
