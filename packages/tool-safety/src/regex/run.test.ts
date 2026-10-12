@@ -1,4 +1,5 @@
-import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worker-clock";
 import {
   REGEX_RUN_DEFAULTS,
   type RegexOutcome,
@@ -42,6 +43,10 @@ afterAll(async () => {
   await settleWorkers(60_000);
 });
 
+// A body abandoned at its budget never reaches a finally of its own, so the
+// real Worker is put back here, after every test.
+afterEach(restoreWorkerClock);
+
 /**
  * Screen-passing, and still abandoned by JavaScriptCore: four adjacent loops
  * over a two-branch group, which is polynomial rather than exponential, so
@@ -50,6 +55,9 @@ afterAll(async () => {
  * ends in "x" and the pattern says `|x`. The executor must not believe it.
  */
 const GIVES_UP = { pattern: "(?:a|b)*(?:a|b)*(?:a|b)*(?:a|b)*!|x", input: `${"a".repeat(100)}x` };
+
+/** What a give-up costs on the scripted worker clock. Every real one measured took 0.4–3 s. */
+const GIVE_UP_COST_MS = 1_000;
 
 describe("runRegex: answers", () => {
   test("test, matchAll, replace, split, testEach and firstMatchingRule", async () => {
@@ -240,29 +248,31 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
     // The engine itself answers wrongly here — the premise of the test.
     expect(new RegExp(GIVES_UP.pattern).test(GIVES_UP.input)).toBe(false);
     expect(GIVES_UP.input.endsWith("x")).toBe(true);
+    // The worker runs the same exec and gets the same wrong "no". Only the
+    // time it took tells it from a real no-match, and an engine a few times
+    // faster than this one made it look like one. The worker's clock is
+    // scripted to what a give-up costs; the deadline only stops a hang.
+    scriptWorkerClock({ [GIVES_UP.input]: GIVE_UP_COST_MS });
     const outcome = await runRegex({ op: "test", ...GIVES_UP, deadlineMs: 30_000 });
-    // gave-up is the expected path; a slow runner may hit the deadline first,
-    // which is equally undetermined. What must never happen is "ok".
-    expect(["gave-up", "timeout"]).toContain(outcome.status);
+    expect(outcome).toMatchObject({ status: "gave-up", execMs: GIVE_UP_COST_MS });
     expect(regexVerdict(outcome)).toBe("undetermined");
-    if (outcome.status === "gave-up") {
-      expect(outcome.execMs).toBeGreaterThanOrEqual(100);
-      expect(outcome.reason).toContain("undetermined");
-    }
+    if (outcome.status === "gave-up") expect(outcome.reason).toContain("undetermined");
   }, 60_000);
 
   test("a no-match that took at least giveUpMs is not trusted, and a batch says where it stopped", async () => {
-    // A genuine but slow no-match: quadratic over a long run of spaces.
-    const slow = `${" ".repeat(40_000)}y`;
+    // A genuine no-match the worker's clock says took a second. "none" is
+    // tried in the same group of inputs, takes no time, and is a definite no.
+    const slow = "spaces, then y";
+    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
     const outcome = await runRegex({
       op: "testEach",
       pattern: "\\s+$",
       inputs: ["trailing  ", "none", slow, "also  "],
-      giveUpMs: 20,
       deadlineMs: 60_000,
     });
     expect(outcome).toMatchObject({
       status: "gave-up",
+      execMs: GIVE_UP_COST_MS,
       index: 2,
       partial: { matched: [0], scanned: 2, truncated: false },
     });
@@ -540,12 +550,17 @@ describe("batch ops", () => {
 
   test('onGiveUp "skip" reports a give-up as undetermined and answers the inputs after it', async () => {
     await settleWorkers(60_000);
+    // GIVES_UP's pattern does not match twelve a's, and the engine says so
+    // at once; the worker's clock says it took as long as a give-up does.
+    // "no" is the same kind of answer, quick, and stays a definite no.
+    const slow = "a".repeat(12);
+    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
     const session = openRegexSession();
     try {
       const each = await session.run({
         op: "testEach",
         pattern: GIVES_UP.pattern,
-        inputs: ["x", GIVES_UP.input, "yx", "no"],
+        inputs: ["x", slow, "yx", "no"],
         onGiveUp: "skip",
         deadlineMs: 60_000,
       });
@@ -556,7 +571,7 @@ describe("batch ops", () => {
       const first = await session.run({
         op: "firstMatchingRule",
         rules: [{ pattern: GIVES_UP.pattern }, { pattern: "a" }],
-        inputs: ["zzz", GIVES_UP.input, "a"],
+        inputs: ["zzz", slow, "a"],
         onGiveUp: "skip",
         deadlineMs: 60_000,
       });
@@ -569,7 +584,7 @@ describe("batch ops", () => {
       const matrix = await session.run({
         op: "testMatrix",
         patterns: [{ pattern: GIVES_UP.pattern }, { pattern: "a" }],
-        inputs: ["zzz", GIVES_UP.input],
+        inputs: ["zzz", slow],
         onGiveUp: "skip",
         deadlineMs: 60_000,
       });
@@ -607,7 +622,9 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
   // giveUpMs has each no-match run again alone, so only the slow input is
   // undetermined, and a match beside it still counts.
   test("one slow no-match among quick ones is the only undetermined input", async () => {
-    const slow = `${" ".repeat(20_000)}y`;
+    // Slow on the worker's scripted clock; every other input takes no time.
+    const slow = "row 101 is slow";
+    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
     const inputs: string[] = [];
     for (let i = 0; i < 200; i++) inputs.push(i % 7 === 0 ? `row ${i} ends  ` : `row ${i}`);
     inputs[101] = slow;
@@ -617,7 +634,6 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
         pattern: "\\s+$",
         inputs: form === "array" ? inputs : { lines: inputs.join("\n") },
         onGiveUp: "skip",
-        giveUpMs: 20,
         deadlineMs: 60_000,
         maxInputChars: 1_000_000,
       });
@@ -628,6 +644,8 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
         inputs.flatMap((s, i) => (i !== 101 && /\s+$/.test(s) ? [i] : [])),
       );
       expect(outcome.result.scanned).toBe(inputs.length);
+      // The slow input ran exactly twice: in its group, and then alone.
+      expect(outcome.elapsedMs).toBe(2 * GIVE_UP_COST_MS);
     }
   }, 90_000);
 
@@ -728,13 +746,14 @@ describe("testEach over one text's lines ({ lines })", () => {
   });
 
   test("a slow no-match is still undetermined, never a miss", async () => {
-    const slow = `${" ".repeat(40_000)}y`;
+    // Slow on the worker's scripted clock; "none" beside it takes no time.
+    const slow = "spaces, then y";
+    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
     const outcome = await runRegex({
       op: "testEach",
       pattern: "\\s+$",
       inputs: { lines: ["trailing  ", "none", slow, "also  "].join("\n") },
       onGiveUp: "skip",
-      giveUpMs: 20,
       deadlineMs: 60_000,
     });
     expect(outcome).toMatchObject({
