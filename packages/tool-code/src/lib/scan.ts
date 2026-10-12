@@ -93,13 +93,16 @@ export function maskSource(src: string): Masked {
   // A stack so `${…}` inside a template returns to template mode afterwards.
   const stack: Array<{ mode: "code" | "template"; depth: number }> = [{ mode: "code", depth: 0 }];
   let prevSignificant = "";
-  let prevWord = "";
   // The last identifier character read, and where its run starts: a later
   // one walks back only to it, and takes its start when the runs join, so
   // each character is walked back over once. Walking back over the whole run
   // at every character of it was quadratic in an identifier's length.
   let wordStart = 0;
   let wordEnd = -1;
+  // Whether that run is still the word before the next `/`. It is copied out
+  // only there: copying it at every character of it, as it grew, was
+  // quadratic in an identifier's length too.
+  let wordLive = false;
   let i = 0;
 
   const blank = (from: number, to: number, k: number): void => {
@@ -127,7 +130,7 @@ export function maskSource(src: string): Masked {
         keep(i, KIND_STRING);
         stack.pop();
         prevSignificant = "`";
-        prevWord = "";
+        wordLive = false;
         i += 1;
         continue;
       }
@@ -136,7 +139,7 @@ export function maskSource(src: string): Masked {
         keep(i + 1, KIND_CODE);
         stack.push({ mode: "code", depth: 0 });
         prevSignificant = "{";
-        prevWord = "";
+        wordLive = false;
         i += 2;
         continue;
       }
@@ -181,7 +184,7 @@ export function maskSource(src: string): Masked {
       if (j < n && src[j] === c) keep(j, KIND_STRING);
       i = j < n && src[j] === c ? j + 1 : j;
       prevSignificant = '"';
-      prevWord = "";
+      wordLive = false;
       continue;
     }
     if (c === "`") {
@@ -190,7 +193,10 @@ export function maskSource(src: string): Masked {
       i += 1;
       continue;
     }
-    if (c === "/" && regexAllowed(prevSignificant, prevWord)) {
+    if (
+      c === "/" &&
+      regexAllowed(prevSignificant, wordLive ? src.slice(wordStart, wordEnd + 1) : "")
+    ) {
       let j = i + 1;
       let inClass = false;
       let closed = false;
@@ -218,7 +224,7 @@ export function maskSource(src: string): Masked {
         blank(j + 1, k, KIND_STRING);
         i = k;
         prevSignificant = "/";
-        prevWord = "";
+        wordLive = false;
         continue;
       }
       // Unterminated on this line: treat as ordinary division after all.
@@ -230,7 +236,7 @@ export function maskSource(src: string): Masked {
         stack.pop();
         i += 1;
         prevSignificant = "}";
-        prevWord = "";
+        wordLive = false;
         continue;
       }
       top.depth = Math.max(0, top.depth - 1);
@@ -244,9 +250,9 @@ export function maskSource(src: string): Masked {
         if (s === wordEnd + 1) s = wordStart;
         wordStart = s;
         wordEnd = i;
-        prevWord = src.slice(s, i + 1);
+        wordLive = true;
       } else {
-        prevWord = "";
+        wordLive = false;
       }
     } else if (c === "\n") {
       // A newline is significant for the regex heuristic (statement start)

@@ -25,6 +25,8 @@
  * (`text[i]`, `items[i]`) or walks a Map or a Set is not counted. So the
  * bound holds for the ways these readers, and 0.7.0's, read text and lists,
  * not for any loop someone could write.
+ *
+ * The same file is in tool-code and tool-verify; keep the copies in step.
  */
 
 type Method = (this: unknown, ...args: unknown[]) => unknown;
