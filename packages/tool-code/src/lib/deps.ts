@@ -25,6 +25,7 @@
  *
  * Pure: text in, records out.
  */
+import { isLineBreak, isRegExpSpace } from "./regexp-space";
 import { KIND_COMMENT, maskSource } from "./scan";
 
 export type DependencyScope = "prod" | "dev" | "peer" | "optional" | "build";
@@ -727,6 +728,41 @@ export function parsePyproject(text: string, source = "pyproject.toml"): Depende
 // ---------------------------------------------------------------------------
 // go
 
+/**
+ * `line` cut at its first `//` that has no line break after it: what
+ * `line.replace(/\/\/.*$/, "")` returned (`.` stops at \n, \r, U+2028 and
+ * U+2029), found with two scans instead. That pattern tries every `/` and,
+ * where a line break follows, rescans up to it before giving the start up,
+ * so a run of slashes before a stray \r was quadratic in the run's length.
+ */
+export function beforeLineComment(line: string): string {
+  let lastBreak = -1;
+  for (let i = line.length - 1; i >= 0; i--) {
+    if (isLineBreak(line.charCodeAt(i))) {
+      lastBreak = i;
+      break;
+    }
+  }
+  const open = line.indexOf("//", lastBreak + 1);
+  return open === -1 ? line : line.slice(0, open);
+}
+
+/**
+ * What follows `require` and its whitespace on a one-line require: what
+ * `/^require\s+(.*)$/.exec(line)?.[1]` returned. The whitespace is taken
+ * whole and the rest must hold no line break, which is the only way that
+ * pattern matches; it tried each shorter run of whitespace before giving up,
+ * so a run of spaces before a stray \r was quadratic in the run's length.
+ */
+export function requireBody(line: string): string | undefined {
+  if (!line.startsWith("require")) return undefined;
+  let start = 7;
+  while (start < line.length && isRegExpSpace(line.charCodeAt(start))) start++;
+  if (start === 7) return undefined;
+  for (let i = start; i < line.length; i++) if (isLineBreak(line.charCodeAt(i))) return undefined;
+  return line.slice(start);
+}
+
 /** `go.mod`: the `require` block, plus `// indirect` markers. */
 export function parseGoMod(text: string, source = "go.mod"): Dependency[] {
   const out: Dependency[] = [];
@@ -734,7 +770,7 @@ export function parseGoMod(text: string, source = "go.mod"): Dependency[] {
   for (const raw of text.split("\n")) {
     const withComment = raw.replace(/\r$/, "");
     const indirect = /\/\/\s*indirect/.test(withComment);
-    const line = withComment.replace(/\/\/.*$/, "").trim();
+    const line = beforeLineComment(withComment).trim();
     if (line === "") continue;
     if (/^require\s*\($/.test(line)) {
       inRequire = true;
@@ -744,7 +780,7 @@ export function parseGoMod(text: string, source = "go.mod"): Dependency[] {
       inRequire = false;
       continue;
     }
-    const body = inRequire ? line : /^require\s+(.*)$/.exec(line)?.[1];
+    const body = inRequire ? line : requireBody(line);
     if (body === undefined) continue;
     const m = /^(?<name>\S+)\s+(?<range>\S+)$/.exec(body.trim());
     if (m === null) continue;

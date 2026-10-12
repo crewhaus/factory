@@ -32,6 +32,7 @@
  * Everything here is pure: same text in, same bytes out.
  */
 import { screenUserRegex } from "@crewhaus/tool-safety/regex";
+import { isRegExpSpace } from "./regexp-space";
 
 /** Character classification produced by `maskSource`. */
 export const KIND_CODE = 0;
@@ -536,6 +537,35 @@ const EXPORT_FROM_RE =
 const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 const REQUIRE_RE = /\brequire\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 
+/** A code unit `[\w$]` matches. */
+function isIdentifierUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    c === 0x5f ||
+    c === 0x24
+  );
+}
+
+/**
+ * The alias in `name as alias`: what `/\s+as\s+([\w$]+)$/.exec(piece)?.[1]`
+ * returned, read from the end. That pattern tries every start inside a run
+ * of whitespace and, where `as` does not follow the run, rescans the rest of
+ * it from each before giving the start up, so a long run inside an import or
+ * export list was quadratic in its length.
+ */
+export function aliasAfterAs(piece: string): string | undefined {
+  let alias = piece.length;
+  while (alias > 0 && isIdentifierUnit(piece.charCodeAt(alias - 1))) alias--;
+  if (alias === piece.length) return undefined;
+  let gap = alias;
+  while (gap > 0 && isRegExpSpace(piece.charCodeAt(gap - 1))) gap--;
+  if (gap === alias || gap < 3) return undefined;
+  if (piece.charCodeAt(gap - 1) !== 0x73 || piece.charCodeAt(gap - 2) !== 0x61) return undefined;
+  return isRegExpSpace(piece.charCodeAt(gap - 3)) ? piece.slice(alias) : undefined;
+}
+
 function clauseNames(clause: string): string[] {
   const text = clause.trim();
   if (text === "") return [];
@@ -551,8 +581,7 @@ function clauseNames(clause: string): string[] {
     for (const part of (braced[1] as string).split(",")) {
       const piece = part.replace(/\btype\s+/g, "").trim();
       if (piece === "") continue;
-      const asMatch = /\s+as\s+([\w$]+)$/.exec(piece);
-      names.push(asMatch !== null ? (asMatch[1] as string) : (piece.split(/\s+/)[0] as string));
+      names.push(aliasAfterAs(piece) ?? (piece.split(/\s+/)[0] as string));
     }
   }
   return names;
@@ -672,8 +701,7 @@ export function scanExports(src: string): ExportRecord[] {
     for (const part of (m.groups?.["body"] ?? "").split(",")) {
       const piece = part.replace(/\btype\s+/g, "").trim();
       if (piece === "") continue;
-      const asMatch = /\s+as\s+([\w$]+)$/.exec(piece);
-      const name = asMatch !== null ? (asMatch[1] as string) : (piece.split(/\s+/)[0] as string);
+      const name = aliasAfterAs(piece) ?? (piece.split(/\s+/)[0] as string);
       out.push({ name, line, kind: "named", ...(from === undefined ? {} : { from }) });
     }
   }
