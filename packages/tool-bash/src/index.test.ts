@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { __resetBackgroundProcsForTest, bash, bashOutput, killShell } from "./index";
 
 describe("Bash tool metadata", () => {
@@ -91,6 +94,26 @@ async function drainBackground(
   return { combined, last };
 }
 
+/**
+ * Poll a background process until what its polls returned, together,
+ * satisfies `done`, and return that. Ends on the output, not on a count of
+ * polls a slow runner could exhaust; `hangStopMs` only stops a wait for
+ * output that never comes, and the assertions after it then fail.
+ */
+async function pollUntil(
+  id: string,
+  done: (seen: string) => boolean,
+  hangStopMs = 10_000,
+): Promise<string> {
+  const began = performance.now();
+  let seen = "";
+  for (;;) {
+    seen += `${await bashOutput.execute({ bash_id: id })}\n`;
+    if (done(seen) || performance.now() - began > hangStopMs) return seen;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 describe("background Bash + BashOutput + KillShell", () => {
   afterEach(() => {
     __resetBackgroundProcsForTest();
@@ -127,19 +150,34 @@ describe("background Bash + BashOutput + KillShell", () => {
   });
 
   test("BashOutput is incremental — a poll only returns output since the last poll", async () => {
-    const start = await bash.execute({
-      command: "echo first; sleep 0.3; echo second",
-      background: true,
-    });
-    const id = start.match(/bash_[0-9a-f]{12}/)?.[0] as string;
-    // First poll (quick) should catch "first" but not yet "second".
-    await new Promise((r) => setTimeout(r, 50));
-    const poll1 = await bashOutput.execute({ bash_id: id });
-    expect(poll1).toContain("first");
-    // Drain the rest; "second" appears in a later poll, not re-reported "first".
-    const { combined } = await drainBackground(id);
-    expect(combined).toContain("second");
-  });
+    // The second line waits for a file this test creates once it has polled
+    // the first, so the order is caused, not hoped for: a fixed 50 ms sleep
+    // before the first poll raced the shell's start, and a slow start left
+    // the poll empty. Each wait ends on what it waits for; 10 s only stops
+    // one that never comes.
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-bash-gate-"));
+    const gate = join(dir, "release-second");
+    try {
+      const start = await bash.execute({
+        command: `echo first; while [ ! -f '${gate}' ]; do sleep 0.01; done; echo second`,
+        background: true,
+      });
+      const id = start.match(/bash_[0-9a-f]{12}/)?.[0] as string;
+      const before = await pollUntil(id, (seen) => seen.includes("first"));
+      expect(before).toContain("first");
+      expect(before).not.toContain("second");
+      expect(before).toContain("[status] running");
+
+      writeFileSync(gate, "");
+      // The rest: "second" and the exit, with "first" not reported again.
+      const after = await pollUntil(id, (seen) => seen.includes("[status] exited"));
+      expect(after).toContain("second");
+      expect(after).not.toContain("first");
+      expect(after).toContain("[status] exited 0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("KillShell stops a long-running background process", async () => {
     const start = await bash.execute({ command: "sleep 30", background: true });
