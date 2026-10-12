@@ -195,6 +195,12 @@ export function inferCsvColumnTypes(
 /** One column's value in one record, when it is neither null nor undefined. */
 export type JsonField = { readonly column: number; readonly value: unknown };
 
+/** A distinct column name, and the columns it fills: a name listed twice fills both. */
+export type JsonName = { readonly index: number; readonly columns: readonly number[] };
+
+/** The value a record holds for one distinct name, when it is neither null nor undefined. */
+export type JsonCell = { readonly name: JsonName; readonly value: unknown };
+
 /**
  * The cells of a JSON record that are there, found from the record's own
  * names rather than by asking it for every column.
@@ -207,71 +213,99 @@ export type JsonField = { readonly column: number; readonly value: unknown };
  * reads `Object.prototype.toString` from a record without one. So a record
  * is asked for the names it owns, and for the columns its prototype answers
  * for, and no other cell can matter.
+ *
+ * A record is read once per distinct name, however often the name is
+ * listed: the columns are the model's to write, and a name repeated k times
+ * would otherwise cost k for every record that holds it.
  */
 export class JsonColumns {
-  /** Each name's columns; a name listed twice fills both. */
-  private readonly byName = new Map<string, number[]>();
+  /** Each distinct name, in the order it is first listed. */
+  readonly names: JsonName[] = [];
+  private readonly byName = new Map<string, { index: number; columns: number[] }>();
   /** Per prototype, the names it answers for: `name in prototype`. */
-  private readonly inherited = new Map<object | null, string[]>();
+  private readonly inherited = new Map<object, Array<readonly [string, JsonName]>>();
 
   constructor(readonly columns: readonly string[]) {
     for (let column = 0; column < columns.length; column++) {
-      const name = columns[column] as string;
-      const list = this.byName.get(name);
-      if (list === undefined) this.byName.set(name, [column]);
-      else list.push(column);
+      const key = columns[column] as string;
+      const known = this.byName.get(key);
+      if (known !== undefined) {
+        known.columns.push(column);
+      } else {
+        const name = { index: this.names.length, columns: [column] };
+        this.byName.set(key, name);
+        this.names.push(name);
+      }
     }
+  }
+
+  /**
+   * The record's non-null values, one for each distinct name, as
+   * `record[name]` reads them: the names it owns, then the names its
+   * prototype answers for.
+   */
+  cells(record: object): JsonCell[] {
+    const out: JsonCell[] = [];
+    const values = record as Record<string, unknown>;
+    for (const key of Object.getOwnPropertyNames(record)) {
+      const name = this.byName.get(key);
+      if (name !== undefined) keep(out, name, values[key]);
+    }
+    for (const [key, name] of this.answeredBy(Object.getPrototypeOf(record) as object | null)) {
+      if (!Object.hasOwn(record, key)) keep(out, name, values[key]);
+    }
+    return out;
   }
 
   /** The record's non-null cells, as `record[columns[column]]` reads them. */
   fields(record: object): JsonField[] {
     const out: JsonField[] = [];
-    const cells = record as Record<string, unknown>;
-    for (const name of Object.getOwnPropertyNames(record)) {
-      const columns = this.byName.get(name);
-      if (columns !== undefined) this.push(out, columns, cells[name]);
-    }
-    for (const name of this.answeredBy(Object.getPrototypeOf(record) as object | null)) {
-      if (Object.hasOwn(record, name)) continue;
-      this.push(out, this.byName.get(name) as number[], cells[name]);
+    for (const { name, value } of this.cells(record)) {
+      for (const column of name.columns) out.push({ column, value });
     }
     return out;
   }
 
-  private push(out: JsonField[], columns: readonly number[], value: unknown): void {
-    if (value === null || value === undefined) return;
-    for (const column of columns) out.push({ column, value });
-  }
-
-  private answeredBy(prototype: object | null): readonly string[] {
+  private answeredBy(prototype: object | null): ReadonlyArray<readonly [string, JsonName]> {
     if (prototype === null) return [];
     const known = this.inherited.get(prototype);
     if (known !== undefined) return known;
-    const names: string[] = [];
-    for (const name of this.byName.keys()) if (name in prototype) names.push(name);
+    const names: Array<readonly [string, JsonName]> = [];
+    for (const [key, name] of this.byName) if (key in prototype) names.push([key, name]);
     this.inherited.set(prototype, names);
     return names;
   }
 }
 
+function keep(out: JsonCell[], name: JsonName, value: unknown): void {
+  if (value !== null && value !== undefined) out.push({ name, value });
+}
+
 /**
  * Every column's type from JSON records, in one pass over the cells they
  * hold: what `inferTypeFromJson(records.map((r) => r[column]))` answered for
- * each column, without asking each record for every column.
+ * each column, without asking each record for every column. A name listed
+ * twice reads the same values into both its columns, so it is tallied once
+ * and both columns get its type.
  */
 export function inferJsonColumnTypes(
   columns: readonly string[],
   records: ReadonlyArray<object>,
 ): InferredType[] {
   const reader = new JsonColumns(columns);
-  const tallies: Tally[] = columns.map(() => newTally());
+  const tallies: Tally[] = reader.names.map(() => newTally());
   for (const record of records) {
-    for (const { column, value } of reader.fields(record)) {
-      const tally = tallies[column] as Tally;
+    for (const { name, value } of reader.cells(record)) {
+      const tally = tallies[name.index] as Tally;
       if (tally.allNumeric) countJson(tally, value);
     }
   }
-  return tallies.map(decide);
+  const types: InferredType[] = columns.map(() => "TEXT");
+  for (const name of reader.names) {
+    const type = decide(tallies[name.index] as Tally);
+    for (const column of name.columns) types[column] = type;
+  }
+  return types;
 }
 
 /**

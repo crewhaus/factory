@@ -10,7 +10,9 @@
  *     the rows were one cell wide, and the records of an NDJSON file that
  *     each bring one new key make C as large as R;
  *   - ImportJson's dry run asked every record for every column, and a table
- *     that will not be created is not held to SQLite's column limit.
+ *     that will not be created is not held to SQLite's column limit;
+ *   - a name the model lists k times in ImportJson's `columns` was read k
+ *     times from every record that holds it, before the repeat is refused.
  *
  * A cell of digits also went whole to BigInt, which the engine reads with
  * one multiply-add over the number per digit, and past 313,592 digits
@@ -120,28 +122,28 @@ async function bigIntCharacters<T>(body: () => Promise<T>): Promise<{ value: T; 
 }
 
 /**
- * How often `JsonColumns#fields` is asked for a record's cells while `body`
+ * How often `JsonColumns#cells` is asked for a record's values while `body`
  * runs, and how many it hands back. A loop that reads `record[column]` for
  * every column is property reads, which no meter sees; the readers that
  * replaced it go through here.
  */
-async function fieldsAsked<T>(
+async function cellsAsked<T>(
   body: () => Promise<T>,
-): Promise<{ value: T; calls: number; fields: number }> {
+): Promise<{ value: T; calls: number; cells: number }> {
   const proto = JsonColumns.prototype;
-  const real = proto.fields;
-  const tally = { calls: 0, fields: 0 };
-  proto.fields = function (this: JsonColumns, record: object) {
+  const real = proto.cells;
+  const tally = { calls: 0, cells: 0 };
+  proto.cells = function (this: JsonColumns, record: object) {
     const out = real.call(this, record);
     tally.calls += 1;
-    tally.fields += out.length;
+    tally.cells += out.length;
     return out;
   };
   try {
     const value = await body();
-    return { value, calls: tally.calls, fields: tally.fields };
+    return { value, calls: tally.calls, cells: tally.cells };
   } finally {
-    proto.fields = real;
+    proto.cells = real;
   }
 }
 
@@ -281,7 +283,7 @@ describe("the import tools read a wide file in one pass", () => {
       const ndjson = `${Array.from({ length: count }, (_, i) => `{"k${i}":${i}}`).join("\n")}\n`;
       writeFileSync("keys.ndjson", ndjson);
       const limit = WORK_PER_CHARACTER * ndjson.length;
-      const asked = await fieldsAsked(() =>
+      const asked = await cellsAsked(() =>
         importWork(limit, () =>
           importJson.execute({
             database: "keys.db",
@@ -295,11 +297,11 @@ describe("the import tools read a wide file in one pass", () => {
       );
       const run = asked.value;
       expect(run.work).toBeLessThanOrEqual(limit);
-      // Each record is asked for its fields once to infer the types and once
+      // Each record is asked for its values once to infer the types and once
       // to check it, and holds one. Asking it for every column instead is a
       // loop of property reads, which nothing can count, so this is what
       // says it is not done.
-      expect(asked).toMatchObject({ calls: 2 * count, fields: 2 * count });
+      expect(asked).toMatchObject({ calls: 2 * count, cells: 2 * count });
       const out = parsed(run.value);
       expect(out.columns).toHaveLength(count);
       expect(out.inferredTypes.every((t: string) => t === "INTEGER")).toBe(true);
@@ -329,6 +331,50 @@ describe("the import tools read a wide file in one pass", () => {
     expect(run.work).toBeLessThanOrEqual(limit);
     expect(run.value).toBe('ImportCsv refused a duplicate column name "c17".');
   }, 20_000);
+
+  test("a column name the model lists thousands of times is read once per record", async () => {
+    // `columns` is the model's, with no length limit, and the types are
+    // inferred before the repeat is refused. Fanning each record's value out
+    // to every column that names it was k × R.
+    const measured: number[] = [];
+    for (const count of [4_000, 8_000]) {
+      const ndjson = `${Array.from({ length: count }, () => '{"a":1}').join("\n")}\n`;
+      writeFileSync("same.ndjson", ndjson);
+      const columns = Array.from({ length: count }, () => "a");
+      const limit = WORK_PER_CHARACTER * (ndjson.length + 4 * columns.length);
+      const asked = await cellsAsked(() =>
+        importWork(limit, () =>
+          importJson.execute({
+            database: "same.db",
+            create: true,
+            file: "same.ndjson",
+            table: "same",
+            createTable: true,
+            dryRun: true,
+            columns,
+          }),
+        ),
+      );
+      const run = asked.value;
+      expect(run.work).toBeLessThanOrEqual(limit);
+      expect(run.value).toBe('ImportJson refused a duplicate column name "a".');
+      // Once per record, to infer the types, and one value each.
+      expect(asked).toMatchObject({ calls: count, cells: count });
+      measured.push(run.work);
+    }
+    expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
+  }, 20_000);
+
+  test("a name listed twice gets the type its values give, in both its columns", () => {
+    const records = [{ a: 1, b: "x" }, { a: 2 }, { b: null }];
+    expect(inferJsonColumnTypes(["a", "b", "a", "b", "a"], records)).toEqual([
+      "INTEGER",
+      "TEXT",
+      "INTEGER",
+      "TEXT",
+      "INTEGER",
+    ]);
+  });
 
   test("a cell of digits goes to BigInt only when it could be in range", async () => {
     const digits = "7".repeat(400_000);
