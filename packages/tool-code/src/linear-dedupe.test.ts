@@ -1,11 +1,13 @@
 /**
- * Three readers keep their "seen already?" answer in a set.
+ * Four readers keep their "seen already?" answer in a set.
  *
  * Each checked a new item against every item it had kept so far, quadratic
  * in the items of one workspace input:
  *
  *   - `scanExports` (SymbolOutline) checked each `export default` against
  *     every export found before it, over a file of up to 2 MB;
+ *   - `scanImports` (SymbolOutline, ImportGraph, DeadFileScan) checked each
+ *     bare `import "x"` against every import found before it, over the same;
  *   - `buildImportGraph` (ImportGraph and the cycle tools) checked each
  *     import against the file's targets listed so far, and one file can
  *     import thousands of the 20,000 files a walk may visit;
@@ -24,7 +26,7 @@ import { join } from "node:path";
 import { jsWork, jsWorkAsync } from "./__test__/js-work";
 import { dependencyList } from "./index";
 import { type FileImports, buildImportGraph } from "./lib/graph";
-import { scanExports } from "./lib/scan";
+import { scanExports, scanImports } from "./lib/scan";
 
 const range = (k: number) => Array.from({ length: k }, (_, i) => i);
 
@@ -55,6 +57,55 @@ describe("scanExports lists one default a line, in one pass", () => {
     expect(scanExports(text).filter((e) => e.kind === "default")).toEqual([
       { name: "f", line: 1, kind: "default" },
       { name: "default", line: 2, kind: "default" },
+    ]);
+  });
+});
+
+describe("scanImports checks each bare import in one pass", () => {
+  // About 0.5 a character here.
+  const WORK_PER_CHARACTER = 2;
+
+  test('a file of `import "x";` lines', () => {
+    const rows = [4_000, 8_000].map((k) => {
+      // Every fourth line imports its module with a clause too: the bare
+      // pattern matches that line again, and the clause has claimed it.
+      const text = range(k)
+        .map((i) =>
+          i % 4 === 0 ? `import x from "m${i}"; import "m${i}";\n` : `import "m${i}";\n`,
+        )
+        .join("");
+      const run = jsWork(WORK_PER_CHARACTER * text.length, () => scanImports(text));
+      return { k, text, run };
+    });
+    for (const { k, text, run } of rows) {
+      expect(run.work).toBeLessThanOrEqual(WORK_PER_CHARACTER * text.length);
+      const records = (run.value ?? []).map((r) => [r.line, r.specifier, r.names]);
+      expect(records).toEqual(range(k).map((i) => [i + 1, `m${i}`, i % 4 === 0 ? ["x"] : []]));
+    }
+    const [small, large] = rows as [(typeof rows)[0], (typeof rows)[0]];
+    expect(large.run.work / small.run.work).toBeLessThan(2.4);
+  }, 20_000);
+
+  test("a bare import is dropped where a record on its line has its masked specifier", () => {
+    // The bare pattern reads the masked text, where a string's body is
+    // blank, so only an empty or all-space specifier can equal a record's.
+    const text = [
+      'import x from "a"; import "a";',
+      'export * from "c"; import "c";',
+      'require(""); import "";',
+      'export * from ""; import "";',
+      'import "  "; require("  ");',
+      'import "\t"; require("\t");',
+    ].join("\n");
+    expect(scanImports(text).map((r) => [r.line, r.kind, r.specifier])).toEqual([
+      [1, "import", "a"],
+      [2, "export-from", "c"],
+      [2, "import", "c"],
+      [3, "require", ""],
+      [4, "export-from", ""],
+      [5, "require", "  "],
+      [6, "require", "\t"],
+      [6, "import", "\t"],
     ]);
   });
 });

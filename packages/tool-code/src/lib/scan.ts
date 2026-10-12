@@ -726,6 +726,10 @@ export function scanImports(src: string): ImportRecord[] {
   const starts = lineStarts(code);
   const out: ImportRecord[] = [];
   const seen = new Set<string>();
+  // Each record's line and specifier, for the bare-import check below. `out`
+  // grows only through `push`, so this set holds exactly what searching it
+  // would find.
+  const claimed = new Set<string>();
 
   const push = (
     index: number,
@@ -740,6 +744,7 @@ export function scanImports(src: string): ImportRecord[] {
     const key = `${line}:${kind}:${specifier}`;
     if (seen.has(key)) return;
     seen.add(key);
+    claimed.add(`${line}:${specifier}`);
     out.push({ specifier, line, kind, typeOnly, names });
   };
 
@@ -781,9 +786,12 @@ export function scanImports(src: string): ImportRecord[] {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     const line = lineAt(starts, m.index as number);
-    // A bare `import "x"` only counts when no clause form already claimed
-    // this line, since `import x from "y"` matches this pattern too.
-    if (out.some((r) => r.line === line && r.specifier === spec)) continue;
+    // A bare `import "x"` is dropped when a record already holds this line
+    // and this specifier. `spec` is read from the masked text, whose string
+    // bodies are blank, so only an empty or all-space specifier matches; the
+    // `seen` key drops the other repeats. A set answers it: searching every
+    // record so far was quadratic in a file of `import "x";` lines.
+    if (claimed.has(`${line}:${spec}`)) continue;
     push(m.index as number, specStart, spec.length, "import", false, []);
   }
 
