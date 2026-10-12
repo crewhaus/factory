@@ -171,6 +171,7 @@ async function gate(
   input: unknown,
   ruleSet: RuleSet,
   mode: PermissionMode = "default",
+  opts: { readonly judgeAllows?: boolean } = {},
 ): Promise<string | undefined> {
   // The tools resolve a relative path against process.cwd(). A test that
   // outlives its timeout keeps running after afterEach has put the cwd back
@@ -198,6 +199,11 @@ async function gate(
     permissionMode: mode,
     permissionRules: ruleSet,
     tools: [builtin(name)],
+    // A justification-gated tool the rules allow runs only past the intent
+    // gate; a test that reads what it did says the judge allows.
+    ...(opts.judgeAllows === true
+      ? { justificationJudge: () => ({ allow: true, reason: "on task", judgeModel: "test" }) }
+      : {}),
     _adapter: adapterFor(name, input),
   });
   const first = events.find((e) => e.kind === "permission_decision");
@@ -4422,4 +4428,62 @@ describe("critic9 — a deny that fired in 0.7.0 still fires", () => {
     const allow = rules(["alwaysAllow", "EventQuery(sess-prod-*)"]);
     expect(await gate("EventQuery", { sessionId: "sess-prod-1" }, allow)).toBe("ask");
   }, 30_000);
+});
+
+describe("critic9 audit — a tenant's overlay is another pin than the global one", () => {
+  // SpecPin, DeployRollback and DeployInspect read and write a tenant's
+  // overlay (`_tenants/<id>/<name>.json`) when the call names `tenant`. A rule
+  // read only `<name>/<env>`, so an allow written for the global pin covered
+  // every tenant's overlay of it as well.
+  const overlay = () => join(ws, ".crewhaus", "specs", "_tenants", "acme", "s.json");
+  beforeEach(async () => {
+    writeFileSync(join(ws, "crewhaus.yaml"), "name: s\nshape: cli\n");
+    await builtin("SpecPin").execute({ name: "s", specFile: "crewhaus.yaml", env: "prod" });
+  });
+
+  test("an allow on a spec's environment does not cover a tenant's overlay of it", async () => {
+    const rs = rules(["alwaysAllow", "DeployRollback(s/prod)"]);
+    const roll = { name: "s", env: "prod", toVersion: "v1", dryRun: false };
+    const judged = { judgeAllows: true };
+    expect(await gate("DeployRollback", roll, rs, "default", judged)).toBe("allow");
+    expect(await gate("DeployRollback", { ...roll, tenant: "acme" }, rs, "default", judged)).toBe(
+      "ask",
+    );
+    expect(existsSync(overlay())).toBe(false);
+    // An allow that covers every value still covers it, and the overlay is written.
+    const every = rules(["alwaysAllow", "DeployRollback(**)"]);
+    expect(
+      await gate("DeployRollback", { ...roll, tenant: "acme" }, every, "default", judged),
+    ).toBe("allow");
+    expect(existsSync(overlay())).toBe(true);
+  }, 30_000);
+
+  test("a deny on a tenant fires on each tool, in every mode; the overlay is not written", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["SpecPin", { name: "s", specFile: "crewhaus.yaml", env: "prod", tenant: "acme" }],
+      [
+        "DeployRollback",
+        { name: "s", env: "prod", toVersion: "v1", dryRun: false, tenant: "acme" },
+      ],
+      ["DeployInspect", { name: "s", env: "prod", tenant: "acme" }],
+    ];
+    for (const [name, input] of calls) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        const rs = rules(["alwaysDeny", `${name}(acme)`], ["alwaysAllow", name]);
+        const got = await gate(name, input, rs, mode, { judgeAllows: true });
+        expect({ name, mode, got, written: existsSync(overlay()) }).toEqual({
+          name,
+          mode,
+          got: "deny",
+          written: false,
+        });
+      }
+      // Another tenant is not this rule's business.
+      const other = rules(["alwaysDeny", `${name}(acme)`], ["alwaysAllow", name]);
+      const beta = await gate(name, { ...input, tenant: "beta" }, other, "default", {
+        judgeAllows: true,
+      });
+      expect({ name, got: beta }).toEqual({ name, got: "allow" });
+    }
+  }, 60_000);
 });

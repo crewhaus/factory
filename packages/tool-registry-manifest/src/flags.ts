@@ -1201,6 +1201,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", default: "*", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
   },
   deployRollback: {
@@ -1214,6 +1215,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
   },
   depseudonymize: {
@@ -4900,6 +4902,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "specFile", kind: "path" },
       { field: "env", kind: "id", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
   },
   specSummarize: {

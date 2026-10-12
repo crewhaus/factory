@@ -107,6 +107,11 @@ registry reserves (its `_tenants`, or any other `_` name): the second
 registry's files would be invisible to the first one's listing and could be
 mistaken for its own.
 
+A rule reads `<name>/<env>` (`alwaysAllow DeployRollback(billing/staging)`). A
+call that names a `tenant` acts on that tenant's overlay, another pin, so the
+rule also reads the tenant: such an allow does not cover it, and
+`alwaysDeny DeployRollback(acme)` stops a rollback of tenant `acme`'s overlay.
+
 **Destructive means dry run by default, through the same selection code.**
 `DeployRollback` takes an explicit `dryRun: false` to act, and the preview is
 produced by `planRollback`, the same function the real call plans with — not a

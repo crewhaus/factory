@@ -1816,6 +1816,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", default: "*", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
     categories: ["deploy", "operations"],
     package: "@crewhaus/tool-deploy",
@@ -1834,6 +1835,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     operativeArgs: [
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
     categories: ["deploy", "operations"],
     package: "@crewhaus/tool-deploy",
@@ -7348,6 +7350,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
       { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "specFile", kind: "path" },
       { field: "env", kind: "id", within: "name" },
+      { field: "tenant", kind: "id" },
     ],
     categories: ["deploy", "operations"],
     package: "@crewhaus/tool-deploy",
