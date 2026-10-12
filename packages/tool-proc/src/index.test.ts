@@ -1963,14 +1963,41 @@ describe("WaitForPort", () => {
       expect(lookups).toEqual([]);
     }, 20_000);
 
+    // Each wait's deadline passes once the work it is about has been
+    // counted: the lookup, then the probe. A real 100 ms and 50 ms deadline
+    // let a runner descheduled between the wait's first two clock reads skip
+    // the loop, so nothing was looked up or probed at all.
     test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
       registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
       answers["meta.example"] = ["169.254.169.254"];
-      const meta = await call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 });
+      const meta = await withClockUntil(
+        () => lookups.length >= 1,
+        () => call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 }),
+      );
       expect(String(meta)).toContain("link-local");
-      const listed = await call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 });
-      expect(listed.attempts).toBeGreaterThanOrEqual(1);
-    });
+      expect(lookups).toEqual(["meta.example"]);
+      // Each probe sets its socket's timeout once; counted, still armed.
+      let probes = 0;
+      const realSetTimeout = Socket.prototype.setTimeout;
+      const counted = spyOn(Socket.prototype, "setTimeout").mockImplementation(function (
+        this: Socket,
+        ...args: Parameters<Socket["setTimeout"]>
+      ) {
+        probes += 1;
+        return realSetTimeout.apply(this, args);
+      } as Socket["setTimeout"]);
+      try {
+        const listed = await withClockUntil(
+          () => probes >= 1,
+          () => call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 }),
+        );
+        expect({ attempts: listed.attempts, probes }).toEqual({ attempts: 1, probes: 1 });
+      } finally {
+        counted.mockRestore();
+      }
+      // A literal is dialled as written, never looked up.
+      expect(lookups).toEqual(["meta.example"]);
+    }, 20_000);
 
     test("a model pool candidate's own block replaces the boot list for its calls", async () => {
       registerProcConfig({ wait_for_port_hosts: ["10.255.255.1"] });
