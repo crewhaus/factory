@@ -11,27 +11,112 @@
  * address parser.
  *
  * Each old regex is kept here as an ORACLE and run on small inputs only, so
- * the equivalence is checked without ever pinning a core; the large inputs
- * run through the new code alone, with a limit the old code misses by
- * orders of magnitude.
+ * the equivalence is checked without ever pinning a core; the hostile inputs
+ * run through the new code alone, and their work is counted, not timed.
  */
 import { describe, expect, test } from "bun:test";
+import { type RegexWork, regexWork, regexWorkAsync } from "./__test__/regex-work";
+import { type ScanWork, scanWork, scanWorkAsync } from "./__test__/scan-work";
 import { emlParse } from "./index";
 import { tidyLines } from "./lib/lines";
 import { parseAddressList, parseMailDate, replaceComments, stripHtml } from "./lib/mail";
 import { parseToUnicodeCMap } from "./lib/pdf-text";
 
 /**
- * The linear-time tests time a parse only to catch a hang. Each 0.7.0 regex
- * was quadratic by backtracking inside the engine, which no count taken from
- * outside it can see, so these stay on time. 0.7.0 runs for about a minute
- * or longer on every hostile input here, on a fast Mac, while the scans take
- * at most about 10 ms an input (CI, under the whole suite, has taken
- * 17-620 ms for a whole test): no runner is slow enough to reach the bound
- * with the fix in place, and 0.7.0 cannot get under it. Each of these tests
- * declares a 20 s budget, so this bound decides, not bun's 5 s default.
+ * The linear-time tests count a parse's work instead of timing it: every
+ * pattern's backtracking steps (__test__/regex-work.ts), and the characters
+ * the scans search, read and copy (__test__/scan-work.ts). On the hostile
+ * inputs here the parsers take at most 13 steps and 12 characters of
+ * scanning a character of input, at any size. Each 0.7.0 regex rescanned
+ * the rest of its input from every `<`, `(` or blank, so its count grows
+ * with the input's length: these inputs are about the sizes that took it a
+ * second to half a minute, where it takes 600 to 1 900 times the bound. A
+ * count past its bound stops the parse there and reads as Infinity, so a
+ * quadratic parse fails at once, however fast or slow the machine.
  */
-const HANG_MS = 5_000;
+const STEPS_PER_CHARACTER = 64;
+const SCAN_PER_CHARACTER = 32;
+
+/** Whether a pattern's source refers back to a group, which the step model cannot count. */
+function hasBackReference(source: string): boolean {
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] !== "\\") continue;
+    const next = source[i + 1] ?? "";
+    if ((next >= "1" && next <= "9") || (next === "k" && source[i + 2] === "<")) return true;
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * `body`, with every pattern the step model cannot count refused before it
+ * runs. 0.7.0's script and style pass, `/<(script|style)[\s\S]*?<\/\1>/gi`,
+ * refers back to its group: regex-work.ts would list it and run it
+ * uncounted, for minutes on these inputs. Refused, it fails the test at once.
+ */
+function countable<T>(body: () => T): T {
+  const counted = RegExp.prototype.exec;
+  RegExp.prototype.exec = function (this: RegExp, input: string): RegExpExecArray | null {
+    if (hasBackReference(this.source)) {
+      throw new Error(
+        `/${this.source}/${this.flags} refers back to a group: the step model cannot count it`,
+      );
+    }
+    return counted.call(this, input);
+  };
+  const restore = (): void => {
+    RegExp.prototype.exec = counted;
+  };
+  let out: T;
+  try {
+    out = body();
+  } catch (err) {
+    restore();
+    throw err;
+  }
+  if (out instanceof Promise) return out.finally(restore) as T;
+  restore();
+  return out;
+}
+
+/** `run`'s result, once its work on `size` characters of `input` is shown linear. */
+function linear<T>(input: string, size: number, run: () => T): T {
+  return linearIn(
+    input,
+    size,
+    regexWork(STEPS_PER_CHARACTER * size, () =>
+      countable(() => scanWork(SCAN_PER_CHARACTER * size, run)),
+    ),
+  );
+}
+
+async function linearAsync<T>(input: string, size: number, run: () => Promise<T>): Promise<T> {
+  return linearIn(
+    input,
+    size,
+    await regexWorkAsync(STEPS_PER_CHARACTER * size, () =>
+      countable(() => scanWorkAsync(SCAN_PER_CHARACTER * size, run)),
+    ),
+  );
+}
+
+function linearIn<T>(input: string, size: number, counted: RegexWork<ScanWork<T>>): T {
+  const scan = counted.value;
+  // A count within its bound reads "linear"; one past it, Infinity. A parse
+  // the step count stopped never finished its scan.
+  expect({
+    input,
+    unmodelled: counted.unmodelled,
+    steps: counted.steps <= STEPS_PER_CHARACTER * size ? "linear" : counted.steps,
+    scanned:
+      scan === undefined
+        ? "stopped"
+        : scan.work <= SCAN_PER_CHARACTER * size
+          ? "linear"
+          : scan.work,
+  }).toEqual({ input, unmodelled: [], steps: "linear", scanned: "linear" });
+  return scan?.value as T;
+}
 
 /** 0.7.0's stripHtml, verbatim. Small inputs only. */
 function oldStripHtml(html: string): string {
@@ -155,31 +240,22 @@ describe("stripHtml", () => {
 
   test("is linear on input with no closer: '<', '<style', '<script' and blank runs", () => {
     // 0.7.0: '<style' x 56 000 (336 KB) took 17 s, '<' x 40 000 0.8 s, and
-    // 200 000 spaces then "x" 28 s — each quadratic. These are 4-12x those
-    // sizes, so the old code would take minutes to hours on each. Each input
-    // is timed on its own: one bound covers one input, not the seven, and
-    // the budget keeps bun's 5 s default from bounding all seven at once.
-    // That is a deliberate trade: the seven together may now take up to the
-    // 20 s budget, where they had 5 s, so a slowdown spread thinly across
-    // them is caught later. A quadratic scan is not thin: it takes a minute
-    // or more on any one of them.
-    const inputs = [
-      "<".repeat(400_000),
-      "<style".repeat(200_000),
-      "<SCRIPT".repeat(200_000),
-      `${" ".repeat(800_000)}x`,
-      `${"\t ".repeat(400_000)}x\n`,
-      "</".repeat(400_000),
-      `<style>${"</styl".repeat(150_000)}`,
+    // 200 000 spaces then "x" 28 s — each quadratic. Each input is counted
+    // on its own, against its own length.
+    const inputs: Array<[string, string]> = [
+      ["'<'", "<".repeat(40_000)],
+      ["'<style'", "<style".repeat(20_000)],
+      ["'<SCRIPT'", "<SCRIPT".repeat(20_000)],
+      ["spaces then x", `${" ".repeat(80_000)}x`],
+      ["tabs and spaces then x", `${"\t ".repeat(40_000)}x\n`],
+      ["'</'", "</".repeat(40_000)],
+      ["'</styl' in a style", `<style>${"</styl".repeat(15_000)}`],
     ];
-    for (const [input, text] of inputs.entries()) {
-      const started = performance.now();
-      stripHtml(text);
-      const hung = performance.now() - started >= HANG_MS;
-      expect({ input, hung }).toEqual({ input, hung: false });
-    }
+    for (const [input, text] of inputs) linear(input, text.length, () => stripHtml(text));
     expect(stripHtml("<style".repeat(1_000))).toBe("<style".repeat(1_000));
     expect(stripHtml(`${" ".repeat(1_000)}x`)).toBe("x");
+    // Slow by construction: the step model walks all seven inputs, about
+    // 0.1 s here, and this package's tests ran up to 27 times slower on CI.
   }, 20_000);
 
   test("EmlParse on an HTML-only message is linear", async () => {
@@ -187,11 +263,13 @@ describe("stripHtml", () => {
       "From: a@x.test",
       "Content-Type: text/html; charset=utf-8",
       "",
-      "<style".repeat(100_000),
+      "<style".repeat(10_000),
     ].join("\r\n");
-    const started = performance.now();
-    const out = String(await emlParse.execute({ content: message, asText: true }, {} as never));
-    expect(performance.now() - started).toBeLessThan(HANG_MS);
+    const out = String(
+      await linearAsync("an HTML-only message", message.length, () =>
+        emlParse.execute({ content: message, asText: true }, {} as never),
+      ),
+    );
     // No `>` anywhere, so no tag: the text is the text.
     expect(out.startsWith("<style<style")).toBe(true);
   }, 20_000);
@@ -229,10 +307,10 @@ describe("parseAddressList", () => {
   });
 
   test("is linear on a piece of many '<' and no '>'", () => {
-    // 0.7.0: 40 000 '<' took 0.9 s (quadratic); this is 10x that.
-    const started = performance.now();
-    parseAddressList("<".repeat(400_000), new Set());
-    expect(performance.now() - started).toBeLessThan(HANG_MS);
+    // 0.7.0: 40 000 '<' took 0.9 s (quadratic).
+    const piece = "<".repeat(40_000);
+    const out = linear("'<'", piece.length, () => parseAddressList(piece, new Set()));
+    expect(out).toEqual([{ address: piece }]);
   }, 20_000);
 });
 
@@ -254,13 +332,18 @@ describe("parseMailDate's comment strip (bounds review)", () => {
 
   test("is linear on a Date of many '(' and no ')'", async () => {
     // 0.7.0 and 0.7.1's first cut: 80 000 '(' took 3.6 s, four times as
-    // long per doubling. This is ten times that.
-    const started = performance.now();
-    expect(parseMailDate("(".repeat(800_000))).toBeUndefined();
-    const message = `From: a@x.test\r\nDate: ${"(".repeat(400_000)}\r\n\r\nbody\r\n`;
-    const out = JSON.parse(String(await emlParse.execute({ content: message }, {} as never)));
+    // long per doubling.
+    const date = "(".repeat(80_000);
+    expect(linear("a Date", date.length, () => parseMailDate(date))).toBeUndefined();
+    const message = `From: a@x.test\r\nDate: ${"(".repeat(40_000)}\r\n\r\nbody\r\n`;
+    const out = JSON.parse(
+      String(
+        await linearAsync("a message's Date", message.length, () =>
+          emlParse.execute({ content: message }, {} as never),
+        ),
+      ),
+    );
     expect(out.date).toBeUndefined();
-    expect(performance.now() - started).toBeLessThan(HANG_MS);
   }, 20_000);
 });
 
@@ -283,11 +366,14 @@ describe("parseToUnicodeCMap", () => {
 
   test("is linear on sections with no end, and on '[' lists with no ']'", () => {
     // 0.7.0: 40 000 unclosed sections took 8-9 s each way (quadratic).
-    const started = performance.now();
-    parseToUnicodeCMap("beginbfchar ".repeat(400_000));
-    parseToUnicodeCMap("beginbfrange ".repeat(400_000));
-    parseToUnicodeCMap(`beginbfrange ${"<1> <2> [".repeat(200_000)} endbfrange`);
-    expect(performance.now() - started).toBeLessThan(HANG_MS);
+    const inputs: Array<[string, string]> = [
+      ["unclosed bfchar sections", "beginbfchar ".repeat(40_000)],
+      ["unclosed bfrange sections", "beginbfrange ".repeat(40_000)],
+      ["'[' lists with no ']'", `beginbfrange ${"<1> <2> [".repeat(20_000)} endbfrange`],
+    ];
+    for (const [input, text] of inputs) {
+      expect(linear(input, text.length, () => parseToUnicodeCMap(text).size)).toBe(0);
+    }
   }, 20_000);
 
   test("refuses ranges that expand past sixteen 2-byte code spaces", () => {
