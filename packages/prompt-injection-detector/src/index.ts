@@ -34,6 +34,7 @@
  */
 
 import {
+  findAutoExecute,
   findBackgroundCommand,
   findRoleMarker,
   findScriptIframe,
@@ -325,8 +326,10 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "auto-execute",
-    pattern:
+    pattern: scanned(
       /\b(?:then|next|after that|finally|now)\s+(?:run|execute|do)\s+(?:the following|this|these)\b[^\n]*\b(?:rm|curl|wget|chmod|chown|sudo|nc|ncat)\b/i,
+      findAutoExecute,
+    ),
     severity: "high",
   },
   {

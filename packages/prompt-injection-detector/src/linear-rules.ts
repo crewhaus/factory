@@ -2,17 +2,18 @@
  * Scans for the detector patterns the regex engine runs in quadratic time.
  *
  * Each pattern here rescans the text from every place it could start: every
- * `[INST]` reads on to the end looking for `[/INST]`, every `nohup` to the
- * end of its line looking for a command, every `<iframe` to its `>` (and over
- * a run of spaces after it twice over), every `http://` to the end of its URL
- * and then 80 characters more for every character of it. On 64 KiB of tool
- * output (MAX_CLASSIFY_LEN) that is seconds per rule, and over a minute for
- * the URL pair. Each scan returns the match its pattern returns, found by
- * reading each character a bounded number of times; linear-rules.test.ts
- * checks every one against its pattern.
+ * `[INST]` reads on to the end looking for `[/INST]`, every `nohup` and every
+ * `now do this` to the end of its line looking for a command, every `<iframe`
+ * to its `>` (and over a run of spaces after it twice over), every `http://`
+ * to the end of its URL and then 80 characters more for every character of
+ * it. On 64 KiB of tool output (MAX_CLASSIFY_LEN) that is seconds per rule,
+ * and over a minute for the URL pair. Each scan returns the match its pattern
+ * returns, found by reading each character a bounded number of times;
+ * linear-rules.test.ts and linear-auto-execute.test.ts check every one
+ * against its pattern.
  *
- * The three rule patterns stay RegExp objects with their own source and
- * flags (`ScannedPattern`), so the rule table reads as before and every
+ * The rule patterns stay RegExp objects with their own source and flags
+ * (`ScannedPattern`), so the rule table reads as before and every
  * `exec`/`test`/`match` on them takes the scan.
  */
 
@@ -298,6 +299,84 @@ export function findUrlCredentialPair(text: string): Found {
     }
     from = urlEnd;
   }
+}
+
+const LEADS = ["then", "next", "after that", "finally", "now"] as const;
+const VERBS = ["run", "execute", "do"] as const;
+const OBJECTS = ["the following", "this", "these"] as const;
+const DANGEROUS = ["rm", "curl", "wget", "chmod", "chown", "sudo", "nc", "ncat"] as const;
+
+/** Where the first of `words` at `at` (ignoring ASCII case) ends, or -1. */
+function wordEnd(text: string, at: number, words: readonly string[]): number {
+  for (const word of words) if (hasFolded(text, at, word)) return at + word.length;
+  return -1;
+}
+
+/** Where the run of `\s` from `at` ends. */
+function blanksEnd(text: string, at: number): number {
+  let p = at;
+  while (p < text.length && isSpace(text.charCodeAt(p))) p++;
+  return p;
+}
+
+/**
+ * Where `\b(?:then|next|after that|finally|now)\s+(?:run|execute|do)\s+(?:the following|this|these)\b`
+ * (any case) ends at `at`, or -1. No word in a group starts another, and a
+ * `\s+` gives back nothing a letter can follow, so there is one way to match.
+ */
+function autoExecuteHeadEnd(text: string, at: number): number {
+  if (!startsWord(text, at)) return -1;
+  const lead = wordEnd(text, at, LEADS);
+  if (lead === -1) return -1;
+  const verbAt = blanksEnd(text, lead);
+  if (verbAt === lead) return -1;
+  const verb = wordEnd(text, verbAt, VERBS);
+  if (verb === -1) return -1;
+  const objectAt = blanksEnd(text, verb);
+  if (objectAt === verb) return -1;
+  const object = wordEnd(text, objectAt, OBJECTS);
+  return object !== -1 && endsWord(text, object) ? object : -1;
+}
+
+/** Where `\b(?:rm|curl|wget|chmod|chown|sudo|nc|ncat)\b` (any case) ends at `at`, or -1. */
+function dangerousCommandEnd(text: string, at: number): number {
+  if (!startsWord(text, at)) return -1;
+  for (const command of DANGEROUS) {
+    if (hasFolded(text, at, command) && endsWord(text, at + command.length)) {
+      return at + command.length;
+    }
+  }
+  return -1;
+}
+
+/**
+ * `/\b(?:then|next|after that|finally|now)\s+(?:run|execute|do)\s+(?:the following|this|these)\b[^\n]*\b(?:rm|curl|wget|chmod|chown|sudo|nc|ncat)\b/i`.
+ *
+ * After its head the match runs to the end of the line and gives it back to
+ * the last command on it. When the line has none, every later head that ends
+ * on the same line searches a part of the same stretch and finds none either,
+ * so that stretch is searched once. A head can still run on past the newline
+ * (its blanks may hold one), so later heads are tried, not skipped; one that
+ * ends past the stretch searches its own.
+ */
+export function findAutoExecute(text: string): Found {
+  let clearFrom = -1;
+  let clearTo = -1;
+  for (let at = 0; at < text.length; at++) {
+    const head = autoExecuteHeadEnd(text, at);
+    if (head === -1 || (head >= clearFrom && head <= clearTo)) continue;
+    let lineEnd = text.indexOf("\n", head);
+    if (lineEnd === -1) lineEnd = text.length;
+    let end = -1;
+    for (let q = head + 1; q < lineEnd; q++) {
+      const found = dangerousCommandEnd(text, q);
+      if (found !== -1) end = found;
+    }
+    if (end !== -1) return { index: at, end };
+    clearFrom = head;
+    clearTo = lineEnd;
+  }
+  return null;
 }
 
 /** The rule pattern `pattern`, matched by `find` instead of the regex engine. */
