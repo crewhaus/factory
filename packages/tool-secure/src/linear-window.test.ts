@@ -178,8 +178,10 @@ describe("each scan finds the global search's matches", () => {
 describe("a hostile stretch is read once", () => {
   // The scans' own patterns take a few steps a character on these, and the
   // scans read each character at most eight times; the old patterns took
-  // hundreds to thousands of steps. The model walks every step in
-  // JavaScript, so each test declares a 20 s budget.
+  // hundreds to thousands of steps. Each check that rules a try out has a
+  // case of its own: a check that lets too much through changes no match,
+  // only the steps, so the tables above cannot see it. The model walks every
+  // step in JavaScript, so each test declares a 20 s budget.
   const STEPS_PER_CHARACTER = 8;
   const READS_PER_CHARACTER = 16;
 
@@ -203,6 +205,22 @@ describe("a hostile stretch is read once", () => {
       (s: string) => hits(markdownLinkMatches(s)),
       OLD_MARKDOWN_LINK,
     ],
+    // The `]` closes every label, but more than 200 characters after most
+    // of the `[`: only a label of at most 200 is tried.
+    [
+      "markdown link, a run of [ closed out of reach",
+      `${"[".repeat(20_000)}](x)`,
+      (s: string) => hits(markdownLinkMatches(s)),
+      OLD_MARKDOWN_LINK,
+    ],
+    // Every label closes and opens a target, but the `)` is more than 500
+    // characters after most of them: only a target of at most 500 is tried.
+    [
+      "markdown link, targets closed out of reach",
+      `${"[a](".repeat(5_000)})`,
+      (s: string) => hits(markdownLinkMatches(s)),
+      OLD_MARKDOWN_LINK,
+    ],
     [
       "pipe-to-shell, blanks with no |",
       `curl${" ".repeat(20_000)}x`,
@@ -212,6 +230,21 @@ describe("a hostile stretch is read once", () => {
     [
       "pipe-to-shell, curl after curl with no |",
       "curl x ".repeat(3_000),
+      (s: string) => hits(pipeToShell?.matches?.(s) ?? []),
+      OLD_PIPE_TO_SHELL,
+    ],
+    // A `|` and a shell, but 201 characters before the `|` whatever the
+    // blanks keep: no split leaves at most 200, so no try is made.
+    [
+      "pipe-to-shell, the | out of reach of every split",
+      `curl${" ".repeat(20_000)}${"a".repeat(201)}|sh`,
+      (s: string) => hits(pipeToShell?.matches?.(s) ?? []),
+      OLD_PIPE_TO_SHELL,
+    ],
+    // A `|` in reach, but no shell after it: no try is made.
+    [
+      "pipe-to-shell, a | with no shell after it",
+      `curl${" ".repeat(20_000)}|x`,
       (s: string) => hits(pipeToShell?.matches?.(s) ?? []),
       OLD_PIPE_TO_SHELL,
     ],
