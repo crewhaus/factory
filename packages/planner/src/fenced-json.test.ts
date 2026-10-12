@@ -5,6 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { scanWork } from "./__test__/scan-work";
 import { fencedJson } from "./fenced-json";
 import { PlannerError, decompose } from "./index.js";
 
@@ -111,8 +112,8 @@ describe("fencedJson", () => {
   }, 20_000);
 });
 
-// Counted, not timed: the only place super-linear work could hide in reading
-// the reply is a pattern run over it, so each one is refused and recorded.
+// Counted, not timed: a pattern run over the reply is refused and recorded.
+// The fence read's own reads are counted below.
 describe("a reply with an unclosed fence and a long run of whitespace", () => {
   test("is refused without a pattern over the reply", async () => {
     const run = " ".repeat(10_000);
@@ -128,4 +129,32 @@ describe("a reply with an unclosed fence and a long run of whitespace", () => {
     expect(planned.outcome).toBeInstanceOf(PlannerError);
     expect((planned.outcome as Error).message).toContain("could not locate JSON block");
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so its own
+// reads are counted (__test__/scan-work.ts) over replies shaped to make it
+// rescan, and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the fence read takes a long reply in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["an unclosed fence and a long run of whitespace", fencedJson, `\`\`\`${" ".repeat(N)}`],
+    [
+      "a json fence closed after a long run of whitespace",
+      fencedJson,
+      `\`\`\`json${" ".repeat(N)}\`\`\``,
+    ],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

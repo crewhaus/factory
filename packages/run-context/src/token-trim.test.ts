@@ -4,6 +4,7 @@
  * time quadratic in a run that is not at the end of the token.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { createRunContext, tagContent } from "./index";
 import { trimToken } from "./token-trim";
 
@@ -101,8 +102,8 @@ describe("trimToken", () => {
     expect(checked).toBe(1 + 20 + 20 ** 2 + 20 ** 3 + 20 ** 4);
   }, 20_000);
 
-  // Counted, not timed: the only place quadratic work could hide in a trim
-  // is a pattern run over the token, so every run is refused and recorded.
+  // Counted, not timed: a pattern run over the token is refused and
+  // recorded. The trim's own reads are counted below.
   test("runs no pattern over the token, however long its run of punctuation", () => {
     const dots = ".".repeat(100_000);
     // Control: the hook sees a pattern String#replace runs.
@@ -126,4 +127,32 @@ describe("tagContent on a long run of punctuation", () => {
     tagContent(ctx, `prefix ${token} suffix`, "tool");
     expect(ctx.dataLineage?.get(token)).toBe("tool");
   }, 30_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so its own
+// reads are counted (__test__/scan-work.ts) over tokens shaped to make it
+// rescan, and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the trim takes a long token in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a run of punctuation inside the token", trimToken, `x${".".repeat(N)}y`],
+    [
+      "runs of wrappers and punctuation at its ends",
+      trimToken,
+      `${"(".repeat(N)}x${".".repeat(N)}`,
+    ],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

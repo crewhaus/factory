@@ -6,6 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import type { OptimizerState } from "@crewhaus/prompt-optimizer";
+import { scanWork } from "./__test__/scan-work";
 import { ClaudeMutationProvider } from "./index";
 import { firstObjectSpan } from "./json-span";
 
@@ -116,8 +117,8 @@ describe("firstObjectSpan", () => {
   }, 20_000);
 });
 
-// Counted, not timed: the only place quadratic work could hide in reading
-// the reply is a pattern run over it, so each one is refused and recorded.
+// Counted, not timed: a pattern run over the reply is refused and recorded.
+// The span read's own reads are counted below.
 describe("a reply that is a long run of {", () => {
   test("falls back to the current best without a pattern over the reply", async () => {
     const run = "{".repeat(10_000);
@@ -134,4 +135,28 @@ describe("a reply that is a long run of {", () => {
       "claude-fallback: model response did not contain a JSON object",
     );
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so its own
+// reads are counted (__test__/scan-work.ts) over replies shaped to make it
+// rescan, and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the span read takes a long reply in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a run of { with no }", firstObjectSpan, "{".repeat(N)],
+    ["a run of } after one {", firstObjectSpan, `{${"}".repeat(N)}`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

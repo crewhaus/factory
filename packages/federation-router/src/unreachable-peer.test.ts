@@ -4,6 +4,7 @@
  * `peer ` in the message, and a message can hold a peer's version string.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { classifyRouterError } from "./index";
 import { mentionsUnreachablePeer } from "./unreachable-peer";
 
@@ -131,7 +132,7 @@ function refusingOldOver<T>(run: string, body: () => T): { ran: string[]; outcom
 }
 
 // Counted, not timed: the old pattern is refused on the spot if it runs over
-// the peer's text; the scan reads it once.
+// the peer's text. The scan's own reads are counted below.
 describe("a message holding a peer's long version string", () => {
   test("is classified without the pattern over it", () => {
     const run = "peer ".repeat(1_000);
@@ -142,4 +143,30 @@ describe("a message holding a peer's long version string", () => {
     expect(classified.ran).toEqual([]);
     expect(classified.outcome).toEqual({ kind: "fail", reason: message });
   }, 20_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so the scan's
+// own reads are counted (__test__/scan-work.ts) over messages shaped to make it
+// rescan, and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the scan reads a long message a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a line of peer with no unreachable", mentionsUnreachablePeer, fill("peer ")],
+    ["peer on every line", mentionsUnreachablePeer, fill("peer x\n")],
+    ["a line of peer, then a line break", mentionsUnreachablePeer, `${fill("peer ")}\nx`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

@@ -5,6 +5,7 @@
  * sentence of `marked` must not run the pattern.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { DONE_CLAIM_PATTERN, findDoneClaim } from "./done-claim";
 import { DONE_CLAIM_REGEX, doneClaimSentences } from "./heuristics";
 
@@ -143,4 +144,32 @@ describe("DONE_CLAIM_REGEX", () => {
     expect(doneClaimSentences(`${"marked ".repeat(285_715)}x`)).toEqual([]);
     expect(doneClaimSentences(`${"marked ".repeat(285_715)}x as done`)).toHaveLength(1);
   }, 60_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so the scan's
+// own reads are counted (__test__/scan-work.ts) over sentences shaped to make
+// it rescan (the hang detector below catches the same thing, but only after a
+// minute), and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the done-claim scan reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 16;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a sentence of marked", findDoneClaim, fill("marked ")],
+    ["sentences of marked … as donex", findDoneClaim, fill("marked x as donex. ")],
+    ["a run of i", findDoneClaim, fill("i ")],
+    ["a sentence of marked, then a stop", findDoneClaim, `${fill("marked ")}.`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

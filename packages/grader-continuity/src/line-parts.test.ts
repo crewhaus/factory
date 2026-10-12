@@ -3,6 +3,7 @@
  * the spaces after `##` one at a time when the line ended in a `\r`.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { handoffCueLines } from "./index";
 import { h2Text } from "./line-parts";
 
@@ -92,4 +93,28 @@ describe("h2Text", () => {
     expect(cues.refused).toEqual([]);
     expect(cues.outcome).toEqual([]);
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so its own
+// reads are counted (__test__/scan-work.ts) over a line shaped to make it
+// rescan, and held to a few per character. A rescan reads the rest of the run
+// from every place in it and stops at the bound at once.
+describe("the heading read takes a long line in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a CRLF heading with a long run of spaces", h2Text, `##${" ".repeat(N)}x\r`],
+    ["a heading with a long run of spaces", h2Text, `##${" ".repeat(N)}x`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });
