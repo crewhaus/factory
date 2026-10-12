@@ -741,9 +741,10 @@ const LETTER_OR_NUMBER = /^[\p{L}\p{N}]$/u;
  * as one, as it does under `u`). That pattern tries every start inside such a
  * run that is not at the end and rescans the rest of it from each, so it was
  * quadratic in the run's length, and anchor text is whatever the page holds.
- * JavaScriptCore's `u` matcher also misread a few pairs of ordinary
- * characters as one code point (see anchor-code-points.test.ts); this reads
- * them as the specification and V8 do.
+ * JavaScriptCore's regex JIT (Bun 1.3.14; its interpreter and V8 follow the
+ * specification) also read a few pairs of ordinary characters, and a lone
+ * surrogate beside one, as one code point (see anchor-code-points.test.ts);
+ * this reads them as the specification does.
  */
 export function withoutTrailingDecoration(text: string): string {
   let end = text.length;
