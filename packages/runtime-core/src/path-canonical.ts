@@ -37,7 +37,11 @@
 import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { ApprovalPlace } from "@crewhaus/session-store";
-import type { PathCanonicalizer } from "@crewhaus/tool-executor";
+import type {
+  PathCanonicalizer,
+  ProgramPathReader,
+  ProgramPathReading,
+} from "@crewhaus/tool-executor";
 import { physicalPath } from "@crewhaus/tool-safety/fs";
 
 type OperativeValue = ReturnType<PathCanonicalizer>[number];
@@ -476,6 +480,116 @@ function readWorkspacePath(
  */
 export const UNRESOLVED_PLACE = "unresolved:";
 
+/** A command word read by {@link readProgramPlace}: what a rule reads, and the places an approval binds. */
+type ProgramPlace = {
+  /** `undefined` where the walk failed: a loop of links, a directory that cannot be searched. */
+  readonly reading: ProgramPathReading | undefined;
+  /** Where it lands and, when that is a symlink, where it leads (or {@link UNRESOLVED_PLACE}). */
+  readonly at: string[];
+  /** Where it lands on its face: the directory joined to the word, `..` collapsed, nothing followed. */
+  readonly asWritten: string;
+};
+
+function isSeparator(code: number): boolean {
+  return code === 0x2f || (path.sep === "\\" && code === 0x5c);
+}
+
+/**
+ * `rel` walked from the physical directory `dir` the way the kernel walks it:
+ * `physicalPath` from a start already known to be physical, so each `..` is
+ * applied after the link before it, never folded as text first.
+ */
+function walkFrom(dir: string, rel: string): string {
+  if (rel === "") return dir;
+  const joined = dir.endsWith(path.sep) ? `${dir}${rel}` : `${dir}${path.sep}${rel}`;
+  return physicalPath(joined, { known: { lexical: dir, physical: dir } });
+}
+
+/**
+ * Where a command word that names a file lands (`ProgramPathReader` in
+ * `@crewhaus/tool-executor`): from the directory the command runs in — the
+ * tools join `runsIn` to the root as text and the kernel then follows it —
+ * each name followed the way the kernel follows it, a `..` after a link
+ * climbing out of the link's target. `link/../run.sh` with `link →
+ * secrets/deep` is `secrets/run.sh`, which `path.resolve` would fold to
+ * `run.sh` before any link was seen. The last name is kept as written; when
+ * it is a symlink, where it leads is the program the kernel runs, and a
+ * second place.
+ */
+function readProgramPlace(word: string, runsIn: string | undefined, root: string): ProgramPlace {
+  const rootAbs = path.resolve(root);
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(rootAbs);
+  } catch {
+    rootReal = rootAbs;
+  }
+  const dirLexical = path.resolve(rootReal, runsIn ?? ".");
+  const lexical = path.resolve(dirLexical, word);
+  const asWritten = toPosix(lexical);
+  const unresolved: ProgramPlace = {
+    reading: undefined,
+    at: [`${UNRESOLVED_PLACE}${asWritten}`],
+    asWritten,
+  };
+  // Longer than any path can be: the kernel refuses to run it.
+  if (word.length > MAX_PATH_CHARS || dirLexical.length > MAX_PATH_CHARS) return unresolved;
+  const inWorkspace = (p: string): string | undefined => {
+    const rel = path.relative(rootReal, p);
+    return climbsOut(rel) ? undefined : rel === "" ? "." : toPosix(rel);
+  };
+  // The last name, and the directory part before it, by index.
+  let end = word.length;
+  while (end > 0 && isSeparator(word.charCodeAt(end - 1))) end--;
+  let cut = end;
+  while (cut > 0 && !isSeparator(word.charCodeAt(cut - 1))) cut--;
+  const leaf = word.slice(cut, end);
+  const head = word.slice(0, cut);
+  const known = { lexical: rootReal, physical: rootReal };
+  let at: string;
+  let target: string | undefined;
+  try {
+    const absolute = path.isAbsolute(word);
+    const start = absolute ? path.parse(word).root : physicalPath(dirLexical, { known });
+    const from = (rel: string): string =>
+      absolute ? physicalPath(`${start}${rel}`, { known }) : walkFrom(start, rel);
+    const relHead = absolute ? head.slice(start.length) : head;
+    if (leaf === "" || leaf === "." || leaf === "..") {
+      at = from(absolute ? word.slice(start.length) : word);
+    } else {
+      const parent = from(relHead);
+      at = path.join(parent, leaf);
+      if (isSymlink(at)) {
+        const led = walkFrom(parent, leaf);
+        if (led !== at) target = led;
+      }
+    }
+  } catch {
+    return unresolved;
+  }
+  const atInWorkspace = inWorkspace(at);
+  const targetInWorkspace = target !== undefined ? inWorkspace(target) : undefined;
+  const reading: ProgramPathReading = {
+    at: toPosix(at),
+    ...(atInWorkspace !== undefined ? { inWorkspace: atInWorkspace } : {}),
+    asWritten,
+    writtenInWorkspace: inWorkspace(lexical) !== undefined,
+    ...(target !== undefined
+      ? {
+          target: {
+            at: toPosix(target),
+            ...(targetInWorkspace !== undefined ? { inWorkspace: targetInWorkspace } : {}),
+          },
+        }
+      : {}),
+  };
+  return {
+    reading,
+    at: target !== undefined ? [toPosix(at), toPosix(target)] : [toPosix(at)],
+    asWritten,
+  };
+}
+
 /**
  * The gate's canonicaliser, keeping a record of every path it read and where
  * each one lands — absolute, every symlink followed, one place per value it
@@ -487,6 +601,8 @@ export const UNRESOLVED_PLACE = "unresolved:";
  */
 export function placeRecordingCanonicalizer(root: string = process.cwd()): {
   readonly canonicalizePath: PathCanonicalizer;
+  /** Where a command word that names a file lands; see `ProgramPathReader`. */
+  readonly readProgramPath: ProgramPathReader;
   /** Every path read so far, ordered by path, each with where it lands. */
   readonly places: () => ApprovalPlace[];
   /**
@@ -503,6 +619,7 @@ export function placeRecordingCanonicalizer(root: string = process.cwd()): {
       seen.set(raw, reading);
       return reading.values;
     },
+    readProgramPath: (word, runsIn) => readProgramPlace(word, runsIn, root).reading,
     places: () =>
       [...seen.entries()]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))

@@ -862,8 +862,9 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   followed, plus the same location as an absolute path. An allow rule must
  *   match one of these. A `command` with none — run in another directory, or
  *   with an environment the call set, where its words may name another
- *   program — is granted only by a glob that matches every command
- *   (`RunCommand(**)`).
+ *   program; or naming a program whose place could not be worked out, or
+ *   a line a shell parses whose program lands elsewhere than it reads — is
+ *   granted only by a glob that matches every command (`RunCommand(**)`).
  * - `spellings` — other ways of writing the same value (what the model sent,
  *   the path before symlinks were followed). A deny or ask rule also fires on
  *   these, so a rule written against either form is not dodged.
@@ -1827,13 +1828,17 @@ export function matchesPattern(
 
 export {
   MAX_SHELL_NESTING,
+  type ProgramWords,
   type ShellChain,
+  type ShellCommandWords,
   type ShellReading,
   type ShellRestrictReading,
   type ShellWork,
   linesRunBy,
+  programWords,
   readShellChain,
   readShellLine,
+  shellProgramWords,
   shellRestrictReading,
   shellRestrictSpellings,
 } from "./shell";

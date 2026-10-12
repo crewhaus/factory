@@ -6016,6 +6016,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const gateView = placeRecordingCanonicalizer();
     const subject = preparePermissionSubject(tool, operativeInput, {
       canonicalizePath: gateView.canonicalizePath,
+      readProgramPath: gateView.readProgramPath,
     });
     if (!subject.ok) {
       // Not a permission decision: no rule was consulted, and the call fails
@@ -6157,7 +6158,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             const subjectOfReplay = preparePermissionSubject(
               tool,
               operativeToolInput(tu.name, replay.input),
-              { canonicalizePath: replayView.canonicalizePath },
+              {
+                canonicalizePath: replayView.canonicalizePath,
+                readProgramPath: replayView.readProgramPath,
+              },
             );
             // An approved input that no longer parses is denied by the
             // re-check below, as before; it has no place to compare.
@@ -6198,10 +6202,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // 0.7.1 — the recheck, like the first check, reads the PARSED
             // approved input and its canonical operative values; an approved
             // input that no longer parses is a denial, never a run.
+            const approvedView = placeRecordingCanonicalizer();
             const approvedSubject =
               replaySubject ??
               preparePermissionSubject(tool, approvedOperative, {
-                canonicalizePath: placeRecordingCanonicalizer().canonicalizePath,
+                canonicalizePath: approvedView.canonicalizePath,
+                readProgramPath: approvedView.readProgramPath,
               });
             const recheck = approvedSubject.ok
               ? evaluateWithReason(

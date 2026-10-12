@@ -15,8 +15,10 @@ import {
   compilePattern,
   linesRunBy,
   matchesPattern,
+  programWords,
   readShellChain,
   readShellLine,
+  shellProgramWords,
   shellRestrictReading,
   shellRestrictSpellings,
 } from "./index";
@@ -629,5 +631,110 @@ describe("a shell value: an allow covers every command, a deny fires on any", ()
     expect(
       matchesPattern(compilePattern("Other(git *)"), "Other", { text: "git status && rm" }),
     ).toBe(true);
+  });
+});
+
+// critic8 (0.7.1): the words of a command that name code it runs are the ones
+// the gate reads where the kernel finds them. A program is found by its path
+// when it has a `/`; an interpreter opens the files it is handed.
+describe("programWords: the words of a command that name code it runs", () => {
+  const read = (...words: string[]) => {
+    const got = programWords(words);
+    return {
+      programs: got.programs.map((i) => words[i]),
+      operands: got.operands.map((i) => words[i]),
+      movesDir: got.movesDir,
+    };
+  };
+
+  test("the program, and the one each wrapper on the way runs", () => {
+    expect(read("./x.sh", "a/../b")).toEqual({
+      programs: ["./x.sh"],
+      operands: [],
+      movesDir: false,
+    });
+    expect(read("timeout", "5", "./x.sh")).toEqual({
+      programs: ["timeout", "./x.sh"],
+      operands: [],
+      movesDir: false,
+    });
+    expect(read("sudo", "-u", "root", "env", "A=1", "./x.sh").programs).toEqual([
+      "sudo",
+      "env",
+      "./x.sh",
+    ]);
+    // An argument is the program's to read, not code the OS runs.
+    expect(read("git", "diff", "a/../b")).toEqual({
+      programs: ["git"],
+      operands: [],
+      movesDir: false,
+    });
+  });
+
+  test("every operand an interpreter is handed that is not an option", () => {
+    expect(read("sh", "x.sh", "arg").operands).toEqual(["x.sh", "arg"]);
+    expect(read("node", "-r", "./hook.js", "app.js").operands).toEqual(["./hook.js", "app.js"]);
+    expect(read("bun", "./x.ts").operands).toEqual(["./x.ts"]);
+    expect(read("python3.12", "-u", "x.py").operands).toEqual(["x.py"]);
+    expect(read("bash", "--", "-x.sh").operands).toEqual(["-x.sh"]);
+    expect(read("env", "FOO=1", "sh", "link/../run.sh").operands).toEqual(["link/../run.sh"]);
+    // A shell given a line, an eval: the line is read by linesRunBy, not here.
+    expect(read("sh", "-c", "./a/../b", "x").operands).toEqual([]);
+    expect(read("bash", "-lc", "./a/../b").operands).toEqual([]);
+    // Not an interpreter.
+    expect(read("python3x", "x.py").operands).toEqual([]);
+  });
+
+  test("a wrapper that runs the command in another directory is marked", () => {
+    expect(read("env", "-C", "sub", "./x.sh").movesDir).toBe(true);
+    expect(read("env", "--chdir=sub", "./x.sh").movesDir).toBe(true);
+    expect(read("sudo", "-D", "sub", "./x.sh").movesDir).toBe(true);
+    expect(read("env", "-u", "C", "./x.sh").movesDir).toBe(false);
+  });
+});
+
+describe("shellProgramWords: each simple command of a line, unquoted, at every level", () => {
+  const read = (line: string) =>
+    shellProgramWords(line).map((c) => ({
+      words: c.words,
+      programs: c.programs.programs.map((i) => c.words[i]),
+      operands: c.programs.operands.map((i) => c.words[i]),
+      movesDir: c.programs.movesDir,
+    }));
+
+  test("the line's own commands, with variables put in and quoting taken off", () => {
+    expect(read("FOO=1 './scripts/../x.sh' a && sh \"link/../run.sh\"")).toEqual([
+      {
+        words: ["./scripts/../x.sh", "a"],
+        programs: ["./scripts/../x.sh"],
+        operands: [],
+        movesDir: false,
+      },
+      {
+        words: ["sh", "link/../run.sh"],
+        programs: ["sh"],
+        operands: ["link/../run.sh"],
+        movesDir: false,
+      },
+    ]);
+    expect(read("p=./a/../b; $p").map((c) => c.programs)).toEqual([["./a/../b"]]);
+  });
+
+  test("the commands of a line it hands a shell, and of a substitution", () => {
+    expect(read("sh -c './a/../b x'").map((c) => c.programs)).toEqual([["sh"], ["./a/../b"]]);
+    expect(read("echo $(./c/../d)").map((c) => c.programs)).toEqual([["echo"], ["./c/../d"]]);
+  });
+
+  test("a command after a change of directory is marked, one before it is not", () => {
+    expect(read("./a.sh; cd sub && ./b.sh").map((c) => [c.programs[0], c.movesDir])).toEqual([
+      ["./a.sh", false],
+      ["cd", false],
+      ["./b.sh", true],
+    ]);
+    expect(read("sh -c 'pushd x; ./q'").map((c) => [c.programs[0], c.movesDir])).toEqual([
+      ["sh", false],
+      ["pushd", false],
+      ["./q", true],
+    ]);
   });
 });

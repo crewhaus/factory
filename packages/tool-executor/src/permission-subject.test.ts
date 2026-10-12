@@ -8,10 +8,16 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildTool } from "@crewhaus/tool-builder";
-import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
+import {
+  compilePattern,
+  matchesPattern,
+  normalizePathLexically,
+} from "@crewhaus/tool-permission-matcher";
 import { z } from "zod";
 import {
   type PathCanonicalizer,
+  type ProgramPathReader,
+  type ProgramPathReading,
   executeTool,
   lexicalPathValues,
   operativeValuesFor,
@@ -1510,5 +1516,161 @@ describe("executeTool allowedPatterns match the parsed, canonical call (security
         { polarity: "allow", ...(values ? { operativeValues: values } : {}) },
       ),
     ).toBe(true);
+  });
+});
+
+// critic8 (0.7.1): a command word naming a file was read as text, its `..`
+// collapsed before any link was followed, so `./scripts/../evil.sh` was
+// granted by `Run(./scripts/**)` and `link/../run.sh` missed a deny on the
+// `secrets/run.sh` the kernel runs. Here, without a filesystem: the reading
+// with no reader, and the rewrite with a scripted one. The kernel's own
+// reading, through the real tools, is in apps/cli's permission-hardening.
+describe("a command word that names a file is read where the kernel finds it", () => {
+  const run = buildTool({
+    name: "Run",
+    description: "d",
+    inputSchema: z.object({
+      argv: z.array(z.string()),
+      cwd: z.string().optional(),
+      envSet: z.record(z.string()).optional(),
+    }),
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    execute: async () => "ok",
+  });
+  const sh = buildTool({
+    name: "Sh",
+    description: "d",
+    inputSchema: z.object({ command: z.string() }),
+    operativeArgs: [{ field: "command", kind: "command", shell: true }],
+    execute: async () => "ok",
+  });
+  const decide =
+    (readProgramPath?: ProgramPathReader) =>
+    (polarity: "allow" | "restrict", pattern: string, input: Record<string, unknown>) => {
+      const tool = "argv" in input ? run : sh;
+      return matchesPattern(compilePattern(pattern), tool.name, input, {
+        polarity,
+        operativeValues:
+          operativeValuesFor(
+            tool,
+            input,
+            readProgramPath !== undefined ? { readProgramPath } : {},
+          ) ?? [],
+      });
+    };
+
+  test("with no reader, a program word with a `..` after a name is placed nowhere", () => {
+    const at = decide();
+    for (const input of [
+      { argv: ["./scripts/../evil.sh"] },
+      { argv: ["sh", "scripts/../evil.sh"] },
+      { argv: ["env", "A=1", "./scripts/../evil.sh"] },
+      { argv: ["sh", "-c", "./scripts/../evil.sh"] },
+      { command: "true && ./scripts/../evil.sh" },
+    ]) {
+      const head = "argv" in input ? "Run" : "Sh";
+      expect({
+        input,
+        scoped: at("allow", `${head}(./scripts/**)`, input),
+        every: at("allow", `${head}(**)`, input),
+        unrelated: at("restrict", `${head}(nothing-like-it)`, input),
+      }).toEqual({ input, scoped: false, every: true, unrelated: true });
+    }
+    // Nor, in a command that changed directory first, one with any `..`.
+    expect(at("restrict", "Run(nothing-like-it)", { argv: ["env", "-C", "sub", "../x.sh"] })).toBe(
+      true,
+    );
+    expect(at("restrict", "Sh(nothing-like-it)", { command: "cd sub; ../x.sh" })).toBe(true);
+  });
+
+  test("control: with no reader, ordinary words and arguments read as before", () => {
+    const at = decide();
+    for (const [pattern, input] of [
+      ["Run(./build.sh)", { argv: ["./build.sh"] }],
+      ["Run(sh scripts/x.sh)", { argv: ["sh", "scripts/x.sh"] }],
+      ["Run(../tools/x.sh)", { argv: ["../tools/x.sh"] }],
+      ["Run(git diff a/../b)", { argv: ["git", "diff", "a/../b"] }],
+      ["Sh(echo a/../b)", { command: "echo a/../b" }],
+      ["Sh(cd sub && ./x.sh)", { command: "cd sub && ./x.sh" }],
+    ] as const) {
+      expect({ pattern, allow: at("allow", pattern, input) }).toEqual({ pattern, allow: true });
+      expect({ pattern, unrelated: at("restrict", "Run(nothing-like-it)", input) }).toEqual({
+        pattern,
+        unrelated: false,
+      });
+    }
+    // The `./` the call wrote is kept in the collapsed spelling a deny reads.
+    expect(at("restrict", "Run(cat ./b)", { argv: ["cat", "./a/../b"] })).toBe(true);
+    expect(at("restrict", "Run(./b)", { argv: ["cat", "./a/../b"] })).toBe(true);
+  });
+
+  /** A reader answering from a table: word (joined to its directory) → reading. */
+  const table =
+    (
+      ws: string,
+      entries: Record<string, Omit<ProgramPathReading, "asWritten" | "writtenInWorkspace">>,
+    ) =>
+    (word: string, runsIn: string | undefined): ProgramPathReading | undefined => {
+      const key = runsIn === undefined ? word : `${runsIn}/${word}`;
+      const got = entries[key];
+      if (got === undefined) return undefined;
+      const lexical = key.startsWith("/") ? key : `${ws}/${key.replace(/^\.\//, "")}`;
+      const asWritten = normalizePathLexically(lexical).path;
+      return { ...got, asWritten, writtenInWorkspace: asWritten.startsWith(`${ws}/`) };
+    };
+
+  test("a word that lands elsewhere than it reads is put in its place for an allow", () => {
+    const ws = "/ws";
+    const at = decide(
+      table(ws, {
+        "./scripts/../evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
+        "./scripts/../deploy.sh": { at: "/ws/deploy.sh", inWorkspace: "deploy.sh" },
+        "link/../run.sh": { at: "/ws/secrets/run.sh", inWorkspace: "secrets/run.sh" },
+        "./tools/run.sh": { at: "/ws/safe/run.sh", inWorkspace: "safe/run.sh" },
+        "./build.sh": { at: "/ws/build.sh", inWorkspace: "build.sh" },
+        "./bin/tool": {
+          at: "/ws/bin/tool",
+          inWorkspace: "bin/tool",
+          target: { at: "/ws/scripts/ok.sh", inWorkspace: "scripts/ok.sh" },
+        },
+        "/sys/bin/sh": { at: "/sys/usr/bin/sh" },
+        "/sys/bin/../../ws/evil.sh": { at: "/ws/evil.sh", inWorkspace: "evil.sh" },
+      }),
+    );
+    const argv = (...a: string[]) => ({ argv: a });
+    expect(at("allow", "Run(./scripts/**)", argv("./scripts/../evil.sh"))).toBe(false);
+    expect(at("allow", "Run(./evil.sh)", argv("./scripts/../evil.sh"))).toBe(true);
+    expect(
+      at("restrict", "Run(./deploy.sh --force)", argv("./scripts/../deploy.sh", "--force")),
+    ).toBe(true);
+    expect(at("restrict", "Run(secrets/**)", argv("link/../run.sh"))).toBe(true);
+    expect(at("restrict", "Run(nothing-like-it)", argv("link/../run.sh"))).toBe(false);
+    expect(at("allow", "Run(./tools/**)", argv("./tools/run.sh"))).toBe(false);
+    expect(at("allow", "Run(./safe/run.sh)", argv("./tools/run.sh"))).toBe(true);
+    expect(at("restrict", "Run(./tools/run.sh)", argv("./tools/run.sh"))).toBe(true);
+    // Unmoved, a word is read as written; the workspace's own absolute path
+    // is not a spelling the call named.
+    expect(at("allow", "Run(./build.sh)", argv("./build.sh"))).toBe(true);
+    expect(at("restrict", "Run(/ws/**)", argv("./build.sh"))).toBe(false);
+    // A program reached through a link to it is named by the link; a deny on
+    // where the link leads fires.
+    expect(at("allow", "Run(./bin/*)", argv("./bin/tool"))).toBe(true);
+    expect(at("restrict", "Run(scripts/ok.sh)", argv("./bin/tool"))).toBe(true);
+    // Outside the workspace an absolute program keeps its name, unless a
+    // `..` after a name takes it elsewhere.
+    expect(at("allow", "Run(/sys/bin/sh -c x)", argv("/sys/bin/sh", "-c", "x"))).toBe(true);
+    expect(at("restrict", "Run(/sys/usr/bin/sh*)", argv("/sys/bin/sh", "-c", "x"))).toBe(true);
+    expect(at("allow", "Run(/sys/bin/**)", argv("/sys/bin/../../ws/evil.sh"))).toBe(false);
+    expect(at("allow", "Run(/ws/evil.sh)", argv("/sys/bin/../../ws/evil.sh"))).toBe(true);
+    // A word the reader cannot place: every deny fires, no scoped allow.
+    expect(at("restrict", "Run(nothing-like-it)", argv("./loop/x"))).toBe(true);
+    expect(at("allow", "Run(./loop/**)", argv("./loop/x"))).toBe(false);
+    // A shell line cannot have a word put in its place: only an allow naming
+    // every command grants one whose program moved.
+    const line = { command: "./scripts/../deploy.sh" };
+    expect(at("allow", "Sh(./deploy.sh)", line)).toBe(false);
+    expect(at("allow", "Sh(**)", line)).toBe(true);
+    expect(at("restrict", "Sh(./deploy.sh)", line)).toBe(true);
+    expect(at("allow", "Sh(./build.sh)", { command: "./build.sh" })).toBe(true);
   });
 });

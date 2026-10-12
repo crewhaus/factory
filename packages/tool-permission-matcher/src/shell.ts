@@ -661,6 +661,12 @@ type Wrapper = {
   readonly operands?: number;
   /** Options after which the program only looks the command up. */
   readonly lookupOnly?: string;
+  /**
+   * The short and long option that change the directory the command runs in
+   * (`env -C dir`, `sudo -D dir`): a file its words name is then somewhere
+   * else.
+   */
+  readonly chdir?: { readonly short: string; readonly long: string };
 };
 
 const WRAPPERS: ReadonlyMap<string, Wrapper> = new Map<string, Wrapper>([
@@ -670,6 +676,7 @@ const WRAPPERS: ReadonlyMap<string, Wrapper> = new Map<string, Wrapper>([
       shortWithValue: "uCSP",
       longWithValue: ["unset", "chdir", "split-string"],
       assignments: true,
+      chdir: { short: "C", long: "chdir" },
     },
   ],
   ["command", { lookupOnly: "vV" }],
@@ -696,6 +703,7 @@ const WRAPPERS: ReadonlyMap<string, Wrapper> = new Map<string, Wrapper>([
         "other-user",
       ],
       assignments: true,
+      chdir: { short: "D", long: "chdir" },
     },
   ],
   ["doas", { shortWithValue: "uC" }],
@@ -750,11 +758,12 @@ function programName(word: string): string {
 function unwrap(
   words: ReadonlyArray<string>,
   k: number,
-): { readonly at: number; readonly line?: string } | undefined {
+): { readonly at: number; readonly line?: string; readonly movesDir?: true } | undefined {
   const wrapper = WRAPPERS.get(programName(words[k] as string));
   if (wrapper === undefined) return undefined;
   let j = k + 1;
   let line: string | undefined;
+  let movesDir = false;
   while (j < words.length) {
     const w = words[j] as string;
     if (w === "--") {
@@ -770,6 +779,7 @@ function unwrap(
       const name = w.slice(2, eq === -1 ? undefined : eq);
       const takes = (wrapper.longWithValue ?? []).includes(name);
       if (name === "split-string") line = eq === -1 ? words[j + 1] : w.slice(eq + 1);
+      if (name === wrapper.chdir?.long) movesDir = true;
       j += takes && eq === -1 ? 2 : 1;
       continue;
     }
@@ -789,6 +799,7 @@ function unwrap(
           if (letters.charAt(x) === "S" && programName(words[k] as string) === "env") {
             line = valueWord;
           }
+          if (letters.charAt(x) === wrapper.chdir?.short) movesDir = true;
           if (glued === "") skip = 2;
           break;
         }
@@ -799,8 +810,9 @@ function unwrap(
     break;
   }
   j += wrapper.operands ?? 0;
-  if (line !== undefined) return { at: j, line };
-  return j < words.length ? { at: j } : undefined;
+  const moved = movesDir ? { movesDir: true as const } : {};
+  if (line !== undefined) return { at: j, line, ...moved };
+  return j < words.length ? { at: j, ...moved } : undefined;
 }
 
 /**
@@ -840,9 +852,10 @@ function shellScriptAt(words: ReadonlyArray<string>, k: number): string | undefi
 function followWrappers(
   values: ReadonlyArray<string>,
   first: number,
-): { readonly starts: number[]; readonly lines: string[] } {
+): { readonly starts: number[]; readonly lines: string[]; readonly movesDir: boolean } {
   const starts: number[] = [];
   const lines: string[] = [];
+  let movesDir = false;
   let k = first;
   for (let hops = 0; hops < 16 && k < values.length; hops++) {
     const script = shellScriptAt(values, k);
@@ -856,6 +869,7 @@ function followWrappers(
     }
     const inner = unwrap(values, k);
     if (inner === undefined) break;
+    if (inner.movesDir === true) movesDir = true;
     if (inner.line !== undefined) {
       lines.push([inner.line, ...values.slice(inner.at)].join(" "));
       break;
@@ -863,7 +877,7 @@ function followWrappers(
     k = inner.at;
     starts.push(k);
   }
-  return { starts, lines };
+  return { starts, lines, movesDir };
 }
 
 /**
@@ -874,6 +888,133 @@ function followWrappers(
  */
 export function linesRunBy(words: ReadonlyArray<string>): string[] {
   return followWrappers(words, 0).lines;
+}
+
+/**
+ * Programs that run a file they are handed: a shell given no `-c` (and the
+ * `.` and `source` builtins), and the script runtimes.
+ */
+const INTERPRETERS: ReadonlySet<string> = new Set([
+  ...SHELLS,
+  ".",
+  "source",
+  "node",
+  "nodejs",
+  "bun",
+  "deno",
+  "tsx",
+  "ts-node",
+  "ruby",
+  "perl",
+  "php",
+  "lua",
+  "luajit",
+  "rscript",
+  "julia",
+  "osascript",
+]);
+
+/** One of {@link INTERPRETERS}, or a versioned Python (`python3`, `python3.12`, `pypy3`). */
+function isInterpreter(name: string): boolean {
+  if (INTERPRETERS.has(name)) return true;
+  const stem = name.startsWith("python") ? 6 : name.startsWith("pypy") ? 4 : -1;
+  if (stem < 0) return false;
+  for (let i = stem; i < name.length; i++) {
+    const c = name.charAt(i);
+    if (c !== "." && (c < "0" || c > "9")) return false;
+  }
+  return true;
+}
+
+/** The words of one command that name code it runs; see {@link programWords}. */
+export type ProgramWords = {
+  /**
+   * The index of each word the OS runs as a program: the first, and the one
+   * each wrapper on the way runs (`env`, `sudo`, `nice`, `timeout`, …). A
+   * word with a `/` in it is a file the OS opens from the directory the
+   * command runs in; one without is looked up on PATH.
+   */
+  readonly programs: ReadonlyArray<number>;
+  /**
+   * The index of each word an interpreter at the end of that chain is handed
+   * that is not an option: the script it runs (`sh x.sh`, `node x.js`,
+   * `bun x.ts`, `python x.py`) and anything else it may load or run. Each is
+   * a file it opens from the directory the command runs in, with or without
+   * a `/`. A shell given `-c`, an `eval` or an `env -S` runs a line instead
+   * ({@link linesRunBy}), and is handed no file here.
+   */
+  readonly operands: ReadonlyArray<number>;
+  /**
+   * A wrapper on the way runs the command in another directory (`env -C`,
+   * `sudo -D`), or — in a shell line — a command before it changed
+   * directory (`cd`, `pushd`, `popd`): where a relative word lands cannot be
+   * read from the directory the command started in.
+   */
+  readonly movesDir: boolean;
+};
+
+/**
+ * Which words of an argv name code it runs: its programs, through any
+ * wrappers, and the files an interpreter at the end of the chain is handed.
+ * The rest are arguments the program reads as it likes.
+ */
+export function programWords(words: ReadonlyArray<string>): ProgramWords {
+  if (words.length === 0) return { programs: [], operands: [], movesDir: false };
+  const followed = followWrappers(words, 0);
+  const programs = [0, ...followed.starts];
+  const operands: number[] = [];
+  const last = programs[programs.length - 1] as number;
+  if (followed.lines.length === 0 && isInterpreter(programName(words[last] as string))) {
+    let options = true;
+    for (let j = last + 1; j < words.length; j++) {
+      const w = words[j] as string;
+      if (options && w === "--") {
+        options = false;
+        continue;
+      }
+      if ((options && w.startsWith("-")) || w === "") continue;
+      operands.push(j);
+    }
+  }
+  return { programs, operands, movesDir: followed.movesDir };
+}
+
+/** Programs that change the directory the rest of a shell line runs in. */
+const CHANGES_DIRECTORY: ReadonlySet<string> = new Set(["cd", "pushd", "popd"]);
+
+/** One simple command of a shell line, as {@link shellProgramWords} reads it. */
+export type ShellCommandWords = {
+  /**
+   * Its words from the program on, with the quoting taken off and the
+   * variables the line sets put in: the words the program is run with.
+   */
+  readonly words: ReadonlyArray<string>;
+  /** Which of them name code it runs; see {@link programWords}. */
+  readonly programs: ProgramWords;
+};
+
+/**
+ * The simple commands a shell line runs, each with the words that name code
+ * it runs — at every level a deny reads ({@link MAX_SHELL_NESTING}): the
+ * line's own commands, and those of each `sh -c`, `eval`, `env -S` and
+ * substitution inside it. A command after a `cd`, `pushd` or `popd`
+ * anywhere earlier in the reading is marked `movesDir`.
+ */
+export function shellProgramWords(
+  line: string,
+  work: ShellWork = { steps: 0 },
+): ReadonlyArray<ShellCommandWords> {
+  const commands: ShellCommandWords[] = [];
+  const state: RestrictState = {
+    work,
+    unknown: undefined,
+    setByLine: undefined,
+    budget: Math.max(EXPANSION_BUDGET_CHARS, 4 * line.length),
+    commands,
+    movedDir: false,
+  };
+  collectRestrictSpellings(line, 0, new Set(), work, new Map(), state);
+  return commands;
 }
 
 /** How a deny or ask reads a shell line, beyond the line itself. */
@@ -950,6 +1091,10 @@ type RestrictState = {
   setByLine: string | undefined;
   budget: number;
   readonly work: ShellWork;
+  /** Where {@link shellProgramWords} collects each simple command, when it asks. */
+  readonly commands?: ShellCommandWords[];
+  /** A command read so far changed directory (`cd`, `pushd`, `popd`). */
+  movedDir?: boolean;
 };
 
 /**
@@ -1248,6 +1393,15 @@ function collectRestrictSpellings(
       for (const from of [first, ...followed.starts]) {
         out.add(line.slice((words[from] as Token).start, end).trim());
         out.add(values.slice(from).join(" "));
+      }
+      if (state.commands !== undefined) {
+        const own = values.slice(first);
+        const programs = programWords(own);
+        state.commands.push({
+          words: own,
+          programs: state.movedDir === true ? { ...programs, movesDir: true } : programs,
+        });
+        if (CHANGES_DIRECTORY.has(programName(values[program] as string))) state.movedDir = true;
       }
       for (const inner of followed.lines) nested.push([inner, known]);
       // Bash's brace lists, spread, and read the same way.

@@ -639,3 +639,64 @@ console.log(JSON.stringify(out));
     expect(past).toHaveLength(2);
   }, 30_000);
 });
+
+// critic8 (0.7.1): a command word that names a file — a program run by its
+// path, a script handed to an interpreter — lands where the kernel takes it:
+// each link followed BEFORE the `..` after it. And a headless grant is bound
+// to where it lands, like a path.
+describe("placeRecordingCanonicalizer — command words read where the kernel finds them", () => {
+  beforeEach(() => {
+    for (const d of ["secrets/deep", "safe", "bin", "loop"]) {
+      mkdirSync(path.join(ws, d), { recursive: true });
+    }
+    for (const f of ["safe/run.sh", "secrets/run.sh", "run.sh"]) {
+      writeFileSync(path.join(ws, f), "#!/bin/sh\n");
+    }
+    symlinkSync("secrets/deep", path.join(ws, "link"));
+    symlinkSync("safe", path.join(ws, "tools"));
+    symlinkSync("../safe/run.sh", path.join(ws, "bin", "tool"));
+    symlinkSync("b", path.join(ws, "loop", "a"));
+    symlinkSync("a", path.join(ws, "loop", "b"));
+  });
+
+  test("a `..` after a symlink climbs out of the link's target", () => {
+    const view = placeRecordingCanonicalizer(ws);
+    expect(view.readProgramPath("link/../run.sh", undefined)).toEqual({
+      at: `${ws}/secrets/run.sh`,
+      inWorkspace: "secrets/run.sh",
+      asWritten: `${ws}/run.sh`,
+      writtenInWorkspace: true,
+    });
+    // From a directory reached through the link, the same.
+    expect(view.readProgramPath("../run.sh", "link")).toMatchObject({
+      at: `${ws}/secrets/run.sh`,
+      inWorkspace: "secrets/run.sh",
+    });
+    // A `..` with no link before it lands where the text says.
+    expect(view.readProgramPath("./bin/../run.sh", undefined)).toMatchObject({
+      at: `${ws}/run.sh`,
+      asWritten: `${ws}/run.sh`,
+    });
+  });
+
+  test("a symlinked directory is followed; the program's own link is kept, and where it leads is read too", () => {
+    const view = placeRecordingCanonicalizer(ws);
+    expect(view.readProgramPath("./tools/run.sh", undefined)).toEqual({
+      at: `${ws}/safe/run.sh`,
+      inWorkspace: "safe/run.sh",
+      asWritten: `${ws}/tools/run.sh`,
+      writtenInWorkspace: true,
+    });
+    expect(view.readProgramPath("./bin/tool", undefined)).toEqual({
+      at: `${ws}/bin/tool`,
+      inWorkspace: "bin/tool",
+      asWritten: `${ws}/bin/tool`,
+      writtenInWorkspace: true,
+      target: { at: `${ws}/safe/run.sh`, inWorkspace: "safe/run.sh" },
+    });
+    // Climbing out of the workspace: absolute, and not inside it.
+    const out = view.readProgramPath("../elsewhere/x", undefined);
+    expect(out?.inWorkspace).toBeUndefined();
+    expect(out?.writtenInWorkspace).toBe(false);
+  });
+});

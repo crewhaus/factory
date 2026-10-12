@@ -30,7 +30,28 @@
  *      word is kept as another spelling, so a deny or ask rule naming one
  *      word (`RunCommand(rm)`) still fires on the whole argv. A word that
  *      names a file through `.`, `..` or a doubled `/` is also read with
- *      them collapsed, so `scripts//release.sh` is `scripts/release.sh`.
+ *      them collapsed (and with the `./` it was written with kept), so
+ *      `scripts//release.sh` is `scripts/release.sh`.
+ *    - the words of a command that name code it runs — its program when it
+ *      is written with a `/` (also through wrappers such as `env` or `sudo`;
+ *      a bare name is found on PATH), and each word an interpreter (`sh`,
+ *      `node`, `bun`, `python`, …) is handed — are read where the kernel
+ *      finds them (`readProgramPath`; runtime-core's reader walks each name
+ *      from the directory the command runs in, a `..` after a symlink
+ *      climbing out of the link's target). One that lands elsewhere than it
+ *      reads is put in its place for an allow: `./scripts/../evil.sh` is
+ *      `./evil.sh`, which `RunCommand(./scripts/**)` does not grant, and a
+ *      deny or ask reads that place too — `link/../run.sh` with `link →
+ *      secrets/deep` is `secrets/run.sh`. A program reached through a
+ *      symlink to it (`node_modules/.bin/eslint`) is named by the link; a
+ *      deny or ask also reads where the link leads. A program named by an
+ *      absolute path outside the workspace is read as written unless it has
+ *      a `..` after a name: the system's own links (`/bin → usr/bin`) are not
+ *      the call's to move. A line a shell parses cannot have a word put in
+ *      its place, so one whose program lands elsewhere is granted only by an
+ *      allow naming every command. With no reader (the edge worker), or for
+ *      a relative word after a change of directory (`cd`, `env -C`), a word
+ *      with a `..` cannot be placed: it is flagged `outsideWorkspace`.
  *    - a field declared `within` another is written `<qualifier>/<value>` —
  *      except a `command`, whose `within` names the directory it runs in:
  *      the program `./build.sh` names is another program in `src/`. A
@@ -124,8 +145,11 @@ import type { OperativeArg, OperativeArgKind, RegisteredTool } from "@crewhaus/t
 import {
   type OperativeValue,
   type OperativeValueKind,
+  type ProgramWords,
   linesRunBy,
   normalizePathLexically,
+  programWords,
+  shellProgramWords,
 } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
 
@@ -137,6 +161,35 @@ void kindsAgree;
 
 /** Turns one path-kind operative value into the value(s) a rule is matched against. */
 export type PathCanonicalizer = (raw: string) => ReadonlyArray<OperativeValue>;
+
+/**
+ * Where a word of a command that names a file lands — a program run by its
+ * path, or a script handed to an interpreter — read the way the kernel reads
+ * it from the directory the command runs in (`runsIn` as the call wrote it;
+ * `undefined` for the workspace root): each directory on the way followed,
+ * and each `..` applied AFTER the link before it, so `link/../run.sh` with
+ * `link → secrets/deep` is `secrets/run.sh`. `undefined` when that cannot be
+ * worked out (a loop of links, a directory that cannot be searched, a path
+ * longer than any path can be): no tool can run the word either.
+ */
+export type ProgramPathReader = (
+  word: string,
+  runsIn: string | undefined,
+) => ProgramPathReading | undefined;
+
+/** One word read by a {@link ProgramPathReader}. */
+export type ProgramPathReading = {
+  /** Absolute: where the word lands, its last name as written (not followed). */
+  readonly at: string;
+  /** `at` relative to the workspace root (`.` for the root, never `./`), when it is inside it. */
+  readonly inWorkspace?: string;
+  /** Absolute: the same word read as text — joined to the directory, `..` collapsed, nothing followed. */
+  readonly asWritten: string;
+  /** Whether {@link asWritten} is inside the workspace. */
+  readonly writtenInWorkspace: boolean;
+  /** Where the last name leads when it is a symlink: the file the kernel runs. */
+  readonly target?: { readonly at: string; readonly inWorkspace?: string };
+};
 
 export type PermissionSubject =
   | {
@@ -158,6 +211,12 @@ export type PermissionSubjectOptions = {
    * — `..` collapsed, no symlinks followed, no workspace root known.
    */
   readonly canonicalizePath?: PathCanonicalizer;
+  /**
+   * Where a command word that names a file lands. Default: none — the words
+   * are read as text, and one with a `..` after a name is flagged outside,
+   * since a symlink before the `..` could not be seen.
+   */
+  readonly readProgramPath?: ProgramPathReader;
 };
 
 /**
@@ -269,15 +328,36 @@ export function operativeValuesOf(
           const argv = words ?? raw.split(/\s+/).filter((w) => w !== "");
           // A shell parses a string it is handed; an argv reaches one only
           // when the program it names is a shell, an eval or an env -S.
-          const shell = arg.shell === true && words === undefined ? { shell: true } : {};
+          const shellLine = arg.shell === true && words === undefined;
+          const shell = shellLine ? { shell: true } : {};
           const shellLines = words !== undefined ? linesRunBy(words) : [];
+          const where = { runsIn, readProgramPath: opts.readProgramPath };
           const read = commandSpellings(
             argv,
             elsewhere ? runDirSpellings(runsIn as string, dirValues as OperativeValue[]) : [],
             setsEnv ? env : undefined,
             canonicalizePath,
+            where,
           );
-          if (elsewhere || setsEnv) {
+          // The words that name code it runs, read where the OS finds them:
+          // an argv's own, and those of each command of a line a shell runs
+          // (the Bash tool's, or one an argv hands to `sh -c`). A string that
+          // is neither, and runs nowhere in particular, is code for a sandboxed
+          // interpreter (`Python`'s `code`), not a command line.
+          const own = shellLine
+            ? readShellPrograms([raw], where)
+            : words !== undefined || arg.within !== undefined
+              ? readPrograms(argv, programWords(argv), where, true)
+              : NOTHING_READ;
+          const handed = readShellPrograms(shellLines, where);
+          // A word that lands elsewhere than it reads is put in its place for
+          // an allow; inside a line a shell parses it cannot be, so no scoped
+          // allow grants that line, nor an argv that hands it to a shell.
+          const ungrantable =
+            own.unplaceable || handed.unplaceable || handed.moved || (shellLine && own.moved);
+          const unplaceable = read.unreadable || own.unplaceable || handed.unplaceable;
+          const programSpellings = shellLine ? [] : own.spellings;
+          if (elsewhere || setsEnv || ungrantable) {
             // Run in another directory, or with an environment the call set,
             // the same words may be another program: nothing canonical for an
             // allow to grant. A deny or ask reads what was written, and each
@@ -286,23 +366,43 @@ export function operativeValuesOf(
             values.push({
               kind: "command",
               canonical: [],
-              spellings: [...new Set([raw, ...(words ?? []), ...read.spellings])],
+              spellings: [
+                ...new Set([raw, ...(words ?? []), ...read.spellings, ...programSpellings]),
+              ],
               ...shell,
-              ...(read.unreadable ? { outsideWorkspace: true } : {}),
+              ...(unplaceable ? { outsideWorkspace: true } : {}),
               ...(every === true ? { standsForAny: [""] } : {}),
             });
-            values.push(...shellLineValues(shellLines));
-            break;
+          } else {
+            // A program word that lands elsewhere than it reads is read where
+            // it lands: `./scripts/../evil.sh` is `./evil.sh`, which
+            // `RunCommand(./scripts/**)` does not grant.
+            const canonical = own.rewritten?.join(" ") ?? raw;
+            const spellings = [
+              ...new Set([
+                ...(canonical !== raw ? [raw] : []),
+                ...(words ?? []),
+                ...read.spellings,
+                ...programSpellings,
+              ]),
+            ];
+            values.push({
+              kind: "command",
+              canonical: [canonical],
+              ...(spellings.length > 0 ? { spellings } : {}),
+              ...shell,
+              ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
+            });
           }
-          const spellings = [...new Set([...(words ?? []), ...read.spellings])];
-          values.push({
-            kind: "command",
-            canonical: [raw],
-            ...(spellings.length > 0 ? { spellings } : {}),
-            ...shell,
-            ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
-          });
           values.push(...shellLineValues(shellLines));
+          // What a deny or ask reads of the program words in a line a shell
+          // parses, as plain text: read as a line again, a word with its
+          // quoting taken off could split into commands the line never runs.
+          values.push(
+            ...programPlaceValues(
+              shellLine ? [...own.spellings, ...handed.spellings] : handed.spellings,
+            ),
+          );
           break;
         }
         default: {
@@ -357,6 +457,204 @@ function shellLineValues(lines: ReadonlyArray<string>): OperativeValue[] {
   return [
     { kind: "command", canonical: [], spellings: [...lines], shell: true, restrictOnly: true },
   ];
+}
+
+/**
+ * Where the words of a command that name code it runs land, as values only a
+ * deny or ask reads, never read as a shell line: see {@link readPrograms}.
+ */
+function programPlaceValues(spellings: ReadonlyArray<string>): OperativeValue[] {
+  if (spellings.length === 0) return [];
+  return [
+    { kind: "command", canonical: [], spellings: [...new Set(spellings)], restrictOnly: true },
+  ];
+}
+
+/** Where a command runs, and how to read where its words land. */
+type CommandPlace = {
+  readonly runsIn: string | undefined;
+  readonly readProgramPath: ProgramPathReader | undefined;
+};
+
+/** What a rule reads of the words of a command that name code it runs. */
+type ProgramsReading = {
+  /**
+   * The words with each one that lands elsewhere than it reads put in its
+   * place (see {@link placeForms}); absent when none does.
+   */
+  readonly rewritten?: ReadonlyArray<string>;
+  /** Some word lands elsewhere than it reads. */
+  readonly moved: boolean;
+  /**
+   * Where some word lands could not be worked out: every deny or ask fires,
+   * and only an allow naming every command grants it.
+   */
+  readonly unplaceable: boolean;
+  /** What a deny or ask also reads: each place alone, and the words with it put in. */
+  readonly spellings: ReadonlyArray<string>;
+};
+
+/** A command none of whose words is read as a place. */
+const NOTHING_READ: ProgramsReading = { moved: false, unplaceable: false, spellings: [] };
+
+/**
+ * Read the words of one command that name code it runs ({@link programWords}:
+ * its programs through any wrappers, and what an interpreter at the end is
+ * handed) where the OS finds them, from the directory it runs in.
+ *
+ * A program word names a file when it has a `/` — a bare name is found on
+ * PATH, not in the directory — and an interpreter's operand always does.
+ * Read through `readProgramPath`, each lands where the kernel takes it:
+ * every directory on the way followed and each `..` applied after the link
+ * before it. One that lands elsewhere than it reads — a `..` after a name,
+ * or a symlinked directory on the way — is put in its place
+ * ({@link placeForms}), so an allow reads where it lands; a deny or ask also
+ * reads that place in each of its forms, and, when the word itself is a
+ * symlink, where it leads. A program named by an absolute path outside the
+ * workspace with no `..` after a name is not put in its place: the system's
+ * own links (`/bin → usr/bin`) are not the call's to move, and an allow
+ * written `/bin/sh` still reads `/bin/sh`.
+ *
+ * With no reader (the edge worker has no filesystem), a word with a `..`
+ * after a name cannot be placed: a symlink before the `..` would take it
+ * elsewhere. Nor can a relative word with a `..` in a command run in another
+ * directory than it started in (`env -C`, or after a `cd` in a shell line);
+ * one without is read as written.
+ */
+function readPrograms(
+  words: ReadonlyArray<string>,
+  found: ProgramWords,
+  where: CommandPlace,
+  canRewrite: boolean,
+): ProgramsReading {
+  const spellings = new Set<string>();
+  // The words with every placed word in one of its forms, per form.
+  const lines = new Map<number, string[]>();
+  const put = (slot: number, i: number, form: string): void => {
+    let line = lines.get(slot);
+    if (line === undefined) {
+      line = [...words];
+      lines.set(slot, line);
+    }
+    line[i] = form;
+    spellings.add(form);
+  };
+  let rewritten: string[] | undefined;
+  let moved = false;
+  let unplaceable = false;
+  const read = [
+    ...found.programs.map((i) => [i, true] as const),
+    ...found.operands.map((i) => [i, false] as const),
+  ];
+  for (const [i, runs] of read) {
+    const word = words[i] as string;
+    if (runs ? !/[\\/]/.test(word) : word.includes("://")) continue;
+    for (const c of collapsedWords(word)) spellings.add(c);
+    if (found.movesDir && !isAbsolutePath(word)) {
+      if (word.split(/[\\/]/).includes("..")) unplaceable = true;
+      continue;
+    }
+    const climbs = climbsAfterName(word);
+    if (where.readProgramPath === undefined) {
+      if (climbs) unplaceable = true;
+      continue;
+    }
+    const place = where.readProgramPath(word, where.runsIn);
+    if (place === undefined) {
+      unplaceable = true;
+      continue;
+    }
+    const forms = placeForms(place.at, place.inWorkspace, word, runs);
+    const system =
+      isAbsolutePath(word) && place.inWorkspace === undefined && !place.writtenInWorkspace;
+    if ((climbs || place.at !== place.asWritten) && !system) {
+      moved = true;
+      if (canRewrite) {
+        rewritten ??= [...words];
+        rewritten[i] = forms[0];
+      }
+    }
+    forms.forEach((form, k) => put(k, i, form));
+    if (place.target !== undefined) {
+      const led = placeForms(place.target.at, place.target.inWorkspace, word, runs);
+      led.forEach((form, k) => put(forms.length + k, i, form));
+    }
+  }
+  for (const line of lines.values()) spellings.add(line.join(" "));
+  return {
+    ...(rewritten !== undefined ? { rewritten } : {}),
+    moved,
+    unplaceable,
+    spellings: [...spellings],
+  };
+}
+
+/**
+ * {@link readPrograms} for each simple command of each line a shell parses,
+ * at every level a deny reads (`shellProgramWords`), with their quoting
+ * taken off. A shell line cannot be rewritten: a word that lands elsewhere
+ * only marks it `moved`.
+ */
+function readShellPrograms(lines: ReadonlyArray<string>, where: CommandPlace): ProgramsReading {
+  const spellings: string[] = [];
+  let moved = false;
+  let unplaceable = false;
+  for (const line of lines) {
+    for (const command of shellProgramWords(line)) {
+      const read = readPrograms(command.words, command.programs, where, false);
+      moved ||= read.moved;
+      unplaceable ||= read.unplaceable;
+      spellings.push(...read.spellings);
+    }
+  }
+  return { moved, unplaceable, spellings };
+}
+
+/**
+ * The forms a rule reads of a place a command word lands at: first the one
+ * written the way the call wrote the word — absolute when the word was, or
+ * when the place is outside the workspace; else relative to the workspace
+ * root, with `./` when the word had one, or when it is a program and the
+ * place has no `/` left (`deploy.sh` alone would be looked up on PATH) —
+ * then the place relative to the root. The workspace's own absolute path is
+ * not one of them unless the call wrote it: `RunCommand(**prod**)` does not
+ * fire on `sh x.sh` because the workspace lives in `prod-agent/`.
+ */
+function placeForms(
+  at: string,
+  inWorkspace: string | undefined,
+  word: string,
+  runs: boolean,
+): [string, string] {
+  if (inWorkspace === undefined) return [at, at];
+  const dotted = startsWithDotSlash(word) || (runs && !inWorkspace.includes("/"));
+  const written = isAbsolutePath(word)
+    ? at
+    : dotted && inWorkspace !== "."
+      ? `./${inWorkspace}`
+      : inWorkspace;
+  return [written, inWorkspace];
+}
+
+/** `./` or `.\\` at the start: a word the call wrote relative to its directory. */
+function startsWithDotSlash(word: string): boolean {
+  return word.startsWith("./") || word.startsWith(".\\");
+}
+
+/**
+ * Does a `..` in `word` follow a name? That `..` may climb out of a symlink's
+ * target rather than back to where the name sits, and text matching lets
+ * `./scripts/**` cover `./scripts/../evil.sh`. A `..` at the start
+ * (`../x`) climbs from the directory itself, which the text says.
+ */
+function climbsAfterName(word: string): boolean {
+  let names = 0;
+  for (const segment of word.split(/[\\/]/)) {
+    if (segment === "" || segment === ".") continue;
+    if (segment !== "..") names++;
+    else if (names > 0) return true;
+  }
+  return false;
 }
 
 /** A value that ends in a `0x` (or `0X`) hex id, after any `<qualifier>/`. */
@@ -712,13 +1010,17 @@ function joinedSpellings(dir: string, word: string): string[] {
   return lexical.escapes || lexical.path === written ? [written] : [written, lexical.path];
 }
 
-/** A word with separators, collapsed the way {@link joinedSpellings} does, when that changes it. */
-function collapsedWord(word: string): string | undefined {
-  if (!/[\\/]/.test(word)) return undefined;
+/**
+ * A word with separators, collapsed the way {@link joinedSpellings} does,
+ * when that changes it — and again with the `./` the call wrote kept, so
+ * `alwaysDeny RunCommand(./deploy.sh)` reads `./a/../deploy.sh` as well.
+ */
+function collapsedWords(word: string): string[] {
+  if (!/[\\/]/.test(word)) return [];
   const lexical = normalizePathLexically(word);
-  return lexical.escapes || lexical.path === word || lexical.path === "."
-    ? undefined
-    : lexical.path;
+  if (lexical.escapes || lexical.path === word || lexical.path === ".") return [];
+  const dotted = startsWithDotSlash(word) ? `./${lexical.path}` : undefined;
+  return dotted !== undefined && dotted !== word ? [lexical.path, dotted] : [lexical.path];
 }
 
 /**
@@ -749,20 +1051,20 @@ function commandSpellings(
   dirs: ReadonlyArray<string>,
   env: Readonly<Record<string, string>> | undefined,
   canonicalizePath: PathCanonicalizer,
+  where: CommandPlace,
 ): CommandReading {
   const out = new Set<string>();
   const program = argv[0] ?? "";
   const bareProgram = program !== "" && !/[\\/]/.test(program);
-  // Words collapsed where the call wrote a separator.
-  let collapsedAny = false;
-  const collapsedLine = argv.map((w) => {
-    const c = namesAFile(w) ? collapsedWord(w) : undefined;
-    if (c === undefined) return w;
-    out.add(c);
-    collapsedAny = true;
-    return c;
-  });
-  if (collapsedAny) out.add(collapsedLine.join(" "));
+  // Words collapsed where the call wrote a separator: once as collapsed, and
+  // once with the `./` the call wrote kept.
+  const collapsed = argv.map((w) => (namesAFile(w) ? collapsedWords(w) : []));
+  if (collapsed.some((c) => c.length > 0)) {
+    for (const c of collapsed) for (const form of c) out.add(form);
+    for (const k of [0, 1]) {
+      out.add(argv.map((w, i) => collapsed[i]?.[k] ?? collapsed[i]?.[0] ?? w).join(" "));
+    }
+  }
   // Words joined to the directory the command runs in.
   for (const d of dirs) {
     const line = argv.map((w, i) => {
@@ -789,8 +1091,7 @@ function commandSpellings(
     for (const w of words.slice(0, MAX_ENV_WORDS)) {
       if (!namesAFile(w)) continue;
       out.add(w);
-      const c = collapsedWord(w);
-      if (c !== undefined) out.add(c);
+      for (const c of collapsedWords(w)) out.add(c);
       for (const d of dirs) for (const j of joinedSpellings(d, w)) out.add(j);
     }
     if (name.toUpperCase() !== "PATH" || !bareProgram) continue;
@@ -813,6 +1114,20 @@ function commandSpellings(
         for (const d of places) {
           for (const j of joinedSpellings(d === "." ? entry : `${d}/${entry}`, program))
             found.add(j);
+        }
+      }
+      // And where the kernel finds it there, each link followed before the
+      // `..` after it: `PATH=link/..` is the directory above link's target.
+      if (where.readProgramPath !== undefined) {
+        const candidate = `${entry === "/" ? "" : entry}/${program}`;
+        const from = isAbsolutePath(entry) ? [undefined] : [undefined, where.runsIn];
+        for (const runsIn of new Set(from)) {
+          const place = where.readProgramPath(candidate, runsIn);
+          if (place === undefined) continue;
+          for (const f of placeForms(place.at, place.inWorkspace, candidate, true)) found.add(f);
+          if (place.target === undefined) continue;
+          const { at, inWorkspace } = place.target;
+          for (const f of placeForms(at, inWorkspace, candidate, true)) found.add(f);
         }
       }
       for (const f of found) {

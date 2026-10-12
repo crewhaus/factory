@@ -8,6 +8,8 @@ export {
   type PathCanonicalizer,
   type PermissionSubject,
   type PermissionSubjectOptions,
+  type ProgramPathReader,
+  type ProgramPathReading,
   lexicalPathValues,
   operativeValuesFor,
   operativeValuesOf,
