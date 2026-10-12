@@ -115,10 +115,11 @@ function parsePaxRecords(data: Uint8Array): { path?: string; linkpath?: string }
   const out: { path?: string; linkpath?: string } = {};
   let sparseName: string | undefined;
   let offset = 0;
+  const fields = lengthFields(text);
   while (offset < text.length) {
-    const space = text.indexOf(" ", offset);
+    const space = fields.spaceFrom(offset);
     if (space === -1) break;
-    const length = Number.parseInt(text.slice(offset, space), 10);
+    const length = fields.parse(offset, space);
     if (!Number.isFinite(length) || length <= 0) break;
     const record = text.slice(space + 1, offset + length).replace(/\n$/, "");
     const eq = record.indexOf("=");
@@ -133,6 +134,64 @@ function parsePaxRecords(data: Uint8Array): { path?: string; linkpath?: string }
   }
   if (sparseName !== undefined) out.path = sparseName;
   return out;
+}
+
+/** Whether `parseInt` skips this code unit as leading white space. */
+function parseIntSkips(code: number): boolean {
+  if (code > 32 && code < 127) return false;
+  // Asked of parseInt itself, so the set is exactly the one it trims.
+  return Number.parseInt(`${String.fromCharCode(code)}1`, 10) === 1;
+}
+
+function isDigit(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
+/**
+ * The record loop's two reads, `text.indexOf(" ", offset)` and
+ * `Number.parseInt(text.slice(offset, space), 10)`, without reading any
+ * character twice.
+ *
+ * Each length field is read from where the previous record ended. A length
+ * shorter than its own field puts the next read inside the same field, and
+ * reading the field from there again each time made a header of a million
+ * zeros before `1 ` cost half a million million character reads: a tiny
+ * .tar.gz that hung ArchiveList. Offsets only grow, so the first space at or
+ * after one is the first after the next until the offset passes it, and the
+ * white space, sign, leading zeros and digits `parseInt` reads are each
+ * scanned once, from where the last read stopped.
+ */
+function lengthFields(text: string): {
+  spaceFrom(offset: number): number;
+  parse(offset: number, space: number): number;
+} {
+  // Forward-only positions. Each scan stops at the field's space, which the
+  // next field's offset is past, so a position left from an earlier field is
+  // behind the offset and is moved up to it before it is used.
+  const at = { space: -1, white: 0, zeros: 0, digits: 0 };
+  return {
+    spaceFrom(offset) {
+      if (at.space < offset) at.space = text.indexOf(" ", offset);
+      return at.space;
+    },
+    parse(offset, space) {
+      if (at.white < offset) at.white = offset;
+      while (at.white < space && parseIntSkips(text.charCodeAt(at.white))) at.white += 1;
+      if (at.white === space) return Number.NaN;
+      const sign = text.charCodeAt(at.white);
+      const first = sign === 43 || sign === 45 ? at.white + 1 : at.white;
+      if (at.zeros < first) at.zeros = first;
+      while (at.zeros < space && text.charCodeAt(at.zeros) === 48) at.zeros += 1;
+      if (at.digits < at.zeros) at.digits = at.zeros;
+      while (at.digits < space && isDigit(text.charCodeAt(at.digits))) at.digits += 1;
+      if (at.digits === first) return Number.NaN;
+      // Past 15 significant digits the value is beyond any offset in the text,
+      // so this read ends the loop: parseInt itself gives it, rounding and all.
+      if (at.digits - at.zeros > 15) return Number.parseInt(text.slice(offset, space), 10);
+      const magnitude = at.digits === at.zeros ? 0 : Number(text.slice(at.zeros, at.digits));
+      return sign === 45 ? -magnitude : magnitude;
+    },
+  };
 }
 
 /**

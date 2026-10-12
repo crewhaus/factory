@@ -1,6 +1,6 @@
 /**
  * An archive's index is untrusted, and reading it costs no more than its
- * names and link targets are long: counted, never timed.
+ * names, link targets and members add up to: counted, never timed.
  *
  *   - The link check (`unsafeArchiveLinks`, run by ArchiveList, ArchiveCreate
  *     and ArchiveExtract including `dryRun`) kept every prefix of every name
@@ -8,6 +8,8 @@
  *     a 206-byte .tar.gz made ArchiveList hold 64 million. Each link's walk
  *     also copied its queue at every step and expanded every link it passed
  *     through again, so n links through one long target cost n times it.
+ *   - A pax header's length field was re-read from each offset inside it, so
+ *     a header of k zeros before `1 ` cost k² character reads.
  *
  * Each rewrite is held to the 0.7.1 code it replaced, kept below as the
  * reference, on generated and hostile archives.
@@ -18,7 +20,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { gzipSync } from "node:zlib";
 import { archiveExtract, archiveList } from "./index";
-import type { ArchiveEntry } from "./lib/archive-format";
+import { type ArchiveEntry, readTarEntries } from "./lib/archive-format";
 import { memberComponents, unsafeArchiveLinks } from "./lib/archive-links";
 
 // ---------------------------------------------------------------------------
@@ -306,6 +308,25 @@ function longNameTar(members: ReadonlyArray<Member>): Buffer {
   return Buffer.concat(parts);
 }
 
+/** A tar of one pax header holding `records`, then one member, `plain.txt`. */
+function paxTar(records: string, typeflag = "x"): Buffer {
+  const data = Buffer.from(records, "utf8");
+  return Buffer.concat([
+    header("././@PaxHeader", data.length, typeflag),
+    padded(data),
+    header("plain.txt", 0, "0"),
+    Buffer.alloc(BLOCK * 2, 0),
+  ]);
+}
+
+/** A well-formed pax record: its length counts its own digits. */
+function paxRecord(key: string, value: string): string {
+  const body = ` ${key}=${value}\n`;
+  let n = body.length + 1;
+  while (String(n).length + body.length !== n) n = String(n).length + body.length;
+  return `${n}${body}`;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed JSON shape directly.
 function parsed(result: unknown): any {
   return JSON.parse(String(result));
@@ -475,6 +496,47 @@ describe("the hop limit and loops, whichever link a chain is entered by", () => 
 });
 
 // ---------------------------------------------------------------------------
+// the pax reader
+// ---------------------------------------------------------------------------
+
+describe("a pax header's length fields are read once", () => {
+  const fields = [
+    ["zeros", (k: number) => `${"0".repeat(k)}1 x=y\n`],
+    ["tabs", (k: number) => `${"\t".repeat(k)}1 x=y\n`],
+    [
+      "no-break spaces, a sign and zeros",
+      (k: number) => `${"\u00a0".repeat(k)}+${"0".repeat(k)}1 x=y\n`,
+    ],
+  ] as const;
+  for (const [label, records] of fields) {
+    test(`a field of thousands of ${label} before "1 "`, () => {
+      const counted = [4000, 8000].map((k) => {
+        const bytes = paxTar(records(k));
+        return { k, ...archiveWork(16 * k, () => readTarEntries(bytes)) };
+      });
+      for (const { k, value, work } of counted) {
+        expect(value?.map((e) => e.name)).toEqual(["plain.txt"]);
+        expect(work).toBeLessThanOrEqual(16 * k);
+        expect(work).toBeGreaterThanOrEqual(k);
+      }
+      const [small, large] = counted as [(typeof counted)[0], (typeof counted)[0]];
+      expect(large.work / small.work).toBeLessThan(2.25);
+    }, 20_000);
+  }
+
+  test("well-formed records still name the member, and the sparse name wins", () => {
+    const bytes = paxTar(
+      paxRecord("path", "decoy.txt") +
+        paxRecord("linkpath", "../../x") +
+        paxRecord("GNU.sparse.name", "real.txt"),
+    );
+    expect(readTarEntries(bytes)).toEqual([
+      { name: "real.txt", size: 0, kind: "file", linkTarget: "../../x" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // through the tools
 // ---------------------------------------------------------------------------
 
@@ -543,6 +605,16 @@ describe("ArchiveList and ArchiveExtract's dry run, on a tiny archive with very 
     const out = parsed(value);
     expect(out.extracted).toBe(false);
     expect(out.refused).toEqual([escaping(d)]);
+  }, 20_000);
+
+  test("a pax header of zeros lists in work linear in its size", async () => {
+    const k = 8000;
+    writeFileSync("pax.tar.gz", gzipSync(paxTar(`${"0".repeat(k)}1 x=y\n`)));
+    const { value, work } = await archiveWorkAsync(16 * k, () =>
+      archiveList.execute({ path: "pax.tar.gz" }),
+    );
+    expect(work).toBeLessThanOrEqual(16 * k);
+    expect(parsed(value).entries.map((e: { name: string }) => e.name)).toEqual(["plain.txt"]);
   }, 20_000);
 });
 
@@ -640,6 +712,31 @@ function referenceUnsafeArchiveLinks(entries: ReadonlyArray<ArchiveEntry>): unkn
       refuse(walked.hops > 0 ? "link points outside, through another link" : "link points outside");
   }
   return unsafe;
+}
+
+/** The pax record loop as 0.7.1 first shipped it: the member's path and link target. */
+function referencePax(text: string): { path?: string; linkpath?: string } {
+  const out: { path?: string; linkpath?: string } = {};
+  let sparseName: string | undefined;
+  let offset = 0;
+  while (offset < text.length) {
+    const space = text.indexOf(" ", offset);
+    if (space === -1) break;
+    const length = Number.parseInt(text.slice(offset, space), 10);
+    if (!Number.isFinite(length) || length <= 0) break;
+    const record = text.slice(space + 1, offset + length).replace(/\n$/, "");
+    const eq = record.indexOf("=");
+    if (eq > 0) {
+      const key = record.slice(0, eq);
+      const value = record.slice(eq + 1);
+      if (key === "path") out.path = value;
+      if (key === "linkpath") out.linkpath = value;
+      if (key === "GNU.sparse.name") sparseName = value;
+    }
+    offset += length;
+  }
+  if (sparseName !== undefined) out.path = sparseName;
+  return out;
 }
 
 /** xorshift32: the same cases on every run and every machine. */
@@ -762,5 +859,64 @@ describe("every verdict is the one the 0.7.1 code gave", () => {
       "link target unresolvable: links chain too deeply to resolve",
     ]);
     expect(verdicts).toBeGreaterThan(12_000);
+  }, 60_000);
+
+  test("generated pax headers: misstated lengths, zeros, signs, white space and huge numbers", () => {
+    const random = generator(72);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const WHITE = [
+      "\t",
+      "\n",
+      "\v",
+      "\f",
+      "\r",
+      "\u00a0",
+      "\u2003",
+      "\u2028",
+      "\u3000",
+      "\ufeff",
+      "\u180e",
+      "\u200b",
+      "\x7f",
+    ];
+    const KEYS = ["path", "linkpath", "GNU.sparse.name", "mtime", "", "pa=th"];
+    const VALUES = ["evil.txt", "a/../b", "", "x=y", "two\nlines", ".git/config"];
+    const token = (): string => {
+      const roll = random();
+      if (roll < 0.3) return paxRecord(pick(KEYS), pick(VALUES));
+      if (roll < 0.4) {
+        const record = paxRecord(pick(KEYS), pick(VALUES));
+        const digits = record.match(/^\d+/)?.[0] ?? "1";
+        const misstated = Math.max(0, Number(digits) + Math.floor(random() * 7) - 3);
+        return `${misstated}${record.slice(digits.length)}`;
+      }
+      if (roll < 0.5) {
+        return "0".repeat(Math.floor(random() * 30)) + pick(["1", "2", "9", "10", "0", ""]);
+      }
+      if (roll < 0.58) return pick(WHITE).repeat(1 + Math.floor(random() * 3));
+      if (roll < 0.63) return pick(["+", "-", "-0", "+0", "0x1", "1e3"]);
+      if (roll < 0.68) return " ";
+      if (roll < 0.72) {
+        return pick(["9".repeat(16), "1".repeat(20), "9".repeat(320), `00000${"1".repeat(17)}`]);
+      }
+      if (roll < 0.8) return `${pick(KEYS)}=${pick(VALUES)}`;
+      return pick(["\n", "=", "a", "\u00e9", "7"]);
+    };
+    let mismatches = 0;
+    let named = 0;
+    for (let i = 0; i < 4000; i++) {
+      let text = "";
+      for (let j = 0, n = 1 + Math.floor(random() * 14); j < n; j++) text += token();
+      // The reader decodes the bytes, and decoding drops a leading BOM.
+      const expected = referencePax(new TextDecoder().decode(Buffer.from(text, "utf8")));
+      const [entry] = readTarEntries(paxTar(text, pick(["x", "g"])));
+      if (expected.path !== undefined) named += 1;
+      const same =
+        entry?.name === (expected.path ?? "plain.txt") &&
+        entry?.linkTarget === (expected.linkpath === "" ? undefined : expected.linkpath);
+      if (!same) mismatches += 1;
+    }
+    expect(mismatches).toBe(0);
+    expect(named).toBeGreaterThan(400);
   }, 60_000);
 });
