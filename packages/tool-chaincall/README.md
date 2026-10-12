@@ -125,10 +125,12 @@ on `supportsInterface`, one that is not a proxy reverts on `implementation()`.
 A probe the node could not answer at all — it is down, it is rate-limiting, it
 pruned the block — is not, and the two are counted separately. With several
 nodes in the chain's `rpcUrls`, a probe counts as reverted when every node that
-answered said so; a node that could not be reached counts neither way. When
-*every* probe fails that way the whole read is **refused**, because the report
-it would otherwise produce ("not a proxy, not ERC-165") is a set of claims
-about a contract nobody managed to ask.
+answered said so; a node that could not be reached counts neither way. A
+`quorum` of two or more nodes stops waiting once no answer can win, so there a
+probe that fails on every node counts as unanswered. When *every* probe fails
+that way the whole read is **refused**, because the report it would otherwise
+produce ("not a proxy, not ERC-165") is a set of claims about a contract nobody
+managed to ask.
 
 The same line is held one probe at a time. When it is the `0xffffffff`
 sentinel that the node would not answer, the claims are still dropped — but
