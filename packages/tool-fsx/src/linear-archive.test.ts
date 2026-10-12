@@ -14,7 +14,8 @@
  *   - A pax header's length field was re-read from each offset inside it, so
  *     a header of k zeros before `1 ` cost k² character reads.
  *   - A zip symlink's target was inflated whole before its length was
- *     checked, once per member, and members can share one bomb.
+ *     checked, once per member, and members can share one bomb. Then each
+ *     was bounded, but still read once per member that named it.
  *   - ArchiveExtract looked each staged top-level name up in the list of the
  *     index's, n² comparisons for n names.
  *
@@ -620,6 +621,8 @@ type ZipMember = {
   readonly data: Buffer;
   /** Index of an earlier member whose local data this one's directory entry points at. */
   readonly sharesWith?: number;
+  /** The compressed size this one's directory entry states, when not its data's length. */
+  readonly statedSize?: number;
 };
 
 /** A zip of symlink members, each central-directory entry pointing at its own data or an earlier member's. */
@@ -655,7 +658,7 @@ function zipOfLinks(members: ReadonlyArray<ZipMember>): Buffer {
     entry.writeUInt16LE(0x031e, 4);
     entry.writeUInt16LE(20, 6);
     entry.writeUInt16LE(source.method, 10);
-    entry.writeUInt32LE(source.data.length, 20);
+    entry.writeUInt32LE(member.statedSize ?? source.data.length, 20);
     entry.writeUInt32LE(source.data.length, 24);
     entry.writeUInt16LE(name.length, 28);
     // S_IFLNK in the high half of the external attributes: a symlink.
@@ -684,13 +687,14 @@ function paddedDeflate(text: string, blocks: number): Buffer {
 
 /**
  * Run `body` with the zip reader's inflater counted: the bytes it is handed
- * and the bytes it returns (for a call stopped at its output limit, the
- * limit). Nothing is timed.
+ * (`handed`), and those plus the bytes it returns (for a call stopped at its
+ * output limit, the limit). Nothing is timed.
  */
-function inflateWork<T>(body: () => T): { value: T; calls: number; bytes: number } {
-  const counter = { calls: 0, bytes: 0 };
+function inflateWork<T>(body: () => T): { value: T; calls: number; handed: number; bytes: number } {
+  const counter = { calls: 0, handed: 0, bytes: 0 };
   _setInflateRawForTest(((data: Uint8Array, options?: { maxOutputLength?: number }) => {
     counter.calls += 1;
+    counter.handed += data.length;
     counter.bytes += data.length;
     try {
       const out = inflateRawSync(data, options);
@@ -711,12 +715,13 @@ function inflateWork<T>(body: () => T): { value: T; calls: number; bytes: number
 describe("a zip's link targets are read within their limits", () => {
   const unstated = "a link whose target this archive does not state";
 
-  test("hundreds of links sharing one deflate bomb: each costs at most its limits", () => {
-    // A kilobyte of deflate that inflates to a megabyte, named by every link.
-    // Each was inflated whole before its length was checked: a 102 KB zip
-    // made the listing inflate 2 GB.
-    const bomb = deflateRawSync(Buffer.alloc(1 << 20, 0x61));
-    const perMember = 16_384 + 8_192;
+  /** A kilobyte of deflate that inflates to a megabyte. */
+  const bomb = deflateRawSync(Buffer.alloc(1 << 20, 0x61));
+
+  test("hundreds of links sharing one deflate bomb: it is inflated once, within its limits", () => {
+    // Each link's target was inflated whole before its length was checked
+    // (a 102 KB zip made the listing inflate 2 GB), then each within its
+    // limits but once per link: 24 KiB of work for a 46-byte entry.
     const counted = [200, 400].map((n) => {
       const members: ZipMember[] = [{ name: "l0", method: 8, data: bomb }];
       for (let i = 1; i < n; i++)
@@ -724,18 +729,146 @@ describe("a zip's link targets are read within their limits", () => {
       const zip = zipOfLinks(members);
       return { n, ...inflateWork(() => readZipEntries(zip)) };
     });
-    for (const { n, value, calls, bytes } of counted) {
-      // Every link went through the counted inflater, and none was read.
-      expect(calls).toBe(n);
+    for (const { n, value, calls, handed, bytes } of counted) {
+      expect(calls).toBe(1);
+      expect(handed).toBe(bomb.length);
+      expect(bytes).toBeLessThanOrEqual(bomb.length + 8_192);
+      // None was read, and every one is refused by name.
+      expect(value.length).toBe(n);
       expect(
         value.every((entry) => entry.kind === "symlink" && entry.linkTarget === undefined),
       ).toBe(true);
-      expect(bytes).toBeLessThanOrEqual(n * perMember);
-      expect(unsafeArchiveLinks(value).every((u) => u.why === unstated)).toBe(true);
+      const refused = unsafeArchiveLinks(value);
+      expect(refused.length).toBe(n);
+      expect(refused.every((u) => u.why === unstated)).toBe(true);
     }
-    const [small, large] = counted as [(typeof counted)[0], (typeof counted)[0]];
-    expect(large.bytes / small.bytes).toBeLessThan(2.25);
   }, 20_000);
+
+  test("links naming one bomb at different lengths read no more than the archive holds", () => {
+    // Each stated length is a different target to read, so sharing the
+    // result does not help: n links would hand the inflater n kilobytes from
+    // a zip of a few dozen. What is read for them stops at the zip's size.
+    const counted = [200, 400].map((n) => {
+      const members: ZipMember[] = [{ name: "l0", method: 8, data: bomb }];
+      for (let i = 1; i < n; i++) {
+        members.push({
+          name: `l${i}`,
+          method: 8,
+          data: bomb,
+          sharesWith: 0,
+          statedSize: bomb.length - i,
+        });
+      }
+      const zip = zipOfLinks(members);
+      return { n, zip, ...inflateWork(() => readZipEntries(zip)) };
+    });
+    for (const { n, zip, value, calls, handed } of counted) {
+      expect(handed).toBeLessThanOrEqual(zip.length);
+      expect(calls).toBeGreaterThan(1);
+      expect(calls).toBeLessThan(n);
+      expect(value.length).toBe(n);
+      const refused = unsafeArchiveLinks(value);
+      expect(refused.length).toBe(n);
+      expect(refused.every((u) => u.why === unstated)).toBe(true);
+    }
+  }, 20_000);
+
+  test("data shared at different lengths reads as it would alone, until the archive's size is read", () => {
+    // A stored target named by every link at a shorter length: each is a
+    // different prefix, a target in its own right. The rule, step by step:
+    // a target not read before is read while the data read for targets
+    // stays within the archive's size, and reads as unstated past it.
+    const text = "t/".repeat(100);
+    const n = 60;
+    const members: ZipMember[] = [{ name: "l00", method: 0, data: Buffer.from(text) }];
+    for (let i = 1; i < n; i++) {
+      members.push({
+        name: `l${String(i).padStart(2, "0")}`,
+        method: 0,
+        data: Buffer.from(text),
+        sharesWith: 0,
+        statedSize: text.length - i,
+      });
+    }
+    const zip = zipOfLinks(members);
+    const rule = { spent: 0 };
+    const expected = members.map((member) => {
+      const size = member.statedSize ?? text.length;
+      if (rule.spent + size > zip.length) return undefined;
+      rule.spent += size;
+      return text.slice(0, size);
+    });
+    expect(readZipEntries(zip).map((entry) => entry.linkTarget)).toEqual(expected);
+    // Both sides of the line are reached.
+    const read = expected.filter((target) => target !== undefined).length;
+    expect(read).toBeGreaterThan(10);
+    expect(read).toBeLessThan(n);
+  });
+
+  test("links with their own data, or sharing it whole, read as each would alone", () => {
+    // What a zip writer makes: each member's data is its own, so what is
+    // read for the targets never passes the archive's size. Targets of every
+    // length up to past the limit, stored and deflated, and deflated streams
+    // truncated, bit-flipped or followed by garbage; some links name an
+    // earlier one's data whole, which is read once.
+    const random = generator(75);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const decoder = new TextDecoder("utf-8");
+    const alone = (data: Buffer, method: number): string | undefined => {
+      if (method === 0) return data.length > 8192 ? undefined : decoder.decode(data);
+      if (method !== 8 || data.length > 16_384) return undefined;
+      try {
+        const inflated = Bun.inflateSync(data as Uint8Array<ArrayBuffer>);
+        return inflated.length > 8192 ? undefined : decoder.decode(inflated);
+      } catch {
+        return undefined;
+      }
+    };
+    let targets = 0;
+    let read = 0;
+    let shared = 0;
+    let mismatches = 0;
+    for (let archive = 0; archive < 150; archive++) {
+      const members: ZipMember[] = [];
+      for (let i = 0, n = 1 + Math.floor(random() * 24); i < n; i++) {
+        const own = members.filter((m) => m.sharesWith === undefined);
+        if (own.length > 0 && random() < 0.25) {
+          const source = pick(own);
+          members.push({ ...source, name: `s${i}`, sharesWith: members.indexOf(source) });
+          shared += 1;
+          continue;
+        }
+        const length = pick([0, 1, 9, 120, 4000, 8191, 8192, 8193]);
+        const text = Buffer.alloc(length);
+        for (let j = 0; j < length; j++) text[j] = pick([47, 46, 97, 98, 0xc3, 0xa9]);
+        if (random() < 0.4) {
+          members.push({ name: `l${i}`, method: 0, data: text });
+          continue;
+        }
+        let data: Buffer = deflateRawSync(text, { level: Math.floor(random() * 10) });
+        const roll = random();
+        if (roll < 0.15) data = data.subarray(0, Math.floor(random() * data.length));
+        else if (roll < 0.3) data = Buffer.concat([data, Buffer.from([1, 2, 3])]);
+        else if (roll < 0.45 && data.length > 0) {
+          data = Buffer.from(data);
+          const k = Math.floor(random() * data.length);
+          data[k] = (data[k] as number) ^ (1 << Math.floor(random() * 8));
+        }
+        members.push({ name: `l${i}`, method: pick([8, 8, 8, 12]), data });
+      }
+      const got = readZipEntries(zipOfLinks(members));
+      members.forEach((member, i) => {
+        const expected = alone(member.data, member.method);
+        targets += 1;
+        if (expected !== undefined) read += 1;
+        if (got[i]?.linkTarget !== expected) mismatches += 1;
+      });
+    }
+    expect(mismatches).toBe(0);
+    expect(targets).toBeGreaterThan(1500);
+    expect(read).toBeGreaterThan(600);
+    expect(shared).toBeGreaterThan(300);
+  }, 60_000);
 
   test("a deflated target over 16 KiB compressed is refused unread, though it would inflate to a short path", () => {
     // 16,384 bytes is twice the longest target read; deflate never needs

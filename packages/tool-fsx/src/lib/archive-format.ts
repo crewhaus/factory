@@ -304,6 +304,24 @@ export function _setInflateRawForTest(fn: typeof inflateRawSync | undefined): vo
 }
 
 /**
+ * What one listing has read of its link targets.
+ *
+ * Many central-directory entries may name the same member data; a zip
+ * writer never does that, a crafted archive can. Each target is read once
+ * and kept, by where its data starts, how long it is and how it is stored,
+ * which is everything the answer depends on. And the data read for distinct
+ * targets may come to no more than the archive's own size, which members
+ * that each have their own data never exceed, since theirs do not overlap.
+ * Past that a target reads as unstated, which the link check refuses: a
+ * crafted archive is stopped, not believed.
+ */
+type LinkReads = {
+  readonly known: Map<string, string | undefined>;
+  /** Bytes of member data read for targets so far. */
+  spent: number;
+};
+
+/**
  * Read a symlink member's target, which a zip stores as the member's own
  * FILE DATA. The central directory records where that data starts, so the
  * local header is consulted for this one purpose (and only for the name and
@@ -319,6 +337,7 @@ function readZipLinkTarget(
   localOffset: number,
   compressedSize: number,
   method: number,
+  reads: LinkReads,
 ): string | undefined {
   if (localOffset + 30 > data.length) return undefined;
   if (view.getUint32(localOffset, true) !== LOCAL_SIGNATURE) return undefined;
@@ -327,10 +346,24 @@ function readZipLinkTarget(
   const start = localOffset + 30 + nameLength + extraLength;
   const end = start + compressedSize;
   if (compressedSize < 0 || end > data.length) return undefined;
-  const stored = data.subarray(start, end);
+  const key = `${start}:${compressedSize}:${method}`;
+  if (reads.known.has(key)) return reads.known.get(key);
+  if (reads.spent + compressedSize > data.length) return undefined;
+  const target = decodeZipLinkTarget(data.subarray(start, end), method, reads);
+  reads.known.set(key, target);
+  return target;
+}
+
+/** A link target from its stored bytes, or undefined; `reads.spent` counts what is read. */
+function decodeZipLinkTarget(
+  stored: Uint8Array,
+  method: number,
+  reads: LinkReads,
+): string | undefined {
   try {
     if (method === 0) {
       if (stored.length > MAX_LINK_TARGET_BYTES) return undefined;
+      reads.spent += stored.length;
       return TEXT.decode(stored);
     }
     if (method === 8) {
@@ -340,6 +373,7 @@ function readZipLinkTarget(
       // data past the bound is refused unread (a stream of empty blocks
       // reads all of it and writes nothing); output past the limit throws.
       if (stored.length > MAX_DEFLATED_LINK_TARGET_BYTES) return undefined;
+      reads.spent += stored.length;
       const inflated = inflater.raw(stored, { maxOutputLength: MAX_LINK_TARGET_BYTES });
       if (inflated.length > MAX_LINK_TARGET_BYTES) return undefined;
       return TEXT.decode(inflated);
@@ -379,6 +413,7 @@ export function readZipEntries(data: Uint8Array): ArchiveEntry[] {
   }
 
   const entries: ArchiveEntry[] = [];
+  const reads: LinkReads = { known: new Map(), spent: 0 };
   let offset = directoryOffset;
   for (let i = 0; i < count; i++) {
     if (offset + 46 > data.length || view.getUint32(offset, true) !== CENTRAL_SIGNATURE) {
@@ -400,7 +435,7 @@ export function readZipEntries(data: Uint8Array): ArchiveEntry[] {
     const isSymlink = (unixMode & 0xf000) === 0xa000;
     const kind: ArchiveEntryKind = isSymlink ? "symlink" : name.endsWith("/") ? "dir" : "file";
     const linkTarget = isSymlink
-      ? readZipLinkTarget(data, view, localOffset, compressedSize, method)
+      ? readZipLinkTarget(data, view, localOffset, compressedSize, method, reads)
       : undefined;
     const special = specialFromUnixMode(unixMode);
     entries.push({
