@@ -719,10 +719,10 @@ describe("DependencyAudit refuses a redirect from its OSV mirror", () => {
 });
 
 // ---------------------------------------------------------------------------
-// FIXED — a chain read never follows a redirect off the chains block
+// FIXED — a chain read never follows a redirect
 // ---------------------------------------------------------------------------
 
-describe("a chain read refuses a redirect to a node the chains block does not name", () => {
+describe("a chain read refuses every redirect, and says where it pointed", () => {
   // B answers like a node, so a followed redirect would come back as a
   // plausible answer rather than an error.
   const b = server(async (req) => {
