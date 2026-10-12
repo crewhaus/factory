@@ -532,6 +532,57 @@ describe("what a call can make the glossary do is counted", () => {
     work(2).forEach((w, j) => expect(w / (work(0)[j] as number)).toBeLessThan(1.1));
   });
 
+  test("a whole-word term found everywhere and turned down nearly everywhere is one read of the text", () => {
+    // critic8: m "a"s over n "a"s is an occurrence at every place, and whole
+    // words turn each one down, since an "a" touches it on one side or both:
+    // all the work is in going on after a refusal. Starting again one unit
+    // past the refused start, with nothing of it kept, is the n × m search
+    // once more, and gives the same text, so only the count can tell. The
+    // second text takes some: runs of exactly m between spaces are whole
+    // words; one that meets a "-", or is longer, is not.
+    const texts = (n: number, m: number): string[] => {
+      const a = (k: number) => "a".repeat(k);
+      const block = `${a(m)} ${a(m)}-${a(2 * m)} `;
+      return [a(n), block.repeat(Math.ceil(n / block.length)).slice(0, n)];
+    };
+    const counted = [
+      [10_000, 100],
+      [20_000, 100],
+      [10_000, 200],
+    ].map(([n, m]) => {
+      const term = "a".repeat(m as number);
+      return {
+        n: n as number,
+        m: m as number,
+        runs: texts(n as number, m as number).flatMap((text) =>
+          [true, false].map((caseSensitive) => ({
+            want: referenceGlossary(text, { [term]: "v" }, true, caseSensitive),
+            ...searchWork(8 * ((n as number) + (m as number)), () =>
+              glossaryReplace(text, { [term]: "v" }, true, caseSensitive),
+            ),
+          })),
+        ),
+      };
+    });
+    for (const { n, m, runs } of counted) {
+      for (const [i, { want, outcome, work }] of runs.entries()) {
+        expect({ n, m, i, outcome }).toEqual({ n, m, i, outcome: want });
+        expect(work).toBeLessThanOrEqual(8 * (n + m));
+        expect(work).toBeGreaterThanOrEqual(n);
+      }
+      // The second text has whole words to take, the first none.
+      expect(runs.map((r) => r.want.replacements["a".repeat(m)] ?? 0).map((c) => c > 0)).toEqual([
+        false,
+        false,
+        true,
+        true,
+      ]);
+    }
+    const work = (i: number) => (counted[i] as (typeof counted)[number]).runs.map((r) => r.work);
+    // Twice the text, about twice the work.
+    work(1).forEach((w, j) => expect(w / (work(0)[j] as number)).toBeLessThan(2.1));
+  });
+
   test("thousands of terms over a long text: refused after a hundred passes' reading", () => {
     const limit = 2_000;
     const text = "z".repeat(limit);
