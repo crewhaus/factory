@@ -699,4 +699,48 @@ describe("placeRecordingCanonicalizer — command words read where the kernel fi
     expect(out?.inWorkspace).toBeUndefined();
     expect(out?.writtenInWorkspace).toBe(false);
   });
+
+  test("a loop of links is placed nowhere, and the place says so", () => {
+    const view = placeRecordingCanonicalizer(ws);
+    expect(view.readProgramPath("./loop/a/x", undefined)).toBeUndefined();
+    expect(view.places()).toEqual([{ path: "./loop/a/x", at: [`unresolved:${ws}/loop/a/x`] }]);
+    // Longer than any path can be: the kernel refuses to run it.
+    expect(view.readProgramPath(`./${"a/".repeat(MAX_PATH_CHARS)}x`, undefined)).toBeUndefined();
+  });
+
+  test("each word is a place an approval is bound to, after the paths, keyed by where it runs", () => {
+    const view = placeRecordingCanonicalizer(ws);
+    view.canonicalizePath("src/app.ts");
+    view.readProgramPath("./tools/run.sh", undefined);
+    view.readProgramPath("../run.sh", "link/");
+    view.readProgramPath("./bin/tool", undefined);
+    expect(view.places()).toEqual([
+      { path: "src/app.ts", at: [`${ws}/src/app.ts`] },
+      { path: "./bin/tool", at: [`${ws}/bin/tool`, `${ws}/safe/run.sh`] },
+      { path: "./tools/run.sh", at: [`${ws}/safe/run.sh`] },
+      { path: "link/../run.sh", at: [`${ws}/secrets/run.sh`] },
+    ]);
+    // Through a link, a word does not land where it reads on its face, so a
+    // grant written before approvals were bound does not cover it.
+    expect(view.allAsWritten()).toBe(false);
+    const plain = placeRecordingCanonicalizer(ws);
+    plain.canonicalizePath("src/app.ts");
+    plain.readProgramPath("./run.sh", undefined);
+    expect(plain.allAsWritten()).toBe(true);
+  });
+
+  test("a bare word an interpreter is handed is a place only where it names an entry", () => {
+    // `bun run build`, `python -m pytest`: a subcommand or a module is not a
+    // file, and a card listing one would name a file that is not there.
+    const view = placeRecordingCanonicalizer(ws);
+    expect(view.readProgramPath("build", undefined)).toMatchObject({ at: `${ws}/build` });
+    expect(view.readProgramPath("pytest", undefined)).toMatchObject({ at: `${ws}/pytest` });
+    expect(view.readProgramPath("run.sh", ".")).toMatchObject({ at: `${ws}/run.sh` });
+    expect(view.readProgramPath("run.sh", "safe/")).toMatchObject({ at: `${ws}/safe/run.sh` });
+    expect(view.places()).toEqual([
+      { path: "build", at: [`${ws}/build`] },
+      { path: "run.sh", at: [`${ws}/run.sh`] },
+      { path: "safe/run.sh", at: [`${ws}/safe/run.sh`] },
+    ]);
+  });
 });

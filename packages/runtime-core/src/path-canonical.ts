@@ -590,45 +590,74 @@ function readProgramPlace(word: string, runsIn: string | undefined, root: string
   };
 }
 
+/** `text` without its trailing separators, in one pass from the end. */
+function withoutTrailingSeparators(text: string): string {
+  let end = text.length;
+  while (end > 0 && isSeparator(text.charCodeAt(end - 1))) end--;
+  return text.slice(0, end);
+}
+
 /**
  * The gate's canonicaliser, keeping a record of every path it read and where
  * each one lands — absolute, every symlink followed, one place per value it
  * gave a rule (the entry itself and, when that is a symlink, its target),
  * inside or outside the workspace alike. That record is what a headless
  * approval is bound to (`landsWhereApproved` in this package). Paths a call names through a directory field (a
- * command's `cwd`, a PATH entry it sets) are read through it too, so the
- * record is everything on the filesystem the gate's decision rested on.
+ * command's `cwd`, a PATH entry it sets) are read through it too, and so is
+ * each command word that names a file — the program run by its path, the
+ * script an interpreter is handed — through `readProgramPath`, so the record
+ * is everything on the filesystem the gate's decision rested on.
  */
 export function placeRecordingCanonicalizer(root: string = process.cwd()): {
   readonly canonicalizePath: PathCanonicalizer;
-  /** Where a command word that names a file lands; see `ProgramPathReader`. */
+  /** Where a command word that names a file lands, recorded like a path. */
   readonly readProgramPath: ProgramPathReader;
-  /** Every path read so far, ordered by path, each with where it lands. */
+  /**
+   * Every path read so far, ordered by path, each with where it lands; then
+   * every command word, ordered the same way, keyed by the word joined to
+   * the directory it runs in.
+   */
   readonly places: () => ApprovalPlace[];
   /**
-   * True when every path read lands exactly where it reads on its face —
-   * one place, the root joined to the path with `..` collapsed and no
-   * symlink followed. Vacuously true when no path was read.
+   * True when every path and command word read lands exactly where it reads
+   * on its face — one place, the root joined to the path with `..` collapsed
+   * and no symlink followed. Vacuously true when nothing was read.
    */
   readonly allAsWritten: () => boolean;
 } {
   const seen = new Map<string, WorkspacePathReading>();
+  const programs = new Map<string, ProgramPlace>();
+  const byKey = <T>(entries: Iterable<[string, T]>): Array<[string, T]> =>
+    [...entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return {
     canonicalizePath: (raw) => {
       const reading = readWorkspacePath(raw, root, {});
       seen.set(raw, reading);
       return reading.values;
     },
-    readProgramPath: (word, runsIn) => readProgramPlace(word, runsIn, root).reading,
-    places: () =>
-      [...seen.entries()]
-        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-        .map(([p, r]) => ({ path: p, at: [...r.places()] })),
+    readProgramPath: (word, runsIn) => {
+      const place = readProgramPlace(word, runsIn, root);
+      // A bare word an interpreter is handed may be a subcommand or a module
+      // (`bun run build`, `python -m pytest`): it is a place only where it
+      // names an entry, or a card would list files that are not there.
+      const separated = word.includes("/") || (path.sep === "\\" && word.includes("\\"));
+      if (!separated && place.reading !== undefined && !nameExists(place.reading.at)) {
+        return place.reading;
+      }
+      const dir = runsIn !== undefined ? withoutTrailingSeparators(runsIn) : "";
+      const key = dir === "" || dir === "." || path.isAbsolute(word) ? word : `${dir}/${word}`;
+      programs.set(key, place);
+      return place.reading;
+    },
+    places: () => [
+      ...byKey(seen.entries()).map(([p, r]) => ({ path: p, at: [...r.places()] })),
+      ...byKey(programs.entries()).map(([p, r]) => ({ path: p, at: [...r.at] })),
+    ],
     allAsWritten: () =>
       [...seen.values()].every((r) => {
         const at = r.places();
         return at.length === 1 && at[0] === r.asWritten;
-      }),
+      }) && [...programs.values()].every((r) => r.at.length === 1 && r.at[0] === r.asWritten),
   };
 }
 

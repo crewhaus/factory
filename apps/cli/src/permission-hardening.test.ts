@@ -1922,6 +1922,52 @@ describe("a path longer than any path can be is outside to the gate and refused 
   }, 120_000);
 });
 
+/** One response per step: each tool_use in turn, then "done". */
+function scripted(steps: ReadonlyArray<{ name: string; input: unknown }>): ProviderAdapter {
+  let i = 0;
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: () => {
+      const step = steps[i];
+      i++;
+      return (async function* () {
+        yield { kind: "message_start" } as const;
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block:
+            step !== undefined
+              ? { type: "tool_use", id: `tu_${i}`, name: step.name, input: {} }
+              : { type: "text", text: "" },
+        } as const;
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta:
+            step !== undefined
+              ? { type: "input_json_delta", partial_json: JSON.stringify(step.input) }
+              : { type: "text_delta", text: "done" },
+        } as const;
+        yield { kind: "content_block_stop", index: 0 } as const;
+        yield {
+          kind: "message_delta",
+          stopReason: step !== undefined ? "tool_use" : "end_turn",
+          usage: { input: 1, output: 1 },
+        } as const;
+        yield { kind: "message_stop" } as const;
+      })();
+    },
+  };
+}
+
 describe("critic7 — a headless grant covers the place it was asked for, not where a link points later", () => {
   // The operator grants a Write to `pub/link/x.md` while `pub/link` points
   // at `public/`. In the resumed turn an ALLOWED call (here `ln -sfn`, through
@@ -1931,52 +1977,6 @@ describe("critic7 — a headless grant covers the place it was asked for, not wh
   const sessionId = "sess_0123456789abcdef";
   const write = { path: "pub/link/x.md", content: "approved for public/" };
   const rs = rules(["alwaysAsk", "Write(secrets/**)"], ["alwaysAllow", "RunCommand(ln **)"]);
-
-  /** One response per step: each tool_use in turn, then "done". */
-  function scripted(steps: ReadonlyArray<{ name: string; input: unknown }>): ProviderAdapter {
-    let i = 0;
-    return {
-      providerId: "anthropic",
-      features: {
-        caching: "explicit",
-        tool_use: true,
-        vision: true,
-        thinking: true,
-        web_search: true,
-      },
-      estimateTokens: () => 0,
-      stream: () => {
-        const step = steps[i];
-        i++;
-        return (async function* () {
-          yield { kind: "message_start" } as const;
-          yield {
-            kind: "content_block_start",
-            index: 0,
-            block:
-              step !== undefined
-                ? { type: "tool_use", id: `tu_${i}`, name: step.name, input: {} }
-                : { type: "text", text: "" },
-          } as const;
-          yield {
-            kind: "content_block_delta",
-            index: 0,
-            delta:
-              step !== undefined
-                ? { type: "input_json_delta", partial_json: JSON.stringify(step.input) }
-                : { type: "text_delta", text: "done" },
-          } as const;
-          yield { kind: "content_block_stop", index: 0 } as const;
-          yield {
-            kind: "message_delta",
-            stopReason: step !== undefined ? "tool_use" : "end_turn",
-            usage: { input: 1, output: 1 },
-          } as const;
-          yield { kind: "message_stop" } as const;
-        })();
-      },
-    };
-  }
 
   let store: ReturnType<typeof createPendingApprovalStore>;
   beforeEach(() => {
@@ -2444,4 +2444,123 @@ describe("critic8 — a program path read where the kernel finds it", () => {
       ),
     ).toBe("deny");
   }, 120_000);
+});
+
+// critic8 (0.7.1): a headless grant was bound to the paths a call names, and
+// a command's program was not one of them: RunCommand ["./tools/run.sh"]
+// with tools → safe parked with no places, and once an allowed call in the
+// resumed turn pointed tools at evil/, the same call spent the grant and ran
+// evil/run.sh.
+describe("critic8 — a headless grant for a command covers the program it was asked for", () => {
+  const sessionId = "sess_0123456789abcdef";
+  const call = { argv: ["./tools/run.sh"] };
+  const rs = rules(["alwaysAllow", "RunCommand(ln **)"]);
+  let marker: string;
+  let store: ReturnType<typeof createPendingApprovalStore>;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    for (const d of ["safe", "evil"]) {
+      mkdirSync(join(ws, d));
+      writeFileSync(join(ws, d, "run.sh"), `#!/bin/sh\necho ${d}/run.sh >> "${marker}"\n`, {
+        mode: 0o755,
+      });
+    }
+    symlinkSync("safe", join(ws, "tools"));
+    store = createPendingApprovalStore({ rootDir: join(state, "approvals") });
+  });
+  const ran = () => readFileSync(marker, "utf8").trim();
+
+  async function turn(steps: ReadonlyArray<{ name: string; input: unknown }>) {
+    const where = relative(ws, process.cwd());
+    if (where.startsWith("..") || isAbsolute(where) || !existsSync(ws)) {
+      throw new Error(`turn outlived its test's workspace; refusing to run in ${process.cwd()}`);
+    }
+    let parked: string | undefined;
+    await runChatLoop({
+      model: "test-model",
+      instructions: "approval places",
+      runContext: createRunContext({ sessionId }),
+      sessionRootDir: mkdtempSync(join(state, "sess-")),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      permissionMode: "default",
+      permissionRules: rs,
+      tools: [builtin("RunCommand")],
+      approvals: { store },
+      _adapter: scripted(steps),
+    }).catch((err: { report?: { class?: string; detail?: string } }) => {
+      if (err.report?.class !== "approval_pending") throw err;
+      parked = err.report.detail;
+    });
+    return parked;
+  }
+  const idIn = (detail: string | undefined) =>
+    /parked as approval (appr_[0-9a-f]{16})/.exec(detail ?? "")?.[1];
+  const record = async (id: string | undefined) => (await store.list()).find((a) => a.id === id);
+  async function parkAndGrant(): Promise<string> {
+    const id = idIn(await turn([{ name: "RunCommand", input: call }]));
+    if (id === undefined) throw new Error("the RunCommand did not park");
+    expect(ran()).toBe("");
+    expect((await record(id))?.places).toEqual([
+      { path: "./tools/run.sh", at: [`${ws}/safe/run.sh`] },
+    ]);
+    await store.resolve(id, "grant", "operator");
+    return id;
+  }
+
+  test("retargeted by an allowed call in the resumed turn: asked again, evil/run.sh never runs", async () => {
+    const granted = await parkAndGrant();
+    const detail = await turn([
+      { name: "RunCommand", input: { argv: ["ln", "-sfn", "evil", "tools"] } },
+      { name: "RunCommand", input: call },
+    ]);
+    expect(realpathSync(join(ws, "tools"))).toBe(join(ws, "evil"));
+    expect(ran()).toBe("");
+    expect(detail).toContain(
+      `approval ${granted} was granted for ./tools/run.sh -> ${ws}/safe/run.sh, and the call now lands at ./tools/run.sh -> ${ws}/evil/run.sh, so it is asked again`,
+    );
+    expect((await record(granted))?.consumedAt).toBeUndefined();
+  }, 60_000);
+
+  test("control: the link left where it was, the grant runs safe/run.sh once", async () => {
+    const granted = await parkAndGrant();
+    const detail = await turn([
+      { name: "RunCommand", input: { argv: ["ln", "-sfn", "safe", "tools"] } },
+      { name: "RunCommand", input: call },
+    ]);
+    expect(detail).toBeUndefined();
+    expect(ran()).toBe("safe/run.sh");
+    expect((await record(granted))?.consumedAt).toBeDefined();
+  }, 60_000);
+
+  test("a grant made before approvals were bound covers a program only where it reads", async () => {
+    // As 0.7.0 wrote it: no `places`. Through `tools`, the program is not
+    // where the call names it, so the call is asked again.
+    for (const [argv, runs] of [
+      [["./tools/run.sh"], ""],
+      [["./safe/run.sh"], "safe/run.sh"],
+    ] as const) {
+      writeFileSync(marker, "");
+      const input = { argv: [...argv] };
+      const legacy = `appr_00000000000000${argv[0] === "./safe/run.sh" ? "cd" : "ab"}`;
+      await store.persist({
+        id: legacy,
+        toolName: "RunCommand",
+        inputHash: hashApprovalInput("RunCommand", input),
+        input,
+        runId: "run_old",
+        sessionId,
+        surface: "single-turn",
+        createdAt: new Date().toISOString(),
+      });
+      await store.resolve(legacy, "grant", "operator");
+      const detail = await turn([{ name: "RunCommand", input }]);
+      expect({ argv, parked: idIn(detail) !== undefined, ran: ran() }).toEqual({
+        argv,
+        parked: runs === "",
+        ran: runs,
+      });
+    }
+  }, 60_000);
 });
