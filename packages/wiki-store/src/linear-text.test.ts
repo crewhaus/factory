@@ -4,6 +4,7 @@
  * the body's trailing whitespace goes with `trimEnd()`.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { type WikiArticle, extractWikilinks, parseArticle, serializeArticle } from "./index";
 import { wikilinkInners } from "./wikilinks";
 
@@ -123,8 +124,8 @@ describe("trimEnd strips what /\\s+$/ stripped", () => {
   }, 20_000);
 });
 
-// Counted, not timed: the only place quadratic work could hide in these
-// reads is a pattern run over the run, so each one is refused and recorded.
+// Counted, not timed: a pattern run over the run is refused and recorded.
+// The link scan's own reads are counted below.
 describe("long runs in a body", () => {
   test("a run of [ with no closing ]] runs no pattern", () => {
     const run = "[".repeat(10_000);
@@ -160,4 +161,33 @@ describe("long runs in a body", () => {
     expect(read.refused).toEqual([]);
     expect((read.outcome as WikiArticle).body).toBe(body);
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all, if it
+// resumes one character on instead of after what it has read. So the link
+// scan's own reads are counted (__test__/scan-work.ts) over runs shaped to
+// make it rescan, and held to a few per character: a rescan reads the rest of
+// the run from every place in it and stops at the bound at once.
+describe("the link scan reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, string, number]> = [
+    ["a run of [ with no ]", "[".repeat(N), 0],
+    ["a run of [ before one ]", `${"[".repeat(N)}]`, 0],
+    ["a run of [ before ]]", `${"[".repeat(N)}]]`, 1],
+    ["[[ and one ] again and again", fill("[[a]"), 0],
+    ["links one after another", fill("[[a]]"), N / 5],
+  ];
+  for (const [label, body, links] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * body.length;
+      const { value, work } = scanWork(most, () => wikilinkInners(body));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(body.length);
+      expect(value?.length).toBe(links);
+    });
+  }
 });
