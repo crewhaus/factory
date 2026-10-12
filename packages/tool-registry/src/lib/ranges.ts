@@ -181,7 +181,7 @@ function translatePep440(spec: string): RangeTranslation {
   if (parts.length === 0) return { ok: false, reason: "the specifier is empty" };
   const out: string[] = [];
   for (const part of parts) {
-    const m = PEP440_CLAUSE.exec(part);
+    const m = operatorAndRest(part, PEP440_OPERATORS);
     if (m === null) {
       // Name the likely cause rather than only the symptom: a caret, a tilde
       // or a bare version here is almost always a Poetry constraint that
@@ -195,8 +195,8 @@ function translatePep440(spec: string): RangeTranslation {
           : `"${part}" is not a PEP 440 version specifier`,
       };
     }
-    const op = m[1] as string;
-    const version = (m[2] as string).trim();
+    const op = m.op;
+    const version = m.rest.trim();
     if (op === "!=" || op === "===") {
       return {
         ok: false,
@@ -247,7 +247,62 @@ function translatePep440(spec: string): RangeTranslation {
   return { ok: true, range: out.join(" ") };
 }
 
-const PEP440_CLAUSE = /^(===|==|!=|<=|>=|~=|<|>)\s*(.+)$/;
+/** PEP 440's comparison operators, longest first where one starts another. */
+export const PEP440_OPERATORS: readonly string[] = ["===", "==", "!=", "<=", ">=", "~=", "<", ">"];
+
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** A code unit `.` does not match without the `s` flag. */
+function isLineBreak(c: number): boolean {
+  return c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+}
+
+/**
+ * The first of `operators` that starts `part` and what follows it and its
+ * whitespace: what `/^(op|op|…)\s*(.+)$/` captured, read in one pass. The
+ * whitespace is taken whole and the rest must hold no line break (`.` stops
+ * at \n, \r, U+2028 and U+2029); with nothing after the whitespace, the
+ * pattern took its last character, unless that is a line break. When an
+ * operator leaves no such rest the next is tried, as the alternation did, so
+ * `===` alone reads as `==` with the version `=`. The pattern tried every
+ * shorter run of whitespace and rescanned the rest from each, so a run before
+ * a stray \r or U+2028 in a manifest's spec was quadratic in its length.
+ */
+export function operatorAndRest(
+  part: string,
+  operators: readonly string[],
+): { op: string; rest: string } | null {
+  for (const op of operators) {
+    if (!part.startsWith(op)) continue;
+    let at = op.length;
+    while (at < part.length && isRegExpSpace(part.charCodeAt(at))) at++;
+    if (at === part.length) {
+      if (at > op.length && !isLineBreak(part.charCodeAt(at - 1))) {
+        return { op, rest: part.charAt(at - 1) };
+      }
+      continue;
+    }
+    let broken = false;
+    for (let i = at; i < part.length && !broken; i++) broken = isLineBreak(part.charCodeAt(i));
+    if (!broken) return { op, rest: part.slice(at) };
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Poetry
@@ -259,6 +314,20 @@ const PEP440_CLAUSE = /^(===|==|!=|<=|>=|~=|<|>)\s*(.+)$/;
  * thing, but `^0.2` and `^0` do not, and neither does `~1` against `~1.0`.
  */
 const POETRY_VERSION = /^v?(\d+(?:\.\d+)*)((?:[-+][0-9A-Za-z.-]+)?)$/;
+
+/** Poetry's operators, in the order its reader tries them. */
+export const POETRY_OPERATORS: readonly string[] = [
+  "^",
+  "~=",
+  "~",
+  ">=",
+  "<=",
+  "==",
+  "=",
+  "!=",
+  "<",
+  ">",
+];
 
 function poetrySegments(version: string): number[] | undefined {
   const m = POETRY_VERSION.exec(version);
@@ -293,9 +362,9 @@ function poetryClause(part: string): RangeTranslation {
   const wildcard = /^v?(\d+(?:\.\d+)?)\.\*$/.exec(part);
   if (wildcard !== null) return { ok: true, range: `${wildcard[1]}.x` };
 
-  const operator = /^(\^|~=|~|>=|<=|==|=|!=|<|>)\s*(.+)$/.exec(part);
-  const op = operator === null ? "" : (operator[1] as string);
-  const version = (operator === null ? part : (operator[2] as string)).trim();
+  const operator = operatorAndRest(part, POETRY_OPERATORS);
+  const op = operator === null ? "" : operator.op;
+  const version = (operator === null ? part : operator.rest).trim();
 
   if (op === "!=") {
     return {
