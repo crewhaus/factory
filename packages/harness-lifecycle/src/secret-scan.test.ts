@@ -5,6 +5,7 @@
  * a text with a long run must not have those patterns run over it.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import {
   KNOWLEDGE_SECRET_DETECTORS,
   looksLikeSecret,
@@ -216,7 +217,8 @@ describe("each scan answers what its pattern answers", () => {
 });
 
 // Counted, not timed: the three patterns are refused if they run over the
-// run; the other detectors run as usual and read it in linear time.
+// run; the other detectors run as usual. The scans' own reads are counted
+// below.
 describe("a memory with a long run", () => {
   test("is masked and checked without those patterns over the run", () => {
     const units = ["a-", "eyJ-", "-----BEGIN X-----\n"];
@@ -236,4 +238,45 @@ describe("a memory with a long run", () => {
       expect(checked.outcome).toBe(false);
     }
   }, 20_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a
+// search that resumes one character on instead of after the run it read), so
+// each scan's own reads are counted (__test__/scan-work.ts) over runs shaped
+// to make it rescan, and held to a few per character. A rescan reads the rest
+// of the run from every place in it and stops at the bound at once.
+describe("each scan reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["BEGIN lines with no END line", pemBlockMatches, fill("-----BEGIN X-----\n")],
+    ["a BEGIN line whose name never ends", pemBlockMatches, `-----BEGIN ${"a".repeat(N)}`],
+    [
+      "a BEGIN line and END lines with no dashes",
+      pemBlockMatches,
+      `-----BEGIN X-----\n${fill("-----END x\n")}`,
+    ],
+    ["a run of eyJ-", jwtMatches, fill("eyJ-")],
+    ["first segments with no second", jwtMatches, fill("eyJaaaaaaaaaaa.")],
+    ["two segments with no third", jwtMatches, fill("eyJaaaaaaaaaaa.bbbbbbbbbbb.")],
+    [
+      "three segments that run into the next",
+      jwtMatches,
+      fill("eyJaaaaaaaaaaa.bbbbbbbbbbb.ccccccccccc-"),
+    ],
+    ["a run of a- with no digit", hasHighEntropyToken, fill("a-")],
+    ["a run of -a1 with no word boundary far enough in", hasHighEntropyToken, fill("-a1")],
+    ["a run of dashes", hasHighEntropyToken, fill("-")],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });
