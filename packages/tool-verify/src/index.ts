@@ -44,6 +44,7 @@ import {
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
 import { integrityLimits, integrityWalk } from "./integrity";
+import { digestLine } from "./lib/digest-line";
 import {
   citationDefinitions,
   citedClaims,
@@ -715,9 +716,9 @@ export const checksumVerify: RegisteredTool = buildTool({
         if (entry !== undefined) expected.set(manifestKey(entry.rel), entry.signature);
         continue;
       }
-      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(trimmed);
-      if (m === null) continue;
-      expected.set(manifestKey((m[2] as string).trim()), (m[1] as string).toLowerCase());
+      const entry = digestLine(trimmed);
+      if (entry === null) continue;
+      expected.set(manifestKey(entry.path.trim()), entry.digest.toLowerCase());
     }
 
     const mismatched: string[] = [];
