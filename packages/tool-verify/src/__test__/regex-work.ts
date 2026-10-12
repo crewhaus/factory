@@ -32,8 +32,8 @@
  * lone surrogate under `u`), the agreement check throws rather than count
  * something else.
  *
- * The same file is in tool-text, tool-verify, prompt-injection-detector and
- * tool-docs; keep the copies in step.
+ * The same file is in prompt-injection-detector, tool-code, tool-docs,
+ * tool-text and tool-verify; keep the copies in step.
  */
 
 type K = (j: number) => boolean;

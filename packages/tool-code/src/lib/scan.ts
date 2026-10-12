@@ -544,11 +544,16 @@ export type ImportRecord = {
  * whitespace (or is empty): the shortest clause the old `[^;'"]*?` found was
  * always such a one, because `\s*` takes any whitespace after it, and trying
  * `\s*from` only there reads a run of spaces inside the clause once rather
- * than once per space. It is tried where an `import` starts (see
- * importFailedTo).
+ * than once per space. The whitespace after `import` and after `type` is
+ * taken whole (`(?!\s)`): a shorter take leaves the clause to start with
+ * the rest of the run, which matches only where the whole take does, and
+ * trying each one rescanned the run from each. The closing quote is written
+ * out for each opening one rather than as a back-reference, which matches
+ * the same text and lets a test count the pattern's steps. It is tried where
+ * an `import` starts (see importFailedTo).
  */
 export const STATIC_IMPORT_RE =
-  /\bimport\s+(?<type>type\s+)?(?<clause>(?:[^;'"]*?[^;'"\s])??)\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+  /\bimport\s+(?!\s)(?<type>type\s+(?!\s))?(?<clause>(?:[^;'"]*?[^;'"\s])??)\s*from\s*(?:(?<q>")(?<spec>[^'"\n]*)"|(?<q>')(?<spec>[^'"\n]*)')/g;
 const BARE_IMPORT_RE = /\bimport\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 export const EXPORT_FROM_RE =
   /\bexport\s+(?<type>type\s+)?(?<clause>\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
