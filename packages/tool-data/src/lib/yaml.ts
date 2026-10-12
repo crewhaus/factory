@@ -82,7 +82,11 @@ function tokenize(text: string): Line[] {
       throw new YamlError("tab characters cannot be used for indentation", lineNo);
     }
     const indent = indentMatch[0].length;
-    const content = original.slice(indent).replace(/\s+$/, "");
+    // trimEnd drops exactly what `.replace(/\s+$/, "")` did. That call was
+    // linear only because JSC turns that exact spelling into a trim; the same
+    // pattern run as a pattern (exec, test, a /g flag) rescans a run of spaces
+    // inside the line from each start in it, quadratic in the run's length.
+    const content = original.slice(indent).trimEnd();
     if (content.startsWith("#")) return;
     if (content === "---") return;
     if (content === "...") return;
@@ -296,8 +300,20 @@ function readBlockScalar(
   } else {
     out = body.join("\n");
   }
-  if (header.chomp === "strip") return out.replace(/\n+$/, "");
+  if (header.chomp === "strip") return withoutTrailingNewlines(out);
   return `${out}\n`;
+}
+
+/**
+ * `text` without its trailing newlines: what `text.replace(/\n+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of newlines that is not at the end (blank lines inside a block
+ * scalar) and rescans the rest of the run from each, quadratic in its length.
+ */
+export function withoutTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return end === text.length ? text : text.slice(0, end);
 }
 
 /** Remove a trailing ` # comment`, respecting quotes. */
