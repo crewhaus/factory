@@ -164,7 +164,11 @@ function resolveLocation(target: string, depth = 0): string {
     const link = readlinkSync(probe);
     real = resolveLocation(path.resolve(realpathSync(path.dirname(probe)), link), depth + 1);
   }
-  return tail.length > 0 ? path.join(real, ...tail) : real;
+  // One string, not one argument per name: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments, so 65,536 missing names
+  // would give back `real` alone — a path the tool, whose own walk has one
+  // name more, does not act on.
+  return tail.length > 0 ? path.join(real, tail.join(path.sep)) : real;
 }
 
 /** Two paths that are the same directory entry: same device, same inode. */

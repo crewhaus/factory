@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PermissionRule, emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
+import { resolveContained } from "@crewhaus/tool-safety/fs";
 import { canonicalWorkspacePath, workspacePathCanonicalizer } from "./path-canonical";
 
 let ws: string;
@@ -316,4 +317,67 @@ describe("a name spelled another way the filesystem treats as the same", () => {
     expect(decide("Read", nfd, ...guard)).toBe("deny");
     if (existsSync(path.join(ws, nfd))) expect(values(nfd)[0]?.canonical[0]).toBe(nfc);
   });
+});
+
+/**
+ * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
+ * its arguments. The names below the deepest existing ancestor were joined
+ * one argument apiece, so a path 65,536 names below an existing file came
+ * back as its leaf alone, at the workspace root: an allow rule for that one
+ * root-level name let the call through, while a tool, whose own walk has one
+ * name more, acted on the file itself. (Deny and ask still fired, on the
+ * spellings.) The three sizes straddle the boundary for both walks.
+ *
+ * Each size is one walk over 131 KB of path, so each test declares a budget
+ * (house rule); nothing here is timed.
+ */
+describe("a path 65,535 to 65,537 names below an existing file", () => {
+  const deep = (n: number) => `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
+  // A failure prints this, not two 131 KB strings.
+  const brief = (s: string | undefined) =>
+    s === undefined ? undefined : { length: s.length, head: s.slice(0, 20), end: s.slice(-12) };
+
+  for (const n of [65_535, 65_536, 65_537]) {
+    test(`${n} names: the canonical path is the whole path, and an allow for "a" does not cover it`, () => {
+      mkdirSync(path.join(ws, "secrets"));
+      writeFileSync(path.join(ws, "secrets", "prod.db"), "db");
+      const raw = deep(n);
+      const cwd = process.cwd();
+      let got: ReturnType<typeof values>;
+      try {
+        // As the runtime runs it: from the workspace, with the default root.
+        process.chdir(ws);
+        got = workspacePathCanonicalizer()(raw);
+      } finally {
+        process.chdir(cwd);
+      }
+      expect(got).toHaveLength(1);
+      const [v] = got;
+      expect(v?.outsideWorkspace).toBeUndefined();
+      expect(brief(v?.canonical[0])).toEqual(brief(raw));
+      expect(v?.canonical[0] === raw).toBe(true);
+      expect(v?.canonical[2] === `${ws}/${raw}`).toBe(true);
+      // The same place the file tools act on: tool-fs resolves through
+      // tool-safety, whose walk is not the gate's.
+      const tool = resolveContained(ws, raw, { followLeaf: false });
+      expect("real" in tool && tool.real === v?.canonical[2]).toBe(true);
+
+      const decide = (pattern: string) =>
+        evaluate(
+          {
+            toolName: "WriteLike",
+            input: { path: raw },
+            operativeValues: got,
+            readOnly: false,
+            destructive: true,
+          },
+          "default",
+          { ...emptyRuleSet, yaml: [{ type: "alwaysAllow", pattern, source: "yaml" }] },
+        );
+      expect(decide("WriteLike(a)")).toBe("ask");
+      expect(decide("WriteLike(secrets/prod.db)")).toBe("ask");
+      // Control: an allow that does cover where it lands still allows.
+      expect(decide("WriteLike(secrets/**)")).toBe("allow");
+    }, 120_000);
+  }
 });
