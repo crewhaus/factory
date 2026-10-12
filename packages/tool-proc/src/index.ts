@@ -916,6 +916,13 @@ export const waitForOutput: RegisteredTool = buildTool({
     const startedAt = Date.now();
     const deadline = startedAt + input.timeoutMs;
 
+    // Whether a look is the last one is decided BEFORE it is taken. The
+    // exit, and the pipes' last bytes, can land while a match is running in
+    // the worker, so a process seen finished only afterwards gets one more
+    // look. And it has finished only when its pipes have ended too: the exit
+    // can reach the parent before the line printed just ahead of it, and a
+    // process it started can still hold the pipes and print.
+    const finished = (): boolean => bg.status !== "running" && bg.outputEnded;
     const haystack = (): string =>
       which === "stdout"
         ? bg.stdout
@@ -968,6 +975,7 @@ export const waitForOutput: RegisteredTool = buildTool({
 
     try {
       for (;;) {
+        const last = finished();
         const text = haystack();
         if (input.failurePattern !== undefined) {
           const failed = await firstMatch(input.failurePattern, text);
@@ -996,9 +1004,9 @@ export const waitForOutput: RegisteredTool = buildTool({
             waitedMs: Date.now() - startedAt,
           });
         }
-        // A process that has exited will never produce the line; one last look
-        // has already happened above, so stop instead of burning the deadline.
-        if (bg.status !== "running") {
+        // A process that had finished before this look will never produce the
+        // line, so stop instead of burning the deadline.
+        if (last) {
           return json({
             matched: false,
             id: bg.id,

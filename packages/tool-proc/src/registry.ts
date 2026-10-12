@@ -35,6 +35,13 @@ export type BgProc = {
   stdoutReturned: number;
   stderrReturned: number;
   status: BgStatus;
+  /**
+   * Both pipes have reached their end, so `stdout` and `stderr` hold all the
+   * process will ever print. This can lag `status`: the exit and the pipes'
+   * last bytes reach the parent as separate events, and a process it started
+   * that shares the pipes can keep them open after it is gone.
+   */
+  outputEnded: boolean;
   exitCode: number | null;
   readonly startedAt: number;
   exitedAt: number | null;
@@ -151,6 +158,7 @@ export function startBackground(
     stdoutReturned: 0,
     stderrReturned: 0,
     status: "running",
+    outputEnded: false,
     exitCode: null,
     startedAt: Date.now(),
     exitedAt: null,
@@ -158,8 +166,12 @@ export function startBackground(
   };
   procs.set(id, bg);
   // Fire and forget: the tool returns while the process keeps running.
-  void pump(spawned.stdout as ReadableStream<Uint8Array>, (t) => append(bg, "stdout", t));
-  void pump(spawned.stderr as ReadableStream<Uint8Array>, (t) => append(bg, "stderr", t));
+  void Promise.all([
+    pump(spawned.stdout as ReadableStream<Uint8Array>, (t) => append(bg, "stdout", t)),
+    pump(spawned.stderr as ReadableStream<Uint8Array>, (t) => append(bg, "stderr", t)),
+  ]).then(() => {
+    bg.outputEnded = true;
+  });
   void spawned.exited.then((code) => {
     if (bg.status === "running") bg.status = "exited";
     bg.exitCode = code;

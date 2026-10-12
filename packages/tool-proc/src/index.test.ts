@@ -48,6 +48,7 @@ import {
 } from "./index";
 import { unspecifiedDial } from "./lib/addr";
 import { _setPlatform, searchPath } from "./lib/which";
+import { getProc } from "./registry";
 
 let originalCwd: string;
 let tmp: string;
@@ -313,13 +314,16 @@ type HeldWait<T> = {
  * anyway and every held timer fires, so a broken wait fails on the
  * assertions after it instead of hanging with the clocks held. It counts the
  * matches asked of the worker and the timers it held, so a test can show
- * that every match's deadline was held. Every spy is restored before this
- * returns.
+ * that every match's deadline was held. With `beforeMatch`, a match is sent
+ * to the worker only once the promise it returns for that match (counted
+ * from 1) settles: the wait has taken that look, and has no answer yet.
+ * Every spy is restored before this returns.
  */
 async function withWaitClocksHeld<T>(
   options: {
     readonly matchDeadlines: readonly number[];
     readonly deadlinePassesAfter?: { readonly sleeps: number; readonly interval: number };
+    readonly beforeMatch?: (run: number) => Promise<void> | undefined;
   },
   body: () => Promise<T>,
 ): Promise<HeldWait<T>> {
@@ -336,10 +340,28 @@ async function withWaitClocksHeld<T>(
   class CountingWorker extends RealWorker {
     override postMessage(
       message: unknown,
-      options?: Bun.StructuredSerializeOptions | Bun.Transferable[],
+      transfer?: Bun.StructuredSerializeOptions | Bun.Transferable[],
     ): void {
-      if ((message as { op?: unknown } | null)?.op === "matchAll") counted.runs += 1;
-      super.postMessage(message, options as Bun.StructuredSerializeOptions);
+      const send = (): void => {
+        super.postMessage(message, transfer as Bun.StructuredSerializeOptions);
+      };
+      if ((message as { op?: unknown } | null)?.op !== "matchAll") {
+        send();
+        return;
+      }
+      counted.runs += 1;
+      const hold = options.beforeMatch?.(counted.runs);
+      if (hold === undefined) {
+        send();
+        return;
+      }
+      void hold.then(() => {
+        try {
+          send();
+        } catch {
+          // The worker was stopped meanwhile; the wait has its answer.
+        }
+      });
     }
   }
   const valve = realSetTimeout(() => {
@@ -1150,10 +1172,10 @@ describe("background processes", () => {
 
   test("a finished process keeps its output until it is reaped", async () => {
     const started = await call(processStart, { argv: ["echo", "done"] });
-    await waitDefinitely({ id: started.id, pattern: "done", timeoutMs: 3_000 });
-    // The line can arrive before the exit is seen, and a poll 100 ms later
-    // only usually saw both. A wait for a line it never prints ends when the
-    // registry has seen it exit.
+    const saw = await waitDefinitely({ id: started.id, pattern: "done", timeoutMs: 3_000 });
+    expect(saw.matched).toBe(true);
+    // A wait for a line it never prints ends once the process has exited and
+    // its output has ended, so the status below is the exit's.
     const finished = await waitDefinitely({
       id: started.id,
       pattern: "never-printed",
@@ -1370,13 +1392,163 @@ describe("WaitForOutput", () => {
     expect(out.reason).toBe("process finished without matching");
   }, 20_000);
 
+  testScript(
+    "a line printed while a look was being matched is found by the next look, not reported missing",
+    async () => {
+      // The wait takes a look before the line exists, and the worker's answer
+      // to it is held until the process has printed the line and exited. So
+      // the exit is seen only after that look, for certain. A wait that took
+      // that exit as the end answered "process finished without matching"
+      // for a line the process did print.
+      const gate = join(tmp, "print-now");
+      const path = script(
+        "last-words.sh",
+        `while [ ! -f "${gate}" ]; do sleep 0.01; done\necho ready`,
+      );
+      const started = await call(processStart, { argv: [path] });
+      const bg = getProc(started.id);
+      if (bg === undefined) throw new Error(`${started.id} is not registered`);
+      const printedAndExited = async (): Promise<void> => {
+        writeFileSync(gate, "");
+        await bg.proc.exited;
+        while (!bg.stdout.includes("ready")) await new Promise((r) => setImmediate(r));
+      };
+      const { result, runs, held, valveFired } = await withWaitClocksHeld(
+        {
+          matchDeadlines: [MATCH_DEADLINE_MS],
+          beforeMatch: (run) => (run === 1 ? printedAndExited() : undefined),
+        },
+        () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+      );
+      expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
+        matched: true,
+        match: "ready",
+        status: "exited",
+      });
+      // The held look, then the one that found the line.
+      expect({ runs, held, valveFired }).toEqual({ runs: 2, held: 2, valveFired: false });
+    },
+    20_000,
+  );
+
+  for (const stream of ["stdout", "stderr"] as const) {
+    test(`a line still in the ${stream} pipe when the exit is seen is matched: the wait reads the output to its end`, async () => {
+      // The exit and a pipe's last bytes reach the parent as separate events,
+      // in either order. Here what the child printed on this stream is held
+      // back until the wait has taken two looks at the exited process, so the
+      // exit comes first, for certain. A wait that took the exit alone as the
+      // end answered "process finished without matching" for a line already
+      // in the pipe.
+      let release = (): void => {};
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const realSpawn = Bun.spawn.bind(Bun);
+      const spawned = spyOn(Bun, "spawn").mockImplementation(((
+        ...args: Parameters<typeof Bun.spawn>
+      ) => {
+        const proc = realSpawn(...args);
+        const source = proc[stream];
+        if (!(source instanceof ReadableStream)) return proc;
+        const reader = (source as ReadableStream<Uint8Array>).getReader();
+        const heldBack = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            await released;
+            const next = await reader.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          },
+          cancel: (reason) => reader.cancel(reason),
+        });
+        Object.defineProperty(proc, stream, { value: heldBack });
+        return proc;
+      }) as typeof Bun.spawn);
+      let started: { id: string };
+      try {
+        started = await call(processStart, {
+          argv: ["sh", "-c", stream === "stdout" ? "echo ready" : "echo ready >&2"],
+        });
+      } finally {
+        spawned.mockRestore();
+      }
+      try {
+        const bg = getProc(started.id);
+        if (bg === undefined) throw new Error(`${started.id} is not registered`);
+        await bg.proc.exited;
+        expect({ status: bg.status, output: bg[stream] }).toEqual({ status: "exited", output: "" });
+        const { result, runs, held, valveFired } = await withWaitClocksHeld(
+          {
+            matchDeadlines: [MATCH_DEADLINE_MS],
+            beforeMatch: (run) => {
+              if (run === 2) release();
+              return undefined;
+            },
+          },
+          () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+        );
+        expect({ matched: result.matched, match: result.match, reason: result.reason }).toEqual({
+          matched: true,
+          match: "ready",
+          reason: undefined,
+        });
+        // Two looks at an exited process with the line still held back, then
+        // the line.
+        expect(runs).toBeGreaterThanOrEqual(3);
+        expect({ held: held === runs, valveFired }).toEqual({ held: true, valveFired: false });
+      } finally {
+        release();
+      }
+    }, 20_000);
+  }
+
+  testScript(
+    "a process that exits while one it started still holds its output is watched on, not reported finished",
+    async () => {
+      // `sh` exits at once; the subshell it started keeps the pipes and prints
+      // the line once the test lets it, after the wait has looked at the exited
+      // shell. The line can still come, so "process finished without
+      // matching" would be a wrong answer. The subshell also stops when the
+      // workspace is gone, so a failed run leaves nothing behind.
+      const gate = join(tmp, "print-now");
+      const started = await call(processStart, {
+        argv: [
+          "sh",
+          "-c",
+          `( while [ ! -f "${gate}" ] && [ -d "${tmp}" ]; do sleep 0.01; done; echo ready ) & echo shell done`,
+        ],
+      });
+      const bg = getProc(started.id);
+      if (bg === undefined) throw new Error(`${started.id} is not registered`);
+      try {
+        await bg.proc.exited;
+        const { result, runs, held, valveFired } = await withWaitClocksHeld(
+          {
+            matchDeadlines: [MATCH_DEADLINE_MS],
+            beforeMatch: (run) => {
+              if (run === 2) writeFileSync(gate, "");
+              return undefined;
+            },
+          },
+          () => call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }),
+        );
+        expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
+          matched: true,
+          match: "ready",
+          status: "exited",
+        });
+        expect(runs).toBeGreaterThanOrEqual(3);
+        expect({ held: held === runs, valveFired }).toEqual({ held: true, valveFired: false });
+        // The subshell has printed and gone, so its pipes end.
+        while (!bg.outputEnded) await new Promise((r) => setImmediate(r));
+      } finally {
+        writeFileSync(gate, "");
+      }
+    },
+    20_000,
+  );
+
   test("watching does not consume: ProcessOutput still returns everything", async () => {
-    // A process that stays alive, so the wait ends on the line it watched
-    // for. `echo` exits at once, and a wait that sees the exit before it has
-    // looked at the line answers "process finished without matching".
-    const started = await call(processStart, {
-      argv: [process.execPath, "-e", 'console.log("hello world"); setTimeout(() => {}, 30_000);'],
-    });
+    const started = await call(processStart, { argv: ["echo", "hello world"] });
     const saw = await waitDefinitely({ id: started.id, pattern: "hello", timeoutMs: 3_000 });
     expect(saw.matched).toBe(true);
     const polled = await call(processOutput, { id: started.id });
