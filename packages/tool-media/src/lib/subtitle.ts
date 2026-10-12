@@ -45,7 +45,18 @@ export type ParseResult = {
   readonly skipped: ReadonlyArray<{ block: number; reason: string }>;
 };
 
-const TIMING = /^(.*?)-->(.*?)$/;
+/**
+ * A timing line: the text before its first `-->`, the arrow, then the rest.
+ * `.` stops at a line break, so a line that holds one is not a timing line;
+ * `\r\n` folding leaves U+2028 and U+2029 inside a line.
+ *
+ * This was `/^(.*?)-->(.*?)$/`, which splits the same way. Its lazy start
+ * tried every `-->` on the line and ran from each to the break that `$`
+ * cannot pass: quadratic in a line of arrows. The start now takes only
+ * characters before the first `-->`, so a failed try gives each back in a
+ * step.
+ */
+export const TIMING = /^((?:(?!-->).)*)-->(.*)$/;
 const TIMESTAMP = /^(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})$/;
 
 /** `HH:MM:SS,mmm`, `MM:SS.mmm` and the other legal spellings, to millis. */
