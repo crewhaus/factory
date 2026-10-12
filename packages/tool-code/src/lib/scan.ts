@@ -33,6 +33,7 @@
  */
 import { screenUserRegex } from "@crewhaus/tool-safety/regex";
 import { isRegExpSpace } from "./regexp-space";
+import { matchAllSkipping, wordAt } from "./skip-scan";
 
 /** Character classification produced by `maskSource`. */
 export const KIND_CODE = 0;
@@ -529,13 +530,107 @@ export type ImportRecord = {
   readonly names: readonly string[];
 };
 
-const STATIC_IMPORT_RE =
-  /\bimport\s+(?<type>type\s+)?(?<clause>[^;'"]*?)\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+/**
+ * `import … from "…"`. The clause is lazy and ends on a character that is not
+ * whitespace (or is empty): the shortest clause the old `[^;'"]*?` found was
+ * always such a one, because `\s*` takes any whitespace after it, and trying
+ * `\s*from` only there reads a run of spaces inside the clause once rather
+ * than once per space. It is tried where an `import` starts (see
+ * importFailedTo).
+ */
+export const STATIC_IMPORT_RE =
+  /\bimport\s+(?<type>type\s+)?(?<clause>(?:[^;'"]*?[^;'"\s])??)\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 const BARE_IMPORT_RE = /\bimport\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
-const EXPORT_FROM_RE =
+export const EXPORT_FROM_RE =
   /\bexport\s+(?<type>type\s+)?(?<clause>\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+
+/**
+ * After an `import` whose clause was read and found no `from "…"`, every later
+ * `import` before the next `;` or quote would read on to the same place and
+ * fail the same way; a match from one of them would make one from this.
+ */
+function importFailedTo(text: string, at: number): number {
+  if (!text.startsWith("import", at) || !isRegExpSpace(text.charCodeAt(at + 6))) return at + 1;
+  for (let i = at + 6; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x3b || c === 0x27 || c === 0x22) return i;
+  }
+  return text.length;
+}
+
+/**
+ * Where `/export\s+(?:type\s+)?\{/y` would end if it matched at `at`, or -1,
+ * read by hand so a check at every `export` runs no pattern.
+ */
+function exportBraceOpen(text: string, at: number): number {
+  if (!text.startsWith("export", at)) return -1;
+  const spacesFrom = (start: number): number => {
+    let i = start;
+    while (i < text.length && isRegExpSpace(text.charCodeAt(i))) i++;
+    return i;
+  };
+  let i = spacesFrom(at + 6);
+  if (i === at + 6) return -1;
+  if (text.startsWith("type", i)) {
+    const afterType = spacesFrom(i + 4);
+    if (afterType > i + 4 && text.charCodeAt(afterType) === 0x7b) return afterType + 1;
+  }
+  i = text.charCodeAt(i) === 0x7b ? i + 1 : -1;
+  return i;
+}
+
+/**
+ * Where EXPORT_FROM_RE is tried, and what a failed try rules out. After an
+ * `export {` whose list had no `from "…"` after it, every later `export {`
+ * before that list's `}` ends at the same `}` and fails the same way, so it
+ * is not tried; an `export *` there still is. One per scan: it keeps state.
+ */
+function exportFromScan(): {
+  canStart: (text: string, at: number) => boolean;
+  failedTo: (text: string, at: number) => number;
+} {
+  const isExport = wordAt("export");
+  let failedBraceEnd = -1;
+  return {
+    canStart: (text, at) =>
+      isExport(text, at) && !(at < failedBraceEnd && exportBraceOpen(text, at) !== -1),
+    failedTo: (text, at) => {
+      const open = exportBraceOpen(text, at);
+      if (open !== -1) {
+        const close = text.indexOf("}", open);
+        failedBraceEnd = close === -1 ? text.length : close;
+      }
+      return at + 1;
+    },
+  };
+}
 const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 const REQUIRE_RE = /\brequire\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+
+/** STATIC_IMPORT_RE's matches in `code`, tried where an `import` starts. */
+export function staticImportMatches(code: string): Iterable<RegExpExecArray> {
+  return matchAllSkipping(code, STATIC_IMPORT_RE, wordAt("import"), importFailedTo);
+}
+
+/** EXPORT_FROM_RE's matches in `code`, tried where an `export` starts. */
+export function exportFromMatches(code: string): Iterable<RegExpExecArray> {
+  const scan = exportFromScan();
+  return matchAllSkipping(code, EXPORT_FROM_RE, scan.canStart, scan.failedTo);
+}
+
+export const EXPORT_LIST_RE =
+  /\bexport\s+(?<type>type\s+)?\{(?<body>[^}]*)\}(?<tail>\s*from\s*['"][^'"\n]*['"])?/g;
+
+/**
+ * EXPORT_LIST_RE's matches in `code`, tried where an `export` starts. With
+ * its tail optional, a try fails only when no `}` follows its `{`, and then
+ * none follows a later one either.
+ */
+export function exportListMatches(code: string): Iterable<RegExpExecArray> {
+  return matchAllSkipping(code, EXPORT_LIST_RE, wordAt("export"), (text, at) =>
+    exportBraceOpen(text, at) === -1 ? at + 1 : text.length,
+  );
+}
 
 /** A code unit `[\w$]` matches. */
 function isIdentifierUnit(c: number): boolean {
@@ -566,19 +661,31 @@ export function aliasAfterAs(piece: string): string | undefined {
   return isRegExpSpace(piece.charCodeAt(gap - 3)) ? piece.slice(alias) : undefined;
 }
 
+/**
+ * The first `{…}` in `text`: what `/\{([^}]*)\}/.exec(text)` found, with two
+ * searches, the first `{` and the first `}` after it (with none after the
+ * first `{`, none follows a later one). The pattern rescanned a run of `{`
+ * from each one in it.
+ */
+export function firstBraced(text: string): { index: number; body: string } | null {
+  const open = text.indexOf("{");
+  const close = open === -1 ? -1 : text.indexOf("}", open + 1);
+  return close === -1 ? null : { index: open, body: text.slice(open + 1, close) };
+}
+
 function clauseNames(clause: string): string[] {
   const text = clause.trim();
   if (text === "") return [];
   if (text.startsWith("*")) return ["*"];
   const names: string[] = [];
-  const braced = /\{([^}]*)\}/.exec(text);
+  const braced = firstBraced(text);
   const beforeBrace = braced === null ? text : text.slice(0, braced.index);
   const defaultName = beforeBrace.replace(/,/g, " ").trim().split(/\s+/)[0];
   if (defaultName !== undefined && defaultName !== "" && /^[\w$]+$/.test(defaultName)) {
     names.push(defaultName);
   }
   if (braced !== null) {
-    for (const part of (braced[1] as string).split(",")) {
+    for (const part of braced.body.split(",")) {
       const piece = part.replace(/\btype\s+/g, "").trim();
       if (piece === "") continue;
       names.push(aliasAfterAs(piece) ?? (piece.split(/\s+/)[0] as string));
@@ -616,7 +723,7 @@ export function scanImports(src: string): ImportRecord[] {
     out.push({ specifier, line, kind, typeOnly, names });
   };
 
-  for (const m of code.matchAll(STATIC_IMPORT_RE)) {
+  for (const m of staticImportMatches(code)) {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     push(
@@ -628,7 +735,7 @@ export function scanImports(src: string): ImportRecord[] {
       clauseNames(m.groups?.["clause"] ?? ""),
     );
   }
-  for (const m of code.matchAll(EXPORT_FROM_RE)) {
+  for (const m of exportFromMatches(code)) {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     push(
@@ -686,9 +793,7 @@ export function scanExports(src: string): ExportRecord[] {
       });
     }
   }
-  for (const m of code.matchAll(
-    /\bexport\s+(?<type>type\s+)?\{(?<body>[^}]*)\}(?<tail>\s*from\s*['"][^'"\n]*['"])?/g,
-  )) {
+  for (const m of exportListMatches(code)) {
     const line = lineAt(starts, m.index as number);
     const tail = m.groups?.["tail"];
     let from: string | undefined;
