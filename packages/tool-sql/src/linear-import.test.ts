@@ -407,6 +407,28 @@ describe("the import tools read a wide file in one pass", () => {
     );
     expect(run.chars).toBe(0);
     expect(parsed(run.value).inferredTypes).toEqual(["TEXT"]);
+    // Into an INTEGER column the cell is a rejected row, from either tool:
+    // ImportCsv threw the BigInt's RangeError and ImportJson failed with it.
+    const reason = `"${"7".repeat(40)}…" is not an integer`;
+    for (const tool of ["csv", "json"] as const) {
+      const database = `digits-${tool}.db`;
+      const db = new Database(database, { create: true });
+      db.run("CREATE TABLE t (n INTEGER)");
+      db.close();
+      const into =
+        tool === "csv"
+          ? await bigIntCharacters(() =>
+              importCsv.execute({ database, file: "digits.csv", table: "t", dryRun: true }),
+            )
+          : await bigIntCharacters(() =>
+              importJson.execute({ database, records: [{ n: digits }], table: "t" }),
+            );
+      expect(into.chars).toBe(0);
+      expect(parsed(into.value)).toMatchObject({
+        rejected: 1,
+        rejections: [{ row: tool === "csv" ? 2 : 1, reason: expect.stringContaining(reason) }],
+      });
+    }
   }, 20_000);
 
   test("bindParams matches thousands of keys to thousands of names", () => {

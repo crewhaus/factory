@@ -28,7 +28,8 @@ export function looksInteger(raw: string): boolean {
   // enough of them to be in range at all. A cell is whatever the file holds:
   // the engine reads a decimal BigInt with one multiply-add over the whole
   // number per digit, quadratic in the cell, and past 313,592 digits it
-  // throws, which failed the import instead of reading the column as TEXT.
+  // throws, which failed the import instead of reading the column as TEXT,
+  // or rejecting the row when the column is already INTEGER.
   // Twenty or more significant digits are at least 10^19, past 2^63 either
   // way; leading zeros and the sign change nothing.
   const sign = raw.charCodeAt(0) === 0x2d || raw.charCodeAt(0) === 0x2b ? 1 : 0;
