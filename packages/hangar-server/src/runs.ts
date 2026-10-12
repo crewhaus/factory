@@ -45,6 +45,7 @@ import {
 import { REDACTED_VALUE, isCredentialKey } from "@crewhaus/spec-patch";
 import { MAX_JSONL_LINES } from "./constants";
 import { mergedSpawnEnv } from "./env-file";
+import { hasLineBreak } from "./linear-mask";
 import { type TextScrubber, maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 
@@ -131,7 +132,12 @@ export function specCredentialValues(harnessDir: string): Record<string, string>
     return out;
   }
   for (const line of text.split("\n")) {
-    const m = line.match(SPEC_SCALAR_LINE_RE);
+    // A line holding a `\r` or a U+2028 cannot match: `(.*)$` stops at it.
+    // The pattern finds that out only after giving back the run before the
+    // value one character at a time, quadratic in the run, and a model writes
+    // this text too (`crewhaus init`, an optimizer write-back of
+    // `agent.instructions`) while this runs for every response served.
+    const m = hasLineBreak(line) ? null : line.match(SPEC_SCALAR_LINE_RE);
     if (m === null) continue;
     const [, key = "", rawValue = ""] = m;
     const value = unquote(rawValue.trim());

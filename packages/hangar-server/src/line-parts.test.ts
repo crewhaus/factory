@@ -4,6 +4,7 @@
  * a `\r`.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { checkboxParts, headingText } from "./line-parts";
 import { curriculumRungs } from "./memory-ops";
 import { headingTitle } from "./wiki-ops";
@@ -120,7 +121,8 @@ describe("each line reader returns its pattern's captures", () => {
   }, 20_000);
 });
 
-// Counted, not timed: no pattern runs over the run of spaces.
+// Counted, not timed: no pattern runs over the run of spaces. The reads' own
+// reads are counted below.
 describe("CRLF documents with a long run of spaces in a line", () => {
   test("a wiki title and the curriculum rungs are read without a pattern over it", () => {
     const run = " ".repeat(10_000);
@@ -138,4 +140,28 @@ describe("CRLF documents with a long run of spaces in a line", () => {
     // The CRLF lines do not match (`.` stops at the `\r`), as before; the last does.
     expect(rungs.outcome).toEqual([{ done: false, text: "next" }]);
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so each
+// read's own reads are counted (__test__/scan-work.ts) over lines shaped to
+// make it rescan, and held to a few per character. A rescan reads the rest of
+// the run from every place in it and stops at the bound at once.
+describe("each line read takes a long line in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a CRLF heading with a long run of spaces", headingText, `#${" ".repeat(N)}x\r`],
+    ["a CRLF checkbox with a long run of spaces", checkboxParts, `- [ ]${" ".repeat(N)}x\r`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });

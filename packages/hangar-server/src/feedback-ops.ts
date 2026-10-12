@@ -74,6 +74,7 @@ import { jobArg } from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
+import { keyedScalar } from "./spec-lines";
 
 const FEEDBACK_SEGMENTS: readonly string[] = [".crewhaus", "feedback"];
 const WATERMARK_SEGMENTS: readonly string[] = [...FEEDBACK_SEGMENTS, ".distill-state.json"];
@@ -708,12 +709,16 @@ export const adviceApply: M3Handler = (ctx) => {
 // ---------------------------------------------------------------------------
 
 /** Read the spec's `sessionKey:` scalar leniently — a fleet console must
- *  render a spec one schema version ahead of this manager. */
+ *  render a spec one schema version ahead of this manager. The line is read
+ *  by a scan (spec-lines.ts): `/^\s*sessionKey\s*:\s*(.+)$/` was quadratic
+ *  in a run of spaces on a line holding a U+2028. Where that pattern's
+ *  `(.+)` matched only a character of whitespace, the trimmed value is empty
+ *  either way. */
 function sessionKeyOf(specYaml: string): string | null {
   for (const line of specYaml.split("\n")) {
-    const m = line.match(/^\s*sessionKey\s*:\s*(.+)$/);
-    if (m === null) continue;
-    const value = (m[1] ?? "").trim().replace(/^["']|["']$/g, "");
+    const raw = keyedScalar(line, "sessionKey");
+    if (raw === undefined) continue;
+    const value = raw.trim().replace(/^["']|["']$/g, "");
     if (value !== "" && !value.startsWith("#")) return value;
   }
   return null;

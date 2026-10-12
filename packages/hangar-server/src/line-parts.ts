@@ -10,7 +10,7 @@
  */
 
 /** `\s`: ECMAScript WhiteSpace and LineTerminator. */
-const isSpace = (code: number): boolean =>
+export const isSpace = (code: number): boolean =>
   (code >= 0x09 && code <= 0x0d) ||
   code === 0x20 ||
   code === 0xa0 ||
@@ -24,17 +24,18 @@ const isSpace = (code: number): boolean =>
   code === 0xfeff;
 
 /** What `.` does not match. */
-const isLineTerminator = (code: number): boolean =>
+export const isLineTerminator = (code: number): boolean =>
   code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029;
 
-function skipSpace(line: string, from: number): number {
+/** The end of the run of `\s` starting at `from`. */
+export function skipSpace(line: string, from: number): number {
   let at = from;
   while (at < line.length && isSpace(line.charCodeAt(at))) at++;
   return at;
 }
 
 /** Whether `(.*)$` matches `line` from `from`: no line terminator after it. */
-function restIsOneLine(line: string, from: number): boolean {
+export function restIsOneLine(line: string, from: number): boolean {
   for (let at = from; at < line.length; at++) {
     if (isLineTerminator(line.charCodeAt(at))) return false;
   }

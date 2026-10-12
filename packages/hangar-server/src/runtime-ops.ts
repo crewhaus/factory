@@ -76,6 +76,7 @@ import type { M3Context, M3Handler } from "./m3";
 import { jobArg } from "./m3";
 import { isSupervisorRunId } from "./runs";
 import { readSpecYaml } from "./schedulers";
+import { keyedScalar } from "./spec-lines";
 
 /** Job kind for the MCP projection — display key, lock key, and the string
  *  the run ledger's `mcp-server` rows are correlated by. */
@@ -138,13 +139,14 @@ function blockUnder(lines: readonly string[], key: string, atIndent: number): st
   return undefined;
 }
 
-/** The scalar for `key:` inside a block, quotes and trailing comment removed. */
+/** The scalar for `key:` inside a block, quotes and trailing comment removed.
+ *  Read by a scan (spec-lines.ts), not `^\s*key\s*:\s*(.*)$`, which was
+ *  quadratic in a run of spaces on a line holding a U+2028. */
 function scalarIn(block: readonly string[], key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`);
   for (const line of block) {
-    const m = line.match(re);
-    if (m === null) continue;
-    let value = (m[1] ?? "").trim();
+    const raw = keyedScalar(line, key);
+    if (raw === undefined) continue;
+    let value = raw.trim();
     if (value === "" || value.startsWith("#")) continue;
     const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
     if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {

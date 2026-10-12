@@ -28,6 +28,7 @@ import { SAFE_SEGMENT_RE } from "./constants";
 import type { ControlStatusBody, ControlTimerReport } from "./control-client";
 import { maskDeep } from "./mask";
 import { resolveInside } from "./safety";
+import { keyedScalar } from "./spec-lines";
 
 /** The lanes the timeline renders, in display order. */
 export const SCHEDULER_LANES = ["heartbeat", "schedule", "dream", "janitor"] as const;
@@ -83,13 +84,14 @@ function indentOf(line: string): number {
 }
 
 /** The scalar for `key:` inside a block, or undefined. Quotes stripped,
- *  trailing `# comment` dropped. */
+ *  trailing `# comment` dropped.
+ *  Read by a scan (spec-lines.ts), not `^\s*key\s*:\s*(.*)$`, which was
+ *  quadratic in a run of spaces on a line holding a U+2028. */
 function scalarIn(block: readonly string[], key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`);
   for (const line of block) {
-    const m = line.match(re);
-    if (m === null) continue;
-    let value = (m[1] ?? "").trim();
+    const raw = keyedScalar(line, key);
+    if (raw === undefined) continue;
+    let value = raw.trim();
     if (value === "" || value.startsWith("#")) continue;
     const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
     if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {

@@ -73,6 +73,7 @@ import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 import { SCAFFOLDED_WORKFLOWS, scaffoldedWorkflowPath } from "./scaffolded-workflows";
 import { readSpecYaml } from "./schedulers";
+import { keyedScalar } from "./spec-lines";
 
 // ---------------------------------------------------------------------------
 // shared helpers (wiki-ops.ts and watchme-ops.ts import these)
@@ -253,13 +254,14 @@ export function specDeclares(yamlText: string, key: string): boolean {
   return new RegExp(`^${key}\\s*:`, "m").test(yamlText);
 }
 
-/** The scalar for `key:` inside a block. Quotes stripped, `# comment` dropped. */
+/** The scalar for `key:` inside a block. Quotes stripped, `# comment` dropped.
+ *  Read by a scan (spec-lines.ts), not `^\s*key\s*:\s*(.*)$`, which was
+ *  quadratic in a run of spaces on a line holding a U+2028. */
 export function specScalar(block: readonly string[], key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`);
   for (const line of block) {
-    const m = line.match(re);
-    if (m === null) continue;
-    let value = (m[1] ?? "").trim();
+    const raw = keyedScalar(line, key);
+    if (raw === undefined) continue;
+    let value = raw.trim();
     if (value === "" || value.startsWith("#")) continue;
     const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
     if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {
