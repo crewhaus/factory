@@ -198,7 +198,8 @@ annotation fails the suite rather than shipping.
   child yourself so the page cap stays visible.
 - **Crawling.** `RobotsCheck` tells you whether you may fetch a path and what
   `Crawl-delay` the site asked for; it does not pace anything for you, and
-  `LinkCheck` does not discover links.
+  `LinkCheck` does not discover links. A path and query longer than 8 KiB,
+  about the most a web server accepts, is refused rather than evaluated.
 - **Date normalisation in feeds.** Dates come back exactly as the feed wrote
   them, RFC 822 or RFC 3339; guessing a timezone this parser cannot verify
   would be worse than handing the string to `@crewhaus/tool-datetime`.

@@ -69,7 +69,7 @@ import { matchesPredicate, readPath } from "./lib/jsonpath";
 import type { FieldPredicate } from "./lib/jsonpath";
 import { relTarget } from "./lib/link-header";
 import { nextDelayMs } from "./lib/retry";
-import { evaluateRobots, parseRobots } from "./lib/robots";
+import { MAX_ROBOTS_PATH_CHARS, evaluateRobots, parseRobots } from "./lib/robots";
 import { parseSitemap } from "./lib/sitemap";
 import { SseDecoder } from "./lib/sse";
 import type { SseEvent } from "./lib/sse";
@@ -2067,6 +2067,10 @@ export const robotsCheck: RegisteredTool = buildTool({
   execute: async (input, ctx) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
+    const target = `${url.pathname}${url.search}`;
+    if (target.length > MAX_ROBOTS_PATH_CHARS) {
+      return `RobotsCheck refused the URL: its path and query are ${target.length.toLocaleString("en-US")} characters, more than the ${MAX_ROBOTS_PATH_CHARS.toLocaleString("en-US")} it will match robots.txt rules against.`;
+    }
     const cfg = configFor(ctx);
     const robotsUrl = new URL("/robots.txt", url);
     const userAgent = input.userAgent ?? "*";
@@ -2105,7 +2109,6 @@ export const robotsCheck: RegisteredTool = buildTool({
         });
       }
       const file = parseRobots(fetched.text);
-      const target = `${url.pathname}${url.search}`;
       const verdict = evaluateRobots(file, userAgent, target);
       return json({
         allowed: verdict.allowed,

@@ -1,5 +1,5 @@
 /**
- * Two checks that took the product of two inputs, one of them remote.
+ * Three checks that took the product of two inputs, one of them remote.
  *
  *   - HttpWaitFor's `contains` compared every item of a response array with
  *     the predicate's value, and sorted that value's keys again for each
@@ -11,9 +11,13 @@
  *     the list and writes the whole query back into the URL: the parameters
  *     times the query, for every page. The query is worked out in one pass
  *     and written once.
+ *   - RobotsCheck matches every rule of a robots.txt of up to 512 KiB
+ *     against the URL's path and query, and a rule with a `*` searches the
+ *     path. A path and query longer than 8 KiB, about the most a web server
+ *     accepts, is refused before anything is fetched.
  *
- * Both are checked against the code they replaced, restated here, on
- * generated inputs. The work is counted, never timed: `keyWork` counts
+ * The first two are checked against the code they replaced, restated here,
+ * on generated inputs. The work is counted, never timed: `keyWork` counts
  * the keys read and sorted and the callbacks run, and `urlWork` charges each
  * `URLSearchParams` call what the WHATWG URL standard has it do.
  *
@@ -21,8 +25,10 @@
  * does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
+import { robotsCheck } from "./index";
 import { cursorPageUrl } from "./lib/cursor-page";
 import { type FieldPredicate, matchesPredicate, readPath } from "./lib/jsonpath";
+import { MAX_ROBOTS_PATH_CHARS, evaluateRobots, parseRobots } from "./lib/robots";
 
 /** Seeded, so a failure names the same input every run. */
 function rng(start: number): () => number {
@@ -463,4 +469,50 @@ describe("the next cursor page's query is written once", () => {
     expect(differ.slice(0, 3)).toEqual([]);
     expect(Math.min(seen.replaced, seen.appended, seen.collapsed)).toBeGreaterThan(1_000);
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// RobotsCheck.
+
+describe("a robots.txt check is bounded by its path", () => {
+  test("a path and query past the limit is refused before anything is fetched", async () => {
+    // No origin is allow-listed: a refusal that waited for the fetch would
+    // name the allow-list instead.
+    const over = `https://robots.example.test/${"a".repeat(MAX_ROBOTS_PATH_CHARS)}`;
+    expect(await robotsCheck.execute({ url: over })).toBe(
+      "RobotsCheck refused the URL: its path and query are 8,193 characters, more than the 8,192 it will match robots.txt rules against.",
+    );
+    const query = `https://robots.example.test/?q=${"%20".repeat(MAX_ROBOTS_PATH_CHARS)}`;
+    expect(String(await robotsCheck.execute({ url: query }))).toStartWith(
+      "RobotsCheck refused the URL: its path and query are 24,580 characters",
+    );
+    const at = `https://robots.example.test/${"a".repeat(MAX_ROBOTS_PATH_CHARS - 1)}`;
+    // At the limit the check goes on to the fetch, which the allow-list stops.
+    expect(String(await robotsCheck.execute({ url: at }))).toStartWith(
+      'denied: origin "https://robots.example.test" is not in allowed_origins',
+    );
+  });
+
+  test("at the limit, each rule costs at most the path and itself", () => {
+    const measured = [1_000, 2_000].map((count) => {
+      const rules = Array.from({ length: count }, (_, k) => `Disallow: /*z${k}`);
+      const file = parseRobots(`User-agent: *\n${rules.join("\n")}\n`);
+      const path = `/${"a".repeat(MAX_ROBOTS_PATH_CHARS - 1)}`;
+      const searched = { chars: 0 };
+      const real = String.prototype.indexOf;
+      String.prototype.indexOf = function (this: string, needle: string, from?: number) {
+        const at = real.call(this, needle, from);
+        searched.chars += (at === -1 ? this.length : at + needle.length) - (from ?? 0);
+        return at;
+      };
+      try {
+        expect(evaluateRobots(file, "*", path).allowed).toBe(true);
+      } finally {
+        String.prototype.indexOf = real;
+      }
+      expect(searched.chars).toBeLessThanOrEqual(count * (path.length + 16));
+      return searched.chars;
+    });
+    expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
+  });
 });
