@@ -1877,18 +1877,43 @@ describe("a path longer than any path can be is outside to the gate and refused 
       ["AcceptanceCheck", { checks: [{ kind: "fileExists", path: long }] }],
       ["SeoLint", { html: "<html><head><title>t</title></head></html>", corpus: long }],
     ];
-    const wrong: Array<{ tool: string; input: string; said: string | undefined }> = [];
+    const wrong: Array<{ tool: string; input: string; decision?: string; said: string }> = [];
+    // Rows whose own schema stops the value first. The limit is the
+    // platform's, a schema's cap is not: SystemInfo's diskPath stops at 4,096
+    // characters, above the limit on macOS (2,048) and below it on Linux
+    // (8,192), where its path code is never reached. Such a call is refused
+    // before any rule is read (no decision), in the schema's words, which
+    // name a length too. Those rows are listed below, so a cap that starts
+    // hiding a row on this platform is a failure here.
+    const capped: string[] = [];
     for (const [tool, input] of cases) {
+      const parsed = builtin(tool).inputSchema.safeParse(input);
+      const caps = parsed.success
+        ? []
+        : parsed.error.issues.map((i) =>
+            i.code === "too_big" && i.type === "string" && Number(i.maximum) < long.length
+              ? Number(i.maximum)
+              : undefined,
+          );
       const decision = await gate(tool, input, rules(), "bypass");
       const said = lastResult ?? "";
-      if (
-        decision !== "allow" ||
-        !said.includes(why(abs)) ||
-        /outside the|escapes the/.test(said)
-      ) {
-        wrong.push({ tool, input: Object.keys(input).join(","), said: said.slice(0, 160) });
+      const named =
+        caps.length === 0
+          ? said.includes(why(abs))
+          : caps.every((max) => max !== undefined && said.includes(`at most ${max} character`));
+      const decided = caps.length === 0 ? decision === "allow" : decision === undefined;
+      if (!decided || !named || /outside the|escapes the/.test(said)) {
+        const keys = Object.keys(input).join(",");
+        wrong.push({
+          tool,
+          input: keys,
+          ...(decision ? { decision } : {}),
+          said: said.slice(0, 160),
+        });
       }
+      if (caps.length > 0) capped.push(tool);
     }
     expect(wrong).toEqual([]);
+    expect(capped).toEqual(long.length > 4_096 ? ["SystemInfo"] : []);
   }, 120_000);
 });
