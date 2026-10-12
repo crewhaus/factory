@@ -20,6 +20,7 @@
  * like a call, and no amount of regex fixes that without the whole file.
  */
 import type { ParsedDiff, ParsedDiffFile } from "@crewhaus/tool-text";
+import { onlyCommentOpener } from "./scan-text";
 
 export type Severity = "error" | "warning";
 
@@ -365,7 +366,7 @@ export function todoBody(text: string, lang: Lang): string | undefined {
   const marker = TODO_MARKER.exec(text);
   if (marker === null || !inComment(comment, marker.index)) return undefined;
   const between = text.slice(comment ?? 0, marker.index);
-  if (!/^(?:\/\/+|\/\*+|#+|\*+|--|<!--)?[\s\-*>]*$/.test(between)) return undefined;
+  if (!onlyCommentOpener(between)) return undefined;
   return text.slice(marker.index).replace(/\*\/\s*$/, "");
 }
 

@@ -24,6 +24,8 @@
  *     wrong document, not as thirty findings (see `checkRefs`).
  */
 
+import { beforeAs, fenceOpening } from "./scan-text";
+
 /** How a reference was written, which is how much it is trusted. */
 export type Evidence = "import" | "backtick";
 
@@ -216,7 +218,7 @@ function importedNames(line: string, localPrefixes: ReadonlyArray<string>): stri
       if (cleaned === "") continue;
       // `a as b`: `a` is the name that has to exist in the source; `b` is a
       // local alias the document invented and nothing can check.
-      const name = (cleaned.split(/\s+as\s+/)[0] as string).trim();
+      const name = beforeAs(cleaned).trim();
       if (IDENT.test(name)) out.push(name);
     }
   }
@@ -253,13 +255,13 @@ export function extractDocRefs(text: string, doc: string, options: ExtractOption
   for (let i = 0; i < lines.length; i++) {
     const raw = (lines[i] as string).replace(/\r$/, "");
     const context = raw.trim().slice(0, MAX_CONTEXT_CHARS);
-    const fenceMatch = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(raw);
+    const fenceMatch = fenceOpening(raw);
     if (fenceMatch !== null) {
-      const marker = fenceMatch[1] as string;
+      const marker = fenceMatch.marker;
       if (!fence.open) {
         fence.open = true;
         fence.marker = marker[0] as string;
-        fence.info = (fenceMatch[2] ?? "").trim();
+        fence.info = fenceMatch.info.trim();
       } else if (marker.startsWith(fence.marker)) {
         // A closing fence must use the same character; a ``` inside a ~~~
         // block is content, not the end of the block.
