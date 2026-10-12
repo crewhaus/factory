@@ -1108,6 +1108,27 @@ function recordBuiltin(
   }
 }
 
+/**
+ * `name` cut at its first `[` that has no line break after it: what
+ * `name.replace(/\[.*$/, "")` returned (`.` stops at \n, \r, U+2028 and
+ * U+2029), found with two scans instead. That pattern tries every `[` and,
+ * where a line break follows, rescans up to it before giving the start up,
+ * so a run of `[` before a quoted line break was quadratic in the run's
+ * length, and the command is the model's.
+ */
+export function beforeSubscript(name: string): string {
+  let lastBreak = -1;
+  for (let i = name.length - 1; i >= 0; i--) {
+    const c = name.charCodeAt(i);
+    if (c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029) {
+      lastBreak = i;
+      break;
+    }
+  }
+  const open = name.indexOf("[", lastBreak + 1);
+  return open === -1 ? name : name.slice(0, open);
+}
+
 /** Record `name=value` (its unquoted value): plain text, or `null` when it cannot be read. */
 function recordAssignment(
   name: string,
@@ -1120,7 +1141,7 @@ function recordAssignment(
     known.set(name.slice(0, -1), null);
     return;
   }
-  const bare = name.replace(/\[.*$/, "");
+  const bare = beforeSubscript(name);
   if (substituted || PARAMETER_OPERATION.test(value)) {
     known.set(bare, null);
     return;

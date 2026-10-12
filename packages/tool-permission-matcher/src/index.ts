@@ -1,5 +1,6 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { type ShellChain, readShellChain, shellRestrictReading } from "./shell";
+import { withoutTrailingDots } from "./trim";
 
 export class PatternParseError extends CrewhausError {
   override readonly name = "PatternParseError";
@@ -1147,7 +1148,7 @@ function requestUrl(raw: string): URL | undefined {
   url.hash = "";
   const host = url.hostname;
   if (host.endsWith(".") && !host.startsWith("[")) {
-    const bare = host.replace(/\.+$/, "");
+    const bare = withoutTrailingDots(host);
     if (bare !== "") url.hostname = bare;
   }
   const path = url.pathname
@@ -1321,7 +1322,7 @@ function restrictRecipientSpellings(raw: string): string[] {
   const at = value.lastIndexOf("@");
   if (at > 0) {
     const local = value.slice(0, at);
-    const domain = value.slice(at + 1).replace(/\.+$/, "");
+    const domain = withoutTrailingDots(value.slice(at + 1));
     out.push(`${local}@${domain}`);
     const plus = local.indexOf("+");
     if (plus > 0) out.push(`${local.slice(0, plus)}@${domain}`);
@@ -1329,7 +1330,7 @@ function restrictRecipientSpellings(raw: string): string[] {
     const digits = value.replace(/\D/g, "");
     if (digits.length >= 5) out.push(`${value.startsWith("+") ? "+" : ""}${digits}`);
   } else if (value.endsWith(".")) {
-    out.push(value.replace(/\.+$/, ""));
+    out.push(withoutTrailingDots(value));
   }
   return out;
 }
