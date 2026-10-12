@@ -693,6 +693,53 @@ describe("programWords: the words of a command that name code it runs", () => {
     expect(read("node", "-r", "./hook.js", "-e", "x").operands).toEqual(["./hook.js"]);
   });
 
+  // critic9 (0.7.1): node and `bun run` fold a `..` as text before they
+  // open their script; a shell, Python 3, Perl and Ruby hand it to the
+  // kernel as written. Measured with a link and a `..` and a marker each
+  // script wrote.
+  test("the script of an interpreter that opens it through the kernel, and no other", () => {
+    const script = (...words: string[]) => {
+      const at = programWords(words).kernelScript;
+      return at === undefined ? undefined : words[at];
+    };
+    for (const shell of ["sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh"]) {
+      expect({ shell, script: script(shell, "-e", "x.sh", "arg") }).toEqual({
+        shell,
+        script: "x.sh",
+      });
+    }
+    expect(script(".", "x.sh")).toBe("x.sh");
+    expect(script("source", "x.sh")).toBe("x.sh");
+    expect(script("python3", "-u", "x.py", "y")).toBe("x.py");
+    expect(script("python3.12", "x.py")).toBe("x.py");
+    expect(script("/usr/bin/perl", "-w", "x.pl")).toBe("x.pl");
+    expect(script("env", "A=1", "ruby", "x.rb")).toBe("x.rb");
+    // Folded as text first, or never measured: none.
+    for (const words of [
+      ["node", "x.mjs"],
+      ["nodejs", "x.mjs"],
+      ["bun", "run", "x.mjs"],
+      ["bun", "x.mjs"],
+      ["deno", "run", "x.ts"],
+      ["tsx", "x.ts"],
+      ["ts-node", "x.ts"],
+      ["python", "x.py"],
+      ["pypy3", "x.py"],
+      ["fish", "x.fish"],
+      ["php", "x.php"],
+    ]) {
+      expect({ words, script: script(...words) }).toEqual({ words, script: undefined });
+    }
+    // No script among the operands: code in an argument, a module by name,
+    // a script on the input, a line.
+    expect(script("python3", "-c", "x", "y.py")).toBeUndefined();
+    expect(script("python3", "-m", "pytest", "t.py")).toBeUndefined();
+    expect(script("perl", "-e", "1", "x.pl")).toBeUndefined();
+    expect(script("bash", "-s", "x.sh")).toBeUndefined();
+    expect(script("sh", "-c", "x.sh")).toBeUndefined();
+    expect(script("sh")).toBeUndefined();
+  });
+
   test("the directory each wrapper moves to, and the PATH each sets, from the word it applies to", () => {
     const words = ["env", "-C", "sub", "PATH=bin", "sudo", "--chdir=deep", "./x.sh"];
     const got = programWords(words);

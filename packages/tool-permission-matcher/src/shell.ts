@@ -1030,6 +1030,39 @@ const INTERPRETERS: ReadonlyMap<string, string> = new Map([
 const INLINE_CODE_OPTIONS: ReadonlySet<string> = new Set(["--eval", "--print"]);
 
 /**
+ * Interpreters that open the script they are handed as written, through the
+ * kernel, which applies each `..` after the link before it: `sh
+ * lnk/../x.sh` with `lnk → safe/sub` runs `safe/x.sh`. Measured, one run
+ * each with a link and a `..` and a marker the script writes: sh, bash,
+ * dash, zsh, ksh, csh, tcsh, the `.` and `source` builtins, python3 (3.9),
+ * perl (5.34) and ruby (2.6).
+ *
+ * Not here, and so read both ways: node and `bun run`, which fold a `..` as
+ * text before they open their script (`path.resolve`, then its links
+ * followed) and so run `./x.mjs`; `bun x.mjs`, which opens it as the kernel
+ * does today but shares a name with `bun run`; and every runtime that was
+ * not measured (deno, tsx, ts-node, the shells and Pythons not listed).
+ */
+const OPENS_SCRIPT_THROUGH_KERNEL: ReadonlySet<string> = new Set([
+  "sh",
+  "bash",
+  "dash",
+  "zsh",
+  "ksh",
+  "csh",
+  "tcsh",
+  ".",
+  "source",
+  "perl",
+  "ruby",
+]);
+
+/** {@link OPENS_SCRIPT_THROUGH_KERNEL}, with `python3` in any minor version (`python3.12`). */
+function opensScriptThroughKernel(name: string): boolean {
+  return OPENS_SCRIPT_THROUGH_KERNEL.has(name) || /^python3(\.[0-9]+)?$/.test(name);
+}
+
+/**
  * The short options after which an interpreter runs code written in its
  * arguments, or a module it finds by name: see {@link INTERPRETERS}. A
  * versioned Python (`python3`, `python3.12`, `pypy3`) has `-c` and `-m`.
@@ -1068,6 +1101,15 @@ export type ProgramWords = {
    * module by name (`python -m`) — what follows is the code's to read.
    */
   readonly operands: ReadonlyArray<number>;
+  /**
+   * The operand that is the script of an interpreter that opens it as
+   * written, through the kernel (a shell, Python 3, Perl, Ruby; see
+   * {@link OPENS_SCRIPT_THROUGH_KERNEL}): the file it runs is where the
+   * kernel walks, each `..` after the link before it. Absent for any other
+   * interpreter — node and `bun run` fold a `..` as text first — and for
+   * every other operand, which the script reads as it likes.
+   */
+  readonly kernelScript?: number;
   /**
    * Each directory a wrapper on the way runs the command in (`env -C dir`,
    * `sudo -D dir`): the words from `from` on are opened from there, the
@@ -1144,10 +1186,22 @@ export function programWords(words: ReadonlyArray<string>, path?: string): Progr
   const followed = followWrappers(words, 0);
   const programs = [0, ...followed.starts];
   const last = programs[programs.length - 1] as number;
-  const operands =
-    followed.lines.length === 0 ? (scanInterpreter(words, last)?.operands ?? []) : [];
+  const scanned = followed.lines.length === 0 ? scanInterpreter(words, last) : undefined;
+  const operands = scanned?.operands ?? [];
+  // Its script, when it opens it the way the kernel walks it. A runtime
+  // given code in an argument (`python3 -c`) has no script among them.
+  const kernelScript =
+    scanned?.script === "operand" && opensScriptThroughKernel(programName(words[last] as string))
+      ? operands[0]
+      : undefined;
   const paths = path !== undefined ? [{ from: 0, path }, ...followed.paths] : followed.paths;
-  return { programs, operands, chdirs: followed.chdirs, paths };
+  return {
+    programs,
+    operands,
+    ...(kernelScript !== undefined ? { kernelScript } : {}),
+    chdirs: followed.chdirs,
+    paths,
+  };
 }
 
 /**
