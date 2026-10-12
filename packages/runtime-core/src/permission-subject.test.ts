@@ -12,12 +12,14 @@
  *  - an extra string argument in front of a scoped deny/ask  (permission-integration#0, flag-truth-4#0, security-8#0)
  *  - a left-out field the tool fills with a default          (permission-integration#0)
  *  - `..` traversal and a symlinked directory                (permission-integration#1)
+ *  - `..` in a path read from a symlinked working directory   (critic7, 0.7.1)
  *  - a deny on a read-only tool in plan mode                 (permission-integration#6)
  *  - an input the schema rejects                             (parse-then-act)
  *  - approval replay re-checked on the canonical call
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  appendFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -25,9 +27,10 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthropic";
 import {
   type PermissionMode,
@@ -155,7 +158,34 @@ const paginate = buildTool({
   scope: "external",
   execute: record("HttpPaginate"),
 });
-const TOOLS: RegisteredTool[] = [writeTool, removePath, gitBranchDelete, envUpsert, paginate];
+/**
+ * tool-code Format's shape: `paths` declared `within` its `cwd`, each handed
+ * AS WRITTEN to a program run in the real directory. The program here is the
+ * kernel itself: the path is appended to by string, never `path.join`ed, so
+ * a link on the way is followed before the `..` after it, as a formatter's
+ * own open() does. `touched` is what the call really changed.
+ */
+const formatLike = buildTool({
+  name: "Format",
+  description: "tool-code Format's shape",
+  inputSchema: z.object({ cwd: z.string().optional(), paths: z.array(z.string()).optional() }),
+  destructive: true,
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" }],
+  execute: async (input: { cwd?: string; paths?: string[] }) => {
+    ran.push({ tool: "Format", input });
+    const dir = realpathSync(input.cwd ?? ".");
+    for (const p of input.paths ?? []) appendFileSync(isAbsolute(p) ? p : `${dir}/${p}`, "//\n");
+    return "ok";
+  },
+});
+const TOOLS: RegisteredTool[] = [
+  writeTool,
+  removePath,
+  gitBranchDelete,
+  envUpsert,
+  paginate,
+  formatLike,
+];
 
 const rules = (...list: Array<[PermissionRule["type"], string]>): RuleSet => ({
   ...emptyRuleSet,
@@ -361,6 +391,91 @@ describe("`..` traversal and symlinked directories (permission-integration#1)", 
       { default: "ask", auto: "ask", plan: "deny" },
     );
   });
+});
+
+describe("`..` in a path read from a symlinked working directory (critic7)", () => {
+  // `link -> secrets/deep`, an ordinary workspace link
+  // `node_modules/@acme/pkg -> ../../packages/pkg`, and `src/lnk ->
+  // ../secrets/deep`. The gate collapsed `..` before following a link; the
+  // program the tool runs follows the link first. So `../x.ts` in `link` was
+  // `x.ts` to every rule and `secrets/x.ts` on disk.
+  const SECRET = "export const key = 1;\n";
+  beforeEach(() => {
+    mkdirSync(join(ws, "secrets", "deep"), { recursive: true });
+    mkdirSync(join(ws, "packages", "pkg"), { recursive: true });
+    mkdirSync(join(ws, "node_modules", "@acme"), { recursive: true });
+    writeFileSync(join(ws, "secrets", "x.ts"), SECRET);
+    writeFileSync(join(ws, "x.ts"), "export const harmless = 1;\n");
+    writeFileSync(join(ws, "src", "x.ts"), "export const app = 1;\n");
+    symlinkSync("secrets/deep", join(ws, "link"));
+    symlinkSync("../../packages/pkg", join(ws, "node_modules", "@acme", "pkg"));
+    symlinkSync("../secrets/deep", join(ws, "src", "lnk"));
+  });
+  const secretUntouched = () => readFileSync(join(ws, "secrets", "x.ts"), "utf8") === SECRET;
+  const denySecrets = rules(["alwaysDeny", "Format(secrets/**)"], ["alwaysAllow", "Format"]);
+
+  test("deny: a guard on the real place fires, and the program never runs", async () => {
+    for (const input of [
+      { cwd: "link", paths: ["../x.ts"] },
+      { cwd: "node_modules/@acme/pkg", paths: ["../../secrets/x.ts"] },
+      { paths: ["link/../x.ts"] },
+      { cwd: "src", paths: ["lnk/../x.ts"] },
+    ]) {
+      await expectBlocked({ name: "Format", input }, denySecrets, {
+        default: "deny",
+        auto: "deny",
+        plan: "deny",
+      });
+      expect({ input, secretUntouched: secretUntouched() }).toEqual({
+        input,
+        secretUntouched: true,
+      });
+    }
+  }, 30_000);
+
+  test("allow: a rule about another place does not grant it", async () => {
+    for (const [input, allow] of [
+      [{ cwd: "link", paths: ["../x.ts"] }, "Format(x.ts)"],
+      [{ cwd: "node_modules/@acme/pkg", paths: ["../../secrets/x.ts"] }, "Format(node_modules/**)"],
+      [{ cwd: "src", paths: ["lnk/../x.ts"] }, "Format(src/**)"],
+    ] as const) {
+      await expectBlocked({ name: "Format", input }, rules(["alwaysAllow", allow]), {
+        default: "ask",
+        auto: "ask",
+        plan: "deny",
+      });
+      expect({ input, secretUntouched: secretUntouched() }).toEqual({
+        input,
+        secretUntouched: true,
+      });
+    }
+  }, 30_000);
+
+  test("an absolute path is decided as outside, whatever directory it is given with", async () => {
+    await expectBlocked(
+      { name: "Format", input: { cwd: "src", paths: [join(ws, "secrets", "x.ts")] } },
+      rules(["alwaysAllow", "Format(src/**)"], ["alwaysAllow", "Format(secrets/**)"]),
+      { default: "ask", auto: "ask", plan: "deny" },
+    );
+    expect(secretUntouched()).toBe(true);
+  }, 30_000);
+
+  test("control: an ordinary path, through the link or not, is decided where it lands and runs", async () => {
+    // Through the link, x.ts IS secrets/deep/x.ts: a deny there fires...
+    await expectBlocked({ name: "Format", input: { cwd: "link", paths: ["x.ts"] } }, denySecrets, {
+      default: "deny",
+      auto: "deny",
+      plan: "deny",
+    });
+    // ...and a scoped allow grants the call it names, which then runs.
+    await expectRuns(
+      { name: "Format", input: { cwd: "src", paths: ["x.ts"] } },
+      rules(["alwaysAllow", "Format(src/**)"]),
+      ["default", "auto"],
+    );
+    expect(readFileSync(join(ws, "src", "x.ts"), "utf8")).toBe("export const app = 1;\n//\n//\n");
+    expect(secretUntouched()).toBe(true);
+  }, 30_000);
 });
 
 describe("plan mode honours a deny on a read-only tool (permission-integration#6)", () => {

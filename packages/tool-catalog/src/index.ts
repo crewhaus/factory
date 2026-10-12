@@ -242,9 +242,13 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  *
  * For a `path`, `within` names the
  * directory the path is relative to (`{ field: "paths", kind: "path", within:
- * "cwd" }`), and the joined path is what gets resolved; an absolute path is
- * left as it is. When the call leaves the qualifying field out, the value is
- * matched on its own. A `url` cannot be qualified.
+ * "cwd" }`), and the joined path is what gets resolved. When the call leaves
+ * the qualifying field out, the value is matched on its own. Either way, a
+ * path that is absolute or has a `..` segment is read as outside the
+ * workspace — no allow grants it, every deny or ask fires: such a tool hands
+ * the path on as written to a program running in the directory, which follows
+ * a link before the `..` after it, so where it lands cannot be read off the
+ * directory. A `url` cannot be qualified.
  *
  * For a `command`, `within` names the directory it runs in (`{ field: "argv",
  * kind: "command", within: "cwd" }`), because the same words are another

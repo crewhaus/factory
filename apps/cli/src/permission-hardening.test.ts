@@ -1004,6 +1004,176 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
   });
 });
 
+// critic7 (0.7.1): Lint and Format hand each `paths` entry, as written, to
+// the project's formatter run in the REAL `cwd`. The gate collapsed `..`
+// before following a link; the formatter's open() follows the link first. So
+// with `link -> secrets/deep`, `{cwd: "link", paths: ["../x.ts"]}` was x.ts
+// to every rule and secrets/x.ts on disk — and an ordinary workspace link
+// (`node_modules/@acme/pkg`) was enough. An absolute entry was checked as
+// `<cwd>/<abs>` and handed to the formatter as `<abs>`. The stub formatter
+// and test runner record their physical cwd and the physical place of each
+// path, and append a line to it, as `biome format --write` would.
+describe("critic7 — `..` and absolute entries in Lint, Format and RunTests paths", () => {
+  const SECRET = "export const key = 1;\n";
+  let outsideDir: string;
+  let stubLog: string;
+  beforeEach(() => {
+    outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "perm-real-outside-")));
+    writeFileSync(join(outsideDir, "victim.ts"), SECRET);
+    stubLog = join(state, "stub.log");
+    writeFileSync(stubLog, "");
+    for (const d of ["secrets/deep", "packages/pkg", "node_modules/@acme", "node_modules/.bin"]) {
+      mkdirSync(join(ws, d), { recursive: true });
+    }
+    writeFileSync(join(ws, "secrets", "x.ts"), SECRET);
+    writeFileSync(join(ws, "x.ts"), "export const harmless = 1;\n");
+    writeFileSync(join(ws, "src", "x.ts"), "export const app = 1;\n");
+    writeFileSync(join(ws, "src", "x.test.ts"), "export {};\n");
+    // Every directory a call below runs in is a biome and vitest project.
+    for (const d of [".", "src", "secrets/deep", "packages/pkg"]) {
+      writeFileSync(join(ws, d, "biome.json"), "{}\n");
+      writeFileSync(join(ws, d, "vitest.config.ts"), "export default {};\n");
+    }
+    symlinkSync("secrets/deep", join(ws, "link"));
+    symlinkSync("../../packages/pkg", join(ws, "node_modules", "@acme", "pkg"));
+    symlinkSync("../secrets/deep", join(ws, "src", "lnk"));
+    // The in-workspace mirror the old check looked at for an absolute path.
+    mkdirSync(join(ws, "src", outsideDir), { recursive: true });
+    writeFileSync(join(ws, "src", outsideDir, "victim.ts"), "mirror\n");
+    const stub = [
+      "#!/bin/sh",
+      `echo "cwd=$(pwd -P)" >> "${stubLog}"`,
+      "seen=0",
+      'for a in "$@"; do',
+      '  if [ "$seen" = 1 ]; then',
+      `    echo "  $a -> $(cd -P "$(dirname "$a")" && pwd -P)/$(basename "$a")" >> "${stubLog}"`,
+      '    echo "// touched" >> "$a"',
+      "  fi",
+      '  [ "$a" = "--" ] && seen=1',
+      "done",
+      "exit 0",
+      "",
+    ].join("\n");
+    for (const bin of ["biome", "vitest"]) {
+      writeFileSync(join(ws, "node_modules", ".bin", bin), stub, { mode: 0o755 });
+    }
+  });
+  afterEach(() => {
+    rmSync(outsideDir, { recursive: true, force: true });
+  });
+  const stubRan = () => readFileSync(stubLog, "utf8").replaceAll(ws, "<ws>");
+  const untouched = () => ({
+    secret: readFileSync(join(ws, "secrets", "x.ts"), "utf8") === SECRET,
+    outside: readFileSync(join(outsideDir, "victim.ts"), "utf8") === SECRET,
+  });
+  // Each reaches secrets/x.ts on disk, and none says so in its own words.
+  const CLIMBS: ReadonlyArray<Record<string, unknown>> = [
+    { cwd: "link", paths: ["../x.ts"] },
+    { cwd: "node_modules/@acme/pkg", paths: ["../../secrets/x.ts"] },
+    { paths: ["link/../x.ts"] },
+    { cwd: "src", paths: ["lnk/../x.ts"] },
+  ];
+
+  test("a deny on the real place fires, in every mode, and the formatter never runs", async () => {
+    for (const tool of ["Format", "Lint"]) {
+      const rs = rules(["alwaysDeny", `${tool}(secrets/**)`], ["alwaysAllow", tool]);
+      for (const mode of ["default", "auto", "plan"] as const) {
+        for (const input of CLIMBS) {
+          const got = await gate(tool, input, rs, mode);
+          expect({ tool, mode, input, got, ran: stubRan(), ...untouched() }).toEqual({
+            tool,
+            mode,
+            input,
+            got: "deny",
+            ran: "",
+            secret: true,
+            outside: true,
+          });
+        }
+      }
+    }
+  }, 60_000);
+
+  test("an allow about another place does not grant it", async () => {
+    for (const [input, allow] of [
+      [{ cwd: "link", paths: ["../x.ts"] }, "Format(x.ts)"],
+      [{ cwd: "node_modules/@acme/pkg", paths: ["../../secrets/x.ts"] }, "Format(node_modules/**)"],
+      [{ paths: ["link/../x.ts"] }, "Format(x.ts)"],
+      [{ cwd: "src", paths: ["lnk/../x.ts"] }, "Format(src/**)"],
+    ] as const) {
+      const got = await gate("Format", input, rules(["alwaysAllow", allow]));
+      expect({ input, allow, got, ran: stubRan(), ...untouched() }).toEqual({
+        input,
+        allow,
+        got: "ask",
+        ran: "",
+        secret: true,
+        outside: true,
+      });
+    }
+  }, 60_000);
+
+  test("where a bare allow, auto or bypass lets the call through, the tool refuses the entry by name", async () => {
+    const absolute = join(outsideDir, "victim.ts");
+    for (const tool of ["Format", "Lint", "RunTests"]) {
+      for (const [mode, rs] of [
+        ["default", rules(["alwaysAllow", tool])],
+        ["auto", rules(["alwaysAllow", tool])],
+        ["bypass", rules()],
+      ] as const) {
+        for (const input of [...CLIMBS, { cwd: "src", paths: [absolute] }]) {
+          const got = await gate(tool, input, rs, mode);
+          const entry = (input["paths"] as string[])[0] as string;
+          const why = entry === absolute ? "it is absolute" : 'it has a ".." segment';
+          expect({ tool, mode, input, got, ran: stubRan(), ...untouched() }).toEqual({
+            tool,
+            mode,
+            input,
+            got: "allow",
+            ran: "",
+            secret: true,
+            outside: true,
+          });
+          expect(lastResult).toContain(`${tool} refused the path "${entry.slice(0, 80)}`);
+          expect(lastResult).toContain(why);
+        }
+      }
+    }
+  }, 120_000);
+
+  test("control: an ordinary relative path is decided where it lands, and runs unchanged", async () => {
+    const allowSrc = (tool: string) => rules(["alwaysAllow", `${tool}(src/**)`]);
+    for (const tool of ["Format", "Lint"]) {
+      writeFileSync(stubLog, "");
+      expect(await gate(tool, { cwd: "src", paths: ["x.ts"] }, allowSrc(tool))).toBe("allow");
+      expect({ tool, ran: stubRan() }).toEqual({
+        tool,
+        ran: "cwd=<ws>/src\n  x.ts -> <ws>/src/x.ts\n",
+      });
+    }
+    // Through the link, x.ts IS secrets/deep/x.ts, and a deny there fires.
+    writeFileSync(stubLog, "");
+    expect(
+      await gate(
+        "Format",
+        { cwd: "link", paths: ["x.ts"] },
+        rules(["alwaysDeny", "Format(secrets/**)"], ["alwaysAllow", "Format"]),
+      ),
+    ).toBe("deny");
+    expect(stubRan()).toBe("");
+    // RunTests' paths are filters the runner reads from `cwd`.
+    expect(
+      await gate(
+        "RunTests",
+        { cwd: "src", paths: ["x.test.ts"] },
+        rules(["alwaysAllow", "RunTests"]),
+      ),
+    ).toBe("allow");
+    expect(stubRan()).toBe("cwd=<ws>/src\n  x.test.ts -> <ws>/src/x.test.ts\n");
+    expect(untouched()).toEqual({ secret: true, outside: true });
+  }, 120_000);
+});
+
 describe("p12/security-8#0 — argv and extra fields in front of a deny", () => {
   test("RunCommand(rm) fires on an argv that starts with rm, with or without cwd", async () => {
     const rs = rules(["alwaysDeny", "RunCommand(rm)"], ["alwaysAllow", "RunCommand"]);

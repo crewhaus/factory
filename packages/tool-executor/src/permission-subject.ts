@@ -47,6 +47,13 @@
  *      finds it, not the directory. A command inside an array of objects
  *      (`steps.argv`) runs in its element's own directory field when it has
  *      one, else the top-level one.
+ *      A path declared `within` a directory that is absolute or has a `..`
+ *      segment — the call's directory or the root when it gives none — is
+ *      flagged `outsideWorkspace`: the tool hands it on as written to a
+ *      program running there, and the OS follows a symlink before the `..`
+ *      after it, so `../x.ts` run in `link/` (`link → secrets/deep`) is
+ *      `secrets/x.ts`, not the `x.ts` a collapsed reading names (see
+ *      `leavesItsDirectory`).
  *      Unless it is a path or a command, the value alone and the qualifier
  *      alone are kept as other spellings, so a deny or ask rule written
  *      without the qualifier — `alwaysDeny EvmCall(0xdAC17F…)`,
@@ -211,6 +218,7 @@ export function operativeValuesOf(
       runsIn,
       env,
       dir,
+      leavesDir,
       unqualified,
       every,
       anyAfter,
@@ -227,6 +235,10 @@ export function operativeValuesOf(
         case "path": {
           if (every === true) {
             values.push(...everyPathValues(dir ?? ".", canonicalizePath));
+            break;
+          }
+          if (leavesDir === true) {
+            values.push(leavingValue(raw, dir));
             break;
           }
           const read = canonicalizePath(raw);
@@ -368,6 +380,12 @@ type FieldReading = {
   readonly env?: Readonly<Record<string, string>>;
   /** The directory a `path` declared `within` one is relative to. */
   readonly dir?: string;
+  /**
+   * A `path` declared `within` a directory whose value is absolute or has a
+   * `..` segment: where it lands cannot be read off the directory's values.
+   * See {@link leavesItsDirectory}.
+   */
+  readonly leavesDir?: true;
   readonly unqualified?: ReadonlyArray<string>;
   /** The field was left out and its default `*` stands for every value. */
   readonly every?: true;
@@ -462,6 +480,11 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   if (arg.kind === "command") return anyValue(out);
   const qualifier = topQualifier;
   if (qualifier === undefined) {
+    // A path within a directory the call left out is relative to the root,
+    // and handed on as written all the same.
+    if (arg.kind === "path" && arg.within !== undefined && !every) {
+      return out.map((r) => (leavesItsDirectory(r.value) ? { ...r, leavesDir: true } : r));
+    }
     // The qualifier is left out as well: a code search with no owner reaches
     // every repository, so the value stands for every `<owner>/<repo>` too.
     const read = anyValue(out);
@@ -470,13 +493,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
       : read;
   }
   return out.map((r) => {
-    // A path relative to a directory field; an absolute one ignores it.
+    // A path relative to a directory field.
     if (arg.kind === "path") {
       if (every) return { ...r, value: `${qualifier}/${r.value}`, dir: qualifier, every: true };
       // A git command given no path acts on the whole repository, wherever
       // it runs: its default is the workspace root, not the directory.
       if (r.defaulted === true && arg.defaultAtRoot === true) return r;
-      return isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` };
+      if (leavesItsDirectory(r.value)) return { ...r, leavesDir: true, dir: qualifier };
+      return { ...r, value: `${qualifier}/${r.value}` };
     }
     return {
       ...r,
@@ -546,6 +570,43 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
       ...(v.caseInsensitive === true ? { caseInsensitive: true } : {}),
     };
   });
+}
+
+/**
+ * Does a path declared `within` a directory leave it: is it absolute, or does
+ * it have a `..` segment? Where such a path lands cannot be read off the
+ * directory's values.
+ *
+ * - The tool hands the path on as written, to a program that runs in the
+ *   directory (git, a formatter, a test runner), and the OS follows each
+ *   symlink BEFORE it applies the `..` after it. Through a symlinked
+ *   directory (`cwd: "link"`, `link → secrets/deep`), `../x.ts` is
+ *   `secrets/x.ts`; through a link inside the path itself (`lnk/../x.ts`),
+ *   it climbs out of the link's target, which no join of the path to the
+ *   directory can see without a filesystem to ask. Read like every other
+ *   path, with `..` collapsed first, both were `x.ts`.
+ * - An absolute path ignores the directory for a program that resolves it,
+ *   but not for `path.join`, which a tool may check it with: the two name
+ *   different files.
+ *
+ * `\` counts as a separator too, as in tool-git's pathspec check: splitting
+ * at it can only flag more.
+ */
+function leavesItsDirectory(value: string): boolean {
+  return isAbsolutePath(value) || value.split(/[\\/]/).includes("..");
+}
+
+/**
+ * The value of a path that leaves its directory ({@link leavesItsDirectory}):
+ * outside the workspace, so no allow rule names it and every deny or ask fires
+ * on it. Every builtin that declares such a field refuses the path itself;
+ * this keeps a rule about another place from granting it to a tool that does
+ * not. The spellings are the path as written, and joined to the directory as
+ * written.
+ */
+function leavingValue(raw: string, dir: string | undefined): OperativeValue {
+  const joined = dir === undefined || isAbsolutePath(raw) ? [] : [`${dir}/${raw}`];
+  return { kind: "path", canonical: [], spellings: [raw, ...joined], outsideWorkspace: true };
 }
 
 /**

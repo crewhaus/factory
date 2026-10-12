@@ -644,9 +644,95 @@ describe("url, command and id values", () => {
     // Left out, the paths default to the directory itself.
     expect(canonical({ cwd: "pkg" })).toEqual(["pkg"]);
     expect(canonical({})).toEqual(["."]);
-    // `..` in the directory is collapsed with the rest.
+    // `..` in the directory is collapsed with the rest: the tools resolve the
+    // directory itself that way (resolveSafe), before they run anything in it.
     expect(canonical({ cwd: "pkg/..", paths: [".env"] })).toEqual([".env"]);
-    expect(canonical({ cwd: "pkg", paths: ["/etc/passwd"] })).toEqual(["/etc/passwd"]);
+  });
+
+  // critic7 (0.7.1): the tool hands each path, as written, to a program it
+  // runs in the directory, and the OS follows a symlink BEFORE the `..` after
+  // it. With `link -> secrets/deep`, `../x.ts` run in `link` is
+  // secrets/x.ts; collapsed first, it read as x.ts, so `alwaysDeny
+  // Format(secrets/**)` did not fire and `alwaysAllow Format(x.ts)` granted it.
+  test("a path that leaves its directory — `..` or absolute — is outside: no allow, every deny", () => {
+    const tool = buildTool({
+      name: "Probe",
+      description: "d",
+      inputSchema: z.object({ cwd: z.string().optional(), paths: z.array(z.string()).optional() }),
+      operativeArgs: [
+        { field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" },
+      ],
+      execute: async () => "ok",
+    });
+    const vals = (input: unknown) => operativeValuesFor(tool, input) ?? [];
+    const on = (polarity: "allow" | "restrict", input: unknown) => (pattern: string) =>
+      matchesPattern(compilePattern(pattern), "Probe", input, {
+        polarity,
+        operativeValues: vals(input),
+      });
+    for (const input of [
+      { cwd: "link", paths: ["../x.ts"] },
+      { cwd: "node_modules/@acme/pkg", paths: ["../../secrets/x.ts"] },
+      // No directory: the root, and the value is still handed on as written.
+      { paths: ["link/../x.ts"] },
+      // A link inside the value itself: no join to the directory sees it.
+      { cwd: "src", paths: ["lnk/../x.ts"] },
+      { cwd: "src", paths: ["a/b/.."] },
+      { cwd: "src", paths: [".."] },
+      { cwd: "src", paths: ["a\\..\\x.ts"] },
+      // Absolute: a program ignores the directory, `path.join` does not.
+      { cwd: "src", paths: ["/etc/passwd"] },
+      { paths: ["/ws/x.ts"] },
+    ]) {
+      const read = vals(input);
+      expect({ input, read: read.map((v) => [v.canonical, v.outsideWorkspace]) }).toEqual({
+        input,
+        read: [[[], true]],
+      });
+      // Every deny fires — the one that names the real place among them —
+      // and no allow does, however wide short of a bare tool name.
+      expect({
+        input,
+        denies: ["Probe(secrets/**)", "Probe(x.ts)", "Probe(nothing-like-it)"].map(
+          on("restrict", input),
+        ),
+        allows: ["Probe(x.ts)", "Probe(**)", "Probe(node_modules/**)", "Probe(/**)"].map(
+          on("allow", input),
+        ),
+      }).toEqual({ input, denies: [true, true, true], allows: [false, false, false, false] });
+    }
+    // The flagged value keeps what the call wrote, alone and joined.
+    expect(vals({ cwd: "link", paths: ["../x.ts"] })).toEqual([
+      {
+        kind: "path",
+        canonical: [],
+        spellings: ["../x.ts", "link/../x.ts"],
+        outsideWorkspace: true,
+      },
+    ]);
+    // One such entry flags only itself: its neighbour is read as before.
+    expect(vals({ cwd: "src", paths: ["a.ts", "../b.ts"] }).map((v) => v.canonical[0])).toEqual([
+      "src/a.ts",
+      undefined,
+    ]);
+    // Ordinary paths are unchanged: below the directory, a `..` only in the
+    // directory, a dot-name that is not `..`, and the left-out default.
+    const canonical = (input: unknown) => vals(input).map((v) => v.canonical[0]);
+    expect(canonical({ cwd: "src", paths: ["a/b.ts", "./c.ts", "..d", "e..", ".../f"] })).toEqual([
+      "src/a/b.ts",
+      "src/c.ts",
+      "src/..d",
+      "src/e..",
+      "src/.../f",
+    ]);
+    expect(canonical({ cwd: "pkg/..", paths: ["x.ts"] })).toEqual(["x.ts"]);
+    expect(canonical({ cwd: "src" })).toEqual(["src"]);
+    expect(on("allow", { cwd: "src", paths: ["a.ts"] })("Probe(src/**)")).toBe(true);
+    // A path NOT declared `within` a directory is read as before, `..`
+    // collapsed: its tools resolve it themselves, the same way.
+    expect(
+      operativeValuesFor(writeLike(), { path: "build/../src/app.ts", content: "" })?.[0]?.canonical,
+    ).toEqual(["src/app.ts", "./src/app.ts"]);
   });
 
   // C033 — the same argv is another program in another directory
