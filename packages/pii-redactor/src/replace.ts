@@ -8,17 +8,27 @@
  * feedback text is model-written, and a page holding ten thousand e-mail
  * addresses cost a hundred billion characters.
  *
- * {@link replaceValues} gives the same text from one scan. Where every value
- * ends is found at once (Aho–Corasick), and the passes are then replayed
- * over those places: a value takes, left to right, each of its occurrences
- * that overlaps neither one it took itself nor text an earlier, wider value
- * took. That replay is exactly the sequence of passes whenever a
- * value can only ever match the text it was found in — whenever no value can
- * match across, or inside, a marker an earlier pass put in. {@link
- * markersStayPut} decides that from the values and markers alone, and when
- * it cannot rule it out, the passes run one at a time as they always did.
- * With the shipped detectors and `[REDACTED:<kind>]` markers it always rules
- * it out: no detected value holds a bracket, or fits inside a marker.
+ * {@link replaceValues} gives the same text from one scan and a replay.
+ * Where every value ends is found in one scan (Aho–Corasick), and the
+ * passes are then replayed over those places: a value takes, left to right,
+ * each of its occurrences that overlaps neither one it took itself nor text
+ * an earlier, wider value took. That replay is exactly the sequence of
+ * passes whenever a value can only ever match the text it was found in —
+ * whenever no value can match across, or inside, a marker an earlier pass
+ * put in. {@link markersStayPut} decides that from the values and markers
+ * alone, and when it cannot rule it out, the passes run one at a time as
+ * they always did. With the shipped detectors and `[REDACTED:<kind>]`
+ * markers it always rules it out: no detected value holds a bracket, or
+ * fits inside a marker.
+ *
+ * The replay costs the text plus the places it lists. A place is listed for
+ * the widest value ending there, and again for the next narrower one only
+ * when the wider was turned away with the place still free. A detector that
+ * matches whole runs takes its own blocks, so that is about once a place.
+ * At worst — many values that are suffixes of one another, ending just past
+ * text a wider value took — every value is listed at every place: the
+ * distinct values times the text, which is what the passes read, never
+ * more.
  */
 import type { PiiHit } from "@crewhaus/grader-safety-classifiers";
 
@@ -227,7 +237,9 @@ function replaceInOnePass(
   // wider one was turned away with the position still free. Listing them all
   // up front cost the length of the chain at every position: a text that
   // nests addresses inside one another (`za@b.co`, `zza@b.co`, …) ends
-  // dozens of values at each character.
+  // dozens of values at each character. Turned away down the whole chain,
+  // as a run just past a wider take can be, it still costs the chain, but
+  // only there (see the module comment).
   const endsAt: number[][] = distinct.map(() => []);
   const ordered: boolean[] = distinct.map(() => true);
   const list = (id: number, end: number): void => {

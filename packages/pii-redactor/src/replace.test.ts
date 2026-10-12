@@ -132,6 +132,32 @@ describe("the redactor reads its text once, however many values it replaces", ()
       }).toEqual({ label, ratio: true });
     }
   }, 20_000);
+
+  test("values that are suffixes of one another, turned away just past a wider take: never more than the passes", () => {
+    // `b` and K `a`s is taken first, so each shorter run of `a`s that ends
+    // in the `a`s after it starts inside that take and is turned away, down
+    // the chain until one starts past it. Each place is then listed for
+    // every value of the chain still too wide: the documented worst case,
+    // the distinct values times the text, which is what the passes read.
+    for (const k of [40, 80]) {
+      const block = `b${"a".repeat(k + k / 2)}c`;
+      const text = block.repeat(200);
+      const hits: PiiHit[] = [{ kind: "U", value: `b${"a".repeat(k)}` }];
+      for (let j = k; j >= 1; j--) hits.push({ kind: "A", value: "a".repeat(j) });
+      const meter = { steps: 0 };
+      const out = replaceValues(text, hits, (hit) => `[${hit.kind}]`, meter);
+      expect(out).toBe(passes(text, hits, (hit) => `[${hit.kind}]`));
+      const chars = charsOf(
+        text,
+        hits.map((hit) => hit.value),
+      );
+      expect(meter.steps).toBeLessThanOrEqual(
+        hits.length * text.length + STEPS_PER_CHARACTER * chars,
+      );
+      // Under half of it here: the turned-away runs are a third of the text.
+      expect(meter.steps).toBeLessThan((hits.length * text.length) / 2);
+    }
+  }, 20_000);
 });
 
 describe("replaceValues gives what the passes gave", () => {
