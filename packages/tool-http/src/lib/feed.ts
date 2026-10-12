@@ -100,9 +100,10 @@ export function parseFeed(source: string): FeedResult {
   // RSS 2.0 nests items under <channel>; RDF/RSS 1.0 puts them beside it.
   const channel = firstNamed(root, "channel");
   const itemHost = channel ?? root;
-  const items = [...childrenNamed(itemHost, "item"), ...childrenNamed(root, "item")].filter(
-    (item, index, all) => all.indexOf(item) === index,
-  );
+  // Without a <channel> the root's items are listed twice. A set keeps the
+  // first of each, in document order; checking each against the whole list
+  // was quadratic in a feed whose items the server, or the model, writes.
+  const items = [...new Set([...childrenNamed(itemHost, "item"), ...childrenNamed(root, "item")])];
   if (channel === undefined && items.length === 0) {
     throw new Error(
       `root element is <${root.name}> with no <channel> or <item>; not an RSS or Atom feed`,
