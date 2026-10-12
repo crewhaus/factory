@@ -44,6 +44,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import { parseSpec } from "@crewhaus/spec";
 import { registeredToolName } from "@crewhaus/tool-categories";
 import { type GradersConfigObject, synthesizeGraders } from "./feedback";
+import { firstObjectSpan } from "./model-reply-text";
 
 /** Thrown on a spec this scaffold cannot derive eval assets from (and on
  *  invalid flag values). The CLI entry file routes it through `die()`;
@@ -591,11 +592,11 @@ export function buildSampleGenerationPrompt(info: ScaffoldInfo, n: number): stri
  * deterministic template.
  */
 export function parseModelSampleInputs(raw: string, max: number): string[] {
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (jsonMatch === null) return [];
+  const json = firstObjectSpan(raw);
+  if (json === null) return [];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    parsed = JSON.parse(json);
   } catch {
     return [];
   }

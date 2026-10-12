@@ -40,6 +40,7 @@ import {
   readExperienceStore,
 } from "@crewhaus/meta-harness-optimizer";
 import type { MutationProvider, OptimizerState } from "@crewhaus/prompt-optimizer";
+import { firstObjectSpan } from "./model-reply-text";
 
 /** Output-token ceiling per proposer call (also the budget gate's worst case). */
 export const META_HARNESS_MAX_TOKENS = 2048;
@@ -137,13 +138,13 @@ export function createMetaHarnessProposer(opts: MetaHarnessProposerOptions): Pro
     const text = final.content.find(
       (b): b is { type: "text"; text: string } => b.type === "text" && typeof b.text === "string",
     )?.text;
-    // Tolerate ```json fences and leading prose: take the first balanced object.
-    const match = text?.match(/\{[\s\S]*\}/) ?? null;
-    if (match === null) {
+    // Tolerate ```json fences and leading prose: take the first `{` through the last `}`.
+    const json = text === undefined ? null : firstObjectSpan(text);
+    if (json === null) {
       return { bundleSource: fallback, rationale: "proposer returned no JSON object", usage };
     }
     try {
-      const parsed = JSON.parse(match[0]) as { rewrite?: unknown; rationale?: unknown };
+      const parsed = JSON.parse(json) as { rewrite?: unknown; rationale?: unknown };
       if (typeof parsed.rewrite !== "string" || parsed.rewrite.length === 0) {
         return { bundleSource: fallback, rationale: "proposer JSON had no rewrite", usage };
       }
