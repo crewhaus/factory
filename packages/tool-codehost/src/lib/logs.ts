@@ -149,7 +149,7 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
   const cut = (text: string): string =>
     text.length <= maxLineChars ? text : `${text.slice(0, maxLineChars)}…`;
 
-  const stack: string[] = [];
+  const sections = new OpenSections();
   let lastStep: string | null = null;
   const annotations: LogAnnotation[] = [];
   const errorLines: LogLocation[] = [];
@@ -160,7 +160,7 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
   let droppedAnnotations = 0;
   let droppedErrorLines = 0;
 
-  const currentStep = (): string | undefined => stack[stack.length - 1];
+  const currentStep = (): string | undefined => sections.innermost();
 
   let totalLines = 0;
   let cursor = 0;
@@ -185,10 +185,10 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
       const kind = section[1] as string;
       const name = section[2] as string;
       if (kind === "start") {
-        stack.push(name);
+        sections.push(name);
         lastStep = name;
       } else {
-        popTo(stack, name);
+        sections.closeTo(name);
       }
       continue;
     }
@@ -205,12 +205,12 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
     const payload = full.slice(text.length - captured.length);
 
     if (kind === "group") {
-      stack.push(payload.trim());
+      sections.push(payload.trim());
       lastStep = payload.trim();
       continue;
     }
     if (kind === "endgroup") {
-      stack.pop();
+      sections.pop();
       continue;
     }
     if (kind === "error" || kind === "warning" || kind === "notice") {
@@ -273,12 +273,57 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
 }
 
 /**
- * Close a named section, and everything a malformed log left open inside it.
- * A `section_end` for a name that was never started is ignored rather than
- * popping something unrelated.
+ * The groups and sections open at a point in the log, innermost last.
+ *
+ * Each name's count of open entries answers "is it open?" at once. Searching
+ * the stack for a `section_end` whose name was never started visited every
+ * open entry and closed none, so n starts followed by n such ends cost n²,
+ * and a job's own output can print both. A close now walks only for a name
+ * that is open, and visits exactly the entries it closes.
  */
-function popTo(stack: string[], name: string): void {
-  const index = stack.lastIndexOf(name);
-  if (index === -1) return;
-  stack.length = index;
+export class OpenSections {
+  private readonly names: string[] = [];
+  private readonly counts = new Map<string, number>();
+
+  push(name: string): void {
+    this.names.push(name);
+    this.counts.set(name, (this.counts.get(name) ?? 0) + 1);
+  }
+
+  /** `##[endgroup]`: close the innermost entry, whatever its name. */
+  pop(): void {
+    const name = this.names.pop();
+    if (name !== undefined) this.forget(name);
+  }
+
+  /**
+   * Close the innermost entry named `name`, and everything a malformed log
+   * left open inside it. A name that is not open is ignored rather than
+   * popping something unrelated.
+   */
+  closeTo(name: string): void {
+    if (!this.counts.has(name)) return;
+    // Bounded by the stack as well as by the name, so a count that ever
+    // drifted could empty the stack but never spin.
+    while (this.names.length > 0) {
+      const closed = this.names.pop() as string;
+      this.forget(closed);
+      if (closed === name) return;
+    }
+  }
+
+  innermost(): string | undefined {
+    return this.names[this.names.length - 1];
+  }
+
+  /** The open entries, outermost first. */
+  list(): string[] {
+    return [...this.names];
+  }
+
+  private forget(name: string): void {
+    const left = (this.counts.get(name) ?? 0) - 1;
+    if (left > 0) this.counts.set(name, left);
+    else this.counts.delete(name);
+  }
 }
