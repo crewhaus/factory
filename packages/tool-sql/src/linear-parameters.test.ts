@@ -14,18 +14,23 @@
  *
  * The work is counted with tool-code's __test__/js-work.ts, which charges an
  * array's `includes` for the whole array and a `charCodeAt` for one
- * character, never timed.
+ * character, and with the scan's own meter, which counts the characters it
+ * reads however it reads them: the old scan indexed the string by hand,
+ * which js-work cannot see. Never timed.
  */
 import { describe, expect, test } from "bun:test";
 import { jsWork } from "../../tool-code/src/__test__/js-work";
 import { bindParams } from "./db";
-import { namedParameters, scanSql } from "./lib/sql-text";
+import { type NameScanMeter, namedParameters, scanSql } from "./lib/sql-text";
 
 /** Characters copied, searched or read, and elements visited, per character; about 2 here. */
 const WORK_PER_CHARACTER = 3;
 
 /** The same for `bindParams`, which scans the statement twice; about 3.5 here. */
 const BIND_WORK_PER_CHARACTER = 6;
+
+/** Characters the name scan reads per character of the statement; 2 here, 3 at most. */
+const READS_PER_CHARACTER = 3;
 
 /** Seeded, so a failure names the same input every run. */
 function rng(start: number): () => number {
@@ -85,11 +90,13 @@ describe("namedParameters lists names in one pass", () => {
     const measured = [4_000, 8_000].map((k) => {
       const names = Array.from({ length: k }, (_, i) => `${"$:@"[i % 3]}p${i}`);
       const sql = `SELECT ${[...names, ...names].join(", ")}`;
-      const run = jsWork(WORK_PER_CHARACTER * sql.length, () => namedParameters(sql));
-      return { names, sql, run };
+      const meter: NameScanMeter = { reads: 0 };
+      const run = jsWork(WORK_PER_CHARACTER * sql.length, () => namedParameters(sql, meter));
+      return { names, sql, run, meter };
     });
-    for (const { names, sql, run } of measured) {
+    for (const { names, sql, run, meter } of measured) {
       expect(run.work).toBeLessThanOrEqual(WORK_PER_CHARACTER * sql.length);
+      expect(meter.reads).toBeLessThanOrEqual(READS_PER_CHARACTER * sql.length);
       expect(run.value).toEqual(names);
     }
     const [small, large] = measured as [(typeof measured)[0], (typeof measured)[0]];
@@ -151,15 +158,23 @@ describe("namedParameters reads each character a bounded number of times", () =>
     for (const { label, make } of RESCANNED) {
       const measured = [6_000, 12_000].map((k) => {
         const sql = make(k);
-        const run = jsWork(WORK_PER_CHARACTER * sql.length, () => namedParameters(sql));
-        return { sql, run };
+        const meter: NameScanMeter = { reads: 0 };
+        const run = jsWork(WORK_PER_CHARACTER * sql.length, () => namedParameters(sql, meter));
+        return { sql, run, meter };
       });
-      for (const { sql, run } of measured) {
+      for (const { sql, run, meter } of measured) {
         // Labelled, so a failure names the shape.
         expect({ label, within: run.work <= WORK_PER_CHARACTER * sql.length }).toEqual({
           label,
           within: true,
         });
+        // Every character read a bounded number of times, counted by the
+        // scan itself; and read at all, so the meter is live.
+        expect({
+          label,
+          reads: meter.reads <= READS_PER_CHARACTER * sql.length,
+          live: meter.reads >= sql.length,
+        }).toEqual({ label, reads: true, live: true });
         expect(run.value).toEqual([]);
       }
       const [small, large] = measured as [(typeof measured)[0], (typeof measured)[0]];
