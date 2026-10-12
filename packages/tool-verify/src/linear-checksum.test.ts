@@ -8,8 +8,10 @@
  * break the pattern tried every shorter run and rescanned the rest from
  * each: quadratic in the run's length, in a file the workspace supplies.
  *
- * A test that walks many generated inputs, or every code unit, declares a
- * 20 s budget, as the house does for a test that is slow by construction.
+ * The equivalence test walks every code unit and many generated inputs. It
+ * compares the two reads one input at a time, never holding the corpus or
+ * its answers as strings, and declares a 60 s budget, as the house does for
+ * a test that is slow by construction.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -58,56 +60,92 @@ async function regexRunsOver<T>(
 }
 
 /** Every string up to `max` characters long over `alphabet`. */
-function allStrings(alphabet: ReadonlyArray<string>, max: number): string[] {
-  const out = [""];
+function* allStrings(alphabet: ReadonlyArray<string>, max: number): Generator<string> {
   let layer = [""];
+  yield "";
   for (let n = 1; n <= max; n++) {
     layer = layer.flatMap((s) => alphabet.map((c) => s + c));
-    out.push(...layer);
+    yield* layer;
   }
-  return out;
 }
 
-/** `[input, output]` for each input, as one string, so a failure names the input. */
-function answers(inputs: ReadonlyArray<string>, f: (s: string) => unknown): string[] {
-  return inputs.map((s) => `${JSON.stringify(s)} -> ${JSON.stringify(f(s))}`);
+/** `v` as JSON with every code unit outside printable ASCII escaped, so a failure shows it. */
+function shown(v: unknown): string {
+  return (JSON.stringify(v) ?? String(v)).replace(
+    /[^\x20-\x7e]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+/**
+ * The inputs on which `now` and `then` answer differently, compared one at
+ * a time as `inputs` yields them, so the walk costs the two reads and little
+ * else. Names the first 20 that differ, with both answers, and counts every
+ * input, so a corpus that shrank shows up as well.
+ */
+function disagreements<T>(
+  inputs: Iterable<string>,
+  now: (s: string) => T,
+  then: (s: string) => T,
+  same: (a: T, b: T) => boolean,
+): { checked: number; differ: string[] } {
+  let checked = 0;
+  const differ: string[] = [];
+  for (const s of inputs) {
+    checked++;
+    const a = now(s);
+    const b = then(s);
+    if (!same(a, b) && differ.length < 20) {
+      differ.push(`${shown(s)} -> ${shown(a)}, was ${shown(b)}`);
+    }
+  }
+  return { checked, differ };
 }
 
 // The pattern as it was.
 const DIGEST_LINE = /^([0-9a-fA-F]{64})\s+\*?(.+)$/;
 const H = "0123456789abcdefABCDEF".repeat(3).slice(0, 64);
 
-test("digestLine captures what the pattern captured", () => {
-  const inputs = [
-    ...allStrings([" ", "*", "\r", "\u2028", "x", "\t", "\n"], 5).map((s) => H + s),
-    `${H}  ./a.txt`,
-    `${H} *bin/tool`,
-    H.slice(0, 63),
-    `${H.slice(0, 63)} x`,
-    `${H}a x`,
-    "",
-  ];
+type Entry = { digest: string; path: string } | null;
+
+/** Every input the comparison walks, generated as it is read. */
+function* digestLines(): Generator<string> {
+  for (const s of allStrings([" ", "*", "\r", "\u2028", "x", "\t", "\n"], 5)) yield H + s;
+  yield `${H}  ./a.txt`;
+  yield `${H} *bin/tool`;
+  yield H.slice(0, 63);
+  yield `${H.slice(0, 63)} x`;
+  yield `${H}a x`;
+  yield "";
   // Every code unit, in each place the pattern reads.
   for (let c = 0; c <= 0xffff; c++) {
     const ch = String.fromCharCode(c);
-    inputs.push(
-      `${ch}${H.slice(1)} x`,
-      `${H.slice(0, 63)}${ch} x`,
-      `${H}${ch}x`,
-      `${H} ${ch}`,
-      `${H}  ${ch}`,
-      `${H} *${ch}`,
-      `${H} x${ch}`,
-      `${H}${ch}`,
-    );
+    yield `${ch}${H.slice(1)} x`;
+    yield `${H.slice(0, 63)}${ch} x`;
+    yield `${H}${ch}x`;
+    yield `${H} ${ch}`;
+    yield `${H}  ${ch}`;
+    yield `${H} *${ch}`;
+    yield `${H} x${ch}`;
+    yield `${H}${ch}`;
   }
-  expect(answers(inputs, digestLine)).toEqual(
-    answers(inputs, (s) => {
+}
+
+test("digestLine captures what the pattern captured", () => {
+  const { checked, differ } = disagreements<Entry>(
+    digestLines(),
+    digestLine,
+    (s) => {
       const m = DIGEST_LINE.exec(s);
-      return m === null ? null : { digest: m[1], path: m[2] };
-    }),
+      return m === null ? null : { digest: m[1] as string, path: m[2] as string };
+    },
+    (a, b) => (a === null ? b === null : b !== null && a.digest === b.digest && a.path === b.path),
   );
-}, 20_000);
+  expect(differ).toEqual([]);
+  // Strings up to length 5 over 7 characters, 6 fixed lines, and 8 places
+  // for each of the 65 536 code units.
+  expect(checked).toBe(19_608 + 6 + 8 * 65_536);
+}, 60_000);
 
 describe("no pattern rescans a run in a manifest the workspace holds", () => {
   const originalCwd = process.cwd();
