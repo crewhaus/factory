@@ -342,7 +342,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
+    operativeArgs: [{ field: "messageId", kind: "id", within: "channel", service: "apiBaseUrl" }],
   },
   chatPost: {
     key: "chatPost",
@@ -353,7 +353,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "channel", kind: "recipient" }],
+    operativeArgs: [
+      { field: "channel", kind: "recipient", service: "apiBaseUrl" },
+      { field: "webhookUrlEnv", kind: "id" },
+    ],
   },
   chatReact: {
     key: "chatReact",
@@ -364,7 +367,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
+    operativeArgs: [{ field: "messageId", kind: "id", within: "channel", service: "apiBaseUrl" }],
   },
   chatUpdate: {
     key: "chatUpdate",
@@ -375,7 +378,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "channel", kind: "recipient" }],
+    operativeArgs: [{ field: "channel", kind: "recipient", service: "apiBaseUrl" }],
   },
   checkRequiredFields: {
     key: "checkRequiredFields",
@@ -5711,7 +5714,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: true,
-    operativeArgs: [{ field: "url", kind: "url" }],
+    operativeArgs: [
+      { field: "url", kind: "url" },
+      { field: "urlEnv", kind: "id" },
+    ],
   },
   webhookSign: {
     key: "webhookSign",

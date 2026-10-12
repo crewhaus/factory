@@ -170,7 +170,8 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "BundleSizeCheck.files": "the schema requires files or directory; whichever is given is read",
   "ChartRender.path": "the SVG comes back inline; nothing is written",
   "ChatPost.channel":
-    "required in API mode; an incoming webhook posts to the channel the operator bound it to",
+    "required in API mode; an incoming webhook posts to the channel the operator bound it to, and webhookUrlEnv names that webhook",
+  "ChatPost.webhookUrlEnv": "an API-mode call names its channel, on the API apiBaseUrl names",
   "ChatUpdate.channel":
     "required in API mode; an incoming webhook posts to the channel the operator bound it to",
   "ChecksumVerify.manifest": "the manifest comes back inline; nothing is read or written",
@@ -248,7 +249,8 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "SubtitleWrite.path": "the document comes back inline; nothing is written",
   "TlsInspect.servername": "the host, which is declared, is the name sent",
   "WebhookPost.url":
-    "the URL is read from an operator-listed environment variable named in urlEnv; a deny on every call still reads the call's strings",
+    "the URL is read from an operator-listed environment variable, which urlEnv names",
+  "WebhookPost.urlEnv": "the URL is passed in url",
 };
 
 describe("an optional operative field says what leaving it out means (C004)", () => {

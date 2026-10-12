@@ -709,7 +709,13 @@ function renderMessage(
 
 export const chatPost: RegisteredTool = buildTool({
   name: "ChatPost",
-  operativeArgs: [{ field: "channel", kind: "recipient" }],
+  // In API mode the channel on the API the call names; through an incoming
+  // webhook, the variable naming it (the webhook is bound to its channel,
+  // and the tool ignores `channel` there).
+  operativeArgs: [
+    { field: "channel", kind: "recipient", service: "apiBaseUrl" },
+    { field: "webhookUrlEnv", kind: "id" },
+  ],
   description:
     "Post a message to Slack, Discord, Microsoft Teams or a generic incoming webhook, with optional heading/paragraph/fields/divider/link blocks and a thread id where the platform threads. Use it when a harness needs to tell a room something rather than reply where it was spoken to — a nightly result, an alert, a hand-off. Every value is escaped for the platform before it is sent, so text carrying <!channel>, @everyone or a code fence can change what the message SAYS but never what it DOES; mentions are additionally suppressed at the API level. One tool covers four platforms because the payload differs and the intent does not. It takes an idempotency key so a retried call returns the first result instead of posting twice, and it will not follow a redirect — a webhook URL that moved is a configuration change, not something to chase at send time.",
   inputSchema: z.object({
@@ -855,7 +861,7 @@ export const chatPost: RegisteredTool = buildTool({
 
 export const chatUpdate: RegisteredTool = buildTool({
   name: "ChatUpdate",
-  operativeArgs: [{ field: "channel", kind: "recipient" }],
+  operativeArgs: [{ field: "channel", kind: "recipient", service: "apiBaseUrl" }],
   description:
     "Edit a message this harness already posted, by its id, on a platform that allows it. Use it to keep one status message current instead of adding a new one every cycle — a deploy that goes queued → running → done reads better as one edited line than as three. It needs a bot token: an incoming webhook cannot edit, and Teams and generic webhooks cannot edit at all, so both are refused rather than silently reposted. An edit still notifies nobody, but the message is in front of people, so it carries the same gate as posting. The previous text is not returned, because the platform does not give it back.",
   inputSchema: z.object({
@@ -961,7 +967,7 @@ export const chatUpdate: RegisteredTool = buildTool({
 
 export const chatDelete: RegisteredTool = buildTool({
   name: "ChatDelete",
-  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel", service: "apiBaseUrl" }],
   description:
     "Remove a message this harness posted, by its id. Use it to retract something that was wrong, or to tidy a transient status line once the run is over. Deleting does not unsend: anyone watching the channel has already seen it, and on most platforms a tombstone or an audit entry remains, so this is a cleanup tool and not a way to take something back. It needs a bot token, works only where the platform supports deletion, and cannot delete a message this harness did not post unless the token's own permissions allow it.",
   inputSchema: z.object({
@@ -1031,7 +1037,7 @@ export const chatDelete: RegisteredTool = buildTool({
 
 export const chatReact: RegisteredTool = buildTool({
   name: "ChatReact",
-  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel", service: "apiBaseUrl" }],
   description:
     "Add an emoji reaction to a message, as the token's own user. Use it to acknowledge something cheaply — a ✅ on the alert that has been handled says as much as a reply and adds no noise. A reaction is visible to the room and shows who left it, so it counts as putting something in front of people and takes the same gate as a post. Give the emoji by name without colons on Slack, and as the literal character or name:id on Discord; an emoji the workspace does not have is refused by the platform, not invented here.",
   inputSchema: z.object({
@@ -1891,7 +1897,11 @@ export const emailSendPreflight: RegisteredTool = buildTool({
 
 export const webhookPost: RegisteredTool = buildTool({
   name: "WebhookPost",
-  operativeArgs: [{ field: "url", kind: "url" }],
+  // The URL, or the variable that holds one whose path is a secret.
+  operativeArgs: [
+    { field: "url", kind: "url" },
+    { field: "urlEnv", kind: "id" },
+  ],
   description:
     "POST a JSON payload to an allow-listed URL, optionally HMAC-signed, retrying only on 5xx and only on a backoff the call declares. Use it to hand an event to something that is not a chat platform — a pager, an internal receiver, a partner endpoint. Signing runs over the exact bytes transmitted, in either the timestamped (Stripe-style) or body-only (GitHub-style) scheme, and the timestamp is an argument rather than a clock reading so the same call signs the same way twice. The backoff is exponential with no jitter, because unseeded randomness makes a run unreproducible, and it never sleeps past the deadline. An idempotency key makes a retry safe end to end: the key travels to the receiver and a repeat call returns the first result instead of delivering again.",
   inputSchema: z.object({

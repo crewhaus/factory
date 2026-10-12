@@ -148,6 +148,22 @@ because a tool result is a transcript, a trace and usually an eval report. Every
 result — success or failure — passes through a redactor built from the resolved
 secret, in its literal, URL-encoded and base64 forms.
 
+## What a permission rule reads
+
+- **Chat.** `ChatPost` and `ChatUpdate` read the channel; `ChatDelete` and `ChatReact` read
+  `channel/messageId`. An API-mode call always names `apiBaseUrl`, so the value is matched with
+  that URL's origin in front: `alwaysAllow ChatPost(https://slack.com/C0123)`, or
+  `ChatPost(**/C0123)` for that channel on any API. A deny on an API fires on every call to it:
+  `alwaysDeny ChatPost(https://discord.com/**)`.
+- **Incoming webhooks.** A webhook posts to the channel it was created for, and `ChatPost` ignores
+  a `channel` in that call. So the rule reads `webhookUrlEnv`, the variable that names the webhook:
+  `alwaysAllow ChatPost(SLACK_OPS_WEBHOOK)`. An allow on a channel does not cover a webhook post.
+- **`WebhookPost`** reads `url`, or `urlEnv` when the URL is kept in a variable:
+  `alwaysAllow WebhookPost(DEPLOY_HOOK_URL)`.
+- **Not read:** the SMTP relay in `EmailSend`'s `host` (bounded by `allowed_smtp_hosts`), the
+  provider an SMS or push goes through (each one is yours, in `providers`), and the bot token a
+  Chat call names, which picks the workspace. A rule names who receives the message.
+
 ## Injection is the thing this package is most careful about
 
 A notification is almost always assembled from data the harness did not write:

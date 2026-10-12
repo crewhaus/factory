@@ -1,18 +1,23 @@
 /**
  * 0.7.1 — a rule on a tool that can be pointed at another API reads which API.
  *
- * The code-host tools reach the API their tool_config is set up for unless a
- * call names another in `baseUrl`, and a spec may allow-list several. A rule
- * read only the repository, so `alwaysAllow IssueCreate(acme/app)` granted
- * acme/app on every allow-listed host, and no rule could name a host. Now a
- * call that names an API is matched with that API's origin in front
- * (`https://ghe.example.com/acme/app`): an allow must name it, and a deny
- * reads the URL, the bare host and the repository on its own. A call that
- * names no API is read as before, so a spec with one host keeps its rules.
+ * The code-host tools (`baseUrl`) and the Chat tools (`apiBaseUrl`) reach the
+ * API their tool_config is set up for unless a call names another, and a spec
+ * may allow-list several. A rule read only the repository or the channel, so
+ * `alwaysAllow IssueCreate(acme/app)` granted acme/app on every allow-listed
+ * host, and no rule could name a host. Now a call that names an API is matched
+ * with that API's origin in front (`https://ghe.example.com/acme/app`): an
+ * allow must name it, and a deny reads the URL, the bare host and the
+ * repository on its own. A call that names no API is read as before, so a
+ * spec with one host keeps its rules.
+ *
+ * Through an incoming webhook, ChatPost ignores `channel` and posts where the
+ * webhook is bound; the rule now reads the variable naming the webhook
+ * (`webhookUrlEnv`), as WebhookPost's reads `urlEnv`.
  *
  * Everything runs through runChatLoop's real gate and the real tools, against
  * two loopback servers standing for two allow-listed hosts; a name resolves to
- * loopback through the package's own resolver seam. The outcome is read from
+ * loopback through each package's own resolver seam. The outcome is read from
  * what each server received.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -38,6 +43,15 @@ import {
   searchCode,
   _setDnsLookup as setCodehostDns,
 } from "@crewhaus/tool-codehost";
+import {
+  _resetIdempotencyLedger,
+  _resetNotifyConfig,
+  __setPrivateHostsAllowedForTest as allowNotifyLoopback,
+  chatPost,
+  registerNotifyConfig,
+  _setDnsLookup as setNotifyDns,
+  webhookPost,
+} from "@crewhaus/tool-notify";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +67,8 @@ function server() {
     fetch(req) {
       const url = new URL(req.url);
       got.push(`${req.method} ${url.pathname}`);
+      if (url.pathname.endsWith("chat.postMessage")) return Response.json({ ok: true, ts: "1.2" });
+      if (url.pathname.startsWith("/hooks/")) return new Response("ok");
       if (url.pathname.includes("/search/")) return Response.json({ total_count: 0, items: [] });
       if (req.method === "GET") return Response.json([]);
       return Response.json({ number: 1, title: "t", state: "open", html_url: "x" });
@@ -121,22 +137,42 @@ beforeAll(() => {
   state = mkdtempSync(join(tmpdir(), "api-hosts-state-"));
   const loopback = async () => ({ address: "127.0.0.1", family: 4 });
   setCodehostDns(loopback);
+  setNotifyDns(loopback);
   allowCodehostLoopback(true);
+  allowNotifyLoopback(true);
   process.env["API_HOSTS_TOKEN_A"] = "ghp_api_hosts_token_A_0123456789";
   process.env["API_HOSTS_TOKEN_B"] = "ghp_api_hosts_token_B_0123456789";
+  // A bot token's shape, built from parts so no scanner reads it as one.
+  process.env["API_HOSTS_BOT"] = ["xoxb", "api-hosts", "0123456789", "abcdef"].join("-");
+  process.env["API_HOSTS_HOOK"] = `${originA}/hooks/a`;
   registerCodehostConfig({
     allowed_origins: [originA, originB],
     base_url: originA,
     token_env: "API_HOSTS_TOKEN_A",
     token_envs: { API_HOSTS_TOKEN_B: [originB] },
   });
+  registerNotifyConfig({
+    allowed_origins: [originA, originB],
+    allowed_secret_envs: ["API_HOSTS_BOT", "API_HOSTS_HOOK"],
+  });
 });
 
 afterAll(() => {
   setCodehostDns(undefined);
+  setNotifyDns(undefined);
   allowCodehostLoopback(false);
+  allowNotifyLoopback(false);
   _resetCodehostConfig();
-  for (const name of ["API_HOSTS_TOKEN_A", "API_HOSTS_TOKEN_B"]) delete process.env[name];
+  _resetNotifyConfig();
+  _resetIdempotencyLedger();
+  for (const name of [
+    "API_HOSTS_TOKEN_A",
+    "API_HOSTS_TOKEN_B",
+    "API_HOSTS_BOT",
+    "API_HOSTS_HOOK",
+  ]) {
+    delete process.env[name];
+  }
   A.stop();
   B.stop();
   rmSync(state, { recursive: true, force: true });
@@ -165,7 +201,7 @@ async function call(
   const before = { a: A.got.length, b: B.got.length };
   await runChatLoop({
     model: "test-model",
-    instructions: "file the issue",
+    instructions: "file the issue and tell the room",
     runContext,
     sessionRootDir: mkdtempSync(join(state, "sess-")),
     singleTurn: true,
@@ -306,5 +342,81 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
     const rs = rules(["alwaysAllow", "IssueCreate(**)"]);
     const withUser = { ...issueOnB, baseUrl: baseB.replace("http://", "http://user:pw@") };
     expect(await call(issueCreate, withUser, rs)).toEqual({ decision: "ask", a: [], b: [] });
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// chat and webhooks
+// ---------------------------------------------------------------------------
+
+const post = {
+  platform: "slack",
+  apiBaseUrl: `${originB}/api`,
+  tokenEnv: "API_HOSTS_BOT",
+  channel: "C123",
+  text: "deploy finished",
+  justification: "tell the room",
+};
+const posted = ["POST /api/chat.postMessage"];
+
+describe("a Chat rule reads the API a call names, and a webhook post the variable naming it", () => {
+  test("an API-mode post is matched with its API's origin", async () => {
+    const bare = rules(["alwaysAllow", "ChatPost(C123)"]);
+    expect(await call(chatPost, post, bare)).toEqual({ decision: "ask", a: [], b: [] });
+    const named = rules(["alwaysAllow", `ChatPost(${originB}/C123)`]);
+    expect(await call(chatPost, post, named)).toEqual({ decision: "allow", a: [], b: posted });
+    const elsewhere = rules(["alwaysAllow", `ChatPost(${originA}/C123)`]);
+    expect(await call(chatPost, post, elsewhere)).toEqual({ decision: "ask", a: [], b: [] });
+    const deny = rules(
+      ["alwaysDeny", "ChatPost(https://ghe.example.test/**)"],
+      ["alwaysAllow", "ChatPost"],
+    );
+    expect(await call(chatPost, post, deny)).toEqual({ decision: "deny", a: [], b: [] });
+  }, 30_000);
+
+  test("an allow on a channel does not grant a webhook post, which ignores the channel", async () => {
+    // The webhook in API_HOSTS_HOOK is bound to a channel of its own; the call's
+    // `channel` is not where the post goes.
+    const hook = {
+      platform: "slack",
+      webhookUrlEnv: "API_HOSTS_HOOK",
+      channel: "C123",
+      text: "deploy finished",
+      justification: "tell the room",
+    };
+    expect(await call(chatPost, hook, rules(["alwaysAllow", "ChatPost(C123)"]))).toEqual({
+      decision: "ask",
+      a: [],
+      b: [],
+    });
+    const { channel: _channel, ...plain } = hook;
+    expect(await call(chatPost, plain, rules(["alwaysAllow", "ChatPost(API_HOSTS_HOOK)"]))).toEqual(
+      { decision: "allow", a: ["POST /hooks/a"], b: [] },
+    );
+    const deny = rules(["alwaysDeny", "ChatPost(API_HOSTS_HOOK)"], ["alwaysAllow", "ChatPost"]);
+    expect(await call(chatPost, plain, deny)).toEqual({ decision: "deny", a: [], b: [] });
+  }, 30_000);
+
+  test("WebhookPost reads the variable a call names its URL through", async () => {
+    const hook = {
+      urlEnv: "API_HOSTS_HOOK",
+      payload: { event: "deploy", link: "http://status.example.test/1" },
+      justification: "tell the room",
+    };
+    expect(
+      await call(webhookPost, hook, rules(["alwaysAllow", "WebhookPost(API_HOSTS_HOOK)"])),
+    ).toEqual({ decision: "allow", a: ["POST /hooks/a"], b: [] });
+    const deny = rules(
+      ["alwaysDeny", "WebhookPost(API_HOSTS_HOOK)"],
+      ["alwaysAllow", "WebhookPost"],
+    );
+    expect(await call(webhookPost, hook, deny)).toEqual({ decision: "deny", a: [], b: [] });
+    // A link in the payload is not where the post goes.
+    const link = rules(["alwaysDeny", "WebhookPost(http://**)"], ["alwaysAllow", "WebhookPost"]);
+    expect(await call(webhookPost, hook, link)).toEqual({
+      decision: "allow",
+      a: ["POST /hooks/a"],
+      b: [],
+    });
   }, 30_000);
 });
