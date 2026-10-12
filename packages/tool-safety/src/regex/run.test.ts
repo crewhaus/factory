@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worker-clock";
 import {
   REGEX_RUN_DEFAULTS,
@@ -43,9 +43,45 @@ afterAll(async () => {
   await settleWorkers(60_000);
 });
 
-// A body abandoned at its budget never reaches a finally of its own, so the
-// real Worker is put back here, after every test.
-afterEach(restoreWorkerClock);
+/** The worker's real give-up threshold and run deadline, taken before any test moves them. */
+const REAL = { giveUpMs: REGEX_RUN_DEFAULTS.giveUpMs, deadlineMs: REGEX_RUN_DEFAULTS.deadlineMs };
+const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number; deadlineMs: number };
+
+/**
+ * Every test here gets definite answers unless it is about give-ups.
+ *
+ * The worker reports a failing `exec` that took giveUpMs (100 ms) as the
+ * engine giving up, so one preemption of the worker thread that long inside
+ * a no-match turned "no match" into "gave-up", and a stall past the default
+ * 1 s deadline turned a run into a timeout: a dozen tests failed under one
+ * injected 110 ms worker stall, and more under a worker clock moved 150 ms
+ * per read. Both are held out of any runner's reach here. A deadline a test
+ * passes is its own; the 60 s default only stops a hang. A test about
+ * give-ups scripts the worker's clock instead ({@link scriptedGiveUps}).
+ */
+beforeEach(() => {
+  defaults.giveUpMs = 60_000;
+  defaults.deadlineMs = 60_000;
+});
+
+// A body abandoned at its budget never reaches a finally of its own, so
+// everything is put back here, after every test.
+afterEach(() => {
+  restoreWorkerClock();
+  defaults.giveUpMs = REAL.giveUpMs;
+  defaults.deadlineMs = REAL.deadlineMs;
+});
+
+/**
+ * For a test about give-ups: the real threshold, against a worker clock on
+ * which each input in `costs` takes that many milliseconds and every other
+ * input none (see {@link scriptWorkerClock}). Which inputs give up is then
+ * the test's to say, on any machine and under any stall.
+ */
+function scriptedGiveUps(costs: Record<string, number>): void {
+  defaults.giveUpMs = REAL.giveUpMs;
+  scriptWorkerClock(costs);
+}
 
 /**
  * Screen-passing, and still abandoned by JavaScriptCore: four adjacent loops
@@ -252,7 +288,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
     // time it took tells it from a real no-match, and an engine a few times
     // faster than this one made it look like one. The worker's clock is
     // scripted to what a give-up costs; the deadline only stops a hang.
-    scriptWorkerClock({ [GIVES_UP.input]: GIVE_UP_COST_MS });
+    scriptedGiveUps({ [GIVES_UP.input]: GIVE_UP_COST_MS });
     const outcome = await runRegex({ op: "test", ...GIVES_UP, deadlineMs: 30_000 });
     expect(outcome).toMatchObject({ status: "gave-up", execMs: GIVE_UP_COST_MS });
     expect(regexVerdict(outcome)).toBe("undetermined");
@@ -263,7 +299,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
     // A genuine no-match the worker's clock says took a second. "none" is
     // tried in the same group of inputs, takes no time, and is a definite no.
     const slow = "spaces, then y";
-    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
+    scriptedGiveUps({ [slow]: GIVE_UP_COST_MS });
     const outcome = await runRegex({
       op: "testEach",
       pattern: "\\s+$",
@@ -554,7 +590,7 @@ describe("batch ops", () => {
     // at once; the worker's clock says it took as long as a give-up does.
     // "no" is the same kind of answer, quick, and stays a definite no.
     const slow = "a".repeat(12);
-    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
+    scriptedGiveUps({ [slow]: GIVE_UP_COST_MS });
     const session = openRegexSession();
     try {
       const each = await session.run({
@@ -624,7 +660,7 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
   test("one slow no-match among quick ones is the only undetermined input", async () => {
     // Slow on the worker's scripted clock; every other input takes no time.
     const slow = "row 101 is slow";
-    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
+    scriptedGiveUps({ [slow]: GIVE_UP_COST_MS });
     const inputs: string[] = [];
     for (let i = 0; i < 200; i++) inputs.push(i % 7 === 0 ? `row ${i} ends  ` : `row ${i}`);
     inputs[101] = slow;
@@ -748,7 +784,7 @@ describe("testEach over one text's lines ({ lines })", () => {
   test("a slow no-match is still undetermined, never a miss", async () => {
     // Slow on the worker's scripted clock; "none" beside it takes no time.
     const slow = "spaces, then y";
-    scriptWorkerClock({ [slow]: GIVE_UP_COST_MS });
+    scriptedGiveUps({ [slow]: GIVE_UP_COST_MS });
     const outcome = await runRegex({
       op: "testEach",
       pattern: "\\s+$",
