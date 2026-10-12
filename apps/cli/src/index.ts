@@ -1279,6 +1279,7 @@ import {
   buildProposalAuditPayload,
   buildProposalPrPlan,
 } from "./propose";
+import { redactInTurn } from "./redact-in-turn";
 // E49 — `crewhaus redteam generate|report`: the behaviour-taxonomy attack
 // generator (deterministic + offline; attack strings composed from inert
 // parts) and the attack-success-rate report. Pure module — the registry
@@ -21706,18 +21707,7 @@ function watchmeGlobalRoot(rootFlag: string | undefined): string {
  * `[REDACTED:<kind>]` replace marker.
  */
 function watchmeSyncRedactor(): (text: string) => string {
-  const detectors = SYNTHESIZE_PII_DETECTORS.map((d) => ({
-    kind: d.kind,
-    regex: new RegExp(
-      d.regex.source,
-      d.regex.flags.includes("g") ? d.regex.flags : `${d.regex.flags}g`,
-    ),
-  }));
-  return (text: string): string => {
-    let out = text;
-    for (const d of detectors) out = out.replace(d.regex, `[REDACTED:${d.kind}]`);
-    return out;
-  };
+  return (text: string): string => redactInTurn(text, SYNTHESIZE_PII_DETECTORS);
 }
 
 /** The one-criterion turn-quality rubric the watchme judge phase scores
