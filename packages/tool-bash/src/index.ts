@@ -3,6 +3,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
+import { withoutTrailingNewlines } from "./trailing";
 
 /**
  * Built-in Bash tool family. Layer R4. Pairs with the `target-cli` codegen
@@ -167,10 +168,10 @@ function publishProgramOutput(
 
 function formatResult(out: BashOutputResult): string {
   const parts: string[] = [];
-  if (out.stdout.length > 0) parts.push(out.stdout.replace(/\n+$/, ""));
+  if (out.stdout.length > 0) parts.push(withoutTrailingNewlines(out.stdout));
   if (out.stderr.length > 0) {
     parts.push("[stderr]");
-    parts.push(out.stderr.replace(/\n+$/, ""));
+    parts.push(withoutTrailingNewlines(out.stderr));
   }
   const exitLine = out.timedOut
     ? `[exit] ${out.exitCode} (timed out after ${out.timeoutMs}ms)`
@@ -314,10 +315,10 @@ export const bashOutput: RegisteredTool = buildTool({
           : `[status] exited ${bg.exitCode ?? "?"}`;
 
     const parts: string[] = [];
-    if (newStdout.length > 0) parts.push(newStdout.replace(/\n+$/, ""));
+    if (newStdout.length > 0) parts.push(withoutTrailingNewlines(newStdout));
     if (newStderr.length > 0) {
       parts.push("[stderr]");
-      parts.push(newStderr.replace(/\n+$/, ""));
+      parts.push(withoutTrailingNewlines(newStderr));
     }
     if (parts.length === 0) parts.push("[no new output]");
     if (bg.truncated) parts.push("[note] earlier output was truncated (buffer cap reached)");
