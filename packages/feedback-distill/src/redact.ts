@@ -13,6 +13,7 @@ import {
   type PiiDetector,
   type PiiHit,
   detectPii,
+  replaceValues,
 } from "@crewhaus/pii-redactor";
 
 /**
@@ -76,10 +77,8 @@ export function redactText(
 ): string {
   const hits = dedupePiiHits(detectPii(text, detectors)).filter((h) => h.value.length > 0);
   if (hits.length === 0) return text;
-  const sorted = [...hits].sort((a, b) => b.value.length - a.value.length);
-  let out = text;
-  for (const hit of sorted) {
-    out = out.split(hit.value).join(`[REDACTED:${hit.kind}]`);
-  }
-  return out;
+  // The redactor's own replacement, so the two cannot drift: widest value
+  // first, each everywhere, in one scan of the text rather than one per
+  // distinct value.
+  return replaceValues(text, hits, (hit) => `[REDACTED:${hit.kind}]`);
 }
