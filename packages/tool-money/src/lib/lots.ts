@@ -175,6 +175,10 @@ export function computeCostBasis(
   const fromTheEnd = function* (): Generator<OpenLot> {
     for (let i = queue.length - 1; i >= 0; i--) yield queue[i] as OpenLot;
   };
+  // Every lot by its id, built once, for the specific method. A lot is open
+  // while it has units left; that is read at lookup, where an index of the
+  // open lots rebuilt for every disposal cost the lots times the disposals.
+  const lotById = new Map(method === "specific" ? open.map((lot) => [lot.id, lot]) : []);
 
   for (const disposal of disposals) {
     const disposedMs = instant(disposal.disposedAt, `disposal "${disposal.id}" disposedAt`);
@@ -187,10 +191,9 @@ export function computeCostBasis(
           `disposal "${disposal.id}" uses the specific-identification method but names no lots`,
         );
       }
-      const index = new Map(open.filter((l) => l.remainingUnits > 0n).map((l) => [l.id, l]));
       order = wanted.map((id) => {
-        const lot = index.get(id);
-        if (!lot) {
+        const lot = lotById.get(id);
+        if (lot === undefined || lot.remainingUnits <= 0n) {
           throw new Error(`disposal "${disposal.id}" names lot "${id}", which is not open`);
         }
         return lot;

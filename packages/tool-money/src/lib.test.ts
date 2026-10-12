@@ -631,6 +631,41 @@ describe("cost basis", () => {
     expect(fifo.value?.disposals).toHaveLength(n);
     expect(hifo.value?.disposals).toHaveLength(n);
   });
+
+  test("specific identification finds each named lot without an index per disposal", () => {
+    // The open lots were indexed afresh for every disposal: the lots times
+    // the disposals, a hundred million at the schema's ten thousand of
+    // each. Counted, not timed: the index is built once, so the loops visit
+    // a bounded number of elements a lot.
+    const n = 3000;
+    const many = Array.from({ length: n }, (_, i) => ({
+      id: `l${i}`,
+      acquiredAt: new Date(Date.UTC(2020, 0, 1) + i * 3_600_000).toISOString(),
+      quantity: 1,
+      costMinor: 1000 + ((i * 7919) % 100_000),
+    }));
+    // Each disposal names a lot, later ones the lots earlier ones emptied
+    // first, so a lot that is no longer open must still be told apart.
+    const sells = Array.from({ length: n }, (_, i) => ({
+      id: `d${i}`,
+      disposedAt: new Date(Date.UTC(2025, 0, 1) + i * 60_000).toISOString(),
+      quantity: 0.5,
+      proceedsMinor: 5000,
+      lotIds: [`l${Math.floor(i / 2)}`],
+    }));
+    const limits = { sorted: 2 * n, iterated: 32 * n };
+    const run = arrayWork(limits, () => computeCostBasis(many, sells, "specific"));
+    expect(run.iterated).toBeLessThanOrEqual(limits.iterated);
+    expect(run.value?.disposals).toHaveLength(n);
+    expect(run.value?.remainingLots).toHaveLength(n / 2);
+    expect(() =>
+      computeCostBasis(
+        many,
+        [...sells, { ...(sells[0] as (typeof sells)[0]), id: "again", lotIds: ["l0"] }],
+        "specific",
+      ),
+    ).toThrow('disposal "again" names lot "l0", which is not open');
+  });
 });
 
 describe("spend limits", () => {
