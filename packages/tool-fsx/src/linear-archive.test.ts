@@ -12,6 +12,8 @@
  *     a header of k zeros before `1 ` cost k² character reads.
  *   - A zip symlink's target was inflated whole before its length was
  *     checked, once per member, and members can share one bomb.
+ *   - ArchiveExtract looked each staged top-level name up in the list of the
+ *     index's, n² comparisons for n names.
  *
  * Each rewrite is held to the 0.7.1 code it replaced, kept below as the
  * reference, on generated and hostile archives.
@@ -822,6 +824,81 @@ describe("ArchiveList and ArchiveExtract's dry run, on a tiny archive with very 
     expect(work).toBeLessThanOrEqual(16 * k);
     expect(parsed(value).entries.map((e: { name: string }) => e.name)).toEqual(["plain.txt"]);
   }, 20_000);
+});
+
+/**
+ * The elements the array searches visit while `body` runs: `includes`,
+ * `indexOf` and `lastIndexOf` (the array's length), and each callback
+ * `some`, `every`, `find`, `findIndex` and `filter` run. An extraction's
+ * size watch runs on a timer and uses none of these, so the count is the
+ * same however long the extractor takes.
+ */
+async function searchWork<T>(body: () => Promise<T>): Promise<{ value: T; visits: number }> {
+  const arrays = Array.prototype as unknown as Methods;
+  const counter = { visits: 0 };
+  const saved: Array<{ name: string; real: Fn }> = [];
+  for (const name of ["includes", "indexOf", "lastIndexOf"]) {
+    const real = arrays[name] as Fn;
+    saved.push({ name, real });
+    arrays[name] = function (this: unknown, ...args: unknown[]) {
+      counter.visits += (this as unknown[]).length;
+      return real.apply(this, args);
+    };
+  }
+  for (const name of ["some", "every", "find", "findIndex", "filter"]) {
+    const real = arrays[name] as Fn;
+    saved.push({ name, real });
+    arrays[name] = function (this: unknown, fn: unknown, thisArg?: unknown) {
+      return real.call(this, (...args: unknown[]) => {
+        counter.visits += 1;
+        return (fn as Fn).apply(thisArg, args);
+      });
+    };
+  }
+  try {
+    return { value: await body(), visits: counter.visits };
+  } finally {
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const one = saved[i] as (typeof saved)[number];
+      arrays[one.name] = one.real;
+    }
+  }
+}
+
+const hasTar = Bun.which("tar") !== null;
+
+describe.if(hasTar)("ArchiveExtract checks the staged top-level names once each", () => {
+  const originalCwd = process.cwd();
+  let ws: string;
+  beforeEach(() => {
+    ws = mkdtempSync(path.join(tmpdir(), "crewhaus-fsx-linear-extract-"));
+    process.chdir(ws);
+  });
+  afterEach(() => {
+    process.chdir(originalCwd);
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  test("hundreds of top-level names: double them, double the searching", async () => {
+    // Each staged name was looked for in the index's list of top-level
+    // names, n² visits in all; at the 200,000-member cap that is 2e10.
+    const counted: Array<{ n: number; visits: number }> = [];
+    for (const n of [300, 600]) {
+      const names = Array.from({ length: n }, (_, i) => `f${String(i).padStart(4, "0")}`);
+      writeFileSync(`t${n}.tar`, longNameTar(names.map((name) => ({ name, kind: "file" }))));
+      mkdirSync(`d${n}`);
+      const { value, visits } = await searchWork(() =>
+        archiveExtract.execute({ archive: `t${n}.tar`, destination: `d${n}` }),
+      );
+      const out = parsed(value);
+      expect(out.extracted).toBe(true);
+      expect(out.entries).toEqual(names);
+      expect(visits).toBeLessThanOrEqual(16 * n);
+      counted.push({ n, visits });
+    }
+    const [small, large] = counted as [(typeof counted)[0], (typeof counted)[0]];
+    expect(large.visits / small.visits).toBeLessThan(2.25);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

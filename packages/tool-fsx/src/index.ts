@@ -2270,7 +2270,10 @@ export const archiveExtract: RegisteredTool = buildTool({
     // An INCOMPLETE scan is refused on the same terms — a gate that could not
     // read part of the tree has not cleared it.
     const scan = scanStagedTree(staging);
-    const unlisted = readdirSorted(staging).filter((name) => !topLevel.includes(name));
+    // A set, not a scan of the list per name: an archive of n top-level names
+    // made n² comparisons here, 2e10 at the 200,000-member cap.
+    const listed = new Set(topLevel);
+    const unlisted = readdirSorted(staging).filter((name) => !listed.has(name));
     const understated = format === "zip" && scan.bytes > totalBytes;
     if (
       scan.escaping.length > 0 ||
