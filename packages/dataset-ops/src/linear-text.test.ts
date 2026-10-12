@@ -1,9 +1,11 @@
 /**
  * linear-text.ts replaces patterns that rescanned a run from every position
  * in it. Each helper must give exactly what its pattern gave, and reading a
- * long run must not run a pattern over it.
+ * long run must neither run a pattern over it nor read it more than a few
+ * times by hand.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { templateParaphrases } from "./dataset-mine";
 import { cleanRationale, parseRubricSuggestion } from "./graders-suggest";
 import {
@@ -167,10 +169,9 @@ describe("each helper gives what its pattern gave", () => {
   }, 20_000);
 });
 
-// Counted, not timed: the only place quadratic work could hide in reading
-// these texts is a pattern run over the run, so each one is refused and
-// recorded. Collapsing whitespace with /\s+/g needs no suffix after its run,
-// so it stays linear and is allowed.
+// Counted, not timed: a pattern run over the run is refused and recorded.
+// Collapsing whitespace with /\s+/g needs no suffix after its run, so it
+// stays linear and is allowed. The helpers' own reads are counted below.
 describe("long runs", () => {
   test("a rationale that is a run of [ or of judge prefixes runs no rescanning pattern", () => {
     const brackets = "[".repeat(10_000);
@@ -210,6 +211,50 @@ describe("long runs", () => {
     expect(paraphrased.refused).toEqual([]);
     expect((paraphrased.outcome as string[])[1]).toBe(
       `I need help with this: fix it${"?".repeat(1_000_000)}now.`,
+    );
+  });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a
+// search that resumes one character on, or one with no lower bound), so each
+// helper's own reads are counted (__test__/scan-work.ts) over a run shaped to
+// make it rescan, and held to a few per character. A rescan reads the rest of
+// the run from every place in it and stops at the bound at once: before the
+// judge-prefix search was bounded by its own `(`, a rationale of
+// `judge=1 (x):` read hundreds of characters for every one of it.
+describe("each helper reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a run of { with no }", firstObjectSpan, "{".repeat(N)],
+    ["a run of } after one {", firstObjectSpan, `{${"}".repeat(N)}`],
+    ["a word and a run of closing marks", withoutClosingMarks, `x${"?".repeat(N)}`],
+    ["a run of [ before one ]", withoutCombinatorMarkers, `${"[".repeat(N)}]`],
+    ["markers with no mark", withoutCombinatorMarkers, fill("[x: ]")],
+    ["judge prefixes with no need ≥", withoutJudgePrefixes, fill("judge=1 (x):")],
+    ["abstentions with no need ≥", withoutJudgePrefixes, fill("judge abstained (x):")],
+    ["judge prefixes with no )", withoutJudgePrefixes, fill("judge=1 (")],
+    ["judge prefixes before one )", withoutJudgePrefixes, `${fill("judge=1 (")})`],
+    ["a run of need ≥ inside one prefix", withoutJudgePrefixes, `judge=1 (${fill("need ≥")}x):`],
+    ["judge prefixes that all match", withoutJudgePrefixes, fill("judge=1 (need ≥2): ")],
+  ];
+  for (const [label, helper, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => helper(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a helper that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
+
+  test("a rationale of judge prefixes with no need ≥ is cleaned as the pattern cleaned it", () => {
+    const text = "judge=1 (x): ".repeat(500);
+    expect(withoutJudgePrefixes(text)).toBe(byPattern.judge(text));
+    expect(withoutJudgePrefixes(`${text}judge=2 (need ≥3): y`)).toBe(
+      byPattern.judge(`${text}judge=2 (need ≥3): y`),
     );
   });
 });

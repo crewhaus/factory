@@ -79,7 +79,11 @@ const NEED = "need ≥";
  * After its `(`, a prefix runs to the first `)`, which must be followed by
  * `:` and preceded by `need ≥` and a number. Every `judge` before that `)`
  * meets the same `)` and the same text before it, so when it fails they all
- * do, and the search resumes after the `)`.
+ * do, and the search resumes after the `)`. The `need ≥` is looked for only
+ * between the `(` and the `)`: those stretches do not overlap, so each
+ * character is read a bounded number of times. (A search back from the `)`
+ * with no lower bound read to the start of the text for every prefix that
+ * had none: quadratic in a rationale of `judge=1 (x):`.)
  */
 export function withoutJudgePrefixes(text: string): string {
   let out = "";
@@ -96,8 +100,8 @@ export function withoutJudgePrefixes(text: string): string {
     const close = text.indexOf(")", inside);
     if (close === -1) break;
     if (text.charCodeAt(close + 1) === 0x3a /* : */) {
-      const need = text.lastIndexOf(NEED, close - NEED.length);
-      if (need >= inside && numberEnd(text, need + NEED.length) === close) {
+      const need = text.slice(inside, close).lastIndexOf(NEED);
+      if (need !== -1 && numberEnd(text, inside + need + NEED.length) === close) {
         out += `${text.slice(kept, start)} `;
         kept = close + 2;
         from = close + 2;
