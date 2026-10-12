@@ -3,6 +3,7 @@ import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worke
 import {
   REGEX_RUN_DEFAULTS,
   type RegexOutcome,
+  type RegexSession,
   type TestResult,
   describeRegexOutcome,
   openRegexSession,
@@ -72,9 +73,28 @@ function releaseDeadline(): void {
   heldDeadline.restore = undefined;
 }
 
+/**
+ * Every session a test opened through {@link openSession}, closed after it.
+ *
+ * A test abandoned at its budget never reaches its own `finally`, and its
+ * session stayed open with the worker busy: under a 1.5 s delay on every
+ * request, the 540 runs of the built-in comparison went on for minutes, and
+ * four later tests that wait for the workers to exit failed with it, each
+ * passing alone. Closed, the worker is stopped, and the abandoned body's
+ * next run answers `closed` at once instead of starting more work.
+ */
+const openedSessions: RegexSession[] = [];
+
+function openSession(): RegexSession {
+  const session = openRegexSession();
+  openedSessions.push(session);
+  return session;
+}
+
 // A body abandoned at its budget never reaches a finally of its own, so
-// everything is put back here, after every test.
+// everything is put back here, after every test, its sessions closed first.
 afterEach(() => {
+  for (const session of openedSessions.splice(0)) session.close();
   releaseDeadline();
   restoreWorkerClock();
   defaults.giveUpMs = REAL.giveUpMs;
@@ -142,7 +162,7 @@ const GIVE_UP_COST_MS = 1_000;
 
 describe("runRegex: answers", () => {
   test("test, matchAll, replace, split, testEach and firstMatchingRule", async () => {
-    const session = openRegexSession();
+    const session = openSession();
     try {
       expect(await session.run({ op: "test", pattern: "b", input: "abc" })).toMatchObject({
         status: "ok",
@@ -209,7 +229,7 @@ describe("runRegex: answers", () => {
       ["a", "gy"],
     ];
     const inputs = ["aabab", "", "b\u{1F600}a", "ABab"];
-    const session = openRegexSession();
+    const session = openSession();
     let compared = 0;
     try {
       for (const [pattern, flags] of patterns) {
@@ -242,7 +262,10 @@ describe("runRegex: answers", () => {
       session.close();
     }
     expect(compared).toBe(patterns.length * inputs.length * (replacements.length + 4 + 1));
-  });
+    // 540 runs, one after another on one worker: slow by construction, its
+    // time is 540 round trips (40-52 ms on CI). The budget still covers a
+    // worker that takes 150 ms to answer each one, as an injected delay does.
+  }, 120_000);
 
   test("matchAll and split say when they stopped at a cap, and which cap", async () => {
     const byCount = await runRegex({ op: "matchAll", pattern: "a", input: "aaaa", maxMatches: 2 });
@@ -375,7 +398,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
       }
     }
     (globalThis as { Worker: unknown }).Worker = Watched;
-    const session = openRegexSession();
+    const session = openSession();
     try {
       // Warm the worker so start-up is not part of the run.
       expect((await session.run({ op: "test", pattern: "a", input: "a" })).status).toBe("ok");
@@ -636,7 +659,7 @@ describe("batch ops", () => {
     // "no" is the same kind of answer, quick, and stays a definite no.
     const slow = "a".repeat(12);
     scriptedGiveUps({ [slow]: GIVE_UP_COST_MS });
-    const session = openRegexSession();
+    const session = openSession();
     try {
       const each = await session.run({
         op: "testEach",
@@ -934,7 +957,7 @@ describe("abort and busy", () => {
 describe("sessions", () => {
   test("one warm worker serves every run until the session closes", async () => {
     await settleWorkers(60_000);
-    const session = openRegexSession();
+    const session = openSession();
     const outcomes = await Promise.all(
       Array.from({ length: 20 }, (_, i) =>
         session.run({ op: "test", pattern: String(i % 10), input: "0123456789" }),
@@ -951,7 +974,7 @@ describe("sessions", () => {
   });
 
   test("closing mid-run resolves the run as closed instead of leaving it hanging", async () => {
-    const session = openRegexSession();
+    const session = openSession();
     const pending = session.run({
       op: "test",
       pattern: "\\s+$|x",
