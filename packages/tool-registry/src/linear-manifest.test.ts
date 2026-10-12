@@ -61,28 +61,43 @@ function rng(start: number): () => number {
 
 /**
  * Every `LineIndex` that answered a line while `body` ran, how many lines
- * they answered, and the steps they took, building included. `body` may be
- * asynchronous; the count runs until it settles.
+ * they answered, and the steps they took, building included; and the
+ * characters every `JsonMembers` that located something scanned. `body` may
+ * be asynchronous; the count runs until it settles.
  */
-async function lineWork<T>(
-  body: () => T | Promise<T>,
-): Promise<{ value: T; indexes: number; lines: number; steps: number }> {
-  const proto = LineIndex.prototype;
-  const real = proto.lineAt;
-  const used = new Set<LineIndex>();
+async function scanWork<T>(body: () => T | Promise<T>): Promise<{
+  value: T;
+  indexes: number;
+  lines: number;
+  steps: number;
+  jsonSteps: number;
+}> {
+  const lineProto = LineIndex.prototype;
+  const realLineAt = lineProto.lineAt;
+  const jsonProto = JsonMembers.prototype;
+  const realLocate = jsonProto.locate;
+  const indexes = new Set<LineIndex>();
+  const readers = new Set<JsonMembers>();
   const tally = { lines: 0 };
-  proto.lineAt = function (this: LineIndex, at: number) {
-    used.add(this);
+  lineProto.lineAt = function (this: LineIndex, at: number) {
+    indexes.add(this);
     tally.lines += 1;
-    return real.call(this, at);
+    return realLineAt.call(this, at);
+  };
+  jsonProto.locate = function (this: JsonMembers, path: readonly string[]) {
+    readers.add(this);
+    return realLocate.call(this, path);
   };
   try {
     const value = await body();
     let steps = 0;
-    for (const index of used) steps += index.steps;
-    return { value, indexes: used.size, lines: tally.lines, steps };
+    for (const index of indexes) steps += index.steps;
+    let jsonSteps = 0;
+    for (const reader of readers) jsonSteps += reader.steps;
+    return { value, indexes: indexes.size, lines: tally.lines, steps, jsonSteps };
   } finally {
-    proto.lineAt = real;
+    lineProto.lineAt = realLineAt;
+    jsonProto.locate = realLocate;
   }
 }
 
@@ -284,7 +299,7 @@ describe("a manifest is read in one pass", () => {
       for (const count of [4_000, 8_000]) {
         const text = make(count);
         const limit = WORK_PER_CHARACTER * text.length;
-        const lines = await lineWork(() => jsWork(limit, () => collectSites(kind, text)));
+        const lines = await scanWork(() => jsWork(limit, () => collectSites(kind, text)));
         const run = lines.value;
         expect(run.work).toBeLessThanOrEqual(limit);
         const out = run.value;
@@ -296,7 +311,10 @@ describe("a manifest is read in one pass", () => {
         });
         const probes = Math.ceil(Math.log2(text.length)) + 1;
         expect(lines.steps).toBeLessThanOrEqual(text.length + count * probes);
-        measured.push(run.work + lines.steps);
+        // The JSON scanner reads the file once for the top-level object and
+        // once more for the sections inside it, however many it locates.
+        expect(lines.jsonSteps).toBeLessThanOrEqual(2 * text.length);
+        measured.push(run.work + lines.steps + lines.jsonSteps);
       }
       expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
     }, 20_000);
@@ -315,7 +333,7 @@ describe("a manifest is read in one pass", () => {
       });
       // The manifest as read, and as it would be after the edit.
       const limit = WORK_PER_CHARACTER * 2 * text.length;
-      const lines = await lineWork(() =>
+      const lines = await scanWork(() =>
         jsWorkAsync(limit, () => tool.execute(input, {} as never)),
       );
       const run = lines.value;
@@ -331,7 +349,23 @@ describe("a manifest is read in one pass", () => {
       // One line index for each of the two texts.
       expect(lines.indexes).toBe(2);
       expect(lines.steps).toBeLessThanOrEqual(limit);
-      measured.push(run.work + lines.steps);
+      expect(lines.jsonSteps).toBeLessThanOrEqual(2 * 2 * text.length);
+      measured.push(run.work + lines.steps + lines.jsonSteps);
+    }
+    expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
+  }, 20_000);
+
+  test("a package.json that opens with a long run of whitespace", async () => {
+    const measured: number[] = [];
+    for (const count of [4_000, 8_000]) {
+      // As much blank space before the object as there is object.
+      const body = packageJson(count);
+      const text = `${" \n".repeat(body.length / 2)}${body}`;
+      const run = await scanWork(() => collectSites("package.json", text));
+      expect(run.value.ok && run.value.sites.length).toBe(count);
+      // The blank space is skipped once, not once per dependency.
+      expect(run.jsonSteps).toBeLessThanOrEqual(2 * text.length);
+      measured.push(run.jsonSteps);
     }
     expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(2.4);
   }, 20_000);

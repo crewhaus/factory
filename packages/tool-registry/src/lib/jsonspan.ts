@@ -29,9 +29,13 @@ export type JsonLocate =
     }
   | { readonly ok: false; readonly kind: JsonLocateFailure; readonly reason: string };
 
-function skipWs(text: string, from: number): number {
+/** Characters the scan has visited, which a test reads off a `JsonMembers`. */
+type Steps = { steps: number };
+
+function skipWs(text: string, from: number, count: Steps): number {
   let i = from;
   while (i < text.length) {
+    count.steps++;
     const c = text[i];
     // A byte-order mark is not whitespace to the language, but it is exactly
     // as meaningless here — and a manifest written on Windows can start with
@@ -45,10 +49,11 @@ function skipWs(text: string, from: number): number {
 type Read = { end: number } | null;
 
 /** The offset past a JSON string starting at `from` (which must be a quote). */
-function readString(text: string, from: number): Read {
+function readString(text: string, from: number, count: Steps): Read {
   if (text[from] !== '"') return null;
   let i = from + 1;
   while (i < text.length) {
+    count.steps++;
     const c = text[i];
     if (c === "\\") {
       i += 2;
@@ -72,18 +77,19 @@ function decodeString(raw: string): string | null {
 }
 
 /** The offset past any JSON value starting at `from`. */
-function readValue(text: string, from: number): Read {
+function readValue(text: string, from: number, count: Steps): Read {
   const c = text[from];
   if (c === undefined) return null;
-  if (c === '"') return readString(text, from);
+  if (c === '"') return readString(text, from, count);
   if (c === "{" || c === "[") {
     const close = c === "{" ? "}" : "]";
     let depth = 0;
     let i = from;
     while (i < text.length) {
+      count.steps++;
       const ch = text[i];
       if (ch === '"') {
-        const str = readString(text, i);
+        const str = readString(text, i, count);
         if (str === null) return null;
         i = str.end;
         continue;
@@ -100,6 +106,7 @@ function readValue(text: string, from: number): Read {
   // number, true, false, null — everything up to the next structural byte.
   let i = from;
   while (i < text.length) {
+    count.steps++;
     const ch = text[i];
     if (ch === "," || ch === "}" || ch === "]" || ch === undefined) break;
     if (ch === " " || ch === "\n" || ch === "\t" || ch === "\r") break;
@@ -126,7 +133,7 @@ type Members = {
  * can: to the closing brace, to the end of the text, or to the first thing
  * it cannot read, which `stop` names.
  */
-function readMembers(text: string, from: number): Members | Failure {
+function readMembers(text: string, from: number, count: Steps): Members | Failure {
   if (text[from] !== "{") {
     return { ok: false, kind: "notAnObject", reason: `expected an object at offset ${from}` };
   }
@@ -135,25 +142,25 @@ function readMembers(text: string, from: number): Members | Failure {
     byName,
     stop: { ok: false, kind: "malformed", reason },
   });
-  let i = skipWs(text, from + 1);
+  let i = skipWs(text, from + 1, count);
   if (text[i] === "}") return { byName, stop: undefined };
   while (i < text.length) {
-    const keyRead = readString(text, i);
+    const keyRead = readString(text, i, count);
     if (keyRead === null) return stopped(`unreadable key at offset ${i}`);
     const name = decodeString(text.slice(i, keyRead.end));
     if (name === null) return stopped(`unreadable key at offset ${i}`);
-    const colon = skipWs(text, keyRead.end);
+    const colon = skipWs(text, keyRead.end, count);
     if (text[colon] !== ":") return stopped(`expected ":" at offset ${colon}`);
-    const valueStart = skipWs(text, colon + 1);
-    const value = readValue(text, valueStart);
+    const valueStart = skipWs(text, colon + 1, count);
+    const value = readValue(text, valueStart, count);
     if (value === null) return stopped(`unreadable value at offset ${valueStart}`);
     const seen = byName.get(name);
     if (seen === undefined)
       byName.set(name, { hit: { valueStart, valueEnd: value.end }, repeated: false });
     else seen.repeated = true;
-    const next = skipWs(text, value.end);
+    const next = skipWs(text, value.end, count);
     if (text[next] === ",") {
-      i = skipWs(text, next + 1);
+      i = skipWs(text, next + 1, count);
       continue;
     }
     if (text[next] === "}") break;
@@ -202,16 +209,22 @@ function memberOf(members: Members | Failure, key: string): Failure | MemberHit 
  * read. The answers are `locateJsonMember`'s, which is built on this.
  */
 export class JsonMembers {
+  /** Characters scanned so far, across every object read. */
+  steps = 0;
   private readonly objects = new Map<number, Members | Failure>();
+  /** Where the top-level value starts, past any leading whitespace. */
+  private readonly start: number;
 
-  constructor(private readonly text: string) {}
+  constructor(private readonly text: string) {
+    this.start = skipWs(text, 0, this);
+  }
 
   /** Find `path` (e.g. `["dependencies", "left-pad"]`) and return where it is. */
   locate(path: readonly string[]): JsonLocate {
     if (path.length === 0) {
       return { ok: false, kind: "malformed", reason: "no member path was given" };
     }
-    let at = skipWs(this.text, 0);
+    let at = this.start;
     for (let depth = 0; depth < path.length; depth++) {
       const result = memberOf(this.objectAt(at), path[depth] as string);
       if ("ok" in result) {
@@ -240,7 +253,7 @@ export class JsonMembers {
   private objectAt(from: number): Members | Failure {
     const known = this.objects.get(from);
     if (known !== undefined) return known;
-    const read = readMembers(this.text, from);
+    const read = readMembers(this.text, from, this);
     this.objects.set(from, read);
     return read;
   }
