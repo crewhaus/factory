@@ -38,6 +38,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import type { LoggedEvent } from "@crewhaus/feedback-distill";
 import { REGEX_RULES } from "@crewhaus/prompt-injection-detector";
 import { normalizeEvidenceTokens } from "./graders-suggest";
+import { withoutClosingMarks } from "./linear-text";
 
 /** Thrown on malformed flags / unusable inputs. The CLI entry file routes it
  *  through `die()`; tests assert on `.message` without the process exiting. */
@@ -622,7 +623,7 @@ export type SynthVariant = {
  * input → same paraphrases, byte for byte.
  */
 export function templateParaphrases(input: string): string[] {
-  const trimmed = input.trim().replace(/[.?!]+$/, "");
+  const trimmed = withoutClosingMarks(input.trim());
   if (trimmed === "") return [];
   const lower = trimmed.charAt(0).toLowerCase() + trimmed.slice(1);
   return [
