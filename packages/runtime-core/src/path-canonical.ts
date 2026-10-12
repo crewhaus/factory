@@ -635,13 +635,23 @@ export function placeRecordingCanonicalizer(root: string = process.cwd()): {
       seen.set(raw, reading);
       return reading.values;
     },
-    readProgramPath: (word, runsIn) => {
+    readProgramPath: (word, runsIn, opts) => {
       const place = readProgramPlace(word, runsIn, root);
       // A bare word an interpreter is handed may be a subcommand or a module
       // (`bun run build`, `python -m pytest`): it is a place only where it
       // names an entry, or a card would list files that are not there.
       const separated = word.includes("/") || (path.sep === "\\" && word.includes("\\"));
       if (!separated && place.reading !== undefined && !nameExists(place.reading.at)) {
+        return place.reading;
+      }
+      // An argument (or a candidate on a PATH the call sets) is a place only
+      // where it lands elsewhere than it reads, or is a link: anywhere else
+      // its text says where it lands, and it would only crowd the card. A
+      // grant is still bound to it, since a link moving in or out of its way
+      // adds or drops it. One that cannot be walked (text longer than any
+      // path, a loop of links) is no file the call names.
+      const onItsFace = place.at.length === 1 && place.at[0] === place.asWritten;
+      if (opts?.argument === true && (onItsFace || place.reading === undefined)) {
         return place.reading;
       }
       const dir = runsIn !== undefined ? withoutTrailingSeparators(runsIn) : "";

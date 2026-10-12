@@ -9,6 +9,7 @@ export {
   type PermissionSubject,
   type PermissionSubjectOptions,
   type ProgramPathReader,
+  type ProgramPathReaderOptions,
   type ProgramPathReading,
   lexicalPathValues,
   operativeValuesFor,

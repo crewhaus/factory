@@ -2262,7 +2262,7 @@ describe("critic8 — a program path read where the kernel finds it", () => {
       ["RunPipeline", { steps: [{ argv: ["../link/../run.sh"], cwd: "scripts" }] }],
       ["RunPipeline", { cwd: "scripts", steps: [{ argv: ["sh", "../link/../run.sh"] }] }],
       ["Bash", { command: "true && sh link/../run.sh" }],
-      // The line moves before it runs the word: placed nowhere, every deny fires.
+      // Read from where the line moved: scripts/.., then through link.
       ["Bash", { command: "cd scripts && ../link/../run.sh" }],
     ];
     const rows = await decide(calls, (tool) =>
@@ -2355,8 +2355,9 @@ describe("critic8 — a program path read where the kernel finds it", () => {
         rules(["alwaysAllow", "RunCommand(./tools/**)"]),
       ),
     ).toBe("ask");
-    // A Bash line whose program lands elsewhere is granted only by an allow
-    // naming every command: its words cannot be put in their place.
+    // A Bash line cannot have its words put in their place: an allow must
+    // name the line as written, and the command with the program where it
+    // lands.
     writeFileSync(marker, "");
     const bash = { command: "./scripts/../deploy-prod.sh" };
     expect(await gate("Bash", bash, rules(["alwaysAllow", "Bash(./deploy-prod.sh)"]))).toBe("ask");
@@ -2563,4 +2564,387 @@ describe("critic8 — a headless grant for a command covers the program it was a
       });
     }
   }, 60_000);
+});
+
+// command-dotdot review (0.7.1): the program-path reading above covered a
+// program written at the root with a relative `..`, and left out the other
+// places a command's program is spelled. Each case below ran its script past
+// the rule before; every script appends its name to a marker outside the
+// workspace, so what ran is read from disk.
+describe("command-dotdot review — a program read where it lands, however the call spells it", () => {
+  let marker: string;
+  let outside: string;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    outside = realpathSync(mkdtempSync(join(tmpdir(), "perm-cdd-outside-")));
+    for (const d of [
+      "scripts",
+      "secrets/deep",
+      "safe",
+      "evil",
+      "lib",
+      "packages/app",
+      "node_modules/.bin",
+      "node_modules/.pnpm/tool@1.0.0/node_modules/tool/bin",
+    ]) {
+      mkdirSync(join(ws, d), { recursive: true });
+    }
+    symlinkSync("secrets/deep", join(ws, "link"));
+    symlinkSync("safe", join(ws, "tools"));
+    symlinkSync(".pnpm/tool@1.0.0/node_modules/tool", join(ws, "node_modules", "tool"));
+    mkdirSync(join(outside, "tools"));
+    mkdirSync(join(outside, "real", "sub"), { recursive: true });
+    symlinkSync(join(outside, "real", "sub"), join(outside, "tools", "lnk"));
+    const script = (at: string, name: string) =>
+      writeFileSync(at, `#!/bin/sh\necho ${name} >> "${marker}"\n`, { mode: 0o755 });
+    for (const p of [
+      "run.sh",
+      "gen.sh",
+      "scripts/ok.sh",
+      "secrets/run.sh",
+      "secrets/deep/d.sh",
+      "safe/run.sh",
+      "evil/run.sh",
+      "node_modules/.bin/vt",
+      "node_modules/.pnpm/tool@1.0.0/node_modules/tool/bin/cli.sh",
+    ]) {
+      script(join(ws, p), p);
+    }
+    script(join(outside, "tools", "ok.sh"), "out/tools/ok.sh");
+    script(join(outside, "evil.sh"), "out/evil.sh");
+    script(join(outside, "real", "evil2.sh"), "out/real/evil2.sh");
+  });
+  afterEach(() => {
+    rmSync(outside, { recursive: true, force: true });
+  });
+  const ran = () => readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).join(",");
+  /** Each call's first decision and what ran, one row per call. */
+  async function decide(
+    calls: ReadonlyArray<[string, Record<string, unknown>]>,
+    ruleSet: (tool: string) => RuleSet,
+  ) {
+    const rows: Array<{ tool: string; input: Record<string, unknown>; got?: string; ran: string }> =
+      [];
+    for (const [tool, input] of calls) {
+      writeFileSync(marker, "");
+      const got = await gate(tool, input, ruleSet(tool));
+      rows.push({ tool, input, ...(got !== undefined ? { got } : {}), ran: ran() });
+    }
+    return rows;
+  }
+  const expectAll = (rows: Awaited<ReturnType<typeof decide>>, got: string, ranWhat = "") =>
+    expect(rows).toEqual(rows.map((r) => ({ ...r, got, ran: ranWhat })));
+  /** A deny on one place and an allow of everything else. */
+  const denyOnly = (place: string) => (tool: string) =>
+    rules(["alwaysDeny", `${tool}(${place})`], ["alwaysAllow", tool]);
+
+  test("an absolute program outside the workspace is read where a `..` after a name takes it", async () => {
+    const out = outside;
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["RunCommand", { argv: [`${out}/tools/../evil.sh`] }],
+      ["RunCommand", { argv: [`${out}/tools/lnk/../evil2.sh`] }],
+      ["Bash", { command: `${out}/tools/../evil.sh` }],
+      ["Bash", { command: `${out}/tools/lnk/../evil2.sh` }],
+    ];
+    expectAll(
+      await decide(calls, (tool) => rules(["alwaysAllow", `${tool}(${out}/tools/**)`])),
+      "ask",
+    );
+    const handed = await decide(
+      [
+        ["RunCommand", { argv: ["sh", `${out}/tools/../evil.sh`] }],
+        ["Bash", { command: `sh ${out}/tools/../evil.sh` }],
+      ],
+      (tool) => rules(["alwaysAllow", `${tool}(sh ${out}/tools/**)`]),
+    );
+    expectAll(handed, "ask");
+    // Control: the program it names on its face runs.
+    const ok = await decide(
+      [
+        ["RunCommand", { argv: [`${out}/tools/ok.sh`] }],
+        ["Bash", { command: `${out}/tools/ok.sh` }],
+      ],
+      (tool) => rules(["alwaysAllow", `${tool}(${out}/tools/**)`]),
+    );
+    expectAll(ok, "allow", "out/tools/ok.sh");
+  }, 120_000);
+
+  test("a program after a `cd` or a wrapper's directory is read from there", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["Bash", { command: "cd secrets && ./run.sh" }],
+      ["Bash", { command: "cd link && ./d.sh" }],
+      ["Bash", { command: "cd link && sh ../run.sh" }],
+      ["Bash", { command: "cd -P link/.. && ./run.sh" }],
+      ["Bash", { command: "cd scripts; cd ../secrets && ./run.sh" }],
+      ["Bash", { command: "env -C link ./d.sh" }],
+      ["RunCommand", { argv: ["env", "-C", "link", "./d.sh"] }],
+      ["RunCommand", { argv: ["env", "--chdir=secrets", "sh", "run.sh"] }],
+      ["RunCommand", { argv: ["env", "-C", "link", "sh", "-c", "cd .. && ./run.sh"] }],
+    ];
+    expectAll(await decide(calls, denyOnly("secrets/**")), "deny");
+  }, 120_000);
+
+  test("control: a monorepo line that moves and climbs back runs under a deny about something else", async () => {
+    // An operator who allows everything except one thing: these ran before,
+    // and run now.
+    const lines = [
+      ["cd packages/app && ../../node_modules/.bin/vt", "node_modules/.bin/vt"],
+      ["cd packages/app && sh ../../gen.sh", "gen.sh"],
+      ["cd packages/app && cd ../.. && ./scripts/ok.sh", "scripts/ok.sh"],
+    ] as const;
+    for (const deny of ["Bash(rm -rf *)", "Bash(secrets/**)", "Bash(./run.sh)"]) {
+      const rows = await decide(
+        lines.map(([command]) => ["Bash", { command }]),
+        () => rules(["alwaysDeny", deny], ["alwaysAllow", "Bash"]),
+      );
+      expect({ deny, rows: rows.map((r) => [r.got, r.ran]) }).toEqual({
+        deny,
+        rows: lines.map(([, runs]) => ["allow", runs]),
+      });
+    }
+    // An ask about something else does not ask.
+    expect(
+      await gate(
+        "Bash",
+        { command: "cd packages/app && sh ../../gen.sh" },
+        rules(["alwaysAsk", "Bash(git push*)"], ["alwaysAllow", "Bash"]),
+      ),
+    ).toBe("allow");
+    // An allow scoped to the chain still grants it: nothing moved.
+    writeFileSync(marker, "");
+    expect(
+      await gate(
+        "Bash",
+        { command: "cd packages/app && ../../node_modules/.bin/vt" },
+        rules(["alwaysAllow", "Bash(cd packages/app && ../../node_modules/.bin/*)"]),
+      ),
+    ).toBe("allow");
+    expect(ran()).toBe("node_modules/.bin/vt");
+  }, 120_000);
+
+  test("$PWD is where the command runs; a word from a place the gate cannot tell is read as written", async () => {
+    const pwd = await decide(
+      [
+        ["Bash", { command: "$PWD/link/../run.sh" }],
+        ["Bash", { command: '"$PWD"/link/../run.sh' }],
+        ["Bash", { command: "sh ${PWD}/link/../run.sh" }],
+        ["Bash", { command: "$PWD/secrets/run.sh" }],
+        ["Bash", { command: "cd scripts && $PWD/../secrets/run.sh" }],
+      ],
+      denyOnly("secrets/**"),
+    );
+    expectAll(pwd, "deny");
+    // Where `$CDD_UNSET` points is the harness's to say: a `..` after a name
+    // there cannot be placed, so every deny fires; without one it is read
+    // as written, and a deny about something else lets it run.
+    expectAll(
+      await decide(
+        [
+          ["Bash", { command: "$CDD_UNSET/link/../run.sh" }],
+          ["Bash", { command: 'cd "$CDD_UNSET" && ./link/../run.sh' }],
+        ],
+        denyOnly("rm *"),
+      ),
+      "deny",
+    );
+    const asWritten = await decide(
+      [["Bash", { command: 'cd "$CDD_UNSET" && ./run.sh' }]],
+      denyOnly("rm *"),
+    );
+    expect(asWritten.map((r) => r.got)).toEqual(["allow"]);
+  }, 120_000);
+
+  test("a program another program runs from its arguments is read where it lands, on an argv", async () => {
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["RunCommand", { argv: ["caffeinate", "link/../run.sh"] }],
+      ["RunCommand", { argv: ["caffeinate", "-i", "link/d.sh"] }],
+      ["RunCommand", { argv: ["find", ".", "-maxdepth", "0", "-exec", "link/../run.sh", ";"] }],
+      ["RunCommand", { argv: ["find", ".", "-maxdepth", "0", "-exec", "link/d.sh", ";"] }],
+      ["Bash", { command: "caffeinate link/../run.sh" }],
+    ];
+    expectAll(await decide(calls, denyOnly("secrets/**")), "deny");
+    // Control: one it names on its face runs.
+    const ok = await decide(
+      [["RunCommand", { argv: ["find", ".", "-maxdepth", "0", "-exec", "./scripts/ok.sh", ";"] }]],
+      denyOnly("secrets/**"),
+    );
+    expectAll(ok, "allow", "scripts/ok.sh");
+  }, 120_000);
+
+  test("an allow on a Bash line reads the command with its words put in, as well as the line", async () => {
+    // A script reached through a linked package directory (pnpm), and a
+    // data operand with a `..`: an allow that covers where they land grants
+    // them.
+    const rows = await decide(
+      [
+        ["Bash", { command: "sh node_modules/tool/bin/cli.sh" }],
+        ["Bash", { command: "sh gen.sh src/../lib" }],
+      ],
+      () => rules(["alwaysAllow", "Bash(sh **)"]),
+    );
+    expect(rows.map((r) => [r.got, r.ran])).toEqual([
+      ["allow", "node_modules/.pnpm/tool@1.0.0/node_modules/tool/bin/cli.sh"],
+      ["allow", "gen.sh"],
+    ]);
+    // One that covers only how it is written does not.
+    const scoped = await decide(
+      [
+        ["Bash", { command: "sh node_modules/tool/bin/cli.sh" }],
+        ["Bash", { command: "sh gen.sh src/../lib" }],
+        ["Bash", { command: "cd tools && ./run.sh" }],
+      ],
+      () =>
+        rules(
+          ["alwaysAllow", "Bash(sh node_modules/tool/**)"],
+          ["alwaysAllow", "Bash(sh gen.sh src/**)"],
+          ["alwaysAllow", "Bash(cd tools && ./run.sh)"],
+        ),
+    );
+    expectAll(scoped, "ask");
+  }, 120_000);
+
+  test("a script on a shell's input, one it expands as a pattern, and a program on a PATH the call sets", async () => {
+    const bash = await decide(
+      [
+        ["Bash", { command: "sh < link/../run.sh" }],
+        ["Bash", { command: "sh < secrets/run.sh" }],
+        ["Bash", { command: "sh secre?s/run.sh" }],
+        ["Bash", { command: "sh l*/../run.sh" }],
+        ["Bash", { command: "sh secrets/r*.sh" }],
+        ["Bash", { command: "PATH=secrets run.sh" }],
+        ["Bash", { command: "PATH=link/.. run.sh" }],
+        ["Bash", { command: "export PATH=link/..; run.sh" }],
+        ["Bash", { command: "env PATH=secrets run.sh" }],
+        ["RunCommand", { argv: ["env", "PATH=secrets", "run.sh"] }],
+        ["RunCommand", { argv: ["env", "PATH=link/..", "run.sh"] }],
+        ["RunCommand", { argv: ["sh", "-c", "PATH=link/.. run.sh"] }],
+      ],
+      denyOnly("secrets/**"),
+    );
+    expectAll(bash, "deny");
+    // Control: the same spellings of a place the deny is not about.
+    const ok = await decide(
+      [
+        ["Bash", { command: "sh < scripts/ok.sh" }],
+        ["Bash", { command: "sh scripts/o*.sh" }],
+        ["Bash", { command: "PATH=scripts ok.sh" }],
+        ["RunCommand", { argv: ["env", "PATH=scripts", "ok.sh"] }],
+      ],
+      denyOnly("secrets/**"),
+    );
+    expectAll(ok, "allow", "scripts/ok.sh");
+  }, 120_000);
+
+  test("a shell reading the commands it runs from a pipe: every deny fires", async () => {
+    writeFileSync(join(ws, "victim.txt"), "x");
+    const rows = await decide(
+      [
+        ["Bash", { command: "echo rm -f victim.txt | sh" }],
+        ["Bash", { command: "echo ./secrets/run.sh | bash -s" }],
+      ],
+      denyOnly("rm *"),
+    );
+    expectAll(rows, "deny");
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true);
+    // A here-string is the line it runs, and a deny reads it.
+    expect(
+      await gate("Bash", { command: "sh <<< 'rm -f victim.txt'" }, denyOnly("rm *")("Bash")),
+    ).toBe("deny");
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true);
+    // Control: a shell handed a script of its own reads data on the pipe.
+    expect(
+      await gate("Bash", { command: "echo y | sh scripts/ok.sh" }, denyOnly("rm *")("Bash")),
+    ).toBe("allow");
+    expect(ran()).toBe("scripts/ok.sh");
+  }, 120_000);
+
+  describe("a headless grant is bound to where the program lands, however it is spelled", () => {
+    const sessionId = "sess_0123456789abcdef";
+    // One store per call: an unspent grant for another call of the same
+    // tool in the same session is replayed (#400), which is not under test.
+    let store: ReturnType<typeof createPendingApprovalStore>;
+    async function turn(tool: string, input: unknown) {
+      const where = relative(ws, process.cwd());
+      if (where.startsWith("..") || isAbsolute(where) || !existsSync(ws)) {
+        throw new Error(`turn outlived its test's workspace; refusing to run in ${process.cwd()}`);
+      }
+      let parked: string | undefined;
+      await runChatLoop({
+        model: "test-model",
+        instructions: "approval places",
+        runContext: createRunContext({ sessionId }),
+        sessionRootDir: mkdtempSync(join(state, "sess-")),
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        permissionMode: "default",
+        permissionRules: rules(),
+        tools: [builtin(tool)],
+        approvals: { store },
+        _adapter: scripted([{ name: tool, input }]),
+      }).catch((err: { report?: { class?: string; detail?: string } }) => {
+        if (err.report?.class !== "approval_pending") throw err;
+        parked = err.report.detail;
+      });
+      return /parked as approval (appr_[0-9a-f]{16})/.exec(parked ?? "")?.[1];
+    }
+    /** Park the call, grant it, point `tools` at `to`, and resume the same call. */
+    async function grantThenRetarget(tool: string, input: unknown, to: string) {
+      store = createPendingApprovalStore({ rootDir: mkdtempSync(join(state, "approvals-")) });
+      rmSync(join(ws, "tools"));
+      symlinkSync("safe", join(ws, "tools"));
+      writeFileSync(marker, "");
+      const id = await turn(tool, input);
+      if (id === undefined) throw new Error(`${tool} ${JSON.stringify(input)} did not park`);
+      const places = (await store.list()).find((a) => a.id === id)?.places;
+      await store.resolve(id, "grant", "operator");
+      rmSync(join(ws, "tools"));
+      symlinkSync(to, join(ws, "tools"));
+      const again = await turn(tool, input);
+      const consumed = (await store.list()).find((a) => a.id === id)?.consumedAt !== undefined;
+      return { places, parkedAgain: again !== undefined, consumed, ran: ran() };
+    }
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["Bash", { command: "cd tools && ./run.sh" }],
+      ["RunCommand", { argv: ["env", "-C", "tools", "./run.sh"] }],
+      ["Bash", { command: "$PWD/tools/run.sh" }],
+      ["RunCommand", { argv: ["find", ".", "-maxdepth", "0", "-exec", "./tools/run.sh", ";"] }],
+      ["Bash", { command: "PATH=tools run.sh" }],
+      ["RunCommand", { argv: ["env", "PATH=tools", "run.sh"] }],
+      ["Bash", { command: "sh < tools/run.sh" }],
+    ];
+
+    test("retargeted between park and resume: asked again, and evil/run.sh never runs", async () => {
+      for (const [tool, input] of calls) {
+        const got = await grantThenRetarget(tool, input, "evil");
+        expect({ tool, input, ...got, places: got.places?.length }).toEqual({
+          tool,
+          input,
+          places: 1,
+          parkedAgain: true,
+          consumed: false,
+          ran: "",
+        });
+      }
+    }, 120_000);
+
+    test("control: left where it was, the grant runs safe/run.sh once", async () => {
+      for (const [tool, input] of calls) {
+        const got = await grantThenRetarget(tool, input, "safe");
+        expect({
+          tool,
+          input,
+          parkedAgain: got.parkedAgain,
+          consumed: got.consumed,
+          ran: got.ran,
+        }).toEqual({
+          tool,
+          input,
+          parkedAgain: false,
+          consumed: true,
+          ran: "safe/run.sh",
+        });
+      }
+    }, 120_000);
+  });
 });

@@ -1673,4 +1673,125 @@ describe("a command word that names a file is read where the kernel finds it", (
     expect(at("restrict", "Sh(./deploy.sh)", line)).toBe(true);
     expect(at("allow", "Sh(./build.sh)", { command: "./build.sh" })).toBe(true);
   });
+
+  // command-dotdot review (0.7.1): the cases its reading missed.
+  const ws = "/ws";
+  const at = decide(
+    table(ws, {
+      // Outside the workspace, a `..` after a name moves an absolute program.
+      "/out/tools/../evil.sh": { at: "/out/evil.sh" },
+      "/out/tools/ok.sh": { at: "/out/tools/ok.sh" },
+      // A command after `cd`: read from where it moved (sub → secrets/).
+      "sub/./run.sh": { at: "/ws/secrets/run.sh", inWorkspace: "secrets/run.sh" },
+      "pkg/app/../../tool": { at: "/ws/tool", inWorkspace: "tool" },
+      // From a wrapper's directory, walked: env -C sub ./run.sh.
+      "sub/./d.sh": { at: "/ws/secrets/d.sh", inWorkspace: "secrets/d.sh" },
+      // $PWD is the directory the command runs in.
+      "./link/../run.sh": { at: "/ws/secrets/run.sh", inWorkspace: "secrets/run.sh" },
+      // A bare program on a PATH the line or a wrapper sets.
+      "link/../run.sh": { at: "/ws/secrets/run.sh", inWorkspace: "secrets/run.sh" },
+      "bin/tool": { at: "/ws/bin/tool", inWorkspace: "bin/tool" },
+      // A data operand with a `..` after a name.
+      "gen.sh": { at: "/ws/gen.sh", inWorkspace: "gen.sh" },
+      "src/../lib": { at: "/ws/lib", inWorkspace: "lib" },
+      "./node_modules/tool/cli.sh": {
+        at: "/ws/node_modules/.pnpm/tool/cli.sh",
+        inWorkspace: "node_modules/.pnpm/tool/cli.sh",
+      },
+      "scripts/o*.sh": { at: "/ws/scripts/o*.sh", inWorkspace: "scripts/o*.sh" },
+    }),
+  );
+  const argv = (...a: string[]) => ({ argv: a });
+  const line = (command: string) => ({ command });
+
+  test("an absolute program outside the workspace is put where a `..` after a name takes it", () => {
+    expect(at("allow", "Run(/out/tools/**)", argv("/out/tools/../evil.sh"))).toBe(false);
+    expect(at("allow", "Run(/out/evil.sh)", argv("/out/tools/../evil.sh"))).toBe(true);
+    expect(at("allow", "Sh(/out/tools/**)", line("/out/tools/../evil.sh"))).toBe(false);
+    // Control: one it does not move keeps its name.
+    expect(at("allow", "Run(/out/tools/**)", argv("/out/tools/ok.sh"))).toBe(true);
+  });
+
+  test("a line's command runs where the cd before it moved, and a word is read from there", () => {
+    expect(at("restrict", "Sh(secrets/**)", line("cd sub && ./run.sh"))).toBe(true);
+    expect(at("restrict", "Sh(nothing-like-it)", line("cd sub && ./run.sh"))).toBe(false);
+    // It moved through a link: an allow must name where it lands as well.
+    expect(at("allow", "Sh(cd sub && ./run.sh)", line("cd sub && ./run.sh"))).toBe(false);
+    expect(at("allow", "Sh(**)", line("cd sub && ./run.sh"))).toBe(true);
+    // A `..` back up from a directory that is no link is where it reads.
+    const up = line("cd pkg/app && ../../tool");
+    expect(at("restrict", "Sh(nothing-like-it)", up)).toBe(false);
+    expect(at("allow", "Sh(cd pkg/app && ../../tool)", up)).toBe(true);
+    // A wrapper's directory, walked.
+    expect(at("restrict", "Run(secrets/**)", argv("env", "-C", "sub", "./d.sh"))).toBe(true);
+    expect(at("allow", "Run(env -C sub ./d.sh)", argv("env", "-C", "sub", "./d.sh"))).toBe(false);
+  });
+
+  test("a directory that cannot be told: a word is read as written, and one with a `..` after a name is placed nowhere", () => {
+    expect(at("restrict", "Sh(nothing-like-it)", line('cd "$X" && ./run.sh'))).toBe(false);
+    expect(at("allow", 'Sh(cd "$X" && ./run.sh)', line('cd "$X" && ./run.sh'))).toBe(true);
+    expect(at("restrict", "Sh(nothing-like-it)", line('cd "$X" && ./a/../run.sh'))).toBe(true);
+    // So is a word a variable the line does not set starts, or `~`.
+    expect(at("restrict", "Sh(nothing-like-it)", line("$HOME/bin/x"))).toBe(false);
+    expect(at("restrict", "Sh(nothing-like-it)", line("~/a/../x"))).toBe(true);
+  });
+
+  test("$PWD is the directory the command runs in", () => {
+    expect(at("restrict", "Sh(secrets/**)", line("$PWD/link/../run.sh"))).toBe(true);
+    expect(at("restrict", "Sh(secrets/**)", line('"$PWD"/link/../run.sh'))).toBe(true);
+    expect(at("restrict", "Sh(secrets/**)", line("sh ${PWD}/link/../run.sh"))).toBe(true);
+  });
+
+  test("a bare program is read on a PATH the line or a wrapper sets", () => {
+    expect(at("restrict", "Sh(secrets/**)", line("PATH=link/.. run.sh"))).toBe(true);
+    expect(at("restrict", "Sh(secrets/**)", line("export PATH=link/..; run.sh"))).toBe(true);
+    expect(at("restrict", "Run(secrets/**)", argv("env", "PATH=link/..", "run.sh"))).toBe(true);
+    expect(at("restrict", "Run(secrets/**)", argv("env", "-P", "link/..", "run.sh"))).toBe(true);
+    // One found where it moved is in no scoped allow; one that did not move is.
+    expect(at("allow", "Run(env PATH=link/.. run.sh)", argv("env", "PATH=link/..", "run.sh"))).toBe(
+      false,
+    );
+    expect(at("allow", "Run(env PATH=bin tool)", argv("env", "PATH=bin", "tool"))).toBe(true);
+    expect(at("allow", "Sh(PATH=bin tool)", line("PATH=bin tool"))).toBe(true);
+    // The harness's own PATH is looked up as before.
+    expect(at("restrict", "Sh(nothing-like-it)", line('PATH="$PATH" tool'))).toBe(false);
+  });
+
+  test("an allow on a line reads each moved command with its words put in, as well as the line", () => {
+    const data = line("sh gen.sh src/../lib");
+    expect(at("allow", "Sh(sh gen.sh **)", data)).toBe(true);
+    expect(at("allow", "Sh(sh gen.sh src/**)", data)).toBe(false);
+    const linked = line("sh ./node_modules/tool/cli.sh");
+    expect(at("allow", "Sh(sh **)", linked)).toBe(true);
+    expect(at("allow", "Sh(sh ./node_modules/tool/**)", linked)).toBe(false);
+  });
+
+  test("an argv's other words with a `/` are read where they land, for a deny only", () => {
+    const run = argv("arch", "-arm64", "link/../run.sh");
+    expect(at("restrict", "Run(secrets/**)", run)).toBe(true);
+    expect(at("restrict", "Run(nothing-like-it)", run)).toBe(false);
+    expect(at("allow", "Run(arch -arm64 link/../run.sh)", run)).toBe(true);
+    const find = argv("find", ".", "-exec", "link/../run.sh", ";");
+    expect(at("restrict", "Run(secrets/**)", find)).toBe(true);
+    // A shell line's arguments are its programs' to read: `caffeinate` is a
+    // wrapper there; `echo` is not.
+    expect(at("restrict", "Sh(secrets/**)", line("caffeinate link/../run.sh"))).toBe(true);
+    expect(at("restrict", "Sh(secrets/**)", line("echo link/../run.sh"))).toBe(false);
+  });
+
+  test("a script on a shell's input, and one the shell expands as a pattern", () => {
+    expect(at("restrict", "Sh(secrets/**)", line("sh < link/../run.sh"))).toBe(true);
+    // A wildcard before the last name may match a link: placed nowhere.
+    expect(at("restrict", "Sh(nothing-like-it)", line("sh secre?s/run.sh"))).toBe(true);
+    // One in the last name stands for every file it can list there.
+    expect(at("restrict", "Sh(scripts/ok.sh)", line("sh scripts/o*.sh"))).toBe(true);
+    expect(at("restrict", "Sh(scripts/x.sh)", line("sh scripts/o*.sh"))).toBe(false);
+    expect(at("restrict", "Sh(nothing-like-it)", line("sh scripts/o*.sh"))).toBe(false);
+  });
+
+  test("a shell reading the commands it runs from a pipe: every deny fires", () => {
+    expect(at("restrict", "Sh(nothing-like-it)", line("echo rm -f x | sh"))).toBe(true);
+    expect(at("allow", "Sh(echo ** | sh)", line("echo rm -f x | sh"))).toBe(false);
+    expect(at("restrict", "Sh(nothing-like-it)", line("echo y | sh gen.sh"))).toBe(false);
+  });
 });

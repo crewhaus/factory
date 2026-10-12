@@ -743,4 +743,31 @@ describe("placeRecordingCanonicalizer — command words read where the kernel fi
       { path: "safe/run.sh", at: [`${ws}/safe/run.sh`] },
     ]);
   });
+
+  test("an argument is a place only where it lands elsewhere than it reads, or is a link", () => {
+    // `git add src/a.ts` names its files on their face: the card stays
+    // short. `caffeinate ./tools/run.sh` does not: a grant is bound to it.
+    const view = placeRecordingCanonicalizer(ws);
+    const argument = { argument: true } as const;
+    expect(view.readProgramPath("safe/run.sh", undefined, argument)).toMatchObject({
+      at: `${ws}/safe/run.sh`,
+    });
+    expect(view.readProgramPath("./bin/../run.sh", undefined, argument)).toMatchObject({
+      at: `${ws}/run.sh`,
+    });
+    expect(view.readProgramPath("./tools/run.sh", undefined, argument)).toMatchObject({
+      at: `${ws}/safe/run.sh`,
+    });
+    expect(view.readProgramPath("./bin/tool", undefined, argument)).toMatchObject({
+      target: { at: `${ws}/safe/run.sh` },
+    });
+    // Text no path can be (a long base64 word) is no file the call names.
+    expect(view.readProgramPath(`a/${"b".repeat(MAX_PATH_CHARS)}`, undefined, argument)).toBe(
+      undefined,
+    );
+    expect(view.places()).toEqual([
+      { path: "./bin/tool", at: [`${ws}/bin/tool`, `${ws}/safe/run.sh`] },
+      { path: "./tools/run.sh", at: [`${ws}/safe/run.sh`] },
+    ]);
+  });
 });

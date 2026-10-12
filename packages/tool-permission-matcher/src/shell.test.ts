@@ -10,17 +10,21 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  MAX_SHELL_DIRS,
   type OperativeValue,
   type ShellWork,
   compilePattern,
+  holdsUnexpanded,
   linesRunBy,
   matchesPattern,
   programWords,
   readShellChain,
   readShellLine,
+  readsShellOnInput,
   shellProgramWords,
   shellRestrictReading,
   shellRestrictSpellings,
+  withShellPwd,
 } from "./index";
 
 // ---------------------------------------------------------------------------
@@ -643,32 +647,23 @@ describe("programWords: the words of a command that name code it runs", () => {
     return {
       programs: got.programs.map((i) => words[i]),
       operands: got.operands.map((i) => words[i]),
-      movesDir: got.movesDir,
     };
   };
 
   test("the program, and the one each wrapper on the way runs", () => {
-    expect(read("./x.sh", "a/../b")).toEqual({
-      programs: ["./x.sh"],
-      operands: [],
-      movesDir: false,
-    });
+    expect(read("./x.sh", "a/../b")).toEqual({ programs: ["./x.sh"], operands: [] });
     expect(read("timeout", "5", "./x.sh")).toEqual({
       programs: ["timeout", "./x.sh"],
       operands: [],
-      movesDir: false,
     });
     expect(read("sudo", "-u", "root", "env", "A=1", "./x.sh").programs).toEqual([
       "sudo",
       "env",
       "./x.sh",
     ]);
+    expect(read("caffeinate", "-t", "60", "./x.sh").programs).toEqual(["caffeinate", "./x.sh"]);
     // An argument is the program's to read, not code the OS runs.
-    expect(read("git", "diff", "a/../b")).toEqual({
-      programs: ["git"],
-      operands: [],
-      movesDir: false,
-    });
+    expect(read("git", "diff", "a/../b")).toEqual({ programs: ["git"], operands: [] });
   });
 
   test("every operand an interpreter is handed that is not an option", () => {
@@ -677,6 +672,7 @@ describe("programWords: the words of a command that name code it runs", () => {
     expect(read("bun", "./x.ts").operands).toEqual(["./x.ts"]);
     expect(read("python3.12", "-u", "x.py").operands).toEqual(["x.py"]);
     expect(read("bash", "--", "-x.sh").operands).toEqual(["-x.sh"]);
+    expect(read("bash", "-o", "pipefail", "x.sh").operands).toEqual(["x.sh"]);
     expect(read("env", "FOO=1", "sh", "link/../run.sh").operands).toEqual(["link/../run.sh"]);
     // A shell given a line, an eval: the line is read by linesRunBy, not here.
     expect(read("sh", "-c", "./a/../b", "x").operands).toEqual([]);
@@ -685,11 +681,31 @@ describe("programWords: the words of a command that name code it runs", () => {
     expect(read("python3x", "x.py").operands).toEqual([]);
   });
 
-  test("a wrapper that runs the command in another directory is marked", () => {
-    expect(read("env", "-C", "sub", "./x.sh").movesDir).toBe(true);
-    expect(read("env", "--chdir=sub", "./x.sh").movesDir).toBe(true);
-    expect(read("sudo", "-D", "sub", "./x.sh").movesDir).toBe(true);
-    expect(read("env", "-u", "C", "./x.sh").movesDir).toBe(false);
+  test("code written in an argument, a module by name, or a script on the input: no file is handed", () => {
+    expect(read("python3", "-c", "print('a/../b')", "a/../b").operands).toEqual([]);
+    expect(read("python3", "-Bc", "x", "y/z").operands).toEqual([]);
+    expect(read("python3", "-m", "pytest", "tests/x.py").operands).toEqual([]);
+    expect(read("node", "-e", "x", "a/b").operands).toEqual([]);
+    expect(read("node", "--eval=x", "a/b").operands).toEqual([]);
+    expect(read("perl", "-pe", "s/a/b/", "f/g").operands).toEqual([]);
+    expect(read("bash", "-s", "./x").operands).toEqual([]);
+    // What comes before the code is still handed: `-r` loads a module file.
+    expect(read("node", "-r", "./hook.js", "-e", "x").operands).toEqual(["./hook.js"]);
+  });
+
+  test("the directory each wrapper moves to, and the PATH each sets, from the word it applies to", () => {
+    const words = ["env", "-C", "sub", "PATH=bin", "sudo", "--chdir=deep", "./x.sh"];
+    const got = programWords(words);
+    expect(got.chdirs).toEqual([
+      { from: 4, dir: "sub" },
+      { from: 6, dir: "deep" },
+    ]);
+    expect(got.paths).toEqual([{ from: 4, path: "bin" }]);
+    expect(programWords(["sudo", "-D", "sub", "./x.sh"]).chdirs).toEqual([{ from: 3, dir: "sub" }]);
+    expect(programWords(["env", "-P", "bin", "x"]).paths).toEqual([{ from: 3, path: "bin" }]);
+    expect(programWords(["env", "-u", "C", "./x.sh"]).chdirs).toEqual([]);
+    // A PATH the line sets for the command is looked up from its program on.
+    expect(programWords(["x"], "bin").paths).toEqual([{ from: 0, path: "bin" }]);
   });
 });
 
@@ -699,23 +715,20 @@ describe("shellProgramWords: each simple command of a line, unquoted, at every l
       words: c.words,
       programs: c.programs.programs.map((i) => c.words[i]),
       operands: c.programs.operands.map((i) => c.words[i]),
-      movesDir: c.programs.movesDir,
     }));
+  /** Each command's program and the directories it may run in (`?`: not told). */
+  const dirs = (line: string) =>
+    shellProgramWords(line).map((c) => [
+      c.words.join(" "),
+      c.dirs === undefined
+        ? "?"
+        : c.dirs.map((d) => (d.physical === "" ? d.logical : `${d.logical}|${d.physical}`)),
+    ]);
 
   test("the line's own commands, with variables put in and quoting taken off", () => {
     expect(read("FOO=1 './scripts/../x.sh' a && sh \"link/../run.sh\"")).toEqual([
-      {
-        words: ["./scripts/../x.sh", "a"],
-        programs: ["./scripts/../x.sh"],
-        operands: [],
-        movesDir: false,
-      },
-      {
-        words: ["sh", "link/../run.sh"],
-        programs: ["sh"],
-        operands: ["link/../run.sh"],
-        movesDir: false,
-      },
+      { words: ["./scripts/../x.sh", "a"], programs: ["./scripts/../x.sh"], operands: [] },
+      { words: ["sh", "link/../run.sh"], programs: ["sh"], operands: ["link/../run.sh"] },
     ]);
     expect(read("p=./a/../b; $p").map((c) => c.programs)).toEqual([["./a/../b"]]);
   });
@@ -725,16 +738,150 @@ describe("shellProgramWords: each simple command of a line, unquoted, at every l
     expect(read("echo $(./c/../d)").map((c) => c.programs)).toEqual([["echo"], ["./c/../d"]]);
   });
 
-  test("a command after a change of directory is marked, one before it is not", () => {
-    expect(read("./a.sh; cd sub && ./b.sh").map((c) => [c.programs[0], c.movesDir])).toEqual([
-      ["./a.sh", false],
-      ["cd", false],
-      ["./b.sh", true],
+  test("a command after a `cd` runs where it moved, joined as text the way cd does", () => {
+    expect(dirs("./a.sh; cd sub && ./b.sh")).toEqual([
+      ["./a.sh", [""]],
+      ["cd sub", [""]],
+      ["./b.sh", ["sub"]],
     ]);
-    expect(read("sh -c 'pushd x; ./q'").map((c) => [c.programs[0], c.movesDir])).toEqual([
-      ["sh", false],
-      ["pushd", false],
-      ["./q", true],
+    expect(dirs("cd a && cd .. && cd b/c && ./x")).toEqual([
+      ["cd a", [""]],
+      ["cd ..", ["a"]],
+      ["cd b/c", ["a/.."]],
+      ["./x", ["a/../b/c"]],
     ]);
+    expect(dirs("cd /abs && ./x").at(-1)).toEqual(["./x", ["/abs"]]);
+    expect(dirs('cd "$PWD/sub" && ./x').at(-1)).toEqual(["./x", ["./sub"]]);
+    expect(dirs("pushd sub && ./x").at(-1)).toEqual(["./x", ["sub"]]);
+    expect(dirs("pushd -n sub && ./x").at(-1)).toEqual(["./x", [""]]);
+  });
+
+  test("where a `cd` may not have run, the command may run in either place", () => {
+    expect(dirs("cd a; ./x").at(-1)).toEqual(["./x", ["", "a"]]);
+    expect(dirs("cd a || ./x").at(-1)).toEqual(["./x", ["", "a"]]);
+    expect(dirs("cd a | ./x").at(-1)).toEqual(["./x", ["", "a"]]);
+    expect(dirs("! cd a && ./x").at(-1)).toEqual(["./x", ["", "a"]]);
+    // `(cd a || cd b) && x`: x runs after cd a (b skipped) or after cd b.
+    expect(dirs("cd a || cd b && ./x").at(-1)).toEqual(["./x", ["", "a", "b", "a/b"]]);
+    // A subshell's cd is gone after it.
+    expect(dirs("(cd a && ./x) && ./y")).toEqual([
+      ["cd a", [""]],
+      ["./x", ["a"]],
+      ["./y", ["", "a"]],
+    ]);
+  });
+
+  test("a physical cd, and a wrapper's directory, are walked as the kernel walks them", () => {
+    expect(dirs("cd -P link/.. && ./run.sh").at(-1)).toEqual(["./run.sh", ["|link/.."]]);
+    expect(dirs("set -P; cd link/..; ./run.sh").at(-1)).toEqual(["./run.sh", ["", "|link/.."]]);
+    // A line a wrapper hands a shell starts where the wrapper moved; a cd
+    // walked after a physical step stays physical.
+    expect(dirs("env -C link sh -c 'cd .. && ./run.sh'").at(-1)).toEqual([
+      "./run.sh",
+      ["|link/.."],
+    ]);
+    // …unless a `..` follows a name, which the shell folds as text.
+    expect(dirs("cd -P x && cd sub/.. && ./y").at(-1)).toEqual(["./y", "?"]);
+  });
+
+  test("where a command runs cannot be told after a cd to an unknown place, or inside a loop", () => {
+    const where = (line: string) => dirs(line).find(([w]) => w === "./run.sh")?.[1];
+    for (const line of [
+      "cd $X && ./run.sh",
+      "cd ~/x && ./run.sh",
+      "cd - && ./run.sh",
+      "cd && ./run.sh",
+      "cd a b && ./run.sh",
+      "cd s* && ./run.sh",
+      "popd && ./run.sh",
+      "pushd +1 && ./run.sh",
+      "CDPATH=/x; cd sub && ./run.sh",
+      "eval 'cd secrets'; ./run.sh",
+      'eval "$x"; ./run.sh',
+    ]) {
+      expect({ line, dirs: where(line) }).toEqual({ line, dirs: "?" });
+    }
+    // A loop or a function may run its cd more than once, or later.
+    expect(dirs("while true; do cd a; ./x; done").map(([, d]) => d)).toEqual(["?", "?", "?"]);
+    expect(dirs("f() { cd a; }; f; ./x").at(-1)).toEqual(["./x", "?"]);
+    // A loop with no cd in it moves nothing.
+    expect(dirs("while true; do ./x; done").at(-1)).toEqual(["./x", [""]]);
+    // A directory a substitution runs in is anywhere its command may be.
+    expect(dirs("cd a; echo $(./q)").at(-1)).toEqual(["./q", ["", "a"]]);
+  });
+
+  test("past the most directories one command is read in, where it runs is not told", () => {
+    const cds = Array.from({ length: 3 }, (_, i) => `cd d${i}`).join("; ");
+    expect((dirs(`${cds}; ./x`).at(-1)?.[1] as string[]).length).toBe(8);
+    const more = Array.from({ length: 4 }, (_, i) => `cd d${i}`).join("; ");
+    expect(dirs(`${more}; ./x`).at(-1)?.[1]).toBe("?");
+    expect(MAX_SHELL_DIRS).toBe(8);
+  });
+
+  test("a pattern the shell expands, a script on the input, and a PATH the line sets", () => {
+    const [sh] = shellProgramWords("sh l*/../run.sh 'q*'");
+    expect(sh?.patterns).toEqual([1]);
+    expect(shellProgramWords("x='*'; sh $x").at(-1)?.patterns).toEqual([1]);
+    expect(shellProgramWords("sh < link/../run.sh")[0]?.stdinScript).toBe("link/../run.sh");
+    expect(shellProgramWords("node < 'x.js'")[0]?.stdinScript).toBe("x.js");
+    // An interpreter with a script, or code, of its own reads data there.
+    expect(shellProgramWords("sh x.sh < data")[0]?.stdinScript).toBeUndefined();
+    expect(shellProgramWords("python3 -c 'x' < data")[0]?.stdinScript).toBeUndefined();
+    expect(shellProgramWords("PATH=link/.. run.sh")[0]?.programs.paths).toEqual([
+      { from: 0, path: "link/.." },
+    ]);
+    expect(shellProgramWords("export PATH=bin; run.sh").at(-1)?.programs.paths).toEqual([
+      { from: 0, path: "bin" },
+    ]);
+    expect(shellProgramWords("PATH=$(x) run.sh")[0]?.programs.paths).toEqual([]);
+  });
+});
+
+describe("a shell that reads the commands it runs on its input", () => {
+  test("from a pipe, which no reader has: every deny fires", () => {
+    for (const line of ["echo rm -f v | sh", "cat x | bash -s", "curl -s u |& env sh"]) {
+      expect({ line, why: shellRestrictReading(line).unknownProgram }).toEqual({
+        line,
+        why: "a shell reading the commands it runs from a pipe",
+      });
+    }
+    // A shell handed a script, a line, or a here-document of its own does not.
+    for (const line of ["echo y | sh ./install.sh", "echo y | sh -c 'read a'", "x || sh"]) {
+      expect({ line, why: shellRestrictReading(line).unknownProgram }).toEqual({
+        line,
+        why: undefined,
+      });
+    }
+  });
+
+  test("a here-string is the line it runs", () => {
+    expect(shellRestrictSpellings("sh <<< 'rm -f v'")).toContain("rm -f v");
+  });
+
+  test("an argv that runs one, after any wrappers", () => {
+    expect(readsShellOnInput(["sh"])).toBe(true);
+    expect(readsShellOnInput(["bash", "-s", "x"])).toBe(true);
+    expect(readsShellOnInput(["env", "A=1", "sh", "-"])).toBe(true);
+    expect(readsShellOnInput(["sh", "x.sh"])).toBe(false);
+    expect(readsShellOnInput(["sh", "-c", "x"])).toBe(false);
+    expect(readsShellOnInput(["python3"])).toBe(false);
+  });
+});
+
+describe("withShellPwd and holdsUnexpanded: what a shell word says of where it lands", () => {
+  test("$PWD is the directory the command runs in", () => {
+    expect(withShellPwd("$PWD/link/../run.sh")).toBe("./link/../run.sh");
+    expect(withShellPwd("${PWD}")).toBe(".");
+    expect(withShellPwd("$PWDX/run.sh")).toBe("$PWDX/run.sh");
+  });
+
+  test("a variable the line does not set, or a `~`, is the harness's", () => {
+    expect(holdsUnexpanded("$HOME/x")).toBe(true);
+    expect(holdsUnexpanded("${X}/x")).toBe(true);
+    expect(holdsUnexpanded("~/x")).toBe(true);
+    expect(holdsUnexpanded("./a-$1")).toBe(true);
+    expect(holdsUnexpanded("./$(x)/b")).toBe(true);
+    expect(holdsUnexpanded("./a/b")).toBe(false);
+    expect(holdsUnexpanded("./price$")).toBe(false);
   });
 });

@@ -863,7 +863,7 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   match one of these. A `command` with none — run in another directory, or
  *   with an environment the call set, where its words may name another
  *   program; or naming a program whose place could not be worked out, or
- *   a line a shell parses whose program lands elsewhere than it reads — is
+ *   handing a shell a line whose program lands elsewhere than it reads — is
  *   granted only by a glob that matches every command (`RunCommand(**)`).
  * - `spellings` — other ways of writing the same value (what the model sent,
  *   the path before symlinks were followed). A deny or ask rule also fires on
@@ -1827,20 +1827,28 @@ export function matchesPattern(
 }
 
 export {
+  MAX_SHELL_DIRS,
   MAX_SHELL_NESTING,
   type ProgramWords,
   type ShellChain,
   type ShellCommandWords,
+  type ShellDir,
   type ShellReading,
   type ShellRestrictReading,
   type ShellWork,
+  type WrapperChdir,
+  type WrapperPath,
+  climbsAfterName,
+  holdsUnexpanded,
   linesRunBy,
   programWords,
   readShellChain,
   readShellLine,
+  readsShellOnInput,
   shellProgramWords,
   shellRestrictReading,
   shellRestrictSpellings,
+  withShellPwd,
 } from "./shell";
 
 export {

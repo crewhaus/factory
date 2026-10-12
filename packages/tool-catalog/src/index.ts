@@ -354,10 +354,15 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * and on any simple command in it, also read without the variables it sets,
  * unquoted, through wrappers such as `env`, `sudo` and `xargs`, and inside an
  * `eval`, a `sh -c` or a substitution; every deny or ask fires on a command
- * whose program its text does not name (`$(…) -rf x`, `read x; $x`), which
- * no scoped allow grants. A command held as an argv array runs
- * without a shell and is never split; a deny or ask still reads the line an
- * argv hands to a shell (`["sh", "-c", "a && b"]`).
+ * whose program its text does not name (`$(…) -rf x`, `read x; $x`, `curl
+ * … | sh`), which no scoped allow grants. A program or script a command
+ * names by its path is read where it lands, from wherever the `cd`s before
+ * it leave the command, and an allow must also name each command whose
+ * program lands elsewhere than it reads with that place put in:
+ * `Bash(./scripts/**)` does not grant `./scripts/../evil.sh`, nor `cd
+ * scripts/lnk && ./x.sh` with `lnk` a link out of scripts/. A command held
+ * as an argv array runs without a shell and is never split; a deny or ask
+ * still reads the line an argv hands to a shell (`["sh", "-c", "a && b"]`).
  *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
