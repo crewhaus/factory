@@ -93,9 +93,10 @@ describe("an attribute selector", () => {
     ];
     for (let c = 0; c <= 0xffff; c++) {
       const ch = String.fromCharCode(c);
-      // Before the operator (the name and the whitespace set), and after a
-      // bare value (its class, the whitespace set again, the flag).
-      inputs.push(`a${ch}=b`, `a=b${ch}i`);
+      // Before the operator (the name and the whitespace set), after a bare
+      // value (its class, the whitespace set again, the flag), and as the
+      // flag itself after a bare and a quoted value: only `i` is one, not `I`.
+      inputs.push(`a${ch}=b`, `a=b${ch}i`, `a=b ${ch}`, `a="b"${ch}`);
     }
     expect(answers(inputs, (s) => groups(attrSelectorParts(s)))).toEqual(
       answers(inputs, (s) => groups(ATTR.exec(s))),
