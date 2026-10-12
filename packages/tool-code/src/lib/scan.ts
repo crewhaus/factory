@@ -94,6 +94,12 @@ export function maskSource(src: string): Masked {
   const stack: Array<{ mode: "code" | "template"; depth: number }> = [{ mode: "code", depth: 0 }];
   let prevSignificant = "";
   let prevWord = "";
+  // The last identifier character read, and where its run starts: a later
+  // one walks back only to it, and takes its start when the runs join, so
+  // each character is walked back over once. Walking back over the whole run
+  // at every character of it was quadratic in an identifier's length.
+  let wordStart = 0;
+  let wordEnd = -1;
   let i = 0;
 
   const blank = (from: number, to: number, k: number): void => {
@@ -234,7 +240,10 @@ export function maskSource(src: string): Masked {
       prevSignificant = c;
       if (IDENT_CHAR.test(c)) {
         let s = i;
-        while (s > 0 && IDENT_CHAR.test(src[s - 1] as string)) s--;
+        while (s > wordEnd + 1 && IDENT_CHAR.test(src[s - 1] as string)) s--;
+        if (s === wordEnd + 1) s = wordStart;
+        wordStart = s;
+        wordEnd = i;
         prevWord = src.slice(s, i + 1);
       } else {
         prevWord = "";
