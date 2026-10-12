@@ -56,7 +56,10 @@ describe("register replies are bounded", () => {
     const out = await getJson(url);
     expect(out).toMatchObject({ ok: false, kind: "tooLarge" });
     expect(inits[0]?.["decompress"]).toBe(false);
-  });
+    // Slow by construction: inflating the bomb up to the cap is well under
+    // 0.1 s here but 1.4 s on a loaded CI runner, too close to bun's default
+    // of 5 s. The same test declares 20 s in its sibling packages.
+  }, 20_000);
 
   test("a compressed reply is decoded", async () => {
     answer = gz(gzipSync('{"data":{"id":"x"}}'));

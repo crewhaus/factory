@@ -240,7 +240,10 @@ describe("dispatch through executeTool", () => {
         type: "string",
       });
     }
-  });
+    // Slow by construction: eight loopback round trips in turn. A loaded CI
+    // runner has taken 375 ms for one, which puts this test at 3 s, too
+    // close to bun's default of 5 s.
+  }, 20_000);
 
   test("results are deterministic — the same pure call twice gives the same bytes", async () => {
     const args = {

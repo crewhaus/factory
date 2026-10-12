@@ -1023,7 +1023,10 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
     expect(unanchored).toContain(
       "[grep: 1 line(s) longer than 2000 characters were not searched — this pattern has 2 repeats",
     );
-  });
+    // Slow by construction: the no-match on line 1 is real backtracking,
+    // tens of milliseconds here but about 1 s on a loaded CI runner, too
+    // close to bun's default of 5 s.
+  }, 20_000);
 
   test("a chain with a character between its repeats runs on a long line holding few of it", async () => {
     // 0.7.1 before this refused `^.*:.*:.*:.*$` outright (four repeats)

@@ -570,7 +570,10 @@ describe("containment of the repository git discovers", () => {
     const packShown = String(await gitShow.execute({ cwd: "pack-repo", ref: victimHead }));
     expect(packShown).toContain("objects/pack/");
     expect(packShown).not.toContain("victim-secret");
-  });
+    // Slow by construction: about 25 git processes, one after another, are
+    // half a second here but 1.4 s on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 
   test("a loose-object leaf link is refused: objects/<fanout>/<rest> leading out (C071)", async () => {
     // C071 residual: the deep scan walked objects/pack and objects/info but

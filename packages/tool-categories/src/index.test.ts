@@ -432,7 +432,10 @@ describe("lookup helpers", () => {
       );
     });
     expect(bad).toEqual([]);
-  });
+    // Slow by construction: a lookup per builtin, each over every category,
+    // is under 0.1 s here but 1.4 s on a loaded CI runner, too close to
+    // bun's default of 5 s.
+  }, 20_000);
 });
 
 // C038 — the `network` roll-up was titled "Everything that reaches the

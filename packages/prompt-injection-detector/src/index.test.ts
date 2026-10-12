@@ -312,7 +312,9 @@ describe("override-safety: turning off safety, not overriding a header (0.7.1)",
       expect(counted.steps).toBeLessThanOrEqual(bound);
       expect(counted.value).toBe(false);
     }
-  });
+    // About 128 KB through the step-counting model: well under 0.1 s here,
+    // and this package's tests ran up to 39 times slower on CI.
+  }, 30_000);
 });
 
 describe("tool-definition rules (0.7.1, C102)", () => {
