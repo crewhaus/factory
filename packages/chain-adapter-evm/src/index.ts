@@ -167,6 +167,15 @@ function endpointLabel(url: string): string {
   }
 }
 
+/** Where a redirect pointed, named as an endpoint is: scheme, host and port. */
+function redirectLabel(location: string, base: string): string {
+  try {
+    return endpointLabel(new URL(location, base).toString());
+  } catch {
+    return "a location that is not a URL";
+  }
+}
+
 /** One read, as every URL it is sent to sees it. */
 type Dispatch = {
   readonly chainId: string;
@@ -185,6 +194,18 @@ type Dispatch = {
   readonly cancelled: () => string | undefined;
   readonly bypassCache?: boolean;
 };
+
+/**
+ * Why the last URL failed, for the message that says they all did: its own
+ * words without the `[chain] method:` they share. Every failure this file
+ * raises names an endpoint by scheme and host only (see endpointLabel), so
+ * nothing here can carry a key from a URL's path.
+ */
+function lastReason(err: unknown, call: Dispatch): string {
+  if (!(err instanceof ChainAdapterError)) return "";
+  const prefix = `[${call.chainId}] ${call.method}: `;
+  return `; the last: ${err.message.startsWith(prefix) ? err.message.slice(prefix.length) : err.message}`;
+}
 
 /** One URL's attempt: the read's signal, plus its own, so a settled read closes the rest. */
 function attemptOn(call: Dispatch): { readonly call: Dispatch; readonly stop: () => void } {
@@ -260,7 +281,7 @@ function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unkn
                 new ChainAdapterError(
                   chainId,
                   method,
-                  `all ${urls.length} RPC URL(s) failed`,
+                  `all ${urls.length} RPC URL(s) failed${lastReason(lastError, call)}`,
                   lastError,
                 ),
               ),
@@ -311,9 +332,10 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
     };
     const fail = (why: string, timedOut = false): void =>
       finish(() => reject(new ChainAdapterError(chainId, method, why, undefined, { timedOut })));
+    let lastRejection: unknown;
     const noQuorum = (): string =>
       answered === 0
-        ? "quorum failed: every RPC URL rejected"
+        ? `quorum failed: every RPC URL rejected${lastReason(lastRejection, call)}`
         : `quorum failed: no value reached threshold ${threshold}/${urls.length}`;
     const onStop = (): void => {
       if (call.callerCancelled()) {
@@ -355,9 +377,10 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
           }
           decideIfLost();
         },
-        () => {
+        (err: unknown) => {
           if (done) return;
           settled++;
+          lastRejection = err;
           decideIfLost();
         },
       );
@@ -379,6 +402,10 @@ async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
         signal: call.signal,
+        // Never followed: the spec's chains block names the nodes a read may
+        // reach, and a redirect would re-send it to one it does not name and
+        // report that node's answer as the chain's.
+        redirect: "manual",
       }) as RequestInit,
     );
   } catch (err) {
@@ -392,6 +419,13 @@ async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
       await res.body?.cancel();
     } catch {
       // already closed
+    }
+    if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
+      throw new ChainAdapterError(
+        chainId,
+        method,
+        `${endpointLabel(url)} answered HTTP ${res.status} with a redirect to ${redirectLabel(res.headers.get("location") ?? "", url)}; a JSON-RPC read is not followed to a node the chains block does not name, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
+      );
     }
     throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${endpointLabel(url)}`);
   }

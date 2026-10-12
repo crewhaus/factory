@@ -10,10 +10,10 @@
  * it, so the fix shows up here as a deliberate change, and hold the boundary
  * that does apply at every hop: an origin off the tool's allow-list.
  *
- * The last is a fix. DependencyAudit (whose mirror is checked against
- * `tool_config.fetch`) sent its requests with the platform's `fetch`, which
- * follows a redirect anywhere. It now refuses a redirect and says where it
- * pointed.
+ * The last two are fixes. DependencyAudit (whose mirror is checked against
+ * `tool_config.fetch`) and the chain reads (whose nodes the spec's `chains`
+ * block names) sent their requests with the platform's `fetch`, which follows
+ * a redirect anywhere. Both now refuse a redirect and say where it pointed.
  *
  * Everything runs through runChatLoop's real gate and the real tools, against
  * loopback servers, and the outcome is read from what each server received.
@@ -36,6 +36,11 @@ import {
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  bindChainCallChains,
+  contractInspect,
+  setChainRpcResolver,
+} from "@crewhaus/tool-chaincall";
 import {
   _resetFetchConfig,
   _setRawFetch as _setFetchDial,
@@ -555,6 +560,101 @@ describe("DependencyAudit refuses a redirect from its OSV mirror", () => {
       isError: true,
       result: `http://mirror.test/v1/vulns/GHSA-pad answered HTTP 307 with a redirect to ${b.origin}; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.`,
       bGot: [],
+    });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// FIXED — a chain read never follows a redirect off the chains block
+// ---------------------------------------------------------------------------
+
+describe("a chain read refuses a redirect to a node the chains block does not name", () => {
+  // B answers like a node, so a followed redirect would come back as a
+  // plausible answer rather than an error.
+  const b = server(async (req) => {
+    const body = (await req.json()) as { id: number; method: string };
+    const result =
+      body.method === "eth_getCode"
+        ? "0x6001"
+        : body.method === "eth_blockNumber"
+          ? "0x10"
+          : `0x${"0".repeat(64)}`;
+    return Response.json({ jsonrpc: "2.0", id: body.id, result });
+  });
+  // A forwarded read arrives at B as /forwarded; one B is asked by name, as /rpc.
+  const a = server(
+    () => new Response(null, { status: 307, headers: { location: `${b.origin}/forwarded` } }),
+  );
+  const bind = (rpcUrls: string[], rpcPolicy: "single" | "fallback" | "quorum") =>
+    bindChainCallChains({
+      chains: [
+        { chainId: "1", rpcUrls, rpcPolicy, finality: { kind: "finalized" }, reorgTolerant: false },
+      ],
+    });
+  const inspect = () =>
+    call(
+      contractInspect,
+      {
+        chainId: "1",
+        address: "0x000000000000000000000000000000000000dEaD",
+        probeInterfaces: false,
+        timeoutMs: 30_000,
+      },
+      rules(["alwaysAllow", "ContractInspect"]),
+    );
+
+  beforeEach(() => {
+    for (const s of [a, b]) s.got.length = 0;
+  });
+  afterAll(() => {
+    setChainRpcResolver(undefined);
+    for (const s of [a, b]) s.stop();
+  });
+
+  test("control: a node the block names answers", async () => {
+    bind([`${b.origin}/rpc`], "single");
+    const out = await inspect();
+    expect({ isError: out.isError, isContract: out.result.includes('"isContract":true') }).toEqual({
+      isError: false,
+      isContract: true,
+    });
+  }, 60_000);
+
+  test("a 307 is refused, names both ends and the reason, and the other node gets nothing", async () => {
+    bind([`${a.origin}/rpc`], "single");
+    const out = await inspect();
+    expect({ isError: out.isError, result: out.result, aGot: a.got, bGot: b.got }).toEqual({
+      isError: true,
+      result: `[1] eth_getCode: all 1 RPC URL(s) failed; the last: ${a.origin} answered HTTP 307 with a redirect to ${b.origin}; a JSON-RPC read is not followed to a node the chains block does not name, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
+      aGot: ["POST /rpc"],
+      bGot: [],
+    });
+  }, 60_000);
+
+  test("under quorum, nodes that all redirect fail the read with the reason, and B gets nothing", async () => {
+    bind([`${a.origin}/rpc`, `${a.origin}/rpc2`], "quorum");
+    const out = await inspect();
+    expect({ isError: out.isError, result: out.result, bGot: b.got }).toEqual({
+      isError: true,
+      result: expect.stringMatching(
+        /^\[1\] eth_getCode: quorum failed: every RPC URL rejected; the last: http:\/\/127\.0\.0\.1:\d+ answered HTTP 307 with a redirect to /,
+      ),
+      bGot: [],
+    });
+  }, 60_000);
+
+  test("under fallback, a node that redirects counts as failed and the next one named answers", async () => {
+    bind([`${a.origin}/rpc`, `${b.origin}/rpc`], "fallback");
+    const out = await inspect();
+    expect({ isError: out.isError, isContract: out.result.includes('"isContract":true') }).toEqual({
+      isError: false,
+      isContract: true,
+    });
+    // Every read went to A first, was refused there, and was asked of B by
+    // name: B saw only those, never one forwarded by A's redirect.
+    expect({ aAsked: a.got.length > 0, bGot: [...new Set(b.got)] }).toEqual({
+      aAsked: true,
+      bGot: ["POST /rpc"],
     });
   }, 60_000);
 });
