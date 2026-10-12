@@ -239,9 +239,13 @@ export function reservedRegistryRoot(root: SafePath, workspaceReal: string): str
     if (!part.startsWith("_")) continue;
     const parentRel = parts.slice(0, i).join("/");
     // Anything but a definite "no `_tenants` here" counts as a registry.
+    // The parent goes in as one string, not one argument per name: Bun's
+    // `path.join` keeps only (argument count mod 65,536) of its arguments,
+    // and the caller chose how deep this root is.
     const parentIsRegistry =
       parentRel === DEFAULT_REGISTRY_RELDIR ||
-      probeName(join(workspaceReal, ...parts.slice(0, i), TENANTS_DIRNAME)).kind !== "absent";
+      probeName(join(workspaceReal, parts.slice(0, i).join(sep), TENANTS_DIRNAME)).kind !==
+        "absent";
     if (!parentIsRegistry) continue;
     const where = render(parentRel === "" ? "." : parentRel);
     return part.toLowerCase() === TENANTS_DIRNAME

@@ -26,6 +26,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -44,6 +45,7 @@ import {
   probeTenantOverlay,
   probeVersion,
   readManifest,
+  reservedRegistryRoot,
   resolveName,
   versionFilename,
 } from "./lib/registry";
@@ -373,4 +375,38 @@ test("probeTenantOverlay answers about the name the real adapter writes, and kee
   // The registry really cannot tell these apart, which is why the probe is
   // by name rather than by asking it.
   expect(await registry.aliasForTenant("beta", "demo", "prod")).toBe("v1");
+});
+
+// ---------------------------------------------------------------------------
+// a registry root tens of thousands of directories deep
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
+ * its arguments, and the `_tenants` probe passed the parent one argument per
+ * directory. With 65,536 directories above a `_` name the probe asked about
+ * `<workspace>/a/_tenants` instead: absent there, so the root was taken for an
+ * ordinary directory and not refused. A probe of the real, too-long path
+ * cannot answer "absent", and anything else counts as a registry. The root is
+ * built by hand, so nothing here walks the filesystem.
+ */
+test("a `_` name 65,534 to 65,536 directories deep is judged by its own parent", () => {
+  const ws = realpathSync(tmp);
+  for (const depth of [65_534, 65_535, 65_536]) {
+    const rel = `${Array.from({ length: depth }, () => "a").join("/")}/_x`;
+    const real = path.join(ws, rel);
+    const reason = reservedRegistryRoot({ abs: real, real, given: rel, rel }, ws);
+    expect({
+      depth,
+      refused: reason?.startsWith('"_x" is a directory the registry at "a/a/'),
+    }).toEqual({ depth, refused: true });
+  }
+  // Control: the same `_` name one directory down, beside no `_tenants`, is an
+  // ordinary directory.
+  expect(
+    reservedRegistryRoot(
+      { abs: ws, real: path.join(ws, "a", "_x"), given: "a/_x", rel: "a/_x" },
+      ws,
+    ),
+  ).toBeUndefined();
 });
