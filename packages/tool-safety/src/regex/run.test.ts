@@ -84,7 +84,7 @@ function releaseDeadline(): void {
  * A test abandoned at its budget never reaches its own `finally`, and its
  * session stayed open with the worker busy: under a 1.5 s delay on every
  * request, the 540 runs of the built-in comparison went on for minutes, and
- * four later tests that wait for the workers to exit failed with it, each
+ * the later tests that wait for the workers to exit failed with it, each
  * passing alone. Closed, the worker is stopped, and the abandoned body's
  * next run answers `closed` at once instead of starting more work.
  */
