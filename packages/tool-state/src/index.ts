@@ -1398,7 +1398,7 @@ export const noteWrite: RegisteredTool = stateTool({
 
 export const noteSearch: RegisteredTool = stateTool({
   name: "NoteSearch",
-  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true }],
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, beneath: "all" }],
   description:
     "Search the stored notes with BM25 ranking over their titles, tags and text. Use it to recall what the crew already worked out; the matching is LEXICAL ONLY — no embeddings, no synonyms, no stemming — so a note about 'automobiles' will not answer a query about 'cars'.",
   inputSchema: z.object({
@@ -1738,7 +1738,7 @@ function replaceRefusal(root: SafePath): string | undefined {
 
 export const stateExport: RegisteredTool = stateTool({
   name: "StateExport",
-  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true }],
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, beneath: "all" }],
   description:
     "Dump the whole state directory as one JSON document, with a digest per file. Use it to back state up, move it to another machine, or attach it to a bug report; text files are carried as text and anything else as base64, and symlinks are skipped rather than followed.",
   inputSchema: z.object({

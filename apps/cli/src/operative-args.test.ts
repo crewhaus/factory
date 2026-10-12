@@ -301,10 +301,12 @@ describe("an optional operative field says what leaving it out means (C004)", ()
   });
 
   test("the store directories a tool fills in declare where", () => {
+    // Relocating beside a record, or — for a reader that names no record,
+    // such as StateExport — the tool's own place, read by every rule.
     const declared = new Map<string, string | undefined>();
     for (const tool of builtins) {
       for (const arg of tool.operativeArgs ?? []) {
-        if (arg.relocates === true) declared.set(`${tool.name}.${arg.field}`, arg.default);
+        if (arg.default !== undefined) declared.set(`${tool.name}.${arg.field}`, arg.default);
       }
     }
     // The audit's list, each with the place its execute falls back to.
@@ -379,8 +381,12 @@ describe("an optional operative field says what leaving it out means (C004)", ()
  *
  * Every path field a builtin declares is classified here, so a new one fails
  * until somebody says which it is. A relocating field (a store or the
- * repository the tool works in) is out of scope by construction: a rule is
- * about the record it names.
+ * repository the tool works in) is left out only BESIDE a record the call
+ * names (KvGet's key): a rule is about that record. Critic8: the exemption
+ * used to cover every relocating field, so StateExport — whose `stateDir` is
+ * the only place it names, and which dumps every file under it — slipped
+ * through, and `{stateDir: "."}` returned secrets/prod.env under
+ * `alwaysDeny StateExport(secrets/**)`.
  */
 describe("every path a builtin walks is read with what lies beneath it", () => {
   /** `Tool.field` → why the field names one place, not a tree the tool walks. */
@@ -456,19 +462,27 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // A directory whose fixed, named files the tool reads or writes.
     ...Object.fromEntries(
       [
+        // `.crewhaus/sessions/approvals.jsonl` under the harness directory.
+        "ApprovalStatus.dir",
         "CliVersionPin.dirs",
         "DependencyAudit.cwd",
         "DoctorFix.crewhausDir",
         "EvalAggregate.run",
+        // `index.jsonl` and `baselines.json`.
+        "EvalHistory.evalsDir",
         "FlywheelStatus.specDir",
         "HarnessJobStatus.dir",
         "HarnessRegister.dir",
         "HarnessRegister.from",
         "HarnessRetire.registryDir",
         "HooksManage.dir",
+        // The harness's own session logs and `.crewhaus/settings.json`.
+        "PermissionsSuggest.dir",
         "PreflightRun.harnessDir",
         "RegistryOutdated.manifest",
         "RouteControl.dir",
+        // The watch-me store under `.crewhaus/state/watchme`.
+        "WatchmeReport.dir",
       ].map((k) => [k, "fixed files in it"]),
     ),
     // The tool creates this entry, or a named one in it, and touches nothing
@@ -499,13 +513,43 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     ),
   };
 
-  /** Every declared path field that is not a relocating store or repository. */
+  /** Does the tool name a record beside its relocating fields? */
+  const namesARecord = (t: RegisteredTool): boolean =>
+    (t.operativeArgs ?? []).some((a) => a.relocates !== true);
+
+  /** Every declared path field, but a relocating store or repository beside a record. */
   const pathFields = () =>
     builtins.flatMap((t) =>
       (t.operativeArgs ?? [])
-        .filter((a) => a.kind === "path" && a.relocates !== true)
+        .filter((a) => a.kind === "path" && !(a.relocates === true && namesARecord(t)))
         .map((a) => ({ key: `${t.name}.${a.field}`, arg: a })),
     );
+
+  test("a relocating field is left out only beside a record the call names", () => {
+    const relocating = builtins.flatMap((t) =>
+      (t.operativeArgs ?? [])
+        .filter((a) => a.kind === "path" && a.relocates === true)
+        .map((a) => ({ key: `${t.name}.${a.field}`, beside: namesARecord(t) })),
+    );
+    // The sweep's hit count: the store tools and the git branch tools.
+    expect(relocating.length).toBeGreaterThanOrEqual(40);
+    // A store that is the only place its tool names is where the tool acts:
+    // buildTool refuses `relocates` there, and this sweep would classify it.
+    expect(relocating.filter((r) => !r.beside).map((r) => r.key)).toEqual([]);
+    // The readers that name no record are classified like any other path.
+    const keys = new Set(pathFields().map((f) => f.key));
+    for (const key of [
+      "StateExport.stateDir",
+      "NoteSearch.stateDir",
+      "EventQuery.dir",
+      "TraceQuery.dir",
+      "AuditVerify.dir",
+      "EvalHistory.evalsDir",
+      "ApprovalStatus.dir",
+    ]) {
+      expect({ key, classified: keys.has(key) }).toEqual({ key, classified: true });
+    }
+  });
 
   test("each path field is declared beneath or is a reviewed single place", () => {
     const fields = pathFields();
@@ -522,8 +566,11 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // A reviewed entry that now declares beneath, or no longer exists, is stale.
     const known = new Set(fields.map((f) => f.key));
     expect(Object.keys(ONE_PLACE).filter((k) => !known.has(k) || walked.includes(k))).toEqual([]);
-    expect(walked.length).toBe(39);
+    expect(walked.length).toBe(51);
     expect(walked).toContain("Grep.path");
+    // Critic8: the store dump and the readers of every log in a directory.
+    expect(walked).toContain("StateExport.stateDir");
+    expect(walked).toContain("EventQuery.dir");
     expect(walked).toContain("RemovePath.path");
     expect(walked).toContain("GitDiff.paths");
   });

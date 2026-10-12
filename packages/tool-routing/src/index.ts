@@ -1185,7 +1185,7 @@ export const flywheelStatus: RegisteredTool = buildTool({
 
 export const watchmeReport: RegisteredTool = buildTool({
   name: "WatchmeReport",
-  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
+  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   description:
     "Read a harness's observational-learning ledger: whether it is watching, the per-window report outcomes, the per-spec/target quality and cost roll-up, the judge verdicts, and how much of that quality has actually reached the routing scoreboard's observe-only `q:` lane. Report-window outcomes are kept apart — `model_refused_unpriced` is a configuration error that consumed its window, `model_failed` is transient and retries, and collapsing them into one failure state hides the first as the second. A state.json that exists but cannot be parsed is reported as unreadable, never as a harness that has never watched: the store falls back to its default there, which reads as the opposite of the truth. The routing half degrades explicitly — an absent or unreadable scoreboard is reported as such, never as 'no quality signal'. Every rate carries a Wilson interval. Read-only: it never runs the phase-2 judge, never synthesizes, and never feeds routing.",
   inputSchema: z.object({

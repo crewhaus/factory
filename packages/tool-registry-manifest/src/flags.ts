@@ -97,7 +97,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   },
   approvalsInbox: {
     key: "approvalsInbox",
@@ -171,7 +171,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/audit", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/audit", beneath: "all" }],
   },
   barcodeEncode: {
     key: "barcodeEncode",
@@ -708,7 +708,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   costSummarize: {
     key: "costSummarize",
@@ -718,7 +718,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   countTokens: {
     key: "countTokens",
@@ -1518,7 +1518,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   escapeString: {
     key: "escapeString",
@@ -1586,9 +1586,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [
-      { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
-    ],
+    operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals" }],
   },
   evaluate: {
     key: "evaluate",
@@ -1607,7 +1605,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   eventQuery: {
     key: "eventQuery",
@@ -1617,7 +1615,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   evmBlockAtTimestamp: {
     key: "evmBlockAtTimestamp",
@@ -3488,7 +3486,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", beneath: "all" },
     ],
   },
   noteWrite: {
@@ -3791,7 +3789,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   },
   piiRedact: {
     key: "piiRedact",
@@ -4472,7 +4470,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   sampleRecords: {
     key: "sampleRecords",
@@ -4616,7 +4614,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   shell: {
     key: "shell",
@@ -4894,7 +4892,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", beneath: "all" },
     ],
   },
   stateImport: {
@@ -5187,7 +5185,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   toolInventory: {
     key: "toolInventory",
@@ -5225,7 +5223,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: ".crewhaus/sessions", beneath: "all" }],
   },
   trashPath: {
     key: "trashPath",
@@ -5518,7 +5516,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
+    operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   },
   webFetch: {
     key: "webFetch",

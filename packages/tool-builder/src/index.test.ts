@@ -349,13 +349,14 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
   });
 
   test("relocates is carried on a path with a default, and refused anywhere else (C004)", () => {
+    // Beside the record the call names in the store (`issue` here).
     const build = (arg: Record<string, unknown>) => () =>
       buildTool({
         name: "Nested",
         description: "d",
         inputSchema: nested,
         execute: exec,
-        operativeArgs: [arg as unknown as OperativeArg],
+        operativeArgs: [arg as unknown as OperativeArg, { field: "issue", kind: "id" }],
       });
     const tool = build({
       field: "path",
@@ -388,6 +389,37 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     expect(build({ field: "path", kind: "path", default: ".", relocates: "yes" })).toThrow(
       /relocates is either true or left out/,
     );
+  });
+
+  test("relocates is refused on a tool that names no record beside it (critic8)", () => {
+    // StateExport's `stateDir` relocated nothing: it is the only place the
+    // tool names, and the tool dumps every file under it. Declared
+    // relocating, it could not carry `beneath`, and a deny on a file under
+    // the directory never fired on a dump of the directory.
+    const build = (operativeArgs: ReadonlyArray<Record<string, unknown>>) => () =>
+      buildTool({
+        name: "Dump",
+        description: "d",
+        inputSchema: nested,
+        execute: exec,
+        operativeArgs: operativeArgs as unknown as OperativeArg[],
+      });
+    const alone = { field: "path", kind: "path", default: ".crewhaus/state", relocates: true };
+    expect(build([alone])).toThrow(
+      /tool "Dump": operativeArgs \[0\]\.relocates: "path" is the only place this tool names .* with beneath: "all" if the tool reads or writes what is inside it/,
+    );
+    // Two stores and no record are refused the same way.
+    expect(
+      build([alone, { field: "target.url", kind: "url", default: "https://x", relocates: true }]),
+    ).toThrow(/"path" is the only place this tool names/);
+    // Beside a record it is carried; declared as the place itself, it walks.
+    expect(build([alone, { field: "issue", kind: "id" }])().operativeArgs?.[0]?.relocates).toBe(
+      true,
+    );
+    expect(
+      build([{ field: "path", kind: "path", default: ".crewhaus/state", beneath: "all" }])()
+        .operativeArgs,
+    ).toEqual([{ field: "path", kind: "path", default: ".crewhaus/state", beneath: "all" }]);
   });
 
   test("shell is carried on a command, and refused anywhere else", () => {

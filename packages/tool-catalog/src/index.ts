@@ -280,7 +280,11 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * A call that names the field is matched like any other: an allow must cover
  * the place it names too. Without `relocates`, a default is one more value
  * every rule reads — right for a field that IS where the tool acts
- * (`EnvFileUpsert`'s `.env`, a harness directory it deletes).
+ * (`EnvFileUpsert`'s `.env`, a harness directory it deletes). A tool whose
+ * only operative fields relocate names no record, so `buildTool` refuses
+ * it: its store is where it acts, declared without `relocates` — and with
+ * `beneath` when it reads or writes what is inside (StateExport, which
+ * dumps every file under its `stateDir`).
  *
  * `env`, for a `command` only, names a top-level field holding the
  * variables the call sets in the child's environment, a map of names to

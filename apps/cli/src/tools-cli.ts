@@ -1699,7 +1699,12 @@ function allowGlob(arg: OperativeArgLike): string {
   const leaf = (arg.field.split(".").pop() ?? arg.field).toLowerCase();
   switch (arg.kind) {
     case "path":
-      return arg.relocates === true && arg.default !== undefined && arg.default !== "."
+      // A store the tool works in (relocating) or walks (StateExport's
+      // state directory): the example covers the store it uses by default.
+      return (arg.relocates === true || arg.beneath !== undefined) &&
+        arg.default !== undefined &&
+        arg.default !== "." &&
+        arg.default !== "*"
         ? `${arg.default}/**`
         : "src/**";
     case "url":

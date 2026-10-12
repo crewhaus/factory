@@ -462,6 +462,18 @@ function checkOperativeArgs(
       }),
     );
   }
+  // A relocating field moves the tool off the store its OTHER operative
+  // fields name a record in, and an allow is about that record. With no such
+  // field the store is the only place the tool names: every rule is about
+  // it, and a tool that reads or writes what is inside it (StateExport's
+  // whole state directory) must say so with `beneath`, which a relocating
+  // field cannot carry.
+  if (out.length > 0 && out.every((arg) => arg.relocates === true)) {
+    const first = out[0] as OperativeArg;
+    fail(
+      `[0].relocates: "${first.field}" is the only place this tool names — no other operative field names a record in it — so a rule is about "${first.field}" itself. Declare it without relocates, and with beneath: "all" if the tool reads or writes what is inside it`,
+    );
+  }
   return Object.freeze(out);
 }
 

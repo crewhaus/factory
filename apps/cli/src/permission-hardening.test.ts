@@ -757,6 +757,91 @@ describe("final review — a directory the tool walks is read with everything be
   }, 60_000);
 });
 
+describe("critic8 — a store a tool reads whole is read with everything beneath it", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  beforeEach(() => {
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.env"), `API_KEY=${SECRET}\n`);
+    writeFileSync(join(ws, "README.md"), "hello\n");
+  });
+
+  test("StateExport: a deny on anything under the directory stops a dump of it, in every mode", async () => {
+    // `stateDir` relocated nothing (the tool names no record), so it was read
+    // as one point: `{stateDir: "."}` dumped secrets/prod.env under both
+    // denies below.
+    symlinkSync(".", join(ws, "here"));
+    for (const deny of [
+      "StateExport(secrets/**)",
+      "StateExport(secrets/prod.env)",
+      "*(secrets/**)",
+    ]) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        const rs =
+          mode === "default"
+            ? rules(["alwaysDeny", deny], ["alwaysAllow", "StateExport"])
+            : rules(["alwaysDeny", deny]);
+        for (const stateDir of [".", "src/..", "./", "here", "secrets"]) {
+          const got = await gate("StateExport", { stateDir }, rs, mode);
+          expect({
+            deny,
+            mode,
+            stateDir,
+            got,
+            leaked: (lastResult ?? "").includes(SECRET),
+          }).toEqual({ deny, mode, stateDir, got: "deny", leaked: false });
+        }
+      }
+    }
+  }, 60_000);
+
+  test("StateExport: a dump that cannot reach the denied place still runs (control)", async () => {
+    await builtin("KvSet").execute({ namespace: "ns", key: "k", value: "state-value" });
+    const rs = rules(["alwaysDeny", "StateExport(secrets/**)"], ["alwaysAllow", "StateExport"]);
+    for (const input of [{}, { stateDir: ".crewhaus/state" }]) {
+      expect({ input, got: await gate("StateExport", input, rs) }).toEqual({ input, got: "allow" });
+      expect(lastResult ?? "").toContain("state-value");
+      expect(lastResult ?? "").not.toContain(SECRET);
+    }
+    // A directory beside the denied one is dumped as before.
+    const got = await gate("StateExport", { stateDir: "src" }, rs);
+    expect({ got, dumped: (lastResult ?? "").includes("app.ts") }).toEqual({
+      got: "allow",
+      dumped: true,
+    });
+    // An allow on the store still covers the ordinary call, and only that.
+    const store = rules(["alwaysAllow", "StateExport(.crewhaus/state/**)"]);
+    expect(await gate("StateExport", {}, store)).toBe("allow");
+    expect(await gate("StateExport", { stateDir: "." }, store)).toBe("ask");
+  }, 30_000);
+
+  test("the other readers that name no record read their directory with what is beneath it", async () => {
+    // Each reads every log, chain file or note in its directory. A deny on
+    // one of them fires on the call that reads the directory — the ordinary
+    // call, which leaves the directory out — and a deny on another place
+    // does not.
+    const cases: Array<[string, unknown, string]> = [
+      ["EventQuery", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["EventCounts", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["ToolCallStats", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["ErrorCluster", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["RunTimeline", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["CostReport", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["SessionSummarize", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["TraceQuery", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["CostSummarize", {}, ".crewhaus/sessions/sess_private.jsonl"],
+      ["AuditVerify", {}, ".crewhaus/audit/audit-0001.jsonl"],
+      ["NoteSearch", { query: "x" }, ".crewhaus/state/notes/private.json"],
+    ];
+    for (const [name, input, file] of cases) {
+      const deny = rules(["alwaysDeny", `${name}(${file})`], ["alwaysAllow", name]);
+      expect({ name, got: await gate(name, input, deny) }).toEqual({ name, got: "deny" });
+      // Control: a deny about a place the call does not read stays quiet.
+      const elsewhere = rules(["alwaysDeny", `${name}(secrets/**)`], ["alwaysAllow", name]);
+      expect({ name, got: await gate(name, input, elsewhere) }).toEqual({ name, got: "allow" });
+    }
+  }, 60_000);
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as
