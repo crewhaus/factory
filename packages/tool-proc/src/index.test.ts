@@ -24,6 +24,7 @@ import { type AddressInfo, Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import {
   PROC_TOOLS,
   __resetRegistryForTest,
@@ -268,6 +269,150 @@ async function withDeadlineAfterFirstLine<T>(
     held.mockRestore();
     cleared.mockRestore();
   }
+}
+
+/** WaitForOutput's longest match deadline (MATCH_BUDGET_MS in ./index). */
+const MATCH_DEADLINE_MS = 2_000;
+
+/** What {@link withWaitClocksHeld} counted. */
+type HeldWait<T> = {
+  readonly result: T;
+  /** Matches the wait asked of the regex worker. */
+  readonly runs: number;
+  /** Match deadlines held. */
+  readonly held: number;
+  /** Sleeps between polls, counted when the test moves the clock by them. */
+  readonly sleeps: number;
+  /** The call outlasted the 10 s valve, which moved the clock and fired the held timers. */
+  readonly valveFired: boolean;
+};
+
+/**
+ * Runs one WaitForOutput call with no clock but the test's deciding its
+ * answer. The wait asks the regex worker for every match, and two real
+ * clocks around each match could end it as `matched: null`,
+ * "undetermined", on a runner that was only slow:
+ *
+ * - The worker reports a failing exec that took 100 ms as the engine giving
+ *   up, never as "no match". Here that threshold is a minute
+ *   (REGEX_RUN_DEFAULTS.giveUpMs, restored after), so a worker thread left
+ *   without a core for 100 ms inside a no-match still answers "no match".
+ * - Each match has a deadline: the time the wait has left, capped at 2 s and
+ *   never under 100 ms, armed as a timer on this thread. Every timer armed
+ *   for one of `matchDeadlines` is held, never scheduled, so a worker that
+ *   answers late still answers. This thread's performance.now stands still
+ *   for the call, so screening the pattern charges a match nothing and its
+ *   timer is armed for exactly its deadline.
+ *
+ * Date.now, the wait's own clock, stands still too, so the wait ends on what
+ * the process printed (a match, a failure match, its exit), never on its
+ * deadline. With `deadlinePassesAfter`, the clock moves a minute on, past
+ * the deadline, once the wait has slept that many times between polls
+ * (sleeps of exactly `interval` ms), so how many polls fit before the
+ * deadline is a count. Should the call not end, after 10 s the clock moves
+ * anyway and every held timer fires, so a broken wait fails on the
+ * assertions after it instead of hanging with the clocks held. It counts the
+ * matches asked of the worker and the timers it held, so a test can show
+ * that every match's deadline was held. Every spy is restored before this
+ * returns.
+ */
+async function withWaitClocksHeld<T>(
+  options: {
+    readonly matchDeadlines: readonly number[];
+    readonly deadlinePassesAfter?: { readonly sleeps: number; readonly interval: number };
+  },
+  body: () => Promise<T>,
+): Promise<HeldWait<T>> {
+  const counted = { runs: 0, held: 0, sleeps: 0, valveFired: false };
+  const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
+  const giveUpMs = defaults.giveUpMs;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const RealWorker = globalThis.Worker;
+  const heldTimers = new Map<object, () => void>();
+  const heldTokens = new WeakSet<object>();
+  let passed = false;
+  let released = false;
+  class CountingWorker extends RealWorker {
+    override postMessage(
+      message: unknown,
+      options?: Bun.StructuredSerializeOptions | Bun.Transferable[],
+    ): void {
+      if ((message as { op?: unknown } | null)?.op === "matchAll") counted.runs += 1;
+      super.postMessage(message, options as Bun.StructuredSerializeOptions);
+    }
+  }
+  const valve = realSetTimeout(() => {
+    counted.valveFired = true;
+    released = true;
+    passed = true;
+    for (const fire of heldTimers.values()) queueMicrotask(fire);
+    heldTimers.clear();
+  }, 10_000);
+  const frozen = Date.now();
+  const still = performance.now();
+  const clock = spyOn(Date, "now").mockImplementation(() => (passed ? frozen + 60_000 : frozen));
+  const thread = spyOn(performance, "now").mockImplementation(() => still);
+  const armed = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (!released && delay !== undefined && options.matchDeadlines.includes(delay)) {
+      counted.held += 1;
+      const token = {};
+      heldTokens.add(token);
+      heldTimers.set(token, () => fn(...rest));
+      return token as unknown as ReturnType<typeof setTimeout>;
+    }
+    const between = options.deadlinePassesAfter;
+    if (between !== undefined && delay === between.interval) {
+      counted.sleeps += 1;
+      if (counted.sleeps >= between.sleeps) passed = true;
+    }
+    return realSetTimeout(fn, delay, ...rest);
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    const token = id as unknown as object;
+    if (heldTokens.has(token)) heldTimers.delete(token);
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  (globalThis as { Worker: unknown }).Worker = CountingWorker;
+  defaults.giveUpMs = 60_000;
+  try {
+    const result = await body();
+    return { result, ...counted };
+  } finally {
+    defaults.giveUpMs = giveUpMs;
+    (globalThis as { Worker: unknown }).Worker = RealWorker;
+    cleared.mockRestore();
+    armed.mockRestore();
+    thread.mockRestore();
+    clock.mockRestore();
+    realClearTimeout(valve);
+  }
+}
+
+/**
+ * WaitForOutput, for a wait the test means to end on what the process
+ * prints: every clock is held ({@link withWaitClocksHeld}). It checks that
+ * the wait ended before the valve and that every match's 2 s deadline was
+ * held.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+async function waitDefinitely(input: Record<string, unknown>): Promise<any> {
+  const { result, runs, held, valveFired } = await withWaitClocksHeld(
+    { matchDeadlines: [MATCH_DEADLINE_MS] },
+    () => call(waitForOutput, input),
+  );
+  expect({ valveFired, ran: runs > 0, held }).toEqual({
+    valveFired: false,
+    ran: true,
+    held: runs,
+  });
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -963,37 +1108,58 @@ describe("background processes", () => {
     expect(second.id).toBe("proc_2");
   });
 
-  testScript("output is returned once: a second poll sees only what is new", async () => {
-    // The second line must not be written until the first poll has happened,
-    // and a `sleep` cannot promise that: on a loaded machine the wait loop's
-    // own tick outlasts the sleep, both lines land in one read, and the test
-    // fails for a reason that has nothing to do with drain semantics. The
-    // script blocks on a file this test creates, so the ordering is caused
-    // rather than hoped for.
-    const gate = join(tmp, "release-second");
-    const path = script(
-      "emit.sh",
-      `echo first\nwhile [ ! -f "${gate}" ]; do sleep 0.01; done\necho second\n`,
-    );
-    const started = await call(processStart, { argv: [path] });
-    await call(waitForOutput, { id: started.id, pattern: "first", timeoutMs: 3_000 });
-    const firstPoll = await call(processOutput, { id: started.id });
-    expect(firstPoll.stdout).toContain("first");
-    expect(firstPoll.stdout).not.toContain("second");
+  testScript(
+    "output is returned once: a second poll sees only what is new",
+    async () => {
+      // The second line must not be written until the first poll has happened,
+      // and a `sleep` cannot promise that: on a loaded machine the wait loop's
+      // own tick outlasts the sleep, both lines land in one read, and the test
+      // fails for a reason that has nothing to do with drain semantics. The
+      // script blocks on a file this test creates, so the ordering is caused
+      // rather than hoped for. Each wait ends on its line, never on a clock
+      // (a real 3 s deadline raced the script's start), and the script stays
+      // alive after the second line, so that wait cannot end on the exit.
+      const gate = join(tmp, "release-second");
+      const path = script(
+        "emit.sh",
+        `echo first\nwhile [ ! -f "${gate}" ]; do sleep 0.01; done\necho second\nexec sleep 30\n`,
+      );
+      const started = await call(processStart, { argv: [path] });
+      const sawFirst = await waitDefinitely({ id: started.id, pattern: "first", timeoutMs: 3_000 });
+      expect(sawFirst.matched).toBe(true);
+      const firstPoll = await call(processOutput, { id: started.id });
+      expect(firstPoll.stdout).toContain("first");
+      expect(firstPoll.stdout).not.toContain("second");
 
-    writeFileSync(gate, "");
-    await call(waitForOutput, { id: started.id, pattern: "second", timeoutMs: 3_000 });
-    const secondPoll = await call(processOutput, { id: started.id });
-    expect(secondPoll.stdout).toContain("second");
-    expect(secondPoll.stdout).not.toContain("first");
+      writeFileSync(gate, "");
+      const sawSecond = await waitDefinitely({
+        id: started.id,
+        pattern: "second",
+        timeoutMs: 3_000,
+      });
+      expect(sawSecond.matched).toBe(true);
+      const secondPoll = await call(processOutput, { id: started.id });
+      expect(secondPoll.stdout).toContain("second");
+      expect(secondPoll.stdout).not.toContain("first");
 
-    const thirdPoll = await call(processOutput, { id: started.id, stream: "stdout" });
-    expect(thirdPoll.stdout).toBe("");
-  });
+      const thirdPoll = await call(processOutput, { id: started.id, stream: "stdout" });
+      expect(thirdPoll.stdout).toBe("");
+    },
+    20_000,
+  );
 
   test("a finished process keeps its output until it is reaped", async () => {
     const started = await call(processStart, { argv: ["echo", "done"] });
-    await call(waitForOutput, { id: started.id, pattern: "done", timeoutMs: 3_000 });
+    await waitDefinitely({ id: started.id, pattern: "done", timeoutMs: 3_000 });
+    // The line can arrive before the exit is seen, and a poll 100 ms later
+    // only usually saw both. A wait for a line it never prints ends when the
+    // registry has seen it exit.
+    const finished = await waitDefinitely({
+      id: started.id,
+      pattern: "never-printed",
+      timeoutMs: 3_000,
+    });
+    expect(finished.reason).toBe("process finished without matching");
     const status = await call(processStatus, { id: started.id });
     expect(status.status).toBe("exited");
     expect(status.exitCode).toBe(0);
@@ -1002,7 +1168,7 @@ describe("background processes", () => {
     expect(reaped.alreadyFinished).toBe(true);
     expect(reaped.reaped).toBe(true);
     expect(await call(processStatus, { id: started.id })).toContain("no background process");
-  });
+  }, 20_000);
 
   testScript(
     "a process that ignores SIGTERM is escalated to SIGKILL within the grace period",
@@ -1012,11 +1178,15 @@ describe("background processes", () => {
         'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done',
       );
       const started = await call(processStart, { argv: [path] });
-      await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
+      // "ready" comes after the trap, so the stop cannot land before it; the
+      // wait ends on that line, not on a clock.
+      const ready = await waitDefinitely({ id: started.id, pattern: "ready", timeoutMs: 3_000 });
+      expect(ready.matched).toBe(true);
       const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
       expect(stopped.stopped).toBe(true);
       expect(stopped.escalatedToSigkill).toBe(true);
     },
+    20_000,
   );
 
   test("an unknown id is a readable message listing what is known", async () => {
@@ -1040,34 +1210,45 @@ describe("background processes", () => {
 // ---------------------------------------------------------------------------
 
 describe("WaitForOutput", () => {
-  testScript("returns as soon as the pattern appears", async () => {
-    const path = script("server.sh", 'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5');
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "Listening on (\\d+)",
-      timeoutMs: 5_000,
-    });
-    expect(out.matched).toBe(true);
-    expect(out.match).toBe("Listening on 4321");
-  });
+  testScript(
+    "returns as soon as the pattern appears",
+    async () => {
+      const path = script(
+        "server.sh",
+        'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "Listening on (\\d+)",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(true);
+      expect(out.match).toBe("Listening on 4321");
+    },
+    20_000,
+  );
 
-  testScript("a failure pattern ends the wait early instead of burning the deadline", async () => {
-    const path = script(
-      "broken.sh",
-      'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
-    );
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "Listening on",
-      failurePattern: "FATAL",
-      timeoutMs: 5_000,
-    });
-    expect(out.matched).toBe(false);
-    expect(out.matchedFailure).toBe(true);
-    expect(out.match).toBe("FATAL");
-  });
+  testScript(
+    "a failure pattern ends the wait early instead of burning the deadline",
+    async () => {
+      const path = script(
+        "broken.sh",
+        'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "Listening on",
+        failurePattern: "FATAL",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(false);
+      expect(out.matchedFailure).toBe(true);
+      expect(out.match).toBe("FATAL");
+    },
+    20_000,
+  );
 
   test("a brace-quantified nested pattern is refused at once, not run to the deadline (C079)", async () => {
     const started = await call(processStart, {
@@ -1141,34 +1322,66 @@ describe("WaitForOutput", () => {
 
   test("the deadline is honoured when the pattern never appears", async () => {
     const started = await call(processStart, { argv: ["sleep", "30"] });
-    const at = Date.now();
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "never-appears",
-      timeoutMs: 250,
-    });
+    // The wait's clock passes the deadline when it sleeps after its third
+    // no-match, so how many polls it makes is a count, not what fits in
+    // 250 ms. Each match ran under a held deadline: 250 ms (the time left)
+    // while the clock stood still, and 100 ms (the least a match gets) for
+    // the last look after it passed. Real ones, and the worker's 100 ms
+    // give-up, turned a poll answered late into matched: null, "undetermined".
+    const LAST_LOOK_MS = 100;
+    const {
+      result: out,
+      runs,
+      held,
+      sleeps,
+      valveFired,
+    } = await withWaitClocksHeld(
+      { matchDeadlines: [250, LAST_LOOK_MS], deadlinePassesAfter: { sleeps: 3, interval: 10 } },
+      () =>
+        call(waitForOutput, {
+          id: started.id,
+          pattern: "never-appears",
+          timeoutMs: 250,
+          intervalMs: 10,
+        }),
+    );
     expect(out.matched).toBe(false);
     expect(out.reason).toBe("deadline");
-    expect(Date.now() - at).toBeLessThan(5_000);
-  });
+    // Honoured: one last look once the deadline had passed, then no more
+    // polls and no more sleeps.
+    expect({ runs, held, sleeps, valveFired }).toEqual({
+      runs: 4,
+      held: 4,
+      sleeps: 3,
+      valveFired: false,
+    });
+  }, 20_000);
 
   test("a process that finishes without matching stops the wait immediately", async () => {
     const started = await call(processStart, { argv: ["echo", "nothing useful"] });
-    const out = await call(waitForOutput, {
+    // With the wait's clock held, only the exit can end it: a wait that
+    // burned its deadline instead would run into the 10 s valve.
+    const out = await waitDefinitely({
       id: started.id,
       pattern: "ready",
       timeoutMs: 30_000,
     });
     expect(out.matched).toBe(false);
     expect(out.reason).toBe("process finished without matching");
-  });
+  }, 20_000);
 
   test("watching does not consume: ProcessOutput still returns everything", async () => {
-    const started = await call(processStart, { argv: ["echo", "hello world"] });
-    await call(waitForOutput, { id: started.id, pattern: "hello", timeoutMs: 3_000 });
+    // A process that stays alive, so the wait ends on the line it watched
+    // for. `echo` exits at once, and a wait that sees the exit before it has
+    // looked at the line answers "process finished without matching".
+    const started = await call(processStart, {
+      argv: [process.execPath, "-e", 'console.log("hello world"); setTimeout(() => {}, 30_000);'],
+    });
+    const saw = await waitDefinitely({ id: started.id, pattern: "hello", timeoutMs: 3_000 });
+    expect(saw.matched).toBe(true);
     const polled = await call(processOutput, { id: started.id });
     expect(polled.stdout).toContain("hello world");
-  });
+  }, 20_000);
 
   test("a pattern that could backtrack exponentially is refused", async () => {
     const started = await call(processStart, { argv: ["sleep", "1"] });
@@ -1204,17 +1417,21 @@ describe("WaitForOutput", () => {
     },
   );
 
-  testScript("a wait for a line, with an unquantified alternation, still works", async () => {
-    const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(ready|listening) on \\d+",
-      timeoutMs: 5_000,
-    });
-    expect(out.matched).toBe(true);
-    expect(out.match).toBe("ready on 8080");
-  });
+  testScript(
+    "a wait for a line, with an unquantified alternation, still works",
+    async () => {
+      const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "(ready|listening) on \\d+",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(true);
+      expect(out.match).toBe("ready on 8080");
+    },
+    20_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
