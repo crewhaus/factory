@@ -1,9 +1,11 @@
 /**
  * linear-mask.ts replaces masking patterns that rescanned a run from every
  * position in it. Each helper must do exactly what its pattern did, and
- * masking a document with a long run must not run those patterns over it.
+ * masking a document with a long run must neither run those patterns over it
+ * nor read it more than a few times by hand.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { maskRawText } from "./inspect";
 import { hasLineBreak, replacePrivateKeyBlocks, replaceQueryPairs } from "./linear-mask";
 import { maskKeyedText, maskText } from "./mask";
@@ -131,7 +133,7 @@ describe("each helper does what its pattern did", () => {
   }, 20_000);
 
   test("a line with a break other than \\n never matches the keyed-line pattern", () => {
-    const pieces = ["k", ":", " ", "\t", "- ", '"', "'", "\r", "\u2028", "x", "#"];
+    const pieces = ["k", ":", " ", "\t", "- ", '"', "'", "\r", "\u2028", "\u2029", "x", "#"];
     const differ: string[] = [];
     const visit = (t: string): void => {
       const guarded = hasLineBreak(t) ? null : t.match(KEYED_SCALAR_LINE);
@@ -140,14 +142,14 @@ describe("each helper does what its pattern did", () => {
     const checked = everyText(pieces, 5, visit);
     for (const t of randomTexts(pieces, 20_000, 14)) visit(t);
     expect(differ).toEqual([]);
-    expect(checked).toBe((11 ** 6 - 1) / 10);
+    expect(checked).toBe((12 ** 6 - 1) / 11);
   }, 20_000);
 });
 
 // Counted, not timed: each document below holds a run that one of the three
 // patterns rescanned from every position in it. Those patterns are refused on
-// the spot if they run over the run; the rest of the masker runs as usual,
-// and reads the run in linear time.
+// the spot if they run over the run; the rest of the masker runs as usual.
+// The helpers' own reads are counted further down.
 describe("documents with a long run", () => {
   test("a URL whose query is a run of ? with no =", () => {
     const run = "?".repeat(10_000);
@@ -170,15 +172,73 @@ describe("documents with a long run", () => {
     expect(masked.outcome).toBe(doc);
   }, 20_000);
 
-  test("a CRLF line whose value follows a long run of spaces", () => {
+  test("a line whose value follows a long run of spaces and holds a break other than \\n", () => {
     const run = " ".repeat(10_000);
     // Control: the hook sees the pattern String#match runs.
     expect(
       refusingOver(run, [KEYED_SCALAR_LINE], () => `k:${run}x\r`.match(KEYED_SCALAR_LINE)).ran,
     ).toEqual([`/${KEYED_SCALAR_LINE.source}/`]);
-    const doc = `name: demo\r\nnote:${" ".repeat(200_000)}x\r\n`;
+    // `.` matches none of CR, U+2028 and U+2029, so the pattern rescanned
+    // the run before each of them; the guard has to know all three.
+    const spaces = " ".repeat(200_000);
+    const doc = [
+      "name: demo\r",
+      `note:${spaces}x\r`,
+      `line:${spaces}x\u2028y`,
+      `para:${spaces}x\u2029y`,
+      "",
+    ].join("\n");
     const masked = refusingOver(run, [KEYED_SCALAR_LINE], () => maskKeyedText(doc));
     expect(masked.ran).toEqual([]);
     expect(masked.outcome).toBe(doc);
   }, 20_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a
+// search that resumes one character on, or one that keeps looking for an END
+// line after a BEGIN line found none), so each helper's own reads are counted
+// (__test__/scan-work.ts) over runs shaped to make it rescan, and held to a
+// few per character. A rescan reads the rest of the run from every place in
+// it and stops at the bound at once.
+describe("each helper reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const same = (whole: string): string => whole;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a query that is a run of ?", (t) => replaceQueryPairs(t, same), "?".repeat(N)],
+    ["a query of names with no =", (t) => replaceQueryPairs(t, same), fill("?a")],
+    ["a query of pairs", (t) => replaceQueryPairs(t, same), fill("?a=b&")],
+    [
+      "private-key BEGIN lines with no END line",
+      (t) => replacePrivateKeyBlocks(t, "[k]"),
+      fill("-----BEGIN RSA PRIVATE KEY-----\n"),
+    ],
+    [
+      "BEGIN lines that are not a private key's",
+      (t) => replacePrivateKeyBlocks(t, "[k]"),
+      fill("-----BEGIN RSA KEY-----\n"),
+    ],
+    [
+      "a BEGIN line and END lines that are not a private key's",
+      (t) => replacePrivateKeyBlocks(t, "[k]"),
+      `-----BEGIN RSA PRIVATE KEY-----\n${fill("-----END RSA KEY-----\n")}`,
+    ],
+    [
+      "private-key blocks one after another",
+      (t) => replacePrivateKeyBlocks(t, "[k]"),
+      fill("-----BEGIN RSA PRIVATE KEY-----\nab\n-----END RSA PRIVATE KEY-----\n"),
+    ],
+    ["a line of spaces", hasLineBreak, " ".repeat(N)],
+  ];
+  for (const [label, helper, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => helper(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a helper that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });
