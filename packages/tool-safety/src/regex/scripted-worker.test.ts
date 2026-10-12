@@ -1,7 +1,8 @@
 /**
  * The scripted regex worker the give-up and deadline tests run on (see
- * scriptWorkerClock): a cost lands on exactly the input it names, and an
- * input scripted to hang holds its run until the deadline.
+ * scriptWorkerClock): a cost lands on exactly the input it names, an input
+ * scripted to hang holds its run until the deadline, and one scripted to
+ * hold keeps its thread, through terminate(), until the test releases it.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worker-clock";
@@ -54,6 +55,43 @@ describe("the scripted worker", () => {
     const outcome = await runRegex({ op: "test", pattern: "z", input: "stuck", deadlineMs: 200 });
     expect(outcome.status).toBe("timeout");
     // terminate() ends the wait it is in.
+    expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+
+  test("an input scripted to hold keeps its thread through terminate() until released, and it then runs nothing more", async () => {
+    const scripted = scriptWorkerClock({}, [], ["held"]);
+    const controller = new AbortController();
+    const pending = runRegex({
+      op: "testEach",
+      pattern: "z",
+      inputs: ["a", "held", "b", "c"],
+      signal: controller.signal,
+      deadlineMs: 60_000,
+    });
+    expect(await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))])).toBe("held");
+    // "a", then the held one; nothing after it yet.
+    expect(scripted.execs()).toBe(2);
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "error", code: "aborted" });
+    // terminate() was called and cannot end an untimed wait: a hang would
+    // let the thread go within one 10 ms wait, and only a broken hold can
+    // exit here, whatever the wait.
+    expect(await workersExited(500)).toEqual({ live: 1, runaway: 1 });
+    scripted.release();
+    expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
+    // It exited before "b".
+    expect(scripted.execs()).toBe(2);
+  }, 90_000);
+
+  test("released, a held exec gives the engine's own answer to a run still waiting for it", async () => {
+    const scripted = scriptWorkerClock({}, [], ["held x"]);
+    const pending = runRegex({ op: "test", pattern: "x$", input: "held x", deadlineMs: 60_000 });
+    expect(await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))])).toBe(
+      "held x",
+    );
+    scripted.release();
+    expect(await pending).toMatchObject({ status: "ok", result: { matched: true } });
+    expect(scripted.execs()).toBe(1);
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 });

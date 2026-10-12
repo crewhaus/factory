@@ -1,5 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worker-clock";
+import {
+  type ScriptedWorker,
+  restoreWorkerClock,
+  scriptWorkerClock,
+} from "./__test__/scripted-worker-clock";
 import {
   REGEX_RUN_DEFAULTS,
   type RegexOutcome,
@@ -18,8 +22,9 @@ import { REGEX_WORKER_SOURCE } from "./worker-source";
  *
  * A worker abandoned at a deadline keeps its thread until the `exec` it is
  * inside returns, and the tests below deliberately leave such threads
- * behind. Waiting keeps one test's leftovers from making the next one
- * `busy`, and doubles as the check that abandoned threads really do exit.
+ * behind (held on the scripted worker until they release them). Waiting
+ * keeps one test's leftovers from making the next one `busy`, and doubles
+ * as the check that abandoned threads really do exit.
  */
 async function settleWorkers(budgetMs: number): Promise<{ live: number; runaway: number }> {
   const until = performance.now() + budgetMs;
@@ -92,7 +97,8 @@ function openSession(): RegexSession {
 }
 
 // A body abandoned at its budget never reaches a finally of its own, so
-// everything is put back here, after every test, its sessions closed first.
+// everything is put back here, after every test: its sessions closed, then
+// any thread the scripted worker holds released, so it exits too.
 afterEach(() => {
   for (const session of openedSessions.splice(0)) session.close();
   releaseDeadline();
@@ -102,14 +108,16 @@ afterEach(() => {
 });
 
 /**
- * Hold the deadline of the regex runs started until {@link releaseDeadline}:
- * the timer is never armed, and `fire` runs it when the test says. The
- * caller's clock stands still meanwhile, so the screen takes nothing off the
- * deadline and the timer asks for exactly `deadlineMs`; any other timer is
- * left alone. `fire` throws unless exactly one such timer was held, so a
- * changed deadline cannot quietly put the race back.
+ * Hold the deadline of the regex runs started until `release` (or
+ * {@link releaseDeadline}): the timer is never armed, and `fire` runs it
+ * when the test says. The caller's clock stands still meanwhile, so the
+ * screen takes nothing off the deadline and the timer asks for exactly
+ * `deadlineMs`; any other timer is left alone. `fire` throws unless exactly
+ * one such timer was held, so a changed deadline cannot quietly put the race
+ * back. `release` puts back only this hold: a body abandoned at its budget
+ * that gets there late, during a later test, leaves that test's hold alone.
  */
-function holdDeadline(deadlineMs: number): { fire(): void } {
+function holdDeadline(deadlineMs: number): { fire(): void; release(): void } {
   releaseDeadline();
   const realSetTimeout = globalThis.setTimeout;
   const held: Array<() => void> = [];
@@ -123,16 +131,20 @@ function holdDeadline(deadlineMs: number): { fire(): void } {
     held.push(() => fn(...rest));
     return 0 as unknown as ReturnType<typeof setTimeout>;
   }) as typeof setTimeout);
-  heldDeadline.restore = () => {
+  const restore = (): void => {
     timers.mockRestore();
     clock.mockRestore();
   };
+  heldDeadline.restore = restore;
   return {
     fire(): void {
       if (held.length !== 1) {
         throw new Error(`expected one ${deadlineMs} ms deadline to hold, held ${held.length}`);
       }
       held[0]?.();
+    },
+    release(): void {
+      if (heldDeadline.restore === restore) releaseDeadline();
     },
   };
 }
@@ -159,6 +171,26 @@ const GIVES_UP = { pattern: "(?:a|b)*(?:a|b)*(?:a|b)*(?:a|b)*!|x", input: `${"a"
 
 /** What a give-up costs on the scripted worker clock. Every real one measured took 0.4–3 s. */
 const GIVE_UP_COST_MS = 1_000;
+
+/**
+ * An input the scripted worker holds (see {@link scriptWorkerClock}): its
+ * exec does not return until the test releases it, and terminate() cannot
+ * end it, as a thread terminated inside a slow real match runs on until the
+ * match returns. The tests below used a real one, \s+$ over 40 000 spaces
+ * (about a second of one core here), to outlast a 20-100 ms deadline, and an
+ * engine some 20 times faster answered first. Held, a run ends only as the
+ * test says: at its deadline, on an abort, or on a close.
+ */
+const HELD = "the worker holds this one, x";
+
+/** Wait until a worker is inside the held exec; if the run ended first, say how. */
+async function untilHeld(
+  scripted: ScriptedWorker,
+  pending: Promise<RegexOutcome<unknown>>,
+): Promise<void> {
+  const reached = await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))]);
+  expect(reached).toBe(HELD);
+}
 
 describe("runRegex: answers", () => {
   test("test, matchAll, replace, split, testEach and firstMatchingRule", async () => {
@@ -384,19 +416,22 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
 
   test("the deadline holds while the caller's event loop keeps running", async () => {
     await settleWorkers(60_000);
+    const scripted = scriptWorkerClock({}, [], [HELD]);
     // Every message a regex worker posts, in the order this thread receives
     // them. The listener is added in the constructor, before the session's
     // own, so a message is recorded before the session acts on it.
-    const RealWorker = globalThis.Worker;
+    const ScriptedClockWorker = globalThis.Worker;
     const received: string[] = [];
-    class Watched extends RealWorker {
-      constructor(...args: ConstructorParameters<typeof RealWorker>) {
+    class Watched extends ScriptedClockWorker {
+      constructor(...args: ConstructorParameters<typeof ScriptedClockWorker>) {
         super(...args);
         this.addEventListener("message", (event) => {
           received.push(String((event.data as { kind?: unknown } | null)?.kind));
         });
       }
     }
+    // afterEach puts the real Worker back: a finally here would run after
+    // it when the body is abandoned, and leave this class for later tests.
     (globalThis as { Worker: unknown }).Worker = Watched;
     const session = openSession();
     try {
@@ -408,12 +443,13 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
       const tick = setInterval(() => {
         ticks += 1;
       }, 10);
-      // Quadratic and uninterruptible from inside: ≈1 s of one core here,
-      // far longer on a slow runner. It matches — the `x` is there.
+      // The exec is held: the worker cannot answer, however fast its engine,
+      // so only the deadline can end the run. (It matches, once released:
+      // the `x` is there.)
       const outcome = await session.run({
         op: "test",
         pattern: "\\s+$|x",
-        input: `${" ".repeat(40_000)}x`,
+        input: HELD,
         deadlineMs: 50,
       });
       // Read before anything else runs. The answer came at the deadline,
@@ -428,6 +464,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
       expect(regexVerdict(outcome as RegexOutcome<TestResult>)).toBe("undetermined");
       expect(doneByAnswer).toBe(0);
       expect(stillRunning).toBe(1);
+      // The interval was due before the deadline, so it ran first.
       expect(ticks).toBeGreaterThan(0);
       // The same session recovers with a fresh worker.
       expect(await session.run({ op: "test", pattern: "b", input: "abc" })).toMatchObject({
@@ -435,53 +472,83 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
         result: { matched: true },
       });
     } finally {
-      (globalThis as { Worker: unknown }).Worker = RealWorker;
       session.close();
     }
-    const settled = await settleWorkers(60_000);
-    expect(settled).toEqual({ live: 0, runaway: 0 });
+    // Released, the abandoned thread exits.
+    scripted.release();
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 
   test("a timed-out batch is stopped where it is, reports how far it got, and its thread exits", async () => {
     await settleWorkers(60_000);
-    // ≈5 ms per line here, 3000 lines: ≈15 s of work the deadline cuts short.
-    const line = `${" ".repeat(3_000)}y`;
-    const inputs = new Array<string>(3_000).fill(line);
-    inputs[0] = "match  ";
-    const outcome = await runRegex({
-      op: "testEach",
-      pattern: "\\s+$",
-      inputs,
-      deadlineMs: 100,
-      maxInputChars: 20_000_000,
-    });
+    // 300 lines, each one progress interval on the worker's scripted clock,
+    // so every group of lines is reported once decided; every seventh ends in
+    // spaces and matches. Line 150 is held. The deadline is held until the
+    // worker is inside that exec and then fired, so the run stops there,
+    // whatever the engine's speed: a real slow batch (3 000 lines of 3 000
+    // spaces, about 15 s here) let an engine fast enough finish first. Few
+    // lines, so a worker stalled after every exec still gets there.
+    const interval = REGEX_RUN_DEFAULTS.progressEveryMs;
+    const hit = "row ends  ";
+    const miss = "row";
+    const stop = 150;
+    const inputs: string[] = Array.from({ length: 300 }, (_, i) => (i % 7 === 0 ? hit : miss));
+    inputs[stop] = HELD;
+    const scripted = scriptWorkerClock({ [hit]: interval, [miss]: interval }, [], [HELD]);
+    const deadline = holdDeadline(100);
+    const pending = runRegex({ op: "testEach", pattern: "\\s+$", inputs, deadlineMs: 100 });
+    await untilHeld(scripted, pending);
+    // Each line before it ran once (none took long enough to be run again),
+    // and none after it.
+    const execsAtDeadline = scripted.execs();
+    expect(execsAtDeadline).toBe(stop + 1);
+    deadline.fire();
+    const outcome = await pending;
+    deadline.release();
     expect(outcome.status).toBe("timeout");
     if (outcome.status !== "timeout") return;
-    expect(outcome.completed ?? -1).toBeGreaterThanOrEqual(0);
-    expect(outcome.completed ?? 0).toBeLessThan(inputs.length);
-    const partial = outcome.partial as { matched: number[]; scanned: number } | undefined;
-    expect(partial?.scanned).toBe(outcome.completed);
-    for (const i of partial?.matched ?? []) expect(i).toBeLessThan(outcome.completed ?? 0);
-    // terminate() took effect between lines: the thread is gone long
-    // before the batch could have finished. Without terminate() it would
-    // never exit at all.
-    const exitedWithin = performance.now();
-    const settled = await settleWorkers(10_000);
-    expect(settled).toEqual({ live: 0, runaway: 0 });
-    expect(performance.now() - exitedWithin).toBeLessThan(10_000);
+    // How far it got is what the worker reported before the held line: some
+    // of the batch, never past that line, and every match below it.
+    const completed = outcome.completed ?? -1;
+    expect(completed).toBeGreaterThan(0);
+    expect(completed).toBeLessThanOrEqual(stop);
+    expect(outcome.partial).toEqual({
+      matched: inputs.slice(0, completed).flatMap((s, i) => (s === hit ? [i] : [])),
+      scanned: completed,
+      truncated: false,
+      undetermined: [],
+    });
+    // The terminated thread is still inside the held exec, as one inside a
+    // slow real match is. Once that exec returns, terminate() stops the
+    // batch before its next line, and the thread exits: not one of the 149
+    // lines after it runs. Without terminate() it would run them all, and
+    // never exit.
+    expect(regexWorkerCounts().runaway).toBe(1);
+    scripted.release();
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
+    expect(scripted.execs()).toBe(execsAtDeadline);
   }, 90_000);
 
   test("past maxRunawayWorkers abandoned threads, a new run is refused as busy", async () => {
     await settleWorkers(60_000);
-    const first = await runRegex({
+    // Held, the first run's thread stays a runaway until the test releases
+    // it, however fast the engine: a real slow input let an engine fast
+    // enough finish, and exit, before the second run was asked.
+    const scripted = scriptWorkerClock({}, [], [HELD]);
+    const deadline = holdDeadline(20);
+    const pending = runRegex({
       op: "test",
       pattern: "\\s+$|x",
-      input: `${" ".repeat(40_000)}x`,
+      input: HELD,
       deadlineMs: 20,
       maxRunawayWorkers: 1,
     });
+    await untilHeld(scripted, pending);
+    deadline.fire();
+    const first = await pending;
+    deadline.release();
     expect(first.status).toBe("timeout");
-    // Issued immediately, while that thread is still inside its exec.
+    // Asked while that thread is still inside its exec.
     const second = await runRegex({
       op: "test",
       pattern: "a",
@@ -490,6 +557,7 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
     });
     expect(second).toMatchObject({ status: "error", code: "busy" });
     expect(regexVerdict(second as RegexOutcome<TestResult>)).toBe("undetermined");
+    scripted.release();
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
     // And once it has exited, runs start again.
     expect(
@@ -703,20 +771,40 @@ describe("batch ops", () => {
 
   test("a timed-out testMatrix reports its partial answers per pattern", async () => {
     await settleWorkers(60_000);
-    const line = `${" ".repeat(3_000)}y`;
-    const outcome = await runRegex({
+    // Each exec over a row is half a progress interval on the worker's
+    // scripted clock, so each row (two patterns) is reported once both have
+    // run on it; every third row ends in "y". Row 20 is held, and the
+    // deadline fired once the worker is inside it, so the run stops there on
+    // any engine: a real slow matrix (3 000 rows of 3 000 spaces) let an
+    // engine fast enough finish first. Few rows, so a worker stalled after
+    // every exec still gets there.
+    const half = REGEX_RUN_DEFAULTS.progressEveryMs / 2;
+    const plain = "row x";
+    const withY = "row y";
+    const stop = 20;
+    const inputs: string[] = Array.from({ length: 30 }, (_, i) => (i % 3 === 0 ? withY : plain));
+    inputs[stop] = HELD;
+    const scripted = scriptWorkerClock({ [plain]: half, [withY]: half }, [], [HELD]);
+    const deadline = holdDeadline(100);
+    const pending = runRegex({
       op: "testMatrix",
       patterns: [{ pattern: "\\s+$" }, { pattern: "y" }],
-      inputs: new Array<string>(3_000).fill(line),
+      inputs,
       deadlineMs: 100,
-      maxInputChars: 20_000_000,
     });
-    expect(outcome.status).toBe("timeout");
-    if (outcome.status !== "timeout") return;
-    const partial = outcome.partial as { matched: number[][]; undetermined: number[][] };
-    expect(partial.matched.length).toBe(2);
-    expect(partial.matched[0]).toEqual([]);
-    expect(partial.matched[1]?.length ?? 0).toBeLessThanOrEqual(outcome.completed ?? 0);
+    await untilHeld(scripted, pending);
+    deadline.fire();
+    const outcome = await pending;
+    deadline.release();
+    expect(outcome).toMatchObject({
+      status: "timeout",
+      completed: stop,
+      partial: {
+        matched: [[], inputs.slice(0, stop).flatMap((s, i) => (s === withY ? [i] : []))],
+        undetermined: [[], []],
+      },
+    });
+    scripted.release();
     expect(await settleWorkers(30_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 });
@@ -789,7 +877,7 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
     expect(reached).toBe(endless);
     deadline.fire();
     const outcome = await pending;
-    releaseDeadline();
+    deadline.release();
     expect(outcome).toMatchObject({
       status: "timeout",
       completed: 3,
@@ -897,20 +985,27 @@ describe("abort and busy", () => {
       signal: AbortSignal.abort(),
     });
     expect(early).toMatchObject({ status: "error", code: "aborted" });
+    // Held, the run cannot finish, however fast the engine, so only the
+    // abort can end it (the 60 s deadline only stops a hang). A real slow
+    // input aborted after 30 ms let an engine fast enough answer first.
+    const scripted = scriptWorkerClock({}, [], [HELD]);
     const controller = new AbortController();
     const pending = runRegex({
       op: "test",
       pattern: "\\s+$|x",
-      input: `${" ".repeat(40_000)}x`,
+      input: HELD,
       deadlineMs: 60_000,
       signal: controller.signal,
     });
-    setTimeout(() => controller.abort(), 30);
+    await untilHeld(scripted, pending);
+    controller.abort();
     const outcome = await pending;
-    // ≈1 s of one core here, far longer on a slow runner: it cannot finish
-    // before the abort, so only an abort explains the outcome.
     expect(outcome).toMatchObject({ status: "error", code: "aborted" });
     expect(regexVerdict(outcome as RegexOutcome<TestResult>)).toBe("undetermined");
+    // The aborted run's thread was stopped inside its exec: a runaway until
+    // the exec returns, and then it exits.
+    expect(regexWorkerCounts().runaway).toBe(1);
+    scripted.release();
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 
@@ -925,14 +1020,22 @@ describe("abort and busy", () => {
 
   test("abandoned workers make only their own runawayKey busy", async () => {
     await settleWorkers(60_000);
-    const hostile = await runRegex({
+    // Held, the hostile run's thread stays a runaway of "session-a" until
+    // the test releases it, however fast the engine.
+    const scripted = scriptWorkerClock({}, [], [HELD]);
+    const deadline = holdDeadline(20);
+    const pending = runRegex({
       op: "test",
       pattern: "\\s+$|x",
-      input: `${" ".repeat(40_000)}x`,
+      input: HELD,
       deadlineMs: 20,
       maxRunawayWorkers: 1,
       runawayKey: "session-a",
     });
+    await untilHeld(scripted, pending);
+    deadline.fire();
+    const hostile = await pending;
+    deadline.release();
     expect(hostile.status).toBe("timeout");
     const again = await runRegex({
       op: "test",
@@ -950,6 +1053,7 @@ describe("abort and busy", () => {
       runawayKey: "session-b",
     });
     expect(neighbour).toMatchObject({ status: "ok", result: { matched: true } });
+    scripted.release();
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 120_000);
 });
@@ -974,18 +1078,23 @@ describe("sessions", () => {
   });
 
   test("closing mid-run resolves the run as closed instead of leaving it hanging", async () => {
+    // Held, the run is still going when the session closes, however fast the
+    // engine; a real slow input closed after 50 ms let one fast enough
+    // answer "ok" first, so the test had to accept either.
+    const scripted = scriptWorkerClock({}, [], [HELD]);
     const session = openSession();
     const pending = session.run({
       op: "test",
       pattern: "\\s+$|x",
-      input: `${" ".repeat(20_000)}x`,
+      input: HELD,
       deadlineMs: 60_000,
     });
-    await Bun.sleep(50);
+    await untilHeld(scripted, pending);
     session.close();
-    const outcome = await pending;
-    expect(["error", "ok"]).toContain(outcome.status);
-    if (outcome.status === "error") expect(outcome.code).toBe("closed");
+    expect(await pending).toMatchObject({ status: "error", code: "closed" });
+    // The thread was stopped inside its exec: a runaway until it returns.
+    expect(regexWorkerCounts().runaway).toBe(1);
+    scripted.release();
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 });

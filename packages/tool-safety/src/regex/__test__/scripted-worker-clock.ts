@@ -7,20 +7,42 @@ import { REGEX_WORKER_SOURCE } from "../worker-source";
  */
 const AFTER = "var progressEveryMs = 10;\n";
 
-/** What {@link scriptWorkerClock} replaced. A const object, not a module `let`. */
-const installed: { worker: typeof Worker | undefined; url: string | undefined } = {
-  worker: undefined,
-  url: undefined,
-};
+/**
+ * What {@link scriptWorkerClock} replaced, and the gate its workers share.
+ * A const object, not a module `let`.
+ */
+const installed: {
+  worker: typeof Worker | undefined;
+  url: string | undefined;
+  gate: Int32Array | undefined;
+} = { worker: undefined, url: undefined, gate: undefined };
 
-/** What a test can wait for on the scripted worker. */
+/** The gate's slots: shared memory, so a terminated thread's count is still read exactly. */
+const OPEN = 0;
+const EXECS = 1;
+
+/** What a test can wait for, count and release on the scripted worker. */
 export type ScriptedWorker = {
   /**
    * Resolves with the input once a worker is inside an `exec` over one of
-   * the `hangs`. A worker's messages arrive in order, so by then every
-   * progress report it sent before that exec has been taken in.
+   * the `hangs` or `holds`. A worker's messages arrive in order, so by then
+   * every progress report it sent before that exec has been taken in.
    */
   readonly hung: Promise<string>;
+  /**
+   * How many times the scripted workers have called `exec` (a `test` is one
+   * call), over any input, counted as they enter it. Read from memory the
+   * workers share with this thread, so it is exact at any moment, also for
+   * a thread that was terminated.
+   */
+  execs(): number;
+  /**
+   * Let every `exec` waiting on a hang or a hold go on, now and from now on:
+   * a thread that was not terminated returns the engine's real answer, and
+   * one that was exits without starting another `exec`. Also done by
+   * {@link restoreWorkerClock}, so no test leaves a thread held.
+   */
+  release(): void;
 };
 
 /**
@@ -37,21 +59,30 @@ export type ScriptedWorker = {
  * The engine still answers every match; only the time is scripted, so the
  * verdict is the same on any machine and under any stall.
  *
- * An `exec` over a string in `hangs` never returns: it is how a test holds a
- * run past its deadline without a real slow input, which an engine fast
- * enough would finish first. The thread waits rather than spins, and
- * `terminate()` ends it within one 10 ms wait (an untimed `Atomics.wait`
- * outlives `terminate()` in Bun 1.3.14, so the wait is timed and repeated).
+ * An `exec` over a string in `hangs` does not return until
+ * {@link ScriptedWorker.release}: it is how a test holds a run past its
+ * deadline without a real slow input, which an engine fast enough would
+ * finish first. The thread waits rather than spins, and `terminate()` ends
+ * it within one 10 ms wait (an untimed `Atomics.wait` outlives `terminate()`
+ * in Bun 1.3.14, so the wait is timed and repeated).
  *
- * Both lists are matched literally, `$` included. The rest of the worker is
- * the shipped source, unchanged. It is installed by replacing
- * `globalThis.Worker` for the workers started until {@link restoreWorkerClock}.
- * The caller's file wires that to `afterEach`, so a test abandoned at its
- * budget never leaves it in place.
+ * An `exec` over a string in `holds` waits the same way, but untimed, so
+ * `terminate()` cannot end it: the thread stays up, as one terminated inside
+ * a slow real match does, until the test releases it. It then exits without
+ * starting another `exec`, which `execs()` shows. That is how a test keeps an
+ * abandoned thread a runaway for exactly as long as it needs, on any engine.
+ *
+ * All three lists are matched literally, `$` included. The rest of the
+ * worker is the shipped source, unchanged. It is installed by replacing
+ * `globalThis.Worker` for the workers started until
+ * {@link restoreWorkerClock}. The caller's file wires that to `afterEach`,
+ * so a test abandoned at its budget never leaves it in place, or a thread
+ * held.
  */
 export function scriptWorkerClock(
   costs: Readonly<Record<string, number>>,
   hangs: ReadonlyArray<string> = [],
+  holds: ReadonlyArray<string> = [],
 ): ScriptedWorker {
   restoreWorkerClock();
   if (!REGEX_WORKER_SOURCE.includes(AFTER)) {
@@ -60,14 +91,29 @@ export function scriptWorkerClock(
   const prelude = [
     `var scriptedCosts = new Map(${JSON.stringify(Object.entries(costs))});`,
     `var scriptedHangs = new Set(${JSON.stringify(hangs)});`,
+    `var scriptedHolds = new Set(${JSON.stringify(holds)});`,
     "var scriptedNow = 0;",
-    "var scriptedWait = new Int32Array(new SharedArrayBuffer(4));",
+    // Replaced by the test's gate, which the worker is sent before anything
+    // else; the message never reaches the worker's own onmessage.
+    "var scriptedGate = new Int32Array(new SharedArrayBuffer(8));",
+    'addEventListener("message", function (ev) {',
+    "  var data = ev.data;",
+    '  if (data !== null && typeof data === "object" && data.kind === "scripted-gate") {',
+    "    scriptedGate = data.gate;",
+    "    ev.stopImmediatePropagation();",
+    "  }",
+    "});",
     "performance.now = function () { return scriptedNow; };",
     "var nativeExec = RegExp.prototype.exec;",
     "RegExp.prototype.exec = function (s) {",
-    "  if (scriptedHangs.has(s)) {",
+    `  Atomics.add(scriptedGate, ${EXECS}, 1);`,
+    "  var held = scriptedHolds.has(s);",
+    "  if (held || scriptedHangs.has(s)) {",
     '    postMessage({ kind: "scripted-hang", input: s });',
-    "    for (;;) Atomics.wait(scriptedWait, 0, 0, 10);",
+    `    while (Atomics.load(scriptedGate, ${OPEN}) === 0) {`,
+    `      if (held) Atomics.wait(scriptedGate, ${OPEN}, 0);`,
+    `      else Atomics.wait(scriptedGate, ${OPEN}, 0, 10);`,
+    "    }",
     "  }",
     "  var cost = scriptedCosts.get(s);",
     "  if (cost !== undefined) scriptedNow += cost;",
@@ -79,6 +125,7 @@ export function scriptWorkerClock(
   // literally: a replacement STRING would expand $$, $&, $` and $' in them.
   const source = REGEX_WORKER_SOURCE.replace(AFTER, () => AFTER + prelude);
   const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  const gate = new Int32Array(new SharedArrayBuffer(8));
   const hang: { resolve: (input: string) => void } = { resolve: () => {} };
   const hung = new Promise<string>((resolve) => {
     hang.resolve = resolve;
@@ -92,16 +139,34 @@ export function scriptWorkerClock(
         const data = event.data as { kind?: unknown; input?: unknown } | null;
         if (data?.kind === "scripted-hang") hang.resolve(String(data.input));
       });
+      this.postMessage({ kind: "scripted-gate", gate });
     }
   }
   installed.worker = RealWorker;
   installed.url = url;
+  installed.gate = gate;
   (globalThis as { Worker: unknown }).Worker = ScriptedClockWorker;
-  return { hung };
+  return {
+    hung,
+    execs: () => Atomics.load(gate, EXECS),
+    release: () => open(gate),
+  };
 }
 
-/** Put back the real `Worker`, if {@link scriptWorkerClock} replaced it. */
+function open(gate: Int32Array): void {
+  Atomics.store(gate, OPEN, 1);
+  Atomics.notify(gate, OPEN);
+}
+
+/**
+ * Release every thread {@link scriptWorkerClock} holds, and put back the
+ * real `Worker`, if it replaced it.
+ */
 export function restoreWorkerClock(): void {
+  if (installed.gate !== undefined) {
+    open(installed.gate);
+    installed.gate = undefined;
+  }
   if (installed.worker !== undefined) {
     (globalThis as { Worker: unknown }).Worker = installed.worker;
     installed.worker = undefined;
