@@ -99,13 +99,25 @@ export function bytesToBase64(bytes: Uint8Array, options: Base64Options = {}): s
 }
 
 /**
+ * `text` without its trailing `=`: what `text.replace(/=+$/, "")` returned,
+ * in one pass from the end. That pattern tries every start inside a run of
+ * `=` that is not at the end and rescans the rest of the run from each, so
+ * it was quadratic in the run's length, and the text is the caller's.
+ */
+export function withoutTrailingPadding(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x3d) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
+/**
  * Base64 decode. Accepts both alphabets, with or without padding, and
  * tolerates embedded whitespace (PEM bodies and wrapped headers arrive that
  * way). Throws with the offending character on anything else — a caller
  * mistake should be legible, not a silent truncation.
  */
 export function base64ToBytes(text: string): Uint8Array {
-  const cleaned = text.replace(/[\s\r\n]/g, "").replace(/=+$/, "");
+  const cleaned = withoutTrailingPadding(text.replace(/[\s\r\n]/g, ""));
   if (cleaned.length % 4 === 1) {
     throw new Error(`base64 length ${cleaned.length} is impossible — one leftover character`);
   }
