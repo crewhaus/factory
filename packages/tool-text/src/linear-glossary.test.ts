@@ -10,9 +10,19 @@
  * for text, and the passes together may read a hundred times that; past
  * either the call is refused with a sentence, never cut.
  *
- * The glossary loop 0.7.0 shipped is kept below as the reference.
+ * Each term was found by a regular expression that tried the whole term from
+ * every position, so one pass read the text's length times the term's. It is
+ * now found in one read of the text (Knuth–Morris–Pratt), with the same
+ * matches.
+ *
+ * The glossary loop 0.7.0 shipped is kept below as the reference, with a
+ * second one that finds the same matches without a lookbehind: JavaScriptCore
+ * folds case differently in a pattern that has one (see "the lookbehind's
+ * folding", below), and the glossary now folds the same way with and without
+ * whole words.
  */
 import { describe, expect, test } from "bun:test";
+import { regexWork } from "./__test__/regex-work";
 import { glossaryReplace as glossaryTool } from "./index";
 import { escapeFor } from "./lib/format";
 import { glossaryReplace } from "./lib/normalize";
@@ -44,6 +54,46 @@ function referenceGlossary(
   return { text: out, replacements };
 }
 
+/**
+ * The 0.7.0 loop's matches, found without a lookbehind: from each place the
+ * search resumes, the first start where the term matches (a sticky regex,
+ * with the `(?![\w-])` lookahead for whole words) and, for whole words, the
+ * unit before it is not `[\w-]` — which is what `(?<![\w-])` asked. The
+ * same matches, except that JavaScriptCore folds case one way more in a
+ * pattern with a lookbehind (see "the lookbehind's folding").
+ */
+function lookbehindFreeGlossary(
+  text: string,
+  mapping: Readonly<Record<string, string>>,
+  wholeWord: boolean,
+  caseSensitive: boolean,
+): { text: string; replacements: Record<string, number> } {
+  const replacements: Record<string, number> = {};
+  let out = text;
+  for (const term of Object.keys(mapping).sort((a, b) => b.length - a.length)) {
+    const escaped = escapeFor(term, "regex");
+    const re = new RegExp(wholeWord ? `${escaped}(?![\\w-])` : escaped, caseSensitive ? "y" : "yi");
+    const parts: string[] = [];
+    let copied = 0;
+    let count = 0;
+    for (let at = 0; at <= out.length; at++) {
+      if (wholeWord && at > 0 && /[\w-]/.test(out.charAt(at - 1))) continue;
+      re.lastIndex = at;
+      if (!re.test(out)) continue;
+      parts.push(out.slice(copied, at), mapping[term] as string);
+      count++;
+      copied = at + term.length;
+      // An empty match moves on one unit, as a global replace does.
+      at = term.length === 0 ? at : copied - 1;
+    }
+    if (count > 0) {
+      replacements[term] = count;
+      out = parts.join("") + out.slice(copied);
+    }
+  }
+  return { text: out, replacements };
+}
+
 /** xorshift32: the same cases on every run and every machine. */
 function generator(seed: number): () => number {
   const state = { x: seed >>> 0 || 1 };
@@ -66,13 +116,12 @@ type Fn = (this: unknown, ...args: unknown[]) => unknown;
 const OVER = Symbol("over the work limit");
 
 /**
- * Run `body`, counting what `String.prototype.replace` is handed and what
- * its replacer functions return: every pass's text, and every character a
- * pass puts in. Past `limit` the next charge throws, so an expansion that
- * would run away stops at once. A regular expression's own search is native
- * and not seen; it is charged as the text it runs over.
+ * Run `body`, counting the search's work: every step a regular expression
+ * takes (the step model in __test__/regex-work.ts), and every unit read by
+ * `charCodeAt` and every character `slice` and `join` return. Past `limit`
+ * either count stops the body, and the work reads as Infinity.
  */
-function replaceWork<T>(
+function searchWork<T>(
   limit: number,
   body: () => T,
 ): { readonly outcome: T | Error | undefined; readonly work: number } {
@@ -86,30 +135,50 @@ function replaceWork<T>(
     }
   };
   const strings = String.prototype as unknown as Record<string, Fn>;
-  const real = strings["replace"] as Fn;
-  strings["replace"] = function (this: unknown, pattern: unknown, replacer: unknown) {
-    charge(String(this).length);
-    const counted =
-      typeof replacer === "function"
-        ? (...args: unknown[]) => {
-            const out = String((replacer as (...a: unknown[]) => unknown)(...args));
-            charge(out.length);
-            return out;
-          }
-        : replacer;
-    return real.call(this, pattern, counted);
+  const arrays = Array.prototype as unknown as Record<string, Fn>;
+  const real = {
+    charCodeAt: strings["charCodeAt"] as Fn,
+    slice: strings["slice"] as Fn,
+    join: arrays["join"] as Fn,
+  };
+  strings["charCodeAt"] = function (this: unknown, ...args: unknown[]) {
+    charge(1);
+    return real.charCodeAt.apply(this, args);
+  };
+  strings["slice"] = function (this: unknown, ...args: unknown[]) {
+    const out = real.slice.apply(this, args) as string;
+    charge(out.length);
+    return out;
+  };
+  arrays["join"] = function (this: unknown, ...args: unknown[]) {
+    const out = real.join.apply(this, args) as string;
+    charge(out.length);
+    return out;
   };
   let outcome: T | Error | undefined;
+  let steps = 0;
   try {
-    outcome = body();
+    const regex = regexWork(limit, () => {
+      try {
+        return body();
+      } catch (err) {
+        if (err === OVER) throw err;
+        return err as Error;
+      }
+    });
+    steps = regex.steps;
+    outcome = regex.value;
   } catch (err) {
-    if (err !== OVER) outcome = err as Error;
+    if (err !== OVER) throw err;
   } finally {
-    strings["replace"] = real;
+    strings["charCodeAt"] = real.charCodeAt;
+    strings["slice"] = real.slice;
+    arrays["join"] = real.join;
   }
-  return counter.over
+  const work = counter.work + steps;
+  return counter.over || work > limit
     ? { outcome: undefined, work: Number.POSITIVE_INFINITY }
-    : { outcome, work: counter.work };
+    : { outcome, work };
 }
 
 /**
@@ -191,6 +260,10 @@ describe("the glossary gives what the 0.7.0 loop gave", () => {
     let grew = 0;
     let emptyTerm = 0;
     let mismatches = 0;
+    // Against the 0.7.0 loop itself: only where its lookbehind folded the
+    // Kelvin sign or the long s into another letter.
+    let lookbehindFolds = 0;
+    let unexplained = 0;
     for (let i = 0; i < 20_000; i++) {
       const text = piece(10);
       const mapping: Record<string, string> = {};
@@ -210,20 +283,141 @@ describe("the glossary gives what the 0.7.0 loop gave", () => {
       }
       const wholeWord = random() < 0.5;
       const caseSensitive = random() < 0.5;
-      const expected = referenceGlossary(text, mapping, wholeWord, caseSensitive);
+      const expected = lookbehindFreeGlossary(text, mapping, wholeWord, caseSensitive);
+      const shipped = referenceGlossary(text, mapping, wholeWord, caseSensitive);
       const got = glossaryReplace(text, mapping, wholeWord, caseSensitive);
       cases += 1;
       if (expected.text !== text) changed += 1;
       if (expected.text.length > text.length) grew += 1;
       if ("" in mapping) emptyTerm += 1;
       if (JSON.stringify(got) !== JSON.stringify(expected)) mismatches += 1;
+      if (JSON.stringify(got) !== JSON.stringify(shipped)) {
+        const explained =
+          wholeWord &&
+          !caseSensitive &&
+          Object.keys(mapping).some((t) => t.includes("\u212A") || t.includes("\u017F"));
+        if (explained) lookbehindFolds += 1;
+        else unexplained += 1;
+      }
     }
     expect(mismatches).toBe(0);
+    expect(unexplained).toBe(0);
+    expect(lookbehindFolds).toBeLessThan(20);
     expect(cases).toBe(20_000);
     expect(changed).toBeGreaterThan(5_000);
     expect(grew).toBeGreaterThan(2_000);
     expect(emptyTerm).toBeGreaterThan(1_000);
   }, 60_000);
+});
+
+describe("the matches are where the 0.7.0 regex found them", () => {
+  test("every text up to four units and every term up to three, over letters, case, `-` and space", () => {
+    // Exhaustive where the search can go wrong: a term that overlaps itself
+    // (`aa`, `aAa`, `a-a`), a match whole words reject that a later one
+    // inside it may take, the empty term, either case.
+    const units = ["a", "A", "-", " ", "b"];
+    const strings = (alphabet: readonly string[], max: number): string[] => {
+      const out = [""];
+      for (let from = 0, length = 1; length <= max; length++) {
+        const to = out.length;
+        for (let i = from; i < to; i++) for (const u of alphabet) out.push(`${out[i]}${u}`);
+        from = to;
+      }
+      return out;
+    };
+    const texts = strings(units, 4);
+    const terms = strings(["a", "A", "-"], 3);
+    let checked = 0;
+    const wrong: unknown[] = [];
+    for (const text of texts) {
+      for (const term of terms) {
+        for (const wholeWord of [true, false]) {
+          for (const caseSensitive of [true, false]) {
+            const mapping = { [term]: "<>" };
+            const want = referenceGlossary(text, mapping, wholeWord, caseSensitive);
+            const got = glossaryReplace(text, mapping, wholeWord, caseSensitive);
+            checked += 1;
+            if (JSON.stringify(got) !== JSON.stringify(want) && wrong.length < 5) {
+              wrong.push({ text, term, wholeWord, caseSensitive, want, got });
+            }
+          }
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(checked).toBe(781 * 40 * 4);
+  }, 60_000);
+
+  test("long periodic texts and terms that nearly repeat in them", () => {
+    const random = generator(4471);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const BLOCKS = ["ab", "aab", "abab", "aBa", "a-b", "ab ", "Ab", "é", "É", "ß", "σ", "Σ", "ς"];
+    let checked = 0;
+    let matched = 0;
+    const wrong: unknown[] = [];
+    for (let i = 0; i < 400; i++) {
+      const block = pick(BLOCKS);
+      const reps = 1 + Math.floor(random() * 300);
+      const units = block.repeat(reps).split("");
+      // A few units changed, so the term nearly repeats and then does not.
+      for (let j = 0, n = Math.floor(random() * 4); j < n && units.length > 0; j++) {
+        units[Math.floor(random() * units.length)] = pick(["a", "b", "A", " ", "-", "x"]);
+      }
+      const text = units.join("");
+      const termReps = 1 + Math.floor(random() * 6);
+      const term = (random() < 0.5 ? block : pick(BLOCKS)).repeat(termReps);
+      const mapping = { [term]: "#" };
+      const wholeWord = random() < 0.5;
+      const caseSensitive = random() < 0.5;
+      const want = referenceGlossary(text, mapping, wholeWord, caseSensitive);
+      const got = glossaryReplace(text, mapping, wholeWord, caseSensitive);
+      checked += 1;
+      if (want.replacements[term] !== undefined) matched += 1;
+      if (JSON.stringify(got) !== JSON.stringify(want) && wrong.length < 3) {
+        wrong.push({ text, term, wholeWord, caseSensitive });
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(checked).toBe(400);
+    expect(matched).toBeGreaterThan(100);
+  }, 60_000);
+
+  test("the lookbehind's folding: whole words fold case as the term alone does", () => {
+    // JavaScriptCore folds some units further in a pattern that has a
+    // lookbehind, several of them one way only: there the Kelvin sign
+    // matched "k", the long s "S" and the capital sharp s "ß", none of which
+    // the term on its own (whole words off) matched, and "k" never matched
+    // the Kelvin sign. The glossary now folds the same way with whole words
+    // on or off: as the term on its own does.
+    const plainFolds = (term: string, unit: string): boolean =>
+      new RegExp(escapeFor(term, "regex"), "i").test(unit);
+    const cases: Array<[string, string]> = [
+      ["\u212A", "k"],
+      ["\u017F", "S"],
+      ["\u1E9E", "\u00DF"],
+      ["\u0131", "I"],
+      ["\u2126", "\u03C9"],
+    ];
+    for (const [term, unit] of cases) {
+      expect({ term, plain: plainFolds(term, unit) }).toEqual({ term, plain: false });
+      for (const wholeWord of [true, false]) {
+        expect({
+          term,
+          wholeWord,
+          got: glossaryReplace(unit, { [term]: "#" }, wholeWord, false),
+        }).toEqual({
+          term,
+          wholeWord,
+          got: { text: unit, replacements: {} },
+        });
+      }
+    }
+    // And the units they do fold with, they still match with whole words.
+    expect(glossaryReplace("\u03C3 \u03C2 \u03A3", { "\u03C3": "#" }, true, false).text).toBe(
+      "# # #",
+    );
+    expect(glossaryReplace("ÿ Ÿ", { "\u0178": "#" }, true, false).text).toBe("# #");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,7 +482,7 @@ describe("what a call can make the glossary do is counted", () => {
     const { text, mapping } = cascade(12);
     const counted = [20_000, 40_000].map((limit) => ({
       limit,
-      ...replaceWork(8 * limit, () => glossaryReplace(text, mapping, true, false, limit)),
+      ...searchWork(8 * limit, () => glossaryReplace(text, mapping, true, false, limit)),
     }));
     for (const { limit, outcome, work } of counted) {
       expect(work).toBeLessThanOrEqual(4 * limit);
@@ -298,16 +492,57 @@ describe("what a call can make the glossary do is counted", () => {
     expect(large.work / small.work).toBeLessThan(2.25);
   });
 
+  test("a term that keeps nearly matching is searched in one read of the text", () => {
+    // n spaces against m spaces and an "x": the regex tried the whole term
+    // from every start, n × m steps (1.0 M at n = 10 K, m = 100, by the step
+    // model). Counted here: every regex step, and every unit the search reads.
+    const counted = [
+      [10_000, 100],
+      [20_000, 100],
+      [10_000, 200],
+    ].map(([n, m]) => {
+      const text = " ".repeat(n as number);
+      const term = `${" ".repeat(m as number)}x`;
+      return {
+        n: n as number,
+        m: m as number,
+        runs: [true, false].flatMap((wholeWord) =>
+          [true, false].map((caseSensitive) =>
+            searchWork(8 * ((n as number) + (m as number)), () =>
+              glossaryReplace(text, { [term]: "v" }, wholeWord, caseSensitive),
+            ),
+          ),
+        ),
+      };
+    });
+    for (const { n, m, runs } of counted) {
+      for (const { outcome, work } of runs) {
+        expect({ n, m, outcome }).toEqual({
+          n,
+          m,
+          outcome: { text: " ".repeat(n), replacements: {} },
+        });
+        expect(work).toBeLessThanOrEqual(8 * (n + m));
+        expect(work).toBeGreaterThanOrEqual(n);
+      }
+    }
+    const work = (i: number) => (counted[i] as (typeof counted)[number]).runs.map((r) => r.work);
+    // Twice the text, about twice the work; twice the term, about the same.
+    work(1).forEach((w, j) => expect(w / (work(0)[j] as number)).toBeLessThan(2.1));
+    work(2).forEach((w, j) => expect(w / (work(0)[j] as number)).toBeLessThan(1.1));
+  });
+
   test("thousands of terms over a long text: refused after a hundred passes' reading", () => {
     const limit = 2_000;
     const text = "z".repeat(limit);
     const mapping = Object.fromEntries(Array.from({ length: 3_000 }, (_, i) => [`k${i}`, "v"]));
-    const { outcome, work } = replaceWork(128 * limit, () =>
+    const { outcome, work } = searchWork(256 * limit, () =>
       glossaryReplace(text, mapping, true, false, limit),
     );
     expect((outcome as Error).message).toContain(READ);
-    // A hundred passes over the text, and escaping the hundred terms read.
-    expect(work).toBeLessThanOrEqual(101 * limit);
+    // A hundred passes, each reading every unit of the text once and
+    // comparing it with the term's first unit, and the hundred terms read.
+    expect(work).toBeLessThanOrEqual(2 * 101 * limit);
   });
 });
 

@@ -1,5 +1,3 @@
-import { escapeFor } from "./format";
-
 /** CSI/SGR escapes emitted by terminals into captured output. */
 const ANSI_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[ -/]*[@-~]`, "g");
 
@@ -153,6 +151,10 @@ const GLOSSARY_PASSES_PER_LIMIT = 100;
  * to 12.8 million. The text may grow to `limit`, and the passes together may
  * read {@link GLOSSARY_PASSES_PER_LIMIT} times it; past either this throws
  * a sentence that says which, never a cut text.
+ *
+ * Each pass finds its term the way `new RegExp(<escaped term>, "g" | "gi")`
+ * did, with `(?<![\w-])` and `(?![\w-])` around it for whole words — but
+ * reads each unit of the text once, whatever the term ({@link replaceTerm}).
  */
 export function glossaryReplace(
   text: string,
@@ -173,30 +175,146 @@ export function glossaryReplace(
       );
     }
     read += out.length;
-    const escaped = escapeFor(term, "regex");
-    const source = wholeWord ? `(?<![\\w-])${escaped}(?![\\w-])` : escaped;
-    const re = new RegExp(source, caseSensitive ? "g" : "gi");
     // What the replacer returned before: a missing value reads "undefined".
     const value = String(mapping[term]);
-    const before = out.length;
-    let count = 0;
-    let grown = 0;
-    out = out.replace(re, (match: string) => {
-      count++;
-      // Every match of one term is as long as the term (a pattern of
-      // literal units matches one unit each, case folded or not), so the
-      // growth only rises or only falls: once past the limit, the whole
-      // pass ends past it. Throwing here stops the replace before it
-      // builds that text.
-      grown += value.length - match.length;
-      if (grown > 0 && before + grown > limit) {
-        throw new Error(
-          `the glossary would make the text longer than ${limit} characters, the limit for text; terms apply longest first, each to the text the ones before produced, so a replacement that holds a later term is replaced again`,
-        );
-      }
-      return value;
-    });
-    if (count > 0) replacements[term] = count;
+    const replaced = replaceTerm(out, term, value, wholeWord, caseSensitive, limit);
+    if (replaced.count > 0) replacements[term] = replaced.count;
+    out = replaced.text;
   }
   return { text: out, replacements };
+}
+
+/** `[\w-]`: what a whole word may not touch. The regex `i` flag (without `u`) folds no other unit into it. */
+function isWordUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    c === 0x5f ||
+    c === 0x2d
+  );
+}
+
+/** Canonical code unit per code unit, filled on first use; -1 is "not yet". */
+const CANONICAL = new Int32Array(0x10000).fill(-1);
+
+/**
+ * The code unit the regex `i` flag (without `u`) compares `c` as: the
+ * ECMAScript Canonicalize — its upper case when that is one code unit, and not
+ * ASCII for a non-ASCII `c` — as this engine's own tables have it. The
+ * engine's case tables can be older than `toUpperCase`'s, so a pairing the
+ * regex does not make is not made here either. The same function is in
+ * tool-secure's `lib/literal.ts`; keep the two in step.
+ */
+function canonicalUnit(c: number): number {
+  const known = CANONICAL[c] as number;
+  if (known !== -1) return known;
+  let out = c;
+  if (c < 0x80) {
+    if (c >= 0x61 && c <= 0x7a) out = c - 0x20;
+  } else {
+    const upper = String.fromCharCode(c).toUpperCase();
+    if (upper.length === 1) {
+      const u = upper.charCodeAt(0);
+      if (u >= 0x80 && u !== c && regexFolds(c, u)) out = u;
+    }
+  }
+  CANONICAL[c] = out;
+  return out;
+}
+
+function regexFolds(a: number, b: number): boolean {
+  return new RegExp(`^\\u${a.toString(16).padStart(4, "0")}$`, "i").test(String.fromCharCode(b));
+}
+
+const sameUnit = (c: number): number => c;
+
+/**
+ * `text` with `term` replaced by `value` wherever `new RegExp(<escaped
+ * term>, caseSensitive ? "g" : "gi")` matched it — inside
+ * `(?<![\w-])…(?![\w-])` when `wholeWord` — and how many times.
+ *
+ * That regex tried the whole term from every position of the text, so one
+ * pass read the text's length times the term's. Here the term is found with
+ * Knuth–Morris–Pratt, comparing code units folded as the `i` flag folds
+ * them: each unit of the text is read once, and the comparisons that fail
+ * are paid for by ones that matched. Every place the term occurs is found,
+ * overlapping ones too, left to right; one is a match when it starts where
+ * the last match ended or later and, for whole words, the units on either
+ * side of it (in the text as it was, as the lookarounds read it) are not
+ * `[\w-]`. That is the leftmost match from each place the regex resumed. The
+ * empty term occurs before each unit and at the end, as an empty regex
+ * matches.
+ *
+ * Case folds as the term on its own folded. JavaScriptCore folded some units
+ * further when the pattern had the lookbehind, so with whole words the
+ * Kelvin sign matched "k" and the long s "S", where the term on its own
+ * never did; with whole words on or off, they now fold alike.
+ *
+ * Every match is as long as the term, so the text's growth only rises or
+ * only falls: once past `limit` the whole pass ends past it, and this throws
+ * at that match rather than build the text.
+ */
+function replaceTerm(
+  text: string,
+  term: string,
+  value: string,
+  wholeWord: boolean,
+  caseSensitive: boolean,
+  limit: number,
+): { text: string; count: number } {
+  const m = term.length;
+  const n = text.length;
+  const fold = caseSensitive ? sameUnit : canonicalUnit;
+  const parts: string[] = [];
+  let copied = 0;
+  let count = 0;
+  let grown = 0;
+  const take = (start: number): void => {
+    count++;
+    grown += value.length - m;
+    if (grown > 0 && n + grown > limit) {
+      throw new Error(
+        `the glossary would make the text longer than ${limit} characters, the limit for text; terms apply longest first, each to the text the ones before produced, so a replacement that holds a later term is replaced again`,
+      );
+    }
+    parts.push(text.slice(copied, start), value);
+    copied = start + m;
+  };
+  const clearOfWords = (start: number, end: number): boolean =>
+    !wholeWord ||
+    ((start === 0 || !isWordUnit(text.charCodeAt(start - 1))) &&
+      (end === n || !isWordUnit(text.charCodeAt(end))));
+  if (m === 0) {
+    for (let i = 0; i <= n; i++) if (clearOfWords(i, i)) take(i);
+  } else if (m <= n) {
+    // For each prefix of the folded term, its longest proper border.
+    const border = new Int32Array(m);
+    for (let i = 1, k = 0; i < m; i++) {
+      const c = fold(term.charCodeAt(i));
+      while (k > 0 && fold(term.charCodeAt(k)) !== c) k = border[k - 1] as number;
+      if (fold(term.charCodeAt(k)) === c) k += 1;
+      border[i] = k;
+    }
+    let k = 0;
+    for (let i = 0; i < n; i++) {
+      const c = fold(text.charCodeAt(i));
+      while (k > 0 && fold(term.charCodeAt(k)) !== c) k = border[k - 1] as number;
+      if (fold(term.charCodeAt(k)) === c) k += 1;
+      if (k === m) {
+        const start = i + 1 - m;
+        if (start >= copied && clearOfWords(start, i + 1)) {
+          take(start);
+          // The next match starts where this one ends.
+          k = 0;
+        } else {
+          // Not a match here; one may still start inside it.
+          k = border[m - 1] as number;
+        }
+      }
+    }
+  }
+  if (count === 0) return { text, count };
+  parts.push(text.slice(copied));
+  return { text: parts.join(""), count };
 }
