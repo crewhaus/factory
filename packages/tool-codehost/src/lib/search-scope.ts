@@ -92,11 +92,23 @@ export function queryScopes(query: string): QueryScope[] {
   return scopesOf(terms);
 }
 
+/**
+ * `text` without its trailing `)`: what `text.replace(/\)+$/, "")` returned,
+ * in one pass from the end. That pattern tries every start inside a run of
+ * `)` that is not at the end and rescans the rest of the run from each, so it
+ * was quadratic in the run's length, and the query is the model's.
+ */
+export function withoutTrailingParens(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x29) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
 function scopesOf(terms: ReadonlyArray<string>): QueryScope[] {
   const out: QueryScope[] = [];
   for (const raw of terms) {
     // `(repo:a/b` and `repo:a/b)` inside a boolean group are still scopes.
-    const token = raw.replace(/^\(+/, "").replace(/\)+$/, "");
+    const token = withoutTrailingParens(raw.replace(/^\(+/, ""));
     if (token.startsWith("-")) continue;
     const m = token.match(SCOPE_TOKEN);
     if (m === null) continue;
