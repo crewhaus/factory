@@ -38,6 +38,7 @@ import {
 } from "./entropy";
 import {
   type Finding,
+  SpanIndex,
   groupSpan,
   maskValue,
   matchAll,
@@ -373,6 +374,7 @@ export function secretFindings(text: string, options: SecretScanOptions = {}): F
 
   if (options.highEntropy !== false) {
     const requireContext = options.requireContext !== false;
+    const candidates: Array<{ index: number; value: string }> = [];
     for (const { index, match } of matchAll(text, HIGH_ENTROPY_CANDIDATE)) {
       const value = match[0];
       if (PLACEHOLDER.test(value)) continue;
@@ -382,8 +384,16 @@ export function secretFindings(text: string, options: SecretScanOptions = {}): F
         const before = text.slice(Math.max(0, index - 60), index);
         if (!CREDENTIAL_CONTEXT.test(before)) continue;
       }
-      // A vendor rule already covering this span is the better finding.
-      if (raw.some((f) => index < f.end && f.start < index + value.length)) continue;
+      candidates.push({ index, value });
+    }
+    // A vendor rule already covering this span is the better finding. Each
+    // candidate is checked against every finding pushed before it, as it
+    // always was, but through a `SpanIndex`: checking them one by one was
+    // quadratic in the findings on SecretScan's megabytes of text.
+    const covered = new SpanIndex(raw.map((f) => f.start).concat(candidates.map((c) => c.index)));
+    for (const f of raw) covered.add(f.start, f.end);
+    for (const { index, value } of candidates) {
+      if (covered.overlaps(index, index + value.length)) continue;
       raw.push({
         type: HIGH_ENTROPY_RULE,
         rule: HIGH_ENTROPY_RULE,
@@ -393,6 +403,7 @@ export function secretFindings(text: string, options: SecretScanOptions = {}): F
         value,
         detail: { severity: "low" },
       });
+      covered.add(index, index + value.length);
     }
   }
 
