@@ -34,6 +34,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { KnowledgeGap } from "@crewhaus/tool-wiki";
 import { z } from "zod";
+import { uncheckedRungText } from "./line-parts";
 
 // ---------------------------------------------------------------------------
 // fragment slice (what IrLearning lowers into — structural, no @crewhaus/ir)
@@ -170,8 +171,8 @@ const DREAM_SEED_MAX_GAPS = 5;
  */
 export function nextCurriculumRung(curriculumText: string): string | null {
   for (const line of curriculumText.split("\n")) {
-    const m = /^\s*[-*]\s*\[\s\]\s*(.+)$/.exec(line);
-    if (m?.[1] !== undefined && m[1].trim() !== "") return m[1].trim();
+    const text = uncheckedRungText(line);
+    if (text !== undefined && text.trim() !== "") return text.trim();
   }
   return null;
 }
