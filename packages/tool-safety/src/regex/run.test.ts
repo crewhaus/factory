@@ -64,13 +64,58 @@ beforeEach(() => {
   defaults.deadlineMs = 60_000;
 });
 
+/** What {@link holdDeadline} replaced, put back by {@link releaseDeadline}. */
+const heldDeadline: { restore: (() => void) | undefined } = { restore: undefined };
+
+function releaseDeadline(): void {
+  heldDeadline.restore?.();
+  heldDeadline.restore = undefined;
+}
+
 // A body abandoned at its budget never reaches a finally of its own, so
 // everything is put back here, after every test.
 afterEach(() => {
+  releaseDeadline();
   restoreWorkerClock();
   defaults.giveUpMs = REAL.giveUpMs;
   defaults.deadlineMs = REAL.deadlineMs;
 });
+
+/**
+ * Hold the deadline of the regex runs started until {@link releaseDeadline}:
+ * the timer is never armed, and `fire` runs it when the test says. The
+ * caller's clock stands still meanwhile, so the screen takes nothing off the
+ * deadline and the timer asks for exactly `deadlineMs`; any other timer is
+ * left alone. `fire` throws unless exactly one such timer was held, so a
+ * changed deadline cannot quietly put the race back.
+ */
+function holdDeadline(deadlineMs: number): { fire(): void } {
+  releaseDeadline();
+  const realSetTimeout = globalThis.setTimeout;
+  const held: Array<() => void> = [];
+  const clock = spyOn(performance, "now").mockReturnValue(0);
+  const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== deadlineMs) return realSetTimeout(fn, delay, ...rest);
+    held.push(() => fn(...rest));
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  heldDeadline.restore = () => {
+    timers.mockRestore();
+    clock.mockRestore();
+  };
+  return {
+    fire(): void {
+      if (held.length !== 1) {
+        throw new Error(`expected one ${deadlineMs} ms deadline to hold, held ${held.length}`);
+      }
+      held[0]?.();
+    },
+  };
+}
 
 /**
  * For a test about give-ups: the real threshold, against a worker clock on
@@ -696,24 +741,38 @@ describe("testEach times inputs in groups, and a slow group one input at a time"
 
   test("a timed-out batch's partial answers cover only the inputs it counts as done", async () => {
     await settleWorkers(60_000);
-    // Groups of 1, 2 and then 4 inputs: the third holds a match that takes
-    // some 20 ms (every start but the last backtracks through the spaces)
-    // and then a no-match that outlasts the deadline. A match reported while
-    // its group was still running came back as partial.matched [3] with
-    // completed 3: an answer for an input the caller was told was not reached.
-    const inputs = ["x", "x", "x", `${" ".repeat(6_000)}y `, `${" ".repeat(40_000)}y`, "x"];
-    const outcome = await runRegex({
+    // On the worker's scripted clock, in groups of 1, 2 and then up to 4
+    // inputs. The second group holds a match and takes one progress interval,
+    // so a report covers it. The third holds a match that takes another
+    // interval, then an input whose exec never returns. A match reported
+    // while its group was still running came back as partial.matched [.., 3]
+    // with completed 3: an answer for an input the caller was told was not
+    // reached. The deadline is held until the worker is inside that exec and
+    // then fired, so it is the only way the run ends, whatever the engine's
+    // speed, the give-up threshold or a stall of either thread.
+    const interval = REGEX_RUN_DEFAULTS.progressEveryMs;
+    const endless = "never returns";
+    const { hung } = scriptWorkerClock({ c: interval, "d  ": interval }, [endless]);
+    const deadline = holdDeadline(30_000);
+    const pending = runRegex({
       op: "testEach",
       pattern: "\\s+$",
-      inputs,
-      deadlineMs: 300,
+      inputs: ["a", "b  ", "c", "d  ", endless, "e"],
+      deadlineMs: 30_000,
       runawayKey: "testEach-partial-within-count",
     });
-    expect(outcome.status).toBe("timeout");
-    if (outcome.status !== "timeout") return;
-    const partial = outcome.partial as { matched: number[]; scanned: number };
-    expect(partial.scanned).toBe(outcome.completed ?? -1);
-    expect(partial.matched.filter((i) => i >= partial.scanned)).toEqual([]);
+    // The run cannot end on its own; if it does, say how.
+    const reached = await Promise.race([hung, pending.then((ended) => ({ ended }))]);
+    expect(reached).toBe(endless);
+    deadline.fire();
+    const outcome = await pending;
+    releaseDeadline();
+    expect(outcome).toMatchObject({
+      status: "timeout",
+      completed: 3,
+      partial: { matched: [1], scanned: 3, truncated: false, undetermined: [] },
+    });
+    // terminate() ends the endless exec, and the thread exits.
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 });

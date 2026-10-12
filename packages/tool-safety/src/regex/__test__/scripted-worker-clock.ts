@@ -13,6 +13,16 @@ const installed: { worker: typeof Worker | undefined; url: string | undefined } 
   url: undefined,
 };
 
+/** What a test can wait for on the scripted worker. */
+export type ScriptedWorker = {
+  /**
+   * Resolves with the input once a worker is inside an `exec` over one of
+   * the `hangs`. A worker's messages arrive in order, so by then every
+   * progress report it sent before that exec has been taken in.
+   */
+  readonly hung: Promise<string>;
+};
+
 /**
  * Run the real regex worker with its clock scripted.
  *
@@ -27,42 +37,67 @@ const installed: { worker: typeof Worker | undefined; url: string | undefined } 
  * The engine still answers every match; only the time is scripted, so the
  * verdict is the same on any machine and under any stall.
  *
- * The rest of the worker is the shipped source, unchanged. It is installed by
- * replacing `globalThis.Worker` for the workers started until
- * {@link restoreWorkerClock}. The caller's file wires that to `afterEach`, so
- * a test abandoned at its budget never leaves it in place.
+ * An `exec` over a string in `hangs` never returns: it is how a test holds a
+ * run past its deadline without a real slow input, which an engine fast
+ * enough would finish first. The thread waits rather than spins, and
+ * `terminate()` ends it within one 10 ms wait (an untimed `Atomics.wait`
+ * outlives `terminate()` in Bun 1.3.14, so the wait is timed and repeated).
+ *
+ * Both lists are matched literally, `$` included. The rest of the worker is
+ * the shipped source, unchanged. It is installed by replacing
+ * `globalThis.Worker` for the workers started until {@link restoreWorkerClock}.
+ * The caller's file wires that to `afterEach`, so a test abandoned at its
+ * budget never leaves it in place.
  */
-export function scriptWorkerClock(costs: Readonly<Record<string, number>>): void {
+export function scriptWorkerClock(
+  costs: Readonly<Record<string, number>>,
+  hangs: ReadonlyArray<string> = [],
+): ScriptedWorker {
   restoreWorkerClock();
   if (!REGEX_WORKER_SOURCE.includes(AFTER)) {
     throw new Error("the regex worker source changed: no place to script its clock");
   }
   const prelude = [
     `var scriptedCosts = new Map(${JSON.stringify(Object.entries(costs))});`,
+    `var scriptedHangs = new Set(${JSON.stringify(hangs)});`,
     "var scriptedNow = 0;",
+    "var scriptedWait = new Int32Array(new SharedArrayBuffer(4));",
     "performance.now = function () { return scriptedNow; };",
     "var nativeExec = RegExp.prototype.exec;",
     "RegExp.prototype.exec = function (s) {",
+    "  if (scriptedHangs.has(s)) {",
+    '    postMessage({ kind: "scripted-hang", input: s });',
+    "    for (;;) Atomics.wait(scriptedWait, 0, 0, 10);",
+    "  }",
     "  var cost = scriptedCosts.get(s);",
     "  if (cost !== undefined) scriptedNow += cost;",
     "  return nativeExec.call(this, s);",
     "};",
     "",
   ].join("\n");
-  const url = URL.createObjectURL(
-    new Blob([REGEX_WORKER_SOURCE.replace(AFTER, `${AFTER}${prelude}`)], {
-      type: "text/javascript",
-    }),
-  );
+  // A replacer function, so the inputs written into the prelude are taken
+  // literally: a replacement STRING would expand $$, $&, $` and $' in them.
+  const source = REGEX_WORKER_SOURCE.replace(AFTER, () => AFTER + prelude);
+  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  const hang: { resolve: (input: string) => void } = { resolve: () => {} };
+  const hung = new Promise<string>((resolve) => {
+    hang.resolve = resolve;
+  });
   const RealWorker = globalThis.Worker;
   class ScriptedClockWorker extends RealWorker {
     constructor(_url: string | URL, options?: WorkerOptions) {
       super(url, options);
+      // Added before the executor's own listener, so it sees each message first.
+      this.addEventListener("message", (event) => {
+        const data = event.data as { kind?: unknown; input?: unknown } | null;
+        if (data?.kind === "scripted-hang") hang.resolve(String(data.input));
+      });
     }
   }
   installed.worker = RealWorker;
   installed.url = url;
   (globalThis as { Worker: unknown }).Worker = ScriptedClockWorker;
+  return { hung };
 }
 
 /** Put back the real `Worker`, if {@link scriptWorkerClock} replaced it. */
