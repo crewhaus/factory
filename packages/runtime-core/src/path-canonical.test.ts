@@ -16,8 +16,11 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PermissionRule, emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
-import { resolveContained } from "@crewhaus/tool-safety/fs";
-import { canonicalWorkspacePath, workspacePathCanonicalizer } from "./path-canonical";
+import {
+  MAX_PATH_CHARS,
+  canonicalWorkspacePath,
+  workspacePathCanonicalizer,
+} from "./path-canonical";
 
 let ws: string;
 beforeEach(() => {
@@ -320,64 +323,151 @@ describe("a name spelled another way the filesystem treats as the same", () => {
 });
 
 /**
- * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
- * its arguments. The names below the deepest existing ancestor were joined
- * one argument apiece, so a path 65,536 names below an existing file came
- * back as its leaf alone, at the workspace root: an allow rule for that one
- * root-level name let the call through, while a tool, whose own walk has one
- * name more, acted on the file itself. (Deny and ask still fired, on the
- * spellings.) The three sizes straddle the boundary for both walks.
+ * 0.7.1 review — a path no filesystem can hold is not walked.
  *
- * Each size is one walk over 131 KB of path, so each test declares a budget
- * (house rule); nothing here is timed.
+ * The walk to a path's deepest existing name took one name off per step and
+ * handed the whole rest of the path to `path.dirname` and `path.basename`
+ * each time — twice here (`resolveLocation`, then `ignoresCase`), on the
+ * runtime's thread, before any rule was read: about 4·d² characters for d
+ * missing names, a count the model picks (10⁹ at d = 16,384). The walk now
+ * works by index, and a path past MAX_PATH_CHARS — twice the longest any
+ * platform opens — is `outside` before it starts: every deny and ask fires,
+ * no allow grants it. Nothing here is timed: the work is counted.
  */
-describe("a path 65,535 to 65,537 names below an existing file", () => {
-  const deep = (n: number) => `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
-  // A failure prints this, not two 131 KB strings.
-  const brief = (s: string | undefined) =>
-    s === undefined ? undefined : { length: s.length, head: s.slice(0, 20), end: s.slice(-12) };
+describe("a path longer than any path can be is outside, and the walk is linear", () => {
+  /** A path below `secrets/prod.db` whose absolute form is exactly `abs` characters. */
+  const deepTo = (abs: number): string => {
+    const prefix = "secrets/prod.db/";
+    const tail = abs - (ws.length + 1 + prefix.length);
+    const pairs = Math.floor((tail - 1) / 2);
+    return `${prefix}${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  };
+  const decide = (
+    raw: string,
+    got: ReturnType<typeof values>,
+    ...list: Array<[PermissionRule["type"], string]>
+  ) =>
+    evaluate(
+      {
+        toolName: "WriteLike",
+        input: { path: raw },
+        operativeValues: got,
+        readOnly: false,
+        destructive: true,
+      },
+      "default",
+      {
+        ...emptyRuleSet,
+        yaml: list.map(([type, pattern]) => ({ type, pattern, source: "yaml" as const })),
+      },
+    );
+  const seed = () => {
+    mkdirSync(path.join(ws, "secrets"));
+    writeFileSync(path.join(ws, "secrets", "prod.db"), "db");
+  };
 
-  for (const n of [65_535, 65_536, 65_537]) {
-    test(`${n} names: the canonical path is the whole path, and an allow for "a" does not cover it`, () => {
-      mkdirSync(path.join(ws, "secrets"));
-      writeFileSync(path.join(ws, "secrets", "prod.db"), "db");
-      const raw = deep(n);
-      const cwd = process.cwd();
-      let got: ReturnType<typeof values>;
-      try {
-        // As the runtime runs it: from the workspace, with the default root.
-        process.chdir(ws);
-        got = workspacePathCanonicalizer()(raw);
-      } finally {
-        process.chdir(cwd);
-      }
-      expect(got).toHaveLength(1);
-      const [v] = got;
-      expect(v?.outsideWorkspace).toBeUndefined();
-      expect(brief(v?.canonical[0])).toEqual(brief(raw));
-      expect(v?.canonical[0] === raw).toBe(true);
-      expect(v?.canonical[2] === `${ws}/${raw}`).toBe(true);
-      // The same place the file tools act on: tool-fs resolves through
-      // tool-safety, whose walk is not the gate's.
-      const tool = resolveContained(ws, raw, { followLeaf: false });
-      expect("real" in tool && tool.real === v?.canonical[2]).toBe(true);
+  test("at the limit the path is walked and named whole; one character more is outside", () => {
+    seed();
+    const at = deepTo(MAX_PATH_CHARS);
+    expect(path.resolve(ws, at).length).toBe(MAX_PATH_CHARS);
+    const [v, ...rest] = values(at);
+    expect(rest).toEqual([]);
+    expect(v?.outsideWorkspace).toBeUndefined();
+    expect(v?.canonical[0] === at).toBe(true);
+    expect(v?.canonical[2] === `${ws}/${at}`).toBe(true);
+    expect(decide(at, values(at), ["alwaysAllow", "WriteLike(secrets/**)"])).toBe("allow");
+    expect(
+      decide(
+        at,
+        values(at),
+        ["alwaysDeny", "WriteLike(elsewhere/**)"],
+        ["alwaysAllow", "WriteLike"],
+      ),
+    ).toBe("allow");
 
-      const decide = (pattern: string) =>
-        evaluate(
-          {
-            toolName: "WriteLike",
-            input: { path: raw },
-            operativeValues: got,
-            readOnly: false,
-            destructive: true,
-          },
-          "default",
-          { ...emptyRuleSet, yaml: [{ type: "alwaysAllow", pattern, source: "yaml" }] },
-        );
-      expect(decide("WriteLike(a)")).toBe("ask");
-      expect(decide("WriteLike(secrets/prod.db)")).toBe("ask");
-      // Control: an allow that does cover where it lands still allows.
-      expect(decide("WriteLike(secrets/**)")).toBe("allow");
-    }, 120_000);
-  }
+    const over = `${at}b`;
+    expect(path.resolve(ws, over).length).toBe(MAX_PATH_CHARS + 1);
+    const got = values(over);
+    expect(got.map((g) => ({ outside: g.outsideWorkspace, canonical: g.canonical }))).toEqual([
+      { outside: true, canonical: [] },
+    ]);
+    // What the model sent is still a spelling a deny reads.
+    expect(got[0]?.spellings[0] === over).toBe(true);
+    expect(decide(over, got, ["alwaysAllow", "WriteLike(secrets/**)"])).toBe("ask");
+    expect(decide(over, got, ["alwaysAllow", "WriteLike(**)"])).toBe("ask");
+    // Outside: a deny fires whatever it names.
+    expect(
+      decide(over, got, ["alwaysDeny", "WriteLike(elsewhere/**)"], ["alwaysAllow", "WriteLike"]),
+    ).toBe("deny");
+  });
+
+  test("65,535 to 65,537 names (where Bun's path.join wraps) are far past the limit: outside", () => {
+    seed();
+    for (const n of [65_535, 65_536, 65_537]) {
+      const raw = `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
+      const got = values(raw);
+      expect({ n, outside: got.map((g) => g.outsideWorkspace) }).toEqual({ n, outside: [true] });
+      expect({ n, allow: decide(raw, got, ["alwaysAllow", "WriteLike(secrets/**)"]) }).toEqual({
+        n,
+        allow: "ask",
+      });
+      expect({ n, deny: decide(raw, got, ["alwaysDeny", "WriteLike(secrets/prod.db)"]) }).toEqual({
+        n,
+        deny: "deny",
+      });
+    }
+  });
+
+  test("the walk's work is linear in the path: counted at d and 2d missing names", () => {
+    // In a process of its own, so node:path is wrapped before the
+    // canonicaliser (or anything else) imports it: Bun's namespace takes the
+    // export object's functions as they are at the first import.
+    const script = path.join(ws, "count.ts");
+    writeFileSync(
+      script,
+      `const req = require("node:path");
+let chars = 0;
+for (const k of Object.keys(req)) {
+  const f = req[k];
+  if (typeof f !== "function") continue;
+  req[k] = (...a) => { for (const x of a) if (typeof x === "string") chars += x.length; return f(...a); };
+}
+const fs = require("node:fs");
+const { canonicalWorkspacePath, MAX_PATH_CHARS } = await import(${JSON.stringify(path.join(import.meta.dir, "path-canonical.ts"))});
+const root = fs.realpathSync(fs.mkdtempSync(require("node:os").tmpdir() + "/count-"));
+fs.writeFileSync(root + "/f.db", "x");
+const out = [];
+const d = Math.floor((MAX_PATH_CHARS - root.length - 16) / 4);
+for (const n of [d, 2 * d]) {
+  const raw = "f.db/" + Array.from({ length: n }, () => "a").join("/");
+  chars = 0;
+  const got = canonicalWorkspacePath(raw, root, { pwd: undefined, topLevelLinks: [] });
+  out.push({ n, abs: root.length + 1 + raw.length, chars, whole: got.length === 1 && got[0].canonical[0] === raw });
+}
+fs.rmSync(root, { recursive: true, force: true });
+console.log(JSON.stringify(out));
+`,
+    );
+    const run = Bun.spawnSync([process.execPath, script], { stderr: "pipe" });
+    expect(run.stderr.toString()).toBe("");
+    const [atD, at2D] = JSON.parse(run.stdout.toString()) as Array<{
+      n: number;
+      abs: number;
+      chars: number;
+      whole: boolean;
+    }>;
+    // Both resolve to the whole path, under the limit.
+    expect([atD?.whole, at2D?.whole]).toEqual([true, true]);
+    expect((at2D?.abs ?? 0) <= MAX_PATH_CHARS).toBe(true);
+    // Linear: a bounded number of characters per character of path (the walk
+    // that copied the rest of the path per name read ~900 per character at
+    // d = 400, and ~4x as much at 2d).
+    for (const r of [atD, at2D]) {
+      expect({ n: r?.n, perChar: Math.ceil((r?.chars ?? 0) / (r?.abs ?? 1)) <= 40 }).toEqual({
+        n: r?.n,
+        perChar: true,
+      });
+    }
+    expect((at2D?.chars ?? 0) / (atD?.chars ?? 1)).toBeLessThan(2.5);
+  }, 30_000);
 });

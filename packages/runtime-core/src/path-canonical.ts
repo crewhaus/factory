@@ -16,8 +16,9 @@
  * or Unicode normal form (macOS, Windows), `.ENV` opens `.env`, and a rule
  * about `.env` must see that. When the last component is itself a symlink,
  * its target is a second value. A path that ends up outside the workspace,
- * or whose destination cannot be worked out, is flagged; the matcher never
- * lets it satisfy an allow rule and always lets it satisfy a deny or ask.
+ * whose destination cannot be worked out, or that is longer than any path can
+ * be ({@link MAX_PATH_CHARS}), is flagged; the matcher never lets it satisfy
+ * an allow rule and always lets it satisfy a deny or ask.
  * A path on a filesystem that ignores case (or where that cannot be told) is
  * marked `caseInsensitive`, so a deny or ask compares it ignoring case — the
  * name a tool is about to CREATE has no stored spelling to read. A path that
@@ -42,6 +43,19 @@ type OperativeValue = ReturnType<PathCanonicalizer>[number];
 function toPosix(p: string): string {
   return path.sep === "\\" ? p.split(path.sep).join("/") : p;
 }
+
+/**
+ * The longest path this resolves, in UTF-16 code units; a longer one is
+ * refused before it is walked. Nothing that long can be opened or created:
+ * PATH_MAX is 1,024 bytes on macOS and 4,096 on Linux, Windows stops at
+ * 32,767 UTF-16 units, and a path's UTF-8 form is never shorter than its
+ * UTF-16 one. The limit is twice that because the part of a path that exists
+ * is itself under PATH_MAX, so the part that does not is over PATH_MAX on its
+ * own: no spelling of the place reaches it, not even one through a symlink
+ * that shortens the part that exists.
+ */
+export const MAX_PATH_CHARS =
+  2 * (process.platform === "darwin" ? 1_024 : process.platform === "win32" ? 32_767 : 4_096);
 
 /** Top-level symlinks and the directory each resolves to, read once per process. */
 let topLevelLinksRead: ReadonlyArray<readonly [string, string]> | undefined;
@@ -148,14 +162,7 @@ function isSymlink(p: string): boolean {
  */
 function resolveLocation(target: string, depth = 0): string {
   if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break;
-    probe = parent;
-  }
+  const { probe, tail } = deepestName(target);
   let real: string;
   try {
     real = realpathSync(probe);
@@ -168,7 +175,36 @@ function resolveLocation(target: string, depth = 0): string {
   // (argument count mod 65,536) of its arguments, so 65,536 missing names
   // would give back `real` alone — a path the tool, whose own walk has one
   // name more, does not act on.
-  return tail.length > 0 ? path.join(real, tail.join(path.sep)) : real;
+  return tail.length > 0 ? path.join(real, tail) : real;
+}
+
+/**
+ * `target`, an absolute path, split where its deepest prefix that exists as
+ * a NAME ends: that prefix, and the names below it, which do not exist, as
+ * one string ("" when `target` itself exists). This is `path.dirname` and
+ * `path.basename` worked by index on `target` itself: handing them each
+ * shorter prefix in turn copied the rest of the path once per missing name,
+ * the square of a count the caller picks.
+ */
+function deepestName(target: string): { readonly probe: string; readonly tail: string } {
+  const top = path.parse(target).root.length;
+  const isSep = (i: number): boolean => target[i] === "/" || target[i] === path.sep;
+  let probe = target;
+  let start = target.length;
+  let stop = -1;
+  while (!nameExists(probe)) {
+    // `path.basename(probe)` is `target.slice(start, end)`, and
+    // `path.dirname(probe)` is `target.slice(0, up)`.
+    let end = probe.length;
+    while (end > top && isSep(end - 1)) end--;
+    if (stop < 0) stop = end;
+    start = end;
+    while (start > top && !isSep(start - 1)) start--;
+    const up = start > top ? start - 1 : top;
+    if (up === probe.length) break; // reached the filesystem root
+    probe = target.slice(0, up);
+  }
+  return { probe, tail: stop < 0 ? "" : target.slice(start, stop) };
 }
 
 /** Two paths that are the same directory entry: same device, same inode. */
@@ -220,20 +256,29 @@ function storedNames(dir: string, name: string): string[] | undefined {
  * (yes) or nothing (no). `undefined` when no such directory answers.
  */
 function ignoresCase(dir: string): boolean | undefined {
-  let probe = dir;
+  // `path.basename` and `path.dirname` worked by index on `dir`, as in
+  // `deepestName`: `dir` can end in as many missing names as a caller wrote.
+  const top = path.parse(dir).root.length;
+  const isSep = (i: number): boolean => dir[i] === "/" || dir[i] === path.sep;
+  let end = dir.length;
   for (;;) {
-    const base = path.basename(probe);
+    let stop = end;
+    while (stop > top && isSep(stop - 1)) stop--;
+    let start = stop;
+    while (start > top && !isSep(start - 1)) start--;
+    const probe = dir.slice(0, end);
+    const parent = dir.slice(0, start > top ? start - 1 : top);
+    const base = dir.slice(start, stop);
     const swapped = [...base]
       .map((c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()))
       .join("");
     if (swapped !== base && nameExists(probe)) {
-      const other = path.join(path.dirname(probe), swapped);
+      const other = path.join(parent, swapped);
       if (!nameExists(other)) return false;
       return sameEntry(probe, other);
     }
-    const parent = path.dirname(probe);
-    if (parent === probe) return undefined;
-    probe = parent;
+    if (parent.length === end) return undefined;
+    end = parent.length;
   }
 }
 
@@ -289,6 +334,8 @@ export function canonicalWorkspacePath(
     };
   };
   if (climbsOut(lexicalRel)) return [outside];
+  // Longer than any path can be: no tool acts on it, and it is not walked.
+  if (lexicalAbs.length > MAX_PATH_CHARS) return [outside];
   if (lexicalAbs === rootAbs) {
     caseInsensitive = ignoresCase(rootReal) !== false;
     return [located(rootReal)];
