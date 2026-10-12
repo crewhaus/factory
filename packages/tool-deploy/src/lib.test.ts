@@ -384,11 +384,12 @@ test("probeTenantOverlay answers about the name the real adapter writes, and kee
 /**
  * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
  * its arguments, and the `_tenants` probe passed the parent one argument per
- * directory. With 65,536 directories above a `_` name the probe asked about
- * `<workspace>/a/_tenants` instead: absent there, so the root was taken for an
- * ordinary directory and not refused. A probe of the real, too-long path
- * cannot answer "absent", and anything else counts as a registry. The root is
- * built by hand, so nothing here walks the filesystem.
+ * directory. With 65,536 directories above a `_` name, Bun kept two of the
+ * 65,538 arguments and the probe asked about `<workspace>/a` instead: absent
+ * there, so the root was taken for an ordinary directory and not refused. A
+ * probe of the real, too-long path cannot answer "absent", and anything else
+ * counts as a registry. The root is built by hand, so nothing here walks the
+ * filesystem.
  */
 test("a `_` name 65,534 to 65,536 directories deep is judged by its own parent", () => {
   const ws = realpathSync(tmp);
