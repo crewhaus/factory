@@ -209,6 +209,20 @@ export function parseStatusV2(stdout: string): GitStatusReport {
 export const RECORD_SEP = String.fromCharCode(0x1e);
 export const FIELD_SEP = String.fromCharCode(0);
 
+/**
+ * `text` without its trailing newlines: what `text.replace(/\n+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of newlines that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and a commit or tag
+ * message kept verbatim can hold any run of blank lines a repository's
+ * author chose.
+ */
+export function withoutTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
 /** The `--format` string whose output `parseCommits` expects. */
 export const COMMIT_FORMAT =
   "%x1e%H%x00%h%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%b%x00";
@@ -277,7 +291,7 @@ export function parseCommits(stdout: string, withChanges = false): Commit[] {
       committerEmail: f[6] as string,
       commitDate: f[7] as string,
       subject: f[8] as string,
-      body: (f[9] as string).replace(/\n+$/, ""),
+      body: withoutTrailingNewlines(f[9] as string),
     };
     commits.push(withChanges ? { ...base, changes: parseNameStatus(f[10] ?? "") } : base);
   }

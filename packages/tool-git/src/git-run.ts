@@ -953,6 +953,27 @@ export function conflictedPatchPaths(stderr: string): string[] {
   return out;
 }
 
+/**
+ * `field` cut at its first tab that has no line break after it: what
+ * `field.replace(/\t.*$/, "")` returned (`.` stops at \n, \r, U+2028 and
+ * U+2029), found with two scans instead. That pattern tries every tab and,
+ * where a line break follows, rescans up to it before giving the start up,
+ * so a run of tabs before a stray \r was quadratic in the run's length, and a
+ * patch is whatever the model passed.
+ */
+export function beforeTrailingTab(field: string): string {
+  let lastBreak = -1;
+  for (let i = field.length - 1; i >= 0; i--) {
+    const c = field.charCodeAt(i);
+    if (c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029) {
+      lastBreak = i;
+      break;
+    }
+  }
+  const tab = field.indexOf("\t", lastBreak + 1);
+  return tab === -1 ? field : field.slice(0, tab);
+}
+
 /** git's file mode for a symbolic link. */
 const SYMLINK_MODE = "120000";
 
@@ -1009,7 +1030,7 @@ export function symlinksCreatedByPatch(patchText: string, strip: number): PatchS
     let rawPath: string | undefined;
     for (const l of section) {
       if (l.startsWith("+++ ")) {
-        const field = l.slice(4).replace(/\t.*$/, "");
+        const field = beforeTrailingTab(l.slice(4));
         rawPath = field === "/dev/null" ? undefined : field;
         break;
       }

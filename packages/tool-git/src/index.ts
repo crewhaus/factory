@@ -62,6 +62,7 @@ import {
   parseTags,
   parseWorktrees,
   splitNul,
+  withoutTrailingNewlines,
 } from "./lib/parse";
 import { isInside, realOrUndefined } from "./repo-bounds";
 
@@ -381,7 +382,7 @@ export const gitShow: RegisteredTool = buildTool({
     if (patch.code !== 0) return failure("GitShow", patch);
     return json({
       commit,
-      patch: patch.stdout.replace(/^\n+/, "").replace(/\n+$/, ""),
+      patch: withoutTrailingNewlines(patch.stdout.replace(/^\n+/, "")),
       note: truncationNote(patch),
     });
   },
