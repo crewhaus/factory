@@ -28,6 +28,7 @@
  * | `dob.labelled` / `date.calendar` | a calendar date. Only a nearby "date of birth"-style label, or a caller-supplied `referenceDate` that makes the age plausible, raises it above `possible`. |
  * | `address.us-street-suffix` / `address.us-city-state-zip` | a US-style street line or city/state/ZIP tail. US conventions only. |
  */
+import { ipv6Candidates } from "./ipv6-scan";
 import { type Confidence, type Finding, matchAll, matchAllSkipping, withPositions } from "./text";
 
 export const PII_TYPES = [
@@ -375,8 +376,6 @@ const SSN = /\b(\d{3})-(\d{2})-(\d{4})\b/g;
 const IBAN_CANDIDATE = /\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9]{4}[ ]?){2,7}[A-Z0-9]{1,4}\b/g;
 const CARD_RUN = /\b\d(?:[ -]?\d){11,}/g;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/g;
-const IPV6_CANDIDATE =
-  /\b(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7})[0-9A-Fa-f:]{2,39}(?:\.\d{1,3}){0,3}/g;
 const PHONE_E164_RUN = /\+\d(?:[\s().-]?\d)+/g;
 const DATE_ISO = /\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
 const DATE_US = /\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/((?:19|20)\d{2})\b/g;
@@ -691,8 +690,8 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
         detail: { version: 4, scope },
       });
     }
-    for (const { index, match } of matchAll(text, IPV6_CANDIDATE)) {
-      const candidate = match[0].replace(/[:.]+$/, "");
+    for (const { index, value } of ipv6Candidates(text)) {
+      const candidate = value.replace(/[:.]+$/, "");
       if (!candidate.includes(":")) continue;
       const groups = parseIpv6(candidate);
       if (!groups) continue;
