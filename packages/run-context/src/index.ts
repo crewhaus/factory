@@ -10,6 +10,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { type Logger, createLogger } from "@crewhaus/logging";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
+import { trimToken } from "./token-trim";
 
 /**
  * Where content currently flowing through the runtime originated. Mirrors
@@ -267,11 +268,6 @@ function isCredentialShaped(token: string): boolean {
     return /[0-9]/.test(token) && /[a-z]/.test(token) && /[A-Z]/.test(token);
   }
   return false;
-}
-
-/** Strip wrapping quotes/brackets/trailing punctuation off a raw token. */
-function trimToken(raw: string): string {
-  return raw.replace(/^["'`(<[{]+/, "").replace(/["'`)\]}>.,;:!?]+$/, "");
 }
 
 /**
