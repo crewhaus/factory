@@ -20,6 +20,7 @@ import {
   toolListEntryNames,
 } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { withoutEdgeDashes } from "./trim";
 
 /**
  * Wrap an MCP server's remote tools as `RegisteredTool` entries on the
@@ -68,10 +69,7 @@ export const MAX_TOOL_NAME_LENGTH = 64;
 export function mcpServerNameProblem(name: string): string | undefined {
   if (MCP_SERVER_NAME_PATTERN.test(name)) return undefined;
   const suggestion =
-    name
-      .replace(/[^A-Za-z0-9_-]+/g, "-")
-      .replace(/_{2,}/g, "-")
-      .replace(/^[-_]+|[-_]+$/g, "") || "my-server";
+    withoutEdgeDashes(name.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/_{2,}/g, "-")) || "my-server";
   return `MCP server name "${name}" can only use letters, digits, "-" and "_", e.g. "${suggestion}".`;
 }
 
