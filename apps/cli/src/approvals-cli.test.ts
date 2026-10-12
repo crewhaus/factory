@@ -101,6 +101,31 @@ describe("formatApprovalDetail", () => {
     // A record written before 0.7.1 bound approvals has no places to show.
     expect(formatApprovalDetail(approval())).not.toContain("lands at:");
   });
+
+  test("a park asked again names the approval it stands in for, and where that one landed", () => {
+    const out = formatApprovalDetail(
+      approval({
+        toolName: "Write",
+        input: { path: "pub/link/x.md", content: "x" },
+        places: [{ path: "pub/link/x.md", at: ["/ws/secrets/x.md"] }],
+        supersedes: {
+          id: "appr_00000000000000aa",
+          decision: "grant",
+          places: [{ path: "pub/link/x.md", at: ["/ws/public/x.md"] }],
+        },
+      }),
+    );
+    expect(out).toContain(
+      "lands at:\n  pub/link/x.md -> /ws/secrets/x.md\nasked again: approval appr_00000000000000aa was granted where the call landed at:\n  pub/link/x.md -> /ws/public/x.md\n",
+    );
+    // Standing in for a park still waiting, made before places were recorded.
+    expect(
+      formatApprovalDetail(approval({ supersedes: { id: "appr_00000000000000aa" } })),
+    ).toContain(
+      "asked again: approval appr_00000000000000aa was requested for the input as written\n",
+    );
+    expect(formatApprovalDetail(approval())).not.toContain("asked again");
+  });
 });
 
 // ---------- CLI integration ----------

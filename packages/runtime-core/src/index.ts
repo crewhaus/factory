@@ -145,6 +145,7 @@ import {
   type PendingApproval,
   type PendingApprovalStore,
   type SessionStore,
+  type SupersededApproval,
   createSessionStore,
   evictExpiredApprovals,
   generateApprovalId,
@@ -725,6 +726,7 @@ export {
   type PendingApproval,
   type PendingApprovalStore,
   type PendingApprovalStoreOptions,
+  type SupersededApproval,
   createPendingApprovalStore,
   evictExpiredApprovals,
   generateApprovalId,
@@ -914,6 +916,15 @@ async function findApprovalForPlace(
       landsWhereApproved(a, call),
   );
   return [...matches].sort((a, b) => touched(b) - touched(a))[0] ?? null;
+}
+
+/** What a park asked in place of `record` keeps of it, for the card. */
+function supersededBy(record: PendingApproval): SupersededApproval {
+  return {
+    id: record.id,
+    ...(record.decision !== undefined ? { decision: record.decision } : {}),
+    ...(Array.isArray(record.places) ? { places: record.places } : {}),
+  };
 }
 
 /** Where a call lands, for an operator reading why it was asked again. */
@@ -6291,8 +6302,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             toolName: tu.name,
             inputHash,
             input: tu.input,
-            // 0.7.1 — what this park covers: where the call lands now.
+            // 0.7.1 — what this park covers: where the call lands now, and
+            // the approval it asks in place of, so a card can say both.
             places: gateView.places(),
+            ...(movedFrom !== undefined ? { supersedes: supersededBy(movedFrom) } : {}),
             runId: bus.runId,
             sessionId,
             surface: approvalSurface,

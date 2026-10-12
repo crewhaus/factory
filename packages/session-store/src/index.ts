@@ -786,6 +786,20 @@ export type ApprovalPlace = {
 };
 
 /**
+ * 0.7.1 — the approval a park was asked in place of: one for the same call,
+ * granted or still waiting, made while the call landed somewhere else (a
+ * symlink on its path has moved since). Kept on the new record so a surface
+ * can say why the same call is asked again, and where it was approved.
+ */
+export type SupersededApproval = {
+  readonly id: string;
+  /** Its decision when the new park was made; absent while it was still waiting. */
+  readonly decision?: ApprovalDecision;
+  /** Where the call landed then; absent on a record written before approvals were bound. */
+  readonly places?: ReadonlyArray<ApprovalPlace>;
+};
+
+/**
  * One parked tool-approval request. `id` (`appr_<16 hex>`) is the stable key
  * the `approval_requested`/`approval_resolved` trace events and the CLI/Slack
  * approval verbs reference. `inputHash` is `hashApprovalInput(toolName, input)`
@@ -808,6 +822,12 @@ export type PendingApproval = {
    * a place (see runtime-core).
    */
   readonly places?: ReadonlyArray<ApprovalPlace>;
+  /**
+   * 0.7.1 — set when this park asks again for a call already approved (or
+   * already waiting) where it landed before: the approval it was asked in
+   * place of, and where that one landed.
+   */
+  readonly supersedes?: SupersededApproval;
   readonly runId: string;
   readonly sessionId: string;
   /** Free-form non-interactive surface classifier (`"single-turn"`, `"daemon"`, …). */

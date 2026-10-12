@@ -698,6 +698,13 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
     expect(all.find((a) => a.id === reparked)?.places).toEqual([
       { path: "pub/link/x.md", at: [`${ws}/secrets/x.md`] },
     ]);
+    // And it names the approval it stands in for, and where that one landed,
+    // so a card can tell the two apart.
+    expect(all.find((a) => a.id === reparked)?.supersedes).toEqual({
+      id: granted,
+      decision: "grant",
+      places: [{ path: "pub/link/x.md", at: [`${ws}/public/x.md`] }],
+    });
     // Granted for the new place, it runs there — once.
     await store.resolve(reparked as string, "grant", "operator");
     expect(await turn(call)).toBeUndefined();

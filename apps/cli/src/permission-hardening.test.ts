@@ -43,6 +43,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createNavigateTool } from "@crewhaus/tool-navigate";
 import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
+import { formatApprovalDetail } from "./approvals-cli";
 
 let builtins: ReadonlyMap<string, RegisteredTool>;
 beforeAll(async () => {
@@ -2041,7 +2042,19 @@ describe("critic7 — a headless grant covers the place it was asked for, not wh
     expect(detail).toContain(
       `approval ${granted} was granted for pub/link/x.md -> ${ws}/public/x.md, and the call now lands at pub/link/x.md -> ${ws}/secrets/x.md, so it is asked again`,
     );
-    expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeUndefined();
+    expect((await record(granted))?.consumedAt).toBeUndefined();
+    // critic8: the new park carries the one it stands in for, so a card can
+    // tell it from the card the operator already granted.
+    const reparked = await record(idIn(detail));
+    expect(reparked?.places).toEqual([{ path: "pub/link/x.md", at: [`${ws}/secrets/x.md`] }]);
+    expect(reparked?.supersedes).toEqual({
+      id: granted,
+      decision: "grant",
+      places: [{ path: "pub/link/x.md", at: [`${ws}/public/x.md`] }],
+    });
+    expect(formatApprovalDetail(reparked as NonNullable<typeof reparked>)).toContain(
+      `lands at:\n  pub/link/x.md -> ${ws}/secrets/x.md\nasked again: approval ${granted} was granted where the call landed at:\n  pub/link/x.md -> ${ws}/public/x.md\n`,
+    );
   }, 60_000);
 
   test("control: the link left where it was, the same resumed turn spends the grant and writes public/x.md", async () => {

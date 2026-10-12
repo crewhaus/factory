@@ -127,12 +127,32 @@ export function formatApprovalDetail(a: PendingApproval, now: number = Date.now(
   // call that lands anywhere else by the time it resumes is asked again.
   if (Array.isArray(a.places) && a.places.length > 0) {
     lines.push("lands at:");
-    for (const p of a.places) {
-      const at = Array.isArray(p?.at) ? p.at.join(", ") : "?";
-      lines.push(`  ${String(p?.path)} -> ${at}`);
+    lines.push(...placeLines(a.places));
+  }
+  // Asked again because a symlink on the path moved: the approval this one
+  // stands in for, and where that call landed.
+  const before = a.supersedes;
+  if (typeof before === "object" && before !== null && typeof before.id === "string") {
+    const was = before.decision === "grant" ? "granted" : "requested";
+    if (Array.isArray(before.places) && before.places.length > 0) {
+      lines.push(`asked again: approval ${before.id} was ${was} where the call landed at:`);
+      lines.push(...placeLines(before.places));
+    } else {
+      lines.push(`asked again: approval ${before.id} was ${was} for the input as written`);
     }
   }
   return `${lines.join("\n")}\n`;
+}
+
+/** One `  <path> -> <place>, <place>` line per path a call names. */
+function placeLines(places: ReadonlyArray<unknown>): string[] {
+  return places.map((p) => {
+    const { path, at } = (typeof p === "object" && p !== null ? p : {}) as {
+      path?: unknown;
+      at?: unknown;
+    };
+    return `  ${String(path)} -> ${Array.isArray(at) ? at.join(", ") : "?"}`;
+  });
 }
 
 /** Indent every line of a JSON blob by two spaces for the detail view. */
