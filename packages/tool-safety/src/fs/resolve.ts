@@ -104,15 +104,58 @@ export function physicalFrom(
   return walk(dirPhysical, components(rel), options.overlay);
 }
 
+/** The path operations the walk builds its strings with. */
+const pathOps = { join: path.join, dirname: path.dirname };
+
+/**
+ * Test seam: wrap the walk's path operations, so a test can count the
+ * characters they return. Pass `undefined` to restore.
+ */
+export function _setPathOpsForTest(
+  next: { readonly join: typeof path.join; readonly dirname: typeof path.dirname } | undefined,
+): void {
+  pathOps.join = next?.join ?? path.join;
+  pathOps.dirname = next?.dirname ?? path.dirname;
+}
+
+/**
+ * The work is linear in the path and the link texts it meets. A path comes
+ * from the model, so it can be long: 0.7.1's first walk took each component
+ * off the front of the queue (copying the rest) and, once a component was
+ * missing, joined each further one onto an ever-longer path, which is the
+ * square of the depth (Read on a path 8,000 directories below a missing one
+ * built 130 million characters).
+ */
 function walk(start: string, initial: string[], overlay: Overlay | undefined): string {
   let cur = start;
-  let pending = initial;
+  // Components still to walk, the next one LAST: a link's target goes on
+  // top, so taking a component is a pop and nothing queued is copied.
+  const pending = initial.slice().reverse();
   let hops = 0;
+  // Once `cur` is a name that does not exist, the components written after
+  // it are kept in `tail` and joined once at the end. Nothing below a name
+  // that does not exist can exist either, so none of them is probed.
   let missing = false;
+  const tail: string[] = [];
   while (pending.length > 0) {
-    const comp = pending.shift() as string;
+    const comp = pending.pop() as string;
     if (comp === "..") {
-      cur = path.dirname(cur);
+      if (tail.length > 0) {
+        tail.pop();
+        // Still at or below the missing name, where nothing exists; but a
+        // directory the plan is about to create counts as real (see below),
+        // so a plan is asked about the very path it would have to hold.
+        if (overlay !== undefined) {
+          const at = tail.length > 0 ? pathOps.join(cur, tail.join(path.sep)) : cur;
+          if (overlay.has(at)) {
+            cur = at;
+            tail.length = 0;
+            missing = false;
+          }
+        }
+        continue;
+      }
+      cur = pathOps.dirname(cur);
       // Climbing out of the missing region lands back on real directories,
       // whose own children must be probed again. A directory the plan is
       // about to create counts as real: a link planned inside it is followed
@@ -120,11 +163,11 @@ function walk(start: string, initial: string[], overlay: Overlay | undefined): s
       if (missing) missing = overlay?.has(cur) !== true && !nameExists(cur);
       continue;
     }
-    const next = path.join(cur, comp);
     if (missing) {
-      cur = next;
+      tail.push(comp);
       continue;
     }
+    const next = pathOps.join(cur, comp);
     let linkText: string | undefined;
     const planned = overlay?.get(next);
     if (planned !== undefined) {
@@ -144,17 +187,21 @@ function walk(start: string, initial: string[], overlay: Overlay | undefined): s
     }
     hops += 1;
     if (hops > MAX_HOPS) throw new LinkLoop(`more than ${MAX_HOPS} symbolic links`);
+    let parts: string[];
     if (path.isAbsolute(linkText)) {
       const root = path.parse(linkText).root;
       cur = root;
-      pending = [...components(linkText.slice(root.length)), ...pending];
+      parts = components(linkText.slice(root.length));
     } else {
       // Relative to the directory that really holds the link: `cur`, which
       // is physical by construction.
-      pending = [...components(linkText), ...pending];
+      parts = components(linkText);
     }
+    for (let i = parts.length - 1; i >= 0; i--) pending.push(parts[i] as string);
   }
-  return cur;
+  // One string, not one argument per component: Bun's `path.join` drops
+  // arguments past 65,535 without a word.
+  return tail.length > 0 ? pathOps.join(cur, tail.join(path.sep)) : cur;
 }
 
 /** True when `child` is `parent` or below it. Both absolute and normalised. */
