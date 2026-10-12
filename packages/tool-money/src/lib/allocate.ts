@@ -189,9 +189,14 @@ export function computeRefund(
     });
   }
 
-  const fullReturn = lines.every(
-    (l) => (returned.find((r) => r.lineId === l.id)?.quantity ?? 0) === l.quantity,
-  );
+  // The quantity returned of each line, by id: the first entry naming it, as
+  // a search of the returned lines finds. Searching them once per order line
+  // cost the lines times the returned lines.
+  const returnedOf = new Map<string, number>();
+  for (const item of returned) {
+    if (!returnedOf.has(item.lineId)) returnedOf.set(item.lineId, item.quantity);
+  }
+  const fullReturn = lines.every((l) => (returnedOf.get(l.id) ?? 0) === l.quantity);
   const policy = options.shippingPolicy ?? "none";
   const shippingTotal = big(options.shippingMinor ?? 0, "shippingMinor");
   let shipping = 0n;
@@ -205,7 +210,7 @@ export function computeRefund(
     // return refunded the entire shipping charge.
     const shares = allocateExact(shippingTotal, lines.map(lineGross));
     lines.forEach((line, i) => {
-      const returnedQuantity = returned.find((r) => r.lineId === line.id)?.quantity ?? 0;
+      const returnedQuantity = returnedOf.get(line.id) ?? 0;
       if (returnedQuantity === 0) return;
       shipping += splitByQuantity(shares[i] as bigint, [
         BigInt(returnedQuantity),

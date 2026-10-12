@@ -94,6 +94,55 @@ function normalizeDescription(text: string): string {
 
 const abs = (v: bigint): bigint => (v < 0n ? -v : v);
 
+/** `make()`, worked out on the first call and kept. */
+function once<T>(make: () => T): () => T {
+  const held: { made?: { readonly value: T } } = {};
+  return () => {
+    if (held.made === undefined) held.made = { value: make() };
+    return held.made.value;
+  };
+}
+
+/** The lines sharing one key, in the order's own order, and how many at the head are taken. */
+type Candidates = { readonly lines: MatchLine[]; head: number };
+
+/** Every line with a key, grouped by it; a line without one is in no group. */
+function linesBy(
+  lines: ReadonlyArray<MatchLine>,
+  keyOf: (line: MatchLine) => string | undefined,
+): Map<string, Candidates> {
+  const groups = new Map<string, Candidates>();
+  for (const line of lines) {
+    const key = keyOf(line);
+    if (key === undefined) continue;
+    const group = groups.get(key);
+    if (group === undefined) groups.set(key, { lines: [line], head: 0 });
+    else group.lines.push(line);
+  }
+  return groups;
+}
+
+/**
+ * The first line of the order carrying `key` that is still unmatched: what
+ * searching the remaining lines in order finds. A matched line never comes
+ * back, so the ones at the head of the group are passed over once and for
+ * good.
+ */
+function firstRemaining(
+  groups: Map<string, Candidates>,
+  key: string,
+  remaining: ReadonlyMap<string, MatchLine>,
+): MatchLine | undefined {
+  const group = groups.get(key);
+  if (group === undefined) return undefined;
+  while (group.head < group.lines.length) {
+    const line = group.lines[group.head] as MatchLine;
+    if (remaining.has(line.id)) return line;
+    group.head += 1;
+  }
+  return undefined;
+}
+
 /**
  * Whether `actual` is within tolerance of `expected`, decided exactly.
  *
@@ -164,6 +213,16 @@ export function matchInvoiceToPurchaseOrder(
   }
 
   const remainingPo = new Map(poLines.map((l) => [l.id, l]));
+  // The order lines by SKU and by normalized description, each built once,
+  // the first time it is needed. Searching every remaining line for each
+  // invoice line, and normalizing every description again, cost the invoice
+  // lines times the order lines.
+  const bySku = once(() => linesBy(poLines, (l) => l.sku));
+  const byDescription = once(() =>
+    linesBy(poLines, (l) =>
+      l.description === undefined ? undefined : normalizeDescription(l.description),
+    ),
+  );
   const pairs: MatchPair[] = [];
   const unmatchedInvoiceLines: string[] = [];
 
@@ -174,14 +233,12 @@ export function matchInvoiceToPurchaseOrder(
     let po = invoice.poLineId === undefined ? undefined : remainingPo.get(invoice.poLineId);
     let matchedBy: MatchPair["matchedBy"] = "reference";
     if (!po && invoice.sku !== undefined) {
-      po = [...remainingPo.values()].find((l) => l.sku !== undefined && l.sku === invoice.sku);
+      po = firstRemaining(bySku(), invoice.sku, remainingPo);
       if (po) matchedBy = "sku";
     }
     if (!po && invoice.description !== undefined) {
       const wanted = normalizeDescription(invoice.description);
-      po = [...remainingPo.values()].find(
-        (l) => l.description !== undefined && normalizeDescription(l.description) === wanted,
-      );
+      po = firstRemaining(byDescription(), wanted, remainingPo);
       if (po) matchedBy = "description";
     }
     if (!po) {

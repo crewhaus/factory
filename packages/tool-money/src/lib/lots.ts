@@ -90,6 +90,34 @@ function quantityNumber(units: bigint, scale: number): number {
   return negative ? -value : value;
 }
 
+/**
+ * Move `heap[at]` down past every child taken before it. `before(a, b)` is
+ * negative when `a` is taken first; no two lots tie.
+ */
+function siftDown<T>(heap: T[], at: number, before: (a: T, b: T) => number): void {
+  const item = heap[at] as T;
+  let i = at;
+  for (;;) {
+    const left = 2 * i + 1;
+    if (left >= heap.length) break;
+    const right = left + 1;
+    const first =
+      right < heap.length && before(heap[right] as T, heap[left] as T) < 0 ? right : left;
+    if (before(heap[first] as T, item) >= 0) break;
+    heap[i] = heap[first] as T;
+    i = first;
+  }
+  heap[i] = item;
+}
+
+/** Drop the top of the heap. */
+function popTop<T>(heap: T[], before: (a: T, b: T) => number): void {
+  const last = heap.pop() as T;
+  if (heap.length === 0) return;
+  heap[0] = last;
+  siftDown(heap, 0, before);
+}
+
 function instant(value: string, what: string): number {
   if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
     throw new Error(
@@ -165,16 +193,15 @@ export function computeCostBasis(
               return left > right ? 1 : left < right ? -1 : byId(a, b);
             }
           : undefined;
-  // The open lots in that order, sorted ONCE and kept sorted, with the next
-  // lot to take at the END. A disposal takes lots off the end; the only lot
-  // whose place can change is the one it took part of (its cost per unit
-  // moves by the rounding of that part), and that one is put back where it
-  // now belongs. Re-sorting every open lot for every disposal made HIFO
-  // quadratic in the lots at the schema's limit.
-  const queue = takenBefore === undefined ? [] : [...open].sort((a, b) => takenBefore(b, a));
-  const fromTheEnd = function* (): Generator<OpenLot> {
-    for (let i = queue.length - 1; i >= 0; i--) yield queue[i] as OpenLot;
-  };
+  // The open lots as a binary heap in that order, the next lot to take at
+  // the top. A disposal takes lots off the top; the only lot whose place can
+  // change is the one it took part of (its cost per unit moves by the
+  // rounding of that part), and that one is sifted to where it now belongs.
+  // Re-sorting every open lot for every disposal made HIFO quadratic in the
+  // lots at the schema's limit, and so did moving the part-taken lot within
+  // a sorted list: rounding can send it from the front to the back. A list
+  // sorted once is already a heap.
+  const heap = takenBefore === undefined ? [] : [...open].sort(takenBefore);
   // Every lot by its id, built once, for the specific method. A lot is open
   // while it has units left; that is read at lookup, where an index of the
   // open lots rebuilt for every disposal cost the lots times the disposals.
@@ -183,7 +210,7 @@ export function computeCostBasis(
   for (const disposal of disposals) {
     const disposedMs = instant(disposal.disposedAt, `disposal "${disposal.id}" disposedAt`);
 
-    let order: Iterable<OpenLot>;
+    let named: ReadonlyArray<OpenLot> = [];
     if (method === "specific") {
       const wanted = disposal.lotIds;
       if (!wanted || wanted.length === 0) {
@@ -191,15 +218,13 @@ export function computeCostBasis(
           `disposal "${disposal.id}" uses the specific-identification method but names no lots`,
         );
       }
-      order = wanted.map((id) => {
+      named = wanted.map((id) => {
         const lot = lotById.get(id);
         if (lot === undefined || lot.remainingUnits <= 0n) {
           throw new Error(`disposal "${disposal.id}" names lot "${id}", which is not open`);
         }
         return lot;
       });
-    } else {
-      order = fromTheEnd();
     }
 
     const disposalUnits = scaled(disposal.quantity, `disposal "${disposal.id}" quantity`);
@@ -207,8 +232,12 @@ export function computeCostBasis(
     const consumed: Array<Consumption & { readonly units: bigint }> = [];
     let costMinor = 0;
 
-    for (const lot of order) {
-      if (toConsume <= 0n) break;
+    // The named lots in turn, or the top of the heap until the disposal is
+    // met: a lot taken whole leaves the heap, and the one taken in part is
+    // sifted down from the top to its new place.
+    for (let at = 0; toConsume > 0n; at++) {
+      const lot = takenBefore === undefined ? named[at] : heap[0];
+      if (lot === undefined) break;
       // Taking the whole remainder consumes the whole remaining cost. That
       // is what keeps a lot's costs summing to exactly what it cost, however
       // many partial disposals came before.
@@ -236,23 +265,9 @@ export function computeCostBasis(
         acquiredAt: lot.acquiredAt,
         longTerm: disposedMs - lot.acquiredMs > YEAR_MS,
       });
-    }
-    if (takenBefore !== undefined) {
-      while (queue.length > 0 && (queue[queue.length - 1] as OpenLot).remainingUnits === 0n) {
-        queue.pop();
-      }
-      const partial = queue[queue.length - 1];
-      if (partial !== undefined && consumed.some((c) => c.lotId === partial.id)) {
-        queue.pop();
-        // Binary search for its place: every lot before it is taken after it.
-        let lo = 0;
-        let hi = queue.length;
-        while (lo < hi) {
-          const mid = (lo + hi) >>> 1;
-          if (takenBefore(queue[mid] as OpenLot, partial) > 0) lo = mid + 1;
-          else hi = mid;
-        }
-        queue.splice(lo, 0, partial);
+      if (takenBefore !== undefined) {
+        if (lot.remainingUnits === 0n) popTop(heap, takenBefore);
+        else siftDown(heap, 0, takenBefore);
       }
     }
 
