@@ -10,6 +10,7 @@ import { join } from "node:path";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import { readExperienceStore } from "@crewhaus/meta-harness-optimizer";
 import type { OptimizerState } from "@crewhaus/prompt-optimizer";
+import { scanWork } from "./__test__/scan-work";
 import { extractReqMappingLines } from "./init-conversation";
 import { createMetaHarnessProposer } from "./meta-harness-mutator";
 import { firstObjectSpan, mapsARequirement } from "./model-reply-text";
@@ -155,8 +156,8 @@ describe("each helper answers what its pattern answered", () => {
   }, 20_000);
 });
 
-// Counted, not timed: the only place quadratic work could hide in reading a
-// reply is a pattern run over it, so each one is refused and recorded.
+// Counted, not timed: a pattern run over the reply is refused and recorded.
+// The helpers' own reads are counted below.
 describe("a reply holding a long run", () => {
   test("a run of { is not a JSON object, and no pattern reads it", async () => {
     const run = "{".repeat(10_000);
@@ -209,4 +210,33 @@ describe("a reply holding a long run", () => {
     expect(long.refused).toEqual([]);
     expect(long.outcome).toEqual([]);
   });
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a
+// search that resumes one character on instead of after what it read), so
+// each helper's own reads are counted (__test__/scan-work.ts) over runs
+// shaped to make it rescan, and held to a few per character. A rescan reads
+// the rest of the run from every place in it and stops at the bound at once.
+describe("each helper reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a run of { with no }", firstObjectSpan, "{".repeat(N)],
+    ["a run of } after one {", firstObjectSpan, `{${"}".repeat(N)}`],
+    ["a line of requirement ids with no arrow", mapsARequirement, fill("REQ-1 ")],
+    ["the same line, then a line break", mapsARequirement, `${fill("REQ-1 ")}\u2028x`],
+    ["requirement ids each on a line of its own", mapsARequirement, fill("REQ-1\u2028")],
+    ["a run of REQ- with no digit", mapsARequirement, fill("REQ-")],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });
