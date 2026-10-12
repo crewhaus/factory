@@ -927,6 +927,11 @@ export const DEFAULT_TODO_MARKERS: readonly string[] = ["TODO", "FIXME", "HACK",
  * A marker inside a string literal is not a note to a maintainer, it is data —
  * usually this very tool's own test fixture — so the mask decides. An author
  * is read from the two conventional forms, `TODO(dave):` and `TODO @dave:`.
+ *
+ * Each line holding a marker is read once, however many markers it holds.
+ * A note's text runs to the end of its line, and 0.7.0 read it there for
+ * every marker: three patterns over the rest of the line, one of them
+ * unanchored, so a comment line of k markers cost k times the line.
  */
 export function scanTodos(
   src: string,
@@ -936,6 +941,8 @@ export function scanTodos(
   const { kind } = maskSource(src);
   const starts = lineStarts(src);
   const out: TodoRecord[] = [];
+  const lines = new Map<number, TodoLine>();
+  const authorAt = new RegExp(TODO_AUTHOR.source, "y");
   for (const marker of markers) {
     let from = 0;
     while (true) {
@@ -947,25 +954,134 @@ export function scanTodos(
       if (before !== "" && IDENT_CHAR.test(before)) continue;
       const line = lineAt(starts, idx);
       const lineStart = starts[line - 1] as number;
-      const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
-      const rest = src.slice(idx + marker.length, lineEnd);
-      const authorMatch = /^\s*(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))/.exec(rest);
-      const author = authorMatch?.[1] ?? authorMatch?.[2];
-      const body = rest
-        .slice(authorMatch === null ? 0 : authorMatch[0].length)
-        .replace(/^\s*[:\-–]\s*/, "")
-        .replace(/\*\/\s*$/, "")
-        .trim();
+      let read = lines.get(line);
+      if (read === undefined) {
+        const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
+        read = todoLine(src.slice(lineStart, lineEnd));
+        lines.set(line, read);
+      }
+      // A marker running past its line leaves nothing after it, as the
+      // empty slice did.
+      const rest = Math.min(idx + marker.length - lineStart, read.text.length);
+      const note = todoNote(read, rest, authorAt, maxTextChars);
       out.push({
         marker,
-        ...(author === undefined ? {} : { author }),
+        ...(note.author === undefined ? {} : { author: note.author }),
         line,
         column: idx - lineStart + 1,
-        text: body.length > maxTextChars ? `${body.slice(0, maxTextChars)}…` : body,
+        text: note.text,
       });
     }
   }
   return out.sort((a, b) => a.line - b.line || a.column - b.column);
+}
+
+/** `TODO(dave)` or `TODO @dave`, read where the blanks after the marker end. */
+const TODO_AUTHOR = /(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))/;
+
+/** What `scanTodos` needs of a line, read once. */
+type TodoLine = {
+  readonly text: string;
+  /** For each offset, the first at or after it that is not `\s`; the length when none is. */
+  readonly solid: Int32Array;
+  /** The length less the trailing `\s`. */
+  readonly end: number;
+  /** Where a comment close (a star, then a slash) just before that trailing `\s` starts, or -1. */
+  readonly close: number;
+  /** `close` less the `\s` before it. */
+  readonly closeEnd: number;
+  /** The author pattern's answer at each offset it was tried at. */
+  readonly authors: Map<number, RegExpExecArray | null>;
+};
+
+function todoLine(text: string): TodoLine {
+  const solid = new Int32Array(text.length + 1);
+  solid[text.length] = text.length;
+  for (let i = text.length - 1; i >= 0; i--) {
+    solid[i] = isRegExpSpace(text.charCodeAt(i)) ? (solid[i + 1] as number) : i;
+  }
+  const trimmedTo = (to: number): number => {
+    let at = to;
+    while (at > 0 && isRegExpSpace(text.charCodeAt(at - 1))) at--;
+    return at;
+  };
+  const end = trimmedTo(text.length);
+  const close =
+    end >= 2 && text.charCodeAt(end - 2) === 0x2a && text.charCodeAt(end - 1) === 0x2f
+      ? end - 2
+      : -1;
+  return {
+    text,
+    solid,
+    end,
+    close,
+    closeEnd: close === -1 ? -1 : trimmedTo(close),
+    authors: new Map(),
+  };
+}
+
+/** `:`, `-` or `–`, the separators a note may start with. */
+function isNoteSeparator(c: number): boolean {
+  return c === 0x3a || c === 0x2d || c === 0x2013;
+}
+
+/** How much of a text `length` long `slice(0, max)` keeps. */
+function keptLength(length: number, max: number): number {
+  const n = Math.trunc(max) || 0;
+  return n < 0 ? Math.max(length + n, 0) : Math.min(n, length);
+}
+
+/**
+ * The author and the text of the note after a marker, where the marker ends
+ * at `rest` in the line. 0.7.0 read them from a copy of the rest of the line
+ * with `^\s*(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))`, then dropped a
+ * leading `^\s*[:\-–]\s*` and a trailing `\*\/\s*$` and trimmed what was
+ * left; each step is answered here from the line's offsets.
+ *
+ *   - The author pattern's leading `\s*` can give back nothing either
+ *     alternative starts with, so it matched where the blanks end or not at
+ *     all: the rest of the pattern is tried there, once for each offset.
+ *   - The separator pattern is the same: a separator where the blanks end,
+ *     and then the blanks after it.
+ *   - `\*\/\s*$` matches only a comment close with nothing but `\s`
+ *     after it, so the line's own, when it starts inside what is left.
+ *   - The trim keeps from the first non-`\s` to the last before the cut.
+ */
+function todoNote(
+  line: TodoLine,
+  rest: number,
+  authorAt: RegExp,
+  maxTextChars: number,
+): { author: string | undefined; text: string } {
+  const { text, solid } = line;
+  const lead = solid[rest] as number;
+  let match = line.authors.get(lead);
+  if (match === undefined) {
+    authorAt.lastIndex = lead;
+    match = authorAt.exec(text);
+    line.authors.set(lead, match);
+  }
+  const author = match === null ? undefined : (match[1] ?? match[2]);
+  const afterAuthor = match === null ? rest : lead + match[0].length;
+  const separator = solid[afterAuthor] as number;
+  const body =
+    separator < text.length && isNoteSeparator(text.charCodeAt(separator))
+      ? (solid[separator + 1] as number)
+      : afterAuthor;
+  const closes = line.close >= body;
+  const solidAt = solid[body] as number;
+  // Nothing but blanks before the cut: an empty text.
+  const empty = solidAt >= (closes ? line.close : text.length);
+  const first = empty ? 0 : solidAt;
+  const last = empty ? 0 : closes ? line.closeEnd : line.end;
+  const length = last - first;
+  return {
+    author,
+    text:
+      length > maxTextChars
+        ? `${text.slice(first, first + keptLength(length, maxTextChars))}…`
+        : text.slice(first, last),
+  };
 }
 
 // ---------------------------------------------------------------------------
