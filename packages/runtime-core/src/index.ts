@@ -141,6 +141,7 @@ import {
 } from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import {
+  type ApprovalPlace,
   type PendingApproval,
   type PendingApprovalStore,
   type SessionStore,
@@ -207,7 +208,7 @@ import {
   attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
-import { workspacePathCanonicalizer } from "./path-canonical";
+import { placeRecordingCanonicalizer } from "./path-canonical";
 import {
   type PreRouteArm,
   type PreRouteClassifierVerdict,
@@ -720,6 +721,7 @@ export type { AgentIdentityFile } from "./identity";
 // without depending on session-store directly.
 export {
   type ApprovalDecision,
+  type ApprovalPlace,
   type PendingApproval,
   type PendingApprovalStore,
   type PendingApprovalStoreOptions,
@@ -820,6 +822,105 @@ export async function findReplayableGrant(
   // `list()` is newest-first by contract, but sort defensively rather than
   // trust the ordering of a store a caller injected.
   return [...matches].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+}
+
+/**
+ * 0.7.1 — the gate's record of where a call lands: every path it read for
+ * the call and where each one landed, and whether each lands where it reads
+ * on its face (`placeRecordingCanonicalizer`).
+ */
+export type CallPlaces = {
+  readonly places: () => ReadonlyArray<ApprovalPlace>;
+  readonly allAsWritten: () => boolean;
+};
+
+/**
+ * 0.7.1 — does the decision on `record` cover a call that now lands at
+ * `call`?
+ *
+ * An operator approves a call where it acts. The record is keyed on the
+ * input, and the same input can be made to act somewhere else: retarget a
+ * symlinked directory between park and resume — any allowed call in the
+ * resumed turn can — and a grant for `pub/link/x.md` would write wherever
+ * the link now points, a place the operator never saw and one an
+ * `alwaysAsk` rule may name. So the record carries the places the gate
+ * found when it parked, and decides the call only while it lands there.
+ *
+ * A record written before approvals were bound (no `places`: 0.7.0, or an
+ * earlier 0.7.1 build) showed its approver only the input as written, so
+ * the one place it can be said to cover is the one that input names on its
+ * face. It decides the call when every path lands exactly there — no
+ * symlink followed, nothing elsewhere — and otherwise the call is asked
+ * again: never run somewhere the approver could not have seen. A record
+ * whose `places` is not the shape written here (a foreign or hand-edited
+ * line) covers nothing.
+ */
+export function landsWhereApproved(
+  record: Pick<PendingApproval, "places">,
+  call: CallPlaces,
+): boolean {
+  const recorded: unknown = record.places;
+  if (recorded === undefined) return call.allAsWritten();
+  if (!Array.isArray(recorded)) return false;
+  const fresh = call.places();
+  if (recorded.length !== fresh.length) return false;
+  return fresh.every((now, i) => {
+    const then: unknown = recorded[i];
+    if (typeof then !== "object" || then === null) return false;
+    const { path: thenPath, at: thenAt } = then as { path?: unknown; at?: unknown };
+    return (
+      thenPath === now.path &&
+      Array.isArray(thenAt) &&
+      thenAt.length === now.at.length &&
+      now.at.every((place, j) => thenAt[j] === place)
+    );
+  });
+}
+
+/**
+ * 0.7.1 — the newest record for this call that was made where it now lands:
+ * same tool and input (`keys`), not yet spent, and covering its places. The
+ * store's `get` hands back only the newest record for the input; when that
+ * one was made for another place, an older one may still be this place's —
+ * a grant the operator made before a link moved away and back, or a park
+ * already waiting. `list` is optional on an injected store; without it (or
+ * when it fails) there is nothing more to find, and the call parks.
+ */
+async function findApprovalForPlace(
+  store: Pick<PendingApprovalStore, "persist" | "get" | "resolve"> &
+    Partial<Pick<PendingApprovalStore, "list">>,
+  keys: ReadonlyArray<readonly [toolName: string, inputHash: string]>,
+  call: CallPlaces,
+): Promise<PendingApproval | null> {
+  if (typeof store.list !== "function") return null;
+  let all: readonly PendingApproval[];
+  try {
+    all = await store.list();
+  } catch {
+    return null;
+  }
+  // Newest-touched first, as `get` chooses.
+  const touched = (a: PendingApproval): number => {
+    const at = Date.parse(a.decidedAt ?? a.createdAt);
+    return Number.isFinite(at) ? at : 0;
+  };
+  const matches = all.filter(
+    (a) =>
+      keys.some(([toolName, inputHash]) => a.toolName === toolName && a.inputHash === inputHash) &&
+      a.consumedAt === undefined &&
+      landsWhereApproved(a, call),
+  );
+  return [...matches].sort((a, b) => touched(b) - touched(a))[0] ?? null;
+}
+
+/** Where a call lands, for an operator reading why it was asked again. */
+function describePlaces(places: ReadonlyArray<ApprovalPlace> | undefined): string {
+  if (places === undefined) return "the input as written";
+  if (!Array.isArray(places)) return "an unreadable record";
+  if (places.length === 0) return "no path";
+  return places
+    .map((p) => `${p.path} -> ${Array.isArray(p.at) ? p.at.join(" and ") : "?"}`)
+    .join("; ");
 }
 
 // Ops item 31 — alert watchdog seams re-exported so the CLI/codegen can build
@@ -5894,8 +5995,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // before any approval is asked for. Paths are resolved against the
     // current working directory, the root every workspace tool resolves
     // against when it runs.
+    //
+    // The canonicaliser also keeps a record of every path it read and where
+    // each one landed: a headless approval is bound to it (see
+    // `landsWhereApproved`).
+    const gateView = placeRecordingCanonicalizer();
     const subject = preparePermissionSubject(tool, operativeInput, {
-      canonicalizePath: workspacePathCanonicalizer(),
+      canonicalizePath: gateView.canonicalizePath,
     });
     if (!subject.ok) {
       // Not a permission decision: no rule was consulted, and the call fails
@@ -5964,11 +6070,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // have granted it. Honour it (or re-use it while still pending)
         // rather than parking the same call again under a new id.
         const legacyToolName = legacyMcpToolName(tu.name);
+        const approvalKeys: Array<readonly [string, string]> = [[tu.name, inputHash]];
+        if (legacyToolName !== undefined) {
+          approvalKeys.push([legacyToolName, hashApprovalInput(legacyToolName, operativeInput)]);
+        }
         if (existing === null && legacyToolName !== undefined) {
           existing = await approvals.store.get(
             legacyToolName,
             hashApprovalInput(legacyToolName, operativeInput),
           );
+        }
+        // 0.7.1 — A DECISION COVERS THE PLACE IT WAS MADE FOR. The record is
+        // keyed on the input, but a symlink moved since the park (by any
+        // allowed call in the resumed turn) sends the same input somewhere
+        // else. A record made where the call no longer lands decides nothing
+        // here — not a grant, not a deny, not a park to re-use — and the
+        // newest one made where it does land, if any, takes its place;
+        // otherwise the call is asked again below.
+        let movedFrom: PendingApproval | undefined;
+        if (existing !== null && !landsWhereApproved(existing, gateView)) {
+          movedFrom = existing;
+          existing = await findApprovalForPlace(approvals.store, approvalKeys, gateView);
         }
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
         //
@@ -5992,6 +6114,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // card, and that action is what executes. Honouring the grant for the
         // regenerated input instead would let a re-worded `place_call` dial a
         // different number under an approval for the first.
+        let replaySubject: ReturnType<typeof preparePermissionSubject> | undefined;
         if (existing === null) {
           const replay = await findReplayableGrant(approvals.store, {
             toolName: tu.name,
@@ -6005,10 +6128,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // calls both find the same unconsumed grant and both execute. The
           // set is per-run and in-process, which is where that race is;
           // across processes the store's `consumedAt` remains the authority.
+          //
+          // 0.7.1 — and bound like the exact match: the APPROVED input must
+          // still land where it did when the operator approved it. Read here,
+          // once, and re-checked against policy below from this same reading.
           if (replay !== undefined && !replayedApprovalIds.has(replay.id)) {
-            replayedApprovalIds.add(replay.id);
-            replayedFrom = replay;
-            existing = replay;
+            const replayView = placeRecordingCanonicalizer();
+            const subjectOfReplay = preparePermissionSubject(
+              tool,
+              operativeToolInput(tu.name, replay.input),
+              { canonicalizePath: replayView.canonicalizePath },
+            );
+            // An approved input that no longer parses is denied by the
+            // re-check below, as before; it has no place to compare.
+            if (!subjectOfReplay.ok || landsWhereApproved(replay, replayView)) {
+              replayedApprovalIds.add(replay.id);
+              replayedFrom = replay;
+              replaySubject = subjectOfReplay;
+              existing = replay;
+            } else {
+              movedFrom ??= replay;
+            }
           }
         }
         if (existing?.decision === "grant") {
@@ -6038,9 +6178,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // 0.7.1 — the recheck, like the first check, reads the PARSED
             // approved input and its canonical operative values; an approved
             // input that no longer parses is a denial, never a run.
-            const approvedSubject = preparePermissionSubject(tool, approvedOperative, {
-              canonicalizePath: workspacePathCanonicalizer(),
-            });
+            const approvedSubject =
+              replaySubject ??
+              preparePermissionSubject(tool, approvedOperative, {
+                canonicalizePath: placeRecordingCanonicalizer().canonicalizePath,
+              });
             const recheck = approvedSubject.ok
               ? evaluateWithReason(
                   {
@@ -6140,6 +6282,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             toolName: tu.name,
             inputHash,
             input: tu.input,
+            // 0.7.1 — what this park covers: where the call lands now.
+            places: gateView.places(),
             runId: bus.runId,
             sessionId,
             surface: approvalSurface,
@@ -6165,11 +6309,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             approvalId: pending.id,
             toolName: tu.name,
             surface: approvalSurface,
+            ...(movedFrom !== undefined ? { supersedes: movedFrom.id } : {}),
           });
+          // Asked again because the call moved: say where it was approved
+          // and where it lands now, so the operator decides on the new place.
+          const moved =
+            movedFrom === undefined
+              ? ""
+              : `; approval ${movedFrom.id} was ${
+                  movedFrom.decision === "grant"
+                    ? "granted"
+                    : movedFrom.decision === "deny"
+                      ? "denied"
+                      : "requested"
+                } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(
+                  gateView.places(),
+                )}, so it is asked again`;
           throw new RunFailedError({
             class: "approval_pending",
             title: "awaiting tool approval",
-            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface}); the run is parked as approval ${pending.id}`,
+            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface})${moved}; the run is parked as approval ${pending.id}`,
             remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`; add \`--always\` to allow \`${tu.name}\` from now on), then rerun`,
             exitCode: EXIT_CODES.approval_pending,
           });

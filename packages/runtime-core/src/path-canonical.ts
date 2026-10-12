@@ -36,6 +36,7 @@
  */
 import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
+import type { ApprovalPlace } from "@crewhaus/session-store";
 import type { PathCanonicalizer } from "@crewhaus/tool-executor";
 
 type OperativeValue = ReturnType<PathCanonicalizer>[number];
@@ -298,6 +299,32 @@ export function canonicalWorkspacePath(
   root: string,
   rootSpellings: RootSpellingSources = {},
 ): OperativeValue[] {
+  return readWorkspacePath(raw, root, rootSpellings).values;
+}
+
+/** The values a rule reads, and the absolute places they stand for (see {@link ApprovalPlace}). */
+type WorkspacePathReading = {
+  readonly values: OperativeValue[];
+  /** Worked out only when asked: a path that climbs out lexically is walked for it alone. */
+  readonly places: () => string[];
+  /** The place `raw` names on its face: the root joined to it, `..` collapsed, no link followed. */
+  readonly asWritten: string;
+};
+
+/**
+ * {@link canonicalWorkspacePath}, with the place each value stands for: the
+ * absolute location, with every symlink followed, that a value inside the
+ * workspace names in `canonical` — and that a value flagged outside does
+ * not, since a rule needs only the flag. An approval is bound to these
+ * places, and an outside place is a place an operator approved as much as an
+ * inside one. Where the destination cannot be worked out, the place is
+ * {@link UNRESOLVED_PLACE} followed by the path as written.
+ */
+function readWorkspacePath(
+  raw: string,
+  root: string,
+  rootSpellings: RootSpellingSources,
+): WorkspacePathReading {
   const rootAbs = path.resolve(root);
   let rootReal: string;
   try {
@@ -316,6 +343,22 @@ export function canonicalWorkspacePath(
     spellings,
     outsideWorkspace: true,
   };
+  const asWritten = toPosix(path.resolve(rootReal, lexicalRel));
+  const unresolved = `${UNRESOLVED_PLACE}${toPosix(lexicalAbs)}`;
+  const read = (
+    values: OperativeValue[],
+    places: string[] | (() => string[]),
+  ): WorkspacePathReading => {
+    let known = typeof places === "function" ? undefined : places;
+    return {
+      values,
+      places: () => {
+        known ??= (places as () => string[])();
+        return known;
+      },
+      asWritten,
+    };
+  };
   let caseInsensitive = true;
   const located = (real: string): OperativeValue => {
     const rel = path.relative(rootReal, real);
@@ -333,19 +376,31 @@ export function canonicalWorkspacePath(
       ...(isNonDirectory(real) ? { notDirectory: true } : {}),
     };
   };
-  if (climbsOut(lexicalRel)) return [outside];
-  // Longer than any path can be: no tool acts on it, and it is not walked.
-  if (lexicalAbs.length > MAX_PATH_CHARS) return [outside];
+  // Longer than any path can be: no tool acts on it, and it is not walked —
+  // not even for an approval's place.
+  if (lexicalAbs.length > MAX_PATH_CHARS) return read([outside], [unresolved]);
+  if (climbsOut(lexicalRel)) {
+    // A rule needs only the flag. The place is walked for only when an
+    // approval asks, so a grant made for one place outside is not spent on
+    // another.
+    return read([outside], () => {
+      try {
+        return [toPosix(resolveLocation(lexicalAbs))];
+      } catch {
+        return [unresolved];
+      }
+    });
+  }
   if (lexicalAbs === rootAbs) {
     caseInsensitive = ignoresCase(rootReal) !== false;
-    return [located(rootReal)];
+    return read([located(rootReal)], [toPosix(rootReal)]);
   }
   let parent: string;
   try {
     parent = resolveLocation(path.dirname(lexicalAbs));
   } catch {
     // Where it lands cannot be worked out: an allow must not guess.
-    return [outside];
+    return read([outside], [unresolved]);
   }
   // Unknown counts as "ignores case": that only widens what a deny or an ask
   // catches, never what an allow grants.
@@ -357,25 +412,73 @@ export function canonicalWorkspacePath(
     // name to — which, on a filesystem that folds case or Unicode form, may
     // be stored under another spelling. A rule sees that spelling.
     const stored = storedNames(parent, leaf);
-    if (stored === undefined) return [outside];
+    if (stored === undefined) return read([outside], [toPosix(path.join(parent, leaf))]);
     names = stored;
   }
   const values: OperativeValue[] = [];
+  const places: string[] = [];
   for (const name of names) {
     const at = path.join(parent, name);
     values.push(located(at));
+    places.push(toPosix(at));
     if (isSymlink(at)) {
       let target: string;
       try {
         target = resolveLocation(at);
       } catch {
         values.push(outside);
+        places.push(unresolved);
         continue;
       }
-      if (target !== at) values.push(located(target));
+      if (target !== at) {
+        values.push(located(target));
+        places.push(toPosix(target));
+      }
     }
   }
-  return values;
+  return read(values, places);
+}
+
+/** How a place reads when where the path lands could not be worked out. */
+export const UNRESOLVED_PLACE = "unresolved:";
+
+/**
+ * The gate's canonicaliser, keeping a record of every path it read and where
+ * each one lands — absolute, every symlink followed, one place per value it
+ * gave a rule (the entry itself and, when that is a symlink, its target),
+ * inside or outside the workspace alike. That record is what a headless
+ * approval is bound to (`landsWhereApproved` in this package). Paths a call names through a directory field (a
+ * command's `cwd`, a PATH entry it sets) are read through it too, so the
+ * record is everything on the filesystem the gate's decision rested on.
+ */
+export function placeRecordingCanonicalizer(root: string = process.cwd()): {
+  readonly canonicalizePath: PathCanonicalizer;
+  /** Every path read so far, ordered by path, each with where it lands. */
+  readonly places: () => ApprovalPlace[];
+  /**
+   * True when every path read lands exactly where it reads on its face —
+   * one place, the root joined to the path with `..` collapsed and no
+   * symlink followed. Vacuously true when no path was read.
+   */
+  readonly allAsWritten: () => boolean;
+} {
+  const seen = new Map<string, WorkspacePathReading>();
+  return {
+    canonicalizePath: (raw) => {
+      const reading = readWorkspacePath(raw, root, {});
+      seen.set(raw, reading);
+      return reading.values;
+    },
+    places: () =>
+      [...seen.entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([p, r]) => ({ path: p, at: [...r.places()] })),
+    allAsWritten: () =>
+      [...seen.values()].every((r) => {
+        const at = r.places();
+        return at.length === 1 && at[0] === r.asWritten;
+      }),
+  };
 }
 
 /**

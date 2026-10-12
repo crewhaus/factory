@@ -16,9 +16,11 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type PermissionRule, emptyRuleSet, evaluate } from "@crewhaus/permission-engine";
+import { resolveContained } from "@crewhaus/tool-safety/fs";
 import {
   MAX_PATH_CHARS,
   canonicalWorkspacePath,
+  placeRecordingCanonicalizer,
   workspacePathCanonicalizer,
 } from "./path-canonical";
 
@@ -205,6 +207,75 @@ describe("workspacePathCanonicalizer", () => {
       process.chdir(cwd);
     }
     expect(workspacePathCanonicalizer(ws)("build/link/app.ts")[0]?.canonical[0]).toBe("src/app.ts");
+  });
+});
+
+describe("placeRecordingCanonicalizer — the places a headless approval is bound to", () => {
+  test("gives the rule the same values as the gate's canonicaliser", () => {
+    const rec = placeRecordingCanonicalizer(ws);
+    for (const p of ["build/link/app.ts", "src/app.ts", "../elsewhere", "."]) {
+      expect(rec.canonicalizePath(p)).toEqual(canonicalWorkspacePath(p, ws));
+    }
+  });
+
+  test("records each path once, ordered, with where it lands — every link followed", () => {
+    symlinkSync("../.git/hooks/pre-commit", path.join(ws, "src", "hook"));
+    symlinkSync(path.dirname(ws), path.join(ws, "up"));
+    const rec = placeRecordingCanonicalizer(ws);
+    for (const p of ["src/hook", "build/link/app.ts", "src/app.ts", "up/x", "build/link/app.ts"]) {
+      rec.canonicalizePath(p);
+    }
+    expect(rec.places()).toEqual([
+      { path: "build/link/app.ts", at: [`${ws}/src/app.ts`] },
+      { path: "src/app.ts", at: [`${ws}/src/app.ts`] },
+      // A link as the last component: the link itself, and its target.
+      { path: "src/hook", at: [`${ws}/src/hook`, `${ws}/.git/hooks/pre-commit`] },
+      // Outside the workspace the rule reads only a flag; the place is still where it is.
+      { path: "up/x", at: [`${path.dirname(ws)}/x`] },
+    ]);
+  });
+
+  test("a path that climbs out lexically is placed where it lands, links followed", () => {
+    // ../<name>/x where <name> links back into the workspace: the rule sees
+    // only "outside", but the place is the file it reaches.
+    const sibling = `${ws}-sibling`;
+    symlinkSync(path.join(ws, "src"), sibling);
+    try {
+      const rec = placeRecordingCanonicalizer(ws);
+      expect(rec.canonicalizePath(`../${path.basename(sibling)}/app.ts`)[0]?.outsideWorkspace).toBe(
+        true,
+      );
+      expect(rec.places()[0]?.at).toEqual([`${ws}/src/app.ts`]);
+      expect(rec.allAsWritten()).toBe(false);
+    } finally {
+      rmSync(sibling, { force: true });
+    }
+  });
+
+  test("a link chain that cannot be followed is placed as unresolved, by its written path", () => {
+    symlinkSync("loop-b", path.join(ws, "loop-a"));
+    symlinkSync("loop-a", path.join(ws, "loop-b"));
+    const rec = placeRecordingCanonicalizer(ws);
+    expect(rec.canonicalizePath("loop-a/x")[0]?.outsideWorkspace).toBe(true);
+    expect(rec.places()).toEqual([{ path: "loop-a/x", at: [`unresolved:${ws}/loop-a/x`] }]);
+  });
+
+  test("allAsWritten: every path lands where it reads on its face, and only then", () => {
+    const plain = placeRecordingCanonicalizer(ws);
+    expect(plain.allAsWritten()).toBe(true); // nothing read
+    plain.canonicalizePath("src/app.ts");
+    plain.canonicalizePath("src/../src/new.ts");
+    plain.canonicalizePath(".");
+    plain.canonicalizePath(path.join(ws, "src", "app.ts"));
+    expect(plain.allAsWritten()).toBe(true);
+    const linked = placeRecordingCanonicalizer(ws);
+    linked.canonicalizePath("src/app.ts");
+    linked.canonicalizePath("build/link/app.ts");
+    expect(linked.allAsWritten()).toBe(false);
+    symlinkSync("app.ts", path.join(ws, "src", "alias"));
+    const leaf = placeRecordingCanonicalizer(ws);
+    leaf.canonicalizePath("src/alias");
+    expect(leaf.allAsWritten()).toBe(false);
   });
 });
 

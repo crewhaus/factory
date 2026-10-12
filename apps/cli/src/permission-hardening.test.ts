@@ -35,6 +35,7 @@ import {
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createNavigateTool } from "@crewhaus/tool-navigate";
@@ -1916,4 +1917,135 @@ describe("a path longer than any path can be is outside to the gate and refused 
     expect(wrong).toEqual([]);
     expect(capped).toEqual(long.length > 4_096 ? ["SystemInfo"] : []);
   }, 120_000);
+});
+
+describe("critic7 — a headless grant covers the place it was asked for, not where a link points later", () => {
+  // The operator grants a Write to `pub/link/x.md` while `pub/link` points
+  // at `public/`. In the resumed turn an ALLOWED call (here `ln -sfn`, through
+  // the real RunCommand) retargets the link at `secrets/`, which an alwaysAsk
+  // rule names; then the model re-issues the identical Write. 0.7.1 before
+  // this fix spent the grant and the real Write rewrote `secrets/x.md`.
+  const sessionId = "sess_0123456789abcdef";
+  const write = { path: "pub/link/x.md", content: "approved for public/" };
+  const rs = rules(["alwaysAsk", "Write(secrets/**)"], ["alwaysAllow", "RunCommand(ln **)"]);
+
+  /** One response per step: each tool_use in turn, then "done". */
+  function scripted(steps: ReadonlyArray<{ name: string; input: unknown }>): ProviderAdapter {
+    let i = 0;
+    return {
+      providerId: "anthropic",
+      features: {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+      },
+      estimateTokens: () => 0,
+      stream: () => {
+        const step = steps[i];
+        i++;
+        return (async function* () {
+          yield { kind: "message_start" } as const;
+          yield {
+            kind: "content_block_start",
+            index: 0,
+            block:
+              step !== undefined
+                ? { type: "tool_use", id: `tu_${i}`, name: step.name, input: {} }
+                : { type: "text", text: "" },
+          } as const;
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta:
+              step !== undefined
+                ? { type: "input_json_delta", partial_json: JSON.stringify(step.input) }
+                : { type: "text_delta", text: "done" },
+          } as const;
+          yield { kind: "content_block_stop", index: 0 } as const;
+          yield {
+            kind: "message_delta",
+            stopReason: step !== undefined ? "tool_use" : "end_turn",
+            usage: { input: 1, output: 1 },
+          } as const;
+          yield { kind: "message_stop" } as const;
+        })();
+      },
+    };
+  }
+
+  let store: ReturnType<typeof createPendingApprovalStore>;
+  beforeEach(() => {
+    mkdirSync(join(ws, "pub"));
+    mkdirSync(join(ws, "public"));
+    mkdirSync(join(ws, "secrets"));
+    symlinkSync("../public", join(ws, "pub", "link"));
+    store = createPendingApprovalStore({ rootDir: join(state, "approvals") });
+  });
+
+  /** A headless turn of the real builtins; the park's detail, if it parked. */
+  async function turn(steps: ReadonlyArray<{ name: string; input: unknown }>) {
+    const where = relative(ws, process.cwd());
+    if (where.startsWith("..") || isAbsolute(where) || !existsSync(ws)) {
+      throw new Error(`turn outlived its test's workspace; refusing to run in ${process.cwd()}`);
+    }
+    let parked: string | undefined;
+    await runChatLoop({
+      model: "test-model",
+      instructions: "approval places",
+      runContext: createRunContext({ sessionId }),
+      sessionRootDir: mkdtempSync(join(state, "sess-")),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      permissionMode: "default",
+      permissionRules: rs,
+      tools: [builtin("Write"), builtin("RunCommand")],
+      approvals: { store },
+      _adapter: scripted(steps),
+    }).catch((err: { report?: { class?: string; detail?: string } }) => {
+      if (err.report?.class !== "approval_pending") throw err;
+      parked = err.report.detail;
+    });
+    return parked;
+  }
+  const idIn = (detail: string | undefined) =>
+    /parked as approval (appr_[0-9a-f]{16})/.exec(detail ?? "")?.[1];
+
+  async function parkAndGrant(): Promise<string> {
+    const id = idIn(await turn([{ name: "Write", input: write }]));
+    if (id === undefined) throw new Error("the Write did not park");
+    expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+    await store.resolve(id, "grant", "operator");
+    return id;
+  }
+
+  test("retargeted by an allowed call in the resumed turn: the grant is not spent, secrets/ is untouched", async () => {
+    const granted = await parkAndGrant();
+    const detail = await turn([
+      { name: "RunCommand", input: { argv: ["ln", "-sfn", "../secrets", "pub/link"] } },
+      { name: "Write", input: write },
+    ]);
+    // The allowed call ran: the link now points at secrets/.
+    expect(realpathSync(join(ws, "pub", "link"))).toBe(join(ws, "secrets"));
+    // The Write did not: asked again, naming where it was approved and where it lands now.
+    expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
+    expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+    expect(detail).toContain(
+      `approval ${granted} was granted for pub/link/x.md -> ${ws}/public/x.md, and the call now lands at pub/link/x.md -> ${ws}/secrets/x.md, so it is asked again`,
+    );
+    expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeUndefined();
+  }, 60_000);
+
+  test("control: the link left where it was, the same resumed turn spends the grant and writes public/x.md", async () => {
+    const granted = await parkAndGrant();
+    const detail = await turn([
+      { name: "RunCommand", input: { argv: ["ln", "-sfn", "../public", "pub/link"] } },
+      { name: "Write", input: write },
+    ]);
+    expect(detail).toBeUndefined();
+    expect(readFileSync(join(ws, "public", "x.md"), "utf8")).toBe(write.content);
+    expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
+    expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeDefined();
+  }, 60_000);
 });

@@ -776,6 +776,16 @@ function normalizeAdditiveFields(session: Session): Session {
 export type ApprovalDecision = "grant" | "deny";
 
 /**
+ * One path a parked call names, as the permission gate read it, and the
+ * absolute place(s) it landed: the entry itself and, when that is a symlink,
+ * its target. A place the gate could not work out reads `unresolved:<path>`.
+ */
+export type ApprovalPlace = {
+  readonly path: string;
+  readonly at: ReadonlyArray<string>;
+};
+
+/**
  * One parked tool-approval request. `id` (`appr_<16 hex>`) is the stable key
  * the `approval_requested`/`approval_resolved` trace events and the CLI/Slack
  * approval verbs reference. `inputHash` is `hashApprovalInput(toolName, input)`
@@ -789,6 +799,15 @@ export type PendingApproval = {
   readonly inputHash: string;
   /** The tool input verbatim, so an approver can inspect what they're granting. */
   readonly input?: unknown;
+  /**
+   * 0.7.1 — where the call acted when it was parked: every path the
+   * permission gate read for it, and where each one landed (absolute, every
+   * symlink followed). The decision on this record covers the call only
+   * while it still lands there; when a link has moved it since, the call is
+   * asked again. Absent on a record written before 0.7.1 bound approvals to
+   * a place (see runtime-core).
+   */
+  readonly places?: ReadonlyArray<ApprovalPlace>;
   readonly runId: string;
   readonly sessionId: string;
   /** Free-form non-interactive surface classifier (`"single-turn"`, `"daemon"`, …). */

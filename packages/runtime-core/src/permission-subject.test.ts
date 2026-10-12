@@ -39,12 +39,16 @@ import {
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
-import { createPendingApprovalStore, hashApprovalInput } from "@crewhaus/session-store";
+import {
+  type PendingApproval,
+  createPendingApprovalStore,
+  hashApprovalInput,
+} from "@crewhaus/session-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
-import { runChatLoop } from "./index";
+import { REPLAYABLE_GRANT_MAX_AGE_MS, runChatLoop } from "./index";
 
 type Call = { readonly name: string; readonly input: unknown };
 
@@ -595,5 +599,217 @@ describe("approval replay re-checks the CANONICAL approved call", () => {
     expect(
       (await store.get("Write", hashApprovalInput("Write", approved)))?.consumedAt,
     ).toBeUndefined();
+  });
+});
+
+describe("0.7.1 — a headless approval covers the place it was asked for", () => {
+  // critic7: a grant was keyed on the input alone. Retarget a symlinked
+  // directory between park and resume and the operator's grant wrote
+  // wherever the link pointed now — here `secrets/`, which an alwaysAsk rule
+  // names. `landed` records where each write PHYSICALLY went.
+  let landed: string[] = [];
+  const writeWhere = buildTool({
+    name: "Write",
+    description: "tool-fs Write's shape; records where the parent directory really is",
+    inputSchema: z.object({ path: z.string(), content: z.string() }),
+    destructive: true,
+    operativeArgs: [{ field: "path", kind: "path" }],
+    execute: async (input: { path: string }) => {
+      const dir = realpathSync(join(process.cwd(), input.path, ".."));
+      landed.push(`${dir.slice(ws.length + 1)}/${input.path.split("/").pop()}`);
+      return "ok";
+    },
+  });
+  const askSecrets = rules(["alwaysAsk", "Write(secrets/**)"]);
+  const sessionId = "sess_0123456789abcdef";
+  const call = { path: "pub/link/x.md", content: "x" };
+  let store: ReturnType<typeof createPendingApprovalStore>;
+
+  beforeEach(() => {
+    landed = [];
+    mkdirSync(join(ws, "pub"));
+    mkdirSync(join(ws, "public"));
+    mkdirSync(join(ws, "secrets"));
+    symlinkSync("../public", join(ws, "pub", "link"));
+    store = createPendingApprovalStore({ rootDir: join(root, "approvals") });
+  });
+  const retarget = (to: string) => {
+    rmSync(join(ws, "pub", "link"));
+    symlinkSync(to, join(ws, "pub", "link"));
+  };
+
+  /** One headless turn of `input`; what it threw (a park), if anything. */
+  async function turn(input: unknown, ruleSet: RuleSet = askSecrets): Promise<RunFailedLike> {
+    let caught: RunFailedLike;
+    await runChatLoop({
+      model: "test-model",
+      instructions: "approval places",
+      runContext: createRunContext({ sessionId }),
+      sessionRootDir: mkdtempSync(join(root, "sess-")),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      permissionMode: "default",
+      permissionRules: ruleSet,
+      tools: [writeWhere],
+      approvals: { store },
+      _adapter: adapterFor({ name: "Write", input }),
+    }).catch((err: RunFailedLike) => {
+      caught = err;
+    });
+    return caught;
+  }
+  type RunFailedLike = { report?: { class?: string; detail?: string } } | undefined;
+  const parkedId = (err: RunFailedLike) =>
+    /parked as approval (appr_[0-9a-f]{16})/.exec(err?.report?.detail ?? "")?.[1];
+
+  async function parkAndGrant(input: unknown = call): Promise<string> {
+    const park = await turn(input);
+    const id = parkedId(park);
+    if (id === undefined) throw new Error(`expected a park, got ${JSON.stringify(park)}`);
+    await store.resolve(id, "grant", "operator");
+    return id;
+  }
+
+  test("control: resumed where it was approved, the grant runs the call once", async () => {
+    const id = await parkAndGrant();
+    const record = (await store.list()).find((a) => a.id === id);
+    // The park records where the call lands, for the operator and the resume.
+    expect(record?.places).toEqual([{ path: "pub/link/x.md", at: [`${ws}/public/x.md`] }]);
+    expect(await turn(call)).toBeUndefined();
+    expect(landed).toEqual(["public/x.md"]);
+    expect((await store.list()).find((a) => a.id === id)?.consumedAt).toBeDefined();
+  });
+
+  test("retargeted between park and resume, the grant is not spent: the call is asked again", async () => {
+    const granted = await parkAndGrant();
+    retarget("../secrets");
+    const again = await turn(call);
+    expect(landed).toEqual([]);
+    expect(again?.report?.class).toBe("approval_pending");
+    const reparked = parkedId(again);
+    expect(reparked).toBeDefined();
+    expect(reparked).not.toBe(granted);
+    // The operator is told where it was approved and where it lands now.
+    expect(again?.report?.detail).toContain(
+      `approval ${granted} was granted for pub/link/x.md -> ${ws}/public/x.md, and the call now lands at pub/link/x.md -> ${ws}/secrets/x.md, so it is asked again`,
+    );
+    const all = await store.list();
+    expect(all.find((a) => a.id === granted)?.consumedAt).toBeUndefined();
+    expect(all.find((a) => a.id === reparked)?.places).toEqual([
+      { path: "pub/link/x.md", at: [`${ws}/secrets/x.md`] },
+    ]);
+    // Granted for the new place, it runs there — once.
+    await store.resolve(reparked as string, "grant", "operator");
+    expect(await turn(call)).toBeUndefined();
+    expect(landed).toEqual(["secrets/x.md"]);
+  });
+
+  test("a deny still wins over a moved grant, as before", async () => {
+    await parkAndGrant();
+    retarget("../secrets");
+    expect(await turn(call, rules(["alwaysDeny", "Write(secrets/**)"]))).toBeUndefined();
+    expect(landed).toEqual([]);
+  });
+
+  test("moved away and back, the original grant is the one spent", async () => {
+    const granted = parkedId(await turn(call)) as string;
+    // Decided longer ago than #400's replay window reaches, so only the
+    // lookup by place can find it once a newer record stands in front.
+    const earlier = createPendingApprovalStore({
+      rootDir: join(root, "approvals"),
+      now: () => new Date(Date.now() - 2 * REPLAYABLE_GRANT_MAX_AGE_MS),
+    });
+    await earlier.resolve(granted, "grant", "operator");
+    retarget("../secrets");
+    const away = parkedId(await turn(call));
+    expect(away).not.toBe(granted);
+    retarget("../public");
+    // The newest record (the park for secrets/) is not this place's; the
+    // grant made for public/ is.
+    expect(await turn(call)).toBeUndefined();
+    expect(landed).toEqual(["public/x.md"]);
+    const all = await store.list();
+    expect(all.find((a) => a.id === granted)?.consumedAt).toBeDefined();
+    expect(all.find((a) => a.id === away)?.decision).toBeUndefined();
+  });
+
+  test("a park still waiting is re-used only where it was made", async () => {
+    const first = parkedId(await turn(call));
+    retarget("../secrets");
+    const second = parkedId(await turn(call));
+    expect(second).not.toBe(first);
+    // Still in secrets/: the same park, not a third one.
+    expect(parkedId(await turn(call))).toBe(second);
+    // Back in public/: the first park again, though the second is newer.
+    retarget("../public");
+    expect(parkedId(await turn(call))).toBe(first);
+    expect((await store.list()).length).toBe(2);
+  });
+
+  test("a deny made for another place is not applied: the call is asked again", async () => {
+    const first = parkedId(await turn(call));
+    await store.resolve(first as string, "deny", "operator");
+    retarget("../secrets");
+    const again = await turn(call);
+    expect(again?.report?.detail).toContain(`approval ${first} was denied for pub/link/x.md`);
+    expect(landed).toEqual([]);
+  });
+
+  test("a regenerated call does not replay a grant whose input has since moved (#400)", async () => {
+    const granted = await parkAndGrant();
+    retarget("../secrets");
+    // The model re-words the call; the replay would run the APPROVED input,
+    // which now lands in secrets/.
+    const again = await turn({ path: "pub/link/x.md", content: "reworded" });
+    expect(landed).toEqual([]);
+    expect(again?.report?.detail).toContain(`approval ${granted} was granted for pub/link/x.md`);
+    expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeUndefined();
+  });
+
+  test("control: a regenerated call still replays a grant that has not moved (#400)", async () => {
+    await parkAndGrant();
+    expect(await turn({ path: "pub/link/x.md", content: "reworded" })).toBeUndefined();
+    expect(landed).toEqual(["public/x.md"]);
+  });
+
+  describe("a grant written before approvals were bound (no places)", () => {
+    /** Park, grant, then re-write the record the way 0.7.0 did: without places. */
+    async function legacyGrant(input: unknown): Promise<string> {
+      const id = await parkAndGrant(input);
+      const record = (await store.list()).find((a) => a.id === id);
+      if (record === undefined) throw new Error("no record");
+      const { places: _dropped, ...legacy } = record;
+      await store.persist(legacy);
+      expect((await store.list()).find((a) => a.id === id)?.places).toBeUndefined();
+      return id;
+    }
+
+    test("honoured where the input lands as written: no link on the way", async () => {
+      await legacyGrant({ path: "public/x.md", content: "x" });
+      expect(await turn({ path: "public/x.md", content: "x" })).toBeUndefined();
+      expect(landed).toEqual(["public/x.md"]);
+    });
+
+    test("asked again when it goes through a link: where it landed was never recorded", async () => {
+      const id = await legacyGrant(call);
+      const again = await turn(call);
+      expect(landed).toEqual([]);
+      expect(again?.report?.detail).toContain(
+        `approval ${id} was granted for the input as written, and the call now lands at pub/link/x.md -> ${ws}/public/x.md`,
+      );
+      // Granted again, the new record is bound and runs.
+      await store.resolve(parkedId(again) as string, "grant", "operator");
+      expect(await turn(call)).toBeUndefined();
+      expect(landed).toEqual(["public/x.md"]);
+    });
+  });
+
+  test("a record whose places are not the shape written covers nothing", async () => {
+    const id = await parkAndGrant();
+    const record = (await store.list()).find((a) => a.id === id);
+    await store.persist({ ...record, places: "public/x.md" } as unknown as PendingApproval);
+    const again = await turn(call);
+    expect(landed).toEqual([]);
+    expect(again?.report?.class).toBe("approval_pending");
   });
 });

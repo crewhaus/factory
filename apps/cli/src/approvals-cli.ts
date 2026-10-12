@@ -123,6 +123,15 @@ export function formatApprovalDetail(a: PendingApproval, now: number = Date.now(
   const inputText =
     a.input === undefined ? "  (not recorded)" : indentJson(JSON.stringify(a.input, null, 2));
   lines.push(inputText);
+  // 0.7.1 — where the call acts, symlinks followed: what a grant covers. A
+  // call that lands anywhere else by the time it resumes is asked again.
+  if (Array.isArray(a.places) && a.places.length > 0) {
+    lines.push("lands at:");
+    for (const p of a.places) {
+      const at = Array.isArray(p?.at) ? p.at.join(", ") : "?";
+      lines.push(`  ${String(p?.path)} -> ${at}`);
+    }
+  }
   return `${lines.join("\n")}\n`;
 }
 

@@ -88,6 +88,19 @@ describe("formatApprovalDetail", () => {
     const out = formatApprovalDetail(approval({ input: undefined }));
     expect(out).toContain("(not recorded)");
   });
+
+  test("shows where the call lands, which is what a grant covers", () => {
+    const out = formatApprovalDetail(
+      approval({
+        toolName: "Write",
+        input: { path: "pub/link/x.md", content: "x" },
+        places: [{ path: "pub/link/x.md", at: ["/ws/public/x.md"] }],
+      }),
+    );
+    expect(out).toContain("lands at:\n  pub/link/x.md -> /ws/public/x.md\n");
+    // A record written before 0.7.1 bound approvals has no places to show.
+    expect(formatApprovalDetail(approval())).not.toContain("lands at:");
+  });
 });
 
 // ---------- CLI integration ----------
