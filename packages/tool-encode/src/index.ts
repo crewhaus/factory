@@ -690,13 +690,20 @@ export const slugify: RegisteredTool = buildTool({
   execute: async (input) => {
     const oversize = tooLarge(input.text, "text");
     if (oversize !== undefined) return oversize;
-    const result = slugifyText(input.text, {
-      separator: input.separator ?? "-",
-      lowercase: input.lowercase ?? true,
-      ...(input.maxLength !== undefined ? { maxLength: input.maxLength } : {}),
-      allowUnicode: input.allowUnicode ?? false,
-      ...(input.replacements !== undefined ? { replacements: input.replacements } : {}),
-    });
+    let result: ReturnType<typeof slugifyText>;
+    try {
+      result = slugifyText(input.text, {
+        separator: input.separator ?? "-",
+        lowercase: input.lowercase ?? true,
+        ...(input.maxLength !== undefined ? { maxLength: input.maxLength } : {}),
+        allowUnicode: input.allowUnicode ?? false,
+        ...(input.replacements !== undefined ? { replacements: input.replacements } : {}),
+        // What `replacements` may grow the text to: the limit for the text itself.
+        limit: MAX_INPUT_CHARS,
+      });
+    } catch (error) {
+      return message(error);
+    }
     return json({
       slug: result.slug,
       truncated: result.truncated,
