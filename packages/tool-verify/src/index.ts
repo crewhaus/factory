@@ -52,6 +52,7 @@ import {
   headingAnchors,
   lintCitations,
   splitLinkTarget,
+  withoutLinkTitle,
 } from "./lib/markdown";
 import {
   NORMALIZERS,
@@ -1143,7 +1144,7 @@ function loadSource(
 ): { label: string; outcome: SourceOutcome } {
   // A Markdown definition may carry a title after the destination; it is not
   // part of the destination.
-  const destination = raw.replace(/\s+"[^"]*"\s*$/, "").trim();
+  const destination = withoutLinkTitle(raw).trim();
   // What the DOCUMENT wrote, for every answer that is about the citation
   // rather than about a file that was opened. A file that is opened is
   // reported by its workspace-relative path instead, below.

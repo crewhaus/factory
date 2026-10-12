@@ -408,6 +408,19 @@ export function readKeyword(keyword: string): KeywordRead {
 // URLs and slugs.
 
 /**
+ * `text` without its trailing slashes: what `text.replace(/\/+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of slashes that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and a page writes
+ * whatever URL it likes.
+ */
+export function withoutTrailingSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x2f) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
+/**
  * A URL reduced to the form two of them can be compared in.
  *
  * Case in the scheme and host is not meaningful, a fragment is never sent to
@@ -419,7 +432,7 @@ export function readKeyword(keyword: string): KeywordRead {
  * spellings.
  */
 export function canonicalForm(url: URL): string {
-  const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+  const path = url.pathname.length > 1 ? withoutTrailingSlashes(url.pathname) : url.pathname;
   return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}${path}${url.search}`;
 }
 
@@ -432,7 +445,8 @@ export function canonicalForm(url: URL): string {
  * rather than twice with a chance to drift.
  */
 export function pathForm(target: { readonly pathname: string; readonly search: string }): string {
-  const path = target.pathname.length > 1 ? target.pathname.replace(/\/+$/, "") : target.pathname;
+  const path =
+    target.pathname.length > 1 ? withoutTrailingSlashes(target.pathname) : target.pathname;
   return `${path}${target.search}`;
 }
 
@@ -714,12 +728,33 @@ const UNINFORMATIVE: ReadonlySet<string> = new Set([
  * nothing in here is an invisible literal.
  */
 export function isUninformativeAnchor(text: string): boolean {
-  const normalized = text
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}]+$/u, "")
-    .trim();
+  const normalized = withoutTrailingDecoration(text.toLowerCase().replace(/\s+/g, " ")).trim();
   return UNINFORMATIVE.has(normalized);
+}
+
+const LETTER_OR_NUMBER = /^[\p{L}\p{N}]$/u;
+
+/**
+ * `text` without its trailing run of code points that are neither letters
+ * nor numbers: what `text.replace(/[^\p{L}\p{N}]+$/u, "")` returned, one
+ * code point at a time from the end (a lone surrogate counts as one, as it
+ * does under `u`). That pattern tries every start inside such a run that is
+ * not at the end and rescans the rest of it from each, so it was quadratic in
+ * the run's length, and anchor text is whatever the page holds.
+ */
+export function withoutTrailingDecoration(text: string): string {
+  let end = text.length;
+  while (end > 0) {
+    let start = end - 1;
+    const c = text.charCodeAt(start);
+    if (c >= 0xdc00 && c <= 0xdfff && start > 0) {
+      const high = text.charCodeAt(start - 1);
+      if (high >= 0xd800 && high <= 0xdbff) start--;
+    }
+    if (LETTER_OR_NUMBER.test(text.slice(start, end))) break;
+    end = start;
+  }
+  return end === text.length ? text : text.slice(0, end);
 }
 
 /** True when an `alt` is just the file's name, which describes nothing. */

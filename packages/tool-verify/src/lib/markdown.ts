@@ -90,6 +90,41 @@ export function hasUriScheme(href: string): boolean {
   return /^[a-z][a-z0-9+.-]*:/i.test(href);
 }
 
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/**
+ * A Markdown definition's destination without the ` "title"` after it: what
+ * `text.replace(/\s+"[^"]*"\s*$/, "")` returned, read from the end. That
+ * pattern tries every start inside a run of whitespace and, where no title
+ * follows the run, rescans the rest of it from each before giving the start
+ * up, so a long run inside a destination was quadratic in its length.
+ */
+export function withoutLinkTitle(text: string): string {
+  let end = text.length;
+  while (end > 0 && isRegExpSpace(text.charCodeAt(end - 1))) end--;
+  if (end < 2 || text.charCodeAt(end - 1) !== 0x22) return text;
+  const open = text.lastIndexOf('"', end - 2);
+  if (open < 1 || !isRegExpSpace(text.charCodeAt(open - 1))) return text;
+  let start = open - 1;
+  while (start > 0 && isRegExpSpace(text.charCodeAt(start - 1))) start--;
+  return text.slice(0, start);
+}
+
 /**
  * A link destination split into the file it names and the fragment after it.
  *
