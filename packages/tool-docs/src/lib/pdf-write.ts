@@ -368,6 +368,61 @@ export function buildPdf(
   return out;
 }
 
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/**
+ * One part of a page range, read left to right: leading digits, whitespace,
+ * a dash, whitespace, trailing digits, each optional, and nothing after.
+ * What `/^(\d+)?\s*(-)?\s*(\d+)?$/.exec(part)` captured, or `null`. That
+ * pattern gave every whitespace character back to the second `\s*` in turn
+ * when the part did not end where it should, so a long run of spaces before a
+ * stray character was quadratic in its length, and the range is the model's.
+ */
+export function pageRangePart(
+  part: string,
+): [from: string | undefined, dash: string | undefined, to: string | undefined] | null {
+  const digitsFrom = (start: number): number => {
+    let i = start;
+    for (; i < part.length; i++) {
+      const c = part.charCodeAt(i);
+      if (c < 0x30 || c > 0x39) break;
+    }
+    return i;
+  };
+  const spacesFrom = (start: number): number => {
+    let i = start;
+    while (i < part.length && isRegExpSpace(part.charCodeAt(i))) i++;
+    return i;
+  };
+  const fromEnd = digitsFrom(0);
+  let i = spacesFrom(fromEnd);
+  const dash = part.charCodeAt(i) === 0x2d;
+  if (dash) i++;
+  const toStart = spacesFrom(i);
+  const toEnd = digitsFrom(toStart);
+  if (toEnd !== part.length) return null;
+  return [
+    fromEnd > 0 ? part.slice(0, fromEnd) : undefined,
+    dash ? "-" : undefined,
+    toEnd > toStart ? part.slice(toStart, toEnd) : undefined,
+  ];
+}
+
 /**
  * Parse a page range like `1-3,7,10-` against a document of `pageCount`
  * pages. Order is preserved as written, duplicates are allowed (a caller
@@ -383,9 +438,9 @@ export function parsePageRange(spec: string, pageCount: number): number[] {
   for (const rawPart of spec.split(",")) {
     const part = rawPart.trim();
     if (part === "") continue;
-    const match = /^(\d+)?\s*(-)?\s*(\d+)?$/.exec(part);
+    const match = pageRangePart(part);
     if (match === null) throw new PdfError(`"${part}" is not a page or page range`);
-    const [, fromText, dash, toText] = match;
+    const [fromText, dash, toText] = match;
     if (dash === undefined) {
       if (fromText === undefined) throw new PdfError(`"${part}" is not a page or page range`);
       const page = Number.parseInt(fromText, 10);
