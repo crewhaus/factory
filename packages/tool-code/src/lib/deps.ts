@@ -488,6 +488,35 @@ function resolutionField(map: string, key: string): string | undefined {
 }
 
 /**
+ * A pnpm package entry's `name`, `version` or `resolution` line: what
+ * `/^ {4}(name|version|resolution):\s*(.+?)\s*$/.exec(line)` captured, read
+ * from both ends instead. The value is what lies between the whitespace
+ * after the colon and the whitespace at the end, and holds no line break;
+ * when there is nothing between them, the pattern took the last whitespace
+ * character that is not a line break. Its lazy value tried every end inside
+ * a run of whitespace and rescanned the rest of the run from each, so a long
+ * run inside a value was quadratic in its length.
+ */
+export function pnpmField(line: string): { key: string; value: string } | null {
+  if (!line.startsWith("    ")) return null;
+  const key = ["name", "version", "resolution"].find((k) => line.startsWith(`${k}:`, 4));
+  if (key === undefined) return null;
+  const start = 4 + key.length + 1;
+  let lead = start;
+  while (lead < line.length && isRegExpSpace(line.charCodeAt(lead))) lead++;
+  if (lead === line.length) {
+    for (let k = line.length - 1; k >= start; k--) {
+      if (!isLineBreak(line.charCodeAt(k))) return { key, value: line.charAt(k) };
+    }
+    return null;
+  }
+  let end = line.length;
+  while (isRegExpSpace(line.charCodeAt(end - 1))) end--;
+  for (let i = lead; i < end; i++) if (isLineBreak(line.charCodeAt(i))) return null;
+  return { key, value: line.slice(lead, end) };
+}
+
+/**
  * `pnpm-lock.yaml`, generations 5, 6 and 9 — the top-level `packages:` map,
  * which lists every resolved package exactly once.
  *
@@ -564,11 +593,11 @@ export function parsePnpmLockDetailed(text: string): LockedDependency[] {
       continue;
     }
     if (key === undefined) continue;
-    const field = /^ {4}(name|version|resolution):\s*(.+?)\s*$/.exec(line);
+    const field = pnpmField(line);
     if (field === null) continue;
-    const value = (field[2] as string).replace(/^['"]/, "").replace(/['"]$/, "");
-    if (field[1] === "name") name ??= value;
-    else if (field[1] === "version") version ??= value;
+    const value = field.value.replace(/^['"]/, "").replace(/['"]$/, "");
+    if (field.key === "name") name ??= value;
+    else if (field.key === "version") version ??= value;
     else {
       resolvedUrl ??= recordedUrl(resolutionField(value, "tarball"));
       integrity ??= sriIntegrity(resolutionField(value, "integrity"));
