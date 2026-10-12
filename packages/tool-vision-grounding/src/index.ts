@@ -57,6 +57,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
 import { z } from "zod";
+import { fencedBody } from "./fence";
 
 export class VisionGroundingError extends CrewhausError {
   override readonly name = "VisionGroundingError";
@@ -137,15 +138,13 @@ Rules:
   with confidence "low".
 `;
 
-const FENCE_RE = /```(?:json)?\s*([\s\S]*?)\s*```/;
-
 // Every message below is a fixed sentence. The reply comes from a model that
 // read an untrusted page, so no part of it is ever quoted into the result,
 // and the parser's own error (which quotes tokens) is not kept either.
 
 function extractJson(text: string): string {
-  const m = FENCE_RE.exec(text);
-  if (m?.[1]) return m[1].trim();
+  const fenced = fencedBody(text);
+  if (fenced) return fenced.trim();
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start !== -1 && end > start) return text.slice(start, end + 1);
