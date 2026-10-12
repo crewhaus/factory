@@ -225,7 +225,58 @@ export function lineOf(index: SourceIndex, offset: number): number {
   return lo + 1;
 }
 
-/** The source's own words over a token range, whitespace collapsed. */
+/**
+ * True for exactly the UTF-16 code units `\s` matches: ECMAScript's
+ * WhiteSpace and LineTerminator, which are also what `trim` removes.
+ */
+function isSpace(code: number): boolean {
+  if (code <= 0x20) return code === 0x20 || (code >= 0x09 && code <= 0x0d);
+  if (code < 0xa0) return false;
+  return (
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+/**
+ * Where each run of whitespace in a source's text ends, by where it starts,
+ * found the first time an excerpt crosses it: a run is read once per
+ * source, however many excerpts cross it.
+ */
+const SPACE_RUN_ENDS = new WeakMap<SourceIndex, Map<number, number>>();
+
+function spaceRunEnd(index: SourceIndex, start: number): number {
+  let ends = SPACE_RUN_ENDS.get(index);
+  if (ends === undefined) {
+    ends = new Map();
+    SPACE_RUN_ENDS.set(index, ends);
+  }
+  let end = ends.get(start);
+  if (end === undefined) {
+    end = start;
+    while (end < index.text.length && isSpace(index.text.charCodeAt(end))) end++;
+    ends.set(start, end);
+  }
+  return end;
+}
+
+/**
+ * The source's own words over a token range, whitespace collapsed, and cut
+ * to `maxChars` with an ellipsis.
+ *
+ * Read only as far as the cut: cutting the whole range out of the source
+ * first charged every excerpt the whole distance between its words, so a
+ * source of a few words far apart cost each claim the whole source. The
+ * text is the one `slice(…).replace(/\s+/g, " ").trim()` gives: a run of
+ * whitespace becomes one space, and the range begins and ends on a word.
+ */
 export function spanExcerpt(
   index: SourceIndex,
   fromToken: number,
@@ -236,12 +287,45 @@ export function spanExcerpt(
   if (fromToken < 0 || tokens.length === 0) return "";
   const first = tokens[Math.min(fromToken, tokens.length - 1)] as SourceToken;
   const last = tokens[Math.min(Math.max(toToken, fromToken), tokens.length - 1)] as SourceToken;
-  const text = index.text
-    .slice(first.at, last.at + last.raw.length)
-    .replace(/\s+/g, " ")
-    .trim();
-  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
+  const end = last.at + last.raw.length;
+  if (maxChars < 1) {
+    const whole = index.text.slice(first.at, end).replace(/\s+/g, " ").trim();
+    return whole.length > maxChars ? `${whole.slice(0, maxChars - 1)}…` : whole;
+  }
+  // Collapsed text up to one past the cut, which is enough to know whether
+  // there is a cut and what comes before it.
+  const want = maxChars + 1;
+  const parts: string[] = [];
+  let length = 0;
+  let at = first.at;
+  while (at < end && length < want) {
+    if (isSpace(index.text.charCodeAt(at))) {
+      at = spaceRunEnd(index, at);
+      parts.push(" ");
+      length += 1;
+      continue;
+    }
+    let stop = at + 1;
+    while (stop < end && stop - at < want - length && !isSpace(index.text.charCodeAt(stop))) {
+      stop++;
+    }
+    parts.push(index.text.slice(at, stop));
+    length += stop - at;
+    at = stop;
+  }
+  const text = parts.join("");
+  return length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
 }
+
+/**
+ * Source tokens the passes below have read: one per token of a pass over a
+ * whole source (bestSpan's window sliding along it, findSequence's search),
+ * for a test to count with, since a loop that indexes the tokens by hand is
+ * invisible to a meter wrapping the array methods. bestSpan's second look at
+ * the one winning window, at most twice the window, is not counted. Only
+ * ever added to.
+ */
+export const scanMeter = { tokens: 0 };
 
 export type BestSpan = {
   /** How many of the claim's words the best span carries. */
@@ -297,6 +381,7 @@ export function bestSpan(
   let at = -1;
   for (const token of tokens) {
     at += 1;
+    scanMeter.tokens += 1;
     const entering = token.norm;
     if (want.has(entering)) {
       const next = (counts.get(entering) ?? 0) + 1;
@@ -386,6 +471,7 @@ export function findSequence(index: SourceIndex, sequence: ReadonlyArray<string>
   let k = 0;
   for (const token of tokens) {
     at += 1;
+    scanMeter.tokens += 1;
     while (k > 0 && token.norm !== sequence[k]) k = border[k - 1] as number;
     if (token.norm === sequence[k]) k += 1;
     if (k === m) return at - m + 1;

@@ -124,6 +124,26 @@ const LIMITS = {
   sourceBytes: 8 * 1024 * 1024,
 } as const;
 
+/**
+ * Words of its cited sources one FactCrossCheck call may read. Locating a
+ * claim reads each source it cites once, or for a quotation up to twice per
+ * span; the caps above bound one claim, and this bounds the call: 200
+ * claims each quoting 16 near misses of one source read it 6 400 times. A
+ * claim whose reading could pass what is left is reported `unchecked`, with
+ * the reason, before any of it is read. Held in an object so a test can
+ * lower it (see `_setFactCheckReadBudgetForTest`).
+ */
+const READ_BUDGET = { words: 2 ** 27 };
+
+/** Lower (or restore) the per-call reading budget for a test; returns the undo. */
+export function _setFactCheckReadBudgetForTest(words: number): () => void {
+  const before = READ_BUDGET.words;
+  READ_BUDGET.words = words;
+  return () => {
+    READ_BUDGET.words = before;
+  };
+}
+
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".turbo"]);
 
 /** Every file under a directory, workspace-relative and sorted. */
@@ -1323,61 +1343,124 @@ function findingFor(label: string, located: Located): SourceFinding {
 }
 
 /**
+ * What one call has read, and what it found, kept for the whole call: a
+ * quotation or a claim's words located in a source are located there once,
+ * whichever claim asks. `words` counts every pass over a source at its full
+ * length, whether or not the pass stopped early.
+ */
+type Reading = {
+  words: number;
+  readonly found: Map<SourceIndex, Map<string, SpanAnswer | Located>>;
+};
+
+/** Where a quoted span first appears in a source, and if nowhere, what to report. */
+type SpanAnswer = { readonly at: number; readonly miss: Located | null };
+
+function knownIn(reading: Reading, index: SourceIndex): Map<string, SpanAnswer | Located> {
+  let known = reading.found.get(index);
+  if (known === undefined) {
+    known = new Map();
+    reading.found.set(index, known);
+  }
+  return known;
+}
+
+/** The key a quoted span is kept under. */
+const spanKey = (run: ReadonlyArray<string>): string => `q${JSON.stringify(run)}`;
+/** The key a claim's own words are kept under. */
+const wordsKey = (need: ReadonlyArray<string>): string => `w${JSON.stringify(need)}`;
+
+/** The most a claim can still read of `index`: what is not yet known there. */
+function readingBound(claim: PreparedClaim, index: SourceIndex, reading: Reading): number {
+  const known = reading.found.get(index);
+  const words = index.tokens.length;
+  if (claim.quotes.length === 0) return known?.has(claim.needKey) ? 0 : words;
+  // A span can take two passes: looking for it, and the nearest span when
+  // it is not there.
+  let bound = 0;
+  for (const { key } of claim.spans) if (!known?.has(key)) bound += 2 * words;
+  return bound;
+}
+
+/** One quoted span located in one source, once per call. */
+function locateSpan(
+  index: SourceIndex,
+  run: ReadonlyArray<string>,
+  key: string,
+  reading: Reading,
+): SpanAnswer {
+  const known = knownIn(reading, index);
+  const before = known.get(key) as SpanAnswer | undefined;
+  if (before !== undefined) return before;
+  const at = findSequence(index, run);
+  reading.words += index.tokens.length;
+  let miss: Located | null = null;
+  if (at === -1) {
+    // The quotation is not there word for word. A span that carries most of
+    // it is the useful answer — the caller needs to see what the source
+    // actually wrote — and a span that carries little of it is no answer at
+    // all, only a coincidence of vocabulary.
+    const distinct = [...new Set(run)];
+    const near = bestSpan(index, distinct, run.length);
+    reading.words += index.tokens.length;
+    const coverage = near.total === 0 ? 0 : near.matched / near.total;
+    const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
+    miss = enough
+      ? {
+          status: "misquoted",
+          reason: (label) =>
+            `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
+          detail: {
+            coverage: Math.round(coverage * 100) / 100,
+            missing: [...near.missing],
+            differing: [...near.extra],
+            line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
+            excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
+          },
+        }
+      : {
+          status: "notFound",
+          reason: (label) =>
+            `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
+          detail: {
+            coverage: Math.round(coverage * 100) / 100,
+            missing: [...near.missing],
+          },
+        };
+  }
+  const answer: SpanAnswer = { at, miss };
+  known.set(key, answer);
+  return answer;
+}
+
+/**
  * Locate one claim's words in one source.
  *
  * Nothing here depends on how the document spelled the source, so a claim
- * citing one file under many markers locates its words there once (the
- * caller keeps the answer per index). For a quotation, a span already
- * checked is not checked again, and once one is not in the source at all
- * nothing later can change the answer — `notFound` outranks a misquote — so
- * the rest are not read.
+ * citing one file under many markers locates its words there once, and a
+ * span or a claim's words already located in that file by any claim of the
+ * call are not located again. For a quotation, once one span is not in the
+ * source at all nothing later can change the answer — `notFound` outranks a
+ * misquote — so the rest are not read.
  */
-function locate(index: SourceIndex, claim: PreparedClaim, windowTokens: number): Located {
+function locate(
+  index: SourceIndex,
+  claim: PreparedClaim,
+  windowTokens: number,
+  reading: Reading,
+): Located {
   if (claim.quotes.length > 0) {
     let worst: Located | null = null;
     let firstHit = -1;
-    const checked = new Set<string>();
-    for (const run of claim.quotes) {
-      const key = JSON.stringify(run);
-      if (checked.has(key)) continue;
-      checked.add(key);
-      const at = findSequence(index, run);
-      if (at !== -1) {
+    // Each different span once, in the order first quoted.
+    for (const { run, key } of claim.spans) {
+      const { at, miss } = locateSpan(index, run, key, reading);
+      if (miss === null) {
         if (firstHit === -1) firstHit = at;
         continue;
       }
-      // The quotation is not there word for word. A span that carries most of
-      // it is the useful answer — the caller needs to see what the source
-      // actually wrote — and a span that carries little of it is no answer at
-      // all, only a coincidence of vocabulary.
-      const distinct = [...new Set(run)];
-      const near = bestSpan(index, distinct, run.length);
-      const coverage = near.total === 0 ? 0 : near.matched / near.total;
-      const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
-      const finding: Located = enough
-        ? {
-            status: "misquoted",
-            reason: (label) =>
-              `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
-            detail: {
-              coverage: Math.round(coverage * 100) / 100,
-              missing: [...near.missing],
-              differing: [...near.extra],
-              line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
-              excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
-            },
-          }
-        : {
-            status: "notFound",
-            reason: (label) =>
-              `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
-            detail: {
-              coverage: Math.round(coverage * 100) / 100,
-              missing: [...near.missing],
-            },
-          };
-      if (worst === null || VERDICT_RANK[finding.status] > VERDICT_RANK[worst.status]) {
-        worst = finding;
+      if (worst === null || VERDICT_RANK[miss.status] > VERDICT_RANK[worst.status]) {
+        worst = miss;
       }
       if (worst.status === "notFound") break;
     }
@@ -1394,6 +1477,17 @@ function locate(index: SourceIndex, claim: PreparedClaim, windowTokens: number):
     };
   }
 
+  const known = knownIn(reading, index);
+  const before = known.get(claim.needKey) as Located | undefined;
+  if (before !== undefined) return before;
+  const located = locateWords(index, claim, windowTokens);
+  reading.words += index.tokens.length;
+  known.set(claim.needKey, located);
+  return located;
+}
+
+/** A claim with no quotation, located in one source by its words. */
+function locateWords(index: SourceIndex, claim: PreparedClaim, windowTokens: number): Located {
   const span = bestSpan(index, claim.need, windowTokens);
   const coverage = span.total === 0 ? 0 : Math.round((span.matched / span.total) * 100) / 100;
   if (span.matched < span.total) {
@@ -1442,16 +1536,31 @@ function locate(index: SourceIndex, claim: PreparedClaim, windowTokens: number):
 type PreparedClaim = {
   readonly text: string;
   readonly need: ReadonlyArray<string>;
+  /** The key the claim's words are kept under for the call. */
+  readonly needKey: string;
   readonly quotes: ReadonlyArray<ReadonlyArray<string>>;
+  /** The different quoted spans, in the order first quoted, with their keys. */
+  readonly spans: ReadonlyArray<{ readonly run: ReadonlyArray<string>; readonly key: string }>;
   readonly mode: "quote" | "paraphrase";
 };
 
 function prepareClaim(text: string): PreparedClaim {
   const quotes = quotedRuns(text, QUOTE_MIN_TOKENS);
+  const need = contentTokens(text);
+  const spans: Array<{ run: ReadonlyArray<string>; key: string }> = [];
+  const keys = new Set<string>();
+  for (const run of quotes) {
+    const key = spanKey(run);
+    if (keys.has(key)) continue;
+    keys.add(key);
+    spans.push({ run, key });
+  }
   return {
     text,
-    need: contentTokens(text),
+    need,
+    needKey: wordsKey(need),
     quotes,
+    spans,
     // An attributed quotation is the strictest promise a citation makes, so
     // when there is one it is what gets verified; the words around it are the
     // author's framing, not the source's.
@@ -1507,6 +1616,7 @@ export const factCrossCheck: RegisteredTool = buildTool({
     const windowTokens = input.windowTokens ?? 60;
     const limit = input.limit ?? LIMITS.claims;
     const cache = new Map<string, SourceOutcome>();
+    const reading: Reading = { words: 0, found: new Map() };
 
     // Where a source path is measured from. A document's citations are
     // written relative to the document; a caller's are relative to the
@@ -1602,11 +1712,31 @@ export const factCrossCheck: RegisteredTool = buildTool({
       if (prepared.need.length === 0 && prepared.quotes.length === 0) {
         return settle("unchecked", "the claim has no words to look for");
       }
-      const quoted = new Set(prepared.quotes.map((run) => JSON.stringify(run))).size;
+      const quoted = prepared.spans.length;
       if (quoted > LIMITS.quotedSpans) {
         return settle(
           "unchecked",
           `the claim quotes ${quoted} different spans; at most ${LIMITS.quotedSpans} are checked in one claim, so split it into claims that quote fewer`,
+        );
+      }
+
+      const loaded = claim.cites.map((raw) => loadSource(raw, baseAbs, cache));
+      // What locating the claim could still read, over each source it cites
+      // once however many times it cites it. Past what the call has left,
+      // the claim is not checked in part: it is reported, unread.
+      let bound = 0;
+      const bounded = new Set<SourceIndex>();
+      for (const { outcome } of loaded) {
+        if (outcome.kind !== "index" || bounded.has(outcome.index)) continue;
+        bounded.add(outcome.index);
+        bound += readingBound(prepared, outcome.index, reading);
+      }
+      if (reading.words + bound > READ_BUDGET.words) {
+        return settle(
+          "unchecked",
+          bound > READ_BUDGET.words
+            ? `checking it could read ${bound} words of its sources, more than the ${READ_BUDGET.words} one call may read; cite smaller sources, or quote fewer spans`
+            : `checking it could read ${bound} more words of its sources, and this call has read ${reading.words} of the ${READ_BUDGET.words} one call may; check it in a separate call`,
         );
       }
 
@@ -1622,15 +1752,15 @@ export const factCrossCheck: RegisteredTool = buildTool({
         });
       }
       // A source cited under many markers, or under many spellings of its
-      // path, is one index: its words are located once per claim. Doing it
-      // per cite read the whole source again for every marker.
+      // path, is one index: the claim is located there once, and what its
+      // words found is kept for the call. Doing it per cite read the whole
+      // source again for every marker.
       const located = new Map<SourceIndex, Located>();
-      for (const raw of claim.cites) {
-        const { label, outcome } = loadSource(raw, baseAbs, cache);
+      for (const { label, outcome } of loaded) {
         if (outcome.kind === "index") {
           let found = located.get(outcome.index);
           if (found === undefined) {
-            found = locate(outcome.index, prepared, windowTokens);
+            found = locate(outcome.index, prepared, windowTokens, reading);
             located.set(outcome.index, found);
           }
           sources.push(findingFor(label, found));

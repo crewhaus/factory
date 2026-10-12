@@ -202,7 +202,11 @@ nobody looked at, so a run that stopped at its `limit` reports `truncated`,
 `ok: false` and how many were left over, rather than a pass covering the ones
 that fit. In the same way, a claim that puts more than 16 different spans in
 quotation marks is reported `unchecked`, with that reason, rather than checked
-in part: split it into claims that quote fewer.
+in part: split it into claims that quote fewer. And one call reads only so
+much of its sources: a claim that could read past what is left is reported
+`unchecked`, with the reason, and can be checked in a separate call. A
+quotation or a claim already located in a source is not read again in the
+same call, so repeating one costs nothing.
 
 A citation's destination is read the way a Markdown link's is: `./report.md`
 and `./report.md#findings` name the same file, and `CitationLint` and
