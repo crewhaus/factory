@@ -7,29 +7,45 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SPAWN_DEFAULTS } from "@crewhaus/tool-safety/streams";
 import { DRAIN_GRACE_MS, MAX_OUTPUT_CHARS, _setRunner, runHost, unreadableReason } from "./run";
 
 afterEach(() => _setRunner(undefined));
 
 /**
+ * The reap give-up spawnBounded arms when a kill starts: its SIGKILL grace
+ * plus its reap grace. The runner keeps spawnBounded's defaults for both.
+ */
+const REAP_GIVE_UP_MS = SPAWN_DEFAULTS.killGraceMs + SPAWN_DEFAULTS.reapGraceMs;
+
+/**
  * Runs `body` with the command's deadline held: the first timer armed for
  * exactly `ms` milliseconds is never scheduled, and fires once a whole line
  * of the child's stdout has reached the runner (`Bun.spawn` is spied on to
- * see it). Every other timer runs as usual. So the deadline lands after the
- * child printed, on any runner; a real one raced the shell's start, and a
- * shell that took longer to start than the deadline was killed before its
- * first line. The timer's callback runs in a microtask, as it would from the
- * event loop. tool-proc's RunCommand test holds its deadline the same way.
+ * see it). So the deadline lands after the child printed, on any runner; a
+ * real one raced the shell's start, and a shell that took longer to start
+ * than the deadline was killed before its first line. The timer's callback
+ * runs in a microtask, as it would from the event loop. tool-proc's
+ * RunCommand test holds its deadline the same way.
+ *
+ * The reap give-up the deadline's kill arms is held too, and never fires: a
+ * runner that saw the killed shell's exit 3 s late would otherwise report it
+ * left behind rather than timed out. A shell that is never reaped runs into
+ * the test's budget instead. Every other timer runs as usual.
  */
 async function withDeadlineAfterFirstLine<T>(
   ms: number,
   body: () => Promise<T>,
 ): Promise<{ result: T; fired: boolean; problem?: string }> {
   const HELD = Symbol("held deadline") as unknown as ReturnType<typeof setTimeout>;
+  const REAP = Symbol("held reap give-up") as unknown as ReturnType<typeof setTimeout>;
   const deadline: { callback?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
     cleared: false,
     fired: false,
   };
+  // True only while the deadline's callback runs, which is when the kill arms its give-up.
+  let killing = false;
+  let reapHeld = false;
   const realSetTimeout = globalThis.setTimeout;
   const realClearTimeout = globalThis.clearTimeout;
   const realSpawn = Bun.spawn.bind(Bun);
@@ -38,6 +54,10 @@ async function withDeadlineAfterFirstLine<T>(
     delay?: number,
     ...rest: unknown[]
   ) => {
+    if (killing && delay === REAP_GIVE_UP_MS && !reapHeld) {
+      reapHeld = true;
+      return REAP;
+    }
     if (delay !== ms || deadline.callback !== undefined) return realSetTimeout(fn, delay, ...rest);
     deadline.callback = () => fn(...rest);
     return HELD;
@@ -46,7 +66,7 @@ async function withDeadlineAfterFirstLine<T>(
     id?: ReturnType<typeof setTimeout>,
   ) => {
     if (id === HELD) deadline.cleared = true;
-    else realClearTimeout(id);
+    else if (id !== REAP) realClearTimeout(id);
   }) as typeof clearTimeout);
   const fire = (): void => {
     if (deadline.fired) return;
@@ -56,7 +76,14 @@ async function withDeadlineAfterFirstLine<T>(
       deadline.problem = "the deadline was not armed while the child ran";
       return;
     }
-    queueMicrotask(callback);
+    queueMicrotask(() => {
+      killing = true;
+      try {
+        callback();
+      } finally {
+        killing = false;
+      }
+    });
   };
   const spawned = spyOn(Bun, "spawn").mockImplementation(((
     ...args: Parameters<typeof Bun.spawn>
@@ -85,6 +112,9 @@ async function withDeadlineAfterFirstLine<T>(
   }) as typeof Bun.spawn);
   try {
     const result = await body();
+    if (deadline.fired && deadline.problem === undefined && !reapHeld) {
+      deadline.problem = "the deadline's kill armed no reap give-up to hold";
+    }
     return {
       result,
       fired: deadline.fired,
@@ -148,7 +178,9 @@ describe.skipIf(process.platform === "win32")("the real runner", () => {
     // The 1 s deadline fires once the line is out: a real one raced the
     // shell's start, and a runner a second slow to start it lost the line.
     // The shell starts its `sleep` before it prints, so a kill that reached
-    // only the shell leaves the pipe held open at the deadline.
+    // only the shell leaves the pipe held open at the deadline. The kill's
+    // 3 s reap give-up is held, so a runner slow to see the shell exit
+    // cannot turn "did not finish" into "left behind".
     const {
       result: r,
       fired,
