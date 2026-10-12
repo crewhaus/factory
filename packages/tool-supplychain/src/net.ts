@@ -14,7 +14,8 @@
  * origin must be one the OPERATOR allow-listed in `tool_config.fetch`, and it
  * must still survive the SSRF check. A model-supplied URL that only had to
  * pass an IP check would be an exfiltration channel with a response that
- * lands straight back in the context window.
+ * lands straight back in the context window. A redirect is never followed,
+ * for the same reason: neither check ever saw where it points.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -179,6 +180,19 @@ async function readCapped(res: Response, url: string, signal: AbortSignal): Prom
   );
 }
 
+/**
+ * Where a redirect pointed, as an origin only: the rest of a `Location` is
+ * the far end's content, and this ends up in a message a model reads.
+ */
+function redirectTarget(res: Response, url: string): string {
+  try {
+    const target = new URL(res.headers.get("location") ?? "", url);
+    return target.origin === "null" ? `a ${target.protocol} location` : target.origin;
+  } catch {
+    return "a location that is not a URL";
+  }
+}
+
 /** One request, with the timeout and the caller's cancellation both wired in. */
 async function request(
   budget: RequestBudget,
@@ -209,7 +223,18 @@ async function request(
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
+      // Never followed. The endpoint's origin was checked against the
+      // operator's allow-list and the SSRF guard; wherever a redirect points
+      // was not, and the platform's own follow would re-send the lockfile's
+      // coordinates there and report its answer as the audit.
+      redirect: "manual",
     });
+    if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new OsvUnavailableError(
+        `${url} answered HTTP ${res.status} with a redirect to ${redirectTarget(res, url)}; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.`,
+      );
+    }
     return { status: res.status, text: await readCapped(res, url, controller.signal) };
   } catch (err) {
     if (err instanceof OsvUnavailableError) throw err;

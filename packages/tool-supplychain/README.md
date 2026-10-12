@@ -188,7 +188,9 @@ An `endpoint` override exists for a self-hosted OSV mirror and is gated
 that `@crewhaus/tool-fetch` applies to every outbound request. A URL supplied
 by a model that only had to survive an IP check would be an exfiltration
 channel whose response lands straight back in the context window. The
-allow-list is not a bypass for the SSRF check; both gates run.
+allow-list is not a bypass for the SSRF check; both gates run. A redirect is
+never followed, from the mirror or from the public API: neither gate saw where
+it points, so the audit fails with an error naming it instead.
 
 ## Neighbours
 

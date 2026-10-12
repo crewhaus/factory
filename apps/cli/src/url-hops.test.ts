@@ -10,15 +10,20 @@
  * it, so the fix shows up here as a deliberate change, and hold the boundary
  * that does apply at every hop: an origin off the tool's allow-list.
  *
+ * The last is a fix. DependencyAudit (whose mirror is checked against
+ * `tool_config.fetch`) sent its requests with the platform's `fetch`, which
+ * follows a redirect anywhere. It now refuses a redirect and says where it
+ * pointed.
+ *
  * Everything runs through runChatLoop's real gate and the real tools, against
  * loopback servers, and the outcome is read from what each server received.
- * tool-http lifts its loopback refusal with its own test seam. Fetch and
- * WebFetch refuse loopback outright, so for them only the dialler is
+ * tool-http lifts its loopback refusal with its own test seam. Fetch, WebFetch
+ * and DependencyAudit refuse loopback outright, so for them only the dialler is
  * replaced: a name resolves to a documentation address and connects to a
  * loopback port, and the redirect handling being tested is the tool's own.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
@@ -47,6 +52,7 @@ import {
   httpRequest,
   registerHttpConfig,
 } from "@crewhaus/tool-http";
+import { _setFetch as _setOsvFetch, dependencyAudit } from "@crewhaus/tool-supplychain";
 import {
   _resetWebFetchConfig,
   _setRawFetch as _setWebDial,
@@ -441,6 +447,113 @@ describe("Fetch and WebFetch: a redirect hop is bounded by the tool's allow-list
     const listed = await call(webFetch, { url: "http://a.test/to-b" }, rs);
     expect({ result: listed.result, bGot: b.got }).toEqual({
       result: expect.stringContaining('host "b.test" is not in allowed_domains'),
+      bGot: [],
+    });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// FIXED — DependencyAudit never follows a redirect
+// ---------------------------------------------------------------------------
+
+describe("DependencyAudit refuses a redirect from its OSV mirror", () => {
+  const osvRecord = {
+    id: "GHSA-pad",
+    summary: "padding",
+    affected: [
+      {
+        package: { ecosystem: "npm", name: "left-pad" },
+        ranges: [{ type: "SEMVER", events: [{ introduced: "0" }, { fixed: "1.3.1" }] }],
+      },
+    ],
+  };
+  // B is on no list: not the public OSV API, not in tool_config.fetch.
+  const b = server(() => Response.json({ results: [{ vulns: [] }] }));
+  const mirror: { route: (path: string) => Response } = {
+    route: () => new Response(null, { status: 500 }),
+  };
+  const m = server((_req, url) => mirror.route(url.pathname));
+  const answer = (path: string): Response =>
+    path === "/v1/querybatch"
+      ? Response.json({ results: [{ vulns: [{ id: "GHSA-pad" }] }] })
+      : Response.json(osvRecord);
+  const moved = (path: string): Response =>
+    new Response(null, { status: 307, headers: { location: `${b.origin}${path}` } });
+
+  let ws: string;
+  let cwd: string;
+  beforeEach(() => {
+    cwd = process.cwd();
+    ws = realpathSync(mkdtempSync(join(tmpdir(), "url-hops-osv-")));
+    writeFileSync(
+      join(ws, "bun.lock"),
+      JSON.stringify({
+        lockfileVersion: 1,
+        packages: { "left-pad": ["left-pad@1.3.0", "", {}, ""] },
+      }),
+    );
+    process.chdir(ws);
+    registerFetchConfig({ allowed_origins: ["http://mirror.test"] });
+    _setFetchDnsLookup(resolvePublic);
+    // The tool's own request, to the mirror's loopback port, with its init
+    // untouched: whether a redirect is followed is up to that init.
+    _setOsvFetch((url, init) => fetch(url.replace("http://mirror.test", m.origin), init));
+    for (const s of [b, m]) s.got.length = 0;
+  });
+  afterEach(() => {
+    process.chdir(cwd);
+    rmSync(ws, { recursive: true, force: true });
+    _setOsvFetch(undefined);
+    _setFetchDnsLookup(undefined);
+    _resetFetchConfig();
+  });
+  afterAll(() => {
+    for (const s of [b, m]) s.stop();
+  });
+
+  const audit = () =>
+    call(
+      dependencyAudit,
+      { endpoint: "http://mirror.test" },
+      rules(["alwaysAllow", "DependencyAudit"]),
+    );
+
+  test("control: a mirror that answers is audited", async () => {
+    mirror.route = answer;
+    const out = await audit();
+    expect({
+      decision: out.decision,
+      isError: out.isError,
+      matched: out.result.includes('"matchCount":1'),
+    }).toEqual({
+      decision: "allow",
+      isError: false,
+      matched: true,
+    });
+  }, 60_000);
+
+  test("a 307 on the batch query is refused, names where it pointed, and sends nothing there", async () => {
+    mirror.route = moved;
+    const out = await audit();
+    expect({
+      decision: out.decision,
+      isError: out.isError,
+      result: out.result,
+      bGot: b.got,
+    }).toEqual({
+      decision: "allow",
+      isError: true,
+      result: `http://mirror.test/v1/querybatch answered HTTP 307 with a redirect to ${b.origin}; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.`,
+      bGot: [],
+    });
+  }, 60_000);
+
+  test("a 307 on an advisory record is refused the same way, not reported as unserved", async () => {
+    mirror.route = (path) => (path === "/v1/querybatch" ? answer(path) : moved(path));
+    const out = await audit();
+    expect({ isError: out.isError, result: out.result, bGot: b.got }).toEqual({
+      isError: true,
+      result: `http://mirror.test/v1/vulns/GHSA-pad answered HTTP 307 with a redirect to ${b.origin}; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.`,
       bGot: [],
     });
   }, 60_000);
