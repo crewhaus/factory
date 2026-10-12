@@ -552,7 +552,12 @@ export function citedClaims(text: string): CitedClaim[] {
     }
     return undefined;
   };
-  const byStart = new Map<number, { markers: string[]; start: number; end: number }>();
+  // `seen` holds the markers already in `markers`: a sentence can carry
+  // thousands of them, and searching the list for each was quadratic in them.
+  const byStart = new Map<
+    number,
+    { markers: string[]; seen: Set<string>; start: number; end: number }
+  >();
   const order: number[] = [];
 
   for (const m of text.matchAll(CITATION_MARKER)) {
@@ -562,11 +567,15 @@ export function citedClaims(text: string): CitedClaim[] {
     if (sentence === undefined) continue;
     let bucket = byStart.get(sentence.start);
     if (bucket === undefined) {
-      bucket = { markers: [], start: sentence.start, end: sentence.end };
+      bucket = { markers: [], seen: new Set(), start: sentence.start, end: sentence.end };
       byStart.set(sentence.start, bucket);
       order.push(sentence.start);
     }
-    if (!bucket.markers.includes(m[1] as string)) bucket.markers.push(m[1] as string);
+    const marker = m[1] as string;
+    if (!bucket.seen.has(marker)) {
+      bucket.seen.add(marker);
+      bucket.markers.push(marker);
+    }
   }
 
   const claims: CitedClaim[] = [];
