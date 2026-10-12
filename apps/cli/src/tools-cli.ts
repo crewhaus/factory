@@ -1586,6 +1586,7 @@ export type OperativeArgLike = {
   readonly within?: string;
   readonly relocates?: true;
   readonly env?: string;
+  readonly stdin?: string;
   readonly prefix?: true;
   readonly beneath?: string;
   readonly defaultAtRoot?: true;
@@ -1668,6 +1669,11 @@ export function operativeArgWords(arg: OperativeArgLike): string {
   }
   if (arg.env !== undefined) {
     parts.push(`a call that sets ${arg.env} is covered only by an allow on every command (**)`);
+  }
+  if (arg.stdin !== undefined) {
+    parts.push(
+      `a shell handed ${arg.stdin} with no script runs it as a line, and a deny or ask reads each command in it`,
+    );
   }
   if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
   if (arg.beneath === "visible") {

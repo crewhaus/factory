@@ -4032,7 +4032,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
   },
   processStatus: {
     key: "processStatus",
@@ -4356,7 +4358,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
   },
   robotsCheck: {
     key: "robotsCheck",
@@ -4429,7 +4433,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
   },
   runPipeline: {
     key: "runPipeline",
@@ -4440,7 +4446,9 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "steps.argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
   },
   runTests: {
     key: "runTests",

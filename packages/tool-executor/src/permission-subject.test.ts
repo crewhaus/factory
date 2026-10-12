@@ -1795,3 +1795,47 @@ describe("a command word that names a file is read where the kernel finds it", (
     expect(at("restrict", "Sh(nothing-like-it)", line("echo y | sh gen.sh"))).toBe(false);
   });
 });
+
+describe("a command's stdin field: the line a shell given no script runs", () => {
+  const run = buildTool({
+    name: "Run",
+    description: "d",
+    inputSchema: z.object({
+      argv: z.array(z.string()).optional(),
+      stdin: z.string().optional(),
+      steps: z
+        .array(z.object({ argv: z.array(z.string()), stdin: z.string().optional() }))
+        .optional(),
+    }),
+    operativeArgs: [
+      { field: "argv", kind: "command", stdin: "stdin" },
+      { field: "steps.argv", kind: "command", stdin: "stdin" },
+    ],
+    execute: async () => "ok",
+  });
+  const at = (polarity: "allow" | "restrict", pattern: string, input: Record<string, unknown>) =>
+    matchesPattern(compilePattern(pattern), "Run", input, {
+      polarity,
+      operativeValues: operativeValuesFor(run, input) ?? [],
+    });
+
+  test("a deny or ask reads each command of it; an allow reads the argv", () => {
+    const fed = { argv: ["sh"], stdin: "true && rm -f x" };
+    expect(at("restrict", "Run(rm *)", fed)).toBe(true);
+    expect(at("restrict", "Run(rm *)", { argv: ["bash", "-s", "a"], stdin: "rm -f x" })).toBe(true);
+    expect(at("restrict", "Run(rm *)", { argv: ["env", "sh"], stdin: "rm -f x" })).toBe(true);
+    expect(at("allow", "Run(sh)", fed)).toBe(true);
+    // A pipeline step reads its own.
+    const step = { steps: [{ argv: ["sh"], stdin: "rm -f x" }] };
+    expect(at("restrict", "Run(rm *)", step)).toBe(true);
+  });
+
+  test("control: text handed to a script or to a program that is no shell is data", () => {
+    expect(at("restrict", "Run(rm *)", { argv: ["sh", "x.sh"], stdin: "rm -f x" })).toBe(false);
+    expect(at("restrict", "Run(rm *)", { argv: ["sh", "-c", "cat"], stdin: "rm -f x" })).toBe(
+      false,
+    );
+    expect(at("restrict", "Run(rm *)", { argv: ["cat"], stdin: "rm -f x" })).toBe(false);
+    expect(at("restrict", "Run(rm *)", { argv: ["python3"], stdin: "rm -f x" })).toBe(false);
+  });
+});

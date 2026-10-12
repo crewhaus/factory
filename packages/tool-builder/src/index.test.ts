@@ -590,6 +590,63 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     });
   });
 
+  describe("stdin — the text a command's call hands it on standard input", () => {
+    const runSchema = z.object({
+      argv: z.array(z.string()),
+      cwd: z.string().optional(),
+      envSet: z.record(z.string()).optional(),
+      stdin: z.string().max(10).optional(),
+      count: z.number().optional(),
+      steps: z.array(z.object({ argv: z.array(z.string()), input: z.string().optional() })),
+    });
+    const def = { name: "Run", description: "d", inputSchema: runSchema, execute: exec };
+
+    test("a command names a string field at the top, or beside it in its own object", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [
+          { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+          { field: "steps.argv", kind: "command", stdin: "input" },
+        ],
+      });
+      expect(tool.operativeArgs).toEqual([
+        { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+        { field: "steps.argv", kind: "command", stdin: "input" },
+      ]);
+    });
+
+    test("each way a stdin declaration can be wrong is refused, saying why", () => {
+      const bad = (stdin: string, kind: "command" | "text" = "command") => {
+        try {
+          const moves = kind === "command" ? { within: "cwd", env: "envSet" } : {};
+          buildTool({ ...def, operativeArgs: [{ field: "argv", kind, ...moves, stdin }] });
+          return "accepted";
+        } catch (err) {
+          return (err as Error).message;
+        }
+      };
+      expect({
+        text: bad("stdin", "text"),
+        missing: bad("missing"),
+        number: bad("count"),
+        nested: bad("steps.input"),
+        stepOnly: bad("input"),
+        self: bad("argv"),
+        within: bad("cwd"),
+        env: bad("envSet"),
+      }).toEqual({
+        text: expect.stringMatching(/only a "command" reads its input/),
+        missing: expect.stringMatching(/no string field "missing" beside "argv" or at the top/),
+        number: expect.stringMatching(/no string field "count"/),
+        nested: expect.stringMatching(/must name one input field/),
+        stepOnly: expect.stringMatching(/no string field "input" beside "argv"/),
+        self: expect.stringMatching(/names "argv", which is already used/),
+        within: expect.stringMatching(/names "cwd", which is already used/),
+        env: expect.stringMatching(/names "envSet", which is already used/),
+      });
+    });
+  });
+
   test("an opaque schema (an MCP tool's z.unknown()) accepts any field", () => {
     const tool = buildTool({
       name: "Opaque",

@@ -23,6 +23,8 @@ export type RegistryOperativeArg = {
   readonly relocates?: true;
   /** For a `command`: the field holding the environment its call sets. */
   readonly env?: string;
+  /** For a `command`: the field holding the text its call hands it on standard input. */
+  readonly stdin?: string;
   /** The value is a prefix: it stands for every value that starts with it. */
   readonly prefix?: true;
   /** For a `path`: the tool also acts beneath a directory it names (`all` or `visible`). */
@@ -127,6 +129,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.within !== undefined ? { within: arg.within } : {}),
     ...(arg.relocates === true ? { relocates: true as const } : {}),
     ...(arg.env !== undefined ? { env: arg.env } : {}),
+    ...(arg.stdin !== undefined ? { stdin: arg.stdin } : {}),
     ...(arg.prefix === true ? { prefix: true as const } : {}),
     ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
     ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),

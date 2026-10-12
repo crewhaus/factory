@@ -6096,7 +6096,9 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
     categories: ["proc", "code"],
     package: "@crewhaus/tool-proc",
     keywords: ["start a server", "run in the background", "background process"],
@@ -6603,7 +6605,9 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
     categories: ["proc", "code"],
     package: "@crewhaus/tool-proc",
     keywords: ["retry", "try again", "flaky command", "backoff"],
@@ -6711,7 +6715,9 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
     categories: ["proc", "code"],
     package: "@crewhaus/tool-proc",
     keywords: ["run a command", "execute", "run the build", "invoke the binary"],
@@ -6727,7 +6733,9 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd", env: "envSet" }],
+    operativeArgs: [
+      { field: "steps.argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
+    ],
     categories: ["proc", "code"],
     package: "@crewhaus/tool-proc",
     keywords: ["run these in order", "chain commands", "sequence of commands"],

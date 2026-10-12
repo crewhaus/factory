@@ -2859,6 +2859,54 @@ describe("command-dotdot review — a program read where it lands, however the c
     expect(ran()).toBe("scripts/ok.sh");
   }, 120_000);
 
+  test("a shell handed the commands it runs on stdin: a deny reads each of them", async () => {
+    writeFileSync(join(ws, "victim.txt"), "x");
+    const stdin = "rm -f victim.txt\n";
+    const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+    const removes = await decide(
+      [
+        ["RunCommand", { argv: ["sh"], stdin }],
+        ["RunCommand", { argv: ["bash", "-s"], stdin }],
+        ["RunCommand", { argv: ["env", "A=1", "sh", "-"], stdin }],
+        ["Retry", { argv: ["sh"], stdin, ...retry }],
+        ["ProcessStart", { argv: ["sh"], stdin }],
+        ["RunPipeline", { steps: [{ argv: ["true"] }, { argv: ["sh"], stdin }] }],
+      ],
+      denyOnly("rm *"),
+    );
+    expectAll(removes, "deny");
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true);
+    // And where each program it runs lands.
+    const runs = await decide(
+      [
+        ["RunCommand", { argv: ["sh"], stdin: "./secrets/run.sh\n" }],
+        ["RunCommand", { argv: ["sh"], stdin: "link/../run.sh\n" }],
+        ["RunPipeline", { steps: [{ argv: ["sh"], stdin: "cd link && ./d.sh\n" }] }],
+      ],
+      denyOnly("secrets/**"),
+    );
+    expectAll(runs, "deny");
+    // Control: text handed to a script, or to a program that is no shell,
+    // is data; and a line of other commands runs.
+    const data = await decide(
+      [
+        ["RunCommand", { argv: ["sh", "scripts/ok.sh"], stdin }],
+        ["RunCommand", { argv: ["cat"], stdin }],
+      ],
+      denyOnly("rm *"),
+    );
+    expect(data.map((r) => [r.got, r.ran])).toEqual([
+      ["allow", "scripts/ok.sh"],
+      ["allow", ""],
+    ]);
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true);
+    const ok = await decide(
+      [["RunCommand", { argv: ["sh"], stdin: "./scripts/ok.sh\n" }]],
+      denyOnly("secrets/**"),
+    );
+    expectAll(ok, "allow", "scripts/ok.sh");
+  }, 120_000);
+
   describe("a headless grant is bound to where the program lands, however it is spelled", () => {
     const sessionId = "sess_0123456789abcdef";
     // One store per call: an unspent grant for another call of the same
@@ -2912,6 +2960,7 @@ describe("command-dotdot review — a program read where it lands, however the c
       ["Bash", { command: "PATH=tools run.sh" }],
       ["RunCommand", { argv: ["env", "PATH=tools", "run.sh"] }],
       ["Bash", { command: "sh < tools/run.sh" }],
+      ["RunCommand", { argv: ["sh"], stdin: "./tools/run.sh\n" }],
     ];
 
     test("retargeted between park and resume: asked again, and evil/run.sh never runs", async () => {

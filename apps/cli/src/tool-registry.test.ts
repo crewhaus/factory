@@ -1171,12 +1171,14 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "prefix",
         "relocates",
         "shell",
+        "stdin",
         "within",
       ].sort(),
     );
-    // The environment a command's call sets, by name.
+    // The environment a command's call sets, and the text it hands the
+    // command on its input, by name.
     expect(TOOL_FLAGS["runCommand"]?.operativeArgs).toEqual([
-      { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+      { field: "argv", kind: "command", within: "cwd", env: "envSet", stdin: "stdin" },
     ]);
   }, 60_000);
 

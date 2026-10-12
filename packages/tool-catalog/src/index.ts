@@ -300,6 +300,19 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * command tool that lets the call set its child's environment declares it
  * this way; without it, the environment is invisible to every rule.
  *
+ * `stdin`, for a `command` only, names the field holding the text the call
+ * hands its program on standard input (`{ field: "argv", kind: "command",
+ * stdin: "stdin" }`). A shell given no `-c` and no script (`["sh"]`,
+ * `["bash", "-s"]`, after any wrappers) runs that text as its line, so a
+ * deny or ask reads each command in it as it does the line of `["sh",
+ * "-c", text]`: `alwaysDeny RunCommand(rm *)` fires on `["sh"]` handed `rm
+ * -f x`, and `alwaysDeny RunCommand(secrets/**)` on one handed
+ * `./secrets/run.sh`. Text handed to any other program is data, and no rule
+ * reads it. A command inside an array of objects reads its own object's
+ * field of that name when it has one, else the top-level one. A command
+ * tool that hands its program text on its input declares it this way;
+ * without it, a shell's whole line is invisible to every rule.
+ *
  * `prefix: true`, for an `id`, `recipient` or `text` field, says its value
  * is a prefix: the tool acts on every value that starts with it (KvList's
  * `prefix` lists every key that begins with it). It needs `default: "*"` —
@@ -377,6 +390,7 @@ export type OperativeArg = {
   readonly within?: string;
   readonly relocates?: true;
   readonly env?: string;
+  readonly stdin?: string;
   readonly prefix?: true;
   readonly beneath?: "all" | "visible";
   readonly defaultAtRoot?: true;

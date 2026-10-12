@@ -172,6 +172,7 @@ import {
   linesRunBy,
   normalizePathLexically,
   programWords,
+  readsShellOnInput,
   shellProgramWords,
   withShellPwd,
 } from "@crewhaus/tool-permission-matcher";
@@ -312,6 +313,7 @@ export function operativeValuesOf(
       words,
       runsIn,
       env,
+      stdin,
       dir,
       leavesDir,
       unqualified,
@@ -366,7 +368,15 @@ export function operativeValuesOf(
           // when the program it names is a shell, an eval or an env -S.
           const shellLine = arg.shell === true && words === undefined;
           const shell = shellLine ? { shell: true } : {};
-          const shellLines = words !== undefined ? linesRunBy(words) : [];
+          // The lines an argv hands a shell: one it runs with `-c`, and the
+          // text the call puts on the input of a shell given no script.
+          const shellLines =
+            words !== undefined
+              ? [
+                  ...linesRunBy(words),
+                  ...(stdin !== undefined && readsShellOnInput(words) ? [stdin] : []),
+                ]
+              : [];
           const where = { runsIn, readProgramPath: opts.readProgramPath };
           const read = commandSpellings(
             argv,
@@ -983,7 +993,8 @@ const HEX_ID = /(?:^|\/)0[xX][0-9a-fA-F]+$/;
  * `runsIn` the directory a `command` declared `within` one runs in; `dir`
  * the directory a `path` declared `within` one is relative to;
  * `unqualified` the value and its qualifier apart, for any other `within`
- * field; `every` that a left-out field's `*` default stands for every value,
+ * field; `stdin` the text a `command` declared with a `stdin` field is
+ * handed on its input; `every` that a left-out field's `*` default stands for every value,
  * and `anyAfter` the prefixes after which it does for an id, a recipient, a
  * text value or a command run at the root (a path, a URL and a command run
  * elsewhere build their own). `env` is the environment a `command` declared
@@ -994,6 +1005,7 @@ type FieldReading = {
   readonly words?: ReadonlyArray<string>;
   readonly runsIn?: string;
   readonly env?: Readonly<Record<string, string>>;
+  readonly stdin?: string;
   /** The directory a `path` declared `within` one is relative to. */
   readonly dir?: string;
   /**
@@ -1056,7 +1068,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     const env = envMapOf(owner, arg.env) ?? topEnv;
     return env !== undefined ? { env } : {};
   };
-  const placed = (owner: unknown) => ({ ...runsInOf(owner), ...envOf(owner) });
+  // And with its own object's input text, else the top-level one.
+  const topStdin = arg.stdin !== undefined ? qualifierOf(input, arg.stdin) : undefined;
+  const stdinOf = (owner: unknown): { stdin?: string } => {
+    if (arg.kind !== "command" || arg.stdin === undefined) return {};
+    const text = (owner !== input ? qualifierOf(owner, arg.stdin) : undefined) ?? topStdin;
+    return text !== undefined ? { stdin: text } : {};
+  };
+  const placed = (owner: unknown) => ({ ...runsInOf(owner), ...envOf(owner), ...stdinOf(owner) });
   const walk = (value: unknown, i: number, depth: number, owner: unknown): void => {
     if (depth > 64) return;
     if (Array.isArray(value)) {

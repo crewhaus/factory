@@ -423,6 +423,28 @@ function checkOperativeArgs(
       const environment = mapFieldShape(inputSchema, env);
       if (environment !== undefined) fail(`${at}.env: the input schema ${environment}`);
     }
+    const { stdin } = arg;
+    if (stdin !== undefined) {
+      if (kind !== "command") {
+        fail(`${at}.stdin: only a "command" reads its input; a "${kind}" value has none`);
+      }
+      if (typeof stdin !== "string" || !/^[A-Za-z_$][\w$]*$/.test(stdin)) {
+        fail(`${at}.stdin must name one input field, e.g. "stdin"`);
+      }
+      if (stdin === field || stdin === within || stdin === env) {
+        fail(`${at}.stdin names "${stdin}", which is already used`);
+      }
+      // Beside the command (a pipeline step's own `stdin`) or at the top.
+      const beside = [...segments.slice(0, -1), stdin];
+      const holds = [beside, [stdin]].some(
+        (path) => resolveFieldShape(inputSchema, path, 0) === "string",
+      );
+      if (!holds) {
+        fail(
+          `${at}.stdin: the input schema has no string field "${stdin}" beside "${field}" or at the top level`,
+        );
+      }
+    }
     out.push(
       Object.freeze({
         field,
@@ -431,6 +453,7 @@ function checkOperativeArgs(
         ...(within !== undefined ? { within } : {}),
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
+        ...(stdin !== undefined ? { stdin } : {}),
         ...(prefix === true ? { prefix } : {}),
         ...(beneath !== undefined ? { beneath } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
