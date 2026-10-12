@@ -199,6 +199,9 @@ function isIdChar(ch: string): boolean {
 export function namedParameters(sql: string): string[] {
   const { stripped } = scanSql(sql);
   const found: string[] = [];
+  // The names already in `found`: searching the list for each parameter was
+  // quadratic in the distinct names a statement declares.
+  const listed = new Set<string>();
   for (let i = 0; i < stripped.length; i++) {
     const sigil = stripped[i] as string;
     if (sigil !== "$" && sigil !== ":" && sigil !== "@") continue;
@@ -229,7 +232,10 @@ export function namedParameters(sql: string): string[] {
     }
     if (nameChars === 0 || illegal) continue;
     const name = stripped.slice(i, cursor);
-    if (!found.includes(name)) found.push(name);
+    if (!listed.has(name)) {
+      listed.add(name);
+      found.push(name);
+    }
     i = cursor - 1;
   }
   return found;
