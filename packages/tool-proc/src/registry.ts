@@ -36,11 +36,14 @@ export type BgProc = {
   stderrReturned: number;
   status: BgStatus;
   /**
-   * Both pipes have reached their end, so `stdout` and `stderr` hold all the
-   * process will ever print. This can lag `status`: the exit and the pipes'
-   * last bytes reach the parent as separate events, and a process it started
-   * that shares the pipes can keep them open after it is gone.
+   * Each pipe has reached its end, so `stdout` (or `stderr`) holds all the
+   * process will ever print there. This can lag `status`: the exit and a
+   * pipe's last bytes reach the parent as separate events, and a process it
+   * started that shares a pipe can keep it open after it is gone.
    */
+  stdoutEnded: boolean;
+  stderrEnded: boolean;
+  /** Both pipes have reached their end. */
   outputEnded: boolean;
   exitCode: number | null;
   readonly startedAt: number;
@@ -158,6 +161,8 @@ export function startBackground(
     stdoutReturned: 0,
     stderrReturned: 0,
     status: "running",
+    stdoutEnded: false,
+    stderrEnded: false,
     outputEnded: false,
     exitCode: null,
     startedAt: Date.now(),
@@ -167,8 +172,12 @@ export function startBackground(
   procs.set(id, bg);
   // Fire and forget: the tool returns while the process keeps running.
   void Promise.all([
-    pump(spawned.stdout as ReadableStream<Uint8Array>, (t) => append(bg, "stdout", t)),
-    pump(spawned.stderr as ReadableStream<Uint8Array>, (t) => append(bg, "stderr", t)),
+    pump(spawned.stdout as ReadableStream<Uint8Array>, (t) => append(bg, "stdout", t)).then(() => {
+      bg.stdoutEnded = true;
+    }),
+    pump(spawned.stderr as ReadableStream<Uint8Array>, (t) => append(bg, "stderr", t)).then(() => {
+      bg.stderrEnded = true;
+    }),
   ]).then(() => {
     bg.outputEnded = true;
   });
@@ -204,6 +213,39 @@ export function markKilled(bg: BgProc): void {
     bg.status = "killed";
     bg.exitedAt = Date.now();
   }
+}
+
+/** The output a watch reads: one stream, or both. */
+export type WatchedStream = "stdout" | "stderr" | "both";
+
+/**
+ * Whether a process has finished as far as a watch of `stream` goes: the
+ * next look at that output is the last one worth taking.
+ *
+ * An exited process has finished once the watched pipe has ended too. The
+ * exit can reach the parent before the line printed just ahead of it, and a
+ * process it started can still hold the pipe and print. Only the watched
+ * pipe counts: one that holds just the other pipe cannot print on this one.
+ *
+ * A stopped one has finished once its own exit has been seen (`exitCode` is
+ * set then, to a number even for a death by signal), whatever its pipes are
+ * doing. Until then it is still running, whatever ProcessStop asked of it.
+ * ProcessStop signals the process alone, so one it started (a script running
+ * a server without `exec`) can hold the pipes for as long as it runs, and a
+ * wait on them would run to its deadline. The cost is the one 0.7.0 had: a
+ * line a stopped process prints as it goes, such as a SIGTERM handler's last
+ * words, can reach the parent after its exit and be missed. Stopping the
+ * whole process group would let the pipes decide here too.
+ */
+export function watchFinished(
+  bg: Pick<BgProc, "status" | "exitCode" | "stdoutEnded" | "stderrEnded" | "outputEnded">,
+  stream: WatchedStream,
+): boolean {
+  if (bg.status === "running") return false;
+  if (bg.status === "killed") return bg.exitCode !== null;
+  if (stream === "stdout") return bg.stdoutEnded;
+  if (stream === "stderr") return bg.stderrEnded;
+  return bg.outputEnded;
 }
 
 /** Test-only: kill every live process and empty the table, including the id
