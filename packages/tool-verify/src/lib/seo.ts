@@ -736,11 +736,14 @@ const LETTER_OR_NUMBER = /^[\p{L}\p{N}]$/u;
 
 /**
  * `text` without its trailing run of code points that are neither letters
- * nor numbers: what `text.replace(/[^\p{L}\p{N}]+$/u, "")` returned, one
- * code point at a time from the end (a lone surrogate counts as one, as it
- * does under `u`). That pattern tries every start inside such a run that is
- * not at the end and rescans the rest of it from each, so it was quadratic in
- * the run's length, and anchor text is whatever the page holds.
+ * nor numbers: what the specification has `text.replace(/[^\p{L}\p{N}]+$/u,
+ * "")` return, one code point at a time from the end (a lone surrogate counts
+ * as one, as it does under `u`). That pattern tries every start inside such a
+ * run that is not at the end and rescans the rest of it from each, so it was
+ * quadratic in the run's length, and anchor text is whatever the page holds.
+ * JavaScriptCore's `u` matcher also misread a few pairs of ordinary
+ * characters as one code point (see anchor-code-points.test.ts); this reads
+ * them as the specification and V8 do.
  */
 export function withoutTrailingDecoration(text: string): string {
   let end = text.length;
