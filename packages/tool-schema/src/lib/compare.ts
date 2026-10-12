@@ -102,8 +102,20 @@ type Ctx = {
   differences: Difference[];
   truncated: boolean;
   ignored: string[];
+  /** The paths in `ignored`, for the "listed already?" test. */
+  ignoredSeen: Set<string>;
   orderedFallbacks: string[];
 };
+
+/**
+ * Note a path `ignorePaths` matched, once. A set answers "listed already?":
+ * searching the list made a value with many ignored paths quadratic in them.
+ */
+function noteIgnored(ctx: Ctx, path: string): void {
+  if (ctx.ignoredSeen.has(path)) return;
+  ctx.ignoredSeen.add(path);
+  ctx.ignored.push(path);
+}
 
 function record(ctx: Ctx, diff: Difference): void {
   if (ctx.differences.length >= ctx.opts.maxDifferences) {
@@ -127,6 +139,7 @@ function equalUnder(actual: unknown, expected: unknown, ctx: Ctx, path: string):
     differences: [],
     truncated: false,
     ignored: [],
+    ignoredSeen: new Set(),
     orderedFallbacks: [],
   };
   walk(actual, expected, path, probe);
@@ -135,7 +148,7 @@ function equalUnder(actual: unknown, expected: unknown, ctx: Ctx, path: string):
 
 function walk(actual: unknown, expected: unknown, path: string, ctx: Ctx): void {
   if (matchesAnyPattern(path, ctx.patterns)) {
-    if (!ctx.ignored.includes(path)) ctx.ignored.push(path);
+    noteIgnored(ctx, path);
     return;
   }
 
@@ -278,7 +291,7 @@ function compareObjects(
     const childPath = joinPointer(path, key);
     if (!Object.hasOwn(actual, key)) {
       if (matchesAnyPattern(childPath, ctx.patterns)) {
-        if (!ctx.ignored.includes(childPath)) ctx.ignored.push(childPath);
+        noteIgnored(ctx, childPath);
         continue;
       }
       record(ctx, {
@@ -297,7 +310,7 @@ function compareObjects(
     if (Object.hasOwn(expected, key)) continue;
     const childPath = joinPointer(path, key);
     if (matchesAnyPattern(childPath, ctx.patterns)) {
-      if (!ctx.ignored.includes(childPath)) ctx.ignored.push(childPath);
+      noteIgnored(ctx, childPath);
       continue;
     }
     record(ctx, {
@@ -331,6 +344,7 @@ export function compareValues(
     differences: [],
     truncated: false,
     ignored: [],
+    ignoredSeen: new Set(),
     orderedFallbacks: [],
   };
   walk(actual, expected, "", ctx);
