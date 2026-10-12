@@ -1403,17 +1403,15 @@ describe("WaitForOutput", () => {
         'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
       );
       const started = await call(processStart, { argv: [path] });
-      const at = Date.now();
       const out = await call(waitForOutput, {
         id: started.id,
         pattern: "(a|a)*$",
         timeoutMs: 1_000,
       });
+      // Refused up front: the sentence comes only from the screen, before
+      // the first match, and a wait that ran the match ends in a JSON answer.
       expect(typeof out).toBe("string");
       expect(out).toContain("alternation");
-      // Refused up front: it never even reached the deadline, let alone the
-      // match that would have outlived the process.
-      expect(Date.now() - at).toBeLessThan(1_000);
     },
   );
 
@@ -2194,18 +2192,16 @@ describe("dangling-symlink containment in resolveSafe", () => {
     expect(existsSync(target)).toBe(false);
     symlinkSync(target, join(tmp, "dangling.bin"));
 
-    const at = Date.now();
     const out = await call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 });
 
     // The specific refusal matters. Before the fix the path was admitted and
     // the tool polled it to the deadline (returning `satisfied: false`), and
     // the only thing standing between a caller and an outside oracle was the
     // per-poll recheck, whose wording is different ("it NOW resolves
-    // outside…"). This asserts the up-front check did the refusing.
+    // outside…"). This asserts the up-front check did the refusing, so the
+    // path was refused before the first poll, not at the deadline.
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
-    // Refused before the first poll, not at the deadline.
-    expect(Date.now() - at).toBeLessThan(1_000);
     // A read-only tool cannot have created the target, but assert it anyway:
     // this is the assertion that would fail first if a writing tool were ever
     // wired to `resolveSafe`. The planted link is left exactly as it was.
@@ -2294,11 +2290,10 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(join(outside, "realdir"), join(tmp, "dirlink"));
     symlinkSync("../escape.bin", join(outside, "realdir", "l"));
 
-    const at = Date.now();
+    // The up-front check's sentence: refused before the first poll.
     const out = await call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 });
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
-    expect(Date.now() - at).toBeLessThan(1_000);
     expect(existsSync(join(outside, "escape.bin"))).toBe(false);
   });
 

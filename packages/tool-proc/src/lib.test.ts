@@ -4,7 +4,7 @@
  * the package can be proved without a world — no spawning, no filesystem,
  * no clock.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { backoffDelayMs, backoffSchedule, totalBackoffMs } from "./lib/backoff";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv, isValidEnvName } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
@@ -94,9 +94,34 @@ describe("compileSafePattern", () => {
   });
 
   test("the gate is fast enough to be worth having — a refused pattern never runs", () => {
-    const started = Date.now();
-    expect(compileSafePattern("(a|a)*$", "").ok).toBe(false);
-    expect(Date.now() - started).toBeLessThan(100);
+    // The screen reads the pattern and never runs it, so refusing one costs
+    // only the screen's own work, which its work budget bounds (tool-safety's
+    // screen tests count it), not the backtracking it refuses. Every way a
+    // RegExp runs here goes through exec once it is replaced, so the runs are
+    // counted rather than timed. The second pattern is screened nowhere else,
+    // so its verdict is not a cached one.
+    const refused = ["(a|a)*$", "(c|cd)*$"];
+    const ran: string[] = [];
+    const exec = RegExp.prototype.exec;
+    const spy = spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      input: string,
+    ) {
+      ran.push(this.source);
+      return exec.call(this, input);
+    });
+    let outs: Array<ReturnType<typeof compileSafePattern>>;
+    try {
+      outs = refused.map((source) => compileSafePattern(source, ""));
+    } finally {
+      spy.mockRestore();
+    }
+    for (const [i, out] of outs.entries()) {
+      expect({ source: refused[i], ok: out.ok }).toEqual({ source: refused[i], ok: false });
+      // Refused for its shape, not for running out of screen work.
+      if (!out.ok) expect(out.message).toContain("alternation");
+    }
+    expect(ran.filter((source) => refused.includes(source))).toEqual([]);
   });
 
   test("a brace or optional quantifier inside a repeated group is still nesting (C079)", () => {
