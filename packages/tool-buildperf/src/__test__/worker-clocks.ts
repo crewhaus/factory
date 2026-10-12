@@ -6,8 +6,13 @@ const RUN_DEADLINE_MS = 2_000;
 /** Taken before any test runs, so a spy left over from an abandoned test is never called back. */
 const realSetTimeout = globalThis.setTimeout;
 
-/** Puts back what the running {@link withoutWorkerClocks} installed; undefined when nothing is. */
-let installed: (() => void) | undefined;
+/**
+ * What the running {@link withoutWorkerClocks} installed, put back by
+ * `restore`; undefined when nothing is. A const holder, not a module `let`:
+ * apps/cli's boot-seam guard reads an exported function that assigns a
+ * module-level `let` as a boot seam.
+ */
+const installed: { restore: (() => void) | undefined } = { restore: undefined };
 
 /**
  * Put back whatever {@link withoutWorkerClocks} still has installed. Call it
@@ -16,7 +21,7 @@ let installed: (() => void) | undefined;
  * and timers must not stay frozen for the tests after it.
  */
 export function restoreWorkerClocks(): void {
-  installed?.();
+  installed.restore?.();
 }
 
 /**
@@ -53,13 +58,13 @@ export async function withoutWorkerClocks<T>(body: () => Promise<T>): Promise<T>
   // Once only, and only while it is still the installation in place: a body
   // abandoned earlier must not undo a later test's.
   const restore = (): void => {
-    if (installed !== restore) return;
-    installed = undefined;
+    if (installed.restore !== restore) return;
+    installed.restore = undefined;
     timers.mockRestore();
     clock.mockRestore();
     defaults.giveUpMs = giveUpMs;
   };
-  installed = restore;
+  installed.restore = restore;
   try {
     const value = await body();
     if (held === 0) {
