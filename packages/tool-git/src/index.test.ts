@@ -409,7 +409,10 @@ describe("containment of the repository git discovers", () => {
     expect(readFileSync(join(parent, "outside.txt"), "utf8")).toBe("user edit\n");
     expect(git(["stash", "list"], parent).stdout).toBe("");
     expect(git(["branch", "--show-current"], parent).stdout.trim()).toBe("main");
-  });
+    // Slow by construction: about 30 git processes, one after another, take
+    // most of a second here and on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 
   test("a planted .git file naming another repository is refused for reads and writes", async () => {
     const victim = victimRepo("victim");
@@ -748,7 +751,10 @@ describe("containment of the repository git discovers", () => {
     process.chdir(join(sup, "mod"));
     const out = JSON.parse(String(await gitStatus.execute({ cwd: "." })));
     expect(out.clean).toBe(true);
-  });
+    // Slow by construction: about 30 git processes, one after another, take
+    // most of a second here and on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 
   test("control: a worktree GitWorktreeAdd made inside the workspace opens", async () => {
     const added = await call(gitWorktreeAdd, { path: "inner-wt", createBranch: "inner" });
@@ -814,7 +820,10 @@ describe("containment of refs — option injection", () => {
     // The refusals above must have changed nothing.
     expect((await call(gitStatus)).clean).toBe(true);
     expect(existsSync(join(workspace, "wt"))).toBe(false);
-  });
+    // Slow by construction: about 30 git processes, one after another, take
+    // most of a second here and on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 
   test("GitRevParse refuses a ref carrying a newline, which would misalign the batch", async () => {
     const out = await gitRevParse.execute({ cwd: "repo", refs: ["HEAD\nHEAD", "no-such-ref"] });
@@ -862,7 +871,10 @@ describe("refusing a directory that is not a repository", () => {
         refused: true,
       });
     }
-  });
+    // Slow by construction: about 35 git processes, one after another, take
+    // most of a second here and on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
