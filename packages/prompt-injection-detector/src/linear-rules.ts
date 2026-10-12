@@ -281,8 +281,13 @@ export function findUrlCredentialPair(text: string): Found {
       from = start + 1;
       continue;
     }
-    const newline = text.indexOf("\n", urlEnd);
-    const last = Math.min(urlEnd + 80, newline === -1 ? text.length : newline);
+    // The window ends 80 characters on, or at a newline before that. Read to
+    // whichever comes first: a search for the newline with no bound read on
+    // to the end of the text for every URL on a line, quadratic in a line
+    // of short URLs.
+    const limit = Math.min(urlEnd + 80, text.length);
+    let last = urlEnd;
+    while (last < limit && text.charCodeAt(last) !== 0x0a /* \n */) last++;
     for (let at = last; at >= urlEnd; at--) {
       const end = credentialWordEnd(text, at);
       if (end !== -1) return { index: start, end };

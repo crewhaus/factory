@@ -1,10 +1,12 @@
 /**
  * linear-rules.ts scans for the detector patterns the regex engine runs in
  * quadratic time. Each scan must find exactly the match its pattern finds,
- * and classifying a long run must take work linear in it.
+ * and classifying a long run, and each scan's own reads of it, must take work
+ * linear in it.
  */
 import { describe, expect, test } from "bun:test";
 import { regexWorkAsync } from "./__test__/regex-work";
+import { scanWork } from "./__test__/scan-work";
 import { REGEX_RULES, classifyText } from "./index";
 import {
   findBackgroundCommand,
@@ -208,6 +210,26 @@ describe("each scan finds what its pattern finds", () => {
     expect(matched).toBeGreaterThan(1_000);
   }, 30_000);
 
+  test("the window after a URL ends 80 characters on, or at a newline", () => {
+    // "http://a.b" ends at 10, so a word after a space and 78 characters
+    // starts exactly 80 on: the last place the window reaches.
+    const edge: ReadonlyArray<readonly [string, Found]> = [
+      [`http://a.b ${"c".repeat(78)} token`, { index: 0, end: 95 }],
+      [`http://a.b ${"c".repeat(79)} token`, null],
+      [`see http://x.io/p ${"w ".repeat(39)} token`, { index: 4, end: 102 }],
+      [`see http://x.io/p ${"w ".repeat(39)}  token`, null],
+      // `[^\n]` stops only at a newline: a carriage return or a U+2028 ends
+      // the URL (it is whitespace) but not the window.
+      [`http://a.b\r${"c".repeat(70)} token`, { index: 0, end: 87 }],
+      [`http://a.b\u2028${"c".repeat(70)} token`, { index: 0, end: 87 }],
+      [`http://a.b ${"c".repeat(70)}\ntoken`, null],
+    ];
+    for (const [text, want] of edge) {
+      expect({ text, found: byPattern(URL_PAIR, text) }).toEqual({ text, found: want });
+      expect({ text, found: findUrlCredentialPair(text) }).toEqual({ text, found: want });
+    }
+  });
+
   test("the rule table's patterns answer through the scans, as their source would", () => {
     const rules = ["system-role-marker", "iframe-embed", "tool-run-in-background"].map((id) => {
       const rule = REGEX_RULES.find((r) => r.id === id);
@@ -264,5 +286,51 @@ describe("classifying a long run takes linear work", () => {
       expect(counted.steps).toBeLessThanOrEqual(bound);
       expect(counted.value).toBeDefined();
     }, 60_000);
+  }
+});
+
+// Counted, not timed: the step model above counts the patterns the
+// classifier runs, but a scan is no pattern, so it sees none of a scan's own
+// reads. A scan can rescan a run as well as a pattern can (a search that
+// resumes one character on, or one with no bound), so each scan's reads are
+// counted here (__test__/scan-work.ts) over runs shaped to make it rescan.
+// The URL pair reads up to 81 places after each URL, as its pattern does, so
+// a line of short URLs costs it more per character than the others. Before
+// its newline search was bounded by that window, every URL on a line read on
+// to the end of the text.
+describe("each scan reads a long run a bounded number of times", () => {
+  const N = 20_000;
+  const fill = (unit: string): string => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const cases: ReadonlyArray<readonly [string, (text: string) => Found, string, number]> = [
+    ["[INST] with no [/INST]", findRoleMarker, fill("[INST]"), 16],
+    [
+      "<|im_start|> and spaces with no system",
+      findRoleMarker,
+      fill(`<|im_start|>${" ".repeat(20)}`),
+      16,
+    ],
+    ["nohup with no command", findBackgroundCommand, fill("nohup "), 32],
+    ["nohup on every line", findBackgroundCommand, fill("nohup\n"), 32],
+    ["a line of nohup and then a newline", findBackgroundCommand, `${fill("nohup ")}\nx`, 32],
+    ["<iframe with no >", findScriptIframe, fill("<iframe "), 16],
+    ["<iframe and a run of spaces", findScriptIframe, `<iframe ${" ".repeat(N)}`, 16],
+    ["<iframe holding a run of src", findScriptIframe, `<iframe ${fill('src="x" ')}>`, 32],
+    ["<iframe after <iframe before one >", findScriptIframe, `${fill("<iframe ")}>`, 16],
+    ["one URL made of http://", findUrlCredentialPair, fill("http://"), 32],
+    ["a line of short URLs", findUrlCredentialPair, fill("http://a "), 128],
+    ["a line of short URLs in parentheses", findUrlCredentialPair, fill("http://a)"), 128],
+    ["http with no ://", findUrlCredentialPair, fill("http"), 32],
+    ["schemes with no URL", findUrlCredentialPair, fill("http:// "), 32],
+  ];
+  for (const [label, scan, text, perCharacter] of cases) {
+    test(label, () => {
+      const most = perCharacter * text.length;
+      const { value, work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+      expect(value).toBeNull();
+    });
   }
 });
