@@ -1106,8 +1106,13 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     const retry = reaperCalls().find((c) => c.argv[6] === "5");
     expect(retry?.argv.slice(4)).toEqual(["docker", name, "5", "30"]);
     expect(retry?.options["detached"]).toBe(true);
+    // The log is read before the records: the daemon renames the record into
+    // place and only then logs "committed", so once the log says committed,
+    // no record means it was removed. Read the other way round, a commit
+    // landing between the two reads looked like "committed and removed" while
+    // the record was still there.
     await waitUntil(
-      () => records().length === 0 && log().includes(`committed ${name}`),
+      () => log().includes(`committed ${name}`) && records().length === 0,
       began,
       35_000,
     );
