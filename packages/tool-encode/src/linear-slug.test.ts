@@ -237,6 +237,80 @@ describe("the replacements give what the 0.7.0 loop gave", () => {
     expect(emptyKey).toBeGreaterThan(1_000);
   }, 60_000);
 
+  test("keys that overlap themselves, where the search must fall back inside the key", () => {
+    // "aab" in "aaab": after "aa" the next "a" does not finish the key, and a
+    // search that starts the key over from there never sees the match that
+    // began one unit earlier. Two letters make keys like that common.
+    const fixed: Array<[string, string]> = [
+      ["aaab", "aab"],
+      ["aaaab", "aaab"],
+      ["abababb", "ababb"],
+      ["aabaabaaab", "aabaaab"],
+      ["abaababaab", "abaab"],
+      ["babbabbab", "babbab"],
+      // The key's own borders need the fallback too: "aabaaa" falls back to
+      // "aa", not to "a".
+      ["aabaaabaaaa", "aabaaaa"],
+    ];
+    for (const [text, key] of fixed) {
+      expect(applyReplacements(text, { [key]: "X" }, 100)).toBe(
+        referenceReplacements(text, { [key]: "X" }),
+      );
+    }
+    expect(applyReplacements("aaab", { aab: "X" }, 100)).toBe("a X ");
+
+    // A search that starts the key over after a mismatch, which is what a
+    // broken fallback does: the cases below must be ones it gets wrong.
+    const restarting = (text: string, key: string, value: string): string => {
+      let out = "";
+      let copied = 0;
+      let k = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (k > 0 && key[k] !== text[i]) k = 0;
+        if (key[k] === text[i]) k += 1;
+        if (k === key.length) {
+          out += text.slice(copied, i + 1 - key.length) + value;
+          copied = i + 1;
+          k = 0;
+        }
+      }
+      return out + text.slice(copied);
+    };
+    const random = generator(79);
+    const word = (max: number): string => {
+      let out = "";
+      for (let i = 0, n = Math.floor(random() * (max + 1)); i < n; i++) {
+        out += random() < 0.6 ? "a" : "b";
+      }
+      return out;
+    };
+    let mismatches = 0;
+    let fallbacks = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const text = word(16);
+      const replacements: Record<string, string> = {};
+      for (let j = 0, n = 1 + Math.floor(random() * 3); j < n; j++) {
+        // Mostly a piece of the text itself, so the key is there to be found.
+        const from = Math.floor(random() * text.length);
+        const key =
+          random() < 0.7 ? text.slice(from, from + 2 + Math.floor(random() * 5)) : word(6);
+        if (key !== "") replacements[key] = random() < 0.3 ? word(3) : "X";
+      }
+      const expected = referenceReplacements(text, replacements);
+      if (applyReplacements(text, replacements, 2_000_000) !== expected) mismatches += 1;
+      const [first] = Object.keys(replacements).sort((a, b) => b.length - a.length);
+      if (
+        first !== undefined &&
+        restarting(text, first, ` ${replacements[first]} `) !==
+          referenceReplacements(text, { [first]: replacements[first] as string })
+      ) {
+        fallbacks += 1;
+      }
+    }
+    expect(mismatches).toBe(0);
+    expect(fallbacks).toBeGreaterThan(1_000);
+  }, 60_000);
+
   test("the slug is the rest of the pipeline over the replaced text, as before", () => {
     const random = generator(78);
     const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
@@ -299,6 +373,9 @@ describe("the text may grow to the limit, and not one character past it", () => 
       ["a.a.", { a: "x".repeat(47) }, 100],
       // The empty key goes before every unit and at the end; of "" that is once.
       ["", { "": "x".repeat(98) }, 100],
+      // Text after the last match: one past the limit is reached only once
+      // that tail is counted, after the match itself fit.
+      ["xxaxx", { a: "v".repeat(94) }, 100],
     ];
     for (const [text, replacements, length] of cases) {
       const at = applyReplacements(text, replacements, limit);
