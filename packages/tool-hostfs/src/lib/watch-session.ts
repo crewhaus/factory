@@ -257,7 +257,7 @@ export function snapshotTree(
         return { entries, truncated };
       }
       const childRelative = relative === "" ? entry.name : `${relative}/${entry.name}`;
-      const childAbs = path.join(rootAbs, ...childRelative.split("/"));
+      const childAbs = path.join(rootAbs, childRelative);
       const childFacts = probePath(childAbs);
       entries.set(
         childRelative,
@@ -455,9 +455,7 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
       if (reconciledDirs.has(relativeDir)) return;
       reconciledDirs.add(relativeDir);
       const absoluteDir =
-        relativeDir === ""
-          ? options.rootAbs
-          : path.join(options.rootAbs, ...relativeDir.split("/"));
+        relativeDir === "" ? options.rootAbs : path.join(options.rootAbs, relativeDir);
       let entries: Dirent[];
       try {
         entries = readdirSync(absoluteDir, { withFileTypes: true });

@@ -344,7 +344,7 @@ export function copyTreeSafe(
   const consider = (rel: string, srcReal: string, stats: Stats): SafeFsFailure | undefined => {
     const kind = fileKind(stats);
     const srcPath = joinRel(srcRel, rel);
-    const destReal = rel === "" ? dstTop : path.join(dstTop, ...rel.split("/"));
+    const destReal = rel === "" ? dstTop : path.join(dstTop, rel);
     const destPath = joinRel(dstRel, rel);
     const base = { rel, srcReal, srcPath, stats, destReal, destPath, replaces: false };
     if (kind === "symlink") {

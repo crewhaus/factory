@@ -802,7 +802,7 @@ export const storeMigrate: RegisteredTool = buildTool({
     const files: MigrationReceiptFile[] = [];
     const mismatched: Array<{ rel: string; problem: string; detail: string }> = [];
     for (const rel of appliedPaths) {
-      const abs = path.join(dest.value.real, ...rel.split("/"));
+      const abs = path.join(dest.value.real, rel);
       const digest = hashFile(abs);
       if (!digest.ok) {
         mismatched.push({ rel, problem: "missing", detail: digest.reason });
@@ -1339,7 +1339,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
         ? plan.memories.filter((m) => !landedHashes.has(m.contentHash)).map((m) => m.contentHash)
         : [];
       const fragmentsMissing = plan.fragments.filter(
-        (f) => !existsSync(path.join(shared.value.real, ...sharedFragmentRelPath(f).split("/"))),
+        (f) => !existsSync(path.join(shared.value.real, sharedFragmentRelPath(f))),
       );
       return json({
         ...common,
@@ -1454,7 +1454,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
     // check reported as a total one.
     const fragmentsMissing = plan.fragments
       .map((f) => pulledFragmentRelPath(f))
-      .filter((rel) => !existsSync(path.join(harnessDir.value.real, ...rel.split("/"))));
+      .filter((rel) => !existsSync(path.join(harnessDir.value.real, rel)));
     return json({
       ...common,
       status: "applied",

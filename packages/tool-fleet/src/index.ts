@@ -1630,7 +1630,7 @@ export const hooksManage: RegisteredTool = buildTool({
     const tmpRel = `${rel}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
     const escapes = containWritePaths(tool, safe.value, [rel, tmpRel]);
     if (escapes !== undefined) return refusal(tool, escapes.code, escapes.reason, base);
-    const tmpAbs = path.join(harness, ...tmpRel.split("/"));
+    const tmpAbs = path.join(harness, tmpRel);
 
     const doc = probe.doc ?? {};
     const manager = managerBlock(doc);

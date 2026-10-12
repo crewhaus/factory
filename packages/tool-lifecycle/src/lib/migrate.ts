@@ -221,7 +221,7 @@ export function inspectDestination(
         // DANGLING one as absent — so a link left at a destination path read
         // as "nothing here", `overwrite` was never asked for, and the copy
         // went through the link to whatever it pointed at.
-        lstatSync(path.join(destAbs, ...rel.split("/")));
+        lstatSync(path.join(destAbs, rel));
         conflicts.push(rel);
       } catch (err) {
         // ENOENT is the normal case: nothing is there. Anything else means

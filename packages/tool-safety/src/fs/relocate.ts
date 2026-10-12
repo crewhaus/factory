@@ -213,7 +213,7 @@ export function checkRelocatedLinks(
     } catch (err) {
       return fromErrno(join(srcRel, rel), err, "read");
     }
-    const placed = rel === "" ? dstTop : path.join(dstTop, ...rel.split("/"));
+    const placed = rel === "" ? dstTop : path.join(dstTop, rel);
     let target: string;
     try {
       target = physicalFrom(path.dirname(placed), text, { overlay });

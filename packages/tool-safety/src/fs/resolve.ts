@@ -199,8 +199,8 @@ function walk(start: string, initial: string[], overlay: Overlay | undefined): s
     }
     for (let i = parts.length - 1; i >= 0; i--) pending.push(parts[i] as string);
   }
-  // One string, not one argument per component: Bun's `path.join` drops
-  // arguments past 65,535 without a word.
+  // One string, not one argument per component: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments, without a word.
   return tail.length > 0 ? pathOps.join(cur, tail.join(path.sep)) : cur;
 }
 
