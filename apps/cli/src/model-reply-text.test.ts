@@ -13,12 +13,13 @@ import type { OptimizerState } from "@crewhaus/prompt-optimizer";
 import { scanWork } from "./__test__/scan-work";
 import { extractReqMappingLines } from "./init-conversation";
 import { createMetaHarnessProposer } from "./meta-harness-mutator";
-import { firstObjectSpan, mapsARequirement } from "./model-reply-text";
+import { firstObjectSpan, mapsARequirement, withoutClosingMarks } from "./model-reply-text";
 import { parseRedteamVariants } from "./redteam";
-import { parseModelSampleInputs } from "./scaffold-evals";
+import { parseModelSampleInputs, taskPhrasesFromInstructions } from "./scaffold-evals";
 
 const OBJECT = /\{[\s\S]*\}/;
 const MAPPING = /REQ-\d+.*(?:→|->)/;
+const CLOSING = /[.!?]+$/;
 
 /** Every concatenation of up to `depth` of `pieces`, `visit`ed; returns how many. */
 function everyText(pieces: readonly string[], depth: number, visit: (t: string) => void): number {
@@ -154,6 +155,15 @@ describe("each helper answers what its pattern answered", () => {
     expect(differ).toEqual([]);
     expect(checked).toBe((11 ** 6 - 1) / 10);
   }, 20_000);
+
+  test("withoutClosingMarks", () => {
+    const differ: string[] = [];
+    const checked = everyText([".", "!", "?", "a", " ", "\n", "é"], 6, (t) => {
+      if (withoutClosingMarks(t) !== t.replace(CLOSING, "")) differ.push(t);
+    });
+    expect(differ).toEqual([]);
+    expect(checked).toBe((7 ** 7 - 1) / 6);
+  }, 20_000);
 });
 
 // Counted, not timed: a pattern run over the reply is refused and recorded.
@@ -188,6 +198,41 @@ describe("a reply holding a long run", () => {
       bundleSource: "BASE PROMPT",
       rationale: "proposer returned no JSON object",
     });
+  });
+
+  test("instructions with a long run of ! before a word are read without the closing-mark pattern", () => {
+    const run = "!".repeat(10_000);
+    const realExec = RegExp.prototype.exec;
+    const ran: string[] = [];
+    // The closing-mark pattern is refused over the run; the phrase reader's
+    // other patterns need no suffix after a run, and run as usual.
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      if (this.source === CLOSING.source && typeof input === "string" && input.includes(run)) {
+        ran.push(`/${this.source}/`);
+        throw new Error(`/${this.source}/ ran over the run`);
+      }
+      return realExec.call(this, input);
+    };
+    let phrases: string[] | Error;
+    let control: string | Error;
+    try {
+      // Control: the hook sees the pattern String#replace runs.
+      try {
+        control = `x${run}y`.replace(CLOSING, "");
+      } catch (err) {
+        control = err as Error;
+      }
+      try {
+        phrases = taskPhrasesFromInstructions(`Ship the release${"!".repeat(200_000)}now please`);
+      } catch (err) {
+        phrases = err as Error;
+      }
+    } finally {
+      RegExp.prototype.exec = realExec;
+    }
+    expect(control).toBeInstanceOf(Error);
+    expect(ran).toEqual([`/${CLOSING.source}/`]);
+    expect(phrases).toEqual([`Ship the release${"!".repeat(200_000)}now please`]);
   });
 
   test("a line of requirement ids, or one id with a long number, is read without a pattern", async () => {
@@ -228,6 +273,7 @@ describe("each helper reads a long run a bounded number of times", () => {
     ["the same line, then a line break", mapsARequirement, `${fill("REQ-1 ")}\u2028x`],
     ["requirement ids each on a line of its own", mapsARequirement, fill("REQ-1\u2028")],
     ["a run of REQ- with no digit", mapsARequirement, fill("REQ-")],
+    ["a word and a run of closing marks", withoutClosingMarks, `x${"!".repeat(N)}`],
   ];
   for (const [label, scan, text] of cases) {
     test(label, () => {

@@ -44,7 +44,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import { parseSpec } from "@crewhaus/spec";
 import { registeredToolName } from "@crewhaus/tool-categories";
 import { type GradersConfigObject, synthesizeGraders } from "./feedback";
-import { firstObjectSpan } from "./model-reply-text";
+import { firstObjectSpan, withoutClosingMarks } from "./model-reply-text";
 
 /** Thrown on a spec this scaffold cannot derive eval assets from (and on
  *  invalid flag values). The CLI entry file routes it through `die()`;
@@ -190,7 +190,9 @@ export function taskPhrasesFromInstructions(instructions: string): string[] {
       s = s.replace(/^always\s+/i, "");
       s = s.replace(MODAL_PREFIX, "");
       s = s.replace(/^you\s+/i, "");
-      s = s.replace(/[.!?]+$/, "").trim();
+      // A scan, not /[.!?]+$/: the instructions are model-writable (an
+      // optimizer write-back), and the pattern was quadratic in a run of marks.
+      s = withoutClosingMarks(s).trim();
       if (s.split(" ").length < 3 || s.length < 12) continue;
       const key = s.toLowerCase();
       if (seen.has(key)) continue;
