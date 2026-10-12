@@ -1683,12 +1683,21 @@ export const dependencyList: RegisteredTool = buildTool({
         (ecosystems === undefined || ecosystems.has(d.ecosystem)),
     );
     const locks = input.includeLocked === true ? readLocks(dir.value) : undefined;
+    // Versions per name, first seen first. The set answers "seen already?":
+    // a lockfile can lock one name at thousands of versions, and searching
+    // the list for each was quadratic in them.
     const lockIndex = new Map<string, string[]>();
+    const lockSeen = new Map<string, Set<string>>();
     for (const source of locks?.sources ?? []) {
       for (const entry of source.locked) {
         const versions = lockIndex.get(entry.name) ?? [];
-        if (!versions.includes(entry.version)) versions.push(entry.version);
+        const seen = lockSeen.get(entry.name) ?? new Set<string>();
+        if (!seen.has(entry.version)) {
+          seen.add(entry.version);
+          versions.push(entry.version);
+        }
         lockIndex.set(entry.name, versions);
+        lockSeen.set(entry.name, seen);
       }
     }
     const capped = capList(filtered, input.maxResults ?? 1_000);

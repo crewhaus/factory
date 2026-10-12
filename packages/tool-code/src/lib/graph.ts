@@ -193,11 +193,22 @@ export function buildImportGraph(input: readonly FileImports[]): ImportGraph {
     }
   }
 
+  // Each file's distinct targets. The sets answer "listed already?": one file
+  // can import thousands of others, and searching its list for each import
+  // was quadratic in them.
   const adjacency = new Map<string, string[]>();
-  for (const file of files) adjacency.set(file, []);
+  const listed = new Map<string, Set<string>>();
+  for (const file of files) {
+    adjacency.set(file, []);
+    listed.set(file, new Set());
+  }
   for (const edge of edges) {
     const list = adjacency.get(edge.from);
-    if (list !== undefined && !list.includes(edge.to)) list.push(edge.to);
+    const seen = listed.get(edge.from);
+    if (list !== undefined && seen !== undefined && !seen.has(edge.to)) {
+      seen.add(edge.to);
+      list.push(edge.to);
+    }
   }
   for (const [, list] of adjacency) list.sort();
 

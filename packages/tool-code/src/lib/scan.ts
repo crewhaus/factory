@@ -842,9 +842,15 @@ export function scanExports(src: string): ExportRecord[] {
       from: src.slice(specStart, specStart + spec.length),
     });
   }
+  // One default per line. The lines already holding one are kept in a set:
+  // checking each match against every export so far was quadratic in a file
+  // of `export default` lines.
+  const defaultLines = new Set<number>();
+  for (const e of out) if (e.kind === "default") defaultLines.add(e.line);
   for (const m of code.matchAll(/\bexport\s+default\s+(?![\s{])/g)) {
     const line = lineAt(starts, m.index as number);
-    if (out.some((e) => e.line === line && e.kind === "default")) continue;
+    if (defaultLines.has(line)) continue;
+    defaultLines.add(line);
     out.push({ name: "default", line, kind: "default" });
   }
 
