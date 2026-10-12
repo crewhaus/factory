@@ -11,6 +11,9 @@
  * this file is pure: same text in, same records out.
  */
 
+import { blanksAt, restAfterBlanks } from "./blank-tail";
+import { isRegExpSpace } from "./regexp-space";
+
 export type TestFailure = {
   /** Full test name, including the describe path where the runner gives one. */
   readonly name: string;
@@ -40,11 +43,9 @@ export const MAX_MESSAGE_CHARS = 1_000;
 /**
  * How much of a single stack frame is kept.
  *
- * `locationFromFrame` searches a frame for `file:line:col` with an unanchored
- * pattern, which costs the square of the frame's length when there is nothing
- * to find — and `TestFailureSummary` will accept eight megabytes of stored
- * output on one line if a caller hands it that. Capping the frame bounds the
- * search; nothing a real runner prints comes close to this.
+ * `TestFailureSummary` will accept eight megabytes of stored output on one
+ * line if a caller hands it that; nothing a real runner prints comes close to
+ * this.
  */
 export const MAX_FRAME_CHARS = 2_000;
 
@@ -92,11 +93,50 @@ export function splitMessageAndStack(
   return { message: cap(message.join(" ").trim()), stack };
 }
 
-/** `file:line:col` out of a stack frame or a panic line. */
+const isDigit = (c: number): boolean => c >= 0x30 && c <= 0x39;
+/** A code unit `[^\s()]` matches. */
+const isFrameUnit = (c: number): boolean => c !== 0x28 && c !== 0x29 && !isRegExpSpace(c);
+
+/**
+ * `file:line:col` out of a stack frame or a panic line: what
+ * `/([^\s()]+):(\d+):(\d+)/` found. Its first match starts a run of
+ * characters other than blanks and parentheses, and the file is the longest
+ * part of that run followed by `:digits:digit`; a run with none is passed
+ * over whole. As a search, the pattern tried every start in such a run and
+ * reread the rest of it from each, quadratic in the run: MAX_FRAME_CHARS
+ * capped one frame, but a log of thousands of failures, each with a frame
+ * like that, took tens of seconds.
+ */
 export function locationFromFrame(frame: string): { file: string; line: number } | undefined {
-  const m = /([^\s()]+):(\d+):(\d+)/.exec(frame);
-  if (m === null) return undefined;
-  return { file: toPosix(m[1] as string), line: Number(m[2]) };
+  let i = 0;
+  while (i < frame.length) {
+    if (!isFrameUnit(frame.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    const start = i;
+    let end = i;
+    while (end < frame.length && isFrameUnit(frame.charCodeAt(end))) end++;
+    let colon = -1;
+    let lineEnd = -1;
+    for (let j = start + 1; j < end; j++) {
+      if (frame.charCodeAt(j) !== 0x3a) continue;
+      let d = j + 1;
+      while (d < end && isDigit(frame.charCodeAt(d))) d++;
+      if (d > j + 1 && frame.charCodeAt(d) === 0x3a && isDigit(frame.charCodeAt(d + 1))) {
+        colon = j;
+        lineEnd = d;
+      }
+    }
+    if (colon !== -1) {
+      return {
+        file: toPosix(frame.slice(start, colon)),
+        line: Number(frame.slice(colon + 1, lineEnd)),
+      };
+    }
+    i = end;
+  }
+  return undefined;
 }
 
 /**
@@ -387,18 +427,15 @@ export function parsePytest(text: string): TestOutcome {
 
   for (const raw of lines) {
     const line = stripAnsi(raw).trim();
-    const m =
-      /^(?<kind>FAILED|ERROR)\s+(?<path>[^\s:]+)(?:::(?<rest>\S+))?(?:\s+-\s+(?<msg>.*))?$/.exec(
-        line,
-      );
+    const m = pytestFailedLine(line);
     if (m === null) continue;
     sawAny = true;
-    const filePath = toPosix(m.groups?.["path"] as string);
-    const rest = m.groups?.["rest"] ?? "";
+    const filePath = toPosix(m.path);
+    const rest = m.rest ?? "";
     const testName = rest === "" ? filePath : `${filePath}::${rest}`;
     const bare = rest.split("::").pop() ?? rest;
     const located = locations.get(bare);
-    const message = (m.groups?.["msg"] ?? located?.detail ?? "").trim();
+    const message = (m.msg ?? located?.detail ?? "").trim();
     failures.push({
       name: testName,
       file: located?.file ?? filePath,
@@ -431,6 +468,36 @@ export function parsePytest(text: string): TestOutcome {
     failures,
     parsed: sawAny,
   };
+}
+
+/** A `-rf` summary line up to the test id; each part is fixed by the one before. */
+const PYTEST_FAILED_HEAD = /^(?<kind>FAILED|ERROR)\s+(?<path>[^\s:]+)(?:::(?<rest>\S+))?/;
+
+/**
+ * The groups `/^(?<kind>FAILED|ERROR)\s+(?<path>[^\s:]+)(?:::(?<rest>\S+))?(?:\s+-\s+(?<msg>.*))?$/`
+ * captured from `line`, or null where it found no match. When a line break
+ * stood inside the message, that pattern gave the blanks after ` - ` back
+ * one at a time and read the rest again after each: quadratic in the run,
+ * on output a caller hands `TestFailureSummary` (up to eight megabytes).
+ */
+export function pytestFailedLine(
+  line: string,
+): { kind: string; path: string; rest?: string; msg?: string } | null {
+  const head = PYTEST_FAILED_HEAD.exec(line);
+  if (head === null) return null;
+  const g = head.groups as Record<string, string | undefined>;
+  const id = {
+    kind: g["kind"] as string,
+    path: g["path"] as string,
+    ...(g["rest"] === undefined ? {} : { rest: g["rest"] }),
+  };
+  const end = head[0].length;
+  const dash = end + blanksAt(line, end);
+  if (dash > end && line.charCodeAt(dash) === 0x2d) {
+    const at = restAfterBlanks(line, dash + 1, 1, 0);
+    if (at !== -1) return { ...id, msg: line.slice(at) };
+  }
+  return end === line.length ? id : null;
 }
 
 /** The words a pytest summary line counts, in the order 0.7.0's pattern tried them. */

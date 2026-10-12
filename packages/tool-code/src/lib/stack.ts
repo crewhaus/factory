@@ -9,6 +9,8 @@
  * Pure: text in, records out, no filesystem and no clock.
  */
 
+import { blanksAt, restAfterBlanks } from "./blank-tail";
+
 export type FrameKind = "project" | "dependency" | "runtime" | "unknown";
 
 export type StackFrame = {
@@ -122,7 +124,32 @@ function splitNamedFrame(line: string): { fn: string; loc: string } | undefined 
   }
   return undefined;
 }
-const PYTHON = /^File\s+"(?<file>[^"]+)",\s+line\s+(?<line>\d+)(?:,\s+in\s+(?<fn>.+))?$/;
+/** A CPython frame up to its line number; each part is fixed by the one before. */
+const PYTHON_HEAD = /^File\s+"(?<file>[^"]+)",\s+line\s+(?<line>\d+)/;
+
+/**
+ * The groups `/^File\s+"(?<file>[^"]+)",\s+line\s+(?<line>\d+)(?:,\s+in\s+(?<fn>.+))?$/`
+ * captured from `line`, or null where it found no match. When a line break
+ * stood inside the function name, that pattern gave the blanks after `in`
+ * back one at a time and read the rest of the line again after each:
+ * quadratic in the run, and MAX_LINE_CHARS caps a line but not how many
+ * there are, so a 2 MB trace of such lines took seconds.
+ */
+export function pythonFrame(line: string): { file: string; line: string; fn?: string } | null {
+  const head = PYTHON_HEAD.exec(line);
+  if (head === null) return null;
+  const file = head.groups?.["file"] as string;
+  const lineNo = head.groups?.["line"] as string;
+  const end = head[0].length;
+  if (line.charCodeAt(end) === 0x2c) {
+    const word = end + 1 + blanksAt(line, end + 1);
+    if (word > end + 1 && line.startsWith("in", word)) {
+      const at = restAfterBlanks(line, word + 2, 1, 1);
+      if (at !== -1) return { file, line: lineNo, fn: line.slice(at) };
+    }
+  }
+  return end === line.length ? { file, line: lineNo } : null;
+}
 
 function splitLocation(loc: string): { file: string; line?: number; column?: number } {
   const m = /^(?<file>.*?):(?<line>\d+):(?<col>\d+)$/.exec(loc.trim());
@@ -160,14 +187,14 @@ export function parseStackTrace(text: string, root?: string, maxFrames = 100): P
     if (line === "") continue;
     if (frames.length >= maxFrames) break;
 
-    const python = PYTHON.exec(line);
+    const python = pythonFrame(line);
     if (python !== null) {
-      const file = cleanPath(python.groups?.["file"] as string);
-      const fn = python.groups?.["fn"];
+      const file = cleanPath(python.file);
+      const fn = python.fn;
       frames.push({
         ...(fn === undefined ? {} : { function: fn.trim() }),
         file,
-        line: Number(python.groups?.["line"]),
+        line: Number(python.line),
         kind: classifyFrame(file, root),
         raw: line,
       });

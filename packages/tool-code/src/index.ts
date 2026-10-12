@@ -72,6 +72,7 @@ import {
   parseGenericDiagnostics,
   parseRuffJson,
   parseTsc,
+  prettierWarnPath,
   sortDiagnostics,
 } from "./lib/diagnostics";
 import { buildImportGraph, stronglyConnected, unreferencedFiles } from "./lib/graph";
@@ -908,9 +909,9 @@ function unformattedFiles(tool: string, run: RunResult, root: string): string[] 
     if (tool === "prettier") {
       // `[warn] path` per file, then a `[warn] Code style issues…` summary
       // line that names no file and must not be read as one.
-      const m = /^\[warn\]\s+(.*)$/.exec(line);
-      if (m !== null && !/^Code style issues/.test(m[1] as string)) {
-        out.add(m[1] as string);
+      const path = prettierWarnPath(line);
+      if (path !== undefined && !/^Code style issues/.test(path)) {
+        out.add(path);
         continue;
       }
     }
