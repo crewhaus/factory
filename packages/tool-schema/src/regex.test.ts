@@ -9,13 +9,14 @@
  * `notMatches` passed a value it should have stopped and `not: {pattern}`
  * called a forbidden value valid (C073, C089).
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { assert, jsonSchemaValidate, validateRecords } from "./index";
 import { runChecks } from "./lib/assert";
 import { checkSchemaShape, validateValue } from "./lib/jsonschema";
 import {
   RegexAnswers,
   SYNC_PATTERN_MAX_INPUT_CHARS,
+  _setRegexAnswersSessionForTest,
   testPatternSync,
   withRegexAnswers,
 } from "./lib/regex-answers";
@@ -25,35 +26,97 @@ type Tool = {
   execute: (input: never, ctx?: unknown) => Promise<unknown>;
 };
 
-// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
-async function call(tool: Tool, input: unknown): Promise<any> {
-  const out = await tool.execute(tool.inputSchema.parse(input) as never, {});
-  return JSON.parse(out as string);
-}
-
-/** How many times a 5 ms timer fired while `body` ran: 0 means the thread was held. */
-async function ticksDuring<T>(body: () => Promise<T>): Promise<{ result: T; ticks: number }> {
-  let ticks = 0;
-  const timer = setInterval(() => {
-    ticks += 1;
-  }, 5);
-  try {
-    const result = await body();
-    return { result, ticks };
-  } finally {
-    clearInterval(timer);
-  }
-}
+type RegexSession = ReturnType<NonNullable<Parameters<typeof _setRegexAnswersSessionForTest>[0]>>;
+type Asked = { readonly op: string; readonly pattern?: string; readonly inputs?: unknown };
 
 /**
- * ~0.3 s of backtracking locally, polynomial, so the screen lets it through.
- * A no-match that slow is indistinguishable from JavaScriptCore giving up
- * (tool-safety reads one past 100 ms as a give-up), so its answer is
- * undetermined, which is what a gate must see instead of "no match".
+ * Polynomial, so the screen lets it through, and about 0.3 s of backtracking
+ * over this input here. The worker reads a no-match that slow as
+ * JavaScriptCore giving up (anything past 100 ms), so its answer is
+ * undetermined, which is what a gate must see instead of "no match". But
+ * that raced the machine: on an engine three times faster the run ends as a
+ * definite "no", and on a loaded runner it can outlast the call's deadline
+ * instead. So the worker sessions opened in this file answer SLOW over this
+ * input as the worker answers an input the engine gave up on, without running
+ * it, and send every other question to the real worker with the give-up
+ * threshold out of reach (at the real 100 ms, a worker thread stalled that
+ * long inside a definite no-match reads as giving up too). No clock decides
+ * an answer here; each call's 5 s deadline only stops a hang.
  */
 const SLOW = { pattern: "a*a*a*a*b", input: "a".repeat(120) };
 /** Exponential: the screen refuses it, and JSC would give up and say "no match". */
 const CATASTROPHIC = "(a+)+!$|refund";
+
+/** Worker sessions opened, and the testEach questions put to them, in order. */
+let sessions = 0;
+let asked: Array<{ pattern: string; inputs: string[] }> = [];
+/** SLOW runs over its input on the caller's thread, where nothing can stop them. */
+let onThisThread = 0;
+
+function givesUpOnSlow(real: RegexSession): RegexSession {
+  sessions += 1;
+  return {
+    run: (request) => {
+      const r = request as Asked;
+      if (r.op === "testEach") {
+        asked.push({ pattern: String(r.pattern), inputs: [...(r.inputs as string[])] });
+      }
+      if (r.op !== "testEach" || r.pattern !== SLOW.pattern) {
+        return real.run({ ...request, giveUpMs: 60_000 });
+      }
+      const inputs = r.inputs as ReadonlyArray<string>;
+      if (inputs.some((input) => input !== SLOW.input)) {
+        throw new Error("SLOW was asked about an input this script does not answer");
+      }
+      // A testEach run with onGiveUp "skip" lists an input the engine gave
+      // up on as undetermined, and goes on.
+      return Promise.resolve({
+        status: "ok",
+        result: {
+          matched: [],
+          scanned: inputs.length,
+          truncated: false,
+          undetermined: inputs.map((_, i) => i),
+        },
+      } as never);
+    },
+    close: () => real.close(),
+  };
+}
+
+beforeEach(() => {
+  sessions = 0;
+  asked = [];
+  onThisThread = 0;
+  _setRegexAnswersSessionForTest(givesUpOnSlow);
+});
+
+afterEach(() => {
+  _setRegexAnswersSessionForTest(undefined);
+});
+
+/** Run `body`. A run of SLOW over its input on this thread, as in 0.7.0, is counted and refused. */
+async function offThisThread<T>(body: () => Promise<T>): Promise<T> {
+  const realExec = RegExp.prototype.exec;
+  RegExp.prototype.exec = function (this: RegExp, text: string) {
+    if (this.source === SLOW.pattern && text === SLOW.input) {
+      onThisThread += 1;
+      throw new Error(`/${this.source}/ ran over the input on the caller's thread`);
+    }
+    return realExec.call(this, text);
+  };
+  try {
+    return await body();
+  } finally {
+    RegExp.prototype.exec = realExec;
+  }
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+async function call(tool: Tool, input: unknown): Promise<any> {
+  const out = await offThisThread(() => tool.execute(tool.inputSchema.parse(input) as never, {}));
+  return JSON.parse(out as string);
+}
 
 describe("RegexAnswers", () => {
   test("answers many inputs in one worker session, definitely", async () => {
@@ -68,16 +131,56 @@ describe("RegexAnswers", () => {
       false,
       true,
     ]);
+    expect(sessions).toBe(1);
+    expect(asked).toEqual([{ pattern: "^\\d+$", inputs: ["1", "x", "22"] }]);
   });
 
   test("a pattern still running at the deadline is undetermined, and the thread stays free", async () => {
+    // A real 60 ms deadline raced SLOW: an engine fast enough finished first
+    // and answered "no". So this session answers as a worker the deadline
+    // stopped before its first input does, without running SLOW. What is
+    // under test is what RegexAnswers does with that, and that it hands the
+    // run its deadline. The caller's clock stands still while resolve reads
+    // it, so all 60 ms reach the run, never "ran out before this one could
+    // run".
+    const deadlines: number[] = [];
+    _setRegexAnswersSessionForTest((real) => ({
+      run: (request) => {
+        const r = request as Asked & { deadlineMs: number };
+        if (r.op !== "testEach" || r.pattern !== SLOW.pattern) {
+          throw new Error("this script answers SLOW only");
+        }
+        asked.push({ pattern: r.pattern, inputs: [...(r.inputs as string[])] });
+        deadlines.push(r.deadlineMs);
+        return Promise.resolve({
+          status: "timeout",
+          reason: "the deadline passed",
+          deadlineMs: r.deadlineMs,
+          completed: 0,
+          partial: { matched: [], scanned: 0, truncated: false, undetermined: [] },
+        } as never);
+      },
+      close: () => real.close(),
+    }));
     const answers = new RegexAnswers();
-    answers.lookup(SLOW.pattern, "", SLOW.input);
-    const { ticks } = await ticksDuring(() => answers.resolve({}, { deadlineMs: 60 }));
+    await offThisThread(() => {
+      answers.lookup(SLOW.pattern, "", SLOW.input);
+      // resolve reads the clock and hands the run what is left before its
+      // first await, so the clock is back before anything is awaited.
+      const clock = spyOn(performance, "now").mockReturnValue(0);
+      try {
+        return answers.resolve({}, { deadlineMs: 60 });
+      } finally {
+        clock.mockRestore();
+      }
+    });
     const answer = answers.lookup(SLOW.pattern, "", SLOW.input);
     expect(answer).toEqual({ undetermined: expect.stringMatching(/timeout/) });
-    expect(ticks).toBeGreaterThan(0);
-  }, 20_000);
+    // Asked of the worker with the whole deadline, and never run here.
+    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(deadlines).toEqual([60]);
+    expect(onThisThread).toBe(0);
+  });
 
   test("a pattern the screen refuses is refused with its reason, not run", async () => {
     const answers = new RegexAnswers();
@@ -132,17 +235,17 @@ describe("Assert", () => {
   });
 
   test("a slow pattern runs off the caller's thread", async () => {
-    const { result, ticks } = await ticksDuring(() =>
-      call(assert as Tool, {
-        value: SLOW.input,
-        checks: [{ op: "matches", expected: SLOW.pattern }],
-      }),
-    );
-    // 0.7.0 held the thread for the whole match: no timer fired.
-    expect(ticks).toBeGreaterThan(0);
+    const result = await call(assert as Tool, {
+      value: SLOW.input,
+      checks: [{ op: "matches", expected: SLOW.pattern }],
+    });
+    // Asked of the worker, and never run here: 0.7.0 held the thread for the
+    // whole match.
+    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(onThisThread).toBe(0);
     expect(result).toMatchObject({ ok: false, undetermined: 1 });
     expect(result.results[0].reason).toMatch(/could not evaluate \/a\*a\*a\*a\*b\//);
-  }, 20_000);
+  });
 
   test("an undetermined check is counted, keeps its own reason, and is not a pass", () => {
     const answers = new RegexAnswers();
@@ -205,16 +308,15 @@ describe("JsonSchemaValidate and ValidateRecords", () => {
   });
 
   test("a slow schema pattern runs off the caller's thread", async () => {
-    const { result, ticks } = await ticksDuring(() =>
-      call(jsonSchemaValidate as Tool, {
-        value: SLOW.input,
-        schema: { type: "string", pattern: SLOW.pattern },
-      }),
-    );
-    expect(ticks).toBeGreaterThan(0);
+    const result = await call(jsonSchemaValidate as Tool, {
+      value: SLOW.input,
+      schema: { type: "string", pattern: SLOW.pattern },
+    });
+    expect(asked).toEqual([{ pattern: SLOW.pattern, inputs: [SLOW.input] }]);
+    expect(onThisThread).toBe(0);
     expect(result).toMatchObject({ valid: null, undetermined: true });
     expect(result.reason).toMatch(/pattern \/a\*a\*a\*a\*b\/ at \/pattern could not be run/);
-  }, 20_000);
+  });
 
   test("a pattern with no answer leaves the value undetermined, not invalid", () => {
     const answers = new RegexAnswers();
@@ -242,5 +344,6 @@ describe("JsonSchemaValidate and ValidateRecords", () => {
       summaryOnly: true,
     });
     expect(out).toMatchObject({ ok: false, total: 3, passed: 2, failed: 1 });
+    expect(asked).toEqual([{ pattern: "^[A-Z]{2}-\\d+$", inputs: ["AB-1", "ab-2", "CD-33"] }]);
   });
 });

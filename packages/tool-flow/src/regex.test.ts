@@ -28,8 +28,10 @@ import {
  * it is a definite "no" instead, and every undecided case below would decide.
  * So the worker session the tools open in this file answers SLOW over this
  * text as the worker answers an input the engine gave up on, without running
- * it, and sends every other question to the real worker. No clock decides an
- * answer here.
+ * it, and sends every other question to the real worker, with the give-up
+ * threshold out of reach: at the real 100 ms, a worker thread a loaded runner
+ * stalls that long inside a definite no-match reads as giving up too. No
+ * clock decides an answer here; the call's 5 s deadline only stops a hang.
  */
 const SLOW = { pattern: "a*a*a*a*b", text: "a".repeat(120) };
 /** Exponential: refused by the screen before it runs. */
@@ -46,7 +48,9 @@ function givesUpOnSlow(real: RegexSession): RegexSession {
   return {
     run: (request) => {
       const asked = request as { op: string; pattern?: string; inputs?: unknown };
-      if (asked.op !== "testEach" || asked.pattern !== SLOW.pattern) return real.run(request);
+      if (asked.op !== "testEach" || asked.pattern !== SLOW.pattern) {
+        return real.run({ ...request, giveUpMs: 60_000 });
+      }
       askedWorker += 1;
       const inputs = asked.inputs as ReadonlyArray<string>;
       // The one other input this file asks SLOW about is ErrorClassify's
