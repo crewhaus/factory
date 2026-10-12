@@ -471,6 +471,11 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
 
 #### Tool results
 
+- **A hard-linked file gets the same answer every time on macOS.** A file
+  with a second name can be reported under either name there. So the
+  observability tools sometimes refused a workspace file because its other
+  name was outside, and an append sometimes refused it with the wrong reason.
+  Both cases refused; now the decision rests on the name you gave.
 - **Money is exact.** Amounts are whole minor units, and totals are exact or
   refused. RuleScore adds exactly (0.7 + 0.1 meets a band at 0.8),
   CostBasisCompute counts exact decimals, StatementParse reads amounts exactly
