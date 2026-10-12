@@ -805,6 +805,57 @@ describe("a zip's link targets are read within their limits", () => {
     expect(read).toBeLessThan(n);
   });
 
+  test("a target is read when what is read for targets comes to exactly the archive's size, and not one byte past", () => {
+    // The stated sizes are fixed-width fields, so the zip's length does not
+    // depend on them: build it once to learn that length, then state sizes
+    // that bring one read to exactly it and the next to one byte past.
+    const text = "t/".repeat(100);
+    const n = 20;
+    const build = (sizes: ReadonlyArray<number>): Buffer =>
+      zipOfLinks(
+        sizes.map((size, i) => ({
+          name: `l${String(i).padStart(2, "0")}`,
+          method: 0,
+          data: Buffer.from(text),
+          ...(i === 0 ? {} : { sharesWith: 0, statedSize: size }),
+        })),
+      );
+    const length = build(Array.from({ length: n }, () => 0)).length;
+    // The first member reads its own data whole, the next ones shorter and
+    // shorter prefixes of it, each a target of its own.
+    const prefixes = [text.length];
+    const spent = { bytes: text.length };
+    for (let size = text.length - 1; spent.bytes + size < length; size--) {
+      prefixes.push(size);
+      spent.bytes += size;
+    }
+    const exact = length - spent.bytes;
+    // One byte past is a new target of one byte; nothing new is read after
+    // it but the empty prefix, and a prefix read before is still known.
+    const after = [1, 0, text.length - 1];
+    const used = new Set([...prefixes, exact, ...after]);
+    const rest: number[] = [];
+    for (let size = 2; prefixes.length + 1 + after.length + rest.length < n; size++) {
+      if (!used.has(size)) rest.push(size);
+    }
+    const zip = build([...prefixes, exact, ...after, ...rest]);
+    expect(zip.length).toBe(length);
+    // A target of its own, not one read before.
+    expect(exact).toBeGreaterThan(1);
+    expect(exact).toBeLessThan(prefixes[prefixes.length - 1] as number);
+
+    expect(readZipEntries(zip).map((entry) => entry.linkTarget)).toEqual([
+      ...prefixes.map((size) => text.slice(0, size)),
+      // spent + size === the archive's size: read.
+      text.slice(0, exact),
+      // spent + size === the archive's size + 1: unstated.
+      undefined,
+      "",
+      text.slice(0, text.length - 1),
+      ...rest.map(() => undefined),
+    ]);
+  });
+
   test("links with their own data, or sharing it whole, read as each would alone", () => {
     // What a zip writer makes: each member's data is its own, so what is
     // read for the targets never passes the archive's size. Targets of every

@@ -314,6 +314,12 @@ export function _setInflateRawForTest(fn: typeof inflateRawSync | undefined): vo
  * that each have their own data never exceed, since theirs do not overlap.
  * Past that a target reads as unstated, which the link check refuses: a
  * crafted archive is stopped, not believed.
+ *
+ * What this bounds is the data handed to the inflater. Each distinct target
+ * may still inflate to its own limit, so a crafted archive that names short
+ * blocks at several lengths gets more inflated output for its size than one
+ * whose links each have their own data. That output is still linear in the
+ * archive's size, and a target that inflates past its limit is refused.
  */
 type LinkReads = {
   readonly known: Map<string, string | undefined>;
