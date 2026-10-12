@@ -110,8 +110,62 @@ export type PermissionRuleProblemsInput = {
 };
 
 const GLOB_META = /[*?\\]/;
-const METHOD_THEN_REST = /^[A-Za-z]+\s+(.+)$/;
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/;
+
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** A code unit `.` does not match without the `s` flag. */
+function isLineBreak(c: number): boolean {
+  return c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+}
+
+/**
+ * What follows a leading word and its whitespace (`GET https://…`): what
+ * `/^[A-Za-z]+\s+(.+)$/` captured, read in one pass. The letters and the
+ * whitespace are taken whole and the rest must hold no line break (`.` stops
+ * at \n, \r, U+2028 and U+2029); with nothing after the whitespace, the
+ * pattern took its last character, unless that is a line break or the
+ * whitespace is a single character. The pattern tried every shorter run of
+ * whitespace and rescanned the rest from each, so a run before a stray \r
+ * in a spec's rule was quadratic in the run's length.
+ */
+export function afterMethod(argGlob: string): string | undefined {
+  let at = 0;
+  while (at < argGlob.length) {
+    const c = argGlob.charCodeAt(at) | 0x20;
+    if (c < 0x61 || c > 0x7a) break;
+    at++;
+  }
+  if (at === 0) return undefined;
+  const spaceFrom = at;
+  while (at < argGlob.length && isRegExpSpace(argGlob.charCodeAt(at))) at++;
+  if (at === spaceFrom) return undefined;
+  if (at === argGlob.length) {
+    const last = at - 1;
+    return last > spaceFrom && !isLineBreak(argGlob.charCodeAt(last))
+      ? argGlob.charAt(last)
+      : undefined;
+  }
+  for (let i = at; i < argGlob.length; i++) {
+    if (isLineBreak(argGlob.charCodeAt(i))) return undefined;
+  }
+  return argGlob.slice(at);
+}
 
 function split(pattern: string): { tool: string; arg: string | null } {
   const paren = pattern.indexOf("(");
@@ -175,7 +229,7 @@ export function argGlobCanMatchUrl(argGlob: string): boolean {
 
 /** When a URL glob was written after an HTTP method (`GET https://…`), the glob without it. */
 function withoutMethodPrefix(argGlob: string): string | undefined {
-  const rest = argGlob.match(METHOD_THEN_REST)?.[1];
+  const rest = afterMethod(argGlob);
   return rest !== undefined && argGlobCanMatchUrl(rest) ? rest : undefined;
 }
 

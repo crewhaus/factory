@@ -7,11 +7,17 @@
  * giving the start up: quadratic in the run's length. Each value is
  * whatever the call wrote, so each cut is a loop.
  *
+ * `/^[A-Za-z]+\s+(.+)$/` over a rule's argument (`GET https://…`) matches
+ * only when the rest holds no line break; with text between a run of
+ * whitespace and a stray \r, it tried every shorter run and rescanned the
+ * rest from each, quadratic in the run, on a spec's rule. That is a read too.
+ *
  * A test that walks many generated inputs, or every code unit, declares a
  * 20 s budget, as the house does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { type OperativeValue, compilePattern, matchesPattern } from "./index";
+import { afterMethod, permissionRuleProblems } from "./rule-problems";
 import { beforeSubscript, shellRestrictSpellings } from "./shell";
 import { withoutTrailingDots } from "./trim";
 
@@ -97,6 +103,25 @@ describe("the cuts return what the regex forms returned", () => {
     );
   });
 
+  test("afterMethod and /^[A-Za-z]+\\s+(.+)$/", () => {
+    const inputs = [
+      ...allStrings(["G", "t", " ", "\t", "\r", "\u2028", "\n", "x", "*"], 5),
+      "GET https://api.example/*",
+      "post   https://x",
+      "GET ",
+      "GET  ",
+      "GET \r",
+    ];
+    // Every code unit, in each place the pattern reads.
+    for (let c = 0; c <= 0xffff; c++) {
+      const ch = String.fromCharCode(c);
+      inputs.push(`${ch} x`, `G${ch} x`, `G${ch}x`, `G ${ch}`, `G  ${ch}`, `G x${ch}`, `G ${ch}x`);
+    }
+    expect(answers(inputs, afterMethod)).toEqual(
+      answers(inputs, (s) => /^[A-Za-z]+\s+(.+)$/.exec(s)?.[1]),
+    );
+  }, 20_000);
+
   test("beforeSubscript and /\\[.*$/", () => {
     const inputs = [
       ...allStrings(["[", "]", "a", "\r"], 5),
@@ -146,5 +171,39 @@ describe("no pattern rescans a run in a value a deny reads", () => {
     const read = regexRunsOver(brackets, () => shellRestrictSpellings(line), ONE_PASS);
     expect(unlisted(read.runs)).toEqual([]);
     expect(read.outcome).toContain("echo hi");
+  });
+});
+
+describe("no pattern rescans a run in a spec's rule", () => {
+  test("a method, a run of spaces, then text before a stray carriage return", () => {
+    const spaces = " ".repeat(100_000);
+    // Control: the count sees the old pattern run over the run.
+    const arg = `GET${spaces}x\ry`;
+    expect(regexRunsOver(spaces, () => arg.match(/^[A-Za-z]+\s+(.+)$/)).runs).toEqual([
+      `/^[A-Za-z]+\\s+(.+)$/ over ${arg.length} characters`,
+    ]);
+    const read = regexRunsOver(
+      spaces,
+      () =>
+        permissionRuleProblems({
+          rules: [
+            { type: "allow", pattern: `WebFetch(GET${spaces}x\ry)` },
+            { type: "deny", pattern: `WebFetch(GET${spaces}https://a.example/*)` },
+          ],
+          granted: [{ name: "WebFetch", operativeArgs: [{ kind: "url" }] }],
+          known: [],
+          mcpServers: [],
+        }).map((p) => [p.code, p.suggestion]),
+      // A scheme's shape is checked anchored, and stops at the first space.
+      ["^[A-Za-z][A-Za-z0-9+.-]*$"],
+    );
+    expect(new Set(read.runs.map((r) => r.replace(/ over .*/, "")))).toEqual(
+      new Set(["/^[A-Za-z][A-Za-z0-9+.-]*$/"]),
+    );
+    // As before: no URL rule follows a method there, and one does here.
+    expect(read.outcome).toEqual([
+      ["argument-cannot-match", undefined],
+      ["argument-cannot-match", "WebFetch(https://a.example/*)"],
+    ]);
   });
 });
