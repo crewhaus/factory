@@ -3,6 +3,7 @@
  * rule, proxy reconciliation, and the predicate the simulation degrades on.
  */
 import { describe, expect, test } from "bun:test";
+import { createEvmAdapter } from "@crewhaus/chain-adapter-evm";
 import { functionSelector } from "@crewhaus/tool-onchain";
 import { ADDR, aggregate3Return, jsonRpcError, minimalProxyCode, word } from "./fixtures";
 import { chunk } from "./lib/batch";
@@ -48,6 +49,7 @@ import {
   ChainCallError,
   type ChainRpc,
   _setRpc,
+  firstRefusal,
   isAbort,
   isMethodUnsupported,
   resolveRpc,
@@ -410,6 +412,70 @@ describe("rpc — reading a node's refusal", () => {
     expect(isMethodUnsupported(abortErr)).toBe(false);
     // Even the -32601 shape is not degraded on once the signal has aborted.
     expect(isMethodUnsupported(jsonRpcError(-32601, "nope"), controller.signal)).toBe(false);
+  });
+
+  test("through the chain adapter, every node must say the method is missing, whichever failed last", async () => {
+    // The adapter's error ends with the LAST node's reason, which is timing.
+    // Read from those words, a node that rejected the bundle's parameters
+    // and was followed by one lacking the method looked like "unsupported".
+    const said = {
+      missing: {
+        code: -32601,
+        message: "the method eth_simulateV1 does not exist/is not available",
+      },
+      params: { code: -32602, message: "invalid params: bundle rejected" },
+    } as const;
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      const host = new URL(url).hostname.split(".")[0] as "missing" | "params" | "down";
+      if (host === "down") return new Response("upstream down", { status: 503 });
+      const { id } = JSON.parse(String(init.body)) as { id: number };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: said[host] }));
+    }) as unknown as typeof fetch;
+    const failure = (hosts: string[], rpcPolicy: "single" | "fallback" | "quorum") =>
+      createEvmAdapter(
+        {
+          chainId: "1",
+          rpcUrls: hosts.map((h) => `https://${h}.test/`),
+          rpcPolicy,
+          finality: { kind: "finalized" },
+          reorgTolerant: true,
+        },
+        fetchImpl,
+      )
+        .rpcRead("eth_simulateV1", [], { bypassCache: true })
+        .then(
+          () => {
+            throw new Error("the read was expected to fail");
+          },
+          (err: unknown) => err,
+        );
+    const rows: Array<[string, string[], "single" | "fallback" | "quorum"]> = [
+      ["one node lacking it", ["missing"], "single"],
+      ["two nodes lacking it", ["missing", "missing"], "fallback"],
+      ["rejects the params, then lacks it", ["params", "missing"], "fallback"],
+      ["lacks it, then rejects the params", ["missing", "params"], "fallback"],
+      ["lacks it, then cannot be reached", ["missing", "down"], "fallback"],
+      ["two voters lacking it, one never heard", ["missing", "missing"], "quorum"],
+    ];
+    const out: Record<string, unknown> = {};
+    for (const [label, hosts, policy] of rows) {
+      const err = await failure(hosts, policy);
+      out[label] = { unsupported: isMethodUnsupported(err), refusal: firstRefusal(err) };
+    }
+    expect(out).toEqual({
+      "one node lacking it": { unsupported: true, refusal: undefined },
+      "two nodes lacking it": { unsupported: true, refusal: undefined },
+      "rejects the params, then lacks it": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
+      "lacks it, then rejects the params": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
+      "lacks it, then cannot be reached": { unsupported: false, refusal: undefined },
+      "two voters lacking it, one never heard": { unsupported: false, refusal: undefined },
+    });
   });
 
   test("a read that outlives its signal rejects as an abort, so a timeout bounds something", async () => {

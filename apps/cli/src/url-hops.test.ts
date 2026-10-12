@@ -10,10 +10,13 @@
  * it, so the fix shows up here as a deliberate change, and hold the boundary
  * that does apply at every hop: an origin off the tool's allow-list.
  *
- * The last two are fixes. DependencyAudit (whose mirror is checked against
+ * The rest are fixes. DependencyAudit (whose mirror is checked against
  * `tool_config.fetch`) and the chain reads (whose nodes the spec's `chains`
  * block names) sent their requests with the platform's `fetch`, which follows
- * a redirect anywhere. Both now refuse a redirect and say where it pointed.
+ * a redirect anywhere. Both now refuse a redirect and say where it pointed. And a chain read that fails on
+ * every node is judged on what each node said, not on the words of whichever
+ * node failed last: that is what decides whether EvmSimulateBundle and
+ * GasMarketRead fall back and whether ContractInspect reads a revert.
  *
  * Everything runs through runChatLoop's real gate and the real tools, against
  * loopback servers, and the outcome is read from what each server received.
@@ -39,6 +42,8 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   bindChainCallChains,
   contractInspect,
+  evmSimulateBundle,
+  gasMarketRead,
   setChainRpcResolver,
 } from "@crewhaus/tool-chaincall";
 import {
@@ -655,6 +660,194 @@ describe("a chain read refuses a redirect to a node the chains block does not na
     expect({ aAsked: a.got.length > 0, bGot: [...new Set(b.got)] }).toEqual({
       aAsked: true,
       bGot: ["POST /rpc"],
+    });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// FIXED — a chain read that fails on every node is judged on each node's answer
+// ---------------------------------------------------------------------------
+
+describe("a chain read that fails on every node is judged on what each node said, not on the last one's words", () => {
+  // The adapter's error ends with the reason of the node that failed last,
+  // and tool-chaincall used to read those words: whether EvmSimulateBundle
+  // fell back, whether GasMarketRead answered without fee history, and
+  // whether a ContractInspect probe had reverted then rested on which node
+  // failed last, and on nothing at all in 0.7.0 (whose words had no reason).
+  const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11";
+  type Rpc = { readonly id: number; readonly method: string; readonly params: unknown[] };
+  /** A node that answers every read, except where `refuse` names a JSON-RPC error. */
+  const node = (refuse: (rpc: Rpc) => { code: number; message: string } | undefined) =>
+    server(async (req) => {
+      const rpc = (await req.json()) as Rpc;
+      const error = refuse(rpc);
+      if (error !== undefined) return Response.json({ jsonrpc: "2.0", id: rpc.id, error });
+      const result =
+        rpc.method === "eth_getBlockByNumber"
+          ? {
+              number: "0x10",
+              baseFeePerGas: "0x3b9aca00",
+              gasUsed: "0x5208",
+              gasLimit: "0x1c9c380",
+              timestamp: "0x1",
+              hash: `0x${"1".repeat(64)}`,
+            }
+          : rpc.method === "eth_getCode"
+            ? "0x6001"
+            : rpc.method === "eth_getStorageAt"
+              ? `0x${"0".repeat(64)}`
+              : rpc.method === "eth_gasPrice"
+                ? "0x3b9aca00"
+                : rpc.method === "eth_call"
+                  ? "0x"
+                  : "0x10";
+      return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
+    });
+  const lacking = node((rpc) =>
+    rpc.method === "eth_simulateV1" || rpc.method === "eth_feeHistory"
+      ? { code: -32601, message: `the method ${rpc.method} does not exist/is not available` }
+      : undefined,
+  );
+  const rejecting = node((rpc) =>
+    rpc.method === "eth_simulateV1"
+      ? { code: -32602, message: "invalid params: bundle rejected" }
+      : undefined,
+  );
+  /** Every probe reverts; Multicall3 is not there, so the probes go one at a time. */
+  const reverting = node((rpc) => {
+    if (rpc.method !== "eth_call") return undefined;
+    const to = String((rpc.params[0] as { to?: string } | undefined)?.to).toLowerCase();
+    return to === MULTICALL3
+      ? { code: -32000, message: "header not found" }
+      : { code: 3, message: "execution reverted" };
+  });
+  const down = server(() => new Response("upstream down", { status: 503 }));
+  const at = (s: { origin: string }) => `${s.origin}/rpc`;
+  const bind = (rpcUrls: string[], rpcPolicy: "single" | "fallback" | "quorum") =>
+    bindChainCallChains({
+      chains: [
+        { chainId: "1", rpcUrls, rpcPolicy, finality: { kind: "finalized" }, reorgTolerant: false },
+      ],
+    });
+  const simulate = () =>
+    call(
+      evmSimulateBundle,
+      {
+        chainId: "1",
+        calls: [
+          {
+            from: "0x00000000000000000000000000000000000000aa",
+            to: "0x00000000000000000000000000000000000000bb",
+            data: "0x",
+          },
+        ],
+        timeoutMs: 30_000,
+      },
+      rules(["alwaysAllow", "EvmSimulateBundle"]),
+    );
+  const REFUSED =
+    "EvmSimulateBundle: a node refused this bundle — invalid params: bundle rejected (code -32602). That node implements eth_simulateV1, so this is an answer about the bundle and not a reason to fall back to eth_call.";
+  const NOT_EVERY =
+    "The eth_call fallback is used only when every node says it lacks eth_simulateV1";
+
+  afterAll(() => {
+    setChainRpcResolver(undefined);
+    for (const s of [lacking, rejecting, reverting, down]) s.stop();
+  });
+
+  test("GasMarketRead answers without fee history when the node lacks eth_feeHistory, and says so", async () => {
+    bind([at(lacking)], "single");
+    const out = await call(
+      gasMarketRead,
+      { chainId: "1" },
+      rules(["alwaysAllow", "GasMarketRead"]),
+    );
+    expect({
+      isError: out.isError,
+      feeHistory: out.result.includes('"feeHistory":{"available":false}'),
+      caveat: out.result.includes("this node does not implement eth_feeHistory"),
+    }).toEqual({ isError: false, feeHistory: true, caveat: true });
+  }, 60_000);
+
+  test("EvmSimulateBundle falls back to eth_call when every node lacks eth_simulateV1", async () => {
+    const modes: Record<string, unknown> = {};
+    for (const [label, urls] of [
+      ["one node", [at(lacking)]],
+      ["two nodes", [at(lacking), `${lacking.origin}/rpc2`]],
+    ] as const) {
+      bind([...urls], urls.length === 1 ? "single" : "fallback");
+      const out = await simulate();
+      modes[label] = {
+        isError: out.isError,
+        fallback: out.result.includes('"mode":"eth_call-fallback"'),
+      };
+    }
+    expect(modes).toEqual({
+      "one node": { isError: false, fallback: true },
+      "two nodes": { isError: false, fallback: true },
+    });
+  }, 60_000);
+
+  test("a node that rejected the bundle keeps the fallback off, whichever node failed last", async () => {
+    const out: Record<string, unknown> = {};
+    for (const [label, urls] of [
+      ["rejects, then lacks", [at(rejecting), at(lacking)]],
+      ["lacks, then rejects", [at(lacking), at(rejecting)]],
+    ] as const) {
+      bind([...urls], "fallback");
+      const one = await simulate();
+      out[label] = { isError: one.isError, result: one.result };
+    }
+    expect(out).toEqual({
+      "rejects, then lacks": { isError: true, result: REFUSED },
+      "lacks, then rejects": { isError: true, result: REFUSED },
+    });
+  }, 60_000);
+
+  test("a node that could not be reached, or a voter never heard, keeps the fallback off too", async () => {
+    const out: Record<string, unknown> = {};
+    for (const [label, urls, policy] of [
+      ["lacks, then down", [at(lacking), at(down)], "fallback"],
+      ["two quorum voters lacking it", [at(lacking), `${lacking.origin}/rpc2`], "quorum"],
+    ] as const) {
+      bind([...urls], policy);
+      const one = await simulate();
+      out[label] = {
+        isError: one.isError,
+        opens: one.result.startsWith(
+          "EvmSimulateBundle: no node simulated this bundle — [1] eth_simulateV1: ",
+        ),
+        says: one.result.includes(NOT_EVERY),
+      };
+    }
+    expect(out).toEqual({
+      "lacks, then down": { isError: true, opens: true, says: true },
+      "two quorum voters lacking it": { isError: true, opens: true, says: true },
+    });
+  }, 60_000);
+
+  test("ContractInspect reads a revert from the node that answered, in either order of nodes", async () => {
+    const out: Record<string, unknown> = {};
+    for (const [label, urls, policy] of [
+      ["one node", [at(reverting)], "single"],
+      ["reverts, then down", [at(reverting), at(down)], "fallback"],
+      ["down, then reverts", [at(down), at(reverting)], "fallback"],
+    ] as const) {
+      bind([...urls], policy);
+      const one = await call(
+        contractInspect,
+        { chainId: "1", address: "0x000000000000000000000000000000000000dEaD", timeoutMs: 30_000 },
+        rules(["alwaysAllow", "ContractInspect"]),
+      );
+      out[label] = {
+        isError: one.isError,
+        unreadable: one.result.includes("could not be answered by the node at all"),
+      };
+    }
+    expect(out).toEqual({
+      "one node": { isError: false, unreadable: false },
+      "reverts, then down": { isError: false, unreadable: false },
+      "down, then reverts": { isError: false, unreadable: false },
     });
   }, 60_000);
 });

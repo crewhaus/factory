@@ -196,15 +196,29 @@ type Dispatch = {
 };
 
 /**
- * Why the last URL failed, for the message that says they all did: its own
- * words without the `[chain] method:` they share. Every failure this file
- * raises names an endpoint by scheme and host only (see endpointLabel), so
- * nothing here can carry a key from a URL's path.
+ * Why the last URL to fail did, for the message that says they all did: its
+ * own words without the `[chain] method:` they share. Words for a reader
+ * only: which URL failed last is a matter of timing, so a caller deciding why
+ * the read failed reads `attempts` instead. Every failure this file raises
+ * names an endpoint by scheme and host only (see endpointLabel), so nothing
+ * here can carry a key from a URL's path.
  */
 function lastReason(err: unknown, call: Dispatch): string {
   if (!(err instanceof ChainAdapterError)) return "";
   const prefix = `[${call.chainId}] ${call.method}: `;
   return `; the last: ${err.message.startsWith(prefix) ? err.message.slice(prefix.length) : err.message}`;
+}
+
+/**
+ * One URL's failure as a ChainAdapterError, for `attempts`. Anything else that
+ * escapes dispatchOne (an answer malformed enough to break a parse) is named
+ * generically rather than quoted: a foreign error may name the URL, and a
+ * provider keeps its key in the URL's path.
+ */
+function asAdapterError(err: unknown, call: Dispatch): ChainAdapterError {
+  return err instanceof ChainAdapterError
+    ? err
+    : new ChainAdapterError(call.chainId, call.method, "the read failed for a reason not named");
 }
 
 /** One URL's attempt: the read's signal, plus its own, so a settled read closes the rest. */
@@ -225,12 +239,15 @@ function attemptOn(call: Dispatch): { readonly call: Dispatch; readonly stop: ()
  * chance, the first answer from either wins, and the rest are closed. So a
  * primary that stalls cannot spend the whole deadline and leave a healthy
  * secondary unasked, and a primary that is merely slow still answers.
- * The read's own deadline and the caller's cancel end every attempt.
+ * The read's own deadline and the caller's cancel end every attempt. When
+ * every URL fails, each one's failure goes with the error as `attempts`.
  */
 function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unknown> {
   const { chainId, method } = call;
   return new Promise<unknown>((resolve, reject) => {
     const stops: Array<() => void> = [];
+    /** Each URL's failure, by its place in the list, so the order they settled in decides nothing. */
+    const failures: ChainAdapterError[] = [];
     let next = 0;
     let pending = 0;
     let done = false;
@@ -260,7 +277,8 @@ function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unkn
     const launch = (): void => {
       clearTimeout(hedge);
       if (done || next >= urls.length) return;
-      const url = urls[next++] as string;
+      const index = next++;
+      const url = urls[index] as string;
       const attempt = attemptOn(call);
       stops.push(attempt.stop);
       pending++;
@@ -269,6 +287,7 @@ function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unkn
         (err: unknown) => {
           pending--;
           lastError = err;
+          failures[index] = asAdapterError(err, call);
           if (done) return;
           if (call.cancelled() !== undefined) {
             onStop();
@@ -283,6 +302,7 @@ function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unkn
                   method,
                   `all ${urls.length} RPC URL(s) failed${lastReason(lastError, call)}`,
                   lastError,
+                  { attempts: [...failures] },
                 ),
               ),
             );
@@ -333,10 +353,33 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
     const fail = (why: string, timedOut = false): void =>
       finish(() => reject(new ChainAdapterError(chainId, method, why, undefined, { timedOut })));
     let lastRejection: unknown;
+    /** Each voter's failure, by its place in the list. */
+    const failures: ChainAdapterError[] = [];
     const noQuorum = (): string =>
       answered === 0
         ? `quorum failed: every RPC URL rejected${lastReason(lastRejection, call)}`
         : `quorum failed: no value reached threshold ${threshold}/${urls.length}`;
+    /**
+     * Settle once no value can reach the threshold with the voters still out.
+     * Each voter's own failure goes with it only when every voter failed and
+     * was heard: a voter closed here said nothing, and reading the failure
+     * from the voters that happened to answer first would make why the read
+     * failed depend on which node is faster.
+     */
+    const lose = (): void => {
+      const everyVoterFailed = answered === 0 && settled === urls.length;
+      finish(() =>
+        reject(
+          new ChainAdapterError(
+            chainId,
+            method,
+            noQuorum(),
+            undefined,
+            everyVoterFailed ? { attempts: [...failures] } : {},
+          ),
+        ),
+      );
+    };
     const onStop = (): void => {
       if (call.callerCancelled()) {
         fail("the read was cancelled");
@@ -349,17 +392,16 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
         true,
       );
     };
-    /** Settle once no value can reach the threshold with the voters still out. */
     const decideIfLost = (): void => {
       const best = Math.max(0, ...[...counts.values()].map((c) => c.n));
-      if (best + (urls.length - settled) < threshold) fail(noQuorum());
+      if (best + (urls.length - settled) < threshold) lose();
     };
     if (call.signal.aborted) {
       onStop();
       return;
     }
     call.signal.addEventListener("abort", onStop, { once: true });
-    for (const url of urls) {
+    urls.forEach((url, index) => {
       const attempt = attemptOn(call);
       stops.push(attempt.stop);
       dispatchOne(url, attempt.call).then(
@@ -381,10 +423,11 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
           if (done) return;
           settled++;
           lastRejection = err;
+          failures[index] = asAdapterError(err, call);
           decideIfLost();
         },
       );
-    }
+    });
   });
 }
 
@@ -476,10 +519,23 @@ async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
     throw new ChainAdapterError(chainId, method, "response was not valid JSON", err);
   }
   if ("error" in parsed) {
+    const answer: unknown = parsed.error;
+    const fields =
+      typeof answer === "object" && answer !== null ? (answer as Record<string, unknown>) : {};
+    const code = fields["code"];
+    const message = fields["message"];
+    // The node's own code and words, kept apart from the sentence, so a caller
+    // decides on what the node said and not on how this file phrased it.
+    const rpc =
+      typeof code === "number" && Number.isInteger(code)
+        ? { code, message: typeof message === "string" ? message : "" }
+        : undefined;
     throw new ChainAdapterError(
       chainId,
       method,
-      `RPC error ${parsed.error.code}: ${parsed.error.message}`,
+      `RPC error ${code}: ${message}`,
+      undefined,
+      rpc === undefined ? {} : { rpc },
     );
   }
   return parsed.result;

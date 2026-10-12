@@ -36,20 +36,43 @@ export class ChainAdapterError extends CrewhausError {
    * refusing the request (or not implementing the method).
    */
   readonly timedOut: boolean;
+  /**
+   * The JSON-RPC error a node answered with, as it sent it. Set on one
+   * node's failure only, so a caller deciding what "the node" said reads a
+   * code rather than a sentence.
+   */
+  readonly rpc: ChainRpcErrorAnswer | undefined;
+  /**
+   * When every node the read was sent to failed, and each was heard: each
+   * node's own failure, in the order the chain names its nodes. A decision
+   * about why the read failed is made over all of them, never over the one
+   * that happened to fail last. Unset when a node was not heard (a quorum
+   * that was lost before every voter answered) or the read was stopped.
+   */
+  readonly attempts: ReadonlyArray<ChainAdapterError> | undefined;
 
   constructor(
     chainId: string,
     method: string,
     message: string,
     cause?: unknown,
-    opts: { readonly timedOut?: boolean } = {},
+    opts: {
+      readonly timedOut?: boolean;
+      readonly rpc?: ChainRpcErrorAnswer;
+      readonly attempts?: ReadonlyArray<ChainAdapterError>;
+    } = {},
   ) {
     super("adapter", `[${chainId}] ${method}: ${message}`, cause);
     this.chainId = chainId;
     this.method = method;
     this.timedOut = opts.timedOut === true;
+    this.rpc = opts.rpc;
+    this.attempts = opts.attempts;
   }
 }
+
+/** A node's JSON-RPC error object: the code and message it answered with. */
+export type ChainRpcErrorAnswer = { readonly code: number; readonly message: string };
 
 /**
  * A finality policy mirrors `IrChainFinality` from `@crewhaus/ir`. The

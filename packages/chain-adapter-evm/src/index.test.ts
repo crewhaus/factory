@@ -583,4 +583,114 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       "timeoutMs NaN is not a duration",
     );
   });
+
+  // -------------------------------------------------------------------------
+  // why every node failed, kept per node (0.7.1)
+  // -------------------------------------------------------------------------
+
+  /** A node's scripted JSON-RPC error, given when its promise settles. */
+  type Refusal = { readonly code: number; readonly message: string };
+  function refusingFetch(answers: Record<string, () => Promise<Refusal>>): {
+    readonly fetchImpl: typeof fetch;
+    readonly signals: Map<string, AbortSignal>;
+  } {
+    const signals = new Map<string, AbortSignal>();
+    const fetchImpl = (async (input: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal;
+      signals.set(input, signal);
+      const error = await Promise.race([
+        (answers[input] as () => Promise<Refusal>)(),
+        new Promise<never>((_, reject) =>
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }),
+        ),
+      ]);
+      const body = JSON.parse(String(init.body)) as { id: number };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+    }) as unknown as typeof fetch;
+    return { fetchImpl, signals };
+  }
+  const PARAMS: Refusal = { code: -32602, message: "invalid params" };
+  const MISSING: Refusal = { code: -32601, message: "the method eth_call does not exist" };
+
+  test("every node's failure goes with the error, in the order the chain names them, whichever failed last", async () => {
+    // The words end with the reason of the node that failed LAST, which is
+    // timing; a caller deciding why the read failed (tool-chaincall degrades
+    // on "no such method") must not decide on them. The primary stalls past
+    // its share; the secondary, asked then, cannot be reached and fails at
+    // once, and only that releases the primary's refusal, which arrives
+    // after it: the secondary's failure is a few promise steps, the
+    // primary's a body read and a classification.
+    let failPrimary: (r: Refusal) => void = () => {};
+    const primary = new Promise<Refusal>((r) => {
+      failPrimary = r;
+    });
+    const { fetchImpl: refusing } = refusingFetch({ "https://primary.test": () => primary });
+    const fetchImpl = ((url: string, init: RequestInit) => {
+      if (url === "https://primary.test") return refusing(url, init);
+      failPrimary(PARAMS);
+      return Promise.reject(new Error("connection refused"));
+    }) as unknown as typeof fetch;
+    const adapter = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "fallback",
+        rpcUrls: ["https://primary.test", "https://secondary.test"],
+      },
+      fetchImpl,
+    );
+    const { read } = withHedgesHeld((hedges) => {
+      const read = settle(adapter.rpcRead("eth_call", [], { timeoutMs: 60_000 }));
+      hedges.fire();
+      return { read };
+    });
+    const err = (await read) as ChainAdapterError;
+    expect({
+      message: err.message,
+      rpc: err.rpc,
+      attempts: err.attempts?.map((a) => [a.rpc, a.message]),
+    }).toEqual({
+      message: "[1] eth_call: all 2 RPC URL(s) failed; the last: RPC error -32602: invalid params",
+      rpc: undefined,
+      attempts: [
+        [PARAMS, "[1] eth_call: RPC error -32602: invalid params"],
+        [undefined, "[1] eth_call: network error: connection refused"],
+      ],
+    });
+  });
+
+  test("a quorum lost before every voter answered carries no attempts; a one-voter quorum carries its voter's", async () => {
+    // The voter still out is closed and said nothing, so which voters'
+    // reasons arrived first must not stand in for all of them.
+    const { fetchImpl, signals } = refusingFetch({
+      "https://a.test": async () => MISSING,
+      "https://b.test": () => new Promise<Refusal>(() => {}),
+      "https://c.test": async () => MISSING,
+    });
+    const three = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "quorum",
+        rpcUrls: ["https://a.test", "https://b.test", "https://c.test"],
+      },
+      fetchImpl,
+    );
+    const lost = (await settle(
+      three.rpcRead("eth_call", [], { timeoutMs: 60_000 }),
+    )) as ChainAdapterError;
+    expect({
+      message: lost.message,
+      attempts: lost.attempts,
+      closed: signals.get("https://b.test")?.aborted,
+    }).toEqual({
+      message: `[1] eth_call: quorum failed: every RPC URL rejected; the last: RPC error -32601: ${MISSING.message}`,
+      attempts: undefined,
+      closed: true,
+    });
+    const one = createEvmAdapter(
+      { ...LOCAL, rpcPolicy: "quorum", rpcUrls: ["https://a.test"] },
+      fetchImpl,
+    );
+    const heard = (await settle(one.rpcRead("eth_call", []))) as ChainAdapterError;
+    expect(heard.attempts?.map((a) => a.rpc)).toEqual([MISSING]);
+  });
 });

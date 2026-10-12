@@ -85,10 +85,11 @@ import {
 import {
   ChainCallError,
   type ChainRpc,
+  firstRefusal,
   isAbort,
   isMethodUnsupported,
+  nodeAnswers,
   resolveRpc,
-  rpcError,
   rpcErrorText,
   rpcRead,
   startDeadline,
@@ -467,10 +468,18 @@ type ViewRow = {
  */
 function looksLikeRevert(err: unknown): boolean {
   if (revertFromCallError(err) !== undefined) return true;
-  const { code, message } = rpcError(err);
-  // Geth answers a reverted eth_call with code 3. Nodes that do not attach
-  // revert data still say so in the message.
-  return code === 3 || /revert|out of gas|invalid opcode/i.test(message ?? "");
+  // Every node that answered must have said it reverted, and one must have
+  // answered: a node that could not be reached taught nothing either way, and
+  // one that answered anything else contradicts the revert. Geth answers a
+  // reverted eth_call with code 3; nodes that do not attach revert data still
+  // say so in the message.
+  const answers = nodeAnswers(err).flatMap(({ answer }) => (answer === undefined ? [] : [answer]));
+  return (
+    answers.length > 0 &&
+    answers.every(
+      ({ code, message }) => code === 3 || /revert|out of gas|invalid opcode/i.test(message ?? ""),
+    )
+  );
 }
 
 async function runViews(
@@ -1065,8 +1074,12 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
           );
         }
         if (!isMethodUnsupported(err, deadline.signal)) {
+          const refusal = firstRefusal(err);
+          const one = nodeAnswers(err).length === 1;
           throw new ChainCallError(
-            `EvmSimulateBundle: the node refused this bundle — ${rpcErrorText(err)}. The node implements eth_simulateV1, so this is an answer about the bundle and not a reason to fall back to eth_call.`,
+            refusal !== undefined
+              ? `EvmSimulateBundle: ${one ? "the node" : "a node"} refused this bundle — ${refusal}. ${one ? "The node" : "That node"} implements eth_simulateV1, so this is an answer about the bundle and not a reason to fall back to eth_call.`
+              : `EvmSimulateBundle: no node simulated this bundle — ${rpcErrorText(err)}. The eth_call fallback is used only when every node says it lacks eth_simulateV1, and not every node did, so it was not used. Retry, or check the nodes in the chains block.`,
             err,
           );
         }

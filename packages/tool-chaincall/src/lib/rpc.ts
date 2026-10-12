@@ -236,18 +236,44 @@ export function isAbort(err: unknown, signal?: AbortSignal): boolean {
 }
 
 /**
- * -32601 and the strings providers use instead of it.
+ * What each node the read was sent to said, one entry per node.
  *
- * This is the one predicate `EvmSimulateBundle` degrades on, so it has to be
- * narrow in both directions. A node that has never heard of `eth_simulateV1`
- * is a reason to answer a lesser question; a node that timed out, or that
- * rejected the parameters, or whose simulation reverted, is NOT — degrading
- * on those would turn a transient fault into a quietly weaker answer that
- * still looks like an answer.
+ * The chain adapter reports a read that failed on every node as one error
+ * whose words end with the last node's reason; which node failed last is a
+ * matter of timing, so nothing here decides on those words. It also carries
+ * `attempts`, each node's own failure, and each one that the node answered
+ * with a JSON-RPC error carries that error as `rpc`. `answer` is that error,
+ * or undefined for a node that answered nothing a JSON-RPC client can read:
+ * it could not be reached, answered an HTTP error or a redirect, or the
+ * adapter refused what it sent. An adapter error without `attempts` (a quorum
+ * lost before every voter was heard, or no node at all) is one entry with no
+ * answer. Anything else, a transport bound some other way, is read as the
+ * node's own answer, as it always was.
  */
-export function isMethodUnsupported(err: unknown, signal?: AbortSignal): boolean {
-  if (isAbort(err, signal)) return false;
-  const { code, message } = rpcError(err);
+export function nodeAnswers(
+  err: unknown,
+): ReadonlyArray<{ readonly answer: RpcErrorShape | undefined; readonly text: string }> {
+  const record = asRecord(err);
+  if (record?.["name"] !== "ChainAdapterError") {
+    return [{ answer: rpcError(err), text: rpcErrorText(err) }];
+  }
+  const attempts = record["attempts"];
+  const nodes = Array.isArray(attempts) && attempts.length > 0 ? attempts : [err];
+  return nodes.map((node: unknown) => {
+    const rpc = asRecord(asRecord(node)?.["rpc"]);
+    const code = rpc?.["code"];
+    const message = rpc?.["message"];
+    if (typeof code !== "number") {
+      const said = asRecord(node)?.["message"];
+      return { answer: undefined, text: typeof said === "string" ? said : String(node) };
+    }
+    const words = typeof message === "string" ? message : "";
+    return { answer: { code, message: words }, text: `${words} (code ${code})` };
+  });
+}
+
+/** -32601 and the strings providers use instead of it, in one node's answer. */
+function saysUnsupported({ code, message }: RpcErrorShape): boolean {
   // -32601 is "method not found". -32004 is the "method not supported" code
   // several providers return instead; Geth and Erigon both use -32601.
   if (code === -32601 || code === -32004) return true;
@@ -260,6 +286,33 @@ export function isMethodUnsupported(err: unknown, signal?: AbortSignal): boolean
     /\bunknown method\b/.test(text) ||
     /\bdoes not exist\/is not available\b/.test(text)
   );
+}
+
+/**
+ * -32601 and the strings providers use instead of it, from EVERY node.
+ *
+ * This is the one predicate `EvmSimulateBundle` degrades on, so it has to be
+ * narrow in both directions. A node that has never heard of `eth_simulateV1`
+ * is a reason to answer a lesser question; a node that timed out, or that
+ * rejected the parameters, or whose simulation reverted, is NOT — degrading
+ * on those would turn a transient fault into a quietly weaker answer that
+ * still looks like an answer. So with several nodes every one must have said
+ * so: one that rejected the parameters, could not be reached, or was not
+ * heard may implement the method.
+ */
+export function isMethodUnsupported(err: unknown, signal?: AbortSignal): boolean {
+  if (isAbort(err, signal)) return false;
+  return nodeAnswers(err).every(({ answer }) => answer !== undefined && saysUnsupported(answer));
+}
+
+/**
+ * The first node, in the order the chain names them, that answered with an
+ * error other than "no such method": a node that implements the method and
+ * refused this request. Undefined when no node did.
+ */
+export function firstRefusal(err: unknown): string | undefined {
+  return nodeAnswers(err).find(({ answer }) => answer !== undefined && !saysUnsupported(answer))
+    ?.text;
 }
 
 /** A one-line description of a node failure, for a refusal message. */

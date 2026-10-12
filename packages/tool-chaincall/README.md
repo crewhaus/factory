@@ -123,10 +123,12 @@ is not the same thing as one.
 A probe that **reverts** is an answer: a contract that is not ERC-165 reverts
 on `supportsInterface`, one that is not a proxy reverts on `implementation()`.
 A probe the node could not answer at all — it is down, it is rate-limiting, it
-pruned the block — is not, and the two are counted separately. When *every*
-probe fails that way the whole read is **refused**, because the report it would
-otherwise produce ("not a proxy, not ERC-165") is a set of claims about a
-contract nobody managed to ask.
+pruned the block — is not, and the two are counted separately. With several
+nodes in the chain's `rpcUrls`, a probe counts as reverted when every node that
+answered said so; a node that could not be reached counts neither way. When
+*every* probe fails that way the whole read is **refused**, because the report
+it would otherwise produce ("not a proxy, not ERC-165") is a set of claims
+about a contract nobody managed to ask.
 
 The same line is held one probe at a time. When it is the `0xffffffff`
 sentinel that the node would not answer, the claims are still dropped — but
@@ -164,7 +166,10 @@ providers use instead of it mean the method is unimplemented. A **timeout**,
 a **rejected parameter**, a **rate limit** and a **revert** do not — degrading on
 any of those would turn a transient fault into a permanently weaker answer
 that still reads like an answer. A timed-out simulation is a refusal that says
-so, and no `eth_call` is attempted after it.
+so, and no `eth_call` is attempted after it. With several nodes, every one
+must say it lacks the method: one that rejected the bundle, could not be
+reached or was not heard may have it. A `quorum` of two or more nodes stops
+waiting once no answer can win, so it never falls back.
 
 `allowFallback: false` refuses instead of answering the lesser question.
 
@@ -200,7 +205,8 @@ one:
 - a block with no `baseFeePerGas` is a **legacy** chain, priced from
   `eth_gasPrice`, with no 1559 projection at all;
 - a node without `eth_feeHistory` is reported as such — no percentiles, rather
-  than percentiles from somewhere else;
+  than percentiles from somewhere else. With several nodes, every one must lack
+  it, as for the simulation fallback above;
 - a base fee that is **identical in every sampled block** is flagged. Several
   chains hold it at a floor and price congestion elsewhere; that is not a
   quiet market;
