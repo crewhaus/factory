@@ -418,10 +418,12 @@ describe("a path longer than any path can be is outside, and the walk is linear"
     }
   });
 
-  test("the walk's work is linear in the path: counted at d and 2d missing names", () => {
-    // In a process of its own, so node:path is wrapped before the
-    // canonicaliser (or anything else) imports it: Bun's namespace takes the
-    // export object's functions as they are at the first import.
+  test("the walk's work is linear in the path, and a path past the limit is not walked at all", () => {
+    // In a process of its own, so node:path and node:fs are wrapped before
+    // the canonicaliser (or anything else) imports them: Bun's namespace
+    // takes the export object's functions as they are at the first import.
+    // The walk probes each name with lstat, so a path refused before the
+    // walk makes no lstat call; one refused after it makes one per name.
     const script = path.join(ws, "count.ts");
     writeFileSync(
       script,
@@ -433,16 +435,22 @@ for (const k of Object.keys(req)) {
   req[k] = (...a) => { for (const x of a) if (typeof x === "string") chars += x.length; return f(...a); };
 }
 const fs = require("node:fs");
+let lstats = 0;
+const lstat = fs.lstatSync;
+fs.lstatSync = (...a) => { lstats++; return lstat(...a); };
 const { canonicalWorkspacePath, MAX_PATH_CHARS } = await import(${JSON.stringify(path.join(import.meta.dir, "path-canonical.ts"))});
 const root = fs.realpathSync(fs.mkdtempSync(require("node:os").tmpdir() + "/count-"));
 fs.writeFileSync(root + "/f.db", "x");
 const out = [];
 const d = Math.floor((MAX_PATH_CHARS - root.length - 16) / 4);
-for (const n of [d, 2 * d]) {
+const past = Math.floor((MAX_PATH_CHARS - root.length - 5) / 2) + 1;
+for (const n of [d, 2 * d, past, 65_537]) {
   const raw = "f.db/" + Array.from({ length: n }, () => "a").join("/");
   chars = 0;
+  lstats = 0;
   const got = canonicalWorkspacePath(raw, root, { pwd: undefined, topLevelLinks: [] });
-  out.push({ n, abs: root.length + 1 + raw.length, chars, whole: got.length === 1 && got[0].canonical[0] === raw });
+  const abs = root.length + 1 + raw.length;
+  out.push({ n, abs, over: abs > MAX_PATH_CHARS, chars, lstats, whole: got.length === 1 && got[0].canonical[0] === raw, outside: got.length === 1 && got[0].outsideWorkspace === true });
 }
 fs.rmSync(root, { recursive: true, force: true });
 console.log(JSON.stringify(out));
@@ -450,12 +458,16 @@ console.log(JSON.stringify(out));
     );
     const run = Bun.spawnSync([process.execPath, script], { stderr: "pipe" });
     expect(run.stderr.toString()).toBe("");
-    const [atD, at2D] = JSON.parse(run.stdout.toString()) as Array<{
+    type Row = {
       n: number;
       abs: number;
       chars: number;
+      lstats: number;
       whole: boolean;
-    }>;
+      outside: boolean;
+      over: boolean;
+    };
+    const [atD, at2D, ...past] = JSON.parse(run.stdout.toString()) as Row[];
     // Both resolve to the whole path, under the limit.
     expect([atD?.whole, at2D?.whole]).toEqual([true, true]);
     expect((at2D?.abs ?? 0) <= MAX_PATH_CHARS).toBe(true);
@@ -469,5 +481,16 @@ console.log(JSON.stringify(out));
       });
     }
     expect((at2D?.chars ?? 0) / (atD?.chars ?? 1)).toBeLessThan(2.5);
+    // Past the limit — one name past it, and 65,537 names — it is outside,
+    // and refused before the walk: not one name was probed.
+    expect(
+      past.map((r) => ({
+        n: r.n,
+        over: r.over,
+        outside: r.outside,
+        lstats: r.lstats,
+      })),
+    ).toEqual(past.map((r) => ({ n: r.n, over: true, outside: true, lstats: 0 })));
+    expect(past).toHaveLength(2);
   }, 30_000);
 });

@@ -633,13 +633,15 @@ describe("every copy of the resolver climbs by index and refuses a path no files
     expect(Math.min(trailing, climbed)).toBeGreaterThan(2_000);
   });
 
-  test("counted: linear at d and 2d names, the whole path up to the limit, refused one past it", () => {
+  test("counted: linear at d and 2d names, the whole path up to the limit, refused unwalked past it", () => {
     const files = walkCopies().map((c) => join(repoRoot, c.file));
     const dir = mkdtempSync(join(tmpdir(), "walk-count-"));
     const script = join(dir, "count.ts");
-    // In a process of its own, so node:path is wrapped before any copy (or
-    // anything else) imports it: Bun's namespace takes the module's functions
-    // as they are at the first import.
+    // In a process of its own, so node:path and node:fs are wrapped before
+    // any copy (or anything else) imports them: Bun's namespace takes the
+    // module's functions as they are at the first import. Every copy's walk
+    // probes each name with lstat, so a path refused before the walk makes no
+    // lstat call, and one refused after it makes one per name.
     writeFileSync(
       script,
       `const req = require("node:path");
@@ -650,6 +652,9 @@ for (const k of Object.keys(req)) {
   req[k] = (...a) => { for (const x of a) if (typeof x === "string") chars += x.length; return f(...a); };
 }
 const fs = require("node:fs");
+let lstats = 0;
+const lstat = fs.lstatSync;
+fs.lstatSync = (...a) => { lstats++; return lstat(...a); };
 const files = ${JSON.stringify(files)};
 const root = fs.realpathSync(fs.mkdtempSync(require("node:os").tmpdir() + "/count-"));
 fs.writeFileSync(root + "/f.db", "x");
@@ -694,11 +699,12 @@ for (const file of files) {
     return "f.db/" + "a/".repeat(pairs) + "b".repeat(tail - 2 * pairs);
   };
   const d = Math.floor((MAX - root.length - 16) / 4);
-  const ask = [["d", "f.db/" + Array.from({ length: d }, () => "a").join("/")], ["2d", "f.db/" + Array.from({ length: 2 * d }, () => "a").join("/")], ["limit", deepTo(MAX)], ["past", deepTo(MAX + 1)]];
+  const ask = [["d", "f.db/" + Array.from({ length: d }, () => "a").join("/")], ["2d", "f.db/" + Array.from({ length: 2 * d }, () => "a").join("/")], ["limit", deepTo(MAX)], ["past", deepTo(MAX + 1)], ["far", "f.db/" + Array.from({ length: 65_537 }, () => "a").join("/")]];
   for (const [at, raw] of ask) {
     chars = 0;
+    lstats = 0;
     const out = await run(raw);
-    rows.push({ file: file.slice(file.indexOf("packages/")), at, abs: root.length + 1 + raw.length, chars, ...out });
+    rows.push({ file: file.slice(file.indexOf("packages/")), at, abs: root.length + 1 + raw.length, chars, lstats, ...out });
   }
 }
 fs.rmSync(root, { recursive: true, force: true });
@@ -712,6 +718,7 @@ console.log(JSON.stringify({ MAX, rows }));
         at: string;
         abs: number;
         chars: number;
+        lstats: number;
         whole?: boolean;
         refused?: string;
         cannotDrive?: boolean;
@@ -726,7 +733,7 @@ console.log(JSON.stringify({ MAX, rows }));
     }
     const { MAX, rows } = report;
     expect(rows.filter((r) => r.cannotDrive).map((r) => r.file)).toEqual([]);
-    expect(rows.length).toBe(41 * 4);
+    expect(rows.length).toBe(41 * 5);
     const by = (at: string) => rows.filter((r) => r.at === at);
     // Up to the limit every copy resolves the whole path.
     for (const at of ["d", "2d", "limit"]) {
@@ -741,6 +748,13 @@ console.log(JSON.stringify({ MAX, rows }));
       by("past")
         .filter((r) => !(r.refused === "outside" || r.refused?.includes(why)))
         .map((r) => ({ file: r.file, refused: r.refused })),
+    ).toEqual([]);
+    // Refused before the walk: one character past the limit, or 65,537 names
+    // past it, not one name is probed (the walk makes one lstat per name).
+    expect(
+      [...by("past"), ...by("far")]
+        .filter((r) => r.refused === undefined || r.lstats !== 0)
+        .map((r) => ({ file: r.file, at: r.at, refused: r.refused?.slice(-60), lstats: r.lstats })),
     ).toEqual([]);
     // Linear: a bounded number of characters handed to node:path per character
     // of path at every size (the old walk read ~900 per character at d = 400,
