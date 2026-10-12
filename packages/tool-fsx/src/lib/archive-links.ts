@@ -67,6 +67,8 @@ type TreeNode = {
   member: { readonly kind: ArchiveEntry["kind"]; readonly linkTarget?: string } | undefined;
   /** Some member of exactly this path is a directory. */
   dirMember: boolean;
+  /** {@link ascend}'s answers from places on this edge, by `at`, kept once asked. */
+  above: Map<number, Place> | undefined;
 };
 
 /**
@@ -98,7 +100,16 @@ type Tree = {
 };
 
 function makeNode(src: string, start: number, end: number, parent: TreeNode | undefined): TreeNode {
-  return { src, start, end, parent, children: undefined, member: undefined, dirMember: false };
+  return {
+    src,
+    start,
+    end,
+    parent,
+    children: undefined,
+    member: undefined,
+    dirMember: false,
+    above: undefined,
+  };
 }
 
 function edgeLength(node: TreeNode): number {
@@ -191,15 +202,33 @@ function descend(node: TreeNode, at: number, comp: string): Place | undefined {
   return { node, at: after };
 }
 
-/** The place one component above, or undefined at the root. */
+/**
+ * The place one component above, or undefined at the root.
+ *
+ * Finding it reads back over the component being left, which the walk need
+ * not have read: a walk that a memoized link placed (`resume`) never read the
+ * names it was placed in, so n links that each went through one link and
+ * climbed back out read its long name n times. So each place's answer is
+ * kept the first time it is asked. A place ends one component of one edge,
+ * so all the reading back together is at most the tree's edges, which are at
+ * most the archive's names. The tree is complete before any walk, so no edge
+ * is split under a kept answer.
+ */
 function ascend(node: TreeNode, at: number): Place | undefined {
   const parent = node.parent;
   if (parent === undefined) return undefined;
+  const known = node.above?.get(at);
+  if (known !== undefined) return known;
   // An edge starts just after a `/` of its source (or at its start), so this
   // scan stops within the edge's last component.
   const slash = node.src.lastIndexOf("/", node.start + at - 1);
-  if (slash >= node.start) return { node, at: slash - node.start };
-  return { node: parent, at: edgeLength(parent) };
+  const place: Place =
+    slash >= node.start
+      ? { node, at: slash - node.start }
+      : { node: parent, at: edgeLength(parent) };
+  node.above ??= new Map();
+  node.above.set(at, place);
+  return place;
 }
 
 function isAbsoluteTarget(target: string): boolean {

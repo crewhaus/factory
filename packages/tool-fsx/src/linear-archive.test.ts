@@ -8,6 +8,9 @@
  *     a 206-byte .tar.gz made ArchiveList hold 64 million. Each link's walk
  *     also copied its queue at every step and expanded every link it passed
  *     through again, so n links through one long target cost n times it.
+ *     Then, once a link's outcome was kept, a walk it placed inside a long
+ *     name read that name back at each `..`, so n links that went through it
+ *     and climbed back out cost n times the name.
  *   - A pax header's length field was re-read from each offset inside it, so
  *     a header of k zeros before `1 ` cost k² character reads.
  *   - A zip symlink's target was inflated whole before its length was
@@ -386,6 +389,27 @@ function sharedPrefixArchive(n: number): ArchiveEntry[] {
   return entries;
 }
 
+/**
+ * One name n characters long, a link to it, and n links that each go through
+ * that link and climb back out. The walk is placed in the long name by the
+ * link's kept outcome, never reading it, and each `..` read back over it
+ * again: n² characters for names and targets 10n long.
+ */
+function climbOutArchive(n: number): ArchiveEntry[] {
+  const long = "x".repeat(n);
+  const entries = [file(`${long}/f`), link("m", long)];
+  for (let i = 0; i < n; i++) entries.push(link(`s${i}`, "m/.."));
+  return entries;
+}
+
+/** The same climb out of four long names, from a link that sits in a directory. */
+function climbOutDeepArchive(n: number): ArchiveEntry[] {
+  const longs = ["a", "b", "c", "d"].map((c) => c.repeat(n / 4));
+  const entries = [file(`top/${longs.join("/")}/f`), link("top/m", longs.join("/"))];
+  for (let i = 0; i < n; i++) entries.push(link(`top/s${i}`, "m/../../../.."));
+  return entries;
+}
+
 /** At most this much work per character of names and targets; the rewrite does 6 to 8. */
 const PER_CHAR = 16;
 
@@ -399,6 +423,16 @@ describe("the link check is linear in the archive's names and targets", () => {
     [
       "thousands of links through one link whose target is thousands of components long",
       fanInArchive,
+      2000,
+    ],
+    [
+      "thousands of links that go through one link and climb back out of its long name",
+      climbOutArchive,
+      2000,
+    ],
+    [
+      "thousands of links that climb back out of four long names a kept link led into",
+      climbOutDeepArchive,
       2000,
     ],
   ] as const;
@@ -433,6 +467,36 @@ describe("the link check is linear in the archive's names and targets", () => {
     expect(work).toBeLessThanOrEqual(PER_CHAR * chars);
     expect(work).toBeGreaterThanOrEqual(chars);
   }, 20_000);
+
+  test("a climb out of where a kept link led gives the verdicts the 0.7.1 walk gave", () => {
+    // `back` walks `m` first; every later link is placed by its kept outcome
+    // and climbs from there, the kept answers for each place included.
+    const long = "x".repeat(300);
+    const entries = [
+      file(`d/${long}/f`),
+      link("d/m", long),
+      link("d/back", "m/.."),
+      link("d/top", "m/../.."),
+      link("d/out", "m/../../.."),
+      link("d/gone", "m/nope/.."),
+      link("d/again", "m/../m/f"),
+      link("d/twice", "m/../m/../../.."),
+    ];
+    expect(unsafeArchiveLinks(entries)).toEqual(referenceUnsafeArchiveLinks(entries));
+    expect(unsafeArchiveLinks(entries)).toEqual([
+      { name: "d/out", linkTarget: "m/../../..", why: "link points outside, through another link" },
+      {
+        name: "d/gone",
+        linkTarget: "m/nope/..",
+        why: "link target unresolvable: a '..' follows a name this archive does not contain",
+      },
+      {
+        name: "d/twice",
+        linkTarget: "m/../m/../../..",
+        why: "link points outside, through another link",
+      },
+    ]);
+  });
 
   test("an archive with no link members is not walked at all", () => {
     const entries = [file(`${"a/".repeat(5000)}f`), dir("b")];
