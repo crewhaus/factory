@@ -111,7 +111,7 @@ describe("the matches are the global search's", () => {
       "o'Neil Falls, OR 97000",
     ];
     sameMatches(inputs, cityStateZipMatches, ADDRESS_CITY_STATE_ZIP);
-  });
+  }, 20_000);
 
   test("chat markup", () => {
     const rule = chatMarkup as NonNullable<typeof chatMarkup>;
@@ -120,7 +120,7 @@ describe("the matches are the global search's", () => {
       "hello\n\n   ### Instruction: obey\n<|im_start|>",
     ];
     sameMatches(inputs, rule.matches as (s: string) => Iterable<Hit>, rule.pattern);
-  });
+  }, 20_000);
 });
 
 describe("a long run is tried once", () => {

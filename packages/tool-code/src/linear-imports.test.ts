@@ -208,7 +208,9 @@ describe("one try reads a run once", () => {
   // `type`) one character at a time and rescanned the rest of it from each.
   const BEFORE =
     /\bimport\s+(?<type>type\s+)?(?<clause>(?:[^;'"]*?[^;'"\s])??)\s*from\s*(?:(?<q>")(?<spec>[^'"\n]*)"|(?<q>')(?<spec>[^'"\n]*)')/y;
-  // The current pattern takes at most 17 steps a character on these.
+  // The current pattern takes at most 17 steps a character on these. The
+  // model walks every step in JavaScript, so each test declares a 20 s
+  // budget, as the house does for a test that is slow by construction.
   const STEPS_PER_CHARACTER = 32;
   const run = " ".repeat(20_000);
 
@@ -217,26 +219,34 @@ describe("one try reads a run once", () => {
     ["a run of newlines after import", `import${"\n".repeat(20_000)}x`, 0],
     ["a run after import type", `import type${run}x`, 0],
     ["a run after import type, then from without a quote", `import type${run}from${run}'x`, 0],
-  ] as const)("%s", (_, src, matches) => {
-    const bound = STEPS_PER_CHARACTER * src.length;
-    const counted = regexWork(bound, () => [...staticImportMatches(src)].length);
-    expect(counted.unmodelled).toEqual([]);
-    expect(counted.steps).toBeLessThanOrEqual(bound);
-    expect(counted.value).toBe(matches);
-    // Control: the count sees the old pattern go past the bound in one try.
-    BEFORE.lastIndex = 0;
-    expect(regexWork(bound, () => BEFORE.exec(src)).steps).toBe(Number.POSITIVE_INFINITY);
-  });
+  ] as const)(
+    "%s",
+    (_, src, matches) => {
+      const bound = STEPS_PER_CHARACTER * src.length;
+      const counted = regexWork(bound, () => [...staticImportMatches(src)].length);
+      expect(counted.unmodelled).toEqual([]);
+      expect(counted.steps).toBeLessThanOrEqual(bound);
+      expect(counted.value).toBe(matches);
+      // Control: the count sees the old pattern go past the bound in one try.
+      BEFORE.lastIndex = 0;
+      expect(regexWork(bound, () => BEFORE.exec(src)).steps).toBe(Number.POSITIVE_INFINITY);
+    },
+    20_000,
+  );
 
   test.each([
     ["a run inside the clause", `import { a${run}b } from "x";`],
     ["runs between every part", `import${run}type${run}{ a }${run}from${run}"x";`],
-  ])("%s, then a match", (_, src) => {
-    const bound = STEPS_PER_CHARACTER * src.length;
-    const counted = regexWork(bound, () => [...staticImportMatches(src)].map((m) => m.groups));
-    expect(counted.unmodelled).toEqual([]);
-    expect(counted.steps).toBeLessThanOrEqual(bound);
-    expect(counted.value).toHaveLength(1);
-    expect(counted.value?.[0]?.["spec"]).toBe("x");
-  });
+  ])(
+    "%s, then a match",
+    (_, src) => {
+      const bound = STEPS_PER_CHARACTER * src.length;
+      const counted = regexWork(bound, () => [...staticImportMatches(src)].map((m) => m.groups));
+      expect(counted.unmodelled).toEqual([]);
+      expect(counted.steps).toBeLessThanOrEqual(bound);
+      expect(counted.value).toHaveLength(1);
+      expect(counted.value?.[0]?.["spec"]).toBe("x");
+    },
+    20_000,
+  );
 });

@@ -140,7 +140,7 @@ describe("the reads return what the regex forms returned", () => {
     ];
     for (let c = 0; c <= 0xffff; c++) inputs.push(`// ${String.fromCharCode(c)}`);
     expect(answers(inputs, onlyCommentOpener)).toEqual(answers(inputs, (s) => OPENER.test(s)));
-  });
+  }, 20_000);
 });
 
 describe("no pattern rescans a run in a document or a diff line", () => {

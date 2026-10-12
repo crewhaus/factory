@@ -6,6 +6,9 @@
  * the path) and, when the run is not at the end, rescan the rest of it from
  * each before giving the start up: quadratic in the run's length. A workflow
  * is whatever the repository holds, so both strips are loops.
+ *
+ * A test that reads a long run through a whole parse declares a 20 s budget,
+ * as the house does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { classifyExpression, withoutTrailingDots } from "./lib/workflow";
@@ -128,7 +131,7 @@ describe("no pattern rescans a run in a workflow", () => {
       expect(unlisted(parsed.runs)).toEqual([]);
       const doc = (parsed.outcome as ReturnType<typeof parseYamlSubset>).doc;
       expect(asString(mapGet(doc, "run"))).toBe(`a\n${blanks}b${chomp === "|" ? "\n" : ""}`);
-    });
+    }, 20_000);
   }
 
   test("an expression whose event path holds a run of dots", () => {

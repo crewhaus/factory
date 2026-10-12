@@ -5,6 +5,9 @@
  * back to its fraction in turn when the text does not end where it should,
  * rescanning the rest from each: quadratic in the run's length. A cell is
  * whatever the CSV holds, so the check is a scan.
+ *
+ * A test that walks every code unit declares a 20 s budget, as the house
+ * does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { coerceCsvCell, inferTypeFromStrings, isDecimalNumberText } from "./lib/infer";
@@ -78,7 +81,7 @@ describe("a decimal number", () => {
     ];
     for (let c = 0; c <= 0xffff; c++) inputs.push(`1${String.fromCharCode(c)}2`);
     expect(answers(inputs, isDecimalNumberText)).toEqual(answers(inputs, (s) => REAL.test(s)));
-  });
+  }, 20_000);
 
   test("no pattern rescans a run of digits in a cell", () => {
     const digits = "1".repeat(100_000);

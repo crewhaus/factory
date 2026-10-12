@@ -77,7 +77,7 @@ describe("the reads answer what the patterns answered", () => {
     const inputs = [...allStrings(["1", ".", "-", "+", "x"], 6), "3.14", "-.5", "\u0661"];
     for (let c = 0; c <= 0xffff; c++) inputs.push(`1${String.fromCharCode(c)}2`);
     expect(answers(inputs, isPdfNumber)).toEqual(answers(inputs, (s) => NUMBER.test(s)));
-  });
+  }, 20_000);
 
   test("pageRangePart and the page range pattern", () => {
     const inputs = [...allStrings(["1", "2", " ", "-", "x"], 6), "10-", "-3", "1 - 3", "\u00a01"];

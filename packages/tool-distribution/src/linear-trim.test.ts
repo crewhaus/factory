@@ -9,8 +9,9 @@
  * length, on a manifest of up to 512K characters that is the model's or the
  * workspace's.
  *
- * A test that walks many generated inputs, or every code unit, declares a
- * 20 s budget, as the house does for a test that is slow by construction.
+ * A test that walks many generated inputs or every code unit, or reads a
+ * long run through a whole parse, declares a 20 s budget, as the house does
+ * for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -159,7 +160,7 @@ describe("no pattern rescans a run in a manifest", () => {
     const parsed = regexRunsOver(blanks, () => parseManifest(text, "f.rb", "homebrew"), ONE_PASS);
     expect(unlisted(parsed.runs)).toEqual([]);
     expect(parsed.outcome).toMatchObject({ ok: true, manifest: { version: "1.2.3" } });
-  });
+  }, 20_000);
 
   test("a winget line with a long indent before something else", () => {
     const indent = " ".repeat(100_000);

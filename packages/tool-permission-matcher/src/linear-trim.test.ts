@@ -205,5 +205,5 @@ describe("no pattern rescans a run in a spec's rule", () => {
       ["argument-cannot-match", undefined],
       ["argument-cannot-match", "WebFetch(https://a.example/*)"],
     ]);
-  });
+  }, 20_000);
 });

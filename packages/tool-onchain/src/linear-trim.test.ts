@@ -5,6 +5,9 @@
  * turn when the text does not end where it should, rescanning the rest from
  * each: quadratic in the run's length. The amount is the model's, with no
  * length limit, so the check is a scan.
+ *
+ * A test that walks every code unit declares a 20 s budget, as the house
+ * does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { isDecimalText, parseUnits } from "./lib/address";
@@ -71,7 +74,7 @@ describe("a decimal amount", () => {
     const inputs = [...allStrings(["1", "0", ".", "-", "x", " "], 5), "\u0661\u0662", "1e5", "+1"];
     for (let c = 0; c <= 0xffff; c++) inputs.push(`1${String.fromCharCode(c)}2`);
     expect(answers(inputs, isDecimalText)).toEqual(answers(inputs, (s) => DECIMAL.test(s)));
-  });
+  }, 20_000);
 
   test("no pattern rescans a run of digits before a stray character", () => {
     const digits = "1".repeat(100_000);

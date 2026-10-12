@@ -9,7 +9,9 @@
  *
  * Counted, not timed: the identifier test is a regular expression, so a hook
  * on `exec` counts its calls, and throws past the bound so the old walk
- * stops at once rather than after the minutes it would take.
+ * stops at once rather than after the minutes it would take. A test that
+ * reads a long source declares a 20 s budget, as the house does for a test
+ * that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { maskSource, scanExports, scanImports } from "./lib/scan";
@@ -70,7 +72,7 @@ describe("a long identifier is read once", () => {
       const counted = identifierTests(2 * src.length, () => masked(src));
       expect(counted.outcome).toBe(src);
       expect(counted.calls).toBeLessThanOrEqual(2 * src.length);
-    });
+    }, 20_000);
   }
 
   test("through the import and export scans", () => {
@@ -79,5 +81,5 @@ describe("a long identifier is read once", () => {
       const counted = identifierTests(4 * src.length, () => scan(src));
       expect(counted.outcome).not.toBeInstanceOf(Error);
     }
-  });
+  }, 20_000);
 });
