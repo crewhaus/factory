@@ -887,6 +887,9 @@ export function findOccurrences(src: string, name: string, maxLineChars = 300): 
   const { kind } = maskSource(src);
   const starts = lineStarts(src);
   const out: Occurrence[] = [];
+  // Each line's text, worked out once: a line can hold thousands of
+  // occurrences, and copying and trimming it for each was quadratic in them.
+  const texts = new Map<number, string>();
   let from = 0;
   while (true) {
     const idx = src.indexOf(name, from);
@@ -899,13 +902,14 @@ export function findOccurrences(src: string, name: string, maxLineChars = 300): 
     if (kind[idx] !== KIND_CODE) continue;
     const line = lineAt(starts, idx);
     const lineStart = starts[line - 1] as number;
-    const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
-    const text = src.slice(lineStart, lineEnd).trim();
-    out.push({
-      line,
-      column: idx - lineStart + 1,
-      text: text.length > maxLineChars ? `${text.slice(0, maxLineChars)}…` : text,
-    });
+    let text = texts.get(line);
+    if (text === undefined) {
+      const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
+      const trimmed = src.slice(lineStart, lineEnd).trim();
+      text = trimmed.length > maxLineChars ? `${trimmed.slice(0, maxLineChars)}…` : trimmed;
+      texts.set(line, text);
+    }
+    out.push({ line, column: idx - lineStart + 1, text });
   }
   return out;
 }
