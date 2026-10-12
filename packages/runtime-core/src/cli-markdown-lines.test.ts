@@ -6,6 +6,7 @@
  * such a line must not run those patterns.
  */
 import { describe, expect, test } from "bun:test";
+import { scanWork } from "./__test__/scan-work";
 import { createCliMarkdownRenderer } from "./cli-markdown";
 import { bulletParts, fenceParts, headingParts, numberedParts } from "./cli-markdown-lines";
 
@@ -59,6 +60,9 @@ describe("each line reader returns its pattern's captures", () => {
       "\t",
       "\r",
       "\u2028",
+      "\u2029",
+      // U+0085 (NEL) is neither \s nor a line terminator to these patterns.
+      "\u0085",
       "#",
       "#######",
       "-",
@@ -93,7 +97,7 @@ describe("each line reader returns its pattern's captures", () => {
     // Fence lines start with ```: more of them, with what may follow one.
     for (const line of randomTexts(pieces, 10_000, 4)) visit(`\`\`\`${line}`);
     expect(differ).toEqual([]);
-    expect(checked).toBe((16 ** 5 - 1) / 15);
+    expect(checked).toBe((18 ** 5 - 1) / 17);
     for (const m of matched) expect(m).toBeGreaterThan(1_000);
   }, 30_000);
 });
@@ -143,4 +147,30 @@ describe("rendering a reply with a long run of spaces in a line", () => {
     expect(ran).toEqual([`/${HEADING.source}/`]);
     expect(out.split("\n")).toHaveLength(5);
   }, 20_000);
+});
+
+// Counted, not timed: a scan can rescan a run with no pattern at all (a search
+// that resumes one character on instead of after what it read), so each
+// reader's own reads are counted (__test__/scan-work.ts) over lines shaped to
+// make it rescan, and held to a few per character. A rescan reads the rest of
+// the run from every place in it and stops at the bound at once.
+describe("each line reader takes a long line in a bounded number of reads", () => {
+  const N = 20_000;
+  const PER_CHARACTER = 8;
+  const cases: ReadonlyArray<readonly [string, (text: string) => unknown, string]> = [
+    ["a fence with a long run of spaces", fenceParts, `\`\`\`${" ".repeat(N)}x y`],
+    ["a CRLF heading with a long run of spaces", headingParts, `#${" ".repeat(N)}x\r`],
+    ["a CRLF bullet with a long run of spaces", bulletParts, `-${" ".repeat(N)}x\r`],
+    ["a CRLF numbered item with a long run of spaces", numberedParts, `1.${" ".repeat(N)}x\r`],
+  ];
+  for (const [label, scan, text] of cases) {
+    test(label, () => {
+      const most = PER_CHARACTER * text.length;
+      const { work } = scanWork(most, () => scan(text));
+      expect(work).toBeLessThanOrEqual(most);
+      // The count sees the run being read; a scan that read it some other
+      // way would read as no work here.
+      expect(work).toBeGreaterThanOrEqual(text.length);
+    });
+  }
 });
