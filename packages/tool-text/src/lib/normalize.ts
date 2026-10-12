@@ -37,6 +37,22 @@ const INVISIBLE_PATTERN = new RegExp(
   "g",
 );
 
+/**
+ * `line` without its trailing spaces and tabs: what
+ * `line.replace(/[ \t]+$/, "")` returned, in one pass from the end. That
+ * pattern tries every start inside a run of blanks that is not at the end of
+ * the line and rescans the rest of the run from each, so it was quadratic in
+ * the run's length.
+ */
+export function withoutTrailingBlanks(line: string): string {
+  let end = line.length;
+  for (; end > 0; end--) {
+    const c = line.charCodeAt(end - 1);
+    if (c !== 0x20 && c !== 0x09) break;
+  }
+  return end === line.length ? line : line.slice(0, end);
+}
+
 export type NormalizeOptions = {
   readonly eol?: "lf" | "crlf";
   readonly trimTrailingWhitespace?: boolean;
@@ -63,10 +79,7 @@ export function normalizeText(text: string, opts: NormalizeOptions): string {
   // Fold to LF first so later rules see one shape, then convert at the end.
   out = out.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (opts.trimTrailingWhitespace === true) {
-    out = out
-      .split("\n")
-      .map((l) => l.replace(/[ \t]+$/, ""))
-      .join("\n");
+    out = out.split("\n").map(withoutTrailingBlanks).join("\n");
   }
   if (opts.collapseBlankLines === true) out = out.replace(/\n{3,}/g, "\n\n");
   if (opts.lowercase === true) out = out.toLowerCase();
