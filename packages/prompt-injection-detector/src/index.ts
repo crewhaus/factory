@@ -33,6 +33,14 @@
  * classification).
  */
 
+import {
+  findBackgroundCommand,
+  findRoleMarker,
+  findScriptIframe,
+  findUrlCredentialPair,
+  scanned,
+} from "./linear-rules";
+
 export type PromptInjectionClassification = "clean" | "suspicious" | "malicious";
 
 export type PromptInjectionSeverity = "low" | "medium" | "high";
@@ -264,7 +272,10 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "system-role-marker",
-    pattern: /<\|im_start\|>\s*system|<\|system\|>|\[INST\][\s\S]*?\[\/INST\]/,
+    pattern: scanned(
+      /<\|im_start\|>\s*system|<\|system\|>|\[INST\][\s\S]*?\[\/INST\]/,
+      findRoleMarker,
+    ),
     severity: "high",
     description: "OpenAI/Anthropic role-marker injection",
   },
@@ -336,7 +347,10 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "iframe-embed",
-    pattern: /<iframe\s+[^>]*\bsrc\s*=\s*["'](?:javascript:|data:text\/html)/i,
+    pattern: scanned(
+      /<iframe\s+[^>]*\bsrc\s*=\s*["'](?:javascript:|data:text\/html)/i,
+      findScriptIframe,
+    ),
     severity: "high",
   },
   {
@@ -433,7 +447,10 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
   },
   {
     id: "tool-run-in-background",
-    pattern: /\b(?:nohup|setsid|disown).*?(?:rm|curl|wget|nc|bash)\b/i,
+    pattern: scanned(
+      /\b(?:nohup|setsid|disown).*?(?:rm|curl|wget|nc|bash)\b/i,
+      findBackgroundCommand,
+    ),
     severity: "medium",
   },
   {
@@ -704,15 +721,14 @@ function structuralHits(text: string): PromptInjectionHit[] {
     }
   }
 
-  // Smuggled URL with credential exfil pattern in the same line.
-  const urlExfil =
-    /(?:https?:\/\/[^\s)]+)[^\n]{0,80}\b(?:token|secret|api[_\s-]?key|cookie|session)\b/i.exec(
-      text,
-    );
+  // Smuggled URL with credential exfil pattern in the same line:
+  // /(?:https?:\/\/[^\s)]+)[^\n]{0,80}\b(?:token|secret|api[_\s-]?key|cookie|session)\b/i,
+  // found by a scan (linear-rules.ts) because the engine is quadratic in a URL.
+  const urlExfil = findUrlCredentialPair(text);
   if (urlExfil) {
     hits.push({
       rule: "structural-url-exfil-pair",
-      span: [urlExfil.index, urlExfil.index + urlExfil[0].length],
+      span: [urlExfil.index, urlExfil.end],
       severity: "medium",
       layer: "structural",
     });
