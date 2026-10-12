@@ -23,7 +23,10 @@ let answer: () => Response = () => new Response("");
 
 beforeAll(() => {
   bomb = new Uint8Array(gzipSync(new Uint8Array(64 * 1024 * 1024), { level: 9 }));
-});
+  // Slow by construction: gzipping 64 MiB is about 0.1 s here and many
+  // times that on a loaded CI runner. bun gives a hook its own 5 s default,
+  // whatever budget the tests declare, so the hook declares one too.
+}, 20_000);
 
 beforeEach(() => {
   inits = [];
