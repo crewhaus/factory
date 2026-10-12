@@ -605,6 +605,84 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
   const cliCalls = () => calls.filter((c) => c.argv[0] === "docker" || c.argv[0] === "podman");
   const reaperCalls = () => calls.filter((c) => c.argv[3] === SANDBOX_REAPER_TAG);
 
+  /**
+   * Runs `run` with the run's timeout held. `performance.now` reads one
+   * value until the `start` client is spawned, so the create spends none of
+   * the timeout and the start phase is armed with all of `ms`, however slow
+   * the CLI was to start. Every timer armed for exactly `ms` is held: the
+   * create's, which is cleared once the create answers, and the start's,
+   * which fires only when the test calls `fire` — once the program has
+   * printed what the test checks. Every other timer runs as usual. A real
+   * 3 s timeout spanned two CLI starts instead, and a runner 1.6 s slow to
+   * start each killed the program before its first line. `fire` hands the
+   * timer's callback to a microtask, outside the chunk hook, where a throw
+   * would be swallowed.
+   */
+  async function withRunTimeoutHeld<T>(
+    ms: number,
+    run: (fire: () => void) => Promise<T>,
+  ): Promise<{ result: T; fired: boolean; problem?: string }> {
+    type Held = { id: ReturnType<typeof setTimeout>; callback: () => void; cleared: boolean };
+    const createPhase: Held[] = [];
+    const startPhase: Held[] = [];
+    const state: { fired: boolean; problem?: string } = { fired: false };
+    const started = () => calls.some((c) => c.argv[1] === "start");
+    const realNow = performance.now.bind(performance);
+    const frozenAt = realNow();
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const clock = spyOn(performance, "now").mockImplementation(() =>
+      started() ? realNow() : frozenAt,
+    );
+    const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (delay !== ms) return realSetTimeout(fn, delay, ...rest);
+      const id = Symbol("held timeout") as unknown as ReturnType<typeof setTimeout>;
+      (started() ? startPhase : createPhase).push({
+        id,
+        callback: () => fn(...rest),
+        cleared: false,
+      });
+      return id;
+    }) as typeof setTimeout);
+    const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      const timer = [...createPhase, ...startPhase].find((t) => t.id === id);
+      if (timer !== undefined) timer.cleared = true;
+      else realClearTimeout(id);
+    }) as typeof clearTimeout);
+    const fire = (): void => {
+      if (state.fired) return;
+      state.fired = true;
+      const live = startPhase.filter((t) => !t.cleared);
+      const timer = live[0];
+      if (live.length !== 1 || timer === undefined) {
+        state.problem = `${live.length} start-phase timeouts were armed while the program ran`;
+        return;
+      }
+      queueMicrotask(timer.callback);
+    };
+    try {
+      const result = await run(fire);
+      if (createPhase.length !== 1 || createPhase[0]?.cleared !== true) {
+        state.problem ??= "the create's timeout was not armed and cleared once";
+      }
+      return {
+        result,
+        fired: state.fired,
+        ...(state.problem === undefined ? {} : { problem: state.problem }),
+      };
+    } finally {
+      clock.mockRestore();
+      held.mockRestore();
+      cleared.mockRestore();
+    }
+  }
+
   function routeCli(cliPath: (argv0: string) => string | undefined): void {
     const orig = Bun.spawn.bind(Bun);
     spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
@@ -856,11 +934,20 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
   // the program ended on its own, and the container outlived the timeout.
   test("a timeout kills the container by name, and the call returns without waiting for it", async () => {
     const sandbox = createSandbox({ backend: "docker" });
-    const result = await runExec(sandbox, {
-      image: "alpine:3.19",
-      argv: ["sh", "-c", "echo started; sleep 30; echo never"],
-      timeoutMs: 3_000,
-    });
+    // The timeout fires once the program has printed (see withRunTimeoutHeld).
+    let printed = "";
+    const { result, fired, problem } = await withRunTimeoutHeld(3_000, (fire) =>
+      runExec(sandbox, {
+        image: "alpine:3.19",
+        argv: ["sh", "-c", "sleep 30 & echo started; wait; echo never"],
+        timeoutMs: 3_000,
+        onStdoutChunk: (chunk) => {
+          printed += chunk;
+          if (printed.includes("\n")) fire();
+        },
+      }),
+    );
+    expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
     const lines = cliLog();
     const name = nameOf(lines[0]);
     expect(name).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
@@ -872,10 +959,10 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(await waitGone(containerPid(name), 10_000)).toBe(true);
     expect(records()).toEqual([]);
     expect(result.strayContainer).toBeUndefined();
-    // The program's `sleep 30` outlives the kill of its shell and still holds
-    // the pipe: the call stopped reading at the drain grace instead of waiting
-    // for it, and says the output may be incomplete. A call that waited would
-    // run past this test's budget.
+    // The program's `sleep 30`, started before it printed, outlives the kill
+    // of its shell and still holds the pipe: the call stopped reading at the
+    // drain grace instead of waiting for it, and says the output may be
+    // incomplete. A call that waited would run past this test's budget.
     expect(result.outputComplete).toBe(false);
   }, 20_000);
 
