@@ -38,8 +38,16 @@
 import { parseEnvText, unquoteEnvValue } from "@crewhaus/harness-supervisor";
 import { ENV_NAME_RE, type Refusal, type Resolved, refuse } from "./refs";
 
-/** A live assignment, matched on the TRIMMED line exactly as the reader does. */
-const ASSIGN_RE = /^(export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.*)$/;
+/**
+ * A live assignment, matched on the TRIMMED line exactly as the reader does.
+ *
+ * The blanks after `=` are taken whole (`(?![ \t])`). When a line break that
+ * `.` cannot pass (`\r`, U+2028, U+2029) sat later in the line, the pattern
+ * gave them back one at a time and ran `(.*)` to the break from each:
+ * quadratic in the blanks. A match never gave any back, so the groups are
+ * the same.
+ */
+export const ASSIGN_RE = /^(export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(?![ \t])(.*)$/;
 /** A commented-out assignment: the stub `doctor --fix` leaves behind. */
 const STUB_RE = /^#[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/;
 
