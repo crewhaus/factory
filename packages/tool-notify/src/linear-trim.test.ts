@@ -7,11 +7,17 @@
  * model's (`apiBaseUrl` has no length limit) and the path is built before
  * the origin is checked, so the strip is a loop.
  *
+ * A Teams webhook path is checked a segment at a time. Its pattern's
+ * `[^/]+@` overlapped the `@`, so it tried every `@` of a run and rescanned
+ * the rest of the segment from each: quadratic in a URL the call wrote
+ * (`url` has no length limit), before the allow-list was asked.
+ *
  * Nothing is sent: the origin is not on the allow-list, so the call is
  * refused after the path is built and before any request.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { _resetNotifyConfig, chatPost, registerNotifyConfig } from "./index";
+import { _resetNotifyConfig, chatPost, registerNotifyConfig, webhookPost } from "./index";
+import { isTeamsWebhookPath } from "./lib/webhook-path";
 
 /**
  * Every regular expression run over a string holding `run` while `body`
@@ -97,5 +103,73 @@ describe("an API base URL with a run of slashes in its path", () => {
     );
     expect(posted.runs).toEqual([]);
     expect(String(posted.outcome)).toContain("allow-list");
+  });
+});
+
+describe("a Teams webhook path with a run of @ in its segment", () => {
+  // The pattern as it was.
+  const TEAMS = /^\/webhookb2\/[^/]+@[^/]+\/IncomingWebhook\/.+/i;
+
+  test("isTeamsWebhookPath answers what the pattern answered", () => {
+    const inputs: string[] = [];
+    for (const prefix of [
+      "/webhookb2/",
+      "/WebHookB2/",
+      "/webhookb2",
+      "webhookb2/",
+      "//webhookb2/",
+    ]) {
+      for (const segment of allStrings(["a", "@", "/"], 4)) {
+        for (const marker of ["/IncomingWebhook/", "/INCOMINGwebhook/", "/IncomingWebhook", ""]) {
+          for (const rest of ["", "x", "\n", "\u2028x", "/"]) {
+            inputs.push(prefix + segment + marker + rest);
+          }
+        }
+      }
+    }
+    // Every code unit, in a letter of each fixed part, in the segment and
+    // after the marker.
+    for (let c = 0; c <= 0xffff; c++) {
+      const ch = String.fromCharCode(c);
+      inputs.push(
+        `/webhoo${ch}b2/a@b/IncomingWebhook/x`,
+        `/webhookb2/a${ch}b/IncomingWebhook/x`,
+        `/webhookb2/a@b/Incoming${ch}ebhook/x`,
+        `/webhookb2/a@b/IncomingWebhook/${ch}`,
+      );
+    }
+    expect(answers(inputs, isTeamsWebhookPath)).toEqual(answers(inputs, (s) => TEAMS.test(s)));
+  }, 20_000);
+
+  test("no pattern rescans the run before the allow-list is asked", async () => {
+    const ats = "@".repeat(100_000);
+    // Control: the count sees the old pattern run over the run.
+    const path = `/webhookb2/${ats}`;
+    expect((await regexRunsOver(ats, () => TEAMS.test(path))).runs).toEqual([
+      `/${TEAMS.source}/ over ${path.length} characters`,
+    ]);
+    registerNotifyConfig({ allowed_origins: [], allowed_secret_envs: [] });
+    // The Slack and Discord shapes are anchored and stop at the first
+    // character that differs.
+    const shapes = ["^\\/services\\/T[^/]+\\/B[^/]+\\/.+", "^\\/api\\/webhooks\\/\\d+\\/.+"];
+    const origin = "https://hooks.example.invalid";
+    const plain = await regexRunsOver(
+      ats,
+      () => webhookPost.execute({ url: `${origin}/webhookb2/${ats}`, payload: { a: 1 } }),
+      shapes,
+    );
+    expect(plain.runs.map((r) => r.replace(/ over .*/, ""))).toEqual(shapes.map((p) => `/${p}/`));
+    expect(String(plain.outcome)).toContain("allow-list");
+    // As before: a Teams webhook path is refused as a credential.
+    const teams = await regexRunsOver(
+      ats,
+      () =>
+        webhookPost.execute({
+          url: `${origin}/webhookb2/${ats}/IncomingWebhook/x`,
+          payload: { a: 1 },
+        }),
+      shapes,
+    );
+    expect(String(teams.outcome)).toContain("incoming-webhook URL");
   });
 });

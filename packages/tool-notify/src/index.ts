@@ -77,6 +77,7 @@ import { rateLimitGate as evaluateRateLimit } from "./lib/ratelimit";
 import type { RateState } from "./lib/ratelimit";
 import { formatSignatureHeader, hmacHex, signedPayload } from "./lib/sign";
 import { renderTemplate as renderTemplateValues } from "./lib/template";
+import { isTeamsWebhookPath } from "./lib/webhook-path";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_TIMEOUT_MS,
@@ -455,21 +456,25 @@ function webhookUrlFrom(
 /**
  * The incoming-webhook URL shapes that ARE the credential.
  *
- * A Slack `/services/T…/B…/xxxx` or Discord `/api/webhooks/<id>/<token>`
- * path grants posting rights to whoever holds it. Passed inline it lands in
+ * A Slack `/services/T…/B…/xxxx`, Discord `/api/webhooks/<id>/<token>` or
+ * Teams `/webhookb2/…@…/IncomingWebhook/…` path grants posting rights to
+ * whoever holds it. Passed inline it lands in
  * the transcript, the trace and usually an eval report — the same reason
  * every other secret here is named rather than passed — so it is refused
  * with the variable form pointed at instead.
  */
-const WEBHOOK_CREDENTIAL_PATHS: readonly RegExp[] = [
-  /^\/services\/T[^/]+\/B[^/]+\/.+/i,
-  /^\/api\/webhooks\/\d+\/.+/i,
-  /^\/webhookb2\/[^/]+@[^/]+\/IncomingWebhook\/.+/i,
+const SLACK_WEBHOOK_PATH = /^\/services\/T[^/]+\/B[^/]+\/.+/i;
+const DISCORD_WEBHOOK_PATH = /^\/api\/webhooks\/\d+\/.+/i;
+const WEBHOOK_CREDENTIAL_PATHS: ReadonlyArray<(path: string) => boolean> = [
+  (path) => SLACK_WEBHOOK_PATH.test(path),
+  (path) => DISCORD_WEBHOOK_PATH.test(path),
+  // A Teams path is read a segment at a time: see isTeamsWebhookPath.
+  isTeamsWebhookPath,
 ];
 
 /** A refusal when `url` carries a credential in its path, else `null`. */
 function inlineWebhookCredential(url: URL): string | null {
-  if (!WEBHOOK_CREDENTIAL_PATHS.some((shape) => shape.test(url.pathname))) return null;
+  if (!WEBHOOK_CREDENTIAL_PATHS.some((shape) => shape(url.pathname))) return null;
   return "that URL is an incoming-webhook URL, whose path is itself the credential — name the environment variable holding it in urlEnv instead of passing it here, where it would be recorded verbatim. (The value has not been echoed back.)";
 }
 
