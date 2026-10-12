@@ -37,6 +37,7 @@ import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { isTestOnly } from "./test-only";
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -75,7 +76,11 @@ function publishable(): Pkg[] {
   return out;
 }
 
-/** Non-test sources under src/, fixtures excluded. */
+/**
+ * Non-test sources under src/: fixtures, and every module only tests may use
+ * (`isTestOnly`: `__test__/` helpers and the like, which no build compiles or
+ * ships), excluded.
+ */
 function sources(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -86,7 +91,8 @@ function sources(dir: string): string[] {
     } else if (
       /\.tsx?$/.test(entry.name) &&
       !/\.test\.tsx?$/.test(entry.name) &&
-      !entry.name.endsWith(".d.ts")
+      !entry.name.endsWith(".d.ts") &&
+      !isTestOnly(path)
     ) {
       out.push(path);
     }
