@@ -8,7 +8,8 @@
  * match", so RegexExtract reported count 0 and RuleClassify fell back to its
  * default label.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import { regexExtract, ruleClassify } from "./index";
 
@@ -27,33 +28,59 @@ type Tool = typeof regexExtract;
  */
 const GIVES_UP = { pattern: "a*a*a*a*b", text: "a".repeat(12) };
 
-/** GIVES_UP runs over its text on the caller's thread, where nothing can stop them. */
-let onThisThread = 0;
+/** Taken before any test changes them. */
+const GIVE_UP_MS = REGEX_RUN_DEFAULTS.giveUpMs;
+const NATIVE_EXEC = RegExp.prototype.exec;
+
+/** Runs of GIVES_UP over its text on the caller's thread, counted for the call that made them. */
+const ranHere = new AsyncLocalStorage<{ count: number }>();
+
+/** The {@link callGivingUp} whose settings are in place; undefined when none is. */
+let installed: object | undefined;
+
+/** Put back the real give-up threshold and `exec`, whoever changed them. */
+function putBack(): void {
+  installed = undefined;
+  (REGEX_RUN_DEFAULTS as { giveUpMs: number }).giveUpMs = GIVE_UP_MS;
+  RegExp.prototype.exec = NATIVE_EXEC;
+}
+
+// A body abandoned at its budget never reaches its own finally. Without
+// this, its 0 ms threshold would stay for the rest of the process, and
+// every definite no-match after it would read as a give-up.
+afterEach(putBack);
+
+function refuseGivesUpHere(this: RegExp, text: string): RegExpExecArray | null {
+  if (this.source === GIVES_UP.pattern && text === GIVES_UP.text) {
+    const mine = ranHere.getStore();
+    if (mine !== undefined) mine.count += 1;
+    throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
+  }
+  return NATIVE_EXEC.call(this, text);
+}
 
 /**
  * Run a tool with every no-match the regex worker sees reported as the
  * engine giving up. A run of GIVES_UP over its text on this thread, as in
- * 0.7.0, is counted and refused.
+ * 0.7.0, is refused, and counted in `onThisThread`.
  */
-// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
-async function callGivingUp(tool: Tool, input: unknown): Promise<any> {
-  const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
-  const giveUpMs = defaults.giveUpMs;
-  const realExec = RegExp.prototype.exec;
-  onThisThread = 0;
-  defaults.giveUpMs = 0;
-  RegExp.prototype.exec = function (this: RegExp, text: string) {
-    if (this.source === GIVES_UP.pattern && text === GIVES_UP.text) {
-      onThisThread += 1;
-      throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
-    }
-    return realExec.call(this, text);
-  };
+async function callGivingUp(
+  tool: Tool,
+  input: unknown,
+  // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+): Promise<{ result: any; onThisThread: number }> {
+  const mine = {};
+  const ran = { count: 0 };
+  installed = mine;
+  (REGEX_RUN_DEFAULTS as { giveUpMs: number }).giveUpMs = 0;
+  RegExp.prototype.exec = refuseGivesUpHere;
   try {
-    return await call(tool, input);
+    const result = await ranHere.run(ran, () => call(tool, input));
+    return { result, onThisThread: ran.count };
   } finally {
-    RegExp.prototype.exec = realExec;
-    defaults.giveUpMs = giveUpMs;
+    // Only while still the one in place: a call abandoned by an earlier
+    // test must not undo a later test's in the middle of its call.
+    if (installed === mine) putBack();
   }
 }
 
@@ -69,7 +96,7 @@ async function call(tool: Tool, input: unknown): Promise<any> {
 
 describe("RegexExtract", () => {
   test("the match runs off the caller's thread, and a give-up is not a count of 0", async () => {
-    const result = await callGivingUp(regexExtract, {
+    const { result, onThisThread } = await callGivingUp(regexExtract, {
       text: GIVES_UP.text,
       pattern: GIVES_UP.pattern,
     });
@@ -102,7 +129,7 @@ describe("RegexExtract", () => {
 
 describe("RuleClassify", () => {
   test("a regex rule with no answer gives no label, not the default", async () => {
-    const result = await callGivingUp(ruleClassify as Tool, {
+    const { result, onThisThread } = await callGivingUp(ruleClassify as Tool, {
       text: GIVES_UP.text,
       rules: [
         { label: "slow", patterns: [GIVES_UP.pattern], regex: true, weight: 5 },
