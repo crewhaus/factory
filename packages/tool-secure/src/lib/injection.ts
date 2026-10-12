@@ -28,7 +28,7 @@
  * attacker-controlled text. Show it to a person; do not paste it into a
  * prompt as if it were instructions.
  */
-import { type Finding, compareStrings, matchAll, withPositions } from "./text";
+import { type Finding, compareStrings, matchAll, matchAllSkipping, withPositions } from "./text";
 import { scanInvisible } from "./unicode";
 
 export type InjectionCategory =
@@ -46,7 +46,63 @@ export type InjectionRule = {
   readonly weight: number;
   readonly description: string;
   readonly pattern: RegExp;
+  /**
+   * The pattern's matches when a plain global search would rescan a run;
+   * the same matches as `matchAll(text, pattern)`.
+   */
+  readonly matches?: (text: string) => Iterable<{ index: number; match: RegExpExecArray }>;
 };
+
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** Where `^` matches under the `m` flag. */
+function isLineStart(text: string, at: number): boolean {
+  if (at === 0) return true;
+  const c = text.charCodeAt(at - 1);
+  return c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+}
+
+const CHAT_MARKUP =
+  /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim;
+
+/**
+ * CHAT_MARKUP's matches. Its `^\s*###` branch starts at every line and runs
+ * its `\s*` on across blank lines, so a run of blank lines was rescanned from
+ * each line start in it: quadratic in the run's length. The other branches
+ * start at `<` or `[`, which no whitespace is, so a try at a line start that
+ * fails rules out every start up to the end of its whitespace.
+ */
+function chatMarkupMatches(text: string): Iterable<{ index: number; match: RegExpExecArray }> {
+  return matchAllSkipping(
+    text,
+    CHAT_MARKUP,
+    (t, at) => {
+      const c = t.charCodeAt(at);
+      return c === 0x3c || c === 0x5b || isLineStart(t, at);
+    },
+    (t, at) => {
+      if (!isLineStart(t, at)) return at + 1;
+      let i = at;
+      while (i < t.length && isRegExpSpace(t.charCodeAt(i))) i++;
+      return i;
+    },
+  );
+}
 
 /** The phrase rules. Also run against decoded base64, once, no recursion. */
 export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
@@ -87,8 +143,8 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "override",
     weight: 30,
     description: "embeds chat-template or role markup, trying to close the current turn",
-    pattern:
-      /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim,
+    pattern: CHAT_MARKUP,
+    matches: chatMarkupMatches,
   },
   {
     id: "role.you-are-now",
@@ -277,7 +333,7 @@ function phraseHits(
 ): Array<Omit<Finding, "line" | "column">> {
   const raw: Array<Omit<Finding, "line" | "column">> = [];
   for (const rule of INJECTION_RULES) {
-    for (const { index, match } of matchAll(text, rule.pattern)) {
+    for (const { index, match } of rule.matches?.(text) ?? matchAll(text, rule.pattern)) {
       raw.push({
         type: rule.category,
         rule: rule.id,

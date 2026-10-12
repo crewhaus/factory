@@ -232,6 +232,47 @@ export function* matchAll(
 }
 
 /**
+ * `matchAll(text, pattern)`'s matches, in order, with the pattern tried
+ * (sticky) only where `canStart` says a match may begin, and, after a try
+ * that fails at `at`, not again before `failedTo(text, at)`.
+ *
+ * For a pattern that opens with an unbounded run (an email's local part, a
+ * word before a comma, the whitespace after a line start), a global search
+ * that fails at one start moves one character right and scans the same run
+ * again: quadratic in the run's length. Every later start inside such a run
+ * shares the run's end and reads the same text after it, so it fails too;
+ * `failedTo` names where that stops being true, and the matches are the
+ * global pattern's, start for start. After a match the next try is at its
+ * end (one further for an empty match), as `lastIndex` would be.
+ */
+export function* matchAllSkipping(
+  text: string,
+  pattern: RegExp,
+  canStart: (text: string, at: number) => boolean,
+  failedTo: (text: string, at: number) => number,
+): Generator<{ index: number; match: RegExpExecArray }> {
+  let flags = pattern.flags.replace("g", "");
+  if (!flags.includes("d")) flags = `${flags}d`;
+  if (!flags.includes("y")) flags = `${flags}y`;
+  const re = new RegExp(pattern.source, flags);
+  let at = 0;
+  while (at <= text.length) {
+    if (!canStart(text, at)) {
+      at++;
+      continue;
+    }
+    re.lastIndex = at;
+    const m = re.exec(text);
+    if (m !== null) {
+      yield { index: at, match: m };
+      at += Math.max(1, m[0].length);
+      continue;
+    }
+    at = Math.max(at + 1, failedTo(text, at));
+  }
+}
+
+/**
  * The absolute `[start, end)` of one capture group of a match produced by
  * `matchAll`, or `undefined` when the group did not participate.
  *
