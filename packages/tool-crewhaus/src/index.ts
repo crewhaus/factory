@@ -873,6 +873,8 @@ export const preflightRun: RegisteredTool = buildTool({
 
 export const harnessInventory: RegisteredTool = buildTool({
   name: "HarnessInventory",
+  // The directory it walks for harnesses.
+  operativeArgs: [{ field: "root", kind: "path", default: ".", beneath: "all" }],
   description:
     "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec (`unreadable`, with the reason, when that cannot be determined). Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
   inputSchema: z.object({
@@ -936,6 +938,11 @@ export const harnessInventory: RegisteredTool = buildTool({
 
 export const bundleFreshness: RegisteredTool = buildTool({
   name: "BundleFreshness",
+  // The harnesses named, or the directory walked for them.
+  operativeArgs: [
+    { field: "dirs", kind: "path" },
+    { field: "root", kind: "path", default: ".", beneath: "all" },
+  ],
   description:
     'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different". A bundle or spec that exists but cannot be examined is `unreadable`, with the reason, never reported as missing.',
   inputSchema: z.object({

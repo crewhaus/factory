@@ -68,9 +68,11 @@ function valueAt(kind: OperativeValueKind, value: string, cwd: string): Operativ
  * value may come from any. `undefined` when none walks.
  */
 function builtinWalk(toolName: string): "all" | "visible" | undefined {
+  // A walk a call can switch into hidden names (`hiddenWhen`) reaches them
+  // for some call the allow covers, so it counts as `all` here.
   const walks = (TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs ?? [])
     .filter((arg) => arg.kind === "path" && arg.beneath !== undefined)
-    .map((arg) => arg.beneath);
+    .map((arg) => (arg.hiddenWhen !== undefined ? "all" : arg.beneath));
   if (walks.length === 0) return undefined;
   return walks.includes("all") ? "all" : "visible";
 }

@@ -64,6 +64,22 @@ describe("a path allow on a tool that walks directories (final review)", () => {
       ).map((g) => g.pattern),
     ).toEqual(["Grep(src/secrets/**)"]);
   });
+
+  test("a walk a call can switch into hidden names counts them (critic8)", () => {
+    // Settings `alwaysAllow Tree(src)` covers `Tree src includeHidden`, which
+    // lists src/.env, so the spec's deny on it is overridden.
+    const tree = { toolName: "Tree", scopedValue: "src", valueKind: "path" as const };
+    expect(
+      guardsOverridden(tree, [yaml("alwaysDeny", "Tree(src/.env)")], "/ws").map((g) => g.pattern),
+    ).toEqual(["Tree(src/.env)"]);
+    // StateExport dumps every file under its directory.
+    const dump = { toolName: "StateExport", scopedValue: ".", valueKind: "path" as const };
+    expect(
+      guardsOverridden(dump, [yaml("alwaysDeny", "StateExport(secrets/**)")], "/ws").map(
+        (g) => g.pattern,
+      ),
+    ).toEqual(["StateExport(secrets/**)"]);
+  });
 });
 
 describe("an allow of a shell line (0.7.1)", () => {

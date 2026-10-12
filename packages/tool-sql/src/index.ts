@@ -1805,6 +1805,10 @@ function readApplied(
 
 export const migrationStatus: RegisteredTool = buildTool({
   name: "MigrationStatus",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "directory", kind: "path", beneath: "all" },
+  ],
   description:
     "Report which .sql migrations in a directory have been applied to a database and which are still pending. Use before applying anything, and to compare two environments: besides pending and applied it flags a migration whose file changed after it ran, a recorded migration whose file is gone, and a pending file that sorts before one already applied. Files are ordered by plain filename comparison, so mixed-width numeric prefixes are called out as ambiguous.",
   inputSchema: z.object(migrationFields),

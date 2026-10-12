@@ -499,6 +499,11 @@ type InboxRow = ApprovalRow & { readonly harness: string };
 
 export const approvalsInbox: RegisteredTool = buildTool({
   name: "ApprovalsInbox",
+  // The harnesses named, or the directory walked for them.
+  operativeArgs: [
+    { field: "harnesses", kind: "path" },
+    { field: "root", kind: "path", default: ".", beneath: "all" },
+  ],
   description:
     "The fleet's parked tool-approval requests in one page: every harness under a root that has a `crewhaus.yaml`, folded into a single list with the harness, the tool and the argument that parked each run. Use as the operator's morning read — one blocked harness in a fleet of twenty is invisible from any single run. A harness whose ledger cannot be read is listed in `unreadableHarnesses` and makes the totals a FLOOR rather than a total, so one bad mount never reports the fleet as idle. A pure read: it settles nothing and rewrites nothing.",
   inputSchema: z.object({

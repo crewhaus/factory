@@ -66,6 +66,16 @@ describe("operativeArgWords — a declaration in words", () => {
         { field: "path", kind: "path", default: ".", beneath: "visible" },
         "a path; a directory stands for everything beneath it except hidden names; left out, the workspace root",
       ],
+      [
+        {
+          field: "path",
+          kind: "path",
+          default: ".",
+          beneath: "visible",
+          hiddenWhen: "includeHidden",
+        },
+        "a path; a directory stands for everything beneath it except hidden names, and for those too when includeHidden is true; left out, the workspace root",
+      ],
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
   });
@@ -114,6 +124,16 @@ describe("ruleScopeFor — the three answers", () => {
       "an allow must match every one of these; a deny or ask fires on any one",
     );
     expect(lines).toContain("these are of different kinds");
+  });
+
+  test("a store the tool walks gets an example on the store it uses by default", () => {
+    const scope = ruleScopeFor("StateExport", [
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", beneath: "all" },
+    ]);
+    expect(scope.example).toEqual({
+      type: "alwaysAllow",
+      pattern: "StateExport(.crewhaus/state/**)",
+    });
   });
 
   test("an allow skips a relocating field the call leaves out, so the example is about the others", () => {

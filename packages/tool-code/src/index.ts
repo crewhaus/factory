@@ -1153,6 +1153,8 @@ const MAX_PATTERN_NAME_CHARS = 1_024;
 
 export const astQuery: RegisteredTool = buildTool({
   name: "AstQuery",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run, and a name the pattern could not be checked against is listed as unchecked, never dropped as a non-match.",
   inputSchema: z.object({
@@ -1340,6 +1342,8 @@ export const symbolOutline: RegisteredTool = buildTool({
 
 export const findReferences: RegisteredTool = buildTool({
   name: "FindReferences",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "Find every mention of an identifier across a directory, with file and line, skipping comments and string literals. Use it before renaming or deleting something, to see what would break. It is LEXICAL, not semantic: it matches the characters, so a local variable of the same name, a property on an unrelated object, and a shadowed binding all appear, and a name reached through an aliased import does not.",
   inputSchema: z.object({
@@ -1394,6 +1398,8 @@ export const findReferences: RegisteredTool = buildTool({
 
 export const importGraph: RegisteredTool = buildTool({
   name: "ImportGraph",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "Build the module import graph for a directory and report its edges, its external dependencies and any cycles. Use it to see how a package hangs together, or to find the import cycle behind an initialisation bug, without opening every file. Relative specifiers are resolved against the files on disk; bare specifiers are reported as external rather than resolved through node_modules.",
   inputSchema: z.object({
@@ -1466,6 +1472,8 @@ function isConventionalEntry(file: string): boolean {
 
 export const deadFileScan: RegisteredTool = buildTool({
   name: "DeadFileScan",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "List the files in a directory that nothing else in it imports. Use it to find leftovers after a refactor, as a list to REVIEW rather than a list to delete. It is import-based and therefore blind to anything loaded by a computed path, referenced from HTML or a config, discovered by filename convention, or imported from outside the scanned directory; entry points, type declarations, tests and config files are excluded by convention.",
   inputSchema: z.object({
@@ -1514,6 +1522,8 @@ export const deadFileScan: RegisteredTool = buildTool({
 
 export const todoScan: RegisteredTool = buildTool({
   name: "TodoScan",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "Collect TODO, FIXME, HACK and XXX notes from the comments in a directory, with file, line, author and text. Use it to turn the notes scattered through a codebase into a list that can be triaged. Markers inside string literals are ignored, so a fixture containing the word TODO is not reported as a note.",
   inputSchema: z.object({
@@ -1657,6 +1667,8 @@ function skippedClause(skipped: readonly SkippedFile[]): string {
 
 export const dependencyList: RegisteredTool = buildTool({
   name: "DependencyList",
+  // The project directory; it reads the manifests and lockfiles there by name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Read a project's manifests and return its declared dependencies as one list: name, declared range, scope and ecosystem. Use it to answer 'what does this depend on' across package.json, requirements.txt, pyproject.toml, go.mod and Cargo.toml without opening any of them. Nothing is installed and no registry is contacted; the answer comes from the files on disk.",
   inputSchema: z.object({
@@ -1731,6 +1743,8 @@ export const dependencyList: RegisteredTool = buildTool({
 
 export const dependencyOutdated: RegisteredTool = buildTool({
   name: "DependencyOutdated",
+  // The project directory; it reads the manifests and lockfiles there by name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Compare a project's declared dependency ranges against what its lockfile actually resolved, and report the drift: ranges no locked version satisfies, dependencies missing from the lock, and packages locked at several versions at once. Use it to tell whether the lockfile is stale relative to the manifests before trusting an install. Two limits, both of which it reports: it NEVER contacts a registry, so it cannot say a newer version exists upstream, and it compares only npm and cargo, because bun.lock, package-lock.json, yarn.lock, pnpm-lock.yaml and Cargo.lock are the lockfiles it reads — a Python or Go dependency is counted as unchecked rather than declared fine.",
   inputSchema: z.object({
@@ -1832,6 +1846,8 @@ export const dependencyOutdated: RegisteredTool = buildTool({
 
 export const packageScripts: RegisteredTool = buildTool({
   name: "PackageScripts",
+  // The project directory; it reads the manifests and lockfiles there by name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the scripts a project declares, with the exact command that would run each one. Use it to find out how a project is built, tested or started before guessing at a command line. The package manager is read from the lockfile, so the command it returns is the one this project actually uses.",
   inputSchema: z.object({
@@ -1871,6 +1887,8 @@ export const packageScripts: RegisteredTool = buildTool({
 
 export const workspacePackages: RegisteredTool = buildTool({
   name: "WorkspacePackages",
+  // The directory it scans; the walk never opens a hidden name.
+  operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "visible" }],
   description:
     "List the packages in a monorepo and how they depend on each other, including any dependency cycles. Use it to find which package owns a name, or which ones a change would ripple into, without walking the tree by hand. Membership comes from the workspaces globs in the root package.json, or from the packages list in pnpm-workspace.yaml; a package outside those globs is not reported.",
   inputSchema: z.object({
@@ -1985,6 +2003,8 @@ const COVERAGE_CANDIDATES = [
 
 export const coverageSummary: RegisteredTool = buildTool({
   name: "CoverageSummary",
+  // The report it reads: `file` from `cwd`, or the conventional names there.
+  operativeArgs: [{ field: "file", kind: "path", within: "cwd", default: "." }],
   description:
     "Turn a coverage report into per-file percentages, worst-covered first. Use it to find where the tests are thin without reading an lcov file or opening an HTML report. It reads an existing report — lcov.info or istanbul's coverage-summary.json — and never re-runs the tests to produce one.",
   inputSchema: z.object({

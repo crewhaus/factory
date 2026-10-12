@@ -402,6 +402,10 @@ function toTreeNodes(nodes: ReadonlyArray<WalkNode>, showSizes: boolean): TreeNo
 
 export const tree: RegisteredTool = buildTool({
   name: "Tree",
+  // The directory it walks: a deny or ask naming anything under it fires.
+  operativeArgs: [
+    { field: "path", kind: "path", default: ".", beneath: "visible", hiddenWhen: "includeHidden" },
+  ],
   description:
     "Draw a directory as an indented tree, depth-capped, entry-capped and sorted. Use it to learn a project's shape in one call instead of a dozen listings, with .gitignore applied so vendored and build output stay out of the way.",
   inputSchema: z.object({
@@ -450,10 +454,12 @@ export const tree: RegisteredTool = buildTool({
 
 export const diskUsage: RegisteredTool = buildTool({
   name: "DiskUsage",
+  // The directory it totals, hidden entries included unless the call says otherwise.
+  operativeArgs: [{ field: "path", kind: "path", default: ".", beneath: "all" }],
   description:
     "Total the apparent size of every directory in a tree and list them largest-first. Use it to find what is actually taking the space before deleting anything.",
   inputSchema: z.object({
-    path: z.string().optional(),
+    path: z.string().optional().describe("directory to total; defaults to the workspace root"),
     maxDepth: z.number().int().min(0).max(20).optional().describe("how deep to REPORT (default 2)"),
     top: z
       .number()
@@ -515,6 +521,10 @@ export const diskUsage: RegisteredTool = buildTool({
 
 export const findFiles: RegisteredTool = buildTool({
   name: "FindFiles",
+  // The directory it walks: a deny or ask naming anything under it fires.
+  operativeArgs: [
+    { field: "path", kind: "path", default: ".", beneath: "visible", hiddenWhen: "includeHidden" },
+  ],
   description:
     "Find entries by name glob, size range, modification window and type, sorted by path. Use it when Glob's name matching is not enough — time and size bounds come from you as ISO strings and byte counts, never from the clock.",
   inputSchema: z.object({

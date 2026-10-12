@@ -255,6 +255,11 @@ function percentDelta(before: number, after: number): number | null {
 
 export const bundleSizeCheck: RegisteredTool = buildTool({
   name: "BundleSizeCheck",
+  operativeArgs: [
+    { field: "files", kind: "path" },
+    { field: "directory", kind: "path", beneath: "all" },
+    { field: "baselineFile", kind: "path" },
+  ],
   description:
     "Weigh build artifacts — raw and gzip or brotli — against declared budgets and a stored baseline, and report what actually grew. Use it as the size gate on a pull request, instead of a model comparing two numbers whose provenance it cannot see. The compression parameters are part of the measurement and travel with the report: a baseline produced at a different level, with a different algorithm, or with no declared parameters at all is REFUSED rather than differenced, because the gap between gzip level 6 and level 9 is the same few percent a regression is, and subtracting them produces a confident number about nothing. Hashed filenames (app-4f2a1c.js) can be joined on a normalised key so a content-hash change is not reported as every file being new, and two artifacts that normalise to the same key are reported as ambiguous rather than silently paired. The report is itself a baseline: store it and pass it back next time.",
   inputSchema: z

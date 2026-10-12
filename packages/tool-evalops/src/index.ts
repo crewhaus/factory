@@ -749,7 +749,13 @@ export const evalCoverage: RegisteredTool = buildTool({
   name: "EvalCoverage",
   operativeArgs: [
     { field: "dataset", kind: "path" },
-    { field: "sessionsDir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    {
+      field: "sessionsDir",
+      kind: "path",
+      default: DEFAULT_SESSIONS_DIR,
+      relocates: true,
+      beneath: "all",
+    },
     { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
   ],
   description:

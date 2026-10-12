@@ -157,6 +157,8 @@ const watchKindSchema = z.enum(["created", "modified", "deleted"]);
 
 export const watchPath: RegisteredTool = buildTool({
   name: "WatchPath",
+  // The file or directory it reports changes beneath.
+  operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
   description:
     "Watch a file or directory for changes for a bounded time and report what happened. Use it instead of sleeping and re-reading: it ends at whichever comes first of a required deadline and an event cap, and always says which one, so an empty answer cannot be mistaken for a satisfied wait. Events for the same path within a settle window fold into ONE event that reports how many raw notifications it absorbed — an editor writes a file two or three times to save it once, and most editors save by writing a temp file and renaming it over the target, so a caller counting raw notifications counts several saves where there was one. The kind (created, modified, deleted) is derived from the filesystem rather than from the platform's own event name, because macOS calls an ordinary append a 'rename'. On Linux a file created inside a directory that was itself created during the watch may be missed, and the result says so rather than implying the tree was covered.",
   inputSchema: z.object({

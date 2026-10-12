@@ -273,6 +273,20 @@ function scalarFieldShape(inputSchema: unknown, name: string): string | undefine
 }
 
 /**
+ * Why `name` cannot switch a walk into hidden names, or `undefined` when it
+ * can: it must be a top-level boolean field.
+ */
+function booleanFieldShape(inputSchema: unknown, name: string): string | undefined {
+  const s = unwrapZod(inputSchema);
+  if (zodTypeName(s) !== "ZodObject") return "is not an object";
+  const shape = (zodDef(s)["shape"] as () => Record<string, unknown>)();
+  if (!Object.hasOwn(shape, name)) return `has no top-level field "${name}"`;
+  return zodTypeName(unwrapZod(shape[name])) === "ZodBoolean"
+    ? undefined
+    : `field "${name}" is not a boolean`;
+}
+
+/**
  * Why `name` cannot hold a command's environment, or `undefined` when it can:
  * it must be a top-level field holding a map of names to string values.
  */
@@ -381,11 +395,21 @@ function checkOperativeArgs(
       if (kind !== "path") {
         fail(`${at}.beneath: only a "path" can name a directory with things beneath it`);
       }
-      if (relocates === true) {
+      // A relocating field may walk too: a store the tool reads whole,
+      // whatever record the call names beside it (DatasetMine's sessions).
+    }
+    const { hiddenWhen } = arg;
+    if (hiddenWhen !== undefined) {
+      if (beneath !== "visible") {
         fail(
-          `${at}.beneath: a relocating field names the store the tool works in, and a rule is about the record there`,
+          `${at}.hiddenWhen: only a walk that skips hidden names (beneath: "visible") can be switched into them`,
         );
       }
+      if (typeof hiddenWhen !== "string" || !/^[A-Za-z_$][\w$]*$/.test(hiddenWhen)) {
+        fail(`${at}.hiddenWhen must name one top-level input field, e.g. "includeHidden"`);
+      }
+      const switched = booleanFieldShape(inputSchema, hiddenWhen);
+      if (switched !== undefined) fail(`${at}.hiddenWhen: the input schema ${switched}`);
     }
     if (defaultAtRoot !== undefined) {
       if (defaultAtRoot !== true) fail(`${at}.defaultAtRoot is either true or left out`);
@@ -456,6 +480,7 @@ function checkOperativeArgs(
         ...(stdin !== undefined ? { stdin } : {}),
         ...(prefix === true ? { prefix } : {}),
         ...(beneath !== undefined ? { beneath } : {}),
+        ...(hiddenWhen !== undefined ? { hiddenWhen } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
         ...(glob === true ? { glob } : {}),
         ...(shell === true ? { shell } : {}),

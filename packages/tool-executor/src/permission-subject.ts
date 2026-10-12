@@ -142,7 +142,9 @@
  *    - a `path` declared `beneath` (a directory the tool walks: RemovePath,
  *      Grep, a git pathspec) also carries its spellings as `beneath`
  *      prefixes, so a deny or ask naming anything under it fires —
- *      unless the canonicaliser marked it `notDirectory`. One declared
+ *      unless the canonicaliser marked it `notDirectory`. A walk that
+ *      skips hidden names reads them too when the call sets the switch its
+ *      `hiddenWhen` names (Tree's `includeHidden`). One declared
  *      `defaultAtRoot` and left out is the workspace root, not its `within`
  *      directory: a git command given no path acts on the whole repository.
  *    - a `path` declared `glob` (the Glob tool's pattern) is marked
@@ -150,7 +152,8 @@
  *    - a `relocates` field left out stands in with its default, which a
  *      deny or ask reads; when the call carries another operative value an
  *      allow skips it (`restrictOnly`), because the grant is about the
- *      record the call names, not the store it lives in.
+ *      record the call names, not the store it lives in. One declared
+ *      `beneath` too (a store the tool reads whole) carries its prefixes.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash — `0x` or `0X`, both of which a node accepts) is marked
  *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
@@ -332,7 +335,15 @@ export function operativeValuesOf(
     } of readField(parsedInput, arg)) {
       if (arg.relocates === true && defaulted === true) {
         if (arg.kind === "url") relocated.push(canonicalUrl(raw));
-        else relocated.push(...canonicalizePath(raw));
+        else {
+          // A store the tool reads whole, whatever record the call names
+          // (DatasetMine's sessions directory), is read with what is in it.
+          const { beneath } = arg;
+          const read = canonicalizePath(raw);
+          relocated.push(
+            ...(beneath !== undefined ? read.map((v) => withBeneath(v, beneath)) : read),
+          );
+        }
         continue;
       }
       switch (arg.kind) {
@@ -355,7 +366,15 @@ export function operativeValuesOf(
             );
             break;
           }
-          values.push(...(beneath !== undefined ? read.map((v) => withBeneath(v, beneath)) : read));
+          // A walk that skips hidden names opens them too when the call sets
+          // the switch its declaration names (Tree's `includeHidden`).
+          const walk =
+            beneath === "visible" &&
+            arg.hiddenWhen !== undefined &&
+            switchedOn(parsedInput, arg.hiddenWhen)
+              ? "all"
+              : beneath;
+          values.push(...(walk !== undefined ? read.map((v) => withBeneath(v, walk)) : read));
           break;
         }
         case "url":
@@ -1507,6 +1526,16 @@ function namesAFile(word: string): boolean {
 
 function isAbsolutePath(value: string): boolean {
   return value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+/** Does the call set the top-level boolean `field` to `true`? */
+function switchedOn(input: unknown, field: string): boolean {
+  return (
+    input !== null &&
+    typeof input === "object" &&
+    Object.hasOwn(input, field) &&
+    (input as Record<string, unknown>)[field] === true
+  );
 }
 
 /** The top-level `within` field's value, when the call carries one. */

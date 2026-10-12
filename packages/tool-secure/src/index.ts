@@ -535,6 +535,8 @@ const secretOptionsShape = {
 
 export const secretScan: RegisteredTool = buildTool({
   name: "SecretScan",
+  // The file or directory it scans (absent when it scans `text`).
+  operativeArgs: [{ field: "path", kind: "path", beneath: "visible", hiddenWhen: "includeHidden" }],
   description:
     "Look for credentials in a string, a file, or a directory tree — vendor key shapes, PEM private-key blocks, JWTs, URLs carrying a password, and high-entropy strings near credential-shaped names. Use it before publishing a repo or pasting a log somewhere; every finding reports the rule, the location and a MASKED sample, and the secret itself is never included in the result.",
   inputSchema: z.object({

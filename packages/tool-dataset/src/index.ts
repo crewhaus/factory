@@ -1206,8 +1206,8 @@ const mineSchema = z.object({
 export const datasetMine: RegisteredTool = buildTool({
   name: "DatasetMine",
   operativeArgs: [
-    { field: "sessionsDir", kind: "path", default: SESSIONS_REL, relocates: true },
-    { field: "auditDir", kind: "path", default: AUDIT_REL, relocates: true },
+    { field: "sessionsDir", kind: "path", default: SESSIONS_REL, relocates: true, beneath: "all" },
+    { field: "auditDir", kind: "path", default: AUDIT_REL, relocates: true, beneath: "all" },
     { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
     { field: "dedupeAgainst", kind: "id" },
   ],

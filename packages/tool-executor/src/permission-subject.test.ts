@@ -621,8 +621,9 @@ describe("url, command and id values", () => {
       });
     expect(make({ kind: "url", beneath: "all" })).toThrow(/beneath/);
     expect(make({ kind: "path", beneath: "some" })).toThrow(/beneath/);
+    // Alone, a relocating field is the tool's only place: refused as such.
     expect(make({ kind: "path", default: ".", relocates: true, beneath: "all" })).toThrow(
-      /beneath/,
+      /"p" is the only place this tool names/,
     );
     expect(make({ kind: "path", defaultAtRoot: true })).toThrow(/defaultAtRoot/);
     expect(make({ kind: "path", within: "cwd", defaultAtRoot: true })).toThrow(/defaultAtRoot/);
@@ -1398,6 +1399,49 @@ describe("a relocating field's default (C004)", () => {
     expect(
       matchesPattern(allowStore, "KvLike", {}, { polarity: "allow", operativeValues: values }),
     ).toBe(true);
+  });
+
+  test("a store read whole beside a record is read with what is beneath it, on its default too", () => {
+    // DatasetMine: every session log in `sessionsDir`, whatever dataset the
+    // call names to dedupe against.
+    const mine = buildTool({
+      name: "MineLike",
+      description: "mine",
+      inputSchema: z.object({
+        sessionsDir: z.string().optional(),
+        dedupeAgainst: z.string().optional(),
+      }),
+      readOnly: true,
+      operativeArgs: [
+        {
+          field: "sessionsDir",
+          kind: "path",
+          default: ".crewhaus/sessions",
+          relocates: true,
+          beneath: "all",
+        },
+        { field: "dedupeAgainst", kind: "id" },
+      ],
+      execute: async () => "ok",
+    });
+    const on = (input: unknown, pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "MineLike",
+        {},
+        { polarity, operativeValues: operativeValuesFor(mine, input) ?? [] },
+      );
+    const oneLog = "MineLike(.crewhaus/sessions/sess_private.jsonl)";
+    // Left out beside a record: a deny on one log fires, an allow on the
+    // record still covers the ordinary call.
+    expect(on({ dedupeAgainst: "golden" }, oneLog, "restrict")).toBe(true);
+    expect(on({ dedupeAgainst: "golden" }, "MineLike(golden)", "allow")).toBe(true);
+    // Named, and left out with nothing beside it: the same deny fires.
+    expect(on({ sessionsDir: ".crewhaus/sessions" }, oneLog, "restrict")).toBe(true);
+    expect(on({}, oneLog, "restrict")).toBe(true);
+    expect(on({ sessionsDir: "." }, "MineLike(secrets/**)", "restrict")).toBe(true);
+    // Control: a deny about another place stays quiet.
+    expect(on({ dedupeAgainst: "golden" }, "MineLike(secrets/**)", "restrict")).toBe(false);
   });
 
   test("a url default that only moves the tool off its fixed service reads as a url", () => {

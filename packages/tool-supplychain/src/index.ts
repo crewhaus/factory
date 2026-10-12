@@ -571,6 +571,8 @@ const BAND_OF_SEVERITY: Record<Severity, Band> = {
 
 export const ciWorkflowAudit: RegisteredTool = buildTool({
   name: "CiWorkflowAudit",
+  // The workflow file, or the directory of them it reads.
+  operativeArgs: [{ field: "path", kind: "path", default: ".github/workflows", beneath: "all" }],
   description:
     "Parse GitHub Actions workflow YAML and report supply-chain hygiene, with the file, job, step and LINE of each finding: an action referenced by a mutable tag or branch rather than a commit SHA, a privileged trigger (pull_request_target, workflow_run) combined with a checkout of the pull request's own head, permissions broader than the job needs, a self-hosted runner reachable from a fork's pull request, and `${{ github.event.* }}` interpolated into a run: script — the Actions runner substitutes that value before the shell parses the line, so an issue title becomes part of the script. Use it on any repository whose CI you did not write. Entirely offline: it never resolves a tag to a SHA, so a ref that is not a 40-character commit is reported as mutable rather than classified as a tag or a branch. Constructs its YAML reader does not cover come back as warnings rather than as silence.",
   inputSchema: z.object({

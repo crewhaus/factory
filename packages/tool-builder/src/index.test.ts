@@ -422,6 +422,69 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     ).toEqual([{ field: "path", kind: "path", default: ".crewhaus/state", beneath: "all" }]);
   });
 
+  test("beneath is carried on a relocating store beside a record (critic8)", () => {
+    // DatasetMine reads every session log in its store, whatever dataset it
+    // dedupes against.
+    const tool = buildTool({
+      name: "Mine",
+      description: "d",
+      inputSchema: nested,
+      execute: exec,
+      operativeArgs: [
+        {
+          field: "path",
+          kind: "path",
+          default: ".crewhaus/sessions",
+          relocates: true,
+          beneath: "all",
+        },
+        { field: "issue", kind: "id" },
+      ],
+    });
+    expect(tool.operativeArgs?.[0]).toEqual({
+      field: "path",
+      kind: "path",
+      default: ".crewhaus/sessions",
+      relocates: true,
+      beneath: "all",
+    });
+  });
+
+  test("hiddenWhen names a boolean that opens a walk that skips hidden names", () => {
+    const schema = z.object({
+      path: z.string().optional(),
+      includeHidden: z.boolean().optional(),
+      label: z.string().optional(),
+    });
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Walk",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [{ field: "path", kind: "path", default: ".", ...arg } as OperativeArg],
+      });
+    expect(build({ beneath: "visible", hiddenWhen: "includeHidden" })().operativeArgs).toEqual([
+      {
+        field: "path",
+        kind: "path",
+        default: ".",
+        beneath: "visible",
+        hiddenWhen: "includeHidden",
+      },
+    ]);
+    expect(build({ beneath: "all", hiddenWhen: "includeHidden" })).toThrow(
+      /hiddenWhen: only a walk that skips hidden names \(beneath: "visible"\)/,
+    );
+    expect(build({ hiddenWhen: "includeHidden" })).toThrow(/hiddenWhen: only a walk/);
+    expect(build({ beneath: "visible", hiddenWhen: "label" })).toThrow(
+      /hiddenWhen: the input schema field "label" is not a boolean/,
+    );
+    expect(build({ beneath: "visible", hiddenWhen: "showAll" })).toThrow(
+      /hiddenWhen: the input schema has no top-level field "showAll"/,
+    );
+  });
+
   test("shell is carried on a command, and refused anywhere else", () => {
     const build = (arg: Record<string, unknown>) => () =>
       buildTool({

@@ -714,7 +714,7 @@ export const incidentBundle: RegisteredTool = buildTool({
   name: "IncidentBundle",
   operativeArgs: [
     { field: "out", kind: "path" },
-    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true, beneath: "all" },
   ],
   description:
     "Assemble one failed run's events, clustered errors, tool statistics and spec name into a single contained JSON file a human can be handed. Use it at the end of a triage pass so the findings leave the context window as a durable artefact instead of being re-derived by the next reader. The output path goes through workspace containment like every other path here, and the write refuses an existing file unless overwrite is set, so a second bundle never silently replaces the first. It records no timestamp of its own: pass nowMs if the bundle should say when it was made, because a tool that read the clock would produce a different file from the same log every time.",

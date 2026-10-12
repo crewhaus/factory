@@ -203,6 +203,11 @@ const replaceField = z
 
 export const goldenCompare: RegisteredTool = buildTool({
   name: "GoldenCompare",
+  // A file, or two trees walked whole, dotfiles included.
+  operativeArgs: [
+    { field: "actualFile", kind: "path", beneath: "all" },
+    { field: "golden", kind: "path", beneath: "all" },
+  ],
   description:
     "Compare output, a file or a whole directory tree against stored goldens, masking the parts that are allowed to vary. Use it as the gate that says whether a change did anything it did not mean to. Timestamps, durations, uuids, hashes, ports, absolute paths and ANSI escapes can each be masked, and every mask is reported WITH A COUNT — a normalizer that quietly rewrote output would let a real regression hide inside a masked span, which is worse than a golden that fails too often.",
   inputSchema: z
@@ -535,6 +540,11 @@ function describeUnhashed(root: string, rel: string): Recorded | "absent" | unde
 
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
+  // `files` from `directory`; left out, the whole directory is walked.
+  operativeArgs: [
+    { field: "files", kind: "path", within: "directory", default: ".", beneath: "all" },
+    { field: "manifest", kind: "path" },
+  ],
   description:
     "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that when the workspace root is walked with no exclude, its .git and node_modules are left out and listed as excluded. A link to a file in the workspace is hashed through, like sha256sum; any other link, and a FIFO, socket or device, is never opened and is recorded by kind and link text on a # line sha256sum skips. A walk that stops early is not ok.",
   inputSchema: z
@@ -956,6 +966,8 @@ export const acceptanceCheck: RegisteredTool = buildTool({
 
 export const markdownLinkCheck: RegisteredTool = buildTool({
   name: "MarkdownLinkCheck",
+  // The file, or the directory whose Markdown it reads; the walk skips hidden names.
+  operativeArgs: [{ field: "path", kind: "path", default: ".", beneath: "visible" }],
   description:
     "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed.",
   inputSchema: z
@@ -2157,6 +2169,11 @@ async function trigramSimilarity(a: string, b: string): Promise<number> {
 
 export const seoLint: RegisteredTool = buildTool({
   name: "SeoLint",
+  // The page, and the corpus directory whose pages it reads.
+  operativeArgs: [
+    { field: "file", kind: "path" },
+    { field: "corpus", kind: "path", beneath: "visible" },
+  ],
   description:
     "Gate a page on the SEO and readability checks that have a right answer offline: title and meta lengths, headings, image alt and anchor text, keyword placement and density, JSON-LD and rich-result fields, canonical and OpenGraph consistency, slug shape, and near-duplicate text against a corpus. Use it before publishing. What cannot be answered exactly says so: readability is a BAND, never a number; keyword density switches off for languages written without spaces (Chinese, Japanese, Thai); an unfamiliar JSON-LD @type, and the near-duplicate check with no corpus, are NOT CHECKED, never passed. Everything a run did not look at is listed with a reason: under notChecked when it was asked for and could not be answered (ok is false whenever something you asked for lands there), and under notRequested when nobody asked, such as a keyword or corpus you did not pass (named, never counted as passed, and it leaves ok alone). So ok means nothing failed and everything asked for was looked at.",
   inputSchema: z

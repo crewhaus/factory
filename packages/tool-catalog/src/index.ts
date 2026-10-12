@@ -342,6 +342,16 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * that never opens it. The runtime asks the filesystem: a path that names
  * an existing file, or a link to one, stands for itself alone; one it
  * cannot ask about (the edge worker) stands for what could be beneath it.
+ * `hiddenWhen`, beside `beneath: "visible"`, names a top-level boolean
+ * field that makes the walk open hidden names too when the call sets it
+ * `true` (Tree's and FindFiles' `includeHidden`): such a call stands for
+ * everything beneath the directory, as `"all"` does, so `alwaysDeny
+ * Tree(.env)` fires on `Tree . includeHidden` and not on a plain `Tree .`.
+ * A `relocates` field may declare it too, for a store the tool reads whole
+ * whatever record the call names (DatasetMine reads every session log in
+ * its `sessionsDir`): a deny or ask naming anything in the store fires,
+ * on its default as well, and an allow still skips the default beside a
+ * record.
  *
  * `glob: true`, for a `path`, says the value is a pattern the tool lists
  * the paths of (the Glob tool's `pattern`, whose wildcards never list a
@@ -397,6 +407,7 @@ export type OperativeArg = {
   readonly stdin?: string;
   readonly prefix?: true;
   readonly beneath?: "all" | "visible";
+  readonly hiddenWhen?: string;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;

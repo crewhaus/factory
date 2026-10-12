@@ -516,6 +516,11 @@ const DOC_EXTENSIONS: ReadonlySet<string> = new Set([".md", ".mdx", ".markdown"]
 
 export const docsSymbolCheck: RegisteredTool = buildTool({
   name: "DocsSymbolCheck",
+  // The documents and the source tree it reads, hidden names included.
+  operativeArgs: [
+    { field: "docs", kind: "path", beneath: "all" },
+    { field: "source", kind: "path", default: ".", beneath: "all" },
+  ],
   description:
     "Find documentation that names symbols the code no longer has. Point it at markdown and at the source tree the markdown is about; it reports each documented symbol whose identifier appears NOWHERE in the scanned sources, with the document and line. It is built to under-report: only backticked identifiers and named imports inside fenced blocks count as references, a name shaped like an English word is skipped unless written as a call, and a document whose references mostly do not resolve is reported as probably describing a different tree rather than as a page full of dead symbols. A scan that could not read the whole source tree is refused rather than answered, because an incomplete index invents missing symbols.",
   inputSchema: z.object({

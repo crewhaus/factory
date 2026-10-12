@@ -29,6 +29,8 @@ export type RegistryOperativeArg = {
   readonly prefix?: true;
   /** For a `path`: the tool also acts beneath a directory it names (`all` or `visible`). */
   readonly beneath?: string;
+  /** With `beneath: "visible"`: the boolean field that makes the walk open hidden names too. */
+  readonly hiddenWhen?: string;
   /** For a `path` declared `within` a field: its default is read from the workspace root. */
   readonly defaultAtRoot?: true;
   /** For a `path`: the value is a pattern that stands for every path it lists. */
@@ -132,6 +134,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.stdin !== undefined ? { stdin: arg.stdin } : {}),
     ...(arg.prefix === true ? { prefix: true as const } : {}),
     ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
+    ...(arg.hiddenWhen !== undefined ? { hiddenWhen: arg.hiddenWhen } : {}),
     ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),
     ...(arg.glob === true ? { glob: true as const } : {}),
     ...(arg.shell === true ? { shell: true as const } : {}),

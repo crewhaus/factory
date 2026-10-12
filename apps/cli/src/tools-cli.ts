@@ -1589,6 +1589,7 @@ export type OperativeArgLike = {
   readonly stdin?: string;
   readonly prefix?: true;
   readonly beneath?: string;
+  readonly hiddenWhen?: string;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
   readonly shell?: true;
@@ -1677,7 +1678,11 @@ export function operativeArgWords(arg: OperativeArgLike): string {
   }
   if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
   if (arg.beneath === "visible") {
-    parts.push("a directory stands for everything beneath it except hidden names");
+    parts.push(
+      arg.hiddenWhen !== undefined
+        ? `a directory stands for everything beneath it except hidden names, and for those too when ${arg.hiddenWhen} is true`
+        : "a directory stands for everything beneath it except hidden names",
+    );
   }
   if (arg.default !== undefined) parts.push(defaultWords(arg));
   return parts.join("; ");

@@ -214,6 +214,8 @@ export const lockfileDiff: RegisteredTool = buildTool({
 
 export const licenseAggregate: RegisteredTool = buildTool({
   name: "LicenseAggregate",
+  // The package directory; it reads the manifests there by name.
+  operativeArgs: [{ field: "directory", kind: "path", default: "." }],
   description:
     "Roll up the declared licenses of an installed dependency tree: counts per identifier, everything copyleft, everything that declares nothing, and anything a declared policy forbids. Use it before a release instead of reading a few thousand package.json files. It reports what packages declare — it does not read license texts, so a package declaring MIT while shipping otherwise is reported as MIT. OR expressions are treated as alternatives and AND as cumulative, which is what decides whether a deny rule bites.",
   inputSchema: z.object({
@@ -383,6 +385,8 @@ export const packageTarballInspect: RegisteredTool = buildTool({
 
 export const packagePublishPreflight: RegisteredTool = buildTool({
   name: "PackagePublishPreflight",
+  // The package directory; it reads the manifests there by name.
+  operativeArgs: [{ field: "directory", kind: "path", default: "." }],
   description:
     "Check a package directory for the mistakes that only show up after publishing: a workspace: range no registry client can resolve, an entry point no files entry covers, a .env that would ship, a missing version. Use it before cutting a release. Blocking problems would break the published package; warnings would only embarrass it. The files-coverage check approximates npm's rules, so a clean result is not proof — PackageTarballInspect on real pack output is.",
   inputSchema: z.object({

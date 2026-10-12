@@ -840,6 +840,163 @@ describe("critic8 — a store a tool reads whole is read with everything beneath
       expect({ name, got: await gate(name, input, elsewhere) }).toEqual({ name, got: "allow" });
     }
   }, 60_000);
+
+  test("a store read whole beside a record: a deny on one log in it fires, the record's allow still covers", async () => {
+    // These read every log in their sessions (or audit) directory whatever
+    // record the call names. The left-out directory was read by a deny as
+    // one point, so a deny on one session log never fired.
+    mkdirSync(join(ws, ".crewhaus", "sessions"), { recursive: true });
+    const log = join(ws, ".crewhaus", "sessions", "sess_private.jsonl");
+    writeFileSync(log, `${JSON.stringify({ kind: "user_message", text: SECRET, runId: "r1" })}\n`);
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["DatasetMine", { dedupeAgainst: "golden" }],
+      ["DatasetMine", {}],
+      ["SpecAdvise", { path: "crewhaus.yaml" }],
+      ["EvalCoverage", { dataset: "eval/dataset.jsonl" }],
+      ["IncidentBundle", { out: "bundle.json", runId: "r1" }],
+    ];
+    for (const [name, input] of cases) {
+      const deny = rules(
+        ["alwaysDeny", `${name}(.crewhaus/sessions/sess_private.jsonl)`],
+        ["alwaysAllow", name],
+      );
+      const got = await gate(name, input, deny);
+      expect({ name, input, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+        name,
+        input,
+        got: "deny",
+        leaked: false,
+      });
+      // Control: a deny about another place stays quiet.
+      const elsewhere = rules(["alwaysDeny", `${name}(secrets/**)`], ["alwaysAllow", name]);
+      expect({ name, input, got: await gate(name, input, elsewhere) }).toEqual({
+        name,
+        input,
+        got: "allow",
+      });
+    }
+    // The bundle the denied call would have written was never written; the
+    // allowed control wrote it.
+    rmSync(join(ws, "bundle.json"), { force: true });
+    const deny = rules(
+      ["alwaysDeny", "IncidentBundle(.crewhaus/sessions/**)"],
+      ["alwaysAllow", "IncidentBundle(bundle.json)"],
+    );
+    expect(await gate("IncidentBundle", { out: "bundle.json", runId: "r1" }, deny)).toBe("deny");
+    expect(existsSync(join(ws, "bundle.json"))).toBe(false);
+    // An allow on the record still covers the ordinary call.
+    const allow = rules(["alwaysAllow", "IncidentBundle(bundle.json)"]);
+    expect(await gate("IncidentBundle", { out: "bundle.json", runId: "r1" }, allow)).toBe("allow");
+    expect(readFileSync(join(ws, "bundle.json"), "utf8")).toContain("r1");
+  }, 60_000);
+});
+
+describe("critic8 — the read-only walkers that declared nothing read their directory with what is beneath it", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  beforeEach(() => {
+    // A denied directory every walker below could reach from the root, and
+    // something in it each of them would report.
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.env"), `API_KEY=${SECRET}\n`);
+    writeFileSync(join(ws, "secrets", "notes.ts"), `// TODO(ops): rotate ${SECRET}\n`);
+    writeFileSync(join(ws, "secrets", "notes.md"), `[x](./gone-${SECRET}.md)\n`);
+  });
+
+  /** [tool, a call that walks the whole workspace, a call beside secrets/] */
+  const walkers: ReadonlyArray<
+    readonly [string, Record<string, unknown>, Record<string, unknown>]
+  > = [
+    ["Tree", {}, { path: "src" }],
+    ["FindFiles", { path: "." }, { path: "src" }],
+    ["DiskUsage", {}, { path: "src" }],
+    ["AstQuery", {}, { cwd: "src" }],
+    ["FindReferences", { name: "rotate" }, { name: "rotate", cwd: "src" }],
+    ["ImportGraph", {}, { cwd: "src" }],
+    ["DeadFileScan", {}, { cwd: "src" }],
+    ["TodoScan", { extensions: [".ts"] }, { cwd: "src" }],
+    ["WorkspacePackages", {}, { cwd: "src" }],
+    ["SecretScan", { path: "." }, { path: "src" }],
+    ["ChecksumVerify", {}, { directory: "src" }],
+    ["MarkdownLinkCheck", {}, { path: "src" }],
+    ["BundleSizeCheck", { directory: "." }, { directory: "src" }],
+    [
+      "MigrationStatus",
+      { database: "db.sqlite", directory: "." },
+      { database: "db.sqlite", directory: "src" },
+    ],
+    ["DocsSymbolCheck", { docsText: "`rotate()`" }, { docsText: "`rotate()`", source: "src" }],
+    ["HarnessInventory", {}, { root: "src" }],
+    ["BundleFreshness", {}, { root: "src" }],
+    ["ApprovalsInbox", {}, { root: "src" }],
+    ["CiWorkflowAudit", { path: "." }, { path: "src" }],
+    ["WatchPath", { path: ".", timeoutMs: 1 }, { path: "src", timeoutMs: 1 }],
+    ["GoldenCompare", { actualFile: ".", golden: "src" }, { actualFile: "src", golden: "src" }],
+    ["SeoLint", { html: "<p>x</p>", corpus: "." }, { html: "<p>x</p>", corpus: "src" }],
+  ];
+
+  test("a deny on a directory stops a walk of the workspace; a walk beside it runs", async () => {
+    // These declared no operative argument and were matched on the text of
+    // the call, so `alwaysDeny <Tool>(secrets/**)` read `.` (or nothing at
+    // all) and never fired: 0.7.1's documented limitation for Tree,
+    // FindFiles and DiskUsage, and the same for every walker here.
+    for (const [name, walk, beside] of walkers) {
+      const rs = rules(["alwaysDeny", `${name}(secrets/**)`], ["alwaysAllow", name]);
+      const got = await gate(name, walk, rs);
+      expect({ name, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+        name,
+        got: "deny",
+        leaked: false,
+      });
+      // Control: the walk that cannot reach secrets/ is allowed, and runs.
+      const control = await gate(name, beside, rs);
+      expect({ name, control, ran: lastResult !== undefined }).toEqual({
+        name,
+        control: "allow",
+        ran: true,
+      });
+    }
+  }, 120_000);
+
+  test("in auto and plan mode the deny holds too, and what the walk would have shown stays out", async () => {
+    for (const mode of ["auto", "plan"] as const) {
+      for (const [name, walk] of [
+        ["Tree", {}],
+        ["TodoScan", { extensions: [".ts"] }],
+        ["FindFiles", { path: ".", name: "*.env" }],
+      ] as const) {
+        const got = await gate(name, walk, rules(["alwaysDeny", "*(secrets/**)"]), mode);
+        expect({ mode, name, got }).toEqual({ mode, name, got: "deny" });
+      }
+    }
+    // Control: unruled, the same calls do reach into secrets/.
+    await gate("TodoScan", { extensions: [".ts"] }, rules(["alwaysAllow", "TodoScan"]));
+    expect(lastResult ?? "").toContain(SECRET);
+    await gate("Tree", {}, rules(["alwaysAllow", "Tree"]));
+    expect(lastResult ?? "").toContain("prod.env");
+  }, 60_000);
+
+  test("a walk that skips hidden names leaves a deny on one alone, unless the call opens them", async () => {
+    const rs = (name: string) => rules(["alwaysDeny", `${name}(.env)`], ["alwaysAllow", name]);
+    for (const name of ["Tree", "FindFiles", "SecretScan"]) {
+      const plain = await gate(name, { path: "." }, rs(name));
+      expect({ name, plain, listed: (lastResult ?? "").includes("API_KEY=original") }).toEqual({
+        name,
+        plain: "allow",
+        listed: false,
+      });
+      // `includeHidden` opens .env, and the call is read as everything beneath.
+      expect({ name, got: await gate(name, { path: ".", includeHidden: true }, rs(name)) }).toEqual(
+        {
+          name,
+          got: "deny",
+        },
+      );
+    }
+    // The code scanners never open a hidden name, whatever the call says.
+    expect(await gate("TodoScan", {}, rs("TodoScan"))).toBe("allow");
+    // DiskUsage totals hidden entries unless told not to: a deny on one fires.
+    expect(await gate("DiskUsage", {}, rs("DiskUsage"))).toBe("deny");
+  }, 60_000);
 });
 
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
