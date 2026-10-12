@@ -200,7 +200,9 @@ every verdict is worded so it cannot be read as more:
 A claim nobody could check is not a claim that passed — and neither is a claim
 nobody looked at, so a run that stopped at its `limit` reports `truncated`,
 `ok: false` and how many were left over, rather than a pass covering the ones
-that fit.
+that fit. In the same way, a claim that puts more than 16 different spans in
+quotation marks is reported `unchecked`, with that reason, rather than checked
+in part: split it into claims that quote fewer.
 
 A citation's destination is read the way a Markdown link's is: `./report.md`
 and `./report.md#findings` name the same file, and `CitationLint` and

@@ -292,24 +292,28 @@ export function bestSpan(
   let matched = 0;
   let bestMatched = -1;
   let bestStart = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    const entering = (tokens[i] as SourceToken).norm;
+  // An iterator, not an index, so a meter wrapping the array iterator sees
+  // the pass: one token entering per step.
+  let at = -1;
+  for (const token of tokens) {
+    at += 1;
+    const entering = token.norm;
     if (want.has(entering)) {
       const next = (counts.get(entering) ?? 0) + 1;
       counts.set(entering, next);
       if (next === 1) matched++;
     }
-    if (i >= width) {
-      const leaving = (tokens[i - width] as SourceToken).norm;
+    if (at >= width) {
+      const leaving = (tokens[at - width] as SourceToken).norm;
       if (want.has(leaving)) {
         const next = (counts.get(leaving) as number) - 1;
         counts.set(leaving, next);
         if (next === 0) matched--;
       }
     }
-    if (i >= width - 1 && matched > bestMatched) {
+    if (at >= width - 1 && matched > bestMatched) {
       bestMatched = matched;
-      bestStart = i - width + 1;
+      bestStart = at - width + 1;
     }
   }
   if (bestMatched <= 0) return EMPTY_SPAN(need);
@@ -354,27 +358,37 @@ export function bestSpan(
 }
 
 /**
- * Where `sequence` appears as consecutive source tokens, or -1.
+ * Where `sequence` first appears as consecutive source tokens, or -1.
  *
  * Used for an attributed quotation, which is the strictest promise a citation
  * makes. Punctuation and whitespace are not compared — only the run of words —
  * so a quote that differs from the source in a comma still counts as found,
  * while one that differs in a word does not.
+ *
+ * Knuth–Morris–Pratt, so the source is read once. Restarting the comparison
+ * at every token that matched the quote's first word read a source of
+ * repeated words once per word of the quote: up to three hundred times.
  */
 export function findSequence(index: SourceIndex, sequence: ReadonlyArray<string>): number {
   const tokens = index.tokens;
-  if (sequence.length === 0 || sequence.length > tokens.length) return -1;
-  const head = sequence[0] as string;
-  for (let i = 0; i + sequence.length <= tokens.length; i++) {
-    if ((tokens[i] as SourceToken).norm !== head) continue;
-    let ok = true;
-    for (let j = 1; j < sequence.length; j++) {
-      if ((tokens[i + j] as SourceToken).norm !== (sequence[j] as string)) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) return i;
+  const m = sequence.length;
+  if (m === 0 || m > tokens.length) return -1;
+  // border[j]: the length of the longest proper prefix of the first j + 1
+  // words of the quote that is also a suffix of them.
+  const border = new Int32Array(m);
+  for (let j = 1, k = 0; j < m; j++) {
+    const word = sequence[j] as string;
+    while (k > 0 && word !== sequence[k]) k = border[k - 1] as number;
+    if (word === sequence[k]) k += 1;
+    border[j] = k;
+  }
+  let at = -1;
+  let k = 0;
+  for (const token of tokens) {
+    at += 1;
+    while (k > 0 && token.norm !== sequence[k]) k = border[k - 1] as number;
+    if (token.norm === sequence[k]) k += 1;
+    if (k === m) return at - m + 1;
   }
   return -1;
 }

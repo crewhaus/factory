@@ -115,6 +115,10 @@ const LIMITS = {
   diffLines: 50,
   claims: 200,
   claimChars: 4_000,
+  // Different spans one claim may put in quotation marks. Each is looked for
+  // in every source the claim cites, so the count multiplies the reading;
+  // a sentence quoting more is reported unchecked, not checked in part.
+  quotedSpans: 16,
   // A source is tokenized end to end, so its cap is about the work rather
   // than the memory, and is far below the per-file one above.
   sourceBytes: 8 * 1024 * 1024,
@@ -1297,17 +1301,46 @@ type SourceFinding = {
   excerpt?: string;
 };
 
-/** Locate one claim's words in one source. */
-function checkOneSource(
-  label: string,
-  index: SourceIndex,
-  claim: PreparedClaim,
-  windowTokens: number,
-): SourceFinding {
+/**
+ * What locating one claim in one source found, before it is told which
+ * source that was: the finding's fields after `reason`, in the order they
+ * are reported, and the reason as a function of the source's label.
+ */
+type Located = {
+  readonly status: Verdict;
+  readonly reason: (label: string) => string;
+  readonly detail: Omit<SourceFinding, "source" | "status" | "reason">;
+};
+
+/** A located claim, reported against the source it was located in. */
+function findingFor(label: string, located: Located): SourceFinding {
+  return {
+    source: label,
+    status: located.status,
+    reason: located.reason(label),
+    ...located.detail,
+  };
+}
+
+/**
+ * Locate one claim's words in one source.
+ *
+ * Nothing here depends on how the document spelled the source, so a claim
+ * citing one file under many markers locates its words there once (the
+ * caller keeps the answer per index). For a quotation, a span already
+ * checked is not checked again, and once one is not in the source at all
+ * nothing later can change the answer — `notFound` outranks a misquote — so
+ * the rest are not read.
+ */
+function locate(index: SourceIndex, claim: PreparedClaim, windowTokens: number): Located {
   if (claim.quotes.length > 0) {
-    let worst: SourceFinding | null = null;
+    let worst: Located | null = null;
     let firstHit = -1;
+    const checked = new Set<string>();
     for (const run of claim.quotes) {
+      const key = JSON.stringify(run);
+      if (checked.has(key)) continue;
+      checked.add(key);
       const at = findSequence(index, run);
       if (at !== -1) {
         if (firstHit === -1) firstHit = at;
@@ -1321,37 +1354,43 @@ function checkOneSource(
       const near = bestSpan(index, distinct, run.length);
       const coverage = near.total === 0 ? 0 : near.matched / near.total;
       const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
-      const finding: SourceFinding = enough
+      const finding: Located = enough
         ? {
-            source: label,
             status: "misquoted",
-            reason: `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
-            coverage: Math.round(coverage * 100) / 100,
-            missing: [...near.missing],
-            differing: [...near.extra],
-            line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
-            excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
+            reason: (label) =>
+              `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
+            detail: {
+              coverage: Math.round(coverage * 100) / 100,
+              missing: [...near.missing],
+              differing: [...near.extra],
+              line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
+              excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
+            },
           }
         : {
-            source: label,
             status: "notFound",
-            reason: `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
-            coverage: Math.round(coverage * 100) / 100,
-            missing: [...near.missing],
+            reason: (label) =>
+              `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
+            detail: {
+              coverage: Math.round(coverage * 100) / 100,
+              missing: [...near.missing],
+            },
           };
       if (worst === null || VERDICT_RANK[finding.status] > VERDICT_RANK[worst.status]) {
         worst = finding;
       }
+      if (worst.status === "notFound") break;
     }
     if (worst !== null) return worst;
     const last = firstHit + (claim.quotes[0] as ReadonlyArray<string>).length - 1;
     return {
-      source: label,
       status: "supported",
-      reason: `the quoted words appear in "${label}", in order`,
-      coverage: 1,
-      line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
-      excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
+      reason: (label) => `the quoted words appear in "${label}", in order`,
+      detail: {
+        coverage: 1,
+        line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
+        excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
+      },
     };
   }
 
@@ -1359,17 +1398,19 @@ function checkOneSource(
   const coverage = span.total === 0 ? 0 : Math.round((span.matched / span.total) * 100) / 100;
   if (span.matched < span.total) {
     return {
-      source: label,
       status: "notFound",
-      reason: `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
-      coverage,
-      missing: [...span.missing],
-      ...(span.firstToken === -1
-        ? {}
-        : {
-            line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
-            excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
-          }),
+      reason: (label) =>
+        `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
+      detail: {
+        coverage,
+        missing: [...span.missing],
+        ...(span.firstToken === -1
+          ? {}
+          : {
+              line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
+              excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
+            }),
+      },
     };
   }
   const line = lineOf(index, (index.tokens[span.firstToken] as SourceToken).at);
@@ -1380,22 +1421,21 @@ function checkOneSource(
     // words can honestly get, and it is reported as something to read rather
     // than as a contradiction found.
     return {
-      source: label,
       status: "polarityConflict",
-      reason: `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
-      coverage: 1,
-      differing: [...span.extraNegations],
-      line,
-      excerpt,
+      reason: (label) =>
+        `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
+      detail: {
+        coverage: 1,
+        differing: [...span.extraNegations],
+        line,
+        excerpt,
+      },
     };
   }
   return {
-    source: label,
     status: "supported",
-    reason: `every word of the claim is in one span of "${label}"`,
-    coverage: 1,
-    line,
-    excerpt,
+    reason: (label) => `every word of the claim is in one span of "${label}"`,
+    detail: { coverage: 1, line, excerpt },
   };
 }
 
@@ -1562,6 +1602,13 @@ export const factCrossCheck: RegisteredTool = buildTool({
       if (prepared.need.length === 0 && prepared.quotes.length === 0) {
         return settle("unchecked", "the claim has no words to look for");
       }
+      const quoted = new Set(prepared.quotes.map((run) => JSON.stringify(run))).size;
+      if (quoted > LIMITS.quotedSpans) {
+        return settle(
+          "unchecked",
+          `the claim quotes ${quoted} different spans; at most ${LIMITS.quotedSpans} are checked in one claim, so split it into claims that quote fewer`,
+        );
+      }
 
       const sources: SourceFinding[] = [];
       // A marker the document never defines has nothing behind it to read.
@@ -1574,10 +1621,19 @@ export const factCrossCheck: RegisteredTool = buildTool({
           reason: `marker [${marker}] has no source behind it — that is CitationLint's finding`,
         });
       }
+      // A source cited under many markers, or under many spellings of its
+      // path, is one index: its words are located once per claim. Doing it
+      // per cite read the whole source again for every marker.
+      const located = new Map<SourceIndex, Located>();
       for (const raw of claim.cites) {
         const { label, outcome } = loadSource(raw, baseAbs, cache);
         if (outcome.kind === "index") {
-          sources.push(checkOneSource(label, outcome.index, prepared, windowTokens));
+          let found = located.get(outcome.index);
+          if (found === undefined) {
+            found = locate(outcome.index, prepared, windowTokens);
+            located.set(outcome.index, found);
+          }
+          sources.push(findingFor(label, found));
         } else {
           sources.push({
             source: label,
