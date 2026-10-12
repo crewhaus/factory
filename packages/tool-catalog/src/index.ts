@@ -401,7 +401,11 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `file:pub/../secrets/token` and `file:pub/lnk/token` (`pub/lnk` a link to
  * `../secrets`), and `alwaysAllow SecretLookup(file:pub/**)` grants none of
  * them. A deny or ask also reads the file as a path (`alwaysDeny
- * *(secrets/**)`). Other forms are ids, as written but trimmed.
+ * *(secrets/**)`). Other forms are ids, as written but trimmed; a bare NAME
+ * is also looked up in the local chain's files (`.env.local`, `.env`,
+ * `.crewhaus/secrets/NAME`), which a deny or ask reads too, so
+ * `alwaysDeny *(.env)` fires on `API_KEY` while `alwaysAllow
+ * SecretLookup(API_KEY)` still grants it.
  *
  * `source: true` marks a field holding where the tool takes a value from,
  * not where it acts: the reference EnvFileUpsert copies a secret from

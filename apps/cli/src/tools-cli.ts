@@ -1680,7 +1680,7 @@ export function operativeArgWords(arg: OperativeArgLike): string {
   }
   if (arg.secretRef === true) {
     parts.push(
-      "a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path",
+      "a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in",
     );
   }
   if (arg.source === true) {

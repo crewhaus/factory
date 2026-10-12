@@ -612,25 +612,48 @@ function programPlaceValues(
  * a spelling a deny or ask also reads, and the file is a path value only a
  * deny or ask reads (`alwaysDeny *(secrets/**)`). A file outside the
  * workspace is outside: every deny or ask fires, no allow grants it. Any
- * other form (`env:NAME`, `keychain:…`, `op://…`, a bare NAME) is an id.
+ * other form (`env:NAME`, `keychain:…`, `op://…`) is an id. A bare NAME is
+ * an id an allow names as written; it is also looked up in the files of the
+ * local chain ({@link secretChain}), which a deny or ask reads as those
+ * references and those files, so `alwaysDeny *(.env)` fires on `API_KEY`.
  */
 function secretRefValues(raw: string, canonicalizePath: PathCanonicalizer): OperativeValue[] {
   const ref = raw.trim();
   const place = secretRefPlace(ref);
   if (place === undefined) {
+    const id: OperativeValue = {
+      kind: "id",
+      canonical: [ref],
+      ...(ref !== raw ? { spellings: [raw] } : {}),
+      ...(HEX_ID.test(ref) ? { caseInsensitive: true } : {}),
+    };
+    if (!BARE_SECRET_NAME.test(ref)) return [id];
     return [
-      {
-        kind: "id",
-        canonical: [ref],
-        ...(ref !== raw ? { spellings: [raw] } : {}),
-        ...(HEX_ID.test(ref) ? { caseInsensitive: true } : {}),
-      },
+      id,
+      ...secretChain(ref).flatMap((step) =>
+        placeValues(step, canonicalizePath).map((v) => ({ ...v, restrictOnly: true })),
+      ),
     ];
   }
+  // The reference as written and as trimmed are spellings a deny reads too.
+  return placeValues(place, canonicalizePath).map((v) =>
+    v.kind === "id" ? { ...v, spellings: [...new Set([raw, ref, ...(v.spellings ?? [])])] } : v,
+  );
+}
+
+/**
+ * The file one `file:` or `envfile:` reference opens, as the values a rule
+ * reads: the reference with the file's canonical path in it, which an allow
+ * names, and the file itself as a path only a deny or ask reads.
+ */
+function placeValues(
+  place: { readonly scheme: "file" | "envfile"; readonly path: string; readonly key: string },
+  canonicalizePath: PathCanonicalizer,
+): OperativeValue[] {
   const named = (path: string): string => `${place.scheme}:${path}${place.key}`;
   const out: OperativeValue[] = [];
   for (const file of canonicalizePath(place.path)) {
-    const spellings = [...new Set([raw, ref, ...(file.spellings ?? []).map(named)])];
+    const spellings = [...new Set([named(place.path), ...(file.spellings ?? []).map(named)])];
     out.push(
       file.outsideWorkspace === true
         ? { kind: "id", canonical: [], spellings, outsideWorkspace: true }
@@ -1069,6 +1092,27 @@ function placeForms(
 /** `./` or `.\\` at the start: a word the call wrote relative to its directory. */
 function startsWithDotSlash(word: string): boolean {
   return word.startsWith("./") || word.startsWith(".\\");
+}
+
+/** A bare reference: an environment-variable name, which the local chain looks up. */
+const BARE_SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The files a bare NAME is looked up in after the environment, highest
+ * precedence first: `@crewhaus/tool-secrets`' `chainRefs` (the harness
+ * supervisor's `.env.local` and `.env`, then the secrets directory). That
+ * package's tests hold this list to its own.
+ */
+function secretChain(name: string): ReadonlyArray<{
+  readonly scheme: "file" | "envfile";
+  readonly path: string;
+  readonly key: string;
+}> {
+  return [
+    { scheme: "envfile", path: ".env.local", key: `#${name}` },
+    { scheme: "envfile", path: ".env", key: `#${name}` },
+    { scheme: "file", path: `.crewhaus/secrets/${name}`, key: "" },
+  ];
 }
 
 /**

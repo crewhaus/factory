@@ -6,7 +6,7 @@
  * `envfile:` reference opens with its own copy of the split. This holds the
  * two together: over a fixed corpus and a seeded generator, every file the
  * tool would open is a file the gate read, and the gate reads no other file
- * for a reference the tool accepts.
+ * for a reference the tool accepts — a bare NAME's local chain included.
  *
  * The canonicaliser here only records what it is handed; where the file
  * lands is runtime-core's business and has its own tests.
@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
 import { lexicalPathValues, operativeValuesFor } from "@crewhaus/tool-executor";
 import { envFileUpsert, secretLookup, secretRotate } from "./index";
 import { parseRef } from "./lib/refs";
+import { chainRefs } from "./lib/resolve";
 
 /** The files the gate reads for one call: what it hands the canonicaliser. */
 function gateReads(tool: typeof secretLookup, input: unknown): string[] {
@@ -32,8 +33,12 @@ function gateReads(tool: typeof secretLookup, input: unknown): string[] {
 function toolOpens(raw: string): { readonly paths: string[]; readonly refused: boolean } {
   const parsed = parseRef(raw);
   if (!parsed.ok) return { paths: [], refused: true };
-  const ref = parsed.value;
-  return { paths: ref.kind === "file" || ref.kind === "envfile" ? [ref.path] : [], refused: false };
+  // A bare NAME is looked up in every file of the local chain.
+  const steps = parsed.value.kind === "auto" ? chainRefs(parsed.value.name) : [parsed.value];
+  const paths = steps.flatMap((ref) =>
+    ref.kind === "file" || ref.kind === "envfile" ? [ref.path] : [],
+  );
+  return { paths, refused: false };
 }
 
 /** mulberry32: a seeded generator, so a failing reference reproduces. */
@@ -70,6 +75,9 @@ const CORPUS = [
   "keychain:acme#deploy",
   "op://vault/item/field",
   "SLACK_TOKEN",
+  " SLACK_TOKEN\t",
+  "_x9",
+  "9_LIVES",
   "file:secrets/token\nx",
 ];
 
@@ -77,8 +85,33 @@ function generated(count: number, seed: number): string[] {
   const next = seeded(seed);
   const pick = <T>(list: ReadonlyArray<T>): T => list[Math.floor(next() * list.length)] as T;
   const around = ["", "", " ", "\t", " ", "﻿", "\n", "\r", " "];
-  const schemes = ["file:", "file:", "envfile:", "envfile:", "env:", "File:", "op://", "pass:", ""];
-  const segments = ["secrets", ".", "..", "", "pub", "lnk", "a#b", "token", ".env", " x", "é", "#"];
+  const schemes = [
+    "file:",
+    "file:",
+    "envfile:",
+    "envfile:",
+    "env:",
+    "File:",
+    "op://",
+    "pass:",
+    "",
+    "",
+  ];
+  const segments = [
+    "secrets",
+    ".",
+    "..",
+    "",
+    "pub",
+    "lnk",
+    "a#b",
+    "token",
+    ".env",
+    " x",
+    "é",
+    "#",
+    "API_KEY",
+  ];
   const joins = ["/", "/", "//", "\\"];
   const keys = ["", "#KEY", "#KEY", "#bad-key", "#", "#A#B"];
   const out: string[] = [];
@@ -95,11 +128,12 @@ function generated(count: number, seed: number): string[] {
 describe("the gate reads a secret reference as parseRef reads it", () => {
   test("every file the tool opens is a file the gate read, and no other for an accepted reference", () => {
     const refs = [...CORPUS, ...generated(20_000, 0x0c8)];
-    const tally = { opens: 0, refused: 0, ids: 0 };
+    const tally = { opens: 0, refused: 0, ids: 0, bare: 0 };
     const mismatches: Array<{ ref: string; tool: string[]; gate: string[] }> = [];
     for (const ref of refs) {
       const tool = toolOpens(ref);
       const gate = gateReads(secretLookup, { refs: [ref] });
+      if (!tool.refused && parseRef(ref).ok && !ref.includes(":")) tally.bare++;
       if (tool.refused) tally.refused++;
       else if (tool.paths.length > 0) tally.opens++;
       else tally.ids++;
@@ -116,6 +150,7 @@ describe("the gate reads a secret reference as parseRef reads it", () => {
     expect(tally.opens).toBeGreaterThan(2_000);
     expect(tally.refused).toBeGreaterThan(2_000);
     expect(tally.ids).toBeGreaterThan(500);
+    expect(tally.bare).toBeGreaterThan(50);
   });
 
   test("each tool that takes a reference routes it through the same reading", () => {

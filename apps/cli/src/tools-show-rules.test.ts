@@ -48,11 +48,11 @@ describe("operativeArgWords — a declaration in words", () => {
       ],
       [
         { field: "refs", kind: "id", secretRef: true },
-        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path",
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in",
       ],
       [
         { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
-        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path; where the value is taken from: a deny or ask reads it, an allow need not name it",
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, and the .env files and secrets directory a bare NAME is looked up in; where the value is taken from: a deny or ask reads it, an allow need not name it",
       ],
       [
         { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },

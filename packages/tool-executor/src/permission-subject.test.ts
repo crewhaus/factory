@@ -1412,7 +1412,6 @@ describe("a secret reference (critic8)", () => {
       [" env:HOME ", "env:HOME"],
       ["keychain:acme#deploy", "keychain:acme#deploy"],
       ["op://vault/item/field", "op://vault/item/field"],
-      ["SLACK_TOKEN", "SLACK_TOKEN"],
       ["File:secrets/token", "File:secrets/token"],
       ["file:", "file:"],
       ["envfile:secrets/.env", "envfile:secrets/.env"],
@@ -1426,6 +1425,27 @@ describe("a secret reference (critic8)", () => {
       });
     }
     expect(on(" env:HOME", "LookupLike(env:HOME)", "allow")).toBe(true);
+  });
+
+  test("a bare NAME is granted by name, and a deny on a file its chain reads fires on it", () => {
+    const values = operativeValuesFor(lookup(), { refs: [" SLACK_TOKEN"] }) ?? [];
+    // What an allow reads: the name, trimmed.
+    expect(values.filter((v) => v.restrictOnly !== true).map((v) => v.canonical)).toEqual([
+      ["SLACK_TOKEN"],
+    ]);
+    expect(on("SLACK_TOKEN", "LookupLike(SLACK_TOKEN)", "allow")).toBe(true);
+    for (const deny of [
+      "LookupLike(.env)",
+      "LookupLike(.env.local)",
+      "LookupLike(.crewhaus/secrets/**)",
+      "LookupLike(envfile:.env#SLACK_TOKEN)",
+      "LookupLike(file:.crewhaus/secrets/*)",
+    ]) {
+      expect({ deny, fires: on("SLACK_TOKEN", deny, "restrict") }).toEqual({ deny, fires: true });
+    }
+    // Control: a name the tool refuses is looked up nowhere.
+    expect(on("9_LIVES", "LookupLike(.env)", "restrict")).toBe(false);
+    expect(on("SLACK_TOKEN", "LookupLike(secrets/**)", "restrict")).toBe(false);
   });
 
   test("a source field is read by a deny or ask only", () => {

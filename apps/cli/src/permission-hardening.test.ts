@@ -1114,6 +1114,36 @@ describe("critic8 — a secret reference is read where its file lands", () => {
     expect(readFileSync(join(ws, ".env"), "utf8")).toContain("COPIED=public-value");
   }, 60_000);
 
+  test("a bare NAME: a deny on a file its chain reads fires, an allow by name still grants it", async () => {
+    // A bare name is looked up in .env.local, .env and .crewhaus/secrets/,
+    // so EnvFileUpsert could copy a value out of .env, under a deny on it,
+    // into a file the model may read.
+    mkdirSync(join(ws, ".crewhaus", "secrets"), { recursive: true });
+    writeFileSync(join(ws, ".crewhaus", "secrets", "PROD_TOKEN"), "s3cr3t-chain");
+    const store = rules(["alwaysDeny", "*(.crewhaus/secrets/**)"], ["alwaysAllow", "SecretLookup"]);
+    for (const ref of ["PROD_TOKEN", " PROD_TOKEN"]) {
+      const got = await gate("SecretLookup", { refs: [ref] }, store);
+      expect({ ref, got, resolved: resolved() }).toEqual({ ref, got: "deny", resolved: false });
+    }
+    const copy = { path: "public.env", entries: [{ key: "K", valueFrom: "API_KEY" }] };
+    const env = rules(["alwaysDeny", "*(.env)"], ["alwaysAllow", "EnvFileUpsert(public.env)"]);
+    expect(await gate("EnvFileUpsert", copy, env)).toBe("deny");
+    expect(existsSync(join(ws, "public.env"))).toBe(false);
+    // Control: an allow by name still grants it, and the copy runs unruled.
+    expect(
+      await gate(
+        "SecretLookup",
+        { refs: ["PROD_TOKEN"] },
+        rules(["alwaysAllow", "SecretLookup(PROD_TOKEN)"]),
+      ),
+    ).toBe("allow");
+    expect(resolved()).toBe(true);
+    expect(
+      await gate("EnvFileUpsert", copy, rules(["alwaysAllow", "EnvFileUpsert(public.env)"])),
+    ).toBe("allow");
+    expect(readFileSync(join(ws, "public.env"), "utf8")).toContain("K=original");
+  }, 60_000);
+
   test("SecretRotate: a deny reads the reference it rewrites and the one it copies from", async () => {
     const generate = { bytes: 16, encoding: "hex" };
     const rs = rules(
