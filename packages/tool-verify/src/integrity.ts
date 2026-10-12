@@ -18,6 +18,24 @@
  */
 import { type FileKind, walkContained } from "@crewhaus/tool-safety/fs";
 
+/**
+ * An `exclude` entry as a walked path: what `p.replace(/^\.\/+|\/+$/g, "")`
+ * left, a leading `./` (with the slashes after it) and the trailing slashes
+ * cut off. As a global search that pattern tried `\/+$` from every slash of
+ * a run that does not reach the end, reading the rest of the run from each:
+ * quadratic in the run, 64 entries of 1,024 characters a call.
+ */
+export function excludeKey(p: string): string {
+  let start = 0;
+  if (p.startsWith("./")) {
+    start = 2;
+    while (p.charCodeAt(start) === 0x2f) start++;
+  }
+  let end = p.length;
+  while (end > start && p.charCodeAt(end - 1) === 0x2f) end--;
+  return p.slice(start, end);
+}
+
 export type IntegrityEntry = {
   /** Slash-separated path relative to the walked directory. */
   readonly rel: string;
@@ -76,7 +94,7 @@ export function integrityWalk(
     readonly exclude?: ReadonlyArray<string>;
   } = {},
 ): IntegrityWalk {
-  const exclude = new Set((options.exclude ?? []).map((p) => p.replace(/^\.\/+|\/+$/g, "")));
+  const exclude = new Set((options.exclude ?? []).map(excludeKey));
   const walked = walkContained(root, dir === "" ? "." : dir, {
     maxEntries: options.maxEntries ?? defaults.maxEntries,
     maxDepth: options.maxDepth ?? defaults.maxDepth,
