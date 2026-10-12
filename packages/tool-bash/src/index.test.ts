@@ -170,7 +170,12 @@ describe("background Bash + BashOutput + KillShell", () => {
 
       writeFileSync(gate, "");
       // The rest: "second" and the exit, with "first" not reported again.
-      const after = await pollUntil(id, (seen) => seen.includes("[status] exited"));
+      // Wait for both: Bun settles the exit apart from the stdout pump, so a
+      // poll can report the exit before the last chunk has been appended.
+      const after = await pollUntil(
+        id,
+        (seen) => seen.includes("second") && seen.includes("[status] exited"),
+      );
       expect(after).toContain("second");
       expect(after).not.toContain("first");
       expect(after).toContain("[status] exited 0");
