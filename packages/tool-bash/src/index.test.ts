@@ -1,8 +1,15 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __resetBackgroundProcsForTest, bash, bashOutput, killShell } from "./index";
+
+/** Spies a test installs, restored after it even if its body was abandoned. */
+const spies: Array<{ mockRestore: () => void }> = [];
+
+afterEach(() => {
+  for (const spy of spies.splice(0)) spy.mockRestore();
+});
 
 describe("Bash tool metadata", () => {
   test("name + flags", () => {
@@ -48,12 +55,47 @@ describe("Bash tool execution", () => {
   });
 
   test("kills the process and reports timeout when exceeded", async () => {
-    // The command outlasts this test's budget, so only the kill at the
-    // timeout can end the call in time; a call that waited for it fails here
-    // at the budget. Nothing is timed: a 2 s bound on the call (about 0.65 s
-    // on CI) raced the runner. `exec`, so the kill reaches the sleep itself.
-    const out = await bash.execute({ command: "exec sleep 120", timeout: 150 });
-    expect(out).toContain("timed out after 150ms");
+    // The timers the call arms as it starts are held, not left to the clock:
+    // the test checks the only one is set for the requested timeout and fires
+    // it itself, so the kill is shown to be armed for that timeout and to be
+    // what ends the call, however slow the runner. Timing the call (under 2 s
+    // for 150 ms) raced the runner; timing nothing let a kill armed 20 times
+    // late pass. The sleep outlasts the budget, so only the kill can end the
+    // call; `exec`, so the kill reaches the sleep itself.
+    const realSetTimeout = globalThis.setTimeout;
+    const hold = { on: true };
+    const held: Array<{ ms: number | undefined; fire: () => void }> = [];
+    spies.push(
+      spyOn(globalThis, "setTimeout").mockImplementation(((
+        fn: (...args: unknown[]) => void,
+        ms?: number,
+        ...args: unknown[]
+      ) => {
+        if (!hold.on) return realSetTimeout(fn, ms, ...args);
+        const once = { fired: false };
+        held.push({
+          ms,
+          fire: () => {
+            if (once.fired) return;
+            once.fired = true;
+            fn(...args);
+          },
+        });
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as unknown as typeof setTimeout),
+    );
+    // execute() arms its timers synchronously, before its first await.
+    const call = bash.execute({ command: "exec sleep 120", timeout: 150 });
+    hold.on = false;
+    try {
+      expect(held.map((timer) => timer.ms)).toEqual([150]);
+      held[0]?.fire();
+      expect(await call).toContain("timed out after 150ms");
+    } finally {
+      // A failed check must not leave the sleep running: fire what was held.
+      for (const timer of held) timer.fire();
+      await call;
+    }
   }, 20_000);
 
   test("does not time out when command finishes within budget", async () => {
@@ -111,17 +153,28 @@ describe("background Bash + BashOutput + KillShell", () => {
   });
 
   test("background:true returns a bash_id immediately without blocking", async () => {
-    // The command waits for a file this test creates only after the call has
-    // returned, so a call that waited for the command would never return (the
-    // budget stops it), and it is still running once the call has. Nothing is
-    // timed: "under 1 s, against a 2 s sleep" raced the runner.
+    // "Immediately" is counted in event-loop turns, not timed: the call has
+    // settled before one macrotask turn has passed, so it waited on no timer,
+    // no output and no exit (Bun.spawn is synchronous). The command waits for
+    // a file this test creates only after the call has returned, so it is
+    // still running then. Timing the call ("under 1 s, against a 2 s sleep")
+    // raced the runner; only awaiting it let a start that blocks for a
+    // bounded time pass.
     const dir = mkdtempSync(join(tmpdir(), "crewhaus-bash-gate-"));
     const gate = join(dir, "release");
     try {
-      const out = await bash.execute({
+      const call = bash.execute({
         command: `while [ ! -f '${gate}' ]; do sleep 0.01; done; echo done`,
         background: true,
       });
+      const state = { settled: false };
+      const settle = (): void => {
+        state.settled = true;
+      };
+      void call.then(settle, settle);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(state.settled).toBe(true);
+      const out = await call;
       expect(out).toContain("[background] started bash_");
       expect(out).toMatch(/bash_[0-9a-f]{12}/);
       const id = out.match(/bash_[0-9a-f]{12}/)?.[0] as string;
