@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type RuleSet, evaluate } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   detectFormat,
   detectLint,
@@ -727,7 +728,10 @@ describe("code intelligence over a real tree", () => {
     // A name longer than AstQuery runs its pattern on is undetermined for
     // the pattern: listed as unchecked, not silently filtered out.
     write("src/long.ts", `export const ${"a".repeat(2_000)} = 1;\n`);
-    const result = await callJson(astQuery, { cwd: "src", pattern: "^[a-z]" });
+    // "Shape" fails the pattern in the regex worker: without this, a worker a
+    // loaded runner stalls 100 ms there reads as giving up, and the name as
+    // unchecked too.
+    const result = await withoutGiveUp(() => callJson(astQuery, { cwd: "src", pattern: "^[a-z]" }));
     const names = (result["declarations"] as Array<Record<string, unknown>>).map((d) => d["name"]);
     expect(names).toContain("helper");
     expect(names.some((n) => String(n).length > 1_024)).toBe(false);

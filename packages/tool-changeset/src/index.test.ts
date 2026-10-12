@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import { CHANGESET_TOOLS, diffLint, docsSymbolCheck } from "./index";
 
 /**
@@ -728,15 +729,19 @@ describe("DiffLint's caller patterns (C073)", () => {
   };
 
   test("the caller's patterns still decide, run in the worker", async () => {
-    const out = await call<LintResponse & { undetermined?: unknown }>(diffLint, {
-      diff: patch(
-        "// TODO: JIRA-12 wire it",
-        "// TODO: tidy this",
-        'const p = "//buildserver-7/cache";',
-      ),
-      ticketPattern: "JIRA-\\d+",
-      machinePathPatterns: ["//buildserver-\\d+/"],
-    });
+    // Most of these lines fail both patterns in the regex worker: without
+    // this, a worker a loaded runner stalls 100 ms on one reads as giving up.
+    const out = await withoutGiveUp(() =>
+      call<LintResponse & { undetermined?: unknown }>(diffLint, {
+        diff: patch(
+          "// TODO: JIRA-12 wire it",
+          "// TODO: tidy this",
+          'const p = "//buildserver-7/cache";',
+        ),
+        ticketPattern: "JIRA-\\d+",
+        machinePathPatterns: ["//buildserver-\\d+/"],
+      }),
+    );
     const byRule = out.findings.map((f) => `${f.rule}@${f.line}`).sort();
     expect(byRule).toEqual(["machinePath@3", "ticketlessTodo@2"]);
     expect(out.undetermined).toBeUndefined();

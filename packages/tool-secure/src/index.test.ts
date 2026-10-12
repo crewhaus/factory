@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   SECURE_TOOLS,
   allowlistCheck,
@@ -680,7 +681,12 @@ describe("ContentPolicyCheck", () => {
   ];
 
   test("a compliant document passes every rule", async () => {
-    const out = await run(contentPolicyCheck, { text: "Results may vary over time.", rules });
+    // The review pattern finds nothing, a failing exec in the regex worker:
+    // without this, a worker a loaded runner stalls 100 ms there reads as
+    // giving up, and the rule as not evaluated.
+    const out = await withoutGiveUp(() =>
+      run(contentPolicyCheck, { text: "Results may vary over time.", rules }),
+    );
     expect(out.pass).toBe(true);
     expect(out.counts).toMatchObject({ pass: 3, fail: 0 });
   });
