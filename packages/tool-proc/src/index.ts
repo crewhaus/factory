@@ -919,10 +919,15 @@ export const waitForOutput: RegisteredTool = buildTool({
     // Whether a look is the last one is decided BEFORE it is taken. The
     // exit, and the pipes' last bytes, can land while a match is running in
     // the worker, so a process seen finished only afterwards gets one more
-    // look. And it has finished only when its pipes have ended too: the exit
-    // can reach the parent before the line printed just ahead of it, and a
-    // process it started can still hold the pipes and print.
-    const finished = (): boolean => bg.status !== "running" && bg.outputEnded;
+    // look. An exited process has finished only when its pipes have ended
+    // too: the exit can reach the parent before the line printed just ahead
+    // of it, and a process it started can still hold the pipes and print. A
+    // stopped one has finished at once: ProcessStop signals the process
+    // alone, so one it started (a script running a server without `exec`)
+    // can hold the pipes for as long as it runs, and waiting on them ran a
+    // wait on a stopped process to its deadline.
+    const finished = (): boolean =>
+      bg.status === "killed" || (bg.status === "exited" && bg.outputEnded);
     const haystack = (): string =>
       which === "stdout"
         ? bg.stdout
