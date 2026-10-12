@@ -10,6 +10,8 @@
  *     through again, so n links through one long target cost n times it.
  *   - A pax header's length field was re-read from each offset inside it, so
  *     a header of k zeros before `1 ` cost k² character reads.
+ *   - A zip symlink's target was inflated whole before its length was
+ *     checked, once per member, and members can share one bomb.
  *
  * Each rewrite is held to the 0.7.1 code it replaced, kept below as the
  * reference, on generated and hostile archives.
@@ -18,9 +20,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { gzipSync } from "node:zlib";
+import { deflateRawSync, gzipSync, inflateRawSync } from "node:zlib";
 import { archiveExtract, archiveList } from "./index";
-import { type ArchiveEntry, readTarEntries } from "./lib/archive-format";
+import {
+  type ArchiveEntry,
+  _setInflateRawForTest,
+  readTarEntries,
+  readZipEntries,
+} from "./lib/archive-format";
 import { memberComponents, unsafeArchiveLinks } from "./lib/archive-links";
 
 // ---------------------------------------------------------------------------
@@ -534,6 +541,205 @@ describe("a pax header's length fields are read once", () => {
       { name: "real.txt", size: 0, kind: "file", linkTarget: "../../x" },
     ]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// a zip's link targets
+// ---------------------------------------------------------------------------
+
+type ZipMember = {
+  readonly name: string;
+  /** 0 stored, 8 deflated. */
+  readonly method: number;
+  readonly data: Buffer;
+  /** Index of an earlier member whose local data this one's directory entry points at. */
+  readonly sharesWith?: number;
+};
+
+/** A zip of symlink members, each central-directory entry pointing at its own data or an earlier member's. */
+function zipOfLinks(members: ReadonlyArray<ZipMember>): Buffer {
+  const locals: Buffer[] = [];
+  const offsets: number[] = [];
+  let at = 0;
+  for (const member of members) {
+    if (member.sharesWith !== undefined) {
+      offsets.push(offsets[member.sharesWith] as number);
+      continue;
+    }
+    const name = Buffer.from(member.name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(member.method, 8);
+    local.writeUInt32LE(member.data.length, 18);
+    local.writeUInt32LE(member.data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    offsets.push(at);
+    const part = Buffer.concat([local, name, member.data]);
+    locals.push(part);
+    at += part.length;
+  }
+  const directory: Buffer[] = [];
+  members.forEach((member, i) => {
+    const source =
+      member.sharesWith === undefined ? member : (members[member.sharesWith] as ZipMember);
+    const name = Buffer.from(member.name);
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(0x031e, 4);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(source.method, 10);
+    entry.writeUInt32LE(source.data.length, 20);
+    entry.writeUInt32LE(source.data.length, 24);
+    entry.writeUInt16LE(name.length, 28);
+    // S_IFLNK in the high half of the external attributes: a symlink.
+    entry.writeUInt32LE((0o120777 << 16) >>> 0, 38);
+    entry.writeUInt32LE(offsets[i] as number, 42);
+    directory.push(entry, name);
+  });
+  const central = Buffer.concat(directory);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(members.length, 8);
+  end.writeUInt16LE(members.length, 10);
+  end.writeUInt32LE(central.length, 12);
+  end.writeUInt32LE(at, 16);
+  return Buffer.concat([...locals, central, end]);
+}
+
+/** A deflate stream that writes `text` after `blocks` empty stored blocks, which read input and write nothing. */
+function paddedDeflate(text: string, blocks: number): Buffer {
+  const empty = Buffer.from([0x00, 0x00, 0x00, 0xff, 0xff]);
+  return Buffer.concat([
+    ...Array.from({ length: blocks }, () => empty),
+    deflateRawSync(Buffer.from(text)),
+  ]);
+}
+
+/**
+ * Run `body` with the zip reader's inflater counted: the bytes it is handed
+ * and the bytes it returns (for a call stopped at its output limit, the
+ * limit). Nothing is timed.
+ */
+function inflateWork<T>(body: () => T): { value: T; calls: number; bytes: number } {
+  const counter = { calls: 0, bytes: 0 };
+  _setInflateRawForTest(((data: Uint8Array, options?: { maxOutputLength?: number }) => {
+    counter.calls += 1;
+    counter.bytes += data.length;
+    try {
+      const out = inflateRawSync(data, options);
+      counter.bytes += out.length;
+      return out;
+    } catch (err) {
+      counter.bytes += options?.maxOutputLength ?? 0;
+      throw err;
+    }
+  }) as typeof inflateRawSync);
+  try {
+    return { value: body(), ...counter };
+  } finally {
+    _setInflateRawForTest(undefined);
+  }
+}
+
+describe("a zip's link targets are read within their limits", () => {
+  const unstated = "a link whose target this archive does not state";
+
+  test("hundreds of links sharing one deflate bomb: each costs at most its limits", () => {
+    // A kilobyte of deflate that inflates to a megabyte, named by every link.
+    // Each was inflated whole before its length was checked: a 102 KB zip
+    // made the listing inflate 2 GB.
+    const bomb = deflateRawSync(Buffer.alloc(1 << 20, 0x61));
+    const perMember = 16_384 + 8_192;
+    const counted = [200, 400].map((n) => {
+      const members: ZipMember[] = [{ name: "l0", method: 8, data: bomb }];
+      for (let i = 1; i < n; i++)
+        members.push({ name: `l${i}`, method: 8, data: bomb, sharesWith: 0 });
+      const zip = zipOfLinks(members);
+      return { n, ...inflateWork(() => readZipEntries(zip)) };
+    });
+    for (const { n, value, calls, bytes } of counted) {
+      // Every link went through the counted inflater, and none was read.
+      expect(calls).toBe(n);
+      expect(
+        value.every((entry) => entry.kind === "symlink" && entry.linkTarget === undefined),
+      ).toBe(true);
+      expect(bytes).toBeLessThanOrEqual(n * perMember);
+      expect(unsafeArchiveLinks(value).every((u) => u.why === unstated)).toBe(true);
+    }
+    const [small, large] = counted as [(typeof counted)[0], (typeof counted)[0]];
+    expect(large.bytes / small.bytes).toBeLessThan(2.25);
+  }, 20_000);
+
+  test("a deflated target over 16 KiB compressed is refused unread, though it would inflate to a short path", () => {
+    // 16,384 bytes is twice the longest target read; deflate never needs
+    // that much for 8,192 bytes. Padding with empty blocks is how a stream
+    // gets past it, and every link sharing it would be paid for again.
+    const under = paddedDeflate("ok/target", 3_000); // 15,000 bytes of padding
+    const over = paddedDeflate("ok/target", 3_400); // 17,000 bytes
+    expect(under.length).toBeLessThanOrEqual(16_384);
+    expect(over.length).toBeGreaterThan(16_384);
+    const { value, calls } = inflateWork(() =>
+      readZipEntries(
+        zipOfLinks([
+          { name: "read", method: 8, data: under },
+          { name: "refused", method: 8, data: over },
+        ]),
+      ),
+    );
+    expect(calls).toBe(1);
+    expect(value.map((e) => [e.name, e.linkTarget])).toEqual([
+      ["read", "ok/target"],
+      ["refused", undefined],
+    ]);
+    // What the operator sees: the link is refused, by name.
+    expect(unsafeArchiveLinks(value)).toEqual([{ name: "refused", linkTarget: "", why: unstated }]);
+  });
+
+  test("every deflated target reads as 0.7.1's inflate-then-measure read it, up to the bound", () => {
+    // 0.7.1 inflated with Bun.inflateSync and refused more than 8,192 bytes;
+    // the reader now stops inflating there. Truncated, garbage-suffixed,
+    // bit-flipped and random streams included.
+    const random = generator(74);
+    const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+    const decoder = new TextDecoder("utf-8");
+    let read = 0;
+    let mismatches = 0;
+    for (let i = 0; i < 2000; i++) {
+      const length = pick([0, 1, 9, 120, 4000, 8191, 8192, 8193, 12000]);
+      const text = Buffer.alloc(length);
+      for (let j = 0; j < length; j++) {
+        text[j] = random() < 0.5 ? pick([47, 46, 97, 98]) : Math.floor(random() * 256);
+      }
+      let data: Buffer = deflateRawSync(text, { level: Math.floor(random() * 10) });
+      const roll = random();
+      if (roll < 0.15) data = data.subarray(0, Math.floor(random() * data.length));
+      else if (roll < 0.3)
+        data = Buffer.concat([data, Buffer.from([1, 2, 3, Math.floor(random() * 256)])]);
+      else if (roll < 0.45 && data.length > 0) {
+        data = Buffer.from(data);
+        const k = Math.floor(random() * data.length);
+        data[k] = (data[k] as number) ^ (1 << Math.floor(random() * 8));
+      } else if (roll < 0.55) {
+        data = Buffer.from(
+          Array.from({ length: Math.floor(random() * 64) }, () => Math.floor(random() * 256)),
+        );
+      }
+      let expected: string | undefined;
+      try {
+        const inflated = Bun.inflateSync(data as Uint8Array<ArrayBuffer>);
+        expected = inflated.length > 8192 ? undefined : decoder.decode(inflated);
+      } catch {
+        expected = undefined;
+      }
+      if (data.length > 16_384) expected = undefined;
+      const [entry] = readZipEntries(zipOfLinks([{ name: "l", method: 8, data }]));
+      if (expected !== undefined) read += 1;
+      if (entry?.linkTarget !== expected) mismatches += 1;
+    }
+    expect(mismatches).toBe(0);
+    expect(read).toBeGreaterThan(650);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

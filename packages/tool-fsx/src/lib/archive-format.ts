@@ -14,7 +14,7 @@
  * Both parsers are pure: bytes in, entries out. Nothing here touches the
  * filesystem or spawns anything.
  */
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, inflateRawSync } from "node:zlib";
 
 export type ArchiveEntryKind = "file" | "dir" | "symlink" | "hardlink" | "other";
 
@@ -285,6 +285,23 @@ const MAX_EOCD_SEARCH = 22 + 0xffff;
 const LOCAL_SIGNATURE = 0x04034b50;
 /** A symlink target longer than this is not a path anyone meant to store. */
 const MAX_LINK_TARGET_BYTES = 8192;
+/**
+ * The most compressed bytes a deflated link target may take. Deflate adds at
+ * most a few percent to data it cannot compress (zlib's worst for 8,192
+ * bytes is 8,655), so a target within the limit always fits in twice it.
+ */
+const MAX_DEFLATED_LINK_TARGET_BYTES = 2 * MAX_LINK_TARGET_BYTES;
+
+/** What a deflated link target is inflated with. */
+const inflater = { raw: inflateRawSync };
+
+/**
+ * Test seam: stand in for the inflater, so a test can count the bytes it is
+ * handed and returns. Pass `undefined` to restore.
+ */
+export function _setInflateRawForTest(fn: typeof inflateRawSync | undefined): void {
+  inflater.raw = fn ?? inflateRawSync;
+}
 
 /**
  * Read a symlink member's target, which a zip stores as the member's own
@@ -317,7 +334,13 @@ function readZipLinkTarget(
       return TEXT.decode(stored);
     }
     if (method === 8) {
-      const inflated = Bun.inflateSync(stored as Uint8Array<ArrayBuffer>);
+      // Bounded before and during inflation. Every member's target was
+      // inflated whole and only then measured, and many members can name the
+      // same data: a 102 KB zip made the listing inflate 2 GB. Compressed
+      // data past the bound is refused unread (a stream of empty blocks
+      // reads all of it and writes nothing); output past the limit throws.
+      if (stored.length > MAX_DEFLATED_LINK_TARGET_BYTES) return undefined;
+      const inflated = inflater.raw(stored, { maxOutputLength: MAX_LINK_TARGET_BYTES });
       if (inflated.length > MAX_LINK_TARGET_BYTES) return undefined;
       return TEXT.decode(inflated);
     }
