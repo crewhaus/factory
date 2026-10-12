@@ -38,6 +38,7 @@ import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "no
 import * as path from "node:path";
 import type { ApprovalPlace } from "@crewhaus/session-store";
 import type { PathCanonicalizer } from "@crewhaus/tool-executor";
+import { physicalPath } from "@crewhaus/tool-safety/fs";
 
 type OperativeValue = ReturnType<PathCanonicalizer>[number];
 
@@ -317,7 +318,15 @@ type WorkspacePathReading = {
  * workspace names in `canonical` — and that a value flagged outside does
  * not, since a rule needs only the flag. An approval is bound to these
  * places, and an outside place is a place an operator approved as much as an
- * inside one. Where the destination cannot be worked out, the place is
+ * inside one.
+ *
+ * Where `realpath` cannot say where a path lands, the rule still reads only
+ * the outside flag, but the place is walked the way the file tools walk it
+ * (`physicalPath` in `@crewhaus/tool-safety/fs`, one `lstat`/`readlink` per
+ * name): a directory that can be searched but not read (mode 0300) stops
+ * `realpath` and stops listing it, and stops no tool. Only where that walk
+ * fails too (a loop of links, a directory that cannot be searched), which is
+ * where the tool cannot open the path either, is the place
  * {@link UNRESOLVED_PLACE} followed by the path as written.
  */
 function readWorkspacePath(
@@ -345,6 +354,32 @@ function readWorkspacePath(
   };
   const asWritten = toPosix(path.resolve(rootReal, lexicalRel));
   const unresolved = `${UNRESOLVED_PLACE}${toPosix(lexicalAbs)}`;
+  const known = { lexical: rootAbs, physical: rootReal };
+  /** Where `abs` lands, walked as the tools walk it; `undefined` where they could not open it. */
+  const walked = (abs: string): string | undefined => {
+    try {
+      return toPosix(physicalPath(abs, { known }));
+    } catch {
+      return undefined;
+    }
+  };
+  /**
+   * The entry `name` in the directory that really holds it, and where it
+   * leads when it is a symlink: the places the normal reading below gives a
+   * rule, for a directory it could not read.
+   */
+  const entryPlaces = (dir: string, name: string): string[] => {
+    const at = path.join(dir, name);
+    if (!isSymlink(at)) return [toPosix(at)];
+    const target = walked(at);
+    if (target === undefined) return [toPosix(at), unresolved];
+    return target === toPosix(at) ? [toPosix(at)] : [toPosix(at), target];
+  };
+  /** The places of `lexicalAbs` where its directory could not be read. */
+  const placesByWalk = (): string[] => {
+    const dir = walked(path.dirname(lexicalAbs));
+    return dir === undefined ? [unresolved] : entryPlaces(dir, path.basename(lexicalAbs));
+  };
   const read = (
     values: OperativeValue[],
     places: string[] | (() => string[]),
@@ -382,14 +417,10 @@ function readWorkspacePath(
   if (climbsOut(lexicalRel)) {
     // A rule needs only the flag. The place is walked for only when an
     // approval asks, so a grant made for one place outside is not spent on
-    // another.
-    return read([outside], () => {
-      try {
-        return [toPosix(resolveLocation(lexicalAbs))];
-      } catch {
-        return [unresolved];
-      }
-    });
+    // another — and walked in one pass over the path: `resolveLocation`
+    // hands the rest of the path to dirname and basename once per missing
+    // name, the square of a length the model chooses.
+    return read([outside], () => [walked(lexicalAbs) ?? unresolved]);
   }
   if (lexicalAbs === rootAbs) {
     caseInsensitive = ignoresCase(rootReal) !== false;
@@ -400,7 +431,7 @@ function readWorkspacePath(
     parent = resolveLocation(path.dirname(lexicalAbs));
   } catch {
     // Where it lands cannot be worked out: an allow must not guess.
-    return read([outside], [unresolved]);
+    return read([outside], placesByWalk());
   }
   // Unknown counts as "ignores case": that only widens what a deny or an ask
   // catches, never what an allow grants.
@@ -412,7 +443,7 @@ function readWorkspacePath(
     // name to — which, on a filesystem that folds case or Unicode form, may
     // be stored under another spelling. A rule sees that spelling.
     const stored = storedNames(parent, leaf);
-    if (stored === undefined) return read([outside], [toPosix(path.join(parent, leaf))]);
+    if (stored === undefined) return read([outside], placesByWalk());
     names = stored;
   }
   const values: OperativeValue[] = [];
@@ -427,7 +458,7 @@ function readWorkspacePath(
         target = resolveLocation(at);
       } catch {
         values.push(outside);
-        places.push(unresolved);
+        places.push(walked(at) ?? unresolved);
         continue;
       }
       if (target !== at) {
@@ -439,7 +470,11 @@ function readWorkspacePath(
   return read(values, places);
 }
 
-/** How a place reads when where the path lands could not be worked out. */
+/**
+ * How a place reads when even the tools' own walk cannot follow the path: a
+ * loop of links, or a directory that cannot be searched. A tool cannot open
+ * such a path either.
+ */
 export const UNRESOLVED_PLACE = "unresolved:";
 
 /**

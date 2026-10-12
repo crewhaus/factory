@@ -30,7 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthropic";
 import {
   type PermissionMode,
@@ -812,4 +812,61 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
     expect(landed).toEqual([]);
     expect(again?.report?.class).toBe("approval_pending");
   });
+});
+
+describe("critic8 — one park of a path that climbs out costs one walk of the path", () => {
+  // The gate reads only "outside" for such a path, but an approval records
+  // where it lands. That place was walked with resolveLocation, which hands
+  // the rest of the path to dirname and basename once per missing name: the
+  // square of a length the model chooses, on the main thread, before the run
+  // parks (2.2 million characters for 1,024 names). It is walked as the file
+  // tools walk, once. Counted in a process of its own: see the script.
+  test("the characters handed to node:path grow with the path, not its square", () => {
+    const child = Bun.spawnSync(
+      [process.execPath, join(import.meta.dir, "__test__", "outside-place-park.ts")],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const out = child.stdout.toString();
+    expect({ exitCode: child.exitCode, stderr: child.stderr.toString().slice(-2_000) }).toEqual({
+      exitCode: 0,
+      stderr: expect.any(String),
+    });
+    type Park = {
+      d: number;
+      chars: number;
+      work: number;
+      outcome: string;
+      ws: string;
+      parked?: PendingApproval;
+    };
+    const parks: Park[] = out
+      .split("\n")
+      .filter((line) => line.startsWith("{"))
+      .map((line) => JSON.parse(line) as Park);
+    expect(parks.map((p) => p.d)).toEqual([1, 1024, 2048, 4096]);
+    const base = parks[0] as Park;
+    for (const p of parks) {
+      expect({ d: p.d, outcome: p.outcome }).toEqual({ d: p.d, outcome: "approval_pending" });
+      // Recorded where it lands: nothing below the workspace's parent exists.
+      const raw = `../${Array.from({ length: p.d }, () => "a").join("/")}`;
+      const at = `${dirname(p.ws)}/${raw.slice(3)}`;
+      const places = p.parked?.places;
+      expect({ d: p.d, path: places?.[0]?.path === raw, at: places?.[0]?.at[0] === at }).toEqual({
+        d: p.d,
+        path: true,
+        at: true,
+      });
+      if (p === base) continue;
+      const extra = p.work - base.work;
+      // Five characters per character of the path when this was written; the
+      // square walk was 1,000 at 1,024 names. The path is read at least once.
+      expect({ d: p.d, extra }).toEqual({ d: p.d, extra: expect.any(Number) });
+      expect(extra).toBeLessThanOrEqual(8 * p.chars);
+      expect(extra).toBeGreaterThanOrEqual(p.chars);
+    }
+    // Twice the names, twice the work, not four times it.
+    const extra = (i: number) => (parks[i] as Park).work - base.work;
+    expect(extra(2) / extra(1)).toBeLessThan(2.25);
+    expect(extra(3) / extra(2)).toBeLessThan(2.25);
+  }, 120_000);
 });

@@ -5,12 +5,15 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -258,6 +261,77 @@ describe("placeRecordingCanonicalizer — the places a headless approval is boun
     const rec = placeRecordingCanonicalizer(ws);
     expect(rec.canonicalizePath("loop-a/x")[0]?.outsideWorkspace).toBe(true);
     expect(rec.places()).toEqual([{ path: "loop-a/x", at: [`unresolved:${ws}/loop-a/x`] }]);
+  });
+
+  describe("in a directory that can be searched but not read (mode 0300)", () => {
+    // critic8: `realpath` fails there on macOS, and listing it fails
+    // everywhere; no file tool cares, since opening a name needs only search
+    // permission. The rule still reads the outside flag. The place was
+    // `unresolved:<path>` (macOS) or the link alone, never where it led (Linux),
+    // so it read the same wherever the link pointed, and a grant made for it
+    // was spent after an allowed `ln` moved the link to secrets/.
+    const d = () => path.join(ws, "d");
+    beforeEach(() => {
+      mkdirSync(d());
+      mkdirSync(path.join(ws, "secrets"));
+      symlinkSync("../src/app.ts", path.join(d(), "x.md"));
+      chmodSync(d(), 0o300);
+    });
+    // Before the workspace is removed: removing it lists `d`.
+    afterEach(() => chmodSync(d(), 0o755));
+    const placesOf = (raw: string) => {
+      const rec = placeRecordingCanonicalizer(ws);
+      rec.canonicalizePath(raw);
+      return rec.places();
+    };
+    /** Whether this process is refused a listing there (root is not). */
+    const unlistable = (): boolean => {
+      try {
+        readdirSync(d());
+        return false;
+      } catch {
+        return true;
+      }
+    };
+
+    test("a link there is the link and where it leads, and moving it moves the place", () => {
+      if (unlistable()) {
+        expect(placeRecordingCanonicalizer(ws).canonicalizePath("d/x.md")).toEqual([
+          expect.objectContaining({ outsideWorkspace: true }),
+        ]);
+      }
+      expect(placesOf("d/x.md")).toEqual([
+        { path: "d/x.md", at: [`${ws}/d/x.md`, `${ws}/src/app.ts`] },
+      ]);
+      unlinkSync(path.join(d(), "x.md"));
+      symlinkSync("../secrets/x.md", path.join(d(), "x.md"));
+      expect(placesOf("d/x.md")).toEqual([
+        { path: "d/x.md", at: [`${ws}/d/x.md`, `${ws}/secrets/x.md`] },
+      ]);
+    });
+
+    test("a name not there yet is its own place; a link made there later is another", () => {
+      expect(placesOf("d/new.md")).toEqual([{ path: "d/new.md", at: [`${ws}/d/new.md`] }]);
+      symlinkSync("../secrets/x.md", path.join(d(), "new.md"));
+      expect(placesOf("d/new.md")).toEqual([
+        { path: "d/new.md", at: [`${ws}/d/new.md`, `${ws}/secrets/x.md`] },
+      ]);
+    });
+
+    test("a link whose target runs through it is placed where it leads", () => {
+      symlinkSync("../d/x.md", path.join(ws, "src", "via"));
+      symlinkSync("../d", path.join(ws, "src", "to-d"));
+      symlinkSync("../d/new.md", path.join(ws, "src", "to-new"));
+      expect(placesOf("src/via")).toEqual([
+        { path: "src/via", at: [`${ws}/src/via`, `${ws}/src/app.ts`] },
+      ]);
+      expect(placesOf("src/to-d")).toEqual([
+        { path: "src/to-d", at: [`${ws}/src/to-d`, `${ws}/d`] },
+      ]);
+      expect(placesOf("src/to-new")).toEqual([
+        { path: "src/to-new", at: [`${ws}/src/to-new`, `${ws}/d/new.md`] },
+      ]);
+    });
   });
 
   test("allAsWritten: every path lands where it reads on its face, and only then", () => {

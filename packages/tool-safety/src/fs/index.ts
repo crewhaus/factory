@@ -5,6 +5,9 @@
  *
  * - {@link resolveContained}: where a path physically lands, links followed
  *   the way the kernel follows them, refused if outside the root.
+ * - {@link physicalPath}: the same walk for an absolute path, with no root to
+ *   stay inside; it throws where the kernel would fail (a link loop, a
+ *   directory that cannot be searched).
  * - {@link openForRead}: at most N bytes of a contained regular file.
  * - {@link writeFileSafe} / {@link beginAtomicWrite}: temp + rename, never
  *   through a link, permission bits kept on overwrite.
@@ -32,7 +35,13 @@ export {
 } from "./failure";
 export { type FileKind, fileKind } from "../streams/file";
 export { type KindProbe, assertRegularFile, probeKind } from "./kind";
-export { type Contained, type ResolveOptions, joinRel, resolveContained } from "./resolve";
+export {
+  type Contained,
+  type ResolveOptions,
+  joinRel,
+  physicalPath,
+  resolveContained,
+} from "./resolve";
 export {
   type ContainedFd,
   type ContainedRead,

@@ -14,10 +14,12 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -2012,13 +2014,18 @@ describe("critic7 — a headless grant covers the place it was asked for, not wh
   const idIn = (detail: string | undefined) =>
     /parked as approval (appr_[0-9a-f]{16})/.exec(detail ?? "")?.[1];
 
-  async function parkAndGrant(): Promise<string> {
-    const id = idIn(await turn([{ name: "Write", input: write }]));
+  async function park(input: unknown = write): Promise<string> {
+    const id = idIn(await turn([{ name: "Write", input }]));
     if (id === undefined) throw new Error("the Write did not park");
     expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+    return id;
+  }
+  async function parkAndGrant(input: unknown = write): Promise<string> {
+    const id = await park(input);
     await store.resolve(id, "grant", "operator");
     return id;
   }
+  const record = async (id: string | undefined) => (await store.list()).find((a) => a.id === id);
 
   test("retargeted by an allowed call in the resumed turn: the grant is not spent, secrets/ is untouched", async () => {
     const granted = await parkAndGrant();
@@ -2048,4 +2055,63 @@ describe("critic7 — a headless grant covers the place it was asked for, not wh
     expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
     expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeDefined();
   }, 60_000);
+
+  describe("in a directory that can be searched but not read (mode 0300)", () => {
+    // critic8: `realpath` fails in `d` on macOS and listing it fails
+    // everywhere; the file tools need neither, only search permission to
+    // open a name. The place recorded for `d/x.md` read the same wherever the
+    // link there pointed, so the grant for public/ was spent after an
+    // allowed `ln` pointed it at secrets/ — and a grant for a new file was
+    // spent on a link made there afterwards.
+    const dx = { path: "d/x.md", content: "approved for d/x.md" };
+    beforeEach(() => mkdirSync(join(ws, "d")));
+    // Before the workspace is removed: removing it lists `d`.
+    afterEach(() => chmodSync(join(ws, "d"), 0o755));
+
+    test("a leaf link retargeted by an allowed call: asked again, secrets/ untouched", async () => {
+      symlinkSync("../public/x.md", join(ws, "d", "x.md"));
+      chmodSync(join(ws, "d"), 0o300);
+      const granted = await parkAndGrant(dx);
+      expect((await record(granted))?.places).toEqual([
+        { path: "d/x.md", at: [`${ws}/d/x.md`, `${ws}/public/x.md`] },
+      ]);
+      const detail = await turn([
+        { name: "RunCommand", input: { argv: ["ln", "-sfn", "../secrets/x.md", "d/x.md"] } },
+        { name: "Write", input: dx },
+      ]);
+      expect(readlinkSync(join(ws, "d", "x.md"))).toBe("../secrets/x.md");
+      expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
+      expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+      expect(detail).toContain(
+        `approval ${granted} was granted for d/x.md -> ${ws}/d/x.md and ${ws}/public/x.md, and the call now lands at d/x.md -> ${ws}/d/x.md and ${ws}/secrets/x.md, so it is asked again`,
+      );
+      expect((await record(granted))?.consumedAt).toBeUndefined();
+    }, 60_000);
+
+    test("a grant for a new file there is not spent on a link an allowed call makes there", async () => {
+      writeFileSync(join(ws, "secrets", "x.md"), "SECRET ORIGINAL\n");
+      chmodSync(join(ws, "d"), 0o300);
+      const granted = await parkAndGrant(dx);
+      const detail = await turn([
+        { name: "RunCommand", input: { argv: ["ln", "-s", "../secrets/x.md", "d/x.md"] } },
+        { name: "Write", input: dx },
+      ]);
+      expect(readlinkSync(join(ws, "d", "x.md"))).toBe("../secrets/x.md");
+      expect(readFileSync(join(ws, "secrets", "x.md"), "utf8")).toBe("SECRET ORIGINAL\n");
+      expect(detail).toContain(`approval ${granted} was granted for d/x.md -> ${ws}/d/x.md,`);
+      expect((await record(granted))?.consumedAt).toBeUndefined();
+    }, 60_000);
+
+    test("control: the link left where it was, the grant runs once and writes public/x.md", async () => {
+      symlinkSync("../public/x.md", join(ws, "d", "x.md"));
+      chmodSync(join(ws, "d"), 0o300);
+      const granted = await parkAndGrant(dx);
+      expect(await turn([{ name: "Write", input: dx }])).toBeUndefined();
+      expect(readFileSync(join(ws, "public", "x.md"), "utf8")).toBe(dx.content);
+      expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
+      expect((await record(granted))?.consumedAt).toBeDefined();
+      // Spent: the same call is asked again.
+      expect(idIn(await turn([{ name: "Write", input: dx }]))).toBeDefined();
+    }, 60_000);
+  });
 });
