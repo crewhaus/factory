@@ -649,6 +649,18 @@ function parseValue(
   return parsePlainInline(ctx, after, keyIndent, keyLine);
 }
 
+/**
+ * `text` without its trailing newlines: what `text.replace(/\n+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of newlines that is not at the end (blank lines inside a block
+ * scalar) and rescans the rest of the run from each, quadratic in its length.
+ */
+export function withoutTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
 /** `|` / `>` — the body of nearly every `run:` step. */
 function parseBlockScalar(
   ctx: Ctx,
@@ -711,9 +723,9 @@ function parseBlockScalar(
     }
     value = out;
   }
-  if (chomp === "-") value = value.replace(/\n+$/, "");
+  if (chomp === "-") value = withoutTrailingNewlines(value);
   else if (chomp === "+") value = `${value}\n`;
-  else value = value === "" ? "" : `${value.replace(/\n+$/, "")}\n`;
+  else value = value === "" ? "" : `${withoutTrailingNewlines(value)}\n`;
   return {
     kind: "scalar",
     value,

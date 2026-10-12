@@ -781,14 +781,27 @@ export type TaintVerdict = {
   readonly reason: string;
 };
 
+/**
+ * `text` without its trailing dots: what `text.replace(/\.+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of dots that is not at the end and rescans the rest of the run from
+ * each, so it was quadratic in the run's length, and a workflow is whatever
+ * the repository holds.
+ */
+export function withoutTrailingDots(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x2e) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
 /** `['x']`, `["x"]` and `[0]` all mean the same thing as `.x` here. */
 function normalizePath(raw: string): string {
-  return raw
+  const path = raw
     .replace(/\s+/g, "")
     .replace(/\[\s*['"]([^'"]+)['"]\s*\]/g, ".$1")
     .replace(/\[\s*(\d+)\s*\]/g, ".$1")
-    .replace(/^\.+/, "")
-    .replace(/\.+$/, "");
+    .replace(/^\.+/, "");
+  return withoutTrailingDots(path);
 }
 
 /**
