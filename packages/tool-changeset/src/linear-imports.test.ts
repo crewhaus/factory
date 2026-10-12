@@ -88,6 +88,8 @@ describe("namedImports finds what the pattern found", () => {
       "const { a } = require('./m');",
       "let{a}=require( 'x' )",
       "var {a} = require(\"y')",
+      "var {a} = require('./m')",
+      'const\t{\ta,\tb\t}\t=\trequire(\t"./n"\t)',
       "import {a} from 'x\"",
       "import  type  { a }  from  './a'",
     ];
@@ -139,6 +141,29 @@ describe("a line of openers is read once", () => {
       expect(regexWork(bound, () => [...line.matchAll(OLD_SHAPE)].length).steps).toBe(
         Number.POSITIVE_INFINITY,
       );
+    },
+    20_000,
+  );
+
+  // Many short statements, each with its `}`, and each module's quote read
+  // on to the next quote: what follows each `}` is read once, not to the
+  // end of the line again for every statement.
+  test.each([
+    ["imports, each module running into the next", "import {a} from 'x ".repeat(2_500)],
+    ["imports, each module closed by the other quote", `import {a} from 'x" `.repeat(2_500)],
+    ["requires, each module running into the next", "var {a} = require('x ".repeat(2_500)],
+  ])(
+    "%s",
+    (_, line) => {
+      const bound = STEPS_PER_CHARACTER * line.length;
+      const counted = regexWork(bound, () =>
+        scanWork(READS_PER_CHARACTER * line.length, () => namedImports(line)),
+      );
+      expect(counted.unmodelled).toEqual([]);
+      expect(counted.steps).toBeLessThanOrEqual(bound);
+      expect(counted.value?.work).toBeLessThanOrEqual(READS_PER_CHARACTER * line.length);
+      // The pattern reads these in one pass too, so it is run as it was.
+      expect(counted.value?.value).toEqual(old(line));
     },
     20_000,
   );
