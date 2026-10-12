@@ -101,10 +101,103 @@ function parseSimple(source: string): Simple {
   return { tag, id, classes, attrs, pseudos, tests };
 }
 
-function parseAttr(body: string): AttrTest {
-  const m = /^\s*([\w:-]+)\s*(?:([~^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\s\]]*))\s*(i)?)?\s*$/.exec(
-    body,
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
   );
+}
+
+/** A code unit `[\w:-]` matches. */
+function isAttrNameUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    c === 0x5f ||
+    c === 0x3a ||
+    c === 0x2d
+  );
+}
+
+/**
+ * An attribute test's parts, read left to right: what
+ * `/^\s*([\w:-]+)\s*(?:([~^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\s\]]*))\s*(i)?)?\s*$/`
+ * captured (index 0 unused), or `null`. A quoted value is tried first and the
+ * bare form is the fallback, as the alternation orders them. That pattern
+ * shared each run of whitespace between up to three `\s*` and tried every
+ * split of it before giving up, so a run of spaces before a stray character
+ * cost the cube of its length, and the selector is the model's.
+ */
+export function attrSelectorParts(body: string): (string | undefined)[] | null {
+  const spacesFrom = (start: number): number => {
+    let i = start;
+    while (i < body.length && isRegExpSpace(body.charCodeAt(i))) i++;
+    return i;
+  };
+  // What may follow a value: whitespace, an optional `i`, whitespace, the end.
+  const flagAfter = (start: number): { insensitive: boolean } | null => {
+    let i = spacesFrom(start);
+    const insensitive = body.charCodeAt(i) === 0x69;
+    if (insensitive) i = spacesFrom(i + 1);
+    return i === body.length ? { insensitive } : null;
+  };
+  const nameStart = spacesFrom(0);
+  let nameEnd = nameStart;
+  while (nameEnd < body.length && isAttrNameUnit(body.charCodeAt(nameEnd))) nameEnd++;
+  if (nameEnd === nameStart) return null;
+  const name = body.slice(nameStart, nameEnd);
+  const opStart = spacesFrom(nameEnd);
+  if (opStart === body.length) return [undefined, name];
+  const c = body.charCodeAt(opStart);
+  const opLength =
+    (c === 0x7e || c === 0x5e || c === 0x24 || c === 0x2a) && body.charCodeAt(opStart + 1) === 0x3d
+      ? 2
+      : c === 0x3d
+        ? 1
+        : 0;
+  if (opLength === 0) return null;
+  const op = body.slice(opStart, opStart + opLength);
+  const valueStart = spacesFrom(opStart + opLength);
+  const flag = (f: { insensitive: boolean }): string | undefined =>
+    f.insensitive ? "i" : undefined;
+  for (const [quote, slot] of [
+    [0x22, 3],
+    [0x27, 4],
+  ] as const) {
+    if (body.charCodeAt(valueStart) !== quote) continue;
+    const close = body.indexOf(String.fromCharCode(quote), valueStart + 1);
+    if (close === -1) continue;
+    const after = flagAfter(close + 1);
+    if (after === null) continue;
+    const parts: (string | undefined)[] = [undefined, name, op, undefined, undefined, undefined];
+    parts[slot] = body.slice(valueStart + 1, close);
+    parts.push(flag(after));
+    return parts;
+  }
+  let bareEnd = valueStart;
+  while (bareEnd < body.length) {
+    const b = body.charCodeAt(bareEnd);
+    if (isRegExpSpace(b) || b === 0x5d) break;
+    bareEnd++;
+  }
+  const after = flagAfter(bareEnd);
+  if (after === null) return null;
+  return [undefined, name, op, undefined, undefined, body.slice(valueStart, bareEnd), flag(after)];
+}
+
+function parseAttr(body: string): AttrTest {
+  const m = attrSelectorParts(body);
   if (m === null) throw new Error(`"[${body}]" is not an attribute selector this understands`);
   const op = m[2] === undefined ? "exists" : (m[2] as AttrTest["op"]);
   const insensitive = m[6] !== undefined;
