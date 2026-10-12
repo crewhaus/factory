@@ -76,24 +76,6 @@ describe("Bash tool execution", () => {
   });
 });
 
-// Poll a background process until BashOutput reports it is no longer running,
-// or the attempt budget is exhausted. Each poll consumes NEW output, so we
-// accumulate across polls.
-async function drainBackground(
-  id: string,
-  attempts = 50,
-): Promise<{ combined: string; last: string }> {
-  let combined = "";
-  let last = "";
-  for (let i = 0; i < attempts; i++) {
-    last = await bashOutput.execute({ bash_id: id });
-    combined += `${last}\n`;
-    if (!last.includes("[status] running")) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  return { combined, last };
-}
-
 /**
  * Poll a background process until what its polls returned, together,
  * satisfies `done`, and return that. Ends on the output, not on a count of
@@ -139,15 +121,21 @@ describe("background Bash + BashOutput + KillShell", () => {
     const start = await bash.execute({ command: "echo one; echo two", background: true });
     const id = start.match(/bash_[0-9a-f]{12}/)?.[0];
     expect(id).toBeDefined();
-    const { combined, last } = await drainBackground(id as string);
-    expect(combined).toContain("one");
-    expect(combined).toContain("two");
-    expect(last).toContain("[status] exited 0");
+    // Ends on the output and the exit, not after a fixed 50 polls (about a
+    // second), which a child slow to start ran out: it then saw only
+    // "[status] running". Wait for both, as the sibling below does.
+    const seen = await pollUntil(
+      id as string,
+      (polled) => polled.includes("two") && polled.includes("[status] exited"),
+    );
+    expect(seen).toContain("one");
+    expect(seen).toContain("two");
+    expect(seen).toContain("[status] exited 0");
     // A second poll after exit yields no new output but still the status.
     const again = await bashOutput.execute({ bash_id: id as string });
     expect(again).toContain("[no new output]");
     expect(again).toContain("[status] exited 0");
-  });
+  }, 30_000);
 
   test("BashOutput is incremental — a poll only returns output since the last poll", async () => {
     // The second line waits for a file this test creates once it has polled
