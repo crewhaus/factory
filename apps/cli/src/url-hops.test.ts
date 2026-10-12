@@ -13,7 +13,8 @@
  * The rest are fixes. DependencyAudit (whose mirror is checked against
  * `tool_config.fetch`) and the chain reads (whose nodes the spec's `chains`
  * block names) sent their requests with the platform's `fetch`, which follows
- * a redirect anywhere. Both now refuse a redirect and say where it pointed. And a chain read that fails on
+ * a redirect anywhere. Both now refuse every redirect, even one to the same
+ * address, and say where it pointed. And a chain read that fails on
  * every node is judged on what each node said, not on the words of whichever
  * node failed last: that is what decides whether EvmSimulateBundle and
  * GasMarketRead fall back and whether ContractInspect reads a revert.
@@ -558,6 +559,23 @@ describe("DependencyAudit refuses a redirect from its OSV mirror", () => {
     });
   }, 60_000);
 
+  test("a 307 to the mirror's own address is refused too", async () => {
+    // A behaviour change for a mirror that moves a path on its own address:
+    // 0.7.0 followed it.
+    mirror.route = (path) =>
+      path === "/v1/querybatch"
+        ? new Response(null, { status: 307, headers: { location: "/v1/querybatch/" } })
+        : answer(path);
+    const out = await audit();
+    expect({ isError: out.isError, result: out.result, mGot: m.got, bGot: b.got }).toEqual({
+      isError: true,
+      result:
+        "http://mirror.test/v1/querybatch answered HTTP 307 with a redirect to http://mirror.test; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.",
+      mGot: ["POST /v1/querybatch"],
+      bGot: [],
+    });
+  }, 60_000);
+
   test("a 307 on an advisory record is refused the same way, not reported as unserved", async () => {
     mirror.route = (path) => (path === "/v1/querybatch" ? answer(path) : moved(path));
     const out = await audit();
@@ -590,6 +608,12 @@ describe("a chain read refuses a redirect to a node the chains block does not na
   const a = server(
     () => new Response(null, { status: 307, headers: { location: `${b.origin}/forwarded` } }),
   );
+  // A node that moves its own path: /rpc to /rpc/, on the same address.
+  const self = server((_req, url) =>
+    url.pathname === "/rpc"
+      ? new Response(null, { status: 307, headers: { location: "/rpc/" } })
+      : Response.json({ jsonrpc: "2.0", id: 1, result: "0x6001" }),
+  );
   const bind = (rpcUrls: string[], rpcPolicy: "single" | "fallback" | "quorum") =>
     bindChainCallChains({
       chains: [
@@ -609,11 +633,11 @@ describe("a chain read refuses a redirect to a node the chains block does not na
     );
 
   beforeEach(() => {
-    for (const s of [a, b]) s.got.length = 0;
+    for (const s of [a, b, self]) s.got.length = 0;
   });
   afterAll(() => {
     setChainRpcResolver(undefined);
-    for (const s of [a, b]) s.stop();
+    for (const s of [a, b, self]) s.stop();
   });
 
   test("control: a node the block names answers", async () => {
@@ -630,9 +654,22 @@ describe("a chain read refuses a redirect to a node the chains block does not na
     const out = await inspect();
     expect({ isError: out.isError, result: out.result, aGot: a.got, bGot: b.got }).toEqual({
       isError: true,
-      result: `[1] eth_getCode: all 1 RPC URL(s) failed; the last: ${a.origin} answered HTTP 307 with a redirect to ${b.origin}; a JSON-RPC read is not followed to a node the chains block does not name, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
+      result: `[1] eth_getCode: all 1 RPC URL(s) failed; the last: ${a.origin} answered HTTP 307 with a redirect to ${b.origin}; a chain read never follows a redirect, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
       aGot: ["POST /rpc"],
       bGot: [],
+    });
+  }, 60_000);
+
+  test("a 307 to the node's own address is refused too, and says so", async () => {
+    // A behaviour change for a node that moves /rpc to /rpc/: 0.7.0 followed
+    // it. The message must not say the target is a node the block does not
+    // name, when it is the very node the block names.
+    bind([`${self.origin}/rpc`], "single");
+    const out = await inspect();
+    expect({ isError: out.isError, result: out.result, selfGot: self.got }).toEqual({
+      isError: true,
+      result: `[1] eth_getCode: all 1 RPC URL(s) failed; the last: ${self.origin} answered HTTP 307 with a redirect to its own address; a chain read never follows a redirect, so nothing was re-sent. Set rpcUrls to the address that answers directly.`,
+      selfGot: ["POST /rpc"],
     });
   }, 60_000);
 

@@ -445,9 +445,11 @@ async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
         signal: call.signal,
-        // Never followed: the spec's chains block names the nodes a read may
-        // reach, and a redirect would re-send it to one it does not name and
-        // report that node's answer as the chain's.
+        // Never followed, not even to the node's own address: the spec's
+        // chains block names the nodes a read may reach, and a followed
+        // redirect would re-send the read to one it does not name and report
+        // that node's answer as the chain's. tool-chainread and tool-defi
+        // refuse every redirect too.
         redirect: "manual",
       }) as RequestInit,
     );
@@ -464,10 +466,14 @@ async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
       // already closed
     }
     if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
+      const from = endpointLabel(url);
+      const to = redirectLabel(res.headers.get("location") ?? "", url);
       throw new ChainAdapterError(
         chainId,
         method,
-        `${endpointLabel(url)} answered HTTP ${res.status} with a redirect to ${redirectLabel(res.headers.get("location") ?? "", url)}; a JSON-RPC read is not followed to a node the chains block does not name, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
+        to === from
+          ? `${from} answered HTTP ${res.status} with a redirect to its own address; a chain read never follows a redirect, so nothing was re-sent. Set rpcUrls to the address that answers directly.`
+          : `${from} answered HTTP ${res.status} with a redirect to ${to}; a chain read never follows a redirect, so nothing was sent there. Set rpcUrls to the address that answers directly.`,
       );
     }
     throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${endpointLabel(url)}`);

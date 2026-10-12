@@ -693,4 +693,25 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     const heard = (await settle(one.rpcRead("eth_call", []))) as ChainAdapterError;
     expect(heard.attempts?.map((a) => a.rpc)).toEqual([MISSING]);
   });
+
+  test("a redirect is never followed, even to the node's own address, and the error says which it was", async () => {
+    const seen: string[] = [];
+    const fetchImpl = ((url: string, init: RequestInit) => {
+      seen.push(`${url} ${init.redirect}`);
+      const location = url.endsWith("/own") ? "/own/" : "https://elsewhere.test/v2/k";
+      return Promise.resolve(new Response(null, { status: 307, headers: { location } }));
+    }) as unknown as typeof fetch;
+    const reason = async (url: string) => {
+      const adapter = createEvmAdapter({ ...LOCAL, rpcUrls: [url] }, fetchImpl);
+      const err = (await settle(adapter.rpcRead("eth_blockNumber", []))) as ChainAdapterError;
+      return err.attempts?.[0]?.message;
+    };
+    expect([await reason("https://node.test/own"), await reason("https://node.test/away")]).toEqual(
+      [
+        "[1] eth_blockNumber: https://node.test answered HTTP 307 with a redirect to its own address; a chain read never follows a redirect, so nothing was re-sent. Set rpcUrls to the address that answers directly.",
+        "[1] eth_blockNumber: https://node.test answered HTTP 307 with a redirect to https://elsewhere.test; a chain read never follows a redirect, so nothing was sent there. Set rpcUrls to the address that answers directly.",
+      ],
+    );
+    expect(seen).toEqual(["https://node.test/own manual", "https://node.test/away manual"]);
+  });
 });

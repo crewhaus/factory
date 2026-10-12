@@ -254,9 +254,10 @@ A tool that cannot say no is not finished. These say no, with the reason:
   requires, and a **block the node does not have**;
 - **a `multicall3Address` other than the canonical deployment or the one the
   operator configured** for the chain, before anything is dialled;
-- **a node that answers with a redirect**: the read is not re-sent to a node
-  the `chains` block does not name, and the error says where it pointed (under
-  `fallback`, the next node named is asked instead);
+- **a node that answers with any redirect**, even to its own address: a chain
+  read never follows one, and the error says where it pointed. Under
+  `fallback`, the next node named is asked instead. Point `rpcUrls` at the
+  address that answers directly;
 - **an address that is not 20 hex bytes**, before anything is dialled. A
   lowercase address is answered, with `checksumVerified: false` attached,
   because EIP-55 can only verify a checksum that is there.
