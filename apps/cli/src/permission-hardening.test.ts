@@ -36,8 +36,8 @@ import {
 } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, hashApprovalInput } from "@crewhaus/session-store";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
-import { createPendingApprovalStore } from "@crewhaus/session-store";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createNavigateTool } from "@crewhaus/tool-navigate";
@@ -2054,6 +2054,42 @@ describe("critic7 — a headless grant covers the place it was asked for, not wh
     expect(readFileSync(join(ws, "public", "x.md"), "utf8")).toBe(write.content);
     expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
     expect((await store.list()).find((a) => a.id === granted)?.consumedAt).toBeDefined();
+  }, 60_000);
+
+  // critic8: binding keeps a call from RUNNING somewhere unapproved. A deny
+  // runs nothing wherever the call lands, so it is honoured as 0.7.0 did;
+  // asking again would only add a prompt, and a chance of a mistaken grant.
+  test("a refusal still refuses once an allowed call moves the link: denied, not asked again", async () => {
+    const denied = await park();
+    await store.resolve(denied, "deny", "operator");
+    const detail = await turn([
+      { name: "RunCommand", input: { argv: ["ln", "-sfn", "../secrets", "pub/link"] } },
+      { name: "Write", input: write },
+    ]);
+    expect(realpathSync(join(ws, "pub", "link"))).toBe(join(ws, "secrets"));
+    expect(detail).toBeUndefined();
+    expect(existsSync(join(ws, "secrets", "x.md"))).toBe(false);
+    expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+    expect((await store.list()).map((a) => a.id)).toEqual([denied]);
+  }, 60_000);
+
+  test("a refusal made before approvals were bound refuses a call through a link", async () => {
+    // As 0.7.0 wrote it: no `places`.
+    const legacy = "appr_00000000000000bb";
+    await store.persist({
+      id: legacy,
+      toolName: "Write",
+      inputHash: hashApprovalInput("Write", write),
+      input: write,
+      runId: "run_old",
+      sessionId,
+      surface: "single-turn",
+      createdAt: new Date().toISOString(),
+    });
+    await store.resolve(legacy, "deny", "operator");
+    expect(await turn([{ name: "Write", input: write }])).toBeUndefined();
+    expect(existsSync(join(ws, "public", "x.md"))).toBe(false);
+    expect((await store.list()).map((a) => a.id)).toEqual([legacy]);
   }, 60_000);
 
   describe("in a directory that can be searched but not read (mode 0300)", () => {

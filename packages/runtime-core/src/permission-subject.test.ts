@@ -746,13 +746,20 @@ describe("0.7.1 — a headless approval covers the place it was asked for", () =
     expect((await store.list()).length).toBe(2);
   });
 
-  test("a deny made for another place is not applied: the call is asked again", async () => {
+  test("a deny made for another place still refuses the call: it can only refuse", async () => {
+    // critic8: binding keeps a call from RUNNING somewhere unapproved; a deny
+    // runs nothing wherever the call lands, so it is honoured as 0.7.0 did
+    // rather than asked again.
     const first = parkedId(await turn(call));
     await store.resolve(first as string, "deny", "operator");
     retarget("../secrets");
-    const again = await turn(call);
-    expect(again?.report?.detail).toContain(`approval ${first} was denied for pub/link/x.md`);
+    expect(await turn(call)).toBeUndefined();
     expect(landed).toEqual([]);
+    // The model is told why: the operator's refusal.
+    expect(JSON.stringify(requests[1]?.messages ?? [])).toContain(
+      "`Write` approval was denied by operator",
+    );
+    expect((await store.list()).map((a) => a.id)).toEqual([first]);
   });
 
   test("a regenerated call does not replay a grant whose input has since moved (#400)", async () => {

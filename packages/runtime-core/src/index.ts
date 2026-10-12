@@ -854,6 +854,9 @@ export type CallPlaces = {
  * again: never run somewhere the approver could not have seen. A record
  * whose `places` is not the shape written here (a foreign or hand-edited
  * line) covers nothing.
+ *
+ * Binding is about where a call RUNS, so the gate asks this of a grant or a
+ * park it would re-use; a deny refuses the call wherever it lands.
  */
 export function landsWhereApproved(
   record: Pick<PendingApproval, "places">,
@@ -6080,15 +6083,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             hashApprovalInput(legacyToolName, operativeInput),
           );
         }
-        // 0.7.1 — A DECISION COVERS THE PLACE IT WAS MADE FOR. The record is
+        // 0.7.1 — A GRANT COVERS THE PLACE IT WAS MADE FOR. The record is
         // keyed on the input, but a symlink moved since the park (by any
         // allowed call in the resumed turn) sends the same input somewhere
-        // else. A record made where the call no longer lands decides nothing
-        // here — not a grant, not a deny, not a park to re-use — and the
-        // newest one made where it does land, if any, takes its place;
-        // otherwise the call is asked again below.
+        // else. A grant, or a park to re-use, made where the call no longer
+        // lands decides nothing here, and the newest record made where it
+        // does land, if any, takes its place; otherwise the call is asked
+        // again below. A DENY is honoured wherever the call lands: it can
+        // only refuse, so asking again would add a prompt (and a chance of a
+        // mistaken grant) for an action the operator already turned down.
         let movedFrom: PendingApproval | undefined;
-        if (existing !== null && !landsWhereApproved(existing, gateView)) {
+        if (
+          existing !== null &&
+          existing.decision !== "deny" &&
+          !landsWhereApproved(existing, gateView)
+        ) {
           movedFrom = existing;
           existing = await findApprovalForPlace(approvals.store, approvalKeys, gateView);
         }
@@ -6317,11 +6326,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             movedFrom === undefined
               ? ""
               : `; approval ${movedFrom.id} was ${
-                  movedFrom.decision === "grant"
-                    ? "granted"
-                    : movedFrom.decision === "deny"
-                      ? "denied"
-                      : "requested"
+                  movedFrom.decision === "grant" ? "granted" : "requested"
                 } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(
                   gateView.places(),
                 )}, so it is asked again`;
