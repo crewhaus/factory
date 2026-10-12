@@ -94,7 +94,10 @@ describe("a batch is asked about in chunks no larger than the question cap", () 
     for (const n of w.pending) expect(n).toBeLessThanOrEqual(MAX_PATTERN_QUESTIONS);
     expect(w.pending.reduce((a, b) => a + b, 0)).toBe(980 * 16 * 64);
     expect(out).toMatchObject({ coded: 980, needsReview: 0 });
-  }, 120_000);
+    // Slow by construction: it must ask more than the real cap, a million
+    // questions, and nine tenths of its time is asking and reading them on
+    // this thread, not the worker. 10-14 s on CI; the budget is 20 times that.
+  }, 300_000);
 
   test("lines reached after the budget ran out are not asked about, and go to review", async () => {
     const { lines, rules } = batch(12, 3);
