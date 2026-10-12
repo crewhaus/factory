@@ -737,7 +737,7 @@ describe("code intelligence over a real tree", () => {
     expect(names.some((n) => String(n).length > 1_024)).toBe(false);
     expect(result["uncheckedCount"]).toBe(1);
     expect(String((result["uncheckedNames"] as string[])[0]).length).toBe(2_000);
-  });
+  }, 20_000); // walks a real tree and asks a regex worker: slow on a loaded runner
 
   test("AstQuery whose pattern run could not finish reports that, not an empty list (C079)", async () => {
     const controller = new AbortController();

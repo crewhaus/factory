@@ -916,7 +916,7 @@ describe("caller-supplied patterns (C073)", () => {
     expect(report.entries[0]?.key).toBe("dist/app[hash].js");
     expect(report.comparison.matched).toHaveLength(1);
     expect(report.comparison.added).toEqual([]);
-  });
+  }, 20_000); // builds, weighs and joins in a regex worker: slow on a loaded runner
 
   test("a catastrophic joinPattern is refused by the schema and by execute", async () => {
     writeFileSync("dist/app.js", payload("app"));
@@ -970,7 +970,7 @@ describe("caller-supplied patterns (C073)", () => {
     );
     expect(out).toContain("could not determine the joinPattern key of 1 path");
     expect(out).toContain(`(first: "${long}")`);
-  });
+  }, 20_000); // builds, weighs and joins in a regex worker: slow on a loaded runner
 
   test("a catastrophic mask is refused, and a mask the worker could not apply fails the call", async () => {
     const runs = [

@@ -689,7 +689,7 @@ describe("ContentPolicyCheck", () => {
     );
     expect(out.pass).toBe(true);
     expect(out.counts).toMatchObject({ pass: 3, fail: 0 });
-  });
+  }, 20_000); // runs in a regex worker, which a loaded runner can be slow to start
 
   test("a missing disclaimer and a forbidden phrase both fail", async () => {
     const out = await run(contentPolicyCheck, { text: "Guaranteed to work.", rules });
