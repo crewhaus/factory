@@ -98,8 +98,9 @@ describe("compileSafePattern", () => {
     // only the screen's own work, which its work budget bounds (tool-safety's
     // screen tests count it), not the backtracking it refuses. Every way a
     // RegExp runs here goes through exec once it is replaced, so the runs are
-    // counted rather than timed. The second pattern is screened nowhere else,
-    // so its verdict is not a cached one.
+    // counted rather than timed. The gate runs no RegExp at all, so any run
+    // counts, however the refused pattern was wrapped. The second pattern is
+    // screened nowhere else, so its verdict is not a cached one.
     const refused = ["(a|a)*$", "(c|cd)*$"];
     const ran: string[] = [];
     const exec = RegExp.prototype.exec;
@@ -121,7 +122,7 @@ describe("compileSafePattern", () => {
       // Refused for its shape, not for running out of screen work.
       if (!out.ok) expect(out.message).toContain("alternation");
     }
-    expect(ran.filter((source) => refused.includes(source))).toEqual([]);
+    expect(ran).toEqual([]);
   });
 
   test("a brace or optional quantifier inside a repeated group is still nesting (C079)", () => {

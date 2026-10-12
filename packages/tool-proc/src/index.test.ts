@@ -272,6 +272,43 @@ async function withDeadlineAfterFirstLine<T>(
   }
 }
 
+/**
+ * Runs `body` counting the timers armed and the Workers started while it
+ * runs. A wait that sleeps between polls arms a timer, and so does every
+ * match in the regex worker (its deadline), whose first in a call starts a
+ * worker. A refusal made before any of that arms neither, so a test shows
+ * that a refusal came up front by counting, with no clock involved.
+ */
+async function countTimersAndWorkers<T>(
+  body: () => Promise<T>,
+): Promise<{ result: T; timers: number; workers: number }> {
+  const counted = { timers: 0, workers: 0 };
+  const realSetTimeout = globalThis.setTimeout;
+  const RealWorker = globalThis.Worker;
+  class CountedWorker extends RealWorker {
+    constructor(...args: ConstructorParameters<typeof Worker>) {
+      super(...args);
+      counted.workers += 1;
+    }
+  }
+  const armed = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    counted.timers += 1;
+    return realSetTimeout(fn, delay, ...rest);
+  }) as typeof setTimeout);
+  (globalThis as { Worker: unknown }).Worker = CountedWorker;
+  try {
+    const result = await body();
+    return { result, ...counted };
+  } finally {
+    (globalThis as { Worker: unknown }).Worker = RealWorker;
+    armed.mockRestore();
+  }
+}
+
 /** WaitForOutput's longest match deadline (MATCH_BUDGET_MS in ./index). */
 const MATCH_DEADLINE_MS = 2_000;
 
@@ -1292,14 +1329,14 @@ describe("WaitForOutput", () => {
       argv: ["sh", "-c", "echo deadbeefcafe0123456789abcdef0123456789ab; sleep 5"],
     });
     // 0.7.0's scanner took `{1,}` for a literal and ran this: ~6.7 s of a
-    // blocked event loop and a false reason "deadline".
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(\\w{1,})*$",
-      timeoutMs: 3_000,
-    });
+    // blocked event loop and a false reason "deadline". Refused at once: no
+    // match was run and no poll slept, so no timer was armed.
+    const { result: out, ...armed } = await countTimersAndWorkers(() =>
+      call(waitForOutput, { id: started.id, pattern: "(\\w{1,})*$", timeoutMs: 3_000 }),
+    );
     expect(String(out)).toContain("[WaitForOutput error]");
     expect(String(out)).toContain("exponentially");
+    expect(armed).toEqual({ timers: 0, workers: 0 });
   });
 
   test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
@@ -1574,8 +1611,11 @@ describe("WaitForOutput", () => {
 
   test("a pattern that could backtrack exponentially is refused", async () => {
     const started = await call(processStart, { argv: ["sleep", "1"] });
-    const out = await call(waitForOutput, { id: started.id, pattern: "(a+)+b", timeoutMs: 100 });
+    const { result: out, ...armed } = await countTimersAndWorkers(() =>
+      call(waitForOutput, { id: started.id, pattern: "(a+)+b", timeoutMs: 100 }),
+    );
     expect(out).toContain("exponentially");
+    expect(armed).toEqual({ timers: 0, workers: 0 });
   });
 
   /**
@@ -1592,15 +1632,15 @@ describe("WaitForOutput", () => {
         'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
       );
       const started = await call(processStart, { argv: [path] });
-      const out = await call(waitForOutput, {
-        id: started.id,
-        pattern: "(a|a)*$",
-        timeoutMs: 1_000,
-      });
-      // Refused up front: the sentence comes only from the screen, before
-      // the first match, and a wait that ran the match ends in a JSON answer.
+      const { result: out, ...armed } = await countTimersAndWorkers(() =>
+        call(waitForOutput, { id: started.id, pattern: "(a|a)*$", timeoutMs: 1_000 }),
+      );
+      // Refused up front: the sentence comes only from the screen, and a
+      // wait that ran the match ends in a JSON answer. Before the first
+      // match and before any sleep, too: neither armed a timer.
       expect(typeof out).toBe("string");
       expect(out).toContain("alternation");
+      expect(armed).toEqual({ timers: 0, workers: 0 });
     },
   );
 
@@ -2382,16 +2422,20 @@ describe("dangling-symlink containment in resolveSafe", () => {
     expect(existsSync(target)).toBe(false);
     symlinkSync(target, join(tmp, "dangling.bin"));
 
-    const out = await call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 });
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 }),
+    );
 
     // The specific refusal matters. Before the fix the path was admitted and
     // the tool polled it to the deadline (returning `satisfied: false`), and
     // the only thing standing between a caller and an outside oracle was the
     // per-poll recheck, whose wording is different ("it NOW resolves
-    // outside…"). This asserts the up-front check did the refusing, so the
-    // path was refused before the first poll, not at the deadline.
+    // outside…"). This asserts the up-front check did the refusing, and no
+    // poll slept before it, so it came before the polling, not at the
+    // deadline.
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(timers).toBe(0);
     // A read-only tool cannot have created the target, but assert it anyway:
     // this is the assertion that would fail first if a writing tool were ever
     // wired to `resolveSafe`. The planted link is left exactly as it was.
@@ -2404,13 +2448,12 @@ describe("dangling-symlink containment in resolveSafe", () => {
     // for a directory that does not exist yet was walked past the same way,
     // and everything under it inherited the parent's verdict.
     symlinkSync(join(outside, "not-made-yet"), join(tmp, "dlink"));
-    const out = await call(waitForFile, {
-      path: "dlink/artifact.bin",
-      timeoutMs: 2_000,
-      intervalMs: 20,
-    });
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dlink/artifact.bin", timeoutMs: 2_000, intervalMs: 20 }),
+    );
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(timers).toBe(0);
     expect(existsSync(join(outside, "not-made-yet"))).toBe(false);
   });
 
@@ -2480,10 +2523,13 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(join(outside, "realdir"), join(tmp, "dirlink"));
     symlinkSync("../escape.bin", join(outside, "realdir", "l"));
 
-    // The up-front check's sentence: refused before the first poll.
-    const out = await call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 });
+    // The up-front check's sentence, and no poll slept before it.
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 }),
+    );
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(timers).toBe(0);
     expect(existsSync(join(outside, "escape.bin"))).toBe(false);
   });
 
