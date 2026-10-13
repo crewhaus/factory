@@ -30,15 +30,19 @@
  *
  * There is no RPC client and no HTTP client in this package. Chain reads
  * leave through `_setChainReader` and metadata fetches through
- * `_setMetadataFetch`; the runtime binds both at boot and every test drives
+ * `_setMetadataFetch`. A bundle binds them at boot from the spec —
+ * `bindTokenChains` from its `chains` block, `registerTokenConfig` from
+ * `tool_config.token.metadata_origins` (`lib/boot.ts`) — and every test drives
  * them from recorded answers, so the suite cannot reach the network even by
  * accident.
  */
 import { createHash } from "node:crypto";
+import { CHAINS_BLOCK_EXAMPLE } from "@crewhaus/chain-adapter-base";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { MULTICALL3_ADDRESS } from "@crewhaus/tool-onchain";
 import { z } from "zod";
+import { resolveAggregator } from "./lib/boot";
 import {
   type BatchCall,
   type CallOutcome,
@@ -94,6 +98,12 @@ export {
   hasChainReader,
 } from "./lib/chain";
 export {
+  type Aggregator,
+  type TokenConfigInput,
+  bindTokenChains,
+  registerTokenConfig,
+} from "./lib/boot";
+export {
   type MetadataFetch,
   type MetadataResponse,
   type UriPlan,
@@ -141,7 +151,9 @@ const batchField = z
 const multicallField = z
   .string()
   .optional()
-  .describe(`Multicall3's address on this chain; default ${MULTICALL3_ADDRESS}`);
+  .describe(
+    `leave it out: batches go to the canonical Multicall3 (${MULTICALL3_ADDRESS}) or the one the operator configured for the chain, and any other address is refused`,
+  );
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -420,6 +432,7 @@ const CONCERNING_FLAGS: ReadonlySet<string> = new Set([
 
 export const tokenResolve: RegisteredTool = buildTool({
   name: "TokenResolve",
+  operativeArgs: [{ field: "query", kind: "text", within: "chainId" }],
   description:
     "Turn a token symbol, name or address into ONE checksummed address, confirmed against the contract itself — or refuse and show you why. Use it before any transfer, balance read or approval, because a symbol is not an identifier: nothing stops a second contract calling itself USDC with six decimals and a convincing name, and reputable token lists carry different addresses for the same ticker. When a query could mean more than one address this returns EVERY candidate with resolved:false rather than the first hit or a most-likely, because picking between them is a decision with a wrong answer that costs money. Symbols that differ only by a Cyrillic lookalike or a zero-width space are pulled into the same candidate set on purpose, so an impostor a literal match would miss becomes an ambiguity you have to look at. The contract's own decimals and symbol are compared against what the lists claim, and a decimals mismatch is a refusal rather than a footnote.",
   inputSchema: z
@@ -471,7 +484,7 @@ export const tokenResolve: RegisteredTool = buildTool({
   // through whatever the runtime bound to the seam.
   scope: "external",
   ioCapability: "network",
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const query = input.query.trim();
     const lists = (input.lists ?? []) as ReadonlyArray<TokenList>;
     const policy = input.policy ?? "listed-only";
@@ -571,7 +584,7 @@ export const tokenResolve: RegisteredTool = buildTool({
     if (wantsOnchain && !hasChainReader()) {
       if (input.confirmOnchain === true) {
         throw new TokenError(
-          "confirmOnchain was asked for but no chain reader is bound; bind one with _setChainReader() or pass confirmOnchain:false to answer from the lists alone",
+          `confirmOnchain was asked for but no chain is configured. Declare one in the spec — ${CHAINS_BLOCK_EXAMPLE} — or pass confirmOnchain:false to answer from the lists alone`,
         );
       }
     }
@@ -579,6 +592,12 @@ export const tokenResolve: RegisteredTool = buildTool({
 
     const facts = new Map<string, Erc20Facts & { hasCode: boolean | null }>();
     let blockNumber: string | null = null;
+    // Resolved before any read: an aggregator the operator did not name is
+    // refused, not asked.
+    const aggregator =
+      confirm && (input.batch ?? true)
+        ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+        : null;
     if (confirm) {
       const calls: BatchCall[] = [];
       for (const [i, candidate] of candidates.entries()) {
@@ -588,10 +607,8 @@ export const tokenResolve: RegisteredTool = buildTool({
         chainId: input.chainId,
         calls,
         blockTag,
-        batch: input.batch ?? true,
-        ...(input.multicall3Address !== undefined
-          ? { multicall3Address: input.multicall3Address }
-          : {}),
+        batch: aggregator !== null,
+        ...(aggregator !== null ? { multicall3Address: aggregator.address } : {}),
       });
       blockNumber = read.blockNumber;
       for (const [i, candidate] of candidates.entries()) {
@@ -616,7 +633,14 @@ export const tokenResolve: RegisteredTool = buildTool({
       });
     }
 
-    const shared = { ...base, blockNumber, confirmedOnchain: confirm, candidates: flagged };
+    const shared = {
+      ...base,
+      blockNumber,
+      confirmedOnchain: confirm,
+      // Who answered the batched reads, since every one of them is its word.
+      aggregator,
+      candidates: flagged,
+    };
 
     if (flagged.length > 1) {
       return json({
@@ -691,6 +715,7 @@ export const tokenResolve: RegisteredTool = buildTool({
 
 export const erc20Balance: RegisteredTool = buildTool({
   name: "Erc20Balance",
+  operativeArgs: [{ field: "token", kind: "id", within: "chainId" }],
   description:
     "Read ERC-20 balances, and optionally an allowance, for one or many accounts at one block — with the token's decimals taken from the CONTRACT, never from a list and never defaulted. Use it instead of a raw eth_call: every amount comes back both as exact base units and as a decimal string, so a uint256 never becomes a JS number and eighteen digits of precision never quietly become fifteen. A token whose decimals() reverts is reported as unknown and its balances stay in base units rather than being scaled by an assumed 18, which is how a six-decimal transfer becomes a trillion-fold one. Tokens that answer symbol() with a bytes32 instead of a string — MKR and other 2017-era contracts — are decoded rather than crashed on, and an address with no code at it is refused instead of reporting everyone's balance as zero. Pass \"native\" as the token to read the chain's own currency in the same snapshot. It takes a contract ADDRESS, not a symbol: use TokenResolve first.",
   inputSchema: z
@@ -722,10 +747,13 @@ export const erc20Balance: RegisteredTool = buildTool({
   concurrencySafe: true,
   scope: "external",
   ioCapability: "network",
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const blockTag = input.blockTag ?? "latest";
     const batch = input.batch ?? true;
-    const multicall = input.multicall3Address ?? MULTICALL3_ADDRESS;
+    const aggregator = batch
+      ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+      : null;
+    const multicall = aggregator?.address ?? MULTICALL3_ADDRESS;
     const isNative = input.token.trim().toLowerCase() === "native";
 
     if (!isNative && !ADDRESS_SHAPE.test(input.token.trim())) {
@@ -804,6 +832,7 @@ export const erc20Balance: RegisteredTool = buildTool({
         blockTag,
         blockNumber,
         batched: batch,
+        aggregator,
         token: { kind: "native", address: null, decimals },
         balances,
         warnings,
@@ -891,6 +920,7 @@ export const erc20Balance: RegisteredTool = buildTool({
       blockTag,
       blockNumber: read.blockNumber,
       batched: read.batched,
+      aggregator,
       token: {
         kind: "erc20",
         address: token,
@@ -921,6 +951,10 @@ const INTERFACE_KEYS = {
 
 export const erc721TokenInfo: RegisteredTool = buildTool({
   name: "Erc721TokenInfo",
+  operativeArgs: [
+    { field: "contract", kind: "id", within: "chainId" },
+    { field: "ipfsGateway", kind: "url" },
+  ],
   description:
     "Read one NFT: which standard the contract actually implements, the collection's name and symbol, who owns the token (or an ERC-1155 holder's balance of it), and its tokenURI. Use it to check what an NFT is before buying, listing or transferring it. Metadata is read ONLY when it costs no trust: a data: URI is decoded in-process, an ipfs: URI is fetched through a gateway YOU named, and an https: URI only from a host YOU allow-listed — a URL that came out of contract data is not a reason to dial it, and following one is a server-side request forgery with extra steps. The answer lists every URI it read and every one it skipped, with the reason. ERC-1155's {id} placeholder is substituted with the 64-hex-digit zero-padded form the spec requires and almost everyone gets wrong, ERC-1155 has no ownerOf so ownership is answered as a balance or not at all rather than as a misleading null, and a contract that claims to support the invalid interface id is reported as one whose supportsInterface answers mean nothing.",
   inputSchema: z
@@ -996,6 +1030,10 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       );
     }
 
+    const aggregator =
+      (input.batch ?? true)
+        ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+        : null;
     const code =
       (input.checkCode ?? true) ? await readHasCode(input.chainId, contract, blockTag) : null;
     if (code !== null && !code.hasCode) {
@@ -1035,10 +1073,8 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       chainId: input.chainId,
       calls,
       blockTag,
-      batch: input.batch ?? true,
-      ...(input.multicall3Address !== undefined
-        ? { multicall3Address: input.multicall3Address }
-        : {}),
+      batch: aggregator !== null,
+      ...(aggregator !== null ? { multicall3Address: aggregator.address } : {}),
     });
 
     const says = (key: string): boolean | null => {
@@ -1227,6 +1263,7 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       blockTag,
       blockNumber: read.blockNumber,
       batched: read.batched,
+      aggregator,
       standard,
       standardSource,
       interfaces,

@@ -10,6 +10,7 @@ import { join } from "node:path";
 import type { TraceEvent, TraceEventEnvelope } from "@crewhaus/trace-event-bus";
 import {
   HEADROOM_FACTOR,
+  MAX_METRICS_HISTORY_BYTES,
   MAX_METRICS_HISTORY_LINES,
   METRICS_FILENAME,
   MIN_BASELINE_SESSIONS,
@@ -375,6 +376,24 @@ describe("snapshot persistence", () => {
       expect(history).toHaveLength(MAX_METRICS_HISTORY_LINES);
       expect(history[0]?.sessionId).toBe(`s${total - MAX_METRICS_HISTORY_LINES}`);
       expect(history[history.length - 1]?.sessionId).toBe(`s${total - 1}`);
+    });
+
+    test("0.7.1: only the file's tail is read, and a line cut by the byte cap is dropped", () => {
+      const dir = join(tmpRoot, "metrics");
+      const { mkdirSync: mk, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      mk(dir, { recursive: true });
+      // One line longer than the cap, then three real snapshots.
+      const huge = JSON.stringify(
+        snap({ sessionId: `pad-${"x".repeat(MAX_METRICS_HISTORY_BYTES)}` }),
+      );
+      const tail = ["t1", "t2", "t3"].map((id) => JSON.stringify(snap({ sessionId: id })));
+      writeFileSync(join(dir, METRICS_FILENAME), `${huge}\n${tail.join("\n")}\n`);
+      expect(readMetricsHistory(dir).map((s) => s.sessionId)).toEqual(["t1", "t2", "t3"]);
+      // The next append trims the file back under the cap.
+      appendMetricsSnapshot(snap({ sessionId: "t4" }), dir);
+      const { statSync } = require("node:fs") as typeof import("node:fs");
+      expect(statSync(join(dir, METRICS_FILENAME)).size).toBeLessThan(MAX_METRICS_HISTORY_BYTES);
+      expect(readMetricsHistory(dir).map((s) => s.sessionId)).toEqual(["t1", "t2", "t3", "t4"]);
     });
   });
 });

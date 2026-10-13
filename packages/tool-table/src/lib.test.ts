@@ -254,13 +254,20 @@ describe("record linkage", () => {
     // Edit distance is quadratic in the length, so the real cost is
     // comparisons TIMES length squared — and a cap on comparisons alone
     // bounds the wrong quantity. Thirty against thirty, with 3,000-character
-    // values, is only 900 comparisons and took forty-five seconds.
-    const long = (i: number) => ({ v: `${"x".repeat(3_000)}${i}` });
-    const left = Array.from({ length: 30 }, (_, i) => long(i));
-    const right = Array.from({ length: 30 }, (_, i) => long(i));
-    const started = performance.now();
-    linkRecords(left, right, [{ field: "v", compare: "fuzzy", weight: 1 }]);
-    expect(performance.now() - started).toBeLessThan(2_000);
+    // values, is only 900 comparisons and took forty-five seconds. So each
+    // value is cut to its first 256 characters before it is compared, and
+    // what is checked is how much of each value a comparison read, which its
+    // similarity shows. No clock decides it: compared whole, these two pairs
+    // score 0.9997 and 0.9993, and the test fails at once.
+    const fuzzy = [{ field: "v", compare: "fuzzy" as const, weight: 1 }];
+    const similarityOf = (a: string, b: string) =>
+      linkRecords([{ v: a }], [{ v: b }], fuzzy).matched[0]?.evidence[0]?.similarity;
+    const middle = "x".repeat(3_000);
+    // A difference past the first 256 characters is never read...
+    expect(similarityOf(`${middle}a`, `${middle}b`)).toBe(1);
+    // ...and one inside them is weighed over those 256 characters alone: one
+    // edit in 256, not two in 3,002.
+    expect(similarityOf(`a${middle}a`, `b${middle}b`)).toBe(Number((1 - 1 / 256).toFixed(4)));
   });
 
   test("rules that sum to no weight are refused", () => {
@@ -597,6 +604,32 @@ describe("chi-square test of homogeneity", () => {
     const result = chiSquareHomogeneity({ a: 10, b: 20 }, { a: 10, b: 20 });
     expect(result.chiSquare).toBe(0);
     expect(result.p).toBe(1);
+  });
+
+  test("a new category named like an Object.prototype member stays in the table", () => {
+    // The reference is what JSON.parse gives back for a stored profile: a
+    // plain object. On 0.7.0 each of these read the inherited member, the
+    // category dropped out, and the test said categories 2, df 1, p = 1.
+    let checked = 0;
+    for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      const reference = JSON.parse('{"engineer":50,"architect":50}') as Record<string, number>;
+      const current: Record<string, number> = Object.create(null);
+      current["engineer"] = 10;
+      current["architect"] = 10;
+      current[name] = 80;
+      const r = chiSquareHomogeneity(reference, current);
+      expect({ name, categories: r.categories, df: r.df, significant: (r.p ?? 1) < 1e-20 }).toEqual(
+        { name, categories: 3, df: 2, significant: true },
+      );
+      // And when the prototype-named value is the one that disappeared.
+      const dropped = chiSquareHomogeneity(
+        JSON.parse(`{"engineer":10,"architect":10,${JSON.stringify(name)}:80}`),
+        JSON.parse('{"engineer":50,"architect":50}'),
+      );
+      expect({ name, categories: dropped.categories }).toEqual({ name, categories: 3 });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
   });
 
   test("a category on one side only stays in the table", () => {

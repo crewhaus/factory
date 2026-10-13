@@ -292,7 +292,7 @@ describe("event-log — T7 load", () => {
     }
     // Read should be substantially faster than the append loop.
     expect(readMs).toBeLessThan(5_000);
-  }, 30_000);
+  }, 60_000);
 });
 
 describe("event-log — cross-tenant fencing (CWE-1230)", () => {

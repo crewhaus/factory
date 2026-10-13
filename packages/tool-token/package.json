@@ -13,9 +13,11 @@
   },
   "dependencies": {
     "@crewhaus/chain-adapter-base": "workspace:*",
+    "@crewhaus/chain-adapter-evm": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-http": "workspace:*",
     "@crewhaus/tool-onchain": "workspace:*",
     "@crewhaus/tool-text": "workspace:*",
     "zod": "^3.23.8"

@@ -46,6 +46,8 @@ export type {
 } from "./resolve.js";
 export type {
   McpServerConfig,
+  McpToolFlagsConfig,
+  McpToolTrustFlags,
   StdioServerConfig,
   SseServerConfig,
   McpClientState,

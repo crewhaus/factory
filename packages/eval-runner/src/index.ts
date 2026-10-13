@@ -1816,10 +1816,10 @@ async function defaultInvoker(
   cassette: ToolCassette = { missPolicy: "error" },
   routing?: EvalRoutingWiring,
 ): Promise<AgentInvoker> {
-  const wired: SharedAgentDeps = await wireRunOnce(
-    ir,
-    opts.cwd !== undefined ? { cwd: opts.cwd } : {},
-  );
+  const wired: SharedAgentDeps = await wireRunOnce(ir, {
+    ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+    ...(opts.importToolPackage !== undefined ? { importToolPackage: opts.importToolPackage } : {}),
+  });
   // The session runner: `runChatLoop` in production, an injected stub under
   // `RunEvalOptions.chatLoop` (tests pin the options — including the wrapped
   // tools below — without a process-global module mock).
@@ -1937,6 +1937,11 @@ async function defaultInvoker(
         ...(continuityOpt !== undefined ? { continuity: continuityOpt } : {}),
         permissionRules: wired.permissionRules,
         permissionMode: "auto",
+        // A wired code-execution tool passes the sandbox floor exactly when
+        // `crewhaus run` and the compiled bundle would let it (CREWHAUS_SANDBOX).
+        ...(wired.sandboxAvailable !== undefined
+          ? { sandboxAvailable: wired.sandboxAvailable }
+          : {}),
         // G54 — the spec's `failure_taxonomy` reaches the IN-LOOP recovery
         // engine (recovery-engine's matcher runs before its built-in
         // classify+recover flow), exactly as `crewhaus run` wires it: a

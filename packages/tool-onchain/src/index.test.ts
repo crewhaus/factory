@@ -102,6 +102,13 @@ describe("AbiEncodeCall", () => {
     expect(result.data).toStartWith("0xa9059cbb");
   });
 
+  test("an address whose EIP-55 checksum fails is an error, not calldata (C132)", async () => {
+    const typo = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD";
+    await expect(
+      raw(abiEncodeCall, { signature: "transfer(address,uint256)", args: [typo, "1"] }),
+    ).rejects.toThrow(/checksum does not match/);
+  });
+
   test("a value that does not fit is an error, not truncated calldata", async () => {
     await expect(raw(abiEncodeCall, { signature: "f(uint8)", args: ["256"] })).rejects.toThrow(
       /uint8/,
@@ -121,6 +128,29 @@ describe("AbiDecode", () => {
 
   test("truncated data is an error", async () => {
     await expect(raw(abiDecode, { data: "0x00", types: ["uint256"] })).rejects.toThrow(/truncated/);
+  });
+
+  test("a word its type cannot hold is an error, not a plausible value (C209)", async () => {
+    // 0.7.0 answered "256" for a uint8 and the low 20 bytes of a balance for
+    // an address.
+    await expect(
+      raw(abiDecode, { data: `0x${"0".repeat(61)}100`, types: ["uint8"] }),
+    ).rejects.toThrow(/^value\[0\]: a uint8 word holds 256/);
+    await expect(
+      raw(abiDecode, { data: `0x${"ff".repeat(12)}${"11".repeat(20)}`, types: ["address"] }),
+    ).rejects.toThrow(/^value\[0\]: an address word has non-zero upper bytes/);
+  });
+
+  test("offsets that share one tail are refused rather than decoded a million times (C085)", async () => {
+    // uint256[][][][][] where each of five levels' 16 heads share one child:
+    // 1,048,576 values from about 5 KB of hex on 0.7.0.
+    const word = (n: number): string => n.toString(16).padStart(64, "0");
+    let hex = word(32);
+    for (let level = 1; level < 5; level++) hex += word(16) + word(16 * 32).repeat(16);
+    hex += word(16) + word(1).repeat(16);
+    await expect(
+      raw(abiDecode, { data: `0x${hex}`, types: ["uint256[][][][][]"] }),
+    ).rejects.toThrow(/decodes to more than 4 times its own size/);
   });
 });
 
@@ -173,6 +203,37 @@ describe("AddressCheck", () => {
 });
 
 describe("TypedDataHash", () => {
+  test("a field the message lacks is refused, even one every object inherits (C210)", async () => {
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      await expect(
+        raw(typedDataHash, {
+          domain: { name: "X", version: "1", chainId: 1 },
+          types: { M: [{ name, type: "string" }] },
+          primaryType: "M",
+          message: {},
+        }),
+      ).rejects.toThrow(`requires the field "${name}"`);
+    }
+    const out = await call<{ digest: string }>(typedDataHash, {
+      domain: { name: "X", version: "1", chainId: 1 },
+      types: { M: [{ name: "toString", type: "string" }] },
+      primaryType: "M",
+      message: { toString: "hi" },
+    });
+    expect(out.digest).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  test("an odd-length bytes value is an error, not a digest of a shorter value (C133)", async () => {
+    await expect(
+      raw(typedDataHash, {
+        domain: { name: "T", chainId: 1 },
+        types: { Blob: [{ name: "data", type: "bytes" }] },
+        primaryType: "Blob",
+        message: { data: "0xabc" },
+      }),
+    ).rejects.toThrow(/odd number of hex digits/);
+  });
+
   test("computes the specification's digest and says it did not sign it", async () => {
     const result = await call<{ digest: string; note: string; scheme: string }>(typedDataHash, {
       domain: {

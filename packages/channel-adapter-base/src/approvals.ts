@@ -44,6 +44,29 @@ export type NewPendingApproval = {
   readonly context?: unknown;
 };
 
+/**
+ * 0.7.1 — one path a parked call names, and the absolute place(s) it lands:
+ * the entry itself and, when that is a symlink, its target. What a grant
+ * covers: the call is asked again if it lands anywhere else by the time it
+ * resumes. Mirrors `@crewhaus/session-store`'s `ApprovalPlace`.
+ */
+export type ApprovalPlace = {
+  readonly path: string;
+  readonly at: ReadonlyArray<string>;
+};
+
+/**
+ * 0.7.1 — the approval a park was asked in place of: the same call, granted
+ * or still waiting, when a symlink on its path led somewhere else. Mirrors
+ * `@crewhaus/session-store`'s `SupersededApproval`.
+ */
+export type SupersededApproval = {
+  readonly id: string;
+  readonly decision?: ApprovalDecision;
+  /** Absent for an approval made before approvals recorded where a call lands. */
+  readonly places?: ReadonlyArray<ApprovalPlace>;
+};
+
 /** A parked approval as stored: the {@link NewPendingApproval} plus identity,
  *  status, and decision provenance. */
 export type PendingApproval = {
@@ -67,6 +90,10 @@ export type PendingApproval = {
    * the tool, so future calls skip the approval flow entirely.
    */
   readonly always?: boolean;
+  /** 0.7.1 — where the call lands (runtime-parked approvals only). */
+  readonly places?: ReadonlyArray<ApprovalPlace>;
+  /** 0.7.1 — set when this asks again for a call approved where it landed before. */
+  readonly supersedes?: SupersededApproval;
 };
 
 /** Filter for {@link ApprovalStore.list}. */
@@ -300,6 +327,41 @@ export function approvalFallbackText(approvalId: string): string {
   return `approval pending — run \`crewhaus approvals grant ${approvalId}\` (or \`deny\`) to decide; add \`--always\` to allow the tool from now on`;
 }
 
+/** `<path> -> <place> and <place>` for each path, `; `-separated. */
+function describeApprovalPlaces(places: ReadonlyArray<ApprovalPlace>): string {
+  return places.map((p) => `${p.path} -> ${p.at.join(" and ")}`).join("; ");
+}
+
+/**
+ * 0.7.1 — where a parked call lands, and, when it is asked again because a
+ * symlink on its path has moved, where the approval it stands in for was
+ * made: what tells an operator this card from one they already decided.
+ * `undefined` when the approval records neither (one parked through the
+ * channel store, or before approvals were bound to a place).
+ */
+export function approvalPlacesText(
+  approval: Pick<PendingApproval, "places" | "supersedes">,
+): string | undefined {
+  const lines: string[] = [];
+  // The line that tells this card from the one already decided goes first,
+  // so a surface that cuts a long text keeps it.
+  const before = approval.supersedes;
+  if (before !== undefined) {
+    const was = before.decision === "grant" ? "granted" : "requested";
+    const where =
+      before.places !== undefined && before.places.length > 0
+        ? describeApprovalPlaces(before.places)
+        : "the input as written";
+    lines.push(
+      `asked again: approval ${before.id} was ${was} for ${where}, and a symlink on the path now leads elsewhere`,
+    );
+  }
+  if (approval.places !== undefined && approval.places.length > 0) {
+    lines.push(`lands at: ${describeApprovalPlaces(approval.places)}`);
+  }
+  return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
 /**
  * Surface a parked approval to the human. When `postInteractive` is provided
  * (the adapter supports Approve/Deny buttons — Slack), it renders the
@@ -315,22 +377,30 @@ export async function postApprovalPrompt(args: {
     readonly toolName: string;
     readonly inputPreview: string;
     readonly surface: string;
+    /** 0.7.1 — {@link approvalPlacesText}: where the call lands, and why it is asked again. */
+    readonly landsAt?: string;
   }) => Promise<{ messageTs?: string }>;
 }): Promise<{ interactive: boolean; messageTs?: string }> {
   const p = args.pending;
+  const landsAt = approvalPlacesText(p);
   if (args.postInteractive !== undefined) {
     const res = await args.postInteractive({
       approvalId: p.id,
       toolName: p.toolName,
       inputPreview: p.inputPreview,
       surface: p.surface,
+      ...(landsAt !== undefined ? { landsAt } : {}),
     });
     return {
       interactive: true,
       ...(res.messageTs !== undefined ? { messageTs: res.messageTs } : {}),
     };
   }
-  await args.sendText(approvalFallbackText(p.id));
+  await args.sendText(
+    landsAt === undefined
+      ? approvalFallbackText(p.id)
+      : `${approvalFallbackText(p.id)}\n${landsAt}`,
+  );
   return { interactive: false };
 }
 
@@ -456,6 +526,10 @@ export type RuntimeApprovalRecord = {
   readonly consumedAt?: string;
   /** #383 — the grant is a standing allow (unconsumed; a rule covers the tool). */
   readonly always?: boolean;
+  /** 0.7.1 — where the call lands; read defensively, it comes from a file. */
+  readonly places?: ReadonlyArray<ApprovalPlace>;
+  /** 0.7.1 — the approval this one asks again in place of. */
+  readonly supersedes?: SupersededApproval;
 };
 
 export type RuntimeApprovalStoreLike = {
@@ -478,7 +552,35 @@ export type RuntimeBackedApprovalStoreOptions = {
   readonly now?: () => Date;
 };
 
+/** Well-formed places only: the runtime's record is a line in a file. */
+function placesOf(value: unknown): ReadonlyArray<ApprovalPlace> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const places: ApprovalPlace[] = [];
+  for (const p of value as unknown[]) {
+    if (typeof p !== "object" || p === null) return undefined;
+    const { path, at } = p as { path?: unknown; at?: unknown };
+    if (typeof path !== "string" || !Array.isArray(at)) return undefined;
+    if (!at.every((one): one is string => typeof one === "string")) return undefined;
+    places.push({ path, at });
+  }
+  return places;
+}
+
+function supersededOf(value: unknown): SupersededApproval | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { id, decision, places } = value as { id?: unknown; decision?: unknown; places?: unknown };
+  if (typeof id !== "string") return undefined;
+  const at = placesOf(places);
+  return {
+    id,
+    ...(decision === "grant" || decision === "deny" ? { decision } : {}),
+    ...(at !== undefined ? { places: at } : {}),
+  };
+}
+
 function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
+  const places = placesOf(r.places);
+  const supersedes = supersededOf(r.supersedes);
   return {
     id: r.id,
     toolName: r.toolName,
@@ -493,6 +595,8 @@ function toChannelApproval(r: RuntimeApprovalRecord): PendingApproval {
     ...(r.decidedAt !== undefined ? { decidedAt: r.decidedAt } : {}),
     ...(r.decidedBy !== undefined ? { decidedBy: r.decidedBy } : {}),
     ...(r.always === true ? { always: true } : {}),
+    ...(places !== undefined ? { places } : {}),
+    ...(supersedes !== undefined ? { supersedes } : {}),
   };
 }
 

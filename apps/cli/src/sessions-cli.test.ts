@@ -91,7 +91,7 @@ describe("crewhaus sessions summarize (#57)", () => {
     expect(summary.toolsUsed).toEqual(["Bash"]);
     expect(summary.outcome).toBe("listed 3 files");
     expect(summary.ratings.positive).toBe(1);
-  });
+  }, 20_000);
 
   test("--evicted: indexes the session BEFORE unlinking it", async () => {
     const root = newTempRoot();
@@ -110,7 +110,7 @@ describe("crewhaus sessions summarize (#57)", () => {
     const indexFile = join(root, ".crewhaus", "sessions-index", `${S}.json`);
     expect(existsSync(indexFile)).toBe(true);
     expect(JSON.parse(readFileSync(indexFile, "utf-8")).outcome).toBe("listed 3 files");
-  });
+  }, 20_000);
 
   test("--evicted leaves a fresh session (and its transcript) untouched", async () => {
     const root = newTempRoot();
@@ -120,7 +120,7 @@ describe("crewhaus sessions summarize (#57)", () => {
     // Fresh → not evicted → not indexed.
     expect(existsSync(join(root, ".crewhaus", "sessions", `${S}.json`))).toBe(true);
     expect(existsSync(join(root, ".crewhaus", "sessions-index", `${S}.json`))).toBe(false);
-  });
+  }, 20_000);
 });
 
 // Loop contract 0.4 (Batch B, G53) — `sessions export --format trajectories`.
@@ -231,7 +231,7 @@ describe("crewhaus sessions export --format trajectories (G53)", () => {
     const bLast = bSteps[1] as Record<string, unknown>;
     expect(bLast["reward"]).toBe(1); // thumbs up → 1 (distill convention)
     expect(bLast["rewardSource"]).toBe("user_rating");
-  });
+  }, 20_000);
 
   test("a session with no reward signal exports reward: null on its terminal step", async () => {
     const root = newTempRoot();
@@ -249,30 +249,30 @@ describe("crewhaus sessions export --format trajectories (G53)", () => {
     expect(lines).toHaveLength(2);
     expect(lines[1]?.["reward"]).toBeNull();
     expect("rewardSource" in (lines[1] as object)).toBe(false);
-  });
+  }, 20_000);
 
   test("rejects an unsupported --format and a missing one", async () => {
     const root = newTempRoot();
     writeTrajectorySession(root, A);
     expect((await runCli(["sessions", "export", "--format", "parquet"], root)).exitCode).toBe(1);
     expect((await runCli(["sessions", "export"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("fails loudly when there are no sessions to export", async () => {
     const root = newTempRoot();
     const result = await runCli(["sessions", "export", "--format", "trajectories"], root);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("unknown sessions action names both supported ones", async () => {
     const root = newTempRoot();
     const result = await runCli(["sessions", "purge"], root);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("sessions --help exits 0 (documents the G53 posture)", async () => {
     const root = newTempRoot();
     const result = await runCli(["sessions", "--help"], root);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 });

@@ -91,6 +91,15 @@ const baseCrew: IrCrewV0 = {
   compaction: {},
 };
 
+describe("emitClaudePlugin — README tools (shape-reach#10)", () => {
+  test("a spec's builtin tools are listed as not carried, never as built-in", () => {
+    const b = emitClaudePlugin({ ...baseCli, tools: ["jsonQuery"] }, { author: { name: "x" } });
+    const readme = b.files.find((f) => f.path === "README.md")?.content ?? "";
+    expect(readme).toContain("| `jsonQuery` | agent | not wired |");
+    expect(readme).not.toContain("| `jsonQuery` | agent | built-in |");
+  });
+});
+
 describe("emitClaudePlugin — universal files", () => {
   test("always emits plugin.json and README.md", () => {
     const b = emitClaudePlugin(baseCli, { author: { name: "Test" } });

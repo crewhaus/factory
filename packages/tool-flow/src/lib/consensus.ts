@@ -72,11 +72,16 @@ export function normalizeValue(value: unknown, options: NormalizeOptions = {}): 
 
 /** Jaccard similarity of two arrays treated as sets of stringified members. */
 export function jaccard(a: ReadonlyArray<unknown>, b: ReadonlyArray<unknown>): number {
-  const left = new Set(a.map(canonicalize));
-  const right = new Set(b.map(canonicalize));
+  return jaccardOfSets(new Set(a.map(canonicalize)), new Set(b.map(canonicalize)));
+}
+
+/** {@link jaccard} of two arrays already turned into sets of stringified members. */
+function jaccardOfSets(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
   if (left.size === 0 && right.size === 0) return 1;
+  // The shared count is the same whichever side is walked; walk the smaller.
+  const [small, large] = left.size <= right.size ? [left, right] : [right, left];
   let shared = 0;
-  for (const item of left) if (right.has(item)) shared += 1;
+  for (const item of small) if (large.has(item)) shared += 1;
   return shared / (left.size + right.size - shared);
 }
 
@@ -101,9 +106,79 @@ export function tallyVotes(
 ): ConsensusResult {
   if (votes.length === 0) throw new Error("no votes were given");
 
-  type Group = { value: unknown; weight: number; voters: string[]; order: number };
+  type Group = {
+    value: unknown;
+    weight: number;
+    voters: string[];
+    order: number;
+    /** `exact`, and `set` at overlap 1: the value's canonical form, once needed. */
+    key?: string;
+    /** `set`: the value's members as canonical strings, once needed. */
+    members?: ReadonlySet<string>;
+  };
   const groups: Group[] = [];
   let total = 0;
+  const mode = options.mode ?? "exact";
+  const overlap = options.overlap ?? 1;
+  // Groups by canonical form, where "the same answer" is equality of that
+  // form: `exact`, and `set` at overlap 1, where a Jaccard of 1 means equal
+  // sets. Each vote then finds its group by one lookup, where comparing it
+  // with every group canonicalized both sides each time: 512 votes of a
+  // kilobyte made 270 million characters of JSON.
+  const byKey = new Map<string, Group>();
+  /** `set`: the first group whose value is an array, the only kind a set vote can join. */
+  const arrays: { first?: Group } = {};
+  const membersOf = (value: ReadonlyArray<unknown>): ReadonlySet<string> =>
+    new Set(value.map(canonicalize));
+  /** The canonical form of a set vote at overlap 1: its distinct members, sorted. */
+  const setKey = (members: ReadonlySet<string>): string => JSON.stringify([...members].sort());
+  /**
+   * The first group `value` counts as the same answer as, or undefined —
+   * what `groups.find((g) => same(g.value, value, options))` returns, with
+   * each value's canonical form or members worked out once, at the point the
+   * pairwise comparison first needed them, so anything that cannot be
+   * canonicalized throws exactly where it did.
+   */
+  const firstSame = (value: unknown, created: Partial<Group>): Group | undefined => {
+    if (mode === "exact") {
+      const first = groups[0];
+      if (first === undefined) return undefined;
+      if (first.key === undefined) {
+        first.key = canonicalize(first.value);
+        byKey.set(first.key, first);
+      }
+      created.key = canonicalize(value);
+      return byKey.get(created.key);
+    }
+    if (mode === "set") {
+      if (!Array.isArray(value)) return undefined;
+      let mine: ReadonlySet<string> | undefined;
+      if (overlap === 1) {
+        // Only array groups can match; the first of them may not have its
+        // members yet, every later one got them when it was created.
+        const first = arrays.first;
+        if (first === undefined) return undefined;
+        if (first.members === undefined) {
+          first.members = membersOf(first.value as ReadonlyArray<unknown>);
+          first.key = setKey(first.members);
+          byKey.set(first.key, first);
+        }
+        mine = membersOf(value);
+        created.members = mine;
+        created.key = setKey(mine);
+        return byKey.get(created.key);
+      }
+      for (const g of groups) {
+        if (!Array.isArray(g.value)) continue;
+        g.members ??= membersOf(g.value);
+        mine ??= membersOf(value);
+        created.members = mine;
+        if (jaccardOfSets(g.members, mine) >= overlap) return g;
+      }
+      return undefined;
+    }
+    return groups.find((g) => same(g.value, value, options));
+  };
 
   for (const [index, vote] of votes.entries()) {
     const weight = vote.weight ?? 1;
@@ -116,15 +191,21 @@ export function tallyVotes(
     total += weight;
     const voter = vote.voter ?? `#${index}`;
     // Grouping is by first-match against existing groups, which is what makes
-    // `numeric` and `set` work at all: they are not transitive, so there is no
-    // canonical key to bucket by. Declared order therefore decides which
-    // group a borderline value joins, and that is why it is documented.
-    const existing = groups.find((g) => same(g.value, value, options));
+    // `numeric` and `set` below full overlap work at all: they are not
+    // transitive, so there is no canonical key to bucket by. Declared order
+    // therefore decides which group a borderline value joins, and that is why
+    // it is documented. (`exact` and full-overlap `set` are transitive, and
+    // `firstSame` buckets them.)
+    const created: Partial<Group> = {};
+    const existing = firstSame(value, created);
     if (existing) {
       existing.weight += weight;
       existing.voters.push(voter);
     } else {
-      groups.push({ value, weight, voters: [voter], order: index });
+      const group: Group = { ...created, value, weight, voters: [voter], order: index };
+      groups.push(group);
+      if (group.key !== undefined) byKey.set(group.key, group);
+      if (arrays.first === undefined && Array.isArray(value)) arrays.first = group;
     }
   }
 

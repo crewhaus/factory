@@ -8,6 +8,7 @@
     { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../mcp-host" },
+    { "path": "../prompt-injection-detector" },
     { "path": "../run-context" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" }

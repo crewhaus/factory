@@ -15,6 +15,36 @@ export function slugify(title: string): string {
 }
 
 /**
+ * One line read as an ATX heading (`## Title ##`), or null when it is not one.
+ *
+ * The opening `#` run must be followed by a space or a tab, as CommonMark
+ * says; a closing `#` run is dropped only when a space or tab precedes it
+ * (so `# C#` is titled `C#`, and `## Title ##` is titled `Title`). An empty
+ * title is not a heading.
+ *
+ * Written as one anchored, linear match plus a backward scan, because the
+ * obvious `/^(#{1,6})\s+(.+?)\s*#*\s*$/` is cubic: a heading with a few
+ * thousand spaces in it took seconds, and `\s+` let `#` on a line of its own
+ * swallow the paragraph under it as a heading. `@crewhaus/tool-verify` reads
+ * headings through this too, so the two cannot disagree about one.
+ */
+export function parseAtxHeading(line: string): { depth: number; title: string } | null {
+  // `[\s\S]`, not `.`: a CRLF file's line still ends in `\r`, which `.` does
+  // not match and `trimEnd` below removes.
+  const m = /^(#{1,6})[ \t]+([\s\S]*)$/.exec(line);
+  if (m === null) return null;
+  let title = (m[2] as string).trimEnd();
+  let k = title.length;
+  while (k > 0 && title.charCodeAt(k - 1) === 35 /* # */) k--;
+  if (k < title.length && (k === 0 || title[k - 1] === " " || title[k - 1] === "\t")) {
+    title = title.slice(0, k).trimEnd();
+  }
+  title = title.trim();
+  if (title === "") return null;
+  return { depth: (m[1] as string).length, title };
+}
+
+/**
  * Collect ATX headings, ignoring any inside a fenced code block — a
  * `# comment` in a shell sample is not a section, and treating it as one
  * corrupts every section boundary after it.
@@ -38,10 +68,9 @@ export function parseHeadings(markdown: string): Heading[] {
       continue;
     }
     if (inFence) continue;
-    const m = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
-    if (m === null) continue;
-    const title = (m[2] as string).trim();
-    out.push({ depth: (m[1] as string).length, title, line: i + 1, slug: slugify(title) });
+    const heading = parseAtxHeading(line);
+    if (heading === null) continue;
+    out.push({ ...heading, line: i + 1, slug: slugify(heading.title) });
   }
   return out;
 }

@@ -5,17 +5,21 @@
  * than the real builtin set (which `tool-registry.test.ts` covers).
  */
 import { describe, expect, test } from "bun:test";
+import { BUILTIN_TOOLS, categoriesForTool, unknownToolMessage } from "@crewhaus/tool-categories";
 import { z } from "zod";
 import {
   type ToolLike,
   buildCategoryRows,
   buildToolDetail,
+  exactToolKey,
   formatCategoryLines,
   formatSearchLines,
   formatToolDetailLines,
   inputFieldNames,
   nearestToolKeys,
+  resolveToolKey,
   searchTools,
+  shapesRunning,
 } from "./tools-cli";
 
 const FIXTURE_CATEGORIES = {
@@ -131,6 +135,58 @@ describe("buildToolDetail", () => {
   test("an unknown key returns undefined so the caller can suggest", () => {
     expect(buildToolDetail("nope", TOOL_MAP, catsFor)).toBeUndefined();
   });
+
+  test("an Object.prototype member is not a tool", () => {
+    // It returned { key: "constructor", name: "Object" } and advised
+    // `tools: [constructor]`.
+    expect(buildToolDetail("constructor", TOOL_MAP, catsFor)).toBeUndefined();
+    expect(buildToolDetail("toString", TOOL_MAP, catsFor)).toBeUndefined();
+  });
+});
+
+// docs-claims#12 — `tools show GitCommit` (the name a session log records)
+// and `tools show gitcommit` both said "no builtin tool named".
+describe("resolveToolKey", () => {
+  test("the spec key, the registered name, or either in any case", () => {
+    expect(resolveToolKey("writeIt", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("WriteIt", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("writeit", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("WRITEIT", TOOL_MAP)).toBe("writeIt");
+  });
+
+  test("no match, an ambiguous match and a prototype member resolve to nothing", () => {
+    expect(resolveToolKey("nope", TOOL_MAP)).toBeUndefined();
+    expect(resolveToolKey("constructor", TOOL_MAP)).toBeUndefined();
+    expect(resolveToolKey("__proto__", TOOL_MAP)).toBeUndefined();
+    const twins = { aB: { name: "X" }, ab: { name: "Y" } };
+    expect(resolveToolKey("AB", twins)).toBeUndefined();
+    // An exact spelling still picks its own.
+    expect(resolveToolKey("ab", twins)).toBe("ab");
+  });
+
+  test("lint's resolver takes the exact key or registered name only", () => {
+    // `crewhaus lint` resolves through exactToolKey, so a wrong-case key is
+    // still reported (compile rejects it) and --fix still offers the key.
+    expect(exactToolKey("writeIt", TOOL_MAP)).toBe("writeIt");
+    expect(exactToolKey("WriteIt", TOOL_MAP)).toBe("writeIt");
+    expect(exactToolKey("writeit", TOOL_MAP)).toBeUndefined();
+    expect(exactToolKey("constructor", TOOL_MAP)).toBeUndefined();
+  });
+
+  test("over the real table, every builtin answers to its key and name in any case", () => {
+    const entries = Object.entries(BUILTIN_TOOLS);
+    expect(entries.length).toBeGreaterThanOrEqual(550);
+    const wrong: string[] = [];
+    for (const [key, entry] of entries) {
+      for (const spelling of [key, entry.name, key.toLowerCase(), entry.name.toUpperCase()]) {
+        const got = resolveToolKey(spelling, BUILTIN_TOOLS);
+        if (got !== key) wrong.push(`${spelling} -> ${got}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(resolveToolKey("GitCommit", BUILTIN_TOOLS)).toBe("gitCommit");
+    expect(resolveToolKey("gitcommit", BUILTIN_TOOLS)).toBe("gitCommit");
+  });
 });
 
 describe("inputFieldNames", () => {
@@ -170,6 +226,65 @@ describe("formatToolDetailLines", () => {
 
   test("ends with a copy-pasteable enable line", () => {
     expect(text).toContain("tools: [fetchIt]");
+  });
+
+  test("a key the builtin table does not know says nothing about shapes", () => {
+    expect(text).not.toContain("runs on");
+  });
+
+  // docs-claims#14 — the real resolver put the roll-up first (`all-code,
+  // all-git`); the tool's own category now leads.
+  test("the tool's own category comes first, then the roll-ups", () => {
+    const detail = buildToolDetail(
+      "gitCommit",
+      { gitCommit: TOOL_MAP.writeIt as ToolLike },
+      categoriesForTool,
+    ) as NonNullable<ReturnType<typeof buildToolDetail>>;
+    expect(formatToolDetailLines(detail)).toContain("  categories  all-git, all-code");
+  });
+});
+
+// shape-reach#10 — `tools show` printed "enable with tools: [x]" for every
+// tool, as if every shape ran it. It now says which shapes do.
+describe("tools show names the shapes that run a tool", () => {
+  const show = (key: string): string =>
+    formatToolDetailLines(
+      buildToolDetail(key, { [key]: TOOL_MAP.readIt as ToolLike }, catsFor) as NonNullable<
+        ReturnType<typeof buildToolDetail>
+      >,
+    ).join("\n");
+
+  test("a host-only tool runs on every shape that runs tools, but not on the edge", () => {
+    for (const key of ["gitStatus", "python", "jsonQuery"]) {
+      expect(show(key)).toContain(
+        "runs on     every shape that runs tools, except the cf-worker edge",
+      );
+    }
+  });
+
+  test("an edge-safe tool says the edge runs it too", () => {
+    expect(show("fetch")).toContain(
+      "runs on     every shape that runs tools, the cf-worker edge included",
+    );
+  });
+
+  test("the shapes listed are the ones the compiler accepts it on", () => {
+    // A shape with no tool catalog (pipeline, voice, onchain) is never listed.
+    expect(shapesRunning("jsonQuery")).toEqual([
+      "cli",
+      "workflow",
+      "channel",
+      "graph",
+      "managed",
+      "crew",
+      "research",
+      "batch",
+      "browser",
+      "eval",
+    ]);
+    expect(shapesRunning("evmCall")).toEqual(["workflow", "graph", "crew"]);
+    expect(show("evmCall")).toContain("runs on     workflow, graph, crew only");
+    expect(shapesRunning("nope")).toEqual([]);
   });
 });
 
@@ -243,5 +358,45 @@ describe("nearestToolKeys", () => {
 
   test("respects the limit", () => {
     expect(nearestToolKeys("it", Object.keys(TOOL_MAP), 2).length).toBeLessThanOrEqual(2);
+  });
+
+  // docs-claims#12 — it kept table order and took the first three loose
+  // hits, so `gitcommit` was offered gitStatus, gitDiff, gitLog.
+  test("a same-letters match ranks first, then a prefix, then a substring", () => {
+    const git = ["gitStatus", "gitDiff", "gitLog", "gitCommit"];
+    expect(nearestToolKeys("gitcommit", git)[0]).toBe("gitCommit");
+    expect(nearestToolKeys("GitCommit", git)[0]).toBe("gitCommit");
+    expect(nearestToolKeys("gitc", git)).toEqual(["gitCommit", "gitDiff", "gitLog"]);
+    // A key holding the whole query outranks one the query merely holds.
+    expect(nearestToolKeys("readit", ["xreaditx", "readItNow", "rea"])).toEqual([
+      "readItNow",
+      "xreaditx",
+      "rea",
+    ]);
+  });
+
+  // A typo that is neither a prefix nor a substring fell through to "shares
+  // the first three letters", alphabetically: `gitcomit` was offered gitAdd,
+  // gitApplyPatch, gitBlame, while compile's hint for the same typo names
+  // gitCommit.
+  test("a spelling within two edits ranks above a shared first three letters, closest first", () => {
+    const git = ["gitAdd", "gitApplyPatch", "gitBlame", "gitCommit", "gitCommits"];
+    expect(nearestToolKeys("gitcomit", git)).toEqual(["gitCommit", "gitCommits", "gitAdd"]);
+    expect(nearestToolKeys("GitComit", git)[0]).toBe("gitCommit");
+    // A short key inside a misspelt name is the weaker guess.
+    expect(nearestToolKeys("readFle", ["read", "readFile"])).toEqual(["readFile", "read"]);
+    // Rewriting every letter of a short query is not a near miss.
+    expect(nearestToolKeys("ab", ["xy"])).toEqual([]);
+  });
+
+  test("on the real table, the first suggestion for a typo is the key compile names", () => {
+    const keys = Object.keys(BUILTIN_TOOLS);
+    const got = ["gitcomit", "webfetc", "reed", "gitStats"].map((typo) => ({
+      typo,
+      first: nearestToolKeys(typo, keys)[0],
+      compileNames: unknownToolMessage(typo).match(/Did you mean "([^"]+)"/)?.[1],
+    }));
+    expect(got.filter((g) => g.first === undefined || g.first !== g.compileNames)).toEqual([]);
+    expect(got.map((g) => g.first)).toEqual(["gitCommit", "webFetch", "read", "gitStatus"]);
   });
 });

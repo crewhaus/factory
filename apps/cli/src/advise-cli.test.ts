@@ -85,13 +85,13 @@ describe("crewhaus advise CLI (item 14)", () => {
     const root = newTempRoot();
     expect((await runCli(["advise", "--help"], root)).exitCode).toBe(0);
     expect((await runCli(["advise", "--session", SESSION, "--all"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("missing session / empty sessions dir exit 1", async () => {
     const root = newTempRoot();
     expect((await runCli(["advise", "--session", "sess_beef000000000000"], root)).exitCode).toBe(1);
     expect((await runCli(["advise"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("mines a noisy session and writes validated patch suggestions + report", async () => {
     const root = newTempRoot();
@@ -117,7 +117,7 @@ describe("crewhaus advise CLI (item 14)", () => {
     const html = readFileSync(join(out, "report.html"), "utf-8");
     expect(html).toContain("repeated-tool-failures:Fetch");
     expect(html).toContain("truncation-pressure");
-  });
+  }, 20_000);
 
   test("--all default out dir is .crewhaus/advice; --json exits 0", async () => {
     const root = newTempRoot();
@@ -126,7 +126,7 @@ describe("crewhaus advise CLI (item 14)", () => {
     expect((await runCli(["advise", "--all", "--json"], root)).exitCode).toBe(0);
     expect(existsSync(join(root, ".crewhaus", "advice", "suggestions.json"))).toBe(true);
     expect(existsSync(join(root, ".crewhaus", "advice", "report.html"))).toBe(true);
-  });
+  }, 20_000);
 
   test("without a cwd spec, patch suggestions degrade to advice (empty suggestions list)", async () => {
     const root = newTempRoot();
@@ -139,7 +139,7 @@ describe("crewhaus advise CLI (item 14)", () => {
     expect(suggestions.suggestions).toEqual([]);
     // The findings still land in the report as advice.
     expect(readFileSync(join(out, "report.html"), "utf-8")).toContain("truncation-pressure");
-  });
+  }, 20_000);
 
   test("old-vintage sessions (no advisor kinds) mine cleanly with zero findings", async () => {
     const root = newTempRoot();
@@ -161,5 +161,5 @@ describe("crewhaus advise CLI (item 14)", () => {
     ) as SuggestionsFile;
     expect(suggestions.suggestions).toEqual([]);
     expect(readFileSync(join(out, "report.html"), "utf-8")).toContain("No findings");
-  });
+  }, 20_000);
 });

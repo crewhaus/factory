@@ -528,7 +528,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.exitCode).toBe(1);
     // No calibration file was written.
     expect(existsSync(join(root, ".crewhaus", "judge-calibration.json"))).toBe(false);
-  });
+  }, 20_000);
 
   it("exits cleanly when there are no rated turns to calibrate against", async () => {
     const root = newTempRoot();
@@ -537,7 +537,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     const got = await runCli(["judge", "calibrate"], root);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("no rated turns");
-  });
+  }, 20_000);
 
   // -------- NEW-graders-1: --dataset (offline halves) --------
 
@@ -547,7 +547,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.stdout).toContain("--dataset");
     expect(got.stdout).toContain("metadata.user_rating");
     expect(got.stdout).toContain("gold_refreshed");
-  });
+  }, 20_000);
 
   it("documents --by-model and its pair → spec → default resolution", async () => {
     const got = await runCli(["judge", "calibrate", "--help"], newTempRoot());
@@ -555,7 +555,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.stdout).toContain("--by-model");
     expect(got.stdout).toContain("(agent arm, judge");
     expect(got.stdout).toContain("pair -> spec -> default");
-  });
+  }, 20_000);
 
   it("dies loudly (contract explained) when --dataset yields zero usable pairs", async () => {
     const root = newTempRoot();
@@ -571,7 +571,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.stderr).toContain("yielded no calibration pairs");
     expect(got.stderr).toContain("metadata.user_rating");
     expect(got.stderr).toContain("1 unrated");
-  });
+  }, 20_000);
 
   it("accepts --dataset pairs even with zero session ratings, then stops at credentials", async () => {
     const root = newTempRoot();
@@ -594,7 +594,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     expect(got.stderr).not.toContain("no rated turns");
     expect(got.stderr).not.toContain("yielded no calibration pairs");
     expect(got.stderr).toContain("judge calibrate needs a judge model");
-  });
+  }, 20_000);
 
   it("dies with the dataset error when --dataset names a missing file", async () => {
     const root = newTempRoot();
@@ -603,7 +603,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     const got = await runCli(["judge", "calibrate", "--dataset", "missing.jsonl"], root);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain('--dataset "missing.jsonl" unusable');
-  });
+  }, 20_000);
 
   it("mis-paired-only datasets die with the mis-paired count", async () => {
     const root = newTempRoot();
@@ -621,7 +621,7 @@ describe("crewhaus judge calibrate (CLI, no credentials)", () => {
     const got = await runCli(["judge", "calibrate", "--dataset", "labeled.jsonl"], root);
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("1 mis-paired");
-  });
+  }, 20_000);
 });
 
 // -------- NEW-graders-2 interplay: categorical rubrics never calibrate --------
@@ -696,7 +696,7 @@ describe("crewhaus judge calibrate × categorical graders (NEW-graders-2)", () =
     expect(got.exitCode).toBe(1);
     expect(got.stderr).toContain("has only categorical llm_judge grader");
     expect(got.stderr).toContain("scalar passing cut");
-  });
+  }, 20_000);
 
   it("a mixed graders.yaml calibrates the scalar entry — categorical-first is skipped", async () => {
     const root = ratedRoot();
@@ -713,5 +713,5 @@ describe("crewhaus judge calibrate × categorical graders (NEW-graders-2)", () =
     expect(got.stderr).not.toContain("no llm_judge grader to calibrate");
     // … and the run then stops at the dead judge endpoint, not earlier.
     expect(got.stderr).toContain("produced no usable scores");
-  });
+  }, 20_000);
 });

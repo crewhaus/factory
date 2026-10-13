@@ -20,6 +20,12 @@
  */
 import { statSync } from "node:fs";
 import * as path from "node:path";
+import { withoutCredentials } from "@crewhaus/tool-safety/env";
+import {
+  CHECKER_CACHE_PLACEHOLDER,
+  displayMypyCacheArg,
+  isCheckerCachePath,
+} from "./lib/checker-cache";
 import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** Default wall-clock budget for one toolchain invocation. */
@@ -67,7 +73,9 @@ export function resolveDir(toolName: string, rel: string | undefined): Resolved<
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${requested}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${requested}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;
@@ -90,7 +98,9 @@ export function resolveFile(toolName: string, rel: string): Resolved<string> {
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;
@@ -113,7 +123,9 @@ export function resolveDirOrFile(toolName: string, rel: string): Resolved<string
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     throw err;
@@ -158,6 +170,42 @@ export function checkOptionSafe(
     if (/[\0\n\r]/.test(value)) {
       return refuse(
         `${toolName} refused the ${what} "${echo(value.replace(/[\0\n\r]/g, "?"))}": a newline or NUL in an argument is never legitimate here.`,
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Refuse a caller path that is absolute or has a `..` segment, for a tool
+ * that hands its paths, as written, to a program it runs in `cwd`.
+ *
+ * That program resolves each path itself, from the directory it runs in, and
+ * the OS follows every symlink BEFORE it applies the `..` after it. The
+ * containment check here (and the permission gate) collapse `..` first, so
+ * `../x.ts` run in a symlinked `cwd` — an ordinary workspace link such as
+ * `node_modules/@acme/pkg` will do — or `lnk/../x.ts` named one file to them
+ * and another to the formatter. An absolute path ignores `cwd` for the
+ * program, while the check joined it to `cwd` and looked at a file inside
+ * the workspace. With both refused, a path names the same file to the
+ * check, the gate and the program: one below `cwd`. tool-git's
+ * `checkPathspecs` refuses the same shapes.
+ */
+export function checkBelowCwd(
+  toolName: string,
+  paths: readonly string[],
+  what = "path",
+): Refusal | undefined {
+  const instead = "Pass a path below `cwd`, or set `cwd` to the directory you mean.";
+  for (const value of paths) {
+    if (path.isAbsolute(value)) {
+      return refuse(
+        `${toolName} refused the ${what} "${echo(value)}": it is absolute, and paths here are read from \`cwd\`. ${instead}`,
+      );
+    }
+    if (value.split(/[\\/]/).includes("..")) {
+      return refuse(
+        `${toolName} refused the ${what} "${echo(value)}": it has a ".." segment, which the program resolves after following any link on the way, so it may land somewhere other than it reads. ${instead}`,
       );
     }
   }
@@ -226,6 +274,18 @@ export type SpawnOptions = {
   readonly maxOutputChars?: number;
   readonly maxStderrChars?: number;
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Hand the child this process's environment WITHOUT the variables that
+   * hold a credential (a credential-shaped name, or a value in a known token
+   * format). Set by the checkers — Typecheck, Lint, FormatCheck, Diagnostics
+   * — which auto mode runs without asking and which run the project's own
+   * code (an `eslint.config.js`, a `build.rs`). Everything a toolchain needs
+   * (PATH, CARGO_HOME, GOPATH, VIRTUAL_ENV, proxies, CA bundles) is kept.
+   * The destructive runners (RunTests, RunBuild, Format) keep the full
+   * environment: a person approved them, and a test suite may legitimately
+   * need a DATABASE_URL.
+   */
+  readonly withoutCredentials?: boolean;
 };
 
 /**
@@ -312,11 +372,10 @@ async function drain(
 /** Run one command, bounded by a deadline and the caller's abort signal. */
 export async function runProcess(argv: readonly string[], opts: SpawnOptions): Promise<RunResult> {
   const cap = opts.maxOutputChars ?? MAX_OUTPUT_CHARS;
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    ...PINNED_ENV,
-    ...opts.env,
-  };
+  const env: Record<string, string | undefined> =
+    opts.withoutCredentials === true
+      ? withoutCredentials(process.env, { ...PINNED_ENV, ...opts.env }).env
+      : { ...process.env, ...PINNED_ENV, ...opts.env };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -444,7 +503,15 @@ export function truncationNote(run: RunResult, cap = MAX_OUTPUT_CHARS): string |
  */
 export function displayCommand(argv: readonly string[], root: string): string {
   const prefix = `${path.resolve(root)}${path.sep}`;
-  return argv.map((arg) => (arg.startsWith(prefix) ? relPosix(root, arg) : arg)).join(" ");
+  return argv
+    .map((arg) =>
+      // The checker's temp cache file names this machine's temp directory
+      // and a hash of this checkout's path: shown as a placeholder instead.
+      isCheckerCachePath(arg)
+        ? CHECKER_CACHE_PLACEHOLDER
+        : (displayMypyCacheArg(arg) ?? (arg.startsWith(prefix) ? relPosix(root, arg) : arg)),
+    )
+    .join(" ");
 }
 
 /** Slash-separated path relative to `root`, stable across operating systems. */

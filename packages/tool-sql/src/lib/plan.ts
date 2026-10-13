@@ -87,7 +87,49 @@ export function usedIndex(detail: string): string | undefined {
   const matched = detail.match(/USING\s+(?:COVERING\s+)?INDEX\s+("[^"]+"|`[^`]+`|\[[^\]]+\]|\S+)/i);
   const raw = matched?.[1];
   if (raw === undefined) return undefined;
-  return unquote(raw.replace(/\s*\(.*$/, ""));
+  return unquote(beforeParenthesis(raw));
+}
+
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/**
+ * `text` cut before ` (…)` running to its end: what
+ * `text.replace(/\s*\(.*$/, "")` returned, found in two scans. That pattern
+ * tries every start inside a run of whitespace and, where no `(` follows the
+ * run, rescans the rest of it from each before giving the start up, so a
+ * long run inside an index's name was quadratic in its length; the name is
+ * whatever the database holds.
+ */
+export function beforeParenthesis(text: string): string {
+  // `.*$` cannot cross a line break, so the `(` comes after the last one.
+  let lastBreak = -1;
+  for (let i = text.length - 1; i >= 0; i--) {
+    const c = text.charCodeAt(i);
+    if (c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029) {
+      lastBreak = i;
+      break;
+    }
+  }
+  const open = text.indexOf("(", lastBreak + 1);
+  if (open === -1) return text;
+  let start = open;
+  while (start > 0 && isRegExpSpace(text.charCodeAt(start - 1))) start--;
+  return text.slice(0, start);
 }
 
 function unquote(raw: string): string {

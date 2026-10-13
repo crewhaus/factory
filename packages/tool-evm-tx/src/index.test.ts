@@ -58,6 +58,45 @@ describe("EvmSendTransaction & EvmSimulate — tool flags", () => {
     expect(EVM_TX_TOOL_MAP.evmSimulate.readOnly).toBe(true);
     expect(EVM_TX_TOOL_MAP.evmSimulate.destructive).toBe(false);
   });
+  test("EvmSimulate declares the RPC boundary it crosses (C044)", () => {
+    // eth_call and eth_estimateGas carry the model's calldata to the node:
+    // undeclared, the egress classifier never saw it.
+    const t = EVM_TX_TOOL_MAP.evmSimulate;
+    expect({ readOnly: t.readOnly, scope: t.scope, io: t.ioCapability }).toEqual({
+      readOnly: true,
+      scope: "external",
+      io: "network",
+    });
+    expect(t.requireJustification).toBe(false);
+  });
+  test("every tool in the package declares where it sends", () => {
+    const tools = Object.values(EVM_TX_TOOL_MAP);
+    expect(tools).toHaveLength(2);
+    for (const t of tools)
+      expect([t.name, t.scope, t.ioCapability]).toEqual([t.name, "external", "network"]);
+  });
+});
+
+describe("the address a transaction goes to", () => {
+  test("is 0x and 40 hex digits, so a 0X spelling cannot dodge a rule written 0x…", () => {
+    // geth decodes `0X…` to the same address, and a deny or allow written
+    // `0x…` did not read it as that address.
+    const usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+    const base = { walletId: "treasury", data: "0x" };
+    for (const tool of [EVM_TX_TOOL_MAP.evmSendTransaction, EVM_TX_TOOL_MAP.evmSimulate]) {
+      for (const to of [`0X${usdc.slice(2)}`, "usdc.eth", "0xabc", `${usdc}00`]) {
+        const parsed = tool.inputSchema.safeParse({ ...base, to });
+        expect({ tool: tool.name, to, ok: parsed.success }).toEqual({
+          tool: tool.name,
+          to,
+          ok: false,
+        });
+      }
+      for (const to of [usdc, usdc.toLowerCase()]) {
+        expect(tool.inputSchema.safeParse({ ...base, to }).success).toBe(true);
+      }
+    }
+  });
 });
 
 describe("EvmSendTransaction — happy path through wallet-engine", () => {
@@ -140,7 +179,7 @@ describe("EvmSendTransaction — happy path through wallet-engine", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no wallet registered for walletId/);
+    ).rejects.toThrow(/no wallet "[^"]+" is declared\. Add it to the spec's wallets block/);
   });
 });
 
@@ -156,7 +195,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no WalletResolver bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when no TransactionPolicyResolver is bound", async () => {
@@ -169,7 +208,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no TransactionPolicyResolver bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when the policy resolver returns undefined", async () => {
@@ -196,7 +235,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no WalletEngine bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when the engine resolver returns undefined (EvmSimulate path)", async () => {

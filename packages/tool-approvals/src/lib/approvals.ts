@@ -28,7 +28,10 @@
  * answering a question it has no authority over, and an operator who skipped it
  * on that advice would leave a run blocked that a grant would have resumed.
  */
+import type { OperativeArg } from "@crewhaus/tool-catalog";
+import { readOperativeField } from "@crewhaus/tool-executor";
 import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
+import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import { type JsonlRead, readJsonlCapped } from "./jsonl";
 import { compareStrings } from "./unknown";
 
@@ -131,12 +134,29 @@ export function foldApprovals(path: string, maxLines?: number, maxBytes?: number
 }
 
 /**
- * The ISO-8601 shapes this package will place in time: a calendar date, with an
- * optional time and an optional `Z`/`±HH:MM` offset. Anything else is refused
- * rather than guessed at.
+ * The ISO-8601 shapes this package will place in time: a calendar date alone,
+ * which means 00:00:00Z at the start of that day, or a date and a time WITH a
+ * `Z`/`±HH:MM` offset. Anything else is refused rather than guessed at.
+ *
+ * A time without an offset is refused. `Date.parse` reads it in the HOST's
+ * zone (and a bare date as UTC), so the same `since` selected a different
+ * window, and the same `now` gave a different age — negative, on a host east
+ * of the writer — on another machine (security-2#5).
  */
 const ISO_INSTANT_RE =
-  /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+  /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(Z|[+-]\d{2}:?\d{2}))?$/;
+
+/** A date and a time with no offset: the shape {@link parseInstant} refuses. */
+const OFFSETLESS_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+/**
+ * True when `text` is a date and time with no UTC offset — the one near-miss
+ * worth naming in a refusal, because the fix (append `Z` or `±HH:MM`) is
+ * mechanical.
+ */
+export function isOffsetlessDateTime(text: string): boolean {
+  return OFFSETLESS_DATE_TIME_RE.test(text);
+}
 
 /**
  * An ISO instant as a NUMBER, or `null` when the text is not one.
@@ -154,8 +174,17 @@ const ISO_INSTANT_RE =
  * differently on a different runtime.
  */
 export function parseInstant(text: string): number | null {
-  if (!ISO_INSTANT_RE.test(text)) return null;
-  const ms = Date.parse(text);
+  const match = ISO_INSTANT_RE.exec(text);
+  if (match === null) return null;
+  const [, date, time, offset] = match;
+  // Rewritten into the ECMAScript date-time format before parsing — `T`, and
+  // `±HH:MM` — so nothing rests on `Date.parse`'s implementation-defined
+  // acceptance of a space separator or a colon-less offset.
+  const iso =
+    time === undefined || offset === undefined
+      ? `${date}T00:00:00Z`
+      : `${date}T${time}${offset === "Z" ? "Z" : `${offset.slice(0, 3)}:${offset.slice(-2)}`}`;
+  const ms = Date.parse(iso);
   return Number.isNaN(ms) ? null : ms;
 }
 
@@ -288,11 +317,12 @@ export type ApprovalRow = {
   readonly sessionId: string;
   readonly inputHash: string;
   /**
-   * The input field a permission rule would constrain for this tool, per
-   * `@crewhaus/tool-permission-matcher`'s `OPERATIVE_ARG_FIELDS` — the one an
-   * approver is actually judging. `null` for a tool with no entry in that table
-   * (every MCP tool, and any custom tool), where there is no field the matcher
-   * would check either.
+   * The input field a permission rule would constrain for this tool — the one
+   * an approver is actually judging: the first of a builtin's declared
+   * `operativeArgs` that the call carries (or fills with its default), else
+   * the matcher's name table. `null` when there is none: a tool that declares
+   * no scoping argument, and every MCP or custom tool, whose rules are
+   * checked against the call's text.
    */
   readonly operativeField: string | null;
   readonly operativeValue: string | null;
@@ -311,16 +341,36 @@ function typeName(value: unknown): string {
 }
 
 /**
- * The operative field and value for a tool, using the matcher's OWN table.
+ * The operative field and value for a tool, read the way the matcher reads it.
  *
- * Reading the same table the matcher reads is the point: a row that showed some
- * other field would be showing an approver a value that no rule they write
- * about it will ever be checked against.
+ * Reading what the matcher reads is the point: a row that showed some other
+ * field would be showing an approver a value that no rule they write about it
+ * will ever be checked against. A builtin's own declaration comes first (the
+ * builtin manifest carries it); the matcher's name table speaks only for a
+ * tool that declares nothing.
  */
 export function operativeOf(
   toolName: string,
   input: unknown,
 ): { readonly field: string | null; readonly value: string | null } {
+  const declared = TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs;
+  if (declared !== undefined) {
+    // A relocating field the call left out (a store directory, the
+    // repository a branch operation runs in) is where the record lives, not
+    // the record: an approver deciding on GitBranchDelete needs the branch,
+    // not ".". Its default is shown only when the call names nothing else.
+    for (const pass of ["named", "any"] as const) {
+      for (const arg of declared) {
+        const read =
+          pass === "named" && arg.relocates === true
+            ? { field: arg.field, kind: arg.kind as OperativeArg["kind"] }
+            : (arg as OperativeArg);
+        const value = readOperativeField(input, read).find((v) => v.length > 0);
+        if (value !== undefined) return { field: arg.field, value };
+      }
+    }
+    return { field: null, value: null };
+  }
   const fields = OPERATIVE_ARG_FIELDS[toolName];
   if (fields === undefined || input === null || typeof input !== "object") {
     return { field: null, value: null };

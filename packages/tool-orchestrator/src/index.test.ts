@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import type { ToolUseBlock } from "@crewhaus/turn-state-machine";
-import { isCallConcurrencySafe, isConcurrencySafe, partitionToolCalls } from "./index";
+import {
+  type ToolPartition,
+  groupToolCalls,
+  isCallConcurrencySafe,
+  isConcurrencySafe,
+  partitionToolCalls,
+} from "./index";
 
 // Minimal RegisteredTool factory for tests. The orchestrator never invokes
 // `inputSchema` or `execute`, so we don't pull zod in just to satisfy types.
@@ -110,6 +116,52 @@ describe("partitionToolCalls — basic shapes", () => {
   });
 });
 
+// C121 — the groups keep the model's order; a batch never crosses a serial
+// call, so a read after a write runs after it.
+const groupIds = (p: Pick<ToolPartition, "groups">): string[] =>
+  p.groups.map((g) =>
+    g.kind === "serial" ? `S:${g.call.id}` : `C:${g.calls.map((c) => c.id).join(",")}`,
+  );
+
+describe("partitionToolCalls — groups preserve encounter order", () => {
+  test("a read after a write is its own group after the write", () => {
+    expect(groupIds(partitionToolCalls([call("Write", "1"), call("Read", "2")], lookup))).toEqual([
+      "S:1",
+      "C:2",
+    ]);
+  });
+
+  test("runs of safe calls between serial calls stay separate batches, in order", () => {
+    const calls = [
+      call("Read", "1"),
+      call("Read", "2"),
+      call("Bash", "3"),
+      call("Glob", "4"),
+      call("Write", "5"),
+      call("Read", "6"),
+    ];
+    const out = partitionToolCalls(calls, lookup);
+    expect(groupIds(out)).toEqual(["C:1,2", "S:3", "C:4", "S:5", "C:6"]);
+    // groupToolCalls is the same plan without the flat views.
+    expect(groupIds({ groups: groupToolCalls(calls, lookup) })).toEqual(groupIds(out));
+  });
+
+  test("the flat views are derived from the groups and unchanged from 0.7.0", () => {
+    const calls = [call("Read", "1"), call("Write", "2"), call("Read", "3"), call("Read", "4")];
+    const out = partitionToolCalls(calls, lookup);
+    expect(out.concurrent.map((b) => b.map((c) => c.id))).toEqual([["1"], ["3", "4"]]);
+    expect(out.serial.map((c) => c.id)).toEqual(["2"]);
+    // Each flat batch is the very array its group holds.
+    const concurrentGroups = out.groups.filter((g) => g.kind === "concurrent");
+    expect(concurrentGroups.map((g) => (g.kind === "concurrent" ? g.calls : []))).toEqual(
+      out.concurrent,
+    );
+    concurrentGroups.forEach((g, i) => {
+      expect(g.kind === "concurrent" && g.calls === out.concurrent[i]).toBe(true);
+    });
+  });
+});
+
 describe("partitionToolCalls — accepts ToolCatalog", () => {
   test("works with a Map-shaped lookup function", () => {
     const map = new Map<string, RegisteredTool>([["Read", READ]]);
@@ -202,6 +254,20 @@ describe("partitionToolCalls — T9 property invariant", () => {
       // Every input call appears exactly once in either bucket.
       const total = out.concurrent.flat().length + out.serial.length;
       expect(total).toBe(calls.length);
+      // The groups flatten back to the input in the same order, no two
+      // concurrent groups are adjacent (a run is maximal), and a concurrent
+      // group only ever holds safe calls.
+      const flattened = out.groups.flatMap((g) => (g.kind === "serial" ? [g.call] : g.calls));
+      expect(flattened.map((c) => c.id)).toEqual(calls.map((c) => c.id));
+      out.groups.forEach((g, i) => {
+        if (g.kind !== "concurrent") return;
+        expect(g.calls.length).toBeGreaterThan(0);
+        expect(out.groups[i + 1]?.kind).not.toBe("concurrent");
+        for (const c of g.calls) {
+          const tool = toolMap.get(c.name);
+          expect(tool !== undefined && isConcurrencySafe(tool)).toBe(true);
+        }
+      });
     }
   });
 });

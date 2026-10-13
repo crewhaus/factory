@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "@crewhaus/adapter-anthropic": "workspace:*",
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

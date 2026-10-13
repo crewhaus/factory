@@ -21,7 +21,16 @@
  *     version whose file is gone, which is why `probeVersion` exists.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
@@ -31,10 +40,12 @@ import {
   CHANGELOG_FILENAME,
   MANIFEST_FILENAME,
   TENANTS_DIRNAME,
+  isListedSpecName,
   predictRegistration,
   probeTenantOverlay,
   probeVersion,
   readManifest,
+  reservedRegistryRoot,
   resolveName,
   versionFilename,
 } from "./lib/registry";
@@ -92,11 +103,35 @@ test("the mirrored on-disk names are the ones the real registry and changelog wr
 // ---------------------------------------------------------------------------
 
 test("a spec name is resolved to the name the registry will really use", () => {
-  const mapped = named("Brewbird Support");
-  expect(mapped.registryName).toBe("Brewbird-Support");
-  expect(mapped.mapped).toBe(true);
-  const plain = named("demo");
-  expect(plain).toEqual({ given: "demo", registryName: "demo", mapped: false });
+  expect(named("demo")).toEqual({ given: "demo", registryName: "demo" });
+  expect(named("Brewbird-Support.v2")).toEqual({
+    given: "Brewbird-Support.v2",
+    registryName: "Brewbird-Support.v2",
+  });
+});
+
+test("a name the registry would store under another spelling is refused, naming the stored one", () => {
+  // The permission gate reads `<name>/<env>` as the call wrote it. Mapped,
+  // ".billing" was checked as one spec and acted on as "billing": past
+  // `alwaysDeny DeployInspect(billing/**)`, with no judge behind the gate.
+  for (const [given, stored] of [
+    [".billing", "billing"],
+    ["..billing", "billing"],
+    ["billing/", "billing-"],
+    ["bill ing", "bill-ing"],
+    ["Brewbird Support", "Brewbird-Support"],
+    ["._hidden", "_hidden"],
+    ["///", "-"],
+  ] as const) {
+    for (const access of ["write", "read"] as const) {
+      const r = resolveName(given, access);
+      expect({ given, access, ok: r.ok }).toEqual({ given, access, ok: false });
+      if (r.ok) throw new Error("unreachable");
+      expect(r.code).toBe("bad-input");
+      expect(r.reason).toContain(`spec name "${given}" is stored by the registry as "${stored}"`);
+      expect(r.reason).toContain(`Name it "${stored}"`);
+    }
+  }
 });
 
 test("a name that maps onto the shared fallback directory is refused, not mapped", () => {
@@ -113,13 +148,45 @@ test("a name that maps onto the shared fallback directory is refused, not mapped
     // telling the caller their two specs would share one directory.
     expect(r.reason).toContain('fallback "spec"');
   }
-  // A name that maps to something usable is NOT refused, even when the
-  // mapping changed it beyond recognition: that is reported, not blocked.
-  const odd = resolveName("///");
-  expect(odd.ok).toBe(true);
-  if (!odd.ok) throw new Error("unreachable");
-  expect(odd.value.registryName).toBe("-");
-  expect(odd.value.mapped).toBe(true);
+});
+
+test("a name the registry's listing hides is refused for a write, and marked for a read (security-11#9)", () => {
+  // On 0.7.0 all four resolved: SpecPin pinned "_hidden" where DeployInspect's
+  // enumeration never showed it, and wrote a manifest into "_tenants".
+  for (const given of ["_hidden", "_tenants", "__x"]) {
+    const r = resolveName(given);
+    expect({ given, ok: r.ok }).toEqual({ given, ok: false });
+    if (r.ok) throw new Error("unreachable");
+    expect(r.code).toBe("bad-input");
+    expect(r.reason).toContain("listSpecs");
+    expect(r.reason).toContain("tenant-overlay directory");
+    const read = resolveName(given, "read");
+    expect({ given, ok: read.ok }).toEqual({ given, ok: true });
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.value.hiddenFromListing).toBe(true);
+  }
+  // A leading "-", or an "_" anywhere but first, is listed and stays usable.
+  for (const given of ["-dash", "demo_1", "My-Agent"]) {
+    const r = resolveName(given);
+    expect({ given, ok: r.ok }).toEqual({ given, ok: true });
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value.hiddenFromListing).toBeUndefined();
+  }
+});
+
+test("the mirrored listing rule is the one the real registry applies", async () => {
+  // If spec-registry's listSpecs ever changes what it skips, this fails here
+  // instead of the refusal above drifting from what is really hidden.
+  const registry = openRegistry();
+  const names = ["demo", "_legacy", "-dash", "a_b", "__x"];
+  for (const name of names) await registry.put(name, "v1", `name: ${name}\n`);
+  await registry.pinForTenant("acme", "demo", "prod", "v1");
+  const listed = new Set(await registry.listSpecs());
+  const onDisk = readdirSync(rootAbs()).sort();
+  expect(onDisk).toContain(TENANTS_DIRNAME);
+  expect(onDisk.map((n) => [n, isListedSpecName(n)])).toEqual(
+    onDisk.map((n) => [n, listed.has(n)]),
+  );
 });
 
 test("a NUL in a spec name is refused before it becomes a path component", () => {
@@ -325,4 +392,39 @@ test("probeTenantOverlay answers about the name the real adapter writes, and kee
   // The registry really cannot tell these apart, which is why the probe is
   // by name rather than by asking it.
   expect(await registry.aliasForTenant("beta", "demo", "prod")).toBe("v1");
+});
+
+// ---------------------------------------------------------------------------
+// a registry root tens of thousands of directories deep
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
+ * its arguments, and the `_tenants` probe passed the parent one argument per
+ * directory. With 65,536 directories above a `_` name, Bun kept two of the
+ * 65,538 arguments and the probe asked about `<workspace>/a` instead: absent
+ * there, so the root was taken for an ordinary directory and not refused. A
+ * probe of the real, too-long path cannot answer "absent", and anything else
+ * counts as a registry. The root is built by hand, so nothing here walks the
+ * filesystem.
+ */
+test("a `_` name 65,534 to 65,536 directories deep is judged by its own parent", () => {
+  const ws = realpathSync(tmp);
+  for (const depth of [65_534, 65_535, 65_536]) {
+    const rel = `${Array.from({ length: depth }, () => "a").join("/")}/_x`;
+    const real = path.join(ws, rel);
+    const reason = reservedRegistryRoot({ abs: real, real, given: rel, rel }, ws);
+    expect({
+      depth,
+      refused: reason?.startsWith('"_x" is a directory the registry at "a/a/'),
+    }).toEqual({ depth, refused: true });
+  }
+  // Control: the same `_` name one directory down, beside no `_tenants`, is an
+  // ordinary directory.
+  expect(
+    reservedRegistryRoot(
+      { abs: ws, real: path.join(ws, "a", "_x"), given: "a/_x", rel: "a/_x" },
+      ws,
+    ),
+  ).toBeUndefined();
 });

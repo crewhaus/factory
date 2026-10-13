@@ -12,6 +12,7 @@
     { "path": "../infra-utils" },
     { "path": "../memory-store" },
     { "path": "../session-store" },
+    { "path": "../tool-safety" },
     { "path": "../wiki-store" }
   ],
   "include": ["src/**/*"]

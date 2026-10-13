@@ -16,6 +16,7 @@
  * closes, and it closes it at EVERY hop, not just the first.
  */
 import { assertNotSsrf } from "@crewhaus/tool-fetch";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 export class RegistryHttpError extends Error {
   override readonly name = "RegistryHttpError";
@@ -51,7 +52,14 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (pinnedIp === "" || unbracketed === pinnedIp) return globalThis.fetch(req);
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd body in native code
+  // before any reader sees a byte, and a 260 KB gzip of zeros from a
+  // registry (or the object store it redirects to) cost about 1 GB of RSS
+  // before `maxBytes` fired (C093). `readCapped` decodes it, under the cap,
+  // into the same bytes the runtime's decoder gave: a digest is still over
+  // the representation the registry sent.
+  if (pinnedIp === "" || unbracketed === pinnedIp) return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -64,7 +72,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     signal: req.signal,
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RegistryFetch = pinnedFetch;
@@ -141,54 +149,53 @@ export async function httpGet(url: URL, options: GetOptions): Promise<RawRespons
       continue;
     }
 
-    const bytes = await readCapped(res, options.maxBytes);
+    const bytes = await readCapped(res, options.maxBytes, options.signal);
     return { status: res.status, headers: res.headers, bytes, url: current.toString() };
   }
   throw new RegistryHttpError(`registry redirected more than ${MAX_REDIRECTS} times`);
 }
 
 /**
- * Drain a body with a hard byte cap, aborting the read once it is exceeded so a
- * hostile or misconfigured registry cannot pin memory. Concatenation happens
- * once at the end, over the exact chunks that arrived.
+ * Drain a body with a hard cap on its DECODED size, so a hostile or
+ * misconfigured registry cannot pin memory: the body arrives raw (see
+ * `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in small
+ * steps, and the decoder stops at the cap. The bytes returned are exactly
+ * the decoded body; a body past the cap, or one that cannot be decoded, is
+ * refused.
  */
-async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array> {
-  if (res.body === null) return new Uint8Array(0);
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Already aborting.
-        }
-        throw new RegistryHttpError(
-          `response body exceeded ${maxBytes} bytes — aborted before reading it all`,
-        );
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // The stream may already be released; nothing to do.
-    }
+async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) {
+    if (!read.truncated) return read.bytes;
+    throw new RegistryHttpError(
+      `response body exceeded ${maxBytes} bytes — aborted before reading it all`,
+    );
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+  switch (read.code) {
+    case "aborted":
+    case "stalled":
+      // As the runtime reports an abort mid-body, so the caller's timeout
+      // and cancellation handling sees the same thing it always did.
+      throw signal?.reason ?? new RegistryHttpError("the read was aborted before the body ended");
+    case "unsupported-encoding":
+      throw new RegistryHttpError(
+        `the registry sent a body in a stack of content-encodings this tool cannot decode within its ${maxBytes}-byte cap`,
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new RegistryHttpError(
+        "the registry sent a body labelled as compressed that could not be decoded",
+      );
+    default:
+      throw new RegistryHttpError("the registry closed the connection before the body ended");
   }
-  return merged;
 }
 
 /**

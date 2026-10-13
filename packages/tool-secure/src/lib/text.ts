@@ -129,6 +129,87 @@ export function maskValue(value: string, keep = 2): string {
 }
 
 /**
+ * Spans, asked one question: does `[start, end)` overlap any of them?
+ *
+ * Overlap is `start < k.end && k.start < end`, the test `dedupeOverlaps` and
+ * `secretFindings` make, answered for any numbers, empty spans included.
+ * Among the spans that start before `end`, one overlaps exactly when the
+ * largest of their ends is past `start`. So the index keeps that largest end
+ * in a Fenwick tree with one slot per distinct start, and a question or an
+ * addition visits O(log n) slots. Checking every span kept so far made
+ * those two passes quadratic in the findings, on text a model or a web page
+ * supplies.
+ *
+ * Every start a span will be added with is named up front, because the
+ * slots are the distinct starts in order. `steps` counts the slots and
+ * probes the calls visit, so a test can hold the index to its bound.
+ */
+export class SpanIndex {
+  /** Tree slots and binary-search probes visited so far. */
+  steps = 0;
+  /** The distinct starts, ascending. */
+  private readonly starts: Float64Array;
+  /** 1-based Fenwick tree of the largest end per prefix of `starts`. */
+  private readonly maxEnd: Float64Array;
+
+  constructor(starts: ReadonlyArray<number>) {
+    const sorted = new Float64Array(starts.length);
+    let n = 0;
+    // A NaN start never satisfies the test, so it never needs a slot.
+    for (let i = 0; i < starts.length; i++) {
+      const s = starts[i] as number;
+      if (!Number.isNaN(s)) sorted[n++] = s;
+    }
+    sorted.subarray(0, n).sort();
+    let distinct = 0;
+    for (let i = 0; i < n; i++) {
+      const s = sorted[i] as number;
+      if (distinct === 0 || s !== sorted[distinct - 1]) sorted[distinct++] = s;
+    }
+    this.starts = sorted.slice(0, distinct);
+    this.maxEnd = new Float64Array(distinct + 1).fill(Number.NEGATIVE_INFINITY);
+  }
+
+  /** How many distinct starts are below `bound`; none are below NaN. */
+  private below(bound: number): number {
+    let lo = 0;
+    let hi = this.starts.length;
+    while (lo < hi) {
+      this.steps++;
+      const mid = (lo + hi) >>> 1;
+      if ((this.starts[mid] as number) < bound) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /** Whether some span added so far has `k.start < end && start < k.end`. */
+  overlaps(start: number, end: number): boolean {
+    let most = Number.NEGATIVE_INFINITY;
+    for (let i = this.below(end); i > 0; i -= i & -i) {
+      this.steps++;
+      const e = this.maxEnd[i] as number;
+      if (e > most) most = e;
+    }
+    return most > start;
+  }
+
+  /** Add `[start, end)`; `start` must be one the index was built with. */
+  add(start: number, end: number): void {
+    // A NaN on either side never satisfies the test, so it is never found.
+    if (Number.isNaN(start) || Number.isNaN(end)) return;
+    const at = this.below(start);
+    if (at >= this.starts.length || this.starts[at] !== start) {
+      throw new Error(`SpanIndex: start ${start} was not named when the index was built`);
+    }
+    for (let i = at + 1; i < this.maxEnd.length; i += i & -i) {
+      this.steps++;
+      if (end > (this.maxEnd[i] as number)) this.maxEnd[i] = end;
+    }
+  }
+}
+
+/**
  * Drop findings swallowed by a stronger one.
  *
  * Overlap is common and mostly noise: the digit run inside an IBAN also
@@ -136,6 +217,10 @@ export function maskValue(value: string, keep = 2): string {
  * survivor is chosen by confidence, then by length, then by earliest start,
  * then by rule name — a total order, so the same input always yields the
  * same set.
+ *
+ * Each candidate, in that order, is kept unless it overlaps one kept before
+ * it. A `SpanIndex` answers that, so the pass is O(k log k) in the findings
+ * rather than a check against every finding kept so far.
  */
 export function dedupeOverlaps(findings: ReadonlyArray<Finding>): Finding[] {
   const ranked = [...findings].sort((a, b) => {
@@ -146,10 +231,12 @@ export function dedupeOverlaps(findings: ReadonlyArray<Finding>): Finding[] {
     if (a.start !== b.start) return a.start - b.start;
     return compareStrings(a.rule, b.rule);
   });
+  const index = new SpanIndex(ranked.map((f) => f.start));
   const kept: Finding[] = [];
   for (const candidate of ranked) {
-    const clashes = kept.some((k) => candidate.start < k.end && k.start < candidate.end);
-    if (!clashes) kept.push(candidate);
+    if (index.overlaps(candidate.start, candidate.end)) continue;
+    kept.push(candidate);
+    index.add(candidate.start, candidate.end);
   }
   return sortFindings(kept);
 }
@@ -177,8 +264,14 @@ export function withPositions(
 /**
  * Replace each span with the string `replace` returns for it.
  *
- * Spans must not overlap (`dedupeOverlaps` guarantees that); they are
- * applied right to left so earlier offsets stay valid.
+ * Spans must not overlap (`dedupeOverlaps` guarantees that). `replace` is
+ * called right to left, as it always has been, and the output is the text
+ * between the spans joined with their replacements: one copy of the text.
+ * Rebuilding the whole string for every span was O(spans × text), and a
+ * redaction pass over megabytes of findings-dense text has hundreds of
+ * thousands of spans. Spans that overlap, sit out of order or outside the
+ * text, or have fractional offsets keep the old right-to-left rebuild, which
+ * gives the same result on spans that do none of those things.
  */
 export function applySpans(
   text: string,
@@ -186,6 +279,43 @@ export function applySpans(
   replace: (finding: Finding) => string,
 ): string {
   const ordered = sortFindings(findings);
+  if (!disjointWithin(ordered, text.length)) return rebuildRightToLeft(text, ordered, replace);
+  const replacements: Array<string | undefined> = new Array(ordered.length);
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const f = ordered[i];
+    if (f) replacements[i] = replace(f);
+  }
+  const parts: string[] = [];
+  let at = 0;
+  for (let i = 0; i < ordered.length; i++) {
+    const f = ordered[i];
+    if (!f) continue;
+    parts.push(text.slice(at, f.start), replacements[i] as string);
+    at = f.end;
+  }
+  parts.push(text.slice(at));
+  return parts.join("");
+}
+
+/** Whether sorted spans are whole offsets, in order, apart, and inside the text. */
+function disjointWithin(ordered: ReadonlyArray<Finding | undefined>, length: number): boolean {
+  let at = 0;
+  for (let i = 0; i < ordered.length; i++) {
+    const f = ordered[i];
+    if (!f) continue;
+    if (!Number.isInteger(f.start) || !Number.isInteger(f.end)) return false;
+    if (f.start < at || f.end < f.start || f.end > length) return false;
+    at = f.end;
+  }
+  return true;
+}
+
+/** The original rebuild, kept for spans `disjointWithin` refuses. */
+function rebuildRightToLeft(
+  text: string,
+  ordered: ReadonlyArray<Finding | undefined>,
+  replace: (finding: Finding) => string,
+): string {
   let out = text;
   for (let i = ordered.length - 1; i >= 0; i--) {
     const f = ordered[i];
@@ -228,6 +358,47 @@ export function* matchAll(
     if (m === null) return;
     yield { index: m.index, match: m };
     if (m[0].length === 0) re.lastIndex += 1;
+  }
+}
+
+/**
+ * `matchAll(text, pattern)`'s matches, in order, with the pattern tried
+ * (sticky) only where `canStart` says a match may begin, and, after a try
+ * that fails at `at`, not again before `failedTo(text, at)`.
+ *
+ * For a pattern that opens with an unbounded run (an email's local part, a
+ * word before a comma, the whitespace after a line start), a global search
+ * that fails at one start moves one character right and scans the same run
+ * again: quadratic in the run's length. Every later start inside such a run
+ * shares the run's end and reads the same text after it, so it fails too;
+ * `failedTo` names where that stops being true, and the matches are the
+ * global pattern's, start for start. After a match the next try is at its
+ * end (one further for an empty match), as `lastIndex` would be.
+ */
+export function* matchAllSkipping(
+  text: string,
+  pattern: RegExp,
+  canStart: (text: string, at: number) => boolean,
+  failedTo: (text: string, at: number) => number,
+): Generator<{ index: number; match: RegExpExecArray }> {
+  let flags = pattern.flags.replace("g", "");
+  if (!flags.includes("d")) flags = `${flags}d`;
+  if (!flags.includes("y")) flags = `${flags}y`;
+  const re = new RegExp(pattern.source, flags);
+  let at = 0;
+  while (at <= text.length) {
+    if (!canStart(text, at)) {
+      at++;
+      continue;
+    }
+    re.lastIndex = at;
+    const m = re.exec(text);
+    if (m !== null) {
+      yield { index: at, match: m };
+      at += Math.max(1, m[0].length);
+      continue;
+    }
+    at = Math.max(at + 1, failedTo(text, at));
   }
 }
 

@@ -230,7 +230,7 @@ export function verifyAgainst(
   const mismatched: VerifyMismatch[] = [];
   let verified = 0;
   for (const entry of manifest) {
-    const abs = path.join(destRoot, ...entry.rel.split("/"));
+    const abs = path.join(destRoot, entry.rel);
     let stat: ReturnType<typeof lstatSync>;
     try {
       stat = lstatSync(abs);

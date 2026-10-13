@@ -127,6 +127,15 @@ which would tell an operator to set a key that changes nothing here.
 
 Only `EvalBaselinePin` writes, and only to `baselines.json`.
 
+Containment covers the files a tool derives, not only the paths it is given.
+`index.jsonl`, `baselines.json` and a run's `results.json` are read only when
+their own physical location is inside the workspace, so a symbolic link at one
+of those names that leads out is refused and nothing of the file it points at
+reaches the result. A FIFO or device there is refused without being opened. A
+link that stays inside the workspace is still read, but a pin is never written
+through a link: `set` and `clear` (and their `dryRun`) refuse a symlinked
+`baselines.json`. Replace the link with the file it points at to pin there.
+
 ## Two things found upstream while building this
 
 Both are reported by the tools rather than worked around silently:
@@ -141,9 +150,9 @@ Both are reported by the tools rather than worked around silently:
    with `degenerate: true`. `GraderMetaTest` reports both numbers and names the
    disagreement rather than picking one.
 
-`@crewhaus/eval-report` also has no `deleteBaseline`, so the `clear` action
-rewrites `baselines.json` in exactly the shape `setBaseline` writes it. That is
-a second writer and it is marked as one in the source.
+Both `set` and `clear` write through `@crewhaus/eval-report`'s own writers
+(`setBaseline`, `clearBaseline`), which own the key and the file format and
+write only a regular file, through a temp renamed into place.
 
 ## Testing
 

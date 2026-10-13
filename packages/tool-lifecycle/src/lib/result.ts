@@ -12,7 +12,7 @@
  */
 import { statSync } from "node:fs";
 import * as path from "node:path";
-import { type SafePath, ToolPermissionError, resolveSafe } from "../paths";
+import { MAX_PATH_CHARS, type SafePath, ToolPermissionError, resolveSafe } from "../paths";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
 export const json = (value: unknown): string => JSON.stringify(value);
@@ -65,6 +65,16 @@ export function refusal(tool: string, code: FailCode, reason: string, extra = {}
 }
 
 /**
+ * True when `rel` resolves to a path longer than any path can be
+ * ({@link MAX_PATH_CHARS}). It cannot be opened or created, so it leads
+ * nowhere and is no escape; `contain` refuses it, naming the length and the
+ * limit, and anything that touches it meets the filesystem's own refusal.
+ */
+export function pastPathLimit(rel: string): boolean {
+  return path.resolve(process.cwd(), rel).length > MAX_PATH_CHARS;
+}
+
+/**
  * Resolve a caller-supplied path inside the workspace.
  *
  * The NUL guard is here rather than in `paths.ts` (which is a verbatim copy
@@ -85,7 +95,7 @@ export function contain(toolName: string, rel: string): Loaded<SafePath> {
       // control character in the caller's input cannot reach the output.
       return fail(
         "refused",
-        `tool "${toolName}" rejected path "${renderPath(rel)}": resolved location escapes the workspace root`,
+        `tool "${toolName}" rejected path "${renderPath(rel)}": ${err.reason ?? "resolved location escapes the workspace root"}`,
       );
     }
     throw err;
@@ -122,6 +132,8 @@ export function containWritePaths(
   const shownRoot = root.rel === "" ? "." : root.rel;
   for (const rel of rels) {
     const under = root.rel === "" ? rel : `${root.rel}/${rel}`;
+    // Too long to open or create: it leads nowhere, so it is no escape.
+    if (pastPathLimit(under)) continue;
     if (!contain(toolName, under).ok) {
       return fail(
         "refused",

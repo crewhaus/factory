@@ -8,7 +8,8 @@
     { "path": "../errors" },
     { "path": "../eval-dataset" },
     { "path": "../eval-grader" },
-    { "path": "../grader-registry" }
+    { "path": "../grader-registry" },
+    { "path": "../tool-catalog" }
   ],
   "include": ["src/**/*"]
 }

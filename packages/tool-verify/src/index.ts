@@ -12,8 +12,8 @@
  * would be a crawler, and would leak which documents are being reviewed.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import { dirname, join, posix, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -28,8 +28,23 @@ import {
   readableText,
   textOf,
 } from "@crewhaus/tool-html";
+import {
+  type FileKind,
+  fileKind,
+  joinRel,
+  openForReadSync,
+  resolveContained,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
+import {
+  type RegexSession,
+  describeRegexOutcome,
+  openRegexSession,
+} from "@crewhaus/tool-safety/regex";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
+import { integrityLimits, integrityWalk } from "./integrity";
+import { digestLine } from "./lib/digest-line";
 import {
   citationDefinitions,
   citedClaims,
@@ -38,8 +53,16 @@ import {
   headingAnchors,
   lintCitations,
   splitLinkTarget,
+  withoutLinkTitle,
 } from "./lib/markdown";
-import { NORMALIZERS, type Normalizer, firstDifferences, normalizeOutput } from "./lib/normalize";
+import {
+  NORMALIZERS,
+  type NormalizeOptions,
+  type Normalizer,
+  ReplaceRuleError,
+  firstDifferences,
+  normalizeOutput,
+} from "./lib/normalize";
 import {
   LONG_SENTENCE_WORDS,
   SCHEMA_RULES,
@@ -79,6 +102,11 @@ import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot
 
 const json = (value: unknown): string => JSON.stringify(value);
 
+/** Longest file body a caller's `fileMatches` pattern runs over, in characters. */
+const MATCH_INPUT_CHARS = 16 * 1024 * 1024;
+/** How long one `fileMatches` pattern may run before the check is undetermined. */
+const MATCH_DEADLINE_MS = 5_000;
+
 const LIMITS = {
   files: 20_000,
   fileBytes: 256 * 1024 * 1024,
@@ -87,10 +115,34 @@ const LIMITS = {
   diffLines: 50,
   claims: 200,
   claimChars: 4_000,
+  // Different spans one claim may put in quotation marks. Each is looked for
+  // in every source the claim cites, so the count multiplies the reading;
+  // a sentence quoting more is reported unchecked, not checked in part.
+  quotedSpans: 16,
   // A source is tokenized end to end, so its cap is about the work rather
   // than the memory, and is far below the per-file one above.
   sourceBytes: 8 * 1024 * 1024,
 } as const;
+
+/**
+ * Words of its cited sources one FactCrossCheck call may read. Locating a
+ * claim reads each source it cites once, or for a quotation up to twice per
+ * span; the caps above bound one claim, and this bounds the call: 200
+ * claims each quoting 16 near misses of one source read it 6 400 times. A
+ * claim whose reading could pass what is left is reported `unchecked`, with
+ * the reason, before any of it is read. Held in an object so a test can
+ * lower it (see `_setFactCheckReadBudgetForTest`).
+ */
+const READ_BUDGET = { words: 2 ** 27 };
+
+/** Lower (or restore) the per-call reading budget for a test; returns the undo. */
+export function _setFactCheckReadBudgetForTest(words: number): () => void {
+  const before = READ_BUDGET.words;
+  READ_BUDGET.words = words;
+  return () => {
+    READ_BUDGET.words = before;
+  };
+}
 
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", ".turbo"]);
 
@@ -115,11 +167,24 @@ function filesUnder(root: string, rel = "", out: string[] = []): string[] {
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
 function readCapped(abs: string, what: string): Buffer {
-  const size = statSync(abs).size;
+  const stat = statSync(abs);
+  // Opening a FIFO blocks until something writes to it, and a directory
+  // throws an error nobody catches: neither is a file to compare or hash.
+  if (!stat.isFile()) throw new Error(`${what} is not a regular file`);
+  const size = stat.size;
   if (size > LIMITS.fileBytes) {
     throw new Error(`${what} is ${size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
   }
   return readFileSync(abs);
+}
+
+/** The regex context a tool call hands to caller patterns: its abort signal and session. */
+function regexContext(ctx: unknown): NonNullable<NormalizeOptions["regex"]> {
+  const c = ctx as { signal?: AbortSignal; runContext?: { sessionId?: string } } | undefined;
+  return {
+    ...(c?.signal === undefined ? {} : { signal: c.signal }),
+    ...(c?.runContext?.sessionId === undefined ? {} : { runawayKey: c.runContext.sessionId }),
+  };
 }
 
 const normalizerField = z
@@ -138,6 +203,11 @@ const replaceField = z
 
 export const goldenCompare: RegisteredTool = buildTool({
   name: "GoldenCompare",
+  // A file, or two trees walked whole, dotfiles included.
+  operativeArgs: [
+    { field: "actualFile", kind: "path", beneath: "all" },
+    { field: "golden", kind: "path", beneath: "all" },
+  ],
   description:
     "Compare output, a file or a whole directory tree against stored goldens, masking the parts that are allowed to vary. Use it as the gate that says whether a change did anything it did not mean to. Timestamps, durations, uuids, hashes, ports, absolute paths and ANSI escapes can each be masked, and every mask is reported WITH A COUNT — a normalizer that quietly rewrote output would let a real regression hide inside a masked span, which is worse than a golden that fails too often.",
   inputSchema: z
@@ -155,95 +225,172 @@ export const goldenCompare: RegisteredTool = buildTool({
     }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const root = workspaceRoot();
-    const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
-    const goldenAt = resolveSafe("GoldenCompare", input.golden);
-    const maxDiffLines = input.maxDiffLines ?? 20;
-
-    const isTree =
-      input.actualFile !== undefined &&
-      (() => {
-        try {
-          return statSync(
-            resolveSafe("GoldenCompare", input.actualFile as string).real,
-          ).isDirectory();
-        } catch {
-          return false;
-        }
-      })();
-
-    if (isTree) {
-      const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
-      let goldenFiles: string[];
-      try {
-        goldenFiles = filesUnder(goldenAt.real);
-      } catch {
-        return `the golden directory "${goldenAt.rel}" does not exist — create it with GoldenUpdate once the output is right`;
-      }
-      const actualFiles = filesUnder(actualAt.real);
-      const added = actualFiles.filter((f) => !goldenFiles.includes(f));
-      const removed = goldenFiles.filter((f) => !actualFiles.includes(f));
-      const changed: string[] = [];
-      for (const file of goldenFiles.filter((f) => actualFiles.includes(f))) {
-        const a = normalizeOutput(readCapped(join(goldenAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        const b = normalizeOutput(readCapped(join(actualAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        if (a !== b) changed.push(file);
-      }
-      return json({
-        mode: "tree",
-        golden: goldenAt.rel,
-        actual: actualAt.rel,
-        match: added.length === 0 && removed.length === 0 && changed.length === 0,
-        fileCount: actualFiles.length,
-        added,
-        removed,
-        changed,
-      });
-    }
-
-    let goldenText: string;
+  execute: async (input, ctx) => {
+    // One worker for every caller rule over every file of this call.
+    const session = input.replace === undefined ? undefined : openRegexSession();
     try {
-      goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
-    } catch {
-      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+      return await goldenCompareRun(input, {
+        ...regexContext(ctx),
+        ...(session === undefined ? {} : { session }),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) {
+        return `GoldenCompare could not compare, so this is not a verdict: ${err.message}`;
+      }
+      throw err;
+    } finally {
+      session?.close();
     }
-    const actualRaw =
-      input.actual ??
-      readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
-        "utf-8",
-      );
-
-    const expected = normalizeOutput(goldenText, { apply, root, replace: input.replace });
-    const actual = normalizeOutput(actualRaw, { apply, root, replace: input.replace });
-    const match = expected.text === actual.text;
-
-    return json({
-      mode: "text",
-      golden: goldenAt.rel,
-      match,
-      normalized: actual.applied,
-      ...(match
-        ? {}
-        : {
-            differences: firstDifferences(expected.text, actual.text, maxDiffLines),
-            expectedLines: expected.text.split("\n").length,
-            actualLines: actual.text.split("\n").length,
-          }),
-    });
   },
 });
 
+async function goldenCompareRun(
+  input: {
+    actual?: string | undefined;
+    actualFile?: string | undefined;
+    golden: string;
+    normalize?: ReadonlyArray<string> | undefined;
+    replace?: NormalizeOptions["replace"] | undefined;
+    maxDiffLines?: number | undefined;
+  },
+  regex: NonNullable<NormalizeOptions["regex"]>,
+): Promise<string> {
+  const root = workspaceRoot();
+  const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
+  const goldenAt = resolveSafe("GoldenCompare", input.golden);
+  const maxDiffLines = input.maxDiffLines ?? 20;
+  const options: NormalizeOptions = {
+    apply,
+    root,
+    ...(input.replace === undefined ? {} : { replace: input.replace }),
+    regex,
+  };
+
+  const isTree =
+    input.actualFile !== undefined &&
+    (() => {
+      try {
+        return statSync(
+          resolveSafe("GoldenCompare", input.actualFile as string).real,
+        ).isDirectory();
+      } catch {
+        return false;
+      }
+    })();
+
+  if (isTree) {
+    const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
+    // Both trees walked completely: dotfiles, node_modules and links
+    // included, since a tampered `.github/workflows/ci.yml` or a stray
+    // `.env` is exactly the change a tree golden exists to catch.
+    const golden = integrityWalk(root, goldenAt.rel);
+    if (!golden.ok) {
+      return `the golden directory "${goldenAt.rel}" could not be read (${golden.reason}) — create it with GoldenUpdate once the output is right`;
+    }
+    const actual = integrityWalk(root, actualAt.rel);
+    if (!actual.ok) return `GoldenCompare could not walk "${actualAt.rel}": ${actual.reason}`;
+    const goldenByRel = new Map(golden.entries.map((e) => [e.rel, e]));
+    const actualByRel = new Map(actual.entries.map((e) => [e.rel, e]));
+    const added = actual.entries.filter((e) => !goldenByRel.has(e.rel)).map((e) => e.rel);
+    const removed = golden.entries.filter((e) => !actualByRel.has(e.rel)).map((e) => e.rel);
+    const changed: string[] = [];
+    const unreadable: string[] = [
+      ...golden.unreadableDirs.map((d) => `golden ${d} (a directory that could not be listed)`),
+      ...actual.unreadableDirs.map((d) => `actual ${d} (a directory that could not be listed)`),
+    ];
+    const readText = (real: string, rel: string): string | null => {
+      const read = openForReadSync(root, real, {
+        maxBytes: LIMITS.fileBytes,
+        followLeafSymlink: false,
+      });
+      if (!read.ok || read.truncated) {
+        unreadable.push(`${rel}: ${read.ok ? "over the size limit" : read.reason}`);
+        return null;
+      }
+      return read.text;
+    };
+    for (const g of golden.entries) {
+      const a = actualByRel.get(g.rel);
+      if (a === undefined) continue;
+      if (g.kind !== a.kind) {
+        changed.push(g.rel);
+        continue;
+      }
+      if (g.kind === "symlink") {
+        // A link is compared by where it points, not by what is there:
+        // retargeting one is a change even when both targets match.
+        if (g.link?.text !== a.link?.text) changed.push(g.rel);
+        continue;
+      }
+      if (g.kind !== "file") {
+        unreadable.push(`${g.rel}: a ${g.kind}, not a regular file; not opened`);
+        continue;
+      }
+      const goldenText = readText(g.real, g.rel);
+      const actualText = readText(a.real, a.rel);
+      if (goldenText === null || actualText === null) continue;
+      const left = (await normalizeOutput(goldenText, options)).text;
+      const right = (await normalizeOutput(actualText, options)).text;
+      if (left !== right) changed.push(g.rel);
+    }
+    const truncated = golden.truncated || actual.truncated;
+    return json({
+      mode: "tree",
+      golden: goldenAt.rel,
+      actual: actualAt.rel,
+      match:
+        added.length === 0 &&
+        removed.length === 0 &&
+        changed.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
+      fileCount: actual.entries.length,
+      added,
+      removed,
+      changed,
+      truncated,
+      ...(unreadable.length > 0 ? { unreadable } : {}),
+    });
+  }
+
+  let goldenText: string;
+  try {
+    goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+    }
+    // A FIFO, a directory or an oversized file is not "missing"; say what it is.
+    return `GoldenCompare could not read the golden "${goldenAt.rel}", so this is not a verdict: ${(err as Error).message}`;
+  }
+  const actualRaw =
+    input.actual ??
+    readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
+      "utf-8",
+    );
+
+  const expected = await normalizeOutput(goldenText, options);
+  const actual = await normalizeOutput(actualRaw, options);
+  const match = expected.text === actual.text;
+
+  return json({
+    mode: "text",
+    golden: goldenAt.rel,
+    match,
+    normalized: actual.applied,
+    ...(match
+      ? {}
+      : {
+          differences: firstDifferences(expected.text, actual.text, maxDiffLines),
+          expectedLines: expected.text.split("\n").length,
+          actualLines: actual.text.split("\n").length,
+        }),
+  });
+}
+
 export const goldenUpdate: RegisteredTool = buildTool({
   name: "GoldenUpdate",
+  operativeArgs: [{ field: "golden", kind: "path" }],
   description:
     "Write the current output to a golden file, atomically. Use it to accept a change you have reviewed and intend. It writes through a temporary file and a rename, so an interrupted run leaves the old golden intact rather than a half-written one — a truncated golden passes nothing and is easy to mistake for a real diff. This overwrites a reviewed baseline, so it is destructive and asks for a justification.",
   inputSchema: z
@@ -258,38 +405,148 @@ export const goldenUpdate: RegisteredTool = buildTool({
   destructive: true,
   requireJustification: true,
   concurrencySafe: false,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const at = resolveSafe("GoldenUpdate", input.golden);
-    const normalized = normalizeOutput(input.actual, {
-      apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
-      root: workspaceRoot(),
-      replace: input.replace,
-    });
-    let previous: string | null = null;
+    let normalized: Awaited<ReturnType<typeof normalizeOutput>>;
     try {
-      previous = readFileSync(at.real, "utf-8");
-    } catch {
-      previous = null;
+      normalized = await normalizeOutput(input.actual, {
+        apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
+        root: workspaceRoot(),
+        ...(input.replace === undefined ? {} : { replace: input.replace }),
+        regex: regexContext(ctx),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) return `GoldenUpdate wrote nothing: ${err.message}`;
+      throw err;
     }
-    // Temp file plus rename: an interrupted write leaves the old golden in
-    // place rather than a truncated one that passes nothing.
-    const temp = `${at.real}.tmp-${process.pid}`;
-    writeFileSync(temp, normalized.text);
-    renameSync(temp, at.real);
+    const root = workspaceRoot();
+    // The old golden, read no further than one byte past the new one: that is
+    // enough to say whether it changed, and a FIFO or a link out of the
+    // workspace at the golden's name is refused here instead of read.
+    const bytes = Buffer.byteLength(normalized.text);
+    const before = openForReadSync(root, at.rel, { maxBytes: bytes + 1 });
+    if (!before.ok && before.code !== "not-found") {
+      return `GoldenUpdate wrote nothing: ${before.reason}`;
+    }
+    const previous = before.ok ? before.text : null;
+    const changed = !before.ok || before.truncated || before.text !== normalized.text;
+    // Through a randomly named temp created with O_EXCL beside the golden,
+    // then a rename: an interrupted write leaves the old golden in place
+    // rather than a truncated one that passes nothing, and a link planted at
+    // a temp name is never written through. An in-workspace link AT the
+    // golden is written through and stays a link, as editing a linked file
+    // does; one that leads out of the workspace is refused.
+    const written = writeFileSafe(root, at.rel, normalized.text, {
+      overwrite: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) return `GoldenUpdate wrote nothing: ${written.reason}`;
     return json({
       golden: at.rel,
       created: previous === null,
-      changed: previous !== normalized.text,
+      changed,
       bytes: Buffer.byteLength(normalized.text),
       normalized: normalized.applied,
     });
   },
 });
 
+/**
+ * One spelling for a path in a manifest and a path a caller asks about, so
+ * `./a.txt` (what `find . | xargs sha256sum` writes) and `a.txt` (what the
+ * walk and `files` produce) name the same entry instead of one missing and
+ * one unexpected.
+ */
+function manifestKey(rel: string): string {
+  return rel === "" ? rel : posix.normalize(rel);
+}
+
+/**
+ * What ChecksumVerify leaves out when it walks the workspace root with no
+ * exclude list: the version-control store and the installed dependencies. At
+ * a project root they are nearly every entry (a repo's 400 files became 13,000
+ * entries and a 2 MB manifest), and neither is what "has this project
+ * changed" means. Decided on the directory walked, not on whether the field
+ * was sent, so `{}` and `{directory: "."}` give one answer. Always echoed back
+ * in `excluded`; `exclude: []` walks everything.
+ */
+const DEFAULT_ROOT_EXCLUDE: ReadonlyArray<string> = [".git", "node_modules"];
+
+/**
+ * What a manifest records for one entry: a file's digest, or, for an entry
+ * that is not hashed, what it is. A link that leads to a directory, out of the
+ * workspace or nowhere, and a FIFO, socket or device, have no content this
+ * tool reads; recorded by kind and link text, an unchanged tree verifies
+ * against its own manifest (it could never be ok while every such entry was
+ * "unreadable" and then "unexpected"), and a link retargeted or a pipe
+ * swapped for a file is still a change.
+ */
+type Recorded =
+  | { readonly digest: string }
+  | { readonly kind: Exclude<FileKind, "file" | "directory">; readonly target?: string };
+
+/** One comparable string per recorded entry. */
+function recordedSignature(r: Recorded): string {
+  if ("digest" in r) return r.digest;
+  return r.target === undefined ? r.kind : `${r.kind} -> ${JSON.stringify(r.target)}`;
+}
+
+/**
+ * A manifest line. A digest line is what `sha256sum` writes; an entry that is
+ * not hashed is a `#` line, which `sha256sum -c` skips as a comment, with the
+ * path and link text JSON-quoted so no name can forge a line or a field.
+ */
+function manifestLine(rel: string, r: Recorded): string {
+  if ("digest" in r) return `${r.digest}  ${rel}`;
+  return `# ${r.kind} ${JSON.stringify(rel)}${r.target === undefined ? "" : ` -> ${JSON.stringify(r.target)}`}`;
+}
+
+const RECORDED_LINE =
+  /^# (symlink|fifo|socket|character-device|block-device|unknown) ("(?:[^"\\]|\\.)*")(?: -> ("(?:[^"\\]|\\.)*"))?$/;
+
+/** A `#` line of {@link manifestLine}, or undefined for any other comment. */
+function parseRecordedLine(line: string): { rel: string; signature: string } | undefined {
+  const m = RECORDED_LINE.exec(line);
+  if (m === null) return undefined;
+  try {
+    const rel = JSON.parse(m[2] as string) as string;
+    const target = m[3] === undefined ? undefined : (JSON.parse(m[3]) as string);
+    const kind = m[1] as Exclude<FileKind, "file" | "directory">;
+    return {
+      rel,
+      signature: recordedSignature(target === undefined ? { kind } : { kind, target }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What a named entry is, asked without following its last component: for a
+ * `files` entry the read refused, so a link or a pipe is recorded like the
+ * walk records it. `undefined` when nothing is there or it cannot be asked.
+ */
+function describeUnhashed(root: string, rel: string): Recorded | "absent" | undefined {
+  const at = resolveContained(root, rel, { followLeaf: false });
+  if (!at.ok) return undefined;
+  try {
+    const kind = fileKind(lstatSync(at.real));
+    if (kind === "file" || kind === "directory") return undefined;
+    return kind === "symlink" ? { kind, target: readlinkSync(at.real) } : { kind };
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined;
+  }
+}
+
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
+  // `files` from `directory`; left out, the whole directory is walked.
+  operativeArgs: [
+    { field: "files", kind: "path", within: "directory", default: ".", beneath: "all" },
+    { field: "manifest", kind: "path" },
+  ],
   description:
-    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and a file on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship.",
+    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that when the workspace root is walked with no exclude, its .git and node_modules are left out and listed as excluded. A link to a file in the workspace is hashed through, like sha256sum; any other link, and a FIFO, socket or device, is never opened and is recorded by kind and link text on a # line sha256sum skips. A walk that stops early is not ok.",
   inputSchema: z
     .object({
       directory: z.string().optional().describe("what to hash; defaults to the workspace root"),
@@ -297,7 +554,21 @@ export const checksumVerify: RegisteredTool = buildTool({
         .string()
         .optional()
         .describe("workspace-relative SHA256SUMS file to check against"),
-      files: z.array(z.string()).max(LIMITS.files).optional().describe("hash just these"),
+      files: z
+        .array(z.string())
+        .min(1)
+        .max(LIMITS.files)
+        .optional()
+        .describe(
+          "hash just these, and check the manifest for these entries only; its other entries are counted as notChecked",
+        ),
+      exclude: z
+        .array(z.string().min(1).max(1_024))
+        .max(64)
+        .optional()
+        .describe(
+          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded. When the directory is the workspace root and no exclude is given, .git and node_modules at the root are left out",
+        ),
       write: z
         .boolean()
         .optional()
@@ -307,74 +578,224 @@ export const checksumVerify: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
+    const root = workspaceRoot();
     const base = resolveSafe("ChecksumVerify", input.directory ?? ".");
-    const relatives =
-      input.files ??
-      (() => {
-        try {
-          return filesUnder(base.real);
-        } catch {
-          return [];
-        }
-      })();
+    const manifestAt =
+      input.manifest === undefined ? undefined : resolveSafe("ChecksumVerify", input.manifest);
+    const writing = input.manifest === undefined || input.write === true;
 
-    const digests = new Map<string, string>();
+    /** Every entry the manifest will list or is checked against, by path. */
+    const recorded = new Map<string, Recorded>();
     const unreadable: string[] = [];
-    for (const rel of relatives) {
-      try {
-        const at = resolveSafe("ChecksumVerify", join(input.directory ?? ".", rel));
-        digests.set(rel, sha256(readCapped(at.real, rel)));
-      } catch (err) {
-        unreadable.push(`${rel}: ${(err as Error).message}`);
+    /** Everything the walk found, hashable or not: what "unexpected" is measured against. */
+    const onDisk = new Set<string>();
+    /**
+     * With `files`, the entries this run is about. A manifest entry outside
+     * it is not checked (and counted as such), rather than reported missing
+     * while it sits on disk untouched.
+     */
+    const requested = input.files === undefined ? null : new Set<string>();
+    /** Requested files that are not on disk at all. */
+    const absent = new Set<string>();
+    const symlinks: Array<{ path: string; target: string }> = [];
+    let truncated = false;
+    const exclude =
+      input.exclude ??
+      (base.rel === "" && input.files === undefined ? DEFAULT_ROOT_EXCLUDE : undefined);
+    const excludedByDefault = input.exclude === undefined && exclude !== undefined;
+
+    /** Hash `rel` through to its file; `link` is recorded instead when that is not a file. */
+    const hash = (rel: string, link?: string): void => {
+      const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+      if (!read.ok && link !== undefined && read.code === "not-regular-file") {
+        // A link to a directory (every workspace package under
+        // node_modules/@scope is one) has no content to hash.
+        recorded.set(rel, { kind: "symlink", target: link });
+      } else if (!read.ok) {
+        unreadable.push(`${rel}: ${read.reason}`);
+      } else if (read.truncated) {
+        unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+      } else {
+        recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
+      }
+    };
+
+    if (requested !== null) {
+      for (const given of input.files ?? []) {
+        if (posix.isAbsolute(given)) {
+          unreadable.push(`${given}: an absolute path; files are relative to the directory`);
+          continue;
+        }
+        const rel = manifestKey(given);
+        if (requested.has(rel)) continue;
+        requested.add(rel);
+        // Read like every walked file: contained, never through a link that
+        // leads out, and a FIFO or device is refused instead of opened.
+        const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+        if (read.ok) {
+          onDisk.add(rel);
+          if (read.truncated) unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+          else recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
+          continue;
+        }
+        // Refused, or not there: a link that leads to a directory, out of
+        // the workspace or nowhere, or a pipe, is recorded as the walk
+        // records it, never opened.
+        const unhashed =
+          read.code === "not-found" ||
+          read.code === "not-regular-file" ||
+          read.code === "escapes-root"
+            ? describeUnhashed(root, joinRel(base.rel, rel))
+            : undefined;
+        if (unhashed === "absent" || (unhashed === undefined && read.code === "not-found")) {
+          absent.add(rel);
+          continue;
+        }
+        onDisk.add(rel);
+        if (unhashed === undefined) unreadable.push(`${rel}: ${read.reason}`);
+        else recorded.set(rel, unhashed);
+      }
+    } else {
+      const walk = integrityWalk(root, base.rel, {
+        ...(exclude === undefined ? {} : { exclude }),
+      });
+      if (!walk.ok) return `ChecksumVerify could not walk "${base.rel || "."}": ${walk.reason}`;
+      truncated = walk.truncated;
+      if (truncated) {
+        // Refused before any file is hashed: a partial manifest would later
+        // verify a partial tree, and a check of a partial walk is not ok
+        // whatever the hashes say, so hashing it all first only cost time.
+        return json({
+          directory: base.rel,
+          ...(writing ? { manifest: null } : { manifest: manifestAt?.rel, ok: false }),
+          truncated: true,
+          ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+          reason: `the directory holds more than the ${integrityLimits().maxEntries} entries (or ${integrityLimits().maxDepth} levels) one walk covers, so ${writing ? "no manifest was written" : "it could not be checked"} and nothing was hashed; narrow the directory or exclude part of it`,
+        });
+      }
+      for (const dir of walk.unreadableDirs)
+        unreadable.push(`${dir} (a directory that could not be listed)`);
+      // The manifest itself, when it sits inside the directory it describes,
+      // is neither listed in itself nor unexpected.
+      const self =
+        manifestAt === undefined
+          ? undefined
+          : base.rel === ""
+            ? manifestAt.rel
+            : manifestAt.rel.startsWith(`${base.rel}/`)
+              ? manifestAt.rel.slice(base.rel.length + 1)
+              : undefined;
+      for (const entry of walk.entries) {
+        if (entry.rel === self) continue;
+        onDisk.add(entry.rel);
+        if (entry.kind === "file") {
+          hash(entry.rel);
+        } else if (entry.kind === "symlink") {
+          const target = entry.link?.text ?? "";
+          symlinks.push({ path: entry.rel, target });
+          // A link is hashed as `sha256sum` would, through to its file, but
+          // only when that file is inside the workspace. One that leads out,
+          // or nowhere, is never read: it is recorded by its link text.
+          if (entry.link?.inside !== true || entry.link.dangling) {
+            recorded.set(entry.rel, { kind: "symlink", target });
+          } else {
+            hash(entry.rel, target);
+          }
+        } else if (entry.kind !== "directory") {
+          // A FIFO, socket or device: named, never opened.
+          recorded.set(entry.rel, { kind: entry.kind });
+        }
       }
     }
 
-    if (input.manifest === undefined || input.write === true) {
-      const body = [...digests.entries()].map(([rel, hash]) => `${hash}  ${rel}`).join("\n");
+    const walkReport = {
+      truncated,
+      ...(symlinks.length > 0 ? { symlinks } : {}),
+      ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+      ...(excludedByDefault
+        ? {
+            excludedNote:
+              "the workspace root was walked without its .git and node_modules; pass exclude: [] to walk everything",
+          }
+        : {}),
+    };
+
+    if (writing) {
+      for (const rel of absent) unreadable.push(`${rel}: does not exist`);
+      const body = [...recorded].map(([rel, r]) => manifestLine(rel, r)).join("\n");
+      let fileCount = 0;
+      for (const r of recorded.values()) if ("digest" in r) fileCount += 1;
       return json({
         directory: base.rel,
-        fileCount: digests.size,
+        fileCount,
+        ...(recorded.size > fileCount ? { recordedByKind: recorded.size - fileCount } : {}),
+        ...walkReport,
         unreadable,
         manifest: `${body}\n`,
       });
     }
 
-    const manifestAt = resolveSafe("ChecksumVerify", input.manifest);
+    const at = manifestAt as SafePath;
     let manifestText: string;
     try {
-      manifestText = readCapped(manifestAt.real, manifestAt.rel).toString("utf-8");
+      manifestText = readCapped(at.real, at.rel).toString("utf-8");
     } catch {
-      return `the manifest "${manifestAt.rel}" does not exist; run with write:true to produce one`;
+      return `the manifest "${at.rel}" does not exist; run with write:true to produce one`;
     }
     const expected = new Map<string, string>();
     for (const line of manifestText.split("\n")) {
-      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
-      if (m === null) continue;
-      expected.set((m[2] as string).trim(), (m[1] as string).toLowerCase());
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#")) {
+        const entry = parseRecordedLine(trimmed);
+        if (entry !== undefined) expected.set(manifestKey(entry.rel), entry.signature);
+        continue;
+      }
+      const entry = digestLine(trimmed);
+      if (entry === null) continue;
+      expected.set(manifestKey(entry.path.trim()), entry.digest.toLowerCase());
     }
 
     const mismatched: string[] = [];
     const missing: string[] = [];
     const unexpected: string[] = [];
+    let checked = 0;
     for (const [rel, want] of expected) {
-      const got = digests.get(rel);
-      if (got === undefined) missing.push(rel);
-      else if (got !== want) mismatched.push(rel);
+      if (requested !== null && !requested.has(rel)) continue;
+      checked += 1;
+      const got = recorded.get(rel);
+      // Listed and on disk but not hashable is in `unreadable` already.
+      if (got === undefined) {
+        if (!onDisk.has(rel)) missing.push(rel);
+      } else if (recordedSignature(got) !== want) mismatched.push(rel);
     }
-    for (const rel of digests.keys()) if (!expected.has(rel)) unexpected.push(rel);
+    for (const rel of onDisk) if (!expected.has(rel)) unexpected.push(rel);
+    // Asked for, not on disk, and not listed either: not "missing" (the
+    // manifest never promised it), but not a pass.
+    for (const rel of absent) {
+      if (!expected.has(rel))
+        unreadable.push(`${rel}: does not exist, and the manifest does not list it`);
+    }
 
     return json({
       directory: base.rel,
-      manifest: manifestAt.rel,
+      manifest: at.rel,
       // Each failure mode is separate: missing, changed and extra need
       // different action, and an extra file is how something ships that
-      // nobody meant to ship.
-      ok: mismatched.length === 0 && missing.length === 0 && unexpected.length === 0,
-      checked: expected.size,
+      // nobody meant to ship. Anything that could not be read, and a walk
+      // that stopped early, leave the answer open, so they are not ok.
+      ok:
+        mismatched.length === 0 &&
+        missing.length === 0 &&
+        unexpected.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
+      checked,
+      ...(requested === null ? {} : { notChecked: expected.size - checked }),
       mismatched,
       missing,
       unexpected,
       unreadable,
+      ...walkReport,
     });
   },
 });
@@ -414,8 +835,33 @@ export const acceptanceCheck: RegisteredTool = buildTool({
     .strict(),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const results = input.checks.map((check, index) => {
+  execute: async (input, ctx) => {
+    const regex = regexContext(ctx);
+    type CheckResult = {
+      index: number;
+      check: string;
+      ok: boolean;
+      detail: string;
+      undetermined?: true;
+    };
+    // One worker for every pattern in the call: a one-shot run starts its
+    // own, about 2 ms each, which made 150 checks take half a second.
+    const session = input.checks.some((c) => c.kind === "fileMatches")
+      ? openRegexSession()
+      : undefined;
+    const results: CheckResult[] = [];
+    try {
+      for (const [index, check] of input.checks.entries()) {
+        results.push(await runCheck(check, index));
+      }
+    } finally {
+      session?.close();
+    }
+
+    async function runCheck(
+      check: (typeof input.checks)[number],
+      index: number,
+    ): Promise<CheckResult> {
       const label = `${check.kind}(${check.path})`;
       let exists = false;
       let body: string | null = null;
@@ -427,7 +873,11 @@ export const acceptanceCheck: RegisteredTool = buildTool({
           body = readCapped(at.real, check.path).toString("utf-8");
         }
       } catch (err) {
-        if (err instanceof Error && /escapes the workspace/.test(err.message)) {
+        if (
+          err instanceof Error &&
+          (/escapes the workspace/.test(err.message) ||
+            (err instanceof ToolPermissionError && err.reason !== undefined))
+        ) {
           return { index, check: label, ok: false, detail: err.message };
         }
         exists = false;
@@ -465,22 +915,44 @@ export const acceptanceCheck: RegisteredTool = buildTool({
         default: {
           if (body === null)
             return { index, check: label, ok: false, detail: "the file could not be read" };
-          let re: RegExp;
-          try {
-            re = new RegExp(check.pattern, check.flags ?? "");
-          } catch (err) {
+          // The caller's pattern runs in a worker under a deadline, never on
+          // this thread; a check it cannot answer fails closed and says so,
+          // never "does not match".
+          if (body.length > MATCH_INPUT_CHARS) {
             return {
               index,
               check: label,
               ok: false,
-              detail: `invalid pattern: ${(err as Error).message}`,
+              undetermined: true,
+              detail: `could not verify: the file has ${body.length} characters, more than the ${MATCH_INPUT_CHARS} a pattern is run over`,
             };
           }
-          const hit = re.test(body);
+          const outcome = await (session as RegexSession).run({
+            op: "test",
+            pattern: check.pattern,
+            flags: check.flags ?? "",
+            input: body,
+            deadlineMs: MATCH_DEADLINE_MS,
+            maxInputChars: MATCH_INPUT_CHARS,
+            ...regex,
+          });
+          if (outcome.status === "rejected") {
+            return { index, check: label, ok: false, detail: `invalid pattern: ${outcome.reason}` };
+          }
+          if (outcome.status !== "ok") {
+            return {
+              index,
+              check: label,
+              ok: false,
+              undetermined: true,
+              detail: `could not verify: ${describeRegexOutcome(outcome)}`,
+            };
+          }
+          const hit = outcome.result.matched;
           return { index, check: label, ok: hit, detail: hit ? "" : "the pattern does not match" };
         }
       }
-    });
+    }
 
     const failed = results.filter((r) => !r.ok);
     return json({
@@ -494,8 +966,10 @@ export const acceptanceCheck: RegisteredTool = buildTool({
 
 export const markdownLinkCheck: RegisteredTool = buildTool({
   name: "MarkdownLinkCheck",
+  // The file, or the directory whose Markdown it reads; the walk skips hidden names.
+  operativeArgs: [{ field: "path", kind: "path", default: ".", beneath: "visible" }],
   description:
-    "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed.",
+    "Resolve every link in Markdown files against the filesystem and report the broken ones, including heading anchors. Use it before publishing docs. Links inside code blocks are ignored, because a path in an example is not a promise. External links are listed as UNCHECKED rather than fetched — a link checker that made requests would be a crawler, and would tell whoever is watching which documents are being reviewed. A heading anchor is checked only in the documents this call reads — the file given, or the Markdown its directory walk finds; an anchor into any other file is listed in anchorsUnchecked, its headings never read, so check a path that includes it.",
   inputSchema: z
     .object({
       path: z.string().optional().describe("a file or directory; defaults to the workspace root"),
@@ -516,8 +990,18 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
     const isDir = statSync(at.real).isDirectory();
     const docs = isDir ? filesUnder(at.real).filter((f) => /\.(md|mdx|markdown)$/i.test(f)) : [""];
     const root = isDir ? at.real : dirname(at.real);
+    // The documents this call reads, which the permission rule read too: the
+    // file given, or what the walk found (no hidden name, no link). A target
+    // anywhere else is checked for existence, but its headings are not read —
+    // reading them answered whether a file a rule denies carries a heading.
+    const checkedDocs = new Set(isDir ? docs.map((doc) => join(root, doc)) : [at.real]);
+    const anchorsUnchecked: Array<{ file: string; line: number; href: string; reason: string }> =
+      [];
 
     const broken: Array<{ file: string; line: number; href: string; reason: string }> = [];
+    // Anchors of each target document, computed once however many links
+    // point at it: fifty links into one README used to parse it fifty times.
+    const anchorsOf = new Map<string, Set<string>>();
     let checked = 0;
     let external = 0;
     const limit = input.limit ?? 500;
@@ -569,7 +1053,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
             href: link.href,
             reason:
               err instanceof ToolPermissionError
-                ? "the target is outside the workspace"
+                ? (err.reason ?? "the target is outside the workspace")
                 : `the target could not be resolved: ${(err as Error).message}`,
           });
           continue;
@@ -591,7 +1075,32 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           continue;
         }
         if (input.checkAnchors && fragment !== undefined && /\.(md|mdx|markdown)$/i.test(target)) {
-          const targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+          if (!checkedDocs.has(targetAt.real)) {
+            if (anchorsUnchecked.length < limit) {
+              anchorsUnchecked.push({
+                file: label,
+                line: link.line,
+                href: link.href,
+                reason: `"${targetAt.rel}" is not one of the documents this call reads, so its headings were not opened; check a path that includes it`,
+              });
+            }
+            continue;
+          }
+          let targetAnchors = anchorsOf.get(targetAt.real);
+          if (targetAnchors === undefined) {
+            try {
+              targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+            } catch (err) {
+              broken.push({
+                file: label,
+                line: link.line,
+                href: link.href,
+                reason: `the target could not be read: ${(err as Error).message}`,
+              });
+              continue;
+            }
+            anchorsOf.set(targetAt.real, targetAnchors);
+          }
           if (!targetAnchors.has(fragment.toLowerCase())) {
             broken.push({
               file: label,
@@ -614,6 +1123,7 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
       ok: broken.length === 0,
       broken: broken.slice(0, limit),
       truncated: broken.length >= limit,
+      ...(anchorsUnchecked.length > 0 ? { anchorsUnchecked } : {}),
       note: "external links are listed as unchecked, never fetched",
     });
   },
@@ -694,7 +1204,7 @@ function loadSource(
 ): { label: string; outcome: SourceOutcome } {
   // A Markdown definition may carry a title after the destination; it is not
   // part of the destination.
-  const destination = raw.replace(/\s+"[^"]*"\s*$/, "").trim();
+  const destination = withoutLinkTitle(raw).trim();
   // What the DOCUMENT wrote, for every answer that is about the citation
   // rather than about a file that was opened. A file that is opened is
   // reported by its workspace-relative path instead, below.
@@ -754,7 +1264,7 @@ function loadSource(
     if (err instanceof ToolPermissionError) {
       return {
         label: written,
-        outcome: { kind: "unreadable", reason: "it is outside the workspace" },
+        outcome: { kind: "unreadable", reason: err.reason ?? "it is outside the workspace" },
       };
     }
     return { label: written, outcome: { kind: "unreadable", reason: (err as Error).message } };
@@ -846,79 +1356,190 @@ type SourceFinding = {
   excerpt?: string;
 };
 
-/** Locate one claim's words in one source. */
-function checkOneSource(
-  label: string,
+/**
+ * What locating one claim in one source found, before it is told which
+ * source that was: the finding's fields after `reason`, in the order they
+ * are reported, and the reason as a function of the source's label.
+ */
+type Located = {
+  readonly status: Verdict;
+  readonly reason: (label: string) => string;
+  readonly detail: Omit<SourceFinding, "source" | "status" | "reason">;
+};
+
+/** A located claim, reported against the source it was located in. */
+function findingFor(label: string, located: Located): SourceFinding {
+  return {
+    source: label,
+    status: located.status,
+    reason: located.reason(label),
+    ...located.detail,
+  };
+}
+
+/**
+ * What one call has read, and what it found, kept for the whole call: a
+ * quotation or a claim's words located in a source are located there once,
+ * whichever claim asks. `words` counts every pass over a source at its full
+ * length, whether or not the pass stopped early.
+ */
+type Reading = {
+  words: number;
+  readonly found: Map<SourceIndex, Map<string, SpanAnswer | Located>>;
+};
+
+/** Where a quoted span first appears in a source, and if nowhere, what to report. */
+type SpanAnswer = { readonly at: number; readonly miss: Located | null };
+
+function knownIn(reading: Reading, index: SourceIndex): Map<string, SpanAnswer | Located> {
+  let known = reading.found.get(index);
+  if (known === undefined) {
+    known = new Map();
+    reading.found.set(index, known);
+  }
+  return known;
+}
+
+/** The key a quoted span is kept under. */
+const spanKey = (run: ReadonlyArray<string>): string => `q${JSON.stringify(run)}`;
+/** The key a claim's own words are kept under. */
+const wordsKey = (need: ReadonlyArray<string>): string => `w${JSON.stringify(need)}`;
+
+/** The most a claim can still read of `index`: what is not yet known there. */
+function readingBound(claim: PreparedClaim, index: SourceIndex, reading: Reading): number {
+  const known = reading.found.get(index);
+  const words = index.tokens.length;
+  if (claim.quotes.length === 0) return known?.has(claim.needKey) ? 0 : words;
+  // A span can take two passes: looking for it, and the nearest span when
+  // it is not there.
+  let bound = 0;
+  for (const { key } of claim.spans) if (!known?.has(key)) bound += 2 * words;
+  return bound;
+}
+
+/** One quoted span located in one source, once per call. */
+function locateSpan(
   index: SourceIndex,
-  claim: PreparedClaim,
-  windowTokens: number,
-): SourceFinding {
-  if (claim.quotes.length > 0) {
-    let worst: SourceFinding | null = null;
-    let firstHit = -1;
-    for (const run of claim.quotes) {
-      const at = findSequence(index, run);
-      if (at !== -1) {
-        if (firstHit === -1) firstHit = at;
-        continue;
-      }
-      // The quotation is not there word for word. A span that carries most of
-      // it is the useful answer — the caller needs to see what the source
-      // actually wrote — and a span that carries little of it is no answer at
-      // all, only a coincidence of vocabulary.
-      const distinct = [...new Set(run)];
-      const near = bestSpan(index, distinct, run.length);
-      const coverage = near.total === 0 ? 0 : near.matched / near.total;
-      const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
-      const finding: SourceFinding = enough
-        ? {
-            source: label,
-            status: "misquoted",
-            reason: `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
+  run: ReadonlyArray<string>,
+  key: string,
+  reading: Reading,
+): SpanAnswer {
+  const known = knownIn(reading, index);
+  const before = known.get(key) as SpanAnswer | undefined;
+  if (before !== undefined) return before;
+  const at = findSequence(index, run);
+  reading.words += index.tokens.length;
+  let miss: Located | null = null;
+  if (at === -1) {
+    // The quotation is not there word for word. A span that carries most of
+    // it is the useful answer — the caller needs to see what the source
+    // actually wrote — and a span that carries little of it is no answer at
+    // all, only a coincidence of vocabulary.
+    const distinct = [...new Set(run)];
+    const near = bestSpan(index, distinct, run.length);
+    reading.words += index.tokens.length;
+    const coverage = near.total === 0 ? 0 : near.matched / near.total;
+    const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
+    miss = enough
+      ? {
+          status: "misquoted",
+          reason: (label) =>
+            `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
+          detail: {
             coverage: Math.round(coverage * 100) / 100,
             missing: [...near.missing],
             differing: [...near.extra],
             line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
             excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
-          }
-        : {
-            source: label,
-            status: "notFound",
-            reason: `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
+          },
+        }
+      : {
+          status: "notFound",
+          reason: (label) =>
+            `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
+          detail: {
             coverage: Math.round(coverage * 100) / 100,
             missing: [...near.missing],
-          };
-      if (worst === null || VERDICT_RANK[finding.status] > VERDICT_RANK[worst.status]) {
-        worst = finding;
+          },
+        };
+  }
+  const answer: SpanAnswer = { at, miss };
+  known.set(key, answer);
+  return answer;
+}
+
+/**
+ * Locate one claim's words in one source.
+ *
+ * Nothing here depends on how the document spelled the source, so a claim
+ * citing one file under many markers locates its words there once, and a
+ * span or a claim's words already located in that file by any claim of the
+ * call are not located again. For a quotation, once one span is not in the
+ * source at all nothing later can change the answer — `notFound` outranks a
+ * misquote — so the rest are not read.
+ */
+function locate(
+  index: SourceIndex,
+  claim: PreparedClaim,
+  windowTokens: number,
+  reading: Reading,
+): Located {
+  if (claim.quotes.length > 0) {
+    let worst: Located | null = null;
+    let firstHit = -1;
+    // Each different span once, in the order first quoted.
+    for (const { run, key } of claim.spans) {
+      const { at, miss } = locateSpan(index, run, key, reading);
+      if (miss === null) {
+        if (firstHit === -1) firstHit = at;
+        continue;
       }
+      if (worst === null || VERDICT_RANK[miss.status] > VERDICT_RANK[worst.status]) {
+        worst = miss;
+      }
+      if (worst.status === "notFound") break;
     }
     if (worst !== null) return worst;
     const last = firstHit + (claim.quotes[0] as ReadonlyArray<string>).length - 1;
     return {
-      source: label,
       status: "supported",
-      reason: `the quoted words appear in "${label}", in order`,
-      coverage: 1,
-      line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
-      excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
+      reason: (label) => `the quoted words appear in "${label}", in order`,
+      detail: {
+        coverage: 1,
+        line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
+        excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
+      },
     };
   }
 
+  const known = knownIn(reading, index);
+  const before = known.get(claim.needKey) as Located | undefined;
+  if (before !== undefined) return before;
+  const located = locateWords(index, claim, windowTokens);
+  reading.words += index.tokens.length;
+  known.set(claim.needKey, located);
+  return located;
+}
+
+/** A claim with no quotation, located in one source by its words. */
+function locateWords(index: SourceIndex, claim: PreparedClaim, windowTokens: number): Located {
   const span = bestSpan(index, claim.need, windowTokens);
   const coverage = span.total === 0 ? 0 : Math.round((span.matched / span.total) * 100) / 100;
   if (span.matched < span.total) {
     return {
-      source: label,
       status: "notFound",
-      reason: `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
-      coverage,
-      missing: [...span.missing],
-      ...(span.firstToken === -1
-        ? {}
-        : {
-            line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
-            excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
-          }),
+      reason: (label) =>
+        `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
+      detail: {
+        coverage,
+        missing: [...span.missing],
+        ...(span.firstToken === -1
+          ? {}
+          : {
+              line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
+              excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
+            }),
+      },
     };
   }
   const line = lineOf(index, (index.tokens[span.firstToken] as SourceToken).at);
@@ -929,38 +1550,52 @@ function checkOneSource(
     // words can honestly get, and it is reported as something to read rather
     // than as a contradiction found.
     return {
-      source: label,
       status: "polarityConflict",
-      reason: `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
-      coverage: 1,
-      differing: [...span.extraNegations],
-      line,
-      excerpt,
+      reason: (label) =>
+        `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
+      detail: {
+        coverage: 1,
+        differing: [...span.extraNegations],
+        line,
+        excerpt,
+      },
     };
   }
   return {
-    source: label,
     status: "supported",
-    reason: `every word of the claim is in one span of "${label}"`,
-    coverage: 1,
-    line,
-    excerpt,
+    reason: (label) => `every word of the claim is in one span of "${label}"`,
+    detail: { coverage: 1, line, excerpt },
   };
 }
 
 type PreparedClaim = {
   readonly text: string;
   readonly need: ReadonlyArray<string>;
+  /** The key the claim's words are kept under for the call. */
+  readonly needKey: string;
   readonly quotes: ReadonlyArray<ReadonlyArray<string>>;
+  /** The different quoted spans, in the order first quoted, with their keys. */
+  readonly spans: ReadonlyArray<{ readonly run: ReadonlyArray<string>; readonly key: string }>;
   readonly mode: "quote" | "paraphrase";
 };
 
 function prepareClaim(text: string): PreparedClaim {
   const quotes = quotedRuns(text, QUOTE_MIN_TOKENS);
+  const need = contentTokens(text);
+  const spans: Array<{ run: ReadonlyArray<string>; key: string }> = [];
+  const keys = new Set<string>();
+  for (const run of quotes) {
+    const key = spanKey(run);
+    if (keys.has(key)) continue;
+    keys.add(key);
+    spans.push({ run, key });
+  }
   return {
     text,
-    need: contentTokens(text),
+    need,
+    needKey: wordsKey(need),
     quotes,
+    spans,
     // An attributed quotation is the strictest promise a citation makes, so
     // when there is one it is what gets verified; the words around it are the
     // author's framing, not the source's.
@@ -1016,6 +1651,7 @@ export const factCrossCheck: RegisteredTool = buildTool({
     const windowTokens = input.windowTokens ?? 60;
     const limit = input.limit ?? LIMITS.claims;
     const cache = new Map<string, SourceOutcome>();
+    const reading: Reading = { words: 0, found: new Map() };
 
     // Where a source path is measured from. A document's citations are
     // written relative to the document; a caller's are relative to the
@@ -1111,6 +1747,33 @@ export const factCrossCheck: RegisteredTool = buildTool({
       if (prepared.need.length === 0 && prepared.quotes.length === 0) {
         return settle("unchecked", "the claim has no words to look for");
       }
+      const quoted = prepared.spans.length;
+      if (quoted > LIMITS.quotedSpans) {
+        return settle(
+          "unchecked",
+          `the claim quotes ${quoted} different spans; at most ${LIMITS.quotedSpans} are checked in one claim, so split it into claims that quote fewer`,
+        );
+      }
+
+      const loaded = claim.cites.map((raw) => loadSource(raw, baseAbs, cache));
+      // What locating the claim could still read, over each source it cites
+      // once however many times it cites it. Past what the call has left,
+      // the claim is not checked in part: it is reported, unread.
+      let bound = 0;
+      const bounded = new Set<SourceIndex>();
+      for (const { outcome } of loaded) {
+        if (outcome.kind !== "index" || bounded.has(outcome.index)) continue;
+        bounded.add(outcome.index);
+        bound += readingBound(prepared, outcome.index, reading);
+      }
+      if (reading.words + bound > READ_BUDGET.words) {
+        return settle(
+          "unchecked",
+          bound > READ_BUDGET.words
+            ? `checking it could read ${bound} words of its sources, more than the ${READ_BUDGET.words} one call may read; cite smaller sources, or quote fewer spans`
+            : `checking it could read ${bound} more words of its sources, and this call has read ${reading.words} of the ${READ_BUDGET.words} one call may; check it in a separate call`,
+        );
+      }
 
       const sources: SourceFinding[] = [];
       // A marker the document never defines has nothing behind it to read.
@@ -1123,10 +1786,19 @@ export const factCrossCheck: RegisteredTool = buildTool({
           reason: `marker [${marker}] has no source behind it — that is CitationLint's finding`,
         });
       }
-      for (const raw of claim.cites) {
-        const { label, outcome } = loadSource(raw, baseAbs, cache);
+      // A source cited under many markers, or under many spellings of its
+      // path, is one index: the claim is located there once, and what its
+      // words found is kept for the call. Doing it per cite read the whole
+      // source again for every marker.
+      const located = new Map<SourceIndex, Located>();
+      for (const { label, outcome } of loaded) {
         if (outcome.kind === "index") {
-          sources.push(checkOneSource(label, outcome.index, prepared, windowTokens));
+          let found = located.get(outcome.index);
+          if (found === undefined) {
+            found = locate(outcome.index, prepared, windowTokens, reading);
+            located.set(outcome.index, found);
+          }
+          sources.push(findingFor(label, found));
         } else {
           sources.push({
             source: label,
@@ -1406,7 +2078,9 @@ function readCorpus(given: string, pageReal: string | undefined): CorpusRead {
       kind: "unusable",
       reason:
         err instanceof ToolPermissionError
-          ? `the corpus path "${given}" is outside the workspace`
+          ? err.reason !== undefined
+            ? err.message
+            : `the corpus path "${given}" is outside the workspace`
           : `the corpus path "${given}" could not be resolved: ${(err as Error).message}`,
     };
   }
@@ -1514,8 +2188,13 @@ async function trigramSimilarity(a: string, b: string): Promise<number> {
 
 export const seoLint: RegisteredTool = buildTool({
   name: "SeoLint",
+  // The page, and the corpus directory whose pages it reads.
+  operativeArgs: [
+    { field: "file", kind: "path" },
+    { field: "corpus", kind: "path", beneath: "visible" },
+  ],
   description:
-    "Gate a page on the on-page SEO and readability checks that have a right answer offline: title and description lengths, heading hierarchy, image alt and anchor-text coverage, keyword placement and density, JSON-LD shape and the fields a rich result needs, canonical and OpenGraph consistency, slug shape, and near-duplicate text against a corpus. Use it before publishing. Three of these cannot be answered exactly, and each says so rather than pretending: readability is reported as a BAND and never as a number, because the syllable count behind Flesch-Kincaid is a heuristic and a decimal invites tuning prose against its bugs; keyword density DISABLES ITSELF for Chinese, Japanese, Thai and the other languages written without spaces between words, where a whitespace tokenizer is meaningless; and the near-duplicate check reports NOT CHECKED when no corpus is configured, rather than passing. JSON-LD is checked against rules bundled offline for the common types; any other @type is named as NOT CHECKED, never called valid. Everything a run did not look at is listed with a reason, in one of two places, because they mean opposite things: notChecked is what was asked for and could not be answered, and it makes ok false — a gate that passes on a check it was asked to make and could not is worse than no gate. notRequested is what nobody asked for, such as a keyword or a corpus you did not pass; it is named, it never counts as passed, and it does not make ok false, because a gate that fails every clean page is a gate nobody reads. So ok means nothing failed and everything this run was asked to look at was looked at — read notRequested to see what it did not cover.",
+    "Gate a page on the SEO and readability checks that have a right answer offline: title and meta lengths, headings, image alt and anchor text, keyword placement and density, JSON-LD and rich-result fields, canonical and OpenGraph consistency, slug shape, and near-duplicate text against a corpus. Use it before publishing. What cannot be answered exactly says so: readability is a BAND, never a number; keyword density switches off for languages written without spaces (Chinese, Japanese, Thai); an unfamiliar JSON-LD @type, and the near-duplicate check with no corpus, are NOT CHECKED, never passed. Everything a run did not look at is listed with a reason: under notChecked when it was asked for and could not be answered (ok is false whenever something you asked for lands there), and under notRequested when nobody asked, such as a keyword or corpus you did not pass (named, never counted as passed, and it leaves ok alone). So ok means nothing failed and everything asked for was looked at.",
   inputSchema: z
     .object({
       html: z.string().max(LIMITS.textChars).optional().describe("the page markup"),

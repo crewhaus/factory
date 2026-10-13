@@ -66,12 +66,14 @@ import { createMemoryStore } from "@crewhaus/memory-store";
 import { MAX_MEMORY_ITEMS, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readJsonlCapped, readTextCapped } from "./jsonl";
+import { checkboxParts } from "./line-parts";
 import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, requireBoolean, requireString, requireTypedConfirm } from "./m3";
 import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 import { SCAFFOLDED_WORKFLOWS, scaffoldedWorkflowPath } from "./scaffolded-workflows";
 import { readSpecYaml } from "./schedulers";
+import { keyedScalar } from "./spec-lines";
 
 // ---------------------------------------------------------------------------
 // shared helpers (wiki-ops.ts and watchme-ops.ts import these)
@@ -252,13 +254,14 @@ export function specDeclares(yamlText: string, key: string): boolean {
   return new RegExp(`^${key}\\s*:`, "m").test(yamlText);
 }
 
-/** The scalar for `key:` inside a block. Quotes stripped, `# comment` dropped. */
+/** The scalar for `key:` inside a block. Quotes stripped, `# comment` dropped.
+ *  Read by a scan (spec-lines.ts), not `^\s*key\s*:\s*(.*)$`, which was
+ *  quadratic in a run of spaces on a line holding a U+2028. */
 export function specScalar(block: readonly string[], key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`);
   for (const line of block) {
-    const m = line.match(re);
-    if (m === null) continue;
-    let value = (m[1] ?? "").trim();
+    const raw = keyedScalar(line, key);
+    if (raw === undefined) continue;
+    let value = raw.trim();
     if (value === "" || value.startsWith("#")) continue;
     const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : undefined;
     if (quote !== undefined && value.length >= 2 && value.endsWith(quote)) {
@@ -1147,9 +1150,9 @@ function latestExamRun(ctx: M3Context, dataset: string): ExamRun | null {
 export function curriculumRungs(text: string): Array<{ text: string; done: boolean }> {
   const out: Array<{ text: string; done: boolean }> = [];
   for (const line of text.split("\n")) {
-    const m = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.*)$/);
-    if (m === null) continue;
-    out.push({ done: (m[1] ?? " ").toLowerCase() === "x", text: maskText((m[2] ?? "").trim()) });
+    const parts = checkboxParts(line);
+    if (parts === null) continue;
+    out.push({ done: parts[0].toLowerCase() === "x", text: maskText(parts[1].trim()) });
   }
   return out;
 }

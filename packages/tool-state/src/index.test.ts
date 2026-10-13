@@ -47,6 +47,7 @@ import {
   stateExport,
   stateImport,
 } from "./index";
+import { statePath as joinUnderState, stateRoot } from "./store";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -1203,4 +1204,55 @@ describe("determinism", () => {
     await run(kvGet, { namespace: "n", key: "k", stateDir: "lazy" });
     expect(readdirSync(tmp)).not.toContain("lazy");
   });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — Bun's `path.join` keeps only (argument count mod 65,536) of
+ * its arguments, and `statePath` passed one argument per segment. StateImport
+ * takes its segments from the document, so an entry 65,539 segments deep
+ * below `kv/ns/victim.json` was written into `victim.json` itself: Bun kept
+ * the root and the first three segments. The joined path must be the whole
+ * path at every count.
+ *
+ * Each size is one walk over 131 KB of path (the containment check), so each
+ * test declares a budget (house rule); nothing here is timed.
+ */
+describe("a document entry 65,535 to 65,537 segments deep", () => {
+  const deepRel = (segments: number) =>
+    `kv/ns/victim.json/${Array.from({ length: segments - 3 }, () => "a").join("/")}`;
+  // A failure prints this, not two 131 KB strings.
+  const brief = (s: string) => ({ length: s.length, end: s.slice(-24) });
+  const seedVictim = () => {
+    mkdirSync(statePath("kv", "ns"), { recursive: true });
+    writeFileSync(statePath("kv", "ns", "victim.json"), "keep");
+  };
+
+  for (const n of [65_535, 65_536, 65_537]) {
+    test(`${n} segments: statePath names the whole path`, () => {
+      seedVictim();
+      const root = stateRoot("StateImport", undefined);
+      const rel = deepRel(n);
+      const joined = joinUnderState("StateImport", root, ...rel.split("/"));
+      expect(brief(joined)).toEqual(brief(path.join(root.abs, rel)));
+      expect(joined === path.join(root.abs, rel)).toBe(true);
+    }, 120_000);
+  }
+
+  test("StateImport does not write a deep entry into the file above it", async () => {
+    seedVictim();
+    try {
+      await stateImport.execute({
+        document: {
+          version: 1,
+          files: [{ path: deepRel(65_539), encoding: "utf8", content: "replaced" }],
+        },
+      });
+    } catch {
+      // The OS refuses a path this long; that is not what is checked here.
+    }
+    expect(readFileSync(statePath("kv", "ns", "victim.json"), "utf8")).toBe("keep");
+    expect(readdirSync(statePath("kv", "ns"))).toEqual(["victim.json"]);
+  }, 120_000);
 });

@@ -8,7 +8,8 @@
     { "path": "../errors" },
     { "path": "../tenancy" },
     { "path": "../tool-catalog" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

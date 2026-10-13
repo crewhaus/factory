@@ -55,7 +55,7 @@ import {
   imageStats,
   resizeImage,
 } from "./lib/imageops";
-import { findExifSegment, parseExif, readJpegSegments, stripJpegMetadata } from "./lib/jpeg";
+import { inspectJpegMetadata, stripJpegMetadata } from "./lib/jpeg";
 import {
   DEFAULT_DECODE_LIMITS,
   type PngColorType,
@@ -158,6 +158,8 @@ function readWhole(
   const path = resolveSafe(toolName, rel);
   const stats = statSync(path.real);
   if (stats.isDirectory()) throw new ToolInputError(`"${rel}" is a directory, not a file`);
+  // Opening a FIFO blocks until something writes to it; a device may never end.
+  if (!stats.isFile()) throw new ToolInputError(`"${rel}" is not a regular file`);
   if (stats.size > maxBytes) {
     throw new ToolInputError(
       `"${rel}" is ${stats.size} bytes, over the ${maxBytes}-byte limit for this tool`,
@@ -190,6 +192,7 @@ function readHead(
   const path = resolveSafe(toolName, rel);
   const stats = statSync(path.real);
   if (stats.isDirectory()) throw new ToolInputError(`"${rel}" is a directory, not a file`);
+  if (!stats.isFile()) throw new ToolInputError(`"${rel}" is not a regular file`);
   const want = Math.min(window, stats.size);
   const fd = openSync(path.real, "r");
   try {
@@ -405,44 +408,140 @@ export const pngRead: RegisteredTool = buildTool({
 export const exifRead: RegisteredTool = buildTool({
   name: "ExifRead",
   description:
-    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at.",
+    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too, and so does GPS written in XMP; when it cannot tell, hasGps is null with the reason.",
   inputSchema: z.object({ path: pathField.describe("a JPEG inside the workspace") }),
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) =>
     attempt(() => {
-      const { path, bytes } = readHead("ExifRead", input.path);
+      // The whole file, not a head window: GPS can sit between scans or in
+      // an appended image, and "no GPS" must not be said about bytes that
+      // were never read. A file past the read limit is read as far as the
+      // limit and answered from that, with GPS undetermined unless found.
+      const { path, bytes, size } = readHead("ExifRead", input.path, MAX_FILE_BYTES);
+      const partial = bytes.length < size;
       const kind = detectKind(bytes);
       if (kind?.kind !== "jpeg") {
         throw new ToolInputError(
           `"${input.path}" is ${kind === undefined ? "not a recognised format" : kind.kind}; EXIF reading here covers JPEG only`,
         );
       }
-      const { segments } = readJpegSegments(bytes);
-      const segment = findExifSegment(segments);
-      if (segment === undefined) {
-        return json({
-          path: path.rel,
-          hasExif: false,
-          hasGps: false,
-          note: "no APP1 EXIF segment; the file carries no EXIF metadata this reader can see",
-          metadataSegments: segments
-            .filter((s) => s.marker >= 0xe0 && s.marker <= 0xef)
-            .map((s) => s.name)
-            .sort(),
-        });
+      const report = inspectJpegMetadata(bytes);
+      // The main image's own EXIF: never a block found after it.
+      const primary = report.exifBlocks.find(
+        (b) => b.where === "before the first scan" || b.where === "between scans",
+      );
+      const withGps = report.exifBlocks.filter((b) => b.exif?.hasGps === true);
+      const unreadableBlocks = report.exifBlocks.filter((b) => b.exif === null);
+      // XMP and Photoshop resources are read for a location; a segment this
+      // reader does not parse (a C2PA manifest in APP11, a vendor APPn) may
+      // hold one, so it leaves "no GPS" undetermined, as an unparsed EXIF
+      // block does.
+      const locatedElsewhere = report.otherMetadata.filter((m) => m.location === true);
+      const notRead = report.otherMetadata.filter((m) => m.location === null);
+      // GPS found anywhere is a definite yes. No GPS is a definite no only
+      // when every byte was read, every EXIF block parsed, and every byte
+      // after the image accounted for by an appended image that was walked.
+      const unknowns: string[] = [];
+      if (partial) {
+        unknowns.push(
+          `only the first ${bytes.length} of the file's ${size} bytes were read, the most this tool reads`,
+        );
       }
-      const exif = parseExif(segment.payload);
-      return json({
-        path: path.rel,
-        hasExif: true,
-        ...exif,
-        ...(exif.hasGps
+      if (report.breaksOffAt !== undefined) {
+        // A walk that broke off has no trailer: its unaccounted bytes are
+        // the part after the break.
+        unknowns.push(
+          `the file breaks off at offset ${report.breaksOffAt.offset} (${report.breaksOffAt.reason}), and the ${bytes.length - report.breaksOffAt.offset} bytes from there could not be walked`,
+        );
+      } else if (report.unaccountedBytes > 0) {
+        unknowns.push(
+          `${report.unaccountedBytes} bytes after the image that no walk accounts for (${report.trailingKind ?? "unrecognised data"}) were searched for EXIF blocks but not parsed, and may carry a location`,
+        );
+      }
+      if (report.embeddedImagesNotInspected > 0) {
+        unknowns.push(`${report.embeddedImagesNotInspected} more appended images were not walked`);
+      }
+      if (unreadableBlocks.length > 0)
+        unknowns.push("an EXIF block in the file could not be parsed");
+      if (notRead.length > 0) {
+        const named = notRead
+          .slice(0, 8)
+          .map((m) => `${m.segment} at offset ${m.offset}`)
+          .join(", ");
+        const more = notRead.length > 8 ? ` and ${notRead.length - 8} more` : "";
+        unknowns.push(`metadata this reader does not parse may carry a location: ${named}${more}`);
+      }
+      const found = withGps.length > 0 || locatedElsewhere.length > 0;
+      const undetermined = !found && unknowns.length > 0;
+      const hasGps = found ? true : undetermined ? null : false;
+      const where = {
+        ...(partial ? { bytesRead: bytes.length, fileBytes: size } : {}),
+        trailingBytes: report.trailingBytes,
+        ...(report.trailingKind === undefined ? {} : { trailingKind: report.trailingKind }),
+        embeddedImages: report.embeddedImages,
+        interScanMetadataSegments: report.interScanMetadataSegments,
+        ...(report.eoiMissing && !partial ? { eoiMissing: true } : {}),
+        ...(report.breaksOffAt === undefined ? {} : { breaksOffAt: report.breaksOffAt.offset }),
+        ...(report.unaccountedBytes > 0 ? { unaccountedBytes: report.unaccountedBytes } : {}),
+        ...(report.exifBlocks.length > 1 ||
+        (report.exifBlocks.length === 1 && primary === undefined)
+          ? {
+              exifBlocks: report.exifBlocks.map((b) => ({
+                where: b.where,
+                offset: b.offset,
+                hasGps: b.exif?.hasGps ?? null,
+                ...(b.exif?.gps === undefined ? {} : { gps: b.exif.gps }),
+                ...(b.unreadable === undefined ? {} : { unreadable: b.unreadable }),
+              })),
+            }
+          : {}),
+        ...(locatedElsewhere.length > 0
+          ? {
+              gpsInOtherMetadata: locatedElsewhere.map((m) => ({
+                segment: m.segment,
+                where: m.where,
+                offset: m.offset,
+              })),
+            }
+          : {}),
+        ...(undetermined ? { gpsUndetermined: unknowns.join("; ") } : {}),
+        ...(report.trailingKind?.startsWith("an appended video") === true
+          ? {
+              videoNote:
+                "the appended video is not read here and may carry its own location; ExifStrip removes it",
+            }
+          : {}),
+      };
+      const privacy =
+        hasGps === true
           ? {
               privacyWarning:
                 "this file records where it was taken; publishing it publishes that location. ExifStrip removes it.",
             }
-          : {}),
+          : {};
+      if (primary === undefined || primary.exif === null) {
+        return json({
+          path: path.rel,
+          hasExif: report.exifBlocks.length > 0,
+          hasGps,
+          ...(report.exifBlocks.length === 0
+            ? {
+                note: "no APP1 EXIF segment; the file carries no EXIF metadata this reader can see",
+              }
+            : {}),
+          metadataSegments: report.metadataSegments,
+          ...where,
+          ...privacy,
+        });
+      }
+      return json({
+        path: path.rel,
+        hasExif: true,
+        ...primary.exif,
+        hasGps,
+        ...where,
+        ...privacy,
       });
     }),
 });
@@ -511,6 +610,7 @@ const colorTypeField = z
 
 export const pngWrite: RegisteredTool = buildTool({
   name: "PngWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Encode raw RGBA pixels as a valid PNG file, choosing the smallest lossless colour type by default. Use to write out an image a tool or a script has computed pixel by pixel, without adding an image library to the project.",
   inputSchema: z.object({
@@ -559,6 +659,10 @@ export const pngWrite: RegisteredTool = buildTool({
 
 export const imageResize: RegisteredTool = buildTool({
   name: "ImageResize",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Resize a PNG to a new size and write it out as a PNG, stating the resampling method used. Use to produce a thumbnail or a fixed-width asset; pass only a width or only a height to keep the aspect ratio.",
   inputSchema: z.object({
@@ -612,6 +716,10 @@ export const imageResize: RegisteredTool = buildTool({
 
 export const imageCrop: RegisteredTool = buildTool({
   name: "ImageCrop",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Cut a rectangle out of a PNG and write it out as a PNG. Use to isolate a region of a screenshot — the part a diff flagged, or one panel of a wider capture — before comparing or reading it.",
   inputSchema: z.object({
@@ -645,8 +753,12 @@ export const imageCrop: RegisteredTool = buildTool({
 
 export const exifStrip: RegisteredTool = buildTool({
   name: "ExifStrip",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
-    "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality.",
+    "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality. Metadata between scans is removed too, and so is anything appended after the image (a preview, gain map or motion-photo video, each of which can carry its own location).",
   inputSchema: z.object({
     path: pathField.describe("the source JPEG"),
     output: pathField.describe("where to write the stripped JPEG"),
@@ -679,7 +791,18 @@ export const exifStrip: RegisteredTool = buildTool({
         bytesAfter: result.bytes.length,
         bytesRemoved: result.bytesRemoved,
         removed: result.removed,
-        note: "the entropy-coded scan data was copied verbatim; the picture is unchanged",
+        trailingBytesRemoved: result.trailingBytesRemoved,
+        ...(result.trailingKind === undefined ? {} : { trailingKind: result.trailingKind }),
+        ...(result.eoiMissing ? { eoiMissing: true } : {}),
+        ...(result.breaksOffAt === undefined ? {} : { breaksOffAt: result.breaksOffAt.offset }),
+        note:
+          result.breaksOffAt !== undefined
+            ? `the file breaks off at offset ${result.breaksOffAt.offset} (${result.breaksOffAt.reason}); the scan data up to there was copied verbatim, and the cut-off part after it was ${result.removed.some((r) => r.name.endsWith("(cut off)")) ? "a metadata segment, and was dropped" : "kept as it was"}`
+            : result.trailingBytesRemoved > 0
+              ? `the main image's scan data was copied verbatim, so that picture is unchanged; the ${result.trailingBytesRemoved} bytes after its end-of-image marker were dropped with any metadata in them: ${result.trailingKind}`
+              : result.eoiMissing
+                ? "the scan data was copied verbatim; the file has no end-of-image marker, so it was walked to its end and kept as it was"
+                : "the entropy-coded scan data was copied verbatim; the picture is unchanged",
       });
     }),
 });
@@ -689,6 +812,7 @@ export const exifStrip: RegisteredTool = buildTool({
 
 export const qrEncode: RegisteredTool = buildTool({
   name: "QrEncode",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Generate a QR code from text, as a PNG file or as a text matrix, with a chosen error-correction level. Use to turn a URL, a Wi-Fi string or a payload into a scannable code without a service call; versions 1 to 10 are supported, which is up to 271 bytes at level L.",
   inputSchema: z.object({
@@ -774,6 +898,7 @@ export const qrEncode: RegisteredTool = buildTool({
 
 export const barcodeEncode: RegisteredTool = buildTool({
   name: "BarcodeEncode",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Generate a Code 128 or EAN-13 barcode, as a PNG file or as the raw module pattern, computing the check digit. Use for a label, a product code or an asset tag; EAN-13 accepts twelve digits and computes the thirteenth, or thirteen and verifies it.",
   inputSchema: z.object({
@@ -885,6 +1010,7 @@ function emitSvg(
 
 export const chartRender: RegisteredTool = buildTool({
   name: "ChartRender",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Render bar, line, scatter or pie data as an SVG chart with axes, ticks, labels and a legend. Use to turn a query result or a metric series into a picture for a report; the layout is fixed arithmetic, so the same data always produces the same bytes.",
   inputSchema: z.object({
@@ -992,6 +1118,7 @@ export const sparklineRender: RegisteredTool = buildTool({
 
 export const diagramRender: RegisteredTool = buildTool({
   name: "DiagramRender",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Render a node and edge list as a box-and-arrow SVG diagram with a layered layout. Use for a pipeline, a state machine or a service sketch; nodes are placed by layer and declaration order, so the same graph always draws the same, and edges that close a cycle are drawn dashed and reported.",
   inputSchema: z.object({
@@ -1175,6 +1302,7 @@ export const subtitleParse: RegisteredTool = buildTool({
 
 export const subtitleWrite: RegisteredTool = buildTool({
   name: "SubtitleWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write cues out as SRT or WebVTT, optionally shifting every time and re-wrapping the text. Use to fix a track that runs early or late, to convert between the two formats, or to re-wrap long lines to a readable width.",
   inputSchema: z.object({
@@ -1238,6 +1366,7 @@ export const subtitleWrite: RegisteredTool = buildTool({
 
 export const mediaProbe: RegisteredTool = buildTool({
   name: "MediaProbe",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Probe an audio or video file with ffprobe and return its duration, streams, codecs, resolution and bitrate as structured data. Use to learn what a media file actually contains before transcoding or embedding it; ffprobe must be installed, and the tool says so plainly when it is not.",
   inputSchema: z.object({
@@ -1251,10 +1380,12 @@ export const mediaProbe: RegisteredTool = buildTool({
       .describe(`milliseconds before ffprobe is killed; default ${DEFAULT_PROCESS_TIMEOUT_MS}`),
   }),
   // NOT `readOnly`. ffprobe only reads, but `readOnly` is what the
-  // permission engine auto-allows in `plan` mode, and a plan must not spawn
-  // anything: every other process-spawning tool in this repo (tool-bash,
-  // tool-proc) makes the same call. `destructive` stays false, because
-  // nothing this runs can change a file.
+  // permission engine auto-allows in `plan` mode, and this tool keeps a plan
+  // from spawning it. (Not every spawning tool makes that call: the git
+  // readers and system probes are read-only because the program they run is
+  // fixed by the tool, not supplied by the workspace — the rule, and the list
+  // it allows, are in apps/cli/src/flag-rules.test.ts.) `destructive` stays
+  // false, because nothing this runs can change a file.
   // Spawning a process crosses a boundary the runtime cannot re-classify
   // afterwards, so this declares both the policy and the capability.
   scope: "external",

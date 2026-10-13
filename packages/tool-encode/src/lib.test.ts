@@ -1068,6 +1068,19 @@ describe("slugify", () => {
     expect(slugify("Hello World", { separator: "_" }).slug).toBe("hello_world");
   });
 
+  test("a separator or replacement is text, never a replacement pattern", () => {
+    // As String.replace replacement strings, `$&` put the punctuation back
+    // ("hello, world!") and `$'`/`` $` `` spliced in the rest of the input.
+    expect(slugify("Hello, World!", { separator: "$&" }).slug).toBe("hello$&world");
+    expect(slugify("Hello, World!", { separator: "$'" }).slug).toBe("hello$'world");
+    expect(slugify("a/../b", { separator: "$&" }).slug).toBe("a$&b");
+    // The replacement goes through the ordinary pipeline as the text it is
+    // ("$" folds to "usd"); expanded, `$\`` had made "tom-tom-jerry".
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$`" } }).slug).toBe("tom-usd-jerry");
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$'" } }).slug).toBe("tom-usd-jerry");
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$$" } }).slug).toBe("tom-usdusd-jerry");
+  });
+
   test("keeps case when asked to", () => {
     expect(slugify("Hello World", { lowercase: false }).slug).toBe("Hello-World");
   });
@@ -1233,5 +1246,16 @@ describe("keccak256, against published vectors", () => {
       expect({ length, hex: keccak256Hex("a".repeat(length)).length }).toEqual({ length, hex: 64 });
     }
     expect(keccak256Hex("a".repeat(136))).not.toBe(keccak256Hex("a".repeat(137)));
+  });
+});
+
+describe("a UUID namespace name is looked up in its own table only", () => {
+  test("a prototype member's name is refused as not a UUID, not a crash", async () => {
+    // UUID_NAMESPACES["constructor"] read Object, and parseUuid threw
+    // "text.trim is not a function".
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      await expect(uuidNamed(5, name, "x")).rejects.toThrow(/is neither a UUID nor one of/);
+    }
+    expect(await uuidNamed(5, "url", "https://example.com")).toMatch(/^[0-9a-f-]{36}$/);
   });
 });

@@ -62,6 +62,31 @@ export type BundleReadmeOptions = {
   readonly includeWorkspaceNote?: boolean;
   /** Extra sections appended at the end (e.g. claude-plugin's Origin). */
   readonly extraSections?: readonly BundleReadmeSection[];
+  /**
+   * Tools the spec names but this bundle does not carry — every one of them
+   * (`"all"`: a shape with no tool catalog, or an export such as a Claude
+   * Code plugin) or a named few (a cf-worker leaves out what the edge cannot
+   * run). Their row says so instead of calling them built-in.
+   */
+  readonly unwiredTools?: {
+    readonly names: ReadonlySet<string> | "all";
+    readonly note: string;
+  };
+  /**
+   * What the Tools table says about each builtin — its scope, and notes such
+   * as `configured by \`tool_config.http\`` — by spec key or registered name.
+   * Emitters pass `readmeToolFacts` from `@crewhaus/tool-categories`, which
+   * reads the builtin table and the registrations the bundle really makes;
+   * this package has no dependency to read them itself. A name it does not
+   * know is shown as built-in with no notes.
+   */
+  readonly toolFacts?: (name: string) => ReadmeToolFacts | undefined;
+};
+
+/** One builtin's row in the Tools table. */
+export type ReadmeToolFacts = {
+  readonly scope: string;
+  readonly notes: ReadonlyArray<string>;
 };
 
 /**
@@ -93,8 +118,38 @@ const SYNTHESIZED_LITERAL_KEYS: ReadonlySet<string> = new Set([
   "THREDZ_API_BASE",
 ]);
 
+/** A whole `tool_config` string value `$UPPER_SNAKE`: read from the environment at boot. */
+const TOOL_CONFIG_ENV_RE = /^\$([A-Z_][A-Z0-9_]*)$/;
+
+/** Every `$VAR` a `tool_config` block (agent, step, node, role or pool candidate) reads. */
+function collectToolConfigEnvNames(ir: unknown, into: Set<string>): void {
+  const strings = (node: unknown): void => {
+    if (typeof node === "string") {
+      const name = node.match(TOOL_CONFIG_ENV_RE)?.[1];
+      if (name !== undefined) into.add(name);
+    } else if (Array.isArray(node)) {
+      for (const item of node) strings(item);
+    } else if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node as Record<string, unknown>)) strings(value);
+    }
+  };
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === "toolConfigs") strings(value);
+      else visit(value);
+    }
+  };
+  visit(ir);
+}
+
 export function collectSecretRefs(ir: unknown): CollectedSecretRefs {
   const envNames = new Set<string>();
+  collectToolConfigEnvNames(ir, envNames);
   let literalCount = 0;
   const visit = (node: unknown, parentKey?: string): void => {
     if (Array.isArray(node)) {
@@ -141,45 +196,6 @@ const RUN_COMMANDS: Record<IrNode["target"], string> = {
   "onchain-game": "bun agent.ts",
 };
 
-/**
- * Definitionally outward-reaching tool names, in both the spec-key
- * (camelCase) and registered (PascalCase) forms the IR can carry. Mirrors
- * `OUTWARD_TOOL_NAMES` in `@crewhaus/tool-builder` — the canonical rule —
- * but kept inline (exactly as `IrVectorBackend` mirrors `vector-store`)
- * so the runtime-agnostic IR keeps its zero package dependencies. Keep in
- * sync when a name is added or removed.
- */
-const OUTWARD_TOOL_NAMES: ReadonlySet<string> = new Set([
-  "fetch",
-  "Fetch",
-  "webFetch",
-  "WebFetch",
-  "webSearch",
-  "WebSearch",
-  "sendMessage",
-  "SendMessage",
-  "evmSendTransaction",
-  "EvmSendTransaction",
-  "imageGenerate",
-  "ImageGenerate",
-]);
-
-/** Tools executed inside the §18 sandbox (see `target-cli`'s sandbox gate). */
-const SANDBOXED_TOOL_NAMES: ReadonlySet<string> = new Set(["python", "javascript", "shell"]);
-
-/**
- * Tools that `requireJustification: true` by default (the Pillar 3 intent
- * gate — see AGENTS.md). Both name forms, same mirroring caveat as above.
- */
-const JUSTIFICATION_GATED_TOOL_NAMES: ReadonlySet<string> = new Set([
-  "sendMessage",
-  "SendMessage",
-  "evmSendTransaction",
-  "EvmSendTransaction",
-  "imageGenerate",
-  "ImageGenerate",
-]);
-
 /** Keys whose array items scope the `tools` lists nested beneath them. */
 const NESTED_TOOL_CONTEXTS: Record<string, string> = {
   steps: "step",
@@ -196,10 +212,19 @@ const NESTED_TOOL_CONTEXTS: Record<string, string> = {
  */
 function collectToolUsage(ir: unknown): ReadonlyMap<string, ReadonlySet<string>> {
   const usage = new Map<string, Set<string>>();
+  // A builtin is spelled `read` in a shape's tools: list and `Read` in a
+  // sub-agent's (the registered name the child is filtered by). They are one
+  // tool, so rows merge without regard to case — no two builtins differ only
+  // in case — under the first spelling seen (the agent's own list is visited
+  // first).
+  const displayName = new Map<string, string>();
   const add = (tool: string, context: string): void => {
-    const contexts = usage.get(tool) ?? new Set<string>();
+    const lower = tool.toLowerCase();
+    const shown = displayName.get(lower) ?? tool;
+    displayName.set(lower, shown);
+    const contexts = usage.get(shown) ?? new Set<string>();
     contexts.add(context);
-    usage.set(tool, contexts);
+    usage.set(shown, contexts);
   };
   const visit = (node: unknown, context: string): void => {
     if (Array.isArray(node)) {
@@ -227,27 +252,6 @@ function collectToolUsage(ir: unknown): ReadonlyMap<string, ReadonlySet<string>>
   };
   visit(ir, "agent");
   return usage;
-}
-
-/** Every tool name carrying a `tool_config` blob, across nested variants. */
-function collectConfiguredToolNames(ir: unknown): ReadonlySet<string> {
-  const configured = new Set<string>();
-  const visit = (node: unknown): void => {
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    if (node === null || typeof node !== "object") return;
-    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (key === "toolConfigs" && value !== null && typeof value === "object") {
-        for (const name of Object.keys(value as Record<string, unknown>)) configured.add(name);
-        continue;
-      }
-      visit(value);
-    }
-  };
-  visit(ir);
-  return configured;
 }
 
 /**
@@ -447,27 +451,33 @@ function maskUrlCredentials(url: string): string {
   return `${base}${query}`;
 }
 
-function toolScopeHint(name: string): string {
+function toolScope(name: string, facts: ReadmeToolFacts | undefined): string {
   if (name.startsWith("mcp__")) return "external (MCP)";
-  if (OUTWARD_TOOL_NAMES.has(name)) return "external";
-  return "built-in";
+  return facts?.scope ?? "built-in";
 }
 
-function toolNotes(name: string, configured: ReadonlySet<string>): string {
-  const notes: string[] = [];
-  if (SANDBOXED_TOOL_NAMES.has(name)) notes.push("sandboxed");
-  if (JUSTIFICATION_GATED_TOOL_NAMES.has(name)) notes.push("justification-gated by default");
-  if (configured.has(name)) notes.push("configured via `tool_config`");
-  return notes.length > 0 ? notes.join("; ") : "—";
-}
-
-function renderToolsSection(ir: IrNode): string | undefined {
+function renderToolsSection(
+  ir: IrNode,
+  unwired?: BundleReadmeOptions["unwiredTools"],
+  toolFacts?: BundleReadmeOptions["toolFacts"],
+): string | undefined {
   const usage = collectToolUsage(ir);
   if (usage.size === 0) return undefined;
-  const configured = collectConfiguredToolNames(ir);
+  const isUnwired = (name: string): boolean =>
+    unwired !== undefined && (unwired.names === "all" || unwired.names.has(name));
   const rows = [...usage.keys()].sort().map((name) => {
     const contexts = [...(usage.get(name) ?? new Set<string>())].sort().join(", ");
-    return `| \`${escapeCell(name)}\` | ${contexts} | ${toolScopeHint(name)} | ${toolNotes(name, configured)} |`;
+    if (isUnwired(name) && unwired !== undefined) {
+      return `| \`${escapeCell(name)}\` | ${contexts} | not wired | ${escapeCell(unwired.note)} |`;
+    }
+    const facts = toolFacts?.(name);
+    // Notes keep their code spans; a pipe or newline from a spec key would
+    // still split the cell.
+    const notes =
+      facts !== undefined && facts.notes.length > 0
+        ? facts.notes.join("; ").replace(/\|/g, "\\|").replace(/\r?\n/g, " ")
+        : "—";
+    return `| \`${escapeCell(name)}\` | ${contexts} | ${toolScope(name, facts)} | ${notes} |`;
   });
   return ["| Tool | Used by | Scope | Notes |", "| --- | --- | --- | --- |", ...rows].join("\n");
 }
@@ -560,7 +570,7 @@ export function renderBundleReadme(ir: IrNode, opts: BundleReadmeOptions = {}): 
   // 0.6.0 §4.3 — the `models:` registry, when the spec declared one.
   const profiles = renderModelProfilesSection(ir);
   if (profiles !== undefined) sections.push({ heading: "Model profiles", body: profiles });
-  const tools = renderToolsSection(ir);
+  const tools = renderToolsSection(ir, opts.unwiredTools, opts.toolFacts);
   if (tools !== undefined) sections.push({ heading: "Tools", body: tools });
   const mcp = renderMcpSection(ir);
   if (mcp !== undefined) sections.push({ heading: "MCP servers", body: mcp });

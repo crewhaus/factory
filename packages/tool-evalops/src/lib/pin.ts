@@ -21,7 +21,6 @@
  * private pin helper rather than in an exported predicate, so it is restated
  * here — deliberately, and named as a mirror rather than an invention.
  */
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
   BASELINES_FILENAME,
@@ -29,14 +28,26 @@ import {
   type BaselineLineage,
   type BaselineLookup,
   type BaselinesFile,
+  HistoryWriteError,
+  ReportError,
   type RunIndexEntry,
   baselineKey,
   baselineKeyFor,
+  clearBaseline,
   lineageOfEntry,
   setBaseline,
 } from "@crewhaus/eval-report";
-import type { SafePath } from "../paths";
-import { type Loaded, compareStrings, fail, renderPath } from "./read";
+import { probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
+import { type SafePath, workspaceRoot } from "../paths";
+import {
+  type Loaded,
+  compareStrings,
+  containedDir,
+  fail,
+  joinRel,
+  leafFailure,
+  renderPath,
+} from "./read";
 import { RESULTS_FILENAME } from "./run";
 
 export type PinAction = "show" | "set" | "clear";
@@ -112,6 +123,9 @@ export type PlanInput = {
   readonly row?: RunIndexEntry;
   /** The evals directory, already contained — used to verify a run directory. */
   readonly evalsDir: SafePath;
+  /** `baselines.json` is a symbolic link (inside the workspace, or the read
+   *  would have been refused): a pin is never written through one. */
+  readonly pinsLinked?: boolean;
 };
 
 /**
@@ -166,6 +180,14 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
         changes: false,
       },
     };
+  }
+  if (input.pinsLinked === true) {
+    // Refused in the PLAN, so a dryRun says what the real call would do. The
+    // writer refuses a link on its own too; this is the same answer, earlier.
+    return fail(
+      "refused",
+      `${BASELINES_FILENAME} in this evals directory is a symbolic link — a pin is written only to a regular file, never through a link, so nothing would be written. Replace the link with the file it points at to pin here.`,
+    );
   }
   if (input.action === "clear") {
     return {
@@ -267,47 +289,73 @@ function verifyRunDir(row: RunIndexEntry): Loaded<true> {
       `run ${row.runId} recorded its output at "${renderPath(outDir)}", outside this workspace — its results.json cannot be verified from here, and a pin to an unverifiable run is a gate that silently re-baselines`,
     );
   }
-  const results = path.join(path.resolve(process.cwd(), rel), RESULTS_FILENAME);
-  try {
-    if (!statSync(results).isFile()) {
-      return fail("missing", `run ${row.runId}'s ${RESULTS_FILENAME} is not a file`);
-    }
-  } catch {
+  // The whole path to results.json is resolved physically, links included,
+  // and must stay inside the workspace — not just the recorded directory.
+  const leaf = joinRel(rel.split(path.sep).join("/"), RESULTS_FILENAME);
+  const shown = `${renderPath(rel)}/${RESULTS_FILENAME}`;
+  const at = resolveContained(workspaceRoot(), leaf);
+  if (!at.ok) {
+    if (at.code === "escapes-root") return leafFailure(at, shown);
     return fail(
       "missing",
       `run ${row.runId}'s ${RESULTS_FILENAME} could not be read at "${renderPath(rel)}" — the run directory it points at is gone`,
     );
   }
+  const kind = probeKind(at.real);
+  if (!kind.ok) {
+    return fail(
+      "missing",
+      `run ${row.runId}'s ${RESULTS_FILENAME} could not be read at "${renderPath(rel)}" — the run directory it points at is gone`,
+    );
+  }
+  if (kind.kind !== "file") {
+    return fail("missing", `run ${row.runId}'s ${RESULTS_FILENAME} is not a file`);
+  }
   return { ok: true, value: true };
 }
 
 /**
- * Write the planned change.
+ * Write the planned change, through `@crewhaus/eval-report`'s writers, which
+ * own the key and the file format and write only a regular file at the name:
+ * an exclusively created temp in the same directory, renamed into place. A
+ * link or special file at `baselines.json` is refused there, whatever the plan
+ * saw (security-7#0, flag-truth-4#3).
  *
- * `set` goes through `setBaseline`, which owns the key and the file format.
- * `clear` cannot: `@crewhaus/eval-report` has no `deleteBaseline`, so the file
- * is rewritten here in exactly the shape `setBaseline` writes it — two spaces,
- * trailing newline, whole-file replacement. That is a second writer, and it is
- * named as such: the right fix is an upstream `deleteBaseline`.
+ * The evals directory is contained once more first and must still be the one
+ * the plan read: the write goes to that physical directory, so one swapped for
+ * a link in between would otherwise take the write with it.
  */
-export function commitPin(plan: PinPlan, baselines: BaselinesFile, evalsDirReal: string): void {
-  if (plan.action === "set" && plan.next !== undefined) {
-    setBaseline(plan.next, evalsDirReal);
-    return;
-  }
-  if (plan.action === "clear") {
-    if (plan.previous === undefined) return;
-    const next: BaselinesFile = { ...baselines };
-    delete next[plan.key];
-    mkdirSync(evalsDirReal, { recursive: true });
-    writeFileSync(
-      path.join(evalsDirReal, BASELINES_FILENAME),
-      `${JSON.stringify(next, null, 2)}\n`,
+export function commitPin(
+  toolName: string,
+  plan: PinPlan,
+  dir: SafePath,
+  dirRel: string,
+): Loaded<true> {
+  const again = containedDir(toolName, dirRel);
+  if (!again.ok) return again;
+  if (again.value.real !== dir.real) {
+    return fail(
+      "refused",
+      `"${renderPath(dirRel)}" changed while the pin was being planned — nothing was written`,
     );
   }
-}
-
-/** True when a baselines file exists on disk for this directory. */
-export function pinsFileExists(evalsDirReal: string): boolean {
-  return existsSync(path.join(evalsDirReal, BASELINES_FILENAME));
+  try {
+    if (plan.action === "set" && plan.next !== undefined) setBaseline(plan.next, dir.real);
+    else if (plan.action === "clear" && plan.previous !== undefined) {
+      clearBaseline(plan.key, dir.real);
+    }
+  } catch (err) {
+    const shown = `${renderPath(dirRel)}/${BASELINES_FILENAME}`;
+    if (err instanceof HistoryWriteError) {
+      return fail("refused", `"${shown}" was not written: ${err.reason}`);
+    }
+    if (err instanceof ReportError) {
+      return fail(
+        "malformed",
+        `"${shown}" is not a map of pins any more — it changed after it was read, and nothing was written`,
+      );
+    }
+    throw err;
+  }
+  return { ok: true, value: true };
 }

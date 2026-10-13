@@ -11,7 +11,7 @@
  * keys nobody published a vector for — which is every key a caller will
  * actually use.
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
 import {
@@ -19,6 +19,7 @@ import {
   UNSIGNED_PAYLOAD,
   canonicalRequest,
   credentialScope,
+  registerObjectStoreConfig,
   sign,
   stringToSign,
 } from "./index";
@@ -164,10 +165,28 @@ const BASE = {
   region: "us-east-1",
   bucket: "examplebucket",
   key: "test.txt",
-  accessKeyId: KEY_ID,
-  secretAccessKey: SECRET,
   signedAt: "2026-02-03T04:05:06Z",
 };
+
+// Credentials come from the operator's profile, never the call (flag-truth-5#8).
+beforeAll(() => {
+  process.env["CREWHAUS_OBJ_INT_KEY_ID"] = KEY_ID;
+  process.env["CREWHAUS_OBJ_INT_SECRET"] = SECRET;
+  registerObjectStoreConfig({
+    credentials: {
+      main: {
+        access_key_id_env: "CREWHAUS_OBJ_INT_KEY_ID",
+        secret_access_key_env: "CREWHAUS_OBJ_INT_SECRET",
+      },
+    },
+  });
+});
+
+afterAll(() => {
+  Reflect.deleteProperty(process.env, "CREWHAUS_OBJ_INT_KEY_ID");
+  Reflect.deleteProperty(process.env, "CREWHAUS_OBJ_INT_SECRET");
+  registerObjectStoreConfig({});
+});
 
 describe("registration", () => {
   test("every tool registers without a name collision", () => {

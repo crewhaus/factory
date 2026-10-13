@@ -1,4 +1,3 @@
-import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
 import type { EventKind, EventLog } from "@crewhaus/event-log";
@@ -31,6 +30,7 @@ import {
   attachIfEnvSet as attachPrinterIfEnvSet,
   formatJsonLine,
 } from "@crewhaus/structured-event-printer";
+import { appendContained } from "@crewhaus/tool-safety/fs";
 import type {
   CostAccrualEvent,
   JudgeVerdictEvent,
@@ -437,12 +437,27 @@ export function attachAlertWatchdog(
     finalized = true;
 
     const snapshot = acc.snapshot(runContext.sessionId);
+    // 0.7.1 — a history file the store refuses (a link, FIFO or directory
+    // planted at it or at `metrics/`) is reported after the breach check
+    // rather than aborting it: the session is graded against the bootstrap
+    // defaults, as a first session is, and nothing is read or written through
+    // the plant.
+    const persistence: string[] = [];
     // Derive thresholds from PRIOR history (before this session's snapshot is
     // appended) so a session is never graded against itself.
-    const history = readMetricsHistory(options.metricsDir);
+    let history: ReturnType<typeof readMetricsHistory> = [];
+    try {
+      history = readMetricsHistory(options.metricsDir);
+    } catch (err) {
+      persistence.push(err instanceof Error ? err.message : String(err));
+    }
     const thresholds = deriveThresholds(history);
     // Persist AFTER reading history so the next session benefits from this one.
-    appendMetricsSnapshot(snapshot, options.metricsDir);
+    try {
+      appendMetricsSnapshot(snapshot, options.metricsDir);
+    } catch (err) {
+      persistence.push(err instanceof Error ? err.message : String(err));
+    }
 
     const breaches = detectBreaches(snapshot, thresholds);
     const sink = options.alertSink;
@@ -479,6 +494,7 @@ export function attachAlertWatchdog(
           .catch((err) => logFlushError(runContext, "alert-hook", err));
       }
     }
+    if (persistence.length > 0) throw new Error(persistence.join("; "));
   };
 
   return { finalize, unsubscribe };
@@ -948,24 +964,41 @@ export type AttachedWatchmeCapture = {
  *
  * Gated on CREWHAUS_WATCHME=1|true (stamped by `crewhaus run` /
  * the compiled-bundle preambles); returns undefined otherwise. Appends are
- * synchronous (`appendFileSync`, mode 0600, one line < PIPE_BUF ⇒ atomic) and
- * every failure is swallowed — capture can never crash a run.
+ * synchronous (mode 0600, one line < PIPE_BUF ⇒ atomic) and every failure is
+ * swallowed — capture can never crash a run.
+ *
+ * 0.7.1: the append goes through @crewhaus/tool-safety's `appendContained`,
+ * rooted at the session directory as the event log's is, so a symlink, FIFO
+ * or directory at `<sessionId>.events.jsonl` is refused instead of followed.
+ * A model that planted a link there (GitApplyPatch creates one from a patch)
+ * had every trace event of the next watched run appended to a file of its
+ * choosing. A refusal stops the capture for this run and is reported once on
+ * `onRefused` (default: one stderr line naming the file and the reason).
  */
 export function attachWatchmeCapture(
   bus: TraceEventBus,
   sessionsDir: string,
   sessionId: string,
   env: NodeJS.ProcessEnv = process.env,
+  onRefused: (message: string) => void = (message) => process.stderr.write(`${message}\n`),
 ): AttachedWatchmeCapture | undefined {
   const gate = env["CREWHAUS_WATCHME"];
   if (gate !== "1" && gate !== "true") return undefined;
 
-  const path = join(sessionsDir, `${sessionId}.events.jsonl`);
+  const name = `${sessionId}.events.jsonl`;
+  let refused = false;
   const unsubscribe = bus.subscribe((event: TraceEvent): void => {
+    if (refused) return;
     if (WATCHME_EPHEMERAL_KINDS.has(event.kind)) return;
     if (WATCHME_MIRRORED_KINDS.has(event.kind)) return;
     try {
-      appendFileSync(path, formatJsonLine(event), { mode: 0o600 });
+      const appended = appendContained(sessionsDir, name, formatJsonLine(event), { mode: 0o600 });
+      if (!appended.ok && appended.code !== "not-found") {
+        refused = true;
+        onRefused(
+          `[watchme] capture stopped: refusing to append to ${join(sessionsDir, name)}: ${appended.reason} (code ${appended.code})`,
+        );
+      }
     } catch {
       // Swallowed by design — a capture hiccup must never abort a turn.
     }

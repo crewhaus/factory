@@ -107,16 +107,19 @@ export type FieldPredicate = {
 /** Evaluate a predicate. Returns false rather than throwing on a type mismatch. */
 export function matchesPredicate(body: unknown, predicate: FieldPredicate): boolean {
   const actual = readPath(body, predicate.path);
+  const expected = sortedKeysOnce();
   switch (predicate.op) {
     case "exists":
       return actual !== undefined;
     case "equals":
-      return sameValue(actual, predicate.value);
+      return sameValue(actual, predicate.value, expected);
     case "notEquals":
-      return !sameValue(actual, predicate.value);
+      return !sameValue(actual, predicate.value, expected);
     case "contains": {
       if (typeof actual === "string") return actual.includes(String(predicate.value));
-      if (Array.isArray(actual)) return actual.some((item) => sameValue(item, predicate.value));
+      if (Array.isArray(actual)) {
+        return actual.some((item) => sameValue(item, predicate.value, expected));
+      }
       return false;
     }
     case "gte":
@@ -132,22 +135,44 @@ export function matchesPredicate(body: unknown, predicate: FieldPredicate): bool
   }
 }
 
-/** Structural equality over JSON values; key order does not matter. */
-function sameValue(a: unknown, b: unknown): boolean {
+/**
+ * An object's own keys, sorted, worked out once per object for one check.
+ *
+ * `contains` compares every item of a response array with the predicate's
+ * value. Sorting that value's keys again for each item made the check the
+ * product of the response and the model's predicate; sorted once, an item
+ * costs only what it holds itself.
+ */
+function sortedKeysOnce(): (o: object) => readonly string[] {
+  const sorted = new Map<object, readonly string[]>();
+  return (o) => {
+    const known = sorted.get(o);
+    if (known !== undefined) return known;
+    const keys = Object.keys(o).sort();
+    sorted.set(o, keys);
+    return keys;
+  };
+}
+
+/**
+ * Structural equality over JSON values; key order does not matter. `b` is
+ * the predicate's side, and `bKeys` hands back its objects' sorted keys.
+ */
+function sameValue(a: unknown, b: unknown, bKeys: (o: object) => readonly string[]): boolean {
   if (a === b) return true;
   if (a === null || b === null || typeof a !== typeof b) return false;
   if (typeof a !== "object") return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (Array.isArray(a) && Array.isArray(b)) {
-    return a.length === b.length && a.every((item, i) => sameValue(item, b[i]));
+    return a.length === b.length && a.every((item, i) => sameValue(item, b[i], bKeys));
   }
   const ao = a as Record<string, unknown>;
   const bo = b as Record<string, unknown>;
-  const ak = Object.keys(ao).sort();
-  const bk = Object.keys(bo).sort();
-  return (
-    ak.length === bk.length &&
-    ak.every((k, i) => k === bk[i]) &&
-    ak.every((k) => sameValue(ao[k], bo[k]))
-  );
+  const bk = bKeys(bo);
+  // The counts first: an item with a different number of keys is no match,
+  // and costs no more than reading its own keys.
+  const ak = Object.keys(ao);
+  if (ak.length !== bk.length) return false;
+  ak.sort();
+  return ak.every((k, i) => k === bk[i]) && ak.every((k) => sameValue(ao[k], bo[k], bKeys));
 }

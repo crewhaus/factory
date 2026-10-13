@@ -986,3 +986,103 @@ describe("#400 — a one-shot grant satisfies a REGENERATED call", () => {
     expect(executed).toEqual([]);
   });
 });
+
+describe("0.7.1 — an approval parked under an MCP tool's old name survives the rename", () => {
+  // 0.7.0 registered an MCP tool as `srv__echo`; 0.7.1 registers it as
+  // `mcp__srv__echo`. An approval parked on 0.7.0 is keyed on the old name,
+  // and the operator may grant it after upgrading.
+  const mcpTool = (name: string, onCall?: (input: unknown) => void) =>
+    buildTool({
+      name,
+      description: "an MCP tool",
+      inputSchema: z.object({ text: z.string() }).strict(),
+      readOnly: false,
+      destructive: false,
+      concurrencySafe: false,
+      execute: async (i) => {
+        onCall?.(i);
+        return `echo:${i.text}`;
+      },
+    });
+
+  async function parkAsOldName(input: { text: string }) {
+    const first = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "srv__echo", input)], [text("done")]]).adapter,
+      tools: [mcpTool("srv__echo")],
+      approvals: { store },
+    });
+    const req = first.events.find((e) => e.kind === "approval_requested");
+    if (req?.kind !== "approval_requested") throw new Error("expected a park");
+    const parked = await store.get("srv__echo", hashApprovalInput("srv__echo", input));
+    if (parked === null) throw new Error("expected a persisted record");
+    return { approvalId: req.approvalId, sessionId: parked.sessionId };
+  }
+
+  test("a grant made after the upgrade runs the renamed call once, and is spent", async () => {
+    const { approvalId, sessionId } = await parkAsOldName({ text: "hi" });
+    await store.resolve(approvalId, "grant", "tester");
+
+    const executed: unknown[] = [];
+    const resumed = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "mcp__srv__echo", { text: "hi" })], [text("done")]])
+        .adapter,
+      tools: [mcpTool("mcp__srv__echo", (i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(resumed.caught).toBeUndefined();
+    expect(executed).toEqual([{ text: "hi" }]);
+    expect(resumed.events.some((e) => e.kind === "approval_requested")).toBe(false);
+    const all = await store.list();
+    expect(all.find((a) => a.id === approvalId)?.consumedAt).toBeDefined();
+    expect(all).toHaveLength(1);
+  });
+
+  test("a regenerated call finds the old-name grant too, and runs what was approved", async () => {
+    const { approvalId, sessionId } = await parkAsOldName({ text: "approved words" });
+    await store.resolve(approvalId, "grant", "tester");
+
+    const executed: unknown[] = [];
+    const resumed = await runSingleTurn({
+      _adapter: scriptedAdapter([
+        [use("tu_1", "mcp__srv__echo", { text: "regenerated words" })],
+        [text("done")],
+      ]).adapter,
+      tools: [mcpTool("mcp__srv__echo", (i) => executed.push(i))],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(resumed.caught).toBeUndefined();
+    expect(executed).toEqual([{ text: "approved words" }]);
+  });
+
+  test("still pending, the old-name record is re-used rather than a second one parked", async () => {
+    const { approvalId, sessionId } = await parkAsOldName({ text: "hi" });
+    const again = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "mcp__srv__echo", { text: "hi" })], [text("done")]])
+        .adapter,
+      tools: [mcpTool("mcp__srv__echo")],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(again.caught).toBeInstanceOf(RunFailedError);
+    const req = again.events.find((e) => e.kind === "approval_requested");
+    expect(req?.kind === "approval_requested" ? req.approvalId : undefined).toBe(approvalId);
+    expect(await store.list()).toHaveLength(1);
+  });
+
+  test("the old name never reaches a tool that is not an MCP tool", async () => {
+    // A grant for `srv__echo` is not a grant for a builtin that happens to be
+    // called `echo`, nor for another server's tool.
+    const { approvalId, sessionId } = await parkAsOldName({ text: "hi" });
+    await store.resolve(approvalId, "grant", "tester");
+    const other = await runSingleTurn({
+      _adapter: scriptedAdapter([[use("tu_1", "mcp__other__echo", { text: "hi" })], [text("done")]])
+        .adapter,
+      tools: [mcpTool("mcp__other__echo")],
+      approvals: { store },
+      _sessionId: sessionId,
+    });
+    expect(other.caught).toBeInstanceOf(RunFailedError);
+  });
+});

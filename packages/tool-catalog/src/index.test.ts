@@ -4,12 +4,18 @@ import { z } from "zod";
 import {
   JUSTIFICATION_FIELD_DESCRIPTION,
   JUSTIFICATION_INPUT_FIELD,
+  MCP_TOOL_NAME_PREFIX,
   type RegisteredTool,
+  TOOL_CONTRACT_VERSION,
   ToolCatalog,
   ToolCatalogError,
   defaultCatalog,
+  hasModelChosenDestination,
+  legacyMcpToolName,
+  mcpToolName,
   schemaDeclaresJustification,
   stripJustificationField,
+  toolListEntryNames,
   withJustificationField,
 } from "./index";
 
@@ -264,5 +270,71 @@ describe("justification schema advertisement (#386)", () => {
     expect(stripJustificationField(undefined)).toBe(undefined);
     const arr = [1, 2];
     expect(stripJustificationField(arr)).toBe(arr);
+  });
+});
+
+describe("TOOL_CONTRACT_VERSION", () => {
+  test("is a semver string an external tool package can compare against", () => {
+    expect(TOOL_CONTRACT_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    // 1.1.0 added `operativeArgs`; an older reader must not assume it exists.
+    const [major, minor] = TOOL_CONTRACT_VERSION.split(".").map(Number);
+    expect(major).toBe(1);
+    expect(minor).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("MCP tool names", () => {
+  test("the registered name is mcp__<server>__<tool>", () => {
+    expect(mcpToolName("github", "create_issue")).toBe("mcp__github__create_issue");
+    expect(mcpToolName("github", "create_issue").startsWith(MCP_TOOL_NAME_PREFIX)).toBe(true);
+  });
+
+  test("the pre-0.7.1 spelling is recovered from an MCP name, and only from one", () => {
+    expect(legacyMcpToolName("mcp__github__create_issue")).toBe("github__create_issue");
+    expect(legacyMcpToolName("mcp__my-server__a__b")).toBe("my-server__a__b");
+    expect(legacyMcpToolName("github__create_issue")).toBeUndefined();
+    expect(legacyMcpToolName("Read")).toBeUndefined();
+    expect(legacyMcpToolName("mcp__")).toBeUndefined();
+    expect(legacyMcpToolName("mcp____tool")).toBeUndefined();
+    expect(legacyMcpToolName("mcp__server__")).toBeUndefined();
+  });
+
+  test("a tool-list entry names a tool by its registered or its legacy spelling", () => {
+    expect(toolListEntryNames("mcp__github__create_issue", "mcp__github__create_issue")).toBe(true);
+    expect(toolListEntryNames("github__create_issue", "mcp__github__create_issue")).toBe(true);
+    expect(toolListEntryNames("github__other", "mcp__github__create_issue")).toBe(false);
+    // The alias runs one way: an mcp__ entry never names a non-MCP tool.
+    expect(toolListEntryNames("mcp__contract__fn", "contract__fn")).toBe(false);
+    expect(toolListEntryNames("", "mcp__a__b")).toBe(false);
+  });
+});
+
+describe("hasModelChosenDestination", () => {
+  test("a url or a recipient on an external tool is a destination the model picks", () => {
+    for (const kind of ["url", "recipient"]) {
+      expect(hasModelChosenDestination({ scope: "external", operativeArgs: [{ kind }] })).toBe(
+        true,
+      );
+      expect(hasModelChosenDestination({ scope: "internal", operativeArgs: [{ kind }] })).toBe(
+        false,
+      );
+    }
+    expect(hasModelChosenDestination({ scope: "external", operativeArgs: [{ kind: "id" }] })).toBe(
+      false,
+    );
+  });
+
+  test("a url that is its own service names which configured API, not a destination", () => {
+    // RateLimitStatus's baseUrl: it stays a configured sink, as the other
+    // code-host reads do.
+    const api = { kind: "url", service: "baseUrl" };
+    expect(hasModelChosenDestination({ scope: "external", operativeArgs: [api] })).toBe(false);
+    // A recipient on a service still is one (IssueCreate's repository).
+    expect(
+      hasModelChosenDestination({
+        scope: "external",
+        operativeArgs: [api, { kind: "recipient", service: "baseUrl" }],
+      }),
+    ).toBe(true);
   });
 });

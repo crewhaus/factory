@@ -8,7 +8,8 @@
  * sandboxed to `process.cwd()` — tests address files by workspace-
  * relative path.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as nodeFs from "node:fs";
 import {
   existsSync,
   lstatSync,
@@ -17,6 +18,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -225,6 +227,128 @@ describe("ingestDocument — size cap", () => {
   });
 });
 
+/** The content between the metadata separator and the closing tag. */
+function bodyOf(result: unknown): string {
+  const text = String(result);
+  const start = text.indexOf("\n---\n") + "\n---\n".length;
+  return text.slice(start, text.lastIndexOf("\n</document>"));
+}
+
+describe("ingestDocument — maxBytes bounds what is READ (C077)", () => {
+  test("a 5 GiB file is read as its first maxBytes, never allocated whole", async () => {
+    // Sparse: no disk cost. 0.7.0 allocated the whole file first, so this
+    // threw a RangeError however small maxBytes was.
+    writeFileSync(join(tmp, "huge.log"), "");
+    truncateSync(join(tmp, "huge.log"), 5 * 1024 ** 3);
+    const result = await ingestDocument.execute({ path: "huge.log", maxBytes: 1000 });
+    expect(result).toContain("TRUNCATED to 1000 bytes");
+    expect(result).toContain('"size":5368709120');
+    expect(result).toContain('"linesPartial":true');
+    expect(Buffer.byteLength(bodyOf(result))).toBe(1000);
+  });
+
+  test("the bytes read, and the buffer they fill, are bounded by maxBytes, not by the file", async () => {
+    // Counts what is read, not the process's RSS: RSS moves with the
+    // allocator and with every other test in the process, and the same
+    // measurement elsewhere read 61 MB against a 40 MB bound on a loaded CI
+    // runner. 0.7.0 allocated a buffer the size of the file and read all of
+    // it (64 MiB here), then decoded and counted it: some 190 MiB of RSS.
+    writeFileSync(join(tmp, "big.log"), "");
+    truncateSync(join(tmp, "big.log"), 64 * 1024 ** 2);
+    const realReadSync = nodeFs.readSync;
+    const realReadFileSync = nodeFs.readFileSync;
+    let bytesRead = 0;
+    let largestBuffer = 0;
+    const reads = spyOn(nodeFs, "readSync").mockImplementation(((
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      ...rest: unknown[]
+    ): number => {
+      largestBuffer = Math.max(largestBuffer, buffer.byteLength);
+      const n = (realReadSync as (...args: unknown[]) => number)(fd, buffer, ...rest);
+      bytesRead += n;
+      return n;
+    }) as unknown as typeof nodeFs.readSync);
+    // A whole-file readSync or readFileSync is counted too, however it is
+    // imported. A read through another API (Bun.file, node:fs/promises, a
+    // stream) is not seen here. The 5 GiB test above catches one that holds
+    // the whole file, since Bun will not allocate a buffer over 4 GiB.
+    const wholeReads = spyOn(nodeFs, "readFileSync").mockImplementation(((
+      ...args: unknown[]
+    ): string | Buffer => {
+      const out = (realReadFileSync as (...a: unknown[]) => string | Buffer)(...args);
+      const bytes = typeof out === "string" ? Buffer.byteLength(out) : out.byteLength;
+      largestBuffer = Math.max(largestBuffer, bytes);
+      bytesRead += bytes;
+      return out;
+    }) as unknown as typeof nodeFs.readFileSync);
+    let result: unknown;
+    try {
+      result = await ingestDocument.execute({ path: "big.log", maxBytes: 1000 });
+    } finally {
+      reads.mockRestore();
+      wholeReads.mockRestore();
+    }
+    expect(result).toContain("TRUNCATED to 1000 bytes");
+    // The 1000 bytes returned were read through a counted call, plus at most
+    // the one byte that tells a longer file from one that fits.
+    expect(bytesRead).toBeGreaterThanOrEqual(1000);
+    expect(bytesRead).toBeLessThanOrEqual(1001);
+    expect(largestBuffer).toBeLessThanOrEqual(1001);
+    // 0.7.0 read, decoded and counted all 64 MiB, which on a loaded runner
+    // takes seconds: the budget lets it fail on the counts above.
+  }, 20_000);
+
+  test("the cut never splits a character, and never exceeds maxBytes", async () => {
+    writeFile("accents.txt", "é".repeat(100));
+    const body = bodyOf(await ingestDocument.execute({ path: "accents.txt", maxBytes: 51 }));
+    expect(body.includes("\uFFFD")).toBe(false);
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(51);
+    expect(body).toBe("é".repeat(25));
+  });
+
+  test("line counts of a truncated file describe the part read, and say so", async () => {
+    writeFile("many.log", "x\n".repeat(10_000));
+    const result = await ingestDocument.execute({ path: "many.log", maxBytes: 100 });
+    expect(result).toContain('"lines":50');
+    expect(result).toContain('"linesPartial":true');
+    // A file that fits is counted exactly, with no flag.
+    const whole = await ingestDocument.execute({ path: "many.log" });
+    expect(whole).toContain('"lines":10000');
+    expect(whole).not.toContain("linesPartial");
+  });
+
+  test("a truncated .json is not validated, rather than called invalid", async () => {
+    writeFile("data.json", `${JSON.stringify({ k: "v".repeat(40) })}   junk`);
+    const cut = await ingestDocument.execute({ path: "data.json", maxBytes: 50 });
+    expect(cut).toContain('"valid_json":null');
+    expect(cut).toContain("skipped: the file is larger than maxBytes");
+    writeFile("small.json", '{"k":1}');
+    expect(await ingestDocument.execute({ path: "small.json" })).toContain('"valid_json":true');
+  });
+
+  test("a truncated .csv counts rows in the part read, flagged, with columns from the header", async () => {
+    writeFile("rows.csv", `a,b,c\n${"1,2,3\n".repeat(1000)}`);
+    const result = await ingestDocument.execute({ path: "rows.csv", maxBytes: 60 });
+    expect(result).toContain('"rowsPartial":true');
+    expect(result).toContain('"columns":3');
+    expect(result).not.toContain('"rows":1001');
+  });
+
+  test("a registered parser is told the budget, and its output is cut on a character boundary", async () => {
+    let told: unknown;
+    registerDocumentParser(".bin", (_path, options) => {
+      told = options;
+      return { content: "ü".repeat(100) };
+    });
+    writeFile("blob.bin", "raw");
+    const result = await ingestDocument.execute({ path: "blob.bin", maxBytes: 31 });
+    expect(told).toEqual({ maxBytes: 31 });
+    expect(result).toContain("TRUNCATED to 31 bytes");
+    expect(bodyOf(result)).toBe("ü".repeat(15));
+  });
+});
+
 // Regression — the DANGLING-symlink variant of the containment hole. A link
 // whose target is missing answers false to `existsSync`, because `existsSync`
 // follows symlinks: a containment walk that probes with it strolls past the
@@ -358,5 +482,26 @@ describe("ingestDocument — relative dangling-link base", () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe("ingestDocument — a dangling link's target is walked as the kernel walks it (C068)", () => {
+  test("a parser is never handed a file the caller's path does not lead to", async () => {
+    // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's
+    // parent: `evil.pdf` leads outside. Folded as text it read as the
+    // in-root `a/x.pdf`, which a registered parser was then handed.
+    mkdirSync(join(tmp, "a"));
+    symlinkSync("..", join(tmp, "a", "y"));
+    writeFileSync(join(tmp, "a", "x.pdf"), "in-root decoy");
+    symlinkSync("a/y/../x.pdf", join(tmp, "evil.pdf"));
+    const handed: string[] = [];
+    registerDocumentParser(".pdf", async (path) => {
+      handed.push(path);
+      return { content: "parsed" };
+    });
+    await expect(ingestDocument.execute({ path: "evil.pdf" })).rejects.toBeInstanceOf(
+      ToolPermissionError,
+    );
+    expect(handed).toEqual([]);
   });
 });

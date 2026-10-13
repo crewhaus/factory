@@ -28,7 +28,7 @@
  * attacker-controlled text. Show it to a person; do not paste it into a
  * prompt as if it were instructions.
  */
-import { type Finding, compareStrings, matchAll, withPositions } from "./text";
+import { type Finding, compareStrings, matchAll, matchAllSkipping, withPositions } from "./text";
 import { scanInvisible } from "./unicode";
 
 export type InjectionCategory =
@@ -46,7 +46,134 @@ export type InjectionRule = {
   readonly weight: number;
   readonly description: string;
   readonly pattern: RegExp;
+  /**
+   * The pattern's matches when a plain global search would rescan a run;
+   * the same matches as `matchAll(text, pattern)`.
+   */
+  readonly matches?: (text: string) => Iterable<{ index: number; match: RegExpExecArray }>;
 };
+
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** Where `^` matches under the `m` flag. */
+function isLineStart(text: string, at: number): boolean {
+  if (at === 0) return true;
+  const c = text.charCodeAt(at - 1);
+  return c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+}
+
+const CHAT_MARKUP =
+  /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim;
+
+/**
+ * CHAT_MARKUP's matches. Its `^\s*###` branch starts at every line and runs
+ * its `\s*` on across blank lines, so a run of blank lines was rescanned from
+ * each line start in it: quadratic in the run's length. The other branches
+ * start at `<` or `[`, which no whitespace is, so a try at a line start that
+ * fails rules out every start up to the end of its whitespace.
+ */
+function chatMarkupMatches(text: string): Iterable<{ index: number; match: RegExpExecArray }> {
+  return matchAllSkipping(
+    text,
+    CHAT_MARKUP,
+    (t, at) => {
+      const c = t.charCodeAt(at);
+      return c === 0x3c || c === 0x5b || isLineStart(t, at);
+    },
+    (t, at) => {
+      if (!isLineStart(t, at)) return at + 1;
+      let i = at;
+      while (i < t.length && isRegExpSpace(t.charCodeAt(i))) i++;
+      return i;
+    },
+  );
+}
+
+const PIPE_TO_SHELL = /\b(?:curl|wget)\s+[^\n|]{1,200}\|\s*(?:sudo\s+)?(?:ba|z|d|fi)?sh\b/gi;
+/** What PIPE_TO_SHELL reads after its `|`, tried at one place. */
+const PIPE_TO_SHELL_TAIL = /\s*(?:sudo\s+)?(?:ba|z|d|fi)?sh\b/iy;
+
+/** A code unit `\w` matches. */
+function isWordUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f
+  );
+}
+
+/** `word` (lowercase ASCII) at `at`, in either case, as the `i` flag reads it. */
+function asciiWordAt(text: string, at: number, word: string): boolean {
+  for (let i = 0; i < word.length; i++) {
+    const c = text.charCodeAt(at + i);
+    if (c !== word.charCodeAt(i) && c !== word.charCodeAt(i) - 0x20) return false;
+  }
+  return true;
+}
+
+/**
+ * PIPE_TO_SHELL's matches. Its blanks after `curl` and the up to 200
+ * characters before `|` overlap on blanks, so a try that fails gave the
+ * blanks back one at a time and read up to 200 characters again after each,
+ * and every `curl` in a stretch did it again: hundreds of steps a character
+ * over text of up to 2M characters. A try is made only where it matches:
+ * after `curl` or `wget` and its blanks, the first `|` or `\n` must be a `|`
+ * that some split of the blanks leaves 1 to 200 characters before, with no
+ * `\n` among them, and the shell must follow it. Those ends only move
+ * forward, so each is found once.
+ */
+function pipeToShellMatches(text: string): Iterable<{ index: number; match: RegExpExecArray }> {
+  let stop = -1;
+  let tailAt = -1;
+  let tailMatches = false;
+  return matchAllSkipping(
+    text,
+    PIPE_TO_SHELL,
+    (t, at) => {
+      if (!(asciiWordAt(t, at, "curl") || asciiWordAt(t, at, "wget"))) return false;
+      if (at > 0 && isWordUnit(t.charCodeAt(at - 1))) return false;
+      const from = at + 4;
+      let blanksEnd = from;
+      let lastBreak = -1;
+      while (blanksEnd < t.length && isRegExpSpace(t.charCodeAt(blanksEnd))) {
+        if (t.charCodeAt(blanksEnd) === 0x0a) lastBreak = blanksEnd;
+        blanksEnd++;
+      }
+      if (blanksEnd === from) return false;
+      if (stop < blanksEnd) {
+        stop = blanksEnd;
+        while (stop < t.length && t.charCodeAt(stop) !== 0x7c && t.charCodeAt(stop) !== 0x0a)
+          stop++;
+      }
+      if (t.charCodeAt(stop) !== 0x7c) return false;
+      // The blanks the `\s+` keeps, `w`: at least one, no `\n` left after
+      // them, and 1 to 200 characters from them to the `|`.
+      const lo = Math.max(1, stop - from - 200, lastBreak - from + 1);
+      const hi = Math.min(blanksEnd - from, stop - from - 1);
+      if (lo > hi) return false;
+      if (tailAt !== stop + 1) {
+        tailAt = stop + 1;
+        PIPE_TO_SHELL_TAIL.lastIndex = tailAt;
+        tailMatches = PIPE_TO_SHELL_TAIL.test(t);
+      }
+      return tailMatches;
+    },
+    (_, at) => at + 1,
+  );
+}
 
 /** The phrase rules. Also run against decoded base64, once, no recursion. */
 export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
@@ -87,8 +214,8 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "override",
     weight: 30,
     description: "embeds chat-template or role markup, trying to close the current turn",
-    pattern:
-      /<\/?(?:system|assistant|human|user)>|\[\/?INST\]|<\|im_(?:start|end)\|>|^\s*###\s*(?:instruction|system)/gim,
+    pattern: CHAT_MARKUP,
+    matches: chatMarkupMatches,
   },
   {
     id: "role.you-are-now",
@@ -147,7 +274,8 @@ export const INJECTION_RULES: ReadonlyArray<InjectionRule> = [
     category: "tool-coercion",
     weight: 35,
     description: "a download-and-execute one-liner",
-    pattern: /\b(?:curl|wget)\s+[^\n|]{1,200}\|\s*(?:sudo\s+)?(?:ba|z|d|fi)?sh\b/gi,
+    pattern: PIPE_TO_SHELL,
+    matches: pipeToShellMatches,
   },
   {
     id: "tool.credential-request",
@@ -206,6 +334,80 @@ const MARKDOWN_LINK = /\[([^\]\n]{1,200})\]\(([^)\s]{1,500})\)/g;
 const BASE64_BLOB = /[A-Za-z0-9+/]{40,}={0,2}/g;
 const DOMAIN_IN_TEXT =
   /\b(?:https?:\/\/)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)/i;
+
+/**
+ * HTML_COMMENT's matches. From each `<!--` it reads up to 4,000 characters
+ * for a `-->`, so a text of `<!--` with none read 4,000 characters again
+ * from every one: thousands of steps a character, seconds over 2M. A try is
+ * made only where the first `-->` after the opener lies within reach; that
+ * `-->` only moves forward, so it is searched for once.
+ */
+export function htmlCommentMatches(
+  text: string,
+): Iterable<{ index: number; match: RegExpExecArray }> {
+  let close = -2;
+  return matchAllSkipping(
+    text,
+    HTML_COMMENT,
+    (t, at) => {
+      if (!t.startsWith("<!--", at)) return false;
+      const from = at + 4;
+      if (close !== -1 && close < from) close = t.indexOf("-->", from);
+      return close !== -1 && close - from <= 4_000;
+    },
+    (_, at) => at + 1,
+  );
+}
+
+/**
+ * MARKDOWN_LINK's matches. From each `[` it reads up to 200 label and 500
+ * target characters, so a run of `[` read 200 again from every one. A try
+ * is made only where it matches: the label runs from the `[` to the first
+ * `]` or `\n` (1 to 200 characters, ending at `]`), `(` follows, and the
+ * target runs to the first `)` or blank (1 to 500, ending at `)`). Both ends
+ * only move forward, so each is found once.
+ */
+export function markdownLinkMatches(
+  text: string,
+): Iterable<{ index: number; match: RegExpExecArray }> {
+  let labelEnd = -1;
+  let targetEnd = -1;
+  return matchAllSkipping(
+    text,
+    MARKDOWN_LINK,
+    (t, at) => {
+      if (t.charCodeAt(at) !== 0x5b) return false;
+      const label = at + 1;
+      if (labelEnd < label) {
+        labelEnd = label;
+        while (
+          labelEnd < t.length &&
+          t.charCodeAt(labelEnd) !== 0x5d &&
+          t.charCodeAt(labelEnd) !== 0x0a
+        ) {
+          labelEnd++;
+        }
+      }
+      const labelLength = labelEnd - label;
+      if (labelLength < 1 || labelLength > 200 || t.charCodeAt(labelEnd) !== 0x5d) return false;
+      if (t.charCodeAt(labelEnd + 1) !== 0x28) return false;
+      const target = labelEnd + 2;
+      if (targetEnd < target) {
+        targetEnd = target;
+        while (
+          targetEnd < t.length &&
+          t.charCodeAt(targetEnd) !== 0x29 &&
+          !isRegExpSpace(t.charCodeAt(targetEnd))
+        ) {
+          targetEnd++;
+        }
+      }
+      const targetLength = targetEnd - target;
+      return targetLength >= 1 && targetLength <= 500 && t.charCodeAt(targetEnd) === 0x29;
+    },
+    (_, at) => at + 1,
+  );
+}
 
 /** Decoded blobs are bounded so one base64 wall cannot blow up memory. */
 export const MAX_BASE64_CANDIDATE_CHARS = 100_000;
@@ -277,7 +479,7 @@ function phraseHits(
 ): Array<Omit<Finding, "line" | "column">> {
   const raw: Array<Omit<Finding, "line" | "column">> = [];
   for (const rule of INJECTION_RULES) {
-    for (const { index, match } of matchAll(text, rule.pattern)) {
+    for (const { index, match } of rule.matches?.(text) ?? matchAll(text, rule.pattern)) {
       raw.push({
         type: rule.category,
         rule: rule.id,
@@ -366,7 +568,7 @@ export function scanInjection(text: string): InjectionResult {
   }
 
   // Concealment: instruction text inside an HTML comment.
-  for (const { index, match } of matchAll(text, HTML_COMMENT)) {
+  for (const { index, match } of htmlCommentMatches(text)) {
     const inner = match[1] ?? "";
     if (phraseHits(inner, "text").length === 0) continue;
     raw.push({
@@ -393,7 +595,7 @@ export function scanInjection(text: string): InjectionResult {
   }
 
   // Concealment: a link whose label names a different host than its target.
-  for (const { index, match } of matchAll(text, MARKDOWN_LINK)) {
+  for (const { index, match } of markdownLinkMatches(text)) {
     const label = match[1] ?? "";
     const href = match[2] ?? "";
     const labelDomain = DOMAIN_IN_TEXT.exec(label)?.[1]?.toLowerCase();

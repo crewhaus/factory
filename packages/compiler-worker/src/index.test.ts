@@ -50,6 +50,63 @@ agent:
     expect(body.bundle.files.some((f) => f.path === "agent.ts")).toBe(true);
   });
 
+  // 0.7.1 review: the IR passes keep the rules in order now, so an allow
+  // above a narrower deny decides in this path as it does in the CLI's. The
+  // CLI warns about it; this path is told too.
+  test("POST /compile with applyIrPasses warns about a deny an allow above it always beats", async () => {
+    const yaml = `
+name: shadowed
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [bash]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: Bash }
+    - { type: alwaysDeny, pattern: "Bash(rm -rf **)" }
+`;
+    const post = async (applyIrPasses: boolean) => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ yaml, applyIrPasses }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        bundle: { warnings: ReadonlyArray<{ code: string; path: string; message: string }> };
+      };
+      return body.bundle.warnings.filter((w) => w.code.startsWith("permission-rule"));
+    };
+    const warned = await post(true);
+    expect(warned.map((w) => [w.code, w.path])).toEqual([["permission-rule", "permissions.rules"]]);
+    expect(warned[0]?.message).toContain('Move it above "alwaysAllow Bash"');
+    // Without the passes the rules were always kept in order: nothing changed there.
+    expect(await post(false)).toEqual([]);
+    // In plan mode, which reads no allow, the deny fires: a note.
+    const plan = await (async () => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            yaml: yaml.replace("permissions:\n", "permissions:\n  mode: plan\n"),
+            applyIrPasses: true,
+          }),
+        }),
+        env,
+      );
+      const body = (await res.json()) as {
+        bundle: { warnings: ReadonlyArray<{ code: string }> };
+      };
+      return body.bundle.warnings.map((w) => w.code).filter((c) => c.startsWith("permission-rule"));
+    })();
+    expect(plan).toEqual(["permission-rule-note"]);
+  });
+
   test("POST /compile emitAs:cf-worker with a CLI spec returns a worker.js bundle", async () => {
     const yaml = `
 name: hello-cli
@@ -74,6 +131,31 @@ agent:
     expect(file).toBeDefined();
     expect(file?.content).toContain("@crewhaus/worker-runtime");
     expect(file?.content).toContain("runWorkerLoop");
+  });
+
+  test("POST /compile emitAs:cf-worker returns a warning for each builtin the worker leaves out", async () => {
+    const yaml = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch, gitStatus]
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { warnings?: Array<{ code: string; message: string }> };
+    };
+    expect(body.bundle.warnings?.map((w) => w.code)).toEqual(["edge-unsafe-tool"]);
+    expect(body.bundle.warnings?.[0]?.message).toContain('tool "gitStatus" is a builtin');
   });
 
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {
@@ -163,6 +245,68 @@ voice:
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("UNSUPPORTED_TARGET");
+  });
+
+  test("POST /compile emitAs:cf-worker reports an unsupported target before its tools", async () => {
+    // The channel starter's host tools would be refused on the edge too; the
+    // caller must hear about the target first, with the code 0.7.0 returned.
+    const yaml = `
+name: hello-channel
+target: channel
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Reply in the thread.
+  tools: [read, bash]
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("UNSUPPORTED_TARGET");
+    expect(body.error.message).toBe(
+      "cf-worker emit supports target=cli|workflow|graph, got channel",
+    );
+  });
+
+  test("POST /compile accepts a sub-agent that lists builtin web tools (the trader starter's shape)", async () => {
+    // Lowering spells a sub-agent's list with registered names (`WebSearch`);
+    // the strict gate must still read them as the vetted builtins they are.
+    const yaml = `
+name: trader-like
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Research, then trade on paper.
+  sub_agents:
+    researcher:
+      description: Looks things up.
+      instructions: Search, then fetch one page.
+      tools: [webSearch, webFetch, read]
+tools: [read, write, edit, glob, grep, webSearch, webFetch, todoWrite]
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml }),
+      }),
+      env,
+    );
+    const body = (await res.json()) as { error?: { message: string } };
+    expect(body.error?.message).toBeUndefined();
+    expect(res.status).toBe(200);
   });
 
   // FR-002 — Pillar 3 sink-side scope gate. The Worker compiles arbitrary

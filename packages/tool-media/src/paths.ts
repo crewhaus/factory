@@ -12,19 +12,53 @@ import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 
-/** Raised when a caller-supplied path resolves outside the workspace root. */
+/**
+ * The longest path this resolves, in UTF-16 code units; a longer one is
+ * refused before it is walked. Nothing that long can be opened or created:
+ * PATH_MAX is 1,024 bytes on macOS and 4,096 on Linux, Windows stops at
+ * 32,767 UTF-16 units, and a path's UTF-8 form is never shorter than its
+ * UTF-16 one. The limit is twice that because the part of a path that exists
+ * is itself under PATH_MAX, so the part that does not is over PATH_MAX on its
+ * own: no spelling of the place reaches it, not even one through a symlink
+ * that shortens the part that exists.
+ */
+export const MAX_PATH_CHARS =
+  2 * (process.platform === "darwin" ? 1_024 : process.platform === "win32" ? 32_767 : 4_096);
+
+/** A path as a refusal quotes it: whole, unless it is past {@link MAX_PATH_CHARS}. */
+function shownPath(given: string): string {
+  return given.length > MAX_PATH_CHARS ? `${given.slice(0, 64)}…` : given;
+}
+
+/** Why a path past {@link MAX_PATH_CHARS} is refused: its length and the limit. */
+function tooLong(abs: string): string {
+  return `it is ${abs.length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`;
+}
+
+/**
+ * Raised when a caller-supplied path resolves outside the workspace root, or
+ * is longer than any path can be.
+ */
 export class ToolPermissionError extends CrewhausError {
   override readonly name = "ToolPermissionError";
   readonly toolName: string;
   readonly path: string;
+  /**
+   * Why, when it is not that the location escapes the workspace root: a path
+   * longer than any path can be. A caller that rewords the refusal says this.
+   */
+  readonly reason: string | undefined;
 
-  constructor(toolName: string, attemptedPath: string) {
+  constructor(toolName: string, attemptedPath: string, reason?: string) {
     super(
       "tool",
-      `tool "${toolName}" rejected path "${attemptedPath}": resolved location escapes the workspace root`,
+      reason === undefined
+        ? `tool "${toolName}" rejected path "${attemptedPath}": resolved location escapes the workspace root`
+        : `tool "${toolName}" rejected path "${shownPath(attemptedPath)}": ${reason}`,
     );
     this.toolName = toolName;
     this.path = attemptedPath;
+    this.reason = reason;
   }
 }
 
@@ -83,14 +117,7 @@ function nameExists(p: string): boolean {
  */
 function resolveLocation(target: string, depth = 0): string {
   if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break; // reached the filesystem root
-    probe = parent;
-  }
+  const { probe, tail } = deepestName(target);
   let probeReal: string;
   try {
     probeReal = realpathSync(probe);
@@ -110,7 +137,38 @@ function resolveLocation(target: string, depth = 0): string {
     const base = realpathSync(path.dirname(probe));
     probeReal = resolveLocation(path.resolve(base, link), depth + 1);
   }
-  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
+  // One string, not one argument per name: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments.
+  return tail.length > 0 ? path.join(probeReal, tail) : probeReal;
+}
+
+/**
+ * `target`, an absolute path, split where its deepest prefix that exists as
+ * a NAME ends: that prefix, and the names below it, which do not exist, as
+ * one string ("" when `target` itself exists). This is `path.dirname` and
+ * `path.basename` worked by index on `target` itself: handing them each
+ * shorter prefix in turn copied the rest of the path once per missing name,
+ * the square of a count the caller picks.
+ */
+function deepestName(target: string): { readonly probe: string; readonly tail: string } {
+  const top = path.parse(target).root.length;
+  const isSep = (i: number): boolean => target[i] === "/" || target[i] === path.sep;
+  let probe = target;
+  let start = target.length;
+  let stop = -1;
+  while (!nameExists(probe)) {
+    // `path.basename(probe)` is `target.slice(start, end)`, and
+    // `path.dirname(probe)` is `target.slice(0, up)`.
+    let end = probe.length;
+    while (end > top && isSep(end - 1)) end--;
+    if (stop < 0) stop = end;
+    start = end;
+    while (start > top && !isSep(start - 1)) start--;
+    const up = start > top ? start - 1 : top;
+    if (up === probe.length) break; // reached the filesystem root
+    probe = target.slice(0, up);
+  }
+  return { probe, tail: stop < 0 ? "" : target.slice(start, stop) };
 }
 
 /**
@@ -132,6 +190,8 @@ export function resolveSafe(toolName: string, rel: string, root = workspaceRoot(
   if (abs !== rootResolved && !abs.startsWith(`${rootResolved}${path.sep}`)) {
     throw new ToolPermissionError(toolName, rel);
   }
+  // Longer than any path can be: refused before the walk below reads it.
+  if (abs.length > MAX_PATH_CHARS) throw new ToolPermissionError(toolName, rel, tooLong(abs));
   let real: string;
   try {
     const rootReal = realpathSync(rootResolved);

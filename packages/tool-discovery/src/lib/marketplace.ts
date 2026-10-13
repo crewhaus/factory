@@ -51,6 +51,7 @@ import {
   contain,
   containExistingDir,
   fail,
+  pastPathLimit,
   renderPath,
 } from "./result";
 
@@ -100,6 +101,8 @@ export function openLocalRegistry(toolName: string, registryDir: string): Loaded
   const files = entries.filter((name) => name.endsWith(".json")).sort(compareStrings);
   for (const name of files) {
     const rel = dir.rel === "" ? name : `${dir.rel}/${name}`;
+    // Too long to open or create: it leads nowhere, so it is no escape.
+    if (pastPathLimit(rel)) continue;
     if (!contain(toolName, rel).ok) {
       return fail(
         "refused",

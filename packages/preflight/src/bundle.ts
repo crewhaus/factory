@@ -19,9 +19,18 @@ import { join } from "node:path";
 import type { PreflightItem } from "./types";
 
 export type BundleFreshness = {
-  readonly state: "missing-spec" | "missing-bundle" | "stale" | "fresh";
+  /**
+   * `unreadable`: `crewhaus.yaml` or something under `dist/` exists but could
+   * not be examined (a permission error, an I/O error), so whether the bundle
+   * is current is UNKNOWN — see `reason`. It is never reported as
+   * `missing-bundle`: "I could not look" is not "there is nothing there", and
+   * the remedy is not a recompile.
+   */
+  readonly state: "missing-spec" | "missing-bundle" | "stale" | "fresh" | "unreadable";
   readonly specMtimeMs?: number;
   readonly bundleMtimeMs?: number;
+  /** `unreadable` only: the errno and the harness-relative path that failed. */
+  readonly reason?: string;
 };
 
 /** The comparator seam. `runPreflight` defaults to the mtime heuristic;
@@ -30,29 +39,60 @@ export type FreshnessComparator = (
   harnessDir: string,
 ) => BundleFreshness | Promise<BundleFreshness>;
 
-function newestMtimeMs(dir: string): number | undefined {
+type Newest =
+  /** `dist/` is not there (or is not a directory). */
+  | { readonly kind: "absent" }
+  /** Something under `dist/` could not be read: the answer is unknown. */
+  | { readonly kind: "unreadable"; readonly reason: string }
+  /** Walked in full; `newest` is undefined for a `dist/` holding no file. */
+  | { readonly kind: "walked"; readonly newest?: number };
+
+/** The errno, never the message: node puts the absolute path in it. */
+function errnoOf(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? "an unidentified error";
+}
+
+/**
+ * The newest mtime under `dir`. `rel` is the same path relative to the
+ * harness directory, for the reason.
+ *
+ * Only ENOENT is a skip, and only where it means a raced deletion (an entry
+ * listed and gone before it was examined). Any other failure — EACCES on a
+ * subdirectory, EIO on a file — ends the walk as `unreadable`: skipping it
+ * could hide the one file newer than the spec and turn `stale` into `fresh`.
+ */
+function newestMtimeMs(dir: string, rel: string, top: boolean): Newest {
   let newest: number | undefined;
   let entries: Dirent[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return undefined;
+  } catch (err) {
+    const code = errnoOf(err);
+    if (top && (code === "ENOENT" || code === "ENOTDIR")) return { kind: "absent" };
+    if (!top && code === "ENOENT") return { kind: "walked" };
+    return { kind: "unreadable", reason: `${code} listing ${rel}/` };
   }
   for (const entry of entries) {
     const path = join(dir, entry.name);
+    const entryRel = `${rel}/${entry.name}`;
     if (entry.isDirectory()) {
-      const sub = newestMtimeMs(path);
-      if (sub !== undefined && (newest === undefined || sub > newest)) newest = sub;
+      const sub = newestMtimeMs(path, entryRel, false);
+      if (sub.kind === "unreadable") return sub;
+      if (sub.kind === "walked" && sub.newest !== undefined) {
+        if (newest === undefined || sub.newest > newest) newest = sub.newest;
+      }
       continue;
     }
     try {
       const mtime = statSync(path).mtimeMs;
       if (newest === undefined || mtime > newest) newest = mtime;
-    } catch {
-      // Raced deletion — skip.
+    } catch (err) {
+      const code = errnoOf(err);
+      if (code === "ENOENT") continue; // raced deletion (or a link to nothing)
+      return { kind: "unreadable", reason: `${code} examining ${entryRel}` };
     }
   }
-  return newest;
+  return newest === undefined ? { kind: "walked" } : { kind: "walked", newest };
 }
 
 /** The default comparator: `crewhaus.yaml` mtime vs the newest file under
@@ -61,11 +101,17 @@ export function compareBundleFreshnessByMtime(harnessDir: string): BundleFreshne
   let specMtimeMs: number;
   try {
     specMtimeMs = statSync(join(harnessDir, "crewhaus.yaml")).mtimeMs;
-  } catch {
-    return { state: "missing-spec" };
+  } catch (err) {
+    const code = errnoOf(err);
+    if (code === "ENOENT" || code === "ENOTDIR") return { state: "missing-spec" };
+    return { state: "unreadable", reason: `${code} examining crewhaus.yaml` };
   }
-  const bundleMtimeMs = newestMtimeMs(join(harnessDir, "dist"));
-  if (bundleMtimeMs === undefined) return { state: "missing-bundle", specMtimeMs };
+  const walk = newestMtimeMs(join(harnessDir, "dist"), "dist", true);
+  if (walk.kind === "unreadable") return { state: "unreadable", reason: walk.reason, specMtimeMs };
+  if (walk.kind === "absent" || walk.newest === undefined) {
+    return { state: "missing-bundle", specMtimeMs };
+  }
+  const bundleMtimeMs = walk.newest;
   return {
     state: specMtimeMs > bundleMtimeMs ? "stale" : "fresh",
     specMtimeMs,
@@ -96,6 +142,14 @@ export function bundleFreshnessItem(freshness: BundleFreshness): PreflightItem |
         message:
           "crewhaus.yaml is newer than the newest dist/ artifact (approximate mtime heuristic) — the compiled bundle may be running an older spec",
         remediation: "recompile: `crewhaus compile crewhaus.yaml`",
+      };
+    case "unreadable":
+      return {
+        id: "bundle.unreadable",
+        area: "bundle",
+        level: "warn",
+        message: `could not determine whether the compiled bundle is current: ${freshness.reason ?? "a file could not be examined"}`,
+        remediation: "check the permissions on dist/ and crewhaus.yaml",
       };
     case "fresh":
       return {

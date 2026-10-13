@@ -83,6 +83,7 @@ import { readTextCapped } from "./jsonl";
 import { type M3Context, type M3Handler, jobArg, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
+import { keyLineParts, namedValues } from "./spec-lines";
 
 /** The spec file every harness is anchored on. */
 const SPEC_FILE = "crewhaus.yaml";
@@ -559,7 +560,6 @@ export function classifyPath(target: string, segments: readonly string[]): SpecT
 // the lenient path scan
 // ---------------------------------------------------------------------------
 
-const KEY_LINE_RE = /^(\s*)([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:\s+(.*))?$/;
 const BLOCK_SCALAR_RE = /^[|>][-+0-9]*\s*(?:#.*)?$/;
 
 /**
@@ -573,6 +573,10 @@ const BLOCK_SCALAR_RE = /^[|>][-+0-9]*\s*(?:#.*)?$/;
  * |`) are skipped wholesale, so prose that reads `Note: something` never
  * becomes a fake path; and sequence ITEMS are represented by their container
  * path rather than by index, because the console addresses list fields whole.
+ *
+ * Each key line is read by a scan (`keyLineParts`, spec-lines.ts) that
+ * answers what `/^(\s*)([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:\s+(.*))?$/` did;
+ * the pattern was quadratic in a run of spaces on a line holding a U+2028.
  */
 export function declaredPaths(yamlText: string): string[][] {
   const out: string[][] = [];
@@ -598,10 +602,10 @@ export function declaredPaths(yamlText: string): string[][] {
       seqIndent = indent;
       continue;
     }
-    const m = line.match(KEY_LINE_RE);
-    if (m === null) continue;
-    const key = m[2] as string;
-    const value = (m[3] ?? "").trim();
+    const parts = keyLineParts(line);
+    if (parts === null) continue;
+    const [, key, rawValue] = parts;
+    const value = (rawValue ?? "").trim();
     while (stack.length > 0 && (stack[stack.length - 1] as { indent: number }).indent >= indent) {
       stack.pop();
     }
@@ -936,16 +940,18 @@ function readVersionYaml(ctx: M3Context, dirName: string, version: string): stri
 }
 
 /** Optimizer provenance from a version's write-back header comment: the
- *  `runId`/`mutator`/score fields the optimizer stamps above the document. */
+ *  `runId`/`mutator`/score fields the optimizer stamps above the document.
+ *
+ *  The fields are read by a scan (`namedValues`, spec-lines.ts) that finds
+ *  what `/([A-Za-z][A-Za-z0-9_]*)=("[^"]*"|\S+)/g` found: the pattern read a
+ *  long word with no `=` from every letter in it, and with the `m` flag a
+ *  header can start after a U+2028 inside model-written instructions. */
 export function provenanceOf(yamlText: string): Record<string, unknown> | null {
-  const header = /^#\s*crewhaus:optimize\s+(.*)$/m.test(yamlText)
-    ? (yamlText.match(/^#\s*crewhaus:optimize\s+(.*)$/m)?.[1] ?? "")
-    : null;
-  if (header === null) return null;
+  const header = yamlText.match(/^#\s*crewhaus:optimize\s+(.*)$/m)?.[1];
+  if (header === undefined) return null;
   const fields: Record<string, unknown> = {};
-  for (const m of header.matchAll(/([A-Za-z][A-Za-z0-9_]*)=("[^"]*"|\S+)/g)) {
-    const key = m[1] as string;
-    const raw = (m[2] ?? "").replace(/^"|"$/g, "");
+  for (const [key, quoted] of namedValues(header)) {
+    const raw = quoted.replace(/^"|"$/g, "");
     const num = Number(raw);
     fields[key] = raw !== "" && !Number.isNaN(num) ? num : raw;
   }

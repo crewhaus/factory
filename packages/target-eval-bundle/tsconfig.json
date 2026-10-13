@@ -12,7 +12,8 @@
     { "path": "../target-graph" },
     { "path": "../target-pipeline" },
     { "path": "../target-workflow" },
-    { "path": "../tenancy" }
+    { "path": "../tenancy" },
+    { "path": "../tool-categories" }
   ],
   "include": ["src/**/*"]
 }

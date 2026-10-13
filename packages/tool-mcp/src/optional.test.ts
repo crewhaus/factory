@@ -151,7 +151,7 @@ describe("registerOptionalMcpServer", () => {
     });
     expect(await handle.firstAttempt).toBe(true);
     expect(handle.connected()).toBe(true);
-    expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__ping");
     expect(lines.join("")).toContain('optional server "peer" connected — 1 tool(s) registered');
   });
 
@@ -196,7 +196,7 @@ describe("registerOptionalMcpServer", () => {
     flaky.bringUp();
     await timers.fire();
     expect(handle.connected()).toBe(true);
-    expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__ping");
     expect(timers.pending()).toBe(0);
   });
 
@@ -230,7 +230,7 @@ describe("registerOptionalMcpServer", () => {
     });
     expect(await handle.firstAttempt).toBe(true);
     expect(flaky.added).toEqual([{ name: "peer", config }]);
-    expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__ping");
   });
 
   test("config thunk failure (unset env var) degrades permanently — no retry", async () => {
@@ -279,15 +279,15 @@ describe("registerOptionalMcpServer", () => {
     const catalog = new ToolCatalog();
     const handle = registerOptionalMcpServer(flaky.host, "peer", catalog, {});
     await handle.firstAttempt;
-    expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__ping");
     handle.stop();
     // Stopping the watch must NOT yank tools out from under a running turn.
-    expect(catalog.list().map((t) => t.name)).toContain("peer__ping");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__ping");
     // And post-stop drift no longer reconciles.
     flaky.setTools([TOOL_A, TOOL_B]);
     flaky.fireChanged();
     await new Promise((r) => setTimeout(r, 0));
-    expect(catalog.list().map((t) => t.name)).not.toContain("peer__echo");
+    expect(catalog.list().map((t) => t.name)).not.toContain("mcp__peer__echo");
   });
 
   test("a connected optional server stays live-reconciled (G74 watch)", async () => {
@@ -298,7 +298,7 @@ describe("registerOptionalMcpServer", () => {
     flaky.setTools([TOOL_A, TOOL_B]);
     flaky.fireChanged();
     await new Promise((r) => setTimeout(r, 0));
-    expect(catalog.list().map((t) => t.name)).toContain("peer__echo");
+    expect(catalog.list().map((t) => t.name)).toContain("mcp__peer__echo");
   });
 
   test("a one-shot surface's failed peer never holds the process open (real subprocess)", async () => {

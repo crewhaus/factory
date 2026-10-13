@@ -21,12 +21,29 @@ That claim is not left to the reader. The test suite greps this package's own
 source for `node:http`, `node:net`, `node:fs`, a `fetch` call and the rest, so
 an edit that adds one fails a test rather than a review.
 
-It holds no credential either. The access key and secret arrive as arguments
-from whatever the caller uses for secrets, the secret is consumed by the
-signing-key derivation, and it appears in no result, no error and no stack
-trace — asserted on both the success and the failure path. The access key ID
-*is* in the URL: SigV4 puts it in `X-Amz-Credential` by construction, which is
-how the store knows which key to check against. That one is public by design.
+It holds no credential either, and never takes one as an argument. The
+operator names a credential profile in the spec — the environment variables
+that hold the access key id, the secret and, for temporary credentials, the
+session token — and a call picks the profile by name:
+
+```yaml
+tool_config:
+  objectstore:
+    credentials:
+      r2:
+        access_key_id_env: R2_ACCESS_KEY_ID
+        secret_access_key_env: R2_SECRET_ACCESS_KEY
+        # session_token_env: AWS_SESSION_TOKEN   # STS only
+```
+
+Before 0.7.1 the secret and the session token were tool arguments, so they sat
+in the model's context, the transcript and the session log. The secret is
+consumed by the signing-key derivation and appears in no result, no error and
+no stack trace — asserted on both the success and the failure path. The access
+key ID *is* in the URL: SigV4 puts it in `X-Amz-Credential` by construction,
+which is how the store knows which key to check against. That one is public by
+design. A session token rides in the URL too (`X-Amz-Security-Token`), and the
+result says so.
 
 ## Three things that fail hours later
 
@@ -169,10 +186,11 @@ the two carrying `!` `'` `(` `)` `*`.
   "contentType": "application/pdf",
   "metadata": { "run-id": "r-4412" },
   "expiresInSeconds": 900,
-  "accessKeyId": "…",
-  "secretAccessKey": "…"
+  "credentials": "r2"
 }
 ```
+
+`credentials` may be left out when the operator configured exactly one profile.
 
 `signedAt` pins the signing instant, so a URL can be reproduced exactly when
 somebody asks why theirs stopped working. `includeCanonical` returns the

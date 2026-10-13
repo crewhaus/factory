@@ -118,6 +118,12 @@ instead of reporting: a version written from a partial read is a version that si
   from `@crewhaus/tool-pkg`), which refuses anything resolving outside `process.cwd()`, including
   via a symlink that lives inside the workspace. Every result says which root it used and where
   that root came from (`input` / `env` / `default`).
+- So does every path **under** the root. Before the registry touches `<root>/<name>` or
+  `<root>/<name>/<version>.json`, each is resolved with its links followed and refused if it lands
+  outside the workspace, and a record that is not a regular file (a FIFO, a device) is refused
+  without being opened. A dataset directory linked to another place inside the workspace still
+  works. A new version is created exclusively, so nothing already at its name — a link included —
+  is written through.
 - A dataset file path is **never** handed to `loadDataset`, which dispatches `http(s)://` to a
   fetching loader. The extension of the *resolved, contained* path selects a local loader, so a
   caller-supplied URL can only ever be a (missing) local file.

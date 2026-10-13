@@ -142,6 +142,57 @@ describe("projectEvalIr (#10)", () => {
 
 // Evals Wave 4, cluster S (D36 + NEW-shape-1) — the multi-stage rejection is
 // LIFTED: workflow/graph/crew/pipeline project into runtime-invoking bridges.
+describe("projectEvalIr — tool_config and permission rules (C002)", () => {
+  const RESEARCH_YAML = `
+name: rsch
+target: research
+agent:
+  model: claude-sonnet-4-6
+  instructions: Research things.
+goal: What is up?
+branchingFactor: 2
+maxDurationMs: 60000
+tools: [httpRequest, gitStatus]
+tool_config:
+  http:
+    allowed_origins: [https://api.example.com]
+permissions:
+  mode: default
+  rules:
+    - type: alwaysDeny
+      pattern: GitStatus
+`;
+
+  test("a single-agent shape carries its tool_config and rules to the bridge's runner", () => {
+    const projected = projectEvalIr(ir(RESEARCH_YAML));
+    expect(projected.agent.tools).toEqual(["httpRequest", "gitStatus"]);
+    expect(projected.toolConfigs).toEqual({
+      http: { allowed_origins: ["https://api.example.com"] },
+    });
+    expect(projected.permissions).toEqual({
+      rules: [{ type: "alwaysDeny", pattern: "GitStatus" }],
+    });
+  });
+
+  test("a spec without either leaves both keys out (0.7.0's projection)", () => {
+    const projected = projectEvalIr(ir(CHANNEL_YAML));
+    expect("toolConfigs" in projected).toBe(false);
+    expect("permissions" in projected).toBe(false);
+  });
+
+  test("a multi-stage descriptor carries neither: its compiled entry runs its own", () => {
+    const projected = projectEvalIr(
+      ir(`${WORKFLOW_YAML}permissions:
+  rules:
+    - type: alwaysDeny
+      pattern: Bash
+`),
+    );
+    expect("permissions" in projected).toBe(false);
+    expect("toolConfigs" in projected).toBe(false);
+  });
+});
+
 describe("projectEvalIr — multi-stage shapes (cluster S)", () => {
   const GRAPH_YAML = `
 name: a-graph

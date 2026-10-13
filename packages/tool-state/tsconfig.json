@@ -5,7 +5,8 @@
     { "path": "../errors" },
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../vector-store" }
   ],
   "include": ["src/**/*"]
 }

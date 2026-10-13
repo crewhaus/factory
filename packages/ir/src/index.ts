@@ -41,11 +41,30 @@ export type IrPermissions = {
  * unresolved config verbatim and the emitted bundle resolves it at process
  * start via `resolveMcpServerConfig` from `@crewhaus/mcp-host`.
  */
+/**
+ * 0.7.1 — `mcp_servers.<n>.tool_flags`, lowered. Tighten-only: every flag is
+ * the literal `true`, and there is no `readOnly` (it is a grant). `perTool`
+ * is keyed by the server's own tool name. The emitted bundle hands it to
+ * `resolveMcpServerConfig` with the rest of the config, and `@crewhaus/tool-mcp`
+ * folds it in when it registers the server's tools. Mirrors
+ * `McpToolFlagsConfig` in `@crewhaus/mcp-host`.
+ */
+export type IrMcpToolTrustFlags = {
+  readonly destructive?: true;
+  readonly requireJustification?: true;
+};
+export type IrMcpToolFlags = {
+  readonly defaults?: IrMcpToolTrustFlags;
+  readonly perTool?: Readonly<Record<string, IrMcpToolTrustFlags>>;
+};
+
 export type IrMcpStdioConfig = {
   readonly transport: "stdio";
   readonly command: string;
   readonly args: readonly string[];
   readonly env?: Readonly<Record<string, IrSecretRef>>;
+  /** Present only when the spec sets `tool_flags`, so other configs lower byte-identically. */
+  readonly toolFlags?: IrMcpToolFlags;
   /** #406 — present (false) ONLY when the spec opted out of fail-fast
    *  (`required: false`): a failed boot connect degrades + retries instead
    *  of exiting. Absent = required, byte-identical to pre-#406. */
@@ -56,6 +75,8 @@ export type IrMcpSseConfig = {
   readonly transport: "sse";
   readonly url: string;
   readonly headers?: Readonly<Record<string, IrSecretRef>>;
+  /** See {@link IrMcpStdioConfig.toolFlags}. */
+  readonly toolFlags?: IrMcpToolFlags;
   /** #406 — see {@link IrMcpStdioConfig.required}. */
   readonly required?: false;
 };
@@ -2553,13 +2574,17 @@ export type IrChainTrigger =
     };
 
 /**
- * Section 47 — IR for the `onchain` target shape. The compiled daemon
+ * Section 47 — IR for the `onchain` target shape. The intended daemon
  * subscribes to the configured triggers, dedupes events by `(txHash,
  * logIndex)` within `idempotencyWindowMs`, and runs one
- * `runChatLoop({singleTurn: true})` per inbound trigger with the
- * decoded payload as the user message. The agent has access to the
- * standard tool catalog (including §47 `tool-evm` + `tool-evm-tx`) so
- * it can respond with transactions, alerts, or notifications.
+ * `runChatLoop({singleTurn: true})` per inbound trigger with the decoded
+ * payload as the user message.
+ *
+ * Not yet: the emitter (target-onchain) wires the chain adapters and the
+ * trigger metadata only and emits no agent loop, so `tools`, `toolConfigs`
+ * and `mcp_servers` are lowered here but nothing consumes them. The compiler
+ * says so (an accepted-but-unwired warning per key) and the bundle README
+ * marks each tool "not wired" (C140, shape-reach#7).
  */
 export type IrChainV0 = {
   readonly version: 0;
@@ -2602,6 +2627,11 @@ export type IrChainV0 = {
  */
 export type IrChainGameTurnSemantics = "turn-based" | "real-time" | "async";
 
+/**
+ * Like {@link IrChainV0}, the onchain-game emitter runs no agent loop yet:
+ * `tools`, `toolConfigs` and `mcp_servers` are lowered and not consumed, and
+ * the compiler warns for each one declared.
+ */
 export type IrChainGameV0 = {
   readonly version: 0;
   readonly name: string;
@@ -2676,6 +2706,7 @@ export {
   type BundleReadmeSection,
   type CollectedSecretRefs,
   type EmitReadmeOptions,
+  type ReadmeToolFacts,
   GENERATED_README_MARKER,
   collectSecretRefs,
   renderBundleReadme,

@@ -2,14 +2,15 @@
  * The one place this package starts a child process — and the seam every
  * test drives instead of the machine.
  *
- * The conventions here are `@crewhaus/tool-proc`'s (`src/spawn.ts`), copied
- * rather than re-invented: argv is an ARRAY, stdin is closed unless supplied,
- * every run has a deadline with a SIGTERM and then a SIGKILL behind it, and
- * both streams are capped so one chatty command cannot fill a context window.
- * They are copied instead of imported because tool-proc publishes only its
- * tools from `src/index.ts`; `runOnce` is not on its public surface, and
- * reaching past a package's exports map to grab it would be worse than a
- * documented copy.
+ * The spawn is `@crewhaus/tool-safety`'s `spawnBounded`, the one tool-proc
+ * uses too: argv is an ARRAY, stdin is closed unless supplied, every run has
+ * a deadline with a SIGTERM and then a SIGKILL behind it (to the child's
+ * whole process group), both streams are capped AS THEY ARE READ, and a pipe
+ * a grandchild still holds after the child exits is read for a bounded
+ * grace and then cut, with the result saying so (C078). 0.7.0 kept a copy
+ * here that buffered each stream whole before capping it, and on a drain
+ * that outlived the grace returned "" — which every reader took for an
+ * empty listing.
  *
  * Two rules on top of tool-proc's, both specific to reading a scheduler:
  *
@@ -25,33 +26,24 @@
  *      with "Failed to connect to bus" — a pinned-env bug that looks exactly
  *      like "this host has no timers".
  *
- * Nothing in this file is reachable from a test: `_setRunner` replaces all of
- * it, and the suite drives recorded fixtures. That is deliberate — CI is
- * Linux, development is macOS, and a test that asked the real host what it
- * had scheduled would assert something different on each.
+ * The scheduler readers never reach this runner in a test: `_setRunner`
+ * replaces it, and the suite drives recorded fixtures. That is deliberate —
+ * CI is Linux, development is macOS, and a test that asked the real host
+ * what it had scheduled would assert something different on each. The
+ * runner itself is tested (run.test.ts) with `sh`, never with a scheduler.
  */
+import { constants } from "node:os";
+import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/streams";
 
-/** Grace between the deadline's SIGTERM and the SIGKILL that follows it. */
-const KILL_GRACE_MS = 2_000;
-/**
- * After the SIGKILL, how long to keep waiting for the child to be reaped.
- *
- * tool-proc's `REAP_GRACE_MS`, and here for its reason: SIGKILL cannot be
- * caught, but it cannot interrupt a process wedged in an uninterruptible
- * kernel wait either, and `systemctl` talking to a dead bus over a stale
- * socket is exactly the shape of command that gets stuck there. Every other
- * bound in this file is downstream of `await proc.exited`, so without this
- * one a wedged child hangs the whole tool with no deadline left to save it.
- * (There is no portable way to put a process into that state, so this is the
- * one guarantee here with no test behind it — same as in tool-proc.)
- */
-const REAP_GRACE_MS = 1_000;
 /**
  * A child that forks a grandchild leaves the pipe's write end open after it
- * is gone, so reading to EOF can outlive the process. Bound the drain and
- * return what arrived. (`launchctl` does exactly this on macOS.)
+ * is gone, so reading to EOF can outlive the process. The drain is bounded
+ * by this, and what arrived is returned with `outputIncomplete`.
+ * (`launchctl` does exactly this on macOS.) SIGKILL follows SIGTERM after
+ * spawnBounded's 2 s grace, and a child that is not reaped 1 s after that
+ * (`systemctl` wedged on a dead bus) is abandoned, as before.
  */
-const DRAIN_GRACE_MS = 500;
+export const DRAIN_GRACE_MS = 500;
 /** Per-stream cap. A crontab or a unit listing that exceeds this is not one. */
 export const MAX_OUTPUT_CHARS = 512_000;
 /** Default per-command deadline. Every scheduler command here is local. */
@@ -108,6 +100,13 @@ export type HostResult = {
    */
   readonly abandoned?: boolean;
   /**
+   * Set when reading stopped before a stream ended: the command exited but a
+   * process it started still held its output open past `DRAIN_GRACE_MS`.
+   * What came back is what arrived by then — possibly all of it, possibly
+   * not — so every reader treats it as unreadable, never as the listing.
+   */
+  readonly outputIncomplete?: boolean;
+  /**
    * Set when the program could not be started at all — the honest signal for
    * "this host does not have `systemctl`", which is a different answer from
    * "systemctl ran and reported nothing".
@@ -138,8 +137,9 @@ export function checkArgument(what: string, value: string): string | undefined {
   return undefined;
 }
 
-function capText(text: string): { text: string; truncated: boolean } {
-  if (text.length <= MAX_OUTPUT_CHARS) return { text, truncated: false };
+/** A stream's kept head, cut to `MAX_OUTPUT_CHARS`, and whether anything was not kept. */
+function capHead(text: string, truncatedAsRead: boolean): { text: string; truncated: boolean } {
+  if (text.length <= MAX_OUTPUT_CHARS) return { text, truncated: truncatedAsRead };
   return { text: text.slice(0, MAX_OUTPUT_CHARS), truncated: true };
 }
 
@@ -163,97 +163,57 @@ export function buildEnv(source: NodeJS.ProcessEnv = process.env): Record<string
 }
 
 const defaultRunner: HostRunner = async (cmd) => {
-  const timeoutMs = cmd.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn([...cmd.argv], {
-      // No `cwd` is passed: every path this package touches is absolute, and
-      // inheriting the harness's directory keeps the child from depending on
-      // one this tool chose.
-      env: buildEnv(),
-      stdin: cmd.stdin === undefined ? "ignore" : new TextEncoder().encode(cmd.stdin),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-  } catch (err) {
+  const r = await spawnBounded({
+    cmd: cmd.argv,
+    // No `cwd` is passed: every path this package touches is absolute, and
+    // inheriting the harness's directory keeps the child from depending on
+    // one this tool chose.
+    env: buildEnv(),
+    ...(cmd.stdin !== undefined ? { stdin: cmd.stdin } : {}),
+    timeoutMs: cmd.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+    // A prefix, never head-and-tail: a listing's reader needs its start, and
+    // the flag below tells it the rest is missing. Three bytes per character
+    // is the most UTF-8 ever needs, so MAX_OUTPUT_CHARS always fits.
+    maxStdoutBytes: MAX_OUTPUT_CHARS * 3,
+    maxStderrBytes: MAX_OUTPUT_CHARS * 3,
+    drainGraceMs: DRAIN_GRACE_MS,
+  });
+  if (r.spawnError !== undefined) {
     return {
       argv: cmd.argv,
       exitCode: -1,
       stdout: "",
       stderr: "",
       timedOut: false,
-      spawnError: err instanceof Error ? err.message : String(err),
+      spawnError: r.spawnError,
     };
   }
-
-  let timedOut = false;
-  let reapGiveUp: ReturnType<typeof setTimeout> | undefined;
-  const term = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Already gone between the timer firing and the signal.
-    }
-  }, timeoutMs);
-  const hardKill = setTimeout(() => {
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }, timeoutMs + KILL_GRACE_MS);
-
-  try {
-    // `.catch` is attached here, not after the race below: a stream torn down
-    // with a killed process rejects, and an unhandled rejection takes down the
-    // harness rather than the command that caused it.
-    const stdoutText = new Response(proc.stdout as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const stderrText = new Response(proc.stderr as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const abandonedMarker = Symbol("abandoned");
-    const reaped = await Promise.race([
-      proc.exited,
-      new Promise<typeof abandonedMarker>((resolve) => {
-        reapGiveUp = setTimeout(
-          () => resolve(abandonedMarker),
-          timeoutMs + KILL_GRACE_MS + REAP_GRACE_MS,
-        );
-      }),
-    ]);
-    const abandoned = reaped === abandonedMarker;
-    const exitCode = abandoned ? -1 : (reaped as number);
-    const drainFallback = (): Promise<string> =>
-      new Promise((resolve) => setTimeout(() => resolve(""), DRAIN_GRACE_MS));
-    const [rawOut, rawErr] = await Promise.all([
-      Promise.race([stdoutText, drainFallback()]),
-      Promise.race([stderrText, drainFallback()]),
-    ]);
-    const out = capText(rawOut);
-    const err = capText(rawErr);
-    return {
-      argv: cmd.argv,
-      exitCode,
-      stdout: out.text,
-      stderr: err.text,
-      // Carried, not dropped: a prefix of a scheduler's output is not that
-      // scheduler's output, and the readers have to be able to tell.
-      ...(out.truncated ? { stdoutTruncated: true } : {}),
-      ...(err.truncated ? { stderrTruncated: true } : {}),
-      timedOut: timedOut || abandoned,
-      ...(abandoned ? { abandoned: true } : {}),
-    };
-  } finally {
-    clearTimeout(term);
-    clearTimeout(hardKill);
-    // Unconditional: left running, this would hold the event loop open for
-    // the whole timeout on every command that finished in a millisecond.
-    if (reapGiveUp !== undefined) clearTimeout(reapGiveUp);
-  }
+  const out = capHead(r.stdout, r.stdoutTruncated);
+  const err = capHead(r.stderr, r.stderrTruncated);
+  return {
+    argv: cmd.argv,
+    exitCode: r.abandoned ? -1 : exitStatus(r),
+    stdout: out.text,
+    stderr: err.text,
+    // Carried, not dropped: a prefix of a scheduler's output is not that
+    // scheduler's output, and the readers have to be able to tell.
+    ...(out.truncated ? { stdoutTruncated: true } : {}),
+    ...(err.truncated ? { stderrTruncated: true } : {}),
+    timedOut: r.timedOut || r.abandoned,
+    ...(r.abandoned ? { abandoned: true } : {}),
+    ...(r.outputComplete ? {} : { outputIncomplete: true }),
+  };
 };
+
+/** The status a shell would report: 128 + the signal's number for a signalled child. */
+function exitStatus(r: SpawnBoundedResult): number {
+  if (r.exitCode !== null) return r.exitCode;
+  if (r.signal !== null) {
+    const n = (constants.signals as Record<string, number | undefined>)[r.signal];
+    if (n !== undefined) return 128 + n;
+  }
+  return -1;
+}
 
 let runner: HostRunner = defaultRunner;
 
@@ -292,6 +252,9 @@ export function unreadableReason(
     return `${what} ignored SIGTERM and SIGKILL and was left behind, so its output is incomplete`;
   }
   if (result.timedOut) return `${what} did not finish within ${timeoutMs}ms`;
+  if (result.outputIncomplete === true) {
+    return `${what} exited, but a process it started kept its output open past ${DRAIN_GRACE_MS}ms, so what came back may be incomplete`;
+  }
   if (result.stdoutTruncated === true) {
     return `${what} printed more than ${MAX_OUTPUT_CHARS} characters, so what came back is a PREFIX of its output, not the whole of it`;
   }

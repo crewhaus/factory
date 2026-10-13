@@ -1,3 +1,4 @@
+import type { ProviderFeatures } from "@crewhaus/adapter-anthropic";
 /**
  * `buildAdvertisement` (§4.4, §5) — the SUBSET-ONLY per-candidate toolset.
  *
@@ -15,7 +16,7 @@
  * gate that makes it a subset in EXECUTION lives in runtime-core (§4.4 item
  * 3) and reads the same `names` set this returns.
  */
-import type { ProviderFeatures } from "@crewhaus/adapter-anthropic";
+import { toolConfigBlockFor } from "@crewhaus/tool-categories";
 import type { CandidateCapabilities, FeatureRequirement, ModelProfile } from "./types.js";
 
 /** The minimum a tool must carry to be advertised — `RegisteredTool` satisfies it. */
@@ -157,41 +158,49 @@ export function satisfiesFeatures(
  * so this cannot make one pattern match two tools.
  */
 export function matchesToolPattern(pattern: string, name: string): boolean {
+  if (matchesToolSpelling(pattern, name)) return true;
+  // 0.7.1 — an MCP tool is registered as `mcp__<server>__<tool>`; a pattern
+  // written against its pre-0.7.1 spelling `<server>__<tool>` still names it.
+  const legacy = legacyMcpName(name);
+  return legacy !== undefined && matchesToolSpelling(pattern, legacy);
+}
+
+function matchesToolSpelling(pattern: string, name: string): boolean {
   if (!pattern.includes("*"))
     return pattern === name || pattern.toLowerCase() === name.toLowerCase();
   return globToRegExp(pattern).test(name);
 }
 
-/** The spec keys whose `tool_config` block every code-execution tool shares. */
-const CODE_EXECUTION_CONFIG_ALIASES = ["codeExecution", "code_execution"] as const;
-const CODE_EXECUTION_TOOL_NAMES = new Set(["python", "javascript", "shell"]);
+/**
+ * `<server>__<tool>` for an `mcp__<server>__<tool>` name, else undefined. The
+ * same rule as `legacyMcpToolName` in `@crewhaus/tool-catalog` and
+ * `@crewhaus/tool-permission-matcher`; this package keeps its own copy so it
+ * stays free of tool-package dependencies, and apps/cli's
+ * `mcp-names.test.ts` checks the copies agree.
+ */
+function legacyMcpName(name: string): string | undefined {
+  if (!name.startsWith("mcp__")) return undefined;
+  const rest = name.slice("mcp__".length);
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
 
 /**
  * 0.6.0 §4.4 — the per-candidate `tool_config` block that applies to ONE
- * tool: the entry keyed by the tool's registered name, else by its spec
- * spelling (the same case-insensitive rule `matchesToolPattern` applies),
- * else — for the code-execution family (`Python` / `JavaScript` / `Shell`)
- * — the shared `codeExecution` / `code_execution` alias codegen's
- * `resolveTools` honours for the boot-time registration. `undefined` when
- * the candidate declares nothing for the tool, so the tool reads its
- * registered config as before.
+ * tool: the entry keyed by the tool's registered name or its spec key (the
+ * same case-insensitive rule `matchesToolPattern` applies), else its
+ * package's documented key — `tool_config.http` for `HttpRequest`,
+ * `codeExecution` for `Python`. The rule is the builtin table's
+ * (`toolConfigBlockFor` in `@crewhaus/tool-categories`), so a candidate reads
+ * the keys a boot registration reads. `undefined` when the candidate declares
+ * nothing for the tool, so the tool reads its registered config as before.
  */
 export function toolConfigFor(
   toolConfigs: Readonly<Record<string, unknown>> | undefined,
   toolName: string,
 ): unknown {
-  if (toolConfigs === undefined) return undefined;
-  if (toolConfigs[toolName] !== undefined) return toolConfigs[toolName];
-  const lower = toolName.toLowerCase();
-  for (const [key, value] of Object.entries(toolConfigs)) {
-    if (key.toLowerCase() === lower && value !== undefined) return value;
-  }
-  if (CODE_EXECUTION_TOOL_NAMES.has(lower)) {
-    for (const alias of CODE_EXECUTION_CONFIG_ALIASES) {
-      if (toolConfigs[alias] !== undefined) return toolConfigs[alias];
-    }
-  }
-  return undefined;
+  return toolConfigBlockFor(toolConfigs, toolName);
 }
 
 function globToRegExp(pattern: string): RegExp {

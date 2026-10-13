@@ -45,6 +45,15 @@
  * directory cannot get past it either — decompression aborts mid-stream
  * rather than after the fact. (This is why `node:zlib` is used here instead
  * of `Bun.inflateSync`, which has no output cap.)
+ *
+ * The input is bounded too. Any number of central-directory entries, and
+ * any number of reads, may name the same compressed data, and a stream
+ * padded with empty stored blocks costs its whole length to inflate however
+ * little it writes. So each compressed span is inflated once per archive,
+ * and the distinct spans inflated may come to no more than the archive's
+ * own size: members that each have their own data never exceed it, since
+ * theirs do not overlap. Every read still counts its output against
+ * `maxTotalBytes`, as before.
  */
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
@@ -96,6 +105,17 @@ const SIG_CENTRAL = 0x02014b50;
 const SIG_LOCAL = 0x04034b50;
 
 const UTF8 = new TextDecoder("utf-8", { fatal: false });
+
+/** What a deflated entry is inflated with. */
+const inflater = { raw: inflateRawSync };
+
+/**
+ * Test seam: stand in for the inflater, so a test can count the bytes it is
+ * handed and returns. Pass `undefined` to restore.
+ */
+export function _setInflateRawForTest(fn: typeof inflateRawSync | undefined): void {
+  inflater.raw = fn ?? inflateRawSync;
+}
 
 function u16(b: Uint8Array, at: number): number {
   const lo = b[at];
@@ -201,6 +221,15 @@ export class ZipArchive {
   private readonly limits: ZipLimits;
   private spent = 0;
   private readonly byName: Map<string, ZipEntry>;
+  /**
+   * Each deflated span's output, or the inflater's error, by where the span
+   * starts and how long it is: everything the answer depends on. Kept for
+   * the archive's life; each output was counted against `maxTotalBytes`
+   * when it was first read.
+   */
+  private readonly inflated = new Map<string, Uint8Array | { readonly failed: string }>();
+  /** Compressed bytes of the distinct spans inflated so far. */
+  private inflatedIn = 0;
 
   private constructor(data: Uint8Array, entries: ZipEntry[], limits: ZipLimits) {
     this.data = data;
@@ -320,18 +349,7 @@ export class ZipArchive {
       throw new ZipError(`zip entry "${name}" runs past the end of the file`);
     }
     const raw = this.data.subarray(dataStart, dataEnd);
-    let out: Uint8Array;
-    if (entry.method === 0) {
-      out = raw;
-    } else {
-      try {
-        // maxOutputLength aborts the inflate itself — this is the bound that
-        // makes a zip bomb cost nothing, not a check applied afterwards.
-        out = inflateRawSync(raw, { maxOutputLength: this.limits.maxEntryBytes + 1 });
-      } catch (err) {
-        throw new ZipError(`zip entry "${name}" failed to decompress: ${(err as Error).message}`);
-      }
-    }
+    const out = entry.method === 0 ? raw : this.inflate(name, dataStart, raw);
     if (out.length > this.limits.maxEntryBytes) {
       throw new ZipError(
         `zip entry "${name}" decompressed past the ${this.limits.maxEntryBytes} per-entry limit`,
@@ -344,6 +362,35 @@ export class ZipArchive {
       );
     }
     return out;
+  }
+
+  /**
+   * A deflated span's output, inflated the first time any entry names it
+   * and kept for every later read. A span not inflated before is refused
+   * when it would bring the distinct spans inflated past the archive's own
+   * size, which only entries whose data overlaps can do.
+   */
+  private inflate(name: string, start: number, raw: Uint8Array): Uint8Array {
+    const key = `${start}:${raw.length}`;
+    let done = this.inflated.get(key);
+    if (done === undefined) {
+      if (this.inflatedIn + raw.length > this.data.length) {
+        throw new ZipError(
+          `zip entry "${name}" overlaps the data of other entries: reading it would inflate more than the archive's ${this.data.length} bytes, which only a crafted zip does`,
+        );
+      }
+      this.inflatedIn += raw.length;
+      try {
+        // maxOutputLength aborts the inflate itself — this is the bound that
+        // makes a zip bomb cost nothing, not a check applied afterwards.
+        done = inflater.raw(raw, { maxOutputLength: this.limits.maxEntryBytes + 1 });
+      } catch (err) {
+        done = { failed: (err as Error).message };
+      }
+      this.inflated.set(key, done);
+    }
+    if (done instanceof Uint8Array) return done;
+    throw new ZipError(`zip entry "${name}" failed to decompress: ${done.failed}`);
   }
 
   /** An entry decoded as UTF-8 text. Used for every OOXML part. */

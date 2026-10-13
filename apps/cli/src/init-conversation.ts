@@ -50,6 +50,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { ASK_USER_TOOL, EMIT_SPEC_TOOL, buildInterviewSystemPrompt } from "./init-interactive";
+import { mapsARequirement } from "./model-reply-text";
 
 /** The saved-interview hint appended to every terminal-failure report and to
  *  the incomplete-interview error (design §2.9's exact promise). */
@@ -130,7 +131,6 @@ function interviewRuleSet(): RuleSet {
  * produced; correctness of the written spec never depends on it.
  */
 export function extractReqMappingLines(rawJsonl: string): string[] {
-  const mapRe = /REQ-\d+.*(?:→|->)/;
   let lines: string[] = [];
   for (const line of rawJsonl.split("\n")) {
     if (line.trim() === "") continue;
@@ -156,7 +156,7 @@ export function extractReqMappingLines(rawJsonl: string): string[] {
     const matching = text
       .split("\n")
       .map((l) => l.trim())
-      .filter((l) => mapRe.test(l));
+      .filter((l) => mapsARequirement(l));
     if (matching.length > 0) lines = matching;
   }
   return lines;

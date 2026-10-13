@@ -29,6 +29,7 @@ import {
   desktopNotify,
   openExternal,
   powerAssertion,
+  powerStateFile,
   printDocument,
 } from "./index";
 import { escapeXmlText } from "./lib/escape";
@@ -128,7 +129,8 @@ function everythingSent(): string[] {
   return out;
 }
 
-const STATE_FILE = `${process.cwd()}/.crewhaus/power-assertion.json`;
+/** The private record's path; the in-memory fs keys on it, so nothing is written. */
+const STATE_FILE = powerStateFile();
 
 // ---------------------------------------------------------------------------
 // OpenExternal — the scheme gate is a parse, and the parse must be the thing
@@ -415,7 +417,7 @@ test("a state file that is not a complete record crashes nothing and is not 'non
       expect(detachSeen).toEqual([]);
       // The file is left exactly as it was, for an operator to look at.
       expect(files.get(STATE_FILE)).toBe(text);
-      expect(String(out["statePath"])).toContain("power-assertion.json");
+      expect(out["statePath"]).toBe(STATE_FILE);
     }
   }
   // A COMPLETE record still works, so the validator is not simply refusing
@@ -491,6 +493,113 @@ test("a command line that merely mentions the holder is not the holder", async (
   expect(out["outcome"]).toBe("stale");
   expect(argvSeen.map((call) => call.argv[0])).toEqual(["ps"]);
   expect(argvSeen.some((call) => call.argv[0] === "kill")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// PowerAssertion — the record supplies the pid, so it must not also choose
+// what that pid is checked against (security-10#1)
+// ---------------------------------------------------------------------------
+
+/** A complete record for `pid`, as a planted file would carry it. */
+function record(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    pid: 4242,
+    marker: "caffeinate",
+    backend: "caffeinate",
+    platform: "darwin",
+    scope: "system",
+    startedAt: 1_700_000_000_000,
+    expiresAt: 1_700_000_600_000,
+    reason: null,
+    ...over,
+  });
+}
+
+test("a state record cannot choose the marker its pid is checked against", async () => {
+  // BEFORE THE FIX: liveness compared the live command line with the
+  // record's own `marker`, so {pid, marker:"sleep"} made `status` answer
+  // "alive" for the operator's `sleep 300` and `release` SIGTERM it.
+  files = new Map([[STATE_FILE, record({ marker: "sleep" })]]);
+  answers["ps"] = { code: 0, stdout: "sleep 300\n" };
+  const status = parse(await powerAssertion.execute({ action: "status" } as never));
+  expect(status["liveness"]).toBe("reused");
+  const released = parse(await powerAssertion.execute({ action: "release" } as never));
+  expect(released["outcome"]).toBe("stale");
+  expect(argvSeen.map((call) => call.argv[0])).toEqual(["ps", "ps"]);
+  expect(argvSeen.some((call) => call.argv[0] === "kill")).toBe(false);
+});
+
+test("the operator's own caffeinate or inhibitor is not taken for this package's holder", async () => {
+  // BEFORE THE FIX: the program name alone matched, so a record naming the
+  // pid of the operator's `caffeinate -d` released it.
+  files = new Map([[STATE_FILE, record()]]);
+  answers["ps"] = { code: 0, stdout: "caffeinate -d\n" };
+  expect(parse(await powerAssertion.execute({ action: "release" } as never))["outcome"]).toBe(
+    "stale",
+  );
+  _setPlatform("linux");
+  files = new Map([[STATE_FILE, record({ platform: "linux", marker: "systemd-inhibit" })]]);
+  answers["ps"] = { code: 0, stdout: "systemd-inhibit --what=sleep gnome-session\n" };
+  expect(parse(await powerAssertion.execute({ action: "release" } as never))["outcome"]).toBe(
+    "stale",
+  );
+  _setPlatform("win32");
+  files = new Map([[STATE_FILE, record({ platform: "win32", marker: "chrome" })]]);
+  answers["powershell.exe"] = {
+    code: 0,
+    stdout: '"C:\\Program Files\\chrome.exe" --type=renderer',
+  };
+  answers["powershell"] = answers["powershell.exe"];
+  expect(parse(await powerAssertion.execute({ action: "release" } as never))["outcome"]).toBe(
+    "stale",
+  );
+  expect(argvSeen.some((call) => call.argv[0] === "kill" || call.argv[0] === "taskkill")).toBe(
+    false,
+  );
+});
+
+test("a record made on another platform is foreign: nothing is probed or signalled", async () => {
+  files = new Map([[STATE_FILE, record({ platform: "linux", marker: "caffeinate" })]]);
+  answers["ps"] = { code: 0, stdout: "caffeinate -i -m -t 1800\n" };
+  const out = parse(await powerAssertion.execute({ action: "release" } as never));
+  expect(out["outcome"]).toBe("stale");
+  expect(String(out["reason"])).toContain("made on linux");
+  expect(argvSeen).toEqual([]);
+});
+
+test("this package's own holder is still released (positive control)", async () => {
+  files = new Map([[STATE_FILE, record()]]);
+  answers["ps"] = { code: 0, stdout: "/usr/bin/caffeinate -i -m -t 1800\n" };
+  const out = parse(await powerAssertion.execute({ action: "release" } as never));
+  expect(out["outcome"]).toBe("released");
+  expect(argvSeen.map((call) => call.argv)).toEqual([
+    ["ps", "-o", "command=", "-p", "4242"],
+    ["kill", "-TERM", "4242"],
+  ]);
+  expect(files.has(STATE_FILE)).toBe(false);
+});
+
+test("a dry-run release changes nothing, the record included", async () => {
+  // BEFORE THE FIX: a dry run that found the holder gone or reused deleted
+  // the record before the dryRun branch was reached.
+  for (const stdout of ["", "sleep 300\n"]) {
+    files = new Map([[STATE_FILE, record()]]);
+    answers["ps"] = stdout === "" ? { code: 1, stdout } : { code: 0, stdout };
+    const out = parse(await powerAssertion.execute({ action: "release", dryRun: true } as never));
+    expect(["expired", "stale"]).toContain(out["outcome"]);
+    expect(files.get(STATE_FILE)).toBe(record());
+  }
+});
+
+test("a record planted where 0.7.0 kept it is never read or signalled", async () => {
+  const legacy = `${process.cwd()}/.crewhaus/power-assertion.json`;
+  files = new Map([[legacy, record({ marker: "sleep" })]]);
+  answers["ps"] = { code: 0, stdout: "sleep 300\n" };
+  expect(STATE_FILE.startsWith(process.cwd())).toBe(false);
+  const out = parse(await powerAssertion.execute({ action: "release" } as never));
+  expect(out["outcome"]).toBe("none");
+  expect(out["legacyStateFile"]).toBe(".crewhaus/power-assertion.json");
+  expect(argvSeen).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

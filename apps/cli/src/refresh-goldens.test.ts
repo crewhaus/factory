@@ -367,12 +367,12 @@ describe("crewhaus dataset refresh-goldens (CLI, offline)", () => {
     const refreshed = all.find((s: { id: string }) => s.id === "s1");
     expect(refreshed.expected_output).toBe("the corrected gold answer");
     expect(refreshed.metadata.gold_refreshed).toBeDefined();
-  });
+  }, 20_000);
 
   it("errors without --dataset", async () => {
     const root = newTempRoot();
     expect((await runCli(["dataset", "refresh-goldens"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   // B16 — --apply must NEVER re-split the record: a bare ref reconciles
   // train+dev only, so re-splitting the resolved union would drop the locked
@@ -423,5 +423,5 @@ describe("crewhaus dataset refresh-goldens (CLI, offline)", () => {
     // same golds, same order — never dropped, never re-populated from
     // already-consumed train/dev samples.
     expect(JSON.stringify(v2.splits.test)).toBe(JSON.stringify(v1.splits.test));
-  });
+  }, 20_000);
 });

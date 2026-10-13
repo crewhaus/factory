@@ -271,7 +271,7 @@ export function exifApp1Payload(fixture: ExifFixture): Uint8Array {
   return concatBytes([ascii("Exif"), new Uint8Array([0, 0]), tiff]);
 }
 
-function jpegSegment(marker: number, payload: Uint8Array): Uint8Array {
+export function jpegSegment(marker: number, payload: Uint8Array): Uint8Array {
   return concatBytes([new Uint8Array([0xff, marker]), u16be(payload.length + 2), payload]);
 }
 

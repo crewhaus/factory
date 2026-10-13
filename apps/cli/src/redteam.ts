@@ -42,6 +42,7 @@ import { injectionVariants } from "@crewhaus/dataset-ops/dataset-mine";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { firstObjectSpan } from "./model-reply-text";
 
 /** Thrown on an invalid taxonomy, count or report input. The CLI entry file
  *  routes it through `die()`; tests assert on `.message`. */
@@ -459,11 +460,11 @@ export function buildRedteamAugmentPrompt(opts: {
  *  `parseModelSampleInputs`): `[]` on ANY failure — the deterministic corpus
  *  is always the floor. */
 export function parseRedteamVariants(raw: string, max: number): string[] {
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (jsonMatch === null) return [];
+  const json = firstObjectSpan(raw);
+  if (json === null) return [];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    parsed = JSON.parse(json);
   } catch {
     return [];
   }

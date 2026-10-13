@@ -13,15 +13,15 @@
  *
  * WHAT IS HERE, AND WHY EACH PIECE HAD TO BE.
  *
- *   1. THE NAME THE REGISTRY WILL ACTUALLY USE. A caller names a spec the way
- *      the spec does ("Brewbird Support"); the registry stores it under
- *      `registrySpecName`'s mapping ("Brewbird-Support"). Every containment
- *      check, every refusal message and every result field below is built on
- *      the MAPPED name, because that is the one the filesystem sees. Acting
- *      on the caller's spelling while the store acts on the mapped one is the
- *      parse-then-act-on-the-original defect, and here it is worse than
- *      cosmetic: the mapping is many-to-one, so "a b" and "a-b" land in the
- *      same directory and a rollback aimed at one can repoint the other.
+ *   1. THE NAME THE REGISTRY WILL ACTUALLY USE. The registry stores a spec
+ *      under `registrySpecName`'s mapping ("Brewbird Support" becomes
+ *      "Brewbird-Support"), and a name the mapping would change is REFUSED,
+ *      naming the stored one. Acting on the mapped name while the caller's
+ *      spelling is what was checked is the parse-then-act-on-the-original
+ *      defect twice over: the mapping is many-to-one, so "a b" and "a-b"
+ *      land in the same directory and a rollback aimed at one can repoint
+ *      the other; and a permission rule reads the name as the call wrote it,
+ *      so `.billing` would be checked as one spec and act on `billing`.
  *   2. THE PATHS THE REGISTRY OPENS. `spec-registry` does not export its
  *      filenames, so they are mirrored here — and asserted against the real
  *      adapter in `lib.test.ts` rather than trusted, so a rename upstream
@@ -36,7 +36,7 @@
  *      on the link's target. That is the one case where absence and a door
  *      are spelled the same, so it is probed with `lstat` instead.
  */
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { contentHash, registrySpecName } from "@crewhaus/spec-changelog";
 import type { Manifest, RegistryAdapter } from "@crewhaus/spec-registry";
 import { SpecRegistryError } from "@crewhaus/spec-registry";
@@ -94,19 +94,46 @@ export const VERSION_DIFF_UNAVAILABLE =
 // names
 // ---------------------------------------------------------------------------
 
-/** A caller's spec name and the name the registry will really use for it. */
+/**
+ * A caller's spec name and the name the registry will really use for it —
+ * the same string, since {@link resolveName} refuses one the mapping changes.
+ */
 export type ResolvedName = {
   /** As the caller wrote it. */
   readonly given: string;
   /** `registrySpecName(given)` — the directory component, and what we act on. */
   readonly registryName: string;
-  /** True when the mapping changed the name, so the result can say so. */
-  readonly mapped: boolean;
+  /**
+   * Present (read access only) when `listSpecs` hides this name. A writer
+   * never gets one: {@link resolveName} refuses such a name for a write.
+   */
+  readonly hiddenFromListing?: true;
 };
 
 /**
+ * Whether `@crewhaus/spec-registry`'s `listSpecs` enumerates a spec stored
+ * under `registryName`: it skips every directory whose name starts with `_`
+ * or `.`, and `_tenants` is the tenant-overlay directory itself. Mirrored
+ * because the package keeps the rule private, and asserted against the real
+ * adapter in `lib.test.ts` like the filenames above, so an upstream change
+ * fails a test rather than silently hiding a pin.
+ */
+export function isListedSpecName(registryName: string): boolean {
+  return !registryName.startsWith("_") && !registryName.startsWith(".");
+}
+
+/** Why a hidden spec name matters, said once for the refusal and the report. */
+export const HIDDEN_FROM_LISTING =
+  '@crewhaus/spec-registry\'s listSpecs skips every name that starts with "_" or "." ' +
+  "(\"_tenants\" is the registry's tenant-overlay directory), so this spec's pins are missing from " +
+  "DeployInspect's registry-wide listing and from every other listSpecs walk, fleet migrations included";
+
+/** Whether a name is resolved for a call that may write (pin, roll back) or only reads. */
+export type NameAccess = "write" | "read";
+
+/**
  * Put a caller's spec name through `@crewhaus/spec-changelog`'s own mapping —
- * the one `autoRegisterSpecVersion` uses — and refuse the two results a
+ * the one `autoRegisterSpecVersion` uses — and refuse the three results a
  * caller must never get silently.
  *
  * The `"spec"` fallback is the dangerous one. `registrySpecName` returns it
@@ -114,8 +141,20 @@ export type ResolvedName = {
  * so every such spec lands in ONE shared directory: a pin for one silently
  * repoints another. That is a collision the caller cannot see from their own
  * input, so it is refused rather than mapped.
+ *
+ * The second is any other name the mapping changes (".billing", "bill ing",
+ * "billing/"). The permission gate reads `<name>/<env>` as the call wrote it,
+ * so acting on the mapped name would act on a spec no rule was checked
+ * against: `alwaysDeny DeployInspect(billing/**)` did not fire on ".billing"
+ * — and DeployInspect has no justification judge behind the gate. It is
+ * refused, naming the stored name for the caller to send instead.
+ *
+ * The third is a name `listSpecs` hides (a leading `_`, `_tenants`
+ * included; a leading `.` cannot survive the mapping). A WRITE under it is
+ * refused (security-11#9); a READ is allowed and marked, so what an earlier
+ * build pinned there can still be inspected.
  */
-export function resolveName(given: string): Loaded<ResolvedName> {
+export function resolveName(given: string, access: NameAccess = "write"): Loaded<ResolvedName> {
   if (given.includes("\u0000")) {
     return fail("bad-input", `spec name "${render(given)}" contains a NUL byte`);
   }
@@ -129,7 +168,31 @@ export function resolveName(given: string): Loaded<ResolvedName> {
       `spec name "${render(given)}" has nothing the registry can use, so @crewhaus/spec-changelog's registrySpecName maps it to the shared fallback "spec" — where it would share a directory, a manifest and every environment pin with every other unmappable name. Give the spec a name containing letters, digits, "_", "." or "-".`,
     );
   }
-  return { ok: true, value: { given, registryName, mapped: registryName !== given } };
+  if (registryName !== given) {
+    return fail(
+      "bad-input",
+      `spec name "${render(given)}" is stored by the registry as "${render(registryName)}". Name it "${render(registryName)}": permission rules read the name as written, so a name the registry changes would be checked as one spec and acted on as another.`,
+    );
+  }
+  const hidden = !isListedSpecName(registryName);
+  if (hidden && access === "write") {
+    // A pin written here would exist on disk and be absent from every
+    // enumeration, and "_tenants" would mix a spec's manifest into the
+    // overlay directory. Reads stay allowed, so a pin 0.7.0 wrote under
+    // such a name can still be inspected by name.
+    return fail(
+      "bad-input",
+      `spec name "${render(given)}" starts with "_", and ${HIDDEN_FROM_LISTING}. Give the spec a name that starts with a letter, a digit or "-".`,
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      given,
+      registryName,
+      ...(hidden ? { hiddenFromListing: true as const } : {}),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +221,51 @@ export function containSpecPaths(
     ...versions.map((v) => `${registryName}/${versionFilename(v)}`),
   ];
   return containUnder(toolName, root, rels);
+}
+
+/**
+ * Why a registry ROOT may not be written under, or undefined when it may.
+ *
+ * {@link resolveName} refuses a spec NAME a registry hides (`_hidden`,
+ * `_tenants`), but the root is the caller's choice too: `registryDir:
+ * ".crewhaus/specs/_tenants"` with the name `acme` put `manifest.json`,
+ * `v1.yaml` and `CHANGELOG.md` into tenant acme's overlay directory, where
+ * `aliasForTenant` reads `manifest.json` as the overlay of a spec named
+ * "manifest", and DeployInspect listed none of it. So a root is refused
+ * when its REAL path (links followed, so a link to `_tenants` is caught)
+ * goes through
+ *
+ * a `_`-prefixed directory directly inside a registry — the default root,
+ * or any directory holding `_tenants` — which that registry reserves:
+ * `_tenants` (in any letter case) holds its overlays, and its listing skips
+ * every other `_` name, as it skips a `_`-prefixed spec name.
+ *
+ * A `_`-prefixed directory anywhere else (`_infra/specs`) is an ordinary
+ * directory and is not refused.
+ */
+export function reservedRegistryRoot(root: SafePath, workspaceReal: string): string | undefined {
+  const rel = relative(workspaceReal, root.real);
+  if (rel === "" || rel.startsWith("..")) return undefined;
+  const parts = rel.split(sep);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i] as string;
+    if (!part.startsWith("_")) continue;
+    const parentRel = parts.slice(0, i).join("/");
+    // Anything but a definite "no `_tenants` here" counts as a registry.
+    // The parent goes in as one string, not one argument per name: Bun's
+    // `path.join` keeps only (argument count mod 65,536) of its arguments,
+    // and the caller chose how deep this root is.
+    const parentIsRegistry =
+      parentRel === DEFAULT_REGISTRY_RELDIR ||
+      probeName(join(workspaceReal, parts.slice(0, i).join(sep), TENANTS_DIRNAME)).kind !==
+        "absent";
+    if (!parentIsRegistry) continue;
+    const where = render(parentRel === "" ? "." : parentRel);
+    return part.toLowerCase() === TENANTS_DIRNAME
+      ? `it is inside "${render(parentRel === "" ? part : `${parentRel}/${part}`)}", the tenant-overlay directory of the registry at "${where}", where a spec's manifest.json would be read as a tenant's overlay`
+      : `"${render(part)}" is a directory the registry at "${where}" skips (${HIDDEN_FROM_LISTING})`;
+  }
+  return undefined;
 }
 
 /** The tenant overlay directory and file a tenant-scoped call reads or writes. */

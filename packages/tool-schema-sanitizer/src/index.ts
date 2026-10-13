@@ -24,7 +24,11 @@
  * - {@link sanitizeGeminiSchema} — Gemini's OpenAPI-3.0-derived `Schema`
  *   (allow-list of keywords; `nullable` instead of null-typed unions;
  *   `oneOf`→`anyOf`; `allOf` merged; single-branch unions flattened;
- *   unsupported `format` values dropped; `const`→single-value `enum`).
+ *   unsupported `format` values dropped; a string `const`→single-value
+ *   `enum`; Gemini's `enum` is string-only, so a number, boolean or other
+ *   non-string `enum`/`const` is dropped and its allowed values are written
+ *   into the `description` instead, while the tool's own validator still
+ *   enforces them).
  *
  * - {@link sanitizeBedrockSchema} — Converse `toolSpec.inputSchema.json`
  *   (deny-list strip of the structural metadata Converse models choke
@@ -34,11 +38,16 @@
  * - {@link toOpenAIStrictSchema} — OpenAI Structured-Outputs strict mode.
  *   OpenAI is the inverse case: rather than downcast, we UPGRADE a
  *   qualifying schema (object root, keywords entirely inside the strict
- *   subset) into a strict-ready form — `additionalProperties: false` on
- *   every object, every property listed in `required`, previously
- *   optional properties made nullable — so the adapter can set
- *   `strict: true`. Schemas that can't be expressed in the strict subset
- *   return `null` and stay non-strict (best-effort, never a 400).
+ *   subset, every property of every object already required) into a
+ *   strict-ready form — `additionalProperties: false` on every object —
+ *   so the adapter can set `strict: true`. Schemas that can't be
+ *   expressed in the strict subset return `null` and stay non-strict
+ *   (best-effort, never a 400). A schema with an optional property stays
+ *   non-strict: strict would make the model send `null` for it, which the
+ *   tool's validator refuses.
+ *
+ * Inlining is bounded ({@link inlineRefsWithReport}): a `$ref` DAG cannot
+ * grow a small schema exponentially.
  *
  * The Anthropic adapter deliberately does NOT consume this — the
  * canonical schema IS Anthropic's tool-input shape, so it passes through
@@ -111,7 +120,8 @@ function resolvePointer(root: JsonSchema, ref: string): unknown {
   let current: unknown = root;
   for (const segment of segments) {
     if (isSchemaObject(current)) {
-      current = current[segment];
+      // Own keys only: `#/__proto__` names nothing in the document.
+      current = Object.hasOwn(current, segment) ? current[segment] : undefined;
     } else if (Array.isArray(current)) {
       const index = Number(segment);
       current = Number.isInteger(index) ? current[index] : undefined;
@@ -123,50 +133,152 @@ function resolvePointer(root: JsonSchema, ref: string): unknown {
 }
 
 /**
+ * How much inlining one schema may do. A `$ref` is copied in full wherever
+ * it is used, so a definition referenced twice by a definition referenced
+ * twice (a DAG, not a cycle) doubles at every level: a 2 KB schema used to
+ * inline to tens of megabytes, rebuilt on every Gemini, Bedrock and OpenAI
+ * request (flag-truth-4#6). Past either limit a `$ref` is not expanded (see
+ * {@link inlineRefsWithReport}).
+ */
+export type InlineBudget = {
+  /**
+   * Roughly how many bytes of JSON the inlined schema may reach before a
+   * further `$ref` is left unexpanded. Content the caller wrote without a
+   * `$ref` is never cut: the budget bounds what inlining ADDS.
+   */
+  readonly maxBytes?: number;
+  /** How many `$ref`s may be expanded inside one another. */
+  readonly maxRefDepth?: number;
+};
+
+/** The default {@link InlineBudget.maxBytes}: 256 KiB, about 64k tokens of schema. */
+export const DEFAULT_INLINE_MAX_BYTES = 256 * 1024;
+/** The default {@link InlineBudget.maxRefDepth}. */
+export const DEFAULT_INLINE_MAX_REF_DEPTH = 32;
+
+/** What a `$ref` that was not expanded says in its place. */
+export const REF_NOT_EXPANDED_NOTE =
+  "(not expanded: this tool's schema is too large to inline in full, so any value is accepted here)";
+
+export type InlineReport = {
+  readonly schema: JsonSchema;
+  /** How many `$ref`s were left unexpanded because a budget ran out. 0 = fully inlined. */
+  readonly truncatedRefs: number;
+};
+
+type Budget = {
+  bytes: number;
+  truncated: number;
+  readonly maxBytes: number;
+  readonly maxRefDepth: number;
+};
+
+/**
  * Deep-clone `schema`, resolving every local `$ref` against the document
  * root and dropping the `$defs`/`definitions` containers. `refStack`
  * tracks the pointers currently being expanded on this path so a
  * recursive definition breaks into a permissive `{}` instead of looping
  * forever. Sibling keywords alongside a `$ref` (Draft 2020-12 allows
  * them) override the referenced target.
+ *
+ * Bounded: see {@link inlineRefsWithReport}, which also says whether
+ * anything was left out.
  */
-export function inlineRefs(schema: JsonSchema): JsonSchema {
-  const expanded = expandNode(schema, schema, []);
-  return isSchemaObject(expanded) ? expanded : {};
+export function inlineRefs(schema: JsonSchema, budget: InlineBudget = {}): JsonSchema {
+  return inlineRefsWithReport(schema, budget).schema;
 }
 
-function expandValue(value: unknown, root: JsonSchema, refStack: readonly string[]): unknown {
-  if (Array.isArray(value)) return value.map((item) => expandValue(item, root, refStack));
-  if (isSchemaObject(value)) return expandNode(value, root, refStack);
+/**
+ * {@link inlineRefs}, and how many `$ref`s it left unexpanded.
+ *
+ * Inlining counts the JSON it emits, repeats included. Once that passes
+ * `maxBytes`, or a `$ref` sits `maxRefDepth` expansions deep, the `$ref` is
+ * replaced by its sibling keywords plus a description saying it was not
+ * expanded ({@link REF_NOT_EXPANDED_NOTE}) — permissive, the way a cycle
+ * already breaks, and labelled, so the model is told. The tool's own
+ * validator (or the MCP server) still checks every call. The result is at
+ * most the budget plus the definitions being expanded when it ran out, so it
+ * grows with the input, never exponentially.
+ */
+export function inlineRefsWithReport(schema: JsonSchema, budget: InlineBudget = {}): InlineReport {
+  const state: Budget = {
+    bytes: 0,
+    truncated: 0,
+    maxBytes: budget.maxBytes ?? DEFAULT_INLINE_MAX_BYTES,
+    maxRefDepth: budget.maxRefDepth ?? DEFAULT_INLINE_MAX_REF_DEPTH,
+  };
+  const expanded = expandNode(schema, schema, [], state);
+  return { schema: isSchemaObject(expanded) ? expanded : {}, truncatedRefs: state.truncated };
+}
+
+/** The JSON size of a value copied verbatim (literal data, a primitive). */
+function literalBytes(value: unknown): number {
+  if (typeof value === "string") return value.length + 2;
+  if (typeof value === "number" || typeof value === "boolean") return String(value).length;
+  if (value === null || value === undefined) return 4;
+  return JSON.stringify(value)?.length ?? 4;
+}
+
+function expandValue(
+  value: unknown,
+  root: JsonSchema,
+  refStack: readonly string[],
+  budget: Budget,
+): unknown {
+  if (Array.isArray(value)) {
+    budget.bytes += 2 + value.length;
+    return value.map((item) => expandValue(item, root, refStack, budget));
+  }
+  if (isSchemaObject(value)) return expandNode(value, root, refStack, budget);
+  budget.bytes += literalBytes(value);
   return value;
 }
 
-function expandNode(node: JsonSchema, root: JsonSchema, refStack: readonly string[]): JsonSchema {
+function expandNode(
+  node: JsonSchema,
+  root: JsonSchema,
+  refStack: readonly string[],
+  budget: Budget,
+): JsonSchema {
   const ref = node["$ref"];
   if (typeof ref === "string") {
-    const siblings = expandSchemaEntries(withoutKey(node, "$ref"), root, refStack);
+    const siblings = expandSchemaEntries(withoutKey(node, "$ref"), root, refStack, budget);
     if (refStack.includes(ref)) return siblings; // cycle → break with siblings only
     const target = resolvePointer(root, ref);
     if (!isSchemaObject(target)) return siblings; // unresolvable → drop the ref
-    const expandedTarget = expandNode(target, root, [...refStack, ref]);
+    if (budget.bytes >= budget.maxBytes || refStack.length >= budget.maxRefDepth) {
+      budget.truncated++;
+      const own = siblings["description"];
+      const description =
+        typeof own === "string" && own !== ""
+          ? `${own} ${REF_NOT_EXPANDED_NOTE}`
+          : REF_NOT_EXPANDED_NOTE;
+      budget.bytes += description.length + 16;
+      return { ...siblings, description };
+    }
+    const expandedTarget = expandNode(target, root, [...refStack, ref], budget);
     return { ...expandedTarget, ...siblings }; // siblings win
   }
-  return expandSchemaEntries(node, root, refStack);
+  return expandSchemaEntries(node, root, refStack, budget);
 }
 
 function expandSchemaEntries(
   node: JsonSchema,
   root: JsonSchema,
   refStack: readonly string[],
+  budget: Budget,
 ): JsonSchema {
   const out: JsonSchema = {};
+  budget.bytes += 2;
   for (const [key, value] of Object.entries(node)) {
     if (DEF_CONTAINER_KEYS.has(key)) continue; // drop containers post-inline
+    budget.bytes += key.length + 4;
     if (DATA_KEYWORDS.has(key)) {
       out[key] = value; // literal data — never treated as a sub-schema
+      budget.bytes += literalBytes(value);
       continue;
     }
-    out[key] = expandValue(value, root, refStack);
+    out[key] = expandValue(value, root, refStack, budget);
   }
   return out;
 }
@@ -361,7 +473,39 @@ function sanitizeGeminiNode(node: JsonSchema): JsonSchema {
     out["format"] = format;
   }
 
-  return filterGeminiKeys(out);
+  return filterGeminiKeys(normaliseGeminiEnum(out));
+}
+
+/**
+ * Gemini's `Schema.enum` is `string[]` (the proto field is a repeated
+ * string; the SDK types it so, and writes integer enums as strings). A
+ * `{type: "number", enum: [0, 1]}` or a numeric `const` (zod's
+ * `z.literal(1)`) would reach the API as numbers in a string field.
+ *
+ * - `null` among the values becomes `nullable: true`.
+ * - All strings: kept as the enum.
+ * - Anything else: the enum is dropped and the allowed values are written
+ *   into the description, so the model still sees them. The tool's own
+ *   validator enforces them either way. (Stringifying them with
+ *   `format: "enum"` would keep the choice structural, but whether Gemini
+ *   then returns `"1"` or `1` is unverified, and `"1"` fails `z.literal(1)`.)
+ */
+function normaliseGeminiEnum(node: JsonSchema): JsonSchema {
+  const values = node["enum"];
+  if (!Array.isArray(values)) return node;
+  const out = omit(node, ["enum"]);
+  if (values.includes(null)) out["nullable"] = true;
+  const rest = values.filter((v) => v !== null);
+  if (rest.length === 0) return out;
+  if (rest.every((v) => typeof v === "string")) {
+    out["enum"] = rest;
+    return out;
+  }
+  const listed = rest.map((v) => JSON.stringify(v)).join(", ");
+  const note = rest.length === 1 ? `Must be ${listed}.` : `Allowed values: ${listed}.`;
+  const existing = typeof out["description"] === "string" ? out["description"].trim() : "";
+  out["description"] = existing === "" ? note : `${existing} ${note}`;
+  return out;
 }
 
 function isSupportedGeminiFormat(type: unknown, format: string): boolean {
@@ -480,14 +624,22 @@ const OPENAI_STRICT_DISQUALIFIERS: ReadonlySet<string> = new Set([
  * when it can't be expressed in the strict subset.
  *
  * A qualifying schema is an object-rooted schema whose every node uses
- * only strict-supported keywords. The returned schema has `$ref`s
- * inlined, `additionalProperties: false` on every object, and every
- * property listed in `required` — with properties that were previously
- * optional made nullable (`type: ["T", "null"]`), the documented way to
- * keep a field optional under strict mode.
+ * only strict-supported keywords AND whose every object already lists
+ * every one of its properties in `required`. The returned schema has
+ * `$ref`s inlined and `additionalProperties: false` on every object.
+ *
+ * A schema with an optional property anywhere stays non-strict. Strict
+ * mode makes the model send every key, so the only way to leave one out
+ * is to send `null`; the tools' validators read `null` as a value, not as
+ * absence, and refused the call (`Grep` with `path: null` — provider-limits#2).
+ * Non-strict, the model simply omits the key. So does a schema whose
+ * `$ref`s could not all be inlined ({@link inlineRefsWithReport}): the
+ * permissive stand-in has no strict form, and the adapter sends the
+ * original schema instead, which loses nothing.
  */
 export function toOpenAIStrictSchema(schema: JsonSchema): JsonSchema | null {
-  const inlined = inlineRefs(schema);
+  const { schema: inlined, truncatedRefs } = inlineRefsWithReport(schema);
+  if (truncatedRefs > 0) return null;
   if (!qualifiesForStrict(inlined)) return null;
   return makeStrict(inlined);
 }
@@ -507,10 +659,23 @@ function strictNodeOk(node: JsonSchema): boolean {
   const additional = node["additionalProperties"];
   if (additional === true || isSchemaObject(additional)) return false;
 
-  if (isSchemaObject(node["properties"])) {
-    for (const value of Object.values(node["properties"])) {
+  const properties = node["properties"];
+  if (isSchemaObject(properties)) {
+    // Every property must already be required: strict would force an
+    // optional one to be sent, as `null` (see toOpenAIStrictSchema).
+    const required = new Set(
+      Array.isArray(node["required"])
+        ? node["required"].filter((r): r is string => typeof r === "string")
+        : [],
+    );
+    for (const [key, value] of Object.entries(properties)) {
+      if (!required.has(key)) return false;
       if (isSchemaObject(value) && !strictNodeOk(value)) return false;
     }
+  } else if (node["type"] === "object" && additional !== false) {
+    // `{ type: "object" }` with no properties is a free-form object; strict
+    // would lock it to `{}`.
+    return false;
   }
   if (Array.isArray(node["items"])) return false; // tuple typing is unsupported
   if (isSchemaObject(node["items"]) && !strictNodeOk(node["items"])) return false;
@@ -526,20 +691,12 @@ function makeStrict(node: JsonSchema): JsonSchema {
   const out: JsonSchema = { ...node };
 
   if (isSchemaObject(out["properties"])) {
-    const originalRequired = new Set(
-      Array.isArray(out["required"])
-        ? out["required"].filter((r): r is string => typeof r === "string")
-        : [],
-    );
+    // strictNodeOk has checked every property is already required.
     const props: JsonSchema = {};
     const allKeys: string[] = [];
     for (const [key, value] of Object.entries(out["properties"])) {
       allKeys.push(key);
-      let child: unknown = isSchemaObject(value) ? makeStrict(value) : value;
-      // Strict requires every property in `required`; a property that
-      // was optional becomes nullable so omission is still expressible.
-      if (isSchemaObject(child) && !originalRequired.has(key)) child = makeNullable(child);
-      props[key] = child;
+      props[key] = isSchemaObject(value) ? makeStrict(value) : value;
     }
     out["properties"] = props;
     out["required"] = allKeys;
@@ -551,20 +708,6 @@ function makeStrict(node: JsonSchema): JsonSchema {
   if (isSchemaObject(out["items"])) out["items"] = makeStrict(out["items"]);
   if (Array.isArray(out["anyOf"])) {
     out["anyOf"] = out["anyOf"].map((m) => (isSchemaObject(m) ? makeStrict(m) : m));
-  }
-  return out;
-}
-
-function makeNullable(node: JsonSchema): JsonSchema {
-  const out: JsonSchema = { ...node };
-  const type = out["type"];
-  if (typeof type === "string") {
-    if (type !== "null") out["type"] = [type, "null"];
-  } else if (Array.isArray(type)) {
-    if (!type.includes("null")) out["type"] = [...type, "null"];
-  } else if (Array.isArray(out["anyOf"])) {
-    const hasNull = out["anyOf"].some((m) => isSchemaObject(m) && m["type"] === "null");
-    if (!hasNull) out["anyOf"] = [...out["anyOf"], { type: "null" }];
   }
   return out;
 }

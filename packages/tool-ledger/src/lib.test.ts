@@ -1222,6 +1222,19 @@ describe("invoice totals", () => {
     expect(formatAmount(-5n, 2)).toBe("-0.05");
   });
 
+  test("a group separator is written as text, never expanded as a replacement pattern", () => {
+    // As a String.replace replacement, `$'` `$\`` `$1` and `$&` expanded to
+    // pieces of the number: "$'" rendered 1234567.89 as 1234567234567567.89.
+    for (const sep of ["$'", "$`", "$1", "$&", "$$"]) {
+      expect(formatAmount(123_456_789n, 2, { groupSeparator: sep })).toBe(`1${sep}234${sep}567.89`);
+    }
+    expect(formatAmount(-123_456_789_012n, 0, { groupSeparator: "," })).toBe("-123,456,789,012");
+    expect(formatAmount(12_345n, 0, { groupSeparator: "," })).toBe("12,345");
+    expect(formatAmount(999n, 0, { groupSeparator: "," })).toBe("999");
+    expect(formatAmount(1_000n, 0, { groupSeparator: "," })).toBe("1,000");
+    expect(formatAmount(0n, 2, { groupSeparator: "," })).toBe("0.00");
+  });
+
   test("a due date before the issue date is a transposed pair, not a document", () => {
     expect(() => validateInvoiceDates("2026-02-01", "2026-01-01")).toThrow(/before issueDate/);
   });

@@ -7,17 +7,11 @@ import {
   randomBytes,
   scryptSync,
 } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Secrets } from "@crewhaus/secrets-manager";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 /**
  * Catalog R17 `audit-encryption` — Section 39 envelope encryption for
@@ -340,12 +334,24 @@ export function createFileDekStore(
     return parsed;
   }
 
-  /** Atomic write at 0o600: write `.tmp`, then rename into place. */
+  /**
+   * Atomic write at 0o600: a random O_EXCL|O_NOFOLLOW temp, renamed into
+   * place. 0.7.1 — the temp was the fixed `<file>.tmp`, opened through any
+   * link planted there; a link at the key file itself is refused too.
+   */
   function writePersisted(tenantId: string, value: PersistedDek): void {
     const p = pathFor(tenantId);
-    const tmp = `${p}.tmp`;
-    writeFileSync(tmp, JSON.stringify(value), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, p);
+    const written = writeFileSafe(
+      rootDir,
+      `${FILE_PREFIX}${tenantId}${FILE_SUFFIX}`,
+      JSON.stringify(value),
+      { overwrite: true, mode: 0o600 },
+    );
+    if (!written.ok) {
+      throw new AuditEncryptionError(
+        `createFileDekStore: refusing to write ${p}: ${written.reason} (code ${written.code})`,
+      );
+    }
   }
 
   return {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IrV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitCfWorkerCli, resolveEdgeTools } from "./index";
@@ -342,18 +342,39 @@ describe("resolveEdgeTools — the cf-worker tool gate (G12/G83)", () => {
 
   test("every edge-safe builtin wires to a real tool factory", () => {
     const wiring = resolveEdgeTools(
-      ["fetch", "webFetch", "webSearch", "sendMessage", "imageGenerate", "todoWrite"],
+      ["fetch", "webFetch", "webSearch", "imageGenerate", "todoWrite"],
       {},
     );
     expect(wiring.unwired).toEqual([]);
     expect(wiring.toolsExpr).toBe(
-      "[__t_fetch, __t_webFetch, __t_webSearch, __t_sendMessage, __t_imageGenerate, __t_todoWrite]",
+      "[__t_fetch, __t_webFetch, __t_webSearch, __t_imageGenerate, __t_todoWrite]",
     );
     expect(wiring.imports).toContain("fetch as __t_fetch"); // never shadows global fetch
     expect(wiring.imports).toContain('from "@crewhaus/tool-fetch"');
     expect(wiring.packages).toContain("@crewhaus/tool-web");
     // per-package grouping: webFetch + webSearch share one import line.
     expect(wiring.imports.match(/@crewhaus\/tool-web/g)?.length).toBe(1);
+  });
+
+  test("imports keep 0.7.0's bytes: tools in spec order, then the sorted registrars", () => {
+    // A redeploy of an unchanged spec must not change the worker's hash.
+    // These strings are what 0.7.0 emitted for the same input.
+    const wiring = resolveEdgeTools(["webSearch", "webFetch", "fetch"], {
+      fetch: { allowedHosts: ["a.example"] },
+      webFetch: { allowedHosts: ["a.example"] },
+    });
+    expect(wiring.imports).toBe(
+      [
+        'import { fetch as __t_fetch, registerFetchConfig } from "@crewhaus/tool-fetch";',
+        'import { webSearch as __t_webSearch, webFetch as __t_webFetch, registerWebFetchConfig } from "@crewhaus/tool-web";',
+      ].join("\n"),
+    );
+    expect(wiring.inits).toBe(
+      [
+        'registerWebFetchConfig({"allowedHosts":["a.example"]});',
+        'registerFetchConfig({"allowedHosts":["a.example"]});',
+      ].join("\n"),
+    );
   });
 
   test("tool_config for an edge tool emits its init call", () => {
@@ -372,6 +393,18 @@ describe("resolveEdgeTools — the cf-worker tool gate (G12/G83)", () => {
     const worker = workerCode({ ...baseIr, tools: ["myCustomThing"] });
     expect(worker).toContain("permitted but not wired on this edge worker");
     expect(worker).toContain("myCustomThing");
+  });
+
+  test("every @crewhaus dependency is pinned to the version this workspace publishes (0.7.1)", () => {
+    // 0.7.0 pinned a literal ^0.3.0: npm has no worker-runtime in that range,
+    // so `npm install` failed, and tool packages resolved to 0.3.x.
+    const pkg =
+      emitCfWorkerCli({ ...baseIr, tools: ["webFetch", "todoWrite"] }).files.find(
+        (f) => f.path === "package.json",
+      )?.content ?? "";
+    const { checked, stale } = stalePins(pkg);
+    expect(stale).toEqual([]);
+    expect(checked).toBe(3);
   });
 
   test("edge-safe tool packages are declared in the bundle package.json", () => {
@@ -566,3 +599,42 @@ describe("emitCfWorkerCli — /chat SSE through the shared runtime", () => {
     expect(String(err?.data["message"])).toMatch(/context window exceeded/i);
   });
 });
+
+/**
+ * 0.7.1 — the version each workspace package would publish at, by name. The
+ * release train stamps them all in lockstep, so a pin that differs from these
+ * is a pin to some other release.
+ */
+function workspaceVersions(): Map<string, string> {
+  const root = join(import.meta.dir, "..", "..", "..");
+  const out = new Map<string, string>();
+  for (const entry of readdirSync(join(root, "packages"), { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    let manifest: { name?: unknown; version?: unknown };
+    try {
+      manifest = JSON.parse(
+        readFileSync(join(root, "packages", entry.name, "package.json"), "utf8"),
+      );
+    } catch {
+      continue;
+    }
+    if (typeof manifest.name === "string" && typeof manifest.version === "string") {
+      out.set(manifest.name, manifest.version);
+    }
+  }
+  return out;
+}
+
+/** Deps of an emitted package.json whose pin is not the workspace's version. */
+function stalePins(pkgJson: string): { checked: number; stale: string[] } {
+  const deps = (JSON.parse(pkgJson) as { dependencies: Record<string, string> }).dependencies;
+  const versions = workspaceVersions();
+  const stale: string[] = [];
+  let checked = 0;
+  for (const [name, pin] of Object.entries(deps)) {
+    if (!name.startsWith("@crewhaus/")) continue;
+    checked += 1;
+    if (pin !== versions.get(name)) stale.push(`${name}@${pin} (workspace: ${versions.get(name)})`);
+  }
+  return { checked, stale };
+}

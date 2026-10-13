@@ -18,6 +18,9 @@
     "@crewhaus/tool-catalog": "workspace:*",
     "zod": "^3.23.8"
   },
+  "devDependencies": {
+    "@crewhaus/model-plan": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

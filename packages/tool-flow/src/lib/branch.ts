@@ -7,7 +7,7 @@
  * here: an operator who learns `startsWith` from Assert gets the same
  * operator, with the same semantics, in a branch.
  */
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, checksVerdict, runChecks } from "@crewhaus/tool-schema";
 
 /** Whether every check must hold, or any one of them. */
 export type MatchMode = "all" | "any";
@@ -30,6 +30,8 @@ export type ArmReport = {
   readonly failed: number;
   /** The first failing check's reason; empty when the arm matched. */
   readonly reason: string;
+  /** Set when the arm could not be decided: a pattern had no answer. */
+  readonly undetermined?: true;
 };
 
 export type BranchOutcome = {
@@ -43,11 +45,19 @@ export type BranchOutcome = {
   readonly fallback: boolean;
   /** Every arm evaluated, in order, up to and including the winner. */
   readonly evaluated: ReadonlyArray<ArmReport>;
+  /**
+   * Why no route was taken, when an arm could not be decided: its pattern
+   * had no answer. Later arms and `otherwise` are not tried, because the
+   * undecided arm might have been the one that matched.
+   */
+  readonly undetermined?: string;
 };
 
 export type BranchOptions = {
   /** Used when no arm matches. Without it, a miss returns `matched: false`. */
   readonly otherwise?: { readonly name: string; readonly result?: unknown };
+  /** Answers for the arms' `matches` patterns, resolved by the caller in the worker. */
+  readonly regex?: RegexAnswers;
 };
 
 /**
@@ -89,16 +99,40 @@ export function evaluateBranches(
   const evaluated: ArmReport[] = [];
   for (const [index, rule] of rules.entries()) {
     const mode: MatchMode = rule.match ?? "all";
-    const report = runChecks(value, rule.when as Check[]);
-    const ok = mode === "all" ? report.ok : report.passed > 0;
+    const report = runChecks(
+      value,
+      rule.when as Check[],
+      options.regex === undefined ? {} : { regex: options.regex },
+    );
+    const verdict = checksVerdict(report, mode);
+    const ok = verdict === "pass";
+    const undecided = report.failures.find((f) => f.undetermined === true);
     evaluated.push({
       name: rule.name,
       index,
       ok,
       passed: report.passed,
       failed: report.failed,
-      reason: ok ? "" : (report.failures[0]?.reason ?? ""),
+      reason: ok
+        ? ""
+        : ((verdict === "undetermined" ? undecided?.reason : undefined) ??
+          report.failures[0]?.reason ??
+          ""),
+      ...(verdict === "undetermined" ? { undetermined: true as const } : {}),
     });
+    if (verdict === "undetermined") {
+      // A router that fell through here would take a later arm, or the
+      // default, on the strength of an answer it never got.
+      return {
+        matched: false,
+        name: null,
+        index: null,
+        result: undefined,
+        fallback: false,
+        evaluated,
+        undetermined: `arm "${rule.name}" could not be decided: ${undecided?.reason ?? "a check had no answer"}`,
+      };
+    }
     if (ok) {
       return {
         matched: true,

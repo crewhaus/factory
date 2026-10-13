@@ -166,8 +166,18 @@ export function selectGroup(file: RobotsFile, userAgent: string): RobotsGroup | 
 }
 
 /**
+ * The longest path and query `evaluateRobots` is asked about: 8 KiB, about
+ * the most a web server accepts in a request line. Every rule with a `*`
+ * searches the path, so the work is the rules times the path; the rules are
+ * whatever the site's robots.txt holds and the path is whatever the caller
+ * wrote. A longer path is refused, never answered.
+ */
+export const MAX_ROBOTS_PATH_CHARS = 8192;
+
+/**
  * Decide whether `path` (a path + query, not a full URL) may be fetched.
- * Nothing matching means allowed — robots.txt is a deny-list.
+ * Nothing matching means allowed — robots.txt is a deny-list. The caller
+ * keeps `path` to {@link MAX_ROBOTS_PATH_CHARS}.
  */
 export function evaluateRobots(file: RobotsFile, userAgent: string, path: string): RobotsVerdict {
   const group = selectGroup(file, userAgent);

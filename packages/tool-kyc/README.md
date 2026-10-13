@@ -28,7 +28,20 @@ So every code VIES publishes is mapped explicitly, and a code we have never
 seen becomes *could-not-check* with the code quoted, rather than a guess about
 which side of the line it falls on. The same rule covers HTTP: a 500, a 429 or
 a 403 is *could-not-check*. The only 404 that means anything about the subject
-is HMRC's, which is documented to mean "not registered".
+is HMRC's carrying its `NOT_FOUND` code, which is documented to mean "not
+registered". Any other 404 — no code, a body that is not JSON, or
+`MATCHING_RESOURCE_NOT_FOUND` — is *could-not-check* with the code quoted, and
+an HMRC answer about a different number than the one asked is too.
+
+**GB lookups are could-not-check today.** HMRC removed version 1.0 of its
+unauthenticated VAT checker in February 2025 and answers a version-1.0 request
+with `MATCHING_RESOURCE_NOT_FOUND`; version 2.0 needs registered API
+credentials, which this package does not hold. So a GB number gets its format
+and check digits checked, and registration reads as unchecked, with that
+reason. (0.7.0 read that 404 as "not registered" for every GB number.)
+
+`requesterVatId` is held to its country's format like the subject's own id,
+before anything is dialled.
 
 `syntaxOnly` fits the same grammar: the format is well-formed, and registration
 reads as unchecked rather than as fine.
@@ -188,8 +201,9 @@ and it was fine".
   is a recorded fixture per publisher, because a mis-read alias-quality field
   reports a weak match as a strong one and nothing downstream can tell.
 - **It reads two registers, not four.** Companies House and OpenCorporates need
-  an API key; GLEIF, EDGAR, VIES and HMRC do not, and no schema here accepts a
-  credential.
+  an API key; GLEIF, EDGAR and VIES do not, and no schema here accepts a
+  credential. HMRC's current VAT checker (version 2.0) does need one, which is
+  why GB registration is could-not-check (see above).
 - **EDGAR by name covers listed filers only**, through EDGAR's own ticker map,
   and each row says so. Not finding a company there is not evidence it does not
   exist.

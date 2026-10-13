@@ -3,6 +3,7 @@ import { OUTWARD_TOOL_NAMES } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolIoCapability } from "@crewhaus/tool-catalog";
 import { fetch as fetchTool } from "@crewhaus/tool-fetch";
 import { imageGenerate } from "@crewhaus/tool-image-generation";
+import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 import { webFetch, webSearch } from "@crewhaus/tool-web";
 import { auditSpecToolNames, auditToolScopes, collectToolNames } from "./scope-audit";
 
@@ -112,6 +113,39 @@ describe("auditSpecToolNames — FR-002 compile --strict spec-level gate", () =>
     const findings = auditSpecToolNames(["SendMessage"], resolveNone);
     expect(findings).toHaveLength(1);
     expect(findings[0]?.toolName).toBe("SendMessage");
+  });
+
+  // C001 (wave III): the graph, workflow and crew shapes' evm tools are not in
+  // the CLI's tool map, and were skipped rather than audited. They are now
+  // read from the manifest's flags — by spec key, the spelling a site uses.
+  test("audits a builtin the CLI does not carry from its manifest flags", () => {
+    for (const key of ["evmCall", "evmGetLogs", "evmSimulate", "evmSendTransaction"]) {
+      expect({ key, findings: auditSpecToolNames([key], resolveNone) }).toEqual({
+        key,
+        findings: [],
+      });
+    }
+    // The audit is real: were the manifest to say the tool is internal, the
+    // same spec would be refused. (The row is swapped for the length of
+    // this check and put back.)
+    const table = NON_CLI_TOOL_FLAGS as Record<string, (typeof NON_CLI_TOOL_FLAGS)[string]>;
+    const real = table["evmCall"];
+    if (real === undefined) throw new Error("evmCall has no manifest flags");
+    try {
+      table["evmCall"] = { ...real, scope: "internal" };
+      expect(auditSpecToolNames(["evmCall"], resolveNone)).toEqual([
+        {
+          toolName: "EvmCall",
+          reason:
+            'declares ioCapability "network" (crosses a network boundary) but scope is "internal" (expected "external")',
+        },
+      ]);
+    } finally {
+      table["evmCall"] = real;
+    }
+    // A registered name is not vouched for from the manifest: a crew role's
+    // SendMessage is the orchestrator's own tool, not the channel builtin.
+    expect(auditSpecToolNames(["SendMessage"], resolveNone)).toHaveLength(1);
   });
 
   test("does NOT flag an unknown NON-outward custom name (offline gate has nothing to assert)", () => {

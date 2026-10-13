@@ -29,9 +29,13 @@ export type JsonLocate =
     }
   | { readonly ok: false; readonly kind: JsonLocateFailure; readonly reason: string };
 
-function skipWs(text: string, from: number): number {
+/** Characters the scan has visited, which a test reads off a `JsonMembers`. */
+type Steps = { steps: number };
+
+function skipWs(text: string, from: number, count: Steps): number {
   let i = from;
   while (i < text.length) {
+    count.steps++;
     const c = text[i];
     // A byte-order mark is not whitespace to the language, but it is exactly
     // as meaningless here — and a manifest written on Windows can start with
@@ -45,10 +49,11 @@ function skipWs(text: string, from: number): number {
 type Read = { end: number } | null;
 
 /** The offset past a JSON string starting at `from` (which must be a quote). */
-function readString(text: string, from: number): Read {
+function readString(text: string, from: number, count: Steps): Read {
   if (text[from] !== '"') return null;
   let i = from + 1;
   while (i < text.length) {
+    count.steps++;
     const c = text[i];
     if (c === "\\") {
       i += 2;
@@ -72,18 +77,19 @@ function decodeString(raw: string): string | null {
 }
 
 /** The offset past any JSON value starting at `from`. */
-function readValue(text: string, from: number): Read {
+function readValue(text: string, from: number, count: Steps): Read {
   const c = text[from];
   if (c === undefined) return null;
-  if (c === '"') return readString(text, from);
+  if (c === '"') return readString(text, from, count);
   if (c === "{" || c === "[") {
     const close = c === "{" ? "}" : "]";
     let depth = 0;
     let i = from;
     while (i < text.length) {
+      count.steps++;
       const ch = text[i];
       if (ch === '"') {
-        const str = readString(text, i);
+        const str = readString(text, i, count);
         if (str === null) return null;
         i = str.end;
         continue;
@@ -100,6 +106,7 @@ function readValue(text: string, from: number): Read {
   // number, true, false, null — everything up to the next structural byte.
   let i = from;
   while (i < text.length) {
+    count.steps++;
     const ch = text[i];
     if (ch === "," || ch === "}" || ch === "]" || ch === undefined) break;
     if (ch === " " || ch === "\n" || ch === "\t" || ch === "\r") break;
@@ -110,89 +117,149 @@ function readValue(text: string, from: number): Read {
 
 type MemberHit = { valueStart: number; valueEnd: number };
 
+type Failure = Extract<JsonLocate, { ok: false }>;
+
 /**
- * The value span of `key` in the object that starts at `from`.
+ * One object's members, read once: each key's first value span and whether
+ * it is declared again, and the reason the read stopped early, if it did.
+ */
+type Members = {
+  readonly byName: ReadonlyMap<string, { readonly hit: MemberHit; readonly repeated: boolean }>;
+  readonly stop: Failure | undefined;
+};
+
+/**
+ * Read every member of the object that starts at `from`, as far as the scan
+ * can: to the closing brace, to the end of the text, or to the first thing
+ * it cannot read, which `stop` names.
+ */
+function readMembers(text: string, from: number, count: Steps): Members | Failure {
+  if (text[from] !== "{") {
+    return { ok: false, kind: "notAnObject", reason: `expected an object at offset ${from}` };
+  }
+  const byName = new Map<string, { hit: MemberHit; repeated: boolean }>();
+  const stopped = (reason: string): Members => ({
+    byName,
+    stop: { ok: false, kind: "malformed", reason },
+  });
+  let i = skipWs(text, from + 1, count);
+  if (text[i] === "}") return { byName, stop: undefined };
+  while (i < text.length) {
+    const keyRead = readString(text, i, count);
+    if (keyRead === null) return stopped(`unreadable key at offset ${i}`);
+    const name = decodeString(text.slice(i, keyRead.end));
+    if (name === null) return stopped(`unreadable key at offset ${i}`);
+    const colon = skipWs(text, keyRead.end, count);
+    if (text[colon] !== ":") return stopped(`expected ":" at offset ${colon}`);
+    const valueStart = skipWs(text, colon + 1, count);
+    const value = readValue(text, valueStart, count);
+    if (value === null) return stopped(`unreadable value at offset ${valueStart}`);
+    const seen = byName.get(name);
+    if (seen === undefined)
+      byName.set(name, { hit: { valueStart, valueEnd: value.end }, repeated: false });
+    else seen.repeated = true;
+    const next = skipWs(text, value.end, count);
+    if (text[next] === ",") {
+      i = skipWs(text, next + 1, count);
+      continue;
+    }
+    if (text[next] === "}") break;
+    return stopped(`expected "," or "}" at offset ${next}`);
+  }
+  return { byName, stop: undefined };
+}
+
+/**
+ * The value span of `key` in an object already read.
  *
  * A key present twice is refused rather than resolved. `JSON.parse` keeps the
  * last one, a reader skimming the file sees the first, and a splice would
  * change whichever this scan reached — three answers to one question is how a
  * manifest ends up saying something nobody wrote.
+ *
+ * The answer is the one a scan for this key alone gave: it stopped at the
+ * second declaration of the key, so that is a duplicate whatever follows it,
+ * and otherwise it read to the end of the object, so anything unreadable
+ * after the key still fails the lookup.
  */
-function memberOf(text: string, from: number, key: string): JsonLocate | MemberHit {
-  if (text[from] !== "{") {
-    return { ok: false, kind: "notAnObject", reason: `expected an object at offset ${from}` };
+function memberOf(members: Members | Failure, key: string): Failure | MemberHit {
+  if ("ok" in members) return members;
+  const entry = members.byName.get(key);
+  if (entry?.repeated === true) {
+    return {
+      ok: false,
+      kind: "duplicate",
+      reason: `"${key}" is declared more than once in the same object`,
+    };
   }
-  let i = skipWs(text, from + 1);
-  let hit: MemberHit | undefined;
-  if (text[i] === "}") {
+  if (members.stop !== undefined) return members.stop;
+  if (entry === undefined)
     return { ok: false, kind: "missing", reason: `"${key}" is not declared` };
+  return entry.hit;
+}
+
+/**
+ * Members of one document's objects, each object read once however many
+ * lookups go through it.
+ *
+ * Locating every dependency of a package.json with `locateJsonMember` read
+ * the whole top-level object, and the whole section, again for each one:
+ * quadratic in a manifest the workspace supplies. Here an object is read the
+ * first time a path passes through it, and every later lookup in it is a map
+ * read. The answers are `locateJsonMember`'s, which is built on this.
+ */
+export class JsonMembers {
+  /** Characters scanned so far, across every object read. */
+  steps = 0;
+  private readonly objects = new Map<number, Members | Failure>();
+  /** Where the top-level value starts, past any leading whitespace. */
+  private readonly start: number;
+
+  constructor(private readonly text: string) {
+    this.start = skipWs(text, 0, this);
   }
-  while (i < text.length) {
-    const keyRead = readString(text, i);
-    if (keyRead === null) {
-      return { ok: false, kind: "malformed", reason: `unreadable key at offset ${i}` };
+
+  /** Find `path` (e.g. `["dependencies", "left-pad"]`) and return where it is. */
+  locate(path: readonly string[]): JsonLocate {
+    if (path.length === 0) {
+      return { ok: false, kind: "malformed", reason: "no member path was given" };
     }
-    const name = decodeString(text.slice(i, keyRead.end));
-    if (name === null) {
-      return { ok: false, kind: "malformed", reason: `unreadable key at offset ${i}` };
-    }
-    const colon = skipWs(text, keyRead.end);
-    if (text[colon] !== ":") {
-      return { ok: false, kind: "malformed", reason: `expected ":" at offset ${colon}` };
-    }
-    const valueStart = skipWs(text, colon + 1);
-    const value = readValue(text, valueStart);
-    if (value === null) {
-      return { ok: false, kind: "malformed", reason: `unreadable value at offset ${valueStart}` };
-    }
-    if (name === key) {
-      if (hit !== undefined) {
+    let at = this.start;
+    for (let depth = 0; depth < path.length; depth++) {
+      const result = memberOf(this.objectAt(at), path[depth] as string);
+      if ("ok" in result) {
+        // Name the segment that was missing, not just the leaf: "dependencies"
+        // being absent and "left-pad" being absent are different fixes.
+        return depth === path.length - 1
+          ? result
+          : { ok: false, kind: result.kind, reason: `${result.reason} (at "${path[depth]}")` };
+      }
+      at = result.valueStart;
+      if (depth === path.length - 1) {
+        const isString = this.text[result.valueStart] === '"';
         return {
-          ok: false,
-          kind: "duplicate",
-          reason: `"${key}" is declared more than once in the same object`,
+          ok: true,
+          valueSpan: { start: result.valueStart, end: result.valueEnd },
+          isString,
+          ...(isString
+            ? { inner: { start: result.valueStart + 1, end: result.valueEnd - 1 } }
+            : {}),
         };
       }
-      hit = { valueStart, valueEnd: value.end };
     }
-    const next = skipWs(text, value.end);
-    if (text[next] === ",") {
-      i = skipWs(text, next + 1);
-      continue;
-    }
-    if (text[next] === "}") break;
-    return { ok: false, kind: "malformed", reason: `expected "," or "}" at offset ${next}` };
+    return { ok: false, kind: "missing", reason: "not found" };
   }
-  if (hit === undefined) return { ok: false, kind: "missing", reason: `"${key}" is not declared` };
-  return hit;
+
+  private objectAt(from: number): Members | Failure {
+    const known = this.objects.get(from);
+    if (known !== undefined) return known;
+    const read = readMembers(this.text, from, this);
+    this.objects.set(from, read);
+    return read;
+  }
 }
 
 /** Find `path` (e.g. `["dependencies", "left-pad"]`) and return where it is. */
 export function locateJsonMember(text: string, path: readonly string[]): JsonLocate {
-  if (path.length === 0) {
-    return { ok: false, kind: "malformed", reason: "no member path was given" };
-  }
-  let at = skipWs(text, 0);
-  for (let depth = 0; depth < path.length; depth++) {
-    const result = memberOf(text, at, path[depth] as string);
-    if ("ok" in result) {
-      if (result.ok) return result;
-      // Name the segment that was missing, not just the leaf: "dependencies"
-      // being absent and "left-pad" being absent are different fixes.
-      return depth === path.length - 1
-        ? result
-        : { ok: false, kind: result.kind, reason: `${result.reason} (at "${path[depth]}")` };
-    }
-    at = result.valueStart;
-    if (depth === path.length - 1) {
-      const isString = text[result.valueStart] === '"';
-      return {
-        ok: true,
-        valueSpan: { start: result.valueStart, end: result.valueEnd },
-        isString,
-        ...(isString ? { inner: { start: result.valueStart + 1, end: result.valueEnd - 1 } } : {}),
-      };
-    }
-  }
-  return { ok: false, kind: "missing", reason: "not found" };
+  return new JsonMembers(text).locate(path);
 }

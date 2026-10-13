@@ -279,6 +279,7 @@ describe("mapHmrcResponse", () => {
         consultationNumber: "ABC-1234",
       },
       true,
+      "123456782",
     );
     expect(answer.outcome).toBe("found");
     expect(answer.registration?.address).toBe("1 High St, SW1A 1AA, GB");
@@ -286,9 +287,21 @@ describe("mapHmrcResponse", () => {
   });
 
   test("a 200 with no target is unreadable, not evidence of non-registration", () => {
-    const answer = mapHmrcResponse({ processingDate: "2026-09-18T00:00:00+00:00" }, false);
+    const answer = mapHmrcResponse(
+      { processingDate: "2026-09-18T00:00:00+00:00" },
+      false,
+      "123456782",
+    );
     expect(answer.outcome).toBe("unavailable");
     expect(answer.basis).toContain("not evidence that a number is unregistered");
+  });
+
+  test("a branch trader's 12 digits match an answer about its 9-digit VRN; another number does not", () => {
+    const about = (vatNumber: string, asked: string) =>
+      mapHmrcResponse({ target: { name: "ACME LTD", vatNumber } }, false, asked).outcome;
+    expect(about("123456782", "123456782001")).toBe("found");
+    expect(about("123456782001", "123456782001")).toBe("found");
+    expect(about("111111111", "123456782")).toBe("unavailable");
   });
 
   test("HMRC's error codes each have a meaning", () => {

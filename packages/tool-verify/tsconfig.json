@@ -22,6 +22,9 @@
     },
     {
       "path": "../tool-text"
+    },
+    {
+      "path": "../tool-safety"
     }
   ],
   "include": ["src/**/*"]

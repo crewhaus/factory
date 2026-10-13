@@ -3,7 +3,10 @@
  *
  * Modes
  *   default — ask on first encounter; rules can pre-decide
- *   plan    — read-only; non-readOnly tools always denied (no rules consulted)
+ *   plan    — read-only; non-readOnly tools always denied. Only deny and ask
+ *             rules are consulted (both deny); allow rules are ignored, so
+ *             plan mode can never be widened, and the sandbox floor holds —
+ *             plan never allows what auto would not
  *   auto    — read-only auto-allow; destructive auto-ask; rules can override
  *   bypass  — allow everything (CLI flag only — see security note)
  *
@@ -14,6 +17,11 @@
  *
  * Rule types: alwaysAllow / alwaysDeny / alwaysAsk
  *
+ * An argument-scoped rule (`Tool(glob)`) is matched differently by type
+ * (0.7.1): an allow needs EVERY operative value of the call to match its
+ * glob, a deny or ask fires when ANY does. See `matchesPattern` in
+ * `@crewhaus/tool-permission-matcher`.
+ *
  * SECURITY: `mode: bypass` must NEVER come from a config file. Both
  * `parsePermissionsConfig()` (yaml/settings) and the Zod schema reject it
  * explicitly. Bypass enters the system through the `--permission-mode bypass`
@@ -22,14 +30,17 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type CompiledPattern,
+  type OperativeValue,
+  type RulePolarity,
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
@@ -52,7 +63,19 @@ export type RuleSet = {
 
 export type ToolCallContext = {
   readonly toolName: string;
+  /**
+   * The call's input. Pass it AFTER the tool's schema has parsed it (unknown
+   * keys stripped, defaults filled in): that is what the tool acts on, so it
+   * is what a rule must be checked against.
+   */
   readonly input: unknown;
+  /**
+   * The values of the tool's declared `operativeArgs`, canonicalised (paths
+   * resolved against the workspace, URLs parsed). When present, argument
+   * globs are matched against these instead of `input`. Absent ⇒ the tool
+   * declares none, and the matcher falls back to `input`'s string values.
+   */
+  readonly operativeValues?: ReadonlyArray<OperativeValue>;
   readonly readOnly: boolean;
   readonly destructive: boolean;
   /**
@@ -157,6 +180,10 @@ export const BUILTIN_DEFAULT_RULES: ReadonlyArray<PermissionRule> = [
   ...BUILTIN_BOOKKEEPING_RULES,
 ];
 
+function rulePolarity(t: RuleType): RulePolarity {
+  return t === "alwaysAllow" ? "allow" : "restrict";
+}
+
 function ruleTypeToDecision(t: RuleType): Decision {
   switch (t) {
     case "alwaysAllow":
@@ -175,6 +202,50 @@ function compile(rule: PermissionRule): CompiledPattern {
   const compiled = compilePattern(rule.pattern);
   compileCache.set(rule, compiled);
   return compiled;
+}
+
+/**
+ * The first rule, in source-priority order, that matches `call` among the
+ * rules `consider` admits. Each rule is matched with its own polarity: an
+ * allow needs every operative value to match, a deny or ask any one.
+ *
+ * A malformed rule pattern fails CLOSED for safety rules: an uncompilable
+ * `alwaysDeny`/`alwaysAsk` still gates (it counts as a match), so an
+ * attacker-influenced broken guard — e.g. a deny pattern in an untrusted
+ * sub-agent definition — can't be silently dropped to fail open. A malformed
+ * `alwaysAllow` is skipped: a broken grant simply isn't honored.
+ */
+function firstMatchingRule(
+  call: ToolCallContext,
+  rules: RuleSet,
+  consider: (type: RuleType) => boolean,
+): PermissionRule | undefined {
+  for (const sourceKey of SOURCE_PRIORITY) {
+    for (const rule of rules[sourceKey]) {
+      if (!consider(rule.type)) continue;
+      try {
+        const compiled = compile(rule);
+        const matched = matchesPattern(compiled, call.toolName, call.input, {
+          polarity: rulePolarity(rule.type),
+          ...(call.operativeValues !== undefined ? { operativeValues: call.operativeValues } : {}),
+        });
+        if (matched) return rule;
+      } catch {
+        if (rule.type === "alwaysDeny" || rule.type === "alwaysAsk") return rule;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Why a sandboxed tool was refused for want of a sandbox. The runtime reads
+ * CREWHAUS_SANDBOX through the sandbox's own parser: unset means docker, so
+ * the floor only closes on `noop` or a value that names no backend — or in a
+ * runtime that never said a sandbox exists.
+ */
+function noSandboxReason(toolName: string): string {
+  return `tool "${toolName}" requires a sandbox, and the runtime reports none (CREWHAUS_SANDBOX is noop or names no backend — set it to docker or podman, or leave it unset for docker)`;
 }
 
 /**
@@ -200,36 +271,39 @@ export function evaluateWithReason(
   opts: EvaluateOptions = {},
 ): DecisionDetails {
   if (mode === "bypass") return { decision: "allow" };
-  if (mode === "plan") return { decision: call.readOnly ? "allow" : "deny" };
+  if (mode === "plan") {
+    // permission-integration#6 — plan mode used to consult no rule at all,
+    // so an operator's explicit deny on a read-only egress tool (HttpPaginate,
+    // SseRead, …) did nothing there. Deny and ask rules are read first, and
+    // both deny (plan mode has no one to ask). Allow rules are still ignored:
+    // plan mode can never be widened, only narrowed.
+    const guard = firstMatchingRule(call, rules, (type) => type !== "alwaysAllow");
+    if (guard !== undefined) {
+      return {
+        decision: "deny",
+        reason:
+          guard.type === "alwaysDeny"
+            ? `plan mode: the rule alwaysDeny ${guard.pattern} (${guard.source}) denies \`${call.toolName}\``
+            : `plan mode: the rule alwaysAsk ${guard.pattern} (${guard.source}) needs a person to approve \`${call.toolName}\`, and plan mode cannot ask, so it is denied`,
+      };
+    }
+    if (!call.readOnly) return { decision: "deny" };
+    // The sandbox floor holds here too. A read-only tool that runs in a
+    // sandbox is refused in auto mode when there is none, so plan mode —
+    // which must never be wider than auto — refuses it as well.
+    if (call.requiresSandbox === true && opts.sandboxAvailable !== true) {
+      return { decision: "deny", reason: noSandboxReason(call.toolName) };
+    }
+    return { decision: "allow" };
+  }
 
   // Section 18 production safety floor: a tool that declared
   // `requiresSandbox` cannot be allowed unless (a) a rule explicitly
   // matched AND (b) a non-noop sandbox is available. We compute the
   // base decision first so ruleHit is already known.
-  let baseDecision: Decision | undefined;
-  for (const sourceKey of SOURCE_PRIORITY) {
-    for (const rule of rules[sourceKey]) {
-      try {
-        const compiled = compile(rule);
-        if (matchesPattern(compiled, call.toolName, call.input)) {
-          baseDecision = ruleTypeToDecision(rule.type);
-          break;
-        }
-      } catch {
-        // A malformed rule pattern fails CLOSED for safety rules: an
-        // uncompilable `alwaysDeny`/`alwaysAsk` still gates (treated as a
-        // match for its own decision), so an attacker-influenced broken guard
-        // — e.g. a deny pattern in an untrusted sub-agent definition — can't
-        // be silently dropped to fail open. A malformed `alwaysAllow` is still
-        // skipped: a broken grant simply isn't honored (no widening).
-        if (rule.type === "alwaysDeny" || rule.type === "alwaysAsk") {
-          baseDecision = ruleTypeToDecision(rule.type);
-          break;
-        }
-      }
-    }
-    if (baseDecision !== undefined) break;
-  }
+  const hit = firstMatchingRule(call, rules, () => true);
+  let baseDecision: Decision | undefined =
+    hit !== undefined ? ruleTypeToDecision(hit.type) : undefined;
 
   if (baseDecision === undefined) {
     // No rule matched: mode-specific fallback.
@@ -245,10 +319,7 @@ export function evaluateWithReason(
 
   if (call.requiresSandbox === true) {
     if (opts.sandboxAvailable !== true) {
-      return {
-        decision: "deny",
-        reason: `tool "${call.toolName}" requires a sandbox but none is configured (CREWHAUS_SANDBOX must be set to docker or podman)`,
-      };
+      return { decision: "deny", reason: noSandboxReason(call.toolName) };
     }
     if (baseDecision !== "allow") {
       return {
@@ -444,13 +515,36 @@ export function __resetRuleBasedJudgeWarningForTests(): void {
  */
 function warnRuleBasedJudgeOnce(toolName: string): void {
   if (warnedAboutRuleBasedJudge) return;
-  // `bun test`/`NODE_ENV=test` exercises the rule-based judge constantly; only
-  // surface the warning for real runs so test output stays clean.
-  if (process.env.NODE_ENV === "test") return;
+  // `bun test` exercises the rule-based judge constantly; only surface the
+  // warning for real runs so test output stays clean.
+  if (underTestRunner()) return;
   warnedAboutRuleBasedJudge = true;
   console.warn(
     `[permission-engine] SECURITY: the rule-based justification judge is gating a justification-required tool (first seen: \`${toolName}\`). It only checks token overlap between the justification and the spec instructions, so the SAME (potentially prompt-injected) model that chose the tool can also write a passing justification — this offers NO protection against an injected justification. Production MUST set \`security.justification.judge: claude\` in the spec (or pass an LLM-backed \`justificationJudge\` to the runtime). This warning fires once per process.`,
   );
+}
+
+/** A file `bun test` runs: `*.test.*`, `*_test.*`, `*.spec.*`, `*_spec.*`. */
+const TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+
+/**
+ * Whether this process is the test runner: `bun test` sets `NODE_ENV=test`
+ * AND its entry is a test file.
+ *
+ * `NODE_ENV=test` alone used to be enough. It is an ambient variable — a
+ * staging host or a CI job may export it — and a compiled bundle is a
+ * distributed artifact that runs wherever it is copied, so a bundle started
+ * under it accepted the rule-based judge's gameable `allow` on every
+ * justification-gated call (0.7.1 review). A bundle's entry is its
+ * `agent.ts`, and `crewhaus run`'s is the CLI, so neither is ever the test
+ * runner whatever NODE_ENV says; an operator who wants the rule-based judge
+ * sets CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1.
+ */
+function underTestRunner(): boolean {
+  if (process.env.NODE_ENV !== "test") return false;
+  const bun = (globalThis as { readonly Bun?: { readonly main?: unknown } }).Bun;
+  const entry = typeof bun?.main === "string" ? bun.main : process.argv?.[1];
+  return typeof entry === "string" && TEST_FILE.test(entry);
 }
 
 /**
@@ -470,13 +564,13 @@ function warnRuleBasedJudgeOnce(toolName: string): void {
  * fail CLOSED in production: a justification-required tool is denied unless an
  * LLM-backed judge is configured (it reports a different judgeModel and is
  * never overridden). Two escape hatches keep this from being a hard break:
- *   - `NODE_ENV=test` (Bun sets it for `bun test`) keeps the judge deterministic
- *     for the test suite;
+ *   - the test runner (see {@link underTestRunner}) keeps the judge
+ *     deterministic for the test suite;
  *   - `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` lets an operator explicitly
  *     accept the rule-based judge's weakness in production.
  */
 function ruleBasedShouldFailClosed(): boolean {
-  if (process.env.NODE_ENV === "test") return false;
+  if (underTestRunner()) return false;
   if (process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] === "1") return false;
   return true;
 }
@@ -591,6 +685,14 @@ export function tagRules(
 /** The settings file's path relative to a harness root. */
 export const SETTINGS_RELATIVE_PATH = join(".crewhaus", "settings.json");
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /** Absolute settings path for a harness root. */
 export function settingsFilePath(dir: string): string {
   return join(dir, SETTINGS_RELATIVE_PATH);
@@ -679,9 +781,29 @@ export function appendSettingsRule(
       ],
     },
   };
-  mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
-  renameSync(tmpPath, path);
+  // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp beside the file, never the fixed
+  // `settings.json.tmp`, which was opened through any link a model had
+  // planted there. A settings.json that links elsewhere in the workspace is
+  // written where it leads; one that leads out of it is refused.
+  //
+  // `.crewhaus` itself may be a link an operator made to keep a harness's
+  // state elsewhere; rules are read through it, so they are written through
+  // it too: it is then the root, as it is for the session and routing stores.
+  mkdirSync(dir, { recursive: true });
+  const crewhausDir = join(dir, ".crewhaus");
+  const linkedStateDir = isSymlink(crewhausDir);
+  const written = writeFileSafe(
+    linkedStateDir ? crewhausDir : dir,
+    linkedStateDir ? "settings.json" : SETTINGS_RELATIVE_PATH,
+    `${JSON.stringify(next, null, 2)}\n`,
+    {
+      overwrite: true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    },
+  );
+  if (!written.ok) {
+    throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
+  }
   return { added: true, path };
 }

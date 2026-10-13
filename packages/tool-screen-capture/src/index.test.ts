@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
 import { CrewhausError } from "@crewhaus/errors";
+import { buildAdvertisement } from "@crewhaus/model-plan";
 import { ScreenCaptureError, createScreenshotTool } from "./index.js";
 
 function stubDriver(pngBytes: Uint8Array): Driver {
@@ -41,13 +42,32 @@ describe("createScreenshotTool", () => {
     expect(Array.from(decoded)).toEqual(Array.from(png));
   });
 
-  test("flag profile: read-only, not destructive, classifier off (controlled output)", () => {
+  // 0.7.1 (C152): the result is an image the model must see, of a page an
+  // attacker may control.
+  test("flag profile: read-only, not destructive, classifier on, requires vision", () => {
     const driver = stubDriver(new Uint8Array(0));
     const tool = createScreenshotTool({ driver });
     expect(tool.readOnly).toBe(true);
     expect(tool.destructive).toBe(false);
-    expect(tool.classifyOutput).toBe(false);
+    expect(tool.classifyOutput).toBe(true);
+    expect(tool.requiresModelFeatures).toEqual({ vision: true });
     expect(tool.name).toBe("Screenshot");
+  });
+
+  // What the declaration is for: the runtime builds each model_pool
+  // candidate's tool list with buildAdvertisement, and a candidate that
+  // cannot see an image is not offered a tool whose whole result is one.
+  test("a pool candidate without vision is not advertised Screenshot; one with vision is", () => {
+    const tool = createScreenshotTool({ driver: stubDriver(new Uint8Array(0)) });
+    const features = (vision: boolean) =>
+      ({ caching: false, tool_use: true, vision, thinking: false, web_search: false }) as const;
+    const blind = buildAdvertisement([tool], {}, { capabilities: { features: features(false) } });
+    expect([...blind.names]).toEqual([]);
+    expect(blind.excluded).toEqual([
+      { name: "Screenshot", reason: "requires-feature", detail: "vision" },
+    ]);
+    const sighted = buildAdvertisement([tool], {}, { capabilities: { features: features(true) } });
+    expect([...sighted.names]).toEqual(["Screenshot"]);
   });
 
   test("empty PNG still yields a well-formed image block with empty base64 data", async () => {

@@ -41,6 +41,15 @@ The rules:
 | `oversizedFile` | warning | a file adding more than 800 lines |
 | `commentedCode` | warning | **off by default** — see below |
 
+`ticketPattern` replaces what counts as a ticket, and `machinePathPatterns`
+adds path shapes of your own. Both are regular expressions the caller writes,
+so each is screened before it is accepted (a shape that backtracks
+catastrophically, such as `(a+)+` or `(a|a)*`, is refused with the reason) and
+then run in `@crewhaus/tool-safety`'s regex worker under a deadline, never on
+the harness's own thread. A line the worker could not answer is listed under
+`undetermined` with a warning: it is neither a finding nor clean, so `clean`
+is not set.
+
 Disable any of them by name with `disable`, and turn the opt-in ones on with
 `enable`. An id that is not a rule is rejected by the schema rather than
 ignored, because a typo that silently disables nothing is how a team ends up
@@ -125,6 +134,16 @@ git selector (`cwd`, `ref`, `range`, `staged`, `paths`) and the tool runs
 nobody here reads. Passing both is refused: with the text in hand there is
 nothing for git to do.
 
+That `git diff` goes through `@crewhaus/tool-git`'s runner, so it is a read
+in the strong sense: no program the repository's own config names runs. The
+fsmonitor hook, external diff drivers, textconv and the repository's own
+filter drivers are switched off (a result says `repoConfigNote` when a filter
+was skipped), a submodule's change is shown as its pointer (`Subproject
+commit …`) rather than by running git inside the submodule under the
+submodule's own config, a repository directory committed inside another one is refused
+rather than run in, and git gets the environment without the harness's
+credentials.
+
 The tool declares `scope: "external"` and `ioCapability: "process"` whichever
 way it is called. A static flag describes the worst case, and a capability
 that is sometimes true is true.
@@ -133,7 +152,12 @@ A ref or range that begins with `-` is refused, because git would read it as
 an option and `git diff --output=<file>` writes anywhere on the disk. A
 pathspec that is absolute, contains `..` or starts with git's `:` magic is
 refused for the same reason. The directory git runs in is resolved against
-the workspace root, symlinks included.
+the workspace root, symlinks included, and so is the repository git finds
+from there: a workspace nested inside a larger checkout, a `.git` file naming
+another repository, or a `.git` directory whose history is linked or borrowed
+from outside is refused. A linked worktree or submodule whose git directory
+lives outside still works, because git's own bookkeeping there names this
+checkout.
 
 ## DocsSymbolCheck is built to under-report
 

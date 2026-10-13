@@ -13,10 +13,13 @@
  * turning memory on must never silently grant outward messaging.
  */
 import { describe, expect, test } from "bun:test";
+import type { McpHost } from "@crewhaus/mcp-host";
+import { ToolCatalog } from "@crewhaus/tool-catalog";
 import {
   THREDZ_ALIAS_TOOL_FLAGS,
   THREDZ_ALIAS_TOOL_NAMES,
   THREDZ_MESSAGING_TOOL_NAMES,
+  connectThredz,
   thredzAliasToolNames,
 } from "./thredz";
 
@@ -59,11 +62,55 @@ describe("the messaging vocabulary", () => {
 
 describe("the messaging permission posture", () => {
   test("reads are readOnly", () => {
-    for (const name of ["agent_list", "inbox_poll", "thread_get"]) {
+    for (const name of ["agent_list", "thread_get"]) {
       expect(`${name}:${JSON.stringify(THREDZ_ALIAS_TOOL_FLAGS[name])}`).toBe(
         `${name}:{"readOnly":true}`,
       );
     }
+  });
+
+  // 0.7.1 (C047): `mode: "consume"` and `ack` move the server cursor, so
+  // inbox_poll is not a read. It is not destructive either, so an auto-mode
+  // heartbeat keeps polling without a prompt.
+  test("inbox_poll is neither readOnly nor destructive", () => {
+    expect(THREDZ_ALIAS_TOOL_FLAGS["inbox_poll"]).toEqual({ readOnly: false, destructive: false });
+    const readOnly = THREDZ_MESSAGING_TOOL_NAMES.filter(
+      (n) => THREDZ_ALIAS_TOOL_FLAGS[n]?.readOnly === true,
+    );
+    expect(readOnly).toEqual(["agent_list", "thread_get"]);
+  });
+
+  test("registered through the real alias path, inbox_poll is not readOnly even when the server hints it is", async () => {
+    const advertised = THREDZ_MESSAGING_TOOL_NAMES.map((name) => ({
+      name,
+      description: name,
+      inputSchema: { type: "object", properties: {} },
+      // A server claim may tighten a tool, never loosen it.
+      annotations: { readOnlyHint: true },
+    }));
+    const client = {
+      toolFlags: undefined,
+      async connect() {},
+      async listTools() {
+        return advertised;
+      },
+      async callTool() {
+        return { content: "[]", isError: false };
+      },
+    };
+    const host = { has: () => true, getClient: () => client } as unknown as McpHost;
+    const catalog = new ToolCatalog();
+    const conn = await connectThredz(host, catalog, { messaging: true });
+    expect(conn).not.toBeNull();
+    const flags = (name: string) => {
+      const t = catalog.get(name);
+      return `${name}:${t?.readOnly}:${t?.destructive}`;
+    };
+    expect([flags("inbox_poll"), flags("message_ack"), flags("thread_get")]).toEqual([
+      "inbox_poll:false:false",
+      "message_ack:false:true",
+      "thread_get:true:false",
+    ]);
   });
 
   test("everything that mutates a directory or a mailbox is destructive", () => {

@@ -39,6 +39,7 @@ import {
   textFromA2AMessage,
 } from "@crewhaus/federation-protocol";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
+import { mentionsUnreachablePeer } from "./unreachable-peer";
 
 export class FederationRouterError extends CrewhausError {
   override readonly name = "FederationRouterError";
@@ -254,10 +255,11 @@ export type RecoveryHint =
 
 export function classifyRouterError(err: Error): RecoveryHint {
   const message = err.message ?? "";
+  // `peer .* unreachable` is a scan (unreachable-peer.ts): the message can
+  // hold a peer's version string, and the pattern was quadratic in it.
   if (
-    /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|federation transport timeout|peer .* unreachable/i.test(
-      message,
-    )
+    /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|federation transport timeout/i.test(message) ||
+    mentionsUnreachablePeer(message)
   ) {
     return { kind: "retry", delayMs: 1_000 };
   }

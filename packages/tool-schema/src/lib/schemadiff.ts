@@ -21,7 +21,8 @@
  * writer sees the mirror image — a widened type is a breaking change for
  * whoever must now produce it.
  */
-import { deepEqual, isPlainObject, joinPointer, preview } from "./value";
+import { type ShapeIndex, indexShapes } from "./shape-index";
+import { isPlainObject, joinPointer, preview } from "./value";
 
 export type Compat = "compatible" | "breaking" | "unknown";
 
@@ -43,7 +44,11 @@ export type SchemaDiffResult = {
   counts: { compatible: number; breaking: number; unknown: number };
 };
 
-type Ctx = { changes: SchemaChange[] };
+type Ctx = {
+  changes: SchemaChange[];
+  /** `deepEqual` over the two schemas' subtrees, answered by lookup. */
+  readonly same: ShapeIndex;
+};
 
 function note(ctx: Ctx, path: string, keyword: string, compat: Compat, detail: string): void {
   ctx.changes.push({ path, keyword, detail, compat });
@@ -74,7 +79,7 @@ function diffLowerBound(
   before: unknown,
   after: unknown,
 ): void {
-  if (deepEqual(before, after)) return;
+  if (ctx.same.equal(before, after)) return;
   if (typeof after !== "number") {
     note(ctx, path, keyword, "compatible", `${keyword} removed — the constraint is gone`);
     return;
@@ -102,7 +107,7 @@ function diffUpperBound(
   before: unknown,
   after: unknown,
 ): void {
-  if (deepEqual(before, after)) return;
+  if (ctx.same.equal(before, after)) return;
   if (typeof after !== "number") {
     note(ctx, path, keyword, "compatible", `${keyword} removed — the constraint is gone`);
     return;
@@ -177,8 +182,34 @@ const ANNOTATIONS = new Set([
   "definitions",
 ]);
 
+/**
+ * The values of `values` equal to no value of `others`, in order. By key
+ * when the index covers every value, so two enums of n values cost n and not
+ * n²; otherwise by comparing every pair, as `deepEqual` would.
+ */
+function missingFrom(
+  values: ReadonlyArray<unknown>,
+  others: ReadonlyArray<unknown>,
+  same: ShapeIndex,
+): unknown[] {
+  const pairwise = () => values.filter((v) => !others.some((w) => same.equal(v, w)));
+  const present = new Set<string>();
+  for (const other of others) {
+    const key = same.key(other);
+    if (key === undefined) return pairwise();
+    present.add(key);
+  }
+  const missing: unknown[] = [];
+  for (const value of values) {
+    const key = same.key(value);
+    if (key === undefined) return pairwise();
+    if (!present.has(key)) missing.push(value);
+  }
+  return missing;
+}
+
 function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void {
-  if (deepEqual(before, after)) return;
+  if (ctx.same.equal(before, after)) return;
 
   // Boolean schemas: `true` accepts everything, `false` accepts nothing.
   if (typeof before === "boolean" || typeof after === "boolean") {
@@ -243,8 +274,8 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   } else if (aEnum !== null && bEnum === null) {
     note(ctx, path, "enum", "compatible", "enum removed — values are no longer limited");
   } else if (aEnum !== null && bEnum !== null) {
-    const removed = aEnum.filter((v) => !bEnum.some((w) => deepEqual(v, w)));
-    const added = bEnum.filter((v) => !aEnum.some((w) => deepEqual(v, w)));
+    const removed = missingFrom(aEnum, bEnum, ctx.same);
+    const added = missingFrom(bEnum, aEnum, ctx.same);
     if (removed.length > 0) {
       note(ctx, path, "enum", "breaking", `enum values removed: ${preview(removed, 80)}`);
     }
@@ -254,7 +285,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   }
   const aConst = Object.hasOwn(a, "const");
   const bConst = Object.hasOwn(b, "const");
-  if (!deepEqual(a["const"], b["const"]) || aConst !== bConst) {
+  if (!ctx.same.equal(a["const"], b["const"]) || aConst !== bConst) {
     if (bConst && !aConst) {
       note(ctx, path, "const", "breaking", `const added (${preview(b["const"], 60)})`);
     } else if (aConst && !bConst) {
@@ -277,8 +308,12 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   const bRequired = Array.isArray(b["required"])
     ? b["required"].filter((k) => typeof k === "string")
     : [];
-  const nowRequired = bRequired.filter((k) => !aRequired.includes(k));
-  const noLongerRequired = aRequired.filter((k) => !bRequired.includes(k));
+  // Sets, not a search of the other list per name: two lists of n names, and
+  // n properties added against a list of n, each cost n².
+  const aRequiredSet = new Set(aRequired);
+  const bRequiredSet = new Set(bRequired);
+  const nowRequired = bRequired.filter((k) => !aRequiredSet.has(k));
+  const noLongerRequired = aRequired.filter((k) => !bRequiredSet.has(k));
   if (nowRequired.length > 0) {
     note(ctx, path, "required", "breaking", `now required: ${nowRequired.join(", ")}`);
   }
@@ -302,7 +337,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   for (const keyword of ["pattern", "format", "multipleOf"]) {
     const beforeValue = a[keyword];
     const afterValue = b[keyword];
-    if (deepEqual(beforeValue, afterValue)) continue;
+    if (ctx.same.equal(beforeValue, afterValue)) continue;
     if (afterValue === undefined) {
       note(ctx, path, keyword, "compatible", `${keyword} removed`);
     } else if (beforeValue === undefined) {
@@ -354,7 +389,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   }
   for (const key of Object.keys(bProps)) {
     if (Object.hasOwn(aProps, key)) continue;
-    const required = bRequired.includes(key);
+    const required = bRequiredSet.has(key);
     note(
       ctx,
       joinPointer(propsPath, key),
@@ -365,7 +400,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   }
 
   // --- additionalProperties
-  if (!deepEqual(a["additionalProperties"], b["additionalProperties"])) {
+  if (!ctx.same.equal(a["additionalProperties"], b["additionalProperties"])) {
     const apPath = joinPointer(path, "additionalProperties");
     if (b["additionalProperties"] === false) {
       note(ctx, apPath, "additionalProperties", "breaking", "extra properties are now rejected");
@@ -390,7 +425,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   // --- items
   const aItems = a["items"];
   const bItems = b["items"];
-  if (!deepEqual(aItems, bItems)) {
+  if (!ctx.same.equal(aItems, bItems)) {
     const itemsPath = joinPointer(path, "items");
     if (Array.isArray(aItems) || Array.isArray(bItems)) {
       note(
@@ -411,7 +446,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
 
   // --- everything compositional
   for (const keyword of COMPOSITIONAL) {
-    if (deepEqual(a[keyword], b[keyword])) continue;
+    if (ctx.same.equal(a[keyword], b[keyword])) continue;
     note(
       ctx,
       joinPointer(path, keyword),
@@ -428,7 +463,7 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
   // verdict read "compatible".
   for (const keyword of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
     if (MODELLED.has(keyword) || ANNOTATIONS.has(keyword)) continue;
-    if (deepEqual(a[keyword], b[keyword])) continue;
+    if (ctx.same.equal(a[keyword], b[keyword])) continue;
     note(
       ctx,
       joinPointer(path, keyword),
@@ -440,11 +475,64 @@ function diffNode(before: unknown, after: unknown, path: string, ctx: Ctx): void
 }
 
 /**
+ * The deepest a schema may nest, counting every object and array, for it to
+ * be diffed. Each level is a level of recursion here, and the stack's own
+ * limit moves with the platform and with how warm the code is: a schema
+ * near it came back answered in one process and as a crash in another. A
+ * fixed limit answers the same everywhere. It also bounds the pointers: every
+ * change carries its full path, so a schema differing at every level made a
+ * result the square of its depth. The same limit tool-data puts on a
+ * document.
+ */
+export const MAX_SCHEMA_DEPTH = 256;
+
+/**
+ * Whether `value` nests deeper than `limit` objects and arrays, read with an
+ * explicit stack and abandoned as soon as it does. An object reached again
+ * (only a caller's own value can share one) is walked again only when it is
+ * reached deeper, so a cycle is too deep rather than endless.
+ */
+export function nestsDeeperThan(value: unknown, limit: number): boolean {
+  const deepest = new Map<object, number>();
+  const stack: Array<{ readonly node: unknown; readonly depth: number }> = [
+    { node: value, depth: 1 },
+  ];
+  for (let top = stack.pop(); top !== undefined; top = stack.pop()) {
+    const { node, depth } = top;
+    if (typeof node !== "object" || node === null) continue;
+    if (depth > limit) return true;
+    const before = deepest.get(node);
+    if (before !== undefined && before >= depth) continue;
+    deepest.set(node, depth);
+    const children: ReadonlyArray<unknown> = Array.isArray(node) ? node : Object.values(node);
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      if (typeof child === "object" && child !== null)
+        stack.push({ node: child, depth: depth + 1 });
+    }
+  }
+  return false;
+}
+
+/**
  * Diff two schemas and classify each change. See the module comment for what
  * "compatible" means here and for the cases deliberately left `unknown`.
+ * Refuses a schema nested past {@link MAX_SCHEMA_DEPTH}, before reading it.
  */
 export function diffSchemas(before: unknown, after: unknown): SchemaDiffResult {
-  const ctx: Ctx = { changes: [] };
+  for (const [side, schema] of [
+    ["before", before],
+    ["after", after],
+  ] as const) {
+    if (nestsDeeperThan(schema, MAX_SCHEMA_DEPTH)) {
+      throw new Error(
+        `\`${side}\` nests deeper than ${MAX_SCHEMA_DEPTH} levels, the most SchemaDiff compares — diff the nested part on its own`,
+      );
+    }
+  }
+  // Every subtree of both schemas numbered once, so the comparisons below at
+  // each level of nesting, and the enum diffs, are lookups rather than walks.
+  const ctx: Ctx = { changes: [], same: indexShapes([before, after]) };
   diffNode(before, after, "", ctx);
   const counts = {
     compatible: ctx.changes.filter((c) => c.compat === "compatible").length,
@@ -457,7 +545,7 @@ export function diffSchemas(before: unknown, after: unknown): SchemaDiffResult {
     // Structural identity, not "nothing was found": two schemas differing
     // only in a `description` produce no changes, and saying they are
     // identical would be a different claim from the one made here.
-    identical: deepEqual(before, after),
+    identical: ctx.same.equal(before, after),
     verdict,
     backwardCompatible: verdict === "compatible",
     changes: ctx.changes,

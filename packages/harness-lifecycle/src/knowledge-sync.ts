@@ -50,6 +50,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { type SecretMatch, hasHighEntropyToken, jwtMatches, pemBlockMatches } from "./secret-scan";
 
 /** Thrown for operational failures. The CLI routes the message through
  *  `die()`; tests assert on `.message`. */
@@ -149,18 +150,27 @@ const b62 = "[A-Za-z0-9]";
 const b64 = "[A-Za-z0-9+/]"; // base64 alphabet incl. `+` and `/` (AWS secret keys)
 
 /** The credential token shapes, each a global RegExp so `replace` masks every
- *  occurrence. Order matters only for the PEM block (masked whole, first). */
-export const KNOWLEDGE_SECRET_DETECTORS: ReadonlyArray<{ kind: string; regex: RegExp }> = [
+ *  occurrence. Order matters only for the PEM block (masked whole, first).
+ *  A detector with `matches` is matched by that scan (secret-scan.ts) instead
+ *  of its `regex`, which the engine runs in quadratic time; `regex` stays the
+ *  pattern the scan implements. */
+export const KNOWLEDGE_SECRET_DETECTORS: ReadonlyArray<{
+  kind: string;
+  regex: RegExp;
+  matches?: (text: string) => ReadonlyArray<SecretMatch>;
+}> = [
   // PEM blocks — mask the WHOLE block (header + body + footer), not just the
   // header. `[\s\S]` so it spans newlines; non-greedy so adjacent blocks split.
   {
     kind: "pem_block",
     regex: /-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g,
+    matches: pemBlockMatches,
   },
   // JWT: three base64url segments separated by dots.
   {
     kind: "jwt",
     regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    matches: jwtMatches,
   },
   // Stripe-style keys: (sk|pk|rk)_(live|test)_<tail> — the `_` after the prefix
   // is what broke the old `sk-`-only match.
@@ -193,20 +203,26 @@ export const KNOWLEDGE_SECRET_DETECTORS: ReadonlyArray<{ kind: string; regex: Re
  * 40+-char base64 blob) so a novel credential shape the named set doesn't
  * recognize is still refused rather than leaked.
  */
-const HIGH_ENTROPY_MIXED_RE =
-  /\b(?=[A-Za-z0-9+/_-]*[A-Za-z])(?=[A-Za-z0-9+/_-]*[0-9])[A-Za-z0-9+/_-]{32,}\b/;
+// The high-entropy probe is
+// /\b(?=[A-Za-z0-9+/_-]*[A-Za-z])(?=[A-Za-z0-9+/_-]*[0-9])[A-Za-z0-9+/_-]{32,}\b/,
+// answered by a scan (`hasHighEntropyToken`, secret-scan.ts) because the
+// engine is quadratic in a run like `a-a-a-…`.
 const LONG_BASE64_RE = new RegExp(`\\b${b64}{40,}\\b`);
 
 /** True when `text` still contains something credential-shaped — used as the
  *  `secretRemains` verdict AFTER redaction so anything suspicious is dropped. */
 export function looksLikeSecret(text: string): boolean {
   for (const d of KNOWLEDGE_SECRET_DETECTORS) {
+    if (d.matches !== undefined) {
+      if (d.matches(text).length > 0) return true;
+      continue;
+    }
     // Fresh lastIndex isn't a concern: `.test` on a `g` regex advances
     // lastIndex, so reset before each probe to keep this deterministic.
     d.regex.lastIndex = 0;
     if (d.regex.test(text)) return true;
   }
-  return HIGH_ENTROPY_MIXED_RE.test(text) || LONG_BASE64_RE.test(text);
+  return hasHighEntropyToken(text) || LONG_BASE64_RE.test(text);
 }
 
 /**
@@ -217,6 +233,10 @@ export function looksLikeSecret(text: string): boolean {
 export function maskKnowledgeSecrets(text: string): string {
   let out = text;
   for (const d of KNOWLEDGE_SECRET_DETECTORS) {
+    if (d.matches !== undefined) {
+      out = replaceMatches(out, d.matches(out), "***");
+      continue;
+    }
     d.regex.lastIndex = 0;
     if (d.kind === "bearer") {
       // Group 1 is the scheme word "bearer" — keep it, mask only the token.
@@ -226,6 +246,18 @@ export function maskKnowledgeSecrets(text: string): string {
     }
   }
   return out;
+}
+
+/** `text` with each of `matches` (in order, not overlapping) replaced by `marker`. */
+function replaceMatches(text: string, matches: ReadonlyArray<SecretMatch>, marker: string): string {
+  if (matches.length === 0) return text;
+  let out = "";
+  let kept = 0;
+  for (const m of matches) {
+    out += `${text.slice(kept, m.index)}${marker}`;
+    kept = m.index + m.value.length;
+  }
+  return out + text.slice(kept);
 }
 
 /** Primitive PII pass injected into {@link buildKnowledgeRedactor}: redact PII

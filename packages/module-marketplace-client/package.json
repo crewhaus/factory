@@ -2,7 +2,7 @@
   "name": "@crewhaus/module-marketplace-client",
   "version": "0.7.0",
   "type": "module",
-  "description": "Plugin marketplace client — discover, install, update, and publish plugins via a remote registry source. Sits on top of plugin-registry (Section 42).",
+  "description": "Plugin marketplace client \u2014 discover, install, update, and publish plugins via a remote registry source. Sits on top of plugin-registry (Section 42).",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -14,7 +14,8 @@
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/plugin-registry": "workspace:*",
-    "@crewhaus/plugin-sdk": "workspace:*"
+    "@crewhaus/plugin-sdk": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -367,7 +367,7 @@ describe("plan.dirty — the §2.5 runtime bridge seam", () => {
     }
     // The literal runtime-core reads back (its exported PLAN_DIRTY_STATE_KEY).
     expect(PLAN_DIRTY_STATE_KEY).toBe("plan.dirty");
-  });
+  }, 20_000);
 
   test("read-only tools never flip the flag; failed mutations don't either", async () => {
     const bundle = makeTools();

@@ -45,6 +45,21 @@ export const VOID_ELEMENTS: ReadonlySet<string> = new Set([
 const RAW_TEXT: ReadonlySet<string> = new Set(["script", "style", "textarea", "title"]);
 
 /**
+ * The close-tag search for each raw-text element, run from the cursor.
+ *
+ * Case-insensitive WITHOUT the `u` flag, so only ASCII letters fold, as a
+ * browser's tag-name match does (`</ſcript>` closes nothing). The search runs
+ * on the source itself: the old `source.toLowerCase().indexOf(...)` lowercased
+ * the whole document once per raw-text element (quadratic: 256 KB of titles
+ * took seconds, the 16 MB limit hours), and its offsets were in the
+ * lowercased copy, which is longer wherever a character lowercases to two
+ * (`İ`), so the element's text ran into its own close tag.
+ */
+const RAW_TEXT_CLOSE: ReadonlyMap<string, RegExp> = new Map(
+  [...RAW_TEXT].map((tag) => [tag, new RegExp(`</${tag}`, "gi")]),
+);
+
+/**
  * Which open elements a start tag implicitly closes.
  *
  * `<li>` closes an open `<li>`; a `<td>` closes an open `<td>` or `<th>`.
@@ -69,58 +84,67 @@ const IMPLICIT_CLOSE: Readonly<Record<string, ReadonlyArray<string>>> = {
 /** Elements a `</p>`-style stray close may not escape past. */
 const SCOPE_BARRIERS: ReadonlySet<string> = new Set(["table", "template", "html", "body"]);
 
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-  copy: "©",
-  reg: "®",
-  trade: "™",
-  hellip: "…",
-  mdash: "—",
-  ndash: "–",
-  lsquo: "‘",
-  rsquo: "’",
-  ldquo: "“",
-  rdquo: "”",
-  eacute: "é",
-  egrave: "è",
-  agrave: "à",
-  uuml: "ü",
-  ouml: "ö",
-  auml: "ä",
-  szlig: "ß",
-  ccedil: "ç",
-  ntilde: "ñ",
-  pound: "£",
-  euro: "€",
-  yen: "¥",
-  cent: "¢",
-  deg: "°",
-  middot: "·",
-  bull: "•",
-  times: "×",
-  divide: "÷",
-  laquo: "«",
-  raquo: "»",
-  sect: "§",
-  para: "¶",
-  dagger: "†",
-  permil: "‰",
-  prime: "′",
-  ne: "≠",
-  le: "≤",
-  ge: "≥",
-  minus: "−",
-  plusmn: "±",
-  frac12: "½",
-  shy: "",
-  zwnj: "",
-  zwj: "",
-};
+/**
+ * A null prototype, because the key is whatever name a page wrote between `&`
+ * and `;`: on an object literal `&constructor;`, `&valueOf;` and
+ * `&toString;` resolved to Object.prototype's functions and decoded into
+ * their source text ("function Object() { [native code] }") in the middle of
+ * the page's prose.
+ */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<string, string>, {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+    copy: "©",
+    reg: "®",
+    trade: "™",
+    hellip: "…",
+    mdash: "—",
+    ndash: "–",
+    lsquo: "‘",
+    rsquo: "’",
+    ldquo: "“",
+    rdquo: "”",
+    eacute: "é",
+    egrave: "è",
+    agrave: "à",
+    uuml: "ü",
+    ouml: "ö",
+    auml: "ä",
+    szlig: "ß",
+    ccedil: "ç",
+    ntilde: "ñ",
+    pound: "£",
+    euro: "€",
+    yen: "¥",
+    cent: "¢",
+    deg: "°",
+    middot: "·",
+    bull: "•",
+    times: "×",
+    divide: "÷",
+    laquo: "«",
+    raquo: "»",
+    sect: "§",
+    para: "¶",
+    dagger: "†",
+    permil: "‰",
+    prime: "′",
+    ne: "≠",
+    le: "≤",
+    ge: "≥",
+    minus: "−",
+    plusmn: "±",
+    frac12: "½",
+    shy: "",
+    zwnj: "",
+    zwj: "",
+  }),
+);
 
 /** Expand character references. Unknown ones are left as written. */
 export function decodeEntities(text: string): string {
@@ -154,16 +178,38 @@ const element = (tag: string, attrs: Record<string, string>, parent: Element | n
   parent,
 });
 
+/**
+ * An attribute map with a null prototype. Attribute names are the page's
+ * choice: on a plain object, `constructor` and `__proto__` read as inherited
+ * members, so `[constructor]` matched every element, a real `constructor`
+ * attribute was dropped as "already present", and `__proto__="x"` set the
+ * map's prototype instead of storing a value.
+ */
+function attributeMap(): Record<string, string> {
+  return Object.create(null) as Record<string, string>;
+}
+
+/**
+ * The value of attribute `name` on `node`, reading own entries only.
+ *
+ * Every lookup by a name that came from a caller or a page goes through
+ * this, so an Element whose `attrs` some other code built as a plain `{}`
+ * still cannot answer with an Object.prototype member.
+ */
+export function attrOf(node: Element, name: string): string | undefined {
+  return Object.hasOwn(node.attrs, name) ? node.attrs[name] : undefined;
+}
+
 /** Parse an attribute list: quoted, unquoted, and bare attributes. */
 function parseAttributes(source: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
+  const attrs = attributeMap();
   const re = /([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]*)))?/g;
   let m: RegExpExecArray | null = re.exec(source);
   while (m !== null) {
     const name = (m[1] as string).toLowerCase();
     const value = m[2] ?? m[3] ?? m[4] ?? "";
     // First wins, which is what browsers do with a repeated attribute.
-    if (!(name in attrs)) attrs[name] = decodeEntities(value);
+    if (!Object.hasOwn(attrs, name)) attrs[name] = decodeEntities(value);
     m = re.exec(source);
   }
   return attrs;
@@ -187,10 +233,34 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
   }
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
 
-  const root = element("#root", {}, null);
+  const root = element("#root", attributeMap(), null);
   let current = root;
   let depth = 0;
   let i = 0;
+
+  // How many open elements of each tag sit between `current` and the nearest
+  // scope barrier (inclusive), one map per barrier on the open chain. A close
+  // tag with no open element of its name in scope is ignored without walking
+  // the chain: the walk cost up to maxDepth per stray close, so 16 MB of
+  // `</x>` under deep nesting took most of a minute. Every element counted
+  // here is uncounted exactly when it leaves the open chain.
+  const scopes: Array<Map<string, number>> = [new Map()];
+  const enter = (node: Element): void => {
+    if (SCOPE_BARRIERS.has(node.tag)) {
+      scopes.push(new Map([[node.tag, 1]]));
+      return;
+    }
+    const top = scopes[scopes.length - 1] as Map<string, number>;
+    top.set(node.tag, (top.get(node.tag) ?? 0) + 1);
+  };
+  const leave = (node: Element): void => {
+    if (SCOPE_BARRIERS.has(node.tag)) {
+      if (scopes.length > 1) scopes.pop();
+      return;
+    }
+    const top = scopes[scopes.length - 1] as Map<string, number>;
+    top.set(node.tag, (top.get(node.tag) ?? 1) - 1);
+  };
 
   const addText = (value: string): void => {
     if (value === "") return;
@@ -226,11 +296,14 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
       i = lt + 1;
       continue;
     }
-    const tag = (nameMatch[0] as string).toLowerCase();
+    const name = nameMatch[0] as string;
+    const tag = name.toLowerCase();
 
     // Find the end of the tag, respecting quoted attribute values so a `>`
-    // inside one does not terminate it early.
-    let cursor = nameStart + tag.length;
+    // inside one does not terminate it early. Measured on the name as
+    // written: its lowercase can be longer (`İ` lowercases to two code units).
+    const nameEnd = nameStart + name.length;
+    let cursor = nameEnd;
     let quote: string | null = null;
     while (cursor < source.length) {
       const ch = source[cursor] as string;
@@ -240,16 +313,22 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
       else if (ch === ">") break;
       cursor++;
     }
-    const inner = source.slice(nameStart + tag.length, cursor);
+    const inner = source.slice(nameEnd, cursor);
     i = cursor + 1;
 
     if (isClose) {
       // Walk up to the matching open element, but never past a barrier: a
-      // stray `</div>` should not unwind the whole document.
+      // stray `</div>` should not unwind the whole document. The count says
+      // up front whether the walk would find one.
+      if (((scopes[scopes.length - 1] as Map<string, number>).get(tag) ?? 0) === 0) continue;
       let node: Element | null = current;
       let unwound = 0;
       while (node !== null && node !== root) {
         if (node.tag === tag) {
+          for (let open: Element = current; ; open = open.parent as Element) {
+            leave(open);
+            if (open === node) break;
+          }
           current = (node.parent ?? root) as Element;
           depth = Math.max(0, depth - unwound - 1);
           break;
@@ -261,8 +340,9 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
       continue;
     }
 
-    for (const closable of IMPLICIT_CLOSE[tag] ?? []) {
+    for (const closable of Object.hasOwn(IMPLICIT_CLOSE, tag) ? (IMPLICIT_CLOSE[tag] ?? []) : []) {
       if (current.tag === closable) {
+        leave(current);
         current = (current.parent ?? root) as Element;
         depth = Math.max(0, depth - 1);
       }
@@ -275,9 +355,11 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
     const selfClosing = inner.trimEnd().endsWith("/");
     if (VOID_ELEMENTS.has(tag) || selfClosing) continue;
 
-    if (RAW_TEXT.has(tag)) {
+    const closeSearch = RAW_TEXT_CLOSE.get(tag);
+    if (closeSearch !== undefined) {
       // Everything up to the matching close tag is text, including markup.
-      const closeAt = source.toLowerCase().indexOf(`</${tag}`, i);
+      closeSearch.lastIndex = i;
+      const closeAt = closeSearch.exec(source)?.index ?? -1;
       const end = closeAt === -1 ? source.length : closeAt;
       const raw = source.slice(i, end);
       if (raw !== "") {
@@ -295,6 +377,7 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
 
     if (depth < maxDepth) {
       current = node;
+      enter(node);
       depth++;
     }
   }
@@ -367,6 +450,94 @@ export function textOf(node: Node, skipNonRendered = true): string {
   }
   const joined = parts.join("");
   return BLOCK.has(node.tag) ? `\n${joined}\n` : joined;
+}
+
+/**
+ * What one call may spend reading element text: characters and nodes read,
+ * shared by every element the call takes text from. Nested matches each
+ * read their whole subtree, so without it 500 nested `<div>`s cost 500
+ * copies of the page.
+ */
+export type TextWork = { units: number };
+
+/**
+ * `normalizeText(textOf(node))`, cut to at most `max` characters, reading
+ * no more of the subtree than that needs and charging what it reads to
+ * `work`. `complete` is false when the text returned is not all of it:
+ * longer than `max`, or the walk stopped because `work` ran out (or the
+ * subtree held far more whitespace and markup than text).
+ */
+export function boundedText(
+  node: Node,
+  max: number,
+  work: TextWork,
+): { text: string; complete: boolean } {
+  const limit = Math.max(0, Math.floor(max));
+  // The raw text a walk may collect: whitespace collapses, so it may need
+  // more than `limit` raw characters, but never unboundedly more.
+  const rawCap = limit * 8 + 4096;
+  const parts: string[] = [];
+  let raw = 0;
+  let check = limit + 1;
+  let complete = true;
+  const take = (value: string): boolean => {
+    if (value === "") return true;
+    let piece = value;
+    if (raw + piece.length > rawCap) {
+      piece = piece.slice(0, rawCap - raw);
+      complete = false;
+    }
+    if (piece.length > work.units) {
+      piece = piece.slice(0, Math.max(0, work.units));
+      complete = false;
+    }
+    work.units -= piece.length;
+    parts.push(piece);
+    raw += piece.length;
+    if (!complete) return false;
+    // At doubling lengths, stop once the text is already longer than wanted.
+    if (raw >= check) {
+      if (normalizeText(parts.join("")).length > limit) {
+        complete = false;
+        return false;
+      }
+      check = raw * 2;
+    }
+    return true;
+  };
+
+  if (node.type === "text") {
+    take(node.value);
+  } else if (!NON_RENDERED.has(node.tag)) {
+    const frames: Array<{ node: Element; at: number }> = [{ node, at: 0 }];
+    let going = !BLOCK.has(node.tag) || take("\n");
+    while (going && frames.length > 0) {
+      const frame = frames[frames.length - 1] as { node: Element; at: number };
+      if (frame.at >= frame.node.children.length) {
+        frames.pop();
+        if (BLOCK.has(frame.node.tag)) going = take("\n");
+        continue;
+      }
+      const child = frame.node.children[frame.at] as Node;
+      frame.at += 1;
+      work.units -= 1;
+      if (work.units < 0) {
+        complete = false;
+        break;
+      }
+      if (child.type === "text") going = take(child.value);
+      else if (!NON_RENDERED.has(child.tag)) {
+        frames.push({ node: child, at: 0 });
+        if (BLOCK.has(child.tag)) going = take("\n");
+      }
+    }
+  }
+  let text = normalizeText(parts.join(""));
+  if (text.length > limit) {
+    text = text.slice(0, limit);
+    complete = false;
+  }
+  return { text, complete };
 }
 
 /** Collapse runs of whitespace the way rendering does, keeping paragraphs. */

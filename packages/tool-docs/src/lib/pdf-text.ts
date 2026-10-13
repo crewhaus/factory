@@ -1,3 +1,4 @@
+import { tidyLines } from "./lines";
 /**
  * Text extraction from PDF content streams.
  *
@@ -192,7 +193,8 @@ const GLYPH_CODES: Readonly<Record<string, number>> = {
 };
 
 function glyphToUnicode(name: string): string | undefined {
-  const known = GLYPH_CODES[name];
+  // Own entries only: the name is the PDF's, and `/constructor` read Object.
+  const known = Object.hasOwn(GLYPH_CODES, name) ? GLYPH_CODES[name] : undefined;
   if (known !== undefined) return String.fromCodePoint(known);
   const uni = /^uni([0-9A-Fa-f]{4,6})$/.exec(name);
   if (uni?.[1] !== undefined) return String.fromCodePoint(Number.parseInt(uni[1], 16));
@@ -218,6 +220,28 @@ type Font = {
   readonly unmappable: boolean;
 };
 
+/** Most codes a ToUnicode map's ranges may expand to: 16 full 2-byte code spaces. */
+const MAX_CMAP_CODES = 16 * 65_536;
+
+/**
+ * The bodies between each `open` and the first `close` after it, left to
+ * right: what `/open([\s\S]*?)close/g` finds, by index search. The lazy
+ * regex was quadratic on many `open`s with no `close` after them — each one
+ * re-read the rest of the stream — and the first `open` with no `close`
+ * after it means no later one has one either.
+ */
+function* sections(text: string, open: string, close: string): Generator<string> {
+  let at = 0;
+  for (;;) {
+    const start = text.indexOf(open, at);
+    if (start === -1) return;
+    const end = text.indexOf(close, start + open.length);
+    if (end === -1) return;
+    yield text.slice(start + open.length, end);
+    at = end + close.length;
+  }
+}
+
 /** Parse the `beginbfchar` / `beginbfrange` sections of a ToUnicode CMap. */
 export function parseToUnicodeCMap(text: string): Map<number, string> {
   const map = new Map<number, string>();
@@ -229,24 +253,22 @@ export function parseToUnicodeCMap(text: string): Map<number, string> {
     }
     return out;
   };
-  const charBlock = /beginbfchar([\s\S]*?)endbfchar/g;
-  for (;;) {
-    const block = charBlock.exec(text);
-    if (block === null) break;
+  for (const block of sections(text, "beginbfchar", "endbfchar")) {
     const pair = /<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\/(\S+))/g;
     for (;;) {
-      const m = pair.exec(block[1] ?? "");
+      const m = pair.exec(block);
       if (m === null) break;
       const code = Number.parseInt(m[1] as string, 16);
       const value = m[2] !== undefined ? hexToString(m[2]) : (glyphToUnicode(m[3] ?? "") ?? "");
       if (value !== "") map.set(code, value);
     }
   }
-  const rangeBlock = /beginbfrange([\s\S]*?)endbfrange/g;
-  for (;;) {
-    const block = rangeBlock.exec(text);
-    if (block === null) break;
-    const body = block[1] ?? "";
+  // Every code a range maps is one map write, so a few kilobytes of
+  // `<0000> <FFFF> …` lines were minutes of CPU. A CMap maps at most a
+  // 2-byte code space, so a range total past a few times that is not a
+  // font's; the map is refused and the font falls back to its encoding.
+  let expanded = 0;
+  for (const body of sections(text, "beginbfrange", "endbfrange")) {
     // Both `<lo> <hi> <dst>` and `<lo> <hi> [<d1> <d2> ...]` are legal.
     const simple = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
     for (;;) {
@@ -256,14 +278,22 @@ export function parseToUnicodeCMap(text: string): Map<number, string> {
       const hi = Number.parseInt(m[2] as string, 16);
       const dst = hexToString(m[3] as string);
       if (hi < lo || hi - lo > 65535) continue;
+      expanded += hi - lo + 1;
+      if (expanded > MAX_CMAP_CODES) {
+        throw new RangeError(`the ToUnicode map's ranges cover more than ${MAX_CMAP_CODES} codes`);
+      }
       for (let c = lo; c <= hi; c++) {
         if (dst.length === 1) map.set(c, String.fromCharCode(dst.charCodeAt(0) + (c - lo)));
         else map.set(c, dst);
       }
     }
     const listed = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([^\]]*)\]/g;
+    // Only up to the last `]`: past it every `[^\]]*` would read to the end
+    // and fail, once per `<lo> <hi> [` — quadratic. Before it, each match
+    // ends at the first `]` it reaches.
+    const listable = body.slice(0, body.lastIndexOf("]") + 1);
     for (;;) {
-      const m = listed.exec(body);
+      const m = listed.exec(listable);
       if (m === null) break;
       const lo = Number.parseInt(m[1] as string, 16);
       const items = (m[3] ?? "").match(/<([0-9A-Fa-f]+)>/g) ?? [];
@@ -730,11 +760,7 @@ export function extractPageText(doc: PdfDocument, page: PdfPage): PageText {
     0,
   );
 
-  const text = pieces
-    .join("")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const text = tidyLines(pieces.join(""));
   return { text, hasTextLayer: drewGlyph, notes: [...notes].sort() };
 }
 

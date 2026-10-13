@@ -215,16 +215,28 @@ export function renderAuditReport(report: DatasetAuditReport, label: string): st
       `${report.totalHits} PII/secret hit(s) across ${report.samplesWithHits} sample(s)`,
   ];
   // Group (kind, field) → total count + sample ids, in a stable sorted order.
-  const groups = new Map<string, { kind: string; field: string; count: number; ids: string[] }>();
+  // `seen` holds the ids already listed: searching the list for each hit was
+  // quadratic in the samples that share a kind and field.
+  type Group = { kind: string; field: string; count: number; ids: string[]; seen: Set<string> };
+  const groups = new Map<string, Group>();
   for (const h of report.hits) {
     const key = `${h.kind}\u0000${h.field}`;
-    const g = groups.get(key) ?? { kind: h.kind, field: h.field, count: 0, ids: [] };
+    const g = groups.get(key) ?? {
+      kind: h.kind,
+      field: h.field,
+      count: 0,
+      ids: [],
+      seen: new Set<string>(),
+    };
     g.count += h.count;
-    if (!g.ids.includes(h.sampleId)) g.ids.push(h.sampleId);
+    if (!g.seen.has(h.sampleId)) {
+      g.seen.add(h.sampleId);
+      g.ids.push(h.sampleId);
+    }
     groups.set(key, g);
   }
   for (const key of [...groups.keys()].sort()) {
-    const g = groups.get(key) as { kind: string; field: string; count: number; ids: string[] };
+    const g = groups.get(key) as Group;
     const shown = g.ids.slice(0, REPORT_MAX_IDS).join(", ");
     const elided = g.ids.length > REPORT_MAX_IDS ? ` +${g.ids.length - REPORT_MAX_IDS} more` : "";
     lines.push(`  ${g.kind} in ${g.field}: ${g.count} hit(s) — ${shown}${elided}`);

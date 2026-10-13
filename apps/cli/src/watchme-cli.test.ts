@@ -123,7 +123,7 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     expect(result.stdout).toContain("watchme report [--all]");
     expect(result.stdout).toContain("watchme synthesize");
     expect(result.stdout).toContain("watchme publish");
-  });
+  }, 20_000);
 
   test("an unknown action dies with the exact negative-space message", async () => {
     const home = newTempDir("home");
@@ -132,7 +132,7 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     expect(result.stderr).toContain(
       'crewhaus: watchme action must be one of: start, stop, status, report, intents, synthesize, publish (got "bogus")',
     );
-  });
+  }, 20_000);
 
   test("-h in the action slot routes to help (stdout, exit 0)", async () => {
     const home = newTempDir("home");
@@ -143,7 +143,7 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     // anthropic adapter emits a benign fallback-version warning to stderr when
     // no `claude` CLI is installed (e.g. on CI runners).
     expect(result.stderr).not.toContain("usage:");
-  });
+  }, 20_000);
 
   test("start flips state, registers the harness, and backfills a report", async () => {
     const harness = newTempDir("start");

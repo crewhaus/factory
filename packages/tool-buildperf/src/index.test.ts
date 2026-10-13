@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { restoreWorkerClocks, withoutWorkerClocks } from "./__test__/worker-clocks";
 import { BUILDPERF_TOOLS, benchmarkCompare, bundleSizeCheck, flakyTestDetect } from "./index";
 
 const originalCwd = process.cwd();
@@ -47,6 +48,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  restoreWorkerClocks();
   process.chdir(originalCwd);
   rmSync(workspace, { recursive: true, force: true });
 });
@@ -824,26 +826,34 @@ describe("FlakyTestDetect", () => {
   });
 
   test("masks are applied to failure text and their hit counts reported", async () => {
-    const report = await call<{
-      masksApplied: Record<string, number>;
-      tests: Array<{ failureGroups: unknown[]; sameFailureEveryTime: boolean | null }>;
-    }>(flakyTestDetect, {
-      runs: [
-        { id: "r1", tests: [{ id: "t", status: "fail", error: "closed port 51234" }] },
-        { id: "r2", tests: [{ id: "t", status: "fail", error: "closed port 61111" }] },
-      ],
-      masks: [{ pattern: "port \\d+", with: "port <n>" }],
-    });
+    // The mask runs in the regex worker, and every scan ends on a failing
+    // exec: no clock of the worker's may turn that into "could not apply".
+    const report = await withoutWorkerClocks(() =>
+      call<{
+        masksApplied: Record<string, number>;
+        tests: Array<{ failureGroups: unknown[]; sameFailureEveryTime: boolean | null }>;
+      }>(flakyTestDetect, {
+        runs: [
+          { id: "r1", tests: [{ id: "t", status: "fail", error: "closed port 51234" }] },
+          { id: "r2", tests: [{ id: "t", status: "fail", error: "closed port 61111" }] },
+        ],
+        masks: [{ pattern: "port \\d+", with: "port <n>" }],
+      }),
+    );
     expect(report.masksApplied["port \\d+"]).toBe(2);
     expect(report.tests[0]?.failureGroups).toHaveLength(1);
     expect(report.tests[0]?.sameFailureEveryTime).toBe(true);
   });
 
-  test("an unusable mask comes back as a sentence, not a crash", async () => {
-    const out = await callRaw(flakyTestDetect, {
+  test("an unusable mask is refused with the reason, by the schema and by execute", async () => {
+    const input = {
       runs: [{ id: "r1", tests: [{ id: "t", status: "fail", error: "x" }] }],
       masks: [{ pattern: "(" }],
-    });
+    };
+    const parsed = flakyTestDetect.inputSchema.safeParse(input);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.message).toContain("not a valid regular expression");
+    const out = String(await flakyTestDetect.execute(input as never, ctx));
     expect(out).toContain("not a valid regular expression");
   });
 
@@ -865,5 +875,146 @@ describe("FlakyTestDetect", () => {
       },
     );
     expect(report.tests[0]?.failureGroups[0]?.runs).toEqual(["run-1"]);
+  });
+});
+
+/**
+ * C073: joinPattern and masks are caller regexes. They are screened for the
+ * catastrophic shapes before they are accepted, and run in
+ * @crewhaus/tool-safety's worker under a deadline — never synchronously on
+ * this thread. Any answer the worker could not give fails the call; it is
+ * never taken for "no match" (an unnormalised key, an unmasked text).
+ */
+describe("caller-supplied patterns (C073)", () => {
+  const gzip9 = {
+    algorithm: "gzip",
+    level: 9,
+    tuning: { memLevel: 8, strategy: 0, windowBits: 15 },
+  } as const;
+  const aborted = (): typeof ctx => {
+    const controller = new AbortController();
+    controller.abort();
+    return { signal: controller.signal };
+  };
+
+  test("a custom join still pairs a renamed chunk with its baseline row", async () => {
+    writeFileSync("dist/app-4f2a1c.js", payload("app"));
+    const report = await withoutWorkerClocks(() =>
+      call<{
+        entries: Array<{ key: string }>;
+        comparison: { matched: unknown[]; added: string[] };
+      }>(bundleSizeCheck, {
+        files: ["dist/app-4f2a1c.js"],
+        join: "custom",
+        joinPattern: "-[0-9a-f]{6}",
+        baseline: {
+          parameters: gzip9,
+          entries: [{ path: "dist/app-99aa11.js", bytes: 14_400, compressedBytes: 200 }],
+        },
+      }),
+    );
+    expect(report.entries[0]?.key).toBe("dist/app[hash].js");
+    expect(report.comparison.matched).toHaveLength(1);
+    expect(report.comparison.added).toEqual([]);
+  }, 20_000); // builds, weighs and joins in a regex worker: slow on a loaded runner
+
+  test("a catastrophic joinPattern is refused by the schema and by execute", async () => {
+    writeFileSync("dist/app.js", payload("app"));
+    const input = { files: ["dist/app.js"], join: "custom", joinPattern: "(a+)+!$|x" };
+    const parsed = bundleSizeCheck.inputSchema.safeParse(input);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.message).toContain("(a+)+");
+    const out = String(await bundleSizeCheck.execute(input as never, ctx));
+    expect(out).toContain("was refused");
+    expect(() => JSON.parse(out)).toThrow();
+  });
+
+  test("a join the worker could not finish fails the call, never an unnormalised key", async () => {
+    writeFileSync("dist/app-4f2a1c.js", payload("app"));
+    const out = String(
+      await bundleSizeCheck.execute(
+        { files: ["dist/app-4f2a1c.js"], join: "custom", joinPattern: "-[0-9a-f]{6}" } as never,
+        aborted(),
+      ),
+    );
+    expect(out).toContain("could not normalise");
+    expect(out).toContain("No comparison was made");
+  });
+
+  test("a baseline path the worker would not run is undetermined, and fails the call", async () => {
+    writeFileSync("dist/app-4f2a1c.js", payload("app"));
+    const long = `dist/${"a".repeat(70_000)}.js`;
+    // Past the schema's cap, so it only reaches execute on a direct call.
+    const parsed = bundleSizeCheck.inputSchema.safeParse({
+      files: ["dist/app-4f2a1c.js"],
+      baseline: { parameters: gzip9, entries: [{ path: long, bytes: 1 }] },
+    });
+    expect(parsed.success).toBe(false);
+    // The head's own path must get a definite key first: given up on, it
+    // fails the call with this same sentence, about the wrong path.
+    const out = String(
+      await withoutWorkerClocks(() =>
+        bundleSizeCheck.execute(
+          {
+            files: ["dist/app-4f2a1c.js"],
+            join: "custom",
+            joinPattern: "-[0-9a-f]{6}",
+            baseline: {
+              parameters: gzip9,
+              entries: [{ path: long, bytes: 1, compressedBytes: 1 }],
+            },
+          } as never,
+          ctx,
+        ),
+      ),
+    );
+    expect(out).toContain("could not determine the joinPattern key of 1 path");
+    expect(out).toContain(`(first: "${long}")`);
+  }, 20_000); // builds, weighs and joins in a regex worker: slow on a loaded runner
+
+  test("a catastrophic mask is refused, and a mask the worker could not apply fails the call", async () => {
+    const runs = [
+      { id: "r1", tests: [{ id: "t", status: "fail", error: "port 1234 in use" }] },
+      { id: "r2", tests: [{ id: "t", status: "fail", error: "port 99 in use" }] },
+    ];
+    const bad = flakyTestDetect.inputSchema.safeParse({
+      runs,
+      masks: [{ pattern: "(\\w+\\s?)*$" }],
+    });
+    expect(bad.success).toBe(false);
+    const refused = String(
+      await flakyTestDetect.execute({ runs, masks: [{ pattern: "(a|a)*$" }] } as never, ctx),
+    );
+    expect(refused).toContain("was refused");
+    const unapplied = String(
+      await flakyTestDetect.execute({ runs, masks: [{ pattern: "\\d+" }] } as never, aborted()),
+    );
+    expect(unapplied).toContain("could not apply mask");
+    expect(unapplied).toContain("not grouped");
+  });
+
+  test("masks applied in the worker group and count exactly as before", async () => {
+    const report = await withoutWorkerClocks(() =>
+      call<{
+        tests: Array<{ failureGroups: Array<{ signature: string; count: number }> }>;
+        masksApplied: Record<string, number>;
+      }>(flakyTestDetect, {
+        runs: [
+          { id: "r1", tests: [{ id: "t", status: "fail", error: "port 1234  in use at 10ms" }] },
+          { id: "r2", tests: [{ id: "t", status: "fail", error: "port 99 in use at 7ms" }] },
+          { id: "r3", tests: [{ id: "t", status: "fail", error: "port 99 in use at 7ms" }] },
+        ],
+        masks: [
+          { pattern: "\\d+", with: "N" },
+          { pattern: "N(ms)", with: "<t>$1" },
+        ],
+      }),
+    );
+    expect(report.tests[0]?.failureGroups).toEqual([
+      expect.objectContaining({ signature: "port N in use at <t>ms", count: 3 }),
+    ]);
+    // Per failing observation, as the synchronous path counted: 2 numbers in
+    // each of 3 texts, then one timing in each.
+    expect(report.masksApplied).toEqual({ "\\d+": 6, "N(ms)": 3 });
   });
 });

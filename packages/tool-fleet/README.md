@@ -123,10 +123,18 @@ The exception is deliberate and no input can move it. The two machine-wide files
 (`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`), because a registry that only ever saw the
 current workspace would not be a registry. Their absolute paths are reported in every result.
 
-Two binaries are executed: `crewhaus compile` (by `CompileBundle`) and `<bin> --version` (by
-`CliVersionPin --probe`). Both come from the supervisor's own resolver — harness-local
-`node_modules/.bin/crewhaus` first, then `PATH` — and a binary that resolves OUTSIDE the workspace
-is refused unless `allowExternalCli` is passed, with its path named.
+`CompileBundle` executes `crewhaus compile`. The binary comes from the supervisor's own resolver —
+harness-local `node_modules/.bin/crewhaus` first, then `PATH` — and a binary that resolves OUTSIDE
+the workspace is refused unless `allowExternalCli` is passed, with its path named.
+
+`CliVersionPin --probe` does not run a CLI the workspace supplies. A cloned repository can commit
+`node_modules/.bin/crewhaus`, and this tool is not destructive, so auto mode runs it without asking.
+The version is READ from the `package.json` of the `crewhaus` package the binary belongs to (npm's
+`.bin` entry links into `node_modules/crewhaus/`), found by walking up from where the binary really
+is and then at `<harness>/node_modules/crewhaus/package.json`; each read is contained, and a
+`package.json` a link puts outside the workspace is refused, not read. A CLI outside the workspace
+is the operator's own install: it is read the same way with `allowExternalCli`, and only a
+standalone binary with no `package.json` (brew, scoop) is asked with `--version`.
 
 ## What a compile is given
 
@@ -212,7 +220,8 @@ Every result is one JSON object carrying a `status`:
 
 ## Notes
 
-- `HarnessJobStatus` and `CliVersionPin` declare `readOnly: true`, and nothing they do writes.
+- `HarnessJobStatus` declares `readOnly: true`; `CliVersionPin` does not (0.7.1: it can run the
+  operator's own standalone CLI, see above), but is not destructive either. Nothing either does writes.
   `harness-registry`'s `list()` normally persists its own missing-directory stamps and any pending
   pre-v2 lift ON A READ, so merely reporting the fleet would edit a machine-wide file — and
   `readOnly` is a flag a permission layer acts on, not a note. Every enumerating READ here opens

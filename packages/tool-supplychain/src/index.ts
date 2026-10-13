@@ -88,7 +88,10 @@ function resolveInside(toolName: string, rel: string): Resolved<string> {
     if (err instanceof ToolPermissionError) {
       return {
         ok: false,
-        message: `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        message:
+          err.reason !== undefined
+            ? err.message
+            : `${toolName} refused the path "${rel}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       };
     }
     throw err;
@@ -274,6 +277,13 @@ function bandOf(rating: CvssRating | undefined, label: string | undefined): Band
 
 export const dependencyAudit: RegisteredTool = buildTool({
   name: "DependencyAudit",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: "." },
+    // Left out, the lockfile's versions go to the public OSV database: a deny
+    // or ask naming it reads that, while an allow scoped to the project
+    // (`DependencyAudit(.)`) is not also asked to cover the fixed service.
+    { field: "endpoint", kind: "url", default: OSV_DEFAULT_ENDPOINT, relocates: true },
+  ],
   description:
     "Read a project's lockfile and ask the public OSV database whether any locked version falls inside a range a published advisory declares affected, returning the severity, the affected range and the fixed version where OSV records one. Use it before trusting a dependency tree you did not install yourself. Read the limit in the result and do not round it up: a match means this VERSION IS IN AN AFFECTED RANGE, not that the vulnerable code is reachable from this project — nothing here analyses call paths, and `reachabilityAnalyzed` is always false. It reads bun.lock, package-lock.json, npm-shrinkwrap.json, yarn.lock and Cargo.lock; a pnpm, Python or Go lockfile beside them is reported as NOT audited rather than passed over in silence. Queries are batched, and a database that cannot be reached is an error rather than an empty, reassuring answer.",
   inputSchema: z.object({
@@ -561,6 +571,8 @@ const BAND_OF_SEVERITY: Record<Severity, Band> = {
 
 export const ciWorkflowAudit: RegisteredTool = buildTool({
   name: "CiWorkflowAudit",
+  // The workflow file, or the directory of them it reads.
+  operativeArgs: [{ field: "path", kind: "path", default: ".github/workflows", beneath: "all" }],
   description:
     "Parse GitHub Actions workflow YAML and report supply-chain hygiene, with the file, job, step and LINE of each finding: an action referenced by a mutable tag or branch rather than a commit SHA, a privileged trigger (pull_request_target, workflow_run) combined with a checkout of the pull request's own head, permissions broader than the job needs, a self-hosted runner reachable from a fork's pull request, and `${{ github.event.* }}` interpolated into a run: script — the Actions runner substitutes that value before the shell parses the line, so an issue title becomes part of the script. Use it on any repository whose CI you did not write. Entirely offline: it never resolves a tag to a SHA, so a ref that is not a 40-character commit is reported as mutable rather than classified as a tag or a branch. Constructs its YAML reader does not cover come back as warnings rather than as silence.",
   inputSchema: z.object({

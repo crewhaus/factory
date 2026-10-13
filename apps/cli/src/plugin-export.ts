@@ -17,7 +17,7 @@
  */
 
 import { type Dirent, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import { SkillParseError, parseSkillFile } from "@crewhaus/skills-registry";
 
 /** One emitted plugin file (structural mirror of `target-claude-plugin`'s `PluginFile`). */
@@ -187,7 +187,7 @@ export function collectHarnessPluginAssets(harnessDir: string): HarnessPluginAss
     const skillDir = join(skillsRoot, dir);
     if (!isReadableFile(join(skillDir, SKILL_FILE))) continue;
     for (const rel of walkRelativeFiles(skillDir)) {
-      const abs = join(skillDir, ...rel);
+      const abs = join(skillDir, rel.join(sep));
       const read = readTextFile(abs);
       if (read === undefined) {
         skipped.push(abs);
@@ -289,7 +289,7 @@ function sortedEntries(root: string): Dirent[] {
 /** Every regular file under `root`, as path segments relative to `root`. */
 function walkRelativeFiles(root: string, prefix: ReadonlyArray<string> = []): string[][] {
   const out: string[][] = [];
-  for (const entry of sortedEntries(join(root, ...prefix))) {
+  for (const entry of sortedEntries(join(root, prefix.join(sep)))) {
     const next = [...prefix, entry.name];
     if (entry.isFile()) out.push(next);
     else if (entry.isDirectory()) out.push(...walkRelativeFiles(root, next));
