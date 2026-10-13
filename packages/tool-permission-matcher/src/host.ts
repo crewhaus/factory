@@ -6,7 +6,9 @@
  * the same place under other spellings: the IDNA form of a name
  * (`münchen.de` is looked up as `xn--mnchen-3ya.de`, and full-width letters
  * and ideographic dots fold into ASCII ones), and an IPv4 address in any
- * numeric form (`10.5`, `0xa.0.0.5` and `167772165` are all `10.0.0.5`). A
+ * numeric form (`10.5`, `0xa.0.0.5` and `167772165` are all `10.0.0.5`).
+ * `localhost` and the unspecified address (`0.0.0.0`, `::`) reach this
+ * machine's loopback address, which is what WaitForPort probes for them. A
  * deny or ask rule reads these, so it decides on the place the tool reaches
  * rather than on how the call spelled it.
  */
@@ -69,16 +71,40 @@ function isBareHost(host: string): boolean {
 }
 
 /**
+ * The loopback addresses a host that names this machine reaches. WaitForPort
+ * probes `localhost` without a list, as this machine, and dials the
+ * unspecified address itself as loopback: `0.0.0.0` (and `0`, `::ffff:0.0.0.0`)
+ * as 127.0.0.1 and `::` as ::1, which is also where any connection to them
+ * lands. So a deny on 127.0.0.1 or ::1 meets these as the probe does.
+ */
+const LOOPBACK_OF: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["localhost", ["127.0.0.1", "::1"]],
+  ["0.0.0.0", ["127.0.0.1"]],
+  ["::", ["::1"]],
+];
+
+/**
  * The other spellings of a bare host that a tool which looks it up or dials
  * it reaches, lower-cased: as the WHATWG host parser reads it (IDNA, case,
  * an IPv4 address in any numeric form as its dotted quad, an IPv6 address in
  * its shortest form) without a root dot, as {@link ipv4Address} reads it,
- * and an IPv4-mapped IPv6 address as the IPv4 one. `[]` for a value that is
- * not a bare host: an address, a URL, a path, a number with spaces.
+ * an IPv4-mapped IPv6 address as the IPv4 one, and this machine for a host
+ * that names it with no address of its own (see {@link LOOPBACK_OF}). `[]`
+ * for a value that is not a bare host: an address, a URL, a path, a number
+ * with spaces.
  */
 export function hostSpellings(raw: string): string[] {
   const host = raw.trim();
   if (!isBareHost(host)) return [];
+  const out = readHost(host);
+  for (const [place, loopback] of LOOPBACK_OF) {
+    if (out.includes(place)) out.push(...loopback);
+  }
+  return out;
+}
+
+/** A bare host as {@link ipv4Address} and the WHATWG host parser read it. */
+function readHost(host: string): string[] {
   const out: string[] = [];
   const v4 = ipv4Address(host);
   if (v4 !== undefined) out.push(v4);

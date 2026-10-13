@@ -55,9 +55,10 @@ built it.
   hex case. A deny on a phone number missed `(+1)5550100000` and the other
   spellings SmsSend sends to it, and a deny on a host that WaitForPort,
   DeliverabilityCheck or FederationDiscover reaches missed it written another
-  way: `10.5` is `10.0.0.5`, and `münchen.de` is `xn--mnchen-3ya.de`. Numbers
-  and hosts are now read the way the tool reads them, in the call and in the
-  rule: `alwaysDeny SmsSend(+1 555*)` covers `+15550100000`, and
+  way: `10.5` is `10.0.0.5`, `münchen.de` is `xn--mnchen-3ya.de`, and
+  WaitForPort probes `localhost`, `0.0.0.0` and `::` on 127.0.0.1 or ::1.
+  Numbers and hosts are now read the way the tool reads them, in the call and
+  in the rule: `alwaysDeny SmsSend(+1 555*)` covers `+15550100000`, and
   `alwaysDeny DeliverabilityCheck(münchen.de)` covers `xn--mnchen-3ya.de`.
   A deny that names a host covers it over http and https
   and on any port, unless it names a port; one whose host is a wildcard
@@ -1254,6 +1255,11 @@ deny, warn or fail `--strict`; each says what to write instead.
   ContainerImageInspect and ContainerImageTags read `alpine` as Docker Hub's
   `docker.io/library/alpine`, but a deny on one of those spellings does not
   stop the other. Deny each spelling, or the tool.
+- **A rule on an address does not meet a name that resolves to it.** Rules
+  are checked before anything is looked up, so
+  `alwaysDeny WaitForPort(10.0.0.5)` does not stop a probe of a listed `db`
+  that resolves there. Deny the name too, or the tool. `localhost` is the
+  exception: a deny on 127.0.0.1 or ::1 covers it.
 - **Git tools that take no path (GitStatus, GitStashPop, GitCherryPick …)
   are matched on their repository.** Taking only a `cwd`, they change or
   report files no path rule reads. Deny the tool to keep it off.

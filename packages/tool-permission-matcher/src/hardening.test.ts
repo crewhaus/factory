@@ -1426,6 +1426,32 @@ describe("a restrict rule reads every spelling of a destination", () => {
     expect(fires("T(10.0.0.*)", host("167772165"))).toBe(true);
   });
 
+  // WaitForPort probes `localhost` with no list, and dials the unspecified
+  // address itself as loopback (`0.0.0.0` as 127.0.0.1, `::` as ::1), where
+  // any connection to it lands anyway; a deny on the loopback address read
+  // neither.
+  test("a deny on a loopback address meets localhost and the unspecified address, which reach it", () => {
+    const host = (raw: string): OperativeValue => ({ kind: "recipient", canonical: [raw] });
+    const reach: Record<string, string[]> = {
+      "127.0.0.1": ["0.0.0.0", "0", "0x0", "00.0.0.0", "::ffff:0.0.0.0", "localhost", "LOCALHOST."],
+      "::1": ["::", "::0", "0:0:0:0:0:0:0:0", "localhost"],
+    };
+    for (const [loopback, spellings] of Object.entries(reach)) {
+      const missed = spellings.filter((s) => !fires(`T(${loopback})`, host(s)));
+      expect({ loopback, missed }).toEqual({ loopback, missed: [] });
+      // An allow is not widened: it reads only what the call wrote.
+      expect(spellings.filter((s) => fires(`T(${loopback})`, host(s), allow))).toEqual([]);
+    }
+    // A rule written on one of them is read as the place it reaches.
+    expect(fires("T(localhost)", host("127.1"))).toBe(true);
+    expect(fires("T(0.0.0.0)", host("127.0.0.1"))).toBe(true);
+    // Each lands on its own family's loopback, and nowhere else.
+    expect(fires("T(::1)", host("0.0.0.0"))).toBe(false);
+    expect(fires("T(127.0.0.1)", host("::"))).toBe(false);
+    expect(fires("T(127.0.0.1)", host("mail.localhost"))).toBe(false);
+    expect(fires("T(10.0.0.5)", host("localhost"))).toBe(false);
+  });
+
   test("an id or a program name is compared ignoring case", () => {
     const id: OperativeValue = { kind: "id", canonical: ["CrewHaus/Factory"] };
     expect(fires("T(crewhaus/factory)", id)).toBe(true);

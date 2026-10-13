@@ -155,6 +155,28 @@ type Audit = {
 
 const justified = { justification: "on task" };
 const LISTED_PORT_HOSTS = ["10.0.0.5", "93.184.216.34", "db.internal", "fd00::5"];
+/** IPv6 spellings of loopback WaitForPort probes with no list. */
+const V6_LOOPBACK = [
+  "::1",
+  "0::1",
+  "::ffff:127.0.0.1",
+  "::FFFF:127.0.0.1",
+  "0:0:0:0:0:ffff:127.0.0.1",
+  "::ffff:7f00:0001",
+];
+/** The unspecified address, which WaitForPort dials as 127.0.0.1 or ::1. */
+const UNSPECIFIED = [
+  "0.0.0.0",
+  "0",
+  "0x0",
+  "0.0",
+  "00.0.0.0",
+  "::ffff:0.0.0.0",
+  "::",
+  "::0",
+  "0::0",
+  "0:0:0:0:0:0:0:0",
+];
 const chat = (channel: string) => ({
   platform: "slack",
   apiBaseUrl: "https://slack.com/api",
@@ -240,6 +262,9 @@ const AUDITED: Readonly<Record<string, Audit>> = {
       "db.internal",
       "DB.Internal",
       "localhost",
+      ...V6_LOOPBACK,
+      // dialled as 127.0.0.1 or ::1 by the tool itself
+      ...UNSPECIFIED,
     ],
   },
   federationDiscover: {

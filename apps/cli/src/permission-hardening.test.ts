@@ -4802,6 +4802,55 @@ describe("recipient audit — a host deny meets the host in the form the tool re
     }
   }, 60_000);
 
+  // WaitForPort probes `localhost` with no list, and dials the unspecified
+  // address itself as loopback: `0.0.0.0` as 127.0.0.1, `::` as ::1. A deny
+  // on the loopback address read neither.
+  test("WaitForPort: a deny on 127.0.0.1 or ::1 stops localhost and the unspecified address, which it probes as them; nothing runs", async () => {
+    let connections = 0;
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open() {
+          connections++;
+        },
+        data() {},
+      },
+    });
+    try {
+      const probe = (host: string) => ({ host, port: listener.port, timeoutMs: 5_000 });
+      const cases: Array<[string, string[]]> = [
+        ["127.0.0.1", ["0.0.0.0", "0", "0x0", "00.0.0.0", "::ffff:0.0.0.0", "localhost"]],
+        ["::1", ["::", "::0", "0::0", "0:0:0:0:0:0:0:0", "localhost", "LOCALHOST."]],
+      ];
+      for (const [deny, hosts] of cases) {
+        const rs = rules(["alwaysDeny", `WaitForPort(${deny})`], ["alwaysAllow", "WaitForPort"]);
+        for (const host of hosts) {
+          for (const mode of ["default", "auto"] as const) {
+            const got = await gate("WaitForPort", probe(host), rs, mode);
+            // The model is handed the denial, never the tool's report.
+            const ran = (lastResult ?? "").includes('"satisfied"');
+            expect({ deny, host, mode, got, ran }).toEqual({
+              deny,
+              host,
+              mode,
+              got: "deny",
+              ran: false,
+            });
+          }
+        }
+      }
+      expect(connections).toBe(0);
+      // Control: under a deny on another address the call runs, and the tool
+      // reaches the listener on 127.0.0.1 through `0.0.0.0`.
+      const other = rules(["alwaysDeny", "WaitForPort(10.0.0.5)"]);
+      expect(await gate("WaitForPort", probe("0.0.0.0"), other, "auto")).toBe("allow");
+      expect(JSON.parse(lastResult ?? "{}")).toMatchObject({ satisfied: true, state: "open" });
+    } finally {
+      listener.stop(true);
+    }
+  }, 60_000);
+
   test("DeliverabilityCheck: a deny on the domain stops its Unicode spellings, written either way; nothing is looked up", async () => {
     const asked: string[] = [];
     _setDnsTxtResolver(async (name) => {

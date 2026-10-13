@@ -984,7 +984,8 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * a `+tag`; a phone number as SmsSend reads it, separators taken out
  * wherever they are; a bare host as the tools that look it up or dial it
  * reach it (its IDNA form, an IPv4 address in any numeric form as its dotted
- * quad); and a number or a host the rule writes another way the same; an
+ * quad, `localhost` and `0.0.0.0` or `::` as loopback); and a number or a
+ * host the rule writes another way the same; an
  * id or a program name in lower case. An allow rule reads only
  * `canonical`, and never grants a URL that carries userinfo or an escaped
  * `..`.
@@ -1327,7 +1328,7 @@ const PHONE_SHAPED = /^\+?[\d\s().-]+$/;
  * ({@link normalizePhoneNumber}), so `(+1)5550001111` meets a deny on
  * `+15550001111` as the message does. A bare host is also read as the tools
  * that look it up or dial it reach it ({@link hostSpellings}): `münchen.de`
- * as `xn--mnchen-3ya.de`, `10.5` as `10.0.0.5`.
+ * as `xn--mnchen-3ya.de`, `10.5` as `10.0.0.5`, `0.0.0.0` as 127.0.0.1.
  */
 function restrictRecipientSpellings(raw: string): string[] {
   const written = raw.normalize("NFC").toLowerCase().trim();
