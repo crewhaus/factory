@@ -185,11 +185,12 @@ built it.
   `apiBaseUrl`, so a rule now reads the repository or channel with that
   API's origin in front (`https://ghe.example.com/acme/app`):
   `alwaysDeny IssueCreate(https://ghe.example.com/**)` fires, including on a
-  call that names no `baseUrl` but goes there. A ChatPost through an incoming
-  webhook, which ignores its `channel`, is read by the variable that names
-  the webhook, and WebhookPost by `urlEnv` when it gives one. A deploy call
-  that names a `tenant` acts on that tenant's own copy of the pin and is read
-  as `<tenant>/<name>/<env>`.
+  call that names no `baseUrl` but goes there. RateLimitStatus is read as the
+  API it reports on, so a deny on a host stops it however the call picks that
+  host. A ChatPost through an incoming webhook, which ignores its `channel`,
+  is read by the variable that names the webhook, and WebhookPost by `urlEnv`
+  when it gives one. A deploy call that names a `tenant` acts on that tenant's
+  own copy of the pin and is read as `<tenant>/<name>/<env>`.
 - **A headless approval holds only where it was granted.** A parked call
   records where each path, program and script it names lands. If a link on
   the way has moved by the time it resumes, the call is asked again, naming
@@ -892,6 +893,10 @@ deny, warn or fail `--strict`; each says what to write instead.
     `IssueCreate(https://ghe.example.com/acme/*)`, or
     `IssueCreate(https://*/acme/app)` for that repository on any https host.
     A spec with one host keeps its rules.
+  - A scoped allow on RateLimitStatus names the API it reads,
+    `RateLimitStatus(https://api.github.com/**)`, or `RateLimitStatus(**)` for
+    any. `RateLimitStatus(*)`, or one written on another value of the call
+    such as `RateLimitStatus(github)`, now asks.
   - An API-mode Chat rule names the API: `ChatPost(https://slack.com/C0123)`,
     or `ChatPost(https://*/C0123)` on any API; `ChatPost(C0123)` alone now
     asks. A post through an incoming webhook is allowed by the variable that

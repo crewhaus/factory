@@ -292,6 +292,18 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * password, cannot be placed: no allow grants the call, and every deny or
  * ask fires.
  *
+ * A top-level `url` field may name ITSELF as its `service`, for a tool that
+ * acts on the API as a whole rather than on something there (RateLimitStatus
+ * reads the quota at its `baseUrl`): `{ field: "baseUrl", kind: "url",
+ * service: "baseUrl" }`. The value is the API the call goes to, matched as
+ * any URL is (`alwaysAllow RateLimitStatus(https://ghe.example.com/**)`): the
+ * one the call names, else the one the tool's `serviceDefaults` says
+ * (`unnamed`), so a deny on a host fires whichever field picked it. A deny or
+ * ask also reads it after the host alone (`RateLimitStatus(ghe.example.com/**)`).
+ * It names no destination the model picks: like the `service` of a
+ * repository, it is one of the APIs the tool is set up for (see
+ * {@link hasModelChosenDestination}).
+ *
  * `overlay`, for an `id` or `recipient`, names a top-level field holding
  * whose own copy of the value a call acts on, when it names one: a deploy
  * tenant's overlay of a pin. The value is then matched with it in front:
@@ -531,18 +543,24 @@ export const DESTINATION_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set(["ur
  * `scope: "external"` and one of its `operativeArgs` is a URL or a
  * recipient. Such a tool can carry whatever the model puts in the call to
  * wherever the model points it, so the egress fabric treats it as a dynamic
- * sink.
+ * sink. A URL declared as its own `service` does not count: it names which
+ * of the APIs the tool is set up for a call goes to, as a repository's
+ * `service` does (RateLimitStatus's `baseUrl`).
  *
  * Taken structurally, so a data-only description of a tool (the builtin
  * manifest) answers the same way as the live one.
  */
 export function hasModelChosenDestination(tool: {
   readonly scope: string;
-  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string; readonly service?: string }>;
 }): boolean {
   return (
     tool.scope === "external" &&
-    (tool.operativeArgs ?? []).some((a) => DESTINATION_ARG_KINDS.has(a.kind as OperativeArgKind))
+    (tool.operativeArgs ?? []).some(
+      (a) =>
+        DESTINATION_ARG_KINDS.has(a.kind as OperativeArgKind) &&
+        !(a.kind === "url" && a.service !== undefined),
+    )
   );
 }
 
@@ -722,8 +740,10 @@ export interface ToolDefinition<TInput = unknown> {
    * `unnamed`'s origin in front, so `alwaysDeny IssueCreate(https://api.github.com/**)`
    * fires on it. A call to `home`, whether or not it names it, is also
    * matched without an origin, so `alwaysAllow IssueCreate(acme/app)` covers
-   * it and nothing on another host. Without this, a call that names no API
-   * carries no origin, and no rule written on a host meets it.
+   * it and nothing on another host. A URL declared as its own `service`
+   * (RateLimitStatus's `baseUrl`) left out is read as `unnamed`. Without
+   * this, a call that names no API carries no origin, and no rule written
+   * on a host meets it.
    *
    * Must be pure and synchronous. A throw is read as an API that cannot be
    * placed: no allow grants the call, and every deny or ask fires.

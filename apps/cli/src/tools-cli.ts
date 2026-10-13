@@ -1669,6 +1669,10 @@ function defaultWords(arg: OperativeArgLike): string {
 
 /** One operative argument in words: its kind, what qualifies it, what it stands for. */
 export function operativeArgWords(arg: OperativeArgLike, opts: RuleScopeOptions = {}): string {
+  // A URL that is its own service (RateLimitStatus's baseUrl): the API itself.
+  if (arg.kind === "url" && arg.service !== undefined && arg.service === arg.field) {
+    return `the API the call goes to, read as a URL: the one in ${arg.field}, else the configured one; a deny or ask also reads its host alone`;
+  }
   const parts: string[] = [];
   const kind = KIND_WORDS[arg.kind] ?? arg.kind;
   if (arg.glob === true) parts.push("a path pattern, which stands for every path it can list");

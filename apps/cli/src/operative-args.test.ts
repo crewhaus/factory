@@ -82,7 +82,6 @@ const NO_SCOPING_ARGUMENT: Readonly<Record<string, string>> = {
   PriceQuote: "asks fixed public price providers",
   ProcessOutput: "reads a process this session started, by a handle only this session has",
   ProcessStop: "stops a process this session started, by a handle only this session has",
-  RateLimitStatus: "reads the configured code host's own rate limit",
   RegistrySearch: "searches a fixed public package registry",
   Retrieve: "sends the query to the configured embedder and vector store",
   SystemInfo: "reads this machine's hardware and OS facts",
@@ -227,6 +226,8 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "PaymentFileBuild.outFile": "the file comes back inline; nothing is written",
   "PortfolioValuation.wallet": "the amounts are passed inline; no balance is read",
   "QrEncode.path": "only a PNG is written; an SVG comes back inline and nothing is written",
+  "RateLimitStatus.baseUrl":
+    "the API the tool_config sends the call to stands in, read from the tool's serviceDefaults",
   "RunBuild.command":
     "the build the project declares, detected at run time; its directory declares a default",
   "RunTests.command":

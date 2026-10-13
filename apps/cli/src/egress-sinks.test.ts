@@ -189,7 +189,10 @@ describe("which builtins are dynamic sinks", () => {
     PrReviews: CODE_HOST,
     PreflightRun: "binds local ports to see whether they are free; sends nothing anywhere",
     PriceQuote: "fixed public price providers (the ECB, Coinbase)",
-    RateLimitStatus: CODE_HOST,
+    // Its baseUrl is declared as the API itself (a service), not a
+    // destination: like the reads above, it sends nothing of the model's.
+    RateLimitStatus:
+      "the configured code host, or another allow-listed one; it reads the quota there",
     RegistryOutdated: "fixed public package registries (npm, PyPI, crates.io)",
     RegistryPackageInfo: "fixed public package registries (npm, PyPI, crates.io)",
     RegistrySearch: "fixed public package registries (npm, PyPI, crates.io)",

@@ -529,9 +529,12 @@ function checkOperativeArgs(
     }
     const { service } = arg;
     if (service !== undefined) {
-      if (kind !== "id" && kind !== "recipient") {
+      // A URL can only be the API itself: it names its own field, and a call
+      // that leaves it out goes where the tool's `serviceDefaults` say.
+      const apiRoot = kind === "url";
+      if (kind !== "id" && kind !== "recipient" && !apiRoot) {
         fail(
-          `${at}.service: only an "id" or a "recipient" lives on a service a call can name; a "${kind}" value is read as it is`,
+          `${at}.service: only an "id" or a "recipient" lives on a service a call can name, and a "url" is the API itself; a "${kind}" value is read as it is`,
         );
       }
       if (prefix !== undefined || secretRef !== undefined || relocates !== undefined) {
@@ -540,7 +543,12 @@ function checkOperativeArgs(
       if (typeof service !== "string" || !/^[A-Za-z_$][\w$]*$/.test(service)) {
         fail(`${at}.service must name one top-level input field, e.g. "baseUrl"`);
       }
-      if (service === field || service === within) {
+      if (apiRoot && (service !== field || arg.default !== undefined)) {
+        fail(
+          `${at}.service: a "url" with a service is the API itself, so it names its own field "${field}" and has no default (serviceDefaults say where a call that leaves it out goes)`,
+        );
+      }
+      if (!apiRoot && (service === field || service === within)) {
         fail(`${at}.service names "${service}", which is already used`);
       }
       const holds = scalarFieldShape(inputSchema, service);

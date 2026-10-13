@@ -166,6 +166,10 @@
  *      password, cannot be placed: the value is flagged `outsideWorkspace`
  *      (see {@link servedValue}). A tool with no `serviceDefaults` reads a
  *      call that names no API without an origin.
+ *    - a `url` declared as its own `service` (RateLimitStatus's `baseUrl`)
+ *      is the API the call goes to, matched as a URL: the one it names, else
+ *      the one the tool's `serviceDefaults` say it goes to. A deny or ask
+ *      also reads it after its host alone (see {@link apiRootValue}).
  *    - an `id` or `recipient` declared with an `overlay` field (a deploy
  *      tenant), on a call that names it, is matched with its value in front
  *      (`acme/billing/staging`): the call acts on that owner's own copy. A
@@ -502,7 +506,9 @@ function valuesOf(
           values.push(
             every === true
               ? { kind: "url", canonical: [ANY_VALUE], standsForAny: [""] }
-              : canonicalUrl(raw),
+              : service !== undefined
+                ? apiRootValue(service)
+                : canonicalUrl(raw),
           );
           break;
         case "command": {
@@ -1472,8 +1478,15 @@ function namesWorkspaceRoot(values: ReadonlyArray<OperativeValue>): boolean {
 export function readOperativeField(input: unknown, arg: OperativeArg): string[] {
   return readField(input, arg).map((r) => {
     const value = r.overlay !== undefined ? `${r.overlay}/${r.value}` : r.value;
+    // A URL that is its own service is the API already.
+    if (isApiRoot(arg)) return value;
     return r.service?.origin !== undefined ? `${r.service.origin}/${value}` : value;
   });
+}
+
+/** A `url` declared as its own `service`: the API a call goes to, itself. */
+function isApiRoot(arg: OperativeArg): boolean {
+  return arg.kind === "url" && arg.service !== undefined && arg.service === arg.field;
 }
 
 /**
@@ -1495,6 +1508,10 @@ function readField(
   if (reading === undefined) return read;
   const home = reading.origin !== undefined && reading.origin === services?.home;
   const service: ServiceReading = home ? { ...reading, home: true } : reading;
+  // The API itself, left out: the one the tool's config sends the call to
+  // stands in, so a rule on that host meets the call whichever field (or
+  // none) picked it.
+  if (isApiRoot(arg) && read.length === 0) return [{ value: reading.url, service }];
   return read.map((r) => ({ ...r, service }));
 }
 
@@ -1599,6 +1616,32 @@ function servedValue(value: OperativeValue, service: ServiceReading): OperativeV
         }
       : {}),
   };
+}
+
+/**
+ * The API a call goes to, for a `url` declared as its own `service`
+ * (RateLimitStatus's `baseUrl`): matched as any URL is, the one the call
+ * names or the one its config sends it to. A deny or ask also reads it after
+ * the host alone (`ghe.example.com/api/v3`), as for a value on a service. A
+ * URL that cannot be placed leaves nothing an allow could grant, and every
+ * deny or ask fires.
+ */
+function apiRootValue(service: ServiceReading): OperativeValue {
+  if (service.origin === undefined) {
+    return {
+      kind: "url",
+      canonical: [],
+      spellings: service.url !== "" ? [service.url] : [],
+      outsideWorkspace: true,
+    };
+  }
+  const read = canonicalUrl(service.url);
+  const url = new URL(service.url);
+  const rest = `${url.pathname}${url.search}`;
+  const hosts = service.hosts.flatMap((host) =>
+    rest === "/" ? [`${host}/`, host] : [`${host}${rest}`],
+  );
+  return { ...read, spellings: [...new Set([...(read.spellings ?? []), ...hosts])] };
 }
 
 function readValues(input: unknown, arg: OperativeArg): FieldReading[] {

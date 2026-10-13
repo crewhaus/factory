@@ -1684,7 +1684,9 @@ export const searchIssues: RegisteredTool = readTool({
 
 export const rateLimitStatus: RegisteredTool = readTool({
   name: "RateLimitStatus",
-  operativeArgs: [],
+  // It acts on the API itself: a rule reads the one the call goes to, named
+  // in baseUrl or picked by host and the config.
+  operativeArgs: [{ field: "baseUrl", kind: "url", service: "baseUrl" }],
   description:
     "Report how much API quota the token has left, per resource where the host publishes it. Use it before a fleet job starts a long walk, and between batches, so the job stops on purpose instead of hitting a 403 halfway through. GitHub answers with a real endpoint covering core, search, graphql and the rest; GitLab has no such endpoint, so the tool makes one cheap request and reads the RateLimit headers off it, which means a GitLab instance with rate limiting disabled honestly reports nothing. Reset times are the epoch seconds the host stated, echoed rather than converted.",
   inputSchema: z.object({

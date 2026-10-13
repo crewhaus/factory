@@ -30,6 +30,10 @@ describe("operativeArgWords — a declaration in words", () => {
   test("the kind, what qualifies it, and what a left-out value stands for", () => {
     const cases: ReadonlyArray<[OperativeArgLike, string]> = [
       [{ field: "url", kind: "url" }, "a URL"],
+      [
+        { field: "baseUrl", kind: "url", service: "baseUrl" },
+        "the API the call goes to, read as a URL: the one in baseUrl, else the configured one; a deny or ask also reads its host alone",
+      ],
       [{ field: "repo", kind: "recipient", within: "owner" }, "a recipient; matched as owner/repo"],
       [
         { field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" },
@@ -349,6 +353,9 @@ describe("the printed example works, through the real matcher", () => {
       { url: "https://api.example.com/v1/status", method: "GET" },
       { url: "https://elsewhere.example.org/", method: "GET" },
     ],
+    // The API itself, whatever else the call names; with no baseUrl, the
+    // configured one (github.com here).
+    ["rateLimitStatus", { baseUrl: "https://api.example.com/api/v3", host: "github" }, {}],
     ["runCommand", { argv: ["git", "status"] }, { argv: ["git", "push"] }],
     [
       "issueCreate",

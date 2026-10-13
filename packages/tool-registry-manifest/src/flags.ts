@@ -4258,7 +4258,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [],
+    operativeArgs: [{ field: "baseUrl", kind: "url", service: "baseUrl" }],
   },
   read: {
     key: "read",

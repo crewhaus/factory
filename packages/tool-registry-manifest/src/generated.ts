@@ -6388,7 +6388,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [],
+    operativeArgs: [{ field: "baseUrl", kind: "url", service: "baseUrl" }],
     categories: ["codehost", "code"],
     package: "@crewhaus/tool-codehost",
     keywords: ["api quota", "rate limit", "how many calls left"],

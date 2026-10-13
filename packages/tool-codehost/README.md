@@ -101,6 +101,10 @@ A call's `host` picks the dialect, and with `base_url` set it does not move the 
 `base_url` it also picks the API: in a config set up for GitHub, `host: "gitlab"` sends a call to
 gitlab.com, which a rule reads as another host.
 
+`RateLimitStatus` names no repository: it reads the quota of the API itself, so its rules name the
+API, `alwaysAllow RateLimitStatus(https://ghe.example.com/**)`. That is the API in `baseUrl`, or
+the one the call goes to without it, so a deny on a host fires on every call to it here too.
+
 ## The tools
 
 ### Read — `readOnly`, `scope: "external"`, `ioCapability: "network"`

@@ -22,6 +22,7 @@ import {
   executeTool,
   lexicalPathValues,
   operativeValuesFor,
+  operativeValuesOf,
   preparePermissionSubject,
   readOperativeField,
 } from "./index";
@@ -2837,6 +2838,145 @@ describe("a call that names no API goes where the tool's config says (serviceDef
     expect(
       build([{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }]),
     ).not.toThrow();
+  });
+});
+
+describe("the API itself: a url declared as its own service", () => {
+  // RateLimitStatus's shape: it reads the quota at the API in baseUrl, else
+  // at the one its config sends it to, which the call's host may pick.
+  type Config = { readonly baseUrl?: string };
+  const API = { github: "https://api.github.com", gitlab: "https://gitlab.com/api/v4" };
+  const quotaTool = (registered: Config = {}, opts: { readonly throws?: boolean } = {}) =>
+    buildTool({
+      name: "Quota",
+      description: "d",
+      inputSchema: z.object({
+        host: z.enum(["github", "gitlab"]).optional(),
+        baseUrl: z.string().optional(),
+        tokenEnv: z.string().optional(),
+      }),
+      operativeArgs: [{ field: "baseUrl", kind: "url", service: "baseUrl" }],
+      serviceDefaults: (input, toolConfig) => {
+        if (opts.throws === true) throw new Error("a config it cannot read");
+        const cfg = (toolConfig ?? registered) as Config;
+        const asked = (input as { host?: "github" | "gitlab" }).host ?? "github";
+        return { unnamed: cfg.baseUrl ?? API[asked], home: cfg.baseUrl ?? API.github };
+      },
+      readOnly: true,
+      execute: async () => "ok",
+    });
+  const decide = (tool: ReturnType<typeof quotaTool>, input: unknown, toolConfig?: unknown) => {
+    const values =
+      operativeValuesFor(tool, input, toolConfig !== undefined ? { toolConfig } : {}) ?? [];
+    return (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Quota", input, {
+        polarity,
+        operativeValues: values,
+      });
+  };
+  const ghe = "https://ghe.example.com/api/v3";
+
+  test("a call that names the API is read on it, as a URL, whatever else it names", () => {
+    const tool = quotaTool();
+    for (const input of [{ baseUrl: ghe }, { baseUrl: ghe, host: "github", tokenEnv: "T" }]) {
+      expect(operativeValuesFor(tool, input)).toEqual([
+        {
+          kind: "url",
+          canonical: [ghe],
+          spellings: [ghe, "ghe.example.com/api/v3"],
+        },
+      ]);
+      const match = decide(tool, input);
+      for (const [pattern, fires] of [
+        ["Quota(https://ghe.example.com/**)", true],
+        ["Quota(http://ghe.example.com/**)", true],
+        ["Quota(HTTPS://GHE.example.com/api/v3)", true],
+        ["Quota(ghe.example.com/**)", true],
+        ["Quota(https://api.github.com/**)", false],
+        ["Quota(api.github.com/**)", false],
+      ] as const) {
+        expect({ input, pattern, fires: match(pattern, "restrict") }).toEqual({
+          input,
+          pattern,
+          fires,
+        });
+      }
+      expect(match("Quota(https://ghe.example.com/**)", "allow")).toBe(true);
+      expect(match("Quota(https://api.github.com/**)", "allow")).toBe(false);
+      // The host alone is a deny's reading, not a grant.
+      expect(match("Quota(ghe.example.com/**)", "allow")).toBe(false);
+    }
+  });
+
+  test("a call that names none is read on the API its config sends it to", () => {
+    const configured = decide(quotaTool({ baseUrl: ghe }), {});
+    expect(configured("Quota(ghe.example.com/**)", "restrict")).toBe(true);
+    expect(configured("Quota(https://ghe.example.com/**)", "allow")).toBe(true);
+    // With no base URL configured, the call's host picks it.
+    const tool = quotaTool();
+    const github = decide(tool, {});
+    expect(github("Quota(https://api.github.com/**)", "restrict")).toBe(true);
+    expect(github("Quota(api.github.com)", "restrict")).toBe(true);
+    expect(github("Quota(https://api.github.com)", "allow")).toBe(true);
+    const gitlab = decide(tool, { host: "gitlab" });
+    expect(gitlab("Quota(gitlab.com/**)", "restrict")).toBe(true);
+    expect(gitlab("Quota(api.github.com/**)", "restrict")).toBe(false);
+    expect(gitlab("Quota(https://api.github.com/**)", "allow")).toBe(false);
+    // The serving candidate's tool_config is the one read.
+    const served = decide(quotaTool({ baseUrl: ghe }), {}, { baseUrl: API.gitlab });
+    expect(served("Quota(gitlab.com/**)", "restrict")).toBe(true);
+    expect(served("Quota(ghe.example.com/**)", "restrict")).toBe(false);
+  });
+
+  test("an API that cannot be placed is granted by no allow, and every deny fires", () => {
+    for (const input of [
+      { baseUrl: "https://user:pw@ghe.example.com/api/v3" },
+      { baseUrl: "ftp://ghe.example.com/api" },
+      { baseUrl: "not a url" },
+    ]) {
+      const match = decide(quotaTool(), input);
+      expect({ input, allow: match("Quota(**)", "allow") }).toEqual({ input, allow: false });
+      expect({ input, deny: match("Quota(nothing-like-it)", "restrict") }).toEqual({
+        input,
+        deny: true,
+      });
+    }
+    const unreadable = decide(quotaTool({}, { throws: true }), {});
+    expect(unreadable("Quota(**)", "allow")).toBe(false);
+    expect(unreadable("Quota(nothing-like-it)", "restrict")).toBe(true);
+  });
+
+  test("read from the declaration alone, a call that names none carries no API", () => {
+    const declared = [{ field: "baseUrl", kind: "url", service: "baseUrl" }] as const;
+    expect(operativeValuesOf(declared, {})).toEqual([]);
+    expect(operativeValuesOf(declared, { baseUrl: ghe })?.[0]?.canonical).toEqual([ghe]);
+    // An approval row shows the API as the call names it.
+    expect(readOperativeField({ baseUrl: ghe }, declared[0])).toEqual([ghe]);
+    expect(readOperativeField({}, declared[0])).toEqual([]);
+  });
+
+  test("buildTool takes a url's service only as its own field, with no default", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({
+          baseUrl: z.string().optional(),
+          mirror: z.string().optional(),
+        }),
+        operativeArgs: [arg] as never,
+        execute: async () => "ok",
+      });
+    expect(build({ field: "baseUrl", kind: "url", service: "mirror" })).toThrow(
+      /names its own field "baseUrl"/,
+    );
+    expect(
+      build({ field: "baseUrl", kind: "url", service: "baseUrl", default: "https://a.example" }),
+    ).toThrow(/has no default/);
+    expect(build({ field: "baseUrl", kind: "path", service: "baseUrl" })).toThrow(
+      /a "path" value is read as it is/,
+    );
+    expect(build({ field: "baseUrl", kind: "url", service: "baseUrl" })).not.toThrow();
   });
 });
 

@@ -43,6 +43,7 @@ import {
   __setPrivateHostsAllowedForTest as allowCodehostLoopback,
   issueCreate,
   issueList,
+  rateLimitStatus,
   registerCodehostConfig,
   searchCode,
   _setDnsLookup as setCodehostDns,
@@ -389,6 +390,126 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
   }, 30_000);
 });
 
+/**
+ * RateLimitStatus acts on the API itself: it reads the token's quota there.
+ * It declared no argument, so a rule read every string in the call, and
+ * `alwaysDeny RateLimitStatus(https://ghe.example.com/**)` was dodged by
+ * adding `host` to a call that named the host in `baseUrl` (critic10). Now a
+ * rule reads the API the call goes to: the one in `baseUrl`, else the one the
+ * tool_config sends it to.
+ */
+describe("a RateLimitStatus rule reads the API the call goes to, whichever field picks it", () => {
+  const onB = { baseUrl: baseB, tokenEnv: "API_HOSTS_TOKEN_B" };
+  const quotaOnA = ["GET /rate_limit"];
+  const quotaOnB = ["GET /api/v3/rate_limit"];
+
+  test("a deny on a host fires on every call to it, whatever else the call names", async () => {
+    for (const glob of ["https://ghe.example.test/**", `${originB}/**`, "ghe.example.test/**"]) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysAllow", "RateLimitStatus"],
+      );
+      for (const input of [
+        { baseUrl: baseB },
+        { baseUrl: baseB, host: "github" },
+        onB,
+        { ...onB, baseUrl: baseB.replace("ghe.example.test", "GHE.example.test.") },
+      ]) {
+        expect({ glob, input, got: await call(rateLimitStatus, input, rs) }).toEqual({
+          glob,
+          input,
+          got: { decision: "deny", a: [], b: [] },
+        });
+      }
+      // A call to the configured API is not that host.
+      expect({ glob, got: await call(rateLimitStatus, {}, rs) }).toEqual({
+        glob,
+        got: { decision: "allow", a: quotaOnA, b: [] },
+      });
+    }
+  }, 60_000);
+
+  test("a deny on the configured host fires on a call that names no baseUrl", async () => {
+    for (const glob of [`${originA}/**`, "https://api.example.test/**", "api.example.test/**"]) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysAllow", "RateLimitStatus"],
+      );
+      for (const input of [{}, { host: "github" }, { baseUrl: originA }]) {
+        expect({ glob, input, got: await call(rateLimitStatus, input, rs) }).toEqual({
+          glob,
+          input,
+          got: { decision: "deny", a: [], b: [] },
+        });
+      }
+      expect({ glob, got: await call(rateLimitStatus, onB, rs) }).toEqual({
+        glob,
+        got: { decision: "allow", a: [], b: quotaOnB },
+      });
+    }
+  }, 60_000);
+
+  test("an allow names the API, and covers a call to it whichever field picked it", async () => {
+    const onA = rules(["alwaysAllow", `RateLimitStatus(${originA}/**)`]);
+    for (const input of [{}, { host: "github" }, { baseUrl: originA }]) {
+      expect({ input, got: await call(rateLimitStatus, input, onA) }).toEqual({
+        input,
+        got: { decision: "allow", a: quotaOnA, b: [] },
+      });
+    }
+    expect(await call(rateLimitStatus, onB, onA)).toEqual({ decision: "ask", a: [], b: [] });
+    const onHostB = rules(["alwaysAllow", `RateLimitStatus(${originB}/**)`]);
+    for (const input of [onB, { ...onB, host: "github" }]) {
+      expect({ input, got: await call(rateLimitStatus, input, onHostB) }).toEqual({
+        input,
+        got: { decision: "allow", a: [], b: quotaOnB },
+      });
+    }
+    expect(await call(rateLimitStatus, {}, onHostB)).toEqual({ decision: "ask", a: [], b: [] });
+  }, 60_000);
+
+  test("plan mode honours a deny or ask on the host a call names none of", async () => {
+    for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+      const rs = rules([type, "RateLimitStatus(api.example.test/**)"]);
+      expect({ type, got: await call(rateLimitStatus, {}, rs, "plan") }).toEqual({
+        type,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
+    // A deny on the other host leaves this read to run.
+    const elsewhere = rules(["alwaysDeny", "RateLimitStatus(ghe.example.test/**)"]);
+    expect(await call(rateLimitStatus, {}, elsewhere, "plan")).toEqual({
+      decision: "allow",
+      a: quotaOnA,
+      b: [],
+    });
+  }, 30_000);
+
+  test("a deny that fired in 0.7.0 still fires", async () => {
+    // 0.7.0 read the tool by every string in the call, all of which had to match.
+    for (const [glob, input] of [
+      ["github", { host: "github" }],
+      ["API_HOSTS_TOKEN_B", { tokenEnv: "API_HOSTS_TOKEN_B" }],
+      [baseB, { baseUrl: baseB }],
+    ] as const) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysAllow", "RateLimitStatus"],
+      );
+      expect({ glob, got: await call(rateLimitStatus, input, rs) }).toEqual({
+        glob,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
+  }, 30_000);
+
+  test("a base URL that names no origin a request can go to is granted by no allow", async () => {
+    const rs = rules(["alwaysAllow", "RateLimitStatus(**)"]);
+    const withUser = { ...onB, baseUrl: baseB.replace("http://", "http://user:pw@") };
+    expect(await call(rateLimitStatus, withUser, rs)).toEqual({ decision: "ask", a: [], b: [] });
+  }, 30_000);
+});
+
 describe("a code-host rule on GitLab, whose owner is a group path", () => {
   beforeAll(() => {
     registerCodehostConfig({
@@ -463,6 +584,41 @@ describe("without base_url, a call's host picks the API as well as the dialect",
       expect({ glob, got: await call(issueCreate, onGitlab, rs) }).toEqual({
         glob,
         got: { decision: "deny", a: [], b: [] },
+      });
+    }
+  }, 30_000);
+
+  test("RateLimitStatus with host gitlab reads gitlab.com, and with none the configured API", async () => {
+    // Asked, not run: nothing here reaches either host.
+    for (const glob of ["https://gitlab.com/**", "gitlab.com/**"]) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysAsk", "RateLimitStatus"],
+      );
+      for (const [input, decision] of [
+        [{ host: "gitlab" }, "deny"],
+        [{ host: "github" }, "ask"],
+        [{}, "ask"],
+      ] as const) {
+        expect({ glob, input, got: await call(rateLimitStatus, input, rs) }).toEqual({
+          glob,
+          input,
+          got: { decision, a: [], b: [] },
+        });
+      }
+    }
+    const github = rules(
+      ["alwaysDeny", "RateLimitStatus(api.github.com/**)"],
+      ["alwaysAsk", "RateLimitStatus"],
+    );
+    for (const [input, decision] of [
+      [{}, "deny"],
+      [{ host: "github" }, "deny"],
+      [{ host: "gitlab" }, "ask"],
+    ] as const) {
+      expect({ input, got: await call(rateLimitStatus, input, github) }).toEqual({
+        input,
+        got: { decision, a: [], b: [] },
       });
     }
   }, 30_000);

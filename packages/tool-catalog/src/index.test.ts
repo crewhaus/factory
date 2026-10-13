@@ -10,6 +10,7 @@ import {
   ToolCatalog,
   ToolCatalogError,
   defaultCatalog,
+  hasModelChosenDestination,
   legacyMcpToolName,
   mcpToolName,
   schemaDeclaresJustification,
@@ -305,5 +306,35 @@ describe("MCP tool names", () => {
     // The alias runs one way: an mcp__ entry never names a non-MCP tool.
     expect(toolListEntryNames("mcp__contract__fn", "contract__fn")).toBe(false);
     expect(toolListEntryNames("", "mcp__a__b")).toBe(false);
+  });
+});
+
+describe("hasModelChosenDestination", () => {
+  test("a url or a recipient on an external tool is a destination the model picks", () => {
+    for (const kind of ["url", "recipient"]) {
+      expect(hasModelChosenDestination({ scope: "external", operativeArgs: [{ kind }] })).toBe(
+        true,
+      );
+      expect(hasModelChosenDestination({ scope: "internal", operativeArgs: [{ kind }] })).toBe(
+        false,
+      );
+    }
+    expect(hasModelChosenDestination({ scope: "external", operativeArgs: [{ kind: "id" }] })).toBe(
+      false,
+    );
+  });
+
+  test("a url that is its own service names which configured API, not a destination", () => {
+    // RateLimitStatus's baseUrl: it stays a configured sink, as the other
+    // code-host reads do.
+    const api = { kind: "url", service: "baseUrl" };
+    expect(hasModelChosenDestination({ scope: "external", operativeArgs: [api] })).toBe(false);
+    // A recipient on a service still is one (IssueCreate's repository).
+    expect(
+      hasModelChosenDestination({
+        scope: "external",
+        operativeArgs: [api, { kind: "recipient", service: "baseUrl" }],
+      }),
+    ).toBe(true);
   });
 });
