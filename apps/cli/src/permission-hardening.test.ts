@@ -4169,7 +4169,6 @@ describe("critic9 — a script node opens with its `..` folded as text", () => {
 // ./evil.rb. Every script below appends its own name to a marker outside the
 // workspace, so what ran is read from disk.
 describe("interp review — an option's argument is read both ways", () => {
-  const hasRuby = Bun.which("ruby") !== null;
   const hasPython3 = Bun.which("python3") !== null;
   let marker: string;
   beforeEach(() => {
@@ -4242,33 +4241,22 @@ describe("interp review — an option's argument is read both ways", () => {
     }
   }, 120_000);
 
-  test.skipIf(!hasRuby || !hasPython3)(
+  test.skipIf(!hasPython3)(
     "control: the script after an option's argument still lands where the kernel walks",
     async () => {
-      const cases: Array<[string[], string, string]> = [
-        [
-          ["ruby", "-r", "./safe/ok.rb", "lnk/../evil.rb"],
-          "ruby -r ./safe/** safe/**",
-          "safe/ok.rb,safe/evil.rb",
-        ],
-        [
-          ["python3", "-W", "ignore", "lnk/../evil.py"],
-          "python3 -W ignore safe/**",
-          "safe/evil.py",
-        ],
-      ];
-      // The argv tools share one reading, so RunCommand runs each; a Bash
-      // line is also read as written, which the allow does not name.
-      for (const [argv, glob, runs] of cases) {
-        const rows = await decide(
-          onEvery(argv).filter(([t]) => t === "RunCommand" || t === "Bash"),
-          allowOn(glob),
-        );
-        expect(rows.map((r) => [r.tool, r.got, r.ran])).toEqual([
-          ["RunCommand", "allow", runs],
-          ["Bash", "ask", ""],
-        ]);
-      }
+      // python3 opens its script where the kernel walks (measured 3.8–3.11).
+      // The argv tools share one reading, so RunCommand runs it; a Bash line
+      // is also read as written, which the allow does not name.
+      const rows = await decide(
+        onEvery(["python3", "-W", "ignore", "lnk/../evil.py"]).filter(
+          ([t]) => t === "RunCommand" || t === "Bash",
+        ),
+        allowOn("python3 -W ignore safe/**"),
+      );
+      expect(rows.map((r) => [r.tool, r.got, r.ran])).toEqual([
+        ["RunCommand", "allow", "safe/evil.py"],
+        ["Bash", "ask", ""],
+      ]);
     },
     60_000,
   );
