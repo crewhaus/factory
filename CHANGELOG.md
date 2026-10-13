@@ -14,7 +14,7 @@ way. A tool could write through a symbolic link planted in the workspace, or
 hang on a crafted file or pattern. The model could choose which environment
 variable a tool sent as a credential. And `tool_config` never reached many of
 the tools that read it, while shapes other than `cli` could not use the new
-tools at all. This release fixes what the audit confirmed, apart from the few
+tools at all. This release fixes what the audit confirmed, apart from the
 items under **Known limitations**. Most specs need no change. To upgrade: use
 Bun 1.3.14 or later; run `crewhaus lint` and `crewhaus compile --strict` on
 each spec, which point out most rules, tool lists and `tool_config` blocks
@@ -32,6 +32,11 @@ built it.
   argument, or left out one the tool fills in (`EnvFileUpsert` with no `path`
   writes `.env`). Rules now see defaults and are checked against the input
   the tool will actually run on.
+- **A deny that fired in 0.7.0 still fires.** Rules now read the place a
+  tool acts on, but a deny or ask also still reads a call as 0.7.0 did, and
+  fires when every text value in it matches: `alwaysDeny
+  EventQuery(sess-prod-*)` still stops a call that names only that session.
+  An allow reads the place alone.
 - **A scoped allow can no longer be widened.** `Write(src/**)` authorised a
   write to `.crewhaus/settings.json` — and so standing permissions on the
   next run — through a decoy `file_path` the tool never reads, through
@@ -54,13 +59,22 @@ built it.
   writers. The same holds for the git branch tools' and RunBuild/RunTests'
   `cwd` and DependencyAudit's OSV endpoint. An allow scoped to a record, such
   as `KvSet(scratch/*)`, keeps covering ordinary calls.
-- **A deny on a directory also covers the directories above it**, for tools
-  that walk what a directory holds. `alwaysDeny RemovePath(src/prod/**)` now
-  stops `RemovePath src`, and `alwaysDeny Grep(secrets/**)` stops a search of
-  the whole workspace, including one with no path. A git tool given no path
-  counts as the whole repository, wherever it runs. A path that names a file
-  is just that file, and Grep skips hidden names, so `alwaysDeny Grep(.env)`
-  still leaves everyday searches alone.
+- **A deny on a directory also covers the directories above it**, for every
+  tool that walks, lists or dumps what a directory holds, read-only ones
+  included. `alwaysDeny RemovePath(src/prod/**)` now stops `RemovePath src`,
+  `alwaysDeny Grep(secrets/**)` stops a search of the whole workspace,
+  including one with no path, and `alwaysDeny *(secrets/**)` stops `Tree .`, a
+  StateExport of the workspace, and the same in FindFiles, DiskUsage,
+  TodoScan, SecretScan, ChecksumVerify and the other walkers. A deny on a
+  harness's own records (session logs, the approvals ledger, settings, eval
+  history, the watch-me and routing stores) also stops the tools that read
+  them, such as PermissionsSuggest and ApprovalStatus. A git tool given no
+  path counts as the whole repository, wherever it runs. A path that names a
+  file is just that file. Grep, Tree, FindFiles, SecretScan and the code
+  scanners skip hidden names unless the call asks for them, so
+  `alwaysDeny Tree(.env)` still allows `Tree .` and stops
+  `Tree . includeHidden`; DiskUsage, ChecksumVerify and the harness finders
+  read hidden names, so a deny on `.env` stops their whole-workspace runs.
 - **A rule reads everything a call can reach.** A Glob pattern stands for
   every path it can list, including a hidden name it spells out
   (`alwaysDeny Glob(secrets/**)` stops `**/*` and `*/.env`). A path
@@ -68,13 +82,28 @@ built it.
   `secrets/**`. A KvList prefix stands for every key that starts with it. A
   GitHub or GitLab search is scoped by its `owner` and `repo`, and a deny on a
   repository also stops an owner-wide or unscoped search.
-- **A deny on a script holds however the call reaches it.** RunCommand,
-  RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format and
-  HooksManage are read with the directory they run in and the environment
-  they set (`PATH`, `BASH_ENV`, `NODE_OPTIONS` and the like), so a deny on
-  `scripts/release.sh` holds when the call runs `./release.sh` from
-  `scripts/`. A scoped command allow does not follow the call into another
-  directory.
+- **A command rule decides on the program that really runs.** RunCommand,
+  RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format, HooksManage
+  and Bash are read with the directory they run in, the environment they set
+  (`PATH`, `BASH_ENV`, `NODE_OPTIONS` and the like) and the `cd`s before each
+  command, so a deny on `scripts/release.sh` holds when the call runs
+  `./release.sh` from `scripts/`. A program or script named by a path is read
+  where the system finds it, through `..` and symlinked folders:
+  `alwaysDeny RunCommand(./deploy.sh)` stops `./scripts/../deploy.sh`, and
+  `alwaysAllow RunCommand(./scripts/**)` no longer grants a script that a `..`
+  or a link takes out of `scripts/`. The same holds after `env -C` or
+  `sudo -D`, for a program found on a PATH the call sets or written with
+  `$PWD`, and for a script handed to an interpreter (`sh`, `node`, `bun`,
+  `python3`, …) or fed to a shell (`sh < x.sh`). node, `bun run` and a script
+  whose `#!` line names node settle a `..` before they follow links, so they
+  can open a different file than a shell would: such a word is read both ways,
+  a deny or ask fires on either, and an allow must cover both. A program
+  reached through a link to the file itself (`node_modules/.bin/eslint`) is
+  still allowed by its link name, and a deny on where the link leads fires
+  too. On RunCommand, Retry, ProcessStart and RunPipeline a deny also reads
+  every other path in the command where it lands
+  (`find . -exec link/../run.sh ;`). A scoped command allow does not follow
+  the call into another directory.
 - **A Bash rule reads each command in the line.** `alwaysAllow Bash(git *)`
   allowed `git status && rm -rf build`, and `alwaysDeny Bash(rm -rf **)`
   missed an `rm` that came second. A line is now split into the commands it
@@ -92,6 +121,61 @@ built it.
   ask. The Shell tool is
   read the same way, and a deny on RunCommand or another argv tool reads the
   line it hands to `sh -c`.
+- **Text handed to a shell is read as the commands it runs.** A call that
+  hands a shell text on its input (`argv: ["sh"]` with `stdin: "rm -f x"`,
+  on RunCommand, Retry, ProcessStart or a RunPipeline step) meets
+  `alwaysDeny RunCommand(rm *)` as `sh -c` does. In a Bash line, a shell that
+  reads its commands from a pipe (`curl … | sh`) sets off every deny and ask.
+  Each shell's options are read the way that shell reads them, so an
+  option's argument is never taken for the script. A program or script
+  written under the shell's own directory any way but a plain leading `$PWD`
+  (`${PWD%/*}/x.sh`, `$OLDPWD/x.sh`, `$(dirname "$PWD")/x.sh`) sets off every
+  deny and ask.
+- **A path read from another argument's directory cannot climb past a
+  rule.** When a tool reads a path relative to another argument (a git or
+  formatter path relative to `cwd`), a path that is absolute or has a `..`
+  is read as outside the workspace: no scoped allow grants it, and every
+  deny or ask fires. The program opens it from that directory, following a
+  link before the `..`, so through a symlinked folder it reached another
+  file than the rule checked: `alwaysDeny Format(secrets/**)` missed
+  `../x.ts` run from a link into `secrets/`. Lint, Format and RunTests now
+  refuse such a `paths` entry, naming it.
+- **A path names one place at any length.** A very long path could be read
+  as one file by the permission check and as another by the tool, so an
+  allow on one name approved a change to a different file; StateImport could
+  write a deeply nested entry above where it said; and SpecPin and
+  DeployRollback judged a very deep registry folder by the wrong parent.
+  Each now acts on the place the path names. A path longer than any
+  filesystem can open is refused before it is resolved, with its length and
+  the limit, and the check reads it as outside the workspace.
+- **A deny on a secret holds however the reference is written.** SecretLookup,
+  SecretRotate and EnvFileUpsert read a `file:` or `envfile:` reference as the
+  file it opens, so `alwaysDeny SecretLookup(file:secrets/**)` now stops
+  `file:./secrets/token`, `file:pub/../secrets/token`, a link into `secrets/`
+  and a reference with a leading space, and path rules such as `*(secrets/**)`
+  apply too. A bare `API_KEY` or `env:API_KEY` is also read as the files it is
+  loaded from (`.env.local`, `.env`), so `alwaysDeny *(.env)` stops it, while
+  `alwaysAllow SecretLookup(API_KEY)` still grants it. A deny or ask also
+  reads what a tool copies from: EnvFileUpsert's and SecretRotate's source
+  reference, IndexBuild's and DatasetPut's files, EmailSend's attachments,
+  InvoiceRender's template and the test files RunTests is limited to.
+- **A rule reads which service, and whose copy, a call acts on.** A
+  code-host call can name its own API in `baseUrl`, and a Chat call names
+  `apiBaseUrl`, so a rule now reads the repository or channel with that
+  API's origin in front (`https://ghe.example.com/acme/app`):
+  `alwaysDeny IssueCreate(https://ghe.example.com/**)` fires, including on a
+  call that names no `baseUrl` but goes there. A ChatPost through an incoming
+  webhook, which ignores its `channel`, is read by the variable that names
+  the webhook, and WebhookPost by `urlEnv` when it gives one. A deploy call
+  that names a `tenant` acts on that tenant's own copy of the pin and is read
+  as `<tenant>/<name>/<env>`.
+- **A headless approval holds only where it was granted.** A parked call
+  records where each path, program and script it names lands. If a link on
+  the way has moved by the time it resumes, the call is asked again, naming
+  where it was approved and where it lands now, instead of running where you
+  never approved it. The Slack card, the text fallback and
+  `crewhaus approvals show` say where a parked call lands. A call you refused
+  stays refused wherever it now lands.
 - **A permission pattern can no longer stall the daemon.** A rule with
   several `*`, matched against a long command, could block the event loop
   indefinitely. Patterns now match in time proportional to the input, and
@@ -267,6 +351,12 @@ built it.
   list the host. WebFetch never looks up a host outside `allowed_domains`.
   Token and multicall batches go only to the canonical Multicall3, or the one
   in `tool_config`.
+- **A redirect cannot move DependencyAudit or a chain read.** Both refuse
+  any redirect, even to the same address, and fail with an error saying
+  where it pointed. DependencyAudit re-sent your lockfile's package list to
+  wherever the OSV API or a mirror redirected it, even to a server on no
+  allow-list, and a chain node could send a read to one your `chains` block
+  does not name. Under `rpcPolicy: fallback` the next node is asked.
 - **A `model_pool` candidate's `allowed_origins` narrows** what the chain
   readers and FederationDiscover reach for that model; it never widens the
   agent's list. For other tools a candidate's block replaces the agent's, and
@@ -288,6 +378,34 @@ built it.
   dates, PDF text, test-runner output, ABI and typed data, JSON Schema, and
   glob and `.gitignore` patterns. A small input can no longer decode into
   millions of values.
+- **Long runs in text no longer slow a tool to a crawl.** A long run of
+  spaces, blank lines, slashes, digits, braces or repeated phrases made many
+  readers scan the same text again and again: command, build and test
+  output, commit messages, YAML and workflow files, manifests and lockfiles,
+  `.env` files, PDFs, subtitles, colours, CSV cells, SQL statements,
+  `date-time` checks, feeds and event streams, the PII, secret and
+  prompt-injection scanners, the permission check's reading of a call's
+  directory, PATH, URLs and recipients, model replies read by the planner,
+  the justification judge and the optimizer, and the Hangar's views. Each
+  now reads its input once. Tools that compare many items with each other
+  (SchemaDiff, FactCrossCheck, ImportCsv and ImportJson, the SQL tools,
+  CostBasisCompute, ConsensusVote, the registry tools on a manifest with
+  thousands of dependencies, and a session that starts with a large union
+  schema) no longer slow down sharply as the items grow.
+- **Archives and documents cost what their bytes allow.** Listing, checking
+  and extracting an archive stays fast with very deep member paths, many
+  links that lead through one another, or many top-level entries, and a tar
+  with a malformed extended header no longer hangs. Zip data that many
+  entries share is inflated once, a zip link whose stored target is
+  implausibly large is refused, and PptxRead, XlsxRead and DocumentText
+  refuse a zip whose entries overlap.
+- **Paths are checked in time proportional to their length**, by the
+  permission check and every file tool, including a path below folders that
+  do not exist yet.
+- **Replacements cannot grow text without bound.** Slugify and
+  GlossaryReplace refuse replacements that would grow the text past its
+  limit, or take too many passes over it, and say which limit they hit; they
+  never return a cut text.
 - **A compressed reply costs at most the tool's byte cap after decoding.** A
   small gzip or brotli body could inflate to gigabytes in Fetch, WebFetch,
   WebSearch, the HTTP, notify, code-host and observability tools, the
@@ -303,7 +421,10 @@ built it.
 - **Large files and results are bounded.** Read and Edit refuse files over
   64 MiB (ReadLines reads part of one); ReadLines and IngestDocument keep to
   their budgets; JSON depth, HtmlTable, TableJoin, text similarity and
-  timezone caches are capped. A cut result always says so.
+  timezone caches are capped. SchemaDiff refuses a schema nested deeper than
+  256 levels, FactCrossCheck reads only so much of its sources in one call,
+  and RobotsCheck refuses a path and query longer than a web server accepts.
+  A cut result always says so.
 - **Keys named `__proto__` or `constructor` are ordinary data** in every
   tool, and no document or tool name can change how another tool behaves.
 
@@ -468,6 +589,19 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   and a three-way apply that leaves conflicts says so.
 - Grep says "no matches in the lines searched" and names the lines and files
   it could not search.
+- FactCrossCheck reports a claim it could not check in full as unchecked,
+  with the reason, instead of checking it in part: one that quotes more than
+  16 different spans (split it into smaller claims), or one the call has no
+  reading budget left for (check it in a separate call).
+- MarkdownLinkCheck reads a link target's headings only in the documents it
+  was asked to check, and lists anchors into any other file under
+  `anchorsUnchecked`.
+- ContractInspect tells a probe that reverted from one the node could not
+  answer, so a contract whose probes revert is no longer refused on a chain
+  without Multicall3. EvmSimulateBundle falls back to `eth_call`, and
+  GasMarketRead answers without fee percentiles, when every node says it
+  lacks the method. A chain read that fails on every node ends with the last
+  node's reason.
 
 #### Tool results
 
@@ -476,6 +610,13 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   observability tools sometimes refused a workspace file because its other
   name was outside, and an append sometimes refused it with the wrong reason.
   Both cases refused; now the decision rests on the name you gave.
+- **WaitForOutput sees the line it waits for.** It reported "process
+  finished without matching" for a line a short-lived process printed just
+  before it exited. A process now counts as finished once it has exited and
+  the output being watched has closed, so a process it started that still
+  holds that output open keeps the wait going until the line or the
+  deadline. A wait on a process you stopped ends once that process exits, so
+  lines it prints while shutting down are still seen.
 - **Money is exact.** Amounts are whole minor units, and totals are exact or
   refused. RuleScore adds exactly (0.7 + 0.1 meets a band at 0.8),
   CostBasisCompute counts exact decimals, StatementParse reads amounts exactly
@@ -524,6 +665,16 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   - SpendLimitCheck says it computes a verdict from its inputs and enforces
     nothing itself, and ExportCsv says its cells are written verbatim,
     formulas included.
+  - SeoLint keeps every letter of a link's text in Arabic presentation forms
+    and CJK compatibility characters when it checks for vague text such as
+    "here".
+  - GlossaryReplace matches letters the same way with whole words on as off
+    when case is ignored: the Kelvin sign, the long s and the capital sharp s
+    no longer match another letter only with whole words on.
+  - A registry manifest that lists a version name too long to be a file no
+    longer blocks DeployRollback and the other registry tools.
+  - A tool that refuses a path for its length says so, instead of calling it
+    outside the workspace.
 
 #### CLI
 
@@ -654,8 +805,6 @@ deny, warn or fail `--strict`; each says what to write instead.
   the same origin as `tool_config.imageGenerate.openaiBaseUrl`, or it stops at
   start. Plain http is refused except on loopback.
 - **Some permission rules need rewriting:**
-  - Write paths relative to the workspace: `src/**`, not `./src/**` (an
-    absolute pattern still matches the absolute path).
   - Use the tool's name, not its spec key: `RemovePath(tmp/**)`, not
     `removePath(tmp/**)`.
   - An argument-scoped allow must cover every argument it is about.
@@ -679,9 +828,71 @@ deny, warn or fail `--strict`; each says what to write instead.
     `$(…)`, `$((…))`, backticks, a `$'…'` string, a here-document or a `for`
     loop asks unless a bare `Bash`, `Bash(*)` or `Bash(**)` allows it; those
     three allow what they did before.
+  - An allow on a program or script names where it really is. If `tools`
+    links to `safe/`, `RunCommand(./safe/run.sh)` grants `./tools/run.sh` and
+    `RunCommand(./tools/**)` asks. A program or script that a `..` or a link
+    takes out of the allow's folder asks, `/opt/tools/../evil.sh` under
+    `RunCommand(/opt/tools/**)` included. A node or `bun run` script reached
+    through a link and then a `..` asks unless the allow covers both places
+    it can read as, and a command with two such words is granted only by
+    `RunCommand(**)`. A program reached through a link to the file itself
+    (`./node_modules/.bin/eslint`) is still allowed by its link name.
+  - A Bash allow must also cover where each program really is:
+    `Bash(sh **)` still grants a script reached through a linked package
+    folder, but `Bash(./scripts/**)` asks on `./scripts/lnk/run.sh` when
+    `lnk` leads out of `scripts/`. A line in which a shell reads its commands
+    from a pipe (`curl … | sh`), or a program is written under `${PWD%/*}` or
+    `$OLDPWD`, sets off every deny and ask, and asks unless an allow covers
+    every command (`Bash` or `Bash(**)`).
+  - A path a tool reads relative to `cwd` (git and formatter `paths`) that is
+    absolute or has a `..` asks under a scoped allow, and Lint, Format and
+    RunTests refuse it. Set `cwd` to the folder you mean and list paths below
+    it.
+  - A deny or ask on a file now also stops a tool that walks or dumps the
+    folder holding it, the workspace root included. Under
+    `alwaysDeny *(**/.env)` the ordinary StateExport, NoteSearch, EventQuery,
+    TraceQuery, SessionSummarize, CostSummarize, AuditVerify,
+    PermissionsSuggest and CiWorkflowAudit calls are denied; under
+    `alwaysAsk *(.crewhaus/**)` the workspace walkers and those readers ask,
+    which parks a headless run. To keep such a rule on file readers only,
+    name them (`Read(**/.env)`); to keep a scan you rely on, point it at a
+    folder (`TodoScan` with `cwd: src`). An allow on a walked folder still
+    reads the folder alone.
+  - A secret rule reads the file a reference opens.
+    `SecretLookup(file:public/**)` no longer allows a link that leads
+    elsewhere, and a deny or ask on `.env` or `.env.local` now stops a
+    SecretLookup, EnvFileUpsert or SecretRotate call that names a secret as
+    `API_KEY` or `env:API_KEY`. An allow that names the secret
+    (`SecretLookup(env:API_KEY)`) still grants it.
+  - In a spec that reaches more than one code host, `IssueCreate(acme/app)`
+    covers only the API `tool_config` is set up for. Name the host:
+    `IssueCreate(https://ghe.example.com/acme/*)`, or
+    `IssueCreate(https://*/acme/app)` for that repository on any https host.
+    A spec with one host keeps its rules.
+  - An API-mode Chat rule names the API: `ChatPost(https://slack.com/C0123)`,
+    or `ChatPost(https://*/C0123)` on any API; `ChatPost(C0123)` alone now
+    asks. A post through an incoming webhook is allowed by the variable that
+    names it, `ChatPost(SLACK_OPS_WEBHOOK)`, not by a channel, and
+    WebhookPost by its `urlEnv`, `WebhookPost(DEPLOY_HOOK_URL)`.
+  - A deploy call that names a `tenant` is read as `<tenant>/<name>/<env>`:
+    `DeployRollback(billing/staging)` no longer covers a tenant's copy of
+    that pin. Write `DeployRollback(acme/billing/staging)`.
   - A pattern aimed at something that is not where the tool acts, such as a
-    message body, no longer matches: deny the tool, or its destination.
+    message body, no longer grants a call, and a deny or ask on it fires only
+    when every text value of the call matches, as in 0.7.0. To stop a call,
+    deny the tool or its destination.
   - A rule on a chain tool is written `Tool(<chainId>/<address>)`.
+- **Approvals parked before the upgrade** settle as before when the call's
+  path goes through no link. Through a link, the call is asked once more,
+  and so is a command call parked by a 0.7.1 pre-release whose program or
+  script was reached through a link. A refusal still applies.
+- **SpecPin, DeployRollback and DeployInspect take a spec name as the
+  registry stores it.** A name the registry would store under another
+  spelling (`Brewbird Support` is `Brewbird-Support`, `.billing` is
+  `billing`) is refused with the name to use; DeployInspect lists them.
+- **A mirror or chain node that redirects now fails.** Point
+  DependencyAudit's `endpoint`, or a chain's `rpcUrls`, at the address that
+  answers directly.
 - **MCP tools are named `mcp__<server>__<tool>`**, as the docs always said;
   they were registered as `<server>__<tool>`. Rules, model-profile lists,
   skill and sub-agent `tools:`, hook matchers, `rate_limits` and eval
@@ -792,12 +1003,16 @@ deny, warn or fail `--strict`; each says what to write instead.
   nothing there. A matching deny or ask now denies; allow rules are still
   ignored, so plan mode can only get stricter.
 - **Deny and ask rules fire in more places** — on defaults the call leaves
-  out, on directories above a denied one, on every spelling of a destination,
-  on a command reached through its directory or environment, and on any
-  command in a Bash line. Only denies and asks got wider, with one harmless
-  exception: a scoped Bash allow now also matches a line that differs from
-  it only by blanks around it or a trailing comment (`git status # check`
-  under `Bash(git status)`).
+  out, on directories above a denied one and the folders a tool walks, on
+  every spelling of a destination, on where a program, script or secret file
+  really is, on what a tool copies from, on a command reached through its
+  directory, environment or input, on any command in a Bash line, and on the
+  API a call names. A deny that fired in 0.7.0 still fires. Allows got wider
+  in two harmless ways only: a scoped Bash allow also matches a line that
+  differs from it only by blanks around it or a trailing comment
+  (`git status # check` under `Bash(git status)`), and an allow naming where
+  a program really is grants a call that reaches it through a symlinked
+  folder.
 - **A call whose input the tool would reject is refused before any rule or
   approval.** It could not run anyway. It is not counted as a denial in eval
   safety violations or deny alerts.
@@ -834,6 +1049,14 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **ArchiveExtract** refuses an archive that declares more than `maxBytes`,
   which defaults to 1 GiB and can be raised to 16 GiB, or holds a FIFO,
   device or socket.
+- **New limits refuse rather than slow down**: SchemaDiff past 256 levels of
+  nesting, RobotsCheck past a URL a web server would accept, and Slugify and
+  GlossaryReplace past their text limit. SchemaDiff lists the first changes
+  when there are too many to show, with how many it left out; its verdict and
+  counts still cover every change.
+- **ImportCsv and ImportJson no longer fail on an extremely long number.**
+  It is imported as text, and ImportCsv infers its column as text; in a
+  column that is already `INTEGER`, its row is rejected as not an integer.
 - **Chain and DeFi reads**: EVM reads time out after 30 seconds and refuse
   oversized answers; DeFi `timeoutMs` bounds the whole call, and
   PortfolioValuation's default is a 60-second deadline for the call.
@@ -849,9 +1072,11 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **Discovery tools strip hidden Unicode** (tag characters, stray variation
   selectors, soft hyphens) from authored fields and say so.
 - **For library users**, many result shapes gain fields (`undetermined`,
-  `outputIncomplete`, `truncatedBy`, `refused`, `determined` and others),
-  `Sandbox.exec` reports `aborted` and byte counts, and
-  `@crewhaus/preflight`'s `BundleFreshness.state` gains `"unreadable"`.
+  `outputIncomplete`, `truncatedBy`, `refused`, `determined`,
+  `anchorsUnchecked` and others), `Sandbox.exec` reports `aborted` and byte
+  counts, `@crewhaus/preflight`'s `BundleFreshness.state` gains
+  `"unreadable"`, and a parked approval records the `places` it was granted
+  for.
 
 ### Added
 
@@ -865,14 +1090,22 @@ deny, warn or fail `--strict`; each says what to write instead.
   only; its README's adoption table says which helper replaces what.
 - **`operativeArgs` on a tool definition**: the input field or fields a
   permission rule is about, and what kind each is — path, URL, command,
-  recipient, id or text — with whether it is read `within` another field
-  (a repository as `owner/repo`, a path from the tool's `cwd`), what a
-  left-out value stands for, and whether a command is a line a shell parses
-  (`shell`, which Bash and Shell declare). Every builtin that changes
-  something or reaches outside declares them, and `buildTool` refuses a
-  declaration that names a field the input does not have. An empty list says
-  no argument decides where the tool acts. Tool packages outside this repo
-  can check `TOOL_CONTRACT_VERSION` in `@crewhaus/tool-catalog`.
+  recipient, id or text. A declaration also says how a value is read: whether
+  it is `within` another field (a repository as `owner/repo`, a path from the
+  tool's `cwd`), what a left-out value stands for, whether the tool walks
+  what is beneath a path (`beneath`, with `hiddenWhen` for a walk that skips
+  hidden names) or opens fixed files there (`opens`), whether a command is a
+  line a shell parses (`shell`, which Bash and Shell declare) or is handed an
+  environment or input (`env`, `stdin`), whether a value is a secret
+  reference (`secretRef`) or where the tool copies from (`source`), the API a
+  call names (`service`, with the tool's new `serviceDefaults` saying where a
+  call that names none goes), whose own copy it acts on (`overlay`), and a
+  field the tool ignores when the call names another (`ignoredWhen`). Every
+  builtin that changes something, reaches outside or walks a directory
+  declares them, and `buildTool` refuses a declaration that names a field the
+  input does not have. An empty list says no argument decides where the tool
+  acts. Tool packages outside this repo can check `TOOL_CONTRACT_VERSION` in
+  `@crewhaus/tool-catalog`.
 - **`ToolRegistry`** (`@crewhaus/tool-capability`): a harness can see the
   builtin tools it was not given — search by text, narrow by category, or ask
   for one tool's description, and each row says whether this harness runs it.
@@ -883,7 +1116,7 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **`@crewhaus/tool-registry-manifest`**: every builtin tool's name,
   description, flags, categories and operative arguments as data, generated
   by `scripts/gen-tool-registry.ts` and checked for staleness by a test. It is
-  about 250 KB of description text in a module of about 490 KB, which is why
+  about 250 KB of description text in a module of about 500 KB, which is why
   it is its own package and `ToolRegistry` its own tool.
 - **`crewhaus tools show <tool>` says what a permission rule on it
   checks**: each argument a scoped rule reads, in words (a path read from
@@ -917,16 +1150,75 @@ deny, warn or fail `--strict`; each says what to write instead.
   `{ type: alwaysAsk, pattern: Fetch }` and
   `{ type: alwaysAsk, pattern: ImageGenerate }` to `permissions.rules`, or
   leave the tools out of `tools:`.
-- **A deny on a command is a list, and a list has gaps.** It reads the
-  commands a Bash line runs, through wrappers, `eval`, `sh -c` and the line's
-  own variables, but not a program another program runs from its arguments
-  (`find -exec`, `git -c alias…`, `python -c`), what a script does, a
-  directory a line `cd`s into, or a link in an argument: a symlink to
-  `release.sh` gets past a deny on `release.sh`. For Bash, allow what may run
-  rather than deny what may not.
-- **Tools that declare no operative argument are matched on the text of the
-  call, as in 0.7.0.** A deny on a directory does not stop a whole-tree
-  FindFiles, Tree or DiskUsage.
+- **A URL rule is checked on the URL a call names, not where the tool goes
+  next.** Redirects, and the next pages HttpPaginate follows, are checked
+  against the tool's own allow-list (`allowed_origins`, or WebFetch's
+  `allowed_domains`), not your rules, in every mode, and a rule on part of an
+  origin, such as a path, is not checked on them at all. This covers the
+  HTTP tools, Fetch, WebFetch and HealthProbe. WebFetch has no allow-list
+  until you set one. Keep an origin you deny off the tool's allow-list, list
+  only origins whose redirects you trust, or deny the tool.
+- **A deny on a command is a list, and a list has gaps.** It reads each
+  command a line runs, through wrappers, `eval`, `sh -c`, the line's own
+  variables and its `cd`s, and where each program and script lands. Its gaps:
+  - In a Bash line, a program another program runs from its arguments
+    (`find -exec`, `git -c alias…`, `make`) and a file a program opens from
+    its arguments (`cat link/../x`) are read as written.
+  - What a script, or code handed to an interpreter other than a shell
+    (`python3 -c`, `node -e`, or on its input), does once it runs is not
+    read.
+  - A file an interpreter loads through an option written with `=`
+    (`node --require=./x.js`) is read as written.
+  - A word read after a `cd` that cannot be followed from the text
+    (`cd "$X"`, `cd $(…)`, `cd` to a pattern, `cd -`, a `CDPATH`), or one
+    that starts with `~` or `$HOME`, is read as written, and a headless grant
+    for it is not bound to where it lands.
+  - A deny written across more than one command's words
+    (`Bash(true && secrets/**)`, `Bash(A=1 secrets/**)`,
+    `RunCommand(sh -c sh secrets/**)`) is matched on the text as written.
+    Write it on one command: `Bash(secrets/**)`.
+
+  For Bash, allow what may run rather than deny what may not.
+- **A command allow reads a program's arguments as written.**
+  `alwaysAllow RunCommand(cat src/**)` also grants `cat src/../.env`, since
+  `**` matches `..`. On RunCommand, Retry, ProcessStart and RunPipeline a
+  deny reads where each argument lands, so deny what must stay out
+  (`alwaysDeny RunCommand(**/.env)`).
+- **Tools that open one file named in the call are matched on the call's
+  text.** ReadLines, PdfText, TailFile and the other single-file readers
+  declare no place, so a deny on `secrets/**` does not follow a link into it
+  (`ReadLines pub/lnk/token`). Deny the tool, or keep links into a denied
+  folder out of the workspace.
+- **A tool that reads every file in a folder follows a file in it that links
+  elsewhere in the workspace**, and a deny on the link's target does not stop
+  it: the session-log readers (EventQuery and the other observability
+  readers, TraceQuery, SessionSummarize, CostSummarize, DatasetMine,
+  SpecAdvise, EvalCoverage), DocsSymbolCheck, ChecksumVerify,
+  MigrationStatus and CiWorkflowAudit, including its default
+  `.github/workflows`. Keep such links out of the folders they read, or deny
+  the tool.
+- **A deny on a hidden file also stops the session-log readers.** EventQuery
+  and the other tools that read a folder of records whole are read as
+  everything in it, though they open only their own record files, so
+  `alwaysDeny *(**/.env)` denies their ordinary calls. To keep such a rule on
+  file readers only, name them: `alwaysDeny Read(**/.env)`.
+- **A deny naming a project or harness file does not stop the tools that
+  read it by name.** DependencyList, DependencyOutdated, DependencyAudit,
+  PackageScripts, LicenseAggregate, PackagePublishPreflight and
+  RegistryOutdated read manifests and lockfiles, and the fleet tools read a
+  harness's spec and bundle. Deny the tool.
+- **IndexSearch reopens the files an index recorded**, so after adding a
+  deny, rebuild any index built before it. **MarkdownLinkCheck** still
+  reports whether a link target exists anywhere in the workspace, a denied
+  one included.
+- **Git tools that name no path are matched on their repository.**
+  GitCherryPick, GitStashPop, GitStatus and the other git tools that take
+  only a `cwd` change or report files no path rule reads. Deny the tool to
+  keep it off.
+- **A notify rule names who receives the message**, not the SMTP relay, the
+  SMS or push provider, or the Chat bot token it goes through; `tool_config`
+  bounds each of those. A webhook post is read by the variable that names
+  it, never by its URL: deny the variable.
 - **Some of the runtime's own bookkeeping in `.crewhaus/` is not yet
   link-contained**: the Hangar and supervisor ledgers, research fetch and
   citation logs, the feedback queue, the experiment ledger, and the files
