@@ -74,7 +74,8 @@
  *      `cd`s the shell joined, a link's name and all, so after `cd lnk` node
  *      runs `$PWD/../x.mjs` as `./x.mjs` (where that text cannot be told —
  *      after a wrapper's or a `cd -P`'s move — one that climbs out of it
- *      cannot be placed). A word read from a directory
+ *      cannot be placed). Spelled any other way (`${PWD%/*}`, `$OLDPWD`),
+ *      the shell's own directory cannot be placed. A word read from a directory
  *      that cannot be told (`cd "$X"`, `cd -`, a `cd` in a loop), or that a
  *      variable the line does not set or a `~` starts, is read as written;
  *      with a `..` after a name it cannot be placed. A pattern the shell
@@ -784,6 +785,15 @@ type CommandReadingOptions = {
 const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
+ * A reference to a directory the shell itself sets, `PWD` or `OLDPWD`, in
+ * any spelling: `${PWD%/*}`, `$OLDPWD`, `$(dirname "$PWD")`. Only a plain
+ * `$PWD` or `${PWD}` at the start of a word is put in ({@link withShellPwd});
+ * any other is the text of a directory a `cd` went through, a link's name
+ * and all, which the gate cannot place.
+ */
+const SHELL_DIRECTORY_VARIABLE = /\$\{?[#!]?(?:OLD)?PWD(?![A-Za-z0-9_])/;
+
+/**
  * Read the words of one command that name a file where the OS finds them,
  * from each directory it may run in ({@link WordDir}):
  *
@@ -827,8 +837,10 @@ const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * A word cannot be placed — every deny or ask fires, and only an allow
  * naming every command grants it — when it has a `..` after a name and no
  * reader can follow the links before it (the edge worker), or it is read
- * from a directory that cannot be told; when a script is a pattern with a
- * wildcard before its last name; or when the reader cannot walk it. A word
+ * from a directory that cannot be told; when a shell's word names its own
+ * directory in a spelling not put in ({@link SHELL_DIRECTORY_VARIABLE});
+ * when a script is a pattern with a wildcard before its last name; or when
+ * the reader cannot walk it. A word
  * from a directory that cannot be told, or that a variable the line does
  * not set or a `~` starts, is otherwise read as written.
  */
@@ -909,7 +921,11 @@ function readCommand(
       // approval would be bound to it, not at all.
       if (role === "argument" && !/[\\/]/.test(word) && (opts.shell || !elsewhere)) return;
       if (!known) {
-        if (role !== "argument" && climbs) unplaceable = true;
+        // With a `..` after a name, or under a directory the shell set
+        // (`cd lnk && node ${PWD%/*}/dl/x.mjs` runs dl/x.mjs from the root):
+        // it may land anywhere.
+        const shellDir = opts.shell && SHELL_DIRECTORY_VARIABLE.test(ownDir);
+        if (role !== "argument" && (climbs || shellDir)) unplaceable = true;
         return;
       }
       if (pattern && (/[*?[]/.test(ownDir) || climbs)) {

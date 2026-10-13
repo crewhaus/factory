@@ -2245,6 +2245,43 @@ describe("a command word that names a file is read where the kernel finds it", (
         });
       }
     });
+
+    // interp review (0.7.1): only a plain `$PWD` or `${PWD}` that starts a word
+    // is put in. After `cd lnk`, `${PWD%/*}` is the root's text, `$OLDPWD`
+    // the root itself; through dl → secrets, each runs secrets/x.mjs.
+    test("the shell's own directory spelled any other way cannot be placed", () => {
+      for (const command of [
+        "cd lnk && node ${PWD%/*}/dl/x.mjs",
+        "cd lnk && sh ${PWD%/*}/dl/x.sh",
+        "cd lnk && node ${PWD:-.}/x.mjs",
+        "cd lnk && node $OLDPWD/dl/x.mjs",
+        "cd lnk && node ${OLDPWD}/dl/x.mjs",
+        'cd lnk && node "$(dirname "$PWD")"/dl/x.mjs',
+      ]) {
+        expect({ command, every: at("restrict", "Sh(nothing-like-it)", line(command)) }).toEqual({
+          command,
+          every: true,
+        });
+        expect({
+          command,
+          scoped: at("allow", "Sh(cd lnk && node **)", line(command)),
+          every: at("allow", "Sh(**)", line(command)),
+        }).toEqual({ command, scoped: false, every: true });
+      }
+      // An argument a line hands a program, and a variable that is no
+      // directory the shell sets, are read as written, as before.
+      for (const command of [
+        "cd lnk && cat ${PWD%/*}/x",
+        "node $HOME/x.mjs",
+        "node ${PWDX}/x.mjs",
+        "node $PWD_OLD/x.mjs",
+      ]) {
+        expect({ command, every: at("restrict", "Sh(nothing-like-it)", line(command)) }).toEqual({
+          command,
+          every: false,
+        });
+      }
+    });
   });
 });
 

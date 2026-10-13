@@ -4273,3 +4273,63 @@ describe("interp review — an option's argument is read both ways", () => {
     60_000,
   );
 });
+
+// interp review (0.7.1): a shell line's `$PWD` is put in only as a plain
+// `$PWD` or `${PWD}` that starts a word. After `cd lnk` (lnk → safe/sub) the
+// shell's PWD keeps lnk's name, so `${PWD%/*}` is the root's text and
+// `$OLDPWD` the root: through dl → secrets each word runs secrets/x.*, which
+// the gate read as written and so let past a deny on secrets/.
+describe("interp review — the shell's own directory, spelled another way", () => {
+  let marker: string;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    for (const d of ["safe/sub", "secrets"]) mkdirSync(join(ws, d), { recursive: true });
+    symlinkSync("safe/sub", join(ws, "lnk"));
+    symlinkSync("secrets", join(ws, "dl"));
+    writeFileSync(
+      join(ws, "secrets", "x.mjs"),
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(marker)}, "secrets/x.mjs\\n");\n`,
+    );
+    for (const p of ["secrets/x.sh", "safe/ok.sh"]) {
+      writeFileSync(join(ws, p), `#!/bin/sh\necho ${p} >> "${marker}"\n`, { mode: 0o755 });
+    }
+  });
+  const ran = () => readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).join(",");
+
+  test("a deny or ask on secrets/ fires, and nothing runs", async () => {
+    for (const command of [
+      "cd lnk && node ${PWD%/*}/dl/x.mjs",
+      "cd lnk && sh ${PWD%/*}/dl/x.sh",
+      "cd lnk && node $OLDPWD/dl/x.mjs",
+      'cd lnk && node "$(dirname "$PWD")"/dl/x.mjs',
+    ]) {
+      for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+        writeFileSync(marker, "");
+        const got = await gate(
+          "Bash",
+          { command },
+          rules([type, "Bash(**secrets/**)"], ["alwaysAllow", "Bash"]),
+        );
+        expect({ command, type, got, ran: ran() }).toEqual({
+          command,
+          type,
+          got: type === "alwaysDeny" ? "deny" : "ask",
+          ran: "",
+        });
+      }
+    }
+  }, 60_000);
+
+  test("control: a plain `$PWD` is still put in, and the line runs", async () => {
+    for (const command of ["cd safe && sh $PWD/ok.sh", "sh ${PWD}/safe/ok.sh"]) {
+      writeFileSync(marker, "");
+      const got = await gate(
+        "Bash",
+        { command },
+        rules(["alwaysDeny", "Bash(**secrets/**)"], ["alwaysAllow", "Bash"]),
+      );
+      expect({ command, got, ran: ran() }).toEqual({ command, got: "allow", ran: "safe/ok.sh" });
+    }
+  }, 60_000);
+});
