@@ -58,8 +58,9 @@
  * result would not be. List rows are checked by the local layers one by one,
  * but go to a model-backed classifier (Layer 3) in chunks of rows, so a long
  * list costs a few model calls rather than one per row; see `classifyRows`.
- * Neighbouring rows are also classified side by side, so an injection split
- * across two rows redacts both of them.
+ * Neighbouring rows, and neighbouring `wiki_recall` articles, are also
+ * classified side by side, so an injection split across two of them redacts
+ * both (boundary-classifier's `classifySideBySide`).
  * A non-blocked unit is `tagContent`-ed into
  * `RunContext.dataLineage` under origin `"memory"` (the skills-registry
  * two-site pattern) so the sink-side egress fabric can attribute a later
@@ -85,7 +86,11 @@
  * memory-service decide where events land; nothing here imports runtime
  * wiring.
  */
-import { buildRedactionNotice, classifyBoundary } from "@crewhaus/boundary-classifier";
+import {
+  buildRedactionNotice,
+  classifyBoundary,
+  classifySideBySide,
+} from "@crewhaus/boundary-classifier";
 import type { WikiWriteEventPayload } from "@crewhaus/event-log";
 import { type RunContext, formatAgentIdentity, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -384,7 +389,7 @@ function named(ref: { readonly slug: unknown; readonly version: unknown }): stri
 }
 
 /**
- * The most row text one classification sees at once, besides the row a chunk
+ * The most row text one classification sees at once, besides the rows a chunk
  * carries over from the one before it: well inside the classifier's window
  * (64 KiB), so every row in a chunk is analysed in full.
  */
@@ -394,48 +399,14 @@ const ROW_CHUNK_CHARS = 16 * 1024;
 const ROW_CLASSIFY_CONCURRENCY = 8;
 
 /**
- * A Layer-3 stand-in that answers nothing: passed per call, it makes a
- * classification run only the local layers (regex and structural).
- */
-const LOCAL_LAYERS_ONLY = async (): Promise<undefined> => undefined;
-
-/** Run `fn` over `items` in order, at most {@link ROW_CLASSIFY_CONCURRENCY} at a time. */
-async function mapPooled<T, R>(
-  items: ReadonlyArray<T>,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i] as T, i);
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, items.length) }, () => worker()),
-  );
-  return out;
-}
-
-/**
  * Classify many list rows at origin `"memory"`, each row its own unit for
- * the verdict, without paying one model call per row.
- *
- *  1. The local layers (regex, structural, decoded variants) run on each row
- *     alone, so a row's encoded payload is decoded however many rows sit
- *     beside it. A malicious verdict there is final: the model layer can
- *     raise a verdict but never lower one. This pass bypasses the verdict
- *     cache, so a local-only verdict never stands in for a full one.
- *  2. The rows that pass are joined into chunks of at most
- *     {@link ROW_CHUNK_CHARS} and each chunk is classified in full, Layer 3
- *     included when the runtime registered one: one model call per chunk,
- *     not per row (a 400-row wiki_search used to make 400). Each chunk after
- *     the first starts with the row the one before it ended on, so every two
- *     neighbouring rows are classified side by side in some chunk.
- *  3. Only inside a chunk that comes back malicious is each row classified
- *     in full on its own, so only the row that carries the injection is
- *     redacted, never its neighbours.
- *  4. The rows of that chunk that pass on their own still go through
- *     {@link redactSplitInjections}: an injection split across two rows
- *     ("… ignore previous" / "instructions and …") passes row by row.
+ * the verdict and side by side with its neighbours, without paying one model
+ * call per row: boundary-classifier's `classifySideBySide` (the local layers
+ * on each row alone, then chunks of at most {@link ROW_CHUNK_CHARS} in full,
+ * one model call per chunk instead of one per row, and inside a malicious
+ * chunk each row alone and then each neighbouring pair). Only the row that
+ * carries an injection is redacted, or both rows of an injection split
+ * across them ("… ignore previous" / "instructions and …").
  *
  * A row that passes is tagged into the run's data lineage at `"memory"`.
  */
@@ -443,111 +414,17 @@ async function classifyRows(
   rows: ReadonlyArray<string>,
   rc: RunContext | undefined,
 ): Promise<Classified[]> {
-  const out = new Array<Classified | undefined>(rows.length);
-  const local = await mapPooled(rows, (row) =>
-    classifyBoundary(row, {
-      origin: "memory",
-      llmClassifier: LOCAL_LAYERS_ONLY,
-      bypassCache: true,
-    }),
-  );
-  const chunks: number[][] = [];
-  let chunk: number[] = [];
-  let chunkChars = 0;
-  let fresh = 0;
-  local.forEach((result, i) => {
-    if (result.action === "redact") {
-      out[i] = {
-        safe: false,
-        notice: result.redacted ?? buildRedactionNotice(result.verdict.hits),
-      };
-      return;
-    }
-    const length = (rows[i] as string).length + 1;
-    if (fresh > 0 && chunkChars + length > ROW_CHUNK_CHARS) {
-      chunks.push(chunk);
-      const last = chunk[chunk.length - 1] as number;
-      chunk = [last];
-      chunkChars = (rows[last] as string).length + 1;
-      fresh = 0;
-    }
-    chunk.push(i);
-    chunkChars += length;
-    fresh++;
+  const { redacted } = await classifySideBySide(rows, {
+    origin: "memory",
+    concurrency: ROW_CLASSIFY_CONCURRENCY,
+    chunkChars: ROW_CHUNK_CHARS,
   });
-  if (fresh > 0) chunks.push(chunk);
-  const wholes = await mapPooled(chunks, (members) =>
-    classifyBoundary(members.map((i) => rows[i]).join("\n"), { origin: "memory" }),
-  );
-  // In chunk order, not completion order, so the output does not depend on
-  // which chunk's model call returned first.
-  const flaggedChunks = chunks.filter((_, c) => wholes[c]?.action === "redact");
-  const flagged = [...new Set(flaggedChunks.flat())];
-  const each = await mapPooled(flagged, (i) => classifyMemory(rows[i] as string, undefined));
-  flagged.forEach((i, j) => {
-    const result = each[j] as Classified;
-    if (!result.safe) out[i] = result;
-  });
-  // One flagged chunk at a time: the check pools its own pair calls, so this
-  // keeps at most ROW_CLASSIFY_CONCURRENCY classifications in flight. A row
-  // carried between two flagged chunks takes the first chunk's notice.
-  for (const members of flaggedChunks) {
-    const passed = members.filter((i) => out[i] === undefined);
-    for (const [k, notice] of await redactSplitInjections(passed.map((i) => rows[i] as string))) {
-      const i = passed[k] as number;
-      out[i] ??= { safe: false, notice };
-    }
-  }
   return rows.map((row, i) => {
-    const result = out[i] ?? { safe: true, text: row };
-    if (result.safe && rc !== undefined) tagContent(rc, result.text, "memory");
-    return result;
+    const notice = redacted.get(i);
+    if (notice !== undefined) return { safe: false, notice };
+    if (rc !== undefined) tagContent(rc, row, "memory");
+    return { safe: true, text: row };
   });
-}
-
-/**
- * An injection split across rows. Each of `rows` passed classification on its
- * own, but an attacker who can plant two articles that list side by side can
- * split one phrase between them, so each half classifies clean and the model
- * still reads one sentence. The rows are classified joined with "\n" at
- * TrustOrigin `"memory"`: the raw rows, not the rendered `  • ` lines, whose
- * bullets break the detector's phrase rules without breaking the sentence for
- * the model. When the join is malicious, each pair of neighbours is classified
- * and both rows of a malicious pair are redacted. When no pair reproduces the
- * verdict, or the rows left still join malicious (a split over three rows, or
- * weak hits that only add up across the chunk), every row is redacted: fail
- * closed. runtime-core's `renderRecalledMemory` runs the same check on
- * auto-recalled lines. Returns the notice for each row to redact, by index
- * into `rows`.
- */
-async function redactSplitInjections(rows: ReadonlyArray<string>): Promise<Map<number, string>> {
-  const redacted = new Map<number, string>();
-  if (rows.length < 2) return redacted;
-  const joined = await classifyBoundary(rows.join("\n"), { origin: "memory" });
-  if (joined.action !== "redact") return redacted;
-  const pairs = await mapPooled(rows.slice(1), (_row, i) =>
-    classifyBoundary(`${rows[i]}\n${rows[i + 1]}`, { origin: "memory" }),
-  );
-  pairs.forEach((pair, i) => {
-    if (pair.action !== "redact") return;
-    const notice = pair.redacted ?? buildRedactionNotice(pair.verdict.hits);
-    redacted.set(i, notice);
-    redacted.set(i + 1, notice);
-  });
-  const left = rows.filter((_, i) => !redacted.has(i));
-  const residual =
-    redacted.size === 0
-      ? joined
-      : left.length > 1
-        ? await classifyBoundary(left.join("\n"), { origin: "memory" })
-        : undefined;
-  if (residual?.action === "redact") {
-    const notice = residual.redacted ?? buildRedactionNotice(residual.verdict.hits);
-    for (let i = 0; i < rows.length; i++) {
-      if (!redacted.has(i)) redacted.set(i, notice);
-    }
-  }
-  return redacted;
 }
 
 /**
@@ -576,8 +453,30 @@ async function safeRefLines<R extends WikiRef>(
 }
 
 function hitHeader(hit: WikiHit): string {
+  return `--- ${hitLine(hit)}`;
+}
+
+/** The header line of a `wiki_recall` hit, without the `--- ` marker. */
+function hitLine(hit: WikiHit): string {
   const viaSuffix = hit.via === "link" ? ", via link" : "";
-  return `--- ${refLine(hit.ref)} (score ${hit.score.toFixed(4)}${viaSuffix})`;
+  return `${refLine(hit.ref)} (score ${hit.score.toFixed(4)}${viaSuffix})`;
+}
+
+/** The most of each article's head and tail that its seams are checked with. */
+const SEAM_WINDOW_CHARS = 2 * 1024;
+
+/**
+ * An article's ends, for the check across `wiki_recall` articles: its head
+ * (slug, title, tags, start of body) and its tail (end of body), each at most
+ * {@link SEAM_WINDOW_CHARS} long, around a "…" that no phrase rule reads
+ * across. The article as a whole was classified on its own; the check across
+ * articles only needs what sits next to a seam, and fifty whole articles
+ * would make one chunk per article. A short article is kept whole, so a split
+ * that runs through it to the article after is still seen.
+ */
+function seamView(text: string): string {
+  const w = SEAM_WINDOW_CHARS;
+  return text.length <= 2 * w + 3 ? text : `${text.slice(0, w)}\n…\n${text.slice(-w)}`;
 }
 
 const STALE_WRITE_REMEDIATION =
@@ -635,15 +534,34 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       if (hits.length === 0) {
         return `no wiki articles matched "${input.query}" — if this is a real gap, record it with log_knowledge_gap`;
       }
-      const lines = [`${hits.length} wiki hit(s) for "${input.query}":`];
+      // Header and body are one unit: the title and tags are free text too.
+      const verdicts: Classified[] = [];
       for (const hit of hits) {
-        // Header and body are one unit: the title and tags are free text too.
-        const c = await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, rc);
+        verdicts.push(await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, undefined));
+      }
+      // The articles that pass, side by side: an injection split across two
+      // of them passes article by article. Their ends, not the rendered text,
+      // whose "--- " headers break the detector's phrase rules.
+      const passed = hits.flatMap((_, i) => (verdicts[i]?.safe === true ? [i] : []));
+      const split = await classifySideBySide(
+        passed.map((i) => {
+          const hit = hits[i] as WikiHit;
+          return seamView(`${hitLine(hit)}\n${hit.body}`);
+        }),
+        { origin: "memory", concurrency: ROW_CLASSIFY_CONCURRENCY },
+      );
+      for (const [k, notice] of split.redacted) {
+        verdicts[passed[k] as number] = { safe: false, notice };
+      }
+      const lines = [`${hits.length} wiki hit(s) for "${input.query}":`];
+      hits.forEach((hit, i) => {
+        const c = verdicts[i] as Classified;
+        if (c.safe && rc !== undefined) tagContent(rc, c.text, "memory");
         lines.push(
           "",
           ...(c.safe ? [c.text] : [`--- ${named(hit.ref)} — [article redacted]`, c.notice]),
         );
-      }
+      });
       return lines.join("\n");
     },
   });
