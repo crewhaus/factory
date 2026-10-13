@@ -45,6 +45,7 @@ import {
   __setPrivateHostsAllowedForTest,
   _resetIdempotencyLedger,
   _resetNotifyConfig,
+  _setDnsTxtResolver,
   registerNotifyConfig,
 } from "@crewhaus/tool-notify";
 import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
@@ -4746,5 +4747,82 @@ describe("critic10 — a deny on a phone number meets every spelling SmsSend sen
     }
     expect(await gate("SmsSend", sms("+15550100000"), exact, "default", judged)).toBe("allow");
     expect(wire.length).toBe(1);
+  }, 60_000);
+});
+
+// The recipient-kind audit after critic10: a tool that dials or looks up a
+// bare host reaches it under other spellings than the one a deny named.
+// WaitForPort dials `127.1` as 127.0.0.1; DeliverabilityCheck looks
+// `münchen.de` up as `xn--mnchen-3ya.de`. Both are read-only, so in auto
+// mode a deny is the only thing between the call and the network.
+describe("recipient audit — a host deny meets the host in the form the tool reaches it", () => {
+  test("WaitForPort: a deny on 127.0.0.1 stops its numeric forms; nothing is probed", async () => {
+    let connections = 0;
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open() {
+          connections++;
+        },
+        data() {},
+      },
+    });
+    try {
+      const probe = (host: string) => ({ host, port: listener.port, timeoutMs: 5_000 });
+      const rs = rules(["alwaysDeny", "WaitForPort(127.0.0.1)"]);
+      for (const host of ["127.1", "2130706433", "0x7f000001", "0177.0.0.1", "127.0.0.01"]) {
+        for (const mode of ["default", "auto"] as const) {
+          const got = await gate("WaitForPort", probe(host), rs, mode);
+          expect({ host, mode, got }).toEqual({ host, mode, got: "deny" });
+        }
+      }
+      expect(connections).toBe(0);
+      // Control: a deny on another address leaves the call to run, and the
+      // tool reaches the listener through the same spelling.
+      const other = rules(["alwaysDeny", "WaitForPort(10.0.0.5)"]);
+      expect(await gate("WaitForPort", probe("127.1"), other, "auto")).toBe("allow");
+      expect(JSON.parse(lastResult ?? "{}")).toMatchObject({ satisfied: true, state: "open" });
+    } finally {
+      listener.stop(true);
+    }
+  }, 60_000);
+
+  test("DeliverabilityCheck: a deny on the domain stops its Unicode spellings, written either way; nothing is looked up", async () => {
+    const asked: string[] = [];
+    _setDnsTxtResolver(async (name) => {
+      asked.push(name);
+      return [];
+    });
+    registerNotifyConfig({ allowed_sender_domains: ["münchen.de"] });
+    try {
+      const cases: Array<[string, string]> = [
+        ["xn--mnchen-3ya.de", "münchen.de"],
+        ["xn--mnchen-3ya.de", "MÜNCHEN.DE"],
+        ["xn--mnchen-3ya.de", "ｍüｎｃｈｅｎ.de"],
+        ["xn--mnchen-3ya.de", "mün\u00adchen.de"],
+        ["xn--mnchen-3ya.de", "münchen。de"],
+        ["münchen.de", "xn--mnchen-3ya.de"],
+        ["münchen.de", "XN--MNCHEN-3YA.DE"],
+      ];
+      for (const [deny, domain] of cases) {
+        for (const mode of ["default", "auto"] as const) {
+          const rs = rules(["alwaysDeny", `DeliverabilityCheck(${deny})`]);
+          const got = await gate("DeliverabilityCheck", { domain }, rs, mode);
+          expect({ deny, domain, mode, got }).toEqual({ deny, domain, mode, got: "deny" });
+        }
+      }
+      expect(asked).toEqual([]);
+      // Control: a deny on another domain leaves the call to run, and the
+      // tool asks about the name the deny above was written on.
+      const other = rules(["alwaysDeny", "DeliverabilityCheck(berlin.de)"]);
+      expect(await gate("DeliverabilityCheck", { domain: "MÜNCHEN.DE" }, other, "auto")).toBe(
+        "allow",
+      );
+      expect(asked).toContain("_dmarc.xn--mnchen-3ya.de");
+    } finally {
+      _setDnsTxtResolver(undefined);
+      _resetNotifyConfig();
+    }
   }, 60_000);
 });

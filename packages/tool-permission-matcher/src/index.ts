@@ -1,8 +1,10 @@
 import { CrewhausError } from "@crewhaus/errors";
+import { IPV4_IN_IPV6, hostSpellings } from "./host";
 import { isE164Number, normalizePhoneNumber } from "./phone";
 import { type ShellChain, readShellChain, shellRestrictReading } from "./shell";
 import { withoutTrailingDots } from "./trim";
 
+export { hostSpellings, ipv4Address } from "./host";
 export { isE164Number, normalizePhoneNumber } from "./phone";
 
 export class PatternParseError extends CrewhausError {
@@ -980,7 +982,9 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * http and https (a rule that names a port or leaves the host a wildcard
  * keeps to the scheme and port it names); an address in lower case without
  * a `+tag`; a phone number as SmsSend reads it, separators taken out
- * wherever they are, and the same of a number the rule writes with them; an
+ * wherever they are; a bare host as the tools that look it up or dial it
+ * reach it (its IDNA form, an IPv4 address in any numeric form as its dotted
+ * quad); and a number or a host the rule writes another way the same; an
  * id or a program name in lower case. An allow rule reads only
  * `canonical`, and never grants a URL that carries userinfo or an escaped
  * `..`.
@@ -1195,9 +1199,6 @@ type UrlFold = {
   readonly schemeSwapped: boolean;
 };
 
-/** An IPv6 literal that reaches an IPv4 host, as WHATWG writes it: mapped, or NAT64. */
-const IPV4_IN_IPV6 = /^\[(?:::ffff:|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/;
-
 /**
  * The same request with its host written the other ways that name that
  * host: an IPv4-mapped (`[::ffff:93.184.215.14]`, which WHATWG writes
@@ -1324,7 +1325,9 @@ const PHONE_SHAPED = /^\+?[\d\s().-]+$/;
  * providers, and a phone number is the same number with or without spaces,
  * dashes, dots and brackets, wherever they are written: SmsSend's own reading
  * ({@link normalizePhoneNumber}), so `(+1)5550001111` meets a deny on
- * `+15550001111` as the message does.
+ * `+15550001111` as the message does. A bare host is also read as the tools
+ * that look it up or dial it reach it ({@link hostSpellings}): `münchen.de`
+ * as `xn--mnchen-3ya.de`, `10.5` as `10.0.0.5`.
  */
 function restrictRecipientSpellings(raw: string): string[] {
   const written = raw.normalize("NFC").toLowerCase().trim();
@@ -1348,6 +1351,7 @@ function restrictRecipientSpellings(raw: string): string[] {
   }
   const number = normalizePhoneNumber(raw);
   if (isE164Number(number)) out.push(number);
+  out.push(...hostSpellings(raw));
   return out;
 }
 
@@ -1368,6 +1372,28 @@ function phoneArgMatcher(compiled: CompiledPattern): GlobMatcher | undefined {
     phoneGlobs.set(compiled, matcher);
   }
   return matcher ?? undefined;
+}
+
+const hostGlobs = new WeakMap<CompiledPattern, GlobMatcher[]>();
+
+/**
+ * A deny or ask glob that writes a host another way than the tools reach it
+ * (`DeliverabilityCheck(münchen.de)`, `WaitForPort(10.5)`), read as they
+ * read it ({@link hostSpellings}); `*` is kept, as a host may hold it. None
+ * for a glob with a `?` or an escape, which is read as written.
+ */
+function hostArgMatchers(compiled: CompiledPattern): GlobMatcher[] {
+  let matchers = hostGlobs.get(compiled);
+  if (matchers === undefined) {
+    const glob = compiled.argGlob ?? "";
+    const lower = glob.normalize("NFC").toLowerCase();
+    matchers =
+      glob.includes("?") || glob.includes("\\")
+        ? []
+        : [...new Set(hostSpellings(glob))].filter((h) => h !== lower).map(compileGlob);
+    hostGlobs.set(compiled, matchers);
+  }
+  return matchers;
 }
 
 /**
@@ -1527,9 +1553,13 @@ function valueMatches(
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   if (folds.some((candidate) => folded.test(candidate))) return true;
-  // A number the rule writes with separators is the number SmsSend reads.
-  const phone = value.kind === "recipient" ? phoneArgMatcher(compiled) : undefined;
-  return phone !== undefined && (restrictFoldsOf(value) ?? []).some((c) => phone.test(c));
+  if (value.kind !== "recipient") return false;
+  // A number the rule writes with separators is the number SmsSend reads,
+  // and a host it writes another way is the host the tools reach.
+  const all = restrictFoldsOf(value) ?? [];
+  const phone = phoneArgMatcher(compiled);
+  if (phone !== undefined && all.some((c) => phone.test(c))) return true;
+  return hostArgMatchers(compiled).some((m) => all.some((c) => m.test(c)));
 }
 
 /** Whether an argument glob matches every command with no `/` in it, per glob. */

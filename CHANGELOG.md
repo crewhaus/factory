@@ -48,12 +48,16 @@ built it.
   or ask ignores case where the filesystem does. Linux is unchanged.
 - **Every spelling of a destination meets a deny.** A deny on
   `https://evil.example/**` missed `https://x@evil.example/`, a trailing dot,
-  another port and an IPv4 address written as IPv6; a deny on an email
-  address missed another letter case or a `+tag`; a deny on a phone number
-  missed `(+1)5550100000` and the other spellings SmsSend sends to it; a
-  chain address missed another hex case. A number is read the way SmsSend
-  reads it, in the call and in the rule: `alwaysDeny SmsSend(+1 555*)` covers
-  `+15550100000`. A deny that names a host covers it over http and https
+  another port and an IPv4 address written as IPv6. A deny on an email
+  address missed another letter case or a `+tag`, and a chain address another
+  hex case. A deny on a phone number missed `(+1)5550100000` and the other
+  spellings SmsSend sends to it, and a deny on a host that WaitForPort,
+  DeliverabilityCheck or FederationDiscover reaches missed it written another
+  way: `10.5` is `10.0.0.5`, and `münchen.de` is `xn--mnchen-3ya.de`. Numbers
+  and hosts are now read the way the tool reads them, in the call and in the
+  rule: `alwaysDeny SmsSend(+1 555*)` covers `+15550100000`, and
+  `alwaysDeny DeliverabilityCheck(münchen.de)` covers `xn--mnchen-3ya.de`.
+  A deny that names a host covers it over http and https
   and on any port, unless it names a port; one whose host is a wildcard
   (`http://**`) keeps to its scheme and port, as an allow does. A path deny
   written through a symlinked spelling of the workspace (`/tmp` for
@@ -1244,6 +1248,10 @@ deny, warn or fail `--strict`; each says what to write instead.
   deny, rebuild any index built before it. **MarkdownLinkCheck** still
   reports whether a link target exists anywhere in the workspace, a denied
   one included.
+- **A container image is matched as the call writes it.**
+  ContainerImageInspect and ContainerImageTags read `alpine` as Docker Hub's
+  `docker.io/library/alpine`, but a deny on one of those spellings does not
+  stop the other. Deny each spelling, or the tool.
 - **Git tools that take no path (GitStatus, GitStashPop, GitCherryPick …)
   are matched on their repository.** Taking only a `cwd`, they change or
   report files no path rule reads. Deny the tool to keep it off.

@@ -1317,6 +1317,65 @@ describe("a restrict rule reads every spelling of a destination", () => {
     expect(fires("T(10.0.0.1)", to("10001"))).toBe(false);
   });
 
+  // The recipient-kind audit after critic10: WaitForPort dials `10.5` as
+  // 10.0.0.5, DeliverabilityCheck looks `münchen.de` up as
+  // `xn--mnchen-3ya.de`, and FederationDiscover reaches `1572395042` as
+  // 93.184.216.34, but a deny read each only as written.
+  test("a host deny meets the host in any form the tools that dial or look it up reach", () => {
+    const host = (raw: string): OperativeValue => ({ kind: "recipient", canonical: [raw] });
+    const forms: Record<string, string[]> = {
+      "10.0.0.5": [
+        "10.5",
+        "10.0.5",
+        "0xa.0.0.5",
+        "012.0.0.5",
+        "167772165",
+        "0x0a000005",
+        "10.0.0.05",
+        "10.0.0.0x5",
+      ],
+      "93.184.216.34": ["1572395042", "0x5db8d822", "93.184.55330", "0135.0270.0330.042"],
+      "xn--mnchen-3ya.de": [
+        "münchen.de",
+        "MÜNCHEN.DE",
+        "münchen.de",
+        "münchen.de.",
+        "mün­chen.de",
+        "ｍüｎｃｈｅｎ.de",
+      ],
+      "example.com": ["ｅｘａｍｐｌｅ.com", "ex­ample.com", "example。com", " EXAMPLE.com "],
+      "fd00::5": ["fd00:0:0:0:0:0:0:5", "FD00::0005", "[fd00::5]"],
+      "127.0.0.1": ["::ffff:127.0.0.1", "[::ffff:7f00:1]"],
+    };
+    for (const [place, spellings] of Object.entries(forms)) {
+      const missed = spellings.filter((s) => !fires(`T(${place})`, host(s)));
+      expect({ place, missed }).toEqual({ place, missed: [] });
+      // A rule that writes the host another way reads it as the tools do.
+      for (const written of spellings.slice(0, 2)) {
+        expect({ written, fires: fires(`T(${written})`, host(place)) }).toEqual({
+          written,
+          fires: true,
+        });
+      }
+      // An allow is not widened: it reads only what the call wrote.
+      expect(spellings.filter((s) => fires(`T(${place})`, host(s), allow))).toEqual([]);
+    }
+    expect(fires("T(*.xn--mnchen-3ya.de)", host("mail.münchen.de"))).toBe(true);
+    expect(fires("T(*.münchen.de)", host("mail.xn--mnchen-3ya.de"))).toBe(true);
+    // Another place is not this rule's.
+    for (const other of ["10.0.0.6", "10.6", "berlin.de", "fd00::6", "10.0.0.5.example"]) {
+      expect({ other, fires: fires("T(10.0.0.5)", host(other)) }).toEqual({ other, fires: false });
+    }
+    expect(fires("T(xn--mnchen-3ya.de)", host("muenchen.de"))).toBe(false);
+    // What is not a bare host keeps its reading: with a port, a path, or as
+    // the domain of an address.
+    expect(fires("T(10.0.0.5)", host("10.5:5432"))).toBe(false);
+    expect(fires("T(10.0.0.5)", host("10.5/x"))).toBe(false);
+    expect(fires("T(10.0.0.5)", host("ops@10.5"))).toBe(false);
+    // A wildcard glob meets the dotted quad a numeric form is.
+    expect(fires("T(10.0.0.*)", host("167772165"))).toBe(true);
+  });
+
   test("an id or a program name is compared ignoring case", () => {
     const id: OperativeValue = { kind: "id", canonical: ["CrewHaus/Factory"] };
     expect(fires("T(crewhaus/factory)", id)).toBe(true);
