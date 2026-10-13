@@ -20,10 +20,12 @@ import { dirname, join } from "node:path";
 import {
   type OperativeValue,
   compilePattern,
+  isE164Number,
   legacyMcpToolName,
   matchesPattern,
   matchesToolName,
   normalizePathLexically,
+  normalizePhoneNumber,
 } from "./index";
 
 // ---------------------------------------------------------------------------
@@ -1274,6 +1276,45 @@ describe("a restrict rule reads every spelling of a destination", () => {
     expect(fires("T(db.corp.example)", mail("DB.Corp.Example."))).toBe(true);
     // An allow compares only what was written.
     expect(fires("T(*@corp.example)", mail("ops@CORP.example"), allow)).toBe(false);
+  });
+
+  // critic10: SmsSend takes the separators out of a number wherever they are,
+  // before the `+` too, and then sends to what is left; the fold read a number
+  // only when its `+` came first, so `(+1)5550100000` dodged a deny on it.
+  test("a phone deny meets every spelling SmsSend reads as that number, and no other", () => {
+    const to = (raw: string): OperativeValue => ({ kind: "recipient", canonical: [raw] });
+    const number = "+15550100000";
+    const seps = [" ", "-", ".", "(", ")"];
+    const spellings = new Set<string>([number, "(+1)5550100000", "-+15550100000", ".+15550100000"]);
+    for (let p = 0; p <= number.length; p++) {
+      for (const sep of seps) spellings.add(number.slice(0, p) + sep + number.slice(p));
+      for (let q = p; q <= number.length; q++) {
+        spellings.add(`${number.slice(0, p)}(${number.slice(p, q)})${number.slice(q)}`);
+      }
+    }
+    spellings.add("(+1) 555-010-0000");
+    // Each is the number SmsSend sends to: the one implementation says so.
+    const read = [...spellings].filter((s) => normalizePhoneNumber(s) === number);
+    expect(read.length).toBe(spellings.size);
+    expect(read.every((s) => isE164Number(normalizePhoneNumber(s)))).toBe(true);
+    for (const rule of [`T(${number})`, "T(+1555*)", "T(+1 (555) 010-0000)", "T(+1 555*)"]) {
+      expect({ rule, missed: read.filter((s) => !fires(rule, to(s))) }).toEqual({
+        rule,
+        missed: [],
+      });
+    }
+    // Another number is not this rule's, however it is written.
+    expect(read.filter((s) => fires("T(+15550100001)", to(s)))).toEqual([]);
+    expect(fires("T(+1 (555) 010-0000)", to("+15550100001"))).toBe(false);
+    // Spellings SmsSend refuses keep the reading they had: a tab inside a
+    // number still folds as before, and a second `+` names no number.
+    expect(fires(`T(${number})`, to("+1\t5550100000"))).toBe(true);
+    expect(fires(`T(${number})`, to("+1+5550100000"))).toBe(false);
+    // An allow is not widened: it still reads only what was written.
+    expect(read.filter((s) => fires(`T(${number})`, to(s), allow))).toEqual([number]);
+    expect(fires("T(+1 (555) 010-0000)", to(number), allow)).toBe(false);
+    // A rule that only looks like a number once its dots go is read as written.
+    expect(fires("T(10.0.0.1)", to("10001"))).toBe(false);
   });
 
   test("an id or a program name is compared ignoring case", () => {

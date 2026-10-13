@@ -12,6 +12,12 @@
  * refuses everyone.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { preparePermissionSubject } from "@crewhaus/tool-executor";
+import {
+  compilePattern,
+  matchesPattern,
+  normalizePhoneNumber,
+} from "@crewhaus/tool-permission-matcher";
 import {
   __setPrivateHostsAllowedForTest,
   _resetIdempotencyLedger,
@@ -20,7 +26,12 @@ import {
   registerNotifyConfig,
   smsSend,
 } from "./index";
-import { NotifyPermissionError, buildNotifyConfig, normalizeSmsNumber } from "./net";
+import {
+  NotifyPermissionError,
+  buildNotifyConfig,
+  destinationRefusal,
+  normalizeSmsNumber,
+} from "./net";
 
 let wire: Array<Record<string, unknown>> = [];
 let http: ReturnType<typeof Bun.serve>;
@@ -180,4 +191,46 @@ describe("the destination lists are checked when the harness starts", () => {
     expect(buildNotifyConfig({ allowed_push_targets: [" t "] }).allowedPushTargets).toEqual(["t"]);
     expect(normalizeSmsNumber(" +1.555.000.1111 ")).toBe("+15550001111");
   });
+});
+
+// critic10 (0.7.1): the gate read a number only when its `+` came first,
+// while this tool takes the separators out wherever they are, so
+// `(+1)5550001111` was sent to a number a deny on `+15550001111` did not see.
+describe("a permission rule reads a number as SmsSend does", () => {
+  test("one implementation: the tool's normaliser is the permission matcher's", () => {
+    expect(normalizeSmsNumber).toBe(normalizePhoneNumber);
+  });
+
+  test("every spelling the tool would send meets a deny on its number, and no other number's", () => {
+    const listed = buildNotifyConfig({
+      allowed_sms_recipients: ["+1*", "+2*", "+3*", "+4*", "+5*", "+6*", "+7*", "+8*", "+9*"],
+    });
+    const seps = [" ", "-", ".", "(", ")"];
+    const spaces = [" ", "\t", "\n", "\u00a0", "\u3000", "\ufeff"];
+    const spellings = new Set<string>();
+    for (const number of ["+15550001111", "+442071234567", "+12"]) {
+      for (let p = 0; p <= number.length; p++) {
+        for (const sep of seps) spellings.add(number.slice(0, p) + sep + number.slice(p));
+        for (let q = p; q <= number.length; q++) {
+          spellings.add(`${number.slice(0, p)}(${number.slice(p, q)})${number.slice(q)}`);
+          spellings.add(`${number.slice(0, p)}.-${number.slice(p, q)} ${number.slice(q)}`);
+        }
+      }
+      for (const space of spaces) spellings.add(`${space}(${number.slice(0, 2)})${space}`);
+    }
+    const deny = (rule: string, to: string): boolean => {
+      const subject = preparePermissionSubject(smsSend, { provider: "gw", to, body: "x" });
+      if (!subject.ok) throw new Error(subject.reason);
+      return matchesPattern(compilePattern(rule), "SmsSend", subject.input, {
+        polarity: "restrict",
+        operativeValues: subject.operativeValues,
+      });
+    };
+    const sent = [...spellings].filter((to) => destinationRefusal(to, "sms", listed) === null);
+    // The sweep's own size, so a generator that stopped producing spellings fails.
+    expect(sent.length).toBe(579);
+    const missed = sent.filter((to) => !deny(`SmsSend(${normalizeSmsNumber(to)})`, to));
+    const other = sent.filter((to) => deny(`SmsSend(${normalizeSmsNumber(to)}9)`, to));
+    expect({ missed, other }).toEqual({ missed: [], other: [] });
+  }, 30_000);
 });

@@ -49,8 +49,11 @@ built it.
 - **Every spelling of a destination meets a deny.** A deny on
   `https://evil.example/**` missed `https://x@evil.example/`, a trailing dot,
   another port and an IPv4 address written as IPv6; a deny on an email
-  address missed another letter case or a `+tag`; a chain address missed
-  another hex case. A deny that names a host covers it over http and https
+  address missed another letter case or a `+tag`; a deny on a phone number
+  missed `(+1)5550100000` and the other spellings SmsSend sends to it; a
+  chain address missed another hex case. A number is read the way SmsSend
+  reads it, in the call and in the rule: `alwaysDeny SmsSend(+1 555*)` covers
+  `+15550100000`. A deny that names a host covers it over http and https
   and on any port, unless it names a port; one whose host is a wildcard
   (`http://**`) keeps to its scheme and port, as an allow does. A path deny
   written through a symlinked spelling of the workspace (`/tmp` for

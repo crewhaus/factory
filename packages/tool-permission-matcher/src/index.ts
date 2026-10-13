@@ -1,6 +1,9 @@
 import { CrewhausError } from "@crewhaus/errors";
+import { isE164Number, normalizePhoneNumber } from "./phone";
 import { type ShellChain, readShellChain, shellRestrictReading } from "./shell";
 import { withoutTrailingDots } from "./trim";
+
+export { isE164Number, normalizePhoneNumber } from "./phone";
 
 export class PatternParseError extends CrewhausError {
   override readonly name = "PatternParseError";
@@ -976,7 +979,9 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * its IPv4 address, and, for a rule that names a host, on any port and over
  * http and https (a rule that names a port or leaves the host a wildcard
  * keeps to the scheme and port it names); an address in lower case without
- * a `+tag`; an id or a program name in lower case. An allow rule reads only
+ * a `+tag`; a phone number as SmsSend reads it, separators taken out
+ * wherever they are, and the same of a number the rule writes with them; an
+ * id or a program name in lower case. An allow rule reads only
  * `canonical`, and never grants a URL that carries userinfo or an escaped
  * `..`.
  */
@@ -1317,7 +1322,9 @@ const PHONE_SHAPED = /^\+?[\d\s().-]+$/;
  * host or an email domain names the same place with a root dot or in
  * capitals, an address with a `+tag` reaches the mailbox without it at most
  * providers, and a phone number is the same number with or without spaces,
- * dashes and brackets.
+ * dashes, dots and brackets, wherever they are written: SmsSend's own reading
+ * ({@link normalizePhoneNumber}), so `(+1)5550001111` meets a deny on
+ * `+15550001111` as the message does.
  */
 function restrictRecipientSpellings(raw: string): string[] {
   const written = raw.normalize("NFC").toLowerCase().trim();
@@ -1339,7 +1346,28 @@ function restrictRecipientSpellings(raw: string): string[] {
   } else if (value.endsWith(".")) {
     out.push(withoutTrailingDots(value));
   }
+  const number = normalizePhoneNumber(raw);
+  if (isE164Number(number)) out.push(number);
   return out;
+}
+
+const phoneGlobs = new WeakMap<CompiledPattern, GlobMatcher | null>();
+
+/**
+ * A deny or ask glob that writes a phone number with separators
+ * (`SmsSend(+1 (555) 000-1111)`, `SmsSend(+44 20*)`), read as SmsSend reads
+ * a number: the separators taken out, as they are from its allow-list
+ * entries. `undefined` for any other glob, which the folds above already read.
+ */
+function phoneArgMatcher(compiled: CompiledPattern): GlobMatcher | undefined {
+  let matcher = phoneGlobs.get(compiled);
+  if (matcher === undefined) {
+    const glob = compiled.argGlob ?? "";
+    const number = normalizePhoneNumber(glob);
+    matcher = number !== glob && /^\+[0-9*?]+$/.test(number) ? compileGlob(number) : null;
+    phoneGlobs.set(compiled, matcher);
+  }
+  return matcher ?? undefined;
 }
 
 /**
@@ -1498,7 +1526,10 @@ function valueMatches(
   const folds = globFoldsToItself(compiled) ? restrictNewFoldsOf(value) : restrictFoldsOf(value);
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");
-  return folds.some((candidate) => folded.test(candidate));
+  if (folds.some((candidate) => folded.test(candidate))) return true;
+  // A number the rule writes with separators is the number SmsSend reads.
+  const phone = value.kind === "recipient" ? phoneArgMatcher(compiled) : undefined;
+  return phone !== undefined && (restrictFoldsOf(value) ?? []).some((c) => phone.test(c));
 }
 
 /** Whether an argument glob matches every command with no `/` in it, per glob. */

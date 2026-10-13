@@ -47,6 +47,7 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { isE164Number, normalizePhoneNumber } from "@crewhaus/tool-permission-matcher";
 import {
   REDACTED,
   type SecretValue,
@@ -259,22 +260,14 @@ const DESTINATION_KEYS: Readonly<Record<DestinationKind, string>> = {
   push: "allowed_push_targets",
 };
 
-/** An E.164 number: `+`, a non-zero digit, and at most fifteen digits in all. */
-const E164 = /^\+[1-9]\d{0,14}$/;
-
 /**
  * A phone number as the SMS allow-list compares it: the separators people
- * write (spaces, `-`, `.`, parentheses) removed, so `+1 (555) 000-1111` and
- * `+15550001111` are the same number.
+ * write (spaces, `-`, `.`, parentheses) removed wherever they are, so
+ * `+1 (555) 000-1111` and `+15550001111` are the same number. It is the
+ * permission matcher's own reading, so a deny rule decides on the number
+ * this tool checks and sends.
  */
-export function normalizeSmsNumber(raw: string): string {
-  let out = "";
-  for (const ch of raw.trim()) {
-    if (ch === " " || ch === "-" || ch === "." || ch === "(" || ch === ")") continue;
-    out += ch;
-  }
-  return out;
-}
+export const normalizeSmsNumber: (raw: string) => string = normalizePhoneNumber;
 
 /**
  * Check a destination allow-list at boot. A malformed entry throws, so a
@@ -293,7 +286,7 @@ function buildDestinations(raw: unknown, kind: DestinationKind): readonly string
     if (kind === "sms") {
       const normalized = normalizeSmsNumber(entry);
       const digits = normalized.endsWith("*") ? normalized.slice(0, -1) : normalized;
-      if (!E164.test(digits)) {
+      if (!isE164Number(digits)) {
         throw new NotifyPermissionError(
           `${where} must be a number in E.164 form (a + and up to fifteen digits, such as +15550001111), or a prefix of one ending in * (such as +44*); there is no allow-everything value`,
         );
@@ -327,7 +320,7 @@ export function destinationRefusal(
   const key = DESTINATION_KEYS[kind];
   const patterns = kind === "sms" ? cfg.allowedSmsRecipients : cfg.allowedPushTargets;
   const value = kind === "sms" ? normalizeSmsNumber(to) : to.trim();
-  const usable = kind === "push" || E164.test(value);
+  const usable = kind === "push" || isE164Number(value);
   if (
     usable &&
     patterns.some((p) => (p.endsWith("*") ? value.startsWith(p.slice(0, -1)) : value === p))

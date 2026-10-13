@@ -12,7 +12,7 @@
  * only a fallback for tools that declare nothing, so every builtin that
  * carries one of its names must declare `operativeArgs` itself.
  */
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -41,7 +41,13 @@ import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createNavigateTool } from "@crewhaus/tool-navigate";
-import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
+import {
+  __setPrivateHostsAllowedForTest,
+  _resetIdempotencyLedger,
+  _resetNotifyConfig,
+  registerNotifyConfig,
+} from "@crewhaus/tool-notify";
+import { OPERATIVE_ARG_FIELDS, normalizePhoneNumber } from "@crewhaus/tool-permission-matcher";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { formatApprovalDetail } from "./approvals-cli";
 
@@ -4635,4 +4641,110 @@ describe("critic11 — TempDir is read as the directory it makes, and with clear
     expect(await gate("TempDir", { name: "work", clear: true }, rs)).toBe("deny");
     expect(kept(".tmp", "work", "key.txt")).toBe(true);
   }, 30_000);
+});
+
+// critic10 (0.7.1): SmsSend takes spaces, `-`, `.` and brackets out of a
+// number wherever they are, then checks its list and sends. A deny read a
+// number that way only when its `+` came first, so `(+1)5550100000`,
+// `-+15550100000` and `.+15550100000` dodged `alwaysDeny SmsSend(+15550100000)`
+// and `SmsSend(+1555*)` while the message went to that number. The gate now
+// reads a recipient with the tool's own normaliser.
+describe("critic10 — a deny on a phone number meets every spelling SmsSend sends to", () => {
+  let wire: Array<Record<string, unknown>> = [];
+  let gateway: ReturnType<typeof Bun.serve>;
+  beforeAll(() => {
+    gateway = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (req) => {
+        wire.push((await req.json()) as Record<string, unknown>);
+        return Response.json({ sid: "SM1" }, { status: 201 });
+      },
+    });
+  });
+  afterAll(() => {
+    gateway.stop(true);
+  });
+  beforeEach(() => {
+    wire = [];
+    __setPrivateHostsAllowedForTest(true);
+    const origin = `http://127.0.0.1:${gateway.port}`;
+    registerNotifyConfig({
+      allowed_origins: [origin],
+      allowed_sms_recipients: ["+1555*"],
+      providers: { gw: { endpoint: `${origin}/sms`, fields: { to: "To", body: "Body" } } },
+    });
+  });
+  afterEach(() => {
+    __setPrivateHostsAllowedForTest(false);
+    _resetNotifyConfig();
+    _resetIdempotencyLedger();
+  });
+
+  const sms = (to: string) => ({
+    provider: "gw",
+    to,
+    body: "disk full",
+    justification: "page the on-call engineer",
+  });
+  const judged = { judgeAllows: true };
+  // The audit's four, and one written the way people write a number.
+  const dodges = [
+    "(+1)5550100000",
+    "-+15550100000",
+    ".+15550100000",
+    "(+1) 555-010-0000",
+    "+1 (555) 010-0000",
+  ];
+
+  test("a deny on the number, on a prefix of it, or written with separators fires on each spelling; nothing is sent", async () => {
+    for (const denied of ["+15550100000", "+1555*", "+1 (555) 010-0000", "+1 555*"]) {
+      const rs = rules(["alwaysDeny", `SmsSend(${denied})`], ["alwaysAllow", "SmsSend"]);
+      for (const to of dodges) {
+        for (const mode of ["default", "auto"] as const) {
+          const got = await gate("SmsSend", sms(to), rs, mode, judged);
+          expect({ denied, to, mode, got }).toEqual({ denied, to, mode, got: "deny" });
+        }
+      }
+    }
+    expect(wire).toEqual([]);
+  }, 120_000);
+
+  test("an ask on the number asks for each spelling; nothing is sent", async () => {
+    const rs = rules(["alwaysAsk", "SmsSend(+15550100000)"], ["alwaysAllow", "SmsSend"]);
+    for (const to of dodges) {
+      expect({ to, got: await gate("SmsSend", sms(to), rs, "default", judged) }).toEqual({
+        to,
+        got: "ask",
+      });
+    }
+    expect(wire).toEqual([]);
+  }, 60_000);
+
+  test("control: each spelling is sent to that number, another number is not denied, and an allow is not widened", async () => {
+    const deny = rules(["alwaysDeny", "SmsSend(+15550100000)"], ["alwaysAllow", "SmsSend"]);
+    expect(await gate("SmsSend", sms("(+1)5550100001"), deny, "default", judged)).toBe("allow");
+    expect(wire.map((w) => normalizePhoneNumber(String(w["To"])))).toEqual(["+15550100001"]);
+    wire = [];
+    for (const to of dodges) {
+      expect(
+        await gate("SmsSend", sms(to), rules(["alwaysAllow", "SmsSend"]), "default", judged),
+      ).toBe("allow");
+    }
+    expect(wire.map((w) => normalizePhoneNumber(String(w["To"])))).toEqual(
+      dodges.map(() => "+15550100000"),
+    );
+    // An allow reads what the call wrote, as before: it grants that spelling
+    // and asks for the others.
+    wire = [];
+    const exact = rules(["alwaysAllow", "SmsSend(+15550100000)"]);
+    for (const to of dodges) {
+      expect({ to, got: await gate("SmsSend", sms(to), exact, "default", judged) }).toEqual({
+        to,
+        got: "ask",
+      });
+    }
+    expect(await gate("SmsSend", sms("+15550100000"), exact, "default", judged)).toBe("allow");
+    expect(wire.length).toBe(1);
+  }, 60_000);
 });
