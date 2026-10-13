@@ -404,12 +404,12 @@ describe("runConversationalInterview — the ledger protects answers across comp
       "Use a semicolon (;) as the CSV delimiter, and always quote fields that contain one.";
     const SUMMARY_OMITTING_ANSWER =
       "Summary: the user wants a CSV exporter; implementation details were discussed.";
-    const filler = (seed: string): string => `${seed} ${"x".repeat(400)}`;
+    const filler = (seed: string): string => `${seed} ${"x".repeat(800)}`;
 
     const main = makeScriptedAdapter([
-      // Turn 1 — long opening; ask the delimiter question.
+      // Turn 1 — a short opening; ask the delimiter question.
       [
-        { type: "text", text: filler("REQ-001 pinned: a CSV exporter agent.") },
+        { type: "text", text: "REQ-001 pinned: a CSV exporter agent." },
         {
           type: "tool_use",
           id: "tu_ask_delim",
@@ -417,13 +417,17 @@ describe("runConversationalInterview — the ledger protects answers across comp
           input: { question: "Which delimiter should the export use?" },
         },
       ],
-      [{ type: "text", text: filler("(waiting for your answer)") }],
-      // Turn 2 — the ANSWER arrives; the tiny context limit trips
-      // snip+autocompact BEFORE this call, evicting the middle (and the
-      // answer) exactly like the motivating failure.
+      [{ type: "text", text: "(waiting for your answer)" }],
+      // Turn 2 — the ANSWER arrives, still under the limit; the long reply
+      // pushes the transcript over it.
       [{ type: "text", text: filler("REQ-002 confirmed: semicolon delimiter.") }],
-      // Turn 3 — history now holds only the (answer-omitting) summary; the
-      // ledger re-injects the answer, so the model emits without re-asking.
+      // Turn 3 — the tiny context limit trips snip+autocompact BEFORE this
+      // call, evicting the middle (and the answer) exactly like the
+      // motivating failure. (The pending message of the compacting turn is
+      // kept verbatim, so an answer is only ever lost on a LATER turn.)
+      // History now holds only the (answer-omitting) summary and the pending
+      // message; the ledger re-injects the answer, so the model emits
+      // without re-asking.
       [
         { type: "text", text: 'REQ-002 "semicolon delimiter" → agent.instructions' },
         { type: "tool_use", id: "tu_emit", name: "emit_spec", input: { yaml: VALID_YAML } },
@@ -437,7 +441,7 @@ describe("runConversationalInterview — the ledger protects answers across comp
 
     const input = new PassThrough();
     const pacer = paceStdin(input, [
-      `${filler("Build a CSV exporter agent.")}\n`,
+      "Build a CSV exporter agent.\n",
       `${ANSWER}\n`,
       "Nothing else — emit the spec now.\n",
     ]);
