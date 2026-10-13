@@ -20,7 +20,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { type AddressInfo, Socket, createServer } from "node:net";
+import { type AddressInfo, Socket, createServer, isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -46,7 +46,8 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
-import { unspecifiedDial } from "./lib/addr";
+import { ipv6Dial, portTarget, unspecifiedDial } from "./lib/addr";
+import { PORT_HOSTS_KEY } from "./lib/config";
 import { _setPlatform, searchPath } from "./lib/which";
 import { getProc } from "./registry";
 
@@ -1962,6 +1963,54 @@ describe("WaitForPort", () => {
       expect(unspecifiedDial("10.0.0.1")).toBeNull();
       expect(lookups).toEqual([]);
     }, 20_000);
+
+    // An IPv4 part with a leading zero is octal to this package's parser,
+    // decimal to macOS's resolver and invalid to the URL parser a permission
+    // rule reads a host with: `::ffff:0177.0.0.1` was classified as loopback,
+    // dialled as written, and reached 177.0.0.1.
+    test("an IPv6 address with no one reading is refused unprobed, listed or not", async () => {
+      const ambiguous = [
+        "::ffff:0177.0.0.1",
+        "::ffff:0177.200.1.1",
+        "::ffff:127.0.0.01",
+        "::ffff:127.000.000.001",
+        "::0:0:0:0:0:0:0:1",
+      ];
+      for (const listed of [[], ambiguous]) {
+        registerProcConfig({ wait_for_port_hosts: listed });
+        for (const host of ambiguous) {
+          const out = String(await call(waitForPort, { host, port, timeoutMs: 1_000 }));
+          expect({ listed: listed.length, host, refused: out.includes("resolvers read") }).toEqual({
+            listed: listed.length,
+            host,
+            refused: true,
+          });
+          // A refusal is a sentence: no probe ran, so no `attempts`.
+          expect(out).not.toContain('"attempts"');
+        }
+      }
+      expect(lookups).toEqual([]);
+    }, 20_000);
+
+    test("an IPv6 address is dialled in the form a permission rule reads it, an address the system dials as is", () => {
+      const reads: Array<[string, string]> = [
+        ["0:0:0:0:0:ffff:127.0.0.1", "::ffff:7f00:1"],
+        ["::FFFF:127.0.0.1", "::ffff:7f00:1"],
+        ["0000:0000:0000:0000:0000:ffff:7f00:0001", "::ffff:7f00:1"],
+        ["0::1", "::1"],
+        ["::0.0.0.1", "::1"],
+        ["::ffff:0.0.0.0", "127.0.0.1"],
+        ["0::0", "::1"],
+        ["FD00:0:0:0:0:0:0:0005", "fd00::5"],
+      ];
+      for (const [host, dial] of reads) {
+        const target = portTarget(host, ["fd00::5"], PORT_HOSTS_KEY);
+        expect({ host, target }).toEqual({ host, target: { ok: true, dial } });
+        expect({ host, isIP: isIP(dial) }).toEqual({ host, isIP: dial.includes(":") ? 6 : 4 });
+        // The unspecified address is dialled as loopback; any other is itself.
+        if (unspecifiedDial(host) === null) expect(ipv6Dial(host)).toBe(dial);
+      }
+    });
 
     // Each wait's deadline passes once the work it is about has been
     // counted: the lookup, then the probe. A real 100 ms and 50 ms deadline

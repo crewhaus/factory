@@ -4851,6 +4851,51 @@ describe("recipient audit — a host deny meets the host in the form the tool re
     }
   }, 60_000);
 
+  // An IPv4 part with a leading zero is octal to WaitForPort's own parser,
+  // decimal to macOS's resolver and invalid to the URL parser a rule reads a
+  // host with, so no rule could be written on the place it reached:
+  // `::ffff:127.0.0.01` reached 127.0.0.1 past a deny on it, and
+  // `::ffff:0177.0.0.1` passed as loopback and reached 177.0.0.1.
+  test("WaitForPort: an IPv6 address with no one reading is refused by the tool, under a deny or a bare allow; nothing is probed", async () => {
+    let connections = 0;
+    const listener = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open() {
+          connections++;
+        },
+        data() {},
+      },
+    });
+    try {
+      const probe = (host: string) => ({ host, port: listener.port, timeoutMs: 5_000 });
+      const ruleSets = [
+        rules(["alwaysDeny", "WaitForPort(127.0.0.1)"], ["alwaysAllow", "WaitForPort"]),
+        rules(["alwaysAllow", "WaitForPort"]),
+      ];
+      const outcomes: string[] = [];
+      for (const rs of ruleSets) {
+        for (const host of ["::ffff:127.0.0.01", "::ffff:127.000.000.001", "::ffff:0177.0.0.1"]) {
+          const got = await gate("WaitForPort", probe(host), rs, "auto");
+          const refused = (lastResult ?? "").includes("written in a form resolvers read");
+          outcomes.push(got === "deny" ? "deny" : refused ? "refused" : "ran");
+        }
+      }
+      expect(outcomes).toEqual(Array(6).fill("refused"));
+      expect(connections).toBe(0);
+      // Control: the same address written the standard way is probed, and a
+      // deny on 127.0.0.1 meets it.
+      expect(await gate("WaitForPort", probe("::ffff:127.0.0.1"), ruleSets[0], "auto")).toBe(
+        "deny",
+      );
+      expect(await gate("WaitForPort", probe("127.0.0.1"), ruleSets[1], "auto")).toBe("allow");
+      expect(JSON.parse(lastResult ?? "{}")).toMatchObject({ satisfied: true, state: "open" });
+    } finally {
+      listener.stop(true);
+    }
+  }, 60_000);
+
   test("DeliverabilityCheck: a deny on the domain stops its Unicode spellings, written either way; nothing is looked up", async () => {
     const asked: string[] = [];
     _setDnsTxtResolver(async (name) => {

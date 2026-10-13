@@ -14,6 +14,7 @@
  * audited here.
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { isIP } from "node:net";
 import { join } from "node:path";
 import {
   type PermissionRule,
@@ -22,7 +23,11 @@ import {
   evaluateWithReason,
 } from "@crewhaus/permission-engine";
 import type { OperativeValue } from "@crewhaus/tool-permission-matcher";
-import { ipv4Address, normalizePhoneNumber } from "@crewhaus/tool-permission-matcher";
+import {
+  hostSpellings,
+  ipv4Address,
+  normalizePhoneNumber,
+} from "@crewhaus/tool-permission-matcher";
 import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 
@@ -49,7 +54,7 @@ let portTarget: (
   host: string,
   allowed: ReadonlyArray<string>,
   key: string,
-) => { ok: boolean; dial?: string; resolve?: string };
+) => { ok: boolean; dial?: string; resolve?: string; message?: string };
 let normalizeDomain: (raw: string) => { ok: boolean; name?: string };
 let isValidAddress: (raw: string) => boolean;
 const tools = new Map<string, Tool>();
@@ -177,6 +182,17 @@ const UNSPECIFIED = [
   "0::0",
   "0:0:0:0:0:0:0:0",
 ];
+/**
+ * IPv6 spellings WaitForPort refuses: an IPv4 part with a leading zero is
+ * octal to its parser and decimal to macOS's resolver, and the URL parser a
+ * rule reads a host with refuses it.
+ */
+const NO_ONE_READING = [
+  "::ffff:127.0.0.01",
+  "::ffff:127.000.000.001",
+  "::ffff:0177.0.0.1",
+  "::0:0:0:0:0:0:0:1",
+];
 const chat = (channel: string) => ({
   platform: "slack",
   apiBaseUrl: "https://slack.com/api",
@@ -259,12 +275,15 @@ const AUDITED: Readonly<Record<string, Audit>> = {
       "10.0.0.08",
       "fd00::5",
       "FD00::5",
+      "fd00:0:0:0:0:0:0:0005",
       "db.internal",
       "DB.Internal",
       "localhost",
       ...V6_LOOPBACK,
       // dialled as 127.0.0.1 or ::1 by the tool itself
       ...UNSPECIFIED,
+      // refused by the tool: no one reading
+      ...NO_ONE_READING,
     ],
   },
   federationDiscover: {
@@ -390,4 +409,69 @@ describe("the gate reads an IPv4 address as WaitForPort does", () => {
     const disagree = [...inputs].filter((s) => (ipv4Address(s) ?? null) !== normalizeIpv4(s));
     expect({ checked: inputs.size, disagree }).toEqual({ checked: 4682, disagree: [] });
   }, 30_000);
+});
+
+describe("WaitForPort dials what the gate reads", () => {
+  // An IPv4 part with a leading zero is octal to WaitForPort's parser,
+  // decimal to macOS's resolver and invalid to the URL parser the gate reads
+  // a host with. `::ffff:0177.0.0.1` was classified as loopback and dialled
+  // as written, and macOS reached 177.0.0.1; `::ffff:127.0.0.01` reached
+  // 127.0.0.1 there past a deny on it.
+  test("each address it dials is one the system dials as is and the gate reads the host as; a spelling with no one reading is refused", () => {
+    // An embedded IPv4 part in decimal, with leading zeros, and in octal digits.
+    const parts = (n: number) => [String(n), `0${n}`, `00${n}`, `0${n.toString(8)}`];
+    const spellings = new Set<string>([
+      ...V6_LOOPBACK,
+      ...UNSPECIFIED,
+      ...NO_ONE_READING,
+      "localhost",
+      "127.1",
+      "fd00::5",
+      "db.internal",
+    ]);
+    for (const [a, d] of [
+      [127, 1],
+      [0, 0],
+      [10, 5],
+      [177, 1],
+    ] as const) {
+      for (const pa of parts(a)) {
+        for (const pd of parts(d)) {
+          for (const prefix of ["::ffff:", "::", "0:0:0:0:0:ffff:", "64:ff9b::"]) {
+            spellings.add(`${prefix}${pa}.0.0.${pd}`);
+          }
+        }
+      }
+    }
+    const outcome = { dialled: 0, looked_up: 0, no_one_reading: 0, not_listed: 0 };
+    const wrong: string[] = [];
+    for (const s of spellings) {
+      const target = portTarget(s, LISTED_PORT_HOSTS, "tool_config.proc.wait_for_port_hosts");
+      // An IPv6 spelling whose IPv4 part has a part with a leading zero.
+      const quad = s.includes(":") ? /(\d+(?:\.\d+){3})$/.exec(s)?.[1] : undefined;
+      const leadingZero =
+        NO_ONE_READING.includes(s) || (quad?.split(".").some((p) => /^0\d/.test(p)) ?? false);
+      if (!target.ok) {
+        const why = (target.message ?? "").includes("resolvers read")
+          ? "no_one_reading"
+          : "not_listed";
+        outcome[why]++;
+        if (leadingZero !== (why === "no_one_reading")) wrong.push(`${s} refused: ${why}`);
+        continue;
+      }
+      if (leadingZero) wrong.push(`${s} accepted`);
+      if (target.resolve !== undefined) {
+        outcome.looked_up++;
+        continue;
+      }
+      outcome.dialled++;
+      const dial = target.dial as string;
+      // The system dials the string as is (no resolver reads it again), and
+      // it is one of the spellings a deny or ask rule reads the host as.
+      if (dial !== "localhost" && isIP(dial) === 0) wrong.push(`${s} dials ${dial}`);
+      if (!hostSpellings(s).includes(dial)) wrong.push(`${s}: the gate does not read ${dial}`);
+    }
+    expect({ wrong }).toEqual({ wrong: [] });
+    expect(outcome).toEqual({ dialled: 23, looked_up: 1, no_one_reading: 154, not_listed: 9 });
+  });
 });

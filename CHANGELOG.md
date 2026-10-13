@@ -371,7 +371,9 @@ built it.
   numbers and targets you list, and send them as the list compared them: a
   number in E.164 form (`+15550100000`, not `+1 (555) 010-0000`), a target
   without surrounding spaces. WaitForPort probes this machine unless you
-  list the host. WebFetch never looks up a host outside `allowed_domains`.
+  list the host, and refuses an IPv6 address that resolvers read differently:
+  `::ffff:0177.0.0.1` passed as this machine, and macOS dialled 177.0.0.1.
+  WebFetch never looks up a host outside `allowed_domains`.
   Token and multicall batches go only to the canonical Multicall3, or the one
   in `tool_config`.
 - **A redirect cannot move DependencyAudit or a chain read.** Both refuse

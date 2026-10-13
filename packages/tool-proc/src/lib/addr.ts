@@ -258,6 +258,33 @@ export function unspecifiedDial(address: string): string | null {
   return mapped && groups[6] === 0 && groups[7] === 0 ? "127.0.0.1" : null;
 }
 
+/**
+ * An IPv6 literal in the form WaitForPort dials it, or `null` when it is not
+ * one or may not be dialled.
+ *
+ * The form is the URL parser's (`0:0:0:0:0:ffff:127.0.0.1` is
+ * `::ffff:7f00:1`), which is how a permission rule reads a host too, so the
+ * probe goes to the address classified here and decided on there, and no
+ * resolver reads the string again. A spelling the URL parser does not read
+ * as the address {@link parseIpv6} does has no one reading, and is not
+ * dialled: an IPv4 part with a leading zero is octal to parseIpv6, decimal
+ * to macOS's resolver and invalid to the URL parser, so `::ffff:0177.0.0.1`
+ * was classified as loopback and reached 177.0.0.1.
+ */
+export function ipv6Dial(address: string): string | null {
+  const groups = parseIpv6(address);
+  if (groups === null) return null;
+  const inner = address.trim().replace(/^\[(.*)\]$/, "$1");
+  let host: string;
+  try {
+    host = new URL(`http://[${inner}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+  const read = parseIpv6(host);
+  return read?.every((g, i) => g === groups[i]) ? host : null;
+}
+
 export type PortTarget =
   | { readonly ok: true; readonly dial: string }
   /** A listed name, resolved at probe time by {@link resolveListedHost}. */
@@ -270,13 +297,16 @@ export type PortTarget =
  *
  * - `localhost`, and any IP literal that is loopback in any spelling, is
  *   allowed with no configuration (a literal is dialled in its canonical
- *   form, so `0x7f.1` dials 127.0.0.1). So is the unspecified address
- *   (0.0.0.0, ::), dialled as 127.0.0.1 / ::1.
+ *   form, so `0x7f.1` dials 127.0.0.1, and an IPv6 one in the URL parser's,
+ *   see {@link ipv6Dial}). So is the unspecified address (0.0.0.0, ::),
+ *   dialled as 127.0.0.1 / ::1.
+ * - An IPv6 literal with no one reading (`::ffff:0177.0.0.1`) is refused,
+ *   listed or not.
  * - Any other host must be listed in `allowed` (the operator's
  *   `tool_config.proc.wait_for_port_hosts`), and is refused BEFORE any DNS
  *   query, so an unlisted name is not a way to send one either.
- * - A listed literal is dialled as written; a listed NAME is resolved at probe
- *   time (`resolveListedHost`).
+ * - A listed literal is dialled in that canonical form; a listed NAME is
+ *   resolved at probe time (`resolveListedHost`).
  */
 export function portTarget(
   host: string,
@@ -285,9 +315,18 @@ export function portTarget(
 ): PortTarget {
   const lower = host.toLowerCase();
   if (lower === "localhost" || lower === "localhost.") return { ok: true, dial: "localhost" };
-  const literal = canonicalIp(host);
-  if (literal !== null && isLoopbackIp(host)) return { ok: true, dial: literal };
-  const unspecified = unspecifiedDial(host);
+  let literal = normalizeIpv4(host);
+  if (literal === null && parseIpv6(host) !== null) {
+    literal = ipv6Dial(host);
+    if (literal === null) {
+      return {
+        ok: false,
+        message: `[WaitForPort error] "${host}" is an IPv6 address written in a form resolvers read as different addresses. Write it the standard way, such as ::1 or ::ffff:127.0.0.1.`,
+      };
+    }
+  }
+  if (literal !== null && isLoopbackIp(literal)) return { ok: true, dial: literal };
+  const unspecified = literal === null ? null : unspecifiedDial(literal);
   if (unspecified !== null) return { ok: true, dial: unspecified };
   const listed = allowed.includes(lower) || (literal !== null && allowed.includes(literal));
   if (!listed) {
