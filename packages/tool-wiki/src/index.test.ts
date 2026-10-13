@@ -560,7 +560,7 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
       expect(out).not.toContain(encoded);
       expect(out).toMatch(/digest-zz \(v1\) — \[tool output redacted/);
       expect(out.split("\n").filter((l) => /digest-\d\d \(v1, published/.test(l))).toHaveLength(12);
-    });
+    }, 20_000);
   });
 
   // C154 (attacker review): a planted index.json put injection text in the

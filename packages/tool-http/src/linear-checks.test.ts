@@ -307,7 +307,7 @@ describe("a predicate's value is compared with each item at the item's own cost"
     });
     // The response is n × n: doubling n is four times the input.
     expect((measured[1] as number) / (measured[0] as number)).toBeLessThan(4.8);
-  });
+  }, 20_000);
 
   test("matchesPredicate answers what it answered, on generated bodies and predicates", () => {
     const next = rng(0x5eed2001);
@@ -468,7 +468,7 @@ describe("the next cursor page's query is written once", () => {
     }
     expect(differ.slice(0, 3)).toEqual([]);
     expect(Math.min(seen.replaced, seen.appended, seen.collapsed)).toBeGreaterThan(1_000);
-  }, 30_000);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

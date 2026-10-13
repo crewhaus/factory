@@ -20,8 +20,8 @@
  * (__test__/scan-work.ts), so a scan that rereads the run fails the same
  * way.
  *
- * A test that walks many generated inputs declares a 20 s budget, as the
- * house does for a test that is slow by construction.
+ * A test that walks many generated inputs declares a budget, as the house
+ * does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { regexWork } from "../../tool-text/src/__test__/regex-work";
@@ -106,7 +106,7 @@ describe("each scan finds the global search's matches", () => {
     const r = disagreements(inputs, ipv6Candidates, OLD_IPV6);
     expect(r.differ).toEqual([]);
     expect(r.matches).toBeGreaterThan(50_000);
-  }, 20_000);
+  }, 60_000);
 
   test("HTML comments, up to and past 4,000 characters", () => {
     const pieces = ["<!--", "-->", "-", ">", "<", "!", "x", "\n"];
@@ -125,7 +125,7 @@ describe("each scan finds the global search's matches", () => {
     const r = disagreements(inputs, (s) => hits(htmlCommentMatches(s)), OLD_HTML_COMMENT);
     expect(r.differ).toEqual([]);
     expect(r.matches).toBeGreaterThan(3_000);
-  }, 20_000);
+  }, 30_000);
 
   test("markdown links, up to and past 200 and 500 characters", () => {
     const pieces = ["[", "]", "(", ")", "a", " ", "\n", "]("];
@@ -172,7 +172,7 @@ describe("each scan finds the global search's matches", () => {
     const r = disagreements(inputs, scan, OLD_PIPE_TO_SHELL);
     expect(r.differ).toEqual([]);
     expect(r.matches).toBeGreaterThan(500);
-  }, 20_000);
+  }, 30_000);
 });
 
 describe("a hostile stretch is read once", () => {

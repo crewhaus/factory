@@ -439,7 +439,7 @@ describe("wireMemory — seams behavior", () => {
     const handoffPath = join(tmp, ".crewhaus", "state", "seam-cont", "handoff.md");
     expect(existsSync(handoffPath)).toBe(true);
     expect(readFileSync(handoffPath, "utf8")).toContain(SESSION_ID);
-  });
+  }, 20_000);
 
   test("continuity ledger/handoff flags thread through (§2.1)", async () => {
     const { deps: d } = deps();

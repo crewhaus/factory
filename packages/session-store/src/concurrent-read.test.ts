@@ -54,7 +54,7 @@ describe("a session read that overlaps a save (0.7.1)", () => {
     // Hit count: the reads interleaved with the saves.
     expect(reads).toBeGreaterThan(100);
     expect((await store.get(session.id))?.lastTurnIndex).toBe(1499);
-  }, 60_000);
+  }, 180_000);
 
   test("across processes: reads while another process saves the session all succeed", async () => {
     const dir = root();

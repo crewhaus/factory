@@ -8,7 +8,7 @@
  * the next one after it are each one `indexOf`.
  *
  * A test that walks many generated inputs, or every code unit, declares a
- * 20 s budget, as the house does for a test that is slow by construction.
+ * budget, as the house does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
@@ -86,7 +86,7 @@ test("fencedBody finds what the pattern captured", () => {
     );
   }
   expect(answers(inputs, fencedBody)).toEqual(answers(inputs, (s) => FENCE_RE.exec(s)?.[1]));
-}, 20_000);
+}, 30_000);
 
 describe("no pattern rescans a run in a grounding reply", () => {
   const run = " ".repeat(100_000);

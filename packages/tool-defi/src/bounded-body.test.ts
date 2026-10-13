@@ -49,14 +49,14 @@ const gz =
 const corrupt = gz(new Uint8Array([0x1f, 0x8b, 8, 0, 9, 9, 9, 9, 9, 9, 9, 9]));
 
 describe("DeFi replies are bounded", () => {
-  // Slow by construction (inflating a bomb up to the cap; 3.3 s on CI's loaded runner).
+  // Slow by construction (inflating a bomb up to the cap; 5.0 s on CI's loaded runner).
   test("a gzip bomb price reply is refused at the cap, and the body was asked for raw", async () => {
     answer = gz(bomb);
     const out = await getJson("https://prices.example.test/v1/eth");
     expect(out).toMatchObject({ ok: false, kind: "malformed" });
     expect(!out.ok && out.message).toContain("sent more than 16777216 bytes");
     expect(inits[0]?.["decompress"]).toBe(false);
-  }, 20_000);
+  }, 30_000);
 
   // Slow by construction too (it inflates up to the RPC cap): usually under a
   // second on CI, but a loaded runner took it past bun's 5 s default.

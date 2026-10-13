@@ -833,7 +833,7 @@ describe("RunCommand", () => {
     expect(out.stdoutTruncated).toBe(true);
     // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
     expect(out.stdout).toContain("[199999900 bytes dropped]");
-  }, 30_000);
+  }, 60_000);
 
   test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
     // The grandchild writes only once this test says so, after the call

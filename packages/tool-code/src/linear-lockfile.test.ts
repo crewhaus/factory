@@ -7,7 +7,7 @@
  * workspace's, so the read is two scans.
  *
  * A test that walks many generated inputs, or every code unit, declares a
- * 20 s budget, as the house does for a test that is slow by construction.
+ * budget, as the house does for a test that is slow by construction.
  */
 import { describe, expect, test } from "bun:test";
 import { parsePnpmLockDetailed, pnpmField } from "./lib/deps";
@@ -95,7 +95,7 @@ describe("a pnpm package field", () => {
         return m === null ? null : { key: m[1], value: m[2] };
       }),
     );
-  }, 20_000);
+  }, 30_000);
 
   test("no pattern rescans a run of spaces inside a version", () => {
     const spaces = " ".repeat(100_000);

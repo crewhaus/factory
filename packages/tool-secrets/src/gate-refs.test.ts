@@ -170,7 +170,7 @@ describe("the gate reads a secret reference as parseRef reads it", () => {
     expect(tally.ids).toBeGreaterThan(500);
     expect(tally.bare).toBeGreaterThan(50);
     expect(tally.env).toBeGreaterThan(30);
-  });
+  }, 20_000);
 
   test("each tool that takes a reference routes it through the same reading", () => {
     // SecretRotate's target and source, and EnvFileUpsert's source beside

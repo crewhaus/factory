@@ -1795,7 +1795,8 @@ describe("timeoutMs is one deadline for the whole call, and a call's requests ar
     expect(before.priced).toEqual(["ETH"]);
     expect(after.priced).toEqual(["ETH"]);
     expect(before.notes).toContain("had a price route that was not asked");
-  });
+    // Slow by construction: four valuations, each up to the call's request budget (1.1 s on CI).
+  }, 20_000);
 
   test("a round the budget cannot give to every holding is not given to the first few", async () => {
     // ZZZ is priced by its third request (ZZZ-USD, with USD-EUR already

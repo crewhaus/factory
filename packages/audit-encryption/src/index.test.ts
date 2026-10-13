@@ -81,7 +81,8 @@ describe("Per-tenant isolation", () => {
     // Different DEK means different wrapped DEK + different ciphertext.
     expect(a.wrappedDek).not.toBe(b.wrappedDek);
     expect(a.encryptedPayload).not.toBe(b.encryptedPayload);
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("missing tenantId throws AuditEncryptionError", async () => {
     const enc = await buildEncryption();
@@ -103,7 +104,8 @@ describe("T8 — tampered ciphertext detection", () => {
       })(),
     };
     await expect(enc.decryptPayload(tampered)).rejects.toThrow();
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("flipping the auth tag causes decrypt to throw", async () => {
     const enc = await buildEncryption();
@@ -117,7 +119,8 @@ describe("T8 — tampered ciphertext detection", () => {
       })(),
     };
     await expect(enc.decryptPayload(tampered)).rejects.toThrow();
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("flipping the IV causes decrypt to throw", async () => {
     const enc = await buildEncryption();
@@ -131,7 +134,8 @@ describe("T8 — tampered ciphertext detection", () => {
       })(),
     };
     await expect(enc.decryptPayload(tampered)).rejects.toThrow();
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("flipping the wrapped DEK causes decrypt to throw", async () => {
     const enc = await buildEncryption();
@@ -145,7 +149,8 @@ describe("T8 — tampered ciphertext detection", () => {
       })(),
     };
     await expect(enc.decryptPayload(tampered)).rejects.toThrow();
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 });
 
 describe("KEK rotation", () => {
@@ -195,7 +200,8 @@ describe("#163 — salted, stretched KEK derivation (CWE-916)", () => {
     await expect(enc.decryptPayload(wrongSalt)).rejects.toThrow();
     // With the genuine salt, the record round-trips.
     expect(await enc.decryptPayload(record)).toEqual({ x: 1 });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("salt + wrapped DEK are shared by records on one DEK version", async () => {
     const enc = await buildEncryption();
@@ -389,7 +395,8 @@ describe("#164 — DEK versioning + rotation re-keys (CWE-323)", () => {
     const after = await enc.encryptPayload({ era: "v2" }, "tenant-a");
     expect(after.kekRef).toBe("kek:KEK_TEST:v2");
     expect(await enc.decryptPayload(after)).toEqual({ era: "v2" });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("rotateKek mints a fresh DEK version per tenant", async () => {
     const store = new InMemoryDekStore();
@@ -412,7 +419,8 @@ describe("#164 — DEK versioning + rotation re-keys (CWE-323)", () => {
     // The new DEK is genuinely different material (different wrapped DEK
     // even accounting for the fresh salt).
     expect(v2a.wrappedDek).not.toBe(v1a.wrappedDek);
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("DEK rolls to a new version once the per-DEK record threshold is hit", async () => {
     const store = new InMemoryDekStore();
@@ -665,7 +673,8 @@ describe("FileDekStore get/set (non-versioned DekStore surface)", () => {
     const entry = await store.getEntry?.("tenant-a");
     expect(entry?.version).toBe(1);
     expect(entry?.uses).toBe(0);
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("set preserves the existing version on overwrite (prev.version branch)", async () => {
     const dir = freshDir();
@@ -680,7 +689,8 @@ describe("FileDekStore get/set (non-versioned DekStore surface)", () => {
     expect(entry?.version).toBe(3);
     expect(entry?.uses).toBe(0);
     expect(Buffer.from(entry?.dek as Buffer).equals(replacement)).toBe(true);
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 });
 
 describe("get/set-only DekStore (engine fallback to non-versioned surface)", () => {
@@ -738,7 +748,8 @@ describe("get/set-only DekStore (engine fallback to non-versioned surface)", () 
     const after = await enc.encryptPayload({ era: "v2" }, "tenant-a");
     expect(after.kekRef).toBe("kek:KEK_TEST:v2");
     expect(await enc.decryptPayload(after)).toEqual({ era: "v2" });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 });
 
 describe("auto-subscribed rotation via secrets.onRotation", () => {
@@ -765,7 +776,8 @@ describe("auto-subscribed rotation via secrets.onRotation", () => {
     const after = await enc.encryptPayload({ era: "v2" }, "tenant-a");
     expect(after.kekRef).toBe(enc.kekRef);
     expect(await enc.decryptPayload(after)).toEqual({ era: "v2" });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("a failing event-driven rotation does not surface an unhandled rejection", async () => {
     // Regression: the onRotation handler used to fire-and-forget the re-key

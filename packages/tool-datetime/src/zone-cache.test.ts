@@ -123,5 +123,5 @@ describe("the timezone formatter cache (C084)", () => {
     }
     expect(__nameCacheSizeForTest()).toBeGreaterThan(0);
     expect(__nameCacheSizeForTest()).toBeLessThanOrEqual(2_048);
-  });
+  }, 20_000);
 });

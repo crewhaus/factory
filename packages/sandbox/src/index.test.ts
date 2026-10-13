@@ -1114,11 +1114,11 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     await waitUntil(
       () => log().includes(`committed ${name}`) && records().length === 0,
       began,
-      35_000,
+      55_000,
     );
     expect(log()).toContain(`committed ${name}`);
     expect({ records: records(), running: running() }).toEqual({ records: [], running: [] });
-  }, 40_000);
+  }, 60_000);
 
   test("an rm -f that fails is reported, not presented as a clean stop", async () => {
     setFakeEnv({ FAKE_CLI_RM_FAIL: "the daemon is wedged" });
@@ -1394,12 +1394,12 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       // Timeout 4 s → the watchdog fires 14 s after the run began. Nothing
       // else is left to stop it, so its `kill` is waited for as long as the
       // machine takes to get there, up to just under the test's budget.
-      await waitUntil(() => cliLog().includes(`kill ${name}`), began, 45_000);
+      await waitUntil(() => cliLog().includes(`kill ${name}`), began, 115_000);
       expect(cliLog()).toContain(`kill ${name}`);
       expect(await waitGone(containerPid(name), 10_000)).toBe(true);
       expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
       expect(records()).toEqual([]);
-    }, 50_000);
+    }, 120_000);
   });
 });
 

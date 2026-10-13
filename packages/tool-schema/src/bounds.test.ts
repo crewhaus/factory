@@ -168,7 +168,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
   });
 
   // Slow by construction (each 16-level union spends about 410,000 of its
-  // 500,000 evaluations; 0.4 s here, 10.4 s on CI's loaded runner).
+  // 500,000 evaluations; 0.4 s here, up to 27.1 s on CI's loaded runner).
   test("anyOf and oneOf failures carry a bounded message", async () => {
     for (const kw of ["anyOf", "oneOf"] as const) {
       const out = await jsonSchemaValidate.execute(
@@ -181,20 +181,22 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
       expect(parsed.valid).toBe(false);
       for (const error of parsed.errors) expect(error.message.length).toBeLessThanOrEqual(1_000);
     }
-  }, 60_000);
+  }, 180_000);
 
   test("an ordinary anyOf failure still names each alternative", () => {
     const result = validateValue(true, { anyOf: [{ type: "string" }, { type: "number" }] });
     expect(result.errors[0]?.message).toMatch(/\[0\] expected string.*\[1\] expected number/);
   });
 
+  // Slow by construction (it spends the default evaluation budget; 12.8 s on CI's loaded runner).
   test("JsonSchemaValidate reports the bomb as undetermined, with valid null", async () => {
     const out = await call(jsonSchemaValidate, { value: "x", schema: chain(22, "allOf") });
     expect(out.valid).toBeNull();
     expect(out.undetermined).toBe(true);
     expect(out.reason).toMatch(new RegExp(`more than ${DEFAULT_MAX_WORK} subschema`));
-  }, 30_000);
+  }, 120_000);
 
+  // Slow by construction (it spends the call's whole budget; 7.7 s on CI's loaded runner).
   test("ValidateRecords counts rows it could not decide as neither passed nor failed", async () => {
     const out = await call(validateRecords as typeof jsonSchemaValidate, {
       records: ["x", "y"],
@@ -202,9 +204,9 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     });
     expect(out).toMatchObject({ ok: false, total: 2, passed: 0, failed: 0, undetermined: 2 });
     expect(out.undeterminedFrom.row).toBe(0);
-  }, 30_000);
+  }, 60_000);
 
-  // Slow by construction (it spends the call's whole evaluation budget; 2.6 s on CI's loaded runner).
+  // Slow by construction (it spends the call's whole evaluation budget; 5.9 s on CI's loaded runner).
   test("the rows of one call share one budget", () => {
     const report = validateRecordsFn(Array(1_000).fill("x"), chain(12, "allOf"));
     // 2^12 evaluations a row: the first rows pass, then the budget is spent.
@@ -212,8 +214,9 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(report.undetermined).toBeGreaterThan(0);
     expect(report.passed + report.undetermined).toBe(1_000);
     expect(report.ok).toBe(false);
-  }, 20_000);
+  }, 30_000);
 
+  // Slow by construction (about 620,000 evaluations; 10.9 s on CI's loaded runner).
   test("a large value gets a budget in proportion to its size", () => {
     const branches = Array.from({ length: 30 }, (_, k) => ({ const: k }));
     const schema: Schema = { type: "array", items: { anyOf: branches } };
@@ -223,7 +226,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(result.undetermined).toBeNull();
     expect(result.valid).toBe(true);
     expect(20_000 * 31).toBeGreaterThan(DEFAULT_MAX_WORK);
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("the default budget answers honest wide and nested unions", () => {
@@ -269,7 +272,7 @@ describe("the default budget answers honest wide and nested unions", () => {
   const nested = JSON.parse(JSON.stringify(message)) as Schema;
 
   // Slow by construction (every block of 1,000 rows is tried against ten block
-  // and ten source kinds, twice; 0.9 s here, 12.3 s on CI's loaded runner).
+  // and ten source kinds, twice; 0.9 s here, up to 26.8 s on CI's loaded runner).
   test("a 10 x 10 nested oneOf over 1,000 valid rows", async () => {
     const records = await call(validateRecords as typeof jsonSchemaValidate, {
       records: rows,
@@ -283,8 +286,9 @@ describe("the default budget answers honest wide and nested unions", () => {
       schema: { type: "array", items: nested },
     });
     expect(whole).toMatchObject({ valid: true });
-  }, 60_000);
+  }, 180_000);
 
+  // Slow by construction (2,000 rows through each of two wide unions; 7.8 s on CI's loaded runner).
   test("a flat 64- and 100-way discriminated union over 2,000 valid rows", async () => {
     for (const width of [64, 100]) {
       const schema = {
@@ -307,7 +311,7 @@ describe("the default budget answers honest wide and nested unions", () => {
       });
       expect({ width, ok: out.ok, passed: out.passed }).toEqual({ width, ok: true, passed: 2_000 });
     }
-  }, 30_000);
+  }, 60_000);
 
   test("the allowance per value node is the schema's subschema count, between a floor and a ceiling", () => {
     expect(schemaFanout({ type: "string" })).toBe(1);
@@ -380,7 +384,7 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
     // 8,000 keys under 8,000 patterns ran 64 million tests and answered valid.
     // Now it runs until the value's budget (about 8.2 million evaluations) is
     // spent and answers undetermined: slow by construction, about 2 s here
-    // and 6.7 to 7.2 s on CI's loaded ubuntu runner.
+    // and up to 29.5 s on CI's loaded ubuntu runner.
     const wide = (n: number) => ({
       value: Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 1])),
       schema: {
@@ -414,7 +418,7 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
       true,
     );
     expect(listed).toBeLessThanOrEqual(3);
-  }, 60_000);
+  }, 180_000);
 
   test("an object with no keys does no work per pattern", () => {
     // The compiled list was copied into a fresh array for every object, so

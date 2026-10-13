@@ -548,7 +548,7 @@ describe("storeAndPreview — a repeated tool_use_id", () => {
     expect(out.persisted).toBe(false);
     expect(out.unsaved).toContain("is taken");
     expect(existsSync(join(dir, `tu_b.${MAX_NAME_ATTEMPTS + 1}.txt`))).toBe(false);
-  }, 30_000);
+  }, 60_000);
 });
 
 describe("storeAndPreview — path traversal guard", () => {

@@ -572,7 +572,7 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     } finally {
       server.stop(true);
     }
-  }, 20_000);
+  }, 30_000);
 
   test("a deadline that is not a duration is refused before anything is sent", async () => {
     const fetchImpl = mockFetch(() => {

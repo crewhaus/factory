@@ -140,8 +140,8 @@ describe("the matches are the old patterns'", () => {
 
   // Some 70 000 generated sources per pattern: budgeted, as the house does for
   // a test that is slow by construction.
-  test("import … from", () => sameMatches(inputs, staticImportMatches, OLD_IMPORT), 20_000);
-  test("export … from", () => sameMatches(inputs, exportFromMatches, OLD_EXPORT_FROM), 20_000);
+  test("import … from", () => sameMatches(inputs, staticImportMatches, OLD_IMPORT), 30_000);
+  test("export … from", () => sameMatches(inputs, exportFromMatches, OLD_EXPORT_FROM), 30_000);
   test("export { … }", () => sameMatches(inputs, exportListMatches, OLD_EXPORT_LIST), 20_000);
 
   test("firstBraced and /\\{([^}]*)\\}/", () => {

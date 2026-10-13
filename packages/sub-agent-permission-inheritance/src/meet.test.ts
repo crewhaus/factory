@@ -175,7 +175,7 @@ describe("meetRuleSets", () => {
     expect(checked).toBe(500 * CALLS.length * 2);
     // The meet is not vacuous: it still allows what both sides allow.
     expect(allowed).toBeGreaterThan(1000);
-    // 39 000 evaluations are slow by construction: about 0.2 s here but 2.2 s
+    // 39 000 evaluations are slow by construction: about 0.2 s here but 3.2 s
     // on a loaded CI runner, too close to bun's default of 5 s.
-  }, 10_000);
+  }, 20_000);
 });

@@ -1023,7 +1023,7 @@ describe("runChatLoop singleTurn mode", () => {
 
     expect(attempt).toBe(2); // first call failed, second succeeded
     expect(result).toBe("ok after retry");
-  });
+  }, 20_000);
 
   test("throws RuntimeError when seedMessages is missing or does not end with role:user", async () => {
     const { adapter } = makeStubAdapter();

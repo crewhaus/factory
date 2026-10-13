@@ -431,7 +431,8 @@ describe("containment of the repository git discovers", () => {
     const created = String(await gitBranchCreate.execute({ cwd: "sub", name: "planted-ref" }));
     expect(created).toContain(REFUSED);
     expect(existsSync(join(victim, ".git", "refs", "heads", "planted-ref"))).toBe(false);
-  });
+    // Slow by construction: about 25 git processes, one after another (1.1 s on CI).
+  }, 20_000);
 
   test("a planted .git directory whose core.worktree points outside is refused", async () => {
     const target = outsideDir("wt-target");
@@ -488,7 +489,8 @@ describe("containment of the repository git discovers", () => {
         leaked: false,
       });
     }
-  });
+    // Slow by construction: about 25 git processes, one after another (1.1 s on CI).
+  }, 20_000);
 
   test("chained alternates are followed: an in-workspace alternate whose own alternates name the victim is refused", async () => {
     // C071 bypass: the first `info/alternates` names an in-workspace object
@@ -1886,7 +1888,8 @@ describe("GitApplyPatch", () => {
     const entry = out.files.find((f: { path: string }) => f.path === "big.txt");
     expect(entry.tooLarge).toBe(true);
     expect(entry.regions).toEqual([]);
-  });
+    // Slow by construction: about 20 git processes over two 2.6 MB files (1.1 s on CI).
+  }, 20_000);
 });
 
 describe("GitCherryPick", () => {

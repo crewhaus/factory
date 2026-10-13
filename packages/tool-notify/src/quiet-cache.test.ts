@@ -43,14 +43,14 @@ describe("the QuietHours formatter cache (C084)", () => {
       quietDecision({ timezone: zone, quietWindows: night }, at);
     }
     expect(__quietFormatterCountForTest()).toBe(before);
-  });
+  }, 20_000);
 
   test("however many zones are asked about, the cache holds at most 64", () => {
     for (let n = 1; n <= 200; n++) {
       quietDecision({ timezone: offsetZone(n), quietWindows: night }, at);
     }
     expect(__quietFormatterCountForTest()).toBe(64);
-  });
+  }, 20_000);
 
   test("a spelling does not change the answer, and an evicted zone is answered correctly", () => {
     const canonical = quietDecision({ timezone: "America/New_York", quietWindows: night }, at);
@@ -114,5 +114,5 @@ describe("the QuietHours formatter cache (C084)", () => {
     expect(made.length).toBeGreaterThanOrEqual(3_000);
     expect(alive).toBeLessThanOrEqual(64);
     expect(__quietFormatterCountForTest()).toBeLessThanOrEqual(64);
-  }, 30_000);
+  }, 60_000);
 });

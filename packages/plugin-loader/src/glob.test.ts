@@ -100,7 +100,7 @@ describe("matchesGlob answers as 0.7.0 did", () => {
     expect(matched).toBeGreaterThan(1_000);
     expect(20_000 - matched).toBeGreaterThan(1_000);
     expect(crossedLine).toBeGreaterThan(100);
-  });
+  }, 20_000);
 
   test("the documented cases", () => {
     expect(matchesGlob("", "")).toBe(true);

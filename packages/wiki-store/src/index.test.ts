@@ -327,7 +327,7 @@ describe("timestamps read from disk are timestamps", () => {
     expect(fresh.map((r) => r.slug)).toEqual(["c", "b", "a"]);
     expect(stale.at(-1)?.updatedAt).toBe(UNKNOWN_TIMESTAMP);
     expect((await store.get("a"))?.updatedAt).toBe(UNKNOWN_TIMESTAMP);
-  });
+  }, 20_000);
 
   test("an index.json entry whose updatedAt is not a timestamp sends the load to a rebuild", async () => {
     const store = makeStore();

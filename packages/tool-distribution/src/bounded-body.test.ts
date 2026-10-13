@@ -62,7 +62,7 @@ describe("asset downloads are bounded", () => {
     expect(inits[0]?.["decompress"]).toBe(false);
   }, 20_000);
 
-  // Slow by construction (inflating and hashing 64 MiB; 2.7 s on CI's loaded runner).
+  // Slow by construction (inflating and hashing 64 MiB; 7.4 s on CI's loaded runner).
   test("an encoded asset under the cap is hashed as the decoded bytes, never held whole", async () => {
     answer = gz(bomb);
     const probe = await probeAsset(url, { maxBytes: 128 * 1024 * 1024, timeoutMs: 20_000 });
@@ -72,7 +72,7 @@ describe("asset downloads are bounded", () => {
       bytes: 64 * 1024 * 1024,
       sha256: "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
     });
-  }, 20_000);
+  }, 60_000);
 
   test("a body that is not the gzip it claims to be is 'unreadable', not a mismatch", async () => {
     answer = corrupt;
