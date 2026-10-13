@@ -644,6 +644,8 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     def.operativeArgs !== undefined
       ? checkOperativeArgs(def.name, def.inputSchema, def.operativeArgs)
       : undefined;
+  const { serviceDefaults } = def;
+  if (serviceDefaults !== undefined) checkServiceDefaults(def.name, serviceDefaults, operativeArgs);
   return {
     name: def.name,
     description: def.description,
@@ -702,5 +704,34 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // checked against the schema above. Omitted ⇒ omitted, and rules fall
     // back to the tool's string values.
     ...(operativeArgs !== undefined ? { operativeArgs } : {}),
+    // 0.7.1 — where a call that names no API goes, for the gate to read it.
+    ...(serviceDefaults !== undefined ? { serviceDefaults } : {}),
   };
+}
+
+/**
+ * A tool's `serviceDefaults` say where a call goes when it leaves its
+ * `service` field out, so the tool must declare one, and only one field can
+ * be it: the defaults name one API.
+ */
+function checkServiceDefaults(
+  name: string,
+  serviceDefaults: unknown,
+  operativeArgs: ReadonlyArray<OperativeArg> | undefined,
+): void {
+  const fail = (what: string): never => {
+    throw new ToolCatalogError(`tool "${name}": serviceDefaults ${what}`);
+  };
+  if (typeof serviceDefaults !== "function") fail("must be a function");
+  const services = new Set(
+    (operativeArgs ?? []).flatMap((arg) => (arg.service !== undefined ? [arg.service] : [])),
+  );
+  if (services.size === 0) {
+    fail(
+      "say where a call goes when it names no API, but no operative field declares a `service` for a call to name one in",
+    );
+  }
+  if (services.size > 1) {
+    fail(`name one API, but the operative fields declare ${services.size} service fields`);
+  }
 }

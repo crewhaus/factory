@@ -2560,6 +2560,9 @@ describe("a value on the service a call names (service)", () => {
       "not a url",
       "ftp://ghe.example.com/api",
       "https://user:secret@ghe.example.com/api/v3",
+      // a user name alone, and a password alone, are each a credential
+      "https://user@ghe.example.com/api/v3",
+      "https://:secret@ghe.example.com/api/v3",
       "file:///etc/passwd",
     ]) {
       const match = decide(tool, { owner: "acme", repo: "app", baseUrl });
@@ -2625,5 +2628,163 @@ describe("a value on the service a call names (service)", () => {
       build({ field: "repo", kind: "id", prefix: true, default: "*", service: "baseUrl" }),
     ).toThrow(/cannot be combined/);
     expect(build({ field: "repo", kind: "id", within: "owner", service: "baseUrl" })).not.toThrow();
+  });
+});
+
+describe("a call that names no API goes where the tool's config says (serviceDefaults)", () => {
+  // codehost's shape: base_url when the config sets one, else the default API
+  // of the dialect the call speaks.
+  type Config = { readonly baseUrl?: string; readonly host?: "github" | "gitlab" };
+  const API = { github: "https://api.github.com", gitlab: "https://gitlab.com/api/v4" };
+  const hostTool = (registered: Config = {}, opts: { readonly throws?: boolean } = {}) =>
+    buildTool({
+      name: "Repo",
+      description: "d",
+      inputSchema: z.object({
+        owner: z.string(),
+        repo: z.string(),
+        host: z.enum(["github", "gitlab"]).optional(),
+        baseUrl: z.string().optional(),
+      }),
+      operativeArgs: [{ field: "repo", kind: "recipient", within: "owner", service: "baseUrl" }],
+      serviceDefaults: (input, toolConfig) => {
+        if (opts.throws === true) throw new Error("a config it cannot read");
+        const cfg = (toolConfig ?? registered) as Config;
+        const home = cfg.host ?? "github";
+        const asked = (input as { host?: "github" | "gitlab" }).host ?? home;
+        return { unnamed: cfg.baseUrl ?? API[asked], home: cfg.baseUrl ?? API[home] };
+      },
+      destructive: true,
+      execute: async () => "ok",
+    });
+  const decide = (tool: ReturnType<typeof hostTool>, input: unknown, toolConfig?: unknown) => {
+    const values =
+      operativeValuesFor(tool, input, toolConfig !== undefined ? { toolConfig } : {}) ?? [];
+    return (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Repo", input, { polarity, operativeValues: values });
+  };
+  const ghe = { baseUrl: "https://ghe.example.com/api/v3" };
+
+  test("a call that names none is read on the configured API: a deny on that host fires", () => {
+    const tool = hostTool(ghe);
+    const input = { owner: "acme", repo: "app" };
+    const values = operativeValuesFor(tool, input);
+    expect(values?.[0]?.canonical).toEqual(["acme/app", "https://ghe.example.com/acme/app"]);
+    expect(values?.[1]).toEqual({
+      kind: "url",
+      canonical: ["https://ghe.example.com/api/v3"],
+      spellings: ["https://ghe.example.com/api/v3"],
+      restrictOnly: true,
+    });
+    const match = decide(tool, input);
+    for (const [pattern, fires] of [
+      ["Repo(https://ghe.example.com/**)", true],
+      ["Repo(http://ghe.example.com/**)", true],
+      ["Repo(ghe.example.com/**)", true],
+      ["Repo(https://ghe.example.com/api/v3/**)", true],
+      ["Repo(acme/app)", true],
+      ["Repo(https://api.github.com/**)", false],
+    ] as const) {
+      expect({ pattern, fires: match(pattern, "restrict") }).toEqual({ pattern, fires });
+    }
+    // An allow that names no host covers it, and so does one that names it.
+    expect(match("Repo(acme/app)", "allow")).toBe(true);
+    expect(match("Repo(https://ghe.example.com/acme/*)", "allow")).toBe(true);
+    expect(match("Repo(https://*/acme/app)", "allow")).toBe(true);
+    expect(match("Repo(https://api.github.com/acme/app)", "allow")).toBe(false);
+  });
+
+  test("a call that names the configured API is read as one that names none", () => {
+    const tool = hostTool(ghe);
+    for (const baseUrl of [
+      "https://ghe.example.com/api/v3",
+      "https://ghe.example.com/api/v3/",
+      "HTTPS://GHE.example.com/api/v3",
+    ]) {
+      const match = decide(tool, { owner: "acme", repo: "app", baseUrl });
+      expect({ baseUrl, allow: match("Repo(acme/app)", "allow") }).toEqual({
+        baseUrl,
+        allow: true,
+      });
+      expect({ baseUrl, deny: match("Repo(ghe.example.com/**)", "restrict") }).toEqual({
+        baseUrl,
+        deny: true,
+      });
+    }
+    // Another API on the same host name is another origin: another port.
+    const port = decide(tool, {
+      owner: "acme",
+      repo: "app",
+      baseUrl: "https://ghe.example.com:8443",
+    });
+    expect(port("Repo(acme/app)", "allow")).toBe(false);
+    // Another host is not the configured one.
+    const other = decide(tool, { owner: "acme", repo: "app", baseUrl: "https://api.github.com" });
+    expect(other("Repo(acme/app)", "allow")).toBe(false);
+    expect(other("Repo(https://api.github.com/acme/app)", "allow")).toBe(true);
+  });
+
+  test("without base_url, a call's host picks the API: another dialect is another host", () => {
+    const tool = hostTool();
+    const github = decide(tool, { owner: "acme", repo: "app" });
+    expect(github("Repo(acme/app)", "allow")).toBe(true);
+    expect(github("Repo(https://api.github.com/**)", "restrict")).toBe(true);
+    const gitlab = decide(tool, { owner: "acme", repo: "app", host: "gitlab" });
+    expect(gitlab("Repo(acme/app)", "allow")).toBe(false);
+    expect(gitlab("Repo(https://gitlab.com/acme/app)", "allow")).toBe(true);
+    expect(gitlab("Repo(gitlab.com/**)", "restrict")).toBe(true);
+    // A config set up for GitLab has it as its home.
+    const home = decide(tool, { owner: "acme", repo: "app", host: "gitlab" }, { host: "gitlab" });
+    expect(home("Repo(acme/app)", "allow")).toBe(true);
+  });
+
+  test("the serving candidate's tool_config is the one read", () => {
+    const tool = hostTool(ghe);
+    const input = { owner: "acme", repo: "app" };
+    const served = decide(tool, input, { baseUrl: "https://gitlab.example.com/api/v4" });
+    expect(served("Repo(gitlab.example.com/**)", "restrict")).toBe(true);
+    expect(served("Repo(ghe.example.com/**)", "restrict")).toBe(false);
+    expect(served("Repo(acme/app)", "allow")).toBe(true);
+  });
+
+  test("a config the tool cannot read leaves nothing an allow can grant", () => {
+    const tool = hostTool(ghe, { throws: true });
+    const match = decide(tool, { owner: "acme", repo: "app" });
+    expect(match("Repo(**)", "allow")).toBe(false);
+    expect(match("Repo(nothing-like-it)", "restrict")).toBe(true);
+    // A call that names its API is read on it; it is not the home one.
+    const named = decide(tool, { owner: "acme", repo: "app", ...ghe });
+    expect(named("Repo(https://ghe.example.com/acme/app)", "allow")).toBe(true);
+    expect(named("Repo(acme/app)", "allow")).toBe(false);
+  });
+
+  test("buildTool refuses serviceDefaults on a tool with no service field, or two", () => {
+    const build = (operativeArgs: ReadonlyArray<Record<string, unknown>>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({
+          owner: z.string(),
+          repo: z.string(),
+          channel: z.string(),
+          baseUrl: z.string().optional(),
+          apiBaseUrl: z.string().optional(),
+        }),
+        operativeArgs: operativeArgs as never,
+        serviceDefaults: () => ({ unnamed: "https://a.example", home: "https://a.example" }),
+        execute: async () => "ok",
+      });
+    expect(build([{ field: "repo", kind: "id", within: "owner" }])).toThrow(
+      /no operative field declares a `service`/,
+    );
+    expect(
+      build([
+        { field: "repo", kind: "id", within: "owner", service: "baseUrl" },
+        { field: "channel", kind: "id", service: "apiBaseUrl" },
+      ]),
+    ).toThrow(/declare 2 service fields/);
+    expect(
+      build([{ field: "repo", kind: "id", within: "owner", service: "baseUrl" }]),
+    ).not.toThrow();
   });
 });

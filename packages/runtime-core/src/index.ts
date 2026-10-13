@@ -6013,10 +6013,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // The canonicaliser also keeps a record of every path it read and where
     // each one landed: a headless approval is bound to it (see
     // `landsWhereApproved`).
+    //
+    // The tool's `tool_config` block on the serving candidate is the one it
+    // will run with: a code host reads from it which API a call that names
+    // none goes to, so a rule written on that host meets the call.
     const gateView = placeRecordingCanonicalizer();
+    const gateToolConfig = toolConfigFor(servingPlan.toolConfigs, tu.name);
     const subject = preparePermissionSubject(tool, operativeInput, {
       canonicalizePath: gateView.canonicalizePath,
       readProgramPath: gateView.readProgramPath,
+      ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
     });
     if (!subject.ok) {
       // Not a permission decision: no rule was consulted, and the call fails
@@ -6161,6 +6167,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               {
                 canonicalizePath: replayView.canonicalizePath,
                 readProgramPath: replayView.readProgramPath,
+                ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
               },
             );
             // An approved input that no longer parses is denied by the
@@ -6208,6 +6215,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               preparePermissionSubject(tool, approvedOperative, {
                 canonicalizePath: approvedView.canonicalizePath,
                 readProgramPath: approvedView.readProgramPath,
+                ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
               });
             const recheck = approvedSubject.ok
               ? evaluateWithReason(

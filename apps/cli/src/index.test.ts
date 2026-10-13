@@ -4069,7 +4069,7 @@ describe("crewhaus tools show / list — names and bad categories", () => {
         {
           field: "repo",
           words:
-            "a recipient; matched as owner/repo; on a call that names baseUrl, matched as https://host/owner/repo with that URL's origin, and a deny or ask also reads the URL",
+            "a recipient; matched as owner/repo; matched as https://host/owner/repo with the origin of the API the call goes to (the one in baseUrl, else the configured one), and also as owner/repo on the API the tool is set up for; a deny or ask also reads the URL",
         },
       ],
       example: { type: "alwaysAllow", pattern: "IssueCreate(acme/*)" },

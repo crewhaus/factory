@@ -5,11 +5,12 @@
  * API their tool_config is set up for unless a call names another, and a spec
  * may allow-list several. A rule read only the repository or the channel, so
  * `alwaysAllow IssueCreate(acme/app)` granted acme/app on every allow-listed
- * host, and no rule could name a host. Now a call that names an API is matched
- * with that API's origin in front (`https://ghe.example.com/acme/app`): an
- * allow must name it, and a deny reads the URL, the bare host and the
- * repository on its own. A call that names no API is read as before, so a
- * spec with one host keeps its rules.
+ * host, and no rule could name a host. Now the repository is matched with the
+ * origin of the API the call goes to in front (`https://ghe.example.com/acme/app`):
+ * the one it names, else the one its tool_config sends it to. An allow must
+ * name the origin, except on that configured API, where the repository alone
+ * still covers a call (so a spec with one host keeps its rules); a deny reads
+ * the URL, the bare host and the repository on its own.
  *
  * Through an incoming webhook, ChatPost ignores `channel` and posts where the
  * webhook is bound; the rule now reads the variable naming the webhook
@@ -31,8 +32,10 @@ import {
   type RuleSet,
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
+import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { type PendingApprovalStore, createPendingApprovalStore } from "@crewhaus/session-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   _resetCodehostConfig,
@@ -253,8 +256,8 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
       a: [],
       b: [],
     });
-    // `**/acme/app` names the repository on any host.
-    const anyHost = rules(["alwaysAllow", "IssueCreate(**/acme/app)"]);
+    // `http://*/acme/app` names the repository on any http host.
+    const anyHost = rules(["alwaysAllow", "IssueCreate(http://*/acme/app)"]);
     expect(await call(issueCreate, issue, anyHost)).toEqual({
       decision: "allow",
       a: created,
@@ -291,6 +294,37 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
     }
   }, 60_000);
 
+  test("a deny written on the configured host fires on a call that names no baseUrl", async () => {
+    for (const glob of [`${originA}/**`, "https://api.example.test/**", "api.example.test/**"]) {
+      const rs = rules(["alwaysDeny", `IssueCreate(${glob})`], ["alwaysAllow", "IssueCreate"]);
+      for (const call_ of [issue, { ...issue, baseUrl: originA }]) {
+        expect({ glob, call_, got: await call(issueCreate, call_, rs) }).toEqual({
+          glob,
+          call_,
+          got: { decision: "deny", a: [], b: [] },
+        });
+      }
+      // The other host is not this rule's business.
+      expect({ glob, got: await call(issueCreate, issueOnB, rs) }).toEqual({
+        glob,
+        got: { decision: "allow", a: [], b: createdOnB },
+      });
+    }
+  }, 60_000);
+
+  test("an allow that names no host covers a call that names the configured API", async () => {
+    const rs = rules(["alwaysAllow", "IssueCreate(acme/app)"]);
+    for (const baseUrl of [originA, `${originA}/`]) {
+      expect({ baseUrl, got: await call(issueCreate, { ...issue, baseUrl }, rs) }).toEqual({
+        baseUrl,
+        got: { decision: "allow", a: created, b: [] },
+      });
+    }
+    // And one that names the configured host covers a call that names none.
+    const onA = rules(["alwaysAllow", `IssueCreate(${originA}/acme/*)`]);
+    expect(await call(issueCreate, issue, onA)).toEqual({ decision: "allow", a: created, b: [] });
+  }, 30_000);
+
   test("a deny that names no host fires on every host", async () => {
     const rs = rules(["alwaysDeny", "IssueCreate(acme/app)"], ["alwaysAllow", "IssueCreate"]);
     expect(await call(issueCreate, issue, rs)).toEqual({ decision: "deny", a: [], b: [] });
@@ -315,6 +349,15 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
     const onA = await call(issueList, { owner: "acme", repo: "app" }, rs, "plan");
     expect(onA.decision).toBe("allow");
     expect(onA.a).toEqual(["GET /repos/acme/app/issues"]);
+    // And a deny or ask on the configured host stops a read that names no baseUrl.
+    for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+      const onHost = rules([type, `IssueList(${originA}/**)`]);
+      const plain = { owner: "acme", repo: "app" };
+      expect({ type, got: await call(issueList, plain, onHost, "plan") }).toEqual({
+        type,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
   }, 60_000);
 
   test("a search on a named host that covers a denied repository meets the deny", async () => {
@@ -343,6 +386,178 @@ describe("a code-host rule reads the API a call names (baseUrl)", () => {
     const withUser = { ...issueOnB, baseUrl: baseB.replace("http://", "http://user:pw@") };
     expect(await call(issueCreate, withUser, rs)).toEqual({ decision: "ask", a: [], b: [] });
   }, 30_000);
+});
+
+describe("a code-host rule on GitLab, whose owner is a group path", () => {
+  beforeAll(() => {
+    registerCodehostConfig({
+      host: "gitlab",
+      allowed_origins: [originA, originB],
+      base_url: originA,
+      token_env: "API_HOSTS_TOKEN_A",
+      token_envs: { API_HOSTS_TOKEN_B: [originB] },
+    });
+  });
+  afterAll(() => {
+    registerCodehostConfig({
+      allowed_origins: [originA, originB],
+      base_url: originA,
+      token_env: "API_HOSTS_TOKEN_A",
+      token_envs: { API_HOSTS_TOKEN_B: [originB] },
+    });
+  });
+
+  test("a rule for one repository on any host does not cover a subgroup's project", async () => {
+    // `IssueCreate(**/acme/app)` would: `**` is any run of groups, so it also
+    // names evil/acme/app. One origin segment, then the repository, does not.
+    const rs = rules(["alwaysAllow", "IssueCreate(http://*/acme/app)"]);
+    const issues = `/projects/${encodeURIComponent("acme/app")}/issues`;
+    expect(await call(issueCreate, issue, rs)).toEqual({
+      decision: "allow",
+      a: [`POST ${issues}`],
+      b: [],
+    });
+    expect(await call(issueCreate, issueOnB, rs)).toEqual({
+      decision: "allow",
+      a: [],
+      b: [`POST /api/v3${issues}`],
+    });
+    for (const input of [
+      { ...issue, owner: "evil/acme" },
+      { ...issue, owner: "evil/acme", baseUrl: originA },
+      { ...issueOnB, owner: "evil/acme" },
+    ]) {
+      expect({ input, got: await call(issueCreate, input, rs) }).toEqual({
+        input,
+        got: { decision: "ask", a: [], b: [] },
+      });
+    }
+  }, 60_000);
+});
+
+describe("without base_url, a call's host picks the API as well as the dialect", () => {
+  beforeAll(() => {
+    // Set up for GitHub; gitlab.com is allow-listed too.
+    registerCodehostConfig({
+      allowed_origins: ["https://api.github.com", "https://gitlab.com"],
+      token_env: "API_HOSTS_TOKEN_A",
+    });
+  });
+  afterAll(() => {
+    registerCodehostConfig({
+      allowed_origins: [originA, originB],
+      base_url: originA,
+      token_env: "API_HOSTS_TOKEN_A",
+      token_envs: { API_HOSTS_TOKEN_B: [originB] },
+    });
+  });
+
+  test("a call with host gitlab goes to gitlab.com, which a rule reads as that host", async () => {
+    const onGitlab = { ...issue, host: "gitlab" };
+    // The repository alone names it on the configured API, github.com.
+    const repoOnly = rules(["alwaysAllow", "IssueCreate(acme/app)"]);
+    expect(await call(issueCreate, onGitlab, repoOnly)).toEqual({ decision: "ask", a: [], b: [] });
+    for (const glob of ["https://gitlab.com/**", "gitlab.com/**"]) {
+      const rs = rules(["alwaysDeny", `IssueCreate(${glob})`], ["alwaysAllow", "IssueCreate"]);
+      expect({ glob, got: await call(issueCreate, onGitlab, rs) }).toEqual({
+        glob,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
+  }, 30_000);
+});
+
+describe("the gate reads the serving candidate's tool_config, the one the tool runs with", () => {
+  // Registered at boot: base_url A. The serving candidate's block: base_url B.
+  const candidateBlock = {
+    allowed_origins: [originA, originB],
+    base_url: baseB,
+    token_env: "API_HOSTS_TOKEN_B",
+  };
+  /** One IssueCreate call under a model pool whose one candidate carries the block. */
+  async function served(
+    input: unknown,
+    ruleSet: RuleSet,
+    extra: { readonly sessionId?: string; readonly store?: PendingApprovalStore } = {},
+  ): Promise<Outcome> {
+    const runContext = createRunContext(
+      extra.sessionId !== undefined ? { sessionId: extra.sessionId } : {},
+    );
+    const events: TraceEvent[] = [];
+    runContext.eventBus.subscribe((e) => {
+      events.push(e);
+    });
+    const before = { a: A.got.length, b: B.got.length };
+    await runChatLoop({
+      model: "test-model",
+      instructions: "file the issue",
+      runContext,
+      sessionRootDir: mkdtempSync(join(state, "sess-")),
+      singleTurn: true,
+      seedMessages: [{ role: "user", content: "go" }],
+      permissionMode: "default",
+      permissionRules: ruleSet,
+      tools: [issueCreate],
+      justificationJudge: () => ({ allow: true, reason: "on task", judgeModel: "test" }),
+      _adapter: adapterFor(issueCreate.name, input),
+      modelPool: {
+        candidates: [{ model: "pool-model", toolConfigs: { codehost: candidateBlock } }],
+        policy: "static",
+      },
+      _poolAdapters: new Map([["pool-model", adapterFor(issueCreate.name, input)]]),
+      _scoreboard: openScoreboard(mkdtempSync(join(state, "sb-"))),
+      ...(extra.store !== undefined ? { approvals: { store: extra.store } } : {}),
+      installSigintHandler: false,
+      spinner: false,
+      stdout: () => {},
+      settingsDir: null,
+    }).catch(() => undefined);
+    const first = events.find((e) => e.kind === "permission_decision");
+    return {
+      decision: first?.kind === "permission_decision" ? first.decision : undefined,
+      a: A.got.slice(before.a),
+      b: B.got.slice(before.b),
+    };
+  }
+
+  test("a call that names no baseUrl is read on the candidate's base_url", async () => {
+    const denyB = rules(
+      ["alwaysDeny", "IssueCreate(ghe.example.test/**)"],
+      ["alwaysAllow", "IssueCreate"],
+    );
+    expect(await served(issue, denyB)).toEqual({ decision: "deny", a: [], b: [] });
+    // A deny on the boot registration's host is not where this call goes.
+    const denyA = rules(
+      ["alwaysDeny", "IssueCreate(api.example.test/**)"],
+      ["alwaysAllow", "IssueCreate"],
+    );
+    expect(await served(issue, denyA)).toEqual({ decision: "allow", a: [], b: createdOnB });
+    // The repository alone names it on the candidate's API.
+    expect(await served(issue, rules(["alwaysAllow", "IssueCreate(acme/app)"]))).toEqual({
+      decision: "allow",
+      a: [],
+      b: createdOnB,
+    });
+  }, 60_000);
+
+  test("a granted approval replayed for a re-worded call is re-checked on that API too", async () => {
+    const store = createPendingApprovalStore({ rootDir: join(state, "approvals") });
+    const sessionId = "sess_0123456789abcdef";
+    // Park the call (a destructive tool asks by default), then grant it.
+    await served(issue, emptyRuleSet, { sessionId, store });
+    const parked = (await store.list()).find((r) => r.toolName === "IssueCreate");
+    if (parked === undefined) throw new Error("expected a parked approval");
+    await store.resolve(parked.id, "grant", "tester");
+    // The operator then denies the candidate's host. The model re-words the
+    // call to name A, which asks; the replay would run the APPROVED input,
+    // which names no baseUrl and so goes to B.
+    const rs = rules(
+      ["alwaysDeny", "IssueCreate(ghe.example.test/**)"],
+      ["alwaysAsk", "IssueCreate(api.example.test/**)"],
+    );
+    const got = await served({ ...issue, baseUrl: originA }, rs, { sessionId, store });
+    expect(got).toEqual({ decision: "ask", a: [], b: [] });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

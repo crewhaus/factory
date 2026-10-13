@@ -94,11 +94,12 @@ export async function executeTool(
     // values canonicalised — never the raw input, which can carry a decoy key
     // the schema strips (#145, security-1#0).
     const compiled = allowedPatterns.map(compilePattern);
-    const operativeValues = operativeValuesFor(
-      tool,
-      validation.value,
-      context.canonicalizePath !== undefined ? { canonicalizePath: context.canonicalizePath } : {},
-    );
+    const operativeValues = operativeValuesFor(tool, validation.value, {
+      ...(context.canonicalizePath !== undefined
+        ? { canonicalizePath: context.canonicalizePath }
+        : {}),
+      ...(context.toolConfig !== undefined ? { toolConfig: context.toolConfig } : {}),
+    });
     const permitted = compiled.some((p) =>
       matchesPattern(p, tool.name, validation.value, {
         polarity: "allow",

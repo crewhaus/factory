@@ -151,16 +151,19 @@
  *      the qualifier (read one segment on, so a deny naming another
  *      namespace's key does not fire on every listing).
  *    - an `id` or `recipient` declared with a `service` field (codehost's
- *      `baseUrl`, a Chat tool's `apiBaseUrl`), on a call that names the
- *      service, is matched with the URL's origin in front
- *      (`https://ghe.example.com/acme/app`): an allow must name it, and one
- *      that names none covers only a call that leaves the field out. A deny
- *      or ask also reads the value without the origin, after the origin's
- *      other spellings (no root dot, no port, the other of http and https)
- *      and after its host alone (`ghe.example.com/acme/app`), and the URL
- *      itself as a URL. A URL with no http or https origin, or with a user
- *      name or password, cannot be placed: the value is flagged
- *      `outsideWorkspace` (see {@link servedValue}).
+ *      `baseUrl`, a Chat tool's `apiBaseUrl`) is matched with the origin of
+ *      the API the call goes to in front (`https://ghe.example.com/acme/app`):
+ *      the one it names, else the one the tool's `serviceDefaults` says it
+ *      goes to (read from `toolConfig`). An allow must name the origin,
+ *      unless the API is the one the tool is set up for (its `home`): a call
+ *      to it, named or not, is also matched without one. A deny or ask also
+ *      reads the value without the origin, after the origin's other
+ *      spellings (no root dot, no port, the other of http and https) and
+ *      after its host alone (`ghe.example.com/acme/app`), and the URL itself
+ *      as a URL. A URL with no http or https origin, or with a user name or
+ *      password, cannot be placed: the value is flagged `outsideWorkspace`
+ *      (see {@link servedValue}). A tool with no `serviceDefaults` reads a
+ *      call that names no API without an origin.
  *    - a `path` declared `beneath` (a directory the tool walks: RemovePath,
  *      Grep, a git pathspec) also carries its spellings as `beneath`
  *      prefixes, so a deny or ask naming anything under it fires —
@@ -200,7 +203,12 @@
  * Nothing here touches the filesystem or imports a `node:` builtin: this
  * package is part of the worker runtime's import graph.
  */
-import type { OperativeArg, OperativeArgKind, RegisteredTool } from "@crewhaus/tool-catalog";
+import type {
+  OperativeArg,
+  OperativeArgKind,
+  RegisteredTool,
+  ServiceDefaults,
+} from "@crewhaus/tool-catalog";
 import {
   type OperativeValue,
   type OperativeValueKind,
@@ -300,6 +308,13 @@ export type PermissionSubjectOptions = {
    * since a symlink before the `..` could not be seen.
    */
   readonly readProgramPath?: ProgramPathReader;
+  /**
+   * The tool's block of the serving candidate's `tool_config`, as the tool
+   * will be handed it (`ToolExecuteContext.toolConfig`); left out, the tool
+   * reads the config it was registered with. The tool's `serviceDefaults`
+   * read it to tell which API a call that names none goes to.
+   */
+  readonly toolConfig?: unknown;
 };
 
 /**
@@ -332,19 +347,69 @@ export function operativeValuesFor(
   parsedInput: unknown,
   opts: PermissionSubjectOptions = {},
 ): ReadonlyArray<OperativeValue> | undefined {
-  return operativeValuesOf(tool.operativeArgs, parsedInput, opts);
+  return valuesOf(
+    tool.operativeArgs,
+    parsedInput,
+    opts,
+    serviceDefaultsOf(tool, parsedInput, opts.toolConfig),
+  );
 }
 
 /**
  * {@link operativeValuesFor} from a declaration alone — for a caller that has
  * a tool's `operativeArgs` as data (the builtin manifest) but not the tool.
- * The values are read the same way; the caller is responsible for passing an
- * input the tool's schema has parsed, when it can.
+ * The values are read the same way, except that a call naming no API in a
+ * `service` field is read without an origin: which API it goes to is the
+ * tool's to say. The caller is responsible for passing an input the tool's
+ * schema has parsed, when it can.
  */
 export function operativeValuesOf(
   operativeArgs: ReadonlyArray<OperativeArg> | undefined,
   parsedInput: unknown,
   opts: PermissionSubjectOptions = {},
+): ReadonlyArray<OperativeValue> | undefined {
+  return valuesOf(operativeArgs, parsedInput, opts, undefined);
+}
+
+/**
+ * Where the tool's config sends a call that names no API, read once per
+ * call (`serviceDefaults` on the tool): `unnamed` as a rule reads that API,
+ * and `home`, the origin of the one the tool is set up for when it has one a
+ * request can go to.
+ */
+type ServiceDefaultsReading = {
+  readonly unnamed: ServiceReading;
+  readonly home?: string;
+};
+
+/** A service the tool could not name: nothing an allow could grant. */
+const UNPLACEABLE_SERVICE: ServiceReading = { url: "", otherOrigins: [], hosts: [] };
+
+function serviceDefaultsOf(
+  tool: RegisteredTool,
+  parsedInput: unknown,
+  toolConfig: unknown,
+): ServiceDefaultsReading | undefined {
+  const { serviceDefaults } = tool;
+  if (serviceDefaults === undefined) return undefined;
+  let read: ServiceDefaults | undefined;
+  try {
+    read = serviceDefaults(parsedInput, toolConfig);
+  } catch {
+    // The tool cannot say where the call goes (a config it cannot read,
+    // which fails the call too): read as a place no allow names.
+    return { unnamed: UNPLACEABLE_SERVICE };
+  }
+  if (read === undefined) return undefined;
+  const home = serviceOf(read.home).origin;
+  return { unnamed: serviceOf(read.unnamed), ...(home !== undefined ? { home } : {}) };
+}
+
+function valuesOf(
+  operativeArgs: ReadonlyArray<OperativeArg> | undefined,
+  parsedInput: unknown,
+  opts: PermissionSubjectOptions,
+  services: ServiceDefaultsReading | undefined,
 ): ReadonlyArray<OperativeValue> | undefined {
   if (operativeArgs === undefined || operativeArgs.length === 0) return undefined;
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
@@ -370,7 +435,7 @@ export function operativeValuesOf(
       anyQualifier,
       prefixOf,
       service,
-    } of readField(parsedInput, arg)) {
+    } of readField(parsedInput, arg, services)) {
       if (arg.relocates === true && defaulted === true) {
         if (arg.kind === "url") relocated.push(canonicalUrl(raw));
         else {
@@ -561,13 +626,13 @@ export function operativeValuesOf(
             // key may hold `/`: what follows is any run, not one segment.
             ...(prefixOf !== undefined ? { standsForAnyRun: true } : {}),
           };
-          // A value on a service the call names is that service's: an
-          // allow names its origin, a deny also reads the URL as a URL.
+          // A value on a service is that service's: an allow names its
+          // origin, a deny also reads the URL as a URL.
           if (service !== undefined) {
-            values.push(servedValue(value, service), {
-              ...canonicalUrl(service.url),
-              restrictOnly: true,
-            });
+            values.push(servedValue(value, service));
+            if (service.url !== "") {
+              values.push({ ...canonicalUrl(service.url), restrictOnly: true });
+            }
           } else values.push(value);
           // The prefix alone, for a deny or ask written without the
           // qualifier (`alwaysDeny KvGet(apikey)`, as for any `within`
@@ -1341,7 +1406,10 @@ type FieldReading = {
    * `unqualified` is the prefix alone when the value was qualified.
    */
   readonly prefixOf?: { readonly unqualified?: string };
-  /** A field declared `service`, when the call names the service's URL. */
+  /**
+   * A field declared `service`: the API the call goes to, when the call
+   * names it or the tool's `serviceDefaults` say where it goes.
+   */
   readonly service?: ServiceReading;
 };
 
@@ -1351,13 +1419,15 @@ type FieldReading = {
  * http or https, a host, and no user name or password. `otherOrigins` are
  * the same origin without a root dot, without its port and over the other
  * of http and https, and `hosts` its host written each of those ways with no
- * scheme: a deny or ask also reads the value after each of them.
+ * scheme: a deny or ask also reads the value after each of them. `home`:
+ * the origin is the one the tool is set up for.
  */
 type ServiceReading = {
   readonly url: string;
   readonly origin?: string;
   readonly otherOrigins: ReadonlyArray<string>;
   readonly hosts: ReadonlyArray<string>;
+  readonly home?: true;
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -1382,15 +1452,22 @@ export function readOperativeField(input: unknown, arg: OperativeArg): string[] 
 }
 
 /**
- * {@link readValues}, with the API the call names in a `service` field: the
- * same for every value of the field, since it is a top-level one.
+ * {@link readValues}, with the API the call goes to for a `service` field:
+ * the one it names, else the one the tool's config sends it to — the same
+ * for every value of the field, since it is a top-level one.
  */
-function readField(input: unknown, arg: OperativeArg): FieldReading[] {
+function readField(
+  input: unknown,
+  arg: OperativeArg,
+  services?: ServiceDefaultsReading,
+): FieldReading[] {
   const read = readValues(input, arg);
   if (arg.service === undefined) return read;
   const url = qualifierOf(input, arg.service);
-  if (url === undefined) return read;
-  const service = serviceOf(url);
+  const reading = url !== undefined ? serviceOf(url) : services?.unnamed;
+  if (reading === undefined) return read;
+  const home = reading.origin !== undefined && reading.origin === services?.home;
+  const service: ServiceReading = home ? { ...reading, home: true } : reading;
   return read.map((r) => ({ ...r, service }));
 }
 
@@ -1435,12 +1512,12 @@ function withoutTrailingDots(host: string): string {
 }
 
 /**
- * A value of a field declared `service`, read for a call that names the
- * service: matched with the service's origin in front, so an allow must name
- * it; a deny or ask also reads it without the origin (what a call naming no
- * service is read as) and with the origin's other spellings. A URL that
- * cannot be placed leaves nothing an allow could grant, and every deny or ask
- * fires.
+ * A value of a field declared `service`, read for a call to that service:
+ * matched with the service's origin in front, so an allow must name it —
+ * unless the service is the tool's `home`, whose values are also matched
+ * without it, first. A deny or ask also reads the value without the origin
+ * and with the origin's other spellings. A URL that cannot be placed leaves
+ * nothing an allow could grant, and every deny or ask fires.
  */
 function servedValue(value: OperativeValue, service: ServiceReading): OperativeValue {
   const own = [...value.canonical, ...(value.spellings ?? [])];
@@ -1449,7 +1526,7 @@ function servedValue(value: OperativeValue, service: ServiceReading): OperativeV
     return {
       kind: value.kind,
       canonical: [],
-      spellings: [...own, service.url],
+      spellings: [...own, ...(service.url !== "" ? [service.url] : [])],
       outsideWorkspace: true,
     };
   }
@@ -1458,7 +1535,10 @@ function servedValue(value: OperativeValue, service: ServiceReading): OperativeV
   const { standsForAny } = value;
   return {
     ...value,
-    canonical: value.canonical.map((c) => at(origin, c)),
+    canonical: [
+      ...(service.home === true ? value.canonical : []),
+      ...value.canonical.map((c) => at(origin, c)),
+    ],
     spellings: [
       ...new Set([...others.flatMap((o) => value.canonical.map((c) => at(o, c))), ...own]),
     ],

@@ -41,7 +41,12 @@
  * says so.
  */
 import { buildTool } from "@crewhaus/tool-builder";
-import type { OperativeArg, RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type {
+  OperativeArg,
+  RegisteredTool,
+  ServiceDefaults,
+  ToolExecuteContext,
+} from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import {
   type ApiResult,
@@ -89,6 +94,7 @@ import {
   str,
 } from "./lib/shape";
 import {
+  type CodehostConfig,
   DEFAULT_BASE_URL,
   DEFAULT_MAX_BYTES,
   DEFAULT_TIMEOUT_MS,
@@ -226,7 +232,7 @@ async function withCall(
 ): Promise<string> {
   const cfg = resolveCodehostConfig(ctx?.toolConfig);
   const host: HostKind = input.host ?? cfg.host ?? "github";
-  const baseUrl = normalizeBaseUrl(input.baseUrl ?? cfg.baseUrl ?? DEFAULT_BASE_URL[host]);
+  const baseUrl = normalizeBaseUrl(input.baseUrl ?? configuredBaseUrl(cfg, host));
   // Checked before the token is read: a base URL that cannot address the API
   // is a mistake to report, not a reason to go looking for a secret.
   const baseProblem = baseUrlProblem(baseUrl);
@@ -261,6 +267,32 @@ async function withCall(
   } finally {
     deadline.cancel();
   }
+}
+
+/**
+ * The API root a call that names no `baseUrl` is sent to: the config's
+ * `base_url`, else the default API of the dialect the call speaks.
+ */
+function configuredBaseUrl(cfg: CodehostConfig, host: HostKind): string {
+  return cfg.baseUrl ?? DEFAULT_BASE_URL[host];
+}
+
+/**
+ * Where a call that names no `baseUrl` goes, and the API this tool_config is
+ * set up for — read as {@link withCall} reads them, for the permission gate
+ * (`serviceDefaults` on the tool). Without `base_url`, a call's `host` picks
+ * the API as well as the dialect, so `host: "gitlab"` goes to gitlab.com,
+ * which is not the home of a config set up for GitHub.
+ */
+function codehostServiceDefaults(input: unknown, toolConfig: unknown): ServiceDefaults {
+  const cfg = resolveCodehostConfig(toolConfig);
+  const asked = input !== null && typeof input === "object" ? (input as BaseInput).host : undefined;
+  const home: HostKind = cfg.host ?? "github";
+  const host: HostKind = asked === "github" || asked === "gitlab" ? asked : home;
+  return {
+    unnamed: normalizeBaseUrl(configuredBaseUrl(cfg, host)),
+    home: normalizeBaseUrl(configuredBaseUrl(cfg, home)),
+  };
 }
 
 /** The repository's path prefix for this host, or a readable refusal. */
@@ -368,6 +400,18 @@ function mapDefined<T>(items: readonly unknown[], fn: (value: unknown) => T | un
 }
 
 /** A read tool: external boundary, no mutation, safe to run beside its siblings. */
+/**
+ * A tool whose rule reads the API a call names in `baseUrl` also says where a
+ * call that names none goes, so a rule on that host meets it too.
+ */
+function servedFrom(operativeArgs: ReadonlyArray<OperativeArg>): {
+  serviceDefaults?: typeof codehostServiceDefaults;
+} {
+  return operativeArgs.some((arg) => arg.service !== undefined)
+    ? { serviceDefaults: codehostServiceDefaults }
+    : {};
+}
+
 function readTool<S extends z.ZodTypeAny>(def: {
   name: string;
   /** Required, so no tool here can leave a rule nothing to match. */
@@ -379,6 +423,7 @@ function readTool<S extends z.ZodTypeAny>(def: {
   return buildTool<z.infer<S>>({
     name: def.name,
     operativeArgs: def.operativeArgs,
+    ...servedFrom(def.operativeArgs),
     description: def.description,
     inputSchema: def.inputSchema as z.ZodType<z.infer<S>>,
     readOnly: true,
@@ -406,6 +451,7 @@ function writeTool<S extends z.ZodTypeAny>(def: {
   return buildTool<z.infer<S>>({
     name: def.name,
     operativeArgs: def.operativeArgs,
+    ...servedFrom(def.operativeArgs),
     description: def.description,
     inputSchema: def.inputSchema as z.ZodType<z.infer<S>>,
     readOnly: false,

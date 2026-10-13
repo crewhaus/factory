@@ -1670,7 +1670,7 @@ export function operativeArgWords(arg: OperativeArgLike): string {
     const leaf = arg.field.split(".").pop() ?? arg.field;
     const value = arg.within !== undefined ? `${arg.within}/${leaf}` : leaf;
     parts.push(
-      `on a call that names ${arg.service}, matched as https://host/${value} with that URL's origin, and a deny or ask also reads the URL`,
+      `matched as https://host/${value} with the origin of the API the call goes to (the one in ${arg.service}, else the configured one), and also as ${value} on the API the tool is set up for; a deny or ask also reads the URL`,
     );
   }
   if (arg.shell === true) {

@@ -166,7 +166,7 @@ export type ModelFeatureRequirement = {
  * or becomes required is a major one.
  *
  * - `1.0.0` — the contract as released in crewhaus 0.7.0.
- * - `1.1.0` — adds `operativeArgs` (crewhaus 0.7.1).
+ * - `1.1.0` — adds `operativeArgs` and `serviceDefaults` (crewhaus 0.7.1).
  */
 export const TOOL_CONTRACT_VERSION = "1.1.0";
 
@@ -269,22 +269,24 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `service`, for an `id` or `recipient`, names a top-level field holding the
  * root URL of the API the tool sends the call to, for a tool that reaches
  * the service it is set up for unless the call names another (codehost's
- * `baseUrl`, a Chat tool's `apiBaseUrl`). A call that names one acts on the
- * value on THAT service, so the value is matched with the URL's origin in
- * front: `{ field: "repo", kind: "recipient", within: "owner", service:
- * "baseUrl" }` is matched as `https://ghe.example.com/acme/app` for a call
- * to `https://ghe.example.com/api/v3`. An allow must then name the origin
- * (`IssueCreate(https://ghe.example.com/acme/*)`, or `IssueCreate(**` +
- * `/acme/app)` for any), and one that names none (`IssueCreate(acme/app)`)
- * covers only a call that leaves the field out, which goes to the service
- * the tool is set up for. A deny or ask also reads the URL as a URL
- * (`alwaysDeny IssueCreate(https://ghe.example.com/**)`), and the value
- * without the origin, so `alwaysDeny IssueCreate(acme/app)` fires on every
- * service, and after the host alone (`IssueCreate(ghe.example.com/**)`), the
- * origin without a root dot, without its port and over the other of http
- * and https. A URL that names no http or https origin, or carries a user
- * name or password, cannot be placed: no allow grants the call, and every
- * deny or ask fires.
+ * `baseUrl`, a Chat tool's `apiBaseUrl`). The value is matched with the
+ * origin of the API the call goes to in front: `{ field: "repo", kind:
+ * "recipient", within: "owner", service: "baseUrl" }` is matched as
+ * `https://ghe.example.com/acme/app` for a call to
+ * `https://ghe.example.com/api/v3`. A call that leaves the field out goes
+ * where the tool's `serviceDefaults` says, and is read the same way. An
+ * allow names the origin (`IssueCreate(https://ghe.example.com/acme/*)`, or
+ * `IssueCreate(https://*` + `/acme/app)` for any https host); one that names
+ * none (`IssueCreate(acme/app)`) covers only a call to the API the tool is
+ * set up for (`serviceDefaults`' `home`), whether or not the call names it.
+ * A deny or ask also reads the URL as a URL (`alwaysDeny
+ * IssueCreate(https://ghe.example.com/**)`), and the value without the
+ * origin, so `alwaysDeny IssueCreate(acme/app)` fires on every service, and
+ * after the host alone (`IssueCreate(ghe.example.com/**)`), the origin
+ * without a root dot, without its port and over the other of http and
+ * https. A URL that names no http or https origin, or carries a user name or
+ * password, cannot be placed: no allow grants the call, and every deny or
+ * ask fires.
  *
  * `relocates: true` marks a `path` field that only moves the tool off its
  * usual place: the store its other operative fields name a record in
@@ -510,6 +512,17 @@ export function hasModelChosenDestination(tool: {
   );
 }
 
+/**
+ * Where a call goes when it names no API, for a tool whose `operativeArgs`
+ * declare a `service`: see {@link ToolDefinition.serviceDefaults}.
+ */
+export type ServiceDefaults = {
+  /** The root URL of the API THIS call is sent to when it leaves the `service` field out. */
+  readonly unnamed: string;
+  /** The root URL of the API the tool is set up for. */
+  readonly home: string;
+};
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -661,6 +674,27 @@ export interface ToolDefinition<TInput = unknown> {
    * holds that.
    */
   operativeArgs?: ReadonlyArray<OperativeArg>;
+  /**
+   * For a tool whose `operativeArgs` declare a `service`: which API a call
+   * goes to when it names none, read from the tool's config the way
+   * `execute` reads it. `toolConfig` is the serving candidate's `tool_config`
+   * block for the tool, or `undefined` for the config the tool was
+   * registered with at boot. `unnamed` is the API root THIS call is sent to
+   * when it leaves the service field out (another field of the call may pick
+   * it, as a code host's `host` does); `home` is the one the tool is set up
+   * for.
+   *
+   * The permission gate reads both. A call that names no API is matched with
+   * `unnamed`'s origin in front, so `alwaysDeny IssueCreate(https://api.github.com/**)`
+   * fires on it. A call to `home`, whether or not it names it, is also
+   * matched without an origin, so `alwaysAllow IssueCreate(acme/app)` covers
+   * it and nothing on another host. Without this, a call that names no API
+   * carries no origin, and no rule written on a host meets it.
+   *
+   * Must be pure and synchronous. A throw is read as an API that cannot be
+   * placed: no allow grants the call, and every deny or ask fires.
+   */
+  serviceDefaults?: (input: unknown, toolConfig: unknown) => ServiceDefaults | undefined;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -709,6 +743,9 @@ export interface RegisteredTool {
   /** See ToolDefinition.operativeArgs. Optional and passed through verbatim
    *  by `buildTool` after it has checked every field against the schema. */
   operativeArgs?: ReadonlyArray<OperativeArg>;
+  /** See ToolDefinition.serviceDefaults. Optional; `buildTool` passes it
+   *  through for a tool that declares a `service`, and refuses it otherwise. */
+  serviceDefaults?: (input: unknown, toolConfig: unknown) => ServiceDefaults | undefined;
 }
 
 export class ToolCatalogError extends CrewhausError {
