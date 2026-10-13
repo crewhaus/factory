@@ -1081,8 +1081,9 @@ describe("every command a shell parses is read as the commands it runs", () => {
  * granted it on every allow-listed host, and no deny written on a host fired.
  * So every value such a tool reads declares the field as its `service`, and
  * says where a call that names none goes (`serviceDefaults`). The scope is
- * read from the schemas: any top-level string field whose name ends in
- * `baseUrl`.
+ * read from the schemas: any external builtin with a top-level string field
+ * whose name ends in `baseUrl`, whatever it declares. Declaring `[]` was how
+ * RateLimitStatus, which acts on the API itself, slipped past (critic10).
  */
 describe("a rule on a tool a call can point at another API reads which API (service)", () => {
   const API_ROOT = /base_?url$/i;
@@ -1096,11 +1097,13 @@ describe("a rule on a tool a call can point at another API reads which API (serv
     }
     return false;
   }
-  /** Each builtin that declares where it acts and takes an API root, with the field. */
+  /** Each external builtin that takes an API root, with the field. */
   function pointable(): Array<{ tool: RegisteredTool; field: string }> {
     const out: Array<{ tool: RegisteredTool; field: string }> = [];
     for (const tool of builtins) {
-      if ((tool.operativeArgs ?? []).length === 0) continue;
+      // An internal tool that takes one (HtmlLinks resolves links against
+      // it) sends nothing there.
+      if (tool.scope !== "external") continue;
       const shape = shapeOf(tool.inputSchema);
       for (const [field, schema] of Object.entries(shape ?? {})) {
         if (API_ROOT.test(field) && holdsString(schema)) out.push({ tool, field });
@@ -1123,16 +1126,34 @@ describe("a rule on a tool a call can point at another API reads which API (serv
   test("the sweep finds the code-host and Chat tools", () => {
     const names = new Set(pointable().map(({ tool }) => tool.name));
     // The guard's own hit count: a sweep that cannot read the schemas finds nothing.
-    expect(names.size).toBeGreaterThanOrEqual(28);
+    expect(names.size).toBeGreaterThanOrEqual(30);
     for (const known of [
       "IssueCreate",
       "WorkflowRunRerun",
       "SearchIssues",
+      "RateLimitStatus",
       "ChatPost",
       "ChatDelete",
     ]) {
       expect(names.has(known)).toBe(true);
     }
+  });
+
+  test("each reads the API a call goes to: a value on it, or the API itself", () => {
+    // A tool that acts on the API as a whole (RateLimitStatus) declares the
+    // URL as its own service; the rest declare it on what they act on there.
+    const unread = pointable()
+      .filter(({ tool, field }) => !(tool.operativeArgs ?? []).some((a) => a.service === field))
+      .map(({ tool, field }) => `${tool.name}.${field}`);
+    expect(unread).toEqual([]);
+    const apiItself = pointable()
+      .filter(({ tool, field }) =>
+        (tool.operativeArgs ?? []).some(
+          (a) => a.field === field && a.kind === "url" && a.service === field,
+        ),
+      )
+      .map(({ tool }) => tool.name);
+    expect(apiItself).toEqual(["RateLimitStatus"]);
   });
 
   test("every repository or channel value names the API root as its service", () => {
@@ -1157,11 +1178,68 @@ describe("a rule on a tool a call can point at another API reads which API (serv
     const declaring = builtins.filter((t) =>
       (t.operativeArgs ?? []).some((a) => a.service !== undefined),
     );
-    expect(declaring.length).toBeGreaterThanOrEqual(28);
+    expect(declaring.length).toBeGreaterThanOrEqual(30);
     const without = declaring
       .filter((t) => t.serviceDefaults === undefined)
       .map((t) => t.name)
       .sort();
     expect(without).toEqual(Object.keys(NO_DEFAULT_API).sort());
+  });
+});
+
+/**
+ * A `host` a call names decides where it goes as much as a base URL does: a
+ * code-host call's `host` picks the API when tool_config sets no `base_url`,
+ * TlsInspect and WaitForPort dial theirs. So every external builtin that
+ * takes one either declares it, or reads it where the call goes
+ * (`serviceDefaults`, checked here by asking it), or is listed with the
+ * reason no rule reads it.
+ */
+describe("a host a call names is read by a rule", () => {
+  const HOST = /host(name)?$/i;
+  const HOST_NOT_READ: Readonly<Record<string, string>> = {
+    EmailSend:
+      "the SMTP relay, which must be in allowed_smtp_hosts; a rule names who receives the message",
+  };
+  /** The options of an enum field, looking through optional and the like. */
+  function enumOptions(schema: unknown): ReadonlyArray<string> {
+    let current = schema as { _def?: Record<string, unknown> } | undefined;
+    for (let depth = 0; depth < 16 && current !== undefined; depth++) {
+      const def = current._def ?? {};
+      if (def["typeName"] === "ZodEnum") return def["values"] as string[];
+      current = (def["innerType"] ?? def["schema"]) as typeof current;
+    }
+    return [];
+  }
+  /** Does the tool's serviceDefaults send a call elsewhere for each value of the field? */
+  function movesTheCall(tool: RegisteredTool, field: string, schema: unknown): boolean {
+    const { serviceDefaults } = tool;
+    const options = enumOptions(schema);
+    if (serviceDefaults === undefined || options.length < 2) return false;
+    // With no base_url set, which is when a code host's `host` picks the API.
+    const apis = new Set(options.map((o) => serviceDefaults({ [field]: o }, {})?.unnamed));
+    return !apis.has(undefined) && apis.size === options.length;
+  }
+
+  test("every external tool that takes a host declares it, reads it, or says why not", () => {
+    const unread: string[] = [];
+    const exemptionsUsed = new Set<string>();
+    const readBy = { declared: 0, serviceDefaults: 0 };
+    for (const tool of builtins) {
+      if (tool.scope !== "external") continue;
+      for (const [field, schema] of Object.entries(shapeOf(tool.inputSchema) ?? {})) {
+        if (!HOST.test(field)) continue;
+        if ((tool.operativeArgs ?? []).some((a) => a.field === field)) readBy.declared++;
+        else if (movesTheCall(tool, field, schema)) readBy.serviceDefaults++;
+        else if (Object.hasOwn(HOST_NOT_READ, tool.name)) exemptionsUsed.add(tool.name);
+        else unread.push(`${tool.name}.${field}`);
+      }
+    }
+    // The sweep's hit count: the code-host tools read it through
+    // serviceDefaults; TlsInspect and WaitForPort declare it.
+    expect(readBy.serviceDefaults).toBeGreaterThanOrEqual(26);
+    expect(readBy.declared).toBeGreaterThanOrEqual(2);
+    expect([...exemptionsUsed].sort()).toEqual(Object.keys(HOST_NOT_READ).sort());
+    expect(unread).toEqual([]);
   });
 });
