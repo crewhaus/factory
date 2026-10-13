@@ -94,10 +94,13 @@ describe("SmsSend reaches only a listed number", () => {
     expect(wire).toEqual([]);
   });
 
-  test("a listed number is matched whatever separators it is written with, and sent as written", async () => {
-    const out = JSON.parse(await sms("+1 (555) 000-1111"));
-    expect(out.sent).toBe(true);
-    expect(wire).toEqual([{ To: "+1 (555) 000-1111", Body: "x" }]);
+  test("a listed number is matched whatever separators it is written with, and sent in E.164 form", async () => {
+    for (const to of ["+1 (555) 000-1111", "(+1)5550001111", "-+1.555.000.1111"]) {
+      expect(JSON.parse(await sms(to)).sent).toBe(true);
+    }
+    // The number the list and a permission rule decided on, not the call's
+    // spelling of it, which a gateway might read as another number.
+    expect(wire).toEqual([1, 2, 3].map(() => ({ To: "+15550001111", Body: "x" })));
   });
 
   test("a prefix entry admits the numbers under it, and only those", async () => {
@@ -157,6 +160,11 @@ describe("PushNotify reaches only a listed target", () => {
       expect(out).not.toContain(target);
     }
     expect(wire.map((w) => w["To"])).toEqual(["exact-token", "topic:ops-db"]);
+  });
+
+  test("a target is sent as the list compared it, without the spaces around it", async () => {
+    expect(JSON.parse(await push(" exact-token\n")).sent).toBe(true);
+    expect(wire.map((w) => w["To"])).toEqual(["exact-token"]);
   });
 
   test("an empty list refuses everyone", async () => {

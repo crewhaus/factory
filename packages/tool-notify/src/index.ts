@@ -91,6 +91,7 @@ import {
   assertSmtpHostAllowed,
   byString,
   describeFailure,
+  destinationFor,
   destinationRefusal,
   excerptOf,
   isDotSegment,
@@ -2242,11 +2243,14 @@ async function runProviderSend(
     const refused = destinationRefusal(values["to"] ?? "", kind, cfg);
     if (refused !== null) return notSentBecause(refused);
   }
-  const fingerprint = requestFingerprint({ provider: providerName, ...values });
+  // What is sent is the destination the list decided on, in the form it
+  // compared: the number in E.164 form, not the call's spelling of it.
+  const sending = { ...values, to: destinationFor(values["to"] ?? "", kind) };
+  const fingerprint = requestFingerprint({ provider: providerName, ...sending });
   const cached = ledgerAnswer(toolName, args.idempotencyKey, fingerprint);
   if (cached !== undefined) return cached;
 
-  const call = buildProviderCall(cfg, providerName, values, args.idempotencyKey);
+  const call = buildProviderCall(cfg, providerName, sending, args.idempotencyKey);
   if (!call.ok) return notSentBecause(call.message);
 
   const prepared: Prepared = {
@@ -2307,7 +2311,7 @@ export const smsSend: RegisteredTool = buildTool({
       .min(1)
       .max(100)
       .describe(
-        "the destination number; it must be in tool_config.notify.allowed_sms_recipients, which is matched in E.164 form (+ and digits; spaces, dashes and parentheses are ignored)",
+        "the destination number; it must be in tool_config.notify.allowed_sms_recipients, which is matched in E.164 form (+ and digits; spaces, dashes, dots and parentheses are ignored), and it is sent in that form",
       ),
     body: z
       .string()

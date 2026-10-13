@@ -47,7 +47,7 @@ import {
   _resetNotifyConfig,
   registerNotifyConfig,
 } from "@crewhaus/tool-notify";
-import { OPERATIVE_ARG_FIELDS, normalizePhoneNumber } from "@crewhaus/tool-permission-matcher";
+import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { formatApprovalDetail } from "./approvals-cli";
 
@@ -4724,16 +4724,16 @@ describe("critic10 — a deny on a phone number meets every spelling SmsSend sen
   test("control: each spelling is sent to that number, another number is not denied, and an allow is not widened", async () => {
     const deny = rules(["alwaysDeny", "SmsSend(+15550100000)"], ["alwaysAllow", "SmsSend"]);
     expect(await gate("SmsSend", sms("(+1)5550100001"), deny, "default", judged)).toBe("allow");
-    expect(wire.map((w) => normalizePhoneNumber(String(w["To"])))).toEqual(["+15550100001"]);
+    expect(wire.map((w) => w["To"])).toEqual(["+15550100001"]);
     wire = [];
+    // Each spelling goes to the number the deny names, sent in the form the
+    // rule and the list decided on rather than as the call spelled it.
     for (const to of dodges) {
       expect(
         await gate("SmsSend", sms(to), rules(["alwaysAllow", "SmsSend"]), "default", judged),
       ).toBe("allow");
     }
-    expect(wire.map((w) => normalizePhoneNumber(String(w["To"])))).toEqual(
-      dodges.map(() => "+15550100000"),
-    );
+    expect(wire.map((w) => w["To"])).toEqual(dodges.map(() => "+15550100000"));
     // An allow reads what the call wrote, as before: it grants that spelling
     // and asks for the others.
     wire = [];

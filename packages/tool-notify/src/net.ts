@@ -307,6 +307,16 @@ function buildDestinations(raw: unknown, kind: DestinationKind): readonly string
 }
 
 /**
+ * A provider send's destination as its list compares it, and as it is sent:
+ * an SMS number normalised (`+1 (555) 000-1111` is `+15550001111`), a push
+ * target trimmed. Sending the call's own spelling would let a gateway read
+ * it as another number than the one the list and a permission rule decided on.
+ */
+export function destinationFor(to: string, kind: DestinationKind): string {
+  return kind === "sms" ? normalizeSmsNumber(to) : to.trim();
+}
+
+/**
  * Why a provider send's destination is refused, or `null` when the list
  * admits it. The one matcher for both lists: an entry matches exactly, or,
  * ending in `*`, as a prefix. An SMS number is compared in normalised E.164
@@ -319,7 +329,7 @@ export function destinationRefusal(
 ): string | null {
   const key = DESTINATION_KEYS[kind];
   const patterns = kind === "sms" ? cfg.allowedSmsRecipients : cfg.allowedPushTargets;
-  const value = kind === "sms" ? normalizeSmsNumber(to) : to.trim();
+  const value = destinationFor(to, kind);
   const usable = kind === "push" || isE164Number(value);
   if (
     usable &&

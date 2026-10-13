@@ -361,7 +361,9 @@ built it.
   ChatReact and DeliveryCheck refuse an id of `.` or `..`, which could send
   the request to another endpoint.
 - **Destinations need your list.** SmsSend and PushNotify reach only the
-  numbers and targets you list. WaitForPort probes this machine unless you
+  numbers and targets you list, and send them as the list compared them: a
+  number in E.164 form (`+15550100000`, not `+1 (555) 010-0000`), a target
+  without surrounding spaces. WaitForPort probes this machine unless you
   list the host. WebFetch never looks up a host outside `allowed_domains`.
   Token and multicall batches go only to the canonical Multicall3, or the one
   in `tool_config`.
