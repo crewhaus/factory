@@ -86,6 +86,21 @@ describe("prompt-optimizer — T1 mutations", () => {
     expect(out).not.toContain("Input: 2+2");
   });
 
+  test("swap-example writes the new sample verbatim, never as a replacement pattern", () => {
+    // Dataset text is data: as a String.replace replacement, `$&` wrote the
+    // OLD example back in and `$$5` lost a dollar sign.
+    const orig = "Sys.\n\nExample:\nInput: old question\nExpected output: old";
+    const out = applyMutation(orig, {
+      kind: "swap-example",
+      oldSample: sample("a", "old question", "old"),
+      newSample: sample("b", "price is $& per $'", "cost $$5"),
+    });
+    expect(out).toBe(
+      "Sys.\n\nExample:\nInput: price is $& per $'\nExpected output: cost $$5\nExpected output: old",
+    );
+    expect(out).not.toContain("old question");
+  });
+
   test("add-COT-prefix prepends the COT prefix", () => {
     const out = applyMutation("answer", { kind: "add-COT-prefix" });
     expect(out.startsWith("Think step by step")).toBe(true);

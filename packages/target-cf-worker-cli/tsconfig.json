@@ -10,6 +10,7 @@
     { "path": "../infra-utils" },
     { "path": "../ir" },
     { "path": "../model-router" },
+    { "path": "../tool-categories" },
     { "path": "../worker-runtime" }
   ]
 }

@@ -3,6 +3,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
+import { withoutTrailingNewlines } from "./trailing";
 
 /**
  * Built-in Bash tool family. Layer R4. Pairs with the `target-cli` codegen
@@ -167,10 +168,10 @@ function publishProgramOutput(
 
 function formatResult(out: BashOutputResult): string {
   const parts: string[] = [];
-  if (out.stdout.length > 0) parts.push(out.stdout.replace(/\n+$/, ""));
+  if (out.stdout.length > 0) parts.push(withoutTrailingNewlines(out.stdout));
   if (out.stderr.length > 0) {
     parts.push("[stderr]");
-    parts.push(out.stderr.replace(/\n+$/, ""));
+    parts.push(withoutTrailingNewlines(out.stderr));
   }
   const exitLine = out.timedOut
     ? `[exit] ${out.exitCode} (timed out after ${out.timeoutMs}ms)`
@@ -230,6 +231,8 @@ export const bash: RegisteredTool = buildTool({
     "Run a shell command via `sh -c`. Captures stdout and stderr; default timeout 30s, max 10min. Pass `background: true` to detach a long-running command and get a bash_id to poll with BashOutput / stop with KillShell.",
   inputSchema: bashSchema,
   destructive: true,
+  // `sh -c` parses the command: a rule reads each simple command in it.
+  operativeArgs: [{ field: "command", kind: "command", shell: true }],
   // Pillar 3 sink-side: Bash spawns a host process and its command string is an
   // exfiltration channel (curl, nc, `base64 | sh`, …). Mark it external +
   // process so runtime-core runs classifyEgress on the command payload and the
@@ -289,6 +292,7 @@ const bashIdSchema = z.object({
 
 export const bashOutput: RegisteredTool = buildTool({
   name: "BashOutput",
+  operativeArgs: [],
   description:
     "Return the stdout/stderr a background Bash process has produced since the last poll, plus its status (running / exited with code / killed). Poll a `bash_id` from a `Bash({ background: true })` call.",
   inputSchema: bashIdSchema,
@@ -311,10 +315,10 @@ export const bashOutput: RegisteredTool = buildTool({
           : `[status] exited ${bg.exitCode ?? "?"}`;
 
     const parts: string[] = [];
-    if (newStdout.length > 0) parts.push(newStdout.replace(/\n+$/, ""));
+    if (newStdout.length > 0) parts.push(withoutTrailingNewlines(newStdout));
     if (newStderr.length > 0) {
       parts.push("[stderr]");
-      parts.push(newStderr.replace(/\n+$/, ""));
+      parts.push(withoutTrailingNewlines(newStderr));
     }
     if (parts.length === 0) parts.push("[no new output]");
     if (bg.truncated) parts.push("[note] earlier output was truncated (buffer cap reached)");
@@ -325,6 +329,7 @@ export const bashOutput: RegisteredTool = buildTool({
 
 export const killShell: RegisteredTool = buildTool({
   name: "KillShell",
+  operativeArgs: [],
   description:
     "Stop a background Bash process (SIGKILL) started with `Bash({ background: true })`. Pass its bash_id.",
   inputSchema: bashIdSchema,

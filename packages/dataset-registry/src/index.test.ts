@@ -10,8 +10,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -594,5 +596,57 @@ describe("dataset-registry — NEW-HUNT-9 appendReleaseEntry", () => {
         entry: { version: "v1", runId: "run_1", ts: "t", passRate: 1 },
       }),
     ).toThrow(DatasetRegistryError);
+  });
+});
+
+describe("dataset-registry — a record is never written through a link (0.7.1)", () => {
+  // security-6#7, flag-truth-3#3: `put` checked `existsSync(path)` — which
+  // answers false for a DANGLING link — and then `writeFileSync` followed the
+  // link and created its target. A new version is now created exclusively.
+  test("a dangling link at the new version's name is refused, and its target never created", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "dataset-registry-outside-"));
+    try {
+      const target = join(outside, "created.json");
+      mkdirSync(join(tmpRoot, "evil"));
+      symlinkSync(target, join(tmpRoot, "evil", "v1.json"));
+      const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+      await expect(
+        reg.put({ name: "evil", version: "v1", splits: { train: [sample("a", "x")], dev: [] } }),
+      ).rejects.toBeInstanceOf(DatasetRegistryError);
+      expect(existsSync(target)).toBe(false);
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("allowOverwrite and a release entry do not write through a link to an existing file", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "dataset-registry-outside-"));
+    try {
+      const reg = createFileBackedRegistry({ rootDir: tmpRoot });
+      await reg.put({ name: "ds", version: "v1", splits: { train: [sample("a", "x")], dev: [] } });
+      const target = join(outside, "record.json");
+      writeFileSync(target, readFileSync(join(tmpRoot, "ds", "v1.json")));
+      const before = readFileSync(target, "utf8");
+      rmSync(join(tmpRoot, "ds", "v1.json"));
+      symlinkSync(target, join(tmpRoot, "ds", "v1.json"));
+      await expect(
+        reg.put(
+          { name: "ds", version: "v1", splits: { train: [sample("b", "y")], dev: [] } },
+          { allowOverwrite: true },
+        ),
+      ).rejects.toThrow(/symbolic link/);
+      expect(() =>
+        appendReleaseEntry({
+          rootDir: tmpRoot,
+          name: "ds",
+          version: "v1",
+          entry: { version: "v1", runId: "run_1", ts: "2026-09-01T00:00:00Z", passRate: 1 },
+        }),
+      ).toThrow(/symbolic link/);
+      expect(readFileSync(target, "utf8")).toBe(before);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

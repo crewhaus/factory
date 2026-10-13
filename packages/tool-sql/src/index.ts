@@ -98,12 +98,14 @@ import {
 import { csvCell, formatCsvRow, parseCsv } from "./lib/csv";
 import {
   type InferredType,
+  JsonColumns,
   affinityOf,
   checkTypeFor,
   coerceCsvCell,
   coerceJsonValue,
-  inferTypeFromJson,
-  inferTypeFromStrings,
+  inferCsvColumnTypes,
+  inferJsonColumnTypes,
+  jsonRecordRejection,
   unionKeys,
 } from "./lib/infer";
 import {
@@ -196,7 +198,9 @@ function safePath(toolName: string, given: string): SafePath | Refusal {
   } catch (err) {
     if (err instanceof ToolPermissionError) {
       return refuse(
-        `${toolName} refused the path "${describePath(given)}": it resolves outside the workspace root. Pass a path inside the working directory.`,
+        err.reason !== undefined
+          ? err.message
+          : `${toolName} refused the path "${describePath(given)}": it resolves outside the workspace root. Pass a path inside the working directory.`,
       );
     }
     return refuse(`${toolName} could not resolve "${describePath(given)}": ${errorText(err)}`);
@@ -380,6 +384,7 @@ export const sqlQuery: RegisteredTool = buildTool({
 
 export const sqlExec: RegisteredTool = buildTool({
   name: "SqlExec",
+  operativeArgs: [{ field: "database", kind: "path" }],
   description:
     "Run one writing statement — INSERT, UPDATE, DELETE or DDL — against a SQLite database, with values supplied as bound parameters. Use when the point of the call is to change the database rather than to read it; it reports rows changed and the last inserted rowid. It applies exactly one statement and will not create the database file unless create is set.",
   inputSchema: z.object({
@@ -447,6 +452,7 @@ export const sqlExec: RegisteredTool = buildTool({
 
 export const sqlTransaction: RegisteredTool = buildTool({
   name: "SqlTransaction",
+  operativeArgs: [{ field: "database", kind: "path" }],
   description:
     "Apply several writing statements to a SQLite database as one unit, rolling every one of them back if any fails. Use when a change spans more than one statement and a half-applied version would be worse than no change at all; each statement carries its own bound parameters and the failing index is named on rollback. Statements run in the order given, on one connection, and may not contain their own BEGIN or COMMIT.",
   inputSchema: z.object({
@@ -916,10 +922,16 @@ function prepareTarget(
       return refuse(`${toolName} refused the column name "${clip(column, 60)}".`);
     }
   }
-  const lowered = columns.map((c) => c.toLowerCase());
-  const duplicate = lowered.find((name, index) => lowered.indexOf(name) !== index);
-  if (duplicate !== undefined) {
-    return refuse(`${toolName} refused a duplicate column name "${duplicate}".`);
+  // A set, not a search of the list for each name: the names are a CSV
+  // header or a file's keys, and checking each against all the others was
+  // quadratic in how many there are.
+  const lowered = new Set<string>();
+  for (const column of columns) {
+    const name = column.toLowerCase();
+    if (lowered.has(name)) {
+      return refuse(`${toolName} refused a duplicate column name "${name}".`);
+    }
+    lowered.add(name);
   }
   const existing = findObjectName(db, table, ["table"]);
   if (existing === undefined) {
@@ -1055,6 +1067,10 @@ function importResult(
 
 export const importCsv: RegisteredTool = buildTool({
   name: "ImportCsv",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "file", kind: "path" },
+  ],
   description:
     "Load a CSV file into a SQLite table in one transaction, creating the table from inferred column types if asked. Use to get a delimited export into a database without hand-writing thousands of INSERTs; it reports rows inserted and every rejected row with the reason it was rejected. A cell whose text does not fit its column's declared type is a rejection rather than a value silently stored as text, which is what SQLite would otherwise do.",
   inputSchema: z.object({
@@ -1124,12 +1140,7 @@ export const importCsv: RegisteredTool = buildTool({
     }
     if (columns.length === 0) return `ImportCsv found no columns in "${at.rel}".`;
 
-    const inferred = columns.map((_, index) =>
-      inferTypeFromStrings(
-        records.map((record) => record.values[index] ?? ""),
-        emptyIsNull,
-      ),
-    );
+    const inferred = inferCsvColumnTypes(columns.length, records, emptyIsNull);
     const deadline = startDeadline(input.timeout);
     return useDatabase(
       "ImportCsv",
@@ -1198,6 +1209,10 @@ export const importCsv: RegisteredTool = buildTool({
 
 export const importJson: RegisteredTool = buildTool({
   name: "ImportJson",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "file", kind: "path" },
+  ],
   description:
     "Load JSON records into a SQLite table in one transaction, from a file or from records passed inline. Use for an API dump or a computed result set that needs to become queryable; it accepts a JSON array or newline-delimited JSON, creates the table from inferred types if asked, and reports every rejected record with its reason. Booleans become 1 and 0 and nested objects become JSON text, because SQLite has neither type.",
   inputSchema: z.object({
@@ -1260,9 +1275,7 @@ export const importJson: RegisteredTool = buildTool({
     if (records.length === 0) return `ImportJson found no records in ${source}.`;
     const columns = input.columns === undefined ? unionKeys(records) : [...input.columns];
     if (columns.length === 0) return `ImportJson found no fields in the records from ${source}.`;
-    const inferred = columns.map((column) =>
-      inferTypeFromJson(records.map((record) => record[column])),
-    );
+    const inferred = inferJsonColumnTypes(columns, records);
     const deadline = startDeadline(input.timeout);
     return useDatabase(
       "ImportJson",
@@ -1285,6 +1298,32 @@ export const importJson: RegisteredTool = buildTool({
         if (isRefusal(target)) return target.message;
         const accepted: Array<{ row: number; values: Array<string | number | null> }> = [];
         const rejections: Rejection[] = [];
+        if (input.dryRun === true) {
+          // A dry run binds nothing, so it asks each record only for the
+          // fields it holds. Every column of every record is C × R, and a
+          // table that will not be created is not held to SQLite's column
+          // limit: records that each bring one new key made that quadratic
+          // in the file. A real insert below binds every column of every
+          // row, which is the table's own width, created or matched above.
+          const reader = new JsonColumns(columns);
+          let wouldInsert = 0;
+          for (const [index, record] of records.entries()) {
+            const bad = jsonRecordRejection(reader, record, target.types);
+            if (bad !== undefined) rejections.push({ row: index + 1, reason: bad });
+            else wouldInsert += 1;
+          }
+          rejections.sort((a, b) => a.row - b.row);
+          return json({
+            dryRun: true,
+            table: target.name,
+            wouldCreateTable: target.created,
+            columns: target.columns,
+            inferredTypes: target.created ? inferred : target.types,
+            wouldInsert,
+            rejected: rejections.length,
+            rejections: rejections.slice(0, MAX_REPORTED_REJECTIONS),
+          });
+        }
         for (const [index, record] of records.entries()) {
           const values: Array<string | number | null> = [];
           let bad: string | undefined;
@@ -1302,19 +1341,6 @@ export const importJson: RegisteredTool = buildTool({
           // identifier an inline array has.
           if (bad !== undefined) rejections.push({ row: index + 1, reason: bad });
           else accepted.push({ row: index + 1, values });
-        }
-        if (input.dryRun === true) {
-          rejections.sort((a, b) => a.row - b.row);
-          return json({
-            dryRun: true,
-            table: target.name,
-            wouldCreateTable: target.created,
-            columns: target.columns,
-            inferredTypes: target.created ? inferred : target.types,
-            wouldInsert: accepted.length,
-            rejected: rejections.length,
-            rejections: rejections.slice(0, MAX_REPORTED_REJECTIONS),
-          });
         }
         const outcome = insertRows(db, target, accepted, rejections, input.onRowError === "abort");
         if (isRefusal(outcome)) return `ImportJson: ${outcome.message}`;
@@ -1466,8 +1492,12 @@ const exportFields = {
 
 export const exportCsv: RegisteredTool = buildTool({
   name: "ExportCsv",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
-    "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection.",
+    "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection. Cells are written verbatim, so text starting with =, +, - or @ opens as a formula in a spreadsheet: prefix such values with ' in the query when the data is untrusted.",
   inputSchema: z.object({
     ...exportFields,
     delimiter: z.string().length(1).optional().describe("field separator (default ,)"),
@@ -1530,6 +1560,10 @@ export const exportCsv: RegisteredTool = buildTool({
 
 export const exportJson: RegisteredTool = buildTool({
   name: "ExportJson",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
     "Write a query's rows to a JSON or newline-delimited JSON file inside the workspace, streaming them rather than holding them in memory. Use when the consumer wants typed values rather than CSV's strings: NULL stays null, and a BLOB becomes an object carrying its base64 and byte length. An integer past 2^53 is written as a decimal string so its digits survive; the query runs on a read-only connection.",
   inputSchema: z.object({
@@ -1596,6 +1630,10 @@ export const exportJson: RegisteredTool = buildTool({
 
 export const databaseBackup: RegisteredTool = buildTool({
   name: "DatabaseBackup",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
     "Copy a SQLite database to another path inside the workspace using SQLite's own VACUUM INTO, which takes a consistent snapshot while other connections are writing. Use instead of copying the file: a byte copy taken under a live writer can capture a half-written page or miss a write-ahead log entirely, and the result is a file that opens and is wrong. The copy is compacted, so it is usually smaller than the original and is not a byte-for-byte image.",
   inputSchema: z.object({
@@ -1767,6 +1805,10 @@ function readApplied(
 
 export const migrationStatus: RegisteredTool = buildTool({
   name: "MigrationStatus",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "directory", kind: "path", beneath: "all" },
+  ],
   description:
     "Report which .sql migrations in a directory have been applied to a database and which are still pending. Use before applying anything, and to compare two environments: besides pending and applied it flags a migration whose file changed after it ran, a recorded migration whose file is gone, and a pending file that sorts before one already applied. Files are ordered by plain filename comparison, so mixed-width numeric prefixes are called out as ambiguous.",
   inputSchema: z.object(migrationFields),
@@ -1814,6 +1856,10 @@ export const migrationStatus: RegisteredTool = buildTool({
 
 export const migrationApply: RegisteredTool = buildTool({
   name: "MigrationApply",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "directory", kind: "path", beneath: "all" },
+  ],
   description:
     "Apply the pending .sql migrations from a directory in filename order, recording each one and stopping at the first failure. Use to bring a database up to date: a migration already recorded is skipped, each one runs inside its own transaction so a failure leaves that file unapplied, and migrations applied before the failure stay applied. It refuses to start when an applied file has since been edited or when a pending file sorts before an applied one, and a file containing its own BEGIN or COMMIT is refused because it would fight the wrapping transaction.",
   inputSchema: z.object({

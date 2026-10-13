@@ -19,6 +19,7 @@
     "@crewhaus/infra-utils": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*"
   },
   "license": "Apache-2.0",

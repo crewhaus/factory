@@ -157,17 +157,25 @@ export function chiSquareHomogeneity(
   reference: Readonly<Record<string, number>>,
   current: Readonly<Record<string, number>>,
 ): ChiSquareResult {
+  // Own properties only. The keys are CELL VALUES, and a stored profile comes
+  // back from JSON.parse as a plain object: `reference["constructor"]` on a
+  // reference that never saw that value is Object's constructor, a function,
+  // and `function + 80` is a string that compares false against 0 — so a
+  // brand-new category named "constructor", "toString" or "__proto__"
+  // vanished from the table and the test answered p = 1 on real drift.
+  const countOf = (counts: Readonly<Record<string, number>>, key: string): number =>
+    Object.hasOwn(counts, key) ? (counts[key] as number) : 0;
   // A key recorded as zero on BOTH sides is dropped rather than counted: it
   // would make its column total zero, so both its expected counts would be
   // 0/0, and it would inflate df with a cell that holds no observation.
   const categories = [...new Set([...Object.keys(reference), ...Object.keys(current)])]
-    .filter((key) => (reference[key] ?? 0) + (current[key] ?? 0) > 0)
+    .filter((key) => countOf(reference, key) + countOf(current, key) > 0)
     .sort();
   let referenceTotal = 0;
   let currentTotal = 0;
   for (const key of categories) {
-    referenceTotal += reference[key] ?? 0;
-    currentTotal += current[key] ?? 0;
+    referenceTotal += countOf(reference, key);
+    currentTotal += countOf(current, key);
   }
   const total = referenceTotal + currentTotal;
   const base = {
@@ -202,8 +210,8 @@ export function chiSquareHomogeneity(
   let cellsBelowFive = 0;
   let cellsBelowOne = 0;
   for (const key of categories) {
-    const observedReference = reference[key] ?? 0;
-    const observedCurrent = current[key] ?? 0;
+    const observedReference = countOf(reference, key);
+    const observedCurrent = countOf(current, key);
     const columnTotal = observedReference + observedCurrent;
     // A column total of zero cannot occur: the key is in the union because at
     // least one side counted it. So neither expectation below is 0/0.

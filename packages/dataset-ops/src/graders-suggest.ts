@@ -41,6 +41,7 @@ import {
   mergeFeedback,
   normalizeRating,
 } from "@crewhaus/feedback-distill";
+import { firstObjectSpan, withoutCombinatorMarkers, withoutJudgePrefixes } from "./linear-text";
 
 /** Thrown on malformed flags / unusable evidence. The CLI entry file routes
  *  it through `die()`; tests assert on `.message`. */
@@ -159,11 +160,11 @@ export function cleanRationale(rationale: string): string {
   let s = rationale.trim();
   if (s.startsWith("grader threw:") || s.startsWith("agent invocation error")) return "";
   if (s.startsWith("judge abstained")) return "";
-  s = s.replace(/\[[^\]]*: [✓✗]\]/g, " ");
+  s = withoutCombinatorMarkers(s);
   // Covers `judge=4 (need ≥3):`, `judge=3.5 (median of 3 repeats
   // [3, abstain, 4], agreement 1/2, need ≥4):` and a mid-string `judge
   // abstained (… need ≥3):` (after combinator-marker stripping).
-  s = s.replace(/judge(?:=\d+(?:\.\d+)?| abstained) \([^)]*need ≥\d+(?:\.\d+)?\):/g, " ");
+  s = withoutJudgePrefixes(s);
   return s.replace(/\s+/g, " ").trim();
 }
 
@@ -718,11 +719,11 @@ const ANCHOR_KEYS = ["1", "2", "3", "4", "5"] as const;
  * suggestions and notes the skipped rubric.
  */
 export function parseRubricSuggestion(raw: string, model?: string): GraderSpecObject | undefined {
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (jsonMatch === null) return undefined;
+  const json = firstObjectSpan(raw);
+  if (json === undefined) return undefined;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    parsed = JSON.parse(json);
   } catch {
     return undefined;
   }

@@ -4,7 +4,7 @@
  * the package can be proved without a world — no spawning, no filesystem,
  * no clock.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { backoffDelayMs, backoffSchedule, totalBackoffMs } from "./lib/backoff";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv, isValidEnvName } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
@@ -94,9 +94,66 @@ describe("compileSafePattern", () => {
   });
 
   test("the gate is fast enough to be worth having — a refused pattern never runs", () => {
-    const started = Date.now();
-    expect(compileSafePattern("(a|a)*$", "").ok).toBe(false);
-    expect(Date.now() - started).toBeLessThan(100);
+    // The screen reads the pattern and never runs it, so refusing one costs
+    // only the screen's own work, which its work budget bounds (tool-safety's
+    // screen tests count it), not the backtracking it refuses. Every way a
+    // RegExp runs here goes through exec once it is replaced, so the runs are
+    // counted rather than timed. The gate runs no RegExp at all, so any run
+    // counts, however the refused pattern was wrapped. The second pattern is
+    // screened nowhere else, so its verdict is not a cached one.
+    const refused = ["(a|a)*$", "(c|cd)*$"];
+    const ran: string[] = [];
+    const exec = RegExp.prototype.exec;
+    const spy = spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      input: string,
+    ) {
+      ran.push(this.source);
+      return exec.call(this, input);
+    });
+    let outs: Array<ReturnType<typeof compileSafePattern>>;
+    try {
+      outs = refused.map((source) => compileSafePattern(source, ""));
+    } finally {
+      spy.mockRestore();
+    }
+    for (const [i, out] of outs.entries()) {
+      expect({ source: refused[i], ok: out.ok }).toEqual({ source: refused[i], ok: false });
+      // Refused for its shape, not for running out of screen work.
+      if (!out.ok) expect(out.message).toContain("alternation");
+    }
+    expect(ran).toEqual([]);
+  });
+
+  test("a brace or optional quantifier inside a repeated group is still nesting (C079)", () => {
+    // 0.7.0 counted only `*` and `+` inside a group, so each of these passed
+    // and JavaScriptCore then gave up on it as a false "no match".
+    for (const source of [
+      "(a{1,})+$",
+      "(\\w{1,})*$",
+      "(\\w{1,64})*$",
+      "(\\w\\w?)*$",
+      "(?:a{1,}){1,}$",
+      "(a?){20}a{20}",
+      "^(a|a){1,99}$",
+    ]) {
+      expect({ source, ok: compileSafePattern(source, "").ok }).toEqual({ source, ok: false });
+    }
+  });
+
+  test("the shared screen admits what a waiting pattern really looks like", () => {
+    // Including a quantified alternation whose branches cannot overlap, which
+    // 0.7.0's scanner refused wholesale.
+    for (const source of [
+      "(\\d{1,3}\\.){3}\\d{1,3}",
+      "Listening on (\\d+)",
+      "(ready|listening)",
+      "a{2,5}",
+      "\\{literal\\}",
+      "(a|b)*$",
+    ]) {
+      expect({ source, ok: compileSafePattern(source, "").ok }).toEqual({ source, ok: true });
+    }
   });
 
   test("a character class containing a bracket does not confuse the scan", () => {
@@ -205,13 +262,22 @@ describe("inspectEnv", () => {
     expect(views).toEqual([{ name: "TOKEN", present: true, chars: 9 }]);
   });
 
-  test("a revealed value comes back in full", () => {
-    const { views } = inspectEnv(parent, ["TOKEN"], ["TOKEN"]);
-    expect(views[0]?.value).toBe("sk-abcdef");
+  test("a revealed value comes back in full only when the policy allows it", () => {
+    const allow = () => ({ ok: true }) as const;
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"], allow).views[0]?.value).toBe("sk-abcdef");
+    // The default policy reveals nothing, and says so.
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"]).views).toEqual([
+      { name: "TOKEN", present: true, chars: 9, withheld: "not-allowed" },
+    ]);
+    const deny = () => ({ ok: false, code: "credential-shaped" }) as const;
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"], deny).views[0]?.withheld).toBe(
+      "credential-shaped",
+    );
   });
 
   test("an unset variable is reported as absent, never invented", () => {
-    const { views } = inspectEnv(parent, ["MISSING"], ["MISSING"]);
+    const allow = () => ({ ok: true }) as const;
+    const { views } = inspectEnv(parent, ["MISSING"], ["MISSING"], allow);
     expect(views).toEqual([{ name: "MISSING", present: false, chars: 0 }]);
   });
 

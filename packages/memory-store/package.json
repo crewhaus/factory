@@ -12,7 +12,8 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/embedder": "workspace:*"

@@ -40,7 +40,7 @@
  * scalars, so the output is unambiguous.
  */
 
-import { isPlainObject } from "./json";
+import { OutputLimitError, isPlainObject, setOwn } from "./json";
 
 export class YamlError extends Error {
   readonly line: number;
@@ -82,7 +82,11 @@ function tokenize(text: string): Line[] {
       throw new YamlError("tab characters cannot be used for indentation", lineNo);
     }
     const indent = indentMatch[0].length;
-    const content = original.slice(indent).replace(/\s+$/, "");
+    // trimEnd drops exactly what `.replace(/\s+$/, "")` did. That call was
+    // linear only because JSC turns that exact spelling into a trim; the same
+    // pattern run as a pattern (exec, test, a /g flag) rescans a run of spaces
+    // inside the line from each start in it, quadratic in the run's length.
+    const content = original.slice(indent).trimEnd();
     if (content.startsWith("#")) return;
     if (content === "---") return;
     if (content === "...") return;
@@ -173,15 +177,15 @@ function parseMapping(state: State, indent: number, depth: number): Record<strin
     const valueText = stripComment(line.content.slice(colon + 1).trim());
     state.i += 1;
     if (valueText === "") {
-      out[key] = parseChildBlock(state, indent, depth);
+      setOwn(out, key, parseChildBlock(state, indent, depth));
       continue;
     }
     const block = blockScalarHeader(valueText);
     if (block !== null) {
-      out[key] = readBlockScalar(state, indent, block, line.lineNo);
+      setOwn(out, key, readBlockScalar(state, indent, block, line.lineNo));
       continue;
     }
-    out[key] = parseScalarValue(valueText, line.lineNo);
+    setOwn(out, key, parseScalarValue(valueText, line.lineNo));
   }
   return out;
 }
@@ -296,8 +300,20 @@ function readBlockScalar(
   } else {
     out = body.join("\n");
   }
-  if (header.chomp === "strip") return out.replace(/\n+$/, "");
+  if (header.chomp === "strip") return withoutTrailingNewlines(out);
   return `${out}\n`;
+}
+
+/**
+ * `text` without its trailing newlines: what `text.replace(/\n+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of newlines that is not at the end (blank lines inside a block
+ * scalar) and rescans the rest of the run from each, quadratic in its length.
+ */
+export function withoutTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return end === text.length ? text : text.slice(0, end);
 }
 
 /** Remove a trailing ` # comment`, respecting quotes. */
@@ -478,7 +494,7 @@ function parseFlowNode(s: FlowState, depth: number): unknown {
       skipFlowSpace(s);
       if (s.text[s.i] !== ":") throw new YamlError("expected ':' in a flow mapping", s.lineNo);
       s.i += 1;
-      out[String(coerceFlowKey(key, s.lineNo))] = parseFlowNode(s, depth + 1);
+      setOwn(out, String(coerceFlowKey(key, s.lineNo)), parseFlowNode(s, depth + 1));
       skipFlowSpace(s);
       const d = s.text[s.i];
       if (d === ",") {
@@ -557,43 +573,81 @@ function writeScalar(value: unknown): string {
   return canWritePlain(s) ? s : JSON.stringify(s);
 }
 
-/** Serialize a JSON value as block-style YAML with a two-space indent. */
-export function stringifyYaml(value: unknown, indentLevel = 0): string {
-  const pad = "  ".repeat(indentLevel);
+/**
+ * Serialize a JSON value as block-style YAML with a two-space indent.
+ *
+ * Lines are emitted once, into one list: the 0.7.0 writer returned each
+ * nested block as a string and re-sliced it at every level to fold a
+ * sequence item's first line onto its dash (`- - x`), which copied the
+ * whole block once per level. The folding is now a prefix handed down
+ * instead. With `maxChars`, it throws `OutputLimitError` as soon as the text
+ * would pass that many characters, before building the rest: indentation
+ * makes YAML's size depth x width, not the input's size.
+ */
+export function stringifyYaml(
+  value: unknown,
+  indentLevel = 0,
+  maxChars = Number.POSITIVE_INFINITY,
+): string {
+  const out: YamlOut = { lines: [], chars: -1, max: maxChars };
+  emitYaml(value, indentLevel, null, out);
+  return out.lines.join("\n");
+}
+
+type YamlOut = { readonly lines: string[]; chars: number; readonly max: number };
+
+function pushLine(out: YamlOut, line: string): void {
+  out.chars += line.length + 1;
+  if (out.chars > out.max) throw new OutputLimitError(out.max, "the YAML");
+  out.lines.push(line);
+}
+
+const nonEmptyContainer = (v: unknown): boolean =>
+  (isPlainObject(v) && Object.keys(v).length > 0) || (Array.isArray(v) && v.length > 0);
+
+/**
+ * Emit `value` at `level`. `lead`, when given, replaces the indentation of
+ * the FIRST line only: it is how a sequence item's dash lands on the same
+ * line as the item's first key or first element. It always has the same
+ * length as the indentation it replaces.
+ */
+function emitYaml(value: unknown, level: number, lead: string | null, out: YamlOut): void {
+  const pad = "  ".repeat(level);
+  let first = true;
+  const prefix = (): string => {
+    const p = first && lead !== null ? lead : pad;
+    first = false;
+    return p;
+  };
   if (Array.isArray(value)) {
-    if (value.length === 0) return `${pad}[]`;
-    return value
-      .map((el) => {
-        if (isPlainObject(el) && Object.keys(el).length > 0) {
-          const body = stringifyYaml(el, indentLevel + 1);
-          return `${pad}-${body.slice(pad.length + 1)}`;
-        }
-        if (Array.isArray(el) && el.length > 0) {
-          const body = stringifyYaml(el, indentLevel + 1);
-          return `${pad}-${body.slice(pad.length + 1)}`;
-        }
-        return `${pad}- ${writeScalar(el)}`;
-      })
-      .join("\n");
+    if (value.length === 0) {
+      pushLine(out, `${prefix()}[]`);
+      return;
+    }
+    for (const el of value) {
+      if (nonEmptyContainer(el)) emitYaml(el, level + 1, `${prefix()}- `, out);
+      else pushLine(out, `${prefix()}- ${writeScalar(el)}`);
+    }
+    return;
   }
   if (isPlainObject(value)) {
     const keys = Object.keys(value);
-    if (keys.length === 0) return `${pad}{}`;
-    return keys
-      .map((k) => {
-        const v = value[k];
-        const key = canWritePlain(k) ? k : JSON.stringify(k);
-        if (Array.isArray(v)) {
-          if (v.length === 0) return `${pad}${key}: []`;
-          return `${pad}${key}:\n${stringifyYaml(v, indentLevel + 1)}`;
-        }
-        if (isPlainObject(v)) {
-          if (Object.keys(v).length === 0) return `${pad}${key}: {}`;
-          return `${pad}${key}:\n${stringifyYaml(v, indentLevel + 1)}`;
-        }
-        return `${pad}${key}: ${writeScalar(v)}`;
-      })
-      .join("\n");
+    if (keys.length === 0) {
+      pushLine(out, `${prefix()}{}`);
+      return;
+    }
+    for (const k of keys) {
+      const v = value[k];
+      const key = canWritePlain(k) ? k : JSON.stringify(k);
+      if (Array.isArray(v) && v.length === 0) pushLine(out, `${prefix()}${key}: []`);
+      else if (isPlainObject(v) && Object.keys(v).length === 0)
+        pushLine(out, `${prefix()}${key}: {}`);
+      else if (Array.isArray(v) || isPlainObject(v)) {
+        pushLine(out, `${prefix()}${key}:`);
+        emitYaml(v, level + 1, null, out);
+      } else pushLine(out, `${prefix()}${key}: ${writeScalar(v)}`);
+    }
+    return;
   }
-  return `${pad}${writeScalar(value)}`;
+  pushLine(out, `${prefix()}${writeScalar(value)}`);
 }

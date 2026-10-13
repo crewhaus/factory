@@ -29,7 +29,7 @@ import {
   splitFrontmatter,
 } from "./lib/frontmatter";
 import { compileIgnoreRule, isIgnored, parseGitignore } from "./lib/gitignore";
-import { globToRegExpSource, matchGlob } from "./lib/glob";
+import { compileGlob, matchGlob } from "./lib/glob";
 import {
   NotebookError,
   applyNotebookEdit,
@@ -86,8 +86,16 @@ describe("glob", () => {
   });
 
   test("an unterminated class degrades to a literal bracket", () => {
-    expect(globToRegExpSource("[abc")).toBe("\\[abc");
     expect(matchGlob("[abc", "[abc")).toBe(true);
+    expect(matchGlob("[abc", "a")).toBe(false);
+  });
+
+  test("a class never matches a separator, negated or not", () => {
+    // gitignore(5): `*`, `?` and `[...]` do not cross `/`. A negated class
+    // compiled to `[^x]` in the RegExp days, which did.
+    expect(matchGlob("a[!x]b", "a/b")).toBe(false);
+    expect(matchGlob("a[^x]b", "a/b")).toBe(false);
+    expect(matchGlob("a[!x]b", "ayb")).toBe(true);
   });
 });
 
@@ -305,6 +313,36 @@ describe("front matter", () => {
       split.eol,
     );
     expect(rebuilt).toBe(original);
+  });
+});
+
+describe("a __proto__ front matter key is an ordinary key (C199)", () => {
+  test("it is kept, in order, as an own property", () => {
+    const data = parseFrontmatter("__proto__: keepme\ntitle: t");
+    expect(Object.keys(data)).toEqual(["__proto__", "title"]);
+    expect(Object.getOwnPropertyDescriptor(data, "__proto__")?.value).toBe("keepme");
+    expect(JSON.stringify(data)).toBe('{"__proto__":"keepme","title":"t"}');
+  });
+
+  test("a list or ~ value does not become, or remove, the record's prototype", () => {
+    const list = parseFrontmatter("__proto__: [a, b]");
+    expect(Array.isArray(Object.getPrototypeOf(list))).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(list, "__proto__")?.value).toEqual(["a", "b"]);
+    const nul = parseFrontmatter("__proto__: ~\nx: 1");
+    expect(Object.keys(nul)).toEqual(["__proto__", "x"]);
+    expect(Object.getOwnPropertyDescriptor(nul, "__proto__")?.value).toBeNull();
+  });
+
+  test("a repeated __proto__ is a duplicate key like any other", () => {
+    expect(() => parseFrontmatter("__proto__: a\n__proto__: b")).toThrow(FrontmatterError);
+    expect(() => parseFrontmatter("__proto__: a\n__proto__: b")).toThrow(
+      /duplicate key "__proto__"/,
+    );
+  });
+
+  test("it serializes back where it was", () => {
+    const data = parseFrontmatter("__proto__: keepme\ntitle: t");
+    expect(serializeFrontmatter(data, Object.keys(data))).toBe("__proto__: keepme\ntitle: t");
   });
 });
 
@@ -537,11 +575,16 @@ describe("glob compilation is bounded", () => {
     // non-matching subject took the best part of a second, and a few more
     // segments would never have come back at all.
     const pattern = `${"**/".repeat(12)}zzz`;
-    expect(globToRegExpSource(pattern)).toBe("(?:[^/]+/)*zzz");
     const subject = `${Array.from({ length: 24 }, (_, i) => `seg${i}`).join("/")}/nope`;
-    const started = Date.now();
-    expect(matchGlob(pattern, subject)).toBe(false);
-    expect(Date.now() - started).toBeLessThan(250);
+    // Counted, not timed, as the C081 tests below count it.
+    const most = productOf(pattern, subject);
+    const { value, subjectRuns, reads } = globWork([subject], most, () =>
+      matchGlob(pattern, subject),
+    );
+    expect(value).toBe(false);
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    expect(reads).toBeGreaterThan(0);
   });
 
   test("collapsing does not change what the pattern means", () => {
@@ -551,4 +594,217 @@ describe("glob compilation is bounded", () => {
     expect(matchGlob("src/**/a.ts", "src/x/a.ts")).toBe(true);
     expect(matchGlob("src/**/a.ts", "other/x/a.ts")).toBe(false);
   });
+});
+
+/**
+ * The matcher as it was: a pattern compiled to a RegExp, `*` to `[^/]*`
+ * (with negated classes kept off `/`, the one meaning that changed). The
+ * reference the rewrite is compared against on inputs short enough for a
+ * backtracking engine to answer quickly.
+ */
+function referenceGlob(pattern: string): RegExp {
+  const meta = /[.*+?^${}()|[\]\\]/g;
+  const esc = (c: string): string => c.replace(meta, "\\$&");
+  let out = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i] as string;
+    if (c === "\\") {
+      const next = pattern[i + 1];
+      out += next === undefined ? "\\\\" : esc(next);
+      i += next === undefined ? 1 : 2;
+    } else if (c === "*") {
+      const start = i === 0 || pattern[i - 1] === "/";
+      const after = i + 2;
+      const end = after >= pattern.length || pattern[after] === "/";
+      if (pattern[i + 1] === "*" && start && end) {
+        if (after < pattern.length) {
+          if (!out.endsWith("(?:[^/]+/)*")) out += "(?:[^/]+/)*";
+          i = after + 1;
+        } else {
+          out += ".*";
+          i = after;
+        }
+      } else {
+        out += "[^/]*";
+        i += 1;
+      }
+    } else if (c === "?") {
+      out += "[^/]";
+      i += 1;
+    } else if (c === "[") {
+      let j = i + 1;
+      let cls = "[";
+      if (pattern[j] === "!" || pattern[j] === "^") {
+        cls += "^/";
+        j += 1;
+      }
+      if (pattern[j] === "]") {
+        cls += "\\]";
+        j += 1;
+      }
+      let ok = true;
+      while (j < pattern.length && pattern[j] !== "]") {
+        const ch = pattern[j] as string;
+        if (ch === "\\") {
+          const next = pattern[j + 1];
+          if (next === undefined) {
+            ok = false;
+            break;
+          }
+          cls += `\\${next.replace(meta, "\\$&")}`;
+          j += 2;
+          continue;
+        }
+        cls += ch === "[" || ch === "^" ? `\\${ch}` : ch;
+        j += 1;
+      }
+      if (!ok || j >= pattern.length) {
+        out += "\\[";
+        i += 1;
+      } else {
+        out += `${cls}]`;
+        i = j + 1;
+      }
+    } else {
+      out += esc(c);
+      i += 1;
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/**
+ * The work a glob match does, counted rather than timed. A regular
+ * expression run over a subject is counted and refused on the spot: 0.7.0
+ * compiled each glob to a RegExp, whose backtracking is the hang, so a return
+ * to it fails at once instead of running for hours. A run over anything else
+ * is not the match, and is neither counted nor refused. The matcher's own
+ * work is the characters it reads with `charCodeAt`, which the segment walk
+ * keeps within the product of the pattern's and the subject's lengths. A read
+ * past `maxReads` throws, so a walk that blows up without a RegExp fails at
+ * once too. Both originals are put back before this returns.
+ */
+function globWork<T>(
+  subjects: readonly string[],
+  maxReads: number,
+  body: () => T,
+): { value: T; subjectRuns: number; reads: number } {
+  const realExec = RegExp.prototype.exec;
+  const realCharCodeAt = String.prototype.charCodeAt;
+  let subjectRuns = 0;
+  let reads = 0;
+  RegExp.prototype.exec = function (this: RegExp, input: string) {
+    const text = String(input);
+    if (subjects.some((subject) => text.includes(subject))) {
+      subjectRuns += 1;
+      throw new Error(`/${this.source}/ ran over a ${text.length}-character subject`);
+    }
+    return realExec.call(this, text);
+  };
+  String.prototype.charCodeAt = function (this: string, index: number) {
+    reads += 1;
+    if (reads > maxReads) throw new Error(`the match read more than ${maxReads} characters`);
+    return realCharCodeAt.call(this, index);
+  };
+  try {
+    const value = body();
+    return { value, subjectRuns, reads };
+  } finally {
+    RegExp.prototype.exec = realExec;
+    String.prototype.charCodeAt = realCharCodeAt;
+  }
+}
+
+/** What the segment walk may read for one match: the product of the lengths. */
+function productOf(pattern: string, subject: string): number {
+  return (pattern.length + 1) * (subject.length + 1);
+}
+
+describe("the glob matcher cannot be made to backtrack (C081)", () => {
+  test("many-star patterns answer in linear time", () => {
+    // Counted, not timed. As a RegExp the first two took about 4 s and
+    // 3.6 s, and the last one hours; the walk reads each subject character
+    // about once.
+    const cases: ReadonlyArray<readonly [string, string, boolean]> = [
+      ["*a*a*a*a*a*a*b", "a".repeat(80), false],
+      ["*****b", "a".repeat(200), false],
+      ["*a*a*a*a*a*a*b", `${"a".repeat(80)}b`, true],
+      ["*a*a*a*a*a*a*a*a*b", "a".repeat(255), false],
+    ];
+    for (const [pattern, subject, matches] of cases) {
+      const most = productOf(pattern, subject);
+      const { value, subjectRuns, reads } = globWork([subject], most, () =>
+        matchGlob(pattern, subject),
+      );
+      expect({ pattern, value, subjectRuns }).toEqual({ pattern, value: matches, subjectRuns: 0 });
+      expect(reads).toBeLessThanOrEqual(most);
+      // The walk reads every subject character. Fewer reads means it reads
+      // them some other way, and the count above no longer sees it.
+      expect(reads).toBeGreaterThanOrEqual(subject.length);
+    }
+  });
+
+  test("so do .gitignore rules", () => {
+    const rule = compileIgnoreRule("*a*a*a*a*a*a*b");
+    if (rule === undefined) throw new Error("the rule should compile");
+    const name = "a".repeat(255);
+    // Two matches of the rule against the name.
+    const most = 2 * productOf("*a*a*a*a*a*a*b", name);
+    const { value, subjectRuns, reads } = globWork([name], most, () => [
+      rule.test(name),
+      isIgnored([{ base: "", rules: [rule] }], `x/${name}`, false),
+    ]);
+    expect(value).toEqual([false, false]);
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    expect(reads).toBeGreaterThanOrEqual(name.length);
+  });
+
+  test("globstars across many segments stay polynomial", () => {
+    const subject = Array.from({ length: 200 }, () => "a").join("/");
+    const pattern = `${"**/a/".repeat(60)}b`;
+    const most = productOf(pattern, subject);
+    const { value, subjectRuns, reads } = globWork([subject], most, () =>
+      matchGlob(pattern, subject),
+    );
+    expect(value).toBe(false);
+    expect(subjectRuns).toBe(0);
+    expect(reads).toBeLessThanOrEqual(most);
+    // One read: only the last segment can meet `b`, and it does not.
+    expect(reads).toBeGreaterThan(0);
+  });
+
+  test("it agrees with the RegExp translation on every short input", () => {
+    const atoms = ["a", "b", "*", "?", "/", "[ab]", "[!a]", "**", "\\*", "[", "]", "-", "[a-b]"];
+    const letters = ["a", "b", "/", "*", "["];
+    let seed = 7;
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let k = 0; k < 20_000; k++) {
+      let pattern = "";
+      for (let i = 1 + rnd(6); i > 0; i--) pattern += atoms[rnd(atoms.length)];
+      let subject = "";
+      for (let i = rnd(12); i > 0; i--) subject += letters[rnd(letters.length)];
+      let reference: RegExp;
+      try {
+        reference = referenceGlob(pattern);
+      } catch {
+        continue; // an out-of-order range: the RegExp refused to compile it
+      }
+      const expected = reference.test(subject);
+      expect({ pattern, subject, match: compileGlob(pattern)(subject) }).toEqual({
+        pattern,
+        subject,
+        match: expected,
+      });
+      compared += 1;
+    }
+    // The guard's hit count: nearly every generated pair was compared.
+    expect(compared).toBeGreaterThan(18_000);
+    // Slow by construction: 20 000 comparisons took up to 1.1 s on CI.
+  }, 20_000);
 });

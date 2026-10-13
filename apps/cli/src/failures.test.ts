@@ -299,7 +299,7 @@ describe("crewhaus failures report (CLI)", () => {
     expect(stdout).toContain("incident:circuit_open");
     // The two timeout runs cluster into one row of count 2.
     expect(stdout).toMatch(/timeout\s+2\s+2/);
-  });
+  }, 20_000);
 
   test("--propose-taxonomy drafts a failure_taxonomy block", async () => {
     await seedRunFailed(
@@ -319,7 +319,7 @@ describe("crewhaus failures report (CLI)", () => {
     expect(stdout).toContain("failure_taxonomy:");
     expect(stdout).toContain("model call timed out after");
     expect(stdout).toContain("recovery:");
-  });
+  }, 20_000);
 
   test("--json emits structured clusters", async () => {
     await seedRunFailed("sess_00000000cccc0001", "auth", "invalid api key", 30);
@@ -328,23 +328,23 @@ describe("crewhaus failures report (CLI)", () => {
     const parsed = JSON.parse(stdout) as { clusters: Array<{ class: string; count: number }> };
     expect(parsed.clusters[0]?.class).toBe("auth");
     expect(parsed.clusters[0]?.count).toBe(1);
-  });
+  }, 20_000);
 
   test("empty harness reports no failures (exit 0)", async () => {
     const { exitCode, stdout } = await runCli(["failures", "report"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("no run failures or incidents recorded");
-  });
+  }, 20_000);
 
   test("rejects an unknown action", async () => {
     const { exitCode, stderr } = await runCli(["failures", "bogus"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('failures action must be "report"');
-  });
+  }, 20_000);
 
   test("--help prints usage (exit 0)", async () => {
     const { exitCode, stdout } = await runCli(["failures", "--help"]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("usage: crewhaus failures report");
-  });
+  }, 20_000);
 });

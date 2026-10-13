@@ -11,6 +11,8 @@
  *      ignoring it is how a rate limit turns into a ban.
  */
 
+import { parseHttpDate, parseIsoInstantWithOffset, parseZonedMailDate } from "./http-date";
+
 /** Exponential backoff: `base * 2^attempt`, clamped. `attempt` is 0-based. */
 export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): number {
   if (attempt < 0) return 0;
@@ -22,6 +24,16 @@ export function backoffDelayMs(attempt: number, baseMs: number, maxMs: number): 
  * `Retry-After` in milliseconds: either delta-seconds, or an HTTP-date
  * measured against `nowMs`. `null` when the header is absent or unparseable,
  * and never negative — a date already in the past means "retry now".
+ *
+ * The date is read by {@link parseHttpDate} — the three RFC 9110 forms, all
+ * GMT — or as an ISO-8601 or RFC 5322 date-time that names its own zone
+ * (`+0000`, `UTC`, a one-digit hour, no weekday: what servers send in place
+ * of a strict IMF-fixdate). `Date.parse` used to read it, and that reads a
+ * date with no zone (the asctime form, a zone-less RFC 1123 date, an
+ * offset-less ISO string) as the HOST's local time, so the same header
+ * waited an hour on one machine and not at all on another. A date with no
+ * zone is unparseable, and the backoff curve decides, as for any other
+ * header this cannot read.
  */
 export function parseRetryAfterMs(value: string | null, nowMs: number): number | null {
   if (value === null) return null;
@@ -31,8 +43,11 @@ export function parseRetryAfterMs(value: string | null, nowMs: number): number |
     const seconds = Number.parseInt(trimmed, 10);
     return Number.isFinite(seconds) ? seconds * 1000 : null;
   }
-  const at = Date.parse(trimmed);
-  if (Number.isNaN(at)) return null;
+  const at =
+    parseHttpDate(trimmed, nowMs) ??
+    parseIsoInstantWithOffset(trimmed) ??
+    parseZonedMailDate(trimmed);
+  if (at === undefined) return null;
   return Math.max(0, at - nowMs);
 }
 

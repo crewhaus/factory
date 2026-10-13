@@ -55,6 +55,7 @@ import {
   type DreamState,
   createFileIdempotencyStore,
   dreamWindowKey,
+  ensureDreamDir,
   readDreamState,
   writeDreamState,
 } from "./state";
@@ -75,8 +76,10 @@ export {
   type DreamState,
   DreamStateError,
   createFileIdempotencyStore,
+  dreamStoreRoot,
   dreamWindowIndex,
   dreamWindowKey,
+  ensureDreamDir,
   readDreamState,
   writeDreamState,
 } from "./state";
@@ -437,7 +440,9 @@ export function createDreamEngine(options: DreamEngineOptions): DreamEngine {
   const pricing = options.pricing ?? DEFAULT_PRICING;
   const idempotency =
     options.idempotencyStore ??
-    createFileIdempotencyStore(join(dreamDir, DREAM_IDEMPOTENCY_FILENAME));
+    createFileIdempotencyStore(join(dreamDir, DREAM_IDEMPOTENCY_FILENAME), {
+      root: options.crewhausDir,
+    });
 
   function overdueOf(state: DreamState | null, everyMs: number, nowMs: number): boolean {
     if (state === null) return true;
@@ -571,13 +576,17 @@ export function createDreamEngine(options: DreamEngineOptions): DreamEngine {
       nextDueAt,
     };
 
-    await writeDreamState(dreamDir, {
-      schemaVersion: 1,
-      lastRunAt: startedAt,
-      lastOutcome: outcome,
-      phase1Counts: phase1.counts,
-      lastEvidence: model?.evidence ?? [],
-    });
+    await writeDreamState(
+      dreamDir,
+      {
+        schemaVersion: 1,
+        lastRunAt: startedAt,
+        lastOutcome: outcome,
+        phase1Counts: phase1.counts,
+        lastEvidence: model?.evidence ?? [],
+      },
+      options.crewhausDir,
+    );
 
     // Additive `dream_run` proof record (design §6.2/§9) through the
     // injected sink — the composition root / CLI decide which log it lands
@@ -610,6 +619,10 @@ export function createDreamEngine(options: DreamEngineOptions): DreamEngine {
     const windowKey = dreamWindowKey(options.specName, now().getTime(), everyMs);
 
     try {
+      // The lock's own `mkdir -p` follows links; the directory is made (or
+      // checked) contained first, so a planted `.crewhaus/dream` link that
+      // leads out of `.crewhaus` is refused before anything is written.
+      ensureDreamDir(dreamDir, options.crewhausDir);
       return await withFileLock(
         join(dreamDir, "run.lock"),
         async () => {

@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../errors" },
+    { "path": "../tool-safety" },
     { "path": "../infra-utils" },
     { "path": "../tenancy" },
     { "path": "../embedder" }

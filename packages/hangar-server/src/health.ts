@@ -53,6 +53,7 @@
  * `durability.budget` finding. Preflight is the authority on what a start
  * actually needs; this module only prices it.
  */
+import { withoutTrailingComment } from "./spec-lines";
 
 /** The console tab a deduction is fixed on — every value is a real tab in
  *  the harness detail strip (`HARNESS_TABS` in the console's router), so a
@@ -426,7 +427,9 @@ export function declaredBudgetUsd(yamlText: string): number | null {
   const block: string[] = [(lines[start] as string).replace(/^budget\s*:/, "")];
   for (let i = start + 1; i < lines.length; i += 1) {
     const line = lines[i] as string;
-    if (line.trim() === "" || /^[\s#]/.test(line)) block.push(line.replace(/#.*$/, ""));
+    // The comment strip is a scan: `/#.*$/` read on from every `#` of a line
+    // holding a U+2028 or a lone `\r`, which `.` does not match.
+    if (line.trim() === "" || /^[\s#]/.test(line)) block.push(withoutTrailingComment(line));
     else break;
   }
   const m = block.join("\n").match(/(?:^|[\s{,])usd\s*:\s*([0-9]+(?:\.[0-9]+)?)/m);

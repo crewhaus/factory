@@ -41,7 +41,7 @@
  * until you revoke it there. The result says so every time.
  */
 import { randomBytes as cryptoRandomBytes } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -49,6 +49,8 @@ import { classifyWrite, helperName } from "./lib/backends";
 import {
   type Edit,
   type EnvDoc,
+  encodeBare,
+  exportedAssignment,
   parseEnvDoc,
   planUnset,
   planUpsert,
@@ -63,6 +65,7 @@ import {
   now,
   readJournal,
 } from "./lib/journal";
+import { readWorkspaceText } from "./lib/read";
 import {
   type Resolved,
   type SecretRef,
@@ -75,7 +78,7 @@ import {
 import { type Resolution, _setEnv, reasonOf, resolveChain, resolveOne } from "./lib/resolve";
 import { _setRunner, runCommand } from "./lib/run";
 import { writeFileAtomic } from "./lib/write";
-import { resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** The seams. Every test in this package drives these instead of the host. */
 export { _setRunner, _setEnv, _setClock };
@@ -270,6 +273,9 @@ async function lookupOne(
 
 export const secretLookup: RegisteredTool = buildTool({
   name: "SecretLookup",
+  // A reference, read as parseRef reads it: a `file:` or `envfile:` one is
+  // matched with the workspace file it opens, where that lands.
+  operativeArgs: [{ field: "refs", kind: "id", secretRef: true }],
   description:
     "Check whether a secret reference resolves, and report where it resolves FROM — without returning the secret. Use it to preflight credentials before a run, to find out which of several definitions of the same variable actually wins, or to confirm a rotation took. Each reference comes back with the backend that answered, the source, and a truncated SHA-256 fingerprint that lets you compare two secrets or detect a change without ever seeing either value; a bare NAME is searched across the environment, the .env chain and the secrets directory, and a shadowing definition with a different value is reported as a warning. It deliberately has no option to reveal a value.",
   inputSchema: z.object({
@@ -303,11 +309,25 @@ export const secretLookup: RegisteredTool = buildTool({
         });
         continue;
       }
-      const report = await lookupOne(parsed.value, {
-        toolName: "SecretLookup",
-        timeoutMs,
-        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      });
+      let report: LookupReport;
+      try {
+        report = await lookupOne(parsed.value, {
+          toolName: "SecretLookup",
+          timeoutMs,
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        });
+      } catch (err) {
+        // One reference that breaks must not discard the answers for the
+        // others. Only the error's class is reported: a message can carry
+        // whatever the failing step was holding, and here that is a secret.
+        report = {
+          ref: formatRef(parsed.value),
+          backend: parsed.value.kind,
+          status: "error",
+          resolved: false,
+          reason: `looking this reference up failed unexpectedly (${err instanceof Error ? err.name : typeof err}); the other references were still checked.`,
+        };
+      }
       const rotated = lastRotation(journal.entries, formatRef(parsed.value));
       reports.push({
         ...report,
@@ -414,7 +434,8 @@ function readDocForEdit(toolName: string, path: string): Resolved<OpenedDoc> {
   let real: string;
   try {
     real = resolveSafe(toolName, path).real;
-  } catch {
+  } catch (err) {
+    if (err instanceof ToolPermissionError && err.reason !== undefined) return refuse(err.message);
     return refuse(
       `refused "${path}": it resolves outside the workspace root. A .env is written inside the workspace only.`,
     );
@@ -423,7 +444,7 @@ function readDocForEdit(toolName: string, path: string): Resolved<OpenedDoc> {
   try {
     return {
       ok: true,
-      value: { real, doc: parseEnvDoc(readFileSync(real, "utf8")), existed: true },
+      value: { real, doc: parseEnvDoc(readWorkspaceText(path)), existed: true },
     };
   } catch (err) {
     return refuse(
@@ -476,6 +497,15 @@ export const envFileUpsert: RegisteredTool = buildTool({
   destructive: true,
   scope: "external",
   ioCapability: "process",
+  // The file a rule is about. Leaving `path` out writes `.env`, so a rule
+  // sees `.env` too — `alwaysDeny EnvFileUpsert(.env)` cannot be dodged by
+  // omitting the field. A `valueFrom` reference is where a value is copied
+  // from: a deny or ask reads it (`alwaysDeny EnvFileUpsert(file:secrets/**)`),
+  // an allow on the file does not have to name it.
+  operativeArgs: [
+    { field: "path", kind: "path", default: ".env" },
+    { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+  ],
   execute: async (input, ctx?: ToolExecuteContext) => {
     const path = input.path ?? ".env";
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;
@@ -606,7 +636,10 @@ async function writeValue(
     let real: string;
     try {
       real = resolveSafe(options.toolName, ref.path).real;
-    } catch {
+    } catch (err) {
+      if (err instanceof ToolPermissionError && err.reason !== undefined) {
+        return { ok: false, message: err.message };
+      }
       return { ok: false, message: `"${ref.path}" resolves outside the workspace root.` };
     }
     if (options.dry) return { ok: true, detail: `would write ${ref.path} (0600)` };
@@ -682,6 +715,12 @@ function previousRef(ref: SecretRef): SecretRef | undefined {
 
 export const secretRotate: RegisteredTool = buildTool({
   name: "SecretRotate",
+  // The secret it rewrites, and the one it may copy the new value from,
+  // which only a deny or ask reads.
+  operativeArgs: [
+    { field: "ref", kind: "id", secretRef: true },
+    { field: "newValueFrom", kind: "id", secretRef: true, source: true },
+  ],
   description:
     "Replace a stored secret with a new value and prove the new one reads back, without either value appearing in the result. The new value is generated here or taken from another reference; it is written first, verified by re-reading it, and only then is the previous copy retired — so a failure at any step leaves the old secret working, and the result names the step that failed. A rotation takes an exclusive lock, so two callers cannot rotate the same secret at once and invalidate each other. It rotates the STORED value only: a credential issued by a provider stays valid there until you revoke it. dryRun walks the same steps and reports what each one would do.",
   inputSchema: z.object({
@@ -897,6 +936,18 @@ export const secretRotate: RegisteredTool = buildTool({
           // fact worth recording before a credential is replaced with it.
           detail: `read from ${resolution.source}${resolution.note !== undefined ? ` — ${resolution.note}` : ""}`,
         });
+      }
+      // An envfile can hold only a value it can write losslessly for every
+      // reader (see encodeBare). Refused HERE, before keep-previous touches
+      // the file: a refusal at write-new would leave KEY_PREVIOUS written
+      // beside an unchanged KEY (C137).
+      if (ref.kind === "envfile") {
+        const current = readDocForEdit("SecretRotate", ref.path);
+        const exported = current.ok && exportedAssignment(current.value.doc, ref.key);
+        const encodable = encodeBare(ref.key, newValue, { exported });
+        if (!encodable.ok) {
+          return failed("new-value", `${encodable.message} Nothing was written.`);
+        }
       }
       const afterFingerprint = fingerprint(newValue);
       if (beforeFingerprint === afterFingerprint) {

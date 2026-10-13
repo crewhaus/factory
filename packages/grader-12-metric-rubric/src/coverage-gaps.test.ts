@@ -50,6 +50,19 @@ describe("toolSelectionAccuracy — no tool calls but expectation present", () =
   });
 });
 
+describe("toolSelectionAccuracy — an MCP tool's pre-0.7.1 name", () => {
+  test("a dataset naming srv__echo matches a first call recorded as mcp__srv__echo", async () => {
+    const first = [{ toolName: "mcp__srv__echo", toolUseId: "t1", isError: false }];
+    for (const expectedTool of ["srv__echo", "mcp__srv__echo"]) {
+      const s = { ...sample, expectedTool } as Sample;
+      const r = await toolSelectionAccuracy(s, emptyRun({ toolCalls: first }));
+      expect({ expectedTool, passed: r.passed }).toEqual({ expectedTool, passed: true });
+    }
+    const other = { ...sample, expectedTool: "other__echo" } as Sample;
+    expect((await toolSelectionAccuracy(other, emptyRun({ toolCalls: first }))).passed).toBe(false);
+  });
+});
+
 describe("contextRelevance — empty retrieved set", () => {
   test("returns 'no chunks retrieved' when retrievedChunks is empty", async () => {
     const s = {

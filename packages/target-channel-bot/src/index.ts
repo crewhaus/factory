@@ -30,6 +30,16 @@ import {
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  LOOP_TOOL_NAMES,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  SANDBOX_AVAILABLE_IMPORT,
+  type SpecChainBlocks,
+  readmeToolFacts,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 /**
  * Emit a self-contained channel-bot bundle for a channel-target IR.
@@ -90,7 +100,15 @@ export function emitChannelBot(ir: IrChannelV0, opts: EmitChannelBotOptions = {}
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts(
+          [{ tools: ir.tools, toolConfigs: ir.toolConfigs, path: AGENT_TOOL_CONFIG }],
+          ir,
+        ),
+      }),
+    });
   }
   return { files };
 }
@@ -103,75 +121,57 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
- * Built-in tool name → package + export. Mirror of the target-cli /
- * target-workflow maps, plus `sendMessage` (the channel-target's
- * cross-channel addressing tool from Section 12).
+ * Where this shape's block sits in the spec. README rows and boot errors name
+ * it, so they point at the key the operator actually wrote.
  */
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
+const AGENT_TOOL_CONFIG = "agent.tool_config";
 
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  sendMessage: { package: "@crewhaus/tool-message-channel", export: "sendMessage" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-};
-
+/**
+ * The spec's `agent.tools` → imports, `tool_config` registrations and
+ * `defaultCatalog.register(...)` lines, through the one shared builtin table
+ * (`@crewhaus/tool-categories`). `sendMessage` — the channel shape's own
+ * cross-channel addressing tool — is a channel-only entry there.
+ */
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
+  chains?: SpecChainBlocks,
 ): {
-  imports: string[];
-  inits: string[];
-  registrations: string[];
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
+  registrations: ReadonlyArray<string>;
+  sandbox: boolean;
 } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-  const byPackage = new Map<string, Set<string>>();
-  const registrations: string[] = [];
-  const inits: string[] = [];
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg = toolConfigs[name];
-      if (cfg !== undefined) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-      }
-    }
-    registrations.push(`defaultCatalog.register(${entry.export});`);
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools(
+      "channel",
+      [{ tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG }],
+      chains,
+    );
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
+    sandbox: resolved.sandbox,
+  };
+}
+
+/**
+ * `sandboxAvailable` for the turn's runChatLoop when a registered tool runs
+ * model-written code — the CREWHAUS_SANDBOX grammar the cli bundle and
+ * `crewhaus run` use. "" otherwise, so bundles without those tools keep
+ * their bytes.
+ */
+function renderSandboxField(ir: IrChannelV0): string {
+  return resolveTools(ir.tools, ir.toolConfigs).sandbox
+    ? `\n        sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},`
+    : "";
 }
 
 /**
@@ -657,12 +657,15 @@ defaultCatalog.register(__knowledgeTool);`;
 }
 
 /**
- * Item 3 (G32) — plugin activation for the channel daemon. Mirror of target-cli's
- * renderPlugins (keep in sync): when the spec declares `plugins:`, `daemon.ts`
- * activates the named plugins at boot via `@crewhaus/plugin-loader` (registry
- * read → Ed25519 signature + entrypoint-digest verify → import) and registers
- * the contributed tools on the shared `defaultCatalog`, so they ride
- * `defaultCatalog.list()` into `createAgent`.
+ * Item 3 (G32) — plugin activation for the channel daemon. Like target-cli's
+ * renderPlugins: when the spec declares `plugins:`, `daemon.ts` activates the
+ * named plugins at boot via `@crewhaus/plugin-loader` (registry read →
+ * Ed25519 signature + entrypoint-digest verify → import) and registers the
+ * contributed tools on the shared `defaultCatalog`, so they ride
+ * `defaultCatalog.list()` into `createAgent`. Unlike the cli bundle, a plugin
+ * that cannot load is skipped with a warning instead of stopping the start
+ * (`activatePluginsOrStartWithout`): 0.7.0 ignored `plugins:` here, so a
+ * daemon that ran then must keep running.
  *
  * Split so ordering is safe inside `main()`:
  *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
@@ -670,7 +673,9 @@ defaultCatalog.register(__knowledgeTool);`;
  *   - `registerBoot` runs AFTER the built-in + skill tools are on the catalog and
  *     skips any name already registered — first-party wins, and a plugin tool
  *     named after a built-in never trips `defaultCatalog.register`'s
- *     duplicate-name throw and bricks the daemon.
+ *     duplicate-name throw and bricks the daemon. It also skips the names the
+ *     run loop adds itself (`LOOP_TOOL_NAMES`), which a plugin tool would
+ *     otherwise take from the loop.
  * Both blocks are indented two spaces for the `main()` body. Empty when the spec
  * omits `plugins:`, keeping bundles byte-identical.
  */
@@ -686,14 +691,19 @@ function renderPlugins(ir: IrChannelV0): {
   }
   return {
     hasAny: true,
-    imports: [
-      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
-    ],
-    activateBoot: `  const __plugins = await activatePlugins({
+    imports: [`import { activatePluginsOrStartWithout } from "@crewhaus/plugin-loader";`],
+    // 0.7.0 accepted `plugins:` here and ignored it, so a daemon that ran
+    // then keeps starting: a plugin that is not installed or does not verify
+    // is skipped with a warning on every start, and never imported.
+    activateBoot: `  const __plugins = await activatePluginsOrStartWithout({
     names: ${JSON.stringify(names)},
-    ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
   });`,
-    registerBoot: `  for (const __t of __plugins.tools) {
+    registerBoot: `  const __loopOwned = new Set(${JSON.stringify(LOOP_TOOL_NAMES)});
+  for (const __t of __plugins.tools) {
+    if (__loopOwned.has(__t.name)) {
+      process.stderr.write(\`[plugins] tool "\${__t.name}" is the run loop's own — plugin contribution skipped\\n\`);
+      continue;
+    }
     if (defaultCatalog.get(__t.name) !== undefined) {
       process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
       continue;
@@ -1174,7 +1184,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${hybridImport}${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${hybridImport}${permImport}${renderSandboxField(ir) !== "" ? SANDBOX_AVAILABLE_IMPORT : ""}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";${
@@ -1232,7 +1242,7 @@ export function createAgent(config: AgentConfig): Agent {
       const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
-        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
+        instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}
         sessionName: ${escapeJsonString(ir.name)},
         sessionTarget: "channel",
         ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}),
@@ -2045,7 +2055,11 @@ function renderDaemon(ir: IrChannelV0): string {
   ) {
     throw new TargetEmitError("channel target requires at least one channel configured");
   }
-  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
+  const {
+    imports: builtinImports,
+    inits,
+    registrations,
+  } = resolveTools(ir.tools, ir.toolConfigs, ir);
   const mcp = renderMcpServers(ir);
   const knowledge = renderKnowledge(ir);
   const subAgents = renderSubAgents(ir);
@@ -2586,20 +2600,33 @@ try {
       ? `\n  // Loop contract 0.4 — spec-declared lifecycle hooks, layered below the\n  // settings.json-discovered ones (spec first; user → project later-wins).\n  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
       : "";
   const agentHooksExpr = specHooks !== undefined ? "[...__specHooks, ...__hooks]" : "__hooks";
+  // extension-path#4 — `plugins:` is wired on channel (renderPlugins was
+  // defined and never called, so a declared plugin silently did nothing).
+  // Activation runs before skill discovery so the plugins' skill dirs are
+  // discovered; their tools register after the MCP, sub-agent and knowledge
+  // boots, so a first-party tool always wins a name collision. All three
+  // pieces are empty without `plugins:`, keeping those bundles byte-identical.
+  const plugins = renderPlugins(ir);
+  const pluginsImport = plugins.imports.length > 0 ? `\n${plugins.imports.join("\n")}` : "";
+  const pluginsActivateBoot = plugins.hasAny ? `${plugins.activateBoot}\n` : "";
+  const pluginsRegisterBoot = plugins.hasAny
+    ? `\n  // Plugins (G32) — after every first-party tool is on the catalog.\n${plugins.registerBoot}\n`
+    : "";
+  const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
   const extensionImports = continuityOn
     ? `${hooksEngineImport}
-import { defaultCatalog } from "@crewhaus/tool-catalog";`
+import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`
     : `${hooksEngineImport}
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-import { defaultCatalog } from "@crewhaus/tool-catalog";`;
+import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`;
   const extensionBoot = continuityOn
-    ? `  const __cwd = process.cwd();
+    ? `${pluginsActivateBoot}  const __cwd = process.cwd();
   const __hooks = await loadHooks({ cwd: __cwd });`
-    : `  const __cwd = process.cwd();
+    : `${pluginsActivateBoot}  const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
-    discoverSkills({ cwd: __cwd }),
+    discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
     loadCommands({ cwd: __cwd }),
   ]);
   if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -2751,7 +2778,7 @@ async function main(): Promise<void> {
 ${adapterConstructBlock}
 
 ${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
-${controlPlaneBoot}${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
+${controlPlaneBoot}${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}${pluginsRegisterBoot}
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
   // rotation store (§2.5). One small JSON record under
   // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses
@@ -2875,7 +2902,11 @@ main().catch((err) => {
  * artifact.
  */
 function renderEvalEntry(ir: IrChannelV0): string {
-  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
+  const {
+    imports: builtinImports,
+    inits,
+    registrations,
+  } = resolveTools(ir.tools, ir.toolConfigs, ir);
   const fabric = memoryFabric(ir);
   const continuityOn = fabric.continuityOn;
   const thredzOn = ir.thredz !== undefined && fabric.wired;
@@ -2891,6 +2922,13 @@ function renderEvalEntry(ir: IrChannelV0): string {
     ...(ir.knowledge !== undefined
       ? [
           "// note: knowledge: declared but not ingested by the eval bridge entry in this slice — the Retrieve tool is absent from bridged channel evals",
+        ]
+      : []),
+    // C103 — the daemon activates plugins: at start; the bridge does not, so
+    // a bridged eval runs without the plugin's tools and skills. Say so.
+    ...(ir.plugins !== undefined && ir.plugins.length > 0
+      ? [
+          "// note: plugins: declared but not activated by the eval bridge entry — plugin tools and skills are absent from bridged channel evals (the daemon activates them at start)",
         ]
       : []),
     ...(thredzOn

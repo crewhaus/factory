@@ -16,6 +16,8 @@
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-code": "workspace:*",
+    "@crewhaus/tool-git": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/tool-text": "workspace:*",
     "zod": "^3.23.8"
   },

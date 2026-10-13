@@ -209,12 +209,26 @@ export function isTime(value: string): FormatResult {
 }
 
 /**
+ * A date-time split at its separator: one character, then everything up to
+ * the first `T` or `t` after it, then a non-empty rest. `.` and the class
+ * both stop at a line break (`\n`, `\r`, U+2028, U+2029), so a value that
+ * holds one never splits.
+ *
+ * This was `/^(.+?)[Tt](.+)$/`, which splits the same way. Its lazy group
+ * tried every `T` of a long first line and ran `(.+)` from each to the line
+ * break that `$` cannot pass: quadratic in the line, on ordinary prose. A
+ * failed try now gives back only characters that cannot be a `T`, one step
+ * each.
+ */
+export const DATE_TIME_SPLIT = /^(.[^Tt\n\r\u2028\u2029]*)[Tt](.+)$/;
+
+/**
  * RFC 3339 `date-time`: a date, a `T` (or lowercase `t`) separator, and a
  * time with an offset. A space separator, as SQL writes it, is rejected —
  * this is the strict interchange form.
  */
 export function isDateTime(value: string): FormatResult {
-  const split = value.match(/^(.+?)[Tt](.+)$/);
+  const split = value.match(DATE_TIME_SPLIT);
   if (split === null) return bad('expected a "T" between the date and the time');
   const date = isDate(split[1] ?? "");
   if (!date.valid) return bad(`date part: ${date.reason}`);

@@ -47,10 +47,25 @@ export function parseInline(src) {
   return spans;
 }
 
-const HEADING_RE = /^(#{1,6})\s+(.*)$/;
-const UL_ITEM_RE = /^\s*[-*]\s+(.*)$/;
-const OL_ITEM_RE = /^\s*\d+[.)]\s+(.*)$/;
+// Each block pattern reads only its marker and the blanks after it; the rest
+// of the line is the text. A line can still hold a break the split on "\n"
+// leaves (\r, U+2028, U+2029), and such a line is not a block: a trailing
+// `(.*)$` refused it by giving the blanks back one at a time and reading the
+// rest again after each, quadratic in the blanks, on agent-written memory and
+// feedback text in the operator's tab. The rest is now checked once.
+const HEADING_RE = /^(#{1,6})\s+/;
+const UL_ITEM_RE = /^\s*[-*]\s+/;
+const OL_ITEM_RE = /^\s*\d+[.)]\s+/;
+const LINE_BREAK_RE = /[\n\r\u2028\u2029]/;
 const FENCE_RE = /^```/;
+
+/** `head`'s match and the rest of the line after it; null when it does not match or the rest holds a break. */
+function blockAt(line, head) {
+  const match = line.match(head);
+  if (match === null) return null;
+  const rest = line.slice(match[0].length);
+  return LINE_BREAK_RE.test(rest) ? null : { match, rest };
+}
 
 /**
  * Parse a markdown source string into a flat list of block tokens:
@@ -93,20 +108,24 @@ export function parseMarkdown(src) {
       blocks.push({ type: "code", text: body.join("\n") });
       continue;
     }
-    const heading = line.match(HEADING_RE);
+    const heading = blockAt(line, HEADING_RE);
     if (heading) {
       flushPara();
       flushList();
-      blocks.push({ type: "heading", level: heading[1].length, spans: parseInline(heading[2]) });
+      blocks.push({
+        type: "heading",
+        level: heading.match[1].length,
+        spans: parseInline(heading.rest),
+      });
       i += 1;
       continue;
     }
-    const ul = line.match(UL_ITEM_RE);
-    const ol = ul === null ? line.match(OL_ITEM_RE) : null;
+    const ul = blockAt(line, UL_ITEM_RE);
+    const ol = ul === null ? blockAt(line, OL_ITEM_RE) : null;
     if (ul || ol) {
       flushPara();
       const ordered = ol !== null;
-      const item = parseInline((ul ?? ol)[1]);
+      const item = parseInline((ul ?? ol).rest);
       if (list === null || list.ordered !== ordered) {
         flushList();
         list = { type: "list", ordered, items: [] };

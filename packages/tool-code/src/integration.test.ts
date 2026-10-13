@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -56,6 +57,83 @@ afterEach(() => {
   process.chdir(originalCwd);
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/**
+ * C150: `tsc --noEmit` still writes `.tsbuildinfo` for an incremental or
+ * composite project — beside the tsconfig, into a `dist/` it creates, or to
+ * a committed `tsBuildInfoFile` that can point outside the workspace. Driven
+ * with the repository's real TypeScript: each case is first shown live with
+ * plain tsc, then Typecheck (and Diagnostics) must leave the project and the
+ * outside file untouched.
+ */
+describe.skipIf(process.platform === "win32")(
+  "the checkers write nothing into the project (C150)",
+  () => {
+    const tscBin = Bun.resolveSync("typescript/bin/tsc", import.meta.dir);
+    const listing = (dir: string): string[] =>
+      Bun.spawnSync(["find", ".", "-not", "-path", "./node_modules*"], { cwd: dir })
+        .stdout.toString()
+        .split("\n")
+        .filter((l) => l !== "")
+        .sort();
+
+    const cases: ReadonlyArray<{ what: string; options: Record<string, unknown> }> = [
+      { what: "an incremental project", options: { incremental: true } },
+      { what: "a composite project with an outDir", options: { composite: true, outDir: "dist" } },
+      {
+        what: "a tsBuildInfoFile pointing outside the workspace",
+        options: { incremental: true, tsBuildInfoFile: "../outside/victim.txt" },
+      },
+    ];
+
+    for (const c of cases) {
+      test(`Typecheck and Diagnostics on ${c.what}`, async () => {
+        const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-c150-")));
+        try {
+          const ws = join(base, "ws");
+          mkdirSync(join(base, "outside"));
+          writeFileSync(join(base, "outside", "victim.txt"), "precious");
+          mkdirSync(join(ws, "src"), { recursive: true });
+          mkdirSync(join(ws, "node_modules", ".bin"), { recursive: true });
+          symlinkSync(tscBin, join(ws, "node_modules", ".bin", "tsc"));
+          writeFileSync(join(ws, "src", "a.ts"), "export const a: number = 1;\n");
+          writeFileSync(
+            join(ws, "tsconfig.json"),
+            JSON.stringify({ compilerOptions: { strict: true, ...c.options }, include: ["src"] }),
+          );
+          const before = listing(ws);
+          // Live: plain `tsc --noEmit` writes the build info somewhere.
+          const plain = Bun.spawnSync([tscBin, "--noEmit", "-p", "tsconfig.json"], { cwd: ws });
+          expect(plain.exitCode).toBe(0);
+          const wrote =
+            listing(ws).join() !== before.join() ||
+            readFileSync(join(base, "outside", "victim.txt"), "utf8") !== "precious";
+          expect({ what: c.what, plainWrote: wrote }).toEqual({ what: c.what, plainWrote: true });
+          // Reset what plain tsc wrote.
+          rmSync(join(ws, "dist"), { recursive: true, force: true });
+          rmSync(join(ws, "tsconfig.tsbuildinfo"), { force: true });
+          writeFileSync(join(base, "outside", "victim.txt"), "precious");
+
+          process.chdir(ws);
+          const tc = JSON.parse(String(await lookup("Typecheck").execute({}))) as { ok: boolean };
+          const dg = JSON.parse(String(await lookup("Diagnostics").execute({}))) as {
+            ok: boolean;
+          };
+          expect({ what: c.what, typecheck: tc.ok, diagnostics: dg.ok }).toEqual({
+            what: c.what,
+            typecheck: true,
+            diagnostics: true,
+          });
+          expect(listing(ws)).toEqual(before);
+          expect(readFileSync(join(base, "outside", "victim.txt"), "utf8")).toBe("precious");
+        } finally {
+          process.chdir(workspace);
+          rmSync(base, { recursive: true, force: true });
+        }
+      }, 60_000);
+    }
+  },
+);
 
 describe("registration", () => {
   test("every tool registers without a name collision", () => {

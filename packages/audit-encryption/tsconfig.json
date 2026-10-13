@@ -7,7 +7,8 @@
   "references": [
     { "path": "../audit-log" },
     { "path": "../errors" },
-    { "path": "../secrets-manager" }
+    { "path": "../secrets-manager" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

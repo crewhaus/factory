@@ -23,7 +23,7 @@
  * them apart in {@link JsonlRead.state}, because collapsing them is how a
  * blocked run gets reported as an idle one.
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { constants, closeSync, fstatSync, openSync, readSync } from "node:fs";
 
 /** Default byte cap for one approvals log. Past this the tail is taken. */
 export const MAX_JSONL_BYTES = 16 * 1024 * 1024;
@@ -70,21 +70,29 @@ function errnoOf(err: unknown): string {
 }
 
 /**
+ * How a log is opened: never through a symbolic link at the leaf (every
+ * caller passes a path whose links were already resolved and checked, so a
+ * link found here is one that appeared since), and never blocking on a FIFO
+ * that has no writer. Both flags are absent on Windows, where they are 0.
+ */
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/**
  * Read at most `maxBytes` from the TAIL of a file.
  *
- * `missing` is distinguished from every other failure by probing with `stat`
- * first: `ENOENT` there is the one failure that means "no records", and
- * anything else (EACCES, EISDIR, a race that truncates the file under the fd)
- * is a genuine unknown.
+ * `missing` is distinguished from every other failure: `ENOENT` on open is
+ * the one failure that means "no records", and anything else (EACCES, a
+ * directory, a symbolic link, a race that truncates the file under the fd) is
+ * a genuine unknown. The size and the kind of file are read from the open
+ * descriptor, so what is measured is what is read.
  */
 export function readTailCapped(path: string, maxBytes: number): TailRead {
-  let size: number;
+  let fd: number;
   try {
-    const stat = statSync(path);
-    if (!stat.isFile()) return unreadable("the path is not a regular file");
-    size = stat.size;
+    fd = openSync(path, OPEN_FLAGS);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = errnoOf(err);
+    if (code === "ENOENT") {
       // `bytes: 0`, not null: a file that is not there holds zero bytes of
       // ledger, which is a fact rather than a failed measurement — `state`
       // already separates "no file" from "empty file". `null` here would be an
@@ -92,15 +100,21 @@ export function readTailCapped(path: string, maxBytes: number): TailRead {
       // there is, which trains a reader to ignore the nulls that matter.
       return { state: { kind: "missing" }, text: "", truncated: false, bytes: 0 };
     }
-    return unreadable(`the file could not be examined (${errnoOf(err)})`);
-  }
-  let fd: number;
-  try {
-    fd = openSync(path, "r");
-  } catch (err) {
-    return unreadable(`the file could not be opened (${errnoOf(err)})`);
+    // O_NOFOLLOW reports a link as ELOOP (EMLINK on FreeBSD).
+    if (code === "ELOOP" || code === "EMLINK") {
+      return unreadable("the path is a symbolic link, which is not followed here");
+    }
+    return unreadable(`the file could not be opened (${code})`);
   }
   try {
+    let size: number;
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) return unreadable("the path is not a regular file");
+      size = stat.size;
+    } catch (err) {
+      return unreadable(`the file could not be examined (${errnoOf(err)})`);
+    }
     const take = Math.min(size, maxBytes);
     const buf = Buffer.alloc(take);
     const read = readSync(fd, buf, 0, take, size - take);

@@ -345,10 +345,15 @@ describe("globToRegex — `**` invariants", () => {
   });
 
   test("a `**` guard fires on a multi-line command", () => {
-    // The builtin safety floor is `Bash(rm**)`; a newline must not slip past it.
+    // The builtin safety floor is `alwaysAsk Bash(rm**)`; a newline must not
+    // slip past it. A guard is an ask, so it is read with that polarity.
     const p = compilePattern("Bash(rm**)");
-    expect(matchesPattern(p, "Bash", { command: "rm -rf /\necho done" })).toBe(true);
-    expect(matchesPattern(p, "Bash", { command: "rm\n-rf\n/" })).toBe(true);
+    const ask = { polarity: "restrict" } as const;
+    expect(matchesPattern(p, "Bash", { command: "rm -rf /\necho done" }, ask)).toBe(true);
+    expect(matchesPattern(p, "Bash", { command: "rm\n-rf\n/" }, ask)).toBe(true);
+    // 0.7.1: a newline starts another command, so as an ALLOW the same glob
+    // no longer grants the `echo` that comes second.
+    expect(matchesPattern(p, "Bash", { command: "rm -rf /\necho done" })).toBe(false);
   });
 });
 

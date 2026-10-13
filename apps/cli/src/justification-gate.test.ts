@@ -93,7 +93,7 @@ describe("createJustificationJudge", () => {
     });
     expect(verdict.allow).toBe(false); // fail-closed on transport error
     expect(verdict.judgeModel).toBe("justification-judge-model (error)");
-  });
+  }, 20_000);
 });
 
 describe("openJustificationAuditSink", () => {

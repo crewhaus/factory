@@ -46,6 +46,7 @@ import type {
   ProviderMutation,
 } from "@crewhaus/prompt-optimizer";
 import { z } from "zod";
+import { firstObjectSpan } from "./json-span";
 
 export class ClaudeMutationProviderError extends CrewhausError {
   override readonly name = "ClaudeMutationProviderError";
@@ -201,15 +202,15 @@ export class ClaudeMutationProvider implements MutationProvider {
       return this.fallback(state, "model returned no text block", callUsage);
     }
 
-    // Extract JSON: tolerate ```json fences and leading prose. We
-    // search for the first balanced `{...}` substring.
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (jsonMatch === null) {
+    // Extract JSON: tolerate ```json fences and leading prose. We take
+    // the first `{` through the last `}`.
+    const json = firstObjectSpan(rawText);
+    if (json === null) {
       return this.fallback(state, "model response did not contain a JSON object", callUsage);
     }
     let parsed: { rewrite: string; rationale: string };
     try {
-      const raw = JSON.parse(jsonMatch[0]);
+      const raw = JSON.parse(json);
       parsed = META_RESPONSE_SCHEMA.parse(raw);
     } catch (err) {
       return this.fallback(

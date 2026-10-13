@@ -22,6 +22,16 @@
  *     every result says which of the three sources the root came from — a
  *     tool that reads a different registry than the operator thinks it does
  *     is a tool that reports the wrong dataset as clean.
+ *   - EVERY PATH UNDER THE ROOT IS CONTAINED TOO, not only the root (0.7.1,
+ *     security-6#7, flag-truth-3#3). The registry joins `<root>/<name>` and
+ *     `<root>/<name>/<version>.json` and follows whatever is there, so a
+ *     dataset directory linked out of the workspace took DatasetPut's write
+ *     and fed DatasetInspect/Lint/Mine an outside record. {@link openRegistry}
+ *     hands back a registry whose every operation first resolves the paths it
+ *     is about to touch, physically, and refuses one that lands outside the
+ *     workspace or a record that is not a regular file. A link that stays
+ *     inside the workspace (a dataset shared between two harnesses in one
+ *     repository) still works.
  */
 import { existsSync, statSync } from "node:fs";
 import { defaultDatasetsRoot } from "@crewhaus/dataset-ops";
@@ -30,10 +40,13 @@ import {
   type DatasetRegistry,
   DatasetRegistryError,
   type DatasetSplit,
+  assertDatasetName,
+  assertDatasetVersion,
   compareVersions,
   createFileBackedRegistry,
 } from "@crewhaus/dataset-registry";
-import { type SafePath, ToolPermissionError, resolveSafe } from "../paths";
+import { joinRel, probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
+import { type SafePath, ToolPermissionError, resolveSafe, workspaceRoot } from "../paths";
 import { type Loaded, errorMessage, fail, renderGiven } from "./result";
 
 /** Where the root came from, so a result can say so. */
@@ -97,9 +110,79 @@ export function resolveRegistryRoot(toolName: string, given?: string): Loaded<Re
   return { ok: true, value: { safe, rel: safe.rel === "" ? "." : safe.rel, source, exists } };
 }
 
-/** The registry implementation, pointed at a root that already passed the gate. */
+/**
+ * A path under the registry root that resolves outside the workspace, or a
+ * record that is not a regular file. Thrown by the registry
+ * {@link openRegistry} returns, before the underlying registry touches it.
+ */
+export class DatasetPathRefused extends Error {
+  override readonly name = "DatasetPathRefused";
+}
+
+/**
+ * Resolve `<root>/<name>` — and `<root>/<name>/<version>.json` when a version
+ * is given — the way the kernel will, links included, and throw
+ * {@link DatasetPathRefused} unless each lands inside the workspace and the
+ * record, if present, is a regular file. The name and version are checked
+ * against the registry's OWN grammar first (its error, unchanged), so a name
+ * the registry rejects is never resolved on disk.
+ */
+export function containDatasetPaths(root: RegistryRoot, name: string, version?: string): void {
+  assertDatasetName(name);
+  if (version !== undefined) assertDatasetVersion(version);
+  const dirRel = joinRel(root.safe.rel, name);
+  const dir = resolveContained(workspaceRoot(), dirRel);
+  if (!dir.ok) {
+    throw new DatasetPathRefused(
+      dir.code === "escapes-root"
+        ? `dataset "${renderGiven(name)}" is a symbolic link leading outside the workspace — refused, not read or written`
+        : `dataset "${renderGiven(name)}" could not be resolved (${dir.code})`,
+    );
+  }
+  if (version === undefined) return;
+  const leaf = resolveContained(workspaceRoot(), joinRel(dirRel, `${version}.json`));
+  if (!leaf.ok) {
+    throw new DatasetPathRefused(
+      leaf.code === "escapes-root"
+        ? `the record for "${renderGiven(name)}@${renderGiven(version)}" is a symbolic link leading outside the workspace — refused, not read or written`
+        : `the record for "${renderGiven(name)}@${renderGiven(version)}" could not be resolved (${leaf.code})`,
+    );
+  }
+  const kind = probeKind(leaf.real);
+  if (kind.ok && kind.kind !== "file") {
+    // A FIFO here would block the registry's synchronous read for ever.
+    throw new DatasetPathRefused(
+      `the record for "${renderGiven(name)}@${renderGiven(version)}" is a ${kind.kind}, not a regular file — refused without opening it`,
+    );
+  }
+}
+
+/**
+ * The registry implementation, pointed at a root that already passed the gate,
+ * with every operation contained (see the module comment). The record layout,
+ * grammar and immutability rule stay the registry's own.
+ */
 export function openRegistry(root: RegistryRoot): DatasetRegistry {
-  return createFileBackedRegistry({ rootDir: root.safe.real });
+  const inner = createFileBackedRegistry({ rootDir: root.safe.real });
+  return {
+    async put(record, opts) {
+      containDatasetPaths(root, record.name, record.version);
+      return inner.put(record, opts);
+    },
+    get(name, version, split, opts) {
+      containDatasetPaths(root, name, version);
+      return inner.get(name, version, split, opts);
+    },
+    async getRecord(name, version) {
+      containDatasetPaths(root, name, version);
+      return inner.getRecord(name, version);
+    },
+    async list(name) {
+      containDatasetPaths(root, name);
+      return inner.list(name);
+    },
+    listDatasets: () => inner.listDatasets(),
+  };
 }
 
 /**
@@ -116,6 +199,7 @@ export async function listVersions(
     const versions = await registry.list(name);
     return { ok: true, value: [...versions].sort(compareVersions) };
   } catch (err) {
+    if (err instanceof DatasetPathRefused) return fail("refused", err.message);
     // `list` does two things that throw: the registry's name grammar, and a
     // readdir. Reporting an EACCES or an ENOTDIR as "your name was rejected"
     // sends an operator to fix a name that is fine — the two failures are
@@ -157,6 +241,7 @@ export async function readRecord(
   try {
     return { ok: true, value: await registry.getRecord(name, version) };
   } catch (err) {
+    if (err instanceof DatasetPathRefused) return fail("refused", err.message);
     const message = errorMessage(err);
     if (/not found/i.test(message)) {
       return fail(

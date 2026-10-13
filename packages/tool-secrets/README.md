@@ -94,6 +94,31 @@ message naming the export that would remove the limitation. That is a real gap �
 write such a value by hand until `encodeEnvValue` is exported — and it is the
 honest one. A refusal an operator can act on beats a secret silently rewritten.
 
+The canonical reader is not the only one. A shell that sources the file
+(these files carry `export` lines) and Bun's own `.env` autoloader (a harness
+started from its directory loads that `.env`) both interpret some characters the
+canonical reader keeps literally. Bun expands `$` even inside single quotes, and
+double quotes (what `encodeEnvValue` writes) leave `$` and the backtick live for
+both, so **no quoting form** keeps such a value the same for every reader. Those
+values are refused, naming the character and the reader:
+
+- `$` (a shell and Bun expand it), a backtick (runs a command), `\` (an
+  escape), `;` `|` `&` (end the assignment), `<` `>` (redirect; `>` creates a
+  file), `(` `)` (a syntax error), and a quote;
+- `~` at the start or after a `:` (expands to a home directory);
+- `=` at the start or after a `:` (zsh's `=command` expansion);
+- `{` with `}` when the line has an `export` prefix (bash brace-expands an
+  export argument, `{a,b}` or `{1..3}`; a plain `KEY=` line is not expanded).
+
+Everything else is written: a shell does no globbing or word splitting in an
+assignment, so `?`, `*`, `!`, `^`, brackets and non-ASCII letters read back
+unchanged — a `DATABASE_URL` with `?sslmode=require` or `APP_NAME=Café` is
+fine. The tests run sh, dash, bash, zsh and Bun against both lists. Control
+characters and text that is not valid Unicode are refused too, for what they
+are. Generated rotation values (base64, base64url, hex) always qualify.
+`SecretRotate` checks this before it writes anything, so a refused new value
+leaves no `KEY_PREVIOUS` behind.
+
 ## Rotation, in the order that matters
 
 If a rotation half-succeeds, the operator is locked out of their own service. So

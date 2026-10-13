@@ -461,15 +461,33 @@ export function mapViesResponse(body: unknown, requesterSupplied: boolean): Regi
  * 503 with a maintenance code for an outage. The failure path lives in the
  * caller; this reads the 200 body.
  */
-export function mapHmrcResponse(body: unknown, requesterSupplied: boolean): RegisterAnswer {
+export function mapHmrcResponse(
+  body: unknown,
+  requesterSupplied: boolean,
+  askedNumber: string,
+): RegisterAnswer {
   const doc = (body ?? {}) as Record<string, unknown>;
   const target = (doc["target"] ?? {}) as Record<string, unknown>;
   const name = str(target["name"]);
-  if (name === undefined && str(target["vatNumber"]) === undefined) {
+  const answeredNumber = str(target["vatNumber"]);
+  if (name === undefined && answeredNumber === undefined) {
     return {
       outcome: "unavailable",
       basis:
         "HMRC answered 200 with no target — the response shape is not one this tool can read, and an empty body is not evidence that a number is unregistered",
+      retryable: false,
+    };
+  }
+  // The answer must be about the number asked about. A branch trader's 12
+  // digits are its 9-digit VRN plus a branch, so either form matches.
+  if (
+    answeredNumber !== undefined &&
+    answeredNumber !== askedNumber &&
+    answeredNumber !== askedNumber.slice(0, 9)
+  ) {
+    return {
+      outcome: "unavailable",
+      basis: `HMRC answered about ${answeredNumber}, not the number asked about (${askedNumber}), so its answer says nothing about this one`,
       retryable: false,
     };
   }
@@ -517,6 +535,11 @@ export function hmrcErrorMeaning(code: string | undefined, status: number | unde
   switch (code) {
     case "NOT_FOUND":
       return "HMRC: this number is not registered for VAT";
+    case "MATCHING_RESOURCE_NOT_FOUND":
+      // HMRC's answer for a request no API route or version matches. It is
+      // what version 1.0 of the checker has answered since HMRC removed it
+      // (February 2025); version 2.0 needs registered API credentials.
+      return "HMRC answered MATCHING_RESOURCE_NOT_FOUND: no API route matches the request, which is what HMRC answers since it removed version 1.0 of its unauthenticated VAT checker (February 2025). Version 2.0 needs registered API credentials, which this tool does not hold, so GB registration could not be checked";
     case "INVALID_REQUEST":
       return "HMRC rejected the request as malformed and did not look the number up";
     case "SCHEDULED_MAINTENANCE":
@@ -525,6 +548,6 @@ export function hmrcErrorMeaning(code: string | undefined, status: number | unde
     case "INTERNAL_SERVER_ERROR":
       return "HMRC's checker failed internally";
     default:
-      return `HMRC answered ${status ?? "an error"}${code === undefined ? "" : ` with the code "${code}"`}`;
+      return `HMRC answered ${status ?? "an error"}${code === undefined ? " with no error code, which says nothing about the number" : ` with the code "${code}"`}`;
   }
 }

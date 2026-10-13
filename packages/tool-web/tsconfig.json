@@ -8,9 +8,11 @@
     { "path": "../errors" },
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
+    { "path": "../tool-fetch" },
     { "path": "../tool-validate" },
     { "path": "../tool-permission-matcher" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../prompt-injection-detector" }
   ],
   "include": ["src/**/*"]
 }

@@ -81,7 +81,12 @@ export const WINDOWS_PRESENCE = registerPowerShellScript({
   script: [
     `$src = '${WINDOWS_IDLE_SOURCE}'`,
     "try { Add-Type -TypeDefinition $src -ErrorAction Stop; [Console]::Out.WriteLine('idleMs=' + [CHIdle]::Ms()) } catch { [Console]::Out.WriteLine('idleMs=?') }",
-    "$lock = @(Get-Process -Name LogonUI -ErrorAction SilentlyContinue).Count",
+    // THIS session's LogonUI only: Get-Process lists every session's, so on
+    // a host with another signed-in (or RDP) user, their lock screen read as
+    // this user being locked out — the direction that sends a workflow off
+    // to act unattended.
+    "$sid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId",
+    "$lock = @(Get-Process -Name LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $sid }).Count",
     "[Console]::Out.WriteLine('locked=' + $(if ($lock -gt 0) { 'yes' } else { 'no' }))",
   ].join("; "),
   reads: [],
@@ -239,6 +244,8 @@ export function parseWindowsPresence(stdout: string): {
   readonly idleSeconds: number | null;
   readonly locked: boolean | null;
 } {
+  // `[Console]::Out.WriteLine` ends each line with CRLF on Windows; `$`
+  // under `m` matches before `\r` as well as `\n`, so both parse.
   const idle = /^idleMs=(\d+)$/m.exec(stdout);
   const locked = /^locked=(yes|no)$/m.exec(stdout);
   return {

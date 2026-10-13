@@ -21,12 +21,39 @@
 const ANSI_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[ -/]*[@-~]`, "g");
 /** GitHub Actions prefixes every raw log line with an RFC 3339 timestamp. */
 const LEADING_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s?/;
+/*
+ * The line patterns below run on every line of a log that anyone whose pull
+ * request runs CI can write into, and a synchronous RegExp cannot be
+ * interrupted by the call's deadline. So each one is linear by construction:
+ * no two adjacent quantified pieces may accept the same character (`\s+[^:]*`
+ * lets both take a space, so a failed match tried every split of a long
+ * whitespace run, quadratically), and a trailing `(.*)$` carries the `s` flag
+ * so a U+2028 in the line cannot fail `$` and send the engine back into the
+ * pieces before it.
+ */
 /** `##[group]NAME`, `##[endgroup]`, `##[error]TEXT` — the runner's own markers. */
-const RUNNER_MARKER = /^##\[([a-z]+)\](.*)$/;
-/** The `::error file=x,line=1::message` workflow-command spelling. */
-const WORKFLOW_COMMAND = /^::([a-z]+)(?:\s+[^:]*)?::(.*)$/;
-/** GitLab's collapsible-section markers, after ANSI and CR removal. */
-const GITLAB_SECTION = /^section_(start|end):\d+:([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$/;
+export const RUNNER_MARKER = /^##\[([a-z]+)\](.*)$/s;
+/**
+ * The `::error file=x,line=1::message` workflow-command spelling. One `\s`,
+ * never `\s+`: `[^:]*` already takes any further whitespace, so the language
+ * is the same and a line with no closing `::` fails in one pass.
+ */
+export const WORKFLOW_COMMAND = /^::([a-z]+)(?:\s[^:]*)?::(.*)$/s;
+/**
+ * GitLab's collapsible-section markers, after ANSI and CR removal. Only the
+ * kind and the name are read, so nothing after the name is matched: the old
+ * `\s*(.*)$` tail overlapped on whitespace and was quadratic.
+ */
+export const GITLAB_SECTION = /^section_(start|end):\d+:([A-Za-z0-9_.-]+)/;
+/**
+ * How much of one line the patterns look at. Real CI lines are far shorter;
+ * a minified bundle echoed into a stack trace is one line of megabytes. The
+ * patterns above are linear, so this is defence in depth: a future pattern
+ * that is not costs at most this much per line. It is not `maxLineChars`,
+ * which cuts what is RETURNED (500 by default) and would stop a long
+ * `::error file=…::` command from being recognised.
+ */
+export const MATCH_WINDOW_CHARS = 64 * 1024;
 
 /** Lines that read as the actual failure, rather than merely mentioning one. */
 const ERROR_PATTERNS: ReadonlyArray<{ readonly name: string; readonly pattern: RegExp }> = [
@@ -122,7 +149,7 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
   const cut = (text: string): string =>
     text.length <= maxLineChars ? text : `${text.slice(0, maxLineChars)}…`;
 
-  const stack: string[] = [];
+  const sections = new OpenSections();
   let lastStep: string | null = null;
   const annotations: LogAnnotation[] = [];
   const errorLines: LogLocation[] = [];
@@ -133,14 +160,15 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
   let droppedAnnotations = 0;
   let droppedErrorLines = 0;
 
-  const currentStep = (): string | undefined => stack[stack.length - 1];
+  const currentStep = (): string | undefined => sections.innermost();
 
   let totalLines = 0;
   let cursor = 0;
   while (cursor < raw.length) {
     const brk = raw.indexOf("\n", cursor);
     const end = brk === -1 ? raw.length : brk;
-    const text = normalizeLogLine(raw.slice(cursor, end)).trimEnd();
+    const full = normalizeLogLine(raw.slice(cursor, end)).trimEnd();
+    const text = full.length <= MATCH_WINDOW_CHARS ? full : full.slice(0, MATCH_WINDOW_CHARS);
     cursor = end + 1;
     totalLines++;
     const lineNumber = totalLines;
@@ -148,7 +176,7 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
     // Keep a rolling tail of the non-blank lines rather than slicing at the
     // end: on a large log that is one pass and one small array.
     if (text.trim() !== "") {
-      tail.push(cut(text));
+      tail.push(cut(full));
       if (tail.length > tailLines) tail.shift();
     }
 
@@ -157,10 +185,10 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
       const kind = section[1] as string;
       const name = section[2] as string;
       if (kind === "start") {
-        stack.push(name);
+        sections.push(name);
         lastStep = name;
       } else {
-        popTo(stack, name);
+        sections.closeTo(name);
       }
       continue;
     }
@@ -169,16 +197,20 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
     const command = marker === null ? text.match(WORKFLOW_COMMAND) : null;
     const kind =
       marker !== null ? (marker[1] as string) : command !== null ? (command[1] as string) : null;
-    const payload =
+    // The payload group runs to the end of the matched window, so the whole
+    // payload is the same suffix of the full line: what is kept is cut by
+    // `maxLineChars`, never by the match window.
+    const captured =
       marker !== null ? (marker[2] as string) : command !== null ? (command[2] as string) : "";
+    const payload = full.slice(text.length - captured.length);
 
     if (kind === "group") {
-      stack.push(payload.trim());
+      sections.push(payload.trim());
       lastStep = payload.trim();
       continue;
     }
     if (kind === "endgroup") {
-      stack.pop();
+      sections.pop();
       continue;
     }
     if (kind === "error" || kind === "warning" || kind === "notice") {
@@ -215,7 +247,7 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
     if (looksLikeFailure(text)) {
       const entry: LogLocation = {
         line: lineNumber,
-        text: cut(text.trim()),
+        text: cut(full.trim()),
         ...(currentStep() !== undefined ? { step: currentStep() as string } : {}),
       };
       if (errorLines.length < maxErrorLines) errorLines.push(entry);
@@ -241,12 +273,57 @@ export function excerptLog(raw: string, opts: ExcerptOptions = {}): LogExcerpt {
 }
 
 /**
- * Close a named section, and everything a malformed log left open inside it.
- * A `section_end` for a name that was never started is ignored rather than
- * popping something unrelated.
+ * The groups and sections open at a point in the log, innermost last.
+ *
+ * Each name's count of open entries answers "is it open?" at once. Searching
+ * the stack for a `section_end` whose name was never started visited every
+ * open entry and closed none, so n starts followed by n such ends cost n²,
+ * and a job's own output can print both. A close now walks only for a name
+ * that is open, and visits exactly the entries it closes.
  */
-function popTo(stack: string[], name: string): void {
-  const index = stack.lastIndexOf(name);
-  if (index === -1) return;
-  stack.length = index;
+export class OpenSections {
+  private readonly names: string[] = [];
+  private readonly counts = new Map<string, number>();
+
+  push(name: string): void {
+    this.names.push(name);
+    this.counts.set(name, (this.counts.get(name) ?? 0) + 1);
+  }
+
+  /** `##[endgroup]`: close the innermost entry, whatever its name. */
+  pop(): void {
+    const name = this.names.pop();
+    if (name !== undefined) this.forget(name);
+  }
+
+  /**
+   * Close the innermost entry named `name`, and everything a malformed log
+   * left open inside it. A name that is not open is ignored rather than
+   * popping something unrelated.
+   */
+  closeTo(name: string): void {
+    if (!this.counts.has(name)) return;
+    // Bounded by the stack as well as by the name, so a count that ever
+    // drifted could empty the stack but never spin.
+    while (this.names.length > 0) {
+      const closed = this.names.pop() as string;
+      this.forget(closed);
+      if (closed === name) return;
+    }
+  }
+
+  innermost(): string | undefined {
+    return this.names[this.names.length - 1];
+  }
+
+  /** The open entries, outermost first. */
+  list(): string[] {
+    return [...this.names];
+  }
+
+  private forget(name: string): void {
+    const left = (this.counts.get(name) ?? 0) - 1;
+    if (left > 0) this.counts.set(name, left);
+    else this.counts.delete(name);
+  }
 }

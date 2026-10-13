@@ -192,3 +192,65 @@ describe("the question these two answer together", () => {
     expect(out.assets.every((a: { reason: string }) => a.reason === "cancelled")).toBe(true);
   });
 });
+
+describe("the egress screen on the URLs it would dial (C049)", () => {
+  // What the runtime hands a builtin: the run's context on its bridge. Only
+  // the lineage map is read here, so a structural stand-in is enough.
+  const secret = "internal-doc-7f3a9c Q3 acquisition target";
+  const runContextWith = (lineage: ReadonlyArray<[string, string]>) =>
+    ({ dataLineage: new Map(lineage) }) as unknown as NonNullable<
+      Parameters<RegisteredTool["execute"]>[1]
+    >["runContext"];
+  const formula = renderHomebrewFormula(RELEASE);
+  // Every download URL in the formula carries the tagged text in its query.
+  const tagged = formula.replace(/(url "[^"?]+)"/g, `$1?d=${encodeURIComponent(secret)}"`);
+
+  test("a URL carrying text a tool returned is not fetched, and the row says why", async () => {
+    const stub = stubFetch(releaseRoutes());
+    _setFetch(stub.fetch);
+    const runContext = runContextWith([[secret, "tool"]]);
+    for (const ctx of [{ bridge: { runContext } }, { runContext }]) {
+      const out = String(
+        await lookup("PackageManifestVerify").execute({ manifests: [{ text: tagged }] }, ctx),
+      );
+      const parsed = JSON.parse(out) as {
+        verdict: string;
+        assets: Array<{ outcome: string; reason?: string; message?: string }>;
+      };
+      expect(parsed.verdict).toBe("incomplete");
+      expect(parsed.assets.length).toBeGreaterThanOrEqual(2);
+      for (const asset of parsed.assets) {
+        expect([asset.outcome, asset.reason]).toEqual(["unchecked", "egressBlocked"]);
+        expect(asset.message).toContain("egress guard");
+      }
+    }
+    expect(stub.calls).toEqual([]);
+  });
+
+  test("text only the user wrote, or no lineage at all, is fetched as before", async () => {
+    for (const lineage of [[[secret, "user"]], []] as Array<Array<[string, string]>>) {
+      const stub = stubFetch(releaseRoutes());
+      _setFetch(stub.fetch);
+      const out = String(
+        await lookup("PackageManifestVerify").execute(
+          { manifests: [{ text: formula }] },
+          { bridge: { runContext: runContextWith(lineage) } },
+        ),
+      );
+      expect(out).not.toContain("egressBlocked");
+      expect(stub.calls.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("download:false dials nothing and screens nothing", async () => {
+    _setFetch(forbidNetwork);
+    const out = String(
+      await lookup("PackageManifestVerify").execute(
+        { manifests: [{ text: tagged }], download: false },
+        { bridge: { runContext: runContextWith([[secret, "tool"]]) } },
+      ),
+    );
+    expect(out).toContain('"reason":"notRequested"');
+    expect(out).not.toContain("egressBlocked");
+  });
+});

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
-import { PROC_TOOLS, __resetRegistryForTest, processStart } from "./index";
+import { PROC_TOOLS, __resetRegistryForTest, __stopAllForTest, processStart } from "./index";
 
 let catalog: ToolCatalog;
 let originalCwd: string;
@@ -33,8 +33,8 @@ beforeEach(() => {
   for (const tool of PROC_TOOLS) catalog.register(tool);
 });
 
-afterEach(() => {
-  __resetRegistryForTest();
+afterEach(async () => {
+  await __stopAllForTest();
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
 });

@@ -114,6 +114,87 @@ describe("toGeminiParams", () => {
     expect(fr?.id).toBe("gemini_my_tool_3");
   });
 
+  test("an orphaned id in the 0.7.1 shape (stream nonce + index) still yields the function name", async () => {
+    const { translateGeminiStream } = await import("./stream.js");
+    let id = "";
+    for await (const e of translateGeminiStream(
+      (async function* () {
+        yield {
+          candidates: [
+            {
+              content: { role: "model", parts: [{ functionCall: { name: "my_tool", args: {} } }] },
+            },
+          ],
+        } as never;
+      })(),
+    )) {
+      if (e.kind === "content_block_start" && e.block.type === "tool_use") id = e.block.id;
+    }
+    expect(id).not.toBe("gemini_my_tool_0");
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] },
+      ],
+    });
+    const fr = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.[0]?.functionResponse;
+    expect(fr?.name).toBe("my_tool");
+    expect(fr?.id).toBe(id);
+  });
+
+  // f916f83f used Gemini's own call id as the tool_use id, so once that
+  // tool_use left the window (compaction) the result was sent as
+  // functionResponse.name "fc_9f2k1", which names no declared function.
+  test("an orphaned result of a call Gemini gave an id: named by its function, answered under that id", async () => {
+    const { translateGeminiStream } = await import("./stream.js");
+    const ids: string[] = [];
+    for await (const e of translateGeminiStream(
+      (async function* () {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [
+                  { functionCall: { id: "fc_9f2k1", name: "Read", args: { path: "a" } } },
+                  { functionCall: { name: "my_tool", args: {} } },
+                ],
+              },
+            },
+          ],
+        } as never;
+      })(),
+    )) {
+      if (e.kind === "content_block_start" && e.block.type === "tool_use") ids.push(e.block.id);
+    }
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "user",
+          content: ids.map((id) => ({
+            type: "tool_result" as const,
+            tool_use_id: id,
+            content: "ok",
+          })),
+        },
+      ],
+    });
+    const frs = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.map((p) => p.functionResponse);
+    expect(frs?.map((fr) => [fr?.name, fr?.id])).toEqual([
+      ["Read", "fc_9f2k1"],
+      ["my_tool", ids[1]],
+    ]);
+  });
+
   test("orphaned non-synthetic tool_use_ids pass through as the name unchanged", () => {
     const params = toGeminiParams({
       ...baseReq,
@@ -499,5 +580,39 @@ describe("toGeminiParams — temperature (NEW-HUNT-2)", () => {
 
   test("omits temperature entirely when the request carries none", () => {
     expect(toGeminiParams(baseReq).config?.temperature).toBeUndefined();
+  });
+});
+
+/**
+ * An MCP-style `$ref` DAG: each level references the next twice, so a naive
+ * inline copies the leaf 2^depth times (flag-truth-4#6).
+ */
+function dagSchema(depth: number): Record<string, unknown> {
+  const defs: Record<string, unknown> = { [`d${depth}`]: { type: "string" } };
+  for (let i = 0; i < depth; i++) {
+    defs[`d${i}`] = {
+      type: "object",
+      properties: { a: { $ref: `#/$defs/d${i + 1}` }, b: { $ref: `#/$defs/d${i + 1}` } },
+      required: ["a", "b"],
+    };
+  }
+  return {
+    type: "object",
+    properties: { root: { $ref: "#/$defs/d0" } },
+    required: ["root"],
+    $defs: defs,
+  };
+}
+
+describe("toGeminiParams — a $ref DAG in a tool schema (flag-truth-4#6)", () => {
+  test("the request stays small: the schema is inlined within a budget", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      tools: [{ name: "deep", description: "deep schema", input_schema: dagSchema(16) }],
+    });
+    // Inlined naively this one tool was 5 MB, rebuilt on every request.
+    const size = JSON.stringify(params).length;
+    expect(size).toBeLessThan(1_000_000);
+    expect(JSON.stringify(params)).toContain("not expanded");
   });
 });

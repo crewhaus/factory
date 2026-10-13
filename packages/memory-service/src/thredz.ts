@@ -27,13 +27,12 @@
  * (`thredz_quota` on the free plan's 3-goal cap — never a crash); the local
  * write has ALWAYS already succeeded by the time a mirror runs.
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { ContinuityStore } from "@crewhaus/continuity-store";
 import type { McpHost } from "@crewhaus/mcp-host";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import type { ToolCatalog } from "@crewhaus/tool-catalog";
 import { type McpToolFlags, registerMcpToolAliases } from "@crewhaus/tool-mcp";
+import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { THREDZ_WIKI_TOOL_NAMES } from "@crewhaus/tool-wiki";
 
 /** The synthesized MCP server's name (compiler `THREDZ_MCP_SERVER_NAME`
@@ -113,7 +112,8 @@ export function thredzAliasToolNames(messaging = false): readonly string[] {
  * `@crewhaus/tool-wiki` / the goal tools' intent, so the backend flip never
  * relaxes a permission posture: `wiki_write`/`wiki_set_signals` keep their
  * Pillar 3 justification gate, `log_knowledge_gap` stays the un-gated honest
- * path, reads stay readOnly.
+ * path, reads stay readOnly. `inbox_poll` can consume, so it is not one of
+ * the reads (see its entry).
  */
 export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   wiki_recall: { readOnly: true },
@@ -139,6 +139,27 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   // Item 5 (G44) / #401 — the messaging set. Reads are reads; everything
   // that mutates the agent directory or a mailbox is destructive.
   //
+  // `inbox_poll` is not a read (0.7.1): its `mode: "consume"` advances the
+  // agent's at-least-once cursor and its `ack` commits one — the same effect
+  // as `message_ack` — and the call forwards both to the server untouched.
+  // Flags cannot depend on the arguments, so it is neither readOnly nor
+  // destructive: plan mode refuses it, default mode asks unless a rule
+  // allows it, and auto mode lets the heartbeat that polls every tick run
+  // without asking (making it destructive would stall every auto-mode A2A
+  // daemon that has no rule for it). The cursor stays recoverable
+  // (`message_ack` seek with `allowRegression`), and `thread_get` reads a
+  // thread without touching it.
+  //
+  // Decided, not overlooked (0.7.1 review): auto mode therefore also runs
+  // `inbox_poll`'s `ack` unasked. The server clamps it to the newest seq and
+  // only moves the cursor forward, so one call can mark messages the agent
+  // never saw as read, where `consume` only passes what it returned.
+  // `message_ack` stays destructive because its `seek` can move the cursor
+  // BACK (a replay); that gate is not what stops a forward commit. An
+  // operator who wants every poll to ask adds
+  // `{ type: alwaysAsk, pattern: inbox_poll }`; the forwarded arguments are
+  // the server's own, so they are left untouched.
+  //
   // `message_send` additionally carries the Pillar 3 intent gate, exactly as
   // the built-in `SendMessage` does and exactly as the spec's own
   // `thredz.messaging` docblock promises ("the send-side tools are
@@ -148,7 +169,7 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   // mutations are directory bookkeeping scoped to this agent's own handle,
   // so gating them would only train operators to wave the gate through.
   agent_list: { readOnly: true },
-  inbox_poll: { readOnly: true },
+  inbox_poll: { readOnly: false, destructive: false },
   thread_get: { readOnly: true },
   agent_register: { destructive: true },
   agent_update: { destructive: true },
@@ -429,9 +450,34 @@ export type ThredzGoalMirrorOptions = {
   readonly log?: (line: string) => void;
 };
 
-function readGoalMap(path: string): Record<string, string> {
+/** A goal map is a few ids per goal; anything past this is not one. */
+const GOAL_MAP_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The map is read and written contained to the store's directory
+ * (`.crewhaus/…/<spec>/`, which any agent with a write tool can reach):
+ * never through a link planted at `thredz-goals.json`, never from a FIFO,
+ * and never past {@link GOAL_MAP_MAX_BYTES}. A plain `readFileSync` /
+ * `writeFileSync` used to follow a planted link, so a mirrored `goal_write`
+ * overwrote whatever file the link named. A refusal is logged once per
+ * reason and treated as an empty map: the local goal is authoritative, and
+ * the only cost is a later mirror update skipped (with its own warning).
+ */
+function readGoalMap(dir: string, onRefused: (why: string) => void): Record<string, string> {
+  const read = openForReadSync(dir, THREDZ_GOAL_MAP_FILE, {
+    maxBytes: GOAL_MAP_MAX_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    if (read.code !== "not-found") onRefused(`not read: ${read.reason}`);
+    return {};
+  }
+  if (read.truncated) {
+    onRefused(`not read: it is larger than ${GOAL_MAP_MAX_BYTES} bytes`);
+    return {};
+  }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+    const parsed = JSON.parse(read.text) as unknown;
     if (typeof parsed !== "object" || parsed === null) return {};
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed)) {
@@ -443,13 +489,18 @@ function readGoalMap(path: string): Record<string, string> {
   }
 }
 
-function writeGoalMap(path: string, map: Record<string, string>): void {
-  try {
-    writeFileSync(path, `${JSON.stringify(map, null, 2)}\n`);
-  } catch {
-    // Best-effort bookkeeping — a failed map write only costs a future
-    // mirror update (skip + warn), never the local goal.
-  }
+function writeGoalMap(
+  dir: string,
+  map: Record<string, string>,
+  onRefused: (why: string) => void,
+): void {
+  // Best-effort bookkeeping — a failed map write only costs a future
+  // mirror update (skip + warn), never the local goal.
+  const written = writeFileSafe(dir, THREDZ_GOAL_MAP_FILE, `${JSON.stringify(map, null, 2)}\n`, {
+    overwrite: true,
+    mode: 0o600,
+  });
+  if (!written.ok) onRefused(`not written: ${written.reason}`);
 }
 
 /** Pull the created goal's id out of a `goal_write` response body (Thredz
@@ -484,7 +535,13 @@ export function withThredzGoalMirror(
   store: ContinuityStore,
   opts: ThredzGoalMirrorOptions,
 ): ContinuityStore {
-  const mapPath = join(store.dir(), THREDZ_GOAL_MAP_FILE);
+  const mapDir = store.dir();
+  const refusals = new Set<string>();
+  const onMapRefused = (why: string): void => {
+    if (refusals.has(why)) return;
+    refusals.add(why);
+    opts.log?.(`[thredz] goal mirror map ${THREDZ_GOAL_MAP_FILE} ${why}\n`);
+  };
   const redactor = createPiiRedactor();
   const warn = (op: string, detail: string): void => {
     const klass = classifyThredzFailure(detail);
@@ -516,7 +573,11 @@ export function withThredzGoalMirror(
         } else {
           const remoteId = extractThredzGoalId(res.content);
           if (remoteId !== undefined) {
-            writeGoalMap(mapPath, { ...readGoalMap(mapPath), [goal.id]: remoteId });
+            writeGoalMap(
+              mapDir,
+              { ...readGoalMap(mapDir, onMapRefused), [goal.id]: remoteId },
+              onMapRefused,
+            );
           }
         }
       } catch (err) {
@@ -526,7 +587,7 @@ export function withThredzGoalMirror(
     },
     async updateGoal(goalId, patch) {
       const goal = await store.updateGoal(goalId, patch);
-      const remoteId = readGoalMap(mapPath)[goalId];
+      const remoteId = readGoalMap(mapDir, onMapRefused)[goalId];
       if (remoteId === undefined) {
         // The create mirror was skipped (offline/quota) — nothing to address.
         opts.log?.(

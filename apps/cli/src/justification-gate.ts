@@ -85,16 +85,16 @@ export function resolveJudgeChoice(
  * for `"rule-based"` so the caller omits `justificationJudge` from
  * `runChatLoop` (runtime-core then uses `ruleBasedJustificationJudge`, the
  * documented default for tests/offline runs). For `"claude"` it lazily
- * imports the model-router + `@crewhaus/justification-judge-claude` so
- * that model-backed code only loads when actually selected.
+ * imports `@crewhaus/justification-judge-claude` so that model-backed code
+ * only loads when actually selected.
  *
- * The judge model is resolved through the model-router, so the spec's
- * `security.justification.model` accepts the full router grammar
- * (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) — the judge
- * package only needs a `ProviderAdapter`. The wire model is the
- * resolution's *stripped* modelId; the previous hardcoded
- * `createAnthropicAdapter()` + verbatim model string broke every
- * non-Anthropic judge with model-not-found.
+ * The construction itself is `createJustificationJudgeFromSlot`, the one a
+ * compiled bundle calls too, so the two judge a justification the same way:
+ * the model resolves through the model-router (the spec's
+ * `security.justification.model` accepts the full router grammar —
+ * claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url> — and the wire
+ * model is the resolution's stripped id), defaulting to
+ * `DEFAULT_JUSTIFICATION_JUDGE_MODEL`.
  */
 export async function createJustificationJudge(
   choice: JudgeChoice,
@@ -102,12 +102,10 @@ export async function createJustificationJudge(
   params?: JustificationSlot["params"],
 ): Promise<JustificationJudge | undefined> {
   if (choice === "rule-based") return undefined;
-  const { resolveModel } = await import("@crewhaus/model-router");
-  const { createClaudeJustificationJudge } = await import("@crewhaus/justification-judge-claude");
-  const resolution = await resolveModel(model ?? "claude-haiku-4-5");
-  return createClaudeJustificationJudge({
-    adapter: resolution.adapter,
-    model: resolution.modelId,
+  const { createJustificationJudgeFromSlot } = await import("@crewhaus/justification-judge-claude");
+  return createJustificationJudgeFromSlot({
+    judge: choice,
+    ...(model !== undefined ? { model } : {}),
     // 0.6.0 §4.2 — the judge profile's pinned request params.
     ...(params !== undefined ? { params } : {}),
   });

@@ -9,6 +9,7 @@ import {
   type RuntimeApprovalRecord,
   type RuntimeApprovalStoreLike,
   approvalFallbackText,
+  approvalPlacesText,
   createApprovalPrompter,
   createRuntimeBackedApprovalStore,
   postApprovalPrompt,
@@ -363,6 +364,93 @@ describe("createRuntimeBackedApprovalStore", () => {
     // The channel surface renders a preview; the raw input stays behind.
     expect(listed[0]?.inputPreview).toContain("ship it");
     expect((listed[0] as unknown as { input?: unknown }).input).toBeUndefined();
+  });
+
+  test("0.7.1 — a park asked again says where it lands and which approval it stands in for (critic8)", async () => {
+    // The two records runtime-core writes when a symlink on the path moves
+    // between park and resume: the grant made while `pub/link` led to
+    // public/, and the park asked again now that it leads to secrets/. Same
+    // tool, same input: on the card they read the same but for these lines.
+    const input = { path: "pub/link/x.md", content: "x" };
+    const granted = record({
+      toolName: "Write",
+      input,
+      places: [{ path: "pub/link/x.md", at: ["/ws/public/x.md"] }],
+      decision: "grant",
+      decidedBy: "slack:U1",
+      decidedAt: "2026-01-01T00:00:01.000Z",
+    });
+    const again = record({
+      id: "appr_00000000000000bb",
+      toolName: "Write",
+      input,
+      places: [{ path: "pub/link/x.md", at: ["/ws/secrets/x.md"] }],
+      supersedes: {
+        id: granted.id,
+        decision: "grant",
+        places: [{ path: "pub/link/x.md", at: ["/ws/public/x.md"] }],
+      },
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+    const bridged = createRuntimeBackedApprovalStore(fakeRuntimeStore([granted, again]).store);
+    const first = await bridged.get(granted.id);
+    const second = await bridged.get(again.id);
+    if (first === null || second === null) throw new Error("both records are cards");
+    expect(second.inputPreview).toBe(first.inputPreview);
+    expect(approvalPlacesText(first)).toBe("lands at: pub/link/x.md -> /ws/public/x.md");
+    const text = `asked again: approval ${granted.id} was granted for pub/link/x.md -> /ws/public/x.md, and a symlink on the path now leads elsewhere\nlands at: pub/link/x.md -> /ws/secrets/x.md`;
+    expect(approvalPlacesText(second)).toBe(text);
+
+    // Posted, the interactive card carries it, and so does the text fallback.
+    const cards: unknown[] = [];
+    await postApprovalPrompt({
+      pending: second,
+      sendText: async () => {},
+      postInteractive: async (card) => {
+        cards.push(card);
+        return {};
+      },
+    });
+    expect(cards).toEqual([
+      {
+        approvalId: again.id,
+        toolName: "Write",
+        inputPreview: second.inputPreview,
+        surface: "channel",
+        landsAt: text,
+      },
+    ]);
+    const sent: string[] = [];
+    await postApprovalPrompt({ pending: second, sendText: async (t) => void sent.push(t) });
+    expect(sent).toEqual([`${approvalFallbackText(again.id)}\n${text}`]);
+  });
+
+  test("0.7.1 — places a record does not hold in the shape written are left off the card", async () => {
+    const malformed = [
+      record({ id: "appr_00000000000000a1", places: "public/x.md" as never }),
+      record({ id: "appr_00000000000000a2", places: [{ path: 1, at: ["/ws/x"] }] as never }),
+      record({ id: "appr_00000000000000a3", supersedes: { id: 7 } as never }),
+      // No places at all: parked through the channel store, or before 0.7.1.
+      record({ id: "appr_00000000000000a4" }),
+    ];
+    const bridged = createRuntimeBackedApprovalStore(fakeRuntimeStore(malformed).store);
+    for (const r of malformed) {
+      const card = await bridged.get(r.id);
+      expect({ id: r.id, places: card?.places, supersedes: card?.supersedes }).toEqual({
+        id: r.id,
+        places: undefined,
+        supersedes: undefined,
+      });
+      expect(approvalPlacesText(card as PendingApproval)).toBeUndefined();
+    }
+    // And the text fallback is what it always was.
+    const sent: string[] = [];
+    const plain = await bridged.get("appr_00000000000000a4");
+    await postApprovalPrompt({
+      pending: plain as PendingApproval,
+      sendText: async (t) => void sent.push(t),
+    });
+    expect(sent).toEqual([approvalFallbackText("appr_00000000000000a4")]);
   });
 
   test("a decided record maps status from the runtime's `decision`", async () => {

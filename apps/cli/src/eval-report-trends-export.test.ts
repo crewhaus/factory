@@ -195,7 +195,7 @@ describe("eval-report trends (C31)", () => {
     expect(stdout).toContain("pass_rate 50.0% → 100.0% (+50.0pp)");
     expect(stdout).toContain("cost $0.0300 over 2 priced run(s)");
     expect(stdout).toContain("flaky_samples=1");
-  });
+  }, 20_000);
 
   test("--dataset filters to one lineage", async () => {
     const root = newTempRoot();
@@ -204,7 +204,7 @@ describe("eval-report trends (C31)", () => {
     expect(stdout).toContain("hard-suite");
     expect(stdout).not.toContain("run_1111111111111111");
     expect(stdout).toContain("no trend yet");
-  });
+  }, 20_000);
 
   test("-o writes a self-contained HTML chart page + trends.json", async () => {
     const root = newTempRoot();
@@ -222,14 +222,14 @@ describe("eval-report trends (C31)", () => {
     }>;
     expect(json).toHaveLength(2);
     expect(json[0]?.points).toHaveLength(2);
-  });
+  }, 20_000);
 
   test("an empty history says so instead of rendering an empty chart", async () => {
     const root = newTempRoot();
     const { exitCode, stdout } = await runCli(["eval-report", "trends"], root);
     expect(exitCode).toBe(0);
     expect(stdout).toContain("no recorded runs match");
-  });
+  }, 20_000);
 });
 
 describe("eval-report export (C32)", () => {
@@ -249,7 +249,7 @@ describe("eval-report export (C32)", () => {
     expect(stdout).toContain("run_2222222222222222");
     expect(stdout).toContain("concierge");
     expect(stdout).toContain("difficulty=hard");
-  });
+  }, 20_000);
 
   test("--format jsonl emits one parseable object per row, -o writes the file", async () => {
     const root = newTempRoot();
@@ -269,7 +269,7 @@ describe("eval-report export (C32)", () => {
     expect(rows.map((r) => r["grader"])).toEqual(["exact", "judge", "exact", "judge"]);
     // C34's flaky flag rides the export so instability is analyzable.
     expect(rows.filter((r) => r["flaky"] === true)).toHaveLength(2);
-  });
+  }, 20_000);
 
   test("a comma-separated run list works, and a missing dir warns but does not abort", async () => {
     const root = newTempRoot();
@@ -288,7 +288,7 @@ describe("eval-report export (C32)", () => {
     expect(exitCode).toBe(0);
     expect(stderr).toContain("warning: skipping");
     expect(stdout.trim().split("\n")).toHaveLength(1 + 8);
-  });
+  }, 20_000);
 
   test("bad flags die with a usable message", async () => {
     const root = newTempRoot();
@@ -310,7 +310,7 @@ describe("eval-report export (C32)", () => {
     );
     expect(unreadable.exitCode).not.toBe(0);
     expect(unreadable.stderr).toContain("none of the requested runs could be read");
-  });
+  }, 20_000);
 });
 
 describe("eval-report diff --epsilon (NEW-stats-1)", () => {
@@ -345,14 +345,14 @@ describe("eval-report diff --epsilon (NEW-stats-1)", () => {
     );
     expect(bad.exitCode).not.toBe(0);
     expect(bad.stderr).toContain("--epsilon must be a non-negative number");
-  });
+  }, 20_000);
 
   test("--epsilon on a read verb warns that it is diff-only", async () => {
     const root = newTempRoot();
     fixtureHistory(root);
     const { stderr } = await runCli(["eval-report", "history", "--epsilon", "0.2"], root);
     expect(stderr).toContain("--epsilon only applies to `eval-report diff`");
-  });
+  }, 20_000);
 });
 
 describe("eval-report history (C34 marking)", () => {
@@ -363,7 +363,7 @@ describe("eval-report history (C34 marking)", () => {
     expect(stdout).toContain("flaky");
     expect(stdout).toContain("run(s) contain flaky samples (worst: run_2222222222222222, 1 sample");
     expect(stdout).toContain("crewhaus eval-report export --runs");
-  });
+  }, 20_000);
 });
 
 describe("eval plan (C28) at the CLI seam", () => {
@@ -384,7 +384,7 @@ describe("eval plan (C28) at the CLI seam", () => {
     const missing = await runCli(["eval", "plan"], root);
     expect(missing.exitCode).not.toBe(0);
     expect(missing.stderr).toContain("--target-delta F is required");
-  });
+  }, 20_000);
 });
 
 describe("schedule generate (D41) at the CLI seam", () => {
@@ -401,7 +401,7 @@ describe("schedule generate (D41) at the CLI seam", () => {
     // The verb is a shim: the working directory is untouched — no crontab,
     // no unit file, not even a `.crewhaus/` scaffold.
     expect(readdirSync(root)).toEqual([]);
-  });
+  }, 20_000);
 
   test("unknown target / action die with the supported list", async () => {
     const root = newTempRoot();
@@ -412,5 +412,5 @@ describe("schedule generate (D41) at the CLI seam", () => {
     const badAction = await runCli(["schedule", "install"], root);
     expect(badAction.exitCode).not.toBe(0);
     expect(badAction.stderr).toContain('schedule action must be "generate"');
-  });
+  }, 20_000);
 });

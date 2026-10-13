@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
-import { SECURE_TOOLS } from "./index";
+import { SECURE_TOOLS, registerSecureConfig } from "./index";
 
 const KEY_VAR = "CREWHAUS_TEST_SIGNING_KEY";
 const originalCwd = process.cwd();
@@ -28,6 +28,7 @@ function lookup(name: string): RegisteredTool {
 
 beforeEach(() => {
   process.env[KEY_VAR] = "an-integration-key";
+  registerSecureConfig({ key_env_vars: [KEY_VAR] });
   tmp = mkdtempSync(path.join(tmpdir(), "crewhaus-secure-int-"));
   process.chdir(tmp);
   mkdirSync(path.join(tmp, "src"), { recursive: true });
@@ -41,6 +42,7 @@ afterEach(() => {
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   delete process.env[KEY_VAR];
+  registerSecureConfig({});
 });
 
 describe("registration", () => {

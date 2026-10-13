@@ -19,6 +19,7 @@
  * whole reason a team spends a week chasing the wrong test.
  */
 import { statsKernel } from "@crewhaus/tool-math";
+import { compileUserRegex } from "@crewhaus/tool-safety/regex";
 
 export const TEST_STATUSES = ["pass", "fail", "error", "skip"] as const;
 export type TestStatus = (typeof TEST_STATUSES)[number];
@@ -56,6 +57,17 @@ export type FlakyOptions = {
   readonly quarantineLowerBound?: number;
   /** Caller-declared substitutions applied to failure text before grouping. */
   readonly masks?: ReadonlyArray<Mask>;
+  /**
+   * The masks already applied, off this thread: each failure text's
+   * grouping key, and each mask's hit count over every failure. The tool
+   * computes these in @crewhaus/tool-safety's regex worker under a deadline
+   * (C073), so a caller's pattern never runs synchronously here; `masks`
+   * is then only named, not run. A text missing from `keys` is an error.
+   */
+  readonly maskedText?: {
+    readonly keys: ReadonlyMap<string, string>;
+    readonly counts: Readonly<Record<string, number>>;
+  };
 };
 
 export type FailureGroup = {
@@ -119,6 +131,27 @@ export type FlakyReport = {
 const isFailure = (status: TestStatus): boolean => status === "fail" || status === "error";
 
 /**
+ * The failure texts masks are applied to, one per failing observation that
+ * carries text and no signature, in input order: exactly the texts
+ * `groupFailures` would mask, so a hit count summed over them is the count
+ * `applyMasks` reports.
+ */
+export function maskSubjects(runs: ReadonlyArray<RunInput>): string[] {
+  const out: string[] = [];
+  for (const run of runs) {
+    for (const test of run.tests) {
+      if (!isFailure(test.status) || test.signature !== undefined) continue;
+      const raw = test.error ?? "";
+      if (raw !== "") out.push(raw);
+    }
+  }
+  return out;
+}
+
+/** The whitespace fold every grouping key gets after the masks. */
+export const foldWhitespace = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/**
  * Apply the caller's substitutions and report how many times each fired.
  *
  * A mask that rewrites text invisibly can merge two genuinely different
@@ -141,21 +174,21 @@ export function applyMasks(
   let out = text;
   for (const mask of masks) {
     const flags = mask.flags ?? "";
-    let re: RegExp;
-    try {
-      re = new RegExp(mask.pattern, flags.includes("g") ? flags : `${flags}g`);
-    } catch (err) {
-      throw new FlakyError(
-        `mask /${mask.pattern}/ is not a valid regular expression: ${(err as Error).message}`,
-      );
+    // Screened for the catastrophic shapes even here, where the caller is
+    // this package's own code: FlakyTestDetect itself never gets this far
+    // with a caller's mask (see `maskedText`).
+    const compiled = compileUserRegex(mask.pattern, flags.includes("g") ? flags : `${flags}g`);
+    if (!compiled.ok) {
+      throw new FlakyError(`mask /${mask.pattern}/ was refused: ${compiled.reason}`);
     }
+    const re = compiled.regex;
     const fired = out.match(re)?.length ?? 0;
     if (fired > 0) {
       out = out.replace(re, mask.with ?? "<masked>");
       counts[mask.pattern] = (counts[mask.pattern] ?? 0) + fired;
     }
   }
-  return out.replace(/\s+/g, " ").trim();
+  return foldWhitespace(out);
 }
 
 /**
@@ -265,6 +298,7 @@ function groupFailures(
   occurrences: ReadonlyArray<Occurrence>,
   masks: ReadonlyArray<Mask>,
   counts: Record<string, number>,
+  maskedText: FlakyOptions["maskedText"],
 ): FailureGroup[] {
   const groups = new Map<string, { count: number; example: string; runs: string[] }>();
   for (const occurrence of occurrences) {
@@ -273,7 +307,7 @@ function groupFailures(
     // No text and no signature means the run recorded a failure without
     // saying anything about it; that is not a group of one, it is an unknown.
     if (occurrence.signature === undefined && raw === "") continue;
-    const key = occurrence.signature ?? applyMasks(raw, masks, counts);
+    const key = occurrence.signature ?? maskedKey(raw, masks, counts, maskedText);
     const row = groups.get(key);
     if (row === undefined) {
       groups.set(key, { count: 1, example: raw, runs: [occurrence.runId] });
@@ -290,6 +324,22 @@ function groupFailures(
       runs: row.runs,
     }))
     .sort((a, b) => b.count - a.count || (a.signature < b.signature ? -1 : 1));
+}
+
+function maskedKey(
+  raw: string,
+  masks: ReadonlyArray<Mask>,
+  counts: Record<string, number>,
+  maskedText: FlakyOptions["maskedText"],
+): string {
+  if (maskedText === undefined) return applyMasks(raw, masks, counts);
+  const key = maskedText.keys.get(raw);
+  if (key === undefined) {
+    throw new FlakyError(
+      "a failure text has no precomputed mask key; its failures cannot be grouped",
+    );
+  }
+  return key;
 }
 
 export function detectFlaky(
@@ -362,7 +412,7 @@ export function detectFlaky(
       z,
     };
     const order = orderAnalysis(list, orderVaried, suiteSize);
-    const failureGroups = groupFailures(list, masks, maskCounts);
+    const failureGroups = groupFailures(list, masks, maskCounts, options.maskedText);
     // A failure that recorded no text and no signature is in no group, so one
     // group does not mean one failure mode — it means one failure mode among
     // the failures that said anything. Answering "yes, always the same way"
@@ -470,7 +520,7 @@ export function detectFlaky(
     },
     tests,
     summary,
-    masksApplied: maskCounts,
+    masksApplied: options.maskedText?.counts ?? maskCounts,
     runsForDeterminismClaim: runsForLowerBound(0.9, z),
     verdict,
     note:

@@ -87,8 +87,12 @@ function fakePluginRegistry(): PluginRegistry {
     async get(name) {
       return memEntries.get(name);
     },
-    async pin() {
-      throw new Error("not used");
+    async pin(name, version) {
+      const entry = memEntries.get(name);
+      if (entry === undefined) throw new Error(`not registered: ${name}`);
+      const next = { ...entry, pinnedVersion: version };
+      memEntries.set(name, next);
+      return next;
     },
     async verifyEntry() {
       throw new Error("not used");
@@ -233,22 +237,30 @@ describe("install", () => {
     expect(caught).toBeInstanceOf(ModuleMarketplaceError);
   });
 
-  test("downloads source tarball when registry implements downloadSource", async () => {
-    let downloaded: { name: string; version: string } | undefined;
+  // extension-path#3 (C017): 0.7.0 wrote the archive as base64 `source.bin`,
+  // which nothing read, so install reported success for code that could never
+  // run. An archive is now neither fetched nor unpacked, and install says so.
+  test("a source archive is neither fetched nor unpacked, and install says so", async () => {
+    let downloaded = false;
     const c = createMarketplaceClient({
       registry: fakeRegistrySource({
-        async downloadSource(name, version) {
-          downloaded = { name, version };
+        async downloadSource() {
+          downloaded = true;
           return new TextEncoder().encode("fake-source");
         },
       }),
       pluginRegistry: fakePluginRegistry(),
       pluginsDir: PLUGINS_DIR,
       writeFileImpl: recordWrite,
+      readEntrypointImpl: async () => undefined,
     });
-    await c.install("alpha-tools");
-    expect(downloaded).toEqual({ name: "alpha-tools", version: "1.0.0" });
-    expect(memFiles.has("/tmp/plugins/alpha-tools/source.bin")).toBe(true);
+    const result = await c.install("alpha-tools");
+    expect(downloaded).toBe(false);
+    expect([...memFiles.keys()]).toEqual(["/tmp/plugins/alpha-tools/plugin.json"]);
+    expect(result.runnable).toBe(false);
+    expect(result.warnings[0]).toBe(
+      'registry "test-registry" offers a source archive for alpha-tools@1.0.0; this crewhaus installs the manifest only and does not fetch or unpack it.',
+    );
   });
 
   test("respects subdir + manifestFilename overrides", async () => {
@@ -336,6 +348,33 @@ describe("update", () => {
     const updated = await c.update("alpha-tools");
     expect(updated).toBeDefined();
     expect(updated?.manifest.version).toBe("2.0.0");
+  });
+});
+
+describe("update leaves a pinned plugin at its pin (C172)", () => {
+  // Activation loads a pinned plugin only at its pin, so updating past it
+  // would stop the plugin loading.
+  test("a newer remote is not installed over a pin", async () => {
+    let calls = 0;
+    const registry = fakePluginRegistry();
+    const c = createMarketplaceClient({
+      registry: fakeRegistrySource({
+        async getManifest() {
+          calls += 1;
+          return calls === 1
+            ? (MANIFESTS["alpha-tools"] as PluginManifest)
+            : { name: "alpha-tools", version: "2.0.0" };
+        },
+      }),
+      pluginRegistry: registry,
+      pluginsDir: PLUGINS_DIR,
+      writeFileImpl: recordWrite,
+    });
+    await c.install("alpha-tools");
+    await registry.pin("alpha-tools", "1.0.0");
+    expect(await c.update("alpha-tools")).toBeUndefined();
+    expect(calls).toBe(1);
+    expect((await registry.get("alpha-tools"))?.manifest.version).toBe("1.0.0");
   });
 });
 

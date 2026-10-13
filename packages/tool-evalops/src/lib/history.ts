@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import * as path from "node:path";
 /**
  * The eval history, read through the reader that owns it.
@@ -29,13 +29,27 @@ import {
   INDEX_FILENAME,
   type RunIndexEntry,
   baselineKeyFor,
+  jsonSyntaxProblem,
+  latestRunIndexEntries,
   lineageOfEntry,
-  readBaselines,
-  readRunIndex,
-  readRunIndexLatest,
+  parseRunIndex,
 } from "@crewhaus/eval-report";
-import type { SafePath } from "../paths";
-import { type Loaded, containedDir, countNonBlankLines, fail, renderPath } from "./read";
+import { type SafePath, workspaceRoot } from "../paths";
+import {
+  type Loaded,
+  containedDir,
+  countNonBlankLines,
+  fail,
+  joinRel,
+  readLeaf,
+  renderPath,
+} from "./read";
+
+/**
+ * The most bytes of `baselines.json` read. A pin is a few hundred bytes; a
+ * file this size is not a pin file, and refusing it is not "none pinned".
+ */
+const MAX_BASELINES_BYTES = 16 * 1024 * 1024;
 
 /** One row the index carried that this package refuses to fold. */
 export type UnusableRow = {
@@ -115,12 +129,25 @@ export function rowProblem(parsed: unknown): string | undefined {
   return undefined;
 }
 
-/** Read the run index for an evals directory, with the accounting above. */
+/**
+ * Read the run index for an evals directory, with the accounting above.
+ *
+ * `index.jsonl` is read with its LEAF contained (security-7#12): a link at
+ * that name leading out of the workspace is refused, not stat'ed, counted and
+ * reported. The bytes read here are the bytes parsed — they go to
+ * `@crewhaus/eval-report`'s text parser, not back to it as a path to open a
+ * second time.
+ */
 export function readIndex(toolName: string, dirRel: string, maxBytes: number): Loaded<IndexRead> {
   const dir = containedDir(toolName, dirRel);
   if (!dir.ok) return dir;
-  const indexPath = path.join(dir.value.real, INDEX_FILENAME);
-  if (!existsSync(indexPath)) {
+  const read = readLeaf(
+    joinRel(dir.value.rel, INDEX_FILENAME),
+    `${dirRel}/${INDEX_FILENAME}`,
+    maxBytes,
+  );
+  if (!read.ok) {
+    if (read.code !== "missing") return read;
     return {
       ok: true,
       value: {
@@ -136,33 +163,13 @@ export function readIndex(toolName: string, dirRel: string, maxBytes: number): L
       },
     };
   }
-  // Size-check and read the raw text FIRST, for two reasons: the cap must be
-  // applied before any reader loads the file into memory, and the file's own
-  // line count is the only denominator against which the shared reader's
-  // silent skipping becomes visible.
-  let bytes: number;
-  try {
-    bytes = statSync(indexPath).size;
-  } catch {
-    return fail("unreadable", `"${renderPath(dirRel)}/${INDEX_FILENAME}" could not be stat'ed`);
-  }
-  if (bytes > maxBytes) {
-    return fail(
-      "too-large",
-      `"${renderPath(dirRel)}/${INDEX_FILENAME}" is ${bytes} bytes, over this tool's ${maxBytes}-byte limit — raise maxBytes`,
-    );
-  }
-  let text: string;
-  try {
-    text = readFileSync(indexPath, "utf8");
-  } catch {
-    return fail("unreadable", `"${renderPath(dirRel)}/${INDEX_FILENAME}" could not be read`);
-  }
+  // The cap was applied by the read itself, and the file's own line count is
+  // the only denominator against which the shared parser's silent skipping
+  // becomes visible.
+  const { text, bytes } = read.value;
   const lines = countNonBlankLines(text);
 
-  // The absolute directory goes to the shared reader so its own `join` cannot
-  // be re-based by a cwd change between the containment check and the read.
-  const allRows = readRunIndex(dir.value.real);
+  const allRows = parseRunIndex(text);
   // BELT AND BRACES. `readRunIndexLatest` reads `.runId` off every row it is
   // given, and `readRunIndex` used to hand it a line holding `null` — which
   // parses fine — so the collapse threw a TypeError and took this whole read
@@ -176,7 +183,7 @@ export function readIndex(toolName: string, dirRel: string, maxBytes: number): L
   let latest: RunIndexEntry[];
   let collapseFailed: string | undefined;
   try {
-    latest = readRunIndexLatest(dir.value.real);
+    latest = latestRunIndexEntries(allRows);
   } catch (err) {
     latest = allRows;
     collapseFailed = `the supersede collapse in @crewhaus/eval-report threw (${(err as Error).message}) — a line in this index parses as JSON but is not an object. Rows are reported WITHOUT the collapse, so a resumed run may appear more than once.`;
@@ -215,6 +222,12 @@ export function readIndex(toolName: string, dirRel: string, maxBytes: number): L
 export type BaselinesRead = {
   readonly present: boolean;
   readonly file: BaselinesFile;
+  /**
+   * `baselines.json` is a symbolic link that stays inside the workspace. It
+   * is READ through the link; a pin is never WRITTEN through one (see
+   * `commitPin`), so `set` and `clear` refuse it.
+   */
+  readonly linked: boolean;
 };
 
 /**
@@ -233,29 +246,77 @@ function isBaselinesMap(parsed: unknown): parsed is BaselinesFile {
   return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
 }
 
-/** Read `baselines.json`, distinguishing "no pins yet" from "unreadable". */
+/**
+ * Read `baselines.json`, distinguishing "no pins yet" from "unreadable".
+ *
+ * The LEAF is contained (security-7#0): a link at that name leading out of the
+ * workspace is refused before anything is read — dangling or not, since a
+ * dangling link is exactly the one a write would follow to CREATE its target.
+ * A parse failure is reported without the parser's message, which quotes the
+ * file's first token.
+ */
 export function readPins(dir: SafePath, dirRel: string): Loaded<BaselinesRead> {
-  const pinPath = path.join(dir.real, BASELINES_FILENAME);
-  if (!existsSync(pinPath)) return { ok: true, value: { present: false, file: {} } };
-  try {
-    const file = readBaselines(dir.real);
-    if (!isBaselinesMap(file)) {
+  const shown = `${renderPath(dirRel)}/${BASELINES_FILENAME}`;
+  const leafRel = joinRel(dir.rel, BASELINES_FILENAME);
+  const read = readLeaf(leafRel, `${dirRel}/${BASELINES_FILENAME}`, MAX_BASELINES_BYTES);
+  if (!read.ok) {
+    if (read.code === "missing" && !nameExists(path.join(workspaceRoot(), leafRel))) {
+      return { ok: true, value: { present: false, file: {}, linked: false } };
+    }
+    if (read.code === "missing") {
+      // The NAME is there but leads nowhere: a dangling link inside the
+      // workspace. Not "no pins yet" — a write would follow it.
       return fail(
-        "malformed",
-        `"${renderPath(dirRel)}/${BASELINES_FILENAME}" parses as JSON but is ${
-          file === null ? "null" : Array.isArray(file) ? "an array" : `a ${typeof file}`
-        }, not a map of lineage key to pinned run — the pins cannot be read, which is not the same as none being pinned, and writing over it would be a guess about what it was meant to hold`,
+        "refused",
+        `"${shown}" is a symbolic link to nothing — the pins cannot be read, and a pin is never written through a link`,
       );
     }
-    return { ok: true, value: { present: true, file } };
+    return read;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(read.value.text);
   } catch (err) {
-    // `readBaselines` throws a ReportError on malformed JSON. A malformed pin
-    // file is NOT "no baseline is pinned": every gate that reads it is
-    // currently broken, and saying "none" here would hide that.
+    // A malformed pin file is NOT "no baseline is pinned": every gate that
+    // reads it is currently broken, and saying "none" here would hide that.
     return fail(
       "malformed",
-      `"${renderPath(dirRel)}/${BASELINES_FILENAME}" could not be parsed (${(err as Error).message}) — the pins cannot be read, which is not the same as none being pinned`,
+      `"${shown}" could not be parsed (it is not valid JSON: ${jsonSyntaxProblem(err)}) — the pins cannot be read, which is not the same as none being pinned`,
     );
+  }
+  if (!isBaselinesMap(parsed)) {
+    return fail(
+      "malformed",
+      `"${shown}" parses as JSON but is ${
+        parsed === null ? "null" : Array.isArray(parsed) ? "an array" : `a ${typeof parsed}`
+      }, not a map of lineage key to pinned run — the pins cannot be read, which is not the same as none being pinned, and writing over it would be a guess about what it was meant to hold`,
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      present: true,
+      file: parsed,
+      linked: isSymlink(path.join(workspaceRoot(), leafRel)),
+    },
+  };
+}
+
+/** True when the NAME exists, whether or not it leads anywhere (`lstat`). */
+function nameExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSymlink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 

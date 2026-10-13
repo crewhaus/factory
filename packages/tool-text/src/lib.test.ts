@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
+import { regexWork } from "./__test__/regex-work";
 import {
   type ParsedDiff,
   type ParsedDiffFile,
@@ -22,13 +24,14 @@ import { compactLogLines, looksLikeError, stripTimestamps } from "./lib/log";
 import {
   codeBlocks,
   markdownTable,
+  parseAtxHeading,
   parseHeadings,
   renderOutline,
   sectionBody,
   slugify,
 } from "./lib/markdown";
 import { glossaryReplace, normalizeText, sortLines, stripAnsi } from "./lib/normalize";
-import { regexExtractAll } from "./lib/regex";
+import { answerPatterns, regexExtractAll } from "./lib/regex";
 import {
   extractKeywords,
   fuzzyRank,
@@ -68,41 +71,67 @@ describe("locate", () => {
 });
 
 describe("regexExtractAll", () => {
-  test("locates each match by offset and line", () => {
-    const { matches } = regexExtractAll("foo\nbar foo", "foo", "", 10);
+  // The worker reports a failing `exec` that took 100 ms as the engine giving
+  // up, never as "no match". A worker thread a loaded runner stalls that long
+  // in a scan's last, failing `exec` turns "no more matches" into
+  // "undetermined", which reads as truncated. So these scans run with a
+  // give-up threshold no runner reaches; the 5 s deadline still stops a hang.
+  const extract = async (text: string, pattern: string, flags: string, max: number) => {
+    const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
+    const giveUpMs = defaults.giveUpMs;
+    defaults.giveUpMs = 60_000;
+    let result: Awaited<ReturnType<typeof regexExtractAll>>;
+    try {
+      result = await regexExtractAll(text, pattern, flags, max);
+    } finally {
+      defaults.giveUpMs = giveUpMs;
+    }
+    if (!result.ok) throw new Error(result.invalid);
+    return result;
+  };
+
+  test("locates each match by offset and line", async () => {
+    const { matches } = await extract("foo\nbar foo", "foo", "", 10);
     expect(matches.length).toBe(2);
     expect(matches[0]).toMatchObject({ match: "foo", index: 0, line: 1, column: 1 });
     expect(matches[1]).toMatchObject({ match: "foo", line: 2, column: 5 });
   });
 
-  test("returns named capture groups", () => {
-    const { matches } = regexExtractAll("v1.2.3", "(?<major>\\d+)\\.(?<minor>\\d+)", "", 10);
+  test("returns named capture groups", async () => {
+    const { matches } = await extract("v1.2.3", "(?<major>\\d+)\\.(?<minor>\\d+)", "", 10);
     expect(matches[0]?.groups).toEqual({ major: "1", minor: "2" });
   });
 
-  test("returns positional captures too", () => {
-    const { matches } = regexExtractAll("a=1", "(\\w)=(\\d)", "", 10);
+  test("returns positional captures too", async () => {
+    const { matches } = await extract("a=1", "(\\w)=(\\d)", "", 10);
     expect(matches[0]?.captures).toEqual(["a", "1"]);
   });
 
-  test("a zero-width pattern terminates instead of spinning", () => {
-    const { matches } = regexExtractAll("abc", "x*", "", 100);
+  test("a zero-width pattern terminates instead of spinning", async () => {
+    const { matches } = await extract("abc", "x*", "", 100);
     expect(matches.length).toBeLessThanOrEqual(100);
     expect(matches.length).toBeGreaterThan(0);
   });
 
-  test("respects maxMatches and reports truncation", () => {
-    const { matches, truncated } = regexExtractAll("aaaa", "a", "", 2);
+  test("respects maxMatches and reports truncation", async () => {
+    const { matches, truncated } = await extract("aaaa", "a", "", 2);
     expect(matches.length).toBe(2);
     expect(truncated).toBe(true);
   });
 
-  test("does not report truncation when everything fit", () => {
-    expect(regexExtractAll("aa", "a", "", 10).truncated).toBe(false);
+  test("does not report truncation when everything fit", async () => {
+    expect((await extract("aa", "a", "", 10)).truncated).toBe(false);
   });
 
-  test("honours case-insensitive flags", () => {
-    expect(regexExtractAll("FOO", "foo", "i", 10).matches.length).toBe(1);
+  test("honours case-insensitive flags", async () => {
+    expect((await extract("FOO", "foo", "i", 10)).matches.length).toBe(1);
+  });
+
+  test("a pattern the screen refuses is invalid, with the reason", async () => {
+    expect(await regexExtractAll("aaaa!", "(a+)+$", "", 10)).toEqual({
+      ok: false,
+      invalid: expect.stringMatching(/repeat|nest/i),
+    });
   });
 });
 
@@ -819,6 +848,34 @@ describe("markdown", () => {
     expect(parseHeadings(doc).some((h) => h.title === "not a heading")).toBe(false);
   });
 
+  test("the heading reader follows CommonMark on the closing sequence and the space", () => {
+    expect(parseAtxHeading("## Title ##")).toEqual({ depth: 2, title: "Title" });
+    // A closing run needs a space before it; 0.7.0 read this as "C".
+    expect(parseAtxHeading("# C#")).toEqual({ depth: 1, title: "C#" });
+    expect(parseAtxHeading("# Foo#bar")).toEqual({ depth: 1, title: "Foo#bar" });
+    expect(parseAtxHeading("#\tTabbed #")).toEqual({ depth: 1, title: "Tabbed" });
+    expect(parseAtxHeading("# Crlf\r")).toEqual({ depth: 1, title: "Crlf" });
+    expect(parseAtxHeading("#NoSpace")).toBeNull();
+    expect(parseAtxHeading("####### seven")).toBeNull();
+    expect(parseAtxHeading("# ###")).toBeNull();
+    // A lone `#` does not take the next line as its title.
+    expect(parseHeadings("#\nnot a heading").map((h) => h.title)).toEqual([]);
+  });
+
+  test("a heading with a long run of spaces is read in linear time", () => {
+    // Counted, not timed: every pattern the reader runs is walked by a model
+    // that counts its backtracking steps (__test__/regex-work.ts). The reader
+    // takes 5 steps a character here. 0.7.0's `/^(#{1,6})\s+(.+?)\s*#*\s*$/`
+    // is cubic: 125,752 steps a character at 500 spaces, and 1.5 s of wall
+    // time at 2,000. A count past the bound stops the read and is Infinity.
+    const line = `# a${" ".repeat(20_000)}b ##`;
+    const bound = 64 * line.length;
+    const counted = regexWork(bound, () => parseHeadings(line));
+    expect(counted.unmodelled).toEqual([]);
+    expect(counted.steps).toBeLessThanOrEqual(bound);
+    expect(counted.value?.[0]?.title).toBe(`a${" ".repeat(20_000)}b`);
+  });
+
   test("slugify matches the GitHub anchor shape", () => {
     expect(slugify("Hello, World!")).toBe("hello-world");
   });
@@ -876,6 +933,18 @@ describe("markdown", () => {
 });
 
 describe("template", () => {
+  test("a placeholder reads the data's own fields, never Object.prototype's", () => {
+    const data = { user: { name: "ada" }, items: [1] };
+    for (const path of ["constructor", "user.toString", "user.__proto__", "items.constructor"]) {
+      expect({ path, value: lookupPath(data, path) }).toEqual({ path, value: undefined });
+    }
+    expect(() => renderTemplateString("hi {{constructor}}", data, true)).toThrow(
+      /"constructor", which the data does not provide/,
+    );
+    const own = JSON.parse('{"constructor":"C","__proto__":"P"}');
+    expect(renderTemplateString("{{constructor}} {{__proto__}}", own, true).text).toBe("C P");
+  });
+
   test("lookupPath walks objects and arrays", () => {
     const data = { user: { name: "ada" }, items: [{ id: 7 }] };
     expect(lookupPath(data, "user.name")).toBe("ada");
@@ -953,9 +1022,30 @@ describe("classifyByRules", () => {
     expect(classifyByRules("x y", weighted, 1, null).label).toBe("b");
   });
 
-  test("regex rules are supported", () => {
+  test("regex rules read their answers, worked out in the worker", async () => {
     const re = [{ label: "id", patterns: ["ORD-\\d+"], regex: true }];
-    expect(classifyByRules("order ORD-42", re, 1, null).label).toBe("id");
+    const answered = await answerPatterns("order ORD-42", ["ORD-\\d+"], "i");
+    if (!answered.ok) throw new Error(answered.invalid);
+    expect(classifyByRules("order ORD-42", re, 1, null, answered.answers).label).toBe("id");
+    // Without an answer the pattern is never run here, and nothing is labelled.
+    const unanswered = classifyByRules("order ORD-42", re, 1, "other");
+    expect(unanswered.label).toBeNull();
+    expect(unanswered.undetermined).toEqual([
+      { pattern: "ORD-\\d+", reason: expect.stringMatching(/not answered/) },
+    ]);
+  });
+
+  test("a label named like an Object.prototype member is a label", () => {
+    // 0.7.0 added the points to Object's own constructor function and
+    // ranked the string that made.
+    const rules = [
+      { label: "constructor", patterns: ["x"], weight: 2 },
+      { label: "toString", patterns: ["y"] },
+    ];
+    const out = classifyByRules("x y", rules, 1, null);
+    expect(out.label).toBe("constructor");
+    expect(out.score).toBe(2);
+    expect(Object.hasOwn(out.scores, "toString")).toBe(true);
   });
 
   test("ties break on label so the answer is stable", () => {

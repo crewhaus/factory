@@ -75,9 +75,67 @@ export type JobFilter = {
   readonly jobId?: string;
   readonly kind?: string;
   readonly state?: string;
-  /** ISO 8601; keeps records enqueued at or after this instant. */
+  /** ISO 8601; keeps records enqueued at or after this instant (no offset: UTC). */
   readonly sinceIso?: string;
 };
+
+/**
+ * ISO 8601: a date, or a date-time with an optional `Z` or ±hh:mm offset.
+ * Anchored, one pass, no nested repetition.
+ */
+const ISO_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?(?:([Zz])|([+-])(\d{2}):?(\d{2}))?)?$/;
+
+export type ParsedInstant = {
+  readonly ms: number;
+  /** False when the text carried no `Z` or offset and was read as UTC. */
+  readonly offsetGiven: boolean;
+};
+
+function daysIn(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * An ISO 8601 date or date-time as epoch milliseconds, never read in the
+ * host's time zone (0.7.1 policy): a value with no `Z` or offset is read as
+ * UTC, and `offsetGiven` says so. `Date.parse` reads `2026-09-26T10:00:00`
+ * in the host's zone, so the same call kept a job on a UTC host and dropped
+ * it in Los Angeles; it also reads forms like `Sep 26 2026` host-local,
+ * which are not ISO 8601 and are not instants here.
+ */
+export function parseIsoInstant(text: string): ParsedInstant | undefined {
+  const m = ISO_INSTANT.exec(text.trim());
+  if (m === null) return undefined;
+  const num = (i: number): number => (m[i] === undefined ? 0 : Number(m[i]));
+  const [year, month, day, hour, minute, second] = [1, 2, 3, 4, 5, 6].map(num) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  if (month < 1 || month > 12 || day < 1 || day > daysIn(year, month)) return undefined;
+  if (hour > 23 || minute > 59 || second > 59) return undefined;
+  const fraction = m[7] === undefined ? 0 : Number(`0.${m[7]}`);
+  const zulu = m[8] !== undefined;
+  const sign = m[9] === "-" ? -1 : 1;
+  const offsetHours = num(10);
+  const offsetMinutes = num(11);
+  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
+  const at = new Date(0);
+  at.setUTCFullYear(year, month - 1, day);
+  at.setUTCHours(hour, minute, second, Math.floor(fraction * 1000));
+  const offsetMs = m[9] === undefined ? 0 : sign * (offsetHours * 60 + offsetMinutes) * 60_000;
+  return { ms: at.getTime() - offsetMs, offsetGiven: zulu || m[9] !== undefined };
+}
+
+/** {@link parseIsoInstant}'s milliseconds, or NaN, for code that sorts and compares. */
+function instantMs(text: string): number {
+  return parseIsoInstant(text)?.ms ?? Number.NaN;
+}
 
 /**
  * Apply the filter to already-folded records.
@@ -93,7 +151,7 @@ export function filterJobs(
   records: readonly JobRecord[],
   filter: JobFilter,
 ): { readonly kept: JobRecord[]; readonly unparsedTimestamps: string[] } {
-  const since = filter.sinceIso === undefined ? undefined : Date.parse(filter.sinceIso);
+  const since = filter.sinceIso === undefined ? undefined : instantMs(filter.sinceIso);
   const dirs = filter.harnessDirs === undefined ? undefined : new Set(filter.harnessDirs);
   const unparsedTimestamps: string[] = [];
   const kept = records.filter((record) => {
@@ -103,7 +161,7 @@ export function filterJobs(
     if (filter.kind !== undefined && record.kind !== filter.kind) return false;
     if (filter.state !== undefined && record.state !== filter.state) return false;
     if (since !== undefined && !Number.isNaN(since)) {
-      const at = Date.parse(record.enqueuedAt);
+      const at = instantMs(record.enqueuedAt);
       if (Number.isNaN(at)) {
         unparsedTimestamps.push(record.jobId);
         return true;
@@ -119,7 +177,7 @@ export function filterJobs(
  *  ties break on `jobId` so the order is stable rather than readdir-shaped. */
 export function sortJobs(records: readonly JobRecord[]): JobRecord[] {
   const at = (record: JobRecord): number => {
-    const ms = Date.parse(record.enqueuedAt);
+    const ms = instantMs(record.enqueuedAt);
     return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
   };
   return [...records].sort((a, b) => at(b) - at(a) || compareStrings(a.jobId, b.jobId));

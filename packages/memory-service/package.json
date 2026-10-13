@@ -29,6 +29,7 @@
     "@crewhaus/tool-mcp": "workspace:*",
     "@crewhaus/tool-memory": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/tool-wiki": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*",
     "zod": "^3.23.8"

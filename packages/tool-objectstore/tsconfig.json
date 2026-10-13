@@ -18,6 +18,12 @@
       "path": "../tool-encode"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
+      "path": "../tool-categories"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

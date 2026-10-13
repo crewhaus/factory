@@ -8,7 +8,8 @@
  * is also what gives the containment assertions something to escape from —
  * and removes it afterwards. Nothing is ever written into the repo.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { heapSize } from "bun:jsc";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   lstatSync,
@@ -19,13 +20,17 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { type AddressInfo, createServer } from "node:net";
+import { type AddressInfo, Socket, createServer, isIP } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { REGEX_RUN_DEFAULTS } from "@crewhaus/tool-safety/regex";
 import {
   PROC_TOOLS,
   __resetRegistryForTest,
+  __stopAllForTest,
+  _resetProcConfig,
+  _setDnsLookup,
   commandExists,
   envInspect,
   processList,
@@ -33,6 +38,7 @@ import {
   processStart,
   processStatus,
   processStop,
+  registerProcConfig,
   retry,
   runCommand,
   runPipeline,
@@ -40,6 +46,10 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
+import { ipv6Dial, portTarget, unspecifiedDial } from "./lib/addr";
+import { PORT_HOSTS_KEY } from "./lib/config";
+import { _setPlatform, searchPath } from "./lib/which";
+import { getProc } from "./registry";
 
 let originalCwd: string;
 let tmp: string;
@@ -55,8 +65,8 @@ beforeEach(() => {
   __resetRegistryForTest();
 });
 
-afterEach(() => {
-  __resetRegistryForTest();
+afterEach(async () => {
+  await __stopAllForTest();
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
@@ -64,8 +74,8 @@ afterEach(() => {
 
 /** Tools return compact JSON on success and a plain string on a refusal. */
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
-async function call(tool: RegisteredTool, input: unknown): Promise<any> {
-  const out = await tool.execute(input);
+async function call(tool: RegisteredTool, input: unknown, ctx?: ToolExecuteContext): Promise<any> {
+  const out = await tool.execute(input, ctx);
   if (typeof out !== "string") throw new Error("expected a string result");
   try {
     return JSON.parse(out);
@@ -74,11 +84,406 @@ async function call(tool: RegisteredTool, input: unknown): Promise<any> {
   }
 }
 
+/**
+ * A test that runs a {@link script} file as the program. Windows cannot
+ * execute a `#!/bin/sh` file (CreateProcess knows no shebang), so these run on
+ * macOS and Linux only; on Windows the spawn, deadline and kill paths are
+ * still exercised by the tests that run `sh -c`, `sleep`, `cat` and `echo`
+ * from PATH.
+ */
+const testScript = test.skipIf(process.platform === "win32");
+
 /** Write an executable shell script into the temp workspace. */
 function script(name: string, body: string): string {
   const file = join(tmp, name);
   writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return file;
+}
+
+/** What {@link watchStdout} saw of the children's stdout. */
+type StdoutWatch = {
+  /** 64 KiB pieces handed to the code under test. */
+  delivered: number;
+  /** Bytes read from the children. */
+  bytes: number;
+  /** The code under test cancelled a stream. */
+  cancelled: boolean;
+  /** Pieces (and copies made of them) still alive when a stream ended; -1 before one did. */
+  heldAtEnd: number;
+  /**
+   * Bytes of live JS objects gained from the spawn to the stream's end, each
+   * read after a full collection; NaN before a stream ended.
+   */
+  heapGainAtEnd: number;
+};
+
+const PIECE_BYTES = 64 * 1024;
+
+/**
+ * Spies on `Bun.spawn` so each child's stdout reaches the code under test in
+ * 64 KiB pieces of a Uint8Array subclass, each one (and each `slice()` or
+ * `subarray()` made of one) kept as a WeakRef. When a stream ends, after a
+ * full collection, it counts the pieces still alive: code that keeps only
+ * its cap holds a handful, code that reads to the end before capping holds
+ * every one. Code that copies the bytes out of the pieces first (into one
+ * growing buffer, or a decoded string) lets every piece go but holds the
+ * whole stream all the same, so it also reads the bytes of live JS objects
+ * gained since the spawn, both after a full collection: what is still
+ * reachable, not the process's RSS, which moves with the allocator, with
+ * Bun's own pipe buffering and with every other test in the process.
+ * Neither sees bytes held outside the JS heap (a `Bun.ArrayBufferSink`). It
+ * also counts the bytes read and sees a cancel.
+ */
+function watchStdout(): { seen: StdoutWatch; restore: () => void } {
+  const real = Bun.spawn.bind(Bun);
+  const pieces: WeakRef<Uint8Array>[] = [];
+  class Piece extends Uint8Array {
+    constructor(...args: unknown[]) {
+      super(...(args as [ArrayBuffer]));
+      pieces.push(new WeakRef(this));
+    }
+  }
+  const seen: StdoutWatch = {
+    delivered: 0,
+    bytes: 0,
+    cancelled: false,
+    heldAtEnd: -1,
+    heapGainAtEnd: Number.NaN,
+  };
+  const spy = spyOn(Bun, "spawn").mockImplementation(((...args: Parameters<typeof Bun.spawn>) => {
+    Bun.gc(true);
+    const heapAtSpawn = heapSize();
+    const proc = real(...args);
+    const source = proc.stdout;
+    if (!(source instanceof ReadableStream)) return proc;
+    const reader = (source as ReadableStream<Uint8Array>).getReader();
+    const counted = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await reader.read();
+        if (seen.cancelled) return;
+        if (next.done) {
+          // A WeakRef keeps its target until the job that made it ends.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          Bun.gc(true);
+          seen.heldAtEnd = pieces.filter((ref) => ref.deref() !== undefined).length;
+          seen.heapGainAtEnd = heapSize() - heapAtSpawn;
+          controller.close();
+          return;
+        }
+        seen.bytes += next.value.length;
+        for (let at = 0; at < next.value.length; at += PIECE_BYTES) {
+          controller.enqueue(new Piece(next.value.subarray(at, at + PIECE_BYTES)));
+          seen.delivered += 1;
+        }
+      },
+      cancel(reason) {
+        seen.cancelled = true;
+        return reader.cancel(reason);
+      },
+    });
+    Object.defineProperty(proc, "stdout", { value: counted });
+    return proc;
+  }) as typeof Bun.spawn);
+  return { seen, restore: () => spy.mockRestore() };
+}
+
+/**
+ * Runs `body` with the command's deadline held: the first timer armed for
+ * exactly `ms` milliseconds is never scheduled, and fires once a whole line
+ * of the child's stdout has reached the code under test (`Bun.spawn` is
+ * spied on to see it). Every other timer runs as usual. So the deadline
+ * lands after the child printed, on any runner; a real one raced the
+ * child's start, and a child that took longer to start than the deadline
+ * was killed before its first line. The timer's callback runs in a
+ * microtask, as it would from the event loop.
+ */
+async function withDeadlineAfterFirstLine<T>(
+  ms: number,
+  body: () => Promise<T>,
+): Promise<{ result: T; fired: boolean; problem?: string }> {
+  const HELD = Symbol("held deadline") as unknown as ReturnType<typeof setTimeout>;
+  const deadline: { callback?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+    cleared: false,
+    fired: false,
+  };
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const realSpawn = Bun.spawn.bind(Bun);
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== ms || deadline.callback !== undefined) return realSetTimeout(fn, delay, ...rest);
+    deadline.callback = () => fn(...rest);
+    return HELD;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (id === HELD) deadline.cleared = true;
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const fire = (): void => {
+    if (deadline.fired) return;
+    deadline.fired = true;
+    const callback = deadline.callback;
+    if (callback === undefined || deadline.cleared) {
+      deadline.problem = "the deadline was not armed while the child ran";
+      return;
+    }
+    queueMicrotask(callback);
+  };
+  const spawned = spyOn(Bun, "spawn").mockImplementation(((
+    ...args: Parameters<typeof Bun.spawn>
+  ) => {
+    const proc = realSpawn(...args);
+    const source = proc.stdout;
+    if (!(source instanceof ReadableStream)) return proc;
+    const reader = (source as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    const watched = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const next = await reader.read();
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+        text += decoder.decode(next.value, { stream: true });
+        if (text.includes("\n")) fire();
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+    Object.defineProperty(proc, "stdout", { value: watched });
+    return proc;
+  }) as typeof Bun.spawn);
+  try {
+    const result = await body();
+    return {
+      result,
+      fired: deadline.fired,
+      ...(deadline.problem === undefined ? {} : { problem: deadline.problem }),
+    };
+  } finally {
+    spawned.mockRestore();
+    held.mockRestore();
+    cleared.mockRestore();
+  }
+}
+
+/**
+ * Runs `body` counting the timers armed and the Workers started while it
+ * runs. A wait that sleeps between polls arms a timer, and so does every
+ * match in the regex worker (its deadline), whose first in a call starts a
+ * worker. A refusal made before any of that arms neither, so a test shows
+ * that a refusal came up front by counting, with no clock involved.
+ */
+async function countTimersAndWorkers<T>(
+  body: () => Promise<T>,
+): Promise<{ result: T; timers: number; workers: number }> {
+  const counted = { timers: 0, workers: 0 };
+  const realSetTimeout = globalThis.setTimeout;
+  const RealWorker = globalThis.Worker;
+  class CountedWorker extends RealWorker {
+    constructor(...args: ConstructorParameters<typeof Worker>) {
+      super(...args);
+      counted.workers += 1;
+    }
+  }
+  const armed = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    counted.timers += 1;
+    return realSetTimeout(fn, delay, ...rest);
+  }) as typeof setTimeout);
+  (globalThis as { Worker: unknown }).Worker = CountedWorker;
+  try {
+    const result = await body();
+    return { result, ...counted };
+  } finally {
+    (globalThis as { Worker: unknown }).Worker = RealWorker;
+    armed.mockRestore();
+  }
+}
+
+/** WaitForOutput's longest match deadline (MATCH_BUDGET_MS in ./index). */
+const MATCH_DEADLINE_MS = 2_000;
+
+/** What {@link withWaitClocksHeld} counted. */
+type HeldWait<T> = {
+  readonly result: T;
+  /** Matches the wait asked of the regex worker. */
+  readonly runs: number;
+  /** Match deadlines held. */
+  readonly held: number;
+  /** Sleeps between polls, counted when the test moves the clock by them. */
+  readonly sleeps: number;
+  /** The call outlasted the 10 s valve, which moved the clock and fired the held timers. */
+  readonly valveFired: boolean;
+};
+
+/**
+ * Runs one WaitForOutput call with no clock but the test's deciding its
+ * answer. The wait asks the regex worker for every match, and two real
+ * clocks around each match could end it as `matched: null`,
+ * "undetermined", on a runner that was only slow:
+ *
+ * - The worker reports a failing exec that took 100 ms as the engine giving
+ *   up, never as "no match". Here that threshold is a minute
+ *   (REGEX_RUN_DEFAULTS.giveUpMs, restored after), so a worker thread left
+ *   without a core for 100 ms inside a no-match still answers "no match".
+ * - Each match has a deadline: the time the wait has left, capped at 2 s and
+ *   never under 100 ms, armed as a timer on this thread. Every timer armed
+ *   for one of `matchDeadlines` is held, never scheduled, so a worker that
+ *   answers late still answers. This thread's performance.now stands still
+ *   for the call, so screening the pattern charges a match nothing and its
+ *   timer is armed for exactly its deadline.
+ *
+ * Date.now, the wait's own clock, stands still too, so the wait ends on what
+ * the process printed (a match, a failure match, its exit), never on its
+ * deadline. With `deadlinePassesAfter`, the clock moves a minute on, past
+ * the deadline, once the wait has slept that many times between polls
+ * (sleeps of exactly `interval` ms), so how many polls fit before the
+ * deadline is a count. Should the call not end, after 10 s a valve puts
+ * every clock back at once, fires the held timers and aborts the signal
+ * `body` hands the call, which the wait honours while matching and between
+ * polls. So a broken wait ends "aborted" and fails on the assertions after
+ * it, even one that ignores its deadline, and the next test starts on the
+ * real clocks. It counts the matches asked of the worker and the timers it
+ * held, so a test can show that every match's deadline was held. With
+ * `beforeMatch`, a match is sent to the worker only once the promise it
+ * returns for that match (counted from 1) settles: the wait has taken that
+ * look, and has no answer yet. Every spy is restored before this returns.
+ */
+async function withWaitClocksHeld<T>(
+  options: {
+    readonly matchDeadlines: readonly number[];
+    readonly deadlinePassesAfter?: { readonly sleeps: number; readonly interval: number };
+    readonly beforeMatch?: (run: number) => Promise<void> | undefined;
+  },
+  body: (signal: AbortSignal) => Promise<T>,
+): Promise<HeldWait<T>> {
+  const counted = { runs: 0, held: 0, sleeps: 0, valveFired: false };
+  const defaults = REGEX_RUN_DEFAULTS as { giveUpMs: number };
+  const giveUpMs = defaults.giveUpMs;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const RealWorker = globalThis.Worker;
+  const heldTimers = new Map<object, () => void>();
+  const heldTokens = new WeakSet<object>();
+  let passed = false;
+  let released = false;
+  class CountingWorker extends RealWorker {
+    override postMessage(
+      message: unknown,
+      transfer?: Bun.StructuredSerializeOptions | Bun.Transferable[],
+    ): void {
+      const send = (): void => {
+        super.postMessage(message, transfer as Bun.StructuredSerializeOptions);
+      };
+      if ((message as { op?: unknown } | null)?.op !== "matchAll") {
+        send();
+        return;
+      }
+      counted.runs += 1;
+      const hold = options.beforeMatch?.(counted.runs);
+      if (hold === undefined) {
+        send();
+        return;
+      }
+      void hold.then(() => {
+        try {
+          send();
+        } catch {
+          // The worker was stopped meanwhile; the wait has its answer.
+        }
+      });
+    }
+  }
+  const frozen = Date.now();
+  const still = performance.now();
+  const clock = spyOn(Date, "now").mockImplementation(() => (passed ? frozen + 60_000 : frozen));
+  const thread = spyOn(performance, "now").mockImplementation(() => still);
+  const armed = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (!released && delay !== undefined && options.matchDeadlines.includes(delay)) {
+      counted.held += 1;
+      const token = {};
+      heldTokens.add(token);
+      heldTimers.set(token, () => fn(...rest));
+      return token as unknown as ReturnType<typeof setTimeout>;
+    }
+    const between = options.deadlinePassesAfter;
+    if (between !== undefined && delay === between.interval) {
+      counted.sleeps += 1;
+      if (counted.sleeps >= between.sleeps) passed = true;
+    }
+    return realSetTimeout(fn, delay, ...rest);
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    const token = id as unknown as object;
+    if (heldTokens.has(token)) heldTimers.delete(token);
+    else realClearTimeout(id);
+  }) as typeof clearTimeout);
+  (globalThis as { Worker: unknown }).Worker = CountingWorker;
+  defaults.giveUpMs = 60_000;
+  let restored = false;
+  const restore = (): void => {
+    if (restored) return;
+    restored = true;
+    defaults.giveUpMs = giveUpMs;
+    (globalThis as { Worker: unknown }).Worker = RealWorker;
+    cleared.mockRestore();
+    armed.mockRestore();
+    thread.mockRestore();
+    clock.mockRestore();
+  };
+  const stop = new AbortController();
+  const valve = realSetTimeout(() => {
+    counted.valveFired = true;
+    released = true;
+    passed = true;
+    restore();
+    for (const fire of heldTimers.values()) queueMicrotask(fire);
+    heldTimers.clear();
+    stop.abort();
+  }, 10_000);
+  try {
+    const result = await body(stop.signal);
+    return { result, ...counted };
+  } finally {
+    realClearTimeout(valve);
+    restore();
+  }
+}
+
+/**
+ * WaitForOutput, for a wait the test means to end on what the process
+ * prints: every clock is held ({@link withWaitClocksHeld}). It checks that
+ * the wait ended before the valve and that every match's 2 s deadline was
+ * held.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+async function waitDefinitely(input: Record<string, unknown>): Promise<any> {
+  const { result, runs, held, valveFired } = await withWaitClocksHeld(
+    { matchDeadlines: [MATCH_DEADLINE_MS] },
+    (signal) => call(waitForOutput, input, { signal }),
+  );
+  expect({ valveFired, ran: runs > 0, held }).toEqual({
+    valveFired: false,
+    ran: true,
+    held: runs,
+  });
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +728,7 @@ describe("RunCommand", () => {
     expect(out.stdout).toBe("");
   });
 
-  test("stderr is captured separately", async () => {
+  testScript("stderr is captured separately", async () => {
     const path = script("noisy.sh", "echo out; echo err >&2; exit 2");
     const out = await call(runCommand, { argv: [path] });
     expect(out.stdout.trim()).toBe("out");
@@ -345,26 +750,30 @@ describe("RunCommand", () => {
    * it must still die. This asserts the SIGKILL escalation really happens, by
    * running a script that ignores TERM and would otherwise loop forever.
    */
-  test("a command that ignores SIGTERM is SIGKILLed after the grace period", async () => {
-    const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
-    const started = Date.now();
-    const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
-    const elapsed = Date.now() - started;
-    expect(out.timedOut).toBe(true);
-    expect(out.exitCode).not.toBe(0);
-    // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
-    // emphatically not run to the end of a `while true`.
-    expect(elapsed).toBeGreaterThanOrEqual(200);
-    expect(elapsed).toBeLessThan(8_000);
-    // Waits out a real SIGTERM grace period before the SIGKILL.
-  }, 20_000);
+  testScript(
+    "a command that ignores SIGTERM is SIGKILLed after the grace period",
+    async () => {
+      const path = script("deaf.sh", 'trap "" TERM\nwhile true; do sleep 0.05; done');
+      const started = Date.now();
+      const out = await call(runCommand, { argv: [path], timeoutMs: 200 });
+      const elapsed = Date.now() - started;
+      expect(out.timedOut).toBe(true);
+      expect(out.exitCode).not.toBe(0);
+      // SIGTERM at 200ms, SIGKILL 2s later: it must land well inside that, and
+      // emphatically not run to the end of a `while true`.
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(8_000);
+      // Waits out a real SIGTERM grace period before the SIGKILL.
+    },
+    20_000,
+  );
 
   /**
    * A grandchild inherits the pipe, so reading stdout to EOF can outlive the
    * process that was actually being run. The drain window is what stops that
    * from becoming an unbounded wait.
    */
-  test("a grandchild holding the pipe open does not hold the call open", async () => {
+  testScript("a grandchild holding the pipe open does not hold the call open", async () => {
     const path = script("forker.sh", "sleep 20 &\necho parent done");
     const started = Date.now();
     const out = await call(runCommand, { argv: [path], timeoutMs: 30_000 });
@@ -374,12 +783,99 @@ describe("RunCommand", () => {
     // The grandchild sleeps 20s; returning in anything under that proves the
     // drain gave up rather than waiting for EOF.
     expect(elapsed).toBeLessThan(10_000);
+    // C078: what arrived before the drain gave up is kept, and the result
+    // says it may be incomplete — it used to come back as "" with ok:true.
+    expect(out.stdout).toContain("parent done");
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.ok).toBe(true);
   });
+
+  test("a timed-out command still returns what it printed before the deadline", async () => {
+    // The 1 s deadline fires once the line is out: a real one raced the
+    // shell's start, and a runner a second slow to start it lost the line.
+    const {
+      result: out,
+      fired,
+      problem,
+    } = await withDeadlineAfterFirstLine(1_000, () =>
+      call(runCommand, {
+        // No `exec`: the shell's own child is what used to hold the pipe open
+        // after the deadline's signal killed only the shell.
+        argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
+        timeoutMs: 1_000,
+      }),
+    );
+    expect({ fired, problem }).toEqual({ fired: true, problem: undefined });
+    expect(out.timedOut).toBe(true);
+    expect(out.stdout).toContain("error: port in use");
+  });
+
+  test("output past the cap is discarded as it arrives, not buffered first", async () => {
+    const { seen, restore } = watchStdout();
+    let out: { stdoutTruncated: boolean; stdout: string };
+    try {
+      out = await call(runCommand, {
+        argv: ["head", "-c", "200000000", "/dev/zero"],
+        maxOutputChars: 100,
+      });
+    } finally {
+      restore();
+    }
+    // 0.7.0 held the whole 200 MB (and more) as a string before capping:
+    // every one of the 3 000-odd pieces was still alive at the end.
+    expect(seen.delivered).toBeGreaterThanOrEqual(3_000);
+    expect(seen.heldAtEnd).toBeGreaterThanOrEqual(0);
+    expect(seen.heldAtEnd).toBeLessThanOrEqual(64);
+    // Copying the bytes out of the pieces into one buffer, or decoding them
+    // into a string, before capping lets every piece go and still holds the
+    // 200 MB: live objects gain about 1 MB here, any read-everything 190 MB+.
+    expect(seen.heapGainAtEnd).toBeLessThan(32 * 1024 * 1024);
+    expect(out.stdoutTruncated).toBe(true);
+    // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
+    expect(out.stdout).toContain("[199999900 bytes dropped]");
+  }, 60_000);
+
+  test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
+    // The grandchild writes only once this test says so, after the call
+    // has returned, and says when it is done (or was refused).
+    const go = join(tmp, "go");
+    const done = join(tmp, "done");
+    const { seen, restore } = watchStdout();
+    try {
+      const out = await call(runCommand, {
+        argv: [
+          "sh",
+          "-c",
+          '(while [ ! -e "$1" ]; do sleep 0.05; done; head -c 50000000 /dev/zero; : > "$2") &\necho started',
+          "sh",
+          go,
+          done,
+        ],
+        maxOutputChars: 100,
+      });
+      expect(out.outputIncomplete).toBe(true);
+      expect(out.stdout).toContain("started");
+      const atReturn = seen.bytes;
+      writeFileSync(go, "");
+      // The cut-off pipe refuses the write at once. The wait is bounded so
+      // that a platform where the write blocks instead still gets an answer.
+      for (let n = 0; n < 500 && !existsSync(done); n++) await Bun.sleep(20);
+      // The stream was cancelled at the drain grace: of the 50 MB the
+      // grandchild writes afterwards, not a byte reaches this process.
+      expect({ cancelled: seen.cancelled, readAfterReturn: seen.bytes - atReturn }).toEqual({
+        cancelled: true,
+        readAfterReturn: 0,
+      });
+    } finally {
+      restore();
+      writeFileSync(go, "");
+    }
+  }, 20_000);
 
   test("output over the cap is truncated at both ends rather than dropped or unbounded", async () => {
     const out = await call(runCommand, { argv: ["seq", "1", "5000"], maxOutputChars: 200 });
     expect(out.stdoutTruncated).toBe(true);
-    expect(out.stdout).toContain("chars dropped");
+    expect(out.stdout).toContain("bytes dropped");
     expect(out.stdout.startsWith("1\n2\n")).toBe(true);
     expect(out.stdout.trimEnd().endsWith("5000")).toBe(true);
   });
@@ -594,22 +1090,25 @@ describe("Retry", () => {
     ]);
   });
 
-  test("a command that only works on the second attempt succeeds there, and every attempt is reported", async () => {
-    const path = script(
-      "flaky.sh",
-      'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
-    );
-    const out = await call(retry, {
-      argv: [path],
-      maxAttempts: 4,
-      backoff: { kind: "exponential", baseMs: 10 },
-    });
-    expect(out.succeeded).toBe(true);
-    expect(out.attemptsUsed).toBe(2);
-    expect(out.attempts[0].ok).toBe(false);
-    expect(out.attempts[1].ok).toBe(true);
-    expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
-  });
+  testScript(
+    "a command that only works on the second attempt succeeds there, and every attempt is reported",
+    async () => {
+      const path = script(
+        "flaky.sh",
+        'n=$(cat counter 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > counter\necho "attempt $n"\n[ "$n" -ge 2 ]',
+      );
+      const out = await call(retry, {
+        argv: [path],
+        maxAttempts: 4,
+        backoff: { kind: "exponential", baseMs: 10 },
+      });
+      expect(out.succeeded).toBe(true);
+      expect(out.attemptsUsed).toBe(2);
+      expect(out.attempts[0].ok).toBe(false);
+      expect(out.attempts[1].ok).toBe(true);
+      expect(out.attempts[1].stdout.trim()).toBe("attempt 2");
+    },
+  );
 
   test("successExitCodes lets a caller define success", async () => {
     const out = await call(retry, {
@@ -680,37 +1179,58 @@ describe("background processes", () => {
     expect(second.id).toBe("proc_2");
   });
 
-  test("output is returned once: a second poll sees only what is new", async () => {
-    // The second line must not be written until the first poll has happened,
-    // and a `sleep` cannot promise that: on a loaded machine the wait loop's
-    // own tick outlasts the sleep, both lines land in one read, and the test
-    // fails for a reason that has nothing to do with drain semantics. The
-    // script blocks on a file this test creates, so the ordering is caused
-    // rather than hoped for.
-    const gate = join(tmp, "release-second");
-    const path = script(
-      "emit.sh",
-      `echo first\nwhile [ ! -f "${gate}" ]; do sleep 0.01; done\necho second\n`,
-    );
-    const started = await call(processStart, { argv: [path] });
-    await call(waitForOutput, { id: started.id, pattern: "first", timeoutMs: 3_000 });
-    const firstPoll = await call(processOutput, { id: started.id });
-    expect(firstPoll.stdout).toContain("first");
-    expect(firstPoll.stdout).not.toContain("second");
+  testScript(
+    "output is returned once: a second poll sees only what is new",
+    async () => {
+      // The second line must not be written until the first poll has happened,
+      // and a `sleep` cannot promise that: on a loaded machine the wait loop's
+      // own tick outlasts the sleep, both lines land in one read, and the test
+      // fails for a reason that has nothing to do with drain semantics. The
+      // script blocks on a file this test creates, so the ordering is caused
+      // rather than hoped for. Each wait ends on its line, never on a clock
+      // (a real 3 s deadline raced the script's start), and the script stays
+      // alive after the second line, so that wait cannot end on the exit.
+      const gate = join(tmp, "release-second");
+      const path = script(
+        "emit.sh",
+        `echo first\nwhile [ ! -f "${gate}" ]; do sleep 0.01; done\necho second\nexec sleep 30\n`,
+      );
+      const started = await call(processStart, { argv: [path] });
+      const sawFirst = await waitDefinitely({ id: started.id, pattern: "first", timeoutMs: 3_000 });
+      expect(sawFirst.matched).toBe(true);
+      const firstPoll = await call(processOutput, { id: started.id });
+      expect(firstPoll.stdout).toContain("first");
+      expect(firstPoll.stdout).not.toContain("second");
 
-    writeFileSync(gate, "");
-    await call(waitForOutput, { id: started.id, pattern: "second", timeoutMs: 3_000 });
-    const secondPoll = await call(processOutput, { id: started.id });
-    expect(secondPoll.stdout).toContain("second");
-    expect(secondPoll.stdout).not.toContain("first");
+      writeFileSync(gate, "");
+      const sawSecond = await waitDefinitely({
+        id: started.id,
+        pattern: "second",
+        timeoutMs: 3_000,
+      });
+      expect(sawSecond.matched).toBe(true);
+      const secondPoll = await call(processOutput, { id: started.id });
+      expect(secondPoll.stdout).toContain("second");
+      expect(secondPoll.stdout).not.toContain("first");
 
-    const thirdPoll = await call(processOutput, { id: started.id, stream: "stdout" });
-    expect(thirdPoll.stdout).toBe("");
-  });
+      const thirdPoll = await call(processOutput, { id: started.id, stream: "stdout" });
+      expect(thirdPoll.stdout).toBe("");
+    },
+    20_000,
+  );
 
   test("a finished process keeps its output until it is reaped", async () => {
     const started = await call(processStart, { argv: ["echo", "done"] });
-    await call(waitForOutput, { id: started.id, pattern: "done", timeoutMs: 3_000 });
+    const saw = await waitDefinitely({ id: started.id, pattern: "done", timeoutMs: 3_000 });
+    expect(saw.matched).toBe(true);
+    // A wait for a line it never prints ends once the process has exited and
+    // its output has ended, so the status below is the exit's.
+    const finished = await waitDefinitely({
+      id: started.id,
+      pattern: "never-printed",
+      timeoutMs: 3_000,
+    });
+    expect(finished.reason).toBe("process finished without matching");
     const status = await call(processStatus, { id: started.id });
     expect(status.status).toBe("exited");
     expect(status.exitCode).toBe(0);
@@ -719,16 +1239,26 @@ describe("background processes", () => {
     expect(reaped.alreadyFinished).toBe(true);
     expect(reaped.reaped).toBe(true);
     expect(await call(processStatus, { id: started.id })).toContain("no background process");
-  });
+  }, 20_000);
 
-  test("a process that ignores SIGTERM is escalated to SIGKILL within the grace period", async () => {
-    const path = script("stubborn.sh", 'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done');
-    const started = await call(processStart, { argv: [path] });
-    await call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 });
-    const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
-    expect(stopped.stopped).toBe(true);
-    expect(stopped.escalatedToSigkill).toBe(true);
-  });
+  testScript(
+    "a process that ignores SIGTERM is escalated to SIGKILL within the grace period",
+    async () => {
+      const path = script(
+        "stubborn.sh",
+        'trap "" TERM\necho ready\nwhile true; do sleep 0.05; done',
+      );
+      const started = await call(processStart, { argv: [path] });
+      // "ready" comes after the trap, so the stop cannot land before it; the
+      // wait ends on that line, not on a clock.
+      const ready = await waitDefinitely({ id: started.id, pattern: "ready", timeoutMs: 3_000 });
+      expect(ready.matched).toBe(true);
+      const stopped = await call(processStop, { id: started.id, killAfterMs: 300 });
+      expect(stopped.stopped).toBe(true);
+      expect(stopped.escalatedToSigkill).toBe(true);
+    },
+    20_000,
+  );
 
   test("an unknown id is a readable message listing what is known", async () => {
     await call(processStart, { argv: ["true"] });
@@ -751,70 +1281,342 @@ describe("background processes", () => {
 // ---------------------------------------------------------------------------
 
 describe("WaitForOutput", () => {
-  test("returns as soon as the pattern appears", async () => {
-    const path = script("server.sh", 'echo booting\nsleep 0.1\necho "Listening on 4321"\nsleep 5');
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "Listening on (\\d+)",
-      timeoutMs: 5_000,
+  testScript(
+    "returns as soon as the pattern appears",
+    async () => {
+      // The script stays alive after its line (the afterEach kills it), so
+      // with the wait's clocks held only the line can end the wait; the exit
+      // has tests of its own.
+      const path = script(
+        "server.sh",
+        'echo booting\nsleep 0.1\necho "Listening on 4321"\nexec sleep 30',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "Listening on (\\d+)",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(true);
+      expect(out.match).toBe("Listening on 4321");
+    },
+    20_000,
+  );
+
+  testScript(
+    "a failure pattern ends the wait early instead of burning the deadline",
+    async () => {
+      // Alive after its line, so only a line can end the wait.
+      const path = script(
+        "broken.sh",
+        'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nexec sleep 30',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "Listening on",
+        failurePattern: "FATAL",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(false);
+      expect(out.matchedFailure).toBe(true);
+      expect(out.match).toBe("FATAL");
+    },
+    20_000,
+  );
+
+  test("a brace-quantified nested pattern is refused at once, not run to the deadline (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", "echo deadbeefcafe0123456789abcdef0123456789ab; sleep 5"],
     });
-    expect(out.matched).toBe(true);
-    expect(out.match).toBe("Listening on 4321");
+    // 0.7.0's scanner took `{1,}` for a literal and ran this: ~6.7 s of a
+    // blocked event loop and a false reason "deadline". Refused at once: no
+    // match was run and no poll slept, so no timer was armed.
+    const { result: out, ...armed } = await countTimersAndWorkers(() =>
+      call(waitForOutput, { id: started.id, pattern: "(\\w{1,})*$", timeoutMs: 3_000 }),
+    );
+    expect(String(out)).toContain("[WaitForOutput error]");
+    expect(String(out)).toContain("exponentially");
+    expect(armed).toEqual({ timers: 0, workers: 0 });
   });
 
-  test("a failure pattern ends the wait early instead of burning the deadline", async () => {
-    const path = script(
-      "broken.sh",
-      'echo booting\nsleep 0.05\necho "FATAL: port in use" >&2\nsleep 5',
-    );
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "Listening on",
-      failurePattern: "FATAL",
-      timeoutMs: 5_000,
+  test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
+    // One process, not `sh -c "…; sleep 5"`: that left `sleep` behind when
+    // the registry killed `sh`, and on Windows a live process whose cwd is
+    // the workspace keeps it from being removed (EBUSY in afterEach).
+    const started = await call(processStart, {
+      argv: [process.execPath, "-e", "setTimeout(() => {}, 5000);"],
     });
-    expect(out.matched).toBe(false);
-    expect(out.matchedFailure).toBe(true);
-    expect(out.match).toBe("FATAL");
-  });
+    // The regex worker is one that says it is ready and never answers, so
+    // every match ends at the run's own deadline on any machine. A real
+    // runaway pattern (cubic, ~0.4 s on 300 characters) raced the engine's
+    // speed against a 250 ms deadline: an engine 4x faster answered "no
+    // match" in time and the wait ended as "deadline".
+    const Real = globalThis.Worker;
+    const asked: Array<Record<string, unknown>> = [];
+    let stopped = 0;
+    class Silent extends EventTarget {
+      constructor(_url: string | URL) {
+        super();
+        setTimeout(() => {
+          this.dispatchEvent(new MessageEvent("message", { data: { kind: "ready" } }));
+        }, 0);
+      }
+      postMessage(message: Record<string, unknown>): void {
+        asked.push(message);
+      }
+      terminate(): void {
+        stopped += 1;
+        setTimeout(() => this.dispatchEvent(new Event("close")), 0);
+      }
+      unref(): void {}
+    }
+    (globalThis as { Worker: unknown }).Worker = Silent;
+    try {
+      const out = await call(waitForOutput, {
+        id: started.id,
+        pattern: "\\w*\\w*\\w*!",
+        timeoutMs: 250,
+      });
+      expect({ matched: out.matched, reason: out.reason }).toEqual({
+        matched: null,
+        reason: "undetermined",
+      });
+      expect(String(out.detail)).toContain("pattern could not be evaluated");
+      // The pattern was asked of the worker once, and the worker that sat
+      // on it was stopped; the first unanswered match ended the wait.
+      expect({
+        asked: asked.map((m) => [m["op"], m["pattern"]]),
+        stopped,
+      }).toEqual({ asked: [["matchAll", "\\w*\\w*\\w*!"]], stopped: 1 });
+    } finally {
+      (globalThis as { Worker: unknown }).Worker = Real;
+      await call(processStop, { id: started.id, signal: "SIGKILL" });
+    }
+  }, 20_000);
 
   test("the deadline is honoured when the pattern never appears", async () => {
     const started = await call(processStart, { argv: ["sleep", "30"] });
-    const at = Date.now();
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "never-appears",
-      timeoutMs: 250,
-    });
+    // The wait's clock passes the deadline when it sleeps after its third
+    // no-match, so how many polls it makes is a count, not what fits in
+    // 250 ms. Each match ran under a held deadline: 250 ms (the time left)
+    // while the clock stood still, and 100 ms (the least a match gets) for
+    // the last look after it passed. Real ones, and the worker's 100 ms
+    // give-up, turned a poll answered late into matched: null, "undetermined".
+    const LAST_LOOK_MS = 100;
+    const {
+      result: out,
+      runs,
+      held,
+      sleeps,
+      valveFired,
+    } = await withWaitClocksHeld(
+      { matchDeadlines: [250, LAST_LOOK_MS], deadlinePassesAfter: { sleeps: 3, interval: 10 } },
+      (signal) =>
+        call(
+          waitForOutput,
+          { id: started.id, pattern: "never-appears", timeoutMs: 250, intervalMs: 10 },
+          { signal },
+        ),
+    );
     expect(out.matched).toBe(false);
     expect(out.reason).toBe("deadline");
-    expect(Date.now() - at).toBeLessThan(5_000);
-  });
+    // Honoured: one last look once the deadline had passed, then no more
+    // polls and no more sleeps.
+    expect({ runs, held, sleeps, valveFired }).toEqual({
+      runs: 4,
+      held: 4,
+      sleeps: 3,
+      valveFired: false,
+    });
+  }, 20_000);
 
   test("a process that finishes without matching stops the wait immediately", async () => {
     const started = await call(processStart, { argv: ["echo", "nothing useful"] });
-    const out = await call(waitForOutput, {
+    // With the wait's clock held, only the exit can end it: a wait that
+    // burned its deadline instead would run into the 10 s valve.
+    const out = await waitDefinitely({
       id: started.id,
       pattern: "ready",
       timeoutMs: 30_000,
     });
     expect(out.matched).toBe(false);
     expect(out.reason).toBe("process finished without matching");
-  });
+  }, 20_000);
+
+  testScript(
+    "a line printed while a look was being matched is found by the next look, not reported missing",
+    async () => {
+      // The wait takes a look before the line exists, and the worker's answer
+      // to it is held until the process has printed the line and exited. So
+      // the exit is seen only after that look, for certain. A wait that took
+      // that exit as the end answered "process finished without matching"
+      // for a line the process did print.
+      const gate = join(tmp, "print-now");
+      const path = script(
+        "last-words.sh",
+        `while [ ! -f "${gate}" ]; do sleep 0.01; done\necho ready`,
+      );
+      const started = await call(processStart, { argv: [path] });
+      const bg = getProc(started.id);
+      if (bg === undefined) throw new Error(`${started.id} is not registered`);
+      const printedAndExited = async (): Promise<void> => {
+        writeFileSync(gate, "");
+        await bg.proc.exited;
+        while (!bg.stdout.includes("ready")) await new Promise((r) => setImmediate(r));
+      };
+      const { result, runs, held, valveFired } = await withWaitClocksHeld(
+        {
+          matchDeadlines: [MATCH_DEADLINE_MS],
+          beforeMatch: (run) => (run === 1 ? printedAndExited() : undefined),
+        },
+        (signal) =>
+          call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
+      );
+      expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
+        matched: true,
+        match: "ready",
+        status: "exited",
+      });
+      // The held look, then the one that found the line.
+      expect({ runs, held, valveFired }).toEqual({ runs: 2, held: 2, valveFired: false });
+    },
+    20_000,
+  );
+
+  for (const stream of ["stdout", "stderr"] as const) {
+    test(`a line still in the ${stream} pipe when the exit is seen is matched: the wait reads the output to its end`, async () => {
+      // The exit and a pipe's last bytes reach the parent as separate events,
+      // in either order. Here what the child printed on this stream is held
+      // back until the wait has taken two looks at the exited process, so the
+      // exit comes first, for certain. A wait that took the exit alone as the
+      // end answered "process finished without matching" for a line already
+      // in the pipe.
+      let release = (): void => {};
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const realSpawn = Bun.spawn.bind(Bun);
+      const spawned = spyOn(Bun, "spawn").mockImplementation(((
+        ...args: Parameters<typeof Bun.spawn>
+      ) => {
+        const proc = realSpawn(...args);
+        const source = proc[stream];
+        if (!(source instanceof ReadableStream)) return proc;
+        const reader = (source as ReadableStream<Uint8Array>).getReader();
+        const heldBack = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            await released;
+            const next = await reader.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          },
+          cancel: (reason) => reader.cancel(reason),
+        });
+        Object.defineProperty(proc, stream, { value: heldBack });
+        return proc;
+      }) as typeof Bun.spawn);
+      let started: { id: string };
+      try {
+        started = await call(processStart, {
+          argv: ["sh", "-c", stream === "stdout" ? "echo ready" : "echo ready >&2"],
+        });
+      } finally {
+        spawned.mockRestore();
+      }
+      try {
+        const bg = getProc(started.id);
+        if (bg === undefined) throw new Error(`${started.id} is not registered`);
+        await bg.proc.exited;
+        expect({ status: bg.status, output: bg[stream] }).toEqual({ status: "exited", output: "" });
+        const { result, runs, held, valveFired } = await withWaitClocksHeld(
+          {
+            matchDeadlines: [MATCH_DEADLINE_MS],
+            beforeMatch: (run) => {
+              if (run === 2) release();
+              return undefined;
+            },
+          },
+          (signal) =>
+            call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
+        );
+        expect({ matched: result.matched, match: result.match, reason: result.reason }).toEqual({
+          matched: true,
+          match: "ready",
+          reason: undefined,
+        });
+        // Two looks at an exited process with the line still held back, then
+        // the line.
+        expect(runs).toBeGreaterThanOrEqual(3);
+        expect({ held: held === runs, valveFired }).toEqual({ held: true, valveFired: false });
+      } finally {
+        release();
+      }
+    }, 20_000);
+  }
+
+  testScript(
+    "a process that exits while one it started still holds its output is watched on, not reported finished",
+    async () => {
+      // `sh` exits at once; the subshell it started keeps the pipes and prints
+      // the line once the test lets it, after the wait has looked at the exited
+      // shell. The line can still come, so "process finished without
+      // matching" would be a wrong answer. The subshell also stops when the
+      // workspace is gone, so a failed run leaves nothing behind.
+      const gate = join(tmp, "print-now");
+      const started = await call(processStart, {
+        argv: [
+          "sh",
+          "-c",
+          `( while [ ! -f "${gate}" ] && [ -d "${tmp}" ]; do sleep 0.01; done; echo ready ) & echo shell done`,
+        ],
+      });
+      const bg = getProc(started.id);
+      if (bg === undefined) throw new Error(`${started.id} is not registered`);
+      try {
+        await bg.proc.exited;
+        const { result, runs, held, valveFired } = await withWaitClocksHeld(
+          {
+            matchDeadlines: [MATCH_DEADLINE_MS],
+            beforeMatch: (run) => {
+              if (run === 2) writeFileSync(gate, "");
+              return undefined;
+            },
+          },
+          (signal) =>
+            call(waitForOutput, { id: started.id, pattern: "ready", timeoutMs: 3_000 }, { signal }),
+        );
+        expect({ matched: result.matched, match: result.match, status: result.status }).toEqual({
+          matched: true,
+          match: "ready",
+          status: "exited",
+        });
+        expect(runs).toBeGreaterThanOrEqual(3);
+        expect({ held: held === runs, valveFired }).toEqual({ held: true, valveFired: false });
+        // The subshell has printed and gone, so its pipes end.
+        while (!bg.outputEnded) await new Promise((r) => setImmediate(r));
+      } finally {
+        writeFileSync(gate, "");
+      }
+    },
+    20_000,
+  );
 
   test("watching does not consume: ProcessOutput still returns everything", async () => {
     const started = await call(processStart, { argv: ["echo", "hello world"] });
-    await call(waitForOutput, { id: started.id, pattern: "hello", timeoutMs: 3_000 });
+    const saw = await waitDefinitely({ id: started.id, pattern: "hello", timeoutMs: 3_000 });
+    expect(saw.matched).toBe(true);
     const polled = await call(processOutput, { id: started.id });
     expect(polled.stdout).toContain("hello world");
-  });
+  }, 20_000);
 
   test("a pattern that could backtrack exponentially is refused", async () => {
     const started = await call(processStart, { argv: ["sleep", "1"] });
-    const out = await call(waitForOutput, { id: started.id, pattern: "(a+)+b", timeoutMs: 100 });
+    const { result: out, ...armed } = await countTimersAndWorkers(() =>
+      call(waitForOutput, { id: started.id, pattern: "(a+)+b", timeoutMs: 100 }),
+    );
     expect(out).toContain("exponentially");
+    expect(armed).toEqual({ timers: 0, workers: 0 });
   });
 
   /**
@@ -823,36 +1625,42 @@ describe("WaitForOutput", () => {
    * therefore happen before the first match, and it must cover the
    * overlapping-alternation shape that star height alone does not see.
    */
-  test("an overlapping alternation is refused before it is ever matched, not at the deadline", async () => {
-    const path = script(
-      "many-a.sh",
-      'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
-    );
-    const started = await call(processStart, { argv: [path] });
-    const at = Date.now();
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(a|a)*$",
-      timeoutMs: 1_000,
-    });
-    expect(typeof out).toBe("string");
-    expect(out).toContain("alternation");
-    // Refused up front: it never even reached the deadline, let alone the
-    // match that would have outlived the process.
-    expect(Date.now() - at).toBeLessThan(1_000);
-  });
+  testScript(
+    "an overlapping alternation is refused before it is ever matched, not at the deadline",
+    async () => {
+      const path = script(
+        "many-a.sh",
+        'printf "%s" "$(head -c 400 /dev/zero | tr "\\0" "a")"\nsleep 5',
+      );
+      const started = await call(processStart, { argv: [path] });
+      const { result: out, ...armed } = await countTimersAndWorkers(() =>
+        call(waitForOutput, { id: started.id, pattern: "(a|a)*$", timeoutMs: 1_000 }),
+      );
+      // Refused up front: the sentence comes only from the screen, and a
+      // wait that ran the match ends in a JSON answer. Before the first
+      // match and before any sleep, too: neither armed a timer.
+      expect(typeof out).toBe("string");
+      expect(out).toContain("alternation");
+      expect(armed).toEqual({ timers: 0, workers: 0 });
+    },
+  );
 
-  test("a wait for a line, with an unquantified alternation, still works", async () => {
-    const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nsleep 5');
-    const started = await call(processStart, { argv: [path] });
-    const out = await call(waitForOutput, {
-      id: started.id,
-      pattern: "(ready|listening) on \\d+",
-      timeoutMs: 5_000,
-    });
-    expect(out.matched).toBe(true);
-    expect(out.match).toBe("ready on 8080");
-  });
+  testScript(
+    "a wait for a line, with an unquantified alternation, still works",
+    async () => {
+      // Alive after its line, so only the line can end the wait.
+      const path = script("alt.sh", 'sleep 0.05\necho "server ready on 8080"\nexec sleep 30');
+      const started = await call(processStart, { argv: [path] });
+      const out = await waitDefinitely({
+        id: started.id,
+        pattern: "(ready|listening) on \\d+",
+        timeoutMs: 5_000,
+      });
+      expect(out.matched).toBe(true);
+      expect(out.match).toBe("ready on 8080");
+    },
+    20_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -891,62 +1699,516 @@ describe("WaitForPort", () => {
     const out = await call(waitForPort, { port: 80, host: "not a host", timeoutMs: 50 });
     expect(out).toContain("is not a hostname");
   });
+
+  /**
+   * C144: WaitForPort is read-only, so plan and auto mode run it unasked. It
+   * probes loopback; any other host needs the operator's
+   * tool_config.proc.wait_for_port_hosts, and is refused before a DNS query
+   * or a socket.
+   */
+  describe("what it may probe (C144)", () => {
+    let lookups: string[] = [];
+    let answers: Record<string, string[]> = {};
+    let server: ReturnType<typeof createServer>;
+    let port = 0;
+    beforeEach(async () => {
+      lookups = [];
+      answers = {};
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        return answers[host] ?? [];
+      });
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+    });
+    afterEach(async () => {
+      _setDnsLookup(undefined);
+      _resetProcConfig();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    /**
+     * Runs `body` with Date.now, WaitForPort's clock, standing still until
+     * `reached()` says the work the test counts is done; then the clock is a
+     * minute on, past any deadline here. So how many probes fit before the
+     * deadline is decided by that count, not by the runner's speed: a real
+     * 200-300 ms deadline had to fit two probes. Should the work never come,
+     * the clock moves after 10 s anyway, so a broken wait fails on the
+     * assertions after it instead of hanging with the clock frozen.
+     */
+    async function withClockUntil<T>(reached: () => boolean, body: () => Promise<T>): Promise<T> {
+      const frozen = Date.now();
+      const began = performance.now();
+      const clock = spyOn(Date, "now").mockImplementation(() =>
+        reached() || performance.now() - began > 10_000 ? frozen + 60_000 : frozen,
+      );
+      try {
+        return await body();
+      } finally {
+        clock.mockRestore();
+      }
+    }
+
+    /**
+     * Runs `body` with each probe's own timers held: the socket's idle timer
+     * is never armed, and the hard stop behind it, armed for exactly
+     * `hardStopMs`, is never scheduled. A probe then ends only on connect,
+     * refusal or close, never because the runner took longer than a timer to
+     * report the connect; the test's budget bounds one that never ends.
+     * Counts what it held, so a test can show that every probe's timers were.
+     */
+    async function withProbeTimersHeld<T>(
+      hardStopMs: number,
+      body: () => Promise<T>,
+    ): Promise<{ result: T; idleTimers: number; hardStops: number }> {
+      const held = { idleTimers: 0, hardStops: 0 };
+      const realSetTimeout = globalThis.setTimeout;
+      const idle = spyOn(Socket.prototype, "setTimeout").mockImplementation(function (
+        this: Socket,
+      ) {
+        held.idleTimers += 1;
+        return this;
+      } as Socket["setTimeout"]);
+      const hardStop = spyOn(globalThis, "setTimeout").mockImplementation(((
+        fn: (...args: unknown[]) => void,
+        delay?: number,
+        ...rest: unknown[]
+      ) => {
+        if (delay !== hardStopMs) return realSetTimeout(fn, delay, ...rest);
+        held.hardStops += 1;
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout);
+      try {
+        const result = await body();
+        return { result, ...held };
+      } finally {
+        idle.mockRestore();
+        hardStop.mockRestore();
+      }
+    }
+
+    test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
+      for (const host of [
+        "169.254.169.254",
+        "10.0.0.5",
+        "0xa9.0xfe.0xa9.0xfe",
+        "x.attacker.test",
+      ]) {
+        const out = await call(waitForPort, { host, port: 80, timeoutMs: 100 });
+        expect({ host, refused: String(out).includes("is not a loopback address") }).toEqual({
+          host,
+          refused: true,
+        });
+        // A refusal is a sentence: no probe ran, so no `attempts`.
+        expect(String(out)).not.toContain('"attempts"');
+      }
+      // Not even a DNS query for the unlisted name.
+      expect(lookups).toEqual([]);
+    });
+
+    // Each wait is met by its first probe: the 10 s deadline only bounds a
+    // probe that never connects, and fails on the assertion before the
+    // test's budget.
+    test("loopback in any spelling still works, with no configuration", async () => {
+      for (const host of ["127.0.0.1", "0x7f.1", "2130706433", "127.1", "localhost"]) {
+        const out = await call(waitForPort, { host, port, timeoutMs: 10_000 });
+        expect({ host, satisfied: out.satisfied }).toEqual({ host, satisfied: true });
+      }
+      expect(lookups).toEqual([]);
+    }, 20_000);
+
+    test("a listed name is resolved once and its address dialled for every probe", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["db.internal"] });
+      answers["db.internal"] = ["127.0.0.1"];
+      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 10_000 });
+      expect(out.satisfied).toBe(true);
+      // A closed wait on a listener of this test's own polls until its
+      // deadline, and the listener counts every probe that reaches it (a
+      // fresh one: the first wait's probe may still be arriving at the old).
+      // The deadline passes once it has counted three; the name is still
+      // looked up once. (An open wait on the closed port raced a real 300 ms
+      // deadline for two probes, on a port another process could take.)
+      // A probe that times out before it sees its connect reads as closed and
+      // meets this wait, so each probe's timers are held. With the clock
+      // frozen, timeoutMs only sizes them: the socket timeout is the deadline
+      // capped at 1 s, and the hard stop 1 s more. (A 300 ms deadline gave
+      // each probe a real 300 ms, which a runner held that long lost.)
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      let dialled = 0;
+      server = createServer((socket) => {
+        dialled += 1;
+        socket.destroy();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+      lookups = [];
+      const PROBE_HARD_STOP_MS = 1_000 + 1_000;
+      const {
+        result: closed,
+        idleTimers,
+        hardStops,
+      } = await withProbeTimersHeld(PROBE_HARD_STOP_MS, () =>
+        withClockUntil(
+          () => dialled >= 3,
+          () =>
+            call(waitForPort, {
+              host: "db.internal",
+              port,
+              state: "closed",
+              timeoutMs: 10_000,
+              intervalMs: 10,
+            }),
+        ),
+      );
+      expect({ satisfied: closed.satisfied, reason: closed.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(closed.attempts).toBeGreaterThanOrEqual(3);
+      // Every probe's timers were held, so none could end it early.
+      expect({ idleTimers, hardStops }).toEqual({
+        idleTimers: closed.attempts,
+        hardStops: closed.attempts,
+      });
+      expect(lookups).toEqual(["db.internal"]);
+    }, 30_000);
+
+    test("a listed name that does not resolve yet is waited for, then pinned", async () => {
+      // A compose service's name exists only once its container does: the
+      // wait must keep looking it up, not give up on the first empty answer
+      // (regression review). Once it answers, that address is dialled on.
+      registerProcConfig({ wait_for_port_hosts: ["db"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 3 ? ["127.0.0.1"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "db",
+        port,
+        timeoutMs: 5_000,
+        intervalMs: 20,
+      });
+      expect({ satisfied: out.satisfied, attempts: out.attempts, note: out.note }).toEqual({
+        satisfied: true,
+        attempts: 3,
+        note: undefined,
+      });
+      expect(lookups).toEqual(["db", "db", "db"]);
+    });
+
+    test("a listed name that never resolves is closed: a closed wait is met, an open one is not", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["gone.invalid"] });
+      const closed = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        state: "closed",
+        timeoutMs: 2_000,
+      });
+      expect({ satisfied: closed.satisfied, state: closed.state }).toEqual({
+        satisfied: true,
+        state: "closed",
+      });
+      expect(String(closed.note)).toContain("did not resolve");
+      // The open wait looks the name up at every probe, and its deadline
+      // passes at the third lookup.
+      lookups = [];
+      const open = await withClockUntil(
+        () => lookups.length >= 3,
+        () =>
+          call(waitForPort, {
+            host: "gone.invalid",
+            port,
+            timeoutMs: 200,
+            intervalMs: 10,
+          }),
+      );
+      expect({ satisfied: open.satisfied, reason: open.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(open.attempts).toBe(3);
+      expect(lookups).toEqual(["gone.invalid", "gone.invalid", "gone.invalid"]);
+      expect(String(open.note)).toContain("did not resolve");
+    }, 20_000);
+
+    test("a listed name that later resolves to link-local is refused mid-wait", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["flaky.example"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 2 ? ["169.254.169.254"] : [];
+      });
+      // The refusal comes at the second lookup; the 10 s deadline only
+      // bounds a wait that never makes one.
+      const out = await call(waitForPort, {
+        host: "flaky.example",
+        port: 80,
+        timeoutMs: 10_000,
+        intervalMs: 20,
+      });
+      expect(String(out)).toContain("link-local");
+    }, 20_000);
+
+    test("0.0.0.0 and :: — what a dev server prints — are probed as loopback", async () => {
+      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 10_000 });
+      expect(out.satisfied).toBe(true);
+      expect(unspecifiedDial("0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("::")).toBe("::1");
+      expect(unspecifiedDial("0:0:0:0:0:0:0:0")).toBe("::1");
+      expect(unspecifiedDial("::ffff:0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("10.0.0.1")).toBeNull();
+      expect(lookups).toEqual([]);
+    }, 20_000);
+
+    // An IPv4 part with a leading zero is octal to this package's parser,
+    // decimal to macOS's resolver and invalid to the URL parser a permission
+    // rule reads a host with: `::ffff:0177.0.0.1` was classified as loopback,
+    // dialled as written, and reached 177.0.0.1.
+    test("an IPv6 address with no one reading is refused unprobed, listed or not", async () => {
+      const ambiguous = [
+        "::ffff:0177.0.0.1",
+        "::ffff:0177.200.1.1",
+        "::ffff:127.0.0.01",
+        "::ffff:127.000.000.001",
+        "::0:0:0:0:0:0:0:1",
+      ];
+      for (const listed of [[], ambiguous]) {
+        registerProcConfig({ wait_for_port_hosts: listed });
+        for (const host of ambiguous) {
+          const out = String(await call(waitForPort, { host, port, timeoutMs: 1_000 }));
+          expect({ listed: listed.length, host, refused: out.includes("resolvers read") }).toEqual({
+            listed: listed.length,
+            host,
+            refused: true,
+          });
+          // A refusal is a sentence: no probe ran, so no `attempts`.
+          expect(out).not.toContain('"attempts"');
+        }
+      }
+      expect(lookups).toEqual([]);
+    }, 20_000);
+
+    test("an IPv6 address is dialled in the form a permission rule reads it, an address the system dials as is", () => {
+      const reads: Array<[string, string]> = [
+        ["0:0:0:0:0:ffff:127.0.0.1", "::ffff:7f00:1"],
+        ["::FFFF:127.0.0.1", "::ffff:7f00:1"],
+        ["0000:0000:0000:0000:0000:ffff:7f00:0001", "::ffff:7f00:1"],
+        ["0::1", "::1"],
+        ["::0.0.0.1", "::1"],
+        ["::ffff:0.0.0.0", "127.0.0.1"],
+        ["0::0", "::1"],
+        ["FD00:0:0:0:0:0:0:0005", "fd00::5"],
+      ];
+      for (const [host, dial] of reads) {
+        const target = portTarget(host, ["fd00::5"], PORT_HOSTS_KEY);
+        expect({ host, target }).toEqual({ host, target: { ok: true, dial } });
+        expect({ host, isIP: isIP(dial) }).toEqual({ host, isIP: dial.includes(":") ? 6 : 4 });
+        // The unspecified address is dialled as loopback; any other is itself.
+        if (unspecifiedDial(host) === null) expect(ipv6Dial(host)).toBe(dial);
+      }
+    });
+
+    // Each wait's deadline passes once the work it is about has been
+    // counted: the lookup, then the probe. A real 100 ms and 50 ms deadline
+    // let a runner descheduled between the wait's first two clock reads skip
+    // the loop, so nothing was looked up or probed at all.
+    test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
+      answers["meta.example"] = ["169.254.169.254"];
+      const meta = await withClockUntil(
+        () => lookups.length >= 1,
+        () => call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 }),
+      );
+      expect(String(meta)).toContain("link-local");
+      expect(lookups).toEqual(["meta.example"]);
+      // Each probe sets its socket's timeout once; counted, still armed.
+      let probes = 0;
+      const realSetTimeout = Socket.prototype.setTimeout;
+      const counted = spyOn(Socket.prototype, "setTimeout").mockImplementation(function (
+        this: Socket,
+        ...args: Parameters<Socket["setTimeout"]>
+      ) {
+        probes += 1;
+        return realSetTimeout.apply(this, args);
+      } as Socket["setTimeout"]);
+      try {
+        const listed = await withClockUntil(
+          () => probes >= 1,
+          () => call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 }),
+        );
+        expect({ attempts: listed.attempts, probes }).toEqual({ attempts: 1, probes: 1 });
+      } finally {
+        counted.mockRestore();
+      }
+      // A literal is dialled as written, never looked up.
+      expect(lookups).toEqual(["meta.example"]);
+    }, 20_000);
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["10.255.255.1"] });
+      const out = await waitForPort.execute(
+        { host: "10.255.255.1", port: 80, timeoutMs: 50 },
+        { toolConfig: { wait_for_port_hosts: [] } },
+      );
+      expect(String(out)).toContain("is not a loopback address");
+    });
+
+    test("the registrar refuses a malformed host list, naming the key", () => {
+      expect(() => registerProcConfig({ wait_for_port_hosts: "db" })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+      expect(() => registerProcConfig({ wait_for_port_hosts: ["has space"] })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Regression review: RunCommand's child is spawned detached (setsid), so it
+ * has no controlling terminal — sudo, ssh and gpg prompts fail instead of
+ * waiting. That is the chosen behaviour (a model-run command must not read or
+ * inject into the operator's terminal), so it is pinned here under a real
+ * pty: the same shell run directly under `script` opens /dev/tty, and run
+ * through RunCommand inside that same pty it cannot.
+ */
+describe("RunCommand runs without a terminal", () => {
+  const script = ["/usr/bin/script", "/bin/script"].find((p) => existsSync(p));
+  const probe = "if (exec 3</dev/tty) 2>/dev/null; then echo TTY-OK; else echo TTY-NONE; fi";
+  const underPty = (argv: string[]): string => {
+    const quoted = argv.map((a) => `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+    const cmd =
+      process.platform === "darwin"
+        ? [script as string, "-q", "/dev/null", ...argv]
+        : [script as string, "-qec", quoted, "/dev/null"];
+    const r = Bun.spawnSync(cmd, { cwd: tmp, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    return r.stdout.toString().replaceAll("\r", "");
+  };
+
+  test.skipIf(process.platform === "win32" || script === undefined)(
+    "a child of RunCommand cannot open the terminal its harness runs in",
+    () => {
+      // The pty is live: a shell started in it opens /dev/tty.
+      expect(underPty(["/bin/sh", "-c", probe])).toContain("TTY-OK");
+      const child = join(tmp, "run-in-pty.ts");
+      writeFileSync(
+        child,
+        [
+          `import { runCommand } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          `const out = await runCommand.execute({ argv: ["/bin/sh", "-c", ${JSON.stringify(probe)}], timeoutMs: 10000 });`,
+          'console.log("RESULT", String(out));',
+        ].join("\n"),
+      );
+      const out = underPty([process.execPath, child]);
+      const line = out.split("\n").find((l) => l.includes("RESULT {")) ?? "";
+      const result = JSON.parse(line.slice(line.indexOf("{"))) as { ok: boolean; stdout: string };
+      expect({ ok: result.ok, stdout: result.stdout }).toEqual({ ok: true, stdout: "TTY-NONE\n" });
+    },
+    30_000,
+  );
+});
+
+/**
+ * Runs one WaitForFile call on a clock that moves only when the wait sleeps
+ * between polls, by exactly the time it asked for, and the sleep ends on the
+ * next turn of the event loop, with no timer. `between(n)` runs as the wait
+ * starts its nth sleep, after its nth poll, so a file appears, goes or grows
+ * between two counted polls instead of on a real timer racing the wait's
+ * real deadline: a runner whose timers ran late made the change land after
+ * it. The deadline is a number of polls too. Should a broken wait run on
+ * past twice its deadline, the clocks are put back and the call's signal is
+ * aborted, which the wait honours, so it fails on its own assertions and the
+ * next test starts on the real clocks.
+ */
+async function waitForFileBetweenPolls(
+  input: { readonly timeoutMs: number; readonly intervalMs: number } & Record<string, unknown>,
+  between: (sleep: number) => void,
+  // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed shape directly.
+): Promise<any> {
+  const realSetTimeout = globalThis.setTimeout;
+  const frozen = Date.now();
+  let elapsed = 0;
+  let sleeps = 0;
+  const stop = new AbortController();
+  const clock = spyOn(Date, "now").mockImplementation(() => frozen + elapsed);
+  const asleep = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay === undefined || delay > input.intervalMs) return realSetTimeout(fn, delay, ...rest);
+    sleeps += 1;
+    elapsed += delay;
+    between(sleeps);
+    if (elapsed > 2 * input.timeoutMs) {
+      restore();
+      stop.abort();
+    }
+    return setImmediate(() => fn(...rest)) as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  let restored = false;
+  function restore(): void {
+    if (restored) return;
+    restored = true;
+    asleep.mockRestore();
+    clock.mockRestore();
+  }
+  try {
+    return await call(waitForFile, input, { signal: stop.signal });
+  } finally {
+    restore();
+  }
+}
+
 describe("WaitForFile", () => {
   test("returns once the file appears", async () => {
     const target = join(tmp, "artifact.bin");
-    const timer = setTimeout(() => writeFileSync(target, "built"), 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "artifact.bin",
-        timeoutMs: 3_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(5);
-    } finally {
-      clearTimeout(timer);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "artifact.bin", timeoutMs: 3_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(target, "built");
+      },
+    );
+    // The first poll found nothing; the one after the file appeared returned.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 5, attempts: 2 });
   });
 
   test("waits for a file to disappear", async () => {
     const target = join(tmp, "lock");
     writeFileSync(target, "held");
-    const timer = setTimeout(() => rmSync(target, { force: true }), 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "lock",
-        condition: "absent",
-        timeoutMs: 3_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.exists).toBe(false);
-    } finally {
-      clearTimeout(timer);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "lock", condition: "absent", timeoutMs: 3_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) rmSync(target, { force: true });
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, exists: false, attempts: 2 });
   });
 
   test("'stable' waits for the size to stop moving", async () => {
     const target = join(tmp, "growing.log");
     writeFileSync(target, "a");
-    const grow = setTimeout(() => writeFileSync(target, "aaaaaa"), 60);
-    try {
-      const out = await call(waitForFile, {
+    const out = await waitForFileBetweenPolls(
+      {
         path: "growing.log",
         condition: "stable",
         stableForMs: 150,
         timeoutMs: 5_000,
         intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(6);
-    } finally {
-      clearTimeout(grow);
-    }
+      },
+      (sleep) => {
+        if (sleep === 3) writeFileSync(target, "aaaaaa");
+      },
+    );
+    // The size moved at the 4th poll (60 ms in), and the wait returned at the
+    // first poll 150 ms after that: 11 sleeps of 20 ms.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 6, attempts: 12, waitedMs: 220 });
   });
 
   test("a file that never appears fails at the deadline", async () => {
@@ -1001,36 +2263,28 @@ describe("WaitForFile", () => {
   });
 
   test("a symlink swapped in mid-wait cannot escape either", async () => {
-    const swap = setTimeout(() => {
-      writeFileSync(join(outside, "late.txt"), "secret");
-      symlinkSync(join(outside, "late.txt"), join(tmp, "swapped.txt"));
-    }, 100);
-    try {
-      const out = await call(waitForFile, {
-        path: "swapped.txt",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out).toContain("refused path");
-    } finally {
-      clearTimeout(swap);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "swapped.txt", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep !== 1) return;
+        writeFileSync(join(outside, "late.txt"), "secret");
+        symlinkSync(join(outside, "late.txt"), join(tmp, "swapped.txt"));
+      },
+    );
+    expect(out).toContain("refused path");
+    // Refused by the per-poll recheck, at the poll after the swap.
+    expect(out).toContain("now resolves outside");
   });
 
   test("a dangling symlink to a path INSIDE the workspace still works normally", async () => {
     symlinkSync(join(tmp, "built-later.txt"), join(tmp, "link-to-artifact"));
-    const build = setTimeout(() => writeFileSync(join(tmp, "built-later.txt"), "ok!"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "link-to-artifact",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "link-to-artifact", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(join(tmp, "built-later.txt"), "ok!");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 });
 
@@ -1040,7 +2294,8 @@ describe("CommandExists", () => {
   test("finds a program that is on PATH and resolves it", async () => {
     const out = await call(commandExists, { name: "sh" });
     expect(out.found).toBe(true);
-    expect(out.path.endsWith("/sh")).toBe(true);
+    // `…/bin/sh` on POSIX; on Windows the PATHEXT match, e.g. `…\\usr\\bin\\sh.exe`.
+    expect(out.path).toMatch(process.platform === "win32" ? /\\sh(\.exe)?$/i : /\/sh$/);
   });
 
   test("reports a missing program as an answer, not an error", async () => {
@@ -1052,6 +2307,56 @@ describe("CommandExists", () => {
   test("a path is refused: this looks up names, it does not stat wherever it is pointed", async () => {
     expect(await call(commandExists, { name: "/etc/passwd" })).toContain("is a path");
     expect(await call(commandExists, { name: "../sh" })).toContain("is a path");
+  });
+
+  describe("on Windows (C125)", () => {
+    const saved = { path: process.env["PATH"], pathext: process.env["PATHEXT"] };
+    afterEach(() => {
+      _setPlatform(undefined);
+      for (const [key, value] of [
+        ["PATH", saved.path],
+        ["PATHEXT", saved.pathext],
+      ] as const) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    });
+
+    test("a bare name finds the program through PATHEXT, as RunCommand's spawn would", async () => {
+      const dir = join(tmp, "bin");
+      mkdirSync(dir);
+      // No execute bit: Windows has none, and the POSIX check must not apply.
+      writeFileSync(join(dir, "tool.exe"), "");
+      process.env["PATH"] = dir;
+      process.env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD";
+      _setPlatform("win32");
+      const out = await call(commandExists, { name: "tool" });
+      expect({ found: out.found, path: out.path }).toEqual({
+        found: true,
+        path: join(dir, "tool.exe"),
+      });
+      // Control: the same directory on POSIX has no program called "tool".
+      _setPlatform("linux");
+      expect((await call(commandExists, { name: "tool" })).found).toBe(false);
+    });
+
+    test("PATHEXT order, PATH order, a spelled-out extension and an extensionless file", () => {
+      const a = join(tmp, "a");
+      const b = join(tmp, "b");
+      mkdirSync(a);
+      mkdirSync(b);
+      writeFileSync(join(a, "git"), "");
+      writeFileSync(join(b, "git.exe"), "");
+      writeFileSync(join(b, "git.com"), "");
+      writeFileSync(join(a, "npm.cmd"), "");
+      const win = { pathValue: `"${a}";${b}`, platform: "win32" as const, pathext: ".COM;.EXE" };
+      // An extensionless `git` in an earlier directory is not a program there.
+      expect(searchPath("git", win)).toEqual({ path: join(b, "git.com"), searchedDirs: 2 });
+      expect(searchPath("git.exe", win).path).toBe(join(b, "git.exe"));
+      // .CMD is not in this PATHEXT, so npm is not found; with the default it is.
+      expect(searchPath("npm", win).path).toBeNull();
+      expect(searchPath("npm", { ...win, pathext: undefined }).path).toBe(join(a, "npm.cmd"));
+    });
   });
 
   test("the answer is stable across calls", async () => {
@@ -1077,12 +2382,104 @@ describe("EnvInspect", () => {
     expect(JSON.stringify(out)).not.toContain("sk-0123456789");
   });
 
-  test("reveals only what the caller names", async () => {
-    const out = await call(envInspect, {
-      names: ["TOOL_PROC_TOKEN"],
-      reveal: ["TOOL_PROC_TOKEN"],
+  // C052: before 0.7.1 the CALL chose what to reveal, so a model could read
+  // any key into its own context from a read-only tool plan mode runs unasked.
+  describe("a value is shown only where the operator allowed it", () => {
+    const KEY = ["sk-ant-api03-", "0123456789abcdef", "ABCDEFGH"].join("");
+    beforeEach(() => {
+      process.env["TOOL_PROC_API_KEY"] = KEY;
+      process.env["TOOL_PROC_MODE"] = "staging";
+      process.env["TOOL_PROC_PGPASSWORD"] = "hunter2";
+      process.env["TOOL_PROC_DATABASE_URL"] = "postgres://u:p@h/db";
+      process.env["TOOL_PROC_GITHUB_PAT"] = "ghp-lookalike-value";
     });
-    expect(out.variables[0].value).toBe("sk-0123456789");
+    afterEach(() => {
+      _resetProcConfig();
+      for (const n of [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_MODE",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ]) {
+        Reflect.deleteProperty(process.env, n);
+      }
+    });
+
+    test("with no tool_config, a reveal shows nothing and says why", async () => {
+      const out = await call(envInspect, {
+        names: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+        reveal: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+      });
+      expect(JSON.stringify(out)).not.toContain(KEY);
+      expect(JSON.stringify(out)).not.toContain("staging");
+      expect(out.variables).toEqual([
+        {
+          name: "TOOL_PROC_API_KEY",
+          present: true,
+          chars: KEY.length,
+          withheld: "credential-shaped",
+        },
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, withheld: "not-allowed" },
+      ]);
+      expect(out.note).toContain("tool_config.proc.env_reveal");
+    });
+
+    test("a listed, ordinary name is shown", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const out = await call(envInspect, { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] });
+      expect(out.variables).toEqual([
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, value: "staging" },
+      ]);
+    });
+
+    test("a credential-shaped name is never shown, and cannot be listed", async () => {
+      // Names the old suffix-only heuristics missed are caught too.
+      const secretNames = [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ];
+      for (const name of secretNames) {
+        expect(() => registerProcConfig({ env_reveal: [name] })).toThrow("looks like a credential");
+      }
+      const out = await call(envInspect, { names: secretNames, reveal: secretNames });
+      for (const secret of [KEY, "hunter2", "postgres://u:p@h/db", "ghp-lookalike-value"]) {
+        expect(JSON.stringify(out)).not.toContain(secret);
+      }
+      expect(out.variables.map((v: { withheld?: string }) => v.withheld)).toEqual([
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+      ]);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const input = { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] };
+      const narrowed = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: [] } } as never)),
+      );
+      expect(narrowed.variables[0].withheld).toBe("not-allowed");
+      const broken = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: "x" } } as never)),
+      );
+      expect(broken.variables[0].withheld).toBe("not-allowed");
+    });
+
+    test("the registrar refuses a block it cannot read, naming the key", () => {
+      expect(() => registerProcConfig({ env_reveal: "NODE_ENV" })).toThrow(
+        "tool_config.proc.env_reveal",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["not a name"] })).toThrow(
+        "not an environment",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["A"], envReveal: ["B"] })).toThrow("both");
+      expect(() => registerProcConfig({})).not.toThrow();
+      expect(() => registerProcConfig({ allowed_origins: ["https://a.example"] })).not.toThrow();
+    });
   });
 
   test("revealing something that was not inspected is refused", async () => {
@@ -1136,18 +2533,20 @@ describe("dangling-symlink containment in resolveSafe", () => {
     expect(existsSync(target)).toBe(false);
     symlinkSync(target, join(tmp, "dangling.bin"));
 
-    const at = Date.now();
-    const out = await call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 });
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dangling.bin", timeoutMs: 2_000, intervalMs: 20 }),
+    );
 
     // The specific refusal matters. Before the fix the path was admitted and
     // the tool polled it to the deadline (returning `satisfied: false`), and
     // the only thing standing between a caller and an outside oracle was the
     // per-poll recheck, whose wording is different ("it NOW resolves
-    // outside…"). This asserts the up-front check did the refusing.
+    // outside…"). This asserts the up-front check did the refusing, and no
+    // poll slept before it, so it came before the polling, not at the
+    // deadline.
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
-    // Refused before the first poll, not at the deadline.
-    expect(Date.now() - at).toBeLessThan(1_000);
+    expect(timers).toBe(0);
     // A read-only tool cannot have created the target, but assert it anyway:
     // this is the assertion that would fail first if a writing tool were ever
     // wired to `resolveSafe`. The planted link is left exactly as it was.
@@ -1160,13 +2559,12 @@ describe("dangling-symlink containment in resolveSafe", () => {
     // for a directory that does not exist yet was walked past the same way,
     // and everything under it inherited the parent's verdict.
     symlinkSync(join(outside, "not-made-yet"), join(tmp, "dlink"));
-    const out = await call(waitForFile, {
-      path: "dlink/artifact.bin",
-      timeoutMs: 2_000,
-      intervalMs: 20,
-    });
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dlink/artifact.bin", timeoutMs: 2_000, intervalMs: 20 }),
+    );
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
+    expect(timers).toBe(0);
     expect(existsSync(join(outside, "not-made-yet"))).toBe(false);
   });
 
@@ -1177,18 +2575,14 @@ describe("dangling-symlink containment in resolveSafe", () => {
     mkdirSync(join(tmp, "sub"));
     const realTarget = join(tmp, "sub", "built-later.bin");
     symlinkSync(realTarget, join(tmp, "inside-link.bin"));
-    const build = setTimeout(() => writeFileSync(realTarget, "built"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "inside-link.bin",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(5);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "inside-link.bin", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "built");
+      },
+    );
+    // Admitted and polled while it dangled, then found.
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 5, attempts: 2 });
   });
 
   test("an in-workspace target NAMED through an outside path is honoured, not refused", async () => {
@@ -1207,18 +2601,13 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(tmp, join(outside, "alias"));
     const realTarget = join(tmp, "sub", "via-alias.bin");
     symlinkSync(join(outside, "alias", "sub", "via-alias.bin"), join(tmp, "aliased-link.bin"));
-    const build = setTimeout(() => writeFileSync(realTarget, "ok!"), 80);
-    try {
-      const out = await call(waitForFile, {
-        path: "aliased-link.bin",
-        timeoutMs: 2_000,
-        intervalMs: 20,
-      });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "aliased-link.bin", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "ok!");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 
   test("a RELATIVE dangling target is measured from where the link really lives", async () => {
@@ -1236,11 +2625,13 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(join(outside, "realdir"), join(tmp, "dirlink"));
     symlinkSync("../escape.bin", join(outside, "realdir", "l"));
 
-    const at = Date.now();
-    const out = await call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 });
+    // The up-front check's sentence, and no poll slept before it.
+    const { result: out, timers } = await countTimersAndWorkers(() =>
+      call(waitForFile, { path: "dirlink/l", timeoutMs: 2_000, intervalMs: 20 }),
+    );
     expect(typeof out).toBe("string");
     expect(out).toMatch(/a symlink on it leads outside the workspace root/);
-    expect(Date.now() - at).toBeLessThan(1_000);
+    expect(timers).toBe(0);
     expect(existsSync(join(outside, "escape.bin"))).toBe(false);
   });
 
@@ -1254,13 +2645,12 @@ describe("dangling-symlink containment in resolveSafe", () => {
     symlinkSync(join(tmp, "deep", "inner"), join(tmp, "inlink"));
     symlinkSync("../../legit.bin", join(tmp, "deep", "inner", "m"));
     const realTarget = join(tmp, "legit.bin");
-    const build = setTimeout(() => writeFileSync(realTarget, "yes"), 80);
-    try {
-      const out = await call(waitForFile, { path: "inlink/m", timeoutMs: 2_000, intervalMs: 20 });
-      expect(out.satisfied).toBe(true);
-      expect(out.sizeBytes).toBe(3);
-    } finally {
-      clearTimeout(build);
-    }
+    const out = await waitForFileBetweenPolls(
+      { path: "inlink/m", timeoutMs: 2_000, intervalMs: 20 },
+      (sleep) => {
+        if (sleep === 1) writeFileSync(realTarget, "yes");
+      },
+    );
+    expect(out).toMatchObject({ satisfied: true, sizeBytes: 3, attempts: 2 });
   });
 });

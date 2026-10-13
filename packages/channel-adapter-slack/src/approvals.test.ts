@@ -71,6 +71,27 @@ describe("buildApprovalMessage (block-kit)", () => {
     expect(types).toEqual(["section", "actions", "context"]);
   });
 
+  test("0.7.1 — where the call lands is a section of its own, so a card asked again reads differently (critic8)", () => {
+    const content = {
+      approvalId: "appr_abc",
+      toolName: "Write",
+      inputPreview: '{"path":"pub/link/x.md"}',
+      surface: "daemon",
+    };
+    const landsAt =
+      "asked again: approval appr_old was granted for pub/link/x.md -> /ws/public/x.md, and a symlink on the path now leads elsewhere\nlands at: pub/link/x.md -> /ws/secrets/x.md ```";
+    const plain = buildApprovalMessage(content);
+    const placed = buildApprovalMessage({ ...content, landsAt });
+    expect((plain.blocks as Any[]).map((b) => b.type)).toEqual(["section", "actions", "context"]);
+    const types = (placed.blocks as Any[]).map((b) => b.type);
+    expect(types).toEqual(["section", "section", "actions", "context"]);
+    const where = (placed.blocks as Any[])[1].text.text as string;
+    expect(where).toContain("approval appr_old was granted for pub/link/x.md -> /ws/public/x.md");
+    expect(where).toContain("lands at: pub/link/x.md -> /ws/secrets/x.md");
+    // A backtick fence in a path cannot close the block early.
+    expect(where.match(/```/g)?.length).toBe(2);
+  });
+
   test("all three buttons carry the approvalId in value; block_id carries it too", () => {
     const id = "appr_deadbeef";
     const msg = buildApprovalMessage({

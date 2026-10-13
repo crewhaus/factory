@@ -203,6 +203,8 @@ describe("dispatch through executeTool", () => {
     expect(result.content).toContain('"status":200');
   });
 
+  // The calls run one after another, so the budget sits above the sum of
+  // their deadlines: a stalled call fails here, not as an orphan after it.
   test("every tool survives a schema-valid call — none throws out of execute", async () => {
     const calls: Record<string, unknown> = {
       DnsLookup: { name: "127.0.0.1", types: ["A"], timeoutMs: 1_000 },
@@ -250,5 +252,5 @@ describe("dispatch through executeTool", () => {
       });
       expect(typeof result.content).toBe("string");
     }
-  });
+  }, 90_000);
 });

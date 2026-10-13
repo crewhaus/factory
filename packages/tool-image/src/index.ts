@@ -1,17 +1,10 @@
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  readlinkSync,
-  realpathSync,
-} from "node:fs";
+import { closeSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolResultContent } from "@crewhaus/tool-catalog";
+import { openForReadFd, resolveContained } from "@crewhaus/tool-safety/fs";
+import { readOpenedFileSync } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 
 /**
@@ -22,9 +15,10 @@ import { z } from "zod";
  * Defenses:
  *   - Path resolved against `process.cwd()` and rejected if it escapes,
  *     lexically or via an in-root symlink whose real target lies outside
- *     (CWE-59). Mirrors `tool-fs`'s `resolveSafe` — duplicated (here and
- *     in `tool-document-ingest`) rather than extracted to a shared util;
- *     keep the copies in sync.
+ *     (CWE-59). Where the path lands is tool-safety's `resolveContained`
+ *     (component by component, dangling links followed), and the read is
+ *     its `openForReadFd`: a FIFO, socket or device is refused before it
+ *     is opened, and the open descriptor must be inside the workspace.
  *   - Magic-byte validation on the first 12 bytes — rejects extension
  *     spoofing (e.g. `evil.png` whose actual content is a PDF).
  *   - 5 MB per-image cap.
@@ -54,73 +48,6 @@ export class ToolPermissionError extends CrewhausError {
   }
 }
 
-/**
- * True when the NAME exists, whether or not it leads anywhere.
- *
- * `existsSync` follows symlinks, so it answers false for a link whose target
- * is missing — and a missing target is exactly the case that matters here: a
- * dangling link is still a door. Probing with `lstat` keeps that name in the
- * part of the path that gets RESOLVED rather than in the "does not exist
- * yet" tail that is appended to the root verbatim. `ReadImage` only ever
- * opens read-only, so today the consequence of getting this wrong is a
- * mis-scoped read rather than a file created outside the workspace — but the
- * check is the package's boundary, and the next tool added here may write.
- */
-function nameExists(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Where `target` would actually land, with every symlink on the way already
- * followed — including one whose own target does not exist yet.
- *
- * `realpathSync` gives up with ENOENT on a dangling link, which would leave
- * that link unresolved and let it stand in for a plain missing file. So the
- * deepest ancestor that exists as a NAME is resolved, a dangling one is
- * followed a hop by hand, and the components that do not exist are appended.
- * The result is the path an `open` would reach, which is the only path worth
- * checking containment against.
- */
-function resolveLocation(target: string, depth = 0): string {
-  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break; // reached the filesystem root
-    probe = parent;
-  }
-  let probeReal: string;
-  try {
-    probeReal = realpathSync(probe);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    // The name is there but `realpath` cannot finish it: a symlink with a
-    // missing target. `readlinkSync` throws EINVAL on anything else, which
-    // fails closed. A relative target resolves against the link's directory.
-    // Recursing (rather than returning the raw target) is what resolves an
-    // absolute target such as /var/folders/... to its real /private/var/...
-    // form, so a legitimate in-workspace dangling link is not wrongly refused.
-    const link = readlinkSync(probe);
-    // A RELATIVE target resolves against the directory that actually CONTAINS
-    // the link, which is not the link's lexical parent when that parent is
-    // itself reached through a symlink. `<root>/dirlink/x -> ../y` with
-    // `dirlink` pointing out of the root really lands at `<elsewhere>/y`, but
-    // measured from the lexical parent it reads as `<root>/y` — an in-root
-    // path the caller's path does not lead to. So the parent is made real
-    // first. An absolute target ignores the base.
-    const base = realpathSync(path.dirname(probe));
-    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
-  }
-  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
-}
-
 function resolveSafe(toolName: string, rel: string, root: string = process.cwd()): string {
   const rootResolved = path.resolve(root);
   const abs = path.resolve(rootResolved, rel);
@@ -131,28 +58,14 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   }
   // 2) Symlink-aware containment (CWE-59). The lexical check above is fooled
   //    by an in-root symlink that points outside the workspace, so re-check
-  //    the REAL path. The leaf may not exist (the file-not-found error comes
-  //    after containment so escaping paths never leak existence info), so
-  //    resolve the deepest ancestor that EXISTS AS A NAME and re-append the
-  //    missing tail. "Exists as a name" rather than "exists": a dangling
-  //    symlink is still followed by the kernel, so it is resolved here too
-  //    rather than treated as a plain missing leaf that gets re-appended to
-  //    the root and waved through.
-  //    Fails closed if realpath errors for any reason other than the walk.
-  let real: string;
-  try {
-    const rootReal = realpathSync(rootResolved);
-    real = resolveLocation(abs);
-    if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
-      throw new ToolPermissionError(toolName, rel);
-    }
-  } catch (err) {
-    if (err instanceof ToolPermissionError) throw err;
-    throw new ToolPermissionError(toolName, rel);
-  }
-  // Return the validated REAL path; the read site opens it with O_NOFOLLOW so a
-  // leaf swapped to a symlink after this check (TOCTOU/CWE-367) is rejected.
-  return real;
+  //    where the path PHYSICALLY lands. The leaf may not exist (the
+  //    file-not-found error comes after containment so escaping paths never
+  //    leak existence info). tool-safety walks it one component at a time,
+  //    as the kernel does, following dangling links too; the copy that lived
+  //    here folded a dangling link's target as text (C068). Fails closed.
+  const resolved = resolveContained(rootResolved, abs);
+  if (!resolved.ok) throw new ToolPermissionError(toolName, rel);
+  return resolved.real;
 }
 
 export type ImageMediaType = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
@@ -220,25 +133,27 @@ export const readImage: RegisteredTool = buildTool({
   // when that lands, parallel calls would race on the counter. Mark serial
   // until the runtime exposes a shared turn store.
   execute: async (input): Promise<string | ToolResultContent> => {
-    const abs = resolveSafe("ReadImage", input.path);
-    // Open with O_NOFOLLOW so a leaf swapped to a symlink after the containment
-    // check (TOCTOU/CWE-367) is rejected rather than followed out of the root.
-    let fd: number;
-    try {
-      fd = openSync(abs, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") {
+    resolveSafe("ReadImage", input.path);
+    // tool-safety's contained open: a FIFO, socket or device is refused
+    // BEFORE it is opened (a blocking open of a FIFO froze the event loop
+    // until a writer appeared, and no timeout or abort reaches it: C074), a
+    // leaf or directory swapped for a link out of the workspace after the
+    // check above is refused on the descriptor, and the size is read from
+    // the descriptor before a byte is.
+    const opened = openForReadFd(process.cwd(), input.path);
+    if (!opened.ok) {
+      if (opened.code === "escapes-root") throw new ToolPermissionError("ReadImage", input.path);
+      if (opened.code === "not-found") {
         throw new ToolPermissionError("ReadImage", input.path, "file not found");
       }
-      if (code === "ELOOP") {
+      if (opened.code === "is-symlink") {
         throw new ToolPermissionError("ReadImage", input.path, "path is a symlink");
       }
-      throw err;
+      throw new ToolPermissionError("ReadImage", input.path, opened.reason);
     }
     let buf: Uint8Array;
     try {
-      const size = fstatSync(fd).size;
+      const size = opened.stats.size;
       if (size > MAX_IMAGE_BYTES) {
         throw new ToolPermissionError(
           "ReadImage",
@@ -246,16 +161,22 @@ export const readImage: RegisteredTool = buildTool({
           `image is ${size} bytes — exceeds the ${MAX_IMAGE_BYTES}-byte cap`,
         );
       }
-      const b = Buffer.allocUnsafe(size);
-      let offset = 0;
-      while (offset < size) {
-        const n = readSync(fd, b, offset, size - offset, offset);
-        if (n === 0) break;
-        offset += n;
+      const r = readOpenedFileSync(
+        { ok: true, fd: opened.fd, stats: opened.stats },
+        { maxBytes: MAX_IMAGE_BYTES },
+      );
+      if (!r.ok)
+        throw new ToolPermissionError("ReadImage", input.path, "the file could not be read");
+      if (r.truncated) {
+        throw new ToolPermissionError(
+          "ReadImage",
+          input.path,
+          `image grew past the ${MAX_IMAGE_BYTES}-byte cap while it was read`,
+        );
       }
-      buf = b.subarray(0, offset);
+      buf = r.bytes;
     } finally {
-      closeSync(fd);
+      closeSync(opened.fd);
     }
     const mediaType = detectMediaType(buf);
     if (mediaType === null) {

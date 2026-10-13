@@ -17,7 +17,7 @@ its method in its result, and refuses when the data cannot answer the question.
 ```yaml
 tools:
   - all-math          # every tool below
-  - -Evaluate         # ...except this one
+  - -evaluate         # ...except this one
 ```
 
 | Tool | What it does |

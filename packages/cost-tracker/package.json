@@ -11,7 +11,8 @@
     "./ranking": "./src/ranking.ts",
     "./capabilities": "./src/capabilities.ts",
     "./feed": "./src/feed.ts",
-    "./candidates": "./src/candidates.ts"
+    "./candidates": "./src/candidates.ts",
+    "./tool-limits": "./src/tool-limits.ts"
   },
   "scripts": {
     "test": "bun test src"

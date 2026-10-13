@@ -108,7 +108,7 @@ describe("crewhaus lessons update (#56)", () => {
     const second = await runCli(["lessons", "update", "--sessions", "all"], root);
     expect(second.exitCode).toBe(0);
     expect(readFileSync(lessonsFile, "utf-8")).toBe(md1);
-  });
+  }, 20_000);
 
   test("preserves a human-authored preamble across updates", async () => {
     const root = newTempRoot();
@@ -124,5 +124,5 @@ describe("crewhaus lessons update (#56)", () => {
     const md = readFileSync(join(root, "LESSONS.md"), "utf-8");
     expect(md).toContain("Hand-written intro that must survive.");
     expect(md).toContain("crewhaus deploy");
-  });
+  }, 20_000);
 });

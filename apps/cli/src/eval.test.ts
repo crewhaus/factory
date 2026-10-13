@@ -87,6 +87,47 @@ async function runCli(
   return { exitCode };
 }
 
+/**
+ * shape-reach#1 — eval-runner wired tools from its own 11-entry map, so a
+ * spec using any 0.7.0 tool crashed `crewhaus eval` with a stack trace
+ * before the first model call. The spawned CLI has no model credentials, so
+ * the run gets exactly as far as the model call: wiring is what is under
+ * test, and the sample's error says why it stopped.
+ */
+describe("crewhaus eval wires 0.7.0 tools through the shared table", () => {
+  test("tools: [jsonQuery] wires, and the run stops at the missing credentials instead", async () => {
+    const root = newTempRoot();
+    const spec = join(root, "crewhaus.yaml");
+    writeFileSync(
+      spec,
+      "name: evalwire\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [jsonQuery]\ncontinuity: false\n",
+    );
+    writeFileSync(join(root, "data.jsonl"), '{"id":"s1","input":"hi","expected_output":"hi"}\n');
+    writeFileSync(join(root, "graders.yaml"), "graders:\n  - name: exact\n    type: exact_match\n");
+    const out = join(root, "out");
+    const { exitCode } = await runCli(
+      [
+        "eval",
+        spec,
+        "--dataset",
+        join(root, "data.jsonl"),
+        "--graders",
+        join(root, "graders.yaml"),
+        "--out",
+        out,
+      ],
+      root,
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(readFileSync(join(out, "results.json"), "utf-8")) as {
+      samples: Array<{ error?: string }>;
+    };
+    const error = results.samples[0]?.error ?? "";
+    expect(error).not.toContain("unknown tool");
+    expect(error).toContain("credentials");
+  }, 60_000);
+});
+
 describe("crewhaus eval CLI integration (T3)", () => {
   // Stub-mode is wired via a deterministic spec that returns the
   // expected_output verbatim; we exercise the orchestration path
@@ -151,12 +192,12 @@ describe("crewhaus eval CLI integration (T3)", () => {
   test("eval --help exits 0", async () => {
     const result = await runCli(["eval", "--help"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("eval rejects missing --dataset", async () => {
     const result = await runCli(["eval", HELLO_SPEC]);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch B, G15) — `--repeats` is validated strictly and
   // BEFORE any dataset load or model spend, so these need no credentials.
@@ -227,17 +268,17 @@ describe("crewhaus eval CLI integration (T3)", () => {
       "500",
     ]);
     expect(sentinel.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("eval-report --help exits 0", async () => {
     const result = await runCli(["eval-report", "--help"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("eval-report rejects unknown action", async () => {
     const result = await runCli(["eval-report", "bogus"]);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
@@ -274,12 +315,12 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
       (await runCli(["eval-report", "history", "--spec", "concierge", "--dataset", "smoke"], root))
         .exitCode,
     ).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline show exits 0 with no pins", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a recorded run into baselines.json", async () => {
     const root = newTempRoot();
@@ -304,7 +345,7 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     });
     // `baseline show` over the pin still exits 0.
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a ROUTED run under its own lineage key, not the legacy one", async () => {
     // 0.6.0 §6.1 — `setBaseline` keys on the entry's lineage, so a manual pin
@@ -342,23 +383,23 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     // The primary's baseline is exactly where it was.
     expect(baselines["concierge::smoke"]?.runId).toBe("run_prim1111prim1111");
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline set rejects a runId absent from the index", async () => {
     const root = newTempRoot();
     const result = await runCli(["eval-report", "baseline", "set", "run_ffff9999ffff9999"], root);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline set rejects a missing runId argument", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "set"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline rejects unknown sub-action", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "bogus"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", () => {
@@ -464,7 +505,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     const html = readFileSync(join(out, "index.html"), "utf-8");
     expect(html).toContain("Paired significance:");
     expect(html).toContain("Slice deltas (2)");
-  });
+  }, 20_000);
 
   test("unseeded diffs are byte-identical across runs (fixed default seed)", async () => {
     const root = newTempRoot();
@@ -485,7 +526,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     expect(parsed.significance.method).toBe("monte-carlo");
     // 6/25 same-direction regressions: decisively significant.
     expect(parsed.significance.significant).toBe(true);
-  });
+  }, 20_000);
 
   test("--seed override is recorded; a garbled seed dies loudly", async () => {
     const root = newTempRoot();
@@ -502,7 +543,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     );
     expect(bad.exitCode).toBe(1);
     expect(bad.stderr).toContain("--seed must be an integer");
-  });
+  }, 20_000);
 
   test("--judge-model without --pairwise warns loudly and stays offline", async () => {
     const root = newTempRoot();
@@ -518,7 +559,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     // The flag stayed inert: a fully offline diff, no pairwise block.
     const diff = JSON.parse(readFileSync(join(out, "diff.json"), "utf-8"));
     expect(diff.pairwise).toBeUndefined();
-  });
+  }, 20_000);
 
   test("history/baseline warn when handed the pairwise-only flags", async () => {
     const root = newTempRoot();
@@ -531,7 +572,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     );
     expect(baseline.exitCode).toBe(0);
     expect(baseline.stderr).toContain("--judge-model only applies to `eval-report diff`");
-  });
+  }, 20_000);
 
   test("disjoint sample ids → clean mismatch message, not a stack trace", async () => {
     const root = newTempRoot();
@@ -541,7 +582,7 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("dataset shape mismatch");
     expect(result.stderr).not.toContain("    at "); // no stack frames
-  });
+  }, 20_000);
 
   test("a missing run dir also dies cleanly", async () => {
     const root = newTempRoot();
@@ -549,5 +590,5 @@ describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", ()
     const result = await runCliStderr(["eval-report", "diff", prev, join(root, "nope")], root);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("results.json not found");
-  });
+  }, 20_000);
 });

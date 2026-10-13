@@ -16,6 +16,78 @@
  */
 import type { ManifestKind } from "./inputs";
 
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** A code unit after which `^` matches under the `m` flag. */
+function isLineBreak(c: number): boolean {
+  return c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
+}
+
+/**
+ * The first match of `rest` (sticky) right after a line's own indentation:
+ * the `rest` that `/^\s*rest/m.exec(text)` found first, with the same
+ * groups (the whitespace in front is not part of what is returned). A `^\s*`
+ * under `m` starts at every line and its `\s*` runs on across blank lines, so
+ * a run of them was rescanned from each line start in it: quadratic in its
+ * length. Starting at each line's first non-blank character finds the same
+ * `rest`, because a match that crossed blank lines is also a match from the
+ * line it reached, and that line comes first among the ones that match.
+ */
+export function firstAtLineStart(text: string, rest: RegExp): RegExpExecArray | null {
+  let lineStart = 0;
+  for (;;) {
+    let i = lineStart;
+    while (i < text.length) {
+      const c = text.charCodeAt(i);
+      if (!isRegExpSpace(c) || isLineBreak(c)) break;
+      i++;
+    }
+    rest.lastIndex = i;
+    const m = rest.exec(text);
+    if (m !== null) return m;
+    while (i < text.length && !isLineBreak(text.charCodeAt(i))) i++;
+    if (i >= text.length) return null;
+    lineStart = i + 1;
+  }
+}
+
+/**
+ * The value after `key:` on a winget line that may open a list item: what
+ * `/^\s*-?\s*key:[ \t]*(\S+)/.exec(line)?.[1]` captured. Its two `\s*` shared
+ * a run of whitespace and tried every split of it before giving up, so a long
+ * indent before something else was quadratic in its length.
+ */
+export function wingetField(line: string, key: string): string | undefined {
+  const spacesFrom = (start: number): number => {
+    let i = start;
+    while (i < line.length && isRegExpSpace(line.charCodeAt(i))) i++;
+    return i;
+  };
+  let i = spacesFrom(0);
+  if (line.charCodeAt(i) === 0x2d) i = spacesFrom(i + 1);
+  if (!line.startsWith(`${key}:`, i)) return undefined;
+  i += key.length + 1;
+  while (line.charCodeAt(i) === 0x20 || line.charCodeAt(i) === 0x09) i++;
+  let end = i;
+  while (end < line.length && !isRegExpSpace(line.charCodeAt(end))) end++;
+  return end > i ? line.slice(i, end) : undefined;
+}
+
 export type FindingSeverity = "error" | "unknown" | "note";
 
 export type Finding = {
@@ -57,7 +129,9 @@ const SHA256 = /^[0-9a-f]{64}$/i;
  * "I could not tell what this is" is a different answer from "it is fine".
  */
 export function detectKind(text: string): ManifestKind | undefined {
-  if (/^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*<\s*Formula\b/m.test(text)) return "homebrew";
+  if (firstAtLineStart(text, /class\s+[A-Za-z_][A-Za-z0-9_]*\s*<\s*Formula\b/y) !== null) {
+    return "homebrew";
+  }
   if (/^PackageIdentifier:/m.test(text)) return "winget";
   if (/^Package:[ \t]*\S/m.test(text)) return "debian";
   const trimmed = text.trim();
@@ -99,7 +173,7 @@ export function parseManifest(text: string, source: string, kind: ManifestKind):
 function parseHomebrew(text: string, source: string): ParsedManifest {
   const findings: Finding[] = [];
   const assets: DeclaredAsset[] = [];
-  const version = /^\s*version\s+"([^"\n]*)"/m.exec(text)?.[1];
+  const version = firstAtLineStart(text, /version\s+"([^"\n]*)"/y)?.[1];
   if (version === undefined) {
     findings.push({
       severity: "unknown",
@@ -285,12 +359,12 @@ function parseWinget(text: string, source: string): ParsedManifest {
   let pendingUrl: string | undefined;
   let pendingArch: string | undefined;
   for (const line of text.split("\n")) {
-    const arch = /^\s*-?\s*Architecture:[ \t]*(\S+)/.exec(line)?.[1];
+    const arch = wingetField(line, "Architecture");
     if (arch !== undefined) {
       pendingArch = arch;
       continue;
     }
-    const url = /^\s*-?\s*InstallerUrl:[ \t]*(\S+)/.exec(line)?.[1];
+    const url = wingetField(line, "InstallerUrl");
     if (url !== undefined) {
       if (pendingUrl !== undefined) {
         findings.push({
@@ -302,7 +376,7 @@ function parseWinget(text: string, source: string): ParsedManifest {
       pendingUrl = url;
       continue;
     }
-    const sha = /^\s*-?\s*InstallerSha256:[ \t]*(\S+)/.exec(line)?.[1];
+    const sha = wingetField(line, "InstallerSha256");
     if (sha === undefined) continue;
     if (pendingUrl === undefined) {
       findings.push({
@@ -521,5 +595,31 @@ export function versionTokensInUrl(url: string): ReadonlyArray<string> {
   } catch {
     scanned = url;
   }
-  return [...scanned.matchAll(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/g)].map((m) => m[0]);
+  // `/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/g`, tried only where a run of
+  // digits starts: from inside a run it would read the same digits to the
+  // same end, so a long run with no version in it was rescanned from every
+  // digit, quadratic in its length. After a match the next try starts where
+  // it ended, as the global pattern's would.
+  const version = /\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/y;
+  const isDigit = (i: number): boolean => {
+    const c = scanned.charCodeAt(i);
+    return c >= 0x30 && c <= 0x39;
+  };
+  const found: string[] = [];
+  let at = 0;
+  while (at < scanned.length) {
+    if (!isDigit(at)) {
+      at++;
+      continue;
+    }
+    version.lastIndex = at;
+    const m = version.exec(scanned);
+    if (m !== null) {
+      found.push(m[0]);
+      at += m[0].length;
+      continue;
+    }
+    while (at < scanned.length && isDigit(at)) at++;
+  }
+  return found;
 }

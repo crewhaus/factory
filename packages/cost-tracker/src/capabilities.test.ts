@@ -105,6 +105,31 @@ describe("0.6.0 N1 — contextWindow / maxOutputTokens", () => {
     ).toBe(4096);
   });
 
+  test("Opus 5.5 / Opus 5 / Sonnet 5 are 1M context / 128K output on anthropic and bedrock", () => {
+    // Regression: both Opus ids fell through to the bare `claude-opus`
+    // fallback (200K/32K) and Sonnet 5 carried 200K/64K, so eligibility
+    // routing under-rated their context and the plan builder clamped
+    // `max_tokens` well below what the models can emit.
+    for (const [provider, prefix] of [
+      ["anthropic", ""],
+      ["bedrock", "anthropic."],
+      ["bedrock", "us.anthropic."],
+    ] as const) {
+      for (const id of ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5"]) {
+        const caps = resolveCapabilities(DEFAULT_CAPABILITIES, provider, `${prefix}${id}`);
+        expect(caps?.contextWindow, `${provider}/${prefix}${id}`).toBe(1000000);
+        expect(caps?.maxOutputTokens, `${provider}/${prefix}${id}`).toBe(128000);
+      }
+    }
+    // The new rows do not leak into the 4.x base or the next-major fallback.
+    expect(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-opus-4-1")?.maxOutputTokens,
+    ).toBe(32000);
+    expect(
+      resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-opus-6")?.contextWindow,
+    ).toBe(200000);
+  });
+
   test("size floors: known-and-at-least satisfies, unknown never does", () => {
     const haiku = must(resolveCapabilities(DEFAULT_CAPABILITIES, "anthropic", "claude-3-5-haiku"));
     expect(satisfiesCapabilities(haiku, { contextWindowGte: 200000 })).toBe(true);

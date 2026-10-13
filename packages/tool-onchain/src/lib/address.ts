@@ -45,9 +45,11 @@ export function validateAddress(raw: string): AddressResult {
       valid: false,
       checksummed: "",
       hadChecksum: false,
-      reason: /^0x/i.test(text)
-        ? `an address is 0x followed by 40 hex characters; this has ${body.length}`
-        : "an address starts with 0x",
+      reason: text.startsWith("0X")
+        ? "an address starts with a lowercase 0x; this starts with 0X"
+        : text.startsWith("0x")
+          ? `an address is 0x followed by 40 hex characters; this has ${body.length}`
+          : "an address starts with 0x",
     };
   }
 
@@ -77,6 +79,41 @@ export function validateAddress(raw: string): AddressResult {
 }
 
 /**
+ * An address a coder may put into calldata or a digest: 0x and 40 hex
+ * characters, whose EIP-55 checksum holds when it carries one. Returns the
+ * checksummed form; throws the reason otherwise.
+ *
+ * Every path that writes an address goes through this, not only
+ * `AddressCheck`: the encoder is the last point where a re-typed character
+ * can still be caught, and ethers and viem refuse the same input.
+ */
+export function checkedAddress(raw: unknown, what: string): string {
+  if (typeof raw !== "string") throw new Error(`${what}: an address is a 0x hex string`);
+  const result = validateAddress(raw);
+  if (!result.valid) throw new Error(`${what}: ${result.reason}`);
+  return result.checksummed;
+}
+
+/**
+ * Whether `text` is an optional `-`, digits, an optional `.` and digits: what
+ * `/^-?\d*\.?\d*$/.test(text)` answered, in one pass. That pattern gave
+ * every digit back to the second run in turn when the text did not end where
+ * it should, so a long run of digits before a stray character was quadratic
+ * in its length, and the amount is the model's.
+ */
+export function isDecimalText(text: string): boolean {
+  const digit = (i: number): boolean => {
+    const c = text.charCodeAt(i);
+    return c >= 0x30 && c <= 0x39;
+  };
+  let i = text.charCodeAt(0) === 0x2d ? 1 : 0;
+  while (i < text.length && digit(i)) i++;
+  if (text.charCodeAt(i) === 0x2e) i++;
+  while (i < text.length && digit(i)) i++;
+  return i === text.length;
+}
+
+/**
  * Parse a decimal amount into base units, exactly.
  *
  * `parseFloat("0.1") * 1e18` is not 10^17, and the difference is real money.
@@ -84,7 +121,7 @@ export function validateAddress(raw: string): AddressResult {
  */
 export function parseUnits(amount: string, decimals: number): bigint {
   const text = amount.trim();
-  if (!/^-?\d*\.?\d*$/.test(text) || text === "" || text === "." || text === "-") {
+  if (!isDecimalText(text) || text === "" || text === "." || text === "-") {
     throw new Error(`"${amount}" is not a decimal amount`);
   }
   const negative = text.startsWith("-");

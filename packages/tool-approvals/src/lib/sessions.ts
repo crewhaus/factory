@@ -25,12 +25,54 @@
  * line that was skipped counted so the caller can say the mining window was
  * incomplete.
  */
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { type SessionEvents, parseJsonlObjects } from "@crewhaus/harness-advice";
+import { isInside, workspaceRoot } from "../paths";
 import { APPROVALS_FILENAME } from "./approvals";
 import { readTailCapped } from "./jsonl";
 import { compareStrings } from "./unknown";
+
+/**
+ * Where one listed log really is, or why it is not read.
+ *
+ * The sessions DIRECTORY was checked against the workspace by the caller; the
+ * files in it were not. A log that is a symbolic link is followed only when it
+ * lands inside the workspace: a link planted in `.crewhaus/sessions` must not
+ * pull another project's transcripts — and the secrets in their tool inputs —
+ * into this tool's answer (security-2#2).
+ */
+function locateLog(
+  full: string,
+  rootReal: string | undefined,
+): { readonly ok: true; readonly real: string } | { readonly ok: false; readonly reason: string } {
+  let isLink: boolean;
+  try {
+    isLink = lstatSync(full).isSymbolicLink();
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `could not be examined (${(err as NodeJS.ErrnoException).code ?? "an unidentified error"}), so it has no place in the recency order`,
+    };
+  }
+  if (!isLink) return { ok: true, real: full };
+  let real: string;
+  try {
+    real = realpathSync(full);
+  } catch {
+    return {
+      ok: false,
+      reason: "is a symbolic link that leads to nothing readable, so it was not read",
+    };
+  }
+  if (rootReal === undefined || !isInside(rootReal, real)) {
+    return {
+      ok: false,
+      reason: "is a symbolic link that leads outside the workspace, so it was not read",
+    };
+  }
+  return { ok: true, real };
+}
 
 /** One session transcript. Past this the tail is mined and the cut reported. */
 export const MAX_SESSION_BYTES = 64 * 1024 * 1024;
@@ -97,8 +139,15 @@ export type SessionsRead = {
  * Without that tiebreak two logs written in the same millisecond — which a test
  * fixture and a fast run both produce — order by whatever `readdir` returned,
  * and the same directory mines differently on two hosts.
+ *
+ * A log that is a symbolic link out of `root` (the workspace, by default) is
+ * reported in `failures` and never opened.
  */
-export function readRecentSessions(dirReal: string, limit: number | "all"): SessionsRead {
+export function readRecentSessions(
+  dirReal: string,
+  limit: number | "all",
+  root: string = workspaceRoot(),
+): SessionsRead {
   let names: string[];
   try {
     names = readdirSync(dirReal).filter(isSessionLogName);
@@ -125,11 +174,22 @@ export function readRecentSessions(dirReal: string, limit: number | "all"): Sess
     };
   }
 
+  let rootReal: string | undefined;
+  try {
+    rootReal = realpathSync(root);
+  } catch {
+    rootReal = undefined; // every link is then refused: fail closed
+  }
   const failures: SessionReadFailure[] = [];
-  const ranked: Array<{ file: string; mtimeMs: number }> = [];
+  const ranked: Array<{ file: string; real: string; mtimeMs: number }> = [];
   for (const file of names.sort(compareStrings)) {
+    const located = locateLog(path.join(dirReal, file), rootReal);
+    if (!located.ok) {
+      failures.push({ file, reason: located.reason });
+      continue;
+    }
     try {
-      ranked.push({ file, mtimeMs: statSync(path.join(dirReal, file)).mtimeMs });
+      ranked.push({ file, real: located.real, mtimeMs: statSync(located.real).mtimeMs });
     } catch (err) {
       // A log that cannot be STATTED cannot be ranked. Mining it anyway would
       // put an unplaceable file in the "20 most recent" window and push out one
@@ -146,8 +206,8 @@ export function readRecentSessions(dirReal: string, limit: number | "all"): Sess
   const sessions: SessionEvents[] = [];
   const truncatedFiles: string[] = [];
   let tornLines = 0;
-  for (const { file } of chosen) {
-    const read = readTailCapped(path.join(dirReal, file), MAX_SESSION_BYTES);
+  for (const { file, real } of chosen) {
+    const read = readTailCapped(real, MAX_SESSION_BYTES);
     if (read.state.kind === "missing") {
       failures.push({ file, reason: "the log was removed between listing it and reading it" });
       continue;

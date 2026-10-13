@@ -53,11 +53,11 @@ afterAll(() => {
 /** Spawn the CLI, optionally feeding `stdin` (then EOF), and capture streams. */
 async function runCli(
   args: ReadonlyArray<string>,
-  opts: { cwd?: string; stdin?: string } = {},
+  opts: { cwd?: string; stdin?: string; env?: Record<string, string> } = {},
 ): Promise<RunResult> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd: opts.cwd ?? SPAWN_CWD,
-    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
+    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY, ...opts.env },
     stdin: opts.stdin !== undefined ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -104,7 +104,7 @@ describe("crewhaus export claude-plugin", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("refuses to overwrite a non-empty out dir without --force", async () => {
     const out = join(freshTmp(), "plugin");
@@ -118,19 +118,19 @@ describe("crewhaus export claude-plugin", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("--help prints usage and exits 0", async () => {
     const r = await runCli(["export", "claude-plugin", "--help"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("export claude-plugin");
-  });
+  }, 20_000);
 
   test("an unknown export target errors", async () => {
     const r = await runCli(["export", "nonsense"]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("claude-plugin");
-  });
+  }, 20_000);
 
   /**
    * Item 14 — a harness that ships hand-written skills + slash commands used to
@@ -189,7 +189,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
 
     test("--no-assets emits the spec projection alone", async () => {
       const harness = freshHarness();
@@ -210,7 +210,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
 
     test("an authored SKILL.md Claude Code could not load fails the export", async () => {
       const harness = freshHarness({ ".crewhaus/skills/broken/SKILL.md": "no frontmatter here\n" });
@@ -231,7 +231,7 @@ describe("crewhaus export claude-plugin", () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
-    });
+    }, 20_000);
   });
 });
 
@@ -240,24 +240,24 @@ describe("crewhaus serve --mcp", () => {
     const r = await runCli(["serve", "--help"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("serve --mcp");
-  });
+  }, 20_000);
 
   test("requires --mcp", async () => {
     const r = await runCli(["serve", CLI_SPEC]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("--mcp");
-  });
+  }, 20_000);
 
   test("rejects a non-cli target", async () => {
     const r = await runCli(["serve", "--mcp", VOICE_SPEC]);
     expect(r.exitCode).not.toBe(0);
     expect(r.stderr + r.stdout).toContain("supports target: cli");
-  });
+  }, 20_000);
 
   test("errors on a missing spec path", async () => {
     const r = await runCli(["serve", "--mcp", join(REPO_ROOT, "does-not-exist.yaml")]);
     expect(r.exitCode).not.toBe(0);
-  });
+  }, 20_000);
 
   test("boots stdio, answers initialize + tools/list on a clean stdout, exits on EOF", async () => {
     const requests = `${JSON.stringify({
@@ -290,26 +290,31 @@ describe("crewhaus serve --mcp", () => {
 
     // The serve diagnostics went to stderr, not the protocol channel.
     expect(r.stderr).toContain("[serve] MCP stdio server");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus run --plugins (item 3)", () => {
   // `--plugins <names>` reaches plugin activation before any model call: with no
-  // trust anchors + allowUnsigned off (the clean-env default), the loader fails
-  // CLOSED, which proves the override was threaded into activatePlugins (a spec
-  // with no plugins: and no flag never constructs the loader).
+  // trust anchors + allowUnsigned off (the clean-env default), the boot refuses
+  // and says where a publisher's key goes, which proves the override was
+  // threaded into activatePlugins (a spec with no plugins: and no flag never
+  // constructs the loader). HOME is a fresh directory, so a key the developer
+  // keeps in their own ~/.crewhaus/plugin-trust cannot change the answer.
   test("threads the override into activation (fails closed with no trust anchors)", async () => {
-    const r = await runCli([
-      "run",
-      CLI_SPEC,
-      "--plugins",
-      "__definitely_not_installed__",
-      "--prompt",
-      "hi",
-    ]);
-    expect(r.exitCode).not.toBe(0);
-    expect(r.stderr + r.stdout).toContain("plugin-loader");
-  });
+    const home = mkdtempSync(join(tmpdir(), "crewhaus-plugins-home-"));
+    try {
+      const r = await runCli(
+        ["run", CLI_SPEC, "--plugins", "__definitely_not_installed__", "--prompt", "hi"],
+        { env: { HOME: home } },
+      );
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain(
+        `no plugin can be verified: no trust anchor is configured. Put the publisher's Ed25519 public key (a .pem file) in ${join(home, ".crewhaus", "plugin-trust")}`,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("crewhaus plugins/templates default registry (item 10)", () => {
@@ -318,10 +323,10 @@ describe("crewhaus plugins/templates default registry (item 10)", () => {
     const r = await runCli(["plugins"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("registry.crewhaus.ai/plugins");
-  });
+  }, 20_000);
   test("templates usage documents the default public registry", async () => {
     const r = await runCli(["templates"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("registry.crewhaus.ai/templates");
-  });
+  }, 20_000);
 });

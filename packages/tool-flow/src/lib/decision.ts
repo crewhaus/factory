@@ -8,7 +8,7 @@
  * policy bug that "first wins" hides.
  */
 import { createHash } from "node:crypto";
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, checksVerdict, runChecks } from "@crewhaus/tool-schema";
 import type { MatchMode } from "./branch";
 import { canonicalize } from "./canonical";
 
@@ -48,6 +48,11 @@ export type DecisionResult = {
   readonly fallback: boolean;
   /** Set when the table could not answer: ambiguity under `unique`/`priority`. */
   readonly conflict: string | null;
+  /**
+   * Set when a row could not be decided (a pattern had no answer) that could
+   * have changed the outcome: no outputs are given, not even `otherwise`'s.
+   */
+  readonly undetermined?: string;
   /** Stable digest of the table, so a changed policy is visible in a log. */
   readonly tableHash: string;
 };
@@ -58,7 +63,11 @@ export function hashTable(table: DecisionTable): string {
   return createHash("sha256").update(material).digest("hex").slice(0, 16);
 }
 
-export function evaluateTable(value: unknown, table: DecisionTable): DecisionResult {
+export function evaluateTable(
+  value: unknown,
+  table: DecisionTable,
+  options: { readonly regex?: RegexAnswers } = {},
+): DecisionResult {
   if (table.rows.length === 0) throw new Error("the decision table has no rows");
 
   const seen = new Set<string>();
@@ -77,10 +86,22 @@ export function evaluateTable(value: unknown, table: DecisionTable): DecisionRes
   const base = { policy: table.policy, version, tableHash } as const;
 
   const matches: DecisionRow[] = [];
+  const undecided: string[] = [];
   for (const row of table.rows) {
-    const report = runChecks(value, row.when as Check[]);
-    const ok = (row.match ?? "all") === "all" ? report.ok : report.passed > 0;
-    if (ok) {
+    const report = runChecks(
+      value,
+      row.when as Check[],
+      options.regex === undefined ? {} : { regex: options.regex },
+    );
+    const verdict = checksVerdict(report, row.match ?? "all");
+    if (verdict === "undetermined") {
+      const why = report.failures.find((f) => f.undetermined === true)?.reason ?? "";
+      undecided.push(`row "${row.id}": ${why}`);
+      // Under `first`, a later row cannot be taken past one not decided.
+      if (table.policy === "first") break;
+      continue;
+    }
+    if (verdict === "pass") {
       matches.push(row);
       // `first` needs no further rows; the others need to see them all.
       if (table.policy === "first") break;
@@ -88,6 +109,19 @@ export function evaluateTable(value: unknown, table: DecisionTable): DecisionRes
   }
 
   const matchedIds = matches.map((r) => r.id);
+
+  if (undecided.length > 0) {
+    return {
+      ...base,
+      ok: false,
+      matched: false,
+      matchedIds,
+      outputs: null,
+      fallback: false,
+      conflict: null,
+      undetermined: `could not decide ${undecided.join("; ")}`,
+    };
+  }
 
   if (matches.length === 0) {
     if (table.otherwise) {

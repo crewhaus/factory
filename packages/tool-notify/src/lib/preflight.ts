@@ -23,6 +23,7 @@
  *     that is fine are different answers, and only one of them means the
  *     message is ready.
  */
+import { parseOffsetInstant } from "./instant";
 import { isMessageId, isReservedHeaderName, isValidAddress, isValidHeaderName } from "./mime";
 import type { Mailbox } from "./mime";
 import { templatePlaceholders } from "./template";
@@ -224,18 +225,14 @@ function checkEnvelope(draft: Draft): Check {
 }
 
 function checkDate(draft: Draft): Check {
-  const when = new Date(draft.date);
-  if (Number.isNaN(when.getTime())) {
-    return {
-      check: "date",
-      status: "fail",
-      detail: `"${draft.date}" is not an instant - use ISO-8601 with an offset, e.g. 2026-09-17T09:30:00Z`,
-    };
-  }
+  // The same reader EmailSend and EmailCompose build the header with, so a
+  // date the preflight passes is a date the send accepts.
+  const instant = parseOffsetInstant(draft.date);
+  if (!instant.ok) return { check: "date", status: "fail", detail: instant.message };
   return {
     check: "date",
     status: "pass",
-    detail: `the Date header will read ${when.toISOString()}`,
+    detail: `the Date header will read ${new Date(instant.ms).toISOString()}`,
   };
 }
 

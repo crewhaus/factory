@@ -34,6 +34,7 @@
  * one. Three outcomes, never two.
  */
 import { readFileSync, statSync } from "node:fs";
+import { classifyEgress } from "@crewhaus/egress-classifier";
 import {
   CREWHAUS_PRODUCT,
   type ManifestInputs,
@@ -375,7 +376,7 @@ type AssetRow = {
   url: string;
   declaredSha256: string;
   outcome: AssetOutcome;
-  reason?: UnknownReason | "notRequested" | "malformedSha" | AssetUrlFlawCode;
+  reason?: UnknownReason | "notRequested" | "malformedSha" | "egressBlocked" | AssetUrlFlawCode;
   message?: string;
   computedSha256?: string;
   status?: number;
@@ -387,8 +388,17 @@ type AssetRow = {
 
 export const packageManifestVerify: RegisteredTool = buildTool({
   name: "PackageManifestVerify",
+  // The URLs this tool downloads are written inside the manifests — inline
+  // text the model writes, or files it names — so nothing in the input IS
+  // the destination, and the runtime's egress scan of the whole input would
+  // either miss a URL in a file or block the local paths (a Glob result names
+  // them). So the tool screens what it will actually dial: each URL is
+  // classified against the run's data lineage as a model-chosen destination
+  // before it is fetched, and one carrying text a tool returned earlier is not
+  // fetched (C049). `download: false` dials nothing and screens nothing.
+  operativeArgs: [{ field: "paths", kind: "path" }],
   description:
-    "Check that a published package manifest is telling the truth: fetch every URL it points at, hash the bytes, and compare them to the sha256 the manifest claims. Also checks that the version in the file matches the version in its download URLs, that a Debian paragraph's continuation lines are intact, and that a winget InstallerSha256 is uppercase. Takes one manifest or all four, as text or as workspace-relative paths, and recognises the format on its own. Every download is streamed and hashed as it arrives, never held in memory, and capped. The result distinguishes three outcomes and never collapses them: the asset is MISSING (a definite 404), the hash DISAGREES (a definite mismatch), or the check COULD NOT BE MADE (DNS failed, the deadline elapsed, the body stopped short, the cap was hit, the SSRF guard refused the hop) — with the reason named, because 'could not reach it' is neither a pass nor a failure.",
+    "Check that a published package manifest is telling the truth: fetch every URL it points at, hash the bytes, and compare them to the sha256 the manifest claims. Also checks that the version in the file matches the version in its download URLs, that a Debian paragraph's continuation lines are intact, and that a winget InstallerSha256 is uppercase. Takes one manifest or all four, as text or as workspace-relative paths, and recognises the format on its own. Every download is streamed and hashed as it arrives, never held in memory, and capped. The result distinguishes three outcomes and never collapses them: the asset is MISSING (a definite 404), the hash DISAGREES (a definite mismatch), or the check COULD NOT BE MADE (DNS failed, the deadline elapsed, the body stopped short, the cap was hit, the SSRF guard refused the hop, the URL carries text another tool returned) — with the reason named, because 'could not reach it' is neither a pass nor a failure.",
   inputSchema: z.object({
     manifests: z
       .array(
@@ -550,6 +560,13 @@ export const packageManifestVerify: RegisteredTool = buildTool({
     // four manifests moves the bytes of five assets, not six. Every row still
     // gets its own verdict, because the sha each manifest DECLARES is its own.
     const probes = new Map<string, AssetProbe>();
+    const screened = new Map<string, string | undefined>();
+    const egressRefusal = async (url: string): Promise<string | undefined> => {
+      if (screened.has(url)) return screened.get(url);
+      const refusal = await screenEgress(url, runContextOf(ctx));
+      screened.set(url, refusal);
+      return refusal;
+    };
     const probeOnce = async (url: string): Promise<{ probe: AssetProbe; fresh: boolean }> => {
       const cached = probes.get(url);
       if (cached !== undefined) return { probe: cached, fresh: false };
@@ -598,7 +615,12 @@ export const packageManifestVerify: RegisteredTool = buildTool({
             },
           });
         }
-        const { row, fresh } = await verifyAsset(manifest, asset, { download, probeOnce }, flaw);
+        const { row, fresh } = await verifyAsset(
+          manifest,
+          asset,
+          { download, probeOnce, egressRefusal },
+          flaw,
+        );
         if (fresh && row.bytes !== undefined && row.outcome !== "unchecked") {
           bytesDownloaded += row.bytes;
         }
@@ -744,7 +766,40 @@ function assetUrlFlaw(url: string): AssetUrlFlaw | undefined {
 type VerifyOptions = {
   readonly download: boolean;
   readonly probeOnce: (url: string) => Promise<{ probe: AssetProbe; fresh: boolean }>;
+  /** Why this URL must not be dialled, or undefined when it may be. */
+  readonly egressRefusal: (url: string) => Promise<string | undefined>;
 };
+
+/**
+ * The run's context: on the call itself, or on the runtime's bridge, which
+ * is where runtime-core hands it to a builtin today (as tool-mcp reads it).
+ */
+function runContextOf(ctx: ToolExecuteContext | undefined): ToolExecuteContext["runContext"] {
+  if (ctx?.runContext !== undefined) return ctx.runContext;
+  return (ctx?.bridge as { runContext?: ToolExecuteContext["runContext"] } | undefined)?.runContext;
+}
+
+/**
+ * Would dialling `url` carry text a tool (or a sub-agent, an MCP server, a
+ * channel…) returned earlier in this run to a destination the model picked?
+ * The URL is classified against the run's data lineage exactly as the
+ * runtime classifies a model-chosen destination's payload
+ * (`external-dynamic`); a `block` verdict is the reason it is not fetched.
+ * No run context, or no lineage yet, is a pass — nothing has crossed a
+ * boundary.
+ */
+async function screenEgress(
+  url: string,
+  runContext: ToolExecuteContext["runContext"],
+): Promise<string | undefined> {
+  if (runContext === undefined) return undefined;
+  const verdict = await classifyEgress(url, runContext, {
+    sinkId: "PackageManifestVerify",
+    sinkScope: "external-dynamic",
+  });
+  if (verdict.verdict !== "block") return undefined;
+  return `not fetched: this URL carries text that ${verdict.originsFound.join(", ")} output returned earlier in this run, and a request to it would send that text to a host the manifest names (egress guard) — its sha256 is unconfirmed, not confirmed`;
+}
 
 /**
  * The declared sha256 of every URL, per URL, across all the manifests — as a
@@ -809,6 +864,11 @@ async function verifyAsset(
           "downloads were turned off, so this asset was not fetched — its sha256 is unconfirmed, not confirmed",
       },
     };
+  }
+
+  const refusal = await options.egressRefusal(asset.url);
+  if (refusal !== undefined) {
+    return { fresh: false, row: { ...base, reason: "egressBlocked", message: refusal } };
   }
 
   const { probe, fresh } = await options.probeOnce(asset.url);

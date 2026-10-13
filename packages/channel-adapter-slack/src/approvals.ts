@@ -31,6 +31,13 @@ export type ApprovalPromptContent = {
   readonly toolName: string;
   readonly inputPreview: string;
   readonly surface: string;
+  /**
+   * 0.7.1 — where the call lands, symlinks followed, and, when it is asked
+   * again because a link on its path moved, where the approval it stands in
+   * for was made (channel-adapter-base's `approvalPlacesText`). Without it a
+   * re-asked card reads exactly like the one the operator already decided.
+   */
+  readonly landsAt?: string;
 };
 
 /** A built Slack message: `text` is the notification/accessibility fallback,
@@ -60,6 +67,17 @@ export function buildApprovalMessage(content: ApprovalPromptContent): SlackAppro
         text: `*Approval needed* · surface \`${content.surface}\`\n\`${content.toolName}\` requested with:\n\`\`\`${truncateForBlock(content.inputPreview)}\`\`\``,
       },
     },
+    ...(content.landsAt !== undefined && content.landsAt.length > 0
+      ? [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Where it acts*, symlinks followed:\n\`\`\`${truncateForBlock(content.landsAt, 2_000)}\`\`\``,
+            },
+          },
+        ]
+      : []),
     {
       type: "actions",
       block_id: `${APPROVAL_BLOCK_ID_PREFIX}${content.approvalId}`,

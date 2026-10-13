@@ -52,7 +52,15 @@ export function createScreenshotTool(opts: CreateScreenshotToolOptions): Registe
     readOnly: true,
     destructive: false,
     concurrencySafe: false,
-    classifyOutput: false,
+    // 0.7.1 — the result is an image block the model must be able to SEE
+    // (ReadImage's 0.6.0 §5.1 rule): a pool candidate without vision never
+    // gets this tool advertised.
+    requiresModelFeatures: { vision: true },
+    // The output classifier stays on. A screenshot of an arbitrary page is
+    // attacker-controlled, so the `classifyOutput: false` opt-out (for
+    // output an attacker cannot shape) never fit; an image-only result
+    // passes through it untouched, and a failed capture's error text is
+    // classified like any other tool's.
     execute: async (): Promise<ToolResultContent> => {
       const png = await opts.driver.screenshot();
       // For v0 we ship the PNG verbatim. Downscale path is exposed in

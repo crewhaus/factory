@@ -1,10 +1,19 @@
 import { describe, expect, mock, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearBoundaryCache } from "@crewhaus/boundary-classifier";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import {
+  MAX_SKILL_FILE_BYTES,
   SkillParseError,
   createSkillTool,
   discoverSkills,
@@ -640,3 +649,217 @@ describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-foll
 });
 
 void mock;
+
+/**
+ * C170: a plugin's skills must really live inside the plugin. activatePlugins
+ * checks that `<plugin>/skills` does; every skill in it, and its SKILL.md,
+ * are checked here, where they are read. And a SKILL.md is read as a regular
+ * file of bounded size, so a FIFO cannot hang the boot.
+ */
+describe("discoverSkills: plugin skills stay inside the plugin, and every SKILL.md is bounded (C170)", () => {
+  const skillText = (name: string) =>
+    `---\nname: ${name}\ndescription: the ${name} skill\n---\nbody of ${name}\n`;
+
+  function layout() {
+    const base = mkdtempSync(join(tmpdir(), "skills-contain-"));
+    const plugin = join(base, "plugins", "acme");
+    const skills = join(plugin, "skills");
+    const outside = join(base, "outside");
+    mkdirSync(join(skills, "inside"), { recursive: true });
+    writeFileSync(join(skills, "inside", "SKILL.md"), skillText("inside"));
+    mkdirSync(join(outside, "elsewhere"), { recursive: true });
+    writeFileSync(join(outside, "elsewhere", "SKILL.md"), skillText("outsider"));
+    writeFileSync(join(outside, "x.md"), skillText("linked"));
+    return {
+      base,
+      plugin,
+      skills,
+      outside,
+      cleanup: () => rmSync(base, { recursive: true, force: true }),
+    };
+  }
+
+  test("a skill directory that links out of the plugin is left out, and said so", async () => {
+    const l = layout();
+    try {
+      symlinkSync(join(l.outside, "elsewhere"), join(l.skills, "outsider"));
+      const warnings: string[] = [];
+      const skills = await discoverSkills({
+        cwd: l.base,
+        homeDir: l.base,
+        pluginDirs: [l.skills],
+        warn: (w) => warnings.push(w),
+      });
+      expect(skills.map((s) => s.name)).toEqual(["inside"]);
+      expect(warnings).toEqual([
+        `${join(l.skills, "outsider")} is a link that leads outside the plugin's directory ${l.plugin}; that skill was not loaded.`,
+      ]);
+    } finally {
+      l.cleanup();
+    }
+  });
+
+  test("a SKILL.md that links out of the plugin is left out, and said so", async () => {
+    const l = layout();
+    try {
+      mkdirSync(join(l.skills, "linked"));
+      symlinkSync(join(l.outside, "x.md"), join(l.skills, "linked", "SKILL.md"));
+      const warnings: string[] = [];
+      const skills = await discoverSkills({
+        cwd: l.base,
+        homeDir: l.base,
+        pluginDirs: [l.skills],
+        warn: (w) => warnings.push(w),
+      });
+      expect(skills.map((s) => s.name)).toEqual(["inside"]);
+      expect(warnings).toEqual([
+        `${join(l.skills, "linked", "SKILL.md")} is a link that leads outside the plugin's directory ${l.plugin}; that skill was not loaded.`,
+      ]);
+    } finally {
+      l.cleanup();
+    }
+  });
+
+  test("links that stay inside the plugin still work, and a user's own skill may link anywhere", async () => {
+    const l = layout();
+    try {
+      mkdirSync(join(l.plugin, "shared", "kept"), { recursive: true });
+      writeFileSync(join(l.plugin, "shared", "kept", "SKILL.md"), skillText("kept"));
+      symlinkSync(join(l.plugin, "shared", "kept"), join(l.skills, "kept"));
+      const userSkills = join(l.base, "home", ".crewhaus", "skills");
+      mkdirSync(userSkills, { recursive: true });
+      symlinkSync(join(l.outside, "elsewhere"), join(userSkills, "outsider"));
+      const warnings: string[] = [];
+      const skills = await discoverSkills({
+        cwd: l.base,
+        homeDir: join(l.base, "home"),
+        pluginDirs: [l.skills],
+        warn: (w) => warnings.push(w),
+      });
+      expect(skills.map((s) => s.name).sort()).toEqual(["inside", "kept", "outsider"]);
+      expect(warnings).toEqual([]);
+      const kept = skills.find((s) => s.name === "kept");
+      expect(kept?.containedIn).toBe(l.plugin);
+      expect(await loadSkillBody(kept as NonNullable<typeof kept>)).toBe("body of kept\n");
+      expect(skills.find((s) => s.name === "outsider")?.containedIn).toBeUndefined();
+    } finally {
+      l.cleanup();
+    }
+  });
+
+  test("a plugin SKILL.md swapped for a link out after discovery is not read", async () => {
+    const l = layout();
+    try {
+      const [inside] = await discoverSkills({
+        cwd: l.base,
+        homeDir: l.base,
+        pluginDirs: [l.skills],
+        warn: () => {},
+      });
+      expect(inside?.name).toBe("inside");
+      unlinkSync(join(l.skills, "inside", "SKILL.md"));
+      symlinkSync(join(l.outside, "x.md"), join(l.skills, "inside", "SKILL.md"));
+      await expect(loadSkillBody(inside as NonNullable<typeof inside>)).rejects.toThrow(
+        `skill "inside": cannot read ${join(l.skills, "inside", "SKILL.md")}: it is a link that leads outside the plugin's directory ${l.plugin}`,
+      );
+    } finally {
+      l.cleanup();
+    }
+  });
+
+  test("a SKILL.md larger than the cap is left out, and said so", async () => {
+    const l = layout();
+    try {
+      mkdirSync(join(l.skills, "huge"));
+      writeFileSync(
+        join(l.skills, "huge", "SKILL.md"),
+        `${skillText("huge")}${"x".repeat(MAX_SKILL_FILE_BYTES)}`,
+      );
+      const warnings: string[] = [];
+      const skills = await discoverSkills({
+        cwd: l.base,
+        homeDir: l.base,
+        pluginDirs: [l.skills],
+        warn: (w) => warnings.push(w),
+      });
+      expect(skills.map((s) => s.name)).toEqual(["inside"]);
+      expect(warnings).toEqual([
+        `${join(l.skills, "huge", "SKILL.md")} is larger than ${MAX_SKILL_FILE_BYTES} bytes; that skill was not loaded.`,
+      ]);
+    } finally {
+      l.cleanup();
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO SKILL.md — a plugin's, a user's, or one swapped in before the body is read — is refused, not waited on",
+    () => {
+      const l = layout();
+      try {
+        const home = join(l.base, "home");
+        mkdirSync(join(home, ".crewhaus", "skills", "userfifo"), { recursive: true });
+        mkdirSync(join(l.skills, "stuck"));
+        for (const fifo of [
+          join(l.skills, "stuck", "SKILL.md"),
+          join(home, ".crewhaus", "skills", "userfifo", "SKILL.md"),
+        ]) {
+          const made = Bun.spawnSync(["mkfifo", fifo]);
+          expect(made.exitCode).toBe(0);
+        }
+        // In a child with a deadline: an unfixed read blocks its thread for good.
+        const script = `
+          const { discoverSkills, loadSkillBody } = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+          const { unlinkSync } = await import("node:fs");
+          const warnings = [];
+          const skills = await discoverSkills({ cwd: ${JSON.stringify(l.base)}, homeDir: ${JSON.stringify(home)}, pluginDirs: [${JSON.stringify(l.skills)}], warn: (w) => warnings.push(w) });
+          const inside = skills.find((s) => s.name === "inside");
+          unlinkSync(inside.filePath);
+          Bun.spawnSync(["mkfifo", inside.filePath]);
+          let body;
+          try { body = await loadSkillBody(inside); } catch (err) { body = "refused: " + err.message; }
+          console.log(JSON.stringify({ names: skills.map((s) => s.name), warnings, body }));
+        `;
+        const run = Bun.spawnSync([process.execPath, "-e", script], {
+          timeout: 30_000,
+          stderr: "pipe",
+        });
+        expect({ exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({
+          exit: 0,
+          stderr: "",
+        });
+        const got = JSON.parse(run.stdout.toString());
+        expect(got.names).toEqual(["inside"]);
+        expect(got.warnings.sort()).toEqual([
+          `${join(home, ".crewhaus", "skills", "userfifo", "SKILL.md")} is a fifo, not a regular file; that skill was not loaded.`,
+          `${join(l.skills, "stuck", "SKILL.md")} is a fifo, not a regular file; that skill was not loaded.`,
+        ]);
+        expect(got.body).toBe(
+          `refused: skill "inside": cannot read ${join(l.skills, "inside", "SKILL.md")}: it is a fifo, not a regular file`,
+        );
+      } finally {
+        l.cleanup();
+      }
+    },
+    40_000,
+  );
+
+  test("warnings go to stderr by default", async () => {
+    const l = layout();
+    const writes: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    try {
+      symlinkSync(join(l.outside, "elsewhere"), join(l.skills, "outsider"));
+      process.stderr.write = ((chunk: string) => {
+        writes.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      await discoverSkills({ cwd: l.base, homeDir: l.base, pluginDirs: [l.skills] });
+    } finally {
+      process.stderr.write = original;
+      l.cleanup();
+    }
+    expect(writes).toEqual([
+      `[skills] ${join(l.skills, "outsider")} is a link that leads outside the plugin's directory ${l.plugin}; that skill was not loaded.\n`,
+    ]);
+  });
+});

@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../tenancy" }],
+  "references": [{ "path": "../errors" }, { "path": "../tenancy" }, { "path": "../tool-safety" }],
   "include": ["src/**/*"]
 }

@@ -99,7 +99,11 @@ export function stateRoot(toolName: string, stateDir: string | undefined): SafeP
  */
 export function statePath(toolName: string, root: SafePath, ...segments: string[]): string {
   const label = segments.join("/");
-  const joined = path.join(root.abs, ...segments);
+  // One string, not one argument per segment: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments, and StateImport's count is
+  // the document's. Empty segments are dropped first, as `join` drops them,
+  // so `a/` still names `a` and not `a/`.
+  const joined = path.join(root.abs, segments.filter((s) => s !== "").join(path.sep));
   if (!isInside(root.abs, joined)) throw new ToolPermissionError(toolName, label);
   resolveWithin(toolName, root.real, joined, label);
   return joined;

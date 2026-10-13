@@ -31,12 +31,11 @@
  * families are not.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { xmlParse } from "@crewhaus/tool-data";
 import { paymentIdentifierValidate } from "@crewhaus/tool-money";
+import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { AmountError, formatMinor, minorUnitExponent } from "./lib/amounts";
 import { CalendarError } from "./lib/calendar";
@@ -55,7 +54,7 @@ import {
   localName,
   serialize,
 } from "./lib/xml";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -285,23 +284,34 @@ function describeRules(report: RuleReport): Record<string, unknown> {
   };
 }
 
-/** Write to a contained path, refusing to clobber unless told to. */
+/**
+ * Write to a contained path, refusing to clobber unless told to.
+ *
+ * Through tool-safety's writer: the bytes go to an exclusively created temp
+ * beside the destination and are renamed into place, so a destination that
+ * is a FIFO, socket, device or directory is refused by name instead of
+ * opened. 0.7.0 (and 0.7.1's first cut) `statSync`ed and then
+ * `writeFileSync`ed it; with `overwrite` a FIFO with no reader blocked that
+ * synchronous open for ever, and the whole runtime with it (C074's sibling,
+ * bounds review). A replaced file keeps its permission bits.
+ */
 function writeContained(toolName: string, rel: string, text: string, overwrite: boolean): string {
+  // This package's own containment first, so an escape is worded as before.
   const at = resolveSafe(toolName, rel);
-  if (!overwrite) {
-    try {
-      statSync(at.real);
-      throw new PaymentFileError(`"${rel}" already exists; pass overwrite to replace it`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
+  // Parents are created, each one contained: the destination was already
+  // proved to be inside the workspace, and `resolveSafe` allows a missing
+  // leaf precisely so a tool can validate a destination before making it.
+  const written = writeFileSafe(workspaceRoot(), rel, text, {
+    overwrite,
+    createParents: true,
+    leafSymlink: "follow-contained",
+  });
+  if (written.ok) return at.rel;
+  if (written.code === "exists") {
+    throw new PaymentFileError(`"${rel}" already exists; pass overwrite to replace it`);
   }
-  // The parent is created because the destination was already proved to be
-  // inside the workspace — `resolveSafe` allows a missing leaf precisely so a
-  // tool can validate a destination before making it.
-  mkdirSync(dirname(at.real), { recursive: true });
-  writeFileSync(at.real, text, "utf8");
-  return at.rel;
+  if (written.code === "escapes-root") throw new ToolPermissionError(toolName, rel);
+  throw new PaymentFileError(`${toolName}: ${written.reason}`);
 }
 
 /**
@@ -362,6 +372,7 @@ async function identifierProblem(
 
 export const eInvoiceBuild: RegisteredTool = buildTool({
   name: "EInvoiceBuild",
+  operativeArgs: [{ field: "outFile", kind: "path" }],
   description:
     'Write an EN 16931 e-invoice as UBL or CII (the syntaxes Peppol BIS 3, XRechnung, Factur-X and ZUGFeRD use) from an invoice record, and report which of the standard\'s rules were checked. Use it instead of a model composing the XML: every total, the VAT breakdown and every line net amount are computed from the rows, so there is no way to state a total that disagrees with them. The rule check is NARROW and names the rule identifiers it covers and the families it does not — it is not a Schematron run, and it never reports "valid". The bytes come back or go to a path you name; nothing is submitted anywhere.',
   inputSchema: z.object({
@@ -481,13 +492,20 @@ export const eInvoiceParse: RegisteredTool = buildTool({
     let source: string;
     if (input.file !== undefined) {
       const at = resolveSafe("EInvoiceParse", input.file);
-      const size = statSync(at.real).size;
-      if (size > LIMITS.documentBytes) {
+      // Opened without blocking, and only as a regular file: a FIFO with no
+      // writer blocks an ordinary open for ever, and this read was
+      // synchronous, so a named pipe in the workspace stopped the whole
+      // harness (C074). The limit is enforced while reading.
+      const read = openForReadSync(workspaceRoot(), input.file, {
+        maxBytes: LIMITS.documentBytes,
+      });
+      if (!read.ok) throw new ToolInputError(`EInvoiceParse: ${read.reason}`);
+      if (read.truncated) {
         throw new ToolInputError(
-          `${at.rel} is ${size} bytes, over the ${LIMITS.documentBytes}-byte limit for this tool`,
+          `${at.rel} is ${read.size} bytes, over the ${LIMITS.documentBytes}-byte limit for this tool`,
         );
       }
-      text = readFileSync(at.real, "utf8");
+      text = read.text;
       source = at.rel;
     } else {
       text = input.xml as string;
@@ -679,6 +697,7 @@ const paymentSchema = z.object({
 
 export const paymentFileBuild: RegisteredTool = buildTool({
   name: "PaymentFileBuild",
+  operativeArgs: [{ field: "outFile", kind: "path" }],
   description:
     "Assemble a bank-ready NACHA ACH batch or a SEPA pain.001 credit transfer from approved payment rows, with every control figure computed from the rows. Use it because this is arithmetic a model cannot be allowed to approximate: NACHA is 94-byte fixed-width records whose entry hash, debit and credit totals, entry count and block padding must agree exactly or the ODFI rejects the whole file with no line number, and pain.001's NbOfTxs and CtrlSum are no more forgiving. Duplicate references are refused before anything is written, names are truncated to the field and reported while references and amounts are refused rather than shortened, and a settlement date the calendar does not settle on is refused unless you ask for it to be moved. IT BUILDS THE FILE AND DOES NOT SEND IT: there is no transport here and no schema accepts a credential.",
   inputSchema: z.object({

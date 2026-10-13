@@ -61,8 +61,24 @@ export type ValueShape = {
   readonly leadingOrTrailingSpace: boolean;
 };
 
+/**
+ * `text` without its trailing CR and LF: what `text.replace(/[\r\n]+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of line breaks that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and a value can be a
+ * file's whole content.
+ */
+export function withoutTrailingLineBreaks(text: string): string {
+  let end = text.length;
+  for (; end > 0; end--) {
+    const c = text.charCodeAt(end - 1);
+    if (c !== 0x0d && c !== 0x0a) break;
+  }
+  return end === text.length ? text : text.slice(0, end);
+}
+
 export function describeValue(value: string): ValueShape {
-  const trimmed = value.replace(/[\r\n]+$/, "");
+  const trimmed = withoutTrailingLineBreaks(value);
   return {
     fingerprint: fingerprint(value),
     length: value.length,

@@ -7,65 +7,1311 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+**0.7.1 makes the 0.7.0 tools safe to grant.** An audit of 0.7.0 found that
+its new tools did less than the release notes said, and could do more than a
+spec allowed. A permission rule could be dodged by spelling a call another
+way. A tool could write through a symbolic link planted in the workspace, or
+hang on a crafted file or pattern. The model could choose which environment
+variable a tool sent as a credential. And `tool_config` never reached many of
+the tools that read it, while shapes other than `cli` could not use the new
+tools at all. This release fixes what the audit confirmed, apart from the
+items under **Known limitations**. Most specs need no change. To upgrade: use
+Bun 1.3.14 or later; run `crewhaus lint` and `crewhaus compile --strict` on
+each spec, which point out most rules, tool lists and `tool_config` blocks
+this release reads differently; read **Before you upgrade** under Changed;
+then recompile your bundles, since a bundle uses the packages of the CLI that
+built it.
 
-- **A harness can now see the tools it does NOT have.** `ListTools` has always
-  answered "what can I call right now", from the live catalog. The other half —
-  "what exists in this framework that I was not given" — had no answer at all:
-  a compiled bundle contains only the tools its spec granted, so from inside,
-  the ones it lacks were invisible. An agent could not name one, let alone say
-  what it would do.
+### Security
 
-  The new **`ToolRegistry`** tool (`@crewhaus/tool-capability`) answers it.
-  Search by text, narrow by category, or ask for one key and get that tool's
-  whole description. Rows split into what this harness is running and what it
-  is not, and a row it is not running carries a line on how to ask for it.
+#### Permission rules can no longer be dodged
 
-  **This is ergonomics, not a control.** Leaving a tool out of `tools:` is what
-  shapes a harness; this only makes the omission legible, so an operator can
-  see what the agent is missing. In any harness that grants bash, file write or
-  code execution the agent can already edit `crewhaus.yaml` itself, and nothing
-  here changes that.
+- **A deny or ask fires when any argument it is about matches.** A scoped
+  deny such as `alwaysDeny RemovePath(.git/**)` in front of a bare
+  `alwaysAllow RemovePath` missed as soon as the call carried one more
+  argument, or left out one the tool fills in (`EnvFileUpsert` with no `path`
+  writes `.env`). Rules now see defaults and are checked against the input
+  the tool will actually run on.
+- **A deny that fired in 0.7.0 still fires.** Rules now read the place a
+  tool acts on, but a deny or ask also still reads a call as 0.7.0 did, and
+  fires when every text value in it matches: `alwaysDeny
+  EventQuery(sess-prod-*)` still stops a call that names only that session.
+  An allow reads the place alone.
+- **A scoped allow can no longer be widened.** `Write(src/**)` authorised a
+  write to `.crewhaus/settings.json` — and so standing permissions on the
+  next run — through a decoy `file_path` the tool never reads, through
+  `src/../`, or through a symlinked directory. None of these pass now, and a
+  path outside the workspace never satisfies a scoped allow. An allow on a
+  number grants only the numbers it names: `SmsSend(+1555?1234567)` no longer
+  grants `+1555-1234567`, which goes to `+15551234567`.
+- **On macOS and Windows, a deny holds in any letter case.**
+  `alwaysDeny Read(**/.env)` did not stop `Read(.ENV)`, which opens the same
+  file. A path is matched under the name the file is stored with, and a deny
+  or ask ignores case where the filesystem does. Linux is unchanged.
+- **Every spelling of a destination meets a deny.** A deny on
+  `https://evil.example/**` missed `https://x@evil.example/`, a trailing dot,
+  another port and an IPv4 address written as IPv6. A deny on an email
+  address missed another letter case or a `+tag`, and a chain address another
+  hex case. A deny on a phone number missed `(+1)5550100000` and the other
+  spellings SmsSend sends to it, and a deny on a host that WaitForPort,
+  DeliverabilityCheck or FederationDiscover reaches missed it written another
+  way: `10.5` is `10.0.0.5`, `münchen.de` is `xn--mnchen-3ya.de`, and
+  WaitForPort probes `localhost`, `0.0.0.0` and `::` on 127.0.0.1 or ::1.
+  Numbers and hosts are now read the way the tool reads them, in the call and
+  in the rule: `alwaysDeny SmsSend(+1 555*)` covers `+15550100000`, and
+  `alwaysDeny DeliverabilityCheck(münchen.de)` covers `xn--mnchen-3ya.de`.
+  A deny that names a host covers it over http and https
+  and on any port, unless it names a port; one whose host is a wildcard
+  (`http://**`) keeps to its scheme and port, as an allow does. A path deny
+  written through a symlinked spelling of the workspace (`/tmp` for
+  `/private/tmp`) holds too.
+- **A deny on a place the call leaves out still fires.**
+  `alwaysDeny KvDelete(.crewhaus/state/**)` now stops a call that leaves the
+  store directory to its default, for the store readers as well as the
+  writers. The same holds for the git branch tools' and RunBuild/RunTests'
+  `cwd` and DependencyAudit's OSV endpoint. An allow scoped to a record, such
+  as `KvSet(scratch/*)`, keeps covering ordinary calls.
+- **A deny on a directory also covers the directories above it**, for every
+  tool that walks, lists or dumps what a directory holds, read-only ones
+  included. `alwaysDeny RemovePath(src/prod/**)` now stops `RemovePath src`,
+  `alwaysDeny Grep(secrets/**)` stops a search of the whole workspace,
+  including one with no path, and `alwaysDeny *(secrets/**)` stops `Tree .`, a
+  StateExport of the workspace, and the same in FindFiles, DiskUsage,
+  TodoScan, SecretScan, ChecksumVerify and the other walkers. A deny on a
+  harness's own records (session logs, the approvals ledger, settings, eval
+  history, the watch-me and routing stores) also stops the tools that read
+  them, such as PermissionsSuggest and ApprovalStatus. A git tool that takes
+  a path but is given none (GitDiff, GitLog, GitShow) counts as the whole
+  repository, wherever it runs. A path that names a file is just that file.
+  Grep, Tree, FindFiles, SecretScan and the code scanners skip hidden names
+  unless the call asks for them, so `alwaysDeny Tree(.env)` still allows
+  `Tree .` and stops `Tree . includeHidden`; DiskUsage, ChecksumVerify and
+  the harness finders read hidden names, so a deny on `.env` stops their
+  whole-workspace runs.
+- **A rule reads everything a call can reach.** A Glob pattern stands for
+  every path it can list, including a hidden name it spells out
+  (`alwaysDeny Glob(secrets/**)` stops `**/*` and `*/.env`). A path
+  given to a git tool is literal, so `secret*` cannot reach around a deny on
+  `secrets/**`. A KvList prefix stands for every key that starts with it. A
+  GitHub or GitLab search is scoped by its `owner` and `repo`, and a deny on a
+  repository also stops an owner-wide or unscoped search. TempDir is read as
+  the directory it makes (`base/name`, under `.tmp` by default) and, when
+  `clear` empties it first, as everything in it, so `alwaysDeny
+  *(secrets/**)` stops it from emptying `secrets/`.
+- **A command rule decides on the program that really runs.** RunCommand,
+  RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format, HooksManage
+  and Bash are read with the directory they run in, the environment they set
+  (`PATH`, `BASH_ENV`, `NODE_OPTIONS` and the like) and the `cd`s before each
+  command, so a deny on `scripts/release.sh` holds when the call runs
+  `./release.sh` from `scripts/`. A program or script named by a path is read
+  where the system finds it, through `..` and symlinked folders:
+  `alwaysDeny RunCommand(deploy.sh)` stops `./scripts/../deploy.sh` and the
+  absolute path, and `alwaysAllow RunCommand(./scripts/**)` no longer grants
+  a script that a `..` or a link takes out of `scripts/`. The same holds
+  after `env -C` or `sudo -D`, for a program found on a PATH the call sets or
+  written with `$PWD`, and for a script handed to an interpreter (`sh`,
+  `node`, `bun`, `python3`, …) or fed to a shell (`sh < x.sh`). node,
+  `bun run` and a script whose `#!` line names node settle a `..` before
+  they follow links, so they can open a different file than a shell would:
+  such a word is read both ways, a deny or ask fires on either, and an allow
+  must cover both. A program reached through a link to the file itself
+  (`node_modules/.bin/eslint`) is still allowed by its link name, and a deny
+  on where the link leads fires too. On all of these but Bash a deny also
+  reads every other path in the command where it lands
+  (`find . -exec link/../run.sh ;`). Write a deny's path without `./`: one
+  written with it can miss the same program written without the `./` or as
+  an absolute path (see Known limitations). A scoped command allow does not
+  follow the call into another directory.
+- **A Bash rule reads each command in the line.** `alwaysAllow Bash(git *)`
+  allowed `git status && rm -rf build`, and `alwaysDeny Bash(rm -rf **)`
+  missed an `rm` that came second. A line is now split into the commands it
+  runs, at `&&`, `||`, `;`, `|`, `&` and newlines, respecting quotes and
+  comments. An allow must match every command, or be written as the same
+  chain (`Bash(cd ** && make *)` matches `cd build && make all`, each part
+  against the command in its place); a deny or ask fires on any of them, or
+  on the whole line as before. A deny also sees a command through
+  `env`, `sudo`, `xargs` and similar wrappers, inside `eval`, `sh -c` and
+  `$(…)`, without its quotes, and through variables the line sets. A line
+  whose commands cannot be read from its text — `$(…)`, `$((…))`, backticks,
+  a `$'…'` string, a here-document, an unterminated quote, a `for` or `case`
+  block — is allowed by no scoped rule, so it asks; one whose program the
+  text does not name (`read x; $x -rf build`) also sets off every deny and
+  ask. The Shell tool is
+  read the same way, and a deny on RunCommand or another argv tool reads the
+  line it hands to `sh -c`.
+- **Text handed to a shell is read as the commands it runs.** A call that
+  hands a shell text on its input (`argv: ["sh"]` with `stdin: "rm -f x"`,
+  on RunCommand, Retry, ProcessStart or a RunPipeline step) meets
+  `alwaysDeny RunCommand(rm *)` as `sh -c` does. In a Bash line, a shell that
+  reads its commands from a pipe (`curl … | sh`) sets off every deny and ask.
+  Each shell's options are read the way that shell reads them, so an
+  option's argument is never taken for the script. A program or script
+  written under the shell's own directory any way but a plain leading `$PWD`
+  (`${PWD%/*}/x.sh`, `$OLDPWD/x.sh`, `$(dirname "$PWD")/x.sh`) sets off every
+  deny and ask.
+- **A path read from another argument's directory cannot climb past a
+  rule.** When a tool reads a path relative to another argument (a git or
+  formatter path relative to `cwd`), a path that is absolute or has a `..`
+  is read as outside the workspace: no scoped allow grants it, and every
+  deny or ask fires. The program opens it from that directory, following a
+  link before the `..`, so through a symlinked folder it reached another
+  file than the rule checked: `alwaysDeny Format(secrets/**)` missed
+  `../x.ts` run from a link into `secrets/`. Lint, Format and RunTests now
+  refuse such a `paths` entry, naming it.
+- **A path names one place at any length.** A very long path could be read
+  as one file by the permission check and as another by the tool, so an
+  allow on one name approved a change to a different file; StateImport could
+  write a deeply nested entry above where it said; and SpecPin and
+  DeployRollback judged a very deep registry folder by the wrong parent.
+  Each now acts on the place the path names. The check reads a path longer
+  than any filesystem can open as outside the workspace, and most tools
+  refuse it before resolving it, with its length and the limit; the core
+  file tools (Read, Write, Grep, Stat, ReadLines, Tree and the like) still
+  report it as outside the workspace, or as a read or write that failed.
+- **A deny on a secret holds however the reference is written.** SecretLookup,
+  SecretRotate and EnvFileUpsert read a `file:` or `envfile:` reference as the
+  file it opens, so `alwaysDeny SecretLookup(file:secrets/**)` now stops
+  `file:./secrets/token`, `file:pub/../secrets/token`, a link into `secrets/`
+  and a reference with a leading space, and path rules such as `*(secrets/**)`
+  apply too. A bare `API_KEY` or `env:API_KEY` is also read as the files it is
+  loaded from (`.env.local`, `.env`), so `alwaysDeny *(.env)` stops it, while
+  an allow naming the reference as the call writes it still grants it. A
+  deny or ask also reads what a tool copies from: EnvFileUpsert's and
+  SecretRotate's source reference, IndexBuild's and DatasetPut's files,
+  EmailSend's attachments, InvoiceRender's template and the test files
+  RunTests is limited to.
+- **A rule reads which service, and whose copy, a call acts on.** A
+  code-host call can name its own API in `baseUrl`, and a Chat call names
+  `apiBaseUrl`, so a rule now reads the repository or channel with that
+  API's origin in front (`https://ghe.example.com/acme/app`):
+  `alwaysDeny IssueCreate(https://ghe.example.com/**)` fires, including on a
+  call that names no `baseUrl` but goes there. RateLimitStatus is read as the
+  API it reports on, the way the tool reaches it, so a deny on that API or its
+  host stops it however the call picks or spells it (`…/api/v3/` is
+  `…/api/v3`). A ChatPost through an incoming webhook, which ignores its
+  `channel`, is read by the variable that names the webhook, and WebhookPost
+  by `urlEnv` when it gives one. A deploy call that names a `tenant` acts on
+  that tenant's own copy of the pin and is read as `<tenant>/<name>/<env>`.
+- **A headless approval holds only where it was granted.** A parked call
+  records where each path, program and script it names lands. If a link on
+  the way has moved by the time it resumes, the call is asked again, naming
+  where it was approved and where it lands now, instead of running where you
+  never approved it. The Slack card, the text fallback and
+  `crewhaus approvals show` say where a parked call lands. A call you refused
+  stays refused wherever it now lands.
+- **A permission pattern can no longer stall the daemon.** A rule with
+  several `*`, matched against a long command, could block the event loop
+  indefinitely. Patterns now match in time proportional to the input, and
+  match exactly what they matched before.
+- **A sub-agent written to `.crewhaus/sub-agents/` can only narrow its
+  parent.** Any agent with a file-write tool can add a file there while it
+  runs. Its `permissions` replaced the parent's rules — enough to lift an
+  `alwaysDeny` — and a `model_pool` candidate's `toolConfigs` in it replaced
+  the operator's `tool_config`. Such a definition now runs under its own rules
+  and the parent's together, only on models the spec names, and is read
+  without following links; `toolConfigs` and `inherit_bypass` there are
+  ignored with a notice. To grant a sub-agent more, declare it under
+  `sub_agents` in `crewhaus.yaml`.
 
-  Whether a tool is bound is read from the LIVE catalog rather than from the
-  spec, so a tool an MCP peer registered an hour after boot counts as bound.
+#### Plan and auto mode
 
-  **MCP is asymmetric, and the answer says so.** A spec declares an MCP server,
-  not the tools it offers, and a server's tools are only known once it
-  connects. So the "not bound" half is builtins only, bound MCP tools are
-  absent from the "bound" half, and every result points at `ListTools` for the
-  whole live toolset.
+- **Plan mode no longer runs the project's own programs.** Typecheck, Lint,
+  FormatCheck, Diagnostics and CliVersionPin were marked read-only, so plan
+  mode ran them without asking — and the program they run is the project's (a
+  linter config, a binary in `node_modules/.bin`), so planning in a cloned
+  repository ran its code. They are no longer read-only, and they run without
+  your API keys and tokens in their environment. CliVersionPin now reads a
+  CLI's version from its `package.json` instead of running it.
+- **Plan mode keeps the sandbox floor**: a read-only tool that needs a
+  sandbox is refused when none is available, as auto mode already did.
+- **`NODE_ENV=test` no longer switches off the justification check.** The
+  built-in rule check, which the same model that picks a tool can talk past,
+  was accepted on every justification-gated call whenever `NODE_ENV=test`
+  was set, so a compiled bundle or `crewhaus run` started on a host that
+  exports it (a staging box, a CI job) let those calls through. Only the
+  test runner itself is exempt now; set
+  `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` to accept the rule check
+  anywhere else.
+- **OpenExternal asks in auto mode**, and every call carries a justification:
+  an app it opens keeps running, and a page opens with your cookies. It also
+  refuses more files a desktop runs or follows on open (`.fileloc`, `.jnlp`,
+  `.mobileconfig`, installers, disk images and others).
+- **MCP tools can be marked destructive, and a server that says a tool is
+  destructive is believed.** In auto mode every MCP call ran without asking,
+  a remote `delete_repo` included, and `mcp_servers.<name>.tool_flags`, the
+  setting meant to change that, failed to compile. It now takes effect, and a
+  server's own `destructiveHint` makes that tool ask in auto mode. Flags and
+  hints can only tighten: `readOnlyHint` is ignored, and `tool_flags` no
+  longer accepts `readOnly`.
 
-- **`@crewhaus/tool-registry-manifest` — every builtin tool, as data.** Nothing
-  in the tree could describe a tool that had not been imported: the CLI
-  emitter's builtin map carries a package and an export name, the category
-  registry is forbidden from importing a tool package, and descriptions and
-  flags live only on the tool objects themselves. So they are projected once,
-  by `scripts/gen-tool-registry.ts`, into a dependency-free package — the shape
-  `@crewhaus/docker-images` already uses for its Dockerfile bodies. The key set
-  is derived from the emitter's map rather than written out, so it is a
-  projection and not one more list to keep in sync, and
-  `apps/cli/src/tool-registry.test.ts` re-projects every row and fails when the
-  checked-in data has gone stale.
+  ```yaml
+  mcp_servers:
+    github:
+      transport: stdio
+      command: github-mcp
+      tool_flags:
+        defaults: { requireJustification: true }
+        per_tool: { delete_repo: { destructive: true } }
+  ```
 
-  It is around 450 KB of description text, which is why it is its own package
-  and why `ToolRegistry` is its own tool: growing `ListTools` instead would
-  carry all of it into every bundle of every shape.
+- **A deny on MCP tools written the documented way fires.**
+  `alwaysDeny mcp__github__*` matched nothing, because the tools were
+  registered under another name, so in auto mode the call simply ran.
+- **Thredz `inbox_poll` is no longer treated as a read**, since it
+  acknowledges what it fetches: plan mode refuses it, and default mode asks
+  unless a rule allows it.
+- **`CREWHAUS_SANDBOX=noop` turns code execution off in every mode.** Under
+  `--permission-mode bypass`, or with a stray space or CRLF in the value, the
+  model's code ran on the host.
+
+#### Files stay inside the workspace
+
+- **Tools no longer write through a link or file planted in the workspace.**
+  A symbolic link at a file's name, at a temp name derived from it, or at a
+  parent directory could redirect a write outside the workspace. Writes now
+  go through a randomly named temp file created exclusively, and a link that
+  leads out is refused, naming the file. This covers the file tools (Write,
+  Edit, CopyPath, MovePath, SplitFile, ConcatFiles, GoldenUpdate,
+  DownloadFile, InvoiceRender, IncidentBundle, EmitTraceEvent), the wiki,
+  memory and continuity stores, datasets, eval baselines and history, the
+  audit log, and the runtime's own files in `.crewhaus/`: sessions and
+  transcripts, the approvals log, settings, routing, dream state,
+  prompt-cache records, session summaries, watch-me data, incident captures,
+  alert history, recorded tool cassettes and encryption keys. A link that
+  stays inside the workspace is still followed, and `.crewhaus` itself may be
+  a link to state kept elsewhere.
+- **Reads no longer follow a link out of the workspace.** Package manifests,
+  lockfiles, coverage reports, dataset records, eval results, the session logs
+  `PermissionsSuggest` reads and the `.env` that `ApprovalStatus` reads are
+  not read through a link that leads out; the tool reports what it skipped.
+- **A named pipe or device no longer freezes the harness.** Read, Edit,
+  ReadImage and the listing, document, table, e-invoice and secrets tools,
+  and plugin and skill loading, refuse a FIFO or other special file instead
+  of waiting on it.
+- **Archives cannot plant files past the workspace.** ArchiveExtract follows
+  link chains the way the operating system does, checks what the extractor
+  actually wrote, refuses FIFO, device and socket members, and caps what it
+  extracts (`maxBytes`, 1 GiB by default). ArchiveCreate stores a link as a
+  link in zip archives too.
+- **Copying or moving a link keeps its reach.** CopyPath and MovePath judge
+  each link from where it will sit: one that would point somewhere new
+  outside the workspace is refused, and one that points exactly where it did
+  (a virtualenv's interpreter) is kept and listed in `outsideLinks`. CopyPath
+  refuses a symlink under its destination, and MovePath never deletes the
+  destination before the move succeeds.
+- **Git tools work only on the workspace's own repository.** A workspace
+  inside a larger checkout, a planted `.git`, or a repository that borrows
+  objects or refs from outside is refused. The read-only git tools and
+  DiffLint no longer run programs a repository's own config names (fsmonitor,
+  diff drivers, textconv, filters, signature programs, hooks), or run git
+  inside a submodule. GitApplyPatch refuses a patch that names a file outside
+  `cwd` or creates a link pointing outside the workspace.
+- **TrashPath** uses only real trash directories you own and never
+  overwrites what is already in the trash. **PowerAssertion** keeps its
+  record in a private per-user directory, and checks a process is its own
+  before signalling it.
+
+#### Credentials
+
+- **The model no longer chooses which environment variable is sent as a
+  credential.** Tools that took a variable name from the call now read only
+  names you list. An unlisted name is refused the same way whether or not it
+  is set.
+
+  | Tools | Where to list the variables |
+  |---|---|
+  | HTTP `auth` profiles | `tool_config.http.allowed_auth_envs` (each can be bound to origins) |
+  | WebhookSign, WebhookVerify | `tool_config.http.allowed_signing_envs` |
+  | Notify tools | `tool_config.notify.allowed_secret_envs` (a provider's own `auth.envVar` works unlisted) |
+  | Code-host tools | `tool_config.codehost.token_env`, or `token_envs` for several |
+  | SignPayload, VerifyPayload, Pseudonymize, PiiRedact, RedactForExport | `tool_config.secure.key_env_vars` |
+  | ObjectPresign | a profile under `tool_config.objectstore.credentials`; credentials are no longer arguments |
+  | EnvInspect's `reveal` | `tool_config.proc.env_reveal`; a key, token or password is never shown |
+
+- **A credential stays with its destination.** Fetch no longer sends a
+  call's Authorization, Cookie or custom headers to another origin it is
+  redirected to. HttpPaginate sends your credential only to the origin you
+  named. A code-host token goes only to `base_url`'s host. ImageGenerate sends
+  `OPENAI_API_KEY` only to api.openai.com unless `OPENAI_BASE_URL` approves
+  another origin.
+- **A credential is not repeated back.** A server that echoes a credential,
+  even escaped (`\u002B`, `%2F`, `&#x2F;`, nested JSON, UTF-16), has it
+  replaced with `<redacted>`; DownloadFile will not save such a body, and an
+  HttpWaitFor condition cannot be used to guess one. RPC and knowledge-source
+  URLs, remote URLs in GitRemoteList, MCP server arguments in SpecSummarize
+  and SpecDiff, and object-store and image endpoints are shown without their
+  secrets, and errors name the origin or the variable, never the value.
+- **Programs the project supplies run without your credentials.** Typecheck,
+  Lint, FormatCheck and Diagnostics get an environment without
+  credential-shaped variables or URLs that carry a password. RunTests,
+  RunBuild and Format still get your full environment.
+- **Secrets in `tool_config` can stay out of the spec.** A value written
+  `$UPPER_SNAKE` is read from the environment when the harness starts, as
+  `mcp_servers` values are, and is never repeated in an error.
+
+#### Where tools send
+
+- **Every tool that sends to a place the model picks gets the strict egress
+  check.** Fetch and WebFetch blocked a call carrying text from a tool
+  result, an MCP response or a sub-agent; HttpRequest, HttpBatch,
+  GraphqlQuery, WebhookPost, EmailSend, SmsSend, ChatPost, the issue and
+  pull-request writers, DownloadFile, OpenExternal, HttpPaginate,
+  PackageManifestVerify, the RPC readers, MCP calls and the other tools that
+  take a URL or recipient from the model only logged it. They now block it.
+  Tools that send to a place you configured (SendMessage, WebSearch,
+  ImageGenerate, a code host's reads) still only log. To relax one sink for a
+  deployment, pass `resolveSinkScope` to the runtime.
+- **Tools that reach the network say so**, so egress checks and permission
+  rules see them: the EVM reads and EvmSimulate, generated contract tools
+  (whose writes now need a justification), Retrieve, the browser's Type, Key
+  and Click, FindElement, and Recall and wiki ranking when the embedder is
+  hosted.
+- **An id cannot move a request.** ChatPost, ChatUpdate, ChatDelete,
+  ChatReact and DeliveryCheck refuse an id of `.` or `..`, which could send
+  the request to another endpoint.
+- **Destinations need your list.** SmsSend and PushNotify reach only the
+  numbers and targets you list, and send them as the list compared them: a
+  number in E.164 form (`+15550100000`, not `+1 (555) 010-0000`), a target
+  without surrounding spaces. WaitForPort probes this machine unless you
+  list the host, and refuses an IPv6 address that resolvers read differently:
+  `::ffff:0177.0.0.1` passed as this machine, and macOS dialled 177.0.0.1.
+  WebFetch never looks up a host outside `allowed_domains`.
+  Token and multicall batches go only to the canonical Multicall3, or the one
+  in `tool_config`.
+- **A redirect cannot move DependencyAudit or a chain read.** Both refuse
+  any redirect, even to the same address, and fail with an error saying
+  where it pointed. DependencyAudit re-sent your lockfile's package list to
+  wherever the OSV API or a mirror redirected it, even to a server on no
+  allow-list, and a chain node could send a read to one your `chains` block
+  does not name. Under `rpcPolicy: fallback` the next node is asked.
+- **A `model_pool` candidate's `allowed_origins` narrows** what the chain
+  readers and FederationDiscover reach for that model; it never widens the
+  agent's list. For other tools a candidate's block replaces the agent's, and
+  compile notes when it reaches more hosts.
+
+#### Crafted input can no longer freeze or exhaust the harness
+
+- **A pattern a caller supplies runs under a deadline, off the main
+  thread.** Grep, AcceptanceCheck, the Golden tools, ContentPolicyCheck,
+  GlCodeSuggest, TableQuery, JsonQuery, RegexExtract, RuleClassify, the
+  routers and scorers, Assert, JsonSchemaValidate, BundleSizeCheck,
+  FlakyTestDetect, DiffLint, WaitForOutput and AstQuery could freeze the
+  process on a runaway pattern, or report "no match" when the regex engine
+  gave up. A pattern that cannot finish is now "undetermined": a check that
+  depends on it fails, and a search names what it could not scan. Patterns
+  known to backtrack without bound are refused with the reason.
+- **Built-in parsers take time in proportion to their input**: HTML
+  selectors, Markdown, sitemaps and feeds, OFX statements, CI logs, mail
+  dates, PDF text, test-runner output, ABI and typed data, JSON Schema, and
+  glob and `.gitignore` patterns. A small input can no longer decode into
+  millions of values.
+- **Long runs in text no longer slow a tool to a crawl.** A long run of
+  spaces, blank lines, slashes, digits, braces or repeated phrases made many
+  readers scan the same text again and again: command, build and test
+  output, commit messages, YAML and workflow files, manifests and lockfiles,
+  `.env` files, PDFs, subtitles, colours, CSV cells, SQL statements,
+  `date-time` checks, feeds and event streams, the PII, secret and
+  prompt-injection scanners, the permission check's reading of a call's
+  directory, PATH, URLs and recipients, model replies read by the planner,
+  the justification judge and the optimizer, and the Hangar's views. Each
+  now reads its input once. Tools that compare many items with each other
+  (SchemaDiff, FactCrossCheck, ImportCsv and ImportJson, the SQL tools,
+  CostBasisCompute, ConsensusVote, the registry tools on a manifest with
+  thousands of dependencies, and a session that starts with a large union
+  schema) no longer slow down sharply as the items grow.
+- **Archives and documents cost what their bytes allow.** Listing, checking
+  and extracting an archive stays fast with very deep member paths, many
+  links that lead through one another, or many top-level entries, and a tar
+  with a malformed extended header no longer hangs. Zip data that many
+  entries share is inflated once, a zip link whose stored target is
+  implausibly large is refused, and PptxRead, XlsxRead and DocumentText
+  refuse a zip whose entries overlap.
+- **Paths are checked in time proportional to their length**, by the
+  permission check and every file tool, including a path below folders that
+  do not exist yet.
+- **A compressed reply costs at most the tool's byte cap after decoding.** A
+  small gzip or brotli body could inflate to gigabytes in Fetch, WebFetch,
+  WebSearch, the HTTP, notify, code-host and observability tools, the
+  crawler, and the chain, registry, container, KYC and discovery readers.
+- **Output is capped as it arrives.** Commands, cron, desktop and host-search
+  helpers and code execution keep what fits and flag what was cut, and a
+  timeout stops the whole process group. A code-execution container is
+  stopped and removed at its timeout, on cancel, and when the host exits; a
+  watchdog stops one whose host was killed outright.
+- **Network reads have a deadline.** EVM calls, WebFetch's body and
+  ImageGenerate also have a size cap, and a DeFi call's `timeoutMs` bounds the
+  whole call.
+- **Large files and results are bounded.** IngestDocument keeps to its
+  budget; JSON depth, HtmlTable, TableJoin, text similarity and timezone
+  caches are capped; and FactCrossCheck reads only so much of its sources in
+  one call. The new limits you may meet in Read, Edit, ReadLines,
+  SchemaDiff, RobotsCheck, Slugify and GlossaryReplace are listed under
+  Changed. A cut result always says so.
+- **Keys named `__proto__` or `constructor` are ordinary data** in every
+  tool, and no document or tool name can change how another tool behaves.
+
+#### MCP servers and plugins
+
+- **An MCP server can no longer slip instructions to the model through a
+  tool definition.** Descriptions and schemas are screened at registration:
+  flagged description text is withheld with a warning, a flagged name or
+  schema leaves that tool out, and long descriptions are cut. One bad tool no
+  longer takes down the rest of its server.
+- **Signed plugins verify on every boot path**, reading trust anchors from
+  `~/.crewhaus/plugin-trust/*.pem` and `CREWHAUS_PLUGIN_TRUST_ANCHORS`; before,
+  no boot path had an anchor. `crewhaus plugins install` checks the
+  publisher's signature, installs the version you asked for or nothing, and
+  delivers the manifest only. A signed plugin runs exactly the bytes its
+  signature names, and a signed `notAfter` expires it. Unsigned plugins still
+  need `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`, which now warns on every boot.
+- **A plugin stays in its folder and its lane.** Its `index.js` and `skills/`
+  must live inside its own directory; its `engines.crewhaus` is checked; it
+  must be the plugin the registry lists, at its pin; it cannot take a
+  crewhaus tool's name; its tools reach only the host tools its
+  `permissions.tools` lists; and a tool definition with a mistyped flag or
+  schema stops the plugin at boot, naming the field.
+- **The boot says what a plugin is not held to**: plugins run with
+  crewhaus's full access, so `permissions.fs`, `net` and `secrets` are not
+  enforced, and a plugin's channels, models, graders and emitters have no
+  effect yet.
+
+### Fixed
+
+#### Every shape runs the 0.7.0 tools
+
+- **Graph nodes, workflow steps, crew roles and the channel, managed,
+  research, batch and browser shapes can use the 0.7.0 tools and
+  categories.** `tools: [jsonQuery]` or `tools: [all-data]` compiled only on
+  the cli shape and failed elsewhere with `unknown tool`. Every shape now
+  reads one builtin table. cf-worker runs its edge-safe set and says which
+  tools it leaves out (`edge-unsafe-tool`). Voice, onchain and onchain-game
+  accept `tools:` and `tool_config:` but do not wire them yet, and say so
+  (`accepted-but-unwired`, an error under `--strict`).
+- **`crewhaus eval` and `crewhaus optimize` run specs that use the new
+  tools**, with the tools and `tool_config` the compiled bundle uses, instead
+  of stopping with a stack trace. A bridged eval of a channel spec with
+  `plugins:` says it runs without the plugins' tools.
+- **Eval harnesses built with `compile --with-eval-harness` apply the spec's
+  `tool_config` and permission rules**, so the agent you grade is the agent
+  you ship.
+- **Code execution works on every shape that registers it.** The managed
+  daemon denied every call and pointed at `CREWHAUS_SANDBOX`, which it never
+  read. Sub-agents given Python, JavaScript or Shell now run them when the
+  parent has a sandbox.
+- **Sub-agents get the tools their `tools:` list names**, categories and spec
+  keys included; before, those gave the child no tools at all.
+- **`plugins:` on a channel daemon is loaded.** It was accepted and did
+  nothing. A plugin the daemon cannot load is skipped with a warning at every
+  start.
+- **A compiled cli bundle starts when a plugin adds a tool named like a
+  builtin**: the plugin's tool is skipped with a warning.
+- **A compiled cli bundle uses the justification judge its spec names.**
+  Only `crewhaus run` read `security.justification.judge`, so a bundle
+  checked every justification-gated call (HttpRequest, EmailSend,
+  DownloadFile and the rest) with the built-in rule check, which denies them
+  all outside tests. The bundle now builds the same judge `crewhaus run`
+  does and writes the same audit log. Recompile to pick it up. A sub-agent
+  now judges its gated calls with that judge too, in the bundle and in
+  `crewhaus run`, and logs them on the same audit log.
+- **A model profile or pool candidate can narrow to a tool the shape grants
+  through a category**: `tools: [csvParse]` under a shape's
+  `tools: [all-data]` was refused as "not one of the shape's tools".
+- **Cloudflare Worker bundles install again**: their `package.json` pins the
+  release that built them.
+
+#### `tool_config` reaches the tools that read it
+
+- **Each package's block reaches its tools** on every shape, in
+  `crewhaus run` and in `crewhaus eval`, and a model-pool candidate reads the
+  same keys. The http, codehost, notify, obs and defi tools ignored the blocks
+  their READMEs document, so their network tools refused every request.
+  Write the block under the package key (`http`), a tool's key
+  (`httpRequest`) or its registered name (`HttpRequest`); `crewhaus tools
+  show <tool>` names it.
+- **`tool_config.WebFetch` restricts WebFetch**: written with the registered
+  name, the block was dropped at boot and WebFetch could reach any host.
+  `tool_config.fetch` reaches DependencyAudit's OSV mirror list without Fetch
+  in `tools:`, and `crewhaus run` and the browser shape apply
+  `tool_config.imageGenerate`.
+- **Tools that read a chain work when the spec declares one.** The chaincall
+  tools, `erc20Balance`, `erc721TokenInfo`, TokenResolve's on-chain check,
+  and on graph, workflow and crew the `evm*` readers and `evmSimulate`, take
+  their RPC from the spec's `chains` block. Without one they refuse and name
+  the block to write, and compile warns (`tool-unwired`). A graph, workflow
+  or crew bundle that lists an EVM tool reads the `chains` block's `$VAR`s
+  when it starts, and stops if one is unset; on 0.7.0 it started, and those
+  tools failed on every call.
+- **VectorDelete deletes from the store `tool_config.vectorDelete` names**,
+  and `erc721TokenInfo` reads metadata from the origins
+  `tool_config.token.metadata_origins` allows. Both refused every call.
+- **The bundle README tells the truth about each tool**: its scope and
+  justification gate come from the tool, "configured by" appears only when
+  the block reaches it, a tool the bundle does not carry is marked "not
+  wired", and the `$VAR` names a block reads are listed.
+
+#### Model providers
+
+- **Every builtin tool description fits OpenAI's limit**, so granting any
+  tool or category no longer breaks every request on OpenAI or Azure OpenAI.
+- **On OpenAI, a tool with an optional argument is not sent in strict
+  mode**, which forced the model to send `null` for arguments it meant to
+  leave out.
+- **A deeply shared `$ref` schema from an MCP server no longer grows to
+  megabytes** on Gemini, Bedrock or OpenAI requests, and Gemini schemas no
+  longer carry the numeric enums Gemini rejects.
+- **Every tool call has its own id** on Gemini and on OpenAI-compatible
+  servers that send none, so a long result's "full output at …" pointer names
+  that call's own file.
+- **Claude Opus 5.5 and Sonnet 5 are priced and sized correctly.** They were
+  billed at older models' rates, and Opus 5, Opus 5.5 and Sonnet 5 were
+  treated as having a smaller context and output than they do.
+- **`crewhaus` no longer runs `claude --version` on every command**, or
+  warns that it could not, unless it uses a Claude subscription token.
+
+#### Answers that say when they do not know
+
+A result the tool could not determine used to read as a definite one. It now
+says "unknown", `null`, "undetermined" or "refused", with the reason.
+
+- VatIdValidate answers "could not check" for UK numbers instead of "not
+  registered": HMRC's old free checker is gone.
+- CronList returns `ok: false` when it could not read a scheduler, instead of
+  "nothing scheduled", and a new `determined` field says whether anything was
+  read.
+- PackageQuery never accepts a winget source agreement for you: an
+  outstanding one makes the answer "unknown", with the command to run once.
+- ExifRead reads the whole file for GPS, and `hasGps` is `null` when it
+  cannot tell.
+- JsonSchemaValidate answers `valid: null` for a schema too expensive to
+  finish, and ValidateRecords counts such rows as undetermined.
+- UrlReachable, LinkCheck and HealthProbe report a URL the allow-list refused
+  as refused, not down, and LinkCheck marks URLs the deadline never reached as
+  skipped.
+- ChecksumVerify checks every entry, dotfiles and links included, and a walk
+  that stopped at its limit or an unreadable entry is not `ok`. GoldenCompare
+  calls an unreadable golden unreadable, not missing.
+- Browser Click, Type, Key, Scroll and FindElement record a driver or
+  grounding failure as a failed call, and with `streaming: true` a failed
+  action cancels the ones queued behind it, so typing no longer goes into a
+  field the click missed.
+- ClipboardRead, the Windows printer and window-focus probes, TlsInspect,
+  the preflight bundle check and the audit verifier say "unknown",
+  "unreadable" or "could not verify" where they reported empty, missing or
+  tampered.
+- The HTTP, notify, code-host and observability tools report a timeout only
+  when the timeout caused the failure.
+- EvalBaselineCompare fails runs that share no samples or name different
+  datasets; pass `allowDatasetMismatch` to compare across datasets on purpose.
+- PortfolioValuation lists the holdings it did not price, with the reason, and
+  LedgerReconcile lists the statement rows it could not read.
+- Reusing an `idempotencyKey` for a different message sends nothing and says
+  so, instead of reporting the earlier message as sent. A Slack verdict cut
+  short is "unknown", not "sent".
+- GitApplyPatch no longer reports "applied" for a patch git partly skipped,
+  and a three-way apply that leaves conflicts says so.
+- Grep says "no matches in the lines searched" and names the lines and files
+  it could not search.
+- FactCrossCheck reports a claim it could not check in full as unchecked,
+  with the reason, instead of checking it in part: one that quotes more than
+  16 different spans (split it into smaller claims), or one the call has no
+  reading budget left for (check it in a separate call).
+- MarkdownLinkCheck reads a link target's headings only in the documents it
+  was asked to check, and lists anchors into any other file under
+  `anchorsUnchecked`.
+- ContractInspect tells a probe that reverted from one the node could not
+  answer, so a contract whose probes revert is no longer refused on a chain
+  without Multicall3. EvmSimulateBundle falls back to `eth_call`, and
+  GasMarketRead answers without fee percentiles, when every node says it
+  lacks the method. A chain read that fails on every node ends with the last
+  node's reason.
+
+#### Tool results
+
+- **A hard-linked file gets the same answer every time on macOS.** A file
+  with a second name can be reported under either name there. So the
+  observability tools sometimes refused a workspace file because its other
+  name was outside, and an append sometimes refused it with the wrong reason.
+  Both cases refused; now the decision rests on the name you gave.
+- **WaitForOutput sees the line it waits for.** It reported "process
+  finished without matching" for a line a short-lived process printed just
+  before it exited. A process now counts as finished once it has exited and
+  the output being watched has closed, so a process it started that still
+  holds that output open keeps the wait going until the line or the
+  deadline. A wait on a process you stopped ends once that process exits, so
+  lines it prints while shutting down are still seen.
+- **Money is exact.** Amounts are whole minor units, and totals are exact or
+  refused. RuleScore adds exactly (0.7 + 0.1 meets a band at 0.8),
+  CostBasisCompute counts exact decimals, StatementParse reads amounts exactly
+  and keeps OFX transactions whose closing tag is missing, and
+  OraclePriceRead reads a Pyth confidence correctly.
+- **Decoders refuse what they cannot represent.** AbiDecode refuses a value
+  its type cannot hold; AbiEncodeCall and TypedDataHash check an address's
+  EIP-55 checksum; TypedDataHash refuses a message missing a field and an
+  odd-length `bytes`.
+- **Edits land as written.** Edit writes `$&`, `$$` and the like exactly —
+  the file could differ from the diff it showed — and Slugify, InvoiceRender
+  and the prompt optimizer insert them literally. Write, Edit,
+  FrontmatterWrite and NotebookEdit keep a file's permissions, and Read and
+  Edit keep a UTF-8 byte-order mark.
+- **Dates read the same on every machine.** HttpRequest and ErrorClassify read
+  a Retry-After date as GMT, and the tools that took a time without a UTC
+  offset no longer read it in the host's own zone (see Changed).
+- **Also fixed:**
+  - JsonQuery no longer drops matches in large arrays, and TableJoin's
+    `maxRows` bounds the work as well as the output.
+  - JsonSchemaValidate follows recursive schemas through `anyOf`, `oneOf`,
+    `not`, `if` and `contains`.
+  - CSV tools refuse a delimiter they could not read back.
+  - SemverResolve and the registry tools read `1.2`, `<=1.2`, `~1` and hyphen
+    ranges the way npm does, and order prereleases correctly.
+  - WorkspacePackages reads `?` and `!` globs correctly.
+  - CommandExists finds a Windows program by its bare name.
+  - Discord calls use the `Bot` token scheme.
+  - Typecheck and Diagnostics keep the checkers' caches out of your project.
+  - DnsLookup keeps to one budget for the whole lookup.
+  - WatchPath reports a rewrite or permission change made just after it
+    starts.
+  - GlCodeSuggest codes large batches in full.
+  - ExifStrip also removes metadata between scans and anything appended after
+    the image, such as previews and motion-photo video.
+  - The wiki tools check an article's title, tags and sources for prompt
+    injection, not only its body. Ordinary API phrases ("override the
+    Content-Type header") and a tool's own refusals are no longer flagged as
+    injections.
+  - SpecDiff flags a changed MCP server command or endpoint, and a new env or
+    header key, as widening.
+  - Chain RPC fallback no longer lets a stalled first URL use up the deadline.
+  - Marking a plan step or goal proven pins its evidence before recording the
+    status.
+  - Plugin tools written with zod 4 show their parameters to the model.
+  - SpendLimitCheck says it computes a verdict from its inputs and enforces
+    nothing itself, and ExportCsv says its cells are written verbatim,
+    formulas included.
+  - SeoLint keeps every letter of a link's text in Arabic presentation forms
+    and CJK compatibility characters when it checks for vague text such as
+    "here".
+  - GlossaryReplace matches letters the same way with whole words on as off
+    when case is ignored: the Kelvin sign, the long s and the capital sharp s
+    no longer match another letter only with whole words on.
+  - A registry manifest that lists a version name too long to be a file no
+    longer blocks DeployRollback and the other registry tools.
+  - Most tools that refuse a path for its length say so, instead of calling
+    it outside the workspace; the core file tools do not yet.
+
+#### CLI
+
+- **`crewhaus lint` and `compile` point out permission rules that can never
+  fire**, in every rule list — `permissions.rules`, model profiles and
+  sub-agents: the spec key where the tool name belongs (`removePath(tmp/**)`
+  for `RemovePath(tmp/**)`), a URL with a method in front, a near-miss or
+  re-cased name, a key-form glob (`codegraph*`), an MCP server the spec does
+  not declare, and an argument pattern on a tool that has no such argument.
+  `compile --strict` fails on them. A rule naming a tool nothing knows (a
+  plugin may register it) gets a note, never a fix, and an allow is never
+  "corrected" into a tool that can change or delete things.
+- **`crewhaus lint` and `compile` say when a deny or ask can never fire
+  because an allow above it always matches first**: the first matching rule
+  decides, so `alwaysAllow Bash` above `alwaysDeny Bash(rm -rf **)` lets every
+  `rm` run. The warning names both rules; move the deny above the allow.
+  `compile --strict` fails on it. A sub-agent's `allow` list is read before
+  its `deny` list, so there, narrow the allow. Only a case that can be proven
+  is reported. In a spec whose mode is `plan`, which reads no allow, the deny
+  does fire: it is a note that it would stop in another mode, and `--strict`
+  does not fail on it.
+- **`crewhaus compile --help` lists every warning that never fails
+  `--strict`.** It is now built from the same list `--strict` reads; the
+  hand-written copy had left out `mcp-server-name` and `permission-rule-note`.
+- **A bundle built with the optional IR passes decides as `crewhaus compile`'s
+  does.** The passes (`applyIrPasses`, which the compiler worker's
+  `POST /compile` accepts) re-sorted `permissions.rules` deny-first, so an
+  allow written above a narrower deny was a deny there. Rules keep their
+  order; only an exact repeat is dropped. Such a bundle now lets that allow
+  decide, so the compile returns the warning `crewhaus compile` prints for
+  it: move the deny above the allow.
+- **`crewhaus lint` agrees with `compile` about tools**, and knows the tools
+  a `thredz:` block adds. It also reports a key the spec's shape accepts but
+  does not wire (`accepted-but-unwired`), which it used to call clean. `lint --fix` edits only the fields it fixes, inside
+  `tools:` lists compile reads, never prompt text or a `$profile` reference,
+  and says when it skipped a file that is not valid YAML.
+- **`crewhaus permissions suggest` proposes rules scoped to what was
+  approved** — `RemovePath(build/cache)`, `RunCommand(git status)` — instead
+  of a blanket grant. A proposal that can only cover the whole tool is marked
+  `BLANKET GRANT` with the reason, and any deny or ask in your spec or the
+  builtin floor that a proposed allow would override is named, and each
+  proposal is checked to allow the calls it came from. The
+  `PermissionsSuggest` and `ApprovalStatus` tools do the same, and approval
+  rows show the record a call acts on.
+- **`crewhaus tools`** reads the tools a spec really grants. `suggest` reads
+  the instructions of every step, node and role and no longer proposes a tool
+  the spec's shape cannot run; `audit` never tells you to drop an exclusion.
+  `show` says which shapes run a tool and which `tool_config` key configures
+  it, takes the registered name in any case, and suggests the tool a typo
+  meant. `list` marks justification-gated tools, and `categories` says what
+  `all-network` leaves out.
+- **Tool errors name the problem.** A builtin the shape cannot run is refused
+  by name, with the shapes that carry it; `unknown tool` suggests the nearest
+  builtin; errors start with the spec path they concern (`nodes.plan.tools:`).
+- **A category exclusion only has to remove something you included**, so
+  `tools: [all-code, -all-network]` compiles.
+- **`compile --strict` scope-audits the `evm*` and `sendMessage` builtins**
+  instead of skipping them.
+- **PermissionAudit reports each builtin's real flags** and checks every rule
+  list. An unruled call gets the decision the engine would make, rules that
+  can never fire are listed, and rules on Thredz, MCP and runtime-added tools
+  get their own sections instead of being called dead. ToolInventory checks
+  builtin names against the spec's own shape without being asked.
+- **`tools audit`, `permissions suggest`, `doctor` and PII tuning no longer
+  count the approvals log as a session.**
+- **Hangar reports a refused baseline re-pin with the reason**, not "internal
+  error".
+
+#### Packaging
+
+- **The `crewhaus` package declares everything it loads at startup**, so an
+  install that lays packages out differently no longer fails with "cannot
+  find package".
+- **Published packages carry LICENSE, NOTICE and a README**, declare the Bun
+  they need, resolve with `require()` on Bun, and no longer include test
+  fixtures. Container images are built on Bun 1.3.
+- **A release never publishes a package whose dependency failed to
+  publish**, and the npm ownership check fails when the registry cannot be
+  reached instead of passing.
 
 ### Changed
 
-- **`ToolInventory` checks builtin names without being asked.** Its own
-  docstring named the gap: a builtin key could only be checked against a
-  `knownTools` list you passed, because the builtin registry lived in the
-  compiled bundle rather than in the spec. With the builtin set in the tree
-  that is obsolete — the check is now the default, `unknown` is always
-  reported, and the "not checked" note is gone. An explicit `knownTools` still
-  wins, for a spec being checked against a different release's runtime, and the
-  answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
-  this package already reaches and which is keys without prose, so no bundle
-  granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
+#### Before you upgrade
+
+Most 0.7.0 specs compile and run unchanged. These changes can make one ask,
+deny, warn or fail `--strict`; each says what to write instead.
+
+- **Bun 1.3.14 or later.** `crewhaus doctor` checks it. The Homebrew, Scoop,
+  winget and apt binaries bring their own Bun.
+- **List the variables a tool may read as a credential** (the table under
+  Security). A call naming an unlisted HTTP `auth` profile variable, notify
+  credential, code-host `tokenEnv`, signing or pseudonym key, or EnvInspect
+  `reveal` variable is refused until it is listed. WebhookSign and
+  WebhookVerify needed no configuration on 0.7.0 and now need
+  `allowed_signing_envs`. ObjectPresign needs a profile:
+
+  ```yaml
+  tool_config:
+    secure:
+      key_env_vars: [AUDIT_SIGNING_KEY]
+    objectstore:
+      credentials:
+        r2: { access_key_id_env: R2_ACCESS_KEY_ID, secret_access_key_env: R2_SECRET_ACCESS_KEY }
+  ```
+
+- **List where SmsSend, PushNotify and WaitForPort may reach.** SmsSend and
+  PushNotify reach only `tool_config.notify.allowed_sms_recipients` (E.164
+  numbers, or a prefix such as `+44*`) and `allowed_push_targets`; an empty
+  list refuses everyone. WaitForPort probes any host but this machine only
+  when it is in `tool_config.proc.wait_for_port_hosts`.
+- **DownloadFile and OpenExternal need a justification judge.** Every call
+  now carries a justification, and outside the test runner the built-in rule
+  check denies it, as it denies every justification-gated call, whatever
+  `NODE_ENV` says. What to set:
+  - A cli spec: `security.justification.judge: claude`. `crewhaus run` and
+    the compiled bundle both use it. It runs on `claude-haiku-4-5` unless
+    `security.justification.model` names another model, and needs that
+    model's provider key (`ANTHROPIC_API_KEY` for Claude) wherever the agent
+    runs; without it the agent stops at start.
+  - Any other shape has no `security:` block: set
+    `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` where it runs to accept the
+    rule check.
+  - `crewhaus eval` and `crewhaus optimize` do not use the judge yet: set
+    the same variable for them.
+
+  OpenExternal also asks in auto mode unless a rule allows it.
+- **ImageGenerate pointed at another endpoint** needs `OPENAI_BASE_URL` set to
+  the same origin as `tool_config.imageGenerate.openaiBaseUrl`, or it stops at
+  start. Plain http is refused except on loopback.
+- **Some permission rules need rewriting:**
+  - Use the tool's name, not its spec key: `RemovePath(tmp/**)`, not
+    `removePath(tmp/**)`.
+  - An argument-scoped allow must cover every argument it is about.
+    `Grep(src/**)` no longer allows a search just because its path is under
+    `src/`, since the pattern counts too. Keep a bare `Grep` allow and deny
+    what must stay out.
+  - A value the call leaves out that stands for everything needs an allow that
+    covers everything: `SearchIssues(**)`, not `SearchIssues(*)`, for a search
+    that names no repository (also SearchCode and DeployInspect);
+    `KvList(ns/**)`, not `KvList(ns/*)`; `Glob(src/**)` for the pattern
+    `src/**`; `EvmGetLogs(1/*)` for every contract's logs.
+  - An allow naming a command covers it in the workspace root. RunCommand,
+    RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format and
+    HooksManage ask when the same command runs in a subdirectory or sets
+    `envSet`. `RunCommand(**)` still covers every call.
+  - A Bash or Shell allow must match every command in the line.
+    `Bash(git *)` no longer allows `git pull && npm test` or
+    `git log | head`; they ask. Write one rule that covers each command, or
+    write the rule as the same chain: `Bash(cd ** && make *)` allows
+    `cd build && make all` but not `cd build && rm -rf ~`. A line with
+    `$(…)`, `$((…))`, backticks, a `$'…'` string, a here-document or a `for`
+    loop asks unless a bare `Bash`, `Bash(*)` or `Bash(**)` allows it; those
+    three allow what they did before.
+  - An allow on a program or script names where it really is. If `tools`
+    links to `safe/`, `RunCommand(./safe/run.sh)` grants `./tools/run.sh` and
+    `RunCommand(./tools/**)` asks. A program or script that a `..` or a link
+    takes out of the allow's folder asks, `/opt/tools/../evil.sh` under
+    `RunCommand(/opt/tools/**)` included. A node or `bun run` script reached
+    through a link and then a `..` asks unless the allow covers both places
+    it can read as, and a command with two such words is granted only by
+    `RunCommand(**)`. A program reached through a link to the file itself
+    (`./node_modules/.bin/eslint`) is still allowed by its link name.
+  - A Bash allow must also cover where each program really is:
+    `Bash(sh **)` still grants a script reached through a linked package
+    folder, but `Bash(./scripts/**)` asks on `./scripts/lnk/run.sh` when
+    `lnk` leads out of `scripts/`. A line in which a shell reads its commands
+    from a pipe (`curl … | sh`), or a program is written under `${PWD%/*}` or
+    `$OLDPWD`, sets off every deny and ask, and asks unless an allow covers
+    every command (`Bash` or `Bash(**)`).
+  - A path a tool reads relative to `cwd` (git and formatter `paths`) that is
+    absolute or has a `..` asks under a scoped allow, and Lint, Format and
+    RunTests refuse it. Set `cwd` to the folder you mean and list paths below
+    it.
+  - A deny or ask on a file now also stops a tool that walks or dumps the
+    folder holding it, the workspace root included, unless the file is
+    hidden and the tool skips hidden names. Under `alwaysDeny *(**/.env)`
+    the ordinary StateExport, NoteSearch, EventQuery, TraceQuery,
+    SessionSummarize, CostSummarize, AuditVerify, PermissionsSuggest,
+    CiWorkflowAudit, DiskUsage and ChecksumVerify calls are denied; under
+    `alwaysAsk *(.crewhaus/**)` all of them but CiWorkflowAudit ask, which
+    parks a headless run. Tree, Grep, FindFiles and the other walkers that
+    skip hidden names run as before. To keep such a rule on file readers
+    only, name them (`Read(**/.env)`); to keep a scan you rely on, point it
+    at a folder (`TodoScan` with `cwd: src`). An allow on a walked folder
+    still reads the folder alone.
+  - A secret rule reads the file a reference opens.
+    `SecretLookup(file:public/**)` no longer allows a link that leads
+    elsewhere, and a deny or ask on `.env` or `.env.local` now stops a
+    SecretLookup, EnvFileUpsert or SecretRotate call that names a secret as
+    `API_KEY` or `env:API_KEY`. An allow that names the secret as the call
+    writes it still grants it: `SecretLookup(API_KEY)` for `API_KEY`,
+    `SecretLookup(env:API_KEY)` for `env:API_KEY`.
+  - In a spec that reaches more than one code host, `IssueCreate(acme/app)`
+    covers only the API `tool_config` is set up for. Name the host:
+    `IssueCreate(https://ghe.example.com/acme/*)`, or
+    `IssueCreate(https://*/acme/app)` for that repository on any https host.
+    A spec with one host keeps its rules.
+  - A scoped allow on RateLimitStatus names the API it reads,
+    `RateLimitStatus(https://api.github.com/**)`, or `RateLimitStatus(**)` for
+    any. `RateLimitStatus(*)`, or one written on another value of the call
+    such as `RateLimitStatus(github)`, now asks.
+  - An API-mode Chat rule names the API: `ChatPost(https://slack.com/C0123)`,
+    or `ChatPost(https://*/C0123)` on any API; `ChatPost(C0123)` alone now
+    asks. A post through an incoming webhook is allowed by the variable that
+    names it, `ChatPost(SLACK_OPS_WEBHOOK)`, not by a channel, and
+    WebhookPost by its `urlEnv`, `WebhookPost(DEPLOY_HOOK_URL)`.
+  - A deploy call that names a `tenant` is read as `<tenant>/<name>/<env>`:
+    `DeployRollback(billing/staging)` no longer covers a tenant's copy of
+    that pin. Write `DeployRollback(acme/billing/staging)`.
+  - A TempDir allow names the directory it makes: `TempDir(.tmp/*)` for the
+    ones it makes by default, not `TempDir(scratch)`.
+  - A pattern aimed at something that is not where the tool acts, such as a
+    message body, no longer grants a call, and a deny or ask on it fires only
+    when every text value of the call matches, as in 0.7.0. To stop a call,
+    deny the tool or its destination.
+  - A rule on a chain tool is written `Tool(<chainId>/<address>)`.
+- **Approvals parked before the upgrade** settle as before when the call's
+  path goes through no link. Through a link, the call is asked once more. A
+  refusal still applies.
+- **SpecPin, DeployRollback and DeployInspect take a spec name as the
+  registry stores it.** A name the registry would store under another
+  spelling (`Brewbird Support` is `Brewbird-Support`, `.billing` is
+  `billing`) is refused with the name to use; DeployInspect lists them.
+- **A mirror or chain node that redirects now fails.** Point
+  DependencyAudit's `endpoint`, or a chain's `rpcUrls`, at the address that
+  answers directly.
+- **MCP tools are named `mcp__<server>__<tool>`**, as the docs always said;
+  they were registered as `<server>__<tool>`. Rules, model-profile lists,
+  skill and sub-agent `tools:`, hook matchers, `rate_limits` and eval
+  expectations written the old way keep working, and an approval parked
+  before the upgrade still settles. Update instructions that name a tool the
+  old way, and **hook scripts that compare the tool name**: compare the new
+  `legacyName` field, or accept both. `mcp__<server>__*` in a model profile's
+  `tools:` now selects that server's tools, where before it selected none.
+- **`mcp_servers` keys must fit in a tool name**: letters, digits, `-` and
+  `_`. A key with any other character fails compile with a suggested rename.
+  A key with `__`, or `_` at either end, still works but warns, since two
+  servers' tool names could collide. An MCP tool whose full name would be
+  longer than providers accept is left out with a warning; the server's other
+  tools still register.
+- **`tool_config` is now applied, so it is now checked.** Two different
+  blocks for one package are an error. A key no listed tool reads is
+  `tool-config-unused` (an error under `--strict`); for a `tool_config.mcp`
+  block, which never did anything, the warning says where its `destructive`
+  and `requireJustification` flags go:
+  `mcp_servers.<server>.tool_flags.per_tool.<tool>`. An allow-list entry that
+  is not an origin, or a key the tool refuses, is reported at compile, with
+  `--emit-as cf-worker` too, where it used to emit a worker that failed to
+  load. Anything else a tool refuses stops the harness at start. A value written
+  `$UPPER_SNAKE` is read from the environment: set the variable, or a spec
+  that meant the text literally stops at start. A credential written
+  `${API_KEY}` or `$api_key` is refused (write `$API_KEY`), and cf-worker
+  refuses every `$VAR`. `tool_config.codeExecution` configures only Python,
+  JavaScript and Shell; give Fetch, WebFetch and ImageGenerate their own
+  blocks.
+- **A tool list longer than every model in the spec can take fails
+  compile.** Azure OpenAI and Groq accept 128 tools per request, and Gemini
+  (on Vertex AI too) 512; `tools: [all-code]` is over 128. Narrow it with
+  smaller `all-<category>` roll-ups or `-tool` exclusions. For an `openai/`
+  model it is a note, since `OPENAI_BASE_URL` may point at a server that
+  takes more, and the run stops at start, before any model call, if the list
+  goes to api.openai.com. When only a fallback, tier or pool model is over
+  its limit, compile notes it and a pool never routes a turn to that model.
+  Neither note fails `--strict`. On 0.7.0 every call of such a spec failed.
+- **`compile --emit-as cf-worker` refuses a builtin the spec's own shape
+  refuses**, with the same message `compile` gives: `sendMessage` on a cli,
+  workflow or graph spec (only the channel shape carries it; the worker
+  compiled it, and every call failed), and the `evm*` tools on a cli spec.
+  Remove them from `tools:`.
+- **`evmSendTransaction` warns `tool-unwired`** (an error under `--strict`):
+  no custody provider that can sign ships in this release, so every call
+  failed. Remove it; `evmSimulate` runs the same transaction without signing.
+- **New warnings that fail `--strict`**:
+  - A permission rule that can never fire (see CLI under Fixed): rewrite it as
+    the warning suggests.
+  - A deny or ask below an allow that always matches first: move it above
+    the allow.
+  - `sub-agent-tool-ungranted`: a sub-agent lists a builtin its parent never
+    registers, so the sub-agent never had it. Add the tool to the parent, or
+    remove it from the sub-agent.
+  - `edge-unsafe-tool`: `compile --emit-as cf-worker` names each builtin the
+    edge leaves out. Remove it, or compile for Bun.
+  - `accepted-but-unwired` for `tools:` and `tool_config:` on onchain and
+    onchain-game, and for `tool_config:` on voice: none of them is wired yet.
+    Remove them. `crewhaus lint` reports these too.
+- **A `tools:` entry named after a JavaScript built-in** (`constructor`,
+  `all-toString`) is refused as unknown. It compiled to a bundle with no tools
+  or a broken import.
+- **`all-state`, `all-memory` and `all-data-stores` no longer grant
+  VectorDelete**, which deletes from a remote store. Grant it with
+  `all-vector` or `tools: [vectorDelete]`; `all-network` does not include it.
+  A `-vectorDelete` exclusion after those roll-ups still compiles.
+- **A time without a UTC offset is refused** by QuietHours, RateLimitGate,
+  EmailCompose, EmailSend, EmailSendPreflight, ApprovalStatus and
+  ApprovalsInbox, whose schemas always asked for one, and in a plugin's
+  `notAfter`. Write `2026-09-17T23:30:00Z` or `2026-09-17T23:30:00+01:00`.
+  CronList reads an offset-less `now` in the `timeZone` you give, UTC by
+  default, and HarnessJobStatus reads an offset-less `since` as UTC.
+- **A bundle that reads a chain needs its RPC variables at start.** A graph,
+  workflow or crew bundle that lists an EVM tool stops at start when a
+  `$VAR` in the `chains` block is unset. Set it where the bundle runs.
+- **Git tools need the harness to own its repository.** Run the harness from
+  the repository's top level, or give it its own repository.
+- **Some edits are for people, not tools.** SpecPatchApply refuses prompts,
+  tool grants, models, human gates, `transaction_policy`, `chains` and
+  `security`, at any depth. EnvFileUpsert and SecretRotate refuse a value a
+  shell or Bun's `.env` loader would expand (`$`, backticks, `;`, `&`). Edit
+  those by hand, or with `crewhaus optimize`.
+- **PackageInstall never removes a package.** An apt install that would
+  remove one is refused with the command to run yourself, and a name apt reads
+  as a pattern is refused.
+- **Plugins.** `plugins install` needs a trust key (`--allow-unsigned` is for
+  development). A signed plugin must carry `entrypointDigest` and be one
+  bundled ES module. A plugin tool named like `server__tool` is left out,
+  because rules written for MCP tools would match it: use single
+  underscores.
+- **`CREWHAUS_SANDBOX=noop` turns code execution off.** Tests that set it to
+  run code in-process should call
+  `registerCodeExecutionConfig({ backend: "noop" })` or pass a sandbox.
+- **Eval harnesses run your spec's allowed tools for real**, with their side
+  effects, and need every `$VAR` your `tool_config` reads.
+
+#### Other behaviour changes
+
+- **A compiled cli bundle whose spec declares `security.justification`
+  writes an audit log** to `.crewhaus/audit` in its working directory, as
+  `crewhaus run` does: every justification verdict, and every outbound call
+  the egress check warned about or blocked, hash chained.
+  `CREWHAUS_SECURITY_AUDIT=0` turns it off. One that cannot create the log (a
+  read-only working directory) says so in one line and runs without it. A
+  bundle whose spec declares no judge is unchanged.
+- **Plan mode honours deny and ask rules.** It decided on the tool's
+  read-only flag alone, so an `alwaysDeny` on a read-only network tool did
+  nothing there. A matching deny or ask now denies; allow rules are still
+  ignored, so plan mode can only get stricter.
+- **Deny and ask rules fire in more places** — on defaults the call leaves
+  out, on directories above a denied one and the folders a tool walks, on
+  every spelling of a destination, on where a program, script or secret file
+  really is, on what a tool copies from, on a command reached through its
+  directory, environment or input, on any command in a Bash line, and on the
+  API a call names. A deny that fired in 0.7.0 still fires. Allows got wider
+  only toward the same place: an allow on a path or URL meets more spellings
+  of what it names (an absolute path, `./`, a symlinked folder, another
+  letter case where the filesystem ignores case, a URL's default port, its
+  scheme or host in another case), an allow naming where a program really is
+  grants a call that reaches it through a symlinked folder, and a scoped Bash
+  allow also matches a line that differs from it only by blanks around it or
+  a trailing comment (`git status # check` under `Bash(git status)`).
+- **A call whose input the tool would reject is refused before any rule or
+  approval.** It could not run anyway. It is not counted as a denial in eval
+  safety violations or deny alerts.
+- **A `CREWHAUS_SANDBOX` value that names no backend blocks code execution**,
+  with a message saying what to set.
+- **Tool calls in one turn run in the order the model wrote them**, with or
+  without `agent.streaming`, so a read after a write sees the write.
+- **A long one-line tool result reaches the model as a preview**, like a
+  multi-line one; the full output is still saved.
+- **Read and Edit refuse files over 64 MiB** (ReadLines reads part of one),
+  and ReadLines keeps to a character budget (`maxChars`); a cut line is
+  reported with its full length.
+- **Code execution** keeps the start and end of long output with a line
+  saying how much was dropped, and reports a cancelled run as cancelled.
+  `tool_config.codeExecution.max_timeout_ms` caps the timeout the model may
+  ask for; unset, it may still ask for up to ten minutes. In a pool candidate,
+  a cap written under `python`, `javascript` or `shell` caps only that tool
+  (`tool-config-partial-cap`); write it under `codeExecution` to cap all
+  three.
+- **ImageGenerate** stops when the turn is cancelled, after three minutes
+  (`timeoutMs`) or past its response cap (`maxResponseBytes`), and refuses a
+  base URL with a query. Its description now says each call is billed.
+- **Git**: a wildcard in a path is no longer expanded; GitLog and GitShow no
+  longer verify signatures; changes inside a submodule's working tree are not
+  reported from the superproject; a binary a repository's textconv rendered
+  as text is reported as binary.
+- **Code-host search**: on GitHub, a `repo:`, `org:` or `user:` qualifier in
+  the query must match the `owner` and `repo` fields (text in quotes is
+  searched as written); on GitLab, SearchIssues with an owner but no repo is
+  refused.
+- **ChecksumVerify** walks dotfiles, links and hidden folders. A call that
+  names neither a directory nor `exclude` leaves the root's `.git` and
+  `node_modules` out and lists them as excluded. A walk that would pass its
+  limit is refused before hashing.
+- **ArchiveExtract** refuses an archive that declares more than `maxBytes`,
+  which defaults to 1 GiB and can be raised to 16 GiB, or holds a FIFO,
+  device or socket.
+- **New limits refuse rather than slow down**: SchemaDiff past 256 levels of
+  nesting, RobotsCheck past a path and query longer than a web server
+  accepts, and Slugify and GlossaryReplace when a replacement would grow the
+  text past its limit or take too many passes over it. Slugify and
+  GlossaryReplace say which limit they hit and never return a cut text.
+  SchemaDiff lists the first changes when there are too many to show, with
+  how many it left out; its verdict and counts still cover every change.
+- **ImportCsv and ImportJson no longer fail on an extremely long number.**
+  It is imported as text, and ImportCsv infers its column as text; in a
+  column that is already `INTEGER`, its row is rejected as not an integer.
+- **Chain and DeFi reads**: EVM reads time out after 30 seconds and refuse
+  oversized answers; DeFi `timeoutMs` bounds the whole call, and
+  PortfolioValuation's default is a 60-second deadline for the call.
+- **Budgets and pools**: FindElement's grounding calls count toward
+  `budget.usd`, and a pool candidate whose model cannot see images is not
+  offered Screenshot.
+- **A knowledge source whose URL carries a credential gets a new document
+  id.** Re-index a persistent vector store to drop the old chunks.
+- **SpecPin and DeployRollback refuse spec names that start with `_`**,
+  which the registry's listing hides.
+- **Typecheck's first run after upgrading is cold**, since its cache moved
+  out of the project.
+- **Discovery tools strip hidden Unicode** (tag characters, stray variation
+  selectors, soft hyphens) from authored fields and say so.
+- **For library users**, many result shapes gain fields (`undetermined`,
+  `outputIncomplete`, `truncatedBy`, `refused`, `determined`,
+  `anchorsUnchecked` and others), `Sandbox.exec` reports `aborted` and byte
+  counts, `@crewhaus/preflight`'s `BundleFreshness.state` gains
+  `"unreadable"`, and a parked approval records the `places` it was granted
+  for.
+
+### Added
+
+- **`@crewhaus/tool-safety`**: shared guards for tool authors, so a tool
+  package does not write its own. `./regex` runs a caller's regex under a
+  deadline and answers matched, not matched or undetermined; `./streams`
+  reads process output, HTTP bodies and files within a byte budget and
+  refuses FIFOs; `./fs` opens, writes, walks and copies without leaving a
+  root or writing through a link; `./env` reads a credential only from a
+  variable the operator allowed and scrubs what comes back. It runs on Bun
+  only; its README's adoption table says which helper replaces what.
+- **`operativeArgs` on a tool definition**: the input field or fields a
+  permission rule is about, and what kind each is — path, URL, command,
+  recipient, id or text. A declaration also says how a value is read: whether
+  it is `within` another field (a repository as `owner/repo`, a path from the
+  tool's `cwd`, with `withinDefault` for the folder a left-out one means),
+  what a left-out value stands for, whether the tool walks what is beneath a
+  path (`beneath`, with `hiddenWhen` for a walk that skips hidden names and
+  `beneathWhen` for one a switch turns on) or opens fixed files there
+  (`opens`), whether a command is a line a shell parses (`shell`, which Bash
+  and Shell declare) or is handed an environment or input (`env`, `stdin`),
+  whether a value is a secret reference (`secretRef`) or where the tool
+  copies from (`source`), the API a call names (`service`, with the tool's
+  new `serviceDefaults` saying where a call that names none goes), whose own
+  copy it acts on (`overlay`), and a field the tool ignores when the call
+  names another (`ignoredWhen`). Every builtin that changes something,
+  reaches outside or walks a directory declares them, and `buildTool` refuses
+  a declaration that names a field the input does not have. An empty list
+  says no argument decides where the tool acts. Tool packages outside this
+  repo can check `TOOL_CONTRACT_VERSION` in `@crewhaus/tool-catalog`.
+- **`ToolRegistry`** (`@crewhaus/tool-capability`): a harness can see the
+  builtin tools it was not given — search by text, narrow by category, or ask
+  for one tool's description, and each row says whether this harness runs it.
+  This is ergonomics, not a control: leaving a tool out of `tools:` is what
+  shapes a harness, and a harness that can write files can already edit its
+  own spec. MCP tools are known only once their server connects, so the
+  answer points at `ListTools` for them.
+- **`@crewhaus/tool-registry-manifest`**: every builtin tool's name,
+  description, flags, categories and operative arguments as data, generated
+  by `scripts/gen-tool-registry.ts` and checked for staleness by a test. It is
+  about 250 KB of description text in a module of about 500 KB, which is why
+  it is its own package and `ToolRegistry` its own tool.
+- **`crewhaus tools show <tool>` says what a permission rule on it
+  checks**: each argument a scoped rule reads, in words (a path read from
+  `cwd`, a repository matched as `owner/repo`, a Chat channel with the
+  origin of the API the call names, what a left-out value stands for, and
+  for Bash and Shell that an allow must match every command in the line),
+  and an example rule to copy into `permissions.rules`, such as
+  `ChatDelete(https://slack.com/C0123/*)`. Every example matches a call the
+  tool runs. It also says that an allow matches a recipient or an id only as
+  the call writes it: `SmsSend(+1555*)` asks on `+1 (555) 010-0000`, which a
+  deny on `+1555*` still stops. `--json` carries the same answer.
+- **`all-vector`**, a category holding VectorDelete alone.
+- **New `tool_config` keys**: the credential and destination lists above;
+  `codeExecution.max_timeout_ms`; `imageGenerate.timeoutMs` and
+  `maxResponseBytes`; `chainread.allowed_origins` and
+  `federationDiscover.allowed_origins`, which can only narrow;
+  `token.metadata_origins`; `token.multicall3` and `chaincall.multicall3`.
+- **New compile warnings.** `tool-config-unused`, `tool-unwired`,
+  `edge-unsafe-tool`, `sub-agent-tool-ungranted`, `tool-config-partial-cap`,
+  `model-plan-tool-config-unreachable` and `permission-rule` fail `--strict`.
+  `provider-tool-cap`, `provider-tool-cap-unverified`,
+  `channel-plugins-at-start`, `model-plan-tool-config-widens`,
+  `model-plan-tool-config-narrowed`, `permission-rule-note` and
+  `mcp-server-name` are informational.
+- **Options**: EvalBaselineCompare `allowDatasetMismatch` and
+  `minSharedFraction`, ArchiveExtract `maxBytes`, and `plugins install
+  --trust-anchor`.
+
+### Known limitations
+
+- **Fetch's POST, PUT and DELETE, and ImageGenerate, still run unasked in
+  auto mode.** Neither tool is marked destructive, so auto mode runs a
+  request that changes a remote service, or an image call that is billed,
+  without asking. A fix is planned for 0.8. Until then, add
+  `{ type: alwaysAsk, pattern: Fetch }` and
+  `{ type: alwaysAsk, pattern: ImageGenerate }` to `permissions.rules`, or
+  leave the tools out of `tools:`.
+- **A URL rule is checked on the URL a call names, not where the tool goes
+  next.** Redirects, and the next pages HttpPaginate follows, are checked
+  against the tool's own allow-list (`allowed_origins`, or WebFetch's
+  `allowed_domains`), not your rules, in every mode, and a rule on part of an
+  origin, such as a path, is not checked on them at all. This covers the
+  HTTP tools, Fetch, WebFetch and HealthProbe. WebFetch has no allow-list
+  until you set one. Keep an origin you deny off the tool's allow-list, list
+  only origins whose redirects you trust, or deny the tool.
+- **A deny on a command is a list, and a list has gaps.** It reads each
+  command a line runs, through wrappers, `eval`, `sh -c`, the line's own
+  variables and its `cd`s, and where each program and script lands. Its gaps:
+  - In a Bash line, a program another program runs from its arguments
+    (`find -exec`, `git -c alias…`, `make`) and a file a program opens from
+    its arguments (`cat link/../x`) are read as written.
+  - A command `xargs` runs gets more arguments from its input than the line
+    shows, so `Bash(rm -rf **)` misses `find build | xargs rm -rf`. Write
+    `Bash(rm*)`.
+  - A deny with a leading `./` (`RunCommand(./secrets/**)`) misses the same
+    program or script written without the `./` (`secrets/run.sh`, or
+    `pub/lnk/run.sh` through a link into `secrets/`) or as an absolute path.
+    Write it without: `RunCommand(secrets/**)` meets each of these.
+  - What a script, or code handed to an interpreter other than a shell
+    (`python3 -c`, `node -e`, or on its input), does once it runs is not
+    read.
+  - A file an interpreter loads through an option written with `=`
+    (`node --require=./x.js`) is read as written.
+  - A word read after a `cd` that cannot be followed from the text
+    (`cd "$X"`, `cd $(…)`, `cd` to a pattern, `cd -`, a `CDPATH`), or one
+    that starts with `~` or `$HOME`, is read as written, and a headless grant
+    for it is not bound to where it lands.
+  - A deny written across more than one command's words
+    (`Bash(true && secrets/**)`, `Bash(A=1 secrets/**)`,
+    `RunCommand(sh -c sh secrets/**)`) is matched on the text as written.
+    Write it on one command: `Bash(secrets/**)`.
+
+  For Bash, allow what may run rather than deny what may not.
+- **A command allow reads a program's arguments as written.**
+  `alwaysAllow RunCommand(cat src/**)` also grants `cat src/../.env`, since
+  `**` matches `..`, and `cat src/lnk/x` through a linked folder; a Bash
+  allow does the same. On RunCommand and the other tools that take an argv,
+  a deny reads where each argument lands, so deny what must stay out
+  (`alwaysDeny RunCommand(**/.env)`).
+- **Tools that open one file named in the call are matched on the call's
+  text.** ReadLines, PdfText, TailFile and the other single-file readers
+  declare no place, so a deny on `secrets/**` does not follow a link into it
+  (`ReadLines pub/lnk/token`). Deny the tool, or keep links into a denied
+  folder out of the workspace.
+- **A tool that reads every file in a folder follows a file in it that links
+  elsewhere in the workspace**, and a deny on the link's target does not stop
+  it: the session-log readers (EventQuery and the other observability
+  readers, TraceQuery, SessionSummarize, CostSummarize, DatasetMine,
+  SpecAdvise, EvalCoverage), DocsSymbolCheck, ChecksumVerify,
+  MigrationStatus and CiWorkflowAudit, including its default
+  `.github/workflows`. Keep such links out of the folders they read, or deny
+  the tool.
+- **A deny on a hidden file also stops the session-log readers.** EventQuery
+  and the other tools that read a folder of records whole are read as
+  everything in it, though they open only their own record files. Before you
+  upgrade lists the calls this stops and how to keep such a rule on file
+  readers.
+- **A deny naming a project or harness file does not stop the tools that
+  read it by name.** DependencyList, DependencyOutdated, DependencyAudit,
+  PackageScripts, LicenseAggregate, PackagePublishPreflight and
+  RegistryOutdated read manifests and lockfiles, and the fleet tools read a
+  harness's spec and bundle. Deny the tool.
+- **IndexSearch reopens the files an index recorded**, so after adding a
+  deny, rebuild any index built before it. **MarkdownLinkCheck** still
+  reports whether a link target exists anywhere in the workspace, a denied
+  one included.
+- **A container image is matched as the call writes it.**
+  ContainerImageInspect and ContainerImageTags read `alpine` as Docker Hub's
+  `docker.io/library/alpine`, but a deny on one of those spellings does not
+  stop the other. Deny each spelling, or the tool.
+- **A rule on an address does not meet a name that resolves to it.** Rules
+  are checked before anything is looked up, so
+  `alwaysDeny WaitForPort(10.0.0.5)` does not stop a probe of a listed `db`
+  that resolves there. Deny the name too, or the tool. `localhost` is the
+  exception: a deny on 127.0.0.1 or ::1 covers it.
+- **Git tools that take no path (GitStatus, GitStashPop, GitCherryPick …)
+  are matched on their repository.** Taking only a `cwd`, they change or
+  report files no path rule reads. Deny the tool to keep it off.
+- **A notify rule names who receives the message**, not the SMTP relay, the
+  SMS or push provider, or the Chat bot token it goes through; `tool_config`
+  bounds each of those. A post through a webhook variable (ChatPost's
+  `webhookUrlEnv`, WebhookPost's `urlEnv`) is read by that variable, never
+  by the URL it holds: deny the variable.
+- **Some of the runtime's own bookkeeping in `.crewhaus/` is not yet
+  link-contained**: the Hangar and supervisor ledgers, research fetch and
+  citation logs, the feedback queue, the experiment ledger, and the files
+  `hoist-models` and `memory migrate` rewrite.
+- **Plugins are not sandboxed**, and `plugins install` delivers the manifest
+  only: you put the plugin's `index.js` in place yourself. Delivering plugin
+  code is planned for 0.8.
+
+### Corrections to the 0.7.0 notes
+
+Some statements in the 0.7.0 entry were wrong:
+
+- "It can now call 549" held for the cli shape only, because no target
+  emitter changed. From 0.7.1 every shape that runs tools can call them, with
+  the exceptions under Fixed, and `export claude-plugin` carries none.
+- "Every other one is local work": the rest make no model call, but many
+  reach a service you configure — a chain node, GitHub, a chat or SMS
+  provider. `crewhaus tools show` marks each one `io:network`.
+- `tool-table` is not pure computation: it reads CSV and JSON files from the
+  workspace, and `all-compute` does not include it.
+- The release added fifty-six tool packages plus `@crewhaus/tool-categories`,
+  and the grouped list left out `tool-http` (HTTP requests, downloads and
+  probes).
+- Not every chain package refuses `eth_sendTransaction` at an RPC seam: the
+  four that talk to a node refuse it through a read-only allow-list, and
+  `tool-onchain` never talks to one.
+- A category leaf usually maps to one package, not always: `all-http` is
+  `tool-http` and `tool-fetch`, and `all-media` is `tool-media`, `tool-image`
+  and `tool-image-generation`.
 
 ## [0.7.0] - 2026-09-22
+
+> **Correction, 0.7.1:** a few statements below were wrong. The tool count
+> held for the cli shape only, many of the tools reach the network, `tool-table`
+> reads files, and the package count and chain-seam details were off. See
+> "Corrections to the 0.7.0 notes" in the 0.7.1 entry.
 
 **Tools a harness can run without spending a token.** A CrewHaus harness could
 call 22 builtin tools; it can now call 549. They read chains and ledgers, drive

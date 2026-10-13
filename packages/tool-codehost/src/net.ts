@@ -38,9 +38,16 @@
  * A token a model can put in a tool argument is a token in the transcript,
  * the trace and the eval report.
  */
-import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  createSecretRedactor,
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** Refusal by the allow-list, the SSRF gate, a redirect rule or a credential rule. */
 export class CodehostPermissionError extends CrewhausError {
@@ -84,9 +91,24 @@ export type CodehostConfig = {
   readonly baseUrl?: string;
   /** NAME of the environment variable holding the token, never the token. */
   readonly tokenEnv?: string;
+  /**
+   * Further variables a call may name as `tokenEnv`, each with the origins
+   * its token may be sent to (null: any allowed origin). A call can choose
+   * among these and `tokenEnv`; it can never add one.
+   */
+  readonly tokenEnvs: ReadonlyMap<string, ReadonlySet<string> | null>;
   /** Default host kind for calls that do not name one. */
   readonly host?: HostKind;
 };
+
+/**
+ * `token_envs`: a list of variable names, whose tokens may go to any
+ * allowed origin, or a map from a name to the origins its token may go to.
+ */
+export type TokenEnvsInput = readonly string[] | Readonly<Record<string, readonly string[]>>;
+
+/** Where an operator lists the variables a call may name. Every refusal names it. */
+export const TOKEN_ENVS_KEY = "tool_config.codehost.token_envs";
 
 export type CodehostConfigInput = {
   readonly allowed_origins?: readonly string[];
@@ -95,10 +117,12 @@ export type CodehostConfigInput = {
   readonly baseUrl?: string;
   readonly token_env?: string;
   readonly tokenEnv?: string;
+  readonly token_envs?: TokenEnvsInput;
+  readonly tokenEnvs?: TokenEnvsInput;
   readonly host?: string;
 };
 
-const EMPTY_CONFIG: CodehostConfig = { allowedOrigins: new Set<string>() };
+const EMPTY_CONFIG: CodehostConfig = { allowedOrigins: new Set<string>(), tokenEnvs: new Map() };
 
 let codehostConfig: CodehostConfig = EMPTY_CONFIG;
 
@@ -110,12 +134,66 @@ export function buildCodehostConfig(input: CodehostConfigInput): CodehostConfig 
   const baseUrl = input.baseUrl ?? input.base_url;
   const tokenEnv = input.tokenEnv ?? input.token_env;
   const host = input.host === "github" || input.host === "gitlab" ? input.host : undefined;
+  const tokenEnvs = buildTokenEnvs(input.tokenEnvs ?? input.token_envs, origins);
   return {
     allowedOrigins: origins,
+    tokenEnvs,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
     ...(tokenEnv !== undefined ? { tokenEnv } : {}),
     ...(host !== undefined ? { host } : {}),
   };
+}
+
+/**
+ * Check `token_envs` at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts. An entry is never
+ * quoted: an operator who pasted a token here, or wrote `$GITHUB_TOKEN`
+ * (which the bundle resolves to the token itself), would otherwise see it
+ * printed.
+ */
+function buildTokenEnvs(
+  raw: unknown,
+  origins: ReadonlySet<string>,
+): ReadonlyMap<string, ReadonlySet<string> | null> {
+  const out = new Map<string, ReadonlySet<string> | null>();
+  if (raw === undefined || raw === null) return out;
+  const checkName = (name: unknown, where: string): string => {
+    if (!isEnvName(name) || looksLikePastedSecret(name) || looksLikeAToken(name)) {
+      throw new CodehostPermissionError(
+        `${TOKEN_ENVS_KEY} lists environment variable NAMES (such as GITHUB_TOKEN, written without a $); ${where} is not one, and has not been echoed back`,
+      );
+    }
+    return name;
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach((name, index) => out.set(checkName(name, `entry ${index + 1}`), null));
+    return out;
+  }
+  if (typeof raw !== "object") {
+    throw new CodehostPermissionError(
+      `${TOKEN_ENVS_KEY} must be a list of variable names, or a map from a variable name to the origins its token may be sent to`,
+    );
+  }
+  Object.entries(raw as Record<string, unknown>).forEach(([key, bound], index) => {
+    const name = checkName(key, `key ${index + 1}`);
+    if (!Array.isArray(bound) || bound.length === 0) {
+      throw new CodehostPermissionError(
+        `${TOKEN_ENVS_KEY}.${name} must list the origins its token may be sent to`,
+      );
+    }
+    const set = new Set<string>();
+    for (const origin of bound) {
+      const canonical = canonicalizeOrigin(String(origin));
+      if (!origins.has(canonical)) {
+        throw new CodehostPermissionError(
+          `${TOKEN_ENVS_KEY}.${name} lists ${canonical}, which is not in allowed_origins`,
+        );
+      }
+      set.add(canonical);
+    }
+    out.set(name, set);
+  });
+  return out;
 }
 
 /** Replace the process-global config. Codegen calls this at boot. */
@@ -582,11 +660,32 @@ export function expandIpv6(raw: string): number[] | null {
 // deadlines
 // ---------------------------------------------------------------------------
 
+/**
+ * The reason a deadline's own timer aborts its signal with. An error is
+ * traced to the deadline by this reason, never by the clock: a transport
+ * failure that merely ARRIVES after the deadline's time (a starved event
+ * loop delivers it before the timer callback runs) is that failure, and a
+ * runtime cancel aborts with the runtime's reason instead.
+ */
+export class DeadlineElapsedError extends Error {
+  override readonly name = "TimeoutError";
+}
+
 export type Deadline = {
   readonly signal: AbortSignal;
   /** Milliseconds left; never negative. */
   remaining(): number;
+  /**
+   * The clock says the time is up. For scheduling (stop starting new work),
+   * never for saying why something failed — that is {@link timedOut}.
+   */
   expired(): boolean;
+  /**
+   * The deadline's timer — or an outer deadline's, forwarded — really
+   * aborted the signal. False for a runtime cancel, and false while the
+   * timer has not run, however late the clock says it is.
+   */
+  timedOut(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -600,7 +699,10 @@ export type Deadline = {
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
   const startedAt = Date.now();
-  const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(
+    () => ctrl.abort(new DeadlineElapsedError(`deadline of ${ms}ms elapsed`)),
+    ms,
+  );
   const onOuter = () => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) ctrl.abort(outer.reason);
@@ -610,6 +712,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
     signal: ctrl.signal,
     remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
     expired: () => Date.now() - startedAt >= ms,
+    timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
@@ -717,6 +820,76 @@ export function resolveToken(
 }
 
 /**
+ * The token ONE call sends, and only to where it may go.
+ *
+ * The variable is `tokenEnv` from the call, else `token_env` from the
+ * codehost tool_config. A call may only name `token_env` itself or a
+ * variable listed in `token_envs`; anything else is refused before the
+ * environment is read, so a call cannot send another process secret (a
+ * provider key, a deploy token) as a bearer token, nor learn whether one is
+ * set (flag-truth-5#11, security-10#8).
+ *
+ * The token is also held to the origins it was configured for, checked
+ * against the origin of the API root this call will use: a `token_envs` map
+ * entry names them, and `token_env` belongs to `base_url`'s origin, or,
+ * when the operator set none, to the default API of the config's `host`
+ * (https://api.github.com unless `host: gitlab`). So a call cannot point
+ * the operator's token at another allowed host by passing its own
+ * `baseUrl` or `host`: the first 0.7.1 cut bound it only when `base_url`
+ * was set, and in the common configuration (token_env alone) a call's
+ * baseUrl sent the GitHub token to any allowed origin (net review, C155).
+ */
+export function resolveCallToken(
+  inputName: string | undefined,
+  cfg: CodehostConfig,
+  baseOrigin: string,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedToken {
+  const name = inputName ?? cfg.tokenEnv;
+  // The pasted-token and no-name refusals first: they must never quote.
+  if (name === undefined || name === "" || !ENV_NAME.test(name) || looksLikeAToken(name)) {
+    return resolveToken(name, env);
+  }
+  const allowed = [...(cfg.tokenEnv !== undefined ? [cfg.tokenEnv] : []), ...cfg.tokenEnvs.keys()];
+  const resolved = resolveCredentialEnv(name, {
+    allowed,
+    purpose: "tokenEnv",
+    configKey: TOKEN_ENVS_KEY,
+    env,
+  });
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      message:
+        resolved.code === "not-allowed"
+          ? `${resolved.reason} (the codehost tool_config's token_env is allowed too)`
+          : resolved.reason,
+    };
+  }
+  const bound = cfg.tokenEnvs.has(name)
+    ? (cfg.tokenEnvs.get(name) ?? null)
+    : name === cfg.tokenEnv
+      ? new Set([originOfBase(cfg.baseUrl ?? DEFAULT_BASE_URL[cfg.host ?? "github"])])
+      : null;
+  if (bound !== null && !bound.has(baseOrigin)) {
+    return {
+      ok: false,
+      message: `the token in "${name}" may be sent only to ${[...bound].sort().join(", ")} (token_env belongs to the codehost tool_config's base_url, or when it has none to its host's default API; a ${TOKEN_ENVS_KEY} map entry names the origins for its variable), and this call's baseUrl is ${baseOrigin} — nothing was sent`,
+    };
+  }
+  return { ok: true, token: resolved.value };
+}
+
+/** The canonical origin of an API root, or its text when it is not a URL. */
+export function originOfBase(baseUrl: string): string {
+  try {
+    return canonicalizeOrigin(baseUrl);
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
  * A function that scrubs a secret out of anything on its way back to the
  * caller.
  *
@@ -728,26 +901,20 @@ export function resolveToken(
  * each put the token in a transcript, and that is not a mistake worth leaving
  * one layer deep.
  *
+ * It is tool-safety's redactor, so it also catches the JSON-escaped and
+ * base64url spellings, and the start of the token that a cut left at a
+ * string's end.
+ *
  * Secrets shorter than six characters are left alone: replacing every "x" in
  * a result would mangle it without protecting anything real, and no usable
  * host token is that short.
  */
 export function redactorFor(secret: string | undefined): (text: string) => string {
-  if (secret === undefined || secret.length < 6) return (text) => text;
-  const encodedForms = new Set<string>([secret, encodeURIComponent(secret)]);
-  try {
-    encodedForms.add(Buffer.from(secret, "utf8").toString("base64"));
-  } catch {
-    // not encodable — the literal form is still covered
-  }
-  return (text: string): string => {
-    let out = text;
-    for (const form of [...encodedForms].sort((a, b) => b.length - a.length)) {
-      if (form.length < 6) continue;
-      out = out.split(form).join("<redacted>");
-    }
-    return out;
-  };
+  // tool-safety's redactor: every spelling of the token, and the part of
+  // one a cut left at a string's end. A cut this package makes itself is
+  // trimmed where it is made (readCapped), as tool-http's is (net attacker
+  // review).
+  return createSecretRedactor([secret]);
 }
 
 /** The auth header for a host, ready to merge into a request. */
@@ -765,12 +932,17 @@ export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
 /**
  * Dial the vetted IP while keeping the real hostname for the `Host` header
  * and TLS SNI, so virtual hosting and certificate validation still work.
+ *
+ * Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`).
+ * Without it Bun inflates a gzip, deflate, br or zstd body in native code
+ * before any reader sees a byte, and the byte cap bounded only what was
+ * returned (security-5#7). {@link readCapped} decodes it, under the cap.
  */
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (unbracketed === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  if (unbracketed === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -789,7 +961,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     init.duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -805,6 +977,13 @@ export type OpenOptions = {
   readonly signal: AbortSignal;
   readonly cfg: CodehostConfig;
   readonly maxRedirects?: number;
+  /**
+   * The canonical origin the call's token is for. When given, a request to
+   * any other origin carries no credential header, at every hop — so a
+   * `rel="next"` page URL that names another allowed origin is fetched
+   * without the token, as a redirect there already is.
+   */
+  readonly credentialOrigin?: string | undefined;
 };
 
 export type OpenResult = {
@@ -815,6 +994,21 @@ export type OpenResult = {
   /** True when a cross-origin hop dropped the token. */
   readonly credentialsDropped: boolean;
 };
+
+/**
+ * Whether a redirect turns the request into a GET without its body, as the
+ * Fetch Standard says (HTTP-redirect fetch) and browsers, curl and Bun's own
+ * fetch do: a 303 turns any method but GET and HEAD into a GET, and a 301 or
+ * 302 turns only a POST into one. A PUT, PATCH or DELETE keeps its method
+ * and body there, as on a 307 or 308, so it is made where the server moved
+ * it instead of becoming a read whose 200 reports an update or a delete
+ * that never happened. A POST is still never replayed on a 301/302/303.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
 
 /**
  * Issue a request, following redirects by hand so the allow-list, the SSRF
@@ -829,6 +1023,12 @@ export type OpenResult = {
 export async function openRequest(o: OpenOptions): Promise<OpenResult> {
   const limit = o.maxRedirects ?? MAX_REDIRECTS;
   const headers: Record<string, string> = { ...o.headers };
+  // Ask for the body as it is. The reader decodes gzip, deflate, br and zstd
+  // under the cap anyway, so a server that compresses regardless still
+  // works; a caller that set its own Accept-Encoding keeps it.
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "accept-encoding")) {
+    headers["accept-encoding"] = "identity";
+  }
   const redirects: string[] = [];
   let credentialsDropped = false;
   let current = o.url;
@@ -844,6 +1044,14 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
+    if (o.credentialOrigin !== undefined && currentOrigin !== o.credentialOrigin) {
+      for (const name of Object.keys(headers)) {
+        if (CREDENTIAL_HEADERS.has(name.toLowerCase())) {
+          delete headers[name];
+          credentialsDropped = true;
+        }
+      }
+    }
     // The call's own signal bounds the lookup; DNS_TIMEOUT_MS is the backstop
     // for a caller that opened no deadline at all.
     const pinnedIp = await assertNotSsrf(current.hostname, o.signal);
@@ -885,15 +1093,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
         }
       }
     }
-    // RFC 9110 §15.4.3/§15.4.4: a 303 always becomes a GET, and 301/302 after
-    // a non-GET has meant GET in every deployed client for decades. Replaying
-    // a POST body at a hop the caller never asked for would create the same
-    // issue or comment twice.
-    if (
-      (res.status === 303 || res.status === 301 || res.status === 302) &&
-      method !== "GET" &&
-      method !== "HEAD"
-    ) {
+    // See becomesGet: 303 always, 301/302 only after a POST.
+    if (becomesGet(res.status, method)) {
       method = "GET";
       body = undefined;
       for (const name of Object.keys(headers)) {
@@ -932,52 +1133,52 @@ export type CappedBody = {
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the cap
- * is passed. The cap bounds MEMORY, not just what is returned: chunks past it
- * are never retained and the reader is cancelled rather than drained.
+ * Drain a body with a hard cap on its DECODED size: the body arrives raw
+ * (see `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in
+ * small steps, and the decoder stops once `maxBytes` exist, so neither a
+ * hostile server nor a merely enormous compressed reply can pin memory. A
+ * body that cannot be decoded within the bound is refused without quoting
+ * it; an aborted read throws an `AbortError`, which `describeFailure`
+ * reports as the deadline or the abort.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  if (res.body === null) return { text: "", bytes: 0, truncated: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        chunks.push(value.subarray(0, maxBytes - total));
-        total = maxBytes;
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+  secrets: readonly (string | undefined)[] = [],
+): Promise<CappedBody> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) {
+    return {
+      // A cut can fall inside a token the server echoed; what it leaves is a
+      // prefix no whole spelling matches, so it is trimmed here.
+      text: read.truncated ? trimSecretTail(read.text, secrets) : read.text,
+      bytes: read.bytes.byteLength,
+      truncated: read.truncated,
+    };
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+  switch (read.code) {
+    case "aborted":
+    case "stalled": {
+      const aborted = new Error("the read was aborted before the body ended");
+      aborted.name = "AbortError";
+      throw aborted;
+    }
+    case "unsupported-encoding":
+      throw new CodehostPermissionError(
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new CodehostPermissionError(
+        "the body is labelled as compressed but could not be decoded, so it was not read",
+      );
+    default:
+      throw new CodehostPermissionError("the body could not be read to the end");
   }
-  return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged),
-    bytes: total,
-    truncated,
-  };
 }
 
 /**
@@ -987,10 +1188,28 @@ export async function readCapped(res: Response, maxBytes: number): Promise<Cappe
  */
 export function describeFailure(err: unknown, deadline?: Deadline): string {
   if (err instanceof CodehostPermissionError) return err.message;
-  if (deadline?.expired() === true) return "deadline elapsed before the request completed";
+  // The cause decides, not the clock: see DeadlineElapsedError.
+  if (isDeadlineAbort(err, deadline)) return "deadline elapsed before the request completed";
+  const aborted = "the request was aborted before it completed";
+  if (deadline?.signal.aborted === true && err === deadline.signal.reason) return aborted;
   if (err instanceof Error) {
-    if (err.name === "AbortError") return "the request was aborted before it completed";
-    return `${err.name}: ${err.message}`;
+    if (err.name === "AbortError") return aborted;
+    // A real failure that arrived late is still that failure; the clock is
+    // mentioned, because the caller may want a longer deadline as well.
+    const late = deadline?.expired() === true ? " (the deadline had also elapsed)" : "";
+    return `${err.name}: ${err.message}${late}`;
   }
   return String(err);
+}
+
+/**
+ * Whether `err` is what the deadline's own timer did: its abort reason, or an
+ * abort-shaped error (a body reader's AbortError) raised after that timer
+ * fired. Exported for the few callers that report a deadline themselves.
+ */
+export function isDeadlineAbort(err: unknown, deadline?: Deadline): boolean {
+  if (err instanceof DeadlineElapsedError) return true;
+  if (deadline?.timedOut() !== true) return false;
+  if (err === deadline.signal.reason) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 }

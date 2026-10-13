@@ -99,6 +99,7 @@ import { parseEnvText } from "./env-file";
 import type { M3Context, M3Handler } from "./m3";
 import { maskText } from "./mask";
 import { resolveInside } from "./safety";
+import { hasIndentedKey, keyedScalar } from "./spec-lines";
 
 // ---------------------------------------------------------------------------
 // transport constants
@@ -189,13 +190,14 @@ function indentOf(line: string): number {
   return n;
 }
 
-/** `key: value` inside an already-extracted block, or undefined. */
+/** `key: value` inside an already-extracted block, or undefined. Read by a
+ *  scan (spec-lines.ts), not `^\s*key\s*:\s*(.*)$`, which was quadratic in a
+ *  run of spaces on a line holding a U+2028. */
 function scalarIn(block: readonly string[], key: string): string | undefined {
-  const re = new RegExp(`^\\s*${key}\\s*:\\s*(.*)$`);
   for (const line of block) {
-    const m = line.match(re);
-    if (m === null) continue;
-    const value = cleanScalar(m[1] ?? "");
+    const raw = keyedScalar(line, key);
+    if (raw === undefined) continue;
+    const value = cleanScalar(raw);
     if (value === "" || value.startsWith("#")) continue;
     return value;
   }
@@ -841,6 +843,17 @@ function maskArticle(article: unknown): unknown {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether a spec's text declares a local wiki: `memory:` at the start of a
+ * line and an indented `wiki:` somewhere. The second is a scan
+ * (spec-lines.ts) that answers `/^\s+wiki\s*:/m`, which read every blank line
+ * after each line start in a run of them, and model-written instructions can
+ * hold such a run.
+ */
+export function declaresLocalWiki(specText: string): boolean {
+  return /^memory:/m.test(specText) && hasIndentedKey(specText, "wiki");
+}
+
+/**
  * `GET /api/h/:id/thredz` — the harness's Thredz status.
  *
  * Key PRESENCE (never the key), the resolved workspace, the permission tier
@@ -855,7 +868,7 @@ function maskArticle(article: unknown): unknown {
 export const thredzStatus: M3Handler = async (ctx) => {
   const r = resolveHarnessSession(ctx);
   const specText = readContained(ctx, ["crewhaus.yaml"]) ?? "";
-  const localWikiDeclared = /^memory:/m.test(specText) && /^\s+wiki\s*:/m.test(specText);
+  const localWikiDeclared = declaresLocalWiki(specText);
   const base: Extra = {
     spec: {
       declared: r.config.declared,

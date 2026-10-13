@@ -34,16 +34,24 @@ for (const tool of bundle.all) defaultCatalog.register(tool);
 | `wiki_stats` | readOnly | Corpus health |
 | `log_knowledge_gap` | destructive (sideEffect audit-and-allow, **no** justification) | Record what the expert could not answer |
 
-All tools are `scope: "internal"` — local files, no network.
+The tools read and write local files and are `scope: "internal"`, with one
+exception: when `memory.wiki.embedder` names a provider outside the process
+(anything but `mock/…`), `wiki_recall`, `wiki_semantic_search` and
+`wiki_related` send the query and article text to it, so they are built
+`scope: "external"` with `ioCapability: "network"` (still `readOnly`). The
+egress classifier then sees the query, and `compile --strict` counts them.
 
 ## Pillar 3 — the `memory` TrustOrigin
 
-Article bodies returned by the read tools are classified via
-`boundary-classifier` at the new **`"memory"` origin** (default policy:
-block tier, like `"skill"`) before reaching the model — an article written
-in an earlier session may have absorbed attacker text, and recall re-injects
-it across a session boundary. Malicious verdicts return the redaction notice
-instead of the body; non-blocked bodies are `tagContent`-ed into
+Everything the read tools render from an article (body, title, tags and
+the sources line) is classified via `boundary-classifier` at the
+**`"memory"` origin** (default policy: block tier, like `"skill"`) before
+reaching the model: an article written in an earlier session may have
+absorbed attacker text, and recall re-injects it across a session boundary.
+The unit is one article (`wiki_get`, `wiki_recall`) or one row (`wiki_search`,
+`wiki_semantic_search`, `wiki_list`, `wiki_related`). A malicious verdict
+replaces that article or row with its slug, version and the redaction notice,
+and the rest render normally; non-blocked units are `tagContent`-ed into
 `RunContext.dataLineage` under `"memory"` (the skills-registry two-site
 pattern) so the egress fabric can attribute a later exfiltration to the
 memory boundary.

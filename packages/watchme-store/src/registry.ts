@@ -8,9 +8,16 @@
  * deleted, volume unmounted) is dropped from the RETURNED list and reported
  * via `onWarn` — the file itself is only rewritten by `register`/`deregister`,
  * so a read never races a concurrent writer.
+ *
+ * 0.7.1: the file is replaced with @crewhaus/tool-safety's `writeFileSafe` (a
+ * random O_EXCL|O_NOFOLLOW temp, never the fixed `harnesses.json.tmp`) and read
+ * without following a link at its name. The default root is under the home
+ * directory, but `--root` and CREWHAUS_WATCHME_ROOT can put it in a workspace,
+ * where a model could plant a link; one at the file is refused, naming it.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { openForReadFd, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import type { HarnessEntry } from "./types.js";
 
 export type HarnessRegistry = {
@@ -52,10 +59,27 @@ export function openHarnessRegistry(
   const now = opts.now ?? Date.now;
   const onWarn = opts.onWarn ?? ((message: string) => console.error(message));
 
-  const readAll = (): HarnessEntry[] => {
-    if (!existsSync(path)) return [];
+  const readText = (): string | undefined => {
+    if (!existsSync(globalRoot)) return undefined;
+    const opened = openForReadFd(globalRoot, REGISTRY_FILENAME, { followLeafSymlink: false });
+    if (!opened.ok) {
+      if (opened.code === "not-found") return undefined;
+      throw new Error(
+        `watchme-store: refusing to read ${path}: ${opened.reason} (code ${opened.code})`,
+      );
+    }
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+      return readFileSync(opened.fd, "utf8");
+    } finally {
+      closeSync(opened.fd);
+    }
+  };
+
+  const readAll = (): HarnessEntry[] => {
+    const text = readText();
+    if (text === undefined) return [];
+    try {
+      const parsed = JSON.parse(text) as unknown;
       if (typeof parsed === "object" && parsed !== null) {
         const harnesses = (parsed as Record<string, unknown>)["harnesses"];
         if (Array.isArray(harnesses)) return harnesses.filter(isEntry);
@@ -69,11 +93,17 @@ export function openHarnessRegistry(
   const writeAll = (entries: HarnessEntry[]): void => {
     if (!existsSync(globalRoot)) mkdirSync(globalRoot, { recursive: true, mode: 0o700 });
     const sorted = [...entries].sort((a, b) => a.dir.localeCompare(b.dir));
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify({ v: 1, harnesses: sorted }, null, 2)}\n`, {
-      mode: 0o600,
-    });
-    renameSync(tmp, path);
+    const written = writeFileSafe(
+      globalRoot,
+      REGISTRY_FILENAME,
+      `${JSON.stringify({ v: 1, harnesses: sorted }, null, 2)}\n`,
+      { overwrite: true, mode: 0o600 },
+    );
+    if (!written.ok) {
+      throw new Error(
+        `watchme-store: refusing to write ${path}: ${written.reason} (code ${written.code})`,
+      );
+    }
   };
 
   return {

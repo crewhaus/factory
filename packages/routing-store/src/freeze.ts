@@ -23,9 +23,10 @@
  * removes the whole `routing/` state. Like the arms file it is local,
  * single-writer and tenant-fenced; Hangar never writes it.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { Scoreboard } from "./scoreboard.js";
+import { writeStoreFile } from "./store-io.js";
 
 /** The on-disk shape (version 1). */
 export type RouteFreeze = {
@@ -100,9 +101,6 @@ export function writeRouteFreeze(rootDir: string, opts: WriteRouteFreezeOptions)
   if (policyVersion.length === 0) {
     throw new Error("route freeze: a policyVersion is required");
   }
-  const path = routeFreezePath(rootDir);
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   const record: RouteFreeze = {
     version: 1,
     policyVersion,
@@ -110,9 +108,12 @@ export function writeRouteFreeze(rootDir: string, opts: WriteRouteFreezeOptions)
     ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
   };
   // Write-then-rename: a concurrent boot reads the old marker or the new one.
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
+  // The temp is random and never followed through a planted link (0.7.1).
+  writeStoreFile(
+    rootDir,
+    join("routing", ROUTE_FREEZE_FILE),
+    `${JSON.stringify(record, null, 2)}\n`,
+  );
   return record;
 }
 

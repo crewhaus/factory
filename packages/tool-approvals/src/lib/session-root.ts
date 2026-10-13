@@ -31,8 +31,17 @@
  * here is evidence and a miss is not proof. That is why it only ever fires on
  * an ABSENT ledger, where the alternative answer is a zero nobody should trust.
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import {
+  constants,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import * as path from "node:path";
+import { isInside, workspaceRoot } from "../paths";
 
 /** The variable the runtime and the hangar both read to relocate a session
  *  root. Named, never resolved, by this package. */
@@ -65,25 +74,43 @@ export function declaresSessionDir(text: string): boolean {
   return false;
 }
 
-/** Read at most {@link MAX_ENV_BYTES} of a file, or `undefined` for anything
- *  that is not a readable regular file. Failures are silent BY DESIGN: this is
- *  a corroborating probe, and the caller's answer is already "unknown". */
-function readCapped(file: string): string | undefined {
-  let size: number;
+/** Never through a link at the leaf (one was resolved and checked already),
+ *  never blocking on a FIFO; both 0 on Windows. */
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/**
+ * Read at most {@link MAX_ENV_BYTES} of an env file.
+ *
+ * `undefined` for anything that is not a readable regular file — failures are
+ * silent BY DESIGN: this is a corroborating probe, and the caller's answer is
+ * already "unknown". The harness directory was checked against the workspace
+ * by the caller; the file in it may be a link. One that leads OUTSIDE the
+ * workspace (`.env -> /elsewhere/.env`) is not read, because even the one bit
+ * this probe reports about it is a read of a file the caller never named
+ * (security-2#2), and `"outside"` says so, because "not read" is not "does not
+ * relocate the session root". A link that stays inside is followed: a shared
+ * `.env` linked into each harness is common.
+ */
+function readCapped(file: string, rootReal: string | undefined): string | "outside" | undefined {
+  let real = file;
   try {
-    const stat = statSync(file);
-    if (!stat.isFile()) return undefined;
-    size = stat.size;
+    if (lstatSync(file).isSymbolicLink()) {
+      real = realpathSync(file);
+      if (rootReal === undefined || !isInside(rootReal, real)) return "outside";
+    }
   } catch {
-    return undefined;
+    return undefined; // not there, or a link to nothing
   }
   let fd: number;
   try {
-    fd = openSync(file, "r");
+    fd = openSync(real, OPEN_FLAGS);
   } catch {
     return undefined;
   }
   try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return undefined;
+    const size = stat.size;
     const take = Math.min(size, MAX_ENV_BYTES);
     const buf = Buffer.alloc(take);
     const read = readSync(fd, buf, 0, take, 0);
@@ -106,13 +133,23 @@ function readCapped(file: string): string | undefined {
 export function sessionRootRelocation(
   harnessDirReal: string,
   env: Readonly<Record<string, string | undefined>> = process.env,
+  root: string = workspaceRoot(),
 ): string | undefined {
   const fromEnv = env[SESSION_DIR_ENV];
   if (typeof fromEnv === "string" && fromEnv.trim() !== "") {
     return `${SESSION_DIR_ENV} is set in this process's environment, which moves the session root (and the approvals ledger with it) away from the path read above`;
   }
+  let rootReal: string | undefined;
+  try {
+    rootReal = realpathSync(root);
+  } catch {
+    rootReal = undefined;
+  }
   for (const name of ENV_CHAIN_FILES) {
-    const text = readCapped(path.join(harnessDirReal, name));
+    const text = readCapped(path.join(harnessDirReal, name), rootReal);
+    if (text === "outside") {
+      return `the harness's ${name} is a link to a file outside the workspace, which is not read here, so whether it assigns ${SESSION_DIR_ENV} (and moves the session root and the approvals ledger with it) is unknown`;
+    }
     if (text !== undefined && declaresSessionDir(text)) {
       return `the harness's ${name} assigns ${SESSION_DIR_ENV}, which moves the session root (and the approvals ledger with it) away from the path read above`;
     }

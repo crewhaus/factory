@@ -293,6 +293,27 @@ describe("the endpoint guard", () => {
   test("the refusal is an RpcEndpointError, so a caller can tell it from a chain answer", async () => {
     await expect(vetEndpoint("not-a-url")).rejects.toBeInstanceOf(RpcEndpointError);
   });
+
+  test("a URL that does not parse is refused without repeating any of it (C157)", async () => {
+    // 0.7.0 quoted the whole string, and the likeliest typo — a keyed URL
+    // missing its scheme — put the key in the refusal.
+    const cases: Array<[string, RegExp]> = [
+      ["https://h.example:443443/v2/SECRETPATHKEY", /check the host and the port/],
+      ["h.example/v3/SECRETPATHKEY", /must start with https:\/\//],
+      ["https://exa mple.com/v2/SECRETPATHKEY?k=SECRETQ", /check the host and the port/],
+    ];
+    for (const [raw, hint] of cases) {
+      const err = await vetEndpoint(raw).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(RpcEndpointError);
+      const message = (err as Error).message;
+      expect({ raw, leaks: /SECRET|\/v[23]\//.test(message) }).toEqual({ raw, leaks: false });
+      expect(message).toMatch(hint);
+      expect(message).toStartWith("rpcUrl is not an absolute URL");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -309,6 +330,25 @@ describe("the read-only gate", () => {
     ]) {
       await expect(rpc.call(method, [])).rejects.toThrow(/read-only allowlist/);
     }
+  });
+
+  test("a dialler's error that quotes the URL loses the path before it is repeated (C157)", async () => {
+    _setFetch(async (req) => {
+      const pinned = new URL(req.url);
+      pinned.hostname = "93.184.216.34";
+      throw new Error(
+        `Unable to connect to ${req.url} (dialled ${pinned.href}); path ${pinned.pathname}`,
+      );
+    });
+    const rpc = await openRpc(`${RPC_URL}?apikey=SECRETQ`);
+    const outcome = await rpc.call("eth_blockNumber", []);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) throw new Error("unreachable");
+    expect(outcome.kind).toBe("transport");
+    expect(outcome.message).toContain("https://rpc.example.com");
+    expect(outcome.message).toContain("<redacted>");
+    expect(outcome.message).not.toContain("a-key-that-must-not-leak");
+    expect(outcome.message).not.toContain("SECRETQ");
   });
 
   test("the endpoint's path never appears in an error, because a provider key lives there", async () => {

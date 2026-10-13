@@ -37,9 +37,10 @@
  * can catch a lock in its zero-byte moment, and "I could not read it, so I
  * took it" would let both rotations run.
  */
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveSafe } from "../paths";
+import { readWorkspaceText } from "./read";
 import { type Resolved, refuse } from "./refs";
 import { SECRETS_DIR } from "./resolve";
 import { writeFileAtomic } from "./write";
@@ -97,7 +98,7 @@ export function readJournal(toolName: string): {
   }
   let text: string;
   try {
-    text = readFileSync(real, "utf8");
+    text = readWorkspaceText(JOURNAL_PATH);
   } catch (err) {
     // ENOENT is the ONLY failure that means "nothing has been rotated yet".
     // Every other one (EACCES, EISDIR, EIO) means the history could not be
@@ -110,7 +111,7 @@ export function readJournal(toolName: string): {
     if (code === "ENOENT") return { journal: EMPTY };
     return {
       journal: EMPTY,
-      unreadable: `${JOURNAL_PATH} could not be read (${code ?? "unknown error"}), so no rotation history is available`,
+      unreadable: `${JOURNAL_PATH} could not be read (${code ?? "unknown error"}: ${(err as Error).message}), so no rotation history is available`,
     };
   }
   try {
@@ -188,7 +189,7 @@ export function acquireLock(toolName: string, ref: string): Resolved<Lock> {
 
   let held: { ref?: string; startedAt?: number };
   try {
-    held = JSON.parse(readFileSync(real, "utf8")) as { ref?: string; startedAt?: number };
+    held = JSON.parse(readWorkspaceText(LOCK_PATH)) as { ref?: string; startedAt?: number };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       // The holder released it between our EEXIST and this read. The lock is

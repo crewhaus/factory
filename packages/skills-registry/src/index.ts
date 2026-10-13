@@ -35,18 +35,27 @@
  * v1 — runtime-core does not yet narrow the catalog while a skill is
  * "active".
  */
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { dirname, join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { CrewhausError } from "@crewhaus/errors";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { openForRead, openForReadSync, resolveContained } from "@crewhaus/tool-safety/fs";
+import { readFileBounded, readFileBoundedSync } from "@crewhaus/tool-safety/streams";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
 const SKILL_FILE = "SKILL.md";
 const SKILLS_RELATIVE = ".crewhaus/skills";
+
+/**
+ * The largest SKILL.md read, whole, at discovery and when its body is
+ * loaded. A skill's body goes into the model's context, so this is far more
+ * than any context window holds; a larger file is left out, and said so.
+ */
+export const MAX_SKILL_FILE_BYTES = 1024 * 1024;
 
 /**
  * SKILL.md frontmatter. The required pair (`name`, `description`) matches
@@ -92,6 +101,13 @@ export type SkillFrontmatter = {
 
 export type SkillRef = SkillFrontmatter & {
   readonly filePath: string;
+  /**
+   * The directory `filePath` must really be inside when the body is read: a
+   * plugin's own directory, for a skill a plugin brings. A link that leads
+   * out of it — swapped in after discovery or not — is refused, not
+   * followed. Absent for user, project and builtin skills.
+   */
+  readonly containedIn?: string;
 };
 
 export type LoadedSkill = SkillRef & {
@@ -101,7 +117,21 @@ export type LoadedSkill = SkillRef & {
 export type DiscoverSkillsOptions = {
   readonly cwd?: string;
   readonly homeDir?: string;
+  /**
+   * Plugins' `skills` directories (plugin-loader's `activatePlugins` returns
+   * them as `skillDirs`). Everything read from one must really be inside the
+   * plugin's own directory — the `skills` directory's parent — so a skill,
+   * or its SKILL.md, that is a link out of the plugin is left out, with a
+   * warning. A user or project skill may still be a link anywhere.
+   */
   readonly pluginDirs?: ReadonlyArray<string>;
+  /**
+   * Where a skill that is left out is reported: a link out of its plugin, a
+   * SKILL.md that is a FIFO or other special file, one larger than
+   * {@link MAX_SKILL_FILE_BYTES}, or one that cannot be read. Defaults to
+   * stderr, prefixed `[skills] `.
+   */
+  readonly warn?: (line: string) => void;
   /**
    * Shipped default skills, merged at LOWEST precedence: any user, project,
    * or plugin skill with the same `name` overrides a builtin wholesale.
@@ -227,13 +257,14 @@ function findFrontmatterEnd(content: string): number {
 export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<SkillRef[]> {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.homeDir ?? homedir();
-  const roots: string[] = [];
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`[skills] ${line}\n`));
+  const roots: Array<{ readonly dir: string; readonly containedIn?: string }> = [];
   const userRoot = join(home, SKILLS_RELATIVE);
   const projectRoot = join(cwd, SKILLS_RELATIVE);
-  if (existsSync(userRoot)) roots.push(userRoot);
-  if (projectRoot !== userRoot && existsSync(projectRoot)) roots.push(projectRoot);
+  if (existsSync(userRoot)) roots.push({ dir: userRoot });
+  if (projectRoot !== userRoot && existsSync(projectRoot)) roots.push({ dir: projectRoot });
   for (const dir of opts.pluginDirs ?? []) {
-    if (existsSync(dir)) roots.push(dir);
+    if (existsSync(dir)) roots.push({ dir, containedIn: dirname(dir) });
   }
   const byName = new Map<string, SkillRef>();
   // Builtins first: every later root wins by `name`, which is exactly the
@@ -243,7 +274,7 @@ export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<
     byName.set(ref.name, ref);
   }
   for (const root of roots) {
-    for (const ref of readSkillsUnder(root)) {
+    for (const ref of readSkillsUnder(root.dir, root.containedIn, warn)) {
       byName.set(ref.name, ref);
     }
   }
@@ -261,7 +292,67 @@ export async function discoverSkills(opts: DiscoverSkillsOptions = {}): Promise<
   return safe;
 }
 
-function readSkillsUnder(root: string): SkillRef[] {
+/**
+ * One `<root>/<entry>/SKILL.md`, read whole — or why it is left out, or
+ * `undefined` when there is none. With `containedIn`, the entry and its
+ * SKILL.md must really be inside that directory; either way the file must be
+ * a regular file of at most {@link MAX_SKILL_FILE_BYTES}, so a FIFO cannot
+ * stall discovery and a device cannot fill memory.
+ */
+function readSkillFile(
+  dir: string,
+  containedIn: string | undefined,
+):
+  | { readonly ok: true; readonly text: string; readonly file: string }
+  | { readonly ok: false; readonly reason: string }
+  | undefined {
+  const file = join(dir, SKILL_FILE);
+  let at = dir;
+  if (containedIn !== undefined) {
+    const contained = resolveContained(containedIn, dir);
+    if (!contained.ok) {
+      return {
+        ok: false,
+        reason:
+          contained.code === "escapes-root"
+            ? `${dir} is a link that leads outside the plugin's directory ${containedIn}`
+            : contained.reason,
+      };
+    }
+    at = contained.real;
+  }
+  try {
+    if (!statSync(at).isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
+  const read =
+    containedIn !== undefined
+      ? openForReadSync(containedIn, file, { maxBytes: MAX_SKILL_FILE_BYTES })
+      : readFileBoundedSync(file, { maxBytes: MAX_SKILL_FILE_BYTES });
+  if (!read.ok) {
+    if (read.code === "not-found") return undefined;
+    return {
+      ok: false,
+      reason:
+        read.code === "escapes-root"
+          ? `${file} is a link that leads outside the plugin's directory ${containedIn}`
+          : read.code === "not-regular-file"
+            ? `${file} is a ${read.kind ?? "special file"}, not a regular file`
+            : `${file}: ${read.reason}`,
+    };
+  }
+  if (read.truncated) {
+    return { ok: false, reason: `${file} is larger than ${MAX_SKILL_FILE_BYTES} bytes` };
+  }
+  return { ok: true, text: read.text, file };
+}
+
+function readSkillsUnder(
+  root: string,
+  containedIn: string | undefined,
+  warn: (line: string) => void,
+): SkillRef[] {
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -270,31 +361,51 @@ function readSkillsUnder(root: string): SkillRef[] {
   }
   const out: SkillRef[] = [];
   for (const entry of entries) {
-    const dir = join(root, entry);
-    let st: ReturnType<typeof statSync>;
-    try {
-      st = statSync(dir);
-    } catch {
-      continue;
-    }
-    if (!st.isDirectory()) continue;
-    const file = join(dir, SKILL_FILE);
-    if (!existsSync(file)) continue;
-    let raw: string;
-    try {
-      raw = readFileSync(file, "utf8");
-    } catch {
+    const read = readSkillFile(join(root, entry), containedIn);
+    if (read === undefined) continue;
+    if (!read.ok) {
+      warn(`${read.reason}; that skill was not loaded.`);
       continue;
     }
     let parsed: { frontmatter: SkillFrontmatter; body: string };
     try {
-      parsed = parseSkillFile(raw);
+      parsed = parseSkillFile(read.text);
     } catch (err) {
-      throw new SkillParseError(`failed to parse ${file}: ${(err as Error).message}`, err);
+      throw new SkillParseError(`failed to parse ${read.file}: ${(err as Error).message}`, err);
     }
-    out.push({ ...parsed.frontmatter, filePath: file });
+    out.push({
+      ...parsed.frontmatter,
+      filePath: read.file,
+      ...(containedIn !== undefined ? { containedIn } : {}),
+    });
   }
   return out;
+}
+
+/**
+ * A skill's SKILL.md, read whole: a regular file of at most
+ * {@link MAX_SKILL_FILE_BYTES}, inside `ref.containedIn` when it names one.
+ */
+async function readSkillText(ref: SkillRef): Promise<string> {
+  const read =
+    ref.containedIn !== undefined
+      ? await openForRead(ref.containedIn, ref.filePath, { maxBytes: MAX_SKILL_FILE_BYTES })
+      : await readFileBounded(ref.filePath, { maxBytes: MAX_SKILL_FILE_BYTES });
+  if (!read.ok) {
+    const why =
+      read.code === "escapes-root"
+        ? `it is a link that leads outside the plugin's directory ${ref.containedIn}`
+        : read.code === "not-regular-file"
+          ? `it is a ${read.kind ?? "special file"}, not a regular file`
+          : read.reason;
+    throw new SkillParseError(`skill "${ref.name}": cannot read ${ref.filePath}: ${why}`);
+  }
+  if (read.truncated) {
+    throw new SkillParseError(
+      `skill "${ref.name}": ${ref.filePath} is larger than ${MAX_SKILL_FILE_BYTES} bytes`,
+    );
+  }
+  return read.text;
 }
 
 /**
@@ -327,9 +438,7 @@ export async function loadSkillBody(ref: SkillRef, ctx?: RunContext): Promise<st
   // still `"skill"`-origin content, same as anything found on disk.
   const inMemory = (ref as Partial<LoadedSkill>).body;
   const body =
-    typeof inMemory === "string"
-      ? inMemory
-      : parseSkillFile(readFileSync(ref.filePath, "utf8")).body;
+    typeof inMemory === "string" ? inMemory : parseSkillFile(await readSkillText(ref)).body;
   const boundary = await classifyBoundary(body, { origin: "skill" });
   if (boundary.action === "redact" && boundary.redacted !== undefined) {
     // Malicious — the raw body never reaches the model, so there is nothing

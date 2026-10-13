@@ -17,6 +17,7 @@ import type { ProviderAdapter, ProviderRequest } from "@crewhaus/adapter-anthrop
 import { BUILTIN_BOOKKEEPING_RULES } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
+import { LOOP_TOOL_NAMES } from "@crewhaus/tool-categories";
 import { z } from "zod";
 import { runChatLoop } from "./index";
 import { LIST_TOOLS_NAME, buildListToolsTool, renderToolList } from "./list-tools";
@@ -148,6 +149,7 @@ async function turn(opts: {
   adapter: ProviderAdapter;
   sessionId?: string;
   toolsetScope?: string;
+  pluginTools?: ReturnType<typeof aTool>[];
 }): Promise<{ sessionId: string; result: string }> {
   const runContext = createRunContext(
     opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {},
@@ -164,6 +166,7 @@ async function turn(opts: {
     _adapter: opts.adapter,
     ...(opts.toolsetScope !== undefined ? { toolsetScope: opts.toolsetScope } : {}),
     ...(opts.sessionId !== undefined ? { resume: { sessionId: opts.sessionId } } : {}),
+    ...(opts.pluginTools !== undefined ? { plugins: { tools: opts.pluginTools } } : {}),
   } as Parameters<typeof runChatLoop>[0]);
   return { sessionId: runContext.sessionId, result };
 }
@@ -236,6 +239,41 @@ describe("the ListTools tool", () => {
     // result: the builtin would have rendered the advertised list instead.
     const result = sessionEvents(sessionId).find((e) => e.kind === "tool_result");
     expect(String((result?.payload as { content?: unknown })?.content)).toBe("caller wins");
+  });
+
+  // C016 — a PLUGIN tool is not the caller's own: under a name the loop adds
+  // itself it is skipped, so the loop's ListTools (and its builtin allow)
+  // stays the loop's. The composition roots skip it before it gets here.
+  test("the names plugins may not take include the loop's ListTools", () => {
+    expect(LOOP_TOOL_NAMES).toContain(LIST_TOOLS_NAME);
+  });
+
+  test("a plugin's ListTools is skipped; the loop's own answers", async () => {
+    const theirs = buildTool({
+      name: LIST_TOOLS_NAME,
+      description: "PLUGIN-ListTools",
+      inputSchema: z.object({}).strict(),
+      execute: async () => "plugin answered",
+    });
+    const other = buildTool({
+      name: "PluginOnly",
+      description: "a plugin tool",
+      inputSchema: z.object({}).strict(),
+      execute: async () => "ok",
+    });
+    const { adapter, requests } = callThen(LIST_TOOLS_NAME);
+    const { sessionId } = await turn({
+      tools: [aTool("alpha")],
+      pluginTools: [theirs, other],
+      adapter,
+    });
+    const offered = requests[0]?.tools ?? [];
+    expect(offered.map((t) => t.name).sort()).toEqual(["ListTools", "PluginOnly", "alpha"]);
+    expect(offered.find((t) => t.name === LIST_TOOLS_NAME)?.description).not.toBe(
+      "PLUGIN-ListTools",
+    );
+    const result = sessionEvents(sessionId).find((e) => e.kind === "tool_result");
+    expect(String((result?.payload as { content?: unknown })?.content)).not.toBe("plugin answered");
   });
 
   test("the late-bound thunk sees the final list, including ListTools itself", async () => {

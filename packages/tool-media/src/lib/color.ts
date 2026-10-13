@@ -19,8 +19,19 @@ const HEX3 = /^#?([0-9a-f])([0-9a-f])([0-9a-f])$/i;
 const HEX4 = /^#?([0-9a-f])([0-9a-f])([0-9a-f])([0-9a-f])$/i;
 const HEX6 = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i;
 const HEX8 = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i;
-const RGB_FN = /^rgba?\(\s*([^)]+)\)$/i;
-const HSL_FN = /^hsla?\(\s*([^)]+)\)$/i;
+/*
+ * `rgb(…)` and `hsl(…)`, alpha forms included. The capture is the text
+ * between the parentheses without its leading whitespace, or its last
+ * character when it is all whitespace.
+ *
+ * These were `\(\s*([^)]+)\)$`, which captures the same. Because the capture
+ * could start with whitespace too, a failed match gave a run of whitespace
+ * back one character at a time and re-read the rest of the run from each:
+ * quadratic in the run, on a colour the model wrote. The capture now starts
+ * at a character that is not whitespace, or is a single whitespace character.
+ */
+export const RGB_FN = /^rgba?\(\s*([^)\s][^)]*|\s)\)$/i;
+export const HSL_FN = /^hsla?\(\s*([^)\s][^)]*|\s)\)$/i;
 
 /**
  * The 16 colour keywords every CSS level has had, lowercase. The full
@@ -87,7 +98,10 @@ function alphaValue(text: string | undefined): number {
  */
 export function parseColor(input: string): Rgb {
   const text = input.trim();
-  const keyword = KEYWORDS[text.toLowerCase()];
+  // Own entries only: `constructor` read Object, and the recursion below
+  // failed with "input.trim is not a function" instead of "not a colour".
+  const name = text.toLowerCase();
+  const keyword = Object.hasOwn(KEYWORDS, name) ? KEYWORDS[name] : undefined;
   if (keyword !== undefined) return parseColor(keyword);
 
   const hex8 = HEX8.exec(text);

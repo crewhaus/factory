@@ -11,6 +11,7 @@
     { "path": "../prompt-optimizer" },
     { "path": "../spec" },
     { "path": "../spec-patch" },
+    { "path": "../tool-safety" },
     { "path": "../trace-event-bus" }
   ],
   "include": ["src/**/*"]

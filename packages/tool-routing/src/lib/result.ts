@@ -14,7 +14,7 @@
  */
 import { realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { type SafePath, ToolPermissionError, resolveSafe } from "../paths";
+import { MAX_PATH_CHARS, type SafePath, ToolPermissionError, resolveSafe } from "../paths";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
 export const json = (value: unknown): string => JSON.stringify(value);
@@ -105,6 +105,16 @@ function containmentFailure(abs: string): FailCode {
 }
 
 /**
+ * True when `rel` resolves to a path longer than any path can be
+ * ({@link MAX_PATH_CHARS}). It cannot be opened or created, so it leads
+ * nowhere and is no escape; `contain` refuses it, naming the length and the
+ * limit, and anything that touches it meets the filesystem's own refusal.
+ */
+export function pastPathLimit(rel: string): boolean {
+  return path.resolve(process.cwd(), rel).length > MAX_PATH_CHARS;
+}
+
+/**
  * Resolve a caller-supplied path inside the workspace.
  *
  * The NUL guard is here rather than in `paths.ts` (which is a verbatim copy
@@ -124,6 +134,11 @@ export function contain(toolName: string, rel: string): Loaded<SafePath> {
       // The error's own message carries the path unrendered; rebuild it so a
       // control character in the caller's input cannot reach the output.
       const shown = renderPath(rel);
+      // Refused for another reason (a path longer than any can be): say that,
+      // and do not walk it to classify an escape it is not.
+      if (err.reason !== undefined) {
+        return fail("refused", `tool "${toolName}" rejected path "${shown}": ${err.reason}`);
+      }
       return containmentFailure(path.resolve(process.cwd(), rel)) === "unreadable"
         ? fail(
             "unreadable",
@@ -166,6 +181,8 @@ export function containWritePaths(
   const shownRoot = root.rel === "" ? "." : root.rel;
   for (const rel of rels) {
     const under = root.rel === "" ? rel : `${root.rel}/${rel}`;
+    // Too long to open or create: it leads nowhere, so it is no escape.
+    if (pastPathLimit(under)) continue;
     const resolved = contain(toolName, under);
     if (resolved.ok) continue;
     // The CODE comes from `contain`, which already separated "this leads out

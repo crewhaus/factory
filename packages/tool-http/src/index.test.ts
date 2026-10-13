@@ -16,7 +16,7 @@
  * Filesystem tests run inside a throwaway temp directory; nothing is ever
  * written inside the repository.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -28,6 +28,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { auditToolScopes } from "@crewhaus/tool-builder";
@@ -38,6 +39,7 @@ import {
   _resetHttpConfig,
   _setDnsLookup,
   _setDnsRecordResolver,
+  _setRawFetch,
   dnsLookup,
   downloadFile,
   feedParse,
@@ -69,6 +71,105 @@ async function run(tool: RegisteredTool, input: unknown): Promise<any> {
   }
 }
 
+/**
+ * Run `body` with every timer of exactly `ms` milliseconds held: scheduled
+ * never, so a deadline of that length cannot fire however slow the runner
+ * is, while its clock (`expired()`) still runs. Other timers run as usual.
+ * For tests about what a failure is CALLED once the clock has run out,
+ * which must not depend on whether the deadline's timer won a race. Each
+ * held timer's callback is appended to `fire`, when given, in the order
+ * they were set, for a test that fires one itself.
+ */
+async function withTimersHeld<T>(
+  ms: number,
+  body: () => Promise<T>,
+  fire?: Array<() => void>,
+): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    if (delay !== ms) return realSetTimeout(fn, delay, ...rest);
+    fire?.push(() => fn(...rest));
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  try {
+    return await body();
+  } finally {
+    held.mockRestore();
+  }
+}
+
+/**
+ * Run `start` on a clock this test drives: every `setTimeout` it schedules
+ * is queued, not armed, and `Date.now()` reads the clock's time. Whenever
+ * the call has nothing left to do but wait, the earliest queued timer fires
+ * and the clock jumps to its due time; nothing else moves it. `settledAt`
+ * is the clock's time when the call settled, so a test reads WHEN a call
+ * ended by the timers that ended it, in the order they fall due, and not by
+ * how long a runner took to service them. For calls that wait only on
+ * timers and promises, never on I/O. Every spy is restored before this
+ * returns.
+ */
+async function onTestClock<T>(start: () => Promise<T>): Promise<{ value: T; settledAt: number }> {
+  const realClearTimeout = globalThis.clearTimeout;
+  const epoch = Date.now();
+  let now = 0;
+  let made = 0;
+  const queued = new Map<number, { due: number; fire: () => void }>();
+  const scheduled = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) => {
+    made += 1;
+    queued.set(made, { due: now + Math.max(0, Number(delay) || 0), fire: () => fn(...rest) });
+    return made as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout);
+  const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+    id?: ReturnType<typeof setTimeout>,
+  ) => {
+    if (!queued.delete(id as unknown as number)) realClearTimeout(id);
+  }) as typeof clearTimeout);
+  const clock = spyOn(Date, "now").mockImplementation(() => epoch + now);
+  // The call has done all it can once a macrotask turn finds nothing more.
+  const idle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  try {
+    let settledAt: number | undefined;
+    const pending = start().finally(() => {
+      settledAt = now;
+    });
+    for (;;) {
+      await idle();
+      if (settledAt !== undefined) break;
+      let next: [number, { due: number; fire: () => void }] | undefined;
+      for (const entry of queued) {
+        // Due order; among timers due together, the order they were set.
+        if (next === undefined || entry[1].due < next[1].due) next = entry;
+      }
+      if (next === undefined) throw new Error("the call waits on nothing the test clock can fire");
+      queued.delete(next[0]);
+      now = next[1].due;
+      next[1].fire();
+    }
+    return { value: await pending, settledAt: settledAt as number };
+  } finally {
+    scheduled.mockRestore();
+    cleared.mockRestore();
+    clock.mockRestore();
+  }
+}
+
+/** Hold the event loop for `ms`, so that the clock moves and nothing else runs. */
+function busy(ms: number): void {
+  const started = performance.now();
+  while (performance.now() - started < ms) {
+    // spin
+  }
+}
+
 const TOKEN_VAR = "CREWHAUS_TEST_HTTP_TOKEN";
 const SECRET_VAR = "CREWHAUS_TEST_WEBHOOK_SECRET";
 
@@ -84,7 +185,14 @@ let origin = "";
 let otherOrigin = "";
 /** Per-test counters, so a flaky-endpoint test starts from a known state. */
 let flakyCalls = 0;
+/**
+ * What `/echo` (on either server) really received. A tool result scrubs the
+ * credential, so what arrived on the wire is read here.
+ */
+let echoSeen: Array<{ authorization: string | null; apiKey: string | null }> = [];
 let jobCalls = 0;
+/** Called as `/slow` begins its sleep, so a test can act while it is in flight. */
+let onSlow: (() => void) | undefined;
 
 const FEED_XML = `<?xml version="1.0"?><rss version="2.0"><channel>
   <title>Releases</title><link>http://x.test</link>
@@ -116,6 +224,10 @@ async function mainHandler(req: Request): Promise<Response> {
   if (p === "/json") return jsonRes({ hello: "world" });
 
   if (p === "/echo") {
+    echoSeen.push({
+      authorization: req.headers.get("authorization"),
+      apiKey: req.headers.get("x-api-key"),
+    });
     return jsonRes({
       method: req.method,
       path: `${url.pathname}${url.search}`,
@@ -132,6 +244,7 @@ async function mainHandler(req: Request): Promise<Response> {
   }
 
   if (p === "/slow") {
+    onSlow?.();
     await Bun.sleep(2_000);
     return new Response("late");
   }
@@ -146,6 +259,9 @@ async function mainHandler(req: Request): Promise<Response> {
   }
   if (p === "/redirect-303") {
     return new Response(null, { status: 303, headers: { location: "/echo" } });
+  }
+  if (p === "/redirect-301") {
+    return new Response(null, { status: 301, headers: { location: "/echo" } });
   }
   if (p === "/redirect-307") {
     return new Response(null, { status: 307, headers: { location: "/echo" } });
@@ -282,11 +398,17 @@ async function mainHandler(req: Request): Promise<Response> {
 beforeEach(() => {
   flakyCalls = 0;
   jobCalls = 0;
+  onSlow = undefined;
+  echoSeen = [];
   main = Bun.serve({ port: 0, fetch: mainHandler });
   other = Bun.serve({
     port: 0,
     fetch: async (req) => {
       const url = new URL(req.url);
+      echoSeen.push({
+        authorization: req.headers.get("authorization"),
+        apiKey: req.headers.get("x-api-key"),
+      });
       return new Response(
         JSON.stringify({
           server: "other",
@@ -301,7 +423,11 @@ beforeEach(() => {
   });
   origin = `http://127.0.0.1:${main.port}`;
   otherOrigin = `http://127.0.0.1:${other.port}`;
-  registerHttpConfig({ allowed_origins: [origin, otherOrigin] });
+  registerHttpConfig({
+    allowed_origins: [origin, otherOrigin],
+    allowed_auth_envs: [TOKEN_VAR, "CREWHAUS_TEST_ABSENT"],
+    allowed_signing_envs: [SECRET_VAR, "CREWHAUS_TEST_NO_SUCH_SECRET"],
+  });
   __setPrivateHostsAllowedForTest(true);
   process.env[TOKEN_VAR] = "s3cret-token";
   process.env[SECRET_VAR] = "whsec_fixture";
@@ -337,7 +463,9 @@ describe("package contract", () => {
     "UrlReachable",
   ]);
   const mutating = new Set(["DownloadFile", "GraphqlQuery", "HttpBatch", "HttpRequest"]);
-  const justified = new Set(["GraphqlQuery", "HttpBatch", "HttpRequest"]);
+  // DownloadFile since 0.7.1: every destructive tool that goes to a place the
+  // model chose is justification-gated (apps/cli/src/flag-rules.test.ts).
+  const justified = new Set(["DownloadFile", "GraphqlQuery", "HttpBatch", "HttpRequest"]);
 
   test("every tool is exported in HTTP_TOOLS, with unique PascalCase names", () => {
     expect(HTTP_TOOLS.length).toBe(17);
@@ -584,6 +712,7 @@ describe("refusals", () => {
     });
     expect(result).toContain("CREWHAUS_TEST_ABSENT");
     expect(result).toContain("unset or empty");
+    expect(echoSeen).toEqual([]);
   });
 
   test("a deadline fires and is reported as a deadline", async () => {
@@ -632,7 +761,9 @@ describe("HttpRequest", () => {
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    // The server repeated it back; the result does not.
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.requestHeaders["Authorization"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
   });
@@ -643,7 +774,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
+    expect(result.json.apiKey).toBe("<redacted>");
   });
 
   test("a header-type auth secret is redacted in the echo, not just the Authorization one", async () => {
@@ -653,7 +785,7 @@ describe("HttpRequest", () => {
       parseJson: true,
     });
     // The server really did receive it...
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
     // ...and the model really does not.
     expect(result.requestHeaders["X-Api-Key"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
@@ -665,7 +797,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(same.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: "s3cret-token" });
+    expect(same.json.apiKey).toBe("<redacted>");
     expect(same.credentialsDropped).toBe(false);
 
     const cross = await run(httpRequest, {
@@ -675,6 +808,7 @@ describe("HttpRequest", () => {
     });
     expect(cross.json.server).toBe("other");
     expect(cross.json.apiKey).toBeNull();
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: null });
     expect(cross.credentialsDropped).toBe(true);
   });
 
@@ -707,13 +841,46 @@ describe("HttpRequest", () => {
     expect(preserved.json.body).toBe('{"a":1}');
   });
 
+  test("net-review: a 301 or 302 after a PUT, PATCH or DELETE keeps the method and body", async () => {
+    let checked = 0;
+    for (const path of ["/redirect-301", "/redirect-same"]) {
+      for (const method of ["PUT", "PATCH", "DELETE"] as const) {
+        const moved = await run(httpRequest, {
+          url: `${origin}${path}`,
+          method,
+          body: '{"a":1}',
+          parseJson: true,
+        });
+        expect({ path, method, seen: moved.json.method, body: moved.json.body }).toEqual({
+          path,
+          method,
+          seen: method,
+          body: '{"a":1}',
+        });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(6);
+    // A POST still becomes a GET on a 301.
+    const post = await run(httpRequest, {
+      url: `${origin}/redirect-301`,
+      method: "POST",
+      body: '{"a":1}',
+      parseJson: true,
+    });
+    expect(post.json).toMatchObject({ method: "GET", body: "" });
+    // Fourteen loopback round trips in turn. With each reply 375 ms late, as
+    // CI has shown, bun's default 5 s ran out before the last.
+  }, 20_000);
+
   test("a same-origin redirect keeps the credential", async () => {
     const result = await run(httpRequest, {
       url: `${origin}/redirect-same`,
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.credentialsDropped).toBe(false);
     expect(result.redirects.length).toBe(1);
   });
@@ -726,6 +893,7 @@ describe("HttpRequest", () => {
     });
     expect(result.json.server).toBe("other");
     expect(result.json.authorization).toBeNull();
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: null }]);
     expect(result.credentialsDropped).toBe(true);
   });
 
@@ -776,6 +944,13 @@ describe("HttpRequest", () => {
 
 // ---------------------------------------------------------------------------
 
+// Each call below is a few loopback round trips that take milliseconds. Its
+// deadline is one no runner reaches, and its test's budget sits above it: a
+// deadline equal to the default 5 s budget turned one stalled request into a
+// budget timeout plus an orphaned "Expected 3, Received undefined" after it.
+// A call that does stall now fails inside its own test, on its own
+// assertions. The same holds for LinkCheck, HttpWaitFor, SseRead and
+// TlsInspect below.
 describe("HttpPaginate", () => {
   test("follows Link rel=next to the end and concatenates the items", async () => {
     const result = await run(httpPaginate, {
@@ -783,12 +958,12 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(2);
     expect(result.items).toEqual([1, 2, 3]);
     expect(result.stoppedBy).toBe("end");
-  });
+  }, 30_000);
 
   test("the page cap stops the walk and says so", async () => {
     const result = await run(httpPaginate, {
@@ -796,12 +971,12 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 1,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(1);
     expect(result.stoppedBy).toBe("pageCap");
     expect(result.items).toEqual([1, 2]);
-  });
+  }, 30_000);
 
   test("cursor style reads the named field and stops when it goes null", async () => {
     const result = await run(httpPaginate, {
@@ -811,12 +986,12 @@ describe("HttpPaginate", () => {
       cursorParam: "cursor",
       itemsPath: "items",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.pages).toBe(2);
     expect(result.items).toEqual(["a", "b", "c"]);
     expect(result.stoppedBy).toBe("end");
-  });
+  }, 30_000);
 
   test("page style increments the parameter and stops on the first empty page", async () => {
     const result = await run(httpPaginate, {
@@ -827,13 +1002,13 @@ describe("HttpPaginate", () => {
       pageSize: 50,
       itemsPath: "rows",
       maxPages: 10,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
-    expect(result.pages).toBe(3);
-    expect(result.items).toEqual(["p1", "p2"]);
-    expect(result.stoppedBy).toBe("emptyPage");
+    expect(result).toEqual(
+      expect.objectContaining({ pages: 3, items: ["p1", "p2"], stoppedBy: "emptyPage" }),
+    );
     expect(result.lastUrl).toContain("size=50");
-  });
+  }, 30_000);
 
   test("the item cap stops mid-walk", async () => {
     const result = await run(httpPaginate, {
@@ -842,22 +1017,22 @@ describe("HttpPaginate", () => {
       itemsPath: "items",
       maxPages: 10,
       maxItems: 1,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.items).toEqual([1]);
     expect(result.stoppedBy).toBe("itemCap");
-  });
+  }, 30_000);
 
   test("a non-2xx page stops the walk and keeps what was already collected", async () => {
     const result = await run(httpPaginate, {
       url: `${origin}/status/500`,
       style: "link",
       maxPages: 3,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("status");
     expect(result.status).toBe(500);
-  });
+  }, 30_000);
 
   test("a body that is not an array says how to point at the items", async () => {
     const result = await run(httpPaginate, {
@@ -865,11 +1040,11 @@ describe("HttpPaginate", () => {
       style: "link",
       itemsPath: "items",
       maxPages: 3,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("shape");
     expect(result.note).toContain("itemsPath");
-  });
+  }, 30_000);
 
   test("an aggregate byte budget stops a walk that would otherwise fill memory", async () => {
     // Each page fits well inside maxBytes, so the per-page cap never fires —
@@ -887,7 +1062,7 @@ describe("HttpPaginate", () => {
     expect(result.bytes).toBeGreaterThanOrEqual(100_000);
     expect(result.pages).toBeLessThan(100);
     expect(result.pages).toBeGreaterThan(1);
-  });
+  }, 30_000);
 
   test("a cursor style missing its parameters is a readable refusal, not a request", async () => {
     const result = await run(httpPaginate, {
@@ -959,6 +1134,29 @@ describe("HttpBatch", () => {
   // healthy request exposed to the failure: still in flight when the failure
   // lands, or not yet started when the deadline fires.
 
+  test("a transport failure that lands after the deadline's time is reported as itself", async () => {
+    // The stub holds the event loop past the 50ms per-request deadline and
+    // then fails; the deadline's timer is held, so however slow the runner,
+    // the failure is what ends the request while the clock says the time is
+    // up — no race against the timer or real I/O.
+    _setRawFetch(async () => {
+      busy(80);
+      throw new TypeError("fetch failed: ECONNRESET");
+    });
+    try {
+      const result = await withTimersHeld(50, () =>
+        run(httpBatch, { requests: [{ url: `${origin}/json` }], timeoutMs: 50 }),
+      );
+      // 0.7.0 said "deadline elapsed before the request completed", off the
+      // clock, and the reset was never mentioned.
+      expect(result.results[0].error).toBe(
+        "TypeError: fetch failed: ECONNRESET (the deadline had also elapsed)",
+      );
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("a failure never cancels a sibling that is still in flight", async () => {
     // The refused origin fails before any I/O; /slow is then mid-request for
     // two seconds. An abort that fanned out from the failure would reach it.
@@ -976,14 +1174,32 @@ describe("HttpBatch", () => {
   test("one request's deadline does not leak into the requests after it", async () => {
     // One at a time, so /json is issued only after /slow's deadline has fired.
     // If that abort reached the batch's own signal, /json would start already
-    // cancelled. /slow cannot win the race: its 2s sleep and this 1s deadline
-    // share one event loop, and the deadline expires first however late both
-    // run.
-    const result = await run(httpBatch, {
-      requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
-      timeoutMs: 1_000,
-      concurrency: 1,
+    // cancelled. Each request's 1 s deadline timer is held: /slow's is fired
+    // from here once /slow is in flight, and /json's never fires, so neither
+    // the runner's speed nor /slow's 2 s sleep decides the outcome.
+    const deadlines: Array<() => void> = [];
+    const slowInFlight = new Promise<"in flight">((resolve) => {
+      onSlow = () => resolve("in flight");
     });
+    const result = await withTimersHeld(
+      1_000,
+      async () => {
+        const pending = run(httpBatch, {
+          requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
+          timeoutMs: 1_000,
+          concurrency: 1,
+        });
+        const first = await Promise.race([slowInFlight, pending.then(() => "settled")]);
+        expect(first).toBe("in flight");
+        // Only /slow's deadline is armed yet; it fires now, mid-request.
+        expect(deadlines).toHaveLength(1);
+        deadlines[0]?.();
+        return pending;
+      },
+      deadlines,
+    );
+    // /json was given a deadline of its own, which never fired.
+    expect(deadlines).toHaveLength(2);
     expect(result.results[0].ok).toBe(false);
     // The reason, not just the failure: a batch-wide abort is `ok: false` too.
     expect(result.results[0].error).toContain("deadline");
@@ -1033,8 +1249,12 @@ describe("HttpBatch", () => {
       requests: [{ url: `${origin}/echo` }, { url: `${origin}/echo` }],
       auth: { type: "bearer", envVar: TOKEN_VAR },
     });
+    expect(echoSeen).toEqual([
+      { authorization: "Bearer s3cret-token", apiKey: null },
+      { authorization: "Bearer s3cret-token", apiKey: null },
+    ]);
     for (const entry of result.results) {
-      expect(JSON.parse(entry.body).authorization).toBe("Bearer s3cret-token");
+      expect(JSON.parse(entry.body).authorization).toBe("Bearer <redacted>");
     }
   });
 });
@@ -1259,19 +1479,21 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
   test("LinkCheck returns one row per URL in input order, with a per-URL status", async () => {
     const result = await run(linkCheck, {
       urls: [`${origin}/json`, `${origin}/status/404`, "http://example.com/off"],
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
       concurrency: 2,
     });
     expect(result.checked).toBe(3);
     expect(result.okCount).toBe(1);
-    expect(result.brokenCount).toBe(2);
+    // The 404 is broken; the URL the allow-list refused was never checked.
+    expect(result.brokenCount).toBe(1);
+    expect(result.refusedCount).toBe(1);
     expect(result.results.map((r: { url: string }) => r.url)).toEqual([
       `${origin}/json`,
       `${origin}/status/404`,
       "http://example.com/off",
     ]);
     expect(result.results[2].error).toContain("not in allowed_origins");
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1282,12 +1504,12 @@ describe("HttpWaitFor", () => {
       url: `${origin}/job`,
       expectJson: { path: "state", op: "equals", value: "ready" },
       intervalMs: 20,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.met).toBe(true);
     expect(result.attempts).toBe(3);
     expect(result.stoppedBy).toBe("condition");
-  });
+  }, 30_000);
 
   test("stops at the deadline when the condition never holds", async () => {
     const result = await run(httpWaitFor, {
@@ -1317,16 +1539,18 @@ describe("HttpWaitFor", () => {
   });
 
   test("a permission refusal stops the poll immediately instead of retrying it", async () => {
-    const started = Date.now();
     const result = await run(httpWaitFor, {
       url: "http://example.com/x",
       expectStatus: [200],
       timeoutMs: 5_000,
       intervalMs: 1_000,
     });
+    // The refusal itself, not a poll report: a poll that retried it would end
+    // at the 5 s deadline as { met: false, attempts, lastError }, and fail
+    // here inside the budget rather than racing a wall-clock bound.
+    expect(typeof result).toBe("string");
     expect(result).toContain("not in allowed_origins");
-    expect(Date.now() - started).toBeLessThan(2_000);
-  });
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1337,35 +1561,164 @@ describe("SseRead", () => {
       url: `${origin}/sse`,
       terminatorEvent: "done",
       maxEvents: 20,
-      timeoutMs: 5_000,
+      timeoutMs: 20_000,
     });
     expect(result.stoppedBy).toBe("terminator");
     expect(result.count).toBe(4);
     expect(result.events.map((e: { data: string }) => e.data)).toEqual(["1", "2", "3", "bye"]);
-  });
+  }, 30_000);
 
   test("the event cap stops the read early", async () => {
-    const result = await run(sseRead, { url: `${origin}/sse`, maxEvents: 2, timeoutMs: 5_000 });
+    const result = await run(sseRead, { url: `${origin}/sse`, maxEvents: 2, timeoutMs: 20_000 });
     expect(result.count).toBe(2);
     expect(result.stoppedBy).toBe("eventCap");
-  });
+  }, 30_000);
+
+  /**
+   * SseRead on /sse-forever, which never terminates, with the read's own
+   * 2 s deadline held and fired from the stream: on the first read the tool
+   * asks for once a whole event has reached it. So the deadline lands after
+   * the head and the first event on any runner, and nothing else can end
+   * the read first (maxEvents is the schema's maximum, and the stream sends
+   * one event per 5 ms or more for 50 s). A real 2 s deadline raced the
+   * runner instead, which CI has seen take 300-375 ms for one loopback
+   * request (C117; #481 fixed the same race in HttpBatch). `latencyMs` is
+   * real latency in front of the real fetch.
+   */
+  async function readUntilDeadlineFired(latencyMs: number) {
+    const DEADLINE_MS = 2_000;
+    const HELD = Symbol("held") as unknown as ReturnType<typeof setTimeout>;
+    const deadline: { fire?: () => void; cleared: boolean; fired: boolean; problem?: string } = {
+      cleared: false,
+      fired: false,
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (delay !== DEADLINE_MS) return realSetTimeout(fn, delay, ...rest);
+      deadline.fire = () => fn(...rest);
+      return HELD;
+    }) as typeof setTimeout);
+    const cleared = spyOn(globalThis, "clearTimeout").mockImplementation(((
+      id?: ReturnType<typeof setTimeout>,
+    ) => {
+      if (id === HELD) deadline.cleared = true;
+      else realClearTimeout(id);
+    }) as typeof clearTimeout);
+    _setRawFetch(async (req) => {
+      if (latencyMs > 0) await Bun.sleep(latencyMs);
+      const res = await fetch(req, { decompress: false } as RequestInit);
+      if (res.body === null) return res;
+      const source = res.body.getReader();
+      let passed = "";
+      const body = new ReadableStream<Uint8Array>(
+        {
+          async pull(controller) {
+            if (passed.includes("\n\n") && !deadline.fired) {
+              // A whole event has been taken and the tool asks for more.
+              deadline.fired = true;
+              if (deadline.fire === undefined || deadline.cleared) {
+                deadline.problem = "the read's deadline was not armed while the body was read";
+                await source.cancel().catch(() => undefined);
+                throw new Error(deadline.problem);
+              }
+              deadline.fire();
+            }
+            const next = await source.read();
+            if (next.done) {
+              controller.close();
+              return;
+            }
+            passed += new TextDecoder().decode(next.value);
+            controller.enqueue(next.value);
+          },
+          cancel: (reason) => source.cancel(reason),
+        },
+        // Pulled only when the tool reads.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { status: res.status, headers: res.headers });
+    });
+    try {
+      const result = await run(sseRead, {
+        url: `${origin}/sse-forever`,
+        maxEvents: 1_000,
+        timeoutMs: DEADLINE_MS,
+      });
+      return { result, fired: deadline.fired, problem: deadline.problem };
+    } finally {
+      _setRawFetch(undefined);
+      held.mockRestore();
+      cleared.mockRestore();
+    }
+  }
 
   test("the deadline stops a stream that never terminates", async () => {
-    // The budget has to outlast connecting and fall well short of the
-    // stream, or the test measures the runner rather than the deadline. At
-    // 12ms against a stream that ended after four events it measured both,
-    // and on CI the connection itself did not finish in time.
-    const started = performance.now();
-    const result = await run(sseRead, {
-      url: `${origin}/sse-forever`,
-      maxEvents: 10_000,
-      timeoutMs: 300,
-    });
+    const { result, fired, problem } = await readUntilDeadlineFired(0);
+    expect(problem).toBeUndefined();
+    expect(fired).toBe(true);
     expect(result.stoppedBy).toBe("deadline");
     expect(result.count).toBeGreaterThan(0);
-    // It stopped because of the budget, not because the stream ran out.
-    expect(performance.now() - started).toBeLessThan(10_000);
   }, 20_000);
+
+  test("half a second of connect latency still leaves the deadline to end the read", async () => {
+    // The latency CI has shown, and more, in front of the real fetch: the
+    // 300 ms budget this test file used to give failed here.
+    const { result, fired, problem } = await readUntilDeadlineFired(500);
+    expect(problem).toBeUndefined();
+    expect(fired).toBe(true);
+    expect(result.stoppedBy).toBe("deadline");
+    expect(result.count).toBeGreaterThan(0);
+  }, 20_000);
+
+  test("a cancel that lands after the deadline's time, before its timer, is not a deadline", async () => {
+    // The stream's second read holds the event loop past the 50 ms deadline
+    // and then the runtime cancels: the clock says "expired", the cause is
+    // the cancel. 0.7.0 asked the clock and said stoppedBy "deadline".
+    const runtime = new AbortController();
+    let reads = 0;
+    _setRawFetch(async () => {
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads++;
+            if (reads === 1) {
+              controller.enqueue(new TextEncoder().encode("event: tick\ndata: 1\n\n"));
+              return;
+            }
+            busy(80);
+            runtime.abort();
+          },
+        },
+        // Pulled only when read, so the first event is taken before the
+        // second read cancels.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      // The deadline's timer is held, so it cannot fire first on a slow
+      // runner: the clock runs out, and the cancel is what ends the read.
+      const out = await withTimersHeld(50, () =>
+        sseRead.execute(
+          { url: `${origin}/sse`, maxEvents: 10, timeoutMs: 50 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      const result = JSON.parse(String(out));
+      expect({ stoppedBy: result.stoppedBy, count: result.count, reads }).toEqual({
+        stoppedBy: "error",
+        count: 1,
+        reads: 2,
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
 
   test("events after the terminator in the same chunk are not returned", async () => {
     const result = await run(sseRead, {
@@ -1437,6 +1790,19 @@ describe("RobotsCheck / SitemapParse / FeedParse", () => {
     );
     expect(await run(sitemapParse, {})).toContain("either text or url");
   });
+
+  test("FeedParse on a hostile tag parses in milliseconds rather than holding the loop (C091)", async () => {
+    // A hang detector, kept on time (lib.test.ts says why): 0.7.0's
+    // attribute pattern took about a minute on this tag and the one-pass
+    // scan takes milliseconds, so the 5 s bound sits well between them.
+    const hostile = `<rss version="2.0"><channel x${"y".repeat(240_000)}><title>T</title><item><title>a</title></item></channel></rss>`;
+    const t0 = performance.now();
+    const result = await run(feedParse, { text: hostile });
+    expect(performance.now() - t0).toBeLessThan(5_000);
+    expect(result.kind).toBe("rss");
+    expect(result.title).toBe("T");
+    expect(result.entries.map((e: { title: string }) => e.title)).toEqual(["a"]);
+  }, 20_000);
 
   test("FeedParse reads a fetched feed and keeps its order", async () => {
     const result = await run(feedParse, { url: `${origin}/feed.xml` });
@@ -1585,30 +1951,135 @@ describe("DnsLookup / TlsInspect", () => {
     });
     _setDnsRecordResolver(undefined);
     // The budget is spent by the first type, so the other five are never
-    // issued. Giving each type its own copy of the timeout — which is what a
-    // per-call `withTimeout` does — would instead have run all six, and the
-    // "whole lookup" deadline in the description would be six times what it
-    // says. The distinction is visible in WHICH error each type reports.
+    // issued. Giving each type its own copy of the timeout would instead have
+    // run all six, and the "whole lookup" deadline in the description would
+    // be six times what it says. The distinction is visible in WHICH error
+    // each type reports.
     expect(result.records).toEqual({});
     expect(Object.keys(result.errors).sort()).toEqual(["A", "AAAA", "CNAME", "MX", "NS", "TXT"]);
 
     // The distinction that matters is AT MOST ONE type ever got as far as a
     // lookup. Six private budgets would have started all six and reported
-    // "exceeded 1ms" six times; one shared budget can only be spent once.
-    //
-    // Which type that is — or whether even the first one wins the race to
-    // start — is scheduling, not behaviour. This used to assert that `A`
-    // specifically reported the mid-lookup timeout, and on a loaded CI runner
-    // the 1ms was gone before `A` was issued, so every type reported "never
-    // asked" and a correct result failed.
+    // the timeout six times; one shared budget can only be spent once. (The
+    // frozen-clock test below pins which type that is, and that it is the
+    // only one issued.)
     const NEVER_ASKED = "the 1ms lookup budget elapsed before this record type was asked for";
     const all = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"] as const;
-    const started = all.filter((t) => String(result.errors[t]).includes("exceeded 1ms"));
+    const started = all.filter((t) =>
+      String(result.errors[t]).includes("exceeded the 1ms lookup budget"),
+    );
     const neverAsked = all.filter((t) => result.errors[t] === NEVER_ASKED);
     expect(started.length).toBeLessThanOrEqual(1);
     // ...and every type is accounted for by exactly one of the two answers, so
     // a third, vaguer error cannot slip through unnoticed.
     expect(started.length + neverAsked.length).toBe(all.length);
+  });
+
+  test("DnsLookup's budget is its timer, not the wall clock: a spent budget starts nothing more", async () => {
+    // The budget used to be checked against `Date.now()` while a separate
+    // `setTimeout` enforced it. The two clocks disagree: a 1ms timer can fire
+    // before the wall clock has moved a whole millisecond, and then the next
+    // record type saw budget "left", was issued, and timed out too. On a
+    // loaded CI runner that put TWO types in flight and failed the test above.
+    //
+    // Freezing the wall clock makes that disagreement total instead of rare:
+    // the timer still fires, but `Date.now()` never moves. Counting the
+    // lookups the resolver actually receives measures what the budget is for,
+    // rather than inferring it from error text.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return await new Promise((resolve) => setTimeout(() => resolve([]), 50));
+    });
+    const nowSpy = spyOn(Date, "now").mockReturnValue(1_000_000);
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["A", "AAAA", "CNAME", "MX", "NS", "TXT"],
+      timeoutMs: 1,
+    }).finally(() => {
+      nowSpy.mockRestore();
+      _setDnsRecordResolver(undefined);
+    });
+    // Exactly one lookup is issued: the budget is unspent when the first type
+    // is asked for, and spent for good once its timer fires.
+    expect(issued).toEqual(["A"]);
+    expect(result.records).toEqual({});
+    expect(result.errors.A).toBe("A lookup exceeded the 1ms lookup budget");
+    for (const t of ["AAAA", "CNAME", "MX", "NS", "TXT"]) {
+      expect(result.errors[t]).toBe(
+        "the 1ms lookup budget elapsed before this record type was asked for",
+      );
+    }
+  });
+
+  test("DnsLookup keeps answers that arrive inside the budget, and one type's error does not stop the rest", async () => {
+    // Every other budget test spends the budget on the first type, so none of
+    // them would notice a deadline that fires at once, a race that drops the
+    // answer it won, or a loop that gives up after the first error.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (type === "A") return ["192.0.2.1"];
+      throw Object.assign(new Error(`no ${type} records`), { code: "ENODATA" });
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "AAAA"],
+      timeoutMs: 2000,
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "AAAA", "MX"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({ AAAA: "ENODATA", MX: "ENODATA" });
+  });
+
+  test("DnsLookup gives a type issued late only what is left of the budget", async () => {
+    // A answers at 100ms of a 150ms budget, and AAAA never answers. One shared
+    // budget ends the lookup at 150ms; a fresh budget per type would let AAAA
+    // run until 250ms. Both timers run on the test's clock, which fires them
+    // in the order they fall due and moves only when it fires one, so the
+    // lookup ends at 150 however late a loaded runner would have serviced
+    // real ones. (Real timers raced here: a runner 50ms late to schedule A's
+    // answer let the budget fire first.)
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      if (type !== "A") return await new Promise(() => {});
+      return await new Promise((resolve) => setTimeout(() => resolve(["192.0.2.1"]), 100));
+    });
+    const { value: result, settledAt } = await onTestClock(() =>
+      run(dnsLookup, {
+        name: "dns-budget.invalid",
+        types: ["A", "AAAA", "MX"],
+        timeoutMs: 150,
+      }),
+    ).finally(() => _setDnsRecordResolver(undefined));
+    expect(settledAt).toBe(150);
+    expect(issued).toEqual(["A", "AAAA"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({
+      AAAA: "AAAA lookup exceeded the 150ms lookup budget",
+      MX: "the 150ms lookup budget elapsed before this record type was asked for",
+    });
+  });
+
+  test("DnsLookup asks for a repeated record type once", async () => {
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return [`${type}-answer`];
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "MX", "A"],
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "MX"]);
+    expect(result.records).toEqual({ A: ["A-answer"], MX: ["MX-answer"] });
+    expect(result.errors).toBeUndefined();
   });
 
   test("TlsInspect refuses a host no allow-listed origin names", async () => {
@@ -1623,6 +2094,44 @@ describe("DnsLookup / TlsInspect", () => {
     expect(await run(tlsInspect, { host: "127.0.0.1", port: main.port })).toContain("SSRF");
   });
 
+  test("TlsInspect says a service that does not speak TLS presented no certificate", async () => {
+    // Two services that answer a ClientHello with something other than TLS.
+    // On this runtime the handshake callback still fires, with an empty
+    // certificate, a cipher named null and "TLSv1.2" — which 0.7.0 reported
+    // as a certificate with the wrong name. Two calls of 10 s deadline each,
+    // so the budget sits above both: a slow handshake fails here, not later.
+    const speakers = [
+      (socket: import("node:net").Socket) => socket.write("SSH-2.0-OpenSSH_9.6\r\n"),
+      (socket: import("node:net").Socket) =>
+        socket.once("data", () =>
+          socket.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
+        ),
+    ];
+    const outs: string[] = [];
+    for (const speak of speakers) {
+      const server = createTcpServer(speak);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const port = (server.address() as { port: number }).port;
+      try {
+        registerHttpConfig({ allowed_origins: [`https://127.0.0.1:${port}`] });
+        outs.push(
+          String(
+            await tlsInspect.execute({
+              host: "127.0.0.1",
+              port,
+              servername: "crewhaus.test",
+              timeoutMs: 10_000,
+            }),
+          ),
+        );
+      } finally {
+        server.close();
+      }
+    }
+    expect(outs.filter((o) => !o.includes("no TLS handshake with 127.0.0.1:"))).toEqual([]);
+    expect(outs.filter((o) => o.includes('"protocol"') || o.includes('"certificate"'))).toEqual([]);
+  }, 30_000);
+
   test.skipIf(!hasOpenssl())(
     "TlsInspect reads a real certificate chain from a local TLS server",
     async () => {
@@ -1634,8 +2143,13 @@ describe("DnsLookup / TlsInspect", () => {
           "openssl",
           "req",
           "-x509",
+          // An EC key: RSA-2048 keygen is the heavy-tailed part of this test
+          // (70-670 ms locally), and TlsInspect reports nothing about the
+          // key type, so P-256 loses no coverage.
           "-newkey",
-          "rsa:2048",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:prime256v1",
           "-nodes",
           "-days",
           "30",
@@ -1648,7 +2162,13 @@ describe("DnsLookup / TlsInspect", () => {
           "-out",
           certPath,
         ]);
-        if (made.exitCode !== 0) return; // no usable openssl — nothing to assert
+        // skipIf covers a machine with no openssl. One that has it but cannot
+        // build the fixture is a failure, not a pass with nothing asserted.
+        expect(
+          made.exitCode === 0
+            ? ""
+            : `openssl exited ${made.exitCode}: ${made.stderr.toString().trim()}`,
+        ).toBe("");
 
         const tlsServer = Bun.serve({
           port: 0,
@@ -1670,6 +2190,7 @@ describe("DnsLookup / TlsInspect", () => {
             "DNS:crewhaus.test",
             "IP Address:127.0.0.1",
           ]);
+          expect(typeof result.cipher).toBe("string");
           // Self-signed: the handshake completes, but nothing vouches for it.
           expect(result.authorized).toBe(false);
           expect(result.authorizationError).toBeDefined();
@@ -1680,6 +2201,9 @@ describe("DnsLookup / TlsInspect", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     },
+    // Key generation plus a TLS handshake: 0.8-2.9 s on CI with RSA, where
+    // bun's default budget is 5 s.
+    20_000,
   );
 });
 

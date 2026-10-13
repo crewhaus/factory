@@ -24,9 +24,9 @@
  *      The XML reader has no entity resolver, so a document cannot make this
  *      package fetch anything.
  */
-import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync, writeFileSafe as writeContained } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { diffLines, diffStats, normalizeLine, renderUnified, wordCounts } from "./lib/diff";
 import { type DocxWriteBlock, docxPlainText, readDocx, writeDocx } from "./lib/docx";
@@ -54,7 +54,7 @@ import { pptxPlainText, readPptx } from "./lib/pptx";
 import { type CellValue, readXlsx, writeXlsx } from "./lib/xlsx";
 import { XmlError } from "./lib/xml";
 import { DEFAULT_ZIP_LIMITS, ZipArchive, ZipError, type ZipLimits } from "./lib/zip";
-import { type SafePath, ToolPermissionError, resolveSafe } from "./paths";
+import { type SafePath, ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 /** Compact JSON — the reader is a model, and every byte returned is context. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -68,44 +68,68 @@ const LATIN1 = new TextDecoder("latin1" as ConstructorParameters<typeof TextDeco
 const UTF8 = new TextDecoder("utf-8");
 
 /**
- * Read a file after checking its size, so an enormous file is refused rather
- * than read and then rejected. The `stat` is on the RESOLVED path, which is
- * the same path the read uses.
+ * Read at most `maxBytes` of a contained regular file; a larger one is
+ * refused, never cut.
+ *
+ * Opened without blocking, and only as a regular file. 0.7.0 `statSync`ed
+ * the path (which does not block on a FIFO, and reports it as 0 bytes) and
+ * then `readFileSync`ed it, a synchronous open that waits for ever for a
+ * writer, so a named pipe passed to DocumentText, PdfText, DocxRead or any
+ * reader here stopped the whole harness (C074's sibling, bounds review).
  */
 function readFileCapped(
   toolName: string,
   rel: string,
   maxBytes = MAX_FILE_BYTES,
 ): { path: SafePath; bytes: Uint8Array } {
+  // This package's own containment first, so an escape is worded as before.
   const path = resolveSafe(toolName, rel);
-  const stats = statSync(path.real);
-  if (stats.isDirectory()) throw new ToolInputError(`"${rel}" is a directory, not a file`);
-  if (stats.size > maxBytes) {
+  const read = openForReadSync(workspaceRoot(), rel, { maxBytes });
+  if (!read.ok) {
+    if (read.code === "not-found") throw new ToolInputError(`no such file: ${rel}`);
+    if (read.code === "not-regular-file" && read.kind === "directory") {
+      throw new ToolInputError(`"${rel}" is a directory, not a file`);
+    }
+    if (read.code === "escapes-root") throw new ToolPermissionError(toolName, rel);
+    throw new ToolInputError(`${toolName}: ${read.reason}`);
+  }
+  if (read.truncated) {
     throw new ToolInputError(
-      `"${rel}" is ${stats.size} bytes, over the ${maxBytes} limit for this tool`,
+      `"${rel}" is ${read.size} bytes, over the ${maxBytes} limit for this tool`,
     );
   }
-  return { path, bytes: new Uint8Array(readFileSync(path.real)) };
+  return { path, bytes: read.bytes };
 }
 
-/** Write bytes to a contained path, refusing to clobber unless told to. */
-function writeFileSafe(
+/**
+ * Write bytes to a contained path, refusing to clobber unless told to.
+ *
+ * Through tool-safety's writer: the bytes go to an exclusively created temp
+ * beside the destination and are renamed into place, so a destination that
+ * is a FIFO, socket, device or directory is refused by name instead of
+ * opened. 0.7.0 `statSync`ed and then `writeFileSync`ed it; with `overwrite`
+ * a FIFO with no reader blocked that synchronous open for ever, and the
+ * whole runtime with it (C074's sibling, bounds review). A replaced file
+ * keeps its permission bits; a missing parent directory is still refused.
+ */
+function writeOutput(
   toolName: string,
   rel: string,
   data: Uint8Array | string,
   overwrite: boolean,
 ): SafePath {
+  // This package's own containment first, so an escape is worded as before.
   const path = resolveSafe(toolName, rel);
-  if (!overwrite) {
-    try {
-      statSync(path.real);
-      throw new ToolInputError(`"${rel}" already exists; pass overwrite to replace it`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
+  const written = writeContained(workspaceRoot(), rel, data, {
+    overwrite,
+    leafSymlink: "follow-contained",
+  });
+  if (written.ok) return path;
+  if (written.code === "exists") {
+    throw new ToolInputError(`"${rel}" already exists; pass overwrite to replace it`);
   }
-  writeFileSync(path.real, data);
-  return path;
+  if (written.code === "escapes-root") throw new ToolPermissionError(toolName, rel);
+  throw new ToolInputError(`${toolName}: ${written.reason}`);
 }
 
 /**
@@ -431,6 +455,7 @@ const docxBlockSchema = z.discriminatedUnion("type", [
 
 export const docxWrite: RegisteredTool = buildTool({
   name: "DocxWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write a .docx from structured content: headings, paragraphs, bullet or numbered lists, and tables. Use to hand somebody a real Word file; it produces a MINIMAL valid document with plain styling, not a re-render of an existing one.",
   inputSchema: z.object({
@@ -452,7 +477,7 @@ export const docxWrite: RegisteredTool = buildTool({
       if (input.creator !== undefined) options.creator = input.creator;
       if (input.created !== undefined) options.created = input.created;
       const bytes = writeDocx(input.blocks as DocxWriteBlock[], options);
-      const path = writeFileSafe("DocxWrite", input.path, bytes, input.overwrite === true);
+      const path = writeOutput("DocxWrite", input.path, bytes, input.overwrite === true);
       return json({ path: path.rel, bytes: bytes.length, blocks: input.blocks.length });
     }),
 });
@@ -510,6 +535,7 @@ const cellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
 export const xlsxWrite: RegisteredTool = buildTool({
   name: "XlsxWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write a .xlsx from rows, with numbers, booleans and strings kept as their own cell types and an optional bold header row. Use to produce a spreadsheet somebody can open; ISO-8601 strings become real date cells only for the columns you name, never by guessing.",
   inputSchema: z.object({
@@ -545,7 +571,7 @@ export const xlsxWrite: RegisteredTool = buildTool({
           return out;
         }),
       );
-      const path = writeFileSafe("XlsxWrite", input.path, bytes, input.overwrite === true);
+      const path = writeOutput("XlsxWrite", input.path, bytes, input.overwrite === true);
       return json({
         path: path.rel,
         bytes: bytes.length,
@@ -732,6 +758,10 @@ export const pdfText: RegisteredTool = buildTool({
 
 export const pdfSplit: RegisteredTool = buildTool({
   name: "PdfSplit",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Write a new PDF containing only the pages you select from an existing one. Use to pull a chapter or an exhibit out of a large PDF; the page tree is rebuilt from scratch, so the output is well-formed even when the input's cross-reference table was not.",
   inputSchema: z.object({
@@ -757,7 +787,7 @@ export const pdfSplit: RegisteredTool = buildTool({
       const options: { date?: string } = {};
       if (input.date !== undefined) options.date = input.date;
       const out = buildPdf([{ doc, pages: selection }], options);
-      const path = writeFileSafe("PdfSplit", input.output, out, input.overwrite === true);
+      const path = writeOutput("PdfSplit", input.output, out, input.overwrite === true);
       return json({
         path: path.rel,
         pages: selection.length,
@@ -769,6 +799,10 @@ export const pdfSplit: RegisteredTool = buildTool({
 
 export const pdfMerge: RegisteredTool = buildTool({
   name: "PdfMerge",
+  operativeArgs: [
+    { field: "inputs.path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Concatenate several PDFs, or selected pages of them, into one new file. Use to assemble an exhibit set or a combined report; each source's page objects are copied into a freshly built page tree, and annotations and bookmarks are dropped rather than left pointing at pages that are no longer there.",
   inputSchema: z.object({
@@ -806,7 +840,7 @@ export const pdfMerge: RegisteredTool = buildTool({
       const options: { date?: string } = {};
       if (input.date !== undefined) options.date = input.date;
       const out = buildPdf(selections, options);
-      const path = writeFileSafe("PdfMerge", input.output, out, input.overwrite === true);
+      const path = writeOutput("PdfMerge", input.output, out, input.overwrite === true);
       return json({
         path: path.rel,
         pages: selections.reduce((total, s) => total + s.pages.length, 0),
@@ -990,6 +1024,7 @@ export const icsParse: RegisteredTool = buildTool({
 
 export const icsWrite: RegisteredTool = buildTool({
   name: "IcsWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write an RFC 5545 calendar file from a list of events, with correct 75-octet line folding and text escaping. Use to produce an invitation or a feed another calendar application can import; the DTSTAMP is an input, so the same events always write the same bytes.",
   inputSchema: z.object({
@@ -1026,7 +1061,7 @@ export const icsWrite: RegisteredTool = buildTool({
       if (input.productId !== undefined) options.productId = input.productId;
       if (input.calendarName !== undefined) options.calendarName = input.calendarName;
       const text = writeCalendar(input.events as ReadonlyArray<EventInput>, options);
-      const path = writeFileSafe("IcsWrite", input.path, text, input.overwrite === true);
+      const path = writeOutput("IcsWrite", input.path, text, input.overwrite === true);
       return json({ path: path.rel, events: input.events.length, bytes: text.length });
     }),
 });

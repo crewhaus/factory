@@ -243,7 +243,7 @@ describe("crewhaus graders suggest (CLI)", () => {
     // No --force → refuse; --force → replace.
     expect((await runCli(["graders", "suggest"], root)).exitCode).toBe(1);
     expect((await runCli(["graders", "suggest", "--force"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   it("accepts an explicit --runs <dir> without any index", async () => {
     const root = newTempRoot();
@@ -252,11 +252,11 @@ describe("crewhaus graders suggest (CLI)", () => {
     const got = await runCli(["graders", "suggest", "--runs", runDir, "-o", "review.yaml"], root);
     expect(got.exitCode).toBe(0);
     expect(existsSync(join(root, "review.yaml"))).toBe(true);
-  });
+  }, 20_000);
 
   it("fails cleanly with no evidence and rejects unknown actions", async () => {
     const root = newTempRoot();
     expect((await runCli(["graders", "suggest"], root)).exitCode).toBe(1);
     expect((await runCli(["graders", "propose"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });

@@ -641,6 +641,111 @@ describe("profile tools are subset-only (0.6.0 §5.2)", () => {
     ).toEqual([]);
   });
 
+  test("a tool the shape grants through a category is in its toolset (0.7.1)", () => {
+    // csvParse is in all-data: a profile may narrow to it.
+    expect(
+      issuePaths(cli("tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }")),
+    ).toEqual([]);
+    // ...and an exclusion in the shape's list is honoured: csvWrite is not granted.
+    const excluded = parseSpecIssues(
+      cli(
+        "tools: [all-data, -csvWrite]",
+        "models:",
+        "  fast: { model: m, tools: [csvParse, csvWrite] }",
+      ),
+    );
+    expect(excluded.map((i) => i.path.join("."))).toEqual(["models.fast.tools.1"]);
+    expect(excluded[0]?.message).toMatch(
+      /"csvWrite" is not one of the shape's tools \(all-data, -csvWrite\)/,
+    );
+    // A tool no category of the shape grants is still refused.
+    expect(
+      issuePaths(cli("tools: [all-data]", "models:", "  fast: { model: m, tools: [bash] }")),
+    ).toEqual(["models.fast.tools.0"]);
+  });
+
+  test("a profile's own category is judged by the tools it keeps", () => {
+    const shape = "tools: [all-data, gitStatus]";
+    expect(issuePaths(cli(shape, "models:", "  fast: { model: m, tools: [all-data] }"))).toEqual(
+      [],
+    );
+    // all-git reaches past what the shape grants: named, with the tools it adds.
+    const wider = parseSpecIssues(cli(shape, "models:", "  fast: { model: m, tools: [all-git] }"));
+    expect(wider.map((i) => i.path.join("."))).toEqual(["models.fast.tools.0"]);
+    expect(wider[0]?.message).toMatch(
+      /"all-git" includes tools the shape's tools \(all-data, gitStatus\) do not grant: git/,
+    );
+    // A profile exclusion narrows its own category, and is never itself refused.
+    expect(
+      issuePaths(
+        cli(
+          "tools: [all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [all-data, -csvWrite] }",
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a profile naming a category the shape's list names is accepted as on 0.7.0, exclusions or not", () => {
+    // 0.7.0 compared the literal selector: `all-data` under
+    // `[read, all-data, -csvWrite]` was valid, and stays valid.
+    expect(
+      issuePaths(
+        cli(
+          "tools: [read, all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [read, all-data] }",
+        ),
+      ),
+    ).toEqual([]);
+    expect(
+      issuePaths(
+        workflow(
+          "    tools: [read, all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [all-data] }",
+        ),
+      ),
+    ).toEqual([]);
+    // A category the shape's lists do not name is still judged by what it adds.
+    const wider = parseSpecIssues(
+      cli(
+        "tools: [read, all-data, -csvWrite]",
+        "models:",
+        "  fast: { model: m, tools: [all-git] }",
+      ),
+    );
+    expect(wider.map((i) => i.path.join("."))).toEqual(["models.fast.tools.0"]);
+  });
+
+  test("a step's, node's or role's category grants to the shape's profiles and to its own pool", () => {
+    for (const yaml of [
+      workflow("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      graph("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      crew("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      cliAgent(
+        [
+          "  model_pool:",
+          "    candidates:",
+          "      - {model: m1, tags: [cheap], tools: [csvParse]}",
+          "      - {model: m2, tags: [strong]}",
+        ],
+        "tools: [all-data]",
+      ),
+    ]) {
+      expect(issuePaths(yaml)).toEqual([]);
+    }
+  });
+
+  test("a shape list that does not expand leaves the subset question to the compiler's error", () => {
+    // all-nonsense is refused by the compiler with the category message; the
+    // parse does not add a second, wrong subset error on top of it.
+    expect(
+      issuePaths(cli("tools: [all-nonsense]", "models:", "  fast: { model: m, tools: [read] }")),
+    ).toEqual([]);
+  });
+
   test("when the shape declares no tools list the subset check waits for the ir-pass (no issue)", () => {
     expect(issuePaths(cli("models:", "  fast: { model: m, tools: [read] }"))).toEqual([]);
   });
@@ -1429,13 +1534,13 @@ describe("mcp_servers.<n>.tool_flags is narrowing-only (0.6.0 §5.5)", () => {
   test("accepts defaults + per_tool in the tightening direction on both transports", () => {
     const spec = parseSpec(
       server(
-        "{ defaults: { readOnly: true }, per_tool: { create_issue: { destructive: true, requireJustification: true } } }",
+        "{ defaults: { requireJustification: true }, per_tool: { create_issue: { destructive: true, requireJustification: true } } }",
       ),
     );
     if (spec.target !== "cli") expect.unreachable();
     const flags: SpecMcpToolFlags = spec.mcp_servers?.["github"]?.tool_flags;
     expect(flags).toEqual({
-      defaults: { readOnly: true },
+      defaults: { requireJustification: true },
       per_tool: { create_issue: { destructive: true, requireJustification: true } },
     });
     const sse = parseSpec(
@@ -1444,14 +1549,29 @@ describe("mcp_servers.<n>.tool_flags is narrowing-only (0.6.0 §5.5)", () => {
         "  remote:",
         "    transport: sse",
         "    url: https://mcp.example",
-        "    tool_flags: { defaults: { readOnly: true } }",
+        "    tool_flags: { defaults: { destructive: true } }",
       ),
     );
     if (sse.target !== "cli") expect.unreachable();
-    expect(sse.mcp_servers?.["remote"]?.tool_flags?.defaults?.readOnly).toBe(true);
+    expect(sse.mcp_servers?.["remote"]?.tool_flags?.defaults?.destructive).toBe(true);
+  });
+
+  test("REJECTS readOnly: true — it is a grant, not a restriction — and says what to write", () => {
+    // Plan and auto mode run a read-only tool without asking, so marking a
+    // remote tool read-only would widen what it may do.
+    let message = "";
+    try {
+      parseSpec(server("{ per_tool: { list_repos: { readOnly: true } } }"));
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecParseError);
+      message = (err as Error).message;
+    }
+    expect(message).toContain("read-only is a grant, not a restriction");
+    expect(message).toContain("destructive: true or requireJustification: true");
   });
 
   test.each([
+    ["readOnly: true", "{ defaults: { readOnly: true } }"],
     ["readOnly: false", "{ defaults: { readOnly: false } }"],
     ["requireJustification: false", "{ per_tool: { x: { requireJustification: false } } }"],
     ["destructive: false", "{ defaults: { destructive: false } }"],

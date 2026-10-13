@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
  * temporary directory and the escape tests reach for a path outside it.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -120,6 +120,23 @@ describe("SemverResolve", () => {
   test("a non-range specifier gets an explanation, not an empty answer", async () => {
     const out = await callRaw(semverResolve, { range: "workspace:*", versions: ["1.0.0"] });
     expect(out).toContain("not understood");
+  });
+
+  test("versions that do not parse are blamed, not the range", async () => {
+    const out = await callRaw(semverResolve, {
+      range: "^1.0.0",
+      versions: ["banana", "not-a-version"],
+    });
+    expect(out).not.toContain("not understood");
+    expect(out).toContain("none of the 2 versions parsed");
+  });
+
+  test("the pick is the one npm would install, not a prerelease of a later tuple", async () => {
+    const result = await call(semverResolve, {
+      range: "^1.2.3-beta.2",
+      versions: ["1.2.3-beta.4", "1.5.0", "1.9.0-rc.1"],
+    });
+    expect(result).toMatchObject({ best: "1.5.0" });
   });
 });
 
@@ -430,4 +447,126 @@ describe("PackagePublishPreflight", () => {
     const out = await callRaw(packagePublishPreflight, {});
     expect(out).toContain("package.json");
   });
+});
+
+// ---------------------------------------------------------------------------
+// 0.7.1 — the package.json LEAF is contained, not only its directory
+// (security-7#1, flag-truth-4#8). Both tools used to realpath/contain the
+// directory and then read `<dir>/package.json` through a following read; the
+// parser's error quoted a bare token file whole.
+// ---------------------------------------------------------------------------
+
+describe("a package.json linked out of the workspace", () => {
+  /** A token-shaped sentinel built at run time, clear of push protection. */
+  const TOKEN = ["gh", "p_", "LEAKTEST".repeat(4)].join("");
+  let outside: string;
+  beforeEach(() => {
+    outside = mkdtempSync(join(tmpdir(), "crewhaus-pkg-outside-"));
+    writeFileSync(
+      join(outside, "secret.json"),
+      '{"name":"leaked-name","version":"9.9.9","license":"LEAKED-LICENSE"}',
+    );
+    writeFileSync(join(outside, "token"), `${TOKEN}\n`);
+  });
+  afterEach(() => rmSync(outside, { recursive: true, force: true }));
+
+  test("LicenseAggregate skips and counts it, in neither the list nor the counts", async () => {
+    mkdirSync(join(workspace, "node_modules", "leaky"), { recursive: true });
+    symlinkSync(
+      join(outside, "secret.json"),
+      join(workspace, "node_modules", "leaky", "package.json"),
+    );
+    const dir = join(workspace, "node_modules", "honest");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), '{"name":"honest","version":"1.0.0","license":"MIT"}');
+    const out = await callRaw(licenseAggregate, { listPackages: true });
+    const result = JSON.parse(out) as { packages: number; skippedOutsideWorkspace?: number };
+    expect(result.packages).toBe(1);
+    expect(result.skippedOutsideWorkspace).toBe(1);
+    expect(out).not.toContain("LEAKED");
+    expect(out).not.toContain("leaked-name");
+  });
+
+  test("a pnpm-style manifest link that stays inside is still read", async () => {
+    const store = join(workspace, "store", "inner");
+    mkdirSync(store, { recursive: true });
+    writeFileSync(
+      join(store, "package.json"),
+      '{"name":"inner","version":"1.0.0","license":"ISC"}',
+    );
+    mkdirSync(join(workspace, "node_modules", "inner"), { recursive: true });
+    symlinkSync(
+      join("..", "..", "store", "inner", "package.json"),
+      join(workspace, "node_modules", "inner", "package.json"),
+    );
+    const result = await call<{ packages: number; counts: Array<{ license: string }> }>(
+      licenseAggregate,
+      {},
+    );
+    expect(result.packages).toBe(1);
+    expect(result.counts[0]?.license).toBe("ISC");
+  });
+
+  test("an unparseable manifest is counted, not silently dropped", async () => {
+    mkdirSync(join(workspace, "node_modules", "torn"), { recursive: true });
+    writeFileSync(join(workspace, "node_modules", "torn", "package.json"), "{ torn");
+    const result = await call<{ packages: number; skippedUnreadableManifests?: number }>(
+      licenseAggregate,
+      {},
+    );
+    expect(result.packages).toBe(0);
+    expect(result.skippedUnreadableManifests).toBe(1);
+  });
+
+  test("PackagePublishPreflight never reads it — JSON or a bare token", async () => {
+    for (const target of ["secret.json", "token"]) {
+      rmSync(join(workspace, "pkg"), { recursive: true, force: true });
+      mkdirSync(join(workspace, "pkg"));
+      symlinkSync(join(outside, target), join(workspace, "pkg", "package.json"));
+      const out = await callRaw(packagePublishPreflight, { directory: "pkg" }).catch((e) =>
+        String(e),
+      );
+      expect({ target, leaked: out.includes(TOKEN) || out.includes("leaked-name") }).toEqual({
+        target,
+        leaked: false,
+      });
+      expect(out).toMatch(/escapes the workspace root/);
+    }
+  });
+
+  test("a malformed manifest inside the workspace is named without quoting it", async () => {
+    writeFileSync(join(workspace, "package.json"), `${TOKEN} not json`);
+    const out = await callRaw(packagePublishPreflight, {});
+    // The parser's words stay; the token it quoted does not.
+    expect(out).toBe("package.json is not valid JSON (Unexpected identifier)");
+    // A trailing comma is named as what it is, as 0.7.0 named it.
+    writeFileSync(join(workspace, "package.json"), '{"name": "x",}');
+    expect(await callRaw(packagePublishPreflight, {})).toBe(
+      "package.json is not valid JSON (Property name must be a string literal)",
+    );
+  });
+
+  // In a child process: before the fix the read BLOCKED on the FIFO, and a
+  // blocked test would hang the suite instead of failing.
+  test.skipIf(process.platform === "win32")(
+    "a FIFO where a lockfile belongs is refused without being opened",
+    async () => {
+      writeFileSync(join(workspace, "package-lock.json"), "{}");
+      execFileSync("mkfifo", [join(workspace, "fifo-lock.json")]);
+      const script = `
+        process.chdir(${JSON.stringify(workspace)});
+        const { lockfileDiff } = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+        try { console.log(await lockfileDiff.execute({ before: "fifo-lock.json", after: "package-lock.json" }, {})); }
+        catch (err) { console.log("threw: " + err.message); }
+      `;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const text = await new Response(child.stdout).text();
+      clearTimeout(killer);
+      expect(await child.exited).toBe(0);
+      expect(text).toMatch(/threw: fifo-lock\.json is not a regular file \(it is a fifo\)/);
+      expect(readdirSync(workspace).sort()).toEqual(["fifo-lock.json", "package-lock.json"]);
+    },
+    20_000,
+  );
 });

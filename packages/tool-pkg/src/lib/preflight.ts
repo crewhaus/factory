@@ -65,7 +65,19 @@ const SECRET_NAMES = [
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
-const clean = (p: string): string => p.replace(/^\.\//, "").replace(/\/+$/, "");
+/**
+ * `p` without a leading `./` or its trailing slashes. Slicing and a loop
+ * from the end, not `/\/+$/`: that pattern tries every start inside a run
+ * of slashes and rescans the rest of the run from each, quadratic in the
+ * run's length, and a package.json comes from the repository, which may be
+ * a template or a pull request.
+ */
+export function clean(p: string): string {
+  const from = p.startsWith("./") ? 2 : 0;
+  let end = p.length;
+  while (end > from && p.charCodeAt(end - 1) === 0x2f) end--;
+  return p.slice(from, end);
+}
 
 /**
  * Match a `*` glob against a path, without building a regular expression.

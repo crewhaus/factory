@@ -19,7 +19,11 @@
     "@crewhaus/model-router": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

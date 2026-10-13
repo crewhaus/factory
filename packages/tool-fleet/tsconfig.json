@@ -24,6 +24,9 @@
       "path": "../spec"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

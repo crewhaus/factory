@@ -334,6 +334,14 @@ export type RunOptions = {
   readonly sessionId?: string;
   /** Override session root dir. Defaults to runtime-core's default `.crewhaus/sessions`. */
   readonly sessionRootDir?: string;
+  /**
+   * A code-execution backend is available, so the permission engine's
+   * sandbox floor lets python/javascript/shell run. Forwarded verbatim to
+   * every role's runChatLoop; the crew emitter sets it (from
+   * CREWHAUS_SANDBOX, like the cli bundle) only when a role registers one of
+   * those tools. Absent means no sandbox: those tools are denied.
+   */
+  readonly sandboxAvailable?: boolean;
   /** Test injection backdoor: scripted ProviderAdapter shared by every role. */
   readonly _adapter?: ProviderAdapter;
   /**
@@ -690,6 +698,9 @@ async function* driveCrew(
           }),
           permissionMode,
           permissionRules,
+          ...(args.opts.sandboxAvailable !== undefined
+            ? { sandboxAvailable: args.opts.sandboxAvailable }
+            : {}),
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
           // 0.5.0 — except `memory`, which a role may override so it recalls
@@ -789,6 +800,9 @@ async function* driveCrew(
           }),
           permissionMode,
           permissionRules,
+          ...(args.opts.sandboxAvailable !== undefined
+            ? { sandboxAvailable: args.opts.sandboxAvailable }
+            : {}),
           ...(failureTaxonomy !== undefined ? { failureTaxonomy } : {}),
           // v0.3.0 — the memory fabric's seams/skills, crew-wide (§2.7).
           // 0.5.0 — except `memory`, which a role may override so it recalls

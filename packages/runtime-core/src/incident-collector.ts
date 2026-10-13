@@ -15,9 +15,10 @@
  * is best-effort (a capture failure is logged, never thrown — an incident
  * writer must not turn one failure into two).
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { RunContext } from "@crewhaus/run-context";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import type { TraceEvent, TraceEventBus, Unsubscribe } from "@crewhaus/trace-event-bus";
 
 export type IncidentTriggerKind =
@@ -147,8 +148,28 @@ export function attachIncidentCollector(
 
     try {
       const ts = now().toISOString();
-      const dir = join(incidentsDir, incidentDirName(ts, trigger.kind));
-      mkdirSync(dir, { recursive: true });
+      const name = incidentDirName(ts, trigger.kind);
+      const dir = join(incidentsDir, name);
+      // 0.7.1: written rooted at the incidents directory's PARENT (the
+      // harness `.crewhaus`), with the path under it relative, so the lazily
+      // created `incidents/` directory is contained too. With a plain
+      // `mkdir -p` + `writeFileSync`, a link a model planted at
+      // `.crewhaus/incidents` (GitApplyPatch creates one) received the
+      // capture, ring-buffer events and all, wherever it pointed.
+      const root = dirname(resolve(incidentsDir));
+      const rel = `${basename(resolve(incidentsDir))}/${name}`;
+      mkdirSync(root, { recursive: true });
+      const write = (file: string, data: string): void => {
+        const written = writeFileSafe(root, `${rel}/${file}`, data, {
+          overwrite: true,
+          createParents: true,
+        });
+        if (!written.ok) {
+          throw new Error(
+            `refusing to write ${join(dir, file)}: ${written.reason} (code ${written.code})`,
+          );
+        }
+      };
       const ring = bus.recent();
       const capture = {
         version: 1 as const,
@@ -161,9 +182,9 @@ export function attachIncidentCollector(
         spec: options.spec ?? null,
         ringEventCount: ring.length,
       };
-      writeFileSync(join(dir, "incident.json"), `${JSON.stringify(capture, null, 2)}\n`);
-      writeFileSync(
-        join(dir, "events.jsonl"),
+      write("incident.json", `${JSON.stringify(capture, null, 2)}\n`);
+      write(
+        "events.jsonl",
         ring.length === 0 ? "" : `${ring.map((e) => JSON.stringify(e)).join("\n")}\n`,
       );
       process.stderr.write(

@@ -14,8 +14,9 @@
  * clobber each other's keypair (first writer wins; the loser re-reads it).
  */
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { closeSync, mkdirSync, writeSync } from "node:fs";
+import { resolve } from "node:path";
+import { createExclusive, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 /** Default directory the identity file lives in (the project `.crewhaus` dir). */
 export const DEFAULT_IDENTITY_DIR = ".crewhaus";
@@ -59,10 +60,20 @@ function mint(now: () => Date): AgentIdentityFile {
   };
 }
 
-function safeParse(path: string): AgentIdentityFile | undefined {
-  if (!existsSync(path)) return undefined;
+/** The largest identity file read: a keypair is a few hundred bytes. */
+const MAX_IDENTITY_BYTES = 64 * 1024;
+
+function safeParse(dir: string): AgentIdentityFile | undefined {
+  // 0.7.1: never through a link at the name, so a planted
+  // `identity.json -> <elsewhere>` is never taken for (or replaced as) the
+  // agent's identity.
+  const read = openForReadSync(dir, IDENTITY_FILENAME, {
+    maxBytes: MAX_IDENTITY_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok || read.truncated) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<AgentIdentityFile>;
+    const parsed = JSON.parse(read.text) as Partial<AgentIdentityFile>;
     if (
       typeof parsed.agentId === "string" &&
       parsed.agentId.length > 0 &&
@@ -86,23 +97,40 @@ export function loadOrCreateAgentIdentity(
   dir: string = DEFAULT_IDENTITY_DIR,
   now: () => Date = () => new Date(),
 ): AgentIdentityFile {
-  const path = resolve(dir, IDENTITY_FILENAME);
-  const existing = safeParse(path);
+  const root = resolve(dir);
+  const path = resolve(root, IDENTITY_FILENAME);
+  mkdirSync(root, { recursive: true });
+  const existing = safeParse(root);
   if (existing !== undefined) return existing;
 
   const identity = mint(now);
   const body = `${JSON.stringify(identity, null, 2)}\n`;
-  mkdirSync(dirname(path), { recursive: true });
-  try {
-    // create-exclusive: the first concurrent first-boot wins the keypair.
-    writeFileSync(path, body, { flag: "wx", mode: 0o600 });
-    return identity;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    // Lost the create race, or a corrupt file squats the path.
-    const winner = safeParse(path);
-    if (winner !== undefined) return winner;
-    writeFileSync(path, body, { mode: 0o600 });
+  // create-exclusive: the first concurrent first-boot wins the keypair.
+  const created = createExclusive(root, IDENTITY_FILENAME, { mode: 0o600 });
+  if (created.ok) {
+    try {
+      const bytes = Buffer.from(body, "utf8");
+      let at = 0;
+      while (at < bytes.length) at += writeSync(created.fd, bytes, at, bytes.length - at);
+    } finally {
+      closeSync(created.fd);
+    }
     return identity;
   }
+  if (created.code !== "exists") throw identityRefusal(path, created);
+  // Lost the create race, or a corrupt file squats the path.
+  const winner = safeParse(root);
+  if (winner !== undefined) return winner;
+  // 0.7.1: replaced through a random O_EXCL|O_NOFOLLOW temp, never written
+  // through what squats the name. A link there is refused: 0.7.0 wrote the
+  // new keypair, private key included, through it to wherever it pointed.
+  const written = writeFileSafe(root, IDENTITY_FILENAME, body, { overwrite: true, mode: 0o600 });
+  if (!written.ok) throw identityRefusal(path, written);
+  return identity;
+}
+
+function identityRefusal(path: string, failure: { reason: string; code: string }): Error {
+  return new Error(
+    `agent identity: refusing to write ${path}: ${failure.reason} (code ${failure.code})`,
+  );
 }

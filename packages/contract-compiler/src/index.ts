@@ -35,6 +35,7 @@ import {
   type SpecializationMatch,
   match as matchSpecialization,
 } from "@crewhaus/specialization-registry";
+import { bulletText, numberedText } from "./line-parts";
 
 export class ContractCompilerError extends CrewhausError {
   override readonly name = "ContractCompilerError";
@@ -161,14 +162,16 @@ export async function compileContract(opts: CompileContractOptions): Promise<Com
 
 /**
  * Bullet-extractor: lines starting with -, *, or numbered. Collects
- * the trimmed body of each.
+ * the trimmed body of each. The items are read by scans (line-parts.ts):
+ * their patterns were quadratic in a run of spaces on a line holding a
+ * lone `\r` or a U+2028.
  */
 function extractRequirements(text: string): string[] {
   const lines = text.split(/\r?\n/);
   const out: string[] = [];
   for (const line of lines) {
-    const m = line.match(/^\s*[-*]\s+(.+)$/) ?? line.match(/^\s*\d+\.\s+(.+)$/);
-    if (m !== null && m[1] !== undefined) out.push(m[1].trim());
+    const item = bulletText(line) ?? numberedText(line);
+    if (item !== undefined) out.push(item.trim());
   }
   return out;
 }

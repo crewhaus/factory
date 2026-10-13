@@ -3,6 +3,7 @@
  * rule, proxy reconciliation, and the predicate the simulation degrades on.
  */
 import { describe, expect, test } from "bun:test";
+import { createEvmAdapter } from "@crewhaus/chain-adapter-evm";
 import { functionSelector } from "@crewhaus/tool-onchain";
 import { ADDR, aggregate3Return, jsonRpcError, minimalProxyCode, word } from "./fixtures";
 import { chunk } from "./lib/batch";
@@ -13,6 +14,7 @@ import {
   balanceOfData,
   bytes4Arg,
   checkAddress,
+  decodeValues,
   getEthBalanceData,
   supportsInterfaceData,
 } from "./lib/codec";
@@ -47,6 +49,7 @@ import {
   ChainCallError,
   type ChainRpc,
   _setRpc,
+  firstRefusal,
   isAbort,
   isMethodUnsupported,
   resolveRpc,
@@ -176,6 +179,16 @@ describe("codec — the selectors are recomputed, never trusted on sight", () =>
 
   test("a mistyped address is refused rather than checksummed into something", async () => {
     await expect(checkAddress("0x1234", "the target")).rejects.toThrow(ChainCallError);
+  });
+
+  test("return data is held to AbiDecode's own size cap, not decoded past it (C085)", async () => {
+    // A node's answer reaches the decoder without passing a model, so the
+    // schema's cap has to be applied here: 0.7.0 called execute directly.
+    const huge = `0x${"00".repeat(1_000_001)}`;
+    await expect(decodeValues(["uint256"], huge, "calls[0]")).rejects.toThrow(
+      /^calls\[0\]: AbiDecode refused the input \(data\): String must contain at most 2000000/,
+    );
+    expect(await decodeValues(["uint256"], `0x${"00".repeat(31)}2a`, "calls[0]")).toEqual(["42"]);
   });
 });
 
@@ -401,6 +414,77 @@ describe("rpc — reading a node's refusal", () => {
     expect(isMethodUnsupported(jsonRpcError(-32601, "nope"), controller.signal)).toBe(false);
   });
 
+  test("through the chain adapter, every node must say the method is missing, whichever failed last", async () => {
+    // The adapter's error ends with the LAST node's reason, which is timing.
+    // Read from those words, a node that rejected the bundle's parameters
+    // and was followed by one lacking the method looked like "unsupported".
+    const said = {
+      missing: {
+        code: -32601,
+        message: "the method eth_simulateV1 does not exist/is not available",
+      },
+      params: { code: -32602, message: "invalid params: bundle rejected" },
+      reverts: { code: 3, message: "execution reverted" },
+    } as const;
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      const host = new URL(url).hostname.split(".")[0] as keyof typeof said | "down";
+      if (host === "down") return new Response("upstream down", { status: 503 });
+      const { id } = JSON.parse(String(init.body)) as { id: number };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: said[host] }));
+    }) as unknown as typeof fetch;
+    const failure = (hosts: string[], rpcPolicy: "single" | "fallback" | "quorum") =>
+      createEvmAdapter(
+        {
+          chainId: "1",
+          rpcUrls: hosts.map((h) => `https://${h}.test/`),
+          rpcPolicy,
+          finality: { kind: "finalized" },
+          reorgTolerant: true,
+        },
+        fetchImpl,
+      )
+        .rpcRead("eth_simulateV1", [], { bypassCache: true })
+        .then(
+          () => {
+            throw new Error("the read was expected to fail");
+          },
+          (err: unknown) => err,
+        );
+    const rows: Array<[string, string[], "single" | "fallback" | "quorum"]> = [
+      ["one node lacking it", ["missing"], "single"],
+      ["two nodes lacking it", ["missing", "missing"], "fallback"],
+      ["rejects the params, then lacks it", ["params", "missing"], "fallback"],
+      ["lacks it, then rejects the params", ["missing", "params"], "fallback"],
+      ["lacks it, then cannot be reached", ["missing", "down"], "fallback"],
+      ["rejects the params, then reverts", ["params", "reverts"], "fallback"],
+      ["two voters lacking it, one never heard", ["missing", "missing"], "quorum"],
+    ];
+    const out: Record<string, unknown> = {};
+    for (const [label, hosts, policy] of rows) {
+      const err = await failure(hosts, policy);
+      out[label] = { unsupported: isMethodUnsupported(err), refusal: firstRefusal(err) };
+    }
+    expect(out).toEqual({
+      "one node lacking it": { unsupported: true, refusal: undefined },
+      "two nodes lacking it": { unsupported: true, refusal: undefined },
+      "rejects the params, then lacks it": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
+      "lacks it, then rejects the params": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
+      "lacks it, then cannot be reached": { unsupported: false, refusal: undefined },
+      // The refusal quoted is the first node's in the chain's order, not the last to fail.
+      "rejects the params, then reverts": {
+        unsupported: false,
+        refusal: "invalid params: bundle rejected (code -32602)",
+      },
+      "two voters lacking it, one never heard": { unsupported: false, refusal: undefined },
+    });
+  });
+
   test("a read that outlives its signal rejects as an abort, so a timeout bounds something", async () => {
     // `ChainAdapter.rpcRead` takes no signal, so the transport below cannot
     // be cancelled. Racing is what makes `timeoutMs` mean anything at all;
@@ -426,9 +510,11 @@ describe("rpc — reading a node's refusal", () => {
     expect(dispatched).toBe(0);
   });
 
-  test("with nothing bound, a tool says what the operator has to wire", () => {
+  test("with nothing bound, a tool says what the spec has to declare", () => {
     _setRpc(undefined);
-    expect(() => resolveRpc("base-mainnet", "EvmMulticall")).toThrow(/setChainRpcResolver/);
+    expect(() => resolveRpc("base-mainnet", "EvmMulticall")).toThrow(
+      /EvmMulticall: no chain is configured\. Declare one in the spec — chains:/,
+    );
   });
 
   test("with a chain missing, it names the chain rather than the wiring", () => {

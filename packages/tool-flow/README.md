@@ -61,6 +61,10 @@ explanation rather than guessed at, because per ECMAScript an offset-less
 date-time string is *local* time while the date-only form is UTC — so the
 same spec would mean different instants on two machines.
 
+`RuleScore` adds points as exact decimals, not binary floats, so `0.7 + 0.1`
+is `0.8` and meets a band at `0.8`, and the total does not depend on the
+order the rules are declared in.
+
 An epoch outside the ±8.64e15 ms a `Date` can represent is rejected by name
 for the same reason: the field that parsed it is the only place that still
 knows which of a spec's several instants was the bad one, and left to reach a
@@ -137,6 +141,12 @@ Two details worth knowing:
   `capacity`, which is retryable in general — but that particular one
   resolves to `escalate`, and a caller reading the boolean would otherwise
   re-run the identical command and be killed identically.
+- **A `Retry-After` date is read only with its zone written.** The RFC 9110
+  HTTP-date forms (GMT by definition), an RFC 5322 date with its zone
+  (`+0200`, `UTC`, `-0000`, `PDT`), and an ISO-8601 instant with an offset
+  (`T` or a space before the time) are the same instant on every machine; a
+  date with no zone is not read at all, rather than read as the host's local
+  time. A date that does not exist (30 February, hour 24) is not read either.
 - **Message matching uses substrings, not regular expressions.** That text
   comes from a remote server, and a pattern with nested quantifiers there is
   a denial of service waiting to happen. Caller-supplied rules may use a
@@ -146,33 +156,32 @@ Exit code `1` is deliberately unclassified. It is the generic "it failed" and
 says nothing about why, so claiming a class for it would be inventing
 information.
 
-## A known limitation: regex denial of service
+## Caller patterns: off the thread, and never a guessed miss
 
-The `matches` and `notMatches` ops compile a caller-supplied pattern and run
-it against caller-supplied text. JavaScript's regex engine backtracks, so a
-pattern with nested quantifiers against text that *nearly* matches can take
-seconds of CPU:
+The `matches` and `notMatches` ops, and an `ErrorClassify` rule's `matches`,
+run a caller-supplied pattern against caller-supplied text. JavaScript's regex
+engine backtracks, so a synchronous match can hold the whole process
+(`a*a*a*a*b` against 200 letters: 3.7 s; against 400: 108 s), and when the
+engine gives up on a match it answers "no match".
 
-```
-^(([a-z])+.)+[A-Z]([a-z])+$   against 60 lowercase letters   ~2.7s
-```
+So no tool here runs one on the caller's thread. Before evaluating, each tool
+asks every pattern its arms, rows, rules, owners or steps will test, answers
+them all in one `@crewhaus/tool-safety` regex worker under a five-second
+deadline, and then evaluates with the answers (the shared machinery is in
+`@crewhaus/tool-schema`). A pattern the screen refuses (a shape that
+backtracks exponentially, such as `(a+)+`) fails its check as an invalid
+regex does, and an `ErrorClassify` rule with one is an invalid rule. A pattern
+that cannot be run to an answer (the deadline, the engine giving up, which
+includes a no-match slower than 100 ms) decides nothing:
 
-This is a property of the shared check grammar in `@crewhaus/tool-schema`,
-not of this package — the `Assert` tool has the same exposure, and both are
-reachable with operator-written or model-written patterns matched against
-text a harness fetched from somewhere else.
+- `Branch` takes no arm, and not `otherwise`, and says which arm was undecided;
+- `DecisionTable` gives no outputs when the undecided row could change them;
+- `RuleScore` gives a null score and band, and lists the undecided rules;
+- `LeadAssign` refuses, as it does for an owner missing a load;
+- `SequenceRun` holds the step in `undetermined`, and the flow is `blocked`;
+- `ErrorClassify` answers class `unknown`, action `escalate`, source
+  `undetermined`, never a later rule's or a builtin pack's answer.
 
-Two things reduce it, neither of which is a fix:
-
-- `ErrorClassify` matches `message` and `code` **separately** rather than
-  joining them. A pattern anchored with `$` against a joined string can never
-  match, and a pattern that can never match is precisely the worst case for a
-  backtracking engine — joining the fields manufactured that for free.
-- `ErrorClassify`'s builtin packs use substrings, never patterns, so the
-  default path compiles no regex at all.
-
-A real fix has to live in the shared evaluator: reject nested-quantifier
-patterns before compiling them, or match with an engine that does not
-backtrack. Until then, treat `matches` as trusted-pattern-only, and prefer
-`contains`, `startsWith` and `endsWith` — which are linear — where they will
-do.
+`ErrorClassify` still matches `message` and `code` separately (a pattern
+anchored with `$` against a joined string could never match), and its
+builtin packs still use substrings, never patterns.

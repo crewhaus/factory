@@ -23,16 +23,15 @@
  * and appending its own snapshot JSONL); event folding, threshold derivation,
  * and breach detection are pure and unit-tested.
  */
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, mkdirSync, readSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { FLOOR_BLOCKED_ROUTE_REASON as ROUTER_FLOOR_BLOCKED_ROUTE_REASON } from "@crewhaus/model-router";
+import {
+  type SafeFsFailure,
+  appendContained,
+  openForReadFd,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 /** Default location of the per-session metrics history, relative to cwd. */
@@ -431,6 +430,68 @@ function fmt(n: number): string {
 // --------- snapshot persistence (the only I/O this module owns) ---------
 
 /**
+ * The most bytes of history {@link readMetricsHistory} reads: the file's
+ * TAIL, never more. {@link MAX_METRICS_HISTORY_LINES} snapshot lines are a few
+ * hundred KiB; a file past this was grown by something else, and only its end
+ * is ever consulted.
+ */
+export const MAX_METRICS_HISTORY_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Where the history lives, as a root and a path under it. 0.7.1: the root is
+ * the metrics directory's PARENT (the harness `.crewhaus`), so the lazily
+ * created `metrics/` directory is itself contained: a symlink planted at
+ * `.crewhaus/metrics`, or at `sessions.jsonl`, is refused instead of written
+ * through (a model with GitApplyPatch can plant one; the path is fixed, so it
+ * needs nothing else). The parent itself is the operator's, and may be a link.
+ */
+function metricsLocation(metricsDir: string): { root: string; rel: string; abs: string } {
+  const dir = resolve(metricsDir);
+  return {
+    root: dirname(dir),
+    rel: `${basename(dir)}/${METRICS_FILENAME}`,
+    abs: join(dir, METRICS_FILENAME),
+  };
+}
+
+function metricsRefusal(op: string, abs: string, failure: SafeFsFailure): Error {
+  return new Error(
+    `alert-watchdog: refusing to ${op} ${abs}: ${failure.reason} (code ${failure.code})`,
+  );
+}
+
+/**
+ * The last {@link MAX_METRICS_HISTORY_BYTES} of the history file, or
+ * undefined when there is none. A link, FIFO or directory at the name, or a
+ * `metrics/` directory that leads out of `.crewhaus`, is refused (thrown),
+ * never read.
+ */
+function readHistoryTail(metricsDir: string): string | undefined {
+  const { root, rel, abs } = metricsLocation(metricsDir);
+  const opened = openForReadFd(root, rel, { followLeafSymlink: false });
+  if (!opened.ok) {
+    if (opened.code === "not-found") return undefined;
+    throw metricsRefusal("read", abs, opened);
+  }
+  try {
+    const size = opened.stats.size;
+    const length = Math.min(size, MAX_METRICS_HISTORY_BYTES);
+    const buf = Buffer.alloc(length);
+    let got = 0;
+    while (got < length) {
+      const n = readSync(opened.fd, buf, got, length - got, size - length + got);
+      if (n === 0) break;
+      got += n;
+    }
+    const text = buf.subarray(0, got).toString("utf-8");
+    // A tail that starts mid-file starts mid-line: drop the partial line.
+    return length < size ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally {
+    closeSync(opened.fd);
+  }
+}
+
+/**
  * Read the persisted session history, oldest first. Torn lines are skipped.
  *
  * F3 — bounds itself to the trailing {@link MAX_METRICS_HISTORY_LINES} raw
@@ -438,19 +499,20 @@ function fmt(n: number): string {
  * an older binary that predates the cap, or a file that grew past the cap
  * some other way) is never fully materialized into memory just to derive a
  * threshold from its tail. `appendMetricsSnapshot` keeps the file itself
- * trimmed going forward; this is the reader's independent bound.
+ * trimmed going forward; this is the reader's independent bound. 0.7.1: only
+ * the file's last {@link MAX_METRICS_HISTORY_BYTES} are read at all, and the
+ * file is read contained (see {@link appendMetricsSnapshot}); a refused file
+ * throws rather than reading as an empty history.
  */
 export function readMetricsHistory(
   metricsDir: string = DEFAULT_METRICS_DIR,
 ): SessionMetricsSnapshot[] {
-  const path = join(metricsDir, METRICS_FILENAME);
-  if (!existsSync(path)) return [];
+  const text = readHistoryTail(metricsDir);
+  if (text === undefined) return [];
   // Filter blank lines (incl. the trailing "" from the file's final newline)
   // BEFORE slicing to the trailing cap — slicing raw split() output would
   // waste one slot of the cap on that trailing empty entry.
-  const lines = readFileSync(path, "utf-8")
-    .split("\n")
-    .filter((l) => l.trim() !== "");
+  const lines = text.split("\n").filter((l) => l.trim() !== "");
   const bounded = lines.slice(-MAX_METRICS_HISTORY_LINES);
   const out: SessionMetricsSnapshot[] = [];
   for (const line of bounded) {
@@ -471,21 +533,32 @@ export function readMetricsHistory(
  * temp-write + rename so a crash mid-trim never leaves a torn or truncated
  * file in place of the real one; a torn LINE within the kept tail is still
  * tolerated by `readMetricsHistory`.
+ *
+ * 0.7.1: both go through @crewhaus/tool-safety, rooted at `.crewhaus` (see
+ * {@link metricsLocation}): the append with `appendContained`, the trim with
+ * `writeFileSafe` (a random O_EXCL|O_NOFOLLOW temp, never the pid-derived
+ * `sessions.jsonl.tmp-<pid>-<ms>`). A refusal throws, naming the file and the
+ * reason; the watchdog logs it and still checks this session's breaches.
  */
 export function appendMetricsSnapshot(
   snapshot: SessionMetricsSnapshot,
   metricsDir: string = DEFAULT_METRICS_DIR,
 ): void {
-  const path = join(metricsDir, METRICS_FILENAME);
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, `${JSON.stringify(snapshot)}\n`);
+  const { root, rel, abs } = metricsLocation(metricsDir);
+  mkdirSync(root, { recursive: true });
+  const appended = appendContained(root, rel, `${JSON.stringify(snapshot)}\n`, {
+    createParents: true,
+  });
+  if (!appended.ok) throw metricsRefusal("append to", abs, appended);
 
-  const lines = readFileSync(path, "utf-8")
-    .split("\n")
-    .filter((l) => l.trim() !== "");
-  if (lines.length <= MAX_METRICS_HISTORY_LINES) return;
+  // Past the byte cap the reader sees only the tail, so the file is trimmed
+  // to the tail's last lines even when that is fewer than the line cap.
+  const text = readHistoryTail(metricsDir) ?? "";
+  const lines = text.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length <= MAX_METRICS_HISTORY_LINES && appended.size <= MAX_METRICS_HISTORY_BYTES) {
+    return;
+  }
   const trimmed = lines.slice(-MAX_METRICS_HISTORY_LINES);
-  const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmpPath, `${trimmed.join("\n")}\n`);
-  renameSync(tmpPath, path);
+  const written = writeFileSafe(root, rel, `${trimmed.join("\n")}\n`, { overwrite: true });
+  if (!written.ok) throw metricsRefusal("trim", abs, written);
 }

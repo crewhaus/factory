@@ -1,5 +1,5 @@
 # Section 32 — docker-images: workflow target shape (sequential multi-step agent).
-FROM oven/bun:1.2-alpine AS deps
+FROM oven/bun:1.3-alpine AS deps
 WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
@@ -12,7 +12,7 @@ COPY tsconfig.base.json tsconfig.json ./
 RUN bun run typecheck
 RUN bun build apps/cli/src/index.ts --target=bun --outfile=/app/dist/crewhaus.js
 
-FROM oven/bun:1.2-alpine AS runtime
+FROM oven/bun:1.3-alpine AS runtime
 RUN addgroup -S crewhaus && adduser -S crewhaus -G crewhaus -u 10001
 WORKDIR /app
 COPY --from=build --chown=crewhaus:crewhaus /app/dist/crewhaus.js /app/crewhaus.js

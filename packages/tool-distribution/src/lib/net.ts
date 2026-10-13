@@ -42,6 +42,7 @@
  */
 import { createHash } from "node:crypto";
 import { assertNotSsrf } from "@crewhaus/tool-fetch";
+import { decodeBody, fetchRaw } from "@crewhaus/tool-safety/streams";
 
 /** Release hosts redirect to CDNs and object stores; five hops is generous. */
 export const MAX_REDIRECTS = 5;
@@ -118,7 +119,12 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (pinnedIp === "" || unbracketed === pinnedIp) return globalThis.fetch(req);
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd body in native code
+  // before any reader sees a byte — hashing chunk by chunk bounded nothing,
+  // because the whole decoded body was already in memory (C093). The body
+  // is decoded in `hashStream`, chunk by chunk, under the cap.
+  if (pinnedIp === "" || unbracketed === pinnedIp) return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -131,7 +137,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     signal: req.signal,
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let distributionFetch: DistributionFetch = pinnedFetch;
@@ -268,7 +274,7 @@ export async function probeAsset(rawUrl: string, options: ProbeOptions): Promise
       const declaredLength = contentLength(res);
       let hashed: { sha256: string; bytes: number } | { capped: true; bytes: number };
       try {
-        hashed = await hashStream(res, options.maxBytes);
+        hashed = await hashStream(res, options.maxBytes, deadline.signal);
       } catch (err) {
         if (err instanceof UnreadableBody) {
           return {
@@ -276,7 +282,7 @@ export async function probeAsset(rawUrl: string, options: ProbeOptions): Promise
             reason: "unreadable",
             status: res.status,
             finalUrl: current.toString(),
-            message: `${safeLabel(current)} answered ${res.status} with ${err.message} — an empty asset and a dropped body look identical from here, so nothing was verified`,
+            message: `${safeLabel(current)} answered ${res.status} with ${err.message}, so nothing was verified`,
           };
         }
         return transportFailure(err, current, deadline, options.signal);
@@ -381,8 +387,8 @@ function transportFailure(
  * The declared body size, when it is comparable to the bytes we will count.
  *
  * `Content-Length` describes the bytes ON THE WIRE. When the response is
- * content-encoded the runtime hands us the DECODED body, which is a different
- * (usually larger) number — so comparing the two would report a perfectly good
+ * content-encoded, what is hashed is the DECODED body (see `hashStream`),
+ * which is a different (usually larger) number — so comparing the two would report a perfectly good
  * download as a short read. Rare for an installer, but "gzip on everything" is
  * a common CDN default, and a false `shortRead` on every asset would make this
  * tool useless exactly where it is needed.
@@ -414,40 +420,43 @@ function contentLength(res: Response): number | undefined {
 async function hashStream(
   res: Response,
   maxBytes: number,
+  signal: AbortSignal,
 ): Promise<{ sha256: string; bytes: number } | { capped: true; bytes: number }> {
   if (res.body === null) {
     // A 200 with no body at all: this may be an empty asset or a body the
     // runtime dropped, and there is no way to tell which. Hashing "no bytes"
     // would answer e3b0c442… with total confidence about something we did not
     // read, so the caller is told the read did not happen.
-    throw new UnreadableBody("the response carried no body to hash");
+    throw new UnreadableBody(
+      "no body to hash — an empty asset and a dropped body look identical from here",
+    );
   }
-  const reader = res.body.getReader();
+  // The body arrives raw (see `pinnedFetch`); a content-encoded one is
+  // decoded here in small steps and each decoded chunk is hashed and
+  // dropped, so the decoder never holds more than a step past the cap.
+  const body = decodeBody(res, { maxBytes, signal });
   const digest = createHash("sha256");
   let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      if (total + value.byteLength > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Already aborting; a failed cancel changes nothing.
-        }
-        return { capped: true, bytes: total + value.byteLength };
-      }
-      digest.update(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // The stream may already be released.
-    }
+  for await (const chunk of body) {
+    digest.update(chunk);
+    total += chunk.byteLength;
   }
+  const outcome = body.outcome;
+  if (outcome === undefined || !outcome.ok) {
+    if (outcome?.code === "aborted" || outcome?.code === "stalled") {
+      const err = new Error("the read was aborted before the body ended");
+      err.name = "AbortError";
+      throw err;
+    }
+    throw new UnreadableBody(
+      outcome?.code === "unsupported-encoding"
+        ? "a body in a stack of content-encodings this tool cannot decode within its cap"
+        : outcome?.code === "read-error"
+          ? "a body that ended before it was complete"
+          : "a body labelled as compressed that could not be decoded",
+    );
+  }
+  if (outcome.truncated) return { capped: true, bytes: outcome.decodedBytes };
   return { sha256: digest.digest("hex"), bytes: total };
 }
 

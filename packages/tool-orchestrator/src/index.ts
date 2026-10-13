@@ -1,9 +1,9 @@
 /**
- * Catalog R3 `tool-orchestrator` — partition a flat list of `tool_use`
- * blocks into concurrent batches and serial calls based on catalog
- * metadata. The runtime runs the concurrent batches via `Promise.all`
- * and the serial calls one-at-a-time, recovering most of the wall-clock
- * latency of read-heavy turns without ever paralleling side effects.
+ * Catalog R3 `tool-orchestrator` — group a turn's `tool_use` blocks into
+ * concurrent batches and serial calls based on catalog metadata. The
+ * runtime runs a concurrent batch in parallel and a serial call alone,
+ * recovering most of the wall-clock latency of read-heavy turns without
+ * ever parallelising side effects or reordering them.
  *
  * A call is **concurrent-safe** iff its registered tool has all three
  * flags set the right way:
@@ -19,24 +19,48 @@
  * takes the sibling `catalog` so those classifiers can resolve what they
  * need — see {@link isCallConcurrencySafe}.
  *
- * The returned shape `{ concurrent: ToolUseBlock[][], serial: ToolUseBlock[] }`
- * deliberately drops interleaving information between batch and serial
- * groups. The runtime executes all concurrent batches first via
- * `Promise.all`, then serial sequentially. This is sound for the typical
- * "read N files, then mutate one" pattern. If a turn truly needs an
- * `[Read, Write, Read]` order with the second Read seeing post-Write
- * state, the model should split it across turns.
+ * The partition's `groups` keep the model's order: a maximal run of
+ * consecutive concurrency-safe calls is one `concurrent` group, and every
+ * other call is its own `serial` group, in the order the model issued them.
+ * A batch never crosses a serial call, so in `[Read, Write, Read]` the second
+ * Read runs after the Write and sees what it wrote. The runtime runs the
+ * groups in order (a concurrent group's calls in parallel, up to its cap),
+ * which is also the dispatch rule the streaming executor follows, so a turn
+ * gives the same results with and without `agent.streaming`.
+ *
+ * `concurrent` and `serial` are the pre-0.7.1 flat views of the same
+ * partition, derived from `groups`. They drop the interleaving, so running
+ * them bucket by bucket reorders a turn; they stay only for callers that
+ * read them as data.
  *
  * Reference: `claude-code/services/tools/toolOrchestration.ts`
- * `partitionToolCalls` (returns a `Batch[]` of consecutive groups). We
- * mirror its concurrency-safety predicate but flatten to the
- * spec-prescribed two-bucket return.
+ * `partitionToolCalls` (returns a `Batch[]` of consecutive groups) — the
+ * same predicate and the same ordered-groups shape.
  */
 import type { RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import type { ToolUseBlock } from "@crewhaus/turn-state-machine";
 
+/**
+ * One step of a turn's execution plan: a run of consecutive
+ * concurrency-safe calls that may run in parallel, or one call that runs
+ * alone.
+ */
+export type ToolGroup =
+  | { readonly kind: "concurrent"; readonly calls: ReadonlyArray<ToolUseBlock> }
+  | { readonly kind: "serial"; readonly call: ToolUseBlock };
+
 export type ToolPartition = {
+  /** The calls in the model's order, grouped; run these in order. */
+  readonly groups: ReadonlyArray<ToolGroup>;
+  /**
+   * @deprecated The concurrent groups' calls, without their position
+   * relative to the serial calls. Run {@link ToolPartition.groups} instead.
+   */
   readonly concurrent: ReadonlyArray<ReadonlyArray<ToolUseBlock>>;
+  /**
+   * @deprecated The serial calls, without their position relative to the
+   * concurrent groups. Run {@link ToolPartition.groups} instead.
+   */
   readonly serial: ReadonlyArray<ToolUseBlock>;
 };
 
@@ -93,36 +117,51 @@ function asLookup(lookup: ToolLookup): (name: string) => RegisteredTool | undefi
 }
 
 /**
- * Walk `calls` in order, grouping consecutive concurrency-safe calls
- * into the same batch. A non-safe call breaks the run and is appended
- * to `serial`. The order of returned concurrent batches mirrors the
- * order in which they appeared in `calls`.
+ * Walk `calls` in order, grouping consecutive concurrency-safe calls into
+ * one concurrent group. A non-safe call ends the run and becomes its own
+ * serial group, so the groups flatten back to `calls` in the same order.
+ */
+export function groupToolCalls(
+  calls: ReadonlyArray<ToolUseBlock>,
+  lookup: ToolLookup,
+  catalog: ReadonlyArray<RegisteredTool> = [],
+): ReadonlyArray<ToolGroup> {
+  const get = asLookup(lookup);
+  const groups: ToolGroup[] = [];
+  let currentBatch: ToolUseBlock[] | null = null;
+  for (const call of calls) {
+    const tool = get(call.name);
+    if (isCallConcurrencySafe(call, tool, catalog)) {
+      if (currentBatch === null) {
+        currentBatch = [call];
+        groups.push({ kind: "concurrent", calls: currentBatch });
+      } else {
+        currentBatch.push(call);
+      }
+    } else {
+      currentBatch = null;
+      groups.push({ kind: "serial", call });
+    }
+  }
+  return groups;
+}
+
+/**
+ * {@link groupToolCalls}, plus the flat `concurrent` / `serial` views
+ * earlier releases returned. Each concurrent batch in `concurrent` is the
+ * same array as its group's `calls`.
  */
 export function partitionToolCalls(
   calls: ReadonlyArray<ToolUseBlock>,
   lookup: ToolLookup,
   catalog: ReadonlyArray<RegisteredTool> = [],
 ): ToolPartition {
-  const get = asLookup(lookup);
-  const concurrent: ToolUseBlock[][] = [];
+  const groups = groupToolCalls(calls, lookup, catalog);
+  const concurrent: ReadonlyArray<ToolUseBlock>[] = [];
   const serial: ToolUseBlock[] = [];
-
-  let currentBatch: ToolUseBlock[] | null = null;
-  for (const call of calls) {
-    const tool = get(call.name);
-    const safe = isCallConcurrencySafe(call, tool, catalog);
-    if (safe) {
-      if (currentBatch === null) {
-        currentBatch = [call];
-        concurrent.push(currentBatch);
-      } else {
-        currentBatch.push(call);
-      }
-    } else {
-      currentBatch = null;
-      serial.push(call);
-    }
+  for (const group of groups) {
+    if (group.kind === "concurrent") concurrent.push(group.calls);
+    else serial.push(group.call);
   }
-
-  return { concurrent, serial };
+  return { groups, concurrent, serial };
 }

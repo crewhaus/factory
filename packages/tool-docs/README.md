@@ -12,7 +12,7 @@ contract says is worse than no answer.
 
 ```yaml
 tools:
-  - all-docs        # every tool below
+  - all-documents   # every tool below
   - -pdfMerge       # ...except this one
 ```
 
@@ -93,8 +93,10 @@ Every limit is enforced *before* the bytes exist. A file's size is checked
 before it is read. A decompression cap is passed into the inflater as
 `maxOutputLength`, so a zip bomb aborts mid-stream rather than after a hundred
 megabytes are already resident — a cap applied to a buffer you have already
-filled is not a cap. Entry counts, nesting depth, page counts and returned
-characters are all bounded too.
+filled is not a cap. The input is bounded the same way: data that many zip
+entries name is inflated once, and a crafted zip whose entries overlap cannot
+make the reader inflate more than the zip holds. Entry counts, nesting depth,
+page counts and returned characters are all bounded too.
 
 This is why `node:zlib` is used rather than `Bun.inflateSync`: the Bun helper
 has no output cap.

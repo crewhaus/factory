@@ -8,7 +8,8 @@
     { "path": "../boundary-classifier" },
     { "path": "../errors" },
     { "path": "../run-context" },
-    { "path": "../tool-catalog" }
+    { "path": "../tool-catalog" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

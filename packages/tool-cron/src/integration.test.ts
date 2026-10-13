@@ -173,13 +173,20 @@ describe("the one test that touches this machine", () => {
     const raw = await cronList.execute({ sources: ["crontab"], nextRuns: 0, timeoutMs: 10_000 });
     expect(typeof raw).toBe("string");
     const out = JSON.parse(raw as string) as Record<string, unknown>;
-    expect(out["ok"]).toBe(true);
     expect(typeof out["platform"]).toBe("string");
     expect(typeof out["now"]).toBe("string");
-    const sources = out["sources"] as { source: string; available: boolean }[];
+    const sources = out["sources"] as { source: string; available: boolean; reason?: string }[];
     expect(sources.length).toBe(1);
     expect(sources[0]?.source).toBe("crontab");
-    expect(typeof sources[0]?.available).toBe("boolean");
+    // A host without a readable crontab (a bare CI container) is an honest
+    // "could not look", never an empty listing.
+    if (sources[0]?.available !== true) {
+      expect(out).toMatchObject({ ok: false, determined: false, outcome: "unavailable" });
+      expect(typeof sources[0]?.reason).toBe("string");
+      expect(out["entries"]).toBeUndefined();
+      return;
+    }
+    expect(out).toMatchObject({ ok: true, determined: true });
     const entries = out["entries"] as Record<string, unknown>[];
     expect(Array.isArray(entries)).toBe(true);
     for (const entry of entries) {

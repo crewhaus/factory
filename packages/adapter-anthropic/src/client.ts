@@ -56,8 +56,8 @@ const defaultVersionProbe: ClaudeVersionProbe = (file, args) =>
  * system expects. Falls back to {@link FALLBACK_CLAUDE_CLI_VERSION} (warning
  * once) when the binary is absent, not on PATH, or times out.
  *
- * `probe` is injectable for unit testing; production callers use the
- * module-level {@link CLAUDE_CODE_HEADERS} computed at import.
+ * `probe` is injectable for unit testing; production callers read the
+ * `user-agent` of {@link CLAUDE_CODE_HEADERS}, which runs it once, on first use.
  */
 export function detectClaudeCliVersion(probe: ClaudeVersionProbe = defaultVersionProbe): string {
   try {
@@ -76,15 +76,40 @@ export function detectClaudeCliVersion(probe: ClaudeVersionProbe = defaultVersio
   return FALLBACK_CLAUDE_CLI_VERSION;
 }
 
-const DETECTED_CLAUDE_CLI_VERSION = detectClaudeCliVersion();
+/**
+ * The detected version, probed on first use rather than at import. Importing
+ * this package is something every `crewhaus` command does (the CLI reaches it
+ * through @crewhaus/runtime-core), so a probe at import ran `claude --version`
+ * — up to a second, and a warning on stderr where the claude CLI is not
+ * installed — for `compile`, `tools show` and every other command that never
+ * builds an OAuth client. Now only a request that sends the identity headers
+ * pays for the probe, once per process.
+ */
+let detectedClaudeCliVersion: string | undefined;
 
-/** Identity headers paired with the OAuth token for subscription-billing routing. */
-export const CLAUDE_CODE_HEADERS = {
+function claudeCliUserAgent(): string {
+  detectedClaudeCliVersion ??= detectClaudeCliVersion();
+  return `claude-cli/${detectedClaudeCliVersion} (external, cli)`;
+}
+
+/**
+ * Identity headers paired with the OAuth token for subscription-billing
+ * routing. `user-agent` is a getter: the installed claude CLI is probed the
+ * first time it is read (spreading the object reads it), never at import.
+ */
+export const CLAUDE_CODE_HEADERS: {
+  readonly accept: "application/json";
+  readonly "anthropic-dangerous-direct-browser-access": "true";
+  readonly "user-agent": string;
+  readonly "x-app": "cli";
+} = {
   accept: "application/json",
   "anthropic-dangerous-direct-browser-access": "true",
-  "user-agent": `claude-cli/${DETECTED_CLAUDE_CLI_VERSION} (external, cli)`,
+  get "user-agent"(): string {
+    return claudeCliUserAgent();
+  },
   "x-app": "cli",
-} as const;
+};
 
 /** System-prompt prefix expected for subscription-billed OAuth requests. */
 export const CLAUDE_CODE_SYSTEM_PREFIX =

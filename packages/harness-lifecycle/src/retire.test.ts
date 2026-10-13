@@ -23,6 +23,13 @@ import {
   runRetirement,
 } from "./retire";
 
+/**
+ * A test that needs a write or a listing to be REFUSED by a directory's mode
+ * cannot run as root, which the mode does not stop (a container's CI user,
+ * `docker run --user 0`). It is skipped there rather than failing.
+ */
+const canTestUnwritable = (process.getuid?.() ?? 0) !== 0;
+
 let root: string;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "crewhaus-retire-test-"));
@@ -319,37 +326,40 @@ describe("runRetirement — real", () => {
     expect(existsSync(stateDir)).toBe(false);
   });
 
-  test("the retirement log is durably written BEFORE the destructive move (crash-safety)", async () => {
-    // Force the destructive rename to THROW (a read-only archive dir), then
-    // assert the log already exists on disk — proving it was fsynced before the
-    // move, so a crash mid-remove still leaves the evidence.
-    const stateDir = join(root, ".crewhaus");
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, "marker"), "x");
-    const archiveDir = join(root, "archive");
-    mkdirSync(archiveDir, { recursive: true });
-    const plan = buildRetirementPlan({
-      specName: "c",
-      harnessDir: root,
-      archiveDir,
-      pins: {},
-      force: false,
-      pushKnowledge: false,
-    });
-    const { steps } = stubSteps();
-    // Make the HARNESS dir read-only so renameSync (which must remove the source
-    // .crewhaus from its parent) throws — but the ARCHIVE dir stays writable so
-    // the pre-move log write still lands. This isolates "log written before the
-    // move" from "move succeeded".
-    chmodSync(root, 0o500);
-    try {
-      await expect(runRetirement({ plan, steps, dryRun: false })).rejects.toThrow();
-    } finally {
-      chmodSync(root, 0o700);
-    }
-    // The pre-move durable write landed the log despite the failed move.
-    expect(existsSync(join(archiveDir, RETIREMENT_LOG_FILENAME))).toBe(true);
-    // And the state was NOT lost — the rename never completed.
-    expect(existsSync(join(stateDir, "marker"))).toBe(true);
-  });
+  test.if(canTestUnwritable)(
+    "the retirement log is durably written BEFORE the destructive move (crash-safety)",
+    async () => {
+      // Force the destructive rename to THROW (a read-only archive dir), then
+      // assert the log already exists on disk — proving it was fsynced before the
+      // move, so a crash mid-remove still leaves the evidence.
+      const stateDir = join(root, ".crewhaus");
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(join(stateDir, "marker"), "x");
+      const archiveDir = join(root, "archive");
+      mkdirSync(archiveDir, { recursive: true });
+      const plan = buildRetirementPlan({
+        specName: "c",
+        harnessDir: root,
+        archiveDir,
+        pins: {},
+        force: false,
+        pushKnowledge: false,
+      });
+      const { steps } = stubSteps();
+      // Make the HARNESS dir read-only so renameSync (which must remove the source
+      // .crewhaus from its parent) throws — but the ARCHIVE dir stays writable so
+      // the pre-move log write still lands. This isolates "log written before the
+      // move" from "move succeeded".
+      chmodSync(root, 0o500);
+      try {
+        await expect(runRetirement({ plan, steps, dryRun: false })).rejects.toThrow();
+      } finally {
+        chmodSync(root, 0o700);
+      }
+      // The pre-move durable write landed the log despite the failed move.
+      expect(existsSync(join(archiveDir, RETIREMENT_LOG_FILENAME))).toBe(true);
+      // And the state was NOT lost — the rename never completed.
+      expect(existsSync(join(stateDir, "marker"))).toBe(true);
+    },
+  );
 });

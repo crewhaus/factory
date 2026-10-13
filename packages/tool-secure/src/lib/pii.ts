@@ -28,7 +28,8 @@
  * | `dob.labelled` / `date.calendar` | a calendar date. Only a nearby "date of birth"-style label, or a caller-supplied `referenceDate` that makes the age plausible, raises it above `possible`. |
  * | `address.us-street-suffix` / `address.us-city-state-zip` | a US-style street line or city/state/ZIP tail. US conventions only. |
  */
-import { type Confidence, type Finding, matchAll, withPositions } from "./text";
+import { ipv6Candidates } from "./ipv6-scan";
+import { type Confidence, type Finding, matchAll, matchAllSkipping, withPositions } from "./text";
 
 export const PII_TYPES = [
   "credit_card",
@@ -300,14 +301,81 @@ function ipv4Scope(octets: ReadonlyArray<number>): string {
 // patterns
 // ---------------------------------------------------------------------------
 
-const EMAIL =
+export const EMAIL =
   /[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g;
+/** A character an email's local part may hold, besides the dots between its runs. */
+function isLocalPartUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    "!#$%&'*+/=?^_`{|}~-".includes(String.fromCharCode(c))
+  );
+}
+
+/**
+ * Where a failed EMAIL try at `at` stops binding: the end of the dotted run
+ * of local-part characters that starts there. A later start inside it reads
+ * the same run to the same end and the same text after it, so it fails too.
+ */
+function localPartEnd(text: string, at: number): number {
+  let i = at;
+  for (;;) {
+    while (i < text.length && isLocalPartUnit(text.charCodeAt(i))) i++;
+    if (text.charCodeAt(i) !== 0x2e || !isLocalPartUnit(text.charCodeAt(i + 1))) return i;
+    i++;
+  }
+}
+
+/** Where ADDRESS_CITY_STATE_ZIP may begin: an ASCII capital at a word boundary. */
+function startsCapitalWord(text: string, at: number): boolean {
+  const c = text.charCodeAt(at);
+  if (c < 0x41 || c > 0x5a) return false;
+  if (at === 0) return true;
+  const p = text.charCodeAt(at - 1);
+  const word = (p >= 0x30 && p <= 0x39) || (p >= 0x41 && p <= 0x5a) || (p >= 0x61 && p <= 0x7a);
+  return !word && p !== 0x5f;
+}
+
+/** The end of the `[A-Za-z.'-]` run at `at`: a failed address try binds to it. */
+function addressWordEnd(text: string, at: number): number {
+  let i = at;
+  for (; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    const ok =
+      (c >= 0x41 && c <= 0x5a) ||
+      (c >= 0x61 && c <= 0x7a) ||
+      c === 0x2e ||
+      c === 0x27 ||
+      c === 0x2d;
+    if (!ok) break;
+  }
+  return i;
+}
+
+/**
+ * EMAIL's matches. It opens with an unbounded local-part run, so it is tried
+ * only where one starts, and a failed try skips the rest of that run (see
+ * matchAllSkipping): 100K of base64 cost seconds as a global search.
+ */
+export function emailMatches(text: string): Iterable<{ index: number; match: RegExpExecArray }> {
+  return matchAllSkipping(text, EMAIL, (t, at) => isLocalPartUnit(t.charCodeAt(at)), localPartEnd);
+}
+
+/**
+ * ADDRESS_CITY_STATE_ZIP's matches, tried where a capitalised word starts; a
+ * failed try skips the rest of its `[A-Za-z.'-]` run.
+ */
+export function cityStateZipMatches(
+  text: string,
+): Iterable<{ index: number; match: RegExpExecArray }> {
+  return matchAllSkipping(text, ADDRESS_CITY_STATE_ZIP, startsCapitalWord, addressWordEnd);
+}
+
 const SSN = /\b(\d{3})-(\d{2})-(\d{4})\b/g;
 const IBAN_CANDIDATE = /\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9]{4}[ ]?){2,7}[A-Z0-9]{1,4}\b/g;
 const CARD_RUN = /\b\d(?:[ -]?\d){11,}/g;
 const IPV4 = /\b\d{1,3}(?:\.\d{1,3}){3}\b/g;
-const IPV6_CANDIDATE =
-  /\b(?=[0-9A-Fa-f:]*::|(?:[0-9A-Fa-f]{1,4}:){7})[0-9A-Fa-f:]{2,39}(?:\.\d{1,3}){0,3}/g;
 const PHONE_E164_RUN = /\+\d(?:[\s().-]?\d)+/g;
 const DATE_ISO = /\b(19|20)\d{2}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g;
 const DATE_US = /\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/((?:19|20)\d{2})\b/g;
@@ -322,7 +390,7 @@ const ADDRESS_STREET = new RegExp(
   `\\b\\d{1,6}\\s+(?:[A-Za-z0-9.'#-]+\\s+){0,4}${STREET_SUFFIX}\\b\\.?(?:\\s+(?:Apt|Suite|Ste|Unit|#)\\s*[A-Za-z0-9-]+)?`,
   "g",
 );
-const ADDRESS_CITY_STATE_ZIP =
+export const ADDRESS_CITY_STATE_ZIP =
   /\b[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3},\s*(A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[AR]|RI|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])\s+\d{5}(?:-\d{4})?\b/g;
 
 const NATIONAL_PHONE: Readonly<Record<PhoneCountry, RegExp>> = {
@@ -527,7 +595,7 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
   }
 
   if (selected(options, "email")) {
-    for (const { index, match } of matchAll(text, EMAIL)) {
+    for (const { index, match } of emailMatches(text)) {
       raw.push({
         type: "email",
         rule: "email.addr-spec-subset",
@@ -622,8 +690,8 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
         detail: { version: 4, scope },
       });
     }
-    for (const { index, match } of matchAll(text, IPV6_CANDIDATE)) {
-      const candidate = match[0].replace(/[:.]+$/, "");
+    for (const { index, value } of ipv6Candidates(text)) {
+      const candidate = value.replace(/[:.]+$/, "");
       if (!candidate.includes(":")) continue;
       const groups = parseIpv6(candidate);
       if (!groups) continue;
@@ -737,7 +805,7 @@ export function scanPii(text: string, options: PiiOptions = {}): Finding[] {
         detail: { convention: "US" },
       });
     }
-    for (const { index, match } of matchAll(text, ADDRESS_CITY_STATE_ZIP)) {
+    for (const { index, match } of cityStateZipMatches(text)) {
       raw.push({
         type: "postal_address",
         rule: "address.us-city-state-zip",

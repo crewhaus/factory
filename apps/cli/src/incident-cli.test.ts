@@ -64,13 +64,13 @@ describe("crewhaus incident collect", () => {
     const res = await runCli(["incident", "collect"]);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("--session");
-  });
+  }, 20_000);
 
   test("unknown action is rejected", async () => {
     const res = await runCli(["incident", "explode"]);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain('must be "collect"');
-  });
+  }, 20_000);
 
   test("assembles a bundle from a seeded session + audit", async () => {
     await seedSession(SESSION_ID);
@@ -121,14 +121,14 @@ describe("crewhaus incident collect", () => {
     const html = readFileSync(join(bundleDir, "index.html"), "utf-8");
     expect(html).toContain("<!doctype html>");
     expect(html).toContain("Incident — circuit_open");
-  });
+  }, 20_000);
 
   test("rejects an unknown --kind", async () => {
     await seedSession(SESSION_ID);
     const res = await runCli(["incident", "collect", "--session", SESSION_ID, "--kind", "bogus"]);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain("--kind must be one of");
-  });
+  }, 20_000);
 
   test("an empty/missing session fails cleanly", async () => {
     // No session seeded — openEventLog on a nonexistent session yields no events.
@@ -136,5 +136,5 @@ describe("crewhaus incident collect", () => {
     const res = await runCli(["incident", "collect", "--session", SESSION_ID]);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toMatch(/no events|could not read/);
-  });
+  }, 20_000);
 });

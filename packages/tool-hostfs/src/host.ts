@@ -152,6 +152,11 @@ export type PathFacts = {
   readonly mode: number;
   readonly mtimeMs: number;
   /**
+   * Inode-change time in ms. Optional so a test probe that predates it still
+   * type-checks; readers fall back to `mtimeMs`.
+   */
+  readonly ctimeMs?: number;
+  /**
    * An opaque token that changes whenever the path does: modification time
    * and inode-change time, at NANOSECOND resolution.
    *
@@ -161,12 +166,40 @@ export type PathFacts = {
    * chmod a few microseconds after the write lands in the same MILLISECOND,
    * so the millisecond-resolution fields are equal and the change is
    * invisible — measured on macOS 15.6 while writing this. A filesystem with
-   * a coarser clock (HFS+ stores whole seconds) gives a coarser token, and
-   * the blind spot grows accordingly.
+   * a coarser clock gives a coarser token: Linux stamps inodes from the
+   * coarse kernel clock (one tick is 1-10 ms before kernel 6.13), HFS+ keeps
+   * whole seconds, FAT two. So equal tokens prove nothing about a write made
+   * within a tick of the last look, and WatchPath compares the content of a
+   * recently written file instead (see `lib/watch-session.ts`).
+   *
+   * The mode is the third part ({@link changeStampOf}). Comparing content
+   * cannot see a chmod, and on a coarse clock a chmod within a tick of the
+   * last change moves neither time: on the Windows runner the same test saw
+   * the chmod in one run and missed it in the next.
    */
   readonly changeStamp: string;
   readonly sizeBytes: number;
+  /**
+   * The owner's uid. A trash directory must belong to the user trashing
+   * into it (the FreeDesktop spec's check, and GLib's): a component owned by
+   * someone else, or planted by a checked-out repository as a link, is not
+   * this user's trash.
+   */
+  readonly uid: number;
 };
+
+/**
+ * The change token {@link PathFacts.changeStamp} carries: modification time
+ * and inode-change time in nanoseconds, then the mode. Split on ":", the
+ * first two parts are the times (`stampsAreFine` reads them).
+ */
+export function changeStampOf(stats: {
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+  readonly mode: bigint | number;
+}): string {
+  return `${stats.mtimeNs}:${stats.ctimeNs}:${stats.mode}`;
+}
 
 export type PathProbe = (absolutePath: string) => PathFacts | undefined;
 
@@ -202,8 +235,10 @@ export function probePath(absolutePath: string): PathFacts | undefined {
     isSymlink: stats.isSymbolicLink(),
     mode: Number(stats.mode),
     mtimeMs: Number(stats.mtimeMs),
-    changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
+    ctimeMs: Number(stats.ctimeMs),
+    changeStamp: changeStampOf(stats),
     sizeBytes: Number(stats.size),
+    uid: Number(stats.uid),
   };
 }
 

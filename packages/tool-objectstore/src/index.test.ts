@@ -10,10 +10,10 @@
  * the way through the tool with `signedAt` pinned. If the encoder, the
  * canonicalization, the query assembly or the addressing changes, it moves.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { OBJECTSTORE_TOOLS, _setClock, objectPresign } from "./index";
+import { OBJECTSTORE_TOOLS, _setClock, objectPresign, registerObjectStoreConfig } from "./index";
 
 // biome-ignore lint/suspicious/noExplicitAny: the executor supplies this context, and this tool does not read it.
 const ctx = {} as any;
@@ -23,6 +23,36 @@ const DOC_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 /** Distinctive enough that a substring search for it means something. */
 const CANARY_SECRET = "canary-SECRET-8f3a9d2b-do-not-leak";
 
+/**
+ * The variables the operator's profiles name. Credentials are never tool
+ * arguments (flag-truth-5#8): the call names a profile, and the tool reads
+ * the variables the profile names.
+ */
+const KEY_ID_ENV = "CREWHAUS_OBJ_TEST_KEY_ID";
+const SECRET_ENV = "CREWHAUS_OBJ_TEST_SECRET";
+const TOKEN_ENV = "CREWHAUS_OBJ_TEST_SESSION_TOKEN";
+
+beforeEach(() => {
+  process.env[KEY_ID_ENV] = DOC_KEY_ID;
+  process.env[SECRET_ENV] = DOC_SECRET;
+  process.env[TOKEN_ENV] = "FQoGZXIvYXdzE...";
+  registerObjectStoreConfig({
+    credentials: {
+      doc: { access_key_id_env: KEY_ID_ENV, secret_access_key_env: SECRET_ENV },
+      sts: {
+        access_key_id_env: KEY_ID_ENV,
+        secret_access_key_env: SECRET_ENV,
+        session_token_env: TOKEN_ENV,
+      },
+    },
+  });
+});
+
+afterEach(() => {
+  for (const name of [KEY_ID_ENV, SECRET_ENV, TOKEN_ENV]) Reflect.deleteProperty(process.env, name);
+  registerObjectStoreConfig({});
+});
+
 const BASE = {
   operation: "get",
   endpoint: "https://s3.us-east-1.amazonaws.com",
@@ -30,10 +60,14 @@ const BASE = {
   region: "us-east-1",
   bucket: "examplebucket",
   key: "test.txt",
-  accessKeyId: DOC_KEY_ID,
-  secretAccessKey: DOC_SECRET,
+  credentials: "doc",
   signedAt: "2013-05-24T00:00:00Z",
 } as const;
+
+/** Sign the next call with this secret, as an operator's environment would hold it. */
+function withSecret(secret: string): void {
+  process.env[SECRET_ENV] = secret;
+}
 
 async function raw(input: unknown): Promise<string> {
   const parsed = objectPresign.inputSchema.safeParse(input);
@@ -355,7 +389,7 @@ describe("expiry", () => {
   });
 
   test("temporary credentials carry their own expiry, and the result says so", async () => {
-    const result = await call({ ...BASE, sessionToken: "FQoGZXIvYXdzE..." });
+    const result = await call({ ...BASE, credentials: "sts" });
     expect(params(result.url).get("X-Amz-Security-Token")).toBe("FQoGZXIvYXdzE...");
     expect(result.warnings?.join(" ")).toContain("session token expires");
   });
@@ -371,7 +405,7 @@ describe("expiry", () => {
 
     const temporary = (await call({
       ...BASE,
-      sessionToken: "FQoGZXIvYXdzE...",
+      credentials: "sts",
     })) as unknown as { credentials: string };
     expect(temporary.credentials).toContain("X-Amz-Security-Token");
     expect(temporary.credentials).toContain("live credential");
@@ -404,7 +438,8 @@ describe("the clock", () => {
 
 describe("the secret never leaves", () => {
   test("it is in no part of a successful result", async () => {
-    const result = await raw({ ...BASE, secretAccessKey: CANARY_SECRET, includeCanonical: true });
+    withSecret(CANARY_SECRET);
+    const result = await raw({ ...BASE, includeCanonical: true });
     expect(result.includes(CANARY_SECRET)).toBe(false);
     // Not even a fragment of it: the derived signing key is not the secret,
     // but a prefix check catches a naive "echo the input back" regression.
@@ -417,9 +452,9 @@ describe("the secret never leaves", () => {
   test("it is in no part of a refusal either", async () => {
     // The failure path is where a secret usually escapes: an error message
     // that helpfully echoes its inputs.
+    withSecret(CANARY_SECRET);
     const attempt = raw({
       ...BASE,
-      secretAccessKey: CANARY_SECRET,
       key: "a/../escape.txt",
     });
     await expect(attempt).rejects.toThrow(/resolve those before sending/);
@@ -431,9 +466,9 @@ describe("the secret never leaves", () => {
   });
 
   test("nor when the secret was pasted into the endpoint, which callers do", async () => {
-    // The tool's own schema has a field for the secret, but an agent that
-    // knows S3 URLs writes `https://KEY:SECRET@host` — the code refuses that
-    // shape for exactly that reason. Two of the endpoint checks run before
+    // The tool takes no secret at all (the operator's profile holds it), but
+    // an agent that knows S3 URLs writes `https://KEY:SECRET@host` — the code
+    // refuses that shape for exactly that reason. Two of the endpoint checks run before
     // the refusal and quoted the whole string back.
     for (const endpoint of [
       `ftp://AKIAIOSFODNN7EXAMPLE:${CANARY_SECRET}@files.example.com`,
@@ -456,7 +491,8 @@ describe("the secret never leaves", () => {
   });
 
   test("the canonical request it hands back for debugging holds no secret", async () => {
-    const result = await call({ ...BASE, secretAccessKey: CANARY_SECRET, includeCanonical: true });
+    withSecret(CANARY_SECRET);
+    const result = await call({ ...BASE, includeCanonical: true });
     expect(result.canonicalRequest).toContain("UNSIGNED-PAYLOAD");
     expect(result.stringToSign).toContain("AWS4-HMAC-SHA256");
     expect(`${result.canonicalRequest}${result.stringToSign}`.includes(CANARY_SECRET)).toBe(false);
@@ -528,8 +564,11 @@ describe("refusals", () => {
   });
 
   test("a credential with whitespace, which is a pasted newline every time", async () => {
-    await refuses({ secretAccessKey: `${DOC_SECRET}\n` }, /leading or trailing whitespace/);
-    await refuses({ accessKeyId: "AKIA EXAMPLE" }, /whitespace/);
+    withSecret(`${DOC_SECRET}\n`);
+    await refuses({}, /leading or trailing whitespace/);
+    withSecret(DOC_SECRET);
+    process.env[KEY_ID_ENV] = "AKIA EXAMPLE";
+    await refuses({}, /whitespace/);
   });
 
   test("upload fields on a download and download fields on an upload", async () => {

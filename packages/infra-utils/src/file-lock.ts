@@ -14,7 +14,10 @@
  *      STOLEN — unlinked and re-raced — and a warning naming the dead holder
  *      is recorded via `onWarn`;
  *   4. past the deadline the acquire FAILS with an error naming the holder
- *      pid, so "who has it" is never a mystery.
+ *      pid, so "who has it" is never a mystery;
+ *   5. a symlink, FIFO or other non-regular entry at the lock path is not a
+ *      lock this policy made: the acquire fails at once, naming the path and
+ *      what is there, and never follows, blocks on or removes it (0.7.1).
  *
  * The lock is advisory: it serializes cooperating writers (two sessions, a
  * crew of roles, a janitor/dream tick) but does not stop a hostile process.
@@ -27,7 +30,8 @@
  * module changes zero observable behavior. infra-utils stays dependency-free:
  * the default error is a plain `Error`; callers wrap.
  */
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { type FileHandle, lstat, mkdir, open, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export type FileLockPolicy = {
@@ -70,15 +74,45 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
+/** A holder payload is one short JSON line; nothing past this is read. */
+const HOLDER_MAX_BYTES = 4096;
+
+/**
+ * The holder a lock file names, read without following a link at the leaf,
+ * without blocking on a FIFO, and never past {@link HOLDER_MAX_BYTES}. The
+ * lock sits in a store directory any agent with a write tool can reach, and
+ * `readFile` used to follow a link planted there (a `/dev/zero` target reads
+ * for ever) and to block on a planted FIFO. Anything but a regular file
+ * reads as an unknown holder.
+ */
 async function readHolder(lockPath: string): Promise<LockFilePayload> {
+  let handle: FileHandle | undefined;
   try {
-    const raw = await readFile(lockPath, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
+    handle = await open(
+      lockPath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+    if (!(await handle.stat()).isFile()) return {};
+    const buf = Buffer.alloc(HOLDER_MAX_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, HOLDER_MAX_BYTES, 0);
+    const parsed = JSON.parse(buf.subarray(0, bytesRead).toString("utf8")) as unknown;
     if (typeof parsed === "object" && parsed !== null) return parsed as LockFilePayload;
   } catch {
-    // Unreadable or torn lock payload — the pid is simply unknown.
+    // Unreadable, torn or oversized lock payload — the pid is simply unknown.
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
   return {};
+}
+
+/** What a non-regular entry at the lock path is, for the refusal. */
+function describeKind(st: Stats): string {
+  if (st.isSymbolicLink()) return "a symbolic link";
+  if (st.isFIFO()) return "a FIFO";
+  if (st.isDirectory()) return "a directory";
+  if (st.isSocket()) return "a socket";
+  if (st.isCharacterDevice() || st.isBlockDevice()) return "a device";
+  return "not a regular file";
 }
 
 /**
@@ -121,15 +155,25 @@ export async function acquireFileLock(
     }
 
     // Contended. Stale-steal check first so an abandoned lock never forces
-    // the deadline failure.
-    let mtimeMs: number | undefined;
+    // the deadline failure. lstat, never stat: the entry itself is judged.
+    let entry: Stats;
     try {
-      mtimeMs = (await stat(lockPath)).mtimeMs;
+      entry = await lstat(lockPath);
     } catch {
       // The holder released between our create attempt and the stat — retry
       // the create immediately.
       continue;
     }
+    // A lock is a regular file this policy created with O_EXCL. A link, FIFO
+    // or other special file at its name was put there by something else:
+    // waiting on it, stealing it or reading its holder would follow it or
+    // block on it, so it is refused, naming the path and what it is.
+    if (!entry.isFile()) {
+      throw createError(
+        `${label}: ${lockPath} is ${describeKind(entry)}, not a lock file — refusing to wait on it, remove it or read it. If nothing should be there, delete it and retry.`,
+      );
+    }
+    const mtimeMs = entry.mtimeMs;
     const ageMs = Date.now() - mtimeMs;
     if (ageMs > staleMs) {
       const holder = await readHolder(lockPath);
