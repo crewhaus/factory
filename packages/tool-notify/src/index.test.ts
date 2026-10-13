@@ -1445,6 +1445,34 @@ describe("WebhookPost", () => {
     }
   });
 
+  test("a cancel that fails the last allowed attempt reads as a cancel, not as every attempt failing", async () => {
+    // With no retries left the call used to answer from the retry count
+    // first, so the same cancel read as "all 1 attempt(s) failed" here and as
+    // a cancel when a retry was still allowed.
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      runtime.abort();
+      throw req.signal.reason;
+    });
+    try {
+      const result = String(
+        await webhookPost.execute(
+          { url: `${origin}/hook`, payload: { a: 1 }, retries: 0, timeoutMs: 30_000 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      const aborted = "the send was aborted before it completed";
+      expect({ issued, result }).toEqual({
+        issued: 1,
+        result: `nothing was sent: ${aborted}\n${JSON.stringify({ attempts: [{ attempt: 1, error: aborted }] })}`,
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("REFUSAL: an inline Authorization header is refused in favour of the auth profile", async () => {
     const result = String(
       await webhookPost.execute({

@@ -1846,8 +1846,12 @@ export const dnsLookup: RegisteredTool = buildTool({
     // enforced each type's share, and the two clocks disagree — a 1ms timer
     // can fire before the wall clock has moved a whole millisecond — so a type
     // could time out and the next still see budget left and be issued.
+    //
+    // The runtime's cancel aborts the same signal. Without it a cancelled
+    // turn still asked for every type left, and a hung resolver held it for
+    // the whole budget.
     const budget = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const deadline = startDeadline(budget);
+    const deadline = startDeadline(budget, ctx?.signal);
     const records: Record<string, unknown> = {};
     const errors: Record<string, string> = {};
 
@@ -1856,8 +1860,9 @@ export const dnsLookup: RegisteredTool = buildTool({
       // own answer, and could land in `records` and `errors` both.
       for (const type of [...new Set(wanted)].sort(byString)) {
         if (deadline.signal.aborted) {
-          errors[type] =
-            `the ${budget}ms lookup budget elapsed before this record type was asked for`;
+          errors[type] = wasCancelled(deadline)
+            ? "the lookup was cancelled before this record type was asked for"
+            : `the ${budget}ms lookup budget elapsed before this record type was asked for`;
           continue;
         }
         try {
@@ -1867,6 +1872,10 @@ export const dnsLookup: RegisteredTool = buildTool({
             `${type} lookup exceeded the ${budget}ms lookup budget`,
           );
         } catch (err) {
+          if (wasCancelled(deadline)) {
+            errors[type] = `the lookup was cancelled before the ${type} answer arrived`;
+            continue;
+          }
           const code = (err as { code?: string }).code;
           errors[type] = code ?? (err instanceof Error ? err.message : String(err));
         }

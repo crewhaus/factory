@@ -2294,6 +2294,59 @@ describe("DnsLookup / TlsInspect", () => {
     }
   });
 
+  test("DnsLookup stops at a runtime cancel: the type in flight and the types left say so, and nothing more is asked", async () => {
+    // The lookup's deadline was not chained to the runtime's signal, so a
+    // cancel reached nothing: every type was still asked for, each for its
+    // share of the whole budget. The resolver cancels on its first call and
+    // never answers inside the test, so only the cancel can end the call.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const runtime = new AbortController();
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      runtime.abort();
+      return await new Promise((resolve) => setTimeout(() => resolve(["192.0.2.1"]), 50));
+    });
+    const result = await run(
+      dnsLookup,
+      { name: "dns-budget.invalid", types: ["A", "AAAA", "MX"], timeoutMs: 60_000 },
+      runtime.signal,
+    ).finally(() => _setDnsRecordResolver(undefined));
+    expect({ issued, records: result.records, errors: result.errors }).toEqual({
+      issued: ["A"],
+      records: {},
+      errors: {
+        A: "the lookup was cancelled before the A answer arrived",
+        AAAA: "the lookup was cancelled before this record type was asked for",
+        MX: "the lookup was cancelled before this record type was asked for",
+      },
+    });
+  });
+
+  test("DnsLookup called on an already-cancelled signal asks for nothing", async () => {
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const runtime = new AbortController();
+    runtime.abort();
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return ["192.0.2.1"];
+    });
+    const result = await run(
+      dnsLookup,
+      { name: "dns-budget.invalid", types: ["A", "TXT"], timeoutMs: 60_000 },
+      runtime.signal,
+    ).finally(() => _setDnsRecordResolver(undefined));
+    expect({ issued, records: result.records, errors: result.errors }).toEqual({
+      issued: [],
+      records: {},
+      errors: {
+        A: "the lookup was cancelled before this record type was asked for",
+        TXT: "the lookup was cancelled before this record type was asked for",
+      },
+    });
+  });
+
   test("DnsLookup keeps answers that arrive inside the budget, and one type's error does not stop the rest", async () => {
     // Every other budget test spends the budget on the first type, so none of
     // them would notice a deadline that fires at once, a race that drops the
