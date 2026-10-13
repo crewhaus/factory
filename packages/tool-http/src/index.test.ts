@@ -2298,7 +2298,8 @@ describe("DnsLookup / TlsInspect", () => {
     // The lookup's deadline was not chained to the runtime's signal, so a
     // cancel reached nothing: every type was still asked for, each for its
     // share of the whole budget. The resolver cancels on its first call and
-    // never answers inside the test, so only the cancel can end the call.
+    // answers 50ms later, so a lookup that ignored the cancel would ask for
+    // every type and come back with their records.
     registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
     const runtime = new AbortController();
     const issued: string[] = [];
