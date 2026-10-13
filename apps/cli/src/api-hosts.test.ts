@@ -508,6 +508,136 @@ describe("a RateLimitStatus rule reads the API the call goes to, whichever field
     const withUser = { ...onB, baseUrl: baseB.replace("http://", "http://user:pw@") };
     expect(await call(rateLimitStatus, withUser, rs)).toEqual({ decision: "ask", a: [], b: [] });
   }, 30_000);
+
+  test("a rule on the API matches it however the call spells it, as the tool joins it", async () => {
+    // The tool drops one trailing slash and appends /rate_limit as text, so
+    // each of these sends the request the rule names (critic11).
+    const spellings = [baseB, `${baseB}/`, `${baseB}/.`, `${baseB}/x/..`, `${baseB}/%2e`];
+    const deny = rules(
+      ["alwaysDeny", `RateLimitStatus(${baseB})`],
+      ["alwaysAllow", "RateLimitStatus"],
+    );
+    for (const baseUrl of spellings) {
+      expect({ baseUrl, got: await call(rateLimitStatus, { ...onB, baseUrl }, deny) }).toEqual({
+        baseUrl,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
+    // An exact allow covers the same request, written with a slash or not.
+    for (const root of [baseB, `${baseB}/`]) {
+      const allow = rules(["alwaysAllow", `RateLimitStatus(${root})`]);
+      for (const baseUrl of spellings) {
+        expect({
+          root,
+          baseUrl,
+          got: await call(rateLimitStatus, { ...onB, baseUrl }, allow),
+        }).toEqual({ root, baseUrl, got: { decision: "allow", a: [], b: quotaOnB } });
+      }
+      // An API under it is another one.
+      const under = { ...onB, baseUrl: `${baseB}/x` };
+      expect({ root, got: await call(rateLimitStatus, under, allow) }).toEqual({
+        root,
+        got: { decision: "ask", a: [], b: [] },
+      });
+    }
+    // Two slashes reach another path, which an allow on the API does not
+    // grant; a deny on it reads them as one, as many servers do.
+    const doubled = { ...onB, baseUrl: `${baseB}//` };
+    expect(await call(rateLimitStatus, doubled, deny)).toEqual({ decision: "deny", a: [], b: [] });
+    expect(
+      await call(rateLimitStatus, doubled, rules(["alwaysAllow", `RateLimitStatus(${baseB})`])),
+    ).toEqual({ decision: "ask", a: [], b: [] });
+    expect(
+      await call(rateLimitStatus, doubled, rules(["alwaysAllow", `RateLimitStatus(${baseB}/)`])),
+    ).toEqual({ decision: "allow", a: [], b: ["GET /api/v3//rate_limit"] });
+  }, 120_000);
+
+  test("a deny on a host written with any scheme fires on its named port, as on a repository", async () => {
+    // RateLimitStatus read the API with the call's own origin only, so
+    // `*://ghe.example.test/**` missed it on a named port while IssueList on
+    // the same host was denied (critic11).
+    const listOnB = { owner: "acme", repo: "app", ...onB };
+    for (const glob of ["*://ghe.example.test/**", "http*://ghe.example.test/**"]) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysDeny", `IssueList(${glob})`],
+        ["alwaysAllow", "RateLimitStatus"],
+        ["alwaysAllow", "IssueList"],
+      );
+      for (const [tool, input] of [
+        [rateLimitStatus, onB],
+        [rateLimitStatus, { ...onB, host: "github" }],
+        [issueList, listOnB],
+      ] as const) {
+        expect({ glob, input, got: await call(tool, input, rs) }).toEqual({
+          glob,
+          input,
+          got: { decision: "deny", a: [], b: [] },
+        });
+      }
+      // The configured API is another host.
+      expect({ glob, got: await call(rateLimitStatus, {}, rs) }).toEqual({
+        glob,
+        got: { decision: "allow", a: quotaOnA, b: [] },
+      });
+    }
+    for (const glob of ["*://api.example.test/**", "http*://api.example.test/**"]) {
+      const rs = rules(
+        ["alwaysDeny", `RateLimitStatus(${glob})`],
+        ["alwaysAllow", "RateLimitStatus"],
+      );
+      for (const input of [{}, { host: "github" }]) {
+        expect({ glob, input, got: await call(rateLimitStatus, input, rs) }).toEqual({
+          glob,
+          input,
+          got: { decision: "deny", a: [], b: [] },
+        });
+      }
+      expect({ glob, got: await call(rateLimitStatus, onB, rs) }).toEqual({
+        glob,
+        got: { decision: "allow", a: [], b: quotaOnB },
+      });
+    }
+  }, 120_000);
+});
+
+describe("a configured API root is read as the tool joins it", () => {
+  const configured = (base_url: string) =>
+    registerCodehostConfig({
+      allowed_origins: [originA, originB],
+      base_url,
+      token_env: "API_HOSTS_TOKEN_B",
+    });
+  afterAll(() => {
+    registerCodehostConfig({
+      allowed_origins: [originA, originB],
+      base_url: originA,
+      token_env: "API_HOSTS_TOKEN_A",
+      token_envs: { API_HOSTS_TOKEN_B: [originB] },
+    });
+  });
+
+  test("the config's root, with the one slash the tool drops, is the API a rule names", async () => {
+    const exact = rules(["alwaysAllow", `RateLimitStatus(${baseB})`]);
+    configured(`${baseB}/`);
+    expect(await call(rateLimitStatus, {}, exact)).toEqual({
+      decision: "allow",
+      a: [],
+      b: ["GET /api/v3/rate_limit"],
+    });
+    // Written with two, the tool reaches /api/v3//rate_limit: the gate reads
+    // that root, not the one with both slashes dropped.
+    configured(`${baseB}//`);
+    expect(await call(rateLimitStatus, {}, exact)).toEqual({ decision: "ask", a: [], b: [] });
+    expect(
+      await call(rateLimitStatus, {}, rules(["alwaysAllow", `RateLimitStatus(${baseB}/)`])),
+    ).toEqual({ decision: "allow", a: [], b: ["GET /api/v3//rate_limit"] });
+    const deny = rules(
+      ["alwaysDeny", `RateLimitStatus(${baseB})`],
+      ["alwaysAllow", "RateLimitStatus"],
+    );
+    expect(await call(rateLimitStatus, {}, deny)).toEqual({ decision: "deny", a: [], b: [] });
+  }, 60_000);
 });
 
 describe("a code-host rule on GitLab, whose owner is a group path", () => {

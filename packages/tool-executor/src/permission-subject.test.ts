@@ -2882,14 +2882,21 @@ describe("the API itself: a url declared as its own service", () => {
       expect(operativeValuesFor(tool, input)).toEqual([
         {
           kind: "url",
-          canonical: [ghe],
-          spellings: [ghe, "ghe.example.com/api/v3"],
+          canonical: [ghe, `${ghe}/`],
+          spellings: [
+            ghe,
+            "http://ghe.example.com/api/v3",
+            "http://ghe.example.com/api/v3/",
+            "ghe.example.com/api/v3",
+            "ghe.example.com/api/v3/",
+          ],
         },
       ]);
       const match = decide(tool, input);
       for (const [pattern, fires] of [
         ["Quota(https://ghe.example.com/**)", true],
         ["Quota(http://ghe.example.com/**)", true],
+        ["Quota(*://ghe.example.com/**)", true],
         ["Quota(HTTPS://GHE.example.com/api/v3)", true],
         ["Quota(ghe.example.com/**)", true],
         ["Quota(https://api.github.com/**)", false],
@@ -2946,10 +2953,91 @@ describe("the API itself: a url declared as its own service", () => {
     expect(unreadable("Quota(nothing-like-it)", "restrict")).toBe(true);
   });
 
+  test("the API is read as the tool joins its paths to it: one trailing slash dropped", () => {
+    // The tool drops one trailing slash and appends each path as text, so
+    // these all send `GET /api/v3/rate_limit`; each is that API, written with
+    // a slash at the end or not.
+    for (const baseUrl of [
+      ghe,
+      `${ghe}/`,
+      `${ghe}/.`,
+      `${ghe}/x/..`,
+      `${ghe}/%2e`,
+      "HTTPS://GHE.example.com:443/api/v3/",
+    ]) {
+      expect({
+        baseUrl,
+        canonical: operativeValuesFor(quotaTool(), { baseUrl })?.[0]?.canonical,
+      }).toEqual({ baseUrl, canonical: [ghe, `${ghe}/`] });
+    }
+    // The path the tool reaches when the slash is not the last character, or
+    // there are two: `${ghe}//rate_limit`, `${ghe}/%20/rate_limit`.
+    for (const [baseUrl, root] of [
+      [`${ghe}//`, `${ghe}/`],
+      [`${ghe}\\`, `${ghe}/`],
+      [`${ghe}/\n`, `${ghe}/`],
+      [`${ghe}/ `, `${ghe}/%20`],
+      [`${ghe}/..`, "https://ghe.example.com/api"],
+    ] as const) {
+      expect({
+        baseUrl,
+        canonical: operativeValuesFor(quotaTool(), { baseUrl })?.[0]?.canonical,
+      }).toEqual({ baseUrl, canonical: [root, `${root}/`] });
+    }
+    // Two slashes are another path, which an allow on the API does not
+    // grant; a deny on it reads them as one, as many servers do.
+    for (const baseUrl of [
+      `${ghe}//`,
+      `${ghe}\\`,
+      `${ghe}/\n`,
+      "https://ghe.example.com//api//v3",
+    ]) {
+      const match = decide(quotaTool(), { baseUrl });
+      expect({
+        baseUrl,
+        allow: match(`Quota(${ghe})`, "allow"),
+        deny: match(`Quota(${ghe})`, "restrict"),
+        host: match("Quota(ghe.example.com/api/v3)", "restrict"),
+        other: match("Quota(*://ghe.example.com/api/v3/)", "restrict"),
+      }).toEqual({ baseUrl, allow: false, deny: true, host: true, other: true });
+    }
+    expect(
+      decide(quotaTool(), { baseUrl: "https://api.github.com//" })(
+        "Quota(https://api.github.com)",
+        "restrict",
+      ),
+    ).toBe(true);
+    // The origin's own root, as any URL is.
+    for (const baseUrl of ["https://api.github.com", "https://api.github.com/"]) {
+      expect(operativeValuesFor(quotaTool(), { baseUrl })?.[0]?.canonical).toEqual([
+        "https://api.github.com/",
+        "https://api.github.com",
+      ]);
+    }
+    // A root the tool refuses, a query or a fragment in it: nothing to grant.
+    for (const baseUrl of [`${ghe}?per_page=1`, `${ghe}#`]) {
+      const match = decide(quotaTool(), { baseUrl });
+      expect({ baseUrl, allow: match("Quota(**)", "allow") }).toEqual({ baseUrl, allow: false });
+      expect({ baseUrl, deny: match("Quota(nothing-like-it)", "restrict") }).toEqual({
+        baseUrl,
+        deny: true,
+      });
+    }
+  });
+
+  test("the configured API is read as written, with the tool's one slash dropped", () => {
+    // A config that writes its root with two slashes sends `${ghe}//rate_limit`.
+    const doubled = operativeValuesFor(quotaTool({ baseUrl: `${ghe}//` }), {});
+    expect(doubled?.[0]?.canonical).toEqual([`${ghe}/`, `${ghe}//`]);
+    expect(decide(quotaTool({ baseUrl: `${ghe}//` }), {})(`Quota(${ghe})`, "allow")).toBe(false);
+    const plain = operativeValuesFor(quotaTool({ baseUrl: `${ghe}/` }), {});
+    expect(plain?.[0]?.canonical).toEqual([ghe, `${ghe}/`]);
+  });
+
   test("read from the declaration alone, a call that names none carries no API", () => {
     const declared = [{ field: "baseUrl", kind: "url", service: "baseUrl" }] as const;
     expect(operativeValuesOf(declared, {})).toEqual([]);
-    expect(operativeValuesOf(declared, { baseUrl: ghe })?.[0]?.canonical).toEqual([ghe]);
+    expect(operativeValuesOf(declared, { baseUrl: ghe })?.[0]?.canonical).toEqual([ghe, `${ghe}/`]);
     // An approval row shows the API as the call names it.
     expect(readOperativeField({ baseUrl: ghe }, declared[0])).toEqual([ghe]);
     expect(readOperativeField({}, declared[0])).toEqual([]);

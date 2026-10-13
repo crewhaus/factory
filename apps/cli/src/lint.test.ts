@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { IrNode } from "@crewhaus/compiler";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { rateLimitStatus } from "@crewhaus/tool-codehost";
 import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import {
   applyLintFixes,
@@ -604,6 +608,64 @@ permissions:
     expect(found[0]?.message).not.toContain("Write ");
     expect(result.ok).toBe(true);
   });
+
+  // critic11: RateLimitStatus reads the API itself (a url that is its
+  // own service). A deny or ask on it also reads the host alone, and every
+  // string of the call as 0.7.0 did, so both denies below fire at the gate
+  // (api-hosts.test.ts) and were reported as "can never match". An allow
+  // reads the URL only, so the host-alone allow is still dead.
+  test("a deny or ask on an API root is live when written without a scheme; an allow is not", async () => {
+    const yaml = `${validCli}tools: [rateLimitStatus]
+permissions:
+  rules:
+    - { type: alwaysDeny, pattern: "RateLimitStatus(ghe.example.com/**)" }
+    - { type: alwaysDeny, pattern: "RateLimitStatus(GHE_TOKEN)" }
+    - { type: alwaysAsk, pattern: "RateLimitStatus(api.github.com/**)" }
+    - { type: alwaysAllow, pattern: "RateLimitStatus(gitlab.example.com/**)" }
+    - { type: alwaysAllow, pattern: "RateLimitStatus(https://ghe.example.com/**)" }
+`;
+    const dead = [
+      [
+        "permission-rule:argument-cannot-match",
+        "permissions.rules[alwaysAllow RateLimitStatus(gitlab.example.com/**)]",
+      ],
+    ];
+    const found = (resolve: (name: string) => RegisteredTool | undefined) =>
+      runLint(yaml, resolve)
+        .findings.filter((f) => f.rule.startsWith("permission-rule:"))
+        .map((f) => [f.rule, f.path]);
+    // The builtin manifest, and the live tool.
+    expect(found(noTools)).toEqual(dead);
+    expect(found((name) => (name === "rateLimitStatus" ? rateLimitStatus : undefined))).toEqual(
+      dead,
+    );
+    // compile warns about the same one rule.
+    const warnings = await permissionRuleWarnings(yaml, async () => ({ rateLimitStatus }));
+    expect(warnings.map((w) => [w.code, w.message.match(/rule "([^"]+)"/)?.[1]])).toEqual([
+      ["permission-rule", "RateLimitStatus(gitlab.example.com/**)"],
+    ]);
+    // And the real CLI prints only it.
+    const dir = mkdtempSync(join(tmpdir(), "lint-api-root-"));
+    try {
+      writeFileSync(join(dir, "crewhaus.yaml"), yaml);
+      const proc = Bun.spawn(
+        [process.execPath, join(import.meta.dir, "index.ts"), "lint", "crewhaus.yaml"],
+        { cwd: dir, env: { PATH: process.env["PATH"] ?? "" }, stdout: "pipe", stderr: "pipe" },
+      );
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      const printed = `${stdout}${stderr}`;
+      expect(printed.match(/\[permission-rule:[a-z-]+\] \S+/g)).toEqual([
+        "[permission-rule:argument-cannot-match] permissions.rules[alwaysAllow",
+      ]);
+      expect(printed).toContain("RateLimitStatus(gitlab.example.com/**)]");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("the live tool's declaration is what is checked", () => {
     const declaresNothing = { name: "ClipboardWrite" } as RegisteredTool;

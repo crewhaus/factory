@@ -2,6 +2,7 @@ import type { PermissionRule, RuleType } from "@crewhaus/permission-engine";
 import {
   type OperativeArg,
   type RegisteredTool,
+  isApiRootArg,
   stripJustificationField,
 } from "@crewhaus/tool-catalog";
 import { operativeValuesOf, preparePermissionSubject } from "@crewhaus/tool-executor";
@@ -51,7 +52,9 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  *   (an MCP or custom tool, or one this caller could not look up);
  * - `no-scoping-argument` — it says no argument does (`operativeArgs: []`);
  * - `not-parsed` — a recorded input no longer parses with the tool's schema;
- * - `no-value` — a call carried none of the tool's operative arguments;
+ * - `no-value` — a call carried none of the tool's operative arguments, or
+ *   left out the API it acts on (RateLimitStatus's `baseUrl`), which is then
+ *   the one the harness's tool_config sends it to, and the log does not say;
  * - `several-places` — one call acted on more than one place (a source and a
  *   destination, several recipients), which one rule value cannot cover;
  * - `not-representable` — a value cannot be written as a rule value: a path
@@ -172,6 +175,13 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
       withoutInjectedJustification(info.tool, input),
     );
     if (!subject.ok) return unscoped("not-parsed");
+    // An API the call leaves out is read from the tool_config the harness
+    // ran with, which neither the log nor this process has: the value read
+    // here would name an API the call may never have reached.
+    const parsed = subject.input as Record<string, unknown> | null;
+    if (declared.some((a) => isApiRootArg(a) && parsed?.[a.field] === undefined)) {
+      return unscoped("no-value");
+    }
     values = subject.operativeValues ?? [];
   } else {
     values = operativeValuesOf(declared, input) ?? [];

@@ -168,8 +168,9 @@
  *      call that names no API without an origin.
  *    - a `url` declared as its own `service` (RateLimitStatus's `baseUrl`)
  *      is the API the call goes to, matched as a URL: the one it names, else
- *      the one the tool's `serviceDefaults` say it goes to. A deny or ask
- *      also reads it after its host alone (see {@link apiRootValue}).
+ *      the one the tool's `serviceDefaults` say it goes to, read as the tool
+ *      joins its request paths to it. A deny or ask also reads it after the
+ *      origin's other spellings and its host alone (see {@link apiRootValue}).
  *    - an `id` or `recipient` declared with an `overlay` field (a deploy
  *      tenant), on a call that names it, is matched with its value in front
  *      (`acme/billing/staging`): the call acts on that owner's own copy. A
@@ -1620,14 +1621,25 @@ function servedValue(value: OperativeValue, service: ServiceReading): OperativeV
 
 /**
  * The API a call goes to, for a `url` declared as its own `service`
- * (RateLimitStatus's `baseUrl`): matched as any URL is, the one the call
- * names or the one its config sends it to. A deny or ask also reads it after
- * the host alone (`ghe.example.com/api/v3`), as for a value on a service. A
- * URL that cannot be placed leaves nothing an allow could grant, and every
- * deny or ask fires.
+ * (RateLimitStatus's `baseUrl`): the one the call names or the one its
+ * config sends it to, read the way the tool reaches it. The tool drops one
+ * trailing slash and appends each request path as text, so `…/api/v3`,
+ * `…/api/v3/`, `…/api/v3/.` and `…/api/v3/x/..` are one API, which is
+ * matched with or without a slash at the end (as `https://example.com` and
+ * `https://example.com/` are one URL). A deny or ask also reads it after the
+ * origin's other spellings (no root dot, no port, the other of http and
+ * https) and after the host alone (`ghe.example.com/api/v3`), as for a value
+ * on a service, as written, and with each run of slashes read as one, as
+ * many servers read a path: the tool reaches `…/api/v3//` as
+ * `…/api/v3//rate_limit`, which an allow on `…/api/v3` does not grant and a
+ * deny on it stops. A URL that cannot be placed, or that the tool refuses as
+ * a root because it carries a query or a fragment, leaves nothing an allow
+ * could grant, and every deny or ask fires.
  */
 function apiRootValue(service: ServiceReading): OperativeValue {
-  if (service.origin === undefined) {
+  const { origin } = service;
+  const root = origin !== undefined ? joinedApiRoot(service.url, origin) : undefined;
+  if (origin === undefined || root === undefined) {
     return {
       kind: "url",
       canonical: [],
@@ -1635,13 +1647,45 @@ function apiRootValue(service: ServiceReading): OperativeValue {
       outsideWorkspace: true,
     };
   }
-  const read = canonicalUrl(service.url);
-  const url = new URL(service.url);
-  const rest = `${url.pathname}${url.search}`;
-  const hosts = service.hosts.flatMap((host) =>
-    rest === "/" ? [`${host}/`, host] : [`${host}${rest}`],
-  );
-  return { ...read, spellings: [...new Set([...(read.spellings ?? []), ...hosts])] };
+  const at =
+    (path: string) =>
+    (o: string): string[] =>
+      path === "" ? [`${o}/`, o] : [`${o}${path}`, `${o}${path}/`];
+  const others = [...service.otherOrigins, ...service.hosts];
+  const folded = root.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  return {
+    kind: "url",
+    canonical: at(root)(origin),
+    spellings: [
+      ...new Set([
+        service.url,
+        ...others.flatMap(at(root)),
+        ...(folded !== root ? [origin, ...others].flatMap(at(folded)) : []),
+      ]),
+    ],
+  };
+}
+
+/**
+ * The path of the API root at `raw` as a tool that drops one trailing slash
+ * and appends its request paths as text reaches it, without its last `/`:
+ * `/api/v3` for `https://h/api/v3/.`, `""` for the origin's own root.
+ * Undefined when a path appended to it would land in a query or a fragment,
+ * or on another origin.
+ */
+function joinedApiRoot(raw: string, origin: string): string | undefined {
+  const text = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+  let url: URL;
+  try {
+    url = new URL(`${text}/`);
+  } catch {
+    return undefined;
+  }
+  const { pathname } = url;
+  if (url.origin !== origin || url.search !== "" || url.hash !== "" || !pathname.endsWith("/")) {
+    return undefined;
+  }
+  return pathname.slice(0, -1);
 }
 
 function readValues(input: unknown, arg: OperativeArg): FieldReading[] {

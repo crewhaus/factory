@@ -298,11 +298,16 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * service: "baseUrl" }`. The value is the API the call goes to, matched as
  * any URL is (`alwaysAllow RateLimitStatus(https://ghe.example.com/**)`): the
  * one the call names, else the one the tool's `serviceDefaults` says
- * (`unnamed`), so a deny on a host fires whichever field picked it. A deny or
- * ask also reads it after the host alone (`RateLimitStatus(ghe.example.com/**)`).
+ * (`unnamed`), so a deny on a host fires whichever field picked it. It is an
+ * API ROOT the tool appends its request paths to as text, after dropping one
+ * trailing slash (tool-codehost's `normalizeBaseUrl`), and is read that way:
+ * `…/api/v3`, `…/api/v3/` and `…/api/v3/.` are one API, matched with or
+ * without a slash at the end. A deny or ask also reads it after the origin's
+ * other spellings and the host alone, as for a value on a service
+ * (`RateLimitStatus(*://ghe.example.com/**)`, `RateLimitStatus(ghe.example.com/**)`).
  * It names no destination the model picks: like the `service` of a
  * repository, it is one of the APIs the tool is set up for (see
- * {@link hasModelChosenDestination}).
+ * {@link hasModelChosenDestination}). See {@link isApiRootArg}.
  *
  * `overlay`, for an `id` or `recipient`, names a top-level field holding
  * whose own copy of the value a call acts on, when it names one: a deploy
@@ -535,6 +540,21 @@ export type OperativeOpening = {
   readonly beneath?: "all" | "visible";
 };
 
+/**
+ * A `url` declared as its own `service`: the API a call goes to, itself
+ * (RateLimitStatus's `baseUrl`; see {@link OperativeArg}). Its value depends
+ * on the tool's config when a call leaves it out, and a deny or ask on it
+ * also reads its host alone. Taken structurally, so the builtin manifest
+ * answers the same way as the live tool.
+ */
+export function isApiRootArg(arg: {
+  readonly field: string;
+  readonly kind: string;
+  readonly service?: string;
+}): boolean {
+  return arg.kind === "url" && arg.service !== undefined && arg.service === arg.field;
+}
+
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */
 export const DESTINATION_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set(["url", "recipient"]);
 
@@ -741,7 +761,9 @@ export interface ToolDefinition<TInput = unknown> {
    * fires on it. A call to `home`, whether or not it names it, is also
    * matched without an origin, so `alwaysAllow IssueCreate(acme/app)` covers
    * it and nothing on another host. A URL declared as its own `service`
-   * (RateLimitStatus's `baseUrl`) left out is read as `unnamed`. Without
+   * (RateLimitStatus's `baseUrl`) left out is read as `unnamed`, which is
+   * then given as the config writes it: the gate drops one trailing slash
+   * as the tool does. Without
    * this, a call that names no API carries no origin, and no rule written
    * on a host meets it.
    *

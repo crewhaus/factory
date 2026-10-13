@@ -411,6 +411,35 @@ describe("argument patterns that cannot scope", () => {
     expect(matches(p?.suggestion ?? "")).toBe(true);
   });
 
+  test("on an API root, only an allow written without a scheme can never match", () => {
+    // RateLimitStatus's baseUrl is its own service: a deny or ask also reads
+    // the host alone and every string of the call, so it fires.
+    const quota = tool("RateLimitStatus", [{ field: "baseUrl", kind: "url", service: "baseUrl" }]);
+    const found = permissionRuleProblems({
+      rules: [
+        { type: "alwaysDeny", pattern: "RateLimitStatus(ghe.example.com/**)" },
+        { type: "alwaysDeny", pattern: "RateLimitStatus(GHE_TOKEN)" },
+        { type: "alwaysAsk", pattern: "RateLimitStatus(ghe.example.com/**)" },
+        { type: "alwaysAllow", pattern: "RateLimitStatus(ghe.example.com/**)" },
+        { type: "alwaysAllow", pattern: "RateLimitStatus(https://ghe.example.com/**)" },
+      ],
+      granted: [quota],
+      known: [quota],
+      mcpServers: [],
+    });
+    expect(found.map((p) => [p.type, p.pattern, p.code])).toEqual([
+      ["alwaysAllow", "RateLimitStatus(ghe.example.com/**)", "argument-cannot-match"],
+    ]);
+    // A url that is not its own service is read as the URL alone, either way.
+    const deny = permissionRuleProblems({
+      rules: [{ type: "alwaysDeny", pattern: "HttpRequest(api.example.com/**)" }],
+      granted,
+      known,
+      mcpServers: [],
+    });
+    expect(deny.map((p) => p.code)).toEqual(["argument-cannot-match"]);
+  });
+
   test("an argument on a tool that declares no scoping field is pointed out", () => {
     const [p] = problems(["ClipboardWrite(*secret*)"]);
     expect(p?.code).toBe("argument-not-scoped");

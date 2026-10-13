@@ -186,11 +186,12 @@ built it.
   API's origin in front (`https://ghe.example.com/acme/app`):
   `alwaysDeny IssueCreate(https://ghe.example.com/**)` fires, including on a
   call that names no `baseUrl` but goes there. RateLimitStatus is read as the
-  API it reports on, so a deny on a host stops it however the call picks that
-  host. A ChatPost through an incoming webhook, which ignores its `channel`,
-  is read by the variable that names the webhook, and WebhookPost by `urlEnv`
-  when it gives one. A deploy call that names a `tenant` acts on that tenant's
-  own copy of the pin and is read as `<tenant>/<name>/<env>`.
+  API it reports on, the way the tool reaches it, so a deny on that API or its
+  host stops it however the call picks or spells it (`…/api/v3/` is
+  `…/api/v3`). A ChatPost through an incoming webhook, which ignores its
+  `channel`, is read by the variable that names the webhook, and WebhookPost
+  by `urlEnv` when it gives one. A deploy call that names a `tenant` acts on
+  that tenant's own copy of the pin and is read as `<tenant>/<name>/<env>`.
 - **A headless approval holds only where it was granted.** A parked call
   records where each path, program and script it names lands. If a link on
   the way has moved by the time it resumes, the call is asked again, naming

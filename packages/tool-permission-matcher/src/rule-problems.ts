@@ -46,7 +46,11 @@ export type RuleToolDescriptor = {
    * The tool's `operativeArgs`. Absent when it declares none, which leaves
    * nothing to check an argument pattern against.
    */
-  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+  readonly operativeArgs?: ReadonlyArray<{
+    readonly kind: string;
+    readonly field?: string;
+    readonly service?: string;
+  }>;
   /** Its flags, when known. Absent reads as "may be destructive". */
   readonly destructive?: boolean;
   readonly requiresSandbox?: boolean;
@@ -225,6 +229,19 @@ export function argGlobCanMatchUrl(argGlob: string): boolean {
   // A scheme is a letter, then letters, digits, `+`, `-` or `.`; the fixed
   // start may stop part-way through one (`ht*`).
   return scheme === "" ? colon === -1 : SCHEME.test(scheme);
+}
+
+/**
+ * A `url` declared as its own `service`: the API a call goes to, itself
+ * (tool-catalog's `isApiRootArg`, restated here because this package takes
+ * plain data and depends on no tool package).
+ */
+function isApiRoot(arg: {
+  readonly kind: string;
+  readonly field?: string;
+  readonly service?: string;
+}): boolean {
+  return arg.kind === "url" && arg.service !== undefined && arg.service === arg.field;
 }
 
 /** When a URL glob was written after an HTTP method (`GET https://…`), the glob without it. */
@@ -588,6 +605,11 @@ export function permissionRuleProblems(
         continue;
       }
       if (declared.every((a) => a.kind === "url") && !argGlobCanMatchUrl(arg)) {
+        // A deny or ask on an API root (a url that is its own service, as
+        // RateLimitStatus's baseUrl) also reads its host alone, and every
+        // string of a call as 0.7.0 did: `RateLimitStatus(ghe.example.com/**)`
+        // fires. Only an allow, which reads the URL alone, never matches.
+        if (rule.type !== "alwaysAllow" && declared.some(isApiRoot)) break;
         cannotMatch++;
         continue;
       }

@@ -2034,6 +2034,45 @@ describe("permission reporting matches the engine", () => {
     ]);
   });
 
+  test("a deny on an API root written without a scheme is live cover, not an unused rule", async () => {
+    // RateLimitStatus reads the API itself: a deny also reads the host alone
+    // and every string of the call, and fires at the gate (critic11).
+    for (const pattern of ["RateLimitStatus(ghe.example.com/**)", "RateLimitStatus(GHE_TOKEN)"]) {
+      const spec = [
+        "name: demo",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: x",
+        "tools: [rateLimitStatus]",
+        "permissions:",
+        "  rules:",
+        `    - { type: alwaysDeny, pattern: "${pattern}" }`,
+      ].join("\n");
+      const result = await callJson<{
+        tools: Array<{
+          tool: string;
+          decision: string;
+          rule?: { pattern: string };
+          conditional: boolean;
+        }>;
+        ruleProblems: unknown[];
+        unusedRules: unknown[];
+      }>(permissionAudit, { spec });
+      expect({ pattern, ruleProblems: result.ruleProblems, unused: result.unusedRules }).toEqual({
+        pattern,
+        ruleProblems: [],
+        unused: [],
+      });
+      expect(result.tools[0]).toMatchObject({
+        tool: "rateLimitStatus",
+        decision: "deny",
+        rule: { pattern },
+        conditional: true,
+      });
+    }
+  });
+
   test("a rule naming a tool the runtime adds on its own is not a dead rule", async () => {
     // procode's `alwaysAllow Skill` and the browser starter's `alwaysAllow
     // Type` were listed as covering nothing, with "Write Shell" / "Write Tree".

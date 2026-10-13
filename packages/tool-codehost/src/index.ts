@@ -289,10 +289,9 @@ function codehostServiceDefaults(input: unknown, toolConfig: unknown): ServiceDe
   const asked = input !== null && typeof input === "object" ? (input as BaseInput).host : undefined;
   const home: HostKind = cfg.host ?? "github";
   const host: HostKind = asked === "github" || asked === "gitlab" ? asked : home;
-  return {
-    unnamed: normalizeBaseUrl(configuredBaseUrl(cfg, host)),
-    home: normalizeBaseUrl(configuredBaseUrl(cfg, home)),
-  };
+  // As the config writes them: the gate drops one trailing slash from an API
+  // root itself, as withCall does, and reads the rest by origin.
+  return { unnamed: configuredBaseUrl(cfg, host), home: configuredBaseUrl(cfg, home) };
 }
 
 /** The repository's path prefix for this host, or a readable refusal. */

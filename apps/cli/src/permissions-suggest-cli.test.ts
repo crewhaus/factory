@@ -112,6 +112,30 @@ describe("crewhaus permissions suggest", () => {
       '+ { type: alwaysAllow, pattern: "RemovePath" } (⚠ BLANKET GRANT — every call of the tool)',
     );
   }, 30_000);
+
+  test("a call that leaves its API to the config is not scoped to an API it may never reach", async () => {
+    // The log does not record which API the harness's tool_config sent the
+    // call to, and this process reads none: `RateLimitStatus {}` was proposed
+    // as `RateLimitStatus(https://api.github.com/)` for a GHE harness, which
+    // never covered its calls (critic11).
+    writeFileSync(
+      join(cwd, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: check the quota\ntools: [rateLimitStatus]\ntool_config:\n  codehost:\n    base_url: https://ghe.example.com/api/v3\n    allowed_origins: [https://ghe.example.com]\n",
+    );
+    seed([{ name: "RateLimitStatus", input: {} }]);
+    const { stdout, exitCode } = await suggest(true);
+    expect(exitCode).toBe(0);
+    const out = JSON.parse(stdout) as Json;
+    expect(out.suggestions.map((s) => s.rule.pattern)).toEqual(["RateLimitStatus"]);
+    expect(stdout).not.toContain("api.github.com");
+    expect(out.suggestions[0]?.evidence.join("\n")).toContain("BLANKET GRANT");
+    // A call that names the API is scoped to it, as the gate reads it.
+    seed([{ name: "RateLimitStatus", input: { baseUrl: "https://GHE.example.com/api/v3/" } }]);
+    const named = JSON.parse((await suggest(true)).stdout) as Json;
+    expect(named.suggestions.map((s) => s.rule.pattern)).toEqual([
+      "RateLimitStatus(https://ghe.example.com/api/v3)",
+    ]);
+  }, 60_000);
 });
 
 // The engine reads settings before the spec: an allow `--apply` writes to
