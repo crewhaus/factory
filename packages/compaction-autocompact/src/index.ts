@@ -48,7 +48,8 @@ export const SUMMARY_MARKER =
 /**
  * The user-role turn a compacted history ends on when no pending user
  * message can be kept verbatim: the tail was a tool result mid-loop, the
- * pending message was too large to keep, or it was the only message.
+ * pending message was too large to keep or carried a block the size
+ * estimate cannot see, or it was the only message.
  */
 export const COMPACTION_CONTINUE =
   "[The conversation above was compacted into a summary. Continue from it, picking up the most recent request where it left off.]";
@@ -87,6 +88,18 @@ function carriesToolResult(message: Anthropic.MessageParam): boolean {
 }
 
 /**
+ * The size estimate sees all of `message`. `estimateTokens` counts image and
+ * document blocks as 0, so a message carrying one fits any bound however
+ * large it really is. A reactive compaction would then keep the very message
+ * the provider just called too long, and the retry fails the same way.
+ */
+function sizeIsEstimable(message: Anthropic.MessageParam): boolean {
+  return (
+    typeof message.content === "string" || message.content.every((block) => block.type === "text")
+  );
+}
+
+/**
  * Decide which trailing user message, if any, survives compaction verbatim.
  *
  * Pure and deterministic, so a caller can call it BEFORE {@link autoCompact}
@@ -99,6 +112,8 @@ function carriesToolResult(message: Anthropic.MessageParam): boolean {
  *  - it carries no `tool_result` block — a result kept without the
  *    `tool_use` that produced it (summarized away) is itself a 400;
  *  - something precedes it — summarizing nothing frees nothing;
+ *  - it is text only — the size estimate counts an image or document block
+ *    as 0, so the next condition could not bound it;
  *  - it fits `keepPendingMaxTokens` — keeping an oversized message verbatim
  *    would defeat the compaction it is part of.
  */
@@ -113,6 +128,7 @@ export function planCompaction(
     messages.length > 1 &&
     last.role === "user" &&
     !carriesToolResult(last) &&
+    sizeIsEstimable(last) &&
     estimateTokens([last]) <= maxTokens
   ) {
     return { toSummarize: messages.slice(0, -1), kept: last };

@@ -307,6 +307,87 @@ describe("compaction ends the history on a user turn", () => {
     expect(reactive?.payload["summary"]).toBe("compacted summary");
   });
 
+  test("reactive forceCompact keeps the pending message only within a quarter of the context limit", async () => {
+    // The other reactive test runs under the default 200K limit with a short
+    // pending message, so it cannot tell the reactive path's cap from no cap.
+    // ~1.1K chars ≈ 275 tokens: over 25% of 1K, yet the whole history stays
+    // under the pre-turn threshold, so only the reactive path compacts.
+    const root = mkdtempSync(join(SESSION_ROOT, "reactive-oversized-"));
+    const adapter = prefillStrictAdapter({ firstError: promptTooLongError });
+    const pending = filler("an oversized paste");
+    await runChatLoop({
+      model: "test-model",
+      instructions: "t",
+      _adapter: adapter,
+      runContext: createRunContext(),
+      sessionRootDir: root,
+      permissionMode: "bypass",
+      continuity: LEDGER_ON,
+      singleTurn: true,
+      contextLimit: 1000,
+      seedMessages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+        { role: "user", content: pending },
+      ],
+    });
+    expect(adapter.prefillRejections).toBe(0);
+    expect(adapter.requests).toHaveLength(2);
+    // The prompt_too_long attempt went out uncompacted.
+    expect(adapter.requests[0]?.messages).toHaveLength(3);
+    expect(textOf(adapter.requests[0]?.messages[2])).toBe(pending);
+    const messages = adapter.requests[1]?.messages ?? [];
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(textOf(messages[2])).toBe(COMPACTION_CONTINUE);
+    const [, , continuation] = messages;
+    expect(continuation !== undefined && isSyntheticMessage(continuation)).toBe(true);
+    const evicted = sessionEvents(root).filter((e) => e.kind === "context_evicted");
+    expect(evicted.some((e) => e.payload["text"] === pending)).toBe(true);
+  });
+
+  test("reactive forceCompact does not keep a pending document the size estimate cannot see", async () => {
+    // The estimate counts a document block as 0 tokens, so a cap alone keeps
+    // it at any size. Kept, the retry carries the message the provider just
+    // refused as too long, and with one compaction allowed the turn fails.
+    const root = mkdtempSync(join(SESSION_ROOT, "reactive-document-"));
+    const adapter = prefillStrictAdapter({ firstError: promptTooLongError });
+    const pending: Anthropic.MessageParam = {
+      role: "user",
+      content: [
+        {
+          type: "document",
+          source: { type: "text", media_type: "text/plain", data: "lorem ".repeat(50_000) },
+        },
+        { type: "text", text: "summarise this report" },
+      ],
+    };
+    const result = await runChatLoop({
+      model: "test-model",
+      instructions: "t",
+      _adapter: adapter,
+      runContext: createRunContext(),
+      sessionRootDir: root,
+      permissionMode: "bypass",
+      continuity: LEDGER_ON,
+      singleTurn: true,
+      seedMessages: [
+        { role: "user", content: "u1" },
+        { role: "assistant", content: "a1" },
+        pending,
+      ],
+    });
+    expect(result).toBe("answer");
+    expect(adapter.prefillRejections).toBe(0);
+    expect(adapter.requests).toHaveLength(2);
+    const messages = adapter.requests[1]?.messages ?? [];
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(textOf(messages[2])).toBe(COMPACTION_CONTINUE);
+    const carriesDocument = messages.some(
+      (m) => typeof m.content !== "string" && m.content.some((b) => b.type === "document"),
+    );
+    expect(carriesDocument).toBe(false);
+  });
+
   test("a pending message too large to keep is summarized, and a synthetic continuation ends the history", async () => {
     const root = mkdtempSync(join(SESSION_ROOT, "oversized-"));
     const adapter = prefillStrictAdapter({});

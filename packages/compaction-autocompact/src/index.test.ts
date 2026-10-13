@@ -390,15 +390,47 @@ describe("planCompaction", () => {
     expect(plan.toSummarize).toEqual([u("q"), a("r")]);
   });
 
-  test("keeps a block-content user message that carries no tool_result (text + image)", () => {
+  test("keeps a block-content user message made of text blocks", () => {
     const pending: Anthropic.MessageParam = {
       role: "user",
       content: [
-        { type: "text", text: "what is in this?" },
-        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+        { type: "text", text: "first part" },
+        { type: "text", text: "second part" },
       ],
     };
     expect(planCompaction([u("q"), a("r"), pending]).kept).toBe(pending);
+  });
+
+  test("never keeps an image or document block — the estimate counts it as 0, so no bound holds it", () => {
+    // A 4 MB image and a 3 MB document both estimate at a handful of tokens.
+    // Kept, the document is the message a prompt_too_long just refused, and
+    // the reactive retry carries it again.
+    const image: Anthropic.MessageParam = {
+      role: "user",
+      content: [
+        { type: "text", text: "what is in this?" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "A".repeat(4_000_000) },
+        },
+      ],
+    };
+    const document: Anthropic.MessageParam = {
+      role: "user",
+      content: [
+        {
+          type: "document",
+          source: { type: "text", media_type: "text/plain", data: "lorem ".repeat(500_000) },
+        },
+        { type: "text", text: "summarise this report" },
+      ],
+    };
+    for (const pending of [image, document]) {
+      const history = [u("q"), a("r"), pending];
+      const plan = planCompaction(history, { keepPendingMaxTokens: 1_000_000 });
+      expect(plan.kept).toBeUndefined();
+      expect(plan.toSummarize).toBe(history);
+    }
   });
 
   test("never keeps a tool_result tail — its tool_use is summarized away, so keeping it would 400", () => {
