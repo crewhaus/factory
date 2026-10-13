@@ -232,7 +232,7 @@ describe("crewhaus export claude-plugin", () => {
         rmSync(tmp, { recursive: true, force: true });
       }
     }, 20_000);
-  }, 20_000);
+  });
 });
 
 describe("crewhaus serve --mcp", () => {
