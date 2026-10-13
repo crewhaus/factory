@@ -1058,10 +1058,13 @@ type ScriptOptions = {
   readonly longArgument?: ReadonlySet<string>;
 };
 
-/** bash, dash, ksh and `sh` (one of them): `-o name` and bash's `-O name`, ksh's `-R file`. */
+/**
+ * bash, dash and `sh` (one of them): each `-o` and bash's `-O` take the next
+ * word as their name, wherever they stand in their word (`-oe pipefail`).
+ */
 const POSIX_SHELL_OPTIONS: ScriptOptions = {
   flags: "abefhiklmnprtuvxBCDEHIPT",
-  argument: "oOR",
+  argument: "oO",
   attached: false,
   long: new Set([
     "--debugger",
@@ -1095,7 +1098,9 @@ const OPENS_SCRIPT_THROUGH_KERNEL: ReadonlyMap<string, ScriptOptions> = new Map(
   ["sh", POSIX_SHELL_OPTIONS],
   ["bash", POSIX_SHELL_OPTIONS],
   ["dash", POSIX_SHELL_OPTIONS],
-  ["ksh", POSIX_SHELL_OPTIONS],
+  // ksh: `-o` takes the rest of its word, or the next (`-oerrexit`, `-o
+  // errexit`); `-R file` left out.
+  ["ksh", { flags: "abefhiklmnprtuvxBCDEH", argument: "o", attached: true }],
   // zsh: `-O` and `-R` are flags; `-o` takes the rest of its word, or the
   // next. zsh's and csh's `-b` end the options, as `--` does: left out.
   [
@@ -1138,6 +1143,34 @@ const PYTHON3_OPTIONS: ScriptOptions = {
   attached: true,
   longArgument: new Set(["--check-hash-based-pycs"]),
 };
+
+/**
+ * How a shell reads one of its option words (`-eo`, `+O`): the letters it
+ * takes as options — up to one whose name is the rest of the word — and how
+ * many of the words after it those take as their names (`-o pipefail`), as
+ * {@link ScriptOptions} says. bash and dash take the next word for each `-o`
+ * or `-O` (`-oe pipefail`); zsh and ksh take the rest of the word if there
+ * is one (`-oerrexit`), and zsh's `-O` is a flag. A shell not measured is
+ * read as one whose `-o` or `-O` ending the word takes the next.
+ */
+function readShellOption(name: string, letters: string): { letters: string; takes: number } {
+  const options = OPENS_SCRIPT_THROUGH_KERNEL.get(name);
+  if (options === undefined) return { letters, takes: /[oO]$/.test(letters) ? 1 : 0 };
+  let takes = 0;
+  for (let c = 0; c < letters.length; c++) {
+    if (!options.argument.includes(letters.charAt(c))) continue;
+    if (!options.attached) takes++;
+    else return { letters: letters.slice(0, c + 1), takes: c === letters.length - 1 ? 1 : 0 };
+  }
+  return { letters, takes };
+}
+
+/** Does a shell's long option take the next word: bash's `--rcfile file`, zsh's `--emulate sh`? */
+function shellLongTakesWord(name: string, option: string): boolean {
+  const options = OPENS_SCRIPT_THROUGH_KERNEL.get(name);
+  if (options === undefined) return option === "--rcfile" || option === "--init-file";
+  return options.longArgument?.has(option) === true;
+}
 
 /** How the options of an interpreter that opens its script through the kernel read, if `name` is one. */
 function kernelScriptOptions(name: string): ScriptOptions | undefined {
@@ -1259,8 +1292,9 @@ export type ProgramWords = {
  * of them, what it reads on its input (a shell given `-s` or no operand, a
  * runtime given none), or code written in an argument (`python -c`, `node
  * -e`) or a module found by name (`python -m`). `undefined` when the
- * program is no interpreter. A shell's `-o name` and `--rcfile file` take
- * the word after them.
+ * program is no interpreter. A shell's options take the words
+ * {@link readShellOption} says (`-o name`, bash's `-O name`) and `--rcfile
+ * file` or zsh's `--emulate sh` the next.
  */
 function scanInterpreter(
   words: ReadonlyArray<string>,
@@ -1282,15 +1316,20 @@ function scanInterpreter(
     if (options && w.startsWith("--")) {
       const long = w.slice(0, w.includes("=") ? w.indexOf("=") : undefined);
       if (!shell && INLINE_CODE_OPTIONS.has(long)) return { operands, script: "inline" };
-      if (shell && (w === "--rcfile" || w === "--init-file")) j++;
+      if (shell && shellLongTakesWord(name, w)) j++;
       continue;
     }
     if (options && (w.startsWith("-") || (shell && w.startsWith("+") && w.length > 1))) {
       const letters = w.slice(1);
-      if (shell && w.startsWith("-") && letters.includes("s")) {
-        return { operands: [], script: "input" };
+      if (shell) {
+        // Its flags, and the words its `-o` (or bash's `-O`) take as names.
+        const read = readShellOption(name, letters);
+        if (w.startsWith("-") && read.letters.includes("s")) {
+          return { operands: [], script: "input" };
+        }
+        j += read.takes;
+        continue;
       }
-      if (shell && /[oO]$/.test(letters)) j++;
       if (code !== "" && code.includes(letters.charAt(letters.length - 1))) {
         return { operands, script: "inline" };
       }

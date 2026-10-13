@@ -681,6 +681,26 @@ describe("programWords: the words of a command that name code it runs", () => {
     expect(read("python3x", "x.py").operands).toEqual([]);
   });
 
+  // interp review (0.7.1): which words a shell's options take, measured with
+  // `SH OPT a.sh b.sh` and a marker. bash and dash take the next word for
+  // each `-o` or `-O` in the option word; zsh and ksh take the rest of the
+  // word if there is one; zsh's `-O` is a flag; zsh's `--emulate` takes one.
+  test("the words a shell's options take as names, and its script", () => {
+    expect(read("bash", "-oe", "pipefail", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("sh", "-oo", "errexit", "nounset", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("bash", "-eO", "extglob", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("zsh", "-O", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("zsh", "-eO", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("zsh", "-oshwordsplit", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("zsh", "-eo", "shwordsplit", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("ksh", "-oerrexit", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("zsh", "--emulate", "sh", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("bash", "--rcfile", "rc", "x.sh").operands).toEqual(["x.sh"]);
+    // A shell not measured: an `-o` or `-O` that ends its word takes the next.
+    expect(read("mksh", "-o", "errexit", "x.sh").operands).toEqual(["x.sh"]);
+    expect(read("mksh", "-O", "x", "y.sh").operands).toEqual(["y.sh"]);
+  });
+
   test("code written in an argument, a module by name, or a script on the input: no file is handed", () => {
     expect(read("python3", "-c", "print('a/../b')", "a/../b").operands).toEqual([]);
     expect(read("python3", "-Bc", "x", "y/z").operands).toEqual([]);
@@ -965,6 +985,13 @@ describe("a shell that reads the commands it runs on its input", () => {
     expect(readsShellOnInput(["sh", "x.sh"])).toBe(false);
     expect(readsShellOnInput(["sh", "-c", "x"])).toBe(false);
     expect(readsShellOnInput(["python3"])).toBe(false);
+    // Each option word's names taken, nothing is left for a script.
+    expect(readsShellOnInput(["bash", "-oe", "pipefail"])).toBe(true);
+    expect(readsShellOnInput(["sh", "-os", "pipefail"])).toBe(true);
+    expect(readsShellOnInput(["zsh", "--emulate", "sh"])).toBe(true);
+    expect(readsShellOnInput(["zsh", "-eO"])).toBe(true);
+    expect(readsShellOnInput(["zsh", "-oshwordsplit"])).toBe(true);
+    expect(readsShellOnInput(["zsh", "-oshwordsplit", "x.sh"])).toBe(false);
   });
 });
 

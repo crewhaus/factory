@@ -4333,3 +4333,59 @@ describe("interp review — the shell's own directory, spelled another way", () 
     }
   }, 60_000);
 });
+
+// interp review (0.7.1): the gate read a shell's options as if every shell
+// were bash, and bash's only when `-o` ended its word. zsh's `-O` is a flag,
+// so `zsh -O dl/x.sh` (dl → secrets) ran a script the gate took for -O's
+// name; zsh's `-oshwordsplit` holds an `s` that is no `-s`; bash's `-oe
+// pipefail`, and zsh's `--emulate sh`, take a word, so the shell reads its
+// line on the input, which the gate did not read.
+describe("interp review — the words a shell's options take", () => {
+  let marker: string;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    for (const d of ["safe", "secrets"]) mkdirSync(join(ws, d), { recursive: true });
+    symlinkSync("secrets", join(ws, "dl"));
+    for (const p of ["secrets/x.sh", "safe/ok.sh"]) {
+      writeFileSync(join(ws, p), `#!/bin/sh\necho ${p} >> "${marker}"\n`, { mode: 0o755 });
+    }
+  });
+  const ran = () => readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).join(",");
+
+  test("a deny reads the script and the line on the input, and nothing runs", async () => {
+    const calls: Array<[string, Record<string, unknown>, RuleSet]> = [];
+    for (const command of ["zsh -O dl/x.sh", "zsh -eO dl/x.sh", "zsh -oshwordsplit dl/x.sh"]) {
+      calls.push([
+        "Bash",
+        { command },
+        rules(["alwaysDeny", "Bash(**secrets/**)"], ["alwaysAllow", "Bash"]),
+      ]);
+    }
+    for (const argv of [
+      ["zsh", "--emulate", "sh"],
+      ["bash", "-oe", "pipefail"],
+      ["sh", "-oe", "pipefail"],
+    ]) {
+      calls.push([
+        "RunCommand",
+        { argv, stdin: "sh secrets/x.sh\n" },
+        rules(["alwaysDeny", "RunCommand(sh secrets/**)"], ["alwaysAllow", "RunCommand"]),
+      ]);
+    }
+    for (const [tool, input, ruleSet] of calls) {
+      writeFileSync(marker, "");
+      const got = await gate(tool, input, ruleSet);
+      expect({ input, got, ran: ran() }).toEqual({ input, got: "deny", ran: "" });
+    }
+  }, 60_000);
+
+  test("control: a line on the input that names nothing denied runs", async () => {
+    const got = await gate(
+      "RunCommand",
+      { argv: ["bash", "-oe", "pipefail"], stdin: "sh safe/ok.sh\n" },
+      rules(["alwaysDeny", "RunCommand(sh secrets/**)"], ["alwaysAllow", "RunCommand"]),
+    );
+    expect({ got, ran: ran() }).toEqual({ got: "allow", ran: "safe/ok.sh" });
+  }, 60_000);
+});
