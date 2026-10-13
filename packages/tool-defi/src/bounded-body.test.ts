@@ -59,7 +59,9 @@ describe("DeFi replies are bounded", () => {
   }, 30_000);
 
   // Slow by construction too (it inflates up to the RPC cap): usually under a
-  // second on CI, but a loaded runner took it past bun's 5 s default.
+  // second on CI, but a loaded runner cut it off at bun's 5 s default, so its
+  // time there is unknown. The call's own 20 s deadline (DEFAULT_TIMEOUT_MS)
+  // ends any slower run, so the budget only has to clear that.
   test("a gzip bomb RPC reply is refused at the cap", async () => {
     answer = gz(bomb);
     const out = await rpcCall("https://rpc.example.test/key", "eth_blockNumber", []);
