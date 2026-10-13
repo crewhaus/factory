@@ -105,6 +105,10 @@ describe("operativeArgWords — a declaration in words", () => {
         },
         "a recipient; matched as https://host/channel with the origin of the API the call goes to (the one in apiBaseUrl, else the configured one), and also as channel on the API the tool is set up for; a deny or ask also reads the URL; ignored when the call names webhookUrlEnv: then a deny or ask reads it, an allow need not name it",
       ],
+      [
+        { field: "env", kind: "id", within: "name", overlay: "tenant" },
+        "an id; matched as name/env; on a call that names tenant, matched as tenant/name/env, its own copy; a deny or ask also reads name/env and the tenant alone",
+      ],
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
   });

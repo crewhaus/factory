@@ -399,9 +399,9 @@ export const specPin: RegisteredTool = buildTool({
   operativeArgs: [
     { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
     { field: "specFile", kind: "path" },
-    { field: "env", kind: "id", within: "name" },
-    // A tenant's overlay is another pin: an allow on the global one is not it.
-    { field: "tenant", kind: "id" },
+    // A tenant's overlay is another pin, `<tenant>/<name>/<env>`: an allow on
+    // the global one is not it.
+    { field: "env", kind: "id", within: "name", overlay: "tenant" },
   ],
   description:
     'Register a spec file\'s current content as a version in the local spec registry and pin that version to an environment (or a tenant\'s overlay of one). Use it to deploy a spec change. Registration is content-hashed: unchanged content is a no-op that reports the version already holding it, and each new version appends an entry to the spec\'s CHANGELOG.md. It REFUSES to move an existing pin unless repin:true, because the registry keeps no pin history; a tenant\'s first overlay replaces nothing and is written. It refuses a spec name the registry would store under another spelling, map to its shared "spec" fallback, or hide (a leading "_", "_tenants" included), a registryDir inside such a directory of another registry, a manifest that cannot be read or is a symlink (never treated as "no versions"), and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed. dryRun changes nothing and previews the same pin decision.',
@@ -900,8 +900,7 @@ export const deployRollback: RegisteredTool = buildTool({
   name: "DeployRollback",
   operativeArgs: [
     { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
-    { field: "env", kind: "id", within: "name" },
-    { field: "tenant", kind: "id" },
+    { field: "env", kind: "id", within: "name", overlay: "tenant" },
   ],
   description:
     'Repoint an environment (or a tenant\'s overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller\'s rollback. Use it to undo a bad deploy. DESTRUCTIVE: the registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as "previous" (there is no history to resolve it against; use DeployInspect to pick a version by name), a spec name the registry would store under another spelling (naming the stored one) or its listing hides (a leading "_"), a version this registry has never seen, a listed version whose file cannot be fetched (the environment would resolve to nothing while reading as a successful deploy), a manifest that cannot be read, and any path the registry would open that resolves outside the workspace. NO AUDIT RECORD IS WRITTEN, and the result says so next to the pin that changed.',
@@ -1084,8 +1083,7 @@ export const deployInspect: RegisteredTool = buildTool({
   name: "DeployInspect",
   operativeArgs: [
     { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
-    { field: "env", kind: "id", within: "name", default: "*" },
-    { field: "tenant", kind: "id" },
+    { field: "env", kind: "id", within: "name", default: "*", overlay: "tenant" },
   ],
   description:
     "Read-only: what is pinned where in the local spec registry. Use it before a pin or a rollback. Reports each spec's registered versions, its environment pins, and whether the version each pin points at can actually be fetched (a manifest can list a version whose file is gone). With a tenant, reports the tenant's effective version per environment and whether an overlay file exists; the environments listed are the spec's global pins, so one pinned only for that tenant appears only when env names it. Every path is contained before it is read. An environment name outside the registry's grammar is refused, not reported as unpinned; a spec the registry's listing hides (a leading \"_\") is named under hiddenByRegistry; an absent registry is reported absent and an unreadable one unread, never as empty. It cannot show deployment history (only the audit log's deployment_action chain has it) or a field-level diff (use SpecDiff).",

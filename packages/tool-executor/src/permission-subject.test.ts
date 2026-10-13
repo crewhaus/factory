@@ -2865,3 +2865,117 @@ describe("a field the tool ignores beside another the call names (ignoredWhen)",
     ).not.toThrow();
   });
 });
+
+describe("an owner's own copy of a value (overlay)", () => {
+  // tool-deploy's shape: a pin `<name>/<env>`, or a tenant's overlay of it.
+  const pinTool = (envDefault?: "*") =>
+    buildTool({
+      name: "Pin",
+      description: "d",
+      inputSchema: z.object({
+        name: z.string(),
+        env: envDefault === undefined ? z.string() : z.string().optional(),
+        tenant: z.string().optional(),
+      }),
+      operativeArgs: [
+        {
+          field: "env",
+          kind: "id",
+          within: "name",
+          overlay: "tenant",
+          ...(envDefault !== undefined ? { default: envDefault } : {}),
+        },
+      ],
+      destructive: true,
+      execute: async () => "ok",
+    });
+  const decide = (tool: ReturnType<typeof pinTool>, input: unknown) => {
+    const values = operativeValuesFor(tool, input) ?? [];
+    return (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Pin", input, { polarity, operativeValues: values });
+  };
+
+  test("a call that names none is the shared value", () => {
+    const tool = pinTool();
+    const input = { name: "billing", env: "staging" };
+    expect(operativeValuesFor(tool, input)?.[0]?.canonical).toEqual(["billing/staging"]);
+    expect(decide(tool, input)("Pin(billing/staging)", "allow")).toBe(true);
+  });
+
+  test("a call that names one is matched with it in front: an allow must name it", () => {
+    const tool = pinTool();
+    const input = { name: "billing", env: "staging", tenant: "acme" };
+    expect(operativeValuesFor(tool, input)?.[0]?.canonical).toEqual(["acme/billing/staging"]);
+    expect(readOperativeField(input, tool.operativeArgs?.[0] as never)).toEqual([
+      "acme/billing/staging",
+    ]);
+    const match = decide(tool, input);
+    for (const [pattern, allow] of [
+      ["Pin(acme/billing/staging)", true],
+      ["Pin(*/billing/staging)", true],
+      ["Pin(acme/**)", true],
+      ["Pin(billing/staging)", false],
+      ["Pin(billing/**)", false],
+      ["Pin(acme)", false],
+      ["Pin(beta/billing/staging)", false],
+    ] as const) {
+      expect({ pattern, allow: match(pattern, "allow") }).toEqual({ pattern, allow });
+    }
+    // A deny reads it with the owner, without it, and the owner alone.
+    for (const [pattern, fires] of [
+      ["Pin(acme/billing/staging)", true],
+      ["Pin(billing/staging)", true],
+      ["Pin(acme)", true],
+      ["Pin(ACME)", true],
+      ["Pin(beta)", false],
+      ["Pin(beta/**)", false],
+    ] as const) {
+      expect({ pattern, fires: match(pattern, "restrict") }).toEqual({ pattern, fires });
+    }
+  });
+
+  test("a call that names every value of its owner's copy stands for each of them", () => {
+    const tool = pinTool("*");
+    const match = decide(tool, { name: "billing", tenant: "acme" });
+    expect(match("Pin(acme/billing/*)", "allow")).toBe(true);
+    expect(match("Pin(billing/*)", "allow")).toBe(false);
+    expect(match("Pin(acme/billing/prod)", "restrict")).toBe(true);
+    expect(match("Pin(billing/prod)", "restrict")).toBe(true);
+  });
+
+  test("buildTool refuses an overlay it cannot put in front of the value", () => {
+    const build =
+      (arg: Record<string, unknown>, extra: Record<string, z.ZodTypeAny> = {}) =>
+      () =>
+        buildTool({
+          name: "Bad",
+          description: "d",
+          inputSchema: z.object({
+            name: z.string(),
+            env: z.string(),
+            tenant: z.string().optional(),
+            baseUrl: z.string().optional(),
+            path: z.string().optional(),
+            ...extra,
+          }),
+          operativeArgs: [arg as never],
+          execute: async () => "ok",
+        });
+    expect(build({ field: "path", kind: "path", overlay: "tenant" })).toThrow(
+      /only an "id" or a "recipient"/,
+    );
+    expect(build({ field: "env", kind: "id", overlay: "owner" })).toThrow(
+      /has no top-level field "owner"/,
+    );
+    expect(build({ field: "env", kind: "id", within: "name", overlay: "name" })).toThrow(
+      /already used/,
+    );
+    expect(
+      build({ field: "env", kind: "id", overlay: "tenants" }, { tenants: z.array(z.string()) }),
+    ).toThrow(/is a list/);
+    expect(build({ field: "env", kind: "id", overlay: "tenant", service: "baseUrl" })).toThrow(
+      /cannot be combined/,
+    );
+    expect(build({ field: "env", kind: "id", within: "name", overlay: "tenant" })).not.toThrow();
+  });
+});

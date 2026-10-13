@@ -1171,6 +1171,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "ignoredWhen",
         "kind",
         "opens",
+        "overlay",
         "prefix",
         "relocates",
         "secretRef",
@@ -1189,6 +1190,11 @@ describe("the generated tool manifest matches the tools it describes", () => {
     // The API a code-host call may name instead of the configured one.
     expect(TOOL_FLAGS["issueCreate"]?.operativeArgs).toEqual([
       { field: "repo", kind: "recipient", within: "owner", service: "baseUrl" },
+    ]);
+    // A tenant's overlay of a pin is that tenant's own copy of it.
+    expect(TOOL_FLAGS["deployRollback"]?.operativeArgs).toEqual([
+      { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
+      { field: "env", kind: "id", within: "name", overlay: "tenant" },
     ]);
     // A webhook post ignores the channel; the webhook comes first.
     expect(TOOL_FLAGS["chatPost"]?.operativeArgs).toEqual([

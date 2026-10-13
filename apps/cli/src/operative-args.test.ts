@@ -243,9 +243,6 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "SpecPatchApply.path":
     "the spec is passed inline and patched text comes back; nothing is written",
   "SpecPin.env": "the version is registered and no pin moves",
-  "SpecPin.tenant": "the global pin, not a tenant's overlay of it",
-  "DeployRollback.tenant": "the global pin, not a tenant's overlay of it",
-  "DeployInspect.tenant": "the global pins, not a tenant's overlay of them",
   "SplitFile.outputDir":
     "the parts are written beside the source, in the directory of path, which is declared",
   "StatusPagePost.incidentId": "a new incident on the operator's configured status page",

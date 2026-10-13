@@ -1585,6 +1585,7 @@ export type OperativeArgLike = {
   readonly default?: string;
   readonly within?: string;
   readonly service?: string;
+  readonly overlay?: string;
   readonly ignoredWhen?: string;
   readonly relocates?: true;
   readonly env?: string;
@@ -1672,6 +1673,13 @@ export function operativeArgWords(arg: OperativeArgLike): string {
     const value = arg.within !== undefined ? `${arg.within}/${leaf}` : leaf;
     parts.push(
       `matched as https://host/${value} with the origin of the API the call goes to (the one in ${arg.service}, else the configured one), and also as ${value} on the API the tool is set up for; a deny or ask also reads the URL`,
+    );
+  }
+  if (arg.overlay !== undefined) {
+    const leaf = arg.field.split(".").pop() ?? arg.field;
+    const value = arg.within !== undefined ? `${arg.within}/${leaf}` : leaf;
+    parts.push(
+      `on a call that names ${arg.overlay}, matched as ${arg.overlay}/${value}, its own copy; a deny or ask also reads ${value} and the ${arg.overlay} alone`,
     );
   }
   if (arg.ignoredWhen !== undefined) {

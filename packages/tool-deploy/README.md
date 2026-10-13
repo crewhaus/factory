@@ -108,9 +108,12 @@ registry's files would be invisible to the first one's listing and could be
 mistaken for its own.
 
 A rule reads `<name>/<env>` (`alwaysAllow DeployRollback(billing/staging)`). A
-call that names a `tenant` acts on that tenant's overlay, another pin, so the
-rule also reads the tenant: such an allow does not cover it, and
-`alwaysDeny DeployRollback(acme)` stops a rollback of tenant `acme`'s overlay.
+call that names a `tenant` acts on that tenant's overlay, another pin, read as
+`<tenant>/<name>/<env>`: `alwaysAllow DeployRollback(acme/billing/staging)`
+covers acme's overlay of it and nothing else, and an allow written for the
+global pin covers no tenant's. A deny also reads the global pin's name and the
+tenant alone: `alwaysDeny DeployRollback(acme)` stops a rollback of any of
+acme's overlays.
 
 **Destructive means dry run by default, through the same selection code.**
 `DeployRollback` takes an explicit `dryRun: false` to act, and the preview is

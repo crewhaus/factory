@@ -21,6 +21,8 @@ export type RegistryOperativeArg = {
   readonly within?: string;
   /** For an `id` or `recipient`: the field holding the URL of the API a call may name instead of the tool's own. */
   readonly service?: string;
+  /** For an `id` or `recipient`: the field naming whose own copy of the value a call acts on (a tenant's overlay). */
+  readonly overlay?: string;
   /** Another field that, when a call names it, makes the tool ignore this one: read by a deny or ask only. */
   readonly ignoredWhen?: string;
   /** The field only moves the tool; its default is read by a deny or ask. */
@@ -140,6 +142,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
     ...(arg.service !== undefined ? { service: arg.service } : {}),
+    ...(arg.overlay !== undefined ? { overlay: arg.overlay } : {}),
     ...(arg.ignoredWhen !== undefined ? { ignoredWhen: arg.ignoredWhen } : {}),
     ...(arg.relocates === true ? { relocates: true as const } : {}),
     ...(arg.env !== undefined ? { env: arg.env } : {}),

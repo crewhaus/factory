@@ -164,6 +164,11 @@
  *      password, cannot be placed: the value is flagged `outsideWorkspace`
  *      (see {@link servedValue}). A tool with no `serviceDefaults` reads a
  *      call that names no API without an origin.
+ *    - an `id` or `recipient` declared with an `overlay` field (a deploy
+ *      tenant), on a call that names it, is matched with its value in front
+ *      (`acme/billing/staging`): the call acts on that owner's own copy. A
+ *      deny or ask also reads the value without it, and its value alone
+ *      (see {@link overlaidValue}).
  *    - a `path` declared `beneath` (a directory the tool walks: RemovePath,
  *      Grep, a git pathspec) also carries its spellings as `beneath`
  *      prefixes, so a deny or ask naming anything under it fires —
@@ -437,6 +442,7 @@ function valuesOf(
       anyQualifier,
       prefixOf,
       service,
+      overlay,
     } of readField(parsedInput, arg, services)) {
       if (arg.relocates === true && defaulted === true) {
         if (arg.kind === "url") relocated.push(canonicalUrl(raw));
@@ -617,7 +623,7 @@ function valuesOf(
             break;
           }
           const spellings = [...(words ?? []), ...(unqualified ?? [])];
-          const value: OperativeValue = {
+          const read: OperativeValue = {
             kind: arg.kind,
             canonical: [raw],
             ...(spellings.length > 0 ? { spellings } : {}),
@@ -628,6 +634,8 @@ function valuesOf(
             // key may hold `/`: what follows is any run, not one segment.
             ...(prefixOf !== undefined ? { standsForAnyRun: true } : {}),
           };
+          // An owner's own copy of the value (a tenant's overlay of a pin).
+          const value = overlay !== undefined ? overlaidValue(read, overlay) : read;
           // A value on a service is that service's: an allow names its
           // origin, a deny also reads the URL as a URL.
           if (service !== undefined) {
@@ -1417,6 +1425,8 @@ type FieldReading = {
    * names it or the tool's `serviceDefaults` say where it goes.
    */
   readonly service?: ServiceReading;
+  /** A field declared `overlay`: whose own copy of the value, when the call names one. */
+  readonly overlay?: string;
 };
 
 /**
@@ -1452,9 +1462,10 @@ function namesWorkspaceRoot(values: ReadonlyArray<OperativeValue>): boolean {
  * absolute path as it is.
  */
 export function readOperativeField(input: unknown, arg: OperativeArg): string[] {
-  return readField(input, arg).map((r) =>
-    r.service?.origin !== undefined ? `${r.service.origin}/${r.value}` : r.value,
-  );
+  return readField(input, arg).map((r) => {
+    const value = r.overlay !== undefined ? `${r.overlay}/${r.value}` : r.value;
+    return r.service?.origin !== undefined ? `${r.service.origin}/${value}` : value;
+  });
 }
 
 /**
@@ -1467,7 +1478,9 @@ function readField(
   arg: OperativeArg,
   services?: ServiceDefaultsReading,
 ): FieldReading[] {
-  const read = readValues(input, arg);
+  const values = readValues(input, arg);
+  const owner = arg.overlay !== undefined ? qualifierOf(input, arg.overlay) : undefined;
+  const read = owner !== undefined ? values.map((r) => ({ ...r, overlay: owner })) : values;
   if (arg.service === undefined) return read;
   const url = qualifierOf(input, arg.service);
   const reading = url !== undefined ? serviceOf(url) : services?.unnamed;
@@ -1515,6 +1528,25 @@ function withoutTrailingDots(host: string): string {
   let end = host.length;
   while (end > 0 && host.charCodeAt(end - 1) === 0x2e) end--;
   return host.slice(0, end);
+}
+
+/**
+ * A value of a field declared `overlay`, read for a call that names whose
+ * copy it acts on: matched with the owner in front, so an allow must name it;
+ * a deny or ask also reads the value without it (the shared copy's name) and
+ * the owner alone.
+ */
+function overlaidValue(value: OperativeValue, owner: string): OperativeValue {
+  const at = (v: string): string => `${owner}/${v}`;
+  const { standsForAny } = value;
+  return {
+    ...value,
+    canonical: value.canonical.map(at),
+    spellings: [...new Set([...value.canonical, ...(value.spellings ?? []), owner])],
+    ...(standsForAny !== undefined
+      ? { standsForAny: [...new Set([...standsForAny.map(at), ...standsForAny])] }
+      : {}),
+  };
 }
 
 /**

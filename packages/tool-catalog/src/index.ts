@@ -288,6 +288,18 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * password, cannot be placed: no allow grants the call, and every deny or
  * ask fires.
  *
+ * `overlay`, for an `id` or `recipient`, names a top-level field holding
+ * whose own copy of the value a call acts on, when it names one: a deploy
+ * tenant's overlay of a pin. The value is then matched with it in front:
+ * `{ field: "env", kind: "id", within: "name", overlay: "tenant" }` is
+ * `acme/billing/staging` for tenant acme's overlay of billing's staging pin.
+ * So `alwaysAllow DeployRollback(acme/billing/staging)` grants that overlay
+ * alone, and `DeployRollback(billing/staging)`, written for the shared pin,
+ * grants none. A deny or ask also reads the value without it, and the
+ * field's value alone: `alwaysDeny DeployRollback(acme)` fires on each of
+ * acme's overlays, and `alwaysDeny DeployRollback(billing/staging)` on every
+ * tenant's overlay of that pin as well as on the pin.
+ *
  * `ignoredWhen` names another operative field of the tool which, when the
  * call names it, makes the tool ignore this one: ChatPost's `channel`
  * through an incoming webhook (`webhookUrlEnv`), which posts to the channel
@@ -473,6 +485,7 @@ export type OperativeArg = {
   readonly default?: string;
   readonly within?: string;
   readonly service?: string;
+  readonly overlay?: string;
   readonly ignoredWhen?: string;
   readonly relocates?: true;
   readonly env?: string;

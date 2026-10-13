@@ -512,12 +512,41 @@ function checkOperativeArgs(
         );
       }
     }
+    const { overlay } = arg;
+    if (overlay !== undefined) {
+      if (kind !== "id" && kind !== "recipient") {
+        fail(
+          `${at}.overlay: only an "id" or a "recipient" has an owner's own copy; a "${kind}" value is read as it is`,
+        );
+      }
+      if (
+        prefix !== undefined ||
+        secretRef !== undefined ||
+        relocates !== undefined ||
+        service !== undefined
+      ) {
+        fail(`${at}.overlay cannot be combined with prefix, secretRef, relocates or service`);
+      }
+      if (typeof overlay !== "string" || !/^[A-Za-z_$][\w$]*$/.test(overlay)) {
+        fail(`${at}.overlay must name one top-level input field, e.g. "tenant"`);
+      }
+      if (overlay === field || overlay === within) {
+        fail(`${at}.overlay names "${overlay}", which is already used`);
+      }
+      const holds = scalarFieldShape(inputSchema, overlay);
+      if (holds !== undefined) fail(`${at}.overlay: the input schema ${holds}`);
+    }
     const { ignoredWhen } = arg;
     if (ignoredWhen !== undefined) {
       if (typeof ignoredWhen !== "string" || !/^[A-Za-z_$][\w$]*$/.test(ignoredWhen)) {
         fail(`${at}.ignoredWhen must name one top-level input field, e.g. "webhookUrlEnv"`);
       }
-      if (ignoredWhen === field || ignoredWhen === within || ignoredWhen === service) {
+      if (
+        ignoredWhen === field ||
+        ignoredWhen === within ||
+        ignoredWhen === service ||
+        ignoredWhen === overlay
+      ) {
         fail(`${at}.ignoredWhen names "${ignoredWhen}", which is already used`);
       }
       // Checked against the other declarations below, once all are read.
@@ -572,6 +601,7 @@ function checkOperativeArgs(
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
         ...(service !== undefined ? { service } : {}),
+        ...(overlay !== undefined ? { overlay } : {}),
         ...(ignoredWhen !== undefined ? { ignoredWhen } : {}),
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
