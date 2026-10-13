@@ -611,48 +611,94 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
       });
 
       // Rows are classified together in chunks, so the pair can fall on either
-      // side of a chunk boundary: every position must catch it. The tail row
-      // is longer than a widget row, so some position puts the head last in
-      // one chunk and the tail first in the next.
+      // side of a chunk boundary: every position must catch it. Thirty widget
+      // rows make two chunks. The tail row is longer than a widget row, so
+      // some position puts the head last in one chunk and the tail first in
+      // the next.
       test("the pair is redacted wherever it falls among the chunks", async () => {
+        const widgets = WIDGETS.slice(0, 30);
         const tail = {
           ...TAIL,
           title: `${TAIL.title} ${"a calm survey of grinder burr geometry ".repeat(20)}`,
         };
         const leaks: number[] = [];
-        for (let at = 0; at <= WIDGETS.length; at++) {
-          const bundle = searchingFor([...WIDGETS.slice(0, at), HEAD, tail, ...WIDGETS.slice(at)]);
+        for (let at = 0; at <= widgets.length; at++) {
+          const bundle = searchingFor([...widgets.slice(0, at), HEAD, tail, ...widgets.slice(at)]);
           const out = String(await bundle.search.execute({ query: "widget" }));
           if (out.includes("ignore previous") || out.includes("exfiltrate")) leaks.push(at);
-          expect(out.split("\n").filter((l) => l.includes("brewing ratios"))).toHaveLength(60);
+          expect(out.split("\n").filter((l) => l.includes("brewing ratios"))).toHaveLength(30);
         }
         expect(leaks).toEqual([]);
       }, 20_000);
 
       // The model flags the two halves only together, and a clean row sits
       // between them, so no pair of neighbours reproduces the verdict.
-      test("a chunk verdict no pair reproduces fails closed: every row is redacted", async () => {
-        const halves = ["zebra", "quartz"];
-        const stub = async (text: string) => ({
-          verdict: halves.every((h) => text.includes(h))
+      const zebraQuartz = async (text: string) => ({
+        verdict:
+          text.includes("zebra") && text.includes("quartz")
             ? ("malicious" as const)
             : ("clean" as const),
+      });
+      const FAR_APART = [
+        widgetRef("widget-a", "Widget zebra"),
+        widgetRef("widget-b", "Widget between"),
+        widgetRef("widget-c", "Widget quartz"),
+        widgetRef("widget-d", "Widget after"),
+      ];
+
+      // Alone, and beside a regex pair that is redacted first: the rows left
+      // must still be re-checked together.
+      for (const [name, refs] of [
+        ["alone", FAR_APART],
+        ["after a pair beside it is redacted", [...FAR_APART, HEAD, TAIL]],
+      ] as const) {
+        test(`a chunk verdict no pair reproduces fails closed, ${name}: every row is redacted`, async () => {
+          const bundle = searchingFor(refs);
+          setDefaultBoundaryLlmClassifier(zebraQuartz);
+          try {
+            const rc = createRunContext();
+            const out = String(
+              await bundle.search.execute({ query: "widget" }, { runContext: rc }),
+            );
+            const rows = out.split("\n").slice(1);
+            expect(rows).toHaveLength(refs.length);
+            for (const row of rows) expect(row).toMatch(/• \S+ \(v1\) — \[tool output redacted/);
+            expect(rc.dataLineage?.size ?? 0).toBe(0);
+          } finally {
+            setDefaultBoundaryLlmClassifier(undefined);
+          }
         });
-        const bundle = searchingFor([
-          widgetRef("widget-a", "Widget zebra"),
-          widgetRef("widget-b", "Widget between"),
-          widgetRef("widget-c", "Widget quartz"),
-          widgetRef("widget-d", "Widget after"),
-        ]);
-        setDefaultBoundaryLlmClassifier(stub);
+      }
+
+      // Several chunks flagged at once: their checks run one chunk at a time,
+      // so the pair calls stay inside the pool of eight.
+      test("several flagged chunks keep at most eight classifications in flight", async () => {
+        const rows = [...WIDGETS];
+        for (const at of [55, 30, 5]) {
+          rows.splice(
+            at,
+            0,
+            widgetRef(`widget-zebra-${at}`, "Widget zebra"),
+            widgetRef(`widget-quartz-${at}`, "Widget quartz"),
+          );
+        }
+        let inFlight = 0;
+        let most = 0;
+        const slow = async (text: string) => {
+          inFlight++;
+          most = Math.max(most, inFlight);
+          await new Promise((r) => setTimeout(r, 2));
+          inFlight--;
+          return zebraQuartz(text);
+        };
+        const bundle = searchingFor(rows);
+        setDefaultBoundaryLlmClassifier(slow);
         try {
-          const rc = createRunContext();
-          const out = String(await bundle.search.execute({ query: "widget" }, { runContext: rc }));
-          const rows = out.split("\n").slice(1);
-          expect(rows).toHaveLength(4);
-          for (const row of rows)
-            expect(row).toMatch(/widget-[a-d] \(v1\) — \[tool output redacted/);
-          expect(rc.dataLineage?.size ?? 0).toBe(0);
+          const out = String(await bundle.search.execute({ query: "widget" }));
+          expect(out).not.toContain("Widget zebra");
+          expect(out).not.toContain("Widget quartz");
+          expect(out.split("\n").filter((l) => l.includes("brewing ratios"))).toHaveLength(60);
+          expect(most).toBeLessThanOrEqual(8);
         } finally {
           setDefaultBoundaryLlmClassifier(undefined);
         }

@@ -476,29 +476,28 @@ async function classifyRows(
     fresh++;
   });
   if (fresh > 0) chunks.push(chunk);
-  const flaggedChunks: number[][] = [];
-  await mapPooled(chunks, async (members) => {
-    const whole = await classifyBoundary(members.map((i) => rows[i]).join("\n"), {
-      origin: "memory",
-    });
-    if (whole.action === "redact") flaggedChunks.push(members);
-  });
+  const wholes = await mapPooled(chunks, (members) =>
+    classifyBoundary(members.map((i) => rows[i]).join("\n"), { origin: "memory" }),
+  );
+  // In chunk order, not completion order, so the output does not depend on
+  // which chunk's model call returned first.
+  const flaggedChunks = chunks.filter((_, c) => wholes[c]?.action === "redact");
   const flagged = [...new Set(flaggedChunks.flat())];
   const each = await mapPooled(flagged, (i) => classifyMemory(rows[i] as string, undefined));
   flagged.forEach((i, j) => {
     const result = each[j] as Classified;
     if (!result.safe) out[i] = result;
   });
-  const passed = flaggedChunks.map((members) => members.filter((i) => out[i] === undefined));
-  const split = await mapPooled(passed, (members) =>
-    redactSplitInjections(members.map((i) => rows[i] as string)),
-  );
-  passed.forEach((members, c) => {
-    for (const [k, notice] of split[c] ?? []) {
-      const i = members[k] as number;
+  // One flagged chunk at a time: the check pools its own pair calls, so this
+  // keeps at most ROW_CLASSIFY_CONCURRENCY classifications in flight. A row
+  // carried between two flagged chunks takes the first chunk's notice.
+  for (const members of flaggedChunks) {
+    const passed = members.filter((i) => out[i] === undefined);
+    for (const [k, notice] of await redactSplitInjections(passed.map((i) => rows[i] as string))) {
+      const i = passed[k] as number;
       out[i] ??= { safe: false, notice };
     }
-  });
+  }
   return rows.map((row, i) => {
     const result = out[i] ?? { safe: true, text: row };
     if (result.safe && rc !== undefined) tagContent(rc, result.text, "memory");
