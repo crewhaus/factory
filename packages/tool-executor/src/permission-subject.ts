@@ -657,6 +657,12 @@ function valuesOf(
             values.push(servedValue(value, service));
             if (service.url !== "") {
               values.push({ ...canonicalUrl(service.url), restrictOnly: true });
+              // The tool drops one trailing slash from an API root before it
+              // joins a request path, so `…/api/v3/` is the API `…/api/v3`:
+              // a deny or ask written on that one meets it too.
+              if (service.url.endsWith("/") && service.url.length > 1) {
+                values.push({ ...canonicalUrl(service.url.slice(0, -1)), restrictOnly: true });
+              }
             }
           } else values.push(value);
           // The prefix alone, for a deny or ask written without the

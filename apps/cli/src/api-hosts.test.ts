@@ -638,6 +638,29 @@ describe("a configured API root is read as the tool joins it", () => {
     );
     expect(await call(rateLimitStatus, {}, deny)).toEqual({ decision: "deny", a: [], b: [] });
   }, 60_000);
+
+  test("a deny on the configured API root fires whether or not base_url ends in a slash", async () => {
+    // The repository tools read the configured root as a URL a deny or ask
+    // meets. Written `…/api/v3/`, the tool drops the slash and reaches
+    // `…/api/v3/repos/…`, so a deny written on `…/api/v3` must still fire.
+    const deny = rules(["alwaysDeny", `IssueCreate(${baseB})`], ["alwaysAllow", "IssueCreate"]);
+    for (const base_url of [baseB, `${baseB}/`]) {
+      configured(base_url);
+      expect({ base_url, ...(await call(issueCreate, issue, deny)) }).toEqual({
+        base_url,
+        decision: "deny",
+        a: [],
+        b: [],
+      });
+    }
+    // An allow is not widened: the deny's own URL reading is restrict-only.
+    configured(`${baseB}/`);
+    expect(await call(issueCreate, issue, rules(["alwaysAllow", "IssueCreate"]))).toEqual({
+      decision: "allow",
+      a: [],
+      b: createdOnB,
+    });
+  }, 60_000);
 });
 
 describe("a code-host rule on GitLab, whose owner is a group path", () => {
