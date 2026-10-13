@@ -1374,6 +1374,29 @@ function phoneArgMatcher(compiled: CompiledPattern): GlobMatcher | undefined {
   return matcher ?? undefined;
 }
 
+const numberGlobs = new WeakMap<CompiledPattern, GlobMatcher>();
+
+/**
+ * Does an allow glob that matches `candidate` as written also match the
+ * number SmsSend sends for it? Only a spelling with separators in it can
+ * differ, and the glob is read as the tool reads a number when it is written
+ * as one (separators in it taken out too). `SmsSend(+1555?1234567)` matches
+ * `+1555-1234567` as written, but the message goes to `+15551234567`, which
+ * the glob does not name; `SmsSend(+1 555*)` still grants `+1 555 0100000`.
+ */
+function namesNumberSent(candidate: string, compiled: CompiledPattern): boolean {
+  const number = normalizePhoneNumber(candidate);
+  if (number === candidate || !isE164Number(number)) return true;
+  let matcher = numberGlobs.get(compiled);
+  if (matcher === undefined) {
+    const glob = compiled.argGlob ?? "";
+    const asNumber = normalizePhoneNumber(glob);
+    matcher = /^[+0-9*?]*$/.test(asNumber) ? compileGlob(asNumber) : compileGlob(glob);
+    numberGlobs.set(compiled, matcher);
+  }
+  return matcher.test(number);
+}
+
 const hostGlobs = new WeakMap<CompiledPattern, GlobMatcher[]>();
 
 /**
@@ -1498,7 +1521,17 @@ function valueMatches(
       : [...value.canonical, ...(value.spellings ?? [])];
   for (const candidate of candidates) {
     if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
-    if (argRe.test(candidate)) return true;
+    if (!argRe.test(candidate)) continue;
+    // An allow on a number grants it only when it names the number SmsSend
+    // sends: a `?` can stand for a separator the tool takes out.
+    if (
+      polarity === "allow" &&
+      value.kind === "recipient" &&
+      !namesNumberSent(candidate, compiled)
+    ) {
+      continue;
+    }
+    return true;
   }
   if (polarity !== "restrict") return false;
   // A field the call left out whose default is `*` stands for every value, so

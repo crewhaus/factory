@@ -1317,6 +1317,56 @@ describe("a restrict rule reads every spelling of a destination", () => {
     expect(fires("T(10.0.0.1)", to("10001"))).toBe(false);
   });
 
+  test("an allow grants a number only when it names the number SmsSend sends, and never more than before", () => {
+    const as = (kind: "recipient" | "text", raw: string): OperativeValue => ({
+      kind,
+      canonical: [raw],
+    });
+    const globs = [
+      "+15551234567",
+      "+1555?1234567",
+      "+1555??234567",
+      "+1555*",
+      "+1 555*",
+      "+1 (555) 123-4567",
+      "+1 (555) 123-456?",
+      "* 555*",
+      "*4567",
+      "*",
+      "+1555-1234567",
+    ];
+    const numbers = ["+15551234567", "+155512345678", "+1555123456"];
+    const spellings = new Set<string>(numbers);
+    for (const n of numbers) {
+      for (let p = 0; p <= n.length; p++) {
+        for (const sep of [" ", "-", "(", "."]) spellings.add(n.slice(0, p) + sep + n.slice(p));
+      }
+    }
+    spellings.add("+1 (555) 123-4567");
+    spellings.add("(+1)5551234567");
+    let granted = 0;
+    const wrong: string[] = [];
+    for (const glob of globs) {
+      // The glob read as the tool reads a number: its separators taken out.
+      const asNumber = glob.replace(/[ ().-]/g, "");
+      for (const s of spellings) {
+        const before = fires(`T(${glob})`, as("text", s), allow);
+        const sent = normalizePhoneNumber(s);
+        const names = fires(`T(${asNumber})`, as("text", sent), allow);
+        const after = fires(`T(${glob})`, as("recipient", s), allow);
+        if (after) granted++;
+        if (after !== (before && names)) wrong.push(`${glob} ${JSON.stringify(s)}`);
+      }
+    }
+    expect({ wrong }).toEqual({ wrong: [] });
+    expect(granted).toBeGreaterThan(100);
+    // The case it is for: `?` stood for the dash, and the message goes to a
+    // number the allow does not name.
+    expect(fires("T(+1555?1234567)", as("recipient", "+1555-1234567"), allow)).toBe(false);
+    expect(fires("T(+1555?1234567)", as("recipient", "+155591234567"), allow)).toBe(true);
+    expect(fires("T(+1 555*)", as("recipient", "+1 555 0100000"), allow)).toBe(true);
+  }, 30_000);
+
   // The recipient-kind audit after critic10: WaitForPort dials `10.5` as
   // 10.0.0.5, DeliverabilityCheck looks `münchen.de` up as
   // `xn--mnchen-3ya.de`, and FederationDiscover reaches `1572395042` as

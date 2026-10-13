@@ -41,7 +41,9 @@ built it.
   write to `.crewhaus/settings.json` — and so standing permissions on the
   next run — through a decoy `file_path` the tool never reads, through
   `src/../`, or through a symlinked directory. None of these pass now, and a
-  path outside the workspace never satisfies a scoped allow.
+  path outside the workspace never satisfies a scoped allow. An allow on a
+  number grants only the numbers it names: `SmsSend(+1555?1234567)` no longer
+  grants `+1555-1234567`, which goes to `+15551234567`.
 - **On macOS and Windows, a deny holds in any letter case.**
   `alwaysDeny Read(**/.env)` did not stop `Read(.ENV)`, which opens the same
   file. A path is matched under the name the file is stored with, and a deny

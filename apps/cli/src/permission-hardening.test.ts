@@ -4748,6 +4748,20 @@ describe("critic10 — a deny on a phone number meets every spelling SmsSend sen
     expect(await gate("SmsSend", sms("+15550100000"), exact, "default", judged)).toBe("allow");
     expect(wire.length).toBe(1);
   }, 60_000);
+
+  test("an allow grants a number only when it names the number the message goes to", async () => {
+    // `?` was meant for a digit; written against the call's spelling it
+    // stood for the dash, and the message went to +15551234567.
+    const rs = rules(["alwaysAllow", "SmsSend(+1555?1234567)"]);
+    expect(await gate("SmsSend", sms("+1555-1234567"), rs, "default", judged)).toBe("ask");
+    expect(wire).toEqual([]);
+    // Control: a number it names is granted and sent; so is one written
+    // with separators the allow writes too.
+    expect(await gate("SmsSend", sms("+155591234567"), rs, "default", judged)).toBe("allow");
+    const spaced = rules(["alwaysAllow", "SmsSend(+1 555*)"]);
+    expect(await gate("SmsSend", sms("+1 555 0100000"), spaced, "default", judged)).toBe("allow");
+    expect(wire.map((w) => w["To"])).toEqual(["+155591234567", "+15550100000"]);
+  }, 60_000);
 });
 
 // The recipient-kind audit after critic10: a tool that dials or looks up a
