@@ -13,12 +13,21 @@
  * point; kept in `src` so the tests can import it without a build step.
  */
 
+import { deflateRawSync } from "node:zlib";
+
 export type FixtureEntry = {
   readonly name: string;
   readonly data?: string;
-  /** "file" (default), "dir", or "symlink" with `linkTarget`. */
-  readonly kind?: "file" | "dir" | "symlink";
+  /**
+   * "file" (default), "dir", "symlink" (with `linkTarget`), "hardlink" (tar
+   * only, with `linkTarget`), or "fifo" (tar typeflag 6; a zip's unix mode).
+   */
+  readonly kind?: "file" | "dir" | "symlink" | "hardlink" | "fifo";
   readonly linkTarget?: string;
+  /** zip only: store the data deflated (method 8) rather than stored. */
+  readonly deflate?: boolean;
+  /** zip only: the uncompressed size BOTH headers claim, whatever the data is. */
+  readonly declaredSize?: number;
 };
 
 const BLOCK = 512;
@@ -30,7 +39,16 @@ function writeOctal(block: Buffer, value: number, offset: number, width: number)
 /** One 512-byte ustar header with a correct checksum. */
 function tarHeader(entry: FixtureEntry, size: number): Buffer {
   const block = Buffer.alloc(BLOCK, 0);
-  const typeflag = entry.kind === "dir" ? "5" : entry.kind === "symlink" ? "2" : "0";
+  const typeflag =
+    entry.kind === "dir"
+      ? "5"
+      : entry.kind === "symlink"
+        ? "2"
+        : entry.kind === "hardlink"
+          ? "1"
+          : entry.kind === "fifo"
+            ? "6"
+            : "0";
   block.write(entry.name.slice(0, 100), 0, "ascii");
   writeOctal(block, entry.kind === "dir" ? 0o755 : 0o644, 100, 8);
   writeOctal(block, 0, 108, 8);
@@ -89,9 +107,11 @@ export function crc32(bytes: Uint8Array): number {
 }
 
 /**
- * Build a zip with STORED (uncompressed) entries. Local headers and the
- * central directory agree, so a real `unzip` reads it happily — which is the
- * point: a refusal has to come from our own check, not from a broken file.
+ * Build a zip with STORED (uncompressed) entries, or deflated ones with
+ * `deflate`. Local headers and the central directory agree, so a real
+ * `unzip` reads it happily — which is the point: a refusal has to come from
+ * our own check, not from a broken file. `declaredSize` makes both headers
+ * understate (or overstate) a member, as a crafted archive does.
  */
 export function buildZip(entries: ReadonlyArray<FixtureEntry>): Buffer {
   const locals: Buffer[] = [];
@@ -108,34 +128,43 @@ export function buildZip(entries: ReadonlyArray<FixtureEntry>): Buffer {
       "utf8",
     );
     const checksum = crc32(data);
+    const stored = entry.deflate === true ? deflateRawSync(data) : data;
+    const declared = entry.declaredSize ?? data.length;
 
     const local = Buffer.alloc(30 + name.length);
     local.writeUInt32LE(0x04034b50, 0);
     local.writeUInt16LE(20, 4);
     local.writeUInt16LE(0, 6);
-    local.writeUInt16LE(0, 8); // stored
+    local.writeUInt16LE(entry.deflate === true ? 8 : 0, 8); // deflated or stored
     local.writeUInt16LE(0, 10); // fixed time
     local.writeUInt16LE(0x21, 12); // fixed date (1980-01-01)
     local.writeUInt32LE(checksum, 14);
-    local.writeUInt32LE(data.length, 18);
-    local.writeUInt32LE(data.length, 22);
+    local.writeUInt32LE(stored.length, 18);
+    local.writeUInt32LE(declared, 22);
     local.writeUInt16LE(name.length, 26);
     local.writeUInt16LE(0, 28);
     name.copy(local, 30);
-    locals.push(local, data);
+    locals.push(local, stored);
 
-    const mode = entry.kind === "symlink" ? 0o120777 : isDir ? 0o040755 : 0o100644;
+    const mode =
+      entry.kind === "symlink"
+        ? 0o120777
+        : entry.kind === "fifo"
+          ? 0o010644
+          : isDir
+            ? 0o040755
+            : 0o100644;
     const central = Buffer.alloc(46 + name.length);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(0x031e, 4); // made on unix
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(0, 8);
-    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(entry.deflate === true ? 8 : 0, 10);
     central.writeUInt16LE(0, 12);
     central.writeUInt16LE(0x21, 14);
     central.writeUInt32LE(checksum, 16);
-    central.writeUInt32LE(data.length, 20);
-    central.writeUInt32LE(data.length, 24);
+    central.writeUInt32LE(stored.length, 20);
+    central.writeUInt32LE(declared, 24);
     central.writeUInt16LE(name.length, 28);
     central.writeUInt16LE(0, 30);
     central.writeUInt16LE(0, 32);
@@ -146,7 +175,7 @@ export function buildZip(entries: ReadonlyArray<FixtureEntry>): Buffer {
     name.copy(central, 46);
     centrals.push(central);
 
-    offset += local.length + data.length;
+    offset += local.length + stored.length;
   }
 
   const directory = Buffer.concat(centrals);

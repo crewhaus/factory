@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { withoutGiveUp } from "./__test__/without-give-up";
 import {
   SECURE_TOOLS,
   allowlistCheck,
@@ -26,12 +27,14 @@ import {
   promptInjectionScan,
   pseudonymize,
   redactForExport,
+  registerSecureConfig,
   secretScan,
   signPayload,
   urlSafetyCheck,
   verifyPayload,
 } from "./index";
 import { computeLink } from "./lib/evidence";
+import { evaluatePolicy } from "./lib/policy";
 
 /** Tools return compact JSON; parse it so assertions read as data. */
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed JSON shape directly.
@@ -51,6 +54,12 @@ let tmp: string;
 
 beforeEach(() => {
   process.env[KEY_VAR] = "a-test-key-value";
+  // The operator's list (tool_config.secure.key_env_vars): the only names a
+  // keyed tool may read. The two unset names are listed so their tests reach
+  // the "unset" answer rather than the "not listed" one.
+  registerSecureConfig({
+    key_env_vars: [KEY_VAR, "CREWHAUS_DEFINITELY_UNSET_KEY", "CREWHAUS_NOT_SET_AT_ALL"],
+  });
   tmp = mkdtempSync(path.join(tmpdir(), "crewhaus-secure-"));
   process.chdir(tmp);
 });
@@ -59,6 +68,7 @@ afterEach(() => {
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   delete process.env[KEY_VAR];
+  registerSecureConfig({});
 });
 
 describe("package-wide contract", () => {
@@ -671,10 +681,15 @@ describe("ContentPolicyCheck", () => {
   ];
 
   test("a compliant document passes every rule", async () => {
-    const out = await run(contentPolicyCheck, { text: "Results may vary over time.", rules });
+    // The review pattern finds nothing, a failing exec in the regex worker:
+    // without this, a worker a loaded runner stalls 100 ms there reads as
+    // giving up, and the rule as not evaluated.
+    const out = await withoutGiveUp(() =>
+      run(contentPolicyCheck, { text: "Results may vary over time.", rules }),
+    );
     expect(out.pass).toBe(true);
     expect(out.counts).toMatchObject({ pass: 3, fail: 0 });
-  });
+  }, 20_000); // runs in a regex worker, which a loaded runner can be slow to start
 
   test("a missing disclaimer and a forbidden phrase both fail", async () => {
     const out = await run(contentPolicyCheck, { text: "Guaranteed to work.", rules });
@@ -698,6 +713,96 @@ describe("ContentPolicyCheck", () => {
     });
     expect(out.outcomes[0].status).toBe("error");
     expect(out.pass).toBe(false);
+  });
+
+  // C073: patterns ran on this thread, and JavaScriptCore's give-up on a
+  // runaway match reads as "no match", so the gate passed text it had not
+  // checked: pass:true, "forbidden text is absent".
+  test("a pattern that could run away is an error that fails the check, never 'absent'", async () => {
+    const text = `${"a".repeat(30)}! guaranteed returns`;
+    const rules = Array.from({ length: 10 }, (_, i) => ({
+      id: `g${i}`,
+      kind: "forbidden_pattern" as const,
+      value: `(a+)+!$|guaranteed returns${i === 0 ? "" : `|x{${i}}`}`,
+    }));
+    // Counted, not timed: no regex ran over the text on this thread, where
+    // nothing can stop it. 0.7.0 ran all ten here, each until the engine gave
+    // up; this test refuses such a run on the spot rather than wait it out.
+    let onThisThread = 0;
+    const realExec = RegExp.prototype.exec;
+    RegExp.prototype.exec = function (this: RegExp, input: string) {
+      if (input === text) {
+        onThisThread += 1;
+        throw new Error(`/${this.source}/ ran over the text on the caller's thread`);
+      }
+      return realExec.call(this, input);
+    };
+    const out = await run(contentPolicyCheck, { text, rules }).finally(() => {
+      RegExp.prototype.exec = realExec;
+    });
+    expect(onThisThread).toBe(0);
+    expect(out.pass).toBe(false);
+    expect(out.counts).toMatchObject({ error: 10, pass: 0 });
+    expect(out.outcomes[0].message).toContain("nested-quantifier");
+    // The same rule without the runaway branch finds the forbidden text.
+    const plain = await run(contentPolicyCheck, {
+      text,
+      rules: [{ id: "g", kind: "forbidden_pattern", value: "guaranteed returns" }],
+    });
+    expect(plain.outcomes[0]).toMatchObject({ status: "fail", matchCount: 1 });
+  });
+
+  test("a pattern that was not run to the end is an error, with the reason", async () => {
+    const out = await evaluatePolicy(
+      "guaranteed",
+      [
+        { id: "f", kind: "forbidden_pattern", value: "absent-thing" },
+        { id: "r", kind: "required_pattern", value: "absent-thing" },
+        { id: "p", kind: "forbidden_phrase", value: "absent-thing" },
+      ],
+      {},
+      { deadlineMs: 0 },
+    );
+    expect(out.pass).toBe(false);
+    const byId = Object.fromEntries(out.outcomes.map((o) => [o.id, o]));
+    expect(byId.f).toMatchObject({ status: "error", matchCountIsLowerBound: true });
+    expect(byId.r).toMatchObject({ status: "error" });
+    expect(byId.f?.message).toContain("ran out");
+    expect(byId.f?.message).toContain("not the same as nothing matching");
+    // A literal runs on this thread, whatever the pattern budget.
+    expect(byId.p).toMatchObject({ status: "pass" });
+  });
+
+  test("a count past the cap is reported as a lower bound", async () => {
+    const out = await run(contentPolicyCheck, {
+      text: "a".repeat(20_000),
+      rules: [
+        { id: "pat", kind: "forbidden_pattern", value: "a" },
+        { id: "lit", kind: "forbidden_phrase", value: "a" },
+      ],
+    });
+    const byId = Object.fromEntries(
+      (out.outcomes as Array<{ id: string }>).map((o) => [o.id, o]),
+    ) as Record<
+      string,
+      {
+        status: string;
+        matchCount: number;
+        message: string;
+        matchCountIsLowerBound?: boolean;
+        matches: unknown[];
+      }
+    >;
+    expect(byId.pat).toMatchObject({
+      status: "fail",
+      matchCount: 10_000,
+      matchCountIsLowerBound: true,
+    });
+    expect(byId.pat?.message).toContain("at least 10000");
+    expect(byId.pat?.matches.length).toBe(20);
+    // Literals are counted in full.
+    expect(byId.lit).toMatchObject({ status: "fail", matchCount: 20_000 });
+    expect(byId.lit?.matchCountIsLowerBound).toBeUndefined();
   });
 
   test("a duplicate rule id is refused with a readable message", async () => {
@@ -798,8 +903,10 @@ describe("SignPayload and VerifyPayload", () => {
   });
 
   test("a key name that is not an env-var name is refused", async () => {
-    const out = await signPayload.execute({ payload: "x", keyEnvVar: "not a var" });
-    expect(String(out)).toContain("not a valid environment variable name");
+    const out = await signPayload.execute({ payload: "x", keyEnvVar: "bad name!" });
+    expect(String(out)).toContain("must name an environment variable");
+    // Not quoted back: a value that is not a name is most often the key itself.
+    expect(String(out)).not.toContain("bad name!");
   });
 
   test("base64url encoding round-trips", async () => {

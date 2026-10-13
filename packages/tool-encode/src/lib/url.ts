@@ -139,6 +139,19 @@ function matchesAny(name: string, patterns: ReadonlyArray<string>): boolean {
 }
 
 /**
+ * `text` without its trailing slashes: what `text.replace(/\/+$/, "")`
+ * returned, in one pass from the end. That pattern tries every start inside
+ * a run of slashes that is not at the end and rescans the rest of the run
+ * from each, so it was quadratic in the run's length, and the URL is the
+ * caller's.
+ */
+export function withoutTrailingSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x2f) end--;
+  return end === text.length ? text : text.slice(0, end);
+}
+
+/**
  * Canonicalize a URL so two spellings of the same resource compare equal.
  *
  * On top of what the URL parser already does (lowercased scheme and host,
@@ -182,7 +195,7 @@ export function normalizeUrl(input: string, options: NormalizeOptions = {}): str
   if ((options.stripTrailingSlash ?? false) && url.pathname !== "/" && url.pathname.endsWith("/")) {
     // The slash that IS the path ("https://host/") stays; a trailing slash on
     // a deeper path is the spelling difference this option exists to remove.
-    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.pathname = withoutTrailingSlashes(url.pathname);
   }
   const href = url.href;
   // An empty query renders as a bare "?", which is noise when comparing. Only

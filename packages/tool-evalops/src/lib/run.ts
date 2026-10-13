@@ -20,13 +20,13 @@
  *     the pass rate and point estimates for these two. 3 of 5 is not 60%, and
  *     pass@k over a handful of samples is exactly where that matters.
  */
-import { existsSync, statSync } from "node:fs";
-import * as path from "node:path";
+import { statSync } from "node:fs";
+import { jsonSyntaxProblem } from "@crewhaus/eval-report";
 import type { EvalAggregates, EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { aggregate } from "@crewhaus/eval-runner";
 import { statsKernel } from "@crewhaus/tool-math";
 import type { SafePath } from "../paths";
-import { type Loaded, contain, fail, readResolved, renderPath } from "./read";
+import { type Loaded, contain, fail, joinRel, readLeaf, renderPath } from "./read";
 
 /** The file a run directory is identified by. */
 export const RESULTS_FILENAME = "results.json";
@@ -55,34 +55,39 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 export function readRunDoc(toolName: string, rel: string, maxBytes: number): Loaded<RunDoc> {
   const safe = contain(toolName, rel);
   if (!safe.ok) return safe;
-  let target = safe.value;
+  let fileRel = safe.value.rel;
   let shown = rel;
   let isDir = false;
   try {
-    isDir = statSync(target.real).isDirectory();
+    isDir = statSync(safe.value.real).isDirectory();
   } catch {
     return fail("missing", `"${renderPath(rel)}" does not exist or is unreadable`);
   }
   if (isDir) {
-    const file = path.join(target.real, RESULTS_FILENAME);
-    if (!existsSync(file)) {
+    // The LEAF is contained too (security-7#12): `results.json` joined onto a
+    // contained run directory used to be read through a link planted at that
+    // name, and its parse error quoted the outside file's first token.
+    fileRel = joinRel(safe.value.rel, RESULTS_FILENAME);
+    shown = `${rel}/${RESULTS_FILENAME}`;
+  }
+  const read = readLeaf(fileRel, shown, maxBytes);
+  if (!read.ok) {
+    if (isDir && read.code === "missing") {
       return fail(
         "missing",
         `"${renderPath(rel)}" is a directory with no ${RESULTS_FILENAME} — it is not an eval run directory`,
       );
     }
-    target = { ...target, real: file, abs: path.join(target.abs, RESULTS_FILENAME) };
-    shown = `${rel}/${RESULTS_FILENAME}`;
+    return read;
   }
-  const read = readResolved(target, shown, maxBytes);
-  if (!read.ok) return read;
   let parsed: unknown;
   try {
     parsed = JSON.parse(read.value.text);
   } catch (err) {
+    // The parser's words, never the token it quotes (jsonSyntaxProblem).
     return fail(
       "malformed",
-      `"${renderPath(shown)}" is not valid JSON (${(err as Error).message})`,
+      `"${renderPath(shown)}" is not valid JSON (${jsonSyntaxProblem(err)})`,
     );
   }
   if (!isRecord(parsed)) {

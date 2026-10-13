@@ -71,6 +71,7 @@ import {
   reqWorthySentences,
   sentences,
 } from "./heuristics";
+import { h2Text } from "./line-parts";
 
 export {
   MIN_QUESTION_TOKENS,
@@ -356,9 +357,9 @@ export function handoffCueLines(handoff: string): string[] {
   const cues: string[] = [];
   let section: string | null = null;
   for (const line of handoff.split("\n")) {
-    const heading = /^##\s+(.*)$/.exec(line);
-    if (heading !== null) {
-      section = (heading[1] as string).trim().toLowerCase();
+    const heading = h2Text(line);
+    if (heading !== undefined) {
+      section = heading.trim().toLowerCase();
       continue;
     }
     const trimmed = line.trim();

@@ -15,17 +15,17 @@
  * with the reason, rather than rewritten on a guess. A best-effort write into
  * somebody's Cargo.toml is a corrupt Cargo.toml.
  */
-import { locateJsonMember } from "./jsonspan";
+import { JsonMembers } from "./jsonspan";
 import { normalizePypiName } from "./names";
 import type { Ecosystem } from "./net";
 import type { RangeDialect } from "./ranges";
 import {
+  LineIndex,
   type Span,
   type TomlEntry,
   type TomlScan,
   type TomlTable,
   inlineTableEntries,
-  lineAt,
   lookupPath,
   scanToml,
   stringArrayElements,
@@ -114,18 +114,30 @@ export function dialectForSection(kind: ManifestKind, section: string): RangeDia
   return section === "tool.poetry" || section.startsWith("tool.poetry.") ? "poetry" : "pep440";
 }
 
+/**
+ * Every dependency a manifest declares, with the span of its version.
+ *
+ * One pass over the file, however many it declares: each object of a
+ * package.json is read once, and every line number comes from one index of
+ * the file's line breaks. Locating each dependency from the top of the file,
+ * and counting its line from there, was quadratic in a manifest the
+ * workspace supplies.
+ */
 export function collectSites(kind: ManifestKind, text: string): ManifestSites {
-  if (kind === "package.json") return collectNpmSites(text);
+  const lines = new LineIndex(text);
+  if (kind === "package.json") return collectNpmSites(text, lines);
   const scan = scanToml(text);
   if (!scan.ok) return { ok: false, reason: `this file does not scan as TOML: ${scan.reason}` };
-  return kind === "Cargo.toml" ? collectCargoSites(text, scan) : collectPyprojectSites(text, scan);
+  return kind === "Cargo.toml"
+    ? collectCargoSites(text, lines, scan)
+    : collectPyprojectSites(text, lines, scan);
 }
 
 // ---------------------------------------------------------------------------
 // package.json
 // ---------------------------------------------------------------------------
 
-function collectNpmSites(text: string): ManifestSites {
+function collectNpmSites(text: string, lines: LineIndex): ManifestSites {
   let parsed: unknown;
   try {
     // `JSON.parse` throws on a leading byte-order mark; the locator skips it,
@@ -139,6 +151,7 @@ function collectNpmSites(text: string): ManifestSites {
   }
   const sites: DependencySite[] = [];
   const skipped: SkippedSite[] = [];
+  const members = new JsonMembers(text);
   for (const section of NPM_SECTIONS) {
     const block = (parsed as Record<string, unknown>)[section];
     if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
@@ -152,7 +165,7 @@ function collectNpmSites(text: string): ManifestSites {
         });
         continue;
       }
-      const located = locateJsonMember(text, [section, name]);
+      const located = members.locate([section, name]);
       if (!located.ok || located.inner === undefined) {
         skipped.push({
           name,
@@ -177,7 +190,7 @@ function collectNpmSites(text: string): ManifestSites {
         spec: raw,
         specSpan: located.inner,
         quote: '"',
-        line: lineAt(text, located.inner.start),
+        line: lines.lineAt(located.inner.start),
       });
     }
   }
@@ -215,6 +228,7 @@ function dependencyTables(scan: { tables: readonly TomlTable[] }): {
 function siteFromTomlEntry(
   kind: ManifestKind,
   text: string,
+  lines: LineIndex,
   section: string,
   name: string,
   entry: TomlEntry,
@@ -243,7 +257,7 @@ function siteFromTomlEntry(
     spec: raw,
     specSpan: inner.inner,
     quote: inner.quote,
-    line: lineAt(text, inner.inner.start),
+    line: lines.lineAt(inner.inner.start),
   };
 }
 
@@ -258,6 +272,7 @@ function isSkipped(value: DependencySite | SkippedSite): value is SkippedSite {
 function collectTomlTableSites(
   kind: ManifestKind,
   text: string,
+  lineIndex: LineIndex,
   scan: TomlScan & { ok: true },
 ): { sites: DependencySite[]; skipped: SkippedSite[] } {
   const sites: DependencySite[] = [];
@@ -286,7 +301,7 @@ function collectTomlTableSites(
         // parser rejects outright, and taking the first silently edits one of
         // them and leaves a file that still says two different things.
         const lines = declarations
-          .map((entry) => lineAt(text, entry.keySpan.start))
+          .map((entry) => lineIndex.lineAt(entry.keySpan.start))
           .sort((a, b) => a - b);
         skipped.push({
           name,
@@ -298,7 +313,7 @@ function collectTomlTableSites(
       const plain = plains[0];
       const dotted = dotteds[0];
       if (dotted !== undefined) {
-        const site = siteFromTomlEntry(kind, text, section, name, dotted, "dottedKey");
+        const site = siteFromTomlEntry(kind, text, lineIndex, section, name, dotted, "dottedKey");
         if (isSkipped(site)) skipped.push(site);
         else sites.push(site);
         continue;
@@ -328,12 +343,20 @@ function collectTomlTableSites(
           });
           continue;
         }
-        const site = siteFromTomlEntry(kind, text, section, name, version, "inlineTable");
+        const site = siteFromTomlEntry(
+          kind,
+          text,
+          lineIndex,
+          section,
+          name,
+          version,
+          "inlineTable",
+        );
         if (isSkipped(site)) skipped.push(site);
         else sites.push(site);
         continue;
       }
-      const site = siteFromTomlEntry(kind, text, section, name, plain, "tomlString");
+      const site = siteFromTomlEntry(kind, text, lineIndex, section, name, plain, "tomlString");
       if (isSkipped(site)) skipped.push(site);
       else sites.push(site);
     }
@@ -345,7 +368,7 @@ function collectTomlTableSites(
     );
     if (versions.length > 1) {
       const lines = versions
-        .map((entry) => lineAt(text, entry.keySpan.start))
+        .map((entry) => lineIndex.lineAt(entry.keySpan.start))
         .sort((a, b) => a - b);
       skipped.push({
         name,
@@ -359,15 +382,19 @@ function collectTomlTableSites(
       skipped.push({ name, section, reason: "the detached table declares no version key" });
       continue;
     }
-    const site = siteFromTomlEntry(kind, text, section, name, version, "detachedTable");
+    const site = siteFromTomlEntry(kind, text, lineIndex, section, name, version, "detachedTable");
     if (isSkipped(site)) skipped.push(site);
     else sites.push(site);
   }
   return { sites, skipped };
 }
 
-function collectCargoSites(text: string, scan: TomlScan & { ok: true }): ManifestSites {
-  const { sites, skipped } = collectTomlTableSites("Cargo.toml", text, scan);
+function collectCargoSites(
+  text: string,
+  lines: LineIndex,
+  scan: TomlScan & { ok: true },
+): ManifestSites {
+  const { sites, skipped } = collectTomlTableSites("Cargo.toml", text, lines, scan);
   return { ok: true, sites, skipped };
 }
 
@@ -433,8 +460,12 @@ export function parseRequirement(raw: string): ParsedRequirement | null {
   return { name, specStart, specEnd: specStart + trimmed.length, spec: trimmed };
 }
 
-function collectPyprojectSites(text: string, scan: TomlScan & { ok: true }): ManifestSites {
-  const { sites, skipped } = collectTomlTableSites("pyproject.toml", text, scan);
+function collectPyprojectSites(
+  text: string,
+  lines: LineIndex,
+  scan: TomlScan & { ok: true },
+): ManifestSites {
+  const { sites, skipped } = collectTomlTableSites("pyproject.toml", text, lines, scan);
   for (const { section, span } of requirementArrays(scan)) {
     const elements = stringArrayElements(text, span);
     if (elements === null) {
@@ -474,7 +505,7 @@ function collectPyprojectSites(text: string, scan: TomlScan & { ok: true }): Man
           end: element.inner.start + requirement.specEnd,
         },
         quote: element.quote,
-        line: lineAt(text, element.inner.start),
+        line: lines.lineAt(element.inner.start),
       });
     }
   }

@@ -29,6 +29,8 @@
  * proof ladder never penalizes honest in-progress narration.
  */
 
+import { DONE_CLAIM_SCANNED } from "./done-claim";
+
 /** Minimum content tokens for a question to be considered for re-ask
  *  matching — one-token questions ("Why?") carry no matchable content. */
 export const MIN_QUESTION_TOKENS = 2;
@@ -200,9 +202,12 @@ export function reqWorthySentences(text: string): string[] {
   );
 }
 
-/** Past-tense completed-work claims (see the module header). */
-export const DONE_CLAIM_REGEX =
-  /\b(i(?:'ve| have)?(?: now| also| just)? (?:completed|finished|implemented|fixed|deployed|created|built|updated|wrote|added|shipped|migrated|merged)|(?:is|are|was|were|has been|have been)(?: now| all)? (?:complete|completed|done|finished|deployed|fixed|implemented|shipped|merged)|marked [^.?!]* as (?:done|complete))\b/i;
+/**
+ * Past-tense completed-work claims (see the module header): the pattern in
+ * done-claim.ts, as a RegExp with that source whose `exec` is a scan, since
+ * the engine is quadratic in a sentence of `marked`.
+ */
+export const DONE_CLAIM_REGEX: RegExp = DONE_CLAIM_SCANNED;
 
 /** Non-question assistant sentences that claim completed work. */
 export function doneClaimSentences(text: string): string[] {

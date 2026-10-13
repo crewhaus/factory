@@ -34,6 +34,7 @@ import { BROKEN_FOR_SECURITY, digest, digestLength, hmac as hmacBytes } from "./
 import {
   NANOID_ALPHABET,
   UUID_NAMESPACES,
+  namespaceUuid,
   nanoId as nanoIdFrom,
   ulid as ulidFrom,
   uuidNamed,
@@ -580,7 +581,7 @@ export const uuid: RegisteredTool = buildTool({
       return json({
         version,
         deterministic: true,
-        namespace: UUID_NAMESPACES[input.namespace] ?? input.namespace,
+        namespace: namespaceUuid(input.namespace),
         uuids: ids,
         ...(version === "v3"
           ? { note: "v3 uses MD5; prefer v5 unless something else already uses v3" }
@@ -689,13 +690,20 @@ export const slugify: RegisteredTool = buildTool({
   execute: async (input) => {
     const oversize = tooLarge(input.text, "text");
     if (oversize !== undefined) return oversize;
-    const result = slugifyText(input.text, {
-      separator: input.separator ?? "-",
-      lowercase: input.lowercase ?? true,
-      ...(input.maxLength !== undefined ? { maxLength: input.maxLength } : {}),
-      allowUnicode: input.allowUnicode ?? false,
-      ...(input.replacements !== undefined ? { replacements: input.replacements } : {}),
-    });
+    let result: ReturnType<typeof slugifyText>;
+    try {
+      result = slugifyText(input.text, {
+        separator: input.separator ?? "-",
+        lowercase: input.lowercase ?? true,
+        ...(input.maxLength !== undefined ? { maxLength: input.maxLength } : {}),
+        allowUnicode: input.allowUnicode ?? false,
+        ...(input.replacements !== undefined ? { replacements: input.replacements } : {}),
+        // What `replacements` may grow the text to: the limit for the text itself.
+        limit: MAX_INPUT_CHARS,
+      });
+    } catch (error) {
+      return message(error);
+    }
     return json({
       slug: result.slug,
       truncated: result.truncated,

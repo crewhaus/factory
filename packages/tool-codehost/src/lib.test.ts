@@ -10,7 +10,16 @@
  */
 import { describe, expect, test } from "bun:test";
 import { baseUrlProblem, normalizeBaseUrl } from "./api";
-import { excerptLog, failureRule, looksLikeFailure, normalizeLogLine } from "./lib/logs";
+import {
+  GITLAB_SECTION,
+  MATCH_WINDOW_CHARS,
+  RUNNER_MARKER,
+  WORKFLOW_COMMAND,
+  excerptLog,
+  failureRule,
+  looksLikeFailure,
+  normalizeLogLine,
+} from "./lib/logs";
 import { nextPageFrom, parseLinkHeader, rateHeadersFrom } from "./lib/page";
 import {
   buildQuery,
@@ -23,6 +32,7 @@ import {
   gitlabProjectPath,
   joinCommaList,
 } from "./lib/refs";
+import { githubSearchQuery, queryScopes } from "./lib/search-scope";
 import {
   apiErrorMessage,
   clip,
@@ -655,6 +665,444 @@ describe("excerptLog", () => {
   });
 });
 
+/** A regular expression as a backtracking matcher walks it. */
+type Matcher =
+  | { readonly kind: "char"; readonly test: (c: string) => boolean }
+  | { readonly kind: "start" | "end" }
+  | {
+      readonly kind: "boundary";
+      /** `\b` wants a word boundary here, `\B` wants none. */
+      readonly wanted: boolean;
+      readonly word: (c: string) => boolean;
+    }
+  | { readonly kind: "seq"; readonly items: readonly Matcher[] }
+  | { readonly kind: "alt"; readonly options: readonly Matcher[] }
+  | { readonly kind: "repeat"; readonly body: Matcher; readonly min: number; readonly max: number };
+
+/**
+ * The structure of `re`, for {@link backtrackSteps}. Only the syntax the log
+ * patterns use is modelled — anchors, `\b` and `\B`, groups, alternation,
+ * greedy `*` `+` `?` `{n}` `{n,}` `{n,m}`, and one-character atoms, whose
+ * membership the engine itself decides — and anything else is refused rather
+ * than guessed at.
+ */
+function parseMatcher(re: RegExp): Matcher {
+  const flags = [...re.flags];
+  if (flags.some((flag) => "muv".includes(flag))) {
+    throw new Error(`/${re.source}/${re.flags}: flags not modelled`);
+  }
+  // Only `i` and `s` change what one character matches; `g` and `y` move
+  // where a match starts, which backtrackSteps does itself.
+  const charFlags = flags.filter((flag) => "is".includes(flag)).join("");
+  const source = re.source;
+  let at = 0;
+  const refuse = (): never => {
+    throw new Error(`/${source}/: the syntax at ${at} is not modelled`);
+  };
+  const oneChar = (text: string): ((c: string) => boolean) => {
+    const single = new RegExp(`^(?:${text})$`, charFlags);
+    // The engine decides each character once: the answer cannot change.
+    const known = new Map<string, boolean>();
+    return (c) => {
+      let answer = known.get(c);
+      if (answer === undefined) {
+        answer = single.test(c);
+        known.set(c, answer);
+      }
+      return answer;
+    };
+  };
+  const term = (): Matcher => {
+    const c = source[at] as string;
+    if (c === "^" || c === "$") {
+      at++;
+      return { kind: c === "^" ? "start" : "end" };
+    }
+    if (c === "\\" && (source[at + 1] === "b" || source[at + 1] === "B")) {
+      const wanted = source[at + 1] === "b";
+      at += 2;
+      return { kind: "boundary", wanted, word: oneChar("\\w") };
+    }
+    const from = at;
+    let atom: Matcher;
+    if (c === "(") {
+      if (source.startsWith("(?", at) && !source.startsWith("(?:", at)) refuse();
+      at += source.startsWith("(?:", at) ? 3 : 1;
+      atom = disjunction();
+      if (source[at++] !== ")") refuse();
+    } else if (c === "[") {
+      for (at++; source[at] !== "]"; at += source[at] === "\\" ? 2 : 1) {
+        if (at >= source.length) refuse();
+      }
+      at++;
+      atom = { kind: "char", test: oneChar(source.slice(from, at)) };
+    } else if (c === "\\") {
+      // `\x1b` and `\u2717` are one character spelled in four and six, and
+      // Bun's transpiler spells a non-ASCII character in a pattern literal
+      // the second way (`✗` in logs.ts). A back-reference is not one
+      // character, and `\cA` is not modelled.
+      const next = source[at + 1] ?? "";
+      const width = next === "x" ? 4 : next === "u" ? 6 : 2;
+      const spelled = source.slice(at, at + width);
+      const hex = spelled.slice(2);
+      if ("k0123456789c".includes(next)) refuse();
+      if (width > 2 && (hex.length !== width - 2 || Number.isNaN(Number(`0x${hex}`)))) refuse();
+      at += width;
+      atom = { kind: "char", test: oneChar(spelled) };
+    } else {
+      if ("*+?{}".includes(c)) refuse();
+      at++;
+      atom = { kind: "char", test: oneChar(c) };
+    }
+    let min: number;
+    let max: number;
+    const q = source[at];
+    if (q === "*" || q === "+" || q === "?") {
+      at++;
+      min = q === "+" ? 1 : 0;
+      max = q === "?" ? 1 : Number.POSITIVE_INFINITY;
+    } else if (q === "{") {
+      const bounds = source.slice(at).match(/^\{(\d+)(,(\d*))?\}/);
+      if (bounds === null) return refuse();
+      at += bounds[0].length;
+      min = Number(bounds[1]);
+      max =
+        bounds[2] === undefined
+          ? min
+          : bounds[3] === ""
+            ? Number.POSITIVE_INFINITY
+            : Number(bounds[3]);
+    } else {
+      return atom;
+    }
+    // A lazy quantifier tries things in the other order.
+    if (source[at] === "?") refuse();
+    return { kind: "repeat", body: atom, min, max };
+  };
+  const alternative = (): Matcher => {
+    const items: Matcher[] = [];
+    while (at < source.length && source[at] !== "|" && source[at] !== ")") items.push(term());
+    return { kind: "seq", items };
+  };
+  const disjunction = (): Matcher => {
+    const options = [alternative()];
+    while (source[at] === "|") {
+      at++;
+      options.push(alternative());
+    }
+    return options.length === 1 ? (options[0] as Matcher) : { kind: "alt", options };
+  };
+  const root = disjunction();
+  if (at !== source.length) refuse();
+  return root;
+}
+
+/** Parsed once per pattern: `/\r/g` in a function body is a new object every call. */
+const matchers = new Map<string, Matcher>();
+
+const OVER_BUDGET = Symbol("over budget");
+
+/**
+ * The steps a backtracking matcher takes to decide `re` on `input`, trying
+ * things in ECMAScript's order (JavaScriptCore's), or Infinity once past
+ * `budget`. One step is one node entered, one character taken by a repeat,
+ * or one character a repeat gives back. A `g` or `y` pattern starts at its
+ * `lastIndex`, as the engine's does, and a `y` one tries only there.
+ */
+function backtrackSteps(
+  re: RegExp,
+  input: string,
+  budget: number,
+): { matched: boolean; start: number; end: number; steps: number } {
+  const key = `/${re.source}/${re.flags}`;
+  const root = matchers.get(key) ?? parseMatcher(re);
+  matchers.set(key, root);
+  let steps = 0;
+  const step = (): void => {
+    if (++steps > budget) throw OVER_BUDGET;
+  };
+  const match = (node: Matcher, i: number, then: (j: number) => boolean): boolean => {
+    step();
+    switch (node.kind) {
+      case "char":
+        return i < input.length && node.test(input[i] as string) && then(i + 1);
+      case "start":
+        return i === 0 && then(i);
+      case "end":
+        return i === input.length && then(i);
+      case "boundary": {
+        const before = i > 0 && node.word(input[i - 1] as string);
+        const after = i < input.length && node.word(input[i] as string);
+        return (before !== after) === node.wanted && then(i);
+      }
+      case "seq": {
+        const from = (n: number, j: number): boolean =>
+          n === node.items.length
+            ? then(j)
+            : match(node.items[n] as Matcher, j, (next) => from(n + 1, next));
+        return from(0, i);
+      }
+      case "alt":
+        return node.options.some((option) => match(option, i, then));
+      case "repeat": {
+        const { body, min, max } = node;
+        if (body.kind === "char") {
+          // A run of one-character atoms, taken greedily and given back one
+          // at a time; a loop, so a long run cannot overflow the stack.
+          let j = i;
+          while (j - i < max && j < input.length && body.test(input[j] as string)) {
+            j++;
+            step();
+          }
+          for (; j - i >= min; j--) {
+            if (then(j)) return true;
+            step();
+          }
+          return false;
+        }
+        const again = (count: number, j: number): boolean =>
+          (count < max &&
+            match(body, j, (next) => !(next === j && count >= min) && again(count + 1, next))) ||
+          (count >= min && then(j));
+        return again(0, i);
+      }
+    }
+  };
+  const first = re.global || re.sticky ? re.lastIndex : 0;
+  const last = re.sticky ? first : input.length;
+  let end = -1;
+  const found = (j: number): boolean => {
+    end = j;
+    return true;
+  };
+  try {
+    for (let start = first; start <= last && start <= input.length; start++) {
+      if (match(root, start, found)) return { matched: true, start, end, steps };
+    }
+    return { matched: false, start: -1, end: -1, steps };
+  } catch (err) {
+    if (err === OVER_BUDGET) {
+      return { matched: false, start: -1, end: -1, steps: Number.POSITIVE_INFINITY };
+    }
+    throw err;
+  }
+}
+
+/** Steps per character a pattern may take on one line: linear, with room. */
+const STEPS_PER_CHAR = 16;
+
+type PatternRun = {
+  /** `/source/flags`. */
+  readonly pattern: string;
+  readonly chars: number;
+  /** Infinity once past the budget; NaN when the syntax is not modelled. */
+  readonly steps: number;
+  /** The count found the engine's own match, so it is the count of the real search. */
+  readonly agrees: boolean;
+  readonly refused?: string;
+};
+
+/** The runs a linear pattern does not make: over budget, not modelled, or not the engine's match. */
+const unbounded = (runs: readonly PatternRun[]): PatternRun[] =>
+  runs.filter((run) => !run.agrees || !(run.steps <= STEPS_PER_CHAR * run.chars + 64));
+
+/**
+ * Runs `fn` with every RegExp it runs counting its steps on the exact text it
+ * was handed. `.test()`, `String#match` and `String#replace` all reach a
+ * pattern through `RegExp.prototype.exec`, so wrapping that one method counts
+ * every pattern `excerptLog` runs — one added later included — rather than a
+ * list of them that can fall behind. A pattern over its budget, or one whose
+ * syntax is not modelled, answers "no match" instead of running, so a
+ * quadratic one fails the test at once rather than after the match it would
+ * freeze on.
+ */
+function countPatternSteps<T>(fn: () => T): { result: T; runs: PatternRun[] } {
+  const runs: PatternRun[] = [];
+  const native = RegExp.prototype.exec;
+  let counting = false;
+  RegExp.prototype.exec = function (this: RegExp, input: string): RegExpExecArray | null {
+    // The counter's own one-character tests, and the real match, go uncounted.
+    if (counting) return native.call(this, input);
+    counting = true;
+    try {
+      const text = String(input);
+      const run = { pattern: `/${this.source}/${this.flags}`, chars: text.length };
+      let counted: ReturnType<typeof backtrackSteps>;
+      try {
+        counted = backtrackSteps(this, text, STEPS_PER_CHAR * text.length + 64);
+      } catch (err) {
+        runs.push({ ...run, steps: Number.NaN, agrees: false, refused: (err as Error).message });
+        if (this.global || this.sticky) this.lastIndex = 0;
+        return null;
+      }
+      if (counted.steps === Number.POSITIVE_INFINITY) {
+        runs.push({ ...run, steps: counted.steps, agrees: true });
+        if (this.global || this.sticky) this.lastIndex = 0;
+        return null;
+      }
+      const real = native.call(this, text);
+      const agrees =
+        real === null
+          ? !counted.matched
+          : counted.matched &&
+            real.index === counted.start &&
+            real.index + real[0].length === counted.end;
+      runs.push({ ...run, steps: counted.steps, agrees });
+      return real;
+    } finally {
+      counting = false;
+    }
+  };
+  try {
+    return { result: fn(), runs };
+  } finally {
+    RegExp.prototype.exec = native;
+  }
+}
+
+// A CI log line is written by whoever's pull request ran the job, and a
+// synchronous RegExp cannot be interrupted by the call's deadline: one
+// quadratic pattern froze the whole process for as long as the match took.
+// 60 000 characters is deliberate: the 0.7.0 patterns took about 2 s on it
+// locally. The work is counted, not timed, because a time limit a loaded CI
+// runner always meets is too loose to be sure of catching that. Every pattern
+// excerptLog runs on the line is counted — the error rules, the exit-code
+// reader and the decoration it strips, not only the three it exports — and
+// the linear ones decide each of these lines in at most five steps a
+// character, while 0.7.0's grew with the run, to about 90 000 a character here.
+describe("excerptLog on hostile lines (C011)", () => {
+  const N = 60_000;
+  const hostile: Array<[string, string]> = [
+    ["a command with a long space run and no closing ::", `::error${" ".repeat(N)}x\n`],
+    ["a command with a long tab run and no closing ::", `::x${"\t".repeat(N)}y\n`],
+    [
+      "a GitLab section with a space run and a U+2028",
+      `section_start:1:build${" ".repeat(N)}b\u2028c\n`,
+    ],
+    ["a closed command with a space run and a U+2028", `::error${" ".repeat(N)}::b\u2028c\n`],
+    ["a runner marker with a long payload and a U+2028", `##[error]${"x".repeat(N)} \u2028`],
+  ];
+  for (const [name, line] of hostile) {
+    test(`${name} is matched in linear time`, () => {
+      const { result: excerpt, runs } = countPatternSteps(() => excerptLog(line));
+      expect(runs.length).toBeGreaterThan(0);
+      expect(unbounded(runs)).toEqual([]);
+      expect(excerpt.totalLines).toBe(1);
+    }, 20_000);
+  }
+
+  test("the counter sees a pattern however excerptLog runs it", () => {
+    // A runtime that skipped a replaced `exec` on one of these paths would
+    // leave its patterns uncounted, and the tests above would pass blind.
+    const { runs } = countPatternSteps(() => {
+      /a/.test("a");
+      "b".match(/b/);
+      "cc".replace(/c/g, "");
+      "d".replace(/d/, "");
+    });
+    expect(runs.map((run) => run.pattern)).toEqual(["/a/", "/b/", "/c/g", "/c/g", "/c/g", "/d/"]);
+    expect(unbounded(runs)).toEqual([]);
+  });
+
+  test("a line past the match window costs one window, and what is kept is still cut by maxLineChars", () => {
+    const line = `##[error]${"y".repeat(MATCH_WINDOW_CHARS * 4)}`;
+    const { result: excerpt, runs } = countPatternSteps(() =>
+      excerptLog(line, { maxLineChars: 100 }),
+    );
+    // Stripping the runner's decoration reads the whole line, once and in
+    // linear steps; every pattern after that reads one window of it.
+    const decoration = new Set(
+      countPatternSteps(() => normalizeLogLine(line)).runs.map((run) => run.pattern),
+    );
+    const windowed = runs.filter((run) => !decoration.has(run.pattern));
+    expect(windowed.length).toBeGreaterThan(0);
+    expect(windowed.filter((run) => run.chars > MATCH_WINDOW_CHARS)).toEqual([]);
+    expect(unbounded(runs)).toEqual([]);
+    expect(excerpt.annotations).toHaveLength(1);
+    expect(excerpt.annotations[0]?.text).toBe(`${"y".repeat(100)}…`);
+    expect(excerpt.tail[0]).toBe(`##[error]${"y".repeat(91)}…`);
+  }, 20_000);
+
+  test("a payload is taken from the whole line, not the match window", () => {
+    const long = "z".repeat(MATCH_WINDOW_CHARS + 10);
+    const excerpt = excerptLog(`::error::${long}`, { maxLineChars: MATCH_WINDOW_CHARS * 2 });
+    expect(excerpt.annotations[0]?.text).toBe(long);
+  });
+});
+
+describe("the log line patterns keep their meaning (C011)", () => {
+  test("workflow commands are recognised as before", () => {
+    const a = excerptLog("::error file=a.ts,line=3::boom");
+    expect(a.annotations).toEqual([{ level: "error", line: 1, text: "boom" }]);
+    expect(a.firstError?.text).toBe("boom");
+    expect(excerptLog("::warning::w").annotations[0]).toEqual({
+      level: "warning",
+      line: 1,
+      text: "w",
+    });
+    expect(excerptLog("::error   ::spaced").annotations[0]?.text).toBe("spaced");
+    expect(excerptLog("::error x:y").annotations).toEqual([]);
+    expect(excerptLog("::group::G\nerror: here").failingStep).toBe("G");
+    // A line separator inside a payload no longer hides the annotation.
+    expect(excerptLog("::error::msg\u2028tail").annotations[0]?.text).toBe("msg\u2028tail");
+  });
+
+  test("a GitLab section with options still opens its step", () => {
+    const excerpt = excerptLog(
+      "section_start:1756723200:build_script[collapsed=true] Build\nnpm ERR! x",
+    );
+    expect(excerpt.failingStep).toBe("build_script");
+  });
+
+  // The 0.7.0 spellings, kept here only as the oracle for the rewrite.
+  const OLD_COMMAND = /^::([a-z]+)(?:\s+[^:]*)?::(.*)$/;
+  const OLD_SECTION = /^section_(start|end):\d+:([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$/;
+  const OLD_MARKER = /^##\[([a-z]+)\](.*)$/;
+
+  test("on every short line without a line separator, the rewrite matches exactly what 0.7.0 matched", () => {
+    const alphabet = [
+      ":",
+      " ",
+      "\t",
+      "e",
+      "x",
+      "[",
+      "]",
+      "#",
+      "_",
+      "1",
+      "a",
+      "section_start:1:",
+      "##[error]",
+      "::",
+    ];
+    let seed = 7;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let i = 0; i < 20_000; i++) {
+      let line = "";
+      const len = next(10);
+      for (let j = 0; j < len; j++) line += alphabet[next(alphabet.length)];
+      const pairs: Array<[RegExp, RegExp, number[]]> = [
+        [WORKFLOW_COMMAND, OLD_COMMAND, [1, 2]],
+        [GITLAB_SECTION, OLD_SECTION, [1, 2]],
+        [RUNNER_MARKER, OLD_MARKER, [1, 2]],
+      ];
+      for (const [now, old, groups] of pairs) {
+        const a = line.match(now);
+        const b = line.match(old);
+        expect(a === null).toBe(b === null);
+        if (a !== null && b !== null) for (const g of groups) expect(a[g]).toBe(b[g]);
+        compared++;
+      }
+    }
+    expect(compared).toBe(60_000);
+  });
+});
+
 describe("looksLikeFailure", () => {
   test("recognises the common shapes", () => {
     const cases: Array<[string, string]> = [
@@ -948,5 +1396,125 @@ describe("baseUrlProblem", () => {
 
   test("something that is not a URL at all says so", () => {
     expect(baseUrlProblem("api.github.com")).toContain("absolute URL");
+  });
+});
+
+describe("queryScopes: the repositories a GitHub query reaches (C004)", () => {
+  test("repo:, org: and user: are scopes, in any letter case", () => {
+    expect(queryScopes("password REPO:acme/secret Org:acme user:zoe is:open")).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+      { qualifier: "org", owner: "acme" },
+      { qualifier: "user", owner: "zoe" },
+    ]);
+  });
+
+  test("a scope inside a group or behind NOT still counts; a leading - does not", () => {
+    expect(queryScopes("(repo:a/b OR repo:c/d) NOT org:e -repo:f/g")).toEqual([
+      { qualifier: "repo", owner: "a", repo: "b" },
+      { qualifier: "repo", owner: "c", repo: "d" },
+      { qualifier: "org", owner: "e" },
+    ]);
+  });
+
+  test("a quoted value is read without its quotes; a repo with no owner part keeps it empty", () => {
+    expect(queryScopes('repo:"acme/widget" repo:solo')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "widget" },
+      { qualifier: "repo", owner: "solo", repo: "" },
+    ]);
+  });
+
+  test("a qualifier inside a quoted phrase is text GitHub searches for, not a scope", () => {
+    expect(queryScopes('"curl -u user:$TOKEN" repo:acme/app')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "app" },
+    ]);
+    expect(queryScopes('"see repo:foo/bar for details"')).toEqual([]);
+    expect(queryScopes('label:"good first issue" org:acme')).toEqual([
+      { qualifier: "org", owner: "acme" },
+    ]);
+    // A phrase ends the term it interrupts: what follows it is still read.
+    expect(queryScopes('"x"repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
+
+  test("quotes that do not pair up cannot hide a qualifier", () => {
+    expect(queryScopes('"password repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
+});
+
+describe("githubSearchQuery: the fields and the query agree, or nothing is searched", () => {
+  const q = (query: string, owner?: string, repo?: string) =>
+    githubSearchQuery("SearchCode", query, owner, repo);
+
+  test("no scope anywhere is sent as written", () => {
+    expect(q("assignee:@me is:open")).toEqual({ ok: true, q: "assignee:@me is:open" });
+  });
+
+  test("fields with no qualifier are written into the query", () => {
+    expect(q("password", "acme", "widget")).toEqual({ ok: true, q: "password repo:acme/widget" });
+  });
+
+  test("a qualifier the fields cover is kept; the owner covers every one of its repositories", () => {
+    expect(q("x repo:Acme/Widget", "acme", "widget")).toEqual({
+      ok: true,
+      q: "x repo:Acme/Widget",
+    });
+    expect(q("x repo:acme/a repo:acme/b", "acme")).toEqual({
+      ok: true,
+      q: "x repo:acme/a repo:acme/b",
+    });
+    expect(q("x org:acme", "acme")).toEqual({ ok: true, q: "x org:acme" });
+  });
+
+  test("a qualifier the fields do not cover is refused, naming the fields to set", () => {
+    for (const [query, owner, repo, want] of [
+      ["password repo:acme/secret", undefined, undefined, 'owner "acme" and repo "secret"'],
+      ["x repo:acme/secret", "acme", "widget", 'owner "acme" and repo "secret"'],
+      ["x org:acme", "acme", "widget", 'owner "acme" and no repo'],
+      ["x repo:acme/a repo:other/b", "acme", undefined, 'owner "other" and repo "b"'],
+    ] as const) {
+      const r = q(query, owner, repo);
+      expect({ query, ok: r.ok }).toEqual({ query, ok: false });
+      if (!r.ok) expect(r.message).toContain(want);
+    }
+  });
+
+  test("an owner alone must say org: or user:, and a repo needs its owner", () => {
+    const bare = q("x", "acme");
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.message).toContain("add org:acme or user:acme");
+    const orphan = q("x", undefined, "widget");
+    expect(orphan.ok).toBe(false);
+    if (!orphan.ok) expect(orphan.message).toContain("repo needs owner");
+  });
+
+  test("a quoted phrase holding a qualifier is searched as written", () => {
+    // 0.7.0 sent these; reading the phrase as a scope refused them with
+    // advice no call could follow.
+    expect(q('"curl -u user:$TOKEN" repo:acme/app', "acme", "app")).toEqual({
+      ok: true,
+      q: '"curl -u user:$TOKEN" repo:acme/app',
+    });
+    expect(q('"see repo:foo/bar for details"', "acme", "app")).toEqual({
+      ok: true,
+      q: '"see repo:foo/bar for details" repo:acme/app',
+    });
+  });
+
+  test("a qualifier that names no GitHub account is refused without suggesting it", () => {
+    const r = q("x user:$TOKEN", "acme");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain("does not name a GitHub account");
+      expect(r.message).not.toContain("name the same scope there");
+    }
+  });
+
+  test("a name that would add a qualifier of its own is refused before it is written", () => {
+    const r = q("x", "acme", "widget org:evil");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("is not a GitHub name");
   });
 });

@@ -211,7 +211,7 @@ export function usageText(): string {
     "  advise [--session <id> | --all]      mine session logs for spec advice (item 14)",
     "       [--json] [-o <dir>]             writes suggestions.json + report.html (default .crewhaus/advice)",
     "  tools list                           list every builtin tool + its metadata (item 18)",
-    "  tools suggest [spec.yaml]            rank builtins against agent.instructions (keyword match)",
+    "  tools suggest [spec.yaml]            rank builtins against the spec's instructions (keyword match)",
     "  tools audit [--sessions N|all]       mine tool_stats vs. grants — unused/failing/readOnly",
     "  permissions suggest [--apply]        mine ask/deny history into settings.json rules (item 16)",
     "       [--sessions N|all] [--json]     --apply is interactive-confirm only (never eval-gated)",

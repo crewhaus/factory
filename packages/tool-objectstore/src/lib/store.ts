@@ -101,22 +101,32 @@ function isLoopbackHost(hostname: string): boolean {
  * Redacting at the point of echo rather than relying on check order, because
  * check order is exactly what the next edit changes. The host and the path
  * survive, which is all the message needs to identify what was refused.
+ *
+ * The userinfo cannot be found by splitting at the first `/`, `?` or `#`: a
+ * password may contain any of them (about half of AWS secret keys contain a
+ * `/`), and the WHATWG parser ends the authority there, so
+ * `https://KEY:SEC/RET@host` is "not a URL" and `https://KEY:1234/RET@host`
+ * even parses, with the rest of the secret as its path. So everything up to
+ * the LAST `@` is the userinfo. When a `?` or `#` comes before that `@`, the
+ * `@` may be inside a password or inside a query value, and nothing after the
+ * scheme can be told apart from the secret, so all of it is redacted: an
+ * over-redacted refusal costs nothing.
  */
 function quoteEndpoint(raw: string): string {
   const trimmed = raw.trim();
   const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.exec(trimmed);
   const prefix = scheme === null ? "" : scheme[0];
   const rest = trimmed.slice(prefix.length);
-  const cut = rest.search(/[/?#]/);
-  const authority = cut === -1 ? rest : rest.slice(0, cut);
-  const at = authority.lastIndexOf("@");
-  const shown = at === -1 ? authority : `<redacted>@${authority.slice(at + 1)}`;
-  if (cut === -1) return `${prefix}${shown}`;
-  const tail = rest.slice(cut);
-  const mark = tail.search(/[?#]/);
-  const path = mark === -1 ? tail : tail.slice(0, mark);
-  const suffix = mark === -1 ? "" : `${tail[mark]}<redacted>`;
-  return `${prefix}${shown}${path}${suffix}`;
+  const at = rest.lastIndexOf("@");
+  if (at === -1) return `${prefix}${redactQuery(rest)}`;
+  if (/[?#]/.test(rest.slice(0, at))) return `${prefix}<redacted>`;
+  return `${prefix}<redacted>@${redactQuery(rest.slice(at + 1))}`;
+}
+
+/** Keep `text` up to its first `?` or `#`, and redact the rest. */
+function redactQuery(text: string): string {
+  const mark = text.search(/[?#]/);
+  return mark === -1 ? text : `${text.slice(0, mark)}${text[mark]}<redacted>`;
 }
 
 /**
@@ -146,7 +156,7 @@ export function parseEndpoint(raw: string): Endpoint {
   }
   if (url.username !== "" || url.password !== "") {
     throw new PresignError(
-      "endpoint carries a username or password — SigV4 credentials go in accessKeyId/secretAccessKey, and a credential in the URL would be signed into the result",
+      "endpoint carries a username or password — a credential in the URL would be signed into the result. Credentials never go in the endpoint or in any argument: the operator names the environment variables that hold them in a tool_config.objectstore.credentials profile, and the call passes that profile's name as `credentials`",
     );
   }
   if (url.search !== "" || url.hash !== "") {
@@ -159,8 +169,10 @@ export function parseEndpoint(raw: string): Endpoint {
     // and it is refused rather than guessed at: the prefix belongs in the
     // canonical URI ahead of the bucket, and whether THIS gateway wants it
     // signed is a fact about the gateway that nothing here can check.
+    // The path is shown only through quoteEndpoint: the parsed pathname can
+    // hold the tail of a password (`https://KEY:1234/SECRET@host`).
     throw new PresignError(
-      `endpoint "${quoteEndpoint(raw)}" has a path ("${url.pathname}") — this tool signs a path built from the bucket and key, so a prefix on the endpoint would be signed twice or not at all. Pass the origin only`,
+      `endpoint "${quoteEndpoint(raw)}" has a path — this tool signs a path built from the bucket and key, so a prefix on the endpoint would be signed twice or not at all. Pass the origin only`,
     );
   }
   if (url.hostname === "") throw new PresignError(`endpoint "${quoteEndpoint(raw)}" has no host`);

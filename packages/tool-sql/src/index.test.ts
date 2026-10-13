@@ -45,6 +45,7 @@ import {
   tableStats,
 } from "./index";
 import { namedParameters, positionalParameterCount } from "./lib/sql-text";
+import { MAX_PATH_CHARS, ToolPermissionError, resolveSafe } from "./paths";
 
 let workspace = "";
 let originalCwd = "";
@@ -842,6 +843,42 @@ describe("export and backup", () => {
     );
   });
 
+  test("ExportCsv writes a formula-looking cell verbatim, says so, and the documented query neutralizes it", async () => {
+    // Cells are data, byte for byte, so the file round-trips through
+    // ImportCsv; the description and README say what that means for a
+    // spreadsheet, and give the query that makes the file safe to open.
+    expect(exportCsv.description).toContain("formula");
+    const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
+    const documented = /`(CASE WHEN substr\(t,1,1\) IN [^`]+)`/.exec(readme)?.[1];
+    expect(documented).toBeDefined();
+    const db = new Database(join(workspace, "app.db"));
+    db.exec("CREATE TABLE f(id INTEGER PRIMARY KEY, t TEXT, n INTEGER)");
+    db.exec(
+      "INSERT INTO f(t, n) VALUES('=1+2', -5), ('@SUM(1,2)', 3), ('+A1', 0), ('-2+3', 1), ('plain', 2)",
+    );
+    db.close();
+    const verbatim = await run(exportCsv, {
+      database: "app.db",
+      sql: "SELECT t, n FROM f ORDER BY id",
+      out: "raw.csv",
+    });
+    expect(verbatim.rows).toBe(5);
+    expect(readFileSync(join(workspace, "raw.csv"), "utf8")).toBe(
+      't,n\n=1+2,-5\n"@SUM(1,2)",3\n+A1,0\n-2+3,1\nplain,2\n',
+    );
+    const safe = await run(exportCsv, {
+      database: "app.db",
+      sql: `SELECT ${documented}, n FROM f ORDER BY id`,
+      out: "safe.csv",
+    });
+    expect(safe.rows).toBe(5);
+    // Every formula-leading TEXT cell is now text to a spreadsheet; the
+    // INTEGER -5 and the plain value are untouched.
+    expect(readFileSync(join(workspace, "safe.csv"), "utf8")).toBe(
+      "t,n\n'=1+2,-5\n\"'@SUM(1,2)\",3\n'+A1,0\n'-2+3,1\nplain,2\n",
+    );
+  });
+
   test("ExportCsv refuses to overwrite unless told to", async () => {
     writeFileSync(join(workspace, "users.csv"), "existing");
     const refused = await run(exportCsv, {
@@ -1297,5 +1334,82 @@ describe("containment: a relative dangling link under an outward directory link"
     expect(await Bun.file(join(outside, "escape.db")).exists()).toBe(false);
     // Nor quietly redirected to the in-root path the lexical reading names.
     expect(await Bun.file(join(workspace, "escape.db")).exists()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * 0.7.1 review — a destination no filesystem can hold is refused before it
+ * is walked, naming the path and the limit.
+ *
+ * The walk to the deepest existing name read the rest of the path once per
+ * missing name (the square of a count the model picks), and Bun's
+ * `path.join` keeps only (argument count mod 65,536) arguments, so 65,536
+ * names below an existing file once made DatabaseBackup replace that file.
+ * MAX_PATH_CHARS is twice the longest path any platform opens: up to it the
+ * location is the whole path; past it the call is refused, with the file
+ * above left alone.
+ */
+describe("a destination longer than any path can be", () => {
+  /** A path below `secrets/prod.db` whose absolute form is exactly `abs` characters. */
+  const deepTo = (abs: number): string => {
+    const prefix = "secrets/prod.db/";
+    const tail = abs - (workspace.length + 1 + prefix.length);
+    const pairs = Math.floor((tail - 1) / 2);
+    return `${prefix}${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  };
+  const deep = (n: number) => `secrets/prod.db/${Array.from({ length: n }, () => "a").join("/")}`;
+
+  test("at the limit the location is the whole path; one more character is refused, naming the limit", () => {
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    const at = deepTo(MAX_PATH_CHARS);
+    expect(resolveSafe("DatabaseBackup", at).real === join(workspace, at)).toBe(true);
+    let refused: unknown;
+    try {
+      resolveSafe("DatabaseBackup", `${at}b`);
+    } catch (err) {
+      refused = err;
+    }
+    expect(refused).toBeInstanceOf(ToolPermissionError);
+    expect((refused as Error).message).toBe(
+      `tool "DatabaseBackup" rejected path "${at}b": it is ${MAX_PATH_CHARS + 1} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
+  });
+
+  test("65,535 to 65,537 names (where Bun's path.join wraps) are refused, quoting the start of the path", () => {
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    for (const n of [65_535, 65_536, 65_537]) {
+      const raw = deep(n);
+      let message = "";
+      try {
+        resolveSafe("DatabaseBackup", raw);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect({ n, message }).toEqual({
+        n,
+        message: `tool "DatabaseBackup" rejected path "${raw.slice(0, 64)}…": it is ${workspace.length + 1 + raw.length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+      });
+    }
+  });
+
+  test("DatabaseBackup with overwrite says why, and leaves the file above it alone", async () => {
+    seedDatabase();
+    mkdirSync(join(workspace, "secrets"));
+    writeFileSync(join(workspace, "secrets", "prod.db"), "precious");
+    const out = await run(databaseBackup, {
+      database: "app.db",
+      out: deep(65_536),
+      overwrite: true,
+    });
+    expect(typeof out).toBe("string");
+    expect(out as string).toStartWith('tool "DatabaseBackup" rejected path "secrets/prod.db/a/a/');
+    expect(out as string).toEndWith(
+      `over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`,
+    );
+    expect(readFileSync(join(workspace, "secrets", "prod.db"), "utf8")).toBe("precious");
   });
 });

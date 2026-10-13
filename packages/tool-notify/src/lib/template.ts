@@ -31,13 +31,19 @@ export type RenderResult =
     }
   | { readonly ok: false; readonly missing: readonly string[] };
 
-/** Read a dotted path out of the data object. */
+/**
+ * Read a dotted path out of the data object: own properties only. An
+ * inherited one is not data the caller supplied: `{{__proto__}}` read
+ * Object.prototype and rendered `{}` where the rule is that a missing value
+ * is an error rather than a hole (net review, beside C208).
+ */
 function lookup(data: Readonly<Record<string, unknown>>, path: string): unknown {
   let current: unknown = data;
   for (const segment of path.split(".")) {
     if (current === null || typeof current !== "object" || Array.isArray(current)) {
       return undefined;
     }
+    if (!Object.hasOwn(current, segment)) return undefined;
     current = (current as Record<string, unknown>)[segment];
   }
   return current;

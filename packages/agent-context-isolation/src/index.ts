@@ -34,7 +34,7 @@ import type {
   IrSubAgentProfileOption,
   IrThinking,
 } from "@crewhaus/ir";
-import type { PermissionMode, RuleSet } from "@crewhaus/permission-engine";
+import type { JustificationJudge, PermissionMode, RuleSet } from "@crewhaus/permission-engine";
 import type { NamedFailureClass } from "@crewhaus/recovery-engine";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import type { PendingApproval, PendingApprovalStore } from "@crewhaus/session-store";
@@ -312,6 +312,39 @@ export type ParentRunHandle = {
     readonly notify?: (approval: PendingApproval) => Promise<void>;
     readonly surface?: string;
   };
+  /**
+   * 0.7.1 — the parent loop was told a sandbox backend is wired
+   * (`runChatLoop({ sandboxAvailable: true })`). It is a fact about the
+   * process, not a grant: a child runs in the same process against the same
+   * backend, so it inherits the fact. Without it a sub-agent granted Python or
+   * Shell was denied every call by the sandbox floor, with advice to set
+   * CREWHAUS_SANDBOX that the operator had already followed. Present only when
+   * true, so a handle from a sandbox-less parent keeps its key set.
+   */
+  readonly sandboxAvailable?: true;
+  /**
+   * 0.7.1 — the judge the parent loop checks a justification-gated call
+   * with (`security.justification.judge` in the spec, built by `crewhaus run`
+   * or the compiled bundle). A child in the same run judges its gated calls
+   * the same way; without it a child fell back to the rule-based default,
+   * which denies every such call outside tests, so a sub-agent could make no
+   * HttpRequest, EmailSend or DownloadFile call at all. Present only when the
+   * parent was given one.
+   */
+  readonly justificationJudge?: JustificationJudge;
+  /**
+   * 0.7.1 — the parent's durable audit sinks, so a child's justification
+   * verdicts and egress warnings land on the same hash-chained log as the
+   * parent's. Structurally runtime-core's `JustificationAuditSink` /
+   * `EgressAuditSink` (declared here to keep this package off runtime-core).
+   */
+  readonly justificationAuditSink?: ChildAuditSink<"permission_justification_evaluated">;
+  readonly egressAuditSink?: ChildAuditSink<"egress_decision">;
+};
+
+/** An audit sink a child writes to: `@crewhaus/audit-log`'s `append`, narrowed to one kind. */
+export type ChildAuditSink<K extends string> = {
+  append(input: { readonly kind: K; readonly payload: unknown }): Promise<unknown>;
 };
 
 /**
@@ -344,7 +377,11 @@ export type ParentServedArm = {
  *   - unchanged from 0.5.x: the (narrowed) permission rule set, the (filtered)
  *     tool catalog, `maxTokens` when the child declares none, the recall-only
  *     memory seam, skills, the failure taxonomy, the read-only continuity seam,
- *     `askMode` and the approval store, and `sessionRootDir`.
+ *     `askMode` and the approval store, and `sessionRootDir`;
+ *   - 0.7.1: whether a sandbox backend is wired (`sandboxAvailable`), since
+ *     the child runs in the parent's process against the same backend; and
+ *     the parent's justification judge and security audit sinks, so a
+ *     child's gated calls are judged and logged as the parent's are.
  *
  * What a child NEVER inherits: the parent's `model_pool` / `model_tiers` /
  * `model_fallbacks` / `circuit_breaker` (a child routes only through the
@@ -461,6 +498,16 @@ export type RuntimeBridge = ParentRunHandle & {
    * bridges) don't wire it; tools MUST check for undefined.
    */
   readonly runState?: Store<Record<string, unknown>>;
+  /**
+   * 0.7.1 — every model string this run was configured with: the declared
+   * primary, its `model_fallbacks`, both `model_tiers`, each `model_pool`
+   * candidate and its fallbacks, the compaction model and a budget-degrade
+   * target. The Task tool lets a `.crewhaus/sub-agents` definition (a file the
+   * agent could have written) run only on these or on an inline sub-agent's
+   * models. Not part of {@link ParentRunHandle}: a child's own loop builds its
+   * own. Optional — a bridge built elsewhere falls back to `model` alone.
+   */
+  readonly specModels?: ReadonlyArray<string>;
 };
 
 /**
@@ -493,6 +540,14 @@ export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
     ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
     ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
     ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
+    ...(bridge.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),
+    ...(bridge.justificationJudge !== undefined
+      ? { justificationJudge: bridge.justificationJudge }
+      : {}),
+    ...(bridge.justificationAuditSink !== undefined
+      ? { justificationAuditSink: bridge.justificationAuditSink }
+      : {}),
+    ...(bridge.egressAuditSink !== undefined ? { egressAuditSink: bridge.egressAuditSink } : {}),
   };
 }
 

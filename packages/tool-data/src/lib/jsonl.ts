@@ -7,6 +7,7 @@
  * it is not: a line that does not parse is reported with its 1-based line
  * number and the parser's message, never dropped in silence.
  */
+import { MAX_NESTING_DEPTH, OutputLimitError, jsonTextLength, jsonTextNestsDeeper } from "./json";
 
 export type JsonlRecord = { line: number; value: unknown };
 export type JsonlFailure = { line: number; error: string; preview: string };
@@ -41,6 +42,10 @@ export function parseJsonl(
       break;
     }
     try {
+      // Checked before parsing, like every JSON document this package reads.
+      if (jsonTextNestsDeeper(raw, MAX_NESTING_DEPTH)) {
+        throw new Error(`nests deeper than ${MAX_NESTING_DEPTH} levels`);
+      }
       records.push({ line: i + 1, value: JSON.parse(raw) as unknown });
     } catch (err) {
       failures.push({
@@ -63,15 +68,24 @@ export function parseJsonl(
 export function writeJsonl(
   values: ReadonlyArray<unknown>,
   trailingNewline: boolean,
+  maxChars = Number.POSITIVE_INFINITY,
 ): { text: string; skipped: number } {
   const lines: string[] = [];
   let skipped = 0;
+  let chars = 0;
   for (const value of values) {
+    // Measured before it is built: a record converted from CSV repeats every
+    // column name, so one line can be far larger than its source row.
+    if (maxChars !== Number.POSITIVE_INFINITY) {
+      const size = jsonTextLength(value, 0, maxChars - chars);
+      if (chars + size + 1 > maxChars) throw new OutputLimitError(maxChars, "the JSONL");
+    }
     const text = JSON.stringify(value);
     if (text === undefined) {
       skipped += 1;
       continue;
     }
+    chars += text.length + 1;
     lines.push(text);
   }
   const body = lines.join("\n");

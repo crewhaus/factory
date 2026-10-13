@@ -8,7 +8,8 @@
     { "path": "../errors" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
-    { "path": "../model-service" }
+    { "path": "../model-service" },
+    { "path": "../tool-categories" }
   ],
   "include": ["src/**/*"]
 }

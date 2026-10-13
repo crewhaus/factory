@@ -172,7 +172,10 @@ describe("runDreamPhase1 — determinism", () => {
       pins?: string[];
     };
     expect(retention.pins).toContain(SESS_A);
-  });
+    // A seeded fixture and a full phase-1 run are slow by construction: well
+    // under 0.1 s here but 1.4 s on a loaded CI runner, too close to bun's
+    // default of 5 s.
+  }, 20_000);
 
   test("same inputs in a fresh dir → same counts (determinism)", async () => {
     const stores1 = await seedFixture();
@@ -203,7 +206,10 @@ describe("runDreamPhase1 — determinism", () => {
       tmp = keep;
       rmSync(tmp2, { recursive: true, force: true });
     }
-  });
+    // Two seeded fixtures and two full phase-1 runs are slow by construction:
+    // well under 0.1 s here but 1.8 s on a loaded CI runner, too close to
+    // bun's default of 5 s.
+  }, 20_000);
 
   test("second run against the mutated stores is a no-op (zero new mutations)", async () => {
     const stores = await seedFixture();
@@ -223,7 +229,10 @@ describe("runDreamPhase1 — determinism", () => {
       sessionsPinned: 0, // pins already present
       trashPurged: 0, // the old snapshot is gone
     });
-  });
+    // A seeded fixture and two full phase-1 runs are slow by construction:
+    // well under 0.1 s here but 1.1 s on a loaded CI runner, too close to
+    // bun's default of 5 s.
+  }, 20_000);
 
   test("runs clean against an empty .crewhaus dir (all zeros)", async () => {
     const report = await runDreamPhase1({ specName: "bot", crewhausDir: tmp, now: fixedNow });

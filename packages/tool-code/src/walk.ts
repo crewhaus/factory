@@ -11,8 +11,10 @@
  * how a walk leaves it (or loops forever); a caller who wants the target
  * scanned can point a tool at it directly.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { workspaceRoot } from "./paths";
 
 /** Directories skipped unless the caller names them explicitly. */
 export const DEFAULT_IGNORES: readonly string[] = [
@@ -126,24 +128,88 @@ export function walkFiles(options: WalkOptions): WalkResult {
   return { files: files.sort(), truncated };
 }
 
+/** A file a tool looked for and did not read, with the reason, for its result. */
+export type SkippedFile = {
+  /** Slash-separated, relative to the workspace root. */
+  readonly file: string;
+  readonly reason: string;
+};
+
 /**
- * Read a text file, or `undefined` when it is too large or is not text.
+ * Read a text file, or `undefined` when it is missing, too large, not text,
+ * or not a file this package may read.
+ *
+ * This is the package's one read, so it is where containment of the LEAF
+ * lives (C072). The tools contain the directory a caller names, then look
+ * for fixed names in it — package.json, requirements.txt, a lockfile, a
+ * coverage report — and a planted `requirements.txt -> ~/.aws/credentials`
+ * sits exactly there. So the read goes through @crewhaus/tool-safety's
+ * `openForReadSync`: the whole path is resolved physically and must land in
+ * the workspace (a link to another file INSIDE it is still followed), a
+ * FIFO or device is refused before it is opened (a FIFO named
+ * requirements.txt used to block the process for good), and never more than
+ * `maxBytes` plus one byte is read.
  *
  * "Not text" is decided by a NUL byte in the first kilobyte, the same cheap
  * test `grep` uses: a scanner handed a binary blob produces nonsense matches,
  * and a caller is better told the file was skipped.
+ *
+ * Pass `skipped` to learn why an existing file was not read: a tool that
+ * reports "no manifest" when one was refused would be answering a different
+ * question. A missing file is never listed.
  */
-export function readTextFile(abs: string, maxBytes = MAX_FILE_BYTES): string | undefined {
-  try {
-    const size = statSync(abs).size;
-    if (size > maxBytes) return undefined;
-    const buffer = readFileSync(abs);
-    const probe = buffer.subarray(0, Math.min(1024, buffer.length));
-    if (probe.includes(0)) return undefined;
-    return buffer.toString("utf8");
-  } catch {
-    return undefined;
+export function readTextFile(
+  abs: string,
+  maxBytes = MAX_FILE_BYTES,
+  skipped?: SkippedFile[],
+): string | undefined {
+  const r = readLeaf(abs, maxBytes);
+  if (r.ok) return r.text;
+  if (r.reason !== undefined && skipped !== undefined) {
+    skipped.push({ file: workspaceRel(abs), reason: r.reason });
   }
+  return undefined;
+}
+
+/** `abs` relative to the workspace root, slash-separated, for a result. */
+function workspaceRel(abs: string): string {
+  let root = workspaceRoot();
+  try {
+    root = realpathSync(root);
+  } catch {
+    // The lexical root is the best name available.
+  }
+  const rel = path.relative(root, abs);
+  return (rel === "" ? "." : rel).split(path.sep).join("/");
+}
+
+type LeafRead = { ok: true; text: string } | { ok: false; reason?: string };
+
+function readLeaf(abs: string, maxBytes: number): LeafRead {
+  const r = openForReadSync(workspaceRoot(), abs, { maxBytes });
+  if (!r.ok) {
+    switch (r.code) {
+      case "not-found":
+        return { ok: false };
+      case "escapes-root":
+        return {
+          ok: false,
+          reason: "it resolves outside the workspace (a link leading out); not read",
+        };
+      case "not-regular-file":
+        return {
+          ok: false,
+          reason: `it is a ${r.kind ?? "special file"}, not a regular file; not read`,
+        };
+      default:
+        return { ok: false, reason: `it could not be read (${r.code})` };
+    }
+  }
+  if (r.truncated) return { ok: false, reason: `it is larger than ${maxBytes} bytes; not read` };
+  if (r.bytes.subarray(0, Math.min(1024, r.bytes.length)).includes(0)) {
+    return { ok: false, reason: "it is not a text file; not read" };
+  }
+  return { ok: true, text: r.text };
 }
 
 /** True when a path exists and is a file. */

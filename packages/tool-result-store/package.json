@@ -15,7 +15,8 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
-    "@crewhaus/tool-executor": "workspace:*"
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -7,6 +7,7 @@ import {
   type PiiHit,
   detectPii as detectPiiRegex,
 } from "@crewhaus/grader-safety-classifiers";
+import { replaceValues } from "./replace";
 
 /**
  * Catalog R17 `pii-redactor` — Section 39 outbound + audit redaction.
@@ -163,24 +164,6 @@ function applyHashedAllowList(
   return { kept, skipped };
 }
 
-function applyReplacements(
-  text: string,
-  hits: ReadonlyArray<PiiHit>,
-  replacement: (hit: PiiHit) => string,
-): string {
-  if (hits.length === 0) return text;
-  // Sort by descending length so we don't accidentally redact a
-  // sub-string of a wider match (e.g. SSN-shaped substring inside a
-  // longer numeric token).
-  const sorted = [...hits].sort((a, b) => b.value.length - a.value.length);
-  let out = text;
-  for (const hit of sorted) {
-    const repl = replacement(hit);
-    out = out.split(hit.value).join(repl);
-  }
-  return out;
-}
-
 export class PiiRedactor {
   private readonly mode: RedactionMode;
   private readonly secret: string | undefined;
@@ -245,7 +228,9 @@ export class PiiRedactor {
       this.mode === "replace"
         ? replaceMarker(hit.kind)
         : hashMarker(hit.kind, hit.value, this.secret ?? "", this.hashPrefix, this.hashSuffix);
-    const out = applyReplacements(text, replaceableHits, replacement);
+    // Widest value first, each replaced everywhere: one scan of the text,
+    // not one per distinct value (see ./replace).
+    const out = replaceValues(text, replaceableHits, replacement);
     return {
       text: out,
       hits: allHits,
@@ -349,6 +334,8 @@ export function createPiiRedactorWithPolicy(
 export function _sha256ForTest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
+
+export { markersStayPut, type ReplaceMeter, replaceValues } from "./replace";
 
 export {
   DEFAULT_PII_DETECTORS,

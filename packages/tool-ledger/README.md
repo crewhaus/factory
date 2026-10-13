@@ -123,7 +123,10 @@ unmatched.
 Rows on both sides use `@crewhaus/tool-money`'s `Transaction` — the shape
 `StatementParse` produces — imported rather than re-declared. A side with
 `kind: "statement"` is read through tool-money's own parser, so a file whose
-dates could be day-first or month-first is refused there too.
+dates could be day-first or month-first is refused there too. A statement row
+that parser could not read is in neither the matched nor the unmatched lists,
+so it is named in `unreadableStatementRows` (a count per side and the first
+fifty, with reasons) rather than silently missing.
 
 ## Aging refuses rather than answering partially
 

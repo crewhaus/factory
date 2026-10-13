@@ -391,6 +391,55 @@ describe("DataDriftCheck", () => {
     expect(status?.chiSquare?.p).toBeLessThan(0.001);
   });
 
+  test("a stored baseline gates a new category named `constructor` exactly as a fresh one does", async () => {
+    const roles = (counts: Record<string, number>): string => {
+      const lines = ["role"];
+      for (const [role, n] of Object.entries(counts)) for (let i = 0; i < n; i++) lines.push(role);
+      return `${lines.join("\n")}\n`;
+    };
+    write("ref.csv", roles({ engineer: 50, architect: 50 }));
+    write("cur.csv", roles({ engineer: 10, architect: 10, constructor: 80 }));
+    write("ref.profile.json", await raw(tableProfile, { file: "ref.csv", driftProfile: {} }));
+    type Report = {
+      gate: { ok: boolean };
+      columns: Array<{ column: string; chiSquare: { categories: number; p: number } | null }>;
+    };
+    const stored = await call<Report>(dataDriftCheck, {
+      file: "cur.csv",
+      referenceProfile: "ref.profile.json",
+      epsilon: 0.01,
+      failOn: { pValue: 0.05 },
+    });
+    const fresh = await call<Report>(dataDriftCheck, {
+      file: "cur.csv",
+      referenceFile: "ref.csv",
+      epsilon: 0.01,
+      failOn: { pValue: 0.05 },
+    });
+    // 0.7.0: the stored path answered gate.ok true, categories 2, p 1.
+    expect(stored.gate.ok).toBe(false);
+    const role = stored.columns.find((c) => c.column === "role");
+    expect(role?.chiSquare?.categories).toBe(3);
+    expect(role?.chiSquare).toEqual(
+      fresh.columns.find((c) => c.column === "role")?.chiSquare ?? null,
+    );
+  });
+
+  test("a stored baseline whose category count is not a number is refused, naming the column", async () => {
+    const profile = JSON.parse(await raw(tableProfile, { file: "baseline.csv", driftProfile: {} }));
+    const status = profile.columns.find((c: { name: string }) => c.name === "status");
+    status.drift.valueCounts.open = "200";
+    write("edited.profile.json", JSON.stringify(profile));
+    const out = await raw(dataDriftCheck, {
+      referenceProfile: "edited.profile.json",
+      file: "today.csv",
+      epsilon: 1e-3,
+    });
+    expect(out).toContain('"status"');
+    expect(out).toContain("non-numeric count");
+    expect(out).toContain('"open"');
+  });
+
   test("a baseline profiled WITHOUT driftProfile is refused, and the refusal says how to fix it", async () => {
     write("plain.profile.json", await raw(tableProfile, { file: "baseline.csv" }));
     const out = await raw(dataDriftCheck, {

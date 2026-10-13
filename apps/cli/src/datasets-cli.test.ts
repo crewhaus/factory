@@ -99,7 +99,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     const root = newTempRoot();
     expect((await runCli(["datasets", "--help"], root)).exitCode).toBe(0);
     expect((await runCli(["datasets", "bogus"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("put imports a JSONL file as v1 with the deterministic 70/15/15 split", async () => {
     const root = newTempRoot();
@@ -114,7 +114,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect(rec.splits.test).toHaveLength(2);
     expect(rec.sampleHashes.train).toHaveLength(7);
     expect(rec.createdAt).toBeDefined();
-  });
+  }, 20_000);
 
   test("a second put auto-bumps to v2; both versions remain on disk", async () => {
     const root = newTempRoot();
@@ -127,7 +127,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     const v1 = readRecord(root, "d", "v1");
     const v2 = readRecord(root, "d", "v2");
     expect(v2.splits.train.map((s) => s.id)).toEqual(v1.splits.train.map((s) => s.id));
-  });
+  }, 20_000);
 
   test("put --split train lands every sample in train; --split-spec overrides", async () => {
     const root = newTempRoot();
@@ -153,9 +153,10 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect(rec2.splits.train).toHaveLength(3);
     expect(rec2.splits.dev).toHaveLength(3);
     expect(rec2.splits.test).toBeUndefined();
-  });
+  }, 20_000);
 
-  // 6 sequential CLI cold-starts; needs headroom over the 5s default under CI contention.
+  // Six sequential CLI cold-starts: 15000ms timed out in a full `bun run test`
+  // asserting nothing wrong, so it declares 60_000 like its seven-start sibling.
   test("put rejects --split with --split-spec, a bad spec, a bad split, and a missing file", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 4);
@@ -171,7 +172,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       expect((await runCli(args, root)).exitCode).toBe(1);
     }
     expect(existsSync(join(root, ".crewhaus", "datasets", "x"))).toBe(false);
-  }, 15000);
+  }, 60_000);
 
   test("CREWHAUS_DATASETS_DIR overrides the registry root", async () => {
     const root = newTempRoot();
@@ -183,7 +184,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(custom, "env-ds", "v1.json"))).toBe(true);
     expect(existsSync(join(root, ".crewhaus", "datasets", "env-ds"))).toBe(false);
-  });
+  }, 20_000);
 
   test("list exits 0 with and without registered datasets", async () => {
     const root = newTempRoot();
@@ -191,11 +192,12 @@ describe("crewhaus datasets CLI (item 12)", () => {
     const file = writeDatasetFile(root, 4);
     await runCli(["datasets", "put", "listed", "--file", file], root);
     expect((await runCli(["datasets", "list"], root)).exitCode).toBe(0);
-  });
+  }, 30_000);
 
-  // This test does 6 sequential CLI cold-starts; under CI contention the
-  // default 5000ms/test budget is too tight (narrower still with this
-  // branch's +3 import deps), so it gets extra headroom (15000ms, 3rd arg).
+  // This test does seven sequential CLI cold-starts; under CI contention the
+  // default 5000ms/test budget is too tight, and in a full `bun run test`
+  // (every package's suite at once) 15000ms was too (it timed out asserting
+  // nothing wrong), so it declares 60_000 like the other many-spawn CLI tests.
   test("get resolves the latest version / an explicit split; failures exit 1", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 10);
@@ -208,7 +210,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       1,
     );
     expect((await runCli(["datasets", "get"], root)).exitCode).toBe(1);
-  }, 15000);
+  }, 60_000);
 
   // B16 — `datasets get` keeps emitting test rows (inspection, not
   // consumption) but discloses it on stderr; test-free output stays silent.
@@ -225,7 +227,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     const trainOnly = await runCliStderr(["datasets", "get", "g", "--split", "train"], root);
     expect(trainOnly.exitCode).toBe(0);
     expect(trainOnly.stderr).not.toContain("test-split");
-  }, 15000);
+  }, 30_000);
 });
 
 describe("crewhaus distill --register (item 12)", () => {
@@ -301,7 +303,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const root = newTempRoot();
     writeSession(root);
     expect((await runCli(["distill", "--session", SESSION], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("an invalid --register name (path traversal) exits 1 and writes nothing", async () => {
     const root = newTempRoot();
@@ -309,7 +311,7 @@ describe("crewhaus distill --register (item 12)", () => {
     const result = await runCli(["distill", "--session", SESSION, "--register", "../escape"], root);
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(root, ".crewhaus", "escape"))).toBe(false);
-  });
+  }, 20_000);
 
   // B23 — distilled sample text is PII/secret-redacted by default;
   // --no-redact restores the raw text for dev/local inspection.
@@ -397,7 +399,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       );
       expect(result.exitCode).toBe(1);
     }
-  });
+  }, 20_000);
 
   test("eval exits 1 when the ref names a split the record lacks", async () => {
     const root = newTempRoot();
@@ -409,7 +411,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       root,
     );
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   // B16 — an explicit #test needs the --allow-test-split opt-in on eval.
   test("eval refuses #test without --allow-test-split and unlocks with it", async () => {
@@ -451,7 +453,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
       );
       expect(result.exitCode).toBe(1);
     }
-  });
+  }, 20_000);
 
   // B16 — optimize refuses #test outright; there is no opt-in flag for it.
   test("optimize refuses an explicit #test ref with the release-gate explanation", async () => {
@@ -463,7 +465,7 @@ describe("registry: shorthand resolution errors in eval + optimize (item 12)", (
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("optimize never runs over the test split");
-  });
+  }, 20_000);
 
   // B16 — deploy canary is a release-gating flow (a sanctioned holdout
   // spender): #test is consumable there, behind the same opt-in as eval.
@@ -540,7 +542,7 @@ describe("crewhaus datasets put --canary (B18)", () => {
     expect(canaries[0]?.expected_output).toBeUndefined();
     // The canary'd registry still verifies clean.
     expect((await runCli(["datasets", "verify", "cnry"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus datasets status (B17)", () => {
@@ -576,7 +578,7 @@ describe("crewhaus datasets card (B21)", () => {
     expect(after).toBe(before);
     // Unknown dataset exits 1.
     expect((await runCli(["datasets", "card", "ghost"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus datasets release (NEW-HUNT-9)", () => {
@@ -606,7 +608,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("has no test split");
-  });
+  }, 20_000);
 
   test("refuses a second release without --force (the holdout is spent)", async () => {
     const root = newTempRoot();
@@ -630,7 +632,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     // The record's release history is untouched by the refusal.
     const after = JSON.parse(readFileSync(path, "utf-8"));
     expect(after.releases).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("missing --spec/--graders/name exit 1", async () => {
     const root = newTempRoot();
@@ -639,7 +641,7 @@ describe("crewhaus datasets release (NEW-HUNT-9)", () => {
     expect((await runCli(["datasets", "release", "x", "--spec", "spec.yaml"], root)).exitCode).toBe(
       1,
     );
-  });
+  }, 20_000);
 });
 
 describe("crewhaus dataset lint CLI (B26)", () => {
@@ -658,7 +660,7 @@ describe("crewhaus dataset lint CLI (B26)", () => {
     const strict = await runCliStderr(["dataset", "lint", "--dataset", bad, "--strict"], root);
     expect(strict.exitCode).toBe(1);
     expect(strict.stderr).toContain("finding(s)");
-  });
+  }, 20_000);
 
   test("a clean registry dataset lints clean under --strict; --all sweeps", async () => {
     const root = newTempRoot();
@@ -695,7 +697,7 @@ describe("crewhaus dataset lint CLI (B26)", () => {
       root,
     );
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
@@ -721,7 +723,7 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     expect(result.stderr).toContain('duplicate sample id "q1"');
     expect(result.stderr).toContain("--no-preflight");
     expect(existsSync(out)).toBe(false);
-  });
+  }, 20_000);
 
   test("--no-preflight skips the refusal (the run proceeds past the lint-lite)", async () => {
     const root = newTempRoot();
@@ -758,7 +760,7 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     );
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).not.toContain("preflight refused");
-  });
+  }, 20_000);
 
   test("gold-needing graders over an all-goldless dataset refuse pre-spend", async () => {
     const root = newTempRoot();
@@ -777,5 +779,5 @@ describe("crewhaus eval preflight (NEW-HUNT-10)", () => {
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("fail by construction");
-  });
+  }, 20_000);
 });

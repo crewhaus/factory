@@ -89,7 +89,10 @@ describe("continuity fixture — pinned discrimination matrix", () => {
     const cost = await costPerProvenOutcome(s, run);
     expect(cost.passed).toBe(true);
     expect(cost.score).toBeCloseTo(0.03, 10); // $0.06 across 2 proven steps
-  });
+    // Two scripted sessions on the real stores, then five graders, are slow by
+    // construction: well under 0.1 s here but 1.8 s on a loaded CI runner, too
+    // close to bun's default of 5 s.
+  }, 20_000);
 
   test("re-asker fails re-ask, retention, pickup, and cost — honesty stays vacuously green", async () => {
     const { run } = await playedRun("re-asker");

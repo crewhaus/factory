@@ -112,6 +112,34 @@ function isRegular(byte: number): boolean {
 }
 
 /** A one-pass reader over the file's bytes. */
+/**
+ * Whether `token` is a PDF number: an optional sign, digits with an optional
+ * point and fraction, or a point and a fraction. What
+ * `/^[+-]?(\d+\.?\d*|\.\d+)$/.test(token)` answered, in one pass. That
+ * pattern gave every digit of a run back to its fraction in turn when the
+ * token did not end where it should, so a long token of digits before a
+ * stray letter was quadratic in its length, and a pdf is whatever was handed
+ * over.
+ */
+export function isPdfNumber(token: string): boolean {
+  const digitsFrom = (start: number): number => {
+    let i = start;
+    for (; i < token.length; i++) {
+      const c = token.charCodeAt(i);
+      if (c < 0x30 || c > 0x39) break;
+    }
+    return i;
+  };
+  const start = token.charCodeAt(0) === 0x2b || token.charCodeAt(0) === 0x2d ? 1 : 0;
+  const whole = digitsFrom(start);
+  if (whole > start) {
+    return (token.charCodeAt(whole) === 0x2e ? digitsFrom(whole + 1) : whole) === token.length;
+  }
+  if (token.charCodeAt(start) !== 0x2e) return false;
+  const fraction = digitsFrom(start + 1);
+  return fraction > start + 1 && fraction === token.length;
+}
+
 export class PdfLexer {
   readonly bytes: Uint8Array;
   pos: number;
@@ -173,7 +201,7 @@ export class PdfLexer {
     if (token === "true") return true;
     if (token === "false") return false;
     if (token === "null") return null;
-    if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(token)) {
+    if (isPdfNumber(token)) {
       const value = Number.parseFloat(token);
       // `12 0 R` — an integer followed by an integer and `R` is a reference.
       if (/^\d+$/.test(token)) {

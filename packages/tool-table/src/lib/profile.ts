@@ -481,7 +481,9 @@ function captureColumn(
   // `otherCount` still says zero, so the capture claims a complete category
   // list that is missing a category — and a value arriving for the first time
   // today is never named as new. A null prototype makes it an ordinary key,
-  // and `JSON.stringify`/`JSON.parse` round-trip it intact.
+  // and `JSON.stringify`/`JSON.parse` round-trip the keys intact — though
+  // the parsed map is a plain object again, which is why the chi-square
+  // (drift.ts) reads own properties only.
   const valueCounts: Record<string, number> = Object.create(null);
   for (const { value, count } of kept) valueCounts[value] = count;
   let keptTotal = 0;

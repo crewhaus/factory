@@ -50,7 +50,11 @@ export type NameRule = {
  *     tap-qualified name adds two slashes (`homebrew/cask/firefox`). Upper
  *     case is allowed through because a tap's user segment can carry it.
  *   - apt: Debian policy §5.6.1 — `[a-z0-9][a-z0-9+.-]+`, plus an optional
- *     `:arch` qualifier (`libc6:i386`).
+ *     `:arch` qualifier (`libc6:i386`). Neither part may END in `-`: apt-get
+ *     reads a trailing `-` on an install operand as "remove this package"
+ *     (`apt-get install tzdata-` uninstalls tzdata), and no real package or
+ *     architecture name ends in one. A trailing `+` IS legal (`g++`), and apt
+ *     matches an exact name before it reads `+` as a modifier.
  *   - dnf: an rpm name is `[A-Za-z0-9._+-]`, and the whole NEVRA form
  *     (`kernel-5.14.0-427.el9.x86_64`) is spelled with the same characters,
  *     which is why a version is passed as part of the NAME for dnf rather
@@ -72,8 +76,9 @@ export const NAME_RULES: Readonly<Record<ManagerId, NameRule>> = Object.freeze({
     charset: "letters, digits and @ + . _ - , with at most two / segments for a tap-qualified name",
   },
   apt: {
-    pattern: /^[a-z0-9][a-z0-9+._-]*(:[a-z0-9][a-z0-9-]*)?$/,
-    charset: "lowercase letters, digits and + . _ - , with an optional :architecture suffix",
+    pattern: /^[a-z0-9](?:[a-z0-9+._-]*[a-z0-9+._])?(?::[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?$/,
+    charset:
+      "lowercase letters, digits and + . _ - (not ending in -), with an optional :architecture suffix",
   },
   dnf: {
     pattern: /^[A-Za-z0-9][A-Za-z0-9._+-]*$/,
@@ -140,6 +145,12 @@ export function checkPackageName(manager: ManagerId, name: string): string | und
   if (/\s/.test(name)) {
     return "the package name contains whitespace; a package name is a single token";
   }
+  if (manager === "apt" && name.split(":").some((part) => part.endsWith("-"))) {
+    // Named before the charset check, because the reason is not the
+    // characters: apt-get reads `install tzdata-` as REMOVE tzdata, so an
+    // accepted name would turn an install call into an uninstall.
+    return `${JSON.stringify(name)} ends in "-", which apt-get reads as "remove this package", not as part of its name — no apt package or architecture name ends in "-"`;
+  }
   const rule = NAME_RULES[manager];
   if (!rule.pattern.test(name)) {
     return `${JSON.stringify(name)} is not a valid ${manager} package name — accepted: ${rule.charset}`;
@@ -181,6 +192,12 @@ export function checkVersionSyntax(version: string): string | undefined {
   }
   if (!DEBIAN_VERSION_PATTERN.test(version)) {
     return `${JSON.stringify(version)} is not a Debian version string — accepted: letters, digits and . + ~ : - , starting with a letter or digit`;
+  }
+  if (version.endsWith("-")) {
+    // A Debian revision is never empty, so no real version ends in "-"; and
+    // apt-get reads `name=version-` as "remove name" (verified on apt 2.6:
+    // `install tzdata=2026b-0+deb12u1-` uninstalled tzdata).
+    return `${JSON.stringify(version)} ends in "-", which is never a Debian version and which apt-get reads as "remove this package"`;
   }
   return undefined;
 }

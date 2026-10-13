@@ -37,6 +37,7 @@ import { openScoreboard } from "@crewhaus/routing-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { openWatchmeStore } from "@crewhaus/watchme-store";
 import { experimentLedger, flywheelStatus, routeControl, watchmeReport } from "./index";
+import { MAX_PATH_CHARS } from "./paths";
 
 const TOOLS = [routeControl, experimentLedger, flywheelStatus, watchmeReport];
 const WRITERS = [routeControl, experimentLedger];
@@ -761,6 +762,33 @@ test("FlywheelStatus enumerates run directories with the stages they hold", asyn
   // reads it instead of implying the run passed.
   expect(JSON.stringify(r["unavailable"])).toContain("@crewhaus/eval-report");
   expect(JSON.stringify(r["unavailable"])).toContain("@crewhaus/spec-patch");
+});
+
+/**
+ * 0.7.1 review — a probe path too long to be a path leads nowhere, so it is
+ * no escape. A `specDir` just inside MAX_PATH_CHARS is contained; the data
+ * files the status looks for beneath it are past it, and the per-file
+ * containment skips those names rather than refusing the call as a symlink
+ * out of the workspace. The report goes ahead, and says nothing can be read
+ * there.
+ */
+test("FlywheelStatus with a specDir at the path limit reports, rather than calling it a symlink out", async () => {
+  mkdirSync(path.join(tmp, STATE), { recursive: true });
+  // Resolved against the real root, as the containment check resolves it.
+  const prefix = `${process.cwd()}/spec/`;
+  const tail = MAX_PATH_CHARS - 5 - prefix.length;
+  const pairs = Math.floor((tail - 1) / 2);
+  const specDir = `spec/${"a/".repeat(pairs)}${"b".repeat(tail - 2 * pairs)}`;
+  expect(path.resolve(specDir).length).toBe(MAX_PATH_CHARS - 5);
+  const r = await callJson(flywheelStatus, { specDir });
+  expect({ status: r["status"], reason: r["reason"] }).toEqual({
+    status: "ok",
+    reason: undefined,
+  });
+  // The filesystem's own answer for a name that long.
+  const tooLong = { state: "unreadable", detail: "could not be read (ENAMETOOLONG)" };
+  expect(at(r, "datasetPrecedence", "conventionalDataset")).toEqual(tooLong);
+  expect(at(r, "datasetPrecedence", "conventionalGraders")).toEqual(tooLong);
 });
 
 test("FlywheelStatus lists a workflow it does not recognise rather than calling it absent", async () => {

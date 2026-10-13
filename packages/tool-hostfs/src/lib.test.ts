@@ -10,6 +10,7 @@
  * the one case it is least likely to get wrong.
  */
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
   GIO_COLLISION_NAMES,
   GIO_CROSS_DEVICE_STDERR,
@@ -46,9 +47,9 @@ import {
 import { LOCATE_DB_PATHS, classifyLocateResult, describeIndexAge, locateArgv } from "./lib/locate";
 import {
   applyLimit,
+  collapseDoubleStars,
   compileGlob,
   dropTruncatedTail,
-  globRegexSource,
   isInsideRoot,
   scopeResults,
 } from "./lib/scope";
@@ -1271,20 +1272,154 @@ describe("scope: the glob matcher", () => {
     expect(matches("/w/src/a.js")).toBe(false);
   });
 
-  test("a run of ** compiles to ONE group, not one per repetition", () => {
-    // Adjacent `(?:[^/]+/)*` groups can each absorb the same segments, which
-    // is the catastrophic-backtracking shape: twelve of them against a
-    // 24-segment path took over a SECOND to answer `false` before the runs
-    // were collapsed, and every extra one multiplied it. The patterns come
-    // from the caller, and the matcher runs on the same event loop
-    // WatchPath's own deadline timer lives on — so that is not slowness, it
-    // is a deadline that cannot fire.
-    //
-    // Asserted on the compiled SHAPE rather than on a stopwatch: the count of
-    // cross-segment groups is the same fact and cannot flake on a loaded box.
-    expect(globRegexSource(`${"**/".repeat(12)}zzz`).split("(?:").length - 1).toBe(1);
-    expect(globRegexSource("**/**/**/*.ts")).toBe(globRegexSource("**/*.ts"));
+  test("a run of ** collapses to one before matching", () => {
+    expect(collapseDoubleStars(`${"**/".repeat(12)}zzz`)).toBe("**/zzz");
+    expect(collapseDoubleStars("**/**/**/*.ts")).toBe("**/*.ts");
   });
+
+  test("[ and \\ stay literal, as they always were here", () => {
+    expect(compileGlob("a[bc].txt")("a[bc].txt")).toBe(true);
+    expect(compileGlob("a[bc].txt")("ab.txt")).toBe(false);
+    expect(compileGlob("a\\*")("a\\x")).toBe(true);
+  });
+
+  test("a trailing ** needs something after it; a leading **/ takes an absolute root", () => {
+    expect(compileGlob("src/**")("src")).toBe(false);
+    expect(compileGlob("src/**")("src/")).toBe(true);
+    expect(compileGlob("src/**")("src/a/b")).toBe(true);
+    expect(compileGlob("**/*.test.ts")("/w/src/a.test.ts")).toBe(true);
+    expect(compileGlob("**/x")("/x")).toBe(false);
+    expect(compileGlob("a/**/b")("a//b")).toBe(false);
+  });
+});
+
+/**
+ * The RegExp translation 0.7.0 compiled every glob to, kept as the oracle
+ * the linear matcher is checked against. Only ever run on short inputs.
+ */
+function legacyGlobRegex(rawPattern: string): RegExp {
+  const pattern = collapseDoubleStars(rawPattern);
+  let source = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const char = pattern[i] as string;
+    if (char === "*") {
+      if (pattern[i + 1] === "*") {
+        const atSegmentStart = i === 0 || pattern[i - 1] === "/";
+        const after = i + 2;
+        const atSegmentEnd = after >= pattern.length || pattern[after] === "/";
+        if (atSegmentStart && atSegmentEnd) {
+          if (after < pattern.length) {
+            source += i === 0 ? "(?:/?[^/]+/)*" : "(?:[^/]+/)*";
+            i = after + 1;
+            continue;
+          }
+          source += ".*";
+          i = after;
+          continue;
+        }
+      }
+      source += "[^/]*";
+      i += 1;
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      i += 1;
+      continue;
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    i += 1;
+  }
+  return new RegExp(`^${source}$`);
+}
+
+describe("scope: the glob matcher cannot be made to backtrack (C162)", () => {
+  test("it agrees with the old RegExp translation on every short input tried", () => {
+    // A seeded generator, so a failure names a reproducible case. Line
+    // terminators are left out: the old `.*` for a trailing `**` did not
+    // match them (a file name holding a newline escaped `dir/**`), and the
+    // new matcher does, deliberately.
+    let seed = 0x5eed;
+    const rand = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const patternAlphabet = ["a", "b", "*", "*", "?", "/", "/", ".", "[", "\\", "**/", "/**"];
+    const pathAlphabet = ["a", "b", "/", "/", ".", "[", "\\", "ab"];
+    const pick = (alphabet: readonly string[], max: number): string => {
+      let out = "";
+      const len = rand(max + 1);
+      for (let k = 0; k < len; k++) out += alphabet[rand(alphabet.length)];
+      return out;
+    };
+    // And by whole segments, which is where `**`, an absolute root and an
+    // empty segment meet.
+    const patternSegments = [
+      "**",
+      "**",
+      "*",
+      "a",
+      "b",
+      "?",
+      "a*",
+      "*b",
+      "?a",
+      "*a*",
+      "[",
+      "\\",
+      "",
+    ];
+    const pathSegments = ["", "", "a", "b", "ab", "ba", ".a", "[", "\\", "aab"];
+    const bySegments = (alphabet: readonly string[], max: number): string =>
+      Array.from({ length: 1 + rand(max) }, () => alphabet[rand(alphabet.length)]).join("/");
+    let compared = 0;
+    let matched = 0;
+    const compare = (pattern: string, subjects: () => string): void => {
+      const oracle = legacyGlobRegex(pattern);
+      const matcher = compileGlob(pattern);
+      for (let d = 0; d < 40; d++) {
+        const subject = subjects();
+        const want = oracle.test(subject);
+        expect({ pattern, subject, got: matcher(subject) }).toEqual({
+          pattern,
+          subject,
+          got: want,
+        });
+        compared += 1;
+        if (want) matched += 1;
+      }
+    };
+    for (let c = 0; c < 400; c++) compare(pick(patternAlphabet, 6), () => pick(pathAlphabet, 7));
+    for (let c = 0; c < 1_000; c++) {
+      compare(bySegments(patternSegments, 4), () => bySegments(pathSegments, 5));
+    }
+    // The comparison is only worth something if both answers occur.
+    expect(compared).toBe(56_000);
+    expect(matched).toBeGreaterThan(2_000);
+  });
+
+  test("a wildcard-heavy pattern against a long name answers at once", () => {
+    // In a child process, so a regression fails at the timeout instead of
+    // wedging the suite: a synchronous RegExp cannot be interrupted, and on
+    // 0.7.0 these three took minutes. The old translation is not run here.
+    // A file path, not a URL's pathname: on Windows the pathname is
+    // "/D:/..." and the child's import of it failed before it ran anything.
+    const scope = fileURLToPath(new URL("./lib/scope.ts", import.meta.url));
+    const script = `
+      const { compileGlob } = await import(${JSON.stringify(scope)});
+      console.log(JSON.stringify([
+        compileGlob("**/" + "*a".repeat(10) + "*z")("/w/" + "a".repeat(128)),
+        compileGlob("**/" + "*a".repeat(10) + "*a")("/w/" + "a".repeat(128)),
+        compileGlob("*a".repeat(99) + "z")("a".repeat(255)),
+        compileGlob("**/" + "*?".repeat(40) + "*#")("/w/" + "x".repeat(200)),
+      ]));
+    `;
+    const r = Bun.spawnSync([process.execPath, "-e", script], { timeout: 8_000 });
+    expect(r.signalCode ?? null).toBeNull();
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout.toString())).toEqual([false, true, false, false]);
+  }, 15_000);
 });
 
 describe("scope: a listing cut at the output cap", () => {

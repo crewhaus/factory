@@ -303,6 +303,7 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
         continuity: { loadPlan: async () => null },
         askMode: "pause",
         approvals: approvals as unknown as NonNullable<ParentRunHandle["approvals"]>,
+        sandboxAvailable: true,
         hooks: [],
         subAgents: new Map(),
         spawnSubAgent: async () => {
@@ -320,6 +321,8 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
       expect(handle.continuity).toBe(bridge.continuity);
       expect(handle.askMode).toBe("pause");
       expect(handle.approvals).toBe(bridge.approvals);
+      // 0.7.1 — a child runs against the parent's sandbox backend.
+      expect(handle.sandboxAvailable).toBe(true);
       expect(handle.sessionRootDir).toBe(root);
       for (const toolOnly of ["hooks", "subAgents", "spawnSubAgent", "crewMailbox", "runState"]) {
         expect(toolOnly in handle).toBe(false);

@@ -12,6 +12,8 @@
  * pure: text in, records out.
  */
 
+import { blanksAt, restAfterBlanks } from "./blank-tail";
+
 export type Severity = "error" | "warning" | "info";
 
 export type Diagnostic = {
@@ -83,47 +85,89 @@ export function relativize(file: string, root: string): string {
  */
 export function parseTsc(text: string, root = ""): Diagnostic[] {
   const out: Diagnostic[] = [];
-  const re =
-    /^(?<file>[^\s(][^(]*)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning|message)\s+(?<code>TS\d+):\s+(?<msg>.*)$/;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = (lines[i] as string).replace(/\r$/, "");
-    const m = re.exec(line);
+    const m = tscLine(line);
     if (m === null) {
       // A file-less diagnostic: `error TS18003: No inputs were found…`.
-      const bare = /^(?<sev>error|warning)\s+(?<code>TS\d+):\s+(?<msg>.*)$/.exec(line);
+      const bare = tscBareLine(line);
       if (bare !== null) {
         out.push({
           file: "",
           line: 0,
           column: 0,
-          severity: normalizeSeverity(bare.groups?.["sev"] ?? "error"),
-          rule: bare.groups?.["code"] as string,
-          message: (bare.groups?.["msg"] ?? "").trim(),
+          severity: normalizeSeverity(bare.sev),
+          rule: bare.code,
+          message: bare.msg.trim(),
           source: "tsc",
         });
       }
       continue;
     }
     // Indented follow-on lines belong to the diagnostic above them.
-    let message = (m.groups?.["msg"] ?? "").trim();
+    let message = m.msg.trim();
     while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1] as string)) {
       const cont = (lines[i + 1] as string).trim();
-      if (re.test(cont)) break;
+      if (tscLine(cont) !== null) break;
       message += ` ${cont}`;
       i += 1;
     }
     out.push({
-      file: relativize(m.groups?.["file"] as string, root),
-      line: Number(m.groups?.["line"]),
-      column: Number(m.groups?.["col"]),
-      severity: normalizeSeverity(m.groups?.["sev"] ?? "error"),
-      rule: m.groups?.["code"] as string,
+      file: relativize(m.file, root),
+      line: Number(m.line),
+      column: Number(m.col),
+      severity: normalizeSeverity(m.sev),
+      rule: m.code,
       message,
       source: "tsc",
     });
   }
   return sortDiagnostics(out);
+}
+
+/**
+ * Everything of a tsc line up to the message, which `\s+(?<msg>.*)$` then
+ * reads: each part is fixed once the one before it is, so this tries one
+ * way only. The message is {@link restAfterBlanks}'s.
+ */
+const TSC_HEAD =
+  /^(?<file>[^\s(][^(]*)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning|message)\s+(?<code>TS\d+):/;
+const TSC_BARE_HEAD = /^(?<sev>error|warning)\s+(?<code>TS\d+):/;
+
+/**
+ * The groups `/^(?<file>[^\s(][^(]*)\((?<line>\d+),(?<col>\d+)\):\s+(?<sev>error|warning|message)\s+(?<code>TS\d+):\s+(?<msg>.*)$/`
+ * captured from `line`, or null where it found no match. That pattern gave
+ * the blanks before the message back one character at a time when a line
+ * break stood inside the message, rereading the rest after each: quadratic
+ * in the run of blanks, on a compiler's output about workspace files.
+ */
+export function tscLine(
+  line: string,
+): { file: string; line: string; col: string; sev: string; code: string; msg: string } | null {
+  const head = TSC_HEAD.exec(line);
+  if (head === null) return null;
+  const at = restAfterBlanks(line, head[0].length, 1, 0);
+  if (at === -1) return null;
+  const g = head.groups as Record<string, string>;
+  return {
+    file: g["file"] as string,
+    line: g["line"] as string,
+    col: g["col"] as string,
+    sev: g["sev"] as string,
+    code: g["code"] as string,
+    msg: line.slice(at),
+  };
+}
+
+/** The groups `/^(?<sev>error|warning)\s+(?<code>TS\d+):\s+(?<msg>.*)$/` captured, as {@link tscLine}. */
+export function tscBareLine(line: string): { sev: string; code: string; msg: string } | null {
+  const head = TSC_BARE_HEAD.exec(line);
+  if (head === null) return null;
+  const at = restAfterBlanks(line, head[0].length, 1, 0);
+  if (at === -1) return null;
+  const g = head.groups as Record<string, string>;
+  return { sev: g["sev"] as string, code: g["code"] as string, msg: line.slice(at) };
 }
 
 // ---------------------------------------------------------------------------
@@ -306,24 +350,86 @@ export function parseRuffJson(text: string, root = ""): Diagnostic[] | undefined
  */
 export function parseGenericDiagnostics(text: string, source = "generic", root = ""): Diagnostic[] {
   const out: Diagnostic[] = [];
-  const re =
-    /^(?<file>[^\s:][^:]*):(?<line>\d+):(?:(?<col>\d+):)?\s*(?:(?<sev>error|warning|note|info)\s*:)?\s*(?<msg>.+)$/;
   for (const raw of text.split("\n")) {
-    const m = re.exec(raw.replace(/\r$/, "").trim());
+    const m = genericLine(raw.replace(/\r$/, "").trim());
     if (m === null) continue;
-    const file = m.groups?.["file"] as string;
+    const file = m.file;
     // `http://example.com:80` and `12:30:00` are not diagnostics.
     if (/^\d+$/.test(file) || /^https?$/.test(file)) continue;
     out.push({
       file: relativize(file, root),
-      line: Number(m.groups?.["line"]),
-      column: m.groups?.["col"] === undefined ? 0 : Number(m.groups["col"]),
-      severity: normalizeSeverity(m.groups?.["sev"] ?? "error"),
-      message: (m.groups?.["msg"] ?? "").trim(),
+      line: Number(m.line),
+      column: m.col === undefined ? 0 : Number(m.col),
+      severity: normalizeSeverity(m.sev ?? "error"),
+      message: m.msg.trim(),
       source,
     });
   }
   return sortDiagnostics(out);
+}
+
+/**
+ * What `/^\[warn\]\s+(.*)$/` captured from a prettier line, or undefined
+ * where it found no match. A file's name may hold a `\r`, before which the
+ * pattern gave a run of blanks back one at a time, rereading the rest after
+ * each: quadratic in the run.
+ */
+export function prettierWarnPath(line: string): string | undefined {
+  if (!line.startsWith("[warn]")) return undefined;
+  const at = restAfterBlanks(line, 6, 1, 0);
+  return at === -1 ? undefined : line.slice(at);
+}
+
+/** `file:line:`, which the generic pattern opens with; tried one way only. */
+const GENERIC_HEAD = /^(?<file>[^\s:][^:]*):(?<line>\d+):/;
+const GENERIC_COLUMN = /\d+:/y;
+const GENERIC_SEVERITIES = ["error", "warning", "note", "info"];
+
+/**
+ * What `\s*(?:(?<sev>error|warning|note|info)\s*:)?\s*(?<msg>.+)$` captures
+ * when tried at `from`, or null. It tries the severity after the whole first
+ * run of blanks first; then, without one, the message from the latest start
+ * in that run the message can have ({@link restAfterBlanks}).
+ */
+function severityAndMessage(line: string, from: number): { sev?: string; msg: string } | null {
+  const word = from + blanksAt(line, from);
+  for (const sev of GENERIC_SEVERITIES) {
+    if (!line.startsWith(sev, word)) continue;
+    const colon = word + sev.length + blanksAt(line, word + sev.length);
+    if (line.charCodeAt(colon) !== 0x3a) break;
+    const at = restAfterBlanks(line, colon + 1, 0, 1);
+    if (at !== -1) return { sev, msg: line.slice(at) };
+    break;
+  }
+  const at = restAfterBlanks(line, from, 0, 1);
+  return at === -1 ? null : { msg: line.slice(at) };
+}
+
+/**
+ * The groups
+ * `/^(?<file>[^\s:][^:]*):(?<line>\d+):(?:(?<col>\d+):)?\s*(?:(?<sev>error|warning|note|info)\s*:)?\s*(?<msg>.+)$/`
+ * captured from `line`, or null where it found no match. Its three runs of
+ * blanks, one on each side of the optional severity, split a run of spaces
+ * every way there is before a line break inside the message ended the try:
+ * cubic in the run, and a line has no length cap. Here the column is tried,
+ * then left out, as the pattern did, and each costs one pass.
+ */
+export function genericLine(
+  line: string,
+): { file: string; line: string; col?: string; sev?: string; msg: string } | null {
+  const head = GENERIC_HEAD.exec(line);
+  if (head === null) return null;
+  const file = head.groups?.["file"] as string;
+  const lineNo = head.groups?.["line"] as string;
+  const from = head[0].length;
+  GENERIC_COLUMN.lastIndex = from;
+  const column = GENERIC_COLUMN.exec(line);
+  if (column !== null) {
+    const tail = severityAndMessage(line, from + column[0].length);
+    if (tail !== null) return { file, line: lineNo, col: column[0].slice(0, -1), ...tail };
+  }
+  const tail = severityAndMessage(line, from);
+  return tail === null ? null : { file, line: lineNo, ...tail };
 }
 
 /**

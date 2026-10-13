@@ -57,11 +57,49 @@ export type TomlScan =
 const WHITESPACE = new Set([" ", "\t", "\r", "\n", "\ufeff"]);
 const BARE_KEY_CHARS = /^[A-Za-z0-9_-]$/;
 
+/**
+ * Line numbers for offsets into one text: the line breaks are found once,
+ * and each offset is placed among them by binary search.
+ *
+ * A manifest reports a line for every dependency it declares, and counting
+ * the breaks from the top of the file for each one was quadratic in a file
+ * the workspace supplies. `steps` counts the characters scanned for breaks
+ * and the probes each lookup makes, which is what a test reads.
+ */
+export class LineIndex {
+  /** Characters scanned for line breaks, plus binary-search probes, so far. */
+  steps = 0;
+  /** Offsets of every `\n`, ascending. */
+  private readonly breaks: number[] = [];
+
+  constructor(text: string) {
+    // One split finds every break; each piece's length places the next.
+    const pieces = text.split("\n");
+    this.steps += text.length;
+    let at = -1;
+    for (let i = 0; i < pieces.length - 1; i++) {
+      at += (pieces[i] as string).length + 1;
+      this.breaks.push(at);
+    }
+  }
+
+  /** The 1-based line `at` is on: one plus the breaks before it. */
+  lineAt(at: number): number {
+    let lo = 0;
+    let hi = this.breaks.length;
+    while (lo < hi) {
+      this.steps++;
+      const mid = (lo + hi) >>> 1;
+      if ((this.breaks[mid] as number) < at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo + 1;
+  }
+}
+
 /** Where offset `at` is, in 1-based line/column, for a message a human reads. */
 export function lineAt(text: string, at: number): number {
-  let line = 1;
-  for (let i = 0; i < at && i < text.length; i++) if (text[i] === "\n") line += 1;
-  return line;
+  return new LineIndex(text).lineAt(at);
 }
 
 function skipTrivia(text: string, from: number): number {

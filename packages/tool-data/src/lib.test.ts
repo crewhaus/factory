@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import {
   CsvError,
   cellToString,
+  csvDialectError,
   escapeCsvField,
   inferScalar,
   normalizeHeader,
@@ -728,6 +729,79 @@ describe("csv writing", () => {
     const rows = [["a,b", 'c"d', "e\nf"]];
     const text = writeCsvRows(rows, W);
     expect(parseCsv(text, CSV_DEFAULTS).rows).toEqual([["a,b", 'c"d', "e\nf"]]);
+  });
+
+  test("a lone empty field and a leading U+FEFF are quoted, so they read back", () => {
+    // A row whose only field is empty was written as a blank line, which the
+    // reader skips; a first field starting with U+FEFF lost it to the
+    // reader's byte-order-mark strip.
+    const cases: Array<ReadonlyArray<ReadonlyArray<string>>> = [
+      [[""], ["x"], [""]],
+      [
+        ["\ufeffx", "y"],
+        ["a", "b"],
+      ],
+      [["\ufeff"], ["z"]],
+      [
+        ["", ""],
+        ["x", ""],
+      ],
+    ];
+    for (const rows of cases) {
+      const text = writeCsvRows(rows, W);
+      expect({ text, rows: parseCsv(text, CSV_DEFAULTS).rows }).toEqual({ text, rows });
+    }
+    expect(writeCsvRows([[""], ["x"]], W)).toBe('""\nx');
+    expect(writeCsvRows([["\ufeffx", "y"]], W)).toBe('"\ufeffx",y');
+    // Only the file's first field is at risk: later ones are written as before.
+    expect(writeCsvRows([["a"], ["\ufeffb"]], W)).toBe("a\n\ufeffb");
+  });
+
+  test("a line break or the quote character is refused as a delimiter, by reader and writer alike", () => {
+    // One rule for both sides: each of these wrote a file the reader then
+    // refused or misread (a "\n" delimiter read back as one header line of
+    // values and zero records).
+    const refused: Array<[string, string, RegExp]> = [
+      ["\n", '"', /line break/],
+      ["\r", '"', /line break/],
+      ['"', '"', /must differ/],
+      [",", "\n", /line break/],
+      [",", "\r", /line break/],
+      [",,", '"', /single character/],
+      // The reader drops a leading U+FEFF as a byte-order mark, so as the
+      // delimiter `["", "x"]` read back as `["x"]`.
+      ["\ufeff", '"', /U\+FEFF/],
+      [",", "\ufeff", /U\+FEFF/],
+    ];
+    let hits = 0;
+    for (const [delimiter, quote, why] of refused) {
+      expect(csvDialectError(delimiter, quote)).toMatch(why);
+      expect(() => parseCsv("a\nb", { ...CSV_DEFAULTS, delimiter, quote })).toThrow(CsvError);
+      expect(() => writeCsvRows([["a"]], { ...W, delimiter, quote })).toThrow(why);
+      hits += 1;
+    }
+    expect(hits).toBe(8);
+    expect(csvDialectError(",", '"')).toBeNull();
+  });
+
+  test("for every usable delimiter, a written file reads back exactly, CRLF or not", () => {
+    const rows = [
+      ["plain", "has,comma", "has;semi", "has\ttab", "has|pipe", "has space"],
+      ['has"quote', "has\nlf", "has\rcr", "has\r\ncrlf", "", "x"],
+    ];
+    let checked = 0;
+    for (const delimiter of [",", ";", "\t", "|", " "]) {
+      for (const newline of ["\n", "\r\n"]) {
+        const text = writeCsvRows(rows, { ...W, delimiter, newline });
+        expect({
+          delimiter,
+          newline,
+          rows: parseCsv(text, { ...CSV_DEFAULTS, delimiter }).rows,
+        }).toEqual({ delimiter, newline, rows });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(10);
   });
 });
 
@@ -1579,6 +1653,66 @@ describe("joining", () => {
       maxRows: 1,
     });
     expect(out.truncated).toBe(true);
+  });
+
+  test("maxRows bounds the work, not just the output: a pair past the cap is never merged", () => {
+    // Every right row carries a counting getter; mergeRow reads it once per
+    // merge, so the counter IS the number of pairs built. On 0.7.0 it was
+    // 300 x 300 = 90,000 for a 5-row answer.
+    let merged = 0;
+    const right = Array.from({ length: 300 }, () => {
+      const r: Record<string, unknown> = { id: 1 };
+      Object.defineProperty(r, "v", {
+        enumerable: true,
+        get: () => {
+          merged += 1;
+          return 0;
+        },
+      });
+      return r;
+    });
+    const left = Array.from({ length: 300 }, () => ({ id: 1 }));
+    const out = joinRecords(left, right, { ...base, kind: "inner", maxRows: 5 });
+    expect({
+      rows: out.rows.length,
+      truncated: out.truncated,
+      totalRows: out.totalRows,
+      merged,
+    }).toEqual({ rows: 5, truncated: true, totalRows: 90_000, merged: 5 });
+  });
+
+  test("a capped full join still counts every unmatched row, and keeps the uncapped prefix", () => {
+    const l = [{ id: 1, n: "a" }, { id: 1, n: "b" }, { id: 1, n: "c" }, { id: 2 }];
+    const r = [{ id: 1, m: "x" }, { id: 1, m: "y" }, { id: 1, m: "z" }, { id: 3 }];
+    const whole = joinRecords(l, r, { ...base, kind: "full" });
+    const capped = joinRecords(l, r, { ...base, kind: "full", maxRows: 2 });
+    expect(whole.totalRows).toBe(11);
+    expect(whole.truncated).toBe(false);
+    expect({
+      rows: capped.rows,
+      truncated: capped.truncated,
+      totalRows: capped.totalRows,
+      unmatchedLeft: capped.unmatchedLeft,
+      unmatchedRight: capped.unmatchedRight,
+    }).toEqual({
+      rows: whole.rows.slice(0, 2),
+      truncated: true,
+      totalRows: 11,
+      unmatchedLeft: 1,
+      unmatchedRight: 1,
+    });
+  });
+
+  test("a cap that lands exactly on the join's size is not truncation", () => {
+    const out = joinRecords([{ id: 1 }], [{ id: 1 }, { id: 1 }], {
+      ...base,
+      kind: "inner",
+      maxRows: 2,
+    });
+    expect({ truncated: out.truncated, totalRows: out.totalRows }).toEqual({
+      truncated: false,
+      totalRows: 2,
+    });
   });
 });
 

@@ -30,13 +30,49 @@ export class ChainAdapterError extends CrewhausError {
   override readonly name = "ChainAdapterError";
   readonly chainId: string;
   readonly method: string;
+  /**
+   * True when the read's own deadline passed before a node answered. That
+   * is a timeout, not an answer: a caller must not read it as the node
+   * refusing the request (or not implementing the method).
+   */
+  readonly timedOut: boolean;
+  /**
+   * The JSON-RPC error a node answered with, as it sent it. Set on one
+   * node's failure only, so a caller deciding what "the node" said reads a
+   * code rather than a sentence.
+   */
+  readonly rpc: ChainRpcErrorAnswer | undefined;
+  /**
+   * When every node the read was sent to failed, and each was heard: each
+   * node's own failure, in the order the chain names its nodes. A decision
+   * about why the read failed is made over all of them, never over the one
+   * that happened to fail last. Unset when a node was not heard (a quorum
+   * that was lost before every voter answered) or the read was stopped.
+   */
+  readonly attempts: ReadonlyArray<ChainAdapterError> | undefined;
 
-  constructor(chainId: string, method: string, message: string, cause?: unknown) {
+  constructor(
+    chainId: string,
+    method: string,
+    message: string,
+    cause?: unknown,
+    opts: {
+      readonly timedOut?: boolean;
+      readonly rpc?: ChainRpcErrorAnswer;
+      readonly attempts?: ReadonlyArray<ChainAdapterError>;
+    } = {},
+  ) {
     super("adapter", `[${chainId}] ${method}: ${message}`, cause);
     this.chainId = chainId;
     this.method = method;
+    this.timedOut = opts.timedOut === true;
+    this.rpc = opts.rpc;
+    this.attempts = opts.attempts;
   }
 }
+
+/** A node's JSON-RPC error object: the code and message it answered with. */
+export type ChainRpcErrorAnswer = { readonly code: number; readonly message: string };
 
 /**
  * A finality policy mirrors `IrChainFinality` from `@crewhaus/ir`. The
@@ -50,6 +86,13 @@ export type ChainFinality =
   | { readonly kind: "safe" };
 
 export type RpcPolicy = "single" | "quorum" | "fallback";
+
+/**
+ * What a spec writes to give a chain-reading tool its chain. Every "no chain
+ * is configured" refusal quotes it, so the fix is in the message.
+ */
+export const CHAINS_BLOCK_EXAMPLE =
+  'chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL], finality: { kind: finalized } }]';
 
 export type ChainAdapterConfig = {
   readonly chainId: string;
@@ -78,12 +121,21 @@ export interface ChainAdapter {
    * `eth_blockNumber`, `eth_chainId`. Any attempt to dispatch a
    * write-class method (`eth_sendRawTransaction`, etc.) throws.
    */
-  rpcRead(
-    method: string,
-    params: ReadonlyArray<unknown>,
-    opts?: { readonly bypassCache?: boolean },
-  ): Promise<unknown>;
+  rpcRead(method: string, params: ReadonlyArray<unknown>, opts?: RpcReadOptions): Promise<unknown>;
 }
+
+/**
+ * Per-read options. A read is always bounded: an adapter applies its own
+ * default deadline when `timeoutMs` is left out, and gives up as soon as
+ * `signal` fires, so a node that never answers cannot hold a turn open.
+ */
+export type RpcReadOptions = {
+  readonly bypassCache?: boolean;
+  /** The caller's cancellation — a tool passes its call's `ctx.signal`. */
+  readonly signal?: AbortSignal;
+  /** The whole read's deadline, across every RPC URL it tries. */
+  readonly timeoutMs?: number;
+};
 
 /**
  * Whitelist of read-only JSON-RPC methods. Adding writes here is a

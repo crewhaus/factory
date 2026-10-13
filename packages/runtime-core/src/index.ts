@@ -37,6 +37,7 @@ import {
   type PricingTable,
   computeCostMicros,
   createCostTracker,
+  providerToolLimit,
   resolveCapabilities,
   resolvePricing,
   sumRoleCost,
@@ -140,9 +141,11 @@ import {
 } from "@crewhaus/routing-store";
 import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
 import {
+  type ApprovalPlace,
   type PendingApproval,
   type PendingApprovalStore,
   type SessionStore,
+  type SupersededApproval,
   createSessionStore,
   evictExpiredApprovals,
   generateApprovalId,
@@ -158,8 +161,14 @@ import { narrowRuleSet } from "@crewhaus/sub-agent-permission-inheritance";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
-import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
-import { executeTool } from "@crewhaus/tool-executor";
+import {
+  hasModelChosenDestination,
+  legacyMcpToolName,
+  stripJustificationField,
+  withJustificationField,
+} from "@crewhaus/tool-catalog";
+import { LOOP_TOOL_NAMES, resolveToolConfigEnv } from "@crewhaus/tool-categories";
+import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
@@ -185,6 +194,7 @@ import {
 } from "./cli-markdown";
 import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
+import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
 import { attachIncidentCollector } from "./incident-collector";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
@@ -199,6 +209,7 @@ import {
   attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
+import { placeRecordingCanonicalizer } from "./path-canonical";
 import {
   type PreRouteArm,
   type PreRouteClassifierVerdict,
@@ -214,6 +225,12 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
+import {
+  type ServingModel,
+  type ToolLimitVerdict,
+  checkServingToolLimits,
+  unreportedToolLimitLines,
+} from "./tool-limit";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -242,8 +259,9 @@ import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
  * hit, a synthetic warning user message is appended (deduped per
  * signature) so the model can self-correct. Every tool result flows
  * through `@crewhaus/tool-result-store` — outputs over 10 KB are
- * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and the
- * model sees a preview pointing at the full file. Behind a
+ * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` (or
+ * `<toolUseId>.<n>.txt` when an id-less provider's synthesised id repeats)
+ * and the model sees a preview pointing at the full file. Behind a
  * `streaming: true` option, the loop swaps to
  * `@crewhaus/streaming-tool-executor`, which dispatches tools mid-stream
  * via the SDK's `contentBlock` event.
@@ -298,17 +316,6 @@ const DEFAULT_COMPACTION_THRESHOLD = 0.85;
 const DEFAULT_SNIP_KEEP_HEAD = 4;
 const DEFAULT_SNIP_KEEP_TAIL = 20;
 
-// Explicit optional keys (not a bare index signature) so dot-access stays lint-
-// and tsc-clean.
-type JsonSchemaLike = {
-  type?: unknown;
-  properties?: Record<string, unknown>;
-  required?: unknown;
-  anyOf?: unknown;
-  oneOf?: unknown;
-  allOf?: unknown;
-};
-
 // Convert a registered tool to the Anthropic `input_schema` shape. Anthropic
 // requires a JSON-Schema OBJECT at the top level: it rejects a `type`-less
 // schema (`input_schema.type: Field required`) AND a top-level `anyOf`/`oneOf`/
@@ -327,7 +334,10 @@ function toAnthropicInputSchema(t: RegisteredTool): Anthropic.Tool.InputSchema {
     return converted as Anthropic.Tool.InputSchema;
   }
   if (Array.isArray(union)) {
-    return flattenUnionToObject(union as JsonSchemaLike[], converted.properties);
+    return flattenUnionToObject(
+      union as JsonSchemaLike[],
+      converted.properties,
+    ) as Anthropic.Tool.InputSchema;
   }
   // Degenerate (no object type, no union): coerce to an empty object schema.
   return { type: "object", properties: converted.properties ?? {} } as Anthropic.Tool.InputSchema;
@@ -361,41 +371,6 @@ function toAdvertisedTool(t: RegisteredTool): {
     inputSchema: schema as Anthropic.Tool.InputSchema,
     justificationInjected: injected,
   };
-}
-
-// Merge a top-level union of object branches into a single object schema.
-// Anthropic forbids a top-level `anyOf`, but a nested `anyOf` on an individual
-// property is fine — so each property becomes the union of its per-branch
-// shapes, and `required` is the intersection across branches (in practice the
-// shared discriminator). The tool's own zod schema still validates the real
-// input at execute time, so the looser model-facing schema loses no safety.
-function flattenUnionToObject(
-  branches: JsonSchemaLike[],
-  baseProps: Record<string, unknown> | undefined,
-): Anthropic.Tool.InputSchema {
-  const perKey = new Map<string, unknown[]>();
-  const requiredSets: string[][] = [];
-  for (const b of branches) {
-    for (const [k, v] of Object.entries(b.properties ?? {})) {
-      const seen = perKey.get(k) ?? [];
-      if (!seen.some((e) => JSON.stringify(e) === JSON.stringify(v))) seen.push(v);
-      perKey.set(k, seen);
-    }
-    requiredSets.push(Array.isArray(b.required) ? (b.required as string[]) : []);
-  }
-  const properties: Record<string, unknown> = { ...(baseProps ?? {}) };
-  for (const [k, variants] of perKey) {
-    properties[k] = variants.length === 1 ? variants[0] : { anyOf: variants };
-  }
-  const required =
-    requiredSets.length > 0
-      ? requiredSets.reduce((acc, r) => acc.filter((x) => r.includes(x)))
-      : [];
-  return {
-    type: "object",
-    properties,
-    ...(required.length > 0 ? { required } : {}),
-  } as Anthropic.Tool.InputSchema;
 }
 
 // ---------------------------------------------------------------------------
@@ -747,9 +722,11 @@ export type { AgentIdentityFile } from "./identity";
 // without depending on session-store directly.
 export {
   type ApprovalDecision,
+  type ApprovalPlace,
   type PendingApproval,
   type PendingApprovalStore,
   type PendingApprovalStoreOptions,
+  type SupersededApproval,
   createPendingApprovalStore,
   evictExpiredApprovals,
   generateApprovalId,
@@ -816,8 +793,11 @@ export async function findReplayableGrant(
   }
   const now = where.now ?? Date.now();
   const maxAgeMs = where.maxAgeMs ?? REPLAYABLE_GRANT_MAX_AGE_MS;
+  // 0.7.1 — a grant made before MCP tools were renamed names the tool by its
+  // old `<server>__<tool>` spelling; it is the same tool.
+  const legacyToolName = legacyMcpToolName(where.toolName);
   const matches = all.filter((a) => {
-    if (a.toolName !== where.toolName) return false;
+    if (a.toolName !== where.toolName && a.toolName !== legacyToolName) return false;
     if (a.sessionId !== where.sessionId) return false;
     if (a.decision !== "grant") return false;
     if (a.consumedAt !== undefined) return false;
@@ -844,6 +824,117 @@ export async function findReplayableGrant(
   // `list()` is newest-first by contract, but sort defensively rather than
   // trust the ordering of a store a caller injected.
   return [...matches].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
+}
+
+/**
+ * 0.7.1 — the gate's record of where a call lands: every path it read for
+ * the call and where each one landed, and whether each lands where it reads
+ * on its face (`placeRecordingCanonicalizer`).
+ */
+export type CallPlaces = {
+  readonly places: () => ReadonlyArray<ApprovalPlace>;
+  readonly allAsWritten: () => boolean;
+};
+
+/**
+ * 0.7.1 — does the decision on `record` cover a call that now lands at
+ * `call`?
+ *
+ * An operator approves a call where it acts. The record is keyed on the
+ * input, and the same input can be made to act somewhere else: retarget a
+ * symlinked directory between park and resume — any allowed call in the
+ * resumed turn can — and a grant for `pub/link/x.md` would write wherever
+ * the link now points, a place the operator never saw and one an
+ * `alwaysAsk` rule may name. So the record carries the places the gate
+ * found when it parked, and decides the call only while it lands there.
+ *
+ * A record written before approvals were bound (no `places`: 0.7.0, or an
+ * earlier 0.7.1 build) showed its approver only the input as written, so
+ * the one place it can be said to cover is the one that input names on its
+ * face. It decides the call when every path lands exactly there — no
+ * symlink followed, nothing elsewhere — and otherwise the call is asked
+ * again: never run somewhere the approver could not have seen. A record
+ * whose `places` is not the shape written here (a foreign or hand-edited
+ * line) covers nothing.
+ *
+ * Binding is about where a call RUNS, so the gate asks this of a grant or a
+ * park it would re-use; a deny refuses the call wherever it lands.
+ */
+export function landsWhereApproved(
+  record: Pick<PendingApproval, "places">,
+  call: CallPlaces,
+): boolean {
+  const recorded: unknown = record.places;
+  if (recorded === undefined) return call.allAsWritten();
+  if (!Array.isArray(recorded)) return false;
+  const fresh = call.places();
+  if (recorded.length !== fresh.length) return false;
+  return fresh.every((now, i) => {
+    const then: unknown = recorded[i];
+    if (typeof then !== "object" || then === null) return false;
+    const { path: thenPath, at: thenAt } = then as { path?: unknown; at?: unknown };
+    return (
+      thenPath === now.path &&
+      Array.isArray(thenAt) &&
+      thenAt.length === now.at.length &&
+      now.at.every((place, j) => thenAt[j] === place)
+    );
+  });
+}
+
+/**
+ * 0.7.1 — the newest record for this call that was made where it now lands:
+ * same tool and input (`keys`), not yet spent, and covering its places. The
+ * store's `get` hands back only the newest record for the input; when that
+ * one was made for another place, an older one may still be this place's —
+ * a grant the operator made before a link moved away and back, or a park
+ * already waiting. `list` is optional on an injected store; without it (or
+ * when it fails) there is nothing more to find, and the call parks.
+ */
+async function findApprovalForPlace(
+  store: Pick<PendingApprovalStore, "persist" | "get" | "resolve"> &
+    Partial<Pick<PendingApprovalStore, "list">>,
+  keys: ReadonlyArray<readonly [toolName: string, inputHash: string]>,
+  call: CallPlaces,
+): Promise<PendingApproval | null> {
+  if (typeof store.list !== "function") return null;
+  let all: readonly PendingApproval[];
+  try {
+    all = await store.list();
+  } catch {
+    return null;
+  }
+  // Newest-touched first, as `get` chooses.
+  const touched = (a: PendingApproval): number => {
+    const at = Date.parse(a.decidedAt ?? a.createdAt);
+    return Number.isFinite(at) ? at : 0;
+  };
+  const matches = all.filter(
+    (a) =>
+      keys.some(([toolName, inputHash]) => a.toolName === toolName && a.inputHash === inputHash) &&
+      a.consumedAt === undefined &&
+      landsWhereApproved(a, call),
+  );
+  return [...matches].sort((a, b) => touched(b) - touched(a))[0] ?? null;
+}
+
+/** What a park asked in place of `record` keeps of it, for the card. */
+function supersededBy(record: PendingApproval): SupersededApproval {
+  return {
+    id: record.id,
+    ...(record.decision !== undefined ? { decision: record.decision } : {}),
+    ...(Array.isArray(record.places) ? { places: record.places } : {}),
+  };
+}
+
+/** Where a call lands, for an operator reading why it was asked again. */
+function describePlaces(places: ReadonlyArray<ApprovalPlace> | undefined): string {
+  if (places === undefined) return "the input as written";
+  if (!Array.isArray(places)) return "an unreadable record";
+  if (places.length === 0) return "no path";
+  return places
+    .map((p) => `${p.path} -> ${Array.isArray(p.at) ? p.at.join(" and ") : "?"}`)
+    .join("; ");
 }
 
 // Ops item 31 — alert watchdog seams re-exported so the CLI/codegen can build
@@ -1539,10 +1630,11 @@ export type RunChatLoopOptions = {
    * Only `tools` are the chat loop's to bind: they are APPENDED to `opts.tools`
    * and advertised to the model, with first-party tools winning any name
    * collision (a plugin can augment the catalog but not silently shadow a
-   * built-in). The other contribution kinds bind at their own hosts — channels
-   * at the channel daemon, models at the model-router, graders at the eval
-   * stack, target emitters at the compiler — so they are deliberately not
-   * accepted here. A compiled bundle instead registers plugin tools directly on
+   * built-in). The other contribution kinds (channels, models, graders,
+   * target emitters) are bound by no host in this release —
+   * `activatePlugins` collects them and says at boot that they have no effect
+   * (plugin-loader's `UNBOUND_CONTRIBUTION_KINDS`) — so they are not accepted
+   * here. A compiled bundle instead registers plugin tools directly on
    * its `defaultCatalog`; this option is the interpreter path's equivalent so a
    * `runChatLoop` caller need not mutate a global catalog. Absent → the run is
    * byte-identical to a pre-G32 runtime.
@@ -2053,11 +2145,13 @@ export type RunChatLoopOptions = {
   /**
    * Pillar 3 sink-side — classify a tool sink as `"external-configured"` (a
    * spec-declared sink → warn on non-user content) or `"external-dynamic"` (a
-   * runtime-joined sink → block on non-user content). Defaults to treating
-   * `mcp__*` sinks as dynamic and everything else as configured (#144); wire
-   * this to mark federation-joined or other runtime-discovered sinks dynamic.
+   * runtime-joined sink → block on non-user content). Defaults to
+   * {@link defaultSinkScope}: `mcp__*` sinks and tools that send to a
+   * destination the model chooses are dynamic, everything else configured
+   * (#144); wire this to mark federation-joined or other runtime-discovered
+   * sinks dynamic. It receives the tool as well as its name.
    */
-  resolveSinkScope?: (toolName: string) => SinkScope;
+  resolveSinkScope?: (toolName: string, tool?: RegisteredTool) => SinkScope;
   /**
    * Hard cap on the number of model→tool cycles in a single turn. The loop
    * detector is advisory (it only injects a one-time warning and is defeated
@@ -2762,16 +2856,10 @@ export function resolveToolResultRoot(): string | undefined {
 }
 
 /**
- * Sinks whose DESTINATION is chosen at runtime by the (prompt-injectable)
- * model — a fetched/navigated URL, an on-chain recipient — are effectively
- * dynamic even though they are spec-declared built-in tools: an attacker who
- * steers the model picks where the data goes. So non-user cross-origin content
- * reaching them must reach the egress BLOCK tier, not merely warn. Fixed-
- * destination sinks are intentionally NOT here: `SendMessage` replies to the
- * operator-configured channel, `WebSearch`/`ImageGenerate` hit a fixed provider
- * API — classifying those dynamic would block legitimate replies, so they stay
- * `"external-configured"` (warn) and can be tightened per-deployment via the
- * `resolveSinkScope` override or the spec's egress policy.
+ * The names that were model-destination sinks before tools could say so
+ * themselves. They stay dynamic whatever a tool of that name declares, so
+ * the declaration can only add sinks to the block tier, never take one out
+ * (see {@link defaultSinkScope}).
  */
 const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
   "Fetch",
@@ -2781,17 +2869,78 @@ const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Default egress sink-scope. Runtime-joined MCP sinks (`mcp__*`) are the
- * canonical dynamically-discovered external sink, and the model-destination
- * built-ins above are dynamic by virtue of their model-chosen target — both
- * classify as `"external-dynamic"` so the egress block tier is reachable for
- * non-user-origin payloads (#144). Other spec-declared built-in sinks stay
- * `"external-configured"` (warn). Override via `runChatLoop({ resolveSinkScope })`
- * to mark federation-joined or other runtime sinks dynamic too.
+ * 0.7.1 — the tool-name fields of a `pre-tool` / `post-tool` hook payload.
+ * `name` is the registered name; an MCP tool also carries `legacyName`, the
+ * `<server>__<tool>` spelling it had before 0.7.1. A hook matcher accepts
+ * either spelling, but a script that reads `name` from its stdin and compares
+ * it cannot know about the rename, and a guard that stops matching is a
+ * guard that silently stops guarding — so it gets a stable field to compare.
  */
-export function defaultSinkScope(toolName: string): SinkScope {
+function hookToolName(name: string): { name: string; legacyName?: string } {
+  const legacyName = legacyMcpToolName(name);
+  return legacyName !== undefined ? { name, legacyName } : { name };
+}
+
+/**
+ * 0.7.1 — re-key a tool-name map (rate limits) written with the pre-0.7.1
+ * MCP spelling `<server>__<tool>` onto the registered `mcp__<server>__<tool>`
+ * name. A key that already names a tool, `"*"`, or an old spelling whose new
+ * name the map also carries is left alone. Returns the input by reference
+ * when nothing moved.
+ */
+export function rekeyLegacyMcpToolKeys<V>(
+  map: Readonly<Record<string, V>> | undefined,
+  toolNames: ReadonlySet<string>,
+): Readonly<Record<string, V>> | undefined {
+  if (map === undefined) return undefined;
+  const byLegacy = new Map<string, string>();
+  for (const name of toolNames) {
+    const legacy = legacyMcpToolName(name);
+    if (legacy !== undefined) byLegacy.set(legacy, name);
+  }
+  if (byLegacy.size === 0) return map;
+  let moved = false;
+  const out: Record<string, V> = {};
+  for (const [key, value] of Object.entries(map)) {
+    const registered = key === "*" || toolNames.has(key) ? undefined : byLegacy.get(key);
+    if (registered !== undefined && !Object.hasOwn(map, registered)) {
+      out[registered] = value;
+      moved = true;
+    } else {
+      out[key] = value;
+    }
+  }
+  return moved ? out : map;
+}
+
+/**
+ * Default egress sink-scope.
+ *
+ * A sink whose DESTINATION the (prompt-injectable) model chooses is dynamic
+ * even when the spec declares the tool: an attacker who steers the model
+ * picks where the data goes, so content from a non-user origin reaching it
+ * must reach the egress BLOCK tier, not merely warn (#144). Which tools those
+ * are is read from the tool itself: an external tool whose `operativeArgs`
+ * include a `url` or a `recipient` (`hasModelChosenDestination`) — Fetch,
+ * HttpRequest, HttpBatch, WebhookPost, EmailSend, OpenExternal, the RPC
+ * readers, … (permission-integration#5). Runtime-joined MCP sinks (`mcp__*`)
+ * are dynamic too.
+ *
+ * A fixed-destination sink stays `"external-configured"` (warn): `SendMessage`
+ * replies to the operator's channel, `WebSearch` and `ImageGenerate` call a
+ * fixed provider, a code host is reached at its configured origin. The
+ * names that were dynamic before tools declared their destinations (Fetch,
+ * WebFetch, Navigate, EvmSendTransaction) stay dynamic, so a caller that
+ * passes only a name gets the 0.7.0 answer. Override per deployment with
+ * `runChatLoop({ resolveSinkScope })`.
+ */
+export function defaultSinkScope(
+  toolName: string,
+  tool?: Pick<RegisteredTool, "scope" | "operativeArgs">,
+): SinkScope {
   if (toolName.startsWith("mcp__")) return "external-dynamic";
   if (MODEL_DESTINATION_SINKS.has(toolName)) return "external-dynamic";
+  if (tool !== undefined && hasModelChosenDestination(tool)) return "external-dynamic";
   return "external-configured";
 }
 
@@ -2823,6 +2972,32 @@ function bestEffortWireModelId(modelString: string): string {
   } catch {
     return modelString;
   }
+}
+
+/**
+ * 0.7.1 — every model string the run was configured with, for the bridge's
+ * `specModels` (the Task tool's allow-list for a `.crewhaus/sub-agents`
+ * definition's models). Exact strings, in first-seen order, no duplicates.
+ */
+export function specModelsOf(
+  opts: Pick<
+    RunChatLoopOptions,
+    "model" | "modelFallbacks" | "modelTiers" | "modelPool" | "compactionModel" | "budget"
+  >,
+): ReadonlyArray<string> {
+  const out = new Set<string>([opts.model]);
+  for (const m of opts.modelFallbacks ?? []) out.add(m);
+  if (opts.modelTiers !== undefined) {
+    out.add(opts.modelTiers.fast);
+    out.add(opts.modelTiers.default);
+  }
+  for (const c of opts.modelPool?.candidates ?? []) {
+    out.add(c.model);
+    for (const m of c.fallbacks ?? []) out.add(m);
+  }
+  if (opts.compactionModel !== undefined) out.add(opts.compactionModel);
+  if (opts.budget?.onExceed.kind === "degrade") out.add(opts.budget.onExceed.model);
+  return [...out];
 }
 
 /**
@@ -3069,25 +3244,52 @@ export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureR
 }
 
 /**
+ * provider-limits#0 — act on a boot tool-limit verdict: no model can take the
+ * run's tools → a `ConfigError` before any model call; some model cannot →
+ * one `[tools]` line per model on stderr, beside the `[failover]` and
+ * `[model_pool]` boot lines. A daemon runs one loop per message, so each
+ * line is written once per process (`unreportedToolLimitLines`).
+ */
+function reportToolLimits(verdict: ToolLimitVerdict): void {
+  if (verdict.fatal !== undefined) throw new ConfigError(verdict.fatal);
+  for (const line of unreportedToolLimitLines(verdict.warnings)) {
+    process.stderr.write(`[tools] ${line}\n`);
+  }
+}
+
+/**
  * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
  * set. First-party `base` tools WIN any name collision, so an activated plugin
- * can augment the catalog but never silently shadow a built-in. Returns the
- * `base` array unchanged (same reference) when there are no plugin tools, so a
- * run without the `plugins` option is byte-identical to a pre-G32 runtime.
+ * can augment the catalog but never silently shadow a built-in; nor can it
+ * take a name in `reserved` — the tools the loop adds itself (`ListTools`,
+ * and `Consult` / `Escalate`), which would otherwise give way to it. Returns
+ * the `base` array unchanged (same reference) when there are no plugin tools,
+ * so a run without the `plugins` option is byte-identical to a pre-G32
+ * runtime.
  */
 function mergeEffectiveTools(
   base: ReadonlyArray<RegisteredTool>,
   pluginTools: ReadonlyArray<RegisteredTool> | undefined,
+  reserved: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<RegisteredTool> {
   if (pluginTools === undefined || pluginTools.length === 0) return base;
   const byName = new Set(base.map((t) => t.name));
   const merged: RegisteredTool[] = [...base];
   for (const tool of pluginTools) {
-    if (byName.has(tool.name)) continue; // first-party wins the collision
+    if (byName.has(tool.name) || reserved.has(tool.name)) continue; // first-party wins
     byName.add(tool.name);
     merged.push(tool);
   }
   return merged;
+}
+
+/**
+ * Does `limits` set a limit for `toolName` itself? Own keys only: a tool may
+ * be named after an Object.prototype member (`toString`, `constructor`),
+ * which a plain `rate_limits` object inherits but never sets.
+ */
+function ownLimit(limits: Readonly<Record<string, unknown>>, toolName: string): boolean {
+  return Object.hasOwn(limits, toolName) && limits[toolName] !== undefined;
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
@@ -3097,7 +3299,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // 0.6.0 — then the hybrid-strategy tools (`Consult` / `Escalate`) the
   // composition root registered, same first-party-wins posture.
   const mergedTools = mergeEffectiveTools(
-    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools),
+    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools, new Set(LOOP_TOOL_NAMES)),
     opts.hybridTools,
   );
   // #405 — the runtime's own toolset-introspection tool rides every
@@ -3206,6 +3408,48 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     throw new ConfigError(
       `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
     );
+  }
+  // provider-limits#0 — the same fail-early rule for the tool COUNT: OpenAI
+  // (and Azure OpenAI, Groq) refuse more than 128 tools on one request,
+  // Gemini more than 512, and they refuse every request of the run. The list
+  // is final here (builtins, loop tools, MCP, plugin and hybrid tools), so
+  // this is the check `--model` overrides and MCP servers cannot slip past.
+  // A pool is checked per candidate below, once each candidate's subset is
+  // known.
+  if (opts.modelPool === undefined) {
+    const count = effectiveTools.length;
+    const serving: ServingModel[] =
+      opts.modelTiers !== undefined
+        ? (["fast", "default"] as const).map((tier) => {
+            const model = (opts.modelTiers as NonNullable<typeof opts.modelTiers>)[tier];
+            return {
+              model,
+              toolCount: count,
+              role: "serves",
+              label: `model_tiers.${tier} "${model}"`,
+              whenOver: `the run starts, and every turn routed to the ${tier} tier fails`,
+            } satisfies ServingModel;
+          })
+        : [opts.model, ...modelFallbacks].map(
+            (model, i) =>
+              ({
+                model,
+                toolCount: count,
+                role: "serves",
+                label: i === 0 ? `model "${model}"` : `model_fallbacks[${i - 1}] "${model}"`,
+                whenOver: "the run starts because another model in the chain can serve",
+              }) satisfies ServingModel,
+          );
+    if (opts.budget?.onExceed.kind === "degrade") {
+      serving.push({
+        model: opts.budget.onExceed.model,
+        toolCount: count,
+        role: "degrade",
+        label: `budget degrade model "${opts.budget.onExceed.model}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving, process.env));
   }
   let compactionAdapter: ProviderAdapter;
   let compactionWireModelId: string;
@@ -4324,6 +4568,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
   const armIdOf = (candidate: PoolCandidate): string =>
     poolCandidateConfigs.get(candidate)?.profile ?? candidate.modelString;
+  // provider-limits#0 — each pool candidate against its provider's
+  // per-request tool limit, counted on the subset IT is advertised. One over
+  // its limit is left out of routing (the `tool-limit` eligibility exclusion
+  // in preRoute); a pool none of whose candidates can accept its tools
+  // cannot make one call, and stops here.
+  if (poolRouter !== undefined) {
+    const serving: ServingModel[] = [];
+    for (const [candidate, ad] of candidateAdvertisements) {
+      serving.push({
+        model: candidate.modelString,
+        toolCount: ad.names.size,
+        role: "serves",
+        label: `model_pool candidate "${armIdOf(candidate)}"`,
+        whenOver: "routing leaves it out",
+      });
+    }
+    if (budgetDegradeRung !== undefined && !candidateAdvertisements.has(budgetDegradeRung)) {
+      serving.push({
+        model: budgetDegradeRung.modelString,
+        toolCount: effectiveTools.length,
+        role: "degrade",
+        label: `budget degrade model "${budgetDegradeRung.modelString}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving, process.env));
+  }
   {
     const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
     const prior = resumedToolNames === undefined ? undefined : [...resumedToolNames].sort();
@@ -4807,6 +5078,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const bridgeContinuitySeam =
     opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+  // 0.7.1 — the models this run may name, so a sub-agent read from disk can
+  // run on the parent's fallback or tier model, and on nothing unnamed.
+  const bridgeSpecModels = specModelsOf(opts);
   // M3.1 — auto-load project memory files (AGENTS.md / CLAUDE.md /
   // CODE-COMPANION.md / AGENT.md) from cwd at session start. Follows the
   // vendor-neutral agents.md convention; compatible with Claude Code's
@@ -5033,7 +5307,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // gates the acquire call site: tools outside the map (no named entry, no
   // `"*"`) are not rate-gated at all — the limiter itself is fail-closed on
   // unknown keys, so the guard is what keeps unlisted tools ungated.
-  const rateLimitEntries = Object.entries(opts.rateLimits ?? {});
+  // 0.7.1 — MCP tools are registered as `mcp__<server>__<tool>`; a limit a
+  // spec wrote against the old `<server>__<tool>` spelling is re-keyed onto
+  // the registered name so it keeps applying.
+  const toolNamesAtStart: ReadonlySet<string> = new Set(tools.map((t) => t.name));
+  const runRateLimits = rekeyLegacyMcpToolKeys(opts.rateLimits, toolNamesAtStart);
+  const rateLimitEntries = Object.entries(runRateLimits ?? {});
   let toolRateLimiter: RateLimiter | undefined;
   if (rateLimitEntries.length > 0) {
     const buckets = new Map<string, BucketConfig>();
@@ -5047,8 +5326,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     toolRateLimiter = createRateLimiter({ buckets });
   }
   const hasToolRateBucket = (toolName: string): boolean =>
-    opts.rateLimits !== undefined &&
-    (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
+    runRateLimits !== undefined &&
+    (ownLimit(runRateLimits, toolName) || ownLimit(runRateLimits, "*"));
 
   // -------------------------------------------------------------------------
   // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
@@ -5106,7 +5385,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         };
     const deny = cfg?.permissions?.deny ?? [];
     const ask = cfg?.permissions?.ask ?? [];
-    const rateEntries = Object.entries(cfg?.rateLimits ?? {}) as ReadonlyArray<
+    const planRateLimits = rekeyLegacyMcpToolKeys(cfg?.rateLimits, toolNamesAtStart);
+    const rateEntries = Object.entries(planRateLimits ?? {}) as ReadonlyArray<
       readonly [string, { readonly rpm: number; readonly burst?: number }]
     >;
     const armId = fromPool ? (cfg.profile ?? cfg.model) : (candidate?.modelString ?? opts.model);
@@ -5125,7 +5405,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
       planLimiter = createRateLimiter({ buckets });
     }
-    const planRateLimits = cfg?.rateLimits;
     const names = new Set(planAdvertised.map(({ tool }) => tool.name));
     return {
       armId,
@@ -5154,8 +5433,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(planLimiter !== undefined ? { toolRateLimiter: planLimiter } : {}),
       hasToolRateBucket: (toolName: string): boolean =>
         planRateLimits !== undefined &&
-        (planRateLimits[toolName] !== undefined || planRateLimits["*"] !== undefined),
-      ...(cfg?.toolConfigs !== undefined ? { toolConfigs: cfg.toolConfigs } : {}),
+        (ownLimit(planRateLimits, toolName) || ownLimit(planRateLimits, "*")),
+      // `$VAR` values in a candidate's tool_config are read from the
+      // environment here, when the loop starts, as the boot registrations
+      // read theirs — never compiled into the bundle. An unset one fails
+      // the start and names the variable.
+      ...(cfg?.toolConfigs !== undefined
+        ? {
+            toolConfigs: resolveToolConfigEnv(
+              cfg.toolConfigs,
+              `model_pool candidate ${cfg.profile ?? candidate?.modelString ?? opts.model} tool_config`,
+              process.env,
+            ).value as Readonly<Record<string, unknown>>,
+          }
+        : {}),
       ...(cfg?.overlay !== undefined
         ? { overlayBlock: { type: "text" as const, text: cfg.overlay } }
         : {}),
@@ -5645,7 +5936,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // the prior turn in some streaming scenarios).
       const post = await fireHook("post-tool", {
         id: tu.id,
-        name: tu.name,
+        ...hookToolName(tu.name),
         isError: result.is_error === true,
       });
       if (!post.allowed) {
@@ -5686,7 +5977,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
     // Section 11 — pre-tool hook: short-circuit with the hook's reason
     // when any matching hook returns deny/block.
-    const preHook = await fireHook("pre-tool", { id: tu.id, name: tu.name, input: tu.input });
+    const preHook = await fireHook("pre-tool", {
+      id: tu.id,
+      ...hookToolName(tu.name),
+      input: tu.input,
+    });
     if (!preHook.allowed) {
       return finish({
         type: "tool_result",
@@ -5704,6 +5999,45 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `justificationInjectedTools` comment at loop start for the full split.
     let operativeInput = operativeToolInput(tu.name, tu.input);
 
+    // 0.7.1 — rules are checked against the call the tool will RUN: the
+    // input parsed by the tool's own schema (unknown keys stripped, defaults
+    // filled in) and the tool's declared operative values canonicalised
+    // (paths resolved against the workspace, URLs parsed). Matching the raw
+    // input let a decoy key, an extra argument, an omitted default, a `..` or
+    // a symlinked directory walk past a rule. An input the schema rejects
+    // could not run anyway, so it is denied here with the schema's message,
+    // before any approval is asked for. Paths are resolved against the
+    // current working directory, the root every workspace tool resolves
+    // against when it runs.
+    //
+    // The canonicaliser also keeps a record of every path it read and where
+    // each one landed: a headless approval is bound to it (see
+    // `landsWhereApproved`).
+    //
+    // The tool's `tool_config` block on the serving candidate is the one it
+    // will run with: a code host reads from it which API a call that names
+    // none goes to, so a rule written on that host meets the call.
+    const gateView = placeRecordingCanonicalizer();
+    const gateToolConfig = toolConfigFor(servingPlan.toolConfigs, tu.name);
+    const subject = preparePermissionSubject(tool, operativeInput, {
+      canonicalizePath: gateView.canonicalizePath,
+      readProgramPath: gateView.readProgramPath,
+      ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
+    });
+    if (!subject.ok) {
+      // Not a permission decision: no rule was consulted, and the call fails
+      // the way a malformed call always has — an `is_error` tool result, with
+      // `tool_call_end` recording it. Publishing it as a `permission_decision`
+      // deny would count every malformed call as a policy denial (eval
+      // safety_violations, the deny alerts and SLOs).
+      return finish({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: subject.reason,
+        is_error: true,
+      });
+    }
+
     // 0.6.0 §4.4 — the SERVING candidate's rule set: the run's rules narrowed
     // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
     // (a decision-level meet — a profile can only tighten). The primary plan
@@ -5711,7 +6045,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
-        input: operativeInput,
+        input: subject.input,
+        ...(subject.operativeValues !== undefined
+          ? { operativeValues: subject.operativeValues }
+          : {}),
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
@@ -5749,6 +6086,39 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // below so the approving operator SEES the justification.
         const inputHash = hashApprovalInput(tu.name, operativeInput);
         let existing = await approvals.store.get(tu.name, inputHash);
+        // 0.7.1 — an approval parked before MCP tools were renamed is keyed on
+        // the old `<server>__<tool>` spelling, and the operator may already
+        // have granted it. Honour it (or re-use it while still pending)
+        // rather than parking the same call again under a new id.
+        const legacyToolName = legacyMcpToolName(tu.name);
+        const approvalKeys: Array<readonly [string, string]> = [[tu.name, inputHash]];
+        if (legacyToolName !== undefined) {
+          approvalKeys.push([legacyToolName, hashApprovalInput(legacyToolName, operativeInput)]);
+        }
+        if (existing === null && legacyToolName !== undefined) {
+          existing = await approvals.store.get(
+            legacyToolName,
+            hashApprovalInput(legacyToolName, operativeInput),
+          );
+        }
+        // 0.7.1 — A GRANT COVERS THE PLACE IT WAS MADE FOR. The record is
+        // keyed on the input, but a symlink moved since the park (by any
+        // allowed call in the resumed turn) sends the same input somewhere
+        // else. A grant, or a park to re-use, made where the call no longer
+        // lands decides nothing here, and the newest record made where it
+        // does land, if any, takes its place; otherwise the call is asked
+        // again below. A DENY is honoured wherever the call lands: it can
+        // only refuse, so asking again would add a prompt (and a chance of a
+        // mistaken grant) for an action the operator already turned down.
+        let movedFrom: PendingApproval | undefined;
+        if (
+          existing !== null &&
+          existing.decision !== "deny" &&
+          !landsWhereApproved(existing, gateView)
+        ) {
+          movedFrom = existing;
+          existing = await findApprovalForPlace(approvals.store, approvalKeys, gateView);
+        }
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
         //
         // A grant is keyed on whole-input equality, which silently assumes the
@@ -5771,6 +6141,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // card, and that action is what executes. Honouring the grant for the
         // regenerated input instead would let a re-worded `place_call` dial a
         // different number under an approval for the first.
+        let replaySubject: ReturnType<typeof preparePermissionSubject> | undefined;
         if (existing === null) {
           const replay = await findReplayableGrant(approvals.store, {
             toolName: tu.name,
@@ -5784,10 +6155,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // calls both find the same unconsumed grant and both execute. The
           // set is per-run and in-process, which is where that race is;
           // across processes the store's `consumedAt` remains the authority.
+          //
+          // 0.7.1 — and bound like the exact match: the APPROVED input must
+          // still land where it did when the operator approved it. Read here,
+          // once, and re-checked against policy below from this same reading.
           if (replay !== undefined && !replayedApprovalIds.has(replay.id)) {
-            replayedApprovalIds.add(replay.id);
-            replayedFrom = replay;
-            existing = replay;
+            const replayView = placeRecordingCanonicalizer();
+            const subjectOfReplay = preparePermissionSubject(
+              tool,
+              operativeToolInput(tu.name, replay.input),
+              {
+                canonicalizePath: replayView.canonicalizePath,
+                readProgramPath: replayView.readProgramPath,
+                ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
+              },
+            );
+            // An approved input that no longer parses is denied by the
+            // re-check below, as before; it has no place to compare.
+            if (!subjectOfReplay.ok || landsWhereApproved(replay, replayView)) {
+              replayedApprovalIds.add(replay.id);
+              replayedFrom = replay;
+              replaySubject = subjectOfReplay;
+              existing = replay;
+            } else {
+              movedFrom ??= replay;
+            }
           }
         }
         if (existing?.decision === "grant") {
@@ -5814,18 +6206,34 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // §10.1 — approval replay across candidates uses the SERVING
             // candidate's rule set: a grant parked while the strong arm
             // served does not run under a narrower arm's denies.
-            const recheck = evaluateWithReason(
-              {
-                toolName: tu.name,
-                input: approvedOperative,
-                readOnly: tool.readOnly,
-                destructive: tool.destructive,
-                requiresSandbox: tool.requiresSandbox,
-              },
-              permissionMode,
-              servingPlan.permissionRules,
-              { sandboxAvailable: opts.sandboxAvailable === true },
-            );
+            // 0.7.1 — the recheck, like the first check, reads the PARSED
+            // approved input and its canonical operative values; an approved
+            // input that no longer parses is a denial, never a run.
+            const approvedView = placeRecordingCanonicalizer();
+            const approvedSubject =
+              replaySubject ??
+              preparePermissionSubject(tool, approvedOperative, {
+                canonicalizePath: approvedView.canonicalizePath,
+                readProgramPath: approvedView.readProgramPath,
+                ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
+              });
+            const recheck = approvedSubject.ok
+              ? evaluateWithReason(
+                  {
+                    toolName: tu.name,
+                    input: approvedSubject.input,
+                    ...(approvedSubject.operativeValues !== undefined
+                      ? { operativeValues: approvedSubject.operativeValues }
+                      : {}),
+                    readOnly: tool.readOnly,
+                    destructive: tool.destructive,
+                    requiresSandbox: tool.requiresSandbox,
+                  },
+                  permissionMode,
+                  servingPlan.permissionRules,
+                  { sandboxAvailable: opts.sandboxAvailable === true },
+                )
+              : { decision: "deny" as const, reason: approvedSubject.reason };
             if (recheck.decision === "deny") {
               approved = false;
               denialMessage =
@@ -5842,7 +6250,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // actually RUN, so re-fire it against the substituted input.
               const replayHook = await fireHook("pre-tool", {
                 id: tu.id,
-                name: tu.name,
+                ...hookToolName(tu.name),
                 input: tu.input,
               });
               if (!replayHook.allowed) {
@@ -5908,6 +6316,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             toolName: tu.name,
             inputHash,
             input: tu.input,
+            // 0.7.1 — what this park covers: where the call lands now, and
+            // the approval it asks in place of, so a card can say both.
+            places: gateView.places(),
+            ...(movedFrom !== undefined ? { supersedes: supersededBy(movedFrom) } : {}),
             runId: bus.runId,
             sessionId,
             surface: approvalSurface,
@@ -5933,11 +6345,22 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             approvalId: pending.id,
             toolName: tu.name,
             surface: approvalSurface,
+            ...(movedFrom !== undefined ? { supersedes: movedFrom.id } : {}),
           });
+          // Asked again because the call moved: say where it was approved
+          // and where it lands now, so the operator decides on the new place.
+          const moved =
+            movedFrom === undefined
+              ? ""
+              : `; approval ${movedFrom.id} was ${
+                  movedFrom.decision === "grant" ? "granted" : "requested"
+                } for ${describePlaces(movedFrom.places)}, and the call now lands at ${describePlaces(
+                  gateView.places(),
+                )}, so it is asked again`;
           throw new RunFailedError({
             class: "approval_pending",
             title: "awaiting tool approval",
-            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface}); the run is parked as approval ${pending.id}`,
+            detail: `\`${tu.name}\` requires approval on a non-interactive surface (${approvalSurface})${moved}; the run is parked as approval ${pending.id}`,
             remediation: `grant or deny approval ${pending.id} out of band (e.g. \`crewhaus approvals grant ${pending.id}\`; add \`--always\` to allow \`${tu.name}\` from now on), then rerun`,
             exitCode: EXIT_CODES.approval_pending,
           });
@@ -6071,15 +6494,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // we deny the call before it fires. `warn` logs but proceeds.
     //
     // Resolve the sink-scope so the egress block tier is actually reachable
-    // (#144): runtime-joined MCP sinks default to `"external-dynamic"` (block
-    // non-user-origin content), while spec-declared sinks stay
-    // `"external-configured"` (warn). Callers can override via
-    // `opts.resolveSinkScope` to mark federation-joined or other dynamic sinks.
+    // (#144): runtime-joined MCP sinks and tools that send to a destination
+    // the model chose default to `"external-dynamic"` (block non-user-origin
+    // content); other spec-declared sinks stay `"external-configured"`
+    // (warn). Callers can override via `opts.resolveSinkScope`.
     if (tool.scope === "external") {
       // (#386) — scan the OPERATIVE payload: for injected-justification
       // tools this is what `executeTool` actually transmits to the sink.
       const payload = JSON.stringify(operativeInput ?? null);
-      const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name);
+      const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name, tool);
       const egress = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
         sinkScope,
@@ -6262,6 +6685,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // `"pause"` default — identical resolution, no double-defaulting.
       ...(opts.askMode !== undefined ? { askMode: opts.askMode } : {}),
       ...(opts.approvals !== undefined ? { approvals: opts.approvals } : {}),
+      // 0.7.1 — a Task child runs against this process's sandbox backend, so
+      // it passes the sandbox floor exactly when this loop does.
+      ...(opts.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),
+      // 0.7.1 — and judges a justification-gated call with this loop's judge,
+      // writing its verdicts and egress warnings to this loop's audit log.
+      ...(opts.justificationJudge !== undefined
+        ? { justificationJudge: opts.justificationJudge }
+        : {}),
+      ...(opts.justificationAuditSink !== undefined
+        ? { justificationAuditSink: opts.justificationAuditSink }
+        : {}),
+      ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
+      specModels: bridgeSpecModels,
     };
     // Spin "running <tool>…" for exactly the execution window — started after
     // every gate (permission/justification/egress) so it never overlaps the
@@ -6322,10 +6758,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       },
     );
     if (stored.persisted) {
-      runContext.logger.info("tool result persisted", {
+      // A retried call whose bytes were already on disk wrote nothing.
+      runContext.logger.info(
+        stored.reused === true ? "tool result already persisted" : "tool result persisted",
+        { toolUseId: tu.id, toolName: tu.name, fullPath: stored.fullPath },
+      );
+    } else if (stored.unsaved !== undefined) {
+      runContext.logger.warn("tool result could not be persisted; the model sees the preview", {
         toolUseId: tu.id,
         toolName: tu.name,
-        fullPath: stored.fullPath,
+        reason: stored.unsaved,
       });
     }
     // Section 18 — post-tool prompt-injection classifier. Runs after the
@@ -6485,10 +6927,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   /**
-   * Run a list of tool calls honouring the orchestrator's partition:
-   * concurrent-safe batches via `Promise.all`, then serial calls one at
-   * a time. Results are returned in the original `toolUses` order so
-   * they line up with the assistant turn's tool_use blocks.
+   * Run a list of tool calls honouring the orchestrator's partition, group
+   * by group in the order the model issued them: a run of concurrency-safe
+   * calls in parallel (up to `maxConcurrentTools`), every other call alone.
+   * A read issued after a write therefore sees the write. Results are
+   * returned in the original `toolUses` order so they line up with the
+   * assistant turn's tool_use blocks.
    */
   async function runToolBatch(
     toolUses: ReadonlyArray<TsmToolUseBlock>,
@@ -6504,31 +6948,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ]);
     const maxConcurrentTools = opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS;
     runContext.logger.debug("tool partition", {
-      concurrent: partition.concurrent.map((b) => b.length),
-      serial: partition.serial.length,
+      // In order: a number is a concurrent group of that many calls, "S" one
+      // serial call.
+      groups: partition.groups.map((g) => (g.kind === "serial" ? "S" : g.calls.length)),
       maxConcurrentTools,
     });
     // Map each tool_use's identity to its slot in the original order so
     // results can be placed back in order regardless of the
     // concurrent/serial execution shape. `partitionToolCalls` is total —
-    // every input block lands in exactly one partition bucket — and
+    // every input block lands in exactly one group — and
     // `executeOneToolUse` always resolves to a result, so every slot is
     // filled; there is no missing-result case to defend against.
     const indexByBlock = new Map<TsmToolUseBlock, number>();
     toolUses.forEach((tu, idx) => indexByBlock.set(tu, idx));
     const results = new Array<Anthropic.ToolResultBlockParam>(toolUses.length);
-    for (const batch of partition.concurrent) {
-      const settled = await mapWithConcurrency(batch, maxConcurrentTools, (tu) =>
+    for (const group of partition.groups) {
+      if (group.kind === "serial") {
+        // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
+        results[indexByBlock.get(group.call)!] = await executeOneToolUse(group.call);
+        continue;
+      }
+      const settled = await mapWithConcurrency(group.calls, maxConcurrentTools, (tu) =>
         executeOneToolUse(tu),
       );
-      batch.forEach((tu, i) => {
+      group.calls.forEach((tu, i) => {
         // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
         results[indexByBlock.get(tu)!] = settled[i] as Anthropic.ToolResultBlockParam;
       });
-    }
-    for (const tu of partition.serial) {
-      // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
-      results[indexByBlock.get(tu)!] = await executeOneToolUse(tu);
     }
     return results;
   }
@@ -7301,11 +7747,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 const maxOutputTokens =
                   cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
                 const breakerState = c.breaker?.state();
+                const toolLimit = providerToolLimit(c.modelString, process.env);
                 return {
                   armId: armIdOf(c),
                   modelString: c.modelString,
                   tags: c.tags,
                   ...(breakerState !== undefined ? { breakerState } : {}),
+                  ...(toolLimit !== undefined
+                    ? {
+                        toolLimit: {
+                          toolCount: plan.advertisedNames.size,
+                          maxTools: toolLimit.maxTools,
+                        },
+                      }
+                    : {}),
                   capabilities: {
                     features: plan.features,
                     ...(contextWindow !== undefined ? { contextWindow } : {}),

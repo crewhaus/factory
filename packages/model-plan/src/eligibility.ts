@@ -31,6 +31,13 @@ export type EligibilityCandidate = {
   readonly spentUsdMicros?: number;
   /** Price scalar for the cheapest-eligible tie-break (blended $/1M); unknown ⇒ ranked after known. */
   readonly blendedPer1M?: number;
+  /**
+   * provider-limits#0 — the tools this candidate is advertised, against the
+   * most its provider accepts on one request (OpenAI 128, Gemini 512).
+   * Absent when the route has no known limit. Over it, every call to the
+   * candidate is refused, so it is ineligible on every turn.
+   */
+  readonly toolLimit?: { readonly toolCount: number; readonly maxTools: number };
 };
 
 /** What THIS turn needs from whichever candidate serves it. */
@@ -48,6 +55,7 @@ export type EligibilityExclusionReason =
   | "disabled"
   | "breaker-open"
   | "cost-cap-spent"
+  | "tool-limit"
   | "no-adapter-features"
   | `requires:${string}`
   | `self-requires:${string}`
@@ -94,6 +102,9 @@ function exclusionReason(
   headroom: number,
 ): EligibilityExclusionReason | undefined {
   if (c.enabled === false) return "disabled";
+  if (c.toolLimit !== undefined && c.toolLimit.toolCount > c.toolLimit.maxTools) {
+    return "tool-limit";
+  }
   if (c.breakerState === "open") return "breaker-open";
   if (
     c.costCapUsdMicros !== undefined &&

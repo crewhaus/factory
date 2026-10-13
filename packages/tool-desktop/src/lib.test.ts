@@ -27,6 +27,7 @@ import {
   OSASCRIPT_NO_ACCESSIBILITY_STDERR,
   OSASCRIPT_NO_AUTOMATION_STDERR,
   WINDOWS_PRESENCE_STDOUT,
+  WINDOWS_PRINTER_LIST_STDOUT,
   WMCTRL_STDOUT,
   XCLIP_EMPTY_SELECTION_STDERR,
   XCLIP_NO_DISPLAY_STDERR,
@@ -48,16 +49,23 @@ import {
 } from "./lib/escape";
 import { buildToastXml, classifyNotify } from "./lib/notify";
 import { classifyTarget, uriScheme } from "./lib/open";
-import { boundedSeconds, classifyLiveness } from "./lib/power";
 import {
+  boundedSeconds,
+  classifyLiveness,
+  holderMarker,
+  isHolderCommand,
+  planHold,
+} from "./lib/power";
+import {
+  WINDOWS_PRESENCE,
   parseIoregIdleSeconds,
   parseIoregLocked,
   parseLoginctl,
   parseWindowsPresence,
   parseXprintidleSeconds,
 } from "./lib/presence";
-import { classifyPrint, parseJobId, parseQueues } from "./lib/print";
-import { parseWmctrl } from "./lib/windows";
+import { classifyPrint, parseJobId, parseQueues, parseWindowsQueues } from "./lib/print";
+import { parseDelimitedWindows, parseWmctrl, planWindowList } from "./lib/windows";
 import { assertArgv } from "./run";
 
 const FAILED = { code: 1, stdout: "", stderr: "", timedOut: false, missing: false };
@@ -223,6 +231,17 @@ test("the two xclip failures that look identical are told apart by stderr", () =
   expect(noDisplay.outcome).toBe("unavailable");
   expect(empty.outcome).toBe("empty");
   expect(read.outcome).toBe("read");
+});
+
+test("a read whose output could not be drained, with nothing arrived, is unknown, not empty", () => {
+  // Exit 0 and no bytes reads as an empty clipboard; when the pipe was still
+  // held open at the drain grace, nothing arriving proves nothing.
+  const held = classifyClipboardRead({ ...FAILED, code: 0, stdout: "", outputIncomplete: true });
+  expect(held.outcome).toBe("unavailable");
+  expect(JSON.stringify(held)).toContain("could not be read to its end");
+  // What did arrive is still read (the tool marks it truncated).
+  const some = classifyClipboardRead({ ...FAILED, code: 0, stdout: "abc", outputIncomplete: true });
+  expect(some).toEqual({ outcome: "read", text: "abc" });
 });
 
 test("the macOS flavour probe tells an empty pasteboard from an image on it", () => {
@@ -442,4 +461,108 @@ test("liveness keeps four answers apart, so a reused pid is never signalled", ()
   expect(classifyLiveness("caffeinate", probe({ timedOut: true }))).toBe("unknown");
   expect(classifyLiveness("caffeinate", probe({ missing: true }))).toBe("unknown");
   expect(classifyLiveness("caffeinate", probe({ refused: true }))).toBe("unknown");
+});
+
+test("the holder the identity check expects is the holder planHold starts", () => {
+  // security-10#1: one source for both. The check used to read the marker
+  // from the state record, which also supplies the pid.
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    const plan = planHold(platform, "system", 60, null);
+    if (!plan.ok) throw new Error(`no plan for ${platform}`);
+    expect(holderMarker(platform)).toBe(plan.marker);
+    // What planHold starts passes the check on its own platform...
+    const line =
+      platform === "win32"
+        ? `"C:\\Windows\\powershell.exe" -NoProfile -Command "${plan.request.argv.at(-1) ?? ""}"`
+        : plan.request.argv.join(" ");
+    expect(isHolderCommand(platform, line)).toBe(true);
+  }
+  expect(holderMarker("unsupported")).toBeUndefined();
+  // ...and a same-program process this package did not start does not.
+  expect(isHolderCommand("darwin", "caffeinate -d")).toBe(false);
+  expect(isHolderCommand("darwin", "/usr/bin/caffeinate -i -m -t 1800")).toBe(true);
+  expect(isHolderCommand("linux", "systemd-inhibit --what=sleep sleep 60")).toBe(false);
+  expect(isHolderCommand("linux", "systemd-inhibit --who=crewhaus --mode=block sleep 60")).toBe(
+    true,
+  );
+  expect(isHolderCommand("darwin", "sleep 300")).toBe(false);
+  expect(isHolderCommand("win32", '"C:\\Program Files\\chrome.exe" --type=renderer')).toBe(false);
+});
+
+test("the Windows printer probe is parsed whole, and a failure is never 'no printers'", () => {
+  // reliability#7: the 0.7.0 probe printed `printer <Name> is <Status>` into
+  // the lpstat parser, which took `\S+` as the name. Recorded shape of that
+  // bug: "Microsoft Print to PDF" came back as name "Microsoft".
+  expect(parseQueues("printer Microsoft Print to PDF is Normal\r\n", "").printers).toEqual([
+    { name: "Microsoft", state: "Print to PDF is Normal" },
+  ]);
+  const listed = parseWindowsQueues(WINDOWS_PRINTER_LIST_STDOUT, "");
+  expect(listed).toEqual({
+    printers: [
+      { name: "Microsoft Print to PDF", state: "Normal" },
+      { name: "\\\\print-01\\Front Desk, 2F", state: "Offline" },
+    ],
+    defaultPrinter: "Microsoft Print to PDF",
+    schedulerDown: false,
+    unreadable: null,
+  });
+  // ConvertTo-Json unwrapping a one-element list, and a host with none.
+  expect(
+    parseWindowsQueues('{"printers":{"name":"Only One","status":"Normal"},"default":null}', "")
+      .printers,
+  ).toEqual([{ name: "Only One", state: "Normal" }]);
+  expect(parseWindowsQueues('{"printers":[],"default":""}\r\n', "")).toEqual({
+    printers: [],
+    defaultPrinter: null,
+    schedulerDown: false,
+    unreadable: null,
+  });
+  // Get-Printer threw (the spooler is stopped): stderr, nothing on stdout.
+  const failed = parseWindowsQueues("", "The spooler service is not reachable.\r\n");
+  expect(failed.printers).toEqual([]);
+  expect(failed.unreadable).toContain("NOT that it has none");
+  expect(failed.unreadable).toContain("spooler service is not reachable");
+  // The old prose, or anything else that is not the JSON, is unreadable too.
+  expect(
+    parseWindowsQueues("printer Microsoft Print to PDF is Normal\r\n", "").unreadable,
+  ).toContain("did not print the JSON");
+  expect(parseWindowsQueues('{"printers":[{"status":"Normal"}]}', "").unreadable).toContain(
+    "no name",
+  );
+});
+
+test("Windows presence lines end in CRLF and still parse", () => {
+  // `[Console]::Out.WriteLine` writes CRLF on Windows. A pin: `$` under `m`
+  // matches before `\r`, and a rewrite of these patterns must keep that.
+  expect(parseWindowsPresence("idleMs=42000\r\nlocked=no\r\n")).toEqual({
+    idleSeconds: 42,
+    locked: false,
+  });
+  expect(parseWindowsPresence("idleMs=-1\r\nlocked=yes\r\n")).toEqual({
+    idleSeconds: null,
+    locked: true,
+  });
+});
+
+test("the Windows lock probe reads only this session's LogonUI", () => {
+  // Get-Process lists every session's processes, so another signed-in or RDP
+  // user's lock screen read as this user being away.
+  const script = powershellArgv(WINDOWS_PRESENCE, {}).argv.at(-1) ?? "";
+  expect(script).toContain("GetCurrentProcess().SessionId");
+  expect(script).toContain("Where-Object { $_.SessionId -eq $sid }");
+});
+
+test("the Windows window list reports focus as unknown, not as false", () => {
+  // The 0.7.0 script printed a literal `false` for every window's focus.
+  const request = planWindowList("win32", HEADLESS_ENV);
+  if (!request.ok) throw new Error("no win32 window-list plan");
+  const script = request.request.argv.at(-1) ?? "";
+  expect(script).not.toContain("'false'");
+  const FS = String.fromCharCode(31);
+  const RS = String.fromCharCode(30);
+  const rows = parseDelimitedWindows(
+    ["notepad", "notes.txt - Notepad", "?", "?", "?", "?", "?", "?"].join(FS) + RS,
+  );
+  expect(rows[0]?.focused).toBeNull();
+  expect(rows[0]?.title).toBe("notes.txt - Notepad");
 });

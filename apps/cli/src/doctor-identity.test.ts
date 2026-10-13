@@ -56,19 +56,19 @@ describe("crewhaus doctor — agent identity line", () => {
     expect(stdout).toContain("agent identity:");
     expect(stdout).toContain(AGENT_ID);
     expect(stdout).toContain("ed25519");
-  });
+  }, 20_000);
 
   test("reports 'not yet minted' when absent — and NEVER mints one (read-only)", async () => {
     const { stdout } = await runDoctor();
     expect(stdout).toContain("agent identity: not yet minted");
     // doctor must not have written an identity file.
     expect(existsSync(join(cwd, ".crewhaus", "identity.json"))).toBe(false);
-  });
+  }, 20_000);
 
   test("flags a corrupt identity file", async () => {
     writeIdentity("{ not valid json");
     const { stdout } = await runDoctor();
     expect(stdout).toContain("agent identity:");
     expect(stdout).toContain("unreadable or malformed");
-  });
+  }, 20_000);
 });

@@ -1,0 +1,421 @@
+/**
+ * 0.7.1 — `crewhaus tools show <tool>` says which argument(s) a scoped
+ * permission rule is checked against, in words, with one example rule.
+ *
+ * The example is only worth printing if it is a rule that works, so the
+ * representative examples below are run through the real matcher: the call
+ * a tool actually receives is parsed by its schema, its operative values are
+ * read the way the runtime reads them, and the example rule is matched with
+ * the polarity it has. A call outside the example is checked too, so a rule
+ * that matched everything would fail here.
+ */
+import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { BUILTIN_TOOLS } from "@crewhaus/tool-categories";
+import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
+import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
+import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
+import { importToolPackage } from "./tool-packages";
+import {
+  type OperativeArgLike,
+  formatRuleScopeLines,
+  operativeArgWords,
+  ruleScopeFor,
+} from "./tools-cli";
+
+const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+describe("operativeArgWords — a declaration in words", () => {
+  test("the kind, what qualifies it, and what a left-out value stands for", () => {
+    const cases: ReadonlyArray<[OperativeArgLike, string]> = [
+      [{ field: "url", kind: "url" }, "a URL"],
+      [
+        { field: "baseUrl", kind: "url", service: "baseUrl" },
+        "the API the call goes to, read as a URL: the one in baseUrl, else the configured one; a deny or ask also reads its host alone",
+      ],
+      [{ field: "repo", kind: "recipient", within: "owner" }, "a recipient; matched as owner/repo"],
+      [
+        { field: "paths", kind: "path", within: "cwd", default: ".", beneath: "all" },
+        "a path; read from the directory in cwd; a directory stands for everything beneath it; left out, the directory in cwd",
+      ],
+      [
+        {
+          field: "paths",
+          kind: "path",
+          within: "cwd",
+          default: ".",
+          beneath: "all",
+          defaultAtRoot: true,
+        },
+        "a path; read from the directory in cwd; a directory stands for everything beneath it; left out, the whole workspace",
+      ],
+      [
+        { field: "refs", kind: "id", secretRef: true },
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, the .env files and secrets directory a bare NAME is looked up in, and the .env files an env: one's environment is loaded from",
+      ],
+      [
+        { field: "entries.valueFrom", kind: "id", secretRef: true, source: true },
+        "an id; a secret reference (env:NAME, file:path, envfile:path#KEY, …); a file: or envfile: one is matched with the file it names, where it lands, and a deny or ask also reads that file as a path, the .env files and secrets directory a bare NAME is looked up in, and the .env files an env: one's environment is loaded from; where the value is taken from: a deny or ask reads it, an allow need not name it",
+      ],
+      [
+        { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+        "an id prefix, which stands for every value that starts with it; matched as namespace/prefix; left out, it stands for every value",
+      ],
+      [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        'a path; left out, ".crewhaus/state"; it only moves the tool off its usual place, so an allow need not match it when the call leaves it out',
+      ],
+      [
+        { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+        "a command; run in the directory in cwd; a scoped allow covers it only in the workspace root; a call that sets envSet is covered only by an allow on every command (**)",
+      ],
+      [
+        { field: "pattern", kind: "path", glob: true },
+        "a path pattern, which stands for every path it can list",
+      ],
+      [
+        {
+          field: "dir",
+          kind: "path",
+          default: ".",
+          opens: [
+            { path: ".crewhaus/sessions", beneath: "all" },
+            { path: ".crewhaus/settings.json" },
+          ],
+        },
+        "a path; a deny or ask also reads what it opens inside: .crewhaus/sessions/**, .crewhaus/settings.json; left out, the workspace root",
+      ],
+      [
+        { field: "path", kind: "path", default: ".", beneath: "visible" },
+        "a path; a directory stands for everything beneath it except hidden names; left out, the workspace root",
+      ],
+      [
+        {
+          field: "path",
+          kind: "path",
+          default: ".",
+          beneath: "visible",
+          hiddenWhen: "includeHidden",
+        },
+        "a path; a directory stands for everything beneath it except hidden names, and for those too when includeHidden is true; left out, the workspace root",
+      ],
+      [
+        {
+          field: "channel",
+          kind: "recipient",
+          service: "apiBaseUrl",
+          ignoredWhen: "webhookUrlEnv",
+        },
+        "a recipient; matched as https://host/channel with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL; ignored when the call names webhookUrlEnv: then a deny or ask reads it, an allow need not name it",
+      ],
+      [
+        { field: "env", kind: "id", within: "name", overlay: "tenant" },
+        "an id; matched as name/env; on a call that names tenant, matched as tenant/name/env, its own copy; a deny or ask also reads name/env and the tenant alone",
+      ],
+      // TempDir: the directory it makes, and what is in it when it clears it.
+      [
+        {
+          field: "name",
+          kind: "path",
+          within: "base",
+          withinDefault: ".tmp",
+          beneath: "all",
+          beneathWhen: "clear",
+        },
+        'a path; read from the directory in base (".tmp" when the call leaves it out); a directory stands for everything beneath it when clear is true',
+      ],
+    ];
+    for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
+  });
+
+  test("a recipient or an id says an allow matches it only as written (critic11)", () => {
+    // `SmsSend(+1555*)` asks on `+1 (555) 010-0000`: an allow compares a
+    // recipient as written, while a deny also reads its other spellings.
+    const as = (args: ReadonlyArray<OperativeArgLike>) => {
+      const scope = ruleScopeFor("T", args);
+      return scope.kind === "args" ? scope.asWritten : undefined;
+    };
+    expect(as([{ field: "to", kind: "recipient" }])).toBe(
+      "an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling",
+    );
+    expect(as([{ field: "to", kind: "id" }])).toBe(
+      "an allow matches an id only as the call writes it; a deny or ask also matches it in another letter case",
+    );
+    expect(
+      as([
+        { field: "hook", kind: "id" },
+        { field: "channel", kind: "recipient" },
+      ]),
+    ).toBe(
+      "an allow matches a recipient or an id only as the call writes it; a deny or ask also matches it in another letter case or spelling",
+    );
+    // A secret reference and a source have their own words; a path, a URL
+    // and a command are read canonically by an allow too.
+    expect(as([{ field: "refs", kind: "id", secretRef: true }])).toBe(undefined);
+    expect(
+      as([
+        { field: "path", kind: "path" },
+        { field: "from", kind: "id", source: true },
+      ]),
+    ).toBe(undefined);
+    expect(as([{ field: "url", kind: "url" }])).toBe(undefined);
+    // Printed after the arguments, before the example.
+    const lines = formatRuleScopeLines(
+      ruleScopeFor("SmsSend", [{ field: "to", kind: "recipient" }]),
+    );
+    expect(lines.join("\n").replace(/\s+/g, " ")).toBe(
+      ' rule checks to: a recipient an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling example - { type: alwaysAllow, pattern: "SmsSend(+1555*)" }',
+    );
+  });
+
+  test("a value on a service reads the configured API only for a tool that has one", () => {
+    const repo: OperativeArgLike = {
+      field: "repo",
+      kind: "recipient",
+      within: "owner",
+      service: "baseUrl",
+    };
+    // A code host: a call that names no API goes to the configured one.
+    expect(operativeArgWords(repo, { serviceDefaults: true })).toBe(
+      "a recipient; matched as owner/repo; matched as https://host/owner/repo with the origin of the API the call goes to (the one in baseUrl, else the configured one), and also as owner/repo on the API the tool is set up for; a deny or ask also reads the URL",
+    );
+    expect(ruleScopeFor("IssueCreate", [repo], { serviceDefaults: true }).example.pattern).toBe(
+      "IssueCreate(acme/*)",
+    );
+    // A Chat tool has none: the example names the API's origin.
+    const messageId: OperativeArgLike = {
+      field: "messageId",
+      kind: "id",
+      within: "channel",
+      service: "apiBaseUrl",
+    };
+    expect(operativeArgWords(messageId)).toBe(
+      "an id; matched as channel/messageId; matched as https://host/channel/messageId with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL",
+    );
+    expect(ruleScopeFor("ChatDelete", [messageId]).example.pattern).toBe(
+      "ChatDelete(https://slack.com/C0123/*)",
+    );
+  });
+
+  test("a shell line says an allow reads each command, and which lines only a bare allow grants", async () => {
+    // Bash's own declaration, from the tool the runtime loads.
+    const bash = await builtin("bash");
+    expect(bash.operativeArgs).toEqual([{ field: "command", kind: "command", shell: true }]);
+    const lines = formatRuleScopeLines(ruleScopeFor(bash.name, bash.operativeArgs)).join(" ");
+    const text = lines.replace(/\s+/g, " ");
+    expect(text).toContain(
+      "a shell line: an allow must match each command it runs (joined by &&, ||, ;, |, & or a newline), or be written as the same chain (cd ** && make *), and a deny or ask fires on any of them",
+    );
+    expect(text).toContain(
+      "a line with $(…), backticks or a here-document is allowed only by the bare tool, (*) or (**)",
+    );
+    // A command that is not a shell line says none of it.
+    expect(operativeArgWords({ field: "argv", kind: "command" })).toBe("a command");
+  });
+});
+
+describe("ruleScopeFor — the three answers", () => {
+  test("no declaration, and a declared empty list, are named apart and both say to name the tool bare", () => {
+    expect(ruleScopeFor("JsonQuery", undefined)).toEqual({
+      kind: "undeclared",
+      example: { type: "alwaysAllow", pattern: "JsonQuery" },
+    });
+    expect(ruleScopeFor("ClipboardWrite", [])).toEqual({
+      kind: "unscoped",
+      example: { type: "alwaysAllow", pattern: "ClipboardWrite" },
+    });
+    const lines = formatRuleScopeLines(ruleScopeFor("ClipboardWrite", [])).join("\n");
+    expect(lines).toContain("the tool says none decides where it acts");
+    expect(lines).toContain('- { type: alwaysAllow, pattern: "ClipboardWrite" }');
+  });
+
+  test("arguments of different kinds get a deny example on the place, with the reason", () => {
+    const scope = ruleScopeFor("Grep", [
+      { field: "pattern", kind: "text" },
+      { field: "path", kind: "path", default: ".", beneath: "visible" },
+    ]);
+    expect(scope.example).toEqual({ type: "alwaysDeny", pattern: "Grep(secrets/**)" });
+    const lines = formatRuleScopeLines(scope).join("\n");
+    expect(lines).toContain("rule checks pattern: text");
+    expect(lines).toContain(
+      "an allow must match every one of these; a deny or ask fires on any one",
+    );
+    expect(lines).toContain("these are of different kinds");
+  });
+
+  test("a store the tool walks gets an example on the store it uses by default", () => {
+    const scope = ruleScopeFor("StateExport", [
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", beneath: "all" },
+    ]);
+    expect(scope.example).toEqual({
+      type: "alwaysAllow",
+      pattern: "StateExport(.crewhaus/state/**)",
+    });
+  });
+
+  test("an allow skips a relocating field the call leaves out, so the example is about the others", () => {
+    const scope = ruleScopeFor("KvList", [
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+      { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+    ]);
+    expect(scope.example).toEqual({ type: "alwaysAllow", pattern: "KvList(scratch/**)" });
+  });
+});
+
+type ManifestRow = {
+  readonly name: string;
+  readonly operativeArgs?: ReadonlyArray<OperativeArgLike>;
+};
+
+describe("every builtin gets an answer whose example is a rule the engine accepts", () => {
+  test("the example compiles, names the tool, and says what the declaration says", () => {
+    const rows: ManifestRow[] = [
+      ...Object.values(TOOL_REGISTRY as Readonly<Record<string, ManifestRow>>),
+      ...Object.values(NON_CLI_TOOL_FLAGS as Readonly<Record<string, ManifestRow>>),
+    ];
+    const counts = { args: 0, unscoped: 0, undeclared: 0 };
+    for (const row of rows) {
+      const scope = ruleScopeFor(row.name, row.operativeArgs);
+      counts[scope.kind] += 1;
+      const compiled = compilePattern(scope.example.pattern);
+      expect(compiled.toolGlob).toBe(row.name);
+      if (scope.kind === "args") {
+        expect(scope.args.map((a) => a.field)).toEqual(
+          (row.operativeArgs ?? []).map((a) => a.field),
+        );
+        expect(compiled.argGlob).not.toBeNull();
+      } else {
+        expect(compiled.argGlob).toBeNull();
+        expect(scope.kind).toBe(row.operativeArgs === undefined ? "undeclared" : "unscoped");
+      }
+    }
+    expect(counts.args + counts.unscoped + counts.undeclared).toBe(rows.length);
+    expect(rows.length).toBe(Object.keys(BUILTIN_TOOLS).length);
+    expect(counts.args).toBeGreaterThan(200);
+    expect(counts.unscoped).toBeGreaterThan(10);
+  });
+});
+
+/**
+ * A builtin's registered tool, loaded the way `crewhaus run` loads it — or,
+ * for one only another shape carries (SendMessage), from its package source.
+ */
+async function builtin(key: string): Promise<RegisteredTool> {
+  const entry = BUILTIN_TOOLS[key];
+  if (entry === undefined) throw new Error(`no builtin ${key}`);
+  const mod =
+    entry.shapes === undefined
+      ? await importToolPackage(entry.package)
+      : ((await import(
+          join(repoRoot, "packages", entry.package.replace("@crewhaus/", ""), "src", "index.ts")
+        )) as Record<string, unknown>);
+  return mod[entry.export] as RegisteredTool;
+}
+
+type Subject = (
+  tool: RegisteredTool,
+  input: unknown,
+) =>
+  | { ok: true; input: unknown; operativeValues?: ReadonlyArray<unknown> }
+  | { ok: false; reason: string };
+
+/** Does the example rule `tools show` prints for `key` match this call? */
+async function exampleMatches(key: string, input: unknown): Promise<boolean> {
+  const { preparePermissionSubject } = (await import(
+    join(repoRoot, "packages", "tool-executor", "src", "index.ts")
+  )) as { preparePermissionSubject: Subject };
+  const tool = await builtin(key);
+  const scope = ruleScopeFor(tool.name, tool.operativeArgs, {
+    serviceDefaults: tool.serviceDefaults !== undefined,
+  });
+  const subject = preparePermissionSubject(tool, input);
+  if (!subject.ok) throw new Error(`${key}: ${subject.reason}`);
+  return matchesPattern(compilePattern(scope.example.pattern), tool.name, subject.input, {
+    polarity: scope.example.type === "alwaysAllow" ? "allow" : "restrict",
+    ...(subject.operativeValues !== undefined
+      ? { operativeValues: subject.operativeValues as never }
+      : {}),
+  });
+}
+
+describe("the printed example works, through the real matcher", () => {
+  const slackApi = {
+    platform: "slack",
+    apiBaseUrl: "https://slack.com/api",
+    tokenEnv: "SLACK_BOT_TOKEN",
+  };
+  // [key, a call the example covers, a call it does not]
+  const cases: ReadonlyArray<readonly [string, unknown, unknown]> = [
+    ["write", { path: "src/a.ts", content: "x" }, { path: "etc/a.ts", content: "x" }],
+    [
+      "httpRequest",
+      { url: "https://api.example.com/v1/status", method: "GET" },
+      { url: "https://elsewhere.example.org/", method: "GET" },
+    ],
+    // The API itself, whatever else the call names; with no baseUrl, the
+    // configured one (github.com here).
+    ["rateLimitStatus", { baseUrl: "https://api.example.com/api/v3", host: "github" }, {}],
+    ["runCommand", { argv: ["git", "status"] }, { argv: ["git", "push"] }],
+    [
+      "issueCreate",
+      { owner: "acme", repo: "app", title: "t" },
+      { owner: "other", repo: "app", title: "t" },
+    ],
+    ["kvList", { namespace: "scratch", prefix: "a" }, { namespace: "prod", prefix: "a" }],
+    // A Chat tool acts only on a call that names its API (critic10): the
+    // example names the origin, and a call to another API is not covered.
+    [
+      "chatUpdate",
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1", text: "done" },
+      {
+        ...slackApi,
+        apiBaseUrl: "https://chat.example.org/api",
+        channel: "C0123",
+        text: "done",
+        messageId: "1700000000.1",
+      },
+    ],
+    [
+      "chatDelete",
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1" },
+      { ...slackApi, channel: "C9999", messageId: "1700000000.1" },
+    ],
+    [
+      "chatReact",
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1", emoji: "eyes" },
+      {
+        ...slackApi,
+        apiBaseUrl: "https://chat.example.org/api",
+        channel: "C0123",
+        messageId: "1700000000.1",
+        emoji: "eyes",
+      },
+    ],
+    ["dnsLookup", { name: "api.example.com" }, { name: "example.org" }],
+    ["gitAdd", { paths: ["src/a.ts"] }, { paths: ["docs/a.md"] }],
+    ["glob", { pattern: "src/**/*.ts" }, { pattern: "**/*.ts" }],
+    [
+      "sendMessage",
+      { channel: "slack:T0123:C0123:1700000000.1", text: "hi" },
+      { channel: "slack:T0123:C9999", text: "hi" },
+    ],
+    // A secret reference, named where it lives (critic8).
+    ["secretLookup", { refs: ["envfile:.env#DEPLOY_TOKEN"] }, { refs: ["env:HOME"] }],
+    [
+      "envFileUpsert",
+      { path: "src/.env", entries: [{ key: "A", valueFrom: "env:A" }] },
+      { path: ".env", entries: [{ key: "A", valueFrom: "env:A" }] },
+    ],
+    // Deny examples: they fire on the call named, and not on another.
+    ["grep", { pattern: "key", path: "secrets/prod" }, { pattern: "key", path: "src" }],
+    ["python", { code: "import subprocess" }, { code: "print(1)" }],
+    ["webSearch", { query: "admin password reset" }, { query: "weather" }],
+  ];
+  for (const [key, covered, outside] of cases) {
+    test(`${key}: the example matches the call it is about, and not another`, async () => {
+      expect(await exampleMatches(key, covered)).toBe(true);
+      expect(await exampleMatches(key, outside)).toBe(false);
+    });
+  }
+});

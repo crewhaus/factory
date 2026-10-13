@@ -177,6 +177,7 @@ async function fetchConfig(
 
 export const containerImageInspect: RegisteredTool = buildTool({
   name: "ContainerImageInspect",
+  operativeArgs: [{ field: "image", kind: "recipient" }],
   description:
     "Resolve a container image tag to the digest it points at right now, over the OCI registry API — no daemon, no pull, no Docker. Returns the manifest digest and media type, the per-platform digest when the tag is a multi-arch index, the layer sizes, and the image config's labels, entrypoint and created time. Use it to pin a deployment to a digest, or to read an image's labels without downloading it. Pass compareTo a digest you recorded earlier and the answer says, as a boolean, whether the tag still points at it. The digest is computed from the response bytes and checked against the registry's own header rather than copied from it, so a registry cannot tell this tool that bytes are something they are not. Anonymous pulls only: a private repository is refused, with an explanation, rather than guessed at.",
   inputSchema: z.object({
@@ -484,6 +485,7 @@ async function describeImage(
 
 export const containerImageTags: RegisteredTool = buildTool({
   name: "ContainerImageTags",
+  operativeArgs: [{ field: "image", kind: "recipient" }],
   description:
     "List a container repository's tags over the OCI registry API, paged, filtered by glob and sorted newest-first by semver precedence — with tags that are not versions (latest, edge, sha-9f3c1a) kept and listed after them rather than dropped or guessed at. Use it to find the newest release of an image, to check whether a version was ever published, or to see what a repository offers before pinning to one. Set withDigests to resolve each listed tag to its digest, which costs one request per tag and is capped. Anonymous pulls only; a private repository is refused rather than reported as empty.",
   inputSchema: z.object({

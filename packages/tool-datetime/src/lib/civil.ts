@@ -244,14 +244,55 @@ export function isoDateFromEpochMs(epochMs: number, offsetMinutes: number): stri
 // for a given runtime, but it is a runtime fact, not a constant. Historical
 // offsets before ~1970 and far-future ones depend on the tzdb version.
 
+/**
+ * Formatters by CANONICAL zone name, least recently used first, at most
+ * {@link MAX_FORMATTERS}. 0.7.0 kept one per zone string exactly as the
+ * caller spelled it, for the life of the process: Intl accepts any casing of
+ * an IANA name and several spellings of every offset, each formatter holds
+ * tens of kilobytes, and the tools that reach here are readOnly, so plan and
+ * auto mode run them unasked — 9 000 case variants of one zone cost about
+ * 458 MB (C084). Canonical names alone are not a bound either (the offset
+ * zones number in the thousands), so the cache is capped as well.
+ */
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
+const MAX_FORMATTERS = 64;
+
+/**
+ * Spelling -> canonical name, for the spellings seen recently. Learning the
+ * canonical name builds (and drops) a small formatter, which the hot loops
+ * here (a DST search, a recurrence) should not pay per call. Strings only,
+ * and capped, so no spelling pins memory.
+ */
+const canonicalCache = new Map<string, string>();
+const MAX_SPELLINGS = 256;
+
+/** Most recently used moves to the back; the front is evicted past `max`. */
+function remember<V>(cache: Map<string, V>, key: string, value: V, max: number): V {
+  cache.delete(key);
+  while (cache.size >= max) cache.delete(cache.keys().next().value as string);
+  cache.set(key, value);
+  return value;
+}
+
+/**
+ * The zone's canonical name (`america/new_york` is `America/New_York`).
+ * Throws a RangeError for a zone the runtime does not know, and caches
+ * nothing for it.
+ */
+function canonicalZone(timeZone: string): string {
+  const known = canonicalCache.get(timeZone);
+  if (known !== undefined) return remember(canonicalCache, timeZone, known, MAX_SPELLINGS);
+  const canonical = new Intl.DateTimeFormat("en-US", { timeZone }).resolvedOptions().timeZone;
+  return remember(canonicalCache, timeZone, canonical, MAX_SPELLINGS);
+}
 
 function zoneFormatter(timeZone: string): Intl.DateTimeFormat {
-  const cached = formatterCache.get(timeZone);
-  if (cached !== undefined) return cached;
+  const canonical = canonicalZone(timeZone);
+  const cached = formatterCache.get(canonical);
+  if (cached !== undefined) return remember(formatterCache, canonical, cached, MAX_FORMATTERS);
   // The locale is pinned so output never depends on the host's default locale.
   const made = new Intl.DateTimeFormat("en-US", {
-    timeZone,
+    timeZone: canonical,
     hourCycle: "h23",
     year: "numeric",
     month: "2-digit",
@@ -261,8 +302,12 @@ function zoneFormatter(timeZone: string): Intl.DateTimeFormat {
     second: "2-digit",
     era: "short",
   });
-  formatterCache.set(timeZone, made);
-  return made;
+  return remember(formatterCache, canonical, made, MAX_FORMATTERS);
+}
+
+/** Test-only: how many formatters and spellings the caches hold. */
+export function __zoneCacheSizesForTest(): { formatters: number; spellings: number } {
+  return { formatters: formatterCache.size, spellings: canonicalCache.size };
 }
 
 /** True when the runtime's tzdb knows this IANA identifier (or `UTC`). */

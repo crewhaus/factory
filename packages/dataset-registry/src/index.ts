@@ -19,7 +19,16 @@
  * the test split must not be touched until a release tag.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  constants as fsConstants,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
@@ -105,6 +114,52 @@ const VERSION_REGEX = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
 function ensureSafe(name: string, regex: RegExp, kind: string): void {
   if (!regex.test(name)) {
     throw new DatasetRegistryError(`invalid ${kind} "${name}"`);
+  }
+}
+
+/**
+ * Throw the registry's own {@link DatasetRegistryError} unless `name` is a
+ * dataset name its grammar accepts. For a caller that must check a name
+ * BEFORE it resolves `<root>/<name>` on disk (a containment check), without
+ * copying the grammar.
+ */
+export function assertDatasetName(name: string): void {
+  ensureSafe(name, NAME_REGEX, "dataset name");
+}
+
+/** {@link assertDatasetName} for a version string. */
+export function assertDatasetVersion(version: string): void {
+  ensureSafe(version, VERSION_REGEX, "version");
+}
+
+const O_NOFOLLOW = (fsConstants as Record<string, number | undefined>)["O_NOFOLLOW"] ?? 0;
+
+/**
+ * Rewrite an existing record file in place, never through a symbolic link at
+ * its name: `O_NOFOLLOW` fails with ELOOP there instead of writing wherever
+ * the link points.
+ */
+function rewriteNoFollow(path: string, data: string, what: string): void {
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | O_NOFOLLOW,
+      0o600,
+    );
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new DatasetRegistryError(
+        `${what} is a symbolic link — a record is written only to a regular file, never through a link`,
+        err,
+      );
+    }
+    throw err;
+  }
+  try {
+    writeFileSync(fd, data);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -248,7 +303,11 @@ export function appendReleaseEntry(opts: AppendReleaseEntryOptions): DatasetReco
     ...record,
     releases: [...(record.releases ?? []), opts.entry],
   };
-  writeFileSync(path, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  rewriteNoFollow(
+    path,
+    JSON.stringify(updated, null, 2),
+    `the record for "${opts.name}@${opts.version}"`,
+  );
   return updated;
 }
 
@@ -310,9 +369,25 @@ export function createFileBackedRegistry(opts: FileBackedRegistryOptions): Datas
         createdAt: new Date().toISOString(),
       };
       mkdirSync(datasetDir(record.name), { recursive: true });
-      writeFileSync(path, JSON.stringify(full, null, 2), {
-        mode: 0o600,
-      });
+      const data = JSON.stringify(full, null, 2);
+      if (putOpts.allowOverwrite === true) {
+        rewriteNoFollow(path, data, `the record for "${record.name}@${record.version}"`);
+        return full;
+      }
+      // A new version is created EXCLUSIVELY (O_CREAT|O_EXCL): anything
+      // already at the name — a version written since the check above, or a
+      // symbolic link planted there, dangling or not — fails the write instead
+      // of being followed, which would create the link's target (0.7.1).
+      try {
+        writeFileSync(path, data, { mode: 0o600, flag: "wx" });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new DatasetRegistryError(
+            `version "${record.version}" of dataset "${record.name}" already exists (something is already at its name) — versions are immutable; write a new version (nextVersion) or pass allowOverwrite: true if you truly mean to replace it`,
+          );
+        }
+        throw err;
+      }
       return full;
     },
 

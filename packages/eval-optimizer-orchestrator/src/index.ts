@@ -31,8 +31,8 @@
  *
  * Catalog layer: F-eval. Brief: 279.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import {
@@ -53,6 +53,7 @@ import {
   formatWriteBackHeader,
   validatePatch,
 } from "@crewhaus/spec-patch";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import type { CostAccrualEvent, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 import {
   BudgetMeter,
@@ -499,20 +500,25 @@ export async function optimizeSpec(opts: OptimizeSpecOptions): Promise<OptimizeS
       iterations: opts.iterations ?? 10,
     });
     const stamped = `${header}${applyResult.yaml}`;
-    // Atomic-ish write: write to .tmp, then rename. We use writeFileSync
-    // for simplicity; race conditions with concurrent edits are not in
-    // scope for the orchestrator (the user is expected to commit the
-    // source file before invoking optimize).
-    const tmpPath = `${specAbs}.optimize.tmp`;
-    writeFileSync(tmpPath, stamped, { mode: 0o600 });
-    // Bun's rename via the standard fs API would need an import; we
-    // sidestep with a final writeFileSync to the target and a tmp clean-up.
-    writeFileSync(specAbs, stamped);
-    // Best-effort cleanup of the tmp.
+    // 0.7.1 — the spec the operator named is replaced atomically: a random
+    // O_EXCL|O_NOFOLLOW temp beside it, renamed into place, keeping the file's
+    // permission bits. Before, a fixed `<spec>.optimize.tmp` was written
+    // through any link planted there (and then truncated), and the spec was
+    // rewritten in place. A spec path that is itself a link is written where
+    // the operator's link leads, as before: that link is the operator's.
+    let target: string;
     try {
-      writeFileSync(tmpPath, "");
-    } catch {
-      // ignore — directory might be read-only mid-test
+      target = realpathSync(specAbs);
+    } catch (err) {
+      throw new OptimizeSpecError(`cannot resolve spec at ${specAbs} for write-back`, err);
+    }
+    const written = writeFileSafe(dirname(target), basename(target), stamped, {
+      overwrite: true,
+    });
+    if (!written.ok) {
+      throw new OptimizeSpecError(
+        `refusing to write the optimised spec back to ${specAbs}: ${written.reason} (code ${written.code})`,
+      );
     }
     writtenTo = specAbs;
   }

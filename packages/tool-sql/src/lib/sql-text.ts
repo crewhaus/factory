@@ -169,12 +169,38 @@ export function leadingKeyword(sql: string): string {
 }
 
 /**
- * True for a character SQLite counts as part of a parameter's name.
+ * True for a UTF-16 code unit SQLite counts as part of a parameter's name.
  * `sqlite3IdChar`: letters, digits, `_`, `$`, and every byte past ASCII.
  */
-function isIdChar(ch: string): boolean {
-  return /[A-Za-z0-9_$]/.test(ch) || ch.charCodeAt(0) >= 0x80;
+function isIdCode(code: number): boolean {
+  return (
+    (code >= 0x61 && code <= 0x7a) ||
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x30 && code <= 0x39) ||
+    code === 0x5f ||
+    code === 0x24 ||
+    code >= 0x80
+  );
 }
+
+const DOLLAR = 0x24;
+const COLON = 0x3a;
+const AT_SIGN = 0x40;
+const OPEN_PAREN = 0x28;
+const CLOSE_PAREN = 0x29;
+
+/**
+ * Characters `namedParameters` read finding names: each of the statement's
+ * once working back from the end, once going forward, and each name's once
+ * more when it is copied out. For a test, since a scan that indexes the
+ * string by hand is invisible to a meter wrapping the string methods.
+ */
+export type NameScanMeter = { reads: number };
+
+/** A name scan read at least one name character. */
+const NAMED = 1;
+/** A name scan reached a `(` that no `)` closes, which SQLite calls illegal. */
+const UNCLOSED = 2;
 
 /**
  * The named parameters a statement declares, in first-appearance order,
@@ -196,42 +222,71 @@ function isIdChar(ch: string): boolean {
  * and cross-checks the total against SQLite's own count once the statement
  * is compiled.
  */
-export function namedParameters(sql: string): string[] {
+export function namedParameters(sql: string, meter?: NameScanMeter): string[] {
   const { stripped } = scanSql(sql);
-  const found: string[] = [];
-  for (let i = 0; i < stripped.length; i++) {
-    const sigil = stripped[i] as string;
-    if (sigil !== "$" && sigil !== ":" && sigil !== "@") continue;
-    let cursor = i + 1;
-    let nameChars = 0;
-    let illegal = false;
-    while (cursor < stripped.length) {
-      const ch = stripped[cursor] as string;
-      if (isIdChar(ch)) {
-        nameChars += 1;
-        cursor += 1;
-        continue;
-      }
-      if (ch === "(" && nameChars > 0) {
+  const n = stripped.length;
+  /** Characters the name scan below read, for `meter`. */
+  let reads = 0;
+  // Where SQLite's name scan stops when it starts at position x, worked out
+  // once for every x from the end backwards, rather than rescanned from
+  // every sigil. A sigil that starts no name was followed by a rescan from
+  // the next one, so `$a($a($a(…` with no `)`, a run of `:`, or `$$$…(`
+  // cost the square of the statement. Slot 2x is a scan that has read no
+  // name character yet, slot 2x + 1 one that has; `stops` holds where it
+  // ends and `scans` its NAMED and UNCLOSED bits.
+  const stops = new Int32Array(2 * (n + 1));
+  const scans = new Uint8Array(2 * (n + 1));
+  stops[2 * n] = n;
+  stops[2 * n + 1] = n;
+  scans[2 * n + 1] = NAMED;
+  /** The first `)` after x, or -1. */
+  let close = -1;
+  let after = -1;
+  for (let x = n - 1; x >= 0; x--) {
+    const code = stripped.charCodeAt(x);
+    reads += 1;
+    for (let named = 0; named <= 1; named++) {
+      const slot = 2 * x + named;
+      if (isIdCode(code)) {
+        stops[slot] = stops[2 * x + 3] as number;
+        scans[slot] = scans[2 * x + 3] as number;
+      } else if (code === OPEN_PAREN && named === 1) {
         // `$name(...)` — SQLite swallows the whole suffix as part of the
         // name, and calls the token illegal when the `)` never arrives.
-        cursor += 1;
-        while (cursor < stripped.length && stripped[cursor] !== ")") cursor += 1;
-        if (cursor >= stripped.length) illegal = true;
-        else cursor += 1;
-        break;
+        stops[slot] = close === -1 ? n : close + 1;
+        scans[slot] = close === -1 ? NAMED | UNCLOSED : NAMED;
+      } else if (code === COLON && after === COLON) {
+        stops[slot] = stops[2 * x + 4 + named] as number;
+        scans[slot] = scans[2 * x + 4 + named] as number;
+      } else {
+        stops[slot] = x;
+        scans[slot] = named;
       }
-      if (ch === ":" && stripped[cursor + 1] === ":") {
-        cursor += 2;
-        continue;
-      }
-      break;
     }
-    if (nameChars === 0 || illegal) continue;
+    if (code === CLOSE_PAREN) close = x;
+    after = code;
+  }
+
+  const found: string[] = [];
+  // The names already in `found`: searching the list for each parameter was
+  // quadratic in the distinct names a statement declares.
+  const listed = new Set<string>();
+  for (let i = 0; i < n; i++) {
+    const sigil = stripped.charCodeAt(i);
+    reads += 1;
+    if (sigil !== DOLLAR && sigil !== COLON && sigil !== AT_SIGN) continue;
+    // No name character, or an unclosed `(`: not a parameter.
+    if (scans[2 * i + 2] !== NAMED) continue;
+    const cursor = stops[2 * i + 2] as number;
     const name = stripped.slice(i, cursor);
-    if (!found.includes(name)) found.push(name);
+    reads += name.length;
+    if (!listed.has(name)) {
+      listed.add(name);
+      found.push(name);
+    }
     i = cursor - 1;
   }
+  if (meter !== undefined) meter.reads += reads;
   return found;
 }
 

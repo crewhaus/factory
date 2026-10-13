@@ -416,6 +416,65 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     expect(c).toContain("defaultCatalog.register(sendMessage);");
   });
 
+  test("plugins: activates at boot and registers after every first-party tool (extension-path#4)", () => {
+    const c =
+      fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
+    // The lenient activation: a daemon that ran on 0.7.0 keeps starting when
+    // a plugin cannot load (plugin-loader's boot.test.ts drives it).
+    expect(c).toContain('import { activatePluginsOrStartWithout } from "@crewhaus/plugin-loader";');
+    expect(c).toContain('names: ["two-tools"],');
+    expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
+    // Activation precedes skill discovery; registration follows the builtins
+    // and precedes the agent's catalog snapshot.
+    const activate = c.indexOf("await activatePluginsOrStartWithout(");
+    const discover = c.indexOf("discoverSkills(");
+    const builtin = c.indexOf("defaultCatalog.register(read);");
+    const register = c.indexOf("for (const __t of __plugins.tools)");
+    const snapshot = c.indexOf("tools: defaultCatalog.list()");
+    expect(activate).toBeGreaterThan(-1);
+    expect(activate).toBeLessThan(discover);
+    expect(builtin).toBeLessThan(register);
+    expect(register).toBeLessThan(snapshot);
+    // No plugins, no plugin plumbing.
+    expect(fileMap(MIN_IR).get("daemon.ts")).not.toContain("plugin-loader");
+  });
+
+  // C016 — the emitted registration skips the names the run loop adds
+  // itself, run here against a stand-in catalog.
+  test("plugin registration skips the names the run loop adds itself, and says so", () => {
+    const c =
+      fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
+    const start = c.indexOf("const __loopOwned = ");
+    const tail = "defaultCatalog.register(__t);\n  }";
+    const end = c.indexOf(tail, start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = c.slice(start, end + tail.length);
+    const registered: string[] = [];
+    const lines: string[] = [];
+    const catalog = {
+      get: (name: string) => (name === "Read" ? {} : undefined),
+      register: (t: { name: string }) => registered.push(t.name),
+    };
+    const proc = { stderr: { write: (line: string) => lines.push(line) } };
+    const plugins = {
+      tools: ["ListTools", "Consult", "Escalate", "Read", "PluginOnly"].map((name) => ({ name })),
+    };
+    new Function("__plugins", "defaultCatalog", "process", block)(plugins, catalog, proc);
+    expect(registered).toEqual(["PluginOnly"]);
+    expect(lines.filter((l) => l.includes("is the run loop's own"))).toHaveLength(3);
+    expect(lines.filter((l) => l.includes("already registered"))).toHaveLength(1);
+  });
+
+  test("a 0.7.0 builtin and a code-execution tool resolve on the channel shape", () => {
+    const files = fileMap({ ...MIN_IR, tools: ["jsonQuery", "python"] });
+    expect(files.get("daemon.ts")).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(files.get("agent.ts")).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    expect(files.get("agent.ts")).toMatch(
+      /import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/,
+    );
+  });
+
   test("rejects unknown tool names", () => {
     const irBad: IrChannelV0 = { ...MIN_IR, tools: ["nonexistent"] };
     expect(() => emitChannelBot(irBad)).toThrow(TargetEmitError);

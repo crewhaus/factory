@@ -78,6 +78,7 @@ import { join } from "node:path";
 import { MAX_TEXT_BYTES } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
+import { replacePrivateKeyBlocks } from "./linear-mask";
 import type { M3Context, M3Handler } from "./m3";
 import { requireTypedConfirm } from "./m3";
 import { type TextScrubber, maskDeep, maskKeyedText } from "./mask";
@@ -287,11 +288,6 @@ export function isExcludedPath(segments: readonly string[]): boolean {
 // Reading
 // ---------------------------------------------------------------------------
 
-/** A PEM private-key block. Value-shape masking cannot see one — the base64
- *  body carries no key-ish context word — so it is redacted explicitly. */
-const PEM_PRIVATE_BLOCK_RE =
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
-
 /**
  * Mask one raw document served as TEXT.
  *
@@ -304,7 +300,7 @@ const PEM_PRIVATE_BLOCK_RE =
  * the generic shape masker walks straight past it.
  */
 export function maskRawText(text: string): string {
-  return maskKeyedText(text).replace(PEM_PRIVATE_BLOCK_RE, "[redacted private key block]");
+  return replacePrivateKeyBlocks(maskKeyedText(text), "[redacted private key block]");
 }
 
 /**

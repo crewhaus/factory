@@ -71,15 +71,20 @@ import {
 import { PROVIDER_NAMES, type ProviderName, type Quote, quotePrice } from "./lib/quotes";
 import {
   DEFAULT_TIMEOUT_MS,
+  type Deadline,
   type DefiConfig,
   DefiError,
   MAX_TIMEOUT_MS,
+  type ProviderLedger,
+  type RpcOptions,
   blockTagOf,
   ethBlockNumber,
   ethGetBalance,
   json,
+  newProviderLedger,
   requireEndpoint,
   resolveDefiConfig,
+  startDeadline,
 } from "./lib/rpc";
 
 /** The seams, and the config. Every test in this package drives the first two. */
@@ -109,13 +114,52 @@ const NETWORK_TOOL = {
   ioCapability: "network",
 } as const;
 
-const timeoutField = z
-  .number()
-  .int()
-  .positive()
-  .max(MAX_TIMEOUT_MS)
-  .optional()
-  .describe(`deadline for the whole call in ms; default ${DEFAULT_TIMEOUT_MS}`);
+/**
+ * PortfolioValuation's default deadline. It reads a balance batch, an oracle
+ * or a quote per holding, one after another, for up to 256 holdings, so it
+ * gets more time than a single read; every other tool here uses
+ * DEFAULT_TIMEOUT_MS.
+ */
+export const PORTFOLIO_DEFAULT_TIMEOUT_MS = 60_000;
+
+/**
+ * How many requests one call may send to the public price providers. A single
+ * PriceQuote needs at most fifteen (direct, inverted, then crossed through two
+ * intermediates), so its budget is a backstop. PortfolioValuation's is four
+ * per holding priced from a provider — what an asset no provider lists costs
+ * in a fiat quote currency: direct, inverse, and both via USD — between
+ * PriceQuote's sixteen and {@link PORTFOLIO_PROVIDER_REQUESTS}; an answer
+ * already fetched in the same call is reused, not counted again. The
+ * requests go out in rounds, one per holding still unpriced, and only whole
+ * rounds run, so which holdings are priced does not depend on their order
+ * (see valuePortfolio and ProviderLedger.allowance).
+ */
+export const PRICE_QUOTE_PROVIDER_REQUESTS = 16;
+export const PORTFOLIO_PROVIDER_REQUESTS = 512;
+const PROVIDER_REQUESTS_PER_HOLDING = 4;
+
+/** PortfolioValuation's provider budget for these holdings. */
+function portfolioProviderRequests(holdings: ReadonlyArray<{ quotePair?: unknown }>): number {
+  const quoting = holdings.filter((h) => h.quotePair !== undefined).length;
+  return Math.min(
+    PORTFOLIO_PROVIDER_REQUESTS,
+    Math.max(PRICE_QUOTE_PROVIDER_REQUESTS, quoting * PROVIDER_REQUESTS_PER_HOLDING),
+  );
+}
+
+function timeoutFieldWithDefault(defaultMs: number) {
+  return z
+    .number()
+    .int()
+    .positive()
+    .max(MAX_TIMEOUT_MS)
+    .optional()
+    .describe(
+      `deadline for the whole call in ms, every request it makes included; default ${defaultMs}`,
+    );
+}
+
+const timeoutField = timeoutFieldWithDefault(DEFAULT_TIMEOUT_MS);
 
 const blockNumberField = z
   .string()
@@ -146,16 +190,49 @@ function configOf(ctx: ToolExecuteContext | undefined): DefiConfig {
   return resolveDefiConfig(ctx?.toolConfig);
 }
 
-function rpcOptions(
+/**
+ * One call's budget: a single deadline that every request it makes shares,
+ * and (for the tools that quote prices) its price-provider ledger.
+ *
+ * `timeoutMs` is described to the model as the deadline for the whole call,
+ * and it is: 0.7.0 started a fresh timer of that length for EACH request, so
+ * a quote that crossed pairs ran up to six times over it, and a valuation of
+ * many holdings had no bound at all.
+ */
+type CallBudget = { readonly options: RpcOptions; readonly deadline: Deadline };
+
+function startCall(
   ctx: ToolExecuteContext | undefined,
-  timeoutMs: number | undefined,
-  chainId?: string,
-): { signal?: AbortSignal; timeoutMs?: number; chainId?: string } {
+  timeoutMs: number,
+  extra: { readonly chainId?: string; readonly providerRequests?: number } = {},
+): CallBudget {
+  const deadline = startDeadline(timeoutMs, ctx?.signal);
+  const providers: ProviderLedger | undefined =
+    extra.providerRequests === undefined ? undefined : newProviderLedger(extra.providerRequests);
   return {
-    ...(ctx?.signal === undefined ? {} : { signal: ctx.signal }),
-    ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    ...(chainId === undefined ? {} : { chainId }),
+    deadline,
+    options: {
+      signal: deadline.signal,
+      timeoutMs,
+      ...(extra.chainId === undefined ? {} : { chainId: extra.chainId }),
+      ...(providers === undefined ? {} : { providers }),
+    },
   };
+}
+
+/** Run `work` under one call budget, and stop its timer however `work` ends. */
+async function withCall<T>(
+  ctx: ToolExecuteContext | undefined,
+  timeoutMs: number,
+  extra: { readonly chainId?: string; readonly providerRequests?: number },
+  work: (call: CallBudget) => Promise<T>,
+): Promise<T> {
+  const call = startCall(ctx, timeoutMs, extra);
+  try {
+    return await work(call);
+  } finally {
+    call.deadline.cancel();
+  }
 }
 
 /**
@@ -169,7 +246,7 @@ function rpcOptions(
 async function pinBlock(
   endpoint: string,
   requested: bigint | undefined,
-  options: { signal?: AbortSignal; timeoutMs?: number; chainId?: string },
+  options: RpcOptions,
 ): Promise<{ blockNumber: bigint; blockTag: string; pinnedByThisCall: boolean }> {
   if (requested !== undefined) {
     return { blockNumber: requested, blockTag: blockTagOf(requested), pinnedByThisCall: false };
@@ -185,6 +262,7 @@ async function pinBlock(
 
 export const priceQuote: RegisteredTool = buildTool({
   name: "PriceQuote",
+  operativeArgs: [],
   description:
     "Price one asset in another from a public, unauthenticated provider — the ECB's daily euro reference rates for currencies, Coinbase spot for everything else — and return the price with its provenance. Use it whenever a number will be reported to somebody: the result says which source answered, which fixing date it carries, and whether the price is a direct quote, an inversion of the pair the provider actually publishes, or a cross through an intermediate asset (and through which one, with both legs attached). It refuses a historical CRYPTO quote rather than serving one from a spot endpoint that echoes no date, because a price that cannot be told apart from today's must not be labelled as last Tuesday's; a historical currency rate comes from the ECB fixing for that date and says which fixing it resolved to. Nothing here signs or sends anything.",
   inputSchema: z
@@ -219,20 +297,26 @@ export const priceQuote: RegisteredTool = buildTool({
     })
     .strict(),
   ...NETWORK_TOOL,
-  execute: async (input, ctx) => {
-    const result = await quotePrice(
-      {
-        base: input.base,
-        quote: input.quote,
-        ...(input.at === undefined ? {} : { at: input.at }),
-        ...(input.providers === undefined ? {} : { providers: input.providers }),
-        ...(input.via === undefined ? {} : { via: input.via }),
-        ...(input.allowCross === undefined ? {} : { allowCross: input.allowCross }),
+  execute: async (input, ctx) =>
+    withCall(
+      ctx,
+      input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      { providerRequests: PRICE_QUOTE_PROVIDER_REQUESTS },
+      async ({ options }) => {
+        const result = await quotePrice(
+          {
+            base: input.base,
+            quote: input.quote,
+            ...(input.at === undefined ? {} : { at: input.at }),
+            ...(input.providers === undefined ? {} : { providers: input.providers }),
+            ...(input.via === undefined ? {} : { via: input.via }),
+            ...(input.allowCross === undefined ? {} : { allowCross: input.allowCross }),
+          },
+          options,
+        );
+        return json(result.quote);
       },
-      rpcOptions(ctx, input.timeoutMs),
-    );
-    return json(result.quote);
-  },
+    ),
 });
 
 // ---------------------------------------------------------------------------
@@ -241,6 +325,10 @@ export const priceQuote: RegisteredTool = buildTool({
 
 export const oraclePriceRead: RegisteredTool = buildTool({
   name: "OraclePriceRead",
+  operativeArgs: [
+    { field: "feed", kind: "id" },
+    { field: "address", kind: "id", within: "chainId" },
+  ],
   description:
     "Read a Chainlink or Pyth price feed onchain at a pinned block and report the price with EACH FEED'S OWN freshness signal, under its own name. Use it instead of asking whether a feed is 'stale', because that word means two different things: a Chainlink aggregator updates on its heartbeat OR on a deviation threshold, so an unchanged price legitimately looks old and the real incomplete-round signal is answeredInRound being behind roundId — while Pyth's signal is the width of its confidence interval relative to the price, a different quantity entirely. Both are reported, plus the round data, the feed's own description and the publish time the feed itself states; there is deliberately no single boolean called stale. The heartbeat comparison only happens when you supply the heartbeat, because it is a property of the deployment that the aggregator will not tell you. This reads; it never signs or sends.",
   inputSchema: z
@@ -302,7 +390,6 @@ export const oraclePriceRead: RegisteredTool = buildTool({
 
     const endpoint = requireEndpoint(config, chainId);
     const multicall3 = config.multicall.get(chainId);
-    const options = rpcOptions(ctx, input.timeoutMs, chainId);
 
     // Everything that can be refused without asking anybody is refused here,
     // before the block is pinned. A malformed address or a Pyth read with no
@@ -310,42 +397,49 @@ export const oraclePriceRead: RegisteredTool = buildTool({
     // apart by counting what was dialled.
     normalizeAddress(address, "the feed address");
     if (kind === "pyth") requirePriceId(priceId);
-    const block = await pinBlock(endpoint, parseBlockNumber(input.blockNumber), options);
+    return withCall(
+      ctx,
+      input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      { chainId },
+      async ({ options }) => {
+        const block = await pinBlock(endpoint, parseBlockNumber(input.blockNumber), options);
 
-    const reading =
-      kind === "chainlink"
-        ? await readChainlink(
-            {
-              chainId,
-              endpoint,
-              address,
-              blockTag: block.blockTag,
-              ...(heartbeatSeconds === undefined ? {} : { heartbeatSeconds }),
-              ...(multicall3 === undefined ? {} : { multicall3 }),
-            },
-            options,
-          )
-        : await readPyth(
-            {
-              chainId,
-              endpoint,
-              address,
-              priceId: requirePriceId(priceId),
-              blockTag: block.blockTag,
-              ...(input.maxConfidenceBps === undefined
-                ? {}
-                : { maxConfidenceBps: input.maxConfidenceBps }),
-              ...(multicall3 === undefined ? {} : { multicall3 }),
-            },
-            options,
-          );
+        const reading =
+          kind === "chainlink"
+            ? await readChainlink(
+                {
+                  chainId,
+                  endpoint,
+                  address,
+                  blockTag: block.blockTag,
+                  ...(heartbeatSeconds === undefined ? {} : { heartbeatSeconds }),
+                  ...(multicall3 === undefined ? {} : { multicall3 }),
+                },
+                options,
+              )
+            : await readPyth(
+                {
+                  chainId,
+                  endpoint,
+                  address,
+                  priceId: requirePriceId(priceId),
+                  blockTag: block.blockTag,
+                  ...(input.maxConfidenceBps === undefined
+                    ? {}
+                    : { maxConfidenceBps: input.maxConfidenceBps }),
+                  ...(multicall3 === undefined ? {} : { multicall3 }),
+                },
+                options,
+              );
 
-    return json({
-      ...reading.reading,
-      blockNumber: block.blockNumber.toString(),
-      blockPinnedByThisCall: block.pinnedByThisCall,
-      signalNote: STALENESS_NOTE,
-    });
+        return json({
+          ...reading.reading,
+          blockNumber: block.blockNumber.toString(),
+          blockPinnedByThisCall: block.pinnedByThisCall,
+          signalNote: STALENESS_NOTE,
+        });
+      },
+    );
   },
 });
 
@@ -367,6 +461,7 @@ function requirePriceId(priceId: string | undefined): string {
 
 export const defiPositionRead: RegisteredTool = buildTool({
   name: "DefiPositionRead",
+  operativeArgs: [{ field: "contract", kind: "id", within: "chainId" }],
   description:
     "Read one Aave v3, Compound v3 or ERC-4626 position at a pinned block and normalise it into one row, with every figure labelled with the basis it is in. Use it because each protocol answers in its own units and the conversion is where the wrong number gets made: Aave reports in its oracle's base currency and returns type(uint256).max as the health factor of a debt-free account, Compound v3 has one borrowable asset and publishes its own liquidation verdict, and an ERC-4626 share is worth convertToAssets(shares) — not totalAssets/totalSupply, which differs for any vault with a fee. It reports how far the collateral basket may fall before the health factor reaches 1 rather than a liquidation price, because a liquidation price for an aggregate position depends on which collateral you assume moves. A protocol it cannot read is refused with what reading it would take, never probed. It reads; it never signs or sends.",
   inputSchema: z
@@ -412,32 +507,34 @@ export const defiPositionRead: RegisteredTool = buildTool({
     const config = configOf(ctx);
     const endpoint = requireEndpoint(config, input.chainId);
     const multicall3 = config.multicall.get(input.chainId);
-    const options = rpcOptions(ctx, input.timeoutMs, input.chainId);
-    const block = await pinBlock(endpoint, parseBlockNumber(input.blockNumber), options);
+    const budget = { chainId: input.chainId };
+    return withCall(ctx, input.timeoutMs ?? DEFAULT_TIMEOUT_MS, budget, async ({ options }) => {
+      const block = await pinBlock(endpoint, parseBlockNumber(input.blockNumber), options);
 
-    const row = await readPosition(
-      {
-        protocol: protocol as Protocol,
-        chainId: input.chainId,
-        endpoint,
-        contract: input.contract,
-        account: input.account,
-        blockTag: block.blockTag,
-        ...(input.baseCurrencyDecimals === undefined
-          ? {}
-          : { baseCurrencyDecimals: input.baseCurrencyDecimals }),
-        ...(input.collateralAssets === undefined
-          ? {}
-          : { collateralAssets: input.collateralAssets }),
-        ...(multicall3 === undefined ? {} : { multicall3 }),
-      },
-      options,
-    );
+      const row = await readPosition(
+        {
+          protocol: protocol as Protocol,
+          chainId: input.chainId,
+          endpoint,
+          contract: input.contract,
+          account: input.account,
+          blockTag: block.blockTag,
+          ...(input.baseCurrencyDecimals === undefined
+            ? {}
+            : { baseCurrencyDecimals: input.baseCurrencyDecimals }),
+          ...(input.collateralAssets === undefined
+            ? {}
+            : { collateralAssets: input.collateralAssets }),
+          ...(multicall3 === undefined ? {} : { multicall3 }),
+        },
+        options,
+      );
 
-    return json({
-      ...row,
-      blockNumber: block.blockNumber.toString(),
-      blockPinnedByThisCall: block.pinnedByThisCall,
+      return json({
+        ...row,
+        blockNumber: block.blockNumber.toString(),
+        blockPinnedByThisCall: block.pinnedByThisCall,
+      });
     });
   },
 });
@@ -490,6 +587,7 @@ const holdingSchema = z
 
 export const portfolioValuation: RegisteredTool = buildTool({
   name: "PortfolioValuation",
+  operativeArgs: [{ field: "wallet", kind: "id", within: "chainId" }],
   description:
     "Value a set of holdings in one currency at one pinned block and return the total, the priced holdings and the UNPRICED ones as three separate fields. Use it for any figure that will be reported: the unpriced bucket names every asset that could not be priced and why, so a total is never quietly the sum of whatever happened to have a price — which is the failure mode that makes a treasury number wrong in the direction that looks good. Amounts can be given, or read as ERC-20 and native balances for a wallet; prices can be given, read from a pinned oracle feed, or quoted from a public provider, and each priced row carries the provenance of its own price. Weights are stated as a share of the PRICED total. A historical valuation must pin both the block and the date, because a current balance multiplied by a historical price is a plausible number that means nothing. It reads; it never signs or sends.",
   inputSchema: z
@@ -525,11 +623,20 @@ export const portfolioValuation: RegisteredTool = buildTool({
         .min(1)
         .optional()
         .describe("rows worth less than this are summarised as dust — they stay in the total"),
-      timeoutMs: timeoutField,
+      timeoutMs: timeoutFieldWithDefault(PORTFOLIO_DEFAULT_TIMEOUT_MS),
     })
     .strict(),
   ...NETWORK_TOOL,
-  execute: async (input, ctx) => valuePortfolio(input, ctx),
+  execute: async (input, ctx) =>
+    withCall(
+      ctx,
+      input.timeoutMs ?? PORTFOLIO_DEFAULT_TIMEOUT_MS,
+      {
+        ...(input.chainId === undefined ? {} : { chainId: input.chainId }),
+        providerRequests: portfolioProviderRequests(input.holdings),
+      },
+      (call) => valuePortfolio(input, ctx, call),
+    ),
 });
 
 type Holding = z.infer<typeof holdingSchema>;
@@ -560,6 +667,7 @@ async function valuePortfolio(
     timeoutMs?: number;
   },
   ctx: ToolExecuteContext | undefined,
+  call: CallBudget,
 ): Promise<string> {
   const quoteCurrency = input.quoteCurrency.trim().toUpperCase();
   const config = configOf(ctx);
@@ -598,7 +706,7 @@ async function valuePortfolio(
   );
   let endpoint: string | undefined;
   let block: { blockNumber: bigint; blockTag: string; pinnedByThisCall: boolean } | undefined;
-  const options = rpcOptions(ctx, input.timeoutMs, input.chainId);
+  const options = call.options;
   if (needsChain) {
     if (input.chainId === undefined) {
       throw new DefiError(
@@ -619,8 +727,9 @@ async function valuePortfolio(
     options,
   });
 
-  const priced: PricedRow[] = [];
-  const unpriced: UnpricedRow[] = [];
+  // Each holding's row, by its index, so the table keeps the holdings' order
+  // whichever pass priced them.
+  const rows: Array<{ readonly priced: PricedRow } | { readonly unpriced: UnpricedRow }> = [];
   const notes: string[] = [];
   // Two running totals, on purpose. `total` is the sum of the ROUNDED rows, so
   // the table a human reads adds up to the figure at the bottom of it;
@@ -628,49 +737,45 @@ async function valuePortfolio(
   // cost is visible rather than argued about.
   let total: Fixed = ZERO;
   let exactSum: Fixed = ZERO;
-
-  for (let index = 0; index < input.holdings.length; index++) {
-    const holding = input.holdings[index] as Holding;
-    const amount = amounts[index] as AmountOutcome;
-    const sourceError = sourceErrors[index];
-    if (sourceError !== undefined) {
-      unpriced.push({
-        asset: holding.asset,
-        amount: amount.ok ? toDecimalString(trim(amount.value)) : null,
-        reason: sourceError,
-      });
-      continue;
-    }
-    if (!amount.ok) {
-      unpriced.push({ asset: holding.asset, amount: null, reason: amount.reason });
-      continue;
-    }
-    let price: { value: Fixed; provenance: unknown };
-    try {
-      price = await priceFor(holding, {
-        quoteCurrency,
-        config,
-        endpoint,
-        chainId: input.chainId,
-        blockTag: block?.blockTag,
-        at: input.at,
-        options,
-      });
-    } catch (err) {
-      // A holding that could not be priced is a ROW, not a thrown error: the
-      // other forty-nine assets still have values, and the whole point of the
-      // unpriced bucket is that it is visible rather than absent.
-      unpriced.push({
-        asset: holding.asset,
-        amount: toDecimalString(trim(amount.value)),
-        reason: (err as Error).message,
-      });
-      continue;
-    }
+  let outOfTime = 0;
+  let budgetShort = 0;
+  const ledger = options.providers;
+  const context = {
+    quoteCurrency,
+    config,
+    endpoint,
+    chainId: input.chainId,
+    blockTag: block?.blockTag,
+    at: input.at,
+    options,
+  };
+  const unpricedRow = (holding: Holding, amount: Fixed | null, reason: string): UnpricedRow => ({
+    asset: holding.asset,
+    amount: amount === null ? null : toDecimalString(trim(amount)),
+    reason,
+  });
+  const outOfTimeRow = (holding: Holding, amount: Fixed): UnpricedRow => {
+    outOfTime++;
+    return unpricedRow(
+      holding,
+      amount,
+      `${holding.asset}: not priced — ${
+        ctx?.signal?.aborted === true
+          ? "the call was cancelled first"
+          : `the call's timeoutMs of ${call.deadline.ms}ms elapsed first`
+      }`,
+    );
+  };
+  /** A price found: the row, or an arithmetic refusal as a row. */
+  const valued = (
+    holding: Holding,
+    amount: Fixed,
+    price: { value: Fixed; provenance: unknown },
+  ): { readonly priced: PricedRow } | { readonly unpriced: UnpricedRow } => {
     let exact: Fixed;
     let value: Fixed;
     try {
-      exact = multiply(amount.value, price.value);
+      exact = multiply(amount, price.value);
       value = roundToPlaces(exact, places, rounding);
     } catch (err) {
       // The multiplication refuses past MAX_SCALE, and it used to do it out
@@ -679,24 +784,137 @@ async function valuePortfolio(
       // of the whole call, so forty-nine priceable rows were lost to the
       // fiftieth. An arithmetic refusal is a row, exactly like a price
       // refusal is.
-      unpriced.push({
-        asset: holding.asset,
-        amount: toDecimalString(trim(amount.value)),
-        reason: `${holding.asset}: the amount and the price could not be multiplied — ${(err as Error).message}`,
-      });
-      continue;
+      return {
+        unpriced: unpricedRow(
+          holding,
+          amount,
+          `${holding.asset}: the amount and the price could not be multiplied — ${(err as Error).message}`,
+        ),
+      };
     }
     total = add(total, value);
     exactSum = add(exactSum, exact);
-    priced.push({
-      asset: holding.asset,
-      amount: toDecimalString(trim(amount.value)),
-      price: toDecimalString(trim(price.value)),
-      value: toDecimalString(value),
-      weightBps: 0,
-      belowMinValue: false,
-      provenance: price.provenance,
-    });
+    return {
+      priced: {
+        asset: holding.asset,
+        amount: toDecimalString(trim(amount)),
+        price: toDecimalString(trim(price.value)),
+        value: toDecimalString(value),
+        weightBps: 0,
+        belowMinValue: false,
+        provenance: price.provenance,
+      },
+    };
+  };
+
+  // Holdings priced from a public provider, left for the rounds below.
+  let quoting: number[] = [];
+  for (let index = 0; index < input.holdings.length; index++) {
+    const holding = input.holdings[index] as Holding;
+    const amount = amounts[index] as AmountOutcome;
+    const sourceError = sourceErrors[index];
+    if (sourceError !== undefined) {
+      rows[index] = {
+        unpriced: unpricedRow(holding, amount.ok ? amount.value : null, sourceError),
+      };
+      continue;
+    }
+    if (!amount.ok) {
+      rows[index] = { unpriced: unpricedRow(holding, null, amount.reason) };
+      continue;
+    }
+    if (call.deadline.signal.aborted && holding.price === undefined) {
+      // Past the deadline nothing more is asked of anybody: every holding
+      // left is a row that says so, rather than a request per holding that
+      // is refused one at a time.
+      rows[index] = { unpriced: outOfTimeRow(holding, amount.value) };
+      continue;
+    }
+    if (holding.quotePair !== undefined && ledger !== undefined) {
+      quoting.push(index);
+      continue;
+    }
+    try {
+      rows[index] = valued(holding, amount.value, await priceFor(holding, context));
+    } catch (err) {
+      // A holding that could not be priced is a ROW, not a thrown error: the
+      // other forty-nine assets still have values, and the whole point of the
+      // unpriced bucket is that it is visible rather than absent.
+      rows[index] = { unpriced: unpricedRow(holding, amount.value, (err as Error).message) };
+    }
+  }
+
+  // The provider budget goes out in ROUNDS: each round lets every holding
+  // still unpriced make one more request (an answer this call already has
+  // is free), and a round runs only when what is left covers every holding
+  // in it. So which holdings are priced does not depend on where they sit in
+  // the list: a run of assets no provider lists cannot spend the requests a
+  // holding after them needed, nor can one before them take a larger share.
+  // A holding stays in play while its last attempt was cut short by the
+  // round; one that failed having asked everything it wanted is final.
+  const lastReason = new Map<number, string>();
+  while (quoting.length > 0 && ledger !== undefined) {
+    if (call.deadline.signal.aborted) break;
+    // Also what ends the loop: every holding kept in play asked one new
+    // request in its round, so each round spends the budget down.
+    if (ledger.limit - ledger.made < quoting.length) break;
+    const next: number[] = [];
+    for (const index of quoting) {
+      if (call.deadline.signal.aborted) {
+        // Out of time: left for the rows below that say so.
+        next.push(index);
+        continue;
+      }
+      const holding = input.holdings[index] as Holding;
+      const amount = (amounts[index] as { value: Fixed }).value;
+      ledger.allowance = 1;
+      ledger.halted = false;
+      const refusedBefore = ledger.refused;
+      try {
+        const price = await priceFor(holding, context);
+        rows[index] = valued(holding, amount, price);
+      } catch (err) {
+        // Refused a request, so cut short by its round rather than out of
+        // routes: it stays in play.
+        if (ledger.refused > refusedBefore && !call.deadline.signal.aborted) {
+          next.push(index);
+          lastReason.set(index, (err as Error).message);
+        } else {
+          rows[index] = { unpriced: unpricedRow(holding, amount, (err as Error).message) };
+        }
+      }
+    }
+    quoting = next;
+  }
+  if (ledger !== undefined) {
+    ledger.allowance = undefined;
+    ledger.halted = false;
+  }
+  for (const index of quoting) {
+    const holding = input.holdings[index] as Holding;
+    const amount = (amounts[index] as { value: Fixed }).value;
+    const reason = lastReason.get(index);
+    if (call.deadline.signal.aborted) {
+      rows[index] = { unpriced: outOfTimeRow(holding, amount) };
+    } else {
+      budgetShort++;
+      rows[index] = {
+        unpriced: unpricedRow(
+          holding,
+          amount,
+          reason ??
+            `${holding.asset}: not priced — this call's ${ledger?.limit} price-provider requests could not give every holding still unpriced a round`,
+        ),
+      };
+    }
+  }
+
+  const priced: PricedRow[] = [];
+  const unpriced: UnpricedRow[] = [];
+  for (const row of rows) {
+    if (row === undefined) continue;
+    if ("priced" in row) priced.push(row.priced);
+    else unpriced.push(row.unpriced);
   }
 
   const minValue =
@@ -716,6 +934,16 @@ async function valuePortfolio(
   if (unpriced.length > 0) {
     notes.push(
       `${unpriced.length} of ${input.holdings.length} holding(s) could not be priced and are NOT in the total — see unpriced[], which names each one and why`,
+    );
+  }
+  if (outOfTime > 0) {
+    notes.push(
+      `${outOfTime} holding(s) were not priced because the call ran out of time; a larger timeoutMs (up to ${MAX_TIMEOUT_MS}) or fewer holdings per call would price them`,
+    );
+  }
+  if (budgetShort > 0) {
+    notes.push(
+      `${budgetShort} unpriced holding(s) had a price route that was not asked: this call's ${ledger?.limit} price-provider requests go out one per holding per round, and ran out before another round could reach every holding still unpriced; fewer distinct assets per call would try them`,
     );
   }
   if (!isPositive(total) && priced.length > 0) {
@@ -830,7 +1058,7 @@ async function resolveAmounts(
     wallet: string | undefined;
     chainId: string | undefined;
     multicall3: string | undefined;
-    options: { signal?: AbortSignal; timeoutMs?: number; chainId?: string };
+    options: RpcOptions;
   },
 ): Promise<ReadonlyArray<AmountOutcome>> {
   const out: AmountOutcome[] = holdings.map(() => ({ ok: false, reason: "not resolved" }));
@@ -1010,7 +1238,7 @@ async function priceFor(
     chainId: string | undefined;
     blockTag: string | undefined;
     at: string | undefined;
-    options: { signal?: AbortSignal; timeoutMs?: number; chainId?: string };
+    options: RpcOptions;
   },
 ): Promise<{ value: Fixed; provenance: unknown }> {
   // `priceSourceError` has already established that exactly one is set.

@@ -31,6 +31,9 @@
  *
  * Everything here is pure: same text in, same bytes out.
  */
+import { screenUserRegex } from "@crewhaus/tool-safety/regex";
+import { isRegExpSpace } from "./regexp-space";
+import { matchAllSkipping, wordAt } from "./skip-scan";
 
 /** Character classification produced by `maskSource`. */
 export const KIND_CODE = 0;
@@ -90,7 +93,16 @@ export function maskSource(src: string): Masked {
   // A stack so `${…}` inside a template returns to template mode afterwards.
   const stack: Array<{ mode: "code" | "template"; depth: number }> = [{ mode: "code", depth: 0 }];
   let prevSignificant = "";
-  let prevWord = "";
+  // The last identifier character read, and where its run starts: a later
+  // one walks back only to it, and takes its start when the runs join, so
+  // each character is walked back over once. Walking back over the whole run
+  // at every character of it was quadratic in an identifier's length.
+  let wordStart = 0;
+  let wordEnd = -1;
+  // Whether that run is still the word before the next `/`. It is copied out
+  // only there: copying it at every character of it, as it grew, was
+  // quadratic in an identifier's length too.
+  let wordLive = false;
   let i = 0;
 
   const blank = (from: number, to: number, k: number): void => {
@@ -118,7 +130,7 @@ export function maskSource(src: string): Masked {
         keep(i, KIND_STRING);
         stack.pop();
         prevSignificant = "`";
-        prevWord = "";
+        wordLive = false;
         i += 1;
         continue;
       }
@@ -127,7 +139,7 @@ export function maskSource(src: string): Masked {
         keep(i + 1, KIND_CODE);
         stack.push({ mode: "code", depth: 0 });
         prevSignificant = "{";
-        prevWord = "";
+        wordLive = false;
         i += 2;
         continue;
       }
@@ -172,7 +184,7 @@ export function maskSource(src: string): Masked {
       if (j < n && src[j] === c) keep(j, KIND_STRING);
       i = j < n && src[j] === c ? j + 1 : j;
       prevSignificant = '"';
-      prevWord = "";
+      wordLive = false;
       continue;
     }
     if (c === "`") {
@@ -181,7 +193,10 @@ export function maskSource(src: string): Masked {
       i += 1;
       continue;
     }
-    if (c === "/" && regexAllowed(prevSignificant, prevWord)) {
+    if (
+      c === "/" &&
+      regexAllowed(prevSignificant, wordLive ? src.slice(wordStart, wordEnd + 1) : "")
+    ) {
       let j = i + 1;
       let inClass = false;
       let closed = false;
@@ -209,7 +224,7 @@ export function maskSource(src: string): Masked {
         blank(j + 1, k, KIND_STRING);
         i = k;
         prevSignificant = "/";
-        prevWord = "";
+        wordLive = false;
         continue;
       }
       // Unterminated on this line: treat as ordinary division after all.
@@ -221,7 +236,7 @@ export function maskSource(src: string): Masked {
         stack.pop();
         i += 1;
         prevSignificant = "}";
-        prevWord = "";
+        wordLive = false;
         continue;
       }
       top.depth = Math.max(0, top.depth - 1);
@@ -231,10 +246,13 @@ export function maskSource(src: string): Masked {
       prevSignificant = c;
       if (IDENT_CHAR.test(c)) {
         let s = i;
-        while (s > 0 && IDENT_CHAR.test(src[s - 1] as string)) s--;
-        prevWord = src.slice(s, i + 1);
+        while (s > wordEnd + 1 && IDENT_CHAR.test(src[s - 1] as string)) s--;
+        if (s === wordEnd + 1) s = wordStart;
+        wordStart = s;
+        wordEnd = i;
+        wordLive = true;
       } else {
-        prevWord = "";
+        wordLive = false;
       }
     } else if (c === "\n") {
       // A newline is significant for the regex heuristic (statement start)
@@ -527,31 +545,170 @@ export type ImportRecord = {
   readonly names: readonly string[];
 };
 
-const STATIC_IMPORT_RE =
-  /\bimport\s+(?<type>type\s+)?(?<clause>[^;'"]*?)\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+/**
+ * `import … from "…"`. The clause is lazy and ends on a character that is not
+ * whitespace (or is empty): the shortest clause the old `[^;'"]*?` found was
+ * always such a one, because `\s*` takes any whitespace after it, and trying
+ * `\s*from` only there reads a run of spaces inside the clause once rather
+ * than once per space. The whitespace after `import` and after `type` is
+ * taken whole (`(?!\s)`): a shorter take leaves the clause to start with
+ * the rest of the run, which matches only where the whole take does, and
+ * trying each one rescanned the run from each. The closing quote is written
+ * out for each opening one rather than as a back-reference, which matches
+ * the same text and lets a test count the pattern's steps. It is tried where
+ * an `import` starts (see importFailedTo).
+ */
+export const STATIC_IMPORT_RE =
+  /\bimport\s+(?!\s)(?<type>type\s+(?!\s))?(?<clause>(?:[^;'"]*?[^;'"\s])??)\s*from\s*(?:(?<q>")(?<spec>[^'"\n]*)"|(?<q>')(?<spec>[^'"\n]*)')/g;
 const BARE_IMPORT_RE = /\bimport\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
-const EXPORT_FROM_RE =
+export const EXPORT_FROM_RE =
   /\bexport\s+(?<type>type\s+)?(?<clause>\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+
+/**
+ * After an `import` whose clause was read and found no `from "…"`, every later
+ * `import` before the next `;` or quote would read on to the same place and
+ * fail the same way; a match from one of them would make one from this.
+ */
+function importFailedTo(text: string, at: number): number {
+  if (!text.startsWith("import", at) || !isRegExpSpace(text.charCodeAt(at + 6))) return at + 1;
+  for (let i = at + 6; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x3b || c === 0x27 || c === 0x22) return i;
+  }
+  return text.length;
+}
+
+/**
+ * Where `/export\s+(?:type\s+)?\{/y` would end if it matched at `at`, or -1,
+ * read by hand so a check at every `export` runs no pattern.
+ */
+function exportBraceOpen(text: string, at: number): number {
+  if (!text.startsWith("export", at)) return -1;
+  const spacesFrom = (start: number): number => {
+    let i = start;
+    while (i < text.length && isRegExpSpace(text.charCodeAt(i))) i++;
+    return i;
+  };
+  let i = spacesFrom(at + 6);
+  if (i === at + 6) return -1;
+  if (text.startsWith("type", i)) {
+    const afterType = spacesFrom(i + 4);
+    if (afterType > i + 4 && text.charCodeAt(afterType) === 0x7b) return afterType + 1;
+  }
+  i = text.charCodeAt(i) === 0x7b ? i + 1 : -1;
+  return i;
+}
+
+/**
+ * Where EXPORT_FROM_RE is tried, and what a failed try rules out. After an
+ * `export {` whose list had no `from "…"` after it, every later `export {`
+ * before that list's `}` ends at the same `}` and fails the same way, so it
+ * is not tried; an `export *` there still is. One per scan: it keeps state.
+ */
+function exportFromScan(): {
+  canStart: (text: string, at: number) => boolean;
+  failedTo: (text: string, at: number) => number;
+} {
+  const isExport = wordAt("export");
+  let failedBraceEnd = -1;
+  return {
+    canStart: (text, at) =>
+      isExport(text, at) && !(at < failedBraceEnd && exportBraceOpen(text, at) !== -1),
+    failedTo: (text, at) => {
+      const open = exportBraceOpen(text, at);
+      if (open !== -1) {
+        const close = text.indexOf("}", open);
+        failedBraceEnd = close === -1 ? text.length : close;
+      }
+      return at + 1;
+    },
+  };
+}
 const DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
 const REQUIRE_RE = /\brequire\s*\(\s*(?<q>['"])(?<spec>[^'"\n]*)\k<q>/g;
+
+/** STATIC_IMPORT_RE's matches in `code`, tried where an `import` starts. */
+export function staticImportMatches(code: string): Iterable<RegExpExecArray> {
+  return matchAllSkipping(code, STATIC_IMPORT_RE, wordAt("import"), importFailedTo);
+}
+
+/** EXPORT_FROM_RE's matches in `code`, tried where an `export` starts. */
+export function exportFromMatches(code: string): Iterable<RegExpExecArray> {
+  const scan = exportFromScan();
+  return matchAllSkipping(code, EXPORT_FROM_RE, scan.canStart, scan.failedTo);
+}
+
+export const EXPORT_LIST_RE =
+  /\bexport\s+(?<type>type\s+)?\{(?<body>[^}]*)\}(?<tail>\s*from\s*['"][^'"\n]*['"])?/g;
+
+/**
+ * EXPORT_LIST_RE's matches in `code`, tried where an `export` starts. With
+ * its tail optional, a try fails only when no `}` follows its `{`, and then
+ * none follows a later one either.
+ */
+export function exportListMatches(code: string): Iterable<RegExpExecArray> {
+  return matchAllSkipping(code, EXPORT_LIST_RE, wordAt("export"), (text, at) =>
+    exportBraceOpen(text, at) === -1 ? at + 1 : text.length,
+  );
+}
+
+/** A code unit `[\w$]` matches. */
+function isIdentifierUnit(c: number): boolean {
+  return (
+    (c >= 0x30 && c <= 0x39) ||
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    c === 0x5f ||
+    c === 0x24
+  );
+}
+
+/**
+ * The alias in `name as alias`: what `/\s+as\s+([\w$]+)$/.exec(piece)?.[1]`
+ * returned, read from the end. That pattern tries every start inside a run
+ * of whitespace and, where `as` does not follow the run, rescans the rest of
+ * it from each before giving the start up, so a long run inside an import or
+ * export list was quadratic in its length.
+ */
+export function aliasAfterAs(piece: string): string | undefined {
+  let alias = piece.length;
+  while (alias > 0 && isIdentifierUnit(piece.charCodeAt(alias - 1))) alias--;
+  if (alias === piece.length) return undefined;
+  let gap = alias;
+  while (gap > 0 && isRegExpSpace(piece.charCodeAt(gap - 1))) gap--;
+  if (gap === alias || gap < 3) return undefined;
+  if (piece.charCodeAt(gap - 1) !== 0x73 || piece.charCodeAt(gap - 2) !== 0x61) return undefined;
+  return isRegExpSpace(piece.charCodeAt(gap - 3)) ? piece.slice(alias) : undefined;
+}
+
+/**
+ * The first `{…}` in `text`: what `/\{([^}]*)\}/.exec(text)` found, with two
+ * searches, the first `{` and the first `}` after it (with none after the
+ * first `{`, none follows a later one). The pattern rescanned a run of `{`
+ * from each one in it.
+ */
+export function firstBraced(text: string): { index: number; body: string } | null {
+  const open = text.indexOf("{");
+  const close = open === -1 ? -1 : text.indexOf("}", open + 1);
+  return close === -1 ? null : { index: open, body: text.slice(open + 1, close) };
+}
 
 function clauseNames(clause: string): string[] {
   const text = clause.trim();
   if (text === "") return [];
   if (text.startsWith("*")) return ["*"];
   const names: string[] = [];
-  const braced = /\{([^}]*)\}/.exec(text);
+  const braced = firstBraced(text);
   const beforeBrace = braced === null ? text : text.slice(0, braced.index);
   const defaultName = beforeBrace.replace(/,/g, " ").trim().split(/\s+/)[0];
   if (defaultName !== undefined && defaultName !== "" && /^[\w$]+$/.test(defaultName)) {
     names.push(defaultName);
   }
   if (braced !== null) {
-    for (const part of (braced[1] as string).split(",")) {
+    for (const part of braced.body.split(",")) {
       const piece = part.replace(/\btype\s+/g, "").trim();
       if (piece === "") continue;
-      const asMatch = /\s+as\s+([\w$]+)$/.exec(piece);
-      names.push(asMatch !== null ? (asMatch[1] as string) : (piece.split(/\s+/)[0] as string));
+      names.push(aliasAfterAs(piece) ?? (piece.split(/\s+/)[0] as string));
     }
   }
   return names;
@@ -569,6 +726,10 @@ export function scanImports(src: string): ImportRecord[] {
   const starts = lineStarts(code);
   const out: ImportRecord[] = [];
   const seen = new Set<string>();
+  // Each record's line and specifier, for the bare-import check below. `out`
+  // grows only through `push`, so this set holds exactly what searching it
+  // would find.
+  const claimed = new Set<string>();
 
   const push = (
     index: number,
@@ -583,10 +744,11 @@ export function scanImports(src: string): ImportRecord[] {
     const key = `${line}:${kind}:${specifier}`;
     if (seen.has(key)) return;
     seen.add(key);
+    claimed.add(`${line}:${specifier}`);
     out.push({ specifier, line, kind, typeOnly, names });
   };
 
-  for (const m of code.matchAll(STATIC_IMPORT_RE)) {
+  for (const m of staticImportMatches(code)) {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     push(
@@ -598,7 +760,7 @@ export function scanImports(src: string): ImportRecord[] {
       clauseNames(m.groups?.["clause"] ?? ""),
     );
   }
-  for (const m of code.matchAll(EXPORT_FROM_RE)) {
+  for (const m of exportFromMatches(code)) {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     push(
@@ -624,9 +786,12 @@ export function scanImports(src: string): ImportRecord[] {
     const spec = m.groups?.["spec"] ?? "";
     const specStart = (m.index as number) + m[0].length - 1 - spec.length;
     const line = lineAt(starts, m.index as number);
-    // A bare `import "x"` only counts when no clause form already claimed
-    // this line, since `import x from "y"` matches this pattern too.
-    if (out.some((r) => r.line === line && r.specifier === spec)) continue;
+    // A bare `import "x"` is dropped when a record already holds this line
+    // and this specifier. `spec` is read from the masked text, whose string
+    // bodies are blank, so only an empty or all-space specifier matches; the
+    // `seen` key drops the other repeats. A set answers it: searching every
+    // record so far was quadratic in a file of `import "x";` lines.
+    if (claimed.has(`${line}:${spec}`)) continue;
     push(m.index as number, specStart, spec.length, "import", false, []);
   }
 
@@ -656,9 +821,7 @@ export function scanExports(src: string): ExportRecord[] {
       });
     }
   }
-  for (const m of code.matchAll(
-    /\bexport\s+(?<type>type\s+)?\{(?<body>[^}]*)\}(?<tail>\s*from\s*['"][^'"\n]*['"])?/g,
-  )) {
+  for (const m of exportListMatches(code)) {
     const line = lineAt(starts, m.index as number);
     const tail = m.groups?.["tail"];
     let from: string | undefined;
@@ -671,8 +834,7 @@ export function scanExports(src: string): ExportRecord[] {
     for (const part of (m.groups?.["body"] ?? "").split(",")) {
       const piece = part.replace(/\btype\s+/g, "").trim();
       if (piece === "") continue;
-      const asMatch = /\s+as\s+([\w$]+)$/.exec(piece);
-      const name = asMatch !== null ? (asMatch[1] as string) : (piece.split(/\s+/)[0] as string);
+      const name = aliasAfterAs(piece) ?? (piece.split(/\s+/)[0] as string);
       out.push({ name, line, kind: "named", ...(from === undefined ? {} : { from }) });
     }
   }
@@ -688,9 +850,15 @@ export function scanExports(src: string): ExportRecord[] {
       from: src.slice(specStart, specStart + spec.length),
     });
   }
+  // One default per line. The lines already holding one are kept in a set:
+  // checking each match against every export so far was quadratic in a file
+  // of `export default` lines.
+  const defaultLines = new Set<number>();
+  for (const e of out) if (e.kind === "default") defaultLines.add(e.line);
   for (const m of code.matchAll(/\bexport\s+default\s+(?![\s{])/g)) {
     const line = lineAt(starts, m.index as number);
-    if (out.some((e) => e.line === line && e.kind === "default")) continue;
+    if (defaultLines.has(line)) continue;
+    defaultLines.add(line);
     out.push({ name: "default", line, kind: "default" });
   }
 
@@ -719,6 +887,9 @@ export function findOccurrences(src: string, name: string, maxLineChars = 300): 
   const { kind } = maskSource(src);
   const starts = lineStarts(src);
   const out: Occurrence[] = [];
+  // Each line's text, worked out once: a line can hold thousands of
+  // occurrences, and copying and trimming it for each was quadratic in them.
+  const texts = new Map<number, string>();
   let from = 0;
   while (true) {
     const idx = src.indexOf(name, from);
@@ -731,13 +902,14 @@ export function findOccurrences(src: string, name: string, maxLineChars = 300): 
     if (kind[idx] !== KIND_CODE) continue;
     const line = lineAt(starts, idx);
     const lineStart = starts[line - 1] as number;
-    const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
-    const text = src.slice(lineStart, lineEnd).trim();
-    out.push({
-      line,
-      column: idx - lineStart + 1,
-      text: text.length > maxLineChars ? `${text.slice(0, maxLineChars)}…` : text,
-    });
+    let text = texts.get(line);
+    if (text === undefined) {
+      const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
+      const trimmed = src.slice(lineStart, lineEnd).trim();
+      text = trimmed.length > maxLineChars ? `${trimmed.slice(0, maxLineChars)}…` : trimmed;
+      texts.set(line, text);
+    }
+    out.push({ line, column: idx - lineStart + 1, text });
   }
   return out;
 }
@@ -759,6 +931,11 @@ export const DEFAULT_TODO_MARKERS: readonly string[] = ["TODO", "FIXME", "HACK",
  * A marker inside a string literal is not a note to a maintainer, it is data —
  * usually this very tool's own test fixture — so the mask decides. An author
  * is read from the two conventional forms, `TODO(dave):` and `TODO @dave:`.
+ *
+ * Each line holding a marker is read once, however many markers it holds.
+ * A note's text runs to the end of its line, and 0.7.0 read it there for
+ * every marker: three patterns over the rest of the line, one of them
+ * unanchored, so a comment line of k markers cost k times the line.
  */
 export function scanTodos(
   src: string,
@@ -768,6 +945,8 @@ export function scanTodos(
   const { kind } = maskSource(src);
   const starts = lineStarts(src);
   const out: TodoRecord[] = [];
+  const lines = new Map<number, TodoLine>();
+  const authorAt = new RegExp(TODO_AUTHOR.source, "y");
   for (const marker of markers) {
     let from = 0;
     while (true) {
@@ -779,109 +958,157 @@ export function scanTodos(
       if (before !== "" && IDENT_CHAR.test(before)) continue;
       const line = lineAt(starts, idx);
       const lineStart = starts[line - 1] as number;
-      const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
-      const rest = src.slice(idx + marker.length, lineEnd);
-      const authorMatch = /^\s*(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))/.exec(rest);
-      const author = authorMatch?.[1] ?? authorMatch?.[2];
-      const body = rest
-        .slice(authorMatch === null ? 0 : authorMatch[0].length)
-        .replace(/^\s*[:\-–]\s*/, "")
-        .replace(/\*\/\s*$/, "")
-        .trim();
+      let read = lines.get(line);
+      if (read === undefined) {
+        const lineEnd = line < starts.length ? (starts[line] as number) - 1 : src.length;
+        read = todoLine(src.slice(lineStart, lineEnd));
+        lines.set(line, read);
+      }
+      // A marker running past its line leaves nothing after it, as the
+      // empty slice did.
+      const rest = Math.min(idx + marker.length - lineStart, read.text.length);
+      const note = todoNote(read, rest, authorAt, maxTextChars);
       out.push({
         marker,
-        ...(author === undefined ? {} : { author }),
+        ...(note.author === undefined ? {} : { author: note.author }),
         line,
         column: idx - lineStart + 1,
-        text: body.length > maxTextChars ? `${body.slice(0, maxTextChars)}…` : body,
+        text: note.text,
       });
     }
   }
   return out.sort((a, b) => a.line - b.line || a.column - b.column);
 }
 
+/** `TODO(dave)` or `TODO @dave`, read where the blanks after the marker end. */
+const TODO_AUTHOR = /(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))/;
+
+/** What `scanTodos` needs of a line, read once. */
+type TodoLine = {
+  readonly text: string;
+  /** For each offset, the first at or after it that is not `\s`; the length when none is. */
+  readonly solid: Int32Array;
+  /** The length less the trailing `\s`. */
+  readonly end: number;
+  /** Where a comment close (a star, then a slash) just before that trailing `\s` starts, or -1. */
+  readonly close: number;
+  /** `close` less the `\s` before it. */
+  readonly closeEnd: number;
+  /** The author pattern's answer at each offset it was tried at. */
+  readonly authors: Map<number, RegExpExecArray | null>;
+};
+
+function todoLine(text: string): TodoLine {
+  const solid = new Int32Array(text.length + 1);
+  solid[text.length] = text.length;
+  for (let i = text.length - 1; i >= 0; i--) {
+    solid[i] = isRegExpSpace(text.charCodeAt(i)) ? (solid[i + 1] as number) : i;
+  }
+  const trimmedTo = (to: number): number => {
+    let at = to;
+    while (at > 0 && isRegExpSpace(text.charCodeAt(at - 1))) at--;
+    return at;
+  };
+  const end = trimmedTo(text.length);
+  const close =
+    end >= 2 && text.charCodeAt(end - 2) === 0x2a && text.charCodeAt(end - 1) === 0x2f
+      ? end - 2
+      : -1;
+  return {
+    text,
+    solid,
+    end,
+    close,
+    closeEnd: close === -1 ? -1 : trimmedTo(close),
+    authors: new Map(),
+  };
+}
+
+/** `:`, `-` or `–`, the separators a note may start with. */
+function isNoteSeparator(c: number): boolean {
+  return c === 0x3a || c === 0x2d || c === 0x2013;
+}
+
+/** How much of a text `length` long `slice(0, max)` keeps. */
+function keptLength(length: number, max: number): number {
+  const n = Math.trunc(max) || 0;
+  return n < 0 ? Math.max(length + n, 0) : Math.min(n, length);
+}
+
+/**
+ * The author and the text of the note after a marker, where the marker ends
+ * at `rest` in the line. 0.7.0 read them from a copy of the rest of the line
+ * with `^\s*(?:\(\s*@?([\w.@-]+)\s*\)|@([\w.-]+))`, then dropped a
+ * leading `^\s*[:\-–]\s*` and a trailing `\*\/\s*$` and trimmed what was
+ * left; each step is answered here from the line's offsets.
+ *
+ *   - The author pattern's leading `\s*` can give back nothing either
+ *     alternative starts with, so it matched where the blanks end or not at
+ *     all: the rest of the pattern is tried there, once for each offset.
+ *   - The separator pattern is the same: a separator where the blanks end,
+ *     and then the blanks after it.
+ *   - `\*\/\s*$` matches only a comment close with nothing but `\s`
+ *     after it, so the line's own, when it starts inside what is left.
+ *   - The trim keeps from the first non-`\s` to the last before the cut.
+ */
+function todoNote(
+  line: TodoLine,
+  rest: number,
+  authorAt: RegExp,
+  maxTextChars: number,
+): { author: string | undefined; text: string } {
+  const { text, solid } = line;
+  const lead = solid[rest] as number;
+  let match = line.authors.get(lead);
+  if (match === undefined) {
+    authorAt.lastIndex = lead;
+    match = authorAt.exec(text);
+    line.authors.set(lead, match);
+  }
+  const author = match === null ? undefined : (match[1] ?? match[2]);
+  const afterAuthor = match === null ? rest : lead + match[0].length;
+  const separator = solid[afterAuthor] as number;
+  const body =
+    separator < text.length && isNoteSeparator(text.charCodeAt(separator))
+      ? (solid[separator + 1] as number)
+      : afterAuthor;
+  const closes = line.close >= body;
+  const solidAt = solid[body] as number;
+  // Nothing but blanks before the cut: an empty text.
+  const empty = solidAt >= (closes ? line.close : text.length);
+  const first = empty ? 0 : solidAt;
+  const last = empty ? 0 : closes ? line.closeEnd : line.end;
+  const length = last - first;
+  return {
+    author,
+    text:
+      length > maxTextChars
+        ? `${text.slice(first, first + keptLength(length, maxTextChars))}…`
+        : text.slice(first, last),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // caller-supplied patterns
 
 /**
- * True when `pattern` contains a repetition nested inside a repetition, the
- * shape that makes a JavaScript regular expression backtrack exponentially.
+ * True when `pattern` repeats a group whose passes can end in more than one
+ * place or split their text more than one way — a nested quantifier or an
+ * overlapping repeated alternation, the shapes that make a JavaScript regular
+ * expression backtrack exponentially.
  *
- * `AstQuery` compiles a pattern the caller wrote and runs it against every
- * declaration name in a tree, and a JavaScript regex cannot be interrupted
- * once it is running: `^(a|a|aa)+$` against a twenty-six-character identifier
- * measured at six hundred milliseconds HERE, so a few thousand names is a
- * harness that never comes back. There is no timeout to reach for, so the
- * pattern is refused before it is compiled.
- *
- * The test is the classic star-height one, done with a scanner rather than a
- * pattern of its own: a group with an unbounded quantifier (`*`, `+`, `{n,}`)
- * on it whose body itself contains an unbounded quantifier or an alternation.
- * That rejects `(a+)+`, `(a*)*` and `(a|a)+`, and leaves the patterns a caller
- * actually writes over declaration names — `^get[A-Z]\w*`, `^(get|set)Foo$`,
- * `Service$` — alone, because in those the quantifier and the group are not
- * nested in each other.
+ * This is @crewhaus/tool-safety's shared screen (C079). 0.7.0 kept a scanner
+ * here that treated a bounded outer count as safe, so `^(a|a){1,99}$`,
+ * `^(\w|[a-zA-Z]){1,64}Z$` and `^(\w+){2,64}$` passed it and cost about
+ * 650 ms per long identifier. The shared screen models `{n,m}` and `?`,
+ * accepts a small bounded repetition only while the ways through it stay
+ * few, and is fuzzed. `AstQuery` also runs the match in the regex worker
+ * under a deadline, so this is the second layer, not the first.
  */
 export function hasNestedRepetition(pattern: string): boolean {
-  const opens: number[] = [];
-  let inClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "\\") {
-      i += 1;
-      continue;
-    }
-    if (inClass) {
-      if (c === "]") inClass = false;
-      continue;
-    }
-    if (c === "[") {
-      inClass = true;
-      continue;
-    }
-    if (c === "(") {
-      opens.push(i);
-      continue;
-    }
-    if (c !== ")") continue;
-    const start = opens.pop();
-    if (start === undefined) continue;
-    if (!unboundedQuantifierAt(pattern, i + 1)) continue;
-    if (repeatsOrBranches(pattern.slice(start + 1, i))) return true;
-  }
-  return false;
-}
-
-/** `*`, `+` or an open-ended `{n,}` at this offset. */
-function unboundedQuantifierAt(pattern: string, at: number): boolean {
-  const c = pattern[at];
-  if (c === "*" || c === "+") return true;
-  if (c !== "{") return false;
-  const close = pattern.indexOf("}", at);
-  if (close === -1) return false;
-  return /^\{\d*,\s*\}$/.test(pattern.slice(at, close + 1));
-}
-
-/** True when a group body has an unbounded quantifier or a top-level `|`. */
-function repeatsOrBranches(body: string): boolean {
-  let inClass = false;
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i];
-    if (c === "\\") {
-      i += 1;
-      continue;
-    }
-    if (inClass) {
-      if (c === "]") inClass = false;
-      continue;
-    }
-    if (c === "[") {
-      inClass = true;
-      continue;
-    }
-    if (c === "|") return true;
-    if (c === "*" || c === "+") return true;
-    if (c === "{" && unboundedQuantifierAt(body, i)) return true;
-  }
-  return false;
+  const verdict = screenUserRegex(pattern);
+  return (
+    !verdict.ok &&
+    (verdict.code === "nested-quantifier" || verdict.code === "overlapping-alternation")
+  );
 }

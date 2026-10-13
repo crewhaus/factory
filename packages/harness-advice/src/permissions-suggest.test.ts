@@ -14,9 +14,11 @@ import {
 import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
+  type AskAggregate,
   OPERATIVE_ARG_FIELDS,
   aggregateAsks,
   applyToSettingsRoot,
+  blanketGrantNote,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
@@ -24,6 +26,7 @@ import {
   patternFor,
   rankSuggestions,
   readOnlyByName,
+  suggestLookupFromTools,
 } from "./permissions-suggest";
 
 function tool(name: string, readOnly: boolean): RegisteredTool {
@@ -112,6 +115,228 @@ describe("aggregateAsks", () => {
   it("tolerates old-vintage logs with no permission lines", () => {
     const s = session("sess_00000000000000dd", [line("assistant_message", { text: "hi" })]);
     expect(aggregateAsks([s]).size).toBe(0);
+  });
+});
+
+// -------- 0.7.1: reading a call the way the matcher reads it --------
+
+describe("aggregateAsks with the tools' own declarations (permission-integration#8)", () => {
+  function declared(
+    name: string,
+    operativeArgs: RegisteredTool["operativeArgs"],
+    shape: z.ZodRawShape,
+    extra: Partial<RegisteredTool> = {},
+  ): RegisteredTool {
+    return {
+      ...tool(name, false),
+      inputSchema: z.object(shape) as never,
+      ...(operativeArgs !== undefined ? { operativeArgs } : {}),
+      ...extra,
+    };
+  }
+  const TOOLS = {
+    removePath: declared("RemovePath", [{ field: "path", kind: "path" }], {
+      path: z.string(),
+      recursive: z.boolean().optional(),
+    }),
+    httpRequest: declared("HttpRequest", [{ field: "url", kind: "url" }], {
+      url: z.string(),
+      method: z.string().optional(),
+    }),
+    copyPath: declared(
+      "CopyPath",
+      [
+        { field: "source", kind: "path" },
+        { field: "destination", kind: "path" },
+      ],
+      { source: z.string(), destination: z.string() },
+    ),
+    clipboardWrite: declared("ClipboardWrite", [], { text: z.string() }),
+    kvSet: declared(
+      "KvSet",
+      [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "key", kind: "id", within: "namespace" },
+      ],
+      { namespace: z.string(), key: z.string(), stateDir: z.string().optional() },
+    ),
+    emailSend: declared(
+      "EmailSend",
+      [{ field: "to", kind: "recipient" }],
+      { to: z.string(), body: z.string() },
+      { requireJustification: true },
+    ),
+  };
+  const lookup = suggestLookupFromTools(TOOLS);
+  const asked = (name: string, ...inputs: unknown[]) =>
+    session("sess_00000000000000ee", [
+      ...inputs.map((i) => toolUse(name, i)),
+      ask(name, "approved"),
+      ask(name, "approved"),
+      ask(name, "approved"),
+    ]);
+  const aggFor = (name: string, ...inputs: unknown[]) =>
+    aggregateAsks([asked(name, ...inputs)], lookup).get(name) as AskAggregate;
+
+  it("scopes on the declared field, in the canonical form the matcher compares", () => {
+    const rm = aggFor("RemovePath", { path: "./build/../build/cache", recursive: true });
+    expect(patternFor(rm)).toBe("RemovePath(build/cache)");
+    expect(blanketGrantNote(rm)).toBeUndefined();
+    const http = aggFor("HttpRequest", { url: "HTTPS://API.example.com", method: "DELETE" });
+    expect(patternFor(http)).toBe("HttpRequest(https://api.example.com/)");
+  });
+
+  it("a store the calls left out does not turn a key-scoped proposal into a blanket one (C004)", () => {
+    // The store's default is read by a deny or ask only; an allow — what this
+    // proposes — is about the key, which is where these calls all acted.
+    const kv = aggFor("KvSet", { namespace: "scratch", key: "a" });
+    expect(patternFor(kv)).toBe("KvSet(scratch/a)");
+    expect(blanketGrantNote(kv)).toBeUndefined();
+    // A call that names the store is two places, as before.
+    const moved = aggFor("KvSet", { namespace: "scratch", key: "a", stateDir: "elsewhere" });
+    expect(blanketGrantNote(moved)).toContain("more than one place");
+  });
+
+  it("strips the justification the runtime strips before parsing", () => {
+    const mail = aggFor("EmailSend", {
+      to: "ops@example.com",
+      body: "hi",
+      justification: "the weekly report the operator asked for",
+    });
+    expect(patternFor(mail)).toBe("EmailSend(ops@example.com)");
+  });
+
+  it("gives every reason a proposal cannot be scoped, as a BLANKET GRANT line", () => {
+    const cases: Array<[AskAggregate, string]> = [
+      [aggFor("RemovePath", { path: "a" }, { path: "b" }), "2 different places"],
+      [aggFor("RemovePath", { path: "../outside" }), "cannot name (outside the workspace"],
+      [aggFor("RemovePath", { nope: 1 }), "no longer fits the tool's input"],
+      [aggFor("CopyPath", { source: "a", destination: "b" }), "more than one place"],
+      [aggFor("ClipboardWrite", { text: "x" }), "has no argument that decides where it acts"],
+      [aggFor("mcp__srv__delete", { id: "1" }), "does not declare which argument"],
+      [aggFor("HttpRequest", { url: "not a url" }), "cannot name"],
+    ];
+    for (const [agg, reason] of cases) {
+      expect({ tool: agg.toolName, pattern: patternFor(agg) }).toEqual({
+        tool: agg.toolName,
+        pattern: agg.toolName,
+      });
+      expect(blanketGrantNote(agg)).toContain(
+        `BLANKET GRANT: this allows every ${agg.toolName} call`,
+      );
+      expect(blanketGrantNote(agg)).toContain(reason);
+    }
+  });
+
+  it("a call that stands for every value is not proposed as a literal rule (final review)", () => {
+    // KvList's prefix lists every key that starts with it. Escaped as a
+    // literal, `KvList(scratch/a\*)` would never fire for the call it came
+    // from, so the proposal is a bare grant that says why.
+    const list = declared(
+      "KvList",
+      [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "prefix", kind: "id", within: "namespace", default: "*", prefix: true },
+      ],
+      { namespace: z.string(), prefix: z.string().optional(), stateDir: z.string().optional() },
+    );
+    const logs = declared(
+      "EvmGetLogs",
+      [{ field: "address", kind: "id", within: "chainId", default: "*" }],
+      { chainId: z.string(), address: z.string().optional() },
+    );
+    const glob = declared("Glob", [{ field: "pattern", kind: "path", glob: true }], {
+      pattern: z.string(),
+    });
+    const withLists = suggestLookupFromTools({
+      ...TOOLS,
+      kvList: list,
+      evmGetLogs: logs,
+      glob,
+    });
+    for (const [name, input] of [
+      ["KvList", { namespace: "scratch", prefix: "a" }],
+      ["KvList", { namespace: "scratch" }],
+      ["EvmGetLogs", { chainId: "1" }],
+      ["Glob", { pattern: "src/*.ts" }],
+    ] as const) {
+      const agg = aggregateAsks([asked(name, input)], withLists).get(name) as AskAggregate;
+      expect({ name, input, pattern: patternFor(agg) }).toEqual({ name, input, pattern: name });
+      expect(blanketGrantNote(agg)).toContain("every value at once");
+    }
+    // One named value is still scoped.
+    const one = aggregateAsks(
+      [asked("EvmGetLogs", { chainId: "1", address: "0xab" })],
+      withLists,
+    ).get("EvmGetLogs") as AskAggregate;
+    expect(patternFor(one)).toBe("EvmGetLogs(1/0xab)");
+  });
+
+  it("a proposal for a shell line grants the calls it came from, and no other line", () => {
+    // Bash reads its command command by command (0.7.1): an allow must match
+    // each, or be the exact line. A proposal is that exact line, escaped.
+    const bash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
+      command: z.string(),
+    });
+    const shellLookup = suggestLookupFromTools({ bash });
+    const lines = [
+      "git status && git log",
+      "git status;",
+      "echo `date`",
+      "cat <<EOF\nx\nEOF",
+      "npm test 2>&1 | tail -5",
+    ];
+    for (const command of lines) {
+      const agg = aggregateAsks([asked("Bash", { command })], shellLookup).get(
+        "Bash",
+      ) as AskAggregate;
+      const pattern = patternFor(agg);
+      expect({ command, scoped: pattern !== "Bash" }).toEqual({ command, scoped: true });
+      const values = [{ kind: "command" as const, canonical: [command], shell: true }];
+      expect({
+        command,
+        grants: matchesPattern(
+          compilePattern(pattern),
+          "Bash",
+          { command },
+          { operativeValues: values },
+        ),
+      }).toEqual({ command, grants: true });
+      const longer = [
+        { kind: "command" as const, canonical: [`${command}\nrm -rf build`], shell: true },
+      ];
+      expect(matchesPattern(compilePattern(pattern), "Bash", {}, { operativeValues: longer })).toBe(
+        false,
+      );
+    }
+    // Without a declaration, the tool named Bash reads the same way.
+    const legacy = aggregateAsks([asked("Bash", { command: "git status && git log" })]).get(
+      "Bash",
+    ) as AskAggregate;
+    expect(patternFor(legacy)).toBe("Bash(git status && git log)");
+  });
+
+  it("a value its own rule would not match is proposed as a bare grant, and says why", () => {
+    // A declared url that does not parse keeps no canonical spelling an
+    // allow could read, so the rule `HttpRequest(<value>)` never fires.
+    const agg = aggFor("HttpRequest", { url: "https://u:p@example.com/x" });
+    expect(patternFor(agg)).toBe("HttpRequest");
+    expect(blanketGrantNote(agg)).toContain("its own rule would not match");
+  });
+
+  it("rankSuggestions carries the BLANKET GRANT line into a bare allow's evidence", () => {
+    const aggs = aggregateAsks([asked("ClipboardWrite", { text: "x" })], lookup);
+    const [grant] = rankSuggestions(aggs, new Map());
+    expect(grant?.rule.pattern).toBe("ClipboardWrite");
+    expect(grant?.evidence.some((l) => l.startsWith("BLANKET GRANT"))).toBe(true);
+  });
+
+  it("without a lookup, only the matcher's legacy name table is known", () => {
+    const bash = aggregateAsks([asked("Bash", { command: "git status" })]).get("Bash");
+    expect(patternFor(bash as AskAggregate)).toBe("Bash(git status)");
+    const rm = aggregateAsks([asked("RemovePath", { path: "build" })]).get("RemovePath");
+    expect(patternFor(rm as AskAggregate)).toBe("RemovePath");
+    expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
   });
 });
 
@@ -302,6 +527,28 @@ describe("diffPermissions", () => {
     const blob = formatSettingsDiff(diff).join("\n");
     expect(blob).toContain('  + { type: alwaysAllow, pattern: "Read" }');
     expect(blob).toContain('    { type: alwaysDeny, pattern: "Bash(rm**)" }');
+  });
+
+  it("flags a new bare allow as a blanket grant, and nothing else", () => {
+    const diff = diffPermissions(
+      [{ type: "alwaysAllow", pattern: "Glob" }],
+      [
+        ...suggestions,
+        {
+          rule: { type: "alwaysAllow", pattern: "Write(out/report.md)", source: "settings" },
+          reason: "recurring-approved",
+          toolName: "Write",
+          readOnly: false,
+          evidence: [],
+          weight: 3,
+        },
+      ],
+    );
+    const lines = formatSettingsDiff(diff);
+    const flagged = lines.filter((l) => l.includes("BLANKET GRANT"));
+    expect(flagged).toEqual([
+      '  + { type: alwaysAllow, pattern: "Read" } (⚠ BLANKET GRANT — every call of the tool)',
+    ]);
   });
 
   it("annotates a still-wildcarded pattern (F2)", () => {

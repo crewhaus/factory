@@ -110,17 +110,34 @@ recorded and not followed.
 Neither gate is a field in any tool's input schema. A gate a model can open for
 itself is not a gate.
 
+A spec restricts `FederationDiscover` to known peers, and a compiled bundle,
+`crewhaus run` and `crewhaus eval` apply it at boot:
+
+```yaml
+tool_config:
+  federationDiscover:
+    allowed_origins: [https://peer.example]   # the ONLY peers it dials
+```
+
+An empty `allowed_origins` list means *nothing* may be dialled, not *anything*.
+A `model_pool` candidate may carry the same block under its own `tool_config`; it
+narrows that model's sweeps and never widens them (a peer must be on both lists),
+and the result reports it as `posture.modelAllowList`. A candidate block the tool
+cannot read refuses the sweep rather than dialling everything.
+A spec cannot open loopback or the private ranges — `allow_private_hosts` in the
+block is refused. A host that needs a local federation fixture, or wants to
+check manifest signatures, sets the gates in code:
+
 ```ts
 import { setPeerPolicy, setMarketplaceTrustRoot } from "@crewhaus/tool-discovery";
 
-// Reach a local federation fixture, or restrict dialling to known origins.
-setPeerPolicy({ allowPrivateHosts: false, allowedOrigins: ["https://peer.example"] });
+// Reach a local federation fixture.
+setPeerPolicy({ allowPrivateHosts: true, allowedOrigins: ["https://127.0.0.1:8443"] });
 
-// The keys manifest signatures are checked against.
+// The keys manifest signatures are checked against. Unset, a signed
+// manifest's verdict is reported as unknown — never as trusted.
 setMarketplaceTrustRoot({ publicKeys: [pem] });
 ```
-
-An empty `allowedOrigins` array means *nothing* may be dialled, not *anything*.
 
 ## Could not determine is not no
 
@@ -169,8 +186,15 @@ the indirect prompt-injection channel.
 
 Every such string is carried inside a named `authored` object, never
 interpolated into a sentence of the tool's own, under a top-level `dataNotice`
-saying so. Control bytes, C1 codes, bidi overrides and zero-width characters
-are replaced, the field is length-capped, and **every substitution is reported**
+saying so. Control bytes, C1 codes and line/paragraph separators are replaced,
+and so is every character Unicode classes as a format character (bidi marks,
+zero-width characters, the soft hyphen, the tag characters U+E0000–E007F that
+can spell a hidden sentence), every default-ignorable code point (variation
+selectors, fillers), private-use characters and unpaired surrogates — Unicode's
+own classes, not a hand-kept list of ranges. One text/emoji presentation
+selector directly after an emoji survives, so "❤️" keeps its presentation. The
+field is length-capped by code point, so the cut never splits a character, and
+**every substitution is reported**
 in `authoredSanitized` — on a template row and on a peer's `record` alike, a
 silently altered field is its own kind of lie. A library error that quotes the
 peer's own text (the discovery library interpolates the endpoint into its

@@ -1,5 +1,15 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { __resetBackgroundProcsForTest, bash, bashOutput, killShell } from "./index";
+
+/** Spies a test installs, restored after it even if its body was abandoned. */
+const spies: Array<{ mockRestore: () => void }> = [];
+
+afterEach(() => {
+  for (const spy of spies.splice(0)) spy.mockRestore();
+});
 
 describe("Bash tool metadata", () => {
   test("name + flags", () => {
@@ -45,12 +55,48 @@ describe("Bash tool execution", () => {
   });
 
   test("kills the process and reports timeout when exceeded", async () => {
-    const start = Date.now();
-    const out = await bash.execute({ command: "sleep 10", timeout: 150 });
-    const elapsed = Date.now() - start;
-    expect(out).toContain("timed out after 150ms");
-    expect(elapsed).toBeLessThan(2000);
-  });
+    // The timers the call arms as it starts are held, not left to the clock:
+    // the test checks the only one is set for the requested timeout and fires
+    // it itself, so the kill is shown to be armed for that timeout and to be
+    // what ends the call, however slow the runner. Timing the call (under 2 s
+    // for 150 ms) raced the runner; timing nothing let a kill armed 20 times
+    // late pass. The sleep outlasts the budget, so only the kill can end the
+    // call; `exec`, so the kill reaches the sleep itself.
+    const realSetTimeout = globalThis.setTimeout;
+    const hold = { on: true };
+    const held: Array<{ ms: number | undefined; fire: () => void }> = [];
+    spies.push(
+      spyOn(globalThis, "setTimeout").mockImplementation(((
+        fn: (...args: unknown[]) => void,
+        ms?: number,
+        ...args: unknown[]
+      ) => {
+        if (!hold.on) return realSetTimeout(fn, ms, ...args);
+        const once = { fired: false };
+        held.push({
+          ms,
+          fire: () => {
+            if (once.fired) return;
+            once.fired = true;
+            fn(...args);
+          },
+        });
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as unknown as typeof setTimeout),
+    );
+    // execute() arms its timers synchronously, before its first await.
+    const call = bash.execute({ command: "exec sleep 120", timeout: 150 });
+    hold.on = false;
+    try {
+      expect(held.map((timer) => timer.ms)).toEqual([150]);
+      held[0]?.fire();
+      expect(await call).toContain("timed out after 150ms");
+    } finally {
+      // A failed check must not leave the sleep running: fire what was held.
+      for (const timer of held) timer.fire();
+      await call;
+    }
+  }, 20_000);
 
   test("does not time out when command finishes within budget", async () => {
     const out = await bash.execute({ command: "echo fast", timeout: 5000 });
@@ -73,22 +119,24 @@ describe("Bash tool execution", () => {
   });
 });
 
-// Poll a background process until BashOutput reports it is no longer running,
-// or the attempt budget is exhausted. Each poll consumes NEW output, so we
-// accumulate across polls.
-async function drainBackground(
+/**
+ * Poll a background process until what its polls returned, together,
+ * satisfies `done`, and return that. Ends on the output, not on a count of
+ * polls a slow runner could exhaust; `hangStopMs` only stops a wait for
+ * output that never comes, and the assertions after it then fail.
+ */
+async function pollUntil(
   id: string,
-  attempts = 50,
-): Promise<{ combined: string; last: string }> {
-  let combined = "";
-  let last = "";
-  for (let i = 0; i < attempts; i++) {
-    last = await bashOutput.execute({ bash_id: id });
-    combined += `${last}\n`;
-    if (!last.includes("[status] running")) break;
+  done: (seen: string) => boolean,
+  hangStopMs = 10_000,
+): Promise<string> {
+  const began = performance.now();
+  let seen = "";
+  for (;;) {
+    seen += `${await bashOutput.execute({ bash_id: id })}\n`;
+    if (done(seen) || performance.now() - began > hangStopMs) return seen;
     await new Promise((r) => setTimeout(r, 20));
   }
-  return { combined, last };
 }
 
 describe("background Bash + BashOutput + KillShell", () => {
@@ -105,41 +153,98 @@ describe("background Bash + BashOutput + KillShell", () => {
   });
 
   test("background:true returns a bash_id immediately without blocking", async () => {
-    const started = Date.now();
-    const out = await bash.execute({ command: "sleep 2; echo done", background: true });
-    expect(Date.now() - started).toBeLessThan(1000); // did NOT wait for sleep 2
-    expect(out).toContain("[background] started bash_");
-    expect(out).toMatch(/bash_[0-9a-f]{12}/);
-  });
+    // "Immediately" is counted in event-loop turns, not timed: the call has
+    // settled before one macrotask turn has passed, so it waited on no timer,
+    // no output and no exit (Bun.spawn is synchronous). The command waits for
+    // a file this test creates only after the call has returned, so it is
+    // still running then. Timing the call ("under 1 s, against a 2 s sleep")
+    // raced the runner; only awaiting it let a start that blocks for a
+    // bounded time pass.
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-bash-gate-"));
+    const gate = join(dir, "release");
+    try {
+      const call = bash.execute({
+        command: `while [ ! -f '${gate}' ]; do sleep 0.01; done; echo done`,
+        background: true,
+      });
+      const state = { settled: false };
+      const settle = (): void => {
+        state.settled = true;
+      };
+      void call.then(settle, settle);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(state.settled).toBe(true);
+      const out = await call;
+      expect(out).toContain("[background] started bash_");
+      expect(out).toMatch(/bash_[0-9a-f]{12}/);
+      const id = out.match(/bash_[0-9a-f]{12}/)?.[0] as string;
+      expect(await bashOutput.execute({ bash_id: id })).toContain("[status] running");
+      writeFileSync(gate, "");
+      const after = await pollUntil(
+        id,
+        (seen) => seen.includes("done") && seen.includes("[status] exited"),
+      );
+      expect(after).toContain("done");
+      expect(after).toContain("[status] exited 0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("BashOutput streams incremental output then reports the exit code", async () => {
     const start = await bash.execute({ command: "echo one; echo two", background: true });
     const id = start.match(/bash_[0-9a-f]{12}/)?.[0];
     expect(id).toBeDefined();
-    const { combined, last } = await drainBackground(id as string);
-    expect(combined).toContain("one");
-    expect(combined).toContain("two");
-    expect(last).toContain("[status] exited 0");
+    // Ends on the output and the exit, not after a fixed 50 polls (about a
+    // second), which a child slow to start ran out: it then saw only
+    // "[status] running". Wait for both, as the sibling below does.
+    const seen = await pollUntil(
+      id as string,
+      (polled) => polled.includes("two") && polled.includes("[status] exited"),
+    );
+    expect(seen).toContain("one");
+    expect(seen).toContain("two");
+    expect(seen).toContain("[status] exited 0");
     // A second poll after exit yields no new output but still the status.
     const again = await bashOutput.execute({ bash_id: id as string });
     expect(again).toContain("[no new output]");
     expect(again).toContain("[status] exited 0");
-  });
+  }, 30_000);
 
   test("BashOutput is incremental — a poll only returns output since the last poll", async () => {
-    const start = await bash.execute({
-      command: "echo first; sleep 0.3; echo second",
-      background: true,
-    });
-    const id = start.match(/bash_[0-9a-f]{12}/)?.[0] as string;
-    // First poll (quick) should catch "first" but not yet "second".
-    await new Promise((r) => setTimeout(r, 50));
-    const poll1 = await bashOutput.execute({ bash_id: id });
-    expect(poll1).toContain("first");
-    // Drain the rest; "second" appears in a later poll, not re-reported "first".
-    const { combined } = await drainBackground(id);
-    expect(combined).toContain("second");
-  });
+    // The second line waits for a file this test creates once it has polled
+    // the first, so the order is caused, not hoped for: a fixed 50 ms sleep
+    // before the first poll raced the shell's start, and a slow start left
+    // the poll empty. Each wait ends on what it waits for; 10 s only stops
+    // one that never comes.
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-bash-gate-"));
+    const gate = join(dir, "release-second");
+    try {
+      const start = await bash.execute({
+        command: `echo first; while [ ! -f '${gate}' ]; do sleep 0.01; done; echo second`,
+        background: true,
+      });
+      const id = start.match(/bash_[0-9a-f]{12}/)?.[0] as string;
+      const before = await pollUntil(id, (seen) => seen.includes("first"));
+      expect(before).toContain("first");
+      expect(before).not.toContain("second");
+      expect(before).toContain("[status] running");
+
+      writeFileSync(gate, "");
+      // The rest: "second" and the exit, with "first" not reported again.
+      // Wait for both: Bun settles the exit apart from the stdout pump, so a
+      // poll can report the exit before the last chunk has been appended.
+      const after = await pollUntil(
+        id,
+        (seen) => seen.includes("second") && seen.includes("[status] exited"),
+      );
+      expect(after).toContain("second");
+      expect(after).not.toContain("first");
+      expect(after).toContain("[status] exited 0");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("KillShell stops a long-running background process", async () => {
     const start = await bash.execute({ command: "sleep 30", background: true });

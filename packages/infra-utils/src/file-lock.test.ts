@@ -5,8 +5,18 @@
  * and message prefixes — in their own lock tests; this file pins the shared
  * mechanics plus the `label`/`createError` seams the wrappers customize.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +32,31 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+/**
+ * The error `p` rejects with, or undefined if it resolves. Taken with .then,
+ * not `await expect(p).rejects`: Bun waits out the latter on a promise that
+ * never settles with the test's budget disarmed, so a lock that never gave
+ * up would hang the run instead of failing the test.
+ */
+function rejection(p: Promise<unknown>): Promise<Error | undefined> {
+  return p.then(
+    () => undefined,
+    (e: unknown) => e as Error,
+  );
+}
+
+/**
+ * Stops the clock the lock policy reads, so no deadline ends a wait however
+ * slow the runner, and counts its reads: an acquire reads it once to set its
+ * deadline and again only after its create was refused, so a second read
+ * means that waiter was turned away.
+ */
+function freezeClock(): { readonly reads: () => number; readonly restore: () => void } {
+  const now = Date.now();
+  const spy = spyOn(Date, "now").mockImplementation(() => now);
+  return { reads: () => spy.mock.calls.length, restore: () => spy.mockRestore() };
+}
+
 describe("acquireFileLock", () => {
   test("creates the lock file (parent dirs included) and release() removes it", async () => {
     const lockPath = join(tmp, "store", ".lock");
@@ -35,11 +70,25 @@ describe("acquireFileLock", () => {
   test("waits for a contended lock and wins once it frees", async () => {
     const lockPath = join(tmp, ".lock");
     const first = await acquireFileLock(lockPath);
-    const second = acquireFileLock(lockPath, { waitMs: 1_000, pollMs: 10 });
-    setTimeout(() => void first.release(), 50);
-    const handle = await second;
-    expect(handle.stolen).toBe(false);
-    await handle.release();
+    const clock = freezeClock();
+    try {
+      let settled = false;
+      const second = acquireFileLock(lockPath, { waitMs: 1_000, pollMs: 10 });
+      const settle = (): void => {
+        settled = true;
+      };
+      second.then(settle, settle);
+      // The first is released once the second has been turned away (a clock
+      // read past the one that set its deadline), not on a timer racing it.
+      while (clock.reads() < 2 && !settled) await Bun.sleep(1);
+      expect(settled).toBe(false);
+      await first.release();
+      const handle = await second;
+      expect(handle.stolen).toBe(false);
+      await handle.release();
+    } finally {
+      clock.restore();
+    }
   });
 
   test("fails past the deadline via createError, naming label + holder pid", async () => {
@@ -54,23 +103,23 @@ describe("acquireFileLock", () => {
       label: "custom-store",
       createError: (m) => new CustomLockError(m),
     });
-    await expect(attempt).rejects.toThrow(CustomLockError);
-    await expect(
+    expect(await rejection(attempt)).toBeInstanceOf(CustomLockError);
+    const again = await rejection(
       acquireFileLock(lockPath, {
         waitMs: 100,
         pollMs: 10,
         label: "custom-store",
         createError: (m) => new CustomLockError(m),
       }),
-    ).rejects.toThrow(/custom-store: .*held by pid 4242/);
+    );
+    expect(again?.message).toMatch(/custom-store: .*held by pid 4242/);
   });
 
   test("defaults: plain Error with the file-lock label", async () => {
     const lockPath = join(tmp, ".lock");
     writeFileSync(lockPath, `${JSON.stringify({ pid: 7 })}\n`);
-    await expect(acquireFileLock(lockPath, { waitMs: 80, pollMs: 10 })).rejects.toThrow(
-      /^file-lock: /,
-    );
+    const err = await rejection(acquireFileLock(lockPath, { waitMs: 80, pollMs: 10 }));
+    expect(err?.message).toMatch(/^file-lock: /);
   });
 
   test("steals a stale lock (mtime older than staleMs) and records a labeled warning", async () => {
@@ -97,14 +146,15 @@ describe("acquireFileLock", () => {
     const lockPath = join(tmp, ".lock");
     writeFileSync(lockPath, `${JSON.stringify({ pid: 1 })}\n`);
     const warnings: string[] = [];
-    await expect(
+    const err = await rejection(
       acquireFileLock(lockPath, {
         waitMs: 80,
         staleMs: 30_000,
         pollMs: 10,
         onWarn: (m) => warnings.push(m),
       }),
-    ).rejects.toThrow();
+    );
+    expect(err).toBeInstanceOf(Error);
     expect(warnings).toEqual([]);
     expect(existsSync(lockPath)).toBe(true);
   });
@@ -114,34 +164,111 @@ describe("withFileLock", () => {
   test("serializes two writers — the second waits for the first", async () => {
     const lockPath = join(tmp, ".lock");
     const order: string[] = [];
-    const a = withFileLock(
-      lockPath,
-      async () => {
-        order.push("a-start");
-        await new Promise((r) => setTimeout(r, 60));
-        order.push("a-end");
-      },
-      { pollMs: 5 },
-    );
-    await new Promise((r) => setTimeout(r, 10)); // let a acquire first
-    const b = withFileLock(
-      lockPath,
-      async () => {
-        order.push("b");
-      },
-      { pollMs: 5 },
-    );
-    await Promise.all([a, b]);
-    expect(order).toEqual(["a-start", "a-end", "b"]);
+    const clock = freezeClock();
+    try {
+      let aHolds = (): void => undefined;
+      const holding = new Promise<void>((r) => {
+        aHolds = r;
+      });
+      let finishA = (): void => undefined;
+      const gate = new Promise<void>((r) => {
+        finishA = r;
+      });
+      const a = withFileLock(
+        lockPath,
+        async () => {
+          order.push("a-start");
+          aHolds();
+          await gate;
+          order.push("a-end");
+        },
+        { pollMs: 5 },
+      );
+      // b starts once a holds the lock (not after a head start on a timer),
+      // and a finishes once b has been turned away at least once.
+      await holding;
+      const before = clock.reads();
+      const b = withFileLock(
+        lockPath,
+        async () => {
+          order.push("b");
+        },
+        { pollMs: 5 },
+      );
+      while (clock.reads() < before + 2 && order.length === 1) await Bun.sleep(1);
+      finishA();
+      await Promise.all([a, b]);
+      expect(order).toEqual(["a-start", "a-end", "b"]);
+    } finally {
+      clock.restore();
+    }
   });
 
   test("releases the lock even when fn throws", async () => {
     const lockPath = join(tmp, ".lock");
-    await expect(
+    const err = await rejection(
       withFileLock(lockPath, async () => {
         throw new Error("boom");
       }),
-    ).rejects.toThrow("boom");
+    );
+    expect(err?.message).toBe("boom");
     expect(existsSync(lockPath)).toBe(false);
   });
+});
+
+// 0.7.1 (C070 residual, attacker review): the lock sits in a store directory
+// any agent with a write tool can reach. On contention the policy stat()ed
+// (following links) and readFile()d the holder, so a FIFO planted at the lock
+// path made every writer hang for ever and a link was read through.
+describe.skipIf(process.platform === "win32")("a lock path that is not a regular file", () => {
+  const kinds: Array<readonly [string, (lockPath: string) => void, RegExp]> = [
+    ["a FIFO", (p) => execFileSync("mkfifo", [p]), /is a FIFO, not a lock file/],
+    [
+      "a symlink to a regular file",
+      (p) => symlinkSync(join(tmp, "target.json"), p),
+      /is a symbolic link, not a lock file/,
+    ],
+    [
+      "a dangling symlink",
+      (p) => symlinkSync(join(tmp, "nowhere", "x"), p),
+      /is a symbolic link, not a lock file/,
+    ],
+    ["a directory", (p) => mkdirSync(p), /is a directory, not a lock file/],
+  ];
+
+  for (const [name, plant, reason] of kinds) {
+    test(`${name} is refused at once, naming the path, and left as it is`, async () => {
+      writeFileSync(join(tmp, "target.json"), '{"pid":1,"acquiredAt":"then"}\n');
+      const lockPath = join(tmp, ".lock");
+      plant(lockPath);
+      // Refused, not waited out: waiting out the minute it is allowed would
+      // outlast the test's budget, and the budget applies (see rejection).
+      const err = await rejection(acquireFileLock(lockPath, { waitMs: 60_000, label: "store" }));
+      expect(err?.message).toMatch(reason);
+      expect(err?.message).toContain(`store: ${lockPath} is `);
+      // Nothing was removed or written through.
+      expect(lstatSync(lockPath).isFile()).toBe(false);
+      expect(readFileSync(join(tmp, "target.json"), "utf8")).toBe(
+        '{"pid":1,"acquiredAt":"then"}\n',
+      );
+    });
+  }
+
+  test("every kind is exercised (guard)", () => {
+    expect(kinds.length).toBe(4);
+  });
+});
+
+test("a holder payload is read only up to 4 KiB", async () => {
+  const lockPath = join(tmp, ".lock");
+  writeFileSync(lockPath, JSON.stringify({ pid: 4242, pad: "x".repeat(8192) }));
+  const small = join(tmp, "small.lock");
+  writeFileSync(small, JSON.stringify({ pid: 4242, pad: "x".repeat(1024) }));
+  const fail = (p: string) =>
+    acquireFileLock(p, { waitMs: 30, pollMs: 10 }).then(
+      () => "",
+      (e: unknown) => (e as Error).message,
+    );
+  expect(await fail(small)).toContain("held by pid 4242");
+  expect(await fail(lockPath)).toContain("held by pid unknown");
 });

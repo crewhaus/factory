@@ -8,6 +8,9 @@
   "references": [
     { "path": "../errors" },
     { "path": "../tool-builder" },
-    { "path": "../tool-catalog" }
+    { "path": "../tool-catalog" },
+    { "path": "../tool-onchain" },
+    { "path": "../tool-evm" },
+    { "path": "../tool-evm-tx" }
   ]
 }

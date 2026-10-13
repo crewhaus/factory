@@ -285,7 +285,7 @@ describe("crewhaus state backup", () => {
     expect(manifest.sqliteConsistent).toBe(true);
     // and the archived bytes are the source bytes
     expect(readFileSync(join(extracted, "memories", "m1.md"), "utf-8")).toBe("remember me\n");
-  });
+  }, 20_000);
 
   test("--exclude drops matching files from archive and manifest", async () => {
     const harness = join(tmp, "harness");
@@ -303,7 +303,7 @@ describe("crewhaus state backup", () => {
     const manifest = readManifestFromArchiveDir(await extractTo(out, join(tmp, "x")));
     expect(manifest.subdirs["sessions"]).toBeUndefined();
     expect(manifest.totals.files).toBe(1);
-  });
+  }, 20_000);
 
   test("dies cleanly when there is no .crewhaus dir", async () => {
     const empty = join(tmp, "no-state");
@@ -311,14 +311,14 @@ describe("crewhaus state backup", () => {
     const result = await runCli(["state", "backup"], empty);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("nothing to back up");
-  });
+  }, 20_000);
 
   test("help mentions the deliberate scope cuts", async () => {
     const result = await runCli(["state", "backup", "--help"], tmp);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("out of scope");
     expect(result.stdout).toContain("S3/R2");
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -344,7 +344,7 @@ describe("crewhaus state restore", () => {
     expect(result.stdout).toContain("restored 1 file(s)");
     expect(existsSync(join(dest, ".crewhaus", "sessions", `${SESSION_ID}.jsonl`))).toBe(true);
     expect(existsSync(join(dest, ".crewhaus", MANIFEST_FILENAME))).toBe(false);
-  });
+  }, 20_000);
 
   test("refuses an existing non-empty .crewhaus and says how to proceed", async () => {
     const harness = join(tmp, "src");
@@ -365,7 +365,7 @@ describe("crewhaus state restore", () => {
     expect(readFileSync(join(dest, ".crewhaus", "memories", "precious.md"), "utf-8")).toBe(
       "mine\n",
     );
-  });
+  }, 20_000);
 
   test("--force moves the existing dir aside to .crewhaus.bak-<ts> (never deletes)", async () => {
     const harness = join(tmp, "src");
@@ -386,7 +386,7 @@ describe("crewhaus state restore", () => {
     const bak = readdirSync(dest).find((f) => f.startsWith(".crewhaus.bak-"));
     expect(bak).toBeDefined();
     expect(readFileSync(join(dest, bak as string, "marker.txt"), "utf-8")).toBe("old state\n");
-  });
+  }, 20_000);
 
   test("--merge and --force are mutually exclusive; --merge validates its value", async () => {
     const out = join(tmp, "b.tar.gz");
@@ -400,13 +400,13 @@ describe("crewhaus state restore", () => {
     const noFile = await runCli(["state", "restore"], tmp);
     expect(noFile.exitCode).toBe(1);
     expect(noFile.stderr).toContain("missing <file.tar.gz>");
-  });
+  }, 20_000);
 
   test("unknown state action dies with the allowed set", async () => {
     const result = await runCli(["state", "frobnicate"], tmp);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('state action must be "backup" or "restore"');
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -514,7 +514,7 @@ describe("crewhaus state restore --merge feedback", () => {
     const result = await runCli(["state", "restore", out, "--merge", "feedback"], dev);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("no feedback records");
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -547,7 +547,7 @@ describe("crewhaus state restore --merge all", () => {
     );
     // the manifest is metadata, never merged in as state
     expect(existsSync(join(dest, ".crewhaus", MANIFEST_FILENAME))).toBe(false);
-  });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -593,7 +593,7 @@ describe("backup → restore round trip", () => {
     // `audit verify`-ability survives the trip (and the source is untouched).
     expect((await verify(join(destRoot, "audit"))).ok).toBe(true);
     expect((await verify(auditDir)).ok).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("sqlite handling", () => {
@@ -638,7 +638,7 @@ describe("sqlite handling", () => {
     } finally {
       db.close();
     }
-  });
+  }, 20_000);
 
   test("a restored snapshot of a WAL db opens READ-ONLY (journal mode folded to DELETE — review F4)", async () => {
     const harness = join(tmp, "src");
@@ -667,7 +667,7 @@ describe("sqlite handling", () => {
     } finally {
       db.close();
     }
-  });
+  }, 20_000);
 
   test("an unsnapshotttable sqlite file falls back to a raw copy with a warning", async () => {
     const harness = join(tmp, "src");
@@ -695,5 +695,5 @@ describe("sqlite handling", () => {
     expect(manifest.sqlite.snapshotted).toEqual([]);
     // raw fallback is still an exact byte copy
     expect(readFileSync(join(extracted, "broken.sqlite")).equals(corrupt)).toBe(true);
-  });
+  }, 20_000);
 });

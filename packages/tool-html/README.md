@@ -44,6 +44,35 @@ concludes the page changed. `:nth-child(2n+1)` is refused rather than read as
 `:nth-child(2)` — `parseInt("2n+1")` is 2, so a lenient check would accept
 the formula and quietly return the wrong element.
 
+A selector is at most 8,192 characters, with at most 32 compound steps, 32
+tests in one compound (`div.a:not(.b)` makes four) and 32 selectors in a
+comma group; a larger one is refused with the cap named. Within that, a query
+is one pass over the page in document order: it costs one visit per element
+per selector plus the tests actually made (a class list or attribute value is
+charged for the characters a test reads, and split or lowercased at most once
+per element), and keeps nothing per element. The
+queries one call makes share a work budget sized for the largest page these
+tools accept, so a query that would outrun it is refused with the selector
+named rather than left to stall the harness. Parsing is linear in the
+document's length too, including pages full of `<script>`, `<title>` or stray
+close tags.
+
+## Text is budgeted per call
+
+An element's text is its whole subtree's, so nested matches each carry every
+deeper one: 1 MB of nested `<div>`s is hundreds of megabytes of text. Every
+tool that returns element text takes it from one budget per call: 1M
+characters for `HtmlQuery` (which returns each value twice), 2M for the
+others, and a cap on the text read to find it. When the budget cuts a value
+the result says so — `truncatedBy: ["chars"]` on `HtmlQuery`, `HtmlLinks` and
+each `HtmlTable` table, `truncated` on `HtmlRecords` and `HtmlForms`,
+`outlineTruncated` on `HtmlText` — and the values after it are not returned.
+A table's caption is charged like a cell. `HtmlLinks` also charges what
+resolving adds to each href, since a long `<base href>` is copied into every
+one. `HtmlQuery` with `attribute` returns every value whole, since an
+attribute is the element's own: only `matches[].text` is cut, and the note
+says from which match.
+
 ## Details that are wrong by default elsewhere
 
 - **Table spans.** `colspan` and `rowspan` are expanded. A table that uses

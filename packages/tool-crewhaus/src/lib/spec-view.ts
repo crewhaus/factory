@@ -21,10 +21,18 @@
  * so a token in a query string (or a `user:pass@` in its authority) is not
  * echoed into a report, and a stdio server's ARGV — which is the third place
  * an operator pastes a credential, `["--api-key", "sk-…"]` being the usual
- * shape — is redacted by `redactArgs` before it is shown.
+ * shape, and a database URL with its password the next — is redacted by
+ * `redactArgs` before it is shown.
  */
 
-import { ENV_REF_RE } from "@crewhaus/preflight";
+import { createHash } from "node:crypto";
+import { ENV_REF_RE, UNPARSED_ENV_REF_RE } from "@crewhaus/preflight";
+import {
+  credentialShapeOf,
+  isCredentialShapedName,
+  nameWords,
+  redactUrlCredentialsInText,
+} from "@crewhaus/tool-safety/env";
 
 export type LooseRecord = Record<string, unknown>;
 
@@ -56,7 +64,68 @@ export type McpServerView = {
   readonly headerKeys?: readonly string[];
   /** Tool names the spec narrows trust flags for (`tool_flags.per_tool`). */
   readonly flaggedTools?: readonly string[];
+  /**
+   * The trust flags `tool_flags` sets, by name (`destructive`,
+   * `requireJustification`; `readOnly` only in a document the schema would
+   * refuse): `defaults` for every tool on the server, `perTool` per tool.
+   * Absent when the server declares no `tool_flags`.
+   */
+  readonly toolFlags?: {
+    readonly defaults?: readonly string[];
+    readonly perTool?: Readonly<Record<string, readonly string[]>>;
+  };
 };
+
+/**
+ * Fingerprints of what a server view withholds — env and header VALUES, the
+ * raw argv, an `sse` URL's query, userinfo and fragment — so a diff can say a
+ * value CHANGED without either side's value (or a digest of it) ever leaving
+ * the process: this table is keyed by the view object and is never part of
+ * the view's data, so no report can serialize it. A view that did not come
+ * from {@link buildSpecView} in this process has no entry, and a diff then
+ * compares what the view shows and nothing more.
+ */
+type WithheldDigests = {
+  readonly env: ReadonlyMap<string, string>;
+  readonly headers: ReadonlyMap<string, string>;
+  readonly argv?: string;
+  readonly url?: string;
+};
+const WITHHELD = new WeakMap<McpServerView, WithheldDigests>();
+
+function digest(value: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(value) ?? "")
+    .digest("hex");
+}
+
+function digestMap(record: LooseRecord | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [key, value] of Object.entries(record ?? {})) out.set(key, digest(value));
+  return out;
+}
+
+/** The trust flags one `tool_flags` entry sets to true, sorted. */
+const TRUST_FLAG_NAMES = ["destructive", "readOnly", "requireJustification"] as const;
+function flagsSet(entry: unknown): string[] {
+  const record = asRecord(entry);
+  if (record === undefined) return [];
+  return TRUST_FLAG_NAMES.filter((flag) => record[flag] === true);
+}
+
+function toolFlagsView(block: unknown): McpServerView["toolFlags"] | undefined {
+  const flags = asRecord(block);
+  if (flags === undefined) return undefined;
+  const perToolRaw = asRecord(flags["per_tool"]);
+  const perTool: Record<string, readonly string[]> = {};
+  for (const tool of Object.keys(perToolRaw ?? {}).sort(compareStrings)) {
+    perTool[tool] = flagsSet(perToolRaw?.[tool]);
+  }
+  return {
+    ...(flags["defaults"] !== undefined ? { defaults: flagsSet(flags["defaults"]) } : {}),
+    ...(perToolRaw !== undefined ? { perTool } : {}),
+  };
+}
 
 export type PermissionRuleView = { readonly type: string; readonly pattern: string };
 
@@ -135,7 +204,11 @@ export function collectToolSites(spec: unknown): ToolSite[] {
   return sites;
 }
 
-/** `scheme://host/path` — the query string is dropped, it can carry a token. */
+/**
+ * `scheme://host/path` — the query string is dropped, it can carry a token,
+ * and a path segment that holds a key is withheld (`/v2/<key>`,
+ * `/mcp/sk-…/sse`; see {@link redactPathSegments}).
+ */
 function safeEndpoint(raw: unknown): string | undefined {
   const url = asString(raw);
   if (url === undefined) return undefined;
@@ -143,7 +216,7 @@ function safeEndpoint(raw: unknown): string | undefined {
     const parsed = new URL(url);
     // `host` is authority WITHOUT userinfo, so a `https://user:token@h/p`
     // loses the credential here as well as in the query string.
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    return `${parsed.protocol}//${parsed.host}${redactPathSegments(parsed.pathname)}`;
   } catch {
     // The schema requires a valid URL, so this is unreachable for a parsed
     // spec; withhold rather than echo an unparsed string that may be a secret.
@@ -157,14 +230,6 @@ function safeEndpoint(raw: unknown): string | undefined {
 
 /** What a redacted argv entry is replaced with. */
 export const REDACTED = "(redacted)";
-
-/**
- * A flag name (dashes already stripped) whose VALUE is a credential.
- * Deliberately narrow: over-redacting an argv makes the report useless, so
- * only the words operators actually use for a secret are matched.
- */
-const CREDENTIAL_FLAG_RE =
-  /(^|[-_.])(api[-_.]?key|key|token|secret|password|passwd|auth|bearer|credentials?|pat)s?$/i;
 
 /**
  * A value that is a credential on its own evidence: a vendor-prefixed key, a
@@ -186,52 +251,442 @@ function looksLikeSecretValue(value: string): boolean {
   return OPAQUE_TOKEN_RE.test(value) && /[A-Za-z]/.test(value) && /\d/.test(value);
 }
 
+/** `scheme://…` — a value whose credential PARTS can be cut out, keeping what it points at. */
+const URL_VALUE_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+
+/**
+ * Path segments after which hosted MCP servers and webhooks put a key:
+ * Alchemy and Infura `/v2/<key>` and `/v3/<key>`, Zapier `/mcp/<key>/sse`
+ * and `/api/mcp/s/<key>/mcp`, Slack `/services/T…/B…/<secret>`, Discord
+ * `/api/webhooks/<id>/<token>`.
+ */
+const KEY_PATH_OWNERS: ReadonlySet<string> = new Set([
+  "v1",
+  "v2",
+  "v3",
+  "mcp",
+  "s",
+  "services",
+  "hooks",
+  "webhooks",
+  "key",
+  "keys",
+  "token",
+  "tokens",
+  "apikey",
+  "api-key",
+  "secret",
+  "secrets",
+]);
+
+/** A run of key characters, long enough to be a key rather than an id or a word. */
+const KEYISH_RE = /^[A-Za-z0-9_-]{16,}$/;
+
+/** Letters AND digits: a key has both; a word, a slug or a number has one kind. */
+function mixesLettersAndDigits(value: string): boolean {
+  return /[A-Za-z]/.test(value) && /\d/.test(value);
+}
+
+/**
+ * A URL path with every segment that holds a key withheld: one that is a
+ * credential on its own evidence (a vendor prefix such as `sk-`, a JWT, a
+ * long opaque run), or a run of 16+ key characters mixing letters and digits
+ * anywhere after a {@link KEY_PATH_OWNERS} segment. A path segment carries no
+ * name to judge it by, so this is shape alone, and errs towards hiding.
+ */
+function redactPathSegments(path: string): string {
+  let owned = false;
+  return path
+    .split("/")
+    .map((segment) => {
+      const secret =
+        segment !== "" &&
+        (looksLikeSecretValue(segment) ||
+          (owned && KEYISH_RE.test(segment) && mixesLettersAndDigits(segment)));
+      if (KEY_PATH_OWNERS.has(segment.toLowerCase())) owned = true;
+      return secret ? REDACTED : segment;
+    })
+    .join("/");
+}
+
+/** Characters that end a URL written inside a longer entry. */
+const URL_END_RE = /[\s"'`<>]/;
+
+/**
+ * Every `scheme://…` URL inside `text` with its key-bearing path segments
+ * withheld (see {@link redactPathSegments}), and a bare `#fragment` that
+ * looks like a token (8+ key characters mixing letters and digits, no
+ * `name=`) withheld too; tool-safety's URL redaction has already taken the
+ * userinfo and the credential-named parameters. A linear scan.
+ */
+function redactUrlPathsInText(text: string): string {
+  if (!text.includes("://")) return text;
+  let out = "";
+  let copied = 0;
+  let from = 0;
+  for (;;) {
+    const sep = text.indexOf("://", from);
+    if (sep < 0) break;
+    let end = sep + 3;
+    while (end < text.length && !URL_END_RE.test(text.charAt(end))) end++;
+    from = end;
+    if (sep === 0 || !/[A-Za-z0-9+.-]/.test(text.charAt(sep - 1))) continue;
+    // The authority ends at the first `/`, `?` or `#`; the path runs to `?` or `#`.
+    let pathStart = sep + 3;
+    while (pathStart < end && !"/?#".includes(text.charAt(pathStart))) pathStart++;
+    let pathEnd = pathStart;
+    while (pathEnd < end && !"?#".includes(text.charAt(pathEnd))) pathEnd++;
+    // Searched only up to the URL's end, so many URLs in one entry stay linear.
+    let hash = pathEnd;
+    while (hash < end && text.charAt(hash) !== "#") hash++;
+    const fragment = hash < end ? text.slice(hash + 1, end) : undefined;
+    out += text.slice(copied, pathStart) + redactPathSegments(text.slice(pathStart, pathEnd));
+    copied = pathEnd;
+    if (
+      fragment !== undefined &&
+      !fragment.includes("=") &&
+      /^[A-Za-z0-9._~+/-]{8,}$/.test(fragment) &&
+      mixesLettersAndDigits(fragment)
+    ) {
+      out += `${text.slice(copied, hash + 1)}${REDACTED}`;
+      copied = end;
+    }
+  }
+  return out + text.slice(copied);
+}
+
+/**
+ * Whether `word` ENDS in a credential word (`KEY`, `APIKEY`, `GHTOKEN`,
+ * `BEARER`, `COOKIE`, `SECRETS`, `CONNECTIONSTRING`), by tool-safety's one
+ * table of credential words. A word that only STARTS with one —
+ * `TOKENFILE`, `PASSWORDLESS`, `SECRETNAME` — names something else: a path,
+ * a switch, a name.
+ */
+function endsInCredentialWord(word: string): boolean {
+  // `PW` is a password in a flag or an assignment's last word (`--pw`,
+  // `DB_PW=`), but too common a PREFIX of environment names (Playwright's
+  // `PW_TEST_…`) for tool-safety's shared table, which flags a word anywhere.
+  if (word === "PW") return true;
+  // Lower-cased: tool-safety's one exception, `PWD`, is the shell's working
+  // directory variable, and `--pwd` is a password.
+  const shape = credentialShapeOf(word.toLowerCase());
+  return shape !== undefined && (word.endsWith(shape) || word.endsWith(`${shape}S`));
+}
+
+/**
+ * Whether a `NAME=value`, `"name": value` or header name says its value is a
+ * credential: tool-safety's rule, plus a last word of `PW`.
+ */
+function isCredentialName(name: string): boolean {
+  return isCredentialShapedName(name) || nameWords(name).at(-1) === "PW";
+}
+
+/**
+ * A flag whose VALUE is a credential: its last word, or its last two words
+ * run together, end in a credential word — `--api-key`, `--apiKey`,
+ * `--oauth2Bearer`, `--accessToken`, `--client-secret`, `--cookie`, `--dsn`,
+ * `--connection-string`. Words come from tool-safety's `nameWords`, so a
+ * camelCase flag splits the way a separated one does. `--token-file`,
+ * `--key-id` and `--secret-name` name something else, and a `--no-…` flag
+ * is a switch that takes no value.
+ */
 function isCredentialFlag(arg: string): boolean {
   if (!arg.startsWith("-")) return false;
-  return CREDENTIAL_FLAG_RE.test(arg.replace(/^-+/, ""));
+  const words = nameWords(arg);
+  const last = words[words.length - 1];
+  if (last === undefined || words[0] === "NO") return false;
+  const lastTwo = words.length > 1 ? `${words[words.length - 2]}${last}` : undefined;
+  return endsInCredentialWord(last) || (lastTwo !== undefined && endsInCredentialWord(lastTwo));
+}
+
+/**
+ * Flags whose value is an HTTP header — `mcp-remote`'s `--header`, curl's
+ * `-H`, `mcp-proxy`'s `--headers`/`-H`. Two spellings: one entry,
+ * `Name: value`, or two, `Name` then `value` (the form `mcp-proxy`
+ * documents). The value is withheld whatever the name: an `sse` server's
+ * headers are reported by key only, and this is the same data reached
+ * through a stdio bridge.
+ */
+const HEADER_FLAGS: ReadonlySet<string> = new Set(["--header", "--headers", "-H"]);
+
+/** An HTTP header name (RFC 9110 `token`). */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+
+/**
+ * `Name: value`, or undefined when the text is not header-shaped. A URL
+ * (`tcp://build-host:2375`, `ssh://deploy@host`) and a `host:port`
+ * (`localhost:5432`) have a colon too, and docker spells ITS host flag
+ * `-H`: neither is a header.
+ */
+function splitHeader(text: string): { name: string; value: string } | undefined {
+  const colon = text.indexOf(":");
+  if (colon <= 0) return undefined;
+  const name = text.slice(0, colon).trim();
+  if (!HEADER_NAME_RE.test(name)) return undefined;
+  const value = text.slice(colon + 1);
+  if (value.startsWith("//") || /^\d{1,5}(?:[/?#]|$)/.test(value)) return undefined;
+  return { name, value };
+}
+
+/**
+ * The first half of the two-entry header form: a header NAME with no value
+ * of its own. A dotted name (`0.0.0.0`, `build.internal`) and `localhost`
+ * are docker's `-H HOST`, not a header — no real header name has a dot.
+ */
+function isBareHeaderName(arg: string): boolean {
+  return HEADER_NAME_RE.test(arg) && !arg.includes(".") && arg.toLowerCase() !== "localhost";
+}
+
+/**
+ * A header value that is only an env REFERENCE — `${AUTH_HEADER}`,
+ * `$TOKEN`, `Bearer ${TOKEN}` — which `mcp-remote` substitutes itself (the
+ * form its README documents). It carries no secret, and hiding it costs the
+ * reader the variable name.
+ */
+function isEnvRefHeaderValue(value: string): boolean {
+  const bare = value.trim().replace(/^(?:Bearer|Basic|Token)\s+/i, "");
+  return UNPARSED_ENV_REF_RE.test(bare);
+}
+
+/** `Name: (redacted)` — or the text unchanged when there is nothing to hide. */
+function redactHeader(text: string): string {
+  const header = splitHeader(text);
+  if (header === undefined) return text;
+  if (header.value.trim() === "" || isEnvRefHeaderValue(header.value)) return text;
+  return `${header.name}: ${REDACTED}`;
+}
+
+/** A header value given as its own entry: withheld unless empty or an env reference. */
+function redactHeaderValue(value: string): string {
+  return value.trim() === "" || isEnvRefHeaderValue(value) ? value : REDACTED;
+}
+
+/**
+ * A bearer credential anywhere in an entry: `Bearer eyJ…` inside a JSON
+ * blob or a `KEY=Bearer …` pair. (`Basic` is not matched outside a header:
+ * it is an English word too.) The class after the whitespace excludes
+ * whitespace, so each match is linear.
+ */
+const BEARER_TOKEN_RE = /\bBearer(\s+)(?!\$)[A-Za-z0-9._~+/=-]{8,}/g;
+
+/**
+ * `NAME=value` inside an entry: an env assignment handed to a wrapper
+ * (`docker run -e POSTGRES_PASSWORD=…`, `sh -c "API_KEY=… server"`) or one
+ * parameter of a connection string (`Server=db;Password=…`,
+ * `jdbc:sqlserver://db:1433;user=sa;password=…`). The name starts the entry
+ * or follows whitespace, `;`, `&`, `?`, a quote, `{` or `,`, and the value
+ * is quoted (`API_KEY='…'`, `API_KEY="…"`, the forms `sh -c` scripts use) or
+ * runs to the next of those. The value's three alternatives start with
+ * different characters and every class is disjoint from the one after it, so
+ * a match is linear.
+ */
+const ASSIGNMENT_RE =
+  /(^|[\s;&?"'{,])([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)("[^"]*"|'[^']*'|[^\s;&"',}]+)/g;
+
+/**
+ * `"name": "value"` inside a JSON entry — `--config '{"apiKey":"…"}'`, the
+ * form Smithery's CLI takes. Keys are capped at 128 characters and the
+ * value's two alternatives are disjoint, so a match is linear.
+ */
+const JSON_STRING_MEMBER_RE = /"([A-Za-z_$][\w$.-]{0,127})"(\s*:\s*)"((?:[^"\\]|\\.)*)"/g;
+
+/**
+ * `'name': 'value'` — the single-quoted spelling of a JSON member that a
+ * YAML or JavaScript object literal takes (`--config "{'apiKey':'…'}"`).
+ * Linear for the same reasons as {@link JSON_STRING_MEMBER_RE}.
+ */
+const SINGLE_QUOTED_MEMBER_RE = /'([A-Za-z_$][\w$.-]{0,127})'(\s*:\s*)'((?:[^'\\]|\\.)*)'/g;
+
+/**
+ * `user:password@host…` without a scheme — the form `psql`, `mysql` and
+ * `redis-cli` take. The user, host and the rest stay. A pinned image
+ * (`node:20@sha256:…`) has the same shape and is not one: see
+ * {@link IMAGE_DIGEST_RE}.
+ */
+const BARE_USERINFO_RE = /^([^\s:@/]+):([^\s@/]+)@([^\s@/]+)/;
+
+/** The digest half of an image reference, `sha256:…`: a tag before it is not a password. */
+const IMAGE_DIGEST_RE = /^sha\d+:/;
+
+/** Flags whose value is `user:password` (curl's `-u`/`--user`). */
+const USERINFO_FLAGS: ReadonlySet<string> = new Set(["-u", "--user"]);
+
+/** `user:password` with the password withheld; a bare user, or `uid:gid`, is left alone. */
+function redactUserPassword(value: string): string {
+  const colon = value.indexOf(":");
+  if (colon <= 0 || colon === value.length - 1) return value;
+  const password = value.slice(colon + 1);
+  if (/^\d+$/.test(password) || keepsNothingSecret(password)) return value;
+  return `${value.slice(0, colon)}:${REDACTED}`;
+}
+
+/** A value an earlier rule already cut down to `Bearer (redacted)` or `(redacted)`. */
+const ALREADY_REDACTED_RE = /^(?:(?:Bearer|Basic|Token)\s+)?\(redacted\)$/;
+
+function keepsNothingSecret(value: string): boolean {
+  return (
+    value.trim() === "" ||
+    ALREADY_REDACTED_RE.test(value) ||
+    ENV_REF_RE.test(value) ||
+    isEnvRefHeaderValue(value)
+  );
+}
+
+/**
+ * The credential-carrying PARTS of an entry that is not itself a secret:
+ * a URL's userinfo and credential-named query or fragment parameters
+ * (`postgresql://admin:…@db/prod`, `https://host/sse?token=…` — the scheme,
+ * host and path stay, so the report still says what the server is), a
+ * credential header written as one entry (`Authorization: Bearer …`,
+ * `X-Api-Key: …`, `Cookie: …`), a `Bearer` credential inside any text, and
+ * a credential-named `NAME=value` or JSON `"name": "value"` member.
+ */
+function redactEmbedded(text: string): string {
+  let out = redactUrlPathsInText(redactUrlCredentialsInText(text, REDACTED));
+  const bare = BARE_USERINFO_RE.exec(out);
+  if (bare !== null && !URL_VALUE_RE.test(out)) {
+    const [whole, user, password, host] = bare as unknown as [string, string, string, string];
+    if (!keepsNothingSecret(password) && !IMAGE_DIGEST_RE.test(host))
+      out = `${user}:${REDACTED}@${host}${out.slice(whole.length)}`;
+  }
+  const header = splitHeader(out);
+  if (header !== undefined && isCredentialName(header.name)) out = redactHeader(out);
+  out = out.replace(BEARER_TOKEN_RE, (_m, gap: string) => `Bearer${gap}${REDACTED}`);
+  out = out.replace(
+    ASSIGNMENT_RE,
+    (whole, lead: string, name: string, eq: string, value: string) => {
+      const quote = value.startsWith('"') || value.startsWith("'") ? value.charAt(0) : "";
+      const inner = quote === "" ? value : value.slice(1, -1);
+      return isCredentialName(name) && !keepsNothingSecret(inner)
+        ? `${lead}${name}${eq}${quote}${REDACTED}${quote}`
+        : whole;
+    },
+  );
+  const member =
+    (q: string) =>
+    (whole: string, name: string, colon: string, value: string): string =>
+      isCredentialName(name) && !keepsNothingSecret(value)
+        ? `${q}${name}${q}${colon}${q}${REDACTED}${q}`
+        : whole;
+  return out
+    .replace(JSON_STRING_MEMBER_RE, member('"'))
+    .replace(SINGLE_QUOTED_MEMBER_RE, member("'"));
+}
+
+/**
+ * The value after a credential flag: a URL keeps what it points at and
+ * loses its credential parts (`--dsn postgresql://u:…@db/prod`); anything
+ * else is withheld whole.
+ */
+function redactCredentialValue(value: string): string {
+  return URL_VALUE_RE.test(value) ? redactEmbedded(value) : REDACTED;
 }
 
 /**
  * Redact the credential-shaped entries of an MCP server's argv.
  *
- * Three shapes are caught, and only these: `--api-key VALUE` (the entry
- * AFTER a credential-named flag), `--api-key=VALUE` (the half after the
- * `=`), and a bare value that is a credential on its own evidence. Exported
- * because the honest thing to do with a redaction rule is test it directly.
+ * Caught, and only these:
+ *
+ * - `--api-key VALUE` (the entry AFTER a credential flag) and
+ *   `--api-key=VALUE` (the half after the `=`); a URL value keeps its
+ *   scheme, host and path;
+ * - a bare value that is a credential on its own evidence (a vendor-prefixed
+ *   key, a JWT, a long opaque token);
+ * - `--header VALUE`, `-H VALUE`, `--header=VALUE` and the two-entry
+ *   `--headers NAME VALUE`: the header keeps its name and loses its value,
+ *   unless the value is only an env reference;
+ * - inside any other entry, or the value half of any `--flag=VALUE`: a
+ *   URL's userinfo and its credential-named query or fragment parameters, a
+ *   credential header written as one entry, a `Bearer` credential, and a
+ *   credential-named `NAME=value` or JSON string member.
+ *
+ * A `$NAME` env reference is shown as written wherever a whole value is
+ * one. Exported because the honest thing to do with a redaction rule is
+ * test it directly.
  */
 export function redactArgs(args: readonly string[]): { args: string[]; redacted: number } {
   const out: string[] = [];
   let redacted = 0;
-  let previousWasCredentialFlag = false;
+  let previous: "credential-flag" | "header-flag" | "header-name" | "userinfo-flag" | undefined;
+  const push = (value: string, original: string): void => {
+    out.push(value);
+    if (value !== original) redacted += 1;
+  };
   for (const arg of args) {
     const eq = arg.startsWith("-") ? arg.indexOf("=") : -1;
+    const after = previous;
+    previous = undefined;
     // A `$UPPER_SNAKE` value is an env REFERENCE, not a credential: hiding it
     // costs the reader the variable name and protects nothing.
-    if (previousWasCredentialFlag && !arg.startsWith("-") && !ENV_REF_RE.test(arg)) {
-      out.push(REDACTED);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+    if (after === "credential-flag" && !arg.startsWith("-") && !ENV_REF_RE.test(arg)) {
+      push(redactCredentialValue(arg), arg);
       continue;
     }
-    if (
-      eq > 0 &&
-      isCredentialFlag(arg.slice(0, eq)) &&
-      arg.length > eq + 1 &&
-      !ENV_REF_RE.test(arg.slice(eq + 1))
-    ) {
-      out.push(`${arg.slice(0, eq)}=${REDACTED}`);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+    if (after === "header-name" && !arg.startsWith("-")) {
+      push(redactHeaderValue(arg), arg);
+      continue;
+    }
+    if (after === "userinfo-flag" && !arg.startsWith("-")) {
+      push(redactEmbedded(redactUserPassword(arg)), arg);
+      continue;
+    }
+    if (after === "header-flag" && !arg.startsWith("-")) {
+      if (splitHeader(arg) !== undefined) {
+        push(redactHeader(arg), arg);
+      } else if (isBareHeaderName(arg)) {
+        // `--headers X-Api-Key VALUE`: the name now, the value next.
+        push(arg, arg);
+        previous = "header-name";
+      } else {
+        // Not a header at all (docker spells its HOST flag `-H`): only the
+        // embedded rules apply.
+        push(redactEmbedded(arg), arg);
+      }
+      continue;
+    }
+    if (/^-H[^-=]/.test(arg)) {
+      // `-HAuthorization: Bearer …`: curl's short flag with its value attached.
+      push(`-H${redactHeader(arg.slice(2))}`, arg);
+      continue;
+    }
+    const colon = arg.startsWith("-") && eq === -1 ? arg.indexOf(":") : -1;
+    if (colon > 0 && isCredentialFlag(arg.slice(0, colon))) {
+      // `--token:VALUE`, the separator some CLIs take in place of `=`.
+      const value = arg.slice(colon + 1);
+      push(
+        value === "" || ENV_REF_RE.test(value)
+          ? arg
+          : `${arg.slice(0, colon)}:${redactCredentialValue(value)}`,
+        arg,
+      );
+      continue;
+    }
+    if (eq > 0) {
+      const flag = arg.slice(0, eq);
+      const value = arg.slice(eq + 1);
+      if (HEADER_FLAGS.has(flag)) {
+        push(`${flag}=${redactHeader(value)}`, arg);
+        continue;
+      }
+      if (USERINFO_FLAGS.has(flag)) {
+        push(`${flag}=${redactEmbedded(redactUserPassword(value))}`, arg);
+        continue;
+      }
+      if (isCredentialFlag(flag) && value.length > 0 && !ENV_REF_RE.test(value)) {
+        push(`${flag}=${redactCredentialValue(value)}`, arg);
+        continue;
+      }
+      push(`${flag}=${redactEmbedded(value)}`, arg);
       continue;
     }
     if (!arg.startsWith("-") && looksLikeSecretValue(arg)) {
-      out.push(REDACTED);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+      push(REDACTED, arg);
       continue;
     }
-    out.push(arg);
-    previousWasCredentialFlag = isCredentialFlag(arg) && eq === -1;
+    push(arg.startsWith("-") ? arg : redactEmbedded(arg), arg);
+    if (HEADER_FLAGS.has(arg)) previous = "header-flag";
+    else if (USERINFO_FLAGS.has(arg)) previous = "userinfo-flag";
+    else if (isCredentialFlag(arg)) previous = "credential-flag";
   }
   return { args: out, redacted };
 }
@@ -248,7 +703,8 @@ function mcpServerViews(block: unknown): McpServerView[] {
     const perTool = asRecord(asRecord(config["tool_flags"])?.["per_tool"]);
     const rawArgs = config["args"];
     const args = isStringArray(rawArgs) ? redactArgs(rawArgs) : undefined;
-    out.push({
+    const toolFlags = toolFlagsView(config["tool_flags"]);
+    const view: McpServerView = {
       name,
       transport: asString(config["transport"]) ?? "unknown",
       ...(asString(config["command"]) !== undefined
@@ -263,7 +719,15 @@ function mcpServerViews(block: unknown): McpServerView[] {
       ...(env !== undefined ? { envKeys: Object.keys(env).sort(compareStrings) } : {}),
       ...(headers !== undefined ? { headerKeys: Object.keys(headers).sort(compareStrings) } : {}),
       ...(perTool !== undefined ? { flaggedTools: Object.keys(perTool).sort(compareStrings) } : {}),
+      ...(toolFlags !== undefined ? { toolFlags } : {}),
+    };
+    WITHHELD.set(view, {
+      env: digestMap(env),
+      headers: digestMap(headers),
+      ...(rawArgs !== undefined ? { argv: digest(rawArgs) } : {}),
+      ...(typeof config["url"] === "string" ? { url: digest(config["url"]) } : {}),
     });
+    out.push(view);
   }
   out.sort((a, b) => compareStrings(a.name, b.name));
   return out;
@@ -403,6 +867,62 @@ function diffSets(
   };
 }
 
+/** Where each key first appears: the occurrence the first-match rule sees. */
+function firstPositions(keys: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  keys.forEach((key, i) => {
+    if (!out.has(key)) out.set(key, i);
+  });
+  return out;
+}
+
+/** How much a rule type lets through when it is the first to match. */
+const RULE_LEAD: Readonly<Record<string, number>> = {
+  alwaysAllow: 0,
+  alwaysAsk: 1,
+  alwaysDeny: 2,
+};
+const ruleLead = (key: string): number => RULE_LEAD[key.slice(0, key.indexOf(" "))] ?? 2;
+
+/**
+ * Two rules on both sides whose ORDER swapped, when their types differ.
+ *
+ * The engine takes the first matching rule in declaration order, so
+ * `[alwaysDeny X, alwaysAllow X]` denies X and the same two rules reversed
+ * allow it. A swap widens when the rule that now comes first lets more
+ * through (an allow ahead of an ask or a deny, an ask ahead of a deny); it
+ * is conservative in that it does not check the two patterns can match the
+ * same call. A widening swap is reported in preference to a narrowing one.
+ * Linear in the number of rules.
+ */
+function ruleReorder(
+  before: readonly string[],
+  after: readonly string[],
+): { first: string; second: string; widens: boolean } | undefined {
+  const posBefore = firstPositions(before);
+  const posAfter = firstPositions(after);
+  const common = [...posBefore.keys()]
+    .filter((key) => posAfter.has(key))
+    .sort((a, b) => (posBefore.get(a) ?? 0) - (posBefore.get(b) ?? 0));
+  // For each lead (0..2), the seen rule of that type that now sits LATEST.
+  const latest: Array<{ key: string; at: number } | undefined> = [undefined, undefined, undefined];
+  let narrowing: { first: string; second: string; widens: boolean } | undefined;
+  for (const key of common) {
+    const at = posAfter.get(key) ?? 0;
+    const lead = ruleLead(key);
+    for (let other = 0; other < latest.length; other++) {
+      const seen = latest[other];
+      if (other === lead || seen === undefined || seen.at <= at) continue;
+      // `seen` came first before, and `key` comes first now.
+      if (lead < other) return { first: seen.key, second: key, widens: true };
+      narrowing ??= { first: seen.key, second: key, widens: false };
+    }
+    const current = latest[lead];
+    if (current === undefined || current.at < at) latest[lead] = { key, at };
+  }
+  return narrowing;
+}
+
 function sourceToModel(models: readonly ModelSlot[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const slot of models) {
@@ -499,16 +1019,7 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
       continue;
     }
     if (from === undefined || to === undefined) continue;
-    const fromText = describeServer(from);
-    const toText = describeServer(to);
-    if (fromText !== toText) {
-      push({ kind: "mcp-server", path, from: fromText, to: toText, widens: false });
-    }
-    if (from.required && !to.required) {
-      // A peer that may now be absent is a smaller guarantee, not a wider
-      // capability — reported, not flagged.
-      push({ kind: "mcp-server-optional", path, from: "required", to: "optional", widens: false });
-    }
+    for (const change of diffServer(path, from, to)) push(change);
   }
 
   // permissions
@@ -535,16 +1046,34 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
     });
   }
   const ruleKey = (r: PermissionRuleView): string => `${r.type} ${r.pattern}`;
-  const rules = diffSets(
-    before.permissions.rules.map(ruleKey),
-    after.permissions.rules.map(ruleKey),
-  );
+  const beforeRules = before.permissions.rules.map(ruleKey);
+  const afterRules = after.permissions.rules.map(ruleKey);
+  const rules = diffSets(beforeRules, afterRules);
+  const afterPos = firstPositions(afterRules);
+  // The first matching rule decides, so an ask placed ahead of a deny can
+  // turn that deny into a question for every call both match. One pass finds
+  // the last deny, so the check stays linear however many rules are added.
+  let lastDeny = -1;
+  afterRules.forEach((key, i) => {
+    if (key.startsWith("alwaysDeny ")) lastDeny = i;
+  });
   for (const key of rules.added) {
+    const aheadOfDeny = key.startsWith("alwaysAsk ") && (afterPos.get(key) ?? 0) < lastDeny;
     push({
       kind: "permission-rule-added",
       path: "permissions.rules",
       to: key,
-      widens: key.startsWith("alwaysAllow "),
+      widens: key.startsWith("alwaysAllow ") || aheadOfDeny,
+    });
+  }
+  const reorder = ruleReorder(beforeRules, afterRules);
+  if (reorder !== undefined) {
+    push({
+      kind: "permission-rules-reordered",
+      path: "permissions.rules",
+      from: `${reorder.first}, then ${reorder.second}`,
+      to: `${reorder.second}, then ${reorder.first}`,
+      widens: reorder.widens,
     });
   }
   for (const key of rules.removed) {
@@ -576,6 +1105,145 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
       compareStrings(a.to ?? "", b.to ?? ""),
   );
   return changes;
+}
+
+/**
+ * What changed about ONE server present on both sides (security-5#4).
+ *
+ * A server is what it RUNS and what it runs WITH, so every one of these
+ * widens: a different transport, command, argv or endpoint is a different
+ * program behind the same tool names (a routine pin bump runs new code that
+ * may expose new tools — conservative, and deliberately so); an added `env`
+ * or `headers` key hands it something it did not have; a changed value
+ * (withheld — see {@link WITHHELD}) may switch it from paper to live; and a
+ * trust flag removed (`destructive`, `requireJustification`) or `readOnly`
+ * added lets plan and auto mode run its tools without asking. Removing a key
+ * or tightening a flag is reported and does not widen. Names only: no value,
+ * and no digest of one, is ever put in a change.
+ */
+function diffServer(path: string, from: McpServerView, to: McpServerView): SpecChange[] {
+  const out: SpecChange[] = [];
+  const fromText = describeServer(from);
+  const toText = describeServer(to);
+  if (fromText !== toText) {
+    out.push({ kind: "mcp-server", path, from: fromText, to: toText, widens: true });
+  }
+  const fromDigests = WITHHELD.get(from);
+  const toDigests = WITHHELD.get(to);
+  if (fromDigests !== undefined && toDigests !== undefined) {
+    // Only what the display text above cannot show: a redacted argv entry,
+    // or an `sse` URL's query, userinfo or fragment.
+    if (fromText === toText && fromDigests.argv !== toDigests.argv) {
+      out.push({
+        kind: "mcp-server-args-value-changed",
+        path,
+        to: "a redacted argv value changed (withheld)",
+        widens: true,
+      });
+    }
+    if (fromText === toText && fromDigests.url !== toDigests.url) {
+      out.push({
+        kind: "mcp-server-url-value-changed",
+        path,
+        to: "a withheld part of the URL changed (its query, userinfo, fragment or a key in its path)",
+        widens: true,
+      });
+    }
+  }
+  const keyed: ReadonlyArray<
+    readonly ["env" | "header", readonly string[] | undefined, readonly string[] | undefined]
+  > = [
+    ["env", from.envKeys, to.envKeys],
+    ["header", from.headerKeys, to.headerKeys],
+  ];
+  for (const [what, before, after] of keyed) {
+    const { added, removed } = diffSets(before ?? [], after ?? []);
+    for (const key of added) {
+      out.push({ kind: `mcp-server-${what}-added`, path, to: key, widens: true });
+    }
+    for (const key of removed) {
+      out.push({ kind: `mcp-server-${what}-removed`, path, from: key, widens: false });
+    }
+    const fromValues = what === "env" ? fromDigests?.env : fromDigests?.headers;
+    const toValues = what === "env" ? toDigests?.env : toDigests?.headers;
+    if (fromValues === undefined || toValues === undefined) continue;
+    const kept = (before ?? []).filter((key) => (after ?? []).includes(key));
+    for (const key of kept) {
+      if (fromValues.get(key) === toValues.get(key)) continue;
+      out.push({
+        kind: `mcp-server-${what}-value-changed`,
+        path,
+        to: `${key} (value withheld)`,
+        widens: true,
+      });
+    }
+  }
+  out.push(...diffToolFlags(path, from.toolFlags, to.toolFlags));
+  if (from.required && !to.required) {
+    // A peer that may now be absent is a smaller guarantee, not a wider
+    // capability — reported, not flagged.
+    out.push({
+      kind: "mcp-server-optional",
+      path,
+      from: "required",
+      to: "optional",
+      widens: false,
+    });
+  }
+  if (!from.required && to.required) {
+    out.push({
+      kind: "mcp-server-required",
+      path,
+      from: "optional",
+      to: "required",
+      widens: false,
+    });
+  }
+  return out;
+}
+
+/** A trust flag whose REMOVAL loosens a tool: it asked, or it was gated. */
+const TIGHTENING_FLAGS: ReadonlySet<string> = new Set(["destructive", "requireJustification"]);
+
+function diffToolFlags(
+  path: string,
+  from: McpServerView["toolFlags"],
+  to: McpServerView["toolFlags"],
+): SpecChange[] {
+  const out: SpecChange[] = [];
+  const entries: Array<[string, readonly string[], readonly string[]]> = [
+    [`${path}.tool_flags.defaults`, from?.defaults ?? [], to?.defaults ?? []],
+  ];
+  const tools = new Set([...Object.keys(from?.perTool ?? {}), ...Object.keys(to?.perTool ?? {})]);
+  for (const tool of [...tools].sort(compareStrings)) {
+    entries.push([
+      `${path}.tool_flags.per_tool.${tool}`,
+      from?.perTool?.[tool] ?? [],
+      to?.perTool?.[tool] ?? [],
+    ]);
+  }
+  for (const [flagPath, before, after] of entries) {
+    const { added, removed } = diffSets(before, after);
+    for (const flag of removed) {
+      out.push({
+        kind: "mcp-tool-flag-removed",
+        path: flagPath,
+        from: flag,
+        widens: TIGHTENING_FLAGS.has(flag),
+      });
+    }
+    for (const flag of added) {
+      // `readOnly` is a GRANT: plan and auto mode run a read-only tool
+      // without asking. Every other flag tightens.
+      out.push({
+        kind: "mcp-tool-flag-added",
+        path: flagPath,
+        to: flag,
+        widens: flag === "readOnly",
+      });
+    }
+  }
+  return out;
 }
 
 function describeServer(server: McpServerView): string {

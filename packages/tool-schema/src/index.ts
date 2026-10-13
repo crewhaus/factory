@@ -19,7 +19,7 @@
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { ASSERT_OPS, type Check, checkRequired, runChecks } from "./lib/assert";
+import { ASSERT_OPS, type Check, askCheckPatterns, checkRequired, runChecks } from "./lib/assert";
 import { compareValues, firstDifference } from "./lib/compare";
 import { FORMAT_NAMES, type FormatName, checkFormat, matchingFormats } from "./lib/formats";
 import { inferSchema } from "./lib/infer";
@@ -30,6 +30,7 @@ import {
   findDuplicates,
   validateRecords as validateRecordsFn,
 } from "./lib/records";
+import { RegexAnswers, regexRunContext, withRegexAnswers } from "./lib/regex-answers";
 import { diffSchemas } from "./lib/schemadiff";
 import { closestMatch } from "./lib/suggest";
 import { renderFieldTable, summarizeSchema } from "./lib/summarize";
@@ -101,13 +102,41 @@ export const jsonSchemaValidate: RegisteredTool = buildTool({
     .refine(present("value"), { message: "value is required, even when it is null" }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const problems = schemaProblemReport(input.schema);
     if (problems !== null) return problems;
-    const result = validateValue(input.value, input.schema, {
-      assertFormat: input.assertFormat ?? false,
-      maxErrors: input.maxErrors ?? 100,
-    });
+    // The schema's patterns run in the worker, never on this thread; the
+    // walk runs once to learn what they are asked, and again with answers.
+    const run = await withRegexAnswers((regex) => {
+      const pass = validateValue(input.value, input.schema, {
+        assertFormat: input.assertFormat ?? false,
+        maxErrors: input.maxErrors ?? 100,
+        regex,
+      });
+      if (pass.workExhausted) regex.discardPending();
+      return pass;
+    }, regexRunContext(ctx));
+    if ("undetermined" in run) {
+      return json({
+        valid: null,
+        undetermined: true,
+        reason: run.undetermined,
+        errorsBeforeStopping: [],
+      });
+    }
+    const result = run.value;
+    if (result.undetermined !== null) {
+      // Not a verdict either way: `valid` is null, never false or true.
+      return json({
+        valid: null,
+        undetermined: true,
+        reason: result.undetermined,
+        errorsBeforeStopping: result.errors,
+        ...(result.unsupportedKeywords.length > 0
+          ? { unsupportedKeywords: result.unsupportedKeywords }
+          : {}),
+      });
+    }
     return json({
       valid: result.valid,
       errorCount: result.errors.length,
@@ -182,20 +211,37 @@ export const validateRecords: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const problems = schemaProblemReport(input.schema);
     if (problems !== null) return problems;
-    const report = validateRecordsFn(input.records, input.schema, {
-      assertFormat: input.assertFormat ?? false,
-      maxErrorsPerRow: input.maxErrorsPerRow ?? 10,
-      maxFailedRows: input.maxFailedRows ?? 50,
-      idField: input.idField ?? null,
-    });
+    const run = await withRegexAnswers(
+      (regex) =>
+        validateRecordsFn(input.records, input.schema, {
+          assertFormat: input.assertFormat ?? false,
+          maxErrorsPerRow: input.maxErrorsPerRow ?? 10,
+          maxFailedRows: input.maxFailedRows ?? 50,
+          idField: input.idField ?? null,
+          regex,
+        }),
+      regexRunContext(ctx),
+    );
+    if ("undetermined" in run) {
+      return json({
+        ok: false,
+        total: input.records.length,
+        undetermined: input.records.length,
+        reason: run.undetermined,
+      });
+    }
+    const report = run.value;
     const head = {
       ok: report.ok,
       total: report.total,
       passed: report.passed,
       failed: report.failed,
+      ...(report.undetermined > 0
+        ? { undetermined: report.undetermined, undeterminedFrom: report.undeterminedFrom }
+        : {}),
       topIssues: report.topIssues.slice(0, 20),
       ...(report.unsupportedKeywords.length > 0
         ? { unsupportedKeywords: report.unsupportedKeywords }
@@ -237,13 +283,20 @@ export const assert: RegisteredTool = buildTool({
     .refine(present("value"), { message: "value is required, even when it is null" }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const report = runChecks(input.value, input.checks as Check[]);
+  execute: async (input, ctx) => {
+    const checks = input.checks as Check[];
+    // `matches` patterns run in the worker, before the checks are read.
+    const regex = new RegexAnswers();
+    askCheckPatterns(input.value, checks, regex);
+    await regex.resolve(regexRunContext(ctx));
+    const report = runChecks(input.value, checks, { regex });
+    const undetermined = report.undetermined > 0 ? { undetermined: report.undetermined } : {};
     if (input.failuresOnly === true) {
       return json({
         ok: report.ok,
         passed: report.passed,
         failed: report.failed,
+        ...undetermined,
         failures: report.failures,
       });
     }
@@ -251,6 +304,7 @@ export const assert: RegisteredTool = buildTool({
       ok: report.ok,
       passed: report.passed,
       failed: report.failed,
+      ...undetermined,
       results: report.results,
     });
   },
@@ -628,6 +682,9 @@ export const validateReferences: RegisteredTool = buildTool({
   },
 });
 
+/** The most characters the paths of the changes SchemaDiff lists may add up to. */
+export const MAX_LISTED_PATH_CHARS = 1_000_000;
+
 export const schemaDiff: RegisteredTool = buildTool({
   name: "SchemaDiff",
   description:
@@ -648,12 +705,31 @@ export const schemaDiff: RegisteredTool = buildTool({
       input.breakingOnly === true
         ? result.changes.filter((c) => c.compat !== "compatible")
         : result.changes;
+    // Every change carries its full path, so one long name high in a schema
+    // is repeated in every change below it: a result the square of the
+    // input. The changes are listed until their paths reach the cap, and
+    // the rest are counted; the verdict and the counts cover them all.
+    const listed: typeof changes = [];
+    let pathChars = 0;
+    for (const change of changes) {
+      pathChars += change.path.length;
+      if (pathChars > MAX_LISTED_PATH_CHARS) break;
+      listed.push(change);
+    }
+    const omitted = changes.length - listed.length;
     return json({
       identical: result.identical,
       verdict: result.verdict,
       backwardCompatible: result.backwardCompatible,
       counts: result.counts,
-      changes,
+      changes: listed,
+      ...(omitted > 0
+        ? {
+            truncated: true,
+            omitted,
+            detail: `${omitted} of the ${changes.length} changes are not listed: their paths would pass ${MAX_LISTED_PATH_CHARS} characters. The verdict and counts cover every change; diff a nested part on its own to list the rest`,
+          }
+        : {}),
       note: "backward compatible means every value valid under `before` is still valid under `after`",
     });
   },
@@ -729,6 +805,25 @@ export {
   type AssertReport,
   type Check,
   type CheckResult,
+  askCheckPatterns,
   checkRequired,
+  checksVerdict,
   runChecks,
 } from "./lib/assert";
+
+/**
+ * Caller patterns answered in the worker, for the other packages whose
+ * synchronous evaluators run a regex someone else wrote: ask, resolve once,
+ * then read (see `./lib/regex-answers`).
+ */
+export {
+  _setRegexAnswersSessionForTest,
+  CALLER_PATTERN_DEADLINE_MS,
+  MAX_PATTERN_QUESTIONS,
+  type RegexAnswer,
+  RegexAnswers,
+  type RegexRunContext,
+  regexRunContext,
+  testPatternSync,
+  withRegexAnswers,
+} from "./lib/regex-answers";

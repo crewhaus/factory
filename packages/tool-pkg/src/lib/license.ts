@@ -54,6 +54,69 @@ export type LicenseReport = {
   }>;
 };
 
+/** A code unit `\s` matches: WhiteSpace or LineTerminator. */
+function isRegExpSpace(c: number): boolean {
+  return (
+    (c >= 0x09 && c <= 0x0d) ||
+    c === 0x20 ||
+    c === 0xa0 ||
+    c === 0x1680 ||
+    (c >= 0x2000 && c <= 0x200a) ||
+    c === 0x2028 ||
+    c === 0x2029 ||
+    c === 0x202f ||
+    c === 0x205f ||
+    c === 0x3000 ||
+    c === 0xfeff
+  );
+}
+
+/** The length of `OR`, `AND` or `WITH` at `at`, in either case, or 0. */
+function operatorAt(text: string, at: number): number {
+  for (const word of ["or", "and", "with"]) {
+    let i = 0;
+    for (; i < word.length; i++) {
+      const c = text.charCodeAt(at + i);
+      // ASCII case only, as `/i` without `u` folds these letters.
+      const lower = c >= 0x41 && c <= 0x5a ? c + 0x20 : c;
+      if (lower !== word.charCodeAt(i)) break;
+    }
+    if (i === word.length) return word.length;
+  }
+  return 0;
+}
+
+/**
+ * `text` split at each `OR`, `AND` or `WITH` with whitespace on both sides:
+ * what `text.split(/\s+(?:OR|AND|WITH)\s+/i)` returned, in one pass. That
+ * pattern tried every start inside a run of whitespace and, where no operator
+ * followed the run, rescanned the rest of it from each before giving the
+ * start up, so a long run was quadratic in its length; a license field is
+ * whatever a package.json holds.
+ */
+export function splitAtOperators(text: string): string[] {
+  const out: string[] = [];
+  let from = 0;
+  let i = 0;
+  while (i < text.length) {
+    if (!isRegExpSpace(text.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    const runStart = i;
+    while (i < text.length && isRegExpSpace(text.charCodeAt(i))) i++;
+    const word = operatorAt(text, i);
+    if (word > 0 && isRegExpSpace(text.charCodeAt(i + word))) {
+      out.push(text.slice(from, runStart));
+      i += word;
+      while (i < text.length && isRegExpSpace(text.charCodeAt(i))) i++;
+      from = i;
+    }
+  }
+  out.push(text.slice(from));
+  return out;
+}
+
 /**
  * Split an SPDX expression into the identifiers it names.
  *
@@ -64,9 +127,7 @@ export type LicenseReport = {
  * between OR and AND is made.
  */
 export function splitExpression(expression: string): string[] {
-  return expression
-    .replace(/[()]/g, " ")
-    .split(/\s+(?:OR|AND|WITH)\s+/i)
+  return splitAtOperators(expression.replace(/[()]/g, " "))
     .map((part) => part.trim())
     .filter((part) => part !== "" && !/^(OR|AND|WITH)$/i.test(part));
 }

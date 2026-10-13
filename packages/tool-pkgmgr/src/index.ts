@@ -153,8 +153,9 @@ function factsJson(facts: PackageFacts): Record<string, unknown> {
 
 export const packageQuery: RegisteredTool = buildTool({
   name: "PackageQuery",
+  operativeArgs: [{ field: "name", kind: "id" }],
   description:
-    'Ask the system package manager whether a package is installed, at what version, and what its already-downloaded index says is available. Supports Homebrew, apt/dpkg, dnf/rpm, pacman, winget and chocolatey, detecting the manager from the platform unless you name one; a host with none of them is reported as unknown rather than guessed at. It makes NO network call: every answer comes from a local index, which is why winget and chocolatey report installed state only — their available version lives on a remote source. Nothing is ever defaulted: a manager that is not on this host, a probe that timed out, an empty dnf metadata cache or a winget row whose columns could not be split all come back as status "unknown" with the reason and the exact command that was run, never as "not installed". Read-only: it runs only query commands and changes nothing.',
+    'Ask the system package manager whether a package is installed, at what version, and what its already-downloaded index says is available. Supports Homebrew, apt/dpkg, dnf/rpm, pacman, winget and chocolatey, detecting the manager from the platform unless you name one; a host with none of them is reported as unknown rather than guessed at. It asks for nothing over the network: every answer comes from a local index, which is why winget and chocolatey report installed state only — their available version lives on a remote source (winget may still refresh its own source cache when a list opens it; no source agreement is ever accepted for you). Nothing is ever defaulted: a manager that is not on this host, a probe that timed out, an empty dnf metadata cache or a winget row whose columns could not be split all come back as status "unknown" with the reason and the exact command that was run, never as "not installed". Read-only: it runs only query commands and changes nothing.',
   inputSchema: z.object({
     name: nameSchema,
     manager: managerSchema,
@@ -241,6 +242,7 @@ function refusal(fields: {
   readonly probes: readonly Probe[];
   readonly plan?: InstallPlan;
   readonly dryRun: boolean;
+  readonly unknowns?: Unknowns;
 }): string {
   return json({
     tool: "PackageInstall",
@@ -258,14 +260,18 @@ function refusal(fields: {
         }
       : {}),
     ...(fields.plan !== undefined ? { plan: fields.plan } : {}),
+    ...(fields.unknowns !== undefined && fields.unknowns.size > 0
+      ? { unknown: fields.unknowns.list() }
+      : {}),
     probes: probeJson(fields.probes),
   });
 }
 
 export const packageInstall: RegisteredTool = buildTool({
   name: "PackageInstall",
+  operativeArgs: [{ field: "name", kind: "id" }],
   description:
-    "Install a package through the system package manager, or report exactly what installing it would do. DESTRUCTIVE: an install can replace a version that is already working, so the plan names the versions currently on disk before anything runs. Pass dryRun to get that plan and install nothing — it is resolved by the same code the real install uses, and includes the transitive packages the manager says it would add (complete from apt and pacman, resolved-then-declined from dnf, derived from `brew deps` for Homebrew, which has no dry run). THIS TOOL NEVER ACQUIRES PRIVILEGE. It runs no sudo, doas, runas or pkexec and raises no UAC prompt. Homebrew needs no root and is the case that genuinely works unattended; apt, dnf and pacman need root, so they work only when this process is ALREADY root and are otherwise refused with the exact command an operator would run themselves; winget and chocolatey installs are refused outright, because both end in an elevation prompt. A version can only be pinned where the manager can express one — apt can, and every other manager here is refused with the reason rather than quietly installing latest. A package name beginning with '-' is refused, because a manager would read it as a flag.",
+    "Install a package through the system package manager, or report what installing it would do. DESTRUCTIVE: an install can replace a working version, so the plan names the versions on disk first. dryRun returns that plan and installs nothing; it runs the same code as the real install and lists the packages the manager would add. It never acquires privilege: no sudo, doas, runas, pkexec or UAC prompt. Homebrew needs no root; apt, dnf and pacman work only when this process is already root, and otherwise return the command to run yourself; winget and chocolatey installs are refused. Only apt can pin a version; the other managers refuse one rather than install latest. It never removes anything: a plan that would remove a package is refused, and apt must know the exact name (and version) asked for. A name beginning with '-' is refused.",
   inputSchema: z.object({
     name: nameSchema,
     manager: managerSchema,
@@ -280,7 +286,7 @@ export const packageInstall: RegisteredTool = buildTool({
       .boolean()
       .optional()
       .describe(
-        "resolve and report the plan, and install nothing (default false). The plan is produced by the same code the real install runs",
+        "resolve and report the plan, and install nothing (default false). The plan is produced by the same code the real install runs; its added packages are complete from apt and pacman, resolved-then-declined from dnf, and derived from `brew deps` for Homebrew, which has no dry run",
       ),
     timeoutMs: timeoutSchema,
   }),
@@ -359,6 +365,24 @@ export const packageInstall: RegisteredTool = buildTool({
     // ---- resolution: the same code for both paths -------------------------
 
     const facts = await queryPackage(ctx, manager, input.name, unknowns, true);
+
+    // apt reads an operand it has no exact package for as a pattern, and a
+    // version it does not list is stripped to one it does. Nothing is planned
+    // or installed until apt has answered about exactly this name (C021).
+    if (manager === "apt") {
+      const inexact = aptExactRefusal(input.name, requestedVersion, facts);
+      if (inexact !== undefined) {
+        return refusal({
+          platform,
+          manager,
+          reason: inexact,
+          probes: ctx.probes,
+          dryRun,
+          unknowns,
+        });
+      }
+    }
+
     const plan = await resolveInstallPlan(
       ctx,
       manager,
@@ -369,7 +393,19 @@ export const packageInstall: RegisteredTool = buildTool({
       unknowns,
     );
 
+    const removals = removalRefusal(plan);
+
     if (dryRun) {
+      // Stated on the dry run too, so a caller learns BEFORE it tries that
+      // the real call would be refused on this host, or for this plan.
+      const wouldRefuse = [
+        ...(spec.install.needsRoot && !isRoot()
+          ? [
+              `${spec.label} needs root to install and this process is not root; this tool does not acquire privilege`,
+            ]
+          : []),
+        ...(removals !== undefined ? [removals] : []),
+      ];
       return json({
         tool: "PackageInstall",
         platform,
@@ -379,12 +415,10 @@ export const packageInstall: RegisteredTool = buildTool({
         installed: false,
         plan,
         before: factsJson(facts),
-        // Stated on the dry run too, so a caller learns BEFORE it tries that
-        // the real call would be refused on this host.
-        ...(spec.install.needsRoot && !isRoot()
+        ...(wouldRefuse.length > 0
           ? {
               wouldBeRefused: true,
-              wouldBeRefusedReason: `${spec.label} needs root to install and this process is not root; this tool does not acquire privilege`,
+              wouldBeRefusedReason: wouldRefuse.join("; "),
               operatorCommand: spec.operatorCommand(operand),
             }
           : {}),
@@ -420,6 +454,18 @@ export const packageInstall: RegisteredTool = buildTool({
         before: factsJson(facts),
         ...(unknowns.size > 0 ? { unknown: unknowns.list() } : {}),
         probes: probeJson(ctx.probes),
+      });
+    }
+
+    if (removals !== undefined) {
+      return refusal({
+        platform,
+        manager,
+        reason: removals,
+        operatorCommand: spec.operatorCommand(operand),
+        plan,
+        probes: ctx.probes,
+        dryRun: false,
       });
     }
 
@@ -489,6 +535,42 @@ export const packageInstall: RegisteredTool = buildTool({
     });
   },
 });
+
+/**
+ * Why apt's answer does not license an install of exactly `name` (at
+ * `version`), or undefined when it does. `facts.versionTable` exists only
+ * when `apt-cache policy` answered with one stanza headed by this name.
+ */
+function aptExactRefusal(
+  name: string,
+  version: string | null,
+  facts: PackageFacts,
+): string | undefined {
+  const table = facts.versionTable;
+  if (table === undefined) {
+    return facts.knownToManager === false
+      ? `apt has no package named exactly ${JSON.stringify(name)} in its downloaded lists, so there is nothing to install`
+      : `apt did not answer about a package named exactly ${JSON.stringify(name)} — it read the name as a pattern, or its answer could not be read (see unknown) — and an install would act on whatever apt matched instead`;
+  }
+  if (version !== null && !table.includes(version)) {
+    const known = table.length === 0 ? "none" : table.slice(0, 5).join(", ");
+    return `apt's lists have no version ${JSON.stringify(version)} of ${JSON.stringify(name)} (listed: ${known}); apt would install a different version or fail, so nothing was run`;
+  }
+  return undefined;
+}
+
+/**
+ * The refusal for a plan whose simulation REMOVES something. This tool
+ * installs; an install that removes a package (a Conflicts swap, or an
+ * operand apt read as "remove") is a different decision, and the real
+ * install also runs with `--no-remove`, so apt would abort it anyway.
+ */
+function removalRefusal(plan: InstallPlan): string | undefined {
+  const removed = plan.removals ?? [];
+  if (removed.length === 0) return undefined;
+  const names = removed.map((p) => p.name).join(", ");
+  return `the manager's simulation of this install REMOVES ${names}; this tool installs and never removes, so it refuses — run the operator command yourself if the removal is intended`;
+}
 
 /**
  * The install argv for a manager.

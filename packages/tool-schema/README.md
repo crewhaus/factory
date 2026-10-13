@@ -12,7 +12,7 @@ answer twice — and say exactly which field, at which path, was wrong.
 ```yaml
 tools:
   - all-schema        # every tool below
-  - -JsonSchemaInfer  # ...except this one
+  - -jsonSchemaInfer  # ...except this one
 ```
 
 | Tool | What it does |
@@ -63,6 +63,55 @@ sitting in a branch this particular value never reached is not in it. A
 `$ref` that points outside the document is an error, never a silent `true`.
 
 `format` follows Draft-07 and is an annotation until you pass `assertFormat`.
+
+A recursive schema may recurse through any keyword, `anyOf`, `oneOf`, `not`,
+`if` and `contains` included; only the same `$ref` reached twice at the same
+place in the value is reported as a cycle. Depth is counted where the value
+nests, so a recursive schema follows a value 512 levels deep whatever
+keywords it recurses through; a deeper value, or a schema nested so deep the
+walk would overflow the stack, is `undetermined` rather than a verdict.
+
+**The work is bounded.** `anyOf`, `oneOf` and `allOf` over `$ref`s that share
+a target multiply, so a small schema can ask for billions of evaluations.
+Each call gets a budget of subschema evaluations, sized to the value and the
+schema: each node of the value (a long string or key counting as a node per
+256 characters) is allowed as many evaluations as the schema has subschemas
+written out, at least 64 and at most 1,024, and a call gets at least 500,000
+and at most 20 million (a few seconds). A schema written as a tree checks each
+of its subschemas at most once per value node, so a wide or nested union over
+thousands of valid rows is answered; only a `$ref` reached again at the same
+place goes past it. A check whose cost follows the value's size — a string's
+length, pattern or format, `uniqueItems`, listing an object's keys, each
+`enum` candidate (an enum is indexed once, so a value is one lookup), each
+key tested against each `patternProperties` pattern (compiled once per
+schema), a `const` comparison — is charged for that size, and an error
+message is built only when it is kept, from a preview that reads just the
+part it shows. When a schema needs more, `JsonSchemaValidate` answers
+`valid: null` with `undetermined: true` and the reason, never a verdict
+either way; `ValidateRecords` shares one budget across its rows and counts
+the rows it could not decide as `undetermined`, neither passed nor failed,
+with `ok: false`. A failing union's message is at most 1,000 characters:
+when its branches' reasons do not fit, each is cut to an equal share and a
+short one keeps all of it, so a nested union's decisive reason survives.
+
+**Patterns never run on the caller's thread.** A schema's `pattern` and
+`patternProperties`, and `Assert`'s `matches`/`notMatches`, are regexes the
+caller wrote, run over text the caller chose; a synchronous `RegExp` cannot be
+interrupted, and when JavaScriptCore gives up on a backtracking match it says
+"no match". So each tool asks every pattern question first, answers them all
+in one `@crewhaus/tool-safety` regex worker under a five-second deadline, and
+then evaluates with the answers (a schema whose later patterns depend on
+earlier answers, through `if` or a union, takes a few rounds). A pattern the
+screen refuses, because it backtracks exponentially (`(a+)+`, `(\w+\s?)*`) or
+is past 10,000 characters, makes the schema malformed (`schemaValid: false`),
+and fails an `Assert` check as an invalid regex does. One that cannot be run
+to an answer (the deadline, the engine giving up, which includes a no-match
+slower than 100 ms) leaves the value `undetermined`, never invalid or valid,
+and an `Assert` check `undetermined` and not ok. `Branch`, `DecisionTable`,
+`RuleScore`, `LeadAssign`, `SequenceRun` and `ErrorClassify` in
+`@crewhaus/tool-flow` read the same answers. A library caller of `runChecks` or `validateValue` with no
+answers gets a bounded fallback on its own thread: the same screen, at most
+64 KiB of input per pattern, and a give-up read as undetermined.
 
 ## The formats
 

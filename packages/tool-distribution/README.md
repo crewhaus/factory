@@ -54,8 +54,10 @@ three genuinely different places, and the result never folds them together:
 The reasons are `dns`, `timeout`, `cancelled`, `cap`, `shortRead`, `refused`,
 `transport`, `status`, `unreadable`, plus `notRequested` when downloads were
 turned off, `malformedSha` when the manifest's own checksum is not 64 hex
-characters, and `insecureScheme`, `privateHost`, `credentialsInUrl`,
-`urlWhitespace` or `urlMalformed` for a URL that was never dialled.
+characters, `egressBlocked` for a URL that carries text another tool returned
+earlier in the run (below), and `insecureScheme`, `privateHost`,
+`credentialsInUrl`, `urlWhitespace` or `urlMalformed` for a URL that was never
+dialled.
 
 A verifier that reports "could not reach it" as a hash mismatch gets a good
 release blocked. One that reports it as verified ships an unverified release.
@@ -92,6 +94,20 @@ connection pinned to the address it validated, re-checked at every redirect hop,
 and every hop must still be https. A release host that redirects the download to
 `http://169.254.169.254/` is the attack, and a bare `fetch` would have followed
 it.
+
+## A URL is screened before it is dialled
+
+The URLs this tool fetches are written inside the manifests — text the model
+passes, or files it names — so no input field is the destination. Before each
+download the URL is classified against the run's data lineage the way the
+runtime classifies a destination the model picked: a URL that carries text a
+tool, an MCP server or a sub-agent returned earlier in the run (a secret read
+into a query string, say) is not fetched, and its row is `unchecked` with
+reason `egressBlocked`. This covers a manifest named by `paths` as well as one
+passed inline. The local paths themselves are never treated as something sent,
+so verifying a formula that `Glob` listed works in every permission mode, and
+`download: false` dials and screens nothing. The runtime still scans the call's
+input as it scans any external tool's; for this tool that scan only warns.
 
 ## What it refuses
 

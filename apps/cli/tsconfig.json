@@ -106,6 +106,8 @@
     { "path": "../../packages/tool-containers" },
     { "path": "../../packages/tool-supplychain" },
     { "path": "../../packages/tool-registry" },
+    { "path": "../../packages/tool-registry-manifest" },
+    { "path": "../../packages/tool-permission-matcher" },
     { "path": "../../packages/tool-buildperf" },
     { "path": "../../packages/tool-changeset" },
     { "path": "../../packages/tool-table" },

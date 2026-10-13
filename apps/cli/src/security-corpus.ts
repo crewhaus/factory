@@ -8,6 +8,7 @@ import {
   REGEX_RULES,
   classifyText,
 } from "@crewhaus/prompt-injection-detector";
+import { jwtMatches, pemMatches } from "./secret-scan";
 
 /**
  * AUTOMATION-OPPORTUNITIES.md item 50 — `crewhaus security corpus` core: a
@@ -496,11 +497,18 @@ export const NEAR_MISS_SIGNALS: ReadonlyArray<{ signal: string; test: RegExp }> 
  */
 const CANDIDATE_SECRET_DETECTORS: ReadonlyArray<PiiDetector> = [
   ...SYNTHESIZE_PII_DETECTORS,
-  { kind: "jwt", regex: /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g },
+  // Both matched by scans (secret-scan.ts): the engine rescans a run of
+  // `ey-ey-…`, or a text of BEGIN lines with no END line, from every start.
+  {
+    kind: "jwt",
+    regex: /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    matches: jwtMatches,
+  },
   {
     kind: "pem",
     regex:
       /-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----[\s\S]*?-----END [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/g,
+    matches: pemMatches,
   },
 ];
 

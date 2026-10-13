@@ -16,20 +16,48 @@
  *   2. Only the spec's own rules are seen. The engine also consults CLI
  *      flags, `.crewhaus/settings.json`, hook-installed rules and a builtin
  *      floor, in that precedence order; none of those live in the spec.
- *   3. `readOnly` / `destructive` are properties of the TOOL, and the tool
- *      registry lives in the compiled bundle, not in the spec. So the
- *      destructive column is filled only from what the document itself
- *      declares (`mcp_servers.*.tool_flags`) plus anything the caller passes
- *      in. It is never guessed from a name.
+ *   3. `readOnly` / `destructive` / `scope` are properties of the TOOL. For a
+ *      builtin they come from the builtin manifest the caller passes in
+ *      (`flagsOf`), which is generated from the tools themselves. For
+ *      anything else — an MCP tool, a custom tool — only what the document
+ *      declares (`mcp_servers.*.tool_flags`), what the caller passes in, and
+ *      the definitionally outward names (`mcp__*`, `Fetch`, …) are known.
+ *      Nothing is guessed from a name beyond that.
  *
  * Pure: no filesystem, no clock, no locale-sensitive comparison.
  */
 
 import { isOutwardName } from "@crewhaus/tool-builder";
+import { legacyMcpToolName } from "@crewhaus/tool-catalog";
+import {
+  type PermissionRuleList,
+  type PermissionRuleProblem,
+  type RuleToolDescriptor,
+  mcpServersReachedBy,
+  permissionRuleProblems,
+} from "@crewhaus/tool-permission-matcher";
 import { compareStrings } from "./spec-view";
+
+/**
+ * How a builtin is gated, as the manifest describes it (`ToolFlags` in
+ * `@crewhaus/tool-registry-manifest`, taken structurally).
+ */
+export type ToolFlagsLike = {
+  readonly name: string;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification: boolean;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+};
 
 /** A rule as a spec declares it. */
 export type RuleLike = { readonly type: string; readonly pattern: string };
+
+/** A rule that can never do what it says, and the list that holds it. */
+export type LocatedRuleProblem = PermissionRuleProblem & { readonly list: string };
 
 /** How thoroughly a rule's pattern covers a tool name. */
 export type Coverage = "full" | "conditional" | "none";
@@ -42,10 +70,26 @@ export type ToolPermission = {
   readonly rule?: RuleLike;
   /** True when the matched rule also constrains arguments (`Tool(glob)`). */
   readonly conditional: boolean;
-  /** The tool crosses a process or network boundary by name (see `isOutwardName`). */
+  /**
+   * The tool crosses a process or network boundary: its flags say
+   * `scope: "external"` or declare an io capability, or — for a tool the
+   * manifest does not describe — its name is definitionally outward.
+   */
   readonly external: boolean;
-  /** Only set when the document or the caller SAYS so — never inferred. */
+  /** From the tool's flags, the document's `tool_flags` or the caller. */
   readonly destructive?: boolean;
+  /** From the tool's flags; absent when they are not known. */
+  readonly readOnly?: boolean;
+  /** Every call must carry a justification the intent gate accepts. */
+  readonly requireJustification?: boolean;
+  /** The engine allows it only with a sandbox and an explicit allow rule. */
+  readonly requiresSandbox?: boolean;
+  /**
+   * Where the flags came from: `"builtin"` when the manifest describes the
+   * tool, `"name"` when only its name (and anything the document or caller
+   * declared) was available.
+   */
+  readonly flagsFrom: "builtin" | "name";
 };
 
 export type PermissionFinding = {
@@ -59,8 +103,26 @@ export type PermissionAuditResult = {
   /** What an unmatched call resolves to under `mode`, before tool flags. */
   readonly fallback: string;
   readonly tools: readonly ToolPermission[];
-  /** Declared rules that match none of the granted tools — likely dead. */
+  /**
+   * Declared rules that match none of the granted tools and can match no
+   * tool of a declared MCP server — likely dead.
+   */
   readonly unusedRules: readonly RuleLike[];
+  /**
+   * Declared rules that match none of the granted tools but can match a tool
+   * of an MCP server the spec declares (`broker__*`, `mcp__gh__create_*`).
+   * The server lists its tools when it starts, so this report cannot say
+   * which they cover — only that they are not dead.
+   */
+  readonly mcpServerRules: ReadonlyArray<RuleLike & { readonly servers: readonly string[] }>;
+  /**
+   * Declared rules that match none of the granted tools but name a tool the
+   * runtime can add on its own (`Skill`, `Task`, `run_exam`, …), depending
+   * on wiring this report does not model — skills on disk, sub-agents, a
+   * `learning.exam`. Whether this spec's runtime adds it is not known here,
+   * so they are not called dead; `tools` says which such tools they name.
+   */
+  readonly runtimeToolRules: ReadonlyArray<RuleLike & { readonly tools: readonly string[] }>;
   /**
    * Rules the runtime matcher would REFUSE to compile. The engine fails
    * closed on these: an uncompilable `alwaysDeny`/`alwaysAsk` gates every
@@ -71,11 +133,22 @@ export type PermissionAuditResult = {
    */
   readonly malformedRules: readonly RuleLike[];
   /**
-   * True when `mode` makes the rule list moot: in `plan` the engine decides
-   * on the tool's own `readOnly` flag and consults no rule at all, so every
-   * `decision` below describes a rule that will not be reached.
+   * True when `mode` overrides part of the rule list: in `plan` the engine
+   * ignores every allow rule, reads deny and ask rules (both deny — plan mode
+   * cannot ask), and otherwise decides on the tool's own `readOnly` flag. The
+   * `decision`s below are computed that way.
    */
   readonly modeOverridesRules: boolean;
+  /**
+   * Rules that can never do what they say: a spec key where the tool's name
+   * belongs, an argument pattern the tool's operative field cannot match, an
+   * MCP server the spec does not declare. The same check `crewhaus lint`
+   * runs, over every rule list the spec carries: `list` names it
+   * (`permissions.rules`, `models.fast.permissions.deny`,
+   * `agent.sub_agents.helper.permissions.allow`, …). Such a rule is not
+   * counted as covering any tool.
+   */
+  readonly ruleProblems: readonly LocatedRuleProblem[];
   readonly findings: readonly PermissionFinding[];
 };
 
@@ -154,11 +227,17 @@ export function compileToolGlob(glob: string): RegExp {
   return new RegExp(`^${re}$`, "s");
 }
 
-/** How well `pattern` covers `toolName`. A malformed pattern covers nothing. */
+/**
+ * How well `pattern` covers `toolName`. A malformed pattern covers nothing.
+ * An MCP tool (`mcp__<server>__<tool>`) is also covered by a pattern written
+ * against its pre-0.7.1 spelling `<server>__<tool>`, as the engine does.
+ */
 export function patternCoverage(pattern: string, toolName: string): Coverage {
   const split = splitPattern(pattern);
   if (split === undefined) return "none";
-  if (!compileToolGlob(split.toolGlob).test(toolName)) return "none";
+  const glob = compileToolGlob(split.toolGlob);
+  const legacy = legacyMcpToolName(toolName);
+  if (!glob.test(toolName) && (legacy === undefined || !glob.test(legacy))) return "none";
   return split.argGlob === null ? "full" : "conditional";
 }
 
@@ -178,8 +257,13 @@ function decisionOf(ruleType: string): string {
 /**
  * A spec's `tools:` list may spell a builtin in either legal form — the
  * camelCase key (`webFetch`) or the registered PascalCase name (`WebFetch`).
- * Permission patterns are written against the registered name, so both forms
- * are checked wherever a name is compared to the registry.
+ * Permission patterns are written against the registered name.
+ *
+ * This is the NAME-ONLY guess, for a tool the manifest does not describe:
+ * upper-casing the first letter is wrong for the builtins whose names are
+ * not their keys (`javascript` is `JavaScript`, `codegraphSearch` is
+ * `CodeGraphSearch`), so a builtin's name always comes from its flags
+ * (`flagsOf(tool).name`) and never from here.
  */
 export function toRegisteredName(toolKey: string): string {
   if (toolKey.startsWith("mcp__")) return toolKey;
@@ -187,9 +271,25 @@ export function toRegisteredName(toolKey: string): string {
   return first === undefined ? toolKey : first.toUpperCase() + toolKey.slice(1);
 }
 
-/** True when the tool crosses a process or network boundary by definition. */
-export function isExternalTool(toolKey: string): boolean {
+/**
+ * True when the tool crosses a process or network boundary: its flags say so
+ * when they are known, else its name is definitionally outward.
+ */
+export function isExternalTool(toolKey: string, flags?: ToolFlagsLike): boolean {
+  if (flags !== undefined) return flags.scope === "external" || flags.ioCapability !== undefined;
   return isOutwardName(toolKey) || isOutwardName(toRegisteredName(toolKey));
+}
+
+/**
+ * What the engine decides for a call no rule matched, when the tool's flags
+ * are known — the mode's fallback applied to this tool, then the sandbox
+ * floor.
+ */
+export function unmatchedDecision(mode: string, flags: ToolFlagsLike): string {
+  if (mode === "plan") return flags.readOnly ? "allow" : "deny";
+  const base = mode === "auto" ? (flags.readOnly || !flags.destructive ? "allow" : "ask") : "ask";
+  // Section 18 floor: a sandboxed tool is never allowed by a fallback.
+  return flags.requiresSandbox ? "deny" : base;
 }
 
 /** What an unmatched call resolves to under each mode, before tool flags. */
@@ -206,11 +306,47 @@ export function fallbackDecision(mode: string): string {
 
 export type AuditPermissionsInput = {
   readonly tools: readonly string[];
+  /**
+   * Tools the runtime registers under exactly these names with no `tools:`
+   * entry — a `thredz:` block's `goal_list`, `message_send`, … They are
+   * granted like `tools`, and no registered name is guessed for them.
+   */
+  readonly runtimeTools?: readonly string[];
   readonly mode: string;
   readonly askMode: string;
   readonly rules: readonly RuleLike[];
   /** Tools the document or the caller declares destructive. */
   readonly destructiveTools?: ReadonlySet<string>;
+  /**
+   * The flags of a builtin, looked up by spec key or registered name;
+   * `undefined` for anything the manifest does not describe.
+   */
+  readonly flagsOf?: (tool: string) => ToolFlagsLike | undefined;
+  /**
+   * Every tool that exists — the builtins and the tools the runtime registers
+   * on its own (`Skill`, `Type`, …) — for spotting a rule that names none of
+   * them. A tool given without flags is treated as one that may change or
+   * delete things.
+   */
+  readonly knownTools?: readonly RuleToolDescriptor[];
+  /** The MCP servers the spec declares. */
+  readonly mcpServers?: readonly string[];
+  /**
+   * Tools the runtime may register on its own, under exactly these names,
+   * depending on wiring the audit does not model (`RUNTIME_TOOL_NAMES`). A
+   * rule naming one is reported under `runtimeToolRules`, not as unused.
+   */
+  readonly mayRegisterTools?: readonly string[];
+  /**
+   * The spec's other rule lists — model profiles' and pool candidates'
+   * deny/ask, sub-agents' allow/deny (`specPermissionRuleLists`, without
+   * `permissions.rules`). They narrow or replace `rules` for what they
+   * serve, so they are checked for rules that can never fire, not audited
+   * for cover.
+   */
+  readonly otherRuleLists?: readonly PermissionRuleList[];
+  /** The spec's `security.justification.judge`, when it sets one. */
+  readonly justificationJudge?: string;
 };
 
 /**
@@ -220,9 +356,8 @@ export type AuditPermissionsInput = {
 export function auditPermissions(input: AuditPermissionsInput): PermissionAuditResult {
   const destructive = input.destructiveTools ?? new Set<string>();
   const fallback = fallbackDecision(input.mode);
-  // `plan` never reaches the rule list — `evaluateWithReason` returns on the
-  // tool's own readOnly flag before the scan — so a report that presented
-  // rule decisions under it would be describing code that does not run.
+  // `plan` reads only deny and ask rules (both deny) and ignores allows, so
+  // the scan below skips allows and reports a matched ask as a deny there.
   const modeOverridesRules = input.mode === "plan";
   const malformedRules = input.rules
     .filter((rule) => splitPattern(rule.pattern) === undefined)
@@ -235,11 +370,62 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   const usedRules = new Set<string>();
   const tools: ToolPermission[] = [];
   const findings: PermissionFinding[] = [];
+  const flagsOf = input.flagsOf ?? (() => undefined);
+  const runtimeTools = new Set(input.runtimeTools ?? []);
+  const grantedTools = [...new Set([...input.tools, ...runtimeTools])].sort(compareStrings);
+  // The name the engine matches rules against: a builtin's comes from its
+  // flags, a runtime tool's is its own, anything else's is a guess.
+  const registeredNameOf = (tool: string, flags: ToolFlagsLike | undefined): string =>
+    flags?.name ?? (runtimeTools.has(tool) ? tool : toRegisteredName(tool));
 
-  for (const tool of [...new Set(input.tools)].sort(compareStrings)) {
-    const registered = toRegisteredName(tool);
+  // Rules that can never fire as written cover nothing; the ones whose
+  // argument is merely unscoped still match (on the call's text), a
+  // `builtin-not-reached` glob still matches a declared MCP server's tools,
+  // and a `tool-not-known` name may be a plugin's.
+  const granted = grantedTools.flatMap((tool) => {
+    const flags = flagsOf(tool);
+    return flags !== undefined
+      ? [
+          {
+            name: flags.name,
+            ...(flags.operativeArgs ? { operativeArgs: flags.operativeArgs } : {}),
+          },
+        ]
+      : [{ name: registeredNameOf(tool, undefined) }];
+  });
+  const problemsIn = (list: PermissionRuleList): LocatedRuleProblem[] =>
+    permissionRuleProblems({
+      rules: list.rules,
+      granted,
+      known: input.knownTools ?? [],
+      mcpServers: input.mcpServers ?? [],
+    }).map((p) => ({ ...p, list: list.path }));
+  const topProblems = problemsIn({ path: "permissions.rules", rules: input.rules });
+  const ruleProblems = [
+    ...topProblems,
+    ...(input.otherRuleLists ?? []).flatMap((list) => problemsIn(list)),
+  ];
+  const deadRules = new Set(
+    topProblems
+      .filter(
+        (p) =>
+          p.code !== "argument-not-scoped" &&
+          p.code !== "builtin-not-reached" &&
+          p.code !== "tool-not-known",
+      )
+      .map((p) => `${p.type} ${p.pattern}`),
+  );
+
+  for (const tool of grantedTools) {
+    const flags = flagsOf(tool);
+    // The name the engine matches rules against. A builtin's comes from its
+    // flags: `toRegisteredName` gets `javascript` → "Javascript" wrong, and a
+    // live `alwaysDeny JavaScript` was then reported as unused (C032).
+    const registered = registeredNameOf(tool, flags);
     let matched: { rule: RuleLike; coverage: Coverage } | undefined;
     for (const rule of input.rules) {
+      if (modeOverridesRules && rule.type === "alwaysAllow") continue;
+      if (deadRules.has(`${rule.type} ${rule.pattern}`)) continue;
       if (splitPattern(rule.pattern) === undefined) {
         // Mirror the engine: a broken guard still gates, a broken grant does
         // not. Scanning in declaration order, so this rule wins here exactly
@@ -251,51 +437,129 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
         }
         continue;
       }
+      // The engine only ever sees the registered name, so a builtin's rule is
+      // matched against that alone — a glob that matches the spec KEY
+      // (`web*` against `webFetch`) never fires at run time and must not be
+      // reported as the tool's decision. A tool the manifest does not
+      // describe keeps both spellings, since its registered name is a guess.
       const coverage =
-        patternCoverage(rule.pattern, tool) !== "none"
-          ? patternCoverage(rule.pattern, tool)
-          : patternCoverage(rule.pattern, registered);
+        flags !== undefined || runtimeTools.has(tool)
+          ? patternCoverage(rule.pattern, registered)
+          : patternCoverage(rule.pattern, tool) !== "none"
+            ? patternCoverage(rule.pattern, tool)
+            : patternCoverage(rule.pattern, registered);
       if (coverage !== "none") {
-        matched = { rule, coverage };
+        // The first rule that speaks to the tool is its decision; one that
+        // speaks only to some calls (`Edit(curriculum.md)`) leaves the rules
+        // after it reachable for the others (`Edit(eval/**)`), so they are
+        // not reported as matching nothing. A rule that covers every call
+        // shadows the rest.
+        matched ??= { rule, coverage };
         usedRules.add(`${rule.type} ${rule.pattern}`);
-        break;
+        if (coverage === "full") break;
       }
     }
-    const external = isExternalTool(tool);
-    const isDestructive = destructive.has(tool) || destructive.has(registered);
+    const external = isExternalTool(tool, flags);
+    const isDestructive =
+      destructive.has(tool) || destructive.has(registered) || flags?.destructive === true;
+    const ruled = matched === undefined ? undefined : decisionOf(matched.rule.type);
+    const decision =
+      matched === undefined
+        ? flags !== undefined
+          ? unmatchedDecision(input.mode, flags)
+          : fallback
+        : modeOverridesRules
+          ? "deny"
+          : // The sandbox floor holds even over a matching allow: only an
+            // allow can let a sandboxed tool through, and only with a sandbox.
+            flags?.requiresSandbox === true && ruled !== "allow"
+            ? "deny"
+            : (ruled as string);
     const entry: ToolPermission = {
       tool,
-      decision: matched !== undefined ? decisionOf(matched.rule.type) : fallback,
+      decision,
       ...(matched !== undefined ? { rule: matched.rule } : {}),
       conditional: matched?.coverage === "conditional",
       external,
       ...(isDestructive ? { destructive: true } : {}),
+      ...(flags !== undefined
+        ? {
+            readOnly: flags.readOnly,
+            requireJustification: flags.requireJustification,
+            requiresSandbox: flags.requiresSandbox,
+          }
+        : {}),
+      flagsFrom: flags !== undefined ? "builtin" : "name",
     };
     tools.push(entry);
 
+    if (flags?.requireJustification === true && decision !== "deny") {
+      findings.push({
+        tool,
+        reason:
+          input.justificationJudge === undefined || input.justificationJudge === "rule-based"
+            ? "needs a justification on every call, and this spec sets no security.justification.judge: outside tests the default judge denies every such call unless CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1. Set security.justification.judge: claude"
+            : `needs a justification on every call, judged by ${input.justificationJudge}`,
+      });
+    }
+
+    // What an unruled call comes to: this tool's own answer when its flags
+    // are known, else the mode's general fallback.
+    const unruled =
+      flags !== undefined
+        ? `${unmatchedDecision(input.mode, flags)} (mode ${input.mode})`
+        : fallback;
     if (matched === undefined && external) {
       findings.push({
         tool,
-        reason: `reaches outside the process (${registered}) and no declared rule names it — it resolves to the mode fallback: ${fallback}`,
+        reason: `reaches outside the process (${registered}) and no declared rule names it — it resolves to the mode fallback: ${unruled}`,
       });
     } else if (matched === undefined && isDestructive) {
       findings.push({
         tool,
-        reason: `is declared destructive and no rule names it — it resolves to the mode fallback: ${fallback}`,
+        reason: `is destructive and no rule names it — it resolves to the mode fallback: ${unruled}`,
       });
     } else if (matched?.coverage === "conditional" && (external || isDestructive)) {
       findings.push({
         tool,
-        reason: `is covered only by the argument-scoped rule "${matched.rule.pattern}" — calls whose arguments fall outside that glob resolve to the mode fallback: ${fallback}`,
+        reason: `is covered only by the argument-scoped rule "${matched.rule.pattern}" — calls whose arguments fall outside that glob resolve to the mode fallback: ${unruled}`,
       });
     }
   }
 
   // A rule naming a tool the spec does not grant cannot fire. Worth saying:
-  // it is usually a rename or a tool that was dropped and the guard left.
-  const unusedRules = input.rules
-    .filter((rule) => !usedRules.has(`${rule.type} ${rule.pattern}`))
-    .sort((a, b) => compareStrings(a.pattern, b.pattern) || compareStrings(a.type, b.type));
+  // it is usually a rename or a tool that was dropped and the guard left —
+  // unless it can match a declared MCP server's tools, which only the server
+  // can list, or a tool the runtime may add on its own.
+  const byPattern = (a: RuleLike, b: RuleLike) =>
+    compareStrings(a.pattern, b.pattern) || compareStrings(a.type, b.type);
+  const unmatched = input.rules.filter((rule) => !usedRules.has(`${rule.type} ${rule.pattern}`));
+  const unusedRules: RuleLike[] = [];
+  const mcpServerRules: Array<RuleLike & { servers: string[] }> = [];
+  const runtimeToolRules: Array<RuleLike & { tools: string[] }> = [];
+  const mayRegister = [...new Set(input.mayRegisterTools ?? [])].sort(compareStrings);
+  for (const rule of unmatched) {
+    // A rule the checker says can never fire, or an allow plan mode ignores,
+    // matches nothing whatever tools the runtime adds.
+    if (
+      deadRules.has(`${rule.type} ${rule.pattern}`) ||
+      (modeOverridesRules && rule.type === "alwaysAllow")
+    ) {
+      unusedRules.push(rule);
+      continue;
+    }
+    const servers = mcpServersReachedBy(rule.pattern, input.mcpServers ?? []);
+    if (servers.length > 0) {
+      mcpServerRules.push({ ...rule, servers });
+      continue;
+    }
+    const named = mayRegister.filter((tool) => patternCoverage(rule.pattern, tool) !== "none");
+    if (named.length > 0) runtimeToolRules.push({ ...rule, tools: named });
+    else unusedRules.push(rule);
+  }
+  unusedRules.sort(byPattern);
+  mcpServerRules.sort(byPattern);
+  runtimeToolRules.sort(byPattern);
 
   if (blanketGate !== undefined) {
     findings.push({
@@ -307,7 +571,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     findings.push({
       tool: "<every tool>",
       reason:
-        'permissions.mode is "plan", under which the engine allows read-only tools and denies the rest without consulting a single rule — the decisions reported here are what WOULD apply in default or auto mode',
+        'permissions.mode is "plan": the engine ignores every allow rule, denies a call any deny or ask rule matches (plan mode cannot ask), and otherwise allows read-only tools and denies the rest — the decisions reported here are computed that way',
     });
   }
 
@@ -318,8 +582,11 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     fallback,
     tools,
     unusedRules,
+    mcpServerRules,
+    runtimeToolRules,
     malformedRules,
     modeOverridesRules,
+    ruleProblems,
     findings,
   };
 }

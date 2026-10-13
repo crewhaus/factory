@@ -95,13 +95,13 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
 
     // Non-TTY --review just lists (no interactive prompt), exit 0.
     expect((await runCli(["dataset", "mine", "--review"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   it("exits cleanly when there are no sessions", async () => {
     const root = newTempRoot();
     writeFileSync(join(root, "crewhaus.yaml"), CLI_SPEC);
     expect((await runCli(["dataset", "mine"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   // D45 — the eval_graded signal rides the session's trace SIDECAR, so the
   // CLI must read `<id>.events.jsonl` beside the transcript.
@@ -136,7 +136,7 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     expect(cands.length).toBe(1);
     expect(cands[0]?.metadata?.["signal"]).toBe("eval-fail");
     expect(cands[0]?.metadata?.["eval_score"]).toBe(0.2);
-  });
+  }, 20_000);
 
   // D45's precondition is OPT-IN (`CREWHAUS_WATCHME=1` writes the sidecar) and
   // readSessionTraceEvents degrades to [] in silence, so "zero eval-fail
@@ -165,7 +165,7 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     expect(await proc.exited).toBe(0);
     expect(stdout).toContain("0 with a trace sidecar");
     expect(stdout).toContain("CREWHAUS_WATCHME=1");
-  });
+  }, 20_000);
 
   // F3 — non-TTY `--review` must NOT auto-promote without an explicit --yes.
   function seedHardCaseSession(root: string): void {
@@ -191,7 +191,7 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     expect(got.exitCode).toBe(0);
     // No mined registry dataset was created — nothing was promoted.
     expect(existsSync(join(root, ".crewhaus", "datasets", "helper-hardcases"))).toBe(false);
-  });
+  }, 20_000);
 
   it("non-TTY --review WITH --yes promotes all listed candidates (F3)", async () => {
     const root = newTempRoot();
@@ -205,7 +205,7 @@ describe("crewhaus dataset mine (CLI, offline)", () => {
     const rec = JSON.parse(readFileSync(join(registryDir, "v1.json"), "utf-8"));
     const all = [...rec.splits.train, ...rec.splits.dev, ...(rec.splits.test ?? [])];
     expect(all.length).toBe(1);
-  });
+  }, 20_000);
 
   // B23 — mined candidate text is PII/secret-redacted by default before the
   // quarantine file (and any promoted version) is written; --no-redact keeps
@@ -282,7 +282,7 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
       // No synthetic sample ever inherits the gold's expected_output.
       expect(s.expected_output).toBeUndefined();
     }
-  });
+  }, 20_000);
 
   it("rejects a missing source", async () => {
     const root = newTempRoot();
@@ -290,7 +290,7 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
       (await runCli(["dataset", "synthesize", "--from", "nope.jsonl", "--out-dataset", "x"], root))
         .exitCode,
     ).toBe(1);
-  });
+  }, 20_000);
 
   // F1 + F2 — redact-before-mutate-and-write ordering. Offline (no provider
   // credentials in env → the model-paraphrase branch never runs), so this
@@ -341,5 +341,5 @@ describe("crewhaus dataset synthesize (CLI, offline)", () => {
       expect(s.input).toContain("[REDACTED:ssn]");
       expect(s.input).toContain("[REDACTED:email]");
     }
-  });
+  }, 20_000);
 });

@@ -177,16 +177,46 @@ export function asSigned(word: bigint, bits: number): bigint {
 }
 
 /**
+ * Read the low `bits` of a word as an UNSIGNED integer.
+ *
+ * The counterpart of {@link asSigned}, and a `uintN` field must never go
+ * through that one: Pyth's `conf` is a uint64, and read as an int64 every
+ * confidence from 2^63 up came back negative — a negative band is never wider
+ * than any bound, so the widest confidence a feed can state passed as the
+ * tightest.
+ */
+export function asUnsigned(word: bigint, bits: number): bigint {
+  if (!Number.isInteger(bits) || bits <= 0 || bits > 256) {
+    throw new AbiError(`asUnsigned: ${bits} is not a supported integer width`);
+  }
+  return word & ((1n << BigInt(bits)) - 1n);
+}
+
+/**
+ * Whether a word is the one an ABI encoder writes for an integer of `bits`
+ * width: zero above the value for an unsigned one, the sign extended for a
+ * signed one. A word that is not is still read — by its low bits, as every
+ * reader here does — but it is worth saying so, because it is also what a
+ * contract that is not the one the caller meant looks like when it happens
+ * to answer the selector.
+ */
+export function isCanonicalInt(word: bigint, bits: number, signed: boolean): boolean {
+  const value = signed ? asSigned(word, bits) : asUnsigned(word, bits);
+  return BigInt.asUintN(256, value) === word;
+}
+
+/**
  * Read a 32-byte word as an `address`.
  *
  * The low 20 bytes are the address; the upper 12 are padding that the ABI says
- * is zero and that nothing on the receiving end enforces. `@crewhaus/tool-onchain`'s
- * decoder takes the low 20 bytes and ignores the rest, so this does too —
- * formatting the WHOLE word instead produces a 66-character string that is not
- * an address, which every downstream address check then rejects, so one
- * non-conforming contract takes out the read rather than the padding it
- * violated. The dirty padding is reported rather than swallowed: it is also
- * what calling the wrong function on the right contract looks like.
+ * is zero. `@crewhaus/tool-onchain`'s `AbiDecode` refuses a word whose padding
+ * is not, as Solidity's decoder does. This reads the low 20 bytes anyway and
+ * REPORTS the dirty padding, so one non-conforming contract costs a caveat on
+ * a row rather than the whole valuation — formatting the WHOLE word instead
+ * produces a 66-character string that is not an address, which every
+ * downstream address check then rejects. The flag is not a formality: dirty
+ * padding is also what calling the wrong function on the right contract looks
+ * like.
  */
 export function addressFromWord(word: bigint): { address: string; paddingDirty: boolean } {
   const low = word & ((1n << 160n) - 1n);

@@ -139,6 +139,15 @@ failure went ungrouped. One group among the failures that said something is not
 an answer about the failures that did not, and answering `true` from that
 subset is what sends someone after a single root cause for two different bugs.
 
+A mask, and `BundleSizeCheck`'s `joinPattern`, is a regular expression the
+caller writes. Each is screened before it is accepted: a shape that
+backtracks catastrophically (`(a+)+`, `(\w+\s?)*`, `(a|a)*`) is refused with
+the reason. It then runs in `@crewhaus/tool-safety`'s regex worker under a
+deadline, never on the harness's own thread. A text or path the worker could
+not answer (the engine gave up, or the deadline passed) fails the call with
+the reason: a failure grouped by an unmasked text, or an artifact joined by an
+unnormalised key, would be a confident wrong answer.
+
 There are deliberately no built-in masks. `ErrorCluster` in
 `@crewhaus/tool-obs` already owns shape-based masking of error text (URLs,
 uuids, timestamps, paths, prefixed ids, hex blobs, numbers). A second set here

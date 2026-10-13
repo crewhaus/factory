@@ -12,7 +12,9 @@
     { "path": "../run-context" },
     { "path": "../sub-agent-permission-inheritance" },
     { "path": "../tool-builder" },
-    { "path": "../tool-catalog" }
+    { "path": "../tool-catalog" },
+    { "path": "../tool-categories" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

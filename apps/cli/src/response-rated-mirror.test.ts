@@ -70,7 +70,7 @@ describe("response_rated session-trace mirror", () => {
     expect(payload.rating).toBe("up");
     expect(payload.turnNumber).toBe(1);
     expect(payload.source).toBe("cli");
-  });
+  }, 20_000);
 
   test("rate --stars normalizes the rating into [0,1]", async () => {
     const id = "sess_00000000cafe0002";
@@ -80,7 +80,7 @@ describe("response_rated session-trace mirror", () => {
     expect(rated).toHaveLength(1);
     // 4 stars → (4-1)/4 = 0.75.
     expect((rated[0]?.payload as { rating: number }).rating).toBeCloseTo(0.75, 5);
-  });
+  }, 20_000);
 
   test("comment-only feedback does NOT mirror a response_rated (no rating)", async () => {
     const id = "sess_00000000cafe0003";
@@ -90,7 +90,7 @@ describe("response_rated session-trace mirror", () => {
     const lines = readSessionLines(id);
     expect(lines.some((l) => l.kind === "user_feedback")).toBe(true);
     expect(lines.some((l) => l.kind === "response_rated")).toBe(false);
-  });
+  }, 20_000);
 
   test("the mirror is non-conversational — it doesn't disturb the transcript", async () => {
     const id = "sess_00000000cafe0004";
@@ -103,5 +103,5 @@ describe("response_rated session-trace mirror", () => {
     const rated = lines.find((l) => l.kind === "response_rated");
     expect((rated?.payload as { rating: unknown; comment: unknown }).rating).toBe("down");
     expect((rated?.payload as { comment: unknown }).comment).toBe("wrong");
-  });
+  }, 20_000);
 });

@@ -141,6 +141,7 @@ import {
   type ThredzConnection,
   classifyThredzFailure,
   parseThredzRecallLines,
+  thredzAliasToolNames,
   withThredzGoalMirror,
 } from "./thredz.js";
 
@@ -173,12 +174,14 @@ export {
   THREDZ_SERVER_NAME,
   THREDZ_GOAL_TOOL_NAMES,
   THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
   THREDZ_ALIAS_TOOL_FLAGS,
   THREDZ_GOAL_MAP_FILE,
   classifyThredzFailure,
   connectThredz,
   extractThredzGoalId,
   parseThredzRecallLines,
+  thredzAliasToolNames,
   withThredzGoalMirror,
   type ConnectThredzOptions,
   type ThredzCallResult,
@@ -1299,7 +1302,10 @@ export async function wireMemory(
   // the fact/wiki lines they sit beside.
   if (fragment.memory?.sessionRecall === true) {
     const indexDir = join(crewhausDirOf(deps), SESSIONS_INDEX_DIRNAME);
-    const sessionRecall = createSessionSummaryRecall({ indexDir });
+    const sessionRecall = createSessionSummaryRecall({
+      indexDir,
+      ...(deps.log !== undefined ? { log: deps.log } : {}),
+    });
     const base = options.memory;
     const baseRecall = base?.recall;
     options = {

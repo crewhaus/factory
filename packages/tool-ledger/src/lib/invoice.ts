@@ -74,6 +74,22 @@ export type NumberFormatOptions = {
 };
 
 /**
+ * `digits` in groups of three from the right, joined by `group`.
+ *
+ * Sliced and joined, never `replace(regex, group)`: the separator is the
+ * caller's text, and as a replacement STRING its `$'`, `` $` `` and `$1`
+ * expanded to pieces of the number, so a separator of `$'` rendered
+ * 1234567.89 as "1234567234567567.89" — a wrong amount on an invoice. The
+ * lookahead regex was also quadratic in the digit count.
+ */
+function groupDigits(digits: string, group: string): string {
+  const head = digits.length % 3 || 3;
+  const parts = [digits.slice(0, head)];
+  for (let at = head; at < digits.length; at += 3) parts.push(digits.slice(at, at + 3));
+  return parts.join(group);
+}
+
+/**
  * Minor units as the document shows them. No `Intl`, on purpose (see above):
  * the digits come from exact bigint arithmetic and the separators come from
  * the caller, so the same input renders the same bytes on every machine.
@@ -90,7 +106,7 @@ export function formatAmount(
   let whole = dot === -1 ? body : body.slice(0, dot);
   const fraction = dot === -1 ? "" : body.slice(dot + 1);
   const group = options.groupSeparator ?? "";
-  if (group !== "") whole = whole.replace(/\B(?=(\d{3})+(?!\d))/g, group);
+  if (group !== "") whole = groupDigits(whole, group);
   const decimal = options.decimalSeparator ?? ".";
   return `${negative ? "-" : ""}${whole}${fraction === "" ? "" : decimal + fraction}`;
 }

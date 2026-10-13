@@ -22,6 +22,7 @@
  * `pipeline-engine`, `target-pipeline`, `target-cli`/`-channel-bot`/`-managed`.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve as resolvePath } from "node:path";
@@ -30,6 +31,7 @@ import { type Embedder, createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { redactUrlCredentials, redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
 import { type VectorBackendId, type VectorStore, createVectorStore } from "@crewhaus/vector-store";
 import { z } from "zod";
 
@@ -92,13 +94,23 @@ export function registerRetrieveConfig(input: RetrieveConfigInput): void {
       "registerRetrieveConfig requires either an `embedder` instance or `embedderModel` string",
     );
   }
-  activeConfig = {
+  const bound: RetrieveConfig = {
     embedder,
     vectorStore,
     ...((input.defaultK ?? input.default_k !== undefined)
       ? { defaultK: input.defaultK ?? input.default_k }
       : {}),
   };
+  activeConfig = bound;
+  // The singleton is rebuilt for this config, so its flags say where THESE
+  // backends are: a mock embedder over an in-memory or lance store stays in
+  // the process (the RAG starter), anything else reaches the network. Both
+  // hosts register the config before they register `retrieve`, and read it
+  // through the live ESM binding. The rebuilt tool keeps this config, so a
+  // later registration cannot make a tool flagged local reach the network.
+  retrieve = makeRetrieveTool(() => bound, {
+    local: retrieveStaysLocal(embedder, vectorStore),
+  });
 }
 
 export function getRetrieveConfig(): RetrieveConfig | undefined {
@@ -108,6 +120,7 @@ export function getRetrieveConfig(): RetrieveConfig | undefined {
 /** Test-only — clear cached config. */
 export function _resetRetrieveConfig(): void {
   activeConfig = undefined;
+  retrieve = unconfiguredRetrieve;
 }
 
 const retrieveSchema = z.object({
@@ -125,28 +138,65 @@ function formatHits(
   const lines: string[] = [];
   hits.forEach((h, i) => {
     const text = (h.metadata?.["text"] as string | undefined) ?? "";
-    const docId = (h.metadata?.["docId"] as string | undefined) ?? "?";
+    // A persistent store indexed before 0.7.1 still holds ids built from
+    // the raw source URL; whatever it holds, no credential is shown.
+    const docId = redactUrlCredentialsInText((h.metadata?.["docId"] as string | undefined) ?? "?");
+    const id = redactUrlCredentialsInText(h.id);
     const preview = text.length > 280 ? `${text.slice(0, 280)}…` : text;
-    lines.push(`[${i + 1}] id=${h.id} doc=${docId} score=${h.score.toFixed(4)}\n${preview}`);
+    lines.push(`[${i + 1}] id=${id} doc=${docId} score=${h.score.toFixed(4)}\n${preview}`);
   });
   return lines.join("\n\n");
+}
+
+/**
+ * Whether a Retrieve bound to this embedder and vector store stays inside the
+ * process: only `@crewhaus/embedder`'s `mock` provider over an `in-memory` or
+ * on-disk `lance` store does. Every other embedder POSTs the query to its
+ * provider, and qdrant, pinecone and weaviate are HTTP services.
+ */
+export function retrieveStaysLocal(
+  embedder: Pick<Embedder, "provider">,
+  vectorStore: Pick<VectorStore, "backend">,
+): boolean {
+  return (
+    embedder.provider === "mock" &&
+    (vectorStore.backend === "in-memory" || vectorStore.backend === "lance")
+  );
 }
 
 /**
  * Build a `Retrieve` tool whose backends come from `getConfig` at call time.
  * Shared by the singleton `retrieve` export (pipeline shape — reads
  * `activeConfig`) and every {@link knowledgeRetrieve} tool (agent shape —
- * reads its own captured, already-ingested config), so the schema,
- * citation formatting, and safety flags never fork between the two paths.
+ * reads its own captured, already-ingested config), so the schema and
+ * citation formatting never fork between the two paths.
+ *
+ * Retrieve sends the model's query to the configured embedding provider, and
+ * to the vector store when that is an HTTP service, so it is
+ * `scope: "external"` with `ioCapability: "network"`: the query goes through
+ * the egress classifier and `compile --strict` counts it. It stays
+ * `readOnly`, and the destination is the operator's configuration, never one
+ * the model picks. A tool whose backends are known to stay in the process
+ * (`local: true`, see {@link retrieveStaysLocal}) is internal: a knowledge
+ * tool, and the pipeline singleton once its config is registered.
  */
-function makeRetrieveTool(getConfig: () => RetrieveConfig | undefined): RegisteredTool {
+function makeRetrieveTool(
+  getConfig: () => RetrieveConfig | undefined,
+  opts: { readonly local?: boolean } = {},
+): RegisteredTool {
   return buildTool({
     name: "Retrieve",
     description:
       "Retrieve top-k chunks from the configured vector store for a natural-language query. Pass `query` (required), optional `k` (default 5), and optional `filter` (metadata predicates). Returns a numbered list of hits with citations.",
     inputSchema: retrieveSchema,
+    // No argument decides where it acts: the query goes to the configured
+    // embedder and vector store. (Matched exactly as if undeclared.)
+    operativeArgs: [],
     readOnly: true,
     concurrencySafe: true,
+    ...(opts.local === true
+      ? { scope: "internal" as const }
+      : { scope: "external" as const, ioCapability: "network" as const }),
     execute: async (input) => {
       const cfg = getConfig();
       if (cfg === undefined) {
@@ -166,7 +216,19 @@ function makeRetrieveTool(getConfig: () => RetrieveConfig | undefined): Register
   });
 }
 
-export const retrieve: RegisteredTool = makeRetrieveTool(() => activeConfig);
+/**
+ * The pipeline `Retrieve` before any config is registered. Its backends are
+ * not known yet, so it says it reaches the network; it reads whatever config
+ * is registered when it runs.
+ */
+const unconfiguredRetrieve: RegisteredTool = makeRetrieveTool(() => activeConfig);
+
+/**
+ * The pipeline shape's `Retrieve`: a live binding that
+ * {@link registerRetrieveConfig} replaces with a tool bound to the config it
+ * registers, flagged from those backends (see {@link retrieveStaysLocal}).
+ */
+export let retrieve: RegisteredTool = unconfiguredRetrieve;
 
 // ===========================================================================
 // Agent-shape RAG — `knowledge:` on cli/channel/managed (Batch E item 3, G22)
@@ -293,6 +355,92 @@ export type KnowledgeRetrieveConfig = {
 };
 
 /**
+ * How a `url` knowledge source is named wherever it can be seen: its
+ * document id and `docId` (so every chunk id, and every Retrieve hit the
+ * model reads), and boot errors. A private document is often reached with a
+ * credential in its URL (`?private_token=`, a presigned `X-Amz-Signature`,
+ * `user:token@`), and the URL is fetched as written; only its label is
+ * cleaned.
+ *
+ *  - A URL with nothing credential-shaped in it is its own label, so the ids
+ *    of existing clean sources do not move.
+ *  - Otherwise the userinfo is replaced, credential-shaped query values are
+ *    redacted, the fragment is dropped, and `#src-<12 hex>` of the full URL
+ *    is appended, so two sources that differ only by a token stay distinct
+ *    and the id is the same on every boot.
+ *
+ * Finding the userinfo cannot be left to the URL parser. A password may
+ * hold `/`, `?` or `#`, which end the authority before its `@`:
+ * `https://id:1234/rest@host` even parses, as host `id`, port 1234 and a
+ * path holding the rest of the secret. So when an `@` could be the end of a
+ * userinfo (the URL does not parse, the parser found a userinfo, or the
+ * authority it saw has a `:`), everything up to the LAST `@` is replaced;
+ * when a `?` or `#` comes before that `@`, nothing after the scheme can be
+ * told apart from the secret, and all of it is replaced. An `@` the parser
+ * places in the path or query of a URL with no userinfo and no port (npm's
+ * `/@scope/`) is left alone.
+ *
+ * With a port, an `@` later in the path hides the host too
+ * (`https://docs.example.com:8443/guides/@team/x.md` is labelled
+ * `https://<redacted>@team/x.md#src-…`): the parser's `host:port` there may
+ * be a username and the leading digits of a password that holds a `/`, and
+ * a username is often itself a token. Boot errors therefore also name the
+ * source's position in `knowledge.sources`.
+ */
+export function knowledgeSourceLabel(raw: string): string {
+  const fingerprint = (): string =>
+    createHash("sha256")
+      .update("crewhaus/knowledge-source\u0000")
+      .update(raw)
+      .digest("hex")
+      .slice(0, 12);
+  const withoutFragment = (text: string): string => {
+    const hashAt = text.indexOf("#");
+    return hashAt === -1 ? text : text.slice(0, hashAt);
+  };
+  const schemeMatch = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.exec(raw);
+  const scheme = schemeMatch === null ? "" : schemeMatch[0];
+  const rest = raw.slice(scheme.length);
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    parsed = undefined;
+  }
+  const lastAt = rest.lastIndexOf("@");
+  if (lastAt !== -1) {
+    const authority = rest.split(/[/\\?#]/, 1)[0] ?? "";
+    const mayBeUserinfo =
+      parsed === undefined ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      authority.includes(":") ||
+      authority.includes("@");
+    if (mayBeUserinfo) {
+      if (/[?#]/.test(rest.slice(0, lastAt))) return `${scheme}<redacted>#src-${fingerprint()}`;
+      const tail = withoutFragment(redactUrlCredentials(`${scheme}${rest.slice(lastAt + 1)}`));
+      return `${scheme}<redacted>@${tail.slice(scheme.length)}#src-${fingerprint()}`;
+    }
+  }
+  const shown = redactUrlCredentials(raw);
+  if (shown === raw || parsed === undefined) return shown;
+  return `${withoutFragment(shown)}#src-${fingerprint()}`;
+}
+
+/** The error code or name of a failed fetch, never its message or `path`:
+ *  Bun's fetch errors carry the full URL in both. Exported for the CLI's
+ *  `crewhaus run` knowledge loader, which names its failures the same way. */
+export function fetchFailureName(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null) {
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code)) return code;
+    const name = (cause as { name?: unknown }).name;
+    if (typeof name === "string" && /^[A-Za-z0-9_]{1,64}$/.test(name)) return name;
+  }
+  return "fetch error";
+}
+
+/**
  * Read every declared source into a `chunker` {@link Document}. `path` reads
  * one file; `glob` scans the cwd for matches (a zero-match glob contributes
  * nothing — it is a wildcard, not an assertion); `url` fetches the body.
@@ -307,7 +455,7 @@ export async function loadKnowledgeSources(
   const cwd = opts.cwd ?? process.cwd();
   const fetchImpl = opts.fetch ?? (globalThis.fetch as unknown as KnowledgeFetch | undefined);
   const docs: Document[] = [];
-  for (const src of sources) {
+  for (const [position, src] of sources.entries()) {
     if (src.kind === "path") {
       const abs = isAbsolute(src.path) ? src.path : resolvePath(cwd, src.path);
       if (!existsSync(abs)) {
@@ -337,22 +485,35 @@ export async function loadKnowledgeSources(
         docs.push({ id: rel, text, metadata: { docId: rel, source: rel } });
       }
     } else {
+      // Fetched as written; named everywhere else by its cleaned label. A
+      // label can hide the host (see knowledgeSourceLabel), so a boot error
+      // also names the source's position, which always identifies it.
+      const label = knowledgeSourceLabel(src.url);
+      const where = `knowledge.sources[${position}]`;
       if (fetchImpl === undefined) {
         throw new RetrieveConfigError(
-          `knowledge url source needs a fetch implementation: ${src.url}`,
+          `knowledge url source needs a fetch implementation: ${where} ${label}`,
         );
       }
       let res: KnowledgeFetchResponse;
       try {
         res = await fetchImpl(src.url);
       } catch (cause) {
-        throw new RetrieveConfigError(`knowledge url fetch failed: ${src.url}`, cause);
+        // The runtime's error quotes the URL (message and `path`), so only
+        // its code travels on.
+        const reason = fetchFailureName(cause);
+        throw new RetrieveConfigError(
+          `knowledge url fetch failed (${reason}): ${where} ${label}`,
+          new Error(reason),
+        );
       }
       if (!res.ok) {
-        throw new RetrieveConfigError(`knowledge url fetch failed (${res.status}): ${src.url}`);
+        throw new RetrieveConfigError(
+          `knowledge url fetch failed (${res.status}): ${where} ${label}`,
+        );
       }
       const text = await res.text();
-      docs.push({ id: src.url, text, metadata: { docId: src.url, source: src.url } });
+      docs.push({ id: label, text, metadata: { docId: label, source: label } });
     }
   }
   return docs;
@@ -433,5 +594,5 @@ export async function knowledgeRetrieve(config: KnowledgeRetrieveConfig): Promis
     vectorStore,
     defaultK: config.defaultK ?? DEFAULT_KNOWLEDGE_K,
   };
-  return makeRetrieveTool(() => bound);
+  return makeRetrieveTool(() => bound, { local: retrieveStaysLocal(embedder, vectorStore) });
 }

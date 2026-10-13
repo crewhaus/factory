@@ -25,6 +25,7 @@ import { type SpecHeader, readSpecHeader } from "@crewhaus/harness-inventory";
 import { parseSpecIssues } from "@crewhaus/spec";
 import { mergedSpawnEnv } from "./env-file";
 import { maskSpecYaml } from "./mask";
+import { withoutTrailingComment } from "./spec-lines";
 
 /** The M1 capability-badge set (presence of the spec block that declares it). */
 export const BADGE_KEYS = [
@@ -55,17 +56,19 @@ const BADGE_PARENTS: Partial<Record<BadgeKey, readonly string[]>> = {
  * the next key at column 0. Comments are stripped so a commented-out
  * `# wiki:` does not badge. Deliberately textual, like the rest of this
  * scan: a spec that does not parse under this manager's schema must still
- * badge correctly.
+ * badge correctly. The comment strip is a scan (spec-lines.ts): `/#.*$/` read
+ * on from every `#` of a line holding a U+2028 or a lone `\r`.
  */
 function topLevelBlockText(yamlText: string, key: string): string {
   const lines = yamlText.split(/\r?\n/);
-  const uncommented = (line: string): string => line.replace(/#.*$/, "");
   const start = lines.findIndex((line) => new RegExp(`^${key}\\s*:`).test(line));
   if (start === -1) return "";
-  const block = [uncommented(lines[start] as string).replace(new RegExp(`^${key}\\s*:`), "")];
+  const block = [
+    withoutTrailingComment(lines[start] as string).replace(new RegExp(`^${key}\\s*:`), ""),
+  ];
   for (let i = start + 1; i < lines.length; i += 1) {
     const line = lines[i] as string;
-    if (line.trim() === "" || /^[\s#]/.test(line)) block.push(uncommented(line));
+    if (line.trim() === "" || /^[\s#]/.test(line)) block.push(withoutTrailingComment(line));
     else break;
   }
   return block.join("\n");

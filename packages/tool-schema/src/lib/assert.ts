@@ -8,6 +8,7 @@
  * only compares.
  */
 import { checkFormat, isFormatName } from "./formats";
+import { type RegexAnswer, type RegexAnswers, testPatternSync } from "./regex-answers";
 import {
   type JsonType,
   deepEqual,
@@ -69,12 +70,21 @@ export type CheckResult = {
   expected: string | null;
   /** Empty when the check passed. */
   reason: string;
+  /**
+   * Set when the check could not be evaluated: its pattern could not be run
+   * to an answer. It is not ok (a gate fails closed), but it did not fail
+   * either, and `reason` says why. Absent on every other check.
+   */
+  undetermined?: true;
 };
 
 export type AssertReport = {
   ok: boolean;
   passed: number;
+  /** Checks that did not pass, the undetermined ones included. */
   failed: number;
+  /** Of `failed`, the checks that could not be evaluated. */
+  undetermined: number;
   results: CheckResult[];
   /** Just the failures, for a caller that only wants to print those. */
   failures: CheckResult[];
@@ -133,26 +143,51 @@ function compareLength(
     : { ok: false, reason: describe(length, expected) };
 }
 
+type Verdict = { ok: boolean; reason: string; undetermined?: true };
+
+/**
+ * `matches` / `notMatches`. The pattern is the caller's, so it is never run
+ * here: the answer comes from `regex` (resolved in the worker by the tool
+ * that called), or, for a caller with none, from the bounded fallback on
+ * this thread. A pattern the screen refuses fails the check, as an invalid
+ * one always has; one that could not be run to an answer is undetermined,
+ * never "does not match" (and so never a pass for `notMatches`).
+ */
 function matchRegex(
   actual: unknown,
   expected: unknown,
   flags: string,
   want: boolean,
-): { ok: boolean; reason: string } {
+  regex: RegexAnswers | undefined,
+): Verdict {
   if (typeof actual !== "string") {
     return { ok: false, reason: `matches needs a string, found ${typeOf(actual)}` };
   }
   if (typeof expected !== "string") {
     return { ok: false, reason: "the check's expected value must be a regex source string" };
   }
-  let re: RegExp;
-  try {
-    re = new RegExp(expected, flags);
-  } catch (err) {
-    return { ok: false, reason: `invalid regex /${expected}/${flags}: ${(err as Error).message}` };
+  const answer: RegexAnswer | undefined =
+    regex === undefined
+      ? testPatternSync(expected, flags, actual)
+      : regex.lookup(expected, flags, actual);
+  if (answer === undefined) {
+    return {
+      ok: false,
+      undetermined: true,
+      reason: `could not evaluate /${expected}/${flags}: its answer has not been worked out yet`,
+    };
   }
-  const matched = re.test(actual);
-  if (matched === want) return { ok: true, reason: "" };
+  if (typeof answer !== "boolean") {
+    if ("refused" in answer) {
+      return { ok: false, reason: `invalid regex /${expected}/${flags}: ${answer.refused}` };
+    }
+    return {
+      ok: false,
+      undetermined: true,
+      reason: `could not evaluate /${expected}/${flags}: ${answer.undetermined}`,
+    };
+  }
+  if (answer === want) return { ok: true, reason: "" };
   return {
     ok: false,
     reason: want
@@ -161,7 +196,42 @@ function matchRegex(
   };
 }
 
-function evaluate(check: Check, actual: unknown, found: boolean): { ok: boolean; reason: string } {
+/**
+ * Ask `answers` about every pattern `checks` will test against `value`, so
+ * one {@link RegexAnswers.resolve} settles them all before
+ * {@link runChecks} reads them. A caller evaluating several check lists
+ * against one value (a table's rows, a router's arms) asks for every list
+ * first, then resolves once.
+ */
+export function askCheckPatterns(
+  value: unknown,
+  checks: ReadonlyArray<Check>,
+  answers: RegexAnswers,
+): void {
+  for (const check of checks) {
+    if (check.op !== "matches" && check.op !== "notMatches") continue;
+    if (typeof check.expected !== "string") continue;
+    let actual: unknown = value;
+    const path = check.path ?? "";
+    if (path !== "") {
+      try {
+        const resolution = getPath(value, path);
+        if (!resolution.found) continue;
+        actual = resolution.value;
+      } catch {
+        continue;
+      }
+    }
+    if (typeof actual === "string") answers.lookup(check.expected, check.flags ?? "", actual);
+  }
+}
+
+function evaluate(
+  check: Check,
+  actual: unknown,
+  found: boolean,
+  regex: RegexAnswers | undefined,
+): Verdict {
   const expected = check.expected;
   switch (check.op) {
     case "exists":
@@ -212,9 +282,9 @@ function evaluate(check: Check, actual: unknown, found: boolean): { ok: boolean;
       };
     }
     case "matches":
-      return matchRegex(actual, expected, check.flags ?? "", true);
+      return matchRegex(actual, expected, check.flags ?? "", true, regex);
     case "notMatches":
-      return matchRegex(actual, expected, check.flags ?? "", false);
+      return matchRegex(actual, expected, check.flags ?? "", false, regex);
     case "startsWith":
     case "endsWith": {
       if (typeof actual !== "string" || typeof expected !== "string") {
@@ -330,8 +400,18 @@ function evaluate(check: Check, actual: unknown, found: boolean): { ok: boolean;
  * A malformed check (a bad regex, a non-numeric bound) fails that check with
  * an explanatory reason rather than throwing, so one typo cannot take down a
  * whole gate.
+ *
+ * `matches` and `notMatches` read their answers from `options.regex`, which
+ * the calling tool resolved in the worker (see {@link askCheckPatterns});
+ * without it they fall back to a bounded run on this thread. A check whose
+ * pattern could not be run to an answer is not ok and carries
+ * `undetermined: true`; its reason says so whatever `message` the check set.
  */
-export function runChecks(value: unknown, checks: Check[]): AssertReport {
+export function runChecks(
+  value: unknown,
+  checks: ReadonlyArray<Check>,
+  options: { readonly regex?: RegexAnswers } = {},
+): AssertReport {
   const results: CheckResult[] = checks.map((check, index) => {
     const path = check.path ?? "";
     let found = true;
@@ -366,7 +446,7 @@ export function runChecks(value: unknown, checks: Check[]): AssertReport {
       };
     }
 
-    const verdict = evaluate(check, actual, found);
+    const verdict = evaluate(check, actual, found, options.regex);
     return {
       index,
       path,
@@ -374,7 +454,12 @@ export function runChecks(value: unknown, checks: Check[]): AssertReport {
       ok: verdict.ok,
       actual: found ? preview(actual, 80) : null,
       expected: check.expected === undefined ? null : preview(check.expected, 80),
-      reason: verdict.ok ? "" : (check.message ?? verdict.reason),
+      reason: verdict.ok
+        ? ""
+        : verdict.undetermined === true
+          ? verdict.reason
+          : (check.message ?? verdict.reason),
+      ...(verdict.undetermined === true ? { undetermined: true as const } : {}),
     };
   });
 
@@ -383,9 +468,30 @@ export function runChecks(value: unknown, checks: Check[]): AssertReport {
     ok: failures.length === 0,
     passed: results.length - failures.length,
     failed: failures.length,
+    undetermined: failures.filter((r) => r.undetermined === true).length,
     results,
     failures,
   };
+}
+
+/**
+ * What a check list says as a whole, three ways. Under `all`, a check that
+ * definitely failed decides it (`fail`); otherwise an undetermined one leaves
+ * it `undetermined`. Under `any`, a check that passed decides it (`pass`);
+ * otherwise an undetermined one leaves it `undetermined`. A router or a
+ * scorer that reads `report.ok` alone would take an undetermined check for a
+ * miss and fall through to the next arm or the default.
+ */
+export function checksVerdict(
+  report: AssertReport,
+  mode: "all" | "any" = "all",
+): "pass" | "fail" | "undetermined" {
+  if (mode === "all") {
+    if (report.ok) return "pass";
+    return report.failed > report.undetermined ? "fail" : "undetermined";
+  }
+  if (report.passed > 0) return "pass";
+  return report.undetermined > 0 ? "undetermined" : "fail";
 }
 
 /**

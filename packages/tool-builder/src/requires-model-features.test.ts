@@ -24,7 +24,7 @@ describe("buildTool requiresModelFeatures pass-through", () => {
     expect("requiresModelFeatures" in tool).toBe(false);
   });
 
-  test("does not disturb the other fail-closed defaults", () => {
+  test("does not disturb the other defaults", () => {
     const tool = buildTool({ ...base, name: "Read", requiresModelFeatures: { tool_use: true } });
     expect(tool.scope).toBe("internal");
     expect(tool.requireJustification).toBe(false);

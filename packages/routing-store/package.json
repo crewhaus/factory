@@ -11,7 +11,9 @@
   "scripts": {
     "test": "bun test src"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@crewhaus/tool-safety": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

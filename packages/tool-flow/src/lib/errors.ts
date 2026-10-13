@@ -14,6 +14,8 @@
  * called `Date.now()` would return a different answer every second, which is
  * exactly what this package promises not to do.
  */
+import { type RegexAnswers, testPatternSync } from "@crewhaus/tool-schema";
+import { parseHttpDate, parseIsoInstantWithOffset, parseRfc5322WithZone } from "./http-date";
 
 export const ERROR_CLASSES = [
   "ok",
@@ -91,9 +93,24 @@ export type Classification = {
   readonly retryAt: string | null;
   /** Which rule decided this: a pack entry's id, or a caller rule's id. */
   readonly matched: string;
-  readonly source: "custom" | "status" | "exit" | "signal" | "code" | "message" | "default";
+  readonly source:
+    | "custom"
+    | "status"
+    | "exit"
+    | "signal"
+    | "code"
+    | "message"
+    | "default"
+    | "undetermined";
   /** True when attempts ran out, which downgrades a retry to an escalation. */
   readonly exhausted: boolean;
+  /**
+   * Set when a caller rule tried before any match could not be decided (its
+   * pattern had no answer): no class is given for it (`unknown`, source
+   * `undetermined`) and the action is `escalate`, never a later rule's or a
+   * builtin pack's answer, which that rule might have overridden.
+   */
+  readonly undetermined?: string;
 };
 
 type Verdict = {
@@ -312,9 +329,14 @@ const MESSAGE_TABLE: ReadonlyArray<readonly [string, Verdict]> = [
 const MAX_MESSAGE_CHARS = 64_000;
 
 /**
- * Parse `Retry-After`. Two forms are legal: delta-seconds, and an HTTP-date.
- * The date form needs a reference point to become a duration, so without
- * `nowMs` it is returned as a date and `waitMs` stays null.
+ * Parse `Retry-After`. Two forms are legal: delta-seconds, and an HTTP-date
+ * (RFC 9110: IMF-fixdate, or the obsolete rfc850 and asctime forms, all
+ * GMT). An RFC 5322 date-time with its zone written (`+0200`, `UTC`,
+ * `-0000`), and an ISO-8601 instant with an explicit offset, are read too,
+ * because each is unambiguous and 0.7.0 read them. Anything else — a date
+ * with no zone, an offset-less ISO string, prose — answers nulls rather than
+ * being read as the host's local time. The date form needs a reference point to become a duration, so
+ * without `nowMs` it is returned as a date and `waitMs` stays null.
  */
 export function parseRetryAfter(
   raw: string,
@@ -326,8 +348,9 @@ export function parseRetryAfter(
     const seconds = Number.parseInt(text, 10);
     return { waitMs: seconds * 1000, retryAt: null };
   }
-  const parsed = Date.parse(text);
-  if (Number.isNaN(parsed)) return { waitMs: null, retryAt: null };
+  const parsed =
+    parseHttpDate(text, nowMs) ?? parseRfc5322WithZone(text) ?? parseIsoInstantWithOffset(text);
+  if (parsed === undefined) return { waitMs: null, retryAt: null };
   const retryAt = new Date(parsed).toISOString();
   if (nowMs === undefined) return { waitMs: null, retryAt };
   // A date already in the past means "retry now", not "wait a negative time".
@@ -351,7 +374,8 @@ function matchCustom(
   signal: ErrorSignal,
   rules: ReadonlyArray<ErrorRule>,
   fields: ReadonlyArray<string>,
-) {
+  regex: RegexAnswers | undefined,
+): ErrorRule | { readonly undetermined: string; readonly rule: ErrorRule } | null {
   for (const rule of rules) {
     if (rule.status !== undefined && rule.status !== signal.status) continue;
     if (rule.exitCode !== undefined && rule.exitCode !== signal.exitCode) continue;
@@ -360,13 +384,32 @@ function matchCustom(
       if (!fields.some((f) => f.includes(needle))) continue;
     }
     if (rule.matches !== undefined) {
-      let re: RegExp;
-      try {
-        re = new RegExp(rule.matches, "i");
-      } catch (err) {
-        throw new Error(`rule "${rule.id}" has an invalid pattern: ${(err as Error).message}`);
+      // The caller's pattern never runs on this thread: the tool answered it
+      // in the worker (a library caller gets the bounded fallback). Either
+      // field matching decides it; otherwise one without an answer leaves
+      // the rule undecided, never "no match".
+      const pattern = rule.matches;
+      const answers = fields.map((f) =>
+        regex === undefined ? testPatternSync(pattern, "i", f) : regex.lookup(pattern, "i", f),
+      );
+      if (!answers.includes(true)) {
+        for (const answer of answers) {
+          if (typeof answer === "object" && "refused" in answer) {
+            throw new Error(`rule "${rule.id}" has an invalid pattern: ${answer.refused}`);
+          }
+        }
+        // `undefined` is a question not answered yet: as open as undetermined.
+        const open = answers.findIndex((a) => a !== false);
+        if (open !== -1) {
+          const answer = answers[open];
+          const why =
+            typeof answer === "object" && "undetermined" in answer
+              ? answer.undetermined
+              : "its answer has not been worked out yet";
+          return { undetermined: `rule "${rule.id}" could not be decided: ${why}`, rule };
+        }
+        continue;
       }
-      if (!fields.some((f) => re.test(f))) continue;
     }
     // A rule with no conditions at all would match everything silently.
     const hasCondition =
@@ -381,15 +424,39 @@ function matchCustom(
   return null;
 }
 
+/**
+ * Ask `regex` about every caller rule's pattern for `signal`, so one
+ * resolve in the worker settles them before {@link classifyError} reads
+ * them. The fields are the ones {@link classifyError} tests.
+ */
+export function askErrorPatterns(
+  signal: ErrorSignal,
+  rules: ReadonlyArray<ErrorRule>,
+  regex: RegexAnswers,
+): void {
+  for (const field of classifiedFields(signal)) {
+    for (const rule of rules) {
+      if (rule.matches !== undefined) regex.lookup(rule.matches, "i", field);
+    }
+  }
+}
+
+function classifiedFields(signal: ErrorSignal): [string, string] {
+  const message = (signal.message ?? "").slice(0, MAX_MESSAGE_CHARS);
+  return [message.toLowerCase(), (signal.code ?? "").toLowerCase()];
+}
+
 export type ClassifyOptions = {
   readonly rules?: ReadonlyArray<ErrorRule>;
   /** Epoch milliseconds, only used to turn an HTTP-date `Retry-After` into a wait. */
   readonly nowMs?: number;
+  /** Answers for the caller rules' `matches` patterns; see {@link askErrorPatterns}. */
+  readonly regex?: RegexAnswers;
 };
 
 export function classifyError(signal: ErrorSignal, options: ClassifyOptions = {}): Classification {
   const message = (signal.message ?? "").slice(0, MAX_MESSAGE_CHARS);
-  const fields = [message.toLowerCase(), (signal.code ?? "").toLowerCase()];
+  const fields = classifiedFields(signal);
 
   const retry =
     signal.retryAfter === undefined
@@ -400,7 +467,24 @@ export function classifyError(signal: ErrorSignal, options: ClassifyOptions = {}
   let matched = "default";
   let source: Classification["source"] = "default";
 
-  const custom = matchCustom(signal, options.rules ?? [], fields);
+  const custom = matchCustom(signal, options.rules ?? [], fields, options.regex);
+  if (custom !== null && "undetermined" in custom) {
+    const exhausted =
+      signal.attempt !== undefined &&
+      signal.maxAttempts !== undefined &&
+      signal.attempt >= signal.maxAttempts;
+    return {
+      class: "unknown",
+      action: "escalate",
+      retryable: false,
+      waitMs: null,
+      retryAt: retry.retryAt,
+      matched: custom.rule.id,
+      source: "undetermined",
+      exhausted,
+      undetermined: custom.undetermined,
+    };
+  }
   if (custom) {
     verdict = { class: custom.class, action: custom.action, waitMs: custom.waitMs };
     matched = custom.id;

@@ -109,7 +109,7 @@ function walk(
   path: string,
   required: boolean,
   depth: number,
-  seenRefs: string[],
+  seenRefs: Set<string>,
   ctx: Ctx,
 ): void {
   if (ctx.truncated) return;
@@ -136,7 +136,10 @@ function walk(
 
   const ref = typeof schema["$ref"] === "string" ? schema["$ref"] : null;
   if (ref !== null) {
-    if (seenRefs.includes(ref)) {
+    // The refs being followed on the way down to here, as a set kept in
+    // step with the walk: copying and searching a list at every hop cost a
+    // chain of n refs n² (a ref adds no depth, so nothing else stops it).
+    if (seenRefs.has(ref)) {
       push(ctx, { path, type: `${ref} (recursive)`, required, constraints: "", description: "" });
       return;
     }
@@ -145,7 +148,12 @@ function walk(
       push(ctx, { path, type: ref, required, constraints: "unresolved $ref", description: "" });
       return;
     }
-    walk(target, path, required, depth, [...seenRefs, ref], ctx);
+    seenRefs.add(ref);
+    try {
+      walk(target, path, required, depth, seenRefs, ctx);
+    } finally {
+      seenRefs.delete(ref);
+    }
     return;
   }
 
@@ -167,19 +175,28 @@ function walk(
 
   const properties = schema["properties"];
   if (isPlainObject(properties)) {
-    const requiredNames = Array.isArray(schema["required"])
-      ? schema["required"].filter((k): k is string => typeof k === "string")
-      : [];
+    // A set: searching the list once per property cost the properties times
+    // the required names, and went on past the last row the table holds.
+    const requiredNames = new Set(
+      Array.isArray(schema["required"])
+        ? schema["required"].filter((k): k is string => typeof k === "string")
+        : [],
+    );
     for (const key of Object.keys(properties)) {
+      // Once the table is full nothing below adds a row.
+      if (ctx.truncated) return;
       const childPath = path === "" ? key : `${path}.${key}`;
-      walk(properties[key], childPath, requiredNames.includes(key), depth + 1, seenRefs, ctx);
+      walk(properties[key], childPath, requiredNames.has(key), depth + 1, seenRefs, ctx);
     }
   }
   const items = schema["items"];
   if (Array.isArray(items)) {
-    items.forEach((item, index) => {
-      walk(item, `${path}[${index}]`, required, depth + 1, seenRefs, ctx);
-    });
+    for (let index = 0; index < items.length; index++) {
+      if (ctx.truncated) return;
+      // A hole is skipped, as `forEach` skipped it.
+      if (!(index in items)) continue;
+      walk(items[index], `${path}[${index}]`, required, depth + 1, seenRefs, ctx);
+    }
   } else if (items !== undefined) {
     walk(items, `${path}[]`, required, depth + 1, seenRefs, ctx);
   }
@@ -201,7 +218,7 @@ export function summarizeSchema(
     maxDepth: options.maxDepth ?? DEFAULTS.maxDepth,
     truncated: false,
   };
-  walk(schema, "", false, 0, [], ctx);
+  walk(schema, "", false, 0, new Set(), ctx);
   const rootObject = isPlainObject(schema) ? schema : {};
   return {
     title: typeof rootObject["title"] === "string" ? rootObject["title"] : "",

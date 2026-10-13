@@ -14,7 +14,8 @@
  * origin must be one the OPERATOR allow-listed in `tool_config.fetch`, and it
  * must still survive the SSRF check. A model-supplied URL that only had to
  * pass an IP check would be an exfiltration channel with a response that
- * lands straight back in the context window.
+ * lands straight back in the context window. A redirect is never followed,
+ * for the same reason: neither check ever saw where it points.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -23,6 +24,7 @@ import {
   canonicalizeOrigin,
   getFetchConfig,
 } from "@crewhaus/tool-fetch";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import {
   type BatchHit,
   type Coordinate,
@@ -74,7 +76,14 @@ export class OsvUnavailableError extends CrewhausError {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
+/**
+ * The body is kept RAW (`fetchRaw`, Bun's `decompress: false`): otherwise Bun
+ * inflates a gzip, deflate, br or zstd reply in native code before any
+ * reader sees a byte, so an allow-listed mirror's 260 KB gzip of zeros cost
+ * about 1 GB of RSS before the cap fired (C093). `readCapped` decodes it,
+ * under the cap.
+ */
+const defaultFetch: FetchLike = (input, init) => fetchRaw(input, init);
 let fetchFn: FetchLike = defaultFetch;
 
 /** Test seam: replace the fetch used for every OSV call, or restore it. */
@@ -141,42 +150,47 @@ export type RequestBudget = {
 };
 
 /**
- * Read a response body with a hard ceiling.
+ * Read a response body with a hard ceiling on its DECODED size.
  *
  * `res.text()` buffers whatever arrives, and "whatever arrives" from a
- * self-hosted mirror is not a number this process chose. Streaming with a
- * counter is the only version of this that has a limit.
+ * self-hosted mirror is not a number this process chose. The body arrives
+ * raw, a compressed one is decoded here in small steps, and the decoder
+ * stops at the ceiling, so the ceiling bounds memory rather than what is
+ * kept after buffering. A body past it is abandoned, never parsed from a
+ * prefix; one that cannot be decoded is refused without quoting it.
  */
-async function readCapped(res: Response, url: string): Promise<string> {
-  const body = res.body;
-  if (body === null || body === undefined) return await res.text();
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+async function readCapped(res: Response, url: string, signal: AbortSignal): Promise<string> {
+  const read = await readResponseBounded(res, { maxBytes: MAX_RESPONSE_BYTES, signal });
+  if (read.ok) {
+    if (!read.truncated) return read.text;
+    throw new OsvUnavailableError(
+      `${url} returned more than ${MAX_RESPONSE_BYTES} bytes; the response was abandoned rather than buffered`,
+    );
+  }
+  if (read.code === "aborted" || read.code === "stalled") {
+    // The catch in `request` reads the abort reason (timeout or cancel).
+    throw new Error("the read was aborted before the body ended");
+  }
+  throw new OsvUnavailableError(
+    read.code === "unsupported-encoding"
+      ? `${url} sent a body in a stack of content-encodings this tool cannot decode within its ${MAX_RESPONSE_BYTES}-byte cap; nothing was audited`
+      : read.code === "read-error"
+        ? `${url} closed the connection before its body ended; nothing was audited`
+        : `${url} sent a body labelled as compressed that could not be decoded; nothing was audited`,
+  );
+}
+
+/**
+ * Where a redirect pointed, as an origin only: the rest of a `Location` is
+ * the far end's content, and this ends up in a message a model reads.
+ */
+function redirectTarget(res: Response, url: string): string {
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) {
-        await reader.cancel();
-        throw new OsvUnavailableError(
-          `${url} returned more than ${MAX_RESPONSE_BYTES} bytes; the response was abandoned rather than buffered`,
-        );
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
+    const target = new URL(res.headers.get("location") ?? "", url);
+    return target.origin === "null" ? `a ${target.protocol} location` : target.origin;
+  } catch {
+    return "a location that is not a URL";
   }
-  const joined = new Uint8Array(total);
-  let at = 0;
-  for (const part of chunks) {
-    joined.set(part, at);
-    at += part.byteLength;
-  }
-  return new TextDecoder().decode(joined);
 }
 
 /** One request, with the timeout and the caller's cancellation both wired in. */
@@ -209,8 +223,19 @@ async function request(
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
+      // Never followed. The endpoint's origin was checked against the
+      // operator's allow-list and the SSRF guard; wherever a redirect points
+      // was not, and the platform's own follow would re-send the lockfile's
+      // coordinates there and report its answer as the audit.
+      redirect: "manual",
     });
-    return { status: res.status, text: await readCapped(res, url) };
+    if (res.status >= 300 && res.status < 400 && res.headers.has("location")) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new OsvUnavailableError(
+        `${url} answered HTTP ${res.status} with a redirect to ${redirectTarget(res, url)}; DependencyAudit does not follow redirects, so nothing was sent there and nothing was audited. Set endpoint to the address that answers directly.`,
+      );
+    }
+    return { status: res.status, text: await readCapped(res, url, controller.signal) };
   } catch (err) {
     if (err instanceof OsvUnavailableError) throw err;
     if (controller.signal.aborted) {

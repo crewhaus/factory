@@ -33,7 +33,7 @@ import {
   signingKey,
   stringToSign,
 } from "./lib/sigv4";
-import { checkBucket, checkKey, parseEndpoint, resolveTarget } from "./lib/store";
+import { PresignError, checkBucket, checkKey, parseEndpoint, resolveTarget } from "./lib/store";
 
 /** The credentials AWS publishes in its own examples. Not a real key. */
 const DOC_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
@@ -522,6 +522,60 @@ describe("parseEndpoint", () => {
     );
     expect(() => parseEndpoint(`https://key:${leaked}@s3.example.com:99999`)).toThrow(
       /<redacted>@s3\.example\.com:99999" is not a URL/,
+    );
+  });
+
+  // 0.7.1 (C159): the authority ends at the first "/" for the URL parser, so
+  // a password holding "/", "?", "#" or "@" used to be quoted back whole, as
+  // if it were a path (about half of AWS secret keys contain a "/").
+  test("a refusal never echoes a password that contains / ? # or @", () => {
+    const akid = ["AKIA", "IOSFODNN7", "EXAMPLE"].join("");
+    const refusal = (raw: string): string => {
+      try {
+        parseEndpoint(raw);
+        return "";
+      } catch (err) {
+        expect(err).toBeInstanceOf(PresignError);
+        return `${(err as Error).message}\n${(err as Error).stack ?? ""}`;
+      }
+    };
+    const leaks: Array<{ sep: string; shape: string; leaked: string[] }> = [];
+    let cases = 0;
+    for (const sep of ["/", "?", "#", "@"]) {
+      // Built at runtime, so the source holds no secret-shaped literal.
+      const secret = ["wJalrXUtnFEMI", "K7MDENGbPx", "RfiCYEXAMPLEKEY"].join(sep);
+      const frags = secret.split(/[/?#@]/);
+      for (const raw of [
+        `https://${akid}:${secret}@s3.us-east-1.amazonaws.com`,
+        `https://${akid}:${secret}@s3.example.com:99999`,
+        `ftp://${akid}:${secret}@files.example.com`,
+        `${akid}:${secret}@s3.example.com`,
+        `http://${akid}:${secret}@127.0.0.1:9000`,
+        // Digits then the separator: parses as host:port, the rest as a path.
+        `https://${akid}:1234${sep}${secret}@s3.example.com`,
+      ]) {
+        cases += 1;
+        const message = refusal(raw);
+        const leaked = frags.filter((f) => message.includes(f));
+        if (message === "" || leaked.length > 0) {
+          leaks.push({ sep, shape: raw.replace(secret, "…"), leaked });
+        }
+      }
+    }
+    expect(cases).toBe(24);
+    expect(leaks).toEqual([]);
+
+    // A query that holds an "@" before a signature does not expose it either.
+    const signature = ["CANARY", "signature", "0123456789"].join("");
+    expect(refusal(`https://h.example.com/k?a=b@c&X-Amz-Signature=${signature}`)).not.toContain(
+      signature,
+    );
+    // A readable refusal is still readable.
+    expect(refusal(`https://key:${["wJalr", "XUtn"].join("/")}@s3.example.com:99999`)).toMatch(
+      /"https:\/\/<redacted>@s3\.example\.com:99999" is not a URL/,
+    );
+    expect(refusal("https://gw.example.com/s3")).toContain(
+      '"https://gw.example.com/s3" has a path',
     );
   });
 

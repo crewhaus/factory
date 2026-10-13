@@ -34,7 +34,8 @@
  * position, never a silent empty result.
  */
 
-import { isPlainObject } from "./json";
+import { type RegexAnswers, testPatternSync } from "@crewhaus/tool-schema";
+import { getOwn, isPlainObject } from "./json";
 
 export type PathStep =
   | { kind: "child"; name: string }
@@ -244,81 +245,198 @@ export type PathMatch = { path: string; value: unknown };
  */
 export type PathSegment = string | number;
 
-type Node = { path: PathSegment[]; value: unknown };
+/**
+ * A node reached by the query. Its location is a link to the node it was
+ * reached from plus one segment, rendered into a path only for the matches
+ * that are returned: 0.7.0 copied the whole path array for every node it
+ * visited, which is quadratic in depth for a `..` step.
+ */
+type Node = {
+  readonly value: unknown;
+  readonly parent: Node | null;
+  readonly seg: PathSegment | null;
+};
 
-/** Run a parsed path over a value, returning matches in document order. */
+/**
+ * The most nodes one query may visit, counting every node a step produces
+ * and every node a `..` walk passes. A single pass over the largest document
+ * this package accepts is well inside it; a path that walks the document
+ * again for each node it found (`$..*..x` over a deep document) is what it
+ * stops.
+ */
+export const MAX_QUERY_VISITS = 5_000_000;
+
+export type QueryResult = {
+  matches: PathMatch[];
+  /**
+   * True when there are, or may be, matches past the ones returned: the
+   * limit was reached, or the query stopped at the visit budget.
+   */
+  truncated: boolean;
+  /** Set when the query stopped at MAX_QUERY_VISITS rather than at the limit. */
+  stoppedAtVisits?: number;
+  /**
+   * Nodes a `=~` filter could not be answered on (the regex worker's
+   * deadline, the engine giving up): left out, neither matched nor ruled
+   * out, with their paths. Absent when there were none.
+   */
+  undetermined?: { count: number; paths: string[] };
+};
+
+/** What a query reads its `=~` answers from, and where it notes the ones it could not have. */
+type FilterContext = {
+  readonly regex: RegexAnswers | undefined;
+  readonly undetermined: Node[];
+};
+
+/**
+ * Run a parsed path over a value, returning matches in document order.
+ *
+ * Evaluated lazily, depth first: each node a step produces runs through the
+ * remaining steps before the next is produced, which gives exactly the
+ * step-by-step, document-order result, and lets the query stop as soon as it
+ * has one match more than `limit` (to know it truncated). 0.7.0 built each
+ * step's whole node list first and then cut it at 20 x limit — so `$..*`
+ * materialized every node with its path, and a cut in the middle of a path
+ * silently dropped real matches: `$[*].b` over thirty records with `b` only
+ * in the last answered zero matches, not truncated.
+ */
 export function queryPath(
   root: unknown,
   steps: ReadonlyArray<PathStep>,
   limit: number,
-): { matches: PathMatch[]; truncated: boolean } {
-  let nodes: Node[] = [{ path: [], value: root }];
-  for (const step of steps) {
-    const next: Node[] = [];
-    for (const node of nodes) applyStep(step, node, next);
-    nodes = next;
-    // Bound intermediate sets too: `..*` over a deep tree can blow up.
-    const ceiling = Math.max(limit, 1) * 20;
-    if (nodes.length > ceiling) nodes = nodes.slice(0, ceiling);
+  maxVisits = MAX_QUERY_VISITS,
+  regex?: RegexAnswers,
+): QueryResult {
+  const found: Node[] = [];
+  const want = Math.max(limit, 0) + 1;
+  const budget = { left: maxVisits };
+  const filters: FilterContext = { regex, undetermined: [] };
+  const start: Node = { value: root, parent: null, seg: null };
+  let stopped = false;
+  if (steps.length === 0) {
+    found.push(start);
+  } else {
+    // One iterator per step: iterators[i] yields step i's outputs for the
+    // node the level above handed it. An explicit stack, not recursion, so a
+    // long path cannot overflow it.
+    const iterators: Array<Iterator<Node>> = [expand(steps[0] as PathStep, start, budget, filters)];
+    while (iterators.length > 0) {
+      const next = (iterators[iterators.length - 1] as Iterator<Node>).next();
+      if (budget.left < 0) {
+        stopped = true;
+        break;
+      }
+      if (next.done === true) {
+        iterators.pop();
+        continue;
+      }
+      if (iterators.length === steps.length) {
+        found.push(next.value);
+        if (found.length >= want) break;
+        continue;
+      }
+      iterators.push(expand(steps[iterators.length] as PathStep, next.value, budget, filters));
+    }
   }
-  const truncated = nodes.length > limit;
+  const shown = found.slice(0, Math.max(limit, 0));
+  const open = filters.undetermined;
   return {
-    matches: nodes.slice(0, limit).map((n) => ({ path: renderPath(n.path), value: n.value })),
-    truncated,
+    matches: shown.map((n) => ({ path: renderPath(segmentsOf(n)), value: n.value })),
+    truncated: stopped || found.length > shown.length,
+    ...(stopped ? { stoppedAtVisits: maxVisits } : {}),
+    ...(open.length > 0
+      ? {
+          undetermined: {
+            count: open.length,
+            paths: open.slice(0, 50).map((n) => renderPath(segmentsOf(n))),
+          },
+        }
+      : {}),
   };
 }
 
-function applyStep(step: PathStep, node: Node, out: Node[]): void {
+function segmentsOf(node: Node): PathSegment[] {
+  const out: PathSegment[] = [];
+  for (let n: Node | null = node; n !== null && n.seg !== null; n = n.parent) out.push(n.seg);
+  return out.reverse();
+}
+
+const child = (parent: Node, seg: PathSegment, value: unknown): Node => ({ value, parent, seg });
+
+/** The nodes one step produces from `node`, lazily, charging each to the budget. */
+function* expand(
+  step: PathStep,
+  node: Node,
+  budget: { left: number },
+  filters: FilterContext,
+): Generator<Node> {
   const v = node.value;
   switch (step.kind) {
     case "child": {
       if (isPlainObject(v) && Object.hasOwn(v, step.name)) {
-        out.push({ path: [...node.path, step.name], value: v[step.name] });
+        budget.left -= 1;
+        yield child(node, step.name, v[step.name]);
       }
       return;
     }
     case "wildcard": {
       if (Array.isArray(v)) {
-        v.forEach((el, i) => out.push({ path: [...node.path, i], value: el }));
+        for (let i = 0; i < v.length; i++) {
+          budget.left -= 1;
+          yield child(node, i, v[i]);
+        }
       } else if (isPlainObject(v)) {
-        for (const k of Object.keys(v)) out.push({ path: [...node.path, k], value: v[k] });
+        for (const k of Object.keys(v)) {
+          budget.left -= 1;
+          yield child(node, k, v[k]);
+        }
       }
       return;
     }
     case "descend": {
       const name = step.name;
-      walk(node, (n) => {
+      for (const n of descendants(node, budget)) {
         if (name === null) {
-          if (n.path.length !== node.path.length) out.push(n);
-          return;
+          if (n !== node) yield n;
+        } else if (isPlainObject(n.value) && Object.hasOwn(n.value, name)) {
+          yield child(n, name, n.value[name]);
         }
-        if (isPlainObject(n.value) && Object.hasOwn(n.value, name)) {
-          out.push({ path: [...n.path, name], value: n.value[name] });
-        }
-      });
+      }
       return;
     }
     case "index": {
       if (!Array.isArray(v)) return;
       const i = step.index < 0 ? v.length + step.index : step.index;
-      if (i >= 0 && i < v.length) out.push({ path: [...node.path, i], value: v[i] });
+      if (i >= 0 && i < v.length) {
+        budget.left -= 1;
+        yield child(node, i, v[i]);
+      }
       return;
     }
     case "slice": {
       if (!Array.isArray(v)) return;
       for (const i of sliceIndices(v.length, step.start, step.end, step.step)) {
-        out.push({ path: [...node.path, i], value: v[i] });
+        budget.left -= 1;
+        yield child(node, i, v[i]);
       }
       return;
     }
     case "filter": {
+      const keep = (seg: PathSegment, value: unknown): boolean => {
+        const verdict = matchesFilter(value, step, filters.regex);
+        if (verdict === "undetermined") filters.undetermined.push(child(node, seg, value));
+        return verdict === true;
+      };
       if (Array.isArray(v)) {
-        v.forEach((el, i) => {
-          if (matchesFilter(el, step)) out.push({ path: [...node.path, i], value: el });
-        });
+        for (let i = 0; i < v.length; i++) {
+          budget.left -= 1;
+          if (keep(i, v[i])) yield child(node, i, v[i]);
+        }
       } else if (isPlainObject(v)) {
         for (const k of Object.keys(v)) {
-          if (matchesFilter(v[k], step)) out.push({ path: [...node.path, k], value: v[k] });
+          budget.left -= 1;
+          if (keep(k, v[k])) yield child(node, k, v[k]);
         }
       }
       return;
@@ -328,14 +446,46 @@ function applyStep(step: PathStep, node: Node, out: Node[]): void {
   }
 }
 
-/** Depth-first pre-order walk, used by recursive descent. */
-function walk(node: Node, visit: (n: Node) => void): void {
-  visit(node);
-  const v = node.value;
-  if (Array.isArray(v)) {
-    v.forEach((el, i) => walk({ path: [...node.path, i], value: el }, visit));
-  } else if (isPlainObject(v)) {
-    for (const k of Object.keys(v)) walk({ path: [...node.path, k], value: v[k] }, visit);
+/**
+ * `node` and everything under it, depth-first pre-order, lazily. An explicit
+ * stack of child cursors, one per level, so a deep document costs one frame
+ * per level and never a recursion.
+ */
+function* descendants(node: Node, budget: { left: number }): Generator<Node> {
+  budget.left -= 1;
+  yield node;
+  type Cursor = { readonly of: Node; readonly keys: ReadonlyArray<string> | null; at: number };
+  const cursorOf = (n: Node): Cursor | null =>
+    Array.isArray(n.value)
+      ? { of: n, keys: null, at: 0 }
+      : isPlainObject(n.value)
+        ? { of: n, keys: Object.keys(n.value), at: 0 }
+        : null;
+  const stack: Cursor[] = [];
+  const first = cursorOf(node);
+  if (first !== null) stack.push(first);
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1] as Cursor;
+    const container = top.of.value;
+    const size = top.keys === null ? (container as unknown[]).length : top.keys.length;
+    if (top.at >= size) {
+      stack.pop();
+      continue;
+    }
+    const at = top.at;
+    top.at += 1;
+    const next =
+      top.keys === null
+        ? child(top.of, at, (container as unknown[])[at])
+        : child(
+            top.of,
+            top.keys[at] as string,
+            (container as Record<string, unknown>)[top.keys[at] as string],
+          );
+    budget.left -= 1;
+    yield next;
+    const deeper = cursorOf(next);
+    if (deeper !== null) stack.push(deeper);
   }
 }
 
@@ -364,10 +514,22 @@ export function sliceIndices(
   return out;
 }
 
-function matchesFilter(value: unknown, step: Extract<PathStep, { kind: "filter" }>): boolean {
+/**
+ * Does `value` pass the filter? A `=~` pattern is never run here: its
+ * answer comes from `regex`, resolved in the worker by the tool, and one
+ * not answered yet reads as a miss for this pass (the tool runs the query
+ * again once it is answered). One that could not be answered is
+ * `"undetermined"`; one the screen refuses, or that does not compile, is a
+ * bad path, where 0.7.0 silently matched nothing.
+ */
+function matchesFilter(
+  value: unknown,
+  step: Extract<PathStep, { kind: "filter" }>,
+  regex: RegexAnswers | undefined,
+): boolean | "undetermined" {
   let cur: unknown = value;
   for (const seg of step.field) {
-    if (isPlainObject(cur)) cur = cur[seg];
+    if (isPlainObject(cur)) cur = getOwn(cur, seg);
     else if (Array.isArray(cur) && /^-?\d+$/.test(seg)) {
       const i = Number(seg);
       cur = cur[i < 0 ? cur.length + i : i];
@@ -379,11 +541,15 @@ function matchesFilter(value: unknown, step: Extract<PathStep, { kind: "filter" 
   if (step.op === "!=") return !looseEqual(cur, lit);
   if (step.op === "=~") {
     if (typeof lit !== "string") return false;
-    try {
-      return new RegExp(lit).test(String(cur));
-    } catch {
-      return false;
+    const subject = String(cur);
+    const answer =
+      regex === undefined ? testPatternSync(lit, "", subject) : regex.lookup(lit, "", subject);
+    if (answer === undefined) return false;
+    if (typeof answer === "boolean") return answer;
+    if ("refused" in answer) {
+      throw new PathError(`the filter's regex /${lit}/ was not run: ${answer.refused}`);
     }
+    return "undetermined";
   }
   if (typeof cur === "number" && typeof lit === "number") {
     return compare(cur < lit, cur > lit, step.op);

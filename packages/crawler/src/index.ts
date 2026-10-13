@@ -26,13 +26,22 @@
  * `snippetOccursInBody`).
  */
 import { lookup as nodeDnsLookup } from "node:dns/promises";
-import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
-import { basename, dirname, join as joinPath, resolve as resolvePath, sep } from "node:path";
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { dirname, join as joinPath, parse, resolve as resolvePath, sep } from "node:path";
 import type { CitationTracker } from "@crewhaus/citation-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { fetchRaw, readFileBoundedSync, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
+
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed a
+ * file:// page's body, and the sha256 its citation records, for a file that
+ * starts with one (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_REDIRECTS = 5;
@@ -317,8 +326,13 @@ function pinnedFetch(
   const host = original.hostname;
   const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
   // No pin, or the host already IS the pinned IP ⇒ nothing to rewrite.
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd body in native code
+  // before any reader sees a byte, and a 260 KB gzip of zeros cost about
+  // 940 MB of RSS before the 5 MB cap fired (C093). `readBodyCapped`
+  // decodes it, under the cap.
   if (pinnedIp === undefined || pinnedIp === "" || hostUnbracketed === pinnedIp) {
-    return globalThis.fetch(url, init);
+    return fetchRaw(url, init);
   }
   const hostForUrl = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
   const pinnedUrl = new URL(original.toString());
@@ -331,47 +345,71 @@ function pinnedFetch(
     // SNI must stay the real hostname so TLS cert validation passes.
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), pinnedInit);
+  return fetchRaw(pinnedUrl.toString(), pinnedInit);
 }
 
 /**
- * Read a response body, aborting as soon as the running total exceeds `cap`,
- * so a hostile/oversized response is never fully materialized in the heap.
- * Decodes to UTF-8 only after the bounded read completes.
+ * Read a response body with its DECODED size capped at `cap`, so a
+ * hostile/oversized response is never materialised in the heap: the body
+ * arrives raw (see `pinnedFetch`), a gzip, deflate, br or zstd body is
+ * decoded here in small steps, and the decoder stops once `cap` bytes exist.
+ * A body that decodes past the cap is refused, never cut; one this reader
+ * cannot decode (an unknown or stacked coding, a corrupt stream) is refused
+ * without quoting it.
  */
 async function readBodyCapped(
   r: Response,
   cap: number,
   label: string,
   abort: () => void,
+  signal: AbortSignal,
 ): Promise<string> {
-  if (r.body === null) return "";
-  const reader = r.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > cap) {
-        abort();
-        await reader.cancel();
-        throw new CrawlerError(`response body for ${label} exceeds ${cap} bytes`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
+  const read = await readResponseBounded(r, { maxBytes: cap, signal });
+  if (read.ok) {
+    if (!read.truncated) return read.text;
+    abort();
+    throw new CrawlerError(`response body for ${label} exceeds ${cap} bytes`);
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
+  abort();
+  switch (read.code) {
+    case "aborted":
+    case "stalled":
+      throw new CrawlerError(`the read of ${label} was aborted before the body ended`);
+    case "unsupported-encoding":
+      throw new CrawlerError(
+        `response body for ${label} uses a stack of content-encodings the crawler cannot decode within its ${cap}-byte cap`,
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new CrawlerError(
+        `response body for ${label} is labelled as compressed but could not be decoded`,
+      );
+    default:
+      throw new CrawlerError(`response body for ${label} could not be read to the end`);
   }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+}
+
+/**
+ * The longest path this resolves, in UTF-16 code units; a longer one is
+ * refused before it is walked. Nothing that long can be opened or created:
+ * PATH_MAX is 1,024 bytes on macOS and 4,096 on Linux, Windows stops at
+ * 32,767 UTF-16 units, and a path's UTF-8 form is never shorter than its
+ * UTF-16 one. The limit is twice that because the part of a path that exists
+ * is itself under PATH_MAX, so the part that does not is over PATH_MAX on its
+ * own: no spelling of the place reaches it, not even one through a symlink
+ * that shortens the part that exists.
+ */
+export const MAX_PATH_CHARS =
+  2 * (process.platform === "darwin" ? 1_024 : process.platform === "win32" ? 32_767 : 4_096);
+
+/** A path as a refusal quotes it: whole, unless it is past {@link MAX_PATH_CHARS}. */
+function shownPath(given: string): string {
+  return given.length > MAX_PATH_CHARS ? `${given.slice(0, 64)}…` : given;
+}
+
+/** Why a path past {@link MAX_PATH_CHARS} is refused: its length and the limit. */
+function tooLong(abs: string): string {
+  return `it is ${abs.length} characters once resolved, over the ${MAX_PATH_CHARS}-character limit: no path that long can be opened or created`;
 }
 
 /**
@@ -405,14 +443,7 @@ function nameExists(p: string): boolean {
  */
 function resolveLocation(target: string, depth = 0): string {
   if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(basename(probe));
-    const parent = dirname(probe);
-    if (parent === probe) break; // reached filesystem root
-    probe = parent;
-  }
+  const { probe, tail } = deepestName(target);
   let probeReal: string;
   try {
     probeReal = realpathSync(probe);
@@ -428,7 +459,38 @@ function resolveLocation(target: string, depth = 0): string {
     const base = realpathSync(dirname(probe));
     probeReal = resolveLocation(resolvePath(base, link), depth + 1);
   }
-  return tail.length > 0 ? joinPath(probeReal, ...tail) : probeReal;
+  // One string, not one argument per name: Bun's `path.join` keeps only
+  // (argument count mod 65,536) of its arguments.
+  return tail.length > 0 ? joinPath(probeReal, tail) : probeReal;
+}
+
+/**
+ * `target`, an absolute path, split where its deepest prefix that exists as
+ * a NAME ends: that prefix, and the names below it, which do not exist, as
+ * one string ("" when `target` itself exists). This is `path.dirname` and
+ * `path.basename` worked by index on `target` itself: handing them each
+ * shorter prefix in turn copied the rest of the path once per missing name,
+ * the square of a count the caller picks.
+ */
+function deepestName(target: string): { readonly probe: string; readonly tail: string } {
+  const top = parse(target).root.length;
+  const isSep = (i: number): boolean => target[i] === "/" || target[i] === sep;
+  let probe = target;
+  let start = target.length;
+  let stop = -1;
+  while (!nameExists(probe)) {
+    // `path.basename(probe)` is `target.slice(start, end)`, and
+    // `path.dirname(probe)` is `target.slice(0, up)`.
+    let end = probe.length;
+    while (end > top && isSep(end - 1)) end--;
+    if (stop < 0) stop = end;
+    start = end;
+    while (start > top && !isSep(start - 1)) start--;
+    const up = start > top ? start - 1 : top;
+    if (up === probe.length) break; // reached the filesystem root
+    probe = target.slice(0, up);
+  }
+  return { probe, tail: stop < 0 ? "" : target.slice(start, stop) };
 }
 
 export function createCrawler(opts: {
@@ -540,7 +602,7 @@ export function createCrawler(opts: {
           ac.abort();
           throw new CrawlerError(`response body for ${currentUrl} exceeds ${maxBodyBytes} bytes`);
         }
-        return await readBodyCapped(r, maxBodyBytes, currentUrl, () => ac.abort());
+        return await readBodyCapped(r, maxBodyBytes, currentUrl, () => ac.abort(), ac.signal);
       }
       throw new CrawlerError(`exceeded ${maxRedirects} redirects starting from ${url}`);
     } finally {
@@ -559,6 +621,10 @@ export function createCrawler(opts: {
       throw new CrawlerError(
         `file path "${abs}" is outside the configured crawler roots (got ${allowedFileRoots.length} roots)`,
       );
+    }
+    // Longer than any path can be: refused before the walk below reads it.
+    if (abs.length > MAX_PATH_CHARS) {
+      throw new CrawlerError(`file path "${shownPath(abs)}" is refused: ${tooLong(abs)}`);
     }
     // 2) Symlink-aware containment (CWE-59). The lexical check is fooled by an
     //    in-root symlink whose real target lies outside a root, so re-check the
@@ -585,16 +651,21 @@ export function createCrawler(opts: {
         `file path "${abs}" escapes the configured crawler roots via a symlink`,
       );
     }
-    let body: string;
-    try {
-      body = readFileSync(abs, "utf8");
-    } catch (err) {
-      throw new CrawlerError(`failed to read ${abs}`, err);
+    // Bounded while reading, and only a regular file: a FIFO with no writer
+    // blocks an ordinary open for ever, and this read was synchronous, so a
+    // named pipe under a crawler root stopped the whole harness.
+    const read = readFileBoundedSync(abs, { maxBytes: maxBodyBytes });
+    if (!read.ok) {
+      throw new CrawlerError(
+        read.code === "not-regular-file"
+          ? `file ${abs} is a ${read.kind}, not a regular file; it was not opened`
+          : `failed to read ${abs}: ${read.reason}`,
+      );
     }
-    if (Buffer.byteLength(body, "utf8") > maxBodyBytes) {
+    if (read.truncated) {
       throw new CrawlerError(`file ${abs} exceeds ${maxBodyBytes} bytes`);
     }
-    return body;
+    return KEEP_BOM.decode(read.bytes);
   }
 
   return {

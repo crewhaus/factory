@@ -27,6 +27,7 @@
  * than remembered per handler. A handler that forgets it inherits it anyway.
  */
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "@crewhaus/spec-patch";
+import { hasLineBreak, replaceQueryPairs } from "./linear-mask";
 
 /**
  * Rewrites one string on its way out — the harness env scrubber
@@ -223,8 +224,8 @@ function maskUrlCredentials(url: string): string {
 }
 
 function maskQueryValues(query: string): string {
-  return query.replace(
-    /([?&;])([^=&;]*)=([^&;]*)/g,
+  return replaceQueryPairs(
+    query,
     (whole: string, sep: string, name: string, value: string): string =>
       isCredentialKey(name) || OPAQUE_SEGMENT_RE.test(value)
         ? `${sep}${name}=${MASKED_TOKEN}`
@@ -289,7 +290,10 @@ const REDACTED_YAML_SCALAR = `"${REDACTED_VALUE}"`;
  */
 export function maskKeyedText(text: string): string {
   const lines = text.split("\n").map((line) => {
-    const m = line.match(KEYED_SCALAR_LINE_RE);
+    // A line holding a `\r` (a CRLF document) cannot match: `(.*)$` stops
+    // at it. The pattern finds that out only after giving back the run
+    // before the value one character at a time, quadratic in the run.
+    const m = hasLineBreak(line) ? null : line.match(KEYED_SCALAR_LINE_RE);
     if (m !== null) {
       const [, indent = "", quote = "", key = "", gap = "", rest = ""] = m;
       const value = rest.trim();

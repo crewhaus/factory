@@ -29,7 +29,9 @@
  *   7b. A URL carrying `user:pass@` is refused outright, at the first hop and
  *      at every redirect: userinfo is a credential that would otherwise ride
  *      in `finalUrl` and `redirects` straight back into a transcript.
- *   8. Every request is deadline-bounded and every body is byte-capped.
+ *   8. Every request is deadline-bounded and every body is byte-capped by
+ *      its DECODED size: the body is fetched raw and decoded here, under the
+ *      cap, so a compressed reply cannot inflate past it.
  *   9. `Cookie`, `Set-Cookie` and `Authorization` are stripped from response
  *      headers before anything is handed back to a model.
  *
@@ -41,6 +43,18 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  type SecretValue,
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
+import {
+  type ResponseReadFailure,
+  fetchRaw,
+  readResponseBounded,
+} from "@crewhaus/tool-safety/streams";
 
 /** Refusal by the allow-list, the SSRF gate, or a redirect rule. */
 export class HttpPermissionError extends CrewhausError {
@@ -49,6 +63,32 @@ export class HttpPermissionError extends CrewhausError {
     super("tool", message);
   }
 }
+
+/**
+ * The gate refused a request before sending it: a scheme, userinfo, an
+ * origin not in allowed_origins, a credential bound elsewhere, or an address
+ * the SSRF check will not dial. It says nothing about the endpoint, which
+ * was never asked, so a probe reports it as refused, never as down.
+ *
+ * `redirectStatus` is set when the refusal came at a redirect hop: the
+ * endpoint DID answer, with that status, and the gate would not follow its
+ * `Location`. It is undefined when nothing was sent at all.
+ */
+export class HttpRefusedError extends HttpPermissionError {
+  constructor(
+    message: string,
+    readonly redirectStatus: number | undefined,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The host's name did not resolve. The SSRF check raises it, but unlike a
+ * refusal it is a fact about the network — a link to a domain that does not
+ * exist IS broken — so it is not an {@link HttpRefusedError}.
+ */
+export class HttpUnresolvedError extends HttpPermissionError {}
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 600_000;
@@ -77,16 +117,50 @@ export type HttpConfig = {
    * separately, so there is exactly one list to audit.
    */
   readonly allowedHosts: ReadonlySet<string>;
+  /**
+   * The environment variables an `auth` profile may read, each with the
+   * canonical origins its credential may be sent to (`null`: any origin in
+   * `allowedOrigins`). Empty (the default) refuses every auth profile: the
+   * operator names the credentials, and a tool call may only choose among
+   * them.
+   */
+  readonly authEnvs: ReadonlyMap<string, ReadonlySet<string> | null>;
+  /**
+   * The environment variables `WebhookSign` and `WebhookVerify` may use as
+   * an HMAC key. Empty (the default) refuses both: a call that could name
+   * any variable could mint a valid signature with any secret in the
+   * process.
+   */
+  readonly signingEnvs: ReadonlySet<string>;
 };
+
+/**
+ * `allowed_auth_envs`: a list of variable names, whose credentials may go
+ * to any allowed origin, or a map from a name to the origins its credential
+ * may go to.
+ */
+export type AuthEnvsInput = readonly string[] | Readonly<Record<string, readonly string[]>>;
 
 export type HttpConfigInput = {
   readonly allowed_origins?: readonly string[];
   readonly allowedOrigins?: readonly string[];
+  readonly allowed_auth_envs?: AuthEnvsInput;
+  readonly allowedAuthEnvs?: AuthEnvsInput;
+  readonly allowed_signing_envs?: readonly string[];
+  readonly allowedSigningEnvs?: readonly string[];
 };
+
+/** Where an operator allows an auth profile's variable. Every refusal names it. */
+export const AUTH_ENVS_KEY = "tool_config.http.allowed_auth_envs";
+
+/** Where an operator allows a webhook signing secret's variable. */
+export const SIGNING_ENVS_KEY = "tool_config.http.allowed_signing_envs";
 
 const EMPTY_CONFIG: HttpConfig = {
   allowedOrigins: new Set<string>(),
   allowedHosts: new Set<string>(),
+  authEnvs: new Map(),
+  signingEnvs: new Set(),
 };
 
 let httpConfig: HttpConfig = EMPTY_CONFIG;
@@ -101,7 +175,103 @@ export function buildHttpConfig(input: HttpConfigInput): HttpConfig {
     origins.add(canonical);
     hosts.add(new URL(canonical).hostname.toLowerCase());
   }
-  return { allowedOrigins: origins, allowedHosts: hosts };
+  const authEnvs = buildAuthEnvs(input.allowedAuthEnvs ?? input.allowed_auth_envs, origins);
+  const signingEnvs = buildSigningEnvs(input.allowedSigningEnvs ?? input.allowed_signing_envs);
+  return { allowedOrigins: origins, allowedHosts: hosts, authEnvs, signingEnvs };
+}
+
+/** Check `allowed_signing_envs` at boot; an entry is never quoted, as for auth envs. */
+function buildSigningEnvs(raw: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  if (raw === undefined || raw === null) return out;
+  if (!Array.isArray(raw)) {
+    throw new HttpPermissionError(`${SIGNING_ENVS_KEY} must be a list of variable names`);
+  }
+  raw.forEach((name, index) => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new HttpPermissionError(
+        `${SIGNING_ENVS_KEY} lists environment variable NAMES (such as WEBHOOK_SECRET, written without a $); entry ${index + 1} is not one, and has not been echoed back`,
+      );
+    }
+    out.add(name);
+  });
+  return out;
+}
+
+/**
+ * The HMAC key a `WebhookSign` or `WebhookVerify` call names, when the
+ * operator listed its variable in `allowed_signing_envs`. Anything else is
+ * refused before the environment is read, with the same words whether or
+ * not it is set, and a pasted secret is never quoted (security-8#20).
+ */
+export function resolveSigningSecret(
+  name: string,
+  cfg: HttpConfig,
+  env: Record<string, string | undefined> = process.env,
+):
+  | { readonly ok: true; readonly secret: string }
+  | { readonly ok: false; readonly message: string } {
+  const resolved = resolveCredentialEnv(name, {
+    allowed: [...cfg.signingEnvs],
+    purpose: "secretEnvVar",
+    configKey: SIGNING_ENVS_KEY,
+    env,
+  });
+  return resolved.ok
+    ? { ok: true, secret: resolved.value }
+    : { ok: false, message: resolved.reason };
+}
+
+/**
+ * Check `allowed_auth_envs` at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts, not at the first call.
+ * An entry is never quoted: an operator who pasted a token here, or wrote
+ * `$GITHUB_TOKEN` (which the bundle resolves to the token itself), would
+ * otherwise see it printed.
+ */
+function buildAuthEnvs(
+  raw: unknown,
+  origins: ReadonlySet<string>,
+): ReadonlyMap<string, ReadonlySet<string> | null> {
+  const out = new Map<string, ReadonlySet<string> | null>();
+  if (raw === undefined || raw === null) return out;
+  const checkName = (name: unknown, where: string): string => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new HttpPermissionError(
+        `${AUTH_ENVS_KEY} lists environment variable NAMES (such as GITHUB_TOKEN, written without a $); ${where} is not one, and has not been echoed back`,
+      );
+    }
+    return name;
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach((name, index) => out.set(checkName(name, `entry ${index + 1}`), null));
+    return out;
+  }
+  if (typeof raw !== "object") {
+    throw new HttpPermissionError(
+      `${AUTH_ENVS_KEY} must be a list of variable names, or a map from a variable name to the origins its credential may be sent to`,
+    );
+  }
+  Object.entries(raw as Record<string, unknown>).forEach(([key, bound], index) => {
+    const name = checkName(key, `key ${index + 1}`);
+    if (!Array.isArray(bound) || bound.length === 0) {
+      throw new HttpPermissionError(
+        `${AUTH_ENVS_KEY}.${name} must list the origins its credential may be sent to`,
+      );
+    }
+    const set = new Set<string>();
+    for (const origin of bound) {
+      const canonical = canonicalizeOrigin(String(origin));
+      if (!origins.has(canonical)) {
+        throw new HttpPermissionError(
+          `${AUTH_ENVS_KEY}.${name} lists ${canonical}, which is not in allowed_origins`,
+        );
+      }
+      set.add(canonical);
+    }
+    out.set(name, set);
+  });
+  return out;
 }
 
 /** Replace the process-global allow-list. Codegen calls this at boot. */
@@ -344,7 +514,7 @@ export async function assertNotSsrf(hostname: string): Promise<string> {
     resolved = await dnsLookupFn(lower);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new HttpPermissionError(`SSRF: cannot resolve "${hostname}": ${msg}`);
+    throw new HttpUnresolvedError(`SSRF: cannot resolve "${hostname}": ${msg}`);
   }
   if (refused(resolved.address)) {
     throw new HttpPermissionError(
@@ -553,11 +723,32 @@ export function expandIpv6(raw: string): number[] | null {
 // deadlines
 // ---------------------------------------------------------------------------
 
+/**
+ * The reason a deadline's own timer aborts its signal with. An error is
+ * traced to the deadline by this reason, never by the clock: a transport
+ * failure that merely ARRIVES after the deadline's time (a starved event
+ * loop delivers it before the timer callback runs) is that failure, and a
+ * runtime cancel aborts with the runtime's reason instead.
+ */
+export class DeadlineElapsedError extends Error {
+  override readonly name = "TimeoutError";
+}
+
 export type Deadline = {
   readonly signal: AbortSignal;
   /** Milliseconds left; never negative. */
   remaining(): number;
+  /**
+   * The clock says the time is up. For scheduling (stop starting new work),
+   * never for saying why something failed — that is {@link timedOut}.
+   */
   expired(): boolean;
+  /**
+   * The deadline's timer — or an outer deadline's, forwarded — really
+   * aborted the signal. False for a runtime cancel, and false while the
+   * timer has not run, however late the clock says it is.
+   */
+  timedOut(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -570,7 +761,10 @@ export type Deadline = {
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
   const startedAt = Date.now();
-  const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(
+    () => ctrl.abort(new DeadlineElapsedError(`deadline of ${ms}ms elapsed`)),
+    ms,
+  );
   const onOuter = () => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) ctrl.abort(outer.reason);
@@ -580,6 +774,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
     signal: ctrl.signal,
     remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
     expired: () => Date.now() - startedAt >= ms,
+    timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
@@ -654,41 +849,90 @@ export function rejectInlineCredentials(headers: Record<string, string>): string
   return null;
 }
 
+export type AppliedAuth =
+  | {
+      readonly ok: true;
+      /** Lowercased names of the headers the profile set. */
+      readonly secretHeaders: ReadonlySet<string>;
+      /**
+       * The credential values a server could echo back, for the redactor:
+       * the secret, and for `basic` the `user:secret` pair (whose base64
+       * cannot be derived from the secret alone). The pair's `user:` is the
+       * account name, not a secret: a result that ends with it is left
+       * alone (net regression review).
+       */
+      readonly secrets: readonly SecretValue[];
+      /** The origins the credential may be sent to, when the operator bound it. */
+      readonly credentialOrigins: ReadonlySet<string> | undefined;
+    }
+  | { readonly ok: false; readonly message: string };
+
 /**
- * Apply an auth profile. Returns a readable message when the named variable
- * is unset or the profile is incomplete; the secret itself is never echoed,
- * not even in the error.
+ * Apply an auth profile. The variable must be one the operator listed in
+ * `tool_config.http.allowed_auth_envs`: a tool call may choose among those
+ * names and can never add one, so a model cannot send ANTHROPIC_API_KEY (or
+ * any other process secret) as a bearer token to an allowed origin. The
+ * refusal names the key to set, is the same whether or not an unlisted
+ * variable is set, and never quotes a value, or a "name" that is really a
+ * pasted token.
  */
 export function applyAuth(
   headers: Record<string, string>,
   auth: AuthProfile | undefined,
+  cfg: HttpConfig,
   env: Record<string, string | undefined> = process.env,
-): string | null {
-  if (auth === undefined) return null;
-  const secret = env[auth.envVar];
-  if (secret === undefined || secret === "") {
-    return `auth profile names environment variable "${auth.envVar}", which is unset or empty in this process`;
+): AppliedAuth {
+  if (auth === undefined) {
+    return { ok: true, secretHeaders: new Set(), secrets: [], credentialOrigins: undefined };
   }
+  const resolved = resolveCredentialEnv(auth.envVar, {
+    allowed: [...cfg.authEnvs.keys()],
+    purpose: "the auth profile",
+    configKey: AUTH_ENVS_KEY,
+    env,
+  });
+  if (!resolved.ok) return { ok: false, message: resolved.reason };
+  const secret = resolved.value;
+  const credentialOrigins = cfg.authEnvs.get(resolved.name) ?? undefined;
   if (auth.type === "bearer") {
     headers["Authorization"] = `Bearer ${secret}`;
-    return null;
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret],
+      credentialOrigins,
+    };
   }
   if (auth.type === "basic") {
     if (auth.username === undefined) {
-      return 'auth type "basic" needs a username; the password comes from envVar';
+      return {
+        ok: false,
+        message: 'auth type "basic" needs a username; the password comes from envVar',
+      };
     }
-    const encoded = Buffer.from(`${auth.username}:${secret}`, "utf8").toString("base64");
+    const publicPrefix = `${auth.username}:`;
+    const encoded = Buffer.from(`${publicPrefix}${secret}`, "utf8").toString("base64");
     headers["Authorization"] = `Basic ${encoded}`;
-    return null;
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret, { publicPrefix, secret }],
+      credentialOrigins,
+    };
   }
   if (auth.headerName === undefined) {
-    return 'auth type "header" needs a headerName';
+    return { ok: false, message: 'auth type "header" needs a headerName' };
   }
   if (auth.headerName.toLowerCase() === "host") {
-    return 'auth type "header" cannot set the Host header';
+    return { ok: false, message: 'auth type "header" cannot set the Host header' };
   }
   headers[auth.headerName] = `${auth.prefix ?? ""}${secret}`;
-  return null;
+  return {
+    ok: true,
+    secretHeaders: new Set([auth.headerName.toLowerCase()]),
+    secrets: [secret],
+    credentialOrigins,
+  };
 }
 
 /**
@@ -749,12 +993,17 @@ export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
 /**
  * Dial the vetted IP while keeping the real hostname for the `Host` header
  * and TLS SNI, so virtual hosting and certificate validation still work.
+ *
+ * Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`).
+ * Without it Bun inflates a gzip, deflate, br or zstd body in native code
+ * before any reader sees a byte, and the byte caps bounded only what was
+ * returned (security-5#7). The readers below decode it themselves.
  */
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (unbracketed === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  if (unbracketed === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -773,7 +1022,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     init.duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -798,6 +1047,21 @@ export type OpenOptions = {
    * alongside `Authorization`, `Proxy-Authorization` and `Cookie`.
    */
   readonly credentialHeaders?: ReadonlySet<string>;
+  /**
+   * The canonical origins the auth profile's credential may be sent to,
+   * when the operator bound it (`allowed_auth_envs` in map form). A request
+   * to any other origin carrying it is refused before the socket opens.
+   */
+  readonly credentialOrigins?: ReadonlySet<string> | undefined;
+  /**
+   * The canonical origin the call's credentials were set for. When given,
+   * a request to ANY other origin carries none of them, at every hop — not
+   * only where a redirect changes origin. A tool that makes several
+   * requests, some of them to URLs a server named (HttpPaginate's Link
+   * header), passes the origin of the URL the call named, so a server
+   * cannot steer the credential to another origin across requests.
+   */
+  readonly credentialOrigin?: string | undefined;
 };
 
 export type OpenResult = {
@@ -808,6 +1072,21 @@ export type OpenResult = {
   /** True when a cross-origin hop dropped the credential headers. */
   readonly credentialsDropped: boolean;
 };
+
+/**
+ * Whether a redirect turns the request into a GET without its body, as the
+ * Fetch Standard says (HTTP-redirect fetch) and browsers, curl and Bun's own
+ * fetch do: a 303 turns any method but GET and HEAD into a GET, and a 301 or
+ * 302 turns only a POST into one. A PUT, PATCH or DELETE keeps its method
+ * and body there, as on a 307 or 308, so it is made where the server moved
+ * it instead of becoming a read whose 200 reports an update or a delete
+ * that never happened. A POST is still never replayed on a 301/302/303.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
 
 /**
  * Issue a request, following redirects by hand so the allow-list, the SSRF
@@ -822,6 +1101,12 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     const lower = name.toLowerCase();
     return CREDENTIAL_HEADERS.has(lower) || o.credentialHeaders?.has(lower) === true;
   };
+  // Ask for the body as it is. The readers decode gzip, deflate, br and zstd
+  // under the cap anyway, so a server that compresses regardless still
+  // works; a caller that set its own Accept-Encoding keeps it.
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "accept-encoding")) {
+    headers["accept-encoding"] = "identity";
+  }
   const redirects: string[] = [];
   let credentialsDropped = false;
   let current = o.url;
@@ -829,7 +1114,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
   let method = o.method;
   let body = o.body;
 
-  for (let hop = 0; ; hop++) {
+  /** The gate, for the hop about to be sent; returns the address to pin. */
+  const gateHop = async (): Promise<string> => {
     if (current.protocol !== "http:" && current.protocol !== "https:") {
       throw new HttpPermissionError(
         `denied: scheme "${current.protocol}" — only http/https are allowed`,
@@ -837,7 +1123,46 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
-    const pinnedIp = await assertNotSsrf(current.hostname);
+    if (o.credentialOrigin !== undefined && currentOrigin !== o.credentialOrigin) {
+      // Not the origin the call's credentials were set for: whether a
+      // redirect or an earlier response pointed here, they are not sent.
+      for (const name of Object.keys(headers)) {
+        if (isCredential(name)) {
+          delete headers[name];
+          credentialsDropped = true;
+        }
+      }
+    }
+    if (
+      o.credentialOrigins !== undefined &&
+      !o.credentialOrigins.has(currentOrigin) &&
+      Object.keys(headers).some(isCredential)
+    ) {
+      // The operator bound this credential to named origins. A later hop
+      // has already dropped it at the origin change, so this is the first
+      // request: refuse it rather than send the credential elsewhere.
+      throw new HttpPermissionError(
+        `the auth profile's credential may be sent only to ${[...o.credentialOrigins].sort(byString).join(", ")} (${AUTH_ENVS_KEY}); ${currentOrigin} is not one of them`,
+      );
+    }
+    return assertNotSsrf(current.hostname);
+  };
+
+  /** The status of the answer whose Location led to this hop, if any. */
+  let redirectStatus: number | undefined;
+
+  for (let hop = 0; ; hop++) {
+    let pinnedIp: string;
+    try {
+      pinnedIp = await gateHop();
+    } catch (err) {
+      // Everything the gate refuses is a refusal, not a fact about the
+      // endpoint; a name that does not resolve is the one exception.
+      if (err instanceof HttpPermissionError && !(err instanceof HttpUnresolvedError)) {
+        throw new HttpRefusedError(err.message, redirectStatus);
+      }
+      throw err;
+    }
 
     const init: RequestInit = {
       method,
@@ -884,16 +1209,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
         }
       }
     }
-    // RFC 9110 §15.4.4 and §15.4.3: a 303 always becomes a GET, and 301/302
-    // after a non-GET have meant GET in every deployed client since Netscape.
-    // Replaying a POST body at each hop is not what a server asking for a
-    // redirect means, and it re-sends the request payload to an origin that
-    // did not receive it the first time.
-    if (
-      (res.status === 303 || res.status === 301 || res.status === 302) &&
-      method !== "GET" &&
-      method !== "HEAD"
-    ) {
+    // See becomesGet: 303 always, 301/302 only after a POST.
+    if (becomesGet(res.status, method)) {
       method = "GET";
       body = undefined;
       // Whatever casing the caller wrote: there is no body to describe now.
@@ -904,12 +1221,13 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     await discard(res);
     redirects.push(next.toString());
+    redirectStatus = res.status;
     current = next;
     currentOrigin = nextOrigin;
   }
 }
 
-function canonicalizeOriginOf(url: URL): string {
+export function canonicalizeOriginOf(url: URL): string {
   try {
     return canonicalizeOrigin(url.toString());
   } catch {
@@ -930,62 +1248,133 @@ export type CappedBody = {
   readonly bytes: number;
   /** True when the cap cut the read short; `text` is the prefix that fit. */
   readonly truncated: boolean;
+  /**
+   * A `Content-Encoding` label that names no coding (`none`, `utf-8`): the
+   * body was read as it arrived rather than decoded. Null otherwise.
+   */
+  readonly undecodedEncoding: string | null;
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the
- * cap is passed so a hostile server cannot pin memory.
+ * Drain a body with a hard cap on its DECODED size: the body arrives raw
+ * (see `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in
+ * small steps, and the decoder stops once `maxBytes` exist, so a hostile
+ * server cannot pin memory with a compressed reply.
+ *
+ * `secrets` are the call's credential values. When the cap cuts the body,
+ * the cut can fall inside an echoed credential, and what is left at the end
+ * is a prefix no whole-form redaction matches (C050): it is trimmed here.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  const raw = await readBytesCapped(res, maxBytes);
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+  secrets: readonly SecretValue[] = [],
+): Promise<CappedBody> {
+  const raw = await readBytesCapped(res, maxBytes, signal);
   return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(raw.bytes),
+    text: raw.truncated && secrets.length > 0 ? trimSecretTail(raw.text, secrets) : raw.text,
     bytes: raw.bytes.byteLength,
     truncated: raw.truncated,
+    undecodedEncoding: raw.undecodedEncoding,
   };
 }
 
 export async function readBytesCapped(
   res: Response,
   maxBytes: number,
-): Promise<{ bytes: Uint8Array; truncated: boolean }> {
-  if (res.body === null) return { bytes: new Uint8Array(0), truncated: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
+  signal?: AbortSignal,
+): Promise<{
+  bytes: Uint8Array;
+  text: string;
+  truncated: boolean;
+  undecodedEncoding: string | null;
+}> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!read.ok) throw bodyFailure(read);
+  return {
+    bytes: read.bytes,
+    text: read.text,
+    truncated: read.truncated,
+    undecodedEncoding: read.undecodedEncoding,
+  };
+}
+
+/**
+ * Why a body could not be read, as the error the tools already report. It
+ * quotes nothing the server sent. An abort is an `AbortError`, so
+ * `describeFailure` reports the deadline or the abort as it does for the
+ * request itself.
+ */
+export function bodyFailure(failure: ResponseReadFailure): Error {
+  switch (failure.code) {
+    case "aborted":
+    case "stalled": {
+      const err = new Error("the read was aborted before the body ended");
+      err.name = "AbortError";
+      return err;
+    }
+    case "unsupported-encoding":
+      return new HttpPermissionError(
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      return new HttpPermissionError(
+        "the body is labelled as compressed but could not be decoded, so it was not read",
+      );
+    default:
+      return new HttpPermissionError("the body could not be read to the end");
+  }
+}
+
+/**
+ * One GET through this package's gate, for another package that must fetch a
+ * URL it did not choose (a token's metadata document) and has no HTTP client
+ * of its own: the allow-list is the caller's operator list, the SSRF gate and
+ * userinfo refusal run as for every tool here, a redirect is refused rather
+ * than followed, and the body is capped. `truncated` says the cap was hit.
+ */
+export async function guardedGet(
+  url: string,
+  opts: {
+    readonly allowedOrigins: ReadonlyArray<string>;
+    readonly maxBytes: number;
+    readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
+  },
+): Promise<{
+  readonly status: number;
+  readonly contentType: string | null;
+  readonly bytes: Uint8Array;
+  readonly truncated: boolean;
+}> {
+  const parsed = parseUrl(url);
+  if (typeof parsed === "string") throw new HttpPermissionError(parsed);
+  const cfg = buildHttpConfig({ allowed_origins: opts.allowedOrigins });
+  const deadline = startDeadline(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.signal);
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        chunks.push(value.subarray(0, maxBytes - total));
-        total = maxBytes;
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
+    const { res } = await openRequest({
+      url: parsed,
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: deadline.signal,
+      cfg,
+      redirect: "error",
+    });
+    const body = await readBytesCapped(res, opts.maxBytes, deadline.signal);
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      bytes: body.bytes,
+      truncated: body.truncated,
+    };
   } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
+    deadline.cancel();
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return { bytes: merged, truncated };
 }
 
 /** A URL the caller supplied, or a readable refusal. */
@@ -1004,10 +1393,28 @@ export function parseUrl(raw: string): URL | string {
  */
 export function describeFailure(err: unknown, deadline?: Deadline): string {
   if (err instanceof HttpPermissionError) return err.message;
-  if (deadline?.expired() === true) return "deadline elapsed before the request completed";
+  // The cause decides, not the clock: see DeadlineElapsedError.
+  if (isDeadlineAbort(err, deadline)) return "deadline elapsed before the request completed";
+  const aborted = "the request was aborted before it completed";
+  if (deadline?.signal.aborted === true && err === deadline.signal.reason) return aborted;
   if (err instanceof Error) {
-    if (err.name === "AbortError") return "the request was aborted before it completed";
-    return `${err.name}: ${err.message}`;
+    if (err.name === "AbortError") return aborted;
+    // A real failure that arrived late is still that failure; the clock is
+    // mentioned, because the caller may want a longer deadline as well.
+    const late = deadline?.expired() === true ? " (the deadline had also elapsed)" : "";
+    return `${err.name}: ${err.message}${late}`;
   }
   return String(err);
+}
+
+/**
+ * Whether `err` is what the deadline's own timer did: its abort reason, or an
+ * abort-shaped error (a body reader's AbortError) raised after that timer
+ * fired. Exported for the few callers that report a deadline themselves.
+ */
+export function isDeadlineAbort(err: unknown, deadline?: Deadline): boolean {
+  if (err instanceof DeadlineElapsedError) return true;
+  if (deadline?.timedOut() !== true) return false;
+  if (err === deadline.signal.reason) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 }

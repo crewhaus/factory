@@ -1649,3 +1649,15 @@ describe("ffprobe output", () => {
     expect(() => parseProbeJson("[]")).toThrow(/not an object/);
   });
 });
+
+describe("a colour keyword is looked up in its own table only", () => {
+  test("a prototype member's name is not a colour, and says so", () => {
+    // KEYWORDS["constructor"] read Object, and the error was
+    // "input.trim is not a function" instead of "not a colour".
+    for (const name of ["constructor", "toString", "valueOf", "__proto__", "hasOwnProperty"]) {
+      expect(() => parseColor(name)).toThrow(MediaFormatError);
+      expect(() => parseColor(name)).toThrow(/is not a colour this package reads/);
+    }
+    expect(parseColor("navy")).toEqual(parseColor("#000080"));
+  });
+});

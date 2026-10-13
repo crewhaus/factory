@@ -64,6 +64,10 @@ export const HOST_ONLY_TOOLS: ReadonlyMap<string, string> = new Map([
  * NOTE the durable-memory tools (`Remember`/`Recall`) are edge-safe via a KV
  * binding but are wired from the `memory:` block, not the `tools:` list, so
  * they never reach this gate; they are documented here for completeness.
+ *
+ * `sendMessage` is not here (0.7.1): it sends through a channel adapter only
+ * the channel daemon registers at boot, and a Worker registers none, so every
+ * call it made on the edge failed.
  */
 export const EDGE_SAFE_TOOLS: ReadonlySet<string> = new Set([
   // Network — pure `fetch`.
@@ -71,7 +75,6 @@ export const EDGE_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "webFetch",
   "webSearch",
   // Outbound API via `fetch`.
-  "sendMessage",
   "imageGenerate",
   // Working memory via a KV binding.
   "todoWrite",

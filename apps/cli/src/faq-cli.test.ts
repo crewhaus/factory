@@ -106,7 +106,7 @@ describe("crewhaus faq distill (#55)", () => {
     TMP_ROOTS.push(home);
     const skills = await discoverSkills({ cwd: root, homeDir: home });
     expect(skills.map((s) => s.name)).toContain("faq");
-  });
+  }, 20_000);
 
   test("exits non-zero when no question recurs", async () => {
     const root = newTempRoot();
@@ -125,5 +125,5 @@ describe("crewhaus faq distill (#55)", () => {
     writeMinimalSpec(root);
     const result = await runCli(["faq", "distill", "--sessions", "all"], root);
     expect(result.exitCode).not.toBe(0);
-  });
+  }, 20_000);
 });

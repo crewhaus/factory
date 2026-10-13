@@ -309,7 +309,7 @@ describe("Batch G keys never warn (wired this batch)", () => {
     expect(result.warnings).toEqual([]);
   });
 
-  test("channel expose + plugins produce no warnings", () => {
+  test("channel expose + plugins produce no unwired warning", () => {
     const result = compile(
       [
         "name: c",
@@ -321,6 +321,8 @@ describe("Batch G keys never warn (wired this batch)", () => {
         "plugins: [acme-tools]",
       ].join("\n"),
     );
-    expect(paths(result.warnings)).toEqual([]);
+    // Only the informational note on how a channel daemon treats a plugin it
+    // cannot load (0.7.0 ignored plugins: here); --strict never escalates it.
+    expect(result.warnings.map((w) => w.code)).toEqual(["channel-plugins-at-start"]);
   });
 });

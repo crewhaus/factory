@@ -18,6 +18,7 @@
     "@crewhaus/tool-data": "workspace:*",
     "@crewhaus/tool-datetime": "workspace:*",
     "@crewhaus/tool-money": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {

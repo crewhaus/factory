@@ -16,28 +16,14 @@
  * would answer "nothing here" while the matches sat just past the cap.
  */
 
-const REGEXP_METACHARS = /[.*+?^${}()|[\]\\]/g;
-
-function escapeRe(value: string): string {
-  return value.replace(REGEXP_METACHARS, "\\$&");
-}
-
 /**
  * `**​/**​/` means exactly what `**​/` means — zero or more whole segments —
- * but compiling both of them emits two adjacent `(?:[^/]+/)*` groups, and
- * adjacent groups that can each absorb the same segments are the classic
- * catastrophic-backtracking shape: matching a 24-segment path against a
- * pattern holding twelve of them took over a SECOND here, and every extra
- * `**​/` multiplies it. The patterns are caller-supplied (`exclude`, and
- * `WatchPath`'s `match`), and the matcher runs on the same event loop the
- * watch's own deadline timer lives on, so a pattern like that does not just
- * make the tool slow — it stops the deadline from firing at all.
- *
- * Collapsing the run first is a rewrite, not a restriction: the two patterns
- * accept exactly the same paths, and the collapsed one has nothing to
- * backtrack between.
+ * so a run of them is collapsed to one before matching. It used to matter
+ * because two adjacent RegExp groups that could each absorb the same
+ * segments backtracked catastrophically; the matcher below no longer
+ * backtracks, but the collapse still keeps the table small.
  */
-function collapseDoubleStars(pattern: string): string {
+export function collapseDoubleStars(pattern: string): string {
   let out = pattern;
   // Bounded: every pass removes three characters, so it cannot spin.
   for (let pass = 0; pass < pattern.length; pass += 1) {
@@ -48,66 +34,151 @@ function collapseDoubleStars(pattern: string): string {
   return out;
 }
 
+/** One element of a segment pattern. */
+type Token =
+  | { readonly kind: "star" }
+  | { readonly kind: "any" }
+  | { readonly kind: "char"; readonly ch: string };
+
+type Segment =
+  | { readonly kind: "tokens"; readonly tokens: readonly Token[]; readonly fixed: number }
+  /**
+   * `**` followed by `/`: zero or more whole, non-empty segments. The
+   * LEADING one (the pattern starts with it) may also take one empty segment
+   * before each of them, so `**​/*.test.ts` matches the ABSOLUTE path
+   * `/w/src/a.test.ts`, whose first segment is empty: every path this
+   * package filters is absolute.
+   */
+  | { readonly kind: "globstar"; readonly leading: boolean }
+  /** A trailing `**`: at least one more segment, of anything. */
+  | { readonly kind: "rest" };
+
+const STAR: Token = { kind: "star" };
+const ANY: Token = { kind: "any" };
+
 /**
- * The regular-expression source a glob compiles to.
- *
- * Exported so the SHAPE of the compiled pattern can be asserted directly. A
- * test that measured how long a match takes would be asserting a stopwatch,
- * which this repo does not allow and a loaded CI box would make flake; the
- * number of cross-segment groups is the same fact, stated as a fact.
+ * Split a pattern into segments on `/`. `*` is any run within a segment, `?`
+ * one character (one UTF-16 unit) within it, and every other character is
+ * literal, `[` and `\` included: this package has never had classes or
+ * escapes, and a pattern keeps meaning what it meant.
  */
-export function globRegexSource(rawPattern: string): string {
-  const pattern = collapseDoubleStars(rawPattern);
-  let source = "";
-  let i = 0;
-  while (i < pattern.length) {
-    const char = pattern[i] as string;
-    if (char === "*") {
-      if (pattern[i + 1] === "*") {
-        const atSegmentStart = i === 0 || pattern[i - 1] === "/";
-        const after = i + 2;
-        const atSegmentEnd = after >= pattern.length || pattern[after] === "/";
-        if (atSegmentStart && atSegmentEnd) {
-          if (after < pattern.length) {
-            // A leading `**/` may also swallow the root separator, so that
-            // `**/*.test.ts` matches the ABSOLUTE path `/w/src/a.test.ts`.
-            // Without this the exclude patterns silently matched nothing,
-            // because every path this package filters is absolute.
-            source += i === 0 ? "(?:/?[^/]+/)*" : "(?:[^/]+/)*";
-            i = after + 1; // consume the `/` as part of the group
-            continue;
-          }
-          source += ".*";
-          i = after;
-          continue;
-        }
+function compileSegments(rawPattern: string): Segment[] {
+  const raw = collapseDoubleStars(rawPattern).split("/");
+  const out: Segment[] = [];
+  for (let k = 0; k < raw.length; k++) {
+    const text = raw[k] as string;
+    if (text === "**") {
+      out.push(k === raw.length - 1 ? { kind: "rest" } : { kind: "globstar", leading: k === 0 });
+      continue;
+    }
+    const tokens: Token[] = [];
+    for (const ch of text.split("")) {
+      if (ch === "*") {
+        // `a**b` is `a*b`; one star keeps the walk's backtracking linear.
+        if (tokens[tokens.length - 1]?.kind !== "star") tokens.push(STAR);
+      } else if (ch === "?") {
+        tokens.push(ANY);
+      } else {
+        tokens.push({ kind: "char", ch });
       }
-      source += "[^/]*";
-      i += 1;
-      continue;
     }
-    if (char === "?") {
-      source += "[^/]";
-      i += 1;
-      continue;
-    }
-    source += escapeRe(char);
-    i += 1;
+    out.push({ kind: "tokens", tokens, fixed: tokens.filter((t) => t.kind !== "star").length });
   }
-  return source;
+  return out;
+}
+
+/**
+ * One path segment against one token list: the two-pointer wildcard walk,
+ * which only ever returns to the LAST star, so it runs in
+ * O(tokens × characters) where a RegExp tried every split between stars.
+ */
+function matchSegment(
+  seg: { readonly tokens: readonly Token[]; readonly fixed: number },
+  s: string,
+): boolean {
+  if (seg.fixed > s.length) return false;
+  const tokens = seg.tokens;
+  let p = 0;
+  let i = 0;
+  let starP = -1;
+  let starI = 0;
+  while (i < s.length) {
+    const token = tokens[p];
+    if (
+      token !== undefined &&
+      token.kind !== "star" &&
+      (token.kind === "any" || token.ch === s[i])
+    ) {
+      p += 1;
+      i += 1;
+    } else if (token?.kind === "star") {
+      starP = p;
+      starI = i;
+      p += 1;
+    } else if (starP !== -1) {
+      p = starP + 1;
+      starI += 1;
+      i = starI;
+    } else {
+      return false;
+    }
+  }
+  while (tokens[p]?.kind === "star") p += 1;
+  return p === tokens.length;
+}
+
+/**
+ * A pattern's segments against a path's, as a table: `row[si]` answers "do
+ * pattern segments pi.. match path segments si..", filled from the end, one
+ * row per pattern segment. O(pattern segments × path segments) segment
+ * matches, whatever the pattern.
+ */
+function matchSegments(segments: readonly Segment[], parts: readonly string[]): boolean {
+  const n = parts.length;
+  let next: boolean[] = new Array<boolean>(n + 2).fill(false);
+  next[n] = true;
+  for (let pi = segments.length - 1; pi >= 0; pi--) {
+    const seg = segments[pi] as Segment;
+    const row: boolean[] = new Array<boolean>(n + 2).fill(false);
+    for (let si = n; si >= 0; si--) {
+      if (seg.kind === "rest") {
+        row[si] = si < n;
+      } else if (seg.kind === "globstar") {
+        const here = parts[si];
+        row[si] =
+          (next[si] as boolean) ||
+          (here !== undefined && here !== "" && (row[si + 1] as boolean)) ||
+          (seg.leading &&
+            here === "" &&
+            parts[si + 1] !== undefined &&
+            parts[si + 1] !== "" &&
+            (row[si + 2] as boolean));
+      } else {
+        row[si] = si < n && (next[si + 1] as boolean) && matchSegment(seg, parts[si] as string);
+      }
+    }
+    next = row;
+  }
+  return next[0] as boolean;
 }
 
 /**
  * Compile a slash-separated glob to a whole-path matcher.
  *
  * `*` matches within one segment, `**` spans segments, `?` is one character.
- * Written out here rather than imported: `@crewhaus/tool-fsx`'s matcher is
- * internal to that package (not on its public entry), and `Bun.Glob` would
- * make the semantics depend on a runtime rather than on this file.
+ * It is not a RegExp: each `*` used to compile to `[^/]*`, and a backtracking
+ * engine tries every way of dividing a segment between the stars, so
+ * `*a*a*a*a*a*a*a*a*a*a*z` against a long file name took minutes,
+ * synchronously, where neither WatchPath's deadline nor the turn's abort
+ * signal can reach it (C162). The patterns are caller-supplied: WatchPath's
+ * `match`, run per event, and OsIndexSearch's `exclude`, run per hit. Here a
+ * pattern is matched segment by segment with the two-pointer walk, so the
+ * cost is bounded by the product of the lengths. `lib.test.ts` holds the old
+ * RegExp translation as an oracle and checks the two agree.
  */
 export function compileGlob(pattern: string): (path: string) => boolean {
-  const re = new RegExp(`^${globRegexSource(pattern)}$`);
-  return (path: string): boolean => re.test(path);
+  const segments = compileSegments(pattern);
+  return (path: string): boolean => matchSegments(segments, path.split("/"));
 }
 
 /** True when `candidate` is `root` itself or lives beneath it. */

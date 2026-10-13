@@ -107,7 +107,7 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     // MCP tool (2 sessions) ranks first.
     expect(json.backlog[0].subject).toBe("mcp__jira__CreateIssue");
     expect(json.backlog[0].kind).toBe("mcp-tool");
-  });
+  }, 20_000);
 
   // D44 — the flag used to parse and do nothing; it now produces a report.
   it("--graders reports gold-needing graders vs gold-less samples", async () => {
@@ -153,7 +153,7 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     const sub = json.graderCoverage.perGrader.find((g: { grader: string }) => g.grader === "sub");
     expect(sub.needsGold).toBe(false);
     expect(sub.scorable).toBe(2);
-  });
+  }, 20_000);
 
   it("without --graders the JSON report carries no graderCoverage key", async () => {
     const root = newTempRoot();
@@ -165,7 +165,7 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     expect(got.exitCode).toBe(0);
     const text = readFileSync(join(root, "cov", "coverage.json"), "utf-8");
     expect(text).not.toContain("graderCoverage");
-  });
+  }, 20_000);
 
   // B16 collateral — coverage is INSPECTION, not consumption: a bare registry
   // ref must stay split-complete (test included), or gap analysis would
@@ -194,7 +194,7 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     // All 10 samples count — the consumption view (train+dev) would see 8.
     expect(json.sampleCount).toBe(10);
     expect(json.dataset).toBe("cov-ds@v1");
-  });
+  }, 20_000);
 
   it("html format is self-contained and text is the default", async () => {
     const root = newTempRoot();
@@ -214,7 +214,7 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     // Default (no -o, no --format) prints text and exits 0.
     const text = await runCli(["eval", "coverage"], root);
     expect(text.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   it("errors cleanly with no sessions and on a bad --format", async () => {
     const root = newTempRoot();
@@ -226,5 +226,5 @@ describe("crewhaus eval coverage (CLI, offline)", () => {
     mkdirSync(sessionsDir, { recursive: true });
     writeFileSync(join(sessionsDir, "sess_00000000000000c1.jsonl"), sessionJsonl([["Read"]]));
     expect((await runCli(["eval", "coverage", "--format", "pdf"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });

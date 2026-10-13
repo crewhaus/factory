@@ -27,6 +27,7 @@
  */
 import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
+import { ensureDirContained } from "@crewhaus/tool-safety/fs";
 import { type PathFacts, hostIdentity, now, probePath } from "../host";
 import {
   candidateNames,
@@ -107,6 +108,8 @@ export function resolveTrashLocation(
   }
   const homeDevice = deviceOf(home);
   if (homeDevice !== undefined && homeDevice === targetDevice) {
+    const problem = trashDirProblem(home, identity.uid, false);
+    if (problem !== undefined) return { ok: false, reason: problem };
     return { ok: true, trashDir: home };
   }
 
@@ -135,19 +138,55 @@ export function resolveTrashLocation(
     isSymlink: parentFacts?.isSymlink ?? false,
     mode: parentFacts?.mode ?? 0,
   });
-  if (check.usable) return { ok: true, trashDir: shared, topdir };
+  // `$topdir/.Trash/$uid` is used only when it, and the `files` and `info`
+  // inside it, are real directories of this user's (or not there yet).
+  // Otherwise the spec's next choice, as GLib does: `.Trash-$uid`.
+  if (check.usable && trashDirProblem(shared, identity.uid, true) === undefined) {
+    return { ok: true, trashDir: shared, topdir };
+  }
 
   // `$topdir/.Trash-$uid` may be created by this call, but only if the top
   // directory is writable — which is discovered by trying, not guessed at.
   const fallback = userTopdirTrash(topdir, identity.uid);
-  const fallbackFacts = probePath(fallback);
-  if (fallbackFacts?.isSymlink === true) {
-    return {
-      ok: false,
-      reason: `${fallback} is a symbolic link, and a trash directory that is a link could point anywhere`,
-    };
-  }
+  const problem = trashDirProblem(fallback, identity.uid, true);
+  if (problem !== undefined) return { ok: false, reason: problem };
   return { ok: true, trashDir: fallback, topdir };
+}
+
+/**
+ * Why a trash directory cannot be used, or undefined when it can.
+ *
+ * Every component this package writes through must be a real directory
+ * owned by the user: `files/` and `info/` always, and the trash directory
+ * itself for a top-directory trash (the home trash may sit under a linked
+ * `~/.local/share`, which is the user's own doing). On 0.7.0 only `.Trash`
+ * and `.Trash-$uid` were checked, so a checked-out repository's
+ * `.Trash-1000/files -> ~` moved the file out of the workspace, and with
+ * a `.bashrc` waiting there, replaced it. A component that does not exist
+ * yet passes: it is created by this call, then checked again.
+ */
+export function trashDirProblem(
+  trashDir: string,
+  uid: number | undefined,
+  includeSelf: boolean,
+): string | undefined {
+  const components = [
+    ...(includeSelf ? [trashDir] : []),
+    path.join(trashDir, "files"),
+    path.join(trashDir, "info"),
+  ];
+  for (const dir of components) {
+    const facts = probePath(dir);
+    if (facts === undefined) continue;
+    if (facts.isSymlink) {
+      return `${dir} is a symbolic link, and a trash directory that is a link could point anywhere`;
+    }
+    if (!facts.isDirectory) return `${dir} is not a directory, so it cannot be a trash`;
+    if (uid !== undefined && facts.uid !== uid) {
+      return `${dir} belongs to another user (uid ${facts.uid}), so it is not this user's trash`;
+    }
+  }
+  return undefined;
 }
 
 /** The device a path is on, falling back to its nearest existing ancestor. */
@@ -380,41 +419,86 @@ export function applyEntry(entry: PlannedEntry): AppliedEntry {
   const trashDir = entry.trashDir as string;
   const infoDir = path.join(trashDir, "info");
   const filesDir = path.join(trashDir, "files");
-  try {
-    // 0700 is the spec's mode: a trash is private, and a world-readable one
-    // leaks the names of everything a user ever deleted.
-    mkdirSync(infoDir, { recursive: true, mode: 0o700 });
-    mkdirSync(filesDir, { recursive: true, mode: 0o700 });
-  } catch (err) {
-    return { ...entry, status: "refused", trashed: false, reason: describe(err) };
+  const uid = hostIdentity().uid;
+  const topdirTrash = entry.topdir !== undefined;
+  const refuse = (reason: string): AppliedEntry => ({
+    ...entry,
+    status: "refused",
+    trashed: false,
+    reason,
+  });
+
+  // Every directory is created one component at a time, and a symlink on
+  // the way is refused rather than followed (`ensureDirContained` with
+  // `symlinks: "refuse"`); 0.7.0's `mkdir -p` followed `.Trash-1000/files`
+  // wherever it pointed. Only the home trash's own ancestors
+  // (`~/.local/share`) are made with `mkdir -p`: they are the user's, and a
+  // linked `~/.local` is an ordinary setup. 0700 is the spec's mode: a trash
+  // is private, and a world-readable one leaks the name of everything a
+  // user ever deleted.
+  let root: string;
+  let prefix: string;
+  if (topdirTrash) {
+    root = entry.topdir as string;
+    prefix = path.relative(root, trashDir);
+  } else {
+    try {
+      mkdirSync(trashDir, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      return refuse(describe(err));
+    }
+    root = trashDir;
+    prefix = "";
   }
+  for (const leaf of ["info", "files"]) {
+    const made = ensureDirContained(root, prefix === "" ? leaf : path.join(prefix, leaf), {
+      symlinks: "refuse",
+      mode: 0o700,
+    });
+    if (!made.ok) return refuse(made.reason);
+  }
+  const problem = trashDirProblem(trashDir, uid, topdirTrash);
+  if (problem !== undefined) return refuse(problem);
 
   const basename = path.basename(entry.abs);
   let claimedInfo: string | undefined;
   let claimedName: string | undefined;
   for (const candidate of candidateNames(basename)) {
+    // A name is free only when BOTH halves are: `rename` replaces an
+    // existing `files/<name>`, so claiming by the info file alone (0.7.0)
+    // overwrote an orphan there, and disagreed with the dry run, which
+    // checks both.
+    if (probePath(path.join(filesDir, candidate)) !== undefined) continue;
     const infoPath = path.join(infoDir, `${candidate}.trashinfo`);
     try {
       // `wx` is O_CREAT|O_EXCL: the claim is atomic, so two processes
       // trashing the same name cannot both win and overwrite one another.
       writeFileSync(infoPath, entry.infoBytes as string, { flag: "wx", mode: 0o600 });
-      claimedInfo = infoPath;
-      claimedName = candidate;
-      break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
-      return { ...entry, status: "refused", trashed: false, reason: describe(err) };
+      return refuse(describe(err));
     }
+    if (probePath(path.join(filesDir, candidate)) !== undefined) {
+      // Something took the file's half of the name meanwhile.
+      removeClaimedInfoFile(infoPath, trashDir);
+      continue;
+    }
+    claimedInfo = infoPath;
+    claimedName = candidate;
+    break;
   }
   if (claimedInfo === undefined || claimedName === undefined) {
-    return {
-      ...entry,
-      status: "refused",
-      trashed: false,
-      reason: "the trash already holds too many files with this name",
-    };
+    return refuse("the trash already holds too many files with this name");
   }
 
+  // Checked once more immediately before the move. Node has no renameat, so
+  // a swap in the instant between this check and the rename is not
+  // prevented; it would have to race a trash the user owns.
+  const late = trashDirProblem(trashDir, uid, topdirTrash);
+  if (late !== undefined) {
+    removeClaimedInfoFile(claimedInfo, trashDir);
+    return refuse(late);
+  }
   const destination = path.join(filesDir, claimedName);
   try {
     rename(entry.abs, destination);
@@ -422,15 +506,11 @@ export function applyEntry(entry: PlannedEntry): AppliedEntry {
     const code = (err as NodeJS.ErrnoException).code;
     removeClaimedInfoFile(claimedInfo, trashDir);
     if (code === "EXDEV") {
-      return {
-        ...entry,
-        status: "refused",
-        trashed: false,
-        reason:
-          "it turned out to be on a different filesystem from its trash, and a trash is a move, never a copy — nothing was deleted",
-      };
+      return refuse(
+        "it turned out to be on a different filesystem from its trash, and a trash is a move, never a copy — nothing was deleted",
+      );
     }
-    return { ...entry, status: "refused", trashed: false, reason: describe(err) };
+    return refuse(describe(err));
   }
 
   return {

@@ -308,3 +308,43 @@ describe("T8 — relative dangling-link base", () => {
     }
   });
 });
+
+describe("ReadImage reads only regular files (C074)", () => {
+  test.if(process.platform !== "win32")(
+    "a FIFO named .png is refused before it is opened, so the call returns",
+    async () => {
+      const fifo = join(tmp, "pic.png");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      // A writer blocked in open() until someone opens the FIFO to read. A
+      // regression would be unblocked by it (and fail) instead of hanging.
+      const writer = Bun.spawn(["sh", "-c", `cat '${join(tmp, "src.png")}' > '${fifo}'`], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      writeFileSync(join(tmp, "src.png"), TINY_PNG);
+      try {
+        await Bun.sleep(100);
+        await expect(readImage.execute({ path: "pic.png" })).rejects.toThrow(
+          /"pic\.png" is a fifo, not a regular file; it was not opened/,
+        );
+        await Bun.sleep(200);
+        // Nobody opened the FIFO: the writer is still waiting.
+        expect(writer.exitCode).toBeNull();
+      } finally {
+        writer.kill("SIGKILL");
+        await writer.exited;
+      }
+    },
+    10_000,
+  );
+
+  test("a dangling link's target is walked as the kernel walks it (C068)", async () => {
+    // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's parent.
+    mkdirSync(join(tmp, "a"));
+    symlinkSync("..", join(tmp, "a", "y"));
+    symlinkSync("a/y/../nowhere.png", join(tmp, "evil.png"));
+    await expect(readImage.execute({ path: "evil.png" })).rejects.toThrow(
+      /escapes the workspace root/,
+    );
+  });
+});

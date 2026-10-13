@@ -3,6 +3,7 @@
  * reads the filesystem or looks at a clock, so the behaviour that these
  * back can be unit-tested without a world.
  */
+import { compileUserRegex } from "@crewhaus/tool-safety/regex";
 
 export type CappedText = {
   readonly text: string;
@@ -48,8 +49,18 @@ export function formatArgv(argv: readonly string[]): string {
 /**
  * Compile a caller-supplied regular expression, refusing the shapes behind
  * catastrophic backtracking. The pattern reaches us from a model, and a
- * waiting tool applies it repeatedly to a growing buffer, so an exponential
- * pattern would pin a core for the whole deadline.
+ * waiting tool applies it repeatedly to a growing buffer.
+ *
+ * The screen is @crewhaus/tool-safety's `compileUserRegex`, the one every
+ * tool shares (C079). 0.7.0 kept a scanner here that counted only `*` and
+ * `+` inside a group, so `(\w{1,})*$`, `(\w{1,64})*$` and `(\w\w?)*$`
+ * passed it and JavaScriptCore then gave up on them — a false "no match"
+ * after pinning the event loop. The shared screen models `{n,m}` and `?`
+ * too, accepts a repetition only when each pass ends in exactly one place,
+ * and is fuzzed; it also admits safe alternations the old scanner refused
+ * wholesale, such as `(a|b)*`. WaitForOutput still runs the match in the
+ * regex worker under a deadline: the screen is the second layer, not the
+ * first.
  */
 export function compileSafePattern(
   source: string,
@@ -57,97 +68,22 @@ export function compileSafePattern(
 ):
   | { readonly ok: true; readonly regex: RegExp }
   | { readonly ok: false; readonly message: string } {
-  if (source.length > 1_000) {
-    return { ok: false, message: `pattern is ${source.length} characters, over the 1000 limit` };
+  const compiled = compileUserRegex(source, flags);
+  if (compiled.ok) return compiled;
+  switch (compiled.code) {
+    case "nested-quantifier":
+      return {
+        ok: false,
+        message: `pattern nests one quantifier inside another, which can backtrack exponentially: ${compiled.reason}`,
+      };
+    case "overlapping-alternation":
+      return {
+        ok: false,
+        message: `pattern repeats an alternation whose branches can match the same text, e.g. (a|a)*, which can backtrack exponentially: ${compiled.reason}`,
+      };
+    case "invalid-syntax":
+      return { ok: false, message: `invalid regex: ${compiled.reason}` };
+    default:
+      return { ok: false, message: compiled.reason };
   }
-  const risk = backtrackingRisk(source);
-  if (risk === "nested-quantifier") {
-    return {
-      ok: false,
-      message: "pattern nests one quantifier inside another, which can backtrack exponentially",
-    };
-  }
-  if (risk === "quantified-alternation") {
-    return {
-      ok: false,
-      message:
-        "pattern quantifies a group containing an alternation, e.g. (a|a)*, which can backtrack exponentially — quantify a character class instead",
-    };
-  }
-  try {
-    return { ok: true, regex: new RegExp(source, flags) };
-  } catch (err) {
-    return { ok: false, message: `invalid regex: ${(err as Error).message}` };
-  }
-}
-
-/**
- * The two shapes that make a regex blow up, both found in one scan.
- *
- * "nested-quantifier" is star height ≥ 2 — `(a+)+`, `(\s*\w)*`. "quantified-
- * alternation" is a quantified group whose branches can match the same text —
- * `(a|a)*`, `(a|ab)*` — which backtracks just as badly while its star height
- * is only 1. Deciding whether two branches really overlap is not something a
- * scanner can do, so EVERY quantified group containing a `|` is refused.
- *
- * That over-refuses `(a|b)*`, and it is worth it: this matters because
- * `WaitForOutput`'s deadline bounds its POLL LOOP, not a single `exec` call.
- * One catastrophic match against a process's output buffer pins a core for
- * longer than the deadline, longer than the turn, longer than the age of the
- * universe — measurably, `(a|a)*$` against 41 characters already takes ~750ms
- * and doubles with each one after that. A pattern that waits for a line
- * — `Listening on (\d+)`, `(ready|listening)` — is unaffected, because the
- * group is not quantified.
- */
-type BacktrackingRisk = "none" | "nested-quantifier" | "quantified-alternation";
-
-function backtrackingRisk(source: string): BacktrackingRisk {
-  let depth = 0;
-  let nested = false;
-  let quantifiedAlternation = false;
-  const quantifiedAt: boolean[] = [];
-  const alternationAt: boolean[] = [];
-  for (let i = 0; i < source.length; i++) {
-    const ch = source[i];
-    if (ch === "\\") {
-      i++;
-      continue;
-    }
-    if (ch === "[") {
-      while (i < source.length && source[i] !== "]") {
-        if (source[i] === "\\") i++;
-        i++;
-      }
-      continue;
-    }
-    if (ch === "(") {
-      depth++;
-      quantifiedAt[depth] = false;
-      alternationAt[depth] = false;
-      continue;
-    }
-    if (ch === "|") {
-      if (depth > 0) alternationAt[depth] = true;
-      continue;
-    }
-    if (ch === ")") {
-      const next = source[i + 1];
-      if (next === "*" || next === "+" || next === "{" || next === "?") {
-        // This group is itself quantified. `?` cannot repeat, so it only
-        // carries an inner quantifier outward; `*`, `+` and `{n,}` repeat,
-        // which is what turns an overlapping alternation catastrophic.
-        if (quantifiedAt[depth] === true && next !== "?") nested = true;
-        if (alternationAt[depth] === true && next !== "?") quantifiedAlternation = true;
-        if (depth > 1) quantifiedAt[depth - 1] = true;
-      }
-      depth = Math.max(0, depth - 1);
-      continue;
-    }
-    if (ch === "*" || ch === "+") {
-      if (depth > 0) quantifiedAt[depth] = true;
-    }
-  }
-  if (nested) return "nested-quantifier";
-  if (quantifiedAlternation) return "quantified-alternation";
-  return "none";
 }

@@ -28,6 +28,7 @@
 
 import type { StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { GenerateContentResponse } from "@google/genai";
+import { rememberGeminiCallId } from "./call-ids.js";
 
 type OpenBlock = { readonly kind: "text" | "thinking"; readonly index: number };
 
@@ -36,6 +37,14 @@ export async function* translateGeminiStream(
 ): AsyncIterable<StreamEvent> {
   let messageStarted = false;
   let nextBlockIndex = 0;
+  // Block indices restart at 0 on every response, so an id built from the
+  // index alone repeats in every turn whose first call is to the same
+  // function (`gemini_Bash_0`), and a run's tool results collide under it.
+  // A per-stream nonce makes a synthesised id unique within a run. It is
+  // fixed-width DIGITS so `<nonce><index>` never reads as another
+  // (nonce, index) pair and translate.ts's `gemini_<name>_<digits>` parse
+  // still recovers the function name (names may contain `_`).
+  const idNonce = String(crypto.getRandomValues(new Uint32Array(1))[0]).padStart(10, "0");
   let openBlock: OpenBlock | undefined;
   let stopReason: string | undefined;
   let sawFunctionCall = false;
@@ -132,11 +141,15 @@ export async function* translateGeminiStream(
           openBlock = undefined;
         }
         const idx = nextBlockIndex++;
-        // Gemini does not provide tool-call ids. Synthesise a stable
-        // one from the function name + index so subsequent
-        // tool_result messages can correlate.
+        // The tool_use id is synthesised from the function name, this
+        // stream's nonce and the index, so tool_result messages correlate,
+        // no two calls in a run share an id, and an orphaned result can
+        // still be named. An id Gemini sends is kept beside it (call-ids.ts)
+        // and goes back on the functionResponse.
         const fnName = part.functionCall.name ?? "";
-        const id = `gemini_${fnName}_${idx}`;
+        const apiId = part.functionCall.id;
+        const id = `gemini_${fnName}_${idNonce}${idx}`;
+        if (typeof apiId === "string" && apiId.length > 0) rememberGeminiCallId(id, apiId);
         yield {
           kind: "content_block_start",
           index: idx,

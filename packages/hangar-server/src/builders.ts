@@ -49,6 +49,7 @@ import { readTextCapped } from "./jsonl";
 import { type M3Context, type M3Handler, requireTypedConfirm } from "./m3";
 import { maskSpecYaml, maskText } from "./mask";
 import { commitSpecEdits, previewSpecEdits, readSpecFile, requireWholeSpec } from "./spec-edit";
+import { keyValueParts } from "./spec-lines";
 
 const SPEC_FILE = "crewhaus.yaml";
 const GRADERS_PATH = ["eval", "graders.yaml"] as const;
@@ -598,6 +599,9 @@ type ScannedServer = McpServerRow & { readonly env: readonly ScannedEnv[] };
  * A parse would refuse a spec that does not validate — which is exactly when
  * an operator opens this tab — so the connector list comes from the text.
  * Values are read ONLY to lint them; nothing but names reaches a payload.
+ * Each `key: value` line is read by a scan (`keyValueParts`, spec-lines.ts):
+ * `/^(\s*)([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:\s*(.*)$/` was quadratic in a run
+ * of spaces on a line holding a U+2028 or a lone `\r`.
  */
 export function scanMcpServers(yamlText: string): ScannedServer[] {
   const lines = yamlText.split("\n").map((l) => l.replace(/\t/g, "  "));
@@ -641,11 +645,11 @@ export function scanMcpServers(yamlText: string): ScannedServer[] {
       blockIndent = null;
       continue;
     }
-    const entry = line.match(/^(\s*)([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:\s*(.*)$/);
+    const entry = keyValueParts(line);
     if (entry === null) continue;
-    const keyIndent = (entry[1] ?? "").length;
-    const key = entry[2] as string;
-    const value = (entry[3] ?? "").trim();
+    const [indentText, key, rawValue] = entry;
+    const keyIndent = indentText.length;
+    const value = rawValue.trim();
     if (server === null || keyIndent <= server.indent) {
       flush();
       server = {

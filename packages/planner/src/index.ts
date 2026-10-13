@@ -22,6 +22,7 @@ import {
 } from "@crewhaus/adapter-anthropic";
 import { CrewhausError } from "@crewhaus/errors";
 import { resolveModel } from "@crewhaus/model-router";
+import { fencedJson } from "./fenced-json";
 
 export class PlannerError extends CrewhausError {
   override readonly name = "PlannerError";
@@ -69,11 +70,9 @@ function userPrompt(goal: string, branchingFactor: number): string {
   return `Goal: ${goal}\n\nBranching factor: ${branchingFactor}\n\nReturn ${branchingFactor} sub-questions in the JSON format above.`;
 }
 
-const FENCE_RE = /```(?:json)?\s*([\s\S]*?)\s*```/;
-
 function extractJson(text: string): string {
-  const m = FENCE_RE.exec(text);
-  if (m?.[1]) return m[1].trim();
+  const fenced = fencedJson(text);
+  if (fenced) return fenced;
   // Permissive fallback — first { ... } block.
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");

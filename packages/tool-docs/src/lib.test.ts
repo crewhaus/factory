@@ -605,6 +605,17 @@ describe("pdf reading", () => {
     expect(map.get(0x43)).toBe("c");
   });
 
+  test("a glyph name is looked up in its own table only", () => {
+    // GLYPH_CODES["constructor"] read Object, and String.fromCodePoint threw
+    // a RangeError out of the page's text extraction.
+    const map = parseToUnicodeCMap(
+      "beginbfchar\n<0041> /constructor\n<0042> /toString\n<0043> /bullet\nendbfchar",
+    );
+    expect(map.has(0x41)).toBe(false);
+    expect(map.has(0x42)).toBe(false);
+    expect(map.get(0x43)).toBe("\u2022");
+  });
+
   test("a bfrange with an explicit list maps each code in turn", () => {
     const map = parseToUnicodeCMap("beginbfrange\n<0030> <0031> [<0058> <0059>]\nendbfrange");
     expect(map.get(0x30)).toBe("X");
@@ -1303,10 +1314,26 @@ describe("pdf page tree", () => {
     src += `${2 + levels} 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n`;
     src += "trailer<</Root 1 0 R>>\n%%EOF\n";
     const doc = parsePdf(utf8(src));
-    const started = Date.now();
-    expect(() => doc.pages()).toThrow(/page tree visits more than/);
-    expect(Date.now() - started).toBeLessThan(5000);
-  });
+    // Counted, not timed. The walk resolves every node it visits, so its
+    // `resolve` calls are its work. The visit budget is maxPages * 4 + 1024
+    // (81 024 at the default limits), and the refusal must name it. Past
+    // eight calls a visit the counter throws, so a walk without the budget
+    // fails here at once instead of taking 2^40 steps.
+    const budget = doc.limits.maxPages * 4 + 1024;
+    const allowed = 8 * budget;
+    const realResolve = doc.resolve;
+    let resolves = 0;
+    doc.resolve = (value) => {
+      resolves += 1;
+      if (resolves > allowed) throw new Error(`the walk resolved more than ${allowed} values`);
+      return realResolve(value);
+    };
+    expect(() => doc.pages()).toThrow(`page tree visits more than ${budget} nodes`);
+    // At least one call a visit: fewer means the walk no longer resolves
+    // through `resolve`, and the count above no longer sees it.
+    expect(resolves).toBeGreaterThanOrEqual(budget);
+    // Slow by construction: 81 024 visits took up to 671 ms on CI.
+  }, 20_000);
 
   test("an ordinary page tree is nowhere near the visit budget", () => {
     const doc = parsePdf(

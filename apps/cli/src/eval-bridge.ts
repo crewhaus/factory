@@ -90,7 +90,7 @@
  *      chat-capability for the history gate.
  */
 import { createHash } from "node:crypto";
-import type { IrFailureTaxonomy, IrNode } from "@crewhaus/ir";
+import type { IrFailureTaxonomy, IrNode, IrPermissionRule, IrToolConfigs } from "@crewhaus/ir";
 
 /** Thrown on an un-projectable shape / malformed bridge options. The CLI entry
  *  file routes it through `die()`; tests assert on `.message`. */
@@ -120,6 +120,12 @@ export type ProjectedEvalIr = {
   /** D37 — the source spec's failure taxonomy, carried into the bundle so
    *  errored samples classify exactly as `crewhaus eval` classifies them. */
   readonly failureTaxonomy?: IrFailureTaxonomy;
+  /** C002 — a single-agent shape's `tool_config`, so the bridge's runner
+   *  registers the same tool settings the compiled agent does. */
+  readonly toolConfigs?: IrToolConfigs;
+  /** C002 — a single-agent shape's permission rules, so the eval grades the
+   *  agent under the spec's allow/deny/ask rules. */
+  readonly permissions?: { readonly rules: readonly IrPermissionRule[] };
 };
 
 /** The per-shape invoker strategy an eval run wraps the shape with. Entry-
@@ -350,6 +356,17 @@ export function projectEvalIr(ir: IrNode, opts: ProjectEvalOptions = {}): Projec
   // emitted bundle classifies errored samples exactly as `crewhaus eval`
   // would (every bridgeable variant carries the optional field).
   const failureTaxonomy = (ir as { failureTaxonomy?: IrFailureTaxonomy }).failureTaxonomy;
+  // C002 — the spec's tool_config and permission rules ride with the agent
+  // block of a single-agent shape. A multi-stage descriptor wires no tools
+  // (its compiled entry runs its own config and rules), so it carries neither.
+  const policy = multistage
+    ? undefined
+    : (ir as {
+        toolConfigs?: IrToolConfigs;
+        permissions?: { rules?: readonly IrPermissionRule[] };
+      });
+  const toolConfigs = policy?.toolConfigs;
+  const permissionRules = policy?.permissions?.rules;
   const projected: ProjectedEvalIr = {
     version: 0,
     name: ir.name,
@@ -367,6 +384,10 @@ export function projectEvalIr(ir: IrNode, opts: ProjectEvalOptions = {}): Projec
     concurrency: opts.concurrency ?? DEFAULT_CONCURRENCY,
     ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
     ...(failureTaxonomy !== undefined && failureTaxonomy.length > 0 ? { failureTaxonomy } : {}),
+    ...(toolConfigs !== undefined && Object.keys(toolConfigs).length > 0 ? { toolConfigs } : {}),
+    ...(permissionRules !== undefined && permissionRules.length > 0
+      ? { permissions: { rules: permissionRules } }
+      : {}),
   };
   return projected;
 }

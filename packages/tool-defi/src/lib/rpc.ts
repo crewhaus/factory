@@ -24,6 +24,8 @@
  */
 import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
+import { parseMulticallMap } from "@crewhaus/tool-onchain";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** A refusal this package chose: a missing endpoint, a bad shape, a write attempt. */
 export class DefiError extends CrewhausError {
@@ -90,12 +92,18 @@ export function buildDefiConfig(input: DefiConfigInput): DefiConfig {
     if (typeof url !== "string") throw new DefiError(`rpc["${chainId}"] must be a URL string`);
     endpoints.set(String(chainId), assertEndpoint(url, chainId));
   }
-  const multicall = new Map<string, string>();
-  for (const [chainId, address] of Object.entries(input.multicall3 ?? {})) {
-    if (typeof address !== "string") {
-      throw new DefiError(`multicall3["${chainId}"] must be an address string`);
-    }
-    multicall.set(String(chainId), address.trim().toLowerCase());
+  // Checked like any address a coder writes: shape, and the EIP-55 checksum
+  // when it carries one. The deployment answers every read in a batch.
+  let multicall: Map<string, string>;
+  try {
+    multicall = new Map(
+      [...parseMulticallMap(input.multicall3, "multicall3")].map(([id, a]) => [
+        id,
+        a.toLowerCase(),
+      ]),
+    );
+  } catch (err) {
+    throw new DefiError((err as Error).message);
   }
   const feeds = new Map<string, FeedPin>();
   for (const [name, row] of Object.entries(input.feeds ?? {})) {
@@ -160,6 +168,13 @@ export function _resetDefiConfig(): void {
  * is looking at the spec, rather than three tool calls into a run.
  */
 function assertEndpoint(raw: string, chainId: string): string {
+  if (/^\$[A-Z_][A-Z0-9_]*$/.test(raw.trim())) {
+    // A bundle and `crewhaus run` read a `$VAR` value from the environment
+    // before this sees it; one arriving here was handed over unresolved.
+    throw new DefiError(
+      `rpc["${chainId}"] is ${raw.trim()}, an environment reference nothing resolved — a compiled bundle and crewhaus run read it from the environment at start; a direct registerDefiConfig caller passes the URL itself`,
+    );
+  }
   let url: URL;
   try {
     url = new URL(raw.trim());
@@ -246,7 +261,14 @@ export function requireEndpoint(config: DefiConfig, chainId: string): string {
 
 export type DefiFetch = (req: Request) => Promise<Response>;
 
-const realFetch: DefiFetch = (req) => globalThis.fetch(req);
+/**
+ * The body is kept RAW (`fetchRaw`, Bun's `decompress: false`): otherwise Bun
+ * inflates a gzip, deflate, br or zstd reply in native code before any
+ * reader sees a byte, so a 260 KB gzip of zeros from an RPC or price
+ * endpoint cost about 1 GB of RSS before the cap fired (C093). `readCapped`
+ * decodes it, under the cap.
+ */
+const realFetch: DefiFetch = (req) => fetchRaw(req);
 let defiFetch: DefiFetch = realFetch;
 
 /**
@@ -301,7 +323,19 @@ export const DEFI_RPC_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 export type TransportFailure = {
-  readonly kind: "transport" | "status" | "rateLimited" | "malformed" | "rpcError" | "refused";
+  /**
+   * `budget`: not sent, because the call's price-provider requests are spent
+   * or this round's share of them is — nothing was asked, so nothing is
+   * known about what the provider publishes.
+   */
+  readonly kind:
+    | "transport"
+    | "status"
+    | "rateLimited"
+    | "malformed"
+    | "rpcError"
+    | "refused"
+    | "budget";
   readonly message: string;
   readonly status?: number;
   /** The JSON-RPC error code, when the node answered with one. */
@@ -313,11 +347,67 @@ export type RpcOutcome<T> =
   | ({ readonly ok: false } & TransportFailure);
 
 export type RpcOptions = {
+  /**
+   * The WHOLE call's signal: a tool opens one deadline per call
+   * ({@link startDeadline}) and hands its signal down, so every request the
+   * call makes shares one budget of time. Once it has aborted, nothing more
+   * is dialled.
+   */
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
   /** Only for the refusal message when a method is off the allow-list. */
   readonly chainId?: string;
+  /** The call's price-provider budget and answers, for {@link getJson}. */
+  readonly providers?: ProviderLedger;
 };
+
+/**
+ * What one tool call may ask the public price providers, and what it already
+ * has.
+ *
+ * `PortfolioValuation` prices up to 256 holdings, and one quote can take up to
+ * fifteen requests (direct, inverted, then crossed through two intermediates).
+ * Unbounded, one call could send thousands of requests to somebody else's
+ * public endpoint — and the same leg (USD/JPY, for every holding crossed
+ * through USD) was fetched again for every holding. The ledger caps the
+ * requests and answers a URL already fetched in this call from its answer.
+ */
+export type ProviderLedger = {
+  readonly limit: number;
+  made: number;
+  /**
+   * How many NEW requests the attempt in progress may still make, when a
+   * caller shares the budget out in rounds (PortfolioValuation: one per
+   * holding per round). Undefined: no per-attempt limit. An answer already
+   * fetched in the call is free — until the attempt is `halted`.
+   */
+  allowance?: number;
+  /**
+   * Set once the attempt in progress has been refused a request: every
+   * later request of that attempt is refused too, cached or not, so a route
+   * it prefers less cannot answer from the cache while a route it prefers
+   * more was not asked.
+   */
+  halted?: boolean;
+  /** How many requests were refused for budget, so a caller can say so. */
+  refused: number;
+  readonly answers: Map<string, Promise<RpcOutcome<unknown>>>;
+};
+
+export function newProviderLedger(limit: number): ProviderLedger {
+  return { limit, made: 0, refused: 0, answers: new Map() };
+}
+
+/** Why nothing was dialled: the call's signal had already fired. */
+function notAsked(signal: AbortSignal, label: string, what: string): TransportFailure {
+  const cancelled = !(signal.reason instanceof DeadlineElapsed);
+  return {
+    kind: "transport",
+    message: `the deadline elapsed before ${label} was asked ${what}: ${
+      cancelled ? "the call was cancelled" : `the call's ${signal.reason.ms}ms were spent`
+    }`,
+  };
+}
 
 /**
  * Issue one JSON-RPC call.
@@ -344,6 +434,9 @@ export async function rpcCall<T = unknown>(
   }
 
   const label = endpointLabel(endpoint);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, method) };
+  }
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
@@ -413,14 +506,20 @@ export async function rpcCall<T = unknown>(
       };
     }
 
-    const text = await readCapped(res, MAX_RESPONSE_BYTES);
-    if (text === null) {
+    const read = await readCapped(res, MAX_RESPONSE_BYTES, deadline.signal);
+    if (!read.ok) {
       return {
         ok: false,
-        kind: "malformed",
-        message: `${label} sent more than ${MAX_RESPONSE_BYTES} bytes for ${method} — refusing to answer from a prefix of it`,
+        kind: read.why === "aborted" ? "transport" : "malformed",
+        message:
+          read.why === "too-large"
+            ? `${label} sent more than ${MAX_RESPONSE_BYTES} bytes for ${method} — refusing to answer from a prefix of it`
+            : read.why === "aborted"
+              ? `the deadline elapsed before ${label} finished answering ${method}`
+              : `${label} answered ${method} with a body that could not be decoded (${read.why})`,
       };
     }
+    const text = read.text;
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -480,6 +579,48 @@ export async function getJson(
   options: RpcOptions & { readonly accept?: string } = {},
 ): Promise<RpcOutcome<unknown>> {
   const label = endpointLabel(url);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, "for a price") };
+  }
+  const ledger = options.providers;
+  if (ledger === undefined) return dialJson(url, label, options);
+  const key = `${options.accept ?? "application/json"} ${url}`;
+  const roundOver = (): RpcOutcome<unknown> => {
+    ledger.halted = true;
+    ledger.refused++;
+    return {
+      ok: false,
+      kind: "budget",
+      message: `${label} was not asked: this call's ${ledger.limit} price-provider requests go out one per holding per round, and too few were left for another round of every holding still unpriced — price fewer distinct assets per call`,
+    };
+  };
+  if (ledger.halted === true) return roundOver();
+  const known = ledger.answers.get(key);
+  if (known !== undefined) return known;
+  if (ledger.made >= ledger.limit) {
+    ledger.halted = true;
+    ledger.refused++;
+    return {
+      ok: false,
+      kind: "budget",
+      message: `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`,
+    };
+  }
+  if (ledger.allowance !== undefined) {
+    if (ledger.allowance <= 0) return roundOver();
+    ledger.allowance--;
+  }
+  ledger.made++;
+  const answer = dialJson(url, label, options);
+  ledger.answers.set(key, answer);
+  return answer;
+}
+
+async function dialJson(
+  url: string,
+  label: string,
+  options: RpcOptions & { readonly accept?: string },
+): Promise<RpcOutcome<unknown>> {
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     let res: Response;
@@ -538,14 +679,20 @@ export async function getJson(
         ),
       };
     }
-    const text = await readCapped(res, MAX_RESPONSE_BYTES);
-    if (text === null) {
+    const read = await readCapped(res, MAX_RESPONSE_BYTES, deadline.signal);
+    if (!read.ok) {
       return {
         ok: false,
-        kind: "malformed",
-        message: `${label} sent more than ${MAX_RESPONSE_BYTES} bytes`,
+        kind: read.why === "aborted" ? "transport" : "malformed",
+        message:
+          read.why === "too-large"
+            ? `${label} sent more than ${MAX_RESPONSE_BYTES} bytes`
+            : read.why === "aborted"
+              ? `the deadline elapsed before ${label} finished answering`
+              : `${label} answered with a body that could not be decoded (${read.why})`,
       };
     }
+    const text = read.text;
     try {
       return { ok: true, value: JSON.parse(text) };
     } catch (err) {
@@ -628,50 +775,49 @@ async function discard(res: Response): Promise<void> {
   }
 }
 
-/** Read a body with a hard byte cap, cancelling the stream once it is passed. */
-async function readCapped(res: Response, maxBytes: number): Promise<string | null> {
-  if (res.body === null) {
-    const text = await res.text();
-    return new TextEncoder().encode(text).byteLength > maxBytes ? null : text;
-  }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let over = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        over = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
-  }
-  if (over) return null;
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+type CappedText =
+  | { readonly ok: true; readonly text: string }
+  | {
+      readonly ok: false;
+      /** `too-large`, `aborted`, or why the body could not be decoded. */
+      readonly why: string;
+    };
+
+/**
+ * Read a body with a hard cap on its DECODED size: the body arrives raw (see
+ * `realFetch`), a gzip, deflate, br or zstd body is decoded here in small
+ * steps, and the decoder stops at the cap. A body past it is refused, never
+ * parsed from a prefix.
+ */
+async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<CappedText> {
+  const read = await readResponseBounded(res, { maxBytes, signal });
+  if (read.ok)
+    return read.truncated ? { ok: false, why: "too-large" } : { ok: true, text: read.text };
+  if (read.code === "aborted" || read.code === "stalled") return { ok: false, why: "aborted" };
+  return {
+    ok: false,
+    why:
+      read.code === "unsupported-encoding"
+        ? "a stack of content-encodings this package cannot decode within its cap"
+        : read.code === "read-error"
+          ? "the connection closed before the body ended"
+          : "it is labelled as compressed but is not",
+  };
 }
 
-export type Deadline = { readonly signal: AbortSignal; cancel(): void };
+export type Deadline = { readonly signal: AbortSignal; readonly ms: number; cancel(): void };
+
+/** The abort reason of a deadline that ran out, as opposed to a cancellation. */
+export class DeadlineElapsed extends Error {
+  override readonly name = "DeadlineElapsed";
+  constructor(readonly ms: number) {
+    super(`deadline of ${ms}ms elapsed`);
+  }
+}
 
 /**
  * A deadline that also honours the runtime's own cancellation. Every call
@@ -680,7 +826,7 @@ export type Deadline = { readonly signal: AbortSignal; cancel(): void };
  */
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(() => controller.abort(new DeadlineElapsed(ms)), ms);
   const onOuter = (): void => controller.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) controller.abort(outer.reason);
@@ -688,6 +834,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   }
   return {
     signal: controller.signal,
+    ms,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);

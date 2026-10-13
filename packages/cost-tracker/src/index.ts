@@ -102,6 +102,17 @@ export {
   type StrongestResolution,
 } from "./candidates";
 
+export {
+  describeToolLimitOverrun,
+  limitIsUnverified,
+  PROVIDER_TOOL_LIMITS,
+  providerToolLimit,
+  toolLimitOverrun,
+  type ProviderToolLimit,
+  type ToolLimitEnv,
+  type ToolLimitOverrun,
+} from "./tool-limits";
+
 export type RunCostSummary = {
   readonly totalUsdMicros: number;
   /** Stable order: providers sorted alphabetically. */

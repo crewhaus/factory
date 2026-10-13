@@ -23,7 +23,7 @@
  * last month's CLI with every status line green.
  */
 import { readFileSync, realpathSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   type BundleFreshness,
   bundleStaleness,
@@ -32,6 +32,8 @@ import {
   resolveCrewhausBin,
 } from "@crewhaus/harness-supervisor";
 import { parseSpec, parseSpecIssues } from "@crewhaus/spec";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { readFileBoundedSync } from "@crewhaus/tool-safety/streams";
 import type { SafePath } from "../paths";
 import { type Loaded, containUnder, fail, isInside, renderPath, renderText } from "./result";
 
@@ -352,6 +354,117 @@ export function resolveCli(harnessRoot: string, workspaceRoot: string): CliResol
     where: bin === local ? "harness-local" : "PATH",
     inWorkspace: isInside(workspaceRoot, real),
     ...(real !== bin ? { real } : {}),
+  };
+}
+
+/** A semver-shaped token, wherever a CLI or a package.json prints it. */
+export const CLI_VERSION_RE = /\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/;
+
+/** Largest package.json read for a version. A real one is a few KB. */
+const MAX_PACKAGE_JSON_BYTES = 256 * 1024;
+/** How many directories above the binary are searched for its package.json. */
+const PACKAGE_JSON_LEVELS = 4;
+
+/** What reading a CLI's version WITHOUT running it found. */
+export type CliVersionReading =
+  | { readonly state: "known"; readonly version: string; readonly source: string }
+  | { readonly state: "unparsed"; readonly reason: string; readonly source: string }
+  | { readonly state: "unknown"; readonly reason: string }
+  /** Outside the workspace, allowed, and no package.json: only running it can tell. */
+  | { readonly state: "needs-exec" };
+
+/**
+ * A harness CLI's version, read from the `package.json` of the `crewhaus`
+ * package it belongs to — never by running it when it is inside the
+ * workspace (C048).
+ *
+ * A binary under the workspace (`<harness>/node_modules/.bin/crewhaus`, or a
+ * PATH entry that leads into the workspace) is code the workspace supplies:
+ * a cloned repository can commit one. `CliVersionPin` is not destructive, so
+ * auto mode runs it unasked, and `--version` would have run that code with
+ * the harness's environment. npm's layout makes running it unnecessary: the
+ * `.bin` entry links to `../crewhaus/<entry>`, so the version is in
+ * `node_modules/crewhaus/package.json`. The package.json is found by walking
+ * up from where the binary really is (at most four directories), then at
+ * `<harness>/node_modules/crewhaus/package.json`; it counts only if its
+ * `name` is `crewhaus`. Each read is contained to the workspace (a leaf
+ * linked out of it is refused, not followed) and bounded.
+ *
+ * A binary OUTSIDE the workspace is the operator's own install. It is read
+ * the same way when `allowExternal` is set, and only when it has no
+ * package.json (a standalone brew/scoop binary) does the caller get
+ * `needs-exec` — the one case where `--version` may still run.
+ */
+export function readCliVersion(
+  cli: CliResolution,
+  harnessRoot: string,
+  workspaceRoot: string,
+  allowExternal: boolean,
+): CliVersionReading {
+  if (!cli.inWorkspace && !allowExternal) {
+    const refused = externalBinRefusal(cli, false);
+    return { state: "unknown", reason: refused?.reason ?? "outside the workspace root" };
+  }
+  const candidates: string[] = [];
+  let dir = dirname(cli.real ?? cli.bin);
+  for (let i = 0; i < PACKAGE_JSON_LEVELS; i++) {
+    candidates.push(join(dir, "package.json"));
+    const up = dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  if (cli.where === "harness-local") {
+    candidates.push(join(harnessRoot, "node_modules", "crewhaus", "package.json"));
+  }
+  const refusals: string[] = [];
+  for (const candidate of [...new Set(candidates)]) {
+    const inside = isInside(workspaceRoot, candidate);
+    // A walk that climbs out of the workspace from an in-workspace binary
+    // stops at the boundary: what is above it is not this binary's package.
+    if (cli.inWorkspace && !inside) continue;
+    const read = inside
+      ? openForReadSync(workspaceRoot, candidate, { maxBytes: MAX_PACKAGE_JSON_BYTES })
+      : readFileBoundedSync(candidate, { maxBytes: MAX_PACKAGE_JSON_BYTES });
+    const shown = inside ? renderPath(relative(workspaceRoot, candidate)) : renderPath(candidate);
+    if (!read.ok) {
+      // Absent is the ordinary case; anything else — a link out of the
+      // workspace, a FIFO, a permission error — is said, and not followed.
+      if (read.code !== "not-found") refusals.push(`${shown}: ${read.reason}`);
+      continue;
+    }
+    if (read.truncated) {
+      refusals.push(`${shown}: larger than ${MAX_PACKAGE_JSON_BYTES} bytes`);
+      continue;
+    }
+    let pkg: unknown;
+    try {
+      pkg = JSON.parse(read.text);
+    } catch {
+      continue; // not a package manifest at all; keep looking
+    }
+    if (
+      typeof pkg !== "object" ||
+      pkg === null ||
+      (pkg as { name?: unknown }).name !== "crewhaus"
+    ) {
+      continue;
+    }
+    const version = (pkg as { version?: unknown }).version;
+    const matched = typeof version === "string" ? CLI_VERSION_RE.exec(version) : null;
+    return matched === null
+      ? {
+          state: "unparsed",
+          reason: `${shown} names crewhaus but its version (${renderText(String(version), 80)}) is not semver-shaped`,
+          source: shown,
+        }
+      : { state: "known", version: matched[0], source: shown };
+  }
+  if (!cli.inWorkspace) return { state: "needs-exec" };
+  return {
+    state: "unknown",
+    reason: `this crewhaus CLI is inside the workspace, so it is not run to ask its version, and no package.json naming crewhaus was found beside it${
+      refusals.length > 0 ? ` (${refusals.join("; ")})` : ""
+    }`,
   };
 }
 

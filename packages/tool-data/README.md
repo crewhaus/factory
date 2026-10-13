@@ -13,7 +13,7 @@ needs it.
 ```yaml
 tools:
   - all-data          # every tool below
-  - -DataConvert      # ...except this one
+  - -dataConvert      # ...except this one
 ```
 
 | Tool | What it does |
@@ -50,6 +50,43 @@ arrives as a real array of objects, because that is how it comes out of the
 previous tool in the chain. Field references inside the record tools are
 dotted paths (`user.team.id`), so nested records work without flattening
 them first.
+
+A key is data whatever it is called. `constructor`, `toString` and
+`__proto__` are ordinary field names: an XML `<constructor>` element, a CSV
+`__proto__` column and a TOML `[__proto__]` table all come back as fields of
+that name, and a path only ever reads a record's own fields, so `exists
+constructor` does not match a record that has no such field. That holds for
+the records a tool is handed too: a `__proto__` field that CsvParse or
+FlattenObject returned reaches CsvWrite, TableQuery or UnflattenObject
+intact. No tool here writes into `Object.prototype`, whatever the document or
+path says.
+
+## Limits
+
+A document may be up to 4,000,000 characters and nest up to 256 levels
+(each `[` or `{` is a level; YAML's own reader stops at 64). Deeper is
+refused before it is parsed: no real document is near it, and every tool
+here does some work per level. A result may be up to 16,000,000 characters
+— four times the input, so a document at the limit can still be
+pretty-printed. It is measured before it is built, because its size is not
+the input's: indentation writes depth x indent on every line, records
+converted from CSV repeat every column name once per row, and a join repeats
+a matched row once per partner. Past it the tool says so and builds nothing;
+`JsonQuery` instead returns the matches that fit, with `truncatedBy:
+"outputChars"`. A JSONPath query visits at most 5,000,000 nodes
+(`truncatedBy: "visits"`), and a JSON Patch may add at most 2,000,000
+values.
+
+A caller's pattern (`TableQuery`'s `matches`, a JSONPath `=~` filter) never
+runs on the caller's thread. Every pattern question is answered first, in
+one `@crewhaus/tool-safety` regex worker under a five-second deadline, and
+the filter then reads the answers. A pattern that backtracks exponentially
+(`(a+)+`) is refused like an invalid one: `invalid filter` or `invalid path`
+(0.7.0 silently matched nothing on an invalid `=~`). A row or node whose
+pattern cannot be run to an answer (the deadline, or the engine giving up,
+which includes a no-match slower than 100 ms) is neither returned nor ruled
+out: it is listed under `undetermined`, so a `none` exclusion never passes
+the row it was written to stop.
 
 ## The parsers are hand-written, so here is exactly what they support
 

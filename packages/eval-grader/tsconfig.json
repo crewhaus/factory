@@ -9,6 +9,7 @@
     { "path": "../errors" },
     { "path": "../eval-dataset" },
     { "path": "../event-log" },
+    { "path": "../tool-catalog" },
     { "path": "../trace-event-bus" }
   ]
 }
