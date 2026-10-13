@@ -35,12 +35,14 @@ const realBoundaryClassifierSnapshot = { ...realBoundaryClassifierNS };
 const flags = {
   readFileFailsFor: undefined as string | undefined,
   classifyFails: false,
-  /** Reject only a text that spans lines: the recalled lines' join. */
-  classifyJoinFails: false,
+  /** Reject only the side-by-side check of the recalled lines. */
+  splitFails: false,
   classifyCalls: 0,
   /** #53 F1 — every classifyBoundary() call's text and origin, so a test can
    *  assert each recalled-memory line was routed through the classifier. */
   classified: [] as Array<{ text: string; origin: unknown }>,
+  /** Every classifySideBySide() call's units and origin. */
+  split: [] as Array<{ units: readonly string[]; origin: unknown }>,
 };
 
 mock.module("node:fs/promises", () => ({
@@ -60,9 +62,6 @@ mock.module("@crewhaus/boundary-classifier", () => ({
     flags.classifyCalls += 1;
     flags.classified.push({ text: typeof text === "string" ? text : "", origin: opts?.origin });
     if (flags.classifyFails) return Promise.reject(new Error("classifier offline"));
-    if (flags.classifyJoinFails && typeof text === "string" && text.includes("\n")) {
-      return Promise.reject(new Error("classifier offline"));
-    }
     // A pass-shaped BoundaryResult, so callers that read the verdict work.
     return Promise.resolve({
       action: "pass",
@@ -72,14 +71,24 @@ mock.module("@crewhaus/boundary-classifier", () => ({
       fromCache: false,
     });
   },
+  // The real helper calls the package's own classifyBoundary, which this mock
+  // cannot reach, so it is mocked too: it records what it was given.
+  classifySideBySide: (units: readonly string[], opts?: { origin?: unknown }) => {
+    flags.split.push({ units: [...units], origin: opts?.origin });
+    if (flags.classifyFails || flags.splitFails) {
+      return Promise.reject(new Error("classifier offline"));
+    }
+    return Promise.resolve({ redacted: new Map(), alone: [], pairs: [] });
+  },
 }));
 
 afterEach(() => {
   flags.readFileFailsFor = undefined;
   flags.classifyFails = false;
-  flags.classifyJoinFails = false;
+  flags.splitFails = false;
   flags.classifyCalls = 0;
   flags.classified = [];
+  flags.split = [];
 });
 
 /**
@@ -195,17 +204,18 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
     // Every line reached classifyBoundary on its own, raw (the classifier sees
     // what the earlier session wrote, before delimiter escaping), at the
     // "memory" origin whose default policy blocks — not the "user" pass tier.
-    // Then the admitted lines once more, joined raw with "\n" (no bullets), so
-    // an injection split across two lines is seen whole.
+    // Then the admitted lines go to the side-by-side check together, raw (no
+    // bullets), so an injection split across two lines is seen whole.
     const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
-    expect(memoryCalls.map((c) => c.text)).toEqual([...lines, lines.join("\n")]);
+    expect(memoryCalls.map((c) => c.text)).toEqual(lines);
+    expect(flags.split).toEqual([{ units: lines, origin: "memory" }]);
   });
 
   // A classifier rejection must never admit a recalled line unclassified: it
   // propagates out of renderRecalledMemory, and both callers inject nothing.
-  // That holds for the joined lines too, after every line has passed alone.
+  // That holds for the side-by-side check too, after every line has passed alone.
   for (const recallMode of ["session-start", "per-turn"] as const) {
-    for (const failing of ["every call", "the joined lines"] as const) {
+    for (const failing of ["every call", "the side-by-side check"] as const) {
       test(`a classifier rejection on ${failing} fails closed: no recalled line reaches the prompt (${recallMode})`, async () => {
         const { runChatLoop } = await import("./index");
         const { adapter } = makeStubAdapter("done");
@@ -219,7 +229,7 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
           },
         };
         if (failing === "every call") flags.classifyFails = true;
-        else flags.classifyJoinFails = true;
+        else flags.splitFails = true;
         await runChatLoop({
           model: "test-model",
           instructions: "be helpful",
@@ -240,9 +250,7 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
         } as any);
         const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
         expect(memoryCalls.length).toBeGreaterThan(0);
-        if (failing === "the joined lines") {
-          expect(memoryCalls.some((c) => c.text.includes("\n"))).toBe(true);
-        }
+        if (failing === "the side-by-side check") expect(flags.split.length).toBe(1);
         expect(system.length).toBeGreaterThan(0);
         expect(system.some((t) => t.includes("<recalled_memory>"))).toBe(false);
       });

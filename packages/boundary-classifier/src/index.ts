@@ -391,3 +391,204 @@ export async function classifyBoundaryRaw(
   const res = await classifyBoundary(text, { ...opts, severity: "warn" });
   return { verdict: res.verdict, origin: res.origin, fromCache: res.fromCache };
 }
+
+/** What {@link classifySideBySide} found among the units. */
+export type SideBySide = {
+  /** The redaction notice for each unit to redact, by index into the units. */
+  readonly redacted: ReadonlyMap<number, string>;
+  /** Each unit that was malicious on its own: its index and rule ids. */
+  readonly alone: ReadonlyArray<{ readonly at: number; readonly rules: ReadonlyArray<string> }>;
+  /** Each neighbouring pair whose join was malicious: its first index and rule ids. */
+  readonly pairs: ReadonlyArray<{ readonly at: number; readonly rules: ReadonlyArray<string> }>;
+  /**
+   * Set when the units of a chunk were all redacted for a verdict no unit or
+   * pair explained: the rule ids, across every such chunk.
+   */
+  readonly unlocalized?: ReadonlyArray<string>;
+};
+
+export type ClassifySideBySideOptions = {
+  /** Where the units came from; drives the default policy, as for classifyBoundary. */
+  readonly origin: TrustOrigin;
+  /** How many classifications run at once. Default 1. */
+  readonly concurrency?: number;
+  /**
+   * The most joined unit text one classification sees, besides the units a
+   * chunk carries over from the one before it. Default 16 KiB: well inside
+   * the classifier's 64 KiB window, so every unit in a chunk is read in full.
+   */
+  readonly chunkChars?: number;
+};
+
+/** Units a chunk carries over from the one before it: a split over three still shares a chunk. */
+const CARRIED_UNITS = 2;
+
+/**
+ * A Layer-3 stand-in that answers nothing: passed per call, it makes a
+ * classification run only the local layers (regex, structural, decoders).
+ */
+const LOCAL_LAYERS_ONLY = async (): Promise<undefined> => undefined;
+
+/**
+ * Pillar 3 — many units that render together (recalled memory lines, wiki
+ * list rows, recalled articles, Recall results), classified one by one AND
+ * side by side, without one model call per unit.
+ *
+ * Side by side, because whoever can plant two units that render next to each
+ * other can split one phrase between them ("… ignore previous" /
+ * "instructions and …"): each half classifies clean, and the model still
+ * reads one sentence across the seam. Classifying the rendered text does not
+ * help, because the renderer's scaffolding between units (a "- " or "  • "
+ * bullet, a "--- " header) breaks the detector's phrase rules without
+ * breaking the sentence for the model. So the caller passes the RAW units.
+ *
+ *  1. The local layers run on each unit alone (cache bypassed, so a
+ *     local-only verdict never stands in for a full one): a unit's encoded
+ *     payload is decoded however many units sit beside it. Malicious there is
+ *     final.
+ *  2. The units that pass are joined with "\n" into chunks of at most
+ *     `chunkChars`, each starting with the last two units of the chunk before,
+ *     so every pair and every run of three neighbours shares a chunk. Each
+ *     chunk is classified in full, Layer 3 included: one model call per chunk.
+ *  3. In a chunk that comes back malicious, one chunk at a time: each unit is
+ *     classified in full on its own and redacted if malicious; the rest are
+ *     joined again, and if that is malicious each neighbouring pair is
+ *     classified and both units of a malicious pair are redacted. If no pair
+ *     reproduces the verdict, or the units left still join malicious (a split
+ *     over three units, or weak hits that add up inside the chunk), every
+ *     unit left in the chunk is redacted: fail closed, within the chunk.
+ *
+ * At most `concurrency` classifications run at once, and the result does not
+ * depend on which returns first. A classifier rejection propagates.
+ */
+export async function classifySideBySide(
+  units: ReadonlyArray<string>,
+  opts: ClassifySideBySideOptions,
+): Promise<SideBySide> {
+  const origin = opts.origin;
+  const width = Math.max(1, Math.floor(opts.concurrency ?? 1) || 1);
+  const chunkChars = opts.chunkChars ?? 16 * 1024;
+  const redacted = new Map<number, string>();
+  const alone: Array<{ at: number; rules: string[] }> = [];
+  const pairs: Array<{ at: number; rules: string[] }> = [];
+  const unlocalized = new Set<string>();
+  const redact = (i: number, result: BoundaryResult): void => {
+    if (!redacted.has(i)) {
+      redacted.set(i, result.redacted ?? buildRedactionNotice(result.verdict.hits));
+    }
+  };
+  const full = (text: string) => classifyBoundary(text, { origin });
+
+  const local = await mapPool(units.length, width, (i) =>
+    classifyBoundary(units[i] as string, {
+      origin,
+      llmClassifier: LOCAL_LAYERS_ONLY,
+      bypassCache: true,
+    }),
+  );
+  local.forEach((result, i) => {
+    if (result.action !== "redact") return;
+    redact(i, result);
+    alone.push({ at: i, rules: ruleIds(result.verdict) });
+  });
+  const passing = units.flatMap((_, i) => (redacted.has(i) ? [] : [i]));
+  const chunks = chunkUnits(units, passing, chunkChars);
+  const wholes = await mapPool(chunks.length, width, (c) =>
+    full((chunks[c] as number[]).map((i) => units[i]).join("\n")),
+  );
+  for (const [c, members] of chunks.entries()) {
+    if (wholes[c]?.action !== "redact") continue;
+    const open = members.filter((i) => !redacted.has(i));
+    const each = await mapPool(open.length, width, (k) => full(units[open[k] as number] as string));
+    each.forEach((result, k) => {
+      if (result.action !== "redact") return;
+      const at = open[k] as number;
+      if (!redacted.has(at)) alone.push({ at, rules: ruleIds(result.verdict) });
+      redact(at, result);
+    });
+    const rest = open.filter((i) => !redacted.has(i));
+    if (rest.length < 2) continue;
+    const joined = await full(rest.map((i) => units[i]).join("\n"));
+    if (joined.action !== "redact") continue;
+    const pairVerdicts = await mapPool(rest.length - 1, width, (k) =>
+      full(`${units[rest[k] as number]}\n${units[rest[k + 1] as number]}`),
+    );
+    const paired = new Set<number>();
+    pairVerdicts.forEach((result, k) => {
+      if (result.action !== "redact") return;
+      const at = rest[k] as number;
+      paired.add(at).add(rest[k + 1] as number);
+      redact(at, result);
+      redact(rest[k + 1] as number, result);
+      pairs.push({ at, rules: ruleIds(result.verdict) });
+    });
+    const left = rest.filter((i) => !paired.has(i));
+    const residual =
+      paired.size === 0
+        ? joined
+        : left.length > 1
+          ? await full(left.map((i) => units[i]).join("\n"))
+          : undefined;
+    if (residual?.action !== "redact") continue;
+    for (const i of left) redact(i, residual);
+    for (const rule of ruleIds(residual.verdict)) unlocalized.add(rule);
+  }
+  return {
+    redacted,
+    alone,
+    pairs,
+    ...(unlocalized.size > 0 ? { unlocalized: [...unlocalized] } : {}),
+  };
+}
+
+/**
+ * `members` (unit indexes, in order) in chunks of at most `chunkChars` joined
+ * characters, each after the first starting with the last
+ * {@link CARRIED_UNITS} units of the chunk before. Every chunk adds at least
+ * one unit, so a unit longer than `chunkChars` sits in a chunk of its own
+ * (besides the units carried in).
+ */
+function chunkUnits(
+  units: ReadonlyArray<string>,
+  members: ReadonlyArray<number>,
+  chunkChars: number,
+): number[][] {
+  const chunks: number[][] = [];
+  let chunk: number[] = [];
+  let chars = 0;
+  let fresh = 0;
+  for (const i of members) {
+    const length = (units[i] as string).length + 1;
+    if (fresh > 0 && chars + length > chunkChars) {
+      chunks.push(chunk);
+      chunk = chunk.slice(-CARRIED_UNITS);
+      chars = chunk.reduce((n, j) => n + (units[j] as string).length + 1, 0);
+      fresh = 0;
+    }
+    chunk.push(i);
+    chars += length;
+    fresh++;
+  }
+  if (fresh > 0) chunks.push(chunk);
+  return chunks;
+}
+
+/** The distinct rule ids behind a verdict. */
+function ruleIds(verdict: PromptInjectionResult): string[] {
+  return [...new Set(verdict.hits.map((h) => h.rule))];
+}
+
+/** `fn` over the indexes `0 … count - 1`, in order, at most `width` at a time. */
+async function mapPool<R>(
+  count: number,
+  width: number,
+  fn: (index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(count);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < count; i = next++) out[i] = await fn(i);
+  };
+  await Promise.all(Array.from({ length: Math.min(width, count) }, worker));
+  return out;
+}
