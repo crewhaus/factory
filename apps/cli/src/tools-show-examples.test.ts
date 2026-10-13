@@ -413,7 +413,8 @@ const CALLS: Readonly<Record<string, Record<string, unknown>>> = {
   PushNotify: { provider: "gateway", to: "topic:ops-alerts", body: "deploy done" },
   Python: { code: "import subprocess" },
   QrEncode: { text: "https://example.com", path: "src/qr.png" },
-  RateLimitStatus: {},
+  // The API it reports on: a self-hosted one the call names.
+  RateLimitStatus: { baseUrl: "https://api.example.com/api/v3" },
   Read: { path: "src/a.ts" },
   RegistryOutdated: { manifest: "src/app/package.json" },
   RegistryPackageInfo: { ecosystem: "npm", name: "nightly-tools" },
