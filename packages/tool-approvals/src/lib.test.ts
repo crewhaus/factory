@@ -458,6 +458,18 @@ describe("toRow", () => {
     expect(operativeOf("EnvFileUpsert", { entries: {} })).toEqual({ field: "path", value: ".env" });
   });
 
+  test("a field the tool ignores beside another the call names is not shown", () => {
+    // A webhook post goes where the webhook is bound; the channel is ignored.
+    const hook = { platform: "slack", webhookUrlEnv: "OPS_HOOK", channel: "C123", text: "t" };
+    expect(operativeOf("ChatPost", hook)).toEqual({ field: "webhookUrlEnv", value: "OPS_HOOK" });
+    // In API mode the channel is where it goes, on the API the call names.
+    const api = { platform: "slack", apiBaseUrl: "https://slack.com/api", channel: "C123" };
+    expect(operativeOf("ChatPost", api)).toEqual({
+      field: "channel",
+      value: "https://slack.com/C123",
+    });
+  });
+
   test("a store or repository the call leaves out does not stand in for the record it acts on", () => {
     // The approver deciding on these needs the branch, the key, the pin —
     // not the directory each lives in (a relocating field's default).

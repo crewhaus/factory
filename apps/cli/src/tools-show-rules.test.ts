@@ -96,6 +96,15 @@ describe("operativeArgWords — a declaration in words", () => {
         },
         "a path; a directory stands for everything beneath it except hidden names, and for those too when includeHidden is true; left out, the workspace root",
       ],
+      [
+        {
+          field: "channel",
+          kind: "recipient",
+          service: "apiBaseUrl",
+          ignoredWhen: "webhookUrlEnv",
+        },
+        "a recipient; matched as https://host/channel with the origin of the API the call goes to (the one in apiBaseUrl, else the configured one), and also as channel on the API the tool is set up for; a deny or ask also reads the URL; ignored when the call names webhookUrlEnv: then a deny or ask reads it, an allow need not name it",
+      ],
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
   });

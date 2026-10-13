@@ -1168,6 +1168,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "field",
         "glob",
         "hiddenWhen",
+        "ignoredWhen",
         "kind",
         "opens",
         "prefix",
@@ -1188,6 +1189,11 @@ describe("the generated tool manifest matches the tools it describes", () => {
     // The API a code-host call may name instead of the configured one.
     expect(TOOL_FLAGS["issueCreate"]?.operativeArgs).toEqual([
       { field: "repo", kind: "recipient", within: "owner", service: "baseUrl" },
+    ]);
+    // A webhook post ignores the channel; the webhook comes first.
+    expect(TOOL_FLAGS["chatPost"]?.operativeArgs).toEqual([
+      { field: "webhookUrlEnv", kind: "id" },
+      { field: "channel", kind: "recipient", service: "apiBaseUrl", ignoredWhen: "webhookUrlEnv" },
     ]);
   }, 60_000);
 

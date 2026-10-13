@@ -709,12 +709,13 @@ function renderMessage(
 
 export const chatPost: RegisteredTool = buildTool({
   name: "ChatPost",
-  // In API mode the channel on the API the call names; through an incoming
-  // webhook, the variable naming it (the webhook is bound to its channel,
-  // and the tool ignores `channel` there).
+  // Through an incoming webhook, the variable naming it: the webhook is bound
+  // to its channel, and the tool ignores `channel` there. In API mode, the
+  // channel on the API the call names. The webhook comes first, so an
+  // approval card names it.
   operativeArgs: [
-    { field: "channel", kind: "recipient", service: "apiBaseUrl" },
     { field: "webhookUrlEnv", kind: "id" },
+    { field: "channel", kind: "recipient", service: "apiBaseUrl", ignoredWhen: "webhookUrlEnv" },
   ],
   description:
     "Post a message to Slack, Discord, Microsoft Teams or a generic incoming webhook, with optional heading/paragraph/fields/divider/link blocks and a thread id where the platform threads. Use it when a harness needs to tell a room something rather than reply where it was spoken to — a nightly result, an alert, a hand-off. Every value is escaped for the platform before it is sent, so text carrying <!channel>, @everyone or a code fence can change what the message SAYS but never what it DOES; mentions are additionally suppressed at the API level. One tool covers four platforms because the payload differs and the intent does not. It takes an idempotency key so a retried call returns the first result instead of posting twice, and it will not follow a redirect — a webhook URL that moved is a configuration change, not something to chase at send time.",

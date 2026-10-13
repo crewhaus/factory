@@ -512,6 +512,16 @@ function checkOperativeArgs(
         );
       }
     }
+    const { ignoredWhen } = arg;
+    if (ignoredWhen !== undefined) {
+      if (typeof ignoredWhen !== "string" || !/^[A-Za-z_$][\w$]*$/.test(ignoredWhen)) {
+        fail(`${at}.ignoredWhen must name one top-level input field, e.g. "webhookUrlEnv"`);
+      }
+      if (ignoredWhen === field || ignoredWhen === within || ignoredWhen === service) {
+        fail(`${at}.ignoredWhen names "${ignoredWhen}", which is already used`);
+      }
+      // Checked against the other declarations below, once all are read.
+    }
     const { source } = arg;
     if (source !== undefined && source !== true) fail(`${at}.source is either true or left out`);
     const { shell } = arg;
@@ -562,6 +572,7 @@ function checkOperativeArgs(
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
         ...(service !== undefined ? { service } : {}),
+        ...(ignoredWhen !== undefined ? { ignoredWhen } : {}),
         ...(relocates === true ? { relocates } : {}),
         ...(env !== undefined ? { env } : {}),
         ...(stdin !== undefined ? { stdin } : {}),
@@ -576,6 +587,26 @@ function checkOperativeArgs(
         ...(source === true ? { source } : {}),
       }),
     );
+  }
+  // A field the tool ignores when the call names another: that other one is
+  // where the call acts instead, so it must be one every rule reads. It comes
+  // first, so a reader that shows a call's first operative value (an
+  // approval card) names where the call goes.
+  for (const [i, arg] of out.entries()) {
+    const { ignoredWhen } = arg;
+    if (ignoredWhen === undefined) continue;
+    const at = out.findIndex((other) => other.field === ignoredWhen);
+    const instead = out[at];
+    if (instead === undefined || instead.source === true || instead.ignoredWhen !== undefined) {
+      fail(
+        `[${i}].ignoredWhen: "${ignoredWhen}" must be another operative field of this tool, the one a call that names it acts on, read by every rule (no source, no ignoredWhen)`,
+      );
+    }
+    if (at > i) {
+      fail(
+        `[${i}].ignoredWhen: declare "${ignoredWhen}" before "${arg.field}", which it overrides`,
+      );
+    }
   }
   // A source is where the tool takes a value from; something else must say
   // where it acts, or no scoped allow could ever grant the tool.

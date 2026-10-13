@@ -192,7 +192,9 @@
  *      deny or ask only, as the env files they are looked up in or loaded
  *      from (see {@link secretRefValues}).
  *    - a field declared `source` (where the tool takes a value from) is read
- *      by a deny or ask only.
+ *      by a deny or ask only, and so is one declared `ignoredWhen` another
+ *      field the call names (ChatPost's `channel` beside `webhookUrlEnv`):
+ *      the tool does not use it then.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash — `0x` or `0X`, both of which a node accepts) is marked
  *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
@@ -650,9 +652,13 @@ function valuesOf(
         }
       }
     }
-    // Where the tool takes a value from: a deny or ask reads it, an allow
-    // is about where the tool acts (`source` on OperativeArg).
-    if (arg.source === true) {
+    // Where the tool takes a value from, or a field it ignores because the
+    // call names another: a deny or ask reads it, an allow is about where
+    // the tool acts (`source` and `ignoredWhen` on OperativeArg).
+    if (
+      arg.source === true ||
+      (arg.ignoredWhen !== undefined && qualifierOf(parsedInput, arg.ignoredWhen) !== undefined)
+    ) {
       for (let i = from; i < values.length; i++) {
         values[i] = { ...(values[i] as OperativeValue), restrictOnly: true };
       }

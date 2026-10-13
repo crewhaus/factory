@@ -288,6 +288,14 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * password, cannot be placed: no allow grants the call, and every deny or
  * ask fires.
  *
+ * `ignoredWhen` names another operative field of the tool which, when the
+ * call names it, makes the tool ignore this one: ChatPost's `channel`
+ * through an incoming webhook (`webhookUrlEnv`), which posts to the channel
+ * it is bound to. Such a call is read by a deny or ask on this field too,
+ * but an allow need not name it: `alwaysAllow ChatPost(OPS_HOOK)` covers a
+ * webhook post that also carries a `channel`, and `alwaysDeny
+ * ChatPost(C0123)` still fires on it.
+ *
  * `relocates: true` marks a `path` field that only moves the tool off its
  * usual place: the store its other operative fields name a record in
  * (`stateDir`, `registryDir`, `evalsDir`), or the repository a branch
@@ -465,6 +473,7 @@ export type OperativeArg = {
   readonly default?: string;
   readonly within?: string;
   readonly service?: string;
+  readonly ignoredWhen?: string;
   readonly relocates?: true;
   readonly env?: string;
   readonly stdin?: string;

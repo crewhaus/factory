@@ -14,7 +14,8 @@
  *
  * Through an incoming webhook, ChatPost ignores `channel` and posts where the
  * webhook is bound; the rule now reads the variable naming the webhook
- * (`webhookUrlEnv`), as WebhookPost's reads `urlEnv`.
+ * (`webhookUrlEnv`), as WebhookPost's reads `urlEnv`, and the channel such a
+ * call carries is read by a deny or ask only.
  *
  * Everything runs through runChatLoop's real gate and the real tools, against
  * two loopback servers standing for two allow-listed hosts; a name resolves to
@@ -589,7 +590,7 @@ describe("a Chat rule reads the API a call names, and a webhook post the variabl
     expect(await call(chatPost, post, deny)).toEqual({ decision: "deny", a: [], b: [] });
   }, 30_000);
 
-  test("an allow on a channel does not grant a webhook post, which ignores the channel", async () => {
+  test("a webhook post is read by its variable; the channel it ignores is read by a deny only", async () => {
     // The webhook in API_HOSTS_HOOK is bound to a channel of its own; the call's
     // `channel` is not where the post goes.
     const hook = {
@@ -599,17 +600,45 @@ describe("a Chat rule reads the API a call names, and a webhook post the variabl
       text: "deploy finished",
       justification: "tell the room",
     };
-    expect(await call(chatPost, hook, rules(["alwaysAllow", "ChatPost(C123)"]))).toEqual({
-      decision: "ask",
-      a: [],
+    const { channel: _channel, ...plain } = hook;
+    const byVariable = rules(["alwaysAllow", "ChatPost(API_HOSTS_HOOK)"]);
+    for (const input of [hook, plain]) {
+      _resetIdempotencyLedger();
+      expect({ input, got: await call(chatPost, input, byVariable) }).toEqual({
+        input,
+        got: { decision: "allow", a: ["POST /hooks/a"], b: [] },
+      });
+    }
+    // An allow on the channel does not cover it, alone or beside one on another hook.
+    for (const set of [
+      [["alwaysAllow", "ChatPost(C123)"]],
+      [
+        ["alwaysAllow", "ChatPost(C123)"],
+        ["alwaysAllow", "ChatPost(OTHER_HOOK)"],
+      ],
+    ] as Array<Array<[PermissionRule["type"], string]>>) {
+      expect({ set, got: await call(chatPost, hook, rules(...set)) }).toEqual({
+        set,
+        got: { decision: "ask", a: [], b: [] },
+      });
+    }
+    // A deny on the variable, or on the channel, still fires.
+    for (const glob of ["API_HOSTS_HOOK", "C123"]) {
+      const deny = rules(["alwaysDeny", `ChatPost(${glob})`], ["alwaysAllow", "ChatPost"]);
+      expect({ glob, got: await call(chatPost, hook, deny) }).toEqual({
+        glob,
+        got: { decision: "deny", a: [], b: [] },
+      });
+    }
+    // The webhook's URL is a credential no rule reads, its host included:
+    // a deny on an API is an API-mode rule (README).
+    _resetIdempotencyLedger();
+    const onHost = rules(["alwaysDeny", `ChatPost(${originA}/**)`], ["alwaysAllow", "ChatPost"]);
+    expect(await call(chatPost, plain, onHost)).toEqual({
+      decision: "allow",
+      a: ["POST /hooks/a"],
       b: [],
     });
-    const { channel: _channel, ...plain } = hook;
-    expect(await call(chatPost, plain, rules(["alwaysAllow", "ChatPost(API_HOSTS_HOOK)"]))).toEqual(
-      { decision: "allow", a: ["POST /hooks/a"], b: [] },
-    );
-    const deny = rules(["alwaysDeny", "ChatPost(API_HOSTS_HOOK)"], ["alwaysAllow", "ChatPost"]);
-    expect(await call(chatPost, plain, deny)).toEqual({ decision: "deny", a: [], b: [] });
   }, 30_000);
 
   test("WebhookPost reads the variable a call names its URL through", async () => {

@@ -535,8 +535,8 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "channel", kind: "recipient", service: "apiBaseUrl" },
       { field: "webhookUrlEnv", kind: "id" },
+      { field: "channel", kind: "recipient", service: "apiBaseUrl", ignoredWhen: "webhookUrlEnv" },
     ],
     categories: ["notify", "outreach"],
     package: "@crewhaus/tool-notify",

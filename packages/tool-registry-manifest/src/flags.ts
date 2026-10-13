@@ -354,8 +354,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "channel", kind: "recipient", service: "apiBaseUrl" },
       { field: "webhookUrlEnv", kind: "id" },
+      { field: "channel", kind: "recipient", service: "apiBaseUrl", ignoredWhen: "webhookUrlEnv" },
     ],
   },
   chatReact: {

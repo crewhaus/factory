@@ -2788,3 +2788,80 @@ describe("a call that names no API goes where the tool's config says (serviceDef
     ).not.toThrow();
   });
 });
+
+describe("a field the tool ignores beside another the call names (ignoredWhen)", () => {
+  // ChatPost's shape: a webhook post goes where the webhook is bound, and the
+  // channel it carries is not used.
+  const postTool = () =>
+    buildTool({
+      name: "Post",
+      description: "d",
+      inputSchema: z.object({
+        hook: z.string().optional(),
+        channel: z.string().optional(),
+        text: z.string(),
+      }),
+      operativeArgs: [
+        { field: "hook", kind: "id" },
+        { field: "channel", kind: "recipient", ignoredWhen: "hook" },
+      ],
+      destructive: true,
+      execute: async () => "ok",
+    });
+  const decide = (input: unknown) => {
+    const values = operativeValuesFor(postTool(), input) ?? [];
+    return (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Post", input, { polarity, operativeValues: values });
+  };
+
+  test("with the other named, an allow need not name it and a deny still reads it", () => {
+    const match = decide({ hook: "OPS_HOOK", channel: "C123", text: "t" });
+    expect(match("Post(OPS_HOOK)", "allow")).toBe(true);
+    expect(match("Post(C123)", "allow")).toBe(false);
+    expect(match("Post(C123)", "restrict")).toBe(true);
+    expect(match("Post(OPS_HOOK)", "restrict")).toBe(true);
+  });
+
+  test("without it, the field is where the call acts", () => {
+    const match = decide({ channel: "C123", text: "t" });
+    expect(match("Post(C123)", "allow")).toBe(true);
+    expect(match("Post(OPS_HOOK)", "allow")).toBe(false);
+  });
+
+  test("buildTool refuses an ignoredWhen that names no field a rule reads, or one after it", () => {
+    const build = (operativeArgs: ReadonlyArray<Record<string, unknown>>) => () =>
+      buildTool({
+        name: "Bad",
+        description: "d",
+        inputSchema: z.object({
+          hook: z.string().optional(),
+          channel: z.string().optional(),
+          from: z.string().optional(),
+        }),
+        operativeArgs: operativeArgs as never,
+        execute: async () => "ok",
+      });
+    const channel = { field: "channel", kind: "recipient" };
+    expect(build([{ ...channel, ignoredWhen: "hook" }])).toThrow(/must be another operative field/);
+    expect(
+      build([
+        { field: "hook", kind: "id", source: true },
+        { ...channel, ignoredWhen: "hook" },
+      ]),
+    ).toThrow(/must be another operative field/);
+    expect(build([{ ...channel, ignoredWhen: "channel" }])).toThrow(/already used/);
+    expect(build([{ ...channel, ignoredWhen: "a.b" }])).toThrow(/one top-level input field/);
+    expect(
+      build([
+        { ...channel, ignoredWhen: "hook" },
+        { field: "hook", kind: "id" },
+      ]),
+    ).toThrow(/declare "hook" before "channel"/);
+    expect(
+      build([
+        { field: "hook", kind: "id" },
+        { ...channel, ignoredWhen: "hook" },
+      ]),
+    ).not.toThrow();
+  });
+});

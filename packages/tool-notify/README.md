@@ -153,11 +153,14 @@ secret, in its literal, URL-encoded and base64 forms.
 - **Chat.** `ChatPost` and `ChatUpdate` read the channel; `ChatDelete` and `ChatReact` read
   `channel/messageId`. An API-mode call always names `apiBaseUrl`, so the value is matched with
   that URL's origin in front: `alwaysAllow ChatPost(https://slack.com/C0123)`, or
-  `ChatPost(**/C0123)` for that channel on any API. A deny on an API fires on every call to it:
-  `alwaysDeny ChatPost(https://discord.com/**)`.
+  `ChatPost(https://*/C0123)` for that channel on any API. A deny on an API fires on every
+  API-mode call to it: `alwaysDeny ChatPost(https://discord.com/**)`.
 - **Incoming webhooks.** A webhook posts to the channel it was created for, and `ChatPost` ignores
   a `channel` in that call. So the rule reads `webhookUrlEnv`, the variable that names the webhook:
-  `alwaysAllow ChatPost(SLACK_OPS_WEBHOOK)`. An allow on a channel does not cover a webhook post.
+  `alwaysAllow ChatPost(SLACK_OPS_WEBHOOK)` covers a webhook post, with or without a `channel`. An
+  allow on a channel does not cover one, and a deny on a channel still fires on it. The webhook's
+  URL is a credential, so no rule reads it, its host included: a deny on an API does not stop a
+  webhook post to that host. Deny the variable instead: `alwaysDeny ChatPost(DISCORD_WEBHOOK)`.
 - **`WebhookPost`** reads `url`, or `urlEnv` when the URL is kept in a variable:
   `alwaysAllow WebhookPost(DEPLOY_HOOK_URL)`.
 - **Not read:** the SMTP relay in `EmailSend`'s `host` (bounded by `allowed_smtp_hosts`), the
