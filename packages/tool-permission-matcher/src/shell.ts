@@ -1030,12 +1030,60 @@ const INTERPRETERS: ReadonlyMap<string, string> = new Map([
 const INLINE_CODE_OPTIONS: ReadonlySet<string> = new Set(["--eval", "--print"]);
 
 /**
+ * How the options of an interpreter that opens its script through the kernel
+ * read, so that its script can be told from an option's argument: `ruby -r
+ * ./lib.rb x.rb` loads lib.rb with its `..` folded as text (`require` runs
+ * `File.expand_path`), and only x.rb is opened where the kernel walks.
+ *
+ * - `flags`: short options that take no argument.
+ * - `argument`: short options that take one. With `attached`, it is the rest
+ *   of the word or, with nothing there, the next word (`-rlib`, `-r lib`);
+ *   without, the next word, whatever follows in the word (bash's `-oe
+ *   pipefail`), so one can be read only at the end of its word.
+ * - `long` and `longArgument`: long options that take no argument, and those
+ *   that take the next word. A `--name=value` takes none.
+ *
+ * Any other option may take the next word, and the script cannot be told:
+ * every word is then read both ways. An option that moves where the script
+ * is opened from (`ruby -C dir`, `perl -x dir`) or looks it up on PATH (`-S`)
+ * is left out on purpose. Measured with `interp OPT a b`, each file writing
+ * its name to a marker: ruby 2.6, perl 5.34, python3 3.8–3.11, bash 3.2,
+ * dash, zsh, ksh93, csh and tcsh.
+ */
+type ScriptOptions = {
+  readonly flags: string;
+  readonly argument: string;
+  readonly attached: boolean;
+  readonly long?: ReadonlySet<string>;
+  readonly longArgument?: ReadonlySet<string>;
+};
+
+/** bash, dash, ksh and `sh` (one of them): `-o name` and bash's `-O name`, ksh's `-R file`. */
+const POSIX_SHELL_OPTIONS: ScriptOptions = {
+  flags: "abefhiklmnprtuvxBCDEHIPT",
+  argument: "oOR",
+  attached: false,
+  long: new Set([
+    "--debugger",
+    "--login",
+    "--noediting",
+    "--noprofile",
+    "--norc",
+    "--posix",
+    "--restricted",
+    "--verbose",
+  ]),
+  longArgument: new Set(["--init-file", "--rcfile"]),
+};
+
+/**
  * Interpreters that open the script they are handed as written, through the
  * kernel, which applies each `..` after the link before it: `sh
  * lnk/../x.sh` with `lnk → safe/sub` runs `safe/x.sh`. Measured, one run
  * each with a link and a `..` and a marker the script writes: sh, bash,
  * dash, zsh, ksh, csh, tcsh, the `.` and `source` builtins, python3 (3.9),
- * perl (5.34) and ruby (2.6).
+ * perl (5.34) and ruby (2.6). Each with how its options read
+ * ({@link ScriptOptions}).
  *
  * Not here, and so read both ways: node and `bun run`, which fold a `..` as
  * text before they open their script (`path.resolve`, then its links
@@ -1043,23 +1091,101 @@ const INLINE_CODE_OPTIONS: ReadonlySet<string> = new Set(["--eval", "--print"]);
  * does today but shares a name with `bun run`; and every runtime that was
  * not measured (deno, tsx, ts-node, the shells and Pythons not listed).
  */
-const OPENS_SCRIPT_THROUGH_KERNEL: ReadonlySet<string> = new Set([
-  "sh",
-  "bash",
-  "dash",
-  "zsh",
-  "ksh",
-  "csh",
-  "tcsh",
-  ".",
-  "source",
-  "perl",
-  "ruby",
+const OPENS_SCRIPT_THROUGH_KERNEL: ReadonlyMap<string, ScriptOptions> = new Map([
+  ["sh", POSIX_SHELL_OPTIONS],
+  ["bash", POSIX_SHELL_OPTIONS],
+  ["dash", POSIX_SHELL_OPTIONS],
+  ["ksh", POSIX_SHELL_OPTIONS],
+  // zsh: `-O` and `-R` are flags; `-o` takes the rest of its word, or the
+  // next. zsh's and csh's `-b` end the options, as `--` does: left out.
+  [
+    "zsh",
+    {
+      flags: "adefhiklmnprtuvxBCDEFHIOPRTVX",
+      argument: "o",
+      attached: true,
+      long: new Set(["--login", "--verbose"]),
+      longArgument: new Set(["--emulate"]),
+    },
+  ],
+  ["csh", { flags: "defFmnqvVxX", argument: "", attached: false }],
+  ["tcsh", { flags: "defFmnqvVxX", argument: "", attached: false }],
+  // Builtins: no options before the file.
+  [".", { flags: "", argument: "", attached: false }],
+  ["source", { flags: "", argument: "", attached: false }],
+  [
+    "perl",
+    // `-I dir`; `-M`, `-m`, `-x`, `-S` and the rest left out.
+    { flags: "acfnpstTUwWX", argument: "I", attached: true },
+  ],
+  [
+    "ruby",
+    // `-r lib`, `-I dir`, `-E enc`; `-C`/`-X dir`, `-x`, `-S`, `-W` and the rest left out.
+    {
+      flags: "adlnpsvwU",
+      argument: "EIr",
+      attached: true,
+      long: new Set(["--disable-gems", "--jit", "--verbose"]),
+      longArgument: new Set(["--disable", "--dump", "--enable", "--encoding"]),
+    },
+  ],
 ]);
 
-/** {@link OPENS_SCRIPT_THROUGH_KERNEL}, with `python3` in any minor version (`python3.12`). */
-function opensScriptThroughKernel(name: string): boolean {
-  return OPENS_SCRIPT_THROUGH_KERNEL.has(name) || /^python3(\.[0-9]+)?$/.test(name);
+/** Python 3's options (`python3`, `python3.12`): `-W arg` and `-X opt` take one. */
+const PYTHON3_OPTIONS: ScriptOptions = {
+  flags: "bBdEiIOPqRsSuvx",
+  argument: "WX",
+  attached: true,
+  longArgument: new Set(["--check-hash-based-pycs"]),
+};
+
+/** How the options of an interpreter that opens its script through the kernel read, if `name` is one. */
+function kernelScriptOptions(name: string): ScriptOptions | undefined {
+  return (
+    OPENS_SCRIPT_THROUGH_KERNEL.get(name) ??
+    (/^python3(\.[0-9]+)?$/.test(name) ? PYTHON3_OPTIONS : undefined)
+  );
+}
+
+/**
+ * The index of the script an interpreter at `k` opens through the kernel:
+ * the first word after its options, each option read as
+ * {@link ScriptOptions} says. `undefined` for any other interpreter, and
+ * where an option before it may take the next word, or a `-` reads the
+ * script on the input: the first word that is no option may then be that
+ * option's argument (`ruby -r ./lib.rb x.rb`).
+ */
+function kernelScriptAt(words: ReadonlyArray<string>, k: number): number | undefined {
+  const name = programName(words[k] as string);
+  const options = kernelScriptOptions(name);
+  if (options === undefined) return undefined;
+  const shell = SHELLS.has(name);
+  for (let j = k + 1; j < words.length; j++) {
+    const w = words[j] as string;
+    if (w === "") continue;
+    if (w === "--") {
+      for (j++; j < words.length && words[j] === ""; j++);
+      return j < words.length ? j : undefined;
+    }
+    if (w.startsWith("--")) {
+      if (w.includes("=") || options.long?.has(w) === true) continue;
+      if (options.longArgument?.has(w) !== true) return undefined;
+      j++;
+      continue;
+    }
+    if (!w.startsWith("-") && !(shell && w.startsWith("+") && w.length > 1)) return j;
+    const letters = w.slice(1);
+    if (letters === "") return undefined;
+    for (let c = 0; c < letters.length; c++) {
+      const letter = letters.charAt(c);
+      if (options.flags.includes(letter)) continue;
+      if (!options.argument.includes(letter)) return undefined;
+      if (c === letters.length - 1) j++;
+      else if (!options.attached) return undefined;
+      break;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -1106,8 +1232,10 @@ export type ProgramWords = {
    * written, through the kernel (a shell, Python 3, Perl, Ruby; see
    * {@link OPENS_SCRIPT_THROUGH_KERNEL}): the file it runs is where the
    * kernel walks, each `..` after the link before it. Absent for any other
-   * interpreter — node and `bun run` fold a `..` as text first — and for
-   * every other operand, which the script reads as it likes.
+   * interpreter — node and `bun run` fold a `..` as text first — for every
+   * other operand, which the script reads as it likes, and where an option
+   * before the script may have taken it as its argument (`ruby -r
+   * ./lib.rb x.rb`, whose `require` folds `..` as text).
    */
   readonly kernelScript?: number;
   /**
@@ -1188,12 +1316,11 @@ export function programWords(words: ReadonlyArray<string>, path?: string): Progr
   const last = programs[programs.length - 1] as number;
   const scanned = followed.lines.length === 0 ? scanInterpreter(words, last) : undefined;
   const operands = scanned?.operands ?? [];
-  // Its script, when it opens it the way the kernel walks it. A runtime
-  // given code in an argument (`python3 -c`) has no script among them.
-  const kernelScript =
-    scanned?.script === "operand" && opensScriptThroughKernel(programName(words[last] as string))
-      ? operands[0]
-      : undefined;
+  // Its script, when it opens it the way the kernel walks it and its
+  // options say which word that is. A runtime given code in an argument
+  // (`python3 -c`) has no script among them.
+  const at = scanned?.script === "operand" ? kernelScriptAt(words, last) : undefined;
+  const kernelScript = at !== undefined && operands.includes(at) ? at : undefined;
   const paths = path !== undefined ? [{ from: 0, path }, ...followed.paths] : followed.paths;
   return {
     programs,

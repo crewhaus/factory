@@ -740,6 +740,59 @@ describe("programWords: the words of a command that name code it runs", () => {
     expect(script("sh")).toBeUndefined();
   });
 
+  // interp review (0.7.1): the first word after an interpreter's options may
+  // be an option's argument, not its script. `ruby -r ./lnk/../evil.rb
+  // safe/ok.rb` loads ./evil.rb — `require` folds the `..` as text — so only
+  // the word after the argument is opened where the kernel walks. Measured
+  // with `interp OPT a b`, each file writing its name to a marker.
+  test("an option's argument is never the kernel's script", () => {
+    const script = (...words: string[]) => {
+      const at = programWords(words).kernelScript;
+      return at === undefined ? undefined : words[at];
+    };
+    // The argument in the next word, or in the rest of the option's word.
+    expect(script("ruby", "-r", "./x.rb", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "-wr", "./x.rb", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "-r./x.rb", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "-I", "lib", "-r", "x", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "-E", "UTF-8", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "--disable", "gems", "y.rb")).toBe("y.rb");
+    expect(script("ruby", "--disable=gems", "--verbose", "y.rb")).toBe("y.rb");
+    expect(script("perl", "-I", "lib", "x.pl")).toBe("x.pl");
+    expect(script("perl", "-wIlib", "x.pl")).toBe("x.pl");
+    expect(script("python3", "-W", "ignore", "x.py")).toBe("x.py");
+    expect(script("python3", "-bWignore", "-X", "dev", "x.py")).toBe("x.py");
+    expect(script("python3", "--check-hash-based-pycs", "always", "x.py")).toBe("x.py");
+    expect(script("bash", "-o", "pipefail", "x.sh")).toBe("x.sh");
+    expect(script("bash", "-eO", "extglob", "x.sh")).toBe("x.sh");
+    expect(script("bash", "--rcfile", "rc", "x.sh")).toBe("x.sh");
+    expect(script("zsh", "-oerrexit", "x.sh")).toBe("x.sh");
+    expect(script("zsh", "--emulate", "sh", "x.sh")).toBe("x.sh");
+    expect(script("sh", "--", "x.sh")).toBe("x.sh");
+    // An option that may take the next word, or moves where the script is
+    // opened from, or looks it up on PATH: no word is the script.
+    for (const words of [
+      ["ruby", "-W", "x.rb"],
+      ["ruby", "-C", "dir", "x.rb"],
+      ["ruby", "-x", "x.rb"],
+      ["ruby", "-S", "x.rb"],
+      ["ruby", "-Q", "x.rb"],
+      ["ruby", "--backtrace-limit", "1", "x.rb"],
+      ["perl", "-Mstrict", "x.pl"],
+      ["perl", "-x", "dir", "x.pl"],
+      ["python3", "-Z", "x.py"],
+      // bash's `-oe pipefail`: `-o` takes the next word whatever follows it.
+      ["bash", "-oe", "pipefail", "x.sh"],
+      ["bash", "-Z", "x.sh"],
+      ["zsh", "-b", "-x", "x.sh"],
+      ["csh", "-b", "x.sh"],
+      [".", "-p", "dir", "x.sh"],
+      ["python3", "-", "x.py"],
+    ]) {
+      expect({ words, script: script(...words) }).toEqual({ words, script: undefined });
+    }
+  });
+
   test("the directory each wrapper moves to, and the PATH each sets, from the word it applies to", () => {
     const words = ["env", "-C", "sub", "PATH=bin", "sudo", "--chdir=deep", "./x.sh"];
     const got = programWords(words);

@@ -4159,3 +4159,117 @@ describe("critic9 — a script node opens with its `..` folded as text", () => {
     );
   });
 });
+
+// interp review (0.7.1): a shell's, Python 3's, Perl's or Ruby's script is
+// read only where the kernel walks — but the first word after an
+// interpreter's options may be an option's argument, not its script. ruby's
+// `-r` loads its library with `..` folded as text (`require` runs
+// `File.expand_path`), so with `lnk → safe/sub` an allow on `ruby -r ./safe/**
+// safe/**` granted `ruby -r ./lnk/../evil.rb safe/ok.rb`, and ruby loaded
+// ./evil.rb. Every script below appends its own name to a marker outside the
+// workspace, so what ran is read from disk.
+describe("interp review — an option's argument is read both ways", () => {
+  const hasRuby = Bun.which("ruby") !== null;
+  const hasPython3 = Bun.which("python3") !== null;
+  let marker: string;
+  beforeEach(() => {
+    marker = join(state, "ran.log");
+    writeFileSync(marker, "");
+    for (const d of ["safe/sub", "secrets"]) mkdirSync(join(ws, d), { recursive: true });
+    symlinkSync("safe/sub", join(ws, "lnk"));
+    symlinkSync("secrets", join(ws, "dl"));
+    const says = (p: string) => JSON.stringify(`${p}\n`);
+    for (const p of ["evil.rb", "safe/evil.rb", "safe/ok.rb", "secrets/x.rb"]) {
+      writeFileSync(
+        join(ws, p),
+        `File.open(${JSON.stringify(marker)}, "a") { |f| f.write(${says(p)}) }\n`,
+      );
+    }
+    for (const p of ["evil.py", "safe/evil.py"]) {
+      writeFileSync(join(ws, p), `open(${JSON.stringify(marker)}, "a").write(${says(p)})\n`);
+    }
+  });
+  const ran = () => readFileSync(marker, "utf8").trim().split("\n").filter(Boolean).join(",");
+  const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+  /** The same argv on each tool that runs one, from the workspace root. */
+  const onEvery = (argv: string[]): Array<[string, Record<string, unknown>]> => [
+    ["RunCommand", { argv }],
+    ["Retry", { argv, ...retry }],
+    ["ProcessStart", { argv }],
+    ["RunPipeline", { steps: [{ argv }] }],
+    ["RunTests", { command: argv }],
+    ["RunBuild", { command: argv }],
+    ["Bash", { command: argv.join(" ") }],
+  ];
+  /** Each call's first decision under `rule(tool)`, and what ran. */
+  async function decide(
+    calls: ReadonlyArray<[string, Record<string, unknown>]>,
+    rule: (tool: string) => RuleSet,
+  ) {
+    const rows: Array<{ tool: string; input: Record<string, unknown>; got?: string; ran: string }> =
+      [];
+    for (const [tool, input] of calls) {
+      writeFileSync(marker, "");
+      const got = await gate(tool, input, rule(tool));
+      rows.push({ tool, input, ...(got !== undefined ? { got } : {}), ran: ran() });
+    }
+    return rows;
+  }
+  const allowOn = (glob: string) => (tool: string) => rules(["alwaysAllow", `${tool}(${glob})`]);
+
+  test("an allow on where the kernel walks does not grant the library ruby's `-r` folds as text", async () => {
+    for (const [argv, glob] of [
+      [["ruby", "-r", "./lnk/../evil.rb", "safe/ok.rb"], "ruby -r ./safe/** safe/**"],
+      [["ruby", "-r", "./lnk/../evil.rb", "safe/ok.rb"], "ruby -r ./safe/*.rb safe/*.rb"],
+      [["ruby", "-wr", "./lnk/../evil.rb", "safe/ok.rb"], "ruby -wr ./safe/** safe/**"],
+      [
+        ["ruby", "-I", "lib", "-r", "./lnk/../evil.rb", "safe/ok.rb"],
+        "ruby -I lib -r ./safe/** safe/**",
+      ],
+    ] as const) {
+      const rows = await decide(onEvery([...argv]), allowOn(glob));
+      expect(rows).toEqual(rows.map((r) => ({ ...r, got: "ask", ran: "" })));
+    }
+  }, 120_000);
+
+  test("a deny reads the library where ruby folds it, and nothing runs", async () => {
+    for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+      const rows = await decide(onEvery(["ruby", "-r", "./lnk/../dl/x.rb", "safe/ok.rb"]), (tool) =>
+        rules([type, `${tool}(**secrets/**)`], ["alwaysAllow", tool]),
+      );
+      const got = type === "alwaysDeny" ? "deny" : "ask";
+      expect(rows).toEqual(rows.map((r) => ({ ...r, got, ran: "" })));
+    }
+  }, 120_000);
+
+  test.skipIf(!hasRuby || !hasPython3)(
+    "control: the script after an option's argument still lands where the kernel walks",
+    async () => {
+      const cases: Array<[string[], string, string]> = [
+        [
+          ["ruby", "-r", "./safe/ok.rb", "lnk/../evil.rb"],
+          "ruby -r ./safe/** safe/**",
+          "safe/ok.rb,safe/evil.rb",
+        ],
+        [
+          ["python3", "-W", "ignore", "lnk/../evil.py"],
+          "python3 -W ignore safe/**",
+          "safe/evil.py",
+        ],
+      ];
+      // The argv tools share one reading, so RunCommand runs each; a Bash
+      // line is also read as written, which the allow does not name.
+      for (const [argv, glob, runs] of cases) {
+        const rows = await decide(
+          onEvery(argv).filter(([t]) => t === "RunCommand" || t === "Bash"),
+          allowOn(glob),
+        );
+        expect(rows.map((r) => [r.tool, r.got, r.ran])).toEqual([
+          ["RunCommand", "allow", runs],
+          ["Bash", "ask", ""],
+        ]);
+      }
+    },
+    60_000,
+  );
+});
