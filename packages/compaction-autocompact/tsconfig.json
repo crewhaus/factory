@@ -16,6 +16,9 @@
     },
     {
       "path": "../model-plan"
+    },
+    {
+      "path": "../token-budget"
     }
   ],
   "include": ["src/**/*"]
