@@ -1557,9 +1557,9 @@ import {
   literalToolKeys,
   nearestToolKeys,
   resolveToolKey,
-  ruleScopeFor,
   searchTools,
   suggestTools,
+  toolsShowRuleScope,
 } from "./tools-cli";
 // Item 7 — failure-arbiter wiring: post-eval triage (verdicts.json + report
 // section + one-line summary + bug-sample pinning) and the optimize-side
@@ -14428,7 +14428,7 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       const shapes = shapeOnly.shapes?.join(", ") ?? "every shape";
       // What a scoped rule on it reads, from the flags the manifest keeps for
       // the builtins the cli shape does not carry.
-      const rules = ruleScopeFor(shapeOnly.name, NON_CLI_TOOL_FLAGS[key]?.operativeArgs);
+      const rules = toolsShowRuleScope(key, shapeOnly.name, toolMap, NON_CLI_TOOL_FLAGS);
       const lines = [
         `${key} (${shapeOnly.name}) — ${shapeOnly.package}`,
         `  carried by: ${shapes}`,

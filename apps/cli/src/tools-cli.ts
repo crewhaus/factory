@@ -1601,6 +1601,17 @@ export type OperativeArgLike = {
   readonly source?: true;
 };
 
+/**
+ * What `tools show` reads off a tool besides its `operativeArgs`.
+ * `serviceDefaults`: the tool says which API a call that names none goes to
+ * (a code host's configured one). Without it, a value on a `service` is
+ * matched only with the origin of the API the call names, so an example
+ * allow carries one.
+ */
+export type RuleScopeOptions = {
+  readonly serviceDefaults?: boolean;
+};
+
 /** One permission rule, in the shape `permissions.rules` takes it. */
 export type ExampleRule = {
   readonly type: "alwaysAllow" | "alwaysDeny";
@@ -1653,7 +1664,7 @@ function defaultWords(arg: OperativeArgLike): string {
 }
 
 /** One operative argument in words: its kind, what qualifies it, what it stands for. */
-export function operativeArgWords(arg: OperativeArgLike): string {
+export function operativeArgWords(arg: OperativeArgLike, opts: RuleScopeOptions = {}): string {
   const parts: string[] = [];
   const kind = KIND_WORDS[arg.kind] ?? arg.kind;
   if (arg.glob === true) parts.push("a path pattern, which stands for every path it can list");
@@ -1672,7 +1683,10 @@ export function operativeArgWords(arg: OperativeArgLike): string {
     const leaf = arg.field.split(".").pop() ?? arg.field;
     const value = arg.within !== undefined ? `${arg.within}/${leaf}` : leaf;
     parts.push(
-      `matched as https://host/${value} with the origin of the API the call goes to (the one in ${arg.service}, else the configured one), and also as ${value} on the API the tool is set up for; a deny or ask also reads the URL`,
+      opts.serviceDefaults === true
+        ? `matched as https://host/${value} with the origin of the API the call goes to (the one in ${arg.service}, else the configured one), and also as ${value} on the API the tool is set up for; a deny or ask also reads the URL`
+        : // No API of its own (a Chat tool): the call names the one it reaches.
+          `matched as https://host/${value} with the origin of the API the call names in ${arg.service}: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL`,
     );
   }
   if (arg.overlay !== undefined) {
@@ -1734,10 +1748,42 @@ const QUALIFIER_SAMPLES: Readonly<Record<string, string>> = {
   chainId: "1",
   channel: "C0123",
   namespace: "scratch",
+  // A deployed spec's name, and the spec an eval baseline belongs to.
+  name: "billing",
+  spec: "billing",
 };
 
-/** An argument glob an allow on `arg` could sensibly be written with. */
-function allowGlob(arg: OperativeArgLike): string {
+/** An account on an EVM chain, written in full: an address is matched whole. */
+const EVM_ADDRESS = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
+/**
+ * A value for an argument whose name does not say what it holds: a `to` is
+ * a phone number to SmsSend, a device token or topic to PushNotify and an
+ * account to the chain tools. Keyed `<tool>.<field>`.
+ */
+const TOOL_ARG_SAMPLES: Readonly<Record<string, string>> = {
+  "SmsSend.to": "+1555*",
+  "PushNotify.to": "topic:ops-*",
+  "EvmSendTransaction.to": EVM_ADDRESS,
+  "EvmSimulate.to": EVM_ADDRESS,
+};
+
+/**
+ * An argument glob an allow on `arg` could sensibly be written with. A value
+ * on a service the tool has no API of its own for is only ever matched with
+ * the origin of the API the call names, so the glob carries one.
+ */
+function allowGlob(name: string, arg: OperativeArgLike, opts: RuleScopeOptions): string {
+  const glob = TOOL_ARG_SAMPLES[`${name}.${arg.field}`] ?? placeGlob(arg);
+  if (arg.service === undefined || opts.serviceDefaults === true) return glob;
+  // A Chat channel is on the chat platform's API; any other value on a
+  // placeholder one.
+  const onChat = arg.within === "channel" || arg.field.split(".").pop() === "channel";
+  return `${onChat ? "https://slack.com" : "https://api.example.com"}/${glob}`;
+}
+
+/** {@link allowGlob} for the value itself, before any service origin. */
+function placeGlob(arg: OperativeArgLike): string {
   const leaf = (arg.field.split(".").pop() ?? arg.field).toLowerCase();
   switch (arg.kind) {
     case "path":
@@ -1767,6 +1813,9 @@ function allowGlob(arg: OperativeArgLike): string {
         if (/image/.test(leaf)) return "ghcr.io/acme/*";
         return "*.example.com";
       }
+      // A chain, by its id; a price feed pinned in tool_config, by its name.
+      if (leaf === "chainid") return "1";
+      if (leaf === "feed") return "eth-*";
       return "nightly-*";
     }
   }
@@ -1796,15 +1845,19 @@ function denyGlob(arg: OperativeArgLike): string {
  * an allow must match every value at once, so a tool whose arguments are of
  * different kinds (Grep's path and pattern) or that are free text or code is
  * scoped by allowing it bare and denying what must stay out.
+ *
+ * `opts.serviceDefaults` says the tool names the API a call that names none
+ * goes to (see {@link RuleScopeOptions}); left out, it does not.
  */
 export function ruleScopeFor(
   name: string,
   operativeArgs: ReadonlyArray<OperativeArgLike> | undefined,
+  opts: RuleScopeOptions = {},
 ): RuleScope {
   const bare: ExampleRule = { type: "alwaysAllow", pattern: name };
   if (operativeArgs === undefined) return { kind: "undeclared", example: bare };
   if (operativeArgs.length === 0) return { kind: "unscoped", example: bare };
-  const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a) }));
+  const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a, opts) }));
   // An allow skips a relocating field the call leaves out, and a source, so
   // the fields it is about are the others — unless those are all there is.
   const active = operativeArgs.filter((a) => a.relocates !== true && a.source !== true);
@@ -1821,7 +1874,7 @@ export function ruleScopeFor(
     return {
       kind: "args",
       args,
-      example: { type: "alwaysAllow", pattern: `${name}(${allowGlob(first)})` },
+      example: { type: "alwaysAllow", pattern: `${name}(${allowGlob(name, first, opts)})` },
     };
   }
   return {
@@ -1939,8 +1992,33 @@ export function buildToolDetail(
     inputFields: inputFieldNames(tool),
     ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
     shapes: shapesRunning(key),
-    rules: ruleScopeFor(tool.name, tool.operativeArgs),
+    rules: ruleScopeOf(tool),
   };
+}
+
+/** {@link ruleScopeFor} for a tool the CLI loads, with what it says of its API. */
+function ruleScopeOf(tool: ToolLike): RuleScope {
+  return ruleScopeFor(tool.name, tool.operativeArgs, {
+    serviceDefaults: tool.serviceDefaults !== undefined,
+  });
+}
+
+/**
+ * What `crewhaus tools show <key>` says a scoped rule on the builtin `key`
+ * (registered as `name`) checks: read off the tool the CLI loads
+ * (`toolMap`), else, for a builtin only other shapes carry, off the
+ * manifest's flags (`shapeOnly`), which carry no `serviceDefaults`.
+ */
+export function toolsShowRuleScope(
+  key: string,
+  name: string,
+  toolMap: Readonly<Record<string, ToolLike>>,
+  shapeOnly: Readonly<Record<string, { readonly operativeArgs?: ReadonlyArray<OperativeArgLike> }>>,
+): RuleScope {
+  const tool = Object.hasOwn(toolMap, key) ? toolMap[key] : undefined;
+  if (tool !== undefined) return ruleScopeOf(tool);
+  const flags = Object.hasOwn(shapeOnly, key) ? shapeOnly[key] : undefined;
+  return ruleScopeFor(name, flags?.operativeArgs);
 }
 
 /**
@@ -1960,6 +2038,8 @@ export type ToolLike = {
   readonly inputSchema?: unknown;
   readonly jsonSchema?: unknown;
   readonly operativeArgs?: ReadonlyArray<OperativeArgLike>;
+  /** Present when the tool says which API a call that names none goes to. */
+  readonly serviceDefaults?: unknown;
 };
 
 /**

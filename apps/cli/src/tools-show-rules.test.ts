@@ -103,7 +103,7 @@ describe("operativeArgWords — a declaration in words", () => {
           service: "apiBaseUrl",
           ignoredWhen: "webhookUrlEnv",
         },
-        "a recipient; matched as https://host/channel with the origin of the API the call goes to (the one in apiBaseUrl, else the configured one), and also as channel on the API the tool is set up for; a deny or ask also reads the URL; ignored when the call names webhookUrlEnv: then a deny or ask reads it, an allow need not name it",
+        "a recipient; matched as https://host/channel with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL; ignored when the call names webhookUrlEnv: then a deny or ask reads it, an allow need not name it",
       ],
       [
         { field: "env", kind: "id", within: "name", overlay: "tenant" },
@@ -111,6 +111,35 @@ describe("operativeArgWords — a declaration in words", () => {
       ],
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
+  });
+
+  test("a value on a service reads the configured API only for a tool that has one", () => {
+    const repo: OperativeArgLike = {
+      field: "repo",
+      kind: "recipient",
+      within: "owner",
+      service: "baseUrl",
+    };
+    // A code host: a call that names no API goes to the configured one.
+    expect(operativeArgWords(repo, { serviceDefaults: true })).toBe(
+      "a recipient; matched as owner/repo; matched as https://host/owner/repo with the origin of the API the call goes to (the one in baseUrl, else the configured one), and also as owner/repo on the API the tool is set up for; a deny or ask also reads the URL",
+    );
+    expect(ruleScopeFor("IssueCreate", [repo], { serviceDefaults: true }).example.pattern).toBe(
+      "IssueCreate(acme/*)",
+    );
+    // A Chat tool has none: the example names the API's origin.
+    const messageId: OperativeArgLike = {
+      field: "messageId",
+      kind: "id",
+      within: "channel",
+      service: "apiBaseUrl",
+    };
+    expect(operativeArgWords(messageId)).toBe(
+      "an id; matched as channel/messageId; matched as https://host/channel/messageId with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL",
+    );
+    expect(ruleScopeFor("ChatDelete", [messageId]).example.pattern).toBe(
+      "ChatDelete(https://slack.com/C0123/*)",
+    );
   });
 
   test("a shell line says an allow reads each command, and which lines only a bare allow grants", async () => {
@@ -241,7 +270,9 @@ async function exampleMatches(key: string, input: unknown): Promise<boolean> {
     join(repoRoot, "packages", "tool-executor", "src", "index.ts")
   )) as { preparePermissionSubject: Subject };
   const tool = await builtin(key);
-  const scope = ruleScopeFor(tool.name, tool.operativeArgs);
+  const scope = ruleScopeFor(tool.name, tool.operativeArgs, {
+    serviceDefaults: tool.serviceDefaults !== undefined,
+  });
   const subject = preparePermissionSubject(tool, input);
   if (!subject.ok) throw new Error(`${key}: ${subject.reason}`);
   return matchesPattern(compilePattern(scope.example.pattern), tool.name, subject.input, {
@@ -253,6 +284,11 @@ async function exampleMatches(key: string, input: unknown): Promise<boolean> {
 }
 
 describe("the printed example works, through the real matcher", () => {
+  const slackApi = {
+    platform: "slack",
+    apiBaseUrl: "https://slack.com/api",
+    tokenEnv: "SLACK_BOT_TOKEN",
+  };
   // [key, a call the example covers, a call it does not]
   const cases: ReadonlyArray<readonly [string, unknown, unknown]> = [
     ["write", { path: "src/a.ts", content: "x" }, { path: "etc/a.ts", content: "x" }],
@@ -268,10 +304,34 @@ describe("the printed example works, through the real matcher", () => {
       { owner: "other", repo: "app", title: "t" },
     ],
     ["kvList", { namespace: "scratch", prefix: "a" }, { namespace: "prod", prefix: "a" }],
+    // A Chat tool acts only on a call that names its API (critic10): the
+    // example names the origin, and a call to another API is not covered.
+    [
+      "chatUpdate",
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1", text: "done" },
+      {
+        ...slackApi,
+        apiBaseUrl: "https://chat.example.org/api",
+        channel: "C0123",
+        text: "done",
+        messageId: "1700000000.1",
+      },
+    ],
     [
       "chatDelete",
-      { platform: "slack", channel: "C0123", messageId: "1700000000.1" },
-      { platform: "slack", channel: "C9999", messageId: "1700000000.1" },
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1" },
+      { ...slackApi, channel: "C9999", messageId: "1700000000.1" },
+    ],
+    [
+      "chatReact",
+      { ...slackApi, channel: "C0123", messageId: "1700000000.1", emoji: "eyes" },
+      {
+        ...slackApi,
+        apiBaseUrl: "https://chat.example.org/api",
+        channel: "C0123",
+        messageId: "1700000000.1",
+        emoji: "eyes",
+      },
     ],
     ["dnsLookup", { name: "api.example.com" }, { name: "example.org" }],
     ["gitAdd", { paths: ["src/a.ts"] }, { paths: ["docs/a.md"] }],

@@ -1130,10 +1130,12 @@ deny, warn or fail `--strict`; each says what to write instead.
   it is its own package and `ToolRegistry` its own tool.
 - **`crewhaus tools show <tool>` says what a permission rule on it
   checks**: each argument a scoped rule reads, in words (a path read from
-  `cwd`, a repository matched as `owner/repo`, what a left-out value stands
-  for, and for Bash and Shell that an allow must match every command in the
-  line), and an example rule to copy into `permissions.rules`. `--json`
-  carries the same answer.
+  `cwd`, a repository matched as `owner/repo`, a Chat channel with the
+  origin of the API the call names, what a left-out value stands for, and
+  for Bash and Shell that an allow must match every command in the line),
+  and an example rule to copy into `permissions.rules`, such as
+  `ChatDelete(https://slack.com/C0123/*)`. Every example matches a call the
+  tool runs. `--json` carries the same answer.
 - **`all-vector`**, a category holding VectorDelete alone.
 - **New `tool_config` keys**: the credential and destination lists above;
   `codeExecution.max_timeout_ms`; `imageGenerate.timeoutMs` and

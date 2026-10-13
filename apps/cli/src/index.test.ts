@@ -4076,6 +4076,22 @@ describe("crewhaus tools show / list — names and bad categories", () => {
     });
   }, 30_000);
 
+  test("show names the API's origin in a Chat tool's example: it has no API of its own (critic10)", async () => {
+    const r = await runCli(["tools", "show", "chatDelete", "--json"]);
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout).rules).toEqual({
+      kind: "args",
+      args: [
+        {
+          field: "messageId",
+          words:
+            "an id; matched as channel/messageId; matched as https://host/channel/messageId with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL",
+        },
+      ],
+      example: { type: "alwaysAllow", pattern: "ChatDelete(https://slack.com/C0123/*)" },
+    });
+  }, 30_000);
+
   test("show refuses a prototype member instead of printing a fake tool", async () => {
     const r = await runCli(["tools", "show", "constructor"]);
     expect(r.exitCode).toBe(1);
