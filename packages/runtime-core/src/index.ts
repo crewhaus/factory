@@ -22,7 +22,7 @@ import type {
 } from "@crewhaus/agent-context-isolation";
 import { classifyBoundary, setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { type WrappedAdapter, wrap as wrapWithCircuitBreaker } from "@crewhaus/circuit-breaker";
-import { autoCompact } from "@crewhaus/compaction-autocompact";
+import { autoCompact, planCompaction } from "@crewhaus/compaction-autocompact";
 import {
   type Item as CuratorItem,
   DEFAULT_DEDUPE_THRESHOLD,
@@ -5130,11 +5130,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const seed = opts.memory.recallSeed ?? opts.instructions;
       const k = opts.memory.recallK ?? 5;
       // Pillar 3 — a recalled memory can embed content shaped by untrusted
-      // tool output from an earlier session; `renderRecalledMemory` applies
-      // the same delimiter-safety + boundary-classification defenses the
-      // security fabric uses for every other prompt-bound source (#53).
+      // tool output from an earlier session; `renderRecalledMemory` classifies
+      // each line at TrustOrigin "memory" (redacting a malicious one),
+      // lineage-tags the admitted lines, and neutralizes breakout delimiters.
       const lines = await opts.memory.recall(seed, k);
-      const text = await renderRecalledMemory(lines);
+      const text = await renderRecalledMemory(lines, runContext);
       if (text !== undefined) {
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         out.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
@@ -5167,7 +5167,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const k = opts.memory?.recallK ?? 5;
     try {
       const lines = await recall(query, k);
-      const text = await renderRecalledMemory(lines);
+      const text = await renderRecalledMemory(lines, runContext);
       volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
       if (lines.length > 0) {
         out.write(`[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`);
@@ -8765,6 +8765,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 messages,
                 adapter: compactionAdapter,
                 model: compactionWireModelId,
+                contextLimit,
                 snipKeepHead,
                 snipKeepTail,
                 logger: runContext.logger,
@@ -8779,11 +8780,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   : {}),
               }).finally(() => out.spinner.stop());
               // §2.3 — persist the summary text alongside the counts (the
-              // reactive path always ends in autocompact's [marker, summary]).
-              const reactiveSummary =
-                compacted.length === 2 && typeof compacted[1]?.content === "string"
-                  ? compacted[1].content
-                  : undefined;
+              // reactive path always ends in autocompact's [marker, summary,
+              // final user turn]; the summary is the second message).
+              const reactiveSummary = summaryTextOf(compacted);
               messages.length = 0;
               messages.push(...compacted);
               await logEvent("compaction", {
@@ -10309,19 +10308,42 @@ async function curateActiveContext(
 }
 
 /**
- * Item 2 / G21 — render the recalled-memory system block body with the SAME
- * two defenses the session-start recall uses (#53): neutralize any
- * `</recalled_memory>` breakout delimiter inside a recalled line, and run the
- * assembled block through `classifyBoundary` with origin `"user"` (recalled
- * lines may embed content shaped by untrusted tool output in an earlier
- * session). Returns `undefined` when there is nothing to recall.
+ * Item 2 / G21 — render the recalled-memory system block for both recall
+ * modes (#53). Pillar 3: every line is classified at TrustOrigin `"memory"`
+ * BEFORE it reaches the system prompt, because a fact, wiki article, or
+ * session summary written in an earlier session may have absorbed attacker
+ * text, and the system region has no post-tool classifier behind it. A
+ * malicious line is replaced by the redaction notice; a suspicious one is kept
+ * and logged; an admitted line is lineage-tagged for the egress fabric. Each
+ * line then has any
+ * `</recalled_memory>` breakout delimiter neutralized. A classifier rejection
+ * propagates, so both callers fail closed. Returns `undefined` when there is
+ * nothing to recall.
  */
-async function renderRecalledMemory(lines: readonly string[]): Promise<string | undefined> {
+async function renderRecalledMemory(
+  lines: readonly string[],
+  runContext: RunContext,
+): Promise<string | undefined> {
   if (lines.length === 0) return undefined;
-  const body = lines.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
-  const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
-  await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
-  return text;
+  const rendered: string[] = [];
+  for (const line of lines) {
+    const boundary = await classifyBoundary(line, { origin: "memory" });
+    const rules = [...new Set(boundary.verdict.hits.map((h) => h.rule))];
+    if (boundary.action === "redact") {
+      runContext.logger.warn("recalled memory line redacted (prompt injection detected)", {
+        rules,
+      });
+      rendered.push(boundary.redacted ?? "");
+      continue;
+    }
+    if (boundary.action === "warn") {
+      runContext.logger.warn("suspicious recalled memory line kept", { rules });
+    }
+    tagContent(runContext, line, "memory");
+    rendered.push(line);
+  }
+  const body = rendered.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
+  return `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
 }
 
 /**
@@ -10576,17 +10598,16 @@ async function maybeCompact(
   }
 
   logger.info("autocompact triggered", { tokensAfterSnip: effectiveTokens(snipped) });
-  // §2.3 — autocompact replaces the ENTIRE history; externalize all of it
-  // before the summarizer model call so the records survive even a
-  // summarizer failure. The ledger anchor is read afterwards so this
-  // step's evictions are part of it.
-  if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
-  const ledgerText = getLedgerText?.();
-  const after = await autoCompact(snipped, adapter, model, {
-    ...(ledgerText !== undefined ? { ledgerText } : {}),
+  const after = await summarizeHistory({
+    snipped,
+    adapter,
+    model,
+    contextLimit,
+    ...(onEvict !== undefined ? { onEvict } : {}),
+    ...(getLedgerText !== undefined ? { getLedgerText } : {}),
     ...(bus !== undefined ? { bus } : {}),
-    ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
-    ...(compactionParams !== undefined ? { params: compactionParams } : {}),
+    ...(compactionSpecModel !== undefined ? { compactionSpecModel } : {}),
+    ...(compactionParams !== undefined ? { compactionParams } : {}),
   });
   if (onCompaction !== undefined) {
     const summary = summaryTextOf(after);
@@ -10604,6 +10625,8 @@ type ForceCompactArgs = {
   messages: Anthropic.MessageParam[];
   adapter: ProviderAdapter;
   model: string;
+  /** Bounds the pending message kept verbatim — see {@link summarizeHistory}. */
+  contextLimit: number;
   snipKeepHead: number;
   snipKeepTail: number;
   logger: RunContext["logger"];
@@ -10630,6 +10653,7 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
     messages,
     adapter,
     model,
+    contextLimit,
     snipKeepHead,
     snipKeepTail,
     logger,
@@ -10641,19 +10665,78 @@ async function forceCompact(args: ForceCompactArgs): Promise<Anthropic.MessagePa
   } = args;
   const snipped = snip(messages, snipKeepHead, snipKeepTail);
   // §2.3 — same externalize-before-drop contract as the pre-turn ladder:
-  // the snip diff first, then the full remaining history autocompact is
-  // about to replace (disjoint sets, so no record is written twice).
+  // the snip diff first, then what autocompact is about to replace
+  // (disjoint sets, so no record is written twice).
   if (onEvict !== undefined) {
     const evicted = snippedAway(messages, snipped);
     if (evicted.length > 0) await onEvict(evicted);
   }
   logger.info("reactive snip applied", { before: messages.length, after: snipped.length });
-  if (onEvict !== undefined && snipped.length > 0) await onEvict(snipped);
-  const ledgerText = getLedgerText?.();
-  return await autoCompact(snipped, adapter, model, {
-    ...(ledgerText !== undefined ? { ledgerText } : {}),
+  return await summarizeHistory({
+    snipped,
+    adapter,
+    model,
+    contextLimit,
+    ...(onEvict !== undefined ? { onEvict } : {}),
+    ...(getLedgerText !== undefined ? { getLedgerText } : {}),
     ...(bus !== undefined ? { bus } : {}),
-    ...(compactionSpecModel !== undefined ? { specModel: compactionSpecModel } : {}),
-    ...(compactionParams !== undefined ? { params: compactionParams } : {}),
+    ...(compactionSpecModel !== undefined ? { compactionSpecModel } : {}),
+    ...(compactionParams !== undefined ? { compactionParams } : {}),
   });
+}
+
+/**
+ * The pending user message survives compaction verbatim only while it is at
+ * most this share of the context limit, so keeping it can never push the
+ * compacted history back over the trigger threshold.
+ */
+const KEEP_PENDING_CONTEXT_SHARE = 0.25;
+
+type SummarizeHistoryArgs = {
+  snipped: ReadonlyArray<Anthropic.MessageParam>;
+  adapter: ProviderAdapter;
+  model: string;
+  contextLimit: number;
+  onEvict?: (evicted: ReadonlyArray<Anthropic.MessageParam>) => Promise<void>;
+  getLedgerText?: () => string | undefined;
+  bus?: TraceEventBus;
+  compactionSpecModel?: string;
+  compactionParams?: AuxRequestParams;
+};
+
+/**
+ * The autocompact step shared by the pre-turn ladder and the reactive path.
+ *
+ * autoCompact ends the history on a user turn — the pending user message
+ * kept verbatim, or a continuation notice — because current Claude models
+ * reject a trailing assistant turn as prefill. This wrapper keeps the
+ * runtime's two contracts intact around that:
+ *  - §2.3 externalize-before-drop: exactly `plan.toSummarize` is evicted,
+ *    before the summarizer call, so a kept message is never ALSO copied into
+ *    the requirements ledger. `planCompaction` is pure, so this plan and the
+ *    one autoCompact computes agree given the same `keepPendingMaxTokens`.
+ *  - §7.2.1 human-text routing: the marker and the continuation notice are
+ *    runtime-injected, so they are marked synthetic. A kept message is the
+ *    original object and keeps whatever mark it already had.
+ */
+async function summarizeHistory(args: SummarizeHistoryArgs): Promise<Anthropic.MessageParam[]> {
+  const { snipped, adapter, model, contextLimit, onEvict, getLedgerText } = args;
+  const keepPendingMaxTokens = Math.floor(contextLimit * KEEP_PENDING_CONTEXT_SHARE);
+  const plan = planCompaction(snipped, { keepPendingMaxTokens });
+  // §2.3 — externalize what the summary replaces before the summarizer
+  // call, so the records survive even a summarizer failure. The ledger
+  // anchor is read afterwards so this step's evictions are part of it.
+  if (onEvict !== undefined && plan.toSummarize.length > 0) await onEvict(plan.toSummarize);
+  const ledgerText = getLedgerText?.();
+  const after = await autoCompact(snipped, adapter, model, {
+    keepPendingMaxTokens,
+    ...(ledgerText !== undefined ? { ledgerText } : {}),
+    ...(args.bus !== undefined ? { bus: args.bus } : {}),
+    ...(args.compactionSpecModel !== undefined ? { specModel: args.compactionSpecModel } : {}),
+    ...(args.compactionParams !== undefined ? { params: args.compactionParams } : {}),
+  });
+  const [marker, , final] = after;
+  if (marker !== undefined) markSynthetic(marker);
+  if (final !== undefined && final !== plan.kept) markSynthetic(final);
+  return after;
 }

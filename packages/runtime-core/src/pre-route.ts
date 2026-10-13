@@ -31,11 +31,13 @@
  *      reason `classifier failed`;
  *   6. otherwise the hint only carries `eligible[]` and the policy decides.
  *
- * Also here: the SYNTHETIC-message marker. runtime-core pushes five kinds of
+ * Also here: the SYNTHETIC-message marker. runtime-core pushes six kinds of
  * non-human `role: "user"` messages onto the transcript (the grader-rationale
  * correction, the continue nudge, the tombstone retry, loop-detection
- * notices, the resume/toolset marker); they are `synthetic: true` in the
- * event log and marked in memory here so `latestHumanUserMessage` — the
+ * notices, the resume/toolset marker, and autocompact's summary marker and
+ * continuation notice); the first five are `synthetic: true` in the event
+ * log (compaction output is never logged as a user message), and all are
+ * marked in memory here so `latestHumanUserMessage` — the
  * text the rules and the classifier read — never sees them (a `/model fast`
  * echoed inside a judge's rationale must not steer routing, §7.2.1).
  * Directives themselves are parsed at the typed INPUT seams (the REPL input,

@@ -17,6 +17,7 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/model-plan": "workspace:*",
+    "@crewhaus/token-budget": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
   },
   "license": "Apache-2.0",
