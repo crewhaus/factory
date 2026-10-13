@@ -3035,7 +3035,9 @@
       "name": "@crewhaus/tool-memory",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",

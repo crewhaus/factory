@@ -110,9 +110,10 @@ const ORIGIN_DEFAULT_POLICY: SeverityMatrix = {
   compaction: { "external-configured": "warn", "external-dynamic": "block" },
   tool: { "external-configured": "warn", "external-dynamic": "block" },
   chain: { "external-configured": "warn", "external-dynamic": "block" },
-  // 0.3.0: recalled wiki/fact content (tagged by tool-wiki's read tools, and
-  // line by line by runtime-core's renderRecalledMemory for the fact, wiki
-  // and session-summary lines auto-recall puts in the system prompt).
+  // 0.3.0: recalled wiki/fact content (tagged by tool-wiki's read tools, by
+  // tool-memory's Recall for each memory it returns, and line by line by
+  // runtime-core's renderRecalledMemory for the fact, wiki and session-summary
+  // lines auto-recall puts in the system prompt).
   // Same tier as "skill" — disk-persisted content whose exfiltration to an
   // unauthorised sink is the memory-poisoning lateral-move pattern.
   memory: { "external-configured": "warn", "external-dynamic": "block" },

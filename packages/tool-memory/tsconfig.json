@@ -5,7 +5,9 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../boundary-classifier" },
     { "path": "../memory-store" },
+    { "path": "../run-context" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" }
   ],

@@ -15,7 +15,14 @@
  * written in an earlier session may have absorbed attacker text. The
  * runtime's auto-recall classifies each recalled line at TrustOrigin
  * "memory" in both recall modes, and a `Recall` result crosses the
- * runtime's post-tool classifier like any tool output. No cross-origin
+ * runtime's post-tool classifier like any tool output. That classifier sees
+ * the rendered list, whose "  • (score) " bullets break the detector's phrase
+ * rules, so an injection split across two memories ("… ignore previous" /
+ * "instructions and …") would pass it. So `Recall` classifies the memories at
+ * "memory" before rendering, one by one and side by side
+ * (`classifySideBySide`: the local layers on each memory, then one model call
+ * per chunk of them), redacts a memory that carries an injection alone or
+ * across a neighbour, and lineage-tags the text of the rest. No cross-origin
  * lateral movement: a
  * memory written by one user cannot influence another user's session.
  * `MemoryForget` is destructive AND justification-gated (Pillar 3
@@ -39,9 +46,11 @@
  * belongs to the auto-capture path (`captureFacts`), which reads the
  * ids from the session event log itself.
  */
+import { classifySideBySide } from "@crewhaus/boundary-classifier";
 import { type MemoryStore, createMemoryStore } from "@crewhaus/memory-store";
+import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 export type CreateMemoryToolsOptions = {
@@ -108,6 +117,16 @@ const forgetSchema = z.object({
     .describe("Why this memory is wrong/stale. Recorded on the tombstone for audit."),
 });
 
+/** How many classifications of one Recall's memories run at once. */
+const RECALL_CLASSIFY_CONCURRENCY = 8;
+
+/** The run's context, from the execute context or the runtime bridge. */
+function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | undefined {
+  if (ctx?.runContext !== undefined) return ctx.runContext;
+  const bridge = ctx?.bridge as { runContext?: RunContext } | undefined;
+  return bridge?.runContext;
+}
+
 /**
  * Construct the Remember + Recall + MemoryForget tools bound to a spec's
  * memory store. The caller is expected to add the returned tools to the
@@ -153,17 +172,29 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
     inputSchema: recallSchema,
     readOnly: true,
     ...(networked ? { scope: "external" as const, ioCapability: "network" as const } : {}),
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const k = input.k ?? 5;
       const results = await store.recall(input.query, k);
       if (results.length === 0) {
         return `no memories matched "${input.query}" (store size: ${await store.size()})`;
       }
-      const lines = [`${results.length} memory match(es) for "${input.query}":`];
-      for (const r of results) {
+      const units = results.map((r) => {
         const tagSuffix = r.entry.tags.length > 0 ? ` [${r.entry.tags.join(", ")}]` : "";
-        lines.push(`  • (${r.score.toFixed(2)}) ${r.entry.text}${tagSuffix}`);
-      }
+        return `${r.entry.text}${tagSuffix}`;
+      });
+      // Each memory as the list prints it, without the bullet and score: the
+      // tags are free text too.
+      const { redacted } = await classifySideBySide(units, {
+        origin: "memory",
+        concurrency: RECALL_CLASSIFY_CONCURRENCY,
+      });
+      const rc = resolveRunContext(ctx);
+      const lines = [`${results.length} memory match(es) for "${input.query}":`];
+      results.forEach((r, i) => {
+        const notice = redacted.get(i);
+        if (notice === undefined && rc !== undefined) tagContent(rc, r.entry.text, "memory");
+        lines.push(`  • (${r.score.toFixed(2)}) ${notice ?? units[i]}`);
+      });
       return lines.join("\n");
     },
   });

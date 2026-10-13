@@ -273,6 +273,11 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   // 0.3.0 memory release: recalled wiki bodies re-enter the model context
   // across a session boundary — classified at the "memory" origin.
   { name: "tool-wiki", path: "packages/tool-wiki/src/index.ts" },
+  // The Recall tool's memories, classified side by side at the "memory"
+  // origin before they are rendered (the post-tool classifier reads the
+  // bulleted list, whose bullets hide a phrase split across two memories),
+  // and lineage-tagged.
+  { name: "tool-memory", path: "packages/tool-memory/src/index.ts", requireTag: true },
   // 0.6.0 model-plan release (§7.5, §10.1): a Consult reply — a roster
   // sibling's model output — re-enters the parent's context; classified
   // at the "consult" origin AND lineage-tagged inside the tool (the runtime
@@ -292,9 +297,9 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   },
   // Auto-recall: fact, wiki, and session-summary lines recalled from earlier
   // sessions are rendered into the system region as `<recalled_memory>`; each
-  // line, then the admitted lines joined (an injection split across two of
-  // them), is classified at TrustOrigin "memory", and the lines still admitted
-  // are lineage-tagged right before.
+  // line is classified at TrustOrigin "memory", then the admitted lines side
+  // by side (boundary-classifier's classifySideBySide), and the lines
+  // still admitted are lineage-tagged right before.
   {
     name: "runtime-core-recalled-memory",
     path: "packages/runtime-core/src/index.ts",
@@ -302,7 +307,8 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
     // The template literal that builds the block — the bare tag also appears
     // in doc comments elsewhere in the file.
     anchor: "`<recalled_memory>\\nRelevant facts",
-    window: 1500,
+    // The per-line classifyBoundary opens the function, about 1.4k chars up.
+    window: 2500,
   },
   // 0.6.0 §7.3 / §10.1 — the VERIFIER reply path: on a failing in-loop grade
   // the judge's rationale (a model output) is interpolated into a synthetic

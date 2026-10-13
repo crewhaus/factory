@@ -372,12 +372,13 @@ describe("auditBoundarySite — anchored reply paths", () => {
     ]);
   });
 
-  test("the shipped sites hold against this tree: Consult, the guide reply path, and recalled memory are classified and tagged", () => {
+  test("the shipped sites hold against this tree: Consult, the guide reply path, recalled memory and Recall are classified and tagged", () => {
     const root = join(import.meta.dir, "..", "..", "..");
     for (const name of [
       "tool-consult",
       "runtime-core-guide-reply",
       "runtime-core-recalled-memory",
+      "tool-memory",
     ]) {
       const site = BOUNDARY_SITES.find((s) => s.name === name);
       if (site === undefined) throw new Error(`site ${name} missing`);
