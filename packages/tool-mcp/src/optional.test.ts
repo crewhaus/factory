@@ -12,6 +12,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpError } from "@crewhaus/errors";
 import type { McpHost, McpServerConfig, McpToolDefinition } from "@crewhaus/mcp-host";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
@@ -139,6 +140,85 @@ function makeTimers() {
     delays: () => queue.map((q) => q.ms),
     cleared,
   };
+}
+
+/** A workspace package's entry file, resolved from THIS file: the checkout
+ *  under test, never a published release. */
+const inTree = (specifier: string): string =>
+  JSON.stringify(fileURLToPath(import.meta.resolve(specifier)));
+
+/**
+ * Run `body` as a real `bun` process against this checkout; return how it
+ * exited and what it reported once its work was done.
+ *
+ * The script sits in a tmp dir with no node_modules above it, so a BARE
+ * `@crewhaus/*` import there never reaches the workspace: bun's
+ * auto-installer fetches the last published release from npm instead. From
+ * a cold cache that is ~25 MB, so a slow registry alone could blow a 20 s
+ * budget (CI run 38435291702). Nor did the auto-installed tree reliably
+ * import at all: the script could die resolving a dependency, which an
+ * exit-only check counted as a pass. Every import is therefore an absolute
+ * path, and `--no-install` makes a stray bare specifier fail loudly, offline.
+ *
+ * mcp-host's REF'D reconnect ladder is the handle that would hold the
+ * process open, so the script counts it through mcp-host's own timer seam
+ * and reports the count: a leak fails on that number, not on how long a
+ * loaded runner takes to start bun. A pending timer also exits 3, so the
+ * test never waits one out; with none pending the script exits on its own,
+ * which is the property under test.
+ */
+async function runAgainstTree(body: string): Promise<{ exitCode: number; report: unknown }> {
+  const dir = mkdtempSync(join(tmpdir(), "optional-exit-"));
+  const script = join(dir, "run.ts");
+  try {
+    await Bun.write(
+      script,
+      `import { McpHost } from ${inTree("@crewhaus/mcp-host")};
+import { ToolCatalog } from ${inTree("@crewhaus/tool-catalog")};
+import { registerOptionalMcpServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
+const pending = new Set<unknown>();
+const host = new McpHost({
+  clientOptions: {
+    setTimer: (cb: () => void, ms: number) => {
+      const t = setTimeout(() => {
+        pending.delete(t);
+        cb();
+      }, ms);
+      pending.add(t);
+      return t;
+    },
+    clearTimer: (t: unknown) => {
+      pending.delete(t);
+      clearTimeout(t as ReturnType<typeof setTimeout>);
+    },
+  },
+});
+${body}
+const state = host.getClient("peer").getState().kind;
+console.log(JSON.stringify({ state, pendingReconnects: pending.size }));
+if (pending.size > 0) process.exit(3);
+`,
+    );
+    const proc = Bun.spawn([process.execPath, "--no-install", script], {
+      cwd: join(import.meta.dir, ".."),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    // No report means the script died before its work was done (an import
+    // that did not resolve, say): say why, not just that it exited.
+    const line = stdout.trim().split("\n").at(-1) ?? "";
+    if (!line.startsWith("{")) {
+      throw new Error(`the script exited ${exitCode} without reporting:\n${stderr}`);
+    }
+    return { exitCode, report: JSON.parse(line) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 describe("registerOptionalMcpServer", () => {
@@ -306,34 +386,18 @@ describe("registerOptionalMcpServer", () => {
     // that. mcp-host arms its own REF'D reconnect ladder off the failed
     // connect's transport close; `retry: false` must cancel it, or a
     // finished cli/crew/workflow run hangs forever with its work done.
-    const dir = mkdtempSync(join(tmpdir(), "optional-exit-"));
-    const script = join(dir, "run.ts");
-    await Bun.write(
-      script,
-      `import { McpHost } from "@crewhaus/mcp-host";
-import { ToolCatalog } from "@crewhaus/tool-catalog";
-import { registerOptionalMcpServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
-const host = new McpHost();
-const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
+    const script = `const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
   retry: false,
   config: () => ({ transport: "stdio", command: "/nonexistent/mcp-server-binary" }),
   log: () => {},
 });
-await h.firstAttempt;
-`,
-    );
-    const proc = Bun.spawn(["bun", script], {
-      cwd: join(import.meta.dir, ".."),
-      stdout: "ignore",
-      stderr: "ignore",
+await h.firstAttempt;`;
+    expect(await runAgainstTree(script)).toEqual({
+      exitCode: 0,
+      report: { state: "closed", pendingReconnects: 0 },
     });
-    const exited = await Promise.race([
-      proc.exited,
-      new Promise<"hung">((r) => setTimeout(() => r("hung"), 20_000)),
-    ]);
-    if (exited === "hung") proc.kill();
-    rmSync(dir, { recursive: true, force: true });
-    expect(exited).not.toBe("hung");
+    // The 30 s timeout is a backstop for a handle the count cannot see, not
+    // the assertion: a clean run takes well under a second.
   }, 30_000);
 
   test("a retrying surface exits once its host disconnects (the shape's own cleanup)", async () => {
@@ -341,35 +405,17 @@ await h.firstAttempt;
     // IS the retry. The shapes that use it either run forever (channel,
     // batch) or call disconnectAll() when their work ends (research); this
     // pins the second, which is the one that could otherwise hang.
-    const dir = mkdtempSync(join(tmpdir(), "optional-cleanup-"));
-    const script = join(dir, "run.ts");
-    await Bun.write(
-      script,
-      `import { McpHost } from "@crewhaus/mcp-host";
-import { ToolCatalog } from "@crewhaus/tool-catalog";
-import { registerOptionalMcpServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
-const host = new McpHost();
-const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
+    const script = `const h = registerOptionalMcpServer(host, "peer", new ToolCatalog(), {
   config: () => ({ transport: "stdio", command: "/nonexistent/mcp-server-binary" }),
   log: () => {},
 });
 await h.firstAttempt;
 h.stop();
-await host.disconnectAll();
-`,
-    );
-    const proc = Bun.spawn(["bun", script], {
-      cwd: join(import.meta.dir, ".."),
-      stdout: "ignore",
-      stderr: "ignore",
+await host.disconnectAll();`;
+    expect(await runAgainstTree(script)).toEqual({
+      exitCode: 0,
+      report: { state: "closed", pendingReconnects: 0 },
     });
-    const exited = await Promise.race([
-      proc.exited,
-      new Promise<"hung">((r) => setTimeout(() => r("hung"), 20_000)),
-    ]);
-    if (exited === "hung") proc.kill();
-    rmSync(dir, { recursive: true, force: true });
-    expect(exited).not.toBe("hung");
   }, 30_000);
 
   test("never throws: an unknown server name degrades and retries", async () => {
