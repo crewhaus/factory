@@ -1050,3 +1050,95 @@ describe("every command a shell parses is read as the commands it runs", () => {
     expect(declared).toEqual(["Bash", "Shell"]);
   });
 });
+
+/**
+ * A tool that reaches the API its tool_config is set up for unless a call
+ * names another (an API root in `baseUrl`, `apiBaseUrl`) acts on a
+ * repository or a channel ON that API. A rule that read only the repository
+ * granted it on every allow-listed host, and no deny written on a host fired.
+ * So every value such a tool reads declares the field as its `service`, and
+ * says where a call that names none goes (`serviceDefaults`). The scope is
+ * read from the schemas: any top-level string field whose name ends in
+ * `baseUrl`.
+ */
+describe("a rule on a tool a call can point at another API reads which API (service)", () => {
+  const API_ROOT = /base_?url$/i;
+  /** Whether a field holds one string, looking through optional and the like. */
+  function holdsString(schema: unknown): boolean {
+    let current = schema as { _def?: Record<string, unknown> } | undefined;
+    for (let depth = 0; depth < 16 && current !== undefined; depth++) {
+      const def = current._def ?? {};
+      if (def["typeName"] === "ZodString") return true;
+      current = (def["innerType"] ?? def["schema"]) as typeof current;
+    }
+    return false;
+  }
+  /** Each builtin that declares where it acts and takes an API root, with the field. */
+  function pointable(): Array<{ tool: RegisteredTool; field: string }> {
+    const out: Array<{ tool: RegisteredTool; field: string }> = [];
+    for (const tool of builtins) {
+      if ((tool.operativeArgs ?? []).length === 0) continue;
+      const shape = shapeOf(tool.inputSchema);
+      for (const [field, schema] of Object.entries(shape ?? {})) {
+        if (API_ROOT.test(field) && holdsString(schema)) out.push({ tool, field });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The tools that declare a `service` with no `serviceDefaults`: a call that
+   * names no API is never sent to one, so there is nowhere else to read.
+   */
+  const NO_DEFAULT_API: Readonly<Record<string, string>> = {
+    ChatDelete: "API mode needs apiBaseUrl and tokenEnv; an incoming webhook cannot delete",
+    ChatPost: "API mode needs apiBaseUrl and tokenEnv; without them it posts to a webhook",
+    ChatReact: "API mode needs apiBaseUrl and tokenEnv; an incoming webhook cannot react",
+    ChatUpdate: "API mode needs apiBaseUrl and tokenEnv; an incoming webhook cannot edit",
+  };
+
+  test("the sweep finds the code-host and Chat tools", () => {
+    const names = new Set(pointable().map(({ tool }) => tool.name));
+    // The guard's own hit count: a sweep that cannot read the schemas finds nothing.
+    expect(names.size).toBeGreaterThanOrEqual(28);
+    for (const known of [
+      "IssueCreate",
+      "WorkflowRunRerun",
+      "SearchIssues",
+      "ChatPost",
+      "ChatDelete",
+    ]) {
+      expect(names.has(known)).toBe(true);
+    }
+  });
+
+  test("every repository or channel value names the API root as its service", () => {
+    const offenders: string[] = [];
+    for (const { tool, field } of pointable()) {
+      const args = tool.operativeArgs ?? [];
+      // A field a call names INSTEAD of the API (ChatPost's webhook): the
+      // value the tool ignores then says so with `ignoredWhen`.
+      const instead = new Set(
+        args.flatMap((a) => (a.ignoredWhen !== undefined ? [a.ignoredWhen] : [])),
+      );
+      for (const arg of args) {
+        if (arg.kind !== "id" && arg.kind !== "recipient") continue;
+        if (instead.has(arg.field)) continue;
+        if (arg.service !== field) offenders.push(`${tool.name}.${arg.field}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("each one says where a call that names no API goes, or is a reviewed exception", () => {
+    const declaring = builtins.filter((t) =>
+      (t.operativeArgs ?? []).some((a) => a.service !== undefined),
+    );
+    expect(declaring.length).toBeGreaterThanOrEqual(28);
+    const without = declaring
+      .filter((t) => t.serviceDefaults === undefined)
+      .map((t) => t.name)
+      .sort();
+    expect(without).toEqual(Object.keys(NO_DEFAULT_API).sort());
+  });
+});
