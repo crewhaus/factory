@@ -58,13 +58,15 @@ describe("DeFi replies are bounded", () => {
     expect(inits[0]?.["decompress"]).toBe(false);
   }, 20_000);
 
+  // Slow by construction too (it inflates up to the RPC cap): usually under a
+  // second on CI, but a loaded runner took it past bun's 5 s default.
   test("a gzip bomb RPC reply is refused at the cap", async () => {
     answer = gz(bomb);
     const out = await rpcCall("https://rpc.example.test/key", "eth_blockNumber", []);
     expect(out).toMatchObject({ ok: false, kind: "malformed" });
     expect(!out.ok && out.message).toContain("refusing to answer from a prefix");
     expect(inits[0]?.["decompress"]).toBe(false);
-  });
+  }, 30_000);
 
   test("a compressed reply is decoded", async () => {
     answer = gz(gzipSync('{"jsonrpc":"2.0","id":1,"result":"0x10"}'));
