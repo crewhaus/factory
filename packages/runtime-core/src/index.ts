@@ -10315,8 +10315,10 @@ async function curateActiveContext(
  * session summary written in an earlier session may have absorbed attacker
  * text, and the system region has no post-tool classifier behind it. A
  * malicious line is replaced by the redaction notice; a suspicious one is kept
- * and logged; an admitted line is lineage-tagged for the egress fabric. Each
- * line then has any
+ * and logged. The admitted lines are then classified together, so an injection
+ * split across two of them is redacted too (see `redactSplitInjections`); each
+ * line still admitted is lineage-tagged for the egress fabric. Each line then
+ * has any
  * `</recalled_memory>` breakout delimiter neutralized. A classifier rejection
  * propagates, so both callers fail closed. Returns `undefined` when there is
  * nothing to recall.
@@ -10326,25 +10328,85 @@ async function renderRecalledMemory(
   runContext: RunContext,
 ): Promise<string | undefined> {
   if (lines.length === 0) return undefined;
-  const rendered: string[] = [];
-  for (const line of lines) {
+  const rendered = [...lines];
+  const admitted: number[] = [];
+  for (const [i, line] of lines.entries()) {
     const boundary = await classifyBoundary(line, { origin: "memory" });
     const rules = [...new Set(boundary.verdict.hits.map((h) => h.rule))];
     if (boundary.action === "redact") {
       runContext.logger.warn("recalled memory line redacted (prompt injection detected)", {
         rules,
       });
-      rendered.push(boundary.redacted ?? "");
+      rendered[i] = boundary.redacted ?? "";
       continue;
     }
     if (boundary.action === "warn") {
       runContext.logger.warn("suspicious recalled memory line kept", { rules });
     }
-    tagContent(runContext, line, "memory");
-    rendered.push(line);
+    admitted.push(i);
   }
+  const split = await redactSplitInjections(
+    admitted.map((i) => lines[i] as string),
+    runContext,
+  );
+  admitted.forEach((i, j) => {
+    const notice = split.get(j);
+    if (notice !== undefined) rendered[i] = notice;
+    else tagContent(runContext, lines[i] as string, "memory");
+  });
   const body = rendered.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
   return `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
+}
+
+/**
+ * Pillar 3 — an injection split across recalled lines. Each of `lines` passed
+ * classification on its own, but an attacker who can plant two memories that
+ * recall side by side can split one phrase between them ("… ignore previous" /
+ * "instructions and …"): each half classifies clean, and the model still reads
+ * one sentence. So the lines are also classified joined with "\n" at
+ * TrustOrigin `"memory"`. The raw join, not the rendered block, because the
+ * block's `- ` bullets break the detector's phrase rules without breaking the
+ * sentence for the model. When the join is malicious, each adjacent pair is
+ * classified and both lines of a malicious pair are redacted. When no pair
+ * reproduces the verdict, or the lines left still join malicious (a split over
+ * three lines, or weak hits that only add up across the block), every line is
+ * redacted: fail closed. Returns the redaction notice for each line to redact,
+ * by index into `lines`; a classifier rejection propagates.
+ */
+async function redactSplitInjections(
+  lines: readonly string[],
+  runContext: RunContext,
+): Promise<Map<number, string>> {
+  const redacted = new Map<number, string>();
+  if (lines.length < 2) return redacted;
+  const joined = await classifyBoundary(lines.join("\n"), { origin: "memory" });
+  if (joined.action !== "redact") return redacted;
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const pair = await classifyBoundary(`${lines[i]}\n${lines[i + 1]}`, { origin: "memory" });
+    if (pair.action !== "redact") continue;
+    runContext.logger.warn("recalled memory lines redacted (prompt injection split across lines)", {
+      rules: [...new Set(pair.verdict.hits.map((h) => h.rule))],
+    });
+    redacted.set(i, pair.redacted ?? "");
+    redacted.set(i + 1, pair.redacted ?? "");
+  }
+  const left = lines.filter((_, i) => !redacted.has(i));
+  const residual =
+    redacted.size === 0
+      ? joined
+      : left.length > 1
+        ? await classifyBoundary(left.join("\n"), { origin: "memory" })
+        : undefined;
+  if (residual?.action === "redact") {
+    runContext.logger.warn(
+      "recalled memory lines redacted (prompt injection across lines not localized to a pair)",
+      { rules: [...new Set(residual.verdict.hits.map((h) => h.rule))] },
+    );
+    for (let i = 0; i < lines.length; i++) {
+      if (!redacted.has(i)) redacted.set(i, residual.redacted ?? "");
+    }
+  }
+  return redacted;
 }
 
 /**

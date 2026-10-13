@@ -189,8 +189,10 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
     // Every line reached classifyBoundary on its own, raw (the classifier sees
     // what the earlier session wrote, before delimiter escaping), at the
     // "memory" origin whose default policy blocks — not the "user" pass tier.
+    // Then the admitted lines once more, joined raw with "\n" (no bullets), so
+    // an injection split across two lines is seen whole.
     const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
-    expect(memoryCalls.map((c) => c.text)).toEqual(lines);
+    expect(memoryCalls.map((c) => c.text)).toEqual([...lines, lines.join("\n")]);
   });
 
   // A classifier rejection must never admit a recalled line unclassified: it
