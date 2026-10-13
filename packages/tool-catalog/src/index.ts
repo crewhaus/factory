@@ -243,7 +243,11 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * For a `path`, `within` names the
  * directory the path is relative to (`{ field: "paths", kind: "path", within:
  * "cwd" }`), and the joined path is what gets resolved. When the call leaves
- * the qualifying field out, the value is matched on its own. Either way, a
+ * the qualifying field out, the value is matched on its own — or, with
+ * `withinDefault`, joined to the directory the tool uses then: TempDir's
+ * `{ field: "name", kind: "path", within: "base", withinDefault: ".tmp" }`
+ * is `.tmp/scratch` for `{ name: "scratch" }`, the directory it makes. A
+ * `withinDefault` is relative and stays in the workspace. Either way, a
  * path that is absolute or has a `..` segment is read as outside the
  * workspace — no allow grants it, every deny or ask fires: such a tool hands
  * the path on as written to a program running in the directory, which follows
@@ -394,6 +398,12 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * its `sessionsDir`): a deny or ask naming anything in the store fires,
  * on its default as well, and an allow still skips the default beside a
  * record.
+ * `beneathWhen`, beside `beneath`, names a top-level boolean field without
+ * which the tool acts on the path alone: a call that sets it `true` stands
+ * for what lies beneath too, and one that does not for the path itself.
+ * TempDir makes a directory, and empties it first only when `clear` is
+ * true, so `alwaysDeny *(**` + `/.env)` fires on `TempDir work clear` and
+ * not on a plain `TempDir work`. A `relocates` field cannot declare it.
  *
  * `opens`, for a `path` naming a directory, lists the fixed places inside it
  * the tool opens, relative to it: a file (`{ path:
@@ -476,14 +486,15 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
  * whose dangerous mode hangs on a flag should gate that mode itself — for
  * example with `requireJustification` — rather than rely on a scoped rule.
- * (`hiddenWhen` is the one switch a rule reads: it widens what a walk
- * stands for, never what an allow grants.)
+ * (`hiddenWhen` and `beneathWhen` are the switches a rule reads: they widen
+ * what a path stands for, never what an allow grants.)
  */
 export type OperativeArg = {
   readonly field: string;
   readonly kind: OperativeArgKind;
   readonly default?: string;
   readonly within?: string;
+  readonly withinDefault?: string;
   readonly service?: string;
   readonly overlay?: string;
   readonly ignoredWhen?: string;
@@ -493,6 +504,7 @@ export type OperativeArg = {
   readonly prefix?: true;
   readonly beneath?: "all" | "visible";
   readonly hiddenWhen?: string;
+  readonly beneathWhen?: string;
   readonly opens?: ReadonlyArray<OperativeOpening>;
   readonly defaultAtRoot?: true;
   readonly glob?: true;

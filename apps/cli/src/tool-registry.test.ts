@@ -1162,6 +1162,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
     expect([...keysSeen].sort()).toEqual(
       [
         "beneath",
+        "beneathWhen",
         "default",
         "defaultAtRoot",
         "env",
@@ -1180,6 +1181,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "source",
         "stdin",
         "within",
+        "withinDefault",
       ].sort(),
     );
     // The environment a command's call sets, and the text it hands the

@@ -421,6 +421,25 @@ function checkOperativeArgs(
       const qualifier = scalarFieldShape(inputSchema, within);
       if (qualifier !== undefined) fail(`${at}.within: the input schema ${qualifier}`);
     }
+    const { withinDefault } = arg;
+    if (withinDefault !== undefined) {
+      if (kind !== "path" || within === undefined) {
+        fail(
+          `${at}.withinDefault: only a "path" declared \`within\` a directory field has a directory the tool uses when the call leaves that field out`,
+        );
+      }
+      if (
+        typeof withinDefault !== "string" ||
+        withinDefault === "" ||
+        withinDefault === "*" ||
+        /^([\\/]|[A-Za-z]:)/.test(withinDefault) ||
+        withinDefault.split(/[\\/]/).some((s) => s === "..")
+      ) {
+        fail(
+          `${at}.withinDefault must be a directory relative to the workspace that stays in it: no leading "/", no ".." segment, not "*"`,
+        );
+      }
+    }
     const { prefix } = arg;
     if (prefix !== undefined) {
       if (prefix !== true) fail(`${at}.prefix is either true or left out`);
@@ -458,6 +477,25 @@ function checkOperativeArgs(
       }
       const switched = booleanFieldShape(inputSchema, hiddenWhen);
       if (switched !== undefined) fail(`${at}.hiddenWhen: the input schema ${switched}`);
+    }
+    const { beneathWhen } = arg;
+    if (beneathWhen !== undefined) {
+      if (beneath === undefined) {
+        fail(
+          `${at}.beneathWhen: only a path declared beneath (a directory the tool acts inside) can be switched into it`,
+        );
+      }
+      if (relocates !== undefined) {
+        fail(`${at}.beneathWhen: a relocating store is read whole or not at all`);
+      }
+      if (typeof beneathWhen !== "string" || !/^[A-Za-z_$][\w$]*$/.test(beneathWhen)) {
+        fail(`${at}.beneathWhen must name one top-level input field, e.g. "clear"`);
+      }
+      if (beneathWhen === hiddenWhen) {
+        fail(`${at}.beneathWhen names "${beneathWhen}", which is already used`);
+      }
+      const switched = booleanFieldShape(inputSchema, beneathWhen);
+      if (switched !== undefined) fail(`${at}.beneathWhen: the input schema ${switched}`);
     }
     const opens = checkOpenings(at, kind, arg.opens, fail);
     if (opens !== undefined && arg.glob === true) {
@@ -600,6 +638,7 @@ function checkOperativeArgs(
         kind,
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
+        ...(withinDefault !== undefined ? { withinDefault } : {}),
         ...(service !== undefined ? { service } : {}),
         ...(overlay !== undefined ? { overlay } : {}),
         ...(ignoredWhen !== undefined ? { ignoredWhen } : {}),
@@ -609,6 +648,7 @@ function checkOperativeArgs(
         ...(prefix === true ? { prefix } : {}),
         ...(beneath !== undefined ? { beneath } : {}),
         ...(hiddenWhen !== undefined ? { hiddenWhen } : {}),
+        ...(beneathWhen !== undefined ? { beneathWhen } : {}),
         ...(opens !== undefined ? { opens } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
         ...(glob === true ? { glob } : {}),

@@ -1584,6 +1584,7 @@ export type OperativeArgLike = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  readonly withinDefault?: string;
   readonly service?: string;
   readonly overlay?: string;
   readonly ignoredWhen?: string;
@@ -1593,6 +1594,7 @@ export type OperativeArgLike = {
   readonly prefix?: true;
   readonly beneath?: string;
   readonly hiddenWhen?: string;
+  readonly beneathWhen?: string;
   readonly opens?: ReadonlyArray<{ readonly path: string; readonly beneath?: string }>;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
@@ -1632,6 +1634,8 @@ export type RuleScope =
   | {
       readonly kind: "args";
       readonly args: ReadonlyArray<{ readonly field: string; readonly words: string }>;
+      /** How an allow reads a recipient or an id, when the tool has one: as written. */
+      readonly asWritten?: string;
       readonly example: ExampleRule;
       readonly note?: string;
     }
@@ -1672,8 +1676,13 @@ export function operativeArgWords(arg: OperativeArgLike, opts: RuleScopeOptions 
     parts.push(`${kind} prefix, which stands for every value that starts with it`);
   } else parts.push(kind);
   if (arg.within !== undefined) {
-    if (arg.kind === "path") parts.push(`read from the directory in ${arg.within}`);
-    else if (arg.kind === "command") {
+    if (arg.kind === "path") {
+      parts.push(
+        arg.withinDefault !== undefined
+          ? `read from the directory in ${arg.within} ("${arg.withinDefault}" when the call leaves it out)`
+          : `read from the directory in ${arg.within}`,
+      );
+    } else if (arg.kind === "command") {
       parts.push(
         `run in the directory in ${arg.within}; a scoped allow covers it only in the workspace root`,
       );
@@ -1723,12 +1732,14 @@ export function operativeArgWords(arg: OperativeArgLike, opts: RuleScopeOptions 
   if (arg.source === true) {
     parts.push("where the value is taken from: a deny or ask reads it, an allow need not name it");
   }
-  if (arg.beneath === "all") parts.push("a directory stands for everything beneath it");
+  // A tool that acts beneath the path only when the call sets a switch.
+  const when = arg.beneathWhen !== undefined ? ` when ${arg.beneathWhen} is true` : "";
+  if (arg.beneath === "all") parts.push(`a directory stands for everything beneath it${when}`);
   if (arg.beneath === "visible") {
     parts.push(
       arg.hiddenWhen !== undefined
-        ? `a directory stands for everything beneath it except hidden names, and for those too when ${arg.hiddenWhen} is true`
-        : "a directory stands for everything beneath it except hidden names",
+        ? `a directory stands for everything beneath it except hidden names${when}, and for those too when ${arg.hiddenWhen} is true`
+        : `a directory stands for everything beneath it except hidden names${when}`,
     );
   }
   if (arg.opens !== undefined && arg.opens.length > 0) {
@@ -1787,8 +1798,10 @@ function placeGlob(arg: OperativeArgLike): string {
   const leaf = (arg.field.split(".").pop() ?? arg.field).toLowerCase();
   switch (arg.kind) {
     case "path":
-      // A store the tool works in (relocating) or walks (StateExport's
-      // state directory): the example covers the store it uses by default.
+      // A directory the tool makes its own in by default (TempDir's
+      // `.tmp`), a store it works in (relocating) or walks (StateExport's
+      // state directory): the example covers the one it uses by default.
+      if (arg.withinDefault !== undefined) return `${arg.withinDefault}/**`;
       return (arg.relocates === true || arg.beneath !== undefined) &&
         arg.default !== undefined &&
         arg.default !== "." &&
@@ -1819,6 +1832,25 @@ function placeGlob(arg: OperativeArgLike): string {
       return "nightly-*";
     }
   }
+}
+
+/**
+ * How an allow and a deny read a recipient or an id differently, for a tool
+ * that has one: an allow matches the value only as the call writes it,
+ * while a deny or ask also reads it in another letter case (and a recipient
+ * in another spelling: a `+tag`, a phone number's formatting). So
+ * `SmsSend(+1555*)` asks on `+1 (555) 010-0000`, and an EVM address
+ * allowed in checksum case asks when the call writes it in lower case.
+ * A secret reference has its own words, and a source is read by a deny
+ * only.
+ */
+function asWrittenWords(args: ReadonlyArray<OperativeArgLike>): string | undefined {
+  const read = args.filter((a) => a.secretRef !== true && a.source !== true);
+  const recipient = read.some((a) => a.kind === "recipient");
+  const id = read.some((a) => a.kind === "id");
+  if (!recipient && !id) return undefined;
+  const noun = recipient && id ? "a recipient or an id" : recipient ? "a recipient" : "an id";
+  return `an allow matches ${noun} only as the call writes it; a deny or ask also matches it in another letter case${recipient ? " or spelling" : ""}`;
 }
 
 /** A glob a deny on `arg` could sensibly be written with. */
@@ -1858,6 +1890,8 @@ export function ruleScopeFor(
   if (operativeArgs === undefined) return { kind: "undeclared", example: bare };
   if (operativeArgs.length === 0) return { kind: "unscoped", example: bare };
   const args = operativeArgs.map((a) => ({ field: a.field, words: operativeArgWords(a, opts) }));
+  const asWritten = asWrittenWords(operativeArgs);
+  const spelled = asWritten !== undefined ? { asWritten } : {};
   // An allow skips a relocating field the call leaves out, and a source, so
   // the fields it is about are the others — unless those are all there is.
   const active = operativeArgs.filter((a) => a.relocates !== true && a.source !== true);
@@ -1874,12 +1908,14 @@ export function ruleScopeFor(
     return {
       kind: "args",
       args,
+      ...spelled,
       example: { type: "alwaysAllow", pattern: `${name}(${allowGlob(name, first, opts)})` },
     };
   }
   return {
     kind: "args",
     args,
+    ...spelled,
     example: { type: "alwaysDeny", pattern: `${name}(${denyGlob(first)})` },
     note: oneKind
       ? "a scoped allow on free text or code is rarely what you mean: allow the tool bare and deny what must not run"
@@ -1912,6 +1948,7 @@ export function formatRuleScopeLines(scope: RuleScope): string[] {
       ...wrapDetail("", "an allow must match every one of these; a deny or ask fires on any one"),
     );
   }
+  if (scope.asWritten !== undefined) lines.push(...wrapDetail("", scope.asWritten));
   lines.push(`  example     ${example}`);
   if (scope.note !== undefined) lines.push(...wrapDetail("", scope.note));
   return lines;

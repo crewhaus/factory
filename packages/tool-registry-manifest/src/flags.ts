@@ -5230,7 +5230,16 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "base", kind: "path", default: ".tmp" }],
+    operativeArgs: [
+      {
+        field: "name",
+        kind: "path",
+        within: "base",
+        withinDefault: ".tmp",
+        beneath: "all",
+        beneathWhen: "clear",
+      },
+    ],
   },
   testFailureSummary: {
     key: "testFailureSummary",

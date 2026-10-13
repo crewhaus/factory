@@ -7848,7 +7848,16 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "base", kind: "path", default: ".tmp" }],
+    operativeArgs: [
+      {
+        field: "name",
+        kind: "path",
+        within: "base",
+        withinDefault: ".tmp",
+        beneath: "all",
+        beneathWhen: "clear",
+      },
+    ],
     categories: ["fsx", "code", "filesystem"],
     package: "@crewhaus/tool-fsx",
     keywords: ["temp directory", "scratch space", "working directory"],

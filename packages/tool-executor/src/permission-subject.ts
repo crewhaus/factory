@@ -99,6 +99,8 @@
  *      finds it, not the directory. A command inside an array of objects
  *      (`steps.argv`) runs in its element's own directory field when it has
  *      one, else the top-level one.
+ *      A path declared `within` a directory the call leaves out is read from
+ *      the root, or from its declared `withinDefault` (TempDir's `.tmp`).
  *      A path declared `within` a directory that is absolute or has a `..`
  *      segment — the call's directory or the root when it gives none — is
  *      flagged `outsideWorkspace`: the tool hands it on as written to a
@@ -174,7 +176,9 @@
  *      prefixes, so a deny or ask naming anything under it fires —
  *      unless the canonicaliser marked it `notDirectory`. A walk that
  *      skips hidden names reads them too when the call sets the switch its
- *      `hiddenWhen` names (Tree's `includeHidden`). One declared
+ *      `hiddenWhen` names (Tree's `includeHidden`), and one declared with a
+ *      `beneathWhen` switch (TempDir's `clear`) is read beneath only when
+ *      the call sets it: otherwise the tool acts on the path alone. One declared
  *      `defaultAtRoot` and left out is the workspace root, not its `within`
  *      directory: a git command given no path acts on the whole repository.
  *      Each relative prefix is also read with a leading `./`, as a direct
@@ -479,13 +483,17 @@ function valuesOf(
             break;
           }
           // A walk that skips hidden names opens them too when the call sets
-          // the switch its declaration names (Tree's `includeHidden`).
+          // the switch its declaration names (Tree's `includeHidden`). A tool
+          // that acts beneath the path only when the call sets a switch
+          // (TempDir's `clear`) otherwise acts on the path alone.
           const walk =
-            beneath === "visible" &&
-            arg.hiddenWhen !== undefined &&
-            switchedOn(parsedInput, arg.hiddenWhen)
-              ? "all"
-              : beneath;
+            arg.beneathWhen !== undefined && !switchedOn(parsedInput, arg.beneathWhen)
+              ? undefined
+              : beneath === "visible" &&
+                  arg.hiddenWhen !== undefined &&
+                  switchedOn(parsedInput, arg.hiddenWhen)
+                ? "all"
+                : beneath;
           values.push(...(walk !== undefined ? read.map((v) => withBeneath(v, walk)) : read));
           values.push(...openedValues(raw, arg, canonicalizePath));
           break;
@@ -1660,7 +1668,9 @@ function readValues(input: unknown, arg: OperativeArg): FieldReading[] {
     every ? rs.map((r) => ({ ...r, every: true, anyAfter: [""] })) : rs;
   // A command's `within` is where it runs, carried as `runsIn` above.
   if (arg.kind === "command") return anyValue(out);
-  const qualifier = topQualifier;
+  // A path whose directory the call left out is relative to the one the
+  // tool uses then, when it declares one (TempDir's `.tmp`).
+  const qualifier = topQualifier ?? (arg.kind === "path" ? arg.withinDefault : undefined);
   if (qualifier === undefined) {
     // A path within a directory the call left out is relative to the root,
     // and handed on as written all the same.

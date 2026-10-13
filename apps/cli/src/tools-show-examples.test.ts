@@ -469,7 +469,7 @@ const CALLS: Readonly<Record<string, Record<string, unknown>>> = {
     path: "src/a.srt",
   },
   SystemInfo: {},
-  TempDir: { name: "scratch", base: "src/tmp" },
+  TempDir: { name: "scratch" },
   TlsInspect: { host: "api.example.com" },
   TodoScan: { cwd: "src/app" },
   TodoWrite: { todos: [] },
@@ -874,6 +874,49 @@ describe("the Chat, SMS and push examples grant a call the real tool sends", () 
     expect(refused.decision).toBe("allow");
     expect(refused.result).toContain("set both apiBaseUrl and tokenEnv");
     expect(sent).toEqual([]);
+  }, 30_000);
+
+  test("SmsSend and the EVM tools: an allow matches the spelling it is written in, as `tools show` says; a deny meets every one", async () => {
+    // Critic11: `SmsSend(+1555*)` asks on `+1 (555) 010-0000`, which the
+    // tool's own allow-list admits and sends, and an address allowed in its
+    // checksum case asks in lower case. That is the matcher's choice (an
+    // allow compares as written), so `tools show` says so beside the example.
+    for (const name of ["SmsSend", "EvmSimulate", "EvmSendTransaction"]) {
+      const { scope } = row(name);
+      expect({ name, asWritten: scope.kind === "args" ? scope.asWritten : undefined }).toEqual({
+        name,
+        asWritten: expect.stringContaining("an allow matches a"),
+      });
+    }
+    const sms = row("SmsSend");
+    expect(sms.scope.kind === "args" ? sms.scope.asWritten : "").toBe(
+      "an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling",
+    );
+    const spelled = { ...CALLS["SmsSend"], to: "+1 (555) 010-0000" };
+    const printed = rules(["alwaysAllow", sms.scope.example.pattern]);
+    expect((await gate(sms.live, CALLS["SmsSend"], printed)).decision).toBe("allow");
+    expect(sent.length).toBe(1);
+    expect((await gate(sms.live, spelled, printed)).decision).toBe("ask");
+    const denied = rules(["alwaysDeny", sms.scope.example.pattern], ["alwaysAllow", "SmsSend"]);
+    expect((await gate(sms.live, spelled, denied)).decision).toBe("deny");
+    expect(sent.length).toBe(1);
+    // The tool sends that spelling: only the allow's reading kept it back.
+    const bare = await gate(sms.live, spelled, rules(["alwaysAllow", "SmsSend"]));
+    expect({ decision: bare.decision, sent: sent.length }).toEqual({ decision: "allow", sent: 2 });
+    for (const name of ["EvmSimulate", "EvmSendTransaction"]) {
+      const evm = row(name);
+      const lower = { ...CALLS[name], to: ADDRESS.toLowerCase() };
+      evm.ran.length = 0;
+      const allow = rules(["alwaysAllow", evm.scope.example.pattern]);
+      const deny = rules(["alwaysDeny", evm.scope.example.pattern], ["alwaysAllow", name]);
+      expect({
+        name,
+        written: (await gate(evm.tool, CALLS[name], allow)).decision,
+        lower: (await gate(evm.tool, lower, allow)).decision,
+        denied: (await gate(evm.tool, lower, deny)).decision,
+        ran: evm.ran.length,
+      }).toEqual({ name, written: "allow", lower: "ask", denied: "deny", ran: 1 });
+    }
   }, 30_000);
 
   test("ChatPost: the printed deny stops the API call, which a bare allow lets the tool send", async () => {

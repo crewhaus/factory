@@ -84,7 +84,10 @@ built it.
   given to a git tool is literal, so `secret*` cannot reach around a deny on
   `secrets/**`. A KvList prefix stands for every key that starts with it. A
   GitHub or GitLab search is scoped by its `owner` and `repo`, and a deny on a
-  repository also stops an owner-wide or unscoped search.
+  repository also stops an owner-wide or unscoped search. TempDir is read as
+  the directory it makes (`base/name`, under `.tmp` by default) and, when
+  `clear` empties it first, as everything in it, so `alwaysDeny
+  *(secrets/**)` stops it from emptying `secrets/`.
 - **A command rule decides on the program that really runs.** RunCommand,
   RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format, HooksManage
   and Bash are read with the directory they run in, the environment they set
@@ -883,6 +886,8 @@ deny, warn or fail `--strict`; each says what to write instead.
   - A deploy call that names a `tenant` is read as `<tenant>/<name>/<env>`:
     `DeployRollback(billing/staging)` no longer covers a tenant's copy of
     that pin. Write `DeployRollback(acme/billing/staging)`.
+  - A TempDir allow names the directory it makes: `TempDir(.tmp/*)` for the
+    ones it makes by default, not `TempDir(scratch)`.
   - A pattern aimed at something that is not where the tool acts, such as a
     message body, no longer grants a call, and a deny or ask on it fires only
     when every text value of the call matches, as in 0.7.0. To stop a call,
@@ -1102,20 +1107,21 @@ deny, warn or fail `--strict`; each says what to write instead.
   permission rule is about, and what kind each is — path, URL, command,
   recipient, id or text. A declaration also says how a value is read: whether
   it is `within` another field (a repository as `owner/repo`, a path from the
-  tool's `cwd`), what a left-out value stands for, whether the tool walks
-  what is beneath a path (`beneath`, with `hiddenWhen` for a walk that skips
-  hidden names) or opens fixed files there (`opens`), whether a command is a
-  line a shell parses (`shell`, which Bash and Shell declare) or is handed an
-  environment or input (`env`, `stdin`), whether a value is a secret
-  reference (`secretRef`) or where the tool copies from (`source`), the API a
-  call names (`service`, with the tool's new `serviceDefaults` saying where a
-  call that names none goes), whose own copy it acts on (`overlay`), and a
-  field the tool ignores when the call names another (`ignoredWhen`). Every
-  builtin that changes something, reaches outside or walks a directory
-  declares them, and `buildTool` refuses a declaration that names a field the
-  input does not have. An empty list says no argument decides where the tool
-  acts. Tool packages outside this repo can check `TOOL_CONTRACT_VERSION` in
-  `@crewhaus/tool-catalog`.
+  tool's `cwd`, with `withinDefault` for the folder a left-out one means),
+  what a left-out value stands for, whether the tool walks what is beneath a
+  path (`beneath`, with `hiddenWhen` for a walk that skips hidden names and
+  `beneathWhen` for one a switch turns on) or opens fixed files there
+  (`opens`), whether a command is a line a shell parses (`shell`, which Bash
+  and Shell declare) or is handed an environment or input (`env`, `stdin`),
+  whether a value is a secret reference (`secretRef`) or where the tool
+  copies from (`source`), the API a call names (`service`, with the tool's
+  new `serviceDefaults` saying where a call that names none goes), whose own
+  copy it acts on (`overlay`), and a field the tool ignores when the call
+  names another (`ignoredWhen`). Every builtin that changes something,
+  reaches outside or walks a directory declares them, and `buildTool` refuses
+  a declaration that names a field the input does not have. An empty list
+  says no argument decides where the tool acts. Tool packages outside this
+  repo can check `TOOL_CONTRACT_VERSION` in `@crewhaus/tool-catalog`.
 - **`ToolRegistry`** (`@crewhaus/tool-capability`): a harness can see the
   builtin tools it was not given — search by text, narrow by category, or ask
   for one tool's description, and each row says whether this harness runs it.
@@ -1135,7 +1141,9 @@ deny, warn or fail `--strict`; each says what to write instead.
   for Bash and Shell that an allow must match every command in the line),
   and an example rule to copy into `permissions.rules`, such as
   `ChatDelete(https://slack.com/C0123/*)`. Every example matches a call the
-  tool runs. `--json` carries the same answer.
+  tool runs. It also says that an allow matches a recipient or an id only as
+  the call writes it: `SmsSend(+1555*)` asks on `+1 (555) 010-0000`, which a
+  deny on `+1555*` still stops. `--json` carries the same answer.
 - **`all-vector`**, a category holding VectorDelete alone.
 - **New `tool_config` keys**: the credential and destination lists above;
   `codeExecution.max_timeout_ms`; `imageGenerate.timeoutMs` and

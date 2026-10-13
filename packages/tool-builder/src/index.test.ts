@@ -485,6 +485,86 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     );
   });
 
+  test("beneathWhen names the boolean that makes a path stand for what is beneath it", () => {
+    const schema = z.object({
+      name: z.string(),
+      base: z.string().optional(),
+      clear: z.boolean().optional(),
+      label: z.string().optional(),
+    });
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Make",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [{ field: "name", kind: "path", ...arg } as OperativeArg],
+      });
+    expect(build({ beneath: "all", beneathWhen: "clear" })().operativeArgs).toEqual([
+      { field: "name", kind: "path", beneath: "all", beneathWhen: "clear" },
+    ]);
+    expect(build({ beneathWhen: "clear" })).toThrow(/beneathWhen: only a path declared beneath/);
+    expect(build({ beneath: "all", beneathWhen: "label" })).toThrow(
+      /beneathWhen: the input schema field "label" is not a boolean/,
+    );
+    expect(build({ beneath: "all", beneathWhen: "wipe" })).toThrow(
+      /beneathWhen: the input schema has no top-level field "wipe"/,
+    );
+    expect(build({ beneath: "visible", hiddenWhen: "clear", beneathWhen: "clear" })).toThrow(
+      /beneathWhen names "clear", which is already used/,
+    );
+    // A store read whole is read whole: it has no switch.
+    expect(() =>
+      buildTool({
+        name: "Store",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [
+          { field: "name", kind: "path" },
+          {
+            field: "base",
+            kind: "path",
+            default: ".tmp",
+            relocates: true,
+            beneath: "all",
+            beneathWhen: "clear",
+          },
+        ],
+      }),
+    ).toThrow(/beneathWhen: a relocating store/);
+  });
+
+  test("withinDefault is the directory a path is read from when the call leaves its within field out", () => {
+    const schema = z.object({ name: z.string(), base: z.string().optional() });
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Make",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [{ field: "name", kind: "path", ...arg } as OperativeArg],
+      });
+    expect(build({ within: "base", withinDefault: ".tmp" })().operativeArgs).toEqual([
+      { field: "name", kind: "path", within: "base", withinDefault: ".tmp" },
+    ]);
+    expect(build({ withinDefault: ".tmp" })).toThrow(/withinDefault: only a "path" declared/);
+    for (const bad of ["", "*", "/tmp", "../up", "a/../../b", "C:/x"]) {
+      expect(build({ within: "base", withinDefault: bad })).toThrow(
+        /withinDefault must be a directory relative to the workspace/,
+      );
+    }
+    expect(() =>
+      buildTool({
+        name: "Id",
+        description: "d",
+        inputSchema: schema,
+        execute: exec,
+        operativeArgs: [{ field: "name", kind: "id", within: "base", withinDefault: "x" }],
+      }),
+    ).toThrow(/withinDefault: only a "path" declared/);
+  });
+
   test("secretRef is carried on a plain id, and source beside a field that says where the tool acts", () => {
     const schema = z.object({
       ref: z.string(),

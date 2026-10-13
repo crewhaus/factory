@@ -19,6 +19,8 @@ export type RegistryOperativeArg = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  /** For a `path` declared `within` a field: the directory the tool uses when the call leaves that field out. */
+  readonly withinDefault?: string;
   /** For an `id` or `recipient`: the field holding the URL of the API a call may name instead of the tool's own. */
   readonly service?: string;
   /** For an `id` or `recipient`: the field naming whose own copy of the value a call acts on (a tenant's overlay). */
@@ -37,6 +39,8 @@ export type RegistryOperativeArg = {
   readonly beneath?: string;
   /** With `beneath: "visible"`: the boolean field that makes the walk open hidden names too. */
   readonly hiddenWhen?: string;
+  /** With `beneath`: the boolean field without which the tool acts on the path alone. */
+  readonly beneathWhen?: string;
   /** For a `path`: the fixed places inside the directory the tool opens, which a deny or ask reads. */
   readonly opens?: ReadonlyArray<{ readonly path: string; readonly beneath?: string }>;
   /** For a `path` declared `within` a field: its default is read from the workspace root. */
@@ -141,6 +145,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     kind: arg.kind,
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
+    ...(arg.withinDefault !== undefined ? { withinDefault: arg.withinDefault } : {}),
     ...(arg.service !== undefined ? { service: arg.service } : {}),
     ...(arg.overlay !== undefined ? { overlay: arg.overlay } : {}),
     ...(arg.ignoredWhen !== undefined ? { ignoredWhen: arg.ignoredWhen } : {}),
@@ -150,6 +155,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.prefix === true ? { prefix: true as const } : {}),
     ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
     ...(arg.hiddenWhen !== undefined ? { hiddenWhen: arg.hiddenWhen } : {}),
+    ...(arg.beneathWhen !== undefined ? { beneathWhen: arg.beneathWhen } : {}),
     ...(arg.opens !== undefined
       ? {
           opens: arg.opens.map((o) => ({

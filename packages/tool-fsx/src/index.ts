@@ -977,9 +977,23 @@ export const touchFile: RegisteredTool = buildTool({
 
 const TEMP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+/** Where TempDir makes its directory when the call names no `base`. */
+const TEMP_BASE = ".tmp";
+
 export const tempDir: RegisteredTool = buildTool({
   name: "TempDir",
-  operativeArgs: [{ field: "base", kind: "path", default: ".tmp" }],
+  // A rule reads the directory the tool makes, `base/name`, and with `clear`
+  // everything in it, which the tool deletes first.
+  operativeArgs: [
+    {
+      field: "name",
+      kind: "path",
+      within: "base",
+      withinDefault: TEMP_BASE,
+      beneath: "all",
+      beneathWhen: "clear",
+    },
+  ],
   description:
     "Create a scratch directory inside the workspace under a name you choose, and report its path. Use it as somewhere to stage intermediate files; the name comes from you rather than a random suffix so the same call twice gives the same directory instead of littering.",
   inputSchema: z.object({
@@ -996,7 +1010,7 @@ export const tempDir: RegisteredTool = buildTool({
     if (!TEMP_NAME.test(input.name)) {
       return `"${input.name}" is not a usable directory name — letters, digits, '.', '-' and '_' only, and it may not start with a dot`;
     }
-    const base = input.base ?? ".tmp";
+    const base = input.base ?? TEMP_BASE;
     const target = resolveSafe("TempDir", path.join(base, input.name));
     const existing = peek(target.abs);
     if (existing !== undefined && existing.kind !== "dir") {

@@ -550,10 +550,7 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // The tool creates this entry, or a named one in it, and touches nothing
     // already beneath it.
     ...Object.fromEntries(
-      ["GitWorktreeAdd.path", "MakeDirectory.path", "TempDir.base", "TouchFile.path"].map((k) => [
-        k,
-        "created",
-      ]),
+      ["GitWorktreeAdd.path", "MakeDirectory.path", "TouchFile.path"].map((k) => [k, "created"]),
     ),
     // Where git runs. These act on the repository's refs, or on its whole
     // working tree as a commit or a stash names it, which no path argument
@@ -716,7 +713,7 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // A reviewed entry that now declares beneath, or no longer exists, is stale.
     const known = new Set(fields.map((f) => f.key));
     expect(Object.keys(ONE_PLACE).filter((k) => !known.has(k) || walked.includes(k))).toEqual([]);
-    expect(walked.length).toBe(76);
+    expect(walked.length).toBe(77);
     expect(walked).toContain("Grep.path");
     // Critic8: the store dump and the readers of every log in a directory.
     expect(walked).toContain("StateExport.stateDir");
@@ -774,6 +771,31 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
       "SecretScan.path:includeHidden",
       "Tree.path:includeHidden",
     ]);
+  });
+
+  test("a walk a switch turns on, and a directory a left-out field defaults to, are reviewed", () => {
+    // Critic11: TempDir was classified "created", read on its `base` alone,
+    // while it makes `base/name` and, with `clear`, deletes what is in it
+    // first. `alwaysDeny *(secrets/**)` let `{base: ".", name: "secrets",
+    // clear: true}` empty secrets/. A tool that acts beneath a path only
+    // when the call sets a switch names it (`beneathWhen`), and one whose
+    // path is relative to a directory with a default says it
+    // (`withinDefault`), so a new one is a written-down decision.
+    const fields = pathFields();
+    expect(
+      fields
+        .filter((f) => f.arg.beneathWhen !== undefined)
+        .map((f) => ({
+          key: f.key,
+          when: f.arg.beneathWhen,
+          beneath: f.arg.beneath,
+        })),
+    ).toEqual([{ key: "TempDir.name", when: "clear", beneath: "all" }]);
+    expect(
+      fields
+        .filter((f) => f.arg.withinDefault !== undefined)
+        .map((f) => `${f.key}:${f.arg.within}=${f.arg.withinDefault}`),
+    ).toEqual(["TempDir.name:base=.tmp"]);
   });
 
   test("a git command given no path is read as the whole repository", () => {

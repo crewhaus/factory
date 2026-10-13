@@ -4526,3 +4526,113 @@ describe("critic9 audit — a tenant's overlay is another pin than the global on
     }
   }, 120_000);
 });
+
+describe("critic11 — TempDir is read as the directory it makes, and with clear what is in it", () => {
+  // TempDir makes `base/name` (base `.tmp` when left out) and, with
+  // `clear: true`, deletes everything in it first. A rule read `base` alone,
+  // so `alwaysDeny *(secrets/**)` beside `alwaysAllow TempDir` let
+  // `{base: ".", name: "secrets", clear: true}` empty secrets/, while the
+  // same deny stopped `RemovePath secrets`.
+  const kept = (...at: string[]) => existsSync(join(ws, ...at));
+  beforeEach(() => {
+    for (const dir of [
+      "secrets",
+      join("src", "keep"),
+      join("src", "other"),
+      join(".tmp", "work"),
+    ]) {
+      mkdirSync(join(ws, dir), { recursive: true });
+      writeFileSync(join(ws, dir, "key.txt"), "precious");
+    }
+    writeFileSync(join(ws, ".tmp", "work", ".env"), "TOKEN=1\n");
+  });
+
+  test("a deny on a directory stops the clear that would empty it, in every mode", async () => {
+    const call = { base: ".", name: "secrets", clear: true };
+    for (const [deny, allow] of [
+      ["*(secrets/**)", "TempDir"],
+      ["*(secrets/**)", "TempDir(**)"],
+      ["TempDir(secrets/**)", "TempDir"],
+      ["TempDir(secrets)", "TempDir"],
+    ] as const) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        const got = await gate(
+          "TempDir",
+          call,
+          rules(["alwaysDeny", deny], ["alwaysAllow", allow]),
+          mode,
+        );
+        expect({ deny, allow, mode, got, kept: kept("secrets", "key.txt") }).toEqual({
+          deny,
+          allow,
+          mode,
+          got: "deny",
+          kept: true,
+        });
+      }
+    }
+    // The same deny on another directory is not this call's business.
+    const rs = rules(["alwaysDeny", "*(secrets/**)"], ["alwaysAllow", "TempDir"]);
+    expect(await gate("TempDir", { base: ".", name: "scratch", clear: true }, rs)).toBe("allow");
+    expect(kept("scratch")).toBe(true);
+  }, 60_000);
+
+  test("under the printed allow, a deny inside it holds; another directory there runs", async () => {
+    const rs = rules(["alwaysDeny", "TempDir(src/keep/**)"], ["alwaysAllow", "TempDir(src/**)"]);
+    expect(await gate("TempDir", { base: "src", name: "keep", clear: true }, rs)).toBe("deny");
+    expect(kept("src", "keep", "key.txt")).toBe(true);
+    expect(await gate("TempDir", { base: "src", name: "other", clear: true }, rs)).toBe("allow");
+    expect(lastResult).toContain('"cleared":true');
+    expect(kept("src", "other", "key.txt")).toBe(false);
+  }, 30_000);
+
+  test("a deny on a file inside fires only when clear would delete it", async () => {
+    const rs = rules(["alwaysDeny", "*(**/.env)"], ["alwaysAllow", "TempDir"]);
+    expect(await gate("TempDir", { name: "work", clear: true }, rs)).toBe("deny");
+    expect(kept(".tmp", "work", ".env")).toBe(true);
+    // Without clear the tool makes the directory and touches nothing in it.
+    expect(await gate("TempDir", { name: "work" }, rs)).toBe("allow");
+    expect(lastResult).toContain('"existed":true');
+    expect(kept(".tmp", "work", ".env")).toBe(true);
+    // A deny naming one file there fires the same way.
+    const one = rules(["alwaysDeny", "TempDir(.tmp/work/key.txt)"], ["alwaysAllow", "TempDir"]);
+    expect(await gate("TempDir", { name: "work", clear: true }, one)).toBe("deny");
+    expect(kept(".tmp", "work", "key.txt")).toBe(true);
+  }, 30_000);
+
+  test("a call that leaves base out is read in .tmp, by an allow and a deny", async () => {
+    const allow = rules(["alwaysAllow", "TempDir(.tmp/*)"]);
+    expect(await gate("TempDir", { name: "fresh" }, allow)).toBe("allow");
+    expect(kept(".tmp", "fresh")).toBe(true);
+    // The same name elsewhere is not in .tmp.
+    expect(await gate("TempDir", { base: "src", name: "fresh" }, allow)).toBe("ask");
+    expect(kept("src", "fresh")).toBe(false);
+    const deny = rules(["alwaysDeny", "TempDir(.tmp/work/**)"], ["alwaysAllow", "TempDir"]);
+    expect(await gate("TempDir", { name: "work", clear: true }, deny)).toBe("deny");
+    expect(kept(".tmp", "work", "key.txt")).toBe(true);
+  }, 30_000);
+
+  test("a base spelled through a link, and a `..`, is read where the tool joins it", async () => {
+    // `build/link` leads to src/. The tool joins `base` and `name` as text
+    // before it resolves them, so `build/link/..` is build/, not the root.
+    mkdirSync(join(ws, "build", "secrets"));
+    writeFileSync(join(ws, "build", "secrets", "key.txt"), "precious");
+    const rs = rules(["alwaysDeny", "*(build/secrets/**)"], ["alwaysAllow", "TempDir"]);
+    const call = { base: "build/link/..", name: "secrets", clear: true };
+    expect(await gate("TempDir", call, rs)).toBe("deny");
+    expect(kept("build", "secrets", "key.txt")).toBe(true);
+    // Through the link alone, the directory it empties is src/keep.
+    const keep = rules(["alwaysDeny", "*(src/keep/**)"], ["alwaysAllow", "TempDir"]);
+    const linked = { base: "build/link", name: "keep", clear: true };
+    expect(await gate("TempDir", linked, keep)).toBe("deny");
+    expect(kept("src", "keep", "key.txt")).toBe(true);
+  }, 30_000);
+
+  test("a deny written on the name alone, the way 0.7.0 read it, still fires", async () => {
+    // 0.7.0 read TempDir by every string in the call: `{name: "work"}` met
+    // `alwaysDeny TempDir(work)`.
+    const rs = rules(["alwaysDeny", "TempDir(work)"], ["alwaysAllow", "TempDir"]);
+    expect(await gate("TempDir", { name: "work", clear: true }, rs)).toBe("deny");
+    expect(kept(".tmp", "work", "key.txt")).toBe(true);
+  }, 30_000);
+});

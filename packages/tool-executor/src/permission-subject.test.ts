@@ -8,6 +8,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildTool } from "@crewhaus/tool-builder";
+import type { OperativeArg } from "@crewhaus/tool-catalog";
 import {
   compilePattern,
   matchesPattern,
@@ -582,6 +583,56 @@ describe("url, command and id values", () => {
       });
     expect(fires({ cwd: "src" })).toBe(true);
     expect(fires({ cwd: "src", paths: ["a"] })).toBe(false);
+  });
+
+  test("a path within a left-out directory is read from its withinDefault, and beneath only when switched on (critic11)", () => {
+    // TempDir makes `base/name` (base `.tmp` when left out), and with
+    // `clear` deletes what is in it first.
+    const make = buildTool({
+      name: "Make",
+      description: "d",
+      inputSchema: z.object({
+        name: z.string(),
+        base: z.string().optional(),
+        clear: z.boolean().optional(),
+      }),
+      operativeArgs: [
+        {
+          field: "name",
+          kind: "path",
+          within: "base",
+          withinDefault: ".tmp",
+          beneath: "all",
+          beneathWhen: "clear",
+        },
+      ],
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(make, { name: "work" })).toEqual([
+      { kind: "path", canonical: [".tmp/work", "./.tmp/work"], spellings: [".tmp/work"] },
+    ]);
+    expect(operativeValuesFor(make, { base: "src", name: "keep", clear: true })).toEqual([
+      {
+        kind: "path",
+        canonical: ["src/keep", "./src/keep"],
+        spellings: ["src/keep"],
+        beneath: ["src/keep/", "./src/keep/"],
+      },
+    ]);
+    // `clear: false` is no switch.
+    expect(operativeValuesFor(make, { name: "w", clear: false })?.[0]?.beneath).toBe(undefined);
+    expect(readOperativeField({ name: "work" }, make.operativeArgs?.[0] as OperativeArg)).toEqual([
+      ".tmp/work",
+    ]);
+    const fires = (rule: string, value: unknown) =>
+      matchesPattern(compilePattern(rule), "Make", value, {
+        polarity: "restrict",
+        operativeValues: operativeValuesFor(make, value) ?? [],
+      });
+    expect(fires("Make(.tmp/work/.env)", { name: "work", clear: true })).toBe(true);
+    expect(fires("Make(.tmp/work/.env)", { name: "work" })).toBe(false);
+    expect(fires("Make(secrets/**)", { base: ".", name: "secrets" })).toBe(true);
+    expect(fires("Make(secrets/**)", { base: ".", name: "scratch", clear: true })).toBe(false);
   });
 
   test("a path declared `glob` is a pattern that stands for every path it lists (final review)", () => {

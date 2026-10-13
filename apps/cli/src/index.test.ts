@@ -4072,8 +4072,34 @@ describe("crewhaus tools show / list — names and bad categories", () => {
             "a recipient; matched as owner/repo; matched as https://host/owner/repo with the origin of the API the call goes to (the one in baseUrl, else the configured one), and also as owner/repo on the API the tool is set up for; a deny or ask also reads the URL",
         },
       ],
+      asWritten:
+        "an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling",
       example: { type: "alwaysAllow", pattern: "IssueCreate(acme/*)" },
     });
+  }, 30_000);
+
+  test("show says an allow matches a recipient only as written, and reads TempDir's directory (critic11)", async () => {
+    // `SmsSend(+1555*)` asks on `+1 (555) 010-0000`, which the tool sends.
+    const sms = await runCli(["tools", "show", "smsSend"]);
+    expect(sms.exitCode).toBe(0);
+    expect(sms.stdout).toContain(
+      [
+        "  rule checks to: a recipient",
+        "              an allow matches a recipient only as the call writes it; a deny or ask also",
+        "              matches it in another letter case or spelling",
+        '  example     - { type: alwaysAllow, pattern: "SmsSend(+1555*)" }',
+      ].join("\n"),
+    );
+    // TempDir makes base/name, and with clear deletes what is in it first.
+    const temp = await runCli(["tools", "show", "tempDir"]);
+    expect(temp.exitCode).toBe(0);
+    expect(temp.stdout).toContain(
+      [
+        '  rule checks name: a path; read from the directory in base (".tmp" when the call leaves it',
+        "              out); a directory stands for everything beneath it when clear is true",
+        '  example     - { type: alwaysAllow, pattern: "TempDir(.tmp/**)" }',
+      ].join("\n"),
+    );
   }, 30_000);
 
   test("show names the API's origin in a Chat tool's example: it has no API of its own (critic10)", async () => {
@@ -4088,6 +4114,8 @@ describe("crewhaus tools show / list — names and bad categories", () => {
             "an id; matched as channel/messageId; matched as https://host/channel/messageId with the origin of the API the call names in apiBaseUrl: the tool has no API of its own, so an allow names one; a deny or ask also reads the URL",
         },
       ],
+      asWritten:
+        "an allow matches an id only as the call writes it; a deny or ask also matches it in another letter case",
       example: { type: "alwaysAllow", pattern: "ChatDelete(https://slack.com/C0123/*)" },
     });
   }, 30_000);

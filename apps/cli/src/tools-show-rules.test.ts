@@ -109,8 +109,60 @@ describe("operativeArgWords — a declaration in words", () => {
         { field: "env", kind: "id", within: "name", overlay: "tenant" },
         "an id; matched as name/env; on a call that names tenant, matched as tenant/name/env, its own copy; a deny or ask also reads name/env and the tenant alone",
       ],
+      // TempDir: the directory it makes, and what is in it when it clears it.
+      [
+        {
+          field: "name",
+          kind: "path",
+          within: "base",
+          withinDefault: ".tmp",
+          beneath: "all",
+          beneathWhen: "clear",
+        },
+        'a path; read from the directory in base (".tmp" when the call leaves it out); a directory stands for everything beneath it when clear is true',
+      ],
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
+  });
+
+  test("a recipient or an id says an allow matches it only as written (critic11)", () => {
+    // `SmsSend(+1555*)` asks on `+1 (555) 010-0000`: an allow compares a
+    // recipient as written, while a deny also reads its other spellings.
+    const as = (args: ReadonlyArray<OperativeArgLike>) => {
+      const scope = ruleScopeFor("T", args);
+      return scope.kind === "args" ? scope.asWritten : undefined;
+    };
+    expect(as([{ field: "to", kind: "recipient" }])).toBe(
+      "an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling",
+    );
+    expect(as([{ field: "to", kind: "id" }])).toBe(
+      "an allow matches an id only as the call writes it; a deny or ask also matches it in another letter case",
+    );
+    expect(
+      as([
+        { field: "hook", kind: "id" },
+        { field: "channel", kind: "recipient" },
+      ]),
+    ).toBe(
+      "an allow matches a recipient or an id only as the call writes it; a deny or ask also matches it in another letter case or spelling",
+    );
+    // A secret reference and a source have their own words; a path, a URL
+    // and a command are read canonically by an allow too.
+    expect(as([{ field: "refs", kind: "id", secretRef: true }])).toBe(undefined);
+    expect(
+      as([
+        { field: "path", kind: "path" },
+        { field: "from", kind: "id", source: true },
+      ]),
+    ).toBe(undefined);
+    expect(as([{ field: "url", kind: "url" }])).toBe(undefined);
+    // Printed after the arguments, before the example.
+    const lines = formatRuleScopeLines(
+      ruleScopeFor("SmsSend", [{ field: "to", kind: "recipient" }]),
+    );
+    expect(lines.join("\n").replace(/\s+/g, " ")).toBe(
+      ' rule checks to: a recipient an allow matches a recipient only as the call writes it; a deny or ask also matches it in another letter case or spelling example - { type: alwaysAllow, pattern: "SmsSend(+1555*)" }',
+    );
   });
 
   test("a value on a service reads the configured API only for a tool that has one", () => {
