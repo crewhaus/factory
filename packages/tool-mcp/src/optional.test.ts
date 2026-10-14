@@ -221,6 +221,53 @@ describe("registerOptionalMcpServer", () => {
     expect(flaky.disconnectCount()).toBe(1);
   });
 
+  test("retry: false does not wait for the failed client to finish closing", async () => {
+    // disconnect() now waits until the failed transport has closed — for a
+    // child that ignores EOF and SIGTERM, ~4 s. A boot that brings optional
+    // peers up one by one must not pay that per peer.
+    const flaky = makeFlakyHost("peer");
+    flaky.failNextConnects(1);
+    let disconnects = 0;
+    (flaky.host.getClient("peer") as unknown as { disconnect: () => Promise<void> }).disconnect =
+      () => {
+        disconnects += 1;
+        return new Promise<void>(() => undefined);
+      };
+    const handle = registerOptionalMcpServer(flaky.host, "peer", new ToolCatalog(), {
+      retry: false,
+      log: () => {},
+    });
+    let first: boolean | "pending" = "pending";
+    void handle.firstAttempt.then((ok) => {
+      first = ok;
+    });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect({ first, disconnects }).toEqual({ first: false, disconnects: 1 });
+  });
+
+  test("retry: false: a disconnect that rejects is not an unhandled rejection", async () => {
+    const flaky = makeFlakyHost("peer");
+    flaky.failNextConnects(1);
+    (flaky.host.getClient("peer") as unknown as { disconnect: () => Promise<void> }).disconnect =
+      () => Promise.reject(new Error("log sink down"));
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const handle = registerOptionalMcpServer(flaky.host, "peer", new ToolCatalog(), {
+        retry: false,
+        log: () => {},
+      });
+      expect(await handle.firstAttempt).toBe(false);
+      await new Promise((r) => setImmediate(r));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("config thunk: resolution + addServer run inside the boundary", async () => {
     const flaky = makeFlakyHost("peer", { registered: false });
     const catalog = new ToolCatalog();

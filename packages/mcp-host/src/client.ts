@@ -72,7 +72,10 @@ export type McpClientOptions = {
  *                          ↓ (disconnect())
  *                        closed
  *
- * `closed` is terminal — a closed client never reconnects.
+ * `closed` is terminal — a closed client never reconnects. That includes an
+ * attempt already IN FLIGHT when `disconnect()` lands (a boot `connect()`, a
+ * ladder rung, a lazy first call): `disconnect()` closes its transport, and
+ * the attempt rejects instead of adopting a connection or writing any state.
  *
  * In-flight `callTool` promises during a transport close reject with
  * `McpConnectionError`. New `callTool` requests during disconnect await
@@ -107,6 +110,19 @@ export class McpClient {
   private transport: McpClientLikeTransport | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: unknown = null;
+  /** Transports of attempts still in flight: built, not yet adopted. The
+   *  adopted one lives in `transport`; these are the children still spawning
+   *  and the streams still opening, which `disconnect()` must reap too. */
+  private readonly inFlight = new Set<McpClientLikeTransport>();
+  /** Every close this client has started and not yet seen finish — those
+   *  of failed attempts included — so `disconnect()` can wait them out. */
+  private readonly reaping = new Set<Promise<void>>();
+  /** Aborted by `disconnect()`. Read after every await of an attempt — an
+   *  attempt that finds it aborted was overtaken and may only clean up after
+   *  itself — and raced by each handshake, so none outlives the client. */
+  private readonly closing = new AbortController();
+  /** The first `disconnect()`, which every later call joins. */
+  private disconnecting: Promise<void> | undefined;
   private cachedTools: ReadonlyArray<McpToolDefinition> | null = null;
   private connectedDeferred: PromiseDeferred<void> = createDeferred();
   private queuedWaiters = 0;
@@ -141,7 +157,9 @@ export class McpClient {
 
   /**
    * Establish the connection. Resolves once the SDK initialize handshake
-   * completes. If already connected, returns immediately.
+   * completes. If already connected, returns immediately. Rejects with
+   * `McpConnectionError` if `disconnect()` lands before the handshake is
+   * adopted — whatever the handshake would have done.
    */
   async connect(): Promise<void> {
     if (this.state.kind === "connected") return;
@@ -162,6 +180,13 @@ export class McpClient {
    * (tests) is always honoured verbatim and never probed.
    */
   private async tryConnect(): Promise<void> {
+    // connect() and ensureConnected() check `closed` themselves, so only a
+    // ladder rung can get here on a closed client — through an injected
+    // timer seam whose clear does not cancel, say. It must not write
+    // `connecting` over `closed`; the rung's catch swallows the throw.
+    if (this.closing.signal.aborted) {
+      throw new McpConnectionError(`mcp client "${this.name}" is closed`);
+    }
     const attempt = this.reconnectAttempt;
     this.state = { kind: "connecting", attempt };
     this.logger?.debug("mcp.connecting", { server: this.name, attempt });
@@ -172,6 +197,14 @@ export class McpClient {
     // whole point is that failures here are EXPECTED.
     this.probing = candidates.length > 1;
     for (const candidate of candidates) {
+      // Closed before this candidate was built — mid-probe, while the one
+      // before it was in flight, or by a re-entrant `disconnect()` (from the
+      // log line above, say). Building it would spawn a child, or open a
+      // stream and a server session, for a client its caller has closed.
+      if (this.closing.signal.aborted) {
+        lastError ??= this.closedWhileConnecting();
+        break;
+      }
       try {
         await this.connectWith(candidate.build(), attempt);
         this.probing = false;
@@ -215,6 +248,7 @@ export class McpClient {
   /** One handshake attempt against one built transport. */
   private async connectWith(transport: McpClientLikeTransport, attempt: number): Promise<void> {
     void attempt;
+    closeOnce(transport);
     const sdk = this.clientFactory({
       name: "@crewhaus/mcp-host",
       version: "0.0.0",
@@ -238,19 +272,37 @@ export class McpClient {
       });
     }
 
+    // Closed while this candidate was being set up — by a re-entrant
+    // `disconnect()` from a factory, the `onclose` setter or the SDK client's
+    // setNotificationHandler. Never start it; the `disconnect()` waits for
+    // this close (reaped synchronously, before its first check).
+    if (this.closing.signal.aborted) {
+      void this.reap(transport);
+      throw this.closedWhileConnecting();
+    }
+    // In flight until adopted or failed: `disconnect()` reaps it from here.
+    this.inFlight.add(transport);
+    // Cancels the SDK's `initialize` request if this handshake is abandoned.
+    // That request holds its own REF'D timer (60 s), which only the SDK's
+    // close-time cleanup clears — and the catch below detaches the hook that
+    // runs it.
+    const handshake = new AbortController();
     try {
       // SDK's `connect()` calls transport.start() and runs the initialize
       // handshake. Wrap it in a connect-timeout so a wedged child doesn't
-      // hang the boot sequence forever.
+      // hang the boot sequence forever — and race `disconnect()`, so a
+      // transport whose close() never settles its start() cannot either.
       await withTimeout(
-        sdk.connect(transport),
+        sdk.connect(transport, { signal: handshake.signal }),
         this.connectTimeoutMs,
         () =>
           new McpConnectionError(
             `mcp connect to "${this.name}" timed out after ${this.connectTimeoutMs}ms`,
           ),
+        this.closing.signal,
       );
     } catch (err) {
+      this.inFlight.delete(transport);
       // DETACH BEFORE CLOSING (#394). `close()` fires `onclose`, which routes
       // into `handleTransportClose` — the reconnect scheduler. On the probe
       // path that is actively wrong: the FIRST candidate failing is the normal
@@ -260,15 +312,36 @@ export class McpClient {
       transport.onclose = undefined;
       // Best-effort cleanup: SDK's connect may have partially started the
       // transport. Closing it (and ignoring secondary errors) prevents
-      // leaked subprocesses.
-      try {
-        await transport.close();
-      } catch {
-        // intentionally swallowed: we are already in the error path
+      // leaked subprocesses. If the SDK or `disconnect()` closed it first,
+      // this joins that close — for stdio, the one that waits for the child —
+      // and does not wait for it: how slowly a refused child exits (up to
+      // ~4 s if it ignores EOF and SIGTERM) must not decide how fast the
+      // attempt fails, and `disconnect()` waits for it anyway. When this IS
+      // the first close (a timeout, a start that failed), wait, as this
+      // always has: a caller that exits on the error must not leave a child.
+      const first = !closeStarted(transport);
+      const closed = this.reap(transport);
+      // With `onclose` detached, the SDK's close-time cleanup never runs, so
+      // cancel the handshake to clear its own `initialize` timer (REF'D,
+      // 60 s). Only once the close has started: its `notifications/cancelled`
+      // then has no live transport to go out on.
+      handshake.abort();
+      if (first) await closed;
+      // Overtaken by `disconnect()` — before or during that close: its
+      // `closed` must survive this attempt. Keep the attempt's own failure as
+      // the cause, not the disconnect's abort.
+      if (this.closing.signal.aborted) {
+        throw this.closedWhileConnecting(err === this.closing.signal.reason ? undefined : err);
       }
       this.state = { kind: "disconnected", cause: err };
       throw wrapAsConnectionError(err, `mcp connect to "${this.name}" failed`);
     }
+
+    this.inFlight.delete(transport);
+    // The handshake landed after `disconnect()`, which has already taken this
+    // transport and started closing it: adopting it would hand a closed
+    // client a live connection.
+    if (this.closing.signal.aborted) throw this.closedWhileConnecting();
 
     this.sdk = sdk;
     this.transport = transport;
@@ -311,33 +384,52 @@ export class McpClient {
     if (closed !== undefined && this.transport !== null && closed !== this.transport) return;
     if (this.probing && (closed === undefined || closed !== this.transport)) return;
     if (this.state.kind === "closed") return;
-    this.logger?.warn("mcp.transport_closed", { server: this.name });
     this.sdk = null;
     this.transport = null;
     this.state = { kind: "disconnected" };
+    // Logged only once the state is written: a log sink that calls
+    // `disconnect()` must not have its `closed` overwritten here.
+    this.logger?.warn("mcp.transport_closed", { server: this.name });
     this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
     if (this.state.kind === "closed") return;
+    // ONE rung at a time. A failing rung whose transport closed under it has
+    // already armed the next one (via handleTransportClose); arming another
+    // here overwrote that handle, so every such failure doubled the timers
+    // and left all but the newest out of `disconnect()`'s reach — REF'D.
+    if (this.reconnectTimer !== null) return;
     const delay = nextBackoffMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
-    this.logger?.info("mcp.reconnect_scheduled", {
-      server: this.name,
-      attempt: this.reconnectAttempt,
-      delayMs: delay,
-    });
-    this.reconnectTimer = this.setTimer(() => {
+    const attempt = this.reconnectAttempt;
+    // A seam may run the callback synchronously, inside setTimer: only a
+    // handle whose callback has not run yet marks a rung as pending, or the
+    // guard above would silence the ladder for good.
+    let fired = false;
+    const handle = this.setTimer(() => {
+      fired = true;
       this.reconnectTimer = null;
       void this.tryConnect().catch((err) => {
+        // Closed before or during this rung: nothing to retry, and a
+        // shutdown is not a reconnect failure worth a warning.
+        if (this.state.kind === "closed") return;
         this.logger?.warn("mcp.reconnect_failed", {
           server: this.name,
           attempt: this.reconnectAttempt,
           error: (err as Error).message,
         });
-        if (this.state.kind !== "closed") this.scheduleReconnect();
+        this.scheduleReconnect();
       });
     }, delay);
+    if (!fired) this.reconnectTimer = handle;
+    // Logged only once the rung is armed, so a log sink that calls
+    // `disconnect()` finds the handle to clear.
+    this.logger?.info("mcp.reconnect_scheduled", {
+      server: this.name,
+      attempt,
+      delayMs: delay,
+    });
   }
 
   /** Returns the cached tool list, populating it on first use post-connect. */
@@ -521,10 +613,27 @@ export class McpClient {
 
   /**
    * Hard close — no further reconnect attempts. Pending `connectedDeferred`
-   * waiters are rejected. Safe to call repeatedly.
+   * waiters are rejected. An attempt still in flight is ended too: its
+   * transport is closed here and the attempt rejects. Resolves once every
+   * close this client has started has finished — for stdio, once each
+   * direct child has exited or been sent SIGKILL (a transport whose close()
+   * never settles holds it forever, as an adopted one always has — and a
+   * close() that awaits its own client's disconnect() waits on itself).
+   * Safe to call repeatedly: every call joins the first.
    */
-  async disconnect(): Promise<void> {
-    if (this.state.kind === "closed") return;
+  disconnect(): Promise<void> {
+    if (this.disconnecting === undefined) {
+      // Joinable BEFORE the shutdown runs a line: a close it starts may call
+      // disconnect() again, synchronously, and must join — not start a
+      // second shutdown that recurses into the same close.
+      const done = createDeferred<void>();
+      this.disconnecting = done.promise;
+      this.shutdown().then(done.resolve, done.reject);
+    }
+    return this.disconnecting;
+  }
+
+  private async shutdown(): Promise<void> {
     this.state = { kind: "closed" };
     if (this.reconnectTimer !== null) {
       this.clearTimer(this.reconnectTimer);
@@ -545,16 +654,57 @@ export class McpClient {
     const t = this.transport;
     this.sdk = null;
     this.transport = null;
-    if (t) {
-      try {
-        await t.close();
-      } catch (err) {
-        this.logger?.warn("mcp.disconnect_error", {
-          server: this.name,
-          error: (err as Error).message,
-        });
-      }
-    }
+    // Reap what an attempt in flight opened — a child still spawning, a
+    // stream still opening — along with the adopted transport.
+    const warn = (err: unknown): void => {
+      this.logger?.warn("mcp.disconnect_error", {
+        server: this.name,
+        error: describeFailure(err),
+      });
+    };
+    for (const x of [...(t ? [t] : []), ...this.inFlight]) void this.reap(x, warn);
+    this.inFlight.clear();
+    // End every handshake still racing, so none waits out its connect
+    // timeout on a client that is already closed.
+    this.closing.abort();
+    // Resolve only once every close has finished: these, and those of
+    // attempts that had already failed and are still closing their own
+    // transport. Yield before the first check: a `disconnect()` made from
+    // inside a factory returns to an attempt that then reaps the transport
+    // it was building, synchronously — after this line, before the next.
+    do await Promise.all(this.reaping);
+    while (this.reaping.size > 0);
+  }
+
+  /**
+   * Close `transport`, keeping the close where `disconnect()` can wait for
+   * it. Never rejects: a close failure goes to `onError`, or nowhere.
+   */
+  private reap(transport: McpClientLikeTransport, onError?: (err: unknown) => void): Promise<void> {
+    // Every transport reaped here went through closeOnce; the fallback is
+    // only defensive.
+    const close = firstClose.get(transport)?.start ?? (() => transport.close());
+    const done: Promise<void> = (async () => {
+      await close();
+    })()
+      .catch((err) => {
+        try {
+          onError?.(err);
+        } catch {
+          // a failing log sink must not fail the reap
+        }
+      })
+      .finally(() => {
+        this.reaping.delete(done);
+      });
+    this.reaping.add(done);
+    return done;
+  }
+
+  /** What an attempt overtaken by `disconnect()` rejects with. Its own
+   *  failure, if it had one, is kept as the cause. */
+  private closedWhileConnecting(cause?: unknown): McpConnectionError {
+    return new McpConnectionError(`mcp client "${this.name}" was closed while connecting`, cause);
   }
 }
 
@@ -754,17 +904,109 @@ function createDeferred<T>(): PromiseDeferred<T> {
   return { promise, resolve, reject };
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, buildErr: () => Error): Promise<T> {
+/**
+ * `promise`, unless `ms` pass or `signal` aborts first. The abort joins the
+ * SAME race rather than wrapping it: every promise layer between a handshake
+ * landing and its adoption is another microtask, and the reconnect tests
+ * count them.
+ */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  buildErr: () => Error,
+  signal?: AbortSignal,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_, rej) => {
+        if (signal?.aborted) {
+          rej(signal.reason);
+          return;
+        }
         timer = setTimeout(() => rej(buildErr()), ms);
+        if (signal !== undefined) {
+          onAbort = () => rej(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
       }),
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/** Each transport's own `close`, before {@link closeOnce} wrapped it. */
+const unwrappedClose = new WeakMap<McpClientLikeTransport, () => Promise<void>>();
+/** A wrapped transport's first close: start (or join) it, rejection and all;
+ *  and whether anyone has started it yet. */
+const firstClose = new WeakMap<
+  McpClientLikeTransport,
+  { readonly start: () => Promise<void>; readonly started: () => boolean }
+>();
+
+/** Whether `transport`'s first close has started — by anyone, the SDK
+ *  included. */
+function closeStarted(transport: McpClientLikeTransport): boolean {
+  return firstClose.get(transport)?.started() ?? false;
+}
+
+/**
+ * Make `transport.close()` join its first call for the rest of this attempt.
+ * The SDK's own `Client.connect` catch closes a failed handshake's transport
+ * fire-and-forget, and for stdio only that FIRST close waits for the child to
+ * exit — a second returns at once. Joining it is what lets `disconnect()`
+ * wait for the child instead of racing past it.
+ */
+function closeOnce(transport: McpClientLikeTransport): void {
+  // Re-wrapped per attempt (an injected factory may hand back the same
+  // object), always around the transport's own close.
+  const close = unwrappedClose.get(transport) ?? transport.close.bind(transport);
+  unwrappedClose.set(transport, close);
+  let first: Promise<void> | undefined;
+  let inside = false;
+  const start = (): Promise<void> => {
+    if (first === undefined) {
+      // Set before the close runs a line, so a re-entrant close joins it
+      // instead of starting a second one.
+      const settled = createDeferred<void>();
+      first = settled.promise;
+      inside = true;
+      let running: Promise<void>;
+      try {
+        running = (async () => close())();
+      } finally {
+        inside = false;
+      }
+      running.then(settled.resolve, settled.reject);
+    }
+    return first;
+  };
+  firstClose.set(transport, { start, started: () => first !== undefined });
+  try {
+    // Every caller but `reap()` — the SDK's fire-and-forget close among them
+    // — gets a close that cannot reject: none of them handles a rejection.
+    // One made from INSIDE the first close (a linked pair closing its peer,
+    // which closes it back: the SDK's InMemoryTransport) must not wait on
+    // the close it is part of.
+    transport.close = () => (inside ? Promise.resolve() : start().catch(() => undefined));
+  } catch {
+    // A transport whose `close` cannot be reassigned keeps it: our closes
+    // still join through `firstClose`; only the SDK's own goes unjoined.
+  }
+}
+
+/** A close failure's message for the log: never throws, keeps a `{ message }`. */
+function describeFailure(err: unknown): string {
+  try {
+    if (err instanceof Error) return err.message;
+    const message = (err as { message?: unknown } | null | undefined)?.message;
+    return typeof message === "string" ? message : String(err);
+  } catch {
+    return Object.prototype.toString.call(err);
   }
 }
 

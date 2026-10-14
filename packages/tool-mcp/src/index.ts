@@ -1257,7 +1257,13 @@ export function registerOptionalMcpServer(
       //     already over has no use for a reconnect;
       //   - a long-lived surface must NOT stack a second ladder on top of it
       //     (that is a doubled connect/subprocess storm). We watch instead.
-      if (!retry) await client.disconnect().catch(() => {});
+      // Not awaited: disconnect() cancels the ladder before it returns, then
+      // waits for the failed transport to finish closing — up to ~4 s for a
+      // child that ignores EOF and SIGTERM. A boot that brings its optional
+      // peers up one by one must not pay that per peer. A caller that ends
+      // with disconnectAll() joins that close on the way out; one that exits
+      // without it leaves the close to finish on its own, as before.
+      if (!retry) void client.disconnect().catch(() => {});
       const rest = retry
         ? "continuing without its tools; retrying in the background"
         : "continuing without its tools for this run";
