@@ -35,6 +35,8 @@ const realBoundaryClassifierSnapshot = { ...realBoundaryClassifierNS };
 const flags = {
   readFileFailsFor: undefined as string | undefined,
   classifyFails: false,
+  /** Reject only a text that spans lines: the recalled lines' join. */
+  classifyJoinFails: false,
   classifyCalls: 0,
   /** #53 F1 — every classifyBoundary() call's text and origin, so a test can
    *  assert each recalled-memory line was routed through the classifier. */
@@ -58,6 +60,9 @@ mock.module("@crewhaus/boundary-classifier", () => ({
     flags.classifyCalls += 1;
     flags.classified.push({ text: typeof text === "string" ? text : "", origin: opts?.origin });
     if (flags.classifyFails) return Promise.reject(new Error("classifier offline"));
+    if (flags.classifyJoinFails && typeof text === "string" && text.includes("\n")) {
+      return Promise.reject(new Error("classifier offline"));
+    }
     // A pass-shaped BoundaryResult, so callers that read the verdict work.
     return Promise.resolve({
       action: "pass",
@@ -72,6 +77,7 @@ mock.module("@crewhaus/boundary-classifier", () => ({
 afterEach(() => {
   flags.readFileFailsFor = undefined;
   flags.classifyFails = false;
+  flags.classifyJoinFails = false;
   flags.classifyCalls = 0;
   flags.classified = [];
 });
@@ -189,44 +195,57 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
     // Every line reached classifyBoundary on its own, raw (the classifier sees
     // what the earlier session wrote, before delimiter escaping), at the
     // "memory" origin whose default policy blocks — not the "user" pass tier.
+    // Then the admitted lines once more, joined raw with "\n" (no bullets), so
+    // an injection split across two lines is seen whole.
     const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
-    expect(memoryCalls.map((c) => c.text)).toEqual(lines);
+    expect(memoryCalls.map((c) => c.text)).toEqual([...lines, lines.join("\n")]);
   });
 
   // A classifier rejection must never admit a recalled line unclassified: it
   // propagates out of renderRecalledMemory, and both callers inject nothing.
+  // That holds for the joined lines too, after every line has passed alone.
   for (const recallMode of ["session-start", "per-turn"] as const) {
-    test(`a classifier rejection fails closed: no recalled line reaches the prompt (${recallMode})`, async () => {
-      const { runChatLoop } = await import("./index");
-      const { adapter } = makeStubAdapter("done");
-      const stub = adapter as { stream: () => AsyncGenerator<unknown> };
-      const system: string[] = [];
-      const spyAdapter = {
-        ...stub,
-        stream: (req: { system?: ReadonlyArray<{ text: string }> }) => {
-          for (const b of req.system ?? []) system.push(b.text);
-          return stub.stream();
-        },
-      };
-      flags.classifyFails = true;
-      await runChatLoop({
-        model: "test-model",
-        instructions: "be helpful",
-        // biome-ignore lint/suspicious/noExplicitAny: test stub adapter
-        _adapter: spyAdapter as any,
-        singleTurn: true,
-        seedMessages: [{ role: "user", content: "hi" }],
-        sessionRootDir: SESSION_ROOT,
-        memory: {
-          autoRecall: true,
-          recallMode,
-          recall: async () => ["a recalled fact the classifier never cleared"],
-        },
-        // biome-ignore lint/suspicious/noExplicitAny: partial opts for the test
-      } as any);
-      expect(flags.classified.some((c) => c.origin === "memory")).toBe(true);
-      expect(system.length).toBeGreaterThan(0);
-      expect(system.some((t) => t.includes("<recalled_memory>"))).toBe(false);
-    });
+    for (const failing of ["every call", "the joined lines"] as const) {
+      test(`a classifier rejection on ${failing} fails closed: no recalled line reaches the prompt (${recallMode})`, async () => {
+        const { runChatLoop } = await import("./index");
+        const { adapter } = makeStubAdapter("done");
+        const stub = adapter as { stream: () => AsyncGenerator<unknown> };
+        const system: string[] = [];
+        const spyAdapter = {
+          ...stub,
+          stream: (req: { system?: ReadonlyArray<{ text: string }> }) => {
+            for (const b of req.system ?? []) system.push(b.text);
+            return stub.stream();
+          },
+        };
+        if (failing === "every call") flags.classifyFails = true;
+        else flags.classifyJoinFails = true;
+        await runChatLoop({
+          model: "test-model",
+          instructions: "be helpful",
+          // biome-ignore lint/suspicious/noExplicitAny: test stub adapter
+          _adapter: spyAdapter as any,
+          singleTurn: true,
+          seedMessages: [{ role: "user", content: "hi" }],
+          sessionRootDir: SESSION_ROOT,
+          memory: {
+            autoRecall: true,
+            recallMode,
+            recall: async () => [
+              "a recalled fact the classifier never cleared",
+              "and one beside it",
+            ],
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: partial opts for the test
+        } as any);
+        const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
+        expect(memoryCalls.length).toBeGreaterThan(0);
+        if (failing === "the joined lines") {
+          expect(memoryCalls.some((c) => c.text.includes("\n"))).toBe(true);
+        }
+        expect(system.length).toBeGreaterThan(0);
+        expect(system.some((t) => t.includes("<recalled_memory>"))).toBe(false);
+      });
+    }
   }
 });

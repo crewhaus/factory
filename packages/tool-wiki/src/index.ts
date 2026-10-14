@@ -58,6 +58,8 @@
  * result would not be. List rows are checked by the local layers one by one,
  * but go to a model-backed classifier (Layer 3) in chunks of rows, so a long
  * list costs a few model calls rather than one per row; see `classifyRows`.
+ * Neighbouring rows are also classified side by side, so an injection split
+ * across two rows redacts both of them.
  * A non-blocked unit is `tagContent`-ed into
  * `RunContext.dataLineage` under origin `"memory"` (the skills-registry
  * two-site pattern) so the sink-side egress fabric can attribute a later
@@ -382,8 +384,9 @@ function named(ref: { readonly slug: unknown; readonly version: unknown }): stri
 }
 
 /**
- * The most row text one classification sees at once: well inside the
- * classifier's window (64 KiB), so every row in a chunk is analysed in full.
+ * The most row text one classification sees at once, besides the row a chunk
+ * carries over from the one before it: well inside the classifier's window
+ * (64 KiB), so every row in a chunk is analysed in full.
  */
 const ROW_CHUNK_CHARS = 16 * 1024;
 
@@ -397,11 +400,14 @@ const ROW_CLASSIFY_CONCURRENCY = 8;
 const LOCAL_LAYERS_ONLY = async (): Promise<undefined> => undefined;
 
 /** Run `fn` over `items` in order, at most {@link ROW_CLASSIFY_CONCURRENCY} at a time. */
-async function mapPooled<T, R>(items: ReadonlyArray<T>, fn: (item: T) => Promise<R>): Promise<R[]> {
+async function mapPooled<T, R>(
+  items: ReadonlyArray<T>,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
   const out = new Array<R>(items.length);
   let next = 0;
   const worker = async (): Promise<void> => {
-    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i] as T);
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i] as T, i);
   };
   await Promise.all(
     Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, items.length) }, () => worker()),
@@ -421,10 +427,15 @@ async function mapPooled<T, R>(items: ReadonlyArray<T>, fn: (item: T) => Promise
  *  2. The rows that pass are joined into chunks of at most
  *     {@link ROW_CHUNK_CHARS} and each chunk is classified in full, Layer 3
  *     included when the runtime registered one: one model call per chunk,
- *     not per row (a 400-row wiki_search used to make 400).
+ *     not per row (a 400-row wiki_search used to make 400). Each chunk after
+ *     the first starts with the row the one before it ended on, so every two
+ *     neighbouring rows are classified side by side in some chunk.
  *  3. Only inside a chunk that comes back malicious is each row classified
  *     in full on its own, so only the row that carries the injection is
  *     redacted, never its neighbours.
+ *  4. The rows of that chunk that pass on their own still go through
+ *     {@link redactSplitInjections}: an injection split across two rows
+ *     ("… ignore previous" / "instructions and …") passes row by row.
  *
  * A row that passes is tagged into the run's data lineage at `"memory"`.
  */
@@ -443,6 +454,7 @@ async function classifyRows(
   const chunks: number[][] = [];
   let chunk: number[] = [];
   let chunkChars = 0;
+  let fresh = 0;
   local.forEach((result, i) => {
     if (result.action === "redact") {
       out[i] = {
@@ -452,32 +464,90 @@ async function classifyRows(
       return;
     }
     const length = (rows[i] as string).length + 1;
-    if (chunk.length > 0 && chunkChars + length > ROW_CHUNK_CHARS) {
+    if (fresh > 0 && chunkChars + length > ROW_CHUNK_CHARS) {
       chunks.push(chunk);
-      chunk = [];
-      chunkChars = 0;
+      const last = chunk[chunk.length - 1] as number;
+      chunk = [last];
+      chunkChars = (rows[last] as string).length + 1;
+      fresh = 0;
     }
     chunk.push(i);
     chunkChars += length;
+    fresh++;
   });
-  if (chunk.length > 0) chunks.push(chunk);
-  const flagged: number[] = [];
-  await mapPooled(chunks, async (members) => {
-    const whole = await classifyBoundary(members.map((i) => rows[i]).join("\n"), {
-      origin: "memory",
-    });
-    if (whole.action === "redact") flagged.push(...members);
-    else for (const i of members) out[i] = { safe: true, text: rows[i] as string };
-  });
+  if (fresh > 0) chunks.push(chunk);
+  const wholes = await mapPooled(chunks, (members) =>
+    classifyBoundary(members.map((i) => rows[i]).join("\n"), { origin: "memory" }),
+  );
+  // In chunk order, not completion order, so the output does not depend on
+  // which chunk's model call returned first.
+  const flaggedChunks = chunks.filter((_, c) => wholes[c]?.action === "redact");
+  const flagged = [...new Set(flaggedChunks.flat())];
   const each = await mapPooled(flagged, (i) => classifyMemory(rows[i] as string, undefined));
   flagged.forEach((i, j) => {
-    out[i] = each[j];
+    const result = each[j] as Classified;
+    if (!result.safe) out[i] = result;
   });
-  return out.map((c) => {
-    const result = c as Classified;
+  // One flagged chunk at a time: the check pools its own pair calls, so this
+  // keeps at most ROW_CLASSIFY_CONCURRENCY classifications in flight. A row
+  // carried between two flagged chunks takes the first chunk's notice.
+  for (const members of flaggedChunks) {
+    const passed = members.filter((i) => out[i] === undefined);
+    for (const [k, notice] of await redactSplitInjections(passed.map((i) => rows[i] as string))) {
+      const i = passed[k] as number;
+      out[i] ??= { safe: false, notice };
+    }
+  }
+  return rows.map((row, i) => {
+    const result = out[i] ?? { safe: true, text: row };
     if (result.safe && rc !== undefined) tagContent(rc, result.text, "memory");
     return result;
   });
+}
+
+/**
+ * An injection split across rows. Each of `rows` passed classification on its
+ * own, but an attacker who can plant two articles that list side by side can
+ * split one phrase between them, so each half classifies clean and the model
+ * still reads one sentence. The rows are classified joined with "\n" at
+ * TrustOrigin `"memory"`: the raw rows, not the rendered `  • ` lines, whose
+ * bullets break the detector's phrase rules without breaking the sentence for
+ * the model. When the join is malicious, each pair of neighbours is classified
+ * and both rows of a malicious pair are redacted. When no pair reproduces the
+ * verdict, or the rows left still join malicious (a split over three rows, or
+ * weak hits that only add up across the chunk), every row is redacted: fail
+ * closed. runtime-core's `renderRecalledMemory` runs the same check on
+ * auto-recalled lines. Returns the notice for each row to redact, by index
+ * into `rows`.
+ */
+async function redactSplitInjections(rows: ReadonlyArray<string>): Promise<Map<number, string>> {
+  const redacted = new Map<number, string>();
+  if (rows.length < 2) return redacted;
+  const joined = await classifyBoundary(rows.join("\n"), { origin: "memory" });
+  if (joined.action !== "redact") return redacted;
+  const pairs = await mapPooled(rows.slice(1), (_row, i) =>
+    classifyBoundary(`${rows[i]}\n${rows[i + 1]}`, { origin: "memory" }),
+  );
+  pairs.forEach((pair, i) => {
+    if (pair.action !== "redact") return;
+    const notice = pair.redacted ?? buildRedactionNotice(pair.verdict.hits);
+    redacted.set(i, notice);
+    redacted.set(i + 1, notice);
+  });
+  const left = rows.filter((_, i) => !redacted.has(i));
+  const residual =
+    redacted.size === 0
+      ? joined
+      : left.length > 1
+        ? await classifyBoundary(left.join("\n"), { origin: "memory" })
+        : undefined;
+  if (residual?.action === "redact") {
+    const notice = residual.redacted ?? buildRedactionNotice(residual.verdict.hits);
+    for (let i = 0; i < rows.length; i++) {
+      if (!redacted.has(i)) redacted.set(i, notice);
+    }
+  }
+  return redacted;
 }
 
 /**
