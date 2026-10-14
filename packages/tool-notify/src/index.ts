@@ -2119,6 +2119,16 @@ export const webhookPost: RegisteredTool = buildTool({
             ),
           );
         }
+        // Once the signal has aborted — a cancel, or the timer ahead of the
+        // clock — no retry starts: each would fail at once, count as an
+        // attempt, and spend the rest of `retries` in a few milliseconds. It
+        // is asked before the retry count, so a cancel during the last
+        // attempt reads as a cancel too, not as "all N attempt(s) failed".
+        const stopped = (): string =>
+          prepared.redact(
+            `${notSentBecause(describeFailure(prepared.deadline.signal.reason, prepared.deadline))}\n${json({ attempts })}`,
+          );
+        if (prepared.deadline.signal.aborted) return stopped();
         if (attempt >= retries) {
           return prepared.redact(
             `${notSentBecause(`all ${attempt + 1} attempt(s) failed`)}\n${json({ attempts })}`,
@@ -2131,6 +2141,7 @@ export const webhookPost: RegisteredTool = buildTool({
           );
         }
         await sleep(delay, prepared.deadline.signal);
+        if (prepared.deadline.signal.aborted) return stopped();
       }
     } catch (err) {
       return prepared.redact(notSentBecause(describeFailure(err, prepared.deadline)));

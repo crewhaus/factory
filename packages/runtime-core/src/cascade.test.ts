@@ -663,7 +663,7 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
     expect(draftLines[0]).toMatchObject({ q: 0.1, st: "draft" });
   });
 
-  test("the pre-draft snapshot is a COPY: reactive compaction inside the draft turn (a 5-message transcript → [marker, summary]) still hands the strong rung the pre-draft transcript under clean_prompt — no holes, no TypeError", async () => {
+  test("the pre-draft snapshot is a COPY: reactive compaction inside the draft turn (a 5-message transcript → [marker, summary, pending question]) still hands the strong rung the pre-draft transcript under clean_prompt — no holes, no TypeError", async () => {
     const promptTooLong = {
       name: "BadRequestError",
       error: { type: "invalid_request_error" },
@@ -697,12 +697,15 @@ describe("cascade — review findings on PR 9c (§7.13 fall-back, snapshot copy,
     // The draft turn compacted (one summary call); the pool's misroute latch
     // then re-issued the DRAFT on the strongest candidate (a cheap-arm
     // failure escalates the recovery retry), so the strong adapter saw the
-    // compacted 2-message transcript first…
+    // compacted transcript first — marker, summary, then the user's pending
+    // question kept verbatim, so the request ends on a user turn rather than
+    // an assistant prefill…
     expect(compactor.requests).toHaveLength(1);
     expect(cheap.requests).toHaveLength(1);
     expect(cap.seen.filter((e) => e.kind === "compaction_fired")).toHaveLength(1);
     expect(strong.requests).toHaveLength(2);
-    expect(strong.requests[0]?.messages).toHaveLength(2);
+    expect(strong.requests[0]?.messages).toHaveLength(3);
+    expect(strong.requests[0]?.messages.at(-1)).toEqual({ role: "user", content: "hard question" });
     // …and the ESCALATED request equals the PRE-DRAFT transcript — all five
     // seed messages, none of the compaction marker/summary, no rejected
     // draft. (A remembered LENGTH would have extended the 3-entry
