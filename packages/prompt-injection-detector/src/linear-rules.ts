@@ -6,9 +6,11 @@
  * `now do this` to the end of its line looking for a command, every `<iframe`
  * to its `>` (and over a run of spaces after it twice over), every `http://`
  * to the end of its URL and then 80 characters more for every character of
- * it. On 64 KiB of tool output (MAX_CLASSIFY_LEN) that is seconds per rule,
- * and over a minute for the URL pair. Each scan returns the match its pattern
- * returns, found by reading each character a bounded number of times;
+ * it. On 64 KiB of tool output that is seconds per rule, and over a minute
+ * for the URL pair; the classifier now reads texts of up to 4 MiB whole
+ * (MAX_SCAN_CHARS), so every rule must stay linear. Each scan returns the
+ * match its pattern returns, found by reading each character a bounded
+ * number of times;
  * linear-rules.test.ts and linear-auto-execute.test.ts check every one
  * against its pattern.
  *
