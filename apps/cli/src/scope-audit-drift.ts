@@ -292,7 +292,9 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   },
   // Auto-recall: fact, wiki, and session-summary lines recalled from earlier
   // sessions are rendered into the system region as `<recalled_memory>`; each
-  // line is classified at TrustOrigin "memory" and lineage-tagged right before.
+  // line, then the admitted lines joined (an injection split across two of
+  // them), is classified at TrustOrigin "memory", and the lines still admitted
+  // are lineage-tagged right before.
   {
     name: "runtime-core-recalled-memory",
     path: "packages/runtime-core/src/index.ts",
