@@ -59,9 +59,13 @@ export class McpHost {
 
   /**
    * Disconnect every registered client. Used by the generated agent's
-   * try/finally cleanup so spawned subprocesses are reaped on exit. Errors
-   * from individual disconnects are logged and ignored — the goal is best-
-   * effort cleanup.
+   * try/finally cleanup so spawned subprocesses are reaped on exit —
+   * including a peer whose connect is still in flight (an optional peer's
+   * un-awaited first attempt, or a reconnect rung): its transport is closed
+   * too, and its pending `connect()` rejects. Resolves once every client's
+   * closes have finished (stdio signals only its direct child, so a
+   * wrapper's grandchild can outlive this). Errors from individual
+   * disconnects are logged and ignored — the goal is best-effort cleanup.
    */
   async disconnectAll(): Promise<void> {
     await Promise.allSettled([...this.clients.values()].map((c) => c.disconnect()));
