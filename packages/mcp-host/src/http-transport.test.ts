@@ -18,6 +18,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { McpConnectionError } from "@crewhaus/errors";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -199,4 +201,66 @@ describe("falling back to a LEGACY server leaves no phantom reconnects", () => {
       http.close();
     }
   }, 30_000);
+});
+
+describe("a disconnect during the probe ends it", () => {
+  test("disconnect() while the first wire candidate is in flight never tries the second", async () => {
+    // The probe walks the candidates in a loop. A client closed while
+    // candidate 1 was still handshaking must not go on to open candidate 2:
+    // that is a fresh stream (and server session) on a client nobody wants.
+    let posts = 0;
+    let gets = 0;
+    let postSeen!: () => void;
+    const seen = new Promise<void>((r) => {
+      postSeen = r;
+    });
+    let releasePost!: () => void;
+    const held = new Promise<void>((r) => {
+      releasePost = r;
+    });
+    const http = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        if (req.method === "POST") {
+          posts += 1;
+          postSeen();
+          await held;
+          return new Response("not an MCP endpoint", { status: 404 });
+        }
+        if (req.method === "GET") gets += 1;
+        return new Response("not an MCP endpoint", { status: 404 });
+      },
+    });
+    servers.push(http);
+    // Counted at the client too: a candidate built and started after the
+    // close could be torn down before its request ever reached the server.
+    let handshakes = 0;
+    const client = new McpClient(
+      "peer",
+      { transport: "sse", url: `http://127.0.0.1:${http.port}/mcp` },
+      {
+        setTimer: () => Symbol("never fired"),
+        clearTimer: () => undefined,
+        clientFactory: (info) => {
+          handshakes += 1;
+          return new Client(info, { capabilities: {} });
+        },
+      },
+    );
+    clients.push(client);
+    const booting = client.connect();
+    booting.catch(() => undefined);
+    await seen;
+    // Resolves without the server ever answering: disconnect() aborts the
+    // held request itself.
+    await client.disconnect();
+    releasePost();
+    await expect(booting).rejects.toThrow(McpConnectionError);
+    expect({ posts, gets, handshakes, state: client.getState().kind }).toEqual({
+      posts: 1,
+      gets: 0,
+      handshakes: 1,
+      state: "closed",
+    });
+  });
 });
