@@ -6,7 +6,7 @@
  * end of the line and gave it back a character at a time looking for a
  * command, so a line of heads with no command after them was read again from
  * every head: quadratic in the line, about a second and a half per
- * classification at MAX_CLASSIFY_LEN on this machine. `findAutoExecute`
+ * classification of 64 KiB on this machine. `findAutoExecute`
  * returns the match the pattern returns, checked here on every short and
  * many long concatenations of pieces that reach each part, and reads each
  * character a bounded number of times.

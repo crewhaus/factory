@@ -23,6 +23,15 @@
  *   `classify` callback that delegates to a model. Without the env
  *   var the layer is a no-op.
  *
+ * Layers 1 and 2 read the whole text, every decoded blob in it included, in
+ * overlapping 64 KiB windows scored one by one: the text takes its worst
+ * window's verdict, so hits count as densely as in one window and never add
+ * up across a long document. A match longer than a window is caught by a
+ * whole-text pass with the rules that can stretch that far. A text over MAX_SCAN_CHARS (4 MiB), or a window
+ * whose views outgrow their budget, is not read and classifies malicious.
+ * Layer 3 is shown at most the head and tail of a text (MODEL_VIEW_CHARS), so
+ * a classification is one bounded model call.
+ *
  * The aggregate score thresholds:
  *   < 0.40 → "clean"
  *   [0.40, 0.80) → "suspicious"
@@ -97,10 +106,51 @@ const OVERRIDE_SAFETY_PATTERN = (() => {
 const SCORE_SUSPICIOUS = 0.4;
 const SCORE_MALICIOUS = 0.8;
 
-// Upper bound on the text the regex/structural layers scan, so a pathological
-// (e.g. multi-MB whitespace) input cannot wedge the classifier (#153). Larger
-// inputs are analyzed head + tail.
-const MAX_CLASSIFY_LEN = 64 * 1024;
+// The regex and structural layers read the whole text, one window at a time:
+// overlapping windows of WINDOW_CHARS, each scored on its own, and the text
+// takes its worst window's verdict. A text of up to one window is read and
+// scored exactly as before. Reading only the head and tail of a longer text
+// (the old bound, #153) left its middle unread: an injection in the middle of
+// a long recalled memory or a large MCP response was never seen. Scoring a
+// long text as one unit instead let unrelated medium hits pages apart add up
+// to malicious on benign documents; per window, hits add up only as densely
+// as they did in the old 64 KiB view. Two more verdicts join the windows' in
+// a longer text: the invisible characters its windows no longer hold (see
+// WHITESPACE_RUN_KEEP), and a match longer than a window can hold, from one
+// pass over the whole text with the few rules that can stretch that far
+// (LONG_MATCH_RULES).
+const WINDOW_CHARS = 64 * 1024;
+
+// Consecutive windows share this much text, far more than any bounded rule
+// reaches (the longest reads 800 characters), so a phrase is never cut in two.
+const WINDOW_OVERLAP_CHARS = 4 * 1024;
+
+// In a text longer than one window, padding is taken out before windowing,
+// so it cannot push the halves of a phrase into two windows: invisible
+// characters (which the match view deletes anyway) are dropped, and a
+// whitespace run longer than twice this keeps this much of each end, plus a
+// line break when the part cut out held one, so a rule anchored at a line
+// still sees its line. Their presence is still flagged from the text itself.
+const WHITESPACE_RUN_KEEP = 256;
+
+// Every rule is linear (#153, counted in the tests), so the work grows with
+// the text. It stays bounded: a text longer than this is not read at all and
+// classifies malicious ("scan-limit"), fail closed. About 1 s here for 4 MiB
+// of prose, 4.5 s for the slowest shape measured (many short lines).
+const MAX_SCAN_CHARS = 4 * 1024 * 1024;
+
+// A window's normalized and decoded views together may hold at most this many
+// times the window's length (plus VIEW_BUDGET_SLACK): NFKC expands a few
+// characters up to 18-fold, and decodes of decodes add up. A window past it
+// is not read: "scan-limit", fail closed. Benign text stays well under it (a
+// base64 MIME email with percent-encoded links: about 3x).
+const VIEW_BUDGET_RATIO = 8;
+const VIEW_BUDGET_SLACK = 4096;
+
+// What the optional model layer (Layer 3) is shown of a longer text: its head
+// and tail, so a classification is still one model call of bounded size. The
+// regex and structural layers have read the rest, window by window.
+const MODEL_VIEW_CHARS = 64 * 1024;
 
 // Zero-width / format / bidi / tag characters used to split trigger words
 // ("ig<U+200B>nore"). Stripped from the match view; their *presence* is still
@@ -590,16 +640,26 @@ export const TOOL_DEFINITION_RULES: ReadonlyArray<PromptInjectionRule> = [
  */
 export function toolDefinitionHits(text: string): PromptInjectionHit[] {
   if (text === "") return [];
+  // Past the scan bound the text is not read: fail closed, as classifyText does.
+  if (text.length > MAX_SCAN_CHARS) return [scanLimitHit(MAX_SCAN_CHARS, text.length)];
   const hits: PromptInjectionHit[] = [];
-  const seen = new Set<string>();
-  for (const view of matchViews(boundedForScan(text))) {
-    for (const h of regexHits(view, TOOL_DEFINITION_RULES)) {
-      if (seen.has(h.rule)) continue;
-      seen.add(h.rule);
-      hits.push(h);
+  const scanText = scanTextOf(text);
+  const windows: Array<readonly [number, number]> = [];
+  for (const [at, window] of windowsOf(scanText)) {
+    windows.push([at, at + window.length]);
+    const views = viewsOf(window, at > 0);
+    if (views === undefined) return [scanLimitHit(at, at + window.length)];
+    for (const view of views) {
+      for (const h of viewHits(view, TOOL_DEFINITION_RULES)) hits.push(shifted(h, at));
     }
   }
-  return hits;
+  if (text.length > WINDOW_CHARS) {
+    // A match longer than a window can hold (see classifyText).
+    for (const h of regexHits(scanText, TOOL_DEFINITION_RULES.filter(canOutgrowWindows))) {
+      if (!windows.some(([start, end]) => start <= h.span[0] && h.span[1] <= end)) hits.push(h);
+    }
+  }
+  return distinctRules(hits);
 }
 
 /**
@@ -669,12 +729,20 @@ function regexHits(
   return hits;
 }
 
-function structuralHits(text: string): PromptInjectionHit[] {
+/**
+ * Layer 2 over `text`, one window of a longer text: `first` and `last` say
+ * whether it opens or ends the text, since the BOM check reads the opening
+ * and the trailing-imperative check the end.
+ */
+function structuralHits(
+  text: string,
+  edges: { readonly first: boolean; readonly last: boolean } = { first: true, last: true },
+): PromptInjectionHit[] {
   const hits: PromptInjectionHit[] = [];
 
   // BOM tampering — text shouldn't open with a BOM unless it's at the
   // start of a UTF document. Tool outputs almost never legitimately do.
-  if (text.startsWith("﻿")) {
+  if (edges.first && text.startsWith("﻿")) {
     hits.push({ rule: "structural-bom", span: [0, 1], severity: "low", layer: "structural" });
   }
 
@@ -699,7 +767,7 @@ function structuralHits(text: string): PromptInjectionHit[] {
   const tail = text.slice(tailStart);
   const tailImperative =
     /(?:^|\n)[ \t]*(?:now |then |finally )?(?:please[ \t]+)?(?:run|execute|fetch|delete|remove|email|upload|send|forward|leak|exfil(?:trate)?|shutdown|kill|chmod|chown|sudo)\b[^\n]{0,200}$/i;
-  const t = tailImperative.exec(tail);
+  const t = edges.last ? tailImperative.exec(tail) : null;
   if (t) {
     hits.push({
       rule: "structural-trailing-imperative",
@@ -762,6 +830,12 @@ export type ClassifyOptions = {
   readonly thresholds?: { readonly suspicious?: number; readonly malicious?: number };
 };
 
+/** `hits` with each rule's first hit only: a rule counts once. */
+function distinctRules(hits: ReadonlyArray<PromptInjectionHit>): PromptInjectionHit[] {
+  const seen = new Set<string>();
+  return hits.filter((h) => !seen.has(h.rule) && seen.add(h.rule) !== undefined);
+}
+
 function aggregateScore(hits: ReadonlyArray<PromptInjectionHit>): number {
   // Probabilistic OR: each hit raises the score multiplicatively.
   let p = 0;
@@ -807,9 +881,13 @@ function isMostlyPrintable(s: string): boolean {
 }
 
 function tryDecodeBase64(blob: string): string | undefined {
-  if (blob.length < 16 || blob.length % 4 === 1) return undefined;
+  if (blob.length < 16) return undefined;
   try {
-    const decoded = Buffer.from(blob, "base64").toString("utf8");
+    // A length of 1 mod 4 cannot end a base64 stream; its last character is
+    // dropped rather than the whole run (one extra character used to hide a
+    // payload from decoding, and a window boundary cuts runs anywhere).
+    const whole = blob.length % 4 === 1 ? blob.slice(0, -1) : blob;
+    const decoded = Buffer.from(whole, "base64").toString("utf8");
     return isMostlyPrintable(decoded) ? decoded : undefined;
   } catch {
     return undefined;
@@ -826,47 +904,260 @@ function tryDecodeHex(blob: string): string | undefined {
   }
 }
 
-function tryDecodePercent(text: string): string | undefined {
-  try {
-    const decoded = decodeURIComponent(text);
-    return decoded !== text ? decoded : undefined;
-  } catch {
-    return undefined;
+const UTF8 = new TextDecoder("utf-8");
+
+/** A run of percent escapes, decoded as UTF-8 (a replacement character for a byte that is not). */
+function decodePercentRun(run: string): string {
+  const bytes = new Uint8Array(run.length / 3);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = Number.parseInt(run.slice(3 * i + 1, 3 * i + 3), 16);
   }
+  return UTF8.decode(bytes);
+}
+
+/**
+ * `text` with each run of percent escapes decoded on its own, so one stray
+ * "%" or an invalid escape ("%E0%A4") no longer stops the rest of the text
+ * from decoding, and nothing throws.
+ */
+function tryDecodePercent(text: string): string | undefined {
+  const decoded = text.replace(/(?:%[0-9A-Fa-f]{2})+/g, decodePercentRun);
+  return decoded !== text ? decoded : undefined;
+}
+
+const BASE64_RUN = /[A-Za-z0-9+/]{16,}={0,2}/g;
+const HEX_RUN = /(?:[0-9A-Fa-f]{2}){8,}/g;
+
+/**
+ * A text a rule set runs over. `seams` are the offsets of the line breaks
+ * that join separate decodes in a decoded view: a match that runs across one
+ * is two decodes side by side, not a match (see {@link viewHits}).
+ */
+type View = { readonly text: string; readonly seams?: ReadonlyArray<number> };
+
+/** One view of `decodes`, a line each, with the seams between them. */
+function joinedView(decodes: ReadonlyArray<string>): View | undefined {
+  if (decodes.length === 0) return undefined;
+  const seams: number[] = [];
+  let at = 0;
+  for (const [i, d] of decodes.entries()) {
+    if (i > 0) seams.push(at - 1);
+    at += d.length + 1;
+  }
+  return { text: decodes.join("\n"), seams };
 }
 
 /**
  * Recursively decode base64 / hex / percent-encoded blobs so an injection
  * hidden in an encoded payload is rescanned in cleartext, regardless of
- * neighbouring keywords (#143). Match counts and depth are bounded so this
- * cannot itself become a DoS vector.
+ * neighbouring keywords (#143).
+ *
+ * Every blob is decoded, and the readable decodes of each kind go into ONE
+ * view, a line each: the rules run over that view once, so the work grows
+ * with the decoded text, never with the number of blobs, and a payload is
+ * decoded however many blobs come before it. A match across two decodes in
+ * that view does not count (see {@link viewHits}).
+ *
+ * Base64 runs that only whitespace separates (a MIME body's lines, a payload
+ * split across two lines or memories) are decoded as one stream. When every
+ * part but the last is a whole number of 4-character groups with no padding,
+ * the stream is exactly its parts' decodes run together, so only the stream
+ * is kept; otherwise both are. In a window after the first, the run that
+ * opens it may be the rest of a blob the boundary cut, at any alignment, so
+ * it is decoded at each. `seen` holds the runs already decoded in this
+ * window, so a view that repeats the text (the percent view) does not decode
+ * them twice. Depth is bounded, so a decode of a decode is the last.
  */
-function decodedVariants(text: string, depth = 2): string[] {
-  if (depth <= 0 || text.length === 0) return [];
-  const out: string[] = [];
-  const push = (s: string | undefined): void => {
-    if (s !== undefined && s.length > 0) out.push(s, ...decodedVariants(s, depth - 1));
+function decodedVariants(
+  text: string,
+  budget: { left: number },
+  seen: Set<string>,
+  depth = 2,
+  continued = false,
+): View[] {
+  if (depth <= 0 || text.length === 0 || budget.left < 0) return [];
+  const out: View[] = [];
+  const push = (view: View | undefined): void => {
+    if (view === undefined || view.text.length === 0) return;
+    budget.left -= view.text.length;
+    if (budget.left < 0) return;
+    out.push(view, ...decodedVariants(view.text, budget, seen, depth - 1));
   };
-  for (const m of [...text.matchAll(/[A-Za-z0-9+/]{16,}={0,2}/g)].slice(0, 8)) {
-    push(tryDecodeBase64(m[0]));
+  const base64: string[] = [];
+  const add = (s: string | undefined): void => {
+    if (s !== undefined && s.length > 0) base64.push(s);
+  };
+  let runs: string[] = [];
+  let chainStart = -1;
+  let chainEnd = -1;
+  const flush = (): void => {
+    if (runs.length === 0) return;
+    const stream = runs.join("");
+    const opensWindow = continued && chainStart === 0;
+    if (!seen.has(stream)) {
+      seen.add(stream);
+      for (let shift = 0; shift < (opensWindow ? 4 : 1); shift++) {
+        add(tryDecodeBase64(stream.slice(shift)));
+      }
+      const aligned = runs.slice(0, -1).every((r) => r.length % 4 === 0 && !r.endsWith("="));
+      if (runs.length > 1 && (!aligned || opensWindow)) {
+        for (const r of runs) if (!seen.has(r)) add(tryDecodeBase64(r));
+      }
+    }
+    runs = [];
+  };
+  for (const m of text.matchAll(BASE64_RUN)) {
+    if (runs.length > 0 && !/^\s+$/.test(text.slice(chainEnd, m.index))) flush();
+    if (runs.length === 0) chainStart = m.index;
+    runs.push(m[0]);
+    chainEnd = m.index + m[0].length;
   }
-  for (const m of [...text.matchAll(/(?:[0-9A-Fa-f]{2}){8,}/g)].slice(0, 8)) {
-    push(tryDecodeHex(m[0]));
+  flush();
+  push(joinedView(base64));
+  const hex: string[] = [];
+  for (const m of text.matchAll(HEX_RUN)) {
+    const candidates = [m[0]];
+    // A hex run opening a later window may be off the 2-character grid.
+    if (continued && m.index === 0) {
+      const span = /^[0-9A-Fa-f]+/.exec(text)?.[0] ?? m[0];
+      candidates.push(span.slice(1, 1 + 2 * Math.floor((span.length - 1) / 2)));
+    }
+    for (const run of candidates) {
+      if (seen.has(run)) continue;
+      seen.add(run);
+      const decoded = tryDecodeHex(run);
+      if (decoded !== undefined && decoded.length > 0) hex.push(decoded);
+    }
   }
-  if (/%[0-9A-Fa-f]{2}/.test(text)) push(tryDecodePercent(text));
-  return out.slice(0, 16);
+  push(joinedView(hex));
+  if (/%[0-9A-Fa-f]{2}/.test(text)) {
+    const decoded = tryDecodePercent(text);
+    if (decoded !== undefined) push({ text: decoded });
+  }
+  return out;
 }
 
-/** At most {@link MAX_CLASSIFY_LEN} characters of `text`: its head and tail. */
-function boundedForScan(text: string): string {
-  return text.length > MAX_CLASSIFY_LEN
-    ? `${text.slice(0, MAX_CLASSIFY_LEN / 2)}\n${text.slice(-MAX_CLASSIFY_LEN / 2)}`
+/** The hit for text that was not read (see {@link MAX_SCAN_CHARS}, {@link VIEW_BUDGET_RATIO}). */
+function scanLimitHit(start: number, end: number): PromptInjectionHit {
+  return { rule: "scan-limit", span: [start, end], severity: "high", layer: "structural" };
+}
+
+/** `hit` with its span moved from a window's offsets to the text's. */
+function shifted(hit: PromptInjectionHit, at: number): PromptInjectionHit {
+  return at === 0 ? hit : { ...hit, span: [hit.span[0] + at, hit.span[1] + at] };
+}
+
+/**
+ * The text the windows are cut from: `text` itself when it fits one window
+ * (read exactly as before), otherwise `text` without its padding (see
+ * {@link WHITESPACE_RUN_KEEP}). Spans are offsets into this text.
+ */
+function scanTextOf(text: string): string {
+  if (text.length <= WINDOW_CHARS) return text;
+  return text.replace(INVISIBLE_RE, "").replace(/\s+/g, (run) => {
+    if (run.length <= 2 * WHITESPACE_RUN_KEEP) return run;
+    const head = run.slice(0, WHITESPACE_RUN_KEEP);
+    const tail = run.slice(-WHITESPACE_RUN_KEEP);
+    const cut = run.slice(WHITESPACE_RUN_KEEP, -WHITESPACE_RUN_KEEP);
+    return `${head}${/[\r\n]/.test(cut) ? "\n" : ""}${tail}`;
+  });
+}
+
+/**
+ * Whether `rule` can match more text than the window overlap from real
+ * content: its pattern repeats a broad class ([\s\S], ., a negated class)
+ * without bound, or repeats anything at least n times with no upper bound.
+ * A rule that only repeats a narrow class without bound (\s, [ \t], ">")
+ * spans padding, which {@link scanTextOf} cuts, and stays inside a window.
+ */
+function canOutgrowWindows(rule: PromptInjectionRule): boolean {
+  return /\[\\s\\S\][*+]|\[\^[^\]]*\][*+]|(?<!\\)\.[*+]|\{\d+,\}/.test(rule.pattern.source);
+}
+
+/** The rules a longer text is also read with whole, for a match no window holds. */
+const LONG_MATCH_RULES: ReadonlyArray<PromptInjectionRule> = REGEX_RULES.filter(canOutgrowWindows);
+
+/** The rules that flag invisible characters, which {@link scanTextOf} drops. */
+const PRESENCE_RULE_IDS: ReadonlySet<string> = new Set(["unicode-tag-spoof", "rtl-override"]);
+
+/** A UTF-16 low surrogate: the second half of a pair a window must not split. */
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/**
+ * `text` in windows of {@link WINDOW_CHARS}, each starting
+ * {@link WINDOW_OVERLAP_CHARS} before the end of the one before, as
+ * `[offset, window]`. One window when the text fits. No window starts or
+ * ends inside a surrogate pair.
+ */
+function* windowsOf(text: string): Generator<readonly [number, string]> {
+  let start = 0;
+  for (;;) {
+    let end = Math.min(text.length, start + WINDOW_CHARS);
+    if (end < text.length && isLowSurrogate(text.charCodeAt(end))) end--;
+    yield [start, text.slice(start, end)];
+    if (end >= text.length) return;
+    start = end - WINDOW_OVERLAP_CHARS;
+    if (isLowSurrogate(text.charCodeAt(start))) start--;
+  }
+}
+
+/**
+ * A window as written, its normalized match view, and its decoded blobs; or
+ * undefined when the views outgrow the window's budget (see
+ * {@link VIEW_BUDGET_RATIO}), so the window is not read. `continued` says the
+ * window is not the first, so it may open inside a blob.
+ */
+function viewsOf(window: string, continued: boolean): View[] | undefined {
+  const budget = { left: VIEW_BUDGET_RATIO * window.length + VIEW_BUDGET_SLACK };
+  const normalized = normalizeForMatch(window);
+  budget.left -= normalized.length;
+  if (budget.left < 0) return undefined;
+  const decoded = decodedVariants(window, budget, new Set(), 2, continued);
+  if (budget.left < 0) return undefined;
+  return [{ text: window }, { text: normalized }, ...decoded];
+}
+
+/**
+ * `rules` over `view`, each rule's first match. In a decoded view a match
+ * that runs from one decode into the next is two decodes side by side (two
+ * fields of a JSON response, say), so that rule is run on each decode alone
+ * instead and keeps its first match there, if any.
+ */
+function viewHits(
+  view: View,
+  rules: ReadonlyArray<PromptInjectionRule> = REGEX_RULES,
+): PromptInjectionHit[] {
+  const hits = regexHits(view.text, rules);
+  const seams = view.seams;
+  if (seams === undefined || seams.length === 0) return hits;
+  const crosses = (h: PromptInjectionHit): boolean =>
+    seams.some((at) => h.span[0] <= at && h.span[1] > at + 1);
+  return hits.flatMap((h) => {
+    if (!crosses(h)) return [h];
+    const rule = rules.find((r) => r.id === h.rule);
+    if (rule === undefined) return [];
+    let from = 0;
+    for (const at of [...seams, view.text.length]) {
+      const found = regexHits(view.text.slice(from, at), [rule])[0];
+      if (found !== undefined) return [shifted(found, from)];
+      from = at + 1;
+    }
+    return [];
+  });
+}
+
+/** Let other work run between the windows of a long text. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** What the model layer is shown: all of `text`, or its head and tail. */
+function modelView(text: string): string {
+  return text.length > MODEL_VIEW_CHARS
+    ? `${text.slice(0, MODEL_VIEW_CHARS / 2)}\n${text.slice(-MODEL_VIEW_CHARS / 2)}`
     : text;
-}
-
-/** The text as written, its normalized match view, and its decoded blobs. */
-function matchViews(analyzed: string): string[] {
-  return [analyzed, normalizeForMatch(analyzed), ...decodedVariants(analyzed)];
 }
 
 /**
@@ -884,31 +1175,75 @@ export async function classifyText(
   if (text === "") {
     return { classification: "clean", score: 0, hits: [] };
   }
-  // Bound the work the regex/structural layers do so a pathological input
-  // can't wedge the classifier (#153). Keep head + tail so leading and
-  // trailing injections both stay in view.
-  const analyzed = boundedForScan(text);
-  // De-obfuscate into match views so the keyword rules can't be dodged with
-  // full-width characters, zero-width splits, homoglyphs, whitespace tricks,
-  // or base64/percent/hex encoding (#143). Structural rules run on the raw
-  // (bounded) text; regex rules run on every variant, deduped by rule id.
-  const variants = matchViews(analyzed);
-  const regHits: PromptInjectionHit[] = [];
-  const seenRules = new Set<string>();
-  for (const variant of variants) {
-    for (const h of regexHits(variant)) {
-      if (seenRules.has(h.rule)) continue;
-      seenRules.add(h.rule);
-      regHits.push(h);
-    }
+  // Past the scan bound the text is not read: fail closed (see MAX_SCAN_CHARS).
+  if (text.length > MAX_SCAN_CHARS) {
+    return {
+      classification: "malicious",
+      score: 1,
+      hits: [scanLimitHit(MAX_SCAN_CHARS, text.length)],
+    };
   }
-  const hits: PromptInjectionHit[] = [...regHits, ...structuralHits(analyzed)];
-  let score = aggregateScore(hits);
+  // Every window of the text, scored on its own; the worst one decides (see
+  // WINDOW_CHARS). In each, de-obfuscate into match views so the keyword
+  // rules can't be dodged with full-width characters, zero-width splits,
+  // homoglyphs, whitespace tricks, or base64/percent/hex encoding (#143).
+  // Structural rules run on the window as written; regex rules run on every
+  // view, deduped by rule id.
+  const scanText = scanTextOf(text);
+  let worst: { score: number; hits: PromptInjectionHit[] } = { score: -1, hits: [] };
+  const consider = (candidate: ReadonlyArray<PromptInjectionHit>): void => {
+    const distinct = distinctRules(candidate);
+    const candidateScore = aggregateScore(distinct);
+    if (candidateScore > worst.score) worst = { score: candidateScore, hits: distinct };
+  };
+  const windows: Array<readonly [number, number]> = [];
+  for (const [at, window] of windowsOf(scanText)) {
+    if (at > 0) await yieldToEventLoop();
+    windows.push([at, at + window.length]);
+    const views = viewsOf(window, at > 0);
+    if (views === undefined) {
+      return {
+        classification: "malicious",
+        score: 1,
+        hits: [scanLimitHit(at, at + window.length)],
+      };
+    }
+    const edges = { first: at === 0, last: at + window.length >= scanText.length };
+    consider(
+      [...views.flatMap((v) => viewHits(v)), ...structuralHits(window, edges)].map((h) =>
+        shifted(h, at),
+      ),
+    );
+  }
+  if (text.length > WINDOW_CHARS) {
+    // What the windows cannot see in a longer text: the invisible characters
+    // and opening BOM its scan text dropped, read from the text itself; and a
+    // match longer than a window can hold ([INST] … [/INST] around a whole
+    // page, curl <a long URL> | sh), from one pass over the scan text as
+    // written, keeping only the hits no window contains.
+    consider([
+      ...regexHits(
+        text,
+        REGEX_RULES.filter((r) => PRESENCE_RULE_IDS.has(r.id)),
+      ),
+      ...structuralHits(text.slice(0, 1), { first: true, last: false }),
+    ]);
+    const inAWindow = (h: PromptInjectionHit): boolean =>
+      windows.some(([start, end]) => start <= h.span[0] && h.span[1] <= end);
+    consider(
+      [
+        ...regexHits(scanText, LONG_MATCH_RULES),
+        ...structuralHits(scanText, { first: false, last: false }),
+      ].filter((h) => !inAWindow(h)),
+    );
+  }
+  const hits = worst.hits;
+  let score = worst.score;
   let classification = classify(score, threshold);
 
   if (opts.llmClassifier !== undefined) {
     try {
-      const verdict = await opts.llmClassifier(analyzed);
+      const verdict = await opts.llmClassifier(modelView(text));
       if (verdict !== undefined) {
         if (verdict.verdict === "malicious") {
           classification = "malicious";
@@ -972,4 +1307,7 @@ export const __internals = {
   tryDecodeHex,
   tryDecodePercent,
   MIN_CORPUS_RULES,
+  MAX_SCAN_CHARS,
+  MODEL_VIEW_CHARS,
+  LONG_MATCH_RULES,
 } as const;
