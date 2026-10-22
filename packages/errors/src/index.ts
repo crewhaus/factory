@@ -161,6 +161,10 @@ export type FailureClass =
    *  is not a hard error — it is a resumable pause; the run re-executes
    *  pre-resolved once the approval is granted (one-shot) or denied. */
   | "approval_pending"
+  /** 0.8.0 — the spec's `provability:` gate found the final answer's claims
+   *  below the declared floor with `on_fail: halt`. A CrewHaus-configured
+   *  evidence floor, not a provider failure (3x band). */
+  | "provability"
   | "mcp_boot"
   | "context_overflow"
   | "spec"
@@ -221,6 +225,10 @@ export const EXIT_CODES = {
    *  out-of-band grant/deny, distinguishable from a hard failure so `fleet`
    *  / the UI host can surface "needs approval" and resume rather than alert. */
   approval_pending: 36,
+  /** 0.8.0 — the spec's `provability:` gate failed the final answer with
+   *  `on_fail: halt`: its claims did not meet the declared evidence floor.
+   *  Same 3x band rationale as `evaluation`: a CrewHaus-configured floor. */
+  provability: 37,
   /** Tool or MCP failure (including MCP boot). */
   tool: 40,
 } as const;

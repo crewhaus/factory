@@ -1,0 +1,33 @@
+{
+  "name": "@crewhaus/claim-ledger",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "The one text layer every claim checker reads: sentences, claims, content tokens and coverage, the citation and evidence-reference grammar, and number normalization",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/claim-ledger"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/claim-ledger#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

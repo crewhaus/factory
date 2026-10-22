@@ -120,6 +120,13 @@ export type AuditKind =
   // structural `JustificationAuditSink` rather than importing this package, to
   // avoid a dependency cycle; this `AuditLog` satisfies that seam.)
   | "permission_justification_evaluated"
+  // 0.8.0 (design/0.8.0-provability-release.md §5.3) — the provability gate
+  // appends one record per verification pass when a durable sink is wired
+  // (the justification audit sink, `runChatLoop({ justificationAuditSink })`).
+  // Payload: the `ProvabilityGradedSummary` (level, verdict, score, achieved,
+  // claim counts, retryIndex, bundleHash) plus `turnNumber` and `sessionId?`,
+  // so the bundle on disk is pinned by a hash inside the tamper-evident chain.
+  | "provability_evaluated"
   // Section 39 / item 35 — `crewhaus retention sweep|export|purge` appends one
   // record per REAL (non-dry-run) run so retention enforcement is itself
   // tamper-evidenced. Payload shape (opaque JSON; see packages/harness-lifecycle/src/retention.ts):

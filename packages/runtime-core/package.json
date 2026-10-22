@@ -33,6 +33,7 @@
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/prompt-cache-manager": "workspace:*",
     "@crewhaus/prompt-injection-detector": "workspace:*",
+    "@crewhaus/provability": "workspace:*",
     "@crewhaus/rate-limiter": "workspace:*",
     "@crewhaus/recovery-engine": "workspace:*",
     "@crewhaus/routing-store": "workspace:*",

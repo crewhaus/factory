@@ -1,0 +1,31 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../eval-judge"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../provability"
+    },
+    {
+      "path": "../proof-checker"
+    },
+    {
+      "path": "../runtime-core"
+    },
+    {
+      "path": "../trace-event-bus"
+    }
+  ],
+  "include": ["src/**/*"]
+}

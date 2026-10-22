@@ -257,7 +257,15 @@ export type EventKind =
   // existed keep parsing (every session-log reader branches on the kinds it
   // knows and skips the rest). Payload shape exported below as
   // `DreamRunEventPayload`.
-  | "dream_run";
+  | "dream_run"
+  // 0.8.0 (design/0.8.0-provability-release.md §5.3) — one line per
+  // provability verification pass (payload mirrors the `provability_graded`
+  // trace event minus its envelope, plus `turnNumber`), and one per
+  // `ProofCheck` checker run (payload mirrors `proof_checked`). Both are
+  // non-conversational: `replayMessageHistory` ignores them, `--resume` is
+  // unaffected, and readers written before these kinds existed keep parsing.
+  | "provability_graded"
+  | "proof_checked";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article

@@ -1,0 +1,40 @@
+{
+  "name": "@crewhaus/provability",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "The provability ladder (cited, grounded, checked, proven): evidence index, verifiers, proof bundles and proof-artifact storage",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/claim-ledger": "workspace:*",
+    "@crewhaus/continuity-store": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/provability"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/provability#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

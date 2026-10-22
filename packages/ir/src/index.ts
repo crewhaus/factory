@@ -1255,6 +1255,95 @@ export type IrWatchme = {
 };
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §2–§4) — the provability ladder,
+ * lowered from the top-level `provability:` block. A spec sets a FLOOR on a
+ * four-rung ladder and every claim in an answer must bind to evidence at or
+ * above it:
+ *
+ *   - `cited`    — every claim carries a `[n]` marker whose definition names a
+ *                  locatable source (URL, `doi:`, workspace file).
+ *   - `grounded` — the cited source's body was fetched in this run and holds
+ *                  the claim's words.
+ *   - `checked`  — the claim cites `tool:<toolUseId>` of a non-error result
+ *                  that contains its values (and replays, for a pure tool).
+ *   - `proven`   — the claim cites `proof:prf_…`, an artifact a proof checker
+ *                  accepted.
+ *
+ * `level: off` and an absent block lower to NO key (spread-return-`{}`), so a
+ * provability-less spec compiles byte-identically. Every field is RESOLVED at
+ * lower time (the IrWatchme discipline): emitters and the interpreter never
+ * re-derive a default. Carried (wired) on IrV0/cli, IrChannelV0, IrManagedV0
+ * and IrResearchV0; carried with an `accepted-but-unwired` CompileWarning on
+ * IrCrewV0.
+ */
+export type IrProvabilityLevel = "cited" | "grounded" | "checked" | "proven";
+
+export type IrProvability = {
+  /** The floor every claim must meet. */
+  readonly level: IrProvabilityLevel;
+  /** Resolved below-floor behaviour (spec `on_fail`, default "retry"). */
+  readonly onFail: "retry" | "halt" | "note" | "escalate";
+  /** Resolved hard cap on gate-triggered re-runs (spec `max_retries`, default 1). */
+  readonly maxRetries: number;
+  /** Fraction of non-assumption claims that must meet the floor (default 1). */
+  readonly threshold: number;
+  /** How far back evidence may come from: the whole session (default) or this turn. */
+  readonly scope: "session" | "turn";
+  /** Whether `[A1]: assume: …` bindings are accepted (default "allow"). */
+  readonly assumptions: "allow" | "forbid";
+  /** Cap on assumptions per answer; absent = uncapped (they are still counted). */
+  readonly maxAssumptions?: number;
+  /** How the proof bundle shows beside the answer (default "footer"). */
+  readonly render: "footer" | "none" | "json";
+  readonly sources: {
+    /** Host globs a cited URL must match; empty = any public host. */
+    readonly allow: readonly string[];
+    /** Host globs a cited URL must not match; deny wins over allow. */
+    readonly deny: readonly string[];
+    /** Accept un-locatable free-text references at `cited` (default false). */
+    readonly bibliographic: boolean;
+    /** Reachability check at gate time: off (default) or one guarded HEAD per URL. */
+    readonly resolve: "off" | "head";
+  };
+  readonly grounded: {
+    /** Per-claim content-token coverage inside one window (default 0.8). */
+    readonly coverage: number;
+    /** How far apart the claim's words may sit in the source (default 60). */
+    readonly windowTokens: number;
+    /** Distinct origins (eTLD+1 or distinct files) each claim needs (default 1). */
+    readonly independent: number;
+  };
+  readonly execution: {
+    /** CONCRETE tool names whose results count as execution evidence — the
+     *  category grammar is expanded at lower time, exactly as `tools:` is. */
+    readonly allow: readonly string[];
+    /** Re-run pure tools with the logged input and compare digests (default true). */
+    readonly replay: boolean;
+    /** Replays per turn (default 20). */
+    readonly maxReplays: number;
+  };
+  readonly formal: {
+    /** Checker preference order (default ["builtin", "smt"]). */
+    readonly checkers: readonly ("builtin" | "smt" | "lean4")[];
+    /** Optional sandbox image override for the sandbox checkers. */
+    readonly image?: string;
+    /** Tokens the lean4 pre-scan refuses (default ["sorry", "axiom", "native_decide"]). */
+    readonly forbid: readonly string[];
+    /** Per-check budget in ms (default 30000). */
+    readonly timeoutMs: number;
+  };
+  /** The optional paraphrase-waiver judge (0.6.0 §4.2 auxiliary-slot shape). */
+  readonly judge?: {
+    readonly model: string;
+    readonly modelProfile?: string;
+    readonly params?: IrModelParams;
+  };
+  /** Present iff `onFail === "escalate"`: resolved exactly as
+   *  `IrEvaluation.escalateTo` is. */
+  readonly escalateTo?: string;
+};
+
+/**
  * Track F (Section 57) — typed message schemas (Σ) for multi-agent
  * communication. Source: AgentFlow (arxiv 2604.20801). A typed graph
  * DSL with well-formedness checking makes searching the full multi-
@@ -1358,6 +1447,8 @@ export type IrV0 = {
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
+  /** 0.8.0 — the provability ladder (§2); absent when the spec omits the block or sets `level: off`. */
+  readonly provability?: IrProvability;
   /** Pillar 3 (FR-004) — security fabric config (intent-gate judge
    *  selection). Optional; absent when the spec omits the `security`
    *  block. */
@@ -1769,6 +1860,8 @@ export type IrChannelV0 = {
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
+  /** 0.8.0 — the provability ladder (§2); absent when the spec omits the block or sets `level: off`. */
+  readonly provability?: IrProvability;
   /** Response-feedback config. `feedback.channelReactions` gates Slack 👍/👎
    *  → user_feedback codegen in this target. Absent when spec omits it. */
   readonly feedback?: IrFeedback;
@@ -1880,6 +1973,8 @@ export type IrManagedV0 = {
   /** Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
    *  Optional; absent when the spec omits the `evaluation` block. */
   readonly evaluation?: IrEvaluation;
+  /** 0.8.0 — the provability ladder (§2); absent when the spec omits the block or sets `level: off`. */
+  readonly provability?: IrProvability;
   /** NEW-inloop-coverage — response-feedback config. Gates the gateway's
    *  `feedback.submit` rating route and (with `autoDistill`) the daemon's
    *  distill janitor step. Absent when the spec omits the block. */
@@ -2213,6 +2308,9 @@ export type IrCrewV0 = {
    *  opted out with `continuity: false`. Roles share the `spec`-scoped plan
    *  store — the plan IS the coordination surface (§2.7). */
   readonly continuity?: IrContinuity;
+  /** 0.8.0 — the provability ladder (§8): carried with an accepted-but-unwired
+   *  CompileWarning on crew until the orchestrator exposes its synthesis turn. */
+  readonly provability?: IrProvability;
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;
@@ -2294,6 +2392,9 @@ export type IrResearchV0 = {
   /** v0.3.0 Goal 1 — continuity config. DEFAULT-ON: present unless the spec
    *  opted out with `continuity: false`. `scope` resolves to `spec` here. */
   readonly continuity?: IrContinuity;
+  /** 0.8.0 — the provability ladder (§8): gates the rendered report against the
+   *  citation tracker's cache (`on_fail` halt | note on this shape). */
+  readonly provability?: IrProvability;
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */
   readonly thredz?: IrThredz;

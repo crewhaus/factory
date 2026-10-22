@@ -1,0 +1,25 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../claim-ledger"
+    },
+    {
+      "path": "../continuity-store"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../tool-catalog"
+    }
+  ],
+  "include": ["src/**/*"]
+}

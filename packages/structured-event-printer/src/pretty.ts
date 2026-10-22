@@ -204,5 +204,13 @@ function formatBody(ev: TraceEvent): string {
       }${ev.panel !== undefined ? ` panel=${ev.panel.join(",")}` : ""}${
         ev.costUsdMicros !== undefined ? ` micros=${ev.costUsdMicros}` : ""
       }${ev.rationale ? ` rationale=${ev.rationale}` : ""}`;
+    case "provability_graded":
+      return `level=${ev.level} verdict=${ev.verdict} score=${ev.score.toFixed(2)} achieved=${ev.achieved} claims=${ev.met}/${ev.claims - ev.assumptions} assumptions=${ev.assumptions} retry=${ev.retryIndex}${
+        ev.judgeModel !== undefined ? ` judge=${ev.judgeModel}` : ""
+      }${ev.escalatedTo !== undefined ? ` escalatedTo=${ev.escalatedTo}` : ""}`;
+    case "proof_checked":
+      return `checker=${ev.checker} ok=${ev.ok} artifact=${ev.artifactId} duration=${ev.durationMs.toFixed(0)}ms${
+        ev.axioms.length > 0 ? ` axioms=${ev.axioms.join(",")}` : ""
+      }`;
   }
 }

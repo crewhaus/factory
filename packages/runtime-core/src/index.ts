@@ -115,6 +115,7 @@ import {
   classifyText,
   llmClassifierEnabled,
 } from "@crewhaus/prompt-injection-detector";
+import type { ProofBundle, ProvabilityLevel } from "@crewhaus/provability";
 import { type BucketConfig, type RateLimiter, createRateLimiter } from "@crewhaus/rate-limiter";
 import {
   BUILTIN_FAILURE_CLASSES,
@@ -1265,6 +1266,75 @@ export type AuxRequestParams = {
   readonly thinking?: ModelThinking;
   readonly maxTokens?: number;
   readonly temperature?: number;
+};
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.1) — what the injected
+ * provability verifier receives: the same completed-turn view the in-loop
+ * judge gets, plus where the turn sits (for the session-scoped evidence index
+ * and the bundle's file name) and which gate-triggered retry this is.
+ */
+export type ProvabilityTurn = EvaluationTurn & {
+  readonly turnNumber: number;
+  readonly retryIndex: number;
+  /** The run's session id, when it has one (evidence is read from its log). */
+  readonly sessionId?: string;
+  readonly signal?: AbortSignal;
+};
+
+/**
+ * 0.8.0 (design §5.1) — the provability gate seam (spec `provability:` on
+ * cli/channel/managed). After a turn COMPLETES and the `evaluation:` gate (if
+ * any) has accepted it, the injected `verify` checks every claim in the final
+ * text against the declared floor and returns a `ProofBundle`. One
+ * `provability_graded` trace event + event-log line is published per pass. On
+ * `verdict: "fail"`:
+ *
+ *  - `onFail: "retry"` — the runtime appends a synthetic corrective user
+ *    message composed from the bundle (the unmet claims, the evidence each
+ *    cited, the reason — never fetched content) and re-runs the evaluated
+ *    turn, up to `maxRetries` times.
+ *  - `onFail: "halt"` — classified terminal stop: `run_failed` (class
+ *    `"provability"`, exit {@link EXIT_CODES.provability}).
+ *  - `onFail: "note"` — the failing event is the whole story; the answer stands.
+ *  - `onFail: "escalate"` — re-run the turn on the pool's escalation rung
+ *    (`escalateTo`, else the strongest candidate); without a pool, note
+ *    semantics with one warning.
+ *
+ * A verifier that THROWS is grading-infrastructure failure, not a verdict:
+ * logged, fail-open (the answer stands), and the bundle records
+ * `verdict: "unverified"` so no surface prints a ✓. Runtime-core never builds
+ * the verifier itself (`@crewhaus/evaluation-service` does), so it gains no
+ * dependency beyond the bundle TYPE. Absent → zero behaviour change.
+ */
+export type RunProvability = {
+  readonly level: ProvabilityLevel;
+  readonly onFail: "retry" | "halt" | "note" | "escalate";
+  /** Hard cap on gate-triggered re-runs (>= 0; resolved default 1). */
+  readonly maxRetries: number;
+  readonly threshold: number;
+  /** Under `onFail: "escalate"`: the roster arm to re-run on (resolved like `RunEvaluation.escalateTo`). */
+  readonly escalateTo?: string;
+  /** How the bundle shows beside the answer (`render`): a one-line footer, the JSON, or nothing. */
+  readonly render: "footer" | "none" | "json";
+  /**
+   * Where the rendered bundle goes: `"stream"` writes it to the run's output
+   * after the answer (cli); `"reply"` appends it to the text the run returns
+   * (channel bots and the managed gateway send that text). Default `"stream"`.
+   */
+  readonly footerTarget?: "stream" | "reply";
+  readonly verify: (turn: ProvabilityTurn) => Promise<ProofBundle>;
+  /** Render the bundle for `render` (footer line / JSON). Absent ⇒ nothing is rendered. */
+  readonly renderBundle?: (bundle: ProofBundle, bundlePath?: string) => string | undefined;
+  /** Compose the retry nudge from a failing bundle. */
+  readonly nudge: (bundle: ProofBundle) => string;
+  /** Persist the bundle; returns where it landed. Failures are logged, never fatal. */
+  readonly persist?: (
+    bundle: ProofBundle,
+    at: { readonly sessionId?: string; readonly turnNumber: number },
+  ) => Promise<string | undefined>;
+  /** Observe every bundle (the gateway envelope, the research report, tests). */
+  readonly onBundle?: (bundle: ProofBundle, bundlePath?: string) => void;
 };
 
 /**
@@ -2711,6 +2781,13 @@ export type RunChatLoopOptions = {
    * is not evaluated. Absent → zero behaviour change for existing callers.
    */
   evaluation?: RunEvaluation;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §5.1) — the provability gate.
+   * See {@link RunProvability}. Runs after `evaluation` accepts a completed
+   * turn; a failing verdict re-runs the evaluated turn, so a served answer
+   * has passed both gates when retries allow. Absent → zero behaviour change.
+   */
+  provability?: RunProvability;
   /**
    * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity
    * fingerprint (the `agentId` from `loadOrCreateAgentIdentity`). When set AND
