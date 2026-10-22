@@ -44,7 +44,7 @@ checkout at once, so each brief lists the files it owns. The briefs are in `brie
 - Then: an adversarial review of the whole diff, docs (CHANGELOG, README, ROADMAP, AGENTS.md,
   PACKAGES.md, package READMEs, module briefs in `crewhaus/docs`), and the release.
 
-`wave-1-workflow.js` is the Workflow script that ran Wave 1. The briefs and the script use the
+`wave-1-workflow.js.txt` is the Workflow script that ran Wave 1 (renamed so the linter skips it: it uses top-level `await` from the workflow runtime). The briefs and the script use the
 placeholder `/ABSOLUTE/PATH/TO/factory` for the repo root — replace it with your checkout's path
 before running them.
 
