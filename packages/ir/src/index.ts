@@ -1314,8 +1314,12 @@ export type IrProvability = {
     readonly independent: number;
   };
   readonly execution: {
-    /** CONCRETE tool names whose results count as execution evidence — the
-     *  category grammar is expanded at lower time, exactly as `tools:` is. */
+    /** CONCRETE tool keys whose results count as execution evidence — the
+     *  category grammar is expanded at lower time, exactly as `tools:` is
+     *  (default: the expansion of `all-compute` + `all-verify`). Entries are
+     *  spec keys (`moneyAdd`) or exact tool names (`mcp__calc__add`); the
+     *  verifier matches a recorded tool name against them case-insensitively,
+     *  because a builtin's key is its name with a lowercase first letter. */
     readonly allow: readonly string[];
     /** Re-run pure tools with the logged input and compare digests (default true). */
     readonly replay: boolean;
