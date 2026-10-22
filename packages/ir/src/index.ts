@@ -1341,6 +1341,10 @@ export type IrProvability = {
     readonly model: string;
     readonly modelProfile?: string;
     readonly params?: IrModelParams;
+    /** The judge-independence lint waiver (spec `judge.allow_self_judge`),
+     *  carried only when true — the `IrEvaluation.allowSelfJudge` precedent,
+     *  so `crewhaus lint` and `doctor` read the waiver off the IR. */
+    readonly allowSelfJudge?: true;
   };
   /** Present iff `onFail === "escalate"`: resolved exactly as
    *  `IrEvaluation.escalateTo` is. */

@@ -71,6 +71,7 @@ import type {
   IrPermissions,
   IrPipelineV0,
   IrProfilePermissions,
+  IrProvability,
   IrResearchV0,
   IrSchedule,
   IrSecretRef,
@@ -111,6 +112,7 @@ import {
   type SpecModelProfile,
   type SpecModelsBlock,
   type SpecObservabilityBlock,
+  type SpecProvabilityBlock,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
   type SpecTelegramChannel,
@@ -118,6 +120,8 @@ import {
   type SpecWhatsAppChannel,
   mcpServerNameWarnings,
   parseSpec,
+  provabilityLevelOf,
+  provabilityObjectOf,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
 import { emitBrowserDriver } from "@crewhaus/target-browser-driver";
@@ -293,6 +297,9 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
   let ir = lowered.ir;
   if (opts.strict === true) {
     assertToolScopesStrict(ir);
+    // 0.8.0 (design §4.3) — a checked/proven floor whose execution evidence
+    // names a tool the catalog cannot resolve offline.
+    assertProvabilityStrict(ir);
   }
   // Every tool site against what its shape can run: a precise error for a
   // name the shape cannot compile, a warning for a builtin that is inert.
@@ -3728,12 +3735,19 @@ function lowerEvaluation(
  * `agent.model_pool` is a CompilerError here (`parseSpec` already refuses it
  * cross-field; this guards direct `lower()` callers).
  */
-function resolveCascadeTarget(spec: SpecWithEvaluation, ctx: LowerContext): string {
-  const agent = asLooseBlock((spec as unknown as LooseBlock)["agent"]);
+function resolveCascadeTarget(
+  spec: object,
+  ctx: LowerContext,
+  // 0.8.0 §4.2 — `provability.on_fail: escalate` resolves through this same
+  // helper (`IrProvability.escalateTo` is resolved exactly as
+  // `IrEvaluation.escalateTo` is); the label only names the key in errors.
+  label = "evaluation.on_fail",
+): string {
+  const agent = asLooseBlock((spec as LooseBlock)["agent"]);
   const pool = asLooseBlock(agent?.["model_pool"]);
   if (pool === undefined) {
     throw new CompilerError(
-      "evaluation.on_fail: escalate re-runs a failing turn on a stronger pool candidate, so agent.model_pool must be declared (strategy.cascade.escalate_to names the rung; without it the strongest candidate serves)",
+      `${label}: escalate re-runs a failing turn on a stronger pool candidate, so agent.model_pool must be declared (strategy.cascade.escalate_to names the rung; without it the strongest candidate serves)`,
     );
   }
   const cascade = asLooseBlock(asLooseBlock(pool["strategy"])?.["cascade"]);
@@ -3760,7 +3774,7 @@ function resolveCascadeTarget(spec: SpecWithEvaluation, ctx: LowerContext): stri
   const last = enabled[enabled.length - 1];
   if (last === undefined) {
     throw new CompilerError(
-      "evaluation.on_fail: escalate needs at least one enabled agent.model_pool candidate to escalate to",
+      `${label}: escalate needs at least one enabled agent.model_pool candidate to escalate to`,
     );
   }
   const lastModel = last["model"] as string;
@@ -4800,6 +4814,230 @@ function lowerWatchme(spec: SpecWithWatchme, ctx: LowerContext): { watchme?: IrW
 }
 
 /**
+ * 0.8.0 (design §3 / §4.2) — the `execution.allow` default: every in-process,
+ * zero-token computation plus the verification gates. Category grammar, so it
+ * expands through `@crewhaus/tool-categories` exactly as a written list does,
+ * and a tool added to either category joins the default with no edit here.
+ * `bash` is deliberately not in it (design §3).
+ */
+export const PROVABILITY_DEFAULT_EXECUTION_ALLOW: ReadonlyArray<string> = Object.freeze([
+  "all-compute",
+  "all-verify",
+]);
+
+/** The lean pre-scan's default refusals (design §6.4); smt forbids nothing, its input is data. */
+const PROVABILITY_DEFAULT_FORBID: ReadonlyArray<string> = ["sorry", "axiom", "native_decide"];
+
+/** The provability block of any IR variant that carries one (cli/channel/managed/research/crew). */
+export function provabilityOf(ir: IrNode): IrProvability | undefined {
+  return (ir as { readonly provability?: IrProvability }).provability;
+}
+
+/**
+ * Is `key` a tool the builtin catalog resolves OFFLINE — a spec key
+ * (`moneyAdd`) or its registered name (`MoneyAdd`)? The same two lookups the
+ * FR-002 gate does before it calls a name unverifiable (`auditSpecToolNames`
+ * resolves by key, then by registered name). Category expansion only ever
+ * yields builtin keys, so only a name written out by hand can miss: an
+ * `mcp__*` tool, a custom tool registered in code, or a typo.
+ */
+function resolvesOffline(key: string): boolean {
+  return Object.hasOwn(BUILTIN_TOOLS, key) || builtinKeyForName(key) !== undefined;
+}
+
+/**
+ * 0.8.0 (design §4.3) — the `execution.allow` entries of a `checked` /
+ * `proven` floor the builtin catalog cannot resolve offline. At those floors
+ * the gate REPLAYS pure tools and trusts their results as evidence, so a
+ * name whose purity and scope nobody can check at compile time is the FR-002
+ * posture's "unverifiable sink" for evidence. `[]` below `checked` (a lower
+ * floor never depends on execution evidence) and when nothing is unresolved.
+ * Shared by the compile warning, `compile({ strict: true })` and `crewhaus
+ * lint`, so the three cannot disagree.
+ */
+export function unresolvedProvabilityExecutionTools(ir: IrNode): ReadonlyArray<string> {
+  const p = provabilityOf(ir);
+  if (p === undefined || (p.level !== "checked" && p.level !== "proven")) return [];
+  return p.execution.allow.filter((key) => !resolvesOffline(key));
+}
+
+function unresolvedExecutionMessage(level: string, keys: ReadonlyArray<string>): string {
+  return [
+    `provability.execution.allow names ${keys.map((k) => `"${k}"`).join(", ")}, which the builtin`,
+    `catalog cannot resolve offline. At level: ${level} the gate replays pure tools and accepts`,
+    "their results as evidence, so a tool whose purity and scope cannot be verified at compile",
+    "time is refused under --strict. Name builtin tools (or the all-<category> grammar), or",
+    "lower the floor.",
+  ].join(" ");
+}
+
+/**
+ * FR-002 posture for evidence (design §4.3) — the `compile({ strict: true })`
+ * half of the `checked`/`proven` check (the CLI's `--strict` escalates the
+ * `provability-execution-unresolved` warning instead). Throws `CompilerError`.
+ */
+export function assertProvabilityStrict(ir: IrNode): void {
+  const unresolved = unresolvedProvabilityExecutionTools(ir);
+  if (unresolved.length === 0) return;
+  throw new CompilerError(
+    `[strict] ${unresolvedExecutionMessage(provabilityOf(ir)?.level ?? "checked", unresolved)}`,
+  );
+}
+
+/**
+ * 0.8.0 (design §3) — the keys a `level: off` block sets beside `level`. Such
+ * a block is accepted (turning the gate off without deleting its config is a
+ * legitimate edit) but lowers to NOTHING, so the compiler says so rather than
+ * silently dropping config: `provability-inert-block`. `[]` for a live block,
+ * the `off` shorthand, or an absent one.
+ */
+export function inertProvabilityKeys(spec: Spec): ReadonlyArray<string> {
+  const block = provabilityObjectOf(
+    (spec as { readonly provability?: SpecProvabilityBlock }).provability,
+  );
+  if (block === undefined || block.level !== "off") return [];
+  return Object.keys(block)
+    .filter((k) => k !== "level")
+    .sort();
+}
+
+type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
+
+/**
+ * 0.8.0 (design §4.2–§4.3) — lower the `provability:` block, the `lowerWatchme`
+ * template: spread-return-{}, so an absent block or `level: off` spreads
+ * NOTHING and a provability-less spec compiles byte-identically. Every field
+ * RESOLVES here (a bare `provability: cited` arrives fully populated), so no
+ * emitter or interpreter re-derives a default:
+ *
+ *   - `execution.allow` expands through the `tools:` category grammar at
+ *     lower time (default `[all-compute, all-verify]`), so the IR carries
+ *     concrete keys only; an unknown category or an exclusion that removes
+ *     nothing fails the compile exactly as it does in `tools:`.
+ *   - `judge.model` is an auxiliary slot (`$profile` / `cheapest` /
+ *     `strongest`), the watchme precedent.
+ *   - `on_fail: escalate` resolves `escalateTo` with the cascade helper
+ *     `IrEvaluation` uses.
+ *
+ * Per shape (design §8): research's report gate runs once over the rendered
+ * report, not per turn, so `retry` / `escalate` are not supported there in
+ * 0.8.0 — a declared one lowers to `note` with `provability-on-fail-degraded`,
+ * and an UNDECLARED `on_fail` resolves to `note` silently (the shape's
+ * default; warning on every bare `provability: cited` would make the starter
+ * template noisy). Crew carries the block unwired (the table row); it has no
+ * `agent.model_pool` to escalate on, so `escalate` degrades to `note` there
+ * the same way. A `checked`/`proven` floor whose `execution.allow` names a
+ * tool the catalog cannot resolve offline warns
+ * `provability-execution-unresolved`, which `--strict` escalates.
+ */
+function lowerProvability(
+  spec: SpecWithProvability,
+  ctx: LowerContext,
+): { provability?: IrProvability } {
+  const level = provabilityLevelOf(spec.provability);
+  if (level === "off") return {};
+  const block = provabilityObjectOf(spec.provability);
+
+  let onFail: IrProvability["onFail"] = block?.on_fail ?? "retry";
+  if (ctx.target === "research") {
+    if (block?.on_fail === undefined) {
+      onFail = "note";
+    } else if (block.on_fail === "retry" || block.on_fail === "escalate") {
+      onFail = "note";
+      warn(
+        ctx,
+        "provability-on-fail-degraded",
+        "provability.on_fail",
+        `provability.on_fail: ${block.on_fail} is not supported on the research shape in 0.8.0 — the research report gate runs once over the rendered report (the research loop is per-branch, not per-turn), so it supports halt | note; lowered to note. Set on_fail: note or on_fail: halt to say which you mean.`,
+      );
+    }
+  } else if (ctx.target === "crew" && onFail === "escalate") {
+    onFail = "note";
+    warn(
+      ctx,
+      "provability-on-fail-degraded",
+      "provability.on_fail",
+      "provability.on_fail: escalate re-runs a failing turn on a stronger agent.model_pool candidate, and the crew shape has no agent block to escalate on — lowered to note (the block is carried unwired on crew in 0.8.0 regardless).",
+    );
+  }
+  const escalateTo =
+    onFail === "escalate" ? resolveCascadeTarget(spec, ctx, "provability.on_fail") : undefined;
+
+  let allow: ReadonlyArray<string>;
+  try {
+    allow = expandToolSelectors(block?.execution?.allow ?? PROVABILITY_DEFAULT_EXECUTION_ALLOW, {
+      path: "provability.execution.allow",
+    }).tools;
+  } catch (err) {
+    if (err instanceof ToolCategoryError) throw new CompilerError(err.message, err);
+    throw err;
+  }
+
+  const judge =
+    block?.judge !== undefined
+      ? resolveAuxSlot(block.judge.model, ctx, "provability.judge.model")
+      : undefined;
+
+  const provability: IrProvability = {
+    level,
+    onFail,
+    maxRetries: block?.max_retries ?? 1,
+    threshold: block?.threshold ?? 1,
+    scope: block?.scope ?? "session",
+    assumptions: block?.assumptions ?? "allow",
+    ...(block?.max_assumptions !== undefined ? { maxAssumptions: block.max_assumptions } : {}),
+    render: block?.render ?? "footer",
+    sources: {
+      allow: [...(block?.sources?.allow ?? [])],
+      deny: [...(block?.sources?.deny ?? [])],
+      bibliographic: block?.sources?.bibliographic ?? false,
+      resolve: block?.sources?.resolve ?? "off",
+    },
+    grounded: {
+      coverage: block?.grounded?.coverage ?? 0.8,
+      windowTokens: block?.grounded?.window_tokens ?? 60,
+      independent: block?.grounded?.independent ?? 1,
+    },
+    execution: {
+      // An identity expansion (no category syntax) keeps the author's order;
+      // a repeated key would only be matched twice, so it is dropped.
+      allow: [...new Set(allow)],
+      replay: block?.execution?.replay ?? true,
+      maxReplays: block?.execution?.max_replays ?? 20,
+    },
+    formal: {
+      checkers: [...(block?.formal?.checkers ?? ["builtin", "smt"])],
+      ...(block?.formal?.image !== undefined ? { image: block.formal.image } : {}),
+      forbid: [...(block?.formal?.forbid ?? PROVABILITY_DEFAULT_FORBID)],
+      timeoutMs: block?.formal?.timeout_ms ?? 30_000,
+    },
+    ...(judge !== undefined && block?.judge !== undefined
+      ? {
+          judge: {
+            model: judge.model,
+            ...auxSlotFields(judge),
+            ...(block.judge.allow_self_judge === true ? { allowSelfJudge: true as const } : {}),
+          },
+        }
+      : {}),
+    ...(escalateTo !== undefined ? { escalateTo } : {}),
+  };
+
+  if (level === "checked" || level === "proven") {
+    const unresolved = provability.execution.allow.filter((key) => !resolvesOffline(key));
+    if (unresolved.length > 0) {
+      warn(
+        ctx,
+        "provability-execution-unresolved",
+        "provability.execution.allow",
+        unresolvedExecutionMessage(level, unresolved),
+      );
+    }
+  }
+  return { provability };
+}
+
+/**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
  * optional; the helper returns a partial that's spread into the IR
@@ -5217,6 +5455,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         ...lowerSecurity(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -5373,6 +5613,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
         // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -5564,6 +5806,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerSchedule(spec.schedule),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         // NEW-inloop-coverage — rating capture on the gateway shape.
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -5698,6 +5942,9 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           learning.learning !== undefined,
         ),
         ...continuity,
+        // 0.8.0 (design §8) — carried with an accepted-but-unwired warning
+        // until the orchestrator exposes its synthesis turn (§12 item 2).
+        ...lowerProvability(spec, ctx),
         // 0.5.0 — thredz is EMIT-WIRED on crew, with the per-role fan-out:
         // one key (and therefore one space, and one npx process) per role
         // that overrides the crew-wide block.
@@ -5748,6 +5995,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
         ...continuity,
+        // 0.8.0 (design §8) — the report gate (on_fail halt | note here).
+        ...lowerProvability(spec, ctx),
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted daemon), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "research"),
