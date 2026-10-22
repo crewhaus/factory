@@ -2341,22 +2341,53 @@ const watchmeBlock = z
 export const SPEC_PROVABILITY_LEVELS = ["off", "cited", "grounded", "checked", "proven"] as const;
 
 const provabilityLevel = z
-  .enum(SPEC_PROVABILITY_LEVELS)
+  .enum(SPEC_PROVABILITY_LEVELS, {
+    // Only the object form can omit it (the block itself is optional), so
+    // say what an author who left it out most likely meant.
+    required_error:
+      "the object form must say which rung it sets (off | cited | grounded | checked | proven); an absent provability: block is off",
+  })
   .describe(
     "the floor every claim in an answer must meet: off | cited (a defined [n] source) | grounded (the source's body was read this run and holds the claim) | checked (a tool:<toolUseId> result that contains the value) | proven (a proof:prf_… artifact a checker accepted)",
   );
 
+/**
+ * 0.8.0 (design §3, §6.1) — one `sources.allow` / `sources.deny` entry is a
+ * HOST glob, matched against the host of a cited URL: `*` (any host),
+ * `*.<host>` (that host's subdomains) or an exact host (`arxiv.org`, an IPv4
+ * literal). Anything else is refused at parse, because an entry written as a
+ * URL (`https://evil.example/`), with a port or with a path can never equal a
+ * host: on `deny` it fails OPEN (the block the author wrote never fires) and
+ * on `allow` it fails every citation closed. Hosts are case-insensitive, so
+ * the pattern is too; the compiler lowers each entry to lowercase. A
+ * non-ASCII host is written in its punycode (`xn--…`) form, the form a
+ * parsed URL's host takes.
+ */
+const PROVABILITY_HOST_GLOB = /^(?:\*|(?:\*\.)?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*)$/i;
+
+function provabilityHostGlobs(list: "allow" | "deny") {
+  return z.array(
+    z
+      .string()
+      .min(1)
+      .refine(
+        (entry) => PROVABILITY_HOST_GLOB.test(entry),
+        (entry) => ({
+          message: `${JSON.stringify(entry)} is not a host glob — ${list} entries are a host (arxiv.org), *.<host> (*.gov) or *, with no scheme, port, path or spaces`,
+        }),
+      ),
+  );
+}
+
 /** design §3 `sources:` — the cited rung's allowlist. NOT optimizable (an allowlist is policy). */
 const provabilitySourcesBlock = z
   .object({
-    allow: z
-      .array(z.string().min(1))
+    allow: provabilityHostGlobs("allow")
       .optional()
       .describe(
         "host globs a cited URL must match (e.g. *.gov, arxiv.org); absent = any public host",
       ),
-    deny: z
-      .array(z.string().min(1))
+    deny: provabilityHostGlobs("deny")
       .optional()
       .describe("host globs a cited URL must not match; deny wins over allow"),
     bibliographic: z
@@ -2444,7 +2475,12 @@ const provabilityFormalBlock = z
         "proof checkers in preference order: builtin (in-process) | smt | lean4 (sandboxed) (default [builtin, smt])",
       ),
     image: z
-      .string()
+      .string({
+        // design §3's example writes `image: null` for "no override"; the
+        // key is simply omitted for that, and the message says so.
+        invalid_type_error:
+          "expected a sandbox image name; omit the key to use the checker's default image",
+      })
       .min(1)
       .optional()
       .describe(
@@ -2492,6 +2528,48 @@ const provabilityJudgeBlock = z
   .describe(
     "optional model waiver for a paraphrase miss at the grounded rung; it can only waive that one sub-check, never raise a rung",
   );
+
+/**
+ * 0.8.0 — the message `parseSpec` (and so `crewhaus compile`, `run` and
+ * `lint`) prints when the `provability:` union fails as a whole. zod reports a
+ * union's own message ("Invalid input" by default), and an enum or type error
+ * inside the object form fails the union as a whole, so without this every
+ * such typo (`on_fail: retries`, `formal: { checkers: [z3] }`,
+ * `execution: { replay: "yes" }`) printed one generic line that never named
+ * the key. For an object it now names every failing key with its own message,
+ * from the branch `parseSpecIssues` reports ({@link plausibleUnionBranch}),
+ * so the two cannot disagree about which field is wrong. Range errors and
+ * unknown keys never reach here: they leave the object branch dirty rather
+ * than failed, and zod reports them with their own paths.
+ */
+function provabilityUnionError(
+  issue: z.ZodIssueOptionalMessage,
+  ctx: z.ErrorMapCtx,
+): { message: string } {
+  if (issue.code !== z.ZodIssueCode.invalid_union) return { message: ctx.defaultError };
+  const data: unknown = ctx.data;
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    const branch = plausibleUnionBranch(issue.unionErrors, issue.path);
+    const inner = branch === undefined ? [] : zodIssuesToSpecIssues(branch.issues);
+    if (inner.length > 0) {
+      return { message: inner.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+    }
+  }
+  // `null` first: `typeof null` is "object", and an empty `provability:` key
+  // (every child commented out) parses to null, so without this the message
+  // said it wanted an object and then that it received one.
+  const received =
+    data === null
+      ? "nothing (an empty provability: key)"
+      : typeof data === "string"
+        ? JSON.stringify(data)
+        : Array.isArray(data)
+          ? "a list"
+          : typeof data;
+  return {
+    message: `expected a rung name (off | cited | grounded | checked | proven) or an object { level: <rung>, … }, received ${received}`,
+  };
+}
 
 /**
  * 0.8.0 (design §3) — the `provability:` block. A string shorthand sets the
@@ -2564,17 +2642,7 @@ const provabilityObject = z
   .strict();
 
 const provabilityBlock = z
-  .union([provabilityLevel, provabilityObject], {
-    // `parseSpec` prints a union's own message ("Invalid input" by default);
-    // `parseSpecIssues` flattens to the plausible branch instead.
-    errorMap: (issue, ctx) =>
-      issue.code === z.ZodIssueCode.invalid_union
-        ? {
-            message:
-              "expected a rung name (off | cited | grounded | checked | proven) or an object { level: <rung>, … } whose keys are all known and in range",
-          }
-        : { message: ctx.defaultError },
-  })
+  .union([provabilityLevel, provabilityObject], { errorMap: provabilityUnionError })
   .describe(
     "0.8.0 provability: every claim in an answer must bind to evidence at or above this floor before the answer is served (a rung name is shorthand for { level: <rung> })",
   )
@@ -4405,9 +4473,14 @@ export function provabilityLevelOf(block: SpecProvabilityBlock | undefined): Spe
  *     stronger pool candidate, and there is no roster to escalate on. Worded
  *     as the `evaluation.on_fail: escalate` check is. Research degrades
  *     escalate to `note` at lower time (its report gate is not per-turn), and
- *     crew carries the block unwired, so neither is refused here.
+ *     crew carries the block unwired, so neither is refused here. Nor is a
+ *     `level: off` block: design §3 accepts an off block with other keys set
+ *     (turning the gate off without deleting its config is a legitimate edit)
+ *     and the compiler reports it `provability-inert-block` instead — an
+ *     escalate that never runs contradicts nothing.
  *   - `judge.model` naming an undeclared `$profile` (the aux-slot check every
- *     other judge slot gets).
+ *     other judge slot gets). Checked at every level, off included: a typo is
+ *     a typo whether or not the gate is on today.
  *
  * The rest — no source-reading tool at `level ≥ grounded`, sandbox-only
  * checkers, an inert `level: off` block, a self-judging waiver — describe
@@ -4427,6 +4500,7 @@ function provabilityIssues(data: Spec, custom: SpecAddIssue): void {
   if (block === undefined) return;
   if (
     (data.target === "cli" || data.target === "channel" || data.target === "managed") &&
+    block.level !== "off" &&
     block.on_fail === "escalate" &&
     data.agent.model_pool === undefined
   ) {
@@ -5321,9 +5395,10 @@ function yamlSyntaxIssue(err: unknown): SpecIssue {
 
 /**
  * Flatten zod issues to `SpecIssue`s. `invalid_union` issues (the workflow
- * step / graph node / continuity / thredz unions) are replaced by the most
- * plausible branch's issues — the branch that failed with the FEWEST
- * problems, ties broken by the fewest unrecognized KEYS (so a step that
+ * step / graph node / continuity / thredz / provability unions) are replaced
+ * by the most plausible branch's issues ({@link plausibleUnionBranch}) — a
+ * branch whose type matched the value, then the one that failed with the
+ * FEWEST problems, ties broken by the fewest unrecognized KEYS (so a step that
  * declares `kind: judge` with a typo inside `judge:` reports the judge
  * branch's problem, not the regular branch's "unrecognized 'kind'") — so a
  * malformed union member reports its actual problem instead of an opaque
@@ -5341,9 +5416,11 @@ function unrecognizedKeyCount(err: z.ZodError): number {
 /**
  * 1 when the branch failed because the value is the wrong TYPE for it
  * altogether (an `invalid_type` AT the union's own path) — the least
- * plausible branch on a tie. 0.8.0: `provability: { level: bogus }` used to
- * report the shorthand branch's "expected a rung name, received object"
- * rather than the object branch's bad `level`, because both fail once.
+ * plausible branch, which {@link plausibleUnionBranch} ranks LAST before it
+ * compares anything else. 0.8.0:
+ * `provability: { level: bogus }` used to report the shorthand branch's
+ * "expected a rung name, received object" rather than the object branch's
+ * bad `level`, because both fail once.
  */
 function rootTypeMismatch(err: z.ZodError, unionPath: ReadonlyArray<string | number>): number {
   return err.issues.some(
@@ -5356,16 +5433,33 @@ function rootTypeMismatch(err: z.ZodError, unionPath: ReadonlyArray<string | num
     : 0;
 }
 
+/**
+ * The most plausible failed branch of a union: one whose TYPE matched the
+ * value first (a scalar-or-object union fed an object is about the object
+ * branch, however many of its keys are wrong — 0.8.0: `provability:
+ * { level: cited, on_fail: retries, render: markdown }` used to report the
+ * shorthand branch's single "expected a rung name, received object" because
+ * the object branch failed twice), then the fewest problems, then the fewest
+ * unrecognized keys. Shared by `parseSpecIssues` and the provability union's
+ * `parseSpec` message, so both name the same field.
+ */
+function plausibleUnionBranch(
+  unionErrors: ReadonlyArray<z.ZodError>,
+  unionPath: ReadonlyArray<string | number>,
+): z.ZodError | undefined {
+  return [...unionErrors].sort(
+    (a, b) =>
+      rootTypeMismatch(a, unionPath) - rootTypeMismatch(b, unionPath) ||
+      a.issues.length - b.issues.length ||
+      unrecognizedKeyCount(a) - unrecognizedKeyCount(b),
+  )[0];
+}
+
 function zodIssuesToSpecIssues(zodIssues: ReadonlyArray<z.ZodIssue>): SpecIssue[] {
   const out: SpecIssue[] = [];
   for (const issue of zodIssues) {
     if (issue.code === z.ZodIssueCode.invalid_union && issue.unionErrors.length > 0) {
-      const best = [...issue.unionErrors].sort(
-        (a, b) =>
-          a.issues.length - b.issues.length ||
-          unrecognizedKeyCount(a) - unrecognizedKeyCount(b) ||
-          rootTypeMismatch(a, issue.path) - rootTypeMismatch(b, issue.path),
-      )[0];
+      const best = plausibleUnionBranch(issue.unionErrors, issue.path);
       if (best !== undefined && best.issues.length > 0) {
         out.push(...zodIssuesToSpecIssues(best.issues));
         continue;

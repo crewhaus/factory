@@ -29,6 +29,7 @@
  * proof ladder never penalizes honest in-progress narration.
  */
 
+import { contentTokens, isQuestion, sentences } from "@crewhaus/claim-ledger";
 import { DONE_CLAIM_SCANNED } from "./done-claim";
 
 /** Minimum content tokens for a question to be considered for re-ask
@@ -47,144 +48,15 @@ export const RETENTION_COVERAGE = 0.6;
  *  contain to count as "acting on the handoff". */
 export const PICKUP_CUE_COVERAGE = 0.5;
 
-const STOPWORDS = new Set([
-  // articles, conjunctions, prepositions
-  "the",
-  "and",
-  "but",
-  "for",
-  "nor",
-  "with",
-  "without",
-  "from",
-  "into",
-  "onto",
-  "over",
-  "under",
-  "about",
-  "after",
-  "before",
-  "between",
-  "through",
-  "during",
-  "until",
-  "than",
-  "then",
-  // be/do/have + modals (question scaffolding, not content)
-  "are",
-  "was",
-  "were",
-  "been",
-  "being",
-  "does",
-  "did",
-  "doing",
-  "has",
-  "had",
-  "have",
-  "having",
-  "can",
-  "could",
-  "should",
-  "would",
-  "will",
-  "shall",
-  "may",
-  "might",
-  "must",
-  // pronouns + determiners
-  "you",
-  "your",
-  "yours",
-  "our",
-  "ours",
-  "their",
-  "theirs",
-  "they",
-  "them",
-  "she",
-  "her",
-  "him",
-  "his",
-  "its",
-  "this",
-  "that",
-  "these",
-  "those",
-  "there",
-  "here",
-  "what",
-  "which",
-  "when",
-  "where",
-  "who",
-  "whom",
-  "whose",
-  "why",
-  "how",
-  "any",
-  "all",
-  "each",
-  "every",
-  "some",
-  "one",
-  // misc glue
-  "not",
-  "yes",
-  "also",
-  "just",
-  "now",
-  "very",
-  "please",
-  "again",
-  "already",
-  "still",
-  "too",
-  "out",
-  "off",
-  "get",
-  "got",
-  "let",
-  "lets",
-]);
-
-/** Lowercased alphanumeric tokens, ≥3 chars, stopwords removed. */
-export function contentTokens(text: string): Set<string> {
-  const out = new Set<string>();
-  for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (raw.length < 3) continue;
-    if (STOPWORDS.has(raw)) continue;
-    out.add(raw);
-  }
-  return out;
-}
-
-/** Fraction of `needle` tokens present in `haystack` (0 when needle empty). */
-export function coverage(needle: ReadonlySet<string>, haystack: ReadonlySet<string>): number {
-  if (needle.size === 0) return 0;
-  let hit = 0;
-  for (const t of needle) {
-    if (haystack.has(t)) hit += 1;
-  }
-  return hit / needle.size;
-}
-
-/** Split text into sentences: newline-separated, then on `.`/`!`/`?`
- *  boundaries (the terminator stays attached, so `isQuestion` works). */
-export function sentences(text: string): string[] {
-  const out: string[] = [];
-  for (const line of text.split(/\n+/)) {
-    for (const part of line.split(/(?<=[.!?])\s+/)) {
-      const s = part.trim();
-      if (s !== "") out.push(s);
-    }
-  }
-  return out;
-}
-
-export function isQuestion(sentence: string): boolean {
-  return sentence.trimEnd().endsWith("?");
-}
+/**
+ * Content tokens, coverage and the transcript sentence splitter are
+ * `@crewhaus/claim-ledger`'s (design/0.8.0 §4.1): this package wrote them,
+ * the faithfulness graders had copied them byte for byte, and the
+ * provability gate needs the same measure, so they have one owner now and
+ * are re-exported here under the names this package always exported. The
+ * thresholds above were set against exactly these functions.
+ */
+export { contentTokens, coverage, isQuestion, sentences } from "@crewhaus/claim-ledger";
 
 /** Question-shaped sentences of an assistant turn. */
 export function questionSentences(text: string): string[] {

@@ -7,8 +7,9 @@
  * markers and definitions through the two constants below and nothing else:
  * the rule this release enforces is the one the original comment stated —
  * two copies of this drift, and then one tool checks a claim the other never
- * saw. `doctor --philosophy-alignment` holds the marker pattern to exactly
- * one definition in the tree (design §10).
+ * saw. Keep these the only copies: design §10 has `doctor
+ * --philosophy-alignment` check that the marker pattern is defined once in
+ * the tree.
  */
 import { codeSpans, inSpan, indexSpans, inlineLinks, lineIndex } from "./markdown";
 import { splitSentences } from "./sentences";
@@ -128,6 +129,33 @@ export function* markersOutsideCode(
 }
 
 /**
+ * Where the run of bracketed ids that ends at `at` starts — the `[1]` of
+ * `[1][2]` — or `at` when nothing bracketed ends there. For `extractClaims`.
+ *
+ * The grammar reads `[1][2]` as one marker, `[2]`: CommonMark renders it as
+ * a reference link whose text is "1", and the marker set has to stay the one
+ * CitationLint reads (so `[1]`, defined and cited nowhere else, is reported
+ * uncited by both). But the run is still where the sentence's citation sits:
+ * "Revenue rose.[1][2] Costs fell." ends its first sentence at the full stop
+ * before the run, and "Revenue rose. [1][2] Costs fell." cites [2] for the
+ * sentence before it. So the extractor asks this where a marker's run
+ * begins. Only ids the marker grammar could read — `[\w.-]+`, after an
+ * optional `^` — count; linear in the run. Not exported from the package.
+ */
+export function labelRunStart(text: string, at: number): number {
+  let start = at;
+  for (;;) {
+    if (text[start - 1] !== "]") return start;
+    let i = start - 1;
+    while (i > 0 && /[\w.-]/.test(text[i - 1] as string)) i--;
+    if (i === start - 1) return start;
+    if (text[i - 1] === "^") i--;
+    if (text[i - 1] !== "[") return start;
+    start = i - 1;
+  }
+}
+
+/**
  * The character ranges of every definition outside code — the marker line,
  * and the next line too when the source sits under it. For `extractClaims`,
  * which must never read a definition as prose (a definition block with no
@@ -138,12 +166,71 @@ export function definitionRanges(
   text: string,
   inCode: (offset: number) => boolean,
 ): Array<[number, number]> {
-  const out: Array<[number, number]> = [];
+  return definitionEntries(text, inCode).map((entry) => entry.range);
+}
+
+/** One definition line outside code, as `definitionRanges` finds it. */
+export type DefinitionEntry = {
+  readonly range: [number, number];
+  /** The source, as `citationDefinitions` would return it. */
+  readonly source: string;
+  /** Is this the definition `citationDefinitions` returns for its id: the
+   *  first one, outside the code that grammar's own reader sees? A second
+   *  `[1]:` line, or one only the CommonMark reader calls prose, is not. */
+  readonly entry: boolean;
+};
+
+/**
+ * Every definition outside code (`inCode`, the caller's reading of it),
+ * with its source and whether it is the entry `citationDefinitions` keeps.
+ * For `extractClaims`, which leaves a definition line out only where the
+ * text it shows is read some other way: an entry's, by the provability
+ * gate under that definition; an empty one's, by nobody, because a
+ * renderer shows none. Not exported from the package.
+ */
+export function definitionEntries(
+  text: string,
+  inCode: (offset: number) => boolean,
+): DefinitionEntry[] {
+  // `citationDefinitions`' own reading, so `entry` is its answer exactly.
+  const spans = indexSpans(codeSpans(text));
+  const kept = new Set<string>();
+  const out: DefinitionEntry[] = [];
   for (const m of text.matchAll(DEFINITION)) {
-    if (m.index === undefined || inCode(m.index)) continue;
-    out.push([m.index, m.index + m[0].length]);
+    if (m.index === undefined) continue;
+    const id = m[1] as string;
+    const entry = !inSpan(m.index, spans) && !kept.has(id);
+    if (entry) kept.add(id);
+    if (inCode(m.index)) continue;
+    out.push({
+      range: [m.index, m.index + m[0].length],
+      source: (m[2] as string).trim(),
+      entry,
+    });
   }
   return out;
+}
+
+/** A list item's bullet, `- `, `* `, `+ `, `1. ` or `1) `, at any indent. */
+const LIST_BULLET = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/;
+
+/** `DEFINITION` without the `g` flag, for one match from the start of a
+ *  string: the same source, so it cannot drift from the shared pattern. */
+const DEFINITION_AT_START = new RegExp(DEFINITION.source, "m");
+
+/**
+ * The source of a list item that holds nothing but a definition —
+ * `- [1]: https://…` — or null when the item is anything else. The one
+ * `DEFINITION` pattern, run on the item's content after its bullet. For
+ * `extractClaims`, which must not read a reference list written as bullets
+ * as claims; `citationDefinitions` itself never reads such an item, because
+ * the pattern is anchored at the line's start. Not exported from the package.
+ */
+export function definitionItemSource(item: string): string | null {
+  const bullet = LIST_BULLET.exec(item);
+  if (bullet === null) return null;
+  const m = DEFINITION_AT_START.exec(item.slice(bullet[0].length));
+  return m === null || m.index !== 0 ? null : (m[2] as string).trim();
 }
 
 export type CitedClaim = {

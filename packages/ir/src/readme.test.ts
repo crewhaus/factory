@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { IrChannelV0, IrNode, IrV0, IrWorkflowV0 } from "./index";
+import type { IrChannelV0, IrNode, IrProvability, IrV0, IrWorkflowV0 } from "./index";
 import { GENERATED_README_MARKER, collectSecretRefs, renderBundleReadme } from "./readme";
 
 function baseCliIr(overrides: Partial<IrV0> = {}): IrV0 {
@@ -604,5 +604,27 @@ describe("renderBundleReadme — 0.6.0 model plan (§4.3)", () => {
     expect(md).toContain("| `fast` | `claude-haiku-4-5` | `cheap` | `maxTokens`, `tools` |");
     expect(md).toContain("| `strong` | `claude-opus-4-8` | — | — |");
     expect(renderBundleReadme(baseCliIr())).not.toContain("Model profiles");
+  });
+
+  test("0.8.0: the provability waiver judge is a model a run calls, so the Models row lists it", () => {
+    const provability: IrProvability = {
+      level: "grounded",
+      onFail: "retry",
+      maxRetries: 1,
+      threshold: 1,
+      scope: "session",
+      assumptions: "allow",
+      render: "footer",
+      sources: { allow: [], deny: [], bibliographic: false, resolve: "off" },
+      grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+      execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+      formal: { checkers: ["builtin", "smt"], forbid: ["sorry"], timeoutMs: 30_000 },
+    };
+    const judged = renderBundleReadme(
+      baseCliIr({ provability: { ...provability, judge: { model: "gemini/gemini-2.5-flash" } } }),
+    );
+    expect(judged).toMatch(/\| Models \| `[^|]*`, `gemini\/gemini-2\.5-flash` \|/);
+    // No judge, no extra model: the README is the one the block-less IR gets.
+    expect(renderBundleReadme(baseCliIr({ provability }))).toBe(renderBundleReadme(baseCliIr()));
   });
 });

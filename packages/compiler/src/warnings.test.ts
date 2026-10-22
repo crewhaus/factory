@@ -264,6 +264,60 @@ describe("compile() warnings — ACCEPTED_BUT_UNWIRED table", () => {
     );
     expect(crew.warnings).toEqual([]);
   });
+
+  test("0.8.0: provability warns on crew only — cli/channel/managed/research are wired, and off is an opt-out", () => {
+    // Design §8: crew carries the block with the sanctioned row until the
+    // orchestrator exposes its synthesis turn (§12 item 2). Delete the row
+    // and this expectation together when it does.
+    const crew = (block: string): string =>
+      [
+        "name: cr",
+        "target: crew",
+        "model: m",
+        "entry: lead",
+        "roles:",
+        "  lead:",
+        "    instructions: lead it",
+        block,
+      ].join("\n");
+    const declared = compile(crew("provability: cited"));
+    expect(paths(declared.warnings)).toEqual(["provability"]);
+    expect(declared.warnings[0]?.code).toBe("accepted-but-unwired");
+    expect(declared.warnings[0]?.message).toContain("§12 item 2");
+    expect(compile(crew("provability: off")).warnings).toEqual([]);
+    expect(compile(crew("provability: {level: off}")).warnings).toEqual([]);
+
+    // The wired shapes never warn for a live block.
+    const agent = ["agent:", "  model: m", "  instructions: i"];
+    for (const yaml of [
+      ["name: c", "target: cli", ...agent, "provability: cited"],
+      [
+        "name: ch",
+        "target: channel",
+        ...agent,
+        "channels: {slack: {botToken: $SLACK_BOT_TOKEN, signingSecret: $SLACK_SIGNING_SECRET}}",
+        "routing: {sessionKey: thread}",
+        "provability: cited",
+      ],
+      [
+        "name: mg",
+        "target: managed",
+        ...agent,
+        "tenants:",
+        "  - {id: t1, budget: {maxInputTokens: 1, maxOutputTokens: 1}}",
+        "provability: cited",
+      ],
+      [
+        "name: r",
+        "target: research",
+        ...agent,
+        "goal: learn",
+        "provability: {level: cited, on_fail: note}",
+      ],
+    ]) {
+      expect(compile(yaml.join("\n")).warnings).toEqual([]);
+    }
+  });
 });
 
 describe("compile() warnings — channel-reactions-join (D40)", () => {

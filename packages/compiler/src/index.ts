@@ -152,6 +152,7 @@ import {
   checkToolConfigs,
   expandToolSelectors,
   malformedToolConfigRefs,
+  parseSelector,
   registeredToolName,
   toolConfigBlockFor,
   toolConfigProblems,
@@ -272,7 +273,14 @@ export type LowerOptions = {
  * `"model-plan-tool-config-widens"`, `"provider-tool-cap"` for a model whose
  * provider refuses the site's tool count and `"provider-tool-cap-unverified"`
  * for an `openai/` model over OpenAI's limit, which `OPENAI_BASE_URL` may send
- * elsewhere; all informational), `path` the spec key it concerns
+ * elsewhere; all informational), and from 0.8.0 the provability block's
+ * `"provability-on-fail-degraded"` (a declared `on_fail` the shape cannot
+ * honour, lowered to `note`), `"provability-execution-unresolved"` (a
+ * `checked`/`proven` floor whose `execution.allow` names a tool the catalog
+ * cannot resolve offline) and `"provability-inert-block"` (a `level: off`
+ * block that sets other keys) — all three remediable, so `crewhaus compile
+ * --strict` escalates them (apps/cli/src/compile-warnings.ts lists the
+ * informational codes that it does not), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -297,9 +305,6 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
   let ir = lowered.ir;
   if (opts.strict === true) {
     assertToolScopesStrict(ir);
-    // 0.8.0 (design §4.3) — a checked/proven floor whose execution evidence
-    // names a tool the catalog cannot resolve offline.
-    assertProvabilityStrict(ir);
   }
   // Every tool site against what its shape can run: a precise error for a
   // name the shape cannot compile, a warning for a builtin that is inert.
@@ -448,6 +453,18 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // 0.5.0 — crew's row is DELETED, not silenced: thredz is emit-wired on crew
   // now, with the per-role fan-out. The table's contract is that a row exists
   // only while the shape really does ignore the block.
+  // 0.8.0 (design §3 / §8) — crew rejoins the table for `provability:`: the
+  // block parses and lowers onto IrCrewV0 so a crew spec can declare it today,
+  // but the orchestrator's final synthesis is not a completed turn the gate
+  // can wrap. Delete this row when crew-orchestrator exposes that seam
+  // (§12 item 2). `provability: off` is not a declaration (see specDeclares).
+  crew: [
+    unwired(
+      "provability",
+      "crew",
+      "the crew orchestrator's synthesis turn is not exposed to the gate yet, so no answer is verified and no proof bundle is written (design/0.8.0-provability-release.md §12 item 2)",
+    ),
+  ],
   // Loop contract 0.4 (Batch F) — the `schedule:` block is now emit-WIRED on
   // channel/managed/batch: each daemon arms its wake loop (channel + batch via
   // durable-execution's `armSchedule`, managed via its per-tenant
@@ -510,11 +527,16 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
  * and not an explicit opt-out (`false` / `{enabled: false}`) or an empty
  * collection. Only meaningful declarations warn: `continuity: false` is a
  * live opt-out, not dead config, and an empty `mcp_servers: {}` configures
- * nothing worth warning about.
+ * nothing worth warning about. 0.8.0: `provability: off` and
+ * `{ level: off, … }` are that block's opt-out — the latter is reported as
+ * `provability-inert-block` instead, never twice.
  */
 function specDeclares(spec: Spec, path: string): boolean {
   const value = (spec as unknown as Record<string, unknown>)[path];
   if (value === undefined || value === false) return false;
+  if (path === "provability") {
+    return provabilityLevelOf(value as SpecProvabilityBlock) !== "off";
+  }
   if (typeof value === "object" && value !== null) {
     if ((value as { enabled?: unknown }).enabled === false) return false;
     if (Array.isArray(value)) return value.length > 0;
@@ -4834,54 +4856,123 @@ export function provabilityOf(ir: IrNode): IrProvability | undefined {
 }
 
 /**
- * Is `key` a tool the builtin catalog resolves OFFLINE — a spec key
- * (`moneyAdd`) or its registered name (`MoneyAdd`)? The same two lookups the
- * FR-002 gate does before it calls a name unverifiable (`auditSpecToolNames`
- * resolves by key, then by registered name). Category expansion only ever
- * yields builtin keys, so only a name written out by hand can miss: an
- * `mcp__*` tool, a custom tool registered in code, or a typo.
+ * The canonical `execution.allow` entry for `entry`: a builtin written as its
+ * spec key (`moneyAdd`), its registered name (`MoneyAdd`) or in any other case
+ * (`moneyadd`) lowers to its SPEC KEY — the two lookups the FR-002 gate does
+ * before it calls a name unverifiable (`auditSpecToolNames` resolves by key,
+ * then by registered name). Anything else (an `mcp__*` tool, a custom tool
+ * registered in code, a typo) is kept EXACTLY as written: MCP tool names are
+ * case-sensitive, so folding case there would allowlist a tool the author
+ * never named. The IR therefore carries one spelling per builtin, and the
+ * verifier maps a recorded name to its key (`builtinKeyForName`) and matches
+ * exactly (the IR doc).
  */
-function resolvesOffline(key: string): boolean {
-  return Object.hasOwn(BUILTIN_TOOLS, key) || builtinKeyForName(key) !== undefined;
+function canonicalExecutionKey(entry: string): string {
+  return Object.hasOwn(BUILTIN_TOOLS, entry) ? entry : (builtinKeyForName(entry) ?? entry);
+}
+
+/**
+ * `execution.allow` canonicalised ({@link canonicalExecutionKey}) with
+ * repeats dropped after canonicalising, keeping first-seen order: an identity
+ * expansion (no category syntax) keeps the author's order, and
+ * `[moneyAdd, MoneyAdd]` is one entry. Non-builtin names dedupe exactly.
+ */
+function canonicalExecutionAllow(keys: ReadonlyArray<string>): string[] {
+  return [...new Set(keys.map(canonicalExecutionKey))];
+}
+
+/**
+ * One `execution.allow` selector with its tool name canonicalised
+ * ({@link canonicalExecutionKey}) BEFORE the category grammar runs, keeping a
+ * leading `-`; a category selector (`all-*` / `-all-*`) is returned as
+ * written. Canonicalising only the expanded output let a builtin written by
+ * its registered name escape an exclusion its key spelling obeys
+ * (`[all-compute, MoneyAdd, -all-math]` kept moneyAdd, `[all-compute,
+ * moneyAdd, -all-math]` dropped it), and refused `-MoneyAdd` as excluding
+ * "a tool that nothing includes" while `-moneyAdd` was accepted. This list
+ * decides which tool results count as `checked` evidence, so two spellings of
+ * one tool must expand identically.
+ */
+function canonicalExecutionSelector(selector: string): string {
+  const parsed = parseSelector(selector);
+  if (parsed.kind === "category") return selector;
+  const key = canonicalExecutionKey(parsed.key);
+  return parsed.exclude ? `-${key}` : key;
+}
+
+/**
+ * Expand an `execution.allow` list through the `tools:` category grammar,
+ * failing the compile on an unknown category or an exclusion that removes
+ * nothing exactly as `tools:` does. Tool names are canonicalised first
+ * ({@link canonicalExecutionSelector}) so exclusions match whatever spelling
+ * the author used, and repeats are dropped after expansion
+ * ({@link canonicalExecutionAllow}).
+ */
+function expandExecutionAllow(selectors: ReadonlyArray<string>): string[] {
+  try {
+    return canonicalExecutionAllow(
+      expandToolSelectors(selectors.map(canonicalExecutionSelector), {
+        path: "provability.execution.allow",
+      }).tools,
+    );
+  } catch (err) {
+    if (err instanceof ToolCategoryError) throw new CompilerError(err.message, err);
+    throw err;
+  }
+}
+
+/**
+ * The entries of a canonical `execution.allow` the builtin catalog cannot
+ * resolve OFFLINE, at a `checked` / `proven` floor (`[]` below it). After
+ * canonicalisation every builtin is a spec key, so only a name written out by
+ * hand can miss: an `mcp__*` tool, a custom tool registered in code, or a
+ * typo. The one predicate behind both the lowering's warning and
+ * {@link unresolvedProvabilityExecutionTools}.
+ */
+function unresolvedExecutionKeys(
+  level: IrProvability["level"],
+  allow: ReadonlyArray<string>,
+): string[] {
+  if (level !== "checked" && level !== "proven") return [];
+  return allow.filter((key) => !Object.hasOwn(BUILTIN_TOOLS, key));
 }
 
 /**
  * 0.8.0 (design §4.3) — the `execution.allow` entries of a `checked` /
  * `proven` floor the builtin catalog cannot resolve offline. At those floors
- * the gate REPLAYS pure tools and trusts their results as evidence, so a
- * name whose purity and scope nobody can check at compile time is the FR-002
- * posture's "unverifiable sink" for evidence. `[]` below `checked` (a lower
- * floor never depends on execution evidence) and when nothing is unresolved.
- * Shared by the compile warning, `compile({ strict: true })` and `crewhaus
- * lint`, so the three cannot disagree.
+ * execution evidence is what most claims bind to, and the gate REPLAYS pure
+ * tools and trusts their results, so a name whose purity and scope nobody can
+ * check at compile time is the FR-002 posture's "unverifiable sink" for
+ * evidence. Scoped to `checked | proven` because that is where §4.3 puts the
+ * strict posture: a `tool:` citation under a `cited` / `grounded` floor is
+ * still checked against `execution.allow` (higher-rung evidence satisfies a
+ * lower floor, §2), but there it is one way among several to meet the floor,
+ * not the one the floor demands. `[]` below `checked` and when nothing is
+ * unresolved. The lowering's compile warning
+ * (`provability-execution-unresolved`, which `crewhaus compile --strict`
+ * escalates like any remediable code, and which `crewhaus lint` reports in
+ * the same words) is computed by the same predicate over the same list, so
+ * this read of an IR and the warning cannot disagree.
+ *
+ * Deliberately NOT a `compile({ strict: true })` refusal: that option is
+ * FR-002's DEFAULT-ON scope gate (`crewhaus compile`, `run --watch` and the
+ * compiler worker all set it without any `--strict` flag), so refusing there
+ * would reject on those paths a spec that a plain `crewhaus run` accepts —
+ * and the IR doc names `mcp__calc__add` as a valid entry.
  */
 export function unresolvedProvabilityExecutionTools(ir: IrNode): ReadonlyArray<string> {
   const p = provabilityOf(ir);
-  if (p === undefined || (p.level !== "checked" && p.level !== "proven")) return [];
-  return p.execution.allow.filter((key) => !resolvesOffline(key));
+  return p === undefined ? [] : unresolvedExecutionKeys(p.level, p.execution.allow);
 }
 
 function unresolvedExecutionMessage(level: string, keys: ReadonlyArray<string>): string {
   return [
     `provability.execution.allow names ${keys.map((k) => `"${k}"`).join(", ")}, which the builtin`,
-    `catalog cannot resolve offline. At level: ${level} the gate replays pure tools and accepts`,
-    "their results as evidence, so a tool whose purity and scope cannot be verified at compile",
-    "time is refused under --strict. Name builtin tools (or the all-<category> grammar), or",
-    "lower the floor.",
+    `catalog cannot resolve offline. At level: ${level} the gate accepts those tools' results as`,
+    "evidence (and replays the pure ones), so a tool whose purity and scope cannot be verified at",
+    "compile time fails `crewhaus compile --strict`. Name builtin tools (or the all-<category>",
+    "grammar), or lower the floor.",
   ].join(" ");
-}
-
-/**
- * FR-002 posture for evidence (design §4.3) — the `compile({ strict: true })`
- * half of the `checked`/`proven` check (the CLI's `--strict` escalates the
- * `provability-execution-unresolved` warning instead). Throws `CompilerError`.
- */
-export function assertProvabilityStrict(ir: IrNode): void {
-  const unresolved = unresolvedProvabilityExecutionTools(ir);
-  if (unresolved.length === 0) return;
-  throw new CompilerError(
-    `[strict] ${unresolvedExecutionMessage(provabilityOf(ir)?.level ?? "checked", unresolved)}`,
-  );
 }
 
 /**
@@ -4891,7 +4982,7 @@ export function assertProvabilityStrict(ir: IrNode): void {
  * silently dropping config: `provability-inert-block`. `[]` for a live block,
  * the `off` shorthand, or an absent one.
  */
-export function inertProvabilityKeys(spec: Spec): ReadonlyArray<string> {
+export function inertProvabilityKeys(spec: object): ReadonlyArray<string> {
   const block = provabilityObjectOf(
     (spec as { readonly provability?: SpecProvabilityBlock }).provability,
   );
@@ -4912,8 +5003,12 @@ type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
  *
  *   - `execution.allow` expands through the `tools:` category grammar at
  *     lower time (default `[all-compute, all-verify]`), so the IR carries
- *     concrete keys only; an unknown category or an exclusion that removes
- *     nothing fails the compile exactly as it does in `tools:`.
+ *     concrete names only — each builtin as its spec key, anything else
+ *     exactly as written; an unknown category or an exclusion that removes
+ *     nothing fails the compile exactly as it does in `tools:`, on an inert
+ *     `level: off` block too.
+ *   - `sources.allow` / `deny` host globs are lowercased (hosts are
+ *     case-insensitive).
  *   - `judge.model` is an auxiliary slot (`$profile` / `cheapest` /
  *     `strongest`), the watchme precedent.
  *   - `on_fail: escalate` resolves `escalateTo` with the cascade helper
@@ -4921,21 +5016,43 @@ type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
  *
  * Per shape (design §8): research's report gate runs once over the rendered
  * report, not per turn, so `retry` / `escalate` are not supported there in
- * 0.8.0 — a declared one lowers to `note` with `provability-on-fail-degraded`,
- * and an UNDECLARED `on_fail` resolves to `note` silently (the shape's
- * default; warning on every bare `provability: cited` would make the starter
- * template noisy). Crew carries the block unwired (the table row); it has no
- * `agent.model_pool` to escalate on, so `escalate` degrades to `note` there
- * the same way. A `checked`/`proven` floor whose `execution.allow` names a
- * tool the catalog cannot resolve offline warns
- * `provability-execution-unresolved`, which `--strict` escalates.
+ * 0.8.0 — a DECLARED one lowers to `note` with `provability-on-fail-degraded`.
+ * An UNDECLARED `on_fail` resolves to `note` on research SILENTLY: `note` is
+ * that shape's default, not a degraded `retry`. Warning there would fire on
+ * every bare `provability: cited` research spec (the researcher starter
+ * ships exactly that, design §11), and `crewhaus compile --strict` would
+ * then refuse a spec that says nothing wrong. Crew carries the block unwired
+ * (the table row); it has no `agent.model_pool` to escalate on, so a declared
+ * `escalate` degrades to `note` there with the same code.
+ *
+ * Two more compile warnings, both remediable (so `--strict` escalates them):
+ * `provability-inert-block` for a `level: off` object that sets other keys
+ * (it lowers to nothing, and saying so beats silently dropping config), and
+ * `provability-execution-unresolved` for a `checked`/`proven` floor whose
+ * `execution.allow` names a tool the catalog cannot resolve offline.
  */
 function lowerProvability(
   spec: SpecWithProvability,
   ctx: LowerContext,
 ): { provability?: IrProvability } {
   const level = provabilityLevelOf(spec.provability);
-  if (level === "off") return {};
+  if (level === "off") {
+    // An inert block's allowlist is still checked against the category
+    // grammar (and discarded): a typo'd category is a typo whether or not the
+    // gate is on today — the rule the spec applies to `judge.model`.
+    const inertAllow = provabilityObjectOf(spec.provability)?.execution?.allow;
+    if (inertAllow !== undefined) expandExecutionAllow(inertAllow);
+    const inert = inertProvabilityKeys(spec);
+    if (inert.length > 0) {
+      warn(
+        ctx,
+        "provability-inert-block",
+        "provability",
+        `provability: level: off turns the gate off, so ${inert.map((k) => `provability.${k}`).join(", ")} ${inert.length === 1 ? "has" : "have"} no effect — nothing is verified and no proof bundle is written. Set a level (cited | grounded | checked | proven) to turn the gate on, or delete the other keys.`,
+      );
+    }
+    return {};
+  }
   const block = provabilityObjectOf(spec.provability);
 
   let onFail: IrProvability["onFail"] = block?.on_fail ?? "retry";
@@ -4963,15 +5080,9 @@ function lowerProvability(
   const escalateTo =
     onFail === "escalate" ? resolveCascadeTarget(spec, ctx, "provability.on_fail") : undefined;
 
-  let allow: ReadonlyArray<string>;
-  try {
-    allow = expandToolSelectors(block?.execution?.allow ?? PROVABILITY_DEFAULT_EXECUTION_ALLOW, {
-      path: "provability.execution.allow",
-    }).tools;
-  } catch (err) {
-    if (err instanceof ToolCategoryError) throw new CompilerError(err.message, err);
-    throw err;
-  }
+  const allow = expandExecutionAllow(
+    block?.execution?.allow ?? PROVABILITY_DEFAULT_EXECUTION_ALLOW,
+  );
 
   const judge =
     block?.judge !== undefined
@@ -4988,8 +5099,10 @@ function lowerProvability(
     ...(block?.max_assumptions !== undefined ? { maxAssumptions: block.max_assumptions } : {}),
     render: block?.render ?? "footer",
     sources: {
-      allow: [...(block?.sources?.allow ?? [])],
-      deny: [...(block?.sources?.deny ?? [])],
+      // Host globs (the spec refuses anything else); hosts are
+      // case-insensitive, so the IR carries them lowercased.
+      allow: (block?.sources?.allow ?? []).map((glob) => glob.toLowerCase()),
+      deny: (block?.sources?.deny ?? []).map((glob) => glob.toLowerCase()),
       bibliographic: block?.sources?.bibliographic ?? false,
       resolve: block?.sources?.resolve ?? "off",
     },
@@ -4999,9 +5112,7 @@ function lowerProvability(
       independent: block?.grounded?.independent ?? 1,
     },
     execution: {
-      // An identity expansion (no category syntax) keeps the author's order;
-      // a repeated key would only be matched twice, so it is dropped.
-      allow: [...new Set(allow)],
+      allow,
       replay: block?.execution?.replay ?? true,
       maxReplays: block?.execution?.max_replays ?? 20,
     },
@@ -5023,16 +5134,14 @@ function lowerProvability(
     ...(escalateTo !== undefined ? { escalateTo } : {}),
   };
 
-  if (level === "checked" || level === "proven") {
-    const unresolved = provability.execution.allow.filter((key) => !resolvesOffline(key));
-    if (unresolved.length > 0) {
-      warn(
-        ctx,
-        "provability-execution-unresolved",
-        "provability.execution.allow",
-        unresolvedExecutionMessage(level, unresolved),
-      );
-    }
+  const unresolved = unresolvedExecutionKeys(level, allow);
+  if (unresolved.length > 0) {
+    warn(
+      ctx,
+      "provability-execution-unresolved",
+      "provability.execution.allow",
+      unresolvedExecutionMessage(level, unresolved),
+    );
   }
   return { provability };
 }
@@ -5228,32 +5337,73 @@ function specDeclaresStrategy(value: unknown): boolean {
   return Object.values(block).some(specDeclaresStrategy);
 }
 
+/** Every model that may SERVE a block's turns: its primary, its pool candidates, its tiers. */
+function servingArms(block: {
+  readonly model: string;
+  readonly modelPool?: IrModelPool;
+  readonly modelTiers?: IrModelTiers;
+}): Set<string> {
+  const out = new Set<string>([block.model]);
+  for (const c of block.modelPool?.candidates ?? []) out.add(c.model);
+  if (block.modelTiers !== undefined) {
+    out.add(block.modelTiers.fast);
+    out.add(block.modelTiers.default);
+  }
+  return out;
+}
+
+function reportSelfJudge(ctx: LowerContext, path: string, judgeModel: string, gated: string): void {
+  warn(
+    ctx,
+    "model-plan-self-judge",
+    path,
+    `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set allow_self_judge: true to accept it)`,
+  );
+}
+
+/**
+ * 0.8.0 (design §3 / §6.2) — the judge-independence check for the
+ * provability WAIVER judge: it decides whether an excerpt supports a claim
+ * the serving model wrote, so the serving model judging it is the §4.3
+ * hazard. Unlike the in-loop grader, it is NOT gated on the 0.6.0 opt-in:
+ * that gate exists so a 0.5.x spec whose judge silently defaulted to the
+ * serving model does not compile noisily now, and the waiver judge is a new
+ * slot that is always declared explicitly (`judge.model` is required), so
+ * there is no older spec to keep quiet. `judge.allow_self_judge: true`
+ * silences it. Crew carries the block unwired and has no agent, so it is not
+ * checked; `crewhaus lint` reports the same fact as `provability-self-judge`.
+ */
+function noteProvabilitySelfJudge(ir: IrNode, ctx: LowerContext): void {
+  if (
+    ir.target !== "cli" &&
+    ir.target !== "channel" &&
+    ir.target !== "managed" &&
+    ir.target !== "research"
+  ) {
+    return;
+  }
+  const judge = ir.provability?.judge;
+  if (judge === undefined || judge.allowSelfJudge === true) return;
+  if (servingArms(ir.agent).has(judge.model)) {
+    reportSelfJudge(
+      ctx,
+      "provability.judge.model",
+      judge.model,
+      "a serving arm of agent.model / model_pool (the waiver judge would rule on claims its own model wrote)",
+    );
+  }
+}
+
 function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
+  noteProvabilitySelfJudge(ir, ctx);
   if (!ctx.optedIn) return;
   const s = spec as unknown as LooseBlock;
   /** TRUE when the spec itself names the judge model at `block.judge.model` / `grader.model`. */
   const declaredJudge = (block: unknown, key: "judge" | "grader"): boolean =>
     asLooseBlock(asLooseBlock(block)?.[key])?.["model"] !== undefined;
-  const arms = (block: {
-    readonly model: string;
-    readonly modelPool?: IrModelPool;
-    readonly modelTiers?: IrModelTiers;
-  }): Set<string> => {
-    const out = new Set<string>([block.model]);
-    for (const c of block.modelPool?.candidates ?? []) out.add(c.model);
-    if (block.modelTiers !== undefined) {
-      out.add(block.modelTiers.fast);
-      out.add(block.modelTiers.default);
-    }
-    return out;
-  };
+  const arms = servingArms;
   const report = (path: string, judgeModel: string, gated: string): void =>
-    warn(
-      ctx,
-      "model-plan-self-judge",
-      path,
-      `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set allow_self_judge: true to accept it)`,
-    );
+    reportSelfJudge(ctx, path, judgeModel, gated);
   if (ir.target === "cli" || ir.target === "channel" || ir.target === "managed") {
     const ev = ir.evaluation;
     if (ev === undefined || ev.grader.type !== "llm_judge" || ev.allowSelfJudge === true) return;

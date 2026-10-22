@@ -871,6 +871,8 @@ describe("every copy of the private-address classifier is the same classifier", 
   const CLASSIFIER_PACKAGES = [
     "computer-use-driver",
     "crawler",
+    // 0.8.0: the `cited` rung refuses a citation of a private address.
+    "provability",
     "tool-chainread",
     "tool-codehost",
     "tool-discovery",

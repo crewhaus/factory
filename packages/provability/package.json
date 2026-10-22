@@ -13,10 +13,12 @@
   },
   "dependencies": {
     "@crewhaus/claim-ledger": "workspace:*",
-    "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
     "@crewhaus/ir": "workspace:*",
-    "@crewhaus/tool-catalog": "workspace:*"
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

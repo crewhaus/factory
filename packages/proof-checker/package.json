@@ -13,7 +13,9 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
-    "@crewhaus/sandbox": "workspace:*"
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/sandbox-image-lean4": "workspace:*",
+    "@crewhaus/sandbox-image-z3": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

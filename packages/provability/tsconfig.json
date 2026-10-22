@@ -9,16 +9,22 @@
       "path": "../claim-ledger"
     },
     {
-      "path": "../continuity-store"
+      "path": "../errors"
     },
     {
-      "path": "../errors"
+      "path": "../event-log"
     },
     {
       "path": "../ir"
     },
     {
       "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-categories"
+    },
+    {
+      "path": "../tool-safety"
     }
   ],
   "include": ["src/**/*"]

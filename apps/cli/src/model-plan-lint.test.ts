@@ -314,3 +314,107 @@ steps:
     ]);
   });
 });
+
+describe("provability-self-judge — the waiver judge against the agent's serving arms (0.8.0)", () => {
+  const SINGLE = `
+name: single
+target: cli
+agent:
+  model: claude-sonnet-4-5
+  instructions: help
+`.trim();
+
+  test("a waiver judge that IS the agent's model warns — pooled or not (the slot is new and always explicit)", () => {
+    const findings = auditModelPlan(
+      lowered(`${SINGLE}\nprovability: { level: grounded, judge: { model: claude-sonnet-4-5 } }\n`),
+    );
+    expect(findings.map((f) => f.rule)).toEqual(["provability-self-judge"]);
+    expect(findings[0]?.severity).toBe("warning");
+    expect(findings[0]?.path).toBe("provability.judge.model");
+    expect(findings[0]?.message).toContain('"claude-sonnet-4-5"');
+    expect(findings[0]?.message).toContain("provability.judge.allow_self_judge: true");
+  });
+
+  test("a pool candidate as the waiver judge warns; an independent judge does not", () => {
+    expect(
+      auditModelPlan(
+        lowered(`${POOLED}\nprovability: { level: grounded, judge: { model: claude-opus-4-8 } }\n`),
+      ).map((f) => f.rule),
+    ).toEqual(["provability-self-judge"]);
+    expect(
+      auditModelPlan(
+        lowered(
+          `${SINGLE}\nprovability: { level: grounded, judge: { model: claude-haiku-4-5 } }\n`,
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a $profile judge is compared by its RESOLVED model", () => {
+    const ir = lowered(`${SINGLE}
+models:
+  same: { model: claude-sonnet-4-5 }
+provability: { level: grounded, judge: { model: $same } }
+`);
+    expect(auditModelPlan(ir).map((f) => f.rule)).toEqual(["provability-self-judge"]);
+  });
+
+  test("allow_self_judge: true silences it; no judge block means no finding", () => {
+    expect(
+      auditModelPlan(
+        lowered(
+          `${SINGLE}\nprovability: { level: grounded, judge: { model: claude-sonnet-4-5, allow_self_judge: true } }\n`,
+        ),
+      ),
+    ).toEqual([]);
+    expect(auditModelPlan(lowered(`${SINGLE}\nprovability: grounded\n`))).toEqual([]);
+  });
+
+  test("channel, managed and research are checked; crew carries the block unwired and is not", () => {
+    const block =
+      "provability: { level: cited, on_fail: note, judge: { model: claude-sonnet-4-5 } }";
+    const agent = "agent: { model: claude-sonnet-4-5, instructions: i }";
+    for (const yaml of [
+      [
+        "name: ch",
+        "target: channel",
+        agent,
+        "channels: { slack: { botToken: $SLACK_BOT_TOKEN, signingSecret: $SLACK_SIGNING_SECRET } }",
+        "routing: { sessionKey: thread }",
+        block,
+      ],
+      [
+        "name: mg",
+        "target: managed",
+        agent,
+        "tenants:",
+        "  - { id: t1, budget: { maxInputTokens: 1, maxOutputTokens: 1 } }",
+        block,
+      ],
+      ["name: re", "target: research", agent, "goal: learn", block],
+    ]) {
+      expect(auditModelPlan(lowered(yaml.join("\n"))).map((f) => f.rule)).toEqual([
+        "provability-self-judge",
+      ]);
+    }
+    const crew = [
+      "name: cr",
+      "target: crew",
+      "model: claude-sonnet-4-5",
+      "entry: lead",
+      "roles:",
+      "  lead: { instructions: lead it }",
+      block,
+    ].join("\n");
+    expect(auditModelPlan(lowered(crew))).toEqual([]);
+  });
+
+  test("it surfaces through `crewhaus lint` as a warning that does not gate", () => {
+    const lint = runLint(
+      `${SINGLE}\nprovability: { level: cited, judge: { model: claude-sonnet-4-5 } }\n`,
+      noTools,
+    );
+    expect(lint.ok).toBe(true);
+    expect(lint.findings.filter((f) => f.rule === "provability-self-judge")).toHaveLength(1);
+  });
+});

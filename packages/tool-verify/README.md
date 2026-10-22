@@ -224,6 +224,11 @@ because a dot is a decimal point in one locale and a group separator in
 another). And the only word-ending rule is a plural `s`, never stemming —
 "completed" does not answer for "complete".
 
+The matcher, the citation grammar and the sentence splitter live in
+[`@crewhaus/claim-ledger`](../claim-ledger), which the provability gate reads
+too, so a claim the gate checks is the claim `FactCrossCheck` checks.
+`FactCrossCheck` asks for every word of a claim, as it always has.
+
 `GoldenUpdate` is the only tool here that writes. It overwrites a reviewed
 baseline, so it is destructive and justification-gated, and it writes through
 a temporary file and a rename — an interrupted run leaves the old golden

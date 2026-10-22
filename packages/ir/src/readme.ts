@@ -260,7 +260,8 @@ function collectToolUsage(ir: unknown): ReadonlyMap<string, ReadonlySet<string>>
  * other model a run can route a call to: pool candidates, the two tiers,
  * failover chains, and the auxiliary slots (compaction, the in-loop judge or
  * judge panel, the budget degrade rung, the security judge, the watchme
- * judge). The README used to list only the primary slot(s), so a pooled or
+ * judge, and from 0.8.0 the provability waiver judge). The README used to
+ * list only the primary slot(s), so a pooled or
  * judged harness under-reported the credentials it needs. A registry
  * profile's model appears once like any other string; the profile names
  * themselves render in the "Model profiles" section.
@@ -326,6 +327,7 @@ function collectModels(ir: IrNode): readonly string[] {
     readonly budget?: { readonly onExceed: { readonly model?: string } };
     readonly security?: { readonly justification?: { readonly model?: string } };
     readonly watchme?: { readonly judgeModel: string };
+    readonly provability?: { readonly judge?: { readonly model: string } };
     readonly groundingModel?: string;
   };
   for (const sa of aux.subAgents ?? []) {
@@ -337,6 +339,8 @@ function collectModels(ir: IrNode): readonly string[] {
   add(aux.budget?.onExceed.model);
   add(aux.security?.justification?.model);
   add(aux.watchme?.judgeModel);
+  // 0.8.0 — the provability waiver judge (design §6.2) is a model call too.
+  add(aux.provability?.judge?.model);
   add(aux.groundingModel);
   return out;
 }

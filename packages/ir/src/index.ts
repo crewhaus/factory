@@ -1281,7 +1281,13 @@ export type IrProvabilityLevel = "cited" | "grounded" | "checked" | "proven";
 export type IrProvability = {
   /** The floor every claim must meet. */
   readonly level: IrProvabilityLevel;
-  /** Resolved below-floor behaviour (spec `on_fail`, default "retry"). */
+  /** Resolved below-floor behaviour (spec `on_fail`, default "retry"). On
+   *  IrResearchV0 it is only ever "halt" | "note" in 0.8.0 (the report gate
+   *  runs once, not per turn): an undeclared `on_fail` resolves to "note",
+   *  that shape's default, and a declared retry/escalate is lowered to
+   *  "note" with a `provability-on-fail-degraded` CompileWarning. On
+   *  IrCrewV0 a declared escalate is lowered to "note" the same way (crew has
+   *  no `agent.model_pool`). */
   readonly onFail: "retry" | "halt" | "note" | "escalate";
   /** Resolved hard cap on gate-triggered re-runs (spec `max_retries`, default 1). */
   readonly maxRetries: number;
@@ -1296,9 +1302,11 @@ export type IrProvability = {
   /** How the proof bundle shows beside the answer (default "footer"). */
   readonly render: "footer" | "none" | "json";
   readonly sources: {
-    /** Host globs a cited URL must match; empty = any public host. */
+    /** Host globs a cited URL must match; empty = any public host. Each is
+     *  lowercase and one of `*`, `*.<host>` or an exact host — the spec
+     *  refuses a scheme, port, path or whitespace. */
     readonly allow: readonly string[];
-    /** Host globs a cited URL must not match; deny wins over allow. */
+    /** Host globs a cited URL must not match (same grammar); deny wins over allow. */
     readonly deny: readonly string[];
     /** Accept un-locatable free-text references at `cited` (default false). */
     readonly bibliographic: boolean;
@@ -1317,9 +1325,13 @@ export type IrProvability = {
     /** CONCRETE tool keys whose results count as execution evidence — the
      *  category grammar is expanded at lower time, exactly as `tools:` is
      *  (default: the expansion of `all-compute` + `all-verify`). Entries are
-     *  spec keys (`moneyAdd`) or exact tool names (`mcp__calc__add`); the
-     *  verifier matches a recorded tool name against them case-insensitively,
-     *  because a builtin's key is its name with a lowercase first letter. */
+     *  CANONICAL: a builtin is always its spec key (`moneyAdd`, however the
+     *  spec spelled it — `MoneyAdd` and `moneyadd` lower to it), and anything
+     *  else is the exact tool name as written (`mcp__calc__add`). The
+     *  verifier maps a recorded tool name to its builtin key with
+     *  `builtinKeyForName` (`@crewhaus/tool-categories`) and then matches
+     *  exactly; a non-builtin name must match exactly, because MCP tool names
+     *  are case-sensitive. */
     readonly allow: readonly string[];
     /** Re-run pure tools with the logged input and compare digests (default true). */
     readonly replay: boolean;

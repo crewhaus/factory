@@ -1,0 +1,800 @@
+/**
+ * The evidence index: every body the run read and every result it got,
+ * keyed by where it came from (design §5.2).
+ *
+ * Grounding needs the bodies, and they are already persisted: the session
+ * event log records every `tool_use` (full input) and `tool_result` (full
+ * output, `isError`) verbatim — the fact the 0.3.0 proof ladder was built on.
+ * The index is built from the log, children included, because compaction may
+ * have evicted a fetch from the conversation but cannot evict it from the
+ * log; `evidenceFromMessages` reads the in-memory transcript for the turn
+ * still in flight (and for callers with no log), and `buildEvidenceIndex`
+ * merges the two into one record per call.
+ *
+ * Nothing here classifies, fetches or trusts anything. A record is what the
+ * tool returned, verbatim; an origin is read off the call's input and the
+ * result's own header; the verifiers decide what a record proves.
+ */
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { classifyDefinition, contentTokens, coverage } from "@crewhaus/claim-ledger";
+import { CrewhausError } from "@crewhaus/errors";
+import { DEFAULT_ROOT_DIR, openEventLog } from "@crewhaus/event-log";
+import { FETCH, READ, RETRIEVE, WEB_FETCH, builtinKey } from "./builtins";
+import { type PathRoots, doiUrl, normalizePath, normalizeUrl } from "./origin";
+import type { EvidenceIndex, EvidenceRecord } from "./types";
+
+const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
+/** How deep the sub-agent bracket walk descends (continuity-store's bound). */
+const DEFAULT_MAX_DEPTH = 8;
+/** Input fields that name a URL the call fetched. */
+const URL_FIELDS = ["url", "uri", "href"] as const;
+/** Input fields that name a workspace file the call read. */
+const PATH_FIELDS = ["file_path", "path", "file", "filePath"] as const;
+/** Fields of a JSON hit that name where the hit came from, in preference order. */
+const HIT_ORIGIN_FIELDS = ["url", "uri", "href", "link", "source"] as const;
+/** Fields of a JSON hit that carry its text, in the order they are joined. */
+const HIT_TEXT_FIELDS = [
+  "title",
+  "text",
+  "content",
+  "body",
+  "snippet",
+  "excerpt",
+  "chunk",
+  "pageContent",
+  "page_content",
+  "summary",
+  "abstract",
+  "description",
+] as const;
+/** A JSON result larger than this is not parsed for hits (it is still one body). */
+const MAX_JSON_HIT_CHARS = 8 * 1024 * 1024;
+/** Hits indexed per result at most, and how deep a JSON result is walked for them. */
+const MAX_HITS = 1_000;
+const MAX_HIT_DEPTH = 6;
+/** A WebFetch / Fetch response header block longer than this is not a header. */
+const MAX_HEADER_CHARS = 64 * 1024;
+/** Retrieve's schema cap on `k`: no Retrieve result carries more hits. */
+const MAX_RETRIEVE_HITS = 50;
+/**
+ * A result whose text is this much the call's own input is an echo of it
+ * (see `echoesInput`) — the grounded coverage default, so "an echo" and "a
+ * body that says the claim" are measured on one scale.
+ */
+const ECHO_COVERAGE = 0.8;
+
+export class ProvabilityError extends CrewhausError {
+  override readonly name = "ProvabilityError";
+}
+
+/** One tool call, before its origins are read off it. */
+export type ToolCall = {
+  readonly toolUseId: string;
+  readonly toolName: string;
+  readonly input: unknown;
+  readonly content: string;
+  readonly isError: boolean;
+  readonly sessionId?: string;
+  readonly turnNumber?: number;
+};
+
+/** Where path-shaped inputs are measured from (default `process.cwd()`, the
+ *  directory the tools themselves resolve relative paths against). */
+export type EvidenceOptions = Pick<PathRoots, "workspaceRoot"> & {
+  /** Stamped onto records built from messages (they carry no session of their own). */
+  readonly sessionId?: string;
+};
+
+/** `sha256:<hex>` of a string's UTF-8 bytes. */
+export function sha256Of(text: string): string {
+  return `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}`;
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The origin a value names, or `undefined`: an `http(s)` URL (taken whole —
+ * it is what the tool was given, not prose to be read), a DOI, or — where
+ * `paths` is allowed — a workspace path. Whether a non-URL value is a DOI or
+ * a path is claim-ledger's `classifyDefinition`'s call, the one reader of
+ * "what does this reference name", so a citation and a tool input agree.
+ */
+function originOfValue(value: string, roots: PathRoots, paths: boolean): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed === "") return undefined;
+  if (/^https?:\/\//i.test(trimmed)) return normalizeUrl(trimmed);
+  if (/^file:\/\//i.test(trimmed)) return paths ? normalizePath(trimmed, roots) : undefined;
+  const ref = classifyDefinition(trimmed);
+  if (ref.kind === "doi") return doiUrl(ref.doi);
+  if (paths && ref.kind === "path") return normalizePath(ref.path, roots);
+  return undefined;
+}
+
+/**
+ * The header a WebFetch result opens with (`tool-web`: `URL: <url>\nStatus:
+ * <n>\nContent-Type: <ct>\n\n`), read line by line rather than by a pattern
+ * that could backtrack over a large body. Returns the URL it names and where
+ * the page itself starts, or `undefined` when the result does not open so.
+ */
+function webFetchHeader(
+  content: string,
+): { readonly url: string; readonly end: number } | undefined {
+  if (!content.startsWith("URL: ")) return undefined;
+  const lines: string[] = [];
+  let at = 0;
+  while (at < content.length && at < MAX_HEADER_CHARS) {
+    const nl = content.indexOf("\n", at);
+    if (nl === -1) return undefined;
+    const line = content.slice(at, nl).replace(/\r$/, "");
+    at = nl + 1;
+    if (line === "") break;
+    lines.push(line);
+    if (lines.length > 3) return undefined;
+  }
+  const url = /^URL: (\S+)$/.exec(lines[0] ?? "")?.[1];
+  if (url === undefined || !/^Status: \d{3}$/.test(lines[1] ?? "")) return undefined;
+  if (lines.length === 3 && !/^Content-Type:/i.test(lines[2] ?? "")) return undefined;
+  return { url, end: at };
+}
+
+/**
+ * Where the body of a Fetch result (`tool-fetch` `formatResponse`: `HTTP
+ * <status> <reason>\n<name>: <value>…\n\n<body>`) starts, or 0. Strict on
+ * purpose — a status line with a short reason phrase and at least one
+ * header line — so a file that happens to open with "HTTP 200 is…" keeps
+ * its first paragraph.
+ */
+function httpHeaderEnd(content: string): number {
+  if (!content.startsWith("HTTP")) return 0;
+  const blank = content.slice(0, MAX_HEADER_CHARS).indexOf("\n\n");
+  if (blank === -1) return 0;
+  const [status = "", ...headers] = content.slice(0, blank).split("\n");
+  if (!/^HTTP(?:\/[\d.]+)? \d{3}(?: [A-Za-z][A-Za-z '-]{0,40})?$/.test(status)) return 0;
+  if (headers.length === 0) return 0;
+  return headers.every((line) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+: ?\S?/.test(line)) ? blank + 2 : 0;
+}
+
+/**
+ * The text a record is grounded against: the result with its transport
+ * header taken off — WebFetch's `URL:`/`Status:` block and the `[user prompt:
+ * …]` line it prepends when the call carried a `prompt` (that is the model's
+ * OWN text: left in, a model could write the claim into `prompt` and find it
+ * "in the source"), and Fetch's status line and response headers. Read only
+ * off the tool that prints each; anything else is the result, verbatim.
+ */
+export function groundingBody(
+  record: Pick<EvidenceRecord, "content" | "input" | "toolName">,
+): string {
+  const { content } = record;
+  if (record.toolName === FETCH) {
+    const end = httpHeaderEnd(content);
+    return end > 0 ? content.slice(end) : content;
+  }
+  const header = record.toolName === WEB_FETCH ? webFetchHeader(content) : undefined;
+  if (header !== undefined) {
+    let body = content.slice(header.end);
+    const prompt = isRecordObject(record.input) ? record.input["prompt"] : undefined;
+    if (typeof prompt === "string" && prompt !== "") {
+      const echo = `[user prompt: ${prompt}]\n\n`;
+      if (body.startsWith(echo)) body = body.slice(echo.length);
+    }
+    return body;
+  }
+  return content;
+}
+
+/**
+ * The builtins whose result IS the content of the origin their input names
+ * (design §5.2's list: `WebFetch.url`, `Fetch.url`, `Read`'s path), and the
+ * one field that names it. Every other builtin's `url`/`path` argument names
+ * what the tool acted ON, not a body it returned: SeoLint's `url` is context
+ * for its canonical-link check while its result echoes the markup the model
+ * passed in, UrlParse's result is the model's own URL taken apart, a
+ * GitBlame is an annotation of the file. Indexing those under the origin
+ * would let model-written text pose as a page the run never read.
+ */
+const READERS: Readonly<Record<string, { readonly field: string; readonly kind: "url" | "path" }>> =
+  {
+    [WEB_FETCH]: { field: "url", kind: "url" },
+    [FETCH]: { field: "url", kind: "url" },
+    [READ]: { field: "path", kind: "path" },
+  };
+
+/**
+ * Fetch reads its URL only when it sends nothing: a POST's response is the
+ * server's answer to a body the model wrote (an echo endpoint returns it
+ * verbatim), not the page at that URL. tool-fetch drops a body on GET and
+ * HEAD, so those are reads whatever else the input carries.
+ */
+function fetchReads(input: Record<string, unknown>): boolean {
+  const method = input["method"];
+  return method === undefined || (typeof method === "string" && /^(?:GET|HEAD)$/i.test(method));
+}
+
+/** Origins a builtin reader's input names: its one declared field, and nothing else. */
+function readerOrigins(
+  reader: (typeof READERS)[string],
+  toolName: string,
+  input: Record<string, unknown>,
+  roots: PathRoots,
+): string[] {
+  if (toolName === FETCH && !fetchReads(input)) return [];
+  const value = input[reader.field];
+  if (typeof value !== "string") return [];
+  const origin =
+    reader.kind === "url"
+      ? /^https?:\/\//i.test(value.trim())
+        ? normalizeUrl(value)
+        : undefined
+      : normalizePath(value, roots);
+  return origin !== undefined ? [origin] : [];
+}
+
+/**
+ * Origins a call's input names. A builtin names one only when it is a
+ * reader (`READERS`). Any other tool — an MCP server's or a plugin's,
+ * whose flags the gate cannot see — by its URL fields, then its path
+ * fields; whether its result is then an echo of that input rather than a
+ * body is `echoesInput`'s question.
+ */
+function inputOrigins(toolName: string, input: unknown, roots: PathRoots): string[] {
+  if (!isRecordObject(input)) return [];
+  const reader = READERS[toolName];
+  if (reader !== undefined) return readerOrigins(reader, toolName, input, roots);
+  if (builtinKey(toolName) !== undefined) return [];
+  const out: string[] = [];
+  for (const field of URL_FIELDS) {
+    const value = input[field];
+    if (typeof value !== "string") continue;
+    const origin = originOfValue(value, roots, false);
+    if (origin !== undefined) out.push(origin);
+  }
+  for (const field of PATH_FIELDS) {
+    const value = input[field];
+    if (typeof value !== "string") continue;
+    const origin = /^https?:\/\//i.test(value.trim())
+      ? normalizeUrl(value)
+      : normalizePath(value, roots);
+    if (origin !== undefined) out.push(origin);
+  }
+  return out;
+}
+
+/** A JSON hit's text: its text-bearing fields, or every string field when it has none. */
+function hitText(hit: Record<string, unknown>, originField: string): string {
+  const texts = HIT_TEXT_FIELDS.map((field) => hit[field]).filter(
+    (value): value is string => typeof value === "string" && value.trim() !== "",
+  );
+  if (texts.length > 0) return texts.join("\n");
+  return Object.entries(hit)
+    .filter(([key, value]) => key !== originField && typeof value === "string")
+    .map(([, value]) => value as string)
+    .join("\n");
+}
+
+function collectJsonHits(
+  value: unknown,
+  roots: PathRoots,
+  out: Array<{ origin: string; content: string }>,
+  depth: number,
+): void {
+  if (out.length >= MAX_HITS || depth > MAX_HIT_DEPTH) return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectJsonHits(item, roots, out, depth + 1);
+    return;
+  }
+  if (!isRecordObject(value)) return;
+  for (const field of HIT_ORIGIN_FIELDS) {
+    const named = value[field];
+    if (typeof named !== "string") continue;
+    const origin = originOfValue(named, roots, field === "source");
+    if (origin === undefined) continue;
+    const content = hitText(value, field);
+    if (content.trim() !== "") out.push({ origin, content });
+    return;
+  }
+  for (const child of Object.values(value)) {
+    if (typeof child === "object" && child !== null) collectJsonHits(child, roots, out, depth + 1);
+  }
+}
+
+/** Retrieve's hit header (`tool-retrieve` `formatHits`): `[1] id=… doc=<source> score=0.9123`. */
+const RETRIEVE_HIT = /^\[(\d+)\] id=\S+ doc=(\S+) score=[\d.eE+-]+$/gm;
+
+/**
+ * Retrieve's hits, each under its own document. A chunk preview is corpus
+ * text — a crawled third-party page among it — and is printed raw, so a
+ * line in it shaped like a hit header would otherwise start a "hit" under
+ * any origin it names. So the structure `formatHits` prints is required,
+ * and anything else reads as no hits at all (fail closed: a claim cited to
+ * a Retrieve hit is then `not_fetched`, never grounded in the wrong text):
+ *
+ * - a header counts only at the start of the result or after a blank line,
+ *   the separator `formatHits` puts between hits;
+ * - the headers are numbered 1, 2, 3, … with no repeat and no gap;
+ * - there are no more of them than the call asked for (`k`), or than
+ *   Retrieve ever returns.
+ *
+ * A forged header with a blank line before it inside the LAST hit's
+ * preview still reads as one more hit; closing that needs tool-retrieve to
+ * print a delimiter a preview cannot contain (reported, not done here).
+ */
+function retrieveHits(
+  content: string,
+  input: unknown,
+  roots: PathRoots,
+): Array<{ origin: string; content: string }> {
+  const heads = [...content.matchAll(RETRIEVE_HIT)].filter(
+    (head) =>
+      head.index !== undefined && (head.index === 0 || content.endsWith("\n\n", head.index)),
+  );
+  if (heads.length === 0 || heads[0]?.index !== 0) return [];
+  const k = isRecordObject(input) ? input["k"] : undefined;
+  const most =
+    typeof k === "number" && Number.isInteger(k) && k > 0
+      ? Math.min(k, MAX_RETRIEVE_HITS)
+      : MAX_RETRIEVE_HITS;
+  if (heads.length > most) return [];
+  if (heads.some((head, i) => head[1] !== String(i + 1))) return [];
+  const out: Array<{ origin: string; content: string }> = [];
+  heads.forEach((head, i) => {
+    if (head.index === undefined) return;
+    const next = heads[i + 1]?.index ?? content.length;
+    const text = content.slice(head.index + head[0].length, next).trim();
+    const origin = originOfValue(head[2] as string, roots, true);
+    if (origin !== undefined && text !== "") out.push({ origin, content: text });
+  });
+  return out;
+}
+
+/** Every string a call's input carries, at any depth (the grounded echo test reads them too). */
+export function inputStrings(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (depth > MAX_HIT_DEPTH + 2) return out;
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) inputStrings(item, out, depth + 1);
+  else if (isRecordObject(value)) {
+    for (const item of Object.values(value)) inputStrings(item, out, depth + 1);
+  }
+  return out;
+}
+
+const collapse = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
+
+/**
+ * Is `text` the call's own input handed back? A tool the gate cannot see
+ * into (an MCP server's, a plugin's) may reflect what the model sent it — a
+ * SQL tool returns the literal a SELECT names, an "annotate" tool repeats
+ * its note — and its result would then put the model's own words under any
+ * origin it names. Such text is not a body anyone else wrote, so it is not
+ * indexed: it is a substring of one of the input's strings, or its content
+ * words are covered by the input's at the grounded bar.
+ *
+ * A search hit is far longer than its query and keeps its origin. A
+ * reflection padded with text from somewhere else (a SELECT that appends a
+ * real row to its literal) is not wholly an echo and is indexed; `grounded`
+ * then refuses a claim whose words, at their tightest, are the input's own
+ * (verify.ts `echoedSpan`).
+ */
+function echoesInput(text: string, input: unknown): boolean {
+  const strings = inputStrings(input);
+  if (strings.length === 0) return false;
+  const body = collapse(text);
+  if (body === "") return false;
+  if (strings.some((value) => collapse(value).includes(body))) return true;
+  return coverage(contentTokens(text), contentTokens(strings.join("\n"))) >= ECHO_COVERAGE;
+}
+
+/**
+ * Hits a result carries — and only where the hits cannot be the model's own
+ * writing dressed as someone else's page. A hit names its own origin, so a
+ * result the model can author (a `Read` of a file it wrote, `Bash` echoing
+ * JSON, a fetch of an echo endpoint) could otherwise put any text under any
+ * URL and ground a citation of a page the run never read. So:
+ *
+ * - Retrieve's `[n] id=… doc=… score=…` blocks are read only from Retrieve,
+ *   whose corpus the operator ingested, and only in the exact structure it
+ *   prints (`retrieveHits`).
+ * - JSON hits (`url`/`uri`/`href`/`link`/`source` fields) are read only from
+ *   a tool that is not a builtin (an MCP or plugin tool the spec configured)
+ *   and whose input names no URL or path: a search returns hits, a fetch of
+ *   one URL returns that URL's body, whatever the body looks like. A hit
+ *   whose text is the call's own input handed back is dropped
+ *   (`echoesInput`).
+ */
+function resultHits(
+  call: Pick<ToolCall, "toolName" | "content" | "input">,
+  fetchedSomething: boolean,
+  roots: PathRoots,
+): Array<{ origin: string; content: string }> {
+  const { content } = call;
+  if (call.toolName === RETRIEVE) return retrieveHits(content, call.input, roots);
+  if (fetchedSomething || builtinKey(call.toolName) !== undefined) return [];
+  const trimmed = content.trim();
+  if (trimmed.length > MAX_JSON_HIT_CHARS || !/^[[{]/.test(trimmed)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return [];
+  }
+  const out: Array<{ origin: string; content: string }> = [];
+  collectJsonHits(parsed, roots, out, 0);
+  return out.filter((hit) => !echoesInput(hit.content, call.input));
+}
+
+/**
+ * One call as an evidence record: its origins read off the input — a
+ * builtin reader's one field (WebFetch's and Fetch's `url`, Read's `path`),
+ * or any other tool's `url`, `uri`, `href`, `file_path`, `path`, `file`,
+ * `filePath` unless its result is an echo of its input (`inputOrigins`,
+ * `echoesInput`) — and the final URL a WebFetch result reports on its first
+ * line (indexed BESIDE the requested URL, so a citation of either grounds),
+ * and the hits a multi-source result carries (Retrieve; JSON results with
+ * `url`/`uri`/`href`/`link`/`source` from a search tool — see `resultHits`
+ * for which tools). Error results are recorded too: the verifiers reject
+ * them, by reason.
+ */
+export function recordFromCall(call: ToolCall, opts: EvidenceOptions = {}): EvidenceRecord {
+  const roots: PathRoots = {
+    ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
+  };
+  const named = inputOrigins(call.toolName, call.input, roots);
+  // A tool that names an origin but is not a reader the gate knows returns
+  // whatever it returns; when that is its own input, it read nothing.
+  const origins =
+    named.length > 0 &&
+    READERS[call.toolName] === undefined &&
+    echoesInput(call.content, call.input)
+      ? []
+      : named;
+  const fetchedSomething = named.length > 0;
+  // The final-URL line is tool-web's own header; read off any other tool it
+  // would let a file or a page that merely opens with "URL: …" claim a URL.
+  const header = call.toolName === WEB_FETCH ? webFetchHeader(call.content) : undefined;
+  if (header !== undefined) {
+    const final = normalizeUrl(header.url);
+    if (final !== undefined) origins.push(final);
+  }
+  const hits = resultHits(call, fetchedSomething, roots);
+  const sessionId = call.sessionId ?? opts.sessionId;
+  return {
+    toolUseId: call.toolUseId,
+    toolName: call.toolName,
+    input: call.input,
+    content: call.content,
+    isError: call.isError,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    origins: [...new Set(origins)],
+    ...(call.turnNumber !== undefined ? { turnNumber: call.turnNumber } : {}),
+    ...(hits.length > 0 ? { hits } : {}),
+  };
+}
+
+/** A tool result's text: a string as is, the text blocks of an array joined. */
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const texts: string[] = [];
+  for (const block of content) {
+    if (isRecordObject(block) && block["type"] === "text" && typeof block["text"] === "string") {
+      texts.push(block["text"]);
+    }
+  }
+  return texts.join("\n");
+}
+
+function turnOf(payload: Record<string, unknown>): number | undefined {
+  const turn = payload["turnNumber"];
+  return typeof turn === "number" && Number.isInteger(turn) && turn >= 0 ? turn : undefined;
+}
+
+/**
+ * The structural slice of a transcript message this reads: Anthropic-shaped
+ * `MessageParam`s (assistant `tool_use` blocks `{ id, name, input }`, user
+ * `tool_result` blocks `{ tool_use_id, content, is_error }`). Declared here
+ * so the package imports no model SDK.
+ */
+export type EvidenceMessage = {
+  readonly role: string;
+  readonly content: string | ReadonlyArray<unknown>;
+};
+
+/**
+ * Records for every completed tool call in a transcript, in call order. A
+ * `tool_use` with no `tool_result` yet is not a record (the call never
+ * finished); a result whose call is not in the transcript is skipped.
+ */
+export function evidenceFromMessages(
+  messages: ReadonlyArray<EvidenceMessage>,
+  opts: EvidenceOptions = {},
+): EvidenceRecord[] {
+  const uses: Array<{ id: string; name: string; input: unknown }> = [];
+  const seen = new Set<string>();
+  const results = new Map<string, { content: string; isError: boolean }>();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content as ReadonlyArray<unknown>) {
+      if (!isRecordObject(block)) continue;
+      if (block["type"] === "tool_use" && typeof block["id"] === "string") {
+        if (seen.has(block["id"])) continue;
+        seen.add(block["id"]);
+        uses.push({
+          id: block["id"],
+          name: typeof block["name"] === "string" ? block["name"] : "unknown",
+          input: block["input"],
+        });
+      } else if (block["type"] === "tool_result" && typeof block["tool_use_id"] === "string") {
+        if (results.has(block["tool_use_id"])) continue;
+        results.set(block["tool_use_id"], {
+          content: resultText(block["content"]),
+          isError: block["is_error"] === true,
+        });
+      }
+    }
+  }
+  const out: EvidenceRecord[] = [];
+  for (const use of uses) {
+    const result = results.get(use.id);
+    if (result === undefined) continue;
+    out.push(
+      recordFromCall({ toolUseId: use.id, toolName: use.name, input: use.input, ...result }, opts),
+    );
+  }
+  return out;
+}
+
+export type SessionLogEvidenceOptions = {
+  /** The session whose log to read: `sess_<16 hex>`. */
+  readonly sessionId: string;
+  /** Where session `.jsonl` logs live (default `.crewhaus/sessions`). */
+  readonly rootDir?: string;
+  /** Walk sub-agent child sessions (`sub_agent_start` brackets). Default true. */
+  readonly includeChildren?: boolean;
+  /** How deep the child walk descends. Default 8. */
+  readonly maxDepth?: number;
+  /** Workspace root for path-shaped inputs (default `process.cwd()`). */
+  readonly workspaceRoot?: string;
+  /**
+   * Told when a session's log could not be read to its end — a torn last
+   * line from a crash mid-append, a malformed line, a link where the log
+   * should be. The records read before it are kept; the gate logs this.
+   */
+  readonly onUnreadable?: (info: { readonly sessionId: string; readonly message: string }) => void;
+};
+
+type LogSlot =
+  | { readonly kind: "call"; readonly id: string }
+  | { readonly kind: "child"; readonly sessionId: string };
+
+/**
+ * Records for every completed tool call in a session's event log, child
+ * sessions included, in call order: a child's calls are placed where its
+ * `sub_agent_start` bracket sits in the parent, because that is when they
+ * ran. The walk is the one `continuity-store`'s `resolveEvidence` makes —
+ * `sub_agent_start` payloads name a `childSessionId`, a session is read
+ * once, the depth is bounded — so a researcher child's fetches ground the
+ * parent's answer.
+ *
+ * A `tool_use` logged twice under one id (an approval replay: the second
+ * line records the input that RAN) keeps its first position and the last
+ * input. `turnNumber` is carried when a payload records one. A missing log
+ * — the session's or a child's — yields no records, never a throw. A log
+ * that cannot be read to its end (`@crewhaus/event-log` throws at a
+ * malformed line — a crash mid-append leaves one — or refuses a link at
+ * the log's name) keeps the records read before that point and reports it
+ * through `onUnreadable`: fewer records fails closed — a claim whose
+ * evidence was lost is unmet — where a throw would fail OPEN, every later
+ * turn of the session served `unverified` because one child's log is torn.
+ * Reading never creates the log directory.
+ */
+export async function evidenceFromSessionLog(
+  opts: SessionLogEvidenceOptions,
+): Promise<EvidenceRecord[]> {
+  if (!SESSION_ID_REGEX.test(opts.sessionId)) {
+    throw new ProvabilityError(
+      "config",
+      `provability: invalid sessionId "${opts.sessionId}" — expected sess_<16 hex>`,
+    );
+  }
+  const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
+  const includeChildren = opts.includeChildren ?? true;
+  const maxDepth = opts.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const roots: EvidenceOptions =
+    opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {};
+  const visited = new Set<string>();
+  const out: EvidenceRecord[] = [];
+
+  const walk = async (sessionId: string, depth: number): Promise<void> => {
+    if (visited.has(sessionId)) return;
+    visited.add(sessionId);
+    // openEventLog creates its root directory; a read must not.
+    if (!existsSync(join(rootDir, `${sessionId}.jsonl`))) return;
+    const log = await openEventLog(sessionId, { rootDir });
+    const slots: LogSlot[] = [];
+    const uses = new Map<string, { name: string; input: unknown; turnNumber?: number }>();
+    const results = new Map<string, { content: string; isError: boolean; turnNumber?: number }>();
+    try {
+      for await (const event of log.read()) {
+        if (!isRecordObject(event.payload)) continue;
+        const p = event.payload;
+        if (event.kind === "tool_use" && typeof p["id"] === "string") {
+          const turnNumber = turnOf(p);
+          const prior = uses.get(p["id"]);
+          if (prior === undefined) slots.push({ kind: "call", id: p["id"] });
+          uses.set(p["id"], {
+            name: typeof p["name"] === "string" ? p["name"] : (prior?.name ?? "unknown"),
+            input: p["input"],
+            ...(turnNumber !== undefined
+              ? { turnNumber }
+              : prior?.turnNumber !== undefined
+                ? { turnNumber: prior.turnNumber }
+                : {}),
+          });
+        } else if (event.kind === "tool_result" && typeof p["toolUseId"] === "string") {
+          if (results.has(p["toolUseId"])) continue;
+          const turnNumber = turnOf(p);
+          results.set(p["toolUseId"], {
+            content: resultText(p["content"]),
+            isError: p["isError"] === true,
+            ...(turnNumber !== undefined ? { turnNumber } : {}),
+          });
+        } else if (event.kind === "sub_agent_start") {
+          const child = p["childSessionId"];
+          if (typeof child === "string" && SESSION_ID_REGEX.test(child)) {
+            slots.push({ kind: "child", sessionId: child });
+          }
+        }
+      }
+    } catch (err) {
+      opts.onUnreadable?.({
+        sessionId,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      await log.close();
+    }
+    for (const slot of slots) {
+      if (slot.kind === "child") {
+        if (includeChildren && depth < maxDepth) await walk(slot.sessionId, depth + 1);
+        continue;
+      }
+      const use = uses.get(slot.id);
+      const result = results.get(slot.id);
+      if (use === undefined || result === undefined) continue;
+      const turnNumber = use.turnNumber ?? result.turnNumber;
+      out.push(
+        recordFromCall(
+          {
+            toolUseId: slot.id,
+            toolName: use.name,
+            input: use.input,
+            content: result.content,
+            isError: result.isError,
+            sessionId,
+            ...(turnNumber !== undefined ? { turnNumber } : {}),
+          },
+          roots,
+        ),
+      );
+    }
+  };
+
+  await walk(opts.sessionId, 0);
+  return out;
+}
+
+/**
+ * runtime-core logs a non-string `tool_result` (image or multi-block
+ * content) as a summary — `[2 text blocks, 1834 chars]` — not the text. When
+ * the same call also arrives from the transcript, the transcript's text wins
+ * over that placeholder.
+ */
+const LOGGED_BLOCK_SUMMARY =
+  /^\[(?:\d+ (?:image|text|other) blocks?)(?:, \d+ (?:image|text|other) blocks?)*, \d+ chars\]$/;
+
+function mergeRecords(first: EvidenceRecord, later: EvidenceRecord): EvidenceRecord {
+  const takeLater =
+    (first.content === "" && later.content !== "") ||
+    (LOGGED_BLOCK_SUMMARY.test(first.content) && !LOGGED_BLOCK_SUMMARY.test(later.content));
+  const body = takeLater ? later : first;
+  const hits = first.hits ?? later.hits;
+  const sessionId = first.sessionId ?? later.sessionId;
+  const turnNumber = first.turnNumber ?? later.turnNumber;
+  return {
+    toolUseId: first.toolUseId,
+    toolName: first.toolName === "unknown" ? later.toolName : first.toolName,
+    input: first.input,
+    content: body.content,
+    isError: body.isError,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    origins: [...new Set([...first.origins, ...later.origins])],
+    ...(turnNumber !== undefined ? { turnNumber } : {}),
+    ...(takeLater && later.hits !== undefined
+      ? { hits: later.hits }
+      : hits !== undefined
+        ? { hits }
+        : {}),
+  };
+}
+
+/** A view of `record` as one hit's own evidence: the hit's text, under the hit's origin. */
+function hitView(record: EvidenceRecord, hit: { origin: string; content: string }): EvidenceRecord {
+  const { hits: _hits, ...call } = record;
+  return { ...call, content: hit.content, origins: [hit.origin] };
+}
+
+/**
+ * The index over `records`: duplicates of one call (the same `toolUseId`
+ * from the log and from the transcript) merged into one, in the order each
+ * call first appears. The log's record wins where the two disagree, except
+ * where the log holds only runtime-core's summary of block content and the
+ * transcript holds the text.
+ *
+ * `bySource` takes a normalized origin; a raw URL is normalized for the
+ * caller. Error records are indexed like any other — the verifiers reject
+ * them by reason, so "fetched, but it failed" reads differently from "never
+ * fetched".
+ */
+export function buildEvidenceIndex(records: Iterable<EvidenceRecord>): EvidenceIndex {
+  const byId = new Map<string, EvidenceRecord>();
+  const order: string[] = [];
+  for (const record of records) {
+    const prior = byId.get(record.toolUseId);
+    if (prior === undefined) {
+      byId.set(record.toolUseId, record);
+      order.push(record.toolUseId);
+    } else {
+      byId.set(record.toolUseId, mergeRecords(prior, record));
+    }
+  }
+  const all = order.map((id) => byId.get(id) as EvidenceRecord);
+  const sources = new Map<string, EvidenceRecord[]>();
+  const add = (origin: string, record: EvidenceRecord): void => {
+    const list = sources.get(origin);
+    if (list === undefined) sources.set(origin, [record]);
+    else list.push(record);
+  };
+  for (const record of all) {
+    for (const origin of new Set(record.origins)) add(origin, record);
+    for (const hit of record.hits ?? []) add(hit.origin, hitView(record, hit));
+  }
+  return {
+    bySource(origin: string): ReadonlyArray<EvidenceRecord> {
+      const direct = sources.get(origin);
+      if (direct !== undefined) return direct;
+      const normalized = normalizeUrl(origin);
+      return (normalized !== undefined ? sources.get(normalized) : undefined) ?? [];
+    },
+    byToolUseId(toolUseId: string): EvidenceRecord | undefined {
+      return byId.get(toolUseId);
+    },
+    all(): ReadonlyArray<EvidenceRecord> {
+      return all;
+    },
+  };
+}
+
+/**
+ * The index restricted to calls made in `turnNumbers` (`scope: turn`). A
+ * record with no `turnNumber` is dropped: under a turn scope, evidence whose
+ * turn is unknown cannot be shown to be this turn's.
+ */
+export function restrictToTurns(
+  index: EvidenceIndex,
+  turnNumbers: ReadonlySet<number>,
+): EvidenceIndex {
+  const keep = (record: EvidenceRecord): boolean =>
+    record.turnNumber !== undefined && turnNumbers.has(record.turnNumber);
+  return {
+    bySource: (origin) => index.bySource(origin).filter(keep),
+    byToolUseId: (toolUseId) => {
+      const record = index.byToolUseId(toolUseId);
+      return record !== undefined && keep(record) ? record : undefined;
+    },
+    all: () => index.all().filter(keep),
+  };
+}

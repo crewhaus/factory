@@ -1,0 +1,88 @@
+import { describe, expect, test } from "bun:test";
+import { commonMarkFences, fencedSpans } from "./markdown";
+
+const blocks = (text: string): string[] =>
+  commonMarkFences(text).map(([start, end]) => text.slice(start, end));
+
+describe("commonMarkFences — the claim extractor's code reader", () => {
+  test("a fence opens and closes with the same character, indented up to three spaces", () => {
+    expect(blocks("a\n   ```ts\ncode\n  ```\nb")).toEqual(["   ```ts\ncode\n  ```"]);
+    expect(blocks("~~~\ncode\n~~~")).toEqual(["~~~\ncode\n~~~"]);
+    // Four spaces is indented code, not a fence.
+    expect(blocks("    ```\ncode\n    ```")).toEqual([]);
+  });
+
+  test("a closing fence is at least as long, of the same character, with nothing after it", () => {
+    expect(blocks("````\n```\n~~~~\n``` x\n````\nprose")).toEqual(["````\n```\n~~~~\n``` x\n````"]);
+  });
+
+  test("a backtick fence's info string has no backtick; a tilde fence's may", () => {
+    expect(blocks("```x`\nprose\n")).toEqual([]);
+    expect(blocks("~~~ a`b\ncode\n~~~")).toEqual(["~~~ a`b\ncode\n~~~"]);
+  });
+
+  test("lines break at \\n, \\r\\n and \\r only, never at U+2028", () => {
+    expect(blocks("a. ```\nprose")).toEqual([]);
+    expect(blocks("a\r\n```\r\ncode\r\n```\r\nb")).toEqual(["```\r\ncode\r\n```"]);
+    expect(blocks("a\r```\rcode\r```\rb")).toEqual(["```\rcode\r```"]);
+  });
+
+  test("an unclosed fence runs to the end", () => {
+    expect(blocks("prose\n```\ncode")).toEqual(["```\ncode"]);
+  });
+
+  test("a fence on a list item's marker line opens there, and its indented closer closes it", () => {
+    // Read from column 0 the bullet hid the opener and the closer opened a
+    // fence of its own that ran to the end of the answer.
+    expect(blocks("1. ```bash\n   ls\n   ```\n\nThe refund window is 30 days [1].")).toEqual([
+      "1. ```bash\n   ls\n   ```",
+    ]);
+    expect(blocks("- ```js\n  const x = 1;\n  ```\n\nRefunds are accepted.")).toEqual([
+      "- ```js\n  const x = 1;\n  ```",
+    ]);
+    // Nested markers on one line, and a tab after the bullet.
+    expect(blocks("- 1. ```\n     code\n     ```\nprose")).toEqual([
+      "- 1. ```\n     code\n     ```",
+    ]);
+    expect(blocks("-\t```\n    code\n    ```\nprose")).toEqual(["-\t```\n    code\n    ```"]);
+  });
+
+  test("inside a list item, indentation is counted from the item's content", () => {
+    // Four spaces under "- " is two into the item: a fence, not indented code.
+    expect(blocks("- item\n\n    ```\n    code\n    ```\nprose")).toEqual([
+      "    ```\n    code\n    ```",
+    ]);
+    // Six is four into it: indented code, so nothing opens.
+    expect(blocks("- item\n\n      ```\n      code\n\nprose")).toEqual([]);
+    // A paragraph line under an item is lazy; a fence at column 0 is the item's end.
+    expect(blocks("- item\ntext\n```\ncode\n```\nprose")).toEqual(["```\ncode\n```"]);
+  });
+
+  test("a fence left open in a list item ends where the item does", () => {
+    const text =
+      "- Item one is here.\n\n  ```\n  code here\n\nRefunds are accepted within 30 days [1].";
+    expect(blocks(text)).toEqual(["  ```\n  code here\n"]);
+    // A closer at column 0 under "- ```js" is outside the item: the item's
+    // fence ends before it, and it opens a fence of its own (CommonMark).
+    expect(blocks("- ```js\n  code\n```\nprose")).toEqual(["- ```js\n  code", "```\nprose"]);
+    // Blank lines inside the item's fence do not end it.
+    expect(blocks("- ```\n  a\n\n  b\n  ```\nprose")).toEqual(["- ```\n  a\n\n  b\n  ```"]);
+  });
+
+  test("only an item that may interrupt a paragraph opens one there", () => {
+    // "2." cannot interrupt a paragraph, so its backticks are text, and the
+    // fence at column 0 below runs to the end.
+    expect(blocks("Some text\n2. ```js\ncode\n```\nprose")).toEqual(["```\nprose"]);
+    expect(blocks("Some text\n1. ```js\ncode\n```\nprose")).toEqual(["1. ```js", "```\nprose"]);
+    // A thematic break is not a bullet.
+    expect(blocks("* * *\n```\ncode\n```")).toEqual(["```\ncode\n```"]);
+  });
+
+  test("the citation grammar's reader is left as loose as it was (pinned)", () => {
+    // CitationLint and FactCrossCheck read code through fencedSpans; their
+    // output must not move, so the two readers are allowed to differ.
+    const text = "```\ncode\n  ```\nRefunds take 30 days [1].";
+    expect(fencedSpans(text)).toEqual([[0, text.length]]);
+    expect(commonMarkFences(text)).toEqual([[0, "```\ncode\n  ```".length]]);
+  });
+});

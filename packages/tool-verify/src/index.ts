@@ -14,6 +14,18 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
+import {
+  type ClaimQuery,
+  type Location,
+  MAX_EXCERPT_CHARS,
+  type QuoteHit,
+  type SourceIndex,
+  claimQuery,
+  indexSource,
+  locateQuote,
+  locateQuotes,
+  locateWords,
+} from "@crewhaus/claim-ledger";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -87,17 +99,6 @@ import {
   tokenize,
   typeOf,
 } from "./lib/seo";
-import {
-  type SourceIndex,
-  type SourceToken,
-  bestSpan,
-  contentTokens,
-  findSequence,
-  indexSource,
-  lineOf,
-  quotedRuns,
-  spanExcerpt,
-} from "./lib/spans";
 import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
@@ -1164,14 +1165,13 @@ export const citationLint: RegisteredTool = buildTool({
 
 // ---------------------------------------------------------------------------
 
-/** Fewer words than this in quotation marks is a phrase, not a quotation. */
-const QUOTE_MIN_TOKENS = 4;
-/** How much of a quotation a source span must carry to count as a misquote
- *  rather than as nothing at all. Below it there is no "nearly identical
- *  span" to show the caller, and claiming one would be an invention. */
-const MISQUOTE_COVERAGE = 0.7;
+// Locating a claim in a source — the quotation and misquote rules, the
+// window, the polarity check — is claim-ledger's locate kernel, which the
+// provability gate's `grounded` rung runs too (design/0.8.0 §6.2). This tool
+// asks it for every word (`coverage: 1`), the bar it has always held a claim
+// to, and keeps what is its own: reading sources, the per-call cache and
+// reading budget, and the verdicts' wording.
 const MAX_CLAIM_CHARS = 300;
-const MAX_EXCERPT_CHARS = 240;
 
 const clip = (text: string, max: number): string =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -1385,13 +1385,10 @@ function findingFor(label: string, located: Located): SourceFinding {
  */
 type Reading = {
   words: number;
-  readonly found: Map<SourceIndex, Map<string, SpanAnswer | Located>>;
+  readonly found: Map<SourceIndex, Map<string, QuoteHit | Located>>;
 };
 
-/** Where a quoted span first appears in a source, and if nowhere, what to report. */
-type SpanAnswer = { readonly at: number; readonly miss: Located | null };
-
-function knownIn(reading: Reading, index: SourceIndex): Map<string, SpanAnswer | Located> {
+function knownIn(reading: Reading, index: SourceIndex): Map<string, QuoteHit | Located> {
   let known = reading.found.get(index);
   if (known === undefined) {
     known = new Map();
@@ -1423,49 +1420,59 @@ function locateSpan(
   run: ReadonlyArray<string>,
   key: string,
   reading: Reading,
-): SpanAnswer {
+): QuoteHit {
   const known = knownIn(reading, index);
-  const before = known.get(key) as SpanAnswer | undefined;
+  const before = known.get(key) as QuoteHit | undefined;
   if (before !== undefined) return before;
-  const at = findSequence(index, run);
-  reading.words += index.tokens.length;
-  let miss: Located | null = null;
-  if (at === -1) {
-    // The quotation is not there word for word. A span that carries most of
-    // it is the useful answer — the caller needs to see what the source
-    // actually wrote — and a span that carries little of it is no answer at
-    // all, only a coincidence of vocabulary.
-    const distinct = [...new Set(run)];
-    const near = bestSpan(index, distinct, run.length);
-    reading.words += index.tokens.length;
-    const coverage = near.total === 0 ? 0 : near.matched / near.total;
-    const enough = coverage >= MISQUOTE_COVERAGE && near.matched >= 3;
-    miss = enough
-      ? {
-          status: "misquoted",
-          reason: (label) =>
-            `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`,
-          detail: {
-            coverage: Math.round(coverage * 100) / 100,
-            missing: [...near.missing],
-            differing: [...near.extra],
-            line: lineOf(index, (index.tokens[near.firstToken] as SourceToken).at),
-            excerpt: spanExcerpt(index, near.firstToken, near.lastToken, MAX_EXCERPT_CHARS),
-          },
-        }
-      : {
-          status: "notFound",
-          reason: (label) =>
-            `the quoted words are not in "${label}"; that is not a finding that it says otherwise`,
-          detail: {
-            coverage: Math.round(coverage * 100) / 100,
-            missing: [...near.missing],
-          },
-        };
+  const hit = locateQuote(index, run, MAX_EXCERPT_CHARS);
+  // Looking for the span reads the source once; when it is not there,
+  // finding the nearest span reads it again.
+  reading.words += index.tokens.length * (hit.miss === null ? 1 : 2);
+  known.set(key, hit);
+  return hit;
+}
+
+/**
+ * What the kernel found, as this tool reports it: the verdict, the reason in
+ * its words, and the detail fields in the order it has always printed them.
+ */
+function locatedFrom(location: Location): Located {
+  return {
+    status: location.status,
+    reason: reasonFor(location),
+    detail: {
+      coverage: location.coverage,
+      ...(location.missing === undefined ? {} : { missing: [...location.missing] }),
+      ...(location.differing === undefined ? {} : { differing: [...location.differing] }),
+      ...(location.line === undefined ? {} : { line: location.line }),
+      ...(location.excerpt === undefined ? {} : { excerpt: location.excerpt }),
+    },
+  };
+}
+
+function reasonFor(location: Location): (label: string) => string {
+  switch (location.status) {
+    case "supported":
+      return location.mode === "quote"
+        ? (label) => `the quoted words appear in "${label}", in order`
+        : (label) => `every word of the claim is in one span of "${label}"`;
+    case "misquoted":
+      return (label) =>
+        `"${label}" has a nearly identical span, but not the words the claim puts in quotation marks`;
+    case "polarityConflict":
+      // Every word matched, and the span carrying them is negated where the
+      // claim is not. This is as close to "it says the opposite" as counting
+      // words can honestly get, and it is reported as something to read
+      // rather than as a contradiction found.
+      return (label) =>
+        `the claim's words are in "${label}", but the span carrying them is negated ("${(location.differing ?? []).join('", "')}") where the claim is not — read it before relying on either`;
+    case "notFound":
+      return location.mode === "quote"
+        ? (label) =>
+            `the quoted words are not in "${label}"; that is not a finding that it says otherwise`
+        : (label) =>
+            `${location.matched} of ${location.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`;
   }
-  const answer: SpanAnswer = { at, miss };
-  known.set(key, answer);
-  return answer;
 }
 
 /**
@@ -1475,8 +1482,8 @@ function locateSpan(
  * citing one file under many markers locates its words there once, and a
  * span or a claim's words already located in that file by any claim of the
  * call are not located again. For a quotation, once one span is not in the
- * source at all nothing later can change the answer — `notFound` outranks a
- * misquote — so the rest are not read.
+ * source at all nothing later can change the answer, and the kernel stops
+ * reading.
  */
 function locate(
   index: SourceIndex,
@@ -1485,87 +1492,24 @@ function locate(
   reading: Reading,
 ): Located {
   if (claim.quotes.length > 0) {
-    let worst: Located | null = null;
-    let firstHit = -1;
-    // Each different span once, in the order first quoted.
-    for (const { run, key } of claim.spans) {
-      const { at, miss } = locateSpan(index, run, key, reading);
-      if (miss === null) {
-        if (firstHit === -1) firstHit = at;
-        continue;
-      }
-      if (worst === null || VERDICT_RANK[miss.status] > VERDICT_RANK[worst.status]) {
-        worst = miss;
-      }
-      if (worst.status === "notFound") break;
-    }
-    if (worst !== null) return worst;
-    const last = firstHit + (claim.quotes[0] as ReadonlyArray<string>).length - 1;
-    return {
-      status: "supported",
-      reason: (label) => `the quoted words appear in "${label}", in order`,
-      detail: {
-        coverage: 1,
-        line: lineOf(index, (index.tokens[firstHit] as SourceToken).at),
-        excerpt: spanExcerpt(index, firstHit, last, MAX_EXCERPT_CHARS),
-      },
-    };
+    return locatedFrom(
+      locateQuotes(
+        index,
+        claim.quotes,
+        (run, position) =>
+          locateSpan(index, run, (claim.spans[position] as { key: string }).key, reading),
+        MAX_EXCERPT_CHARS,
+      ),
+    );
   }
 
   const known = knownIn(reading, index);
   const before = known.get(claim.needKey) as Located | undefined;
   if (before !== undefined) return before;
-  const located = locateWords(index, claim, windowTokens);
+  const located = locatedFrom(locateWords(index, claim.need, { windowTokens, coverage: 1 }));
   reading.words += index.tokens.length;
   known.set(claim.needKey, located);
   return located;
-}
-
-/** A claim with no quotation, located in one source by its words. */
-function locateWords(index: SourceIndex, claim: PreparedClaim, windowTokens: number): Located {
-  const span = bestSpan(index, claim.need, windowTokens);
-  const coverage = span.total === 0 ? 0 : Math.round((span.matched / span.total) * 100) / 100;
-  if (span.matched < span.total) {
-    return {
-      status: "notFound",
-      reason: (label) =>
-        `${span.matched} of ${span.total} of the claim's words are in "${label}", never together; that is not a finding that it says otherwise`,
-      detail: {
-        coverage,
-        missing: [...span.missing],
-        ...(span.firstToken === -1
-          ? {}
-          : {
-              line: lineOf(index, (index.tokens[span.firstToken] as SourceToken).at),
-              excerpt: spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS),
-            }),
-      },
-    };
-  }
-  const line = lineOf(index, (index.tokens[span.firstToken] as SourceToken).at);
-  const excerpt = spanExcerpt(index, span.firstToken, span.lastToken, MAX_EXCERPT_CHARS);
-  if (span.extraNegations.length > 0) {
-    // Every word matched, and the span carrying them is negated where the
-    // claim is not. This is as close to "it says the opposite" as counting
-    // words can honestly get, and it is reported as something to read rather
-    // than as a contradiction found.
-    return {
-      status: "polarityConflict",
-      reason: (label) =>
-        `the claim's words are in "${label}", but the span carrying them is negated ("${span.extraNegations.join('", "')}") where the claim is not — read it before relying on either`,
-      detail: {
-        coverage: 1,
-        differing: [...span.extraNegations],
-        line,
-        excerpt,
-      },
-    };
-  }
-  return {
-    status: "supported",
-    reason: (label) => `every word of the claim is in one span of "${label}"`,
-    detail: { coverage: 1, line, excerpt },
-  };
 }
 
 type PreparedClaim = {
@@ -1573,33 +1517,22 @@ type PreparedClaim = {
   readonly need: ReadonlyArray<string>;
   /** The key the claim's words are kept under for the call. */
   readonly needKey: string;
-  readonly quotes: ReadonlyArray<ReadonlyArray<string>>;
-  /** The different quoted spans, in the order first quoted, with their keys. */
+  /** The different quoted spans, in the order first quoted. */
+  readonly quotes: ClaimQuery["quotes"];
+  /** The same spans, with the keys they are kept under for the call. */
   readonly spans: ReadonlyArray<{ readonly run: ReadonlyArray<string>; readonly key: string }>;
-  readonly mode: "quote" | "paraphrase";
+  readonly mode: ClaimQuery["mode"];
 };
 
 function prepareClaim(text: string): PreparedClaim {
-  const quotes = quotedRuns(text, QUOTE_MIN_TOKENS);
-  const need = contentTokens(text);
-  const spans: Array<{ run: ReadonlyArray<string>; key: string }> = [];
-  const keys = new Set<string>();
-  for (const run of quotes) {
-    const key = spanKey(run);
-    if (keys.has(key)) continue;
-    keys.add(key);
-    spans.push({ run, key });
-  }
+  const query = claimQuery(text);
   return {
     text,
-    need,
-    needKey: wordsKey(need),
-    quotes,
-    spans,
-    // An attributed quotation is the strictest promise a citation makes, so
-    // when there is one it is what gets verified; the words around it are the
-    // author's framing, not the source's.
-    mode: quotes.length > 0 ? "quote" : "paraphrase",
+    need: query.need,
+    needKey: wordsKey(query.need),
+    quotes: query.quotes,
+    spans: query.quotes.map((run) => ({ run, key: spanKey(run) })),
+    mode: query.mode,
   };
 }
 

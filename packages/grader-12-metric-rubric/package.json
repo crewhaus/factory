@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/claim-ledger": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",

@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../claim-ledger" },
     { "path": "../continuity-store" },
     { "path": "../errors" },
     { "path": "../eval-dataset" },

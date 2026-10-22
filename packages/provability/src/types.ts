@@ -85,9 +85,14 @@ export type ProofBinding = {
   readonly kind: BindingKind;
   /** The highest rung this binding satisfies (`"none"` when it satisfies none). */
   readonly rung: Rung;
-  /** True iff `rung` is at or above the configured floor. */
+  /** True iff `rung` is at or above the configured floor — and, under
+   *  `grounded.independent > 1`, its claim has enough distinct origins (a
+   *  source binding that grounded alone carries `not_independent`). An
+   *  assumption binding is never `ok`: it is not evidence. */
   readonly ok: boolean;
-  /** Present when `ok` is false: the first reason it fell short. */
+  /** Present when `ok` is false: the first reason it fell short. Absent on
+   *  an ALLOWED assumption binding — it is not evidence and not a failure;
+   *  its claim's `status` (`assumption`) says what it is. */
   readonly reason?: UnmetReason;
   /** Human-readable detail for the reason (no fetched content beyond `excerpt`). */
   readonly detail?: string;
@@ -118,6 +123,14 @@ export type ProofClaim = {
   /** The highest rung any binding of this claim reached. */
   readonly best: Rung;
   readonly bindings: ReadonlyArray<ProofBinding>;
+  /**
+   * Present when the claim is text a definition line shows after what it
+   * names (`[1]: https://… Payments clear within 5 days`): that definition's
+   * marker, `"[1]"`. Such text renders as prose, so it is read as claims
+   * citing that definition rather than shown to the reader unread. (0.8.0
+   * additive, W1-C fix pass.)
+   */
+  readonly definition?: string;
 };
 
 export type ProofVerdict = "pass" | "fail" | "unverified";
@@ -139,7 +152,18 @@ export type ProofBundle = {
   readonly claimCount: number;
   readonly met: number;
   readonly unmet: number;
+  /** Claims whose status is `assumption`: accepted, and out of the score. */
   readonly assumptions: number;
+  /**
+   * Declared assumptions the config refused — every one under `assumptions:
+   * forbid`, the ones past `max_assumptions` otherwise. Their claims are
+   * `unmet` (binding reason `assumption_forbidden`), and any refusal fails
+   * the verdict whatever the score (design §2: the turn passes only when
+   * assumptions ≤ max_assumptions). The answer declared `assumptions +
+   * assumptionsRefused` assumptions in all. Absent when none was refused.
+   * (0.8.0 additive, W1-C fix pass.)
+   */
+  readonly assumptionsRefused?: number;
   /** Distinct source origins that grounded at least one claim. */
   readonly sources: number;
   /** Bindings the waiver judge flipped. */
@@ -175,6 +199,8 @@ export type ProvabilityGradedSummary = {
   readonly met: number;
   readonly unmet: number;
   readonly assumptions: number;
+  /** `ProofBundle.assumptionsRefused`, when any. (0.8.0 additive, W1-C fix pass.) */
+  readonly assumptionsRefused?: number;
   readonly retryIndex: number;
   readonly bundleHash: string;
   readonly judgeModel?: string;
@@ -198,15 +224,28 @@ export type EvidenceRecord = {
   readonly isError: boolean;
   /** The session whose log carried the call (child sessions included). */
   readonly sessionId?: string;
-  /** Normalized origins (URLs / workspace paths) this call fetched or read. */
+  /** Normalized origins (URLs / workspace paths) this call fetched or read
+   *  as a WHOLE body: its input's `url`/`path` fields and the final URL a
+   *  fetch reported. `bySource` answers these with the whole record. */
   readonly origins: readonly string[];
   /** Turn number, when the log recorded one (used by `scope: turn`). */
   readonly turnNumber?: number;
+  /**
+   * A result that carries several hits, each from its own origin (Retrieve
+   * hits, a JSON search result with `url`/`source` fields): each hit's own
+   * text under its own normalized origin. `bySource` answers a hit's origin
+   * with that hit's text alone, never the whole result — otherwise one hit
+   * could ground a claim cited to another. Absent when the result has none.
+   * (0.8.0 additive, W1-C.)
+   */
+  readonly hits?: ReadonlyArray<{ readonly origin: string; readonly content: string }>;
 };
 
 /** The session-scoped view of every body the run read and every result it got. */
 export interface EvidenceIndex {
-  /** Records whose fetched/read origin normalizes to `origin`. */
+  /** Records whose fetched/read origin normalizes to `origin`. For a hit's
+   *  origin (`EvidenceRecord.hits`) the record returned is a view of the call
+   *  whose `content` is that hit's text and whose `origins` is `[origin]`. */
   bySource(origin: string): ReadonlyArray<EvidenceRecord>;
   /** The record for one toolUseId, when the run made that call. */
   byToolUseId(toolUseId: string): EvidenceRecord | undefined;
