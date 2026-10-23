@@ -10,8 +10,14 @@ import {
 } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
-import type { IrProvability } from "@crewhaus/ir";
+import type { IrPermissions, IrProvability } from "@crewhaus/ir";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
+import {
+  BUILTIN_DEFAULT_RULES,
+  type PermissionRule,
+  emptyRuleSet,
+  evaluate,
+} from "@crewhaus/permission-engine";
 import {
   type Spec,
   SpecParseError,
@@ -349,6 +355,15 @@ function provabilitySourceToolKeys(): ReadonlySet<string> {
  *    from the spec, so it says what happens without one (design §18): they
  *    are unavailable and proofs fall back to builtin. Nothing fails — the
  *    list is a preference order, not an allowlist.
+ *  - `provability-proofcheck-asks` — a channel or managed harness, where no
+ *    one can answer an approval, whose ProofCheck would ask before running a
+ *    sandbox checker it lists (the lowered `formal.checkers`, so the default
+ *    `smt` counts). permission-engine allows `ProofCheck(builtin)` by default
+ *    — no container, nothing written but the artifact — and leaves `smt` and
+ *    `lean4`, which start a container, to the mode default; the spec's own
+ *    rules are read the way the runtime reads them. Under `ask_mode: pause`
+ *    (the default) the turn parks on such a proof; under `deny` it is
+ *    refused. The cli shape is not checked: its REPL can ask.
  */
 export function auditProvability(ir: IrNode, spec?: Spec): LintFinding[] {
   const p = provabilityOf(ir);
@@ -391,6 +406,27 @@ export function auditProvability(ir: IrNode, spec?: Spec): LintFinding[] {
   }
 
   out.push(...unknownExecutionTools(ir, p.execution.allow, mcpServers));
+
+  if ((ir.target === "channel" || ir.target === "managed") && reachesProof(p, ir)) {
+    const permissions = (ir as { readonly permissions?: IrPermissions }).permissions;
+    const asking = p.formal.checkers.filter(
+      (checker) => checker !== "builtin" && proofCheckAsks(checker, permissions),
+    );
+    if (asking.length > 0) {
+      const named = asking.join(" and ");
+      const refused = permissions?.askMode === "deny";
+      out.push({
+        rule: "provability-proofcheck-asks",
+        severity: "warning",
+        path: "provability.formal.checkers",
+        message: `ProofCheck asks for approval before it runs the ${named} checker (a sandbox checker starts a container; only builtin is allowed by default), and a ${ir.target} harness has no one to ask: a proof that picks it ${
+          refused ? "is refused (ask_mode: deny)" : "parks the turn until someone approves it"
+        }. Allow it with a permissions rule — alwaysAllow ${asking
+          .map((checker) => `ProofCheck(${checker})`)
+          .join(", ")} — or set provability.formal.checkers to [builtin].`,
+      });
+    }
+  }
 
   const sandboxOnly = spec === undefined ? [] : sandboxOnlyProvabilityCheckers(spec);
   if (sandboxOnly.length > 0) {
@@ -439,6 +475,32 @@ function reachesExecution(
 function reachesProof(p: IrProvability, ir: IrNode): boolean {
   const own = (ir as { readonly tools?: ReadonlyArray<string> }).tools ?? [];
   return wantsProofCheckTools(p) || own.some((name) => builtinKeyOf(name) === "proofCheck");
+}
+
+/**
+ * Whether `ProofCheck` with `checker` would ASK under `permissions` (the
+ * spec's rules above the builtin defaults, at the spec's mode), read by the
+ * engine the runtime uses, with the checker as the call's one operative
+ * value — the tool declares `checker` its `id` operative arg.
+ */
+function proofCheckAsks(checker: string, permissions: IrPermissions | undefined): boolean {
+  const yaml: PermissionRule[] = (permissions?.rules ?? []).map((rule) => ({
+    type: rule.type,
+    pattern: rule.pattern,
+    source: "yaml",
+  }));
+  const decision = evaluate(
+    {
+      toolName: "ProofCheck",
+      input: { checker },
+      readOnly: false,
+      destructive: true,
+      operativeValues: [{ kind: "id", canonical: [checker] }],
+    },
+    permissions?.mode ?? "default",
+    { ...emptyRuleSet, yaml, builtin: [...BUILTIN_DEFAULT_RULES] },
+  );
+  return decision === "ask";
 }
 
 /**

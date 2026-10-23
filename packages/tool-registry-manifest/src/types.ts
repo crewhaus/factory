@@ -53,6 +53,10 @@ export type RegistryOperativeArg = {
   readonly secretRef?: true;
   /** Where the tool takes a value from: a deny or ask reads it, an allow need not. */
   readonly source?: true;
+  /** For a `path`: the tool only reads it (the runtime-state floor leaves it out); every rule still reads it. */
+  readonly reads?: true;
+  /** For a `path`: the top-level field whose presence makes the tool only read this one. */
+  readonly readsWhen?: string;
 };
 
 export type RegistryEntry = {
@@ -169,6 +173,8 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.shell === true ? { shell: true as const } : {}),
     ...(arg.secretRef === true ? { secretRef: true as const } : {}),
     ...(arg.source === true ? { source: true as const } : {}),
+    ...(arg.reads === true ? { reads: true as const } : {}),
+    ...(arg.readsWhen !== undefined ? { readsWhen: arg.readsWhen } : {}),
   };
 }
 

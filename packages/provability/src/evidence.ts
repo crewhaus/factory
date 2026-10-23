@@ -22,7 +22,15 @@ import { classifyDefinition, contentTokens, coverage } from "@crewhaus/claim-led
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_ROOT_DIR, openEventLog } from "@crewhaus/event-log";
 import { openForReadSync } from "@crewhaus/tool-safety/fs";
-import { FETCH, READ, RETRIEVE, WEB_FETCH, builtinKey, isMcpTool } from "./builtins";
+import {
+  FETCH,
+  PROVABILITY_PREFLIGHT,
+  READ,
+  RETRIEVE,
+  WEB_FETCH,
+  builtinKey,
+  isMcpTool,
+} from "./builtins";
 import { type PathRoots, doiUrl, normalizePath, normalizeUrl } from "./origin";
 import type { EvidenceIndex, EvidenceRecord } from "./types";
 
@@ -295,17 +303,26 @@ function readerOrigins(
 }
 
 /**
- * Origins a call's input names. A builtin names one only when it is a
- * reader (`READERS`). Any other tool — an MCP server's or a plugin's,
- * whose flags the gate cannot see — by its URL fields, then its path
- * fields; whether its result is then an echo of that input rather than a
- * body is `echoesInput`'s question.
+ * Origins a call's input names (design §5.2: the bodies the run READ). A
+ * builtin names one only when it is a reader (`READERS`). An MCP server's
+ * tool (`isMcpTool`) — a fetcher or a file server whose flags the gate
+ * cannot see — by its URL fields, then its path fields; whether its result
+ * is then an echo of that input rather than a body is `echoesInput`'s
+ * question. Any other tool names none: the runtime's own non-builtins
+ * return MODEL output — `Task` a sub-agent's final message, `Consult` and
+ * `Escalate` a sibling model's reply, `Skill` a skill body, the memory,
+ * plan and goal tools what a model stored (design §8: child returns are
+ * inputs) — and their schemas strip a key they do not declare without
+ * refusing it, so a `url` the model adds to a `Recall` reaches the log
+ * whole. Read as an origin, it put a remembered sentence, or a child's
+ * wrong summary, under a page nobody fetched. A plugin's tool falls here
+ * too: fail closed, it grounds nothing by what its input names.
  */
 function inputOrigins(toolName: string, input: unknown, roots: PathRoots): string[] {
   if (!isRecordObject(input)) return [];
   const reader = READERS[toolName];
   if (reader !== undefined) return readerOrigins(reader, toolName, input, roots);
-  if (builtinKey(toolName) !== undefined) return [];
+  if (builtinKey(toolName) !== undefined || !isMcpTool(toolName)) return [];
   return namedOrigins(input, roots).map((named) => named.origin);
 }
 
@@ -338,10 +355,57 @@ export function isReader(toolName: string): boolean {
 }
 
 /**
- * The input strings a call names its origins by (`inputOrigins`), as
- * written: the URL or path it was pointed at, not text it was handed — a
- * builtin reader's one declared field, any other non-builtin's URL and path
- * fields. `grounded`'s echo test (verify.ts `echoCheck`) reads these apart
+ * Input fields a call that writes may name a place by: the one it writes
+ * (`Write`'s and `Edit`'s `path`, `CopyPath`'s `destination`, a PUT's
+ * `url`) and the one it copies or moves from (`source`).
+ */
+const WRITE_FIELDS = [
+  ...URL_FIELDS,
+  ...PATH_FIELDS,
+  "source",
+  "destination",
+  "dest",
+  "target",
+  "from",
+  "to",
+  "src",
+  "output",
+  "outputPath",
+  "output_path",
+] as const;
+
+/**
+ * The origins a call may have WRITTEN — or copied or moved between — as its
+ * input names them, normalized like a citation's (verify.ts `writtenBy`
+ * reads them: a source the run wrote itself and then read back). Any tool's
+ * input, builtin or not, by {@link WRITE_FIELDS}; none for a call that only
+ * reads — a builtin reader (`WebFetch`, `Read`, a GET or HEAD `Fetch`) and
+ * `ProvabilityPreflight`, which writes nowhere. Whether the tool can write
+ * at all (a pure tool cannot) is the caller's question.
+ */
+export function writtenOrigins(toolName: string, input: unknown, roots: PathRoots = {}): string[] {
+  if (!isRecordObject(input) || toolName === PROVABILITY_PREFLIGHT) return [];
+  if (toolName === FETCH ? fetchReads(input) : isReader(toolName)) return [];
+  const out: string[] = [];
+  for (const field of WRITE_FIELDS) {
+    const value = input[field];
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    const origin = /^https?:\/\//i.test(trimmed)
+      ? normalizeUrl(trimmed)
+      : normalizePath(trimmed, roots);
+    if (origin !== undefined && !out.includes(origin)) out.push(origin);
+  }
+  return out;
+}
+
+/**
+ * The input strings a call names its origins by, as written: the URL or
+ * path it was pointed at, not text it was handed — a builtin reader's one
+ * declared field, any other non-builtin's URL and path fields (what
+ * `inputOrigins` reads off an MCP tool, and the address a record built
+ * outside the log was fetched under — the research crawler's carry their
+ * own origins). `grounded`'s echo test (verify.ts `echoCheck`) reads these apart
  * from the call's other strings, because a URL's slug can spell a claim the
  * page itself states — a reader returns the page, not its address — and
  * only a body that PRINTS the address (a 404 page repeating the path it was
@@ -534,9 +598,26 @@ function resultHits(
 }
 
 /**
+ * The URL a record's body was served from, where the fetcher says so: the
+ * final URL a WebFetch header names on its first line, after any redirect
+ * (design §5.2), normalized. `undefined` for any other record — its body is
+ * what its origins name. A citation of the requested URL grounds in a body
+ * this URL served, so the host checks that hold a redirect hop (`sources.deny`,
+ * the private-address rule) and `grounded.independent` read the body by
+ * this (verify.ts `grounded`).
+ */
+export function servedFrom(
+  record: Pick<EvidenceRecord, "toolName" | "content" | "body">,
+): string | undefined {
+  if (record.toolName !== WEB_FETCH) return undefined;
+  const header = webFetchHeader(record.body ?? record.content);
+  return header !== undefined ? normalizeUrl(header.url) : undefined;
+}
+
+/**
  * One call as an evidence record: its origins read off the input — a
  * builtin reader's one field (WebFetch's and Fetch's `url`, Read's `path`),
- * or any other tool's `url`, `uri`, `href`, `file_path`, `path`, `file`,
+ * or an MCP tool's `url`, `uri`, `href`, `file_path`, `path`, `file`,
  * `filePath` unless its result is an echo of its input (`inputOrigins`,
  * `echoesInput`) — and the URL a WebFetch result's header names on its
  * first line (indexed BESIDE the requested URL, so that once tool-web
@@ -557,8 +638,8 @@ export function recordFromCall(call: ToolCall, opts: EvidenceOptions = {}): Evid
   };
   const text = call.body ?? call.content;
   const named = inputOrigins(call.toolName, call.input, roots);
-  // A tool that names an origin but is not a reader the gate knows returns
-  // whatever it returns; when that is its own input, it read nothing.
+  // An MCP tool that names an origin returns whatever it returns; when that
+  // is its own input, it read nothing.
   const origins =
     named.length > 0 && READERS[call.toolName] === undefined && echoesInput(text, call.input)
       ? []
@@ -938,31 +1019,108 @@ function hitView(record: EvidenceRecord, hit: { origin: string; content: string 
   return { ...call, content: hit.content, origins: [hit.origin] };
 }
 
+export type EvidenceIndexOptions = {
+  /**
+   * The session being graded — the parent, whose sub-agents' logs the walk
+   * reads too (`evidenceFromSessionLog`). A record that names no session
+   * (the in-memory transcript's: `evidenceFromMessages` without
+   * `EvidenceOptions.sessionId`) is one of its calls, and a `tool:<id>` its
+   * calls and a child's share resolves to its own. Default: the session of
+   * the first record that names one — the log walk reads the parent first,
+   * and a parent's call (the `Task` that spawned a child) is logged before
+   * the child's bracket.
+   */
+  readonly sessionId?: string;
+};
+
+/** One call's key: its session and its id, the pair that names it (design §5.2). */
+const callKey = (sessionId: string | undefined, toolUseId: string): string =>
+  `${sessionId ?? ""}\u0000${toolUseId}`;
+
+/** Did two records come from the same call: one tool, one input? */
+function sameCall(a: EvidenceRecord, b: EvidenceRecord): boolean {
+  if (a.toolName !== b.toolName) return false;
+  try {
+    return JSON.stringify(a.input) === JSON.stringify(b.input);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The index over `records`: duplicates of one call (the same `toolUseId`
- * from the log and from the transcript) merged into one, in the order each
- * call first appears. The log's record wins where the two disagree, except
- * where the log holds only runtime-core's summary of block content and the
- * transcript holds the text.
+ * The index over `records`, one record per call: a call is its session and
+ * its `toolUseId` together (design §5.2: the index is keyed per call), so
+ * the log's record and the transcript's of ONE call merge into one, in the
+ * order each call first appears, and two sessions' calls never do. The
+ * log's record wins where the two disagree, except where the log holds
+ * only runtime-core's summary of block content and the transcript holds
+ * the text.
+ *
+ * An id is unique only within a conversation: an OpenAI-compatible server
+ * numbers its calls per conversation (`functions.<name>:<n>`, see
+ * `evidenceFromSessionLog`), and every sub-agent child is a fresh one, so a
+ * parent's first fetch and its child's share an id. Merged by id alone, the
+ * two became one record — one call's body, indexed under both calls' URLs:
+ * a claim the other page contradicts grounded, and the honest one failed.
+ * A record that names no session is the parent's (see
+ * {@link EvidenceIndexOptions.sessionId}); where the parent has no call by
+ * its id, it is the twin of the one call that has its tool and its input,
+ * and otherwise a call of its own.
+ *
+ * `byToolUseId` answers a `tool:<id>` the way continuity-store's
+ * `resolveEvidence` does — the parent's call first, then a child's — and
+ * an id only several children share (and the parent does not) is
+ * ambiguous: `undefined`, with every candidate on `callsById`, so the
+ * gate says so rather than grade one sub-agent's result for another's.
  *
  * `bySource` takes a normalized origin; a raw URL is normalized for the
  * caller. Error records are indexed like any other — the verifiers reject
  * them by reason, so "fetched, but it failed" reads differently from "never
  * fetched".
  */
-export function buildEvidenceIndex(records: Iterable<EvidenceRecord>): EvidenceIndex {
-  const byId = new Map<string, EvidenceRecord>();
+export function buildEvidenceIndex(
+  records: Iterable<EvidenceRecord>,
+  opts: EvidenceIndexOptions = {},
+): EvidenceIndex {
+  const list = [...records];
+  const root = opts.sessionId ?? list.find((record) => record.sessionId !== undefined)?.sessionId;
+  const byKey = new Map<string, EvidenceRecord>();
+  /** Each id's calls, by key, in the order they first appear. */
+  const keysById = new Map<string, string[]>();
   const order: string[] = [];
-  for (const record of records) {
-    const prior = byId.get(record.toolUseId);
+  const keyFor = (record: EvidenceRecord): string => {
+    if (record.sessionId !== undefined) return callKey(record.sessionId, record.toolUseId);
+    const own = callKey(root, record.toolUseId);
+    const keys = keysById.get(record.toolUseId) ?? [];
+    if (keys.length === 0 || (keys.length === 1 && keys[0] === own)) return own;
+    const twin = keys.find((key) => sameCall(byKey.get(key) as EvidenceRecord, record));
+    // The parent's call by this id — unless the parent was guessed wrong:
+    // another session holds this very call, and the guessed one's differs.
+    if (keys.includes(own) && (twin === undefined || twin === own)) return own;
+    return twin ?? own;
+  };
+  for (const record of list) {
+    const key = keyFor(record);
+    const prior = byKey.get(key);
     if (prior === undefined) {
-      byId.set(record.toolUseId, record);
-      order.push(record.toolUseId);
+      byKey.set(key, record);
+      order.push(key);
+      const keys = keysById.get(record.toolUseId);
+      if (keys === undefined) keysById.set(record.toolUseId, [key]);
+      else keys.push(key);
     } else {
-      byId.set(record.toolUseId, mergeRecords(prior, record));
+      byKey.set(key, mergeRecords(prior, record));
     }
   }
-  const all = order.map((id) => byId.get(id) as EvidenceRecord);
+  const all = order.map((key) => byKey.get(key) as EvidenceRecord);
+  const callsOf = (toolUseId: string): EvidenceRecord[] => {
+    const keys = keysById.get(toolUseId) ?? [];
+    const own = callKey(root, toolUseId);
+    // The parent's first, then the children's in the order they ran.
+    return [...keys.filter((key) => key === own), ...keys.filter((key) => key !== own)].map(
+      (key) => byKey.get(key) as EvidenceRecord,
+    );
+  };
   const sources = new Map<string, EvidenceRecord[]>();
   const add = (origin: string, record: EvidenceRecord): void => {
     const list = sources.get(origin);
@@ -981,7 +1139,13 @@ export function buildEvidenceIndex(records: Iterable<EvidenceRecord>): EvidenceI
       return (normalized !== undefined ? sources.get(normalized) : undefined) ?? [];
     },
     byToolUseId(toolUseId: string): EvidenceRecord | undefined {
-      return byId.get(toolUseId);
+      const own = byKey.get(callKey(root, toolUseId));
+      if (own !== undefined) return own;
+      const calls = callsOf(toolUseId);
+      return calls.length === 1 ? calls[0] : undefined;
+    },
+    callsById(toolUseId: string): ReadonlyArray<EvidenceRecord> {
+      return callsOf(toolUseId);
     },
     all(): ReadonlyArray<EvidenceRecord> {
       return all;
@@ -1004,8 +1168,14 @@ export function restrictToTurns(
     bySource: (origin) => index.bySource(origin).filter(keep),
     byToolUseId: (toolUseId) => {
       const record = index.byToolUseId(toolUseId);
-      return record !== undefined && keep(record) ? record : undefined;
+      if (record !== undefined && keep(record)) return record;
+      if (index.callsById === undefined) return undefined;
+      // The id's other calls, in scope: the one left answers for it, and
+      // several stay ambiguous (`buildEvidenceIndex`).
+      const kept = index.callsById(toolUseId).filter((call) => call !== record && keep(call));
+      return kept.length === 1 ? kept[0] : undefined;
     },
+    callsById: (toolUseId) => (index.callsById?.(toolUseId) ?? []).filter(keep),
     all: () => index.all().filter(keep),
   };
 }

@@ -498,6 +498,17 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * (`alwaysAllow EnvFileUpsert(.env)` still covers `valueFrom: env:TOKEN`).
  * A tool needs one operative field that is not a source.
  *
+ * `reads: true`, for a `path`, says the tool only reads what the field names
+ * — CopyPath's and ArchiveCreate's `source`, ArchiveExtract's `archive`,
+ * ConcatFiles' `paths`, an importer's `file` — and writes somewhere another
+ * field names. Every rule reads it as it reads any operative value (an
+ * allow must still cover it: unlike `source`, it widens nothing), and the
+ * runtime-state floor, which reads only where a call WRITES, leaves it out:
+ * copying, archiving or importing a session log or a spilled result forges
+ * nothing. `readsWhen` names a top-level input field instead, for a field
+ * the tool only reads when the call names that one: SplitFile's `path`,
+ * whose parts go beside it unless `outputDir` is given.
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -528,6 +539,8 @@ export type OperativeArg = {
   readonly shell?: true;
   readonly secretRef?: true;
   readonly source?: true;
+  readonly reads?: true;
+  readonly readsWhen?: string;
 };
 
 /**

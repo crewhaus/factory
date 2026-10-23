@@ -1492,6 +1492,66 @@ provability: checked
     });
   });
 
+  describe("provability-proofcheck-asks — a headless shape whose ProofCheck would park", () => {
+    const channel = (block: string, permissions = ""): string =>
+      [
+        "name: support-bot",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+        ...(permissions !== "" ? [permissions] : []),
+        block,
+        "",
+      ].join("\n");
+    const asks = (yaml: string) =>
+      runLint(yaml, noTools).findings.filter((f) => f.rule === "provability-proofcheck-asks");
+
+    test("proven on a channel bot: the default smt checker asks, and the finding says how to allow it", () => {
+      const findings = asks(channel("provability: proven"));
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.severity).toBe("warning");
+      expect(findings[0]?.path).toBe("provability.formal.checkers");
+      expect(findings[0]?.message).toContain("before it runs the smt checker");
+      expect(findings[0]?.message).toContain("parks the turn until someone approves it");
+      expect(findings[0]?.message).toContain("alwaysAllow ProofCheck(smt)");
+      // Under ask_mode: deny the same call is refused, and the finding says so.
+      const denied = asks(channel("provability: proven", "permissions:\n  ask_mode: deny"));
+      expect(denied[0]?.message).toContain("is refused (ask_mode: deny)");
+    });
+
+    test("quiet when the sandbox checkers are allowed, when only builtin is listed, and on cli", () => {
+      expect(
+        asks(
+          channel(
+            "provability: proven",
+            'permissions:\n  rules:\n    - { type: alwaysAllow, pattern: "ProofCheck(smt)" }',
+          ),
+        ),
+      ).toEqual([]);
+      expect(
+        asks(channel("provability: { level: proven, formal: { checkers: [builtin] } }")),
+      ).toEqual([]);
+      expect(asks(cli("[read]", "provability: proven"))).toEqual([]);
+      // Below proven no ProofCheck is wired at all.
+      expect(asks(channel("provability: cited"))).toEqual([]);
+    });
+
+    test("lean4 too, each one named", () => {
+      const findings = asks(
+        channel("provability: { level: proven, formal: { checkers: [builtin, smt, lean4] } }"),
+      );
+      expect(findings[0]?.message).toContain("the smt and lean4 checker");
+      expect(findings[0]?.message).toContain("ProofCheck(smt), ProofCheck(lean4)");
+    });
+  });
+
   test("auditProvability: no block, the off shorthand and crew yield nothing", async () => {
     const { lower } = await import("@crewhaus/compiler");
     const { parseSpec } = await import("@crewhaus/spec");

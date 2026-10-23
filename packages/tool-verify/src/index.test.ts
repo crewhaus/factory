@@ -1098,6 +1098,27 @@ describe("FactCrossCheck", () => {
     expect(claim.verdict).toBe("supported");
   });
 
+  test("a figure or a negation in a spelling the reader cannot tell apart reads as the plain one", async () => {
+    // claim-ledger's fold (design §4.1: one kernel for FactCrossCheck and the
+    // gate): fullwidth digits are 4.5, and a zero-width space hides no "not".
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const fullwidth = await one(
+      `Revenue rose ${at(0xff14)}.${at(0xff15)}% in the second quarter.`,
+      ["sources/report.md"],
+    );
+    expect(fullwidth.verdict).toBe("supported");
+    const hidden = await one(`The migration did n${at(0x200b)}ot complete on schedule.`, [
+      "sources/report.md",
+    ]);
+    expect(hidden.verdict).toBe("supported");
+    const flipped = await one(`The budget was n${at(0x200b)}ot approved by the board.`, [
+      "sources/report.md",
+    ]);
+    expect(flipped.verdict).toBe("supported");
+    const dropped = await one("The migration did complete on schedule.", ["sources/report.md"]);
+    expect(dropped.verdict).toBe("polarityConflict");
+  });
+
   test("an unreadable source leaves the claim undetermined rather than unsupported", async () => {
     // The dominant failure of a checker like this: reporting "not in the
     // sources" when one of the sources was never read.

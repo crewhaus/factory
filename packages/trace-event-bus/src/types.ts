@@ -1053,6 +1053,12 @@ export type ProvabilityGradedEvent = TraceEventEnvelope & {
    * (0.8.0 additive, fix pass.)
    */
   hypotheses?: number;
+  /**
+   * Source origins whose grounding text the run wrote itself before reading
+   * it back (`ProofBundle.selfWritten`), when any — design §10's residual,
+   * surfaced. (0.8.0 additive, completeness pass.)
+   */
+  selfWritten?: number;
   /** 0 = the original answer, n = the n-th gate-triggered retry. */
   retryIndex: number;
   maxRetries: number;

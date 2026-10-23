@@ -15,14 +15,25 @@ export const READ = "Read";
 export const RETRIEVE = "Retrieve";
 /** tool-proof's checker tool: its result is the JSON report of the artifact it wrote. */
 export const PROOF_CHECK = "ProofCheck";
+/** tool-verify's claim checker: its result is a JSON verdict per claim, with the source text behind it. */
+export const FACT_CROSS_CHECK = "FactCrossCheck";
+/** tool-proof's preflight: its input is the model's draft, which it only reads (design §7). */
+export const PROVABILITY_PREFLIGHT = "ProvabilityPreflight";
 
 /**
  * Is `name` a tool an MCP server serves (`mcp__<server>__<tool>`, tool-mcp's
  * naming)? Its result is what that server returned — classified at the
- * `mcp` origin on the way in — never text the run's own model wrote. The
- * runtime's other non-builtin tools are not: `Task` returns a sub-agent's
+ * `mcp` origin on the way in, and not the runtime's own model output: the
+ * runtime's other non-builtin tools are that — `Task` returns a sub-agent's
  * final message, `Consult`/`Escalate` a sibling model's reply, `Skill` a
  * skill body, the memory, plan and goal tools what a model stored.
+ *
+ * Not "never text the model wrote", though: a server with storage (SQL, a
+ * key-value or notes store, a vector index) hands back what was written to
+ * it, by this run or an earlier one. The verifier refuses a claim whose
+ * words an MCP result carries only as text the run itself sent earlier
+ * (verify.ts `echoCheck`); rows stored by an earlier SESSION are the
+ * residual the README names.
  */
 export function isMcpTool(name: string): boolean {
   return name.startsWith("mcp__");

@@ -611,6 +611,49 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     ).toThrow(/"path" is the only place this tool names/);
   });
 
+  test("reads and readsWhen are carried on a plain path, and refused anywhere else", () => {
+    const build = (args: ReadonlyArray<Record<string, unknown>>) => () =>
+      buildTool({
+        name: "Copy",
+        description: "d",
+        inputSchema: z.object({
+          source: z.string(),
+          destination: z.string().optional(),
+          id: z.string().optional(),
+        }),
+        execute: exec,
+        operativeArgs: args as unknown as OperativeArg[],
+      });
+    expect(
+      build([
+        { field: "source", kind: "path", beneath: "all", reads: true },
+        { field: "destination", kind: "path" },
+      ])().operativeArgs,
+    ).toEqual([
+      { field: "source", kind: "path", beneath: "all", reads: true },
+      { field: "destination", kind: "path" },
+    ]);
+    expect(
+      build([
+        { field: "source", kind: "path", readsWhen: "destination" },
+        { field: "destination", kind: "path" },
+      ])().operativeArgs,
+    ).toEqual([
+      { field: "source", kind: "path", readsWhen: "destination" },
+      { field: "destination", kind: "path" },
+    ]);
+    expect(build([{ field: "id", kind: "id", reads: true }])).toThrow(/reads: only a plain "path"/);
+    expect(build([{ field: "source", kind: "path", reads: "yes" }])).toThrow(
+      /reads is either true or left out/,
+    );
+    expect(
+      build([{ field: "source", kind: "path", reads: true, readsWhen: "destination" }]),
+    ).toThrow(/declare one of reads, readsWhen/);
+    expect(build([{ field: "source", kind: "path", readsWhen: "dest ination" }])).toThrow(
+      /readsWhen must name one top-level input field/,
+    );
+  });
+
   test("shell is carried on a command, and refused anywhere else", () => {
     const build = (arg: Record<string, unknown>) => () =>
       buildTool({

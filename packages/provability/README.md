@@ -71,7 +71,9 @@ claim in a body, numbers, quotations, content-token coverage) is
 - **cited.** The marker has a definition, and the definition names something locatable: an
   `http(s)` URL or a `doi:` whose host passes `sources.allow` / `sources.deny` (deny wins; a DOI
   is checked as `doi.org`) and is not a private address, or a workspace path that stays inside the
-  workspace with every symlink followed, and exists. Free text counts only under
+  workspace with every symlink followed, and exists. A URL that puts a user name or password
+  before its host (`https://acme.example@evil.example/`) is `host_denied`: the reader would take
+  it for another site than the one it names. Free text counts only under
   `sources.bibliographic: true`, and can never be grounded. With `sources.resolve: head`, the URL
   must answer one HEAD (per URL, per call) with 2xx or 3xx. One call sends at most
   `MAX_HEAD_REQUESTS` (50) HEADs, because the answer decides how many URLs it cites, at most
@@ -93,15 +95,33 @@ claim in a body, numbers, quotations, content-token coverage) is
   is longer) and the body's digest, so the bundle stays checkable after the transcript is evicted.
   One verification reads at most `MAX_GROUNDING_TOKENS` tokens of fetched text while grounding,
   and yields to the event loop between claims; a source past the budget reaches `cited` and,
-  above it, reads `below_floor` with a detail naming the cap.
+  above it, reads `below_floor` with a detail naming the cap. A path under the harness's own
+  state (`.crewhaus/`, `.crewhaus-shared/`, and the `stateRoots` the caller names: a relocated
+  session directory, a tenant's root) is cited but never read, as the offline check never reads
+  one: a session log holds every answer verbatim, so a `Read` of it would ground the model's own
+  earlier text (`not_fetched`). The path is compared as the filesystem spells it, so
+  `.CREWHAUS/sessions/…` on a case-insensitive volume is the same log; and a `FactCrossCheck`
+  that found a claim only in such a path checks nothing at `checked` (`value_absent`). A body a redirect brought from a host `sources.deny` or the
+  private-address rule refuses does not ground the URL that led there (`host_denied`,
+  `private_address`), the rule `resolve: head` holds every hop to. `sources.allow` names what may
+  be cited, so a DOI still grounds in the publisher it resolves to.
 - **checked.** `tool:<toolUseId>` resolves to a recorded, non-error call of a tool on
-  `execution.allow`. Every number the claim states is in the result, compared as an exact
-  decimal, and every quotation is in it word for word. A claim with neither must still share
-  `grounded.coverage` of its words with the call's input and result, so an allowed tool's
-  unrelated output checks nothing. When the input alone carries the claim (a lint run over the
-  draft answer), the result must carry it too, and a result whose claim-bearing run is one of the
-  input's own strings handed back (NormalizeText of the sentence, a fact-check that repeats the
-  claim it was asked about) checks nothing. The locate kernel then reads the call for the claim, so a
+  `execution.allow`: the graded session's own call first, then a sub-agent's, and an id only
+  several sub-agents share is `tool_missing`, with a detail saying so. Every number the claim
+  states is in the result, compared as an exact decimal, and every quotation is in it word for
+  word. A claim with neither must still share `grounded.coverage` of its words with the call's
+  input and result, so an allowed tool's unrelated output checks nothing. The result is read with
+  the claim the input HANDED OVER blanked out where the tool repeats it: a run of the claim's own
+  words, stopwords included, at `grounded.coverage`, no longer than twice the claim, blanked as
+  often as the input holds it. So a figure or a word a tool only hands back (NormalizeText or
+  WrapText of the sentence) checks nothing, and when the input hands the claim over (a lint run
+  over the draft answer) the result must carry it too. A document a value is selected from does
+  not hand the claim over: JsonQuery's `["suspended"]` over `{"account":{"status":"suspended"}}`
+  checks "the account is suspended". A `FactCrossCheck` result is read by its verdict: only an
+  entry that checked this sentence and found it `supported` checks it, against the source text it
+  found; `notFound`, `polarityConflict` and `misquoted` are the check saying the source does not
+  carry it, whatever the report repeats. What stays open is a claim a tool reassembles from
+  several input strings, and a draft padded past twice the claim's length. The locate kernel then reads the call for the claim, so a
   result saying "the meetings do not overlap" (or "not one vendor is approved") does not check
   "the meetings overlap", and a number word the result does not state beside the claim's words
   is `value_absent`. A claim that states a figure has its polarity read word by word, the way
@@ -142,8 +162,9 @@ claim in a body, numbers, quotations, content-token coverage) is
   more than the proof: "no discount was applied, so the invoice total is 1,284.50 EUR" states a
   proved total, and its "no" is about a discount the proof never mentions. A negation moved to
   another word ("two of the six meetings didn't overlap" for a proof that no two overlap) is
-  another statement, and a partitive ("none of the 3 invoices is overdue") is read as denying
-  the statement it governs. The checker,
+  another statement, a partitive ("none of the 3 invoices is overdue") is read as denying
+  the statement it governs, and so is a frame that negates the whole of it ("it is not true
+  that …", "it is not the case that …": two cancel). The checker,
   the formal statement, the hypotheses the proof rests on (builtin `given` steps, SMT asserts and
   definitions) and the axioms go into the bundle beside the prose. Hypotheses are assumptions:
   they are counted in the footer, refused under `assumptions: forbid` and capped by
@@ -181,7 +202,9 @@ grounded a claim at `grounded` and above.
   `achieved: "none"`. Otherwise a threshold below 1 would pass an answer over the cap.
 - Under `grounded.independent: n` at a `grounded` floor, a claim met only through sources needs n
   distinct origins: registrable domains for URLs (a pragmatic eTLD+1, where every `*.github.io`
-  counts as one origin), the registrant prefix for DOIs, and distinct files for paths. When it
+  counts as one origin), the registrant prefix for DOIs, and distinct files for paths, each read
+  off the host that SERVED the body: a page cited directly and through a shortener that redirects
+  to it, or a DOI and its publisher's URL, is one origin. When it
   falls short, each of its `ok` source bindings keeps its rung and becomes `ok: false` with
   `not_independent`. A claim met by an execution or formal binding is met regardless.
 
@@ -203,7 +226,11 @@ through `onUnreadable`. Fewer records fails closed: a claim whose evidence was l
 throw would fail open, and every later turn of the session would be served `unverified` because
 one child's log was torn. `buildEvidenceIndex` merges the same call from the log and from the transcript
 into one record. The log's verbatim text wins, except where runtime-core logged only a summary of
-block content (`[2 text blocks, 1834 chars]`).
+block content (`[2 text blocks, 1834 chars]`). A call is its session and its id together: an
+OpenAI-compatible server numbers ids per conversation (`functions.<name>:<n>`), so a parent's
+first fetch and its child's share one, and merged they would put one page's body under the other's
+URL. A record that names no session (the transcript's) is the graded session's: pass it as
+`buildEvidenceIndex(records, { sessionId })`, or it is the first session the records name.
 
 **Origins are read off the call, and only where the result is that origin's content.** Among
 builtins, the readers do this: `WebFetch`'s and `Fetch`'s `url` (a `Fetch` only when it sends no
@@ -211,10 +238,13 @@ body, since a POST's response answers the model's own payload) and `Read`'s `pat
 builtin's `url` or `path` argument names what the tool acted on, not a body it returned. SeoLint's
 `url` is context for a canonical check while its result echoes the markup the model passed, and
 UrlParse returns the model's own URL taken apart. Indexing those would let the model's text pose
-as a page the run never read. A tool the gate cannot see into (MCP, plugin) gives origins through
-its `url`/`uri`/`href` and `file_path`/`path`/`file`/`filePath` fields, unless its result is an
-echo of its own input: a substring of one of the input's strings, or covered by the input's
-content words at 0.8. The URL a WebFetch result's header names on its first line is an origin
+as a page the run never read. An MCP server's tool, which the gate cannot see into, gives origins
+through its `url`/`uri`/`href` and `file_path`/`path`/`file`/`filePath` fields, unless its result
+is an echo of its own input: a substring of one of the input's strings, or covered by the input's
+content words at 0.8. A plugin's tool and the runtime's own non-builtins (`Task`, `Recall`,
+`Consult`, `Escalate`, `Skill`, the plan and goal tools) give none: their results are model
+output, and their schemas strip a `url` the model adds without refusing it, so the key reaches
+the log and a remembered sentence would ground a page nobody fetched (design §8). The URL a WebFetch result's header names on its first line is an origin
 too. tool-web prints the final URL there, and after a redirect a `Requested: <asked>` line
 under it (`URL: <final>`, `Requested: <asked>`, `Status: …`), so a citation of either URL
 grounds: the final one from the header, the asked one from the call's `url`. A search result carries hits,
@@ -237,7 +267,33 @@ grounded against, WebFetch's header and the `[user prompt: …]` line it prepend
 line is the model's own text, and leaving it in would let the model write the claim into `prompt`
 and then find it "in the source". Fetch's status line and headers are removed the same way. The
 residuals the design names stay. A model that writes a file and then reads it can ground a
-citation of that file.
+citation of that file, and should: the file does say it now, and an agent that sets a value and
+then reports it reports the truth. But the run is then its own source, and the bundle says so
+(design §10: the residual is surfaced, not assumed away). When a builtin reader's body grounds a
+claim, `grounded` looks for the claim's words at their tightest, word for word, in what an EARLIER
+call of the run sent to that origin: a call that may write (not a reader, not the preflight, not a
+pure tool, not one that errored) whose input names it (`path`, `url`, `destination`, …), or names
+a place a copy or move then brought here (followed back up to four steps; a directory copied whole
+maps each file beneath it). Found, the binding still grounds and carries `writtenBy: { toolUseId,
+toolName }`, the bundle counts the origin in `selfWritten`, the footer reads `1 source (1 written
+by this run)`, `provability show` names the call, `provability audit` lists it under "sources the
+run wrote itself", and `provability.claimCoverage` names it in its rationale and does not count it
+toward a sample's `expected_sources`. What stays open: text written by `Bash` or `RunCommand`
+(a command line names no place this reads), or by an earlier session.
+
+An MCP server with storage (SQL, a notes or key-value store, a vector index) hands back what was
+written to it. When `grounded` finds the claim in an MCP result, it also looks for the claim's
+words at their tightest, word for word, in what an EARLIER call of the run sent (the address a
+call was pointed at aside): found, it is the model's own text stored and read back, and the
+binding is `not_fetched`, the detail naming the call that sent it. Under a URL the call's own
+input named (`mcp__fetch__fetch {url}`) only calls to the same server count, since only its store
+can hand the text back: the draft given to `ProvabilityPreflight`, a saved report, a searched
+phrase or a comment posted to another server never come out of a page fetched over MCP. Under a
+hit the result carried (a JSON row's `url`) every call but the preflight counts: the row is
+whatever the server keeps, and a file `Write` saved is what a filesystem server reads. A page the
+run read and then summarised in its notes is still the page. A row stored before the evidence the gate is
+handed begins (by an earlier session, or under `scope: turn` an earlier turn) is the residual: no
+call in it sent the text, and closing that needs the spec to say which MCP tools return sources.
 
 A reflection padded with other text is caught where the claim is located. A SELECT that appends
 computed text or a real row to a literal, or a linter that repeats a `<title>` it was handed

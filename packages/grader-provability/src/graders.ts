@@ -206,13 +206,32 @@ function sourceGrounds(bundle: ProofBundle, b: ProofBinding, floor: ProvabilityL
   return floor === bundle.level ? b.ok : meetsFloor(b.rung, floor);
 }
 
-/** Every source origin that grounded the answer at `floor` (see {@link sourceGrounds}). */
+/**
+ * Every source origin that grounded the answer at `floor` (see
+ * {@link sourceGrounds}) in text the run did not write there itself: an
+ * expected source is one the answer was meant to READ, and a binding whose
+ * grounding text an earlier call of the run wrote to that origin
+ * (`writtenBy`, design §10) shows the run authored it instead.
+ */
 function okSourceOrigins(bundle: ProofBundle, floor: ProvabilityLevel): Set<string> {
   const out = new Set<string>();
   for (const claim of bundle.claims) {
     for (const b of claim.bindings) {
-      if (b.kind !== "source" || b.origin === undefined) continue;
+      if (b.kind !== "source" || b.origin === undefined || b.writtenBy !== undefined) continue;
       if (sourceGrounds(bundle, b, floor)) out.add(b.origin);
+    }
+  }
+  return out;
+}
+
+/** Every source origin a binding grounded in text the run wrote there itself (`writtenBy`). */
+function selfWrittenOrigins(bundle: ProofBundle): Set<string> {
+  const out = new Set<string>();
+  for (const claim of bundle.claims) {
+    for (const b of claim.bindings) {
+      if (b.kind === "source" && b.origin !== undefined && b.writtenBy !== undefined) {
+        out.add(b.origin);
+      }
     }
   }
   return out;
@@ -259,9 +278,25 @@ export const claimCoverage: Grader = async (sample, run) => {
   if (bundle.assumptions > 0) {
     parts.push(`${bundle.assumptions} ${plural(bundle.assumptions, "assumption")} excluded`);
   }
+  // Design §10: a source the run wrote itself before reading it back still
+  // grounds at the gate; the grader names it, so a sample graded on such a
+  // run says so.
+  const own = selfWrittenOrigins(bundle);
+  if (own.size > 0) {
+    parts.push(
+      `${own.size} ${plural(own.size, "source")} the run wrote itself before reading ${
+        own.size === 1 ? "it" : "them"
+      } back: ${[...own].map((o) => JSON.stringify(o)).join(", ")}`,
+    );
+  }
   if (missing.length > 0) {
     parts.push(
-      `expected source(s) not grounding the answer: ${missing.map((m) => JSON.stringify(m)).join(", ")}`,
+      `expected source(s) not grounding the answer: ${missing
+        .map(
+          (m) =>
+            `${JSON.stringify(m)}${own.has(expectedSourceKey(m)) ? " (the run wrote it itself)" : ""}`,
+        )
+        .join(", ")}`,
     );
   }
   return { passed: score >= threshold && missing.length === 0, score, rationale: parts.join("; ") };

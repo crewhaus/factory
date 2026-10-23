@@ -14,6 +14,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { wireEvaluation } from "@crewhaus/evaluation-service";
 import { provabilitySkills } from "@crewhaus/evaluation-service";
+import { openEventLog } from "@crewhaus/event-log";
 import type { IrV0 } from "@crewhaus/ir";
 import {
   type ProofArtifact,
@@ -41,6 +42,7 @@ import {
   sampleGateIr,
   sampleProofsRoot,
   standingBundleFromEvents,
+  standingBundleFromTranscript,
   wireSampleProvability,
   withGateTools,
   withProvabilityFloor,
@@ -288,6 +290,134 @@ describe("standingBundleFromEvents", () => {
     ).toBeUndefined();
     expect(standingBundleFromEvents([graded(join(dir, "junk.json"), "x")])).toBeUndefined();
     expect(standingBundleFromEvents([graded(join(dir, "shape.json"), "x")])).toBeUndefined();
+  });
+});
+
+describe("standingBundleFromTranscript — the session log's own record (a bridged channel bot)", () => {
+  const line = (payload: Record<string, unknown>): string =>
+    JSON.stringify({ ts: 1, version: 1, kind: "provability_graded", payload });
+
+  test("the LAST provability_graded line names the standing bundle, held to its hash", async () => {
+    const dir = tmp();
+    const first = await bundleOf(ANSWER, false);
+    const last = await bundleOf(ANSWER, true);
+    writeFileSync(join(dir, "turn-1.json"), JSON.stringify(first));
+    writeFileSync(join(dir, "turn-1.1.json"), JSON.stringify(last));
+    const transcript = join(dir, "transcript.jsonl");
+    writeFileSync(
+      transcript,
+      [
+        JSON.stringify({ ts: 0, version: 1, kind: "user_message", payload: { content: "q" } }),
+        line({ bundleHash: first.bundleHash, bundlePath: join(dir, "turn-1.json") }),
+        "{torn",
+        line({ bundleHash: last.bundleHash, bundlePath: join(dir, "turn-1.1.json") }),
+        "",
+      ].join("\n"),
+    );
+    expect(standingBundleFromTranscript(transcript)?.bundleHash).toBe(last.bundleHash);
+  });
+
+  test("a later pass with no persisted bundle supersedes; a forged file, a missing log or no line: undefined", async () => {
+    const dir = tmp();
+    const bundle = await bundleOf(ANSWER, false);
+    writeFileSync(join(dir, "turn-1.json"), JSON.stringify(bundle));
+    const transcript = join(dir, "transcript.jsonl");
+    writeFileSync(
+      transcript,
+      `${line({ bundleHash: bundle.bundleHash, bundlePath: join(dir, "turn-1.json") })}\n${line({ bundleHash: "sha256:x" })}\n`,
+    );
+    expect(standingBundleFromTranscript(transcript)).toBeUndefined();
+    writeFileSync(
+      join(dir, "forged.json"),
+      JSON.stringify({ ...bundle, verdict: "pass", score: 1 }),
+    );
+    writeFileSync(
+      transcript,
+      `${line({ bundleHash: bundle.bundleHash, bundlePath: join(dir, "forged.json") })}\n`,
+    );
+    expect(standingBundleFromTranscript(transcript)).toBeUndefined();
+    expect(standingBundleFromTranscript(join(dir, "nope.jsonl"))).toBeUndefined();
+    writeFileSync(transcript, "");
+    expect(standingBundleFromTranscript(transcript)).toBeUndefined();
+  });
+
+  /**
+   * An invoker shaped like the bridged channel bot's: its runtime keeps its
+   * trace events on a bus of its own, so all the runner sees is the reply
+   * and the session log the gate wrote into the sample directory.
+   */
+  const channelLike =
+    (bundle: ProofBundle, halt = false): AgentInvoker =>
+    async (req) => {
+      const bundlePath = join(
+        req.sessionRootDir,
+        ".crewhaus",
+        "proofs",
+        "support-bot",
+        "turn-1.json",
+      );
+      mkdirSync(join(req.sessionRootDir, ".crewhaus", "proofs", "support-bot"), {
+        recursive: true,
+      });
+      writeFileSync(bundlePath, JSON.stringify(bundle));
+      const log = await openEventLog(req.runContext.sessionId, { rootDir: req.sessionRootDir });
+      await log.append({ kind: "user_message", payload: { content: req.sample.input } });
+      await log.append({
+        kind: "provability_graded",
+        payload: { verdict: bundle.verdict, bundleHash: bundle.bundleHash, bundlePath },
+      });
+      await log.close();
+      if (halt) throw new Error("provability gate failed (halt)");
+      return { agentOutput: ANSWER };
+    };
+
+  test("runEval: a reply-only invoker's gated sample still gets proof.json and passing graders", async () => {
+    const outDir = join(tmp(), "run");
+    const bundle = await bundleOf(ANSWER, true);
+    const { compiled } = parseGradersConfig(
+      "graders:\n  - name: coverage\n    type: registry\n    grader: provability.claimCoverage\n",
+    );
+    const summary = await runEval({
+      ir: cliIr(),
+      dataset: { name: "d", samples: samplesOf([{ id: "s1", input: "q" }]) },
+      compiledGraders: compiled,
+      opts: {
+        outDir,
+        cwd: tmp(),
+        concurrency: 1,
+        retryErrors: false,
+        invoker: channelLike(bundle),
+      },
+    });
+    expect(JSON.parse(readFileSync(join(outDir, "s1", PROOF_FILENAME), "utf8"))).toEqual(bundle);
+    const coverage = summary.samples[0]?.grades.perGrader.find((g) => g.name === "coverage");
+    expect(coverage).toMatchObject({ passed: true, score: 1 });
+  });
+
+  test("runEval: a halted reply-only invoker's bundle is still graded", async () => {
+    const outDir = join(tmp(), "run");
+    const bundle = await bundleOf(ANSWER, false);
+    const summary = await runEval({
+      ir: cliIr(),
+      dataset: { name: "d", samples: samplesOf([{ id: "s1", input: "q" }]) },
+      compiledGraders: [],
+      opts: {
+        outDir,
+        cwd: tmp(),
+        concurrency: 1,
+        retryErrors: false,
+        provability: "grounded",
+        invoker: channelLike(bundle, true),
+      },
+    });
+    const sample = summary.samples[0];
+    expect(sample?.error).toContain("provability gate failed");
+    const proof = JSON.parse(
+      readFileSync(join(outDir, "s1", PROOF_FILENAME), "utf8"),
+    ) as ProofBundle;
+    expect(proof.verdict).toBe("fail");
+    const rung = sample?.grades.perGrader.find((g) => g.name === "provability.rungAchieved");
+    expect(rung).toMatchObject({ passed: false, score: 0.25 });
   });
 });
 

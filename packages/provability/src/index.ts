@@ -13,6 +13,7 @@ export { isProvabilityLevel, levelRank, maxRung, meetsFloor, rungOfRank } from "
 export {
   type PathRoots,
   doiUrl,
+  hasUserinfo,
   hostMatches,
   hostOf,
   isPrivateHost,
@@ -22,6 +23,7 @@ export {
   registrableDomain,
 } from "./origin";
 export {
+  type EvidenceIndexOptions,
   type EvidenceMessage,
   type EvidenceOptions,
   type SessionLogEvidenceOptions,
@@ -33,6 +35,7 @@ export {
   groundingBody,
   recordFromCall,
   restrictToTurns,
+  servedFrom,
   servesPage,
   sha256Of,
   spilledOutput,

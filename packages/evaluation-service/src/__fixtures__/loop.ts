@@ -141,6 +141,8 @@ export async function runTurn(opts: {
    * events, which never reach the returned value.
    */
   readonly onEvent?: (event: TraceEvent) => void;
+  /** Every chunk the run writes to its output, as it is written — a halted run's included. */
+  readonly onStdout?: (chunk: string) => void;
 }) {
   const runContext = createRunContext({
     logger: createLogger({ level: "error", format: "json", sink: () => {} }),
@@ -166,6 +168,7 @@ export async function runTurn(opts: {
     spinner: false,
     stdout: (s) => {
       stdout.push(s);
+      opts.onStdout?.(s);
     },
     _adapter: opts.model,
     tools: mergeGateTools(opts.tools, opts.gates),

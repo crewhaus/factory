@@ -1158,7 +1158,7 @@ function copyContained(
 export const copyPath: RegisteredTool = buildTool({
   name: "CopyPath",
   operativeArgs: [
-    { field: "source", kind: "path", beneath: "all" },
+    { field: "source", kind: "path", beneath: "all", reads: true },
     { field: "destination", kind: "path", beneath: "all" },
   ],
   description:
@@ -1650,7 +1650,7 @@ function partName(prefix: string, index: number): string {
 export const splitFile: RegisteredTool = buildTool({
   name: "SplitFile",
   operativeArgs: [
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", readsWhen: "outputDir" },
     { field: "outputDir", kind: "path", beneath: "all" },
   ],
   description:
@@ -1831,7 +1831,7 @@ export const splitFile: RegisteredTool = buildTool({
 export const concatFiles: RegisteredTool = buildTool({
   name: "ConcatFiles",
   operativeArgs: [
-    { field: "paths", kind: "path" },
+    { field: "paths", kind: "path", reads: true },
     { field: "destination", kind: "path" },
   ],
   description:
@@ -2040,7 +2040,7 @@ const timeoutField = z
 export const archiveCreate: RegisteredTool = buildTool({
   name: "ArchiveCreate",
   operativeArgs: [
-    { field: "source", kind: "path", beneath: "all" },
+    { field: "source", kind: "path", beneath: "all", reads: true },
     { field: "output", kind: "path" },
   ],
   description:
@@ -2171,7 +2171,7 @@ export function _setExtractCommandForTest(
 export const archiveExtract: RegisteredTool = buildTool({
   name: "ArchiveExtract",
   operativeArgs: [
-    { field: "archive", kind: "path" },
+    { field: "archive", kind: "path", reads: true },
     { field: "destination", kind: "path", beneath: "all" },
   ],
   description:

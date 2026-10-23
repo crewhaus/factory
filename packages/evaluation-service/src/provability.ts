@@ -49,7 +49,7 @@ import {
   verifyDocument,
 } from "@crewhaus/provability";
 import type { ProvabilityTurn, RunProvability } from "@crewhaus/runtime-core";
-import { proofRecheck, tenantRootOf } from "@crewhaus/tool-proof";
+import { proofRecheck, runtimeStateRoots, tenantRootOf } from "@crewhaus/tool-proof";
 import { provabilitySkillText } from "./child-skill";
 import { gateEvidence } from "./evidence";
 import {
@@ -75,6 +75,8 @@ export type ProvabilityGateOptions = {
   readonly sessionRootDir?: string;
   /** Where the rendered bundle goes (`RunProvability.footerTarget`). */
   readonly footerTarget?: "stream" | "reply" | "none";
+  /** The turn streams to its reader whatever `footerTarget` says (`RunProvability.streamed`). */
+  readonly streamed?: boolean;
   /**
    * The HEAD request behind `sources.resolve: head` (default: tool-fetch's
    * `guardedHead`). `signal` aborts when the verifier's HEAD deadline
@@ -243,6 +245,16 @@ export function buildRunProvability(
       evidence,
       workspaceRoot: cwd,
       artifacts: createFileArtifactStore({ rootDir: proofs }),
+      // Where this run keeps its own record beyond the workspace's
+      // `.crewhaus/`: a relocated session root, the proofs root, the
+      // tenant's roots, the env relocations. A path under one is the model's
+      // own text, never a source; the preflight reads the same list.
+      stateRoots: runtimeStateRoots({
+        workspaceRoot: cwd,
+        proofsRoot: proofs,
+        ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+        ...(tenant !== undefined ? { tenant } : {}),
+      }),
       retryIndex: turn.retryIndex,
       ...(opts.headDeadlineMs !== undefined ? { headDeadlineMs: opts.headDeadlineMs } : {}),
       ...(opts.catalog !== undefined ? { replay, isPureTool } : {}),
@@ -311,6 +323,7 @@ export function buildRunProvability(
     ...(config.escalateTo !== undefined ? { escalateTo: config.escalateTo } : {}),
     render: config.render,
     ...(opts.footerTarget !== undefined ? { footerTarget: opts.footerTarget } : {}),
+    ...(opts.streamed !== undefined ? { streamed: opts.streamed } : {}),
     verify,
     ...(renderBundle !== undefined ? { renderBundle } : {}),
     nudge: renderNudge,

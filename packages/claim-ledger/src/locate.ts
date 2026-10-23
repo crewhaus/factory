@@ -29,6 +29,7 @@
  * because the question here is "does the source say these words", not "is
  * this about the same thing".
  */
+import { foldText } from "./fold";
 import {
   type CompoundValue,
   compoundValues,
@@ -163,14 +164,19 @@ const STOPWORDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Curly quotes folded to straight ones, one character for one character.
+ * Curly quotes folded to straight ones, and every other spelling the reader
+ * cannot tell apart folded to one (`fold.ts`): a digit of any script to its
+ * ASCII digit, fullwidth and mathematical letters to ASCII, a Cyrillic or
+ * Greek lookalike inside a Latin word to its Latin letter, and an ignorable
+ * character out of the word it hides in — so "n\u200Bot" is a negation and
+ * "٣٠" a figure on both sides of a comparison (design §6.2, §6.4).
  *
- * The 1:1 rule is load-bearing: every offset in the index is an offset into
- * the folded text, so a fold that changed a length would move every excerpt
- * and line number after it.
+ * One character for one character. The 1:1 rule is load-bearing: every
+ * offset in the index is an offset into the folded text, so a fold that
+ * changed a length would move every excerpt and line number after it.
  */
 export function foldTypography(text: string): string {
-  return text.replace(/[‘’‛]/g, "'").replace(/[“”„‟]/g, '"');
+  return foldText(text);
 }
 
 /**
@@ -225,7 +231,7 @@ export function claimWords(text: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const token of tokenize(foldTypography(text))) {
-    if (STOPWORDS.has(token.norm)) continue;
+    if (STOPWORDS.has(token.norm) || SCRIPT_MARK.test(token.norm)) continue;
     if (seen.has(token.norm)) continue;
     seen.add(token.norm);
     out.push(token.norm);
@@ -936,6 +942,18 @@ export function locateQuotes(
 // ---------------------------------------------------------------------------
 // Figures: the words a claim must never lose.
 
+/** A word opening with a numeral of any kind, `\p{N}`. */
+const NUMERAL_LED = /^\p{N}/u;
+
+/**
+ * A word that is nothing but superscript or subscript digits: a footnote
+ * mark or an exponent the fold left as written, because it does not stand
+ * where a number would ("…of purchase.¹", "(see ²)", `fold.ts`). It states
+ * no figure and is no word of the claim's: read as one, "…within 30 days of
+ * purchase.¹" asked the source for a "¹" it has no reason to hold.
+ */
+const SCRIPT_MARK = /^[\u2070\u00b9\u00b2\u00b3\u2074-\u2079\u2080-\u2089]+$/u;
+
 /**
  * What a figure is compared as, or null for a word that states none.
  *
@@ -946,7 +964,11 @@ export function locateQuotes(
  * will not read (`1,5`, `1.2.3`) is compared as written. A cardinal word is
  * its value (`thirty` is `30`); an ordinal and `half` are compared as
  * spelled (`figureWord`). A signed numeral, as the figure rule reports one
- * missing (`-500`, `−3%`), is its key with the sign.
+ * missing (`-500`, `−3%`), is its key with the sign. A word that opens with
+ * a numeral no fold reads as digits — a circled `㉚`, a fraction `½`, a
+ * superscript glued to a number — is a figure compared as written: what
+ * value it states is a guess, and leaving it out let it go under the bar
+ * as an ordinary word (design §6.2, acceptance A).
  */
 export function figureKey(word: string): string | null {
   if (/^[-−]\d/.test(word)) return negative(figureKey(word.slice(1)) as string);
@@ -956,6 +978,7 @@ export function figureKey(word: string): string | null {
     if (value === null) return word;
     return percent ? `${value}%` : value;
   }
+  if (NUMERAL_LED.test(word)) return SCRIPT_MARK.test(word) ? null : word;
   return figureWord(word)?.key ?? null;
 }
 
@@ -1000,6 +1023,7 @@ function figureKeyAt(text: string, tokens: ReadonlyArray<SourceToken>, i: number
     const magnitude = magnitudeSuffix(token.norm);
     if (magnitude !== null) return magnitude;
   }
+  if (NUMERAL_LED.test(token.norm)) return SCRIPT_MARK.test(token.norm) ? null : token.norm;
   return figureWord(token.norm)?.key ?? null;
 }
 

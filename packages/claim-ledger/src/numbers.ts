@@ -34,16 +34,23 @@
  *   writes `1e-7` for 0.0000001). A value whose decimal form would run past
  *   40 characters is written `d.ddde±n` instead, the same way on both sides
  *   of a comparison, so `1e300` costs what it is written in.
- * - Years are numbers like any other: `2024` is `2024`. Only ASCII digits
- *   are read.
+ * - Years are numbers like any other: `2024` is `2024`. A digit of any
+ *   script is the digit it is (`fold.ts`): `٣٠`, `３０` and `𝟑𝟎` are 30, and
+ *   `٩٩٩٫٩٩` is 999.99 — read as ASCII digits only, a claim written in them
+ *   stated no value, and was contained in any result (design §6.3, §0-B).
  * - An ISO date and a time of day are values of their own besides their
  *   parts (`compoundValues`): `2025-04-03` states 2025, 4 and 3, and the date
  *   `2025-04-03`, so a claim of `2025-03-04` is not contained in a result
  *   that says `2025-04-03`, though every part is. Only the shapes that need
  *   no guess: `YYYY-MM-DD`, and `H:MM` or `HH:MM` with optional seconds. A
  *   slash date is either locale's, `3:1` is a ratio or a score, and `10-20`
- *   a range; their parts are read, and nothing whole.
+ *   a range; their parts are read, and nothing whole. A range or an interval
+ *   of two such values states both ends whole: `10:00-11:30` states 11:30,
+ *   and `2025-04-01/2025-04-30` both dates. A UTC offset is not a time of
+ *   day: the `-05:00` of `2025-04-03T09:00:00-05:00` states no 5:00.
  */
+import { foldText } from "./fold";
+
 /** A character a number may not be glued to in front: then it is part of a word. */
 const WORD_CHAR = /[\p{L}\p{N}_]/u;
 
@@ -150,22 +157,69 @@ function* scanNumbers(text: string): Generator<string> {
   }
 }
 
-/** An ISO date: four digits, two, two, not running on into more digits. */
-const ISO_DATE = /(\d{4})-(\d{2})-(\d{2})(?!\d|[-:./]\d)/g;
+/** An ISO date: four digits, two, two (what may follow it is read by `endsDate`). */
+const ISO_DATE = /(\d{4})-(\d{2})-(\d{2})/g;
 /** A time of day, `H:MM` or `HH:MM`, seconds optional, not running on. */
 const TIME_OF_DAY = /(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d|:\d)/g;
 /** What a date or a time may not follow: then it is inside a word, a
  *  version, a path or a longer run (read here, not by a lookbehind, so the
- *  patterns stay ones tool-verify's regex-work model reads). */
+ *  patterns stay ones tool-verify's regex-work model reads) — unless it is
+ *  the second end of a range or an interval (`opensCompound`). */
 const COMPOUND_JOINER = /^[.:/-]$/;
+/** What joins the two ends of a range or an interval: `10:00-11:30`,
+ *  `9:00/17:00`, `2025-04-01/2025-04-30`. */
+const RANGE_JOINER = /^[-/]$/;
+/** An interval's second end after a date: a joiner and a whole ISO date. */
+const NEXT_DATE = /^[-/]\d{4}-\d{2}-\d{2}(?!\d)/;
+/** The ISO date a datetime's time follows across one space (`2025-04-03 10:00:00`). */
+const DATE_BEFORE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** May a date or a time start at `at`? Not glued to a word or a joiner —
- *  except a time right after an ISO date's `T` (`2025-04-03T10:30`). */
-function opensCompound(text: string, at: number, time: boolean): boolean {
+/**
+ * Does the date that ends at `end` end there, rather than run on into more
+ * digits (`2025-04-012`, `2025-04-03-1`, `2025-04-03.5`)? A joiner and a
+ * whole date after it is an interval, and both its ends are dates.
+ */
+function endsDate(text: string, end: number): boolean {
+  const next = text[end];
+  if (next === undefined) return true;
+  if (/\d/.test(next)) return false;
+  if (!/[-:./]/.test(next) || !/\d/.test(text[end + 1] ?? "")) return true;
+  return NEXT_DATE.test(text.slice(end, end + 12));
+}
+
+/** The last date or time read, for the end of a range after it. */
+type Previous = { readonly end: number; readonly anchored: boolean } | undefined;
+
+/**
+ * May a date or a time start at `at`? Not glued to a word or a joiner —
+ * except a time right after an ISO date's `T` (`2025-04-03T10:30`), and the
+ * second end of a range or an interval: a value of the same kind ending at
+ * the joiner before it (`10:00-11:30`, `2025-04-01/2025-04-30`), whose end
+ * was read whole until a range read it only by its parts (the review's I14).
+ * A time after a `-` or a `+` that follows a datetime's time is its UTC
+ * offset, not a time of day: `2025-04-03T09:00:00-05:00` states no 5:00.
+ */
+function opensCompound(text: string, at: number, time: boolean, previous: Previous): boolean {
   if (at === 0) return true;
   const before = text[at - 1] as string;
   if (time && before === "T" && at >= 2 && /\d/.test(text[at - 2] as string)) return true;
+  const joined = previous !== undefined && previous.end === at - 1;
+  if (time && joined && previous.anchored && (before === "-" || before === "+")) return false;
+  if (joined && RANGE_JOINER.test(before)) return true;
   return !WORD_CHAR.test(before) && !COMPOUND_JOINER.test(before);
+}
+
+/**
+ * Is the time at `at` a datetime's — after an ISO date's `T`, or after a
+ * date and one space with seconds (`2025-04-03 10:00:00`, how a timestamp
+ * prints)? A `-HH:MM` after such a time is its offset. Without the seconds,
+ * "2025-04-03 10:00-11:30" is a day's range, and both its ends are read.
+ */
+function anchoredTime(text: string, at: number, seconds: boolean): boolean {
+  if (at >= 2 && text[at - 1] === "T" && /\d/.test(text[at - 2] as string)) return true;
+  return (
+    seconds && text[at - 1] === " " && at >= 11 && DATE_BEFORE.test(text.slice(at - 11, at - 1))
+  );
 }
 
 /** A value stated whole: where it is written in the text, and its key. */
@@ -187,27 +241,33 @@ export type CompoundValue = {
  * is their order, so a day and a month swapped, or a time put together from
  * the hour of one and the minutes of another ("10:30" from "10:00 … 18:30"),
  * is a value the text does not state. Out-of-range parts (`2025-13-40`,
- * `25:61`) are not a date or a time, and are left as their numbers.
+ * `25:61`) are not a date or a time, and are left as their numbers. Both
+ * ends of a range or an interval are values (`opensCompound`). Offsets are
+ * into `text` (folded one for one, `fold.ts`).
  */
 export function compoundValues(text: string): CompoundValue[] {
+  return compoundsIn(foldText(text));
+}
+
+function compoundsIn(text: string): CompoundValue[] {
   const out: CompoundValue[] = [];
+  let previous: Previous;
   for (const m of text.matchAll(ISO_DATE)) {
     const at = m.index as number;
+    const end = at + m[0].length;
     const month = Number(m[2]);
     const day = Number(m[3]);
-    if (!opensCompound(text, at, false) || month < 1 || month > 12 || day < 1 || day > 31) continue;
-    out.push({
-      at,
-      end: at + m[0].length,
-      key: m[0],
-      parts: [String(Number(m[1])), `${month}`, `${day}`],
-    });
+    if (!endsDate(text, end) || !opensCompound(text, at, false, previous)) continue;
+    if (month < 1 || month > 12 || day < 1 || day > 31) continue;
+    out.push({ at, end, key: m[0], parts: [String(Number(m[1])), `${month}`, `${day}`] });
+    previous = { end, anchored: false };
   }
+  previous = undefined;
   for (const m of text.matchAll(TIME_OF_DAY)) {
     const at = m.index as number;
     const hour = Number(m[1]);
     const seconds = m[3];
-    if (!opensCompound(text, at, true)) continue;
+    if (!opensCompound(text, at, true, previous)) continue;
     if (hour > 23 || Number(m[2]) > 59 || (seconds !== undefined && Number(seconds) > 59)) continue;
     const key = `${hour}:${m[2]}${seconds === undefined || seconds === "00" ? "" : `:${seconds}`}`;
     const parts = [
@@ -215,7 +275,9 @@ export function compoundValues(text: string): CompoundValue[] {
       `${Number(m[2])}`,
       ...(seconds === undefined ? [] : [`${Number(seconds)}`]),
     ];
-    out.push({ at, end: at + m[0].length, key, parts });
+    const end = at + m[0].length;
+    out.push({ at, end, key, parts });
+    previous = { end, anchored: anchoredTime(text, at, seconds !== undefined) };
   }
   return out.sort((a, b) => a.at - b.at);
 }
@@ -226,11 +288,13 @@ export function compoundValues(text: string): CompoundValue[] {
  * with its parts and whole (`compoundValues`): `"The total is $1,284.50, up
  * 12%"` → `["1284.5", "12"]`, `"due 2025-04-03"` → `["2025", "4", "3",
  * "2025-04-03"]`. Pass a claim's `text` (markers stripped), not its `raw`:
- * `[1]` is a citation, not a figure.
+ * `[1]` is a citation, not a figure. A digit of any script is read
+ * (`fold.ts`): `"١٢٨٤٫٥"` → `["1284.5"]`.
  */
 export function extractNumbers(text: string): string[] {
-  const compounds = compoundValues(text).flatMap(({ key, parts }) => [...parts, key]);
-  return [...new Set([...scanNumbers(text), ...compounds])];
+  const folded = foldText(text);
+  const compounds = compoundsIn(folded).flatMap(({ key, parts }) => [...parts, key]);
+  return [...new Set([...scanNumbers(folded), ...compounds])];
 }
 
 /**
@@ -240,9 +304,9 @@ export function extractNumbers(text: string): string[] {
  * `"9:05"`).
  */
 export function normalizeNumber(written: string): string | null {
-  const trimmed = written.trim();
+  const trimmed = foldText(written).trim();
   if (trimmed.includes("-") || trimmed.includes(":")) {
-    const [whole] = compoundValues(trimmed);
+    const [whole] = compoundsIn(trimmed);
     if (whole !== undefined && whole.at === 0 && whole.end === trimmed.length) return whole.key;
   }
   const found = [...scanNumbers(trimmed)];
@@ -262,10 +326,9 @@ export function containsValue(haystack: string | ReadonlySet<string>, value: str
   const wanted = normalizeNumber(value);
   if (wanted === null) return false;
   if (typeof haystack !== "string") return haystack.has(wanted);
-  for (const found of scanNumbers(haystack)) if (found === wanted) return true;
-  return compoundValues(haystack).some(
-    ({ key, parts }) => key === wanted || parts.includes(wanted),
-  );
+  const folded = foldText(haystack);
+  for (const found of scanNumbers(folded)) if (found === wanted) return true;
+  return compoundsIn(folded).some(({ key, parts }) => key === wanted || parts.includes(wanted));
 }
 
 /**

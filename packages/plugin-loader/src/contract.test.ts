@@ -245,9 +245,10 @@ describe("a plugin tool cannot take a crewhaus tool's name (C104)", () => {
 
   test("every name crewhaus grants by name is reserved", () => {
     // The builtin rules crewhaus seeds itself allow these by NAME; a plugin
-    // tool that took one would run under the grant.
-    const granted = BUILTIN_DEFAULT_RULES.filter((r) => r.type === "alwaysAllow").map(
-      (r) => r.pattern,
+    // tool that took one would run under the grant. A scoped grant
+    // (`ProofCheck(builtin)`) grants its tool name too, so the scope is cut.
+    const granted = BUILTIN_DEFAULT_RULES.filter((r) => r.type === "alwaysAllow").map((r) =>
+      r.pattern.replace(/\(.*$/, ""),
     );
     const names = [...granted, ...RETAINED_LOOP_TOOL_NAMES, "Consult", "Escalate", "ToolRegistry"];
     const open = names.filter((n) => reservedPluginToolNameReason(n) === undefined);

@@ -242,6 +242,30 @@ describe("provability.claimCoverage", () => {
     expect(result.rationale).toContain(`"${POLICY}"`);
   });
 
+  test("a source the run wrote itself before fetching it: named, and not an expected source read (design §10)", async () => {
+    const put = {
+      id: "toolu_put",
+      name: "HttpRequest",
+      input: { url: POLICY, method: "PUT", body: "Our refund window is 14 days from delivery." },
+      content: "HTTP 201",
+    };
+    const bundle = await bundleFor(GROUNDED_ANSWER, "grounded", [put, POLICY_FETCH]);
+    // The gate still grounds it, and says whose text it is.
+    expect(bundle.verdict).toBe("pass");
+    expect(bundle.selfWritten).toBe(1);
+    const plain = await claimCoverage(sample(), runWith(bundle));
+    expect(plain.passed).toBe(true);
+    expect(plain.rationale).toContain(
+      `1 source the run wrote itself before reading it back: "${POLICY}"`,
+    );
+    const expected = await claimCoverage(
+      sample({ provability: { expected_sources: [POLICY] } }),
+      runWith(bundle),
+    );
+    expect(expected.passed).toBe(false);
+    expect(expected.rationale).toContain(`"${POLICY}" (the run wrote it itself)`);
+  });
+
   test("assumptions are excluded from the score and counted in the rationale", async () => {
     const bundle = await bundleFor(
       `The refund window is 14 days [1]. The customer ordered after the sale ended [A1].\n\n[1]: ${POLICY}\n[A1]: assume: the order date is after the sale`,

@@ -89,6 +89,10 @@ backend, so the sandbox floor applies per checker rather than per tool.
 
 Its operative argument is `checker`, so a permission rule can scope it:
 `alwaysAllow ProofCheck(builtin)` allows the sandbox-free checker alone.
+permission-engine carries that rule as a builtin default, so a `proven`
+harness reaches its floor through the builtin checker without approval on
+every surface; `smt` and `lean4` start a container and keep the mode default
+(allow them with `alwaysAllow ProofCheck(smt)`, `ProofCheck(lean4)`).
 
 ## Reports
 

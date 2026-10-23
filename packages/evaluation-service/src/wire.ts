@@ -71,6 +71,13 @@ export type WireEvaluationDeps = {
    * answer alone). Absent ⇒ the runtime default, `"stream"`.
    */
   readonly footerTarget?: "stream" | "reply" | "none";
+  /**
+   * The reader reads the turn as it streams though the footer rides the
+   * returned text (`RunProvability.streamed`): `crewhaus run --prompt`,
+   * which prints every attempt to stdout and then the result with its
+   * footer. Absent ⇒ the runtime reads it off `footerTarget`.
+   */
+  readonly streamed?: boolean;
   /** A sandbox for the `smt` / `lean4` checkers; absent ⇒ chosen per run from what the run wires. */
   readonly sandbox?: SandboxLike;
   /**
@@ -170,6 +177,7 @@ export async function wireEvaluation(
     ...(deps.catalog !== undefined ? { catalog: deps.catalog } : {}),
     ...(deps.sessionRootDir !== undefined ? { sessionRootDir: deps.sessionRootDir } : {}),
     ...(deps.footerTarget !== undefined ? { footerTarget: deps.footerTarget } : {}),
+    ...(deps.streamed !== undefined ? { streamed: deps.streamed } : {}),
     ...(deps.resolveHead !== undefined ? { resolveHead: deps.resolveHead } : {}),
     ...(deps.headDeadlineMs !== undefined ? { headDeadlineMs: deps.headDeadlineMs } : {}),
     ...(deps.onBundle !== undefined ? { onBundle: deps.onBundle } : {}),

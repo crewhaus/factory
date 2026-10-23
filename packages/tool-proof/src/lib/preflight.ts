@@ -100,6 +100,8 @@ export async function preflightBundle(
     readonly turnNumbers?: ReadonlySet<number>;
     /** The gate's re-check of a stored proof (`recheckProof`), so the preflight reads proofs as it does. */
     readonly recheckProof?: VerifyOptions["recheckProof"];
+    /** The directories the gate refuses path sources under (`VerifyOptions.stateRoots`, `runtimeStateRoots`). */
+    readonly stateRoots?: VerifyOptions["stateRoots"];
     readonly now?: () => Date;
   },
 ): Promise<{ readonly bundle: ProofBundle; readonly notes: ReadonlyArray<string> }> {
@@ -111,6 +113,7 @@ export async function preflightBundle(
     workspaceRoot: opts.workspaceRoot,
     ...(opts.turnNumbers !== undefined ? { turnNumbers: opts.turnNumbers } : {}),
     ...(opts.recheckProof !== undefined ? { recheckProof: opts.recheckProof } : {}),
+    ...(opts.stateRoots !== undefined ? { stateRoots: opts.stateRoots } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     // Deliberately absent: replay, isPureTool, resolveHead, judgeWaiver.
   });

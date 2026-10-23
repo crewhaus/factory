@@ -5,7 +5,8 @@ description: Load before you answer — every claim in your answer is checked ag
 A proof gate checks each answer before it is served. Here the floor is
 `{{level}}`: every claim needs evidence at that rung or above. An answer
 that falls short {{on_fail}}. A claim is any sentence that states a fact or
-a number; questions, headings and code are not claims.
+a number; questions, code and section titles are not claims; a heading that
+states a value or cites a source is one.
 
 ## How to cite
 

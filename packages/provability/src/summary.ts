@@ -21,6 +21,7 @@ export function summarizeBundle(bundle: ProofBundle): ProvabilityGradedSummary {
       ? { assumptionsRefused: bundle.assumptionsRefused }
       : {}),
     ...(bundle.hypotheses !== undefined ? { hypotheses: bundle.hypotheses } : {}),
+    ...(bundle.selfWritten !== undefined ? { selfWritten: bundle.selfWritten } : {}),
     retryIndex: bundle.retryIndex,
     bundleHash: bundle.bundleHash,
     ...(bundle.judgeModel !== undefined ? { judgeModel: bundle.judgeModel } : {}),

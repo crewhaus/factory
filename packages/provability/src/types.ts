@@ -106,6 +106,18 @@ export type ProofBinding = {
   readonly replayed?: boolean;
   /** Grounded bindings: the opt-in waiver judge accepted a paraphrase miss. */
   readonly judgeWaived?: boolean;
+  /**
+   * Grounded bindings: the claim's words in the body the run read under this
+   * origin are text an EARLIER call of the run sent to it — a `Write` or an
+   * `Edit` of the file, a PUT to the URL, or one of those to a place a copy
+   * or move then brought here — and this is that call. The binding still
+   * grounds (the file does say it now: the model may have just set the value
+   * it reports), but the run is its own source: design §10's residual "a
+   * model that fetches a page it wrote itself", surfaced on every surface and
+   * by `provability audit` rather than assumed away. (0.8.0 additive,
+   * completeness pass.)
+   */
+  readonly writtenBy?: { readonly toolUseId: string; readonly toolName: string };
   /** Formal bindings: the checker id and the formal statement shown beside the prose. */
   readonly checker?: string;
   readonly statement?: string;
@@ -188,6 +200,13 @@ export type ProofBundle = {
    * origin that grounded a claim — what "N sources" beside the floor means.
    */
   readonly sources: number;
+  /**
+   * Of those, the origins whose grounding text the run wrote itself earlier
+   * in the session (`ProofBinding.writtenBy`): the footer shows them beside
+   * the sources, and `provability audit` lists them as a gaming signal.
+   * Absent when none. (0.8.0 additive, completeness pass.)
+   */
+  readonly selfWritten?: number;
   /** Bindings the waiver judge flipped. */
   readonly judgeWaived: number;
   /** 0 = the original answer, n = the n-th gate-triggered retry. */
@@ -231,6 +250,11 @@ export type ProvabilityGradedSummary = {
    * assumptions too (design §6.4, §10) — when any. (0.8.0 additive, fix pass.)
    */
   readonly hypotheses?: number;
+  /**
+   * `ProofBundle.selfWritten` — source origins whose grounding text the run
+   * wrote itself — when any. (0.8.0 additive, completeness pass.)
+   */
+  readonly selfWritten?: number;
   readonly retryIndex: number;
   readonly bundleHash: string;
   readonly judgeModel?: string;
@@ -293,8 +317,20 @@ export interface EvidenceIndex {
    *  origin (`EvidenceRecord.hits`) the record returned is a view of the call
    *  whose `content` is that hit's text and whose `origins` is `[origin]`. */
   bySource(origin: string): ReadonlyArray<EvidenceRecord>;
-  /** The record for one toolUseId, when the run made that call. */
+  /**
+   * The record for one toolUseId, when the run made that call: the graded
+   * session's own call first, then a sub-agent's. An id only several
+   * sub-agent sessions share (a provider that numbers ids per conversation)
+   * is ambiguous and answers `undefined` (see `callsById`).
+   */
   byToolUseId(toolUseId: string): EvidenceRecord | undefined;
+  /**
+   * Every call recorded under one toolUseId across the sessions the index
+   * read, the graded session's first — so a verifier can tell "no such
+   * call" from "several, and no way to tell which". Optional: an index
+   * without it reads as one call per id. (0.8.0 additive, fix pass.)
+   */
+  callsById?(toolUseId: string): ReadonlyArray<EvidenceRecord>;
   /** Every record, in the order the calls were made. */
   all(): ReadonlyArray<EvidenceRecord>;
 }
@@ -372,6 +408,17 @@ export type VerifyOptions = {
   readonly evidence: EvidenceIndex;
   /** Workspace root for path sources (default: process.cwd()). */
   readonly workspaceRoot?: string;
+  /**
+   * Directories that hold the harness's own state — the session logs, the
+   * proofs tree, spilled results, memory — wherever this run put them
+   * (absolute, or relative to `workspaceRoot`). A path source under one is
+   * never grounded: what is there is the model's own text (an
+   * `assistant_message` line is an answer verbatim). `.crewhaus/` and
+   * `.crewhaus-shared/` under the workspace are always refused; this names
+   * the rest (a relocated `CREWHAUS_SESSION_DIR`, a tenant's root). (0.8.0
+   * additive, fix pass.)
+   */
+  readonly stateRoots?: ReadonlyArray<string>;
   /** Where relative path sources are measured from (default: workspaceRoot). */
   readonly baseDir?: string;
   /** Proof artifacts for `proof:` bindings. Absent ⇒ every formal binding is `proof_missing`. */

@@ -15,7 +15,8 @@
  *                   outside plan mode, an explicit alwaysAllow
  *   runtime state — a call that is not read-only never writes inside
  *                   `EvaluateOptions.protectedRoots` (0.8.0: the session logs
- *                   and proof bundles the gates read as evidence)
+ *                   and proof bundles the gates read as evidence), nor acts
+ *                   beneath a workspace directory that holds one
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -88,8 +89,9 @@ export type ToolCallContext = {
    * .protectedRoots`): the values of the fields the call WRITES. The runtime
    * leaves out a field declared `relocates` — the store a tool works in
    * through its own format (EmitTraceEvent's namespaced `custom.*` lines,
-   * IncidentBundle's sessions it reads whole), not a file the call names.
-   * Absent ⇒ `operativeValues`.
+   * IncidentBundle's sessions it reads whole), not a file the call names —
+   * and one declared `source`, where the tool takes a value FROM (the files
+   * IndexBuild indexes). Absent ⇒ `operativeValues`.
    */
   readonly floorValues?: ReadonlyArray<OperativeValue>;
   readonly readOnly: boolean;
@@ -128,12 +130,15 @@ export type EvaluateOptions = {
    *
    * The floor reads the call's operative values, so it covers every tool that
    * names where it writes (Write, Edit, MultiEdit, the fsx writers' paths).
-   * A writer that acts BENEATH a directory it names — a tree copied, moved
-   * or extracted onto `.crewhaus` or the workspace root, a patch applied in
-   * it, the directory removed — names a place above every root, where the
-   * floor cannot tell a write that lands in one from one that does not; it
-   * leaves that call to the rules, and the tool checks its own targets
-   * against the same roots, which the runtime hands it on the bridge
+   * A writer that acts BENEATH a directory it names (`beneath`) — a tree
+   * removed, emptied, imported into, migrated, copied, moved or extracted
+   * onto it — is denied when a root lies under that directory and the
+   * directory is inside the workspace (`.crewhaus` holds `.crewhaus/sessions`:
+   * StateImport's `stateDir`, StoreMigrate's `to`). The workspace root itself
+   * is left to the rules, since a git pathspec, a patch's `cwd` or a harness
+   * directory defaults to `.` and every such call would otherwise be refused;
+   * a writer that acts beneath it checks its own targets against the same
+   * roots, which the runtime hands it on the bridge
    * (`RuntimeBridge.protectedRoots`; CopyPath, MovePath, RemovePath,
    * ArchiveExtract, GitApplyPatch). Neither can see where a shell command
    * writes: `Bash` / `RunCommand` stay a documented residual, closed only by
@@ -210,10 +215,22 @@ export const BUILTIN_BOOKKEEPING_RULES: ReadonlyArray<PermissionRule> = [
   // them, and the gate's own retry nudge tells the model to run
   // ProvabilityPreflight; on a headless surface an unruled call parks the
   // turn on the gate's bookkeeping. Both only read (the evidence, the
-  // checkers' availability). `ProofCheck` writes a proof artifact and may
-  // start a sandbox container, so it keeps the mode default.
+  // checkers' availability).
   { type: "alwaysAllow", pattern: "ProvabilityPreflight", source: "builtin" },
   { type: "alwaysAllow", pattern: "ProofCheckers", source: "builtin" },
+  // 0.8.0 (design §6.4, §7) — `ProofCheck` with the BUILTIN checker: the one
+  // way to reach the `proven` rung on a sandbox-less harness, and the path
+  // `provability: proven` steers the model to first. Unruled, every headless
+  // surface (`crewhaus run --prompt`, a channel bot, the managed gateway)
+  // parked the honest proven answer on its first proof. The builtin checker
+  // parses a certificate in a worker thread under the formal timeout — no
+  // container, no network, no process — and the one file a call writes is a
+  // new artifact under the proofs root, a place the model cannot name. The
+  // sandbox checkers (`ProofCheck(smt)`, `ProofCheck(lean4)`) start a
+  // container and keep the mode default; an operator allows them by rule
+  // (`crewhaus lint` says so on a headless shape). Like every builtin allow,
+  // a spec rule outranks it, and plan mode ignores it (the tool writes).
+  { type: "alwaysAllow", pattern: "ProofCheck(builtin)", source: "builtin" },
 ];
 
 /**
@@ -343,23 +360,45 @@ function inputStrings(input: unknown, out: string[] = [], depth = 0): string[] {
   return out;
 }
 
+/** Is this floor key a workspace-relative path strictly inside the workspace (not `.`, not above it)? */
+function insideWorkspace(key: string): boolean {
+  return key !== "." && !key.startsWith("/") && key !== ".." && !key.startsWith("../");
+}
+
 /**
- * The protected root a write lands in (see `EvaluateOptions.protectedRoots`),
- * or `undefined`. Read from the call's `path` operative values (its
+ * The protected root a call reaches (see `EvaluateOptions.protectedRoots`),
+ * and how, or `undefined`. Read from the call's `path` operative values (its
  * `floorValues` when the runtime names the written fields) — every
  * spelling the runtime's canonicaliser gives (workspace-relative and
  * absolute, symlinks followed, the name as sent), case folded where the
  * filesystem folds it — or, for a tool that declares none, from the strings
  * in its input as written. A path is caught when it IS a protected root or
- * lies under one; a directory above a root is not: a writer that acts
- * beneath it checks its own targets against the roots on the bridge
- * (`EvaluateOptions.protectedRoots`), and a shell command stays a residual.
+ * lies under one (`inside`), and a directory the call acts BENEATH (its
+ * value's `beneath` prefixes: a tree removed, emptied, imported into or
+ * migrated onto) when a root lies under it (`above`) — `.crewhaus` for the
+ * session logs at `.crewhaus/sessions`, which StateImport and StoreMigrate
+ * could otherwise fill with a forged fetch. The workspace root and what lies
+ * above it are not read that way: a git pathspec, a patch or a harness
+ * directory defaults to `.`, and every such call would be refused; a writer
+ * that acts beneath the workspace root checks its own targets against the
+ * roots on the bridge, and a shell command stays a residual. The `above`
+ * reading compares workspace-relative spellings only, so a root outside the
+ * workspace (where no in-workspace writer reaches) is read `inside` alone.
  */
-function protectedRootHit(call: ToolCallContext, opts: EvaluateOptions): string | undefined {
+function protectedRootHit(
+  call: ToolCallContext,
+  opts: EvaluateOptions,
+): { readonly root: string; readonly above?: string } | undefined {
   if (call.readOnly || opts.protectedRoots === undefined || opts.protectedRoots.length === 0) {
     return undefined;
   }
   const candidates: Array<{ readonly path: string; readonly fold: boolean }> = [];
+  /** Directories the call acts beneath, as workspace-relative keys. */
+  const walked: Array<{
+    readonly key: string;
+    readonly fold: boolean;
+    readonly opensHidden: boolean;
+  }> = [];
   const values = call.floorValues ?? call.operativeValues;
   if (values !== undefined) {
     for (const value of values) {
@@ -367,6 +406,12 @@ function protectedRootHit(call: ToolCallContext, opts: EvaluateOptions): string 
       const fold = value.caseInsensitive === true;
       for (const path of [...value.canonical, ...(value.spellings ?? [])]) {
         candidates.push({ path, fold });
+      }
+      for (const prefix of value.beneath ?? []) {
+        const key = floorKey(prefix, fold);
+        if (insideWorkspace(key)) {
+          walked.push({ key, fold, opensHidden: value.beneathSkipsHidden !== true });
+        }
       }
     }
   } else {
@@ -381,7 +426,15 @@ function protectedRootHit(call: ToolCallContext, opts: EvaluateOptions): string 
     const plain = floorKey(root, false);
     const folded = plain.toLowerCase();
     for (const { key, fold } of keys) {
-      if (liesUnder(key, fold ? folded : plain)) return root;
+      if (liesUnder(key, fold ? folded : plain)) return { root };
+    }
+    if (!insideWorkspace(plain)) continue;
+    for (const { key, fold, opensHidden } of walked) {
+      const rootKey = fold ? folded : plain;
+      if (!rootKey.startsWith(`${key}/`)) continue;
+      // A walk that skips hidden names never opens a root behind one.
+      const below = rootKey.slice(key.length + 1).split("/");
+      if (opensHidden || !below.some((name) => name.startsWith("."))) return { root, above: key };
     }
   }
   return undefined;
@@ -412,11 +465,20 @@ export function evaluateWithReason(
   if (mode === "bypass") return { decision: "allow" };
   // 0.8.0 — the runtime-state floor (`EvaluateOptions.protectedRoots`): no
   // rule, in any source, lets the agent's own tools write the record the
-  // gates read as evidence.
-  if (protectedRootHit(call, opts) !== undefined) {
+  // gates read as evidence. The reason says what the floor saw — a path
+  // inside the record, or a directory the call acts beneath that holds it —
+  // and that the tool is not read-only; it does not guess whether the call
+  // reads or writes there.
+  const floorHit = protectedRootHit(call, opts);
+  if (floorHit !== undefined) {
+    const RECORD =
+      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)";
     return {
       decision: "deny",
-      reason: `\`${call.toolName}\` would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) — no rule can allow that`,
+      reason:
+        floorHit.above !== undefined
+          ? `\`${call.toolName}\` is not read-only and acts on everything beneath \`${floorHit.above}\`, where ${RECORD} — no rule can allow that`
+          : `\`${call.toolName}\` is not read-only and names a path where ${RECORD} — no rule can allow that`,
     };
   }
   if (mode === "plan") {

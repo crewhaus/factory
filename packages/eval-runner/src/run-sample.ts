@@ -21,7 +21,11 @@ import type {
   TraceEvent,
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
-import { PROOF_FILENAME, standingBundleFromEvents } from "./provability";
+import {
+  PROOF_FILENAME,
+  standingBundleFromEvents,
+  standingBundleFromTranscript,
+} from "./provability";
 import { sampleArtifactDirName } from "./resume";
 import { foldRouteDecisions, foldServedModels } from "./routing";
 import type {
@@ -172,10 +176,16 @@ export async function runSample(args: {
 
   // 0.8.0 §9.1 — the provability gate's STANDING bundle: what the invoker
   // captured, else the file the run's last `provability_graded` event points
-  // at (an `on_fail: halt` throws before the invoker can return it). Persisted
-  // beside the transcript as proof.json and handed to the graders. A run the
-  // gate never saw writes nothing, so its artifacts are byte-identical.
-  const proof = invokerProof ?? standingBundleFromEvents(finalEvents);
+  // at (an `on_fail: halt` throws before the invoker can return it), else the
+  // one the session log's last `provability_graded` line names (a runtime
+  // entry whose own RunContext keeps its events off this bus — the bridged
+  // channel bot's runTurn). Persisted beside the transcript as proof.json and
+  // handed to the graders. A run the gate never saw writes nothing, so its
+  // artifacts are byte-identical.
+  const proof =
+    invokerProof ??
+    standingBundleFromEvents(finalEvents) ??
+    standingBundleFromTranscript(transcriptPath);
   if (proof !== undefined) {
     await Bun.write(join(sampleDir, PROOF_FILENAME), `${JSON.stringify(proof, null, 2)}\n`);
   }

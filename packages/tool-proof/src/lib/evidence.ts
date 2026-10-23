@@ -181,7 +181,10 @@ export async function sessionEvidence(opts: SessionEvidenceOptions): Promise<Ses
   };
   if (opts.scope === "session") {
     const records = await evidenceFromSessionLog({ sessionId: opts.sessionId, ...common });
-    return { index: buildEvidenceIndex(records), notes: unreadableNote(unreadable) };
+    return {
+      index: buildEvidenceIndex(records, { sessionId: opts.sessionId }),
+      notes: unreadableNote(unreadable),
+    };
   }
   const turn = await currentTurn({ sessionId: opts.sessionId, rootDir, onUnreadable });
   const own = await evidenceFromSessionLog({
@@ -199,5 +202,9 @@ export async function sessionEvidence(opts: SessionEvidenceOptions): Promise<Ses
       })),
     );
   }
-  return { index: buildEvidenceIndex(records), notes: unreadableNote(unreadable) };
+  // The parent named, so a child's call never answers the parent's id.
+  return {
+    index: buildEvidenceIndex(records, { sessionId: opts.sessionId }),
+    notes: unreadableNote(unreadable),
+  };
 }

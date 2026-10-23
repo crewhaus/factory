@@ -98,7 +98,7 @@ import {
 } from "@crewhaus/provability";
 import { createSandbox, resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import { parseSpec } from "@crewhaus/spec";
-import { validateTenantId } from "@crewhaus/tenancy";
+import { buildTenant, validateTenantId } from "@crewhaus/tenancy";
 import {
   AVAILABILITY_TIMEOUT_MS,
   type CheckerListing,
@@ -151,10 +151,11 @@ export const PROVABILITY_USAGE =
   "  check     the gate, offline, over any document: exit 0 on pass, 1 otherwise. Evidence is\n" +
   "            the session's event log (--session), a directory of fetched bodies (--evidence:\n" +
   "            each file is one body; its URL is a sidecar <file>.url or the first line\n" +
-  "            `URL: <url>`; a saved WebFetch result that echoes its `[user prompt: …]` needs\n" +
-  "            the prompt in <file>.prompt), and workspace files the document cites by path,\n" +
-  "            read directly (never the document itself, nor the harness's state: .crewhaus/,\n" +
-  "            and the session, tenants and knowledge directories wherever they live).\n" +
+  "            `URL: <url>`, plus `Requested: <url>` for a redirected WebFetch result; one\n" +
+  "            that echoes its `[user prompt: …]` needs the prompt in <file>.prompt), and\n" +
+  "            workspace files the document cites by path, read directly (never the\n" +
+  "            document itself, nor the harness's state: .crewhaus/, and the session,\n" +
+  "            tenants and knowledge directories wherever they live).\n" +
   "            Config: --spec's provability block (--level overrides its floor), else the\n" +
   "            defaults at --level. No HEAD request and no waiver judge run offline.\n" +
   "            --report grades a research report.md as its gate did: without the writer's\n" +
@@ -733,6 +734,17 @@ function bindingProblem(binding: unknown, at: string): string | undefined {
       return `${at}.${field} is not a boolean`;
     }
   }
+  const writer = binding["writtenBy"];
+  if (
+    writer !== undefined &&
+    !(
+      isObject(writer) &&
+      typeof writer["toolUseId"] === "string" &&
+      typeof writer["toolName"] === "string"
+    )
+  ) {
+    return `${at}.writtenBy is not {toolUseId, toolName}`;
+  }
   return undefined;
 }
 
@@ -753,7 +765,7 @@ export function bundleProblem(bundle: unknown): string | undefined {
   for (const field of BUNDLE_COUNTS) {
     if (!isFiniteNumber(bundle[field])) return `${field} is not a number`;
   }
-  for (const field of ["assumptionsRefused", "spentUsdMicros"]) {
+  for (const field of ["assumptionsRefused", "selfWritten", "spentUsdMicros"]) {
     if (bundle[field] !== undefined && !isFiniteNumber(bundle[field])) {
       return `${field} is not a number`;
     }
@@ -831,8 +843,14 @@ function bindingLines(b: ProofBinding): string[] {
   if (b.reason !== undefined) head.push(reasonWords(b.reason));
   if (b.replayed !== undefined) head.push(b.replayed ? "replayed" : "not replayed");
   if (b.judgeWaived === true) head.push("judge-waived");
+  if (b.writtenBy !== undefined) head.push("written by this run");
   const lines = [`     ${head.join(" · ")}`];
   if (b.origin !== undefined) lines.push(`         origin    ${b.origin}`);
+  if (b.writtenBy !== undefined) {
+    lines.push(
+      `         written   by ${b.writtenBy.toolUseId} (${b.writtenBy.toolName}), before it was read`,
+    );
+  }
   if (b.detail !== undefined) lines.push(`         why       ${b.detail}`);
   if (b.excerpt !== undefined) lines.push(`         excerpt   "${b.excerpt}"`);
   if (b.checker !== undefined) lines.push(`         checker   ${b.checker}`);
@@ -867,7 +885,11 @@ export function renderBundleLong(
     }`,
   );
   lines.push(`  achieved    ${bundle.achieved}`);
-  lines.push(`  sources     ${plural(bundle.sources, "distinct origin")}`);
+  lines.push(
+    `  sources     ${plural(bundle.sources, "distinct origin")}${
+      (bundle.selfWritten ?? 0) > 0 ? ` (${bundle.selfWritten} written by this run)` : ""
+    }`,
+  );
   // Every surface counts a proof's hypotheses as assumptions (design §6.4,
   // §10), as the footer below does.
   const hypotheses = bundle.hypotheses ?? 0;
@@ -1088,10 +1110,13 @@ export const CHECK_NOTES = {
  *   2. the file's own first line, `URL: <url>` — the line tool-web's WebFetch
  *      result opens with, so a saved WebFetch result works as is.
  *
- * A saved WebFetch result's header (`URL:`, `Status:`, `Content-Type:`, a
- * blank line) is transport, not page, and is taken off whichever names the
- * origin; when a sidecar names one URL and the header another, the file is
- * skipped — the body is the page of the one it was fetched from.
+ * A saved WebFetch result's header (`URL:`, a redirected fetch's
+ * `Requested:`, `Status:`, `Content-Type:`, a blank line) is transport, not
+ * page, and is taken off whichever names the origin. A redirected result is
+ * indexed under both URLs its header names, the one asked for and the one it
+ * landed on, as the live gate indexes it (design §5.2); when a sidecar names
+ * a URL the header does not, the file is skipped — the body is the page of
+ * the one it was fetched from.
  *
  * WebFetch prepends `[user prompt: <prompt>]` and a blank line when the call
  * carried a prompt. That is the MODEL's text, and the prompt may itself hold
@@ -1119,7 +1144,7 @@ export const CHECK_NOTES = {
  * evidence file is source evidence only.
  */
 export const EVIDENCE_DIR_LAYOUT =
-  "each file is one fetched body; its URL is a sidecar <file>.url, else the file's first line `URL: <url>`; a `[user prompt: …]` echo needs <file>.prompt";
+  "each file is one fetched body; its URL is a sidecar <file>.url, else the file's first line `URL: <url>` (a redirected WebFetch result's `Requested: <url>` too); a `[user prompt: …]` echo needs <file>.prompt";
 
 type EvidenceLoad = { readonly records: EvidenceRecord[]; readonly notes: string[] };
 
@@ -1248,9 +1273,15 @@ function promptEchoAt(body: string): number {
 
 /**
  * An evidence file read apart: the URL its first line names (`URL: <url>`),
- * whether that line opens a full WebFetch header (then `Status:` and
- * optionally `Content-Type:`, then a blank line — provability's
- * `webFetchHeader` rule), and the body after whichever it is.
+ * whether that line opens a full WebFetch header (then, when a redirect moved
+ * the fetch, `Requested: <url>`; then `Status:` and optionally
+ * `Content-Type:`, then a blank line — provability's `webFetchHeader` rule),
+ * the URL asked for when the header names one, and the body after whichever
+ * it is.
+ *
+ * tool-web prints `URL: <final>` first and `Requested: <asked>` only when the
+ * two differ. Both lines are transport: the requested URL is the MODEL's
+ * (the call's input), so it is never page text either.
  *
  * Leading BOMs are dropped first: the decoder drops only one, at byte 0, so a
  * file saved with a second one (or re-encoded) would otherwise open with
@@ -1259,6 +1290,8 @@ function promptEchoAt(body: string): number {
  */
 function readEvidenceFile(raw: string): {
   readonly lineUrl?: string;
+  /** The header's `Requested:` URL — only on a full WebFetch header. */
+  readonly requestedUrl?: string;
   readonly webFetchHeader: boolean;
   readonly body: string;
 } {
@@ -1268,10 +1301,17 @@ function readEvidenceFile(raw: string): {
   const m = /^URL:\s*(\S+)\s*$/.exec(first);
   if (m === null) return { webFetchHeader: false, body: text };
   const rest = firstEnd === -1 ? "" : text.slice(firstEnd + 1);
-  const header = /^Status: \d{3}\r?\n(?:Content-Type:[^\n]*\r?\n)?\r?\n/.exec(rest);
-  return header !== null
-    ? { lineUrl: m[1] as string, webFetchHeader: true, body: rest.slice(header[0].length) }
-    : { lineUrl: m[1] as string, webFetchHeader: false, body: rest };
+  const header =
+    /^(?:Requested:[ \t]*(\S+)[ \t]*\r?\n)?Status: \d{3}\r?\n(?:Content-Type:[^\n]*\r?\n)?\r?\n/.exec(
+      rest,
+    );
+  if (header === null) return { lineUrl: m[1] as string, webFetchHeader: false, body: rest };
+  return {
+    lineUrl: m[1] as string,
+    ...(header[1] !== undefined ? { requestedUrl: header[1] } : {}),
+    webFetchHeader: true,
+    body: rest.slice(header[0].length),
+  };
 }
 
 /** True for a sidecar, which describes a body and never is one. */
@@ -1343,6 +1383,17 @@ async function evidenceDirRecords(
     if (read.truncated)
       notes.push(`--evidence: ${rel} is over ${MAX_BODY_BYTES} bytes; its head was read`);
     const file = readEvidenceFile(read.text);
+    // A redirected result's header names the URL asked for beside the page's
+    // own: the body is indexed under both, as the live gate indexes the
+    // call's `url` beside the header's (design §5.2), so a citation of the
+    // pre-redirect URL grounds offline exactly as it did in the run.
+    const requested = file.requestedUrl !== undefined ? evidenceUrl(file.requestedUrl) : undefined;
+    if (file.requestedUrl !== undefined && requested === undefined) {
+      skip(
+        `its WebFetch header's Requested: line names "${file.requestedUrl.slice(0, 120)}", not an http(s) URL`,
+      );
+      continue;
+    }
     let url: string | undefined;
     let body = file.body;
     const urlSidecar = await sidecar(`${rel}.url`);
@@ -1353,9 +1404,16 @@ async function evidenceDirRecords(
         skip(`its sidecar names "${line.trim().slice(0, 120)}", not an http(s) URL or doi:`);
         continue;
       }
-      if (file.webFetchHeader && file.lineUrl !== undefined && !sameUrl(url, file.lineUrl)) {
+      if (
+        file.webFetchHeader &&
+        file.lineUrl !== undefined &&
+        !sameUrl(url, file.lineUrl) &&
+        (requested === undefined || !sameUrl(url, requested))
+      ) {
         skip(
-          `its sidecar names ${url} but its WebFetch header names ${file.lineUrl.slice(0, 200)} — the body is the page it was fetched from`,
+          `its sidecar names ${url} but its WebFetch header names ${file.lineUrl.slice(0, 200)}${
+            requested !== undefined ? ` (requested as ${requested.slice(0, 200)})` : ""
+          } — the body is the page it was fetched from`,
         );
         continue;
       }
@@ -1408,13 +1466,16 @@ async function evidenceDirRecords(
       skip(`it is a copy of the document — ${SELF_GROUNDING}`);
       continue;
     }
+    // Redirected: the call asked for `requested` and the header names the
+    // page it landed on — recordFromCall indexes both, as for a live call.
+    const page = requested !== undefined ? (evidenceUrl(file.lineUrl as string) ?? url) : url;
     records.push(
       recordFromCall(
         {
           toolUseId: `offline evidence ${records.length + 1}`,
           toolName: "WebFetch",
-          input: { url },
-          content: `URL: ${url}\nStatus: 200\n\n${body}`,
+          input: { url: requested ?? url },
+          content: `URL: ${page}\nStatus: 200\n\n${body}`,
           isError: false,
         },
         { workspaceRoot: cwd },
@@ -1793,10 +1854,20 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
         }`,
       );
     }
+    // A tenant's turn spills a long result under the tenant's toolResultRoot,
+    // not `.crewhaus/tool-results`, and the gate reads it back from there
+    // (evaluation-service threads `tenant.toolResultRoot`): the same root,
+    // by the tenancy rule the runtime builds it with, or a claim past the
+    // preview the log holds would ground live and fail here (design §6, §11).
+    const toolResultsRoot =
+      tenant !== undefined && rootDir === tenantSessions
+        ? buildTenant(tenant.id, { tenantsRoot: tenant.scope.root }).toolResultRoot
+        : undefined;
     const fromLog = await evidenceFromSessionLog({
       sessionId: session,
       rootDir,
       workspaceRoot: deps.cwd,
+      ...(toolResultsRoot !== undefined ? { toolResultsRoot } : {}),
       onUnreadable: (info) =>
         notes.push(`the log of ${info.sessionId} could not be read to its end: ${info.message}`),
     });
@@ -1916,11 +1987,19 @@ export type ProvabilityAudit = {
   readonly bundles: {
     /** Bundles read: every pass of every turn (a retried turn keeps each). */
     readonly count: number;
-    /** The graded turns those bundles are passes of. (0.8.0 additive, fix pass.) */
+    /**
+     * The graded turns those bundles are passes of, each read through its
+     * standing pass — its last (design §5.3). (0.8.0 additive, fix pass.)
+     */
     readonly turns: number;
     /** Bundles that exist but could not be read (malformed, refused). */
     readonly unreadable: number;
     readonly truncated: boolean;
+    /**
+     * This, `achieved`, `floors`, `claims`, `unmetReasons` and the two rates:
+     * one per graded turn, from its standing pass — the answer the gate let
+     * stand, as watch-me and advise count it. Earlier passes are {@link retried}.
+     */
     readonly verdicts: Record<ProofBundle["verdict"], number>;
     readonly achieved: RungCounts;
     readonly floors: Record<ProvabilityLevel, number>;
@@ -1933,6 +2012,18 @@ export type ProvabilityAudit = {
     readonly assumptionsRefused: number;
   };
   readonly unmetReasons: ReadonlyArray<{ readonly reason: UnmetReason; readonly count: number }>;
+  /**
+   * Every pass of a retried turn but its last: read because the failing
+   * pass a retry fixed is what the audit exists to surface (design §5.3,
+   * §10), counted apart because it is not the turn's answer — a fixed turn
+   * is never a failed one above. (0.8.0 additive, fix pass.)
+   */
+  readonly retried: {
+    readonly passes: number;
+    readonly verdicts: Record<ProofBundle["verdict"], number>;
+    readonly claims: { readonly total: number; readonly met: number; readonly unmet: number };
+    readonly unmetReasons: ReadonlyArray<{ readonly reason: UnmetReason; readonly count: number }>;
+  };
   /** Declared assumptions (accepted + refused) / claims; null with no claims. */
   readonly assumptionRate: number | null;
   readonly judgeWaivers: {
@@ -1952,6 +2043,7 @@ export type ProvabilityAudit = {
     readonly escalations: number;
     readonly judgeCostUsdMicros: number;
   };
+  /** Over every pass read, retried ones included: each entry names its bundle file. */
   readonly gaming: {
     readonly sharedEvidence: ReadonlyArray<{
       readonly bundle: string;
@@ -1972,6 +2064,19 @@ export type ProvabilityAudit = {
       readonly similarity: number;
       readonly claim: string;
     }>;
+    /**
+     * Source bindings that grounded in text the run itself wrote to that
+     * origin before reading it back (`ProofBinding.writtenBy`, design §10's
+     * "a model that fetches a page it wrote itself"). (0.8.0 additive,
+     * completeness pass.)
+     */
+    readonly selfWrittenSources: ReadonlyArray<{
+      readonly bundle: string;
+      readonly ref: string;
+      readonly origin: string;
+      readonly writtenBy: string;
+      readonly claim: string;
+    }>;
   };
 };
 
@@ -1987,10 +2092,13 @@ const clipText = (text: string, max = 160): string =>
   text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /**
- * The three gaming signals over one bundle (design §10, §11). Each is a
- * pointer for a human to look at, not a verdict — a long policy page can
- * honestly ground six unrelated claims — which is why the audit lists them
- * and never fails on them.
+ * The four gaming signals over one bundle (design §10, §11): one evidence
+ * ref bound to many unrelated claims, replay mismatches, proofs that restate
+ * the prose, and sources the run wrote itself before it read them back.
+ * Each is a pointer for a human to look at, not a verdict — a long policy
+ * page can honestly ground six unrelated claims, an agent that edits a
+ * config can honestly report what it set — which is why the audit lists
+ * them and never fails on them.
  */
 function gamingSignals(
   bundle: ProofBundle,
@@ -2012,6 +2120,15 @@ function gamingSignals(
         const group = groups.get(key) ?? { kind: b.kind, origin, claims: new Set<number>() };
         group.claims.add(claim.index);
         groups.set(key, group);
+      }
+      if (b.kind === "source" && b.writtenBy !== undefined) {
+        into.selfWrittenSources.push({
+          bundle: where,
+          ref: b.ref,
+          origin: b.origin ?? b.ref,
+          writtenBy: `${b.writtenBy.toolUseId} (${b.writtenBy.toolName})`,
+          claim: clipText(claim.text),
+        });
       }
       if (b.reason === "replay_mismatch") {
         into.replayMismatches.push({
@@ -2132,10 +2249,17 @@ export async function buildAudit(opts: {
   const notes: string[] = [];
   const dirs = allSpecDirs(opts.cwd, opts.spec, opts.tenants);
   // Every pass: a retried turn keeps the failing pass a retry fixed, and
-  // that bundle is what the audit exists to surface (design §5.3, §10).
-  const all = (await listings(dirs, { allPasses: true })).filter(
-    (l) => opts.sinceMs === undefined || l.mtimeMs >= opts.sinceMs,
-  );
+  // that bundle is what the audit's unmet reasons and gaming signals exist
+  // to surface (design §5.3, §10). But the turn's answer is its standing
+  // pass — its last — so only that one is counted as the turn; the passes
+  // before it are counted apart (`retried`). Which pass is last is read off
+  // every listing, before `--since`, so a window never promotes an earlier one.
+  const listed = await listings(dirs, { allPasses: true });
+  const turnOf = (l: Listing): string =>
+    [l.spec.root, l.sessionId, String(l.turnNumber)].join("\u0000");
+  const lastPass = new Map<string, number>();
+  for (const l of listed) lastPass.set(turnOf(l), Math.max(lastPass.get(turnOf(l)) ?? 0, l.pass));
+  const all = listed.filter((l) => opts.sinceMs === undefined || l.mtimeMs >= opts.sinceMs);
   const truncated = all.length > MAX_AUDIT_BUNDLES;
   if (truncated) {
     notes.push(`only the ${MAX_AUDIT_BUNDLES} newest of ${all.length} bundles were read`);
@@ -2145,16 +2269,37 @@ export async function buildAudit(opts: {
   const floors: Record<ProvabilityLevel, number> = { cited: 0, grounded: 0, checked: 0, proven: 0 };
   const claims = { total: 0, met: 0, unmet: 0, assumptions: 0, assumptionsRefused: 0 };
   const reasons = new Map<UnmetReason, number>();
+  const retried = {
+    passes: 0,
+    verdicts: { pass: 0, fail: 0, unverified: 0 } as Record<ProofBundle["verdict"], number>,
+    claims: { total: 0, met: 0, unmet: 0 },
+  };
+  const retriedReasons = new Map<UnmetReason, number>();
   let waived = 0;
   let okSource = 0;
   let waivedBundles = 0;
   let unreadable = 0;
   let count = 0;
-  const gaming = { sharedEvidence: [], replayMismatches: [], restatedProofs: [] } as {
+  const gaming = {
+    sharedEvidence: [],
+    replayMismatches: [],
+    restatedProofs: [],
+    selfWrittenSources: [],
+  } as {
     -readonly [K in keyof ProvabilityAudit["gaming"]]: Array<ProvabilityAudit["gaming"][K][number]>;
   };
   const sessionsWithBundles = new Set<string>();
-  const turnsRead = new Set<string>();
+  let turns = 0;
+  const reasonsOf = (bundle: ProofBundle, into: Map<UnmetReason, number>): void => {
+    for (const claim of bundle.claims) {
+      if (claim.status !== "unmet") continue;
+      for (const reason of claimReasons(claim)) into.set(reason, (into.get(reason) ?? 0) + 1);
+    }
+  };
+  const byCount = (into: ReadonlyMap<UnmetReason, number>) =>
+    [...into.entries()]
+      .map(([reason, n]) => ({ reason, count: n }))
+      .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
   for (const listing of all.slice(0, MAX_AUDIT_BUNDLES)) {
     let bundle: ProofBundle;
     try {
@@ -2175,9 +2320,17 @@ export async function buildAudit(opts: {
     }
     count += 1;
     sessionsWithBundles.add(listing.sessionId);
-    turnsRead.add(
-      [listing.spec.root, listing.sessionId, String(listing.turnNumber)].join("\u0000"),
-    );
+    gamingSignals(bundle, shown(listing.path, opts.cwd), gaming);
+    if (listing.pass < (lastPass.get(turnOf(listing)) ?? listing.pass)) {
+      retried.passes += 1;
+      retried.verdicts[bundle.verdict] += 1;
+      retried.claims.total += bundle.claimCount;
+      retried.claims.met += bundle.met;
+      retried.claims.unmet += bundle.unmet;
+      reasonsOf(bundle, retriedReasons);
+      continue;
+    }
+    turns += 1;
     verdicts[bundle.verdict] += 1;
     achieved[bundle.achieved] += 1;
     floors[bundle.level] += 1;
@@ -2190,16 +2343,14 @@ export async function buildAudit(opts: {
     if (bundle.judgeWaived > 0) waivedBundles += 1;
     for (const claim of bundle.claims) {
       for (const b of claim.bindings) if (b.kind === "source" && b.ok) okSource += 1;
-      if (claim.status !== "unmet") continue;
-      for (const reason of claimReasons(claim)) reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
     }
-    gamingSignals(bundle, shown(listing.path, opts.cwd), gaming);
+    reasonsOf(bundle, reasons);
   }
 
   // The event log: one line per gate PASS (a retried turn is several),
-  // which the bundles now match pass for pass where they were persisted —
-  // and which also counts passes whose bundle was never written (render:
-  // none, a persist that failed).
+  // which the bundles — standing and retried together — match pass for pass
+  // where they were persisted, and which also counts passes whose bundle
+  // was never written (render: none, a persist that failed).
   const markerOf = (dir: string): string => `${sep}proofs${sep}${dir}${sep}`;
   const ofSpec = (line: GradedLine, dir: string | undefined): boolean =>
     dir === undefined ||
@@ -2244,11 +2395,10 @@ export async function buildAudit(opts: {
     ...(opts.sinceMs !== undefined ? { since: new Date(opts.sinceMs).toISOString() } : {}),
     ...(opts.spec !== undefined ? { spec: opts.spec.name } : {}),
     ...(opts.tenants !== undefined ? { tenantsRoot: opts.tenants.root } : {}),
-    bundles: { count, turns: turnsRead.size, unreadable, truncated, verdicts, achieved, floors },
+    bundles: { count, turns, unreadable, truncated, verdicts, achieved, floors },
     claims,
-    unmetReasons: [...reasons.entries()]
-      .map(([reason, n]) => ({ reason, count: n }))
-      .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
+    unmetReasons: byCount(reasons),
+    retried: { ...retried, unmetReasons: byCount(retriedReasons) },
     assumptionRate: claims.total === 0 ? null : round3(declared / claims.total),
     judgeWaivers: {
       bindings: waived,
@@ -2268,15 +2418,20 @@ function rungLine(counts: RungCounts): string {
 
 export function renderAudit(audit: ProvabilityAudit, notes: readonly string[]): string {
   const b = audit.bundles;
+  const r = audit.retried;
   const lines: string[] = [
     `provability audit${audit.spec !== undefined ? ` · ${audit.spec}` : ""} · ${
       audit.since !== undefined ? `since ${audit.since}` : "all time"
     }${audit.tenantsRoot !== undefined ? ` · tenants ${audit.tenantsRoot}` : ""}`,
-    `  bundles     ${plural(b.turns, "graded turn")}${
-      b.count !== b.turns ? ` (${plural(b.count, "bundle")}: every pass of a retried turn)` : ""
-    } · ✓ ${b.verdicts.pass} pass · ✗ ${b.verdicts.fail} fail · ? ${b.verdicts.unverified} unverified${
+    `  bundles     ${plural(b.turns, "graded turn")} · ✓ ${b.verdicts.pass} pass · ✗ ${b.verdicts.fail} fail · ? ${b.verdicts.unverified} unverified${
       b.unreadable > 0 ? ` · ${b.unreadable} unreadable` : ""
     }`,
+    // Earlier passes are not the turn's answer: their own line, never the counts above.
+    ...(r.passes > 0
+      ? [
+          `  retried     ${plural(r.passes, "pass", "passes")} a retry superseded · ✓ ${r.verdicts.pass} pass · ✗ ${r.verdicts.fail} fail · ? ${r.verdicts.unverified} unverified · ${plural(r.claims.unmet, "unmet claim")}`,
+        ]
+      : []),
     `  achieved    ${rungLine(b.achieved)}`,
     `  floors      ${PROVABILITY_LEVELS.map((l) => `${l} ${b.floors[l]}`).join(" · ")}`,
     `  claims      ${audit.claims.total} · met ${audit.claims.met} · unmet ${audit.claims.unmet} · assumptions ${
@@ -2305,7 +2460,12 @@ export function renderAudit(audit: ProvabilityAudit, notes: readonly string[]): 
     "unmet reasons",
   ];
   if (audit.unmetReasons.length === 0) lines.push("  none");
-  for (const r of audit.unmetReasons) lines.push(`  ${r.reason.padEnd(22)} ${r.count}`);
+  for (const u of audit.unmetReasons) lines.push(`  ${u.reason.padEnd(22)} ${u.count}`);
+  if (r.passes > 0) {
+    lines.push("", "unmet reasons in passes a retry superseded");
+    if (r.unmetReasons.length === 0) lines.push("  none");
+    for (const u of r.unmetReasons) lines.push(`  ${u.reason.padEnd(22)} ${u.count}`);
+  }
   const g = audit.gaming;
   lines.push("", "gaming signals (pointers to review, not verdicts)");
   lines.push(`  one evidence ref bound to many unrelated claims (${g.sharedEvidence.length})`);
@@ -2323,6 +2483,10 @@ export function renderAudit(audit: ProvabilityAudit, notes: readonly string[]): 
   lines.push(`  proof statements near-identical to the prose (${g.restatedProofs.length})`);
   for (const s of g.restatedProofs) {
     lines.push(`    ${s.bundle}  ${s.artifact} (similarity ${s.similarity}): "${s.claim}"`);
+  }
+  lines.push(`  sources the run wrote itself (${g.selfWrittenSources.length})`);
+  for (const s of g.selfWrittenSources) {
+    lines.push(`    ${s.bundle}  ${s.ref} ${s.origin}, written by ${s.writtenBy}: "${s.claim}"`);
   }
   for (const note of notes) lines.push(`note: ${note}`);
   return ttyText(lines);
@@ -2604,7 +2768,12 @@ async function pruneCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
   // that manages their size (design §5.3).
   const tenants = tenantsScope(args, deps, spec);
   const dirs = allSpecDirs(deps.cwd, spec, tenants);
-  const stale = (await listings(dirs)).filter((l) => l.mtimeMs < cutoff.getTime());
+  // Every pass, as the store's prune deletes every pass (a retried turn
+  // keeps each, design §5.3): the dry run and the list printed name exactly
+  // the files that go, not only each turn's last pass.
+  const stale = (await listings(dirs, { allPasses: true })).filter(
+    (l) => l.mtimeMs < cutoff.getTime(),
+  );
   let removed = 0;
   if (!dryRun) {
     for (const dir of dirs) {

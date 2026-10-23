@@ -599,6 +599,27 @@ function checkOperativeArgs(
     }
     const { source } = arg;
     if (source !== undefined && source !== true) fail(`${at}.source is either true or left out`);
+    const { reads, readsWhen } = arg;
+    if (reads !== undefined || readsWhen !== undefined) {
+      if (reads !== undefined && reads !== true) fail(`${at}.reads is either true or left out`);
+      if (kind !== "path" || relocates !== undefined || source !== undefined) {
+        fail(
+          `${at}.reads: only a plain "path" the tool reads from (not relocates or source) is read-only to the floor`,
+        );
+      }
+      if (reads !== undefined && readsWhen !== undefined) {
+        fail(
+          `${at}.readsWhen: a field always read needs no switch; declare one of reads, readsWhen`,
+        );
+      }
+      if (
+        readsWhen !== undefined &&
+        (typeof readsWhen !== "string" || !/^[A-Za-z_$][\w$]*$/.test(readsWhen))
+      ) {
+        fail(`${at}.readsWhen must name one top-level input field, e.g. "outputDir"`);
+      }
+      if (readsWhen === field) fail(`${at}.readsWhen names "${readsWhen}", which is already used`);
+    }
     const { shell } = arg;
     if (shell !== undefined) {
       if (shell !== true) fail(`${at}.shell is either true or left out`);
@@ -663,6 +684,8 @@ function checkOperativeArgs(
         ...(shell === true ? { shell } : {}),
         ...(secretRef === true ? { secretRef } : {}),
         ...(source === true ? { source } : {}),
+        ...(reads === true ? { reads } : {}),
+        ...(readsWhen !== undefined ? { readsWhen } : {}),
       }),
     );
   }

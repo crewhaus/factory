@@ -595,6 +595,27 @@ test("StoreMigrate copies the store byte-for-byte, verifies it, and leaves the s
   expect(existsSync(path.join(src, "memories/demo.jsonl"))).toBe(true);
 }, 20_000);
 
+test("StoreMigrate never migrates onto the run's own record (0.8.0, I12)", async () => {
+  store();
+  // The run logs its sessions under a relocated root (CREWHAUS_SESSION_DIR,
+  // a tenant): a migration to the directory above it would write
+  // `logs/sessions/<id>.jsonl` straight into the live log.
+  write(`logs/sessions/${sessionId(9)}.jsonl`, '{"event":"live"}\n');
+  const rel = ["logs/sessions", ".crewhaus/tool-results", ".crewhaus/proofs"];
+  const ctx = { bridge: { protectedRoots: [...rel.map((r) => path.join(tmp, r)), ...rel] } };
+  for (const dryRun of [true, false]) {
+    const out = await storeMigrate.execute({ to: "logs", dryRun, overwrite: true }, ctx);
+    const text = typeof out === "string" ? out : JSON.stringify(out);
+    expect(`${dryRun} → ${text.includes("where the runtime keeps its own record")}`).toBe(
+      `${dryRun} → true`,
+    );
+  }
+  expect(existsSync(path.join(tmp, `logs/sessions/${sessionId(1)}.jsonl`))).toBe(false);
+  // Anywhere else is the migration it always was.
+  const moved = await storeMigrate.execute({ to: "moved", dryRun: true }, ctx);
+  expect(String(moved)).toContain('"status":"preview"');
+});
+
 test("StoreMigrate can be re-run safely over its own destination", async () => {
   store();
   const first = await callJson(storeMigrate, { to: "moved", dryRun: false });

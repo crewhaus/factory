@@ -1176,6 +1176,8 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "opens",
         "overlay",
         "prefix",
+        "reads",
+        "readsWhen",
         "relocates",
         "secretRef",
         "service",

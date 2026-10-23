@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { proofsDirName } from "@crewhaus/evaluation-service";
+import { proofsDirName, wireEvaluation } from "@crewhaus/evaluation-service";
 import { openEventLog } from "@crewhaus/event-log";
 import {
   MANAGED_TENANTS_ROOT_DEFAULT as HANGAR_MANAGED_TENANTS_ROOT_DEFAULT,
@@ -45,8 +45,10 @@ import {
   sha256Of,
   verifyDocument,
 } from "@crewhaus/provability";
+import { buildTenant, withTenant } from "@crewhaus/tenancy";
 import { moneyAdd } from "@crewhaus/tool-math";
 import { defaultProvabilityConfig } from "@crewhaus/tool-proof";
+import { _setDnsLookup, _setRawFetch, webFetch } from "@crewhaus/tool-web";
 import { PROVABILITY_SCHEMA } from "./arg-schemas";
 import {
   CHECK_NOTES,
@@ -70,6 +72,7 @@ import {
   runProvabilityCommand,
   ttySafe,
 } from "./provability-cli";
+import { usageText } from "./usage-text";
 
 /** Any C0/C1 control but the line feed the renderers join lines with. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: the assertion is that none reach the terminal
@@ -233,6 +236,35 @@ describe("dispatch", () => {
     }
     for (const action of PROVABILITY_ACTIONS)
       expect(PROVABILITY_USAGE).toContain(`provability ${action}`);
+  });
+
+  test("every flag a verb takes is in its usage and in `crewhaus --help`, and no other (§11)", async () => {
+    // What each verb takes, as its refusal of a flag it does not take lists it.
+    const takes = async (action: string): Promise<string[]> => {
+      const probe = action === "check" ? ["--dry-run"] : ["--level", "cited"];
+      const err = await run(tempDir(), [action, ...probe]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProvabilityCliError);
+      return (/\(it takes (.*)\)$/.exec((err as Error).message)?.[1] ?? "").split(", ").sort();
+    };
+    // A verb's entry: its synopsis line and the indented lines under it.
+    const entry = (text: string, head: RegExp, more: RegExp): string[] => {
+      const lines = text.split("\n");
+      const at = lines.findIndex((line) => head.test(line));
+      expect(at).toBeGreaterThanOrEqual(0);
+      const end = lines.findIndex((line, i) => i > at && !more.test(line));
+      return lines.slice(at, end === -1 ? undefined : end);
+    };
+    const flags = (lines: readonly string[]): string[] =>
+      [...new Set(lines.join("\n").match(/--[a-z][a-z-]*/g) ?? [])].sort();
+    const global = usageText();
+    for (const action of PROVABILITY_ACTIONS) {
+      const own = flags(
+        entry(PROVABILITY_USAGE, new RegExp(`crewhaus provability ${action} `), /^ {16}\[/),
+      );
+      const help = flags(entry(global, new RegExp(`^ {2}provability ${action} `), /^ {7}/));
+      const taken = await takes(action);
+      expect({ action, own, help }).toEqual({ action, own: taken, help: taken });
+    }
   });
 
   test("an unknown verb is refused, naming the verbs", async () => {
@@ -505,6 +537,103 @@ describe("provability check — evidence from a directory of fetched bodies", ()
     expect(bundle.verdict).toBe("pass");
     // The header is not body: what grounded the claim is the page text.
     expect(bundle.claims[0]?.bindings[0]?.sha256).toBe(sha256Of(`${POLICY}\n`));
+  });
+
+  test("a redirected WebFetch result grounds both the URL asked for and the page it landed on, as the live gate does (§5.2)", async () => {
+    // tool-web's own output through a 301 — `URL: <final>`, then `Requested: <asked>`.
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    _setRawFetch(async (req) =>
+      req.url === "http://acme.example/old"
+        ? new Response(null, { status: 301, headers: { location: "https://acme.example/new/" } })
+        : new Response(POLICY, { status: 200, headers: { "content-type": "text/plain" } }),
+    );
+    let saved: string;
+    try {
+      const out = await webFetch.execute(
+        webFetch.inputSchema.parse({ url: "http://acme.example/old" }),
+        {} as never,
+      );
+      saved = typeof out === "string" ? out : JSON.stringify(out);
+    } finally {
+      _setRawFetch(undefined);
+      _setDnsLookup(undefined);
+    }
+    expect(saved).toStartWith(
+      "URL: https://acme.example/new/\nRequested: http://acme.example/old\nStatus: 200\n",
+    );
+    const cwd = tempDir();
+    const ev = join(cwd, "fetched");
+    mkdirSync(ev);
+    writeFileSync(join(ev, "page.txt"), saved);
+    const live = buildEvidenceIndex([
+      recordFromCall({
+        toolUseId: "toolu_fetch1",
+        toolName: "WebFetch",
+        input: { url: "http://acme.example/old" },
+        content: saved,
+        isError: false,
+      }),
+    ]);
+    const argv = ["check", "answer.md", "--level", "grounded", "--evidence", ev, "--json"];
+    for (const url of ["http://acme.example/old", "https://acme.example/new/"]) {
+      const answer = `Customers may request a refund within 14 days of delivery [1].\n\n[1]: ${url}\n`;
+      const liveBundle = await verifyDocument(answer, {
+        config: { ...defaultProvabilityConfig(), level: "grounded" },
+        evidence: live,
+        now: () => NOW,
+      });
+      writeAnswer(cwd, answer);
+      const r = await run(cwd, argv);
+      const offline = JSON.parse(r.out) as ProofBundle;
+      expect({ url, live: liveBundle.verdict, offline: offline.verdict, code: r.code }).toEqual({
+        url,
+        live: "pass",
+        offline: "pass",
+        code: 0,
+      });
+      // Neither header line is page: the page text alone grounded the claim.
+      expect(offline.claims[0]?.bindings[0]?.sha256).toBe(sha256Of(POLICY));
+    }
+
+    // A sidecar may name either URL the header names, and no third.
+    writeFileSync(join(ev, "page.txt.url"), "http://acme.example/old\n");
+    expect((await run(cwd, argv)).code).toBe(0);
+    writeFileSync(join(ev, "page.txt.url"), "https://elsewhere.example/\n");
+    const third = await run(cwd, argv);
+    expect(third.code).toBe(1);
+    expect(third.err).toContain(
+      "skipped page.txt: its sidecar names https://elsewhere.example/ but its WebFetch header names https://acme.example/new/ (requested as http://acme.example/old)",
+    );
+    rmSync(join(ev, "page.txt.url"));
+
+    // The requested URL is the model's text: a claim spelled into it is not the page's.
+    writeFileSync(
+      join(ev, "page.txt"),
+      "URL: https://acme.example/new/\nRequested: https://acme.example/old?note=Refunds+are+accepted+within+90+days+of+purchase\nStatus: 200\nContent-Type: text/plain\n\nOur store sells shoes and hats.\n",
+    );
+    writeAnswer(
+      cwd,
+      "Refunds are accepted within 90 days of purchase [1].\n\n[1]: https://acme.example/new/\n",
+    );
+    const stuffed = await run(cwd, argv);
+    expect(stuffed.code).toBe(1);
+    expect((JSON.parse(stuffed.out) as ProofBundle).claims[0]?.bindings[0]?.reason).toBe(
+      "not_found_in_source",
+    );
+    // …and a `Requested:` that is no URL fetched is no origin: the file is skipped.
+    writeFileSync(
+      join(ev, "page.txt"),
+      `URL: https://acme.example/new/\nRequested: ftp://acme.example/old\nStatus: 200\n\n${POLICY}\n`,
+    );
+    writeAnswer(
+      cwd,
+      GOOD_ANSWER.replace("https://acme.example/policy", "https://acme.example/new/"),
+    );
+    const odd = await run(cwd, argv);
+    expect(odd.code).toBe(1);
+    expect(odd.err).toContain(
+      'skipped page.txt: its WebFetch header\'s Requested: line names "ftp://acme.example/old", not an http(s) URL',
+    );
   });
 
   test("the `[user prompt: …]` echo of a saved WebFetch result is the model's text, never the page's", async () => {
@@ -1538,7 +1667,12 @@ describe("provability audit", () => {
     expect(audit.bundles.count).toBe(0);
     expect(audit.assumptionRate).toBeNull();
     expect(audit.passes.count).toBe(0);
-    expect(audit.gaming).toEqual({ sharedEvidence: [], replayMismatches: [], restatedProofs: [] });
+    expect(audit.gaming).toEqual({
+      sharedEvidence: [],
+      replayMismatches: [],
+      restatedProofs: [],
+      selfWrittenSources: [],
+    });
   });
 
   test("rolls up verdicts, achieved rungs, floors, unmet reasons, assumptions and waivers", async () => {
@@ -1632,33 +1766,94 @@ describe("provability audit", () => {
     expect(audit.judgeWaivers).toEqual({ bindings: 1, okSourceBindings: 2, rate: 0.5, bundles: 1 });
   });
 
-  test("every pass of a retried turn is read: the failing pass a retry fixed is not left unread", async () => {
+  test("a retried turn counts once, as its standing pass; the passes a retry superseded are read apart (§5.3)", async () => {
     const cwd = tempDir();
-    await persist(cwd, "support", SESS_A, 1, {
-      ...(await gradedBundle(BAD_ANSWER, POLICY)),
-      retryIndex: 0,
-    });
-    await persist(cwd, "support", SESS_A, 1, {
-      ...(await gradedBundle(GOOD_ANSWER, POLICY)),
-      retryIndex: 1,
-    });
-    await persist(cwd, "support", SESS_A, 2, await gradedBundle(GOOD_ANSWER, POLICY));
+    // Four turns, each failing its first pass and passing the retry; one more passing at once.
+    for (const turn of [1, 2, 3, 4]) {
+      await persist(cwd, "support", SESS_A, turn, {
+        ...(await gradedBundle(BAD_ANSWER, POLICY)),
+        retryIndex: 0,
+      });
+      await persist(cwd, "support", SESS_A, turn, {
+        ...(await gradedBundle(GOOD_ANSWER, POLICY)),
+        retryIndex: 1,
+      });
+    }
+    await persist(cwd, "support", SESS_B, 1, await gradedBundle(GOOD_ANSWER, POLICY));
     const { audit } = await buildAudit({
       cwd,
       sessionRootDir: join(cwd, ".crewhaus", "sessions"),
       now: NOW,
     });
+    // The answers the gate let stand — as watch-me and advise count them: no failure.
     expect(audit.bundles).toMatchObject({
-      count: 3,
-      turns: 2,
-      verdicts: { pass: 2, fail: 1, unverified: 0 },
+      count: 9,
+      turns: 5,
+      verdicts: { pass: 5, fail: 0, unverified: 0 },
+      floors: { cited: 0, grounded: 5, checked: 0, proven: 0 },
     });
-    // The failing pass's unmet claim is read, though a retry fixed the turn.
-    expect(audit.unmetReasons).toEqual([{ reason: "not_found_in_source", count: 1 }]);
+    expect(audit.bundles.achieved).toMatchObject({ none: 0, cited: 0, grounded: 5 });
+    expect(audit.claims).toMatchObject({ total: 5, met: 5, unmet: 0 });
+    expect(audit.unmetReasons).toEqual([]);
+    // The failing passes the retries fixed are still read, and say why they failed.
+    expect(audit.retried).toEqual({
+      passes: 4,
+      verdicts: { pass: 0, fail: 4, unverified: 0 },
+      claims: { total: 4, met: 0, unmet: 4 },
+      unmetReasons: [{ reason: "not_found_in_source", count: 4 }],
+    });
     const r = await run(cwd, ["audit"]);
     expect(r.out).toContain(
-      "bundles     2 graded turns (3 bundles: every pass of a retried turn) · ✓ 2 pass · ✗ 1 fail",
+      "  bundles     5 graded turns · ✓ 5 pass · ✗ 0 fail · ? 0 unverified\n",
     );
+    expect(r.out).toContain(
+      "  retried     4 passes a retry superseded · ✓ 0 pass · ✗ 4 fail · ? 0 unverified · 4 unmet claims\n",
+    );
+    expect(r.out).toContain(
+      "unmet reasons\n  none\n\nunmet reasons in passes a retry superseded\n  not_found_in_source    4\n",
+    );
+  });
+
+  test("gaming signals read every pass: a superseded pass's replay mismatch is still listed", async () => {
+    const cwd = tempDir();
+    const mismatched = handBundle({
+      verdict: "fail",
+      achieved: "none",
+      claimCount: 1,
+      unmet: 1,
+      claims: [
+        {
+          index: 0,
+          text: "The invoice total is 1,284.50 USD.",
+          status: "unmet",
+          best: "none",
+          bindings: [
+            {
+              ref: "tool:toolu_sum1",
+              kind: "execution",
+              rung: "checked",
+              ok: false,
+              reason: "replay_mismatch",
+            },
+          ],
+        },
+      ],
+    });
+    const first = await persist(cwd, "support", SESS_A, 1, mismatched);
+    await persist(cwd, "support", SESS_A, 1, handBundle({}));
+    const { audit } = await buildAudit({
+      cwd,
+      sessionRootDir: join(cwd, ".crewhaus", "sessions"),
+      now: NOW,
+    });
+    expect(audit.bundles.verdicts).toEqual({ pass: 1, fail: 0, unverified: 0 });
+    expect(audit.gaming.replayMismatches).toEqual([
+      {
+        bundle: first.slice(cwd.length + 1),
+        ref: "tool:toolu_sum1",
+        claim: "The invoice total is 1,284.50 USD.",
+      },
+    ]);
   });
 
   test("reads provability_graded lines: passes, retries, escalations and judge spend", async () => {
@@ -1848,6 +2043,59 @@ describe("provability audit", () => {
     expect(r.out).toContain("replay mismatches (1)");
     expect(r.out).toContain("proof statements near-identical to the prose (1)");
     expect(r.out).toContain("prf_0123456789abcdef (similarity 1)");
+  });
+
+  test("gaming: a source the run wrote itself before reading it back is listed (design §10)", async () => {
+    const cwd = tempDir();
+    await persist(
+      cwd,
+      "support",
+      SESS_A,
+      1,
+      handBundle({
+        level: "grounded",
+        claimCount: 1,
+        met: 1,
+        unmet: 0,
+        sources: 1,
+        selfWritten: 1,
+        claims: [
+          {
+            index: 0,
+            text: "The refund window is 30 days from the date of purchase.",
+            status: "met",
+            best: "grounded",
+            bindings: [
+              {
+                ref: "[1]",
+                kind: "source",
+                rung: "grounded",
+                ok: true,
+                origin: "notes/policy.md",
+                writtenBy: { toolUseId: "toolu_w1", toolName: "Write" },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { audit } = await buildAudit({ cwd, sessionRootDir: join(cwd, "none"), now: NOW });
+    expect(audit.gaming.selfWrittenSources).toEqual([
+      {
+        bundle: `.crewhaus/proofs/support/${SESS_A}/turn-1.json`,
+        ref: "[1]",
+        origin: "notes/policy.md",
+        writtenBy: "toolu_w1 (Write)",
+        claim: "The refund window is 30 days from the date of purchase.",
+      },
+    ]);
+    const r = await run(cwd, ["audit"]);
+    expect(r.out).toContain("sources the run wrote itself (1)");
+    expect(r.out).toContain("[1] notes/policy.md, written by toolu_w1 (Write)");
+    const shown = await run(cwd, ["show", "--session", SESS_A]);
+    expect(shown.out).toContain("written by this run");
+    expect(shown.out).toContain("written   by toolu_w1 (Write), before it was read");
+    expect(shown.out).toContain("1 distinct origin (1 written by this run)");
   });
 
   test("a spec narrows bundles and graded lines to that spec", async () => {
@@ -2439,6 +2687,41 @@ describe("provability prune", () => {
     expect(readFileSync(artifact, "utf8")).toContain('"checker": "builtin"');
   });
 
+  test("a retried turn keeps every pass: the dry run and the list name every file the prune removes (§5.3)", async () => {
+    const cwd = tempDir();
+    const bundle = await gradedBundle(GOOD_ANSWER, POLICY);
+    const old = NOW.getTime() - 200 * DAY;
+    // Turn 1 of A: three stale passes. Turn 1 of B: two stale passes and a
+    // fresh one — a retry across the cutoff, whose last pass is kept.
+    const a = [
+      await persist(cwd, "support", SESS_A, 1, bundle, old),
+      await persist(cwd, "support", SESS_A, 1, bundle, old),
+      await persist(cwd, "support", SESS_A, 1, bundle, old),
+    ];
+    const b = [
+      await persist(cwd, "support", SESS_B, 1, bundle, old),
+      await persist(cwd, "support", SESS_B, 1, bundle, old),
+    ];
+    const kept = await persist(cwd, "support", SESS_B, 1, bundle, NOW.getTime() - DAY);
+    const rel = (path: string): string => path.slice(cwd.length + 1);
+    const going = [...a, ...b].map(rel).sort();
+
+    const dry = JSON.parse(
+      (await run(cwd, ["prune", "--older-than", "90d", "--dry-run", "--json"])).out,
+    );
+    expect(dry.wouldRemove).toBe(5);
+    expect([...dry.bundles].sort()).toEqual(going);
+    const text = await run(cwd, ["prune", "--older-than", "90d", "--dry-run"]);
+    expect(text.out).toContain("would remove 5 bundles");
+    for (const path of going) expect(text.out).toContain(`  ${path}\n`);
+
+    const real = JSON.parse((await run(cwd, ["prune", "--older-than", "90d", "--json"])).out);
+    expect(real.removed).toBe(dry.wouldRemove);
+    expect([...real.bundles].sort()).toEqual(going);
+    for (const path of [...a, ...b]) expect(() => readFileSync(path)).toThrow();
+    expect(readFileSync(kept, "utf8")).not.toBe("");
+  });
+
   test("--older-than is required and must be a duration", async () => {
     await expect(run(tempDir(), ["prune"])).rejects.toThrow(/--older-than <duration> is required/);
     await expect(run(tempDir(), ["prune", "--older-than", "90"])).rejects.toThrow(
@@ -2528,6 +2811,7 @@ describe("durations and the long form", () => {
         spec: "s\u001b[2J",
         bundles: {
           count: 0,
+          turns: 0,
           unreadable: 0,
           truncated: false,
           verdicts: { pass: 0, fail: 0, unverified: 0 },
@@ -2536,6 +2820,12 @@ describe("durations and the long form", () => {
         },
         claims: { total: 0, met: 0, unmet: 0, assumptions: 0, assumptionsRefused: 0 },
         unmetReasons: [],
+        retried: {
+          passes: 0,
+          verdicts: { pass: 0, fail: 0, unverified: 0 },
+          claims: { total: 0, met: 0, unmet: 0 },
+          unmetReasons: [],
+        },
         assumptionRate: null,
         judgeWaivers: { bindings: 0, okSourceBindings: 0, rate: null, bundles: 0 },
         passes: {
@@ -2551,6 +2841,7 @@ describe("durations and the long form", () => {
           sharedEvidence: [],
           replayMismatches: [{ bundle: "b", ref: "[1]", claim: "x\n  replay mismatches (0)" }],
           restatedProofs: [],
+          selfWrittenSources: [],
         },
       },
       ["a note \u001b]0;t\u0007"],
@@ -2794,6 +3085,74 @@ describe("provability check --tenant — a managed answer's evidence", () => {
       kind: "execution",
       ok: true,
     });
+  });
+
+  test("a page the tenant's run spilled past its preview grounds offline as the live gate grounded it (§6, §11)", async () => {
+    const { cwd, tenants } = await managedTree();
+    const acme = buildTenant("acme", { tenantsRoot: tenants });
+    const url = "https://acme.example/policy";
+    // The claim is on line 151: past the 100-line preview the runtime logs,
+    // so only the file it spilled the whole page to holds it.
+    const lines = Array.from(
+      { length: 300 },
+      (_, i) => `Line ${i}: shipping and handling notes for the warehouse team.`,
+    );
+    lines[150] = "Refunds: Acme accepts refund requests within 14 days of purchase.";
+    const page = `URL: ${url}\nStatus: 200\n\n${lines.join("\n")}\n`;
+    // tool-result-store's layout under a tenant: <toolResultRoot>/<run>/<toolUseId>.txt,
+    // the log holding the head and the path it was saved at.
+    const spill = join(acme.toolResultRoot, "run_1", "toolu_big.txt");
+    mkdirSync(join(acme.toolResultRoot, "run_1"), { recursive: true });
+    writeFileSync(spill, page);
+    const preview = `${page.split("\n").slice(0, 100).join("\n")}\n[truncated, full output at ${spill}]`;
+    expect(preview).not.toContain("within 14 days");
+    const log = await openEventLog(SESS_B, { rootDir: acme.sessionRoot });
+    await log.append({
+      kind: "tool_use",
+      payload: { id: "toolu_big", name: "WebFetch", input: { url } },
+    });
+    await log.append({
+      kind: "tool_result",
+      payload: { toolUseId: "toolu_big", content: preview, isError: false },
+    });
+    await log.close();
+    const answer = `Acme accepts refund requests within 14 days of purchase [1].\n\n[1]: ${url}\n`;
+    writeAnswer(cwd, answer);
+
+    // Live: the gate's own preflight, run under the tenant, reads the spill.
+    const gates = await wireEvaluation(
+      {
+        specName: "mgd",
+        primaryModel: "claude-opus-5",
+        provability: { ...defaultProvabilityConfig(), level: "grounded" },
+      },
+      { cwd, now: () => NOW },
+    );
+    const preflight = gates.tools.find((t) => t.name === "ProvabilityPreflight");
+    const live = await withTenant(acme, () =>
+      preflight?.execute({ draft: answer }, {
+        bridge: { runContext: { sessionId: SESS_B } },
+      } as never),
+    );
+    expect(JSON.parse(String(live)).verdict).toBe("pass");
+
+    // Offline, from the same tenant's tree: the same verdict.
+    const r = await run(cwd, [
+      "check",
+      "answer.md",
+      "--level",
+      "grounded",
+      "--session",
+      SESS_B,
+      "--tenant",
+      "acme",
+      "--tenants-root",
+      "tenants",
+      "--json",
+    ]);
+    const bundle = JSON.parse(r.out) as ProofBundle;
+    expect({ code: r.code, verdict: bundle.verdict }).toEqual({ code: 0, verdict: "pass" });
+    expect(bundle.claims[0]?.bindings[0]?.sha256).toBe(sha256Of(`${lines.join("\n")}\n`));
   });
 
   test("one tenant, named and real: another tenant's evidence never grounds the answer", async () => {

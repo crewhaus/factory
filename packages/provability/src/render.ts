@@ -79,7 +79,8 @@ function claimsSegment(bundle: ProofBundle): string {
  * `unmet:` lists the markers of the unmet claims' failing bindings — the
  * reader finds them in the answer — and `+N uncited` for claims with none.
  * Judge-waived bindings are counted separately: `6/6 claims (1 judge-waived)`,
- * and so are refused assumptions: `3 assumptions (2 refused)`.
+ * and so are refused assumptions: `3 assumptions (2 refused)`, and sources
+ * the run wrote itself: `3 sources (1 written by this run)`.
  */
 export function renderFooter(bundle: ProofBundle, opts: FooterOptions = {}): string {
   const head = `── provability · ${bundle.level}`;
@@ -95,8 +96,18 @@ export function renderFooter(bundle: ProofBundle, opts: FooterOptions = {}): str
     if (uncited > 0) listed.push(listed.length > 0 ? `+${uncited} uncited` : `${uncited} uncited`);
     if (listed.length > 0) parts.push(`unmet: ${listed.join(" ")}`);
   }
-  parts.push(plural(bundle.sources, "source"), assumptionsSegment(bundle));
+  parts.push(sourcesSegment(bundle), assumptionsSegment(bundle));
   return `${parts.join(" · ")}${tail}`;
+}
+
+/**
+ * "N sources", and how many of them the run wrote itself before it read
+ * them back (`selfWritten`, design §10): `2 sources (1 written by this run)`.
+ */
+function sourcesSegment(bundle: ProofBundle): string {
+  const sources = plural(bundle.sources, "source");
+  const own = bundle.selfWritten ?? 0;
+  return own > 0 ? `${sources} (${own} written by this run)` : sources;
 }
 
 /** The bundle as pretty-printed JSON (`render: json`, `--json`). */
@@ -111,7 +122,13 @@ const cell = (text: string): string => text.replace(/\|/g, "\\|").replace(/\s+/g
 
 function bindingCell(b: ProofBinding): string {
   if (allowedAssumption(b)) return `${b.ref} assumption`;
-  if (b.ok) return `${b.ref} ✓ ${b.rung}${b.judgeWaived === true ? " (judge-waived)" : ""}`;
+  if (b.ok) {
+    const notes = [
+      ...(b.judgeWaived === true ? ["judge-waived"] : []),
+      ...(b.writtenBy !== undefined ? ["written by this run"] : []),
+    ];
+    return `${b.ref} ✓ ${b.rung}${notes.length > 0 ? ` (${notes.join(", ")})` : ""}`;
+  }
   return `${b.ref} ✗ ${words(b.reason ?? "below_floor")}`;
 }
 
@@ -159,6 +176,12 @@ export function renderMarkdownSection(bundle: ProofBundle): string {
       `${plural(bundle.judgeWaived, "binding was", "bindings were")} accepted by the paraphrase-waiver judge${
         bundle.judgeModel !== undefined ? ` (${bundle.judgeModel})` : ""
       } — an opinion, not a deterministic check.`,
+    );
+  }
+  if ((bundle.selfWritten ?? 0) > 0) {
+    lines.push(
+      "",
+      `${plural(bundle.selfWritten ?? 0, "source grounds", "sources ground")} only in text this run wrote there itself before reading it back — the run is its own source there.`,
     );
   }
   if (bundle.claims.length > 0) {

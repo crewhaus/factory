@@ -77,6 +77,11 @@ const ProofBinding = z
     excerpt: z.string().optional(),
     replayed: z.boolean().optional(),
     judgeWaived: z.boolean().optional(),
+    /** The earlier call of the run that wrote the grounding text there itself (design §10). */
+    writtenBy: z
+      .object({ toolUseId: z.string().min(1), toolName: z.string().min(1) })
+      .strict()
+      .optional(),
     checker: z.string().optional(),
     statement: z.string().optional(),
     /** A formal binding's proof hypotheses: assumptions too (design §6.4). */
@@ -114,6 +119,8 @@ export const ProofBundle = z
     /** Distinct hypotheses the accepted proofs rest on, counted with `assumptions`. */
     hypotheses: count.optional(),
     sources: count,
+    /** Of `sources`, the origins whose grounding text the run wrote itself. */
+    selfWritten: count.optional(),
     judgeWaived: count,
     retryIndex: count,
     checkers: z

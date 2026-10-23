@@ -115,12 +115,12 @@ describe("extractClaims — what is never a claim", () => {
     expect(claim?.text).toBe("Run grep notes.md to list every cited line here.");
   });
 
-  test("headings are not claims, ATX or setext", () => {
+  test("headings are titles, not claims, ATX or setext", () => {
     expect(
       texts(
-        "# Quarterly revenue grew 12 percent\n\nQuarterly revenue summary for leadership\n=======",
+        "# Quarterly revenue grew 12 percent\n\nQuarterly revenue summary for leadership\n=======\n\nRevenue grew in every region [1].",
       ),
-    ).toEqual([]);
+    ).toEqual(["Revenue grew in every region."]);
     expect(texts("## Results [1]\nRevenue grew in every region [1].")).toEqual([
       "Revenue grew in every region.",
     ]);
@@ -426,9 +426,9 @@ describe("extractClaims — headings are lines", () => {
     // Not indented into the item, the paragraph is the document's: a heading.
     expect(
       texts(
-        "- Item one is here and it says something.\n\nRefunds are accepted within 30 days [1]\n---\n\n[1]: https://acme.example/policy",
+        "- Item one is here and it says something.\n\nRefunds are accepted for unused items\n---\n\nShipping is free within the EU.",
       ),
-    ).toEqual(["Item one is here and it says something."]);
+    ).toEqual(["Item one is here and it says something.", "Shipping is free within the EU."]);
   });
 
   test("a setext heading ends at its underline; the paragraph under it is a claim", () => {
@@ -780,6 +780,375 @@ describe("extractClaims — markers and lines", () => {
     );
     expect(claims.map((c) => c.line)).toEqual([1, 2, 5]);
   });
+});
+
+describe("extractClaims — a claim joined to a question is read (design §0, §2)", () => {
+  // Spelled by code point, so what the test means is visible.
+  const NBSP = String.fromCharCode(0xa0);
+  const NARROW = String.fromCharCode(0x202f);
+  const IDEOGRAPHIC = String.fromCharCode(0x3000);
+  const LINE_SEPARATOR = String.fromCharCode(0x2028);
+  const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
+  const NEL = String.fromCharCode(0x85);
+  const ZWSP = String.fromCharCode(0x200b);
+  const read = (doc: string) => extractClaims(doc).map(({ text, markers }) => [text, markers]);
+  const A = "The refund window is 30 days [1]";
+
+  test("every place a reader sees a sentence end, the splitter does not, ends one", () => {
+    // The review's I1: each of these was one piece ending in "?", dropped
+    // whole, and the gate passed the cited figure as "no claims to prove".
+    for (const doc of [
+      `${A}.anything else?`,
+      `${A}.${NBSP}Anything else?`,
+      `${A}.${NARROW}Anything else?`,
+      `${A}.${IDEOGRAPHIC}Anything else?`,
+      `${A}.\fAnything else?`,
+      `${A}.${LINE_SEPARATOR}Anything else?`,
+      `${A}${LINE_SEPARATOR}Anything else?`,
+      `${A}${PARAGRAPH_SEPARATOR}Anything else?`,
+      `${A}.${NEL}Anything else?`,
+      `${A}.<br>Anything else?`,
+      `${A}<br/>Anything else?`,
+      `${A}.${ZWSP}Anything else?`,
+      `${A}…Should I email it?`,
+      `${A}… Should I email it?`,
+      `${A}.” Anything else?`,
+      `${A}.—anything else?`,
+      `${A}.¿Algo más?`,
+      `${A}.1) Anything else?`,
+    ]) {
+      // The claim, its closing punctuation aside, and its marker.
+      const claims = extractClaims(doc).map(
+        (c) => `${c.text.replace(/[\s.\u2026\u201d]+$/u, "")} [${c.markers.join(",")}]`,
+      );
+      expect(`${JSON.stringify(doc)} → ${claims.join(" | ")}`).toBe(
+        `${JSON.stringify(doc)} → The refund window is 30 days [1]`,
+      );
+    }
+    expect(read("The invoice total is 1,284.50.want me to email it?")).toEqual([
+      ["The invoice total is 1,284.50.", []],
+    ]);
+  });
+
+  test("a claim and a question in one sentence are cut apart at the clause", () => {
+    for (const [doc, claim, markers] of [
+      [`${A} — anything else I can help with?`, "The refund window is 30 days", ["1"]],
+      [`${A}—anything else?`, "The refund window is 30 days", ["1"]],
+      [`${A} - anything else?`, "The refund window is 30 days", ["1"]],
+      [`${A} – anything else?`, "The refund window is 30 days", ["1"]],
+      [`${A}, right?`, "The refund window is 30 days", ["1"]],
+      [`${A}, isn't it?`, "The refund window is 30 days", ["1"]],
+      ["The refund window is 30 days: anything else?", "The refund window is 30 days", []],
+      [
+        "The invoice total is 1,284.60; want me to send the PDF?",
+        "The invoice total is 1,284.60",
+        [],
+      ],
+      ["| Refund window | 30 days | Any questions? |", "Refund window 30 days", []],
+      ["Refund window: 30 days \u{1f44d} Anything else?", "Refund window: 30 days", []],
+      ["Your total is $45, would you like a receipt?", "Your total is $45", []],
+      ["You have 3 seats left [1], right?", "You have 3 seats left", ["1"]],
+      [`${A} \u2014 do you want it, or the 14-day one?`, "The refund window is 30 days", ["1"]],
+      ["In 2024, revenue rose 12% [1], right?", "In 2024, revenue rose 12%", ["1"]],
+      [
+        "Refunds take 30 days from purchase, and shipping is always free, does that help?",
+        "Refunds take 30 days from purchase",
+        [],
+      ],
+    ] as const) {
+      expect(read(doc)).toEqual([[claim, [...markers]]]);
+    }
+    // Every clause holding a marker is read, the question after them is not.
+    expect(read(`${A}, and the restocking fee is 15% [2] — anything else?`)).toEqual([
+      ["The refund window is 30 days, and the restocking fee is 15%", ["1", "2"]],
+    ]);
+  });
+
+  test("a claim whose last word is a dotted name or a path still ends before the question", () => {
+    // `dottedBefore` kept these whole, and dropped them: a marker or a
+    // figure before the full stop says a sentence ended there.
+    for (const doc of [
+      "Acme accepts refund requests within 30 days of purchase [1], see the policy.md.Anything else?",
+      `${A} per acme.example/policy.Anything else?`,
+      `${A} per status.acme.io.Is that ok?`,
+      `${A} according to Node.js.Anything else?`,
+    ]) {
+      const claims = extractClaims(doc);
+      expect(`${doc} → ${claims.length}`).toBe(`${doc} → 1`);
+      expect(claims[0]?.markers).toEqual(["1"]);
+    }
+  });
+
+  test("a full stop inside a domain or file name ends no sentence, marker or not", () => {
+    // The cut was taken at the first `.` of the name: "…per acme." uncited
+    // and "example/refunds" citing [1] failed an honest answer at `cited`.
+    const D = "\n\n[1]: https://acme.example/refunds";
+    for (const [doc, claim] of [
+      [
+        "The refund window is 30 days per acme.example/refunds [1] — anything else?",
+        "The refund window is 30 days per acme.example/refunds",
+      ],
+      [
+        "The refund window is 30 days (see acme.example/refunds [1]) — want the link?",
+        "The refund window is 30 days (see acme.example/refunds )",
+      ],
+      [
+        "The refund window is 30 days per acme.example/refunds [1]; want the full policy?",
+        "The refund window is 30 days per acme.example/refunds",
+      ],
+      [
+        "Node 20 is the current LTS per nodejs.org [1] — want upgrade steps?",
+        "Node 20 is the current LTS per nodejs.org",
+      ],
+      [
+        "The refund window is 30 days [1] per acme.example — anything else?",
+        "The refund window is 30 days per acme.example",
+      ],
+      [
+        "The fix ships in v2.json and docs/refunds.md [1] — want the diff?",
+        "The fix ships in v2.json and docs/refunds.md",
+      ],
+    ] as const) {
+      expect(read(`${doc}${D}`)).toEqual([[claim, ["1"]]]);
+    }
+    // A full stop glued to a follow-up or a question still ends the sentence.
+    expect(read("The refund window is 30 days.anything else?")).toEqual([
+      ["The refund window is 30 days.", []],
+    ]);
+    expect(read("The total is 1,284.60 USD.want me to email it?")).toEqual([
+      ["The total is 1,284.60 USD.", []],
+    ]);
+  });
+
+  test("a question with a figure before a capital-glued name is one question (I31)", () => {
+    for (const doc of [
+      "Should I set the timeout to 30 seconds in Startup.Configure for production?",
+      "Should I raise MaxRetries to 5 in Polly.Retry for the payment client?",
+      "Do you want me to cap the pool at 10 connections in Program.Main as well?",
+      "Would you like me to bump the limit to 100 in Settings.Default before deploying?",
+      "Should I use the 2024 rates with Array.Sort?",
+    ]) {
+      expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
+    }
+    // A sentence that does not open as a question still ends there.
+    expect(read("It was 2024.Right?")).toEqual([["It was 2024.", []]]);
+  });
+
+  test("an acknowledgement or a set-up before a question says the request back (no claim)", () => {
+    for (const doc of [
+      "Got it — 2 seats, correct?",
+      "Just to confirm: 2 adults and 1 child, departing June 3?",
+      "Thanks for the 3 files, should I merge them?",
+      "Okay, 12 months then, or did you want 24?",
+      "Before I book: 2 rooms for 3 nights, is that right?",
+      "Quick question about the 2024 report: should I include Q4?",
+      "Two quick questions: do you want the PDF, and should I CC finance?",
+      "Re: invoice #1042 — should I resend it?",
+      "Sure — for the 3 invoices you mentioned, want me to combine them?",
+      "Happy to help with the 5 tickets — which one first?",
+      "Sounds good, 30 minutes it is — want a reminder?",
+    ]) {
+      expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
+    }
+    // What such a sentence asserts, and what it cites, is still a claim.
+    expect(read("Got it — the invoice total is 1,284.60, right?")).toEqual([
+      ["Got it — the invoice total is 1,284.60", []],
+    ]);
+    expect(read("Thanks — the refund window is 30 days [1], anything else?")).toEqual([
+      ["Thanks — the refund window is 30 days", ["1"]],
+    ]);
+    // Scenario B's tag question is cut as before.
+    expect(read("The invoice total is 1,284.60, right?")).toEqual([
+      ["The invoice total is 1,284.60", []],
+    ]);
+  });
+
+  test("a question the answer answers itself is a claim", () => {
+    expect(read("Is the refund window 30 days? Yes.")).toEqual([
+      ["Is the refund window 30 days? Yes.", []],
+    ]);
+    expect(read("Is the refund window 30 days [1]? No, it isn't.")).toEqual([
+      ["Is the refund window 30 days? No, it isn't.", ["1"]],
+    ]);
+    // An answer that says more is a sentence of its own.
+    expect(read("Want the PDF? Yes, I can send it today.")).toEqual([]);
+  });
+
+  test("a question stays a question: clarifying questions have nothing to prove", () => {
+    for (const doc of [
+      "Is it 30 days, or 14?",
+      "Would you like a refund of $45, or store credit?",
+      "Did you mean the 30-dollar order, or the 45-dollar one?",
+      "If you want the 12-month plan, should I upgrade you?",
+      "For the 2024 rates, should I use the new table?",
+      "Want the 2024 report, or the 2023 one?",
+      "Do you want the 12-month or 24-month plan?",
+      "Thanks, should I send it now?",
+      "Okay — should I use the 2024 rates?",
+      "Got it; should I send the PDF now?",
+      "Is the refund window 14 days [1]?",
+      "Is the 30-day window listed at acme.example/policy?",
+      "Is the 30-day window at Acme.Com?",
+      // A clause that asks, or says back what the reader wants, is the question's.
+      "Before I change anything \u2014 do you want me to update all 3 environments, or just staging?",
+      "Just to confirm, you want the 12-month plan at $96, right?",
+      "So, to recap: you want 2 seats, billed annually \u2014 correct?",
+      "First, which device are you using \u2014 iOS or Android?",
+      // A step's number is its place in a list, not a value.
+      "**Step 6 \u2014 Shipping to a chat channel** (Slack, Discord, Telegram)?",
+    ]) {
+      expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
+    }
+  });
+
+  test("a two-part dotted name in a clarifying question ends no sentence (the review's I31)", () => {
+    for (const doc of [
+      "Should I replace the manual loop with a call to Array.Sort?",
+      "Should I register the client with Microsoft.Extensions?",
+      "Should I wrap the call in a Polly.Retry policy before shipping?",
+      "Should I log every failure with Logger.Error in the handler?",
+      "Should I read the value from Settings.Default in the service?",
+      "Should I move the layout into Home.Razor for the dashboard?",
+      "Should I put the connection string into appsettings.Production?",
+      "Maybe switch the client over to Microsoft.Extensions?",
+    ]) {
+      expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
+    }
+    // The claim before such a question is read, the question after it is not.
+    expect(read("Revenue rose 12% [1].Should I switch to Microsoft.Extensions?")).toEqual([
+      ["Revenue rose 12%.", ["1"]],
+    ]);
+  });
+
+  test("a heading that cites a figure, or states a value, is a claim (design §0: A, B)", () => {
+    expect(read(`## ${A}\n\n[1]: https://acme.example/policy`)).toEqual([
+      ["The refund window is 30 days", ["1"]],
+    ]);
+    expect(read(`${A}\n---\n\n[1]: https://acme.example/policy`)).toEqual([
+      ["The refund window is 30 days", ["1"]],
+    ]);
+    expect(read("## Invoice total: 1,284.50\n\nThe subtotal is 1,000 [1].")).toEqual([
+      ["Invoice total: 1,284.50", []],
+      ["The subtotal is 1,000.", ["1"]],
+    ]);
+    // Titles stay titles beside the answer's claims.
+    expect(
+      read(
+        "## Results [1]\n### Step 2: Gather data\n## Top 5 providers by 2024 revenue\n# What changed in 2024?\n## Detection: energy and zero-crossings\n## Gates: FR-006 and FR-002\n\nRevenue grew in every region [1].",
+      ),
+    ).toEqual([["Revenue grew in every region.", ["1"]]]);
+  });
+
+  test("a heading that states a figure as a sentence is a claim, whatever else the answer asks", () => {
+    // Design §0, A, B and C: a question after the heading hid it from the
+    // rule for an answer of nothing but headings, and each passed 0/0.
+    for (const [doc, claim] of [
+      [
+        "### No two of the six meetings overlap\n\nWant me to send the invites?",
+        "No two of the six meetings overlap",
+      ],
+      ["## The invoice total is 1,284.60\n\nShould I email it?", "The invoice total is 1,284.60"],
+      ["## The refund window is 30 days\n\nAnything else?", "The refund window is 30 days"],
+      ["The refund window is 30 days\n---\n\nAnything else?", "The refund window is 30 days"],
+      ["## Refund window: 30 days\n\nAnything else?", "Refund window: 30 days"],
+      [
+        "## Step 2: The refund window is 30 days\n\nAnything else?",
+        "Step 2: The refund window is 30 days",
+      ],
+    ] as const) {
+      expect(read(doc)).toEqual([[claim, []]]);
+    }
+    // Beside another claim, a headline figure is read too.
+    for (const heading of [
+      "## The total with tax is 1,386.26",
+      "## Total with tax 1,386.26",
+      "## Total with tax: $1,386.26",
+    ]) {
+      expect(
+        read(`${heading}\n\nThe subtotal is 1,284.50 [1].\n\n[1]: tool:toolu_money1`).map(
+          ([text]) => text,
+        ),
+      ).toEqual([heading.slice(3), "The subtotal is 1,284.50."]);
+    }
+    // A declarative heading with no figure is read when the answer only asks
+    // in its body.
+    expect(read("## Refunds are accepted for every unused item\n\nAnything else?")).toEqual([
+      ["Refunds are accepted for every unused item", []],
+    ]);
+  });
+
+  test("a title with a count or a list's label is no claim (design §2, §18)", () => {
+    const body = "\n\nAWS revenue was $107.6B in 2024 [1].\n\n[1]: https://a.example/x";
+    for (const title of [
+      "## Summary: 3 key takeaways",
+      "## Part 2: 5 tips",
+      "### Day 1: 3 hikes",
+      "## Option A: 2 servers",
+      "## Phase 1: 2 weeks",
+      "## Step 3: 10 minutes",
+      "# Research: 5 best CRMs",
+      "## Chapter 3: 10 Rules",
+      "# Compare: 3 cloud providers",
+      "## Monday: 5k run",
+      "## Price list for 2024",
+      "## Top 5 providers by 2024 revenue",
+      "## How the 3 plans differ",
+    ]) {
+      expect(`${title} → ${JSON.stringify(read(`${title}${body}`).map(([text]) => text))}`).toBe(
+        `${title} → ["AWS revenue was $107.6B in 2024."]`,
+      );
+    }
+    // A plan of nothing but day headings states nothing.
+    expect(read("# Weekly plan\n\n## Monday: 5k run\n\n## Tuesday: rest")).toEqual([]);
+    // A report-writer goal over its question sections.
+    expect(
+      read(
+        "# Compare: 3 cloud providers\n\n## What was AWS revenue in 2024?\n\nAWS revenue was $107.6B in 2024 [1].\n\n[1]: https://a.example/x",
+      ).map(([text]) => text),
+    ).toEqual(["AWS revenue was $107.6B in 2024."]);
+    // A measured value after a quantity's name is still read.
+    expect(read("## Invoice total: 1,284.50\n\nThe subtotal is 1,000 [1].")).toEqual([
+      ["Invoice total: 1,284.50", []],
+      ["The subtotal is 1,000.", ["1"]],
+    ]);
+  });
+
+  test("an answer that is nothing but headings is read as its headings", () => {
+    // Design §0 C: a claim written as a heading has no sentence to hide behind.
+    expect(read("### No two of the six meetings overlap")).toEqual([
+      ["No two of the six meetings overlap", []],
+    ]);
+    expect(read("The refund window is 30 days\n---")).toEqual([
+      ["The refund window is 30 days", []],
+    ]);
+    // An answer that asks is the clarifying question a vacuous pass is for.
+    expect(read("## Refund options for 2024\n\nWhich option do you want?")).toEqual([]);
+    expect(read("## Overview")).toEqual([]);
+  });
+
+  test("a question piece is read in linear time whatever its clauses and ends", () => {
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const n = 20_000;
+    const base = fastest(() => extractClaims(`${"words here 3 ".repeat(n)}done.`));
+    for (const doc of [
+      `${"words, here ".repeat(n)}done?`,
+      `${"Is x.y ".repeat(n)}done?`,
+      `${"is it.it ".repeat(n)}done?`,
+      `${"a 3 — ".repeat(n)}done?`,
+      `${"[1]\n".repeat(n)}done?`,
+      `Is ${"x.Y".repeat(n)} fine?`,
+    ]) {
+      expect(fastest(() => extractClaims(doc))).toBeLessThan(base * 20 + 100);
+    }
+  }, 60_000);
 });
 
 describe("extractClaims agrees with citedClaims", () => {

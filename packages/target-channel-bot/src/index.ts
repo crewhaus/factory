@@ -2834,7 +2834,10 @@ main().catch((err) => {
  * daemon concerns not yet mirrored here (a generated note surfaces each);
  * `runTurn` mints its own RunContext, so trace-bus events stay internal —
  * the session transcript in the caller's `sessionRootDir` is the captured
- * artifact.
+ * artifact. Under `provability:` the gate logs its `provability_graded`
+ * line there too, with the path of the bundle it persisted under the sample
+ * root, and the eval runner reads the standing bundle from it
+ * (`standingBundleFromTranscript`) for `proof.json` and the graders.
  */
 function renderEvalEntry(ir: IrChannelV0): string {
   const {

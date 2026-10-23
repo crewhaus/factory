@@ -469,7 +469,7 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     ).toBe("deny");
   });
 
-  test("an extract or a patch: a destination inside a root is denied here; one above every root is the tool's to check", () => {
+  test("an extract or a patch: a destination inside a root is denied here; the workspace root is the tool's to check", () => {
     // ArchiveExtract's destination and GitApplyPatch's cwd are walked
     // (`beneath: "all"`). Named inside the session logs, the floor denies.
     const extractInto = (dest: string): ToolCallContext => ({
@@ -495,11 +495,12 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
         protectedRoots: ROOTS,
       }).decision,
     ).toBe("deny");
-    // Named ABOVE every root (the workspace root, `.crewhaus`), the floor
-    // cannot tell a write that lands in one from one that does not — a
-    // patch's files, an archive's members — so it leaves the call to the
-    // rules, and the tool checks its own targets against the roots the
-    // runtime hands it on the bridge (tool-safety `protectedRootsOf`).
+    // Named at the WORKSPACE ROOT, the floor cannot tell a write that lands
+    // in a root from one that does not — a patch's files, an archive's
+    // members — and a git pathspec or a patch's `cwd` defaults to `.`, so it
+    // leaves the call to the rules, and the tool checks its own targets
+    // against the roots the runtime hands it on the bridge (tool-safety
+    // `protectedRootsOf`).
     const patchAtRoot: ToolCallContext = {
       toolName: "GitApplyPatch",
       input: { cwd: ".", patch: "…" },
@@ -514,9 +515,111 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     expect(
       evaluateWithReason(patchAtRoot, "auto", patchRules, { protectedRoots: ROOTS }).decision,
     ).toBe("allow");
+    // Named at a workspace directory that HOLDS a root, everything beneath
+    // it is the call's: `.crewhaus` holds the session logs.
+    const above = evaluateWithReason(extractInto(".crewhaus"), "auto", rules, {
+      protectedRoots: ROOTS,
+    });
+    expect(above.decision).toBe("deny");
+    expect(above.reason).toBe(
+      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) — no rule can allow that",
+    );
+  });
+
+  test("a writer that acts beneath a directory holding a root is denied: StateImport and StoreMigrate cannot fill the logs from `.crewhaus` (I12)", () => {
+    // What the runtime hands the floor for a `beneath: "all"` path field:
+    // the directory's spellings, and the prefixes everything under it starts with.
+    const beneath = (dir: string) => ({
+      kind: "path" as const,
+      canonical: [dir, `/srv/ws/${dir}`],
+      beneath: [`${dir}/`, `./${dir}/`, `/srv/ws/${dir}/`],
+    });
+    const rules: RuleSet = {
+      ...emptyRuleSet,
+      flag: [
+        rule("alwaysAllow", "StateImport", "flag"),
+        rule("alwaysAllow", "StoreMigrate", "flag"),
+      ],
+    };
+    // StateImport {stateDir: ".crewhaus", files: [sessions/<sid>.jsonl]}.
+    const stateImport: ToolCallContext = {
+      toolName: "StateImport",
+      input: { stateDir: ".crewhaus", mode: "merge" },
+      operativeValues: [beneath(".crewhaus")],
+      readOnly: false,
+      destructive: true,
+    };
+    // StoreMigrate {dir: "fake", to: ".crewhaus"}.
+    const storeMigrate: ToolCallContext = {
+      toolName: "StoreMigrate",
+      input: { dir: "fake", to: ".crewhaus" },
+      operativeValues: [beneath("fake"), beneath(".crewhaus")],
+      readOnly: false,
+      destructive: true,
+    };
+    for (const call of [stateImport, storeMigrate]) {
+      for (const mode of ["default", "auto"] as const) {
+        const r = evaluateWithReason(call, mode, rules, { protectedRoots: ROOTS });
+        expect({ tool: call.toolName, mode, decision: r.decision }).toEqual({
+          tool: call.toolName,
+          mode,
+          decision: "deny",
+        });
+        expect(r.reason).toContain("acts on everything beneath `.crewhaus`");
+      }
+    }
+    // A case the filesystem folds is the same directory.
+    const shouted: ToolCallContext = {
+      ...stateImport,
+      operativeValues: [{ ...beneath(".CREWHAUS"), caseInsensitive: true }],
+    };
+    expect(evaluateWithReason(shouted, "auto", rules, { protectedRoots: ROOTS }).decision).toBe(
+      "deny",
+    );
+  });
+
+  test("acting beneath the workspace root, a sibling, or a directory read alone is not the floor's", () => {
+    const rules: RuleSet = { ...emptyRuleSet, flag: [rule("alwaysAllow", "*", "flag")] };
+    const call = (operativeValues: ToolCallContext["operativeValues"]): ToolCallContext => ({
+      toolName: "StoreMigrate",
+      input: {},
+      ...(operativeValues !== undefined ? { operativeValues } : {}),
+      readOnly: false,
+      destructive: true,
+    });
+    for (const values of [
+      // GitAdd / GitCommit / StoreMigrate's own default: the workspace root.
+      [{ kind: "path" as const, canonical: [".", "/srv/ws"], beneath: ["", "./", "/srv/ws/"] }],
+      // A sibling of the record, and the store a KvSet works in.
+      [{ kind: "path" as const, canonical: [".crewhaus/state"], beneath: [".crewhaus/state/"] }],
+      [{ kind: "path" as const, canonical: ["src"], beneath: ["src/", "/srv/ws/src/"] }],
+      // `.crewhaus` named as itself alone (TempDir without `clear`): no `beneath`.
+      [{ kind: "path" as const, canonical: [".crewhaus", "/srv/ws/.crewhaus"] }],
+      // A walk that skips hidden names never opens `.crewhaus` under `a`.
+      [
+        {
+          kind: "path" as const,
+          canonical: ["a"],
+          beneath: ["a/"],
+          beneathSkipsHidden: true,
+        },
+      ],
+    ]) {
+      expect(
+        evaluateWithReason(call(values), "auto", rules, {
+          protectedRoots: [...ROOTS, "a/.crewhaus/sessions"],
+        }).decision,
+      ).toBe("allow");
+    }
+    // An absolute-only root (sessions kept outside the workspace) is read
+    // inside alone: no workspace directory holds it.
     expect(
-      evaluateWithReason(extractInto(".crewhaus"), "auto", rules, { protectedRoots: ROOTS })
-        .decision,
+      evaluateWithReason(
+        call([{ kind: "path", canonical: ["/var/x"], beneath: ["/var/x/"] }]),
+        "auto",
+        rules,
+        { protectedRoots: ["/var/x/sessions"] },
+      ).decision,
     ).toBe("allow");
   });
 
@@ -941,7 +1044,7 @@ describe("#383 — builtin bookkeeping rules", () => {
     expect(evaluate(bookkeepingCall("MemoryClear"), "default", rs)).toBe("ask");
   });
 
-  test("0.8.0 — the provability gate's read-only tools allow; ProofCheck (writes an artifact) still asks", () => {
+  test("0.8.0 — the provability gate's read-only tools allow; ProofCheck allows the builtin checker alone", () => {
     const rs: RuleSet = { ...emptyRuleSet, builtin: [...BUILTIN_DEFAULT_RULES] };
     const call = (toolName: string, readOnly: boolean): ToolCallContext => ({
       toolName,
@@ -951,7 +1054,31 @@ describe("#383 — builtin bookkeeping rules", () => {
     });
     expect(evaluate(call("ProvabilityPreflight", true), "default", rs)).toBe("allow");
     expect(evaluate(call("ProofCheckers", true), "default", rs)).toBe("allow");
+    // ProofCheck's one operative arg is the checker (`kind: "id"`): the
+    // sandbox-free builtin is allowed, a container checker keeps the mode
+    // default, and a call the runtime could not read the checker of asks.
+    const proofCheck = (checker: string): ToolCallContext => ({
+      toolName: "ProofCheck",
+      input: { checker },
+      readOnly: false,
+      destructive: true,
+      operativeValues: [{ kind: "id", canonical: [checker] }],
+    });
+    expect(evaluate(proofCheck("builtin"), "default", rs)).toBe("allow");
+    expect(evaluate(proofCheck("builtin"), "auto", rs)).toBe("allow");
+    expect(evaluate(proofCheck("smt"), "default", rs)).toBe("ask");
+    expect(evaluate(proofCheck("lean4"), "auto", rs)).toBe("ask");
+    expect(evaluate(proofCheck("builtin-ish"), "default", rs)).toBe("ask");
     expect(evaluate(call("ProofCheck", false), "default", rs)).toBe("ask");
+    // Plan mode never widens: the tool writes an artifact, so it is denied there.
+    expect(evaluate(proofCheck("builtin"), "plan", rs)).toBe("deny");
+    // A spec rule outranks the builtin grant.
+    const asked: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [rule("alwaysAsk", "ProofCheck")],
+      builtin: [...BUILTIN_DEFAULT_RULES],
+    };
+    expect(evaluate(proofCheck("builtin"), "default", asked)).toBe("ask");
     // A spec rule still outranks the builtin grant.
     const denied: RuleSet = {
       ...emptyRuleSet,

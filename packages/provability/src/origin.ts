@@ -75,6 +75,26 @@ export function normalizeUrl(raw: string): string | undefined {
   return `${url.protocol}//${host}${port}${pathname}${url.search}`;
 }
 
+/**
+ * Does `raw` carry userinfo before its host — `https://acme.example@evil.example/
+ * policy`, `https://user:pw@host/`? {@link normalizeUrl} drops it, so the
+ * origin is the host after the `@`; a reader takes what comes before it for
+ * the host. A citation spelled so names one site to the reader and another
+ * to the gate (design §2: `cited` is the source the reader can see), and no
+ * citation has a use for credentials. Only an `http(s)` URL that parses has
+ * any.
+ */
+export function hasUserinfo(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return false;
+  try {
+    const url = new URL(trimmed);
+    return url.username !== "" || url.password !== "";
+  } catch {
+    return false;
+  }
+}
+
 /** The resolver URL a DOI is fetched and grounded under: `https://doi.org/<doi>`, normalized. */
 export function doiUrl(doi: string): string {
   const bare = doi.trim().replace(/^doi:\s*/i, "");

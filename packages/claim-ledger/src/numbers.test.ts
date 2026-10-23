@@ -123,6 +123,79 @@ describe("extractNumbers — dates and times are values whole (design §6.3)", (
   });
 });
 
+describe("extractNumbers — a range or an interval states both its ends (the review's I14)", () => {
+  test("the second end of a time range is a time of day, whole", () => {
+    // "10:00-11:30" read only its first end, and a claim that the meeting
+    // ends at 11:30 was not contained in the result that says so.
+    expect(extractNumbers("Meeting 2: 10:00-11:30, room B")).toEqual([
+      "2",
+      "10",
+      "0",
+      "11",
+      "30",
+      "10:00",
+      "11:30",
+    ]);
+    for (const range of ["9:00-17:00", "9:00/17:00", '{"hours":"9:00-17:00"}']) {
+      expect(containsValue(range, "17:00")).toBe(true);
+      expect(containsValue(range, "9:00")).toBe(true);
+      expect(containsValue(range, "17:30")).toBe(false);
+    }
+    expect(containsValue('{"slot":"10:00-11:30"}', "11:30")).toBe(true);
+    // Still not a time put together from two others' pieces.
+    expect(containsValue("10:00-11:30", "10:30")).toBe(false);
+  });
+
+  test("both dates of an ISO interval are dates", () => {
+    const interval = '{"window":"2025-04-01/2025-04-30"}';
+    expect(containsValue(interval, "2025-04-01")).toBe(true);
+    expect(containsValue(interval, "2025-04-30")).toBe(true);
+    expect(containsValue(interval, "2025-04-03")).toBe(false);
+    expect(containsValue("2025-04-01-2025-04-30", "2025-04-30")).toBe(true);
+    // A date running on into a longer run is still no date.
+    expect(extractNumbers("2025-04-03-1").includes("2025-04-03")).toBe(false);
+    expect(extractNumbers("2025-04-012").includes("2025-04-01")).toBe(false);
+  });
+
+  test("a UTC offset is not a time of day", () => {
+    for (const stamp of [
+      "2025-04-03T09:00:00-05:00",
+      "2025-04-03T09:00-05:00",
+      "2025-04-03 09:00:00-05:00",
+      "2025-04-03T09:00:00+05:30",
+    ]) {
+      expect(`${stamp} ${containsValue(stamp, "9:00")}`).toBe(`${stamp} true`);
+      expect(`${stamp} ${containsValue(stamp, stamp.endsWith("30") ? "5:30" : "5:00")}`).toBe(
+        `${stamp} false`,
+      );
+    }
+    // A day's range after a date, no seconds, reads both ends.
+    expect(containsValue("2025-04-03 10:00-11:30", "11:30")).toBe(true);
+  });
+});
+
+describe("extractNumbers — a digit of any script is read (design §6.3, §0-B)", () => {
+  const at = (...points: number[]): string => String.fromCodePoint(...points);
+  test("fullwidth, Arabic-Indic, Devanagari and mathematical digits are values", () => {
+    expect(
+      extractNumbers(
+        `The amount is ${at(0xff11)},${at(0xff12, 0xff18, 0xff14)}.${at(0xff16, 0xff10)} USD`,
+      ),
+    ).toEqual(["1284.6"]);
+    expect(extractNumbers(at(0x0669, 0x0669, 0x0669, 0x066b, 0x0669, 0x0669))).toEqual(["999.99"]);
+    expect(extractNumbers(`${at(0x0969, 0x0966)} days`)).toEqual(["30"]);
+    expect(extractNumbers(`${at(0x1d7d1, 0x1d7ce)} days`)).toEqual(["30"]);
+    // A misquoted total in another script is not contained in the result.
+    expect(
+      containsValue("1284.50", `${at(0xff11)},${at(0xff12, 0xff18, 0xff14)}.${at(0xff16, 0xff10)}`),
+    ).toBe(false);
+    expect(containsValue(`${at(0x0661, 0x0662, 0x0668, 0x0664, 0x066b, 0x0665)}`, "1,284.50")).toBe(
+      true,
+    );
+    expect(normalizeNumber(at(0x0663, 0x0660))).toBe("30");
+  });
+});
+
 describe("extractNumbers — linear in the text", () => {
   // A fetched page and a tool result reach the number layer on every gated
   // turn (design §10). The least of three runs, each timed against a text of

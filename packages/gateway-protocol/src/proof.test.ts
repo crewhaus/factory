@@ -148,6 +148,39 @@ describe("ProofBundle — every shape the verifier produces parses", () => {
     expect(ProofBundle.parse(b)).toEqual(b);
   });
 
+  test("a source the run wrote itself before reading it: writtenBy and selfWritten parse", async () => {
+    const url = "https://wiki.acme.example/policy";
+    const b = await verifyDocument(
+      `Refunds are accepted within 14 days of purchase [1].\n\n[1]: ${url}`,
+      {
+        config: config("grounded"),
+        evidence: buildEvidenceIndex([
+          recordFromCall({
+            toolUseId: "toolu_put",
+            toolName: "HttpRequest",
+            input: { url, method: "PUT", body: POLICY_BODY },
+            content: "HTTP 201",
+            isError: false,
+          }),
+          recordFromCall({
+            toolUseId: "toolu_get",
+            toolName: "WebFetch",
+            input: { url },
+            content: `URL: ${url}\nStatus: 200\n\n${POLICY_BODY}`,
+            isError: false,
+          }),
+        ]),
+        now: NOW,
+      },
+    );
+    expect(b.selfWritten).toBe(1);
+    expect(b.claims[0]?.bindings[0]?.writtenBy).toEqual({
+      toolUseId: "toolu_put",
+      toolName: "HttpRequest",
+    });
+    expect(ProofBundle.parse(b)).toEqual(b);
+  });
+
   test("a failing answer: an uncited claim and a dangling marker", async () => {
     const b = await bundleOf(
       "Refunds are accepted within 14 days of purchase. Shipping is free on every order [2].",

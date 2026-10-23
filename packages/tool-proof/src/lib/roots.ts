@@ -18,7 +18,7 @@
  * tenant-aware store does. A tools instance built once with a fixed root
  * and shared by every tenant would otherwise pool them all.
  */
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { proofsRoot } from "@crewhaus/provability";
 import { type Tenant, assertSamePath } from "@crewhaus/tenancy";
 
@@ -58,4 +58,59 @@ export function fenced(dir: string, tenant: Tenant | undefined): string {
   const abs = resolve(dir);
   if (tenant !== undefined) assertSamePath(abs, tenantRootOf(tenant));
   return abs;
+}
+
+/**
+ * Environment variables that relocate the runtime's own state: sessions,
+ * datasets, watch-me records, the shared directory and the tenants' roots.
+ */
+export const STATE_ENV_VARS: ReadonlyArray<string> = [
+  "CREWHAUS_SESSION_DIR",
+  "CREWHAUS_DATASETS_DIR",
+  "CREWHAUS_WATCHME_ROOT",
+  "CREWHAUS_SHARED_DIR",
+  "CREWHAUS_TENANTS_ROOT",
+];
+
+/**
+ * The directories, beyond the workspace's `.crewhaus/`, where this run keeps
+ * its own record — the verifier's `VerifyOptions.stateRoots` (design §1
+ * principle 1: evidence is a source the run read, never what the model
+ * said). A session log holds every answer verbatim, a bundle every claim, a
+ * spilled result what a tool returned; read back and cited, each grounds the
+ * model's own text. So a path under the session root the gate reads, the
+ * proofs root, the active tenant's root and spill root, or a directory an
+ * environment variable relocated state to, is no source. The gate and the
+ * preflight read the same list, so they agree (design §6).
+ *
+ * A directory that holds the workspace itself is left out: refusing it
+ * would refuse every file the run read.
+ */
+export function runtimeStateRoots(input: {
+  readonly workspaceRoot: string;
+  readonly sessionRootDir?: string;
+  readonly proofsRoot?: string;
+  readonly tenant?: Tenant;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+}): string[] {
+  const env = input.env ?? process.env;
+  const workspace = resolve(input.workspaceRoot);
+  const named = [
+    input.sessionRootDir,
+    input.proofsRoot,
+    ...(input.tenant !== undefined
+      ? [input.tenant.toolResultRoot, tenantRootOf(input.tenant)]
+      : []),
+    ...STATE_ENV_VARS.map((name) => env[name]),
+  ];
+  const out: string[] = [];
+  for (const dir of named) {
+    if (dir === undefined || dir.trim() === "") continue;
+    const abs = resolve(workspace, dir);
+    const up = relative(abs, workspace);
+    // The workspace is the directory or under it.
+    if (up === "" || (!up.startsWith("..") && !isAbsolute(up))) continue;
+    if (!out.includes(abs)) out.push(abs);
+  }
+  return out;
 }

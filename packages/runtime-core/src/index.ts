@@ -45,6 +45,7 @@ import {
 import {
   type EgressMatcher,
   type EgressVerdict,
+  MIN_MATCH_LENGTH,
   type SinkScope,
   classifyEgress,
   summarizeEgress,
@@ -204,6 +205,7 @@ import {
 import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
+import { createFooterLineGuard, neutralizeFooterLines } from "./forged-footer";
 import { attachIncidentCollector } from "./incident-collector";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
@@ -1419,8 +1421,32 @@ export type RunProvability = {
    * `"stream"`. Where there is no returned text to carry it — the REPL, and
    * a `halt` — a `"reply"` footer is written to the output instead. It never
    * enters the transcript either way.
+   *
+   * Where the reader reads the turn as it streams (the REPL, `"stream"`),
+   * every attempt is on screen before it is graded, so the gate answers for
+   * all of it: a rejected attempt gets its ✗ footer before the turn is
+   * re-run, and a final message that states nothing has the turn's whole
+   * printed text graded in its place (a claim made before a tool call, an
+   * earlier attempt it points back at). A `halt` there stops the run under
+   * the ✗ of an answer that has already printed — the classified stop and
+   * exit code are what refuse it.
    */
   readonly footerTarget?: "stream" | "reply" | "none";
+  /**
+   * Does the reader read this turn as it streams, whatever `footerTarget`
+   * says? `crewhaus run --prompt` prints every attempt to stdout as it is
+   * written and the footer rides the returned result (`"reply"`): there the
+   * turn streams too, so a rejected attempt is marked ✗ under it and a
+   * claimless final message has the turn's printed text graded. Absent ⇒
+   * read off `footerTarget` and the loop's mode (the REPL, or `"stream"`).
+   */
+  readonly streamed?: boolean;
+  /**
+   * The verifier. `turn.finalText` is the text graded: the terminal
+   * assistant message's, or — where the turn streams to its reader and that
+   * message states nothing — everything the turn printed (see
+   * `footerTarget`).
+   */
   readonly verify: (turn: ProvabilityTurn) => Promise<ProofBundle>;
   /** Render the bundle for `render` (footer line / JSON). Absent ⇒ nothing is rendered. */
   readonly renderBundle?: (bundle: ProofBundle, bundlePath?: string) => string | undefined;
@@ -3499,6 +3525,41 @@ function gateResultText(content: unknown): string {
   return texts.join("\n");
 }
 
+/**
+ * §5.4 — a claimless final message that hands the reader an earlier answer
+ * again: "See above.", "As I said before.", "Same as my previous answer.".
+ * Where that earlier answer was rejected, its ✗ stands with it.
+ */
+const POINTS_BACK =
+  /\b(?:see|as|per)\s+(?:above|before|earlier|(?:my|the)\s+(?:previous|last|earlier|above)\s+(?:answer|reply|message|response))\b|\bas\s+(?:i\s+)?(?:said|stated|mentioned|noted)\b|\b(?:same|unchanged)\s+(?:as\s+)?(?:above|before)\b|^\s*(?:↑+|\^+)\s*$/i;
+
+/**
+ * §5.4 — a sentence that only says what the agent is about to do: "Let me
+ * fetch the refund policy page first.", "I'll save the note to your notes
+ * file now.", "I'm checking the policy page." Printed before a tool call, it
+ * is narration, not an answer the reader is handed. One with a figure or a
+ * marker in it says more, and stays.
+ */
+const NARRATION =
+  /^(?:(?:ok(?:ay)?|now|next|first|then|alright|all right|sure|great|got it)[,!—–-]?\s+)?(?:let me|let's|let us|i'll|i will|i'm going to|i am going to|i'm gonna|i need to|i want to|i'm (?:now |first )?\w+ing|i am (?:now |first )?\w+ing)\b/i;
+
+/**
+ * `text` with its narration sentences ({@link NARRATION}) taken out and the
+ * rest exactly as written — its lines too, so a definition line stays one.
+ */
+function withoutNarration(text: string): string {
+  return text
+    .replace(/[^\n.!?…]+(?:[.!?…]+|$)/gm, (sentence) => {
+      const plain = sentence
+        .trim()
+        .replace(/^[*_>#\s-]+/, "")
+        .replace(/’/g, "'");
+      return plain !== "" && NARRATION.test(plain) && !/[\d[]/.test(plain) ? "" : sentence;
+    })
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
@@ -3821,20 +3882,48 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
   /**
-   * The floor's reading of a call: where it WRITES. A field declared
-   * `relocates` names the store a tool works in through its own format
-   * (EmitTraceEvent's namespaced `custom.*` lines, IncidentBundle's sessions
-   * it reads whole), not a file the call names, so it is left out; every
-   * other operative value counts. `undefined` ⇒ the call's operative values
-   * as they are (a tool with no relocating field).
+   * The floor's reading of a call: where it WRITES. Two kinds of field are
+   * left out, field by field:
+   *
+   *  - one declared `relocates` names the store a tool works in through its
+   *    own format (EmitTraceEvent's namespaced `custom.*` lines,
+   *    IncidentBundle's sessions it reads whole), not a file the call names;
+   *  - one declared `source` holds where the tool takes a value FROM (the
+   *    files IndexBuild indexes, the file DatasetPut reads, the reference
+   *    EnvFileUpsert copies a secret out of): reading a spilled output or a
+   *    session log forges nothing, and the runtime itself points the model
+   *    at a spill (`[truncated, full output at …]`), so a copy, an index or
+   *    an import of one is no write into the record (§1 principle 3: the
+   *    floor must not refuse what a harness without the block could do).
+   *
+   *  - one declared `reads` (or `readsWhen`, when the call names the field
+   *    it names) the tool only reads, writing where another field says:
+   *    CopyPath's and ArchiveCreate's `source`, ArchiveExtract's `archive`,
+   *    an importer's `file`. A backup of `.crewhaus` copies the record; it
+   *    writes none of it. MovePath's `source` is not one: a move takes it
+   *    away.
+   *
+   * Every other operative value counts — a secret reference's file included
+   * (SecretRotate's `ref` names the file it writes). `undefined` ⇒ the
+   * call's operative values as they are (a tool with neither kind of field).
    */
   const floorValuesOf = (
     tool: RegisteredTool,
     parsedInput: unknown,
   ): ReturnType<typeof operativeValuesFor> => {
     const args = tool.operativeArgs;
-    if (args === undefined || !args.some((arg) => arg.relocates === true)) return undefined;
-    const written = args.filter((arg) => arg.relocates !== true);
+    const named = (name: string): boolean => {
+      if (typeof parsedInput !== "object" || parsedInput === null) return false;
+      const value = (parsedInput as Record<string, unknown>)[name];
+      return value !== undefined && value !== null && value !== "";
+    };
+    const skipped = (arg: NonNullable<typeof args>[number]): boolean =>
+      arg.relocates === true ||
+      arg.source === true ||
+      arg.reads === true ||
+      (arg.readsWhen !== undefined && named(arg.readsWhen));
+    if (args === undefined || !args.some(skipped)) return undefined;
+    const written = args.filter((arg) => !skipped(arg));
     if (written.length === 0) return [];
     return (
       operativeValuesFor({ ...tool, operativeArgs: written }, parsedInput, {
@@ -4721,16 +4810,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const mdRenderer: StreamRenderer | undefined = isCliMarkdownEnabled()
     ? createCliMarkdownRenderer({ write: (s) => out.write(s) })
     : undefined;
+  const printText = (chunk: string): void => {
+    if (mdRenderer) mdRenderer.push(chunk);
+    else out.write(chunk);
+  };
+  // 0.8.0 (design §1 principle 2, §5.4) — under `provability:` a line of the
+  // answer shaped like the gate's footer streams with a mark saying the model
+  // wrote it (`./forged-footer`): the one verdict line the reader sees is the
+  // gate's. Without the block the text streams exactly as before.
+  const footerGuard = opts.provability !== undefined ? createFooterLineGuard(printText) : undefined;
   const writeText = (chunk: string): void => {
     // First real assistant text ends the "thinking" wait; clear the spinner
     // (idempotent on later chunks) before the answer streams.
     out.spinner.stop();
-    if (mdRenderer) mdRenderer.push(chunk);
-    else out.write(chunk);
+    if (footerGuard !== undefined) footerGuard.push(chunk);
+    else printText(chunk);
   };
   const endTurn = (): void => {
     // Covers the no-text/no-tool case where the spinner is still up.
     out.spinner.stop();
+    footerGuard?.end();
     if (mdRenderer) mdRenderer.end();
     out.write("\n");
   };
@@ -9973,7 +10072,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const block: Anthropic.TextBlock = { type: "text", text: verdict.text, citations: null };
     messages.push({ role: "assistant", content: [block] });
     await logEvent("assistant_message", { content: [block] });
-    out.write(`agent> ${verdict.text}\n`);
+    // §5.4 — printed as the stream prints an answer: no footer-shaped line of
+    // it passes for the gate's verdict under `provability:`.
+    out.write(
+      `agent> ${opts.provability !== undefined ? neutralizeFooterLines(verdict.text) : verdict.text}\n`,
+    );
     lastResponseWireModel = verdict.winner.model;
     await recordServedModel(verdict.winner.model);
     publishStage({
@@ -10146,6 +10249,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       readonly bundle: ProofBundle;
       readonly bundlePath?: string;
     };
+    /** The rejected pass whose ✗ is already on the output (`markRejected`): never rendered twice. */
+    marked?: ProofBundle;
+    /**
+     * The last message of the latest failing pass's attempt: the streamed
+     * text graded in a claimless final message's place starts after it
+     * (`streamedTurnText`), so an attempt already graded — and, where it
+     * streamed, already marked ✗ — is not graded again.
+     */
+    rejectedThrough?: Anthropic.MessageParam;
   };
   const newProvabilityLadder = (): ProvabilityLadder => ({
     passes: 0,
@@ -10218,6 +10330,88 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const trimmed = typeof rendered === "string" ? rendered.trimEnd() : "";
     return trimmed.length > 0 ? trimmed : undefined;
   };
+  /**
+   * §5.4 — does the reader read this turn as it streams? The REPL prints
+   * every attempt as it is made, and so does any run whose footer goes to the
+   * stream (the cli); a run that hands its text back (`"reply"` on a channel
+   * bot, `"none"` on the gateway) serves the final answer alone, and its
+   * output is an operator's log.
+   */
+  const streamsTheTurn = (provability: RunProvability): boolean =>
+    provability.streamed ??
+    (opts.singleTurn !== true || (provability.footerTarget ?? "stream") === "stream");
+  /**
+   * The text the turn in flight has printed so far, as the gate grades it in
+   * a claimless final message's place: every assistant message's text since
+   * the turn's own input — the last user message that is neither
+   * runtime-injected (a retry nudge, a correction) nor a tool result — and
+   * since the last attempt a failing pass graded (`rejectedThrough`), joined
+   * as paragraphs. A rejected attempt was graded once, and where it
+   * streamed its ✗ is already under it: grading it again would fail every
+   * honest retraction after it ("I'm not able to confirm that."), unless
+   * the final message points back at it (`POINTS_BACK`: "See above."),
+   * when it is the answer the reader is handed again. In the messages
+   * before the final one, a sentence that only says what the agent is about
+   * to do (`NARRATION`: "Let me fetch the policy page first.") is no claim
+   * the reader was handed, and is left out.
+   */
+  const streamedTurnText = (
+    messages: readonly Anthropic.MessageParam[],
+    rejectedThrough: Anthropic.MessageParam | undefined,
+  ): string => {
+    const texts: string[] = [];
+    let final = true;
+    let pointsBack = false;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i] as Anthropic.MessageParam;
+      if (message === rejectedThrough && !pointsBack) break;
+      if (message.role === "user") {
+        const carriesResults =
+          Array.isArray(message.content) &&
+          message.content.some((block) => block.type === "tool_result");
+        if (!isSyntheticMessage(message) && !carriesResults) break;
+        continue;
+      }
+      const text =
+        typeof message.content === "string"
+          ? message.content
+          : message.content
+              .filter((block): block is Anthropic.TextBlockParam => block.type === "text")
+              .map((block) => block.text)
+              .join("");
+      if (text.trim() === "") continue;
+      if (final) {
+        final = false;
+        pointsBack = POINTS_BACK.test(text);
+        texts.unshift(text);
+        continue;
+      }
+      const said = withoutNarration(text);
+      if (said !== "") texts.unshift(said);
+    }
+    return texts.join("\n\n");
+  };
+  /**
+   * §5.4 — a failing pass the gate is about to re-run: where the reader has
+   * already seen the rejected attempt stream past (`streamsTheTurn`, a
+   * footer that goes to the output), its ✗ footer is written under it now,
+   * so no answer the reader saw stands unmarked above the next one. The
+   * standing pass renders as before; this bundle is never rendered twice
+   * (`ladder.marked`).
+   */
+  const markRejected = (
+    provability: RunProvability,
+    ladder: ProvabilityLadder,
+    bundle: ProofBundle,
+    bundlePath: string | undefined,
+  ): void => {
+    const target = provability.footerTarget ?? "stream";
+    if (target === "none" || !streamsTheTurn(provability)) return;
+    const footer = renderStanding(provability, bundle, bundlePath);
+    if (footer === undefined) return;
+    out.write(`${footer}\n`);
+    ladder.marked = bundle;
+  };
   /** The retry nudge; a composer that throws or says nothing still leaves the verdict. */
   const composeNudge = (provability: RunProvability, bundle: ProofBundle): string => {
     try {
@@ -10267,18 +10461,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     return true;
   };
   /**
-   * Was `url` handed to the run whole by an EXTERNAL tool's result — a
-   * search hit, a fetched page's own address, an MCP server's answer —
-   * somewhere in `messages`? Such a call already passed the egress fabric
-   * with what it sent, and its answer is the outside world's, so a HEAD to a
-   * URL it named carries nothing new back. A tool that computes inside the
-   * run never hands one, whatever it returns: an echo, a URL normalizer, a
-   * text join returns what the model gave it, so the model could compose a
-   * URL carrying a secret a tool read and have it "handed" back (the
-   * laundering the I10 review found through UrlNormalize).
+   * Did the OUTSIDE WORLD hand the run `url` whole, and nothing else put the
+   * tagged content it carries there? Only then does a HEAD to it carry
+   * nothing new back, and a lineage match on it is let through (§6.1, §10;
+   * Pillar 3). `egress` is what the screen's classification found. Both must
+   * hold:
+   *
+   *  1. a non-error result of an OUTSIDE READER holds the URL verbatim — a
+   *     tool that crosses the network (`ioCapability: "network"`) and writes
+   *     nothing (`readOnly`), or an MCP server (`mcp__*`, whose flags a spec
+   *     can only tighten, so none is ever `readOnly`): a search hit, a
+   *     fetched page's own address, an MCP server's answer. Its request
+   *     passed the egress fabric, and its answer is the outside world's.
+   *     `scope` is no test of that: a
+   *     local process tool is `external` too (GitCommit, GitDiff, Bash,
+   *     Format), and its result is text the model wrote — a commit message,
+   *     the diff of a file it edited — so a secret the model composed into a
+   *     URL comes back "handed" (the laundering the round-2 review found
+   *     through GitCommit, as round 1's did through UrlNormalize). A tool
+   *     that writes can echo what it sent, wherever it sent it;
+   *  2. every tagged string the URL carries came in only inside results that
+   *     hand the URL whole: no other tool result holds it, and it was tagged
+   *     as a tool's or an MCP server's answer. A secret a tool read sits in
+   *     that tool's result without the URL, so a reader that hands back a
+   *     file or a record the model wrote the URL into (an MCP filesystem
+   *     read) still hands nothing new: the secret came from elsewhere.
+   *     Content tagged from memory, a skill, a channel, a sub-agent or a
+   *     consult is never excused, and nor is a match the plain substring
+   *     reading cannot account for (a decoded view's, a custom matcher's).
    */
-  const handedByBoundary = (messages: readonly Anthropic.MessageParam[], url: string): boolean => {
-    const external = new Set<string>();
+  const handedByBoundary = (
+    messages: readonly Anthropic.MessageParam[],
+    url: string,
+    egress: { readonly matchCount: number },
+  ): boolean => {
+    const readerCall = new Map<string, boolean>();
+    const results: Array<{ readonly text: string; readonly handed: boolean }> = [];
     for (const message of messages) {
       if (!Array.isArray(message.content)) continue;
       for (const block of message.content as ReadonlyArray<unknown>) {
@@ -10286,20 +10504,42 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         const b = block as Record<string, unknown>;
         if (b["type"] === "tool_use" && typeof b["id"] === "string") {
           const name = typeof b["name"] === "string" ? b["name"] : "";
-          if (toolByName.get(name)?.scope === "external") external.add(b["id"]);
-          else external.delete(b["id"]);
-        } else if (
-          b["type"] === "tool_result" &&
-          typeof b["tool_use_id"] === "string" &&
-          external.has(b["tool_use_id"]) &&
-          b["is_error"] !== true &&
-          gateResultText(b["content"]).includes(url)
-        ) {
-          return true;
+          const tool = toolByName.get(name);
+          // An MCP server's answer is the outside world's whatever its flags
+          // say: a spec's MCP tool is never `readOnly` (its flags can only
+          // tighten), so reading it by the flag counted no search hit an MCP
+          // server returned. Condition 2 is what refuses a server that echoes
+          // what the model wrote. A local process tool never hands anything.
+          const outside =
+            tool?.ioCapability !== "process" &&
+            (name.startsWith("mcp__") ||
+              (tool?.readOnly === true && tool.ioCapability === "network"));
+          readerCall.set(b["id"], outside);
+        } else if (b["type"] === "tool_result" && typeof b["tool_use_id"] === "string") {
+          const text = gateResultText(b["content"]);
+          const reader = readerCall.get(b["tool_use_id"]) === true && b["is_error"] !== true;
+          results.push({ text, handed: reader && text.includes(url) });
         }
       }
     }
-    return false;
+    // 1 — handed whole by an outside reader.
+    if (!results.some((r) => r.handed)) return false;
+    // 2 — what the URL carries, as the plain substring reading finds it.
+    const carried: string[] = [];
+    let found = 0;
+    for (const [tagged, origin] of runContext.dataLineage ?? []) {
+      if (tagged.length < MIN_MATCH_LENGTH || !url.includes(tagged)) continue;
+      found += 1;
+      if (origin === "user") continue;
+      if (origin !== "tool" && origin !== "mcp") return false;
+      carried.push(tagged);
+    }
+    if (carried.length === 0 || egress.matchCount > found) return false;
+    return carried.every(
+      (tagged) =>
+        results.some((r) => r.handed && r.text.includes(tagged)) &&
+        results.every((r) => r.handed || !r.text.includes(tagged)),
+    );
   };
   /**
    * Pillar 3 sink-side fabric (design §6.1, §10) — the gate's own egress:
@@ -10310,12 +10550,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * request, and the verifier sends nothing. One `permission_decision`
    * trace event per screen, as on the tool path; the durable
    * `egress_decision` record is the verifier's, which also knows what the
-   * request came to. A URL an external tool's result handed the run
-   * VERBATIM (a search hit, a fetched page's own address —
-   * {@link handedByBoundary}) carries nothing new back to its host, so a
-   * match on it is let through, and the event says why: refusing it would
-   * fail an honest citation of a search result. Built per verification
-   * over the transcript it reads.
+   * request came to. A URL an outside reader's result handed the run
+   * VERBATIM (a search hit, a fetched page's own address), carrying nothing
+   * that reached the run any other way ({@link handedByBoundary}), carries
+   * nothing new back to its host, so a match on it is let through, and the
+   * event says why: refusing it would fail an honest citation of a search
+   * result. Built per verification over the transcript it reads.
    */
   const gateEgressScreen =
     (messages: readonly Anthropic.MessageParam[]) =>
@@ -10325,7 +10565,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         sinkScope: "external-dynamic",
         ...(opts.egressMatcher !== undefined ? { matcher: opts.egressMatcher } : {}),
       });
-      const handed = egress.verdict === "block" && handedByBoundary(messages, payload);
+      const handed = egress.verdict === "block" && handedByBoundary(messages, payload, egress);
       const verdict = handed ? "pass" : egress.verdict;
       bus.publish({
         ...bus.envelope(),
@@ -10433,10 +10673,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // 2 — verify.
     let verified: unknown;
     let verifyFailure: { readonly error: unknown } | undefined;
-    out.spinner.start("verifying");
-    try {
-      verified = await provability.verify({
-        finalText: terminalText(attempt.terminalContent),
+    const finalText = terminalText(attempt.terminalContent);
+    const verifyText = (text: string): Promise<ProofBundle> =>
+      provability.verify({
+        finalText: text,
         messages,
         isSynthetic: isSyntheticMessage,
         usage: attempt.usage,
@@ -10461,6 +10701,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
         screenEgress: gateEgressScreen(messages),
       });
+    out.spinner.start("verifying");
+    try {
+      verified = await verifyText(finalText);
+      // §5.4 — where the turn streams to its reader, a final message that
+      // states nothing ("Done.", "See above.") is not the answer the reader
+      // holds: what the turn printed above it is. Its vacuous pass would put
+      // a ✓ under claims nobody graded — a claim made before a tool call, a
+      // rejected attempt the next one points back at — so that text is
+      // graded instead. A final message that makes a claim is the answer,
+      // graded alone, as on every surface.
+      const shown = streamsTheTurn(provability)
+        ? streamedTurnText(messages, ladder.rejectedThrough)
+        : undefined;
+      if (
+        shown !== undefined &&
+        shown.trim() !== "" &&
+        shown !== finalText &&
+        isGradedBundle(verified) &&
+        verified.verdict === "pass" &&
+        verified.claimCount === 0
+      ) {
+        verified = await verifyText(shown);
+      }
     } catch (err) {
       verifyFailure = { error: err };
     } finally {
@@ -10511,6 +10774,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // Decided BEFORE the publish so a failing pass names the rung it hands
     // the turn to (`escalatedTo`), as the evaluation cascade's does.
     const failing = bundle.verdict === "fail";
+    // What this pass graded is graded: a later claimless message's streamed
+    // text starts after it (`streamedTurnText`).
+    if (failing) ladder.rejectedThrough = messages[messages.length - 1];
     const spent = ladder.reruns >= maxRetries;
     if (failing && provability.onFail === "escalate" && ladder.escalation === undefined) {
       ladder.escalation = { target: resolveProvabilityEscalation(provability) };
@@ -10624,6 +10890,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     }
     if (spent || stopped || capped) return { kind: "stands", aborted: stopped };
     const nudge = composeNudge(provability, bundle);
+    markRejected(provability, ladder, bundle, bundlePath);
     if (escalateTo !== undefined) return { kind: "escalate", nudge, target: escalateTo };
     return { kind: "retry", nudge };
   }
@@ -10695,15 +10962,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   };
 
   /**
-   * §5.4 — a gated attempt handed back to its call site. Only the STANDING
-   * pass is rendered, and only when it graded this very attempt (one the
-   * abort tree stopped before its pass was recorded shows nothing; a failed
-   * retry is never shown). `footerTarget: "stream"` writes it to the run's
-   * output after the answer, on its own line; `"reply"` hands it back as
-   * `footer` for the caller to append to the text the run returns;
-   * `"none"` renders nothing (the caller carries the bundle itself, as the
-   * managed gateway's `proof` field does). It never enters `messages`: the
-   * model must not read its own footer next turn.
+   * §5.4 — a gated attempt handed back to its call site. The STANDING pass
+   * is rendered, and only when it graded this very attempt (one the abort
+   * tree stopped before its pass was recorded shows nothing). A rejected
+   * attempt the reader never saw is never shown; one the reader saw stream
+   * past already carries its ✗ (`markRejected`), and an escalation that could
+   * not run leaves that same verdict standing, which is not written twice.
+   * `footerTarget: "stream"` writes it to the run's output after the answer,
+   * on its own line; `"reply"` hands it back as `footer` for the caller to
+   * append to the text the run returns; `"none"` renders nothing (the caller
+   * carries the bundle itself, as the managed gateway's `proof` field does).
+   * It never enters `messages`: the model must not read its own footer next
+   * turn.
    */
   const finishGated = (
     provability: RunProvability,
@@ -10713,7 +10983,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const target = provability.footerTarget ?? "stream";
     const standing = ladder.standing;
     const footer =
-      target !== "none" && standing !== undefined && standing.attempt === attempt
+      target !== "none" &&
+      standing !== undefined &&
+      standing.attempt === attempt &&
+      standing.bundle !== ladder.marked
         ? renderStanding(provability, standing.bundle, standing.bundlePath)
         : undefined;
     if (footer === undefined) return { ...attempt, gated: true };
@@ -10896,9 +11169,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // the run RETURNS (what a channel bot sends, what the gateway answers),
       // after a blank line — never in `messages`, so the transcript the model
       // reads next turn holds the answer alone. An empty answer carries the
-      // footer alone (no leading blank line).
-      if (footer === undefined) return answer;
-      return answer === "" ? footer : `${answer}\n\n${footer}`;
+      // footer alone (no leading blank line). Under `provability:` the text
+      // served is the answer with every footer-shaped line of it marked as
+      // the model's (`./forged-footer`, §1 principle 2): whatever `render`
+      // and the target say, no line the model wrote passes for the verdict.
+      // The transcript and the shadow keep its own words.
+      const served = opts.provability !== undefined ? neutralizeFooterLines(answer) : answer;
+      if (footer === undefined) return served;
+      return served === "" ? footer : `${served}\n\n${footer}`;
     } finally {
       // 0.6.0 §7.8 — the single turn IS the run. A per-message host
       // (`sideCallDrain`) takes the in-flight shadow and the served text

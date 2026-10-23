@@ -63,7 +63,20 @@ if any), `footerTarget` (`"stream"` on the cli, `"reply"` where the returned
 text is what gets sent, `"none"` where the caller carries the bundle on its
 own envelope and the returned text must be the answer alone — the managed
 gateway's `proof`, the channel eval bridge), `sandbox` (for `smt` / `lean4`), `resolveHead`,
-`onBundle`, and the test seams `judgeAdapter` / `now`.
+`onBundle`, and the test seams `judgeAdapter` / `now`. On `"stream"` the
+reader watches every attempt print, so the runtime marks a rejected attempt
+✗ before it re-runs the turn, and grades the turn's printed text when its
+final message states nothing ("Done."): since the last attempt a pass
+rejected (all of it when the final message points back at it, "See
+above."), with the narration of what the agent is about to do ("Let me fetch
+the policy page first.") left out. `streamed: true` says the same of a run
+whose footer rides the returned text but which prints every attempt as it
+goes (`crewhaus run --prompt`). The gate also names the run's own state
+directories to the verifier (`runtimeStateRoots`: a relocated session root,
+the proofs root, the tenant's roots, the environment's relocations), so a
+path under one is never a source. On every target a
+line of the answer shaped like the footer is served with
+`(model-written, not the verdict)` in front of it.
 
 Returns `{ evaluation?, provability?, tools, proofTools }`:
 
@@ -92,9 +105,12 @@ Returns `{ evaluation?, provability?, tools, proofTools }`:
   per-turn wiring asks once; each URL screened first by the run's egress
   fabric — `ProvabilityTurn.screenEgress`, the egress classifier over the
   run's data lineage at `external-dynamic` — so a URL carrying content a tool
-  read is never sent, unless an external tool's result (a search hit, a
-  fetched page) handed the run that URL verbatim — a tool that only computes
-  inside the run, an echo or a URL normalizer, never does; a refused URL is
+  read is never sent, unless an outside reader — a read-only tool that
+  crosses the network: a search hit, a fetched page — handed the run that URL
+  verbatim and nothing it carries reached the run any other way; a tool that
+  computes inside the run (an echo, a URL normalizer), a local process tool
+  (a commit, a diff of a file the model wrote) or one that writes never does,
+  and a secret another tool read stays refused whoever hands it back; a refused URL is
   `unresolved`, its detail naming the egress fabric; each
   request decided recorded as an `egress_decision`, sink
   `provability.resolve`, the screen's verdict and the origins it found, host
@@ -157,7 +173,12 @@ proof tools on the bundle's catalog, replacing a same-named builtin (or, in
 
 `ProvabilityPreflight` and `ProofCheckers` are read-only and carry a builtin
 `alwaysAllow` (permission-engine's bookkeeping rules), so the gate's own
-nudge never parks a headless turn; `ProofCheck` keeps the mode default.
+nudge never parks a headless turn. So does `ProofCheck(builtin)`: the
+sandbox-free checker writes one artifact under the proofs root and starts
+nothing, so the honest `proven` path runs unprompted on every surface.
+`ProofCheck(smt)` and `ProofCheck(lean4)` start a container and keep the mode
+default; on a channel or managed harness `crewhaus lint` says so
+(`provability-proofcheck-asks`), with the rule that allows them.
 
 ## The `provability` skill: `provabilitySkills(block)` / `renderGateSkills(ir)`
 

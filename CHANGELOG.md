@@ -16,7 +16,8 @@ it. At `proven` a proof checker accepted a proof of the claim. Before an
 answer is served, a deterministic gate checks each claim against the
 evidence the run recorded. An answer that falls short is retried,
 served with a visible ✗, handed to a stronger model, or refused, as the spec
-says. The verdict, a proof bundle, travels with the answer on every surface.
+says (on the cli, where an answer streams as it is written, a refused answer
+has already printed: its ✗ footer follows it and the run exits 37). The verdict, a proof bundle, travels with the answer on every surface.
 A spec without the block runs as before, apart from the changes listed
 next. 0.8.0 also ships the 0.7.1 hardening, which was never tagged; its notes
 follow these.
@@ -36,6 +37,28 @@ follow these.
   the tool use IDs a proof cites are recorded but not checked, and every
   view shows `[proven (unverified)]`, never `[proven]`. `ladder`, the
   default, is unchanged.
+- **The agent's tools cannot write the run's own record.** In every
+  harness, the gate and `continuity.proof` read what the runtime recorded
+  as evidence, which proves nothing if the agent can rewrite it. So the
+  agent's tools are kept out of the session logs (`.crewhaus/sessions`, or
+  wherever `CREWHAUS_SESSION_DIR` or the tenant puts them), the tool results
+  the runtime saved to a file because they were too long for the log
+  (`.crewhaus/tool-results`) and the proof bundles (`.crewhaus/proofs`). A
+  `Write`, `Edit` or other call that is not read-only and names a path
+  inside one is denied, and so is a tool that acts on everything beneath a
+  workspace directory holding one, such as `StateImport` or `StoreMigrate`
+  given `.crewhaus`. No permission rule can allow either; only
+  `--permission-mode bypass` lifts this. Reading from these directories is
+  not a write: a copy, an archive or an import of `.crewhaus` or a session
+  log runs as before, while a move of one does not. `CopyPath`, `MovePath`,
+  `RemovePath`, `ArchiveExtract`, `GitApplyPatch`, `StateImport` and
+  `StoreMigrate` also check where their own writes land and refuse one that
+  would reach these directories in every mode, bypass included: so removing
+  or moving `.crewhaus` itself is refused, and so are a patch that names
+  more files than can be checked and a `StateImport` whose `stateDir` is the
+  workspace root. `Bash` and `RunCommand` are not covered, because the
+  runtime cannot see where a shell command writes. Other paths under
+  `.crewhaus` are unaffected.
 - **A bundle with `evaluation:` compiles to different code.** This is the
   release's one change to the shape of generated code. A cli, channel or
   managed bundle used to carry its own copy of the in-loop judge; it now
@@ -57,6 +80,19 @@ follow these.
   default under `/tmp/crewhaus-tenants`). `crewhaus state backup` archives
   the harness's `.crewhaus` directory only, so back up the tenants root as
   well.
+- **`WebFetch` names the page it returned.** When a fetch is redirected,
+  the result's `URL:` line now gives the address the page came from, and a
+  new `Requested:` line gives the one the model asked for. The model reads
+  this header, so its text changes after a redirect; a fetch that is not
+  redirected prints the same header as before.
+- **`compile --emit-as cf-worker` warns about `evaluation:`.** The
+  Cloudflare Worker has never run the in-loop judge, and now says so with
+  an `accepted-but-unwired` warning. The edge compile also reports the spec
+  and lowering warnings a local `compile` gives. With `--strict` any of
+  these fails the compile, so a `--strict` edge build of a spec with
+  `evaluation:` that passed before now fails: remove the block, or compile
+  without `--emit-as`. The hosted compile returns the same warnings beside
+  the bundle and still succeeds.
 
 **What's new.**
 
@@ -77,12 +113,20 @@ follow these.
   in the trace and the session log (`crewhaus sessions tail` shows it), a
   hash-chained audit record when the audit sink is wired, and a JSON file
   under `.crewhaus/proofs/`.
+- **A source the run wrote itself is marked.** If a claim is grounded in
+  text the run itself wrote to that file or URL earlier (a `Write`, then a
+  `Read`), it still passes, but the bundle names the call that wrote it, the
+  footer reads `1 source (1 written by this run)`, and `crewhaus provability
+  audit` lists it among its gaming signals.
 - **Proof tools and checkers.** `ProofCheckers`, `ProofCheck` and
   `ProvabilityPreflight` (category `proof`, part of `all-safety`).
   `ProofCheck` runs the built-in certificate checker, which needs no
   sandbox, or Z3 or Lean 4, which run only in a container sandbox. Their
   images publish as `ghcr.io/crewhaus/sandbox-z3` and
-  `ghcr.io/crewhaus/sandbox-lean4`.
+  `ghcr.io/crewhaus/sandbox-lean4`. The built-in checker runs without
+  approval (a default `alwaysAllow ProofCheck(builtin)`), so a `proven`
+  harness works headless; Z3 and Lean 4 start a container and still ask,
+  and `crewhaus lint` warns about that on a channel or managed spec.
 - **`crewhaus provability show | check | audit | checkers | prune`.**
   `check` runs the gate offline over any document and exits 1 on a fail, so
   a generated report can be gated in CI.
@@ -91,8 +135,9 @@ follow these.
   on, the `provability` default skill teaches the model how to cite.
 - **Eval and optimization.** `crewhaus eval --provability <rung>` measures a
   rung without editing the spec, the `provability.*` graders score every
-  sample's bundle, and a dataset sample can set its own floor and the
-  sources it expects. The optimizer may tune `threshold`, `max_retries` and
+  sample's bundle (a channel bot evaluated through `compile
+  --with-eval-harness` included), and a dataset sample can set its own floor
+  and the sources it expects. The optimizer may tune `threshold`, `max_retries` and
   the grounding window, never the floor or `on_fail`. `crewhaus advise` flags
   a harness whose answers keep failing the gate, and the watch-me report
   reads the gate's verdicts.

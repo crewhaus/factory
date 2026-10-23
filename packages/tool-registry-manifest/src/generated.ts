@@ -193,7 +193,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path", beneath: "all" },
+      { field: "source", kind: "path", beneath: "all", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["fsx", "code", "filesystem"],
@@ -212,7 +212,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "archive", kind: "path" },
+      { field: "archive", kind: "path", reads: true },
       { field: "destination", kind: "path", beneath: "all" },
     ],
     categories: ["fsx", "code", "filesystem"],
@@ -963,7 +963,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "paths", kind: "path" },
+      { field: "paths", kind: "path", reads: true },
       { field: "destination", kind: "path" },
     ],
     categories: ["fsx", "code", "filesystem"],
@@ -1078,7 +1078,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path", beneath: "all" },
+      { field: "source", kind: "path", beneath: "all", reads: true },
       { field: "destination", kind: "path", beneath: "all" },
     ],
     categories: ["fsx", "code", "filesystem"],
@@ -2705,7 +2705,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["media", "content"],
@@ -4156,7 +4156,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["media", "content"],
@@ -4232,7 +4232,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["media", "content"],
@@ -4251,7 +4251,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "database", kind: "path" },
-      { field: "file", kind: "path" },
+      { field: "file", kind: "path", reads: true },
     ],
     categories: ["sql", "data-stores"],
     package: "@crewhaus/tool-sql",
@@ -4284,7 +4284,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "database", kind: "path" },
-      { field: "file", kind: "path" },
+      { field: "file", kind: "path", reads: true },
     ],
     categories: ["sql", "data-stores"],
     package: "@crewhaus/tool-sql",
@@ -5747,7 +5747,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "inputs.path", kind: "path" },
+      { field: "inputs.path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["documents", "content"],
@@ -5765,7 +5765,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
     categories: ["documents", "content"],
@@ -7480,7 +7480,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", readsWhen: "outputDir" },
       { field: "outputDir", kind: "path", beneath: "all" },
     ],
     categories: ["fsx", "code", "filesystem"],

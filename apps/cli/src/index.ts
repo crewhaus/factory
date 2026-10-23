@@ -4901,11 +4901,16 @@ async function runRunCli(
   // this tool list (read at replay time); the proof tools join the list here,
   // replacing a same-named builtin the spec listed and ahead of the plugins.
   // The footer streams after a REPL answer and rides the printed `--prompt`
-  // result. Neither block → nothing is built.
+  // result. `--prompt` still prints every attempt to stdout as it is
+  // written, so its reader reads the turn as it streams (`streamed`): a
+  // rejected attempt is marked ✗ under it, and a claimless final message has
+  // the printed turn graded in its place, as in the REPL (design §5.4).
+  // Neither block → nothing is built.
   const gates = await gateRunOptions(ir, {
     cwd: process.cwd(),
     catalog: { get: (name) => tools.find((t) => t.name === name) },
     footerTarget: oneShotPrompt !== undefined ? "reply" : "stream",
+    ...(oneShotPrompt !== undefined ? { streamed: true } : {}),
   });
   if (gates.proofTools.length > 0) tools = mergeGateTools(tools, gates);
 

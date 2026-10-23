@@ -95,6 +95,21 @@ describe("classifyDefinition — every kind", () => {
     expect(classifyDefinition("./a.md#")).toEqual({ kind: "path", path: "./a.md" });
   });
 
+  test("path: %23 and %25 name a # and a %, so a file name holding # can be cited (I67)", () => {
+    expect(classifyDefinition("./a%23b.md")).toEqual({ kind: "path", path: "./a#b.md" });
+    expect(classifyDefinition("<./sources/notes %232.md>")).toEqual({
+      kind: "path",
+      path: "./sources/notes #2.md",
+    });
+    // One pass: %2523 is a literal %23, never a #.
+    expect(classifyDefinition("./a%2523b.md")).toEqual({ kind: "path", path: "./a%23b.md" });
+    // Every other % is the file's own character.
+    expect(classifyDefinition("./50%.md")).toEqual({ kind: "path", path: "./50%.md" });
+    expect(classifyDefinition("./a%20b.md")).toEqual({ kind: "path", path: "./a%20b.md" });
+    // A # written plainly still starts the fragment.
+    expect(classifyDefinition("./x#y.md")).toEqual({ kind: "path", path: "./x", fragment: "y.md" });
+  });
+
   test("tool, proof: the first word after the prefix", () => {
     expect(classifyDefinition("tool:toolu_01H")).toEqual({ kind: "tool", toolUseId: "toolu_01H" });
     expect(classifyDefinition("Tool: toolu_01H (MoneyAdd)")).toEqual({

@@ -352,13 +352,68 @@ export function standingBundleFromEvents(
   let last: Extract<TraceEvent, { kind: "provability_graded" }> | undefined;
   for (const event of events) if (event.kind === "provability_graded") last = event;
   if (last?.bundlePath === undefined) return undefined;
-  const path = isAbsolute(last.bundlePath) ? last.bundlePath : resolve(cwd, last.bundlePath);
+  return gradedBundleAt(last.bundlePath, last.bundleHash, cwd);
+}
+
+/**
+ * The standing bundle recorded by a session's own event log — the sample's
+ * `transcript.jsonl`: the file its LAST `provability_graded` line points at
+ * (`bundlePath`, as persisted), held to that line's `bundleHash` exactly as
+ * {@link standingBundleFromEvents} holds an event's. For a runtime entry
+ * whose trace events never reach the runner's bus: the bridged channel bot's
+ * `runTurn` mints its own RunContext, so its gate's `provability_graded`
+ * event stays inside the bot, while the line the gate logs lands in the
+ * session log the bridge roots in the sample directory. An `on_fail: halt`
+ * throws before any invoker returns, and its line is logged first. Lines
+ * that do not parse are skipped (the log is append-only; a torn last line
+ * is not a verdict). `undefined` when no line names a bundle that is there
+ * and matches.
+ */
+export function standingBundleFromTranscript(
+  transcriptPath: string,
+  cwd: string = process.cwd(),
+): ProofBundle | undefined {
+  let text: string;
+  try {
+    text = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  let last: { readonly bundlePath: string; readonly bundleHash: string } | undefined;
+  for (const line of text.split("\n")) {
+    if (!line.includes('"provability_graded"')) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof entry !== "object" || entry === null) continue;
+    const { kind, payload } = entry as { kind?: unknown; payload?: unknown };
+    if (kind !== "provability_graded" || typeof payload !== "object" || payload === null) continue;
+    const { bundlePath, bundleHash: hash } = payload as Record<string, unknown>;
+    // A pass whose bundle was not persisted names none: it still supersedes
+    // the passes before it, so none of theirs is the standing one.
+    last =
+      typeof bundlePath === "string" && typeof hash === "string"
+        ? { bundlePath, bundleHash: hash }
+        : undefined;
+  }
+  return last === undefined ? undefined : gradedBundleAt(last.bundlePath, last.bundleHash, cwd);
+}
+
+/**
+ * The bundle persisted at `bundlePath`, when it is there and its content
+ * hashes to `hash` — recomputed over the file (`@crewhaus/provability`'s
+ * `bundleHash`), never read off its own `bundleHash` field, which an edit
+ * after persist would keep.
+ */
+function gradedBundleAt(bundlePath: string, hash: string, cwd: string): ProofBundle | undefined {
+  const path = isAbsolute(bundlePath) ? bundlePath : resolve(cwd, bundlePath);
   if (!existsSync(path)) return undefined;
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-    return isBundleLike(parsed) &&
-      parsed.bundleHash === last.bundleHash &&
-      bundleHash(parsed) === last.bundleHash
+    return isBundleLike(parsed) && parsed.bundleHash === hash && bundleHash(parsed) === hash
       ? parsed
       : undefined;
   } catch {

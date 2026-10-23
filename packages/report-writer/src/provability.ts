@@ -28,7 +28,9 @@
  *     its absolute path outside the workspace — spelled so the grammar reads
  *     it back as that same file, or left as its URL when no spelling does
  *     (`pathSpelling`). After them, each assumption a branch declared, under
- *     a label no other branch uses (`[A1]: assume: …`, design §2);
+ *     a label no other branch uses (`[A1]: assume: …`, design §2), its text
+ *     shown as the characters it is (`asText`: no tag of the branch's opens
+ *     in the writer's lines);
  *   - a `## Provability` section after `## Citations` UNCONDITIONALLY — the
  *     `NO_CITATIONS_NOTICE` posture: an ungated report must never pass for a
  *     gated one, so the verdict is printed whatever it is, and `render:` (a
@@ -49,8 +51,9 @@
  *     assumptions, and is counted and capped by `assumptions` /
  *     `max_assumptions` as on every shape (design §2). A heading that would
  *     read as one of the writer's own sections (`## Provability`,
- *     `## Citations`) is escaped, so the only verdict a reader sees is the
- *     writer's (§5.4). And a code fence the
+ *     `## Citations`, as a renderer shows it however it is spelled) is
+ *     escaped, so the only verdict a reader sees is the writer's (§5.4).
+ *     And a code fence the
  *     answer leaves open (an answer cut off mid-block) is closed at its end,
  *     so it cannot turn every later branch into code the claim reader skips.
  *     The JSON's `subAnswers` keep each answer as the model wrote it.
@@ -572,7 +575,10 @@ function definitionBody(
   label: string,
 ): number[] {
   const below: number[] = [];
-  let text = label;
+  // The end of the text so far, all `runsOn` reads: the last line taken,
+  // after the blank that joins it to the text above. Kept whole, the text
+  // was re-trimmed on every line — quadratic in the definition's length.
+  let end = label;
   for (let j = i + 2; j < pieces.length; j += 2) {
     const line = pieces[j] as string;
     if (line.trim() === "" || isDefinitionLine(line) || FENCE_LINE.test(line)) break;
@@ -584,11 +590,11 @@ function definitionBody(
       const source =
         label === "" && below.length === 0
           ? namesSource(trimmed, false)
-          : opensWithSource(trimmed) || runsOn(text, trimmed);
+          : opensWithSource(trimmed) || runsOn(end, trimmed);
       if (!source) break;
     }
     below.push(j);
-    text = `${text} ${trimmed}`.trim();
+    end = end === "" ? trimmed : ` ${trimmed}`;
   }
   return below;
 }
@@ -808,20 +814,256 @@ function hoistAssumptions(
 }
 
 /**
- * The name a heading shows, folded for comparison: compatibility forms
- * folded (NFKC), emphasis, escapes and punctuation dropped, lower case —
- * `**Provability**` and `PROVABILITY:` are both `provability`.
+ * The writer's own sections (design §5.4). A heading reads as one when the
+ * first word a reader sees in it is one of these, in any case.
  */
-const headingName = (text: string): string =>
-  text
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .toLowerCase();
+const WRITER_SECTIONS = ["provability", "citations"] as const;
 
-/** Does a heading's text name one of the writer's own sections (`## Citations`, `## Provability`)? */
-const namesWriterSection = (text: string): boolean =>
-  /^(?:citations|provability)(?:\s|$)/.test(headingName(text));
+/**
+ * Where a reading of a heading's text has got to in the names, one bit per
+ * place: before each letter of each name, and past each name's end. A set of
+ * readings is one number, and seeing a letter is one shift. `first` holds
+ * each name's start, `last` each name's end, `before` the places before
+ * each letter, `along` every place before a letter (what any one character
+ * may move past).
+ */
+const PLACES = (() => {
+  let first = 0;
+  let last = 0;
+  let bit = 0;
+  const before = new Map<string, number>();
+  for (const name of WRITER_SECTIONS) {
+    first |= 1 << bit;
+    for (const letter of name) before.set(letter, (before.get(letter) ?? 0) | (1 << bit++));
+    last |= 1 << bit++;
+  }
+  return { first, last, along: [...before.values()].reduce((a, b) => a | b, 0), before };
+})();
+
+/** A reading that has seen a whole name, then a break: the heading reads as a writer section. */
+const NAMED = 1 << 30;
+
+/** The readings after a letter or digit a reader sees: each that expects it moves past it. */
+const sawLetter = (s: number, letter: string): number =>
+  ((s & (PLACES.before.get(letter) ?? 0)) << 1) | (s & NAMED);
+
+/**
+ * The readings after a blank or a mark a reader sees: one before a name has
+ * not started (`*:* Provability` opens with the name), one past a name's end
+ * has read it, and one mid-name has read some other word.
+ */
+const sawBreak = (s: number): number =>
+  (s & (PLACES.first | NAMED)) | ((s & PLACES.last) !== 0 ? NAMED : 0);
+
+/** The readings after one character that may show as anything, or as nothing. */
+const sawAny = (s: number): number => s | ((s & PLACES.along) << 1) | sawBreak(s);
+
+/** Characters that show as nothing, or at most as a break: zero-width ones, the soft hyphen, format marks. */
+const INVISIBLE = /^[\p{Default_Ignorable_Code_Point}\p{Cf}]$/u;
+
+const isAsciiLetter = (code: number): boolean => (code | 0x20) >= 0x61 && (code | 0x20) <= 0x7a;
+
+/**
+ * The readings after a character a reader sees, as the letters it reads as:
+ * compatibility forms folded (`ℙ` is P, `㏚` is PR), lower case, accents
+ * dropped (`ö` is o).
+ */
+function sawChar(s: number, ch: string): number {
+  if (s === 0) return 0;
+  const code = ch.charCodeAt(0);
+  if (code < 0x80) {
+    // `| 0x20` lowers a letter and leaves a digit as it is.
+    const alnum = isAsciiLetter(code) || (code >= 0x30 && code <= 0x39);
+    return alnum ? sawLetter(s, String.fromCharCode(code | 0x20)) : sawBreak(s);
+  }
+  if (INVISIBLE.test(ch)) return s | sawBreak(s);
+  let out = s;
+  const letters = ch.normalize("NFKD").toLowerCase().normalize("NFKD").replace(/\p{M}/gu, "");
+  for (const c of letters) out = /[\p{L}\p{N}]/u.test(c) ? sawLetter(out, c) : sawBreak(out);
+  return out;
+}
+
+/**
+ * What a heading's text may be inside of, as a renderer reads it: its text,
+ * a character reference's name, a tag (`<` read, `</` read, the tag, a quoted
+ * attribute value), a comment or declaration, a link's destination or label.
+ * All but the text are hidden.
+ */
+const IN_TEXT = 0;
+const IN_REF_NAME = 1;
+const IN_LT = 2;
+const IN_LT_SLASH = 3;
+const IN_TAG = 4;
+const IN_TAG_DQ = 5;
+const IN_TAG_SQ = 6;
+const IN_COMMENT = 7;
+const IN_DESTINATION = 8;
+const IN_LABEL = 9;
+const MODES = 10;
+
+/** A numeric character reference, read as a browser reads one: every digit, the `;` optional. */
+const NUMERIC_REF = /&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?/y;
+
+/** Markdown a renderer may take as markup and hide, or show: emphasis, strikethrough, code, escapes, marks, inserts, superscripts, an image's `!`, a label's `]`. */
+const MAY_HIDE = new Set(["*", "_", "~", "`", "\\", "=", "^", "+", "!", "]"]);
+
+/** The characters that end a hidden reading: a tag's `>` and quotes, a comment's `>`, a destination's `)`, a label's `]`. */
+const ENDS_HIDDEN = /["'>)\]]/g;
+
+/** The character a numeric reference shows; a C1 control is a windows-1252 letter to a browser and nothing to markdown, so anything. */
+function sawReference(s: number, ref: RegExpExecArray): number {
+  const value = ref[1] !== undefined ? Number.parseInt(ref[1], 16) : Number(ref[2]);
+  if (value >= 0x80 && value <= 0x9f) return sawAny(s);
+  const valid = value > 0 && value <= 0x10ffff && (value < 0xd800 || value > 0xdfff);
+  return sawChar(s, valid ? String.fromCodePoint(value) : "\ufffd");
+}
+
+/**
+ * Reads text as every renderer might show it, for one question: does a
+ * heading in it read as one of the writer's sections? Each way a construct
+ * can render is a reading, kept apart by what it is inside of (`MODES`) and
+ * folded into one set of places per mode, so the text is read once, in
+ * linear time, whatever it holds (design §10). What a renderer may hide is
+ * read both hidden and shown — emphasis and the like (`MAY_HIDE`), and a
+ * `<…>` read as markup (a tag to its `>` outside quotes, a comment to some
+ * `>`) and as text; a named reference (`&Popf;`, `&shy;`, `&ocirc` with no
+ * `;`) shows any one character or none, its name hidden as far as it might
+ * run; a numeric one shows its character, decoded; an invisible character
+ * shows nothing, or a break. A link's destination and label are hidden as
+ * far as any `)` or `]`.
+ *
+ * `start` begins a reading where a heading may begin; `names` says whether
+ * one has read a writer section's name as the heading's first word — on a
+ * break after it, or at the end of what was read.
+ */
+function sectionReader(): {
+  readonly start: () => void;
+  readonly reset: () => void;
+  readonly read: (text: string) => void;
+  readonly names: () => boolean;
+} {
+  let modes = new Array<number>(MODES).fill(0);
+  let next = new Array<number>(MODES).fill(0);
+  let named = false;
+  const add = (mode: number, s: number): void => {
+    next[mode] = (next[mode] as number) | s;
+    if ((s & NAMED) !== 0) named = true;
+  };
+  const inText = (s: number, ch: string): void => {
+    if (ch === "<") {
+      add(IN_TEXT, sawBreak(s));
+      add(IN_LT, s);
+    } else if (ch === "&") {
+      add(IN_TEXT, sawBreak(s));
+      add(IN_REF_NAME, sawAny(s));
+    } else if (ch === "(") {
+      add(IN_TEXT, sawBreak(s));
+      add(IN_DESTINATION, s);
+    } else if (ch === "[") {
+      add(IN_TEXT, s | sawBreak(s));
+      add(IN_LABEL, s);
+    } else {
+      add(IN_TEXT, MAY_HIDE.has(ch) ? s | sawBreak(s) : sawChar(s, ch));
+    }
+  };
+  const step = (mode: number, s: number, ch: string, code: number): void => {
+    switch (mode) {
+      case IN_TEXT:
+        inText(s, ch);
+        return;
+      case IN_REF_NAME:
+        // The name may run on through this character, hidden, or have ended before it.
+        if (isAsciiLetter(code) || (code >= 0x30 && code <= 0x39)) add(IN_REF_NAME, s);
+        else if (ch === ";") add(IN_TEXT, s);
+        inText(s, ch);
+        return;
+      case IN_LT:
+        if (isAsciiLetter(code)) add(IN_TAG, s);
+        else if (ch === "/") add(IN_LT_SLASH, s);
+        else if (ch === "!" || ch === "?") add(IN_COMMENT, s);
+        return;
+      case IN_LT_SLASH:
+        if (isAsciiLetter(code)) add(IN_TAG, s);
+        return;
+      case IN_TAG:
+        // A quote opens a value after `=`, and is part of a name anywhere else.
+        if (ch === '"') add(IN_TAG_DQ, s);
+        else if (ch === "'") add(IN_TAG_SQ, s);
+        add(ch === ">" ? IN_TEXT : IN_TAG, s);
+        return;
+      case IN_TAG_DQ:
+        add(ch === '"' ? IN_TAG : IN_TAG_DQ, s);
+        return;
+      case IN_TAG_SQ:
+        add(ch === "'" ? IN_TAG : IN_TAG_SQ, s);
+        return;
+      default: {
+        // A comment, a destination or a label: hidden, and over at some `>`, `)` or `]`.
+        const end = mode === IN_COMMENT ? ">" : mode === IN_DESTINATION ? ")" : "]";
+        add(mode, s);
+        if (ch === end) add(IN_TEXT, s);
+      }
+    }
+  };
+  return {
+    start: () => {
+      modes[IN_TEXT] = (modes[IN_TEXT] as number) | PLACES.first;
+    },
+    reset: () => {
+      modes.fill(0);
+      named = false;
+    },
+    read: (text: string) => {
+      let i = 0;
+      while (i < text.length && !named) {
+        let alive = 0;
+        for (const s of modes) alive |= s;
+        if (alive === 0) return;
+        const shown =
+          (modes[IN_TEXT] as number) |
+          (modes[IN_REF_NAME] as number) |
+          (modes[IN_LT] as number) |
+          (modes[IN_LT_SLASH] as number);
+        if (shown === 0) {
+          // Hidden readings only: nothing changes them before the next character that ends one.
+          ENDS_HIDDEN.lastIndex = i;
+          if (ENDS_HIDDEN.exec(text) === null) return;
+          i = ENDS_HIDDEN.lastIndex - 1;
+        }
+        const code = text.charCodeAt(i);
+        NUMERIC_REF.lastIndex = i;
+        const ref = code === 0x26 ? NUMERIC_REF.exec(text) : null;
+        const ch =
+          code < 0xd800 || code > 0xdbff
+            ? (text[i] as string)
+            : String.fromCodePoint(text.codePointAt(i) as number);
+        next.fill(0);
+        for (let mode = 0; mode < MODES; mode++) {
+          const s = modes[mode] as number;
+          if (s === 0) continue;
+          if (ref === null) step(mode, s, ch, code);
+          else if (mode === IN_TEXT || mode === IN_REF_NAME) {
+            // Decoded, or shown as the characters it is.
+            let literal = s;
+            for (const c of ref[0]) literal = sawChar(literal, c);
+            add(IN_TEXT, sawReference(s, ref) | literal);
+          } else if (mode !== IN_LT && mode !== IN_LT_SLASH) add(mode, s);
+        }
+        [modes, next] = [next, modes];
+        i += ref !== null ? ref[0].length : ch.length;
+      }
+    },
+    names: () => named || modes.some((s) => (s & PLACES.last) !== 0),
+  };
+}
+
+/** Does a heading's text read as one of the writer's own sections (`## Citations`, `## Provability`)? */
+function namesWriterSection(text: string): boolean {
+  const reader = sectionReader();
+  reader.start();
+  reader.read(text);
+  return reader.names();
+}
 
 /** What may open a line before a heading's marker: an indent, block quotes, list item markers. */
 const CONTAINER_PREFIX = String.raw`[ \t]*(?:(?:>|[-*+](?=[ \t])|\d{1,9}[.)](?=[ \t]))[ \t]*)*`;
@@ -838,18 +1080,11 @@ const ATX_HEADING = new RegExp(String.raw`^(${CONTAINER_PREFIX})(#{1,6})((?:[ \t
  */
 const SETEXT_UNDERLINE = /^([ \t]*(?:>[ \t]*)*)((?:=+|-+)[ \t]*)$/;
 
-/**
- * An HTML heading's opening tag, `<h2>` or `<H2 class="x">`. Its attributes
- * stop at the next `<`, so a run of unclosed `<h2` is read in one pass.
- */
-const HTML_HEADING = /<h[1-6](?=[\s>/])[^<>]*>/gi;
+/** A blank line, CommonMark's: spaces and tabs only, after any block-quote markers. */
+const BLANK_IN_QUOTE = /^[ \t]*(?:>[ \t]*)*$/;
 
-/**
- * How many lines over a setext underline are read as its heading: a heading
- * is short, and reading a bounded tail keeps a long paragraph under many
- * underlines linear (design §10: no super-linear work on untrusted text).
- */
-const SETEXT_LINES = 3;
+/** Where an HTML heading opens: `<h2>`, `<H2 class="x">`. */
+const HTML_HEADING = /<h[1-6](?=[\s>/])/gi;
 
 /**
  * A branch answer whose headings cannot pass for the writer's own sections
@@ -857,44 +1092,74 @@ const SETEXT_LINES = 3;
  * a branch answer is untrusted text — the model's, steered by every page it
  * read — so one holding its own `## Provability … **Verdict:** pass ✓`
  * would show a reader a passing verdict above the writer's real one. Any
- * heading that names a writer section is escaped wherever it sits, code
+ * heading that reads as a writer section is escaped wherever it sits, code
  * included (a code sample costs a visible `\`, never the reader a forged
  * verdict): ATX (`## Provability`, in a list item or a quote too), setext
  * (`Provability` over `---` — the underline escaped, so the paragraph reads
- * as the text it is; any of the last lines over it may start the heading,
- * since the line above may be a block of its own) and HTML (`<h2>`, its `<`
- * written as `&lt;`, which reads as text inside an HTML block as well as in
- * a paragraph). The gate then reads the forged lines as the sentences they
- * are.
+ * as the text it is) and HTML (`<h2>`, its `<` written as `&lt;`, which
+ * reads as text inside an HTML block as well as in a paragraph). The gate
+ * then reads the forged lines as the sentences they are.
+ *
+ * "Reads as" is what a renderer shows, not how the text is spelled
+ * (`sectionReader`): `## &#80;rovability`, `## Prov*a*bility`,
+ * `## Provabil<!-- -->ity` and a name with a zero-width space or a soft
+ * hyphen in it all show Provability. A setext heading is its whole
+ * paragraph, so a reading starts on every line since the last blank line or
+ * setext heading (the line above may be a block of its own); an HTML
+ * heading runs to wherever its tag and its text end, so one reading starts
+ * at each `<h…` and every one of them is escaped if any reads as a writer
+ * section. Out of reach of a name read this way: another script's
+ * lookalike letters, and an image, which may show anything.
  */
 function withoutWriterSections(answer: string): string {
   const pieces = answer.split(/(\r\n|\r|\n|\u2028|\u2029)/);
+  const paragraph = sectionReader();
   for (let i = 0; i < pieces.length; i += 2) {
     const line = pieces[i] as string;
-    const atx = ATX_HEADING.exec(line);
-    if (atx !== null) {
-      if (namesWriterSection(atx[3] as string)) pieces[i] = `${atx[1]}\\${atx[2]}${atx[3]}`;
+    const content = line.replace(LEADING_CONTAINERS, "");
+    // A setext underline is read off the line as written, before anything
+    // calls it blank: `- ` under a paragraph line is an underline (an empty
+    // list item cannot interrupt a paragraph), and stripped as a list
+    // marker it looked like a blank line, so "Provability\n- " rendered a
+    // writer's heading unescaped.
+    const underline = SETEXT_UNDERLINE.exec(line);
+    if (underline !== null) {
+      if (!paragraph.names()) {
+        // A heading of some other name, a thematic break or an empty item:
+        // each ends the paragraph.
+        paragraph.reset();
+        continue;
+      }
+      // Escaped, the underline is a line of the paragraph it would have ended.
+      pieces[i] = `${underline[1]}\\${underline[2]}`;
+      paragraph.read(`${content}\n`);
       continue;
     }
-    const underline = SETEXT_UNDERLINE.exec(line);
-    if (underline === null) continue;
-    let text = "";
-    for (let j = i - 2, n = 0; j >= 0 && n < SETEXT_LINES; j -= 2, n++) {
-      const above = (pieces[j] as string).replace(LEADING_CONTAINERS, "").trim();
-      if (above === "") break;
-      text = `${above} ${text}`;
-      if (namesWriterSection(text)) {
-        pieces[i] = `${underline[1]}\\${underline[2]}`;
-        break;
-      }
+    // Blank as CommonMark reads it: spaces and tabs only, inside any block
+    // quote. A line of no-break or ideographic spaces is paragraph text, and
+    // a paragraph it continues can still be underlined into a heading.
+    if (BLANK_IN_QUOTE.test(line)) {
+      paragraph.reset();
+      continue;
     }
+    const atx = ATX_HEADING.exec(line);
+    if (atx !== null && namesWriterSection(atx[3] as string)) {
+      pieces[i] = `${atx[1]}\\${atx[2]}${atx[3]}`;
+    }
+    paragraph.start();
+    paragraph.read(`${content}\n`);
   }
-  return pieces.join("").replace(HTML_HEADING, (tag: string, at: number, whole: string) => {
-    const after = whole.slice(at + tag.length, at + tag.length + 300);
-    const close = after.search(/<\/h[1-6]\s*>/i);
-    const inner = (close === -1 ? after : after.slice(0, close)).replace(/<[^>]*>/g, " ");
-    return namesWriterSection(inner) ? `&lt;${tag.slice(1)}` : tag;
-  });
+  const joined = pieces.join("");
+  const html = sectionReader();
+  let from = -1;
+  for (const open of joined.matchAll(HTML_HEADING)) {
+    if (from !== -1) html.read(joined.slice(from, open.index));
+    html.start();
+    from = open.index;
+  }
+  if (from === -1) return joined;
+  html.read(joined.slice(from));
+  return html.names() ? joined.replace(HTML_HEADING, (tag) => `&lt;${tag.slice(1)}`) : joined;
 }
 
 /**
@@ -934,6 +1199,17 @@ function closeFences(answer: string): string {
   return answer;
 }
 
+/**
+ * A branch's text, shown in the writer's own lines as the characters it is:
+ * `&` and `<` written as references, so it opens no tag and decodes to
+ * nothing else. An assumption is the branch's — untrusted, like its answer
+ * — but it moves up into the writer's definitions, under the title, and the
+ * verdict section lists it again; an `<h2>Provability</h2>` in it would be
+ * a heading there, above every branch (design §5.4). It sits mid-line,
+ * after its label, so no other markdown in it opens a block.
+ */
+const asText = (text: string): string => text.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
 /** The text the gate verifies: the title, the definitions, the branches (module doc). */
 function renderVerified(args: {
   readonly goal: string;
@@ -951,7 +1227,7 @@ function renderVerified(args: {
     }
     // A branch's assumptions, under their report labels: a renderer shows
     // each as the line it is, so the reader sees what the report assumes.
-    for (const a of args.assumptions) lines.push(`[${a.label}]: assume: ${a.text}`);
+    for (const a of args.assumptions) lines.push(`[${a.label}]: assume: ${asText(a.text)}`);
     lines.push("");
   }
   for (const b of args.branches) {

@@ -39,11 +39,12 @@ for (const claim of extractClaims(answer)) {
 | Module | What it answers |
 |---|---|
 | `citations.ts` | The marker grammar (`[1]`, `[^a]`, `[A1]`) and the definition grammar (`[1]: source`, also with the source on the next line). `lintCitations`, `citationDefinitions`, `citedClaims`. The two patterns are module-private, so they have exactly one definition. |
-| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number (a numeral, or a number word other than "one") or has at least `MIN_CLAIM_TOKENS` content words. Code, headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
+| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number (a numeral, or a number word other than "one") or has at least `MIN_CLAIM_TOKENS` content words. Code, title headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). A heading is a claim when it cites a source for a figure or a claim's words (`## The refund window is 30 days [1]`), states a measured value after a label (`## Invoice total: 1,284.50`, never a count such as `## Part 2: 5 tips` or a list's label such as `## Step 3: 10 minutes`), or is a sentence stating a figure (`## The invoice total is 1,284.60`, `### No two of the six meetings overlap`) — whatever else the answer says or asks — or is all an answer says. Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
 | `markdown.ts` | Code spans, line lookup and link destinations. Two fence readers: `fencedSpans`, the citation grammar's, and `commonMarkFences`, the stricter one the claim extractor reads. |
-| `refs.ts` | `classifyDefinition`: the evidence-reference grammar. A source is a `url`, `doi`, `path` (with its `#fragment`), `tool:<toolUseId>`, `proof:<prf_id>`, `assume:<text>`, or free `text`. `definitionGloss`: the text a definition line shows past what it names. |
+| `refs.ts` | `classifyDefinition`: the evidence-reference grammar. A source is a `url`, `doi`, `path` (with its `#fragment`; `%23` and `%25` in a path are `#` and `%`, so `./x%23y.md` names `x#y.md`), `tool:<toolUseId>`, `proof:<prf_id>`, `assume:<text>`, or free `text`. `definitionGloss`: the text a definition line shows past what it names. |
 | `locate.ts` | The FactCrossCheck kernel. `indexSource` a body once, then `locateClaim` returns `supported`, `misquoted`, `polarityConflict` or `notFound`, along with the excerpt, line, coverage and a `cause`. `isWaivableMiss` says whether the gate's judge may be asked about a miss. `governingNegation` and `clauseNumbers` scope a negation to the words it denies. |
 | `numbers.ts` | `extractNumbers` and `containsValue` compare values as exact decimals, so `1,284.50`, `1284.50` and `1284.5` are one value, and an ISO date or a time of day as a whole value too (`compoundValues`). `figureWord` reads number words for the locate kernel's figure rule. |
+| `fold.ts` | `foldText`, the one character-for-character fold every comparison reads through (`foldTypography` in the locate kernel, and the number layer): curly quotes, a digit of any script, fullwidth and mathematical letters, a Cyrillic or Greek lookalike inside a Latin word, and an ignorable character hidden in a word. |
 | `quotes.ts` | `quotedSpans` and `containsQuote`, the `checked` rung's quotations. |
 | `tokens.ts`, `sentences.ts`, `messages.ts` | The graders' measure: `contentTokens`, `coverage`, the transcript splitter `sentences`, `claimSentences` and `messageText`. Their thresholds were set against exactly these. |
 
@@ -88,9 +89,15 @@ one), cuts fenced code and definition lines out of a sentence, gives a marker wr
 full stop (`text. [1]`, `text.[1]`, or `text.[1][2]`, a reference link whose one marker is `[2]`)
 to the sentence before it — a run only of citation ids, so `[Stripe][2] charges…` keeps its marker
 — leaves out only the question at the end of a piece the splitter ran on (`…30 days [1]` then
-`Anything else?` on the next line, or `…30 days.Anything else?`, keep their claim; a question
-wrapped onto a line that opens lowercase, with no marker or figure before the break, stays one
-question), treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
+`Anything else?` on the next line, `…30 days.Anything else?`, `…30 days.want it?`, a no-break space,
+`<br>` or U+2028 after the full stop, an ellipsis, and a claim ending in a dotted name such as
+`policy.md.Anything else?` keep their claim; a question wrapped onto a line that opens lowercase,
+with no marker or figure before the break, stays one question, and so does a clarifying question
+holding a dotted name such as `Array.Sort?`), cuts a claim from a question in the same sentence
+after the last clause that holds a marker or a figure (`…30 days [1] — anything else?`, `…1,284.60;
+want the PDF?`, `…30 days [1], right?`, a table row ending in a question) unless the sentence opens
+as one (`Is it 30 days, or 14?`), reads a question the answer answers itself (`…30 days? Yes.`) as a
+claim, treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
 indented `14.` that cannot interrupt a list item's paragraph as that paragraph's text), splits at a
 block quote opening under a paragraph, reads a heading only where a line is one (indented
 or inside a list item too) and never lets it take the line under it, counts a cited or
@@ -118,10 +125,19 @@ states the total. The `checked` rung reads a figure's polarity this way, and it 
 
 **Numbers are only read where the reading is certain.** `1,5`, `1.284,50`, `v1.2.3` and
 `10.0.0.1` are not numbers here. Nothing is guessed: a version and a figure in another locale
-are left out rather than read as the wrong value. An ISO date (`2025-04-03`) and a time of day
-(`10:30`, `09:05:00`) are values whole as well as their parts, so a result that says `2025-04-03`
-does not contain a claim's `2025-03-04`. A slash date, a ratio and a range are read as their
-parts only: which is the day, or whether `3:1` is a score, would be a guess.
+are left out rather than read as the wrong value. A digit of any script is its digit (`٣٠`, `３０`
+and `𝟑𝟎` are 30), because a figure the number layer could not read was a figure nothing checked.
+An ISO date (`2025-04-03`) and a time of day (`10:30`, `09:05:00`) are values whole as well as
+their parts, so a result that says `2025-04-03` does not contain a claim's `2025-03-04`. Both ends
+of a time range or a date interval are values (`10:00-11:30` states 11:30), and a UTC offset is
+not a time of day. A slash date, a ratio and a numeric range are read as their parts only: which
+is the day, or whether `3:1` is a score, would be a guess.
+
+**What the reader cannot tell apart is one spelling.** Every comparison reads through `foldText`:
+`not` with a zero-width space inside it, `ｎｏｔ` and a `nоt` with a Cyrillic `о` are the negation `not`, and a numeral no fold
+reads as digits (`㉚`, `½`) is a figure compared as written. The fold keeps every length, so the
+offsets the kernel reports are the text's own. A word wholly in Cyrillic or Greek letters is left
+as written, even one that looks like a Latin word or a number.
 
 ## The two token measures
 

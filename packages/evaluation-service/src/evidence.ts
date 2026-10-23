@@ -123,8 +123,16 @@ export async function gateEvidence<M extends EvidenceMessage>(
       ...evidenceFromMessages(scoped, {
         workspaceRoot: input.workspaceRoot,
         ...(input.toolResultsRoot !== undefined ? { toolResultsRoot: input.toolResultsRoot } : {}),
+        // The transcript is the parent's: its calls are the session's own.
+        ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       }),
     );
   }
-  return buildEvidenceIndex(records);
+  // The parent is named, never inferred from whichever record came first: a
+  // child's call logged ahead of the parent's would otherwise answer the
+  // parent's `tool:<id>` (design §6.3, as `resolveEvidence` reads ids).
+  return buildEvidenceIndex(
+    records,
+    input.sessionId !== undefined ? { sessionId: input.sessionId } : {},
+  );
 }

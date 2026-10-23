@@ -112,8 +112,10 @@ function destinationOf(source: string): { readonly value: string; readonly brack
  * - A relative, `./` or `../` destination, an absolute path, and anything
  *   path-shaped — no whitespace, and a `/` or a file extension — is a `path`,
  *   split at `#` by `splitLinkTarget`, the one rule the link checker and
- *   FactCrossCheck use. `<docs/my report.md>` may hold spaces, as a Markdown
- *   destination in angle brackets may. A bare host such as
+ *   FactCrossCheck use, then with `%23` and `%25` read as `#` and `%`
+ *   (`decodeHashAndPercent`), so a file name holding a `#` can be named.
+ *   `<docs/my report.md>` may hold spaces, as a Markdown destination in
+ *   angle brackets may. A bare host such as
  *   `arxiv.org/abs/1234` is a `path` too, deliberately: it is what a Markdown
  *   renderer makes of it (a relative link), `example.com` cannot be told from
  *   `report.md` without a list of top-level domains, and guessing a scheme
@@ -156,12 +158,27 @@ export function classifyDefinition(source: string): EvidenceRef {
         value.includes("/") ||
         /\.[A-Za-z0-9]{1,10}(?:#|$)/.test(value)));
   if (!pathShaped) return { kind: "text", text: whole };
-  const { target, fragment } = splitLinkTarget(value);
+  const { target: spelled, fragment } = splitLinkTarget(value);
   // `#section` alone points inside the document itself, not at a source.
-  if (target === "") return { kind: "text", text: whole };
+  if (spelled === "") return { kind: "text", text: whole };
+  const target = decodeHashAndPercent(spelled);
   return fragment === undefined || fragment === ""
     ? { kind: "path", path: target }
     : { kind: "path", path: target, fragment };
+}
+
+/**
+ * A path's `%23` and `%25` read as the `#` and `%` they escape, and no other
+ * escape. A `#` ends the path (`splitLinkTarget`), so a file whose name holds
+ * one — a research source saved as `x#y.md` — can only be named with it
+ * escaped, `./x%23y.md`; and `%` escapes too, so a name holding `%23` can be
+ * written (`%2523`). Every other `%` is the file's own character: `./50%.md`
+ * is that file. One pass, so `%2523` is `%23`, never `#`. The research
+ * writer spells a fetched file's definition this way, and the gate reads
+ * back the file it fetched (design §8; the review's I67).
+ */
+function decodeHashAndPercent(path: string): string {
+  return path.replace(/%2[35]/gi, (code) => (code.endsWith("3") ? "#" : "%"));
 }
 
 /**

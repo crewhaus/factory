@@ -70,7 +70,7 @@ import {
 import { sessionEvidence } from "./lib/evidence";
 import { DRAFT_CHARS, preflightBundle, preflightReport } from "./lib/preflight";
 import { proofRecheck } from "./lib/recheck";
-import { defaultProofsRoot, defaultSessionRoot, fenced } from "./lib/roots";
+import { defaultProofsRoot, defaultSessionRoot, fenced, runtimeStateRoots } from "./lib/roots";
 
 export {
   AVAILABILITY_TIMEOUT_MS,
@@ -110,7 +110,13 @@ export {
   preflightReport,
 } from "./lib/preflight";
 export { type RecheckProofOptions, proofRecheck, recheckProof } from "./lib/recheck";
-export { defaultProofsRoot, defaultSessionRoot, tenantRootOf } from "./lib/roots";
+export {
+  STATE_ENV_VARS,
+  defaultProofsRoot,
+  defaultSessionRoot,
+  runtimeStateRoots,
+  tenantRootOf,
+} from "./lib/roots";
 
 /** Compact JSON — the reader is a model, not a person. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -306,7 +312,8 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
     }
     return dir;
   };
-  const artifactsFor = (ctx: ToolExecuteContext | undefined) => {
+  /** Where proofs are filed and read for this call, fenced to the active tenant. */
+  const proofsDirFor = (ctx: ToolExecuteContext | undefined): string => {
     const tenant = tenantNow();
     const rootDir =
       rootFor(opts.proofsRoot, tenant, "proofsRoot") ??
@@ -315,7 +322,21 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
         opts.specName ?? specNameOf(ctx) ?? DEFAULT_SPEC_NAME,
         tenant,
       );
-    return createFileArtifactStore({ rootDir: fenced(rootDir, tenant) });
+    return fenced(rootDir, tenant);
+  };
+  const artifactsFor = (ctx: ToolExecuteContext | undefined) =>
+    createFileArtifactStore({ rootDir: proofsDirFor(ctx) });
+
+  /** The session-log root a preflight reads, when one was chosen (else event-log's default). */
+  const sessionRootFor = (ctx: ToolExecuteContext | undefined): string | undefined => {
+    const tenant = tenantNow();
+    const chosen =
+      rootFor(opts.sessionRootDir, tenant, "sessionRootDir") ??
+      sessionRootOf(ctx) ??
+      defaultSessionRoot(tenant);
+    // Event-log's default (`.crewhaus/sessions`, cwd-relative) when none was
+    // chosen; under a tenant one always is, and it must be the tenant's.
+    return chosen !== undefined ? fenced(chosen, tenant) : undefined;
   };
 
   const evidenceFor = async (
@@ -359,13 +380,7 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
     }
     const tenant = tenantNow();
     const sessionId = sessionIdOf(ctx);
-    const chosen =
-      rootFor(opts.sessionRootDir, tenant, "sessionRootDir") ??
-      sessionRootOf(ctx) ??
-      defaultSessionRoot(tenant);
-    // Event-log's default (`.crewhaus/sessions`, cwd-relative) when none was
-    // chosen; under a tenant one always is, and it must be the tenant's.
-    const rootDir = chosen !== undefined ? fenced(chosen, tenant) : undefined;
+    const rootDir = sessionRootFor(ctx);
     return sessionEvidence({
       scope,
       ...(sessionId !== undefined ? { sessionId } : {}),
@@ -510,11 +525,21 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
       const config = configOf();
       const artifacts = artifactsFor(ctx);
       const evidence = await evidenceFor(ctx, config.scope);
+      const tenant = tenantNow();
+      const sessionRootDir = sessionRootFor(ctx);
       const { bundle, notes } = await preflightBundle(input.draft, {
         config,
         evidence: evidence.index,
         artifacts,
         workspaceRoot: workspaceRoot(),
+        // The directories the gate refuses path sources under, as the gate
+        // names them (`runtimeStateRoots`), so the two agree (design §6).
+        stateRoots: runtimeStateRoots({
+          workspaceRoot: workspaceRoot(),
+          proofsRoot: proofsDirFor(ctx),
+          ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+          ...(tenant !== undefined ? { tenant } : {}),
+        }),
         ...(evidence.turnNumbers !== undefined ? { turnNumbers: evidence.turnNumbers } : {}),
         // The gate's re-check of a stored builtin proof, so a draft resting
         // on a rewritten artifact is told what the gate will say.

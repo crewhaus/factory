@@ -505,6 +505,22 @@ describe("formatSessionEvent — 0.6.0 routing lines", () => {
     expect(graded({ escalatedTo: "anthropic/claude-opus-5", bundlePath: undefined })).toBe(
       "  ⚖ provability grounded ✗ 0/1 claim 1 assumption (reached cited) → escalate anthropic/claude-opus-5",
     );
+    // A proof's hypotheses are counted with the assumptions, as the footer
+    // counts them; they are not claims, so the claim count keeps them.
+    expect(
+      graded({
+        level: "proven",
+        verdict: "pass",
+        score: 1,
+        achieved: "proven",
+        claims: 1,
+        met: 1,
+        unmet: 0,
+        assumptions: 0,
+        hypotheses: 2,
+        bundlePath: undefined,
+      }),
+    ).toBe("  ⚖ provability proven ✓ 1/1 claim 2 assumptions");
   });
 
   test("0.8.0 — proof_checked renders the checker, its verdict and the artifact", () => {

@@ -96,6 +96,28 @@ describe("locateClaim — paraphrase mode", () => {
     expect(found.missing).toBeUndefined();
   });
 
+  test("a footnote mark after the claim is no word or figure of it", () => {
+    const source = "Refunds are accepted within 30 days of purchase for unused items.";
+    const one = String.fromCharCode(0x00b9);
+    for (const claim of [
+      `Refunds are accepted within 30 days of purchase.${one}`,
+      `Refunds are accepted within 30 days of purchase ${one}`,
+      `Refunds are accepted within 30 days of purchase${one}`,
+    ]) {
+      expect(`${claim} → ${locateClaim(claim, source, { coverage: 0.8 }).status}`).toBe(
+        `${claim} → supported`,
+      );
+    }
+    // A superscript standing as a number is that number, and is compared.
+    const thirty = String.fromCharCode(0x00b3, 0x2070);
+    expect(locateClaim(`Refunds are accepted within ${thirty} days`, source).status).toBe(
+      "supported",
+    );
+    expect(
+      locateClaim(`Refunds are accepted within ${thirty} days`, source.replace("30", "14")).status,
+    ).toBe("notFound");
+  });
+
   test("defaults are FactCrossCheck's: every word, a 60-token window", () => {
     expect(DEFAULT_WINDOW_TOKENS).toBe(60);
     const strict = locateClaim("EU customers get a refund window of 14 days by mail", POLICY);
@@ -507,6 +529,87 @@ describe("locateClaim — the figure rule (below full coverage)", () => {
       "2025-03-04",
       "9:05",
     ]);
+  });
+
+  test("a range's second end is a figure the source states (the review's I14)", () => {
+    const options = { coverage: 0.8 };
+    expect(
+      locateClaim("Meeting 2 ends at 11:30.", "Meeting 2: 10:00-11:30, room B.", options).status,
+    ).toBe("supported");
+    expect(
+      locateClaim(
+        "The store closes at 17:00 on weekdays.",
+        "The store is open on weekdays 9:00-17:00.",
+        options,
+      ).status,
+    ).toBe("supported");
+    expect(
+      locateClaim(
+        "The promotion ends on 2025-04-30.",
+        "The promotion runs 2025-04-01/2025-04-30.",
+        options,
+      ).status,
+    ).toBe("supported");
+    // A wrong end is still a value miss.
+    expect(
+      locateClaim("Meeting 2 ends at 11:45.", "Meeting 2: 10:00-11:30, room B.", options),
+    ).toMatchObject({ status: "notFound", cause: "value" });
+  });
+
+  test("a figure in any script is a figure, and a wrong one is a value miss (design §6.2, A)", () => {
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const options = { coverage: 0.8 };
+    for (const thirty of [
+      at(0xff13, 0xff10),
+      at(0x0663, 0x0660),
+      at(0x0969, 0x0966),
+      at(0x1d7d1, 0x1d7ce),
+    ]) {
+      const claim = `The refund window is ${thirty} days from the date of purchase.`;
+      expect(locateClaim(claim, POLICY, options)).toMatchObject({
+        status: "notFound",
+        cause: "value",
+      });
+      expect(
+        locateClaim(claim, "The refund window is 30 days from the date of purchase.", options)
+          .status,
+      ).toBe("supported");
+    }
+    // A Persian page and a Persian answer: 14 on the page, 30 in the answer.
+    const page = `${at(0x0645, 0x062f, 0x062a)} ${at(0x06f1, 0x06f4)} ${at(0x0631, 0x0648, 0x0632)}`;
+    const answer = `${at(0x0645, 0x062f, 0x062a)} ${at(0x06f3, 0x06f0)} ${at(0x0631, 0x0648, 0x0632)}`;
+    expect(locateClaim(answer, page, options)).toMatchObject({
+      status: "notFound",
+      cause: "value",
+    });
+    // A numeral no fold reads as digits is a figure compared as written.
+    expect(figureKey(at(0x325a))).toBe(at(0x325a));
+    expect(
+      locateClaim(
+        `The refund window is ${at(0x325a)} days from the date of purchase.`,
+        POLICY,
+        options,
+      ),
+    ).toMatchObject({ status: "notFound", cause: "value" });
+  });
+
+  test("a negation hidden by an invisible character or a lookalike letter is still one", () => {
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const source = "Refunds are accepted within 14 days of purchase for unused items.";
+    for (const not of [
+      `n${at(0x200b)}ot`,
+      `n${at(0x200d)}ot`,
+      `n${at(0x2060)}ot`,
+      `n${at(0x00ad)}ot`,
+      `n${at(0x043e)}t`,
+      at(0xff4e, 0xff4f, 0xff54),
+      at(0x1d5fb, 0x1d5fc, 0x1d601),
+    ]) {
+      const claim = `Refunds are ${not} accepted within 14 days of purchase for unused items.`;
+      expect(`${JSON.stringify(not)} ${locateClaim(claim, source, { coverage: 0.8 }).status}`).toBe(
+        `${JSON.stringify(not)} polarityConflict`,
+      );
+    }
   });
 
   test("claimFigureKeys: each figure word with what it is compared as", () => {

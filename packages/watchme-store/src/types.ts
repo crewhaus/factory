@@ -110,11 +110,13 @@ export type WatchmeProvability = {
    */
   readonly citedFloor?: number;
   /**
-   * Declared assumptions the gate accepted across the verified standing
-   * passes (claims outside the score), and those it refused (`assumptions:
-   * forbid`, or past `max_assumptions` — unmet claims that fail the turn).
-   * Design §2: assumptions are visible on every surface, never silently
-   * excused. Each present only when non-zero (0.8.0 additive, review I61).
+   * Assumptions the gate accepted across the verified standing passes —
+   * the declared ones (claims outside the score) and the hypotheses accepted
+   * proofs rest on (`hypotheses`, design §6.4: assumptions too, never
+   * claims) — and those it refused (`assumptions: forbid`, or past
+   * `max_assumptions` — unmet claims that fail the turn). Design §2, §10:
+   * assumptions are visible on every surface, never silently excused. Each
+   * present only when non-zero (0.8.0 additive, review I61, I35).
    */
   readonly assumptions?: number;
   readonly assumptionsRefused?: number;

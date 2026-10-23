@@ -433,6 +433,7 @@ export {
   defaultProvabilityBlock,
   proofCassetteEffects,
   standingBundleFromEvents,
+  standingBundleFromTranscript,
   withProvabilityFloor,
 } from "./provability";
 export { registryProvabilityRoles } from "./default-registry";

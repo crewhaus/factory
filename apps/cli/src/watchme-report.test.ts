@@ -13,12 +13,13 @@
  * test files are excluded from `tsc -b`, so the relative import is safe), the
  * real routing-store scoreboard, and the real defaultGraderRegistry.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -151,8 +152,24 @@ type Harness = {
   store: ReturnType<typeof openWatchmeStore>;
 };
 
+// Every temp root a test makes, removed after it: the suite left one
+// directory per harness in $TMPDIR on every run (review I40). `made` keeps
+// them all for the last test's check that none outlived its test.
+const made: string[] = [];
+let live: string[] = [];
+function tempRoot(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  made.push(root);
+  live.push(root);
+  return root;
+}
+afterEach(() => {
+  for (const root of live) rmSync(root, { recursive: true, force: true });
+  live = [];
+});
+
 function makeHarness(): Harness {
-  const root = mkdtempSync(join(tmpdir(), "watchme-report-"));
+  const root = tempRoot("watchme-report-");
   const crewhausDir = join(root, ".crewhaus");
   const sessionsDir = join(crewhausDir, "sessions");
   mkdirSync(sessionsDir, { recursive: true });
@@ -751,6 +768,27 @@ describe("sessionProvability", () => {
     );
   });
 
+  test("a proof's hypotheses are assumptions too — tallied, never claims (design §6.4, §10; review I35)", () => {
+    // summarizeBundle carries the hypotheses accepted proofs rest on as
+    // `hypotheses`, apart from the declared `assumptions`.
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", {
+          level: "proven",
+          achieved: "proven",
+          claims: 1,
+          met: 1,
+          hypotheses: 2,
+        }),
+        gradedLine(2, "pass", { claims: 2, met: 1, assumptions: 1, hypotheses: 1 }),
+        gradedLine(3, "unverified", { hypotheses: 4 }),
+      ]),
+    );
+    expect(got?.digest).toMatchObject({ assumptions: 4, unverified: 1 });
+    // Not claims: the counted claims leave out only the declared assumption.
+    expect(got).toMatchObject({ claims: 3, met: 2, counted: 2 });
+  });
+
   test("the floor is the most common one", () => {
     const got = sessionProvability(
       asLogged([
@@ -909,7 +947,7 @@ describe("runWatchmeReport", () => {
     expect(md).toContain("- Provability gate (exact, per turn");
     expect(md).toContain("replaces the heuristic for 1 of 1 gated session(s)");
     expect(md).toContain("1 still failing after retries");
-    expect(md).toContain("0 declared assumption(s)");
+    expect(md).toContain("0 assumption(s)");
     expect(md).not.toContain(SECRET);
   });
 
@@ -1089,7 +1127,7 @@ describe("runWatchmeReport", () => {
     const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
     expect(md).toContain("faithfulness n/a");
     expect(md).toContain("1 vacuous pass(es)");
-    expect(md).toContain("2 declared assumption(s)");
+    expect(md).toContain("2 assumption(s)");
   });
 
   test("refused assumptions are shown beside the accepted ones (review I61)", async () => {
@@ -1109,7 +1147,38 @@ describe("runWatchmeReport", () => {
     expect(f?.vacuous).toBeUndefined();
     expect(f?.provability).toMatchObject({ assumptionsRefused: 1 });
     const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
-    expect(md).toContain("0 declared assumption(s) (+1 refused)");
+    expect(md).toContain("0 assumption(s) (+1 refused)");
+  });
+
+  test("a proven turn whose proof rests on hypotheses reads as resting on assumptions (design §6.4, §10; review I35)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("Does the discount apply to the order?"),
+        assistantMsg("It applies [1].\n\n[1]: proof:prf_0001"),
+        // The footer reads `1/1 claim · 0 sources · 2 assumptions` for this pass.
+        gradedLine(1, "pass", {
+          level: "proven",
+          achieved: "proven",
+          claims: 1,
+          met: 1,
+          hypotheses: 2,
+        }),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const f = harness.store.readObservations().find((o) => o.sessionId === id)?.factuality;
+    // The hypotheses are not claims: the one claim is met, faithfully.
+    expect(f).toMatchObject({ claims: 1, grounded: 1, faithfulness: 1 });
+    expect(f?.vacuous).toBeUndefined();
+    expect(f?.provability).toMatchObject({ level: "proven", achieved: "proven", assumptions: 2 });
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.provability).toMatchObject({ assumptions: 2, assumptionsRefused: 0 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("2 assumption(s)");
   });
 
   test("an ungated window renders no provability line and no report key", async () => {
@@ -1796,7 +1865,7 @@ describe("runWatchmeAllReport", () => {
       lastSeen: 2,
     };
 
-    const outDir = mkdtempSync(join(tmpdir(), "watchme-all-"));
+    const outDir = tempRoot("watchme-all-");
     const { report, files } = await runWatchmeAllReport(
       { harnesses: [entry(a, "alpha"), entry(b, "beta"), dead], outDir },
       {
@@ -1842,5 +1911,12 @@ describe("runWatchmeAllReport", () => {
     expect(md).toContain("alpha");
     expect(md).toContain("beta");
     expect(md).toContain("[peer-high]");
+  });
+});
+
+// Last in the file, so every test above has run (in order) and been cleaned up.
+describe("temp roots", () => {
+  test("no temp root a test made outlives it (review I40)", () => {
+    expect(made.filter((root) => existsSync(root))).toEqual([]);
   });
 });

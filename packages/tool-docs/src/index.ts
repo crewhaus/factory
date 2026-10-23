@@ -759,7 +759,7 @@ export const pdfText: RegisteredTool = buildTool({
 export const pdfSplit: RegisteredTool = buildTool({
   name: "PdfSplit",
   operativeArgs: [
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", reads: true },
     { field: "output", kind: "path" },
   ],
   description:
@@ -800,7 +800,7 @@ export const pdfSplit: RegisteredTool = buildTool({
 export const pdfMerge: RegisteredTool = buildTool({
   name: "PdfMerge",
   operativeArgs: [
-    { field: "inputs.path", kind: "path" },
+    { field: "inputs.path", kind: "path", reads: true },
     { field: "output", kind: "path" },
   ],
   description:

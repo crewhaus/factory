@@ -153,6 +153,34 @@ describe("gateEvidence", () => {
     }
   });
 
+  test("a `tool:<id>` a child shares with the parent is the parent's, whichever was logged first", async () => {
+    // An OpenAI-compatible server numbers ids per conversation, so a child
+    // and its parent can share one; the child's bracket logged first must
+    // not make the child the session the index answers for.
+    const sessions = dirs.make();
+    await writeLog(sessions, SESSION, [
+      userLine("research it"),
+      { kind: "sub_agent_start", payload: { childSessionId: CHILD } },
+      ...callLines("functions.WebFetch:0", "WebFetch", { url: URL_A }, fetched(URL_A, "parent")),
+    ]);
+    await writeLog(sessions, CHILD, [
+      userLine("child task"),
+      ...callLines("functions.WebFetch:0", "WebFetch", { url: URL_B }, fetched(URL_B, "child")),
+    ]);
+    for (const scope of ["session", "turn"] as const) {
+      const index = await gateEvidence({
+        scope,
+        sessionId: SESSION,
+        sessionRootDir: sessions,
+        workspaceRoot: sessions,
+      });
+      expect([scope, index.byToolUseId("functions.WebFetch:0")?.sessionId]).toEqual([
+        scope,
+        SESSION,
+      ]);
+    }
+  });
+
   test("scope turn: both sources keep only the current turn's calls", async () => {
     const sessions = dirs.make();
     await writeLog(sessions, SESSION, [

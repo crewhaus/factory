@@ -6,6 +6,7 @@
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
     { "path": "../tool-executor" },
+    { "path": "../tool-safety" },
     { "path": "../vector-store" }
   ],
   "include": ["src/**/*"]

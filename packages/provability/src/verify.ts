@@ -11,13 +11,14 @@
  * each is called only when the floor needs it (see {@link verifyDocument}).
  * The package imports no model adapter: the judge is a callback.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
 import {
   type ClaimQuery,
   type EvidenceRef,
   type ExtractedClaim,
   type Location,
+  MIN_CLAIM_TOKENS,
   NEGATIONS,
   type SourceIndex,
   type SourceToken,
@@ -48,7 +49,14 @@ import {
 } from "@crewhaus/claim-ledger";
 import { resolveContained } from "@crewhaus/tool-safety/fs";
 import { isProofArtifact, isProofId } from "./artifact";
-import { PROOF_CHECK, RETRIEVE, builtinKey } from "./builtins";
+import {
+  FACT_CROSS_CHECK,
+  PROOF_CHECK,
+  PROVABILITY_PREFLIGHT,
+  RETRIEVE,
+  builtinKey,
+  isMcpTool,
+} from "./builtins";
 import {
   ProvabilityError,
   groundingBody,
@@ -56,12 +64,15 @@ import {
   isReader,
   originFieldValues,
   restrictToTurns,
+  servedFrom,
   servesPage,
   sha256Of,
+  writtenOrigins,
 } from "./evidence";
 import { isProvabilityLevel, levelRank, maxRung, meetsFloor } from "./levels";
 import {
   doiUrl,
+  hasUserinfo,
   hostMatches,
   hostOf,
   isPrivateHost,
@@ -237,6 +248,7 @@ type Reached = {
   excerpt?: string;
   replayed?: boolean;
   judgeWaived?: boolean;
+  writtenBy?: { readonly toolUseId: string; readonly toolName: string };
   checker?: string;
   statement?: string;
   assumptions?: readonly string[];
@@ -257,6 +269,8 @@ type Waivable = {
   /** The excerpt the bundle freezes when the judge says yes. */
   readonly excerpt: string | undefined;
   readonly sha256: string;
+  /** The origin `grounded.independent` counts the body as ({@link bodyKey}). */
+  readonly key: string;
 };
 
 /** A binding as the claim loop first settles it, and the waiver it may still get. */
@@ -284,6 +298,12 @@ type CallFacts = {
   polarity?: ResultPolarity;
   /** Excerpts centred on a figure or a quotation, by where it sits in the result. */
   excerpts?: Map<number, string>;
+  /** The result with the claim the input handed over blanked out, by the runs blanked ({@link ownResult}). */
+  owns?: Map<string, CallFacts>;
+  /** A `FactCrossCheck` report, read once ({@link factCheckReport}); `null` when it is not one. */
+  factCheck?: FactCheckReport | null;
+  /** Each supported entry's source text as the checks read it, by entry ({@link factCheckFacts}). */
+  factChecks?: Map<number, CallFacts>;
 };
 
 /** How often a word occurs over some stretch of a result, and how often it is denied there. */
@@ -336,6 +356,23 @@ type Run = {
   readonly inputs: Map<EvidenceRecord, CallInputs>;
   /** Bodies with an address they print blanked out, by body and by what was blanked (`echoCheck`). */
   readonly masked: Map<SourceIndex, Map<string, SourceIndex>>;
+  /** The URL each record's body was served from (`servedFrom`), read once. */
+  readonly served: Map<EvidenceRecord, string | undefined>;
+  /**
+   * What `grounded.independent` counts a grounded binding as, by the body's
+   * digest and the origin it was cited under: the origin that SERVED the
+   * body ({@link bodyKey}), so a page cited twice — once through a redirect
+   * to it — is one origin, not two.
+   */
+  readonly bodyKeys: Map<string, string>;
+  /** The state directories a path source must not lie under, real paths ({@link stateRootOf}). */
+  readonly stateRoots: ReadonlyArray<{ readonly dir: string; readonly shown: string }>;
+  /** Text each call sent, in call order, for the stored-text test ({@link storedText}). */
+  sent?: SentText;
+  /** The origins each call of {@link SentText} may have written, by its place there ({@link writtenBy}). */
+  writes?: Map<number, readonly string[]>;
+  /** The places in {@link SentText} of every call that may have written somewhere, in order ({@link writtenBy}). */
+  writers?: readonly number[];
   readonly replays: Map<string, Promise<ReplayOutcome>>;
   readonly artifacts: Map<string, Promise<ProofArtifact | undefined>>;
   readonly checkers: Map<string, NonNullable<ProofBundle["checkers"]>[number]>;
@@ -388,6 +425,7 @@ function finish(
     ...(reached.excerpt !== undefined ? { excerpt: reached.excerpt } : {}),
     ...(reached.replayed !== undefined ? { replayed: reached.replayed } : {}),
     ...(reached.judgeWaived === true ? { judgeWaived: true } : {}),
+    ...(reached.writtenBy !== undefined ? { writtenBy: reached.writtenBy } : {}),
     ...(reached.checker !== undefined ? { checker: reached.checker } : {}),
     ...(reached.statement !== undefined ? { statement: reached.statement } : {}),
     ...(reached.assumptions !== undefined && reached.assumptions.length > 0
@@ -536,7 +574,8 @@ function sendsHeads(run: Run): boolean {
  */
 function definitionUrl(source: string): string | undefined {
   const ref = classifyDefinition(source);
-  if (ref.kind === "url") return normalizeUrl(ref.url);
+  // A URL with userinfo is refused before it is checked (`sourceBinding`).
+  if (ref.kind === "url") return hasUserinfo(ref.url) ? undefined : normalizeUrl(ref.url);
   if (ref.kind === "doi") return doiUrl(ref.doi);
   return undefined;
 }
@@ -597,8 +636,82 @@ async function citedUrl(run: Run, url: string): Promise<Reached | undefined> {
   return undefined;
 }
 
+/**
+ * Directories under the workspace that are always the harness's own state
+ * ({@link stateRootOf}); the caller names any others (`VerifyOptions.stateRoots`).
+ */
+const STATE_DIRS: readonly string[] = [".crewhaus", ".crewhaus-shared"];
+
+/** A directory's real path, or its resolved path when it does not resolve. */
+function realDir(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/**
+ * The state directories one verification refuses path sources under: the
+ * workspace's {@link STATE_DIRS} and the caller's `stateRoots`, each as
+ * resolved and as its real path, so a link into one is caught too.
+ */
+function stateRootsOf(
+  workspaceRoot: string,
+  extra: ReadonlyArray<string> = [],
+): Array<{ readonly dir: string; readonly shown: string }> {
+  const named: Array<readonly [string, string]> = [
+    ...STATE_DIRS.map((dir) => [`${dir}/`, path.join(workspaceRoot, dir)] as const),
+    ...extra
+      .filter((dir) => dir.trim() !== "")
+      .map((dir) => [dir, path.resolve(workspaceRoot, dir)] as const),
+  ];
+  const out: Array<{ readonly dir: string; readonly shown: string }> = [];
+  const seen = new Set<string>();
+  for (const [shown, dir] of named) {
+    for (const candidate of [dir, realDir(dir)]) {
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      out.push({ dir: candidate, shown });
+    }
+  }
+  return out;
+}
+
+/**
+ * The state directory a path source lies under, as the refusal names it, or
+ * `undefined` (design §1: evidence is a source the run read, never what the
+ * model said). A session log holds every answer verbatim (an
+ * `assistant_message` line), a proof bundle every claim, memory what a
+ * model stored: a `Read` of one returns the model's own earlier text, so a
+ * claim it wrote once would ground in its own log — under default
+ * permissions, with no write. The offline gate never reads a cited path
+ * under these (`crewhaus provability check`); the run's gate must not
+ * either. Read by the workspace-relative name and by the real path, so a
+ * link into one is refused too.
+ */
+function stateRootOf(run: Run, rel: string, real: string): string | undefined {
+  const first = rel.split("/")[0] ?? "";
+  if (STATE_DIRS.includes(first)) return `${first}/`;
+  // The path as the filesystem spells it: on a case-insensitive volume
+  // (macOS by default) `.CREWHAUS/sessions/…` is the session log, and the
+  // resolved path keeps the case the model typed. `realpathSync` returns
+  // the on-disk spelling, so it is compared as well as the path given.
+  const canonical = realDir(real);
+  for (const root of run.stateRoots) {
+    const under = root.dir.endsWith(path.sep) ? root.dir : `${root.dir}${path.sep}`;
+    for (const candidate of canonical === real ? [real] : [real, canonical]) {
+      if (candidate === root.dir || candidate.startsWith(under)) return root.shown;
+    }
+  }
+  return undefined;
+}
+
 /** The `cited` checks for a workspace path: inside the workspace, links included, and there. */
-function citedPath(run: Run, given: string): Reached | { readonly origin: string } {
+function citedPath(
+  run: Run,
+  given: string,
+): Reached | { readonly origin: string; readonly real: string } {
   const rel = normalizePath(given, { workspaceRoot: run.workspaceRoot, baseDir: run.baseDir });
   if (rel === undefined) {
     return fail("none", "path_outside_workspace", `${given} resolves outside the workspace`);
@@ -619,7 +732,7 @@ function citedPath(run: Run, given: string): Reached | { readonly origin: string
   if (!existsSync(located.real)) {
     return fail("none", "path_missing", `${rel} does not exist in the workspace`, { origin: rel });
   }
-  return { origin: rel };
+  return { origin: rel, real: located.real };
 }
 
 function bodyOf(
@@ -790,6 +903,9 @@ function maskedIndex(run: Run, index: SourceIndex, prints: readonly string[]): S
  * tool rewrites on the way out (an SQL function applied to the literal, an
  * address printed re-spelled): closing that needs the spec to say which
  * tools' hits are trusted — a design decision, not made here.
+ *
+ * An MCP server's result is asked once more ({@link storedText}): a server
+ * with storage hands back what an EARLIER call wrote to it.
  */
 function echoCheck(
   run: Run,
@@ -797,10 +913,36 @@ function echoCheck(
   query: ClaimQuery,
   index: SourceIndex,
   location: Location,
-): { readonly location: Location; readonly index: SourceIndex } | "echo" {
+): EchoRead {
   const kept = { location, index };
   if (record.toolName === RETRIEVE) return kept;
   if (builtinKey(record.toolName) !== undefined && !isReader(record.toolName)) return kept;
+  const read = sameCallEcho(run, record, query, index, location);
+  return read === "echo" || !isMcpTool(record.toolName)
+    ? read
+    : storedText(run, record, query, read);
+}
+
+/** What {@link echoCheck} makes of a record that carries the claim. */
+type EchoRead =
+  /** Read it by this location (the claim may have moved off a printed address). */
+  | { readonly location: Location; readonly index: SourceIndex }
+  /** The call's own input, handed back. */
+  | "echo"
+  /** Text an earlier call of the run sent, handed back by a store ({@link storedText}). */
+  | { readonly storedBy: EvidenceRecord }
+  /** Not checked: the grounding budget ran out on the way. */
+  | "unread";
+
+/** {@link echoCheck}'s test of the call's own input (see there). */
+function sameCallEcho(
+  run: Run,
+  record: EvidenceRecord,
+  query: ClaimQuery,
+  index: SourceIndex,
+  location: Location,
+): { readonly location: Location; readonly index: SourceIndex } | "echo" {
+  const kept = { location, index };
   const { plain, named } = callInputs(run, record);
   const need = new Set(query.need.map(wordKey));
   // Nothing to ask when no input string was handed over and no address
@@ -832,6 +974,273 @@ function echoCheck(
   if (again.status !== "supported" && !isWaivableMiss(again)) return "echo";
   const rest = spanRuns(run, query, masked, again);
   return rest.length > 0 && rest.every(handedBack) ? "echo" : { location: again, index: masked };
+}
+
+/**
+ * The text each call of the run sent, in the order the calls were made
+ * (`EvidenceIndex.all`, a child's calls where it ran): every string its
+ * input carries but the URL or path it was pointed at (`originFieldValues`
+ * — a fetcher's slug is not text it was handed). Built once per
+ * verification; a call's strings are indexed when first asked for.
+ */
+type SentText = {
+  /** Each call's place in that order, by its session and id. */
+  readonly position: ReadonlyMap<string, number>;
+  readonly calls: ReadonlyArray<EvidenceRecord>;
+  /** Each call's strings, indexed, with the words each holds (a run missing one is not in it). */
+  readonly strings: Map<
+    number,
+    ReadonlyArray<{ readonly index: SourceIndex; readonly words: ReadonlySet<string> }>
+  >;
+};
+
+/** A call's session and id: one call, whichever view of it (a hit's included) is asked. */
+const callOf = (record: EvidenceRecord): string =>
+  `${record.sessionId ?? ""}\u0000${record.toolUseId}`;
+
+function sentText(run: Run): SentText {
+  if (run.sent === undefined) {
+    // Every call the index holds, whatever `turnNumbers` keeps: text sent in
+    // an earlier turn and read back in this one is still the run's own.
+    const calls = run.opts.evidence.all();
+    const position = new Map<string, number>();
+    calls.forEach((call, i) => {
+      if (!position.has(callOf(call))) position.set(callOf(call), i);
+    });
+    run.sent = { position, calls, strings: new Map() };
+  }
+  return run.sent;
+}
+
+/**
+ * One call's sent strings, indexed the first time any claim asks — and
+ * counted against the grounding budget then, once, as a body read is.
+ */
+function sentStrings(
+  run: Run,
+  sent: SentText,
+  at: number,
+): ReadonlyArray<{ readonly index: SourceIndex; readonly words: ReadonlySet<string> }> {
+  let strings = sent.strings.get(at);
+  if (strings === undefined) {
+    const call = sent.calls[at] as EvidenceRecord;
+    const pending = originFieldValues(call.toolName, call.input, {
+      workspaceRoot: run.workspaceRoot,
+    });
+    const out: Array<{ index: SourceIndex; words: ReadonlySet<string> }> = [];
+    for (const value of inputStrings(call.input)) {
+      const named = pending.indexOf(value);
+      if (named !== -1) pending.splice(named, 1);
+      else if (value.trim() !== "") {
+        const index = indexSource(value);
+        run.groundingTokens += index.tokens.length;
+        out.push({ index, words: new Set(index.tokens.map((token) => token.norm)) });
+      }
+    }
+    strings = out;
+    sent.strings.set(at, strings);
+  }
+  return strings;
+}
+
+/**
+ * Is the claim, in an MCP server's result, text an EARLIER call of the run
+ * sent (design §5.2: MCP bodies are evidence because they were fetched; §0
+ * A)? A server with storage — SQL, a key-value or notes store, a vector
+ * index — hands back what was written to it, and the same-call test cannot
+ * see that: `write_query` stores `('https://acme.example/policy', 'The
+ * refund window is 30 days …')`, `read_query` returns it as a `{url, text}`
+ * hit, and the model's own sentence grounds under a page nobody fetched. So
+ * the claim at its tightest in the span that carries it
+ * ({@link tightestRuns}) is looked for, word for word, in what every
+ * earlier call sent; found, every run of it, it is the model's text stored
+ * and read back — `{ storedBy }`, the call that sent it. Only earlier
+ * calls: a page the run read and then summarised in its notes is still the
+ * page. Which earlier calls depends on how the claim reached its URL:
+ *
+ * - under a URL or path the call's input named (`mcp__fetch__fetch {url}`),
+ *   only text sent to the same server (`mcp__<server>__`): a store hands
+ *   back what was written to IT, and text the run sent anywhere else — the
+ *   draft given to `ProvabilityPreflight`, a report `Write` saved, an exact
+ *   phrase searched for, a comment posted to another server — cannot come
+ *   back out of this one. Counting those refused an honest page fetched
+ *   over MCP as "never read", in the designed preflight-then-fetch flow;
+ * - under a hit the result carried (a JSON row's `url`), text sent by any
+ *   call but the preflight, which writes nowhere: the row is whatever the
+ *   server keeps, and a file `Write` saved is what a filesystem server reads.
+ *
+ * What stays open is a row stored before the evidence this verification is
+ * handed begins — by an earlier session, or under `scope: turn` an earlier
+ * turn: no call in it sent the text. Closing that needs the spec to say
+ * which MCP tools return sources (a design decision; the README names the
+ * residual). The words read here count against the grounding budget
+ * ({@link MAX_GROUNDING_TOKENS}); past it the record is `"unread"`, not
+ * grounded.
+ */
+function storedText(
+  run: Run,
+  record: EvidenceRecord,
+  query: ClaimQuery,
+  read: { readonly location: Location; readonly index: SourceIndex },
+): EchoRead {
+  const sent = sentText(run);
+  const at = sent.position.get(callOf(record)) ?? 0;
+  if (at === 0) return read;
+  const server = mcpServerOf(record.toolName);
+  // A hit is a view of the call (`hitView`): its own text, under an origin
+  // the result carried rather than one the input named.
+  const whole = sent.calls[at] as EvidenceRecord;
+  const hit =
+    record !== whole &&
+    (record.content !== whole.content ||
+      record.origins.some((origin) => !whole.origins.includes(origin)));
+  const sentHere = (call: EvidenceRecord): boolean =>
+    hit ? call.toolName !== PROVABILITY_PREFLIGHT : mcpServerOf(call.toolName) === server;
+  const runs = spanRuns(run, query, read.index, read.location);
+  if (runs.length === 0) return read;
+  let by: EvidenceRecord | undefined;
+  for (const words of runs) {
+    let found = false;
+    for (let i = 0; i < at && !found; i++) {
+      if (!sentHere(sent.calls[i] as EvidenceRecord)) continue;
+      for (const held of sentStrings(run, sent, i)) {
+        if (run.groundingTokens >= groundingBudget) return "unread";
+        // A string missing one of the run's words cannot hold it: only a
+        // string that has them all is read through.
+        if (!words.every((word) => held.words.has(word))) continue;
+        run.groundingTokens += held.index.tokens.length;
+        if (findSequence(held.index, words) !== -1) {
+          found = true;
+          by ??= sent.calls[i];
+          break;
+        }
+      }
+    }
+    if (!found) return read;
+  }
+  return by !== undefined ? { storedBy: by } : read;
+}
+
+/** How many copy or move steps {@link writtenBy} follows back from the cited origin. */
+const MAX_WRITE_HOPS = 4;
+/** How many places one cited origin's text may be followed back through. */
+const MAX_WRITE_ORIGINS = 32;
+
+/** The origins call `at` of {@link SentText} may have written (`writtenOrigins`), read once. */
+function writesOf(run: Run, sent: SentText, at: number): readonly string[] {
+  run.writes ??= new Map();
+  let named = run.writes.get(at);
+  if (named === undefined) {
+    const call = sent.calls[at] as EvidenceRecord;
+    // Measured as the evidence index measures a reader's path: from the
+    // workspace root, where the tools resolve one.
+    named = writtenOrigins(call.toolName, call.input, { workspaceRoot: run.workspaceRoot });
+    run.writes.set(at, named);
+  }
+  return named;
+}
+
+/** `origin` relative to `place` (`""` when they are one, `/rest` when it lies beneath it), else `undefined`. */
+function beneathOf(origin: string, place: string): string | undefined {
+  if (origin === place) return "";
+  return origin.startsWith(`${place}/`) ? origin.slice(place.length) : undefined;
+}
+
+/**
+ * Did the run write, itself, the text that grounds a claim in a body a
+ * builtin reader returned (design §10's residual: "a model that fetches a
+ * page it wrote itself")? The call that did, or `undefined`.
+ *
+ * A `Read` returns the file as it is when read, so a claim the model put
+ * there with `Write` grounds like any other — and should: an agent that
+ * sets `timeout: 30` in a config and then reports it reports the truth. But
+ * the run is then its own source, and the bundle says so rather than
+ * letting the ✓ read as an outside source's (`ProofBinding.writtenBy`; the
+ * footer counts it, `provability audit` lists it). So the claim at its
+ * tightest in the span that grounded it ({@link spanRuns}) is looked for,
+ * word for word, in what EARLIER calls of the run sent to that origin:
+ * calls that may write ({@link writtenOrigins}: not a reader, not the
+ * preflight, not a pure tool — `VerifyOptions.isPureTool` — and not one
+ * that errored) and that named it. A copy or a move carries text from one
+ * place to another, so the places a call naming the origin also names are
+ * followed back too (a directory copied whole maps each file beneath it),
+ * at most {@link MAX_WRITE_HOPS} steps. Found — every run of it — the
+ * first such call is returned.
+ *
+ * Only the builtin readers are asked: an MCP server's result is
+ * {@link storedText}'s (it is refused there, not marked), and Retrieve
+ * returns the operator's corpus. What stays open: text written by `Bash`
+ * or `RunCommand` (a command line names no field this reads), or by an
+ * earlier session; and past the grounding budget nothing is marked.
+ */
+function writtenBy(
+  run: Run,
+  record: EvidenceRecord,
+  origin: string,
+  query: ClaimQuery,
+  index: SourceIndex,
+  location: Location,
+): EvidenceRecord | undefined {
+  if (!isReader(record.toolName)) return undefined;
+  const sent = sentText(run);
+  const at = sent.position.get(callOf(record)) ?? 0;
+  if (run.writers === undefined) {
+    const all: number[] = [];
+    sent.calls.forEach((call, i) => {
+      if (call.isError || run.opts.isPureTool?.(call.toolName) === true) return;
+      if (writesOf(run, sent, i).length > 0) all.push(i);
+    });
+    run.writers = all;
+  }
+  const writers = run.writers.filter((i) => i < at);
+  if (writers.length === 0) return undefined;
+  // Every place the text could have come to `origin` from.
+  const trail = new Set([origin]);
+  for (let hop = 0; hop < MAX_WRITE_HOPS && trail.size < MAX_WRITE_ORIGINS; hop++) {
+    const before = trail.size;
+    for (const i of writers) {
+      const named = writesOf(run, sent, i);
+      if (named.length < 2) continue;
+      for (const place of [...trail]) {
+        for (const one of named) {
+          const rest = beneathOf(place, one);
+          if (rest === undefined) continue;
+          for (const other of named) {
+            if (other !== one && trail.size < MAX_WRITE_ORIGINS) trail.add(`${other}${rest}`);
+          }
+        }
+      }
+    }
+    if (trail.size === before) break;
+  }
+  const into = writers.filter((i) => writesOf(run, sent, i).some((place) => trail.has(place)));
+  if (into.length === 0) return undefined;
+  const runs = spanRuns(run, query, index, location);
+  if (runs.length === 0) return undefined;
+  let by: EvidenceRecord | undefined;
+  for (const words of runs) {
+    let found = false;
+    for (const i of into) {
+      for (const held of sentStrings(run, sent, i)) {
+        if (run.groundingTokens >= groundingBudget) return undefined;
+        if (!words.every((word) => held.words.has(word))) continue;
+        run.groundingTokens += held.index.tokens.length;
+        if (findSequence(held.index, words) !== -1) {
+          found = true;
+          by ??= sent.calls[i];
+          break;
+        }
+      }
+      if (found) break;
+    }
+    if (!found) return undefined;
+  }
+  return by;
+}
+
+/** The server an MCP tool is served by (`mcp__<server>__<tool>`), lowercased; `undefined` for any other tool. */
+function mcpServerOf(name: string): string | undefined {
+  return /^mcp__(.+?)__/i.exec(name)?.[1]?.toLowerCase();
 }
 
 /** A word as the figure rule compares it: a figure by its value (`thirty` is `30`). */
@@ -904,15 +1313,86 @@ function groundedExcerpt(
 /** A source binding as `grounded` leaves it, and the paraphrase miss the judge may still waive. */
 type SourceOutcome = { readonly reached: Reached; readonly waivable?: Waivable };
 
+/** The URL `record`'s body was served from (`servedFrom`), read once per verification. */
+function servedOf(run: Run, record: EvidenceRecord): string | undefined {
+  if (!run.served.has(record)) run.served.set(record, servedFrom(record));
+  return run.served.get(record);
+}
+
+/**
+ * Why a body found under `origin` may not stand for it: the fetch was
+ * redirected (`servedFrom`), and the host that SERVED the body fails the
+ * checks a redirect hop is held to — `sources.deny` and the private-address
+ * rule, as `resolve: head` holds every hop (evaluation-service `hopPolicy`).
+ * Not `sources.allow`: that names what may be cited, so a `doi.org`
+ * citation still grounds in the publisher it redirects to (design §3, §10:
+ * the host lists are a security allowlist). `undefined` when it may.
+ */
+function servedRefusal(
+  run: Run,
+  origin: string,
+  record: EvidenceRecord,
+): { readonly reason: UnmetReason; readonly detail: string } | undefined {
+  const served = servedOf(run, record);
+  if (served === undefined || served === origin) return undefined;
+  const host = hostOf(served) ?? "";
+  const { deny } = run.config.sources;
+  if (deny.length > 0 && hostMatches(host, deny)) {
+    return {
+      reason: "host_denied",
+      detail: `${origin} redirected to ${host} when ${record.toolUseId} fetched it, and ${host} matches provability.sources.deny — the body is that host's`,
+    };
+  }
+  if (isPrivateHost(host)) {
+    return {
+      reason: "private_address",
+      detail: `${origin} redirected to ${host} when ${record.toolUseId} fetched it — a loopback, private or link-local address, not a public source`,
+    };
+  }
+  return undefined;
+}
+
+/** A grounded binding's place in {@link Run.bodyKeys}: the body it read, under the origin it cited. */
+const groundedAs = (sha256: string, origin: string): string => `${sha256}\u0000${origin}`;
+
+/**
+ * What `grounded.independent` counts a body found under `origin` as (design
+ * §6.2: n distinct origins): the {@link independenceKey} of the URL that
+ * served it, or of `origin` itself when nothing redirected — kept by the
+ * body's digest and `origin`, which every binding that grounds there
+ * carries. A page cited once directly and once through a shortener that
+ * redirects to it, or a DOI and its publisher's URL, is one origin, not
+ * two: both bodies were served by one host.
+ */
+function bodyKey(run: Run, record: EvidenceRecord, origin: string, sha256: string): string {
+  const at = groundedAs(sha256, origin);
+  let key = run.bodyKeys.get(at);
+  if (key === undefined) {
+    key = independenceKey(servedOf(run, record) ?? origin);
+    run.bodyKeys.set(at, key);
+  }
+  return key;
+}
+
 /**
  * The `grounded` check: the origin was read in this run, and the claim's
  * words are in it. A body is a record that is not an error and whose
  * fetch answered 2xx (`servesPage`): an error page carries the words of
- * whatever path it repeats.
+ * whatever path it repeats. A body served from a host the hop rule
+ * refuses is not one either ({@link servedRefusal}).
  */
 async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promise<SourceOutcome> {
   const records = run.evidence.bySource(origin);
-  const usable = records.filter((record) => !record.isError && servesPage(record.status));
+  const served = records.filter((record) => !record.isError && servesPage(record.status));
+  let redirected: { readonly reason: UnmetReason; readonly detail: string } | undefined;
+  const usable = served.filter((record) => {
+    const refused = servedRefusal(run, origin, record);
+    redirected ??= refused;
+    return refused === undefined;
+  });
+  if (usable.length === 0 && redirected !== undefined) {
+    return { reached: fail("none", redirected.reason, redirected.detail, { origin }) };
+  }
   if (usable.length === 0) {
     const statuses = [
       ...new Set(
@@ -944,10 +1424,14 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
   const options = locateOptions(run);
   const query = claimQuery(claim.text);
   let polarity: { location: Location; sha256: string } | undefined;
-  let waivable: { location: Location; index: SourceIndex; sha256: string } | undefined;
+  let waivable: { location: Location; index: SourceIndex; sha256: string; key: string } | undefined;
   let miss: { location: Location; sha256: string } | undefined;
   let echoed: EvidenceRecord | undefined;
+  let stored: { readonly record: EvidenceRecord; readonly by: EvidenceRecord } | undefined;
   let addressOnly: EvidenceRecord | undefined;
+  // A body that grounds the claim in text the run wrote there itself: kept
+  // while a read that grounds it otherwise is looked for ({@link writtenBy}).
+  let selfGrounded: SourceOutcome | undefined;
   let unread = false;
   for (const record of usable) {
     if (run.groundingTokens >= groundingBudget) {
@@ -962,6 +1446,10 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
       // Before it grounds — or reaches the judge, who would be asked whether
       // the model's own words support it — is it the call's input handed back?
       const read = echoCheck(run, record, query, body.index, location);
+      if (read === "unread") {
+        unread = true;
+        break;
+      }
       if (read === "echo") {
         // A reader's echo is its own address printed back: the page was
         // read, and its own text does not carry the claim.
@@ -969,19 +1457,30 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
         else echoed ??= record;
         continue;
       }
+      if ("storedBy" in read) {
+        stored ??= { record, by: read.storedBy };
+        continue;
+      }
       location = read.location;
       index = read.index;
     }
     if (location.status === "supported") {
+      const writer = writtenBy(run, record, origin, query, index, location);
+      if (writer !== undefined && selfGrounded !== undefined) continue;
       const excerpt = groundedExcerpt(run, query, index, location);
-      return {
-        reached: {
-          rung: "grounded",
-          origin,
-          sha256: body.sha256,
-          ...(excerpt !== undefined ? { excerpt } : {}),
-        },
+      bodyKey(run, record, origin, body.sha256);
+      const reached: Reached = {
+        rung: "grounded",
+        origin,
+        sha256: body.sha256,
+        ...(excerpt !== undefined ? { excerpt } : {}),
+        ...(writer !== undefined
+          ? { writtenBy: { toolUseId: writer.toolUseId, toolName: writer.toolName } }
+          : {}),
       };
+      if (writer === undefined) return { reached };
+      selfGrounded = { reached };
+      continue;
     }
     if (location.status === "polarityConflict") polarity ??= { location, sha256: body.sha256 };
     else if (isWaivableMiss(location)) {
@@ -989,10 +1488,18 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
         waivable === undefined ||
         location.matched / location.total > waivable.location.matched / waivable.location.total
       ) {
-        waivable = { location, index, sha256: body.sha256 };
+        waivable = {
+          location,
+          index,
+          sha256: body.sha256,
+          key: bodyKey(run, record, origin, body.sha256),
+        };
       }
     } else miss ??= { location, sha256: body.sha256 };
   }
+  // Grounded, only in text the run wrote there itself: it still grounds,
+  // and the binding says whose text it is.
+  if (selfGrounded !== undefined) return selfGrounded;
   if (polarity !== undefined) {
     return {
       reached: fail(
@@ -1014,10 +1521,22 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
     };
   }
   if (
-    (echoed !== undefined || addressOnly !== undefined) &&
+    (echoed !== undefined || stored !== undefined || addressOnly !== undefined) &&
     waivable === undefined &&
     miss === undefined
   ) {
+    if (echoed === undefined && stored !== undefined) {
+      // Everything under this origin that carries the claim is text the run
+      // itself sent earlier, handed back by a store.
+      return {
+        reached: fail(
+          "cited",
+          "not_fetched",
+          `${origin} was never read in this run: the only text under it that carries this claim is what ${stored.by.toolUseId} (${stored.by.toolName}) sent earlier, handed back by ${stored.record.toolUseId} (${stored.record.toolName}) — a store returns what was written to it; fetch the page itself`,
+          { origin },
+        ),
+      };
+    }
     if (echoed === undefined && addressOnly !== undefined) {
       // The page was read; the claim is only in the address it prints.
       return {
@@ -1068,6 +1587,7 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
         span: waivable.location.excerpt ?? "",
         excerpt: groundedExcerpt(run, query, waivable.index, waivable.location),
         sha256: waivable.sha256,
+        key: waivable.key,
       },
     };
   }
@@ -1136,12 +1656,38 @@ async function sourceBinding(
     const located = citedPath(run, ref.path);
     if ("rung" in located) return { reached: located };
     origin = located.origin;
+    const state = stateRootOf(run, located.origin, located.real);
+    if (state !== undefined) {
+      // Cited — the file is there, as the offline gate also finds — and
+      // never read: what is under a state root is the model's own text.
+      return {
+        reached: fail(
+          "cited",
+          "not_fetched",
+          `${origin} is under ${state}, the harness's own state — session logs, proof bundles, spilled results and memory hold the model's own text, so nothing there is a source; cite the source itself`,
+          { origin },
+        ),
+      };
+    }
   } else {
     const written = ref.kind === "url" ? ref.url : ref.doi;
     const url = ref.kind === "url" ? normalizeUrl(ref.url) : doiUrl(ref.doi);
     if (url === undefined) {
       return {
         reached: fail("none", "not_locatable", `${clip(written, 120)} is not a well-formed URL`),
+      };
+    }
+    if (ref.kind === "url" && hasUserinfo(ref.url)) {
+      // The reader takes the text before `@` for the host; the page is on
+      // the host after it. Named without the credentials themselves.
+      const host = hostOf(url) ?? url;
+      return {
+        reached: fail(
+          "none",
+          "host_denied",
+          `this URL puts a user name or password before its host, so it reads as another site — the page is on ${host}; cite its URL without them`,
+          { origin: url },
+        ),
       };
     }
     const refused = await citedUrl(run, url);
@@ -1518,29 +2064,315 @@ function inputOf(facts: CallFacts, record: EvidenceRecord): NonNullable<CallFact
   return facts.input;
 }
 
+/** At most this many distinct runs of one claim are looked for in a result ({@link handedRuns}). */
+const MAX_HANDED_RUNS = 8;
+
 /**
- * Does the result carry the claim only as the call's own input handed back
- * (design §10: a real-but-irrelevant tool result fails `checked`)? The
- * claim at its tightest in the result ({@link tightestRuns}) is looked for,
- * word for word, in each string the input carries — `grounded`'s echo test
- * (`echoCheck`) applied to an execution binding. A tool the gate allows
- * because it is pure can still be one that returns what it is given
- * (NormalizeText, WrapText, a fact-check that repeats the claim it was
- * asked about): its result is the model's sentence, not a computation.
- * What stays open is text the tool reassembles from several input strings
- * (a template filled from parts): no one input string holds it.
+ * The claim as the call's input HANDED IT OVER: in each input string, every
+ * run of it that holds the claim's words at their tightest (claim-ledger's
+ * `tightestWindows`) and reads as the claim sentence — the claim's own
+ * words, stopwords included, at the grounded bar, at least
+ * `MIN_CLAIM_TOKENS` long and at most twice the claim. A draft handed to a
+ * lint, a sentence handed to NormalizeText or WrapText, a claim handed to a
+ * fact-check are that; a document a value is selected from is not — `{
+ * "account": { "id": 7, "status": "suspended" } }` holds "account" and
+ * "suspended", not "the account is suspended", and JsonQuery's
+ * `["suspended"]` is the tool's answer, not the model's sentence (design
+ * §6.3: the result contains the claim's values). Distinct runs, at most
+ * {@link MAX_HANDED_RUNS}, in input order.
  */
-function handsBack(facts: CallFacts, record: EvidenceRecord, claimText: string): boolean {
-  const { strings } = inputOf(facts, record);
-  if (strings.length === 0) return false;
-  const runs = tightestRuns(
-    resultOf(facts).index.tokens.map((token) => token.norm),
-    new Set(claimWords(claimText).map(wordKey)),
+function handedRuns(
+  facts: CallFacts,
+  record: EvidenceRecord,
+  claimText: string,
+  bar: number,
+): string[][] {
+  const claim = indexSource(claimText);
+  const own = new Set(claim.tokens.map((token) => wordKey(token.norm)));
+  const need = new Set(claimWords(claimText).map(wordKey));
+  if (own.size === 0 || need.size === 0) return [];
+  const longest = 2 * claim.tokens.length;
+  const out = new Map<string, string[]>();
+  for (const input of inputOf(facts, record).strings) {
+    const keys = input.tokens.map((token) => wordKey(token.norm));
+    for (const [from, to] of tightestWindows(keys, need)) {
+      const length = to - from + 1;
+      if (length < MIN_CLAIM_TOKENS || length > longest) continue;
+      const window = new Set(keys.slice(from, to + 1));
+      const share = (of: ReadonlySet<string>): number =>
+        [...of].filter((key) => window.has(key)).length / of.size;
+      if (share(need) < bar || share(own) < bar) continue;
+      const words = input.tokens.slice(from, to + 1).map((token) => token.norm);
+      out.set(words.join(" "), words);
+      if (out.size >= MAX_HANDED_RUNS) return [...out.values()];
+    }
+  }
+  return [...out.values()];
+}
+
+/** Where `words` occurs in `index`, every start, word for word (KMP: linear in the index). */
+function occurrences(index: SourceIndex, words: readonly string[]): number[] {
+  const m = words.length;
+  const out: number[] = [];
+  if (m === 0) return out;
+  const border = new Int32Array(m);
+  for (let j = 1, k = 0; j < m; j++) {
+    while (k > 0 && words[j] !== words[k]) k = border[k - 1] as number;
+    if (words[j] === words[k]) k += 1;
+    border[j] = k;
+  }
+  let k = 0;
+  index.tokens.forEach((token, at) => {
+    while (k > 0 && token.norm !== words[k]) k = border[k - 1] as number;
+    if (token.norm === words[k]) k += 1;
+    if (k === m) {
+      out.push(at - m + 1);
+      k = border[k - 1] as number;
+    }
+  });
+  return out;
+}
+
+/**
+ * The result with the claim the input handed over ({@link handedRuns})
+ * blanked out where the tool repeats it — what the tool said of its own
+ * (design §10: a real-but-irrelevant tool result fails `checked`). A tool
+ * the gate allows because it is pure can still be one that returns what it
+ * is given (NormalizeText, WrapText, a check that repeats the claim it was
+ * asked about), and a figure or a word in the repeated sentence is the
+ * model's, not a computation's. Each run is blanked as many times as the
+ * input holds it, first occurrence first: a tool that repeats the claim and
+ * then quotes a source saying the same keeps the source's copy. The facts
+ * themselves when nothing is blanked; otherwise the blanked result's own,
+ * kept per call and runs.
+ *
+ * What stays open is text the tool reassembles from several input strings
+ * (a template filled from parts), and a draft padded past twice the
+ * claim's length: no one input string hands that claim over.
+ */
+function ownResult(facts: CallFacts, record: EvidenceRecord, runs: string[][]): CallFacts {
+  if (runs.length === 0) return facts;
+  const key = runs.map((words) => words.join(" ")).join("\u0000");
+  facts.owns ??= new Map();
+  let own = facts.owns.get(key);
+  if (own === undefined) {
+    const result = resultOf(facts).index;
+    const { strings } = inputOf(facts, record);
+    const blank = new Uint8Array(result.tokens.length);
+    let blanked = false;
+    for (const words of runs) {
+      const handed = strings.reduce((n, input) => n + occurrences(input, words).length, 0);
+      for (const at of occurrences(result, words).slice(0, handed)) {
+        blank.fill(1, at, at + words.length);
+        blanked = true;
+      }
+    }
+    if (!blanked) own = facts;
+    else {
+      let text = "";
+      let from = 0;
+      result.tokens.forEach((token, i) => {
+        if (blank[i] !== 1) return;
+        text += result.text.slice(from, token.at) + " ".repeat(token.raw.length);
+        from = token.at + token.raw.length;
+      });
+      own = { content: text + result.text.slice(from) };
+    }
+    facts.owns.set(key, own);
+  }
+  return own;
+}
+
+/**
+ * A `FactCrossCheck` report (tool-verify): each claim it checked, the
+ * verdict, and — where the verdict is `supported` — the source text it
+ * found the claim in (`foundIn.excerpt`, each supporting source's
+ * `excerpt`).
+ */
+type FactCheckReport = ReadonlyArray<{
+  readonly claim: string;
+  readonly verdict: string;
+  /** Each source the check found the claim in (its label as the tool wrote
+   *  it, a workspace-relative path), and the text it found there. */
+  readonly supports: ReadonlyArray<{ readonly source?: string; readonly excerpt: string }>;
+}>;
+
+/** The report a `FactCrossCheck` result is, read once per call; `null` when it is not one. */
+function factCheckReport(facts: CallFacts, record: EvidenceRecord): FactCheckReport | null {
+  if (facts.factCheck !== undefined) return facts.factCheck;
+  let report: FactCheckReport | null = null;
+  try {
+    const parsed: unknown = JSON.parse(record.body ?? facts.content);
+    const claims =
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)["claims"]
+        : undefined;
+    if (Array.isArray(claims)) {
+      const text = (value: unknown): string | undefined =>
+        typeof value === "string" && value.trim() !== "" ? value : undefined;
+      const field = (value: unknown, name: string): unknown =>
+        typeof value === "object" && value !== null
+          ? (value as Record<string, unknown>)[name]
+          : undefined;
+      report = claims.flatMap((entry) => {
+        const claim = text(field(entry, "claim"));
+        const verdict = text(field(entry, "verdict"));
+        if (claim === undefined || verdict === undefined) return [];
+        const sources = field(entry, "sources");
+        const supports: Array<{ readonly source?: string; readonly excerpt: string }> = [];
+        const seen = new Set<string>();
+        const add = (found: unknown): void => {
+          const excerpt = text(field(found, "excerpt"));
+          if (excerpt === undefined) return;
+          const source = text(field(found, "source"));
+          const key = `${source ?? ""}\u0000${excerpt}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          supports.push(source === undefined ? { excerpt } : { source, excerpt });
+        };
+        add(field(entry, "foundIn"));
+        if (Array.isArray(sources)) {
+          for (const source of sources) {
+            if (field(source, "status") === "supported") add(source);
+          }
+        }
+        return [{ claim, verdict, supports }];
+      });
+    }
+  } catch {
+    report = null;
+  }
+  facts.factCheck = report;
+  return report;
+}
+
+/**
+ * What a `FactCrossCheck` result says of this claim (design §6.3, §10): the
+ * source text of an entry that checked THIS claim — the sentence states
+ * the entry's claim and the entry's claim states the sentence — with the
+ * verdict `supported`, as the facts the checks read; or why it is none. The
+ * report repeats every claim it was asked about, whatever it found, so read
+ * whole it "contains" a refuted claim's figure: `notFound`, `polarityConflict`
+ * and `misquoted` are the tool saying the source does NOT carry it. Read
+ * only off the tool that prints it, as WebFetch's header is.
+ */
+function factCheckFacts(
+  run: Run,
+  facts: CallFacts,
+  record: EvidenceRecord,
+  claimText: string,
+): CallFacts | string {
+  const report = factCheckReport(facts, record);
+  if (report === null) {
+    return "is not a FactCrossCheck report this gate can read — cite the call whose result it is";
+  }
+  const bar = run.config.grounded.coverage;
+  const words = contentTokens(claimText);
+  const stating = report
+    .map((entry, i) => ({ entry, i }))
+    .filter(
+      ({ entry }) =>
+        statementMismatch(entry.claim, claimText, bar) === undefined &&
+        coverage(words, contentTokens(entry.claim)) >= bar,
+    );
+  if (stating.length === 0) {
+    return "reports no check of this claim — FactCrossCheck the sentence as the answer states it, then cite that call";
+  }
+  const supported = stating.find(
+    ({ entry }) => entry.verdict === "supported" && entry.supports.length > 0,
   );
-  return (
-    runs.length > 0 &&
-    runs.every((words) => strings.some((input) => findSequence(input, words) !== -1))
-  );
+  if (supported === undefined) {
+    return `reports this claim ${(stating[0] as { entry: FactCheckReport[number] }).entry.verdict}, not supported: the check found the cited source does not carry it — state only what the source says`;
+  }
+  facts.factChecks ??= new Map();
+  let entry = facts.factChecks.get(supported.i);
+  if (entry === undefined) {
+    const read = factCheckSupport(run, supported.entry.supports, claimText);
+    if (typeof read === "string") return read;
+    entry = read;
+    facts.factChecks.set(supported.i, entry);
+  }
+  return entry;
+}
+
+/** The most of a supporting source re-read when FactCrossCheck clipped its excerpt. */
+const FACT_SOURCE_BYTES = 1024 * 1024;
+
+/**
+ * The source text a supported `FactCrossCheck` entry stands on, as the
+ * checks read it (design §1 principle 1, §6.3).
+ *
+ * - A source under a state root is no source (`stateRootOf`): FactCrossCheck
+ *   reads any workspace path, the run's own session log among them, and a
+ *   claim the model wrote once was found there, verbatim, and served
+ *   `checked ✓`. Such a source is dropped; with none left the claim fails,
+ *   naming the root.
+ * - An excerpt the tool clipped (it ends in `…`, at 240 characters) may stop
+ *   short of the claim's figure: the claim is located again in the file the
+ *   tool read, with the gate's bar, and checked against that span. Where it
+ *   is not located there, the clipped excerpt is what there is.
+ *
+ * A label that names no workspace file (a written reference, a URL the tool
+ * did not read) keeps its excerpt as the tool reported it.
+ */
+function factCheckSupport(
+  run: Run,
+  supports: FactCheckReport[number]["supports"],
+  claimText: string,
+): CallFacts | string {
+  const texts: string[] = [];
+  const refused: string[] = [];
+  // The tool names a file it read by its workspace-relative path, whatever
+  // directory the document cited it from.
+  const fromRoot: Run = { ...run, baseDir: run.workspaceRoot };
+  for (const { source, excerpt } of supports) {
+    let file: { readonly origin: string; readonly real: string } | undefined;
+    let state: string | undefined;
+    if (source !== undefined) {
+      const located = citedPath(fromRoot, source);
+      if (!("rung" in located)) {
+        file = located;
+        state = stateRootOf(run, located.origin, located.real);
+      } else {
+        // Gone since, or never a file: a state root is still named by its path.
+        const rel = normalizePath(source, {
+          workspaceRoot: run.workspaceRoot,
+          baseDir: run.workspaceRoot,
+        });
+        if (rel !== undefined) state = stateRootOf(run, rel, path.resolve(run.workspaceRoot, rel));
+      }
+    }
+    if (state !== undefined) {
+      refused.push(`${file?.origin ?? source} (under ${state})`);
+      continue;
+    }
+    const whole =
+      excerpt.endsWith("\u2026") && file !== undefined
+        ? relocated(run, file.real, claimText)
+        : undefined;
+    texts.push(whole ?? excerpt);
+  }
+  if (texts.length === 0) {
+    return `found this claim only in ${refused.join(", ")}, the harness's own state — session logs, proof bundles, spilled results and memory hold the model's own text, so nothing there is a source; check the claim against the source itself`;
+  }
+  return { content: [...new Set(texts)].join("\n") };
+}
+
+/** The claim located in a workspace file at the gate's bar, its span unclipped; `undefined` when it is not there. */
+function relocated(run: Run, real: string, claimText: string): string | undefined {
+  let body: string;
+  try {
+    const stat = statSync(real);
+    if (!stat.isFile() || stat.size > FACT_SOURCE_BYTES) return undefined;
+    body = readFileSync(real, "utf-8");
+  } catch {
+    return undefined;
+  }
+  const found = locateClaim(claimText, body, {
+    ...locateOptions(run),
+    maxExcerptChars: MAX_ECHO_SPAN_CHARS,
+  });
+  return found.status === "supported" ? found.excerpt : undefined;
 }
 
 /**
@@ -1600,6 +2432,18 @@ async function executionBinding(
   toolUseId: string,
 ): Promise<Reached> {
   const record = run.evidence.byToolUseId(toolUseId);
+  const calls = record === undefined ? (run.evidence.callsById?.(toolUseId) ?? []) : [];
+  if (calls.length > 1) {
+    // Several sub-agents made a call by this id (a provider that numbers
+    // ids per conversation) and the session itself did not: grading one of
+    // them for the claim would be a guess (`buildEvidenceIndex`).
+    return fail(
+      "none",
+      "tool_missing",
+      `${toolUseId} names ${calls.length} calls in this run's sub-agent sessions and none in the session itself — the gate cannot tell which one is cited; cite a result of this session's own calls`,
+      { origin: toolUseId },
+    );
+  }
   if (record === undefined) {
     return fail(
       "none",
@@ -1633,6 +2477,25 @@ async function executionBinding(
   const valueAbsent = (detail: string): Reached =>
     fail("none", "value_absent", `the result of ${toolUseId} (${record.toolName}) ${detail}`, base);
   const percent = (share: number): string => `${Math.round(share * 100)}%`;
+  const bar = run.config.grounded.coverage;
+  // The result as the checks read it. A FactCrossCheck result is read by
+  // its verdict: the claim is checked by the source text of an entry that
+  // found it supported, never by the report's repetition of the claim it
+  // was asked about.
+  let result = facts;
+  if (builtinKey(record.toolName) === builtinKey(FACT_CROSS_CHECK)) {
+    const entry = factCheckFacts(run, facts, record, claim.text);
+    if (typeof entry === "string") return valueAbsent(entry);
+    result = entry;
+  }
+  // Anything else is read with the claim the input handed over blanked out
+  // where the tool repeats it (`ownResult`): what is left is the tool's.
+  const handed = handedRuns(facts, record, claim.text, bar);
+  const own = result === facts ? ownResult(facts, record, handed) : result;
+  const handsBack = (): Reached =>
+    valueAbsent(
+      "hands the call's own input back: the claim's words in it are text the call was given — cite a result that computes or reads what the claim states",
+    );
   // Value containment (design §6.3): a figure or a quotation the claim
   // states must be in what the tool returned. A claim with neither still has
   // to be ABOUT the result — an allowed tool's unrelated output must not
@@ -1641,60 +2504,65 @@ async function executionBinding(
   const numbers = extractNumbers(claim.text);
   const quotes = quotedSpans(claim.text);
   if (numbers.length > 0 || quotes.length > 0) {
-    facts.numbers ??= new Set(extractNumbers(content));
-    const stated = facts.numbers;
-    const absent = [
-      ...numbers.filter((value) => !containsValue(stated, value)),
-      ...quotes.filter((quote) => !containsQuote(content, quote)).map((q) => `"${q.text}"`),
-    ];
+    const absentFrom = (from: CallFacts): string[] => {
+      from.numbers ??= new Set(extractNumbers(from.content));
+      const stated = from.numbers;
+      return [
+        ...numbers.filter((value) => !containsValue(stated, value)),
+        ...quotes.filter((quote) => !containsQuote(from.content, quote)).map((q) => `"${q.text}"`),
+      ];
+    };
+    const absent = absentFrom(own);
     if (absent.length > 0) {
+      // In the result only where it repeats what the call was handed.
+      if (own !== result && absentFrom(result).length === 0) return handsBack();
       return valueAbsent(`does not contain ${absent.slice(0, 6).join(", ")}`);
     }
   }
   if (numbers.length > 0) {
     // The figures are there; which way the sentence around them points is
     // read word by word, where the result speaks to those figures.
-    facts.polarity ??= resultPolarity(content);
-    const opposite = figurePolarity(claim.text, facts.polarity);
+    own.polarity ??= resultPolarity(own.content);
+    const opposite = figurePolarity(claim.text, own.polarity);
     if (opposite !== undefined) return valueAbsent(opposite);
   } else {
-    const bar = run.config.grounded.coverage;
-    if (facts.said === undefined) {
-      const said = `${content}\n${inputText(record.input)}`;
-      facts.said = { tokens: contentTokens(said), index: indexSource(said) };
+    if (own.said === undefined) {
+      const text = `${own.content}\n${inputText(record.input)}`;
+      own.said = { tokens: contentTokens(text), index: indexSource(text) };
     }
     if (quotes.length === 0) {
       const words = contentTokens(claim.text);
-      const share = coverage(words, facts.said.tokens);
+      const share = coverage(words, own.said.tokens);
       if (share < bar) {
         return valueAbsent(
           `does not carry this claim: the claim states no figure or quotation, and ${percent(share)} of its words are in the call's input and result (needs ${percent(bar)})`,
         );
       }
+      const left = coverage(words, resultOf(own).tokens);
+      // The words were in the result only where it repeats the claim the
+      // call was handed (NormalizeText, WrapText).
+      if (own !== result && left < bar && coverage(words, resultOf(result).tokens) >= bar) {
+        return handsBack();
+      }
       // The input is read beside the result so a claim may name what the
       // call was asked ("the currency rounding check") and state what came
-      // back ("found no drift"). But when the input ALONE carries the claim,
-      // the input is all the call says of it — a lint run over the draft
-      // answer, handed the very sentence that cites it, would otherwise
-      // check any sentence at all — so the result has to carry it too.
-      if (coverage(words, inputOf(facts, record).tokens) >= bar) {
-        const own = coverage(words, resultOf(facts).tokens);
-        if (own < bar) {
-          return valueAbsent(
-            `does not carry this claim: its words are the call's own input, and ${percent(own)} of them are in what the tool returned (needs ${percent(bar)})`,
-          );
-        }
+      // back ("found no drift"). But when the input HANDS THE CLAIM OVER —
+      // a lint run over the draft answer, given the very sentence that
+      // cites it — the input is all the call says of it, and would otherwise
+      // check any sentence at all, so the result has to carry it too. A
+      // document a value was selected from does not hand the claim over
+      // (`handedRuns`): JsonQuery's `["suspended"]` checks "the account is
+      // suspended" without repeating the account.
+      if (left < bar && handed.length > 0) {
+        return valueAbsent(
+          `does not carry this claim: its words are the call's own input, and ${percent(left)} of them are in what the tool returned (needs ${percent(bar)})`,
+        );
       }
-    }
-    if (handsBack(facts, record, claim.text)) {
-      return valueAbsent(
-        "hands the call's own input back: the claim's words in it are text the call was given — cite a result that computes or reads what the claim states",
-      );
     }
     // The words are there; the coverage measure cannot see which way they
     // point. The locate kernel, which keeps negations and number words,
     // reads the call for the claim (or for the framing of its quotation).
-    const opposite = wordPolarity(run, claim.text, facts.said.index);
+    const opposite = wordPolarity(run, claim.text, own.said.index);
     if (opposite !== undefined) return valueAbsent(opposite);
   }
   let replayed = false;
@@ -1720,7 +2588,7 @@ async function executionBinding(
   return {
     rung: "checked",
     ...base,
-    excerpt: executionExcerpt(facts, claim.text, numbers.length > 0, quotes.length > 0),
+    excerpt: executionExcerpt(result, claim.text, numbers.length > 0, quotes.length > 0),
     replayed,
   };
 }
@@ -1799,6 +2667,87 @@ function partitiveDenial(index: SourceIndex, words: ReadonlySet<string>): boolea
   return false;
 }
 
+/** What may open a statement-level negation frame ({@link negationFrames}). */
+const FRAME_SUBJECTS: ReadonlySet<string> = new Set(["it", "this", "that"]);
+/** What a frame says of a clause, plainly, to deny it: "it is false that …". */
+const FALSITY: ReadonlySet<string> = new Set([
+  "false",
+  "untrue",
+  "incorrect",
+  "wrong",
+  "inaccurate",
+]);
+/** What a frame says of a clause, negated, to deny it: "it is not true that …". */
+const TRUTH: ReadonlySet<string> = new Set(["true", "correct", "accurate", "right"]);
+
+/**
+ * Where the predicate of a negation frame that starts at `at` ends — "is
+ * not true", "isn't the case", "is false", "is incorrect" — or -1.
+ */
+function framePredicate(words: readonly string[], at: number, subject: boolean): number {
+  let i = at;
+  let negated = false;
+  if (words[i] === "is" || words[i] === "was") i += 1;
+  else if (words[i] === "isn't" || words[i] === "wasn't") {
+    i += 1;
+    negated = true;
+  } else if (!subject) return -1;
+  // After a subject the copula may be gone from the words: the tokenizer
+  // reads "it's" as "it".
+  if (!negated && (words[i] === "not" || words[i] === "never")) {
+    i += 1;
+    negated = true;
+  }
+  if (negated && TRUTH.has(words[i] as string)) return i + 1;
+  if (negated && words[i] === "the" && words[i + 1] === "case") return i + 2;
+  if (!negated && FALSITY.has(words[i] as string)) return i + 1;
+  return -1;
+}
+
+/**
+ * How many statement-level negation frames a text opens: "it is not true
+ * that …", "it isn't the case that …", "it's not true that …", "it is false
+ * that …", "it is incorrect that …", "it is wrong that …", "it is not
+ * correct that …"; a "that"-clause put first and denied after it, "that no
+ * two of the three meetings overlap is false"; and a denial heading the
+ * text, "not true: …". Such a frame negates the whole clause it frames, yet
+ * its negation governs "true", "case" or "false" — words no proved claim
+ * states — so the word-by-word comparison sees no flip: "it is not true that
+ * no two of the three meetings overlap" covers "no two of the three meetings
+ * overlap" word for word, figures and every negation included, and states
+ * its opposite. Counted, so that two cancel. Read off the tokens, one
+ * bounded look ahead per word.
+ */
+function negationFrames(index: SourceIndex): number {
+  const words = index.tokens.map((token) => token.norm);
+  let frames = 0;
+  // "Not true: …", "Not the case: …", "Not correct — …".
+  if (
+    words[0] === "not" &&
+    (TRUTH.has(words[1] as string) || (words[1] === "the" && words[2] === "case"))
+  ) {
+    frames += 1;
+  }
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i] as string;
+    if (FRAME_SUBJECTS.has(word)) {
+      const end = framePredicate(words, i + 1, true);
+      if (end !== -1 && words[end] === "that") {
+        frames += 1;
+        continue;
+      }
+    }
+    // The clause first, its denial last: "that … is false", "that … is not
+    // the case". Only where the text opens with the complementizer, and the
+    // predicate ends it.
+    if (i > 1 && words[0] === "that") {
+      const end = framePredicate(words, i, false);
+      if (end === words.length) frames += 1;
+    }
+  }
+  return frames;
+}
+
 /**
  * Why the answer's sentence does not state what a proof's recorded claim
  * says, or `undefined` when it does (design §6.4): "the grounded coverage
@@ -1825,7 +2774,9 @@ function partitiveDenial(index: SourceIndex, words: ReadonlySet<string>): boolea
  *   word to another ("no two of the meetings overlap", "two of the
  *   meetings didn't overlap") is a different statement. A partitive denial
  *   of the whole statement ("none of the 3 invoices is overdue") is read
- *   too ({@link partitiveDenial}).
+ *   too ({@link partitiveDenial}), and so is a frame that negates it ("it
+ *   is not true that …", {@link negationFrames}): one side framed and the
+ *   other not states the opposite (acceptance C).
  *
  * What it cannot see is a sentence that adds a clause of its own to the
  * proved statement ("…, and the CEO approved it"): the coverage runs from
@@ -1854,6 +2805,12 @@ export function statementMismatch(
   }
   const provedIndex = indexSource(proved);
   const sentenceIndex = indexSource(sentence);
+  const provedFramed = negationFrames(provedIndex) % 2 === 1;
+  if (provedFramed !== (negationFrames(sentenceIndex) % 2 === 1)) {
+    return provedFramed
+      ? "the proof's claim is negated and this sentence is not — it states the opposite"
+      : "this sentence is negated and the proof's claim is not — it states the opposite";
+  }
   const ours = polarities(provedIndex);
   const theirs = polarities(sentenceIndex);
   const words = new Set<string>();
@@ -2316,8 +3273,12 @@ export function independenceKey(origin: string): string {
   return `host:${registrableDomain(host)}`;
 }
 
-/** Distinct independence keys among a claim's source bindings that reached `grounded`. */
-function groundedOrigins(bindings: ReadonlyArray<ProofBinding>): Set<string> {
+/**
+ * Distinct independence keys among a claim's source bindings that reached
+ * `grounded`: each by the origin that served the body it grounded in
+ * ({@link bodyKey}), and by its cited origin only where no body is known.
+ */
+function groundedOrigins(run: Run, bindings: ReadonlyArray<ProofBinding>): Set<string> {
   const keys = new Set<string>();
   for (const b of bindings) {
     if (
@@ -2325,7 +3286,10 @@ function groundedOrigins(bindings: ReadonlyArray<ProofBinding>): Set<string> {
       levelRank(b.rung) >= levelRank("grounded") &&
       b.origin !== undefined
     ) {
-      keys.add(independenceKey(b.origin));
+      keys.add(
+        (b.sha256 !== undefined ? run.bodyKeys.get(groundedAs(b.sha256, b.origin)) : undefined) ??
+          independenceKey(b.origin),
+      );
     }
   }
   return keys;
@@ -2346,7 +3310,7 @@ function applyIndependence(run: Run, bindings: ProofBinding[]): ProofBinding[] {
   if (bindings.some((b) => b.ok && b.kind !== "source")) return bindings;
   const okSources = bindings.filter((b) => b.ok && b.kind === "source");
   if (okSources.length === 0) return bindings;
-  const keys = groundedOrigins(bindings);
+  const keys = groundedOrigins(run, bindings);
   if (keys.size >= n) return bindings;
   const shown = [...keys].map((key) => key.replace(/^[a-z]+:/, "")).join(", ");
   const detail = `needs ${n} independent origins; this claim grounds in ${keys.size} (${shown})`;
@@ -2378,19 +3342,19 @@ async function waive(run: Run, bound: readonly Bound[]): Promise<ProofBinding[]>
   const needed = (): boolean => {
     if (n <= 1) return !bindings.some((b) => b.ok);
     if (bindings.some((b) => b.ok && b.kind !== "source")) return false;
-    return groundedOrigins(bindings).size < n;
+    return groundedOrigins(run, bindings).size < n;
   };
   if (n > 1) {
-    const could = groundedOrigins(bindings);
+    const could = groundedOrigins(run, bindings);
     for (const b of bound) {
-      if (b.waivable !== undefined) could.add(independenceKey(b.waivable.origin));
+      if (b.waivable !== undefined) could.add(b.waivable.key);
     }
     if (could.size < n) return bindings;
   }
   for (const [i, b] of bound.entries()) {
     if (b.waivable === undefined) continue;
     if (!needed()) break;
-    if (n > 1 && groundedOrigins(bindings).has(independenceKey(b.waivable.origin))) continue;
+    if (n > 1 && groundedOrigins(run, bindings).has(b.waivable.key)) continue;
     const waived = await askJudge(run, b.waivable);
     if (waived !== undefined) bindings[i] = finish(b.binding.ref, "source", waived, run.floor);
   }
@@ -2445,7 +3409,7 @@ function claimCeiling(run: Run, claim: ProofClaim): Rung {
   const evidence = claim.bindings.filter((b) => b.kind !== "assumption");
   const best = maxRung(...evidence.map((b) => b.rung));
   const n = run.config.grounded.independent;
-  if (n > 1 && best === "grounded" && groundedOrigins(evidence).size < n) return "cited";
+  if (n > 1 && best === "grounded" && groundedOrigins(run, evidence).size < n) return "cited";
   return best;
 }
 
@@ -2625,6 +3589,9 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
     calls: new Map(),
     inputs: new Map(),
     masked: new Map(),
+    served: new Map(),
+    bodyKeys: new Map(),
+    stateRoots: stateRootsOf(workspaceRoot, opts.stateRoots),
     replays: new Map(),
     artifacts: new Map(),
     checkers: new Map(),
@@ -2646,19 +3613,22 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
   // Every HEAD this verification will send, sent up front: a few at once,
   // under one deadline (`sendHeads`), not one at a time as each claim is
   // reached — in the order the claims ask, so the cap keeps the same URLs.
+  // Collected into a set, and no further than the cap: the answer is
+  // model-written, and a list searched once per URL it cites made this
+  // quadratic in them (Pillar 3); a URL past the cap is `budget` anyway
+  // (`headStatus`).
   if (sendsHeads(run)) {
-    const urls: string[] = [];
-    for (const { claim } of all) {
+    const urls = new Set<string>();
+    collect: for (const { claim } of all) {
       for (const id of claim.markers) {
+        if (urls.size >= MAX_HEAD_REQUESTS) break collect;
         const source = definitions.get(id);
         const url = source !== undefined ? definitionUrl(source) : undefined;
-        if (url === undefined || urls.includes(url) || hostRefusal(run, url) !== undefined) {
-          continue;
-        }
-        urls.push(url);
+        if (url === undefined || urls.has(url) || hostRefusal(run, url) !== undefined) continue;
+        urls.add(url);
       }
     }
-    sendHeads(run, urls.slice(0, MAX_HEAD_REQUESTS));
+    sendHeads(run, [...urls]);
   }
 
   const claims: ProofClaim[] = [];
@@ -2788,6 +3758,8 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
   // "0 sources" beside a passing answer that cites a URL in every claim.
   const sourceRung = levelRank(config.level === "cited" ? "cited" : "grounded");
   const sourceOrigins = new Set<string>();
+  // Of those, the ones the run wrote itself (`ProofBinding.writtenBy`).
+  const selfWritten = new Set<string>();
   const hypotheses = new Set<string>();
   const backing = new Set<string>();
   let judgeWaived = 0;
@@ -2795,6 +3767,7 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
     for (const b of claim.bindings) {
       if (b.kind === "source" && levelRank(b.rung) >= sourceRung && b.origin) {
         sourceOrigins.add(b.origin);
+        if (b.writtenBy !== undefined) selfWritten.add(b.origin);
       }
       if (b.kind === "formal" && b.ok && b.origin !== undefined) {
         backing.add(b.origin);
@@ -2821,6 +3794,7 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
     ...(assumptionsRefused > 0 ? { assumptionsRefused } : {}),
     ...(hypotheses.size > 0 ? { hypotheses: hypotheses.size } : {}),
     sources: sourceOrigins.size,
+    ...(selfWritten.size > 0 ? { selfWritten: selfWritten.size } : {}),
     judgeWaived,
     retryIndex: opts.retryIndex ?? 0,
     ...(checkers.length > 0 ? { checkers } : {}),

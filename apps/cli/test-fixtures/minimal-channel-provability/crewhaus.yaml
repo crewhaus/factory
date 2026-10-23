@@ -1,0 +1,13 @@
+name: support-bot
+target: channel
+agent:
+  model: claude-sonnet-4-6
+  instructions: |
+    You are a concise support assistant. Cite the page you answer from.
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: channel
+provability: { level: cited, on_fail: note }

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexSource } from "@crewhaus/claim-ledger";
@@ -2295,7 +2295,23 @@ describe("checked: a result that does not say the claim does not check it", () =
       id: "toolu_fact",
       name: "FactCrossCheck",
       input: { claims: [{ text: sentence, sources: ["https://acme.example/about"] }] },
-      content: JSON.stringify({ ok: false, results: [{ claim: sentence, verdict: "unchecked" }] }),
+      // tool-verify's report shape: a URL nobody fetched is not checked.
+      content: JSON.stringify({
+        from: "claims",
+        ok: false,
+        checked: 1,
+        claims: [
+          {
+            index: 0,
+            claim: sentence,
+            mode: "paraphrase",
+            cites: ["https://acme.example/about"],
+            verdict: "unchecked",
+            reason: "the source is a URL, which this tool does not fetch",
+            sources: [],
+          },
+        ],
+      }),
     },
     {
       id: "toolu_rank",
@@ -2311,7 +2327,7 @@ describe("checked: a result that does not say the claim does not check it", () =
       for (const [id, words] of [
         ["toolu_lint", "its words are the call's own input"],
         ["toolu_norm", "hands the call's own input back"],
-        ["toolu_fact", "hands the call's own input back"],
+        ["toolu_fact", "reports this claim unchecked, not supported"],
       ] as const) {
         const bundle = await verify(`${sentence.slice(0, -1)} [1].\n\n[1]: tool:${id}`, {
           config: config(level, { execution: allow }),
@@ -2879,6 +2895,827 @@ describe("the judge, and the excerpt, are spent only where they decide", () => {
     expect(long.length).toBeLessThanOrEqual(40);
     expect(long.startsWith("…y")).toBe(true);
   });
+});
+
+describe("grounded: what the run itself wrote is never the source", () => {
+  const SAID = "The refund window is 30 days from the date of purchase";
+  const answer = `${SAID} [1].\n\n[1]: ${POLICY}`;
+
+  test("a runtime tool given a url it does not take grounds nothing under it (design §8)", async () => {
+    // Remember, then Recall with a url the model added: tool-memory's schema
+    // strips the key, the log keeps it, and the remembered sentence was
+    // served as grounded ✓ under a page nobody fetched.
+    for (const [name, input] of [
+      ["Recall", { query: "refund window", url: POLICY }],
+      ["Task", { description: "policy", prompt: "What does our policy page say?", url: POLICY }],
+      ["Consult", { question: "What is the refund window?", href: POLICY }],
+      ["Skill", { name: "refunds", uri: POLICY }],
+    ] as const) {
+      const bundle = await verify(answer, {
+        config: config("grounded", { onFail: "halt" }),
+        evidence: evidenceOf([
+          { id: "m", name: "Remember", input: { text: `${SAID}.` }, content: "remembered" },
+          { id: "t", name, input, content: `${SAID}.` },
+        ]),
+      });
+      expect([name, only(bundle).bindings[0]?.reason, bundle.verdict]).toEqual([
+        name,
+        "not_fetched",
+        "fail",
+      ]);
+    }
+    // A path key the same way: a Skill body is not the workspace file.
+    const pathed = await verify(
+      "The Pro plan costs 99 dollars per month [1].\n\n[1]: ./docs/pricing.md",
+      {
+        config: config("grounded"),
+        evidence: evidenceOf(
+          [
+            {
+              id: "s",
+              name: "Skill",
+              input: { name: "pricing", path: "docs/pricing.md" },
+              content: "The Pro plan costs 99 dollars per month.",
+            },
+          ],
+          workspace,
+        ),
+      },
+    );
+    expect(only(pathed).bindings[0]?.reason).toBe("not_fetched");
+    // A child's wrong summary with the page's url beside it: the page, which
+    // the run did fetch, decides.
+    const misreported = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "f",
+          name: "WebFetch",
+          input: { url: POLICY },
+          content: fetched(POLICY, "The refund window is 14 days from the date of purchase."),
+        },
+        {
+          id: "t",
+          name: "Task",
+          input: { description: "policy", prompt: "Summarise the policy", url: POLICY },
+          content: `${SAID}.`,
+        },
+      ]),
+    });
+    expect(only(misreported).bindings[0]?.reason).toBe("not_found_in_source");
+  });
+
+  test("a session log, a bundle or a link into the state directory is never read as a source", async () => {
+    const log = ".crewhaus/sessions/sess_00000000000000aa.jsonl";
+    mkdirSync(join(workspace, ".crewhaus", "sessions"), { recursive: true });
+    const line = `${JSON.stringify({
+      kind: "assistant_message",
+      payload: { text: `Noting for the record: ${SAID.toLowerCase()}.` },
+    })}\n`;
+    writeFileSync(join(workspace, log), line);
+    symlinkSync(join(workspace, log), join(workspace, "docs", "notes.jsonl"));
+    mkdirSync(join(workspace, "logs"), { recursive: true });
+    writeFileSync(join(workspace, "logs", "sess_00000000000000ab.jsonl"), line);
+    const read = (path: string) => ({
+      id: `r_${path}`,
+      name: "Read",
+      input: { path },
+      content: line,
+    });
+    const evidence = evidenceOf(
+      [read(log), read("docs/notes.jsonl"), read("logs/sess_00000000000000ab.jsonl")],
+      workspace,
+    );
+    for (const cited of [log, "docs/notes.jsonl"]) {
+      const bundle = await verify(`${SAID} [1].\n\n[1]: ./${cited}`, {
+        config: config("grounded"),
+        evidence,
+      });
+      const binding = only(bundle).bindings[0];
+      expect([cited, binding?.reason, binding?.rung]).toEqual([cited, "not_fetched", "cited"]);
+      expect(binding?.detail).toContain(".crewhaus/");
+      expect(binding?.detail).toContain("the model's own text");
+    }
+    // Spelled in another case: on a case-insensitive volume (macOS by
+    // default) that is the same log, and the on-disk spelling is compared.
+    const upper = ".CREWHAUS/sessions/sess_00000000000000aa.jsonl";
+    const insensitive = existsSync(join(workspace, upper));
+    const shouted = await verify(`${SAID} [1].\n\n[1]: ./${upper}`, {
+      config: config("grounded"),
+      evidence: evidenceOf([read(upper)], workspace),
+    });
+    const loud = only(shouted).bindings[0];
+    expect(loud?.ok).toBe(false);
+    if (insensitive) {
+      expect([loud?.reason, loud?.rung]).toEqual(["not_fetched", "cited"]);
+      expect(loud?.detail).toContain(".crewhaus/");
+    }
+    // A relocated session directory is refused once the caller names it.
+    const relocated = `${SAID} [1].\n\n[1]: ./logs/sess_00000000000000ab.jsonl`;
+    const named = await verify(relocated, {
+      config: config("grounded"),
+      evidence,
+      stateRoots: ["logs"],
+    });
+    expect(only(named).bindings[0]).toMatchObject({ reason: "not_fetched", rung: "cited" });
+    expect(only(named).bindings[0]?.detail).toContain("under logs");
+    // A workspace file the run read still grounds.
+    const pricing = await verify(
+      "The Pro plan costs 10 dollars per month [1].\n\n[1]: ./docs/pricing.md",
+      {
+        config: config("grounded"),
+        evidence: evidenceOf(
+          [
+            {
+              id: "p",
+              name: "Read",
+              input: { path: "docs/pricing.md" },
+              content: "The Pro plan costs 10 dollars per month and includes unlimited seats.",
+            },
+          ],
+          workspace,
+        ),
+        stateRoots: ["logs"],
+      },
+    );
+    expect(only(pricing).status).toBe("met");
+  });
+
+  test("an MCP store hands back text the run wrote to it: that grounds no URL", async () => {
+    const row = { url: POLICY, text: `${SAID}.` };
+    const stored = await verify(answer, {
+      config: config("grounded", { onFail: "halt" }),
+      evidence: evidenceOf([
+        {
+          id: "w",
+          name: "mcp__sqlite__write_query",
+          input: {
+            query: `INSERT INTO notes (url, text) VALUES ('${POLICY}', '${SAID}.')`,
+          },
+          content: "1 row affected",
+        },
+        {
+          id: "r",
+          name: "mcp__sqlite__read_query",
+          input: { query: "SELECT url, text FROM notes" },
+          content: JSON.stringify([row]),
+        },
+      ]),
+    });
+    const binding = only(stored).bindings[0];
+    expect(binding?.reason).toBe("not_fetched");
+    expect(binding?.detail).toContain("w (mcp__sqlite__write_query) sent earlier");
+    expect(stored.verdict).toBe("fail");
+    // Written to the server, read back through a stray url on its recall:
+    // the same.
+    const recalled = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        { id: "m", name: "mcp__memory__store", input: { text: `${SAID}.` }, content: "ok" },
+        {
+          id: "r",
+          name: "mcp__memory__recall",
+          input: { query: "refund window", url: POLICY },
+          content: `${SAID}.`,
+        },
+      ]),
+    });
+    expect(only(recalled).bindings[0]?.reason).toBe("not_fetched");
+    // A search hit read BEFORE the run wrote its notes is still the page's.
+    const searched = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "s",
+          name: "mcp__search__query",
+          input: { q: "acme refund policy" },
+          content: JSON.stringify([row]),
+        },
+        { id: "n", name: "Write", input: { path: "notes.md", content: `${SAID}.` }, content: "ok" },
+      ]),
+    });
+    expect(only(searched).status).toBe("met");
+    // A row the result carried is whatever the server keeps: a file the run
+    // wrote and a filesystem server read back is the model's text.
+    const filed = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "w",
+          name: "Write",
+          input: { path: "notes.json", content: JSON.stringify([row]) },
+          content: "ok",
+        },
+        {
+          id: "r",
+          name: "mcp__filesystem__read_text_file",
+          input: { path: "notes.json" },
+          content: JSON.stringify([row]),
+        },
+      ]),
+    });
+    expect(only(filed).bindings[0]?.reason).toBe("not_fetched");
+  });
+
+  test("a page fetched over MCP grounds whatever the run sent elsewhere before it", async () => {
+    // Only the server's own store can hand text back: the preflight's draft,
+    // a saved report, a searched phrase and a comment posted to another
+    // server never come out of a fetch the input pointed at the page.
+    const PAGE = `Returns policy\n\n${SAID}. Items must be unused.`;
+    const fetchIt = { id: "f", name: "mcp__fetch__fetch", input: { url: POLICY }, content: PAGE };
+    for (const [label, before] of [
+      [
+        "preflight",
+        {
+          id: "p",
+          name: "ProvabilityPreflight",
+          input: { draft: answer },
+          content: '{"verdict":"fail","claims":[{"status":"unmet","reason":"not_fetched"}]}',
+        },
+      ],
+      [
+        "write",
+        { id: "p", name: "Write", input: { path: "report.md", content: answer }, content: "ok" },
+      ],
+      [
+        "search",
+        {
+          id: "p",
+          name: "WebSearch",
+          input: { query: `acme "${SAID.toLowerCase()}"` },
+          content: `1. Acme returns — ${POLICY}`,
+        },
+      ],
+      [
+        "another server",
+        {
+          id: "p",
+          name: "mcp__zendesk__add_comment",
+          input: { ticket: 7, body: `Customer says: ${SAID.toLowerCase()}. Checking.` },
+          content: "ok",
+        },
+      ],
+    ] as const) {
+      const bundle = await verify(answer, {
+        config: config("grounded"),
+        evidence: evidenceOf([before, fetchIt]),
+      });
+      expect([label, only(bundle).status]).toEqual([label, "met"]);
+    }
+    // Sent to the same server first, it is that server's to hand back.
+    const same = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "p",
+          name: "mcp__fetch__post",
+          input: { url: "https://x.example", body: `${SAID}.` },
+          content: "ok",
+        },
+        fetchIt,
+      ]),
+    });
+    expect(only(same).bindings[0]?.reason).toBe("not_fetched");
+  });
+});
+
+describe("grounded: one sub-agent's call is never graded under another's URL", () => {
+  // An OpenAI-compatible server numbers ids per conversation: the parent's
+  // first fetch and its child's share `functions.WebFetch:0`.
+  const ID = "functions.WebFetch:0";
+  const BLOG = "https://blog.example/acme-refunds";
+  const call = (sessionId: string, url: string, said: string) =>
+    recordFromCall({
+      toolUseId: ID,
+      toolName: "WebFetch",
+      input: { url },
+      content: fetched(url, said),
+      isError: false,
+      sessionId,
+    });
+
+  test("the body under the cited URL is the call that fetched it", async () => {
+    const evidence = buildEvidenceIndex([
+      call(
+        "sess_00000000000000a1",
+        BLOG,
+        "The refund window is 30 days from the date of purchase.",
+      ),
+      call(
+        "sess_00000000000000b2",
+        POLICY,
+        "The refund window is 14 days from the date of purchase.",
+      ),
+    ]);
+    const cite = (days: number) =>
+      verify(`The refund window is ${days} days from the date of purchase [1].\n\n[1]: ${POLICY}`, {
+        config: config("grounded"),
+        evidence,
+      });
+    expect(only(await cite(30)).bindings[0]?.reason).toBe("not_found_in_source");
+    const honest = only(await cite(14)).bindings[0];
+    expect(honest).toMatchObject({ ok: true, rung: "grounded" });
+    expect(honest?.excerpt).toContain("14 days");
+  });
+
+  test("a tool: id only several sub-agents share is ambiguous, not a guess", async () => {
+    const evidence = buildEvidenceIndex(
+      [
+        call("sess_00000000000000b2", POLICY, "x"),
+        call("sess_00000000000000c3", BLOG, "y"),
+        recordFromCall({
+          toolUseId: "toolu_own",
+          toolName: "MoneyAdd",
+          input: {},
+          content: "4",
+          isError: false,
+          sessionId: "sess_00000000000000a1",
+        }),
+      ],
+      { sessionId: "sess_00000000000000a1" },
+    );
+    const bundle = await verify(`The total is 4 [1].\n\n[1]: tool:${ID}`, {
+      config: config("checked", { execution: { allow: ["webFetch"] } }),
+      evidence,
+    });
+    expect(only(bundle).bindings[0]?.reason).toBe("tool_missing");
+    expect(only(bundle).bindings[0]?.detail).toContain("names 2 calls");
+  });
+});
+
+describe("grounded: a redirect is read where it landed", () => {
+  const SHORT = "https://bit.ly/3xYzAbc";
+  const BAD = "https://bad.example/refunds";
+  const SAID = "The refund window is 30 days from the date of purchase";
+  const landed = (from: string, to: string, body: string): string =>
+    `URL: ${to}\nRequested: ${from}\nStatus: 200\nContent-Type: text/html\n\n${body}`;
+  const via = (from: string, to: string) =>
+    evidenceOf([
+      { id: "f", name: "WebFetch", input: { url: from }, content: landed(from, to, `${SAID}.`) },
+    ]);
+
+  test("a body a denied or private host served does not ground the URL that redirected to it", async () => {
+    const deny = config("grounded", { sources: { deny: ["bad.example"] } });
+    const direct = await verify(`${SAID} [1].\n\n[1]: ${BAD}`, {
+      config: deny,
+      evidence: via(SHORT, BAD),
+    });
+    expect(only(direct).bindings[0]?.reason).toBe("host_denied");
+    const shortened = await verify(`${SAID} [1].\n\n[1]: ${SHORT}`, {
+      config: deny,
+      evidence: via(SHORT, BAD),
+    });
+    expect(only(shortened).bindings[0]).toMatchObject({ reason: "host_denied", rung: "none" });
+    expect(only(shortened).bindings[0]?.detail).toContain("redirected to bad.example");
+    const looped = await verify(`${SAID} [1].\n\n[1]: ${SHORT}`, {
+      config: config("grounded"),
+      evidence: via(SHORT, "http://127.0.0.1/refunds"),
+    });
+    expect(only(looped).bindings[0]?.reason).toBe("private_address");
+    // Nothing refused: the shortener grounds in the page it led to.
+    const allowed = await verify(`${SAID} [1].\n\n[1]: ${SHORT}`, {
+      config: config("grounded"),
+      evidence: via(SHORT, BAD),
+    });
+    expect(only(allowed).status).toBe("met");
+    // `allow` names what may be CITED: a DOI's publisher need not be on it.
+    const doi = await verify(`${SAID} [1].\n\n[1]: doi:10.1234/abc`, {
+      config: config("grounded", { sources: { allow: ["doi.org"] } }),
+      evidence: via("https://doi.org/10.1234/abc", "https://publisher.example/article/abc"),
+    });
+    expect(only(doi).status).toBe("met");
+  });
+
+  test("independent: 2 counts the host that served the body, not the URL cited", async () => {
+    const cfg = config("grounded", { grounded: { independent: 2 } });
+    const twice = await verify(`${SAID} [1] [2].\n\n[1]: ${POLICY}\n[2]: ${SHORT}`, {
+      config: cfg,
+      evidence: evidenceOf([
+        { id: "a", name: "WebFetch", input: { url: POLICY }, content: fetched(POLICY, `${SAID}.`) },
+        {
+          id: "b",
+          name: "WebFetch",
+          input: { url: SHORT },
+          content: landed(SHORT, POLICY, `${SAID}.`),
+        },
+      ]),
+    });
+    expect(only(twice).bindings.map((b) => [b.rung, b.reason])).toEqual([
+      ["grounded", "not_independent"],
+      ["grounded", "not_independent"],
+    ]);
+    // One fetch of a DOI, cited as the DOI and as the page it resolved to.
+    const PAGE = "https://publisher.example/article/abc";
+    const doi = await verify(`${SAID} [1] [2].\n\n[1]: doi:10.1234/abc\n[2]: ${PAGE}`, {
+      config: cfg,
+      evidence: via("https://doi.org/10.1234/abc", PAGE),
+    });
+    expect(only(doi).status).toBe("unmet");
+    expect(only(doi).bindings[0]?.reason).toBe("not_independent");
+  });
+});
+
+describe("cited: a user name before the host is refused", () => {
+  test("the reader would see one site and the gate ground another; no HEAD is sent", async () => {
+    const EVIL = "https://evil.example/policy";
+    const SAID = "The refund window is 30 days from the date of purchase";
+    const evidence = evidenceOf([
+      { id: "f", name: "WebFetch", input: { url: EVIL }, content: fetched(EVIL, `${SAID}.`) },
+    ]);
+    const heads: string[] = [];
+    for (const written of [
+      "https://acme.example@evil.example/policy",
+      "https://reader:s3cret@evil.example/policy",
+    ]) {
+      const bundle = await verify(`${SAID} [1].\n\n[1]: ${written}`, {
+        config: config("grounded", { sources: { resolve: "head" } }),
+        evidence,
+        resolveHead: async (url) => {
+          heads.push(url);
+          return 200;
+        },
+      });
+      const binding = only(bundle).bindings[0];
+      expect(binding).toMatchObject({ reason: "host_denied", rung: "none", origin: EVIL });
+      expect(binding?.detail).toContain("the page is on evil.example");
+      expect(binding?.detail).not.toContain("s3cret");
+      expect(binding?.detail).not.toContain("acme.example@");
+    }
+    expect(heads).toEqual([]);
+    const plain = await verify(`${SAID} [1].\n\n[1]: ${EVIL}`, {
+      config: config("grounded"),
+      evidence,
+    });
+    expect(only(plain).status).toBe("met");
+  });
+});
+
+describe("checked: a check that repeats a claim is read by what it found", () => {
+  // tool-verify's FactCrossCheck reports, verbatim, against docs/policy.md
+  // saying "The refund window is 14 days from the date of purchase."
+  const NOTE =
+    "supported means the cited source contains the claim's words — or, for a claim in quotation marks, only the quoted span — never that the claim is true; notFound means they could not be located, never that the source disagrees";
+  const report = (entry: Record<string, unknown>, verdict: string): string =>
+    JSON.stringify({
+      from: "claims",
+      ok: verdict === "supported",
+      checked: 1,
+      claimsFound: 1,
+      truncated: false,
+      notSupported: verdict === "supported" ? 0 : 1,
+      undetermined: 0,
+      claims: [{ index: 0, mode: "paraphrase", cites: ["docs/policy.md"], verdict, ...entry }],
+      note: NOTE,
+    });
+  const thirty = report(
+    {
+      claim: "The refund window is 30 days.",
+      reason:
+        '3 of 4 of the claim\'s words are in "docs/policy.md", never together; that is not a finding that it says otherwise',
+      sources: [
+        {
+          source: "docs/policy.md",
+          status: "notFound",
+          coverage: 0.75,
+          missing: ["30"],
+          line: 1,
+          excerpt: "Refunds The refund window is 14 days",
+        },
+      ],
+    },
+    "notFound",
+  );
+  const fourteen = report(
+    {
+      claim: "The refund window is 14 days.",
+      reason: 'every word of the claim is in one span of "docs/policy.md"',
+      foundIn: {
+        source: "docs/policy.md",
+        line: 1,
+        excerpt: "Refunds The refund window is 14 days",
+      },
+      sources: [
+        {
+          source: "docs/policy.md",
+          status: "supported",
+          coverage: 1,
+          line: 1,
+          excerpt: "Refunds The refund window is 14 days",
+        },
+      ],
+    },
+    "supported",
+  );
+  const europe = report(
+    {
+      claim: "Refunds are processed by Acme in Europe.",
+      reason: '1 of 4 of the claim\'s words are in "docs/policy.md", never together',
+      sources: [
+        {
+          source: "docs/policy.md",
+          status: "notFound",
+          coverage: 0.25,
+          missing: ["processed", "acme", "europe"],
+          line: 1,
+          excerpt: "Refunds The refund",
+        },
+      ],
+    },
+    "notFound",
+  );
+  const asked = (text: string) => ({ claims: [{ text, sources: ["docs/policy.md"] }] });
+  const evidence = evidenceOf([
+    {
+      id: "toolu_30",
+      name: "FactCrossCheck",
+      input: asked("The refund window is 30 days."),
+      content: thirty,
+    },
+    {
+      id: "toolu_14",
+      name: "FactCrossCheck",
+      input: asked("The refund window is 14 days."),
+      content: fourteen,
+    },
+    {
+      id: "toolu_eu",
+      name: "FactCrossCheck",
+      input: asked("Refunds are processed by Acme in Europe."),
+      content: europe,
+    },
+    {
+      id: "toolu_conflict",
+      name: "FactCrossCheck",
+      input: asked("The refund window is 14 days."),
+      content: fourteen.replaceAll('"supported"', '"polarityConflict"'),
+    },
+    {
+      id: "toolu_norm",
+      name: "NormalizeText",
+      input: { text: "The refund window is 30 days.", form: "lower" },
+      content: "the refund window is 30 days.",
+    },
+  ]);
+  const allow = { execution: { allow: ["factCrossCheck", "normalizeText"], replay: false } };
+  const cite = (sentence: string, id: string, level: "checked" | "grounded" = "checked") =>
+    verify(`${sentence} [1].\n\n[1]: tool:${id}`, { config: config(level, allow), evidence });
+
+  test("a FactCrossCheck that did not find the claim supported does not check it — figure or not, at checked or grounded", async () => {
+    for (const level of ["checked", "grounded"] as const) {
+      for (const [sentence, id, verdict] of [
+        ["The refund window is 30 days", "toolu_30", "notFound"],
+        ["Refunds are processed by Acme in Europe", "toolu_eu", "notFound"],
+        ["The refund window is 14 days", "toolu_conflict", "polarityConflict"],
+      ] as const) {
+        const binding = only(await cite(sentence, id, level)).bindings[0];
+        expect([level, id, binding?.reason]).toEqual([level, id, "value_absent"]);
+        expect(binding?.detail).toContain(`reports this claim ${verdict}, not supported`);
+      }
+    }
+  });
+
+  test("a FactCrossCheck that found it supported checks it, by the source text it found", async () => {
+    const binding = only(await cite("The refund window is 14 days", "toolu_14")).bindings[0];
+    expect(binding).toMatchObject({ ok: true, rung: "checked" });
+    expect(binding?.excerpt).toContain("refund window is 14 days");
+    // Not a claim it checked.
+    const other = only(
+      await cite("The refund window is 14 days for gift cards bought in stores", "toolu_14"),
+    ).bindings[0];
+    expect(other?.reason).toBe("value_absent");
+    expect(other?.detail).toContain("reports no check of this claim");
+  });
+
+  test("a FactCrossCheck that found the claim only in the run's own state checks nothing", async () => {
+    // FactCrossCheck reads any workspace path: over the session log it finds
+    // the model's own earlier sentence, verbatim, and reports it supported.
+    const log = ".crewhaus/sessions/sess_00000000000000fc.jsonl";
+    mkdirSync(join(workspace, ".crewhaus", "sessions"), { recursive: true });
+    const said = "the refund window is 30 days from the date of purchase";
+    writeFileSync(
+      join(workspace, log),
+      `${JSON.stringify({ kind: "assistant_message", payload: { text: `Noting: ${said}.` } })}\n`,
+    );
+    const found = { source: log, line: 1, excerpt: said };
+    const fromLog = report(
+      {
+        claim: "The refund window is 30 days from the date of purchase.",
+        reason: `every word of the claim is in one span of "${log}"`,
+        foundIn: found,
+        sources: [{ ...found, status: "supported", coverage: 1 }],
+      },
+      "supported",
+    );
+    for (const source of [log, ".crewhaus/sessions/sess_00000000000000ff.jsonl"]) {
+      const evidence = evidenceOf(
+        [
+          {
+            id: "toolu_fcc",
+            name: "FactCrossCheck",
+            input: asked("The refund window is 30 days from the date of purchase."),
+            content: fromLog.replaceAll(log, source),
+          },
+        ],
+        workspace,
+      );
+      for (const level of ["checked", "grounded"] as const) {
+        const bundle = await verify(
+          "The refund window is 30 days from the date of purchase [1].\n\n[1]: tool:toolu_fcc",
+          { config: config(level, allow), evidence },
+        );
+        const binding = only(bundle).bindings[0];
+        expect([source, level, binding?.ok, binding?.reason]).toEqual([
+          source,
+          level,
+          false,
+          "value_absent",
+        ]);
+        expect(binding?.detail).toContain("the harness's own state");
+      }
+    }
+  });
+
+  test("a FactCrossCheck whose excerpt was clipped is checked against the span in its source", async () => {
+    // The excerpt stops at 240 characters, short of the figure; the claim is
+    // located again in the file the tool read.
+    const policy =
+      "Returns.\n\nThe refund window, which applies to every purchase made in our online store, in any of our retail locations across the country, and through the authorised resellers listed on our partners page, provided that the item is unused and still in its original packaging with all of its tags attached, is 30 days.\n";
+    writeFileSync(join(workspace, "docs", "long-policy.md"), policy);
+    const clipped =
+      "refund window, which applies to every purchase made in our online store, in any of our retail locations across the country, and through the authorised resellers listed on our partners page, provided that the item is unused and still in its\u2026";
+    const found = { source: "docs/long-policy.md", line: 3, excerpt: clipped };
+    const content = report(
+      {
+        claim: "The refund window is 30 days.",
+        reason: 'every word of the claim is in one span of "docs/long-policy.md"',
+        foundIn: found,
+        sources: [{ ...found, status: "supported", coverage: 1 }],
+      },
+      "supported",
+    );
+    const evidence = evidenceOf(
+      [
+        {
+          id: "toolu_long",
+          name: "FactCrossCheck",
+          input: asked("The refund window is 30 days."),
+          content,
+        },
+      ],
+      workspace,
+    );
+    const met = await verify("The refund window is 30 days [1].\n\n[1]: tool:toolu_long", {
+      config: config("checked", allow),
+      evidence,
+    });
+    expect(only(met).status).toBe("met");
+    // A wrong figure is still absent from the span.
+    const wrong = await verify("The refund window is 90 days [1].\n\n[1]: tool:toolu_long", {
+      config: config("checked", allow),
+      evidence,
+    });
+    expect(only(wrong).status).toBe("unmet");
+  });
+
+  test("a tool that hands a figure claim back checks nothing", async () => {
+    const binding = only(await cite("The refund window is 30 days", "toolu_norm")).bindings[0];
+    expect(binding?.reason).toBe("value_absent");
+    expect(binding?.detail).toContain("hands the call's own input back");
+  });
+
+  test("a value selected from a document the call was handed still checks a claim about it", async () => {
+    // JsonQuery and RegexExtract on the default all-compute allowlist,
+    // their real outputs: a bare value is the tool's answer, and the
+    // document it came from is not the claim handed over.
+    const selected = evidenceOf([
+      {
+        id: "toolu_jq",
+        name: "JsonQuery",
+        input: {
+          json: '{"account":{"id":7,"status":"suspended"}}',
+          path: "$.account.status",
+          valuesOnly: true,
+        },
+        content: '{"count":1,"truncated":false,"values":["suspended"]}',
+      },
+      {
+        id: "toolu_rx",
+        name: "RegexExtract",
+        input: {
+          text: "2024-05-01 deploy service=billing status=failed reason=timeout",
+          pattern: "reason=(\\w+)",
+          valuesOnly: true,
+        },
+        content: '{"count":1,"truncated":false,"values":["reason=timeout"]}',
+      },
+      {
+        id: "toolu_rm",
+        name: "RegexExtract",
+        input: { text: "Account 7 status: suspended. Owner: Max.", pattern: "status: (\\w+)" },
+        content:
+          '{"count":1,"truncated":false,"matches":[{"match":"status: suspended","index":10,"line":1,"column":11,"groups":{},"captures":["suspended"]}]}',
+      },
+    ]);
+    const extract = { execution: { allow: ["jsonQuery", "regexExtract"], replay: false } };
+    for (const [sentence, id] of [
+      ["The account is suspended", "toolu_jq"],
+      ["The billing deploy failed with reason timeout", "toolu_rx"],
+      ["The account is suspended", "toolu_rm"],
+    ] as const) {
+      const bundle = await verify(`${sentence} [1].\n\n[1]: tool:${id}`, {
+        config: config("checked", extract),
+        evidence: selected,
+      });
+      expect([id, only(bundle).status, only(bundle).bindings[0]?.detail]).toEqual([
+        id,
+        "met",
+        undefined,
+      ]);
+    }
+  });
+});
+
+describe("proven: a frame that negates the proved statement", () => {
+  test("'it is not true that …' states the opposite of what was proved", async () => {
+    const proved = "No two of the three meetings overlap.";
+    for (const sentence of [
+      "It is not true that no two of the three meetings overlap",
+      "It is not the case that no two of the three meetings overlap",
+      "It's not true that no two of the three meetings overlap",
+      "It isn't the case that no two of the three meetings overlap",
+      "It is false that no two of the three meetings overlap",
+      // Other words for false, and the frame put after its clause.
+      "It is incorrect that no two of the three meetings overlap",
+      "It is wrong that no two of the three meetings overlap",
+      "It is not correct that no two of the three meetings overlap",
+      "That no two of the three meetings overlap is false",
+      "That no two of the three meetings overlap is not true",
+      "That no two of the three meetings overlap is not the case",
+      "Not true: no two of the three meetings overlap",
+    ]) {
+      expect([sentence, statementMismatch(proved, sentence, 0.8)]).toEqual([
+        sentence,
+        "this sentence is negated and the proof's claim is not — it states the opposite",
+      ]);
+    }
+    expect(
+      statementMismatch(
+        "The invoice total is 1,284.50 EUR.",
+        "It is not true that the invoice total is 1,284.50 EUR",
+        0.8,
+      ),
+    ).toContain("states the opposite");
+    // Two frames cancel; "it is true that" is none.
+    for (const sentence of [
+      "It is not true that it is not true that no two of the three meetings overlap",
+      "It is true that no two of the three meetings overlap",
+      "No two of the three meetings overlap",
+    ]) {
+      expect([sentence, statementMismatch(proved, sentence, 0.8)]).toEqual([sentence, undefined]);
+    }
+    // Through the gate, at the proven floor.
+    const accepted = artifact({ id: "prf_00000000000000f1", claim: proved });
+    const bundle = await verify(
+      "It is not true that no two of the three meetings overlap [1].\n\n[1]: proof:prf_00000000000000f1",
+      {
+        config: config("proven"),
+        evidence: checkedBy([accepted]),
+        artifacts: memoryArtifacts([accepted]),
+      },
+    );
+    expect(only(bundle).bindings[0]?.reason).toBe("claim_mismatch");
+  });
+});
+
+describe("bounded work: the HEADs an answer asks for", () => {
+  test("are collected in time linear in the URLs it cites", async () => {
+    const timed = async (n: number): Promise<number> => {
+      const text = [
+        Array.from({ length: n }, (_, i) => `Fact ${i} is here [${i + 1}].`).join(" "),
+        "",
+        ...Array.from({ length: n }, (_, i) => `[${i + 1}]: https://s${i}.example/t`),
+      ].join("\n");
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 2; i++) {
+        let sent = 0;
+        const t = performance.now();
+        const bundle = await verify(text, {
+          config: config("cited", { sources: { resolve: "head" } }),
+          resolveHead: async () => {
+            sent += 1;
+            return 200;
+          },
+        });
+        best = Math.min(best, performance.now() - t);
+        expect([sent, bundle.met]).toEqual([MAX_HEAD_REQUESTS, MAX_HEAD_REQUESTS]);
+      }
+      return best;
+    };
+    const small = await timed(2_000);
+    // Sixteen times the URLs: a list searched once per URL took some seventy
+    // times as long (47 ms to 3.2 s); linear, about fifteen.
+    expect(await timed(32_000)).toBeLessThan(small * 30 + 100);
+  }, 30_000);
 });
 
 test("every UnmetReason is produced by some realistic input above", () => {

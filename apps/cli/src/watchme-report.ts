@@ -783,9 +783,11 @@ export function groundingTurns(digest: WatchmeProvability): number {
  * claims are not grounding claims, so they stay out of the counts too.
  * `grounding` says how many turns the counts cover, and a session with none
  * is NOT the gate's grounding verdict (design §5.1: unverified is never a
- * pass; §2: cited is not grounded — see `analyzeSession`). Declared
- * assumptions, accepted and refused, are tallied over every verified pass
- * (design §2: visible everywhere). `undefined` when the session carries no
+ * pass; §2: cited is not grounded — see `analyzeSession`). Assumptions,
+ * accepted and refused, are tallied over every verified pass (design §2:
+ * visible everywhere) — the declared ones and the hypotheses accepted proofs
+ * rest on, which are assumptions too (§6.4, §10), as the footer, `show`,
+ * `audit` and the grader count them. `undefined` when the session carries no
  * line (ungated, or pre-0.8.0).
  */
 export function sessionProvability(
@@ -820,8 +822,10 @@ export function sessionProvability(
       unverified += 1;
       continue;
     }
+    // A proof's hypotheses (`hypotheses`, design §6.4) count as assumptions
+    // but are not claims, so `counted` below leaves only the declared ones out.
     const passAssumptions = finiteCount(p["assumptions"]);
-    assumptions += passAssumptions;
+    assumptions += passAssumptions + finiteCount(p["hypotheses"]);
     assumptionsRefused += finiteCount(p["assumptionsRefused"]);
     if (RUNG_RANK[level] < RUNG_RANK.grounded) {
       citedFloor += 1;
@@ -904,7 +908,10 @@ export type ProvabilityRollup = {
   /** Verified turns graded at the `cited` floor: never counted as grounded. */
   readonly citedFloor: number;
   readonly unmet: number;
-  /** Declared assumptions the gate accepted / refused (design §2: visible everywhere). */
+  /**
+   * Assumptions the gate accepted (declared, plus the hypotheses accepted
+   * proofs rest on — §6.4) / refused (design §2: visible everywhere).
+   */
   readonly assumptions: number;
   readonly assumptionsRefused: number;
   /** Floor → sessions graded at it. */
@@ -1265,7 +1272,7 @@ export function renderWatchmeReportMd(report: WatchmeReportJson): string {
         .map(([rung, n]) => `${rung} ×${n}`)
         .join(", ");
     lines.push(
-      `- Provability gate (exact, per turn — replaces the heuristic for ${p.exactSessions} of ${p.sessions} gated session(s)): ${p.turns} gated turn(s) · ${p.failing} still failing after retries · ${p.unmet} unmet claim(s) · ${p.assumptions} declared assumption(s)${
+      `- Provability gate (exact, per turn — replaces the heuristic for ${p.exactSessions} of ${p.sessions} gated session(s)): ${p.turns} gated turn(s) · ${p.failing} still failing after retries · ${p.unmet} unmet claim(s) · ${p.assumptions} assumption(s)${
         p.assumptionsRefused > 0 ? ` (+${p.assumptionsRefused} refused)` : ""
       } · floor ${tally(p.levels)} · weakest achieved ${tally(p.weakestAchieved)}${
         p.citedFloor > 0

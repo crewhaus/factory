@@ -121,7 +121,7 @@ describe("recordFromCall origins", () => {
     const record = recordFromCall(
       {
         toolUseId: "t",
-        toolName: "Multi",
+        toolName: "mcp__files__multi",
         input: {
           url: "https://a.example/x",
           uri: "doi:10.1000/ABC",
@@ -142,6 +142,44 @@ describe("recordFromCall origins", () => {
       "a.md",
       "b/c.md",
     ]);
+  });
+
+  test("a runtime tool's stray url or path names no origin: its result is model output (design §8)", () => {
+    // Task, Recall, Consult and Skill declare no url or path field; their
+    // schemas strip an extra key without refusing it, so the raw input — the
+    // key the model added included — reaches the log. Read as an origin, a
+    // remembered sentence or a child's summary grounded a page nobody fetched.
+    const said = "The refund window is 30 days from the date of purchase.";
+    for (const toolName of ["Task", "Recall", "Remember", "Consult", "Escalate", "Skill"]) {
+      for (const input of [
+        { prompt: "What does our policy page say?", url: "https://acme.example/policy" },
+        { query: "refund window", href: "https://acme.example/policy" },
+        { name: "policy", path: "docs/policy.md", file_path: "docs/policy.md" },
+      ]) {
+        const record = recordFromCall(
+          { toolUseId: "t", toolName, input, content: said, isError: false },
+          roots,
+        );
+        expect([toolName, record.origins]).toEqual([toolName, []]);
+        const index = buildEvidenceIndex([record]);
+        expect(index.bySource("https://acme.example/policy")).toEqual([]);
+        expect(index.bySource("docs/policy.md")).toEqual([]);
+      }
+    }
+    // A plugin's tool too; an MCP server's names its origins as before.
+    const of = (toolName: string) =>
+      recordFromCall(
+        {
+          toolUseId: "t",
+          toolName,
+          input: { url: "https://acme.example/policy" },
+          content: "<html>Refunds are accepted within 14 days.</html>",
+          isError: false,
+        },
+        roots,
+      ).origins;
+    expect(of("my_plugin_fetch")).toEqual([]);
+    expect(of("mcp__fetch__fetch")).toEqual(["https://acme.example/policy"]);
   });
 
   test("a WebFetch header naming the final URL (and the one requested) indexes both", () => {
@@ -994,7 +1032,8 @@ describe("buildEvidenceIndex", () => {
     expect(index.bySource("HTTPS://KB.example/a/")[0]?.content).toBe("Alpha.");
     expect(index.bySource("https://kb.example/b")[0]?.origins).toEqual(["https://kb.example/b"]);
     expect(index.bySource("https://kb.example/b")[0]?.hits).toBeUndefined();
-    expect(index.bySource("https://api.example/q")[0]?.content).toContain("Beta.");
+    // Retrieve declares no url: a stray one names nothing it read.
+    expect(index.bySource("https://api.example/q")).toEqual([]);
     expect(index.bySource("https://nowhere.example")).toEqual([]);
   });
 
@@ -1002,7 +1041,7 @@ describe("buildEvidenceIndex", () => {
     const index = buildEvidenceIndex([
       recordFromCall({
         toolUseId: "a",
-        toolName: "T",
+        toolName: "mcp__web__fetch",
         input: { url: "https://a.example" },
         content: "A",
         isError: false,
@@ -1010,7 +1049,7 @@ describe("buildEvidenceIndex", () => {
       }),
       recordFromCall({
         toolUseId: "b",
-        toolName: "T",
+        toolName: "mcp__web__fetch",
         input: { url: "https://a.example" },
         content: "B",
         isError: false,
@@ -1018,7 +1057,7 @@ describe("buildEvidenceIndex", () => {
       }),
       recordFromCall({
         toolUseId: "c",
-        toolName: "T",
+        toolName: "mcp__web__fetch",
         input: { url: "https://a.example" },
         content: "C",
         isError: false,
@@ -1030,5 +1069,122 @@ describe("buildEvidenceIndex", () => {
     expect(turn2.byToolUseId("a")).toBeUndefined();
     expect(turn2.byToolUseId("b")?.content).toBe("B");
     expect(turn2.byToolUseId("c")).toBeUndefined();
+  });
+
+  describe("a call is its session and its id (an id is unique only per conversation)", () => {
+    // An OpenAI-compatible server numbers ids per conversation, and every
+    // sub-agent child is a fresh one: the parent's first fetch and its
+    // child's are both `functions.WebFetch:0`.
+    const ID = "functions.WebFetch:0";
+    const BLOG = "https://blog.example/acme-refunds";
+    const POLICY = "https://acme.example/policy";
+    const call = (
+      sessionId: string | undefined,
+      url: string,
+      body: string,
+      toolUseId = ID,
+    ): ReturnType<typeof recordFromCall> =>
+      recordFromCall({
+        toolUseId,
+        toolName: "WebFetch",
+        input: { url },
+        content: fetched(url, body),
+        isError: false,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      });
+
+    test("two sessions' calls by one id stay two records, each under its own URL", async () => {
+      const rootDir = tempDir();
+      await writeLog(rootDir, PARENT, [
+        { kind: "tool_use", payload: { id: ID, name: "WebFetch", input: { url: BLOG } } },
+        {
+          kind: "tool_result",
+          payload: { toolUseId: ID, content: fetched(BLOG, "The refund window is 30 days.") },
+        },
+        { kind: "sub_agent_start", payload: { childSessionId: CHILD } },
+      ]);
+      await writeLog(rootDir, CHILD, [
+        { kind: "tool_use", payload: { id: ID, name: "WebFetch", input: { url: POLICY } } },
+        {
+          kind: "tool_result",
+          payload: { toolUseId: ID, content: fetched(POLICY, "The refund window is 14 days.") },
+        },
+      ]);
+      const index = buildEvidenceIndex(
+        await evidenceFromSessionLog({ sessionId: PARENT, rootDir }),
+      );
+      expect(index.all()).toHaveLength(2);
+      expect(index.bySource(POLICY).map((r) => [r.sessionId, groundingBody(r)])).toEqual([
+        [CHILD, "The refund window is 14 days."],
+      ]);
+      expect(index.bySource(BLOG).map((r) => [r.sessionId, groundingBody(r)])).toEqual([
+        [PARENT, "The refund window is 30 days."],
+      ]);
+      expect(index.bySource(POLICY)[0]?.origins).toEqual([POLICY]);
+      // `tool:<id>` is the parent's own call, as continuity-store resolves it.
+      expect(index.byToolUseId(ID)?.sessionId).toBe(PARENT);
+      expect(index.callsById?.(ID).map((r) => r.sessionId)).toEqual([PARENT, CHILD]);
+    });
+
+    test("the transcript's copy of a call merges with the parent's, never a child's", () => {
+      // The child's call comes first: the parent is named, not guessed.
+      const index = buildEvidenceIndex(
+        [
+          call(CHILD, POLICY, "The refund window is 14 days."),
+          call(PARENT, BLOG, "The refund window is 30 days."),
+          call(undefined, BLOG, "The refund window is 30 days."),
+        ],
+        { sessionId: PARENT },
+      );
+      expect(index.all().map((r) => r.sessionId)).toEqual([CHILD, PARENT]);
+      expect(index.bySource(POLICY).map((r) => r.sessionId)).toEqual([CHILD]);
+      expect(index.bySource(BLOG).map((r) => r.sessionId)).toEqual([PARENT]);
+      // Unnamed, the parent is the first session the records name — and a
+      // transcript copy still finds its twin by its tool and input.
+      const guessed = buildEvidenceIndex([
+        call(CHILD, POLICY, "The refund window is 14 days."),
+        call(PARENT, BLOG, "The refund window is 30 days."),
+        call(undefined, BLOG, "The refund window is 30 days."),
+      ]);
+      expect(guessed.all()).toHaveLength(2);
+      expect(guessed.bySource(POLICY).map((r) => r.origins)).toEqual([[POLICY]]);
+      expect(guessed.bySource(BLOG).map((r) => r.sessionId)).toEqual([PARENT]);
+      // A transcript-only call of the parent is a call of its own.
+      const fresh = buildEvidenceIndex([
+        call(PARENT, BLOG, "x", "functions.WebFetch:1"),
+        call(CHILD, POLICY, "The refund window is 14 days."),
+        call(undefined, "https://other.example/", "Other.", ID),
+      ]);
+      expect(fresh.bySource(POLICY).map((r) => r.origins)).toEqual([[POLICY]]);
+      expect(fresh.bySource("https://other.example/").map((r) => r.sessionId)).toEqual([undefined]);
+    });
+
+    test("an id only several children share is ambiguous; one child's is that call", () => {
+      const SIBLING = "sess_00000000000000d4";
+      const index = buildEvidenceIndex(
+        [
+          call(PARENT, BLOG, "x", "toolu_parent"),
+          call(CHILD, POLICY, "The refund window is 14 days."),
+          call(SIBLING, BLOG, "The refund window is 30 days."),
+          call(CHILD, POLICY, "Only one.", "functions.WebFetch:9"),
+        ],
+        { sessionId: PARENT },
+      );
+      expect(index.byToolUseId(ID)).toBeUndefined();
+      expect(index.callsById?.(ID).map((r) => r.sessionId)).toEqual([CHILD, SIBLING]);
+      expect(index.byToolUseId("functions.WebFetch:9")?.sessionId).toBe(CHILD);
+      // In a turn scope, the one call left in scope answers.
+      const scoped = restrictToTurns(
+        buildEvidenceIndex(
+          [
+            { ...call(CHILD, POLICY, "a"), turnNumber: 1 },
+            { ...call(SIBLING, BLOG, "b"), turnNumber: 2 },
+          ],
+          { sessionId: PARENT },
+        ),
+        new Set([2]),
+      );
+      expect(scoped.byToolUseId(ID)?.sessionId).toBe(SIBLING);
+    });
   });
 });

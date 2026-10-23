@@ -177,7 +177,9 @@ function formatRoutingEvent(
       // pass, the line that explains a provability retry nudge (`sys>`) and
       // the footer. ✓ pass, ✗ fail, ? unverified (a verifier that threw), as
       // the footer marks them; the claim count leaves assumptions out, as
-      // the score does.
+      // the score does. A proof's hypotheses are assumptions too (design
+      // §6.4, §10): shown beside them, as the footer, `show` and `audit`
+      // count them, but never taken off the claims (they are not claims).
       const verdict = f(payload["verdict"]);
       const mark = verdict === "pass" ? "✓" : verdict === "fail" ? "✗" : "?";
       const parts = [`  ⚖ provability ${f(payload["level"]) ?? "?"} ${mark}`];
@@ -189,8 +191,9 @@ function formatRoutingEvent(
         const counted = Math.max(0, claims - assumptions);
         parts.push(`${met}/${counted} ${counted === 1 ? "claim" : "claims"}`);
       }
-      if (assumptions > 0) {
-        parts.push(`${assumptions} ${assumptions === 1 ? "assumption" : "assumptions"}`);
+      const shown = assumptions + (num(payload["hypotheses"]) ?? 0);
+      if (shown > 0) {
+        parts.push(`${shown} ${shown === 1 ? "assumption" : "assumptions"}`);
       }
       const achieved = f(payload["achieved"]);
       if (verdict === "fail" && achieved !== undefined) parts.push(`(reached ${achieved})`);

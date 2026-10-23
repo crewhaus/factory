@@ -41,7 +41,9 @@
  *     transcript so the real resume path replays it. v0 residue: the
  *     daemon's mcp_servers/knowledge boots are not mirrored (generated
  *     notes surface each), and runTurn's internal RunContext keeps trace
- *     events off the runner bus (the transcript is the captured artifact).
+ *     events off the runner bus (the transcript is the captured artifact —
+ *     under `provability:` the runner finds the gate's standing bundle
+ *     through the transcript's last `provability_graded` line).
  *   - managed → `gateway-request`: the compiled `agent.ts` already exports
  *     `runOneTurn` (the gateway's dispatcher); the bridge drives it per
  *     sample under an isolated per-sample tenant, with the per-sample

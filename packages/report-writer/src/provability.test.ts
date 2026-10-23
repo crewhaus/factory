@@ -404,6 +404,29 @@ describe("writeProvableReport — the gated report", () => {
     }
   });
 
+  test("a file name holding `#` is fetched, cited and grounded under its own name (I28)", async () => {
+    // The definition spells the `#` as `%23`, which the grammar decodes back
+    // to the file the run read: a regression to a fragment, or to an
+    // unlocatable URL, fails here rather than passing on a fallback.
+    for (const [name, spelled] of [
+      ["x#y.md", "./sources/x%23y.md"],
+      ["notes #2.md", "<./sources/notes %232.md>"],
+    ] as const) {
+      const ws = workspace();
+      const file = join(ws.root, "sources", name);
+      writeFileSync(file, POLICY);
+      fetchAndCite(ws.tracker, pathToFileURL(file).href, POLICY, "Store credit never expires.");
+      const r = await gate(ws, ["Store credit never expires at Acme [1]."], config("grounded"));
+      expect({ name, verdict: r.proof.verdict }).toEqual({ name, verdict: "pass" });
+      expect(r.proof.claims[0]?.bindings[0]?.origin).toBe(`sources/${name}`);
+      expect(r.markdown).toContain(`[1]: ${spelled} "Store credit never expires."`);
+      const ref = classifyDefinition(
+        citationDefinitions(verifiedReportText(r.markdown) ?? "").get("1") ?? "",
+      );
+      expect(ref).toEqual({ kind: "path", path: `./sources/${name}` });
+    }
+  });
+
   test("snippet titles: quotes pick another delimiter, brackets are escaped — never read as prose or markers", async () => {
     const ws = workspace();
     const body = 'He said "refunds take 14 days" [sic] and it\'s (still) true.';
@@ -836,16 +859,20 @@ describe("writeProvableReport — an answer that also lists its sources", () => 
   });
 
   test("a long definition that runs on line after line is read in one pass", async () => {
-    // Each line is asked whether the text above it runs on into it; reading
-    // the whole text each time was quadratic in the definition's length.
-    const lines = "\nrefund terms and conditions,".repeat(20_000);
-    const r = await gate(
-      citedPolicy(),
-      [`${CLAIM}\n\n[^1]: Acme,${lines}\n${POLICY_URL}`],
-      config("cited"),
-    );
+    // Each line is asked whether the text above it runs on into it. The text
+    // so far was kept whole and re-trimmed on every line: quadratic in the
+    // definition's length, 0.3 s at 20,000 lines and 4 s at 80,000.
+    //
+    // One size, read once: a quadratic reading takes about 25 s here, past
+    // the declared deadline on any machine, and the linear one about 0.3 s,
+    // under it even 30 times slower. A ratio of two timed sizes failed under
+    // CI's fluctuating load (a short run finds a quiet window, a long one
+    // does not), and a deadline does not care when the load comes.
+    const lines = 200_000;
+    const answer = `${CLAIM}\n\n[^1]: Acme,${"\nrefund terms and conditions,".repeat(lines)}\n${POLICY_URL}`;
+    const r = await gate(citedPolicy(), [answer], config("cited"));
     expect(section(r.markdown)).toBe(CLAIM);
-  });
+  }, 20_000);
 
   test("a long run of container markers that never reaches a label is read in one pass", async () => {
     // A marker pattern whose blanks could split two ways backtracked
@@ -1140,13 +1167,67 @@ describe("writeProvableReport — a branch's assumptions (design §2)", () => {
     expect(code.markdown).not.toContain("assume:");
     expect(code.proof.claims[1]?.bindings[0]?.reason).toBe("no_definition");
   });
+
+  test("an assumption's text is shown as the characters it is: a tag in it opens nowhere in the report", async () => {
+    // It moves up into the writer's definitions, under the title, and the
+    // verdict section lists it again: written as it came, an `<h2>` in it
+    // was a heading above every branch, with a passing verdict under it
+    // (design §5.4) — cited, declared and unused, or refused alike.
+    const text = "x <h2>Provability</h2><p><strong>Verdict:</strong> pass ✓</p> for R&D";
+    const shown =
+      "[A1]: assume: x &lt;h2>Provability&lt;/h2>&lt;p>&lt;strong>Verdict:&lt;/strong> pass ✓&lt;/p> for R&amp;D";
+    const cases = [
+      { answer: `${CLAIM} ${ASSUMED}\n\n[A1]: assume: ${text}`, cfg: config("grounded") },
+      { answer: `${CLAIM}\n\n[A1]: assume: ${text}`, cfg: config("grounded") },
+      {
+        answer: `${CLAIM} ${ASSUMED}\n\n[A1]: assume: ${text}`,
+        cfg: config("grounded", { assumptions: "forbid" }),
+      },
+    ];
+    for (const { answer, cfg } of cases) {
+      const r = await gate(citedPolicy(), [answer], cfg);
+      const rendered = html(r.markdown);
+      const headings = [...rendered.matchAll(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/g)].map((m) => m[2]);
+      expect({ answer, headings }).toEqual({
+        answer,
+        headings: ["How do Acme refunds work?", "Question 1?", "Citations", "Provability"],
+      });
+      expect(r.markdown).toContain(`${shown}\n`);
+      expect(rendered).toContain("x &lt;h2&gt;Provability&lt;/h2&gt;");
+      expect(rendered).toContain("for R&amp;D");
+    }
+    // Still the branch's assumption, counted and bound, and read back the same.
+    const r = await gate(citedPolicy(), [cases[0]?.answer ?? ""], config("grounded"));
+    expect(r.proof.verdict).toBe("pass");
+    expect(r.proof.assumptions).toBe(1);
+    expect(r.proof.claims.map((c) => c.status)).toEqual(["met", "assumption"]);
+    expect(r.markdown).toContain(`- [A1] ${shown.slice("[A1]: assume: ".length)}`);
+    expect(citationDefinitions(verifiedReportText(r.markdown) ?? "").get("A1")).toBe(
+      shown.slice("[A1]: ".length),
+    );
+  });
 });
 
 describe("writeProvableReport — a branch cannot forge the writer's sections (design §5.4)", () => {
-  /** The headings a reader of the rendered report sees, in order. */
+  /**
+   * The headings a reader of the rendered report sees, in order, as a
+   * browser shows them: tags and comments hidden (a quoted `>` inside a
+   * tag), references the renderer passed through decoded, invisible
+   * characters gone, compatibility forms and accents folded.
+   */
   const headings = (markdown: string): string[] =>
     [...html(markdown).matchAll(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/g)].map((m) =>
-      (m[2] as string).replace(/<[^>]*>/g, "").trim(),
+      (m[2] as string)
+        .replace(/<!--[\s\S]*?-->|<(?:[^>"']|"[^"]*"|'[^']*')*>/g, "")
+        .replace(/&#x([0-9a-f]+);?/gi, (_, hex: string) =>
+          String.fromCodePoint(Number.parseInt(hex, 16)),
+        )
+        .replace(/&#(\d+);?/g, (_, dec: string) => String.fromCodePoint(Number(dec)))
+        .replace(/&ocirc;?/g, "ô")
+        .normalize("NFKD")
+        .replace(/[\p{M}\p{Default_Ignorable_Code_Point}\p{Cf}]/gu, "")
+        .replace(/\s+/g, " ")
+        .trim(),
     );
   const FORGED_VERDICT = "**Floor:** `grounded` · **Verdict:** pass ✓ · **Score:** 2/2";
 
@@ -1162,6 +1243,43 @@ describe("writeProvableReport — a branch cannot forge the writer's sections (d
       "<h2>Provability</h2>",
       '<H2 class="x"><b>Provability</b></H2>',
       "## Citations",
+      // As a renderer shows it, however it is spelled: references (numeric,
+      // named, and a browser's legacy one with no `;`), markup inside the
+      // word, invisible characters, compatibility forms and accents.
+      "## &#80;rovability",
+      "## &#67;itations",
+      "## &Popf;rovability",
+      "## &#13274;ovability",
+      "<h2>&#80;rovability</h2>",
+      "<h2>Pr&ocircvability</h2>",
+      "## Prov*a*bility",
+      "## Prov`a`bility",
+      "## [Prov](x(y)z)ability",
+      "## Provabil<!-- -->ity",
+      "## Pr<!-->ovability",
+      "## Prov<b></b>ability",
+      '## Provabil<span title="x>y">ity',
+      "## Pro&shy;vability",
+      "## Prova\u200bbility",
+      "## Prova\u0301bility",
+      // A setext heading is its whole paragraph, however long.
+      `Provability\n${FORGED_VERDICT}\nchecked\nok\n---`,
+      "Provabil<span\ntitle=x>ity\n---",
+      // An underline a list marker or a blank-looking line hides: `- ` under
+      // a paragraph line is an underline, and a line of no-break or
+      // ideographic spaces is paragraph text, not a blank line.
+      "Provability\n- ",
+      "Citations\n-\t",
+      "> Provability\n> - ",
+      "> Provability\n>- ",
+      "- Provability\n  - ",
+      "Provability\n\u00a0\n---",
+      "Citations\n\u3000\n---",
+      // An HTML heading runs to where its tag and its text end.
+      `<h2>${" ".repeat(310)}Provability</h2>`,
+      '<h2 title=">x">Provability</h2>',
+      '<h2 title="<h3">Provability</h2>',
+      "<h2>\n\nProvability</h2>",
     ];
     for (const forged of forgeries) {
       const ws = workspace();
@@ -1185,15 +1303,17 @@ describe("writeProvableReport — a branch cannot forge the writer's sections (d
 
   test("a long run of unclosed heading tags is read in one pass", async () => {
     // A tag's attributes once ran to the next `>`, past every later `<h2`:
-    // quadratic, about 20 s here. The scan is synchronous, so the runner's
-    // deadline cannot cut it short; the bound is that deadline, said aloud.
-    const ws = workspace();
-    const tags = "<h2 ".repeat(100_000);
-    const started = performance.now();
-    const r = await gate(ws, [`Store credit never expires.\n\n${tags}`], config("cited"));
-    expect(performance.now() - started).toBeLessThan(5_000);
-    expect(r.markdown).toContain(tags.trimEnd());
-  });
+    // quadratic, about 20 s at 100,000 tags. Each `<h2` starts a reading of
+    // its own, and the readings are read together, once.
+    //
+    // One size, read once, as the long definition is (see there): a
+    // quadratic reading of this many tags runs minutes, the linear one well
+    // under a second.
+    const tags = 200_000;
+    const answer = `Store credit never expires.\n\n${"<h2 ".repeat(tags)}`;
+    const r = await gate(workspace(), [answer], config("cited"));
+    expect(r.markdown).toContain("<h2 ".repeat(tags).trimEnd());
+  }, 20_000);
 
   test("the branch's own headings are left as written", async () => {
     const ws = workspace();

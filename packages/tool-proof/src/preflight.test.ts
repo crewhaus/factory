@@ -5,7 +5,7 @@
  * deliberately differs (no HEAD, no replay, no judge) it says so in `notes`.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createBuiltinChecker } from "@crewhaus/proof-checker";
 import {
@@ -32,6 +32,7 @@ import {
   preflightConfig,
   preflightReport,
   proofRecheck,
+  runtimeStateRoots,
 } from "./index";
 import {
   MEETINGS,
@@ -721,5 +722,46 @@ describe("the report", () => {
     expect(run.events.filter((e) => e.kind.startsWith("pro"))).toEqual([]);
     expect(run.appended).toEqual([]);
     expect(await createFileArtifactStore({ rootDir: s.proofs }).list()).toEqual([]);
+  });
+});
+
+describe("the run's own state is no source, wherever the session root is (design §1 principle 1)", () => {
+  test("a session log under a relocated root in the workspace grounds nothing, as at the gate", async () => {
+    const workspace = dirs.make();
+    const sessions = join(workspace, "logs", "sessions");
+    const proofs = dirs.make();
+    mkdirSync(sessions, { recursive: true });
+    const log = `logs/sessions/${SESSION}.jsonl`;
+    const said = "Noting for the record: refunds are accepted within 30 days of purchase.";
+    await writeLog(sessions, SESSION, [
+      userMessage("what is the refund window?"),
+      ...call("toolu_read", "Read", { path: log }, said),
+    ]);
+    const tools = createProofTools({
+      config: config("grounded"),
+      proofsRoot: proofs,
+      workspaceRoot: workspace,
+      checkers: [createBuiltinChecker()],
+      now,
+    });
+    const draft = `Refunds are accepted within 30 days of purchase [1].\n\n[1]: ./${log}\n`;
+    const raw = await tools.provabilityPreflight.execute(
+      { draft },
+      fakeRun({ sessionRootDir: sessions }).ctx,
+    );
+    const out: Json = JSON.parse(raw as string);
+    expect(out.verdict).toBe("fail");
+    expect(out.table[0].evidence[0].reason).toBe("not_fetched");
+  });
+
+  test("runtimeStateRoots names the session, proofs and tenant roots, never the workspace's parent", () => {
+    const roots = runtimeStateRoots({
+      workspaceRoot: "/w",
+      sessionRootDir: "/w/logs/sessions",
+      proofsRoot: "/w/.crewhaus/proofs/bot",
+      env: { CREWHAUS_SESSION_DIR: "/elsewhere/sessions", CREWHAUS_SHARED_DIR: "/" },
+    });
+    expect(roots).toEqual(["/w/logs/sessions", "/w/.crewhaus/proofs/bot", "/elsewhere/sessions"]);
+    expect(runtimeStateRoots({ workspaceRoot: "/w", sessionRootDir: "/w", env: {} })).toEqual([]);
   });
 });
