@@ -37,6 +37,13 @@ export const Z3_IMAGE_REPO = "ghcr.io/crewhaus/sandbox-z3";
 /** The image tag this release pins (see the module doc for why it is a constant). */
 export const Z3_IMAGE_TAG = "0.8.0";
 export const Z3_IMAGE_REF = `${Z3_IMAGE_REPO}:${Z3_IMAGE_TAG}`;
+/**
+ * The Z3 release the image at {@link Z3_IMAGE_TAG} carries — the Dockerfile's
+ * `Z3_VERSION` (a unit test holds the two in step), and what
+ * `z3 --version` prints in it. The official release binary, pinned per
+ * architecture by sha256 (see the Dockerfile).
+ */
+export const Z3_SOLVER_VERSION = "4.16.0";
 export const Z3_DEFAULT_ENTRYPOINT: ReadonlyArray<string> = ["z3", "-in"];
 export const Z3_HEALTHCHECK_ARGV: ReadonlyArray<string> = ["z3", "--version"];
 

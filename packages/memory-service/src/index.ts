@@ -51,7 +51,9 @@
  *                      merged at LOWEST precedence via `discoverSkills`'
  *                      `builtinSkills` / `loadCommands`' `builtinDirs` —
  *                      user (`~/.crewhaus`) and project (`<cwd>/.crewhaus`)
- *                      entries override by name
+ *                      entries override by name; skills another root brings
+ *                      (`deps.builtinSkills`, e.g. the provability gate's)
+ *                      merge the same way
  *   wiki on        → `WikiStore` (`.crewhaus/wiki/<spec>/`)
  *                    · the ten thredz-vocabulary `wiki_*` tools
  *                    · `log_knowledge_gap` routed into the plan store as a
@@ -554,6 +556,17 @@ export type WireMemoryDeps = {
   readonly log?: (line: string) => void;
   /** Home directory override for skill/command discovery (tests). */
   readonly homeDir?: string;
+  /**
+   * Shipped skills another composition root brings, merged with this one's
+   * builtins at the SAME lowest precedence (a user or project skill with the
+   * same name overrides; one named like a default skill replaces it). Used
+   * only when the fabric owns the skill surface (continuity or learning on),
+   * which is when the caller takes its skill list from here — so a feature
+   * outside the fabric still reaches the prompt. Today: the provability
+   * gate's skill (`@crewhaus/evaluation-service`'s `provabilitySkills`,
+   * 0.8.0 design §11).
+   */
+  readonly builtinSkills?: ReadonlyArray<LoadedSkill>;
   readonly now?: () => Date;
   /** v0.3.0 Goal 3 — the live Thredz connection from {@link connectThredz}.
    *  `null` means "configured but boot failed" — wireMemory then DEGRADES to
@@ -1163,8 +1176,9 @@ async function loadSkillsAndCommands(
   // continuity is on), the learning-loop skill RENDERED with the fragment's
   // domain/curriculum/sources substitutions (when learning is on, §3.3), and
   // the dream skill when a dream schedule is configured (its /dream command
-  // loads it in-session, §6.3). All merge at LOWEST precedence — a user or
-  // project skill with the same name overrides.
+  // loads it in-session, §6.3), then any the caller brings from another root
+  // (`deps.builtinSkills` — the provability gate's skill). All merge at
+  // LOWEST precedence — a user or project skill with the same name overrides.
   const builtinSkills: LoadedSkill[] = [];
   for (const skill of DEFAULT_SKILLS) {
     if (skill.name === "continuity" && features.continuity) builtinSkills.push(skill);
@@ -1173,6 +1187,7 @@ async function loadSkillsAndCommands(
     }
     if (skill.name === "dream" && features.dream) builtinSkills.push(skill);
   }
+  builtinSkills.push(...(deps.builtinSkills ?? []));
   const skills = await discoverSkills({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),

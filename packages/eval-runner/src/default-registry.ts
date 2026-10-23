@@ -14,6 +14,10 @@
  *
  *   continuity.*             — `registerContinuityGraders` (5 graders)
  *   twelve.*                 — `register12MetricRubric` (12 metrics)
+ *   provability.*            — 0.8.0 §9.1 `createProvabilityGraders` (6
+ *                              deterministic graders over the sample's proof
+ *                              bundle; the flywheel canary can name them like
+ *                              any registered grader)
  *   nlg.rouge1/rouge2/rougeL/bleu1..4/meteor — pack defaults (threshold 0.5)
  *   semantic.similarity      — embedder resolved lazily from
  *                              `CREWHAUS_EVAL_EMBEDDER` (a model spec for
@@ -77,7 +81,7 @@
  *     documented plugin contract; the registry cannot know a plugin's
  *     vocabulary, so it validates nothing and drops nothing;
  *   - registered names with no YAML-settable construction (`twelve.*` /
- *     `continuity.*` constants, the wiring throwers above) reject ALL
+ *     `continuity.*` / `provability.*` constants, the wiring throwers above) reject ALL
  *     opts, pointing at the plugin override path.
  */
 import { join } from "node:path";
@@ -98,7 +102,7 @@ import {
   judgeBackedClassifier,
 } from "./judge-classifier";
 import { PARAPHRASE_GROUP_GRADER, paraphraseGroupConsistency } from "./paraphrase-consistency";
-import type { GraderLookup } from "./types";
+import type { EvalPricingFn, GraderLookup } from "./types";
 import { EVAL_VISION_MODEL_ENV, visionOcr } from "./vision-ocr";
 
 /** Env var naming the embedder model spec for `semantic.similarity`
@@ -110,6 +114,12 @@ export type DefaultGraderRegistryOptions = {
   readonly cwd?: string;
   /** Full override of the plugin discovery root (tests). */
   readonly pluginRoot?: string;
+  /**
+   * 0.8.0 §9.1 — prices `provability.costPerProvenClaim`'s gate re-runs on a
+   * run no cost-tracker metered (`runEval` passes its own
+   * `RunEvalOptions.pricing`). Absent ⇒ those tokens are reported unpriced.
+   */
+  readonly pricing?: EvalPricingFn;
 };
 
 /**
@@ -398,16 +408,22 @@ export async function defaultGraderRegistry(
 ): Promise<DefaultGraderRegistry> {
   const registry = new DefaultGraderRegistry();
 
-  const [nlg, multimodal, safety, twelve, continuity] = await Promise.all([
+  const [nlg, multimodal, safety, twelve, continuity, provability] = await Promise.all([
     import("@crewhaus/grader-nlg-metrics"),
     import("@crewhaus/grader-multimodal"),
     import("@crewhaus/grader-safety-classifiers"),
     import("@crewhaus/grader-12-metric-rubric"),
     import("@crewhaus/grader-continuity"),
+    import("@crewhaus/grader-provability"),
   ]);
 
   continuity.registerContinuityGraders(registry);
   twelve.register12MetricRubric(registry);
+  for (const [name, grader] of provability.createProvabilityGraders(
+    opts.pricing !== undefined ? { pricing: opts.pricing } : {},
+  )) {
+    registry.register(name, grader);
+  }
 
   registry.register("nlg.rouge1", nlg.rouge1());
   registry.register("nlg.rouge2", nlg.rouge2());

@@ -15,9 +15,10 @@
  * context slice for each missing kind and simply produce no findings — the
  * rules only fire where the data now exists.
  */
+import { type ProofClaim, claimReasons } from "@crewhaus/provability";
 import type { ArmStats } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
-import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
+import { type SpecPatch, isOptimizable, validatePatch } from "@crewhaus/spec-patch";
 import { declaredShadowCandidate, liveArmsOf, splitShadowLane } from "./shadow-lane";
 
 // -------- findings --------
@@ -165,6 +166,43 @@ export type AdviceContext = {
    * only and the low-satisfaction rule stays silent.
    */
   readonly watchme?: WatchmeAdviceSlice;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §9.3) — the provability gate's
+   * verdicts folded from the durable `provability_graded` lines. Undefined
+   * when no line exists (an ungated harness, or logs older than the kind),
+   * so `ruleProvabilityPressure` degrades to zero findings there.
+   */
+  readonly provability?: ProvabilityAdviceStats;
+};
+
+/**
+ * 0.8.0 §9.3 — the gate's verdicts per gated turn. A turn's STANDING pass is
+ * its last `provability_graded` line (the original answer is retryIndex 0,
+ * each gate-triggered re-run one more), so a turn "ends failing after
+ * retries" exactly when that last pass failed.
+ */
+export type ProvabilityAdviceStats = {
+  /** Distinct (session, turn) pairs the gate graded. */
+  readonly gatedTurns: number;
+  /** Turns whose standing pass failed — after every retry the gate allowed. */
+  readonly failedTurns: number;
+  /** Turns whose standing pass was `unverified` (the verifier threw; fail-open). */
+  readonly unverifiedTurns: number;
+  /** Gate-triggered re-runs (passes with retryIndex > 0). */
+  readonly retries: number;
+  /** Floor → standing passes graded at it. */
+  readonly levels: ReadonlyMap<string, number>;
+  /** The largest retry cap the lines reported (`maxRetries`), when any did. */
+  readonly maxRetries?: number;
+  /**
+   * Unmet reason → unmet claims on failing standing passes. The lines carry
+   * the counts, not the reasons, so these come from the persisted bundles
+   * ({@link withProvabilityBundles}) or a line's own `unmetReasons` record;
+   * empty when neither was available.
+   */
+  readonly unmetReasons: ReadonlyMap<string, number>;
+  /** Where the failing standing passes' bundles were persisted (`bundlePath`). */
+  readonly failingBundlePaths: ReadonlyArray<string>;
 };
 
 /** 0.6.0 §9.1 — cascade / self-escalation counters over `model_stage`. */
@@ -291,6 +329,11 @@ export function buildAdviceContext(
     totalToolBytes += bytes;
   };
 
+  // 0.8.0 §9.3 — the provability gate's passes, keyed `<session>#<turn>`; the
+  // last line per key is that turn's standing verdict.
+  const provabilityTurns = new Map<string, Record<string, unknown>>();
+  let provabilityRetries = 0;
+
   for (const session of sessions) {
     // Item 21 — correlate tool_result bytes back to the tool_use's name via
     // the toolUseId (both live on separate lines). Per-session scope so ids
@@ -301,6 +344,16 @@ export function buildAdviceContext(
     const ruleByTurn = new Map<number, string>();
     const escalatedTurns = new Set<number>();
     for (const obj of session.objects) {
+      const graded = payloadOf(obj, "provability_graded");
+      if (graded !== undefined) {
+        if (typeof graded["turnNumber"] === "number" && typeof graded["verdict"] === "string") {
+          provabilityTurns.set(`${session.sessionId}#${graded["turnNumber"]}`, graded);
+          if (typeof graded["retryIndex"] === "number" && graded["retryIndex"] > 0) {
+            provabilityRetries += 1;
+          }
+        }
+        continue;
+      }
       const route = payloadOf(obj, "model_route");
       if (route !== undefined) {
         if (typeof route["ruleId"] === "string" && typeof route["turnNumber"] === "number") {
@@ -458,7 +511,104 @@ export function buildAdviceContext(
     },
     routedTurnsByRule: ruleTurns,
     ...(watchme !== undefined ? { watchme } : {}),
+    ...(provabilityTurns.size > 0
+      ? { provability: foldProvabilityTurns(provabilityTurns.values(), provabilityRetries) }
+      : {}),
   };
+}
+
+/** A line's optional `unmetReasons` record (reason → count), tolerantly read. */
+function lineReasons(line: Record<string, unknown>): ReadonlyArray<[string, number]> {
+  const raw = line["unmetReasons"];
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return [];
+  return Object.entries(raw as Record<string, unknown>).filter(
+    (entry): entry is [string, number] =>
+      typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] > 0,
+  );
+}
+
+/** 0.8.0 §9.3 — the standing passes into {@link ProvabilityAdviceStats}. */
+function foldProvabilityTurns(
+  standing: Iterable<Record<string, unknown>>,
+  retries: number,
+): ProvabilityAdviceStats {
+  const levels = new Map<string, number>();
+  const unmetReasons = new Map<string, number>();
+  const failingBundlePaths: string[] = [];
+  let gatedTurns = 0;
+  let failedTurns = 0;
+  let unverifiedTurns = 0;
+  let maxRetries: number | undefined;
+  for (const line of standing) {
+    gatedTurns += 1;
+    if (typeof line["level"] === "string") {
+      levels.set(line["level"], (levels.get(line["level"]) ?? 0) + 1);
+    }
+    if (typeof line["maxRetries"] === "number" && Number.isFinite(line["maxRetries"])) {
+      maxRetries = Math.max(maxRetries ?? 0, line["maxRetries"]);
+    }
+    if (line["verdict"] === "unverified") unverifiedTurns += 1;
+    if (line["verdict"] !== "fail") continue;
+    failedTurns += 1;
+    for (const [reason, n] of lineReasons(line)) {
+      unmetReasons.set(reason, (unmetReasons.get(reason) ?? 0) + n);
+    }
+    if (typeof line["bundlePath"] === "string" && line["bundlePath"] !== "") {
+      failingBundlePaths.push(line["bundlePath"]);
+    }
+  }
+  return {
+    gatedTurns,
+    failedTurns,
+    unverifiedTurns,
+    retries,
+    levels,
+    ...(maxRetries !== undefined ? { maxRetries } : {}),
+    unmetReasons,
+    failingBundlePaths,
+  };
+}
+
+/**
+ * 0.8.0 §9.3 — fold the unmet reasons of the failing standing passes' proof
+ * bundles (the files `ProvabilityAdviceStats.failingBundlePaths` names, read
+ * by the caller — this module does no I/O) into the context. Each bundle
+ * adds `claimReasons` for every unmet claim: the reason of each binding that
+ * fell short, once per claim, or `no_citation` for a claim with no marker.
+ * Anything that is not bundle-shaped is skipped, never thrown on: a pruned
+ * or hand-edited file must not abort mining. Identity when the context has
+ * no provability slice.
+ */
+export function withProvabilityBundles(
+  ctx: AdviceContext,
+  bundles: ReadonlyArray<unknown>,
+): AdviceContext {
+  const p = ctx.provability;
+  if (p === undefined || bundles.length === 0) return ctx;
+  const unmetReasons = new Map(p.unmetReasons);
+  for (const bundle of bundles) {
+    if (bundle === null || typeof bundle !== "object") continue;
+    const claims = (bundle as { claims?: unknown }).claims;
+    if (!Array.isArray(claims)) continue;
+    for (const claim of claims) {
+      if (!isClaimLike(claim)) continue;
+      for (const reason of claimReasons(claim)) {
+        unmetReasons.set(reason, (unmetReasons.get(reason) ?? 0) + 1);
+      }
+    }
+  }
+  return { ...ctx, provability: { ...p, unmetReasons } };
+}
+
+/** Just enough of a `ProofClaim` for `claimReasons` to read. */
+function isClaimLike(value: unknown): value is ProofClaim {
+  if (value === null || typeof value !== "object") return false;
+  const claim = value as { status?: unknown; bindings?: unknown };
+  return (
+    typeof claim.status === "string" &&
+    Array.isArray(claim.bindings) &&
+    claim.bindings.every((b: unknown) => b !== null && typeof b === "object")
+  );
 }
 
 // -------- thresholds --------
@@ -524,6 +674,15 @@ export type AdviceThresholds = {
   /** "Watch me" — mean normalized satisfaction at/below which a persistent
    *  cluster is called low-satisfaction. */
   watchmeLowSatisfaction: number;
+  /** 0.8.0 §9.3 — VERIFIED gated turns a harness needs before provability
+   *  pressure is judged at all (one failed turn of one is not a trend — the
+   *  `escalationMinSamples` / `toolFailureMinCalls` floor every rate rule
+   *  here carries; the design names only the rate). */
+  provabilityMinTurns: number;
+  /** 0.8.0 §9.3 — the share of verified gated turns that END failing (after
+   *  every retry) at/above which the pressure rule fires (design: ≥ 20 %).
+   *  The same share of UNVERIFIED gated turns fires the unverified finding. */
+  provabilityFailRate: number;
 };
 
 /**
@@ -555,6 +714,8 @@ export const DEFAULT_ADVICE_THRESHOLDS: AdviceThresholds = {
   watchmeMinSessions: 10,
   watchmeIntentMinSessions: 3,
   watchmeLowSatisfaction: 0.4,
+  provabilityMinTurns: 5,
+  provabilityFailRate: 0.2,
 };
 
 /** Stop reasons that are part of healthy operation; everything else
@@ -1730,6 +1891,228 @@ export const ruleWatchmeCoverage: AdviceRule = (ctx, opts) => {
   return findings;
 };
 
+/**
+ * 0.8.0 §9.3 — what to do about the dominant unmet reason, keyed by the
+ * gate's stable `UnmetReason` tokens. Every line points at the harness —
+ * its tools, its skill and instructions, its sources — never at the floor.
+ */
+export const PROVABILITY_REASON_ADVICE: Readonly<Record<string, string>> = Object.freeze({
+  no_citation:
+    "answers state claims with no [n] marker at all — tighten the instructions (and check the `provability` skill is loaded, or a project skill that overrides it says the same): cite every claim and close with one `[n]: <source>` line per marker",
+  no_definition:
+    "markers have no `[n]: <source>` definition line — instruct the agent to close every answer with one definition per marker and to run ProvabilityPreflight on the draft",
+  not_locatable:
+    "citations name sources that cannot be located (free text) — ask for URLs, `doi:` refs or workspace paths",
+  host_denied:
+    "citations name hosts outside provability.sources — that allowlist is policy, so point the agent at the allowed sources in its instructions rather than widening it",
+  private_address: "citations name loopback / private-network URLs — those never count as sources",
+  path_outside_workspace: "citations name files outside the workspace — cite workspace paths",
+  path_missing: "citations name workspace files that do not exist — cite files the agent read",
+  unresolved: "cited URLs did not answer the HEAD check — instruct citing pages the agent fetched",
+  not_fetched:
+    "answers cite sources the run never read — add a fetch- or read-capable tool (WebFetch, Fetch, Read, Retrieve, an MCP reader) to `tools:` and instruct the agent to fetch every source before citing it",
+  not_found_in_source:
+    "the fetched sources do not contain the claims' words — instruct quoting or staying close to the source's wording (the opt-in provability.judge waiver covers true paraphrase, at a cost)",
+  polarity_conflict:
+    "claims contradict their sources (a negation the claim lacks) — instruct restating what the source says, qualifiers included",
+  not_independent:
+    "claims lack the independent sources provability.grounded.independent asks for — instruct fetching a second, independent origin",
+  tool_missing:
+    "`tool:` citations name calls the run never made — instruct citing the toolUseId of a call that ran",
+  tool_errored:
+    "`tool:` citations name calls that errored — retry the computation before citing it",
+  tool_not_allowed:
+    "`tool:` citations name tools outside provability.execution.allow — compute with an allowed tool (the allowlist is human-owned)",
+  value_absent:
+    "answers restate numbers the cited tool did not return — instruct copying values from the tool result verbatim, and computing (not recalling) every figure",
+  replay_mismatch:
+    "a cited tool result did not reproduce on replay — the answer misquotes it, or the tool is not pure",
+  proof_missing:
+    "`proof:` citations name no stored artifact — instruct calling ProofCheck and citing its prf_ id",
+  proof_rejected:
+    "cited proofs were rejected by their checker — read the counterexample in the ProofCheck result before citing",
+  claim_mismatch:
+    "cited proofs prove a different statement than the sentence — state the claim the proof covers",
+  assumption_forbidden:
+    "answers lean on more declared assumptions than the gate accepts — prove or cite those claims instead",
+  below_floor:
+    "evidence is valid but below the floor (e.g. a source for a figure at checked) — instruct computing figures with a tool and citing `tool:<toolUseId>`",
+});
+
+/** The one sentence the pressure rule ALWAYS carries (and a test pins). */
+export const PROVABILITY_NEVER_LOWER =
+  "Lowering provability.level is never suggested: the floor is the bar this harness's answers are held to and the provability graders measure against, and an advisor that lowers it trades proof for a passing number (design §9.2 — level is not optimizable).";
+
+/** The schema's `provability.max_retries` ceiling (spec `max(5)`). */
+const PROVABILITY_MAX_RETRIES_CAP = 5;
+
+/**
+ * 0.8.0 §9.3 — provability pressure: when at least
+ * `provabilityFailRate` (20 %) of VERIFIED gated turns END failing — the
+ * standing pass, after every retry the gate allowed — the harness cannot meet
+ * its floor often enough. An `unverified` turn (the verifier threw; design
+ * §5.1 fail-open) measured nothing, so it is neither a pass nor a failure and
+ * stays out of the denominator: a verifier that mostly throws must not dilute
+ * the fail rate of the turns it did grade. The finding carries:
+ *
+ *   - a whitelisted `provability.max_retries` patch (+1, capped at the
+ *     schema's 5) when another retry can help: `on_fail` is `retry` or
+ *     `escalate` (a `note` / `halt` gate never re-runs, so a cap moves
+ *     nothing), the target's gate re-runs at all (`max_retries` is in its
+ *     OPTIMIZABLE_PATHS — research's report gate runs once and is not), the
+ *     block is in object form (a `provability: grounded` shorthand has no key
+ *     to patch), and the cap is not already spent;
+ *   - advice keyed to the DOMINANT unmet reason (from the persisted bundles —
+ *     `withProvabilityBundles`), in the evidence lines and the patch
+ *     rationale, or as the suggestion itself when no patch applies;
+ *   - {@link PROVABILITY_NEVER_LOWER}, always — the rule never suggests
+ *     lowering `level`, and says why.
+ *
+ * Separately, when at least the same share of ALL gated turns stood
+ * unverified, a `provability-unverified` finding says the verifier itself is
+ * failing — those answers were served unchecked, which no fail rate shows.
+ *
+ * Degrades to zero findings on logs without `provability_graded` lines.
+ */
+export const ruleProvabilityPressure: AdviceRule = (ctx, opts) => {
+  const p = ctx.provability;
+  if (p === undefined) return [];
+  const t = resolveThresholds(opts);
+  const findings: AdviceFinding[] = [];
+  const verified = p.gatedTurns - p.unverifiedTurns;
+  if (verified >= t.provabilityMinTurns && p.failedTurns / verified >= t.provabilityFailRate) {
+    findings.push(provabilityPressureFinding(p, verified, t, opts));
+  }
+  if (
+    p.gatedTurns >= t.provabilityMinTurns &&
+    p.unverifiedTurns / p.gatedTurns >= t.provabilityFailRate
+  ) {
+    findings.push({
+      id: "provability-unverified",
+      severity: "warn",
+      summary: `${p.unverifiedTurns}/${p.gatedTurns} gated turns stood UNVERIFIED — the gate's verifier threw, so those answers were served unchecked (${pct(p.unverifiedTurns / p.gatedTurns)})`,
+      evidence: [
+        `${p.unverifiedTurns} of ${p.gatedTurns} gated turn(s) carry an unverified verdict (threshold: ≥${pct(t.provabilityFailRate)} of ≥${t.provabilityMinTurns} turns)`,
+        "An unverified verdict is grading infrastructure failing open (design §5.1), not a verdict on the answer: no claim was checked and no footer showed a pass.",
+        PROVABILITY_NEVER_LOWER,
+      ],
+      counts: { gatedTurns: p.gatedTurns, unverifiedTurns: p.unverifiedTurns },
+      suggestion: {
+        kind: "advice",
+        text: `Fix the verifier before tuning anything: the run's warnings and the \`error\` event-log line beside each unverified \`provability_graded\` line name the cause (a session log the gate could not read, a proofs root it could not write, a checker that crashed). Until then these turns carry no verdict, and provability pressure is measured over the verified turns only. ${PROVABILITY_NEVER_LOWER}`,
+      },
+    });
+  }
+  return findings;
+};
+
+/** The pressure finding itself (see {@link ruleProvabilityPressure}). */
+function provabilityPressureFinding(
+  p: ProvabilityAdviceStats,
+  verified: number,
+  t: AdviceThresholds,
+  opts: RuleOptions | undefined,
+): AdviceFinding {
+  const rate = p.failedTurns / verified;
+
+  const level =
+    [...p.levels].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0] ?? "declared";
+  const dominant = [...p.unmetReasons].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+  const reasonAdvice =
+    dominant !== undefined
+      ? `Dominant unmet reason: ${dominant[0]} (${dominant[1]} claim${dominant[1] === 1 ? "" : "s"}) — ${
+          PROVABILITY_REASON_ADVICE[dominant[0]] ??
+          "see `crewhaus provability audit` for the claims behind it"
+        }.`
+      : "The unmet reasons are in the proof bundles the gate persisted — `crewhaus provability audit` breaks them down.";
+
+  const spec = opts?.spec;
+  const block = specField<unknown>(spec, "provability");
+  const object =
+    block !== null && typeof block === "object" && !Array.isArray(block)
+      ? (block as Record<string, unknown>)
+      : undefined;
+  const onFail = typeof object?.["on_fail"] === "string" ? object["on_fail"] : "retry";
+  const declaredRetries =
+    typeof object?.["max_retries"] === "number" ? object["max_retries"] : undefined;
+  const currentRetries = declaredRetries ?? p.maxRetries ?? 1;
+  // A target whose gate never re-runs (research's report gate, design §8)
+  // has no `max_retries` dial, whatever `on_fail` says.
+  const target = spec?.target;
+  const targetRetries =
+    target === undefined || isOptimizable(target, ["provability", "max_retries"]);
+  const retriesHelp = targetRetries && (onFail === "retry" || onFail === "escalate");
+  const proposed = Math.min(currentRetries + 1, PROVABILITY_MAX_RETRIES_CAP);
+
+  let retryAdvice: string;
+  if (!targetRetries) {
+    retryAdvice = `A ${target} spec's provability gate grades once and never re-runs a failing answer, so max_retries is not a dial here — fix the cause above.`;
+  } else if (!retriesHelp) {
+    retryAdvice = `provability.on_fail is ${onFail}, so the gate never re-runs a failing answer — max_retries moves nothing here.`;
+  } else if (proposed <= currentRetries) {
+    retryAdvice = `provability.max_retries is already at its cap (${currentRetries}) — more retries are not the lever; fix the cause above.`;
+  } else if (typeof block === "string") {
+    retryAdvice = `Give the model another attempt: expand \`provability: ${block}\` to \`provability: { level: ${block}, max_retries: ${proposed} }\`.`;
+  } else {
+    retryAdvice = `Give the model another attempt: raise provability.max_retries to ${proposed}.`;
+  }
+
+  const summary = `${p.failedTurns}/${verified} gated turns ended failing the ${level} floor after retries (${pct(rate)})`;
+  const evidence = [
+    `${p.failedTurns} of ${verified} verified gated turn(s) ended with a failing provability verdict after ${p.retries} gate-triggered re-run(s) (threshold: ≥${pct(t.provabilityFailRate)} of ≥${t.provabilityMinTurns} turns)`,
+    ...(p.unverifiedTurns > 0
+      ? [
+          `${p.unverifiedTurns} more turn(s) stood unverified (the verifier threw) — measured nothing, so neither failures nor passes here`,
+        ]
+      : []),
+    ...[...p.unmetReasons]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 5)
+      .map(([reason, n]) => `unmet: ${reason} ×${n}`),
+    `advice: ${reasonAdvice}`,
+    PROVABILITY_NEVER_LOWER,
+  ];
+  const fallbackText = `${reasonAdvice} ${retryAdvice} ${PROVABILITY_NEVER_LOWER}`;
+  const canPatch =
+    retriesHelp && proposed > currentRetries && object !== undefined && spec !== undefined;
+  const suggestion: AdviceSuggestion = canPatch
+    ? patchOrAdvice(
+        spec,
+        {
+          target: spec.target,
+          path: ["provability", "max_retries"],
+          op:
+            declaredRetries !== undefined ||
+            opts?.specHasPath?.(["provability", "max_retries"]) === true
+              ? "replace"
+              : "add",
+          value: proposed,
+          rationale: `advise: ${p.failedTurns}/${verified} gated turns ended failing the ${level} floor after retries; ${
+            dominant !== undefined ? `dominant unmet reason ${dominant[0]}` : "reasons unread"
+          } — ${PROVABILITY_REASON_ADVICE[dominant?.[0] ?? ""] ?? "see crewhaus provability audit"}`,
+        },
+        fallbackText,
+      )
+    : { kind: "advice", text: fallbackText };
+
+  return {
+    id: "provability-pressure",
+    severity: "warn",
+    summary,
+    evidence,
+    counts: {
+      gatedTurns: p.gatedTurns,
+      failedTurns: p.failedTurns,
+      retries: p.retries,
+      ...(p.unverifiedTurns > 0
+        ? { verifiedTurns: verified, unverifiedTurns: p.unverifiedTurns }
+        : {}),
+      ...(dominant !== undefined ? { dominantReasonClaims: dominant[1] } : {}),
+    },
+    suggestion,
+  };
+}
+
 export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleRepeatedToolFailures,
   ruleTruncationPressure,
@@ -1747,6 +2130,7 @@ export const ADVICE_RULES: ReadonlyArray<AdviceRule> = [
   ruleAuditionReady,
   rulePolicyFlipReady,
   ruleWatchmeCoverage,
+  ruleProvabilityPressure,
 ];
 
 /**

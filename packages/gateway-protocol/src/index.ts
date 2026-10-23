@@ -27,6 +27,9 @@
 
 import { CrewhausError } from "@crewhaus/errors";
 import { z } from "zod";
+import { ProofBundle } from "./proof";
+
+export { PROOF_LEVELS, PROOF_UNMET_REASONS, ProofBundle, type ProofBundleT } from "./proof";
 
 export const PROTOCOL_VERSION = "crewhaus.v1" as const;
 
@@ -86,11 +89,23 @@ export const RunsCreateParams = z
     sessionId: z.string().min(1).optional(),
   })
   .strict();
+/**
+ * What a run answers with. `reply` is the run's final text — the managed
+ * daemon has always returned it; the schema now says so. `proof` (0.8.0,
+ * design/0.8.0-provability-release.md §5.4) is the proof bundle the
+ * `provability:` gate graded the run's final turn against, present only when
+ * the spec declares the block — additive and optional, so the protocol
+ * version stays `crewhaus.v1` and a run without the block answers exactly as
+ * before. The bundle's one-line footer also rides `reply` unless the spec
+ * sets `provability.render: none`.
+ */
 export const RunsCreateResult = z
   .object({
     runId: z.string().min(1),
     sessionId: z.string().min(1),
     tenantId: z.string().min(1),
+    reply: z.string().optional(),
+    proof: ProofBundle.optional(),
   })
   .strict();
 export type RunsCreateParamsT = z.infer<typeof RunsCreateParams>;
@@ -102,11 +117,14 @@ export const RunsContinueParams = z
     input: z.string(),
   })
   .strict();
+/** Same shape as {@link RunsCreateResult}: `reply`, and `proof` under `provability:`. */
 export const RunsContinueResult = z
   .object({
     runId: z.string().min(1),
     sessionId: z.string().min(1),
     tenantId: z.string().min(1),
+    reply: z.string().optional(),
+    proof: ProofBundle.optional(),
   })
   .strict();
 export type RunsContinueParamsT = z.infer<typeof RunsContinueParams>;

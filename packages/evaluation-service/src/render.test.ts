@@ -143,6 +143,46 @@ describe("provability", () => {
     );
   });
 
+  test("managed with a per-run observer: the field composes it in, the import names it", () => {
+    const wiring = renderEvaluationWiring(
+      { ...base, provability },
+      { ...MANAGED, bundleObserverExpr: "args.onProofBundle" },
+    );
+    expect(wiring.imports).toEqual([
+      'import { type ProofBundleObserver, observeProofBundles, registerGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
+    ]);
+    expect(wiring.field).toBe(
+      "\n    provability: observeProofBundles(__gates.provability, args.onProofBundle),",
+    );
+    // The boot line and the registration are the observer-less ones: the
+    // observer is per run, the wiring is per process.
+    expect(wiring.bootBlock).toBe(
+      renderEvaluationWiring({ ...base, provability }, MANAGED).bootBlock,
+    );
+    expect(wiring.toolsRegistration).toEndWith("\nregisterGateTools(defaultCatalog, __gates);");
+  });
+
+  test("an observer without provability: ignored — the evaluation-only and absent pieces are unchanged", () => {
+    const observed = { ...MANAGED, bundleObserverExpr: "args.onProofBundle" };
+    const pieces = (w: ReturnType<typeof renderEvaluationWiring>) => [
+      w.imports,
+      w.bootBlock,
+      w.field,
+      w.toolsRegistration,
+      w.toolsExpr("defaultCatalog.list()"),
+    ];
+    expect(pieces(renderEvaluationWiring({ ...base, evaluation: CONTAINS }, observed))).toEqual(
+      pieces(renderEvaluationWiring({ ...base, evaluation: CONTAINS }, MANAGED)),
+    );
+    const absent = renderEvaluationWiring(base, observed);
+    expect([absent.imports, absent.bootBlock, absent.field, absent.toolsRegistration]).toEqual([
+      [],
+      "",
+      "",
+      "",
+    ]);
+  });
+
   test("both blocks: both fields, evaluation first", () => {
     const wiring = renderEvaluationWiring({ ...base, evaluation: CONTAINS, provability }, CLI);
     expect(wiring.field).toBe(

@@ -12,11 +12,11 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/eval-grader": "workspace:*",
     "@crewhaus/grader-registry": "workspace:*",
-    "@crewhaus/provability": "workspace:*"
+    "@crewhaus/provability": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

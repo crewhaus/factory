@@ -9,6 +9,7 @@ import {
   diffSpecYaml,
   formatDiffValue,
   formatWriteBackHeader,
+  humanOwnedReason,
   isOptimizable,
   parseWriteBackHeader,
   specHasPath,
@@ -701,7 +702,12 @@ agent:
         }),
       ).toThrow(/would change "agent.model_pool.learning.seed"/);
     }
-    expect(OPTIMIZER_REFUSED_LEAVES).toEqual([["model_pool", "learning", "seed"]]);
+    expect(OPTIMIZER_REFUSED_LEAVES).toEqual([
+      ["model_pool", "learning", "seed"],
+      // 0.8.0 §9.2 — the provability floor and its failure mode.
+      ["provability", "level"],
+      ["provability", "on_fail"],
+    ]);
   });
 
   test("pool POLICY paths are whitelisted for cli/channel/managed; roster paths are not", () => {
@@ -1031,5 +1037,200 @@ describe("validatePatch — evaluation dials", () => {
         value: "halt",
       }),
     ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+  });
+});
+
+describe("0.8.0 provability release — the gate's dials and the floor (§9.2)", () => {
+  const PROVABILITY_YAML = `# a support bot that must ground its answers
+target: cli
+name: support-bot
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer from the policy pages.
+tools:
+  - WebFetch
+provability:
+  # the floor — human-owned, never optimizer-tunable
+  level: grounded
+  max_retries: 1
+  threshold: 0.9
+  grounded:
+    # how much of a claim must sit inside one window of the source
+    coverage: 0.8
+    window_tokens: 60
+`;
+
+  const DIALS = [
+    ["provability", "threshold"],
+    ["provability", "max_retries"],
+    ["provability", "grounded", "coverage"],
+    ["provability", "grounded", "window_tokens"],
+  ] as const;
+
+  test("the four dials are whitelisted on cli/channel/managed; research gets all but max_retries", () => {
+    for (const target of ["cli", "channel", "managed"] as const) {
+      for (const path of DIALS) expect(OPTIMIZABLE_PATHS[target]).toContainEqual([...path]);
+    }
+    for (const path of DIALS) {
+      expect(isOptimizable("research", path)).toBe(path[1] !== "max_retries");
+    }
+    // Crew carries the block unwired in 0.8.0: no dial on a gate that never runs.
+    for (const path of DIALS) expect(isOptimizable("crew", path)).toBe(false);
+  });
+
+  test("each dial round-trips through applySpecPatch with comments and key order intact", () => {
+    const values: Record<string, number> = {
+      "provability.threshold": 0.95,
+      "provability.max_retries": 3,
+      "provability.grounded.coverage": 0.7,
+      "provability.grounded.window_tokens": 90,
+    };
+    for (const path of DIALS) {
+      const value = values[path.join(".")] as number;
+      const { yaml, spec } = applySpecPatch(PROVABILITY_YAML, {
+        target: "cli",
+        path: [...path],
+        op: "replace",
+        value,
+      });
+      if (spec.target !== "cli") throw new Error("expected cli spec");
+      const block = spec.provability;
+      if (typeof block !== "object" || block === undefined) throw new Error("expected object form");
+      const got =
+        path.length === 2
+          ? (block as Record<string, unknown>)[path[1]]
+          : (block.grounded as Record<string, unknown> | undefined)?.[path[2] as string];
+      expect(got).toBe(value);
+      expect(yaml).toContain("# a support bot that must ground its answers");
+      expect(yaml).toContain("# the floor — human-owned, never optimizer-tunable");
+      expect(yaml).toContain("# how much of a claim must sit inside one window of the source");
+      expect(yaml).toContain("level: grounded");
+      expect(yaml.indexOf("level:")).toBeLessThan(yaml.indexOf("grounded:\n"));
+      // Only the touched dial moved.
+      expect(diffSpecYaml(PROVABILITY_YAML, yaml)).toHaveLength(1);
+    }
+  });
+
+  test("an out-of-range dial still fails the re-parse", () => {
+    expect(() =>
+      applySpecPatch(PROVABILITY_YAML, {
+        target: "cli",
+        path: ["provability", "max_retries"],
+        op: "replace",
+        value: 9,
+      }),
+    ).toThrow();
+    expect(() =>
+      applySpecPatch(PROVABILITY_YAML, {
+        target: "cli",
+        path: ["provability", "grounded", "coverage"],
+        op: "replace",
+        value: 1.5,
+      }),
+    ).toThrow();
+  });
+
+  test("validatePatch refuses the floor, the failure mode and every excluded knob", () => {
+    const { spec } = applySpecPatch(PROVABILITY_YAML, {
+      target: "cli",
+      path: ["provability", "threshold"],
+      op: "replace",
+      value: 0.9,
+    });
+    for (const [path, value] of [
+      [["provability", "level"], "cited"],
+      [["provability", "on_fail"], "note"],
+      [["provability", "assumptions"], "allow"],
+      [["provability", "max_assumptions"], 10],
+      [["provability", "scope"], "turn"],
+      [["provability", "render"], "none"],
+      [["provability", "sources", "allow"], ["*"]],
+      [["provability", "grounded", "independent"], 1],
+      [["provability", "execution", "replay"], false],
+      [["provability", "formal", "checkers"], ["builtin"]],
+      [["provability", "judge", "model"], "claude-haiku-4-5"],
+      [["provability"], { level: "cited" }],
+      [["provability", "grounded"], { coverage: 0.1 }],
+    ] as const) {
+      expect(() =>
+        validatePatch(spec, { target: "cli", path: [...path], op: "replace", value }),
+      ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+    }
+    for (const path of DIALS) {
+      expect(() =>
+        validatePatch(spec, { target: "cli", path: [...path], op: "replace", value: 1 }),
+      ).not.toThrow();
+    }
+  });
+
+  test("a dial under the `provability: <rung>` SHORTHAND fails as a SpecPatchError naming the scalar (review W3-C2)", () => {
+    const SHORTHAND = `# shorthand
+target: cli
+name: support-bot
+agent:
+  model: claude-sonnet-4-6
+  instructions: Answer from the policy pages.
+provability: grounded
+`;
+    const { spec } = applySpecPatch(SHORTHAND, {
+      target: "cli",
+      path: ["agent", "instructions"],
+      op: "replace",
+      value: "Answer from the policy pages.",
+    });
+    const patch = {
+      target: "cli" as const,
+      path: ["provability", "threshold"],
+      op: "add" as const,
+      value: 0.5,
+    };
+    // The path is whitelisted, so validation alone cannot catch it…
+    expect(() => validatePatch(spec, patch)).not.toThrow();
+    // …and the apply refuses it in the module's own error type, not a raw CST Error.
+    let caught: unknown;
+    try {
+      applySpecPatch(SHORTHAND, patch);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SpecPatchError);
+    expect((caught as Error).message).toContain(
+      'cannot add provability.threshold: provability is a scalar ("grounded")',
+    );
+    expect((caught as Error).message).toContain("expand it to a mapping first");
+    // replace on a scalar intermediate is refused before the CST (the path does not exist).
+    expect(() => applySpecPatch(SHORTHAND, { ...patch, op: "replace" })).toThrow(SpecPatchError);
+    // The expanded form takes the same patch.
+    const expanded = SHORTHAND.replace("provability: grounded", "provability:\n  level: grounded");
+    expect(applySpecPatch(expanded, patch).yaml).toContain("threshold: 0.5");
+  });
+
+  test("the floor and on_fail are refused leaves on EVERY target — no entry can admit them", () => {
+    for (const target of Object.keys(OPTIMIZABLE_PATHS) as Array<keyof typeof OPTIMIZABLE_PATHS>) {
+      expect(isOptimizable(target, ["provability", "level"])).toBe(false);
+      expect(isOptimizable(target, ["provability", "on_fail"])).toBe(false);
+    }
+    expect(OPTIMIZER_REFUSED_LEAVES).toContainEqual(["provability", "level"]);
+  });
+
+  test("every excluded knob names its reason", () => {
+    for (const path of [
+      ["provability", "level"],
+      ["provability", "on_fail"],
+      ["provability", "assumptions"],
+      ["provability", "max_assumptions"],
+      ["provability", "scope"],
+      ["provability", "render"],
+      ["provability", "sources", "deny"],
+      ["provability", "sources", "resolve"],
+      ["provability", "grounded", "independent"],
+      ["provability", "execution", "allow"],
+      ["provability", "formal", "timeout_ms"],
+      ["provability", "judge", "allow_self_judge"],
+    ]) {
+      expect(humanOwnedReason(path), path.join(".")).toBeDefined();
+    }
+    for (const path of DIALS) expect(humanOwnedReason([...path])).toBeUndefined();
+    expect(humanOwnedReason(["provability", "level"])).toContain("blind the critic");
   });
 });

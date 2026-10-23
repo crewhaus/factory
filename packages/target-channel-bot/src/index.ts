@@ -1,5 +1,9 @@
 import { CrewhausError } from "@crewhaus/errors";
-import { type EvaluationWiring, renderEvaluationWiring } from "@crewhaus/evaluation-service";
+import {
+  type EvaluationWiring,
+  renderEvaluationWiring,
+  renderGateSkills,
+} from "@crewhaus/evaluation-service";
 import {
   renderControlDrain,
   renderControlImports,
@@ -909,7 +913,18 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   // interactive turn, wired per turn (see renderEvaluation). Empty pieces when
   // the spec declares neither `evaluation:` nor `provability:`.
   const evaluation = renderEvaluation(ir, { toolsVar: baseToolsExpr, cwdExpr: fabricCwdExpr });
-  const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+  // 0.8.0 §11 — the gate's `provability` skill. Where this turn's wireMemory
+  // owns the skill surface (continuity or learning on) it rides that call's
+  // deps; otherwise the daemon's own discovery carries it (renderDaemon).
+  // Empty without `provability:`.
+  const gateSkills = renderGateSkills(ir);
+  const fabricOwnsSkills = fabric.wired && (fabric.continuityOn || ir.learning !== undefined);
+  const gateSkillsDep =
+    fabricOwnsSkills && gateSkills.expr !== ""
+      ? `\n        builtinSkills: ${gateSkills.expr},`
+      : "";
+  const evalImports = [...evaluation.imports, ...(gateSkillsDep !== "" ? gateSkills.imports : [])];
+  const evalImport = evalImports.length > 0 ? `${evalImports.join("\n")}\n` : "";
   const evaluationTurnBlock = evaluation.bootBlock
     ? `
       // The in-loop gates, through the ONE composition root (0.8.0 §4.4).
@@ -982,7 +997,7 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       const __memTools: RegisteredTool[] = [];
       const __memWired = await wireMemory(${fragmentExpr}, {
         catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-        cwd: ${fabricCwdExpr},${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}
+        cwd: ${fabricCwdExpr},${memEmbedderDep}${thredzOn ? "\n        thredz: config.thredz," : ""}${gateSkillsDep}
         sessionScope: args.sessionId,
       });${
         fabric.continuityOn
@@ -2504,20 +2519,27 @@ try {
     ? `\n  // Plugins (G32) — after every first-party tool is on the catalog.\n${plugins.registerBoot}\n`
     : "";
   const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
+  // 0.8.0 §11 — the `provability` skill, the gate's one builtin skill, joins
+  // the daemon's own discovery (with continuity on, every turn's wireMemory
+  // takes it instead — renderAgent). Empty without `provability:`.
+  const gateSkills = renderGateSkills(ir);
+  const gateSkillsArg = gateSkills.expr !== "" ? `, builtinSkills: ${gateSkills.expr}` : "";
+  const gateSkillsImport =
+    !continuityOn && gateSkills.imports.length > 0 ? `\n${gateSkills.imports.join("\n")}` : "";
   const extensionImports = continuityOn
     ? `${hooksEngineImport}
 import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`
     : `${hooksEngineImport}
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`;
+import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}${gateSkillsImport}`;
   const extensionBoot = continuityOn
     ? `${pluginsActivateBoot}  const __cwd = process.cwd();
   const __hooks = await loadHooks({ cwd: __cwd });`
     : `${pluginsActivateBoot}  const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
-    discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
+    discoverSkills({ cwd: __cwd${pluginSkillDirsArg}${gateSkillsArg} }),
     loadCommands({ cwd: __cwd }),
   ]);
   if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -2833,11 +2855,15 @@ function renderEvalEntry(ir: IrChannelV0): string {
   const builtinImportBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
+  // 0.8.0 §11 — the gate's `provability` skill joins the bridge's own
+  // discovery, as it does the daemon's (renderDaemon). Empty without the block.
+  const gateSkills = renderGateSkills(ir);
+  const gateSkillsArg = gateSkills.expr !== "" ? `, builtinSkills: ${gateSkills.expr}` : "";
   const skillsImports = continuityOn
     ? ""
     : `import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-`;
+${gateSkills.imports.map((line) => `${line}\n`).join("")}`;
   const hooksEngineImport = `import { loadHooks${specHooks !== undefined ? ", type HookDef" : ""} } from "@crewhaus/hooks-engine";`;
 
   const initLines = inits.length > 0 ? `${inits.join("\n")}\n` : "";
@@ -2865,7 +2891,7 @@ defaultCatalog.register(createTaskTool({ subAgents: __subAgents }));
     : `  const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
-    discoverSkills({ cwd: __cwd }),
+    discoverSkills({ cwd: __cwd${gateSkillsArg} }),
     loadCommands({ cwd: __cwd }),
   ]);${specHooksBoot}
   if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;

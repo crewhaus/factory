@@ -1,5 +1,9 @@
 import { CrewhausError } from "@crewhaus/errors";
-import { type EvaluationWiring, renderEvaluationWiring } from "@crewhaus/evaluation-service";
+import {
+  type EvaluationWiring,
+  renderEvaluationWiring,
+  renderGateSkills,
+} from "@crewhaus/evaluation-service";
 import {
   renderControlDrain,
   renderControlImports,
@@ -362,8 +366,9 @@ ${lines.join("\n")}
  * Under `provability:` the proof tools register on `defaultCatalog` after the
  * spec's builtins (replacing a same-named builtin it also listed) and the
  * per-turn tool set unions the catalog; the proof footer rides the reply text
- * the gateway returns (`footerTarget: "reply"`). Empty pieces when the spec
- * declares neither block, keeping those bundles byte-identical.
+ * the gateway returns (`footerTarget: "reply"`), and the bundle itself rides
+ * the result envelope as `proof` (`renderProofResult`). Empty pieces when the
+ * spec declares neither block, keeping those bundles byte-identical.
  */
 function renderEvaluation(ir: IrManagedV0): EvaluationWiring {
   return renderEvaluationWiring(ir, {
@@ -371,6 +376,10 @@ function renderEvaluation(ir: IrManagedV0): EvaluationWiring {
     cwdExpr: "process.cwd()",
     footerTarget: "reply",
     indent: "    ",
+    // 0.8.0 §5.4 — one wiring serves every run, so each run hands its own
+    // observer in (`ManagedAgentArgs.onProofBundle`) and the gateway returns
+    // that run's bundle as `proof`. Ignored without `provability:`.
+    bundleObserverExpr: "args.onProofBundle",
   });
 }
 
@@ -522,6 +531,35 @@ function renderAgent(ir: IrManagedV0): string {
   const gateToolsOn = evaluation.toolsRegistration !== "";
   const gateToolsBlock = gateToolsOn ? `\n${evaluation.toolsRegistration}` : "";
   const fabric = memoryFabric(ir);
+  // 0.8.0 §11 — the `provability` skill, the gate's one builtin skill,
+  // rendered once at module load. Where the per-turn wireMemory owns the
+  // skill surface (continuity or learning on) it rides that call's deps and
+  // comes back merged with the fabric's skills; otherwise it IS the surface
+  // (this shape discovers no skills of its own): one Skill tool over it, on
+  // the per-turn memory tools or — with no fabric — on defaultCatalog, and
+  // only when the list is non-empty (`provabilitySkills` fails soft to []),
+  // as at every other registration site. That direct path skips discovery's
+  // frontmatter pass, which has nothing to check here: the name and
+  // description are the shipped constants (the block substitutes into the
+  // body only; @crewhaus/default-skills' README, "Trust"), and the body is
+  // still classified at the "skill" origin when the Skill tool loads it.
+  // Empty without `provability:`.
+  const gateSkills = renderGateSkills(ir);
+  const gateSkillsOn = gateSkills.expr !== "";
+  const gateSkillsImport = gateSkillsOn
+    ? `\n${gateSkills.imports.join("\n")}${
+        fabric.wired ? "" : `\nimport { createSkillTool } from "@crewhaus/skills-registry";`
+      }`
+    : "";
+  const gateSkillsBlock = gateSkillsOn
+    ? `
+// 0.8.0 §11 — the provability skill: what the gate checks and how to cite.
+const __gateSkills = ${gateSkills.expr};${
+        fabric.wired
+          ? ""
+          : "\nif (__gateSkills.length > 0) defaultCatalog.register(createSkillTool(__gateSkills));"
+      }`
+    : "";
   // Loop contract 0.4 (Batch E, G23) — thredz is now emit-WIRED on managed.
   // The managed shape has NO `mcp_servers` field, so this emitter synthesizes
   // the thredz stdio server from `ir.thredz` itself (mirror of the compiler's
@@ -668,6 +706,14 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   /** v0.3.0 — the request's tenant; fences every memory-fabric store. */
   readonly tenant: Tenant;`
     : "";
+  // 0.8.0 §5.4 — the per-run observer the gate's field composes in (see
+  // renderEvaluation); the gateway handler passes one to return `proof`.
+  const proofArgField =
+    ir.provability !== undefined
+      ? `
+  /** 0.8.0 — sees each proof bundle this turn's gate grades (the last is the standing one). */
+  readonly onProofBundle?: ProofBundleObserver;`
+      : "";
   const memBlock = fabric.wired
     ? `
   // v0.3.0 — the memory fabric, wired per turn through the ONE stable
@@ -675,11 +721,11 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
   const __memTools: RegisteredTool[] = [];
   const __memWired = await wireMemory(${fabric.fragmentJson}, {
     catalog: { register: (t: RegisteredTool) => { __memTools.push(t); } },
-    cwd: process.cwd(),${memEmbedderDep}${thredzDep}
+    cwd: process.cwd(),${memEmbedderDep}${thredzDep}${gateSkillsOn ? "\n    builtinSkills: __gateSkills," : ""}
     tenant: args.tenant,
     sessionScope: args.sessionId,
   });
-  const __skills = __memWired.options.skills ?? [];
+  const __skills = __memWired.options.skills ?? ${gateSkillsOn ? "__gateSkills" : "[]"};
   if (__skills.length > 0) __memTools.push(createSkillTool(__skills));
   // The daemon is a NON-INTERACTIVE surface, so an "ask" decision has nobody
   // to prompt: it parks the turn for out-of-band approval (or, under
@@ -709,13 +755,21 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
       ? "[...__memTools, ...defaultCatalog.list()]"
       : "defaultCatalog.list()"
     : "__memTools";
+  // 0.8.0 §11 — the run's skill list under `provability:`: the one the Skill
+  // tool loads from. With the fabric, `__skills` (its spread re-states the
+  // same list whenever it carries one); without, the gate's skill alone.
+  const gateSkillsField = !gateSkillsOn
+    ? ""
+    : fabric.wired
+      ? "\n    skills: __skills,"
+      : "\n    skills: __gateSkills,";
   const memRunFields = fabric.wired
     ? `
-    tools: ${toolsExpr},
+    tools: ${toolsExpr},${gateSkillsField}
     ...__memWired.options,`
     : catalogUnion
       ? `
-    tools: ${toolsExpr},`
+    tools: ${toolsExpr},${gateSkillsField}`
       : "";
   const permissionsField = renderManagedPermissions(ir, fabric.wired);
   // Loop contract 0.4 (G11) — the pending-approval store, built PER TURN and
@@ -750,12 +804,12 @@ const __memEmbedder = createEmbedder({ model: ${escapeJsonString(memEmbedderMode
 // Source spec: ${escapeJsonString(ir.name)} (target: managed, ir version: ${ir.version})
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
-import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${hybridImport}${permissionImports}${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${evaluationBlock}${toolBootBlock}${gateToolsBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";${hybridImport}${permissionImports}${pcImport}${memImports}${thredzImports}${catalogImport}${toolImportBlock}${knowledgeImports}${embedderImport}${evalImport}${gateSkillsImport}${evaluationBlock}${toolBootBlock}${gateToolsBlock}${gateSkillsBlock}${thredzBootBlock}${embedderBootBlock}${knowledgeBootBlock}${pcBootBlock}
 
 export type ManagedAgentArgs = {
   readonly tenantId: string;
   readonly sessionId: string;
-  readonly input: string;${tenantArgField}
+  readonly input: string;${tenantArgField}${proofArgField}
   readonly extraOptions?: Partial<RunChatLoopOptions>;
 };
 
@@ -1025,10 +1079,103 @@ const federation: GatewayFederationConfig | undefined =
   return { block, field: "\n  federation," };
 }
 
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.4, §8) — the managed shape's
+ * proof surface: `runs.create` / `runs.continue` answer with the bundle the
+ * `provability:` gate graded the run's final turn against, as the optional
+ * `proof` field of `RunsCreateResult` / `RunsContinueResult`
+ * (`@crewhaus/gateway-protocol`).
+ *
+ * The gate is wired ONCE at module load for every tenant (`renderEvaluation`),
+ * so a process-wide observer could not tell one run's bundle from a
+ * concurrent run's. Each run instead hands `runOneTurn` its own
+ * `onProofBundle`, which agent.ts composes onto the shared gate for that
+ * run's `runChatLoop` only. The runtime calls it once per graded pass — the
+ * original answer and each gate-triggered retry, in order — so the last one
+ * seen is the standing verdict, the one the reply's footer renders. A
+ * duplicate resume (the idempotency path) returns the cached reply WITH the
+ * bundle it was graded with, never a bare reply.
+ *
+ * A `halt` verdict throws the classified `provability` failure (exit 37)
+ * before any result exists, so the gateway answers with an error and no
+ * `proof`; the bundle is on disk under the tenant's `.crewhaus/proofs/` and
+ * its summary is on the run's `provability_graded` trace event, which
+ * `runs.subscribe` streams like every other bus event.
+ *
+ * Without `provability:` every piece is the pre-0.8.0 text, byte for byte.
+ */
+function renderProofResult(
+  ir: IrManagedV0,
+  tenantField: string,
+): {
+  readonly importLine: string;
+  readonly storeDecl: string;
+  readonly servedType: string;
+  readonly servedVar: string;
+  readonly executeTurn: string;
+  readonly unwrap: string;
+  readonly resultField: string;
+} {
+  const extraOptions = `          extraOptions: {
+            runContext,
+            justificationAuditSink: log,
+            egressAuditSink: log,
+            ...(isResume ? { resume: { sessionId } } : {}),
+          },`;
+  if (ir.provability === undefined) {
+    return {
+      importLine: "",
+      storeDecl: "const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();",
+      servedType: "string",
+      servedVar: "reply",
+      executeTurn: `      const executeTurn = async (): Promise<string> =>
+        await runOneTurn({
+          tenantId: tenant.id,
+          sessionId,
+          input: p.input${tenantField},
+${extraOptions}
+        });
+      let reply: string;`,
+      unwrap: "",
+      resultField: "",
+    };
+  }
+  return {
+    importLine: 'import type { ProofBundle } from "@crewhaus/evaluation-service";\n',
+    storeDecl: `// 0.8.0 §5.4 — a served turn is its reply and, under provability:, the proof
+// bundle its gate graded; the resume cache keeps both.
+type ServedTurn = { readonly reply: string; readonly proof?: ProofBundle };
+const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<ServedTurn>();`,
+    servedType: "ServedTurn",
+    servedVar: "served",
+    executeTurn: `      // 0.8.0 §5.4 — this run's observer: the gate grades every pass of the
+      // turn and the last bundle it hands over is the standing verdict.
+      const executeTurn = async (): Promise<ServedTurn> => {
+        const graded: { proof?: ProofBundle } = {};
+        const turnReply = await runOneTurn({
+          tenantId: tenant.id,
+          sessionId,
+          input: p.input${tenantField},
+          onProofBundle: (bundle) => {
+            graded.proof = bundle;
+          },
+${extraOptions}
+        });
+        return graded.proof !== undefined ? { reply: turnReply, proof: graded.proof } : { reply: turnReply };
+      };
+      let served: ServedTurn;`,
+    unwrap: "\n      const reply = served.reply;",
+    resultField: ", ...(served.proof !== undefined ? { proof: served.proof } : {})",
+  };
+}
+
 function renderDaemon(ir: IrManagedV0): string {
   // v0.3.0 — thread the request's Tenant into runOneTurn so the memory
   // fabric's stores are tenant-fenced (§2.7).
   const tenantField = memoryFabric(ir).wired ? ", tenant" : "";
+  // 0.8.0 (design §5.4) — `proof` on the run result envelope (the pre-0.8.0
+  // bytes when the spec declares no `provability:`).
+  const proofResult = renderProofResult(ir, tenantField);
   // Loop contract 0.4 (Batch F, temporal contract / ITEM 7) — schedule: wake
   // loop pieces (empty when the spec omits `schedule:`).
   const scheduleWake = renderScheduleWake(ir);
@@ -1265,7 +1412,7 @@ import { createRunContext, type RunContext } from "@crewhaus/run-context";
 ${dreamImport}${distillImport}${feedbackImport}import { createJanitor } from "@crewhaus/runtime-core";
 import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
-
+${proofResult.importLine}
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 ${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
@@ -1427,7 +1574,7 @@ function registerRunBus(runId: string, tenantId: string, bus: RunContext["eventB
 // resume (client retry / a visibility-lease double-pull) returns the cached
 // reply instead of re-executing the turn. TTL bounds the dedupe window
 // (CREWHAUS_RESUME_IDEM_TTL_MS, default 5 min).
-const RESUME_IDEM_STORE = createInMemoryIdempotencyStore<string>();
+${proofResult.storeDecl}
 const RESUME_IDEM_TTL_MS = Number(process.env.CREWHAUS_RESUME_IDEM_TTL_MS ?? 300_000);
 ${federationSurface.block}
 const gateway = createGatewayServer({
@@ -1491,29 +1638,17 @@ const gateway = createGatewayServer({
       // and dedupe a duplicate resume via withIdempotency. runs.create (and a
       // continue with no sessionId) always runs a fresh turn.
       const isResume = method === "runs.continue" && p.sessionId !== undefined;
-      const executeTurn = async (): Promise<string> =>
-        await runOneTurn({
-          tenantId: tenant.id,
-          sessionId,
-          input: p.input${tenantField},
-          extraOptions: {
-            runContext,
-            justificationAuditSink: log,
-            egressAuditSink: log,
-            ...(isResume ? { resume: { sessionId } } : {}),
-          },
-        });
-      let reply: string;
+${proofResult.executeTurn}
       try {
         if (isResume) {
-          const guarded = withIdempotency<undefined, string>(() => executeTurn(), {
+          const guarded = withIdempotency<undefined, ${proofResult.servedType}>(() => executeTurn(), {
             store: RESUME_IDEM_STORE,
             ttlMs: RESUME_IDEM_TTL_MS,
           });
           const key = idempotencyKey(\`\${tenant.id}:\${sessionId}:\${p.input}\`, 0);
-          reply = (await guarded(undefined, key)).value;
+          ${proofResult.servedVar} = (await guarded(undefined, key)).value;
         } else {
-          reply = await executeTurn();
+          ${proofResult.servedVar} = await executeTurn();
         }
       } catch (err) {
         // v0.3.0 Goal 6 — a classified terminal failure (billing/auth/…)
@@ -1525,7 +1660,7 @@ const gateway = createGatewayServer({
           process.stderr.write(\`\${formatRunFailure(err.report, { prefix: "[managed]" })}\\n\`);
         }
         throw err;
-      }
+      }${proofResult.unwrap}
       __control.counters.turns++;
       const inputTokens = Math.ceil(p.input.length / 4);
       const outputTokens = Math.ceil(reply.length / 4);
@@ -1534,7 +1669,7 @@ const gateway = createGatewayServer({
         kind: "model_call",
         payload: { tenantId: tenant.id, sessionId, inputTokens, outputTokens },
       });
-      return { runId, sessionId, tenantId: tenant.id, reply };
+      return { runId, sessionId, tenantId: tenant.id, reply${proofResult.resultField} };
     }
     if (method === "runs.cancel") {
       return { ok: true };

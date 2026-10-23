@@ -4,6 +4,14 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../citation-tracker" }, { "path": "../errors" }],
+  "references": [
+    { "path": "../citation-tracker" },
+    { "path": "../claim-ledger" },
+    { "path": "../crawler" },
+    { "path": "../errors" },
+    { "path": "../ir" },
+    { "path": "../provability" },
+    { "path": "../tool-catalog" }
+  ],
   "include": ["src/**/*"]
 }

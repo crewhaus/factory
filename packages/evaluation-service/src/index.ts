@@ -8,6 +8,7 @@
  * `serve` interpreter calls it directly, so the gates are built in exactly
  * one place. runtime-core receives the closures and stays dependency-free.
  */
+export { type ChildSkillSource, provabilitySkillText } from "./child-skill";
 export { buildRunEvaluation, type EvaluationGateOptions } from "./evaluation";
 export {
   type GateEvidenceInput,
@@ -38,6 +39,7 @@ export {
   type WaiverJudgeOptions,
   createWaiverJudge,
 } from "./judge";
+export { type ProofBundle, type ProofBundleObserver, observeProofBundles } from "./observe";
 export { type ProvabilityGateOptions, buildRunProvability, displayPath } from "./provability";
 export {
   type EvaluationWiring,
@@ -61,6 +63,15 @@ export {
   gateSessionRoot,
   proofsDirName,
 } from "./roots";
+export {
+  type GateSkillsWiring,
+  PROVABILITY_SKILL_NAME,
+  type ProvabilitySkillConfig,
+  type ProvabilitySkillSource,
+  provabilitySkillSubstitutions,
+  provabilitySkills,
+  renderGateSkills,
+} from "./skills";
 export {
   DEFAULT_FORMAL_CHECKERS,
   type GateProofTools,

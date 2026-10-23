@@ -41,6 +41,14 @@ export const LEAN4_IMAGE_REPO = "ghcr.io/crewhaus/sandbox-lean4";
 /** The image tag this release pins (see the module doc for why it is a constant). */
 export const LEAN4_IMAGE_TAG = "0.8.0";
 export const LEAN4_IMAGE_REF = `${LEAN4_IMAGE_REPO}:${LEAN4_IMAGE_TAG}`;
+/**
+ * The Lean toolchain the image at {@link LEAN4_IMAGE_TAG} carries — the
+ * Dockerfile's `LEAN_VERSION` (a unit test holds the two in step), and what
+ * `lean --version` prints in it. The official `leanprover/lean4` release,
+ * pinned per architecture by sha256 and cut down to Init and Std (see the
+ * Dockerfile).
+ */
+export const LEAN4_TOOLCHAIN_VERSION = "4.34.1";
 export const LEAN4_DEFAULT_ENTRYPOINT: ReadonlyArray<string> = ["lean", "--stdin", "--json"];
 export const LEAN4_HEALTHCHECK_ARGV: ReadonlyArray<string> = ["lean", "--version"];
 

@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/default-skills": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/ir": "workspace:*",
@@ -20,6 +21,7 @@
     "@crewhaus/proof-checker": "workspace:*",
     "@crewhaus/provability": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-fetch": "workspace:*",

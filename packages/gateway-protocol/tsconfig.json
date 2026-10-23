@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../event-log" }],
+  "references": [{ "path": "../errors" }, { "path": "../event-log" }, { "path": "../provability" }],
   "include": ["src/**/*"]
 }

@@ -1421,6 +1421,27 @@ describe("crewhaus doctor", () => {
     expect(result.stdout).toContain("~ Bedrock (AWS) credentials");
   }, 20_000);
 
+  // 0.8.0 §11 — healthchecking a checker image on docker pulls it when it is
+  // not local, so the proof-checker probe is a --probe check; a plain doctor
+  // says it did not run. CREWHAUS_SANDBOX=noop keeps both runs container-free.
+  test("the proof-checker probe runs under --probe only; plain doctor says so", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: claude-opus-5\n  instructions: hi\nprovability:\n  level: proven\n  formal:\n    checkers: [builtin, smt]\n",
+    );
+    const env = { CREWHAUS_SANDBOX: "noop" };
+    const plain = await runCli(["doctor"], { cwd: tmp, env });
+    expect(plain.stdout).toContain(
+      "~ provability checker smt: not probed — `crewhaus doctor --probe` runs each checker image's healthcheck",
+    );
+    expect(plain.stdout).not.toContain("✓ provability checker builtin");
+    const probed = await runCli(["doctor", "--probe"], { cwd: tmp, env });
+    expect(probed.stdout).toContain("~ provability checker smt (");
+    expect(probed.stdout).toContain("claims at proven fall back to the builtin checker");
+    expect(probed.stdout).toContain("✓ provability checker builtin");
+    expect(probed.stdout).not.toContain("not probed");
+  }, 30_000);
+
   test("doctor --help documents --liveness and the model-aware checks", async () => {
     const result = await runCli(["doctor", "--help"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);

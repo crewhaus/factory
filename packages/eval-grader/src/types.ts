@@ -1,5 +1,6 @@
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
+import type { ProofBundle } from "@crewhaus/provability";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 
 export type GradeResult = {
@@ -88,6 +89,17 @@ export type RunArtifacts = {
   readonly stateRootDir: string;
   /** The spec name (scopes `.crewhaus/state/<specName>/`), when known. */
   readonly specName?: string;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §9.1) — the proof bundle of
+   * the sample's STANDING verdict: the provability gate's last pass over the
+   * final answer (a gate-triggered retry replaces the original's bundle, as
+   * the footer does). The eval runner captures it per sample and persists it
+   * as `<sampleDir>/proof.json`; `@crewhaus/grader-provability` grades it.
+   * Absent when the run was not gated (no `provability:` block and no
+   * `crewhaus eval --provability`) or the invoker captured none — the
+   * provability graders then report "no proof bundle" rather than guess.
+   */
+  readonly proof?: ProofBundle;
 };
 
 export type RunResult = {

@@ -238,3 +238,70 @@ describe("§10.3 closing invariant — every 0.6.0 spec leaf is classified exact
     }
   });
 });
+
+/**
+ * 0.8.0 §9.2 — the same closing invariant for the `provability:` block, the
+ * knob-by-knob exclusion made enforceable: every leaf under `provability.*`
+ * (the bare shorthand string excepted — it IS the floor, and no entry admits
+ * `["provability"]`) is admitted XOR excluded with a reason. The one
+ * sanctioned "neither" is a whitelisted dial on a shape whose gate does not
+ * run it — research's report gate never retries (`max_retries`), and crew
+ * carries the block unwired — where the dial is deliberately absent rather
+ * than human-owned.
+ */
+describe("§9.2 closing invariant — every provability leaf is classified exactly once", () => {
+  const shapes = Spec.options as ReadonlyArray<ZodTypeAny>;
+  const DIALS = new Set([
+    "provability.threshold",
+    "provability.max_retries",
+    "provability.grounded.coverage",
+    "provability.grounded.window_tokens",
+  ]);
+  const DIAL_GAPS: Readonly<Record<string, ReadonlySet<string>>> = {
+    research: new Set(["provability.max_retries"]),
+    crew: DIALS,
+  };
+
+  const carrying = shapes.filter((shape) => {
+    const all = new Set<string>();
+    leaves(shape, [], all);
+    return [...all].some((k) => k.startsWith("provability "));
+  });
+
+  test("the block is carried by exactly the five design §8 shapes", () => {
+    expect(carrying.map(targetOf).sort()).toEqual([
+      "channel",
+      "cli",
+      "crew",
+      "managed",
+      "research",
+    ]);
+  });
+
+  for (const shape of carrying) {
+    const target = targetOf(shape);
+    test(`${target}: no provability leaf is unclassified, none is claimed twice`, () => {
+      const all = new Set<string>();
+      leaves(shape, [], all);
+      const unclassified: string[] = [];
+      const twice: string[] = [];
+      let seen = 0;
+      for (const key of all) {
+        const path = key.split(" ");
+        if (path[0] !== "provability" || path.length < 2) continue;
+        seen += 1;
+        const joined = path.join(".");
+        const optimizable = reachable(target, path);
+        const excluded = humanOwnedReason(concrete(path)) !== undefined;
+        if (optimizable && excluded) twice.push(joined);
+        if (!optimizable && !excluded && !(DIAL_GAPS[target]?.has(joined) ?? false)) {
+          unclassified.push(joined);
+        }
+      }
+      // level, on_fail, …, judge.allow_self_judge — the walker reached them all.
+      expect(seen).toBeGreaterThan(20);
+      expect(unclassified, "UNCLASSIFIED — whitelist the dial or add an exclusion row").toEqual([]);
+      expect(twice, "CLAIMED TWICE").toEqual([]);
+    });
+  }
+});

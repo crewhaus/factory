@@ -12,10 +12,15 @@ import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
+import type { RunResult } from "@crewhaus/eval-grader";
+import { UNPRICED_COST_PREFIX } from "@crewhaus/grader-provability";
 import type { IrNode, IrV0 } from "@crewhaus/ir";
+import { buildEvidenceIndex, recordFromCall, verifyDocument } from "@crewhaus/provability";
 import { parseSpec } from "@crewhaus/spec";
+import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { defaultGraderRegistry } from "./default-registry";
 import { type AgentInvoker, runEval } from "./index";
+import { defaultProvabilityBlock } from "./provability";
 
 const SPEC = `name: default-registry-test
 target: cli
@@ -60,6 +65,13 @@ describe("defaultGraderRegistry (G14)", () => {
     for (const expected of [
       "continuity.reAskRate",
       "continuity.pickupSuccess",
+      // 0.8.0 §9.1 — the provability pack.
+      "provability.claimCoverage",
+      "provability.rungAchieved",
+      "provability.citationValidity",
+      "provability.assumptionRate",
+      "provability.replayIntegrity",
+      "provability.costPerProvenClaim",
       "twelve.contextRelevance",
       "twelve.p99LatencyMs",
       "nlg.rouge1",
@@ -82,6 +94,69 @@ describe("defaultGraderRegistry (G14)", () => {
     ]) {
       expect(names).toContain(expected);
     }
+  });
+
+  test("0.8.0 — a provability grader on a run with no proof bundle fails, never passes", async () => {
+    const registry = await defaultGraderRegistry({ pluginRoot: join(newTempRoot(), "nope") });
+    const result = await registry.lookup("provability.claimCoverage")(
+      { id: "s", input: "x" },
+      RUN_RESULT,
+    );
+    expect(result.passed).toBe(false);
+    expect(result.rationale).toContain("no proof bundle (is provability: declared?)");
+  });
+
+  test("0.8.0 — the pricing seam reaches provability.costPerProvenClaim (unpriced without it)", async () => {
+    const url = "https://acme.example/policy";
+    const bundle = await verifyDocument(`The refund window is 14 days [1].\n\n[1]: ${url}`, {
+      config: defaultProvabilityBlock("grounded"),
+      evidence: buildEvidenceIndex([
+        recordFromCall({
+          toolUseId: "toolu_f",
+          toolName: "WebFetch",
+          input: { url },
+          content: `URL: ${url}\nStatus: 200\n\nThe refund window is 14 days.`,
+          isError: false,
+        }),
+      ]),
+    });
+    expect(bundle.met).toBe(1);
+    const envelope = {
+      runId: "r",
+      sessionId: "s",
+      turnNumber: 1,
+      traceId: "t",
+      spanId: "p",
+      timestamp: "x",
+    };
+    const events = [
+      { ...envelope, kind: "provability_graded", verdict: "fail", retryIndex: 0 },
+      {
+        ...envelope,
+        kind: "model_response",
+        model: "claude-sonnet-4-6",
+        stopReason: "end_turn",
+        usage: { input: 1000, output: 100 },
+        durationMs: 1,
+      },
+      { ...envelope, kind: "provability_graded", verdict: "pass", retryIndex: 1 },
+    ] as unknown as TraceEvent[];
+    const run = {
+      ...RUN_RESULT,
+      events,
+      artifacts: { ...RUN_RESULT.artifacts, proof: bundle },
+    } as RunResult;
+    const sample: Sample = { id: "s", input: "x" };
+    const priced = await defaultGraderRegistry({
+      pluginRoot: join(newTempRoot(), "nope"),
+      pricing: (_model, t) => t.input + t.output,
+    });
+    const pricedResult = await priced.lookup("provability.costPerProvenClaim")(sample, run);
+    expect(pricedResult.score).toBeCloseTo(1100 / 1_000_000, 12);
+    expect(pricedResult.rationale.startsWith(UNPRICED_COST_PREFIX)).toBe(false);
+    const bare = await defaultGraderRegistry({ pluginRoot: join(newTempRoot(), "nope") });
+    const bareResult = await bare.lookup("provability.costPerProvenClaim")(sample, run);
+    expect(bareResult.rationale.startsWith(UNPRICED_COST_PREFIX)).toBe(true);
   });
 
   test("nlg.rougeL grades for real at pack defaults", async () => {
@@ -258,6 +333,7 @@ describe("resolveWithOpts — pack opts parameterization (NEW-HUNT-7)", () => {
     for (const name of [
       "twelve.contextRelevance",
       "continuity.reAskRate",
+      "provability.claimCoverage",
       "multimodal.audioTranscriptMatch",
     ]) {
       expect(() => registry.resolveWithOpts(name, { threshold: 0.5 })).toThrow(

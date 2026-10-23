@@ -161,6 +161,20 @@ evaluation:
   max_retries: 2
 `.trim();
 
+// 0.8.0 §9.2 — the provability block carrying every whitelisted dial (cli /
+// channel / managed; research carries the same block — the schema accepts
+// max_retries there, it is simply not whitelisted). `cited` keeps the fixture
+// free of the grounded-without-a-reader lint.
+const PROVABILITY = `
+provability:
+  level: cited
+  max_retries: 2
+  threshold: 0.9
+  grounded:
+    coverage: 0.7
+    window_tokens: 80
+`.trim();
+
 // 0.6.0 — a `kind: judge` gate carrying its three dials (positional shapes).
 const JUDGE_GATE = `
     kind: judge
@@ -205,6 +219,7 @@ function cliFixture(dial: readonly string[]): string {
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    PROVABILITY,
     KNOWLEDGE,
   ].join("\n");
 }
@@ -230,6 +245,7 @@ function channelFixture(dial: readonly string[]): string {
     CHAIN_BLOCKS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    PROVABILITY,
     KNOWLEDGE,
   ].join("\n");
 }
@@ -251,6 +267,7 @@ function managedFixture(dial: readonly string[]): string {
     LIMITS,
     MEMORY_CONTINUITY,
     EVALUATION,
+    PROVABILITY,
     KNOWLEDGE,
   ].join("\n");
 }
@@ -354,6 +371,7 @@ const FIXTURES: Readonly<Record<Spec["target"], ReadonlyArray<string>>> = {
       LIMITS,
       CHAIN_BLOCKS,
       MEMORY_CONTINUITY,
+      PROVABILITY,
     ].join("\n"),
   ],
   batch: [

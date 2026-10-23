@@ -35,8 +35,27 @@
  *
  * The JSON report carries the same data programmatically so studio /
  * downstream consumers don't have to re-parse markdown.
+ *
+ * 0.8.0 — a spec that declares `provability:` writes the report through
+ * `writeProvableReport` (the `@crewhaus/report-writer/provability` subpath,
+ * so an ungated bundle never loads the verifier) instead: the same report, gated —
+ * a block of `[N]: <source>` definitions the citation grammar reads under the
+ * title, verified against the tracker's sha256-pinned fetch cache, the same
+ * visible `## Citations` list, then a `## Provability` section and the bundle
+ * in the JSON. `writeReport` is untouched, so an ungated report is
+ * byte-identical.
  */
 import type { Citation } from "@crewhaus/citation-tracker";
+import type { ProofBundle } from "@crewhaus/provability";
+import {
+  NO_CITATIONS_NOTICE,
+  type NumberedCitation,
+  citationListLines,
+  citationNumbersForBranch,
+  numberCitations,
+} from "./citations";
+
+export { NO_CITATIONS_NOTICE, type NumberedCitation, citationNumber } from "./citations";
 
 export type BranchAnswer = {
   readonly question: string;
@@ -60,14 +79,13 @@ export type ReportJson = {
   }>;
   readonly citations: ReadonlyArray<NumberedCitation>;
   readonly generatedAt: string;
-};
-
-export type NumberedCitation = {
-  readonly number: number;
-  readonly url: string;
-  readonly snippet: string;
-  readonly sha256: string;
-  readonly retrievedAt: string;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §5.4, §8) — the proof bundle
+   * the report gate graded this report against. Present only on a report
+   * written by `writeProvableReport` (the spec declares `provability:`);
+   * `writeReport` never sets it, so an ungated report's JSON is unchanged.
+   */
+  readonly proof?: ProofBundle;
 };
 
 export type WriteReportArgs = {
@@ -77,57 +95,6 @@ export type WriteReportArgs = {
   readonly citations: ReadonlyArray<Citation>;
   readonly now?: () => Date;
 };
-
-/**
- * Number citations by URL on first appearance. Same URL appearing in
- * multiple branches reuses the first-assigned number; the snippet text
- * for the numbered entry comes from the FIRST citation against that URL.
- */
-function numberCitations(citations: ReadonlyArray<Citation>): {
-  numbered: NumberedCitation[];
-  numberByUrl: Map<string, number>;
-} {
-  const numberByUrl = new Map<string, number>();
-  const numbered: NumberedCitation[] = [];
-  for (const c of citations) {
-    if (numberByUrl.has(c.url)) continue;
-    const n = numberByUrl.size + 1;
-    numberByUrl.set(c.url, n);
-    numbered.push({
-      number: n,
-      url: c.url,
-      snippet: c.snippet,
-      sha256: c.sha256,
-      retrievedAt: c.retrievedAt,
-    });
-  }
-  return { numbered, numberByUrl };
-}
-
-function citationNumbersForBranch(
-  branch: BranchAnswer,
-  numberByUrl: Map<string, number>,
-): number[] {
-  const seen = new Set<number>();
-  const out: number[] = [];
-  for (const url of branch.citationUrls) {
-    const n = numberByUrl.get(url);
-    if (n === undefined) continue;
-    if (seen.has(n)) continue;
-    seen.add(n);
-    out.push(n);
-  }
-  out.sort((a, b) => a - b);
-  return out;
-}
-
-/**
- * Rendered in place of the `[N] url` list when the run recorded no citations.
- * Exported so a caller (or a test) can assert on the exact wording rather than
- * pattern-matching prose.
- */
-export const NO_CITATIONS_NOTICE =
-  "_No citations were recorded for this run — nothing above is anchored to a fetched source. Treat the findings as unverified._";
 
 function renderMarkdown(args: {
   goal: string;
@@ -152,11 +119,7 @@ function renderMarkdown(args: {
   if (args.numbered.length === 0) {
     lines.push(NO_CITATIONS_NOTICE);
   } else {
-    for (const c of args.numbered) {
-      lines.push(`[${c.number}] ${c.url}`);
-      const trimmed = c.snippet.trim().replace(/\n+/g, " ");
-      lines.push(`    ${trimmed}`);
-    }
+    lines.push(...citationListLines(args.numbered));
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }

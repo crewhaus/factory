@@ -106,6 +106,29 @@ Every root (proofs, session logs) is resolved per turn for the active tenant
 tenant, fenced; the footer shows a bundle path from the tenant's own root,
 never the server's layout. Nothing is opened at wiring time.
 
+`provability.skill` is the rendered `provability` default skill
+(`provabilitySkillText`, with the same substitutions the parent's skill
+gets), absent when the build ships none. The gate never reads
+it: runtime-core projects it, with the floor, onto the bridge as the
+read-only provability seam, and the sub-agent spawner puts it in a Task
+child's instructions so a researcher child cites the way the parent's gate
+reads (design §8). Only the parent's final text is gated.
+
+## One wiring, many runs: `observeProofBundles`
+
+`deps.onBundle` sees every bundle the wiring grades. A surface that wires
+once and serves concurrent runs (the managed gateway) needs the bundle of
+ONE run, so it composes a per-run observer onto the shared gate for that
+run's `runChatLoop`:
+
+```ts
+runChatLoop({ …, provability: observeProofBundles(gates.provability, (bundle) => { proof = bundle; }) });
+```
+
+Identity without an observer; the gate's own `onBundle` runs first; the
+runtime calls `onBundle` once per graded pass, so the last call a run sees
+is the standing verdict.
+
 ## `renderEvaluationWiring(ir, opts)`
 
 The codegen twin: `{ imports, bootBlock, field, toolsRegistration, toolsExpr }`,
@@ -115,11 +138,38 @@ fields are `evaluation: __gates.evaluation,` / `provability: __gates.provability
 for the keys the IR has; `registerGateTools(<catalog>, __gates);` puts the
 proof tools on the bundle's catalog, replacing a same-named builtin (or, in
 `toolsInto: "list"` mode, `toolsExpr` wraps the run's tool list with
-`mergeGateTools(…, __gates)`).
+`mergeGateTools(…, __gates)`). `bundleObserverExpr` (the managed emitter's
+`args.onProofBundle`) renders the field as
+`provability: observeProofBundles(__gates.provability, <expr>),` instead.
 
 `ProvabilityPreflight` and `ProofCheckers` are read-only and carry a builtin
 `alwaysAllow` (permission-engine's bookkeeping rules), so the gate's own
 nudge never parks a headless turn; `ProofCheck` keeps the mode default.
+
+## The `provability` skill: `provabilitySkills(block)` / `renderGateSkills(ir)`
+
+A gated harness advertises `@crewhaus/default-skills`' `provability` skill —
+what the gate checks at each rung and how to cite so an answer passes —
+rendered from the block by `provabilitySkillSubstitutions`: the floor and
+checker order, and every setting that changes what this gate accepts — what
+a failing answer becomes (`on_fail`, `max_retries`), how far back evidence
+counts (`scope`), whether and how many assumptions pass (`assumptions`,
+`max_assumptions`), how many independent sources a `grounded` claim needs —
+plus the proof-tool section, kept exactly where `wantsProofCheckTools` wires
+`ProofCheckers` + `ProofCheck`. Settings that only make the gate more
+lenient than the text (`threshold` below 1, `bibliographic`, `replay: false`)
+are left out. `provabilitySkills(ir.provability)` returns it as a
+`LoadedSkill` (or `[]` without the block), and every surface passes it as a
+builtin to whatever builds its skill list: `discoverSkills({ builtinSkills })`
+where it discovers its own, `wireMemory(…, { builtinSkills })` where
+continuity owns the surface. Lowest precedence, so a user or project skill
+named `provability` replaces it, and classified like every builtin. It is a
+pure function of the block rather than part of `wireEvaluation`'s result
+because every surface discovers its skills before it wires the gates.
+`renderGateSkills(ir)` is its codegen twin — `{ imports, expr }`, both empty
+without the block, so a provability-less bundle gains no bytes and its
+prompt none either. Task children get the same rendering as text
+(`provabilitySkillText`).
 
 ## Known limits
 

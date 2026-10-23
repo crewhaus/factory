@@ -16,6 +16,7 @@ import {
   LEAN4_IMAGE_REF,
   LEAN4_IMAGE_REPO,
   LEAN4_IMAGE_TAG,
+  LEAN4_TOOLCHAIN_VERSION,
   ensureLean4SandboxImage,
   registerLean4SandboxImage,
 } from "./index";
@@ -37,6 +38,8 @@ describe("registerLean4SandboxImage (T1 + T2)", () => {
     expect(LEAN4_IMAGE_REF).toBe("ghcr.io/crewhaus/sandbox-lean4:0.8.0");
     expect(LEAN4_DEFAULT_ENTRYPOINT).toEqual(["lean", "--stdin", "--json"]);
     expect(LEAN4_HEALTHCHECK_ARGV).toEqual(["lean", "--version"]);
+    // The toolchain the image carries; the Dockerfile test holds its ARG to this.
+    expect(LEAN4_TOOLCHAIN_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   test("registerLean4SandboxImage() registers an image with the right shape", () => {
@@ -116,6 +119,7 @@ describe("Lean4-shape T2 contract — round-trip via noop sandbox", () => {
         timeoutMs: 120_000,
       });
       expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain(`version ${LEAN4_TOOLCHAIN_VERSION},`);
       await sandbox.close();
     },
     180_000,

@@ -1,5 +1,9 @@
 import { CrewhausError } from "@crewhaus/errors";
-import { type EvaluationWiring, renderEvaluationWiring } from "@crewhaus/evaluation-service";
+import {
+  type EvaluationWiring,
+  renderEvaluationWiring,
+  renderGateSkills,
+} from "@crewhaus/evaluation-service";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
@@ -579,6 +583,11 @@ function renderAgent(ir: IrV0): string {
   // (`evaluation:`, `provability:`) through the gate composition root. Empty
   // pieces when the spec declares neither.
   const evaluation = renderEvaluation(ir);
+  // 0.8.0 §11 — the `provability` skill, the gate's one builtin skill: passed
+  // as `builtinSkills` to whichever discovery builds this bundle's skill list
+  // (the extension boot's `discoverSkills` below, or `wireMemory` when
+  // continuity owns the surface — renderMemory). Empty without `provability:`.
+  const gateSkills = renderGateSkills(ir);
   // Item 3 (G32) — plugin activation. Empty pieces when the spec omits
   // `plugins:`, keeping bundles byte-identical.
   const plugins = renderPlugins(ir);
@@ -640,13 +649,14 @@ function renderAgent(ir: IrV0): string {
   // take plugin dirs (memory-service follow-up), so plugin tools still bind but
   // plugin skills are not auto-discovered there.
   const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
+  const gateSkillsArg = gateSkills.expr !== "" ? `, builtinSkills: ${gateSkills.expr}` : "";
   const extensionBoot = continuityOn
     ? `const __cwd = process.cwd();
 const __hooks = await loadHooks({ cwd: __cwd });`
     : `const __cwd = process.cwd();
 const [__hooks, __skills, __slashCommands] = await Promise.all([
   loadHooks({ cwd: __cwd }),
-  discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
+  discoverSkills({ cwd: __cwd${pluginSkillDirsArg}${gateSkillsArg} }),
   loadCommands({ cwd: __cwd }),
 ]);
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -817,8 +827,9 @@ ${catchBlock}${finallyBlock}`;
   const egressImportBlock = egress.imports.length > 0 ? `${egress.imports.join("\n")}\n` : "";
   const justificationImportBlock =
     justification.imports.length > 0 ? `${justification.imports.join("\n")}\n` : "";
+  const evaluationImports = [...evaluation.imports, ...gateSkills.imports];
   const evaluationImportBlock =
-    evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+    evaluationImports.length > 0 ? `${evaluationImports.join("\n")}\n` : "";
   // The gates boot after the builtin registrations; under `provability:` the
   // proof tools register right behind the boot line, before memory, MCP,
   // knowledge and plugins (whose registration skips a taken name).
@@ -1145,7 +1156,12 @@ if (__dreamNote !== null) process.stdout.write(\`\${__dreamNote}\\n\`);`
     const field = "\n  ...__memWired.options,";
     return { imports, bootBlock, field };
   }
-  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${embedderDep}${thredzDep}${examDep("__cwd")} });
+  // 0.8.0 §11 — with continuity owning the skill surface, the provability
+  // gate's skill joins wireMemory's builtins (renderAgent's note); nothing
+  // without `provability:`.
+  const gateSkills = renderGateSkills(ir);
+  const gateSkillsDep = gateSkills.expr !== "" ? `, builtinSkills: ${gateSkills.expr}` : "";
+  const bootBlock = `const __memWired = await wireMemory(${fragment}, { catalog: defaultCatalog, cwd: __cwd${embedderDep}${thredzDep}${examDep("__cwd")}${gateSkillsDep} });
 const __skills = __memWired.options.skills ?? [];
 const __slashCommands = __memWired.options.slashCommands ?? new Map();
 if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));${dreamBoot("__cwd")}`;

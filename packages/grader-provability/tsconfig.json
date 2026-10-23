@@ -6,9 +6,6 @@
   },
   "references": [
     {
-      "path": "../errors"
-    },
-    {
       "path": "../eval-dataset"
     },
     {
@@ -19,6 +16,9 @@
     },
     {
       "path": "../provability"
+    },
+    {
+      "path": "../trace-event-bus"
     }
   ],
   "include": ["src/**/*"]

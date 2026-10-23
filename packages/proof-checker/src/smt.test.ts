@@ -5,9 +5,11 @@ import {
   SMT_LIMITS,
   SMT_PREAMBLE_COMMANDS,
   SMT_RESERVED_NAMES,
+  SMT_RESERVED_SORTS,
   buildSmtScript,
   createSmtChecker,
   formatModel,
+  isReservedSmtName,
   parseSExprs,
   parseSmtOutput,
   printSExpr,
@@ -244,7 +246,8 @@ describe("buildSmtScript — the exact script shape", () => {
     expect(() =>
       buildSmtScript(
         "(forall ((n Int)) (let ((m (+ n 1))) (> m n)))",
-        "(declare-datatypes ((L 1)) ((par (T) ((nil) (cons (hd T) (tl (L T)))))))",
+        // `Nil`, not `nil`: Z3's own (List T) owns `nil` (reserved below).
+        "(declare-datatypes ((L 1)) ((par (T) ((Nil) (cons (hd T) (tl (L T)))))))",
         1_000,
       ),
     ).not.toThrow();
@@ -612,7 +615,128 @@ describe("the language paragraph", () => {
     expect(SMT_LANGUAGE).toMatch(/no check-sat, push\/pop, set-option, get-\* or exit/);
     expect(SMT_LANGUAGE).toMatch(/inconsistent hypotheses/);
     expect(SMT_LANGUAGE).toMatch(/not a built-in/);
+    // The SMT-LIB textbook list datatype's names are Z3 built-ins; say so up front.
+    expect(SMT_LANGUAGE).toMatch(/nil, head, tail, .*List/);
     expect(SMT_LANGUAGE).toMatch(/Every assert and every define-fun is listed as an assumption/);
     expect(SMT_LANGUAGE).toMatch(/Example:/);
+  });
+});
+
+/**
+ * What the curated image's solver (Z3 4.16.0) prints for the scripts the
+ * adapter writes, captured verbatim — the same shapes as the 4.x fixtures
+ * above, held here so a solver bump that changed them fails without Docker.
+ * The live run is sandbox.live.test.ts.
+ */
+describe("parseSmtOutput — on what Z3 4.16.0 actually prints", () => {
+  const z3_416 = {
+    proved: 'sat\nunsat\n(error "line 11 column 10: model is not available")\n',
+    counterexample:
+      "sat\nsat\n(\n  (define-fun x () Int\n    4)\n  (define-fun y () Int\n    6)\n)\n",
+    inconsistent: 'unsat\nunsat\n(error "line 10 column 10: model is not available")\n',
+    emptyModel: "sat\nsat\n(\n)\n",
+    preambleError:
+      '(error "line 5 column 11: unknown constant z")\nsat\nsat\n(\n  (define-fun x () Int\n    0)\n)\n',
+    goalError:
+      'sat\n(error "line 6 column 14: Sort mismatch at argument #1 for function (declare-fun not (Bool) Bool) supplied sort is Int")\nsat\n(\n  (define-fun x () Int\n    0)\n)\n',
+    realModel: "sat\nsat\n(\n  (define-fun x () Real\n    1.0)\n)\n",
+  };
+
+  test("each outcome parses to the verdict the checker needs", () => {
+    expect(parseSmtOutput(z3_416.proved)).toEqual({ answers: ["sat", "unsat"], errors: [] });
+    expect(parseSmtOutput(z3_416.counterexample)).toEqual({
+      answers: ["sat", "sat"],
+      errors: [],
+      model: "x = 4, y = 6",
+    });
+    expect(parseSmtOutput(z3_416.inconsistent)).toEqual({
+      answers: ["unsat", "unsat"],
+      errors: [],
+    });
+    expect(parseSmtOutput(z3_416.emptyModel)).toEqual({ answers: ["sat", "sat"], errors: [] });
+    expect(parseSmtOutput(z3_416.preambleError).errors).toEqual([
+      "line 5 column 11: unknown constant z",
+    ]);
+    expect(parseSmtOutput(z3_416.goalError).errors).toEqual([
+      "line 6 column 14: Sort mismatch at argument #1 for function (declare-fun not (Bool) Bool) supplied sort is Int",
+    ]);
+    expect(parseSmtOutput(z3_416.realModel).model).toBe("x = 1.0");
+  });
+});
+
+// Found by probing Z3 4.16.0 (the image's) and 4.11.2 with each identifier
+// applied to several argument shapes: each of these resolves without a
+// declaration, and Z3 accepts a redefinition — `(define-fun equals …) true`
+// makes `(equals 1 2)` "proven", `(define-fun ubv_to_int …) 7` makes
+// `(= (ubv_to_int #b11) 7)` so. sandbox.live.test.ts shows both on the image.
+describe("the built-ins a newer (or older) Z3 adds are reserved too", () => {
+  test("equals, equiv, if_then_else, the SMT-LIB 2.7 conversions, head and tail", () => {
+    for (const name of [
+      "equals",
+      "equiv",
+      "if_then_else",
+      "ubv_to_int",
+      "sbv_to_int",
+      "int_to_bv",
+      "head",
+      "tail",
+    ]) {
+      expect(SMT_RESERVED_NAMES.has(name)).toBe(true);
+      for (const pre of [
+        `(define-fun ${name} ((a Int) (b Int)) Bool true)`,
+        `(declare-const ${name} Int)`,
+        `(declare-fun |${name}| (Int) Int)`,
+        `(declare-datatypes ((T 0)) (((mk (${name} Int)))))`,
+      ]) {
+        expect(() => buildSmtScript("true", pre, 1_000)).toThrow(
+          new RegExp(`may not declare \`${name}\``),
+        );
+      }
+      expect(() => buildSmtScript(`(let ((${name} 1)) (> ${name} 0))`, "", 1_000)).toThrow(
+        new RegExp(`^statement: the preamble may not declare \`${name}\``),
+      );
+    }
+  });
+
+  test("a goal that uses the real built-in is still accepted", () => {
+    const { script } = buildSmtScript(
+      "(= (ubv_to_int v) 3)",
+      "(declare-const v (_ BitVec 2)) (assert (= v #b11))",
+      1_000,
+    );
+    expect(script).toContain("(assert (not (= (ubv_to_int v) 3)))");
+  });
+
+  // Z3's built-in parametric List: `(insert 1 l)` and `(as nil (List Int))`
+  // resolve undeclared once a `(List T)` is in scope, and Z3 accepts
+  // `(define-fun insert ((a Int) (b Int)) Int b)` beside the built-in, which
+  // then "proves" `(= (insert 1 2) 2)` — the `equals` hole again (review of
+  // W3-B: the probe's Int/Bool/BitVec shapes never reached them).
+  test("Z3's built-in List: nil, insert, head, tail and the List sort", () => {
+    for (const name of ["nil", "insert", "head", "tail"]) {
+      expect(isReservedSmtName(name)).toBe(true);
+      for (const pre of [
+        `(define-fun ${name} ((a Int) (b Int)) Int b)`,
+        `(define-fun ${name} () Int 5)`,
+        `(declare-fun |${name}| (Int Int) Int)`,
+        `(declare-datatypes ((IntList 0)) (((${name}) (cons (hd Int) (tl IntList)))))`,
+        `(declare-datatypes ((IntList 0)) (((Nil) (cons (${name} Int) (tl IntList)))))`,
+      ]) {
+        expect(() => buildSmtScript("true", pre, 1_000)).toThrow(
+          new RegExp(`may not declare \`${name}\``),
+        );
+      }
+    }
+    expect(SMT_RESERVED_SORTS.has("List")).toBe(true);
+    expect(() =>
+      buildSmtScript("true", "(declare-datatypes ((List 0)) (((Nil) (cons (hd Int)))))", 1_000),
+    ).toThrow(/may not declare `List`/);
+    // Using the built-in list is fine; only re-declaring its names is not.
+    const { script } = buildSmtScript(
+      "(= (head (insert 1 l)) 1)",
+      "(declare-const l (List Int))",
+      1_000,
+    );
+    expect(script).toContain("(assert (not (= (head (insert 1 l)) 1)))");
   });
 });

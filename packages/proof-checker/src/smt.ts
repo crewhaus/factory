@@ -68,7 +68,7 @@ export const SMT_LANGUAGE = [
   "smt: SMT-LIB 2 checked by the Z3 solver in a sandbox; linear and non-linear integer/real arithmetic, bit-vectors, arrays, datatypes (finite domains), quantifiers (Z3 may answer unknown on them).",
   "`statement` is the goal as ONE SMT-LIB Boolean term, e.g. `(<= (+ x y) 10)`.",
   "`proof` is the problem preamble, using only set-logic, declare-const, declare-fun, define-fun, declare-sort, define-sort, declare-datatype(s) (SMT-LIB 2.6 form) and assert; no check-sat, push/pop, set-option, get-* or exit (the checker adds its own).",
-  "Every name you declare, define or bind is letters, digits and _ starting with a letter, declared once, and not a built-in (true, false, not, and, or, ite, distinct, div, mod, abs, select, store, bv…, Int, Bool, …).",
+  "Every name you declare, define or bind is letters, digits and _ starting with a letter, declared once, and not a built-in (true, false, not, and, or, ite, distinct, div, mod, abs, select, store, nil, head, tail, bv…, Int, Bool, List, …).",
   "The checker first requires the asserts to be satisfiable (inconsistent hypotheses prove anything, so they are rejected), then asserts the negated goal: unsat proves it; sat rejects it with Z3's model as the counterexample; unknown or a timeout rejects it.",
   "Every assert and every define-fun is listed as an assumption of the proof.",
   "Example: statement `(<= (+ x y) 10)`, proof `(declare-const x Int) (declare-const y Int) (assert (<= x 4)) (assert (<= y 6))`.",
@@ -93,12 +93,22 @@ export const SMT_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 
 /**
  * Alphanumeric symbols a declaration may not take: the SMT-LIB 2.6 reserved
- * words and theory symbols, plus every such symbol Z3 4.11.2 resolves without
- * a declaration (found by probing each identifier string in the z3 binary
- * with `(simplify <name>)`). Z3 accepts a redefinition of any of them, and a
- * redefined `<=`, `=`, `ite` or `false` turns a false goal into a "proof".
- * Names starting with `bv` are refused as a family ({@link isReservedSmtName}):
- * Z3 keeps adding bit-vector operators.
+ * words and theory symbols, plus every such symbol Z3 resolves without a
+ * declaration — in 4.16.0 (the curated image's solver) and in 4.11.2 (an
+ * older solver a programmatic `images.smt` override may carry; the spec's
+ * `formal.image` overrides lean4 alone). Found by applying each identifier
+ * string in the z3 binary to several argument shapes and keeping every name
+ * Z3 does not call unknown; `(simplify <name>)` alone misses functions such
+ * as `equals`, and Int/Bool/BitVec arguments alone miss the four names of
+ * Z3's built-in parametric `List` sort (`insert`, `nil`, `head`, `tail`),
+ * which only come into scope once a `(List T)` is mentioned — so the probe
+ * also declares a `(List Int)` and applies each name to it. The live image
+ * test (`sandbox.live.test.ts`) re-runs that probe against the image, so a Z3
+ * bump that adds a built-in fails it. Z3 accepts a redefinition of any of
+ * them at a new signature, and a redefined `<=`, `=`, `ite`, `equals`,
+ * `insert` or `false` turns a false goal into a "proof". Names starting with
+ * `bv` are refused as a family ({@link isReservedSmtName}): Z3 keeps adding
+ * bit-vector operators.
  */
 export const SMT_RESERVED_NAMES: ReadonlySet<string> = new Set([
   // SMT-LIB 2.6 reserved words (the hyphenated commands cannot match the name pattern)
@@ -120,7 +130,7 @@ export const SMT_RESERVED_NAMES: ReadonlySet<string> = new Set([
   "pop",
   "push",
   "reset",
-  // Core
+  // Core (`equals`, `equiv` and `if_then_else` are Z3's own spellings of `=`, `iff` and `ite`)
   "true",
   "false",
   "not",
@@ -131,6 +141,9 @@ export const SMT_RESERVED_NAMES: ReadonlySet<string> = new Set([
   "iff",
   "if",
   "ite",
+  "if_then_else",
+  "equals",
+  "equiv",
   "distinct",
   // Arithmetic (Ints, Reals, Z3's transcendentals)
   "abs",
@@ -187,6 +200,10 @@ export const SMT_RESERVED_NAMES: ReadonlySet<string> = new Set([
   "nat2bv",
   "ubv_to_str",
   "sbv_to_str",
+  // SMT-LIB 2.7's conversions, built in from Z3 4.16
+  "ubv_to_int",
+  "sbv_to_int",
+  "int_to_bv",
   // Floating point
   "fp",
   "NaN",
@@ -207,6 +224,14 @@ export const SMT_RESERVED_NAMES: ReadonlySet<string> = new Set([
   "Char",
   "char",
   "is",
+  // Z3's built-in parametric `(List T)` — constructors `nil` / `insert`,
+  // selectors `head` / `tail` — in 4.11 and 4.16 alike, once a `(List T)` is
+  // in scope (with no set-logic to narrow it). A list datatype of the
+  // preamble's own names its parts otherwise (`Nil`, `cons`, `hd`, `tl`).
+  "nil",
+  "insert",
+  "head",
+  "tail",
   "pbeq",
   "pbge",
   "pble",
@@ -234,6 +259,7 @@ export const SMT_RESERVED_SORTS: ReadonlySet<string> = new Set([
   "RoundingMode",
   "Char",
   "Unicode",
+  "List",
 ]);
 
 /** Whether a (bar-stripped) function or constant name is a built-in. */

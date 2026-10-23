@@ -71,8 +71,9 @@ export type EnumeratedModelSlot = {
    * JUDGE IDENTITY is not swappable either, for a different reason: a
    * downshift search's objective is the AGENT's pass rate on a dataset, and
    * nothing in it measures the judge. `evaluation.grader.model`,
-   * `security.justification.model` (the Pillar-3 intent gate's judge) and
-   * `watchme.judge.model` would therefore always read as a free win when made
+   * `security.justification.model` (the Pillar-3 intent gate's judge),
+   * `watchme.judge.model` and `provability.judge.model` (the gate's
+   * paraphrase-waiver judge) would therefore always read as a free win when made
    * cheaper — the search would recommend weakening the instrument it is being
    * measured with. `["evaluation","grader","model"]` is in the repo's own
    * `HUMAN_OWNED_PATHS` as "judge identity" and §10.3 excludes the judge panel
@@ -306,6 +307,10 @@ export function enumerateModelSlots(ir: IrNode): EnumeratedModelSlot[] {
     readonly budget?: { readonly onExceed: { readonly model?: string } };
     readonly security?: { readonly justification?: { readonly model?: string } };
     readonly watchme?: { readonly judgeModel?: string };
+    /** 0.8.0 — `IrProvability.judge`: the opt-in paraphrase-waiver judge. */
+    readonly provability?: {
+      readonly judge?: { readonly model: string; readonly modelProfile?: string };
+    };
     readonly groundingModel?: string;
   };
 
@@ -373,6 +378,24 @@ export function enumerateModelSlots(ir: IrNode): EnumeratedModelSlot[] {
       label: "watchme.judge.model",
       model: aux.watchme.judgeModel,
       kind: "judge",
+      swappable: false,
+    });
+  }
+  // 0.8.0 (design §6.2) — the provability gate's paraphrase-waiver judge. It
+  // can waive a grounded miss, never raise a rung, so it is an instrument the
+  // gate is measured by: enumerated (pricing, capabilities, params), never
+  // swapped — the judge-identity rule above, for the same reason.
+  const provabilityJudge = aux.provability?.judge;
+  if (provabilityJudge !== undefined) {
+    push({
+      label: "provability.judge.model",
+      model: provabilityJudge.model,
+      kind: "judge",
+      path: ["provability", "judge", "model"],
+      ...(provabilityJudge.modelProfile !== undefined
+        ? { profile: provabilityJudge.modelProfile }
+        : {}),
+      ...profileFields(profileOf(provabilityJudge.modelProfile)),
       swappable: false,
     });
   }

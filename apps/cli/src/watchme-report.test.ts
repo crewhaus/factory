@@ -43,8 +43,10 @@ import {
   judgmentsToFeedback,
   nodeReportFs,
   rollupContinuity,
+  rollupProvability,
   runWatchmeAllReport,
   runWatchmeReport,
+  sessionProvability,
 } from "./watchme-report";
 import type { WatchmeJudgePhase, WatchmeReportDeps, WatchmeReportOptions } from "./watchme-report";
 
@@ -625,9 +627,290 @@ describe("rollupContinuity", () => {
   });
 });
 
+// -- 0.8.0 §9.3 — the provability gate's verdicts ---------------------------
+
+/** One `provability_graded` event-log line as runtime-core's gate writes it. */
+function gradedLine(
+  turnNumber: number,
+  verdict: "pass" | "fail" | "unverified",
+  extra: Record<string, unknown> = {},
+): unknown {
+  return ev("provability_graded", {
+    level: "grounded",
+    verdict,
+    score: verdict === "pass" ? 1 : 0.5,
+    threshold: 1,
+    achieved: verdict === "pass" ? "grounded" : "cited",
+    claims: verdict === "unverified" ? 0 : 2,
+    met: verdict === "pass" ? 2 : verdict === "fail" ? 1 : 0,
+    unmet: verdict === "fail" ? 1 : 0,
+    assumptions: 0,
+    retryIndex: 0,
+    maxRetries: 1,
+    turnNumber,
+    bundleHash: `sha256:${turnNumber}`,
+    ...extra,
+  });
+}
+
+const asLogged = (lines: ReadonlyArray<unknown>): LoggedEvent[] => lines as LoggedEvent[];
+
+describe("sessionProvability", () => {
+  test("no provability_graded line: undefined (the heuristic stays in charge)", () => {
+    expect(sessionProvability(asLogged([userMsg("hi"), assistantMsg("hello")]))).toBeUndefined();
+  });
+
+  test("each turn's STANDING pass is its last: a failed-then-passed retry ends passing", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "fail"),
+        gradedLine(1, "pass", { retryIndex: 1 }),
+        gradedLine(2, "fail", { bundlePath: "/proofs/turn-2.json" }),
+      ]),
+    );
+    expect(got?.digest).toEqual({
+      level: "grounded",
+      achieved: "cited",
+      unmet: 1,
+      turns: 2,
+      failing: 1,
+    });
+    expect(got).toMatchObject({ claims: 4, met: 3, counted: 4 });
+    expect(got?.failingBundlePaths).toEqual(["/proofs/turn-2.json"]);
+  });
+
+  test("unverified turns are gated turns but carry no claims, failure or rung — tallied apart", () => {
+    const got = sessionProvability(asLogged([gradedLine(1, "pass"), gradedLine(2, "unverified")]));
+    expect(got?.digest).toEqual({
+      level: "grounded",
+      achieved: "grounded",
+      unmet: 0,
+      turns: 2,
+      failing: 0,
+      unverified: 1,
+    });
+    expect(got?.verified).toBe(1);
+    const only = sessionProvability(asLogged([gradedLine(1, "unverified")]));
+    expect(only?.digest).toMatchObject({ achieved: "none", turns: 1, unverified: 1 });
+    expect(only?.verified).toBe(0);
+    // A session with no unverified turn carries no `unverified` key (additive).
+    const clean = sessionProvability(asLogged([gradedLine(1, "pass")]));
+    expect(clean?.digest).not.toHaveProperty("unverified");
+  });
+
+  test("assumptions leave the counted denominator; malformed lines are skipped", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { claims: 3, met: 2, assumptions: 1 }),
+        ev("provability_graded", { verdict: "pass" }),
+        ev("provability_graded", { turnNumber: 5, level: "off", verdict: "pass" }),
+      ]),
+    );
+    expect(got).toMatchObject({ claims: 3, met: 2, counted: 2 });
+    expect(got?.digest.turns).toBe(1);
+  });
+
+  test("the floor is the most common one", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { level: "cited", achieved: "cited" }),
+        gradedLine(2, "pass", { level: "checked", achieved: "checked" }),
+        gradedLine(3, "pass", { level: "checked", achieved: "checked" }),
+      ]),
+    );
+    expect(got?.digest).toMatchObject({ level: "checked", achieved: "cited" });
+  });
+});
+
+describe("rollupProvability", () => {
+  const obs = (provability?: Record<string, unknown>) =>
+    ({
+      v: 1,
+      sessionId: "sess_0000000000000001",
+      specName: "s",
+      target: "cli",
+      ts: 0,
+      turnCount: 1,
+      joinConfidence: "ordered",
+      models: [],
+      toolStats: [],
+      intentKeys: [],
+      ...(provability !== undefined ? { factuality: { claims: 1, grounded: 1, provability } } : {}),
+    }) as never;
+
+  test("sums the gated sessions and tallies floors and weakest rungs; none ⇒ undefined", () => {
+    expect(rollupProvability([obs()])).toBeUndefined();
+    expect(
+      rollupProvability([
+        obs({ level: "grounded", achieved: "cited", unmet: 2, turns: 3, failing: 1 }),
+        obs({ level: "grounded", achieved: "grounded", unmet: 0, turns: 2, failing: 0 }),
+        obs(),
+      ]),
+    ).toEqual({
+      sessions: 2,
+      turns: 5,
+      failing: 1,
+      unverified: 0,
+      unmet: 2,
+      levels: { grounded: 2 },
+      weakestAchieved: { cited: 1, grounded: 1 },
+    });
+  });
+
+  test("sums the unverified turns", () => {
+    expect(
+      rollupProvability([
+        obs({ level: "grounded", achieved: "none", unmet: 0, turns: 3, failing: 0, unverified: 3 }),
+        obs({
+          level: "grounded",
+          achieved: "cited",
+          unmet: 1,
+          turns: 2,
+          failing: 1,
+          unverified: 1,
+        }),
+      ]),
+    ).toMatchObject({ sessions: 2, turns: 5, failing: 1, unverified: 4 });
+  });
+});
+
 // -- full report ------------------------------------------------------------
 
 describe("runWatchmeReport", () => {
+  test("0.8.0 §9.3 — a gated session's factuality is the gate's exact verdict; ungated keeps the heuristic", async () => {
+    const harness = makeHarness();
+    const gatedId = freshSessionId();
+    const bundlePath = join(harness.crewhausDir, "proofs", "fx", gatedId, "turn-1.json");
+    mkdirSync(join(harness.crewhausDir, "proofs", "fx", gatedId), { recursive: true });
+    writeFileSync(
+      bundlePath,
+      JSON.stringify({
+        version: 1,
+        verdict: "fail",
+        claims: [
+          { index: 0, text: "Refunds take 14 days.", status: "met", bindings: [] },
+          { index: 1, text: `The fee is waived for ${SECRET}.`, status: "unmet", bindings: [] },
+        ],
+      }),
+    );
+    writeFileSync(
+      join(harness.sessionsDir, `${gatedId}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window and the fee?"),
+        assistantMsg("Refunds take 14 days [1]. The fee is waived [2]."),
+        gradedLine(1, "fail", { retryIndex: 0 }),
+        gradedLine(1, "fail", { retryIndex: 1, bundlePath }),
+      ]),
+    );
+    seedExactSession(harness); // ungated: the heuristic roll-up
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.outcome).toBe("written");
+    const observations = harness.store.readObservations();
+    const gated = observations.find((o) => o.sessionId === gatedId);
+    expect(gated?.factuality).toEqual({
+      claims: 2,
+      grounded: 1,
+      faithfulness: 0.5,
+      provability: { level: "grounded", achieved: "cited", unmet: 1, turns: 1, failing: 1 },
+    });
+    const ungated = observations.find((o) => o.sessionId !== gatedId);
+    expect(ungated?.factuality?.provability).toBeUndefined();
+    expect(ungated?.factuality?.claims).toBeGreaterThan(0);
+
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.provability).toEqual({
+      sessions: 1,
+      turns: 1,
+      failing: 1,
+      unverified: 0,
+      unmet: 1,
+      levels: { grounded: 1 },
+      weakestAchieved: { cited: 1 },
+    });
+    // The unmet claim from the persisted bundle is the example — redacted.
+    expect(report.factuality.exampleUngrounded).toContain("The fee is waived for [REDACTED].");
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("- Provability gate (exact, per turn");
+    expect(md).toContain("1 still failing after retries");
+    expect(md).not.toContain(SECRET);
+  });
+
+  test("a gated session whose every turn stood UNVERIFIED is never read as 100% faithful (review W3-C2)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window?"),
+        assistantMsg("Refunds take 14 days [1]."),
+        gradedLine(1, "unverified"),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.outcome).toBe("written");
+    const obs = harness.store.readObservations().find((o) => o.sessionId === id);
+    const f = obs?.factuality;
+    // The digest says what happened…
+    expect(f?.provability).toEqual({
+      level: "grounded",
+      achieved: "none",
+      unmet: 0,
+      turns: 1,
+      failing: 0,
+      unverified: 1,
+    });
+    // …and nothing claims the gate found the answer faithful.
+    expect(f?.vacuous).not.toBe(true);
+    expect(f?.faithfulness).not.toBe(1);
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.meanFaithfulness).not.toBe(1);
+    expect(report.factuality.vacuousSessions).toBe(0);
+    expect(report.factuality.provability).toMatchObject({ unverified: 1, failing: 0 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("1 turn(s) UNVERIFIED");
+  });
+
+  test("a mixed session: the verified turns are the verdict, the unverified ones are tallied", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window?"),
+        assistantMsg("Refunds take 14 days [1]."),
+        gradedLine(1, "pass"),
+        gradedLine(2, "unverified"),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const obs = harness.store.readObservations().find((o) => o.sessionId === id);
+    expect(obs?.factuality).toEqual({
+      claims: 2,
+      grounded: 2,
+      faithfulness: 1,
+      provability: {
+        level: "grounded",
+        achieved: "grounded",
+        unmet: 0,
+        turns: 2,
+        failing: 0,
+        unverified: 1,
+      },
+    });
+    expect(result.report?.factuality.provability).toMatchObject({ turns: 2, unverified: 1 });
+  });
+
+  test("an ungated window renders no provability line and no report key", async () => {
+    const harness = makeHarness();
+    seedExactSession(harness);
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.report?.factuality.provability).toBeUndefined();
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).not.toContain("Provability gate");
+  });
+
   test("no sessions at all → no-sessions outcome", async () => {
     const harness = makeHarness();
     const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));

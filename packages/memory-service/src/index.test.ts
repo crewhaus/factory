@@ -611,6 +611,51 @@ describe("wireMemory — default-skills merge precedence (§2.6)", () => {
     expect(continuity?.[0]?.filePath).toBe(join(skillDir, "SKILL.md"));
   });
 
+  // 0.8.0 §11 — a skill another composition root brings (the provability
+  // gate's) rides the fabric's skill surface when the fabric owns it, at the
+  // same lowest precedence as the shipped defaults.
+  const GATE_SKILL = {
+    name: "provability",
+    description: "how the proof gate reads an answer",
+    filePath: "/builtin/provability/SKILL.md",
+    body: "Cite every claim.\n",
+  };
+
+  test("deps.builtinSkills join the fabric's skills when it owns the surface", async () => {
+    const { deps: d } = deps({ builtinSkills: [GATE_SKILL] });
+    const wired = await wireMemory({ specName: "gate-skill", continuity: {} }, d);
+    const skills = wired.options.skills ?? [];
+    expect(skills.map((s) => s.name).sort()).toEqual(["continuity", "provability"]);
+    expect(skills.find((s) => s.name === "provability")?.description).toBe(GATE_SKILL.description);
+  });
+
+  test("without deps.builtinSkills the surface is exactly the fabric's own", async () => {
+    const { deps: d } = deps();
+    const wired = await wireMemory({ specName: "no-gate-skill", continuity: {} }, d);
+    expect(wired.options.skills?.map((s) => s.name)).toEqual(["continuity"]);
+  });
+
+  test("a fabric that does not own the skill surface ignores deps.builtinSkills", async () => {
+    // Memory alone: the caller discovers its own skills (and passes the gate's
+    // there), so wireMemory returns no skills key to clobber them with.
+    const { deps: d } = deps({ builtinSkills: [GATE_SKILL] });
+    const wired = await wireMemory({ specName: "memory-only", memory: {} }, d);
+    expect(wired.options.skills).toBeUndefined();
+  });
+
+  test("a project skill with the brought skill's name overrides it", async () => {
+    const skillDir = join(tmp, ".crewhaus", "skills", "provability");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      "---\nname: provability\ndescription: our citation house rules\n---\nOurs.\n",
+    );
+    const { deps: d } = deps({ builtinSkills: [GATE_SKILL] });
+    const wired = await wireMemory({ specName: "gate-skill-override", continuity: {} }, d);
+    const gate = wired.options.skills?.filter((s) => s.name === "provability");
+    expect(gate?.map((s) => s.description)).toEqual(["our citation house rules"]);
+  });
+
   test("a project command with a builtin's name overrides it; extras pass through", async () => {
     const cmdDir = join(tmp, ".crewhaus", "commands");
     mkdirSync(cmdDir, { recursive: true });

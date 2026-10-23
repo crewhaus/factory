@@ -1366,6 +1366,14 @@ export type RunProvability = {
   ) => Promise<string | undefined>;
   /** Observe every bundle (the gateway envelope, the research report, tests). */
   readonly onBundle?: (bundle: ProofBundle, bundlePath?: string) => void;
+  /**
+   * 0.8.0 (design §8) — the rendered `provability` skill text. Never read by
+   * this loop's own gate: the bridge projects it, with `level`, as the
+   * READ-ONLY provability seam a Task child receives, so researcher children
+   * cite the way the parent's gate reads. Absent ⇒ children get the floor
+   * alone (the spawner's own framing).
+   */
+  readonly skill?: string;
 };
 
 /**
@@ -5186,6 +5194,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const bridgeContinuitySeam =
     opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+  //   - provability: READ-ONLY (0.8.0 §8). The floor and the skill text cross;
+  //     the verifier, the retry policy and the bundle store stay parent-side,
+  //     so only this loop's final text is ever gated.
+  const bridgeProvabilitySeam =
+    opts.provability !== undefined
+      ? {
+          level: opts.provability.level,
+          ...(opts.provability.skill !== undefined ? { skill: opts.provability.skill } : {}),
+        }
+      : undefined;
   // 0.7.1 — the models this run may name, so a sub-agent read from disk can
   // run on the parent's fallback or tier model, and on nothing unnamed.
   const bridgeSpecModels = specModelsOf(opts);
@@ -6786,6 +6804,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(skills.length > 0 ? { skills } : {}),
       ...(opts.failureTaxonomy !== undefined ? { failureTaxonomy: opts.failureTaxonomy } : {}),
       ...(bridgeContinuitySeam !== undefined ? { continuity: bridgeContinuitySeam } : {}),
+      // 0.8.0 §8 — the read-only provability seam (projected above).
+      ...(bridgeProvabilitySeam !== undefined ? { provability: bridgeProvabilitySeam } : {}),
       // Loop contract 0.4 (G11) — the approval seam, so a Task child's
       // headless `ask` parks against the SAME store the parent parks against
       // instead of collapsing to a denial. `askMode` is spread only when the

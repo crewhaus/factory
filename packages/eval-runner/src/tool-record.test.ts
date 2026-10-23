@@ -26,6 +26,8 @@ import { z } from "zod";
 import {
   TOOL_RECORDING_FILENAME,
   TOOL_REPLAY_MISS_MARKER,
+  TOOL_REPLAY_RESTORE_MARKER,
+  type ToolCallEffects,
   ToolRecorder,
   ToolReplayer,
   canonicalJson,
@@ -369,6 +371,177 @@ describe("replayingTools", () => {
     const [wrapped] = replayingTools([tool], "s1", new ToolReplayer(recorded("r")), "live");
     expect(await wrapped?.execute({ path: "unrecorded" })).toBe('live:{"path":"unrecorded"}');
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("effects: state a result names travels with the record (0.8.0 §9.1)", () => {
+  /** Effects that file `{ state: <result> }` and log every restore. */
+  function effectsLog(opts: { captureThrows?: string; restoreThrows?: string } = {}): {
+    effects: ToolCallEffects;
+    restored: unknown[];
+  } {
+    const restored: unknown[] = [];
+    return {
+      restored,
+      effects: {
+        capture: async (result) => {
+          if (opts.captureThrows !== undefined) throw new Error(opts.captureThrows);
+          return { state: result };
+        },
+        restore: async (effects) => {
+          if (opts.restoreThrows !== undefined) throw new Error(opts.restoreThrows);
+          restored.push(effects);
+        },
+      },
+    };
+  }
+  const replayerOf = (record: Record<string, unknown>) =>
+    new ToolReplayer({
+      dir: "/rec",
+      path: "/rec/tools.jsonl",
+      hash: "h",
+      records: [
+        {
+          sampleId: "s1",
+          toolName: "Echo",
+          argsHash: hashToolArgs({ path: "x" }),
+          args: { path: "x" },
+          ts: "t",
+          ...record,
+        },
+      ],
+    });
+
+  test("RECORD files what capture returns beside the result; other tools file nothing", async () => {
+    const dir = newTempRoot();
+    const recorder = new ToolRecorder({ dir });
+    const { effects } = effectsLog();
+    const echo = stubTool();
+    const other = stubTool({ name: "Other" });
+    const [wrapped, plain] = recordingTools(
+      [echo.tool, other.tool],
+      "s1",
+      recorder,
+      new Map([["Echo", effects]]),
+    );
+    expect(await wrapped?.execute({ path: "x" })).toBe('live:{"path":"x"}');
+    await plain?.execute({ path: "y" });
+    const [first, second] = loadToolRecording(dir).records;
+    expect(first?.effects).toEqual({ state: 'live:{"path":"x"}' });
+    expect(second).toBeDefined();
+    expect(second !== undefined && "effects" in second).toBe(false);
+  });
+
+  test("RECORD: a capture that throws is the call's recorded ERROR, so record and replay fail alike", async () => {
+    const dir = newTempRoot();
+    const recorder = new ToolRecorder({ dir });
+    const { effects } = effectsLog({ captureThrows: "artifact went missing" });
+    const { tool, calls } = stubTool();
+    const [wrapped] = recordingTools([tool], "s1", recorder, new Map([["Echo", effects]]));
+    await expect(wrapped?.execute({ path: "x" })).rejects.toThrow("artifact went missing");
+    expect(calls).toHaveLength(1);
+    const [record] = loadToolRecording(dir).records;
+    expect(record).toMatchObject({ error: "artifact went missing" });
+    expect(record?.result).toBeUndefined();
+    expect(record?.effects).toBeUndefined();
+    // The replay serves the same failure.
+    const [replayed] = replayingTools(
+      [tool],
+      "s1",
+      new ToolReplayer(loadToolRecording(dir)),
+      "error",
+      new Map([["Echo", effects]]),
+    );
+    await expect(replayed?.execute({ path: "x" })).rejects.toThrow("artifact went missing");
+    expect(calls).toHaveLength(1);
+  });
+
+  test("REPLAY restores the recorded effects BEFORE the result is returned, never running the tool", async () => {
+    const order: string[] = [];
+    const { tool, calls } = stubTool();
+    const [wrapped] = replayingTools(
+      [tool],
+      "s1",
+      replayerOf({ result: "from-the-cassette", effects: { state: "filed" } }),
+      "error",
+      new Map([
+        [
+          "Echo",
+          {
+            capture: async () => undefined,
+            restore: async (effects: unknown) => {
+              order.push(`restore ${JSON.stringify(effects)}`);
+            },
+          },
+        ],
+      ]),
+    );
+    const out = await wrapped?.execute({ path: "x" });
+    order.push(`returned ${String(out)}`);
+    expect(order).toEqual(['restore {"state":"filed"}', "returned from-the-cassette"]);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("REPLAY: no restorer for the tool, or a record with no effects (pre-0.8.0): the result alone", async () => {
+    const { effects, restored } = effectsLog();
+    const { tool } = stubTool();
+    const [unrestored] = replayingTools(
+      [tool],
+      "s1",
+      replayerOf({ result: "r", effects: { state: "filed" } }),
+      "error",
+    );
+    expect(await unrestored?.execute({ path: "x" })).toBe("r");
+    const [legacy] = replayingTools(
+      [tool],
+      "s1",
+      replayerOf({ result: "r" }),
+      "error",
+      new Map([["Echo", effects]]),
+    );
+    expect(await legacy?.execute({ path: "x" })).toBe("r");
+    expect(restored).toEqual([]);
+  });
+
+  test("REPLAY: a recorded THROW restores nothing", async () => {
+    const { effects, restored } = effectsLog();
+    const { tool } = stubTool();
+    const [wrapped] = replayingTools(
+      [tool],
+      "s1",
+      replayerOf({ error: "recorded failure", effects: { state: "filed" } }),
+      "error",
+      new Map([["Echo", effects]]),
+    );
+    await expect(wrapped?.execute({ path: "x" })).rejects.toThrow("recorded failure");
+    expect(restored).toEqual([]);
+  });
+
+  test("REPLAY: a restore that throws is TERMINAL, naming the key and the cassette", async () => {
+    const { effects } = effectsLog({ restoreThrows: "the recorded artifact is malformed" });
+    const { tool, calls } = stubTool();
+    const [wrapped] = replayingTools(
+      [tool],
+      "s1",
+      replayerOf({ result: "r", effects: { state: "filed" } }),
+      "error",
+      new Map([["Echo", effects]]),
+    );
+    let thrown: unknown;
+    try {
+      await wrapped?.execute({ path: "x" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(calls).toHaveLength(0);
+    expect(isRunFailedError(thrown)).toBe(true);
+    const msg = (thrown as Error).message;
+    expect(msg).toContain(TOOL_REPLAY_RESTORE_MARKER);
+    expect(msg).toContain('sample "s1"');
+    expect(msg).toContain('tool "Echo"');
+    expect(msg).toContain("/rec/tools.jsonl");
+    expect(msg).toContain("the recorded artifact is malformed");
+    expect((thrown as { report: { class: string } }).report.class).toBe("config");
   });
 });
 

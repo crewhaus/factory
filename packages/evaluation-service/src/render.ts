@@ -29,7 +29,9 @@
  *
  * An emitter that hands the run a tool LIST rather than a catalog snapshot
  * (the channel bot's per-turn `runTurn`) asks for `toolsInto: "list"` and
- * wraps its tools expression with `toolsExpr(…)` instead.
+ * wraps its tools expression with `toolsExpr(…)` instead. One that serves
+ * many runs from one wiring and must return each run's bundle (the managed
+ * gateway) names a per-run observer with `bundleObserverExpr` (`./observe`).
  *
  * The fragment is `JSON.stringify` of `evaluationFragmentFromIr(ir)`: the
  * lowered blocks are plain data (strings, numbers, booleans, arrays), so
@@ -59,6 +61,16 @@ export type EvaluationWiringOptions = {
   readonly toolsInto?: "catalog" | "list";
   /** An expression for the run's session-log root, when the bundle passes one to `runChatLoop`. */
   readonly sessionRootDirExpr?: string;
+  /**
+   * An expression for a per-run bundle observer (`ProofBundleObserver |
+   * undefined`), when the emitter serves many runs from one wiring and must
+   * hand each run's caller the bundle of that run (the managed gateway's
+   * `proof`, design §5.4). Under `provability:` the field then reads
+   * `provability: observeProofBundles(__gates.provability, <expr>),` and the
+   * import names `observeProofBundles` and the `ProofBundleObserver` type.
+   * Ignored without `provability:`.
+   */
+  readonly bundleObserverExpr?: string;
 };
 
 export type EvaluationWiring = {
@@ -87,8 +99,12 @@ export function renderEvaluationWiring(
   if (fragment === undefined) return EMPTY;
   const provable = fragment.provability !== undefined;
   const intoList = provable && opts.toolsInto === "list";
+  const observed = provable && opts.bundleObserverExpr !== undefined;
   const helper = !provable ? "" : intoList ? "mergeGateTools, " : "registerGateTools, ";
-  const imports = [`import { ${helper}wireEvaluation } from "@crewhaus/evaluation-service";`];
+  const observer = observed ? "type ProofBundleObserver, observeProofBundles, " : "";
+  const imports = [
+    `import { ${observer}${helper}wireEvaluation } from "@crewhaus/evaluation-service";`,
+  ];
   const sessionRootDep =
     provable && opts.sessionRootDirExpr !== undefined
       ? `, ...(${opts.sessionRootDirExpr} !== undefined ? { sessionRootDir: ${opts.sessionRootDirExpr} } : {})`
@@ -101,7 +117,13 @@ export function renderEvaluationWiring(
     ...(fragment.evaluation !== undefined
       ? [`\n${opts.indent}evaluation: ${GATES_VAR}.evaluation,`]
       : []),
-    ...(provable ? [`\n${opts.indent}provability: ${GATES_VAR}.provability,`] : []),
+    ...(provable
+      ? [
+          observed
+            ? `\n${opts.indent}provability: observeProofBundles(${GATES_VAR}.provability, ${opts.bundleObserverExpr}),`
+            : `\n${opts.indent}provability: ${GATES_VAR}.provability,`,
+        ]
+      : []),
   ].join("");
   const toolsRegistration =
     provable && !intoList

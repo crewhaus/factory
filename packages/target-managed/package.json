@@ -21,6 +21,9 @@
     "@crewhaus/model-service": "workspace:*",
     "@crewhaus/tool-categories": "workspace:*"
   },
+  "devDependencies": {
+    "@crewhaus/gateway-server": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

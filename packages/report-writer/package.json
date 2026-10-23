@@ -6,14 +6,22 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./provability": "./src/provability.ts"
   },
   "scripts": {
     "test": "bun test src"
   },
   "dependencies": {
     "@crewhaus/citation-tracker": "workspace:*",
-    "@crewhaus/errors": "workspace:*"
+    "@crewhaus/claim-ledger": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/provability": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/crawler": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

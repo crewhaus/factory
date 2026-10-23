@@ -48,8 +48,16 @@ import { buildDefaultCheckers, createProofTools } from "@crewhaus/tool-proof";
 /** The `formal.checkers` the compiler lowers when a spec names none. */
 export const DEFAULT_FORMAL_CHECKERS: ReadonlyArray<string> = ["builtin", "smt"];
 
-/** Whether a gated harness also gets `ProofCheckers` + `ProofCheck` (see the module doc). */
-export function wantsProofCheckTools(config: IrProvability): boolean {
+/**
+ * Whether a gated harness also gets `ProofCheckers` + `ProofCheck` (see the
+ * module doc). Reads the floor and the checkers only — the `provability`
+ * skill asks the same question of the fields a bundle hands it (`./skills`),
+ * so the skill teaches the proof tools exactly where they are wired.
+ */
+export function wantsProofCheckTools(config: {
+  readonly level: IrProvability["level"];
+  readonly formal: { readonly checkers: ReadonlyArray<string> };
+}): boolean {
   if (config.level === "proven") return true;
   const checkers = config.formal.checkers;
   return (

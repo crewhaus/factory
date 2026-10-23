@@ -126,6 +126,8 @@ type WireMemoryDeps = {
   embedder?: { embed(texts) };    // beats memory.wiki.embedder
   log?: (line: string) => void;   // "[memory] …" status lines (interpreter)
   homeDir?: string;               // skill/command discovery override (tests)
+  builtinSkills?: LoadedSkill[];  // another root's skills (the provability gate's), merged with
+                                  // the defaults at lowest precedence when the fabric owns skills
   now?: () => Date;
 };
 ```

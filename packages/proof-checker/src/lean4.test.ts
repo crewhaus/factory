@@ -658,3 +658,140 @@ describe("createLean4Checker — with a scripted sandbox", () => {
     expect(LEAN4_LANGUAGE).toMatch(/Example:/);
   });
 });
+
+/**
+ * What `lean --stdin --json` prints in the curated image (Lean 4.34.1),
+ * captured verbatim for the files the adapter writes — so the parser and the
+ * verdicts are held to the real toolchain without Docker. The live run is
+ * sandbox.live.test.ts.
+ */
+describe("createLean4Checker — on what Lean 4.34.1 actually prints", () => {
+  const line = (severity: string, row: number, col: number, kind: string, data: string): string =>
+    JSON.stringify({
+      caption: "",
+      data,
+      endPos: { column: 6, line: row },
+      fileName: "<stdin>",
+      isSilent: false,
+      keepFullRange: false,
+      kind,
+      pos: { column: col, line: row },
+      severity,
+    });
+  const axioms = (list: string) =>
+    line("information", 6, 0, "[anonymous]", `'crewhaus_claim' depends on axioms: [${list}]`);
+  const lean434 = {
+    simp: `${axioms("propext")}\n`,
+    classical: `${axioms("propext, Classical.choice, Quot.sound")}\n`,
+    sorry: `${line("warning", 1, 8, "hasSorry", "declaration uses `sorry`")}\n${axioms("sorryAx")}\n`,
+    decideNative: `${axioms("crewhaus_claim._native.decide.ax_1_1")}\n`,
+    nativeDecide: `${axioms("crewhaus_claim._native.native_decide.ax_1_1")}\n`,
+    falseDecide: `${line("error", 5, 5, "[anonymous]", "Tactic `decide` proved that the proposition\n  2 + 2 = 5\nis false")}\n${axioms("sorryAx")}\n`,
+    unsolved: `${line("error", 5, 2, "Tactic.unsolvedGoals", "unsolved goals\nn : Nat\n⊢ n * 1 = n + 0 * n")}\n${axioms("sorryAx")}\n`,
+  };
+  const check = async (
+    statement: string,
+    proof: string,
+    reply: FakeReply,
+    extra: Partial<Parameters<typeof createLean4Checker>[0]> = {},
+  ) => {
+    // Every captured file is the one-line statement + one-line proof shape,
+    // so `#print axioms` sits on line 6, where the captures put it.
+    expect(
+      prescanLean(statement, proof, { forbid: [], imports: LEAN4_CORE_IMPORTS }).printLine,
+    ).toBe(6);
+    return createLean4Checker({ sandbox: fakeSandbox([reply]), ...extra }).check({
+      claim: "c",
+      statement,
+      proof,
+    });
+  };
+
+  test("a simp proof: ok, propext not recorded", async () => {
+    const r = await check("∀ n : Nat, n + 0 = n", "by intro n; simp", { stdout: lean434.simp });
+    expect(r).toMatchObject({ ok: true, axioms: [], assumptions: [] });
+    expect(r.output).toBe("6: information: 'crewhaus_claim' depends on axioms: [propext]");
+  });
+
+  test("a classical proof: Classical.choice is captured and, being standard, not recorded", async () => {
+    const r = await check("∀ p : Prop, p ∨ ¬p", "fun p => Classical.em p", {
+      stdout: lean434.classical,
+    });
+    expect(r).toMatchObject({ ok: true, axioms: [] });
+    expect(r.output).toContain("Classical.choice");
+  });
+
+  test("sorry past an emptied forbid list: the warning is not the verdict, sorryAx is", async () => {
+    const r = await check("2 + 2 = 5", "by sorry", { stdout: lean434.sorry }, { forbid: [] });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("the proof depends on `sorryAx` (a sorry), so it proves nothing");
+  });
+
+  test("a false or unfinished proof: rejected with Lean's error, exit 1", async () => {
+    const no = await check("2 + 2 = 5", "by decide", { exitCode: 1, stdout: lean434.falseDecide });
+    expect(no.reason).toBe(
+      "lean rejected the proof: Tactic `decide` proved that the proposition 2 + 2 = 5 is false",
+    );
+    const open = await check("∀ n : Nat, n * 1 = n + 0 * n", "by intro n", {
+      exitCode: 1,
+      stdout: lean434.unsolved,
+    });
+    expect(open.reason).toBe("lean rejected the proof: unsolved goals n : Nat ⊢ n * 1 = n + 0 * n");
+  });
+
+  // Lean 4.34 names the compiler-trust axiom `<decl>._native.<tactic>.ax_i_j`;
+  // before the adapter knew that, `decide +native` (which never spells
+  // `native_decide`) passed a harness that forbids native_decide.
+  test("`decide +native` is refused while native_decide is forbidden", async () => {
+    const r = await check("(10 : Nat) < 100", "by decide +native", {
+      stdout: lean434.decideNative,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe(
+      "the proof trusts the compiler (crewhaus_claim._native.decide.ax_1_1, what native_decide and decide +native leave behind), which this harness forbids",
+    );
+  });
+
+  test("with native_decide allowed, its auxiliary axiom is recorded and the proof stays ok", async () => {
+    for (const [proof, stdout, axiom] of [
+      ["by native_decide", lean434.nativeDecide, "crewhaus_claim._native.native_decide.ax_1_1"],
+      ["by decide +native", lean434.decideNative, "crewhaus_claim._native.decide.ax_1_1"],
+    ] as const) {
+      const r = await check("(10 : Nat) < 100", proof, { stdout }, { forbid: ["sorry", "axiom"] });
+      expect(r).toMatchObject({ ok: true, axioms: [axiom] });
+    }
+  });
+
+  test("a long axiom list wraps over lines in Lean's message and still reads whole", async () => {
+    const r = await check(
+      "(10 : Nat) < 100 ∧ ∀ p : Prop, p ∨ ¬p",
+      "⟨by native_decide, fun p => Classical.em p⟩",
+      {
+        stdout: `${axioms("propext,\n Classical.choice,\n Quot.sound,\n crewhaus_claim._native.native_decide.ax_1_1,\n crewhaus_claim._native.native_decide.ax_1_2")}\n`,
+      },
+      { forbid: ["sorry", "axiom"] },
+    );
+    expect(r).toMatchObject({
+      ok: true,
+      axioms: [
+        "crewhaus_claim._native.native_decide.ax_1_1",
+        "crewhaus_claim._native.native_decide.ax_1_2",
+      ],
+    });
+  });
+
+  test("only a `_native` name component reads as compiler trust, not a name that mentions native", async () => {
+    const r = await check("2 + 2 = 4", "by decide", {
+      stdout: `${axioms("propext, Mathlib.native_ish, Foo.nativeBar, _nativeX.y")}\n`,
+    });
+    expect(r).toMatchObject({
+      ok: true,
+      axioms: ["Mathlib.native_ish", "Foo.nativeBar", "_nativeX.y"],
+    });
+    const trusted = await check("2 + 2 = 4", "by decide", {
+      stdout: `${axioms("Foo._native.bar")}\n`,
+    });
+    expect(trusted.ok).toBe(false);
+    expect(trusted.reason).toMatch(/^the proof trusts the compiler \(Foo\._native\.bar,/);
+  });
+});

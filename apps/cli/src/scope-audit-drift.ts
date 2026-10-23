@@ -52,7 +52,13 @@ export type PhilosophyFindingClass =
   | "contributor-doc"
   | "boundary-drift"
   /** 0.6.0 §10.1 — the spec-level model-plan checks run over the cwd spec. */
-  | "model-plan";
+  | "model-plan"
+  /** 0.8.0 §10 — a grammar with exactly one definition in the tree (the citation-marker regex). */
+  | "single-definition"
+  /** 0.8.0 §10 — a package that must not import a class of packages (provability ↛ model adapters). */
+  | "import-boundary"
+  /** 0.8.0 §10 / §9.2 — a spec path the optimizer must never patch (`provability.level`). */
+  | "optimizer-exclusion";
 
 export type PhilosophyFinding = {
   readonly class: PhilosophyFindingClass;

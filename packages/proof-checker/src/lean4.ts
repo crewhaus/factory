@@ -54,8 +54,9 @@
  * Verdict: ok ⇔ lean exits 0, reports no `error`, and the `#print axioms`
  * message — read from the JSON message positioned on the adapter's own line,
  * so text the proof prints cannot impersonate it — parses. `sorryAx` is
- * always a rejection; `Lean.ofReduceBool` / `Lean.ofReduceNat` /
- * `Lean.trustCompiler` (the compiler-trusting `native_decide` family) are a
+ * always a rejection; the compiler-trusting axioms — `Lean.ofReduceBool` /
+ * `Lean.ofReduceNat` / `Lean.trustCompiler`, and the `<decl>._native.…`
+ * auxiliaries `native_decide` and `decide +native` leave on Lean 4.34 — are a
  * rejection while `native_decide` is forbidden. Any other axiom beyond
  * `propext`, `Classical.choice` and `Quot.sound` is RECORDED in `axioms` and
  * the proof stays ok: it is shown, not hidden (design §6.4).
@@ -93,8 +94,22 @@ export const LEAN4_STANDARD_AXIOMS: ReadonlyArray<string> = [
 export const LEAN4_CORE_IMPORTS: ReadonlyArray<string> = ["Init", "Std"];
 /** Added to the allowlist when `formal.image` overrides the image. */
 export const LEAN4_OVERRIDE_IMPORTS: ReadonlyArray<string> = ["Mathlib"];
-/** The axioms `native_decide` (and `decide +native`) leave behind. */
+/** The axioms through which a proof trusts the compiler, by name (older Lean, or a direct use). */
 const COMPILER_AXIOMS = new Set(["Lean.ofReduceBool", "Lean.ofReduceNat", "Lean.trustCompiler"]);
+
+/**
+ * Whether an axiom is one a proof that trusts the compiler leaves behind.
+ * `Lean.ofReduceBool` and friends name it directly; Lean 4.34 (the curated
+ * image's toolchain) instead adds one auxiliary axiom per use, named
+ * `<decl>._native.<tactic>.ax_<i>_<j>` — `crewhaus_claim._native.decide.ax_1_1`
+ * for `decide +native`, a spelling the pre-scan's `native_decide` word never
+ * sees. Found against the real toolchain (sandbox.live.test.ts); the `_native`
+ * name component is Lean's, and a proof cannot declare an axiom of its own
+ * (`axiom` is a command word the pre-scan refuses).
+ */
+function trustsCompiler(axiom: string): boolean {
+  return COMPILER_AXIOMS.has(axiom) || axiom.split(".").includes("_native");
+}
 
 /**
  * Words that start a new command (or change how one elaborates). None can
@@ -833,10 +848,10 @@ export function createLean4Checker(opts: Lean4CheckerOptions): SandboxProofCheck
       if (all.includes("sorryAx")) {
         return refuse("the proof depends on `sorryAx` (a sorry), so it proves nothing", output);
       }
-      const compiler = all.filter((a) => COMPILER_AXIOMS.has(a));
+      const compiler = all.filter(trustsCompiler);
       if (compiler.length > 0 && forbid.includes("native_decide")) {
         return refuse(
-          `the proof trusts the compiler (${compiler.join(", ")}, what native_decide leaves behind), which this harness forbids`,
+          `the proof trusts the compiler (${compiler.join(", ")}, what native_decide and decide +native leave behind), which this harness forbids`,
           output,
         );
       }

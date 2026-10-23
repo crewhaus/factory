@@ -5,7 +5,9 @@ import { join } from "node:path";
 import {
   type EvaluationFragment,
   evaluationFragmentFromIr,
+  provabilitySkills,
   registerGateTools,
+  renderGateSkills,
   wireEvaluation,
 } from "@crewhaus/evaluation-service";
 import type { IrV0 } from "@crewhaus/ir";
@@ -1687,6 +1689,161 @@ describe("emitCli — provability (0.8.0 §8: wired on cli)", () => {
       "ProofCheck",
       "ProvabilityPreflight",
     ]);
+  });
+});
+
+describe("emitCli — the provability skill (0.8.0 §11: registered only with the block)", () => {
+  const PROV = (level: "cited" | "grounded" | "proven" = "grounded") => ({
+    level,
+    onFail: "retry" as const,
+    maxRetries: 1,
+    threshold: 1,
+    scope: "session" as const,
+    assumptions: "allow" as const,
+    render: "footer" as const,
+    sources: { allow: [], deny: [], bibliographic: false, resolve: "off" as const },
+    grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+    execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+    formal: {
+      checkers: ["builtin" as const, "smt" as const],
+      forbid: ["sorry"],
+      timeoutMs: 30_000,
+    },
+  });
+  const CONTINUITY = {
+    plan: true,
+    proof: "ladder" as const,
+    ledger: true,
+    handoff: true,
+    scope: "spec" as const,
+  };
+  // The expression itself is pinned in evaluation-service (renderGateSkills);
+  // these tests pin where the emitter splices it.
+  const SKILLS_CALL = renderGateSkills({ provability: PROV() }).expr;
+  const LEARNING = {
+    domain: "specialty coffee extraction science",
+    study: { onHeartbeat: true, onDream: true },
+  } as const;
+
+  test("the call is the block's skill expression", () => {
+    expect(SKILLS_CALL).toStartWith('provabilitySkills({"level":"grounded",');
+  });
+
+  test("without continuity: the bundle's own discovery takes the gate's skill as a builtin", () => {
+    const content = emitCli(baseIr({ provability: PROV() })).files[0]?.content ?? "";
+    expect(content).toContain('import { provabilitySkills } from "@crewhaus/evaluation-service";');
+    expect(content).toContain(`discoverSkills({ cwd: __cwd, builtinSkills: ${SKILLS_CALL} }),`);
+    // One Skill tool, from that one list, and the same list in the run.
+    expect(content).toContain(
+      "if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));",
+    );
+    expect(content).toContain("\n    skills: __skills,");
+  });
+
+  test("plugins and the gate's skill compose in the same discovery call", () => {
+    const content =
+      emitCli(baseIr({ provability: PROV(), plugins: ["p"] })).files[0]?.content ?? "";
+    expect(content).toContain(
+      `discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs, builtinSkills: ${SKILLS_CALL} }),`,
+    );
+  });
+
+  test("with continuity: wireMemory owns the surface, so the gate's skill rides its deps", () => {
+    const content =
+      emitCli(baseIr({ provability: PROV(), continuity: CONTINUITY })).files[0]?.content ?? "";
+    expect(content).toContain(`, builtinSkills: ${SKILLS_CALL} });\nconst __skills = __memWired`);
+    expect(content).not.toContain("discoverSkills(");
+    expect(content.match(/provabilitySkills\(/g)).toHaveLength(1);
+  });
+
+  test("the continuity path's wiring advertises the rendered skill beside continuity", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "target-cli-gate-skill-"));
+    try {
+      const wired = await wireMemory(
+        { specName: "smoke", continuity: CONTINUITY } as MemoryWiringFragment,
+        {
+          catalog: { register: () => {} },
+          cwd: tmp,
+          homeDir: join(tmp, "home"),
+          builtinSkills: provabilitySkills(PROV()),
+        },
+      );
+      const skills = wired.options.skills ?? [];
+      expect(skills.map((s) => s.name).sort()).toEqual(["continuity", "provability"]);
+      const gate = skills.find((s) => s.name === "provability") as { body?: string };
+      expect(gate.body).toContain("`grounded`");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("the rendered call names the block's floor and checker order", () => {
+    const content =
+      emitCli(
+        baseIr({
+          provability: { ...PROV("proven"), formal: { ...PROV().formal, checkers: ["lean4"] } },
+        }),
+      ).files[0]?.content ?? "";
+    expect(content).toContain('provabilitySkills({"level":"proven",');
+    expect(content).toContain('"formal":{"checkers":["lean4"]}})');
+  });
+
+  test("learning without continuity: wireMemory owns the surface, so the skill rides its deps", async () => {
+    const ir = baseIr({
+      provability: PROV(),
+      memory: { wiki: { enabled: true, requireSources: true } },
+      learning: LEARNING,
+    });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    expect(content).toContain(`, builtinSkills: ${SKILLS_CALL} });\nconst __skills = __memWired`);
+    expect(content).not.toContain("discoverSkills(");
+    expect(content.match(/provabilitySkills\(/g)).toHaveLength(1);
+    expect(content).toContain("\n    skills: __skills,");
+    // What that wiring returns: the learning skill and the gate's, one list.
+    const tmp = mkdtempSync(join(tmpdir(), "target-cli-gate-learning-"));
+    try {
+      const wired = await wireMemory(
+        {
+          specName: "smoke",
+          memory: { wiki: { enabled: true, requireSources: true } },
+          learning: LEARNING,
+        } as MemoryWiringFragment,
+        {
+          catalog: { register: () => {} },
+          cwd: tmp,
+          homeDir: join(tmp, "home"),
+          builtinSkills: provabilitySkills(PROV()),
+        },
+      );
+      expect((wired.options.skills ?? []).map((s) => s.name).sort()).toEqual([
+        "learning-loop",
+        "provability",
+      ]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Byte identity without the block is held by the compiler's pinned bundle
+  // fixtures (packages/compiler/src/model-wiring-pin.test.ts,
+  // continuity-byte-restore.test.ts), which compare against bytes captured
+  // before 0.8.0. Here: nothing of the skill wiring appears.
+  test("no block → no skill wiring, with or without continuity or evaluation", () => {
+    for (const extra of [
+      {},
+      { continuity: CONTINUITY },
+      {
+        evaluation: {
+          grader: { type: "contains" as const, value: "x" },
+          onFail: "retry" as const,
+          maxRetries: 1,
+        },
+      },
+    ]) {
+      const content = emitCli(baseIr(extra)).files[0]?.content ?? "";
+      expect(content).not.toContain("provabilitySkills");
+      expect(content).not.toContain("builtinSkills");
+    }
   });
 });
 

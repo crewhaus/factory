@@ -25,7 +25,10 @@ export interface SandboxProofChecker extends ProofChecker {
 export type SandboxCheckerOptions = {
   /** The sandbox the checker runs in. Its `allowedImages` must include {@link SandboxProofChecker.image}. */
   readonly sandbox: SandboxLike;
-  /** Image override (the spec's `formal.image`); default: the curated image. */
+  /**
+   * Image override; default: the curated image. For lean4 it is the spec's
+   * `formal.image`; smt has no spec key, so only a programmatic caller sets it.
+   */
   readonly image?: string;
   /** Per-check budget when the input carries none (ms, default 30 000 — `formal.timeout_ms`). */
   readonly timeoutMs?: number;

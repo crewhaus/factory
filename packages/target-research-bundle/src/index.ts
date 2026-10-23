@@ -341,7 +341,206 @@ function memoryFabric(ir: IrResearchV0): { wired: boolean; fragmentJson: string 
   return { wired, fragmentJson };
 }
 
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.4, §8) — the research shape's
+ * provability report gate. Under `provability:` the daemon writes its report
+ * through `writeProvableReport` (`@crewhaus/report-writer/provability`, a
+ * subpath an ungated bundle never loads): the rendered
+ * report is verified against THIS run's citation tracker (the sha256-pinned
+ * cache of every body the crawler fetched — `evidenceFromTracker`), a
+ * `## Provability` section follows `## Citations` whatever the verdict, the
+ * bundle rides `report.json` as `proof` and lands beside it as `proof.json`,
+ * and a `provability_graded` line goes to stdout with the other run events.
+ * `on_fail` is `halt` or `note` on this shape (the compiler lowers retry /
+ * escalate to note, §8): `halt` writes the report, then stops the run with the
+ * classified `provability` failure (exit 37) instead of `run_done`; `note`
+ * serves the report with its ✗ section. A verifier that throws leaves the
+ * report `unverified` and never halts (§5.1).
+ *
+ * The branch agents are told how the report is checked and how to mark a
+ * claim (`researchProvabilityGuidance`, appended to their instructions), and
+ * `CiteFact` names the `[N]` a recorded fact will carry in the report
+ * (`withCitationNumbers`) — without the number, no branch could cite a claim
+ * the way the report's grammar reads it.
+ *
+ * The rest of the block is honoured as on the in-loop gate
+ * (`@crewhaus/evaluation-service`): `sources.resolve: head` wires the same
+ * guarded HEAD, each request it decides going out as an `egress_decision`
+ * line on stdout (this daemon's event stream; it has no audit sink, §6.1,
+ * §10); `provability.judge` wires the same paraphrase-waiver judge
+ * (`createWaiverJudge`). The report is graded after every branch's loop has
+ * closed, so there is no run bus or `budget.judge_share` to meter it on: the
+ * judge's model and priced spend land on the bundle (`judgeModel`,
+ * `spentUsdMicros`) and on the `provability_graded` line. File sources under
+ * `retrieve.allowedFileRoots` outside the harness directory are admitted by
+ * the gate exactly as the crawler admitted them (`fileRoots`). The evidence
+ * index is built inside the gate's guard (an unreadable cache leaves the
+ * report `unverified`, never unwritten). A `checked` / `proven` floor gets a
+ * warning on stderr at start: the run's only evidence is what it fetched,
+ * which reaches `grounded` at most, so no claim can meet it in 0.8.0.
+ *
+ * Without `provability:` every piece is the pre-0.8.0 text, byte for byte.
+ */
+function renderResearchProvability(ir: IrResearchV0): {
+  readonly errorsImport: string;
+  readonly reportWriterImport: string;
+  readonly constants: string;
+  readonly citeFactTool: string;
+  readonly instructionsExpr: string;
+  readonly reportBlock: string;
+} {
+  const citeFact = `  const citeFactTool = createCiteFactTool({
+    tracker: args.tracker,
+    currentBranchId: () => currentBranch,
+  });`;
+  const p = ir.provability;
+  if (p === undefined) {
+    return {
+      errorsImport: 'import { formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+      reportWriterImport:
+        'import { writeReport, type BranchAnswer } from "@crewhaus/report-writer";',
+      constants: "",
+      citeFactTool: citeFact,
+      instructionsExpr: "SPEC_INSTRUCTIONS",
+      reportBlock: `  const report = writeReport({
+    goal,
+    branches: state.completedBranches,
+    citations: tracker.listCitationsOrdered(),
+  });
+  const reportDir = join(RESEARCH_ROOT, runId);
+  writeFileSync(join(reportDir, "report.md"), report.markdown, { mode: 0o600 });
+  writeFileSync(join(reportDir, "report.json"), JSON.stringify(report.json, null, 2), { mode: 0o600 });
+  // A research run that cited nothing is not a success worth reporting
+  // silently: the report still ships (with its "no citations" notice), but the
+  // operator gets told on stderr, where a scripted caller will actually see it.
+  if (report.json.citations.length === 0) {
+    process.stderr.write(
+      "[research] WARNING: no citations were recorded — the report is not anchored to any fetched source.\\n",
+    );
+  }
+`,
+    };
+  }
+  const head = p.sources.resolve === "head";
+  const judge = p.judge;
+  const evaluationImports = [
+    ...(head ? ["createHeadResolver"] : []),
+    ...(judge !== undefined ? ["createWaiverJudge"] : []),
+  ];
+  const unreachable = p.level === "checked" || p.level === "proven";
+  return {
+    errorsImport:
+      'import { RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
+    reportWriterImport: `${
+      evaluationImports.length > 0
+        ? `import { ${evaluationImports.join(", ")} } from "@crewhaus/evaluation-service";\n`
+        : ""
+    }import type { BranchAnswer } from "@crewhaus/report-writer";
+import {
+  evidenceFromTracker,
+  provabilityFailureReport,
+  researchProvabilityGuidance,
+  withCitationNumbers,
+  writeProvableReport,
+  type ReportProvabilityConfig,
+} from "@crewhaus/report-writer/provability";`,
+    constants: `
+// 0.8.0 (design §5.4, §8) — the provability report gate's lowered block. The
+// branch agents are told how the report is checked and how to mark a claim.
+const PROVABILITY: ReportProvabilityConfig = ${JSON.stringify(p)};
+const BRANCH_INSTRUCTIONS = \`\${SPEC_INSTRUCTIONS}\\n\\n\${researchProvabilityGuidance(PROVABILITY)}\`;${
+      head
+        ? `
+// sources.resolve: head — one guarded HEAD per distinct cited URL at report time.
+const __resolveHead = createHeadResolver(PROVABILITY.sources);`
+        : ""
+    }${
+      judge !== undefined
+        ? `
+// provability.judge — the paraphrase-waiver judge, asked only for a grounded
+// miss on wording alone; its model and spend land on the bundle.
+const __waiverJudge = createWaiverJudge({ judge: ${JSON.stringify(judge)} });`
+        : ""
+    }${
+      unreachable
+        ? `
+// A ${p.level} floor: the report's only evidence is what the run fetched,
+// which reaches grounded at most — say so before the run spends anything.
+process.stderr.write(
+  "[research] WARNING: provability.level is ${p.level}, and no claim of a research report can meet it in this release — the run's only evidence is the sources it fetched, which reach grounded at most. Every cited claim will fall short of the floor${p.onFail === "halt" ? ", and on_fail: halt will stop the run with exit 37" : ""}.\\n",
+);`
+        : ""
+    }`,
+    citeFactTool: `  // 0.8.0 §8 — CiteFact also names the [N] its fact carries in the report, so
+  // the branch can mark the claims it supports the way the report gate reads.
+  const citeFactTool = withCitationNumbers(
+    createCiteFactTool({
+      tracker: args.tracker,
+      currentBranchId: () => currentBranch,
+    }),
+    args.tracker,
+  );`,
+    instructionsExpr: "BRANCH_INSTRUCTIONS",
+    reportBlock: `  // 0.8.0 (design §5.4, §8) — the report gate: the rendered report verified
+  // against this run's own fetch cache at the declared floor, the verdict
+  // served beside it (## Provability, report.json's proof, proof.json, a
+  // provability_graded line).
+  const __gateRoots = { workspaceRoot: process.cwd(), fileRoots: allowedFileRootsAbs };
+  const report = await writeProvableReport({
+    goal,
+    branches: state.completedBranches,
+    citations: tracker.listCitationsOrdered(),
+    provability: {
+      config: PROVABILITY,
+      // Built inside the gate's guard: a cache it cannot read leaves the
+      // report unverified, not unwritten. The crawler's file roots are the
+      // gate's too, so a source it was admitted to is one the gate admits.
+      evidence: () => evidenceFromTracker(tracker, __gateRoots),
+      ...__gateRoots,${
+        head
+          ? `
+      resolveHead: (url) =>
+        __resolveHead(url, {
+          record: (decision) => emit({ kind: "egress_decision", ...decision }),
+        }),`
+          : ""
+      }${judge !== undefined ? "\n      judgeWaiver: __waiverJudge," : ""}
+    },
+  });
+  const reportDir = join(RESEARCH_ROOT, runId);
+  writeFileSync(join(reportDir, "report.md"), report.markdown, { mode: 0o600 });
+  writeFileSync(join(reportDir, "report.json"), JSON.stringify(report.json, null, 2), { mode: 0o600 });
+  const proofPath = join(reportDir, "proof.json");
+  writeFileSync(proofPath, \`\${JSON.stringify(report.proof, null, 2)}\\n\`, { mode: 0o600 });
+  emit({ kind: "provability_graded", ...report.summary, proofPath });
+  // A verifier that threw is grading infrastructure failing, not a verdict:
+  // the report stands, marked unverified, and the operator is told why.
+  if (report.proof.verdict === "unverified") {
+    process.stderr.write(
+      \`[research] WARNING: the provability check could not run (\${report.proof.error ?? "the verifier failed"}) — the report is unverified.\\n\`,
+    );
+  }
+  // A research run that cited nothing is not a success worth reporting
+  // silently: the report still ships (with its "no citations" notice), but the
+  // operator gets told on stderr, where a scripted caller will actually see it.
+  if (report.json.citations.length === 0) {
+    process.stderr.write(
+      "[research] WARNING: no citations were recorded — the report is not anchored to any fetched source.\\n",
+    );
+  }
+  // on_fail: halt — the report and its bundle are on disk; the run ends with
+  // the classified provability failure (exit 37) instead of run_done.
+  if (report.proof.verdict === "fail" && PROVABILITY.onFail === "halt") {
+    throw new RunFailedError(provabilityFailureReport(report.proof, proofPath));
+  }
+`,
+  };
+}
+
 function renderAgent(ir: IrResearchV0): string {
+  // 0.8.0 §8 — the provability report gate's pieces ("" / the pre-0.8.0 text
+  // when the spec declares no `provability:`).
+  const prov = renderResearchProvability(ir);
   // 0.6.0 PR 9f (§11.3) — the closure half of the pool: Consult / Escalate,
   // the route classifier, the guide / shadow lanes. The research row is `E`
   // for every family the schema admits on this shape, so the emitter passes
@@ -429,9 +628,9 @@ ${thredzWarning}import { existsSync, mkdirSync, readFileSync, readdirSync, statS
 import { join, resolve as resolvePath } from "node:path";
 import { createCitationTracker, newRunId } from "@crewhaus/citation-tracker";
 import { createCrawler, createSourceTool, createCiteFactTool } from "@crewhaus/crawler";
-import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
+${prov.errorsImport}
 import { decompose, type Plan } from "@crewhaus/planner";
-import { writeReport, type BranchAnswer } from "@crewhaus/report-writer";
+${prov.reportWriterImport}
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
@@ -462,7 +661,7 @@ const SPEC_GOAL = ${escapeJsonString(ir.goal)};
 const SPEC_BRANCHING = ${ir.branchingFactor};
 const SPEC_MAX_DURATION_MS = ${ir.maxDurationMs};
 const SPEC_MODEL = ${escapeJsonString(ir.agent.model)};
-const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};${hooksConst}
+const SPEC_INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};${hooksConst}${prov.constants}
 const ALLOWED_ORIGINS = ${JSON.stringify(ir.retrieve.allowedOrigins)};
 const ALLOWED_FILE_ROOTS = ${JSON.stringify(ir.retrieve.allowedFileRoots)};
 const RESEARCH_ROOT = ".crewhaus/research";
@@ -549,10 +748,7 @@ async function runOneBranch(args: {
     crawler: args.crawler,
     currentBranchId: () => currentBranch,
   });
-  const citeFactTool = createCiteFactTool({
-    tracker: args.tracker,
-    currentBranchId: () => currentBranch,
-  });
+${prov.citeFactTool}
   const tools = [sourceTool, citeFactTool, ...defaultCatalog.list()];
 
   const beforeUrls = new Set(args.tracker.listFetches().map((f) => f.url));
@@ -571,7 +767,7 @@ async function runOneBranch(args: {
   const runContext = createRunContext();
   const finalText = await runChatLoop({
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}${sandboxField(ir, "    ")}
+    instructions: ${prov.instructionsExpr},${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}${sandboxField(ir, "    ")}
     runContext,
     sessionName: ${escapeJsonString(ir.name)},
     sessionTarget: "research",
@@ -685,23 +881,7 @@ async function main(): Promise<void> {
   state.status = state.completedBranches.length === plan.subQuestions.length ? "done" : "in_progress";
   saveState(state);
 
-  const report = writeReport({
-    goal,
-    branches: state.completedBranches,
-    citations: tracker.listCitationsOrdered(),
-  });
-  const reportDir = join(RESEARCH_ROOT, runId);
-  writeFileSync(join(reportDir, "report.md"), report.markdown, { mode: 0o600 });
-  writeFileSync(join(reportDir, "report.json"), JSON.stringify(report.json, null, 2), { mode: 0o600 });
-  // A research run that cited nothing is not a success worth reporting
-  // silently: the report still ships (with its "no citations" notice), but the
-  // operator gets told on stderr, where a scripted caller will actually see it.
-  if (report.json.citations.length === 0) {
-    process.stderr.write(
-      "[research] WARNING: no citations were recorded — the report is not anchored to any fetched source.\\n",
-    );
-  }
-  emit({ kind: "run_done", runId, reportPath: join(reportDir, "report.md"), citations: report.json.citations.length });${mcpMainCleanup}
+${prov.reportBlock}  emit({ kind: "run_done", runId, reportPath: join(reportDir, "report.md"), citations: report.json.citations.length });${mcpMainCleanup}
 }
 
 main().catch(${mcp.hasAny ? "async " : ""}(err) => {

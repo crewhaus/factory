@@ -22,6 +22,9 @@
  *   - `nudge` — provability's `renderNudge`: the model's own sentences, the
  *     evidence identifiers and fixed reasons, never fetched content.
  *   - `persist` — the bundle store under the proofs root, mode 0600.
+ *   - `skill` — the rendered `provability` skill, which the runtime hands a
+ *     Task child as read-only guidance (design §8, `./child-skill`); absent
+ *     when this build ships none.
  *
  * `level`, `onFail`, `maxRetries`, `threshold`, `escalateTo` and `render`
  * are the IR's resolved values, verbatim.
@@ -43,6 +46,7 @@ import {
 } from "@crewhaus/provability";
 import type { ProvabilityTurn, RunProvability } from "@crewhaus/runtime-core";
 import { tenantRootOf } from "@crewhaus/tool-proof";
+import { provabilitySkillText } from "./child-skill";
 import { gateEvidence } from "./evidence";
 import {
   type HeadDecision,
@@ -52,7 +56,7 @@ import {
 } from "./head";
 import { createWaiverJudge } from "./judge";
 import { type GateCatalog, catalogReplay } from "./replay";
-import { activeTenant, gateProofsRoot, gateSessionRoot } from "./roots";
+import { activeTenant, fencedDir, gateProofsRoot, gateSessionRoot } from "./roots";
 
 const logger = createLogger({ bindings: { module: "evaluation-service" } });
 
@@ -73,6 +77,12 @@ export type ProvabilityGateOptions = {
   /** Test seam: the waiver judge's adapter. */
   readonly judgeAdapter?: CategoricalJudgeOptions["adapter"];
   readonly now?: () => Date;
+  /**
+   * The proofs root, when it is not the harness's (see
+   * `WireEvaluationDeps.proofsRoot`): where `proof:` citations resolve and
+   * bundles persist. Fenced to the active tenant like the default.
+   */
+  readonly proofsRoot?: string;
 };
 
 /**
@@ -163,6 +173,10 @@ export function buildRunProvability(
   opts: ProvabilityGateOptions,
 ): RunProvability {
   const { cwd, specName } = opts;
+  const proofsRootOf = (tenant: ReturnType<typeof activeTenant>): string =>
+    opts.proofsRoot !== undefined
+      ? fencedDir(opts.proofsRoot, tenant)
+      : gateProofsRoot(cwd, specName, tenant);
   const customHead = opts.resolveHead;
   // The default guarded HEAD shares one process-wide cache, so a session
   // asks once even where the gates are wired per turn (the channel bot).
@@ -175,7 +189,7 @@ export function buildRunProvability(
 
   const verify = async (turn: ProvabilityTurn): Promise<ProofBundle> => {
     const tenant = activeTenant();
-    const proofs = gateProofsRoot(cwd, specName, tenant);
+    const proofs = proofsRootOf(tenant);
     const sessionRootDir = gateSessionRoot(opts.sessionRootDir, tenant);
     const evidence = await gateEvidence({
       scope: config.scope,
@@ -230,6 +244,9 @@ export function buildRunProvability(
     return verifyDocument(turn.finalText, verifyOptions);
   };
 
+  // §8 — rendered once per wiring: read-only guidance for Task children.
+  const skill = provabilitySkillText(config);
+
   const renderBundle =
     config.render === "none"
       ? undefined
@@ -253,7 +270,8 @@ export function buildRunProvability(
     ...(renderBundle !== undefined ? { renderBundle } : {}),
     nudge: renderNudge,
     persist: async (bundle, at) =>
-      createBundleStore({ rootDir: gateProofsRoot(cwd, specName, activeTenant()) }).put(bundle, at),
+      createBundleStore({ rootDir: proofsRootOf(activeTenant()) }).put(bundle, at),
     ...(opts.onBundle !== undefined ? { onBundle: opts.onBundle } : {}),
+    ...(skill !== undefined ? { skill } : {}),
   };
 }

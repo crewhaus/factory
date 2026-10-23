@@ -25,6 +25,7 @@ import {
   extractReqMappingLines,
   runConversationalInterview,
 } from "./init-conversation";
+import { provabilityQuestion } from "./init-interactive";
 import { renderCliFailure } from "./run-failure";
 
 const TMP_ROOTS: string[] = [];
@@ -631,6 +632,39 @@ describe("runConversationalInterview — resume", () => {
     expect(askUses.length).toBe(2);
   });
 
+  test("0.8.0 §11 — --provability: the interviewer is told the answer, not to ask the question", async () => {
+    const run = async (provability?: "grounded"): Promise<string> => {
+      const main = makeScriptedAdapter([
+        [{ type: "tool_use", id: "tu_emit", name: "emit_spec", input: { yaml: VALID_YAML } }],
+        [{ type: "text", text: "Done." }],
+      ]);
+      const input = new PassThrough();
+      const pacer = paceStdin(input, ["A cli support bot.\n"]);
+      try {
+        await runConversationalInterview({
+          targetDir: newTargetDir("prov-flag"),
+          specName: "init-prov",
+          model: "test-model",
+          log: () => {},
+          _adapter: main.adapter,
+          input,
+          homeDir: newTargetDir("home-prov-flag"),
+          ...(provability !== undefined ? { provability } : {}),
+        });
+      } finally {
+        pacer.restore();
+      }
+      return systemTexts(main.requests()[0]).join("\n");
+    };
+    const told = await run("grounded");
+    expect(told).toContain("Proof: the user already chose `grounded`");
+    expect(told).toContain("Do NOT ask how much proof answers should carry.");
+    expect(told).not.toContain("Proof (ONE question");
+    const asked = await run();
+    expect(asked).toContain("Proof (ONE question");
+    expect(asked).not.toContain("the user already chose");
+  });
+
   test("--resume with no saved interview fails with a start-fresh hint", async () => {
     const targetDir = newTargetDir("resume-none");
     const homeDir = newTargetDir("home-resume-none");
@@ -849,6 +883,9 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
       // An empty answer is a NO, so the emitted spec is the historical
       // single-model one.
       "run cheap drafts with a stronger model checking them (a hybrid cascade)? [y/N]: ",
+      // 0.8.0 §11 — the ONE proof question, asked last; end of input takes the
+      // cli default (off), which writes no block.
+      provabilityQuestion("off"),
       `wrote ${targetFile}\n`,
       "next: cd scripted-bot && crewhaus run crewhaus.yaml\n",
     ];
@@ -860,6 +897,8 @@ describe("crewhaus init --interactive — scripted fallback + non-TTY gating (su
     // Declining the hybrid question keeps the pre-0.6.0 single-model spec.
     expect(yaml).not.toContain("models:");
     expect(yaml).not.toContain("model_pool:");
+    // ...and the default proof answer keeps it free of a provability block.
+    expect(yaml).not.toContain("provability");
   }, 20_000);
 
   test("0.6.0 §9.2 — answering the hybrid question YES emits the registry + cascade", async () => {

@@ -50,6 +50,18 @@ export type WatchmeObservation = {
     readonly faithfulness?: number;
     readonly hallucinationRate?: number;
     readonly vacuous?: boolean;
+    /**
+     * 0.8.0 (design/0.8.0-provability-release.md §9.3) — present when the
+     * session was gated by `provability:`: the gate's own verdicts, exact
+     * per turn, folded from its `provability_graded` lines. When at least one
+     * gated turn was VERIFIED (`turns > unverified`), `claims` / `grounded` /
+     * `faithfulness` above are the gate's claim / met counts over those turns
+     * rather than the heuristic roll-up. A session whose every gated turn
+     * stood unverified (the verifier threw — design §5.1, never a pass) keeps
+     * the heuristic roll-up, or none. Absent on ungated sessions and on
+     * digests written before 0.8.0 (additive).
+     */
+    readonly provability?: WatchmeProvability;
   };
   readonly quality?: {
     readonly ratings: number;
@@ -60,6 +72,30 @@ export type WatchmeObservation = {
   /** Cluster keys only (redacted upstream). */
   readonly intentKeys: ReadonlyArray<string>;
   readonly feedback?: { readonly up: number; readonly down: number };
+};
+
+/**
+ * 0.8.0 §9.3 — one session's provability digest: the standing (last) pass of
+ * every turn the gate graded. Counts only — no claim text, so nothing here
+ * needs redaction.
+ */
+export type WatchmeProvability = {
+  /** The floor the session's turns were graded at (the most common, if several). */
+  readonly level: "cited" | "grounded" | "checked" | "proven";
+  /** The WEAKEST standing answer's achieved rung — how far the session fell short. */
+  readonly achieved: "none" | "cited" | "grounded" | "checked" | "proven";
+  /** Unmet claims across the standing passes. */
+  readonly unmet: number;
+  /** Turns the gate graded. */
+  readonly turns: number;
+  /** Of those, turns whose standing pass failed (after every retry). */
+  readonly failing: number;
+  /**
+   * Of those, turns whose standing pass stood UNVERIFIED — the verifier
+   * threw, nothing was measured, and the turn counts toward neither
+   * `failing` nor the claim counts. Present only when non-zero (additive).
+   */
+  readonly unverified?: number;
 };
 
 /**

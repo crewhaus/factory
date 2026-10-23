@@ -47,6 +47,12 @@
  *     and the parent's, so `budget`, `cost-summary` and Hangar never saw it;
  *   - `sub_agent_start` / `sub_agent_end` carry the child's `model` and
  *     `profile`.
+ *
+ * 0.8.0 §8 — a parent whose answers are gated by `provability:` threads its
+ * floor and rendered skill to the child as READ-ONLY guidance in the child's
+ * instructions (`childProvabilityGuidance`), so a researcher child cites the
+ * way the parent's gate reads. The child is never gated itself. A federated
+ * child runs its own peer's spec and is not told.
  */
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
 import {
@@ -57,6 +63,7 @@ import {
   type SubAgentDefinition,
   type SubAgentFailure,
   type SubAgentMessage,
+  type SubAgentProvabilitySeam,
   type SubAgentResult,
   type ToolCallRecord,
   createIsolatedContext,
@@ -238,6 +245,39 @@ export function resolveChildLoopPlan(
 }
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §8) — what a child is told when
+ * its parent's answers are gated. Read-only guidance, never a gate: only the
+ * PARENT's final text is verified, and the parent's evidence index already
+ * walks child session logs, so a source a child fetched grounds the parent's
+ * citation of it — but only if the child hands the source back. So the child
+ * learns the floor and how to cite (a `[n]` marker on each claim and a
+ * definitions block naming what it fetched, read or computed), followed by
+ * the parent's rendered `provability` skill when its wiring has one.
+ *
+ * It lands in the child's own instructions (its system region), after the
+ * definition's: the text is first-party — this framing plus a skill the
+ * parent's composition root rendered from the spec's lowered block, with no
+ * tool, model or channel content in it — so it crosses no trust boundary and
+ * takes no classification pass, exactly as the instructions themselves do.
+ */
+export function childProvabilityGuidance(seam: SubAgentProvabilitySeam): string {
+  const skill = seam.skill?.trim() ?? "";
+  return [
+    `<provability_guidance level="${seam.level}">`,
+    `Your reply is evidence for an answer your parent agent must prove at the \`${seam.level}\` floor. Only the parent's final answer is checked, and it can cite only what you hand back: mark each factual claim in your reply with a [n] marker and end with a definitions block — \`[n]: <the URL or workspace path you fetched or read>\`, or \`[n]: tool:<toolUseId>\` for a value a tool computed. Cite only sources you fetched or read in this task.`,
+    ...(skill !== "" ? ["", skill] : []),
+    "</provability_guidance>",
+  ].join("\n");
+}
+
+/** The child's instructions: the plan's, plus the provability guidance under a gated parent. */
+function childInstructions(parent: ParentRunHandle, plan: ChildLoopPlan): string {
+  return parent.provability === undefined
+    ? plan.instructions
+    : `${plan.instructions}\n\n${childProvabilityGuidance(parent.provability)}`;
+}
+
+/**
  * Spawn one sub-agent run.
  *
  * Failure semantics (v0.3.0 §7.1):
@@ -277,9 +317,12 @@ export async function spawnSubAgent(
     model: plan.model,
     ...(plan.profile !== undefined ? { profile: plan.profile } : {}),
   };
+  // 0.8.0 §8 — under a gated parent the child's instructions carry the
+  // read-only provability guidance (`childProvabilityGuidance`).
+  const instructions = childInstructions(parent, plan);
   const isoOpts: CreateIsolatedContextOptions = {
     name: opts.def.name,
-    instructions: plan.instructions,
+    instructions,
     tools: opts.childTools,
     model: plan.model,
     ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
@@ -361,7 +404,7 @@ export async function spawnSubAgent(
       // arm (`inheritRouting`) / a pinned allowed profile, with the child's own
       // params, routing quartet and `budget_share` sub-cap spread below.
       model: plan.model,
-      instructions: plan.instructions,
+      instructions,
       runContext: child.runContext,
       sessionName: opts.def.name,
       sessionTarget: "subagent",
@@ -396,6 +439,10 @@ export async function spawnSubAgent(
       //     `ledger: false` plus the absent onPlanDirty/onHandoff closures
       //     mean a child never writes the parent's plan-store state
       //     through the seam.
+      //   - provability (0.8.0 §8): READ-ONLY — the guidance rides
+      //     `instructions` above; the child gets no `provability` gate of
+      //     its own (only the parent's final text is gated), and its return
+      //     is classified at `subagent` below exactly as before.
       ...(parent.memory !== undefined ? { memory: parent.memory } : {}),
       ...(parent.skills !== undefined && parent.skills.length > 0 ? { skills: parent.skills } : {}),
       ...(parent.failureTaxonomy !== undefined ? { failureTaxonomy: parent.failureTaxonomy } : {}),

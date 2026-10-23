@@ -21,6 +21,7 @@
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
+    "@crewhaus/provability": "workspace:*",
     "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",

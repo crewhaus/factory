@@ -80,6 +80,25 @@ describe("watchme store — observations append/read", () => {
     expect(read[1]?.turnCount).toBe(5);
   });
 
+  test("0.8.0 §9.3 — a gated session's factuality.provability digest round-trips verbatim", () => {
+    const store = openWatchmeStore(newRoot(), { specName: "helpdesk" });
+    const provability = {
+      level: "grounded",
+      achieved: "cited",
+      unmet: 2,
+      turns: 3,
+      failing: 1,
+    } as const;
+    store.appendObservation(
+      obsFixture({ factuality: { claims: 6, grounded: 4, faithfulness: 0.75, provability } }),
+    );
+    store.appendObservation(obsFixture({ sessionId: "sess_b000000000000000" }));
+    const [gated, plain] = store.readObservations();
+    expect(gated?.factuality?.provability).toEqual(provability);
+    // Additive: an ungated digest carries no key at all.
+    expect(plain?.factuality).toBeUndefined();
+  });
+
   test("torn and garbage lines are skipped, not fatal", () => {
     const root = newRoot();
     const store = openWatchmeStore(root, { specName: "helpdesk" });

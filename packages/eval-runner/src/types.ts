@@ -3,6 +3,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader } from "@crewhaus/eval-grader";
 import type { JudgeUsageSink } from "@crewhaus/eval-judge";
 import type { Event as TranscriptEvent } from "@crewhaus/event-log";
+import type { ProofBundle, ProvabilityLevel } from "@crewhaus/provability";
 import type { RunContext } from "@crewhaus/run-context";
 import type { runChatLoop } from "@crewhaus/runtime-core";
 import type { ModelRole, TraceEvent } from "@crewhaus/trace-event-bus";
@@ -42,6 +43,14 @@ export type AgentInvokeResult = {
   readonly transcript?: ReadonlyArray<TranscriptEvent>;
   /** Same as transcript — invoker can short-circuit the bus subscription. */
   readonly events?: ReadonlyArray<TraceEvent>;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §9.1) — the provability
+   * gate's STANDING bundle for this sample (its last pass). The default
+   * invoker supplies it whenever the gate is wired; a hand-wired invoker may
+   * too. Absent ⇒ `runSample` falls back to the bundle the run's last
+   * `provability_graded` event points at, else the sample carries none.
+   */
+  readonly proof?: ProofBundle;
 };
 
 /**
@@ -743,6 +752,12 @@ export type EvalRunSummary = {
     /** 0.6.0 §6.1 — how the run was routed (see {@link EvalRoutingConfig}).
      *  Absent on `routing: "static"` runs. */
     readonly routing?: EvalRoutingConfig;
+    /**
+     * 0.8.0 §9.1 — the provability floor `--provability` imposed on this run
+     * ({@link RunEvalOptions.provability}). Absent when the run measured the
+     * spec's own block (or none), keeping un-flagged results byte-identical.
+     */
+    readonly provability?: ProvabilityLevel;
   };
   readonly outDir: string;
 };
@@ -974,6 +989,27 @@ export type RunEvalOptions = {
    * `<cwd>/.crewhaus`, the root a `crewhaus run` harness writes.
    */
   readonly routingRootDir?: string;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §9.1) — `crewhaus eval
+   * --provability <level>`: measure the ladder at a floor WITHOUT editing the
+   * spec. The run's IR gets the spec's `provability:` block with its `level`
+   * replaced — or, when the spec declares none, the block the compiler lowers
+   * for the shorthand `provability: <level>` (every default resolved) — so
+   * the in-loop gate runs exactly as it would had the spec said so: retries,
+   * nudges, proof tools, the `provability` skill, footers. The six
+   * `provability.*` graders are appended to the grader set (a name the
+   * graders file already carries keeps its own entry) as requirements
+   * BESIDE the file's `combine:` policy — the sample passes only when the
+   * policy passes and each bar holds — with `costPerProvenClaim` reported
+   * only ({@link GraderEntry.role}). They grade at that floor, unless a
+   * sample's `metadata.provability.level` sets its own, in which case that
+   * sample's gate runs at its own floor too. {@link pricing} prices the
+   * gate's re-runs when no cost-tracker metered them.
+   * Recorded as `config.provability` in run.json/results.json and part of
+   * the resume identity (resuming across a different floor is refused).
+   * Absent ⇒ the spec's own block, if any, exactly as before.
+   */
+  readonly provability?: ProvabilityLevel;
 };
 
 /** The chat-loop seam under {@link RunEvalOptions.chatLoop}. */
@@ -985,4 +1021,17 @@ export type GraderEntry = {
   /** A4 — this grader's contribution under `combine: weighted` (positive,
    *  default 1). Ignored by the `all`/`any` combination modes. */
   readonly weight?: number;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §9.1) — how this entry joins
+   * the sample's `overall`. Absent (every graders-file entry): under the
+   * graders config's `combine:` policy, exactly as before.
+   *   - `"requirement"` — OUTSIDE the policy: the sample passes only when the
+   *     policy passes AND this grader passes, and its score never enters the
+   *     policy's score (its scale and direction are its own).
+   *   - `"report"` — recorded in `perGrader` only, never part of `overall`.
+   * The six graders `--provability` appends use these: a flag must not let a
+   * vacuous pass, a lower-is-better rate or a reported dollar figure vote in
+   * a `combine: any` / `weighted` policy written for the user's own graders.
+   */
+  readonly role?: "requirement" | "report";
 };

@@ -11,6 +11,9 @@ name: Release
 #   • GHCR           → ghcr.io/crewhaus/<target> (item 47 — one image per
 #                      target shape with a Dockerfile; the pushed digests are
 #                      recorded back into docker/digests.json on main)
+#   • GHCR           → ghcr.io/crewhaus/sandbox-<id> (0.8.0 — the provability
+#                      proof checkers' sandbox images, z3 and lean4; not target
+#                      shapes, so no digests.json entry)
 #
 # Trigger: push a tag like `v0.1.3`, or run manually with a version input.
 #
@@ -617,3 +620,119 @@ jobs:
           done
           echo "::error::could not push digests.json to main after 3 attempts"
           exit 1
+
+  # ── Sandbox images (0.8.0) ──────────────────────────────────────────────────
+  # The provability checkers' curated images (design/0.8.0-provability-release.md
+  # §6.4): ghcr.io/crewhaus/sandbox-z3 and ghcr.io/crewhaus/sandbox-lean4, built
+  # from packages/sandbox-image-<id>/Dockerfile. They are NOT target shapes:
+  # not in docker-images' TARGET_SHAPES or the docker matrix above, and
+  # record-image-digests would reject them. `@crewhaus/sandbox-image-<id>` pins
+  # the tag the checker runs instead (a constant, bumped when the image
+  # changes), so a release whose version differs from that pin still pushes
+  # its own tag without moving the checker.
+
+  sandbox-images:
+    name: Publish sandbox images to GHCR
+    needs: build
+    runs-on: ubuntu-latest
+    # The Lean toolchain download is ~0.6 GB; a stalled one must not hold the
+    # release for GitHub's 6 h default.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push ghcr.io/crewhaus/sandbox-<id>
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [z3, lean4]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Build, smoke-test, push
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.build.outputs.version }}
+        # Built into the runner's daemon first and RUN the way @crewhaus/sandbox
+        # runs it (no network, read-only root, a /tmp tmpfs, uid 65532), on the
+        # checker's own argv and stdin, so an image whose shipped stage cannot
+        # start is never pushed — the Dockerfile's own checks run in its fetch
+        # stage, not in the distroless one that ships. The build context is
+        # the package directory, which its .dockerignore empties: the images
+        # are made of verified release downloads alone. `:latest` only moves
+        # for stable X.Y.Z, exactly as in the docker job. Single-arch (the
+        # runner's amd64) like the docker job: arm64 hosts run it emulated
+        # until that job's documented multi-arch follow-up lands, and the
+        # Dockerfiles already pick their download by TARGETARCH for it.
+        #
+        # A published version tag is never replaced (unlike the docker job's
+        # target images): the checker runs it by tag, and each release's
+        # adapter was proven against the solver in that exact image — the smt
+        # reserved-name probe and the #print axioms parsing in
+        # packages/proof-checker/src/sandbox.live.test.ts. Re-dispatching an
+        # old version from a newer tree would otherwise swap in a solver that
+        # version's adapter never met. So an existing tag skips the job (a
+        # re-run stays green); to republish, delete that package version on
+        # GHCR first. Any failed inspect — an absent tag, or a registry that
+        # cannot answer, which GHCR does not let us tell apart reliably — goes
+        # on to push, so a first publish is never blocked; the error's first
+        # line is logged. Because the guard keys on the version tag alone, that
+        # tag is pushed LAST: a push that fails part way (a 502 on `:latest`)
+        # leaves it absent, so the re-run rebuilds and pushes every tag instead
+        # of going green with `:latest` still on the previous release.
+        #
+        # Each smoke run keeps its exit status (`|| CODE=$?`) rather than
+        # leaving it to the step's `bash -e`: lean exits 1 whenever it reports
+        # an error, and errexit at the assignment would end the job before the
+        # output it captured, or any ::error:: line, reached the log.
+        run: |
+          REF="ghcr.io/crewhaus/sandbox-$IMAGE:$VERSION"
+          if INSPECT="$(docker buildx imagetools inspect "$REF" 2>&1)"; then
+            echo "::warning::$REF is already published; not rebuilding or overwriting it (delete that package version on GHCR to republish)"
+            exit 0
+          fi
+          echo "$REF is not published yet ($(printf '%s' "$INSPECT" | head -n 1))"
+          TAGS=(--tag "$REF")
+          LATEST=""
+          if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            LATEST="ghcr.io/crewhaus/sandbox-$IMAGE:latest"
+            TAGS+=(--tag "$LATEST")
+          else
+            echo "pre-release version $VERSION — not moving :latest"
+          fi
+          docker buildx build \
+            --file "packages/sandbox-image-$IMAGE/Dockerfile" \
+            "${TAGS[@]}" \
+            --load \
+            "packages/sandbox-image-$IMAGE"
+          RUN=(docker run --rm -i --network=none --read-only --tmpfs /tmp
+            --security-opt no-new-privileges --user 65532:65532 "$REF")
+          CODE=0
+          case "$IMAGE" in
+            z3)
+              OUT="$(printf '(declare-const x Int)\n(assert (> x 1))\n(assert (not (> x 0)))\n(check-sat)\n' \
+                | "${RUN[@]}" z3 -in)" || CODE=$?
+              [ "$CODE" = 0 ] || { echo "::error::z3 smoke exited $CODE: $OUT"; exit 1; }
+              [ "$OUT" = "unsat" ] || { echo "::error::z3 smoke printed '$OUT', expected 'unsat'"; exit 1; } ;;
+            lean4)
+              # bv_decide too: it runs the image's cadical, whose C++ runtime
+              # only the shipped stage can show is there.
+              OUT="$(printf '%s\n' 'import Std' \
+                'theorem smoke : 2 + 2 = 4 := by decide' \
+                'theorem smoke_sat : ∀ x y : BitVec 8, x * y = y * x := by intro x y; bv_decide' \
+                '#print axioms smoke' '#print axioms smoke_sat' \
+                | "${RUN[@]}" lean --stdin --json)" || CODE=$?
+              [ "$CODE" = 0 ] || { echo "::error::lean smoke exited $CODE: $OUT"; exit 1; }
+              case "$OUT" in
+                *'"severity":"error"'*) echo "::error::lean smoke did not check: $OUT"; exit 1 ;;
+                *"'smoke' does not depend on any axioms"*"'smoke_sat' depends on axioms"*) ;;
+                *) echo "::error::lean smoke did not check: $OUT"; exit 1 ;;
+              esac ;;
+            *) echo "::error::no smoke test for sandbox image '$IMAGE'"; exit 1 ;;
+          esac
+          echo "$REF smoke OK"
+          if [ -n "$LATEST" ]; then docker push "$LATEST"; fi
+          docker push "$REF"

@@ -16,6 +16,7 @@ import {
   Z3_IMAGE_REF,
   Z3_IMAGE_REPO,
   Z3_IMAGE_TAG,
+  Z3_SOLVER_VERSION,
   ensureZ3SandboxImage,
   registerZ3SandboxImage,
 } from "./index";
@@ -37,6 +38,8 @@ describe("registerZ3SandboxImage (T1 + T2)", () => {
     expect(Z3_IMAGE_REF).toBe("ghcr.io/crewhaus/sandbox-z3:0.8.0");
     expect(Z3_DEFAULT_ENTRYPOINT).toEqual(["z3", "-in"]);
     expect(Z3_HEALTHCHECK_ARGV).toEqual(["z3", "--version"]);
+    // The solver the image carries; the Dockerfile test holds its ARG to this.
+    expect(Z3_SOLVER_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   test("registerZ3SandboxImage() registers an image with the right shape", () => {
@@ -113,6 +116,7 @@ describe("Z3-shape T2 contract — round-trip via noop sandbox", () => {
         timeoutMs: 120_000,
       });
       expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain(`Z3 version ${Z3_SOLVER_VERSION} `);
       await sandbox.close();
     },
     180_000,

@@ -163,6 +163,7 @@ import {
   isJobKind,
   jobArgv,
 } from "./process";
+import { isProofRunId, proofTenants, proofView } from "./proofs";
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import {
@@ -2094,6 +2095,72 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       });
     }
 
+    // 0.8.0 (design §12 item 5) — the proof bundles a run's provability gate
+    // persisted, keyed by the session id a gateway run answers with. Fleet-
+    // wide (a session id names its harness only implicitly); `?harness=`
+    // narrows it to one registry row. Each harness's bundles are masked with
+    // that harness's OWN scrubber — claim text is model prose and an excerpt
+    // is a fetched body's words — and the whole payload once more on the way
+    // out. 404 when the run persisted none.
+    if (head === "runs" && rest.length === 2 && rest[1] === "proof") {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      const runId = rest[0] as string;
+      if (!isProofRunId(runId)) {
+        throw new HttpError(400, "invalid run id — expected the run's session id (sess_<16 hex>)");
+      }
+      const scope = url.searchParams.get("harness");
+      const entries =
+        scope === null
+          ? registry.list().filter((e) => e.missingSince === null && existsSync(e.dir))
+          : (() => {
+              const entry = entryOr404(scope);
+              liveDirOr404(entry);
+              return [entry];
+            })();
+      // A managed harness's turns run under a tenant, and its gate files
+      // bundles under that tenant's root, not `.crewhaus/proofs`.
+      const harnesses = entries.map((e) => {
+        const tenants = proofTenants(e.dir, e.target);
+        return {
+          id: e.id,
+          dir: e.dir,
+          specName: e.specName,
+          ...(tenants !== undefined ? { tenants } : {}),
+        };
+      });
+      const view = proofView(harnesses, runId);
+      if (view.bundles.length === 0 && view.skipped.length === 0) {
+        const outside = view.tenantRootsNotRead ?? [];
+        throw new HttpError(
+          404,
+          outside.length === 0
+            ? `no proof bundle persisted for ${runId}`
+            : `no proof bundle persisted for ${runId} under a harness directory — a managed harness files its bundles under its tenants root (${[
+                ...new Set(outside.map((o) => o.root)),
+              ].join(
+                ", ",
+              )}), outside the harness directory, which Hangar does not read: run \`crewhaus provability show --session ${runId}\` from the harness directory, or set CREWHAUS_TENANTS_ROOT inside it`,
+        );
+      }
+      // One scrubber per harness (each reads that harness's `.env` chain),
+      // not one per bundle row.
+      const scrubs = new Map<string, TextScrubber>();
+      const scrubFor = (id: string): TextScrubber => {
+        let scrub = scrubs.get(id);
+        if (scrub === undefined) {
+          const dir = harnesses.find((h) => h.id === id)?.dir;
+          scrub = dir !== undefined ? harnessScrub(dir) : (text: string): string => text;
+          scrubs.set(id, scrub);
+        }
+        return scrub;
+      };
+      const masked = {
+        ...view,
+        bundles: view.bundles.map((row) => maskDeep(row, scrubFor(row.harnessId))),
+      };
+      return json(maskDeep(masked, fleetScrub()));
+    }
+
     if (head === "h" && rest.length >= 1) {
       const entry = entryOr404(rest[0] as string);
       if (rest.length === 1) {
@@ -2145,6 +2212,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET  /api/review      POST /api/h/:id/review/:itemId",
       "GET  /api/activity[?since=]",
       "GET  /api/jobs        POST /api/h/:id/jobs {kind}",
+      "GET  /api/runs/:sessionId/proof[?harness=:id]   (0.8.0 provability bundles)",
       "--- M4 ---",
       "GET  /api/health      GET  /api/h/:id/health",
       "GET  /api/onboarding  POST /api/onboarding/demo {starter,dir}",

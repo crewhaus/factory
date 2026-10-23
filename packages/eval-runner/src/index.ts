@@ -146,6 +146,7 @@
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isRunFailedError } from "@crewhaus/errors";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader, PerModelJudgeOverride } from "@crewhaus/eval-grader";
 import { perModelArmKey, perModelOverrideFor } from "@crewhaus/eval-grader";
@@ -155,6 +156,7 @@ import {
   loadCategoricalRubric,
   loadRubric,
 } from "@crewhaus/eval-judge";
+import { provabilitySkills } from "@crewhaus/evaluation-service";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
 import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
@@ -168,6 +170,13 @@ import { aggregate } from "./aggregate";
 import { warnUnconsumedCombinePolicy } from "./combine-warnings";
 import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
 import { RunnerError } from "./errors";
+import {
+  provabilityGraderEntries,
+  sampleGateIr,
+  wireSampleProvability,
+  withGateTools,
+  withProvabilityFloor,
+} from "./provability";
 import {
   type ResumeRouting,
   assertResumeCompatible,
@@ -203,6 +212,7 @@ import {
 import { DEFAULT_SCORE_EPSILON, meanCI95, tCritical975, wilsonCI95 } from "./stats";
 import {
   TOOL_REPLAY_MISS_MARKER,
+  TOOL_REPLAY_RESTORE_MARKER,
   ToolRecorder,
   type ToolReplayMissPolicy,
   ToolReplayer,
@@ -367,6 +377,7 @@ export {
 export {
   TOOL_RECORDING_FILENAME,
   TOOL_REPLAY_MISS_MARKER,
+  TOOL_REPLAY_RESTORE_MARKER,
   ToolRecorder,
   ToolReplayer,
   canonicalJson,
@@ -377,8 +388,11 @@ export {
   replayingTools,
   toolRecordKey,
   toolReplayMissError,
+  toolReplayRestoreError,
   type LoadedToolRecording,
   type ReusedRecordingEntry,
+  type ToolCallEffects,
+  type ToolEffectsByName,
   type ToolRecord,
   type ToolRecorderOptions,
   type ToolReplayMissPolicy,
@@ -408,6 +422,15 @@ export {
 export { aggregate };
 export { RunnerError };
 export { runSample };
+// 0.8.0 §9.1 — the provability eval layer's runner half (see ./provability).
+export {
+  PROOF_CHECK_TOOL,
+  PROOF_FILENAME,
+  defaultProvabilityBlock,
+  proofCassetteEffects,
+  standingBundleFromEvents,
+  withProvabilityFloor,
+} from "./provability";
 
 const DEFAULT_CONCURRENCY = 4;
 
@@ -473,8 +496,12 @@ export function resolveEvalOutDir(runId: string, optsOutDir?: string): string {
  * the summary itself are also persisted under `outDir`.
  */
 export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
-  const { ir, dataset, compiledGraders } = args;
+  const { dataset, compiledGraders } = args;
   const opts = args.opts ?? {};
+  // 0.8.0 §9.1 — `--provability <level>`: the IR this run measures carries the
+  // floor (the spec's block re-levelled, or the shorthand's defaults). Absent
+  // ⇒ `args.ir` itself, so an un-flagged run is untouched.
+  const ir = withProvabilityFloor(args.ir, opts.provability);
 
   // NEW-HUNT-4 — record and replay are two directions of one seam; asking for
   // both at once has no coherent meaning, so refuse before any spend.
@@ -536,7 +563,13 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // `opts.graderRegistry` still wins wholesale.
   let graderRegistry: GraderLookup | undefined = opts.graderRegistry;
   if (graderRegistry === undefined && compiledGraders.some((g) => g.registrySpec !== undefined)) {
-    graderRegistry = await defaultGraderRegistry(opts.cwd !== undefined ? { cwd: opts.cwd } : {});
+    // 0.8.0 §9.1 — the run's pricing seam reaches the registry's
+    // provability.costPerProvenClaim, so a spec-declared gate's re-runs are
+    // priced like a `--provability` run's.
+    graderRegistry = await defaultGraderRegistry({
+      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+      ...(opts.pricing !== undefined ? { pricing: opts.pricing } : {}),
+    });
   }
 
   // G47 — judge calibration: load lazily, only when some `llm_judge` grader
@@ -649,8 +682,20 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // did before: same judge, same cut, same weight, same arm-less usage sink.
   // With an arm it applies that arm's `per_model:` override (judge / cut /
   // weight) and the calibration entry pinned for the (arm, judge) pair.
-  const buildGraders = (arm: string | undefined): GraderEntry[] =>
-    compiledGraders.map((g) => {
+  // 0.8.0 §9.1 — under `--provability` the six `provability.*` graders join
+  // every grader set (base and per-arm alike) as requirements beside the
+  // file's `combine:` policy (cost: a report) — see provabilityGraderEntries;
+  // a name the graders file already carries keeps its own entry. The run's
+  // pricing seam prices the gate's re-runs when no cost-tracker metered them.
+  const provabilityGraders =
+    opts.provability !== undefined
+      ? await provabilityGraderEntries(
+          compiledGraders,
+          opts.pricing !== undefined ? { pricing: opts.pricing } : {},
+        )
+      : [];
+  const buildGraders = (arm: string | undefined): GraderEntry[] => [
+    ...compiledGraders.map((g) => {
       if (g.judgeSpec) {
         // 0.6.0 §6.2 — this arm's override, already merged (file-level under
         // grader-level) at parse time. `undefined` for every arm the map does
@@ -775,7 +820,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         };
       }
       return { name: g.name, grader: g.grader, weight: g.weight };
-    });
+    }),
+    ...provabilityGraders,
+  ];
   const graders: GraderEntry[] = buildGraders(undefined);
 
   // A4/A5 — the graders config's top-level `combine:` policy rides on the
@@ -1108,6 +1155,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       // a pool, and a routed run resumed against a different arm or a
       // different frozen snapshot is measuring something else again.
       ...resumeRoutingIdentity,
+      // 0.8.0 §9.1 — and so is the provability floor `--provability` imposed.
+      ...(opts.provability !== undefined ? { provability: opts.provability } : {}),
     });
   }
   await Bun.write(
@@ -1140,6 +1189,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         // 0.6.0 §6.1 — how the run was ROUTED (absent = static), so the resume
         // identity guard can refuse a static→routed (or cross-arm) resume.
         ...resumeRoutingIdentity,
+        // 0.8.0 §9.1 — the floor `--provability` imposed (absent = the spec's).
+        ...(opts.provability !== undefined ? { provability: opts.provability } : {}),
         // NEW-HUNT-6 — this directory was resumed; `runId`/`startedAt` above
         // are the ORIGINAL run's. One ISO stamp per attempt, appended (the
         // typed round-trip lives in `ResumeManifest.resumedAt`), so a run
@@ -1262,7 +1313,11 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         // a `failure_taxonomy` entry that declares the class terminal (G54).
         const runTrial = async (trial: number): Promise<SampleResult> => {
           const seed = opts.seed !== undefined ? opts.seed + (trial - 1) : undefined;
+          // 0.8.0 §9.1 — whether the attempt just run ended in the gate's
+          // own `on_fail: halt` (a RunFailedError of class "provability").
+          let gateHalted = false;
           const runOnce = async () => {
+            gateHalted = false;
             const r = await runSample({
               sample,
               invoker,
@@ -1276,6 +1331,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               ...(trial > 1 ? { trial } : {}),
               // 0.6.0 §6.1 — served-model attribution is a ROUTED-run field.
               ...(routed !== undefined ? { routed: true } : {}),
+              onInvokerError: (err) => {
+                gateHalted = isRunFailedError(err) && err.report.class === "provability";
+              },
             });
             // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
             // the budget cap (noise-retry attempts included — those tokens
@@ -1293,10 +1351,20 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           // NEW-HUNT-4 — a replay MISS is deterministic by construction (same
           // key, same cassette), so the one blunt noise retry would only buy a
           // second identical failure at a second model call's price. Terminal
-          // for exactly the reason a `recovery: fail` taxonomy class is.
-          if (first.error?.includes(TOOL_REPLAY_MISS_MARKER) === true) {
+          // for exactly the reason a `recovery: fail` taxonomy class is. So is
+          // a recorded call whose state could not be put back (same entry).
+          if (
+            first.error?.includes(TOOL_REPLAY_MISS_MARKER) === true ||
+            first.error?.includes(TOOL_REPLAY_RESTORE_MARKER) === true
+          ) {
             return classifyFailure(first);
           }
+          // 0.8.0 §9.1 — nor is a provability `halt`: it is the gate's
+          // terminal VERDICT on this sample, not noise. A second attempt
+          // would double the spend on exactly the failing samples and swap
+          // the verdict for whatever a re-roll produces (an answer with no
+          // claims passes vacuously), erasing the halt.
+          if (gateHalted) return classifyFailure(first);
           if (first.error !== undefined && taxonomy.length > 0) {
             const named = matchNamedFailure({ message: first.error }, taxonomy);
             if (named !== undefined && named.recovery === "fail") {
@@ -1558,6 +1626,8 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       // exhausted entry.
       ...finalToolRecordingConfig,
       ...routingConfig,
+      // 0.8.0 §9.1 — mirrors run.json: the floor `--provability` imposed.
+      ...(opts.provability !== undefined ? { provability: opts.provability } : {}),
     },
     outDir,
   };
@@ -1837,6 +1907,12 @@ async function defaultInvoker(
   // can never bleed into a measurement.
   const fabricOn =
     (ir.memory !== undefined && ir.memory.enabled !== false) || ir.continuity !== undefined;
+  // 0.8.0 §9.1, §11 — under `provability:` (declared, or `--provability`) the
+  // gate is wired per sample and its `provability` skill joins whichever
+  // discovery owns the skill surface (wireRunOnce's, or the fabric's below).
+  const gateOn = ir.provability !== undefined;
+  const gateCwd = opts.cwd ?? process.cwd();
+  const gateSkills = provabilitySkills(ir.provability);
   // Item 20 — concurrent samples all drive `runChatLoop`, which streams the
   // model's token deltas to stdout. Unprefixed, N of them on one file
   // descriptor splice mid-word ("TheThe capital of Brazil is …capital of
@@ -1886,6 +1962,29 @@ async function defaultInvoker(
     let slashCommands = wired.slashCommands;
     let memoryOpt: Parameters<typeof runChatLoop>[0]["memory"];
     let continuityOpt: Parameters<typeof runChatLoop>[0]["continuity"];
+    // 0.8.0 §9.1 — a sample's `metadata.provability.level` re-floors ITS
+    // gate (and the `provability` skill that teaches the floor), so the
+    // bundle it is graded on was made at that floor (see sampleGateIr).
+    const sampleIr = gateOn ? await sampleGateIr(ir, req.sample) : ir;
+    const sampleGateSkills = sampleIr === ir ? gateSkills : provabilitySkills(sampleIr.provability);
+    if (!fabricOn && sampleGateSkills !== gateSkills) {
+      // wireRunOnce discovered the run-floor skill as a builtin; a user or
+      // project skill of the same name replaced it there and stays (its
+      // file is on disk, the builtin's body is the rendered text). Swap
+      // only the builtin, and re-advertise the Skill tool.
+      const runSkill = gateSkills[0];
+      const ownSkill = sampleGateSkills[0];
+      const isRunSkill = (skill: (typeof skills)[number]): boolean =>
+        runSkill !== undefined &&
+        skill.name === runSkill.name &&
+        skill.filePath === runSkill.filePath &&
+        (skill as { body?: unknown }).body === runSkill.body;
+      if (ownSkill !== undefined && skills.some(isRunSkill)) {
+        skills = skills.map((skill) => (isRunSkill(skill) ? ownSkill : skill));
+        tools = tools.filter((t) => t.name !== "Skill");
+        tools.push(createSkillTool(skills));
+      }
+    }
     if (fabricOn) {
       const memWired = await wireMemory(memoryFragmentFromIr(ir), {
         catalog: {
@@ -1896,6 +1995,7 @@ async function defaultInvoker(
         cwd: req.sessionRootDir,
         sessionRootDir: req.sessionRootDir,
         homeDir: req.sessionRootDir,
+        ...(sampleGateSkills.length > 0 ? { builtinSkills: sampleGateSkills } : {}),
       });
       memoryOpt = memWired.options.memory;
       continuityOpt = memWired.options.continuity;
@@ -1915,10 +2015,37 @@ async function defaultInvoker(
     // wired stack plus whatever the memory fabric registered), so the key's
     // sampleId is the sample actually calling. Absent a cassette the array is
     // handed over untouched.
+    // 0.8.0 §9.1 — the provability gate, wired per sample (its evidence is
+    // THIS sample's session log; its bundles land in THIS sample's dir — see
+    // ./provability). `checked` replay re-runs pure tools from the sample's
+    // own list, read at replay time, BEFORE the cassette wraps it: a pure
+    // tool replays the same with or without a recording, and a replay must
+    // not append to (or consume) the cassette. No block ⇒ nothing wired.
+    // The cassette carries the gate's `ProofCheck` artifacts with its
+    // results (`gate.cassetteEffects`): a replayed ProofCheck files nothing
+    // itself, and the gate resolves `proof:` against the sample's own root.
+    const gateTools: RegisteredTool[] = [];
+    const gate = gateOn
+      ? await wireSampleProvability(sampleIr, {
+          cwd: gateCwd,
+          sessionRootDir: req.sessionRootDir,
+          catalog: { get: (name) => gateTools.find((t) => t.name === name) },
+        })
+      : undefined;
+    if (gate !== undefined) {
+      tools = withGateTools(tools, gate);
+      gateTools.push(...tools);
+    }
     if (cassette.recorder !== undefined) {
-      tools = recordingTools(tools, req.sample.id, cassette.recorder);
+      tools = recordingTools(tools, req.sample.id, cassette.recorder, gate?.cassetteEffects);
     } else if (cassette.replayer !== undefined) {
-      tools = replayingTools(tools, req.sample.id, cassette.replayer, cassette.missPolicy);
+      tools = replayingTools(
+        tools,
+        req.sample.id,
+        cassette.replayer,
+        cassette.missPolicy,
+        gate?.cassetteEffects,
+      );
     }
     const sampleOut = fanOut ? createSampleOutputWriter({ label: req.sample.id }) : undefined;
     try {
@@ -1935,6 +2062,7 @@ async function defaultInvoker(
           : {}),
         ...(memoryOpt !== undefined ? { memory: memoryOpt } : {}),
         ...(continuityOpt !== undefined ? { continuity: continuityOpt } : {}),
+        ...(gate !== undefined ? { provability: gate.provability } : {}),
         permissionRules: wired.permissionRules,
         permissionMode: "auto",
         // A wired code-execution tool passes the sandbox floor exactly when
@@ -1992,7 +2120,8 @@ async function defaultInvoker(
         // keep the exact single-message seed as before.
         seedMessages: [...(req.sample.history ?? []), { role: "user", content: req.sample.input }],
       });
-      return { agentOutput };
+      const proof = gate?.standing();
+      return { agentOutput, ...(proof !== undefined ? { proof } : {}) };
     } finally {
       // A sample that ended mid-line (or threw) still surfaces its tail.
       sampleOut?.end();

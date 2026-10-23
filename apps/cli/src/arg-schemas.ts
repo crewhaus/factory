@@ -248,6 +248,9 @@ export const INIT_SCHEMA: ParseArgsSchema = {
     // the three-line `models:` registry, a two-arm pool, the cascade and the
     // judge that triggers it, every line commented.
     { name: "hybrid", takesValue: false },
+    // 0.8.0 §11 — the new spec's proof floor (off | cited | grounded |
+    // checked | proven); with --interactive it answers the proof question.
+    { name: "provability", takesValue: true },
     // NEW-HUNT-8 — scaffold the TIERED workflow against a suite manifest:
     // --ci emits fast-tier-on-PR + nightly-tier-on-cron, --sentinel appends a
     // nightly tier step beside the drift probe. Without it both scaffolds are
@@ -702,6 +705,10 @@ export const EVAL_SCHEMA: ParseArgsSchema = {
     // 0.6.0 §6.1 — seed that frozen snapshot from the harness's live
     // arms.jsonl instead of starting cold.
     { name: "warm-arms", takesValue: false },
+    // 0.8.0 §9.1 — measure the provability ladder at a floor without editing
+    // the spec: cited | grounded | checked | proven. The gate runs in-loop at
+    // that floor and the six provability.* graders join the run.
+    { name: "provability", takesValue: true },
     // 0.6.0 §6.1 — run --models cells through the run-history flow: each cell
     // keys its OWN per-arm lineage (spec::dataset::<arm>), which is what makes
     // --gate/--no-promote legal under --models.
@@ -1491,6 +1498,39 @@ export const WATCHME_SCHEMA: ParseArgsSchema = {
     { name: "no-model" },
     { name: "dry-run" },
     { name: "forget" },
+    { name: "help", short: "h" },
+  ],
+};
+
+// 0.8.0 (design/0.8.0-provability-release.md §11) — `crewhaus provability
+// show|check|audit|checkers|prune`. EVERY flag any action accepts is declared
+// here (parseArgs throws on an undeclared one); provability-cli.ts refuses a
+// flag on an action that does not read it, so a typo'd verb never silently
+// ignores what the operator asked for.
+export const PROVABILITY_SCHEMA: ParseArgsSchema = {
+  flags: [
+    // show / check — the session whose bundles (show) or log (check) to read.
+    { name: "session", takesValue: true },
+    // show — one graded turn of the session (default: the latest bundle).
+    { name: "turn", takesValue: true },
+    // show / check / audit / checkers — machine output on stdout.
+    { name: "json", takesValue: false },
+    // check — the floor (required unless --spec carries a provability block).
+    { name: "level", takesValue: true },
+    // check — a directory of fetched bodies (layout in provability-cli.ts).
+    { name: "evidence", takesValue: true },
+    // check — the spec whose lowered provability block configures the gate.
+    { name: "spec", takesValue: true },
+    // audit — only bundles and graded lines newer than this (7d, 12h, ISO date).
+    { name: "since", takesValue: true },
+    // prune — remove bundles last written longer ago than this (90d).
+    { name: "older-than", takesValue: true },
+    // prune — list what would be removed, remove nothing.
+    { name: "dry-run", takesValue: false },
+    // show / audit / prune — also read the managed shape's per-tenant bundles
+    // under <dir>/<tenant>/proofs/ (default: CREWHAUS_TENANTS_ROOT, else
+    // target-managed's /tmp/crewhaus-tenants for a managed spec).
+    { name: "tenants-root", takesValue: true },
     { name: "help", short: "h" },
   ],
 };

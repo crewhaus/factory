@@ -976,12 +976,76 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
       `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(managed))}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "reply" });`,
     );
     expect(agent).toContain(
-      'import { registerGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
+      'import { type ProofBundleObserver, observeProofBundles, registerGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
     );
     expect(agent).toContain("\nregisterGateTools(defaultCatalog, __gates);");
-    expect(agent).toContain("\n    provability: __gates.provability,");
+    // §5.4 — the shared gate, with THIS run's observer composed in.
+    expect(agent).toContain(
+      "\n    provability: observeProofBundles(__gates.provability, args.onProofBundle),",
+    );
+    expect(agent).toContain("  readonly onProofBundle?: ProofBundleObserver;");
     // The gate's tools reach the turn through the catalog union.
     expect(agent).toContain("    tools: defaultCatalog.list(),");
+  });
+
+  test("provability: the daemon returns the run's bundle as `proof` (gateway envelope, §5.4)", () => {
+    const daemon =
+      emitManaged({ ...ir, provability: PROVABILITY }).files.find((f) => f.path === "daemon.ts")
+        ?.content ?? "";
+    expect(daemon).toContain('import type { ProofBundle } from "@crewhaus/evaluation-service";');
+    // The resume cache keeps the bundle beside the reply, so a duplicate
+    // resume answers with both.
+    expect(daemon).toContain(
+      "type ServedTurn = { readonly reply: string; readonly proof?: ProofBundle };",
+    );
+    expect(daemon).toContain("createInMemoryIdempotencyStore<ServedTurn>();");
+    expect(daemon).toContain("withIdempotency<undefined, ServedTurn>(() => executeTurn(), {");
+    // Each run hands runOneTurn its own observer; the last bundle stands.
+    expect(daemon).toContain(
+      "          onProofBundle: (bundle) => {\n            graded.proof = bundle;",
+    );
+    expect(daemon).toContain(
+      "return { runId, sessionId, tenantId: tenant.id, reply, ...(served.proof !== undefined ? { proof: served.proof } : {}) };",
+    );
+    // The usage accounting still reads the reply text.
+    expect(daemon).toContain("      const reply = served.reply;");
+    expect(daemon.indexOf("const reply = served.reply;")).toBeLessThan(
+      daemon.indexOf("const outputTokens = Math.ceil(reply.length / 4);"),
+    );
+  });
+
+  test("provability with the memory fabric: the observer and the tenant both reach runOneTurn", () => {
+    const files = emitManaged({
+      ...ir,
+      provability: PROVABILITY,
+      continuity: { plan: true, proof: "ladder", ledger: true, handoff: true, scope: "session" },
+    }).files;
+    const daemon = files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(daemon).toContain(
+      "          input: p.input, tenant,\n          onProofBundle: (bundle) => {",
+    );
+  });
+
+  test("Bun.Transpiler parses the provability agent.ts and daemon.ts", () => {
+    const transpiler = new Bun.Transpiler({ loader: "ts" });
+    for (const f of emitManaged({ ...ir, provability: PROVABILITY }).files) {
+      if (!f.path.endsWith(".ts")) continue;
+      expect(() => transpiler.transformSync(f.content)).not.toThrow();
+    }
+  });
+
+  test("evaluation alone: no observer, no `proof` — the gate field and the result are the pre-0.8.0 ones", () => {
+    const files = emitManaged({
+      ...ir,
+      evaluation: { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 1 },
+    }).files;
+    const agent = files.find((f) => f.path === "agent.ts")?.content ?? "";
+    const daemon = files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    expect(agent).not.toContain("onProofBundle");
+    expect(agent).not.toContain("observeProofBundles");
+    expect(daemon).not.toContain("ServedTurn");
+    expect(daemon).toContain("createInMemoryIdempotencyStore<string>();");
+    expect(daemon).toContain("      return { runId, sessionId, tenantId: tenant.id, reply };");
   });
 
   test("provability with spec-listed builtins: they register first, the gate's replace a same-named one", () => {

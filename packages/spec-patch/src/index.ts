@@ -32,7 +32,7 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
-import { isSeq, parse, parseDocument } from "yaml";
+import { isCollection, isSeq, parse, parseDocument } from "yaml";
 import { z } from "zod";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 
@@ -129,12 +129,32 @@ export function applySpecPatch(yamlText: string, patch: SpecPatch): ApplySpecPat
   }
 
   const path = [...patch.path];
+  // The CST throws a bare `Error` ("Expected YAML collection at …") when an
+  // intermediate key holds a SCALAR — a whitelisted dial under a shorthand
+  // such as `provability: grounded` (0.8.0 §9.2) is the reachable case. Every
+  // other failure here is a SpecPatchError, so this one is too, and it names
+  // the scalar to expand.
+  const setIn = (op: SpecPatchOp): void => {
+    try {
+      doc.setIn(path, patch.value);
+    } catch (err) {
+      const scalarAt = scalarIntermediate(doc, path);
+      throw new SpecPatchError(
+        scalarAt !== undefined
+          ? `cannot ${op} ${formatPath(path)}: ${formatPath(scalarAt)} is a scalar (${JSON.stringify(
+              doc.getIn(scalarAt),
+            )}), not a block — expand it to a mapping first (e.g. \`${scalarAt.at(-1)}: { level: … }\` for a provability shorthand)`
+          : `cannot ${op} ${formatPath(path)}: ${(err as Error).message}`,
+        err,
+      );
+    }
+  };
   switch (patch.op) {
     case "replace": {
       if (!doc.hasIn(path)) {
         throw new SpecPatchError(`cannot replace ${formatPath(path)}: path does not exist`);
       }
-      doc.setIn(path, patch.value);
+      setIn("replace");
       break;
     }
     case "add": {
@@ -143,7 +163,7 @@ export function applySpecPatch(yamlText: string, patch: SpecPatch): ApplySpecPat
           `cannot add ${formatPath(path)}: path already exists (use "replace")`,
         );
       }
-      doc.setIn(path, patch.value);
+      setIn("add");
       break;
     }
     case "remove": {
@@ -163,6 +183,20 @@ export function applySpecPatch(yamlText: string, patch: SpecPatch): ApplySpecPat
     throw new SpecPatchError(`patched YAML failed spec validation: ${(err as Error).message}`, err);
   }
   return { yaml: newYaml, spec };
+}
+
+/** The first proper prefix of `path` whose value is a scalar (not a collection), if any. */
+function scalarIntermediate(
+  doc: ReturnType<typeof parseDocument>,
+  path: ReadonlyArray<string>,
+): string[] | undefined {
+  for (let i = 1; i < path.length; i++) {
+    const prefix = path.slice(0, i);
+    if (!doc.hasIn(prefix)) return undefined;
+    const node = doc.getIn(prefix, true);
+    if (node !== undefined && node !== null && !isCollection(node)) return prefix;
+  }
+  return undefined;
 }
 
 /**
@@ -578,6 +612,62 @@ function judgeGateDials(block: ReadonlyArray<string>): ReadonlyArray<ReadonlyArr
   ]);
 }
 
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §9.2) — the provability gate's
+ * QUALITY dials, on the shapes whose gate is wired per turn (cli, channel,
+ * managed). Each is a scalar that survives lowering 1:1 with its bounds owned
+ * by the spec schema, so an out-of-range patch fails `applySpecPatch`'s
+ * re-parse:
+ *
+ *   provability.threshold               number 0..1 — the fraction of claims
+ *                                       that must meet the floor (default 1)
+ *   provability.max_retries             int 0..5 — gate-triggered re-runs
+ *                                       (retry/escalate); a cost dial
+ *   provability.grounded.coverage       number 0..1 — per-claim token
+ *                                       coverage inside one window
+ *   provability.grounded.window_tokens  int 4..2000 — how far apart a claim's
+ *                                       words may sit in the source
+ *
+ * The rest of the block is EXCLUDED, knob by knob (the watch-me discipline;
+ * each row also lives in {@link HUMAN_OWNED_PATHS}, and the classification
+ * test walks every `provability.*` leaf of every shape):
+ *
+ *   - `level`, `on_fail` — the floor and what a miss does. The optimizer is
+ *     GRADED by the provability graders at that floor: one free to move it
+ *     would learn to blind its critic. Both are also
+ *     {@link OPTIMIZER_REFUSED_LEAVES}, so no wider entry or block patch can
+ *     ever reach them.
+ *   - `assumptions`, `max_assumptions` — the same bar by another door: an
+ *     answer that may assume more proves less.
+ *   - `scope`, `render` — posture (how far back evidence may come from, how
+ *     the bundle shows), not quality.
+ *   - `sources.*` — `allow` / `deny` are an allowlist, which is security;
+ *     `bibliographic` and `resolve` decide what counts as a source.
+ *   - `grounded.independent` — corroboration is part of what counts as
+ *     evidence; lowering it lowers the bar.
+ *   - `execution.*`, `formal.*` — what counts as evidence (the tools whose
+ *     results check a claim, replay, the proof checkers) is human-owned.
+ *   - `judge.*` — the waiver judge's roster is never auto-patched, and
+ *     `judge.model` is spend; `allow_self_judge` is a measurement waiver.
+ */
+const PROVABILITY_DIALS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
+  Object.freeze(["provability", "threshold"]),
+  Object.freeze(["provability", "max_retries"]),
+  Object.freeze(["provability", "grounded", "coverage"]),
+  Object.freeze(["provability", "grounded", "window_tokens"]),
+]);
+
+/**
+ * 0.8.0 §9.2 — research's report gate runs ONCE over the rendered report
+ * (design §8): `retry` / `escalate` lower to `note` there, so `max_retries`
+ * moves nothing and is not offered; the strictness dials are. Crew carries
+ * the block unwired in 0.8.0, so it gets none — a dial on an unwired gate
+ * measures a guaranteed-zero delta.
+ */
+const PROVABILITY_REPORT_DIALS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze(
+  PROVABILITY_DIALS.filter((path) => path[1] !== "max_retries"),
+);
+
 const STEP: ReadonlyArray<string> = Object.freeze(["steps", WILDCARD_SEGMENT]);
 const NODE: ReadonlyArray<string> = Object.freeze(["nodes", WILDCARD_SEGMENT]);
 const ROLE: ReadonlyArray<string> = Object.freeze(["roles", WILDCARD_SEGMENT]);
@@ -606,6 +696,12 @@ const AGENT: ReadonlyArray<string> = Object.freeze(["agent"]);
  *     (`share` crosses the harness boundary to Thredz).
  * The paired `crewhaus advise` watchme rule is text-only for exactly this
  * reason: there is no whitelisted path for it to patch.
+ *
+ * "Provability" (`provability:` on cli/channel/managed/research, design
+ * 0.8.0 §9.2) — only the four strictness/cost dials in
+ * {@link PROVABILITY_DIALS} are whitelisted (three on research); `level` and
+ * `on_fail` are refused outright ({@link OPTIMIZER_REFUSED_LEAVES}) and every
+ * other key is excluded with its reason in the dials' docblock.
  */
 export const OPTIMIZABLE_PATHS: Readonly<
   Record<Spec["target"], ReadonlyArray<ReadonlyArray<string>>>
@@ -716,6 +812,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     // per judge, folded by median). `judges`, `temperature`, `target`,
     // `criteria`, `model` and `on_fail` / `allow_self_judge` stay human-owned.
     Object.freeze(["evaluation", "grader", "repeats"]),
+    // 0.8.0 §9.2 — the provability gate's strictness/cost dials; see
+    // PROVABILITY_DIALS for the knob-by-knob exclusions.
+    ...PROVABILITY_DIALS,
     // Loop contract 0.4 (Batch E) — the agent-shape RAG (`knowledge:`) dials
     // + the per-turn recall cadence. All scalars that survive lower() 1:1
     // with their bounds owned by the spec schema, so an out-of-bounds patch
@@ -775,6 +874,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["evaluation", "threshold"]),
     Object.freeze(["evaluation", "max_retries"]),
     Object.freeze(["evaluation", "grader", "repeats"]),
+    // 0.8.0 §9.2 — the provability gate's strictness/cost dials; see
+    // PROVABILITY_DIALS for the knob-by-knob exclusions.
+    ...PROVABILITY_DIALS,
     // Loop contract 0.4 (Batch E) — knowledge/recall dials; see the cli entry.
     Object.freeze(["knowledge", "default_k"]),
     Object.freeze(["knowledge", "chunk", "size"]),
@@ -815,6 +917,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["evaluation", "threshold"]),
     Object.freeze(["evaluation", "max_retries"]),
     Object.freeze(["evaluation", "grader", "repeats"]),
+    // 0.8.0 §9.2 — the provability gate's strictness/cost dials; see
+    // PROVABILITY_DIALS for the knob-by-knob exclusions.
+    ...PROVABILITY_DIALS,
     // Loop contract 0.4 (Batch E) — knowledge/recall dials; see the cli entry.
     Object.freeze(["knowledge", "default_k"]),
     Object.freeze(["knowledge", "chunk", "size"]),
@@ -886,6 +991,9 @@ export const OPTIMIZABLE_PATHS: Readonly<
     Object.freeze(["continuity", "focusMaxChars"]),
     // Loop contract 0.4 (Batch E) — per-turn recall cadence; see the cli entry.
     Object.freeze(["memory", "refreshEvery"]),
+    // 0.8.0 §9.2 — the report gate's strictness dials (no max_retries: the
+    // report gate never retries); see PROVABILITY_REPORT_DIALS.
+    ...PROVABILITY_REPORT_DIALS,
   ]),
   batch: Object.freeze([
     Object.freeze(["agent", "instructions"]),
@@ -1248,6 +1356,58 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     reason:
       "an SLO threshold decides when production is alerted, paused or rolled back — an operator's call, never an eval loop's (the routing rates added in 0.6.0 follow the existing keys)",
   },
+  // -- provability (0.8.0 §9.2): everything but the four dials in
+  //    PROVABILITY_DIALS — the bar the optimizer is graded against, posture,
+  //    and what counts as evidence --
+  {
+    pattern: ["provability", "level"],
+    reason:
+      "the provability floor is the bar the optimizer is graded against — moving it would blind the critic (also an OPTIMIZER_REFUSED_LEAVES row)",
+  },
+  {
+    pattern: ["provability", "on_fail"],
+    reason:
+      "what a below-floor answer becomes (retry / halt / note / escalate) is human-owned semantics (also an OPTIMIZER_REFUSED_LEAVES row)",
+  },
+  {
+    pattern: ["provability", "assumptions"],
+    reason: "whether answers may rest on declared assumptions lowers the bar by another door",
+  },
+  {
+    pattern: ["provability", "max_assumptions"],
+    reason: "an answer that may assume more proves less — the bar, not a dial",
+  },
+  {
+    pattern: ["provability", "scope"],
+    reason: "how far back evidence may come from is posture, not quality",
+  },
+  {
+    pattern: ["provability", "render"],
+    reason: "how the proof bundle shows beside the answer is posture, not quality",
+  },
+  {
+    pattern: ["provability", "sources"],
+    reason:
+      "sources.allow / deny are an allowlist (security); bibliographic and resolve decide what counts as a source",
+  },
+  {
+    pattern: ["provability", "grounded", "independent"],
+    reason: "corroboration is part of what counts as evidence — lowering it lowers the bar",
+  },
+  {
+    pattern: ["provability", "execution"],
+    reason:
+      "which tools' results check a claim, and whether they are replayed, is what counts as evidence — human-owned",
+  },
+  {
+    pattern: ["provability", "formal"],
+    reason: "the proof checkers, their image and forbidden tactics decide what counts as a proof",
+  },
+  {
+    pattern: ["provability", "judge"],
+    reason:
+      "the waiver judge's roster is never auto-patched, its model is spend, and allow_self_judge is a measurement waiver",
+  },
 ]);
 
 /** A leaf path is human-owned when some {@link HUMAN_OWNED_PATHS} row matches it. */
@@ -1359,7 +1519,7 @@ export function wildcardPlacementIssues(
  * a path (the {@link HUMAN_OWNED_PATHS} matcher) and ENFORCED by
  * {@link isOptimizable}.
  *
- * There is exactly one row, and it exists because `model_pool.learning` is
+ * The first row exists because `model_pool.learning` is
  * deliberately whitelisted WHOLESALE: `crewhaus advise` mines the reward
  * scoreboard into that block and patches it AS a block, so a narrower
  * enumeration would break the advisor. PR 19 shipped the verdict table with
@@ -1375,9 +1535,19 @@ export function wildcardPlacementIssues(
  * `validatePatch` additionally refuses a block patch that would CHANGE the
  * seed — a block patch that preserves it, as the advisor's spread does,
  * passes.
+ *
+ * 0.8.0 (design/0.8.0-provability-release.md §9.2) adds the provability
+ * gate's floor and its failure mode. No entry reaches them today (only the
+ * four dials under `provability` are listed); the rows make that permanent:
+ * the optimizer is graded by the provability graders AT the floor, so a
+ * wholesale `["provability"]` entry added later, or a block patch carrying a
+ * different `level` / `on_fail`, must still never move the bar it is graded
+ * against. `crewhaus doctor --philosophy-alignment` checks the same path.
  */
 export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(["model_pool", "learning", "seed"]),
+  Object.freeze(["provability", "level"]),
+  Object.freeze(["provability", "on_fail"]),
 ]);
 
 /** True when `path` contains one of {@link OPTIMIZER_REFUSED_LEAVES} as a contiguous run. */

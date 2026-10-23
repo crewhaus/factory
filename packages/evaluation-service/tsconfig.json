@@ -6,6 +6,9 @@
   },
   "references": [
     {
+      "path": "../default-skills"
+    },
+    {
       "path": "../errors"
     },
     {
@@ -28,6 +31,9 @@
     },
     {
       "path": "../runtime-core"
+    },
+    {
+      "path": "../skills-registry"
     },
     {
       "path": "../tenancy"

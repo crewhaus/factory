@@ -198,9 +198,17 @@ parameters, datatype constructors and selectors, `let` / `forall` / `exists` /
 `_` starting with a letter (optionally `|quoted|`, the same symbol), must not be
 in `SMT_RESERVED_NAMES` / `SMT_RESERVED_SORTS` or start with `bv`, and a global
 name may be declared once. The reserved set is SMT-LIB 2.6's reserved words and
-theory symbols plus every alphanumeric symbol Z3 4.11.2 resolves undeclared
-(probed from the binary's strings); operator spellings, dotted and hyphenated
-names cannot match the pattern at all.
+theory symbols plus every alphanumeric symbol Z3 resolves undeclared — in 4.16.0
+(the curated image's) and 4.11.2 (an older solver a programmatic `images.smt`
+override may carry; the spec's `formal.image` overrides lean4 alone) — found by
+applying each identifier string in the binary to several argument shapes
+(`(simplify name)` alone misses `equals`, `equiv`, `if_then_else`, and only a
+`(List Int)` argument reaches `insert`, `nil`, `head` and `tail`, the parts of
+Z3's built-in `List` sort, which is reserved too); operator spellings, dotted
+and hyphenated names cannot match the pattern at all. The live test re-runs
+that probe on the image, with known built-ins as controls, so a Z3 bump that
+adds a built-in fails until the name is reserved. A list datatype of the
+preamble's own names its parts otherwise (`Nil`, `cons`, `hd`, `tl`).
 
 The adapter parses both into S-expressions (refusing backslashes in strings and
 quoted symbols, and control characters, so no reader can split them
@@ -283,9 +291,12 @@ Unicode's — so `2omega` is the numeral `2` and the word `omega`, while
 
 Verdict: ok ⇔ lean exits 0, reports no `error`, and the `#print axioms` message
 — the JSON message positioned on the adapter's own line, so nothing the proof
-prints can impersonate it — parses. `sorryAx` is always a rejection;
-`Lean.ofReduceBool` / `Lean.ofReduceNat` / `Lean.trustCompiler` are a
-rejection while `native_decide` is forbidden. Any other axiom beyond `propext`,
+prints can impersonate it — parses. `sorryAx` is always a rejection; an axiom
+through which the proof trusts the compiler — `Lean.ofReduceBool` /
+`Lean.ofReduceNat` / `Lean.trustCompiler`, or the `<decl>._native.<tactic>.ax_i_j`
+auxiliary Lean 4.34 leaves for `native_decide` and for `decide +native` (which
+never spells `native_decide`, so only this check sees it) — is a rejection
+while `native_decide` is forbidden. Any other axiom beyond `propext`,
 `Classical.choice` and `Quot.sound` is recorded in `axioms` and the proof stays
 ok — shown, not hidden (design §6.4).
 
@@ -315,4 +326,20 @@ what it could prove with instead of a checker silently missing.
 ```sh
 bun test                                          # unit tests; no Docker, no Z3
 CREWHAUS_PROOF_CHECKER_HOST_Z3=1 bun test src/smt.host.test.ts   # real Z3 on PATH, via the noop backend
+
+# the real images through a real docker sandbox (build them first, from the repo root):
+bun scripts/build-sandbox-images.ts
+CREWHAUS_SECTION36_LIVE_DOCKER=1 bun test src/sandbox.live.test.ts
 ```
+
+The unit tests also replay what Z3 4.16.0 and Lean 4.34.1 print in the curated
+images, captured verbatim, so the output parsers are held to the real tools
+without Docker. `sandbox.live.test.ts` runs both checkers on the images as a
+harness does — network none, read-only root, a `/tmp` tmpfs, uid 65532, 512 MB:
+proofs, counterexamples, inconsistent hypotheses, `sorry` and the `sorryAx`
+backstop, `Classical.choice` capture, compiler-trust axioms (`bv_decide`
+running the image's cadical among them), a `formal.image` override on and off
+the allowlist — and re-probes the image's Z3 for built-ins the reserved list
+lacks (list-sorted arguments included, with known built-ins as controls so a
+blind probe fails too). It never pulls: a missing image fails with the build
+command.

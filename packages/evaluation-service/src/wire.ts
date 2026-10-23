@@ -79,6 +79,17 @@ export type WireEvaluationDeps = {
   readonly judgeAdapter?: CategoricalJudgeOptions["adapter"];
   /** Clock for bundles and artifacts (tests). */
   readonly now?: () => Date;
+  /**
+   * 0.8.0 §9.1 — the proofs root, when it must not be the harness's
+   * `<cwd>/.crewhaus/proofs/<spec>/` (or the tenant's): where `ProofCheck`
+   * files its artifacts, where the gate resolves `proof:` citations and where
+   * bundles persist. The eval runner points it into each sample's own fabric
+   * root (Pillar 2 isolation: a sample neither writes into nor cites from the
+   * live proofs tree); `cwd` stays the workspace path citations resolve in.
+   * Fenced to the active tenant's root like every other root. Absent ⇒ the
+   * default, unchanged.
+   */
+  readonly proofsRoot?: string;
 };
 
 export type WiredGates = GateProofTools & {
@@ -155,6 +166,7 @@ export async function wireEvaluation(
     ...(deps.onBundle !== undefined ? { onBundle: deps.onBundle } : {}),
     ...(deps.judgeAdapter !== undefined ? { judgeAdapter: deps.judgeAdapter } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...(deps.proofsRoot !== undefined ? { proofsRoot: deps.proofsRoot } : {}),
   });
 
   // The preflight's evidence: the gate's own builder over the run's log
@@ -179,7 +191,10 @@ export async function wireEvaluation(
   const proofTools = gateTools({
     config,
     workspaceRoot: cwd,
-    proofsRoot: (tenant) => gateProofsRoot(cwd, specName, tenant),
+    proofsRoot: (tenant) =>
+      deps.proofsRoot !== undefined
+        ? fencedDir(deps.proofsRoot, tenant)
+        : gateProofsRoot(cwd, specName, tenant),
     evidence,
     ...(deps.sandbox !== undefined ? { sandbox: deps.sandbox } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),

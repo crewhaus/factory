@@ -1,13 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type EvaluationFragment,
   evaluationFragmentFromIr,
   mergeGateTools,
+  provabilitySkills,
+  renderGateSkills,
   wireEvaluation,
 } from "@crewhaus/evaluation-service";
 import type { IrChannelV0 } from "@crewhaus/ir";
+import { type MemoryWiringFragment, wireMemory } from "@crewhaus/memory-service";
 import { TargetEmitError, emitChannelBot } from "./index";
 
 const MIN_IR: IrChannelV0 = {
@@ -2082,6 +2086,134 @@ describe("emitChannelBot — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4
       provability: undefined,
     }).files.map((f) => f.content);
     expect(undef).toEqual(plain);
+  });
+});
+
+describe("emitChannelBot — the provability skill (0.8.0 §11: registered only with the block)", () => {
+  const CONTINUITY: NonNullable<IrChannelV0["continuity"]> = {
+    plan: true,
+    proof: "ladder",
+    ledger: true,
+    handoff: true,
+    scope: "session",
+  };
+  // The expression itself is pinned in evaluation-service (renderGateSkills);
+  // these tests pin where the emitter splices it.
+  const SKILLS_CALL = renderGateSkills({ provability: PROVABILITY }).expr;
+  const IMPORT = 'import { provabilitySkills } from "@crewhaus/evaluation-service";';
+  const withEvalEntry = (ir: IrChannelV0): Map<string, string> =>
+    new Map(emitChannelBot(ir, { evalEntry: true }).files.map((f) => [f.path, f.content]));
+
+  test("without continuity: the daemon's discovery (and the eval bridge's) takes it as a builtin", () => {
+    const files = withEvalEntry({ ...MIN_IR, provability: PROVABILITY });
+    for (const file of ["daemon.ts", "eval-entry.ts"]) {
+      const content = files.get(file) ?? "";
+      expect(content).toContain(IMPORT);
+      expect(content).toContain(`discoverSkills({ cwd: __cwd, builtinSkills: ${SKILLS_CALL} }),`);
+      expect(content).toContain(
+        "if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));",
+      );
+    }
+    // The turn uses the daemon's list (config.skills); agent.ts renders nothing of its own.
+    expect(files.get("agent.ts")).not.toContain("provabilitySkills");
+  });
+
+  test("with continuity: every turn's wireMemory owns the surface, so the skill rides its deps", () => {
+    const files = withEvalEntry({ ...MIN_IR, provability: PROVABILITY, continuity: CONTINUITY });
+    const agent = files.get("agent.ts") ?? "";
+    expect(agent).toContain(IMPORT);
+    expect(agent).toContain(`\n        builtinSkills: ${SKILLS_CALL},\n        sessionScope:`);
+    expect(agent).toContain("const __skills = __memWired.options.skills ?? config.skills;");
+    for (const file of ["daemon.ts", "eval-entry.ts"]) {
+      expect(files.get(file)).not.toContain("discoverSkills(");
+      expect(files.get(file)).not.toContain("provabilitySkills");
+    }
+  });
+
+  test("memory without continuity: the fabric does not own skills, so the daemon's discovery carries it", () => {
+    const files = fileMap({
+      ...MIN_IR,
+      provability: PROVABILITY,
+      memory: { wiki: { enabled: true } },
+    } as IrChannelV0);
+    expect(files.get("agent.ts")).toContain("const __memWired = await wireMemory(");
+    expect(files.get("agent.ts")).not.toContain("builtinSkills");
+    expect(files.get("daemon.ts")).toContain(`builtinSkills: ${SKILLS_CALL}`);
+  });
+
+  test("learning without continuity: the turn's wireMemory lists it AND the daemon's Skill tool loads it", async () => {
+    const learning: NonNullable<IrChannelV0["learning"]> = {
+      domain: "specialty coffee extraction science",
+      study: { onHeartbeat: true, onDream: true },
+    };
+    const files = withEvalEntry({
+      ...MIN_IR,
+      provability: PROVABILITY,
+      memory: { wiki: { enabled: true, requireSources: true } },
+      learning,
+    });
+    // The run's skill list: the per-turn wireMemory's (learning owns the
+    // surface), whose options spread over `skills: config.skills`.
+    const agent = files.get("agent.ts") ?? "";
+    expect(agent).toContain(IMPORT);
+    expect(agent).toContain(`\n        builtinSkills: ${SKILLS_CALL},\n        sessionScope:`);
+    expect(agent).toContain("\n        skills: config.skills,\n");
+    expect(agent.indexOf("skills: config.skills,")).toBeLessThan(
+      agent.indexOf("...__memWired.options,"),
+    );
+    // The Skill tool: the daemon's (and the eval bridge's) own discovery,
+    // which has no continuity to defer to — so it carries the skill too.
+    for (const file of ["daemon.ts", "eval-entry.ts"]) {
+      const content = files.get(file) ?? "";
+      expect(content).toContain(`discoverSkills({ cwd: __cwd, builtinSkills: ${SKILLS_CALL} }),`);
+      expect(content).toContain(
+        "if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));",
+      );
+    }
+    // What the turn's wireMemory hands the run: the learning skill and the gate's.
+    const tmp = mkdtempSync(join(tmpdir(), "channel-gate-learning-"));
+    try {
+      const wired = await wireMemory(
+        {
+          specName: "demo",
+          memory: { wiki: { enabled: true, requireSources: true } },
+          learning,
+        } as MemoryWiringFragment,
+        {
+          catalog: { register: () => {} },
+          cwd: tmp,
+          homeDir: join(tmp, "home"),
+          builtinSkills: provabilitySkills(PROVABILITY),
+        },
+      );
+      expect((wired.options.skills ?? []).map((s) => s.name).sort()).toEqual([
+        "learning-loop",
+        "provability",
+      ]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Byte identity without the block is held by the compiler's pinned bundle
+  // fixtures (packages/compiler/src/model-wiring-pin.test.ts,
+  // continuity-byte-restore.test.ts), which compare against bytes captured
+  // before 0.8.0. Here: nothing of the skill wiring appears.
+  test("no block → no skill wiring in any file (with or without continuity or learning)", () => {
+    for (const ir of [
+      MIN_IR,
+      { ...MIN_IR, continuity: CONTINUITY },
+      {
+        ...MIN_IR,
+        memory: { wiki: { enabled: true, requireSources: true } },
+        learning: { domain: "coffee", study: { onHeartbeat: true, onDream: true } },
+      },
+    ]) {
+      for (const [, content] of withEvalEntry(ir)) {
+        expect(content).not.toContain("provabilitySkills");
+        expect(content).not.toContain("builtinSkills");
+      }
+    }
   });
 });
 

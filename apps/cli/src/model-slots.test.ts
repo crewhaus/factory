@@ -154,8 +154,51 @@ security:
     expect(justification?.swappable).toBe(false);
   });
 
+  // 0.8.0 §6.2 — the provability gate's paraphrase-waiver judge
+  // (`IrProvability.judge.model`) is an instrument the gate is measured by:
+  // listed beside the watchme judge, with its profile provenance, never
+  // offered to a downshift search.
+  const PROVABLE = `
+name: provable
+target: cli
+models:
+  cheap:
+    model: claude-haiku-4-5
+    max_tokens: 1024
+agent:
+  model: claude-opus-5
+  instructions: cite everything
+tools: [WebFetch]
+provability:
+  level: grounded
+  judge:
+    model: $cheap
+`;
+
+  test("provability.judge.model enumerates as a judge slot, with its profile, and is NOT swappable", () => {
+    const slots = walk(PROVABLE);
+    const judge = slots.find((s) => s.label === "provability.judge.model");
+    expect(judge).toMatchObject({
+      model: "claude-haiku-4-5",
+      kind: "judge",
+      path: ["provability", "judge", "model"],
+      profile: "cheap",
+      maxTokens: 1024,
+      swappable: false,
+    });
+    expect(auxModelsFor(slots)).toContainEqual({
+      slot: "provability.judge.model",
+      model: "claude-haiku-4-5",
+    });
+  });
+
+  test("a provability block with no judge adds no slot (zero model spend, nothing to list)", () => {
+    const slots = walk(PROVABLE.replace("  judge:\n    model: $cheap\n", ""));
+    expect(slots.some((s) => s.label.startsWith("provability."))).toBe(false);
+  });
+
   test("no judge-kind slot of any shape is swappable", () => {
-    for (const yaml of [JUDGED, POOLED]) {
+    for (const yaml of [JUDGED, POOLED, PROVABLE]) {
       for (const s of walk(yaml)) {
         if (s.kind === "judge") expect(s.swappable).toBe(false);
       }
