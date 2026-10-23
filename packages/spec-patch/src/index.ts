@@ -219,6 +219,15 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
       `patch target "${patch.target}" does not match spec target "${spec.target}"`,
     );
   }
+  // 0.8.0 §9.2 (review I62) — a refused leaf is refused on EVERY target, by
+  // the rule that wins over every admission: no OPTIMIZABLE_PATHS entry can
+  // admit it, so the message names its own reason rather than suggesting one.
+  const refused = refusedLeafIn(patch.path);
+  if (refused !== undefined) {
+    throw new SpecPatchError(
+      `path ${formatPath(patch.path)} is not optimizable on any target: ${refusedLeafReason(refused)} (an OPTIMIZER_REFUSED_LEAVES row — no OPTIMIZABLE_PATHS entry can admit it)`,
+    );
+  }
   if (!isOptimizable(spec.target, patch.path)) {
     throw new SpecPatchError(
       `path ${formatPath(patch.path)} is not listed in OPTIMIZABLE_PATHS for target "${spec.target}"; add it to packages/spec-patch/src/index.ts if it's intended to be tunable`,
@@ -228,43 +237,104 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
   // `model_pool.learning` is whitelisted WHOLESALE (the advisor patches the
   // block), so a patch at the block carrying a `seed` key would move a leaf
   // the path check just refused. A routed eval pins that seed; a patch to it
-  // would produce a measured delta of guaranteed zero.
-  const moved = refusedBlockValueKey(spec, patch.path, patch.value);
+  // would produce a measured delta of guaranteed zero. 0.8.0 §9.2: the same
+  // holds for any wholesale entry over a refused leaf (`provability` and its
+  // floor), and for a `remove` of the block.
+  const moved = refusedLeafChange(spec, patch);
   if (moved !== undefined) {
     throw new SpecPatchError(
-      `patch at ${formatPath(patch.path)} would change "${moved}", which is not optimizable: a routed eval PINS model_pool.learning.seed, so a patch to it measures a guaranteed-zero delta. Re-issue the block patch carrying the spec's existing seed (a block patch that PRESERVES it is fine).`,
+      `patch at ${formatPath(patch.path)} would change "${moved.key}", which is not optimizable: ${moved.reason}. ${
+        moved.key.endsWith("model_pool.learning.seed")
+          ? "Re-issue the block patch carrying the spec's existing seed (a block patch that PRESERVES it is fine)."
+          : "A block patch that PRESERVES it is fine."
+      }`,
     );
   }
 }
 
+/** A refused leaf a block-level patch would change: its dotted path in the spec, and why it is refused. */
+export type RefusedLeafChange = { readonly key: string; readonly reason: string };
+
 /**
- * The refused LEAF a block-level patch's value would CHANGE, when the patch
- * lands on the parent block of an {@link OPTIMIZER_REFUSED_LEAVES} row.
+ * The refused LEAF a block-level patch would CHANGE, when the patch lands on
+ * a block ABOVE an {@link OPTIMIZER_REFUSED_LEAVES} row (its parent, or any
+ * ancestor the row names) — the half of `validatePatch` the path-level check
+ * cannot see, exported so it can be exercised over a block no
+ * {@link OPTIMIZABLE_PATHS} entry admits today (a wholesale `["provability"]`
+ * entry, say: the defence must hold before anyone adds one).
  *
  * Deliberately "change", not "carry": `crewhaus advise`'s pool rules propose a
  * whole-`learning`-block replace built by SPREADING the spec's current block,
  * so a preserved seed must pass. Only adding, removing or altering the value
- * is refused — the residual the path-level check cannot see.
+ * is refused. A `remove` drops every leaf under the block, so it changes any
+ * the spec sets.
+ *
+ * 0.8.0 §9.2 (review I62) — both sides are read through {@link blockFields},
+ * so a block's scalar shorthand counts as the mapping it means: `provability:
+ * cited` (or `off`) patched over `{ level: grounded, … }` moves the floor
+ * exactly as `{ level: cited }` would, and a block patch that keeps a
+ * shorthand spec's level passes.
  */
-function refusedBlockValueKey(
+export function refusedLeafChange(
   spec: Spec,
-  path: ReadonlyArray<SpecEditPathSegment>,
-  value: unknown,
-): string | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const segs = path.map((s) => String(s));
+  patch: Pick<SpecPatch, "path" | "op" | "value">,
+): RefusedLeafChange | undefined {
+  const segs = patch.path.map((s) => String(s));
+  const proposed = patch.op === "remove" ? undefined : patch.value;
+  const current = readSpecPath(spec, patch.path);
   for (const pattern of OPTIMIZER_REFUSED_LEAVES) {
-    const parent = pattern.slice(0, -1);
-    const leaf = pattern[pattern.length - 1] as string;
-    const endsWithParent =
-      segs.length >= parent.length &&
-      parent.every((p, i) => segs[segs.length - parent.length + i] === p);
-    if (!endsWithParent) continue;
-    const proposed = (value as Record<string, unknown>)[leaf];
-    const current = readSpecPath(spec, [...path, leaf]);
-    if (proposed !== current) return `${segs.join(".")}.${leaf}`;
+    // `covered` pattern segments end the patch path; the rest live in its value.
+    for (let covered = pattern.length - 1; covered >= 1; covered--) {
+      const head = pattern.slice(0, covered);
+      const endsWithHead =
+        segs.length >= covered && head.every((p, i) => segs[segs.length - covered + i] === p);
+      if (!endsWithHead) continue;
+      const rest = pattern.slice(covered);
+      if (leafOf(head, proposed, rest) !== leafOf(head, current, rest)) {
+        return { key: [...segs, ...rest].join("."), reason: refusedLeafReason(pattern) };
+      }
+    }
   }
   return undefined;
+}
+
+/**
+ * A block's fields as the refused-leaf check reads them (review I62): the
+ * mapping itself, or — for a block with a scalar shorthand — the mapping the
+ * shorthand means. `provability: <level>` IS `{ level: <level> }` with every
+ * other key defaulted (the spec schema's union, the compiler's lowering), so
+ * a wholesale patch carrying the string moves the floor. Anything else that
+ * is not a mapping (absent, removed, a list) has no fields: every refused
+ * leaf under it reads absent.
+ */
+function blockFields(
+  block: ReadonlyArray<string>,
+  value: unknown,
+): Readonly<Record<string, unknown>> | undefined {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (block[block.length - 1] === "provability" && typeof value === "string") {
+    return { level: value };
+  }
+  return undefined;
+}
+
+/** The value at `rest` under a block whose own path ends with `block`, through {@link blockFields}. */
+function leafOf(
+  block: ReadonlyArray<string>,
+  value: unknown,
+  rest: ReadonlyArray<string>,
+): unknown {
+  let cur = value;
+  const at = [...block];
+  for (const seg of rest) {
+    const fields = blockFields(at, cur);
+    if (fields === undefined) return undefined;
+    cur = fields[seg];
+    at.push(seg);
+  }
+  return cur;
 }
 
 /** Read a plain path out of a parsed spec. `undefined` for any missing segment. */
@@ -1542,7 +1612,11 @@ export function wildcardPlacementIssues(
  * the optimizer is graded by the provability graders AT the floor, so a
  * wholesale `["provability"]` entry added later, or a block patch carrying a
  * different `level` / `on_fail`, must still never move the bar it is graded
- * against. `crewhaus doctor --philosophy-alignment` checks the same path.
+ * against — nor a patch carrying the shorthand `provability: <level>`, nor a
+ * `remove` of the block ({@link refusedLeafChange}). A path that reaches a
+ * row is refused with the row's own reason, never "add it to
+ * OPTIMIZABLE_PATHS" (an entry could not admit it). `crewhaus doctor
+ * --philosophy-alignment` checks the same path.
  */
 export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(["model_pool", "learning", "seed"]),
@@ -1550,12 +1624,39 @@ export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Ob
   Object.freeze(["provability", "on_fail"]),
 ]);
 
-/** True when `path` contains one of {@link OPTIMIZER_REFUSED_LEAVES} as a contiguous run. */
-function isRefusedLeaf(path: ReadonlyArray<SpecEditPathSegment>): boolean {
+/**
+ * Why each {@link OPTIMIZER_REFUSED_LEAVES} row is refused — what
+ * `validatePatch` says when a patch reaches one, by its path or through a
+ * block (review I62). A row without its own reason says the generic one.
+ */
+const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
+  "model_pool.learning.seed":
+    "a routed eval PINS model_pool.learning.seed, so a patch to it measures a guaranteed-zero delta",
+  "provability.level":
+    "the provability floor is the bar the optimizer is graded against — moving it would blind the critic (design §9.2)",
+  "provability.on_fail":
+    "what a below-floor answer becomes (retry / halt / note / escalate) is human-owned semantics the optimizer is graded under (design §9.2)",
+});
+
+function refusedLeafReason(pattern: ReadonlyArray<string>): string {
+  return (
+    REFUSED_LEAF_REASONS[pattern.join(".")] ?? `${pattern.join(".")} is refused for every target`
+  );
+}
+
+/** The {@link OPTIMIZER_REFUSED_LEAVES} row `path` contains as a contiguous run, if any. */
+function refusedLeafIn(
+  path: ReadonlyArray<SpecEditPathSegment>,
+): ReadonlyArray<string> | undefined {
   const segs = path.map((s) => String(s));
-  return OPTIMIZER_REFUSED_LEAVES.some((pattern) =>
+  return OPTIMIZER_REFUSED_LEAVES.find((pattern) =>
     segs.some((_s, i) => pattern.every((p, j) => segs[i + j] === p)),
   );
+}
+
+/** True when `path` contains one of {@link OPTIMIZER_REFUSED_LEAVES} as a contiguous run. */
+function isRefusedLeaf(path: ReadonlyArray<SpecEditPathSegment>): boolean {
+  return refusedLeafIn(path) !== undefined;
 }
 
 export function isOptimizable(

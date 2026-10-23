@@ -127,7 +127,14 @@ describe("formatSessionEvent", () => {
   });
 
   test("0.6.0 — routing kinds render by default and are hidden by transcriptOnly", () => {
-    for (const kind of ["model_route", "cost_accrual", "model_stage", "judge_verdict"]) {
+    for (const kind of [
+      "model_route",
+      "cost_accrual",
+      "model_stage",
+      "judge_verdict",
+      "provability_graded",
+      "proof_checked",
+    ]) {
       expect(formatSessionEvent({ kind, payload: {} }, opts)).toBeDefined();
       expect(
         formatSessionEvent({ kind, payload: {} }, { ...opts, transcriptOnly: true }),
@@ -447,6 +454,132 @@ describe("formatSessionEvent — 0.6.0 routing lines", () => {
     );
   });
 
+  test("0.8.0 — provability_graded renders the gate's verdict: rung, mark, claims, retry, bundle", () => {
+    // The payload runtime-core logs (summarizeBundle + maxRetries, turnNumber, bundlePath).
+    const graded = (extra: Record<string, unknown>) =>
+      formatSessionEvent(
+        {
+          kind: "provability_graded",
+          payload: {
+            level: "grounded",
+            verdict: "fail",
+            score: 0,
+            threshold: 1,
+            achieved: "cited",
+            claims: 2,
+            met: 0,
+            unmet: 1,
+            assumptions: 1,
+            retryIndex: 0,
+            maxRetries: 1,
+            turnNumber: 1,
+            bundleHash: "ab".repeat(32),
+            bundlePath: ".crewhaus/proofs/support-bot/sess_00000000000000aa/turn-1.json",
+            ...extra,
+          },
+        },
+        opts,
+      );
+    expect(graded({})).toBe(
+      "  ⚖ provability grounded ✗ 0/1 claim 1 assumption (reached cited) · .crewhaus/proofs/support-bot/sess_00000000000000aa/turn-1.json",
+    );
+    expect(
+      graded({
+        verdict: "pass",
+        score: 1,
+        achieved: "grounded",
+        claims: 6,
+        met: 6,
+        unmet: 0,
+        assumptions: 0,
+        retryIndex: 1,
+        judgeModel: "claude-haiku-4-5",
+      }),
+    ).toBe(
+      "  ⚖ provability grounded ✓ 6/6 claims waiver by claude-haiku-4-5 retry 1 · .crewhaus/proofs/support-bot/sess_00000000000000aa/turn-1.json",
+    );
+    // A verifier that threw: never a ✓.
+    expect(graded({ verdict: "unverified", claims: 0, met: 0, assumptions: 0 })).toBe(
+      "  ⚖ provability grounded ? unverified 0/0 claims · .crewhaus/proofs/support-bot/sess_00000000000000aa/turn-1.json",
+    );
+    expect(graded({ escalatedTo: "anthropic/claude-opus-5", bundlePath: undefined })).toBe(
+      "  ⚖ provability grounded ✗ 0/1 claim 1 assumption (reached cited) → escalate anthropic/claude-opus-5",
+    );
+  });
+
+  test("0.8.0 — proof_checked renders the checker, its verdict and the artifact", () => {
+    expect(
+      formatSessionEvent(
+        {
+          kind: "proof_checked",
+          payload: {
+            checker: "builtin",
+            ok: false,
+            artifactId: "prf_3f9a00000000000a",
+            durationMs: 12.4,
+            axioms: [],
+          },
+        },
+        opts,
+      ),
+    ).toBe("  ∎ proof builtin ✗ rejected prf_3f9a00000000000a (12ms)");
+    expect(
+      formatSessionEvent(
+        {
+          kind: "proof_checked",
+          payload: {
+            checker: "lean4",
+            ok: true,
+            artifactId: "prf_3f9a00000000000b",
+            durationMs: 2100,
+            axioms: ["propext", "Classical.choice"],
+          },
+        },
+        opts,
+      ),
+    ).toBe(
+      "  ∎ proof lean4 ✓ accepted prf_3f9a00000000000b (2100ms) axioms: propext, Classical.choice",
+    );
+  });
+
+  test("0.8.0 — a provability retry reads as verdict, nudge, verdict", () => {
+    const line = (kind: string, payload: unknown) => `${JSON.stringify({ kind, payload })}\n`;
+    const text =
+      line("assistant_message", { content: [{ type: "text", text: "30 days [1]." }] }) +
+      line("provability_graded", {
+        level: "grounded",
+        verdict: "fail",
+        claims: 1,
+        met: 0,
+        assumptions: 0,
+        achieved: "cited",
+        retryIndex: 0,
+      }) +
+      line("user_message", { content: "The provability gate did not accept…", synthetic: true }) +
+      line("assistant_message", { content: [{ type: "text", text: "14 days [1]." }] }) +
+      line("provability_graded", {
+        level: "grounded",
+        verdict: "pass",
+        claims: 1,
+        met: 1,
+        assumptions: 0,
+        achieved: "grounded",
+        retryIndex: 1,
+      });
+    expect(renderSessionLog(text, { withTime: false })).toEqual([
+      "asst> 30 days [1].",
+      "  ⚖ provability grounded ✗ 0/1 claim (reached cited)",
+      "sys> The provability gate did not accept…",
+      "asst> 14 days [1].",
+      "  ⚖ provability grounded ✓ 1/1 claim retry 1",
+    ]);
+    expect(renderSessionLog(text, { withTime: false, transcriptOnly: true })).toEqual([
+      "asst> 30 days [1].",
+      "sys> The provability gate did not accept…",
+      "asst> 14 days [1].",
+    ]);
+  });
+
   test("every routing-line field is one line and capped at maxChars, like transcript text", () => {
     // `requested` is user-typed `/model …` text; a newline in it must not
     // print what looks like a second transcript line.
@@ -502,6 +635,25 @@ describe("formatSessionEvent — 0.6.0 routing lines", () => {
         capped,
       ),
     ).toBe("  $ $0.0000 m[p q]");
+    // The provability lines' strings (the bundle path, the checker's axioms) too.
+    expect(
+      formatSessionEvent(
+        {
+          kind: "provability_graded",
+          payload: { level: "cited", verdict: "pass", bundlePath: `a\nb ${long}` },
+        },
+        capped,
+      ),
+    ).toBe(`  ⚖ provability cited ✓ · a b ${"r".repeat(35)}…`);
+    expect(
+      formatSessionEvent(
+        {
+          kind: "proof_checked",
+          payload: { checker: "lean4", ok: true, axioms: ["x\n12:00:00 user> FAKE", long] },
+        },
+        capped,
+      ),
+    ).toBe(`  ∎ proof lean4 ✓ accepted axioms: x 12:00:00 user> FAKE, ${"r".repeat(16)}…`);
   });
 
   test("formatUsdMicros guards a missing value", () => {

@@ -5,7 +5,7 @@
  * deliberately differs (no HEAD, no replay, no judge) it says so in `notes`.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createBuiltinChecker } from "@crewhaus/proof-checker";
 import {
@@ -31,6 +31,7 @@ import {
   preflightBundle,
   preflightConfig,
   preflightReport,
+  proofRecheck,
 } from "./index";
 import {
   MEETINGS,
@@ -113,8 +114,21 @@ async function gate(s: Setup, draft: string, level = config("grounded")): Promis
     evidence: buildEvidenceIndex(records),
     artifacts: createFileArtifactStore({ rootDir: s.proofs }),
     workspaceRoot: s.workspace,
+    recheckProof: proofRecheck({ timeoutMs: level.formal.timeoutMs }),
     now,
   });
+}
+
+/**
+ * One ProofCheck call as the run makes it: the tool runs, and the runtime
+ * logs its `tool_use` and `tool_result` in the session log, where the
+ * `proven` rung reads that a checker accepted the artifact it wrote.
+ */
+async function proofChecked(s: Setup, input: Record<string, unknown>): Promise<Json> {
+  const raw = (await s.tools.proofCheck.execute(input, s.ctx)) as string;
+  const out = JSON.parse(raw);
+  await writeLog(s.sessions, SESSION, call(`toolu_${out.id}`, "ProofCheck", input, raw));
+  return out;
 }
 
 /** The report the preflight would give for `bundle` (no notes). */
@@ -228,20 +242,13 @@ describe("the same verdict the gate would give", () => {
 describe("proven claims and the shared artifacts root", () => {
   test("a sentence citing a ProofCheck artifact is proven; a rejected one is proof_rejected", async () => {
     const s = setup(config("proven"));
-    const good = JSON.parse(
-      (await s.tools.proofCheck.execute({ checker: "builtin", ...MEETINGS }, s.ctx)) as string,
-    );
-    const bad = JSON.parse(
-      (await s.tools.proofCheck.execute(
-        {
-          checker: "builtin",
-          claim: MEETINGS.claim,
-          statement: MEETINGS.falseStatement,
-          proof: "eval",
-        },
-        s.ctx,
-      )) as string,
-    );
+    const good = await proofChecked(s, { checker: "builtin", ...MEETINGS });
+    const bad = await proofChecked(s, {
+      checker: "builtin",
+      claim: MEETINGS.claim,
+      statement: MEETINGS.falseStatement,
+      proof: "eval",
+    });
     const cite = (id: string) => `No two of the three meetings overlap [1].\n\n[1]: proof:${id}\n`;
     const proven = await preflight(s, cite(good.id));
     expect(proven).toEqual(reportOf(await gate(s, cite(good.id), config("proven"))));
@@ -260,12 +267,47 @@ describe("proven claims and the shared artifacts root", () => {
 
   test("a proof cited on a sentence that says the opposite is claim_mismatch", async () => {
     const s = setup(config("proven"));
-    const good = JSON.parse(
-      (await s.tools.proofCheck.execute({ checker: "builtin", ...MEETINGS }, s.ctx)) as string,
-    );
+    const good = await proofChecked(s, { checker: "builtin", ...MEETINGS });
     const draft = `Two of the three meetings overlap [1].\n\n[1]: proof:${good.id}\n`;
     const out = await preflight(s, draft);
     expect(out.table[0].evidence[0].reason).toBe("claim_mismatch");
+  });
+
+  test("an accepted artifact rewritten after the check is not proven, by the log or the re-check", async () => {
+    const s = setup(config("proven"));
+    const good = await proofChecked(s, {
+      checker: "builtin",
+      claim: "Two plus two is four.",
+      statement: "2 + 2 = 4",
+      proof: "eval",
+    });
+    // The file is the model's to write: the claim and statement swapped for
+    // ones the checker rejects, the id and the verdict kept.
+    const store = createFileArtifactStore({ rootDir: s.proofs });
+    const stored = await store.get(good.id);
+    if (stored === undefined) throw new Error("no artifact");
+    const path = join(s.proofs, "artifacts", `${good.id}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({ ...stored, claim: MEETINGS.claim, statement: MEETINGS.falseStatement }),
+    );
+    const draft = `${MEETINGS.claim.replace(/\.$/, "")} [1].\n\n[1]: proof:${good.id}\n`;
+    const out = await preflight(s, draft);
+    expect(out.verdict).toBe("fail");
+    expect(out.table[0].evidence[0].reason).toBe("proof_missing");
+    expect(out).toEqual(reportOf(await gate(s, draft, config("proven"))));
+    // Read with no log at hand (trustStoredProofs), the re-check alone
+    // still refuses the statement the builtin checker rejects.
+    const offline = await verifyDocument(draft, {
+      config: config("proven"),
+      evidence: buildEvidenceIndex([]),
+      artifacts: store,
+      workspaceRoot: s.workspace,
+      trustStoredProofs: true,
+      recheckProof: proofRecheck({ timeoutMs: config("proven").formal.timeoutMs }),
+      now,
+    });
+    expect(offline.claims[0]?.bindings[0]?.reason).toBe("proof_rejected");
   });
 });
 

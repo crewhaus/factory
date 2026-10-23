@@ -1,5 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openEventLog } from "@crewhaus/event-log";
@@ -11,6 +19,8 @@ import {
   groundingBody,
   recordFromCall,
   restrictToTurns,
+  servesPage,
+  spilledOutput,
 } from "./evidence";
 import { fetched } from "./test-helpers";
 
@@ -134,18 +144,67 @@ describe("recordFromCall origins", () => {
     ]);
   });
 
-  test("a WebFetch result's URL line is indexed beside the requested URL", () => {
+  test("a WebFetch header naming the final URL (and the one requested) indexes both", () => {
+    // The header tool-web prints after a redirect (`webFetchHeader`):
+    // `URL: <final>`, then `Requested: <asked>`.
     const record = recordFromCall(
       {
         toolUseId: "t",
         toolName: "WebFetch",
         input: { url: "http://acme.example/old" },
-        content: fetched("https://acme.example/new/", "Body text."),
+        content:
+          "URL: https://acme.example/new/\nRequested: http://acme.example/old\nStatus: 200\nContent-Type: text/html\n\nBody text.",
         isError: false,
       },
       roots,
     );
     expect(record.origins).toEqual(["http://acme.example/old", "https://acme.example/new"]);
+    expect(record.status).toBe(200);
+    expect(groundingBody(record)).toBe("Body text.");
+  });
+
+  test("a header with no Requested: line names one URL, and only that one is indexed", () => {
+    // tool-web prints `Requested:` only when a redirect moved the fetch, so
+    // a header without it (no redirect, or a tool-web older than 0.8.0)
+    // names the page that was asked for and nothing else.
+    const record = recordFromCall(
+      {
+        toolUseId: "t",
+        toolName: "WebFetch",
+        input: { url: "http://acme.example/old" },
+        content: fetched("http://acme.example/old", "Body text."),
+        isError: false,
+      },
+      roots,
+    );
+    expect(record.origins).toEqual(["http://acme.example/old"]);
+  });
+
+  test("a fetcher's HTTP status is carried; a malformed header carries none", () => {
+    const of = (toolName: string, content: string) =>
+      recordFromCall(
+        {
+          toolUseId: "t",
+          toolName,
+          input: { url: "https://a.example/x" },
+          content,
+          isError: false,
+        },
+        roots,
+      );
+    expect(of("WebFetch", "URL: https://a.example/x\nStatus: 404\n\nNot Found").status).toBe(404);
+    expect(
+      of("Fetch", "HTTP 503 Service Unavailable\ncontent-type: text/plain\n\ndown").status,
+    ).toBe(503);
+    expect(of("Fetch", "HTTP/1.1 200 OK\nx-a: 1\n\nok").status).toBe(200);
+    // Read off the tool that prints it only, and not off a header-less result.
+    expect(
+      of("mcp__web__fetch", "URL: https://a.example/x\nStatus: 404\n\nx").status,
+    ).toBeUndefined();
+    expect(of("WebFetch", "Status: 404 is a page title").status).toBeUndefined();
+    expect(servesPage(undefined)).toBe(true);
+    expect([200, 204, 299].every(servesPage)).toBe(true);
+    expect([301, 304, 404, 410, 500, 503].some(servesPage)).toBe(false);
   });
 
   test("a body that merely starts with 'URL:' is not a header", () => {
@@ -208,6 +267,81 @@ describe("recordFromCall origins", () => {
       ].filter((h) => h.content !== ""),
     );
   });
+
+  test("JSON hits come from an MCP tool only, never from a runtime tool whose result is model output", () => {
+    // Task returns a sub-agent's final message, Consult/Escalate a sibling
+    // model's reply, Skill a skill body: JSON-shaped, they are still the
+    // model's writing, and would ground a page nobody fetched (design §8).
+    const content = JSON.stringify([
+      { url: "https://acme.example/policy", text: "Acme accepts refunds within 30 days." },
+    ]);
+    for (const toolName of [
+      "Task",
+      "Consult",
+      "Escalate",
+      "Skill",
+      "A2A",
+      "Recall",
+      "PlanRead",
+      "GoalList",
+      "MCP__search__query",
+      "my_plugin_search",
+    ]) {
+      const record = recordFromCall(
+        {
+          toolUseId: "j",
+          toolName,
+          input: { prompt: "research refunds" },
+          content,
+          isError: false,
+        },
+        roots,
+      );
+      expect([toolName, record.hits]).toEqual([toolName, undefined]);
+      expect(buildEvidenceIndex([record]).bySource("https://acme.example/policy")).toEqual([]);
+    }
+    const mcp = recordFromCall(
+      { toolUseId: "j", toolName: "mcp__search__query", input: {}, content, isError: false },
+      roots,
+    );
+    expect(mcp.hits).toEqual([
+      { origin: "https://acme.example/policy", content: "Acme accepts refunds within 30 days." },
+    ]);
+  });
+
+  test("an MCP hit's origin is read in time linear in its length", () => {
+    // An MCP response is untrusted (AGENTS.md Pillar 3): a url field of a
+    // long run of dots inside angle brackets took quadratic time to classify
+    // (originOfValue → classifyDefinition). Timed against the same size of
+    // plain letters, the least of three runs, so a slow machine slows both.
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const call = (url: string) => () =>
+      buildEvidenceIndex([
+        recordFromCall(
+          {
+            toolUseId: "j",
+            toolName: "mcp__search__query",
+            input: {},
+            content: JSON.stringify({ results: [{ url, text: "Refunds take 14 days." }] }),
+            isError: false,
+          },
+          roots,
+        ),
+      ]);
+    const n = 200_000;
+    const base = fastest(call(`<https://search.example/${"a".repeat(n)}x>`));
+    expect(fastest(call(`<https://search.example/${".".repeat(n)}x>`))).toBeLessThan(
+      base * 20 + 100,
+    );
+  }, 20_000);
 
   test("hit-shaped output the model could have written is not read as hits or headers", () => {
     const jsonHits = JSON.stringify([
@@ -605,6 +739,190 @@ describe("evidenceFromSessionLog", () => {
     const garbage = tempDir();
     writeFileSync(join(garbage, `${PARENT}.jsonl`), "{not json\n");
     expect(await evidenceFromSessionLog({ sessionId: PARENT, rootDir: garbage })).toEqual([]);
+  });
+
+  test("one id logged twice pairs its LAST call with its LAST result, as continuity-store reads it", async () => {
+    // continuity-store's `scanSession` (PlanComplete's resolver) keeps the
+    // last tool_use and the last tool_result of an id; the checked rung
+    // reading the same log otherwise gave the opposite verdict (design §6.3).
+    const rootDir = tempDir();
+    const use = (id: string, input: unknown, turnNumber?: number) => ({
+      kind: "tool_use",
+      payload: { id, name: "MoneyAdd", input, ...(turnNumber !== undefined ? { turnNumber } : {}) },
+    });
+    const result = (id: string, content: string, isError = false) => ({
+      kind: "tool_result",
+      payload: { toolUseId: id, content, isError },
+    });
+    await writeLog(rootDir, PARENT, [
+      use("ok_then_error", { amountsMinor: ["128450"] }),
+      result("ok_then_error", "1284.50"),
+      result("ok_then_error", "boom", true),
+      use("error_then_ok", { amountsMinor: ["128450"] }),
+      result("error_then_ok", "boom", true),
+      result("error_then_ok", "1284.50"),
+      // A provider that reuses ids (`functions.MoneyAdd:0`): two whole calls.
+      use("functions.MoneyAdd:0", { amountsMinor: ["500", "500"] }, 1),
+      result("functions.MoneyAdd:0", "10.00"),
+      use("functions.MoneyAdd:0", { amountsMinor: ["100000", "28450"] }, 2),
+      result("functions.MoneyAdd:0", "1284.50"),
+    ]);
+    const records = await evidenceFromSessionLog({ sessionId: PARENT, rootDir });
+    expect(records.map((r) => [r.toolUseId, r.content, r.isError])).toEqual([
+      ["ok_then_error", "boom", true],
+      ["error_then_ok", "1284.50", false],
+      ["functions.MoneyAdd:0", "1284.50", false],
+    ]);
+    // The reused id's record is ONE call — its input and its own result —
+    // never the second call's input beside the first call's result.
+    expect(records[2]).toMatchObject({
+      input: { amountsMinor: ["100000", "28450"] },
+      turnNumber: 2,
+    });
+    // The transcript is read by the same rule.
+    const messages = [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "r", name: "MoneyAdd", input: { amountsMinor: ["1"] } }],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: "0.01" }] },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "r", name: "MoneyAdd", input: { amountsMinor: ["2"] } }],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "r", content: "0.02" }] },
+    ];
+    expect(evidenceFromMessages(messages).map((r) => [r.toolUseId, r.input, r.content])).toEqual([
+      ["r", { amountsMinor: ["2"] }, "0.02"],
+    ]);
+  });
+});
+
+describe("spilled results (tool-result-store's preview)", () => {
+  /** A 15 KB page whose line 151 says what a claim will cite. */
+  const page = Array.from({ length: 200 }, (_, i) =>
+    i === 150
+      ? "Acme accepts refund requests within 30 days of purchase."
+      : `Line ${i + 1} of the help centre: shipping, sizing and gift cards are covered here.`,
+  ).join("\n");
+  const head = page.split("\n").slice(0, 100).join("\n");
+  const preview = (path: string, toolUseId = "toolu_big") =>
+    `${head}\n[part 1 of 2; Read .crewhaus/tool-results/run_1/${toolUseId}.part-2.txt for part 2]\n[truncated, full output at ${path}]`;
+
+  function workspace(): string {
+    const ws = tempDir();
+    mkdirSync(join(ws, ".crewhaus", "tool-results", "run_1"), { recursive: true });
+    writeFileSync(join(ws, ".crewhaus", "tool-results", "run_1", "toolu_big.txt"), page);
+    return ws;
+  }
+
+  test("a spilled result is read whole from the file the runtime saved it to", async () => {
+    const ws = workspace();
+    const rootDir = tempDir();
+    const content = preview(".crewhaus/tool-results/run_1/toolu_big.txt");
+    expect(content).not.toContain("30 days");
+    await writeLog(rootDir, PARENT, [
+      {
+        kind: "tool_use",
+        payload: { id: "toolu_big", name: "Read", input: { path: "help.md" } },
+      },
+      { kind: "tool_result", payload: { toolUseId: "toolu_big", content, isError: false } },
+    ]);
+    const [record] = await evidenceFromSessionLog({
+      sessionId: PARENT,
+      rootDir,
+      workspaceRoot: ws,
+    });
+    // `content` stays what the log holds (a replay is compared with it);
+    // the evidence is read from the whole output.
+    expect(record?.content).toBe(content);
+    expect(record?.body).toBe(page);
+    expect(groundingBody(record as never)).toContain("within 30 days of purchase");
+    // The transcript carries the same preview, and reads the same file.
+    const [fromMessages] = evidenceFromMessages(
+      [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_big", name: "Read", input: { path: "help.md" } },
+          ],
+        },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_big", content }] },
+      ],
+      { workspaceRoot: ws },
+    );
+    expect(fromMessages?.body).toBe(page);
+    // So does an absolute path under the runtime's own root, and a tenant's root.
+    expect(
+      spilledOutput(preview(join(ws, ".crewhaus/tool-results/run_1/toolu_big.txt")), "toolu_big", {
+        workspaceRoot: ws,
+      }),
+    ).toBe(page);
+    const tenant = tempDir();
+    mkdirSync(join(tenant, "run_9"));
+    writeFileSync(join(tenant, "run_9", "toolu_big.2.txt"), page);
+    expect(
+      spilledOutput(preview(join(tenant, "run_9", "toolu_big.2.txt")), "toolu_big", {
+        workspaceRoot: ws,
+        toolResultsRoot: tenant,
+      }),
+    ).toBe(page);
+  });
+
+  test("only THIS call's own file, under the spill root, starting with the logged head, is read", () => {
+    const ws = workspace();
+    const opts = { workspaceRoot: ws };
+    const results = join(ws, ".crewhaus", "tool-results");
+    // Another call's file — a page that ends with a forged tail naming one.
+    writeFileSync(join(results, "run_1", "toolu_other.txt"), page);
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/run_1/toolu_other.txt"), "toolu_big", opts),
+    ).toBeUndefined();
+    // A file outside the spill root, or not one run directory down.
+    writeFileSync(join(ws, "toolu_big.txt"), page);
+    expect(spilledOutput(preview("toolu_big.txt"), "toolu_big", opts)).toBeUndefined();
+    expect(spilledOutput(preview("../toolu_big.txt"), "toolu_big", opts)).toBeUndefined();
+    writeFileSync(join(results, "toolu_big.txt"), page);
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/toolu_big.txt"), "toolu_big", opts),
+    ).toBeUndefined();
+    // A part file, or a name that merely starts with the id.
+    writeFileSync(join(results, "run_1", "toolu_big.part-2.txt"), page);
+    expect(
+      spilledOutput(
+        preview(".crewhaus/tool-results/run_1/toolu_big.part-2.txt"),
+        "toolu_big",
+        opts,
+      ),
+    ).toBeUndefined();
+    // A link at the name, even to the right bytes.
+    mkdirSync(join(results, "run_2"));
+    symlinkSync(join(results, "run_1", "toolu_big.txt"), join(results, "run_2", "toolu_big.txt"));
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/run_2/toolu_big.txt"), "toolu_big", opts),
+    ).toBeUndefined();
+    // A file that does not begin with the head the log holds.
+    mkdirSync(join(results, "run_3"));
+    writeFileSync(join(results, "run_3", "toolu_big.txt"), `Something else.\n${page}`);
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/run_3/toolu_big.txt"), "toolu_big", opts),
+    ).toBeUndefined();
+    // Gone, never saved, or no tail at all: the preview stands.
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/run_4/toolu_big.txt"), "toolu_big", opts),
+    ).toBeUndefined();
+    expect(
+      spilledOutput(
+        `${head}\n[truncated; the full output could not be saved: disk full]`,
+        "toolu_big",
+        opts,
+      ),
+    ).toBeUndefined();
+    expect(spilledOutput(page, "toolu_big", opts)).toBeUndefined();
+    // The same file, named right, is read.
+    expect(
+      spilledOutput(preview(".crewhaus/tool-results/run_1/toolu_big.txt"), "toolu_big", opts),
+    ).toBe(page);
   });
 });
 

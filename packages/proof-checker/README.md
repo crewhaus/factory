@@ -170,15 +170,27 @@ values; ≤ 1 000 000 quantifier cases per check; ≤ 20 000 000 work units; num
 ≤ 8 192 bits; `arith` polynomials ≤ 2 000 terms and degree ≤ 64; a wall-clock
 deadline from `timeoutMs` (default 10 s, **capped at 10 s** —
 `maxTimeoutMs` — whatever the caller passes) and the caller's `AbortSignal`.
-The check is synchronous on the caller's thread, which is why the deadline is
+A check holds a core for its whole budget, which is why the deadline is
 capped: `formal.timeout_ms` (30 s by default, sized for a container's cold
-start) reaches the sandbox checkers whole but never stalls a harness for 30 s
-here. Parsing, measuring, printing, every rule and every loop spend from one
+start) reaches the sandbox checkers whole but never stretches a check here.
+Parsing, measuring, printing, every rule and every loop spend from one
 budget, and the clock is checked before and after each step, so a spent budget
 is a rejection, never a hang. The never-true probe alone spends from a fork of
 that budget (at most 2 s, its own work and case counts, the same deadline and
 signal), so it never eats a proof's allowance; a probe it cannot finish refutes
 nothing.
+
+`createBuiltinChecker` runs each check on a worker thread of its own, so the
+harness's event loop — every session, every tenant of a managed daemon —
+keeps running while a check does (design §18). An abort terminates the
+worker at once, as does a worker still running 2 s past its deadline (its own
+budget stops it at the deadline). At most `maxConcurrentChecks` (4) run at a
+time; a check past that waits for a free thread inside its own deadline. The worker runs `src/builtin/worker-source.ts`, the checker bundled
+as text so a `bun build --compile` binary carries it; after changing the
+checker run `bun run scripts/gen-worker-source.ts` (a test fails until you
+do). Where no worker can start, the check runs on the caller's thread after
+one yield; `builtinCheckerCounts()` reports how often. `checkCertificate` is
+the same check, synchronous, on whatever thread calls it.
 
 ## `smt` — Z3 in a sandbox
 

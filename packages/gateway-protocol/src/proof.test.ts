@@ -190,6 +190,39 @@ describe("ProofBundle — every shape the verifier produces parses", () => {
     expect(ProofBundle.parse(b)).toEqual(b);
   });
 
+  test("a proven claim whose proof rests on hypotheses: counted, listed on the binding and the checker", async () => {
+    const id = "prf_00000000000000aa";
+    const artifact = {
+      version: 1 as const,
+      id,
+      checker: "builtin",
+      claim: "No two of the six meetings overlap.",
+      statement: "forall i j in 1..6, i != j -> disjoint(m_i, m_j)",
+      proof: "1. given ...",
+      ok: true,
+      assumptions: ["meeting 6 is cancelled"],
+      axioms: [],
+      output: "proved from 1 assumption",
+      outputDigest: `sha256:${"0".repeat(64)}`,
+      checkedAt: NOW().toISOString(),
+    };
+    const b = await verifyDocument(`No two of the six meetings overlap [1].\n\n[1]: proof:${id}`, {
+      config: config("proven"),
+      evidence,
+      artifacts: {
+        get: async (want: string) => (want === id ? artifact : undefined),
+        put: async () => {},
+        list: async () => [artifact],
+      },
+      trustStoredProofs: true,
+      now: NOW,
+    });
+    expect(b.hypotheses).toBe(1);
+    expect(b.claims[0]?.bindings[0]?.assumptions).toEqual(["meeting 6 is cancelled"]);
+    expect(b.checkers?.[0]?.assumptions).toEqual(["meeting 6 is cancelled"]);
+    expect(ProofBundle.parse(b)).toEqual(b);
+  });
+
   test("a vacuous pass (no claims) and an unverified bundle", async () => {
     const vacuous = await bundleOf("Which order do you mean?", "cited");
     expect(vacuous.vacuous).toBeDefined();

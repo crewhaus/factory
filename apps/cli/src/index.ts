@@ -29,8 +29,10 @@ import {
   type IrNode,
   SpecParseError,
   checkShapeTools,
+  collectCompileWarnings,
   compile,
   lower,
+  lowerWithWarnings,
   provabilityOf,
   toolSitesOf,
 } from "@crewhaus/compiler";
@@ -790,6 +792,9 @@ import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./docto
 // plus doctor's proof-checker probe. Side-effect-free modules, unit-tested
 // without this entry file's argv switch.
 import { provabilityPhilosophyFindings } from "./doctor-provability";
+// 0.8.0 §11 — writes a verb awaits before its hard exit, so a pipe gets every
+// byte (`provability … --json | jq`), side-effect-free and subprocess-tested.
+import { drainedOutput } from "./drained-output";
 // v0.3.0 PR 14 — `crewhaus dream run|status|init` (design §6.3), in a
 // side-effect-free module; only the dispatch registration lives here.
 import { DREAM_CLI_SCHEMA, runDreamCommand } from "./dream-cli";
@@ -869,6 +874,9 @@ import {
 // C28 — `crewhaus eval plan`: the offline sample-size helper (pure
 // arithmetic + the pilot reader), in its own side-effect-free module.
 import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
+// 0.8.0 §9.1 — the block `eval --provability <level>` measures when the spec
+// parks its provability: block at level: off (lowered to none otherwise).
+import { parkedProvabilityBlock } from "./eval-provability";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -1318,6 +1326,7 @@ import {
 } from "./propose";
 import {
   ProvabilityCliError,
+  irToolKeys,
   provabilityDoctorChecks,
   runProvabilityCommand,
 } from "./provability-cli";
@@ -2160,10 +2169,19 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // the Worker applies), and any emitter refusal (an unsupported target, a
     // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
     try {
-      const cfIr = lower(parseSpec(yamlText));
+      const cfSpec = parseSpec(yamlText);
+      // Lowered with its warnings, as compile() lowers: a parked
+      // `provability: { level: off, … }` block (provability-inert-block) or
+      // any other lowering notice is said here too, and --strict fails on it
+      // on the edge path exactly as on the local one.
+      const cfLowered = lowerWithWarnings(cfSpec);
+      const emitted = emitCfWorkerBundle(cfLowered.ir, { readme });
       // Warnings ride along like compile()'s: printed below, and escalated by
       // --strict before any file is written.
-      bundle = emitCfWorkerBundle(cfIr, { readme });
+      bundle = {
+        ...emitted,
+        warnings: [...collectCompileWarnings(cfSpec), ...cfLowered.warnings, ...emitted.warnings],
+      };
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
@@ -6362,16 +6380,21 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
   }
 
   // 0.8.0 §11 — the proof checkers' availability probe, when the cwd spec's
-  // provability: block lists a sandbox checker (smt / lean4): the same
-  // available() `crewhaus provability checkers` and the ProofCheckers tool
-  // report (sandbox backend + image health), bounded per checker. Behind
-  // --probe with the other live checks: on docker, healthchecking an image
-  // that is not local pulls it. Without --probe, one ~ line says so; probed,
-  // an unavailable checker is a warning — builtin is always there.
+  // harness runs a checker at all (a proven floor, formal.checkers of its
+  // own, or proofCheck in tools: — never a cited floor on the lowered
+  // defaults) and lists a sandbox one (smt / lean4): the same available()
+  // `crewhaus provability checkers` and the ProofCheckers tool report
+  // (sandbox backend + image health), bounded per checker. Behind --probe
+  // with the other live checks: on docker, healthchecking an image that is
+  // not local pulls it. Without --probe, one ~ line says so; probed, an
+  // unavailable checker is a warning — builtin is always there.
   if (specText !== undefined) {
     let provability: ReturnType<typeof provabilityOf>;
+    let tools: string[] = [];
     try {
-      provability = provabilityOf(lower(parseSpec(specText)));
+      const ir = lower(parseSpec(specText));
+      provability = provabilityOf(ir);
+      tools = irToolKeys(ir);
     } catch {
       provability = undefined; // doctor's spec checks report a spec that does not lower
     }
@@ -6379,7 +6402,7 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
       ...(await provabilityDoctorChecks(
         provability,
         { env: process.env },
-        { probe: args.flags["probe"] === true },
+        { probe: args.flags["probe"] === true, tools },
       )),
     );
   }
@@ -9834,8 +9857,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
   let ir: ReturnType<typeof lower>;
+  let evalSpec: ReturnType<typeof parseSpec>;
   try {
-    ir = lower(parseSpec(yamlText));
+    evalSpec = parseSpec(yamlText);
+    ir = lower(evalSpec);
   } catch (err) {
     if (err instanceof SpecParseError) die(err.message);
     throw err;
@@ -9847,6 +9872,24 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   if (ir.target !== "cli") {
     die(`crewhaus eval only supports target: cli (got "${ir.target}")`);
   }
+  // 0.8.0 §9.1 / §3 — a block PARKED at `level: off` lowers to none, so the
+  // runner would measure the shorthand's defaults instead of the declared
+  // threshold, on_fail and sources: re-validate it at the --provability rung
+  // and hand the runner THAT block to re-level (eval-provability.ts).
+  let parkedBlock: ReturnType<typeof parkedProvabilityBlock>;
+  if (evalProvability !== undefined) {
+    try {
+      parkedBlock = parkedProvabilityBlock(yamlText, evalSpec, evalProvability);
+    } catch (err) {
+      if (err instanceof SpecParseError) {
+        die(
+          `--provability ${evalProvability}: the spec's provability block is parked at level: off, and does not hold at ${evalProvability} — ${err.message}`,
+        );
+      }
+      throw err;
+    }
+  }
+  const evalIr: typeof ir = parkedBlock !== undefined ? { ...ir, provability: parkedBlock } : ir;
 
   let gradersYaml: string;
   try {
@@ -10030,8 +10073,14 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     (typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>"));
   process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
   if (evalProvability !== undefined) {
+    const declared =
+      parkedBlock !== undefined
+        ? "parks its block at level: off — that block runs at this rung"
+        : ir.provability !== undefined
+          ? `declares ${ir.provability.level}`
+          : "declares none — the defaults run";
     process.stdout.write(
-      `[eval] provability: gating every sample at ${evalProvability} (spec ${ir.provability !== undefined ? `declares ${ir.provability.level}` : "declares none"}) + the six provability.* graders — recorded, never promoted\n`,
+      `[eval] provability: gating every sample at ${evalProvability} (spec ${declared}) + the six provability.* graders — recorded, never promoted\n`,
     );
   }
   if (resumeDir !== undefined) {
@@ -10054,7 +10103,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   const cassetteOrResume =
     resumeDir !== undefined || recordToolsDir !== undefined || replayToolsDir !== undefined;
   const summary = await runEvalLib({
-    ir,
+    ir: evalIr,
     dataset,
     compiledGraders: compiled,
     opts: {
@@ -16242,8 +16291,9 @@ async function runSessions(args: ParsedArgs): Promise<void> {
         "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
         "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
         "  tool call + result, and failure prints one line as it lands, and so does each\n" +
-        "  routing decision (⇢), cost accrual ($), judge verdict (⚖) and hybrid-strategy\n" +
-        "  stage (◇) the session recorded — the shape of a hybrid turn beside its text.\n" +
+        "  routing decision (⇢), cost accrual ($), judge or provability verdict (⚖),\n" +
+        "  proof check (∎) and hybrid-strategy stage (◇) the session recorded — the\n" +
+        "  shape of a hybrid turn beside its text.\n" +
         "  --transcript-only hides those. --no-follow dumps the current transcript and\n" +
         "  exits (scriptable/CI); --interval sets the poll ms (default 500). --dir points\n" +
         "  at a session store other than cwd/.crewhaus/sessions.\n" +
@@ -24230,6 +24280,10 @@ switch (subcommand) {
     const first = rest[0] ?? "";
     const isHelp = first === "--help" || first === "-h";
     const action = isHelp ? "" : first;
+    // Every write is awaited before the exit below: Bun drops what a pipe has
+    // not taken when the process exits, which cut piped `--json` (and a long
+    // report in a CI log) at 64 KiB (drained-output.ts).
+    const stdio = drainedOutput();
     try {
       const code = await runProvabilityCommand(
         action,
@@ -24238,17 +24292,19 @@ switch (subcommand) {
           cwd: process.cwd(),
           env: process.env,
           now: () => new Date(),
-          out: (text) => void process.stdout.write(text),
-          err: (text) => void process.stderr.write(text),
+          out: stdio.out,
+          err: stdio.err,
           // `checked` replay re-runs pure tools from the same literal loader
           // table `crewhaus run` wires — built only when a check needs it.
           loadCatalog: async () => Object.values(await loadToolMap()),
         },
       );
+      await stdio.drained();
       // Exit explicitly, as doctor does: a probed sandbox or an imported tool
       // package must not hold the process open past its answer.
       process.exit(code);
     } catch (err) {
+      await stdio.drained();
       if (err instanceof ProvabilityCliError || err instanceof CrewhausError) die(err.message);
       throw err;
     }

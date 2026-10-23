@@ -44,7 +44,7 @@ can never produce a ✓.
 
 | Mode | `claimed` | `proven` | Completion below `proven` |
 | --- | --- | --- | --- |
-| `ladder` (default) | free | evidence verified against the session event log | — (the pre-0.8.0 behaviour, byte for byte) |
+| `ladder` (default) | free | evidence verified against the session event log | — (the pre-0.8.0 proof behaviour and tool descriptions) |
 | `require` | free — honest progress | verified, exactly as `ladder` | refused, with an error that teaches the proof |
 | `off` | free | the cited toolUseIds are **recorded, not resolved** | — |
 
@@ -68,6 +68,14 @@ frozen proof at all, which the store never writes (a hand edit, or a step
 line a multi-line plan title smuggled into a plan file before titles were
 kept to one line). Tool descriptions say so too.
 
+Every surface counts `proven` the way the tools do (continuity-store's
+`countsAsProven`): under `require`, a step or goal proven by assertion or
+with no frozen proof is still open in the `<current_plan>` tail and in
+`handoff.md` (listed under Goals, named in Next actions as `Prove: …`), and
+the Thredz goal mirror does not complete its remote goal. `createPlanTools`
+passes its `proofMode` to the store it builds, so that store's handoff
+agrees with the tools.
+
 **`off`** exists for harnesses that keep **no session event log** — nothing
 to resolve a toolUseId against. `PlanComplete` and `GoalUpdate({status:
 "proven"})` still require cited evidence, but record it as unverified refs
@@ -81,6 +89,19 @@ file. Every render — `PlanRead`, `GoalList`, the `<current_plan>` tail,
 `handoff.md` — shows `[proven (unverified)]`, never `[proven]`. A step
 already proven with verified evidence keeps it: an unverified proof never
 downgrades a ✓.
+
+**Every mode, `ladder` included: one line per record** (0.8.0). A plan or
+goal title, and a goal unit, is stored as one line: every whitespace run,
+newlines included, collapses to one space and the ends are trimmed, as step
+text always was. A title over 512 characters (`MAX_TITLE_CHARS`) or a unit
+over 64 (`MAX_UNIT_CHARS`) is refused with nothing written. Before 0.8.0 a
+title was only trimmed and a unit kept as given, so a multi-line title could
+carry a forged `[proven]` step line into a plan file. A `PlanUpdate`,
+`GoalWrite` or `GoalUpdate` the default mode accepted before 0.8.0 can
+therefore be refused now (an oversized title or unit, or a `GoalUpdate`
+title that is only whitespace, as a new title already could not be) or be
+stored differently (a multi-line title reads back on one line). See
+continuity-store's "One line per record".
 
 ## Event emission (decoupled)
 

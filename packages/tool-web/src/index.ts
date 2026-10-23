@@ -430,11 +430,18 @@ async function readJsonCapped(res: Response): Promise<unknown> {
   return JSON.parse(await readBodyCapped(res));
 }
 
+/**
+ * Fetch `initialUrl`, following at most {@link MAX_REDIRECTS} redirects with
+ * every guard on every hop. Returns the final response and the URL it came
+ * from: the page the body is, which the result names first (`URL:`), so a
+ * citation of the page as it was served resolves (provability's
+ * `webFetchHeader` reads it, design §5.2).
+ */
 async function performWebFetch(
   initialUrl: URL,
   signal: AbortSignal,
   cfg: WebFetchConfig,
-): Promise<Response> {
+): Promise<{ readonly res: Response; readonly finalUrl: URL }> {
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") {
@@ -482,7 +489,7 @@ async function performWebFetch(
       }
       continue;
     }
-    return res;
+    return { res, finalUrl: currentUrl };
   }
   throw new WebFetchPermissionError(`too many redirects (>${MAX_REDIRECTS})`);
 }
@@ -544,9 +551,14 @@ export const webFetch: RegisteredTool = buildTool({
         });
     }
     let res: Response;
+    let finalUrl: URL;
     let body: string;
     try {
-      res = await performWebFetch(url, ctrl.signal, resolveWebFetchConfig(ctx?.toolConfig));
+      ({ res, finalUrl } = await performWebFetch(
+        url,
+        ctrl.signal,
+        resolveWebFetchConfig(ctx?.toolConfig),
+      ));
       // Inside the deadline: a server that sends the head and then drips the
       // body is stopped by the same 30 s as one that never answers.
       body = await readBodyCapped(res);
@@ -567,7 +579,11 @@ export const webFetch: RegisteredTool = buildTool({
     } else {
       content = `[non-textual content: ${ct}, ${body.length} bytes — not displayed]`;
     }
-    const header = `URL: ${url.toString()}\nStatus: ${res.status}\nContent-Type: ${ct}\n\n`;
+    // The page the body is comes first; the URL asked for follows only when
+    // a redirect led elsewhere (the header grammar provability reads).
+    const final = finalUrl.toString();
+    const asked = url.toString();
+    const header = `URL: ${final}\n${final !== asked ? `Requested: ${asked}\n` : ""}Status: ${res.status}\nContent-Type: ${ct}\n\n`;
     if (input.prompt !== undefined && input.prompt !== "") {
       return `${header}[user prompt: ${input.prompt}]\n\n${content}`;
     }

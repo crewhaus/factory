@@ -34,21 +34,32 @@ export const CITATION_MARKER_NAME = "CITATION_MARKER";
 
 /**
  * The marker pattern's STRUCTURE, matched over a line {@link foldRegexSource}
- * has normalised: an escaped `[`, an optional escaped `^?`, a label of
- * character classes / `\w` runs, an escaped `]`, and the negative lookahead
- * after it that keeps definitions and links out (claim-ledger's
- * `citations.ts` has the pattern whole). Matching the structure, not one
- * spelling, is what catches a copy whose class was reordered (`[\w\-.]`),
- * spelled out (`[A-Za-z0-9_.-]`) or whose group moved before the `^?`.
- * Assembled from pieces, and never spelled out in this file — not even in a
- * comment — because this file's own source would otherwise be the second
- * definition it looks for.
+ * has normalised: an escaped `[`, an optional escaped `^?`, a label, an
+ * escaped `]`, and the negative lookahead after it that keeps definitions
+ * and links out (claim-ledger's `citations.ts` has the pattern whole). The
+ * label is any run of what can match a label character — a character class,
+ * a class escape (`\w`, `\d`, `\S`, …), a Unicode property (`\p{L}`) or the
+ * `.` wildcard — each quantified or not (`+`, `*`, `?`, `{1,64}`), and
+ * alternated or not (folding drops the group around an alternation). Matching
+ * the structure, not one spelling, is what catches a copy whose class was
+ * reordered (`[\w\-.]`), spelled out (`[A-Za-z0-9_.-]`), narrowed to the
+ * numeric `[n]` the provability skill teaches (`\d+`), widened (`\S+?`), or
+ * whose group moved before the `^?`. Assembled from pieces, and never spelled
+ * out in this file — not even in a comment — because this file's own source
+ * would otherwise be the second definition it looks for.
  */
+const MARKER_LABEL_ATOM = [
+  "C", // a character class, folded
+  "\\\\[dwsDWS]", // a class escape
+  "\\\\[pP]\\{[\\w=]+\\}", // a Unicode property escape
+  "\\.", // the wildcard
+].join("|");
+const MARKER_QUANTIFIER = "(?:[+*?]|\\{\\d+(?:,\\d*)?\\})";
 const MARKER_STRUCTURE = new RegExp(
   [
     "\\\\\\[", // an escaped [
     "(?:\\\\\\^\\?)?", // an optional escaped ^ and its ?
-    "(?:C|\\\\w)(?:C|\\\\w|[+*?])*", // the label: classes and \w, quantified
+    `(?:(?:${MARKER_LABEL_ATOM})${MARKER_QUANTIFIER}*\\|?)+`, // the label: atoms, quantified, alternated
     "\\\\\\]\\(\\?!", // an escaped ] and a negative lookahead
   ].join(""),
 );
@@ -481,10 +492,30 @@ function namesExactly(entry: ReadonlyArray<string>, path: ReadonlyArray<string>)
 }
 
 /**
+ * An entry for a block ABOVE the path — a proper prefix of it, wildcards
+ * honoured (`["provability"]`, `["*"]`): it admits a patch that replaces or
+ * removes the whole block, and the block carries the level.
+ */
+function coversByPrefix(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
+  return (
+    entry.length > 0 &&
+    entry.length < path.length &&
+    entry.every((seg, i) => seg === "*" || seg === path[i])
+  );
+}
+
+/**
  * Finding 3: no target's whitelist lists `provability.level` (literally or
- * through a wildcard), and no target's admission rule lets the optimizer
- * patch it (a wholesale `["provability"]` entry would, by prefix). `table`
- * and `admits` are the real ones unless a test seeds a failure.
+ * through a wildcard), no entry covers the block above it, and no target's
+ * admission rule lets the optimizer patch it. `table` and `admits` are the
+ * real ones unless a test seeds a failure.
+ *
+ * The block entry is read off the TABLE, not asked of `admits`: the real
+ * rule refuses the level leaf through `OPTIMIZER_REFUSED_LEAVES` before it
+ * looks at any entry, so asking it about the leaf answers "no" whatever the
+ * table holds — while a wholesale `["provability"]` entry still admits a
+ * patch AT the block (a scalar `provability: cited`, or a `remove`), which
+ * moves the floor without naming the leaf (design §9.2).
  */
 export function provabilityLevelOptimizerFindings(
   table: Readonly<Record<string, ReadonlyArray<ReadonlyArray<string>>>> = OPTIMIZABLE_PATHS,
@@ -495,7 +526,12 @@ export function provabilityLevelOptimizerFindings(
   const admitted: string[] = [];
   for (const [target, entries] of Object.entries(table)) {
     if (entries.some((entry) => namesExactly(entry, PROVABILITY_LEVEL_PATH))) listed.push(target);
-    if (admits(target, PROVABILITY_LEVEL_PATH)) admitted.push(target);
+    if (
+      entries.some((entry) => coversByPrefix(entry, PROVABILITY_LEVEL_PATH)) ||
+      admits(target, PROVABILITY_LEVEL_PATH)
+    ) {
+      admitted.push(target);
+    }
   }
   const base = {
     class: "optimizer-exclusion" as const,

@@ -1,4 +1,4 @@
-import { lower } from "@crewhaus/compiler";
+import { lowerWithWarnings } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { isMap, isScalar, parseAllDocuments, parseDocument } from "yaml";
@@ -680,10 +680,14 @@ export function provabilityAnswer(
 }
 
 /**
- * What a fresh scaffold's rung still needs, in `crewhaus lint`'s own words
- * (`auditProvability`): a source-reading tool at `grounded`, an allowlisted
- * tool at `checked`, a sandbox-free checker. Empty when the spec has what its
- * floor asks for. Read off the LOWERED spec, exactly as lint reads it.
+ * What a fresh scaffold's rung still needs, in `crewhaus lint`'s own words:
+ * the `provability-*` warnings the lowering prints (a research floor of
+ * `checked` / `proven` no report can meet, a `formal.image` no checker runs),
+ * then `auditProvability` — a source-reading tool at `grounded`, an
+ * allowlisted tool at `checked`, a sandbox-free checker. Empty when the spec
+ * has what its floor asks for. Read exactly as lint reads it: the lowering's
+ * warnings, then the audit of the lowered IR with the written spec beside it
+ * (the checkers rule reads names as WRITTEN, which the IR no longer has).
  *
  * Advisory, so it never throws: `init` calls it AFTER the spec is written,
  * and not every spec it writes validates. The interview and the
@@ -698,7 +702,11 @@ export function provabilityAnswer(
 export function provabilityScaffoldNotes(spec: Spec | string): string[] {
   try {
     const parsed = typeof spec === "string" ? parseSpec(spec) : spec;
-    return auditProvability(lower(parsed)).map((finding) => finding.message);
+    const lowered = lowerWithWarnings(parsed);
+    return [
+      ...lowered.warnings.filter((w) => w.code.startsWith("provability-")),
+      ...auditProvability(lowered.ir, parsed),
+    ].map((finding) => finding.message);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return [

@@ -14,6 +14,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lower } from "@crewhaus/compiler";
+import { withProvabilityFloor } from "@crewhaus/eval-runner";
+import { parseSpec } from "@crewhaus/spec";
+import { parkedProvabilityBlock } from "./eval-provability";
 
 const SRC_DIR = import.meta.dir.replace(/([/\\])dist$/, "$1src");
 const REPO_ROOT = join(import.meta.dir, "../../..");
@@ -180,5 +184,104 @@ describe("crewhaus eval --provability <level> (design §9.1)", () => {
     expect(got.stdout + got.stderr).toContain("baseline not set");
     expect(existsSync(join(root, ".crewhaus", "evals", "index.jsonl"))).toBe(true);
     expect(existsSync(join(root, ".crewhaus", "evals", "baselines.json"))).toBe(false);
+  }, 60_000);
+});
+
+// 0.8.0 §9.1 / §3 (review I39) — a block PARKED at `level: off` lowers to no
+// IR block, so the runner used to measure the shorthand's defaults: the
+// declared threshold, on_fail and sources vanished from the what-if run.
+describe("a provability block parked at level: off", () => {
+  const SPEC = [
+    "name: parked",
+    "target: cli",
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: i",
+    "tools: [webFetch]",
+    "continuity: false",
+    "provability:",
+    "  level: off",
+    "  threshold: 0.8",
+    "  on_fail: halt",
+    "  sources:",
+    "    allow: [docs.acme.example]",
+    "    deny: [evil.example]",
+    "",
+  ].join("\n");
+
+  test("--provability measures the declared block at the rung, not the shorthand's defaults", () => {
+    const spec = parseSpec(SPEC);
+    const ir = lower(spec);
+    // The compiler parks it: no IR block, so the runner alone would default.
+    expect((ir as { provability?: unknown }).provability).toBeUndefined();
+    const defaulted = withProvabilityFloor(ir, "grounded").provability;
+    expect(defaulted?.threshold).toBe(1);
+    expect(defaulted?.sources.allow).toEqual([]);
+
+    for (const level of ["cited", "grounded", "checked", "proven"] as const) {
+      const block = parkedProvabilityBlock(SPEC, spec, level);
+      expect(block).toMatchObject({
+        level,
+        threshold: 0.8,
+        onFail: "halt",
+        sources: { allow: ["docs.acme.example"], deny: ["evil.example"] },
+      });
+      // What runEval then runs: the declared block, re-levelled — kept as declared.
+      const measured = withProvabilityFloor({ ...ir, provability: block } as typeof ir, level);
+      expect(measured.provability).toEqual(block);
+    }
+  });
+
+  test("only a parked object block is re-lowered: none, the shorthand off, or a live block are the runner's", () => {
+    const base = "name: p\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools: [webFetch]\n";
+    for (const extra of [
+      "",
+      "provability: off\n",
+      "provability:\n  level: cited\n  threshold: 0.5\n",
+    ]) {
+      const text = `${base}${extra}`;
+      expect(parkedProvabilityBlock(text, parseSpec(text), "grounded")).toBeUndefined();
+    }
+  });
+
+  test("a parked block that does not hold at the rung is a parse error, not a silent default", () => {
+    const text =
+      "name: p\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools: [webFetch]\nprovability:\n  level: off\n  on_fail: escalate\n";
+    const spec = parseSpec(text); // parked, it parses
+    expect(() => parkedProvabilityBlock(text, spec, "cited")).toThrow(/model_pool/);
+  });
+
+  test("the CLI says the parked block runs, and refuses one that cannot", async () => {
+    const root = newTempRoot();
+    writeFileSync(join(root, "crewhaus.yaml"), SPEC);
+    writeFileSync(join(root, "data.jsonl"), '{"id":"s1","input":"hi","expected_output":"hi"}\n');
+    writeFileSync(join(root, "graders.yaml"), "graders:\n  - name: exact\n    type: exact_match\n");
+    const args = (spec: string) => [
+      "eval",
+      join(root, spec),
+      "--dataset",
+      join(root, "data.jsonl"),
+      "--graders",
+      join(root, "graders.yaml"),
+      "--provability",
+      "grounded",
+      "--out",
+      join(root, `out-${spec}`),
+    ];
+    const got = await runCli(args("crewhaus.yaml"), root);
+    expect(got.stdout).toContain(
+      "[eval] provability: gating every sample at grounded (spec parks its block at level: off — that block runs at this rung)",
+    );
+    expect(got.stdout).not.toContain("declares none");
+
+    writeFileSync(
+      join(root, "escalate.yaml"),
+      "name: p\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools: [webFetch]\nprovability:\n  level: off\n  on_fail: escalate\n",
+    );
+    const refused = await runCli(args("escalate.yaml"), root);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain(
+      "--provability grounded: the spec's provability block is parked at level: off, and does not hold at grounded",
+    );
   }, 60_000);
 });

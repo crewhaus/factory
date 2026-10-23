@@ -3,9 +3,24 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexSource } from "@crewhaus/claim-ledger";
-import { buildEvidenceIndex, recordFromCall } from "./evidence";
-import { renderFooter } from "./render";
-import { artifact, config, evidenceOf, fetched, memoryArtifacts, now } from "./test-helpers";
+import { openEventLog } from "@crewhaus/event-log";
+import {
+  buildEvidenceIndex,
+  evidenceFromMessages,
+  evidenceFromSessionLog,
+  recordFromCall,
+} from "./evidence";
+import { renderBundleJson, renderFooter, renderMarkdownSection } from "./render";
+import {
+  artifact,
+  checkedBy,
+  config,
+  evidenceOf,
+  fetched,
+  memoryArtifacts,
+  now,
+  proofCheckCall,
+} from "./test-helpers";
 import type {
   ProofArtifactStore,
   ProofBundle,
@@ -14,9 +29,13 @@ import type {
   VerifyOptions,
 } from "./types";
 import {
+  HEAD_CONCURRENCY,
   MAX_HEAD_REQUESTS,
+  _setGroundingBudgetForTest,
+  bareId,
   bundleHash,
   claimReasons,
+  clipAround,
   isToolAllowed,
   polarityMeter,
   statementMismatch,
@@ -805,6 +824,7 @@ describe("acceptance C — the overlap claim (proven)", () => {
     const bundle = await verify(`${claim}\n\n[1]: proof:prf_0123456789abcdef`, {
       config: config("proven"),
       artifacts: store,
+      evidence: checkedBy([accepted]),
     });
     expect(only(bundle).bindings[0]).toMatchObject({
       kind: "formal",
@@ -825,6 +845,7 @@ describe("acceptance C — the overlap claim (proven)", () => {
     const bundle = await verify(`${claim}\n\n[1]: proof:prf_aaaaaaaaaaaaaaaa`, {
       config: config("proven"),
       artifacts: memoryArtifacts([rejected]),
+      evidence: checkedBy([rejected]),
     });
     const binding = only(bundle).bindings[0];
     expect(binding?.reason).toBe("proof_rejected");
@@ -836,6 +857,7 @@ describe("acceptance C — the overlap claim (proven)", () => {
     const bundle = await verify(`${claim}\n\n[1]: proof:prf_bbbbbbbbbbbbbbbb`, {
       config: config("proven"),
       artifacts: memoryArtifacts([unrelated]),
+      evidence: checkedBy([unrelated]),
     });
     expect(only(bundle).bindings[0]?.reason).toBe("claim_mismatch");
   });
@@ -850,6 +872,7 @@ describe("acceptance C — the overlap claim (proven)", () => {
     const inverted = await verify(`${claim}\n\n[1]: proof:prf_cccccccccccccccc`, {
       config: config("proven"),
       artifacts: memoryArtifacts([overlap]),
+      evidence: checkedBy([overlap]),
     });
     expect(only(inverted).bindings[0]).toMatchObject({ reason: "claim_mismatch", ok: false });
     expect(only(inverted).bindings[0]?.detail).toContain("states the opposite");
@@ -857,15 +880,23 @@ describe("acceptance C — the overlap claim (proven)", () => {
     // And the other way round: a proof of "no overlap" does not prove "two overlap".
     const flipped = await verify(
       "Two of the six meetings overlap [1].\n\n[1]: proof:prf_0123456789abcdef",
-      { config: config("proven"), artifacts: memoryArtifacts([accepted]) },
+      {
+        config: config("proven"),
+        artifacts: memoryArtifacts([accepted]),
+        evidence: checkedBy([accepted]),
+      },
     );
     expect(only(flipped).bindings[0]?.reason).toBe("claim_mismatch");
     // Polarity is read word by word: the same denial in other words is
     // proven ("do not" and "don't"; "no two" moved within the sentence)…
-    const proofOf = (id: string, proved: string) => ({
-      config: config("proven"),
-      artifacts: memoryArtifacts([artifact({ id, claim: proved })]),
-    });
+    const proofOf = (id: string, proved: string) => {
+      const proof = artifact({ id, claim: proved });
+      return {
+        config: config("proven"),
+        artifacts: memoryArtifacts([proof]),
+        evidence: checkedBy([proof]),
+      };
+    };
     for (const [sentence, proved] of [
       ["Meetings 2 and 5 don't overlap", "Meetings 2 and 5 do not overlap."],
       ["Of the six meetings, no two overlap", "No two of the six meetings overlap."],
@@ -885,11 +916,14 @@ describe("acceptance C — the overlap claim (proven)", () => {
     expect(only(moved).bindings[0]?.reason).toBe("claim_mismatch");
     expect(only(moved).bindings[0]?.detail).toContain(`denies "two"`);
     // A proof about meetings 1 and 2 is not a proof about all six.
+    const pair = artifact({
+      id: "prf_eeeeeeeeeeeeeeee",
+      claim: "Meetings 1 and 2 do not overlap.",
+    });
     const narrower = await verify(`${claim}\n\n[1]: proof:prf_eeeeeeeeeeeeeeee`, {
       config: config("proven"),
-      artifacts: memoryArtifacts([
-        artifact({ id: "prf_eeeeeeeeeeeeeeee", claim: "Meetings 1 and 2 do not overlap." }),
-      ]),
+      artifacts: memoryArtifacts([pair]),
+      evidence: checkedBy([pair]),
     });
     expect(only(narrower).bindings[0]).toMatchObject({ reason: "claim_mismatch" });
     expect(only(narrower).bindings[0]?.detail).toContain("figures differ");
@@ -902,7 +936,11 @@ describe("acceptance C — the overlap claim (proven)", () => {
       id: "prf_ffffffffffffffff",
       claim: "The invoice total is 1,284.50 EUR.",
     });
-    const opts = { config: config("proven"), artifacts: memoryArtifacts([total]) };
+    const opts = {
+      config: config("proven"),
+      artifacts: memoryArtifacts([total]),
+      evidence: checkedBy([total]),
+    };
     for (const sentence of [
       "No discount was applied, so the invoice total is 1,284.50 EUR",
       "The invoice total without VAT is 1,284.50 EUR",
@@ -944,6 +982,41 @@ describe("acceptance C — the overlap claim (proven)", () => {
         "The invoice total is 1,284.50 EUR.",
         "None of the discounts applied, so the invoice total is 1,284.50 EUR",
         0.8,
+      ),
+    ).toBeUndefined();
+  });
+
+  test("a figure's sign, its glued magnitude and a date's order are part of the statement", () => {
+    // A proof that says -500 is not the statement of a sentence saying 500.
+    expect(
+      statementMismatch(
+        "The account balance at year end is -500 dollars",
+        "The account balance at year end is 500 dollars",
+        0.8,
+      ),
+    ).toContain("the figures differ");
+    expect(
+      statementMismatch(
+        "The account balance at year end is 500 dollars",
+        "The account balance at year end is 600 dollars",
+        0.8,
+      ),
+    ).toContain("the figures differ");
+    // The same three numbers in another order are another date.
+    expect(
+      statementMismatch(
+        "The contract was signed on 2024-03-05 by both parties",
+        "The contract was signed on 2024-05-03 by both parties",
+        0.8,
+      ),
+    ).toContain("the figures differ");
+    // A magnitude glued to its numeral is the same figure as the word (the
+    // bar is lowered only because "million" is a content token "$5M" lacks).
+    expect(
+      statementMismatch(
+        "The acquisition was priced at $5 million in cash",
+        "The acquisition was priced at $5M in cash",
+        0.7,
       ),
     ).toBeUndefined();
   });
@@ -1176,6 +1249,19 @@ describe("cited", () => {
       resolveHead,
     });
     expect(heads).toEqual([]);
+  });
+
+  test("a HEAD the egress fabric refused says so: not checked, never 'no answer'", async () => {
+    const cfg = config("cited", { sources: { resolve: "head" } });
+    const refused = await verify("Alpha is real [1].\n\n[1]: https://collector.example/?k=x", {
+      config: cfg,
+      resolveHead: async () => ({ refused: "egress" }),
+    });
+    const binding = only(refused).bindings[0];
+    expect(binding).toMatchObject({ ok: false, reason: "unresolved" });
+    expect(binding?.detail).toContain("egress fabric refused to send a HEAD");
+    expect(binding?.detail).not.toContain("got no answer");
+    expect(refused.verdict).toBe("fail");
   });
 
   test("resolve: head sends at most MAX_HEAD_REQUESTS per verification; past it, unresolved", async () => {
@@ -1682,8 +1768,9 @@ describe("assumptions", () => {
       assumptionsRefused: 3,
       achieved: "none",
     });
+    // At `cited` the one URL cited is the one source (design §5.4).
     expect(renderFooter(capped)).toBe(
-      "── provability · cited ✗ · 1/4 claims · unmet: [A1] [A2] [A3] · 0 sources · 3 assumptions (3 refused)",
+      "── provability · cited ✗ · 1/4 claims · unmet: [A1] [A2] [A3] · 1 source · 3 assumptions (3 refused)",
     );
     const forbidden = await verify(four, {
       config: config("cited", { assumptions: "forbid", threshold: 0.25 }),
@@ -2008,6 +2095,789 @@ describe("the bundle", () => {
         evidence: buildEvidenceIndex([]),
       }),
     ).rejects.toThrow(/config.level/);
+  });
+});
+
+describe("grounded: only a page the run read, as the page", () => {
+  const CLAIM = "Acme accepts refund requests within 30 days of purchase";
+  const answer = `${CLAIM} [1].\n\n[1]: ${POLICY}`;
+  const asHits = JSON.stringify([{ url: POLICY, text: `${CLAIM}.` }]);
+
+  test("a sub-agent's or a sibling model's JSON answer grounds nothing (design §8: child returns are inputs)", async () => {
+    for (const name of ["Task", "Consult", "Escalate", "Skill"]) {
+      const bundle = await verify(answer, {
+        config: config("grounded"),
+        evidence: evidenceOf([
+          { id: "t", name, input: { prompt: "find Acme's refund window" }, content: asHits },
+        ]),
+      });
+      expect([name, only(bundle).bindings[0]?.reason, bundle.verdict]).toEqual([
+        name,
+        "not_fetched",
+        "fail",
+      ]);
+      expect(renderFooter(bundle)).toContain("grounded ✗");
+    }
+    // A child that DID fetch the page, which says 14 days, and summarised it
+    // as 30: the page decides, not the summary.
+    const misreported = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "c1",
+          name: "WebFetch",
+          input: { url: POLICY },
+          content: fetched(POLICY, "Acme accepts refund requests within 14 days of purchase."),
+        },
+        {
+          id: "t",
+          name: "Task",
+          input: { prompt: "research the refund window" },
+          content: JSON.stringify({ findings: [{ url: POLICY, summary: `${CLAIM}.` }] }),
+        },
+      ]),
+    });
+    expect(only(misreported).bindings[0]?.reason).toBe("not_found_in_source");
+    // An MCP search's hits are evidence, as before.
+    const searched = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        { id: "m", name: "mcp__search__query", input: { q: "acme refunds" }, content: asHits },
+      ]),
+    });
+    expect(only(searched).status).toBe("met");
+  });
+
+  test("an error page is not the page: a 404 that repeats the slug, a 503 that states the claim", async () => {
+    const slug =
+      "https://acme.example/help/acme-accepts-refund-requests-within-30-days-of-purchase";
+    const slugged = `${CLAIM} [1].\n\n[1]: ${slug}`;
+    const apache404 = `URL: ${slug}\nStatus: 404\nContent-Type: text/html\n\nNot Found\n\nThe requested URL /help/acme-accepts-refund-requests-within-30-days-of-purchase was not found on this server.`;
+    const notFound = await verify(slugged, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        { id: "f", name: "WebFetch", input: { url: slug }, content: apache404 },
+      ]),
+    });
+    expect(only(notFound).bindings[0]).toMatchObject({ rung: "cited", reason: "not_fetched" });
+    expect(only(notFound).bindings[0]?.detail).toContain("answered 404");
+    expect(renderFooter(notFound)).toContain("grounded ✗");
+    const unavailable = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "f",
+          name: "Fetch",
+          input: { url: POLICY },
+          content: `HTTP 503 Service Unavailable\ncontent-type: text/plain\n\n${CLAIM}.`,
+        },
+      ]),
+    });
+    expect(only(unavailable).bindings[0]?.reason).toBe("not_fetched");
+    expect(only(unavailable).bindings[0]?.detail).toContain("answered 503");
+    // A later fetch of the same URL that answered 200 is the page.
+    const recovered = await verify(answer, {
+      config: config("grounded"),
+      evidence: evidenceOf([
+        {
+          id: "f1",
+          name: "Fetch",
+          input: { url: POLICY },
+          content: "HTTP 503 Service Unavailable\ncontent-type: text/plain\n\ndown",
+        },
+        {
+          id: "f2",
+          name: "WebFetch",
+          input: { url: POLICY },
+          content: fetched(POLICY, `${CLAIM}.`),
+        },
+      ]),
+    });
+    expect(only(recovered).status).toBe("met");
+  });
+
+  test("a page that holds the claim only where it prints its own address does not ground it; its own text does", async () => {
+    const slug =
+      "https://acme.example/help/acme-accepts-refund-requests-within-30-days-of-purchase";
+    const slugged = `${CLAIM} [1].\n\n[1]: ${slug}`;
+    const of = (body: string, input: Record<string, unknown> = { url: slug }) =>
+      verify(slugged, {
+        config: config("grounded"),
+        evidence: evidenceOf([{ id: "f", name: "WebFetch", input, content: fetched(slug, body) }]),
+      });
+    // A soft 404 — status 200, the requested path printed back.
+    const soft = await of(
+      "This page has moved. You asked for /help/acme-accepts-refund-requests-within-30-days-of-purchase; try the help centre.",
+    );
+    expect(only(soft).bindings[0]?.reason).toBe("not_found_in_source");
+    expect(only(soft).bindings[0]?.detail).toContain("only where it prints the address");
+    // The page's own text states it beside a breadcrumb of its own path.
+    const real = await of(
+      `Help > /help/acme-accepts-refund-requests-within-30-days-of-purchase\n\n${CLAIM}, for every order.`,
+    );
+    expect(only(real).status).toBe("met");
+    // A slug that spells the claim, never printed, on a page that states it.
+    expect(only(await of(`${CLAIM}, for every order.`)).status).toBe("met");
+    // WebFetch's prompt naming the claim is not "the input handed back".
+    expect(
+      only(await of(`${CLAIM}, for every order.`, { url: slug, prompt: `${CLAIM}?` })).status,
+    ).toBe("met");
+  });
+
+  test("a claim further down a spilled page grounds in the whole output, and fails closed without it", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "prov-spill-"));
+    try {
+      const page = Array.from({ length: 200 }, (_, i) =>
+        i === 150
+          ? `${CLAIM}.`
+          : `Line ${i + 1}: shipping, sizing and gift cards are covered here.`,
+      ).join("\n");
+      const head = page.split("\n").slice(0, 100).join("\n");
+      const content = `${fetched(POLICY, head)}\n[part 1 of 2; Read .crewhaus/tool-results/run_1/toolu_big.part-2.txt for part 2]\n[truncated, full output at .crewhaus/tool-results/run_1/toolu_big.txt]`;
+      const evidenceIn = () =>
+        buildEvidenceIndex(
+          evidenceFromMessages(
+            [
+              {
+                role: "assistant",
+                content: [
+                  { type: "tool_use", id: "toolu_big", name: "WebFetch", input: { url: POLICY } },
+                ],
+              },
+              {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "toolu_big", content }],
+              },
+            ],
+            { workspaceRoot: ws },
+          ),
+        );
+      // Without the saved output: the preview alone, and the claim is not in it.
+      const preview = await verify(answer, { config: config("grounded"), evidence: evidenceIn() });
+      expect(only(preview).bindings[0]?.reason).toBe("not_found_in_source");
+      mkdirSync(join(ws, ".crewhaus", "tool-results", "run_1"), { recursive: true });
+      writeFileSync(
+        join(ws, ".crewhaus", "tool-results", "run_1", "toolu_big.txt"),
+        fetched(POLICY, page),
+      );
+      const whole = await verify(answer, { config: config("grounded"), evidence: evidenceIn() });
+      expect(only(whole).status).toBe("met");
+      expect(only(whole).bindings[0]?.excerpt).toContain("within 30 days of purchase");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("checked: a result that does not say the claim does not check it", () => {
+  const draft = "Acme is the leading refund processor in Europe [1].\n\n[1]: tool:toolu_lint";
+  const sentence = "Acme is the leading refund processor in Europe.";
+  const evidence = evidenceOf([
+    {
+      id: "toolu_lint",
+      name: "CitationLint",
+      input: { text: draft },
+      content: JSON.stringify({
+        from: "inline",
+        ok: true,
+        markerCount: 1,
+        definedCount: 1,
+        issues: [],
+      }),
+    },
+    {
+      id: "toolu_norm",
+      name: "NormalizeText",
+      input: { text: sentence, form: "lower" },
+      content: sentence.toLowerCase(),
+    },
+    {
+      id: "toolu_fact",
+      name: "FactCrossCheck",
+      input: { claims: [{ text: sentence, sources: ["https://acme.example/about"] }] },
+      content: JSON.stringify({ ok: false, results: [{ claim: sentence, verdict: "unchecked" }] }),
+    },
+    {
+      id: "toolu_rank",
+      name: "Evaluate",
+      input: { expression: "rank(acme, refunds, europe)" },
+      content: '{"leader":"Acme is the leading refund processor in Europe by volume"}',
+    },
+  ]);
+  const allow = { allow: ["citationLint", "normalizeText", "factCrossCheck", "evaluate"] };
+
+  test("a lint run over the draft, or a tool that hands the sentence back, checks nothing — at checked or grounded", async () => {
+    for (const level of ["checked", "grounded"] as const) {
+      for (const [id, words] of [
+        ["toolu_lint", "its words are the call's own input"],
+        ["toolu_norm", "hands the call's own input back"],
+        ["toolu_fact", "hands the call's own input back"],
+      ] as const) {
+        const bundle = await verify(`${sentence.slice(0, -1)} [1].\n\n[1]: tool:${id}`, {
+          config: config(level, { execution: allow }),
+          evidence,
+        });
+        expect([level, id, only(bundle).bindings[0]?.reason]).toEqual([level, id, "value_absent"]);
+        expect(only(bundle).bindings[0]?.detail).toContain(words);
+        expect(bundle.verdict).toBe("fail");
+      }
+    }
+    // Scenario B through the lint: its figure is not in the result either.
+    const total = await verify("The invoice total is 1,284.50 [1].\n\n[1]: tool:toolu_lint", {
+      config: config("checked", { execution: allow }),
+      evidence,
+    });
+    expect(only(total).bindings[0]?.reason).toBe("value_absent");
+  });
+
+  test("a result that states the claim in its own words still checks it", async () => {
+    const bundle = await verify(`${sentence.slice(0, -1)} [1].\n\n[1]: tool:toolu_rank`, {
+      config: config("checked", { execution: allow }),
+      evidence,
+    });
+    expect(only(bundle).status).toBe("met");
+  });
+
+  test("the excerpt shows the figure that met the floor, however far down the result", async () => {
+    const rows = Array.from({ length: 40 }, (_, i) => `line ${i + 1}: item-${i + 1} amount 100.00`);
+    const result = `${rows.join("\n")}\ntotal: 1284.50`;
+    const bundle = await verify("The invoice total is 1,284.50 [1].\n\n[1]: tool:toolu_rows", {
+      config: config("checked", { execution: { replay: false } }),
+      evidence: evidenceOf([
+        { id: "toolu_rows", name: "Evaluate", input: { expression: "sum(rows)" }, content: result },
+      ]),
+    });
+    const binding = only(bundle).bindings[0];
+    expect(binding).toMatchObject({ ok: true, rung: "checked" });
+    expect(binding?.excerpt).toContain("1284.50");
+    expect((binding?.excerpt ?? "").length).toBeLessThanOrEqual(240);
+    // A result that fits is frozen whole, as before.
+    const short = await verify("The invoice total is 1,284.50 [1].\n\n[1]: tool:toolu_s", {
+      config: config("checked", { execution: { replay: false } }),
+      evidence: evidenceOf([
+        { id: "toolu_s", name: "Evaluate", input: {}, content: '{"total":"1284.50"}' },
+      ]),
+    });
+    expect(only(short).bindings[0]?.excerpt).toBe('{"total":"1284.50"}');
+  });
+
+  test("a duplicated tool_result reads as continuity-store reads it: the last one", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "prov-dup-"));
+    try {
+      const log = await openEventLog("sess_00000000000000d1", { rootDir });
+      for (const [id, results] of [
+        [
+          "toolu_ok_then_error",
+          [
+            ["1284.50", false],
+            ["boom", true],
+          ],
+        ],
+        [
+          "toolu_error_then_ok",
+          [
+            ["boom", true],
+            ["1284.50", false],
+          ],
+        ],
+      ] as const) {
+        await log.append({
+          kind: "tool_use",
+          payload: { id, name: "MoneyAdd", input: {} },
+        } as never);
+        for (const [content, isError] of results) {
+          await log.append({
+            kind: "tool_result",
+            payload: { toolUseId: id, content, isError },
+          } as never);
+        }
+      }
+      await log.close();
+      const evidence = buildEvidenceIndex(
+        await evidenceFromSessionLog({ sessionId: "sess_00000000000000d1", rootDir }),
+      );
+      const bundle = await verify(
+        "The total is 1,284.50 [1]. The total is still 1,284.50 [2].\n\n[1]: tool:toolu_ok_then_error\n[2]: tool:toolu_error_then_ok",
+        { config: config("checked", { execution: { replay: false } }), evidence },
+      );
+      // PlanComplete: error_result for the first, verified for the second.
+      expect(bundle.claims.map((c) => c.bindings[0]?.reason ?? "ok")).toEqual([
+        "tool_errored",
+        "ok",
+      ]);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("proven: a proof's hypotheses are assumptions, and a checker accepted it in this run", () => {
+  const sentence = "Revenue is 9 [1].\n\n[1]: proof:prf_9999999999999999";
+  // A builtin certificate `given "revenue = 9 and true"`, `and_elim left`:
+  // accepted, and resting on its own conclusion.
+  const assumes = artifact({
+    id: "prf_9999999999999999",
+    claim: "Revenue is 9.",
+    statement: "revenue = 9",
+    proof: "1. revenue = 9 and true by given\n2. revenue = 9 by and_elim 1",
+    assumptions: ["revenue = 9 and true"],
+  });
+  const opts = (patch: Parameters<typeof config>[1] = {}) => ({
+    config: config("proven", patch),
+    artifacts: memoryArtifacts([assumes]),
+    evidence: checkedBy([assumes]),
+  });
+
+  test("allowed: listed beside the statement, counted on every surface", async () => {
+    const bundle = await verify(sentence, opts());
+    expect(only(bundle).bindings[0]).toMatchObject({
+      ok: true,
+      rung: "proven",
+      assumptions: ["revenue = 9 and true"],
+    });
+    expect(bundle).toMatchObject({ verdict: "pass", achieved: "proven", hypotheses: 1 });
+    expect(bundle.checkers).toEqual([
+      { id: "builtin", artifact: assumes.id, axioms: [], assumptions: ["revenue = 9 and true"] },
+    ]);
+    expect(renderFooter(bundle)).toBe(
+      "── provability · proven ✓ · 1/1 claim · 0 sources · 1 assumption",
+    );
+    const md = renderMarkdownSection(bundle);
+    expect(md).toContain(
+      `**Assumptions (1):**\n- [1] revenue = 9 and true (a hypothesis of ${assumes.id})`,
+    );
+    expect(md).toContain("(assuming: revenue = 9 and true; axioms: none)");
+    expect(renderBundleJson(bundle)).toContain("revenue = 9 and true");
+  });
+
+  test("forbid refuses the proof, and so does a cap it is past", async () => {
+    for (const patch of [{ assumptions: "forbid" as const }, { maxAssumptions: 0 }]) {
+      const bundle = await verify(sentence, opts(patch));
+      expect(only(bundle).bindings[0]).toMatchObject({
+        ok: false,
+        reason: "assumption_forbidden",
+        assumptions: ["revenue = 9 and true"],
+      });
+      expect(bundle).toMatchObject({
+        verdict: "fail",
+        achieved: "none",
+        assumptionsRefused: 1,
+      });
+      expect(bundle.checkers).toBeUndefined();
+      expect(renderFooter(bundle)).toBe(
+        "── provability · proven ✗ · 0/1 claim · unmet: [1] · 0 sources · 1 assumption (1 refused)",
+      );
+    }
+    const forbid = await verify(sentence, opts({ assumptions: "forbid" }));
+    expect(only(forbid).bindings[0]?.detail).toContain("rests on 1 hypothesis");
+    // The same claim declared outright is refused alike.
+    const declared = await verify(
+      "Revenue is 9 [A1].\n\n[A1]: assume: revenue = 9",
+      opts({ assumptions: "forbid" }),
+    );
+    expect(declared).toMatchObject({ verdict: "fail", assumptionsRefused: 1 });
+  });
+
+  test("the cap counts declared assumptions and hypotheses together, in document order", async () => {
+    const text =
+      "The fiscal year starts in April [A1]. Revenue is 9 [1]. Revenue is still 9 [1].\n\n[A1]: assume: April\n[1]: proof:prf_9999999999999999";
+    const within = await verify(text, opts({ maxAssumptions: 2 }));
+    expect(within).toMatchObject({ verdict: "pass", assumptions: 1, hypotheses: 1 });
+    expect(renderFooter(within)).toContain("· 2 assumptions");
+    const past = await verify(text, opts({ maxAssumptions: 1 }));
+    expect(past.claims.map((c) => c.status)).toEqual(["assumption", "unmet", "unmet"]);
+    expect(past.claims[1]?.bindings[0]?.detail).toContain("max_assumptions (1)");
+    expect(past).toMatchObject({ verdict: "fail", assumptionsRefused: 2 });
+  });
+
+  test("an SMT problem's asserts and definitions are its hypotheses", async () => {
+    const smt = artifact({
+      id: "prf_5555555555555555",
+      checker: "smt",
+      claim: "Revenue is 9.",
+      statement: "(= revenue 9)",
+      assumptions: ["(define-fun revenue () Int 9)", "(assert (> revenue 0))"],
+    });
+    const bundle = await verify("Revenue is 9 [1].\n\n[1]: proof:prf_5555555555555555", {
+      config: config("proven"),
+      artifacts: memoryArtifacts([smt]),
+      evidence: checkedBy([smt]),
+    });
+    expect(bundle).toMatchObject({ verdict: "pass", hypotheses: 2 });
+    expect(renderFooter(bundle)).toContain("· 2 assumptions");
+  });
+
+  test("an artifact no ProofCheck in this run wrote, one flipped to ok, or one off the checker list is not proven", async () => {
+    const accepted = artifact({ id: "prf_7777777777777777" });
+    const text = "No two of the six meetings overlap [1].\n\n[1]: proof:prf_7777777777777777";
+    // Hand-written: the file is there, the run never checked it.
+    const forged = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+    });
+    expect(only(forged).bindings[0]?.reason).toBe("proof_missing");
+    expect(only(forged).bindings[0]?.detail).toContain("no ProofCheck call");
+    // Flipped: the run's ProofCheck said rejected; the file says ok.
+    const flipped = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      evidence: checkedBy([{ ...accepted, ok: false, reason: "10.5 <= 10 is false" }]),
+    });
+    expect(only(flipped).bindings[0]?.reason).toBe("proof_rejected");
+    expect(only(flipped).bindings[0]?.detail).toContain("reported it rejected");
+    // An errored ProofCheck call is not a check.
+    const errored = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      evidence: evidenceOf([{ ...proofCheckCall(accepted), isError: true }]),
+    });
+    expect(only(errored).bindings[0]?.reason).toBe("proof_missing");
+    // Off the list: a lean4 artifact under formal.checkers [builtin, smt].
+    const lean = { ...accepted, checker: "lean4" };
+    const offList = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([lean]),
+      evidence: checkedBy([lean]),
+    });
+    expect(only(offList).bindings[0]?.reason).toBe("proof_missing");
+    expect(only(offList).bindings[0]?.detail).toContain("not on provability.formal.checkers");
+    // Hypotheses stripped from the file after the check.
+    const stripped = await verify(sentence, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([{ ...assumes, assumptions: [] }]),
+      evidence: checkedBy([assumes]),
+    });
+    expect(only(stripped).bindings[0]?.reason).toBe("proof_missing");
+    expect(only(stripped).bindings[0]?.detail).toContain("not the one ProofCheck reported");
+    // Rewritten after the check: the id, the verdict, the checker and the
+    // lists all agree with the run's report, but the claim, the statement or
+    // the proof is not what that ProofCheck call was given (design §6.4,
+    // acceptance C: a rewritten accepted artifact is never served as proven).
+    for (const patch of [
+      {
+        claim: "Two plus two is four.",
+        statement: "2 + 2 = 4",
+      },
+      { statement: "let s = [9, 10, 13], e = [10.5, 12, 14] in forall i, e_i <= s_(i+1)" },
+      { proof: "1. given everything" },
+    ] as const) {
+      const checked = { ...accepted, ...patch };
+      const rewritten = await verify(text, {
+        config: config("proven"),
+        artifacts: memoryArtifacts([accepted]),
+        evidence: checkedBy([checked]),
+      });
+      expect([patch, only(rewritten).status, only(rewritten).bindings[0]?.reason]).toEqual([
+        patch,
+        "unmet",
+        "proof_missing",
+      ]);
+      expect(only(rewritten).bindings[0]?.detail).toContain("not the one ProofCheck checked");
+    }
+    // A call whose logged input is gone is no record of what was checked.
+    const inputless = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      evidence: evidenceOf([{ ...proofCheckCall(accepted), input: {} }]),
+    });
+    expect(only(inputless).bindings[0]?.reason).toBe("proof_missing");
+    // Under scope: turn, a check from another turn does not count.
+    const earlier = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      evidence: evidenceOf([{ ...proofCheckCall(accepted), turnNumber: 1 }]),
+      turnNumbers: new Set([2]),
+    });
+    expect(only(earlier).bindings[0]?.detail).toContain("(this turn)");
+    // An offline check with no log at hand may trust the store, by asking.
+    const trusted = await verify(text, {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      trustStoredProofs: true,
+    });
+    expect(only(trusted).status).toBe("met");
+  });
+
+  test("a report that clipped its lists still matches the artifact that keeps them whole", async () => {
+    const long = Array.from({ length: 3 }, (_, i) => `h${i} ${"x".repeat(400)}`);
+    const many = artifact({ id: "prf_6666666666666666", assumptions: long });
+    const report = proofCheckCall(many);
+    const content = JSON.parse(report.content) as Record<string, unknown>;
+    content["assumptions"] = [
+      `${(long[0] as string).slice(0, 299)}…`,
+      "… and 2 more (the artifact keeps them all)",
+    ];
+    const bundle = await verify(
+      "No two of the six meetings overlap [1].\n\n[1]: proof:prf_6666666666666666",
+      {
+        config: config("proven"),
+        artifacts: memoryArtifacts([many]),
+        evidence: evidenceOf([{ ...report, content: JSON.stringify(content) }]),
+      },
+    );
+    expect(only(bundle).status).toBe("met");
+  });
+
+  test("a wired re-check decides, once per artifact, and supplies the hypotheses", async () => {
+    const accepted = artifact({ id: "prf_8888888888888888" });
+    const text =
+      "No two of the six meetings overlap [1]. Again, no two of the six meetings overlap [1].\n\n[1]: proof:prf_8888888888888888";
+    let calls = 0;
+    const base = {
+      config: config("proven"),
+      artifacts: memoryArtifacts([accepted]),
+      evidence: checkedBy([accepted]),
+    };
+    const rejected = await verify(text, {
+      ...base,
+      recheckProof: async () => {
+        calls += 1;
+        return { ok: false };
+      },
+    });
+    expect(calls).toBe(1);
+    expect(rejected.claims.map((c) => c.bindings[0]?.reason)).toEqual([
+      "proof_rejected",
+      "proof_rejected",
+    ]);
+    const resting = await verify(text, {
+      ...base,
+      recheckProof: () => ({ ok: true, assumptions: ["meeting 6 is cancelled"], axioms: [] }),
+    });
+    expect(resting).toMatchObject({ verdict: "pass", hypotheses: 1 });
+    // A re-check that cannot run is not a verdict.
+    const threw = await verify(text, {
+      ...base,
+      recheckProof: async () => {
+        throw new Error("checker gone");
+      },
+    });
+    expect(threw.verdict).toBe("pass");
+  });
+});
+
+describe("bounded work on what the model writes", () => {
+  const fastest = (run: () => unknown): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      run();
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
+  };
+
+  test("a dressed id is trimmed in linear time, whatever the run of punctuation", () => {
+    expect(bareId("`toolu_01`.")).toBe("toolu_01");
+    expect(bareId("<(prf_0123456789abcdef)>!?")).toBe("prf_0123456789abcdef");
+    expect(bareId("(.)")).toBe("");
+    // An end-anchored class took 6 s on 80 000 dots that do not end the id.
+    const n = 200_000;
+    const base = fastest(() => bareId(`toolu_${"a".repeat(n)}x`));
+    expect(fastest(() => bareId(`toolu_${".".repeat(n)}x`))).toBeLessThan(base * 20 + 100);
+  });
+
+  test("a tool id or a URL with a long internal run is verified in linear time", async () => {
+    const n = 200_000;
+    const timed = async (text: string): Promise<number> => {
+      const t = performance.now();
+      await verify(text, { config: config("checked") });
+      return performance.now() - t;
+    };
+    const idBase = await timed(`The total is 4 [1].\n\n[1]: tool:toolu_${"a".repeat(n)}x`);
+    expect(await timed(`The total is 4 [1].\n\n[1]: tool:toolu_${".".repeat(n)}x`)).toBeLessThan(
+      idBase * 20 + 200,
+    );
+  }, 20_000);
+
+  test("HEADs go out a few at a time, under one deadline for the whole verification", async () => {
+    const urls = Array.from({ length: 12 }, (_, i) => `https://h${i}.example/p`);
+    const text = `${urls.map((_, i) => `Claim number ${i} is cited here [${i + 1}].`).join(" ")}\n\n${urls
+      .map((u, i) => `[${i + 1}]: ${u}`)
+      .join("\n")}`;
+    let inFlight = 0;
+    let most = 0;
+    const t = performance.now();
+    const bundle = await verify(text, {
+      config: config("cited", { sources: { resolve: "head" } }),
+      resolveHead: async () => {
+        inFlight += 1;
+        most = Math.max(most, inFlight);
+        await new Promise((r) => setTimeout(r, 40));
+        inFlight -= 1;
+        return 200;
+      },
+    });
+    expect(bundle.met).toBe(12);
+    expect(most).toBeGreaterThan(1);
+    expect(most).toBeLessThanOrEqual(HEAD_CONCURRENCY);
+    expect(performance.now() - t).toBeLessThan(12 * 40);
+    // Hosts that never answer: unresolved at the deadline, the rest checked.
+    const aborted: string[] = [];
+    const t2 = performance.now();
+    const stalled = await verify(text, {
+      config: config("cited", { sources: { resolve: "head" } }),
+      headDeadlineMs: 150,
+      resolveHead: (url, signal) =>
+        url.includes("h3.") || url.includes("h7.")
+          ? new Promise((resolve) =>
+              signal?.addEventListener("abort", () => {
+                aborted.push(url);
+                resolve(undefined);
+              }),
+            )
+          : Promise.resolve(200),
+    });
+    expect(performance.now() - t2).toBeLessThan(2_000);
+    expect(stalled.met).toBe(10);
+    const late = stalled.claims.filter((c) => c.status === "unmet").map((c) => c.bindings[0]);
+    expect(late.map((b) => b?.reason)).toEqual(["unresolved", "unresolved"]);
+    expect(late[0]?.detail).toContain("ran past 150 ms");
+    expect(aborted.sort()).toEqual(["https://h3.example/p", "https://h7.example/p"]);
+  });
+
+  test("grounding reads at most its budget of fetched text, and yields between claims", async () => {
+    const body = "The refund window is 30 days for every order placed online. ".repeat(50);
+    const evidence = evidenceOf([
+      { id: "f", name: "WebFetch", input: { url: POLICY }, content: fetched(POLICY, body) },
+    ]);
+    const text = `The refund window is 30 days [1]. Every order placed online counts [1]. The window is 30 days [1].\n\n[1]: ${POLICY}`;
+    _setGroundingBudgetForTest(1_000);
+    try {
+      const capped = await verify(text, { config: config("grounded"), evidence });
+      expect(capped.claims.map((c) => c.status)).toEqual(["met", "met", "unmet"]);
+      expect(capped.claims[2]?.bindings[0]).toMatchObject({ rung: "cited", reason: "below_floor" });
+      expect(capped.claims[2]?.bindings[0]?.detail).toContain("not checked");
+      // At `cited` the cap costs nothing: no source needs reading there.
+      expect((await verify(text, { config: config("cited"), evidence })).verdict).toBe("pass");
+    } finally {
+      _setGroundingBudgetForTest();
+    }
+    // A timer due while a long answer is verified runs before it is done.
+    const big = evidenceOf([
+      {
+        id: "g",
+        name: "WebFetch",
+        input: { url: POLICY },
+        content: fetched(
+          POLICY,
+          "Shipping is free over 50 dollars and takes three days. ".repeat(4_000),
+        ),
+      },
+    ]);
+    const many = `${Array.from({ length: 150 }, (_, i) => `Shipping takes ${i + 3} days [1].`).join(" ")}\n\n[1]: ${POLICY}`;
+    let done = false;
+    let ranDuring = false;
+    setTimeout(() => {
+      ranDuring = !done;
+    }, 1);
+    await verify(many, { config: config("grounded"), evidence: big });
+    done = true;
+    expect(ranDuring).toBe(true);
+  }, 20_000);
+});
+
+describe("the judge, and the excerpt, are spent only where they decide", () => {
+  const evidence = evidenceOf([
+    {
+      id: "f",
+      name: "WebFetch",
+      input: { url: POLICY },
+      content: "Customers may return items within the refund window.",
+    },
+    {
+      id: "g",
+      name: "WebFetch",
+      input: { url: "https://acme.example/terms" },
+      content: "Customers can return goods within the refund window of the store.",
+    },
+    {
+      id: "h",
+      name: "WebFetch",
+      input: { url: "https://consumer.gov/returns" },
+      content: "Customers may return items within the refund window.",
+    },
+  ]);
+  const claimText = "Customers can return goods within the refund window of the store";
+
+  test("not asked about a claim another binding already meets, in either order", async () => {
+    for (const refs of ["[1] [2]", "[2] [1]"]) {
+      let asked = 0;
+      const bundle = await verify(
+        `${claimText} ${refs}.\n\n[1]: ${POLICY}\n[2]: https://acme.example/terms`,
+        {
+          config: config("grounded"),
+          evidence,
+          judgeWaiver: async () => {
+            asked += 1;
+            return { supported: true, costUsdMicros: 1500 };
+          },
+        },
+      );
+      expect([refs, asked, bundle.judgeWaived, bundle.spentUsdMicros]).toEqual([
+        refs,
+        0,
+        0,
+        undefined,
+      ]);
+      expect(only(bundle).status).toBe("met");
+      expect(renderFooter(bundle)).not.toContain("judge-waived");
+    }
+  });
+
+  test("at independent: 2, asked only for an origin the claim does not already count", async () => {
+    const asked: string[] = [];
+    const judgeWaiver = async (input: { source: string }) => {
+      asked.push(input.source);
+      return { supported: true };
+    };
+    const cfg = config("grounded", { grounded: { independent: 2 } });
+    const corroborated = await verify(
+      `${claimText} [1] [2].\n\n[1]: https://acme.example/terms\n[2]: https://consumer.gov/returns`,
+      { config: cfg, evidence, judgeWaiver },
+    );
+    expect(asked).toEqual(["https://consumer.gov/returns"]);
+    expect(only(corroborated).status).toBe("met");
+    // A waiver on the same publisher could not make up the count: not asked.
+    asked.length = 0;
+    const samePublisher = await verify(
+      `${claimText} [1] [2].\n\n[1]: https://acme.example/terms\n[2]: ${POLICY}`,
+      { config: cfg, evidence, judgeWaiver },
+    );
+    expect(asked).toEqual([]);
+    expect(only(samePublisher).status).toBe("unmet");
+  });
+
+  test("a grounded excerpt shows the claim at its tightest, its figure first", async () => {
+    const page =
+      "Acme Corporation refund policy. After extensive consultation with our customers, partners, regulators, logistics providers and the wider retail community across many seasons, markets and product categories, the board has decided that refund requests are accepted within 30 days of purchase.";
+    const bundle = await verify(
+      `Acme refund requests are accepted within 30 days of purchase [1].\n\n[1]: ${POLICY}`,
+      {
+        config: config("grounded"),
+        evidence: evidenceOf([
+          { id: "f", name: "WebFetch", input: { url: POLICY }, content: page },
+        ]),
+      },
+    );
+    const binding = only(bundle).bindings[0];
+    expect(binding?.rung).toBe("grounded");
+    expect(binding?.excerpt).toContain("30 days of purchase");
+    expect((binding?.excerpt ?? "").length).toBeLessThanOrEqual(240);
+  });
+
+  test("clipAround keeps what met the floor, and marks each cut", () => {
+    expect(clipAround("short text", 0, 5, 240)).toBe("short text");
+    const text = `${"a ".repeat(200)}TARGET${" b".repeat(200)}`;
+    const at = text.indexOf("TARGET");
+    const out = clipAround(text, at, at + 6, 40);
+    expect(out).toContain("TARGET");
+    expect(out.length).toBeLessThanOrEqual(40);
+    expect(out.startsWith("…")).toBe(true);
+    expect(out.endsWith("…")).toBe(true);
+    const long = clipAround(`x ${"y".repeat(500)}`, 2, 502, 40);
+    expect(long.length).toBeLessThanOrEqual(40);
+    expect(long.startsWith("…y")).toBe(true);
   });
 });
 

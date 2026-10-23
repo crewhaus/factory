@@ -46,6 +46,12 @@ export type SessionEvidenceOptions = {
   readonly rootDir?: string;
   /** Workspace root for path-shaped inputs (default `process.cwd()`). */
   readonly workspaceRoot?: string;
+  /**
+   * Where the runtime spilled results too long for the log (the tenant's
+   * `toolResultRoot` inside a tenant scope; default `.crewhaus/tool-results`
+   * under the workspace), so a spilled page is read whole.
+   */
+  readonly toolResultsRoot?: string;
   /** `session` (every call the run made) or `turn` (the current turn's). */
   readonly scope: "session" | "turn";
   /** Told when a log could not be read to its end (records before it are kept). */
@@ -171,6 +177,7 @@ export async function sessionEvidence(opts: SessionEvidenceOptions): Promise<Ses
     rootDir,
     onUnreadable,
     ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
+    ...(opts.toolResultsRoot !== undefined ? { toolResultsRoot: opts.toolResultsRoot } : {}),
   };
   if (opts.scope === "session") {
     const records = await evidenceFromSessionLog({ sessionId: opts.sessionId, ...common });

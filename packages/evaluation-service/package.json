@@ -35,6 +35,7 @@
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-encode": "workspace:*",
     "@crewhaus/tool-flow": "workspace:*",
+    "@crewhaus/tool-math": "workspace:*",
     "zod": "^3.23.8"
   },
   "license": "Apache-2.0",

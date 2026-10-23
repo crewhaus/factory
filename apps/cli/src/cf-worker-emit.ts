@@ -18,12 +18,19 @@
  * Pillar 1 (the compiler is the protagonist): each case hands the emitter its
  * typed IR variant, narrowed on the `target` discriminant — never the raw
  * spec.
+ *
+ * What the edge leaves out of a spec is said as a warning, never dropped in
+ * silence: builtins it cannot run (`edge-unsafe-tool`) and the answer gates
+ * it does not wire (`cfWorkerUnwiredBlockWarnings`, the compiler's rule, which
+ * the hosted compile applies too).
  */
 import {
   type Bundle,
   type CompileResult,
+  type CompileWarning,
   assertCfWorkerToolsEdgeSafe,
   assertToolScopesStrict,
+  cfWorkerUnwiredBlockWarnings,
 } from "@crewhaus/compiler";
 import { CompilerError } from "@crewhaus/errors";
 import type { IrNode } from "@crewhaus/ir";
@@ -70,7 +77,7 @@ export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): 
   // no shape can run, throw; any other builtin the worker does not wire is an
   // `edge-unsafe-tool` warning (the CLI prints it, and --strict escalates it)
   // rather than a silent omission.
-  const warnings = assertCfWorkerToolsEdgeSafe(ir);
+  const warnings = [...assertCfWorkerToolsEdgeSafe(ir), ...cfWorkerUnwiredBlockWarnings(ir)];
   const bundle = emitFor(ir, opts);
   return { files: bundle.files, warnings };
 }

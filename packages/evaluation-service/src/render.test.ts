@@ -13,7 +13,14 @@ import type { RunEvaluation } from "@crewhaus/runtime-core";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { proofCheck, provabilityPreflight } from "@crewhaus/tool-proof";
-import { MEETINGS, config, recordingBus, sumTool, tempDirs } from "./__fixtures__/helpers";
+import {
+  MEETINGS,
+  callMessages,
+  config,
+  recordingBus,
+  sumTool,
+  tempDirs,
+} from "./__fixtures__/helpers";
 import { type EvaluationWiringOptions, renderEvaluationWiring } from "./render";
 import { proofsDirName } from "./roots";
 import { mergeGateTools, registerGateTools } from "./tools";
@@ -39,7 +46,7 @@ const CHANNEL: EvaluationWiringOptions = {
 const MANAGED: EvaluationWiringOptions = {
   catalogVar: "defaultCatalog",
   cwdExpr: "process.cwd()",
-  footerTarget: "reply",
+  footerTarget: "none",
   indent: "    ",
 };
 
@@ -120,10 +127,10 @@ describe("provability", () => {
     );
   });
 
-  test("managed: the reply footer", () => {
+  test("managed: no footer — the bundle rides the envelope (§5.4)", () => {
     const wiring = renderEvaluationWiring({ ...base, provability }, MANAGED);
     expect(wiring.bootBlock).toBe(
-      `const __gates = await wireEvaluation(${fragmentJson}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "reply" });`,
+      `const __gates = await wireEvaluation(${fragmentJson}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "none" });`,
     );
     expect(wiring.field).toBe("\n    provability: __gates.provability,");
     expect(wiring.toolsRegistration).toEndWith("\nregisterGateTools(defaultCatalog, __gates);");
@@ -141,6 +148,21 @@ describe("provability", () => {
     expect(wiring.toolsExpr("[...config.tools, ...__memTools]")).toBe(
       "mergeGateTools([...config.tools, ...__memTools], __gates)",
     );
+  });
+
+  test("a footer target expression replaces the literal, for a file two callers share (the channel eval entry)", () => {
+    const wiring = renderEvaluationWiring(
+      { ...base, provability },
+      { ...CHANNEL, footerTargetExpr: 'config.footerTarget ?? "reply"' },
+    );
+    expect(wiring.bootBlock).toContain('footerTarget: config.footerTarget ?? "reply"');
+    // Without provability: the deps name no footer at all.
+    expect(
+      renderEvaluationWiring(
+        { ...base, evaluation: CONTAINS },
+        { ...CHANNEL, footerTargetExpr: 'config.footerTarget ?? "reply"' },
+      ).bootBlock,
+    ).not.toContain("footerTarget");
   });
 
   test("managed with a per-run observer: the field composes it in, the import names it", () => {
@@ -358,16 +380,21 @@ describe("the emitted text, evaluated", () => {
       catalog,
       cwd,
     );
-    const out = JSON.parse(
-      (await (catalog.get("ProofCheck") as RegisteredTool).execute({
-        checker: "builtin",
-        ...MEETINGS,
-      })) as string,
-    ) as { ok: boolean; id: string };
+    const raw = (await (catalog.get("ProofCheck") as RegisteredTool).execute({
+      checker: "builtin",
+      ...MEETINGS,
+    })) as string;
+    const out = JSON.parse(raw) as { ok: boolean; id: string };
     expect(out.ok).toBe(true);
     const bundle = await gates.provability?.verify({
       finalText: `${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`,
-      messages: [],
+      // The run's own record of the check that filed the artifact.
+      messages: callMessages(
+        "toolu_proof1",
+        "ProofCheck",
+        { checker: "builtin", ...MEETINGS },
+        raw,
+      ) as Parameters<NonNullable<typeof gates.provability>["verify"]>[0]["messages"],
       usage: { input: 0, output: 0 },
       bus: recordingBus().bus,
       turnNumber: 1,

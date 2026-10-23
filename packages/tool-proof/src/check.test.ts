@@ -14,6 +14,7 @@ import {
   type ProofArtifact,
   buildEvidenceIndex,
   createFileArtifactStore,
+  evidenceFromMessages,
   isProofArtifact,
   isProofId,
   proofsRoot,
@@ -33,7 +34,17 @@ import {
   runChecker,
   toArtifact,
 } from "./index";
-import { MEETINGS, NOW, Z3, config, fakeRun, now, tempDirs, z3Sandbox } from "./test-helpers";
+import {
+  MEETINGS,
+  NOW,
+  Z3,
+  callMessages,
+  config,
+  fakeRun,
+  now,
+  tempDirs,
+  z3Sandbox,
+} from "./test-helpers";
 
 const dirs = tempDirs();
 afterEach(() => dirs.cleanup());
@@ -46,9 +57,22 @@ async function check(
   input: Record<string, unknown>,
   ctx?: ToolExecuteContext,
 ): Promise<Json> {
-  const out = await tools.proofCheck.execute(input, ctx);
-  if (typeof out !== "string") throw new Error("expected a string result");
-  return JSON.parse(out);
+  return (await checkLogged(tools, input, ctx)).out;
+}
+
+/**
+ * One ProofCheck call and its transcript (`callMessages`): what the `proven`
+ * rung reads to know a checker accepted the artifact the call wrote.
+ */
+async function checkLogged(
+  tools: ReturnType<typeof createProofTools>,
+  input: Record<string, unknown>,
+  ctx?: ToolExecuteContext,
+): Promise<{ readonly out: Json; readonly messages: ReturnType<typeof callMessages> }> {
+  const raw = await tools.proofCheck.execute(input, ctx);
+  if (typeof raw !== "string") throw new Error("expected a string result");
+  const out = JSON.parse(raw);
+  return { out, messages: callMessages(`toolu_${out.id}`, "ProofCheck", input, raw) };
 }
 
 function artifactsIn(root: string): string[] {
@@ -628,12 +652,49 @@ describe("a checker that does not settle", () => {
   });
 });
 
+describe("a builtin check leaves the harness's event loop free (design §18)", () => {
+  test("timers fire during each of a turn's worst-case checks, run one after another", async () => {
+    // Runs until its deadline. On the harness's thread a turn of three such
+    // checks — the runtime runs ProofCheck calls one at a time, and nothing
+    // between them yields — held the whole process, every session and every
+    // tenant, for 30 s; the builtin now checks on a worker thread.
+    const statement = "let a = 3^2500 / 7^1100 in forall i in 0..9999: a * a / (a + i) > -1";
+    const builtin = createBuiltinChecker({ timeoutMs: 1_000 });
+    const events: string[] = [];
+    let n = 0;
+    // The builtin as it is, noting when each check's verdict is in (the
+    // call goes on to write the artifact and the log line).
+    const noted: ProofChecker = {
+      ...builtin,
+      check: (input) =>
+        builtin.check(input).then((result) => {
+          events.push(`checked ${n}`);
+          return result;
+        }),
+    };
+    const tools = builtinTools(dirs.make(), { checkers: [noted] });
+    for (n = 1; n <= 2; n++) {
+      const call = check(
+        tools,
+        { checker: "builtin", claim: "The ratio stays above -1.", statement, proof: "eval" },
+        fakeRun().ctx,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      events.push(`timer ${n}`);
+      const out = await call;
+      expect(out.ok).toBe(false);
+      expect(out.reason).toMatch(/ran out of time/);
+    }
+    expect(events).toEqual(["timer 1", "checked 1", "timer 2", "checked 2"]);
+  }, 20_000);
+});
+
 describe("the artifact is what the proven rung reads", () => {
   test("a sentence citing the accepted artifact is proven; the rejected one is proof_rejected", async () => {
     const root = dirs.make();
     const tools = builtinTools(root);
-    const good = await check(tools, { checker: "builtin", ...MEETINGS }, fakeRun().ctx);
-    const bad = await check(
+    const goodCall = await checkLogged(tools, { checker: "builtin", ...MEETINGS }, fakeRun().ctx);
+    const badCall = await checkLogged(
       tools,
       {
         checker: "builtin",
@@ -643,12 +704,27 @@ describe("the artifact is what the proven rung reads", () => {
       },
       fakeRun().ctx,
     );
+    const good = goodCall.out;
+    const bad = badCall.out;
+    // The run's transcript holds both calls: the rung reads the verdict and
+    // the input there, never off the artifact file alone.
+    const evidence = buildEvidenceIndex(
+      evidenceFromMessages([...goodCall.messages, ...badCall.messages]),
+    );
     const artifacts = createFileArtifactStore({ rootDir: root });
     const answer = (id: string) =>
       `No two of the three meetings overlap [1].\n\n[1]: proof:${id}\n`;
-    const proven = await verifyDocument(answer(good.id), {
+    // With no record of the call, the file alone proves nothing.
+    const unlogged = await verifyDocument(answer(good.id), {
       config: config("proven"),
       evidence: buildEvidenceIndex([]),
+      artifacts,
+      now,
+    });
+    expect(unlogged.claims[0]?.bindings[0]?.reason).toBe("proof_missing");
+    const proven = await verifyDocument(answer(good.id), {
+      config: config("proven"),
+      evidence,
       artifacts,
       now,
     });
@@ -660,7 +736,7 @@ describe("the artifact is what the proven rung reads", () => {
     });
     const rejected = await verifyDocument(answer(bad.id), {
       config: config("proven"),
-      evidence: buildEvidenceIndex([]),
+      evidence,
       artifacts,
       now,
     });

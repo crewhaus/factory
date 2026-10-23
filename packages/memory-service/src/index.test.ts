@@ -1064,6 +1064,88 @@ describe("continuity.proof reaches tool-plan's proofMode (design/0.8.0 §6.3)", 
     expect(tool(catalog.registered, "PlanComplete").description).toContain("RECORDED");
   });
 
+  test("require: what the tools still call unproven stays open in the tail and handoff.md", async () => {
+    // Session 1 under `off` proves two steps and a goal by assertion; session
+    // 2 reopens the same store under `require`, where the tools say all of it
+    // still needs a verified proof (design/0.8.0 §6.3).
+    const offWiring = deps({ sessionScope: SESSION_ID });
+    const off = await wireMemory(
+      { specName: "proof-switch", continuity: { proof: "off" } },
+      offWiring.deps,
+    );
+    const offTool = (name: string) => tool(offWiring.catalog.registered, name);
+    await offTool("PlanUpdate").execute({
+      action: "create",
+      title: "release",
+      steps: ["build", "deploy", "announce"],
+    });
+    await offTool("PlanUpdate").execute({ action: "set_active", planId: "plan-0001" });
+    await offTool("PlanComplete").execute({ step: 1, evidence: [{ toolUseId: "tu_a" }] });
+    await offTool("PlanComplete").execute({ step: 2, evidence: [{ toolUseId: "tu_b" }] });
+    await offTool("GoalWrite").execute({ title: "ship it" });
+    await offTool("GoalUpdate").execute({
+      goalId: "goal-0001",
+      status: "proven",
+      evidence: [{ toolUseId: "tu_c" }],
+    });
+    // Under off the asserted goal is done: the tail leaves it out.
+    expect(await off.options.continuity?.loadPlan()).not.toContain("goal-0001");
+
+    const { deps: d, catalog } = deps({ sessionScope: SESSION_ID });
+    const req = await wireMemory({ specName: "proof-switch", continuity: { proof: "require" } }, d);
+    await tool(catalog.registered, "PlanUpdate").execute({
+      action: "set_step_status",
+      step: 3,
+      status: "claimed",
+    });
+    expect(await tool(catalog.registered, "GoalList").execute({})).toBe(
+      "- goal-0001 [proven (unverified)] ship it",
+    );
+
+    const tail = await req.options.continuity?.loadPlan();
+    expect(tail).toContain("goals:\n- goal-0001 [proven (unverified)] ship it");
+    expect(await req.options.continuity?.onPlanDirty?.()).toBe(tail);
+
+    await req.options.continuity?.onHandoff?.({
+      plan: tail ?? null,
+      ledger: [],
+      sessionId: SESSION_ID,
+      stopReason: "complete",
+    });
+    const handoff = readFileSync(
+      join(tmp, ".crewhaus", "state", "proof-switch", "handoff.md"),
+      "utf8",
+    );
+    expect(handoff).toContain("plan-0001 — release (0/3 steps proven, 2 unverified)");
+    expect(handoff).toContain("## Goals\n\n- goal-0001 [proven (unverified)] ship it\n");
+    expect(handoff).toContain(
+      "## Next actions\n\n" +
+        "1. Prove: build (plan-0001 step 1 is proven (unverified), not proven under continuity.proof: require)\n" +
+        "2. Prove: deploy (plan-0001 step 2 is proven (unverified), not proven under continuity.proof: require)\n" +
+        "3. Verify or redo: announce (plan-0001 step 3 is claimed but unproven)\n",
+    );
+
+    // The dream's handoff refresh renders under the same mode, so it does
+    // not rewrite handoff.md back to the ladder's reading.
+    rmSync(join(tmp, ".crewhaus", "state", "proof-switch", "handoff.md"));
+    expect(
+      await runDreamBootCatchUp(
+        {
+          specName: "proof-switch",
+          memory: { dream: { everyMs: 86_400_000 } },
+          continuity: { proof: "require" },
+        },
+        { cwd: tmp },
+      ),
+    ).toBe(DREAM_BOOT_CATCHUP_NOTE);
+    const refreshed = readFileSync(
+      join(tmp, ".crewhaus", "state", "proof-switch", "handoff.md"),
+      "utf8",
+    );
+    expect(refreshed).toContain("## Goals\n\n- goal-0001 [proven (unverified)] ship it\n");
+    expect(refreshed).toContain("1. Prove: build (plan-0001 step 1 is proven (unverified)");
+  }, 20_000);
+
   test("a hand-built fragment with a mode that does not exist fails loudly", async () => {
     const { deps: d } = deps();
     await expect(

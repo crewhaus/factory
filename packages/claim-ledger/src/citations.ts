@@ -113,6 +113,38 @@ export function citationDefinitions(text: string): Map<string, string> {
   return definitions;
 }
 
+/** One citation marker as the grammar reads it (`citationMarkers`). */
+export type CitationMarker = {
+  /** The id: `3` of `[3]`, `a` of `[^a]`. */
+  readonly marker: string;
+  /** A footnote marker, written `[^a]`. */
+  readonly caret: boolean;
+  /** Where the marker's `[` is, and the offset just past its `]`. */
+  readonly at: number;
+  readonly end: number;
+};
+
+/**
+ * Every citation marker in `text`, code included, in document order — read
+ * by the one {@link CITATION_MARKER}, so a caller that tests or rewrites
+ * markers (report-writer, renaming each branch's assumption labels) works
+ * on exactly the set every checker reads, `[1][2]` as the one marker `[2]`.
+ * A caller that must skip code filters by `at`.
+ */
+export function citationMarkers(text: string): CitationMarker[] {
+  const out: CitationMarker[] = [];
+  for (const m of text.matchAll(CITATION_MARKER)) {
+    if (m.index === undefined) continue;
+    out.push({
+      marker: m[1] as string,
+      caret: m[0][1] === "^",
+      at: m.index,
+      end: m.index + m[0].length,
+    });
+  }
+  return out;
+}
+
 /**
  * Every marker outside code, with where it sits, in document order. For
  * `extractClaims`, which needs the markers of each sentence and must find

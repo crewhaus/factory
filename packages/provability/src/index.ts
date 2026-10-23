@@ -33,10 +33,15 @@ export {
   groundingBody,
   recordFromCall,
   restrictToTurns,
+  servesPage,
   sha256Of,
+  spilledOutput,
 } from "./evidence";
 export { PROOF_ID_REGEX, isProofArtifact, isProofId, newProofId } from "./artifact";
 export {
+  HEAD_CONCURRENCY,
+  HEAD_DEADLINE_MS,
+  MAX_GROUNDING_TOKENS,
   MAX_HEAD_REQUESTS,
   bundleHash,
   claimReasons,

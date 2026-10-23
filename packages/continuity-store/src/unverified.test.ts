@@ -656,3 +656,62 @@ describe("ladder records keep their bytes", () => {
     expect("unverified" in (reread?.steps[0] ?? {})).toBe(false);
   });
 });
+
+describe("createContinuityStore({proofMode}) — the handoff counts proven as the mode does", () => {
+  async function offRunStore(proofMode?: string): Promise<ContinuityStore> {
+    // Session 1 under `off`, written by a store with no mode; session 2
+    // reopens the same files under `proofMode`. One root per call.
+    const rootDir = join(tmp, `.crewhaus-${proofMode ?? "absent"}`, "state");
+    const off = makeStore({ sessionId: SESS, rootDir });
+    await off.createPlan({ title: "release", steps: ["build", "announce"] });
+    await off.setActivePlan("plan-0001");
+    await off.proveStep("plan-0001", 1, [{ toolUseId: "tu_a" }], OFF);
+    await off.setStepStatus("plan-0001", 2, "claimed");
+    await off.writeGoal({ title: "ship it" });
+    await off.updateGoal("goal-0001", { status: "proven", evidence: [{ toolUseId: "tu_c" }] }, OFF);
+    return makeStore({
+      sessionId: SESS,
+      rootDir,
+      ...(proofMode !== undefined ? { proofMode } : {}),
+    });
+  }
+
+  test("require: writeHandoff keeps the asserted goal and step open", async () => {
+    const store = await offRunStore("require");
+    const out = readFileSync(await store.writeHandoff({ lastSessionId: SESS }), "utf8");
+    expect(out).toBe(await store.renderHandoff({ lastSessionId: SESS }));
+    expect(out).toContain("plan-0001 — release (0/2 steps proven, 1 unverified)");
+    expect(out).toContain(`- goal-0001 ${PROVEN_UNVERIFIED_LABEL} ship it`);
+    expect(out).toContain(
+      "1. Prove: build (plan-0001 step 1 is proven (unverified), not proven under continuity.proof: require)",
+    );
+    expect(out).toContain("2. Verify or redo: announce (plan-0001 step 2 is claimed but unproven)");
+  });
+
+  test("ladder (explicit or absent) and off write the pre-0.8.0 render", async () => {
+    const ladder = await (await offRunStore()).renderHandoff({ lastSessionId: SESS });
+    expect(ladder).toContain("plan-0001 — release (1/2 steps proven, 1 unverified)");
+    expect(ladder).not.toContain("goal-0001");
+    expect(ladder).not.toContain("Prove:");
+    for (const mode of ["ladder", "off"]) {
+      expect(await (await offRunStore(mode)).renderHandoff({ lastSessionId: SESS })).toBe(ladder);
+    }
+  });
+
+  test("a mode that is not ladder | require | off is refused, never defaulted", () => {
+    expect(() => makeStore({ proofMode: "strict" })).toThrow(ContinuityStoreError);
+    expect(() => makeStore({ proofMode: "strict" })).toThrow(
+      'proofMode "strict" is not one of ladder | require | off',
+    );
+  });
+
+  test("transitions ignore it: require does not make a store refuse what the ladder allows", async () => {
+    // The store applies no policy of its own (tool-plan enforces require).
+    const store = makeStore({ sessionId: SESS, proofMode: "require" });
+    await store.writeGoal({ title: "g", target: 1, current: 1 });
+    await store.createPlan({ title: "p", steps: ["a"] });
+    await store.setStepStatus("plan-0001", 1, "claimed");
+    const plan = await store.proveStep("plan-0001", 1, [{ toolUseId: "tu_x" }], OFF);
+    expect(isProvenByAssertion(plan.steps[0] ?? { status: "open" })).toBe(true);
+  });
+});

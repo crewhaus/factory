@@ -317,6 +317,14 @@ describe("specJsonSchema — document structure", () => {
     }
     expect(asRec(props["on_fail"])["enum"]).toEqual(["retry", "halt", "note", "escalate"]);
     expect(asRec(props["max_retries"])["maximum"]).toBe(5);
+    // The editor forms say what the formal keys DO (design §3, §6.4): the
+    // image overrides lean4 alone, and builtin is always among the checkers.
+    const formal = asRec(deref(asRec(props["formal"]))["properties"]);
+    const describe = (key: string): string =>
+      String(deref(asRec(formal[key]))["description"] ?? "");
+    expect(describe("image")).toContain("lean4 checker only");
+    expect(describe("image")).not.toContain("sandboxed checkers");
+    expect(describe("checkers")).toContain("added last when the list leaves it out");
   });
 
   test("key descriptions surface (Batch B blocks carry them)", () => {

@@ -963,6 +963,103 @@ describe("SpecAdvise", () => {
     expect(String(scoreboard["reason"])).toMatch(/not evidence that routing is healthy/);
   });
 
+  // 0.8.0 §9.3 (review I63) — the gate's lines carry unmet COUNTS; the
+  // reasons are in the bundles it persisted. SpecAdvise reads the failing
+  // ones, as `crewhaus advise` does, so the pressure finding names the
+  // dominant reason instead of always pointing at `provability audit`.
+  function seedGatedSessions(bundleFor: (turn: number) => string | undefined): void {
+    const graded = (turn: number, verdict: "pass" | "fail", retryIndex: number) => {
+      const bundlePath = verdict === "fail" && retryIndex === 1 ? bundleFor(turn) : undefined;
+      return fx.line("provability_graded", {
+        level: "grounded",
+        verdict,
+        claims: 2,
+        met: verdict === "pass" ? 2 : 0,
+        unmet: verdict === "pass" ? 0 : 2,
+        assumptions: 0,
+        retryIndex,
+        maxRetries: 1,
+        turnNumber: turn,
+        bundleHash: `sha256:${turn}-${retryIndex}`,
+        ...(bundlePath !== undefined ? { bundlePath } : {}),
+      });
+    };
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 3; turn++)
+      lines.push(graded(turn, "fail", 0), graded(turn, "fail", 1));
+    for (let turn = 4; turn <= 5; turn++) lines.push(graded(turn, "pass", 0));
+    seedSessions({ "sess_a.jsonl": fx.jsonl(lines) });
+  }
+  const unfetchedBundle = JSON.stringify({
+    version: 1,
+    verdict: "fail",
+    claims: [0, 1].map((index) => ({
+      index,
+      text: `Claim ${index}.`,
+      status: "unmet",
+      best: "cited",
+      bindings: [{ ref: "[1]", kind: "source", rung: "cited", ok: false, reason: "not_fetched" }],
+    })),
+  });
+
+  it("reads the failing turns' proof bundles, so the provability finding names the dominant reason", async () => {
+    const proofs = join(workspace, ".crewhaus", "proofs", "bot", "sess_a");
+    mkdirSync(proofs, { recursive: true });
+    seedGatedSessions((turn) => {
+      const path = join(proofs, `turn-${turn}.json`);
+      writeFileSync(path, unfetchedBundle);
+      return path;
+    });
+    const out = await run(specAdvise, {});
+    const finding = (out["findings"] as Array<Record<string, unknown>>).find(
+      (f) => f["id"] === "provability-pressure",
+    );
+    const evidence = (finding?.["evidence"] as string[] | undefined)?.join("\n") ?? "";
+    console.log(
+      `ADVISE_PROOFS ${JSON.stringify((out["sources"] as Record<string, unknown>)["proofBundles"])}`,
+    );
+    expect(evidence).toContain("unmet: not_fetched ×6");
+    expect(evidence).toContain("Dominant unmet reason: not_fetched (6 claims)");
+    expect(evidence).not.toContain("crewhaus provability audit` breaks them down");
+    expect((out["sources"] as Record<string, unknown>)["proofBundles"]).toEqual({
+      failing: 3,
+      read: 3,
+      unreadable: [],
+    });
+    expect(out["complete"]).toBe(true);
+  });
+
+  it("a proof bundle it could not read is named, never counted as one with no unmet claims", async () => {
+    seedGatedSessions((turn) => join(workspace, ".crewhaus", "proofs", `pruned-${turn}.json`));
+    const out = await run(specAdvise, {});
+    const bundles = (out["sources"] as Record<string, unknown>)["proofBundles"] as Record<
+      string,
+      unknown
+    >;
+    expect(bundles["read"]).toBe(0);
+    expect(JSON.stringify(bundles["unreadable"])).toMatch(/pruned-1\.json.*does not exist/);
+    expect(out["complete"]).toBe(false);
+    expect((out["incomplete"] as string[]).join(" ")).toMatch(/proof bundle .*pruned-1\.json/);
+    // The finding still fires, on the counts the lines carry.
+    expect(
+      (out["findings"] as Array<Record<string, unknown>>).some(
+        (f) => f["id"] === "provability-pressure",
+      ),
+    ).toBe(true);
+  });
+
+  it("a bundle path outside the workspace is refused by the containment boundary, and named", async () => {
+    seedGatedSessions(() => "/etc/passwd");
+    const out = await run(specAdvise, {});
+    const bundles = (out["sources"] as Record<string, unknown>)["proofBundles"] as Record<
+      string,
+      unknown
+    >;
+    expect(bundles["read"]).toBe(0);
+    expect(JSON.stringify(bundles["unreadable"])).toMatch(/escapes the workspace root/);
+    expect(out["complete"]).toBe(false);
+  });
+
   it("a spec that was given but did not parse downgrades to advice AND says so", async () => {
     seedSessions({
       "sess_a.jsonl": fx.jsonl(fx.recoveryLines("MaxTokensError", "continue", 3)),

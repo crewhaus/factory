@@ -269,3 +269,41 @@ describe("phase-1 staleness constants + normalization", () => {
     expect(report.counts.wikiStale).toBe(0);
   });
 });
+
+describe("runDreamPhase1 — open plans counted as continuity.proof counts them", () => {
+  test("under require, a step proven by assertion is still open: the count agrees with handoff.md", async () => {
+    const rootDir = join(tmp, "state");
+    // Proven under `continuity.proof: off`: the cited ref recorded, unchecked.
+    const off = createContinuityStore({ specName: "bot", rootDir, now: fixedNow });
+    const plan = await off.createPlan({ title: "release", steps: ["build"] });
+    await off.proveStep(plan.id, 1, [{ toolUseId: "tu_unchecked", sessionId: SESS_A }], {
+      verification: "unverified",
+    });
+    const counts = async (proofMode?: "ladder" | "require") => {
+      const store = createContinuityStore({
+        specName: "bot",
+        rootDir,
+        now: fixedNow,
+        ...(proofMode !== undefined ? { proofMode } : {}),
+      });
+      const report = await runDreamPhase1({
+        specName: "bot",
+        crewhausDir: tmp,
+        continuityStore: store,
+        ...(proofMode !== undefined ? { proofMode } : {}),
+        now: fixedNow,
+      });
+      return {
+        open: report.counts.openPlans,
+        handoff: readFileSync(join(rootDir, "bot", "handoff.md"), "utf8"),
+      };
+    };
+    const required = await counts("require");
+    expect(required.open).toBe(1);
+    expect(required.handoff).toContain("Prove: build");
+    // The ladder counts the asserted step as done, in both places.
+    const ladder = await counts();
+    expect(ladder.open).toBe(0);
+    expect(ladder.handoff).not.toContain("Prove: build");
+  });
+});

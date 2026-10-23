@@ -2,8 +2,11 @@
  * `continuity.proof` enforcement (design §2.4; design/0.8.0-provability-
  * release.md §6.3): `createPlanTools({proofMode})`.
  *
- *   ladder  — byte-for-byte the pre-0.8.0 surface (index.test.ts runs
- *             unmodified against the default; this file pins the strings).
+ *   ladder  — the pre-0.8.0 proof behaviour and tool descriptions, byte
+ *             for byte (index.test.ts runs unmodified against the default;
+ *             this file pins the strings). Titles and units are one line
+ *             and capped in every mode, the ladder included
+ *             (forged-lines.test.ts).
  *   require — refuses every completion below proven, keeps `claimed` free.
  *   off     — proves without verifying, records unverified refs, pins
  *             nothing, emits `verdict: "unverified"`.
@@ -12,7 +15,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ContinuityStoreError, isProvenByAssertion } from "@crewhaus/continuity-store";
+import {
+  ContinuityStoreError,
+  EvidenceError,
+  isProvenByAssertion,
+} from "@crewhaus/continuity-store";
 import { openEventLog } from "@crewhaus/event-log";
 import {
   type ContinuityEvent,
@@ -98,7 +105,7 @@ describe("proofMode — construction", () => {
 // ladder — unchanged
 // ---------------------------------------------------------------------------
 
-describe("proofMode: ladder — the pre-0.8.0 surface, byte for byte", () => {
+describe("proofMode: ladder — the pre-0.8.0 proof behaviour and descriptions", () => {
   test("explicit ladder and the default produce identical descriptions", () => {
     const byDefault = makeTools().all.map((t) => t.description);
     expect(makeTools("ladder").all.map((t) => t.description)).toEqual(byDefault);
@@ -846,5 +853,83 @@ describe("proofMode: off — no verification, honestly labelled", () => {
       { goalId: "goal-0001", action: "update", status: "proven", verification: "unverified" },
     ]);
     await log.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — one resolver for PlanComplete and the `checked` rung:
+// a torn session log is a verdict, never a raw throw
+// ---------------------------------------------------------------------------
+
+describe("PlanComplete on a session log that cannot be read to its end", () => {
+  /** A crash mid-append: half a JSON line, no newline. */
+  function tearLog(): void {
+    appendFileSync(
+      join(tmp, ".crewhaus", "sessions", `${SESS}.jsonl`),
+      '{"ts":9,"version":1,"kind":"assistant_mess',
+    );
+  }
+
+  for (const mode of ["require", "ladder"] as const) {
+    test(`${mode}: a torn line after the cited result still proves the step`, async () => {
+      const bundle = makeTools(mode, { sessionId: SESS });
+      await bundle.planUpdate.execute({ action: "create", title: "p", steps: ["sum"] });
+      logToolPair("tu_sum");
+      tearLog();
+      expect(
+        await bundle.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_sum" }] }),
+      ).toContain("plan-0001 step 1 proven — evidence: tu_sum");
+      expect(events.filter((e) => e.kind === "action_proof").map((e) => e.payload)).toEqual([
+        { planId: "plan-0001", step: 1, toolUseId: "tu_sum", verdict: "verified" },
+      ]);
+    });
+
+    test(`${mode}: an id past the torn line is refused as missing, and the attempt is audited`, async () => {
+      const bundle = makeTools(mode, { sessionId: SESS });
+      await bundle.planUpdate.execute({ action: "create", title: "p", steps: ["sum"] });
+      logToolPair("tu_before");
+      tearLog();
+      const err = await bundle.planComplete
+        .execute({ step: 1, evidence: [{ toolUseId: "tu_after" }] })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EvidenceError);
+      expect((err as Error).message).toContain(
+        `no verified evidence for tu_after: the session log ${SESS} could not be read to its end`,
+      );
+      expect(events.filter((e) => e.kind === "action_proof").map((e) => e.payload)).toEqual([
+        { planId: "plan-0001", step: 1, toolUseId: "tu_after", verdict: "missing" },
+      ]);
+      expect((await bundle.store.getPlan("plan-0001"))?.steps[0]?.status).toBe("open");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — the store a bundle builds renders handoff.md by its mode
+// ---------------------------------------------------------------------------
+
+describe("createPlanTools hands its proofMode to the store it builds", () => {
+  test("require: the bundle store's handoff keeps an asserted goal and step open", async () => {
+    const off = makeTools("off", { sessionId: SESS });
+    await off.planUpdate.execute({ action: "create", title: "p", steps: ["a"] });
+    await off.planUpdate.execute({ action: "set_active", planId: "plan-0001" });
+    await off.planComplete.execute({ step: 1, evidence: [{ toolUseId: "tu_said" }] });
+    await off.goalWrite.execute({ title: "ship it" });
+    await off.goalUpdate.execute({
+      goalId: "goal-0001",
+      status: "proven",
+      evidence: [{ toolUseId: "tu_said" }],
+    });
+    const offHandoff = await off.store.renderHandoff();
+    expect(offHandoff).not.toContain("goal-0001");
+
+    const strict = makeTools("require", { sessionId: SESS });
+    const handoff = await strict.store.renderHandoff();
+    expect(handoff).toContain("- goal-0001 [proven (unverified)] ship it");
+    expect(handoff).toContain(
+      "1. Prove: a (plan-0001 step 1 is proven (unverified), not proven under continuity.proof: require)",
+    );
+    // The ladder bundle's store renders as `off` does.
+    expect(await makeTools("ladder", { sessionId: SESS }).store.renderHandoff()).toBe(offHandoff);
   });
 });

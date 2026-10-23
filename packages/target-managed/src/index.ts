@@ -365,16 +365,20 @@ ${lines.join("\n")}
  * one tenant's bundles and artifacts never share a directory with another's.
  * Under `provability:` the proof tools register on `defaultCatalog` after the
  * spec's builtins (replacing a same-named builtin it also listed) and the
- * per-turn tool set unions the catalog; the proof footer rides the reply text
- * the gateway returns (`footerTarget: "reply"`), and the bundle itself rides
- * the result envelope as `proof` (`renderProofResult`). Empty pieces when the
- * spec declares neither block, keeping those bundles byte-identical.
+ * per-turn tool set unions the catalog. The bundle rides the result envelope
+ * as `proof` (`renderProofResult`) and nothing is rendered beside the answer
+ * (`footerTarget: "none"`, design §5.4): `reply` is text a program consumes
+ * — a client, the eval bridge's grader, the tenant's output-token meter —
+ * and a footer in it (or, under `render: json`, the whole bundle a second
+ * time) would be scored, parsed and billed as if the agent had said it.
+ * Empty pieces when the spec declares neither block, keeping those bundles
+ * byte-identical.
  */
 function renderEvaluation(ir: IrManagedV0): EvaluationWiring {
   return renderEvaluationWiring(ir, {
     catalogVar: "defaultCatalog",
     cwdExpr: "process.cwd()",
-    footerTarget: "reply",
+    footerTarget: "none",
     indent: "    ",
     // 0.8.0 §5.4 — one wiring serves every run, so each run hands its own
     // observer in (`ManagedAgentArgs.onProofBundle`) and the gateway returns
@@ -1092,15 +1096,20 @@ const federation: GatewayFederationConfig | undefined =
  * `onProofBundle`, which agent.ts composes onto the shared gate for that
  * run's `runChatLoop` only. The runtime calls it once per graded pass — the
  * original answer and each gate-triggered retry, in order — so the last one
- * seen is the standing verdict, the one the reply's footer renders. A
- * duplicate resume (the idempotency path) returns the cached reply WITH the
- * bundle it was graded with, never a bare reply.
+ * seen is the standing verdict. The reply carries no footer (the gate is
+ * wired with `footerTarget: "none"`, see `renderEvaluation`): the envelope's
+ * `proof` is the bundle's one carrier. A duplicate resume (the idempotency
+ * path) returns the cached reply WITH the bundle it was graded with, never a
+ * bare reply.
  *
  * A `halt` verdict throws the classified `provability` failure (exit 37)
  * before any result exists, so the gateway answers with an error and no
- * `proof`; the bundle is on disk under the tenant's `.crewhaus/proofs/` and
- * its summary is on the run's `provability_graded` trace event, which
- * `runs.subscribe` streams like every other bus event.
+ * `proof`; the bundle is on disk under the tenant's root, at
+ * `<tenantsRoot>/<tenant>/proofs/<spec>/` (`CREWHAUS_TENANTS_ROOT`, default
+ * `/tmp/crewhaus-tenants` — outside `.crewhaus/`, so `crewhaus state backup`
+ * does not carry it; the daemon says so at boot), and its summary is on the
+ * run's `provability_graded` trace event, which `runs.subscribe` streams like
+ * every other bus event (its `bundlePath` relative to the tenant's root).
  *
  * Without `provability:` every piece is the pre-0.8.0 text, byte for byte.
  */
@@ -1385,6 +1394,20 @@ await runDrainSweep(() => janitor.runOnce(), {
 });`,
   });
   const controlStart = renderControlStart({});
+  // 0.8.0 (design §5.3, §15) — proof bundles are the audit artifact and carry
+  // no TTL, but on this shape they live with the rest of the tenant's state
+  // under the tenants root, not `.crewhaus/`: left at the /tmp default they
+  // are neither carried by `crewhaus state backup` nor kept from an OS tmp
+  // cleaner. Said once at boot, and only under `provability:`.
+  const tenantsRootWarning =
+    ir.provability === undefined
+      ? ""
+      : `
+if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {
+  console.error(
+    \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to keep them (for example .crewhaus/tenants).\`,
+  );
+}`;
 
   const tenantList = ir.tenants
     .map(
@@ -1415,7 +1438,7 @@ import { runOneTurn } from "./agent.ts";
 ${proofResult.importLine}
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
-${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
+${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";${tenantsRootWarning}
 const PORT = Number(process.env.PORT ?? 3000);
 // Bind every interface unless told otherwise. gateway.listen defaults to
 // 127.0.0.1 — right for a library, wrong here: this is the daemon's only

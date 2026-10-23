@@ -52,7 +52,14 @@ import {
   appendRetentionPins,
   verifyEvidence,
 } from "./evidence";
-import { HANDOFF_MARKER, isProvenByAssertion, isProvenVerified, renderHandoff } from "./handoff";
+import {
+  CONTINUITY_PROOF_MODES,
+  type ContinuityProofMode,
+  HANDOFF_MARKER,
+  isProvenByAssertion,
+  isProvenVerified,
+  renderHandoff,
+} from "./handoff";
 import { type AcquireLockOptions, withLock } from "./lock";
 import {
   type MoveToTrashResult,
@@ -110,9 +117,12 @@ export {
   verifyEvidence,
 } from "./evidence";
 export {
+  type ContinuityProofMode,
   type HandoffInput,
+  CONTINUITY_PROOF_MODES,
   HANDOFF_MARKER,
   PROVEN_UNVERIFIED_LABEL,
+  countsAsProven,
   isProvenByAssertion,
   isProvenVerified,
   renderHandoff,
@@ -272,6 +282,18 @@ export interface ContinuityStoreOptions {
   readonly now?: () => Date;
   /** Lock policy overrides + warning sink (lock steals, §7.6). */
   readonly lock?: AcquireLockOptions;
+  /**
+   * `continuity.proof` as `handoff.md` reads it (design/0.8.0 §6.3): under
+   * `"require"` a record proven by assertion or with no frozen proof is
+   * rendered as open — listed under Goals, named in Next actions — the way
+   * the require tools treat it (see `countsAsProven`). Default `"ladder"`;
+   * `"off"` renders as the ladder does. Only the handoff reads it, so every
+   * caller that rewrites `handoff.md` (the teardown seam, the dream's
+   * refresh) agrees with the tools; transitions never do — the store applies
+   * no policy of its own, and each call says how it verifies
+   * ({@link ProveOptions}).
+   */
+  readonly proofMode?: ContinuityProofMode;
 }
 
 export type AppendRequirementInput = {
@@ -383,6 +405,7 @@ export interface ContinuityStore {
   verifyEvidence(refs: readonly EvidenceRef[]): Promise<readonly FrozenProof[]>;
 
   // ---- handoff ----
+  /** Renders under the store's {@link ContinuityStoreOptions.proofMode}. */
   renderHandoff(opts?: { lastSessionId?: string }): Promise<string>;
   /** Renders and writes `handoff.md`; returns the file path. */
   writeHandoff(opts?: { lastSessionId?: string }): Promise<string>;
@@ -710,6 +733,14 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   if (scope.kind === "session" && !SESSION_ID_REGEX.test(scope.sessionId)) {
     throw new ContinuityStoreError(
       `invalid scope.sessionId "${scope.sessionId}" — expected sess_<16 hex>`,
+    );
+  }
+
+  // A hand-built fragment can carry any string; a typo'd mode must not
+  // quietly render as the ladder (tool-plan refuses it the same way).
+  if (opts.proofMode !== undefined && !CONTINUITY_PROOF_MODES.includes(opts.proofMode)) {
+    throw new ContinuityStoreError(
+      `continuity-store: proofMode "${String(opts.proofMode)}" is not one of ${CONTINUITY_PROOF_MODES.join(" | ")}.`,
     );
   }
 
@@ -1100,6 +1131,7 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       goals,
       requirements: focus.requirements,
       ...(lastSessionId !== undefined ? { lastSessionId } : {}),
+      ...(opts.proofMode !== undefined ? { proofMode: opts.proofMode } : {}),
     };
   }
 

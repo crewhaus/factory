@@ -79,11 +79,24 @@ describe("stripLean", () => {
   });
 
   test("many strings strip in linear time", () => {
+    // Looking back through the kept code for the `!` of `s!"…"` once per
+    // string is quadratic here: billions of steps. Timed against a text of
+    // the same size with no strings, the least of three runs, so a slow
+    // machine slows both (an absolute bound is a flake on a loaded runner).
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
     const many = '"a" '.repeat(50_000);
-    const started = performance.now();
     expect(stripLean(many).length).toBe(many.length);
-    expect(performance.now() - started).toBeLessThan(1_000);
-  });
+    const base = fastest(() => stripLean("aaa ".repeat(50_000)));
+    expect(fastest(() => stripLean(many))).toBeLessThan(base * 20 + 100);
+  }, 20_000);
 
   test("a «…» name is a name: a quote or comment opener inside it hides nothing", () => {
     const out = stripLean('have «"» := 1\n  set_option x true in\n  have «"» := 2');

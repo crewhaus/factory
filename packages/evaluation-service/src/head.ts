@@ -23,16 +23,23 @@
  * does not halt on one). An abort is the turn ending, not the page: it is
  * rethrown and forgotten.
  *
- * The request is an egress whose URL the model wrote, so each one decided
- * (sent, or refused by the guard) is recorded through `record` — the gate
- * turns it into an `egress_decision` on the run's audit sink (sink
- * `provability.resolve`, §10). A cache hit sends nothing and records
- * nothing. What is recorded is the host and the outcome, never the URL: its
- * path and query are model-written and may carry what an injection wanted
- * out.
+ * The request is an egress whose URL the model wrote — path and query
+ * included, and those may carry what an injection wanted out. So before a
+ * request is sent the URL goes through the sink side of the security
+ * fabric (AGENTS.md Pillar 3) when the caller hands a `screen` (the runtime
+ * does: `ProvabilityTurn.screenEgress`, `classifyEgress` over the run's data
+ * lineage at `external-dynamic`): content a boundary tagged from a non-user
+ * origin — a secret a tool read — refuses it, nothing is sent, and the
+ * citation reads as unanswered. A refusal is not cached: it is the run's
+ * lineage speaking, not the page. Each request decided (sent, refused by
+ * the screen, or refused by the guard) is recorded through `record` — the
+ * gate turns it into an `egress_decision` on the run's audit sink (sink
+ * `provability.resolve`, scope `external-dynamic`, the screen's verdict and
+ * the origins it found, §10). A cache hit sends nothing and records nothing.
+ * What is recorded is the host and the outcome, never the URL.
  */
 import type { IrProvability } from "@crewhaus/ir";
-import { hostMatches, isPrivateHost } from "@crewhaus/provability";
+import { type HeadRefusal, hostMatches, isPrivateHost } from "@crewhaus/provability";
 import { FetchPermissionError, guardedHead } from "@crewhaus/tool-fetch";
 
 /** How many (session, URL) answers one wiring remembers. */
@@ -41,19 +48,40 @@ export const HEAD_CACHE_ENTRIES = 1024;
 /** The sink id a HEAD's `egress_decision` names (design §6.1). */
 export const RESOLVE_SINK_ID = "provability.resolve";
 
-/** One HEAD the guard decided on: what the gate records as an `egress_decision`. */
+/**
+ * What the sink-side screen decided about one URL before it was sent (the
+ * runtime's `GateEgressScreen`): `block` refuses the request.
+ */
+export type HeadScreen = {
+  readonly verdict: "pass" | "warn" | "block";
+  readonly originsFound: ReadonlyArray<string>;
+  readonly matchCount: number;
+};
+
+/** One HEAD the gate decided on: what it records as an `egress_decision`. */
 export type HeadDecision = {
   readonly sinkId: typeof RESOLVE_SINK_ID;
-  readonly sinkScope: "external";
-  /** `pass` — the request went out (whatever came back); `block` — the guard refused it. */
-  readonly verdict: "pass" | "block";
+  /** The URL is one the model wrote: a dynamic sink, as egress-classifier names it. */
+  readonly sinkScope: "external-dynamic";
+  /**
+   * `pass` / `warn` — the request went out (whatever came back), with the
+   * screen's verdict; `block` — it did not: the screen or the guard refused it.
+   */
+  readonly verdict: "pass" | "warn" | "block";
   readonly method: "HEAD";
   /** The cited URL's host; absent when the URL did not parse. */
   readonly host?: string;
   /** The final status, when one came back. */
   readonly status?: number;
-  /** Why there is no status: refused by the source / private-host policy, or the request failed. */
-  readonly reason?: "refused" | "failed";
+  /**
+   * Why there is no status: `egress` — the screen found tagged content in
+   * the URL; `refused` — the source / private-host policy; `failed` — the
+   * request failed.
+   */
+  readonly reason?: "egress" | "refused" | "failed";
+  /** The origins of the tagged content the screen found in the URL, when it found any. */
+  readonly originsFound?: ReadonlyArray<string>;
+  readonly matchCount?: number;
 };
 
 export type HeadResolver = (
@@ -63,8 +91,10 @@ export type HeadResolver = (
     readonly signal?: AbortSignal;
     /** Told about every request decided (never a cache hit); see the module doc. */
     readonly record?: (decision: HeadDecision) => void | Promise<void>;
+    /** The sink-side check a URL passes before it is sent; see the module doc. */
+    readonly screen?: (url: string) => Promise<HeadScreen>;
   },
-) => Promise<number | undefined>;
+) => Promise<number | HeadRefusal | undefined>;
 
 /** The spec's source policy as a host test: private hosts never, deny wins, an allow list admits only its hosts. */
 export function sourceHostPolicy(sources: IrProvability["sources"]): (host: string) => boolean {
@@ -94,7 +124,7 @@ export function hopPolicy(sources: IrProvability["sources"]): (host: string) => 
 }
 
 /** Session-and-URL keyed answers; see {@link createHeadResolver}. */
-export type HeadCache = Map<string, Promise<number | undefined>>;
+export type HeadCache = Map<string, Promise<number | HeadRefusal | undefined>>;
 
 /**
  * The guarded HEAD's answers for the whole process, shared by every wiring
@@ -118,6 +148,13 @@ function hostOf(url: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The screen's findings, as a record carries them (none when it found none). */
+function lineageOf(screened: HeadScreen): Pick<HeadDecision, "originsFound" | "matchCount"> {
+  return screened.originsFound.length > 0
+    ? { originsFound: [...screened.originsFound], matchCount: screened.matchCount }
+    : {};
 }
 
 class Stopped extends Error {
@@ -171,7 +208,7 @@ export function createHeadResolver(
       try {
         await ctx.record?.({
           sinkId: RESOLVE_SINK_ID,
-          sinkScope: "external",
+          sinkScope: "external-dynamic",
           method: "HEAD",
           ...(host !== undefined ? { host } : {}),
           ...decision,
@@ -180,13 +217,32 @@ export function createHeadResolver(
         // The audit trail is best-effort here, as on every egress path.
       }
     };
-    const pending = (async (): Promise<number | undefined> => {
+    const pending = (async (): Promise<number | HeadRefusal | undefined> => {
+      let screened: HeadScreen | undefined;
       try {
+        // The sink side first: a URL carrying tagged content is never sent.
+        // A screen that cannot answer refuses — the request is an egress.
+        if (ctx.screen !== undefined) {
+          try {
+            screened = await untilAborted(ctx.screen(url), ctx.signal);
+          } catch (err) {
+            if (ctx.signal?.aborted === true) throw err;
+            screened = { verdict: "block", originsFound: [], matchCount: 0 };
+          }
+          if (screened.verdict === "block") {
+            cache.delete(key);
+            await record({ verdict: "block", reason: "egress", ...lineageOf(screened) });
+            // Not sent: the verifier says the egress fabric refused it,
+            // rather than that the URL gave no answer.
+            return { refused: "egress" };
+          }
+        }
         const status = await untilAborted(request(url, ctx.signal), ctx.signal);
         const answer = typeof status === "number" && Number.isFinite(status) ? status : undefined;
         await record({
-          verdict: "pass",
+          verdict: screened?.verdict ?? "pass",
           ...(answer !== undefined ? { status: answer } : { reason: "failed" }),
+          ...(screened !== undefined ? lineageOf(screened) : {}),
         });
         if (answer === undefined) cache.delete(key);
         return answer;
@@ -199,7 +255,11 @@ export function createHeadResolver(
         if (isLastingRefusal(err)) {
           await record({ verdict: "block", reason: "refused" });
         } else {
-          await record({ verdict: "pass", reason: "failed" });
+          await record({
+            verdict: screened?.verdict ?? "pass",
+            reason: "failed",
+            ...(screened !== undefined ? lineageOf(screened) : {}),
+          });
           cache.delete(key);
         }
         return undefined;

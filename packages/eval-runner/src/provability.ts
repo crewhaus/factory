@@ -41,7 +41,9 @@
  *     the compiler, never re-derived here). The six `provability.*` graders
  *     join the run ({@link provabilityGraderEntries}) as REQUIREMENTS beside
  *     the graders file's `combine:` policy, never inside it, and
- *     `costPerProvenClaim` as a report only.
+ *     `costPerProvenClaim` as a report only. A graders file's `type:
+ *     registry` entry naming one of them takes the same role, flag or no
+ *     flag (`registryProvabilityRoles`, ./default-registry).
  */
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
@@ -122,13 +124,13 @@ export function withProvabilityFloor(ir: IrV0, level: string | undefined): IrV0 
 /**
  * The six `provability.*` graders to append to a run's grader set, skipping
  * any name the graders file already carries (an explicit entry — a registry
- * reference, a plugin override — wins, and joins the file's `combine:`
- * policy like every entry there). Each appended entry carries a
- * {@link GraderEntry.role}: the five with a bar are REQUIREMENTS (the sample
- * must pass each, on top of its own policy — a vacuous pass or a
- * lower-is-better rate can neither carry a `combine: any` nor skew a
- * `weighted` score), and `costPerProvenClaim` is a REPORT (always passing,
- * scored in dollars: it never votes). `pricing` (the run's
+ * reference, a plugin override — wins, and a registry entry naming one of
+ * the six takes the same role: `registryProvabilityRoles`). Each appended
+ * entry carries a {@link GraderEntry.role}: the five with a bar are
+ * REQUIREMENTS (the sample must pass each, on top of its own policy — a
+ * vacuous pass or a lower-is-better rate can neither carry a `combine: any`
+ * nor skew a `weighted` score), and `costPerProvenClaim` is a REPORT (always
+ * passing, scored in dollars: it never votes). `pricing` (the run's
  * `RunEvalOptions.pricing`) prices the gate's re-runs on an unmetered run.
  * Lazily imported: an un-flagged run never loads the pack.
  */
@@ -136,7 +138,7 @@ export async function provabilityGraderEntries(
   existing: ReadonlyArray<{ readonly name: string }>,
   opts: { readonly pricing?: EvalPricingFn } = {},
 ): Promise<GraderEntry[]> {
-  const { PROVABILITY_REPORTED_GRADERS, createProvabilityGraders } = await import(
+  const { createProvabilityGraders, provabilityGraderRole } = await import(
     "@crewhaus/grader-provability"
   );
   const taken = new Set(existing.map((g) => g.name));
@@ -148,7 +150,7 @@ export async function provabilityGraderEntries(
     .map(([name, grader]) => ({
       name,
       grader,
-      role: PROVABILITY_REPORTED_GRADERS.includes(name) ? "report" : "requirement",
+      role: provabilityGraderRole(name) ?? "requirement",
     }));
 }
 

@@ -24,6 +24,10 @@
  *   judged from where the rename will put it; no content budget.
  * - {@link probeKind} / {@link assertRegularFile}: what a path is, without
  *   opening it.
+ * - {@link protectedRootsOf} / {@link protectedRootHolding} /
+ *   {@link protectedRootBeneath}: the run's own record (session logs,
+ *   spilled tool results, proof bundles), which a tool that writes beneath a
+ *   directory refuses to reach.
  *
  * Every refusal is a {@link SafeFsFailure} naming the caller's path and the
  * reason, never where an escaping path led or what is there.
@@ -91,3 +95,10 @@ export {
   type CopySymlinkPolicy,
   copyTreeSafe,
 } from "./copy";
+export {
+  protectedRootBeneath,
+  protectedRootHolding,
+  protectedRootsBeneath,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "./protected";

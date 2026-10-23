@@ -109,6 +109,15 @@ export type ProofBinding = {
   /** Formal bindings: the checker id and the formal statement shown beside the prose. */
   readonly checker?: string;
   readonly statement?: string;
+  /**
+   * Formal bindings: the hypotheses the proof rests on (the artifact's
+   * `assumptions` — builtin `given` steps, SMT asserts and definitions),
+   * shown beside the statement. Design §6.4: hypotheses are assumptions in
+   * the bundle — counted with the declared ones (`ProofBundle.hypotheses`),
+   * refused under `assumptions: forbid` and capped by `max_assumptions`.
+   * Absent when the proof rests on none. (0.8.0 additive, fix pass.)
+   */
+  readonly assumptions?: readonly string[];
 };
 
 export type ClaimStatus = "met" | "unmet" | "assumption";
@@ -164,17 +173,33 @@ export type ProofBundle = {
    * (0.8.0 additive, W1-C fix pass.)
    */
   readonly assumptionsRefused?: number;
-  /** Distinct source origins that grounded at least one claim. */
+  /**
+   * Distinct hypotheses the accepted proofs behind `proven` bindings rest on
+   * (`ProofBinding.assumptions`): assumptions too (design §6.4, §10), so
+   * every surface counts them with `assumptions` — outside the score, which
+   * counts claims. A claim refused for its proof's hypotheses (`forbid`, or
+   * past `max_assumptions`) is in `assumptionsRefused` instead. Absent when
+   * none. (0.8.0 additive, fix pass.)
+   */
+  readonly hypotheses?: number;
+  /**
+   * Distinct source origins behind the claims: at a `cited` floor every
+   * origin that passed the cited checks, at `grounded` and above every
+   * origin that grounded a claim — what "N sources" beside the floor means.
+   */
   readonly sources: number;
   /** Bindings the waiver judge flipped. */
   readonly judgeWaived: number;
   /** 0 = the original answer, n = the n-th gate-triggered retry. */
   readonly retryIndex: number;
-  /** Proof checkers whose artifacts back `proven` bindings. */
+  /** Proof checkers whose artifacts back `proven` bindings, with the axioms
+   *  and (when any) the hypotheses each proof depends on (design §2, §6.4). */
   readonly checkers?: ReadonlyArray<{
     readonly id: string;
     readonly artifact: string;
     readonly axioms: readonly string[];
+    /** The hypotheses the proof rests on; absent when none. (0.8.0 additive, fix pass.) */
+    readonly assumptions?: readonly string[];
   }>;
   /** Present on a zero-claim answer: why the pass is vacuous. */
   readonly vacuous?: string;
@@ -201,6 +226,11 @@ export type ProvabilityGradedSummary = {
   readonly assumptions: number;
   /** `ProofBundle.assumptionsRefused`, when any. (0.8.0 additive, W1-C fix pass.) */
   readonly assumptionsRefused?: number;
+  /**
+   * `ProofBundle.hypotheses` — the hypotheses accepted proofs rest on,
+   * assumptions too (design §6.4, §10) — when any. (0.8.0 additive, fix pass.)
+   */
+  readonly hypotheses?: number;
   readonly retryIndex: number;
   readonly bundleHash: string;
   readonly judgeModel?: string;
@@ -219,15 +249,31 @@ export type EvidenceRecord = {
   readonly toolUseId: string;
   readonly toolName: string;
   readonly input: unknown;
-  /** The result text, verbatim. */
+  /** The result text, verbatim, as the log holds it. */
   readonly content: string;
+  /**
+   * The whole output when `content` is the runtime's spill preview of it
+   * (`@crewhaus/tool-result-store`: the head, then the path the output was
+   * saved at), read back from that file (evidence.ts `spilledOutput`). The
+   * verifiers read a record's text as `body ?? content`; a replay is
+   * compared with `content`, the form the log holds. (0.8.0 additive, fix
+   * pass.)
+   */
+  readonly body?: string;
   readonly isError: boolean;
   /** The session whose log carried the call (child sessions included). */
   readonly sessionId?: string;
   /** Normalized origins (URLs / workspace paths) this call fetched or read
-   *  as a WHOLE body: its input's `url`/`path` fields and the final URL a
-   *  fetch reported. `bySource` answers these with the whole record. */
+   *  as a WHOLE body: its input's `url`/`path` fields and the URL a fetch's
+   *  header names. `bySource` answers these with the whole record. */
   readonly origins: readonly string[];
+  /**
+   * The HTTP status a fetcher's own header reports (WebFetch's `Status:`,
+   * Fetch's status line). A body under a status outside 2xx is the server's
+   * error page, not the page: `grounded` does not read it. (0.8.0 additive,
+   * fix pass.)
+   */
+  readonly status?: number;
   /** Turn number, when the log recorded one (used by `scope: turn`). */
   readonly turnNumber?: number;
   /**
@@ -298,6 +344,22 @@ export interface ProofArtifactStore {
 /** Result of re-executing a pure tool for `checked` replay. */
 export type ReplayResult = { readonly content: string; readonly isError: boolean };
 
+/**
+ * A HEAD the caller's resolver refused to send (`VerifyOptions.resolveHead`):
+ * `egress` — the run's egress fabric found content a boundary tagged (a
+ * secret a tool read) in the URL, so the request would have carried it out.
+ * The URL is not checked, and the binding says why. (0.8.0 additive, fix
+ * pass.)
+ */
+export type HeadRefusal = { readonly refused: "egress" };
+
+/** A stored proof checked again (`VerifyOptions.recheckProof`). */
+export type RecheckedProof = {
+  readonly ok: boolean;
+  readonly assumptions?: readonly string[];
+  readonly axioms?: readonly string[];
+};
+
 /** Verdict of the opt-in paraphrase-waiver judge (design §6.2). */
 export type JudgeWaiverVerdict = {
   readonly supported: boolean;
@@ -314,12 +376,48 @@ export type VerifyOptions = {
   readonly baseDir?: string;
   /** Proof artifacts for `proof:` bindings. Absent ⇒ every formal binding is `proof_missing`. */
   readonly artifacts?: ProofArtifactStore;
+  /**
+   * Re-run a stored artifact's checker on its statement and proof (design
+   * §6.4: a registered checker ACCEPTED it) — wired for a checker that is
+   * pure and cheap enough to run at gate time, the builtin certificate
+   * checker. `undefined` when it cannot re-check this one (another checker,
+   * none wired); a throw reads the same. A re-check that rejects is
+   * `proof_rejected`; one that accepts supplies the hypotheses and axioms
+   * the bundle lists, in place of the stored ones. (0.8.0 additive, fix
+   * pass.)
+   */
+  readonly recheckProof?: (
+    artifact: ProofArtifact,
+  ) => Promise<RecheckedProof | undefined> | RecheckedProof | undefined;
+  /**
+   * Accept a stored artifact WITHOUT the `ProofCheck` call that wrote it in
+   * `evidence`. Off by default and never on the gate: an artifact is a file
+   * in the workspace, so the model can write one (or flip a rejected one to
+   * `ok: true`) with its own file tools, and only the run's own record of
+   * the check shows a checker accepted it. For an offline check of a
+   * document whose run's log is not at hand. (0.8.0 additive, fix pass.)
+   */
+  readonly trustStoredProofs?: boolean;
   /** Re-execute a tool with its logged input. Absent ⇒ no replay (bindings record `replayed: false`). */
   readonly replay?: (toolName: string, input: unknown) => Promise<ReplayResult | undefined>;
   /** Whether a tool is pure (readOnly && concurrencySafe) and so may be replayed. */
   readonly isPureTool?: (toolName: string) => boolean;
-  /** `sources.resolve: head` — the HTTP status of one guarded HEAD, or undefined on failure. */
-  readonly resolveHead?: (url: string) => Promise<number | undefined>;
+  /**
+   * `sources.resolve: head` — the HTTP status of one guarded HEAD, or
+   * undefined on failure. Up to a few run at once, under one deadline for
+   * the whole verification (`headDeadlineMs`); `signal` aborts when that
+   * deadline passes.
+   */
+  readonly resolveHead?: (
+    url: string,
+    signal?: AbortSignal,
+  ) => Promise<number | HeadRefusal | undefined>;
+  /**
+   * How long one verification waits on its HEAD requests in all (default
+   * 15 s): a URL not answered by then is `unresolved`, not checked. (0.8.0
+   * additive, fix pass.)
+   */
+  readonly headDeadlineMs?: number;
   /** The opt-in waiver judge; called only for paraphrase-coverage misses at `grounded`. */
   readonly judgeWaiver?: (input: {
     readonly claim: string;

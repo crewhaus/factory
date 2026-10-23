@@ -4,8 +4,11 @@ import {
   SpecParseError,
   assertCfWorkerToolsEdgeSafe,
   assertToolScopesStrict,
+  cfWorkerUnwiredBlockWarnings,
+  collectCompileWarnings,
   compile,
   lower,
+  lowerWithWarnings,
   parseSpec,
 } from "@crewhaus/compiler";
 import { projectLoop } from "@crewhaus/ir";
@@ -144,7 +147,11 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
     let bundle: Bundle & { readonly warnings?: ReadonlyArray<CompileWarning> };
     if (emitAs === "cf-worker") {
       const spec = parseSpec(body.yaml);
-      const ir = lower(spec);
+      // Lowered with its warnings, as compile() lowers, so the hosted edge
+      // compile says what the local one says (a parked provability block, a
+      // key the shape carries unwired).
+      const lowered = lowerWithWarnings(spec);
+      const ir = lowered.ir;
       // The target first, as on 0.7.0: a tool finding on a shape the edge
       // cannot emit would send the caller to fix tools, only to meet this.
       if (ir.target !== "cli" && ir.target !== "workflow" && ir.target !== "graph") {
@@ -170,7 +177,14 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
       // host tools the edge always refused throw (400 COMPILE); any other
       // builtin the worker leaves out comes back as an edge-unsafe-tool
       // warning beside the bundle instead of vanishing.
-      const edgeWarnings = assertCfWorkerToolsEdgeSafe(ir);
+      // And the answer gates the edge does not run (provability:,
+      // evaluation:), said rather than served ungated without a word.
+      const edgeWarnings = [
+        ...collectCompileWarnings(spec),
+        ...lowered.warnings,
+        ...assertCfWorkerToolsEdgeSafe(ir),
+        ...cfWorkerUnwiredBlockWarnings(ir),
+      ];
       const allowedOrigins = Array.isArray(body.allowedOrigins)
         ? body.allowedOrigins.filter((o): o is string => typeof o === "string")
         : undefined;

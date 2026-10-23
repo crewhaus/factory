@@ -1503,6 +1503,66 @@ describe("GitApplyPatch", () => {
     expect(out.reason).toContain("GitApplyPatch failed");
   });
 
+  test("a patch writing into the run's own record (session logs, spilled results, proofs) is refused whole", async () => {
+    // The floor reads `cwd`, never the files a patch names: these are the
+    // names it would otherwise write unseen (design/0.8.0 §1 principle 1).
+    const sessions = join(repo, ".crewhaus", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, "sess_00000000000000aa.jsonl"), "real\n");
+    const ctx = {
+      bridge: {
+        protectedRoots: [
+          sessions,
+          join(repo, ".crewhaus", "tool-results"),
+          join(repo, ".crewhaus", "proofs"),
+        ],
+      },
+    };
+    const forging = [
+      "diff --git a/README.md b/README.md",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1,2 +1,3 @@",
+      " hello",
+      " world",
+      "+more",
+      "diff --git a/.crewhaus/sessions/sess_00000000000000aa.jsonl b/.crewhaus/sessions/sess_00000000000000aa.jsonl",
+      "--- a/.crewhaus/sessions/sess_00000000000000aa.jsonl",
+      "+++ b/.crewhaus/sessions/sess_00000000000000aa.jsonl",
+      "@@ -1 +1 @@",
+      "-real",
+      "+forged",
+      "",
+    ].join("\n");
+    const out = JSON.parse(
+      String(await gitApplyPatch.execute({ cwd: "repo", patch: forging }, ctx)),
+    ) as { applied: boolean; reason: string };
+    expect(out.applied).toBe(false);
+    expect(out.reason).toContain("would write where the runtime keeps its own record of the run");
+    expect(out.reason).toContain(".crewhaus/sessions/sess_00000000000000aa.jsonl");
+    expect(readFileSync(join(sessions, "sess_00000000000000aa.jsonl"), "utf8")).toBe("real\n");
+    expect(readFileSync(join(repo, "README.md"), "utf8")).toBe("hello\nworld\n");
+    // A rename OUT of the record removes it: the old name is checked too.
+    const moving = [
+      "diff --git a/.crewhaus/sessions/sess_00000000000000aa.jsonl b/moved.jsonl",
+      "similarity index 100%",
+      "rename from .crewhaus/sessions/sess_00000000000000aa.jsonl",
+      "rename to moved.jsonl",
+      "",
+    ].join("\n");
+    const moved = JSON.parse(
+      String(await gitApplyPatch.execute({ cwd: "repo", patch: moving }, ctx)),
+    ) as { applied: boolean; reason: string };
+    expect(moved.applied).toBe(false);
+    expect(moved.reason).toContain("own record of the run");
+    // The same README hunk alone applies.
+    const plain = forging.split("diff --git a/.crewhaus")[0] as string;
+    const fine = JSON.parse(
+      String(await gitApplyPatch.execute({ cwd: "repo", patch: plain }, ctx)),
+    ) as { applied: boolean };
+    expect(fine.applied).toBe(true);
+  });
+
   test("a patch reaching outside the working tree is refused by git itself", async () => {
     const escaping = [
       "diff --git a/../escape.txt b/../escape.txt",

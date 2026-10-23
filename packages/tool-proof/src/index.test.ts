@@ -228,14 +228,18 @@ describe("the default configuration", () => {
     expect(c.judge).toBeUndefined();
   });
 
-  test("execution.allow is the expansion of all-compute + all-verify, concrete keys only", () => {
+  test("execution.allow is the expansion of all-compute + all-verify less goldenUpdate, concrete keys only", () => {
     const allow = defaultProvabilityConfig().execution.allow;
-    expect(allow).toEqual([...expandToolSelectors(["all-compute", "all-verify"]).tools]);
+    expect(allow).toEqual([
+      ...expandToolSelectors(["all-compute", "all-verify", "-goldenUpdate"]).tools,
+    ]);
     expect(allow.length).toBeGreaterThan(20);
     expect(allow.some((k) => k.startsWith("all-"))).toBe(false);
     expect(allow).toContain("factCrossCheck");
-    // Bash is never in the default allowlist (design §6.3).
+    // Bash and every destructive tool stay out of the default allowlist
+    // (design §6.3); goldenUpdate is the destructive one in `verify`.
     expect(allow).not.toContain("bash");
+    expect(allow).not.toContain("goldenUpdate");
   });
 });
 

@@ -137,6 +137,10 @@ puts the reason in its result:
   it, and so do its malformed lines. `auditRecords` is a count of records that
   were read, and anything standing between it and the whole directory is in
   `incomplete`.
+- `SpecAdvise` reads the proof bundles the provability gate saved for its
+  failing turns, so the provability finding can name the most common reason a
+  claim fell short. `proofBundles` says how many it read, and a bundle it could
+  not read is named in `unreadable` and in `incomplete`.
 - `SpecAdvise` also reports `routingScoreboard: { read: false, reason }`. The
   reward scoreboard lives in `@crewhaus/routing-store`, which this package
   does not depend on, so the three pool rules did not run — their silence is

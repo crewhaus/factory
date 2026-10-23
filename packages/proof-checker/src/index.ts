@@ -4,7 +4,8 @@
  *
  * A checker CHECKS; the model searches. Three ship:
  *   - `builtin` — a dependency-free certificate checker for finite,
- *     arithmetic and propositional claims; always available, no sandbox;
+ *     arithmetic and propositional claims; always available, no sandbox,
+ *     each check on a worker thread of its own;
  *   - `smt` — SMT-LIB 2 checked by Z3 in a sandbox
  *     (`@crewhaus/sandbox-image-z3`);
  *   - `lean4` — Lean 4 in a sandbox (`@crewhaus/sandbox-image-lean4`), behind
@@ -17,12 +18,16 @@ export {
   BUILTIN_CHECKER_ID,
   BUILTIN_LANGUAGE,
   BUILTIN_RULES,
-  type BuiltinCheckerOptions,
   type BuiltinRule,
   type BuiltinVerdict,
   checkCertificate,
-  createBuiltinChecker,
 } from "./builtin/checker";
+export {
+  type BuiltinCheckerOptions,
+  builtinCheckerCounts,
+  createBuiltinChecker,
+  stoppedWithoutVerdict,
+} from "./builtin/runner";
 export {
   type SExpr,
   SMT_CHECKER_ID,

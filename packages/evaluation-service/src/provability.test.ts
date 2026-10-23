@@ -6,7 +6,7 @@
  * judge's provider and the network.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { proofsRoot } from "@crewhaus/provability";
 import type { ProofBundle } from "@crewhaus/provability";
@@ -15,6 +15,7 @@ import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog"
 import { uuid } from "@crewhaus/tool-encode";
 import { _setDnsLookup, _setRawFetch } from "@crewhaus/tool-fetch";
 import { proofCheck as builtinProofCheck } from "@crewhaus/tool-proof";
+import { storeAndPreview } from "@crewhaus/tool-result-store";
 import {
   MEETINGS,
   type Message,
@@ -76,6 +77,15 @@ async function provable(
   return { gates, gate: gates.provability };
 }
 
+/**
+ * The run's own record of the `ProofCheck` call that answered `output`: the
+ * gate accepts a stored artifact only beside the call that filed it (a file
+ * in the workspace alone proves nothing — the model's file tools can write
+ * one).
+ */
+const proofCheckRan = (output: string) =>
+  callMessages("toolu_proof1", "ProofCheck", { checker: "builtin", ...MEETINGS }, output);
+
 describe("the RunProvability shape", () => {
   test("level, onFail, maxRetries, threshold, render and escalateTo come straight from the IR", async () => {
     const { cwd } = workspace();
@@ -120,14 +130,15 @@ describe("the RunProvability shape", () => {
       const dir = proofsDirName(specName);
       expect(dir).not.toBe(specName);
       const proofCheck = gates.tools.find((t) => t.name === "ProofCheck") as RegisteredTool;
-      const out = JSON.parse(
-        (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string,
-      ) as { ok: boolean; id: string };
+      const raw = (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string;
+      const out = JSON.parse(raw) as { ok: boolean; id: string };
       expect(out.ok).toBe(true);
       // The tool files under the mapped directory, and the gate looks there.
       expect(existsSync(join(proofsRoot(cwd, dir), "artifacts", `${out.id}.json`))).toBe(true);
       const bundle = await gates.provability?.verify(
-        turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`),
+        turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`, {
+          messages: proofCheckRan(raw),
+        }),
       );
       expect(bundle?.verdict).toBe("pass");
       const path = await gates.provability?.persist?.(bundle as ProofBundle, {
@@ -589,6 +600,51 @@ describe("sources.resolve: head", () => {
     expect(calls).toBe(2);
   });
 
+  test("a HEAD still pending at the verifier's deadline is stopped, so the retry pass never overlaps it", async () => {
+    const { cwd } = workspace();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const signals: AbortSignal[] = [];
+    // A tarpit: answers nothing until the request is aborted.
+    const tarpit = (_url: string, signal?: AbortSignal): Promise<number | undefined> =>
+      new Promise((resolve) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        if (signal === undefined) return;
+        signals.push(signal);
+        signal.addEventListener(
+          "abort",
+          () => {
+            inFlight -= 1;
+            resolve(undefined);
+          },
+          { once: true },
+        );
+      });
+    const { gate } = await provable(
+      cwd,
+      "cited",
+      { resolveHead: tarpit, headDeadlineMs: 100 },
+      { sources: { resolve: "head" } },
+    );
+    const urls = Array.from({ length: 12 }, (_, i) => `https://tarpit${i}.example/page`);
+    const answer = `${urls.map((_, i) => `Fact number ${i} holds [${i + 1}].`).join(" ")}\n\n${urls
+      .map((url, i) => `[${i + 1}]: ${url}`)
+      .join("\n")}`;
+    const first = await gate.verify(turnOf(answer, { sessionId: SESSION }));
+    expect(first.claims.every((c) => c.bindings[0]?.reason === "unresolved")).toBe(true);
+    const sent = maxInFlight;
+    expect(sent).toBeGreaterThan(0);
+    // Every request the first pass sent was told to stop at its deadline.
+    expect(signals.length).toBe(sent);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    expect(inFlight).toBe(0);
+    // The retry pass starts with nothing of the first still running.
+    await gate.verify(turnOf(answer, { sessionId: SESSION, retryIndex: 1 }));
+    expect(maxInFlight).toBe(sent);
+    expect(inFlight).toBe(0);
+  });
+
   test("each HEAD sent is recorded on the run's audit sink as an egress_decision (sink provability.resolve)", async () => {
     const { cwd } = workspace();
     const appended: Array<{ kind: string; payload: unknown }> = [];
@@ -613,7 +669,7 @@ describe("sources.resolve: head", () => {
         kind: "egress_decision",
         payload: {
           sinkId: "provability.resolve",
-          sinkScope: "external",
+          sinkScope: "external-dynamic",
           method: "HEAD",
           host: "acme.example",
           verdict: "pass",
@@ -624,7 +680,7 @@ describe("sources.resolve: head", () => {
         kind: "egress_decision",
         payload: {
           sinkId: "provability.resolve",
-          sinkScope: "external",
+          sinkScope: "external-dynamic",
           method: "HEAD",
           host: "cdn.example",
           verdict: "pass",
@@ -742,15 +798,16 @@ describe("the proof tools", () => {
     const { cwd } = workspace();
     const { gates, gate } = await provable(cwd, "proven");
     const proofCheck = gates.tools.find((t) => t.name === "ProofCheck") as RegisteredTool;
-    const out = JSON.parse(
-      (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string,
-    ) as { ok: boolean; id: string };
+    const raw = (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string;
+    const out = JSON.parse(raw) as { ok: boolean; id: string };
     expect(out.ok).toBe(true);
     expect(existsSync(join(proofsRoot(cwd, "support-bot"), "artifacts", `${out.id}.json`))).toBe(
       true,
     );
     const bundle = await gate.verify(
-      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`),
+      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`, {
+        messages: proofCheckRan(raw),
+      }),
     );
     expect(bundle.verdict).toBe("pass");
     expect(bundle.claims[0]?.bindings[0]).toMatchObject({
@@ -758,6 +815,44 @@ describe("the proof tools", () => {
       rung: "proven",
       checker: "builtin",
     });
+  });
+
+  test("an accepted artifact rewritten after the check is never served as proven (design §6.4, acceptance C)", async () => {
+    const { cwd } = workspace();
+    const { gates, gate } = await provable(cwd, "proven");
+    const proofCheck = gates.tools.find((t) => t.name === "ProofCheck") as RegisteredTool;
+    const input = {
+      checker: "builtin",
+      claim: "Two plus two is four.",
+      statement: "2 + 2 = 4",
+      proof: "eval",
+    };
+    const raw = (await proofCheck.execute(input)) as string;
+    const out = JSON.parse(raw) as { ok: boolean; id: string };
+    expect(out.ok).toBe(true);
+    // The file is in the workspace: rewritten to a claim and a statement the
+    // builtin rejects (meeting 1 ends at 10.5, meeting 2 starts at 10), the
+    // id and the verdict kept.
+    const file = join(proofsRoot(cwd, "support-bot"), "artifacts", `${out.id}.json`);
+    const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...stored,
+        claim: MEETINGS.claim,
+        statement:
+          "let s = [9, 10, 13], e = [10.5, 12, 14] in forall i in 0..2: forall j in 0..2: i = j or e[i] <= s[j] or e[j] <= s[i]",
+      }),
+    );
+    const bundle = await gate.verify(
+      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`, {
+        messages: callMessages("toolu_proof1", "ProofCheck", input, raw),
+      }),
+    );
+    expect(bundle.verdict).toBe("fail");
+    expect(bundle.claims[0]?.best).not.toBe("proven");
+    expect(bundle.claims[0]?.bindings[0]).toMatchObject({ ok: false, reason: "proof_missing" });
+    expect(bundle.claims[0]?.bindings[0]?.detail).toContain("not the one ProofCheck checked");
   });
 
   test("a ProofCheck the spec listed below proven is replaced by the bound one, so its proof: citation is met", async () => {
@@ -769,15 +864,19 @@ describe("the proof tools", () => {
     const listed = mergeGateTools([builtinProofCheck], gates);
     expect(names(listed)).toEqual(["ProofCheck", "ProvabilityPreflight"]);
     expect(listed[0]).not.toBe(builtinProofCheck);
-    const out = JSON.parse(
-      (await (listed[0] as RegisteredTool).execute({ checker: "builtin", ...MEETINGS })) as string,
-    ) as { ok: boolean; id: string };
+    const raw = (await (listed[0] as RegisteredTool).execute({
+      checker: "builtin",
+      ...MEETINGS,
+    })) as string;
+    const out = JSON.parse(raw) as { ok: boolean; id: string };
     expect(out.ok).toBe(true);
     expect(existsSync(join(proofsRoot(cwd, "support-bot"), "artifacts", `${out.id}.json`))).toBe(
       true,
     );
     const bundle = await gate.verify(
-      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`),
+      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${out.id}`, {
+        messages: proofCheckRan(raw),
+      }),
     );
     expect(bundle.verdict).toBe("pass");
     expect(bundle.claims[0]?.bindings[0]).toMatchObject({ ok: true, rung: "proven" });
@@ -831,10 +930,9 @@ describe("tenancy", () => {
     const answerFor = (id: string) => `${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${id}`;
     const { id, path } = (await withTenant(acme, async () => {
       const proofCheck = gates.tools.find((t) => t.name === "ProofCheck") as RegisteredTool;
-      const out = JSON.parse(
-        (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string,
-      ) as { id: string };
-      const bundle = await gate.verify(turnOf(answerFor(out.id)));
+      const raw = (await proofCheck.execute({ checker: "builtin", ...MEETINGS })) as string;
+      const out = JSON.parse(raw) as { id: string };
+      const bundle = await gate.verify(turnOf(answerFor(out.id), { messages: proofCheckRan(raw) }));
       expect(bundle.verdict).toBe("pass");
       const persisted = (await gate.persist?.(bundle, {
         sessionId: SESSION,
@@ -846,15 +944,63 @@ describe("tenancy", () => {
         ` · ${join("proofs", "support-bot", SESSION, "turn-1.json")}`,
       );
       expect(gate.renderBundle?.(bundle, persisted)).not.toContain(tenants);
+      // So do the run's live surfaces — the trace event a runs.subscribe
+      // stream carries, a halt's detail — by the same rule.
+      expect(gate.displayPath?.(persisted)).toBe(
+        join("proofs", "support-bot", SESSION, "turn-1.json"),
+      );
       return { id: out.id, path: persisted };
     })) as { id: string; path: string };
     expect(path.startsWith(tenantProofs)).toBe(true);
+    // Outside a tenant scope, relative to the workspace.
+    expect(gate.displayPath?.(join(cwd, ".crewhaus", "proofs", "x.json"))).toBe(
+      join(".crewhaus", "proofs", "x.json"),
+    );
     expect(existsSync(join(tenantProofs, "artifacts", `${id}.json`))).toBe(true);
     expect(existsSync(join(cwd, ".crewhaus", "proofs"))).toBe(false);
     // Outside the tenant the same citation finds nothing: another root.
     const outside = await gate.verify(turnOf(answerFor(id)));
     expect(outside.verdict).toBe("fail");
     expect(outside.claims[0]?.bindings[0]?.reason).toBe("proof_missing");
+  });
+
+  test("a page the runtime spilled under the tenant's toolResultRoot is graded whole, in the gate and the preflight", async () => {
+    const { cwd } = workspace();
+    const acme = buildTenant("acme", { tenantsRoot: dirs.make() });
+    // The claim is on line 151 of the page: past the 100-line preview the
+    // runtime logs, so only the spilled file holds it.
+    const lines = Array.from(
+      { length: 300 },
+      (_, i) => `Line ${i}: shipping and handling notes for the warehouse team.`,
+    );
+    lines[150] = "Refunds: Acme accepts refund requests within 14 days of purchase.";
+    const page = fetched(URL_A, lines.join("\n"));
+    const stored = await storeAndPreview(
+      { toolUseId: "toolu_big", content: page, isError: false },
+      { runId: "run_1", toolUseId: "toolu_big", rootDir: acme.toolResultRoot },
+    );
+    expect(stored.persisted).toBe(true);
+    const preview = stored.previewContent as string;
+    expect(preview).not.toContain("within 14 days");
+    const answer = `Acme accepts refund requests within 14 days of purchase [1].\n\n[1]: ${URL_A}`;
+    const { gates, gate } = await provable(cwd, "grounded");
+    const messages = callMessages("toolu_big", "WebFetch", { url: URL_A }, preview);
+    const inside = await withTenant(acme, () => gate.verify(turnOf(answer, { messages })));
+    expect(inside.verdict).toBe("pass");
+    // The preflight reads the tenant's session log the same way.
+    await writeLog(acme.sessionRoot, SESSION, [
+      userLine("refund window?"),
+      ...callLines("toolu_big", "WebFetch", { url: URL_A }, preview),
+    ]);
+    const preflight = gates.tools.find((t) => t.name === "ProvabilityPreflight") as RegisteredTool;
+    const ctx: ToolExecuteContext = { bridge: { runContext: { sessionId: SESSION } } };
+    const drafted = (await withTenant(acme, () =>
+      preflight.execute({ draft: answer }, ctx),
+    )) as string;
+    expect(JSON.parse(drafted).verdict).toBe("pass");
+    // Outside the tenant the spill root is the workspace's: only the preview counts.
+    const outside = await gate.verify(turnOf(answer, { messages }));
+    expect(outside.verdict).toBe("fail");
   });
 
   test("a fixed session root outside the tenant's root fails closed (the gate then serves unverified)", async () => {

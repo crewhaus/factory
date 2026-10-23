@@ -36,6 +36,18 @@ describe("extractClaims — what is a claim", () => {
     );
   });
 
+  test("a number word makes a claim however short, as a numeral does (design §2)", () => {
+    expect(texts("Seats: twelve.")).toEqual(["Seats: twelve."]);
+    expect(texts("Seats: 12.")).toEqual(["Seats: 12."]);
+    expect(texts("It holds a dozen.")).toEqual(["It holds a dozen."]);
+    expect(texts("Uptime: half.")).toEqual(["Uptime: half."]);
+    expect(texts("Acme ranked third.")).toEqual(["Acme ranked third."]);
+    // "one" is a pronoun before it is a count, and a list-counting "First,"
+    // states no rank: neither makes a short sentence a claim.
+    expect(texts("Pick one. One moment.")).toEqual([]);
+    expect(texts("First, thanks.")).toEqual([]);
+  });
+
   test("filler too short to verify is skipped", () => {
     expect(texts("Sure thing. Done. I hope this helps!")).toEqual([]);
   });
@@ -509,6 +521,100 @@ describe("extractClaims — markers and lines", () => {
     expect(extractClaims("Revenue rose sharply this quarter.\n[1]")[0]?.markers).toEqual(["1"]);
   });
 
+  test("a question run into a claim drops only the question (design §0, tests A and B)", () => {
+    const read = (doc: string) =>
+      extractClaims(doc).map(({ text, markers, line }) => ({ text, markers, line }));
+    // A: a cited figure with no full stop, then a question on the next line.
+    expect(
+      read(
+        "The refund window is 30 days [1]\nAnything else I can help with?\n\n[1]: https://acme.example/p",
+      ),
+    ).toEqual([{ text: "The refund window is 30 days", markers: ["1"], line: 1 }]);
+    // B: an uncited total, then a question — lowercase too, and over CRLF.
+    expect(read("The invoice total is 1,284.50\nShall I email it to the customer?")).toEqual([
+      { text: "The invoice total is 1,284.50", markers: [], line: 1 },
+    ]);
+    expect(read("The invoice total is 1,284.50\nwant me to email it?")).toHaveLength(1);
+    expect(read("The refund window is 30 days [1]\r\nAnything else?")).toEqual([
+      { text: "The refund window is 30 days", markers: ["1"], line: 1 },
+    ]);
+    expect(read("**Total:** $1,284.50\nWould you like a PDF copy?")).toEqual([
+      { text: "Total: $1,284.50", markers: [], line: 1 },
+    ]);
+    // An uncited sentence of words is a claim the cited floor refuses, as it
+    // would be with a blank line before the question.
+    expect(read("Our team reviewed the refund policy\nAnything else?")).toHaveLength(1);
+  });
+
+  test("a terminator glued to a capital ends the sentence before a question", () => {
+    expect(texts("The refund window is 30 days.Anything else?")).toEqual([
+      "The refund window is 30 days.",
+    ]);
+    // The marker stays bound to the claim it follows.
+    expect(
+      extractClaims("Paris is the capital of France [1].Right?").map((c) => [c.text, c.markers]),
+    ).toEqual([["Paris is the capital of France.", ["1"]]]);
+    // Each question is left out; the claim before them is read.
+    expect(texts("The total is 1,284.50.Is it right?Anything else?")).toEqual([
+      "The total is 1,284.50.",
+    ]);
+    // No capital, an abbreviation or an initialism: no sentence ends.
+    expect(texts("Is acme.example up, and is Node.js 1.2 out?")).toEqual([]);
+    expect(texts("Did the U.S.Army or Acme Inc.Labs publish 3 reports?")).toEqual([]);
+    // A dotted name or a URL path ends no sentence at a capital inside it: a
+    // clarifying question has nothing to prove (design §2).
+    expect(texts("Do you want me to migrate the serializer to System.Text.Json instead?")).toEqual(
+      [],
+    );
+    expect(
+      texts("Should I replace the loop with a call to Console.WriteLine in the handler?"),
+    ).toEqual([]);
+    expect(
+      texts("Did you already read https://acme.example/Docs/Guide.Html about refunds?"),
+    ).toEqual([]);
+    // A sentence still ends after a figure, a marker or a year.
+    expect(texts("It was 2024.Right?")).toEqual(["It was 2024."]);
+    expect(texts("The total came to $1.5M.Anything else?")).toEqual(["The total came to $1.5M."]);
+  });
+
+  test("a long token of glued capitals is read in linear time", () => {
+    const size = 100_000;
+    const time = (doc: string): number => {
+      const start = performance.now();
+      extractClaims(doc);
+      return performance.now() - start;
+    };
+    const base = time(`Is ${"a".repeat(size * 3)} fine?`);
+    expect(time(`Is ${".Ab".repeat(size)} fine?`)).toBeLessThan(base * 20 + 100);
+    expect(time(`Is x/${"y.Ab".repeat(size)} fine?`)).toBeLessThan(base * 20 + 100);
+  }, 20_000);
+
+  test("a table or a list before a question stays what it is without the question", () => {
+    const table =
+      "| Plan | Price |\n|---|---|\n| Pro | $10 [1] |\n| Team | $25 |\nWant the annual prices too?";
+    const alone = extractClaims(table.slice(0, table.lastIndexOf("\n")));
+    expect(extractClaims(table)).toEqual(alone);
+    expect(alone.map((c) => c.markers)).toEqual([["1"]]);
+    // The last item's lazy line is the question; every item is still a claim.
+    expect(
+      extractClaims("- Subtotal: 1,000 [1]\n- Total: 1,284.50 [2]\nWant me to send it?").map(
+        (c) => [c.text, c.markers],
+      ),
+    ).toEqual([
+      ["Subtotal: 1,000", ["1"]],
+      ["Total: 1,284.50", ["2"]],
+    ]);
+  });
+
+  test("a question wrapped over lines is still one question", () => {
+    // The line after the break opens lowercase and the line before states
+    // nothing a claim needs: one sentence, hard-wrapped.
+    expect(
+      texts("Should I send the corrected invoice to the billing contact\nbefore Friday?"),
+    ).toEqual([]);
+    expect(texts("Is the refund window 14 days [1]?")).toEqual([]);
+  });
+
   test("a marker after a question stays with the question, which is not a claim", () => {
     // Without the reattachment [1] would open the next sentence and be its marker.
     const claims = extractClaims(
@@ -799,6 +905,52 @@ describe("extractClaims agrees with citedClaims", () => {
     }
   });
 
+  test("every marker on a line before a question is a marker of a claim", () => {
+    // The shapes a question runs into: a figure line with no full stop, a
+    // bold total, a table row, a lazy list line, a glued full stop.
+    let seed = 11;
+    const rnd = (): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const pick = <T>(xs: ReadonlyArray<T>): T => xs[Math.floor(rnd() * xs.length)] as T;
+    const WORDS = ["revenue", "rose", "costs", "fell", "12%", "30", "days", "refund", "window"];
+    const QUESTIONS = ["Anything else?", "want a chart?", "Shall I send it?", "**Want more?**"];
+    let id = 0;
+    for (let doc = 0; doc < 300; doc++) {
+      const written: string[] = [];
+      const lines: string[] = [];
+      for (let i = 0; i < 1 + Math.floor(rnd() * 4); i++) {
+        const words = Array.from({ length: 2 + Math.floor(rnd() * 5) }, () => pick(WORDS)).join(
+          " ",
+        );
+        id += 1;
+        written.push(String(id));
+        lines.push(
+          pick([
+            `${words} [${id}]`,
+            `**${words}** [${id}]`,
+            `| ${words} | [${id}] |`,
+            `- ${words} [${id}]`,
+            `${words} [${id}] ${words}`,
+            `${words} [${id}].`,
+          ]),
+        );
+      }
+      const question = pick(QUESTIONS);
+      const text =
+        rnd() < 0.3
+          ? `${lines.join("\n")}.${question.replace(/^\W*\w/, (c) => c.toUpperCase())}`
+          : `${lines.join(pick(["\n", "\r\n"]))}${pick(["\n", "\r\n"])}${question}`;
+      const seen = new Set(extractClaims(text).flatMap((c) => c.markers));
+      for (const marker of written) {
+        expect(`${marker} in ${JSON.stringify(text)}`).toBe(
+          `${seen.has(marker) ? marker : "MISSING"} in ${JSON.stringify(text)}`,
+        );
+      }
+    }
+  });
+
   test("an empty document has no claims", () => {
     expect(extractClaims("")).toEqual([]);
     expect(extractClaims("\n\n   \n")).toEqual([]);
@@ -824,5 +976,25 @@ describe("extractClaims — linear in the document", () => {
     const nested = `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`;
     const base = fastest(() => extractClaims(`${"y ".repeat(n)}x\n${"y\n".repeat(n)}`));
     expect(fastest(() => extractClaims(nested))).toBeLessThan(base * 20 + 100);
+  }, 60_000);
+
+  test("a question run into many lines, markers and glued questions", () => {
+    // A question piece is cut from its end, each cut and marker read once.
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const n = 10_000;
+    const base = fastest(() => extractClaims(`${"words here [1] ".repeat(n)}done.`));
+    const wrapped = `${"words here [1] ".repeat(n)}\n${"more\n".repeat(n)}more?`;
+    const glued = `Total is 5.${"Is it?".repeat(n)}`;
+    expect(extractClaims(glued).map((c) => c.text)).toEqual(["Total is 5."]);
+    expect(fastest(() => extractClaims(wrapped))).toBeLessThan(base * 20 + 100);
+    expect(fastest(() => extractClaims(glued))).toBeLessThan(base * 20 + 100);
   }, 60_000);
 });

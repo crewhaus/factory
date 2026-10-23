@@ -167,8 +167,12 @@ import { createSkillTool } from "@crewhaus/skills-registry";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { aggregate } from "./aggregate";
-import { warnUnconsumedCombinePolicy } from "./combine-warnings";
-import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
+import { warnProvabilityOutsidePolicy, warnUnconsumedCombinePolicy } from "./combine-warnings";
+import {
+  defaultGraderRegistry,
+  registryProvabilityRoles,
+  resolveRegistryGrader,
+} from "./default-registry";
 import { RunnerError } from "./errors";
 import {
   provabilityGraderEntries,
@@ -431,6 +435,7 @@ export {
   standingBundleFromEvents,
   withProvabilityFloor,
 } from "./provability";
+export { registryProvabilityRoles } from "./default-registry";
 
 const DEFAULT_CONCURRENCY = 4;
 
@@ -694,6 +699,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           opts.pricing !== undefined ? { pricing: opts.pricing } : {},
         )
       : [];
+  // Review I32 — a `type: registry` entry naming one of the six takes the
+  // role the flag gives it, so a spec-declared gate graded by hand is gated
+  // the same way (see registryProvabilityRoles).
+  const registryRoles = await registryProvabilityRoles(compiledGraders);
   const buildGraders = (arm: string | undefined): GraderEntry[] => [
     ...compiledGraders.map((g) => {
       if (g.judgeSpec) {
@@ -813,10 +822,12 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         }
         // NEW-HUNT-7 — shared with `createExamRunner` (A11): entry `opts:`
         // validate per pack / pass through to plugins; loud at run start.
+        const role = registryRoles.get(g.registrySpec.grader);
         return {
           name: g.name,
           grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
           weight: g.weight,
+          ...(role !== undefined ? { role } : {}),
         };
       }
       return { name: g.name, grader: g.grader, weight: g.weight };
@@ -831,6 +842,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // without `combine: weighted` (shared with the exam surface).
   const combine = compiledGraders.find((g) => g.combine !== undefined)?.combine;
   warnUnconsumedCombinePolicy(compiledGraders);
+  warnProvabilityOutsidePolicy(compiledGraders, registryRoles);
 
   // NEW-HUNT-3 — per-sample wall-clock timeout: `--sample-timeout-ms` wins,
   // else the spec's own `limits.deadline_ms` (in eval each sample IS one

@@ -1,10 +1,11 @@
 /**
  * Where bundles and proof artifacts live (design §5.3, §6.4):
  *
- *   <cwd>/.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json   one bundle per graded turn
+ *   <cwd>/.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json   one bundle per graded pass
+ *   <cwd>/.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.<k>.json  …the k-th pass of a turn
  *   <cwd>/.crewhaus/proofs/<spec>/artifacts/<prf_id>.json      one artifact per ProofCheck
  *
- * Mode 0600, written to a randomly named temp and renamed into place
+ * Files mode 0600 and directories 0700, written to a randomly named temp and renamed into place
  * through `@crewhaus/tool-safety/fs` — never through a link planted at the
  * name (the C070 discipline the continuity store follows). Every name that
  * reaches a path is validated first: a spec name, a session id, a turn
@@ -14,7 +15,7 @@
  */
 import { lstatSync, mkdirSync, readdirSync, rmdirSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { ensureDirContained, openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { isProofArtifact, isProofId } from "./artifact";
 import { ProvabilityError } from "./evidence";
 import type { ProofArtifact, ProofArtifactStore, ProofBundle } from "./types";
@@ -24,7 +25,10 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
 const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 /** The directory bundles of a run with no session go under. */
 export const NO_SESSION = "no-session";
-const TURN_FILE = /^turn-(\d{1,9})\.json$/;
+/** `turn-<n>.json`, the first pass of a turn; `turn-<n>.<k>.json`, its k-th. */
+const TURN_FILE = /^turn-(\d{1,9})(?:\.(\d{1,4}))?\.json$/;
+/** The most passes one turn's bundles are kept under (retries, and turns a resumed session numbers again). */
+const MAX_PASSES = 1_000;
 /** Largest bundle or artifact read back. */
 const MAX_READ_BYTES = 16 * 1024 * 1024;
 
@@ -123,6 +127,8 @@ function entries(dir: string, kind: "dir" | "file"): string[] {
 export type BundleListing = {
   readonly sessionId: string;
   readonly turnNumber: number;
+  /** Which pass of the turn: 1 for `turn-<n>.json`, k for `turn-<n>.<k>.json`. (0.8.0 additive, fix pass.) */
+  readonly pass: number;
   readonly path: string;
   readonly mtimeMs: number;
 };
@@ -130,17 +136,28 @@ export type BundleListing = {
 export interface BundleStore {
   /** The proofs root this store writes under. */
   readonly rootDir: string;
-  /** Persist a bundle as `<root>/<sessionId|no-session>/turn-<n>.json`; returns the path. A
-   *  later pass of the same turn (a retry) replaces the earlier one. */
+  /**
+   * Persist a bundle as `<root>/<sessionId|no-session>/turn-<n>.json` — or,
+   * when a pass of that turn is already stored (a retry, a turn a resumed
+   * session numbers again), the next free `turn-<n>.<k>.json` — and return
+   * the path written. A stored bundle is never replaced: the `bundleHash`
+   * each pass's audit record and trace line carry names a bundle that is
+   * still there (design §5.3), and `provability audit` can read the
+   * failing pass a retry fixed.
+   */
   put(
     bundle: ProofBundle,
     at: { readonly sessionId?: string; readonly turnNumber: number },
   ): Promise<string>;
-  /** The bundle persisted for a turn, or `undefined`. */
-  get(sessionId: string | undefined, turnNumber: number): Promise<ProofBundle | undefined>;
-  /** Every persisted bundle, newest first. */
-  list(): Promise<ReadonlyArray<BundleListing>>;
-  /** Delete bundles last written before `now - olderThanMs`; returns how many. */
+  /** One pass of a turn — by default its last, the turn's standing bundle — or `undefined`. */
+  get(
+    sessionId: string | undefined,
+    turnNumber: number,
+    pass?: number,
+  ): Promise<ProofBundle | undefined>;
+  /** Each turn's last pass, newest first; `allPasses` lists every pass. */
+  list(opts?: { readonly allPasses?: boolean }): Promise<ReadonlyArray<BundleListing>>;
+  /** Delete bundles (every pass) last written before `now - olderThanMs`; returns how many. */
   prune(olderThanMs: number, now?: Date): Promise<number>;
 }
 
@@ -156,21 +173,52 @@ function isBundle(value: unknown): value is ProofBundle {
   );
 }
 
+/** A turn's pass `k` as its file name under the session directory. */
+function passFile(turnNumber: number, pass: number): string {
+  return pass === 1 ? `turn-${turnNumber}.json` : `turn-${turnNumber}.${pass}.json`;
+}
+
+/** The pass numbers stored for one turn in `dir`, read off the names (links included: a read refuses those). */
+function passesOf(dir: string, turnNumber: number): number[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: number[] = [];
+  for (const name of names) {
+    const m = TURN_FILE.exec(name);
+    if (m === null || Number(m[1]) !== turnNumber) continue;
+    out.push(m[2] === undefined ? 1 : Number(m[2]));
+  }
+  return out;
+}
+
 /**
  * The bundle store over a proofs root (`proofsRoot(cwd, specName)`).
  * Tenant fencing is the caller's: on managed, pass the tenant's root.
  */
 export function createBundleStore(opts: { readonly rootDir: string }): BundleStore {
   const rootDir = resolve(opts.rootDir);
-  const relOf = (sessionId: string | undefined, turnNumber: number): string => {
+  const relOf = (sessionId: string | undefined, turnNumber: number, pass = 1): string => {
     assertTurn(turnNumber);
-    return `${sessionDir(sessionId)}/turn-${turnNumber}.json`;
+    if (!Number.isInteger(pass) || pass < 1 || pass > MAX_PASSES) {
+      throw new ProvabilityError(
+        "config",
+        `provability: invalid pass ${String(pass)} — expected 1 to ${MAX_PASSES}`,
+      );
+    }
+    return `${sessionDir(sessionId)}/${passFile(turnNumber, pass)}`;
   };
-  const list = async (): Promise<BundleListing[]> => {
+  const list = async (
+    listOpts: { readonly allPasses?: boolean } = {},
+  ): Promise<BundleListing[]> => {
     const out: BundleListing[] = [];
     for (const session of entries(rootDir, "dir")) {
       if (session !== NO_SESSION && !SESSION_ID_REGEX.test(session)) continue;
       const dir = join(rootDir, session);
+      const last = new Map<number, BundleListing>();
       for (const file of entries(dir, "file")) {
         const turn = TURN_FILE.exec(file);
         if (turn === null) continue;
@@ -181,31 +229,79 @@ export function createBundleStore(opts: { readonly rootDir: string }): BundleSto
         } catch {
           continue;
         }
-        out.push({ sessionId: session, turnNumber: Number(turn[1]), path, mtimeMs });
+        const listing: BundleListing = {
+          sessionId: session,
+          turnNumber: Number(turn[1]),
+          pass: turn[2] === undefined ? 1 : Number(turn[2]),
+          path,
+          mtimeMs,
+        };
+        if (listOpts.allPasses === true) {
+          out.push(listing);
+          continue;
+        }
+        const prior = last.get(listing.turnNumber);
+        if (prior === undefined || listing.pass > prior.pass) last.set(listing.turnNumber, listing);
       }
+      out.push(...last.values());
     }
     return out.sort(
       (a, b) =>
         b.mtimeMs - a.mtimeMs ||
         b.turnNumber - a.turnNumber ||
+        b.pass - a.pass ||
         a.sessionId.localeCompare(b.sessionId),
     );
   };
   return {
     rootDir,
     async put(bundle, at) {
-      const rel = relOf(at.sessionId, at.turnNumber);
-      writeAtomic(rootDir, rel, `${JSON.stringify(bundle, null, 2)}\n`, true);
-      return join(rootDir, rel);
-    },
-    async get(sessionId, turnNumber) {
-      const value = await readJson(rootDir, relOf(sessionId, turnNumber));
-      if (value === undefined) return undefined;
-      if (!isBundle(value)) {
+      relOf(at.sessionId, at.turnNumber);
+      const session = sessionDir(at.sessionId);
+      mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+      // The session directory is as private as the root and the files.
+      const dir = ensureDirContained(rootDir, session, { mode: 0o700 });
+      if (!dir.ok) {
         throw new ProvabilityError(
           "runtime",
-          `provability: ${relOf(sessionId, turnNumber)} is not a proof bundle`,
+          `provability: refusing to write under ${session}: ${dir.reason} (code ${dir.code})`,
         );
+      }
+      const data = `${JSON.stringify(bundle, null, 2)}\n`;
+      for (let pass = 1; pass <= MAX_PASSES; pass++) {
+        const rel = relOf(at.sessionId, at.turnNumber, pass);
+        const written = writeFileSafe(rootDir, rel, data, {
+          overwrite: false,
+          createParents: true,
+          mode: 0o600,
+        });
+        if (written.ok) return join(rootDir, rel);
+        // Taken by an earlier pass: the next name. Anything else — a link
+        // planted at the name, a directory there — is refused, not stepped over.
+        if (written.code !== "exists") {
+          throw new ProvabilityError(
+            "runtime",
+            `provability: refusing to write ${rel}: ${written.reason} (code ${written.code})`,
+          );
+        }
+      }
+      throw new ProvabilityError(
+        "runtime",
+        `provability: ${session} already holds ${MAX_PASSES} passes of turn ${at.turnNumber}`,
+      );
+    },
+    async get(sessionId, turnNumber, pass) {
+      let which = pass;
+      if (which === undefined) {
+        relOf(sessionId, turnNumber);
+        const stored = passesOf(join(rootDir, sessionDir(sessionId)), turnNumber);
+        which = stored.length > 0 ? Math.max(...stored) : 1;
+      }
+      const rel = relOf(sessionId, turnNumber, which);
+      const value = await readJson(rootDir, rel);
+      if (value === undefined) return undefined;
+      if (!isBundle(value)) {
+        throw new ProvabilityError("runtime", `provability: ${rel} is not a proof bundle`);
       }
       return value;
     },
@@ -220,7 +316,7 @@ export function createBundleStore(opts: { readonly rootDir: string }): BundleSto
       const cutoff = now.getTime() - olderThanMs;
       let removed = 0;
       const touched = new Set<string>();
-      for (const listing of await list()) {
+      for (const listing of await list({ allPasses: true })) {
         if (listing.mtimeMs >= cutoff) continue;
         try {
           unlinkSync(listing.path);

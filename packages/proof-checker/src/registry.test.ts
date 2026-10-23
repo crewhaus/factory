@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { CrewhausError } from "@crewhaus/errors";
 import { LEAN4_IMAGE_REF } from "@crewhaus/sandbox-image-lean4";
 import { Z3_IMAGE_REF } from "@crewhaus/sandbox-image-z3";
@@ -15,7 +15,7 @@ import {
   createDefaultCheckers,
 } from "./registry";
 import { SMT_LANGUAGE } from "./smt";
-import { fakeSandbox } from "./test-helpers";
+import { fakeSandbox, withScriptedWorker } from "./test-helpers";
 import type { ProofChecker } from "./types";
 
 const stub = (id: string): ProofChecker => ({
@@ -156,26 +156,28 @@ describe("createDefaultCheckers", () => {
 });
 
 describe("createDefaultCheckers — formal.timeout_ms and the builtin", () => {
-  test("a 30 s formal.timeout_ms still gives the synchronous builtin at most maxTimeoutMs", async () => {
+  test("a 30 s formal.timeout_ms still gives the builtin at most maxTimeoutMs", async () => {
     const [builtin] = createDefaultCheckers({ ids: ["builtin"], timeoutMs: 30_000 });
-    // The clock jumps just past 10 s after the budget is created: a 30 s
-    // deadline would pass, the capped one runs out.
-    const t0 = 5_000_000;
-    let calls = 0;
-    const clock = spyOn(Date, "now").mockImplementation(() =>
-      calls++ === 0 ? t0 : t0 + BUILTIN_LIMITS.maxTimeoutMs + 1,
+    // The check runs on a worker (builtin/runner); the budget it is posted
+    // is the capped one, not the container-sized 30 s.
+    await withScriptedWorker(
+      {
+        reply: () => ({
+          post: { kind: "verdict", verdict: { ok: true, assumptions: [], axioms: [], output: "" } },
+        }),
+      },
+      async (workers) => {
+        const r = await (builtin as ProofChecker).check({
+          claim: "c",
+          statement: "1 = 1",
+          proof: "eval",
+        });
+        expect(r.ok).toBe(true);
+        expect(workers.jobs).toHaveLength(1);
+        expect(workers.jobs[0]?.timeoutMs).toBeLessThanOrEqual(BUILTIN_LIMITS.maxTimeoutMs);
+        expect(workers.jobs[0]?.timeoutMs).toBeGreaterThan(BUILTIN_LIMITS.maxTimeoutMs - 1_000);
+      },
     );
-    try {
-      const r = await (builtin as ProofChecker).check({
-        claim: "c",
-        statement: "1 = 1",
-        proof: "eval",
-      });
-      expect(r.ok).toBe(false);
-      expect(r.reason).toMatch(/ran out of time/);
-    } finally {
-      clock.mockRestore();
-    }
     expect(BUILTIN_LIMITS.maxTimeoutMs).toBe(10_000);
   });
 });

@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import {
   type HandoffInput,
   PROVEN_UNVERIFIED_LABEL,
+  countsAsProven,
   isProvenByAssertion,
   renderHandoff,
   renderLadderStatus,
@@ -228,5 +229,136 @@ describe("renderHandoff — proven by assertion", () => {
 
   test("still deterministic", () => {
     expect(renderHandoff(offInput)).toBe(renderHandoff({ ...offInput }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — `continuity.proof: require` counts only a verified ✓
+// ---------------------------------------------------------------------------
+
+describe("countsAsProven", () => {
+  test("ladder and off: every proven record; require: only a verified one", () => {
+    const verified = { status: "proven", proofs: [proof] };
+    const byAssertion = { status: "proven", proofs: [], unverified: [asserted] };
+    const noProof = { status: "proven", proofs: [] };
+    const claimed = { status: "claimed", proofs: [] };
+    for (const mode of [undefined, "ladder", "off"] as const) {
+      expect([verified, byAssertion, noProof, claimed].map((r) => countsAsProven(r, mode))).toEqual(
+        [true, true, true, false],
+      );
+    }
+    expect(
+      [verified, byAssertion, noProof, claimed].map((r) => countsAsProven(r, "require")),
+    ).toEqual([true, false, false, false]);
+  });
+});
+
+describe("renderHandoff — proofMode: require", () => {
+  // Session 1 ran under `off`: steps 1 and 2 proven by assertion, step 3
+  // claimed, goal-0001 proven by assertion. Session 2 runs under `require`,
+  // where the tools say all of it still needs a verified proof.
+  const offRun: PlanRecord = {
+    ...plan,
+    id: "plan-0001",
+    title: "release",
+    steps: [
+      { index: 1, text: "build", status: "proven", proofs: [], unverified: [asserted] },
+      {
+        index: 2,
+        text: "deploy",
+        status: "proven",
+        proofs: [],
+        unverified: [{ toolUseId: "tu_b", recordedAt: "2026-10-22T00:00:00.000Z" }],
+      },
+      { index: 3, text: "announce", status: "claimed", proofs: [] },
+    ],
+  };
+  // Every step proven, but one of them only by a hand edit (no frozen proof).
+  const handEdited: PlanRecord = {
+    ...otherPlan,
+    steps: [
+      { index: 1, text: "Rotate keys", status: "proven", proofs: [proof] },
+      { index: 2, text: "Revoke old keys", status: "proven", proofs: [] },
+    ],
+  };
+  const requireInput: HandoffInput = {
+    ...input,
+    activePlan: offRun,
+    plans: [offRun, handEdited],
+    goals: [
+      {
+        ...(goals[0] as Goal),
+        title: "ship it",
+        status: "proven",
+        target: 1,
+        current: 1,
+        unit: undefined,
+        unverified: [asserted],
+      } as Goal,
+      {
+        ...(goals[0] as Goal),
+        id: "goal-0002",
+        title: "verified",
+        status: "proven",
+        proofs: [proof],
+      },
+      { ...(goals[0] as Goal), id: "goal-0003", title: "hand-edited", status: "proven" },
+    ],
+    proofMode: "require",
+  };
+
+  test("a step proven by assertion is not counted as proven, and is a Prove next action", () => {
+    const out = renderHandoff(requireInput);
+    expect(out).toContain("plan-0001 — release (0/3 steps proven, 2 unverified)");
+    // The step lines still say how each was proven.
+    expect(out).toContain(
+      "1. [proven (unverified)] build — cited, not verified: tu_said (sess_0123456789abcdef)",
+    );
+    const next = out.slice(out.indexOf("## Next actions"), out.indexOf("## Last session"));
+    expect(next).toBe(
+      [
+        "## Next actions",
+        "",
+        "1. Prove: build (plan-0001 step 1 is proven (unverified), not proven under continuity.proof: require)",
+        "2. Prove: deploy (plan-0001 step 2 is proven (unverified), not proven under continuity.proof: require)",
+        "3. Verify or redo: announce (plan-0001 step 3 is claimed but unproven)",
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("goals proven by assertion or with no proof on record stay under Goals", () => {
+    const out = renderHandoff(requireInput);
+    const goalsSection = out.slice(out.indexOf("## Goals"), out.indexOf("## Unresolved"));
+    expect(goalsSection).toContain("- goal-0001 [proven (unverified)] ship it (1/1)");
+    expect(goalsSection).toContain("- goal-0003 [proven] hand-edited (40/80 %)");
+    expect(goalsSection).not.toContain("goal-0002");
+    expect(goalsSection).not.toContain("_none_");
+  });
+
+  test("a plan proven only by a hand edit is still an open plan; its step is named", () => {
+    const out = renderHandoff(requireInput);
+    expect(out).toContain("## Other open plans");
+    expect(out).toContain("- plan-0002 — Fix auth (1/2 steps proven)");
+    const next = renderHandoff({ ...requireInput, activePlan: handEdited });
+    expect(next).toContain(
+      "1. Prove: Revoke old keys (plan-0002 step 2 is marked proven with no proof on record, not proven under continuity.proof: require)",
+    );
+  });
+
+  test("ladder and off render the same records exactly as before (bytes unchanged)", () => {
+    const { proofMode: _mode, ...noMode } = requireInput;
+    const before = renderHandoff(noMode);
+    expect(renderHandoff({ ...noMode, proofMode: "ladder" })).toBe(before);
+    expect(renderHandoff({ ...noMode, proofMode: "off" })).toBe(before);
+    expect(before).toContain("plan-0001 — release (2/3 steps proven, 2 unverified)");
+    expect(before).not.toContain("Prove:");
+    expect(before).not.toContain("goal-0001");
+    expect(before).not.toContain("## Other open plans");
+  });
+
+  test("still deterministic", () => {
+    expect(renderHandoff(requireInput)).toBe(renderHandoff({ ...requireInput }));
   });
 });

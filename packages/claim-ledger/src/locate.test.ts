@@ -4,6 +4,7 @@ import {
   MAX_EXCERPT_CHARS,
   bestSpan,
   breaksClause,
+  claimFigureKeys,
   claimFigures,
   claimQuery,
   claimWords,
@@ -345,6 +346,180 @@ describe("locateClaim — the figure rule (below full coverage)", () => {
     expect(claimFigures("First, the window is 14 days.")).toEqual(["14"]);
   });
 
+  test("a figure's sign is part of it: 500 is not -500, either way round", () => {
+    // Acceptance A's class (design §6.2): the number layer reads -500, so
+    // the checked rung already refused this; grounded let it through.
+    const claim = "The account balance is 500 dollars.";
+    for (const source of [
+      "The account balance is -500 dollars.",
+      "The account balance is −500 dollars.",
+      "The account balance is -$500 dollars.",
+    ]) {
+      for (const options of [{ coverage: 0.8 }, { coverage: 1, strictFigures: true }]) {
+        expect(locateClaim(claim, source, options)).toMatchObject({
+          status: "notFound",
+          cause: "value",
+          missing: ["500"],
+        });
+      }
+    }
+    expect(
+      locateClaim("The account balance is -500 dollars.", "The account balance is 500 dollars.", {
+        coverage: 0.8,
+      }),
+    ).toMatchObject({ status: "notFound", cause: "value", missing: ["-500"] });
+    const growth = "Growth was 3% year over year in the region.";
+    expect(
+      locateClaim(growth, "Growth was -3% year over year in the region.", { coverage: 0.8 }),
+    ).toMatchObject({ status: "notFound", cause: "value", missing: ["3%"] });
+    // The same sign, however written, is the same figure.
+    expect(
+      locateClaim("The account balance is −500 dollars.", "The account balance is -500 dollars.", {
+        coverage: 0.8,
+      }).status,
+    ).toBe("supported");
+    // A hyphen after a word or a digit signs nothing, and neither do
+    // accounting parentheses, which the number layer does not read as one.
+    for (const text of [
+      "The event ran from 2024-01-15 to 2024-01-20 in Berlin.",
+      "The refund window is 10-20 days for COVID-19 orders.",
+    ]) {
+      expect(locateClaim(text, text, { coverage: 0.8 }).status).toBe("supported");
+    }
+    expect(
+      locateClaim("Acme's headcount was 1,200 in 2024.", "Acme's headcount (1,200) grew in 2024.", {
+        coverage: 0.8,
+      }).status,
+    ).toBe("supported");
+  });
+
+  test("a quotation's numerals keep their sign, and so do its framing's", () => {
+    const source = "Statement for March. The account balance is -500 dollars.";
+    expect(
+      locateClaim('Acme says "the account balance is 500 dollars" today.', source, {
+        coverage: 0.8,
+      }),
+    ).toMatchObject({ status: "misquoted", mode: "quote", missing: ["500"], differing: ["-500"] });
+    expect(
+      locateClaim('Acme says "the account balance is -500 dollars" today.', source, {
+        coverage: 0.8,
+      }).status,
+    ).toBe("supported");
+    // Off the figure rule a quotation is FactCrossCheck's, unchanged.
+    expect(
+      locateClaim('Acme says "the account balance is 500 dollars" today.', source).status,
+    ).toBe("supported");
+    const shown = "As the statement for March shows, the account balance is -500 dollars.";
+    expect(
+      locateClaim('The balance is 500 dollars, as "the statement for March shows".', shown, {
+        coverage: 0.8,
+      }),
+    ).toMatchObject({ status: "notFound", mode: "quote", cause: "value", missing: ["500"] });
+    expect(
+      locateClaim('The balance is -500 dollars, as "the statement for March shows".', shown, {
+        coverage: 0.8,
+      }).status,
+    ).toBe("supported");
+  });
+
+  test("a magnitude glued to a numeral is a figure: $5M is not $5B", () => {
+    for (const [claim, source, missing] of [
+      ["Acme revenue reached $5M in March 2024.", "Acme revenue reached $5B in March 2024.", "m"],
+      [
+        "Acme posted revenue of $1.2M in fiscal 2024.",
+        "Acme posted revenue of $1.2 billion in fiscal 2024.",
+        "m",
+      ],
+      ["Acme has 30k active customers worldwide.", "Acme has 30 active customers worldwide.", "k"],
+      [
+        "The model has 7B parameters and runs locally.",
+        "The model has 7M parameters and runs locally.",
+        "b",
+      ],
+      // Short of the bar too: still a value miss, never one the judge may waive.
+      ["Acme raised $5M.", "Acme raised $5B.", "m"],
+    ] as const) {
+      const found = locateClaim(claim, source, { coverage: 0.8 });
+      expect(found).toMatchObject({ status: "notFound", cause: "value" });
+      expect(found.missing).toContain(missing);
+      expect(isWaivableMiss(found)).toBe(false);
+    }
+    // A suffix is the value its word names, either way round.
+    for (const [claim, source] of [
+      [
+        "Acme posted revenue of $1.2B in fiscal 2024.",
+        "Acme posted revenue of $1.2 billion in fiscal 2024.",
+      ],
+      [
+        "Acme posted revenue of $5 million in fiscal 2024.",
+        "Acme posted revenue of $5M in fiscal 2024.",
+      ],
+      [
+        "Acme posted revenue of $1.2bn in fiscal 2024.",
+        "Acme posted revenue of $1.2B in fiscal 2024.",
+      ],
+    ] as const) {
+      expect(locateClaim(claim, source, { coverage: 0.8 }).status).toBe("supported");
+    }
+    // Glued to no numeral, a letter is a word.
+    const plan = "Plan B costs $10 per month for every team.";
+    expect(locateClaim(plan, plan, { coverage: 0.8 }).status).toBe("supported");
+    expect(claimFigures(plan)).toEqual(["10"]);
+    expect(claimFigures("Acme raised $5M at a 30k valuation")).toEqual(["5", "m", "30", "k"]);
+  });
+
+  test("a date or a time is a figure whole, not only its parts", () => {
+    const swapped = locateClaim(
+      "The annual plan renewal is due on 2025-03-04.",
+      "The annual plan renewal is due on 2025-04-03 for every customer.",
+      { coverage: 0.8 },
+    );
+    expect(swapped).toMatchObject({ status: "notFound", cause: "value" });
+    expect(swapped.missing).toContain("2025-03-04");
+    expect(isWaivableMiss(swapped)).toBe(false);
+    const pieced = locateClaim(
+      "The Berlin office opens at 10:30 on weekdays.",
+      "The Berlin office opens at 10:00 on weekdays and closes at 18:30.",
+      { coverage: 0.8 },
+    );
+    expect(pieced).toMatchObject({ status: "notFound", cause: "value" });
+    expect(pieced.missing).toContain("10:30");
+    // The same value, however its time is spelled, is found.
+    for (const source of [
+      "The Berlin office opens at 10:30 on weekdays.",
+      "The Berlin office opens at 10:30am on weekdays.",
+      "The Berlin office opens at 10:30:00 on weekdays.",
+    ]) {
+      expect(
+        locateClaim("The Berlin office opens at 10:30 on weekdays.", source, { coverage: 0.8 })
+          .status,
+      ).toBe("supported");
+    }
+    // In a quotation's framing too.
+    expect(
+      locateClaim(
+        'It is due 2025-03-04, since "the annual plan renews automatically".',
+        "The annual plan renews automatically. It is due 2025-04-03.",
+        { coverage: 0.8 },
+      ),
+    ).toMatchObject({ status: "notFound", mode: "quote", cause: "value", missing: ["2025-03-04"] });
+    expect(claimQuery("Due 2025-03-04 at 09:05 and 2025-03-04.").compounds).toEqual([
+      "2025-03-04",
+      "9:05",
+    ]);
+  });
+
+  test("claimFigureKeys: each figure word with what it is compared as", () => {
+    expect(claimFigureKeys("from -5 to 5, then $5M and −3%")).toEqual(
+      new Map([
+        ["5", ["-5", "5"]],
+        ["m", ["1000000"]],
+        ["3%", ["-3%"]],
+      ]),
+    );
+    expect(claimFigureKeys("First, thirty days.")).toEqual(new Map([["thirty", ["30"]]]));
+  });
+
   test("figureKey: numerals by value, cardinals by value, ordinals as spelled", () => {
     expect(figureKey("1284.50")).toBe("1284.5");
     expect(figureKey("12.0%")).toBe("12%");
@@ -354,6 +529,11 @@ describe("locateClaim — the figure rule (below full coverage)", () => {
     expect(figureKey("third")).toBe("third");
     expect(figureKey("second")).toBeNull();
     expect(figureKey("refund")).toBeNull();
+    // A signed figure, as a miss reports one; a magnitude suffix alone is a word.
+    expect(figureKey("-500")).toBe("-500");
+    expect(figureKey("−12.0%")).toBe("-12%");
+    expect(figureKey("-0")).toBe("0");
+    expect(figureKey("m")).toBeNull();
   });
 
   test("off at full coverage by default, which is FactCrossCheck's rule unchanged", () => {

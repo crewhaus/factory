@@ -53,8 +53,21 @@ export type EvaluationWiringOptions = {
   readonly catalogVar: string;
   /** The working-directory expression (`process.cwd()`, `__cwd`). */
   readonly cwdExpr: string;
-  /** `"stream"` for the cli; `"reply"` where the returned text is what gets sent. */
-  readonly footerTarget: "stream" | "reply";
+  /**
+   * `"stream"` for the cli; `"reply"` where the returned text is what gets
+   * sent; `"none"` where the caller carries the bundle on its own envelope
+   * (the managed gateway's `proof`) and the returned text must be the answer
+   * alone.
+   */
+  readonly footerTarget: "stream" | "reply" | "none";
+  /**
+   * An EXPRESSION for the footer target, in place of `footerTarget`'s
+   * literal, when one emitted file serves two callers that want different
+   * targets (the channel bot's `agent.ts`, shared by the daemon and the eval
+   * bridge entry). `footerTarget` stays the fallback the expression is
+   * written around. Ignored without `provability:`.
+   */
+  readonly footerTargetExpr?: string;
   /** The indent of a `runChatLoop` field line in this emitter. */
   readonly indent: string;
   /** How the proof tools reach the run (default `"catalog"`). */
@@ -109,8 +122,9 @@ export function renderEvaluationWiring(
     provable && opts.sessionRootDirExpr !== undefined
       ? `, ...(${opts.sessionRootDirExpr} !== undefined ? { sessionRootDir: ${opts.sessionRootDirExpr} } : {})`
       : "";
+  const footerTarget = opts.footerTargetExpr ?? JSON.stringify(opts.footerTarget);
   const deps = provable
-    ? `{ cwd: ${opts.cwdExpr}, catalog: ${opts.catalogVar}, footerTarget: ${JSON.stringify(opts.footerTarget)}${sessionRootDep} }`
+    ? `{ cwd: ${opts.cwdExpr}, catalog: ${opts.catalogVar}, footerTarget: ${footerTarget}${sessionRootDep} }`
     : `{ cwd: ${opts.cwdExpr} }`;
   const bootBlock = `const ${GATES_VAR} = await wireEvaluation(${JSON.stringify(fragment)}, ${deps});`;
   const field = [

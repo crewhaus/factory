@@ -968,12 +968,14 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
     expect([d.judgeModel, d.threshold]).toEqual(["claude-sonnet-4-6", 0.7]);
   });
 
-  test("provability: the reply footer, the catalog, the tool registration and the per-turn tool set", () => {
+  test("provability: no footer on the reply (the bundle rides `proof`), the catalog, the tool registration and the per-turn tool set", () => {
     const managed: IrManagedV0 = { ...ir, provability: PROVABILITY };
     const agent = agentContent({ provability: PROVABILITY });
     expect(agent).toContain('import { defaultCatalog } from "@crewhaus/tool-catalog";');
+    // §5.4 — `reply` is text a program consumes (and a token meter counts):
+    // nothing is rendered beside the answer.
     expect(agent).toContain(
-      `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(managed))}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "reply" });`,
+      `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(managed))}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "none" });`,
     );
     expect(agent).toContain(
       'import { type ProofBundleObserver, observeProofBundles, registerGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
@@ -1007,11 +1009,28 @@ describe("emitManaged — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 
     expect(daemon).toContain(
       "return { runId, sessionId, tenantId: tenant.id, reply, ...(served.proof !== undefined ? { proof: served.proof } : {}) };",
     );
-    // The usage accounting still reads the reply text.
+    // The usage accounting still reads the reply text — the answer alone.
     expect(daemon).toContain("      const reply = served.reply;");
     expect(daemon.indexOf("const reply = served.reply;")).toBeLessThan(
       daemon.indexOf("const outputTokens = Math.ceil(reply.length / 4);"),
     );
+  });
+
+  test("provability: the daemon says at boot that bundles under the /tmp tenants root are neither backed up nor kept (§5.3, §15)", () => {
+    const daemonOf = (over: Partial<IrManagedV0>): string =>
+      emitManaged({ ...ir, ...over }).files.find((f) => f.path === "daemon.ts")?.content ?? "";
+    const daemon = daemonOf({ provability: PROVABILITY });
+    const warning = daemon.indexOf("if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {");
+    expect(warning).toBeGreaterThan(
+      daemon.indexOf(
+        'const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";',
+      ),
+    );
+    expect(daemon.slice(warning)).toContain(
+      "[managed] provability: proof bundles go to ${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them",
+    );
+    // Without the block, not a byte of it.
+    expect(daemonOf({ provability: undefined })).not.toContain("proof bundles go to");
   });
 
   test("provability with the memory fabric: the observer and the tenant both reach runOneTurn", () => {

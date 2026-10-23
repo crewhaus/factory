@@ -99,6 +99,25 @@ describe("watchme store — observations append/read", () => {
     expect(plain?.factuality).toBeUndefined();
   });
 
+  test("0.8.0 — the cited-floor and assumption counts round-trip; a vacuous pass carries no faithfulness", () => {
+    const store = openWatchmeStore(newRoot(), { specName: "helpdesk" });
+    const provability = {
+      level: "cited",
+      achieved: "cited",
+      unmet: 0,
+      turns: 2,
+      failing: 0,
+      citedFloor: 1,
+      assumptions: 2,
+      assumptionsRefused: 1,
+    } as const;
+    store.appendObservation(
+      obsFixture({ factuality: { claims: 2, grounded: 0, vacuous: true, provability } }),
+    );
+    const [gated] = store.readObservations();
+    expect(gated?.factuality).toEqual({ claims: 2, grounded: 0, vacuous: true, provability });
+  });
+
   test("torn and garbage lines are skipped, not fatal", () => {
     const root = newRoot();
     const store = openWatchmeStore(root, { specName: "helpdesk" });

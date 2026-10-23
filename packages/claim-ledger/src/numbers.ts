@@ -36,6 +36,13 @@
  *   of a comparison, so `1e300` costs what it is written in.
  * - Years are numbers like any other: `2024` is `2024`. Only ASCII digits
  *   are read.
+ * - An ISO date and a time of day are values of their own besides their
+ *   parts (`compoundValues`): `2025-04-03` states 2025, 4 and 3, and the date
+ *   `2025-04-03`, so a claim of `2025-03-04` is not contained in a result
+ *   that says `2025-04-03`, though every part is. Only the shapes that need
+ *   no guess: `YYYY-MM-DD`, and `H:MM` or `HH:MM` with optional seconds. A
+ *   slash date is either locale's, `3:1` is a ratio or a score, and `10-20`
+ *   a range; their parts are read, and nothing whole.
  */
 /** A character a number may not be glued to in front: then it is part of a word. */
 const WORD_CHAR = /[\p{L}\p{N}_]/u;
@@ -63,15 +70,22 @@ const MAX_DECIMAL_CHARS = 40;
  * no leading zeros, no trailing fractional zeros, no trailing point, and
  * `-0` read as `0`. Built from the significant digits and where the point
  * falls, never by padding first, so the cost is the length written.
+ *
+ * The zeros are counted off each end by hand. `replace(/0+$/, "")` retried
+ * from every zero of a run that a non-zero digit follows ("1" + 80,000 zeros
+ * + "1" took seconds), and a fetched page or a tool result reaches this on
+ * every gated turn (design §10: no super-linear work on untrusted text).
  */
 function canonical(negative: boolean, whole: string, fraction: string, exponent: number): string {
   let digits = `${whole}${fraction}`;
   // The value is 0.<digits> × 10^point.
   let point = whole.length + exponent;
-  const lead = digits.length - digits.replace(/^0+/, "").length;
-  digits = digits.slice(lead);
+  let lead = 0;
+  while (lead < digits.length && digits.charCodeAt(lead) === 48) lead++;
+  let tail = digits.length;
+  while (tail > lead && digits.charCodeAt(tail - 1) === 48) tail--;
+  digits = digits.slice(lead, tail);
   point -= lead;
-  digits = digits.replace(/0+$/, "");
   if (digits === "") return "0";
   const size =
     point <= 0 ? 2 - point + digits.length : point >= digits.length ? point : digits.length + 1;
@@ -89,8 +103,15 @@ function canonical(negative: boolean, whole: string, fraction: string, exponent:
   return negative ? `-${magnitude}` : magnitude;
 }
 
-/** Is the number starting at `at` negative? Only when the sign could not end a word. */
-function signedAt(text: string, at: number): boolean {
+/**
+ * Is the number whose first digit is at `at` negative? A `-` or `−` before
+ * it, optionally across a currency symbol (`-3`, `−3`, `-$4`, `$-5`), and
+ * only when the sign could not end a word: `2024-01-15` and `COVID-19` are
+ * not negative. The locate kernel's figure rule reads a source's and a
+ * claim's signs with this too, so `grounded` and `checked` agree that 500
+ * is not -500.
+ */
+export function signedAt(text: string, at: number): boolean {
   let i = at - 1;
   if (i >= 0 && CURRENCY.test(text[i] as string)) i--;
   if (i < 0 || !MINUS.test(text[i] as string)) return false;
@@ -129,40 +150,122 @@ function* scanNumbers(text: string): Generator<string> {
   }
 }
 
+/** An ISO date: four digits, two, two, not running on into more digits. */
+const ISO_DATE = /(\d{4})-(\d{2})-(\d{2})(?!\d|[-:./]\d)/g;
+/** A time of day, `H:MM` or `HH:MM`, seconds optional, not running on. */
+const TIME_OF_DAY = /(\d{1,2}):(\d{2})(?::(\d{2}))?(?!\d|:\d)/g;
+/** What a date or a time may not follow: then it is inside a word, a
+ *  version, a path or a longer run (read here, not by a lookbehind, so the
+ *  patterns stay ones tool-verify's regex-work model reads). */
+const COMPOUND_JOINER = /^[.:/-]$/;
+
+/** May a date or a time start at `at`? Not glued to a word or a joiner —
+ *  except a time right after an ISO date's `T` (`2025-04-03T10:30`). */
+function opensCompound(text: string, at: number, time: boolean): boolean {
+  if (at === 0) return true;
+  const before = text[at - 1] as string;
+  if (time && before === "T" && at >= 2 && /\d/.test(text[at - 2] as string)) return true;
+  return !WORD_CHAR.test(before) && !COMPOUND_JOINER.test(before);
+}
+
+/** A value stated whole: where it is written in the text, and its key. */
+export type CompoundValue = {
+  readonly at: number;
+  readonly end: number;
+  /** `2025-04-03`; a time as `10:30`, the hour without a leading zero and
+   *  seconds only when they are not `00` (`9:05`, `10:30:15`). */
+  readonly key: string;
+  /** Its parts as numbers (`2025`, `4`, `3`): stated by it, even where the
+   *  scanner reads no number (the day of `2025-04-03T10:30`, glued to `T`). */
+  readonly parts: ReadonlyArray<string>;
+};
+
 /**
- * The numbers `text` states, as normalized decimal strings, distinct, in the
- * order first stated: `"The total is $1,284.50, up 12%"` → `["1284.5", "12"]`.
- * Pass a claim's `text` (markers stripped), not its `raw`: `[1]` is a
- * citation, not a figure.
+ * Every ISO date and time of day `text` states, in order, each as one value
+ * (design §6.3: the result contains the claim's VALUES). The parts are
+ * numbers too, and `extractNumbers` reads them as such: what a compound adds
+ * is their order, so a day and a month swapped, or a time put together from
+ * the hour of one and the minutes of another ("10:30" from "10:00 … 18:30"),
+ * is a value the text does not state. Out-of-range parts (`2025-13-40`,
+ * `25:61`) are not a date or a time, and are left as their numbers.
+ */
+export function compoundValues(text: string): CompoundValue[] {
+  const out: CompoundValue[] = [];
+  for (const m of text.matchAll(ISO_DATE)) {
+    const at = m.index as number;
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (!opensCompound(text, at, false) || month < 1 || month > 12 || day < 1 || day > 31) continue;
+    out.push({
+      at,
+      end: at + m[0].length,
+      key: m[0],
+      parts: [String(Number(m[1])), `${month}`, `${day}`],
+    });
+  }
+  for (const m of text.matchAll(TIME_OF_DAY)) {
+    const at = m.index as number;
+    const hour = Number(m[1]);
+    const seconds = m[3];
+    if (!opensCompound(text, at, true)) continue;
+    if (hour > 23 || Number(m[2]) > 59 || (seconds !== undefined && Number(seconds) > 59)) continue;
+    const key = `${hour}:${m[2]}${seconds === undefined || seconds === "00" ? "" : `:${seconds}`}`;
+    const parts = [
+      `${hour}`,
+      `${Number(m[2])}`,
+      ...(seconds === undefined ? [] : [`${Number(seconds)}`]),
+    ];
+    out.push({ at, end: at + m[0].length, key, parts });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/**
+ * The values `text` states, distinct: its numbers as normalized decimal
+ * strings, in the order first stated, then each ISO date and time of day
+ * with its parts and whole (`compoundValues`): `"The total is $1,284.50, up
+ * 12%"` → `["1284.5", "12"]`, `"due 2025-04-03"` → `["2025", "4", "3",
+ * "2025-04-03"]`. Pass a claim's `text` (markers stripped), not its `raw`:
+ * `[1]` is a citation, not a figure.
  */
 export function extractNumbers(text: string): string[] {
-  return [...new Set(scanNumbers(text))];
+  const compounds = compoundValues(text).flatMap(({ key, parts }) => [...parts, key]);
+  return [...new Set([...scanNumbers(text), ...compounds])];
 }
 
 /**
  * One written value, normalized the way `extractNumbers` normalizes it, or
- * `null` when the string is not exactly one number (`"v1.2.3"`, `"1 284"`,
- * `"twelve"`).
+ * `null` when the string is not exactly one value (`"v1.2.3"`, `"1 284"`,
+ * `"twelve"`). A date or a time written alone is its key (`"09:05:00"` →
+ * `"9:05"`).
  */
 export function normalizeNumber(written: string): string | null {
-  const found = [...scanNumbers(written.trim())];
+  const trimmed = written.trim();
+  if (trimmed.includes("-") || trimmed.includes(":")) {
+    const [whole] = compoundValues(trimmed);
+    if (whole !== undefined && whole.at === 0 && whole.end === trimmed.length) return whole.key;
+  }
+  const found = [...scanNumbers(trimmed)];
   return found.length === 1 ? (found[0] as string) : null;
 }
 
 /**
  * Does `haystack` state `value`? Compared as normalized decimals, so
  * `containsValue("total: 1284.50", "1,284.5")` is true and
- * `containsValue("total: 1284.05", "1284.5")` is false. `value` may be one
- * `extractNumbers` returned or a written number; anything that is not
- * exactly one number is contained nowhere. Pass a `Set` of `extractNumbers`
- * as the haystack to test many values against one result.
+ * `containsValue("total: 1284.05", "1284.5")` is false; a date or a time
+ * is compared whole, so `containsValue("2025-04-03", "2025-03-04")` is false.
+ * `value` may be one `extractNumbers` returned or a written value; anything
+ * that is not exactly one value is contained nowhere. Pass a `Set` of
+ * `extractNumbers` as the haystack to test many values against one result.
  */
 export function containsValue(haystack: string | ReadonlySet<string>, value: string): boolean {
   const wanted = normalizeNumber(value);
   if (wanted === null) return false;
   if (typeof haystack !== "string") return haystack.has(wanted);
   for (const found of scanNumbers(haystack)) if (found === wanted) return true;
-  return false;
+  return compoundValues(haystack).some(
+    ({ key, parts }) => key === wanted || parts.includes(wanted),
+  );
 }
 
 /**
@@ -256,6 +359,37 @@ const ORDINAL_WORDS: ReadonlySet<string> = new Set([
   "millionth",
   "billionth",
 ]);
+
+/**
+ * Magnitude suffixes and the value each names: the same values as the
+ * cardinal words "thousand", "million", "billion" and "trillion", so "$5M"
+ * and "$5 million" state one figure.
+ *
+ * Only for the locate kernel's figure rule, and only glued to a numeral:
+ * "5M" is "5" and "m" to its tokenizer, and an "m" the 0.8 bar may let go
+ * grounded "$5M" in a source saying "$5B" (design §6.2, acceptance A). Read
+ * without case, so "5m" of metres or minutes is a million too: a claim that
+ * spells its unit unlike the source ("5m" against "5 metres") is a figure
+ * missed, never a wrong one matched. `extractNumbers` reads none of these
+ * ("5km states 5"); a tool result prints its digits.
+ */
+const MAGNITUDE_SUFFIXES: ReadonlyMap<string, string> = new Map([
+  ["k", "1000"],
+  ["m", "1000000"],
+  ["mn", "1000000"],
+  ["b", "1000000000"],
+  ["bn", "1000000000"],
+  ["t", "1000000000000"],
+]);
+
+/**
+ * The value a lowercase magnitude suffix names (`k` → `1000`, `bn` →
+ * `1000000000`), or null. The caller decides it is glued to a numeral: on
+ * its own, "Plan B" names no billion.
+ */
+export function magnitudeSuffix(word: string): string | null {
+  return MAGNITUDE_SUFFIXES.get(word) ?? null;
+}
 
 /** A word that states a figure, and how it is compared. */
 export type FigureWord = {

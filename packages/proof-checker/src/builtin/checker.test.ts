@@ -6,8 +6,8 @@ import {
   BUILTIN_RULES,
   type BuiltinVerdict,
   checkCertificate,
-  createBuiltinChecker,
 } from "./checker";
+import { createBuiltinChecker } from "./runner";
 
 type StepIn = {
   id: string;
@@ -1088,8 +1088,9 @@ describe("rejection extras", () => {
   });
 
   test("the deadline is capped at maxTimeoutMs whatever the caller asks", () => {
-    // The check is synchronous on the harness's thread; formal.timeout_ms (30 s
-    // by default, sized for containers) must not become a 30 s stall.
+    // A check holds a core (or, with no worker, the caller's thread) for its
+    // whole budget; formal.timeout_ms (30 s by default, sized for containers)
+    // must not stretch it.
     const t0 = 1_000_000;
     let calls = 0;
     const clock = spyOn(Date, "now").mockImplementation(() =>

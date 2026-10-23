@@ -1023,15 +1023,17 @@ export type GraderEntry = {
   readonly weight?: number;
   /**
    * 0.8.0 (design/0.8.0-provability-release.md §9.1) — how this entry joins
-   * the sample's `overall`. Absent (every graders-file entry): under the
-   * graders config's `combine:` policy, exactly as before.
+   * the sample's `overall`. Absent (every other graders-file entry): under
+   * the graders config's `combine:` policy, exactly as before.
    *   - `"requirement"` — OUTSIDE the policy: the sample passes only when the
    *     policy passes AND this grader passes, and its score never enters the
    *     policy's score (its scale and direction are its own).
    *   - `"report"` — recorded in `perGrader` only, never part of `overall`.
-   * The six graders `--provability` appends use these: a flag must not let a
-   * vacuous pass, a lower-is-better rate or a reported dollar figure vote in
-   * a `combine: any` / `weighted` policy written for the user's own graders.
+   * The six `provability.*` graders carry these however they joined — the
+   * ones `--provability` appends and a graders file's `type: registry` entry
+   * naming one alike (review I32): neither path may let a vacuous pass, a
+   * lower-is-better rate or a reported dollar figure vote in a `combine:
+   * any` / `weighted` policy written for the user's own graders.
    */
   readonly role?: "requirement" | "report";
 };

@@ -25,8 +25,10 @@ import { openEventLog } from "@crewhaus/event-log";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
 import { type RunProvability, runChatLoop } from "@crewhaus/runtime-core";
+import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createTaskTool } from "@crewhaus/tool-task";
+import { z } from "zod";
 import { childProvabilityGuidance, spawnSubAgent } from "./index.js";
 
 type StreamRequest = Parameters<ProviderAdapter["stream"]>[0];
@@ -128,14 +130,18 @@ async function parentHandle(root: string): Promise<ParentRunHandle> {
   };
 }
 
-const spawnWith = async (parent: ParentRunHandle, root: string) => {
+const spawnWith = async (
+  parent: ParentRunHandle,
+  root: string,
+  childTools: ReadonlyArray<RegisteredTool> = [],
+) => {
   const { adapter, requests } = capturing([text("done")]);
   const result = await spawnSubAgent(parent, {
     def: RESEARCHER,
     prompt: "find the refund window",
     permissionMode: "bypass",
     permissionRules: { ...emptyRuleSet },
-    childTools: [],
+    childTools,
     sessionRootDir: root,
     _client: adapter,
   });
@@ -164,7 +170,100 @@ describe("childProvabilityGuidance", () => {
   });
 });
 
+/**
+ * A skill laid out as the shipped `provability` skill renders for a parent
+ * whose gate retries (`@crewhaus/default-skills`; evaluation-service's
+ * child-skill test pins that layout): an opening about the parent's own
+ * answer, then sections, with the provability tools named in list items.
+ */
+const PARENT_SKILL = [
+  "A proof gate checks each answer before it is served. Here the floor is",
+  "`grounded`: every claim needs evidence at that rung or above. An answer",
+  "that falls short comes back to you with what failed, at most once; after that it is served with a failing verdict.",
+  "",
+  "## How to cite",
+  "",
+  "- `[n]: <url>` or `[n]: <workspace path>` — a page you fetched, a file you read",
+  "- `[n]: proof:prf_…` — the id `ProofCheck` returned",
+  "",
+  "## How to pass",
+  "",
+  "- Fetch or read a source before you cite it, and quote its exact words when",
+  "  you can: a quote is matched verbatim, a paraphrase only by word overlap.",
+  "- A proof meets any floor. To prove a claim, call `ProofCheckers` and pick an",
+  "  available checker, call `ProofCheck`, and cite the id it returns.",
+  "- Before you finish, run `ProvabilityPreflight` on the whole draft,",
+  "  definition lines included, and fix every claim it reports.",
+  "- Drop a claim you cannot support.",
+].join("\n");
+
+/** A stand-in for one of the parent's provability tools, by name. */
+const toolNamed = (name: string): RegisteredTool =>
+  buildTool({
+    name,
+    description: `${name} stand-in`,
+    inputSchema: z.object({}),
+    execute: async () => "ok",
+  });
+
+describe("childProvabilityGuidance — only the parts of the parent's skill true for a child", () => {
+  test("never what happens to a failing answer: a child's reply is not checked, retried or served", () => {
+    const g = childProvabilityGuidance({ level: "grounded", skill: PARENT_SKILL });
+    expect(g).not.toContain("comes back to you");
+    expect(g).not.toContain("is served");
+    expect(g).toContain("## How to cite");
+    expect(g).toContain("## How to pass");
+    expect(g).toContain(
+      "  you can: a quote is matched verbatim, a paraphrase only by word overlap.",
+    );
+    expect(g).toContain("- Drop a claim you cannot support.");
+  });
+
+  test("a provability tool only when the child's own tool set has it", () => {
+    const none = childProvabilityGuidance({ level: "grounded", skill: PARENT_SKILL });
+    for (const tool of ["ProvabilityPreflight", "ProofCheckers", "ProofCheck", "proof:prf_"]) {
+      expect(none).not.toContain(tool);
+    }
+    // Its continuation line goes with it.
+    expect(none).not.toContain("definition lines included");
+    const preflight = childProvabilityGuidance({ level: "grounded", skill: PARENT_SKILL }, [
+      "ProvabilityPreflight",
+    ]);
+    expect(preflight).toContain(
+      "- Before you finish, run `ProvabilityPreflight` on the whole draft,\n  definition lines included, and fix every claim it reports.",
+    );
+    expect(preflight).not.toContain("ProofCheck");
+    const proofs = childProvabilityGuidance({ level: "grounded", skill: PARENT_SKILL }, [
+      "ProofCheckers",
+      "ProofCheck",
+    ]);
+    expect(proofs).toContain("call `ProofCheckers` and pick an");
+    expect(proofs).toContain("- `[n]: proof:prf_…` — the id `ProofCheck` returned");
+    expect(proofs).not.toContain("ProvabilityPreflight");
+  });
+});
+
 describe("spawnSubAgent — the read-only provability seam (direct handle)", () => {
+  test("a gated parent whose gate retries: the child's system prompt never says its reply comes back to it", async () => {
+    // The parent's skill went in whole: a child read that ITS answer is gated
+    // and retried, and was told to run ProvabilityPreflight, which a child on
+    // a `tools:` allowlist need not have.
+    const root = tempRoot();
+    const gated = async (): Promise<ParentRunHandle> => ({
+      ...(await parentHandle(root)),
+      provability: { level: "grounded", skill: PARENT_SKILL },
+    });
+    const bare = (await spawnWith(await gated(), root)).system[0] ?? "";
+    expect(bare).toContain("Only the parent's final answer is checked");
+    expect(bare).toContain("## How to cite");
+    expect(bare).not.toContain("comes back to you");
+    expect(bare).not.toContain("ProvabilityPreflight");
+    const tooled = (await spawnWith(await gated(), root, [toolNamed("ProvabilityPreflight")]))
+      .system[0];
+    expect(tooled).toContain("run `ProvabilityPreflight` on the whole draft");
+    expect(tooled).not.toContain("comes back to you");
+  });
+
   test("a gated parent: the child's system prompt carries the guidance after its own instructions", async () => {
     const root = tempRoot();
     const parent: ParentRunHandle = {

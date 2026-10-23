@@ -327,7 +327,10 @@ export type TaxonomyProposal = {
 
 /** Default recovery action per `FailureClass` — CrewHaus's own ceilings and
  *  hard provider failures `fail`; transient/tool failures `retry`; a context
- *  overflow `compact`. A human refines before adopting. */
+ *  overflow `compact`. A human refines before adopting. `provability` (0.8.0,
+ *  design §5.1 — exit 37) is a configured evidence floor beside `evaluation`:
+ *  the spec's own `on_fail: halt` chose to stop the run, so a retry is not
+ *  the draft's to suggest. */
 export function defaultRecoveryFor(cls: string): string {
   switch (cls) {
     case "timeout":
@@ -340,6 +343,7 @@ export function defaultRecoveryFor(cls: string): string {
     case "auth":
     case "crewhaus_budget":
     case "evaluation":
+    case "provability":
     case "spec":
     case "config":
     case "mcp_boot":

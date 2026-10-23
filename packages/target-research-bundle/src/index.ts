@@ -368,10 +368,11 @@ function memoryFabric(ir: IrResearchV0): { wired: boolean; fragmentJson: string 
  * guarded HEAD, each request it decides going out as an `egress_decision`
  * line on stdout (this daemon's event stream; it has no audit sink, §6.1,
  * §10); `provability.judge` wires the same paraphrase-waiver judge
- * (`createWaiverJudge`). The report is graded after every branch's loop has
- * closed, so there is no run bus or `budget.judge_share` to meter it on: the
- * judge's model and priced spend land on the bundle (`judgeModel`,
- * `spentUsdMicros`) and on the `provability_graded` line. File sources under
+ * (`createWaiverJudge`, `renderWaiverJudge`), metered as role `judge` on the
+ * report gate's own run bus and, under `budget:`, skipped past
+ * `budget.judge_share` (design §1 principle 1, §6.2); its model and priced
+ * spend land on the bundle (`judgeModel`, `spentUsdMicros`) and on the
+ * `provability_graded` line. File sources under
  * `retrieve.allowedFileRoots` outside the harness directory are admitted by
  * the gate exactly as the crawler admitted them (`fileRoots`). The evidence
  * index is built inside the gate's guard (an unreadable cache leaves the
@@ -381,6 +382,68 @@ function memoryFabric(ir: IrResearchV0): { wired: boolean; fragmentJson: string 
  *
  * Without `provability:` every piece is the pre-0.8.0 text, byte for byte.
  */
+/**
+ * `provability.judge` on the research shape (design §1 principle 1, §6.2):
+ * the waiver judge, metered and capped like the in-loop gate's. The report
+ * is graded after every branch's loop has closed, so the gate has no loop's
+ * bus to meter on: it gets its own run context, and its calls publish
+ * `model_request` / `model_response` with `role: "judge"` there. Under
+ * `budget:` a cost tracker on that bus is the share's meter — the workflow
+ * shape's run-spanning meter, over one bus — and `budget.usd` is a
+ * per-loop ceiling on this shape (`budgetField`), the report gate being one
+ * more loop: once the judge has spent `judge_share` of it (default
+ * `DEFAULT_JUDGE_SHARE`), every later waiver is skipped, not guessed — the
+ * miss the deterministic check found stands, as with no judge — and the
+ * operator is told once on stderr. Without `budget:` nothing caps it, as in
+ * the loop (the runtime's share read is false with no budget).
+ */
+function renderWaiverJudge(
+  judge: NonNullable<NonNullable<IrResearchV0["provability"]>["judge"]>,
+  budget: IrResearchV0["budget"],
+): { readonly imports: string; readonly constants: string } {
+  const head = `
+// provability.judge — the paraphrase-waiver judge, asked only for a grounded
+// miss on wording alone, metered as role judge on the report gate's own run
+// bus; its model and spend land on the bundle.
+const __judgeRun = createRunContext();`;
+  if (budget === undefined) {
+    return {
+      imports: "",
+      constants: `${head}
+const __waiverJudge = createWaiverJudge({ judge: ${JSON.stringify(judge)}, bus: __judgeRun.eventBus });`,
+    };
+  }
+  const share = budget.judgeShare ?? "DEFAULT_JUDGE_SHARE";
+  return {
+    imports: `import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";
+${budget.judgeShare === undefined ? 'import { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\n' : ""}import { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";
+`,
+    constants: `${head}
+// budget.judge_share of budget.usd (a per-loop ceiling here; the report gate
+// is one more loop): past it each waiver is skipped, not guessed, and a
+// paraphrase miss stays the miss the deterministic check found.
+const __judgeMeter = createCostTracker(__judgeRun.eventBus, { suppressEvents: true });
+const __judgeShareMicros = Math.round(${budget.usdMicros} * ${share});
+let __judgeShareNoticed = false;
+const __judgeShareExhausted = (): boolean => {
+  const spent = sumRoleCost(__judgeMeter.getRunCost(__judgeRun.runId), AUXILIARY_MODEL_ROLES);
+  if (spent < __judgeShareMicros) return false;
+  if (!__judgeShareNoticed) {
+    __judgeShareNoticed = true;
+    process.stderr.write(
+      \`[research] provability.judge: the waiver judge has spent $\${(spent / 1_000_000).toFixed(4)} of its $\${(__judgeShareMicros / 1_000_000).toFixed(4)} budget.judge_share — the rest of the report's paraphrase misses stay misses, unjudged.\\n\`,
+    );
+  }
+  return true;
+};
+const __waiverJudge = createWaiverJudge({
+  judge: ${JSON.stringify(judge)},
+  bus: __judgeRun.eventBus,
+  exhausted: __judgeShareExhausted,
+});`,
+  };
+}
+
 function renderResearchProvability(ir: IrResearchV0): {
   readonly errorsImport: string;
   readonly reportWriterImport: string;
@@ -388,6 +451,10 @@ function renderResearchProvability(ir: IrResearchV0): {
   readonly citeFactTool: string;
   readonly instructionsExpr: string;
   readonly reportBlock: string;
+  /** A line after a branch's run context is made: "" unless the report gate screens HEADs. */
+  readonly branchContext: string;
+  /** An import line after runtime-core's: "" unless the report gate screens HEADs. */
+  readonly runtimeImport: string;
 } {
   const citeFact = `  const citeFactTool = createCiteFactTool({
     tracker: args.tracker,
@@ -402,6 +469,8 @@ function renderResearchProvability(ir: IrResearchV0): {
       constants: "",
       citeFactTool: citeFact,
       instructionsExpr: "SPEC_INSTRUCTIONS",
+      branchContext: "",
+      runtimeImport: "",
       reportBlock: `  const report = writeReport({
     goal,
     branches: state.completedBranches,
@@ -423,6 +492,7 @@ function renderResearchProvability(ir: IrResearchV0): {
   }
   const head = p.sources.resolve === "head";
   const judge = p.judge;
+  const waiver = judge !== undefined ? renderWaiverJudge(judge, ir.budget) : undefined;
   const evaluationImports = [
     ...(head ? ["createHeadResolver"] : []),
     ...(judge !== undefined ? ["createWaiverJudge"] : []),
@@ -431,7 +501,9 @@ function renderResearchProvability(ir: IrResearchV0): {
   return {
     errorsImport:
       'import { RunFailedError, formatRunFailure, toFailureReport } from "@crewhaus/errors";',
-    reportWriterImport: `${
+    reportWriterImport: `${waiver?.imports ?? ""}${
+      head ? 'import { normalizeUrl } from "@crewhaus/provability";\n' : ""
+    }${
       evaluationImports.length > 0
         ? `import { ${evaluationImports.join(", ")} } from "@crewhaus/evaluation-service";\n`
         : ""
@@ -452,16 +524,22 @@ const BRANCH_INSTRUCTIONS = \`\${SPEC_INSTRUCTIONS}\\n\\n\${researchProvabilityG
       head
         ? `
 // sources.resolve: head — one guarded HEAD per distinct cited URL at report time.
-const __resolveHead = createHeadResolver(PROVABILITY.sources);`
+const __resolveHead = createHeadResolver(PROVABILITY.sources);
+// Pillar 3 — the HEAD is an egress to a URL the report names (a dynamic
+// sink): screened against what every branch's tools handed this process, so
+// a secret a tool read never rides a cited URL out. A URL this run's crawler
+// already requested (its allowedOrigins admitted it) sends nothing new, and
+// is let through: a page that lists another page's address on a line of its
+// own must not fail the honest citation of that page. A resumed run screens
+// against the branches it ran itself.
+const __branchContexts: Array<ReturnType<typeof createRunContext>> = [];
+let __fetchedUrls: ReadonlySet<string> = new Set();
+const __screenHead = lineageEgressScreen({
+  contexts: () => __branchContexts,
+  sent: (url) => __fetchedUrls.has(url),
+});`
         : ""
-    }${
-      judge !== undefined
-        ? `
-// provability.judge — the paraphrase-waiver judge, asked only for a grounded
-// miss on wording alone; its model and spend land on the bundle.
-const __waiverJudge = createWaiverJudge({ judge: ${JSON.stringify(judge)} });`
-        : ""
-    }${
+    }${waiver?.constants ?? ""}${
       unreachable
         ? `
 // A ${p.level} floor: the report's only evidence is what the run fetched,
@@ -481,11 +559,22 @@ process.stderr.write(
     args.tracker,
   );`,
     instructionsExpr: "BRANCH_INSTRUCTIONS",
+    branchContext: head ? "\n  __branchContexts.push(runContext);" : "",
+    runtimeImport: head ? '\nimport { lineageEgressScreen } from "@crewhaus/runtime-core";' : "",
     reportBlock: `  // 0.8.0 (design §5.4, §8) — the report gate: the rendered report verified
   // against this run's own fetch cache at the declared floor, the verdict
   // served beside it (## Provability, report.json's proof, proof.json, a
   // provability_graded line).
-  const __gateRoots = { workspaceRoot: process.cwd(), fileRoots: allowedFileRootsAbs };
+  const __gateRoots = { workspaceRoot: process.cwd(), fileRoots: allowedFileRootsAbs };${
+    head
+      ? `
+  // As the report's definitions spell them: the writer names a fetched page
+  // by its normalized URL, and the verifier asks about that.
+  __fetchedUrls = new Set(
+    tracker.listFetches().flatMap((f) => [f.url, normalizeUrl(f.url) ?? f.url]),
+  );`
+      : ""
+  }
   const report = await writeProvableReport({
     goal,
     branches: state.completedBranches,
@@ -502,6 +591,7 @@ process.stderr.write(
       resolveHead: (url) =>
         __resolveHead(url, {
           record: (decision) => emit({ kind: "egress_decision", ...decision }),
+          screen: __screenHead,
         }),`
           : ""
       }${judge !== undefined ? "\n      judgeWaiver: __waiverJudge," : ""}
@@ -632,7 +722,7 @@ ${prov.errorsImport}
 import { decompose, type Plan } from "@crewhaus/planner";
 ${prov.reportWriterImport}
 import { runChatLoop } from "@crewhaus/runtime-core";
-import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";
+import { createPendingApprovalStore, resolveSessionRootDir } from "@crewhaus/runtime-core";${prov.runtimeImport}
 import { createRunContext } from "@crewhaus/run-context";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
 ${hybridImport}import { defaultCatalog } from "@crewhaus/tool-catalog";
@@ -764,7 +854,7 @@ ${prov.citeFactTool}
     args.question +
     sourcesBlock;
 
-  const runContext = createRunContext();
+  const runContext = createRunContext();${prov.branchContext}
   const finalText = await runChatLoop({
     model: SPEC_MODEL,
     instructions: ${prov.instructionsExpr},${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}${sandboxField(ir, "    ")}

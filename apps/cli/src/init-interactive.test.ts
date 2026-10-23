@@ -29,7 +29,13 @@ import {
   renderProvabilityToolsBlock,
   setProvability,
 } from "./init-interactive";
-import { auditProvability } from "./lint";
+import { auditProvability, runLint } from "./lint";
+
+/** What `crewhaus lint` says about a spec's provability block, in order. */
+const lintProvabilityMessages = (yaml: string): string[] =>
+  runLint(yaml, () => undefined)
+    .findings.filter((f) => f.rule.startsWith("provability-"))
+    .map((f) => f.message);
 
 describe("SHAPE_GUIDANCE + buildInterviewSystemPrompt", () => {
   test("covers the fourteen target shapes", () => {
@@ -610,6 +616,56 @@ describe("provabilityScaffoldNotes — what the rung still needs, in lint's word
       "provability.level: checked needs claims bound to tool:<toolUseId> results",
     );
     expect(provabilityScaffoldNotes(cli("checked", ["evaluate"]))).toEqual([]);
+  });
+
+  test("a research floor no report can meet is noted, in the compile warning's words", () => {
+    // init writes research at checked or proven (provabilityAnswer keeps
+    // both); the compile warns, so init says so before the first run fails.
+    for (const level of ["checked", "proven"] as const) {
+      const research = buildScriptedSpec({
+        name: "agent",
+        shape: "research",
+        model: "m",
+        instructions: "hi",
+        provability: provabilityAnswer("research", level),
+      });
+      const notes = provabilityScaffoldNotes(research.yaml);
+      expect([level, notes.join("\n")]).toEqual([
+        level,
+        expect.stringContaining(`provability.level: ${level} cannot be met on the research shape`),
+      ]);
+      expect(notes).toEqual(provabilityScaffoldNotes(research.spec));
+    }
+    for (const level of ["cited", "grounded"] as const) {
+      const research = buildScriptedSpec({
+        name: "agent",
+        shape: "research",
+        model: "m",
+        instructions: "hi",
+        provability: level,
+      });
+      expect(provabilityScaffoldNotes(research.spec).join("\n")).not.toContain(
+        "cannot be met on the research shape",
+      );
+    }
+  });
+
+  test("checkers that all need a sandbox are noted, as lint notes them", () => {
+    // The checkers rule reads the names as WRITTEN, so the spec must reach it.
+    const yaml =
+      "name: agent\ntarget: cli\nagent:\n  model: m\n  instructions: hi\nprovability:\n  level: proven\n  formal:\n    checkers: [smt]\n";
+    const notes = provabilityScaffoldNotes(yaml);
+    expect(notes.join("\n")).toContain("provability.formal.checkers names only sandbox checkers");
+    expect(notes).toEqual(lintProvabilityMessages(yaml));
+  });
+
+  test("a formal.image no checker runs is noted", () => {
+    const yaml =
+      "name: agent\ntarget: cli\nagent:\n  model: m\n  instructions: hi\nprovability:\n  level: proven\n  formal:\n    checkers: [builtin]\n    image: example.registry/lean:4\n";
+    expect(provabilityScaffoldNotes(yaml).join("\n")).toContain(
+      "provability.formal.image overrides the lean4 checker's image only",
+    );
+    expect(provabilityScaffoldNotes(yaml)).toEqual(lintProvabilityMessages(yaml));
   });
 
   test("a spec that does not lower gets one advisory note — never a throw", () => {

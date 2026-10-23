@@ -39,11 +39,11 @@ for (const claim of extractClaims(answer)) {
 | Module | What it answers |
 |---|---|
 | `citations.ts` | The marker grammar (`[1]`, `[^a]`, `[A1]`) and the definition grammar (`[1]: source`, also with the source on the next line). `lintCitations`, `citationDefinitions`, `citedClaims`. The two patterns are module-private, so they have exactly one definition. |
-| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number or has at least `MIN_CLAIM_TOKENS` content words. Code, headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
+| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number (a numeral, or a number word other than "one") or has at least `MIN_CLAIM_TOKENS` content words. Code, headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
 | `markdown.ts` | Code spans, line lookup and link destinations. Two fence readers: `fencedSpans`, the citation grammar's, and `commonMarkFences`, the stricter one the claim extractor reads. |
 | `refs.ts` | `classifyDefinition`: the evidence-reference grammar. A source is a `url`, `doi`, `path` (with its `#fragment`), `tool:<toolUseId>`, `proof:<prf_id>`, `assume:<text>`, or free `text`. `definitionGloss`: the text a definition line shows past what it names. |
 | `locate.ts` | The FactCrossCheck kernel. `indexSource` a body once, then `locateClaim` returns `supported`, `misquoted`, `polarityConflict` or `notFound`, along with the excerpt, line, coverage and a `cause`. `isWaivableMiss` says whether the gate's judge may be asked about a miss. `governingNegation` and `clauseNumbers` scope a negation to the words it denies. |
-| `numbers.ts` | `extractNumbers` and `containsValue` compare values as exact decimals, so `1,284.50`, `1284.50` and `1284.5` are one value. `figureWord` reads number words for the locate kernel's figure rule. |
+| `numbers.ts` | `extractNumbers` and `containsValue` compare values as exact decimals, so `1,284.50`, `1284.50` and `1284.5` are one value, and an ISO date or a time of day as a whole value too (`compoundValues`). `figureWord` reads number words for the locate kernel's figure rule. |
 | `quotes.ts` | `quotedSpans` and `containsQuote`, the `checked` rung's quotations. |
 | `tokens.ts`, `sentences.ts`, `messages.ts` | The graders' measure: `contentTokens`, `coverage`, the transcript splitter `sentences`, `claimSentences` and `messageText`. Their thresholds were set against exactly these. |
 
@@ -55,9 +55,14 @@ its `grounded.coverage`, which defaults to 0.8. Below 1 the figure rule applies 
 which a gate at `coverage: 1` passes explicitly): some of a claim's words may be missing, but never
 a figure and never a negation the claim makes. Without it, "the refund window is 30 days" would
 clear 0.8 against a source that says 14. A figure is a numeral, compared by value (`$1,284.50` is
-the source's `1284.5`; `12%` is not `12`), a cardinal word (`thirty` is `30`), or an ordinal
-(`third`; a list-counting "First," at the start of a claim is not one, and "second" is left out
-because it is a unit of time as often as a rank). A missing figure comes back as `notFound` with
+the source's `1284.5`; `12%` is not `12`) and with its sign (`500` is not `-500` or `−500`), a
+cardinal word (`thirty` is `30`), an ordinal (`third`; a list-counting "First," at the start of a
+claim is not one, and "second" is left out because it is a unit of time as often as a rank), or a
+magnitude glued to a numeral (`$5M` is `$5 million` and not `$5B`; `k`, `m`, `mn`, `b`, `bn` and
+`t`, read without case, so a claim's `5m` of metres misses a source's `5 metres` rather than
+matching a wrong figure). An ISO date and a time of day must also sit in the span whole:
+`2025-03-04` is not the source's `2025-04-03`, and `10:30` is not the `10` of `10:00` and the `30`
+of `18:30`. A missing figure comes back as `notFound` with
 `cause: "value"`, a missing negation with `cause: "negation"`, and either one wins over
 `coverage` even when the claim's other words fall short too. A negation that opens the source's
 statement, just before the span that carries the claim's words, is the span's own: "No two of the
@@ -72,7 +77,8 @@ checked by those words, in order, and `coverage` does not loosen that. A near-id
 reported as `misquoted`, with what the source actually wrote. Under the figure rule the framing
 around a quotation is read for figures and negations too. `The window is 30 days, since "customers
 may request a refund".` is a `value` miss against a source that says 14, because each figure the
-framing states must sit within `windowTokens` of the quotation.
+framing states must sit within `windowTokens` of the quotation. A quoted numeral keeps its sign
+under the rule: `"the balance is 500 dollars"` is a misquote of a source that says -500.
 
 **`extractClaims` and `citedClaims` agree on plain prose and differ on purpose elsewhere.** Both use
 the same splitter, marker constant and `plainClaim`, and every marker `citedClaims` gives a
@@ -81,7 +87,10 @@ CommonMark renderer does, list items included (`- ```js` opens a fence, and an i
 one), cuts fenced code and definition lines out of a sentence, gives a marker written after the
 full stop (`text. [1]`, `text.[1]`, or `text.[1][2]`, a reference link whose one marker is `[2]`)
 to the sentence before it — a run only of citation ids, so `[Stripe][2] charges…` keeps its marker
-— treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
+— leaves out only the question at the end of a piece the splitter ran on (`…30 days [1]` then
+`Anything else?` on the next line, or `…30 days.Anything else?`, keep their claim; a question
+wrapped onto a line that opens lowercase, with no marker or figure before the break, stays one
+question), treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
 indented `14.` that cannot interrupt a list item's paragraph as that paragraph's text), splits at a
 block quote opening under a paragraph, reads a heading only where a line is one (indented
 or inside a list item too) and never lets it take the line under it, counts a cited or
@@ -109,7 +118,10 @@ states the total. The `checked` rung reads a figure's polarity this way, and it 
 
 **Numbers are only read where the reading is certain.** `1,5`, `1.284,50`, `v1.2.3` and
 `10.0.0.1` are not numbers here. Nothing is guessed: a version and a figure in another locale
-are left out rather than read as the wrong value.
+are left out rather than read as the wrong value. An ISO date (`2025-04-03`) and a time of day
+(`10:30`, `09:05:00`) are values whole as well as their parts, so a result that says `2025-04-03`
+does not contain a claim's `2025-03-04`. A slash date, a ratio and a range are read as their
+parts only: which is the day, or whether `3:1` is a score, would be a guess.
 
 ## The two token measures
 

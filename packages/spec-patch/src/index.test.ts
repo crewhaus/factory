@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { Spec } from "@crewhaus/spec";
 import {
   DIFF_VALUE_MAX_LENGTH,
   OPTIMIZABLE_PATHS,
@@ -12,6 +13,7 @@ import {
   humanOwnedReason,
   isOptimizable,
   parseWriteBackHeader,
+  refusedLeafChange,
   specHasPath,
   validatePatch,
 } from "./index";
@@ -681,7 +683,7 @@ agent:
         op: "replace",
         value: "s2",
       }),
-    ).toThrow(/not listed in OPTIMIZABLE_PATHS/);
+    ).toThrow(/not optimizable on any target: a routed eval PINS model_pool.learning.seed/);
     // A block patch that PRESERVES the seed (what advise's spread produces) is fine…
     expect(() =>
       validatePatch(spec, {
@@ -708,6 +710,48 @@ agent:
       ["provability", "level"],
       ["provability", "on_fail"],
     ]);
+  });
+
+  test("a REMOVE of the learning block, or a patch above it, cannot drop or move the seed (review I62)", () => {
+    const SEEDED = `${POOL_YAML}    policy: learned
+    learning: { seed: "s1", explorationRate: 0 }
+`;
+    const { spec } = applySpecPatch(SEEDED, {
+      target: "cli",
+      path: ["agent", "model_pool", "policy"],
+      op: "replace",
+      value: "learned",
+    });
+    // Reachable today: the learning block is whitelisted wholesale.
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["agent", "model_pool", "learning"],
+        op: "remove",
+      }),
+    ).toThrow(/would change "agent.model_pool.learning.seed".*PINS model_pool.learning.seed/);
+    // An unseeded block may still go.
+    const { spec: unseeded } = applySpecPatch(POOL_YAML, {
+      target: "cli",
+      path: ["agent", "model_pool", "learning"],
+      op: "add",
+      value: { explorationRate: 0 },
+    });
+    expect(() =>
+      validatePatch(unseeded, {
+        target: "cli",
+        path: ["agent", "model_pool", "learning"],
+        op: "remove",
+      }),
+    ).not.toThrow();
+    // A patch at an ANCESTOR the row names carries the seed in its value.
+    expect(
+      refusedLeafChange(spec, {
+        path: ["agent", "model_pool"],
+        op: "replace",
+        value: { candidates: [], learning: { seed: "s2" } },
+      })?.key,
+    ).toBe("agent.model_pool.learning.seed");
   });
 
   test("pool POLICY paths are whitelisted for cli/channel/managed; roster paths are not", () => {
@@ -1137,9 +1181,40 @@ provability:
       op: "replace",
       value: 0.9,
     });
+    // The floor and the failure mode are refused LEAVES: their own reason,
+    // never "add it to OPTIMIZABLE_PATHS" — an entry would change nothing.
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["provability", "level"],
+        op: "replace",
+        value: "cited",
+      }),
+    ).toThrow(
+      /not optimizable on any target: the provability floor is the bar the optimizer is graded against/,
+    );
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: ["provability", "on_fail"],
+        op: "replace",
+        value: "note",
+      }),
+    ).toThrow(/not optimizable on any target: what a below-floor answer becomes/);
+    for (const path of [
+      ["provability", "level"],
+      ["provability", "on_fail"],
+    ]) {
+      let message = "";
+      try {
+        validatePatch(spec, { target: "cli", path, op: "replace", value: "x" });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain("OPTIMIZER_REFUSED_LEAVES");
+      expect(message).not.toContain("add it to");
+    }
     for (const [path, value] of [
-      [["provability", "level"], "cited"],
-      [["provability", "on_fail"], "note"],
       [["provability", "assumptions"], "allow"],
       [["provability", "max_assumptions"], 10],
       [["provability", "scope"], "turn"],
@@ -1211,6 +1286,90 @@ provability: grounded
       expect(isOptimizable(target, ["provability", "on_fail"])).toBe(false);
     }
     expect(OPTIMIZER_REFUSED_LEAVES).toContainEqual(["provability", "level"]);
+  });
+
+  // Review I62 — the block-level defence behind the refused floor, exercised
+  // as if a wholesale `["provability"]` entry existed (none does today: the
+  // path check refuses it first, so refusedLeafChange is called directly).
+  describe("a wholesale provability patch cannot move the floor (review I62)", () => {
+    const expanded = (): Spec =>
+      applySpecPatch(PROVABILITY_YAML, {
+        target: "cli",
+        path: ["provability", "threshold"],
+        op: "replace",
+        value: 0.9,
+      }).spec;
+    const SHORTHAND_YAML = PROVABILITY_YAML.replace(
+      /provability:\n[\s\S]*$/,
+      "provability: grounded\n",
+    );
+    const shorthand = (): Spec =>
+      applySpecPatch(SHORTHAND_YAML, {
+        target: "cli",
+        path: ["agent", "instructions"],
+        op: "replace",
+        value: "Answer from the policy pages.",
+      }).spec;
+    const at = (op: "replace" | "add" | "remove", value?: unknown) => ({
+      path: ["provability"],
+      op,
+      ...(value !== undefined ? { value } : {}),
+    });
+
+    test("the SHORTHAND string is the floor it names: `cited` or `off` over a grounded block is refused", () => {
+      for (const value of ["cited", "off", "proven"]) {
+        expect(refusedLeafChange(expanded(), at("replace", value))).toEqual({
+          key: "provability.level",
+          reason: expect.stringContaining("the bar the optimizer is graded against"),
+        });
+      }
+      expect(refusedLeafChange(shorthand(), at("replace", "cited"))?.key).toBe("provability.level");
+      // The same floor, as a string, changes nothing the row guards.
+      expect(refusedLeafChange(expanded(), at("replace", "grounded"))).toBeUndefined();
+      expect(refusedLeafChange(shorthand(), at("replace", "grounded"))).toBeUndefined();
+    });
+
+    test("a block patch that keeps a shorthand spec's level passes; one that moves it does not", () => {
+      expect(
+        refusedLeafChange(shorthand(), at("replace", { level: "grounded", threshold: 0.5 })),
+      ).toBeUndefined();
+      expect(refusedLeafChange(shorthand(), at("replace", { level: "cited" }))?.key).toBe(
+        "provability.level",
+      );
+    });
+
+    test("a remove of the block drops the floor: refused", () => {
+      expect(refusedLeafChange(expanded(), at("remove"))?.key).toBe("provability.level");
+      expect(refusedLeafChange(shorthand(), at("remove"))?.key).toBe("provability.level");
+    });
+
+    test("adding a floor where the spec has none is moving it too", () => {
+      const bare = applySpecPatch(SHORTHAND_YAML.replace("provability: grounded\n", ""), {
+        target: "cli",
+        path: ["agent", "instructions"],
+        op: "replace",
+        value: "x",
+      }).spec;
+      expect(refusedLeafChange(bare, at("add", "cited"))?.key).toBe("provability.level");
+    });
+
+    test("on_fail is guarded the same way, with its own reason", () => {
+      const halting = applySpecPatch(PROVABILITY_YAML, {
+        target: "cli",
+        path: ["provability", "on_fail"],
+        op: "add",
+        value: "halt",
+      }).spec;
+      expect(
+        refusedLeafChange(halting, at("replace", { level: "grounded", threshold: 0.9 })),
+      ).toEqual({
+        key: "provability.on_fail",
+        reason: expect.stringContaining("what a below-floor answer becomes"),
+      });
+      expect(refusedLeafChange(halting, at("replace", "grounded"))?.key).toBe(
+        "provability.on_fail",
+      );
+    });
   });
 
   test("every excluded knob names its reason", () => {

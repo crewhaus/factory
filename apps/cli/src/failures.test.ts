@@ -10,6 +10,7 @@ import { join } from "node:path";
 import {
   type FailureRecord,
   clusterFailures,
+  defaultRecoveryFor,
   distinctivePattern,
   leadingStableClause,
   longestCommonSubstring,
@@ -166,6 +167,32 @@ describe("proposeTaxonomy", () => {
     const billing = drafts.find((d) => d.class === "billing");
     expect(billing?.pattern).toBe("Provider account has insufficient funds");
     expect(billing?.recovery).toBe("fail");
+  });
+
+  test("a provability halt drafts recovery: fail, like the evaluation floor beside it (0.8.0 §5.1)", () => {
+    // Exit 37 sits in the 3x configured-stop band beside evaluation's 35: the
+    // spec's own on_fail: halt ended the run, so the draft never says retry.
+    expect(defaultRecoveryFor("provability")).toBe("fail");
+    expect(defaultRecoveryFor("evaluation")).toBe("fail");
+    const { drafts } = proposeTaxonomy(
+      clusterFailures([
+        runFailed(
+          "provability",
+          "1/4 claims met the grounded floor (threshold 100%)",
+          "sess_0000000000000001",
+          37,
+        ),
+        runFailed(
+          "provability",
+          "2/4 claims met the grounded floor (threshold 100%)",
+          "sess_0000000000000002",
+          37,
+        ),
+      ]),
+    );
+    const provability = drafts.find((d) => d.class === "provability");
+    expect(provability).toBeDefined();
+    expect(provability?.recovery).toBe("fail");
   });
 
   test("surfaces too-generic clusters instead of drafting them", () => {

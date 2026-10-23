@@ -27,7 +27,11 @@
  * (`thredz_quota` on the free plan's 3-goal cap — never a crash); the local
  * write has ALWAYS already succeeded by the time a mirror runs.
  */
-import type { ContinuityStore } from "@crewhaus/continuity-store";
+import {
+  type ContinuityProofMode,
+  type ContinuityStore,
+  countsAsProven,
+} from "@crewhaus/continuity-store";
 import type { McpHost } from "@crewhaus/mcp-host";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import type { ToolCatalog } from "@crewhaus/tool-catalog";
@@ -448,6 +452,13 @@ export type ThredzGoalMirrorOptions = {
   readonly client: ThredzClient;
   readonly specName: string;
   readonly log?: (line: string) => void;
+  /**
+   * `continuity.proof` — which local goals count as achieved, and so have
+   * their remote goal completed (`countsAsProven`). Default `"ladder"`:
+   * every `proven` goal. Under `"require"` only a goal proven with verified
+   * evidence completes its mirror (design/0.8.0 §6.3).
+   */
+  readonly proofMode?: ContinuityProofMode;
 };
 
 /** A goal map is a few ids per goal; anything past this is not one. */
@@ -602,9 +613,16 @@ export function withThredzGoalMirror(
       if (patch.title !== undefined) body["title"] = (await redactor.redact(goal.title)).text;
       if (patch.target !== undefined) body["targetValue"] = goal.target;
       if (patch.current !== undefined) body["currentValue"] = goal.current;
-      if (goal.status === "proven") {
+      if (countsAsProven(goal, opts.proofMode)) {
         // Thredz goals complete when currentValue reaches targetValue — a
-        // proven local goal completes its mirror deterministically.
+        // proven local goal completes its mirror deterministically. Under
+        // `continuity.proof: require` "proven" means verified (design/0.8.0
+        // §6.3): a goal proven by assertion under an earlier `off` run, or
+        // marked proven with no proof on record, is below proven there, and
+        // tool-plan refuses to complete it. Forcing completion here would be
+        // a second completion path that any allowed update — progress below
+        // the target, a title edit — walks through, so such a goal mirrors
+        // only the fields its patch changed.
         body["targetValue"] = goal.target ?? 1;
         body["currentValue"] = goal.target ?? 1;
       }

@@ -61,6 +61,13 @@
  * - `line` is the line the claim's first character is on. A sentence that
  *   begins on a new line starts, in the splitter's ranges, at the newline
  *   before it.
+ * - A question is a sentence, not a piece. The splitter breaks at a single
+ *   line break only after a full stop, and at a full stop only before space,
+ *   so "The refund window is 30 days [1]\nAnything else?" and "…30
+ *   days.Anything else?" are one piece ending in `?` — and dropping it whole
+ *   dropped the claim, so the gate passed the answer vacuously (design §0,
+ *   tests A and B). Here only the question at the end is left out
+ *   (`questionParts`).
  *
  * Inline code is read as part of the sentence it sits in, words and figures
  * alike: "`packages/gate` holds the verifier" asserts something about the
@@ -92,6 +99,7 @@ import {
   markersOutsideCode,
   plainClaim,
 } from "./citations";
+import { claimFigures } from "./locate";
 import {
   type BlockLines,
   inSpan,
@@ -462,6 +470,188 @@ function markBlocks(text: string, pieces: Piece[], lines: Lines, bibliographic: 
   }
 }
 
+/**
+ * Does a sentence state a figure — the other thing besides a marker that
+ * makes a sentence of any length a claim (design §2)? A numeral the number
+ * layer reads, or a number word the locate kernel's figure rule reads
+ * (`claimFigures`): "Seats: twelve." and "It holds a dozen." state 12 as
+ * surely as "Seats: 12." does, and the figure rule already compares them so.
+ * A list-counting "First," is no figure there and none here. "one" is left
+ * out: it is a pronoun far more often than a count ("pick one", "one
+ * moment", "the one you asked about"), and those are not claims. "Seats:
+ * one." is therefore read only by the word count, the one gap this keeps.
+ */
+function statesFigure(plain: string): boolean {
+  if (extractNumbers(plain).length > 0) return true;
+  return claimFigures(plain).some((word) => !/^\d/.test(word) && word !== "one");
+}
+
+/** What may open a line before its first letter: emphasis, a quote, code, a bracket. */
+const LINE_OPENER = /[ \t*_~>`"'([]/;
+/** What may close after a terminator before the letter glued to it. */
+const CLOSERS = `"')]`;
+/** An initialism, "U.S." or "J.": its full stops end no sentence. */
+const INITIALISM = /^(?:[\p{L}]\.)+$/u;
+/** No abbreviation is longer than this, so a glued word is read back no further. */
+const MAX_ABBREVIATION = 16;
+/**
+ * What a dotted name goes on with after its `.`: a letter (`Text.Json`,
+ * `acme.example`). A digit does not, so "1,284.50.Is it right?" still ends.
+ */
+const NAME_CHAR = /[\p{L}_]/u;
+
+/**
+ * Does the word glued to a terminator at `at` continue an identifier rather
+ * than open a sentence: another name-joining `.` (`Text.Json`) or a capital
+ * inside it (`WriteLine`) before it ends? The word is read only up to its
+ * first `.`, `?`, `!` or whitespace — where the next terminator the caller
+ * reads is — so every terminator's word is read once.
+ */
+function continuesName(text: string, at: number, end: number): boolean {
+  for (let i = at + 1; i < end; i++) {
+    const ch = text[i] as string;
+    if (ch === ".") return NAME_CHAR.test(text[i + 1] ?? "");
+    if (ch === "?" || ch === "!" || /\s/.test(ch)) return false;
+    if (/\p{Lu}/u.test(ch) && /\p{Ll}/u.test(text[i - 1] as string)) return true;
+  }
+  return false;
+}
+
+/** Does the line starting at `at` open (after its Markdown) with a lowercase letter? */
+function opensLowercase(text: string, at: number, end: number): boolean {
+  let i = at;
+  while (i < end && LINE_OPENER.test(text[i] as string)) i++;
+  return i < end && /\p{Ll}/u.test(text[i] as string);
+}
+
+/**
+ * A piece whose text ends in `?`, cut where a sentence inside it ends that
+ * the splitter ran on, so that only the question it ends with is left out
+ * (design §2: a claim is a declarative, non-question sentence; §0: tests A
+ * and B are un-servable even when the model misbehaves). Read from the end:
+ * the question is the last sentence, and what comes before it is one piece,
+ * as it would be with no question after it — a table above "Want the annual
+ * prices too?" stays one claim, its marker with it.
+ *
+ * A sentence ends inside the piece at:
+ *
+ * - a terminator glued to a capital, "30 days.Anything else?" or "France
+ *   [1].Right?" — not after an abbreviation or an initialism ("U.S.Army"),
+ *   not in code, and not inside a dotted name or a URL path: not where the
+ *   token before the terminator already holds a `/` or a name-joining `.`
+ *   ("System.Text.Json", "…/Docs/Guide.Html"), nor where the word after it
+ *   goes on as an identifier, with another such `.` or a capital inside it
+ *   ("Console.WriteLine"). `acme.example`, `Node.js` and `1.2` glue no
+ *   capital; "1,284.50.Is it right?" still ends, its `.` joining digits;
+ * - a line break, unless the line after it opens with a lowercase letter
+ *   and the text before it, back to the last place a sentence could end,
+ *   carries no marker and states no figure. That is one question wrapped
+ *   ("Should I send the corrected invoice to the billing contact\nbefore
+ *   Friday?"); with a marker or a figure before the break it is read as a
+ *   claim, the direction every difference here leans. A wrapped question
+ *   whose wrapped line opens with a capital, or whose first line states a
+ *   figure, is therefore read as a claim too: at a `cited` floor that asks
+ *   for a citation the question did not need, where the other way it served
+ *   a figure unread.
+ *
+ * After a cut, the text before it is read again when it too ends in `?`
+ * ("Is it 30?Anything else?"). A sentence that is itself a question —
+ * "…30 days [1], right?" on one line — is still one; design §2 excludes it.
+ */
+function questionParts(text: string, piece: Piece, inCode: (offset: number) => boolean): Piece[] {
+  // Where a sentence may end inside the piece, left to right: the left part
+  // ends at `left`, the right part starts at `right`.
+  const cuts: Array<{ left: number; right: number; glued: boolean; question: boolean }> = [];
+  // Where the token the scan is in began (after the last whitespace), and
+  // the last `/` or name-joining `.` seen: a token holding one is a dotted
+  // name or a URL path, and a capital glued to it continues it. Both only
+  // move right, so the piece is read once however many terminators it has.
+  let scanned = piece.first;
+  let tokenStart = piece.first;
+  let joined = -1;
+  const dottedBefore = (at: number): boolean => {
+    for (; scanned < at; scanned++) {
+      const ch = text[scanned] as string;
+      if (/\s/.test(ch)) tokenStart = scanned + 1;
+      else if (ch === "/" || (ch === "." && NAME_CHAR.test(text[scanned + 1] ?? ""))) {
+        joined = scanned;
+      }
+    }
+    return joined >= tokenStart;
+  };
+  for (let i = piece.first; i < piece.end; i++) {
+    const c = text[i] as string;
+    if (c === "\n" || c === "\r") {
+      const right = c === "\r" && text[i + 1] === "\n" ? i + 2 : i + 1;
+      cuts.push({ left: i, right, glued: false, question: false });
+      i = right - 1;
+      continue;
+    }
+    if (c !== "." && c !== "!" && c !== "?") continue;
+    let j = i + 1;
+    while (j < piece.end && /[.!?]/.test(text[j] as string)) j++;
+    const run = text.slice(i, j);
+    while (j < piece.end && CLOSERS.includes(text[j] as string)) j++;
+    // Emphasis may open the next sentence: "30 days.**Want more?**".
+    let letter = j;
+    while (letter < piece.end && "*_~".includes(text[letter] as string)) letter++;
+    if (letter < piece.end && /\p{Lu}/u.test(text[letter] as string) && !inCode(i)) {
+      let from = i;
+      while (
+        from > piece.first &&
+        i - from < MAX_ABBREVIATION &&
+        !/\s/.test(text[from - 1] as string)
+      ) {
+        from--;
+      }
+      const word = text.slice(from, i + 1).toLowerCase();
+      if (
+        !ABBREVIATIONS.has(word) &&
+        !INITIALISM.test(word) &&
+        !dottedBefore(i) &&
+        !continuesName(text, letter, piece.end)
+      ) {
+        cuts.push({ left: j, right: j, glued: true, question: run.includes("?") });
+      }
+    }
+    i = j - 1;
+  }
+  if (cuts.length === 0) return [piece];
+
+  // Each cut is read once, and the markers with a pointer that only moves
+  // left, so a long piece of many lines costs its length.
+  const spans: Array<{ first: number; end: number }> = [];
+  const marks = piece.marks;
+  let m = marks.length;
+  let end = piece.end;
+  for (let k = cuts.length - 1; k >= 0; k--) {
+    const cut = cuts[k] as (typeof cuts)[number];
+    const from = k > 0 ? (cuts[k - 1] as (typeof cuts)[number]).right : piece.first;
+    while (m > 0 && (marks[m - 1] as Mark).at >= cut.left) m--;
+    const marked = m > 0 && (marks[m - 1] as Mark).at >= from;
+    const before = cut.glued ? "" : plainClaim(text.slice(from, cut.left));
+    const ends =
+      cut.glued || marked || !opensLowercase(text, cut.right, end) || statesFigure(before);
+    if (!ends) continue;
+    let first = cut.right;
+    while (first < end && /\s/.test(text[first] as string)) first++;
+    if (first < end) spans.push({ first, end });
+    end = trimEnd(text, piece.first, cut.left);
+    if (!(cut.glued ? cut.question : isQuestion(before))) break;
+  }
+  if (end > piece.first) spans.push({ first: piece.first, end });
+  spans.reverse();
+  const parts: Piece[] = [];
+  let next = 0;
+  for (const { first, end: to } of spans) {
+    while (next < marks.length && (marks[next] as Mark).at < first) next++;
+    const own: Mark[] = [];
+    while (next < marks.length && (marks[next] as Mark).at < to) own.push(marks[next++] as Mark);
+    parts.push({ first, end: to, marks: own, excluded: false });
+  }
+  return parts;
+}
+
 /** Does the piece say anything outside inline code and its markers? */
 function hasProse(
   text: string,
@@ -486,8 +676,9 @@ function hasProse(
 
 /**
  * Every declarative, non-question sentence of `text` that is a claim: one
- * that carries a citation marker, or states a number, or has at least
- * `minTokens` content words. Outside fenced code, never a heading, never a
+ * that carries a citation marker, or states a number (a numeral, or a number
+ * word other than "one": `statesFigure`), or has at least `minTokens`
+ * content words. Outside fenced code, never a heading, never a
  * definition line (`[n]: …`, an assumption's `[A1]: assume: …` included) or
  * a list item that is only one — except a definition-shaped line whose text
  * nothing else reads (see the module comment). Uncited claims are included
@@ -597,27 +788,32 @@ export function extractClaims(text: string, options: ExtractClaimsOptions = {}):
   }
 
   const claims: ExtractedClaim[] = [];
-  for (const piece of joined) {
-    if (piece.excluded) continue;
-    const raw = text.slice(piece.first, piece.end);
-    // A bullet "[1]: …" whose source is prose reads as ": …" once the id is
-    // out; the colon is not part of the claim.
-    const plain = plainClaim(raw).replace(/^:\s*/, "");
-    if (!HAS_WORD.test(plain) || isQuestion(plain)) continue;
-    const cited = piece.marks.length > 0;
-    const figured = extractNumbers(plain).length > 0;
-    // Nothing but inline code is a literal — unless it cites or states a
-    // figure, which is what makes any sentence a claim: "`max_retries = 30`
-    // [1]." asserts the 30 its source is cited for.
-    if (!cited && !figured && !hasProse(text, piece, raw, inCode)) continue;
-    if (!cited && !figured && contentWords(plain) < minTokens) continue;
-    claims.push({
-      index: claims.length,
-      text: plain,
-      raw,
-      line: lineAt(piece.first),
-      markers: [...new Set(piece.marks.map((m) => m.marker))],
-    });
+  for (const whole of joined) {
+    if (whole.excluded) continue;
+    // A question is left out by the sentence, not by the piece: the claim
+    // run into one ahead of it is still read (`questionParts`).
+    const asked = isQuestion(plainClaim(text.slice(whole.first, whole.end)));
+    for (const piece of asked ? questionParts(text, whole, inCode) : [whole]) {
+      const raw = text.slice(piece.first, piece.end);
+      // A bullet "[1]: …" whose source is prose reads as ": …" once the id
+      // is out; the colon is not part of the claim.
+      const plain = plainClaim(raw).replace(/^:\s*/, "");
+      if (!HAS_WORD.test(plain) || isQuestion(plain)) continue;
+      const cited = piece.marks.length > 0;
+      const figured = statesFigure(plain);
+      // Nothing but inline code is a literal — unless it cites or states a
+      // figure, which is what makes any sentence a claim: "`max_retries =
+      // 30` [1]." asserts the 30 its source is cited for.
+      if (!cited && !figured && !hasProse(text, piece, raw, inCode)) continue;
+      if (!cited && !figured && contentWords(plain) < minTokens) continue;
+      claims.push({
+        index: claims.length,
+        text: plain,
+        raw,
+        line: lineAt(piece.first),
+        markers: [...new Set(piece.marks.map((m) => m.marker))],
+      });
+    }
   }
   return claims;
 }

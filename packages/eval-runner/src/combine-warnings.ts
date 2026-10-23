@@ -37,3 +37,34 @@ export function warnUnconsumedCombinePolicy(compiled: ReadonlyArray<CompiledGrad
     });
   }
 }
+
+/**
+ * 0.8.0 §9.1 (review I32) — a `type: registry` entry naming a
+ * `provability.*` grader gates BESIDE the `combine:` policy as a
+ * requirement (`costPerProvenClaim`: reported only), so under `combine: any`
+ * / `weighted` it is not the vote the file reads as, and its `weight` is
+ * never consumed. Say so LOUDLY at start — the A4/A5 posture: validated
+ * config never silently means something other than it reads. `roles` is
+ * `registryProvabilityRoles`' map. Under the default `all` the verdict is the
+ * same either way (a requirement ANDs as the policy does), so nothing is said
+ * beyond `weight_ignored`.
+ */
+export function warnProvabilityOutsidePolicy(
+  compiled: ReadonlyArray<CompiledGrader>,
+  roles: ReadonlyMap<string, string>,
+): void {
+  const mode = compiled.find((g) => g.combine !== undefined)?.combine?.mode ?? "all";
+  if (mode === "all") return;
+  const outside = compiled.flatMap((g) => {
+    const role = g.registrySpec !== undefined ? roles.get(g.registrySpec.grader) : undefined;
+    return role === undefined
+      ? []
+      : [`${g.name} (${role}${g.weight !== 1 ? `, weight ${g.weight} unused` : ""})`];
+  });
+  if (outside.length === 0) return;
+  logger.warn("graders.provability_outside_policy", {
+    graders: outside.join(", "),
+    combine: mode,
+    hint: "provability.* graders gate beside `combine:` as requirements (costPerProvenClaim is reported only) — they never vote in the policy and their `weight` is not used, exactly as under --provability",
+  });
+}

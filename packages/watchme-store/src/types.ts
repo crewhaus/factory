@@ -54,12 +54,18 @@ export type WatchmeObservation = {
      * 0.8.0 (design/0.8.0-provability-release.md §9.3) — present when the
      * session was gated by `provability:`: the gate's own verdicts, exact
      * per turn, folded from its `provability_graded` lines. When at least one
-     * gated turn was VERIFIED (`turns > unverified`), `claims` / `grounded` /
+     * gated turn was VERIFIED at a floor of `grounded` or higher
+     * (`turns > unverified + citedFloor`), `claims` / `grounded` /
      * `faithfulness` above are the gate's claim / met counts over those turns
-     * rather than the heuristic roll-up. A session whose every gated turn
-     * stood unverified (the verifier threw — design §5.1, never a pass) keeps
-     * the heuristic roll-up, or none. Absent on ungated sessions and on
-     * digests written before 0.8.0 (additive).
+     * rather than the heuristic roll-up. Only there is a met claim a grounded
+     * one: at `cited` it is a well-formed reference (design §2: "a
+     * fabricated-but-well-formed reference passes this rung"), so a session
+     * gated only at `cited` keeps the heuristic roll-up, as does one whose
+     * every gated turn stood unverified (the verifier threw — design §5.1,
+     * never a pass), or none. When every counted claim is a declared
+     * assumption the pass is `vacuous` and carries no `faithfulness` —
+     * nothing was checked. Absent on ungated sessions and on digests written
+     * before 0.8.0 (additive).
      */
     readonly provability?: WatchmeProvability;
   };
@@ -96,6 +102,22 @@ export type WatchmeProvability = {
    * `failing` nor the claim counts. Present only when non-zero (additive).
    */
   readonly unverified?: number;
+  /**
+   * Of the verified turns, those graded at the `cited` floor. A met claim
+   * there is a well-formed reference, not a grounded one (design §2's
+   * `cited` row), so these turns never enter the factuality claim counts.
+   * Present only when non-zero (0.8.0 additive, review I33).
+   */
+  readonly citedFloor?: number;
+  /**
+   * Declared assumptions the gate accepted across the verified standing
+   * passes (claims outside the score), and those it refused (`assumptions:
+   * forbid`, or past `max_assumptions` — unmet claims that fail the turn).
+   * Design §2: assumptions are visible on every surface, never silently
+   * excused. Each present only when non-zero (0.8.0 additive, review I61).
+   */
+  readonly assumptions?: number;
+  readonly assumptionsRefused?: number;
 };
 
 /**

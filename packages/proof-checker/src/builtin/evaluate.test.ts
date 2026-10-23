@@ -93,7 +93,10 @@ describe("evaluation — quantifiers and domains", () => {
     expect(failure(() => ev("forall i in 1..10000: forall j in 1..10000: true", budget))).toMatch(
       /more than 1000000 quantifier cases/,
     );
-  });
+    // Slow by construction: crossing maxEnumerations takes a million cases
+    // whatever the domains are (0.1-0.4 s here, many times that on a loaded
+    // CI runner), too close to bun's default of 5 s. Never shrink the domains.
+  }, 20_000);
 
   test("the deadline and the abort signal stop a long evaluation", () => {
     expect(

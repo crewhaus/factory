@@ -19,14 +19,24 @@
  * respelling read below full coverage is the figure rule's (`figureKey`):
  * a figure is compared as the value the number layer reads, so a claim's
  * "thirty" or "$1,284.50" is the source's "30" or "1284.5" — and is never
- * among the words a partial bar lets go.
+ * among the words a partial bar lets go. The tokenizer keeps neither a
+ * minus sign nor a magnitude glued after a numeral, so the rule reads both
+ * off the characters around the token (`figureKeyAt`): "500" is not "-500",
+ * and the "M" of "$5M" is a figure, "million".
  *
  * This tokenizer is not `contentTokens` (`tokens.ts`): it keeps short words,
  * numbers with their separators and percent signs, and every negation,
  * because the question here is "does the source say these words", not "is
  * this about the same thing".
  */
-import { figureWord, normalizeNumber } from "./numbers";
+import {
+  type CompoundValue,
+  compoundValues,
+  figureWord,
+  magnitudeSuffix,
+  normalizeNumber,
+  signedAt,
+} from "./numbers";
 
 export type SourceToken = {
   /** Compared against. */
@@ -776,16 +786,36 @@ export type ClaimQuery = {
   readonly mode: "quote" | "paraphrase";
   /** `claimFigures(text)`: which words of `need` state a figure. */
   readonly figures: ReadonlyArray<string>;
+  /** `claimFigureKeys(text)`: what each of them is compared as under the
+   *  figure rule, its sign and a glued magnitude read. */
+  readonly figureKeys: ReadonlyMap<string, ReadonlyArray<string>>;
+  /** `quotes` as the figure rule locates them: a numeral the quotation signs
+   *  is `-` and its digits (`signedRun`), so a quoted "500" is no source's
+   *  "-500". Each different run once, in the order first quoted. */
+  readonly signedQuotes: ReadonlyArray<ReadonlyArray<string>>;
+  /** The dates and times of day the claim states whole (`compoundValues`),
+   *  by key, each once: what the figure rule requires besides their parts. */
+  readonly compounds: ReadonlyArray<string>;
 };
 
 export function claimQuery(text: string): ClaimQuery {
   const quotes: string[][] = [];
+  const signedQuotes: string[][] = [];
   const keys = new Set<string>();
-  for (const run of quotedRuns(text, QUOTE_MIN_TOKENS)) {
-    const key = JSON.stringify(run);
-    if (keys.has(key)) continue;
-    keys.add(key);
-    quotes.push(run);
+  const signedKeys = new Set<string>();
+  for (const { text: quoted, words } of quotations(text)) {
+    if (words.length < QUOTE_MIN_TOKENS) continue;
+    const key = JSON.stringify(words);
+    if (!keys.has(key)) {
+      keys.add(key);
+      quotes.push(words);
+    }
+    const signed = signedRun(quoted);
+    const signedKey = JSON.stringify(signed);
+    if (!signedKeys.has(signedKey)) {
+      signedKeys.add(signedKey);
+      signedQuotes.push(signed);
+    }
   }
   return {
     text,
@@ -793,6 +823,9 @@ export function claimQuery(text: string): ClaimQuery {
     quotes,
     mode: quotes.length > 0 ? "quote" : "paraphrase",
     figures: claimFigures(text),
+    figureKeys: claimFigureKeys(text),
+    signedQuotes,
+    compounds: [...new Set(compoundValues(foldTypography(text)).map(({ key }) => key))],
   };
 }
 
@@ -912,9 +945,11 @@ export function locateQuotes(
  * because 4.5% and 4.5 are different figures. A numeral the number layer
  * will not read (`1,5`, `1.2.3`) is compared as written. A cardinal word is
  * its value (`thirty` is `30`); an ordinal and `half` are compared as
- * spelled (`figureWord`).
+ * spelled (`figureWord`). A signed numeral, as the figure rule reports one
+ * missing (`-500`, `−3%`), is its key with the sign.
  */
 export function figureKey(word: string): string | null {
+  if (/^[-−]\d/.test(word)) return negative(figureKey(word.slice(1)) as string);
   if (/^\d/.test(word)) {
     const percent = word.endsWith("%");
     const value = normalizeNumber(percent ? word.slice(0, -1) : word);
@@ -924,33 +959,112 @@ export function figureKey(word: string): string | null {
   return figureWord(word)?.key ?? null;
 }
 
+/** A figure's key with a minus sign: `-500`, `-3%`. Zero has no sign. */
+function negative(key: string): string {
+  return key === "0" || key === "0%" ? key : `-${key}`;
+}
+
 const isFigure = (word: string): boolean => figureKey(word) !== null;
 
 /**
- * The words of a claim that state a figure, as `claimWords` spells them,
- * distinct, in first-seen order.
+ * What token `i` of `tokens` (cut from `text`) is compared as under the
+ * figure rule, or null when it states no figure: `figureKey`, with what the
+ * tokenizer leaves out of a token read off the characters around it (design
+ * §6.2, acceptance A: a wrong figure never grounds).
+ *
+ * - A numeral's sign, by the number layer's own rule (`signedAt`): a `-` or
+ *   `−` before it, optionally across a currency symbol, that cannot end a
+ *   word. "-500", "−500" and "-$500" are -500, so a claim of 500 is not
+ *   grounded in a source that says -500, nor the other way round — the
+ *   `checked` rung's value layer already reads them so. "2024-01-15",
+ *   "10-20" and "COVID-19" sign nothing. Accounting parentheses, "(500)",
+ *   are not a sign: the number layer does not read them as one either.
+ * - A magnitude glued to a numeral (`magnitudeSuffix`): in "$5M", "$1.2bn"
+ *   and "30k" the letters are a figure, the value "million", "billion" or
+ *   "thousand" names, so "$5M" is the source's "$5 million" and not its
+ *   "$5B" — where an "m" the bar may let go grounded it. "Plan B" glues no
+ *   numeral and is a word.
+ */
+function figureKeyAt(text: string, tokens: ReadonlyArray<SourceToken>, i: number): string | null {
+  const token = tokens[i] as SourceToken;
+  if (/^\d/.test(token.norm)) {
+    const key = figureKey(token.norm) as string;
+    return signedAt(text, token.at) ? negative(key) : key;
+  }
+  const before = tokens[i - 1];
+  if (
+    before !== undefined &&
+    /^\d/.test(before.norm) &&
+    before.at + before.raw.length === token.at
+  ) {
+    const magnitude = magnitudeSuffix(token.norm);
+    if (magnitude !== null) return magnitude;
+  }
+  return figureWord(token.norm)?.key ?? null;
+}
+
+/**
+ * Each token of a claim that states a figure, as `claimWords` spells it,
+ * with what it is compared as (`figureKeyAt`), in order.
  *
  * One reading is left out: an ordinal that opens the claim and is followed
  * by a comma. "First, the refund window is 14 days" counts the points of an
  * answer; it states no rank, and a source that never says "first" has not
  * left out a figure. "Acme ranked first" keeps it.
  */
-export function claimFigures(text: string): string[] {
+function figureTokens(text: string): Array<{ readonly word: string; readonly key: string }> {
   const folded = foldTypography(text);
-  const out: string[] = [];
-  const seen = new Set<string>();
-  let opening = true;
-  for (const token of tokenize(folded)) {
-    const first = opening;
-    opening = false;
-    if (seen.has(token.norm)) continue;
-    const figure = figureWord(token.norm);
-    if (!/^\d/.test(token.norm) && figure === null) continue;
-    if (first && figure?.ordinal === true && folded[token.at + token.raw.length] === ",") continue;
-    seen.add(token.norm);
-    out.push(token.norm);
+  const tokens = tokenize(folded);
+  const out: Array<{ readonly word: string; readonly key: string }> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i] as SourceToken;
+    const key = figureKeyAt(folded, tokens, i);
+    if (key === null) continue;
+    const ordinal = figureWord(token.norm)?.ordinal === true;
+    if (i === 0 && ordinal && folded[token.at + token.raw.length] === ",") continue;
+    out.push({ word: token.norm, key });
   }
   return out;
+}
+
+/**
+ * The words of a claim that state a figure, as `claimWords` spells them,
+ * distinct, in first-seen order: numerals, number words, ordinals, and a
+ * magnitude glued to a numeral (the `m` of "$5M"). A list-counting "First,"
+ * is left out (`figureTokens`).
+ */
+export function claimFigures(text: string): string[] {
+  return [...new Set(figureTokens(text).map(({ word }) => word))];
+}
+
+/**
+ * What each figure word of a claim is compared as under the figure rule
+ * (`figureKeyAt`): `claimFigures` with the keys each was written as, in
+ * first-seen order. "-500" is `500` → `["-500"]`, the `m` of "$5M" is
+ * `m` → `["1000000"]`, and a word written both ways ("from -5 to 5") is
+ * both keys. `need` drops the sign with the tokenizer, so the claim's text
+ * is where it is read.
+ */
+export function claimFigureKeys(text: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const { word, key } of figureTokens(text)) {
+    const keys = out.get(word);
+    if (keys === undefined) out.set(word, [key]);
+    else if (!keys.includes(key)) keys.push(key);
+  }
+  return out;
+}
+
+/**
+ * A quotation's words as the figure rule locates them: a numeral signed
+ * inside the quotation (`signedAt`) is `-` and its digits, every other word
+ * as `tokenize` gives it. Compared against `signedView`, so the verbatim
+ * check holds for signs too, and a spelled "thirty" is still not a "30".
+ */
+function signedRun(quoted: string): string[] {
+  return tokenize(quoted).map((token) =>
+    /^\d/.test(token.norm) && signedAt(quoted, token.at) ? `-${token.norm}` : token.norm,
+  );
 }
 
 /**
@@ -965,14 +1079,36 @@ function figureView(index: SourceIndex): SourceIndex {
   let view = FIGURE_VIEWS.get(index);
   if (view === undefined) {
     let changed = false;
-    const tokens = index.tokens.map((token) => {
-      const key = figureKey(token.norm);
+    const tokens = index.tokens.map((token, i) => {
+      const key = figureKeyAt(index.text, index.tokens, i);
       if (key === null || key === token.norm) return token;
       changed = true;
       return { ...token, norm: key };
     });
     view = changed ? { ...index, tokens } : index;
     FIGURE_VIEWS.set(index, view);
+  }
+  return view;
+}
+
+/**
+ * A source's tokens with each signed numeral written with its sign, every
+ * other token as spelled: the view a quotation is located in under the
+ * figure rule (`signedRun`). Made once per index, offsets shared.
+ */
+const SIGNED_VIEWS = new WeakMap<SourceIndex, SourceIndex>();
+
+function signedView(index: SourceIndex): SourceIndex {
+  let view = SIGNED_VIEWS.get(index);
+  if (view === undefined) {
+    let changed = false;
+    const tokens = index.tokens.map((token) => {
+      if (!/^\d/.test(token.norm) || !signedAt(index.text, token.at)) return token;
+      changed = true;
+      return { ...token, norm: `-${token.norm}` };
+    });
+    view = changed ? { ...index, tokens } : index;
+    SIGNED_VIEWS.set(index, view);
   }
   return view;
 }
@@ -1016,6 +1152,17 @@ export type LocateWordsOptions = {
    *  Default: every word of `need` spelled as one. Read only under the
    *  figure rule. */
   readonly figures?: ReadonlyArray<string>;
+  /** What each figure word of `need` is compared as, for a caller that has
+   *  read the claim's text (`claimFigureKeys`): `need` keeps no sign, so a
+   *  claim's "-500" is only "500" there. Default: `figureKey(word)` (or the
+   *  value of a magnitude suffix listed in `figures`). Read only under the
+   *  figure rule. */
+  readonly figureKeys?: ReadonlyMap<string, ReadonlyArray<string>>;
+  /** Dates and times of day the claim states whole (`compoundValues` keys,
+   *  from `claimQuery`). Under the figure rule each must start inside the
+   *  span that carries the claim's words, whole, not only as its parts:
+   *  "opens at 10:30" is not the "10" of "10:00" and the "30" of "18:30". */
+  readonly compounds?: ReadonlyArray<string>;
 };
 
 type Resolved = {
@@ -1096,7 +1243,14 @@ export function locateWords(
 ): Location {
   const o = resolve(options);
   if (o.strict) {
-    return locateFigures(index, need, new Set(options.figures ?? need.filter(isFigure)), o);
+    return locateFigures(
+      index,
+      need,
+      new Set(options.figures ?? need.filter(isFigure)),
+      options.figureKeys,
+      options.compounds ?? [],
+      o,
+    );
   }
   const span = bestSpan(index, need, o.windowTokens);
   // A claim with no words of its own cannot be located, and an empty set of
@@ -1219,27 +1373,77 @@ function openingNegation(
   return opener;
 }
 
+/** What a figure word of a claim is compared as when no reading of its text says. */
+function keysOf(word: string): string[] {
+  return [figureKey(word) ?? magnitudeSuffix(word) ?? word];
+}
+
+/** A figure key in the claim's own spelling: its word, signed when the key is. */
+function spellingOf(word: string, key: string): string {
+  return key.startsWith("-") && !word.startsWith("-") ? `-${word}` : word;
+}
+
+/** A source's dates and times of day (`compoundValues`), read once per index. */
+const COMPOUNDS = new WeakMap<SourceIndex, ReadonlyArray<CompoundValue>>();
+
+/**
+ * Which of `wanted` (compound keys) no date or time of `index` that starts
+ * between offsets `from` and `to` states. A compound's parts are figures the
+ * span already carries; this asks that they are written together, in the
+ * claim's order — a day and a month swapped, or a time made of two others'
+ * pieces, is not the value the claim states (design §6.3, §0-B).
+ */
+function wholeMissing(
+  index: SourceIndex,
+  wanted: ReadonlyArray<string>,
+  from: number,
+  to: number,
+): string[] {
+  if (wanted.length === 0) return [];
+  let found = COMPOUNDS.get(index);
+  if (found === undefined) {
+    found = compoundValues(index.text);
+    COMPOUNDS.set(index, found);
+  }
+  const stated = new Set(
+    found.filter((one) => one.at >= from && one.at < to).map((one) => one.key),
+  );
+  return wanted.filter((key) => !stated.has(key));
+}
+
+/** The character range of tokens `first` to `last`, or an empty one when nothing matched. */
+function charRange(index: SourceIndex, first: number, last: number): [number, number] {
+  if (first < 0 || last < first) return [0, 0];
+  const end = index.tokens[last] as SourceToken;
+  return [(index.tokens[first] as SourceToken).at, end.at + end.raw.length];
+}
+
 /** `locateWords` under the figure rule. */
 function locateFigures(
   index: SourceIndex,
   need: ReadonlyArray<string>,
   figures: ReadonlySet<string>,
+  read: ReadonlyMap<string, ReadonlyArray<string>> | undefined,
+  compounds: ReadonlyArray<string>,
   o: Resolved,
 ): Location {
   // The claim's words as they are compared: a figure by its key, so two
   // spellings of one value in a claim are one word, and each key reported
-  // back in the claim's own spelling.
+  // back in the claim's own spelling. A figure written both signed and not
+  // ("from -5 to 5") is both keys.
   const keys: string[] = [];
   const spelled = new Map<string, string>();
   const figureKeys = new Set<string>();
   const negations = new Set<string>();
   for (const word of need) {
-    const key = figures.has(word) ? (figureKey(word) ?? word) : word;
-    if (figures.has(word)) figureKeys.add(key);
-    if (NEGATIONS.has(word)) negations.add(key);
-    if (spelled.has(key)) continue;
-    spelled.set(key, word);
-    keys.push(key);
+    const figure = figures.has(word);
+    for (const key of figure ? (read?.get(word) ?? keysOf(word)) : [word]) {
+      if (figure) figureKeys.add(key);
+      if (NEGATIONS.has(word)) negations.add(key);
+      if (spelled.has(key)) continue;
+      spelled.set(key, spellingOf(word, key));
+      keys.push(key);
+    }
   }
   const view = figureView(index);
   // The best window by count is otherwise free to be the one paragraph that
@@ -1265,6 +1469,21 @@ function locateFigures(
   // paraphrase the judge may waive.
   if (span.missing.some((key) => figureKeys.has(key))) {
     return { status: "notFound", cause: "value", ...base, missing, ...where };
+  }
+  // Every part of a date or a time is there; is the value itself?
+  const lostWhole = wholeMissing(
+    view,
+    compounds,
+    ...charRange(view, span.firstToken, span.lastToken),
+  );
+  if (lostWhole.length > 0) {
+    return {
+      status: "notFound",
+      cause: "value",
+      ...base,
+      missing: [...missing, ...lostWhole],
+      ...where,
+    };
   }
   const lostNegations = span.missing.filter((key) => negations.has(key)).map(as);
   if (lostNegations.length > 0) {
@@ -1353,6 +1572,7 @@ function framingOf(text: string): string {
 function framedQuote(
   index: SourceIndex,
   query: ClaimQuery,
+  runs: ReadonlyArray<ReadonlyArray<string>>,
   hits: ReadonlyArray<number>,
   quoted: Location,
   o: Resolved,
@@ -1360,19 +1580,26 @@ function framedQuote(
   const framing = framingOf(query.text);
   const want = new Map<string, string>();
   const figureKeys = new Set<string>();
-  for (const word of claimFigures(framing)) {
-    const key = figureKey(word) ?? word;
-    figureKeys.add(key);
-    if (!want.has(key)) want.set(key, word);
+  for (const [word, keys] of claimFigureKeys(framing)) {
+    for (const key of keys) {
+      figureKeys.add(key);
+      if (!want.has(key)) want.set(key, spellingOf(word, key));
+    }
   }
   for (const word of claimWords(framing)) {
     if (NEGATIONS.has(word) && !want.has(word)) want.set(word, word);
+  }
+  // A date or a time the framing states is a figure of it, whole.
+  const wholes = [...new Set(compoundValues(framing).map(({ key }) => key))];
+  for (const key of wholes) {
+    figureKeys.add(key);
+    if (!want.has(key)) want.set(key, key);
   }
   if (want.size === 0) return quoted;
 
   let first = Number.POSITIVE_INFINITY;
   let last = -1;
-  query.quotes.forEach((run, position) => {
+  runs.forEach((run, position) => {
     const at = hits[position];
     if (at === undefined || at < 0) return;
     first = Math.min(first, at);
@@ -1387,10 +1614,12 @@ function framedQuote(
     const norm = (view.tokens[i] as SourceToken).norm;
     if (want.has(norm)) present.add(norm);
   }
+  const lostWhole = new Set(wholeMissing(view, wholes, ...charRange(view, from, to)));
+  for (const key of wholes) if (!lostWhole.has(key)) present.add(key);
   const lost = [...want.keys()].filter((key) => !present.has(key));
   if (lost.length === 0) return quoted;
 
-  const quotedWords = query.quotes.reduce((n, run) => n + run.length, 0);
+  const quotedWords = runs.reduce((n, run) => n + run.length, 0);
   const total = quotedWords + want.size;
   const matched = total - lost.length;
   const base = {
@@ -1419,7 +1648,9 @@ export type LocateOptions = LocateWordsOptions;
  * Locate one claim in one source: by its quoted spans when it quotes
  * (strictest — each must appear verbatim, and `coverage` does not apply),
  * otherwise by its words at `coverage`. Under the figure rule a quotation's
- * framing figures and negations are checked as well (`strictFigures`).
+ * framing figures and negations are checked as well (`strictFigures`), and
+ * its numerals keep their signs: "the balance is 500 dollars" in quotation
+ * marks is not verbatim in a source that says -500 (`signedRun`).
  *
  * Index a source once with `indexSource` and pass the index when many claims
  * are located in it; a string is indexed per call. The provability gate
@@ -1435,20 +1666,27 @@ export function locateClaim(
   const index = typeof source === "string" ? indexSource(source) : source;
   const o = resolve(options);
   if (query.quotes.length > 0) {
+    const runs = o.strict ? query.signedQuotes : query.quotes;
+    const view = o.strict ? signedView(index) : index;
     const hits: number[] = [];
     const quoted = locateQuotes(
-      index,
-      query.quotes,
+      view,
+      runs,
       (run, position) => {
-        const hit = locateQuote(index, run, o.maxExcerptChars);
+        const hit = locateQuote(view, run, o.maxExcerptChars);
         hits[position] = hit.at;
         return hit;
       },
       o.maxExcerptChars,
     );
     return o.strict && quoted.status === "supported"
-      ? framedQuote(index, query, hits, quoted, o)
+      ? framedQuote(index, query, runs, hits, quoted, o)
       : quoted;
   }
-  return locateWords(index, query.need, { ...options, figures: query.figures });
+  return locateWords(index, query.need, {
+    ...options,
+    figures: query.figures,
+    figureKeys: query.figureKeys,
+    compounds: query.compounds,
+  });
 }

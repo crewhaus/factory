@@ -19,6 +19,7 @@ import {
   PROVABILITY_METRIC_SPECS,
   UNPRICED_COST_PREFIX,
   assumptionRate,
+  provabilityGraderRole,
   registerProvabilityGraders,
   renderProvabilitySummaryLines,
   summarizeCostPerProvenClaim,
@@ -223,5 +224,26 @@ describe("registerProvabilityGraders", () => {
     );
     const result = await registry.lookup("provability.claimCoverage")(sample(), runWith(bundle));
     expect(result).toMatchObject({ passed: true, score: 1 });
+  });
+});
+
+describe("provabilityGraderRole — one answer for the flag and a registry entry (design §9.1)", () => {
+  test("the five with a bar are requirements; the cost is a report", () => {
+    expect(
+      Object.fromEntries(PROVABILITY_GRADER_NAMES.map((n) => [n, provabilityGraderRole(n)])),
+    ).toEqual({
+      "provability.claimCoverage": "requirement",
+      "provability.rungAchieved": "requirement",
+      "provability.citationValidity": "requirement",
+      "provability.assumptionRate": "requirement",
+      "provability.replayIntegrity": "requirement",
+      "provability.costPerProvenClaim": "report",
+    });
+  });
+
+  test("any other name has no role — not even one in the namespace", () => {
+    expect(provabilityGraderRole("continuity.costPerProvenOutcome")).toBeUndefined();
+    expect(provabilityGraderRole("provability.myOwnMetric")).toBeUndefined();
+    expect(provabilityGraderRole("claimCoverage")).toBeUndefined();
   });
 });

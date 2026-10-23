@@ -44,6 +44,13 @@ export type GateEvidenceInput<M extends EvidenceMessage = EvidenceMessage> = {
   readonly sessionRootDir?: string;
   /** Workspace root path-shaped inputs are measured from. */
   readonly workspaceRoot: string;
+  /**
+   * Where the runtime spilled results too long for the log — the active
+   * tenant's `toolResultRoot` inside a tenant scope; absent ⇒
+   * `<workspace>/.crewhaus/tool-results` — so a spilled page is graded whole,
+   * not on its preview.
+   */
+  readonly toolResultsRoot?: string;
   /** The transcript as of turn completion (the gate); absent for a preflight. */
   readonly messages?: ReadonlyArray<M>;
   /** The runtime's synthetic-message test (`EvaluationTurn.isSynthetic`). */
@@ -101,6 +108,7 @@ export async function gateEvidence<M extends EvidenceMessage>(
       scope: input.scope,
       sessionId: input.sessionId,
       workspaceRoot: input.workspaceRoot,
+      ...(input.toolResultsRoot !== undefined ? { toolResultsRoot: input.toolResultsRoot } : {}),
       ...(input.sessionRootDir !== undefined ? { rootDir: input.sessionRootDir } : {}),
       ...(input.onUnreadable !== undefined ? { onUnreadable: input.onUnreadable } : {}),
     });
@@ -111,7 +119,12 @@ export async function gateEvidence<M extends EvidenceMessage>(
       input.scope === "turn"
         ? currentTurnMessages(input.messages, input.isSynthetic)
         : input.messages;
-    records.push(...evidenceFromMessages(scoped, { workspaceRoot: input.workspaceRoot }));
+    records.push(
+      ...evidenceFromMessages(scoped, {
+        workspaceRoot: input.workspaceRoot,
+        ...(input.toolResultsRoot !== undefined ? { toolResultsRoot: input.toolResultsRoot } : {}),
+      }),
+    );
   }
   return buildEvidenceIndex(records);
 }

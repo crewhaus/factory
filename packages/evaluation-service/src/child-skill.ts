@@ -9,50 +9,33 @@
  * spawner puts it in the child's instructions after its own framing
  * (`@crewhaus/sub-agent-spawner`'s `childProvabilityGuidance`).
  *
- * The text is `@crewhaus/default-skills`' `provability` skill, rendered once
- * at wiring time from the lowered block with the compile-time substitutions
- * its body asks for — the parent's own (`./skills`'
- * `provabilitySkillSubstitutions`: the floor, the checkers, the gate's
- * settings; the `learning-loop` precedent). Undefined — and the children get the spawner's framing alone —
- * when this build ships no such skill, or when its body asks for a
- * substitution this cannot fill (warned: a wiring gap, not a reason to fail a
- * run).
+ * The text is the skill the parent itself advertises — `./skills`'
+ * `provabilitySkills`, the ONE renderer of `@crewhaus/default-skills`'
+ * `provability` skill (the floor, the checkers, the gate's settings; the
+ * `learning-loop` precedent) — so a parent and its children never read two
+ * renderings of one block. It is written to the gated model, so the spawner
+ * shows a child only the parts true for it: the sections after the skill's
+ * opening (what happens to a failing answer is the parent's alone), and a
+ * list item naming a provability tool only when the child's own tool set has
+ * it. The layout that rests on — the opening before the first `## ` section,
+ * each tool named in a list item — is pinned by this module's test.
+ *
+ * Undefined — and the children get the spawner's framing alone — when this
+ * build ships no such skill, or when its body asks for a substitution the
+ * block cannot fill (warned by the renderer: a wiring gap, not a reason to
+ * fail a run).
  */
-import { DEFAULT_SKILLS, renderSkill } from "@crewhaus/default-skills";
 import type { IrProvability } from "@crewhaus/ir";
-import { createLogger } from "@crewhaus/logging";
-import { substitutionsFor } from "./skills";
-
-const logger = createLogger({ bindings: { module: "evaluation-service" } });
-
-const SKILL_NAME = "provability";
+import { type ProvabilitySkillSource, provabilitySkills } from "./skills";
 
 /** Where the skill comes from (default: the shipped default skills); a seam for tests. */
-export type ChildSkillSource = {
-  readonly skills: ReadonlyArray<{ readonly name: string; readonly body: string }>;
-  readonly render: (name: string, substitutions: Record<string, string>) => string;
-};
-
-const DEFAULT_SOURCE: ChildSkillSource = { skills: DEFAULT_SKILLS, render: renderSkill };
+export type ChildSkillSource = ProvabilitySkillSource;
 
 /** The rendered `provability` skill for `config`, or undefined (see the module doc). */
 export function provabilitySkillText(
   config: IrProvability,
-  source: ChildSkillSource = DEFAULT_SOURCE,
+  source?: ChildSkillSource,
 ): string | undefined {
-  const skill = source.skills.find((s) => s.name === SKILL_NAME);
-  if (skill === undefined) return undefined;
-  try {
-    // Only the names the body uses: the renderer refuses a key the body lacks.
-    // Computed inside the try: a block missing a field (a bundle compiled
-    // against another shape) costs the skill, never the boot.
-    const substitutions = substitutionsFor(config, skill.body);
-    const text = source.render(SKILL_NAME, substitutions).trim();
-    return text === "" ? undefined : text;
-  } catch (err) {
-    logger.warn("provability: the provability skill could not be rendered for sub-agents", {
-      message: err instanceof Error ? err.message : String(err),
-    });
-    return undefined;
-  }
+  const text = provabilitySkills(config, source)[0]?.body.trim() ?? "";
+  return text === "" ? undefined : text;
 }

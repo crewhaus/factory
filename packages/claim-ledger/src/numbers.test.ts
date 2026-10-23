@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { locateClaim } from "./locate";
 import { containsValue, extractNumbers, figureWord, normalizeNumber } from "./numbers";
 import { containsQuote, quotedSpans } from "./quotes";
 
@@ -30,7 +31,8 @@ describe("extractNumbers", () => {
   test("negatives where a word cannot end, and not otherwise", () => {
     expect(extractNumbers("-3 and (−7) and -$4.20 and $-5")).toEqual(["-3", "-7", "-4.2", "-5"]);
     expect(extractNumbers("COVID-19")).toEqual(["19"]);
-    expect(extractNumbers("2024-01-15")).toEqual(["2024", "1", "15"]);
+    // A date's parts, then the date whole; none of them negative.
+    expect(extractNumbers("2024-01-15")).toEqual(["2024", "1", "15", "2024-01-15"]);
     expect(extractNumbers("-0 and -0.00")).toEqual(["0"]);
   });
 
@@ -69,6 +71,92 @@ describe("extractNumbers", () => {
   test("text without numbers yields none", () => {
     expect(extractNumbers("twelve apples")).toEqual([]);
   });
+});
+
+describe("extractNumbers — dates and times are values whole (design §6.3)", () => {
+  test("an ISO date and a time of day are read whole, besides their parts", () => {
+    expect(extractNumbers("due on 2025-03-04")).toEqual(["2025", "3", "4", "2025-03-04"]);
+    expect(extractNumbers("starts at 10:30")).toEqual(["10", "30", "10:30"]);
+    // An hour's leading zero and zero seconds are spelling, not value.
+    expect(extractNumbers("at 09:05:00")).toEqual(["9", "5", "0", "9:05"]);
+    expect(normalizeNumber("09:05")).toBe("9:05");
+    expect(normalizeNumber(" 2025-04-03 ")).toBe("2025-04-03");
+    // The day glued to an ISO datetime's T is still stated, by the date.
+    expect(extractNumbers("2025-04-03T10:30:00.000Z")).toEqual([
+      "2025",
+      "4",
+      "30",
+      "0",
+      "3",
+      "2025-04-03",
+      "10",
+      "10:30",
+    ]);
+  });
+
+  test("a swapped date or a time put together from two others is not contained", () => {
+    const due = new Set(extractNumbers('{"renewal_due":"2025-04-03"}'));
+    expect(containsValue(due, "2025-03-04")).toBe(false);
+    expect(containsValue(due, "2025-04-03")).toBe(true);
+    // Every part is there; the value is not.
+    for (const value of extractNumbers("due on 2025-03-04")) {
+      expect(containsValue(due, value)).toBe(value !== "2025-03-04");
+    }
+    expect(containsValue('{"start":"10:00","end":"11:30"}', "10:30")).toBe(false);
+    expect(containsValue('{"start":"10:30:00"}', "10:30")).toBe(true);
+    // A date written as prose states its parts only, and they are found.
+    expect(extractNumbers("April 3, 2025").every((v) => containsValue(due, v))).toBe(true);
+    expect(containsValue("2025-04-03T10:30:00Z", "3")).toBe(true);
+  });
+
+  test("only the shapes that need no guess: no slash date, ratio, range or impossible date", () => {
+    for (const text of [
+      "05/03/2024",
+      "a 3:1 ratio",
+      "10-20 days",
+      "2025-13-40",
+      "25:61",
+      "v2024-01-15",
+    ]) {
+      expect(extractNumbers(text).some((v) => /[-:]\d/.test(v.slice(1)))).toBe(false);
+    }
+  });
+});
+
+describe("extractNumbers — linear in the text", () => {
+  // A fetched page and a tool result reach the number layer on every gated
+  // turn (design §10). The least of three runs, each timed against a text of
+  // the same size whose numeral has no zeros, so a slow machine slows both.
+  const fastest = (run: () => unknown): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      run();
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
+  };
+  const n = 200_000;
+  const zeros = `Ref 1${"0".repeat(n)}7 is on file.`;
+  const plain = `Ref 1${"2".repeat(n)}7 is on file.`;
+
+  test("a run of zeros inside a numeral is read once", () => {
+    // Trimming the trailing zeros with /0+$/ retried from every zero of the
+    // run: "1" + 80,000 zeros + "1" took seconds, 200,000 would take minutes.
+    expect(extractNumbers(zeros)).toEqual([`1.${"0".repeat(n)}7e${n + 1}`]);
+    const base = fastest(() => extractNumbers(plain));
+    expect(fastest(() => extractNumbers(zeros))).toBeLessThan(base * 20 + 100);
+    expect(fastest(() => containsValue(zeros, "7"))).toBeLessThan(base * 20 + 100);
+  }, 20_000);
+
+  test("…and so is the figure rule, which keys every numeral of a source", () => {
+    const claim = "The ref is on file.";
+    const base = fastest(() => locateClaim(claim, plain, { coverage: 0.8 }));
+    expect(locateClaim(claim, zeros, { coverage: 0.8 }).status).toBe("supported");
+    expect(fastest(() => locateClaim(claim, zeros, { coverage: 0.8 }))).toBeLessThan(
+      base * 20 + 100,
+    );
+  }, 20_000);
 });
 
 describe("normalizeNumber", () => {

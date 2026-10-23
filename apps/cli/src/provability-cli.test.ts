@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -40,6 +41,7 @@ import {
   newProofId,
   proofsRoot,
   recordFromCall,
+  renderMarkdownSection,
   sha256Of,
   verifyDocument,
 } from "@crewhaus/provability";
@@ -64,6 +66,7 @@ import {
   provabilityDoctorChecks,
   renderAudit,
   renderBundleLong,
+  reportTrailerAt,
   runProvabilityCommand,
   ttySafe,
 } from "./provability-cli";
@@ -323,6 +326,70 @@ describe("provability show", () => {
     await expect(run(cwd, ["show", "--session", SESS_A, "--turn", "9"])).rejects.toThrow(
       new RegExp(`no proof bundle for session ${SESS_A}, turn 9`),
     );
+  });
+
+  test("a retried turn keeps every pass: show reads the last, --pass the one named (the Hangar twin)", async () => {
+    const cwd = tempDir();
+    const failed = { ...(await gradedBundle(BAD_ANSWER, POLICY)), retryIndex: 0 };
+    const fixed = { ...(await gradedBundle(GOOD_ANSWER, POLICY)), retryIndex: 1 };
+    const first = await persist(cwd, "support", SESS_A, 1, failed);
+    const second = await persist(cwd, "support", SESS_A, 1, fixed);
+    expect(first).toEndWith("turn-1.json");
+    expect(second).toEndWith("turn-1.2.json");
+    const standing = await run(cwd, ["show", "--session", SESS_A, "--turn", "1", "--json"]);
+    expect(JSON.parse(standing.out)).toEqual(fixed);
+    const earlier = await run(cwd, [
+      "show",
+      "--session",
+      SESS_A,
+      "--turn",
+      "1",
+      "--pass",
+      "1",
+      "--json",
+    ]);
+    expect(earlier.out).toBe(readFileSync(first, "utf8"));
+    const long = await run(cwd, ["show", "--session", SESS_A, "--turn", "1", "--pass", "2"]);
+    expect(long.out).toContain(`session     ${SESS_A} · turn 1 · pass 2`);
+    await expect(
+      run(cwd, ["show", "--session", SESS_A, "--turn", "1", "--pass", "3"]),
+    ).rejects.toThrow(new RegExp(`no proof bundle for session ${SESS_A}, turn 1, pass 3`));
+    await expect(run(cwd, ["show", "--pass", "2"])).rejects.toThrow(/give --turn too/);
+    await expect(run(cwd, ["show", "--turn", "1", "--pass", "0"])).rejects.toThrow(
+      /invalid --pass "0"/,
+    );
+  });
+
+  test("a proof's hypotheses are counted as assumptions, as the footer counts them", async () => {
+    const cwd = tempDir();
+    const proof = "prf_0123456789abcdef";
+    await persist(
+      cwd,
+      "support",
+      SESS_A,
+      1,
+      handBundle({
+        level: "proven",
+        achieved: "proven",
+        claims: [],
+        assumptions: 1,
+        hypotheses: 2,
+        checkers: [
+          {
+            id: "builtin",
+            artifact: proof,
+            axioms: [],
+            assumptions: ["meeting 6 is cancelled", "rooms are booked by the hour"],
+          },
+        ],
+      }),
+    );
+    const r = await run(cwd, ["show", "--session", SESS_A]);
+    expect(r.out).toContain("assumptions 3 (2 proof hypotheses)");
+    expect(r.out).toContain(
+      `builtin — ${proof} · axioms: none · assumes: meeting 6 is cancelled; rooms are booked by the hour`,
+    );
+    expect(r.out).toContain("· 3 assumptions");
   });
 
   test("--json prints the bundle exactly as persisted (the Hangar route's twin)", async () => {
@@ -998,6 +1065,49 @@ describe("provability check — workspace files cited by path are read directly"
     }
   });
 
+  test("a copy under a header is caught however its origin is named: a sidecar, a bare URL: line, extra BOMs", async () => {
+    // The W3-D residual: with a <file>.url sidecar a bare `URL:` first line is
+    // page, so the body compared was the whole file — header line and all —
+    // and a second BOM ahead of the header hid it from the header parser.
+    const cwd = tempDir();
+    const BOM = "﻿";
+    const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+    const plain = "Every customer gets a free car [1].\n\n[1]: https://example.com/policy\n";
+    writeFileSync(join(cwd, "plain.md"), bytes(plain));
+    const out = join(cwd, "out");
+    mkdirSync(out);
+    const url = "https://example.com/policy";
+    // [the saved file, whether a <file>.url sidecar names the origin]
+    const cases: ReadonlyArray<readonly [string, boolean]> = [
+      [`URL: ${url}\n${plain}`, true],
+      [`URL: ${url}\n${BOM}${plain}`, true],
+      [`${BOM}${BOM}URL: ${url}\nStatus: 200\n\n${plain}`, true],
+      [`${BOM}${BOM}URL: ${url}\nStatus: 200\n\n${BOM}${plain}`, false],
+      [`${BOM}${BOM}URL: ${url}\n${plain}`, false],
+    ];
+    for (const [file, sidecar] of cases) {
+      rmSync(out, { recursive: true, force: true });
+      mkdirSync(out);
+      writeFileSync(join(out, "wrapped.md"), bytes(file));
+      if (sidecar) writeFileSync(join(out, "wrapped.md.url"), `${url}\n`);
+      const r = await run(cwd, ["check", "plain.md", "--level", "grounded", "--evidence", "out"]);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain(
+        "skipped wrapped.md: it is a copy of the document — a document cannot ground its own claims",
+      );
+      expect(r.out).not.toContain("✓ pass");
+    }
+    // A real page under the same shapes still grounds: only a copy is refused.
+    rmSync(out, { recursive: true, force: true });
+    mkdirSync(out);
+    writeFileSync(
+      join(out, "page.md"),
+      bytes(`${BOM}${BOM}URL: ${url}\nStatus: 200\n\nEvery customer gets a free car.\n`),
+    );
+    const page = await run(cwd, ["check", "plain.md", "--level", "grounded", "--evidence", "out"]);
+    expect(page.code).toBe(0);
+  });
+
   test("nothing under .crewhaus/ or the session-log directory is read — it holds the model's own words", async () => {
     const cwd = tempDir();
     const claim = "The refund window is 90 days for every order";
@@ -1311,6 +1421,23 @@ describe("provability check — proof artifacts and configuration", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("statement forall i, j in 1..6");
     expect(r.out).toContain(`builtin — ${id} · axioms: none`);
+    // No run log at hand, so the stored artifact is all there is — and the
+    // note says the live gate would also require the ProofCheck call.
+    expect(r.out).toContain("checked against the stored artifacts alone");
+
+    // With the session's log at hand, its ProofCheck call is required, as live.
+    await writeSession(cwd, SESS_A, [
+      {
+        id: "toolu_fetch1",
+        name: "WebFetch",
+        input: { url: "https://acme.example" },
+        content: "x",
+      },
+    ]);
+    const held = await run(cwd, ["check", "answer.md", "--level", "proven", "--session", SESS_A]);
+    expect(held.code).toBe(1);
+    expect(held.out).toContain("no ProofCheck call in this run's evidence");
+    expect(held.out).not.toContain("checked against the stored artifacts alone");
   });
 
   test("--level is required unless --spec carries a block", async () => {
@@ -1503,6 +1630,35 @@ describe("provability audit", () => {
     ]);
     expect(audit.assumptionRate).toBe(0.2);
     expect(audit.judgeWaivers).toEqual({ bindings: 1, okSourceBindings: 2, rate: 0.5, bundles: 1 });
+  });
+
+  test("every pass of a retried turn is read: the failing pass a retry fixed is not left unread", async () => {
+    const cwd = tempDir();
+    await persist(cwd, "support", SESS_A, 1, {
+      ...(await gradedBundle(BAD_ANSWER, POLICY)),
+      retryIndex: 0,
+    });
+    await persist(cwd, "support", SESS_A, 1, {
+      ...(await gradedBundle(GOOD_ANSWER, POLICY)),
+      retryIndex: 1,
+    });
+    await persist(cwd, "support", SESS_A, 2, await gradedBundle(GOOD_ANSWER, POLICY));
+    const { audit } = await buildAudit({
+      cwd,
+      sessionRootDir: join(cwd, ".crewhaus", "sessions"),
+      now: NOW,
+    });
+    expect(audit.bundles).toMatchObject({
+      count: 3,
+      turns: 2,
+      verdicts: { pass: 2, fail: 1, unverified: 0 },
+    });
+    // The failing pass's unmet claim is read, though a retry fixed the turn.
+    expect(audit.unmetReasons).toEqual([{ reason: "not_found_in_source", count: 1 }]);
+    const r = await run(cwd, ["audit"]);
+    expect(r.out).toContain(
+      "bundles     2 graded turns (3 bundles: every pass of a retried turn) · ✓ 2 pass · ✗ 1 fail",
+    );
   });
 
   test("reads provability_graded lines: passes, retries, escalations and judge spend", async () => {
@@ -2160,6 +2316,63 @@ describe("doctor's proof-checker probe", () => {
     expect(checks[1]).toEqual({ label: "provability checker builtin", pass: true });
   });
 
+  // 0.8.0 §11 — doctor probes the checkers a harness USES. Every gated spec
+  // lowers formal.checkers [builtin, smt], but below proven on those defaults
+  // no ProofCheck is wired, so nothing ever runs smt: no line, no probe, no
+  // Z3 image pulled for a cited harness.
+  test("a harness that never runs a checker gets no line, probed or not — unless it lists proofCheck", async () => {
+    for (const level of ["cited", "grounded", "checked"] as const) {
+      const config = { ...defaultProvabilityConfig(), level };
+      expect(config.formal.checkers).toEqual(["builtin", "smt"]);
+      for (const opts of [PROBE, { probe: false }]) {
+        let created = 0;
+        const checks = await provabilityDoctorChecks(
+          config,
+          {
+            env: {},
+            sandboxAvailable: true,
+            createSandbox: (...a) => {
+              created += 1;
+              return fakeSandbox(0)(...a);
+            },
+          },
+          { ...opts, tools: ["webFetch", "read"] },
+        );
+        expect(checks).toEqual([]);
+        expect(created).toBe(0);
+      }
+      // A spec that listed the proof tool runs the checkers at any floor (the
+      // gate swaps in its bound twin), so it is probed.
+      const listed = await provabilityDoctorChecks(
+        config,
+        { env: {}, sandboxAvailable: false },
+        { probe: false, tools: ["webFetch", "proofCheck"] },
+      );
+      expect(listed.map((c) => c.label)).toEqual(["provability checker smt"]);
+    }
+  });
+
+  test("a cited spec in the harness directory: doctor's lines and the checkers' configured marks agree", async () => {
+    const cwd = tempDir();
+    writeSpec(cwd, "rcited", "provability: cited\n");
+    const report = JSON.parse((await run(cwd, ["checkers", "--json"])).out);
+    expect(report.spec).toBe("rcited");
+    expect(report.note).toContain("never runs a proof checker");
+    expect(report.checkers.every((c: { configured: boolean }) => !c.configured)).toBe(true);
+    const text = (await run(cwd, ["checkers"])).out;
+    expect(text).toContain("note     rcited never runs a proof checker");
+    expect(text).not.toContain("· configured");
+
+    writeSpec(cwd, "rprover", "provability: proven\n");
+    const proven = JSON.parse((await run(cwd, ["checkers", "--json"])).out);
+    expect(proven.note).toBeUndefined();
+    expect(
+      proven.checkers
+        .filter((c: { configured: boolean }) => c.configured)
+        .map((c: { id: string }) => c.id),
+    ).toEqual(["builtin", "smt"]);
+  });
+
   test("a healthy sandbox checker passes", async () => {
     const checks = await provabilityDoctorChecks(
       withCheckers(["builtin", "lean4"]),
@@ -2356,5 +2569,375 @@ describe("durations and the long form", () => {
     const text = renderBundleLong(bundle, { title: "t" });
     expect(text).toContain("verdict     ? unverified — sandbox exploded");
     expect(text).toContain("── provability · grounded ? unverified — sandbox exploded");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// check --report: a research report graded as its gate graded it (§5.4, §11)
+// ---------------------------------------------------------------------------
+
+describe("provability check --report — a gated research report", () => {
+  const SNIPPET = "Customers may request a refund within 14 days of delivery";
+
+  /**
+   * A report the way report-writer's `writeProvableReport` writes it: the
+   * text its gate verifies (title, definitions, one branch), then the
+   * writer's trailer — `## Citations` (the visible list) and `## Provability`
+   * (the section rendered from the bundle the gate produced). The writer's
+   * own source is held to this shape below.
+   */
+  async function researchReport(): Promise<{ report: string; gated: ProofBundle }> {
+    const verified = [
+      "# What is the refund window?",
+      "",
+      `[1]: https://acme.example/policy "${SNIPPET}"`,
+      "",
+      "## What is the refund window?",
+      "",
+      "Customers may request a refund within 14 days of delivery [1].",
+      "",
+    ].join("\n");
+    const gated = await gradedBundle(verified, POLICY);
+    const trailer = ["## Citations", "", "[1] https://acme.example/policy", `    ${SNIPPET}`].join(
+      "\n",
+    );
+    const report = `${verified}\n${trailer}\n\n${renderMarkdownSection(gated).trimEnd()}\n`;
+    return { report, gated };
+  }
+
+  function evidenceDir(cwd: string): void {
+    mkdirSync(join(cwd, "ev"));
+    writeFileSync(join(cwd, "ev", "policy.html"), `URL: https://acme.example/policy\n${POLICY}\n`);
+  }
+
+  test("a report its gate passed passes again with --report; whole, the writer's lines fail it", async () => {
+    const cwd = tempDir();
+    const { report, gated } = await researchReport();
+    expect(gated.verdict).toBe("pass");
+    writeAnswer(cwd, report, "report.md");
+    evidenceDir(cwd);
+    const argv = ["check", "report.md", "--level", "grounded", "--evidence", "ev"];
+
+    // Whole: the citation list, the Floor line and the table rows are claims.
+    const whole = await run(cwd, [...argv, "--json"]);
+    expect(whole.code).toBe(1);
+    expect((JSON.parse(whole.out) as ProofBundle).claimCount).toBeGreaterThan(gated.claimCount);
+    expect(whole.err).toContain("its lines were graded as claims — pass --report");
+
+    // --report: exactly what the gate verified, with the same verdict.
+    const r = await run(cwd, [...argv, "--report", "--json"]);
+    expect(r.code).toBe(0);
+    const again = JSON.parse(r.out) as ProofBundle;
+    expect(again.verdict).toBe("pass");
+    expect(again.claimCount).toBe(gated.claimCount);
+    expect(again.claims.map((c) => c.text)).toEqual(gated.claims.map((c) => c.text));
+    expect(r.err).toContain("--report: from line 9 on is the report writer's trailer");
+
+    const text = await run(cwd, [...argv, "--report"]);
+    expect(text.code).toBe(0);
+    expect(text.out).toContain("verdict     ✓ pass");
+  });
+
+  test("the trailer is never stripped unasked: an answer cannot hide an uncited claim under a fake one", async () => {
+    const cwd = tempDir();
+    writeAnswer(
+      cwd,
+      `${GOOD_ANSWER}\n## Citations\n\n[1] https://acme.example/policy\n    The moon is made of green cheese.\n\n## Provability\n\n**Floor:** \`grounded\` · **Verdict:** pass ✓\n`,
+    );
+    evidenceDir(cwd);
+    const r = await run(cwd, [
+      "check",
+      "answer.md",
+      "--level",
+      "grounded",
+      "--evidence",
+      "ev",
+      "--json",
+    ]);
+    expect(r.code).toBe(1);
+    const claims = (JSON.parse(r.out) as ProofBundle).claims;
+    expect(claims.some((c) => c.text.includes("green cheese") && c.status === "unmet")).toBe(true);
+  });
+
+  test("--report on a document with no gated trailer is refused, not silently graded whole", async () => {
+    const cwd = tempDir();
+    writeAnswer(cwd, GOOD_ANSWER);
+    await expect(run(cwd, ["check", "answer.md", "--level", "cited", "--report"])).rejects.toThrow(
+      /does not end in a gated research report's trailer/,
+    );
+    // An UNGATED report's `## Citations` alone is not a gated trailer either.
+    writeAnswer(cwd, `${GOOD_ANSWER}\n## Citations\n\n[1] https://acme.example/policy\n`);
+    await expect(run(cwd, ["check", "answer.md", "--level", "cited", "--report"])).rejects.toThrow(
+      /does not end in a gated research report's trailer/,
+    );
+  });
+
+  test("a copy of the graded body in --evidence is still a copy of the document", async () => {
+    const cwd = tempDir();
+    const { report } = await researchReport();
+    writeAnswer(cwd, report, "report.md");
+    evidenceDir(cwd);
+    const body = report.slice(0, reportTrailerAt(report));
+    writeFileSync(join(cwd, "ev", "copy.md"), `URL: https://acme.example/policy\n${body}\n`);
+    rmSync(join(cwd, "ev", "policy.html"));
+    const r = await run(cwd, [
+      "check",
+      "report.md",
+      "--level",
+      "grounded",
+      "--evidence",
+      "ev",
+      "--report",
+    ]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("skipped copy.md: it is a copy of the document");
+  });
+
+  test("the trailer rule is report-writer's: verifiedReportText and the writer's layout, held to its source", () => {
+    // apps/cli does not depend on report-writer, so the rule is mirrored in
+    // reportTrailerAt — and this reads the writer's SOURCE (the
+    // target-managed precedent above) so the two cannot drift apart.
+    const writer = readFileSync(
+      join(import.meta.dir, "..", "..", "..", "packages", "report-writer", "src", "provability.ts"),
+      "utf8",
+    );
+    expect(writer.includes('const TRAILER = "\\n\\n## Citations\\n";')).toBe(true);
+    expect(writer.includes("const at = markdown.lastIndexOf(TRAILER);")).toBe(true);
+    expect(writer.includes('!markdown.slice(at).includes("\\n## Provability\\n")')).toBe(true);
+    expect(writer.includes("return `${markdown.slice(0, at)}\\n`;")).toBe(true);
+    expect(
+      writer.includes(
+        "const markdown = `${verified}\\n${trailer}\\n\\n${renderMarkdownSection(proof).trimEnd()}\\n`;",
+      ),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// check --tenant: a managed answer's evidence under the tenants root (§8, §11)
+// ---------------------------------------------------------------------------
+
+describe("provability check --tenant — a managed answer's evidence", () => {
+  const MANAGED_SPEC =
+    "name: mgd\ntarget: managed\nagent:\n  model: claude-opus-5\n  instructions: hi\ntenants:\n  - {id: acme, budget: {maxInputTokens: 10, maxOutputTokens: 10}}\nprovability:\n  level: proven\n";
+
+  /** A managed tenant's tree as the daemon leaves it: a session log and a ProofCheck artifact. */
+  async function managedTree(): Promise<{ cwd: string; tenants: string; proofId: string }> {
+    const cwd = tempDir();
+    const tenants = join(cwd, "tenants");
+    writeFileSync(join(cwd, "crewhaus.yaml"), MANAGED_SPEC);
+    const proofId = newProofId();
+    await createFileArtifactStore({ rootDir: join(tenants, "acme", "proofs", "mgd") }).put({
+      version: 1,
+      id: proofId,
+      checker: "builtin",
+      claim: "No two of the six meetings overlap.",
+      statement: "forall i, j in 1..6, i != j: disjoint(m_i, m_j)",
+      proof: "1. ... by cases",
+      ok: true,
+      assumptions: [],
+      axioms: [],
+      output: "accepted",
+      outputDigest: sha256Of("accepted"),
+      checkedAt: NOW.toISOString(),
+    });
+    const log = await openEventLog(SESS_A, { rootDir: join(tenants, "acme", "sessions") });
+    const content = await moneyAddResult({ currency: "USD", amountsMinor: ["100050", "28400"] });
+    await log.append({
+      kind: "tool_use",
+      payload: {
+        id: "toolu_sum1",
+        name: "MoneyAdd",
+        input: { currency: "USD", amountsMinor: ["100050", "28400"] },
+      },
+    });
+    await log.append({
+      kind: "tool_result",
+      payload: { toolUseId: "toolu_sum1", content, isError: false },
+    });
+    await log.close();
+    return { cwd, tenants, proofId };
+  }
+
+  test("a proof: artifact a tenant's ProofCheck filed backs the claim with --tenant — and only then", async () => {
+    const { cwd, tenants, proofId } = await managedTree();
+    writeAnswer(cwd, `No two of the six meetings overlap [1].\n\n[1]: proof:${proofId}\n`);
+    const argv = ["check", "answer.md", "--spec", "crewhaus.yaml"];
+
+    // Without the tenant: the artifact is not found, and the note says why.
+    const without = await run(cwd, argv, { env: { CREWHAUS_TENANTS_ROOT: "tenants" } });
+    expect(without.code).toBe(1);
+    expect(without.out).toContain("proof missing");
+    expect(without.out).toContain("name the tenant with --tenant <id>");
+
+    for (const over of [
+      { argv: ["--tenant", "acme", "--tenants-root", tenants], env: {} },
+      { argv: ["--tenant", "acme"], env: { CREWHAUS_TENANTS_ROOT: "tenants" } },
+    ]) {
+      const r = await run(cwd, [...argv, ...over.argv], { env: over.env });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("verdict     ✓ pass");
+      expect(r.out).toContain("tenant acme under");
+    }
+  });
+
+  test("a tool: citation is found in the tenant's own session log", async () => {
+    const { cwd, tenants } = await managedTree();
+    writeAnswer(cwd, "The invoice total is 1,284.50 USD [1].\n\n[1]: tool:toolu_sum1\n");
+    const argv = ["check", "answer.md", "--level", "checked", "--session", SESS_A];
+    await expect(run(cwd, argv, { env: { CREWHAUS_TENANTS_ROOT: "tenants" } })).rejects.toThrow(
+      /no event log for sess_00000000000000aa under \.crewhaus\/sessions — a managed harness logs each tenant's sessions under .*: name the tenant with --tenant <id>/,
+    );
+    const r = await run(cwd, [...argv, "--tenant", "acme", "--tenants-root", tenants, "--json"]);
+    expect(r.code).toBe(0);
+    expect((JSON.parse(r.out) as ProofBundle).claims[0]?.bindings[0]).toMatchObject({
+      kind: "execution",
+      ok: true,
+    });
+  });
+
+  test("one tenant, named and real: another tenant's evidence never grounds the answer", async () => {
+    const { cwd, tenants, proofId } = await managedTree();
+    writeAnswer(cwd, `No two of the six meetings overlap [1].\n\n[1]: proof:${proofId}\n`);
+    mkdirSync(join(tenants, "globex"));
+    const argv = ["check", "answer.md", "--spec", "crewhaus.yaml", "--tenants-root", tenants];
+    const other = await run(cwd, [...argv, "--tenant", "globex"]);
+    expect(other.code).toBe(1);
+    expect(other.out).toContain("proof missing");
+    await expect(run(cwd, argv)).rejects.toThrow(/--tenants-root needs --tenant <id>/);
+    await expect(run(cwd, [...argv, "--tenant", "../acme"])).rejects.toThrow(/invalid --tenant/);
+    await expect(run(cwd, [...argv, "--tenant", "initech"])).rejects.toThrow(
+      /no tenant initech under the tenants root/,
+    );
+    // A tenant directory that is a link is not followed into.
+    symlinkSync(join(tenants, "acme"), join(tenants, "linked"));
+    await expect(run(cwd, [...argv, "--tenant", "linked"])).rejects.toThrow(/no tenant linked/);
+    // No root at all (a cli spec, nothing in the env): the tenant cannot be found.
+    rmSync(join(cwd, "crewhaus.yaml"));
+    await expect(
+      run(cwd, ["check", "answer.md", "--level", "proven", "--tenant", "acme"]),
+    ).rejects.toThrow(/--tenant acme needs a tenants root/);
+  });
+
+  test("a path citation into a --tenants-root inside the workspace is state, never a source", async () => {
+    const { cwd, tenants } = await managedTree();
+    const claim = "The refund window is 90 days for every order";
+    writeFileSync(join(tenants, "acme", "note.md"), claim);
+    writeAnswer(cwd, `${claim} [1].\n\n[1]: tenants/acme/note.md\n`);
+    const r = await run(cwd, [
+      "check",
+      "answer.md",
+      "--level",
+      "grounded",
+      "--tenant",
+      "acme",
+      "--tenants-root",
+      "tenants",
+      "--json",
+    ]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(
+      "tenants/acme/note.md is not read: the managed tenants root (--tenants-root)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// research runs: the report bundle beside report.md (§5.4, §8)
+// ---------------------------------------------------------------------------
+
+describe("research report bundles — .crewhaus/research/<run>/proof.json", () => {
+  const RUN = "run_00000000000000cc";
+
+  /** A research run as the report gate leaves it: report.md, report.json and proof.json. */
+  async function researchRun(cwd: string, run = RUN, mtimeMs?: number): Promise<ProofBundle> {
+    const bundle = await gradedBundle(GOOD_ANSWER, POLICY);
+    const dir = join(cwd, ".crewhaus", "research", run);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "report.md"), "# report\n");
+    writeFileSync(join(dir, "report.json"), "{}\n");
+    const path = join(dir, "proof.json");
+    writeFileSync(path, `${JSON.stringify(bundle, null, 2)}\n`);
+    if (mtimeMs !== undefined) utimesSync(path, mtimeMs / 1000, mtimeMs / 1000);
+    return bundle;
+  }
+
+  test("show finds a research run's bundle — the latest, or by its run id (the Hangar twin)", async () => {
+    const cwd = tempDir();
+    const bundle = await researchRun(cwd);
+    const latest = await run(cwd, ["show"]);
+    expect(latest.code).toBe(0);
+    expect(latest.out).toContain(`proof bundle · .crewhaus/research/${RUN}/proof.json`);
+    expect(latest.out).toContain(`run         ${RUN} · research report`);
+    // The exact command Hangar's proof route names for this row.
+    const twin = await run(cwd, ["show", "--session", RUN, "--turn", "1", "--json"]);
+    expect(JSON.parse(twin.out)).toEqual(JSON.parse(JSON.stringify(bundle)));
+    await expect(run(cwd, ["show", "--session", "run_00000000000000dd"])).rejects.toThrow(
+      /no proof bundle for session run_00000000000000dd/,
+    );
+    // check's --session is a session log: a run id is not one.
+    writeAnswer(cwd, GOOD_ANSWER);
+    await expect(
+      run(cwd, ["check", "answer.md", "--level", "cited", "--session", RUN]),
+    ).rejects.toThrow(/invalid --session/);
+  });
+
+  test("a research spec narrows to its runs; another spec's verbs do not read them", async () => {
+    const cwd = tempDir();
+    await researchRun(cwd);
+    writeFileSync(
+      join(cwd, "research.yaml"),
+      "name: digest\ntarget: research\nagent:\n  model: claude-opus-5\n  instructions: research\ngoal: learn\nprovability: cited\n",
+    );
+    expect((await run(cwd, ["show", "research.yaml"])).code).toBe(0);
+    const spec = writeSpec(cwd, "support");
+    await expect(run(cwd, ["show", spec])).rejects.toThrow(/no proof bundle/);
+  });
+
+  test("audit counts research bundles; links and malformed files are not read as bundles", async () => {
+    const cwd = tempDir();
+    await researchRun(cwd);
+    // A run directory linked out of the harness, and a proof.json that is a link.
+    const elsewhere = tempDir("provability-research-outside-");
+    await researchRun(elsewhere, "run_00000000000000ee");
+    symlinkSync(
+      join(elsewhere, ".crewhaus", "research", "run_00000000000000ee"),
+      join(cwd, ".crewhaus", "research", "run_00000000000000ee"),
+    );
+    mkdirSync(join(cwd, ".crewhaus", "research", "run_00000000000000ff"));
+    symlinkSync(
+      join(elsewhere, ".crewhaus", "research", "run_00000000000000ee", "proof.json"),
+      join(cwd, ".crewhaus", "research", "run_00000000000000ff", "proof.json"),
+    );
+    // Not a run id, and a torn bundle.
+    mkdirSync(join(cwd, ".crewhaus", "research", "notes"));
+    writeFileSync(join(cwd, ".crewhaus", "research", "notes", "proof.json"), "{}");
+    mkdirSync(join(cwd, ".crewhaus", "research", "run_0000000000000011"));
+    writeFileSync(join(cwd, ".crewhaus", "research", "run_0000000000000011", "proof.json"), "{");
+    const audit = JSON.parse((await run(cwd, ["audit", "--json"])).out);
+    expect(audit.bundles.count).toBe(1);
+    expect(audit.bundles.unreadable).toBe(1);
+    expect(audit.bundles.verdicts.pass).toBe(1);
+  });
+
+  test("prune removes a stale research bundle and keeps the run's report", async () => {
+    const cwd = tempDir();
+    await researchRun(cwd, RUN, NOW.getTime() - 100 * DAY);
+    await researchRun(cwd, "run_00000000000000dd", NOW.getTime() - DAY);
+    const dry = await run(cwd, ["prune", "--older-than", "90d", "--dry-run", "--json"]);
+    expect(JSON.parse(dry.out)).toMatchObject({
+      wouldRemove: 1,
+      bundles: [`.crewhaus/research/${RUN}/proof.json`],
+    });
+    const r = await run(cwd, ["prune", "--older-than", "90d"]);
+    expect(r.out).toContain("removed 1 bundle");
+    expect(r.out).toContain("research runs lose only their proof.json");
+    const dir = join(cwd, ".crewhaus", "research", RUN);
+    expect(readdirSync(dir).sort()).toEqual(["report.json", "report.md"]);
+    expect(readdirSync(join(cwd, ".crewhaus", "research", "run_00000000000000dd")).sort()).toEqual([
+      "proof.json",
+      "report.json",
+      "report.md",
+    ]);
   });
 });

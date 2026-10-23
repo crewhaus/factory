@@ -162,7 +162,7 @@ describe("every request decided is recorded (an egress_decision), never a cache 
     expect(decisions).toEqual([
       {
         sinkId: "provability.resolve",
-        sinkScope: "external",
+        sinkScope: "external-dynamic",
         method: "HEAD",
         host: "a.example",
         verdict: "pass",
@@ -170,7 +170,7 @@ describe("every request decided is recorded (an egress_decision), never a cache 
       },
       {
         sinkId: "provability.resolve",
-        sinkScope: "external",
+        sinkScope: "external-dynamic",
         method: "HEAD",
         host: "denied.example",
         verdict: "block",
@@ -178,7 +178,7 @@ describe("every request decided is recorded (an egress_decision), never a cache 
       },
       {
         sinkId: "provability.resolve",
-        sinkScope: "external",
+        sinkScope: "external-dynamic",
         method: "HEAD",
         host: "flaky.example",
         verdict: "pass",
@@ -292,5 +292,89 @@ describe("createHeadResolver (default: tool-fetch's guarded HEAD)", () => {
     const resolve = createHeadResolver(SOURCES);
     expect(await resolve("http://169.254.169.254/latest", {})).toBeUndefined();
     expect(seen).toEqual([]);
+  });
+});
+
+describe("the sink-side screen (design §6.1, §10; AGENTS.md Pillar 3)", () => {
+  const BLOCKED = { verdict: "block", originsFound: ["tool"], matchCount: 1 } as const;
+  const CLEAN = { verdict: "pass", originsFound: [], matchCount: 0 } as const;
+
+  test("a URL the screen blocks is never requested, is recorded as a block (egress), and is not cached", async () => {
+    const sent: string[] = [];
+    const decisions: HeadDecision[] = [];
+    let verdict: "block" | "pass" = "block";
+    const resolve = createHeadResolver(SOURCES, async (url) => {
+      sent.push(url);
+      return 200;
+    });
+    const ctx = {
+      sessionId: "s1",
+      record: (d: HeadDecision) => {
+        decisions.push(d);
+      },
+      screen: async () => (verdict === "block" ? BLOCKED : CLEAN),
+    };
+    const url = "https://collector.example/c?k=SECRET-TOKEN";
+    // The verifier is told the request was refused, not that it went unanswered.
+    expect(await resolve(url, ctx)).toEqual({ refused: "egress" });
+    expect(sent).toEqual([]);
+    expect(decisions).toEqual([
+      {
+        sinkId: "provability.resolve",
+        sinkScope: "external-dynamic",
+        method: "HEAD",
+        host: "collector.example",
+        verdict: "block",
+        reason: "egress",
+        originsFound: ["tool"],
+        matchCount: 1,
+      },
+    ]);
+    // Not an answer about the page: screened again next time.
+    verdict = "pass";
+    expect(await resolve(url, ctx)).toBe(200);
+    expect(sent).toEqual([url]);
+    expect(JSON.stringify(decisions)).not.toContain("SECRET-TOKEN");
+  });
+
+  test("a clean screen sends the request and the record carries the screen's verdict", async () => {
+    const decisions: HeadDecision[] = [];
+    const resolve = createHeadResolver(SOURCES, async () => 204);
+    expect(
+      await resolve("https://a.example/page", {
+        record: (d) => {
+          decisions.push(d);
+        },
+        screen: async () => ({ verdict: "warn", originsFound: ["mcp"], matchCount: 2 }),
+      }),
+    ).toBe(204);
+    expect(decisions).toEqual([
+      {
+        sinkId: "provability.resolve",
+        sinkScope: "external-dynamic",
+        method: "HEAD",
+        host: "a.example",
+        verdict: "warn",
+        status: 204,
+        originsFound: ["mcp"],
+        matchCount: 2,
+      },
+    ]);
+  });
+
+  test("a screen that cannot answer refuses: the request is an egress, never sent unscreened", async () => {
+    const sent: string[] = [];
+    const resolve = createHeadResolver(SOURCES, async (url) => {
+      sent.push(url);
+      return 200;
+    });
+    expect(
+      await resolve("https://a.example/page", {
+        screen: async () => {
+          throw new Error("classifier unavailable");
+        },
+      }),
+    ).toEqual({ refused: "egress" });
+    expect(sent).toEqual([]);
   });
 });

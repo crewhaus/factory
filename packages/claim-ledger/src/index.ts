@@ -21,9 +21,11 @@ export {
 } from "./sentences";
 export {
   type Citation,
+  type CitationMarker,
   type CitationReport,
   type CitedClaim,
   citationDefinitions,
+  citationMarkers,
   citedClaims,
   lintCitations,
   plainClaim,
@@ -69,6 +71,7 @@ export {
   QUOTE_MIN_TOKENS,
   bestSpan,
   breaksClause,
+  claimFigureKeys,
   claimFigures,
   claimQuery,
   claimWords,
@@ -92,7 +95,9 @@ export {
   tokenize,
 } from "./locate";
 export {
+  type CompoundValue,
   type FigureWord,
+  compoundValues,
   containsValue,
   extractNumbers,
   figureWord,

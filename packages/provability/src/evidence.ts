@@ -17,11 +17,12 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import * as path from "node:path";
 import { classifyDefinition, contentTokens, coverage } from "@crewhaus/claim-ledger";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_ROOT_DIR, openEventLog } from "@crewhaus/event-log";
-import { FETCH, READ, RETRIEVE, WEB_FETCH, builtinKey } from "./builtins";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { FETCH, READ, RETRIEVE, WEB_FETCH, builtinKey, isMcpTool } from "./builtins";
 import { type PathRoots, doiUrl, normalizePath, normalizeUrl } from "./origin";
 import type { EvidenceIndex, EvidenceRecord } from "./types";
 
@@ -64,6 +65,14 @@ const MAX_RETRIEVE_HITS = 50;
  * body that says the claim" are measured on one scale.
  */
 const ECHO_COVERAGE = 0.8;
+/**
+ * Where the runtime spills a result over its threshold, relative to the
+ * workspace (`@crewhaus/tool-result-store`'s `DEFAULT_ROOT_DIR`: the
+ * runtime resolves it against its cwd, the workspace root here).
+ */
+const DEFAULT_TOOL_RESULTS_DIR = ".crewhaus/tool-results";
+/** The largest spilled output read back as a body (tool-web caps a page at 5 MB). */
+const MAX_SPILL_BYTES = 8 * 1024 * 1024;
 
 export class ProvabilityError extends CrewhausError {
   override readonly name = "ProvabilityError";
@@ -74,7 +83,14 @@ export type ToolCall = {
   readonly toolUseId: string;
   readonly toolName: string;
   readonly input: unknown;
+  /** The result as logged. */
   readonly content: string;
+  /**
+   * The whole output, when `content` is tool-result-store's preview of it
+   * (`spilledOutput`): what the tool returned, which the evidence is read
+   * from. Absent when the log holds the result whole.
+   */
+  readonly body?: string;
   readonly isError: boolean;
   readonly sessionId?: string;
   readonly turnNumber?: number;
@@ -85,6 +101,13 @@ export type ToolCall = {
 export type EvidenceOptions = Pick<PathRoots, "workspaceRoot"> & {
   /** Stamped onto records built from messages (they carry no session of their own). */
   readonly sessionId?: string;
+  /**
+   * Where the runtime spilled results over its threshold (its
+   * `toolResultRoot`; default `.crewhaus/tool-results` under the workspace
+   * root, tool-result-store's own default). A spilled output is read back
+   * only from under it (`spilledOutput`).
+   */
+  readonly toolResultsRoot?: string;
 };
 
 /** `sha256:<hex>` of a string's UTF-8 bytes. */
@@ -115,14 +138,22 @@ function originOfValue(value: string, roots: PathRoots, paths: boolean): string 
 }
 
 /**
- * The header a WebFetch result opens with (`tool-web`: `URL: <url>\nStatus:
- * <n>\nContent-Type: <ct>\n\n`), read line by line rather than by a pattern
- * that could backtrack over a large body. Returns the URL it names and where
- * the page itself starts, or `undefined` when the result does not open so.
+ * The header a WebFetch result opens with, read line by line rather than by
+ * a pattern that could backtrack over a large body. Returns the URL it
+ * names, the HTTP status, and where the page itself starts, or `undefined`
+ * when the result does not open so.
+ *
+ * tool-web prints `URL: <final>\nRequested: <asked>\nStatus: <n>\nContent-Type:
+ * <ct>\n\n`, the `Requested:` line only when a redirect moved the fetch, and
+ * no `Requested:` line at all when the final URL is the one asked for. Design
+ * §5.2 indexes both: the URL on the first line here, beside the requested one
+ * the call's own `url` names, so a citation of either grounds. A header
+ * without the `Requested:` line (an older tool-web, or no redirect) reads the
+ * same way.
  */
 function webFetchHeader(
   content: string,
-): { readonly url: string; readonly end: number } | undefined {
+): { readonly url: string; readonly status: number; readonly end: number } | undefined {
   if (!content.startsWith("URL: ")) return undefined;
   const lines: string[] = [];
   let at = 0;
@@ -133,46 +164,75 @@ function webFetchHeader(
     at = nl + 1;
     if (line === "") break;
     lines.push(line);
-    if (lines.length > 3) return undefined;
+    if (lines.length > 4) return undefined;
   }
   const url = /^URL: (\S+)$/.exec(lines[0] ?? "")?.[1];
-  if (url === undefined || !/^Status: \d{3}$/.test(lines[1] ?? "")) return undefined;
-  if (lines.length === 3 && !/^Content-Type:/i.test(lines[2] ?? "")) return undefined;
-  return { url, end: at };
+  if (url === undefined) return undefined;
+  const rest = /^Requested: \S+$/.test(lines[1] ?? "") ? lines.slice(2) : lines.slice(1);
+  const status = /^Status: (\d{3})$/.exec(rest[0] ?? "")?.[1];
+  if (status === undefined || rest.length > 2) return undefined;
+  if (rest.length === 2 && !/^Content-Type:/i.test(rest[1] ?? "")) return undefined;
+  return { url, status: Number(status), end: at };
 }
 
 /**
- * Where the body of a Fetch result (`tool-fetch` `formatResponse`: `HTTP
- * <status> <reason>\n<name>: <value>…\n\n<body>`) starts, or 0. Strict on
- * purpose — a status line with a short reason phrase and at least one
- * header line — so a file that happens to open with "HTTP 200 is…" keeps
- * its first paragraph.
+ * A Fetch result's response head (`tool-fetch` `formatResponse`: `HTTP
+ * <status> <reason>\n<name>: <value>…\n\n<body>`): the status, and where
+ * the body starts — or `undefined`. Strict on purpose — a status line with
+ * a short reason phrase and at least one header line — so a file that
+ * happens to open with "HTTP 200 is…" keeps its first paragraph.
  */
-function httpHeaderEnd(content: string): number {
-  if (!content.startsWith("HTTP")) return 0;
+function httpHead(content: string): { readonly status: number; readonly end: number } | undefined {
+  if (!content.startsWith("HTTP")) return undefined;
   const blank = content.slice(0, MAX_HEADER_CHARS).indexOf("\n\n");
-  if (blank === -1) return 0;
-  const [status = "", ...headers] = content.slice(0, blank).split("\n");
-  if (!/^HTTP(?:\/[\d.]+)? \d{3}(?: [A-Za-z][A-Za-z '-]{0,40})?$/.test(status)) return 0;
-  if (headers.length === 0) return 0;
-  return headers.every((line) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+: ?\S?/.test(line)) ? blank + 2 : 0;
+  if (blank === -1) return undefined;
+  const [line = "", ...headers] = content.slice(0, blank).split("\n");
+  const status = /^HTTP(?:\/[\d.]+)? (\d{3})(?: [A-Za-z][A-Za-z '-]{0,40})?$/.exec(line)?.[1];
+  if (status === undefined || headers.length === 0) return undefined;
+  return headers.every((h) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+: ?\S?/.test(h))
+    ? { status: Number(status), end: blank + 2 }
+    : undefined;
 }
 
 /**
- * The text a record is grounded against: the result with its transport
- * header taken off — WebFetch's `URL:`/`Status:` block and the `[user prompt:
+ * The HTTP status a fetcher's own header reports for its result (WebFetch's
+ * `Status:` line, Fetch's status line), or `undefined` for any other tool or
+ * a result with no such header. Read only off the tool that prints it.
+ */
+function responseStatus(toolName: string, content: string): number | undefined {
+  if (toolName === WEB_FETCH) return webFetchHeader(content)?.status;
+  if (toolName === FETCH) return httpHead(content)?.status;
+  return undefined;
+}
+
+/**
+ * Is `status` a page's own answer — 2xx? A 404 or a 503 body is the
+ * server's error page, not the page a citation names (design §2's
+ * `grounded` row: the cited source's BODY was fetched): one that prints
+ * the path it was asked for would otherwise ground any claim the model
+ * spelled into that path. A 3xx a fetcher hands back (it follows
+ * redirects) carries no page either.
+ */
+export function servesPage(status: number | undefined): boolean {
+  return status === undefined || (status >= 200 && status < 300);
+}
+
+/**
+ * The text a record is grounded against: the result — the whole output
+ * where the log holds tool-result-store's preview of it (`body`) — with its
+ * transport header taken off: WebFetch's `URL:`/`Status:` block and the `[user prompt:
  * …]` line it prepends when the call carried a `prompt` (that is the model's
  * OWN text: left in, a model could write the claim into `prompt` and find it
  * "in the source"), and Fetch's status line and response headers. Read only
  * off the tool that prints each; anything else is the result, verbatim.
  */
 export function groundingBody(
-  record: Pick<EvidenceRecord, "content" | "input" | "toolName">,
+  record: Pick<EvidenceRecord, "content" | "input" | "toolName" | "body">,
 ): string {
-  const { content } = record;
+  const content = record.body ?? record.content;
   if (record.toolName === FETCH) {
-    const end = httpHeaderEnd(content);
-    return end > 0 ? content.slice(end) : content;
+    const head = httpHead(content);
+    return head !== undefined ? content.slice(head.end) : content;
   }
   const header = record.toolName === WEB_FETCH ? webFetchHeader(content) : undefined;
   if (header !== undefined) {
@@ -272,20 +332,34 @@ function namedOrigins(
   return out;
 }
 
+/** Is `toolName` one of the builtin readers (`WebFetch`, `Fetch`, `Read`: `READERS`)? */
+export function isReader(toolName: string): boolean {
+  return READERS[toolName] !== undefined;
+}
+
 /**
- * The input strings a tool that is not a builtin names its origins by
- * (`inputOrigins`), as written: the URL or path the call was pointed at,
- * not text it was handed. `grounded`'s echo test (verify.ts `echoCheck`)
- * reads these apart from the call's other strings, because a URL's slug can
- * spell a claim the page itself states — a reader returns the page, not its
- * address — and only a body that prints the address can be reflecting it.
+ * The input strings a call names its origins by (`inputOrigins`), as
+ * written: the URL or path it was pointed at, not text it was handed — a
+ * builtin reader's one declared field, any other non-builtin's URL and path
+ * fields. `grounded`'s echo test (verify.ts `echoCheck`) reads these apart
+ * from the call's other strings, because a URL's slug can spell a claim the
+ * page itself states — a reader returns the page, not its address — and
+ * only a body that PRINTS the address (a 404 page repeating the path it was
+ * asked for, a page headed with its own URL) can be reflecting it.
  */
 export function originFieldValues(
   toolName: string,
   input: unknown,
   roots: PathRoots = {},
 ): string[] {
-  if (!isRecordObject(input) || READERS[toolName] !== undefined) return [];
+  if (!isRecordObject(input)) return [];
+  const reader = READERS[toolName];
+  if (reader !== undefined) {
+    const value = input[reader.field];
+    return typeof value === "string" && readerOrigins(reader, toolName, input, roots).length > 0
+      ? [value]
+      : [];
+  }
   if (builtinKey(toolName) !== undefined) return [];
   return namedOrigins(input, roots).map((named) => named.value);
 }
@@ -425,11 +499,18 @@ function echoesInput(text: string, input: unknown): boolean {
  *   whose corpus the operator ingested, and only in the exact structure it
  *   prints (`retrieveHits`).
  * - JSON hits (`url`/`uri`/`href`/`link`/`source` fields) are read only from
- *   a tool that is not a builtin (an MCP or plugin tool the spec configured)
- *   and whose input names no URL or path: a search returns hits, a fetch of
- *   one URL returns that URL's body, whatever the body looks like. A hit
- *   whose text is the call's own input handed back is dropped
- *   (`echoesInput`).
+ *   an MCP server's tool (`mcp__…`, `isMcpTool`) whose input names no URL or
+ *   path: a search returns hits, a fetch of one URL returns that URL's
+ *   body, whatever the body looks like. Never from the runtime's own tools
+ *   whose result is MODEL output — `Task` (a sub-agent's final message),
+ *   `Consult`/`Escalate`, an A2A peer, `Skill`, the memory, plan and goal
+ *   tools: a sub-agent that answers `[{"url": …, "text": …}]` would
+ *   otherwise ground a citation of a page nobody fetched, and a child that
+ *   did fetch it would have its summary indexed beside the page, where a
+ *   wrong summary grounds what the page contradicts (design §8: child
+ *   returns are inputs; the child's evidence is its own logged fetches,
+ *   which the child-log walk indexes). A hit whose text is the call's own
+ *   input handed back is dropped (`echoesInput`).
  */
 function resultHits(
   call: Pick<ToolCall, "toolName" | "content" | "input">,
@@ -438,7 +519,7 @@ function resultHits(
 ): Array<{ origin: string; content: string }> {
   const { content } = call;
   if (call.toolName === RETRIEVE) return retrieveHits(content, call.input, roots);
-  if (fetchedSomething || builtinKey(call.toolName) !== undefined) return [];
+  if (fetchedSomething || !isMcpTool(call.toolName)) return [];
   const trimmed = content.trim();
   if (trimmed.length > MAX_JSON_HIT_CHARS || !/^[[{]/.test(trimmed)) return [];
   let parsed: unknown;
@@ -457,47 +538,122 @@ function resultHits(
  * builtin reader's one field (WebFetch's and Fetch's `url`, Read's `path`),
  * or any other tool's `url`, `uri`, `href`, `file_path`, `path`, `file`,
  * `filePath` unless its result is an echo of its input (`inputOrigins`,
- * `echoesInput`) — and the final URL a WebFetch result reports on its first
- * line (indexed BESIDE the requested URL, so a citation of either grounds),
- * and the hits a multi-source result carries (Retrieve; JSON results with
- * `url`/`uri`/`href`/`link`/`source` from a search tool — see `resultHits`
- * for which tools). Error results are recorded too: the verifiers reject
- * them, by reason.
+ * `echoesInput`) — and the URL a WebFetch result's header names on its
+ * first line (indexed BESIDE the requested URL, so that once tool-web
+ * prints the final URL there a citation of either grounds — see
+ * `webFetchHeader`), and the hits a multi-source result carries (Retrieve;
+ * JSON results with `url`/`uri`/`href`/`link`/`source` from an MCP tool —
+ * see `resultHits` for which tools). A fetcher's HTTP status is carried
+ * (`status`): a non-2xx body is not the page (`servesPage`). Error results
+ * are recorded too: the verifiers reject them, by reason.
+ *
+ * Everything is read off the whole output (`body`) where the log holds a
+ * spill preview of it; `content` stays what the log holds, which a replay
+ * is compared against.
  */
 export function recordFromCall(call: ToolCall, opts: EvidenceOptions = {}): EvidenceRecord {
   const roots: PathRoots = {
     ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
   };
+  const text = call.body ?? call.content;
   const named = inputOrigins(call.toolName, call.input, roots);
   // A tool that names an origin but is not a reader the gate knows returns
   // whatever it returns; when that is its own input, it read nothing.
   const origins =
-    named.length > 0 &&
-    READERS[call.toolName] === undefined &&
-    echoesInput(call.content, call.input)
+    named.length > 0 && READERS[call.toolName] === undefined && echoesInput(text, call.input)
       ? []
       : named;
   const fetchedSomething = named.length > 0;
-  // The final-URL line is tool-web's own header; read off any other tool it
-  // would let a file or a page that merely opens with "URL: …" claim a URL.
-  const header = call.toolName === WEB_FETCH ? webFetchHeader(call.content) : undefined;
+  // The URL line is tool-web's own header; read off any other tool it would
+  // let a file or a page that merely opens with "URL: …" claim a URL.
+  const header = call.toolName === WEB_FETCH ? webFetchHeader(text) : undefined;
   if (header !== undefined) {
     const final = normalizeUrl(header.url);
     if (final !== undefined) origins.push(final);
   }
-  const hits = resultHits(call, fetchedSomething, roots);
+  const status = responseStatus(call.toolName, text);
+  const hits = resultHits({ ...call, content: text }, fetchedSomething, roots);
   const sessionId = call.sessionId ?? opts.sessionId;
   return {
     toolUseId: call.toolUseId,
     toolName: call.toolName,
     input: call.input,
     content: call.content,
+    ...(call.body !== undefined ? { body: call.body } : {}),
     isError: call.isError,
     ...(sessionId !== undefined ? { sessionId } : {}),
     origins: [...new Set(origins)],
+    ...(status !== undefined ? { status } : {}),
     ...(call.turnNumber !== undefined ? { turnNumber: call.turnNumber } : {}),
     ...(hits.length > 0 ? { hits } : {}),
   };
+}
+
+/**
+ * The spill tail tool-result-store puts after a result's head when it saved
+ * the output to a file (`storeAndPreview`: an optional part line, then
+ * `[truncated, full output at <path>]`), read from the END of `content` line
+ * by line — each pattern anchored to one short line, never run over the
+ * body. Returns the head and the path, or `undefined`. A tail saying the
+ * output could not be saved has no file to read.
+ */
+function spillTail(content: string): { readonly head: string; readonly saved: string } | undefined {
+  const last = content.lastIndexOf("\n");
+  if (last === -1) return undefined;
+  const saved = /^\[truncated, full output at ([^\n]+)\]$/.exec(content.slice(last + 1))?.[1];
+  if (saved === undefined) return undefined;
+  const prior = content.lastIndexOf("\n", last - 1);
+  const part = prior === -1 ? "" : content.slice(prior + 1, last);
+  const partLine =
+    /^\[part 1 of \d+; Read .+ for part 2\]$/.test(part) ||
+    /^\[the rest could not also be saved in parts to Read one at a time: .*\]$/.test(part);
+  return { head: content.slice(0, partLine ? prior : last), saved };
+}
+
+/**
+ * The whole output of a call whose logged result is tool-result-store's
+ * preview of it, or `undefined` (design §5.2: grounding needs the bodies
+ * the run read). runtime-core logs, and shows the model, only the first 100
+ * lines or 10 KB of a result over the threshold, then the path the whole
+ * was saved at; the claim the model reads further down a long page (the
+ * preview tells it to `Read` the parts) is in that file, not in the log.
+ *
+ * Read back only where it can be nothing but this call's own output:
+ *
+ * - the path is `<toolResultsRoot>/<runId>/<toolUseId>.txt` (or the
+ *   `<toolUseId>.<n>.txt` tool-result-store moves on to when the name is
+ *   taken) — THIS call's id, one run directory down, under the root the
+ *   runtime spills to; a logged result is the tool's output verbatim, so a
+ *   page that ends with a forged tail naming some other file reads nothing;
+ * - the file is a regular file opened inside that root, no link followed
+ *   (`@crewhaus/tool-safety/fs`), at most {@link MAX_SPILL_BYTES};
+ * - it begins with the head the log holds.
+ *
+ * Anything else — a file gone, a tenant root not passed here — leaves the
+ * preview as the record's text: fewer words, a claim further down unmet,
+ * never more than the run read.
+ */
+export function spilledOutput(
+  content: string,
+  toolUseId: string,
+  opts: Pick<EvidenceOptions, "workspaceRoot" | "toolResultsRoot"> = {},
+): string | undefined {
+  const tail = spillTail(content);
+  if (tail === undefined || tail.head === "") return undefined;
+  const workspace = path.resolve(opts.workspaceRoot ?? process.cwd());
+  const root = path.resolve(workspace, opts.toolResultsRoot ?? DEFAULT_TOOL_RESULTS_DIR);
+  const rel = path.relative(root, path.resolve(workspace, tail.saved));
+  const parts = rel.split(path.sep);
+  if (parts.length !== 2 || parts.some((part) => part === "" || part === "..")) return undefined;
+  const name = parts[1] as string;
+  const own = `${toolUseId}.`;
+  if (!name.startsWith(own) || !/^(?:\d{1,4}\.)?txt$/.test(name.slice(own.length))) {
+    return undefined;
+  }
+  const read = openForReadSync(root, rel, { maxBytes: MAX_SPILL_BYTES, followLeafSymlink: false });
+  if (!read.ok || read.truncated) return undefined;
+  const whole = read.text;
+  return whole.startsWith(tail.head) && whole.length > tail.head.length ? whole : undefined;
 }
 
 /** A tool result's text: a string as is, the text blocks of an array joined. */
@@ -532,29 +688,29 @@ export type EvidenceMessage = {
 /**
  * Records for every completed tool call in a transcript, in call order. A
  * `tool_use` with no `tool_result` yet is not a record (the call never
- * finished); a result whose call is not in the transcript is skipped.
+ * finished); a result whose call is not in the transcript is skipped. An id
+ * that appears twice (a provider that reuses ids) pairs its LAST call with
+ * its LAST result, as the log walk does (`evidenceFromSessionLog`). A
+ * result the runtime spilled is read whole (`spilledOutput`).
  */
 export function evidenceFromMessages(
   messages: ReadonlyArray<EvidenceMessage>,
   opts: EvidenceOptions = {},
 ): EvidenceRecord[] {
-  const uses: Array<{ id: string; name: string; input: unknown }> = [];
-  const seen = new Set<string>();
+  const order: string[] = [];
+  const uses = new Map<string, { name: string; input: unknown }>();
   const results = new Map<string, { content: string; isError: boolean }>();
   for (const message of messages) {
     if (!Array.isArray(message.content)) continue;
     for (const block of message.content as ReadonlyArray<unknown>) {
       if (!isRecordObject(block)) continue;
       if (block["type"] === "tool_use" && typeof block["id"] === "string") {
-        if (seen.has(block["id"])) continue;
-        seen.add(block["id"]);
-        uses.push({
-          id: block["id"],
+        if (!uses.has(block["id"])) order.push(block["id"]);
+        uses.set(block["id"], {
           name: typeof block["name"] === "string" ? block["name"] : "unknown",
           input: block["input"],
         });
       } else if (block["type"] === "tool_result" && typeof block["tool_use_id"] === "string") {
-        if (results.has(block["tool_use_id"])) continue;
         results.set(block["tool_use_id"], {
           content: resultText(block["content"]),
           isError: block["is_error"] === true,
@@ -563,11 +719,22 @@ export function evidenceFromMessages(
     }
   }
   const out: EvidenceRecord[] = [];
-  for (const use of uses) {
-    const result = results.get(use.id);
+  for (const id of order) {
+    const use = uses.get(id) as { name: string; input: unknown };
+    const result = results.get(id);
     if (result === undefined) continue;
+    const body = spilledOutput(result.content, id, opts);
     out.push(
-      recordFromCall({ toolUseId: use.id, toolName: use.name, input: use.input, ...result }, opts),
+      recordFromCall(
+        {
+          toolUseId: id,
+          toolName: use.name,
+          input: use.input,
+          ...result,
+          ...(body !== undefined ? { body } : {}),
+        },
+        opts,
+      ),
     );
   }
   return out;
@@ -584,6 +751,8 @@ export type SessionLogEvidenceOptions = {
   readonly maxDepth?: number;
   /** Workspace root for path-shaped inputs (default `process.cwd()`). */
   readonly workspaceRoot?: string;
+  /** Where the runtime spilled large results (see `EvidenceOptions.toolResultsRoot`). */
+  readonly toolResultsRoot?: string;
   /**
    * Told when a session's log could not be read to its end — a torn last
    * line from a crash mid-append, a malformed line, a link where the log
@@ -600,14 +769,23 @@ type LogSlot =
  * Records for every completed tool call in a session's event log, child
  * sessions included, in call order: a child's calls are placed where its
  * `sub_agent_start` bracket sits in the parent, because that is when they
- * ran. The walk is the one `continuity-store`'s `resolveEvidence` makes —
- * `sub_agent_start` payloads name a `childSessionId`, a session is read
- * once, the depth is bounded — so a researcher child's fetches ground the
- * parent's answer.
+ * ran. The child walk follows the brackets `continuity-store`'s
+ * `resolveEvidence` follows — `sub_agent_start` payloads name a
+ * `childSessionId`, a session is read once, the depth is bounded — so a
+ * researcher child's fetches ground the parent's answer. (It is not that
+ * function: this reads every call of the tree once, in call order, where
+ * `resolveEvidence` looks one id up breadth-first.)
  *
- * A `tool_use` logged twice under one id (an approval replay: the second
- * line records the input that RAN) keeps its first position and the last
- * input. `turnNumber` is carried when a payload records one. A missing log
+ * One id logged more than once in a session pairs its LAST `tool_use` with
+ * its LAST `tool_result`, at the position it first appeared — the rule
+ * continuity-store's `scanSession` applies, so `PlanComplete` and the
+ * `checked` rung read one log the same way (design §6.3). An approval
+ * replay logs the `tool_use` twice (the second line records the input that
+ * RAN) and the result once; a provider that reuses ids (an
+ * OpenAI-compatible server's `functions.<name>:<n>`) logs both twice, and
+ * the last call is paired with its own result rather than with the first
+ * call's. A result the runtime spilled is read whole (`spilledOutput`).
+ * `turnNumber` is carried when a payload records one. A missing log
  * — the session's or a child's — yields no records, never a throw. A log
  * that cannot be read to its end (`@crewhaus/event-log` throws at a
  * malformed line — a crash mid-append leaves one — or refuses a link at
@@ -629,8 +807,10 @@ export async function evidenceFromSessionLog(
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
   const includeChildren = opts.includeChildren ?? true;
   const maxDepth = opts.maxDepth ?? DEFAULT_MAX_DEPTH;
-  const roots: EvidenceOptions =
-    opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {};
+  const roots: EvidenceOptions = {
+    ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
+    ...(opts.toolResultsRoot !== undefined ? { toolResultsRoot: opts.toolResultsRoot } : {}),
+  };
   const visited = new Set<string>();
   const out: EvidenceRecord[] = [];
 
@@ -638,7 +818,7 @@ export async function evidenceFromSessionLog(
     if (visited.has(sessionId)) return;
     visited.add(sessionId);
     // openEventLog creates its root directory; a read must not.
-    if (!existsSync(join(rootDir, `${sessionId}.jsonl`))) return;
+    if (!existsSync(path.join(rootDir, `${sessionId}.jsonl`))) return;
     const log = await openEventLog(sessionId, { rootDir });
     const slots: LogSlot[] = [];
     const uses = new Map<string, { name: string; input: unknown; turnNumber?: number }>();
@@ -661,7 +841,6 @@ export async function evidenceFromSessionLog(
                 : {}),
           });
         } else if (event.kind === "tool_result" && typeof p["toolUseId"] === "string") {
-          if (results.has(p["toolUseId"])) continue;
           const turnNumber = turnOf(p);
           results.set(p["toolUseId"], {
             content: resultText(p["content"]),
@@ -692,6 +871,7 @@ export async function evidenceFromSessionLog(
       const result = results.get(slot.id);
       if (use === undefined || result === undefined) continue;
       const turnNumber = use.turnNumber ?? result.turnNumber;
+      const body = spilledOutput(result.content, slot.id, roots);
       out.push(
         recordFromCall(
           {
@@ -699,6 +879,7 @@ export async function evidenceFromSessionLog(
             toolName: use.name,
             input: use.input,
             content: result.content,
+            ...(body !== undefined ? { body } : {}),
             isError: result.isError,
             sessionId,
             ...(turnNumber !== undefined ? { turnNumber } : {}),
@@ -730,14 +911,17 @@ function mergeRecords(first: EvidenceRecord, later: EvidenceRecord): EvidenceRec
   const hits = first.hits ?? later.hits;
   const sessionId = first.sessionId ?? later.sessionId;
   const turnNumber = first.turnNumber ?? later.turnNumber;
+  const whole = body.body ?? (takeLater ? first.body : later.body);
   return {
     toolUseId: first.toolUseId,
     toolName: first.toolName === "unknown" ? later.toolName : first.toolName,
     input: first.input,
     content: body.content,
+    ...(whole !== undefined ? { body: whole } : {}),
     isError: body.isError,
     ...(sessionId !== undefined ? { sessionId } : {}),
     origins: [...new Set([...first.origins, ...later.origins])],
+    ...(body.status !== undefined ? { status: body.status } : {}),
     ...(turnNumber !== undefined ? { turnNumber } : {}),
     ...(takeLater && later.hits !== undefined
       ? { hits: later.hits }
@@ -749,7 +933,8 @@ function mergeRecords(first: EvidenceRecord, later: EvidenceRecord): EvidenceRec
 
 /** A view of `record` as one hit's own evidence: the hit's text, under the hit's origin. */
 function hitView(record: EvidenceRecord, hit: { origin: string; content: string }): EvidenceRecord {
-  const { hits: _hits, ...call } = record;
+  // The hit's text alone: never the whole output it was read from.
+  const { hits: _hits, body: _body, status: _status, ...call } = record;
   return { ...call, content: hit.content, origins: [hit.origin] };
 }
 

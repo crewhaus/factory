@@ -330,6 +330,50 @@ describe("provability.citationValidity", () => {
     );
     expect((await citationValidity(sample(), runWith(bundle))).score).toBe(1);
   });
+
+  // Design §9.1: defined markers / markers counts the markers the answer
+  // WROTE. A definition's gloss sentence is a claim citing that definition
+  // through a synthetic self-binding — defined by construction — so it must
+  // not add a defined marker to either side of the ratio.
+  const GLOSS = "Refunds are processed within five business days of receipt.";
+
+  test("a definition's gloss claim adds no marker (its self-binding is not one the answer wrote)", async () => {
+    const bundle = await bundleFor(
+      `The refund window is 14 days [1] [2].\n\n[1]: ${POLICY} ${GLOSS}`,
+      "cited",
+    );
+    // The verifier does read the gloss as a claim bound to [1] …
+    expect(bundle.claims.some((c) => c.definition === "[1]" && c.bindings.length === 1)).toBe(true);
+    // … but the answer wrote two markers, one of them dangling.
+    const result = await citationValidity(sample(), runWith(bundle));
+    expect(result).toMatchObject({ passed: false, score: 0.5 });
+    expect(result.rationale).toContain("1/2 markers defined");
+    expect(result.rationale).toContain("no definition for [2]");
+  });
+
+  test("a gloss sentence cannot lift a ratio just under the bar over it", async () => {
+    const cited = Array.from({ length: 98 }, (_, i) => `Clause ${i + 1} holds as written [1].`);
+    const answer = `${cited.join(" ")} The refund window is 14 days [2].\n\n[1]: ${POLICY}`;
+    const without = await citationValidity(sample(), runWith(await bundleFor(answer, "cited")));
+    expect(without.passed).toBe(false);
+    expect(without.rationale).toContain("98/99 markers defined");
+    const glossed = await citationValidity(
+      sample(),
+      runWith(await bundleFor(`${answer} ${GLOSS}`, "cited")),
+    );
+    expect(glossed).toMatchObject({ passed: false, score: without.score });
+    expect(glossed.rationale).toContain("98/99 markers defined");
+  });
+
+  test("an answer whose only markers sit under a gloss is still vacuous", async () => {
+    const bundle = await bundleFor(
+      `The refund window is 14 days.\n\n[1]: ${POLICY} ${GLOSS}`,
+      "cited",
+    );
+    const result = await citationValidity(sample(), runWith(bundle));
+    expect(result).toMatchObject({ passed: true, score: 1 });
+    expect(result.rationale).toContain("no citation markers to check (vacuous)");
+  });
 });
 
 describe("provability.assumptionRate", () => {
@@ -368,6 +412,15 @@ describe("provability.assumptionRate", () => {
       passed: true,
       score: 0,
     });
+  });
+
+  test("a proof's hypotheses count: a proof that assumes its conclusion is not 0 assumptions", async () => {
+    const proven = await bundleFor(twoClaims(false), "cited");
+    // The bundle a proven claim leaves when its proof rests on one hypothesis.
+    const bundle = { ...proven, hypotheses: 1 };
+    const result = await assumptionRate(sample(), runWith(bundle));
+    expect(result).toMatchObject({ passed: false, score: 0.5 });
+    expect(result.rationale).toContain("1 proof hypothesis counted");
   });
 });
 

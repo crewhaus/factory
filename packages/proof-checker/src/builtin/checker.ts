@@ -11,7 +11,7 @@
  * text and evaluates exact arithmetic, and every loop spends from a bounded
  * {@link Budget}.
  */
-import type { CheckInput, CheckResult, ProofChecker } from "../types";
+import type { CheckResult } from "../types";
 import { BUILTIN_LIMITS, Budget, CheckFailure } from "./budget";
 import { compare, domainValues, evalClosed, evalFormula, explainFalse } from "./evaluate";
 import { neverTrue } from "./everywhere";
@@ -876,7 +876,7 @@ const OUTPUT_CAP = 4_000;
 const ASSUMPTION_TEXT_CAP = 2_000;
 
 /** The first finite, non-negative budget; a NaN must not disable the deadline. */
-function usableMs(...candidates: ReadonlyArray<number | undefined>): number {
+export function usableMs(...candidates: ReadonlyArray<number | undefined>): number {
   for (const c of candidates) {
     if (typeof c === "number" && Number.isFinite(c) && c >= 0) return c;
   }
@@ -897,7 +897,9 @@ function clipOutput(lines: readonly string[]): string {
 
 /**
  * Check a statement against a certificate. Pure and synchronous; never
- * throws — every refusal is `{ ok: false, reason }`.
+ * throws — every refusal is `{ ok: false, reason }`. It holds the thread
+ * that calls it for up to its whole budget, so `createBuiltinChecker`
+ * (./runner) calls it on a worker thread, never on the harness's.
  */
 export function checkCertificate(input: {
   readonly statement: string;
@@ -1064,40 +1066,4 @@ function evaluateStatement(
   } catch {
     return undefined;
   }
-}
-
-/** Options for {@link createBuiltinChecker}. */
-export type BuiltinCheckerOptions = {
-  /**
-   * Per-check budget when the input carries none (default 10 s). Capped at
-   * `BUILTIN_LIMITS.maxTimeoutMs` (10 s) whatever is passed: the check runs
-   * synchronously on the caller's thread, so `formal.timeout_ms` — sized for
-   * a container's cold start — must not become a 30 s stall of a daemon.
-   */
-  readonly timeoutMs?: number;
-};
-
-/** The `builtin` checker: always available, no sandbox, no model. */
-export function createBuiltinChecker(opts: BuiltinCheckerOptions = {}): ProofChecker {
-  return {
-    id: BUILTIN_CHECKER_ID,
-    language: BUILTIN_LANGUAGE,
-    async available() {
-      return { ok: true };
-    },
-    async check(input: CheckInput): Promise<CheckResult> {
-      const started = performance.now();
-      const verdict = checkCertificate({
-        statement: input.statement,
-        proof: input.proof,
-        timeoutMs: usableMs(input.timeoutMs, opts.timeoutMs),
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      });
-      return {
-        ...verdict,
-        checker: BUILTIN_CHECKER_ID,
-        durationMs: Math.round(performance.now() - started),
-      };
-    },
-  };
 }

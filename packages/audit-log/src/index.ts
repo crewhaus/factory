@@ -105,6 +105,12 @@ export type AuditKind =
   // The raw outbound payload is NEVER stored verbatim — only the lineage
   // summary. The egress-classifier's `summarizeEgress(result)` produces
   // the human-readable form that lands in the `payload_summary` field.
+  // 0.8.0 (design/0.8.0-provability-release.md §6.1, §10) — the provability
+  // gate's `sources.resolve: head` requests land here too, one record per
+  // request decided: `{ sinkId: "provability.resolve", sinkScope:
+  // "external-dynamic", verdict, method: "HEAD", host?, status?, reason?
+  // ("egress" | "refused" | "failed"), originsFound?, matchCount? }` — the
+  // host, never the URL (its path and query are model-written).
   | "egress_decision"
   // Pillar 3 intent gate — `runtime-core`'s justification gate appends one
   // record per justification-evaluated tool call (allow OR deny) when a

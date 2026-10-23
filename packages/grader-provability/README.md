@@ -40,6 +40,8 @@ registerProvabilityGraders(registry); // the six names above
 ```
 
 `crewhaus eval` registers them in its default registry, so a graders file can name them with
-`type: registry`, and `crewhaus eval --provability <level>` adds all six to the run. Added that
-way, they sit beside your graders' `combine:` policy rather than inside it: a sample passes only
-when your graders pass and every provability bar holds, and the cost is reported only.
+`type: registry`, and `crewhaus eval --provability <level>` adds all six to the run. Either way,
+they sit beside your graders' `combine:` policy rather than inside it: a sample passes only when
+your graders pass and every provability bar holds, and the cost is reported only. A `weight` on one
+of them is not used, and under `combine: any` or `weighted` the run says so at start.
+`provabilityGraderRole(name)` gives each grader's role.

@@ -34,7 +34,8 @@
  *
  * `show`, `audit` and `prune` read the managed shape's bundles too, which a
  * tenant-scoped gate files under the tenants root instead of `.crewhaus/`
- * (see {@link MANAGED_TENANTS_ROOT_DEFAULT}). Every text renderer passes what
+ * (see {@link MANAGED_TENANTS_ROOT_DEFAULT}), and the research shape's, one
+ * per run beside its report (see {@link researchDirs}). Every text renderer passes what
  * it prints through {@link ttySafe}: bundles hold model prose and fetched
  * page text.
  *
@@ -50,12 +51,18 @@ import {
   readdirSync,
   realpathSync,
   statSync,
+  unlinkSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { citationDefinitions, classifyDefinition, contentTokens } from "@crewhaus/claim-ledger";
 import { lower, provabilityOf } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
-import { type GateCatalog, catalogReplay, proofsDirName } from "@crewhaus/evaluation-service";
+import {
+  type GateCatalog,
+  catalogReplay,
+  proofsDirName,
+  wantsProofCheckTools,
+} from "@crewhaus/evaluation-service";
 import { openEventLog } from "@crewhaus/event-log";
 import type { ParsedArgs } from "@crewhaus/infra-utils";
 import { DEFAULT_LEAN4_IMAGE, DEFAULT_SMT_IMAGE, KNOWN_CHECKER_IDS } from "@crewhaus/proof-checker";
@@ -128,17 +135,19 @@ export function isProvabilityAction(value: string): value is ProvabilityAction {
 export const MANAGED_TENANTS_ROOT_DEFAULT = "/tmp/crewhaus-tenants";
 
 export const PROVABILITY_USAGE =
-  "usage: crewhaus provability show [<spec.yaml>] [--session <id>] [--turn N] [--tenants-root <dir>]\n" +
-  "                [--json]\n" +
+  "usage: crewhaus provability show [<spec.yaml>] [--session <id>] [--turn N [--pass K]]\n" +
+  "                [--tenants-root <dir>] [--json]\n" +
   "       crewhaus provability check <answer.md> --level <rung> [--evidence <dir>] [--session <id>]\n" +
-  "                [--spec <spec.yaml>] [--json]\n" +
+  "                [--spec <spec.yaml>] [--report] [--tenant <id> [--tenants-root <dir>]] [--json]\n" +
   "       crewhaus provability audit [<spec.yaml>] [--since 7d] [--tenants-root <dir>] [--json]\n" +
   "       crewhaus provability checkers [<spec.yaml>] [--json]\n" +
   "       crewhaus provability prune [<spec.yaml>] --older-than 90d [--dry-run] [--tenants-root <dir>]\n" +
   "                [--json]\n" +
   "  The proof bundles the provability gate files under .crewhaus/proofs/<spec>/<session>/ — on\n" +
-  "  the managed shape, under <tenants-root>/<tenant>/proofs/<spec>/<session>/ instead.\n" +
-  "  show      one bundle in long form (default: the latest; --json prints it as persisted)\n" +
+  "  the managed shape, under <tenants-root>/<tenant>/proofs/<spec>/<session>/ instead; a\n" +
+  "  research run's report bundle is .crewhaus/research/<run>/proof.json (--session <run>).\n" +
+  "  show      one bundle in long form (default: the latest; --json prints it as persisted).\n" +
+  "            A retried turn keeps every pass: --pass K reads its K-th (default: the last)\n" +
   "  check     the gate, offline, over any document: exit 0 on pass, 1 otherwise. Evidence is\n" +
   "            the session's event log (--session), a directory of fetched bodies (--evidence:\n" +
   "            each file is one body; its URL is a sidecar <file>.url or the first line\n" +
@@ -148,18 +157,22 @@ export const PROVABILITY_USAGE =
   "            and the session, tenants and knowledge directories wherever they live).\n" +
   "            Config: --spec's provability block (--level overrides its floor), else the\n" +
   "            defaults at --level. No HEAD request and no waiver judge run offline.\n" +
+  "            --report grades a research report.md as its gate did: without the writer's\n" +
+  "            trailer (## Citations, ## Provability). --tenant also reads a managed tenant's\n" +
+  "            session log and proof artifacts under the tenants root.\n" +
   "  audit     roll-up of bundles and provability_graded lines: achieved rungs, unmet\n" +
   "            reasons, assumption and judge-waiver rates, and gaming signals\n" +
   "  checkers  every proof checker: available or why not, and its statement language\n" +
   "  prune     delete bundles older than --older-than (proof artifacts are kept)\n" +
   "  --tenants-root  also read managed bundles (default: CREWHAUS_TENANTS_ROOT, else\n" +
-  "                  /tmp/crewhaus-tenants when the spec's target is managed)\n" +
+  "                  /tmp/crewhaus-tenants when the spec's target is managed); on check,\n" +
+  "                  where --tenant's session log and proof artifacts are\n" +
   "  Rungs: cited, grounded, checked, proven. Durations: 30m, 12h, 7d, 2w.\n";
 
 /** Which flags each verb reads; any other declared flag on it is refused. */
 const FLAGS_BY_ACTION: Readonly<Record<ProvabilityAction, readonly string[]>> = {
-  show: ["session", "turn", "tenants-root", "json"],
-  check: ["level", "evidence", "session", "spec", "json"],
+  show: ["session", "turn", "pass", "tenants-root", "json"],
+  check: ["level", "evidence", "session", "spec", "report", "tenants-root", "tenant", "json"],
   audit: ["since", "tenants-root", "json"],
   checkers: ["json"],
   prune: ["older-than", "dry-run", "tenants-root", "json"],
@@ -202,6 +215,10 @@ export type ProvabilityCliDeps = {
 // ---------------------------------------------------------------------------
 
 const SESSION_ID_RE = /^sess_[0-9a-f]{16}$/;
+/** A research run's id (citation-tracker's `newRunId`): its report bundle's key. */
+const RESEARCH_RUN_RE = /^run_[0-9a-f]{16}$/;
+/** Largest research report bundle read back (the bundle store's own cap). */
+const MAX_RESEARCH_BUNDLE_BYTES = 16 * 1024 * 1024;
 /** Largest document `check` reads, and largest body it reads per evidence file. */
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -218,6 +235,8 @@ type SpecView = {
   /** The lowered `target:` (`cli`, `managed`, …), when the IR carries one. */
   readonly target?: string;
   readonly provability?: ProvabilityConfig;
+  /** The lowered `tools:` — builtin keys, categories expanded. */
+  readonly tools: readonly string[];
   /** The proofs directory the gate files this spec's bundles under. */
   readonly proofsDir: string;
 };
@@ -245,8 +264,15 @@ function loadSpec(path: string, cwd: string): SpecView {
     name,
     ...(typeof target === "string" ? { target } : {}),
     ...(provability !== undefined ? { provability } : {}),
+    tools: irToolKeys(ir),
     proofsDir: proofsDirName(name),
   };
+}
+
+/** The lowered `tools:` — builtin keys (`proofCheck`), categories already expanded. */
+export function irToolKeys(ir: unknown): string[] {
+  const tools = (ir as { readonly tools?: unknown }).tools;
+  return Array.isArray(tools) ? tools.filter((t): t is string => typeof t === "string") : [];
 }
 
 /** `<cwd>/.crewhaus/proofs`. */
@@ -287,6 +313,11 @@ type SpecDir = {
   readonly root: string;
   /** The managed tenant whose root holds this directory; absent for `<cwd>/.crewhaus/proofs`. */
   readonly tenant?: string;
+  /**
+   * The research shape's run directory (`<cwd>/.crewhaus/research`), whose
+   * bundles are `<runId>/proof.json` — see {@link researchDirs}.
+   */
+  readonly research?: true;
 };
 
 /** The spec directories under one proofs directory, narrowed to `only` when given. */
@@ -400,9 +431,89 @@ function tenantSessionRoots(scope: TenantsScope): string[] {
     .filter(isRealDir);
 }
 
-/** Every spec directory a reader verb reads: the harness's own, then the tenants'. */
+/**
+ * The research shape's report bundles (design §5.4, §8): its report gate
+ * writes one bundle per run as `.crewhaus/research/<runId>/proof.json`,
+ * beside the `report.md` it grades — not under `.crewhaus/proofs/`, whose
+ * store keys bundles by `sess_` session and has no place for a run. Read when
+ * no spec narrows the verb, or when the named spec is a research one. Below
+ * the directory nothing is followed: a run directory and its `proof.json`
+ * must be real ({@link researchListings}), as everywhere else in the tree.
+ */
+function researchDirs(cwd: string, spec: SpecView | undefined): SpecDir[] {
+  if (spec !== undefined && spec.target !== "research") return [];
+  const root = join(resolve(cwd), ".crewhaus", "research");
+  return isRealDir(root) ? [{ name: spec?.proofsDir ?? "research", root, research: true }] : [];
+}
+
+/** Every spec directory a reader verb reads: the harness's own, its research runs, the tenants'. */
 function allSpecDirs(cwd: string, spec: SpecView | undefined, tenants: TenantsScope | undefined) {
-  return [...specDirs(cwd, spec), ...(tenants !== undefined ? tenantSpecDirs(tenants) : [])];
+  return [
+    ...specDirs(cwd, spec),
+    ...researchDirs(cwd, spec),
+    ...(tenants !== undefined ? tenantSpecDirs(tenants) : []),
+  ];
+}
+
+/** One research run's bundle per real `run_<16 hex>/proof.json` under `root`; turn 1, pass 1. */
+function researchListings(root: string): BundleListing[] {
+  let runs: string[];
+  try {
+    runs = readdirSync(root).sort();
+  } catch {
+    return [];
+  }
+  const out: BundleListing[] = [];
+  for (const run of runs) {
+    if (!RESEARCH_RUN_RE.test(run) || !isRealDir(join(root, run))) continue;
+    const path = join(root, run, "proof.json");
+    try {
+      const stat = lstatSync(path);
+      if (stat.isFile())
+        out.push({ sessionId: run, turnNumber: 1, pass: 1, path, mtimeMs: stat.mtimeMs });
+    } catch {
+      // no report gate ran (an ungated run, or one still in flight)
+    }
+  }
+  return out;
+}
+
+/**
+ * A research run's bundle, read the way the bundle store reads one: contained
+ * under the research directory, never through a link, capped, and the same
+ * top-level shape (deeper checks are {@link bundleProblem}'s, as for any).
+ */
+async function readResearchBundle(listing: Listing): Promise<ProofBundle> {
+  const rel = `${listing.sessionId}/proof.json`;
+  const read = await openForRead(listing.spec.root, rel, {
+    maxBytes: MAX_RESEARCH_BUNDLE_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    throw new ProvabilityCliError(`provability: refusing to read ${listing.path}: ${read.reason}`);
+  }
+  if (read.truncated) {
+    throw new ProvabilityCliError(
+      `provability: ${listing.path} is larger than ${MAX_RESEARCH_BUNDLE_BYTES} bytes`,
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(read.text);
+  } catch (err) {
+    throw new ProvabilityCliError(`provability: ${listing.path} is not valid JSON`, err);
+  }
+  const v = isObject(value) ? value : {};
+  if (
+    v["version"] !== 1 ||
+    typeof v["level"] !== "string" ||
+    typeof v["verdict"] !== "string" ||
+    !Array.isArray(v["claims"]) ||
+    typeof v["bundleHash"] !== "string"
+  ) {
+    throw new ProvabilityCliError(`provability: ${listing.path} is not a proof bundle`);
+  }
+  return value as ProofBundle;
 }
 
 /** How a tenants scope reads in a header or a note. */
@@ -413,10 +524,17 @@ function tenantsWords(scope: TenantsScope): string {
 type Listing = BundleListing & { readonly spec: SpecDir };
 
 /** Every bundle under `dirs`, newest first. */
-async function listings(dirs: readonly SpecDir[]): Promise<Listing[]> {
+async function listings(
+  dirs: readonly SpecDir[],
+  opts: { readonly allPasses?: boolean } = {},
+): Promise<Listing[]> {
   const out: Listing[] = [];
   for (const dir of dirs) {
-    for (const listing of await createBundleStore({ rootDir: dir.root }).list()) {
+    const found =
+      dir.research === true
+        ? researchListings(dir.root)
+        : await createBundleStore({ rootDir: dir.root }).list(opts);
+    for (const listing of found) {
       out.push({ ...listing, spec: dir });
     }
   }
@@ -424,6 +542,7 @@ async function listings(dirs: readonly SpecDir[]): Promise<Listing[]> {
     (a, b) =>
       b.mtimeMs - a.mtimeMs ||
       b.turnNumber - a.turnNumber ||
+      b.pass - a.pass ||
       a.sessionId.localeCompare(b.sessionId) ||
       a.spec.name.localeCompare(b.spec.name) ||
       (a.spec.tenant ?? "").localeCompare(b.spec.tenant ?? ""),
@@ -431,10 +550,13 @@ async function listings(dirs: readonly SpecDir[]): Promise<Listing[]> {
 }
 
 async function readListing(listing: Listing): Promise<ProofBundle> {
+  if (listing.spec.research === true) return readResearchBundle(listing);
   const store = createBundleStore({ rootDir: listing.spec.root });
+  // The listing's own pass: a turn a retry graded again keeps every pass.
   const bundle = await store.get(
     listing.sessionId === NO_SESSION ? undefined : listing.sessionId,
     listing.turnNumber,
+    listing.pass,
   );
   if (bundle === undefined) {
     throw new ProvabilityCliError(`provability: ${listing.path} vanished while reading`);
@@ -487,12 +609,23 @@ function flagString(args: ParsedArgs, name: string): string | undefined {
   return value;
 }
 
-function sessionFlag(args: ParsedArgs, allowNoSession: boolean): string | undefined {
+/**
+ * `--session`: a `sess_<16 hex>` always; for `show`, also `no-session` and a
+ * research run's `run_<16 hex>` (the key its report bundle is filed under).
+ */
+function sessionFlag(args: ParsedArgs, bundleKeys: boolean): string | undefined {
   const session = flagString(args, "session");
   if (session === undefined) return undefined;
-  if (SESSION_ID_RE.test(session) || (allowNoSession && session === NO_SESSION)) return session;
+  if (
+    SESSION_ID_RE.test(session) ||
+    (bundleKeys && (session === NO_SESSION || RESEARCH_RUN_RE.test(session)))
+  ) {
+    return session;
+  }
   throw new ProvabilityCliError(
-    `invalid --session "${session}" — expected sess_<16 hex>${allowNoSession ? ` or "${NO_SESSION}"` : ""}`,
+    `invalid --session "${session}" — expected sess_<16 hex>${
+      bundleKeys ? `, "${NO_SESSION}" or a research run's run_<16 hex>` : ""
+    }`,
   );
 }
 
@@ -735,8 +868,18 @@ export function renderBundleLong(
   );
   lines.push(`  achieved    ${bundle.achieved}`);
   lines.push(`  sources     ${plural(bundle.sources, "distinct origin")}`);
+  // Every surface counts a proof's hypotheses as assumptions (design §6.4,
+  // §10), as the footer below does.
+  const hypotheses = bundle.hypotheses ?? 0;
   lines.push(
-    `  assumptions ${bundle.assumptions + refused}${refused > 0 ? ` (${refused} refused)` : ""}`,
+    `  assumptions ${bundle.assumptions + hypotheses + refused}${
+      refused > 0 || hypotheses > 0
+        ? ` (${[
+            ...(hypotheses > 0 ? [plural(hypotheses, "proof hypothesis", "proof hypotheses")] : []),
+            ...(refused > 0 ? [`${refused} refused`] : []),
+          ].join(", ")})`
+        : ""
+    }`,
   );
   if (bundle.judgeWaived > 0 || bundle.judgeModel !== undefined) {
     lines.push(
@@ -792,6 +935,10 @@ export function renderBundleLong(
       lines.push(
         `  ${checker.id} — ${checker.artifact} · axioms: ${
           checker.axioms.length === 0 ? "none" : checker.axioms.join(", ")
+        }${
+          checker.assumptions !== undefined && checker.assumptions.length > 0
+            ? ` · assumes: ${checker.assumptions.join("; ")}`
+            : ""
         }`,
       );
     }
@@ -814,19 +961,40 @@ async function showCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise<
     }
     turn = Number(turnRaw);
   }
+  const passRaw = flagString(args, "pass");
+  let pass: number | undefined;
+  if (passRaw !== undefined) {
+    if (turn === undefined) {
+      throw new ProvabilityCliError("--pass names a pass of one turn — give --turn too");
+    }
+    if (!/^\d{1,4}$/.test(passRaw) || Number(passRaw) < 1) {
+      throw new ProvabilityCliError(
+        `invalid --pass "${passRaw}" — expected a pass number (1, 2, …)`,
+      );
+    }
+    pass = Number(passRaw);
+  }
   const specPath = args.positional[0];
   const spec = specPath !== undefined ? loadSpec(specPath, deps.cwd) : undefined;
   const tenants = tenantsScope(args, deps, spec);
-  const found = (await listings(allSpecDirs(deps.cwd, spec, tenants))).filter(
+  // Each turn's last pass — its standing bundle — unless a pass is named.
+  const found = (
+    await listings(
+      allSpecDirs(deps.cwd, spec, tenants),
+      pass !== undefined ? { allPasses: true } : {},
+    )
+  ).filter(
     (l) =>
       (session === undefined || l.sessionId === session) &&
-      (turn === undefined || l.turnNumber === turn),
+      (turn === undefined || l.turnNumber === turn) &&
+      (pass === undefined || l.pass === pass),
   );
   const pick = found[0];
   if (pick === undefined) {
     const what = [
       session !== undefined ? `session ${session}` : undefined,
       turn !== undefined ? `turn ${turn}` : undefined,
+      pass !== undefined ? `pass ${pass}` : undefined,
     ].filter((s) => s !== undefined);
     const where =
       spec !== undefined
@@ -858,9 +1026,11 @@ async function showCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise<
     renderBundleLong(bundle, {
       title: [
         `proof bundle · ${path}`,
-        `  session     ${pick.sessionId} · turn ${pick.turnNumber}${
-          pick.spec.tenant !== undefined ? ` · tenant ${pick.spec.tenant}` : ""
-        }`,
+        pick.spec.research === true
+          ? `  run         ${pick.sessionId} · research report`
+          : `  session     ${pick.sessionId} · turn ${pick.turnNumber}${
+              pick.pass > 1 ? ` · pass ${pick.pass}` : ""
+            }${pick.spec.tenant !== undefined ? ` · tenant ${pick.spec.tenant}` : ""}`,
       ],
       path,
     }),
@@ -884,6 +1054,10 @@ async function showCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise<
  *     evidence given counts.
  *   - a workspace file the document cites by path is read from disk as it
  *     is now; the live gate grounds only on what a recorded `Read` returned.
+ *   - without `--session`, a `proof:` citation is held to its stored
+ *     artifact alone (provability's `trustStoredProofs`, which exists for
+ *     exactly this): there is no run log whose `ProofCheck` call the live
+ *     gate would also require. With `--session` that call is required.
  */
 export const CHECK_NOTES = {
   head: "sources.resolve: head is not applied offline — no request is sent; URLs are checked lexically",
@@ -894,6 +1068,14 @@ export const CHECK_NOTES = {
     `${plural(n, "workspace file")} cited by path ${n === 1 ? "was" : "were"} read directly from disk, as ${
       n === 1 ? "it is" : "they are"
     } now — the live gate grounds only on what a recorded Read returned`,
+  report: (line: number): string =>
+    `--report: from line ${line} on is the report writer's trailer (## Citations, then ## Provability) — the writer's text, not the run's claims, so it was not graded`,
+  reportHint: (line: number): string =>
+    `the document ends in a research report's trailer (## Citations, then ## Provability, from line ${line}): its lines were graded as claims — pass --report to grade only what the report's gate verified`,
+  storedProofs:
+    "proof: citations were checked against the stored artifacts alone — with no session log (--session) there is no ProofCheck call to hold them to; the live gate requires that call",
+  tenantHint: (words: string): string =>
+    `a managed harness files each tenant's session logs and proof artifacts under its tenants root, ${words}, which was not read — name the tenant with --tenant <id>`,
 } as const;
 
 /**
@@ -970,8 +1152,50 @@ type CheckedDocument = {
   readonly path: string;
   /** Decoded as openForRead decodes a source (a leading BOM dropped), so a copy compares equal. */
   readonly text: string;
+  /**
+   * What is graded: `text`, or under `--report` the part of a research
+   * report its gate verified ({@link reportTrailerAt}). A copy of either is
+   * the document.
+   */
+  readonly graded: string;
   readonly stat: { readonly dev: number; readonly ino: number };
 };
+
+/** `text` (or, `truncated`, its head) is the document again — whole, or the part of it graded. */
+function isCopyOfDocument(text: string, truncated: boolean, doc: CheckedDocument): boolean {
+  return (
+    isDocumentText(text, truncated, doc.text) ||
+    (doc.graded !== doc.text && isDocumentText(text, truncated, doc.graded))
+  );
+}
+
+/** The writer's trailer heading: from here on a gated research report is the writer's text. */
+const REPORT_TRAILER = "\n\n## Citations\n";
+/** …and the section a GATED report's trailer always ends in, whatever the verdict. */
+const REPORT_SECTION = "\n## Provability\n";
+
+/**
+ * Where a gated research report's writer trailer opens in `text`, or
+ * undefined when `text` does not end in one. The research shape serves
+ * `report.md` as the text its gate verified (title, definitions, branches),
+ * then `## Citations` (the visible list) and `## Provability` (the verdict
+ * table) — the WRITER's lines, not the run's claims, and graded as claims
+ * they fail every floor: a passing report re-checked whole fails (design
+ * §5.4, §11). The rule is report-writer's `verifiedReportText` (the LAST
+ * `## Citations`, with a `## Provability` after it); apps/cli does not depend
+ * on report-writer, so `provability-cli.test.ts` holds this copy to the
+ * writer's source.
+ *
+ * Used only under `--report`: any document may END in these two headings, so
+ * stripping them unasked would let an answer hide uncited claims under a
+ * fake trailer. Without the flag `check` grades the whole file and says the
+ * trailer is there.
+ */
+export function reportTrailerAt(text: string): number | undefined {
+  const at = text.lastIndexOf(REPORT_TRAILER);
+  if (at === -1 || !text.slice(at).includes(REPORT_SECTION)) return undefined;
+  return at;
+}
 
 const SELF_GROUNDING = "a document cannot ground its own claims";
 
@@ -1027,12 +1251,18 @@ function promptEchoAt(body: string): number {
  * whether that line opens a full WebFetch header (then `Status:` and
  * optionally `Content-Type:`, then a blank line — provability's
  * `webFetchHeader` rule), and the body after whichever it is.
+ *
+ * Leading BOMs are dropped first: the decoder drops only one, at byte 0, so a
+ * file saved with a second one (or re-encoded) would otherwise open with
+ * U+FEFF, fail the `URL:` match and be read whole — header and all — as page,
+ * and a copy of the document under that header would stop comparing equal.
  */
-function readEvidenceFile(text: string): {
+function readEvidenceFile(raw: string): {
   readonly lineUrl?: string;
   readonly webFetchHeader: boolean;
   readonly body: string;
 } {
+  const text = withoutLeadingBoms(raw);
   const firstEnd = text.indexOf("\n");
   const first = (firstEnd === -1 ? text : text.slice(0, firstEnd)).replace(/\r$/, "");
   const m = /^URL:\s*(\S+)\s*$/.exec(first);
@@ -1131,7 +1361,7 @@ async function evidenceDirRecords(
       }
       // A bare `URL:` first line is the origin only without a sidecar; with
       // one, only a full WebFetch header is transport, anything else is page.
-      if (!file.webFetchHeader) body = read.text;
+      if (!file.webFetchHeader) body = withoutLeadingBoms(read.text);
     } else {
       url = file.lineUrl !== undefined ? evidenceUrl(file.lineUrl) : undefined;
       if (url === undefined) {
@@ -1166,9 +1396,14 @@ async function evidenceDirRecords(
         continue;
       }
     }
+    // Every way the file can be read apart is compared — whole, after the
+    // `URL:` line or header (even where a sidecar makes that line page), and
+    // the body that would be indexed — so a copy saved under a header is a
+    // copy however the origin was named.
     if (
-      isDocumentText(read.text, read.truncated, doc.text) ||
-      isDocumentText(body, read.truncated, doc.text)
+      [read.text, file.body, body].some((candidate) =>
+        isCopyOfDocument(candidate, read.truncated, doc),
+      )
     ) {
       skip(`it is a copy of the document — ${SELF_GROUNDING}`);
       continue;
@@ -1242,11 +1477,12 @@ export const RELOCATED_STATE_ROOTS: Readonly<Record<string, string>> = {
  * the fleet knowledge store's default `.crewhaus-shared/`; and the managed
  * daemon's default tenants root — always, not only for a managed spec, since
  * any managed daemon on the machine files there and a harness directory that
- * contains it is reading that daemon's tenants. First match names the root.
+ * contains it is reading that daemon's tenants. `extra` adds the roots the
+ * command line named (`--tenants-root`). First match names the root.
  */
-function stateRoots(deps: ProvabilityCliDeps): StateRoot[] {
+function stateRoots(deps: ProvabilityCliDeps, extra: readonly StateRoot[] = []): StateRoot[] {
   const cwd = resolve(deps.cwd);
-  const roots: StateRoot[] = [{ dir: join(cwd, ".crewhaus"), why: DOT_CREWHAUS_WHY }];
+  const roots: StateRoot[] = [{ dir: join(cwd, ".crewhaus"), why: DOT_CREWHAUS_WHY }, ...extra];
   for (const [name, why] of Object.entries(RELOCATED_STATE_ROOTS)) {
     const value = deps.env[name];
     if (value === undefined || value.trim() === "") continue;
@@ -1297,11 +1533,10 @@ async function workspaceFileRecords(
   opts: { readonly cwd: string; readonly stateRoots: readonly StateRoot[] },
 ): Promise<EvidenceLoad> {
   const { cwd } = opts;
-  const { text } = doc;
   const records: EvidenceRecord[] = [];
   const notes: string[] = [];
   const seen = new Set<string>();
-  for (const source of citationDefinitions(text).values()) {
+  for (const source of citationDefinitions(doc.graded).values()) {
     const ref = classifyDefinition(source);
     if (ref.kind !== "path") continue;
     const rel = originKey(ref, { workspaceRoot: cwd });
@@ -1330,7 +1565,7 @@ async function workspaceFileRecords(
     }
     const read = await openForRead(cwd, rel, { maxBytes: MAX_BODY_BYTES });
     if (!read.ok) continue; // the verifier says why (missing, outside the workspace)
-    if (isDocumentText(read.text, read.truncated, text)) {
+    if (isCopyOfDocument(read.text, read.truncated, doc)) {
       notes.push(`${rel} is a copy of the document — ${SELF_GROUNDING}`);
       continue;
     }
@@ -1410,6 +1645,54 @@ function loggedResults(
   };
 }
 
+/**
+ * The managed tenant `check` reads evidence for (`--tenant <id>`), and the
+ * tenants root it lies under. A managed turn runs under its request's tenant:
+ * the daemon logs the session under `<root>/<tenant>/sessions/` and
+ * `ProofCheck` files its artifacts under `<root>/<tenant>/proofs/<spec>/`
+ * (tool-proof's `defaultProofsRoot`), never `.crewhaus/` — so without the
+ * tenant a managed answer's `tool:` and `proof:` citations cannot be found
+ * offline. ONE tenant, named: an answer is that tenant's, and another
+ * tenant's evidence must not ground it. The root resolves as `show` and
+ * `audit` resolve it ({@link tenantsScope}); the tenant must be a tenant id
+ * and a real directory under it (a link is not followed).
+ */
+type CheckTenant = { readonly id: string; readonly dir: string; readonly scope: TenantsScope };
+
+function checkTenant(
+  args: ParsedArgs,
+  deps: ProvabilityCliDeps,
+  spec: SpecView | undefined,
+): { readonly tenant?: CheckTenant; readonly scope?: TenantsScope } {
+  const id = flagString(args, "tenant");
+  const scope = tenantsScope(args, deps, spec);
+  if (id === undefined) {
+    if (flagString(args, "tenants-root") !== undefined) {
+      throw new ProvabilityCliError(
+        "provability check: --tenants-root needs --tenant <id> — an answer is one tenant's, and only that tenant's evidence may ground it",
+      );
+    }
+    return scope !== undefined ? { scope } : {};
+  }
+  if (!isTenantId(id)) {
+    throw new ProvabilityCliError(
+      `invalid --tenant "${id}" — expected a tenant id (letters, digits, - and _, at most 64)`,
+    );
+  }
+  if (scope === undefined) {
+    throw new ProvabilityCliError(
+      `provability check: --tenant ${id} needs a tenants root — --tenants-root <dir>, CREWHAUS_TENANTS_ROOT, or a --spec whose target is managed`,
+    );
+  }
+  const dir = join(scope.root, id);
+  if (!isRealDir(dir)) {
+    throw new ProvabilityCliError(
+      `provability check: no tenant ${id} under the tenants root ${tenantsWords(scope)}`,
+    );
+  }
+  return { tenant: { id, dir, scope }, scope };
+}
+
 async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise<number> {
   const docPath = args.positional[0] as string;
   const absDoc = isAbsolute(docPath) ? docPath : resolve(deps.cwd, docPath);
@@ -1434,15 +1717,34 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
   // a BOM-prefixed document would stop comparing equal and ground every claim
   // in it. A BOM is an encoding mark, not text, so it is not graded either.
   const text = new TextDecoder().decode(readFileSync(absDoc));
+  const notes: string[] = [];
+  // A research report's writer trailer, graded only when not --report (see
+  // reportTrailerAt). Line numbers are the file's: the graded text is a prefix.
+  const trailerAt = reportTrailerAt(text);
+  const trailerLine = trailerAt !== undefined ? text.slice(0, trailerAt + 2).split("\n").length : 0;
+  let graded = text;
+  if (args.flags["report"] === true) {
+    if (trailerAt === undefined) {
+      throw new ProvabilityCliError(
+        `provability check --report: "${docPath}" does not end in a gated research report's trailer (## Citations, then ## Provability) — check it without --report`,
+      );
+    }
+    graded = `${text.slice(0, trailerAt)}\n`;
+    notes.push(CHECK_NOTES.report(trailerLine));
+  } else if (trailerAt !== undefined) {
+    notes.push(CHECK_NOTES.reportHint(trailerLine));
+  }
   const doc: CheckedDocument = {
     path: absDoc,
     text,
+    graded,
     stat: { dev: docStat.dev, ino: docStat.ino },
   };
 
   const level = levelFlag(args);
   const specPath = flagString(args, "spec");
   const spec = specPath !== undefined ? loadSpec(specPath, deps.cwd) : undefined;
+  const { tenant, scope: tenants } = checkTenant(args, deps, spec);
   let config: ProvabilityConfig;
   let configSource: string;
   if (spec?.provability !== undefined) {
@@ -1459,22 +1761,36 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
     );
   }
 
-  const notes: string[] = [];
   if (config.sources.resolve === "head") {
     config = { ...config, sources: { ...config.sources, resolve: "off" } };
     notes.push(CHECK_NOTES.head);
   }
   if (config.judge !== undefined) notes.push(CHECK_NOTES.judge);
   if (config.scope === "turn") notes.push(CHECK_NOTES.scope);
+  const cites = (kind: string): boolean =>
+    [...citationDefinitions(graded).values()].some((s) => classifyDefinition(s).kind === kind);
+  if (tenant === undefined && tenants !== undefined && (cites("proof") || cites("tool"))) {
+    notes.push(CHECK_NOTES.tenantHint(tenantsWords(tenants)));
+  }
 
   const records: EvidenceRecord[] = [];
   const summary: string[] = [];
   const session = sessionFlag(args, false);
   if (session !== undefined) {
-    const rootDir = sessionRoot(deps);
-    if (!existsSync(join(rootDir, `${session}.jsonl`))) {
+    // The tenant's logs first: a managed session is logged under its tenant.
+    const tenantSessions = tenant !== undefined ? join(tenant.dir, "sessions") : undefined;
+    const roots = [
+      ...(tenantSessions !== undefined && isRealDir(tenantSessions) ? [tenantSessions] : []),
+      sessionRoot(deps),
+    ];
+    const rootDir = roots.find((root) => existsSync(join(root, `${session}.jsonl`)));
+    if (rootDir === undefined) {
       throw new ProvabilityCliError(
-        `provability check: no event log for ${session} under ${shown(rootDir, deps.cwd)}`,
+        `provability check: no event log for ${session} under ${roots.map((r) => shown(r, deps.cwd)).join(" or ")}${
+          tenant === undefined && tenants !== undefined
+            ? ` — a managed harness logs each tenant's sessions under ${tenantsWords(tenants)}/<tenant>/sessions: name the tenant with --tenant <id>`
+            : ""
+        }`,
       );
     }
     const fromLog = await evidenceFromSessionLog({
@@ -1485,7 +1801,9 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
         notes.push(`the log of ${info.sessionId} could not be read to its end: ${info.message}`),
     });
     records.push(...fromLog);
-    summary.push(`${plural(fromLog.length, "tool call")} from ${session}`);
+    summary.push(
+      `${plural(fromLog.length, "tool call")} from ${session}${rootDir === tenantSessions ? ` (tenant ${tenant?.id})` : ""}`,
+    );
   }
   const evidenceDir = flagString(args, "evidence");
   if (evidenceDir !== undefined) {
@@ -1496,7 +1814,21 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
       `${plural(loaded.records.length, "fetched body", "fetched bodies")} from ${evidenceDir}`,
     );
   }
-  const files = await workspaceFileRecords(doc, { cwd: deps.cwd, stateRoots: stateRoots(deps) });
+  // A tenants root named on the command line is state like any other: a
+  // path citation into it is never read as a source.
+  const named =
+    tenants?.source === "--tenants-root"
+      ? [
+          {
+            dir: realOf(tenants.root) ?? tenants.root,
+            why: "the managed tenants root (--tenants-root) holds each tenant's session logs, bundles and state — the model's own text",
+          },
+        ]
+      : [];
+  const files = await workspaceFileRecords(doc, {
+    cwd: deps.cwd,
+    stateRoots: stateRoots(deps, named),
+  });
   records.push(...files.records);
   notes.push(...files.notes);
   if (files.records.length > 0) {
@@ -1505,26 +1837,39 @@ async function checkCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
   }
   const evidence = buildEvidenceIndex(records);
 
-  const artifactRoots =
-    spec !== undefined
+  // Proof artifacts: the harness's own proofs tree, then the tenant's.
+  const artifactRoots = [
+    ...(spec !== undefined
       ? [proofsRoot(deps.cwd, spec.proofsDir)]
-      : specDirs(deps.cwd, undefined).map((d) => d.root);
+      : specDirs(deps.cwd, undefined).map((d) => d.root)),
+    ...(tenant !== undefined && isRealDir(join(tenant.dir, "proofs"))
+      ? specDirsUnder(join(tenant.dir, "proofs"), tenant.scope.only, tenant.id).map((d) => d.root)
+      : []),
+  ];
+  if (tenant !== undefined) {
+    summary.push(`tenant ${tenant.id} under ${tenantsWords(tenant.scope)}`);
+  }
   const wantsReplay =
     config.execution.replay &&
     levelRank(config.level) >= levelRank("checked") &&
     deps.loadCatalog !== undefined &&
-    [...citationDefinitions(text).values()].some((s) => classifyDefinition(s).kind === "tool");
+    cites("tool");
   const replay = wantsReplay
     ? catalogReplay(await (deps.loadCatalog as () => Promise<GateCatalog>)(), {
         logged: loggedResults(evidence),
       })
     : undefined;
 
-  const bundle = await verifyDocument(text, {
+  // No run log at hand: a stored artifact is all there is to hold a proof:
+  // citation to (CHECK_NOTES.storedProofs).
+  const trustStoredProofs = session === undefined;
+  if (trustStoredProofs && cites("proof")) notes.push(CHECK_NOTES.storedProofs);
+  const bundle = await verifyDocument(graded, {
     config,
     evidence,
     workspaceRoot: deps.cwd,
     artifacts: artifactsAcross(artifactRoots),
+    ...(trustStoredProofs ? { trustStoredProofs } : {}),
     ...(replay !== undefined ? { replay: replay.replay, isPureTool: replay.isPureTool } : {}),
     now: deps.now,
   });
@@ -1569,7 +1914,10 @@ export type ProvabilityAudit = {
   /** The managed tenants root also read, when there was one. */
   readonly tenantsRoot?: string;
   readonly bundles: {
+    /** Bundles read: every pass of every turn (a retried turn keeps each). */
     readonly count: number;
+    /** The graded turns those bundles are passes of. (0.8.0 additive, fix pass.) */
+    readonly turns: number;
     /** Bundles that exist but could not be read (malformed, refused). */
     readonly unreadable: number;
     readonly truncated: boolean;
@@ -1783,7 +2131,9 @@ export async function buildAudit(opts: {
 }): Promise<{ readonly audit: ProvabilityAudit; readonly notes: string[] }> {
   const notes: string[] = [];
   const dirs = allSpecDirs(opts.cwd, opts.spec, opts.tenants);
-  const all = (await listings(dirs)).filter(
+  // Every pass: a retried turn keeps the failing pass a retry fixed, and
+  // that bundle is what the audit exists to surface (design §5.3, §10).
+  const all = (await listings(dirs, { allPasses: true })).filter(
     (l) => opts.sinceMs === undefined || l.mtimeMs >= opts.sinceMs,
   );
   const truncated = all.length > MAX_AUDIT_BUNDLES;
@@ -1804,6 +2154,7 @@ export async function buildAudit(opts: {
     -readonly [K in keyof ProvabilityAudit["gaming"]]: Array<ProvabilityAudit["gaming"][K][number]>;
   };
   const sessionsWithBundles = new Set<string>();
+  const turnsRead = new Set<string>();
   for (const listing of all.slice(0, MAX_AUDIT_BUNDLES)) {
     let bundle: ProofBundle;
     try {
@@ -1824,13 +2175,16 @@ export async function buildAudit(opts: {
     }
     count += 1;
     sessionsWithBundles.add(listing.sessionId);
+    turnsRead.add(
+      [listing.spec.root, listing.sessionId, String(listing.turnNumber)].join("\u0000"),
+    );
     verdicts[bundle.verdict] += 1;
     achieved[bundle.achieved] += 1;
     floors[bundle.level] += 1;
     claims.total += bundle.claimCount;
     claims.met += bundle.met;
     claims.unmet += bundle.unmet;
-    claims.assumptions += bundle.assumptions;
+    claims.assumptions += bundle.assumptions + (bundle.hypotheses ?? 0);
     claims.assumptionsRefused += bundle.assumptionsRefused ?? 0;
     waived += bundle.judgeWaived;
     if (bundle.judgeWaived > 0) waivedBundles += 1;
@@ -1842,9 +2196,10 @@ export async function buildAudit(opts: {
     gamingSignals(bundle, shown(listing.path, opts.cwd), gaming);
   }
 
-  // The event log: one line per gate PASS (a retried turn is several), the
-  // view of the gate the bundles cannot give, because a retry replaces the
-  // earlier pass's bundle.
+  // The event log: one line per gate PASS (a retried turn is several),
+  // which the bundles now match pass for pass where they were persisted —
+  // and which also counts passes whose bundle was never written (render:
+  // none, a persist that failed).
   const markerOf = (dir: string): string => `${sep}proofs${sep}${dir}${sep}`;
   const ofSpec = (line: GradedLine, dir: string | undefined): boolean =>
     dir === undefined ||
@@ -1889,7 +2244,7 @@ export async function buildAudit(opts: {
     ...(opts.sinceMs !== undefined ? { since: new Date(opts.sinceMs).toISOString() } : {}),
     ...(opts.spec !== undefined ? { spec: opts.spec.name } : {}),
     ...(opts.tenants !== undefined ? { tenantsRoot: opts.tenants.root } : {}),
-    bundles: { count, unreadable, truncated, verdicts, achieved, floors },
+    bundles: { count, turns: turnsRead.size, unreadable, truncated, verdicts, achieved, floors },
     claims,
     unmetReasons: [...reasons.entries()]
       .map(([reason, n]) => ({ reason, count: n }))
@@ -1917,7 +2272,9 @@ export function renderAudit(audit: ProvabilityAudit, notes: readonly string[]): 
     `provability audit${audit.spec !== undefined ? ` · ${audit.spec}` : ""} · ${
       audit.since !== undefined ? `since ${audit.since}` : "all time"
     }${audit.tenantsRoot !== undefined ? ` · tenants ${audit.tenantsRoot}` : ""}`,
-    `  bundles     ${plural(b.count, "graded turn")} · ✓ ${b.verdicts.pass} pass · ✗ ${b.verdicts.fail} fail · ? ${b.verdicts.unverified} unverified${
+    `  bundles     ${plural(b.turns, "graded turn")}${
+      b.count !== b.turns ? ` (${plural(b.count, "bundle")}: every pass of a retried turn)` : ""
+    } · ✓ ${b.verdicts.pass} pass · ✗ ${b.verdicts.fail} fail · ? ${b.verdicts.unverified} unverified${
       b.unreadable > 0 ? ` · ${b.unreadable} unreadable` : ""
     }`,
     `  achieved    ${rungLine(b.achieved)}`,
@@ -1935,7 +2292,7 @@ export function renderAudit(audit: ProvabilityAudit, notes: readonly string[]): 
         ? `${audit.judgeWaivers.bindings} (no grounded source bindings)`
         : `${audit.judgeWaivers.bindings} of ${audit.judgeWaivers.okSourceBindings} met source bindings (${percent(
             audit.judgeWaivers.rate,
-          )}) in ${plural(audit.judgeWaivers.bundles, "turn")}`
+          )}) in ${plural(audit.judgeWaivers.bundles, "bundle")}`
     }`,
     `  gate passes      ${plural(audit.passes.count, "provability_graded line")} in ${plural(
       audit.passes.sessions,
@@ -2006,6 +2363,8 @@ export type CheckerReport = {
     readonly reason?: string;
   };
   readonly spec?: string;
+  /** Set when the spec's harness never runs a checker (see {@link runsProofCheckers}). */
+  readonly note?: string;
   readonly checkers: ReadonlyArray<
     CheckerListing & { readonly configured: boolean; readonly image?: string }
   >;
@@ -2013,6 +2372,28 @@ export type CheckerReport = {
 
 /** Whether a checker runs in a sandbox (the ones whose probe needs a container). */
 const SANDBOX_CHECKERS: ReadonlySet<string> = new Set(["smt", "lean4"]);
+
+/** The builtin keys of the two tools that run a checker (tool-proof's exports). */
+const CHECKER_TOOL_KEYS: ReadonlySet<string> = new Set(["proofCheck", "proofCheckers"]);
+
+/**
+ * Whether a harness ever runs a proof checker — the question doctor's probe
+ * and the `configured` marks answer for (design §11: doctor probes the
+ * checkers a harness USES). A checker runs only inside `ProofCheck` /
+ * `ProofCheckers`, and a run carries those when the gate adds them
+ * (evaluation-service's `wantsProofCheckTools`, the one rule: a `proven`
+ * floor, or `formal.checkers` the spec chose itself) or when the spec listed
+ * one in `tools:` (the gate swaps it for its bound twin at any level). Every
+ * gated spec lowers `formal.checkers: [builtin, smt]`, so reading the list
+ * alone would probe — and on docker, pull — the Z3 image for a `cited`
+ * harness that never calls a checker.
+ */
+export function runsProofCheckers(
+  config: ProvabilityConfig,
+  tools: readonly string[] = [],
+): boolean {
+  return wantsProofCheckTools(config) || tools.some((key) => CHECKER_TOOL_KEYS.has(key));
+}
 
 function imageOf(id: string, config: ProvabilityConfig): string | undefined {
   if (id === "smt") return DEFAULT_SMT_IMAGE;
@@ -2084,6 +2465,7 @@ export function renderCheckers(report: CheckerReport): string {
     `proof checkers${report.spec !== undefined ? ` · ${report.spec}` : ""}`,
     `  sandbox  ${s.backend ?? "invalid"}${s.available ? " (available)" : ` — ${s.reason ?? "unavailable"}`}`,
   ];
+  if (report.note !== undefined) lines.push(`  note     ${report.note}`);
   for (const c of report.checkers) {
     lines.push(
       "",
@@ -2112,8 +2494,20 @@ async function checkersCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Prom
   const spec = specPath !== undefined ? loadSpec(specPath, deps.cwd) : cwdSpec(deps.cwd);
   const config = spec?.provability ?? defaultProvabilityConfig();
   const report = await probeCheckers(config, deps);
+  // A spec whose harness never runs a checker configures none: its lowered
+  // `formal.checkers` is a default nothing reads (see runsProofCheckers).
+  const unused = spec?.provability !== undefined && !runsProofCheckers(config, spec.tools);
   const withSpec: CheckerReport =
-    spec?.provability !== undefined ? { ...report, spec: spec.name } : report;
+    spec?.provability === undefined
+      ? report
+      : unused
+        ? {
+            ...report,
+            spec: spec.name,
+            note: `${spec.name} never runs a proof checker — its ${config.level} floor adds no ProofCheck, and its tools: list none (a proven floor, formal.checkers of its own, or proofCheck in tools: would)`,
+            checkers: report.checkers.map((c) => ({ ...c, configured: false })),
+          }
+        : { ...report, spec: spec.name };
   deps.out(
     args.flags["json"] === true
       ? `${JSON.stringify(withSpec, null, 2)}\n`
@@ -2131,8 +2525,9 @@ export type ProvabilityDoctorCheck = {
 };
 
 /**
- * `crewhaus doctor`'s provability lines: when the cwd spec's lowered
- * `provability:` block lists a sandbox checker (`smt`, `lean4`).
+ * `crewhaus doctor`'s provability lines: when the cwd spec's harness runs a
+ * proof checker at all ({@link runsProofCheckers} over the lowered block and
+ * `tools:`) and its `formal.checkers` lists a sandbox one (`smt`, `lean4`).
  *
  * The probe — the same `available()` `ProofCheckers` and `crewhaus
  * provability checkers` report — runs each checker's image healthcheck in
@@ -2142,15 +2537,20 @@ export type ProvabilityDoctorCheck = {
  * `doctor` prints one informational line saying what `--probe` would check.
  * Probed, an unavailable checker is a WARNING, not a failure: the builtin
  * checker is always there, so a harness still proves what it can, and the
- * model is told why the others refuse. No spec, no block, or only `builtin`
- * → no lines at all (nothing that could fail).
+ * model is told why the others refuse. No spec, no block, a harness that
+ * never runs a checker (a `cited` floor on the lowered default checkers), or
+ * only `builtin` → no lines at all (nothing that could fail).
  */
 export async function provabilityDoctorChecks(
   config: ProvabilityConfig | undefined,
   deps: Pick<ProvabilityCliDeps, "env" | "sandboxAvailable" | "createSandbox" | "probeTimeoutMs">,
-  opts: { readonly probe: boolean },
+  opts: {
+    readonly probe: boolean;
+    /** The lowered `tools:` (builtin keys): a listed `proofCheck` runs the checkers at any floor. */
+    readonly tools?: readonly string[];
+  },
 ): Promise<ProvabilityDoctorCheck[]> {
-  if (config === undefined) return [];
+  if (config === undefined || !runsProofCheckers(config, opts.tools)) return [];
   const listed = config.formal.checkers as readonly string[];
   const sandboxed = listed.filter((id) => SANDBOX_CHECKERS.has(id));
   if (sandboxed.length === 0) return [];
@@ -2208,6 +2608,23 @@ async function pruneCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
   let removed = 0;
   if (!dryRun) {
     for (const dir of dirs) {
+      if (dir.research === true) {
+        // A research run's bundle is its one proof.json (report.md and
+        // report.json beside it are the run's output, not bundles: kept).
+        // Re-checked at delete time: only a regular file is removed.
+        for (const listing of researchListings(dir.root)) {
+          if (listing.mtimeMs >= cutoff.getTime()) continue;
+          try {
+            if (lstatSync(listing.path).isFile()) {
+              unlinkSync(listing.path);
+              removed += 1;
+            }
+          } catch {
+            // gone already
+          }
+        }
+        continue;
+      }
       removed += await createBundleStore({ rootDir: dir.root }).prune(olderThanMs, now);
     }
   }
@@ -2244,6 +2661,9 @@ async function pruneCommand(args: ParsedArgs, deps: ProvabilityCliDeps): Promise
     );
   }
   lines.push("proof artifacts (<proofs>/<spec>/artifacts/) are kept: bundles cite them.");
+  if (dirs.some((dir) => dir.research === true)) {
+    lines.push("research runs lose only their proof.json; report.md and report.json are kept.");
+  }
   deps.out(ttyText(lines));
   return 0;
 }

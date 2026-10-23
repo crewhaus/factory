@@ -1324,7 +1324,8 @@ export type IrProvability = {
   readonly execution: {
     /** CONCRETE tool keys whose results count as execution evidence — the
      *  category grammar is expanded at lower time, exactly as `tools:` is
-     *  (default: the expansion of `all-compute` + `all-verify`). Entries are
+     *  (default: the expansion of `all-compute` + `all-verify`, less the
+     *  destructive `goldenUpdate`). Entries are
      *  CANONICAL: a builtin is always its spec key (`moneyAdd`, however the
      *  spec spelled it — `MoneyAdd` and `moneyadd` lower to it), and anything
      *  else is the exact tool name as written (`mcp__calc__add`). The
@@ -1339,9 +1340,17 @@ export type IrProvability = {
     readonly maxReplays: number;
   };
   readonly formal: {
-    /** Checker preference order (default ["builtin", "smt"]). */
+    /** Checker preference order, and exactly the checkers the proof tools
+     *  run (default ["builtin", "smt"]). Always contains "builtin": the
+     *  lowering appends it last when the spec left it out, because it needs
+     *  no sandbox and the proof tools always carry it — so the list is a
+     *  preference, never an allowlist (`[lean4]` lowers to
+     *  ["lean4", "builtin"]). */
     readonly checkers: readonly ("builtin" | "smt" | "lean4")[];
-    /** Optional sandbox image override for the sandbox checkers. */
+    /** Optional image override for the lean4 checker ONLY (e.g. a
+     *  Mathlib-equipped image); smt always runs the curated Z3 image. Kept
+     *  even when `checkers` has no lean4, where it is unused and the
+     *  lowering says so (`provability-image-unused`). */
     readonly image?: string;
     /** Tokens the lean4 pre-scan refuses (default ["sorry", "axiom", "native_decide"]). */
     readonly forbid: readonly string[];
@@ -2413,7 +2422,9 @@ export type IrResearchV0 = {
    *  opted out with `continuity: false`. `scope` resolves to `spec` here. */
   readonly continuity?: IrContinuity;
   /** 0.8.0 — the provability ladder (§8): gates the rendered report against the
-   *  citation tracker's cache (`on_fail` halt | note on this shape). */
+   *  citation tracker's cache (`on_fail` halt | note on this shape). That
+   *  cache holds fetched bodies only, so `checked` / `proven` can never be
+   *  met here; the lowering warns `provability-research-rung-unreachable`. */
   readonly provability?: IrProvability;
   /** v0.3.0 Goal 3 — Thredz config, CARRIED but not emit-wired on this shape
    *  in this release (the emitter prints the ignored-note comment). */

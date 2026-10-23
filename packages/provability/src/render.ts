@@ -42,14 +42,20 @@ function unmetRefs(bundle: ProofBundle): { refs: string[]; uncited: number } {
 }
 
 /**
- * Every assumption the answer declared, accepted or refused — design §2:
+ * Every assumption the answer rests on, accepted or refused — design §2:
  * assumptions are always counted, so one refused (`forbid`, or past
  * `max_assumptions`) still reads as an assumption, with how many were
- * refused beside it: `3 assumptions (2 refused)`.
+ * refused beside it: `3 assumptions (2 refused)`. The hypotheses an
+ * accepted proof rests on are assumptions too (§6.4, `hypotheses`): a
+ * proof that assumes its own conclusion does not read "0 assumptions".
  */
+function assumptionsCount(bundle: ProofBundle): number {
+  return bundle.assumptions + (bundle.hypotheses ?? 0) + (bundle.assumptionsRefused ?? 0);
+}
+
 function assumptionsSegment(bundle: ProofBundle): string {
   const refused = bundle.assumptionsRefused ?? 0;
-  const declared = plural(bundle.assumptions + refused, "assumption");
+  const declared = plural(assumptionsCount(bundle), "assumption");
   return refused > 0 ? `${declared} (${refused} refused)` : declared;
 }
 
@@ -165,23 +171,42 @@ export function renderMarkdownSection(bundle: ProofBundle): string {
       );
     }
   }
-  const assumed = bundle.claims.flatMap((claim) =>
-    claim.bindings.filter((b) => b.kind === "assumption" && b.origin !== undefined),
-  );
+  // Declared assumptions, then the hypotheses each cited proof rests on.
+  const assumed: Array<{ readonly ref: string; readonly text: string; readonly flag: string }> = [];
+  for (const claim of bundle.claims) {
+    for (const b of claim.bindings) {
+      const refusal = b.reason !== undefined ? words(b.reason) : undefined;
+      if (b.kind === "assumption" && b.origin !== undefined) {
+        assumed.push({
+          ref: b.ref,
+          text: b.origin,
+          flag: refusal !== undefined ? ` (${refusal})` : "",
+        });
+      } else if (b.kind === "formal" && b.assumptions !== undefined) {
+        const of = `a hypothesis of ${b.origin ?? "the proof"}`;
+        for (const hypothesis of b.assumptions) {
+          assumed.push({
+            ref: b.ref,
+            text: hypothesis,
+            flag: ` (${refusal !== undefined ? `${of}; ${refusal}` : of})`,
+          });
+        }
+      }
+    }
+  }
   const refused = bundle.assumptionsRefused ?? 0;
   lines.push(
     "",
-    `**Assumptions (${bundle.assumptions + refused}${refused > 0 ? `, ${refused} refused` : ""}):**${
+    `**Assumptions (${assumptionsCount(bundle)}${refused > 0 ? `, ${refused} refused` : ""}):**${
       assumed.length === 0 ? " none" : ""
     }`,
   );
   const seen = new Set<string>();
-  for (const b of assumed) {
-    const key = `${b.ref} ${b.origin}`;
+  for (const { ref, text, flag } of assumed) {
+    const key = `${ref} ${text}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const flag = b.reason !== undefined ? ` (${words(b.reason)})` : "";
-    lines.push(`- ${b.ref} ${cell(b.origin as string)}${flag}`);
+    lines.push(`- ${ref} ${cell(text)}${flag}`);
   }
   if (bundle.checkers !== undefined && bundle.checkers.length > 0) {
     lines.push("", "**Checkers:**");
@@ -195,10 +220,17 @@ export function renderMarkdownSection(bundle: ProofBundle): string {
     }
     for (const checker of bundle.checkers) {
       const statement = statements.get(checker.artifact);
+      // What the proof rests on, beside its statement (§6.4): the
+      // hypotheses, when any, then the axioms.
+      const hypotheses = checker.assumptions ?? [];
+      const assuming =
+        hypotheses.length > 0
+          ? `assuming: ${hypotheses.map((h) => cell(clip(h, 120))).join("; ")}; `
+          : "";
       lines.push(
         `- \`${checker.id}\` — ${checker.artifact}${
           statement !== undefined ? `: \`${cell(clip(statement, 200)).replace(/`/g, "'")}\`` : ""
-        } (axioms: ${checker.axioms.length === 0 ? "none" : checker.axioms.join(", ")})`,
+        } (${assuming}axioms: ${checker.axioms.length === 0 ? "none" : checker.axioms.join(", ")})`,
       );
     }
   }

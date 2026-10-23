@@ -22,8 +22,17 @@ import { expandToolSelectors } from "@crewhaus/tool-categories";
 /** The floor the builtin instances preflight against (design §7). */
 export const DEFAULT_FLOOR = "grounded" as const;
 
-/** `execution.allow`'s default, before the category grammar expands it (compiler `PROVABILITY_DEFAULT_EXECUTION_ALLOW`). */
-export const DEFAULT_EXECUTION_SELECTORS: ReadonlyArray<string> = ["all-compute", "all-verify"];
+/**
+ * `execution.allow`'s default, before the category grammar expands it
+ * (compiler `PROVABILITY_DEFAULT_EXECUTION_ALLOW`): the read-only computations
+ * and gates, less the one destructive verify tool (design §6.3).
+ * `apps/cli/src/provability-default-allow.test.ts` holds the two copies equal.
+ */
+export const DEFAULT_EXECUTION_SELECTORS: ReadonlyArray<string> = [
+  "all-compute",
+  "all-verify",
+  "-goldenUpdate",
+];
 
 /** The spec name proofs are filed under when neither the caller nor the run names one. */
 export const DEFAULT_SPEC_NAME = "default";

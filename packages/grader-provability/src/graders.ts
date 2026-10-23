@@ -304,6 +304,14 @@ export const rungAchieved: Grader = async (sample, run) => {
  * a marker with no definition is a binding whose reason is `no_definition`.
  * No markers at all is a vacuous pass (claimCoverage is what fails an
  * uncited answer). Passes at ≥ 0.99.
+ *
+ * Design §9.1 counts the markers the ANSWER wrote. A claim carrying
+ * `definition` is text a definition line shows after what it names, read
+ * as citing that definition: its one binding is the verifier's synthetic
+ * self-binding, defined by construction and never typed as a marker. So it
+ * is skipped — counted, a gloss sentence (or a long bibliography) would add
+ * a defined marker to both sides and lift a dangling-marker answer over the
+ * bar.
  */
 export const citationValidity: Grader = async (sample, run) => {
   const s = standing(sample, run, false);
@@ -313,6 +321,7 @@ export const citationValidity: Grader = async (sample, run) => {
   let dangling = 0;
   const undefinedRefs: string[] = [];
   for (const claim of bundle.claims) {
+    if (claim.definition !== undefined) continue;
     for (const b of claim.bindings) {
       markers += 1;
       if (b.reason === "no_definition") {
@@ -347,16 +356,19 @@ export const citationValidity: Grader = async (sample, run) => {
 /**
  * declared assumptions / claims — the assumption dodge made visible. LOWER is
  * better (the continuity.reAskRate precedent): passes at ≤ 0.1. Declared
- * counts the accepted assumptions AND the ones the config refused
- * (`assumptions: forbid`, past `max_assumptions`): a refused assumption is
- * still the answer leaning on one. Zero claims is a vacuous 0.
+ * counts the accepted assumptions, the ones the config refused
+ * (`assumptions: forbid`, past `max_assumptions`) — a refused assumption is
+ * still the answer leaning on one — and the hypotheses accepted proofs rest
+ * on (`hypotheses`, design §6.4): a proof that assumes its own conclusion is
+ * not "0 assumptions". Zero claims is a vacuous 0.
  */
 export const assumptionRate: Grader = async (sample, run) => {
   const s = standing(sample, run, false);
   if ("result" in s) return s.result;
   const { bundle } = s;
   const refused = bundle.assumptionsRefused ?? 0;
-  const declared = bundle.assumptions + refused;
+  const hypotheses = bundle.hypotheses ?? 0;
+  const declared = bundle.assumptions + refused + hypotheses;
   const threshold = PROVABILITY_METRIC_THRESHOLDS.assumptionRate;
   if (bundle.claimCount === 0) {
     return { passed: true, score: 0, rationale: "no claims (assumption rate 0, vacuous)" };
@@ -367,6 +379,10 @@ export const assumptionRate: Grader = async (sample, run) => {
     score: rate,
     rationale: `${declared}/${bundle.claimCount} ${plural(bundle.claimCount, "claim")} rest on a declared assumption (upper-bound ≤${threshold})${
       refused > 0 ? ` — ${refused} refused by the config` : ""
+    }${
+      hypotheses > 0
+        ? ` — ${hypotheses} ${plural(hypotheses, "proof hypothesis", "proof hypotheses")} counted`
+        : ""
     }`,
   };
 };

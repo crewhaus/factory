@@ -158,6 +158,43 @@ tools: [webFetch, gitStatus]
     expect(body.bundle.warnings?.[0]?.message).toContain('tool "gitStatus" is a builtin');
   });
 
+  test("POST /compile emitAs:cf-worker says the answer gates the edge does not run, and a parked block", async () => {
+    // 0.8.0 (design §1, §3; review I40) — a provability floor the worker
+    // never reads must not ship as an ungated worker without a word.
+    const compileEdge = async (yaml: string) => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        bundle: { warnings?: Array<{ code: string; path: string; message: string }> };
+      };
+      return body.bundle.warnings ?? [];
+    };
+    const head = `
+name: gated
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch]
+`;
+    const gated = await compileEdge(`${head}provability:\n  level: grounded\n`);
+    expect(gated.map((w) => [w.code, w.path])).toEqual([["accepted-but-unwired", "provability"]]);
+    expect(gated[0]?.message).toContain("the cf-worker edge does not run the provability gate");
+    // A parked block (level: off with other keys) is said too, as the local
+    // compile says it.
+    const parked = await compileEdge(`${head}provability:\n  level: off\n  threshold: 0.5\n`);
+    expect(parked.map((w) => w.code)).toContain("provability-inert-block");
+    // Without either, nothing.
+    expect(await compileEdge(head)).toEqual([]);
+  });
+
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {
     const yaml = `
 name: hello-workflow

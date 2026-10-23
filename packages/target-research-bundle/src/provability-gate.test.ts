@@ -132,18 +132,43 @@ import {
     expect(head).toContain(`      resolveHead: (url) =>
         __resolveHead(url, {
           record: (decision) => emit({ kind: "egress_decision", ...decision }),
+          screen: __screenHead,
         }),`);
+    // Pillar 3 — each HEAD is screened against every branch's lineage (a
+    // dynamic sink), with no exemption for a URL that merely appears in a
+    // tool result; only a URL this run's crawler already requested passes.
+    expect(head).toContain('import { lineageEgressScreen } from "@crewhaus/runtime-core";');
+    expect(head).toContain(`const __screenHead = lineageEgressScreen({
+  contexts: () => __branchContexts,
+  sent: (url) => __fetchedUrls.has(url),
+});`);
+    expect(head).toContain(`  const runContext = createRunContext();
+  __branchContexts.push(runContext);`);
+    expect(head).toContain(
+      "tracker.listFetches().flatMap((f) => [f.url, normalizeUrl(f.url) ?? f.url]),",
+    );
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(head)).not.toThrow();
     expect(head).not.toContain("createWaiverJudge");
+    // Without resolve: head, none of it.
+    const off = agentOf({ ...baseIr, provability: PROVABILITY });
+    for (const marker of ["lineageEgressScreen", "__branchContexts", "__screenHead"]) {
+      expect(off).not.toContain(marker);
+    }
   });
 
-  test("provability.judge wires the paraphrase-waiver judge into the report gate", () => {
+  test("provability.judge wires the paraphrase-waiver judge into the report gate, metered on its own run bus", () => {
     const judge = { model: "claude-haiku-4-5", allowSelfJudge: true as const };
     const judged = agentOf({ ...baseIr, provability: { ...PROVABILITY, judge } });
     expect(judged).toContain('import { createWaiverJudge } from "@crewhaus/evaluation-service";');
+    // Its calls publish as role judge on the report gate's own run bus.
+    expect(judged).toContain("const __judgeRun = createRunContext();");
     expect(judged).toContain(
-      `const __waiverJudge = createWaiverJudge({ judge: ${JSON.stringify(judge)} });`,
+      `const __waiverJudge = createWaiverJudge({ judge: ${JSON.stringify(judge)}, bus: __judgeRun.eventBus });`,
     );
     expect(judged).toContain("      judgeWaiver: __waiverJudge,");
+    // No budget: nothing caps it, as in the loop.
+    expect(judged).not.toContain("exhausted:");
+    expect(judged).not.toContain("@crewhaus/cost-tracker");
     expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(judged)).not.toThrow();
     // Both at once: one import line.
     const both = agentOf({
@@ -159,6 +184,43 @@ import {
     );
     // Without one, nothing of it.
     expect(code).not.toContain("judgeWaiver");
+    expect(code).not.toContain("__judgeRun");
+  });
+
+  test("under budget:, the waiver judge stops at budget.judge_share of budget.usd (design §6.2)", () => {
+    const judge = { model: "claude-haiku-4-5" };
+    const budget = { usdMicros: 2_000_000, onExceed: { kind: "stop" as const } };
+    const capped = agentOf({ ...baseIr, budget, provability: { ...PROVABILITY, judge } });
+    expect(
+      capped,
+    ).toContain(`import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";
+import { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";
+import { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";
+`);
+    expect(capped).toContain(
+      "const __judgeMeter = createCostTracker(__judgeRun.eventBus, { suppressEvents: true });",
+    );
+    expect(capped).toContain(
+      "const __judgeShareMicros = Math.round(2000000 * DEFAULT_JUDGE_SHARE);",
+    );
+    expect(capped).toContain(`const __waiverJudge = createWaiverJudge({
+  judge: ${JSON.stringify(judge)},
+  bus: __judgeRun.eventBus,
+  exhausted: __judgeShareExhausted,
+});`);
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(capped)).not.toThrow();
+    // A declared share is used as written, and the default is not imported.
+    const shared = agentOf({
+      ...baseIr,
+      budget: { ...budget, judgeShare: 0.1 },
+      provability: { ...PROVABILITY, judge },
+    });
+    expect(shared).toContain("const __judgeShareMicros = Math.round(2000000 * 0.1);");
+    expect(shared).not.toContain("DEFAULT_JUDGE_SHARE");
+    // A budget without a judge adds nothing.
+    expect(agentOf({ ...baseIr, budget, provability: PROVABILITY })).not.toContain(
+      "@crewhaus/cost-tracker",
+    );
   });
 
   test("a checked / proven floor is warned about at start; cited / grounded are not", () => {
@@ -362,6 +424,8 @@ type ModelOptions = {
   readonly cite: boolean;
   /** The answer's sentence, before its marker (default: the snippet, word for word). */
   readonly sentence?: string;
+  /** Several sentences, each marked with the number CiteFact told it (overrides `sentence`). */
+  readonly sentences?: ReadonlyArray<string>;
   /** How the waiver judge answers a `submit_label` call. */
   readonly judge?: "supported" | "not_supported";
 };
@@ -432,8 +496,12 @@ function startModel(opts: ModelOptions): {
         );
       }
       const told = /Cite it as \[(\d+)\]/.exec(results[1] ?? "")?.[1];
-      const sentence = opts.sentence ?? "Refunds are accepted within 14 days of purchase";
-      const answer = opts.cite ? `${sentence} [${told ?? "?"}].` : `${sentence}.`;
+      const sentences = opts.sentences ?? [
+        opts.sentence ?? "Refunds are accepted within 14 days of purchase",
+      ];
+      const answer = sentences
+        .map((sentence) => (opts.cite ? `${sentence} [${told ?? "?"}].` : `${sentence}.`))
+        .join(" ");
       return new Response(sse(answer), { headers });
     },
   });
@@ -565,6 +633,25 @@ describe("the emitted research daemon, run under provability:", () => {
   );
 
   test(
+    "sources.resolve: head boots with the lineage screen wired; a file source sends no HEAD and passes",
+    async () => {
+      const run = await runDaemon(
+        {
+          ...baseIr,
+          provability: { ...PROVABILITY, sources: { ...PROVABILITY.sources, resolve: "head" } },
+        },
+        { cite: true },
+      );
+      expect(run.code).toBe(0);
+      const evs = events(run.stdout);
+      expect(evs.find((e) => e["kind"] === "provability_graded")?.["verdict"]).toBe("pass");
+      // A path is no URL: nothing was asked, so nothing was decided.
+      expect(evs.filter((e) => e["kind"] === "egress_decision")).toEqual([]);
+    },
+    RUN_TIMEOUT_MS,
+  );
+
+  test(
     "halt, answered without a marker: the report is written with its ✗ section, then the run stops with exit 37",
     async () => {
       const run = await runDaemon(
@@ -643,6 +730,42 @@ describe("the emitted research daemon, run under provability:", () => {
       expect(refused.judgeCalls).toBe(1);
       expect(refused.code).toBe(37);
       expect(refused.stderr).toContain("not_found_in_source");
+    },
+    RUN_TIMEOUT_MS * 2,
+  );
+
+  test(
+    "provability.judge under budget: past budget.judge_share the waiver is skipped, not called",
+    async () => {
+      // Two paraphrases of the snippet, each a waivable miss. The fake judge's
+      // first call costs more than a share this small, so the second is skipped.
+      const sentences = [
+        "Acme accepts refund requests for 14 days after a purchase",
+        "Acme takes refund requests for 14 days after the purchase date",
+      ];
+      const judge = { model: "claude-haiku-4-5" };
+      const budget = { usdMicros: 1_000, onExceed: { kind: "stop" as const }, judgeShare: 0.001 };
+      const uncapped = await runDaemon(
+        { ...baseIr, provability: { ...PROVABILITY, judge } },
+        { cite: true, sentences, judge: "supported" },
+      );
+      expect(uncapped.judgeCalls).toBe(2);
+      const capped = await runDaemon(
+        { ...baseIr, budget, provability: { ...PROVABILITY, judge } },
+        { cite: true, sentences, judge: "supported" },
+      );
+      expect(capped.code).toBe(0);
+      expect(capped.judgeCalls).toBe(1);
+      expect(capped.stderr).toContain("[research] provability.judge: the waiver judge has spent");
+      const proof = JSON.parse(readFileSync(join(capped.runDir, "proof.json"), "utf8")) as {
+        verdict: string;
+        judgeWaived: number;
+        claims: Array<{ status: string }>;
+      };
+      // The skipped one keeps the miss the deterministic check found.
+      expect(proof.judgeWaived).toBe(1);
+      expect(proof.claims.map((c) => c.status)).toEqual(["met", "unmet"]);
+      expect(proof.verdict).toBe("fail");
     },
     RUN_TIMEOUT_MS * 2,
   );

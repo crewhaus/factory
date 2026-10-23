@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   citationDefinitions,
+  citationMarkers,
   citedClaims,
   definitionRanges,
   lintCitations,
@@ -120,5 +121,18 @@ describe("citedClaims", () => {
     const claims = citedClaims("As J. Smith noted, e.g. in fig. 3, revenue rose [1].");
     expect(claims).toHaveLength(1);
     expect(claims[0]?.text).toBe("As J. Smith noted, e.g. in fig. 3, revenue rose.");
+  });
+});
+
+describe("citationMarkers — the one grammar, for a caller that rewrites markers", () => {
+  test("ids, carets and places; a link, a definition and a reference link's text are not markers", () => {
+    const text = "Rose 12% [1]. See [^a]. [docs](https://x) [3]: ./r.md [A1][A2]";
+    expect(citationMarkers(text).map((m) => [m.marker, m.caret, text.slice(m.at, m.end)])).toEqual([
+      ["1", false, "[1]"],
+      ["a", true, "[^a]"],
+      ["A2", false, "[A2]"],
+    ]);
+    // The same set lintCitations reads.
+    expect(lintCitations(text).markers.map((m) => m.marker)).toEqual(["1", "a", "A2"]);
   });
 });

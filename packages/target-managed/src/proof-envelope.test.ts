@@ -11,10 +11,16 @@
  *   - `runs.create` answers with `proof`, the bundle the gate graded the run's
  *     final turn against, and the result validates against
  *     `@crewhaus/gateway-protocol`'s `RunsCreateResult`;
- *   - the footer rides `reply`, and `provability.render: none` leaves it off
- *     while the envelope still carries the bundle;
+ *   - `reply` is the answer alone — no footer, and under `render: json` no
+ *     second copy of the bundle — so a client, an eval grader and the
+ *     tenant's output-token meter read only what the agent said; the
+ *     envelope's `proof` is the bundle's one carrier;
  *   - a failing `note` verdict still answers, with `verdict: "fail"` in
- *     `proof` and the ✗ footer;
+ *     `proof`;
+ *   - a session's turns each file their own bundle: `runs.create`, then
+ *     every `runs.continue`, numbered after the turns the session ran;
+ *   - the trace event and a halt's error show the bundle path from the
+ *     tenant's root, never the server's layout above it;
  *   - a duplicate `runs.continue` (the idempotent resume path) returns the
  *     cached reply WITH its bundle, without a second model call;
  *   - `runs.subscribe` replays the run's `provability_graded` trace event —
@@ -25,7 +31,7 @@
  * the loopback interface.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { RunsContinueResult, RunsCreateResult } from "@crewhaus/gateway-protocol";
@@ -222,6 +228,8 @@ async function waitFor(
 }
 
 type Daemon = {
+  /** The harness root the daemon runs in (its tenants root is `<root>/tenants`). */
+  readonly root: string;
   readonly call: (method: string, params: unknown) => Promise<Record<string, unknown>>;
   readonly subscribe: (runId: string, until: RegExp) => Promise<string>;
   readonly modelCalls: () => number;
@@ -266,6 +274,7 @@ async function boot(ir: IrManagedV0): Promise<Daemon> {
   const envelope = (method: string, params: unknown): string =>
     JSON.stringify({ protocol: "crewhaus.v1", id: `req-${++id}`, method, params });
   return {
+    root,
     call: async (method, params) => {
       const res = await fetch(base, { method: "POST", headers, body: envelope(method, params) });
       const body = (await res.json()) as Record<string, unknown>;
@@ -294,7 +303,7 @@ async function boot(ir: IrManagedV0): Promise<Daemon> {
 
 describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () => {
   test(
-    "render: footer — proof on runs.create, the footer on reply, the trace line on runs.subscribe, the bundle on a cached resume",
+    "render: footer — proof on runs.create, the answer alone on reply, the trace line on runs.subscribe, the bundle on a cached resume",
     async () => {
       const daemon = await boot(baseIr(PROVABILITY));
 
@@ -309,10 +318,15 @@ describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () 
       expect(parsed.proof?.verdict).toBe("pass");
       expect(parsed.proof?.claimCount).toBe(1);
       expect(parsed.proof?.claims[0]?.bindings[0]?.origin).toBe("https://acme.example/policy");
-      expect(parsed.reply?.startsWith(CITED)).toBe(true);
-      expect(parsed.reply).toContain("── provability · cited ✓ · 1/1 claim");
-      // The footer names the tenant-fenced bundle file the gate persisted.
-      expect(parsed.reply).toContain("turn-");
+      // The answer alone: the bundle rides `proof`, nothing beside the text —
+      // and the tenant's output-token meter counts the answer alone.
+      expect(parsed.reply).toBe(CITED);
+      const { rows } = (await daemon.call("audit.tail", { tenantId: "tenant-a" })) as {
+        rows: Array<{ kind?: string; payload?: { outputTokens?: number } }>;
+      };
+      expect(
+        rows.filter((r) => r.kind === "model_call").map((r) => r.payload?.outputTokens),
+      ).toEqual([Math.ceil(CITED.length / 4)]);
 
       // The SSE stream replays the run's trace, the gate's line included.
       const frame = await daemon.subscribe(
@@ -322,6 +336,9 @@ describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () 
       const graded = JSON.parse(frame.slice("data: ".length)) as Record<string, unknown>;
       expect(graded["verdict"]).toBe("pass");
       expect(graded["bundleHash"]).toBe(parsed.proof?.bundleHash);
+      // From the tenant's own root — the server's layout above it stays home.
+      expect(graded["bundlePath"]).toBe(`proofs/proof-envelope/${parsed.sessionId}/turn-1.json`);
+      expect(frame).not.toContain(daemon.root);
 
       // An uncited answer under `on_fail: note`: it still answers, failing.
       const failed = RunsCreateResult.parse(
@@ -330,7 +347,7 @@ describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () 
       expect(failed.proof?.verdict).toBe("fail");
       expect(failed.proof?.unmet).toBe(1);
       expect(failed.proof?.claims[0]?.status).toBe("unmet");
-      expect(failed.reply).toContain("── provability · cited ✗");
+      expect(failed.reply).toBe(UNCITED);
 
       // The resume path: a second identical `runs.continue` is a duplicate
       // the idempotency store answers — same reply, same bundle, no model call.
@@ -368,13 +385,11 @@ describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () 
       const slow = RunsCreateResult.parse(await slowCall);
       expect(daemon.maxInFlight()).toBeGreaterThanOrEqual(2);
 
-      expect(fast.reply?.startsWith(CITED)).toBe(true);
-      expect(fast.reply).toContain("── provability · cited ✓");
+      expect(fast.reply).toBe(CITED);
       expect(fast.proof?.verdict).toBe("pass");
       expect(fast.proof?.claims[0]?.text).toBe("Refunds are accepted within 14 days of purchase.");
 
-      expect(slow.reply?.startsWith(UNCITED)).toBe(true);
-      expect(slow.reply).toContain("── provability · cited ✗");
+      expect(slow.reply).toBe(UNCITED);
       expect(slow.proof?.verdict).toBe("fail");
       expect(slow.proof?.claims[0]?.text).toBe(UNCITED);
       expect(slow.proof?.bundleHash).not.toBe(fast.proof?.bundleHash);
@@ -391,6 +406,87 @@ describe("managed — `proof` on the gateway result envelope (0.8.0 §5.4)", () 
       );
       expect(created.reply).toBe(CITED);
       expect(created.proof?.verdict).toBe("pass");
+    },
+    BOOT_TIMEOUT_MS + 30_000,
+  );
+
+  test(
+    "a session's turns each file their own bundle: runs.create, then every runs.continue (§5.3)",
+    async () => {
+      const daemon = await boot(baseIr(PROVABILITY));
+      const created = RunsCreateResult.parse(
+        await daemon.call("runs.create", { spec: "proof-envelope", input: "refunds?" }),
+      );
+      const second = RunsContinueResult.parse(
+        await daemon.call("runs.continue", { sessionId: created.sessionId, input: "and returns?" }),
+      );
+      const third = RunsContinueResult.parse(
+        await daemon.call("runs.continue", {
+          sessionId: created.sessionId,
+          input: "uncited please",
+        }),
+      );
+      expect([created.proof?.verdict, second.proof?.verdict, third.proof?.verdict]).toEqual([
+        "pass",
+        "pass",
+        "fail",
+      ]);
+      const dir = join(
+        daemon.root,
+        "tenants",
+        "tenant-a",
+        "proofs",
+        "proof-envelope",
+        created.sessionId,
+      );
+      expect(readdirSync(dir).sort()).toEqual(["turn-1.json", "turn-2.json", "turn-3.json"]);
+      // Each file holds its own turn's bundle: turn 1's ✓ is not
+      // overwritten by turn 3's ✗.
+      const hashOf = (n: number): string =>
+        (JSON.parse(readFileSync(join(dir, `turn-${n}.json`), "utf8")) as { bundleHash: string })
+          .bundleHash;
+      expect([hashOf(1), hashOf(2), hashOf(3)]).toEqual([
+        created.proof?.bundleHash as string,
+        second.proof?.bundleHash as string,
+        third.proof?.bundleHash as string,
+      ]);
+    },
+    BOOT_TIMEOUT_MS + 60_000,
+  );
+
+  test(
+    "render: json — the reply is still the answer alone, and the tenant is billed for the answer, not the bundle",
+    async () => {
+      const daemon = await boot(baseIr({ ...PROVABILITY, render: "json" }));
+      const created = RunsCreateResult.parse(
+        await daemon.call("runs.create", { spec: "proof-envelope", input: "refunds?" }),
+      );
+      expect(created.reply).toBe(CITED);
+      expect(created.proof?.verdict).toBe("pass");
+      const { rows } = (await daemon.call("audit.tail", { tenantId: "tenant-a" })) as {
+        rows: Array<{ kind?: string; payload?: { outputTokens?: number } }>;
+      };
+      const usage = rows.filter((r) => r.kind === "model_call");
+      expect(usage.map((r) => r.payload?.outputTokens)).toEqual([Math.ceil(CITED.length / 4)]);
+    },
+    BOOT_TIMEOUT_MS + 30_000,
+  );
+
+  test(
+    "on_fail: halt — the error names the bundle from the tenant's root, never the server's path",
+    async () => {
+      const daemon = await boot(baseIr({ ...PROVABILITY, onFail: "halt" }));
+      let message = "";
+      try {
+        await daemon.call("runs.create", { spec: "proof-envelope", input: "uncited please" });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message).toContain("provability gate failed");
+      expect(message).toMatch(
+        /proof bundle: proofs\/proof-envelope\/sess_[0-9a-f]{16}\/turn-1\.json/,
+      );
+      expect(message).not.toContain(daemon.root);
     },
     BOOT_TIMEOUT_MS + 30_000,
   );

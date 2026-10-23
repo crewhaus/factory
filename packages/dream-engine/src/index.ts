@@ -32,7 +32,7 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { ContinuityStore } from "@crewhaus/continuity-store";
+import type { ContinuityProofMode, ContinuityStore } from "@crewhaus/continuity-store";
 import {
   DEFAULT_PRICING,
   type PricingTable,
@@ -252,6 +252,11 @@ export type DreamEngineOptions = {
   readonly memoryStore?: MemoryStore;
   readonly wikiStore?: WikiStore;
   readonly continuityStore?: ContinuityStore;
+  /**
+   * `continuity.proof`, as the run's tools and `handoff.md` read it: how the
+   * report's `openPlans` counts a step as done (`DreamPhase1Options.proofMode`).
+   */
+  readonly proofMode?: ContinuityProofMode;
   /** The injected model-session runner. Absent → phase 2 is skipped with a
    *  note (the deterministic pass still runs). */
   readonly modelPhase?: DreamModelPhase;
@@ -538,6 +543,7 @@ export function createDreamEngine(options: DreamEngineOptions): DreamEngine {
       ...(options.continuityStore !== undefined
         ? { continuityStore: options.continuityStore }
         : {}),
+      ...(options.proofMode !== undefined ? { proofMode: options.proofMode } : {}),
       now,
     });
 

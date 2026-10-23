@@ -92,6 +92,23 @@ export function call(
   ];
 }
 
+/**
+ * The transcript of one completed call, as the runtime hands the gate a
+ * turn's messages: the assistant's `tool_use` block, then the user's
+ * `tool_result` block. The `proven` rung reads a ProofCheck call from here.
+ */
+export function callMessages(
+  id: string,
+  name: string,
+  input: unknown,
+  content: string,
+): Array<{ readonly role: string; readonly content: ReadonlyArray<unknown> }> {
+  return [
+    { role: "assistant", content: [{ type: "tool_use", id, name, input }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
+  ];
+}
+
 export const subAgent = (childSessionId: string): LogLine => ({
   kind: "sub_agent_start",
   payload: { childSessionId },

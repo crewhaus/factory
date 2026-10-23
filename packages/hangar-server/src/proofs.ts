@@ -2,14 +2,23 @@
  * 0.8.0 (design/0.8.0-provability-release.md §5.3, §12 item 5) — `GET
  * /api/runs/:id/proof`: the proof bundles a run's provability gate persisted.
  *
- * The gate files one bundle per graded turn at
- * `<harness>/.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json` (a retry
- * replaces the earlier pass of the same turn), and a gateway `runs.create`
+ * The gate files one bundle per graded PASS of a turn: the first at
+ * `<harness>/.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json`, a retry's
+ * k-th at `turn-<n>.<k>.json` beside it (the store never overwrites — each
+ * pass is its own audit record). Every pass is a row, with its `pass` and
+ * whether it is the turn's last (`standing`: the bundle the answer was
+ * served under, what `provability show` prints by default). A gateway `runs.create`
  * answers with the `sessionId` those files are keyed by — so the route's `:id`
  * is that session id. The route is fleet-wide because a session id names its
  * harness only implicitly: every live registered harness is searched, each
  * contained against its OWN directory, and `?harness=<id>` narrows the search
  * to one registry row.
+ *
+ * The RESEARCH shape files elsewhere too: its report gate grades one report
+ * per run and writes that bundle as `.crewhaus/research/<runId>/proof.json`
+ * beside `report.md` (design §5.4), keyed by the `run_<16 hex>` id its
+ * `run_start` / `run_done` events carry — so a `run_` id is accepted and
+ * reads that file in every harness searched, as turn 1.
  *
  * The MANAGED shape files elsewhere: every managed turn runs under its
  * request's tenant, and the gate files that turn's bundle under
@@ -26,7 +35,7 @@
  *
  * Read the way every Hangar read is (the inspect / evals precedent):
  *
- *   - SHAPE FIRST. `:id` must be `sess_<16 hex>`, a spec directory a name
+ *   - SHAPE FIRST. `:id` must be `sess_<16 hex>` or `run_<16 hex>`, a spec directory a name
  *     provability's store files under ({@link isProofSpecDir}) and a tenant
  *     a {@link SAFE_SEGMENT_RE} name before any path is built from it; a
  *     traversal (`..`, an encoded separator) is a 400, not a read.
@@ -44,8 +53,8 @@
  *     harness's own scrubber and the key/shape masker over the payload.
  *
  * Each row carries its CLI twin — `crewhaus provability show --session <id>
- * --turn <n> --json`, run from the harness directory — whose stdout is that
- * row's `bundle` as persisted (the terminal is the operator's own, so the
+ * --turn <n> --pass <k> --json`, run from the harness directory — whose
+ * stdout is that row's `bundle` as persisted (the terminal is the operator's own, so the
  * CLI does not mask what the console does). `proof-route.test.ts` holds the
  * twin to the CLI's declared flags and dispatch.
  */
@@ -59,8 +68,10 @@ import { isSafePathSegment, resolveContained, resolveInside } from "./safety";
 
 /** The session-id shape the proofs tree is keyed by (provability's store rule). */
 const SESSION_ID_RE = /^sess_[0-9a-f]{16}$/;
-/** A bundle file: `turn-<n>.json` (provability's store rule). */
-const TURN_FILE_RE = /^turn-(\d{1,9})\.json$/;
+/** A research run's id (citation-tracker's `newRunId`): its report bundle's key. */
+const RESEARCH_RUN_RE = /^run_[0-9a-f]{16}$/;
+/** A bundle file: `turn-<n>.json`, a retry's `turn-<n>.<k>.json` (provability's store rule). */
+const TURN_FILE_RE = /^turn-(\d{1,9})(?:\.(\d{1,4}))?\.json$/;
 /** Largest bundle read back. A bundle clips claim text at 400 characters and
  *  excerpts at 240, so even a long answer is far below this. */
 export const MAX_PROOF_BYTES = 4 * 1024 * 1024;
@@ -71,9 +82,9 @@ const MAX_SPEC_DIRS = 200;
 /** Tenant directories looked at per managed harness. */
 const MAX_TENANT_DIRS = 1_000;
 
-/** True when `id` is the session id a run's bundles are filed under. */
+/** True when `id` keys persisted bundles: a session id, or a research run's id. */
 export function isProofRunId(id: string): boolean {
-  return SESSION_ID_RE.test(id);
+  return SESSION_ID_RE.test(id) || RESEARCH_RUN_RE.test(id);
 }
 
 /**
@@ -155,9 +166,19 @@ export type ProofBundleRow = {
   readonly spec: string;
   /** The managed tenant whose root holds the bundle; absent for `.crewhaus/proofs`. */
   readonly tenant?: string;
+  /**
+   * True for a research run's report bundle (`.crewhaus/research/<run>/proof.json`),
+   * which has no spec directory: `spec` is then the harness's spec name and
+   * `sessionId` the run id.
+   */
+  readonly research?: true;
   readonly sessionId: string;
   readonly turn: number;
-  /** Harness-relative: `.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json`
+  /** Which pass of the turn: 1 for `turn-<n>.json`, k for a retry's `turn-<n>.<k>.json`. */
+  readonly pass: number;
+  /** True for the turn's last pass: the bundle its answer was served under. */
+  readonly standing: boolean;
+  /** Harness-relative: `.crewhaus/proofs/<spec>/<sessionId>/turn-<n>[.<k>].json`
    *  (`<tenants>/<tenant>/proofs/<spec>/…` for a managed tenant's). */
   readonly path: string;
   readonly modifiedAt: string;
@@ -175,7 +196,7 @@ export type ProofSkip = {
 
 export type ProofView = {
   readonly runId: string;
-  /** Oldest turn first, then by harness and spec directory. */
+  /** Oldest turn first, then by harness, spec directory and tenant, then pass. */
   readonly bundles: readonly ProofBundleRow[];
   /** Files under the run's directory that are not readable bundles, and why. */
   readonly skipped: readonly ProofSkip[];
@@ -227,7 +248,9 @@ function isDir(path: string): boolean {
 
 /**
  * The CLI twin for one bundle: run from the harness directory, it prints
- * `bundle`. A managed tenant's bundle names the tenants root it was read
+ * `bundle`. A pass past the first is named (`--pass <k>`); the first is
+ * named too when a retry followed it, since `show` reads a turn's LAST pass
+ * by default. A managed tenant's bundle names the tenants root it was read
  * under (harness-relative), so the twin finds it whatever the shell's env.
  */
 export function proofCliTwin(
@@ -235,9 +258,11 @@ export function proofCliTwin(
   sessionId: string,
   turn: number,
   tenantsRoot?: string,
+  pass?: number,
 ): string {
   const tenants = tenantsRoot !== undefined ? ` --tenants-root ${shellQuote(tenantsRoot)}` : "";
-  return `cd ${shellQuote(harnessDir)} && crewhaus provability show --session ${sessionId} --turn ${turn}${tenants} --json`;
+  const which = pass !== undefined ? ` --pass ${pass}` : "";
+  return `cd ${shellQuote(harnessDir)} && crewhaus provability show --session ${sessionId} --turn ${turn}${which}${tenants} --json`;
 }
 
 /**
@@ -259,7 +284,18 @@ export function proofView(harnesses: readonly ProofHarness[], runId: string): Pr
     for (const spec of specs.slice(0, MAX_SPEC_DIRS)) {
       const runDir = resolveInside(harness.dir, [...base, spec, runId]);
       if (runDir === undefined || !isDir(runDir)) continue;
-      for (const file of namesIn(runDir)) {
+      const files = namesIn(runDir);
+      // Each turn's last pass, off the names, as the store's `get` picks it:
+      // that pass is the turn's standing bundle.
+      const lastPass = new Map<number, number>();
+      for (const file of files) {
+        const named = TURN_FILE_RE.exec(file);
+        if (named === null) continue;
+        const n = Number(named[1]);
+        const k = named[2] === undefined ? 1 : Number(named[2]);
+        lastPass.set(n, Math.max(lastPass.get(n) ?? 0, k));
+      }
+      for (const file of files) {
         const turn = TURN_FILE_RE.exec(file);
         if (turn === null) continue;
         const rel = [...base, spec, runId, file].join("/");
@@ -304,6 +340,8 @@ export function proofView(harnesses: readonly ProofHarness[], runId: string): Pr
           continue;
         }
         const turnNumber = Number(turn[1]);
+        const pass = turn[2] === undefined ? 1 : Number(turn[2]);
+        const last = lastPass.get(turnNumber) ?? pass;
         const tenantsRoot = tenant !== undefined ? base.slice(0, -2).join("/") || "." : undefined;
         bundles.push({
           harnessId: harness.id,
@@ -312,16 +350,90 @@ export function proofView(harnesses: readonly ProofHarness[], runId: string): Pr
           ...(tenant !== undefined ? { tenant } : {}),
           sessionId: runId,
           turn: turnNumber,
+          pass,
+          standing: pass === last,
           path: rel,
           modifiedAt: new Date(modifiedMs).toISOString(),
-          cliTwin: proofCliTwin(harness.dir, runId, turnNumber, tenantsRoot),
+          // A sole pass needs no --pass: `show` reads a turn's last.
+          cliTwin: proofCliTwin(
+            harness.dir,
+            runId,
+            turnNumber,
+            tenantsRoot,
+            last === 1 ? undefined : pass,
+          ),
           bundle: parsed,
         });
       }
     }
   };
 
+  /** A research run's one bundle, read with every guard `scan` applies to a turn file. */
+  const scanResearch = (harness: ProofHarness): void => {
+    const segments = [".crewhaus", "research", runId, "proof.json"];
+    const rel = segments.join("/");
+    const runDir = resolveInside(harness.dir, segments.slice(0, -1));
+    if (runDir === undefined || !isDir(runDir)) return;
+    const skip = (reason: string): void => {
+      skipped.push({ harnessId: harness.id, path: rel, reason });
+    };
+    const path = resolveInside(harness.dir, segments);
+    if (path === undefined) {
+      skip("resolves outside the harness directory");
+      return;
+    }
+    let modifiedMs: number;
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile()) {
+        skip("not a regular file");
+        return;
+      }
+      modifiedMs = stat.mtimeMs;
+    } catch {
+      return; // no report gate ran: an ungated run, or one still in flight
+    }
+    const read = readTextCapped(path, MAX_PROOF_BYTES);
+    if (read.truncated) {
+      skip(`larger than ${MAX_PROOF_BYTES} bytes`);
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(read.text);
+    } catch {
+      skip("not valid JSON");
+      return;
+    }
+    if (!isBundle(parsed)) {
+      skip("not a proof bundle");
+      return;
+    }
+    if (bundles.length >= MAX_PROOF_BUNDLES) {
+      truncated = true;
+      return;
+    }
+    bundles.push({
+      harnessId: harness.id,
+      specName: harness.specName,
+      spec: harness.specName,
+      research: true,
+      sessionId: runId,
+      turn: 1,
+      pass: 1,
+      standing: true,
+      path: rel,
+      modifiedAt: new Date(modifiedMs).toISOString(),
+      cliTwin: proofCliTwin(harness.dir, runId, 1),
+      bundle: parsed,
+    });
+  };
+
   for (const harness of harnesses) {
+    if (RESEARCH_RUN_RE.test(runId)) {
+      scanResearch(harness);
+      continue;
+    }
     scan(harness, [".crewhaus", "proofs"]);
     const tenants = harness.tenants;
     if (tenants === undefined) continue;
@@ -343,7 +455,8 @@ export function proofView(harnesses: readonly ProofHarness[], runId: string): Pr
       a.turn - b.turn ||
       a.harnessId.localeCompare(b.harnessId) ||
       a.spec.localeCompare(b.spec) ||
-      (a.tenant ?? "").localeCompare(b.tenant ?? ""),
+      (a.tenant ?? "").localeCompare(b.tenant ?? "") ||
+      a.pass - b.pass,
   );
   return {
     runId,

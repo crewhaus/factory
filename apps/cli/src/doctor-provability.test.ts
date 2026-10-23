@@ -171,6 +171,17 @@ describe("finding 1 — the citation-marker regex has exactly one definition", (
       // a non-capturing / named group, and a constructor string
       String.raw`const d = /\[\^?(?<label>[\w.-]+)\](?!\()/g;`,
       String.raw`const e = new RegExp("\\[(?:\\^?)([A-Za-z0-9_.-]+)\\](?!\\()", "g");`,
+      // a label of class escapes, not a class: the numeric `[n]` the
+      // provability skill teaches, widened to any non-space, in a
+      // constructor string too
+      String.raw`const f = /\[\^?(\d+)\](?!\(|:|\[)/g;`,
+      String.raw`const g = /\[(\S+?)\](?![(:\[])/g;`,
+      String.raw`const h = new RegExp("\\[\\^?(\\d+)\\](?!\\(|:|\\[)", "g");`,
+      // the wildcard, a bounded quantifier, a Unicode property, an alternation
+      String.raw`const i = /\[(.+?)\](?!\()/g;`,
+      String.raw`const j = /\[\^?([\w.-]{1,64})\](?!\(|:|\[)/g;`,
+      String.raw`const k = /\[\^?(\p{L}+)\](?!\()/gu;`,
+      String.raw`const l = /\[\^?(\d+|[a-z]+)\](?!\()/g;`,
     ]) {
       expect(markerLine(variant)).toBe(true);
     }
@@ -185,6 +196,20 @@ describe("finding 1 — the citation-marker regex has exactly one definition", (
       expect(markerLine(other)).toBe(false);
     }
     expect(foldRegexSource(String.raw`/\[\^?([\w.-]+)\](?!x)/`)).toBe(String.raw`/\[\^?C+\](?!x/`);
+  });
+
+  test("a numeric-only copy — narrower than the owner's grammar, the drift itself — fails the doctor", () => {
+    // `[0-9]+` was always caught (a class folds to one token); its twin
+    // `\d+` slipped through while the label took only classes and `\w`.
+    for (const copy of [
+      String.raw`const NUMERIC = /\[\^?(\d+)\](?!\(|:|\[)/g;`,
+      String.raw`const LOOSE = /\[(\S+?)\](?![(:\[])/g;`,
+    ]) {
+      const root = tree({ ...OWNER, "packages/grader-x/src/index.ts": `${copy}\n` });
+      expect(citationMarkerFindings(root).map((f) => [f.file, f.pass])).toEqual([
+        ["packages/grader-x/src/index.ts", false],
+      ]);
+    }
   });
 
   test("every defining line counts: a second copy in the owner file, and a helper module's copy", () => {
@@ -381,6 +406,24 @@ describe("finding 3 — provability.level is not optimizable", () => {
     expect(finding?.pass).toBe(false);
     expect(finding?.reason).toContain("admitted by a broader entry for research");
     expect(finding?.reason).toContain("OPTIMIZER_REFUSED_LEAVES");
+  });
+
+  test("a wholesale block entry fails under the REAL admission rule, which refuses the leaf itself", () => {
+    // spec-patch's isOptimizable answers "no" for provability.level whatever
+    // the table holds (OPTIMIZER_REFUSED_LEAVES wins first), yet a wholesale
+    // entry admits a patch AT the block — `provability: cited`, or a remove —
+    // that moves the floor without naming the leaf. The table itself is read.
+    for (const entry of [["provability"], ["*"]]) {
+      const [finding] = provabilityLevelOptimizerFindings({
+        cli: [["agent", "instructions"], entry],
+      });
+      expect(finding?.pass).toBe(false);
+      expect(finding?.reason).toContain("admitted by a broader entry for cli");
+    }
+    // A deeper entry under the leaf's own block is a sibling, not a cover.
+    expect(
+      provabilityLevelOptimizerFindings({ cli: [["provability", "grounded", "coverage"]] }),
+    ).toMatchObject([{ pass: true }]);
   });
 
   test("a sibling knob is fine", () => {

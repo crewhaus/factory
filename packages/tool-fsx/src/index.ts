@@ -53,6 +53,11 @@ import {
   checkRelocatedLinks,
   copyTreeSafe,
   ensureDirContained,
+  protectedRootBeneath,
+  protectedRootHolding,
+  protectedRootsBeneath,
+  protectedRootsOf,
+  protectedWriteRefusal,
   resolveContained,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
@@ -234,6 +239,42 @@ function writeAtomic(
 }
 
 type Existing = { kind: "file" | "dir" | "symlink" | "other"; size: number; mtimeMs: number };
+
+/**
+ * Would copying the tree at `source` onto `destination` write into a
+ * runtime-state root (`protectedRootsOf`)? Into one that holds the
+ * destination, always; into one beneath it, only where the source has
+ * something at the same place below it — a copy merges entry by entry, so
+ * `CopyPath notes.md .` writes `./notes.md` and nothing under `.crewhaus/`.
+ */
+function copyReachesProtected(
+  source: string,
+  destination: string,
+  roots: readonly string[],
+): string | undefined {
+  if (roots.length === 0) return undefined;
+  const holding = protectedRootHolding(destination, roots);
+  if (holding !== undefined) return holding;
+  for (const { root, rel } of protectedRootsBeneath(destination, roots)) {
+    // The copy writes `<destination>/<x>` for each `<source>/<x>`: it reaches
+    // the root when the source has something on the root's path below it —
+    // a directory all the way to the root, or a file or link on the way,
+    // which is written where a directory holding the root stands.
+    let at = source;
+    let reaches = true;
+    for (const name of rel === "" ? [] : rel.split(path.sep)) {
+      const here = peek(at);
+      if (here === undefined) {
+        reaches = false;
+        break;
+      }
+      if (here.kind !== "dir") break;
+      at = path.join(at, name);
+    }
+    if (reaches && peek(at) !== undefined) return root;
+  }
+  return undefined;
+}
 
 /** lstat without throwing: undefined when the path is not there. */
 function peek(abs: string): Existing | undefined {
@@ -1124,7 +1165,7 @@ export const copyPath: RegisteredTool = buildTool({
     "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when, from where the copy puts them, they point inside the workspace or exactly where the original points; an existing symlink under the destination is never written through.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const source = resolveSafe("CopyPath", input.source);
     const destination = resolveSafe("CopyPath", input.destination);
     if (isInside(source.abs, destination.abs) && source.abs !== destination.abs) {
@@ -1132,6 +1173,12 @@ export const copyPath: RegisteredTool = buildTool({
     }
     if (source.abs === destination.abs) return "source and destination are the same path";
     if (peek(source.abs) === undefined) return `no such path: ${source.rel}`;
+    if (copyReachesProtected(source.abs, destination.abs, protectedRootsOf(ctx)) !== undefined) {
+      return protectedWriteRefusal(
+        "CopyPath",
+        `copying ${source.rel} onto ${destination.rel === "" ? "." : destination.rel}`,
+      );
+    }
     const maxEntries = input.maxEntries ?? 50_000;
     const result = copyContained(source, destination, {
       maxEntries,
@@ -1311,9 +1358,26 @@ export const movePath: RegisteredTool = buildTool({
     "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move is refused when it would leave a symlink pointing outside the workspace somewhere it did not point before.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const source = resolveSafe("MovePath", input.source);
     const destination = resolveSafe("MovePath", input.destination);
+    // A move takes the source away whole and puts it at the destination
+    // whole (replacing what is there): a runtime-state root under either is
+    // removed or written.
+    const roots = protectedRootsOf(ctx);
+    if (
+      roots.length > 0 &&
+      [source.abs, destination.abs].some(
+        (p) =>
+          protectedRootHolding(p, roots) !== undefined ||
+          protectedRootBeneath(p, roots) !== undefined,
+      )
+    ) {
+      return protectedWriteRefusal(
+        "MovePath",
+        `moving ${source.rel === "" ? "." : source.rel} to ${destination.rel === "" ? "." : destination.rel}`,
+      );
+    }
     if (source.abs === destination.abs) return "source and destination are the same path";
     if (isInside(source.abs, destination.abs)) {
       return `refusing to move ${source.rel} into itself (${destination.rel})`;
@@ -1515,9 +1579,18 @@ export const removePath: RegisteredTool = buildTool({
   // A `RemovePath(build/**)` rule is about `path`, resolved the way this tool
   // resolves it: through a symlinked directory, `build/link/x` is `src/x`.
   operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const target = resolveSafe("RemovePath", input.path);
     if (target.abs === workspaceRoot()) return "refusing to delete the workspace root";
+    // Deleting a directory deletes a runtime-state root beneath it.
+    const roots = protectedRootsOf(ctx);
+    if (
+      roots.length > 0 &&
+      (protectedRootHolding(target.abs, roots) !== undefined ||
+        protectedRootBeneath(target.abs, roots) !== undefined)
+    ) {
+      return protectedWriteRefusal("RemovePath", `removing ${target.rel}`);
+    }
     const existing = peek(target.abs);
     if (existing === undefined) {
       if (input.missingOk === true) {
@@ -2213,6 +2286,24 @@ export const archiveExtract: RegisteredTool = buildTool({
     const conflicts = topLevel.filter(
       (name) => peek(path.join(destination.abs, name)) !== undefined,
     );
+    // Each top-level member is promoted onto `<destination>/<name>`, merged
+    // or (with overwrite) replacing what is there: one that is, or holds, a
+    // runtime-state root would write into the run's own record or remove it.
+    const roots = protectedRootsOf(ctx);
+    if (roots.length > 0) {
+      const reaching = [
+        ...(protectedRootHolding(destination.abs, roots) !== undefined ? ["."] : []),
+        ...topLevel.filter(
+          (name) => protectedRootBeneath(path.join(destination.abs, name), roots) !== undefined,
+        ),
+      ];
+      if (reaching.length > 0) {
+        return protectedWriteRefusal(
+          "ArchiveExtract",
+          `extracting ${archive.rel} (its ${reaching.join(", ")}) into ${destination.rel === "" ? "." : destination.rel}`,
+        );
+      }
+    }
 
     const summary = {
       archive: archive.rel,

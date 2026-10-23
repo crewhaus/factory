@@ -2,6 +2,45 @@ import { describe, expect, test } from "bun:test";
 import { citationDefinitions } from "./citations";
 import { classifyDefinition, definitionGloss, isAssumptionMarker } from "./refs";
 
+describe("classifyDefinition — linear in the source", () => {
+  // A source reaches this from the answer's definition lines and from every
+  // url/link field of an MCP result (design §10; AGENTS.md pillar 3). The
+  // least of three runs, timed against a URL of the same size with no
+  // punctuation run, so a slow machine slows both.
+  const fastest = (run: () => unknown): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      run();
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
+  };
+  const n = 200_000;
+
+  test("a punctuation run inside a URL is read once", () => {
+    // Trimming with /[.,;:!?]+$/ retried from every character of the run:
+    // 80,000 dots then an "x" took four seconds.
+    const dotted = `https://a.example/${".".repeat(n)}x`;
+    const base = fastest(() => classifyDefinition(`https://a.example/${"y".repeat(n)}x`));
+    expect(classifyDefinition(dotted)).toEqual({ kind: "url", url: dotted });
+    expect(fastest(() => classifyDefinition(dotted))).toBeLessThan(base * 20 + 100);
+    const bracketed = `<https://a.example/${";".repeat(n)}x>`;
+    expect(fastest(() => classifyDefinition(bracketed))).toBeLessThan(base * 20 + 100);
+  }, 20_000);
+
+  test("the trailing run is still dropped, whatever its length", () => {
+    expect(classifyDefinition(`https://a.example/x${".,;:!?".repeat(n / 6)}`)).toEqual({
+      kind: "url",
+      url: "https://a.example/x",
+    });
+    expect(classifyDefinition("https://a.example/a.b?c=d;e")).toEqual({
+      kind: "url",
+      url: "https://a.example/a.b?c=d;e",
+    });
+  });
+});
+
 describe("classifyDefinition — every kind", () => {
   test("url: http and https, first word, trailing sentence punctuation dropped", () => {
     expect(classifyDefinition("https://acme.example/policy")).toEqual({

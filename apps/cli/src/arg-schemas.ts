@@ -1513,6 +1513,8 @@ export const PROVABILITY_SCHEMA: ParseArgsSchema = {
     { name: "session", takesValue: true },
     // show — one graded turn of the session (default: the latest bundle).
     { name: "turn", takesValue: true },
+    // show — one pass of that turn (a retry files each; default: the last).
+    { name: "pass", takesValue: true },
     // show / check / audit / checkers — machine output on stdout.
     { name: "json", takesValue: false },
     // check — the floor (required unless --spec carries a provability block).
@@ -1529,8 +1531,15 @@ export const PROVABILITY_SCHEMA: ParseArgsSchema = {
     { name: "dry-run", takesValue: false },
     // show / audit / prune — also read the managed shape's per-tenant bundles
     // under <dir>/<tenant>/proofs/ (default: CREWHAUS_TENANTS_ROOT, else
-    // target-managed's /tmp/crewhaus-tenants for a managed spec).
+    // target-managed's /tmp/crewhaus-tenants for a managed spec); check — the
+    // root --tenant's evidence lies under.
     { name: "tenants-root", takesValue: true },
+    // check — the managed tenant whose session log and proof artifacts
+    // (<tenants-root>/<tenant>/sessions, …/proofs/<spec>) are evidence.
+    { name: "tenant", takesValue: true },
+    // check — a research report.md: grade what its gate verified, without the
+    // writer's ## Citations / ## Provability trailer.
+    { name: "report", takesValue: false },
     { name: "help", short: "h" },
   ],
 };

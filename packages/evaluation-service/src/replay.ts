@@ -16,10 +16,22 @@
  * turn's own signal, so a hung tool cannot hold the answer.
  *
  * Pure is not the same as deterministic, and a replay is only a verdict on
- * a tool that answers the same input the same way. Three things the flags
+ * a tool that answers the same input the same way. Four things the flags
  * cannot say are handled here, each as "could not replay" (`replayed:
  * false`), never as a mismatch no retry could cure:
  *
+ *   - THE WORKSPACE. A read-only tool that reads files (GoldenCompare,
+ *     ChecksumVerify, AcceptanceCheck, MarkdownLinkCheck, a `Read`) answers
+ *     about the workspace AS IT WAS when it ran. Check, fix, report is the
+ *     verify tools' whole workflow: the golden is updated, the missing file
+ *     created, and a replay then disagrees with an honest record — a changed
+ *     file is not a misquoted result, and re-running cannot tell the two
+ *     apart. So a call is not re-run when the tool declares a path among its
+ *     operative arguments (the catalog's own word that it acts on the
+ *     workspace), or when its logged input names something that exists in
+ *     the workspace now (a tool that reads a path it does not declare). Its
+ *     binding says "it ran" without "it reproduces", as design §6.3 has
+ *     `Bash` say (`replayed: false`).
  *   - THE CLOCK. A tool whose schema offers `now` ("overrides the real
  *     clock, for tests and replays" — DeadlineCheck, ErrorClassify,
  *     SequenceRun) read the real clock on a call that left it out, so that
@@ -50,6 +62,8 @@
  * on the tool: it throws, and the verifier reads that as "could not run"
  * (`replayed: false`).
  */
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { isPureTool } from "@crewhaus/provability";
 import type { ReplayResult } from "@crewhaus/provability";
 import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
@@ -171,6 +185,55 @@ function offersField(tool: RegisteredTool, field: string): boolean {
   return false;
 }
 
+/** How deep, and how many string leaves, {@link namesWorkspace} reads in one logged input. */
+const INPUT_WALK_DEPTH = 8;
+const INPUT_WALK_LEAVES = 256;
+/** Longer than any path a filesystem opens (provability's `MAX_PATH_CHARS` reasoning). */
+const MAX_PATH_CHARS = 4_096;
+
+/** Whether `tool` declares a path among its operative arguments (`operativeArgs`). */
+function declaresPath(tool: RegisteredTool): boolean {
+  return (tool.operativeArgs ?? []).some((arg) => arg.kind === "path");
+}
+
+/**
+ * Whether a string in the parsed `input` names something that exists under
+ * `root` (relative names resolve against it, absolute ones are themselves) —
+ * the mark of a call whose answer read the workspace. A URL, an empty
+ * string, and text with a line break or a NUL are not names.
+ */
+function namesWorkspace(input: unknown, root: string): boolean {
+  let leaves = 0;
+  const walk = (value: unknown, depth: number): boolean => {
+    if (typeof value === "string") {
+      leaves += 1;
+      if (
+        value.length === 0 ||
+        value.length > MAX_PATH_CHARS ||
+        value.includes("\n") ||
+        value.includes("\r") ||
+        value.includes("\0") ||
+        /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+      ) {
+        return false;
+      }
+      try {
+        return existsSync(resolve(root, value));
+      } catch {
+        return false;
+      }
+    }
+    if (depth >= INPUT_WALK_DEPTH || typeof value !== "object" || value === null) return false;
+    const children = Array.isArray(value) ? value : Object.values(value as Record<string, unknown>);
+    for (const child of children) {
+      if (leaves >= INPUT_WALK_LEAVES) return false;
+      if (walk(child, depth + 1)) return true;
+    }
+    return false;
+  };
+  return walk(input, 0);
+}
+
 class ReplayStopped extends Error {
   override readonly name = "ReplayStopped";
 }
@@ -189,6 +252,12 @@ export type CatalogReplayOptions = {
   readonly logged?: (toolName: string, input: unknown) => ReadonlyArray<string>;
   /** The pause before a disagreeing replay runs again (default {@link REPLAY_RECHECK_MS}). */
   readonly recheckMs?: number;
+  /**
+   * The workspace a logged input's names resolve in (the gate's `cwd`; the
+   * directory a workspace tool resolves against when it runs). Default
+   * `process.cwd()`.
+   */
+  readonly workspaceRoot?: string;
 };
 
 /** The verifier's two replay hooks over `catalog`, bound to one turn's signal. */
@@ -205,6 +274,7 @@ export function catalogReplay(
   };
   const timeoutMs = opts.timeoutMs ?? REPLAY_TIMEOUT_MS;
   const recheckMs = opts.recheckMs ?? REPLAY_RECHECK_MS;
+  const workspaceRoot = opts.workspaceRoot ?? process.cwd();
 
   /** One bounded run: the result, a thrown error as `{ error }`, or a throw on timeout / abort. */
   const runOnce = async (
@@ -261,6 +331,8 @@ export function catalogReplay(
       const parsed = tool.inputSchema.safeParse(input);
       if (!parsed.success) return undefined;
       if (readTheClock(tool, parsed.data)) return undefined;
+      // The workspace may have moved on since the call (see the module doc).
+      if (declaresPath(tool) || namesWorkspace(parsed.data, workspaceRoot)) return undefined;
       const logged = opts.logged?.(toolName, input);
       const first = asCompared(await runOnce(tool, parsed.data), logged);
       if (first === undefined) return undefined;

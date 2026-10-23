@@ -25,7 +25,10 @@
  *     tooltip; a renderer hides the block and links every `[N]` through it.
  *     A `file://` source renders as its workspace-relative path, the form the
  *     grammar can locate (it reads `file:` as an unlocatable scheme), or as
- *     its absolute path outside the workspace;
+ *     its absolute path outside the workspace — spelled so the grammar reads
+ *     it back as that same file, or left as its URL when no spelling does
+ *     (`pathSpelling`). After them, each assumption a branch declared, under
+ *     a label no other branch uses (`[A1]: assume: …`, design §2);
  *   - a `## Provability` section after `## Citations` UNCONDITIONALLY — the
  *     `NO_CITATIONS_NOTICE` posture: an ungated report must never pass for a
  *     gated one, so the verdict is printed whatever it is, and `render:` (a
@@ -40,7 +43,14 @@
  *     only definitions are the writer's, built from the tracker — a branch
  *     can neither point `[N]` at a page `CiteFact` never accepted nor define
  *     a number the report does not list, and an answer that also lists its
- *     sources reads as the same answer without them; and a code fence the
+ *     sources reads as the same answer without them. An `assume:` line names
+ *     no page, so it is not lost with them: it moves up into the writer's
+ *     definitions, renamed with its markers so two branches' `[A1]` stay two
+ *     assumptions, and is counted and capped by `assumptions` /
+ *     `max_assumptions` as on every shape (design §2). A heading that would
+ *     read as one of the writer's own sections (`## Provability`,
+ *     `## Citations`) is escaped, so the only verdict a reader sees is the
+ *     writer's (§5.4). And a code fence the
  *     answer leaves open (an answer cut off mid-block) is closed at its end,
  *     so it cannot turn every later branch into code the claim reader skips.
  *     The JSON's `subAnswers` keep each answer as the model wrote it.
@@ -69,7 +79,8 @@
  * Research's report gate runs once over the whole report, not per turn, so
  * `on_fail` is `halt` or `note` here (the compiler lowers a declared retry /
  * escalate to `note` with a warning, design §8; `on_fail: retry` per branch is
- * deferred, §12 item 3), and `scope` has no turns to narrow to. The tracker
+ * deferred, §12 item 3), `scope` has no turns to narrow to, and
+ * `max_assumptions` caps the assumptions of the whole report. The tracker
  * holds fetched bodies only, so the evidence it gives reaches `grounded` at
  * most: a `checked` or `proven` floor has no execution or formal evidence to
  * bind to on this shape in 0.8.0. `provability.judge` is honoured: the
@@ -80,12 +91,20 @@ import { realpathSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Citation, CitationTracker } from "@crewhaus/citation-tracker";
-import { classifyDefinition, definitionGloss, extractClaims } from "@crewhaus/claim-ledger";
+import {
+  citationDefinitions,
+  citationMarkers,
+  classifyDefinition,
+  codeSpanTest,
+  definitionGloss,
+  extractClaims,
+} from "@crewhaus/claim-ledger";
 import { EXIT_CODES, type FailureReport } from "@crewhaus/errors";
 import type { IrProvability } from "@crewhaus/ir";
 import {
   type EvidenceIndex,
   type EvidenceRecord,
+  type HeadRefusal,
   type ProofBundle,
   type ProvabilityGradedSummary,
   type UnmetReason,
@@ -135,7 +154,7 @@ export type ReportProvabilityOptions = ReportGateRoots & {
    */
   readonly evidence: EvidenceIndex | (() => EvidenceIndex);
   /** `sources.resolve: head` — one guarded HEAD's status (absent ⇒ such sources are `unresolved`). */
-  readonly resolveHead?: (url: string) => Promise<number | undefined>;
+  readonly resolveHead?: (url: string) => Promise<number | HeadRefusal | undefined>;
   /**
    * `provability.judge` — the paraphrase-waiver judge (evaluation-service's
    * `createWaiverJudge`), asked only for a `grounded` miss on wording alone
@@ -223,40 +242,71 @@ function gateRoots(opts: ReportGateRoots): Roots {
 }
 
 /**
- * Where a source's definition points: an `http(s)` URL as the tracker
- * recorded it; a `file://` URL as `./<path>` inside the workspace, or its
- * absolute path outside it — under a declared file root the gate's root
- * covers it, and anywhere else, with the root still the workspace, the gate
- * says `path_outside_workspace`. A file under no declared root while the
- * root is widened (the crawler never fetches one) keeps its URL, which no
- * root admits (`not_locatable`): the wider root admits only what the
- * crawler's roots name.
+ * The path a `file://` source's definition names: `./<path>` inside the
+ * workspace, or its absolute path outside it — under a declared file root
+ * the gate's root covers it, and anywhere else, with the root still the
+ * workspace, the gate says `path_outside_workspace`. Undefined for a file
+ * under no declared root while the root is widened (the crawler never
+ * fetches one; the wider root admits only what the crawler's roots name),
+ * and for a URL that does not parse.
  */
-function destinationOf(url: string, roots: Roots): string {
-  if (!/^file:\/\//i.test(url)) return url;
+function filePathOf(url: string, roots: Roots): string | undefined {
   const rel = normalizePath(url, { workspaceRoot: roots.workspace });
   if (rel !== undefined && rel !== ".") return `./${rel}`;
   let abs: string;
   try {
     abs = fileURLToPath(url);
   } catch {
-    // Not a parseable file URL: leave it as written; the gate reports it.
-    return url;
+    return undefined;
   }
   const admitted = roots.root === roots.workspace || roots.outside.some((r) => within(r, abs));
-  return admitted ? abs : url;
+  return admitted ? abs : undefined;
+}
+
+/**
+ * `path` as a definition writes it so the citation grammar reads back that
+ * same file: as it is (in `<…>` when it holds a blank), or with `%` and `#`
+ * percent-encoded. Asked of `classifyDefinition` itself, so the spelling
+ * cannot drift from the reader the gate uses. The grammar splits a path at
+ * `#` (`notes #2.md` names `notes ` and a fragment), so a name holding one
+ * has no plain spelling, and the encoded one names it only where the
+ * grammar decodes a path's escapes; undefined when neither names it — a
+ * definition then names no file at all rather than another one.
+ */
+function pathSpelling(path: string): string | undefined {
+  const encoded = path.replace(/[%#]/g, (c) => (c === "%" ? "%25" : "%23"));
+  for (const spelled of [path, encoded]) {
+    const written = /\s/.test(spelled) ? `<${spelled}>` : spelled;
+    const ref = classifyDefinition(written);
+    if (ref.kind === "path" && ref.fragment === undefined && ref.path === path) return written;
+  }
+  return undefined;
+}
+
+/**
+ * Where a source's definition points: an `http(s)` URL as the tracker
+ * recorded it; a `file://` URL as its path (`filePathOf`), spelled the way
+ * the grammar reads back (`pathSpelling`). A file no root admits, or whose
+ * name no spelling reaches, keeps its URL, which the gate reads as a scheme
+ * it cannot locate (`not_locatable`) — never as a path to some other file.
+ */
+function destinationOf(url: string, roots: Roots): string {
+  if (!/^file:\/\//i.test(url)) return url;
+  const path = filePathOf(url, roots);
+  return (path !== undefined ? pathSpelling(path) : undefined) ?? url;
 }
 
 /**
  * A fetched URL's origin, keyed exactly as the verifier will key the
- * definition the report renders for it: the normalized URL, or the path
- * `destinationOf` writes, resolved the way `verifyDocument` resolves it.
+ * definition the report renders for it: the normalized URL, or the file's
+ * path (`filePathOf`), resolved the way `verifyDocument` resolves it.
  */
 function sourceOrigin(url: string, roots: Roots): string | undefined {
   if (/^https?:\/\//i.test(url)) return normalizeUrl(url);
-  const dest = destinationOf(url, roots);
-  if (dest === url) return undefined;
-  return normalizePath(dest, { workspaceRoot: roots.root, baseDir: roots.workspace });
+  if (!/^file:\/\//i.test(url)) return undefined;
+  const path = filePathOf(url, roots);
+  if (path === undefined) return undefined;
+  return normalizePath(path, { workspaceRoot: roots.root, baseDir: roots.workspace });
 }
 
 /**
@@ -458,6 +508,39 @@ type DefinitionPlace = {
 };
 
 /**
+ * Does `line` carry a citation marker, `[3]` or `[^a]`, as the grammar reads
+ * one (claim-ledger's `citationMarkers` — not a definition's `[3]:`, not a
+ * link's `[text](…)`)? A line that carries one is a claim the answer cited,
+ * never the rest of a source's text.
+ */
+const carriesMarker = (line: string): boolean => citationMarkers(line).length > 0;
+
+/** Punctuation a text ends with when it goes on into the next line: `Acme,`, `policy —`, `page -`. */
+const RUNS_ON_PUNCTUATION = /(?:[,;:(&–—]|\s-)$/;
+
+/**
+ * Does a definition's text, `text` so far, run on into the unindented line
+ * under it — `[1]: "Refund policy" — Acme's statement on returns and` over
+ * `refunds, https://…`, or `[1]: Acme — https://…, retrieved` over
+ * `October 2026.`? It does when it stops mid-phrase: on a comma, a dash or
+ * an opening bracket, or on a word that is not itself the source. One that
+ * ends a sentence, or ends on its source (`[^1]: Acme — https://…`), has
+ * ended, and so has every text before a line holding a marker.
+ */
+function runsOn(text: string, next: string): boolean {
+  if (text === "" || carriesMarker(next)) return false;
+  // Only the text's end is read — its last two code units, its last word —
+  // so a long definition costs each line under it its own length, never
+  // the length of everything above it (design §10).
+  const end = text.slice(-2);
+  if (RUNS_ON_PUNCTUATION.test(end)) return true;
+  let word = text.length;
+  while (word > 0 && !/\s/.test(text[word - 1] as string)) word--;
+  if (namesSource(text.slice(word), false)) return false;
+  return /[\p{L}\p{N}]$/u.test(end);
+}
+
+/**
  * The lines under definition line `i` that continue it, with no blank line
  * between: the rest of the paragraph a line that is not a complete
  * definition starts, or a footnote's content. Taken only as far as a
@@ -471,32 +554,41 @@ type DefinitionPlace = {
  *     footnote as its content;
  *   - a line indented under the label (`indentedFrom`) continues it;
  *   - a line further out, a lazy continuation in CommonMark's terms,
- *     continues it only when it opens with a source — `[^1]: Acme,
- *     "Refund policy",` over an unindented URL — or, the first line under a
- *     bare label, names one anywhere (`[^1]:` over `Acme, "Refund policy",
- *     https://…`, the line the grammar reads as that label's source). A
- *     sentence further out stays the answer's, whatever the label says.
+ *     continues it when it opens with a source — `[^1]: Acme,
+ *     "Refund policy",` over an unindented URL — or when the text above it
+ *     runs on into it (`runsOn`): a title wrapped onto the line that names
+ *     its source, or a source's text wrapped past it. The first line under
+ *     a bare label continues it when it names a source anywhere (`[^1]:`
+ *     over `Acme, "Refund policy", https://…`, the line the grammar reads
+ *     as that label's source). A sentence further out stays the answer's,
+ *     whatever the label says.
+ *
+ * `label` is the text on the definition line after its label.
  */
 function definitionBody(
   pieces: ReadonlyArray<string>,
   i: number,
   place: DefinitionPlace,
-  bareLabel: boolean,
+  label: string,
 ): number[] {
   const below: number[] = [];
+  let text = label;
   for (let j = i + 2; j < pieces.length; j += 2) {
     const line = pieces[j] as string;
     if (line.trim() === "" || isDefinitionLine(line) || FENCE_LINE.test(line)) break;
     const indent = /^[ \t]*/.exec(line)?.[0] ?? "";
     const column = columnOf(indent);
     if (column < place.content + 4 && OPENS_BLOCK.test(line.slice(indent.length))) break;
+    const trimmed = line.trim();
     if (column < place.indentedFrom) {
-      const text = line.trim();
       const source =
-        bareLabel && below.length === 0 ? namesSource(text, false) : opensWithSource(text);
+        label === "" && below.length === 0
+          ? namesSource(trimmed, false)
+          : opensWithSource(trimmed) || runsOn(text, trimmed);
       if (!source) break;
     }
     below.push(j);
+    text = `${text} ${trimmed}`.trim();
   }
   return below;
 }
@@ -529,8 +621,16 @@ function definitionBody(
  *
  * Lines break where the grammar's `^` breaks them (`\u2028` and `\u2029`
  * too), so no definition it would read starts mid-line here.
+ *
+ * Also returns, by label, the whole text of each top-level definition it
+ * drops (its lines joined, the first per label): how `branchAssumptions`
+ * reads an `assume:` that wraps onto a second line.
  */
-function withoutDefinitions(answer: string, bibliographic: boolean): string {
+function withoutDefinitions(
+  answer: string,
+  bibliographic: boolean,
+): { readonly text: string; readonly dropped: ReadonlyMap<string, string> } {
+  const dropped = new Map<string, string>();
   const pieces = answer.split(/(\r\n|\r|\n|\u2028|\u2029)/);
   const drop = new Set<number>();
   for (let i = 0; i < pieces.length; i += 2) {
@@ -541,8 +641,13 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
     const indent = m[1] as string;
     const rest = (m[2] as string).trim();
     const footnote = line.startsWith("[^", indent.length);
+    const record = (text: string): void => {
+      const label = top !== null ? LABEL.exec(line.slice(indent.length))?.[1] : undefined;
+      if (label !== undefined && !dropped.has(label)) dropped.set(label, text);
+    };
     if (rest !== "" && completeDefinition(footnote, rest, bibliographic)) {
       drop.add(i);
+      record(rest);
       if (titleBelow(rest, pieces[i + 2])) {
         drop.add(i + 2);
         i += 2;
@@ -558,7 +663,7 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
       top !== null
         ? { content: 0, indentedFrom: column + 1 }
         : { content: column, indentedFrom: column },
-      rest === "",
+      rest,
     );
     if (rest === "") {
       drop.add(i);
@@ -570,6 +675,7 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
       const destination = first === undefined ? "" : (pieces[first] as string).trim();
       if (first !== undefined && completeDefinition(footnote, destination, bibliographic)) {
         drop.add(first);
+        record(destination);
         i = first;
         if (titleBelow(destination, pieces[i + 2])) {
           drop.add(i + 2);
@@ -581,6 +687,7 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
     const text = [rest, ...below.map((j) => (pieces[j] as string).trim())].join(" ").trim();
     if (text !== "" && namesSource(text, bibliographic)) {
       drop.add(i);
+      record(text);
       for (const j of below) drop.add(j);
       i = below[below.length - 1] ?? i;
     } else if (rest !== "" && top !== null) {
@@ -589,7 +696,7 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
       pieces[i] = `${indent}\\${line.slice(indent.length)}`;
     }
   }
-  if (drop.size === 0) return pieces.join("");
+  if (drop.size === 0) return { text: pieces.join(""), dropped };
   // Each kept line joins the last kept one by the break that stood before
   // it; the blank lines a drop leaves at either end go.
   const out: string[] = [];
@@ -598,10 +705,196 @@ function withoutDefinitions(answer: string, bibliographic: boolean): string {
     if (out.length > 0) out.push(pieces[i - 1] as string);
     out.push(pieces[i] as string);
   }
-  return out
+  const text = out
     .join("")
     .replace(/^(?:[^\S\r\n\u2028\u2029]*(?:\r\n|\r|\n|\u2028|\u2029))+/, "")
     .trimEnd();
+  return { text, dropped };
+}
+
+/** A definition line's label, read after its indent: `A1` of `[A1]: …` and of `[^A1]: …`. */
+const LABEL = /^\[\^?([\w.-]+)\]:/;
+
+/** A branch's declared assumption: the label its markers use, and what it assumes. */
+type BranchAssumption = { readonly label: string; readonly text: string };
+
+/**
+ * The assumptions a branch declared, in the order it declared them: each
+ * definition the citation grammar reads in its answer (`citationDefinitions`:
+ * outside code, the first per label) whose source is `assume:`, read with
+ * the whole text `withoutDefinitions` dropped for it, so one that wraps onto
+ * a second line is read whole. A number is the report's own (the one
+ * `CiteFact` gave), so an `assume:` under one is not carried: it goes with
+ * the other definitions the branch wrote.
+ */
+function branchAssumptions(
+  answer: string,
+  dropped: ReadonlyMap<string, string>,
+): BranchAssumption[] {
+  const out: BranchAssumption[] = [];
+  for (const [label, source] of citationDefinitions(answer)) {
+    if (/^\d+$/.test(label)) continue;
+    const whole = classifyDefinition(dropped.get(label) ?? source);
+    const ref = whole.kind === "assume" ? whole : classifyDefinition(source);
+    if (ref.kind === "assume") out.push({ label, text: oneLine(ref.text) });
+  }
+  return out;
+}
+
+/** Every marker id in `text` outside code: `A1` of `[A1]` and of `[^A1]`. */
+function markerIds(text: string): Set<string> {
+  const inCode = codeSpanTest(text);
+  const ids = new Set<string>();
+  for (const { marker, at } of citationMarkers(text)) {
+    if (!inCode(at)) ids.add(marker);
+  }
+  return ids;
+}
+
+/**
+ * `text` with each marker outside code whose id `rename` maps renamed, its
+ * caret kept — the markers the grammar reads (claim-ledger's
+ * `citationMarkers`), so what is renamed is what every checker binds.
+ */
+function renameMarkers(text: string, rename: ReadonlyMap<string, string>): string {
+  if (rename.size === 0) return text;
+  const inCode = codeSpanTest(text);
+  let out = "";
+  let from = 0;
+  for (const { marker, caret, at, end } of citationMarkers(text)) {
+    const to = rename.get(marker);
+    if (to === undefined || inCode(at)) continue;
+    out += `${text.slice(from, at)}[${caret ? "^" : ""}${to}]`;
+    from = end;
+  }
+  return out + text.slice(from);
+}
+
+/**
+ * Every branch's assumptions under labels unique in the report, and each
+ * branch's text with its markers renamed to match (design §2: assumptions
+ * are first-class and always counted). Branches are independent agents, so
+ * each numbers its own from `[A1]`; joined as written, the grammar would
+ * bind every branch's `[A1]` to the first branch's text, and count the
+ * second as past a cap that branch never reached. So they are renamed in
+ * order, `A1`, `A2`, …, past any id a branch cites without declaring it: a
+ * marker that is not its own branch's assumption keeps its id, and no
+ * assumption is renamed onto it.
+ */
+function hoistAssumptions(
+  branches: ReadonlyArray<{
+    readonly text: string;
+    readonly assumptions: ReadonlyArray<BranchAssumption>;
+  }>,
+): { readonly texts: string[]; readonly assumptions: BranchAssumption[] } {
+  const taken = new Set<string>();
+  for (const b of branches) {
+    const own = new Set(b.assumptions.map((a) => a.label));
+    for (const id of markerIds(b.text)) if (!own.has(id)) taken.add(id);
+  }
+  let next = 1;
+  const assumptions: BranchAssumption[] = [];
+  const texts = branches.map((b) => {
+    const rename = new Map<string, string>();
+    for (const a of b.assumptions) {
+      while (taken.has(`A${next}`)) next++;
+      const label = `A${next++}`;
+      rename.set(a.label, label);
+      assumptions.push({ label, text: a.text });
+    }
+    return renameMarkers(b.text, rename);
+  });
+  return { texts, assumptions };
+}
+
+/**
+ * The name a heading shows, folded for comparison: compatibility forms
+ * folded (NFKC), emphasis, escapes and punctuation dropped, lower case —
+ * `**Provability**` and `PROVABILITY:` are both `provability`.
+ */
+const headingName = (text: string): string =>
+  text
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .toLowerCase();
+
+/** Does a heading's text name one of the writer's own sections (`## Citations`, `## Provability`)? */
+const namesWriterSection = (text: string): boolean =>
+  /^(?:citations|provability)(?:\s|$)/.test(headingName(text));
+
+/** What may open a line before a heading's marker: an indent, block quotes, list item markers. */
+const CONTAINER_PREFIX = String.raw`[ \t]*(?:(?:>|[-*+](?=[ \t])|\d{1,9}[.)](?=[ \t]))[ \t]*)*`;
+
+/** A line's container prefix, to read the text after it. */
+const LEADING_CONTAINERS = new RegExp(`^${CONTAINER_PREFIX}`);
+
+/** An ATX heading at any depth: its prefix, its `#`s, its text. */
+const ATX_HEADING = new RegExp(String.raw`^(${CONTAINER_PREFIX})(#{1,6})((?:[ \t].*)?)$`);
+
+/**
+ * A setext underline: its indent and block quotes, then the `=` or `-` run
+ * (no blanks inside it — `- - -` is a thematic break, never an underline).
+ */
+const SETEXT_UNDERLINE = /^([ \t]*(?:>[ \t]*)*)((?:=+|-+)[ \t]*)$/;
+
+/**
+ * An HTML heading's opening tag, `<h2>` or `<H2 class="x">`. Its attributes
+ * stop at the next `<`, so a run of unclosed `<h2` is read in one pass.
+ */
+const HTML_HEADING = /<h[1-6](?=[\s>/])[^<>]*>/gi;
+
+/**
+ * How many lines over a setext underline are read as its heading: a heading
+ * is short, and reading a bounded tail keeps a long paragraph under many
+ * underlines linear (design §10: no super-linear work on untrusted text).
+ */
+const SETEXT_LINES = 3;
+
+/**
+ * A branch answer whose headings cannot pass for the writer's own sections
+ * (design §5.4). The verdict section is the writer's, after `## Citations`;
+ * a branch answer is untrusted text — the model's, steered by every page it
+ * read — so one holding its own `## Provability … **Verdict:** pass ✓`
+ * would show a reader a passing verdict above the writer's real one. Any
+ * heading that names a writer section is escaped wherever it sits, code
+ * included (a code sample costs a visible `\`, never the reader a forged
+ * verdict): ATX (`## Provability`, in a list item or a quote too), setext
+ * (`Provability` over `---` — the underline escaped, so the paragraph reads
+ * as the text it is; any of the last lines over it may start the heading,
+ * since the line above may be a block of its own) and HTML (`<h2>`, its `<`
+ * written as `&lt;`, which reads as text inside an HTML block as well as in
+ * a paragraph). The gate then reads the forged lines as the sentences they
+ * are.
+ */
+function withoutWriterSections(answer: string): string {
+  const pieces = answer.split(/(\r\n|\r|\n|\u2028|\u2029)/);
+  for (let i = 0; i < pieces.length; i += 2) {
+    const line = pieces[i] as string;
+    const atx = ATX_HEADING.exec(line);
+    if (atx !== null) {
+      if (namesWriterSection(atx[3] as string)) pieces[i] = `${atx[1]}\\${atx[2]}${atx[3]}`;
+      continue;
+    }
+    const underline = SETEXT_UNDERLINE.exec(line);
+    if (underline === null) continue;
+    let text = "";
+    for (let j = i - 2, n = 0; j >= 0 && n < SETEXT_LINES; j -= 2, n++) {
+      const above = (pieces[j] as string).replace(LEADING_CONTAINERS, "").trim();
+      if (above === "") break;
+      text = `${above} ${text}`;
+      if (namesWriterSection(text)) {
+        pieces[i] = `${underline[1]}\\${underline[2]}`;
+        break;
+      }
+    }
+  }
+  return pieces.join("").replace(HTML_HEADING, (tag: string, at: number, whole: string) => {
+    const after = whole.slice(at + tag.length, at + tag.length + 300);
+    const close = after.search(/<\/h[1-6]\s*>/i);
+    const inner = (close === -1 ? after : after.slice(0, close)).replace(/<[^>]*>/g, " ");
+    return namesWriterSection(inner) ? `&lt;${tag.slice(1)}` : tag;
+  });
 }
 
 /**
@@ -646,14 +939,19 @@ function renderVerified(args: {
   readonly goal: string;
   readonly branches: ReadonlyArray<{ readonly question: string; readonly answer: string }>;
   readonly numbered: ReadonlyArray<NumberedCitation>;
+  readonly assumptions: ReadonlyArray<BranchAssumption>;
   readonly roots: Roots;
 }): string {
   const lines: string[] = [`# ${oneLine(args.goal)}`, ""];
-  if (args.numbered.length > 0) {
+  if (args.numbered.length > 0 || args.assumptions.length > 0) {
     for (const c of args.numbered) {
       const dest = destinationOf(c.url, args.roots);
-      lines.push(`[${c.number}]: ${/\s/.test(dest) ? `<${dest}>` : dest}${linkTitle(c.snippet)}`);
+      const written = /\s/.test(dest) && !dest.startsWith("<") ? `<${dest}>` : dest;
+      lines.push(`[${c.number}]: ${written}${linkTitle(c.snippet)}`);
     }
+    // A branch's assumptions, under their report labels: a renderer shows
+    // each as the line it is, so the reader sees what the report assumes.
+    for (const a of args.assumptions) lines.push(`[${a.label}]: assume: ${a.text}`);
     lines.push("");
   }
   for (const b of args.branches) {
@@ -694,13 +992,20 @@ export async function writeProvableReport(args: WriteProvableReportArgs): Promis
   const roots = gateRoots(args.provability);
   const now = args.now ?? (() => new Date());
   const { numbered, numberByUrl } = numberCitations(args.citations);
+  const read = args.branches.map((b) => {
+    const answer = b.answer.trim();
+    const { text, dropped } = withoutDefinitions(answer, config.sources.bibliographic);
+    return { text, assumptions: branchAssumptions(answer, dropped) };
+  });
+  const hoisted = hoistAssumptions(read);
   const verified = renderVerified({
     goal: args.goal,
-    branches: args.branches.map((b) => ({
+    branches: args.branches.map((b, i) => ({
       question: b.question,
-      answer: closeFences(withoutDefinitions(b.answer.trim(), config.sources.bibliographic)),
+      answer: closeFences(withoutWriterSections(hoisted.texts[i] ?? "")),
     })),
     numbered,
+    assumptions: hoisted.assumptions,
     roots,
   });
 
@@ -796,16 +1101,36 @@ const LEVEL_GUIDANCE: Readonly<Record<IrProvability["level"], string>> = {
 };
 
 /**
+ * What a branch is told about assumptions (design §2): the one definition
+ * line it may write, and how many the report accepts — `max_assumptions`
+ * caps the whole report, which the gate checks once — or that they are
+ * refused.
+ */
+function assumptionGuidance(config: ReportProvabilityConfig): string {
+  const cap = config.maxAssumptions;
+  if (config.assumptions === "forbid" || cap === 0) {
+    return "- Assumptions are refused here: a claim marked [A1] with an `[A1]: assume: …` line fails the report.";
+  }
+  const limit =
+    cap === undefined
+      ? "The report counts and shows each one"
+      : `The whole report accepts at most ${cap === 1 ? "one" : String(cap)}, and shows each one`;
+  return `- A claim no source can settle may rest on a declared assumption: mark it [A1] (A2, … for more) and end your answer with one line for each, \`[A1]: assume: <what you assume>\` — the only definition line you write. ${limit}, so keep them for what no evidence can settle.`;
+}
+
+/**
  * What a research branch agent is told under `provability:` (appended to its
- * instructions): how its answer is checked, and how to mark a claim so the
- * check can bind it. Short on purpose — it is prompt cost on every branch.
+ * instructions): how its answer is checked, how to mark a claim so the check
+ * can bind it, and how to declare an assumption. Short on purpose — it is
+ * prompt cost on every branch.
  */
 export function researchProvabilityGuidance(config: ReportProvabilityConfig): string {
   return [
     `Provability: this run's report is checked at the \`${config.level}\` floor before it is served, and every factual sentence in your answer is a claim the check must bind to a source.`,
     "- Record each fact you rely on with CiteFact; its result names the fact's citation number, e.g. [3]. Put that marker right after each sentence the fact supports.",
-    "- Use only numbers CiteFact gave you, and write no definition lines (`[3]: …`): the report adds its own and leaves out any you write.",
+    "- Use only numbers CiteFact gave you, and write no source definition lines (`[3]: …`): the report adds its own and leaves out any you write.",
     `- ${LEVEL_GUIDANCE[config.level]}`,
+    assumptionGuidance(config),
     "- A sentence with no marker fails the check: leave out what you cannot cite.",
   ].join("\n");
 }

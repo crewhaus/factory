@@ -395,6 +395,211 @@ describe("Section 18 — requiresSandbox floor", () => {
   });
 });
 
+describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
+  // What the runtime hands the floor: its session-log root and proofs root,
+  // absolute and workspace-relative (design/0.8.0-provability-release.md §5.2).
+  const ROOTS = [
+    "/srv/ws/.crewhaus/sessions",
+    "/srv/ws/.crewhaus/proofs",
+    ".crewhaus/sessions",
+    ".crewhaus/proofs",
+  ];
+  const writeTo = (rel: string, over: Partial<ToolCallContext> = {}): ToolCallContext => ({
+    toolName: "Write",
+    input: { path: rel, content: "x" },
+    operativeValues: [{ kind: "path", canonical: [rel, `/srv/ws/${rel}`] }],
+    readOnly: false,
+    destructive: true,
+    ...over,
+  });
+  const LOG = ".crewhaus/sessions/sess_00000000000000aa.jsonl";
+  const allowEverywhere: RuleSet = {
+    ...emptyRuleSet,
+    flag: [rule("alwaysAllow", "Write", "flag")],
+    settings: [rule("alwaysAllow", "Write(**)", "settings")],
+    yaml: [rule("alwaysAllow", "Write(**)")],
+  };
+
+  test("a write into the session logs is denied whatever a rule allows, in default, auto and plan", () => {
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const r = evaluateWithReason(writeTo(LOG), mode, allowEverywhere, { protectedRoots: ROOTS });
+      expect(r.decision).toBe("deny");
+      expect(r.reason).toContain("the runtime keeps its own record of the run");
+    }
+  });
+
+  test("the proof bundles and artifacts are walled off the same way, the roots themselves included", () => {
+    for (const rel of [
+      ".crewhaus/proofs/support-bot/sess_00000000000000aa/turn-1.json",
+      ".crewhaus/proofs/support-bot/artifacts/prf_0123456789abcdef.json",
+      ".crewhaus/sessions",
+    ]) {
+      const r = evaluateWithReason(writeTo(rel), "auto", allowEverywhere, {
+        protectedRoots: ROOTS,
+      });
+      expect(r.decision).toBe("deny");
+    }
+  });
+
+  test("every spelling counts: an absolute path, a symlinked one, a case the filesystem folds", () => {
+    const absolute: ToolCallContext = {
+      ...writeTo(LOG),
+      operativeValues: [{ kind: "path", canonical: [`/srv/ws/${LOG}`], outsideWorkspace: true }],
+    };
+    expect(
+      evaluateWithReason(absolute, "auto", allowEverywhere, { protectedRoots: ROOTS }).decision,
+    ).toBe("deny");
+    const viaLink: ToolCallContext = {
+      ...writeTo("logs/sess.jsonl"),
+      operativeValues: [
+        { kind: "path", canonical: [LOG, `/srv/ws/${LOG}`], spellings: ["logs/sess.jsonl"] },
+      ],
+    };
+    expect(
+      evaluateWithReason(viaLink, "auto", allowEverywhere, { protectedRoots: ROOTS }).decision,
+    ).toBe("deny");
+    const shouted: ToolCallContext = {
+      ...writeTo(".CREWHAUS/Sessions/x.jsonl"),
+      operativeValues: [
+        { kind: "path", canonical: [".CREWHAUS/Sessions/x.jsonl"], caseInsensitive: true },
+      ],
+    };
+    expect(
+      evaluateWithReason(shouted, "auto", allowEverywhere, { protectedRoots: ROOTS }).decision,
+    ).toBe("deny");
+  });
+
+  test("an extract or a patch: a destination inside a root is denied here; one above every root is the tool's to check", () => {
+    // ArchiveExtract's destination and GitApplyPatch's cwd are walked
+    // (`beneath: "all"`). Named inside the session logs, the floor denies.
+    const extractInto = (dest: string): ToolCallContext => ({
+      toolName: "ArchiveExtract",
+      input: { archive: "a.tar", destination: dest },
+      operativeValues: [
+        { kind: "path", canonical: ["a.tar", "/srv/ws/a.tar"] },
+        {
+          kind: "path",
+          canonical: [dest, `/srv/ws/${dest}`],
+          beneath: [`${dest}/`, `/srv/ws/${dest}/`],
+        },
+      ],
+      readOnly: false,
+      destructive: true,
+    });
+    const rules: RuleSet = {
+      ...emptyRuleSet,
+      flag: [rule("alwaysAllow", "ArchiveExtract", "flag")],
+    };
+    expect(
+      evaluateWithReason(extractInto(".crewhaus/sessions/unpacked"), "auto", rules, {
+        protectedRoots: ROOTS,
+      }).decision,
+    ).toBe("deny");
+    // Named ABOVE every root (the workspace root, `.crewhaus`), the floor
+    // cannot tell a write that lands in one from one that does not — a
+    // patch's files, an archive's members — so it leaves the call to the
+    // rules, and the tool checks its own targets against the roots the
+    // runtime hands it on the bridge (tool-safety `protectedRootsOf`).
+    const patchAtRoot: ToolCallContext = {
+      toolName: "GitApplyPatch",
+      input: { cwd: ".", patch: "…" },
+      operativeValues: [{ kind: "path", canonical: [".", "/srv/ws"], beneath: ["", "/srv/ws/"] }],
+      readOnly: false,
+      destructive: true,
+    };
+    const patchRules: RuleSet = {
+      ...emptyRuleSet,
+      flag: [rule("alwaysAllow", "GitApplyPatch", "flag")],
+    };
+    expect(
+      evaluateWithReason(patchAtRoot, "auto", patchRules, { protectedRoots: ROOTS }).decision,
+    ).toBe("allow");
+    expect(
+      evaluateWithReason(extractInto(".crewhaus"), "auto", rules, { protectedRoots: ROOTS })
+        .decision,
+    ).toBe("allow");
+  });
+
+  test("a tool that declares no operative arguments is read from its input strings", () => {
+    const mcpWrite: ToolCallContext = {
+      toolName: "mcp__fs__write_file",
+      input: { target: { path: `./${LOG}` }, content: "x" },
+      readOnly: false,
+      destructive: true,
+    };
+    const rules: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAllow", "mcp__fs__write_file")] };
+    expect(evaluateWithReason(mcpWrite, "default", rules, { protectedRoots: ROOTS }).decision).toBe(
+      "deny",
+    );
+  });
+
+  test("nothing else changes: reads, writes elsewhere, a sibling with the root as a prefix, no roots given", () => {
+    const readLog: ToolCallContext = {
+      toolName: "Read",
+      input: { path: LOG },
+      operativeValues: [{ kind: "path", canonical: [LOG, `/srv/ws/${LOG}`] }],
+      readOnly: true,
+      destructive: false,
+    };
+    expect(
+      evaluateWithReason(readLog, "default", BUILTIN_RULES_ONLY, { protectedRoots: ROOTS })
+        .decision,
+    ).toBe("allow");
+    for (const rel of [
+      "src/app.ts",
+      ".crewhaus/sessions-archive/x.jsonl",
+      ".crewhaus/settings.json",
+    ]) {
+      expect(
+        evaluateWithReason(writeTo(rel), "auto", allowEverywhere, { protectedRoots: ROOTS })
+          .decision,
+      ).toBe("allow");
+    }
+    // A write OUTSIDE the workspace is not the floor's business: the rules decide.
+    const outside: ToolCallContext = {
+      ...writeTo("/tmp/x"),
+      operativeValues: [{ kind: "path", canonical: ["/tmp/x"], outsideWorkspace: true }],
+    };
+    expect(
+      evaluateWithReason(outside, "auto", allowEverywhere, { protectedRoots: ROOTS }).decision,
+    ).toBe("allow");
+    expect(evaluateWithReason(writeTo(LOG), "auto", allowEverywhere).decision).toBe("allow");
+  });
+
+  test("the runtime's floorValues decide where a call writes: a store directory it only works in does not trip the floor", () => {
+    // EmitTraceEvent's shape: its relocating `dir` is the session store
+    // (namespaced custom.* lines), and the runtime leaves it out of floorValues.
+    const emit: ToolCallContext = {
+      toolName: "EmitTraceEvent",
+      input: { dir: ".crewhaus/sessions", sessionId: "sess_00000000000000aa" },
+      operativeValues: [
+        { kind: "path", canonical: [".crewhaus/sessions", "/srv/ws/.crewhaus/sessions"] },
+        { kind: "id", canonical: ["sess_00000000000000aa"] },
+      ],
+      floorValues: [{ kind: "id", canonical: ["sess_00000000000000aa"] }],
+      readOnly: false,
+      destructive: false,
+    };
+    const rules: RuleSet = { ...emptyRuleSet, yaml: [rule("alwaysAllow", "EmitTraceEvent")] };
+    expect(evaluateWithReason(emit, "default", rules, { protectedRoots: ROOTS }).decision).toBe(
+      "allow",
+    );
+    // Without the runtime's reading, every operative value counts.
+    const { floorValues: _ignored, ...unread } = emit;
+    expect(evaluateWithReason(unread, "default", rules, { protectedRoots: ROOTS }).decision).toBe(
+      "deny",
+    );
+  });
+
+  test("bypass consults nothing, the floor included (the documented operator override)", () => {
+    expect(
+      evaluateWithReason(writeTo(LOG), "bypass", emptyRuleSet, { protectedRoots: ROOTS }).decision,
+    ).toBe("allow");
+  });
+});
+
+const BUILTIN_RULES_ONLY: RuleSet = { ...emptyRuleSet, builtin: BUILTIN_DEFAULT_RULES };
+
 describe("Pillar 3 — ruleBasedJustificationJudge", () => {
   test("denies brief justifications", async () => {
     const v = await evaluateJustification({

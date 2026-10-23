@@ -2,11 +2,13 @@
  * Bounds for the builtin certificate checker (design §6.4, §18 "checkers
  * bounded by timeout_ms").
  *
- * The checker runs synchronously on the harness's own thread, so every loop
- * that a statement or a proof can make long — quantifier enumeration,
- * substitution, polynomial expansion, alpha-comparison — spends from one
- * {@link Budget}. A spent budget is a rejection with a reason, never a hang
- * and never a throw out of `check()`.
+ * A check is synchronous on whatever thread runs it — a worker thread of its
+ * own under `createBuiltinChecker` (see ./runner), the caller's when
+ * `checkCertificate` is called directly — so every loop that a statement or
+ * a proof can make long — quantifier enumeration, substitution, polynomial
+ * expansion, alpha-comparison — spends from one {@link Budget}. A spent
+ * budget is a rejection with a reason, never a hang and never a throw out of
+ * `check()`.
  */
 
 /** The hard caps. Exported so the README, the tests and `ProofCheckers` agree. */
@@ -37,11 +39,27 @@ export const BUILTIN_LIMITS = {
   defaultTimeoutMs: 10_000,
   /**
    * The most wall-clock any one check may take (ms), whatever the caller
-   * asks for: the check is synchronous on the harness's thread, so a longer
-   * `formal.timeout_ms` (sized for a sandbox checker's container) must not
-   * stall it.
+   * asks for: a check holds a core for all of it, and the caller's own
+   * thread where no worker can start, so a longer `formal.timeout_ms` (sized
+   * for a sandbox checker's container) must not stretch it.
    */
   maxTimeoutMs: 10_000,
+  /**
+   * Checks that run at once, each on a worker thread of its own (./runner);
+   * one past that waits for a free thread, inside its own deadline. Every
+   * tenant of a managed daemon shares them, so the threads, the cores and
+   * the memory checks take stay bounded however many sessions prove at once.
+   */
+  maxConcurrentChecks: 4,
+} as const;
+
+/**
+ * The reasons a stopped check gives: the budget's own clock and signal, and
+ * the runner's when it stops a worker, say the same words.
+ */
+export const STOP_REASONS = {
+  cancelled: "the check was cancelled",
+  timedOut: "the check ran out of time; shrink the proof or raise timeout_ms",
 } as const;
 
 /**
@@ -120,9 +138,7 @@ export class Budget {
   }
 
   checkClock(): void {
-    if (this.signal?.aborted === true) throw new CheckFailure("the check was cancelled");
-    if (Date.now() > this.deadline) {
-      throw new CheckFailure("the check ran out of time; shrink the proof or raise timeout_ms");
-    }
+    if (this.signal?.aborted === true) throw new CheckFailure(STOP_REASONS.cancelled);
+    if (Date.now() > this.deadline) throw new CheckFailure(STOP_REASONS.timedOut);
   }
 }

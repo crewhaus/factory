@@ -1047,11 +1047,22 @@ export type ProvabilityGradedEvent = TraceEventEnvelope & {
    * W2-A.)
    */
   assumptionsRefused?: number;
+  /**
+   * The hypotheses accepted proofs rest on (`ProofBundle.hypotheses`), when
+   * any: assumptions too, counted on every surface (design §6.4, §10).
+   * (0.8.0 additive, fix pass.)
+   */
+  hypotheses?: number;
   /** 0 = the original answer, n = the n-th gate-triggered retry. */
   retryIndex: number;
   maxRetries: number;
   bundleHash: string;
-  /** Where the bundle was persisted, when it was. */
+  /**
+   * Where the bundle was persisted, when it was — as the gate's display rule
+   * shows it (relative to the tenant's root inside a tenant scope, else the
+   * workspace: a `runs.subscribe` client never learns the server's layout).
+   * The durable event-log twin keeps the path as persisted.
+   */
   bundlePath?: string;
   /** The waiver judge's model and spend, when it ran. */
   judgeModel?: string;

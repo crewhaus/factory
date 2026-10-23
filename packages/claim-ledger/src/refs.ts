@@ -43,7 +43,20 @@ const BARE_DOI = /^10\.\d{4,9}\/\S+$/;
  * rule, for the same reason: "see https://acme.example/policy." means the
  * page, not a page whose path ends in a full stop.
  */
-const TRAILING_PUNCTUATION = /[.,;:!?]+$/;
+const TRAILING_PUNCTUATION = ".,;:!?";
+
+/**
+ * `url` without the sentence punctuation it ends with, read from the end.
+ * `replace(/[.,;:!?]+$/, "")` retried from every character of a punctuation
+ * run that something else follows — quadratic in the run — and a URL here
+ * can be any field of an MCP result or a line of the answer (design §10: no
+ * super-linear work on untrusted text; AGENTS.md pillar 3).
+ */
+function withoutTrailingPunctuation(url: string): string {
+  let end = url.length;
+  while (end > 0 && TRAILING_PUNCTUATION.includes(url[end - 1] as string)) end--;
+  return url.slice(0, end);
+}
 
 /** The first whitespace-free run of a value, which is all an identifier can be. */
 const firstWord = (value: string): string => value.split(/\s/, 1)[0] ?? "";
@@ -128,7 +141,7 @@ export function classifyDefinition(source: string): EvidenceRef {
   const { value, bracketed } = destinationOf(whole);
   if (value === "") return { kind: "text", text: whole };
   if (/^https?:\/\//i.test(value)) {
-    const url = (bracketed ? value : firstWord(value)).replace(TRAILING_PUNCTUATION, "");
+    const url = withoutTrailingPunctuation(bracketed ? value : firstWord(value));
     // `https://` and nothing after it names no page.
     if (/^https?:\/\/[^/?#\s]/i.test(url)) return { kind: "url", url };
     return { kind: "text", text: whole };

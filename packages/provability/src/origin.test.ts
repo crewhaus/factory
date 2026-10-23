@@ -62,6 +62,28 @@ describe("normalizeUrl", () => {
     expect(normalizeUrl("https://acme.example/")).toBe("https://acme.example/");
     expect(normalizeUrl("https://acme.example/p/?id=2#x")).toBe("https://acme.example/p?id=2");
     expect(normalizeUrl("https://acme.example./x")).toBe("https://acme.example/x");
+    expect(normalizeUrl("https://acme.example/a///")).toBe("https://acme.example/a");
+    expect(normalizeUrl("https://acme.example///")).toBe("https://acme.example/");
+    expect(normalizeUrl("https://acme.example//a//b//")).toBe("https://acme.example//a//b");
+  });
+
+  test("a long run of slashes inside the path is folded in linear time", () => {
+    // `/\/+$/` restarted at every slash of a run that does not end the path:
+    // 3 s for 80 000 of them, in a URL the model (or an MCP result) wrote.
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const n = 200_000;
+    const base = fastest(() => normalizeUrl(`https://a.example/${"a".repeat(n)}x`));
+    expect(fastest(() => normalizeUrl(`https://a.example/${"/".repeat(n)}x`))).toBeLessThan(
+      base * 20 + 100,
+    );
   });
 
   test("http and https stay distinct; non-http schemes and junk are not URLs", () => {

@@ -2096,7 +2096,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     }
 
     // 0.8.0 (design §12 item 5) — the proof bundles a run's provability gate
-    // persisted, keyed by the session id a gateway run answers with. Fleet-
+    // persisted, keyed by the session id a gateway run answers with (or, for
+    // a research run, its run id: the report bundle beside report.md). Fleet-
     // wide (a session id names its harness only implicitly); `?harness=`
     // narrows it to one registry row. Each harness's bundles are masked with
     // that harness's OWN scrubber — claim text is model prose and an excerpt
@@ -2106,7 +2107,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       const runId = rest[0] as string;
       if (!isProofRunId(runId)) {
-        throw new HttpError(400, "invalid run id — expected the run's session id (sess_<16 hex>)");
+        throw new HttpError(
+          400,
+          "invalid run id — expected the run's session id (sess_<16 hex>) or a research run's id (run_<16 hex>)",
+        );
       }
       const scope = url.searchParams.get("harness");
       const entries =

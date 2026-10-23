@@ -116,6 +116,23 @@ export const PROVABILITY_GRADER_NAMES: ReadonlyArray<string> = Object.freeze(
 );
 
 /**
+ * How one of the six joins a sample's overall grade (design §9.1), keyed on
+ * its canonical name — the one answer for every path that adds it, the
+ * `--provability` flag and a graders file's `type: registry` entry alike:
+ *   - `"requirement"` — the five with a bar: the sample must pass each on top
+ *     of its own `combine:` policy, never as a vote inside it (a vacuous pass
+ *     or a lower-is-better rate cannot carry a `combine: any` or skew a
+ *     `weighted` score);
+ *   - `"report"` — {@link PROVABILITY_REPORTED_GRADERS}: recorded, never part
+ *     of the verdict (more gate spend can never turn a fail into a pass).
+ * `undefined` for any other name.
+ */
+export function provabilityGraderRole(name: string): "requirement" | "report" | undefined {
+  if (PROVABILITY_REPORTED_GRADERS.includes(name)) return "report";
+  return PROVABILITY_GRADER_NAMES.includes(name) ? "requirement" : undefined;
+}
+
+/**
  * Register all six graders. Skips names already present (like
  * `registerContinuityGraders`, so a plugin registered first keeps its name)
  * and returns the canonical names.

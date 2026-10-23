@@ -48,8 +48,12 @@ import type {
 import { wireWiki } from "@crewhaus/memory-service";
 import type { RunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
-import { warnUnconsumedCombinePolicy } from "./combine-warnings";
-import { defaultGraderRegistry, resolveRegistryGrader } from "./default-registry";
+import { warnProvabilityOutsidePolicy, warnUnconsumedCombinePolicy } from "./combine-warnings";
+import {
+  defaultGraderRegistry,
+  registryProvabilityRoles,
+  resolveRegistryGrader,
+} from "./default-registry";
 import { RunnerError } from "./errors";
 import { runSample } from "./run-sample";
 import { detectSemanticFallback, formatSemanticFallbackWarning } from "./semantic-fallback";
@@ -169,6 +173,10 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
     // `combine: weighted` — exactly like runEval.
     warnUnconsumedCombinePolicy(compiled);
     const combine = compiled.find((g) => g.combine !== undefined)?.combine;
+    // 0.8.0 §9.1 (review I32) — a registry entry naming a `provability.*`
+    // grader takes the same role it takes under `crewhaus eval`.
+    const registryRoles = await registryProvabilityRoles(compiled);
+    warnProvabilityOutsidePolicy(compiled, registryRoles);
     // A11 — `type: registry` graders resolve exactly the way `crewhaus
     // eval` resolves them (G14): an explicit registry wins wholesale, else
     // the default one is built with the harness cwd as the
@@ -225,10 +233,12 @@ export function createExamRunner(opts: CreateExamRunnerOptions): ExamRunner {
             `exam: grader "${g.name}" resolves by registry name "${g.registrySpec.grader}" but no graderRegistry was available`,
           );
         }
+        const role = registryRoles.get(g.registrySpec.grader);
         return {
           name: g.name,
           grader: resolveRegistryGrader(graderRegistry, g.name, g.registrySpec),
           weight: g.weight,
+          ...(role !== undefined ? { role } : {}),
         };
       }
       return { name: g.name, grader: g.grader, weight: g.weight };

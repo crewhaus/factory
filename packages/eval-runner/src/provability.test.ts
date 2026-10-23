@@ -5,7 +5,7 @@
  * `runChatLoop` (a scripted model through the `_adapter` seam, the real
  * session log, the real verifier), graded by the real provability graders.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,7 @@ import { parseSpec } from "@crewhaus/spec";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
+import { registryProvabilityRoles } from "./default-registry";
 import { runEval } from "./index";
 import {
   PROOF_CHECK_TOOL,
@@ -77,11 +78,11 @@ const MEETINGS = {
   proof: "eval",
 };
 
-/** A completed turn as runtime-core hands it to `verify`. */
-function turnOf(finalText: string): ProvabilityTurn {
+/** A completed turn as runtime-core hands it to `verify`, with the transcript of its tool calls. */
+function turnOf(finalText: string, messages: ReadonlyArray<unknown> = []): ProvabilityTurn {
   return {
     finalText,
-    messages: [],
+    messages,
     usage: { input: 0, output: 0 },
     bus: createRunContext().eventBus,
     turnNumber: 1,
@@ -345,11 +346,20 @@ describe("wireSampleProvability", () => {
       if (tool === undefined) throw new Error("no ProofCheck");
       return tool;
     };
-    const run = async (tool: RegisteredTool) =>
-      JSON.parse((await tool.execute({ checker: "builtin", ...MEETINGS })) as string) as {
-        ok: boolean;
-        id: string;
-      };
+    // One ProofCheck call and its transcript: the assistant's tool_use, the
+    // user's tool_result — where the proven rung reads that it was checked.
+    const transcripts = new Map<string, ReadonlyArray<unknown>>();
+    const run = async (tool: RegisteredTool) => {
+      const input = { checker: "builtin", ...MEETINGS };
+      const raw = (await tool.execute(input)) as string;
+      const out = JSON.parse(raw) as { ok: boolean; id: string };
+      const id = `toolu_${out.id}`;
+      transcripts.set(out.id, [
+        { role: "assistant", content: [{ type: "tool_use", id, name: "ProofCheck", input }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: raw }] },
+      ]);
+      return out;
+    };
     const own = await run(proofCheckOf(gate.tools));
     expect(own.ok).toBe(true);
     expect(
@@ -358,7 +368,10 @@ describe("wireSampleProvability", () => {
     expect(existsSync(join(cwd, ".crewhaus", "proofs"))).toBe(false);
     // The sample's own proof is met.
     const met = await gate.provability.verify(
-      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${own.id}`),
+      turnOf(
+        `${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${own.id}`,
+        transcripts.get(own.id),
+      ),
     );
     expect(met.verdict).toBe("pass");
     // An artifact the LIVE harness wrote (a production run, say) is not this sample's evidence.
@@ -370,8 +383,12 @@ describe("wireSampleProvability", () => {
     expect(
       existsSync(join(cwd, ".crewhaus", "proofs", "prov-eval", "artifacts", `${live.id}.json`)),
     ).toBe(true);
+    // Even with that call in the turn's transcript, the sample's store does not hold it.
     const borrowed = await gate.provability.verify(
-      turnOf(`${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${live.id}`),
+      turnOf(
+        `${MEETINGS.claim.slice(0, -1)} [1].\n\n[1]: proof:${live.id}`,
+        transcripts.get(live.id),
+      ),
     );
     expect(borrowed.verdict).toBe("fail");
     expect(borrowed.claims[0]?.bindings[0]?.reason).toBe("proof_missing");
@@ -953,6 +970,138 @@ describe("runEval — --provability graders beside combine: any / weighted (revi
     const required = grades.perGrader.filter((g) => g.name !== "provability.costPerProvenClaim");
     const met = required.filter((g) => g.passed).length;
     expect(grades.overall).toMatchObject({ passed: false, score: met / required.length });
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// the same roles when a spec-declared gate names the graders by hand
+// ---------------------------------------------------------------------------
+
+describe("runEval — `type: registry` provability graders take the flag's roles (review I32)", () => {
+  // `crewhaus eval --help`: a spec that declares provability: "is gated the
+  // same way without the flag — name the graders with type: registry". So a
+  // registry-named provability.* grader is a requirement (the cost a report)
+  // beside the file's combine: policy, never a vote inside it (§9.1).
+  const evOf = (fields: Record<string, unknown>): TraceEvent =>
+    ({
+      runId: "r",
+      sessionId: "sess_0000000000000001",
+      turnNumber: 1,
+      traceId: "t",
+      spanId: "s",
+      timestamp: "2026-10-22T00:00:00.000Z",
+      ...fields,
+    }) as unknown as TraceEvent;
+  const passEv = (verdict: "pass" | "fail", retryIndex: number) =>
+    evOf({ kind: "provability_graded", level: "grounded", verdict, retryIndex, bundleHash: "x" });
+  const spent = (usd: number): TraceEvent[] =>
+    usd === 0
+      ? [passEv("pass", 0)]
+      : [
+          passEv("fail", 0),
+          evOf({
+            kind: "cost_accrual",
+            provider: "anthropic",
+            modelId: "claude-sonnet-4-6",
+            inputTokens: 1,
+            outputTokens: 1,
+            cachedReadTokens: 0,
+            costUsdMicros: usd * 1_000_000,
+          }),
+          passEv("pass", 1),
+        ];
+
+  /** No `--provability`: the spec declares the block, the file names the graders. */
+  async function declaredOverall(
+    graders: string,
+    proof: ProofBundle,
+    events: ReadonlyArray<TraceEvent> = [],
+  ) {
+    const invoker: AgentInvoker = async () => ({ agentOutput: ANSWER, proof, events });
+    const summary = await runEval({
+      ir: cliIr("provability: grounded\n"),
+      dataset: { name: "d", samples: samplesOf([{ id: "s1", input: "q" }]) },
+      compiledGraders: parseGradersConfig(graders).compiled,
+      opts: { outDir: join(tmp(), "run"), cwd: tmp(), concurrency: 1, retryErrors: false, invoker },
+    });
+    const sample = summary.samples[0];
+    if (sample === undefined) throw new Error("no sample");
+    return { grades: sample.grades, graderNames: summary.config.graderNames };
+  }
+
+  const registry = (name: string, grader: string, weight?: number): string =>
+    `  - name: ${name}\n    type: registry\n    grader: provability.${grader}\n${weight !== undefined ? `    weight: ${weight}\n` : ""}`;
+  const OWN_FAILING = '  - name: own\n    type: contains\n    substring: "zzz"\n';
+  const OWN_PASSING = '  - name: own\n    type: contains\n    substring: "refund"\n';
+
+  test("weighted: more gate spend can never turn a failing sample into a pass", async () => {
+    const graders = `combine: weighted\npassing_threshold: 0.7\ngraders:\n${OWN_FAILING.replace("\n    type", "\n    weight: 2\n    type")}${registry("cov", "claimCoverage")}${registry("cost", "costPerProvenClaim")}`;
+    const proof = await bundleOf(ANSWER, true);
+    const cheap = await declaredOverall(graders, proof, spent(0));
+    const dear = await declaredOverall(graders, proof, spent(3));
+    // Before the fix: $0 → 0.250 fail, $3 → 1.000 pass.
+    expect(cheap.grades.overall).toMatchObject({ passed: false, score: 0 });
+    expect(dear.grades.overall).toMatchObject({ passed: false, score: 0 });
+    // The cost is still measured and recorded, under the entry's own name.
+    expect(dear.grades.perGrader.find((g) => g.name === "cost")?.score).toBeCloseTo(3, 9);
+    expect(dear.grades.overall.rationale).not.toContain("[cost");
+    // Nothing was appended: the file's own entries are the set.
+    expect(dear.graderNames).toEqual(["own", "cov", "cost"]);
+  }, 30_000);
+
+  test("any: a reported cost or a vacuous pass cannot carry a sample whose own grader fails", async () => {
+    const graders = `combine: any\ngraders:\n${OWN_FAILING}${registry("cost", "costPerProvenClaim")}${registry("replay", "replayIntegrity")}`;
+    const grades = (await declaredOverall(graders, await bundleOf(ANSWER, true))).grades;
+    expect(grades.perGrader.find((g) => g.name === "cost")?.passed).toBe(true);
+    expect(grades.perGrader.find((g) => g.name === "replay")?.passed).toBe(true);
+    expect(grades.overall.passed).toBe(false);
+  }, 30_000);
+
+  test("any: the user's policy passing is not enough — a registry-named bar must hold too", async () => {
+    const graders = `combine: any\ngraders:\n${OWN_PASSING}${registry("cov", "claimCoverage")}`;
+    const failing = (await declaredOverall(graders, await bundleOf(ANSWER, false))).grades;
+    expect(failing.overall.passed).toBe(false);
+    expect(failing.overall.rationale).toContain("[cov: ✗]");
+    const passing = (await declaredOverall(graders, await bundleOf(ANSWER, true))).grades;
+    expect(passing.overall).toMatchObject({ passed: true, score: 1 });
+  }, 30_000);
+
+  test("all (the default): same verdicts as before; a lower-is-better rate leaves the score alone", async () => {
+    const graders = `graders:\n${OWN_PASSING}${registry("cov", "claimCoverage")}${registry("rate", "assumptionRate")}`;
+    const grades = (await declaredOverall(graders, await bundleOf(ANSWER, true))).grades;
+    expect(grades.overall).toMatchObject({ passed: true, score: 1 });
+    const unfetched = (await declaredOverall(graders, await bundleOf(ANSWER, false))).grades;
+    expect(unfetched.overall.passed).toBe(false);
+  }, 30_000);
+
+  test("a registry name outside the six keeps joining the policy", async () => {
+    const roles = await registryProvabilityRoles(
+      parseGradersConfig(
+        `graders:\n${registry("cov", "claimCoverage")}${registry("cost", "costPerProvenClaim")}  - name: mine\n    type: registry\n    grader: nlg.rougeL\n`,
+      ).compiled,
+    );
+    expect(Object.fromEntries(roles)).toEqual({
+      "provability.claimCoverage": "requirement",
+      "provability.costPerProvenClaim": "report",
+    });
+    expect((await registryProvabilityRoles([])).size).toBe(0);
+  });
+
+  test("under any / weighted the run says LOUDLY the entries gate beside the policy, weight unused", async () => {
+    const graders = `combine: weighted\ngraders:\n${OWN_PASSING}${registry("cov", "claimCoverage", 3)}`;
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      await declaredOverall(graders, await bundleOf(ANSWER, true));
+    } finally {
+      spy.mockRestore();
+    }
+    const logged = writes.join("");
+    expect(logged).toContain("graders.provability_outside_policy");
+    expect(logged).toContain("cov (requirement, weight 3 unused)");
   }, 30_000);
 });
 

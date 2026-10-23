@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_TITLE_CHARS } from "@crewhaus/continuity-store";
+import { MAX_TITLE_CHARS, createContinuityStore } from "@crewhaus/continuity-store";
 import type { DreamModelPhase, DreamModelPhaseInput } from "@crewhaus/dream-engine";
 import { loadSkillBody } from "@crewhaus/skills-registry";
 import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
@@ -533,6 +533,40 @@ describe("PR 17 — dream model-phase learning seed", () => {
     await dream?.engine.run({ trigger: "cli" });
     expect(inputs.length).toBe(1);
     expect(inputs[0]?.prompt).not.toContain("## Learning");
+  });
+
+  test("a gap closes as continuity.proof counts it: under require, proven by assertion stays open", async () => {
+    const seeded = async (proof: "ladder" | "require"): Promise<string> => {
+      // A harness of its own per mode: the dream runs once per window.
+      const cwd = join(tmp, proof);
+      mkdirSync(cwd, { recursive: true });
+      // Proven under `continuity.proof: off`: the cited ref recorded, unchecked.
+      const store = createContinuityStore({
+        specName: "expert",
+        rootDir: join(cwd, ".crewhaus", "state"),
+      });
+      const gap = await store.writeGoal({ title: `${GAP_GOAL_PREFIX} water hardness` });
+      await store.updateGoal(
+        gap.id,
+        {
+          status: "proven",
+          evidence: [{ toolUseId: "tu_unchecked", sessionId: "sess_00000000000000aa" }],
+        },
+        { verification: "unverified" },
+      );
+      const { phase, inputs } = capturingPhase();
+      const dream = wireDream(
+        { ...DREAM_LEARNING_FRAGMENT, continuity: { proof } },
+        { cwd, modelPhase: phase },
+      );
+      await dream?.engine.run({ trigger: "cli" });
+      // The model phase ran, with the engine's own prompt as its base.
+      expect(inputs.length).toBe(1);
+      expect(inputs[0]?.prompt).toContain("Phase-1 counts");
+      return inputs[0]?.prompt ?? "";
+    };
+    expect(await seeded("require")).toContain("water hardness");
+    expect(await seeded("ladder")).not.toContain("water hardness");
   });
 
   test("no gaps and no curriculum file → no seed appended", async () => {

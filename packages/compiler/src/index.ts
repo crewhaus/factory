@@ -277,10 +277,13 @@ export type LowerOptions = {
  * `"provability-on-fail-degraded"` (a declared `on_fail` the shape cannot
  * honour, lowered to `note`), `"provability-execution-unresolved"` (a
  * `checked`/`proven` floor whose `execution.allow` names a tool the catalog
- * cannot resolve offline) and `"provability-inert-block"` (a `level: off`
- * block that sets other keys) — all three remediable, so `crewhaus compile
- * --strict` escalates them (apps/cli/src/compile-warnings.ts lists the
- * informational codes that it does not), `path` the spec key it concerns
+ * cannot resolve offline), `"provability-inert-block"` (a `level: off`
+ * block that sets other keys), `"provability-image-unused"` (a
+ * `formal.image` with no lean4 checker to run it) and
+ * `"provability-research-rung-unreachable"` (a research floor of `checked` /
+ * `proven`, which no report can meet) — all five remediable, so `crewhaus
+ * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
+ * the informational codes that it does not), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -1299,6 +1302,46 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
   };
   visit(ir, "");
   return out;
+}
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §0, §1, §3; review I40) — the
+ * answer gates a spec declares that the edge worker does not run, said
+ * rather than dropped. The cf-worker emitters wire tools, budget, limits and
+ * trace; a `provability:` block lowers onto the IR and the worker never reads
+ * it, so a spec that says `grounded` deployed a worker serving every answer
+ * unverified — no gate, no footer, no bundle — with no word from the CLI,
+ * the hosted compiler or `--strict`. §1: an answer that does not carry proof
+ * is not served; §3: loud rejection beats dead config. `evaluation:` (the
+ * in-loop judge) is left out the same way. Each is an `accepted-but-unwired`
+ * warning — the code the compiler gives a block a shape carries but does
+ * not wire (crew's `provability:`), which `--strict` escalates — so a strict
+ * edge compile fails instead of shipping ungated.
+ *
+ * Called beside {@link assertCfWorkerToolsEdgeSafe} by both cf-worker emit
+ * paths (`crewhaus compile --emit-as cf-worker` and the compiler-worker's
+ * `POST /compile { emitAs: "cf-worker" }`), so the rule has one home.
+ */
+export function cfWorkerUnwiredBlockWarnings(ir: IrNode): CompileWarning[] {
+  const blocks = ir as { readonly provability?: unknown; readonly evaluation?: unknown };
+  const warnings: CompileWarning[] = [];
+  if (blocks.provability !== undefined) {
+    warnings.push({
+      code: "accepted-but-unwired",
+      path: "provability",
+      message:
+        "the cf-worker edge does not run the provability gate: the worker serves every answer ungated — no claim checked, no footer, no proof bundle. Compile without --emit-as to serve gated answers, or remove the block",
+    });
+  }
+  if (blocks.evaluation !== undefined) {
+    warnings.push({
+      code: "accepted-but-unwired",
+      path: "evaluation",
+      message:
+        "the cf-worker edge does not run the in-loop evaluation judge: the worker's answers are served ungraded. Compile without --emit-as to grade them, or remove the block",
+    });
+  }
+  return warnings;
 }
 
 /**
@@ -4836,19 +4879,74 @@ function lowerWatchme(spec: SpecWithWatchme, ctx: LowerContext): { watchme?: IrW
 }
 
 /**
- * 0.8.0 (design §3 / §4.2) — the `execution.allow` default: every in-process,
- * zero-token computation plus the verification gates. Category grammar, so it
- * expands through `@crewhaus/tool-categories` exactly as a written list does,
- * and a tool added to either category joins the default with no edit here.
- * `bash` is deliberately not in it (design §3).
+ * 0.8.0 (design §3 / §4.2 / §6.3) — the `execution.allow` default: every
+ * in-process, zero-token computation plus the verification gates. Category
+ * grammar, so it expands through `@crewhaus/tool-categories` exactly as a
+ * written list does, and a tool added to either category joins the default
+ * with no edit here. `bash` is deliberately not in it (design §3), and
+ * neither is any tool that writes: §6.3 keeps every destructive tool out of
+ * the default, so a result counts as `checked` evidence by default only when
+ * the tool is read-only. `goldenUpdate` (it rewrites a golden file) is the
+ * one such tool in `verify`. A spec that wants it lists it, and the binding
+ * says `replayed: false`. `apps/cli/src/provability-default-allow.test.ts`
+ * reads every expanded entry's safety flags, so a destructive tool added to
+ * either category fails a test instead of joining the default quietly.
  */
 export const PROVABILITY_DEFAULT_EXECUTION_ALLOW: ReadonlyArray<string> = Object.freeze([
   "all-compute",
   "all-verify",
+  "-goldenUpdate",
 ]);
 
 /** The lean pre-scan's default refusals (design §6.4); smt forbids nothing, its input is data. */
 const PROVABILITY_DEFAULT_FORBID: ReadonlyArray<string> = ["sorry", "axiom", "native_decide"];
+
+type ProvabilityCheckerId = IrProvability["formal"]["checkers"][number];
+
+/** `formal.checkers`' default (design §3): the in-process checker first, then Z3. */
+const PROVABILITY_DEFAULT_CHECKERS: ReadonlyArray<ProvabilityCheckerId> = ["builtin", "smt"];
+
+/** The checker that needs no sandbox (design §6.4) — the one the gate always has. */
+const PROVABILITY_BUILTIN_CHECKER = "builtin";
+
+/**
+ * 0.8.0 (design §3, §4.2, §6.4) — `formal.checkers` as the gate RUNS them:
+ * the spec's preference order, then `builtin` when the spec left it out
+ * (default `[builtin, smt]`). The builtin certificate checker needs no
+ * sandbox, so the proof tools always carry it — tool-proof appends it the
+ * same way (`defaultCheckerIds`), "so a harness can always prove something".
+ * Resolving that here keeps the IR the list that runs, so the provability
+ * skill's `{{checkers}}`, `ProofCheckers`, `crewhaus provability checkers`
+ * and `crewhaus lint` all read one list (§4.2: no consumer re-derives it).
+ * The list is a preference order, not an allowlist: `[lean4]` prefers Lean
+ * and falls back to builtin; it cannot exclude builtin, whose accepted
+ * certificate is a sound proof, and a `proof:` binding meets any floor (§2).
+ */
+function resolveFormalCheckers(
+  listed: ReadonlyArray<ProvabilityCheckerId> | undefined,
+): ProvabilityCheckerId[] {
+  const checkers = [...(listed ?? PROVABILITY_DEFAULT_CHECKERS)];
+  return checkers.includes(PROVABILITY_BUILTIN_CHECKER)
+    ? checkers
+    : [...checkers, PROVABILITY_BUILTIN_CHECKER];
+}
+
+/**
+ * 0.8.0 (design §3, §18) — the checkers a LIVE block's `formal.checkers`
+ * names when it leaves `builtin` out: sandbox checkers only (`smt`, `lean4`),
+ * the list {@link resolveFormalCheckers} appends `builtin` to. `[]` when the
+ * list names `builtin` or is not declared, and for an absent or `level: off`
+ * block. Read off the SPEC because the lowered list always carries builtin:
+ * `crewhaus lint`'s `provability-sandbox-only-checkers` reports what the
+ * author wrote against what runs.
+ */
+export function sandboxOnlyProvabilityCheckers(spec: object): ReadonlyArray<string> {
+  const provability = (spec as { readonly provability?: SpecProvabilityBlock }).provability;
+  if (provabilityLevelOf(provability) === "off") return [];
+  const listed = provabilityObjectOf(provability)?.formal?.checkers;
+  if (listed === undefined || listed.includes(PROVABILITY_BUILTIN_CHECKER)) return [];
+  return [...listed];
+}
 
 /** The provability block of any IR variant that carries one (cli/channel/managed/research/crew). */
 export function provabilityOf(ir: IrNode): IrProvability | undefined {
@@ -5002,7 +5100,7 @@ type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
  * emitter or interpreter re-derives a default:
  *
  *   - `execution.allow` expands through the `tools:` category grammar at
- *     lower time (default `[all-compute, all-verify]`), so the IR carries
+ *     lower time (default `[all-compute, all-verify, -goldenUpdate]`), so the IR carries
  *     concrete names only — each builtin as its spec key, anything else
  *     exactly as written; an unknown category or an exclusion that removes
  *     nothing fails the compile exactly as it does in `tools:`, on an inert
@@ -5013,6 +5111,9 @@ type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
  *     `strongest`), the watchme precedent.
  *   - `on_fail: escalate` resolves `escalateTo` with the cascade helper
  *     `IrEvaluation` uses.
+ *   - `formal.checkers` gains `builtin` last when the spec left it out
+ *     ({@link resolveFormalCheckers}), so the IR lists every checker the
+ *     proof tools run.
  *
  * Per shape (design §8): research's report gate runs once over the rendered
  * report, not per turn, so `retry` / `escalate` are not supported there in
@@ -5021,15 +5122,22 @@ type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
  * that shape's default, not a degraded `retry`. Warning there would fire on
  * every bare `provability: cited` research spec (the researcher starter
  * ships exactly that, design §11), and `crewhaus compile --strict` would
- * then refuse a spec that says nothing wrong. Crew carries the block unwired
+ * then refuse a spec that says nothing wrong. Research's report evidence is
+ * the citation tracker's fetched bodies alone, which reach `grounded` at
+ * most, so a `checked` / `proven` floor there can never pass:
+ * `provability-research-rung-unreachable`. Crew carries the block unwired
  * (the table row); it has no `agent.model_pool` to escalate on, so a declared
  * `escalate` degrades to `note` there with the same code.
  *
- * Two more compile warnings, both remediable (so `--strict` escalates them):
+ * More compile warnings, all remediable (so `--strict` escalates them):
  * `provability-inert-block` for a `level: off` object that sets other keys
- * (it lowers to nothing, and saying so beats silently dropping config), and
+ * (it lowers to nothing, and saying so beats silently dropping config),
  * `provability-execution-unresolved` for a `checked`/`proven` floor whose
- * `execution.allow` names a tool the catalog cannot resolve offline.
+ * `execution.allow` names a tool the catalog cannot resolve offline, and
+ * `provability-image-unused` for a `formal.image` with no `lean4` in
+ * `formal.checkers` — the image overrides the lean4 checker's alone (smt
+ * always runs the curated Z3 image), so without lean4 it would be config that
+ * silently does nothing (design §3).
  */
 function lowerProvability(
   spec: SpecWithProvability,
@@ -5079,6 +5187,14 @@ function lowerProvability(
   }
   const escalateTo =
     onFail === "escalate" ? resolveCascadeTarget(spec, ctx, "provability.on_fail") : undefined;
+  if (ctx.target === "research" && (level === "checked" || level === "proven")) {
+    warn(
+      ctx,
+      "provability-research-rung-unreachable",
+      "provability.level",
+      `provability.level: ${level} cannot be met on the research shape in 0.8.0 — the report gate's only evidence is the sources the run fetched, which reach grounded at most, so no claim in a report can meet this floor. Set level: grounded or level: cited.`,
+    );
+  }
 
   const allow = expandExecutionAllow(
     block?.execution?.allow ?? PROVABILITY_DEFAULT_EXECUTION_ALLOW,
@@ -5088,6 +5204,16 @@ function lowerProvability(
     block?.judge !== undefined
       ? resolveAuxSlot(block.judge.model, ctx, "provability.judge.model")
       : undefined;
+
+  const checkers = resolveFormalCheckers(block?.formal?.checkers);
+  if (block?.formal?.image !== undefined && !checkers.includes("lean4")) {
+    warn(
+      ctx,
+      "provability-image-unused",
+      "provability.formal.image",
+      `provability.formal.image overrides the lean4 checker's image only, and provability.formal.checkers (${checkers.join(", ")}) does not list lean4, so the image is never used. Add lean4 to formal.checkers, or delete formal.image.`,
+    );
+  }
 
   const provability: IrProvability = {
     level,
@@ -5117,7 +5243,7 @@ function lowerProvability(
       maxReplays: block?.execution?.max_replays ?? 20,
     },
     formal: {
-      checkers: [...(block?.formal?.checkers ?? ["builtin", "smt"])],
+      checkers,
       ...(block?.formal?.image !== undefined ? { image: block.formal.image } : {}),
       forbid: [...(block?.formal?.forbid ?? PROVABILITY_DEFAULT_FORBID)],
       timeoutMs: block?.formal?.timeout_ms ?? 30_000,

@@ -11,14 +11,18 @@
  *     from the session log and the transcript (scoped by `config.scope`),
  *     the proof artifacts under the spec's proofs root, `checked` replay
  *     through the catalog (pure tools only, compared in the shape the log
- *     holds the call in — `./replay`), the guarded HEAD when
- *     `sources.resolve: head` (each request decided is recorded as an
- *     `egress_decision` on the run's audit sink, when it has one), and the
+ *     holds the call in, never a tool whose answer depends on the
+ *     workspace — `./replay`), the guarded HEAD when `sources.resolve:
+ *     head` (each URL screened by the run's egress fabric before it is sent,
+ *     each request decided recorded as an `egress_decision` on the run's
+ *     audit sink, when it has one), and the
  *     waiver judge when `provability.judge` is set — skipped, not guessed,
  *     once the run's `budget.judge_share` is spent. Every root is resolved
  *     per turn for the active tenant.
  *   - `renderBundle` — the one-line footer (`render: footer`) or the JSON
  *     (`render: json`); absent under `render: none`.
+ *   - `displayPath` — the footer's path rule, for the run's live surfaces
+ *     (the trace event a gateway client streams, a halt's detail).
  *   - `nudge` — provability's `renderNudge`: the model's own sentences, the
  *     evidence identifiers and fixed reasons, never fetched content.
  *   - `persist` — the bundle store under the proofs root, mode 0600.
@@ -45,12 +49,13 @@ import {
   verifyDocument,
 } from "@crewhaus/provability";
 import type { ProvabilityTurn, RunProvability } from "@crewhaus/runtime-core";
-import { tenantRootOf } from "@crewhaus/tool-proof";
+import { proofRecheck, tenantRootOf } from "@crewhaus/tool-proof";
 import { provabilitySkillText } from "./child-skill";
 import { gateEvidence } from "./evidence";
 import {
   type HeadDecision,
   type HeadResolver,
+  RESOLVE_SINK_ID,
   SHARED_HEAD_CACHE,
   createHeadResolver,
 } from "./head";
@@ -69,9 +74,18 @@ export type ProvabilityGateOptions = {
   /** Where session logs live, when the run was given a root (else the runtime's default order). */
   readonly sessionRootDir?: string;
   /** Where the rendered bundle goes (`RunProvability.footerTarget`). */
-  readonly footerTarget?: "stream" | "reply";
-  /** The HEAD request behind `sources.resolve: head` (default: tool-fetch's `guardedHead`). */
-  readonly resolveHead?: (url: string) => Promise<number | undefined>;
+  readonly footerTarget?: "stream" | "reply" | "none";
+  /**
+   * The HEAD request behind `sources.resolve: head` (default: tool-fetch's
+   * `guardedHead`). `signal` aborts when the verifier's HEAD deadline
+   * passes or the turn ends; a request that honours it stops then.
+   */
+  readonly resolveHead?: (url: string, signal?: AbortSignal) => Promise<number | undefined>;
+  /**
+   * How long one verification waits on its HEAD requests in all
+   * (`VerifyOptions.headDeadlineMs`; default 15 s).
+   */
+  readonly headDeadlineMs?: number;
   /** Observe every bundle (the gateway envelope, the research report, tests). */
   readonly onBundle?: (bundle: ProofBundle, bundlePath?: string) => void;
   /** Test seam: the waiver judge's adapter. */
@@ -147,6 +161,16 @@ function recordHead(
   };
 }
 
+/** A signal that aborts when either does; `undefined` when neither is given. */
+function eitherSignal(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined,
+): AbortSignal | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return AbortSignal.any([a, b]);
+}
+
 /** The run's live judge-share read; a read that throws cannot say the share is spent. */
 function shareSpent(turn: ProvabilityTurn): boolean {
   try {
@@ -183,7 +207,7 @@ export function buildRunProvability(
   const head: HeadResolver | undefined =
     config.sources.resolve === "head"
       ? customHead !== undefined
-        ? createHeadResolver(config.sources, (url) => customHead(url))
+        ? createHeadResolver(config.sources, (url, signal) => customHead(url, signal))
         : createHeadResolver(config.sources, undefined, SHARED_HEAD_CACHE)
       : undefined;
 
@@ -194,6 +218,8 @@ export function buildRunProvability(
     const evidence = await gateEvidence({
       scope: config.scope,
       workspaceRoot: cwd,
+      // A managed turn's runtime spills under the tenant's own root.
+      ...(tenant !== undefined ? { toolResultsRoot: tenant.toolResultRoot } : {}),
       messages: turn.messages,
       ...(turn.isSynthetic !== undefined ? { isSynthetic: turn.isSynthetic } : {}),
       ...(turn.sessionId !== undefined ? { sessionId: turn.sessionId } : {}),
@@ -203,27 +229,45 @@ export function buildRunProvability(
     });
     const { replay, isPureTool } = catalogReplay(opts.catalog, {
       logged: loggedResults(evidence),
+      workspaceRoot: cwd,
       ...(turn.signal !== undefined ? { signal: turn.signal } : {}),
     });
     const record =
       turn.egressAuditSink !== undefined ? recordHead(turn.egressAuditSink) : undefined;
+    // Pillar 3 — the run's egress fabric screens every URL before its HEAD.
+    const screenEgress = turn.screenEgress;
+    const screen =
+      screenEgress !== undefined ? (url: string) => screenEgress(url, RESOLVE_SINK_ID) : undefined;
     const verifyOptions: VerifyOptions = {
       config,
       evidence,
       workspaceRoot: cwd,
       artifacts: createFileArtifactStore({ rootDir: proofs }),
       retryIndex: turn.retryIndex,
+      ...(opts.headDeadlineMs !== undefined ? { headDeadlineMs: opts.headDeadlineMs } : {}),
       ...(opts.catalog !== undefined ? { replay, isPureTool } : {}),
       ...(head !== undefined
         ? {
-            resolveHead: (url: string) =>
-              head(url, {
+            // The verifier's own signal ends a HEAD at its deadline (and
+            // before the retry pass starts its own); the turn's ends it when
+            // the turn does. Either one stops the request.
+            resolveHead: (url: string, signal?: AbortSignal) => {
+              const stop = eitherSignal(signal, turn.signal);
+              return head(url, {
                 ...(turn.sessionId !== undefined ? { sessionId: turn.sessionId } : {}),
-                ...(turn.signal !== undefined ? { signal: turn.signal } : {}),
+                ...(stop !== undefined ? { signal: stop } : {}),
                 ...(record !== undefined ? { record } : {}),
-              }),
+                ...(screen !== undefined ? { screen } : {}),
+              });
+            },
           }
         : {}),
+      // A stored builtin proof is checked again before it backs a claim
+      // (design §6.4): the file is in the workspace, the checker is not.
+      recheckProof: proofRecheck({
+        timeoutMs: config.formal.timeoutMs,
+        ...(turn.signal !== undefined ? { signal: turn.signal } : {}),
+      }),
       // Past the judge share the waiver is skipped, not guessed (§6.2): no
       // judge at all when the share is already spent, and the judge itself
       // re-reads it before every call, since its own spend can cross it.
@@ -261,6 +305,7 @@ export function buildRunProvability(
   return {
     level: config.level,
     onFail: config.onFail,
+    displayPath: (bundlePath) => displayPath(bundlePath, footerBase(cwd)),
     maxRetries: config.maxRetries,
     threshold: config.threshold,
     ...(config.escalateTo !== undefined ? { escalateTo: config.escalateTo } : {}),

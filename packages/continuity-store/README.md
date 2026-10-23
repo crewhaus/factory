@@ -85,6 +85,23 @@ heading, and focus.md's sections are found by their last header, so neither
 a title nor a focus body can be read back as a step, a requirement or the
 active-plan pointer.
 
+**Proof mode in the handoff** (0.8.0): `createContinuityStore({ proofMode })`
+takes `continuity.proof` (`"ladder"` by default) and only `handoff.md` reads
+it. Under `"require"`, `countsAsProven` counts a record done only when
+`isProvenVerified`: a step or goal proven by assertion, or `proven` with no
+frozen proof, is rendered as open — the goal under Goals, the step as a
+`Prove: …` next action and out of the proven count — because the require
+tools still ask for a verified proof. The ladder and `"off"` render as
+before. Transitions never read it; each call says how it verifies.
+
+**Unreadable session logs** (0.8.0): a log that cannot be read to its end (a
+torn last line from a crash mid-append, a malformed line, a link where the
+log should be) is read up to that point, as provability's `checked` rung
+reads it. An id found before the bad line resolves as usual; one that is not
+resolves `missing`, with a detail naming the log, so `verifyEvidence` throws
+an `EvidenceError` (and tool-plan audits the rejection) instead of a raw
+event-log error. `onUnreadable` hears about each such log once per call.
+
 **Guards** (0.8.0): `updateGoal(…, { guard })` runs `guard(next, previous)`
 under the store lock on the merged record, before anything is written;
 throwing refuses the update. tool-plan's `continuity.proof: require` uses it

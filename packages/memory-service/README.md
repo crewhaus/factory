@@ -105,6 +105,12 @@ degraded to the ladder with a boot note, which is gone):
   against the session event log.
 - `require` — the ladder, and nothing below `proven` completes anything:
   `claimed` stays settable, but a goal cannot reach its target unproven.
+  A step or goal proven by assertion (an earlier `off` run), or `proven`
+  with no frozen proof, counts as below `proven` everywhere: it stays open
+  in the `<current_plan>` tail and `handoff.md` (the teardown write and the
+  dream's refresh both render under the mode), and the Thredz goal mirror
+  sends only the fields an update changed instead of completing the remote
+  goal.
 - `off` — for harnesses with no event log: `PlanComplete` / `GoalUpdate`
   record the cited toolUseIds without resolving them and pin no session.
   `PlanComplete` emits `action_proof` with `verdict: "unverified"`, and a

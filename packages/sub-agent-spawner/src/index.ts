@@ -244,6 +244,59 @@ export function resolveChildLoopPlan(
   };
 }
 
+/** The provability tools the parent's skill tells a model to call. */
+const PROVABILITY_TOOLS: ReadonlyArray<string> = [
+  "ProvabilityPreflight",
+  "ProofCheckers",
+  "ProofCheck",
+];
+
+/**
+ * The parent's rendered `provability` skill as it applies to a child (design
+ * §8: only the parent's final text is gated). The skill is written to the
+ * gated model, so two parts of it are false for a child:
+ *
+ *   - its opening, before the first `## ` section — what happens to an
+ *     answer that falls short (it "comes back to you", is served failing, or
+ *     stops the run). A child's reply is never checked, retried or served:
+ *     the sections after it (how to cite, what the gate checks, how to pass)
+ *     are what a child needs to cite the way the parent's gate reads;
+ *   - a list item that tells it to call a provability tool its own tool set
+ *     lacks (`ProvabilityPreflight`, `ProofCheckers`, `ProofCheck`) — a child
+ *     runs on its definition's `tools:` allowlist, not the parent's catalog,
+ *     and a call to a tool it has not got is a wasted turn and an error.
+ *
+ * A text with no section is not the shipped skill's layout and is kept
+ * whole: there is no telling its parts apart.
+ */
+function childSkillText(skill: string, tools: ReadonlySet<string>): string {
+  const lines = skill.split(/\r?\n/);
+  const first = lines.findIndex((line) => /^##\s/.test(line));
+  const body = first === -1 ? lines : lines.slice(first);
+  const out: string[] = [];
+  for (let i = 0; i < body.length; ) {
+    const item = /^([ \t]*)[-*+][ \t]/.exec(body[i] as string);
+    if (item === null) {
+      out.push(body[i] as string);
+      i++;
+      continue;
+    }
+    // The item and the lines indented under it, up to a blank line.
+    const indent = (item[1] as string).length;
+    let end = i + 1;
+    while (end < body.length) {
+      const line = body[end] as string;
+      if (line.trim() === "" || (/^[ \t]*/.exec(line)?.[0].length ?? 0) <= indent) break;
+      end++;
+    }
+    const text = body.slice(i, end).join("\n");
+    const lacks = PROVABILITY_TOOLS.some((t) => text.includes(`\`${t}\``) && !tools.has(t));
+    if (!lacks) out.push(...body.slice(i, end));
+    i = end;
+  }
+  return out.join("\n").trim();
+}
+
 /**
  * 0.8.0 (design/0.8.0-provability-release.md §8) — what a child is told when
  * its parent's answers are gated. Read-only guidance, never a gate: only the
@@ -252,7 +305,10 @@ export function resolveChildLoopPlan(
  * citation of it — but only if the child hands the source back. So the child
  * learns the floor and how to cite (a `[n]` marker on each claim and a
  * definitions block naming what it fetched, read or computed), followed by
- * the parent's rendered `provability` skill when its wiring has one.
+ * the parts of the parent's rendered `provability` skill that apply to it
+ * (`childSkillText`: never what happens to a failing answer, and a
+ * provability tool only when `tools`, the names in the child's own tool
+ * set, has it).
  *
  * It lands in the child's own instructions (its system region), after the
  * definition's: the text is first-party — this framing plus a skill the
@@ -260,21 +316,31 @@ export function resolveChildLoopPlan(
  * tool, model or channel content in it — so it crosses no trust boundary and
  * takes no classification pass, exactly as the instructions themselves do.
  */
-export function childProvabilityGuidance(seam: SubAgentProvabilitySeam): string {
-  const skill = seam.skill?.trim() ?? "";
+export function childProvabilityGuidance(
+  seam: SubAgentProvabilitySeam,
+  tools: ReadonlyArray<string> = [],
+): string {
+  const skill = childSkillText(seam.skill?.trim() ?? "", new Set(tools));
   return [
     `<provability_guidance level="${seam.level}">`,
-    `Your reply is evidence for an answer your parent agent must prove at the \`${seam.level}\` floor. Only the parent's final answer is checked, and it can cite only what you hand back: mark each factual claim in your reply with a [n] marker and end with a definitions block — \`[n]: <the URL or workspace path you fetched or read>\`, or \`[n]: tool:<toolUseId>\` for a value a tool computed. Cite only sources you fetched or read in this task.`,
+    `Your reply is evidence for an answer your parent agent must prove at the \`${seam.level}\` floor. Only the parent's final answer is checked — your reply is never checked, retried or served on its own — and the parent can cite only what you hand back: mark each factual claim in your reply with a [n] marker and end with a definitions block — \`[n]: <the URL or workspace path you fetched or read>\`, or \`[n]: tool:<toolUseId>\` for a value a tool computed. Cite only sources you fetched or read in this task.`,
     ...(skill !== "" ? ["", skill] : []),
     "</provability_guidance>",
   ].join("\n");
 }
 
 /** The child's instructions: the plan's, plus the provability guidance under a gated parent. */
-function childInstructions(parent: ParentRunHandle, plan: ChildLoopPlan): string {
+function childInstructions(
+  parent: ParentRunHandle,
+  plan: ChildLoopPlan,
+  tools: ReadonlyArray<{ readonly name: string }>,
+): string {
   return parent.provability === undefined
     ? plan.instructions
-    : `${plan.instructions}\n\n${childProvabilityGuidance(parent.provability)}`;
+    : `${plan.instructions}\n\n${childProvabilityGuidance(
+        parent.provability,
+        tools.map((t) => t.name),
+      )}`;
 }
 
 /**
@@ -319,7 +385,7 @@ export async function spawnSubAgent(
   };
   // 0.8.0 §8 — under a gated parent the child's instructions carry the
   // read-only provability guidance (`childProvabilityGuidance`).
-  const instructions = childInstructions(parent, plan);
+  const instructions = childInstructions(parent, plan, opts.childTools);
   const isoOpts: CreateIsolatedContextOptions = {
     name: opts.def.name,
     instructions,

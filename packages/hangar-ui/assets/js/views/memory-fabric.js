@@ -755,7 +755,7 @@ function plansCard(data, ctx) {
                 { class: "check-list" },
                 (Array.isArray(plan.steps) ? plan.steps : []).map((step) =>
                   el("li", null, [
-                    dot(ladderTone(step.status), String(step.status ?? "")),
+                    ladderDot(step),
                     el("span", { text: ` ${String(step.text ?? "")}` }),
                     ...(Array.isArray(step.proofs) ? step.proofs : []).map((proof) =>
                       el("a", {
@@ -782,6 +782,43 @@ function ladderTone(status) {
   return "off";
 }
 
+/**
+ * How a plan step's or goal's ladder status reads (design/0.8.0 §6.3). The
+ * server keeps `status` the store's ladder value and says beside it what a
+ * step proven BY ASSERTION under `continuity.proof: off` is:
+ * `provenByAssertion`, `statusLabel` (`[proven (unverified)]`, the label
+ * continuity's own renderers give it) and the `unverified` refs it cited. That
+ * one is never a green "proven" — nothing checked it — so it is amber,
+ * labelled unverified, and its title names the refs nothing resolved. A
+ * server that predates the fields reads as before.
+ */
+export function ladderStatus(row) {
+  const status = String(row?.status ?? "");
+  const label =
+    typeof row?.statusLabel === "string" ? row.statusLabel.replace(/^\[(.*)\]$/, "$1") : "";
+  if (row?.provenByAssertion === true) {
+    const refs = (Array.isArray(row.unverified) ? row.unverified : [])
+      .map((ref) => {
+        const id = String(ref?.toolUseId ?? "");
+        return typeof ref?.sessionId === "string" && id !== "" ? `${id} (${ref.sessionId})` : id;
+      })
+      .filter((ref) => ref !== "");
+    return {
+      tone: "warn",
+      text: label !== "" ? label : "proven (unverified)",
+      title: `proven by assertion (continuity.proof: off) — ${
+        refs.length > 0 ? `cited, not verified: ${refs.join(", ")}` : "no cited ref was verified"
+      }`,
+    };
+  }
+  return { tone: ladderTone(status), text: label !== "" ? label : status, title: null };
+}
+
+function ladderDot(row) {
+  const { tone, text, title } = ladderStatus(row);
+  return title === null ? dot(tone, text) : el("span", { title }, [dot(tone, text)]);
+}
+
 function goalsCard(data) {
   const goals = Array.isArray(data.goals) ? data.goals : [];
   if (goals.length === 0)
@@ -793,7 +830,7 @@ function goalsCard(data) {
       goals.map((g) =>
         el("tr", null, [
           el("td", { text: String(g.title ?? "") }),
-          el("td", null, [dot(ladderTone(g.status), String(g.status ?? ""))]),
+          el("td", null, [ladderDot(g)]),
           el("td", {
             text:
               typeof g.current === "number" && typeof g.target === "number"

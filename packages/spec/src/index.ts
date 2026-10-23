@@ -2440,7 +2440,7 @@ const provabilityExecutionBlock = z
       .array(z.string().min(1))
       .optional()
       .describe(
-        "tools whose results count as execution evidence — tool keys, exact tool names, or the tools: category grammar (all-<category>, -<tool>, -all-<category>), expanded at compile time (default [all-compute, all-verify])",
+        "tools whose results count as execution evidence — tool keys, exact tool names, or the tools: category grammar (all-<category>, -<tool>, -all-<category>), expanded at compile time (default [all-compute, all-verify, -goldenUpdate])",
       ),
     replay: z
       .boolean()
@@ -2472,7 +2472,7 @@ const provabilityFormalBlock = z
       })
       .optional()
       .describe(
-        "proof checkers in preference order: builtin (in-process) | smt | lean4 (sandboxed) (default [builtin, smt])",
+        "proof checkers in preference order: builtin (in-process) | smt | lean4 (sandboxed); builtin is always available and is added last when the list leaves it out (default [builtin, smt])",
       ),
     image: z
       .string({
@@ -2484,7 +2484,7 @@ const provabilityFormalBlock = z
       .min(1)
       .optional()
       .describe(
-        "sandbox image override for the sandboxed checkers (e.g. a Mathlib-equipped lean image)",
+        "image override for the lean4 checker only (e.g. a Mathlib-equipped lean image); smt always runs the curated Z3 image, so without lean4 in checkers this is unused",
       ),
     forbid: z
       .array(z.string().min(1))
@@ -2589,9 +2589,10 @@ function provabilityUnionError(
  * `on_fail: escalate` without `agent.model_pool` on the interactive shapes,
  * and an unknown `judge.model` profile. The softer findings — no tool that can
  * read a source at `level ≥ grounded`, sandbox-only checkers, an inert
- * `level: off` block, a self-judging waiver — are `crewhaus lint` rules and
- * compile warnings, never parse errors: each describes a spec that is valid,
- * just unlikely to do what its author meant.
+ * `level: off` block, a `formal.image` no lean4 checker runs, a self-judging
+ * waiver — are `crewhaus lint` rules and compile warnings, never parse
+ * errors: each describes a spec that is valid, just unlikely to do what its
+ * author meant.
  */
 const provabilityObject = z
   .object({
@@ -4483,8 +4484,9 @@ export function provabilityLevelOf(block: SpecProvabilityBlock | undefined): Spe
  *     a typo whether or not the gate is on today.
  *
  * The rest — no source-reading tool at `level ≥ grounded`, sandbox-only
- * checkers, an inert `level: off` block, a self-judging waiver — describe
- * valid specs and are `crewhaus lint` findings / compile warnings instead.
+ * checkers, an inert `level: off` block, a `formal.image` no lean4 checker
+ * runs, a self-judging waiver — describe valid specs and are `crewhaus lint`
+ * findings / compile warnings instead.
  */
 function provabilityIssues(data: Spec, custom: SpecAddIssue): void {
   if (

@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MAX_TITLE_CHARS, MAX_UNIT_CHARS } from "@crewhaus/continuity-store";
 import { type ContinuityEvent, PROOF_MODES, type ProofMode, createPlanTools } from "./index";
 
 let tmp: string;
@@ -113,6 +114,35 @@ describe.each(PROOF_MODES.map((m) => [m]))("proofMode: %s — titles are one lin
     ]);
     expect(list.split("\n")).toHaveLength(2);
     expect(goalLines(await bundle.store.renderHandoff())).toHaveLength(2);
+  });
+
+  // The one input the default `ladder` refuses that it accepted before 0.8.0
+  // (README "one line per record"); pinned per mode so the docs stay true.
+  test("a title over 512 characters or a unit over 64 is refused, nothing written", async () => {
+    expect([MAX_TITLE_CHARS, MAX_UNIT_CHARS]).toEqual([512, 64]);
+    const bundle = makeTools(mode);
+    const long = "x".repeat(MAX_TITLE_CHARS + 1);
+    await expect(bundle.planUpdate.execute({ action: "create", title: long })).rejects.toThrow(
+      `a plan title is ${MAX_TITLE_CHARS + 1} characters; the cap is ${MAX_TITLE_CHARS}`,
+    );
+    await expect(bundle.goalWrite.execute({ title: long })).rejects.toThrow(
+      `a goal title is ${MAX_TITLE_CHARS + 1} characters; the cap is ${MAX_TITLE_CHARS}`,
+    );
+    await expect(
+      bundle.goalWrite.execute({ title: "g", unit: "y".repeat(MAX_UNIT_CHARS + 1) }),
+    ).rejects.toThrow(
+      `a goal unit is ${MAX_UNIT_CHARS + 1} characters; the cap is ${MAX_UNIT_CHARS}`,
+    );
+    expect(await bundle.store.listPlans()).toEqual([]);
+    expect(await bundle.store.listGoals()).toEqual([]);
+    expect(events).toEqual([]);
+    // At the cap is fine.
+    expect(
+      await bundle.goalWrite.execute({
+        title: "x".repeat(MAX_TITLE_CHARS),
+        unit: "y".repeat(MAX_UNIT_CHARS),
+      }),
+    ).toContain("created goal-0001");
   });
 });
 

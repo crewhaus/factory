@@ -34,8 +34,9 @@
  * Proof modes (`continuity.proof`, design §2.4; enforced from 0.8.0,
  * design/0.8.0-provability-release.md §6.3) — `createPlanTools({proofMode})`:
  *
- *   ladder  (default) the behaviour above, byte for byte: `claimed` is free,
- *           `proven` needs verified evidence.
+ *   ladder  (default) the proof behaviour above, unchanged from before
+ *           0.8.0: `claimed` is free, `proven` needs verified evidence, and
+ *           the tool descriptions are the pre-0.8.0 strings.
  *   require the ladder, plus: nothing below `proven` COMPLETES anything.
  *           `claimed` stays settable — it is honest progress — but the
  *           tools refuse every operation that would mark a goal achieved
@@ -52,7 +53,9 @@
  *           steps still need proof. A record proven by assertion under an
  *           earlier `off` run counts as below `proven` here, and so does a
  *           `proven` record with no frozen proof (the store never writes one;
- *           see `verifiedProven`).
+ *           see `verifiedProven`). The `<current_plan>` tail, handoff.md and
+ *           the Thredz goal mirror count such a record the same way
+ *           (continuity-store's `countsAsProven`): open, and not completed.
  *   off     no verification, for harnesses that keep no session event log
  *           to resolve evidence against. PlanComplete / GoalUpdate `proven`
  *           still demand cited toolUseIds (one token each, see the store's
@@ -62,6 +65,17 @@
  *           GoalUpdate marks its `goal_update` `verification: "unverified"`
  *           (`action_proof` is keyed by plan step). Every tool render says
  *           `[proven (unverified)]`, never `[proven]`.
+ *
+ * In EVERY mode, the ladder included (0.8.0, continuity-store's "one line
+ * per record"): a plan or goal title, and a goal unit, is stored as one line
+ * — every whitespace run, newlines included, collapses to one space and the
+ * ends are trimmed, as step text always was — and a title over 512
+ * characters (`MAX_TITLE_CHARS`) or a unit over 64 (`MAX_UNIT_CHARS`) is
+ * refused with nothing written. Before 0.8.0 the store only trimmed a title
+ * and kept a unit as given, so a multi-line title could carry a forged
+ * `[proven]` step line into a plan file, which defeated `require`. These caps, and a GoalUpdate title
+ * that is only whitespace (refused as GoalWrite's and PlanUpdate's always
+ * were), are the input the default mode now refuses that it used to accept.
  *
  * Pillar 3: plan/focus/ledger content is user-authored working state
  * (origin "user" semantics, like tool-memory writes) — recalled wiki/fact
@@ -519,6 +533,8 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
       ...(opts.sessionRootDir !== undefined ? { sessionRootDir: opts.sessionRootDir } : {}),
       ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
       ...(opts.now !== undefined ? { now: opts.now } : {}),
+      // The store's handoff.md counts `proven` as these tools do (§6.3).
+      proofMode,
     });
 
   async function emit(event: ContinuityEvent): Promise<void> {

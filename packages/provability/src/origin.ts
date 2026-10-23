@@ -63,7 +63,13 @@ export function normalizeUrl(raw: string): string | undefined {
   const host = url.hostname.replace(/\.$/, "");
   if (host === "") return undefined;
   let pathname = url.pathname;
-  if (pathname.length > 1) pathname = pathname.replace(/\/+$/, "") || "/";
+  if (pathname.length > 1) {
+    // Walked in from the end: `/\/+$/` restarts at every slash of a long
+    // run that does not end the path — quadratic in a URL the model wrote.
+    let end = pathname.length;
+    while (end > 0 && pathname.charCodeAt(end - 1) === 0x2f) end -= 1;
+    pathname = end === 0 ? "/" : pathname.slice(0, end);
+  }
   if (DOI_HOSTS.has(host)) return `https://doi.org${pathname.toLowerCase()}${url.search}`;
   const port = url.port === "" ? "" : `:${url.port}`;
   return `${url.protocol}//${host}${port}${pathname}${url.search}`;

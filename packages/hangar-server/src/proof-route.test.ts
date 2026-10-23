@@ -14,7 +14,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { makeFixtureHarness } from "./fixture";
 import {
   MANAGED_TENANTS_ROOT_DEFAULT,
@@ -103,10 +103,12 @@ function writeBundle(
   session: string,
   turn: number,
   value: unknown,
+  pass = 1,
 ): string {
   const at = join(dir, ".crewhaus", "proofs", spec, session);
   mkdirSync(at, { recursive: true });
-  const path = join(at, `turn-${turn}.json`);
+  // The store's names: the first pass `turn-<n>.json`, a retry's `turn-<n>.<k>.json`.
+  const path = join(at, pass === 1 ? `turn-${turn}.json` : `turn-${turn}.${pass}.json`);
   writeFileSync(path, typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`);
   return path;
 }
@@ -141,6 +143,39 @@ describe("GET /api/runs/:id/proof", () => {
     // The bundle as persisted: the digests survive the masker untouched.
     expect(rows[0]?.["bundle"]).toEqual(bundle());
     expect((rows[1]?.["bundle"] as Record<string, unknown>)["retryIndex"]).toBe(1);
+  });
+
+  test("a retried turn: every pass is a row, the last is the standing one, and each twin names its pass", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "support"), { specName: "support" });
+    // The gate's first pass failed; the retry's pass is filed beside it.
+    writeBundle(dir, "support", SESS, 1, bundle({ verdict: "fail", retryIndex: 0 }));
+    writeBundle(dir, "support", SESS, 1, bundle({ verdict: "pass", retryIndex: 1 }), 2);
+    writeBundle(dir, "support", SESS, 2, bundle());
+    await register(t, dir);
+    const { status, body } = await t.api(`/api/runs/${SESS}/proof`);
+    expect(status).toBe(200);
+    const rows = body["bundles"] as Array<Record<string, unknown>>;
+    expect(
+      rows.map((r) => [
+        r["turn"],
+        r["pass"],
+        r["standing"],
+        r["path"],
+        (r["bundle"] as Record<string, unknown>)["verdict"],
+      ]),
+    ).toEqual([
+      [1, 1, false, `.crewhaus/proofs/support/${SESS}/turn-1.json`, "fail"],
+      [1, 2, true, `.crewhaus/proofs/support/${SESS}/turn-1.2.json`, "pass"],
+      [2, 1, true, `.crewhaus/proofs/support/${SESS}/turn-2.json`, "pass"],
+    ]);
+    // `show` reads a turn's LAST pass by default: the earlier one is named.
+    expect(rows.map((r) => r["cliTwin"])).toEqual([
+      proofCliTwin(dir, SESS, 1, undefined, 1),
+      proofCliTwin(dir, SESS, 1, undefined, 2),
+      proofCliTwin(dir, SESS, 2),
+    ]);
+    expect(String(rows[0]?.["cliTwin"])).toContain("--turn 1 --pass 1 --json");
   });
 
   test("?harness= narrows the search to one registry row", async () => {
@@ -193,7 +228,14 @@ describe("GET /api/runs/:id/proof", () => {
 
   test("400 for anything but a session id — a traversal is refused before any path is built", async () => {
     const t = boot();
-    for (const id of ["..%2F..%2Fetc", "sess_XYZ", "sess_00000000000000aa.json", "no-session"]) {
+    for (const id of [
+      "..%2F..%2Fetc",
+      "sess_XYZ",
+      "sess_00000000000000aa.json",
+      "no-session",
+      "run_XYZ",
+      "run_00000000000000aa..",
+    ]) {
       const { status } = await t.api(`/api/runs/${id}/proof`);
       expect(status).toBe(400);
     }
@@ -383,9 +425,13 @@ describe("GET /api/runs/:id/proof — spec directories and the managed shape", (
     const dir = join(root, "h");
     mkdirSync(join(dir, "t"), { recursive: true });
     expect(proofTenants(dir, "cli")).toBeUndefined();
+    // The default resolved as the daemon resolves it: against the harness
+    // directory. On POSIX that is the literal; on Windows a drive-less root
+    // takes the harness's drive (`C:\tmp\crewhaus-tenants`), and this suite
+    // runs in the gating windows-supervision job.
     expect(proofTenants(dir, "managed")).toEqual({
       readable: false,
-      root: MANAGED_TENANTS_ROOT_DEFAULT,
+      root: resolve(dir, MANAGED_TENANTS_ROOT_DEFAULT),
     });
     writeFileSync(join(dir, ".env"), "CREWHAUS_TENANTS_ROOT=t\n");
     expect(proofTenants(dir, "managed")).toMatchObject({ readable: true, segments: ["t"] });
@@ -402,9 +448,80 @@ describe("GET /api/runs/:id/proof — spec directories and the managed shape", (
   });
 });
 
+/** A research run's report bundle as its report gate writes it: `.crewhaus/research/<run>/proof.json`. */
+function writeResearchBundle(dir: string, run: string, value: unknown): string {
+  const at = join(dir, ".crewhaus", "research", run);
+  mkdirSync(at, { recursive: true });
+  writeFileSync(join(at, "report.md"), "# report\n");
+  const path = join(at, "proof.json");
+  writeFileSync(path, typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`);
+  return path;
+}
+
+describe("GET /api/runs/:id/proof — a research run's report bundle", () => {
+  const RUN = "run_00000000000000cc";
+
+  // design §5.4 — the research shape's report gate files one bundle per run
+  // beside report.md, keyed by the run id its run_start / run_done events
+  // carry; the bundle store (sess_ ids only) never sees it.
+  test("200: the run's proof.json, as turn 1, with a twin that finds it", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "digest"), { specName: "digest" });
+    writeResearchBundle(dir, RUN, bundle());
+    // A session's bundles in the same harness are not this run's.
+    writeBundle(dir, "digest", SESS, 1, bundle({ verdict: "fail" }));
+    const id = await register(t, dir);
+
+    const { status, body } = await t.api(`/api/runs/${RUN}/proof`);
+    expect(status).toBe(200);
+    const rows = body["bundles"] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      harnessId: id,
+      specName: "digest",
+      spec: "digest",
+      research: true,
+      sessionId: RUN,
+      turn: 1,
+      path: `.crewhaus/research/${RUN}/proof.json`,
+      cliTwin: proofCliTwin(dir, RUN, 1),
+    });
+    expect(rows[0]?.["bundle"]).toEqual(bundle());
+    expect((await t.api("/api/runs/run_00000000000000dd/proof")).status).toBe(404);
+  });
+
+  test("a proof.json linked out of the harness is skipped; a torn one is reported", async () => {
+    const t = boot();
+    const outside = mkdtempSync(join(tmpdir(), "proof-research-outside-"));
+    scratch.push(outside);
+    const secret = join(outside, "proof.json");
+    writeFileSync(secret, `${JSON.stringify(bundle({ level: "proven" }))}\n`);
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "linked"), { specName: "linked" });
+    mkdirSync(join(dir, ".crewhaus", "research", RUN), { recursive: true });
+    symlinkSync(secret, join(dir, ".crewhaus", "research", RUN, "proof.json"));
+    const torn = makeFixtureHarness(join(t.harnessesRoot, "torn"), { specName: "torn" });
+    writeResearchBundle(torn, RUN, '{"version": 1');
+    await register(t, dir);
+    await register(t, torn);
+
+    const { status, body } = await t.api(`/api/runs/${RUN}/proof`);
+    expect(status).toBe(200);
+    expect(body["bundles"]).toEqual([]);
+    expect(JSON.stringify(body)).not.toContain('"proven"');
+    expect(
+      (body["skipped"] as Array<Record<string, unknown>>).map((s) => [s["path"], s["reason"]]),
+    ).toEqual([
+      [`.crewhaus/research/${RUN}/proof.json`, "resolves outside the harness directory"],
+      [`.crewhaus/research/${RUN}/proof.json`, "not valid JSON"],
+    ]);
+  });
+});
+
 describe("proofView (unit)", () => {
-  test("refuses a run id that is not a session id", () => {
+  test("refuses a run id that is not a session id or a research run id", () => {
     expect(isProofRunId(SESS)).toBe(true);
+    expect(isProofRunId("run_00000000000000cc")).toBe(true);
+    expect(isProofRunId("run_00000000000000cc/../x")).toBe(false);
     expect(isProofRunId("../sess_00000000000000aa")).toBe(false);
     expect(() => proofView([], "../x")).toThrow(/invalid run id/);
   });
@@ -468,8 +585,12 @@ describe("the proof route's CLI twin runs", () => {
     expect(tenantTwin).toBe(
       `cd '/srv/poly' && crewhaus provability show --session ${SESS} --turn 7 --tenants-root '.crewhaus/tenants' --json`,
     );
+    const passTwin = proofCliTwin("/srv/poly", SESS, 7, ".crewhaus/tenants", 2);
+    expect(passTwin).toBe(
+      `cd '/srv/poly' && crewhaus provability show --session ${SESS} --turn 7 --pass 2 --tenants-root '.crewhaus/tenants' --json`,
+    );
     const declared = declaredProvabilityFlags();
-    for (const one of [twin, tenantTwin]) {
+    for (const one of [twin, tenantTwin, passTwin]) {
       const command = one.split("&&")[1]?.trim() ?? "";
       const tokens = command.split(/\s+/);
       expect(tokens.slice(0, 3)).toEqual(["crewhaus", "provability", "show"]);

@@ -59,13 +59,46 @@ describe("createBundleStore", () => {
     expect(readdirSync(join(root, SESSION))).toEqual(["turn-7.json"]);
   });
 
-  test("a run with no session writes under no-session; a retry replaces the turn's bundle", async () => {
-    const store = createBundleStore({ rootDir: tempDir() });
-    const first = await store.put(bundle, { turnNumber: 1 });
-    expect(first.endsWith(join(NO_SESSION, "turn-1.json"))).toBe(true);
-    const retried = { ...bundle, retryIndex: 1 };
-    await store.put(retried, { turnNumber: 1 });
-    expect((await store.get(undefined, 1))?.retryIndex).toBe(1);
+  test("a run with no session writes under no-session; a retry is kept beside the first pass", async () => {
+    const root = tempDir();
+    const store = createBundleStore({ rootDir: root });
+    const failing = unverifiedBundle(config("grounded"), "first pass", 0, now);
+    const first = await store.put(failing, { turnNumber: 1 });
+    expect(first).toBe(join(root, NO_SESSION, "turn-1.json"));
+    const retried = unverifiedBundle(config("grounded"), "second pass", 1, now);
+    const second = await store.put(retried, { turnNumber: 1 });
+    // Never replaced: each pass's path still holds the bundle its audit
+    // record's bundleHash names (design §5.3).
+    expect(second).toBe(join(root, NO_SESSION, "turn-1.2.json"));
+    expect(JSON.parse(readFileSync(first, "utf8")).bundleHash).toBe(failing.bundleHash);
+    expect(JSON.parse(readFileSync(second, "utf8")).bundleHash).toBe(retried.bundleHash);
+    // A turn a resumed session numbers again takes the next free name too.
+    const third = await store.put(bundle, { turnNumber: 1 });
+    expect(third).toBe(join(root, NO_SESSION, "turn-1.3.json"));
+    // `get` reads the turn's standing (last) pass, or the one asked for.
+    expect((await store.get(undefined, 1))?.bundleHash).toBe(bundle.bundleHash);
+    expect((await store.get(undefined, 1, 1))?.bundleHash).toBe(failing.bundleHash);
+    expect((await store.get(undefined, 1, 2))?.retryIndex).toBe(1);
+    expect(await store.get(undefined, 1, 4)).toBeUndefined();
+    // `list` shows each turn once (its last pass) unless every pass is asked for.
+    expect((await store.list()).map((l) => [l.turnNumber, l.pass])).toEqual([[1, 3]]);
+    expect(
+      (await store.list({ allPasses: true })).map((l) => l.pass).sort((a, b) => a - b),
+    ).toEqual([1, 2, 3]);
+    // `prune` removes every pass.
+    expect(await store.prune(0, new Date(Date.now() + 60_000))).toBe(3);
+    expect(existsSync(join(root, NO_SESSION))).toBe(false);
+  });
+
+  test("session directories are created 0700, like the root, and the files 0600", async () => {
+    const root = join(tempDir(), "proofs", "spec");
+    const path = await createBundleStore({ rootDir: root }).put(bundle, {
+      sessionId: SESSION,
+      turnNumber: 1,
+    });
+    expect(statSync(root).mode & 0o777).toBe(0o700);
+    expect(statSync(join(root, SESSION)).mode & 0o777).toBe(0o700);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 
   test("refuses a tampered session id or turn before any path is built", async () => {

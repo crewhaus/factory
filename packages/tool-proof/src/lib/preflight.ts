@@ -29,6 +29,7 @@ import {
   type ProofBundle,
   type ProofClaim,
   type ProvabilityConfig,
+  type VerifyOptions,
   renderFooter,
   renderNudge,
   verifyDocument,
@@ -97,6 +98,8 @@ export async function preflightBundle(
      * so it must already be scoped.
      */
     readonly turnNumbers?: ReadonlySet<number>;
+    /** The gate's re-check of a stored proof (`recheckProof`), so the preflight reads proofs as it does. */
+    readonly recheckProof?: VerifyOptions["recheckProof"];
     readonly now?: () => Date;
   },
 ): Promise<{ readonly bundle: ProofBundle; readonly notes: ReadonlyArray<string> }> {
@@ -107,6 +110,7 @@ export async function preflightBundle(
     artifacts: opts.artifacts,
     workspaceRoot: opts.workspaceRoot,
     ...(opts.turnNumbers !== undefined ? { turnNumbers: opts.turnNumbers } : {}),
+    ...(opts.recheckProof !== undefined ? { recheckProof: opts.recheckProof } : {}),
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     // Deliberately absent: replay, isPureTool, resolveHead, judgeWaiver.
   });
@@ -194,6 +198,7 @@ export function preflightReport(
     ...(bundle.assumptionsRefused !== undefined
       ? { assumptionsRefused: bundle.assumptionsRefused }
       : {}),
+    ...(bundle.hypotheses !== undefined ? { hypotheses: bundle.hypotheses } : {}),
     sources: bundle.sources,
     ...(bundle.vacuous !== undefined ? { vacuous: bundle.vacuous } : {}),
     footer: renderFooter(bundle),

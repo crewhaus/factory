@@ -9,7 +9,8 @@
  * cannot right now, instead of a checker silently missing.
  */
 import { CrewhausError } from "@crewhaus/errors";
-import { BUILTIN_CHECKER_ID, createBuiltinChecker } from "./builtin/checker";
+import { BUILTIN_CHECKER_ID } from "./builtin/checker";
+import { createBuiltinChecker } from "./builtin/runner";
 import {
   LEAN4_CHECKER_ID,
   LEAN4_LANGUAGE,
@@ -74,9 +75,9 @@ export type DefaultCheckersOptions = {
   readonly forbid?: readonly string[];
   /**
    * Per-check budget (`formal.timeout_ms`). The sandbox checkers get it whole;
-   * the builtin caps it at `BUILTIN_LIMITS.maxTimeoutMs` (10 s), because it
-   * runs synchronously on the caller's thread and the 30 s default is sized
-   * for a container's cold start.
+   * the builtin caps it at `BUILTIN_LIMITS.maxTimeoutMs` (10 s), because a
+   * check holds a core for all of it and the 30 s default is sized for a
+   * container's cold start.
    */
   readonly timeoutMs?: number;
   /** Which checkers, in preference order (`formal.checkers`; default builtin, smt). */

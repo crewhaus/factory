@@ -414,19 +414,28 @@ function renderLimitsFields(ir: IrChannelV0): string {
  * tool list (`mergeGateTools`, replacing a same-named builtin the spec also
  * listed), replay looks pure tools up in the same list, and the proof footer
  * rides the REPLY (`footerTarget: "reply"`) — the text the bot sends — with
- * `render: none` honoured by the runtime. The dream path carries no gate:
+ * `render: none` honoured by the runtime. The eval bridge entry drives the
+ * same `runTurn` but hands its caller the reply as the sample's output, the
+ * text graders score: it asks for no footer (`config.footerTarget`, the
+ * eval-entry variant's field), as the cli eval invoker's answer carries
+ * none. The dream path carries no gate:
  * its bounded fresh session is a consolidation pass, not a served answer.
  * Empty pieces when the spec declares neither block, keeping those bundles
  * byte-identical.
  */
 function renderEvaluation(
   ir: IrChannelV0,
-  opts: { readonly toolsVar: string; readonly cwdExpr: string },
+  opts: {
+    readonly toolsVar: string;
+    readonly cwdExpr: string;
+    readonly footerTargetExpr?: string;
+  },
 ): EvaluationWiring {
   return renderEvaluationWiring(ir, {
     catalogVar: opts.toolsVar,
     cwdExpr: opts.cwdExpr,
     footerTarget: "reply",
+    ...(opts.footerTargetExpr !== undefined ? { footerTargetExpr: opts.footerTargetExpr } : {}),
     indent: "        ",
     toolsInto: "list",
     sessionRootDirExpr: "config.sessionRootDir",
@@ -864,7 +873,16 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   // Cluster S — scripted-provider test seam (the same \`_adapter\` the other
   // bridged entries expose), so bridge smoke tests drive the REAL runTurn
   // credential-free. Never set by the daemon.
-  _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];`
+  _adapter?: Parameters<typeof runChatLoop>[0]["_adapter"];${
+    ir.provability !== undefined
+      ? `
+  // 0.8.0 (design §5.4, §9.1) — where the proof footer goes. The daemon
+  // leaves it unset (the reply carries it); the eval bridge entry sets
+  // "none", so the reply it hands the runner as the sample's output is the
+  // answer alone — the text graders score.
+  footerTarget?: "stream" | "reply" | "none";`
+      : ""
+  }`
     : "";
   const evalAdapterLine = evalEntry
     ? "\n        ...(config._adapter !== undefined ? { _adapter: config._adapter } : {}),"
@@ -912,7 +930,11 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   // Loop contract 0.4 (Batch B, G02) / 0.8.0 §4.4 — the in-loop gates for the
   // interactive turn, wired per turn (see renderEvaluation). Empty pieces when
   // the spec declares neither `evaluation:` nor `provability:`.
-  const evaluation = renderEvaluation(ir, { toolsVar: baseToolsExpr, cwdExpr: fabricCwdExpr });
+  const evaluation = renderEvaluation(ir, {
+    toolsVar: baseToolsExpr,
+    cwdExpr: fabricCwdExpr,
+    ...(evalEntry ? { footerTargetExpr: 'config.footerTarget ?? "reply"' } : {}),
+  });
   // 0.8.0 §11 — the gate's `provability` skill. Where this turn's wireMemory
   // owns the skill surface (continuity or learning on) it rides that call's
   // deps; otherwise the daemon's own discovery carries it (renderDaemon).
@@ -2941,7 +2963,13 @@ ${skillsFields}
     // handoff can never leak into sample N+1 (nor into the operator's cwd).
     ...(__evalOpts.sessionRootDir !== undefined ? { fabricRoot: __evalOpts.sessionRootDir } : {}),
     // One-shot eval turns never benefit from a persisted prompt-cache stamp.
-    promptCacheStore: { read: async () => undefined, write: async () => {} },${thredzField}${subAgentFields}
+    promptCacheStore: { read: async () => undefined, write: async () => {} },${thredzField}${subAgentFields}${
+      ir.provability !== undefined
+        ? `
+    // 0.8.0 — the sample's output is the answer alone: no proof footer.
+    footerTarget: "none",`
+        : ""
+    }
     ...(__evalOpts._adapter !== undefined ? { _adapter: __evalOpts._adapter } : {}),
   });
   const __sessionId = __evalOpts.sessionId ?? \`sess_\${randomBytes(8).toString("hex")}\`;

@@ -3548,6 +3548,79 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     expect(result.stderr).toContain("cannot combine with --check");
   }, 20_000);
 
+  // 0.8.0 §1, §3 (review I40) — the edge runs no provability gate: a spec
+  // that declares one is told so, and --strict refuses to ship the worker.
+  test("a provability: block is an accepted-but-unwired warning, and --strict writes nothing", async () => {
+    const spec = join(tmp, "gated.yaml");
+    writeFileSync(
+      spec,
+      "name: gated\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [webFetch]\nprovability: { level: grounded }\n",
+    );
+    const out = join(tmp, "edge");
+    const loose = await runCli([
+      "compile",
+      spec,
+      "-o",
+      out,
+      "--emit-as",
+      "cf-worker",
+      "--no-register",
+    ]);
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain("warning[accepted-but-unwired] provability:");
+    expect(loose.stderr).toContain("the worker serves every answer ungated");
+    const strictOut = join(tmp, "edge-strict");
+    const strict = await runCli([
+      "compile",
+      spec,
+      "-o",
+      strictOut,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    expect(existsSync(join(strictOut, "worker.js"))).toBe(false);
+  }, 20_000);
+
+  // §3 — a parked block (level: off with other keys) is warned on the edge
+  // path as on the local one: the lowering's warnings ride along, and
+  // --strict fails on them before a file is written.
+  test("a parked provability block is warned, and fails --strict, as on the local compile", async () => {
+    const spec = join(tmp, "parked.yaml");
+    writeFileSync(
+      spec,
+      "name: parked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [webFetch]\nprovability: { level: off, threshold: 0.5 }\n",
+    );
+    const loose = await runCli([
+      "compile",
+      spec,
+      "-o",
+      join(tmp, "parked-edge"),
+      "--emit-as",
+      "cf-worker",
+      "--no-register",
+    ]);
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain("warning[provability-inert-block]");
+    const strictOut = join(tmp, "parked-strict");
+    const strict = await runCli([
+      "compile",
+      spec,
+      "-o",
+      strictOut,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("warning[provability-inert-block]");
+    expect(existsSync(join(strictOut, "worker.js"))).toBe(false);
+  }, 20_000);
+
   test("--emit-as local is the default bundle (byte path unchanged)", async () => {
     const result = await runCli([
       "compile",

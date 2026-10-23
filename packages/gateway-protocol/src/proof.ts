@@ -79,6 +79,8 @@ const ProofBinding = z
     judgeWaived: z.boolean().optional(),
     checker: z.string().optional(),
     statement: z.string().optional(),
+    /** A formal binding's proof hypotheses: assumptions too (design §6.4). */
+    assumptions: z.array(z.string()).optional(),
   })
   .strict();
 
@@ -109,6 +111,8 @@ export const ProofBundle = z
     unmet: count,
     assumptions: count,
     assumptionsRefused: count.optional(),
+    /** Distinct hypotheses the accepted proofs rest on, counted with `assumptions`. */
+    hypotheses: count.optional(),
     sources: count,
     judgeWaived: count,
     retryIndex: count,
@@ -119,6 +123,7 @@ export const ProofBundle = z
             id: z.string().min(1),
             artifact: z.string().min(1),
             axioms: z.array(z.string()),
+            assumptions: z.array(z.string()).optional(),
           })
           .strict(),
       )

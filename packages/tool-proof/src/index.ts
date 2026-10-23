@@ -69,6 +69,7 @@ import {
 } from "./lib/context";
 import { sessionEvidence } from "./lib/evidence";
 import { DRAFT_CHARS, preflightBundle, preflightReport } from "./lib/preflight";
+import { proofRecheck } from "./lib/recheck";
 import { defaultProofsRoot, defaultSessionRoot, fenced } from "./lib/roots";
 
 export {
@@ -108,6 +109,7 @@ export {
   preflightConfig,
   preflightReport,
 } from "./lib/preflight";
+export { type RecheckProofOptions, proofRecheck, recheckProof } from "./lib/recheck";
 export { defaultProofsRoot, defaultSessionRoot, tenantRootOf } from "./lib/roots";
 
 /** Compact JSON — the reader is a model, not a person. */
@@ -369,6 +371,8 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(rootDir !== undefined ? { rootDir } : {}),
       ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
+      // Inside a tenant scope the runtime spills to the tenant's root.
+      ...(tenant !== undefined ? { toolResultsRoot: tenant.toolResultRoot } : {}),
       onUnreadable: (info) =>
         warn(ctx, "tool-proof: a session log could not be read to its end", { ...info }),
     });
@@ -412,10 +416,10 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
     readOnly: false,
     destructive: true,
     // The one choice a call makes about where it acts is which checker
-    // runs: the in-process builtin, or a container (smt, lean4). The
-    // artifact's place is fixed by the configuration, never by the call.
-    // Declaring it lets an operator allow the sandbox-free checker alone —
-    // `alwaysAllow ProofCheck(builtin)` — and ask before the rest.
+    // runs: the builtin (a worker thread, no sandbox), or a container (smt,
+    // lean4). The artifact's place is fixed by the configuration, never by
+    // the call. Declaring it lets an operator allow the sandbox-free checker
+    // alone — `alwaysAllow ProofCheck(builtin)` — and ask before the rest.
     operativeArgs: [{ field: "checker", kind: "id" }],
     // Each call writes its own uniquely named artifact and shares no state with
     // another, so two checks may run side by side.
@@ -512,6 +516,12 @@ export function createProofTools(opts: CreateProofToolsOptions = {}): ProofTools
         artifacts,
         workspaceRoot: workspaceRoot(),
         ...(evidence.turnNumbers !== undefined ? { turnNumbers: evidence.turnNumbers } : {}),
+        // The gate's re-check of a stored builtin proof, so a draft resting
+        // on a rewritten artifact is told what the gate will say.
+        recheckProof: proofRecheck({
+          timeoutMs: config.formal.timeoutMs,
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        }),
         now,
       });
       return json(preflightReport(bundle, [...evidence.notes, ...notes]));

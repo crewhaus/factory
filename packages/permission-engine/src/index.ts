@@ -10,6 +10,13 @@
  *   auto    — read-only auto-allow; destructive auto-ask; rules can override
  *   bypass  — allow everything (CLI flag only — see security note)
  *
+ * Floors (no rule can lift them; bypass consults nothing)
+ *   sandbox       — a `requiresSandbox` tool needs a real sandbox backend and,
+ *                   outside plan mode, an explicit alwaysAllow
+ *   runtime state — a call that is not read-only never writes inside
+ *                   `EvaluateOptions.protectedRoots` (0.8.0: the session logs
+ *                   and proof bundles the gates read as evidence)
+ *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
  * The first matching rule in source-priority order wins. A later source
@@ -76,6 +83,15 @@ export type ToolCallContext = {
    * declares none, and the matcher falls back to `input`'s string values.
    */
   readonly operativeValues?: ReadonlyArray<OperativeValue>;
+  /**
+   * 0.8.0 — what the runtime-state floor reads (`EvaluateOptions
+   * .protectedRoots`): the values of the fields the call WRITES. The runtime
+   * leaves out a field declared `relocates` — the store a tool works in
+   * through its own format (EmitTraceEvent's namespaced `custom.*` lines,
+   * IncidentBundle's sessions it reads whole), not a file the call names.
+   * Absent ⇒ `operativeValues`.
+   */
+  readonly floorValues?: ReadonlyArray<OperativeValue>;
   readonly readOnly: boolean;
   readonly destructive: boolean;
   /**
@@ -97,6 +113,34 @@ export type Decision = "allow" | "deny" | "ask";
  */
 export type EvaluateOptions = {
   readonly sandboxAvailable?: boolean;
+  /**
+   * 0.8.0 (design/0.8.0-provability-release.md §1 principle 1, §5.2) — the
+   * runtime's own record of the run: directories (absolute, or relative to
+   * the workspace) the runtime writes and the gates read as evidence — the
+   * session event logs (every `tool_use` and `tool_result` the provability
+   * gate grounds a claim on, and `continuity.proof` resolves), the tool
+   * results the runtime spilled to a file (read whole as a long fetch's
+   * body) and the proof bundles. A call that is not read-only and names a path inside one is
+   * DENIED whatever a rule says — the runtime-state floor, beside the
+   * sandbox floor: a hand-written log line holding a fetch that never ran
+   * would otherwise ground any text under any URL. Only `bypass` mode, which
+   * consults nothing, lets such a call through. Absent ⇒ no floor.
+   *
+   * The floor reads the call's operative values, so it covers every tool that
+   * names where it writes (Write, Edit, MultiEdit, the fsx writers' paths).
+   * A writer that acts BENEATH a directory it names — a tree copied, moved
+   * or extracted onto `.crewhaus` or the workspace root, a patch applied in
+   * it, the directory removed — names a place above every root, where the
+   * floor cannot tell a write that lands in one from one that does not; it
+   * leaves that call to the rules, and the tool checks its own targets
+   * against the same roots, which the runtime hands it on the bridge
+   * (`RuntimeBridge.protectedRoots`; CopyPath, MovePath, RemovePath,
+   * ArchiveExtract, GitApplyPatch). Neither can see where a shell command
+   * writes: `Bash` / `RunCommand` stay a documented residual, closed only by
+   * keyed integrity on the log lines themselves (a MAC with a key outside
+   * the tree the agent can write), as does `bypass` mode.
+   */
+  readonly protectedRoots?: ReadonlyArray<string>;
 };
 
 /**
@@ -258,6 +302,92 @@ function noSandboxReason(toolName: string): string {
 }
 
 /**
+ * A path as the floor compares it: `\\` as `/`, `.` and `..` collapsed, no
+ * trailing `/`, in Unicode normal form C (a name spelled with a combining
+ * accent is the precomposed one, as on macOS), and lower-cased where the
+ * filesystem does not tell names apart by case. One pass over the string, and
+ * no `node:path`: the path is model-written and can be long (critic8).
+ */
+function floorKey(path: string, fold: boolean): string {
+  const absolute = path.startsWith("/") || path.startsWith("\\");
+  const names: string[] = [];
+  for (const name of path.split(/[\\/]/)) {
+    if (name === "" || name === ".") continue;
+    if (name === "..") {
+      if (names.length > 0 && names[names.length - 1] !== "..") names.pop();
+      else if (!absolute) names.push("..");
+      continue;
+    }
+    names.push(name);
+  }
+  const joined = `${absolute ? "/" : ""}${names.join("/")}`;
+  const key = (joined === "" ? "." : joined).normalize("NFC");
+  return fold ? key.toLowerCase() : key;
+}
+
+/** Whether `path` is `root` or lies under it (both {@link floorKey}s). */
+function liesUnder(path: string, root: string): boolean {
+  if (path === root) return true;
+  return root === "/" ? path.startsWith("/") : path.startsWith(`${root}/`);
+}
+
+/** Every string in `input`, however deep (a tool that declares no operative arguments). */
+function inputStrings(input: unknown, out: string[] = [], depth = 0): string[] {
+  if (typeof input === "string") {
+    out.push(input);
+  } else if (depth < 8 && typeof input === "object" && input !== null) {
+    for (const value of Object.values(input as Record<string, unknown>)) {
+      inputStrings(value, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+/**
+ * The protected root a write lands in (see `EvaluateOptions.protectedRoots`),
+ * or `undefined`. Read from the call's `path` operative values (its
+ * `floorValues` when the runtime names the written fields) — every
+ * spelling the runtime's canonicaliser gives (workspace-relative and
+ * absolute, symlinks followed, the name as sent), case folded where the
+ * filesystem folds it — or, for a tool that declares none, from the strings
+ * in its input as written. A path is caught when it IS a protected root or
+ * lies under one; a directory above a root is not: a writer that acts
+ * beneath it checks its own targets against the roots on the bridge
+ * (`EvaluateOptions.protectedRoots`), and a shell command stays a residual.
+ */
+function protectedRootHit(call: ToolCallContext, opts: EvaluateOptions): string | undefined {
+  if (call.readOnly || opts.protectedRoots === undefined || opts.protectedRoots.length === 0) {
+    return undefined;
+  }
+  const candidates: Array<{ readonly path: string; readonly fold: boolean }> = [];
+  const values = call.floorValues ?? call.operativeValues;
+  if (values !== undefined) {
+    for (const value of values) {
+      if (value.kind !== "path" || value.globPattern === true) continue;
+      const fold = value.caseInsensitive === true;
+      for (const path of [...value.canonical, ...(value.spellings ?? [])]) {
+        candidates.push({ path, fold });
+      }
+    }
+  } else {
+    for (const path of inputStrings(call.input)) candidates.push({ path, fold: false });
+  }
+  // Each spelling read once, however many roots there are.
+  const keys = candidates
+    .filter(({ path }) => path !== "")
+    .map(({ path, fold }) => ({ key: floorKey(path, fold), fold }));
+  for (const root of opts.protectedRoots) {
+    if (root.trim() === "") continue;
+    const plain = floorKey(root, false);
+    const folded = plain.toLowerCase();
+    for (const { key, fold } of keys) {
+      if (liesUnder(key, fold ? folded : plain)) return root;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Decide allow/deny/ask for one tool call. Pure.
  */
 export function evaluate(
@@ -280,6 +410,15 @@ export function evaluateWithReason(
   opts: EvaluateOptions = {},
 ): DecisionDetails {
   if (mode === "bypass") return { decision: "allow" };
+  // 0.8.0 — the runtime-state floor (`EvaluateOptions.protectedRoots`): no
+  // rule, in any source, lets the agent's own tools write the record the
+  // gates read as evidence.
+  if (protectedRootHit(call, opts) !== undefined) {
+    return {
+      decision: "deny",
+      reason: `\`${call.toolName}\` would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) — no rule can allow that`,
+    };
+  }
   if (mode === "plan") {
     // permission-integration#6 — plan mode used to consult no rule at all,
     // so an operator's explicit deny on a read-only egress tool (HttpPaginate,

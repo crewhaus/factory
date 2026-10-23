@@ -60,7 +60,9 @@ the same function.
 `deps`: `cwd` (required), `catalog` (where `checked` replay finds tools — a
 `ToolCatalog` or a tool list), `sessionRootDir` (the root the run was given,
 if any), `footerTarget` (`"stream"` on the cli, `"reply"` where the returned
-text is what gets sent), `sandbox` (for `smt` / `lean4`), `resolveHead`,
+text is what gets sent, `"none"` where the caller carries the bundle on its
+own envelope and the returned text must be the answer alone — the managed
+gateway's `proof`, the channel eval bridge), `sandbox` (for `smt` / `lean4`), `resolveHead`,
 `onBundle`, and the test seams `judgeAdapter` / `now`.
 
 Returns `{ evaluation?, provability?, tools, proofTools }`:
@@ -79,19 +81,30 @@ Returns `{ evaluation?, provability?, tools, proofTools }`:
   tool-result-store threshold against its logged preview — and never read as
   a mismatch when the tool does not reproduce (a call that left out `now`
   read the clock and is not re-run; two re-runs that disagree with each other
-  mean "could not replay"); one guarded HEAD per URL per session under
+  mean "could not replay"; a tool that declares a path among its operative
+  arguments, or whose logged input names something in the workspace, is not
+  re-run either — its answer was about the workspace as it was, and a golden
+  updated since is not a misquoted result); one guarded HEAD per URL per session under
   `sources.resolve: head` (tool-fetch's `guardedHead`, bounded DNS included;
   the spec's allow list on the cited URL, its deny list and the private-host
   rule on every redirect hop; only answers cached — a timeout or network
   failure is asked again on the next verification — process-wide, so a
-  per-turn wiring asks once; each request decided recorded as an
-  `egress_decision`, sink `provability.resolve`, host and outcome only, on
-  the run's `egressAuditSink`); and, when `provability.judge` is set, one
+  per-turn wiring asks once; each URL screened first by the run's egress
+  fabric — `ProvabilityTurn.screenEgress`, the egress classifier over the
+  run's data lineage at `external-dynamic` — so a URL carrying content a tool
+  read is never sent, unless an external tool's result (a search hit, a
+  fetched page) handed the run that URL verbatim — a tool that only computes
+  inside the run, an echo or a URL normalizer, never does; a refused URL is
+  `unresolved`, its detail naming the egress fabric; each
+  request decided recorded as an `egress_decision`, sink
+  `provability.resolve`, the screen's verdict and the origins it found, host
+  and outcome only, on the run's `egressAuditSink`); and, when `provability.judge` is set, one
   sentinel-wrapped yes/no categorical judge call per paraphrase miss, at
   temperature 0, metered on the turn's bus as `role: "judge"`, and skipped —
   not guessed — once the run's `budget.judge_share` is spent. `renderBundle`
   is the footer (or the JSON), `nudge` provability's `renderNudge`, `persist`
-  the bundle store.
+  the bundle store, and `displayPath` the footer's path rule for the run's
+  live surfaces (the trace event, a halt's detail).
 - **`tools`** — what the level adds: `ProvabilityPreflight` always;
   `ProofCheckers` + `ProofCheck` at `proven`, or when the spec chose its own
   `formal.checkers`. **`proofTools`** — all three, bound to the gate's
@@ -173,9 +186,11 @@ prompt none either. Task children get the same rendering as text
 
 ## Known limits
 
-- The HEAD for `sources.resolve: head` is recorded but not run through the
-  egress classifier's lineage check: the gate has no view of the run's
-  `dataLineage`.
+- A HEAD sent through a resolver the caller built itself, without a
+  `screen`, is recorded but not screened. The research shape's report gate
+  screens its own HEADs against every branch's lineage (runtime-core's
+  `lineageEgressScreen`), letting through only a URL its crawler already
+  requested; a resumed run screens against the branches it ran itself.
 - Under a managed tenant, `cited` path sources resolve against the daemon's
   workspace (where the managed file tools read too), so whether a path exists
   there shows in the verdict.

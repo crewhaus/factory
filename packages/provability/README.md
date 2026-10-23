@@ -54,13 +54,13 @@ console.log(renderFooter(bundle, { path }));
 | `origin.ts` | One spelling for "where a body came from": `normalizeUrl`, `normalizePath` (workspace-relative, lexical, never followed off the workspace), `originKey`, `registrableDomain`, `hostMatches`, `isPrivateHost`. |
 | `private-address.ts` | The repo's private-address classifier, a byte-identical synchronised copy that `apps/cli/src/tool-registry.test.ts` sweeps and executes. Do not edit it here. |
 | `evidence.ts` | `evidenceFromSessionLog`, `evidenceFromMessages`, `recordFromCall`, `buildEvidenceIndex`, `restrictToTurns`, `groundingBody`. |
-| `verify.ts` | `verifyDocument`, `unverifiedBundle` (for the gate's fail-open path), `bundleHash`, `claimReasons`, `isToolAllowed`, `statementMismatch`, `MAX_HEAD_REQUESTS`. (`definitionGloss` is claim-ledger's, re-exported.) |
+| `verify.ts` | `verifyDocument`, `unverifiedBundle` (for the gate's fail-open path), `bundleHash`, `claimReasons`, `isToolAllowed`, `statementMismatch`, `MAX_HEAD_REQUESTS`, `HEAD_CONCURRENCY`, `HEAD_DEADLINE_MS`, `MAX_GROUNDING_TOKENS`. (`definitionGloss` is claim-ledger's, re-exported.) |
 | `render.ts` | `renderFooter`, `renderBundleJson`, `renderMarkdownSection` (the research report's `## Provability`), `renderNudge` (the retry message). |
 | `summary.ts` | `summarizeBundle`, the `provability_graded` / `provability_evaluated` payload. |
 | `store.ts` | `proofsRoot`, `createBundleStore`, `createFileArtifactStore`. |
 | `artifact.ts` | `newProofId`, `isProofId`, `isProofArtifact`: one definition of a proof id and an artifact's shape, for the store and the `proven` verifier. |
 | `purity.ts` | `isPureTool`: which registered tools replay may re-run. |
-| `builtins.ts` | The memoized builtin-name lookup, and the four tools (`WebFetch`, `Fetch`, `Read`, `Retrieve`) whose results the index reads as bodies or hits. |
+| `builtins.ts` | The memoized builtin-name lookup, `isMcpTool`, and the tools whose results the index and the verifiers read in a format of their own (`WebFetch`, `Fetch`, `Read`, `Retrieve`, `ProofCheck`). |
 
 Every text operation (claims, markers, definitions, the evidence-reference grammar, locating a
 claim in a body, numbers, quotations, content-token coverage) is
@@ -74,26 +74,34 @@ claim in a body, numbers, quotations, content-token coverage) is
   workspace with every symlink followed, and exists. Free text counts only under
   `sources.bibliographic: true`, and can never be grounded. With `sources.resolve: head`, the URL
   must answer one HEAD (per URL, per call) with 2xx or 3xx. One call sends at most
-  `MAX_HEAD_REQUESTS` (50) HEADs, because the answer decides how many URLs it cites; a URL past
-  that is `unresolved`, and the detail says why. Every marker in a claim must have a definition:
+  `MAX_HEAD_REQUESTS` (50) HEADs, because the answer decides how many URLs it cites, at most
+  `HEAD_CONCURRENCY` (6) at once and all within `HEAD_DEADLINE_MS` (15 s, `headDeadlineMs`); a URL
+  past the cap or the deadline is `unresolved`, and the detail says why. Every marker in a claim must have a definition:
   a dangling `[2]` beside a good `[1]` leaves the claim `unmet` (`no_definition`), because the
   reader would be shown a citation of nothing. A defined second marker that fails (a source never
   fetched) does not unmeet a claim another binding meets; the bundle and the report's table still
   show it, the footer does not.
-- **grounded.** The cited origin was fetched or read in this run (an error result does not count),
+- **grounded.** The cited origin was fetched or read in this run (an error result does not count,
+  and neither does a fetch that answered outside 2xx: a 404 page is the server's, not the page),
   and claim-ledger's `locateClaim` finds the claim in that body at `grounded.coverage` within
   `grounded.window_tokens`. A quotation must appear verbatim. A figure or a negation is never
   excused by a partial bar, and the figure rule holds at `coverage: 1` too, so a stricter bar
   never switches off the check that a quotation's framing figures agree with the source. A
   negation that opens the source's statement counts ("No two of the six meetings overlap" does
   not ground "two of the six meetings overlap"). The binding carries a frozen excerpt (240
-  characters at most) and the body's digest, so the bundle stays checkable after the transcript
-  is evicted.
+  characters at most: the claim at its tightest in the span, centred on its figure when even that
+  is longer) and the body's digest, so the bundle stays checkable after the transcript is evicted.
+  One verification reads at most `MAX_GROUNDING_TOKENS` tokens of fetched text while grounding,
+  and yields to the event loop between claims; a source past the budget reaches `cited` and,
+  above it, reads `below_floor` with a detail naming the cap.
 - **checked.** `tool:<toolUseId>` resolves to a recorded, non-error call of a tool on
   `execution.allow`. Every number the claim states is in the result, compared as an exact
   decimal, and every quotation is in it word for word. A claim with neither must still share
   `grounded.coverage` of its words with the call's input and result, so an allowed tool's
-  unrelated output checks nothing, and the locate kernel then reads the call for the claim, so a
+  unrelated output checks nothing. When the input alone carries the claim (a lint run over the
+  draft answer), the result must carry it too, and a result whose claim-bearing run is one of the
+  input's own strings handed back (NormalizeText of the sentence, a fact-check that repeats the
+  claim it was asked about) checks nothing. The locate kernel then reads the call for the claim, so a
   result saying "the meetings do not overlap" (or "not one vendor is approved") does not check
   "the meetings overlap", and a number word the result does not state beside the claim's words
   is `value_absent`. A claim that states a figure has its polarity read word by word, the way
@@ -113,10 +121,21 @@ claim in a body, numbers, quotations, content-token coverage) is
   `execution.replay` is on and the
   tool is pure, the gate re-runs it once (shared across claims, at most `max_replays` per call)
   and compares digests. A mismatch fails the binding; a replay that could not run leaves it
-  `checked` with `replayed: false`.
-- **proven.** `proof:prf_<16 hex>` names a stored artifact the checker accepted, and the
-  sentence states the artifact's recorded `claim` (`statementMismatch`): its words cover the
-  claim's at `grounded.coverage`, both state the same figures (`two` and `2` are one), and each
+  `checked` with `replayed: false`. The excerpt is the result when it fits in 240 characters,
+  and otherwise the part around the claim's first figure (or its quotation).
+- **proven.** `proof:prf_<16 hex>` names a stored artifact a checker on `formal.checkers`
+  accepted, and the run's evidence holds the `ProofCheck` call that wrote it, reporting it
+  accepted with the assumptions and axioms the file lists, and given exactly the checker, claim,
+  statement and proof the file holds. The file sits in the workspace, where the model's own file
+  tools could write one, flip a rejected one to `ok: true`, or rewrite an accepted one's claim
+  and statement under its id; the run's record of the check is what shows a checker accepted
+  it (`trustStoredProofs` skips that for an offline check with no log). Where `recheckProof` is
+  wired (the gate and the preflight wire tool-proof's: the builtin checker, bounded by
+  `formal.timeoutMs`), the checker also accepts the stored statement and proof again. The
+  sentence must state the artifact's recorded `claim`
+  (`statementMismatch`): its words cover the
+  claim's at `grounded.coverage`, both state the same figures (`two` and `2` are one, `-500` is
+  not `500`, and a date is its whole value), and each
   word of the proof's claim is denied in both or in neither. Coverage alone drops "no" and "not",
   so without the polarity test an accepted proof that two meetings overlap would prove "no two
   meetings overlap". Polarity is read per word, not per sentence, because the sentence may say
@@ -125,7 +144,11 @@ claim in a body, numbers, quotations, content-token coverage) is
   another word ("two of the six meetings didn't overlap" for a proof that no two overlap) is
   another statement, and a partitive ("none of the 3 invoices is overdue") is read as denying
   the statement it governs. The checker,
-  the formal statement and the axioms go into the bundle beside the prose. What the test cannot
+  the formal statement, the hypotheses the proof rests on (builtin `given` steps, SMT asserts and
+  definitions) and the axioms go into the bundle beside the prose. Hypotheses are assumptions:
+  they are counted in the footer, refused under `assumptions: forbid` and capped by
+  `max_assumptions`, so a proof that assumes its own conclusion does not read "0 assumptions".
+  What the test cannot
   see is a sentence that adds a clause of its own to the proved statement, because the coverage
   runs from the proof's claim into the sentence, as design §6.4 specifies. That residual sits
   with the formalization gap, shown beside the claim rather than closed.
@@ -136,8 +159,14 @@ claim in a body, numbers, quotations, content-token coverage) is
 computed, because `achieved` reports the highest floor the answer would have passed. The HEAD
 request runs only at `cited` and `grounded`, since no source can meet a higher floor. The waiver
 judge runs only at `grounded`, and only for a miss claim-ledger calls waivable: the body was read,
-some of the claim's words were found, and none of the missing ones is a figure or a negation. The
-replay runs only at `checked`. Above the floor, `achieved` is computed without them.
+some of the claim's words were found, and none of the missing ones is a figure or a negation. It
+is asked after the claim's other bindings are settled, and only while the claim still needs it:
+never for a claim another binding already meets, and at `independent: n` only for an origin the
+claim does not already count. The replay runs only at `checked`. Above the floor, `achieved` is
+computed without them.
+
+**"N sources" in the footer** counts the origins cited at a `cited` floor, and the origins that
+grounded a claim at `grounded` and above.
 
 **How each outcome is represented.**
 - A claim with no marker is `unmet` with zero bindings. `claimReasons(claim)` reports that as
@@ -157,9 +186,17 @@ replay runs only at `checked`. Above the floor, `achieved` is computed without t
   `not_independent`. A claim met by an execution or formal binding is met regardless.
 
 **Evidence comes from the log, merged with the transcript.** `evidenceFromSessionLog` walks child
-sessions through their `sub_agent_start` brackets (the same walk continuity-store's
-`resolveEvidence` makes) and places a child's calls where the bracket sits. A tool call logged
-twice under one id, as an approval replay is, keeps the input that ran. A missing log yields no
+sessions through their `sub_agent_start` brackets (the brackets continuity-store's
+`resolveEvidence` follows; this reads the whole tree once, in call order, where that function
+looks one id up) and places a child's calls where the bracket sits. An id logged more than once
+pairs its last `tool_use` with its last `tool_result`, the rule continuity-store applies, so
+`PlanComplete` and the `checked` rung read one log alike: an approval replay keeps the input that
+ran, and a provider that reuses ids does not get one call's input beside another's result. A
+result the runtime spilled to a file (tool-result-store's preview: the head, then `[truncated,
+full output at …]`) is read whole from that file (`body`), but only from this call's own
+`<toolUseId>.txt` under the spill root (`toolResultsRoot`, default `.crewhaus/tool-results`),
+opened without following a link, and only when it starts with the logged head; otherwise the
+preview stands. A missing log yields no
 records. A log that cannot be read to its end (a torn last line after a crash mid-append, a
 malformed line, a link at the log's name) keeps the records read before that point and reports it
 through `onUnreadable`. Fewer records fails closed: a claim whose evidence was lost is unmet. A
@@ -177,15 +214,20 @@ UrlParse returns the model's own URL taken apart. Indexing those would let the m
 as a page the run never read. A tool the gate cannot see into (MCP, plugin) gives origins through
 its `url`/`uri`/`href` and `file_path`/`path`/`file`/`filePath` fields, unless its result is an
 echo of its own input: a substring of one of the input's strings, or covered by the input's
-content words at 0.8. The final URL a WebFetch result prints on its first line is an origin too,
-so a citation of either the requested URL or the final one grounds. A search result carries hits,
+content words at 0.8. The URL a WebFetch result's header names on its first line is an origin
+too. tool-web prints the final URL there, and after a redirect a `Requested: <asked>` line
+under it (`URL: <final>`, `Requested: <asked>`, `Status: …`), so a citation of either URL
+grounds: the final one from the header, the asked one from the call's `url`. A search result carries hits,
 and each hit's own text is indexed under its own origin, so one hit cannot ground a claim cited to
 another. Two kinds of result are read this way. The first is Retrieve's `[n] id=… doc=…` blocks,
 in exactly the structure Retrieve prints: a header at the start or after a blank line, numbered
 1, 2, 3 with no repeat or gap, and no more of them than `k`. Anything else reads as no hits,
 because a chunk preview is corpus text and could carry a header-shaped line. The second is JSON
-with `url`/`uri`/`href`/`link`/`source` fields from a non-builtin tool whose input names no URL or
-path, less any hit that echoes the input. A SQL tool returns the literal its SELECT names.
+with `url`/`uri`/`href`/`link`/`source` fields from an MCP tool (`mcp__…`) whose input names no URL
+or path, less any hit that echoes the input. A SQL tool returns the literal its SELECT names. The
+runtime's own tools whose result is model output (`Task`, `Consult`, `Escalate`, `Skill`, the
+memory, plan and goal tools) are never read for hits: a sub-agent's JSON answer is its own
+writing, and its evidence is the fetches its own log holds.
 
 These format readers are tied to the tools that print each format, because a hit or a header names
 its own origin. If a `Read` of a file the model wrote, `Bash` echoing JSON, or a fetch of an echo
@@ -211,8 +253,10 @@ result read again. A page that says the claim in its own text beside its printed
 grounds there, and one that carries it only in the address is `not_fetched`. A search hit whose
 query only shares words with it still grounds. A hit that repeats, word for word, a phrase the
 model searched for does not, because the gate cannot tell it from a reflection, and fetching the
-page grounds it. Builtin readers and Retrieve are not tested this way: they return what they were
-pointed at, never their input. A reflection the tool rewrites on the way out (an SQL function
+page grounds it. A builtin reader is asked only about its address: a page whose own text carries
+the claim grounds, and one that carries it only where it prints the address it was fetched at is
+`not_found_in_source`. Retrieve is not tested this way: it returns corpus text, never its query.
+A reflection the tool rewrites on the way out (an SQL function
 applied to the literal, an address printed re-spelled) still passes. Closing that needs the spec
 to say whose hits are trusted, a design decision this package does not make.
 
@@ -250,8 +294,11 @@ catches some other throw uses `unverifiedBundle`, so the footer reads `? unverif
 `✓`.
 
 **Storage.** Bundles are written to `.crewhaus/proofs/<spec>/<sessionId>/turn-<n>.json` and
-artifacts to `.crewhaus/proofs/<spec>/artifacts/<prf_id>.json`. Files are mode 0600, written to a
-random temp file and renamed into place through `@crewhaus/tool-safety/fs`, so a link planted at
-the name is never followed. Spec names, session ids, turn numbers and proof ids are validated
-before any path is built from them: a tampered `proof:../../x` reads nothing. Artifacts are
-immutable. Bundles have no TTL; `prune` removes old ones.
+artifacts to `.crewhaus/proofs/<spec>/artifacts/<prf_id>.json`. A later pass of the same turn (a
+retry) is written beside the first as `turn-<n>.<k>.json`, never over it, so every pass's
+`bundleHash` names a bundle still on disk; `get` reads a turn's last pass unless asked for one,
+and `list` shows each turn's last pass unless asked for all. Files are mode 0600 and directories
+0700, written to a random temp file and renamed into place through `@crewhaus/tool-safety/fs`, so
+a link planted at the name is never followed. Spec names, session ids, turn numbers and proof ids
+are validated before any path is built from them: a tampered `proof:../../x` reads nothing. The
+store never replaces an artifact. Bundles have no TTL; `prune` removes old ones.

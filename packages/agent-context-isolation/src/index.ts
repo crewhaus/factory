@@ -272,7 +272,12 @@ export type SubAgentContinuitySeam = {
  */
 export type SubAgentProvabilitySeam = {
   readonly level: "cited" | "grounded" | "checked" | "proven";
-  /** The rendered `provability` skill text, when the parent's wiring has one. */
+  /**
+   * The rendered `provability` skill text, when the parent's wiring has one —
+   * written to the parent. The spawner shows a child only the parts true for
+   * it (`childProvabilityGuidance`): never what happens to a failing answer,
+   * and a provability tool only when the child's own tool set has it.
+   */
   readonly skill?: string;
 };
 
@@ -527,6 +532,18 @@ export type RuntimeBridge = ParentRunHandle & {
    * own. Optional — a bridge built elsewhere falls back to `model` alone.
    */
   readonly specModels?: ReadonlyArray<string>;
+  /**
+   * 0.8.0 (design §1 principle 1, §5.2) — the run's runtime-state roots:
+   * its session logs, spilled tool results and proof bundles, every way the
+   * runtime spells them (runtime-core's `runtimeStateRoots`). The permission
+   * floor denies a call that names a path inside one; a tool that writes
+   * beneath a directory it names (CopyPath, MovePath, RemovePath,
+   * ArchiveExtract, GitApplyPatch) reads them here to refuse a write that
+   * would land in one through a name the floor never sees
+   * (`@crewhaus/tool-safety/fs` `protectedRootsOf`). Optional — a bridge
+   * built elsewhere carries none, and the tools then rely on the floor.
+   */
+  readonly protectedRoots?: ReadonlyArray<string>;
 };
 
 /**

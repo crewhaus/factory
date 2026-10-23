@@ -89,8 +89,10 @@ import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
+  type ContinuityProofMode,
   type ContinuityScope,
   type ContinuityStore,
+  countsAsProven,
   createContinuityStore,
   renderLadderStatus,
 } from "@crewhaus/continuity-store";
@@ -855,15 +857,20 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
 
 /** Render the `<current_plan>` tail content from store state: focus, the
  *  active plan's ladder, open goals. Deterministic; null when the store has
- *  nothing to say (the runtime then omits the block). */
+ *  nothing to say (the runtime then omits the block). A goal is open until
+ *  it counts as proven under `continuity.proof` (`countsAsProven`): under
+ *  `require` one proven by assertion, or with no proof on record, stays in
+ *  the tail, because the tools still say it needs a verified proof
+ *  (design/0.8.0 §6.3) — the same rule `handoff.md` renders by. */
 async function renderPlanTail(
   store: ContinuityStore,
   includePlans: boolean,
+  proofMode: ContinuityProofMode | undefined,
 ): Promise<string | null> {
   const focus = await store.readFocus();
   const activePlan = includePlans ? await store.getActivePlan() : null;
   const goals = includePlans ? await store.listGoals() : [];
-  const openGoals = goals.filter((g) => g.status !== "proven");
+  const openGoals = goals.filter((g) => !countsAsProven(g, proofMode));
 
   const lines: string[] = [];
   if (focus !== null && focus.body !== "") {
@@ -930,6 +937,8 @@ export function wireContinuity(
     ...(deps.sessionScope !== undefined ? { sessionId: deps.sessionScope } : {}),
     ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
+    // handoff.md counts `proven` the way the tools do (design/0.8.0 §6.3).
+    ...(cont.proof !== undefined ? { proofMode: cont.proof } : {}),
   });
 
   // v0.3.0 Goal 3 (§4.4) — the Thredz goal mirror. SPEC scope only (§14.5
@@ -951,6 +960,8 @@ export function wireContinuity(
           client: deps.thredz.client,
           specName: fragment.specName,
           ...(deps.log !== undefined ? { log: deps.log } : {}),
+          // Under require only a verified goal completes its remote twin.
+          ...(cont.proof !== undefined ? { proofMode: cont.proof } : {}),
         })
       : localStore;
 
@@ -970,8 +981,8 @@ export function wireContinuity(
   const tools = plan ? bundle.all : [bundle.focusRead, bundle.focusWrite, bundle.memoryClear];
 
   const continuity: ContinuitySeam = {
-    loadPlan: () => renderPlanTail(store, plan),
-    onPlanDirty: () => renderPlanTail(store, plan),
+    loadPlan: () => renderPlanTail(store, plan, cont.proof),
+    onPlanDirty: () => renderPlanTail(store, plan, cont.proof),
     ledger: cont.ledger !== false,
     // 0.6.0 §7.4 — plan-execute: a first-turn guide's plan lands in the store
     // (only when plans are on; `plan: false` keeps the store plan-free).
@@ -1536,6 +1547,12 @@ function buildDreamEngine(
         sessionRootDir,
         scope: { kind: "spec" },
         ...(deps.now !== undefined ? { now: deps.now } : {}),
+        // The dream's handoff refresh renders as the teardown one does: under
+        // `continuity.proof: require` an unverified `proven` stays open
+        // (design/0.8.0 §6.3).
+        ...(fragment.continuity?.proof !== undefined
+          ? { proofMode: fragment.continuity.proof }
+          : {}),
       })
     : undefined;
   // v0.3.0 Goal 2 (§3.3 study.on_dream, PR 17): with learning on, the model
@@ -1552,8 +1569,13 @@ function buildDreamEngine(
           listGaps: async (): Promise<readonly string[]> => {
             if (continuityStore === undefined) return [];
             const goals = await continuityStore.listGoals();
+            // A gap closes as `continuity.proof` counts it, as handoff.md does.
             return goals
-              .filter((g) => g.status !== "proven" && g.title.startsWith(GAP_GOAL_PREFIX))
+              .filter(
+                (g) =>
+                  !countsAsProven(g, fragment.continuity?.proof) &&
+                  g.title.startsWith(GAP_GOAL_PREFIX),
+              )
               .map((g) => g.title.slice(GAP_GOAL_PREFIX.length).trim());
           },
         })
@@ -1566,6 +1588,7 @@ function buildDreamEngine(
     memoryStore,
     ...(wikiStore !== undefined ? { wikiStore } : {}),
     ...(continuityStore !== undefined ? { continuityStore } : {}),
+    ...(fragment.continuity?.proof !== undefined ? { proofMode: fragment.continuity.proof } : {}),
     ...(modelPhase !== undefined ? { modelPhase } : {}),
     playbook: DREAM_SKILL_BODY,
     ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),

@@ -58,6 +58,22 @@ async function runTool(
   return JSON.parse((await tool.execute(input, ctx)) as string);
 }
 
+/**
+ * One ProofCheck call inside `tenant`'s scope, logged as the runtime logs
+ * it in that tenant's session log: the `proven` rung reads there that a
+ * checker accepted the artifact the call wrote.
+ */
+async function proofCheckedIn(
+  tenant: Tenant,
+  tools: ReturnType<typeof createProofTools>,
+  input: Record<string, unknown> = { checker: "builtin", ...MEETINGS },
+): Promise<Json> {
+  const raw = (await run(tenant, () => tools.proofCheck.execute(input, fakeRun().ctx))) as string;
+  const out = JSON.parse(raw);
+  await writeLog(tenant.sessionRoot, SESSION, call(`toolu_${out.id}`, "ProofCheck", input, raw));
+  return out;
+}
+
 describe("artifacts are filed under the active tenant's root", () => {
   test("ProofCheck inside withTenant writes under <tenantRoot>/proofs/<spec>, nothing under the workspace", async () => {
     const cwd = dirs.make();
@@ -105,9 +121,7 @@ describe("artifacts are filed under the active tenant's root", () => {
       checkers: [createBuiltinChecker()],
       now,
     });
-    const proof = await run(acme, () =>
-      runTool(tools.proofCheck, { checker: "builtin", ...MEETINGS }, fakeRun().ctx),
-    );
+    const proof = await proofCheckedIn(acme, tools);
     const draft = `No two of the three meetings overlap [1].\n\n[1]: proof:${proof.id}\n`;
     const own = await run(acme, () =>
       runTool(
@@ -184,9 +198,7 @@ describe("a composition root builds the tools once, at boot, and serves every te
       checkers: [createBuiltinChecker()],
       now,
     });
-    const a = await run(acme, () =>
-      runTool(tools.proofCheck, { checker: "builtin", ...MEETINGS }, fakeRun().ctx),
-    );
+    const a = await proofCheckedIn(acme, tools);
     const g = await run(globex, () =>
       runTool(tools.proofCheck, { checker: "builtin", ...MEETINGS }, fakeRun().ctx),
     );

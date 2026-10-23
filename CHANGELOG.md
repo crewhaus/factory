@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**0.8.0, the provability release: a harness can promise how much proof its
+answers carry.** A new `provability:` block sets a floor on a four-rung
+ladder. At `cited` every claim names a source. At `grounded` the run read
+that source and it says what the claim says. At `checked` a tool the run
+called computed the value, and the gate runs a pure tool again to confirm
+it. At `proven` a proof checker accepted a proof of the claim. Before an
+answer is served, a deterministic gate checks each claim against the
+evidence the run recorded. An answer that falls short is retried,
+served with a visible ✗, handed to a stronger model, or refused, as the spec
+says. The verdict, a proof bundle, travels with the answer on every surface.
+A spec without the block runs as before, apart from the changes listed
+next. 0.8.0 also ships the 0.7.1 hardening, which was never tagged; its notes
+follow these.
+
+**Changes that can affect a harness without `provability:`.**
+
+- **`continuity.proof: require` and `off` are enforced.** Since 0.3.0 both
+  ran the default `ladder` and printed a boot note saying the mode was
+  carried but not enforced. The note is gone, and each mode now does what it
+  says. Under `require`, nothing completes below `proven`. A plan stays
+  open while any step is only claimed, and the `PlanUpdate` and
+  `PlanComplete` replies name the steps that still need proof. `GoalWrite`
+  and `GoalUpdate` refuse a goal that would reach its target without being
+  proven in the same call. A step or goal proven by assertion under an
+  earlier `off` run counts as unproven. A spec that set `require` and relied
+  on the old fallback will now see these refusals. Under `off`, meant for harnesses that keep no session log,
+  the tool use IDs a proof cites are recorded but not checked, and every
+  view shows `[proven (unverified)]`, never `[proven]`. `ladder`, the
+  default, is unchanged.
+- **A bundle with `evaluation:` compiles to different code.** This is the
+  release's one change to the shape of generated code. A cli, channel or
+  managed bundle used to carry its own copy of the in-loop judge; it now
+  calls `wireEvaluation` from the new `@crewhaus/evaluation-service`, the
+  same code `crewhaus run` uses, so the bundle's source changes and it
+  imports that package. The judge behaves as before. Recompile to pick it
+  up. A bundle with neither `evaluation:` nor `provability:` compiles byte
+  for byte as before.
+- **Plan and goal titles are one line, and capped.** In every
+  `continuity.proof` mode, the default `ladder` included, a plan or goal
+  title and a goal unit are stored on one line: a newline becomes a space,
+  so a title the model writes can no longer print a forged `[proven]` step.
+  A title may be at most 512 characters and a unit at most 64. `PlanUpdate`,
+  `GoalWrite` and `GoalUpdate` refuse a longer one, and `GoalUpdate` refuses
+  a blank title, so the default mode can refuse input that 0.7.x accepted.
+- **Managed proof bundles are not in `state backup`.** On the managed
+  shape every turn runs under its tenant, and the gate files its proof
+  bundles under `<CREWHAUS_TENANTS_ROOT>/<tenant>/proofs/<spec>/` (by
+  default under `/tmp/crewhaus-tenants`). `crewhaus state backup` archives
+  the harness's `.crewhaus` directory only, so back up the tenants root as
+  well.
+
+**What's new.**
+
+- **The `provability:` block**, on cli, channel, managed and research specs.
+  `provability: grounded` sets the floor and takes every default. The full
+  form adds `on_fail` (`retry` by default, `halt`, `note` or `escalate`),
+  `max_retries`, `threshold`, `scope`, limits on declared assumptions,
+  `render`, source allow and deny lists, the grounding window, the tools
+  whose results count as evidence (by default the read-only computation and
+  verification tools), the proof checkers to use, and an opt-in judge that
+  may excuse a paraphrase at `grounded`. `halt` stops the run at the first
+  failing verdict, with the new failure class `provability` and exit code 37
+  (`EXIT_CODES.provability`). A crew spec accepts the block with a warning
+  that it is not wired yet; the other shapes reject it.
+- **A proof bundle beside every gated answer**: a footer line on cli and
+  channel replies, a `proof` field on the gateway's run results, a
+  `## Provability` section in research reports, a `provability_graded` line
+  in the trace and the session log (`crewhaus sessions tail` shows it), a
+  hash-chained audit record when the audit sink is wired, and a JSON file
+  under `.crewhaus/proofs/`.
+- **Proof tools and checkers.** `ProofCheckers`, `ProofCheck` and
+  `ProvabilityPreflight` (category `proof`, part of `all-safety`).
+  `ProofCheck` runs the built-in certificate checker, which needs no
+  sandbox, or Z3 or Lean 4, which run only in a container sandbox. Their
+  images publish as `ghcr.io/crewhaus/sandbox-z3` and
+  `ghcr.io/crewhaus/sandbox-lean4`.
+- **`crewhaus provability show | check | audit | checkers | prune`.**
+  `check` runs the gate offline over any document and exits 1 on a fail, so
+  a generated report can be gated in CI.
+- **`crewhaus init --provability <rung>`** and one new interactive question;
+  the research template starts at `provability: cited`. When the block is
+  on, the `provability` default skill teaches the model how to cite.
+- **Eval and optimization.** `crewhaus eval --provability <rung>` measures a
+  rung without editing the spec, the `provability.*` graders score every
+  sample's bundle, and a dataset sample can set its own floor and the
+  sources it expects. The optimizer may tune `threshold`, `max_retries` and
+  the grounding window, never the floor or `on_fail`. `crewhaus advise` flags
+  a harness whose answers keep failing the gate, and the watch-me report
+  reads the gate's verdicts.
+- **Checks.** New `crewhaus lint` rules for a floor the spec cannot reach,
+  three `doctor --philosophy-alignment` findings, a checker probe in
+  `doctor --probe`, and Hangar's `GET /api/runs/:sessionId/proof`.
+- **New packages:** `@crewhaus/claim-ledger`, `@crewhaus/evaluation-service`,
+  `@crewhaus/provability`, `@crewhaus/proof-checker`, `@crewhaus/tool-proof`,
+  `@crewhaus/sandbox-image-z3`, `@crewhaus/sandbox-image-lean4` and
+  `@crewhaus/grader-provability`.
+
 **0.7.1 makes the 0.7.0 tools safe to grant.** An audit of 0.7.0 found that
 its new tools did less than the release notes said, and could do more than a
 spec allowed. A permission rule could be dodged by spelling a call another

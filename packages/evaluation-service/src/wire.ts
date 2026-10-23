@@ -64,15 +64,23 @@ export type WireEvaluationDeps = {
    */
   readonly sessionRootDir?: string;
   /**
-   * Where the proof footer goes: `"stream"` (cli — written after the answer)
-   * or `"reply"` (channel bots and the managed gateway — appended to the text
-   * they send). Absent ⇒ the runtime default, `"stream"`.
+   * Where the proof footer goes: `"stream"` (cli — written after the
+   * answer), `"reply"` (channel bots — appended to the text they send) or
+   * `"none"` (the managed gateway and the eval bridges — the bundle rides
+   * their own envelope through `onBundle`, and the returned text is the
+   * answer alone). Absent ⇒ the runtime default, `"stream"`.
    */
-  readonly footerTarget?: "stream" | "reply";
+  readonly footerTarget?: "stream" | "reply" | "none";
   /** A sandbox for the `smt` / `lean4` checkers; absent ⇒ chosen per run from what the run wires. */
   readonly sandbox?: SandboxLike;
-  /** The HEAD request behind `sources.resolve: head` (default: tool-fetch's guarded HEAD). */
-  readonly resolveHead?: (url: string) => Promise<number | undefined>;
+  /**
+   * The HEAD request behind `sources.resolve: head` (default: tool-fetch's
+   * guarded HEAD); `signal` aborts at the verifier's HEAD deadline or when
+   * the turn ends.
+   */
+  readonly resolveHead?: (url: string, signal?: AbortSignal) => Promise<number | undefined>;
+  /** How long one verification waits on its HEAD requests in all (default 15 s). */
+  readonly headDeadlineMs?: number;
   /** Observe every proof bundle (gateway envelopes, tests). */
   readonly onBundle?: (bundle: ProofBundle, bundlePath?: string) => void;
   /** Test seam: the adapter every judge call (evaluation and waiver) uses, bypassing the model-router. */
@@ -163,6 +171,7 @@ export async function wireEvaluation(
     ...(deps.sessionRootDir !== undefined ? { sessionRootDir: deps.sessionRootDir } : {}),
     ...(deps.footerTarget !== undefined ? { footerTarget: deps.footerTarget } : {}),
     ...(deps.resolveHead !== undefined ? { resolveHead: deps.resolveHead } : {}),
+    ...(deps.headDeadlineMs !== undefined ? { headDeadlineMs: deps.headDeadlineMs } : {}),
     ...(deps.onBundle !== undefined ? { onBundle: deps.onBundle } : {}),
     ...(deps.judgeAdapter !== undefined ? { judgeAdapter: deps.judgeAdapter } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
@@ -183,6 +192,7 @@ export async function wireEvaluation(
     return gateEvidence({
       scope: config.scope,
       workspaceRoot: cwd,
+      ...(tenant !== undefined ? { toolResultsRoot: tenant.toolResultRoot } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
     });

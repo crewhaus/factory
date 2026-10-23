@@ -56,7 +56,7 @@ Releases between v0.3.1 and v0.6.0 — the v0.4.x agent-loops line and the v0.5.
 Still on the 0.3.x line:
 
 - Thredz backend wiring on the channel/managed/research/crew shapes (the `thredz:` block is carried there today; cli is emit-wired)
-- `proof: require | off` enforcement in tool-plan (carried; degrades to the ladder with a boot note)
+- `proof: require | off` enforcement in tool-plan — lands in v0.8.0 (see below)
 - `crewhaus wiki push | pull --thredz` — the explicit local ↔ hosted knowledge bridge
 - Better integration with the Anthropic, OpenAI, Google, and open-source model providers
 
@@ -73,6 +73,17 @@ The underlying plugin/template marketplace primitives — `packages/plugin-regis
 - Open-source helpers for self-hosted private registries
 
 (A future Crewhaus Cloud integration — `crewhaus login`, `crewhaus push`, hosted run history — is currently deferred. We may add it later if there's clear demand for a hosted product; the Cloud roadmap itself is documented internally but not part of the public commitment.)
+
+## v0.8.x — the provability release (in progress)
+
+A harness can declare how much proof its answers carry. The `provability:` block sets a floor on a four-rung ladder — `cited`, `grounded`, `checked`, `proven` — and a deterministic gate checks every claim in an answer against the evidence the run recorded before the answer is served: sources it actually fetched, tool results it actually logged (pure tools are re-run to confirm), and proofs a checker accepted. A proof bundle travels with every gated answer on every surface. Off unless a spec turns it on. Design: [design/0.8.0-provability-release.md](design/0.8.0-provability-release.md).
+
+- The `provability:` block on cli, channel, managed and research (crew carries it with a warning), its gate in the same turn-completion seam as `evaluation:`, and one composition root for both gates (`@crewhaus/evaluation-service`)
+- Proof tools (`ProofCheckers`, `ProofCheck`, `ProvabilityPreflight`) and three checkers: a built-in certificate checker, Z3 and Lean 4 in curated sandbox images
+- `crewhaus provability show | check | audit | checkers | prune`, `init --provability`, `eval --provability`, the `provability.*` graders and optimizer paths
+- `continuity.proof: require | off` enforced in tool-plan, closing the v0.3.x item above
+
+Deferred, each to a seam the design names (§12): the pipeline (RAG) answer stage, the crew synthesis turn, `on_fail: retry` on research, `kind: provability` workflow and graph gate steps, the Hangar rung badge and bundle viewer, third-party checker plugins, and spec-scoped evidence on channel daemons.
 
 ## v0.5.x — v0.9.x (Days 180-365)
 

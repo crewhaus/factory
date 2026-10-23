@@ -43,6 +43,7 @@ import {
   buildSuggestionsFile,
   parseJsonlObjects,
   runAdviceRules,
+  withProvabilityBundles,
 } from "@crewhaus/harness-advice/advise-rules";
 import {
   type FixAction,
@@ -76,6 +77,7 @@ import {
   compareStrings,
   json,
   loadSpecText,
+  readContained,
   readJsonlDirectory,
   renderPath,
   resolveInput,
@@ -501,20 +503,21 @@ function plainDocument(yamlText: string): unknown {
  * The refused leaf that a `remove` at `path` would delete, if any.
  *
  * SAME EDIT, TWO SPELLINGS, ONE GATE. `validatePatch`'s block-level guard
- * (`refusedBlockValueKey`) asks what a patch's VALUE would change, so it
- * returns at its first line for a `remove`, whose value is `undefined` by
- * definition. The consequence is a hole with the shape this repository keeps
- * shipping: `replace`-ing `agent.model_pool.learning` with a block that DROPS
- * `seed` is refused with §6.1's reason, and `remove`-ing that same block -
- * which deletes the same pinned seed - sails through. A routed eval pins that
- * seed; either spelling unpins it.
+ * asked what a patch's VALUE would change, so it returned at its first line
+ * for a `remove`, whose value is `undefined` by definition. The consequence
+ * was a hole with the shape this repository keeps shipping: `replace`-ing
+ * `agent.model_pool.learning` with a block that DROPS `seed` was refused with
+ * §6.1's reason, and `remove`-ing that same block - which deletes the same
+ * pinned seed - sailed through. A routed eval pins that seed; either spelling
+ * unpins it.
  *
  * This is the tool's refusal layer, not a second rule: the table below is
  * `OPTIMIZER_REFUSED_LEAVES` itself, imported, so a row added upstream is
  * enforced here on the day it lands. The suffix match mirrors the one the
  * value-side guard uses, because both are asking about the same patterns.
- * (The durable fix belongs in `validatePatch`, which should treat a remove as
- * a value of `{}`; that is a shared package this review did not widen.)
+ * Since 0.8.0 (review I62) `validatePatch` itself refuses a remove that drops
+ * a refused leaf (`refusedLeafChange`), so this runs behind it as a second
+ * reading — of the YAML text the caller sent rather than the parsed spec.
  */
 function refusedLeafRemovedBy(
   yamlText: string,
@@ -683,8 +686,8 @@ export const specPatchApply: RegisteredTool = buildTool({
         });
         continue;
       }
-      // The removal half of the block guard `validatePatch` only applies to
-      // values. See `refusedLeafRemovedBy`.
+      // The removal half of the block guard, read off the YAML text (behind
+      // `validatePatch`'s own, since review I62). See `refusedLeafRemovedBy`.
       if (item.op === "remove") {
         const unpinned = refusedLeafRemovedBy(original, item.path);
         if (unpinned !== undefined) {
@@ -1046,7 +1049,31 @@ export const specAdvise: RegisteredTool = buildTool({
       }
     }
 
-    const ctx = buildAdviceContext(sessions, auditObjects);
+    // 0.8.0 §9.3 (review I63) — the provability gate's unmet REASONS live in
+    // the proof bundles its failing `provability_graded` lines point at (the
+    // lines carry counts only), so the pressure finding can name the dominant
+    // reason and key its advice to it only once those are read — exactly as
+    // `crewhaus advise` does. Each is read through the same containment as
+    // every other path, and one that could not be read is NAMED: a bundle
+    // nobody read is not a bundle with no unmet claims.
+    const baseCtx = buildAdviceContext(sessions, auditObjects);
+    const bundlePaths = baseCtx.provability?.failingBundlePaths ?? [];
+    const bundles: unknown[] = [];
+    const unreadableBundles: Array<{ path: string; reason: string }> = [];
+    for (const bundlePath of bundlePaths.slice(0, maxFiles)) {
+      const read = readContained(toolName, bundlePath, MAX_LOG_BYTES);
+      if (!read.ok) {
+        unreadableBundles.push({ path: renderPath(bundlePath), reason: read.message });
+        continue;
+      }
+      try {
+        bundles.push(JSON.parse(read.value));
+      } catch {
+        unreadableBundles.push({ path: renderPath(bundlePath), reason: "not parseable JSON" });
+      }
+    }
+    const bundlesPastCap = Math.max(0, bundlePaths.length - maxFiles);
+    const ctx = withProvabilityBundles(baseCtx, bundles);
     const specTextForOps = specText;
     const findings: AdviceFinding[] = runAdviceRules(ctx, {
       ...(spec !== undefined ? { spec } : {}),
@@ -1093,6 +1120,12 @@ export const specAdvise: RegisteredTool = buildTool({
     if (auditMalformedLines > 0) {
       incomplete.push(
         `${auditMalformedLines} audit line(s) were not parseable JSON and were skipped`,
+      );
+    }
+    for (const u of unreadableBundles) incomplete.push(`proof bundle ${u.path}: ${u.reason}`);
+    if (bundlesPastCap > 0) {
+      incomplete.push(
+        `proof bundles: only the first ${maxFiles} of ${bundlePaths.length} failing turns' bundles were read (maxFiles)`,
       );
     }
     if (specNote !== undefined) incomplete.push(specNote);
@@ -1155,6 +1188,14 @@ export const specAdvise: RegisteredTool = buildTool({
           given: input.spec !== undefined || input.path !== undefined,
           parsed: spec !== undefined,
           ...(specNote !== undefined ? { reason: specNote } : {}),
+        },
+        // The persisted proof bundles of the gate's failing turns: where the
+        // provability-pressure finding's unmet reasons come from.
+        proofBundles: {
+          failing: bundlePaths.length,
+          read: bundles.length,
+          unreadable: unreadableBundles,
+          ...(bundlesPastCap > 0 ? { notRead: bundlesPastCap } : {}),
         },
         routingScoreboard: {
           read: false,

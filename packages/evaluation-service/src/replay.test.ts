@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { isPureTool } from "@crewhaus/provability";
 import { buildTool } from "@crewhaus/tool-builder";
 import { uuid } from "@crewhaus/tool-encode";
@@ -277,5 +279,69 @@ describe("a pure tool that does not reproduce is not replayed into a mismatch", 
         pinned,
       ),
     ).toEqual({ content: loggedPinned, isError: false });
+  });
+
+  test("a tool that declares a path among its operative arguments is never re-run: its answer was about the workspace then", async () => {
+    const root = dirs.make();
+    writeFileSync(join(root, "expected.txt"), "alpha\nbeta\n");
+    let runs = 0;
+    const golden = buildTool({
+      name: "GoldenFake",
+      description: "compare with a golden file",
+      inputSchema: z.object({ actual: z.string(), golden: z.string() }),
+      operativeArgs: [{ field: "golden", kind: "path" }],
+      readOnly: true,
+      concurrencySafe: true,
+      execute: async ({ actual, golden }) => {
+        runs += 1;
+        return readFileSync(join(root, golden), "utf8") === actual ? "match" : "differs";
+      },
+    });
+    expect(isPureTool(golden)).toBe(true);
+    const { isPureTool: pure, replay } = catalogReplay([golden], {
+      workspaceRoot: root,
+      logged: () => ["differs"],
+    });
+    // Pure by its flags — the binding still says it ran — but not re-run.
+    expect(pure("GoldenFake")).toBe(true);
+    // Even a golden that no longer exists: the declaration is what decides.
+    expect(await replay("GoldenFake", { actual: "x", golden: "gone.txt" })).toBeUndefined();
+    expect(await replay("GoldenFake", { actual: "x", golden: "expected.txt" })).toBeUndefined();
+    expect(runs).toBe(0);
+  });
+
+  test("a tool whose logged input names something in the workspace is not re-run; one that names nothing there is", async () => {
+    const root = dirs.make();
+    mkdirSync(join(root, "docs"));
+    writeFileSync(join(root, "docs", "api.md"), "# API\n");
+    let runs = 0;
+    // AcceptanceCheck's shape: paths inside its input, no operative argument.
+    const accept = buildTool({
+      name: "AcceptFake",
+      description: "check files exist",
+      inputSchema: z.object({ checks: z.array(z.object({ path: z.string() })) }),
+      readOnly: true,
+      concurrencySafe: true,
+      execute: async ({ checks }) => {
+        runs += 1;
+        return `${checks.length} checked`;
+      },
+    });
+    const { replay } = catalogReplay([accept], {
+      workspaceRoot: root,
+      logged: () => ["1 checked"],
+    });
+    expect(await replay("AcceptFake", { checks: [{ path: "docs/api.md" }] })).toBeUndefined();
+    expect(await replay("AcceptFake", { checks: [{ path: join(root, "docs") }] })).toBeUndefined();
+    expect(runs).toBe(0);
+    // Nothing named exists, and a URL or prose is not a name: replayed.
+    expect(
+      await replay("AcceptFake", { checks: [{ path: "https://example.com/docs/api.md" }] }),
+    ).toEqual({ content: "1 checked", isError: false });
+    expect(await replay("AcceptFake", { checks: [{ path: "not/there.md" }] })).toEqual({
+      content: "1 checked",
+      isError: false,
+    });
+    expect(runs).toBe(2);
   });
 });

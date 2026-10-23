@@ -113,6 +113,45 @@ export function memoryArtifacts(
   return store;
 }
 
+/**
+ * The `ProofCheck` call that wrote `artifact`, as tool-proof's `checkReport`
+ * prints its result: the run's own record that a checker accepted (or
+ * rejected) it, which the `proven` rung requires beside the stored file.
+ */
+export function proofCheckCall(
+  artifact: ProofArtifact,
+  id = `toolu_check_${artifact.id}`,
+): CallSpec {
+  return {
+    id,
+    name: "ProofCheck",
+    input: {
+      checker: artifact.checker,
+      claim: artifact.claim,
+      statement: artifact.statement,
+      proof: artifact.proof,
+    },
+    content: JSON.stringify({
+      ok: artifact.ok,
+      id: artifact.id,
+      checker: artifact.checker,
+      next: artifact.ok ? `cite it as [n]: proof:${artifact.id}` : "not proven",
+      ...(artifact.reason !== undefined ? { reason: artifact.reason } : {}),
+      assumptions: [...artifact.assumptions],
+      axioms: [...artifact.axioms],
+      output: artifact.output,
+    }),
+  };
+}
+
+/** An index holding the `ProofCheck` call of each artifact (`proofCheckCall`), and `more` besides. */
+export function checkedBy(
+  artifacts: ReadonlyArray<ProofArtifact>,
+  more: ReadonlyArray<CallSpec> = [],
+): EvidenceIndex {
+  return evidenceOf([...artifacts.map((a) => proofCheckCall(a)), ...more]);
+}
+
 /** A proof artifact with sensible defaults. */
 export function artifact(patch: Partial<ProofArtifact> & { readonly id: string }): ProofArtifact {
   return {

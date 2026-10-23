@@ -2,7 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { buildEvidenceIndex } from "./evidence";
 import { renderBundleJson, renderFooter, renderMarkdownSection, renderNudge } from "./render";
 import { summarizeBundle } from "./summary";
-import { artifact, config, evidenceOf, fetched, memoryArtifacts, now } from "./test-helpers";
+import {
+  artifact,
+  config,
+  evidenceOf,
+  fetched,
+  memoryArtifacts,
+  now,
+  proofCheckCall,
+} from "./test-helpers";
 import type { ProofBundle } from "./types";
 import { unverifiedBundle, verifyDocument } from "./verify";
 
@@ -10,7 +18,10 @@ const POLICY = "https://acme.example/policy";
 /** Page text that must never reach the model through the nudge. */
 const PAGE = "Refunds are accepted within 14 days of delivery for every order placed online.";
 
+const PROOF = artifact({ id: "prf_0123456789abcdef", statement: "∀ i≠j. disjoint(m_i, m_j)" });
+
 const evidence = evidenceOf([
+  proofCheckCall(PROOF),
   { id: "f1", name: "WebFetch", input: { url: POLICY }, content: fetched(POLICY, PAGE) },
   {
     id: "f2",
@@ -32,9 +43,7 @@ async function bundleFor(text: string, level = config("grounded")): Promise<Proo
     config: level,
     evidence,
     now,
-    artifacts: memoryArtifacts([
-      artifact({ id: "prf_0123456789abcdef", statement: "∀ i≠j. disjoint(m_i, m_j)" }),
-    ]),
+    artifacts: memoryArtifacts([PROOF]),
   });
 }
 
@@ -107,6 +116,24 @@ describe("renderFooter — design §5.4's exact shapes", () => {
     expect(nudge).toContain("1 declared assumption was refused");
     expect(nudge).toContain('"Costs are stable this year."');
     expect(summarizeBundle(bundle)).toMatchObject({ assumptions: 1, assumptionsRefused: 1 });
+  });
+
+  test("at cited, the sources are the origins cited; at grounded, the ones that grounded", async () => {
+    // Three claims, two URLs, one of them never fetched.
+    const cited = [
+      "Shipping is free over 50 dollars [1].",
+      "Shipping is free on every order over 50 dollars [1].",
+      "Support answers within one hour [2].",
+      "",
+      "[1]: https://acme.example/ship",
+      "[2]: https://acme.example/unread",
+    ].join("\n");
+    expect(renderFooter(await bundleFor(cited, config("cited")))).toBe(
+      "── provability · cited ✓ · 3/3 claims · 2 sources · 0 assumptions",
+    );
+    expect(renderFooter(await bundleFor(cited))).toBe(
+      "── provability · grounded ✗ · 1/3 claims · unmet: [1] [2] · 1 source · 0 assumptions",
+    );
   });
 
   test("unverified", () => {
@@ -268,4 +295,6 @@ test("summarizeBundle carries the trace line's fields", async () => {
     judgeModel: "m",
     judgeCostUsdMicros: 7,
   });
+  // A proof's hypotheses are assumptions too: the trace line carries them.
+  expect(summarizeBundle({ ...bundle, hypotheses: 2 })).toMatchObject({ hypotheses: 2 });
 });

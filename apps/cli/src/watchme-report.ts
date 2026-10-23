@@ -742,9 +742,14 @@ const finiteCount = (value: unknown): number =>
 /** One session's provability fold — the digest plus what the factuality roll-up reads. */
 export type SessionProvability = {
   readonly digest: WatchmeProvability;
-  /** Gated turns whose standing pass was VERIFIED (pass or fail) — the turns the counts below cover. */
+  /** Gated turns whose standing pass was VERIFIED (pass or fail). */
   readonly verified: number;
-  /** Claims / met claims / counted claims (claims − assumptions) over the verified standing passes. */
+  /**
+   * Of those, the GROUNDING turns ({@link groundingTurns}): graded at
+   * `grounded` or higher — the turns the claim counts below cover.
+   */
+  readonly grounding: number;
+  /** Claims / met claims / counted claims (claims − assumptions) over the grounding turns. */
   readonly claims: number;
   readonly met: number;
   readonly counted: number;
@@ -753,16 +758,35 @@ export type SessionProvability = {
 };
 
 /**
+ * A digest's GROUNDING turns: verified standing passes graded at a floor of
+ * `grounded` or higher — the only turns whose met count says a claim is
+ * grounded, and so the only ones whose claim counts may replace the
+ * heuristic grounding roll-up (design §9.3). At `cited` a met claim is a
+ * well-formed reference and nothing more — design §2's `cited` row: "a
+ * fabricated-but-well-formed reference passes this rung" — so a cited-floor
+ * turn, like an unverified one, is tallied in the digest and never counted
+ * as grounded (review I33).
+ */
+export function groundingTurns(digest: WatchmeProvability): number {
+  return digest.turns - (digest.unverified ?? 0) - (digest.citedFloor ?? 0);
+}
+
+/**
  * The provability gate's own per-turn verdicts in one session, folded from
  * its `provability_graded` lines: a turn's STANDING verdict is its last pass
  * (each gate-triggered retry writes one more). Exact per turn — this replaces
  * the heuristic faithfulness roll-up for a gated session (design §9.3).
  * `unverified` passes (the verifier threw; the answer stood unchecked) count
  * as gated turns — tallied as `digest.unverified` — but contribute no
- * claims, no failure and no rung; `verified` says how many turns the counts
- * cover, and a session with none is NOT the gate's verdict (design §5.1:
- * unverified is never a pass — see `analyzeSession`). `undefined` when the
- * session carries no line (ungated, or pre-0.8.0).
+ * claims, no failure and no rung. Verified passes at the `cited` floor are
+ * tallied as `digest.citedFloor` and keep their failure and rung, but their
+ * claims are not grounding claims, so they stay out of the counts too.
+ * `grounding` says how many turns the counts cover, and a session with none
+ * is NOT the gate's grounding verdict (design §5.1: unverified is never a
+ * pass; §2: cited is not grounded — see `analyzeSession`). Declared
+ * assumptions, accepted and refused, are tallied over every verified pass
+ * (design §2: visible everywhere). `undefined` when the session carries no
+ * line (ungated, or pre-0.8.0).
  */
 export function sessionProvability(
   events: ReadonlyArray<LoggedEvent>,
@@ -785,6 +809,9 @@ export function sessionProvability(
   let unmet = 0;
   let failing = 0;
   let unverified = 0;
+  let citedFloor = 0;
+  let assumptions = 0;
+  let assumptionsRefused = 0;
   const failingBundlePaths: string[] = [];
   for (const p of standing.values()) {
     const level = p["level"] as Exclude<Rung, "none">;
@@ -793,10 +820,17 @@ export function sessionProvability(
       unverified += 1;
       continue;
     }
-    const passClaims = finiteCount(p["claims"]);
-    claims += passClaims;
-    met += finiteCount(p["met"]);
-    counted += Math.max(0, passClaims - finiteCount(p["assumptions"]));
+    const passAssumptions = finiteCount(p["assumptions"]);
+    assumptions += passAssumptions;
+    assumptionsRefused += finiteCount(p["assumptionsRefused"]);
+    if (RUNG_RANK[level] < RUNG_RANK.grounded) {
+      citedFloor += 1;
+    } else {
+      const passClaims = finiteCount(p["claims"]);
+      claims += passClaims;
+      met += finiteCount(p["met"]);
+      counted += Math.max(0, passClaims - passAssumptions);
+    }
     unmet += finiteCount(p["unmet"]);
     const rung: Rung = isRung(p["achieved"]) ? p["achieved"] : "none";
     if (achieved === undefined || RUNG_RANK[rung] < RUNG_RANK[achieved]) achieved = rung;
@@ -810,16 +844,21 @@ export function sessionProvability(
   const level = [...levels].sort(
     (a, b) => b[1] - a[1] || RUNG_RANK[b[0]] - RUNG_RANK[a[0]],
   )[0]?.[0] as Exclude<Rung, "none">;
+  const digest: WatchmeProvability = {
+    level,
+    achieved: achieved ?? "none",
+    unmet,
+    turns: standing.size,
+    failing,
+    ...(unverified > 0 ? { unverified } : {}),
+    ...(citedFloor > 0 ? { citedFloor } : {}),
+    ...(assumptions > 0 ? { assumptions } : {}),
+    ...(assumptionsRefused > 0 ? { assumptionsRefused } : {}),
+  };
   return {
-    digest: {
-      level,
-      achieved: achieved ?? "none",
-      unmet,
-      turns: standing.size,
-      failing,
-      ...(unverified > 0 ? { unverified } : {}),
-    },
+    digest,
     verified: standing.size - unverified,
+    grounding: groundingTurns(digest),
     claims,
     met,
     counted,
@@ -852,11 +891,22 @@ function unmetClaimExamples(fs: WatchmeReportFs, paths: ReadonlyArray<string>): 
 /** The report's provability roll-up over every observation that carries one. */
 export type ProvabilityRollup = {
   readonly sessions: number;
+  /**
+   * Of those, sessions whose factuality claim counts ARE the gate's — at
+   * least one grounding turn ({@link groundingTurns}); the rest keep the
+   * heuristic roll-up (review I33).
+   */
+  readonly exactSessions: number;
   readonly turns: number;
   readonly failing: number;
   /** Gated turns that stood unverified (the verifier threw): measured nothing. */
   readonly unverified: number;
+  /** Verified turns graded at the `cited` floor: never counted as grounded. */
+  readonly citedFloor: number;
   readonly unmet: number;
+  /** Declared assumptions the gate accepted / refused (design §2: visible everywhere). */
+  readonly assumptions: number;
+  readonly assumptionsRefused: number;
   /** Floor → sessions graded at it. */
   readonly levels: Readonly<Record<string, number>>;
   /** Each session's WEAKEST achieved rung → sessions. */
@@ -867,26 +917,46 @@ export function rollupProvability(
   observations: ReadonlyArray<WatchmeObservation>,
 ): ProvabilityRollup | undefined {
   let sessions = 0;
+  let exactSessions = 0;
   let turns = 0;
   let failing = 0;
   let unverified = 0;
+  let citedFloor = 0;
   let unmet = 0;
+  let assumptions = 0;
+  let assumptionsRefused = 0;
   const levels: Record<string, number> = {};
   const weakestAchieved: Record<string, number> = {};
   for (const obs of observations) {
     const p = obs.factuality?.provability;
     if (p === undefined) continue;
     sessions += 1;
+    if (groundingTurns(p) > 0) exactSessions += 1;
     turns += p.turns;
     failing += p.failing;
     unverified += p.unverified ?? 0;
+    citedFloor += p.citedFloor ?? 0;
     unmet += p.unmet;
+    assumptions += p.assumptions ?? 0;
+    assumptionsRefused += p.assumptionsRefused ?? 0;
     levels[p.level] = (levels[p.level] ?? 0) + 1;
     weakestAchieved[p.achieved] = (weakestAchieved[p.achieved] ?? 0) + 1;
   }
   return sessions === 0
     ? undefined
-    : { sessions, turns, failing, unverified, unmet, levels, weakestAchieved };
+    : {
+        sessions,
+        exactSessions,
+        turns,
+        failing,
+        unverified,
+        citedFloor,
+        unmet,
+        assumptions,
+        assumptionsRefused,
+        levels,
+        weakestAchieved,
+      };
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1265,13 @@ export function renderWatchmeReportMd(report: WatchmeReportJson): string {
         .map(([rung, n]) => `${rung} ×${n}`)
         .join(", ");
     lines.push(
-      `- Provability gate (exact, per turn — replaces the heuristic for these ${p.sessions} session(s)): ${p.turns} gated turn(s) · ${p.failing} still failing after retries · ${p.unmet} unmet claim(s) · floor ${tally(p.levels)} · weakest achieved ${tally(p.weakestAchieved)}${
+      `- Provability gate (exact, per turn — replaces the heuristic for ${p.exactSessions} of ${p.sessions} gated session(s)): ${p.turns} gated turn(s) · ${p.failing} still failing after retries · ${p.unmet} unmet claim(s) · ${p.assumptions} declared assumption(s)${
+        p.assumptionsRefused > 0 ? ` (+${p.assumptionsRefused} refused)` : ""
+      } · floor ${tally(p.levels)} · weakest achieved ${tally(p.weakestAchieved)}${
+        p.citedFloor > 0
+          ? ` · ${p.citedFloor} turn(s) at the cited floor (references checked for form only — never counted as grounded)`
+          : ""
+      }${
         p.unverified > 0
           ? ` · ${p.unverified} turn(s) UNVERIFIED (the verifier threw — measured nothing, never a pass; a session with no verified turn keeps the heuristic)`
           : ""
@@ -1426,20 +1502,32 @@ async function analyzeSession(input: {
   // verdict, exact per turn: its claim/met counts replace the heuristic
   // faithfulness roll-up (and its hallucination proxy), and its unmet claims
   // are the examples. Relevance is a different signal and still runs.
-  // Only VERIFIED turns are a verdict: a session whose every gated turn stood
-  // unverified (the verifier threw — design §5.1 fail-open, never a pass)
-  // measured nothing, so it keeps the heuristic roll-up (or none) and only
-  // carries the digest, which counts those turns as unverified. Reading it as
-  // "zero claims, vacuously faithful" would report 100% where nothing was
-  // checked.
+  // Only GROUNDING turns are a grounding verdict (`groundingTurns`): a
+  // session whose every gated turn stood unverified (the verifier threw —
+  // design §5.1 fail-open, never a pass) measured nothing, and one gated at
+  // `cited` measured only that its references are well formed (§2: "a
+  // fabricated-but-well-formed reference passes this rung"). Either keeps
+  // the heuristic roll-up (or none) and only carries the digest. Reading the
+  // first as "zero claims, vacuously faithful" would report 100% where
+  // nothing was checked; reading the second's met count as grounded would
+  // report a harness better grounded for turning the lowest rung on.
+  // Zero counted claims is the gate's own vacuous pass (verify: "no
+  // claims to prove" / "every claim is an assumption"). Only a claim-free
+  // answer is vacuously faithful; one whose every claim is a declared
+  // assumption checked nothing, so it carries no faithfulness — and its
+  // assumptions are counted in the digest, never silently excused (§2).
   const gated = sessionProvability(events);
-  const exact = gated !== undefined && gated.verified > 0 ? gated : undefined;
+  const exact = gated !== undefined && gated.grounding > 0 ? gated : undefined;
   if (exact !== undefined) {
     factuality = {
       claims: exact.claims,
       grounded: exact.met,
-      faithfulness: exact.counted === 0 ? 1 : exact.met / exact.counted,
-      ...(exact.claims === 0 ? { vacuous: true } : {}),
+      ...(exact.counted > 0
+        ? { faithfulness: exact.met / exact.counted }
+        : exact.claims === 0
+          ? { faithfulness: 1 }
+          : {}),
+      ...(exact.counted === 0 ? { vacuous: true } : {}),
       provability: exact.digest,
     };
     factualityExamples.push(...unmetClaimExamples(deps.fs, exact.failingBundlePaths));
@@ -1472,8 +1560,9 @@ async function analyzeSession(input: {
   } catch (err) {
     deps.warn?.(`watchme: factuality graders failed on ${sessionId}: ${(err as Error).message}`);
   }
-  // An all-unverified gated session with no heuristic to fall back on still
-  // carries its digest — counts only, no faithfulness and no vacuous pass.
+  // A gated session with no grounding turn (all unverified, or gated only at
+  // `cited`) and no heuristic to fall back on still carries its digest —
+  // counts only, no faithfulness and no vacuous pass.
   if (gated !== undefined && factuality === undefined) {
     factuality = { claims: 0, grounded: 0, provability: gated.digest };
   }

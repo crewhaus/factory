@@ -299,6 +299,16 @@ learning:
 
 That's a domain expert that studies, cites, reflects, and sits its own exam — walkthrough [64 — the self-teaching expert](https://github.com/crewhaus/demos/blob/main/walkthroughs/64-self-teaching-expert.md) walks it end to end.
 
+## Answers that carry proof (v0.8.0)
+
+One line sets how much proof a harness's answers must carry:
+
+```yaml
+provability: grounded   # cited | grounded | checked | proven
+```
+
+Before an answer is served, a deterministic gate checks every claim in it against what the run actually did: a page it fetched, a calculation it ran, a proof a checker accepted. An answer that falls short is retried, marked ✗, or refused, as the spec says, and a short proof footer travels with every answer. `crewhaus provability check` runs the same gate over any document in CI.
+
 ## Documentation
 
 - **New here?** Start with [Getting Started](https://github.com/crewhaus/docs/blob/main/GETTING-STARTED.md) — a guided tour from first principles to a runnable agent.

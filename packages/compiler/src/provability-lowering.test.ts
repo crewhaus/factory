@@ -9,10 +9,12 @@
  *     the same compile errors `tools:` gives;
  *   - the judge as an auxiliary model slot (`$profile`, sentinels, params),
  *     and `escalateTo` resolved exactly as `IrEvaluation.escalateTo` is;
- *   - the per-shape rules: research's report gate (halt | note), crew's
- *     accepted-but-unwired row, the inert-block warning, the
- *     `--strict`-escalated execution-unresolved warning, and the waiver
- *     judge's self-judge note.
+ *   - `formal.checkers` resolved to the list the proof tools run (builtin
+ *     appended when the spec left it out), and the image-unused warning;
+ *   - the per-shape rules: research's report gate (halt | note, and the
+ *     floors it can never meet), crew's accepted-but-unwired row, the
+ *     inert-block warning, the `--strict`-escalated execution-unresolved
+ *     warning, and the waiver judge's self-judge note.
  */
 import { describe, expect, test } from "bun:test";
 import { CompilerError } from "@crewhaus/errors";
@@ -27,6 +29,7 @@ import {
   lower,
   lowerWithWarnings,
   provabilityOf,
+  sandboxOnlyProvabilityCheckers,
   unresolvedProvabilityExecutionTools,
 } from "./index";
 
@@ -195,18 +198,34 @@ describe("provability lowering — spread-return-{} (byte-identical when absent 
 });
 
 describe("provability lowering — defaults resolved at lower time (design §4.2)", () => {
-  test("the default execution allowlist is the concrete expansion of all-compute + all-verify", () => {
-    expect([...PROVABILITY_DEFAULT_EXECUTION_ALLOW]).toEqual(["all-compute", "all-verify"]);
+  test("the default execution allowlist is the concrete expansion of all-compute + all-verify, less goldenUpdate", () => {
+    expect([...PROVABILITY_DEFAULT_EXECUTION_ALLOW]).toEqual([
+      "all-compute",
+      "all-verify",
+      "-goldenUpdate",
+    ]);
     // Concrete keys only (no emitter ever sees a category), and the gates the
     // design names are in it while bash is not (design §3).
     expect(DEFAULT_ALLOW.length).toBeGreaterThan(50);
     expect(DEFAULT_ALLOW.some((k) => k.startsWith("all-") || k.startsWith("-"))).toBe(false);
-    for (const key of ["evaluate", "moneyAdd", "citationLint", "factCrossCheck"]) {
+    for (const key of ["evaluate", "moneyAdd", "citationLint", "factCrossCheck", "goldenCompare"]) {
       expect(DEFAULT_ALLOW).toContain(key);
     }
-    for (const key of ["bash", "python", "webFetch", "write"]) {
+    // §6.3: no destructive tool is evidence by default. goldenUpdate rewrites
+    // a golden file; the flags-based guard over every entry is
+    // apps/cli/src/provability-default-allow.test.ts (the compiler cannot
+    // read tool flags offline).
+    for (const key of ["bash", "python", "webFetch", "write", "goldenUpdate"]) {
       expect(DEFAULT_ALLOW).not.toContain(key);
     }
+  });
+
+  test("goldenUpdate is evidence only when a spec lists it (design §6.3)", () => {
+    const listed = cli("provability: { level: checked, execution: { allow: [all-verify] } }");
+    expect(listed.provability?.execution.allow).toContain("goldenUpdate");
+    const bare = cli("provability: checked");
+    expect(bare.provability?.execution.allow).toEqual([...DEFAULT_ALLOW]);
+    expect(bare.provability?.execution.allow).not.toContain("goldenUpdate");
   });
 
   test("a bare rung shorthand arrives fully populated, at every rung", () => {
@@ -318,6 +337,104 @@ describe("provability lowering — every declared field", () => {
     ).provability;
     expect(p?.threshold).toBe(0);
     expect(p?.formal.forbid).toEqual([]);
+  });
+});
+
+describe("provability lowering — formal.checkers is the list the proof tools run (design §3, §4.2)", () => {
+  test("builtin is appended last when the spec leaves it out, so a sandbox-only list cannot exclude it", () => {
+    const checkersOf = (list: string): IrProvability["formal"]["checkers"] | undefined =>
+      cli(`provability: { level: proven, formal: { checkers: ${list} } }`).provability?.formal
+        .checkers;
+    expect(checkersOf("[smt]")).toEqual(["smt", "builtin"]);
+    expect(checkersOf("[lean4]")).toEqual(["lean4", "builtin"]);
+    expect(checkersOf("[smt, lean4]")).toEqual(["smt", "lean4", "builtin"]);
+    // A list that names builtin keeps the author's order exactly.
+    expect(checkersOf("[lean4, builtin]")).toEqual(["lean4", "builtin"]);
+    expect(checkersOf("[smt, builtin, lean4]")).toEqual(["smt", "builtin", "lean4"]);
+    expect(checkersOf("[builtin]")).toEqual(["builtin"]);
+    // The default already carries it.
+    expect(cli("provability: proven").provability?.formal.checkers).toEqual(["builtin", "smt"]);
+  });
+
+  test("the append is silent: a sandbox-only list compiles with no warning (lint explains it)", () => {
+    expect(
+      lowered(cliYaml("provability: { level: proven, formal: { checkers: [smt] } }")).warnings,
+    ).toEqual([]);
+  });
+
+  test("sandboxOnlyProvabilityCheckers names a live list without builtin as written; [] otherwise", () => {
+    const of = (block: unknown): ReadonlyArray<string> =>
+      sandboxOnlyProvabilityCheckers({ provability: block });
+    expect(of({ level: "proven", formal: { checkers: ["smt", "lean4"] } })).toEqual([
+      "smt",
+      "lean4",
+    ]);
+    expect(of({ level: "cited", formal: { checkers: ["lean4"] } })).toEqual(["lean4"]);
+    expect(of({ level: "proven", formal: { checkers: ["lean4", "builtin"] } })).toEqual([]);
+    expect(of({ level: "proven", formal: { timeout_ms: 5000 } })).toEqual([]);
+    expect(of("proven")).toEqual([]);
+    // An inert block is the inert-block warning's business.
+    expect(of({ level: "off", formal: { checkers: ["smt"] } })).toEqual([]);
+    expect(sandboxOnlyProvabilityCheckers({})).toEqual([]);
+  });
+});
+
+describe("provability lowering — formal.image overrides the lean4 checker only (design §3, §6.4)", () => {
+  const IMAGE = "ghcr.io/acme/z3-custom:1";
+
+  test("an image with no lean4 checker warns provability-image-unused, naming the resolved list", () => {
+    for (const [list, resolved] of [
+      ["[builtin, smt]", "builtin, smt"],
+      ["[smt]", "smt, builtin"],
+      ["[builtin]", "builtin"],
+    ] as const) {
+      const { ir, warnings } = lowered(
+        cliYaml(`provability: { level: proven, formal: { checkers: ${list}, image: "${IMAGE}" } }`),
+      );
+      expect(warnings).toEqual([
+        {
+          code: "provability-image-unused",
+          path: "provability.formal.image",
+          message: `provability.formal.image overrides the lean4 checker's image only, and provability.formal.checkers (${resolved}) does not list lean4, so the image is never used. Add lean4 to formal.checkers, or delete formal.image.`,
+        },
+      ]);
+      // Kept on the IR (lowering drops nothing the author wrote); it is unused.
+      expect(provabilityOf(ir as never)?.formal.image).toBe(IMAGE);
+    }
+    // The default checkers have no lean4 either.
+    expect(
+      codes(
+        lowered(cliYaml(`provability: { level: proven, formal: { image: "${IMAGE}" } }`)).warnings,
+      ),
+    ).toEqual(["provability-image-unused"]);
+  });
+
+  test("with lean4 listed the image is used, and nothing warns", () => {
+    for (const list of ["[lean4]", "[builtin, lean4]", "[smt, lean4]"]) {
+      expect(
+        lowered(
+          cliYaml(
+            `provability: { level: proven, formal: { checkers: ${list}, image: "${IMAGE}" } }`,
+          ),
+        ).warnings,
+      ).toEqual([]);
+    }
+  });
+
+  test("an inert block warns provability-inert-block alone; compile() surfaces it on every carrier", () => {
+    expect(
+      codes(
+        lowered(cliYaml(`provability: { level: off, formal: { image: "${IMAGE}" } }`)).warnings,
+      ),
+    ).toEqual(["provability-inert-block"]);
+    for (const yaml of [
+      cliYaml(`provability: { level: grounded, formal: { image: "${IMAGE}" } }`),
+      channelYaml(`provability: { level: grounded, formal: { image: "${IMAGE}" } }`),
+      managedYaml(`provability: { level: grounded, formal: { image: "${IMAGE}" } }`),
+      researchYaml(`provability: { level: grounded, formal: { image: "${IMAGE}" } }`),
+    ]) {
+      expect(codes(compile(yaml, opts).warnings)).toEqual(["provability-image-unused"]);
+    }
   });
 });
 
@@ -599,6 +716,45 @@ describe("provability lowering — research: the report gate supports halt | not
   test("compile() surfaces the degrade warning too", () => {
     const result = compile(researchYaml("provability: { level: cited, on_fail: retry }"), opts);
     expect(codes(result.warnings)).toContain("provability-on-fail-degraded");
+  });
+
+  test("checked and proven can never be met there: provability-research-rung-unreachable", () => {
+    // The report gate's evidence is the citation tracker's fetched bodies,
+    // which reach grounded at most — no tool: or proof: evidence exists.
+    for (const level of ["checked", "proven"] as const) {
+      for (const block of [
+        `provability: ${level}`,
+        `provability: { level: ${level}, on_fail: halt }`,
+      ]) {
+        const { ir, warnings } = research(block);
+        expect(ir.provability?.level).toBe(level);
+        expect(warnings).toEqual([
+          {
+            code: "provability-research-rung-unreachable",
+            path: "provability.level",
+            message: `provability.level: ${level} cannot be met on the research shape in 0.8.0 — the report gate's only evidence is the sources the run fetched, which reach grounded at most, so no claim in a report can meet this floor. Set level: grounded or level: cited.`,
+          },
+        ]);
+      }
+    }
+    expect(codes(compile(researchYaml("provability: proven"), opts).warnings)).toEqual([
+      "provability-research-rung-unreachable",
+    ]);
+  });
+
+  test("cited and grounded reach on research; checked and proven reach on the interactive shapes", () => {
+    for (const level of ["cited", "grounded"]) {
+      expect(research(`provability: ${level}`).warnings).toEqual([]);
+    }
+    for (const level of ["checked", "proven"]) {
+      for (const yaml of [
+        cliYaml(`provability: ${level}`),
+        channelYaml(`provability: ${level}`),
+        managedYaml(`provability: ${level}`),
+      ]) {
+        expect(lowered(yaml).warnings).toEqual([]);
+      }
+    }
   });
 });
 
