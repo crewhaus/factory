@@ -49,8 +49,49 @@ Statuses: `open → in_progress → claimed → proven`.
   reject with instructive errors (`no verified evidence for tu_…: run the
   action first, then complete the step with its toolUseId.`).
 
-**Proof lifetime**: session transcripts are TTL-evicted, so on every proven
-transition the store (a) appends a retention pin for the cited session to
+**Unverified transitions** (0.8.0, design/0.8.0-provability-release.md
+§6.3): `proveStep(…, { verification: "unverified" })` and
+`updateGoal(…, { verification: "unverified" })` mark the record `proven`
+without resolving anything — what tool-plan's `continuity.proof: off` uses
+for harnesses with no event log. The cited refs are stored as
+`UnverifiedRef`s (`unverified:` in the plan frontmatter / goal entry),
+beside — never among — the frozen proofs; no session is pinned; and
+`renderLadderStatus` / the handoff render `[proven (unverified)]`. A later
+verified transition clears them; an unverified one never downgrades a
+record already proven with verification. Records the ladder writes carry no
+`unverified` key, so their bytes are unchanged. "Proven with verification"
+means `isProvenVerified`: proven, not by assertion, with at least one frozen
+proof. The store never writes a `proven` record without one, so a record
+like that (a hand edit) is not treated as verified.
+
+Nothing vouches for an unverified id, so the store bounds it: each id must
+be one token of letters, digits, `_ . : -` up to 256 characters
+(`UNVERIFIED_TOOL_USE_ID_REGEX`, which covers the ids providers mint) and a
+cited session must be `sess_<16 hex>`. Otherwise the call is refused with
+nothing written, so a citation cannot carry a newline and a forged
+`[proven]` line into a render. A record holds at most `MAX_UNVERIFIED_REFS`
+(32) refs. Re-citing a record already proven by assertion appends to its
+refs; proving a reopened record replaces them, so the list always backs the
+current proof.
+
+**One line per record** (0.8.0): every surface that shows a plan or goal
+is line-oriented, and a plan file is parsed by line, so the store keeps the
+text it prints inside a line to that line. Plan and goal titles and goal
+units collapse every whitespace run (newlines included) to a space, as step
+text always has, and are capped (`MAX_TITLE_CHARS` 512, `MAX_UNIT_CHARS`
+64; longer is refused with nothing written). Files an older store wrote are
+read the same way. A plan's steps are read only below its last `## Steps`
+heading, and focus.md's sections are found by their last header, so neither
+a title nor a focus body can be read back as a step, a requirement or the
+active-plan pointer.
+
+**Guards** (0.8.0): `updateGoal(…, { guard })` runs `guard(next, previous)`
+under the store lock on the merged record, before anything is written;
+throwing refuses the update. tool-plan's `continuity.proof: require` uses it
+so two sessions cannot each pass an at-target check on a stale read.
+
+**Proof lifetime**: session transcripts are TTL-evicted, so on every verified
+proven transition the store (a) appends a retention pin for the cited session to
 `.crewhaus/retention.json` (the pin contract session-store and
 `crewhaus retention` honor) and (b) freezes a `{toolName, inputHash,
 resultDigest}` excerpt into the plan/goal record — evidence outlives the

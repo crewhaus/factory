@@ -458,18 +458,27 @@ export type GoalUpdateEventPayload = {
   readonly title?: string;
   /** See `PlanUpdateEventPayload.agentIdentity`. */
   readonly agentIdentity?: string;
+  /** 0.8.0 (design/0.8.0-provability-release.md §6.3) — `"unverified"` on an
+   *  update that marked the goal proven WITHOUT resolving its evidence
+   *  (`continuity.proof: off`). `action_proof` is keyed by plan step, so
+   *  this is how a goal's proof by assertion stays apart from a verified one
+   *  in the log. Absent otherwise, so every other payload is unchanged. */
+  readonly verification?: "unverified";
 };
 
 /** Payload of an `action_proof` event — one evidence reference checked
  *  during a `proven` transition. `verified` means the cited `tool_use` /
  *  `tool_result` pair resolved in a session log (parent or child) with
  *  `isError` false; `missing` and `error_result` record rejected attempts so
- *  the audit trail shows proof pressure, not just successes. */
+ *  the audit trail shows proof pressure, not just successes. `unverified`
+ *  (0.8.0, design/0.8.0-provability-release.md §6.3) means the ref was
+ *  recorded WITHOUT being resolved — a `proven` transition under
+ *  `continuity.proof: off` — so it is neither a success nor a rejection. */
 export type ActionProofEventPayload = {
   readonly planId: string;
   readonly step: number;
   readonly toolUseId: string;
-  readonly verdict: "verified" | "missing" | "error_result";
+  readonly verdict: "verified" | "missing" | "error_result" | "unverified";
   /** See `PlanUpdateEventPayload.agentIdentity`. */
   readonly agentIdentity?: string;
 };

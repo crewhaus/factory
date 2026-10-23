@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { compile } from "@crewhaus/compiler";
+import { mergeGateTools } from "@crewhaus/evaluation-service";
 import type { HookDef } from "@crewhaus/hooks-engine";
-import type { IrModelPool } from "@crewhaus/ir";
+import type { IrModelPool, IrProvability } from "@crewhaus/ir";
 import { modelWiringFragmentFromIr, wireModels } from "@crewhaus/model-service";
 import type { RunEvaluation } from "@crewhaus/runtime-core";
 import { TraceEventBus } from "@crewhaus/trace-event-bus";
+import { collectCrewhausDeps } from "./bundle-manifest";
 import {
   evaluationRunOptions,
   formatCompileWarning,
+  gateRunOptions,
   isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
@@ -24,13 +28,13 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     bus,
   });
 
-  test("a spec without evaluation: spreads NOTHING", () => {
-    expect(evaluationRunOptions({ agent: { model: "m" } })).toEqual({});
-    expect(Object.keys(evaluationRunOptions({ agent: { model: "m" } }))).toEqual([]);
+  test("a spec without evaluation: spreads NOTHING", async () => {
+    expect(await evaluationRunOptions({ agent: { model: "m" } })).toEqual({});
+    expect(Object.keys(await evaluationRunOptions({ agent: { model: "m" } }))).toEqual([]);
   });
 
   test("contains: pure grader, threshold 1, resolved onFail / maxRetries threaded verbatim", async () => {
-    const out = evaluationRunOptions({
+    const out = await evaluationRunOptions({
       agent: { model: "m" },
       evaluation: { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 2 },
     });
@@ -50,7 +54,7 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
   });
 
   test("regex: lastIndex is reset per call so a global flag cannot flip verdicts", async () => {
-    const out = evaluationRunOptions({
+    const out = await evaluationRunOptions({
       agent: { model: "m" },
       evaluation: { grader: { type: "regex", value: "ok" }, onFail: "note", maxRetries: 1 },
     });
@@ -61,8 +65,8 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     expect((await ev.evaluate(turn("ko"))).rationale).toBe("output does not match /ok/");
   });
 
-  test("llm_judge: graderType, resolved threshold and onFail (escalate included) mirror the bundle", () => {
-    const out = evaluationRunOptions({
+  test("llm_judge: graderType, resolved threshold and onFail (escalate included) mirror the bundle", async () => {
+    const out = await evaluationRunOptions({
       agent: { model: "claude-haiku-4-5" },
       evaluation: {
         grader: { type: "llm_judge", criteria: "is it correct?" },
@@ -82,7 +86,7 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     // does.
     expect(ev.judgeModel).toBe("claude-haiku-4-5");
     // The lower-time default the bundle also falls back to.
-    const defaulted = evaluationRunOptions({
+    const defaulted = await evaluationRunOptions({
       agent: { model: "m" },
       evaluation: {
         grader: { type: "llm_judge", criteria: "c" },
@@ -93,8 +97,8 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     expect((defaulted.evaluation as RunEvaluation).threshold).toBe(0.7);
   });
 
-  test("0.6.0 PR 13b — a declared PANEL names the instrument by its members, joined with +", () => {
-    const out = evaluationRunOptions({
+  test("0.6.0 PR 13b — a declared PANEL names the instrument by its members, joined with +", async () => {
+    const out = await evaluationRunOptions({
       agent: { model: "claude-haiku-4-5" },
       evaluation: {
         grader: {
@@ -115,35 +119,150 @@ describe("evaluationRunOptions (0.6.0 PR 8b — interpreter parity for the in-lo
     // Two panels are two instruments: the lineage key must distinguish them
     // from the single-judge default, which still reads as one model string.
     expect(ev.judgeModel).toBe("claude-sonnet-4-6+claude-opus-4-8");
-    const single = evaluationRunOptions({
-      agent: { model: "claude-haiku-4-5" },
-      evaluation: {
-        grader: { type: "llm_judge", criteria: "c" },
-        onFail: "retry",
-        maxRetries: 1,
-      },
-    }).evaluation as RunEvaluation;
+    const single = (
+      await evaluationRunOptions({
+        agent: { model: "claude-haiku-4-5" },
+        evaluation: {
+          grader: { type: "llm_judge", criteria: "c" },
+          onFail: "retry",
+          maxRetries: 1,
+        },
+      })
+    ).evaluation as RunEvaluation;
     expect(single.judgeModel).toBe("claude-haiku-4-5");
   });
 
-  test("0.6.0 PR 9c — the cascade's lower-time escalateTo is threaded verbatim under on_fail: escalate, and absent otherwise", () => {
+  test("0.6.0 PR 9c — the cascade's lower-time escalateTo is threaded verbatim under on_fail: escalate, and absent otherwise", async () => {
     for (const type of ["llm_judge", "contains", "regex"] as const) {
       const grader =
         type === "llm_judge"
           ? ({ type, criteria: "c" } as const)
           : ({ type, value: "ok" } as const);
-      const escalated = evaluationRunOptions({
-        agent: { model: "m" },
-        evaluation: { grader, onFail: "escalate", maxRetries: 1, escalateTo: "strong" },
-      }).evaluation as RunEvaluation;
+      const escalated = (
+        await evaluationRunOptions({
+          agent: { model: "m" },
+          evaluation: { grader, onFail: "escalate", maxRetries: 1, escalateTo: "strong" },
+        })
+      ).evaluation as RunEvaluation;
       expect(escalated.onFail).toBe("escalate");
       expect(escalated.escalateTo).toBe("strong");
-      const plain = evaluationRunOptions({
-        agent: { model: "m" },
-        evaluation: { grader, onFail: "retry", maxRetries: 1 },
-      }).evaluation as RunEvaluation;
+      const plain = (
+        await evaluationRunOptions({
+          agent: { model: "m" },
+          evaluation: { grader, onFail: "retry", maxRetries: 1 },
+        })
+      ).evaluation as RunEvaluation;
       expect("escalateTo" in plain).toBe(false);
     }
+  });
+});
+
+describe("gateRunOptions (0.8.0 §4.4 — both in-loop gates through the composition root)", () => {
+  const PROVABILITY: IrProvability = {
+    level: "grounded",
+    onFail: "retry",
+    maxRetries: 1,
+    threshold: 1,
+    scope: "session",
+    assumptions: "allow",
+    render: "footer",
+    sources: { allow: [], deny: [], bibliographic: false, resolve: "off" },
+    grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+    execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+    formal: { checkers: ["builtin", "smt"], forbid: ["sorry"], timeoutMs: 30_000 },
+  };
+  const base = { name: "bot", agent: { model: "claude-haiku-4-5" } };
+
+  test("neither block: no options, no tools", async () => {
+    expect(await gateRunOptions(base, { cwd: process.cwd() })).toEqual({
+      options: {},
+      tools: [],
+      proofTools: [],
+    });
+  });
+
+  test("evaluation only: the same gate evaluationRunOptions builds, and no tools", async () => {
+    const evaluation = {
+      grader: { type: "contains", value: "DONE" },
+      onFail: "halt",
+      maxRetries: 2,
+    } as const;
+    const gates = await gateRunOptions({ ...base, evaluation }, { cwd: process.cwd() });
+    expect(Object.keys(gates.options)).toEqual(["evaluation"]);
+    expect(gates.tools).toEqual([]);
+    expect(gates.proofTools).toEqual([]);
+    const viaHelper = (await evaluationRunOptions({ ...base, evaluation }))
+      .evaluation as RunEvaluation;
+    const { evaluate: _a, ...fromGates } = gates.options.evaluation as RunEvaluation;
+    const { evaluate: _b, ...fromHelper } = viaHelper;
+    expect(fromGates).toEqual(fromHelper);
+  });
+
+  test("provability: the gate (footer target and level from the IR) and the preflight tool", async () => {
+    const gates = await gateRunOptions(
+      { ...base, provability: PROVABILITY },
+      { cwd: process.cwd(), footerTarget: "reply" },
+    );
+    expect(Object.keys(gates.options)).toEqual(["provability"]);
+    expect(gates.options.provability).toMatchObject({
+      level: "grounded",
+      onFail: "retry",
+      maxRetries: 1,
+      threshold: 1,
+      render: "footer",
+      footerTarget: "reply",
+    });
+    expect(gates.tools.map((t) => t.name)).toEqual(["ProvabilityPreflight"]);
+    // All three are bound, so the interpreter's merge replaces a ProofCheck the spec listed.
+    const listed = { name: "ProofCheck" } as (typeof gates.proofTools)[number];
+    const merged = mergeGateTools([listed], gates);
+    expect(merged.map((t) => t.name)).toEqual(["ProofCheck", "ProvabilityPreflight"]);
+    expect(merged[0]).toBe(gates.proofTools.find((t) => t.name === "ProofCheck"));
+  });
+
+  test("a spec name the spec schema allows but the proofs store does not (a space) wires", async () => {
+    const gates = await gateRunOptions(
+      { ...base, name: "support bot", provability: PROVABILITY },
+      { cwd: process.cwd() },
+    );
+    expect(Object.keys(gates.options)).toEqual(["provability"]);
+  });
+
+  test("both: one call, both options, evaluation first", async () => {
+    const gates = await gateRunOptions(
+      {
+        ...base,
+        evaluation: { grader: { type: "regex", value: "x" }, onFail: "note", maxRetries: 0 },
+        provability: { ...PROVABILITY, level: "proven" },
+      },
+      { cwd: process.cwd() },
+    );
+    expect(Object.keys(gates.options)).toEqual(["evaluation", "provability"]);
+    expect(gates.tools.map((t) => t.name)).toEqual([
+      "ProofCheckers",
+      "ProofCheck",
+      "ProvabilityPreflight",
+    ]);
+  });
+});
+
+describe("the gate wiring reaches a compiled bundle's manifest", () => {
+  test("a cli bundle with evaluation: + provability: imports @crewhaus/evaluation-service, so its package.json pins it", () => {
+    const spec = [
+      "name: proof-bot",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: cite everything",
+      "provability: grounded",
+      "evaluation:",
+      '  grader: { type: contains, value: "[1]" }',
+    ].join("\n");
+    const bundle = compile(spec, { today: "2026-10-22" });
+    expect(collectCrewhausDeps(bundle.files)).toContain("@crewhaus/evaluation-service");
+    // …and a spec with neither gate does not.
+    const plain = compile(spec.split("\nprovability:")[0] as string, { today: "2026-10-22" });
+    expect(collectCrewhausDeps(plain.files)).not.toContain("@crewhaus/evaluation-service");
   });
 });
 

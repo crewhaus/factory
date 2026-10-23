@@ -12,6 +12,7 @@
  * the tree.
  */
 import { codeSpans, inSpan, indexSpans, inlineLinks, lineIndex } from "./markdown";
+import { isAssumptionMarker } from "./refs";
 import { splitSentences } from "./sentences";
 
 export type Citation = { readonly marker: string; readonly line: number };
@@ -139,10 +140,21 @@ export function* markersOutsideCode(
  * "Revenue rose.[1][2] Costs fell." ends its first sentence at the full stop
  * before the run, and "Revenue rose. [1][2] Costs fell." cites [2] for the
  * sentence before it. So the extractor asks this where a marker's run
- * begins. Only ids the marker grammar could read — `[\w.-]+`, after an
- * optional `^` — count; linear in the run. Not exported from the package.
+ * begins. Linear in the run. Not exported from the package.
+ *
+ * Only a bracket the caller calls a citation id (`isCitationId`, given the
+ * label as written, `^` included) extends the run, and the walk stops at the
+ * first that is not one. The grammar's `[\w.-]+` alone is every one-word
+ * link text too: "[Stripe][2] charges 2.9%" opening a sentence is a link
+ * whose text is the sentence's subject, and read as a run it moved [2] onto
+ * the sentence before it — that sentence cited a source it never used, and
+ * the one that did was flagged uncited.
  */
-export function labelRunStart(text: string, at: number): number {
+export function labelRunStart(
+  text: string,
+  at: number,
+  isCitationId: (label: string) => boolean,
+): number {
   let start = at;
   for (;;) {
     if (text[start - 1] !== "]") return start;
@@ -151,8 +163,25 @@ export function labelRunStart(text: string, at: number): number {
     if (i === start - 1) return start;
     if (text[i - 1] === "^") i--;
     if (text[i - 1] !== "[") return start;
+    if (!isCitationId(text.slice(i, start - 1))) return start;
     start = i - 1;
   }
+}
+
+/**
+ * Is a bracket's label a citation id rather than a word: a number (`1`), a
+ * footnote (`^a`), an assumption (`A1`, `refs.ts`), or an id the document
+ * defines (`citationDefinitions`' keys, `^` dropped). For `labelRunStart`.
+ * Not exported from the package.
+ */
+export function citationIdTest(text: string): (label: string) => boolean {
+  let defined: Set<string> | null = null;
+  return (label) => {
+    if (label.startsWith("^") || /^\d+$/.test(label) || isAssumptionMarker(label)) return true;
+    // Built on first use: most answers have no run to ask about.
+    defined ??= new Set(citationDefinitions(text).keys());
+    return defined.has(label);
+  };
 }
 
 /**

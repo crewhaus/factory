@@ -31,6 +31,38 @@
  * Rejected proof attempts emit `action_proof` too (verdict `missing` /
  * `error_result`): the audit trail records proof pressure, not just wins.
  *
+ * Proof modes (`continuity.proof`, design §2.4; enforced from 0.8.0,
+ * design/0.8.0-provability-release.md §6.3) — `createPlanTools({proofMode})`:
+ *
+ *   ladder  (default) the behaviour above, byte for byte: `claimed` is free,
+ *           `proven` needs verified evidence.
+ *   require the ladder, plus: nothing below `proven` COMPLETES anything.
+ *           `claimed` stays settable — it is honest progress — but the
+ *           tools refuse every operation that would mark a goal achieved
+ *           while it is below `proven`. The store has exactly one such
+ *           path: a goal whose progress (`current`, 0 when unset) reaches
+ *           its `target` (the Thredz mirror completes a goal on
+ *           `currentValue >= targetValue`), so GoalWrite/GoalUpdate refuse
+ *           that unless the same call proves the goal — GoalUpdate through
+ *           a store guard evaluated under the store lock, so concurrent
+ *           sessions cannot each pass a stale check. Plans have no close
+ *           operation: a plan is complete exactly when every step is
+ *           proven, which only PlanComplete's verified path reaches — so a
+ *           claimed step leaves the plan open, and the tools say which
+ *           steps still need proof. A record proven by assertion under an
+ *           earlier `off` run counts as below `proven` here, and so does a
+ *           `proven` record with no frozen proof (the store never writes one;
+ *           see `verifiedProven`).
+ *   off     no verification, for harnesses that keep no session event log
+ *           to resolve evidence against. PlanComplete / GoalUpdate `proven`
+ *           still demand cited toolUseIds (one token each, see the store's
+ *           `UNVERIFIED_TOOL_USE_ID_REGEX`), record them as UNVERIFIED refs
+ *           (never frozen proofs) and pin no session for retention.
+ *           PlanComplete emits `action_proof` with `verdict: "unverified"`;
+ *           GoalUpdate marks its `goal_update` `verification: "unverified"`
+ *           (`action_proof` is keyed by plan step). Every tool render says
+ *           `[proven (unverified)]`, never `[proven]`.
+ *
  * Pillar 3: plan/focus/ledger content is user-authored working state
  * (origin "user" semantics, like tool-memory writes) — recalled wiki/fact
  * content is what gets the new `memory` TrustOrigin, not this. All tools are
@@ -44,8 +76,12 @@ import {
   type Goal,
   type PlanRecord,
   type Requirement,
+  type UpdateGoalInput,
   createContinuityStore,
-  renderStatus,
+  isProvenByAssertion,
+  isProvenVerified,
+  renderLadderStatus,
+  renderUnverifiedRef,
 } from "@crewhaus/continuity-store";
 import type {
   ActionProofEventPayload,
@@ -89,6 +125,26 @@ export const PLAN_DIRTY_STATE_KEY = "plan.dirty";
 /** Structural view of `RuntimeBridge.runState` — no runtime-core import. */
 type RunStateLike = { set(partial: Record<string, unknown>): void };
 
+/**
+ * `continuity.proof` (design §2.4, enforced from design/0.8.0 §6.3) — how the
+ * tools treat the `proven` rung. See the module docblock for each mode.
+ */
+export type ProofMode = "ladder" | "require" | "off";
+
+export const PROOF_MODES: readonly ProofMode[] = ["ladder", "require", "off"];
+
+/** The lowered default, and the only behaviour before 0.8.0. */
+export const DEFAULT_PROOF_MODE: ProofMode = "ladder";
+
+/**
+ * Thrown under `proofMode: "require"` by an operation that would complete
+ * something below `proven`. The message teaches the proven path — the
+ * model's next call should be the proof, not a retry of the same claim.
+ */
+export class ProofRequiredError extends Error {
+  override readonly name = "ProofRequiredError";
+}
+
 export type CreatePlanToolsOptions = {
   readonly specName: string;
   readonly rootDir?: string;
@@ -103,6 +159,8 @@ export type CreatePlanToolsOptions = {
   /** Event-log append seam — see `AppendContinuityEvent`. */
   readonly appendEvent?: AppendContinuityEvent;
   readonly now?: () => Date;
+  /** `continuity.proof` — default {@link DEFAULT_PROOF_MODE} (`"ladder"`). */
+  readonly proofMode?: ProofMode;
 };
 
 export type PlanToolBundle = {
@@ -239,26 +297,194 @@ function renderPlan(plan: PlanRecord): string {
     lines.push("  (no steps yet — add some with PlanUpdate {action: 'add_step'})");
   }
   for (const step of plan.steps) {
-    const proofSuffix =
-      step.status === "proven" && step.proofs.length > 0
+    const proofSuffix = isProvenByAssertion(step)
+      ? ` — cited, not verified: ${(step.unverified ?? []).map((r) => r.toolUseId).join(", ")}`
+      : step.status === "proven" && step.proofs.length > 0
         ? ` — proof: ${step.proofs.map((p) => p.toolUseId).join(", ")}`
         : "";
-    lines.push(`  ${step.index}. ${renderStatus(step.status)} ${step.text}${proofSuffix}`);
+    lines.push(`  ${step.index}. ${renderLadderStatus(step)} ${step.text}${proofSuffix}`);
   }
   return lines.join("\n");
 }
 
+function progressOf(goal: Pick<Goal, "target" | "current" | "unit">): string {
+  return goal.target !== undefined
+    ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
+    : "";
+}
+
 function renderGoal(goal: Goal): string {
-  const progress =
-    goal.target !== undefined
-      ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
-      : "";
-  return `- ${goal.id} ${renderStatus(goal.status)} ${goal.title}${progress}`;
+  return `- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progressOf(goal)}`;
+}
+
+/**
+ * The `require`-mode reading of "achieved": progress at or past the target,
+ * with an unset `current` read as 0. That is how every surface shows a goal
+ * (`progressOf`, the handoff, the `<current_plan>` tail all print
+ * `current ?? 0`), and it is the Thredz goal mirror's completion rule
+ * (`currentValue >= targetValue`, `currentValue` defaulting to 0). So a
+ * `target: 0` goal is achieved the moment it exists.
+ */
+function atTarget(goal: { readonly target?: number; readonly current?: number }): boolean {
+  return goal.target !== undefined && (goal.current ?? 0) >= goal.target;
+}
+
+type LadderRecord = {
+  readonly status: string;
+  readonly unverified?: Goal["unverified"];
+  readonly proofs?: Goal["proofs"];
+};
+
+/** The `require` label for a `proven` record with no frozen proof. */
+const NO_PROOF_LABEL = "marked proven with no proof on record";
+
+/**
+ * `proven` with machine-checked evidence on record (the store's
+ * `isProvenVerified`). Under `require`, two kinds of `proven` record are
+ * below this, and complete nothing until a verified proof replaces them: one
+ * proven by assertion (an earlier `off` run), and one with no frozen proof at
+ * all. The store never writes the second — every verified transition freezes
+ * at least one proof — so it was edited into a file by hand, or read back
+ * from a step line that a multi-line plan title smuggled into a plan file
+ * before the store kept titles to one line. Nobody checked either.
+ */
+function verifiedProven(record: LadderRecord): boolean {
+  return isProvenVerified(record);
+}
+
+/** How a below-proven record names itself in a `require` refusal. */
+function belowProvenLabel(record: LadderRecord): string {
+  if (isProvenByAssertion(record)) return "proven (unverified)";
+  return record.status === "proven" ? NO_PROOF_LABEL : record.status;
+}
+
+/** `a`, `a or b`, `a, b or c`. */
+function orList(items: readonly string[]): string {
+  return items.length > 2
+    ? `${items.slice(0, -1).join(", ")} or ${items[items.length - 1]}`
+    : items.join(" or ");
+}
+
+/**
+ * Under `require`, the note a plan earns once nothing is left open or in
+ * progress while some step is still below proven: claimed, proven by
+ * assertion under an earlier `off` run, or marked proven with no proof on
+ * record (see {@link verifiedProven}). That is the moment a model is
+ * likeliest to believe the plan is done, and it is not: each such step still
+ * needs a verified proof. Null while the plan still has unstarted work (the
+ * claim is then plainly not the end) or once every step is proven.
+ */
+function incompletePlanNote(plan: PlanRecord): string | null {
+  if (plan.steps.some((s) => s.status === "open" || s.status === "in_progress")) return null;
+  const below = plan.steps.filter((s) => !verifiedProven(s));
+  if (below.length === 0) return null;
+  const present = new Set(below.map(belowProvenLabel));
+  const labels = orList(
+    ["claimed", "proven (unverified)", NO_PROOF_LABEL].filter((l) => present.has(l)),
+  );
+  const which =
+    below.length === 1
+      ? `step ${below[0]?.index} is ${labels}, not proven — prove it`
+      : `steps ${below.map((s) => s.index).join(", ")} are ${labels}, not proven — prove each`;
+  return `${plan.id} is not complete: ${which} with PlanComplete({step, evidence: [{toolUseId}]}) first.`;
+}
+
+/**
+ * The `require` refusal for a GoalWrite that would create a goal already at
+ * its target, or null when the goal starts below it.
+ */
+function goalWriteRefusal(input: {
+  readonly target?: number;
+  readonly current?: number;
+  readonly unit?: string;
+}): string | null {
+  if (input.target === undefined || !atTarget(input)) return null;
+  const progress = `${input.current ?? 0}/${input.target}${input.unit !== undefined ? ` ${input.unit}` : ""}`;
+  const head = `a new goal cannot start at its target (${progress}) under continuity.proof: require — that would mark it achieved without proof.`;
+  if (input.target > 0) {
+    return `${head} Create it without current (or below the target), then prove it with GoalUpdate({goalId, current: ${input.current}, status: "proven", evidence: [{toolUseId}]}).`;
+  }
+  // A target of 0 or below is met before any work: progress counts up from
+  // `current`, which reads as 0 when unset. Leaving out `current` cannot help.
+  return `${head} Progress counts up from current (0 when unset), so a target of ${input.target} is met before any work. Count up toward a positive target instead (for example, items done out of a total), or create the goal without a target and set it in the GoalUpdate that proves it: GoalUpdate({goalId, target: ${input.target}, status: "proven", evidence: [{toolUseId}]}).`;
+}
+
+/**
+ * The `require` refusal for a GoalUpdate whose RESULT (`next`, the record
+ * as written) sits at its target below a verified proof, or null. `input`
+ * supplies the fields the reply tells the model to resend with its proof.
+ */
+function goalUpdateRefusal(
+  goalId: string,
+  input: { readonly current?: number; readonly target?: number },
+  next: LadderRecord & Pick<Goal, "target" | "current" | "unit">,
+): string | null {
+  if (!atTarget(next) || verifiedProven(next)) return null;
+  const fields = [
+    ...(input.current !== undefined ? [`current: ${input.current}`] : []),
+    ...(input.target !== undefined ? [`target: ${input.target}`] : []),
+  ].join(", ");
+  const why = isProvenByAssertion(next)
+    ? `${goalId} is proven (unverified), which under continuity.proof: require is not proven — reaching its target${progressOf(next)} would mark it achieved. Prove it again in the same call, with verified evidence`
+    : `${goalId} is ${belowProvenLabel(next)}, not proven — reaching its target${progressOf(next)} would mark it achieved. Prove it in the same call`;
+  return `${why}: GoalUpdate({goalId: "${goalId}", ${fields}, status: "proven", evidence: [{toolUseId}]}), citing the call that measured it.`;
 }
 
 function renderRequirement(req: Requirement): string {
   return `- ${req.id} [${req.status}] ${JSON.stringify(req.text)} (user, ${req.source.sessionId}, turn ${req.source.turn})`;
 }
+
+// ---------------------------------------------------------------------------
+// per-mode descriptions — the ladder strings are the pre-0.8.0 bytes
+// ---------------------------------------------------------------------------
+
+const PLAN_READ_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "Read a plan's numbered steps with their proof-ladder statuses. 'claimed' steps are rendered as unverified — only 'proven' steps have machine-checked evidence. Omit planId for the active plan.",
+  require:
+    "Read a plan's numbered steps with their proof-ladder statuses. 'claimed' steps are rendered as unverified — only 'proven' steps have machine-checked evidence, and a plan is complete only when every step is proven. Omit planId for the active plan.",
+  off: "Read a plan's numbered steps with their proof-ladder statuses. Proof checking is off in this harness: 'claimed' and 'proven (unverified)' steps are both the model's own account, and nothing is machine-checked. Omit planId for the active plan.",
+};
+
+const PLAN_UPDATE_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "Mutate the persisted plan: create a plan, add a step, move a step's ladder status (open → in_progress → claimed), or set the active plan. 'claimed' records progress WITHOUT verification — the 'proven' transition goes through PlanComplete with evidence.",
+  require:
+    "Mutate the persisted plan: create a plan, add a step, move a step's ladder status (open → in_progress → claimed), or set the active plan. 'claimed' records progress WITHOUT verification and completes nothing — a step is done only once PlanComplete proves it with evidence.",
+  off: "Mutate the persisted plan: create a plan, add a step, move a step's ladder status (open → in_progress → claimed), or set the active plan. 'claimed' records progress; the 'proven' transition goes through PlanComplete, which in this harness records the cited evidence without checking it.",
+};
+
+const PLAN_COMPLETE_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "The proven transition (machine-checked): mark a plan step proven by citing the toolUseId(s) of the calls that did the work. Each id is resolved against the session event logs (child sessions included); missing or errored results are rejected. Do the work first, then complete the step.",
+  require:
+    "The proven transition (machine-checked): mark a plan step proven by citing the toolUseId(s) of the calls that did the work. Each id is resolved against the session event logs (child sessions included); missing or errored results are rejected. This is the ONLY way a step completes — 'claimed' never counts as done. Do the work first, then complete the step.",
+  off: "Mark a plan step proven by citing the toolUseId(s) of the calls that did the work. Proof checking is off in this harness: the ids are RECORDED as unverified refs, not resolved against an event log, and the step reads 'proven (unverified)'. Cite only calls you actually ran. Do the work first, then complete the step.",
+};
+
+const GOAL_WRITE_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "Create a persisted goal ({title, target?, current?, unit?}) in goals.yaml. Goals carry the same open → in_progress → claimed → proven ladder as plan steps.",
+  require:
+    "Create a persisted goal ({title, target?, current?, unit?}) in goals.yaml. Goals carry the same open → in_progress → claimed → proven ladder as plan steps, and reach their target only as proven — create a goal below its target, then prove it with GoalUpdate.",
+  off: "Create a persisted goal ({title, target?, current?, unit?}) in goals.yaml. Goals carry the same open → in_progress → claimed → proven ladder as plan steps.",
+};
+
+const GOAL_UPDATE_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "Update a goal: title, target/current progress, or ladder status. 'claimed' is free; 'proven' requires evidence [{toolUseId}] verified against the session event logs, exactly like PlanComplete.",
+  require:
+    "Update a goal: title, target/current progress, or ladder status. 'claimed' is free; 'proven' requires evidence [{toolUseId}] verified against the session event logs, exactly like PlanComplete. A goal reaches its target only as proven: set current to the target in the same call as status 'proven' with evidence.",
+  off: "Update a goal: title, target/current progress, or ladder status. 'claimed' is free; 'proven' requires evidence [{toolUseId}], which this harness records WITHOUT checking it (the goal reads 'proven (unverified)').",
+};
+
+const GOAL_LIST_DESCRIPTION: Record<ProofMode, string> = {
+  ladder:
+    "List persisted goals with ladder statuses and progress. 'claimed' goals are rendered as unverified.",
+  require:
+    "List persisted goals with ladder statuses and progress. 'claimed' goals are rendered as unverified.",
+  off: "List persisted goals with ladder statuses and progress. 'claimed' and 'proven (unverified)' goals are both unchecked.",
+};
 
 /** Thrown when a plan-scoped call has neither a planId nor an active plan. */
 export class NoActivePlanError extends Error {
@@ -275,6 +501,15 @@ export class NoActivePlanError extends Error {
  * `for (const t of bundle.all) defaultCatalog.register(t)`).
  */
 export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
+  const proofMode: ProofMode = opts.proofMode ?? DEFAULT_PROOF_MODE;
+  // A hand-built fragment can carry any string; a typo'd mode must not
+  // quietly become the ladder (the spec schema rejects it at compile time —
+  // this is the same refusal for callers that skip the compiler).
+  if (!PROOF_MODES.includes(proofMode)) {
+    throw new Error(
+      `createPlanTools: proofMode "${String(proofMode)}" is not one of ${PROOF_MODES.join(" | ")}.`,
+    );
+  }
   const store: ContinuityStore =
     opts.store ??
     createContinuityStore({
@@ -368,8 +603,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const planRead: RegisteredTool = buildTool({
     name: "PlanRead",
-    description:
-      "Read a plan's numbered steps with their proof-ladder statuses. 'claimed' steps are rendered as unverified — only 'proven' steps have machine-checked evidence. Omit planId for the active plan.",
+    description: PLAN_READ_DESCRIPTION[proofMode],
     inputSchema: planReadSchema,
     readOnly: true,
     execute: async (input) => {
@@ -393,8 +627,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const planUpdate: RegisteredTool = buildTool({
     name: "PlanUpdate",
-    description:
-      "Mutate the persisted plan: create a plan, add a step, move a step's ladder status (open → in_progress → claimed), or set the active plan. 'claimed' records progress WITHOUT verification — the 'proven' transition goes through PlanComplete with evidence.",
+    description: PLAN_UPDATE_DESCRIPTION[proofMode],
     inputSchema: planUpdateSchema,
     destructive: true, // audit-and-allow (§7.4): a judge call per routine plan update would drown the loop
     execute: async (input, ctx) => {
@@ -423,7 +656,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
         }
         case "set_step_status": {
           const planId = await resolvePlanId(input.planId);
-          await store.setStepStatus(planId, input.step, input.status);
+          const plan = await store.setStepStatus(planId, input.step, input.status);
           await emit({
             kind: "plan_update",
             payload: {
@@ -435,6 +668,14 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             },
           });
           markPlanDirty(ctx);
+          if (proofMode === "require" && input.status === "claimed") {
+            // `claimed` stays settable under require — it is honest progress
+            // — but the reply says plainly that it completes nothing.
+            const note = incompletePlanNote(plan);
+            return `${planId} step ${input.step} → claimed (unverified — under continuity.proof: require it completes nothing; prove it with PlanComplete({step: ${input.step}, evidence: [{toolUseId}]}))${
+              note !== null ? `\n${note}` : ""
+            }`;
+          }
           return `${planId} step ${input.step} → ${input.status}${
             input.status === "claimed" ? " (unverified — prove it with PlanComplete)" : ""
           }`;
@@ -454,8 +695,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const planComplete: RegisteredTool = buildTool({
     name: "PlanComplete",
-    description:
-      "The proven transition (machine-checked): mark a plan step proven by citing the toolUseId(s) of the calls that did the work. Each id is resolved against the session event logs (child sessions included); missing or errored results are rejected. Do the work first, then complete the step.",
+    description: PLAN_COMPLETE_DESCRIPTION[proofMode],
     inputSchema: planCompleteSchema,
     destructive: true,
     execute: async (input, ctx) => {
@@ -469,6 +709,48 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             ? { sessionId }
             : {}),
       }));
+      if (proofMode === "off") {
+        // design/0.8.0 §6.3 — no verification: the step is proven by
+        // assertion, the citations are recorded unresolved, no session is
+        // pinned, and the audit trail says `unverified`, never `verified`.
+        const plan = await store.proveStep(planId, input.step, refs, {
+          verification: "unverified",
+        });
+        const step = plan.steps.find((s) => s.index === input.step);
+        if (step === undefined || !isProvenByAssertion(step)) {
+          // The store kept an earlier machine-checked proof rather than
+          // downgrade it — nothing new was recorded, so nothing is emitted.
+          return `${planId} step ${input.step} is already proven with verified evidence — nothing recorded.`;
+        }
+        const cited = new Set(refs.map((r) => r.toolUseId));
+        const recorded = (step.unverified ?? []).filter((r) => cited.has(r.toolUseId));
+        for (const ref of recorded) {
+          await emit({
+            kind: "action_proof",
+            payload: {
+              planId,
+              step: input.step,
+              toolUseId: ref.toolUseId,
+              verdict: "unverified",
+              ...identityOf(ctx),
+            },
+          });
+        }
+        await emit({
+          kind: "plan_update",
+          payload: {
+            planId,
+            action: "prove_step",
+            step: input.step,
+            status: "proven",
+            ...identityOf(ctx),
+          },
+        });
+        markPlanDirty(ctx);
+        return `${planId} step ${input.step} proven (unverified) — continuity.proof is off, so the evidence was recorded, not checked: ${recorded
+          .map(renderUnverifiedRef)
+          .join(", ")}`;
+      }
       try {
         const plan = await store.proveStep(planId, input.step, refs);
         const step = plan.steps.find((s) => s.index === input.step);
@@ -497,9 +779,14 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
           },
         });
         markPlanDirty(ctx);
-        return `${planId} step ${input.step} proven — evidence: ${refs
+        const reply = `${planId} step ${input.step} proven — evidence: ${refs
           .map((r) => r.toolUseId)
           .join(", ")}`;
+        // Under require, proving the last open step of a plan whose other
+        // steps are claimed (or proven only by assertion) does not finish
+        // it; say which steps still need a verified proof.
+        const note = proofMode === "require" ? incompletePlanNote(plan) : null;
+        return note !== null ? `${reply}\n${note}` : reply;
       } catch (err) {
         if (err instanceof EvidenceError) {
           // Audit the rejected attempt too — proof pressure is signal.
@@ -521,11 +808,14 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const goalWrite: RegisteredTool = buildTool({
     name: "GoalWrite",
-    description:
-      "Create a persisted goal ({title, target?, current?, unit?}) in goals.yaml. Goals carry the same open → in_progress → claimed → proven ladder as plan steps.",
+    description: GOAL_WRITE_DESCRIPTION[proofMode],
     inputSchema: goalWriteSchema,
     destructive: true,
     execute: async (input, ctx) => {
+      // A new goal's record comes from the input alone, so checking the
+      // input is checking the record (no lock needed, unlike GoalUpdate).
+      const refusal = proofMode === "require" ? goalWriteRefusal(input) : null;
+      if (refusal !== null) throw new ProofRequiredError(refusal);
       const goal = await store.writeGoal({
         title: input.title,
         ...(input.target !== undefined ? { target: input.target } : {}),
@@ -543,8 +833,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const goalUpdate: RegisteredTool = buildTool({
     name: "GoalUpdate",
-    description:
-      "Update a goal: title, target/current progress, or ladder status. 'claimed' is free; 'proven' requires evidence [{toolUseId}] verified against the session event logs, exactly like PlanComplete.",
+    description: GOAL_UPDATE_DESCRIPTION[proofMode],
     inputSchema: goalUpdateSchema,
     destructive: true,
     execute: async (input, ctx) => {
@@ -557,20 +846,68 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
             ? { sessionId }
             : {}),
       }));
-      const goal = await store.updateGoal(input.goalId, {
+      // `require`: the store's one completion path below proven is progress
+      // reaching the target (the Thredz mirror completes the goal on it), so
+      // an update that moves progress is refused when the goal would end up
+      // at its target without a verified proof. Only progress moves are
+      // policed: a title edit on a goal already sitting at its target
+      // completes nothing new.
+      const guarded =
+        proofMode === "require" && (input.current !== undefined || input.target !== undefined);
+      const refuseUnproven = (next: Parameters<typeof goalUpdateRefusal>[2]): void => {
+        const why = goalUpdateRefusal(input.goalId, input, next);
+        if (why !== null) throw new ProofRequiredError(why);
+      };
+      if (guarded) {
+        // Early refusal on a snapshot, before any evidence is resolved; it
+        // holds whatever store wrapper is in use. The authoritative check is
+        // the store guard below, which sees the record as written under the
+        // lock, so two sessions cannot each pass on a stale read. An unknown
+        // id falls through to the store's own "no goal" error.
+        const existing = (await store.listGoals()).find((g) => g.id === input.goalId);
+        // A call that sets `proven` resolves its evidence (require is the
+        // ladder there), so it lands verified — with a frozen proof,
+        // replacing any assertion — or not at all; the snapshot has nothing
+        // to refuse in it.
+        if (existing !== undefined && input.status !== "proven") {
+          refuseUnproven({
+            status: input.status ?? existing.status,
+            unverified: existing.unverified,
+            proofs: existing.proofs,
+            target: input.target ?? existing.target,
+            current: input.current ?? existing.current,
+            unit: input.unit ?? existing.unit,
+          });
+        }
+      }
+      const patch: UpdateGoalInput = {
         ...(input.title !== undefined ? { title: input.title } : {}),
         ...(input.status !== undefined ? { status: input.status } : {}),
         ...(input.target !== undefined ? { target: input.target } : {}),
         ...(input.current !== undefined ? { current: input.current } : {}),
         ...(input.unit !== undefined ? { unit: input.unit } : {}),
         ...(evidence !== undefined ? { evidence } : {}),
-      });
+      };
+      // `off` records a proven goal's evidence unresolved (design/0.8.0
+      // §6.3); `require` hands the store its at-target guard; the ladder
+      // makes the exact pre-0.8.0 call.
+      const goal =
+        proofMode === "off"
+          ? await store.updateGoal(input.goalId, patch, { verification: "unverified" })
+          : guarded
+            ? await store.updateGoal(input.goalId, patch, { guard: (next) => refuseUnproven(next) })
+            : await store.updateGoal(input.goalId, patch);
+      // `action_proof` is keyed by plan step, so a goal proven by assertion
+      // is marked on its own `goal_update` instead: the log must not show it
+      // the way it shows a verified goal proof.
+      const asserted = input.status === "proven" && isProvenByAssertion(goal);
       await emit({
         kind: "goal_update",
         payload: {
           goalId: goal.id,
           action: "update",
           ...(input.status !== undefined ? { status: input.status } : {}),
+          ...(asserted ? { verification: "unverified" as const } : {}),
           ...identityOf(ctx),
         },
       });
@@ -581,8 +918,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const goalList: RegisteredTool = buildTool({
     name: "GoalList",
-    description:
-      "List persisted goals with ladder statuses and progress. 'claimed' goals are rendered as unverified.",
+    description: GOAL_LIST_DESCRIPTION[proofMode],
     inputSchema: goalListSchema,
     readOnly: true,
     execute: async () => {

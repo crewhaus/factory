@@ -3,11 +3,13 @@
  * from store state at teardown with NO model call — same inputs, identical
  * bytes (the determinism is test-pinned). It renders what session 2 needs to
  * pick up: current focus, the active plan's steps with claimed-vs-proven
- * marked DISTINCTLY (a claim is never conflated with a machine-verified ✓),
- * open goals, unresolved requirements, derived next actions, and the last
- * session id.
+ * marked DISTINCTLY (a claim is never conflated with a machine-verified ✓,
+ * and a step proven without verification under `continuity.proof: off`
+ * renders `[proven (unverified)]`, never `[proven]`), open goals, unresolved
+ * requirements, derived next actions, and the last session id.
  */
-import type { Goal, PlanRecord, Requirement } from "./types";
+import type { FrozenProof } from "./evidence";
+import type { Goal, PlanRecord, Requirement, UnverifiedRef } from "./types";
 
 export const HANDOFF_MARKER = "<!-- crewhaus:handoff -->";
 
@@ -29,17 +31,80 @@ export function renderStatus(status: string): string {
   return status === "claimed" ? "[claimed — unverified]" : `[${status}]`;
 }
 
+/** The label a proven-by-assertion record renders with (design/0.8.0 §6.3):
+ *  `continuity.proof: off` still says `proven`, but never the way a
+ *  machine-checked `[proven]` says it. */
+export const PROVEN_UNVERIFIED_LABEL = "[proven (unverified)]";
+
+/**
+ * True when a record's `proven` status came from a transition that skipped
+ * verification (`continuity.proof: off`) — it carries the refs it cited as
+ * {@link UnverifiedRef}s and no verified transition has superseded them.
+ */
+export function isProvenByAssertion(record: {
+  readonly status: string;
+  readonly unverified?: readonly UnverifiedRef[];
+}): boolean {
+  return record.status === "proven" && (record.unverified?.length ?? 0) > 0;
+}
+
+/**
+ * True when a record's `proven` status is backed by machine-checked evidence
+ * ON RECORD: not proven by assertion, and carrying at least one frozen proof.
+ * Every verified transition freezes one, so a `proven` record with none was
+ * written outside the store's API — a hand edit, or a step line that a
+ * multi-line plan title smuggled into a plan file before titles were kept to
+ * one line — and nothing checked it. Renders still show it as `[proven]`
+ * (the ladder's bytes are unchanged), but `continuity.proof: require` counts
+ * it below proven and an unverified transition may replace it (design/0.8.0
+ * §6.3).
+ */
+export function isProvenVerified(record: {
+  readonly status: string;
+  readonly unverified?: readonly UnverifiedRef[];
+  readonly proofs?: readonly FrozenProof[];
+}): boolean {
+  return (
+    record.status === "proven" && !isProvenByAssertion(record) && (record.proofs?.length ?? 0) > 0
+  );
+}
+
+/**
+ * {@link renderStatus} for a whole step or goal record: identical to it for
+ * every record the ladder wrote, and {@link PROVEN_UNVERIFIED_LABEL} for one
+ * proven by assertion — so "the log proves X ran" and "the model said X ran
+ * and nobody checked" stay as distinct as claimed and proven (design §2.4,
+ * design/0.8.0 §6.3).
+ */
+export function renderLadderStatus(record: {
+  readonly status: string;
+  readonly unverified?: readonly UnverifiedRef[];
+}): string {
+  return isProvenByAssertion(record) ? PROVEN_UNVERIFIED_LABEL : renderStatus(record.status);
+}
+
+/** `tu_x (sess_…)` — or the bare id when the citation named no session. */
+export function renderUnverifiedRef(ref: UnverifiedRef): string {
+  return ref.sessionId !== undefined ? `${ref.toolUseId} (${ref.sessionId})` : ref.toolUseId;
+}
+
 function renderStepLine(step: PlanRecord["steps"][number]): string {
-  const proofSuffix =
-    step.status === "proven" && step.proofs.length > 0
+  const proofSuffix = isProvenByAssertion(step)
+    ? ` — cited, not verified: ${(step.unverified ?? []).map(renderUnverifiedRef).join(", ")}`
+    : step.status === "proven" && step.proofs.length > 0
       ? ` — proof: ${step.proofs.map((p) => `${p.toolUseId} (${p.sessionId})`).join(", ")}`
       : "";
-  return `${step.index}. ${renderStatus(step.status)} ${step.text}${proofSuffix}`;
+  return `${step.index}. ${renderLadderStatus(step)} ${step.text}${proofSuffix}`;
 }
 
 function planSummary(plan: PlanRecord): string {
   const proven = plan.steps.filter((s) => s.status === "proven").length;
-  return `${plan.id} — ${plan.title} (${proven}/${plan.steps.length} steps proven)`;
+  // Proven-by-assertion steps still count as proven (that is what `off`
+  // means), but the summary says how many of them nobody checked. Absent on
+  // every ladder plan, so its bytes are unchanged.
+  const unverified = plan.steps.filter(isProvenByAssertion).length;
+  const unverifiedNote = unverified > 0 ? `, ${unverified} unverified` : "";
+  return `${plan.id} — ${plan.title} (${proven}/${plan.steps.length} steps proven${unverifiedNote})`;
 }
 
 function renderGoalLine(goal: Goal): string {
@@ -47,7 +112,7 @@ function renderGoalLine(goal: Goal): string {
     goal.target !== undefined
       ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
       : "";
-  return `- ${goal.id} ${renderStatus(goal.status)} ${goal.title}${progress}`;
+  return `- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progress}`;
 }
 
 function renderRequirementLine(req: Requirement): string {

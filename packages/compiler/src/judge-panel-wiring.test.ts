@@ -70,15 +70,15 @@ describe("PR 13b — nothing this PR wires is dropped any more", () => {
 
   test("the panel knobs and the judge profile's params reach the emitted cli bundle", () => {
     const agent = compile(EVERYTHING, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
-    expect(agent).toContain(
-      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
-    );
-    expect(agent).toContain('judges: ["claude-sonnet-4-6", "claude-opus-4-8"],');
-    expect(agent).toContain("repeats: 3,");
-    expect(agent).toContain("temperature: 0.2,");
-    expect(agent).toContain('target: "transcript",');
-    // The `judges` panel names the INSTRUMENT declaratively too.
-    expect(agent).toContain('judgeModel: "claude-sonnet-4-6+claude-opus-4-8",');
+    // 0.8.0 §4.4 — the panel rides the lowered block into the gate
+    // composition root (`wireEvaluation`), which grades through
+    // `gradeWithJudgePanel` and names the instrument from `judges`
+    // (pinned in @crewhaus/evaluation-service's own tests).
+    expect(agent).toContain('import { wireEvaluation } from "@crewhaus/evaluation-service";');
+    expect(agent).toContain('"judges":["claude-sonnet-4-6","claude-opus-4-8"]');
+    expect(agent).toContain('"repeats":3');
+    expect(agent).toContain('"temperature":0.2');
+    expect(agent).toContain('"target":"transcript"');
     // §4.2 — the compaction slot's profile params ride beside its model.
     expect(agent).toContain('compactionModel: "claude-sonnet-4-6",');
     expect(agent).toContain('compactionParams: {"thinking":{"effort":"low"},"maxTokens":512},');
@@ -102,15 +102,17 @@ describe("PR 13b — nothing this PR wires is dropped any more", () => {
       "  grader: { type: llm_judge, criteria: helpful }",
     ].join("\n");
     const agent = compile(plain, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
-    // The panel call carries exactly one field beyond the run: the model.
+    // The grader carries its criteria and nothing else; the judge model is
+    // the primary the fragment names (0.8.0 §4.4 — `wireEvaluation` defaults
+    // it exactly as the inline grader did).
     expect(agent).toContain(
-      '      run: inLoopRunResult({ finalText, messages, isSynthetic }),\n      model: "claude-sonnet-4-6",\n      // Judge spend rides',
+      '"primaryModel":"claude-sonnet-4-6","evaluation":{"grader":{"type":"llm_judge","criteria":"helpful"},',
     );
-    expect(agent).not.toContain("judges:");
-    expect(agent).not.toContain("repeats:");
-    expect(agent).not.toContain("temperature:");
-    expect(agent).not.toContain('target: "');
-    expect(agent).not.toContain("params:");
+    expect(agent).not.toContain('"judges"');
+    expect(agent).not.toContain('"repeats"');
+    expect(agent).not.toContain('"temperature"');
+    expect(agent).not.toContain('"target"');
+    expect(agent).not.toContain('"params"');
     expect(agent).not.toContain("compactionParams");
   });
 });

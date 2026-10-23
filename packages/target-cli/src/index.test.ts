@@ -2,6 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  type EvaluationFragment,
+  evaluationFragmentFromIr,
+  registerGateTools,
+  wireEvaluation,
+} from "@crewhaus/evaluation-service";
 import type { IrV0 } from "@crewhaus/ir";
 import { type MemoryWiringFragment, wireMemory } from "@crewhaus/memory-service";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -1403,155 +1409,284 @@ describe("emitCli — learning block (v0.3.0 §3.3, PR 17)", () => {
   });
 });
 
-describe("emitCli — evaluation block (loop contract 0.4, Batch B, G02)", () => {
-  test("llm_judge: emits the eval-judge wiring with the explicit judge model", () => {
-    const content =
-      emitCli(
-        baseIr({
-          evaluation: {
-            grader: {
-              type: "llm_judge",
-              criteria: "answers cite a source",
-              model: "claude-haiku-4-5",
-            },
-            threshold: 0.8,
-            onFail: "retry",
-            maxRetries: 2,
-          },
-        }),
-      ).files[0]?.content ?? "";
-    expect(content).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
+/** The JSON fragment an emitted `wireEvaluation(<fragment>, …)` boot line carries. */
+function emittedGateFragment(content: string): EvaluationFragment {
+  const head = "const __gates = await wireEvaluation(";
+  const line = content.split("\n").find((l) => l.startsWith(head)) ?? "";
+  return JSON.parse(line.slice(head.length, line.lastIndexOf(", { cwd:"))) as EvaluationFragment;
+}
+
+type RunEvaluation = NonNullable<Awaited<ReturnType<typeof wireEvaluation>>["evaluation"]>;
+
+/** A completed turn for a deterministic grader (which never reads the bus). */
+const gateTurn = (finalText: string): Parameters<RunEvaluation["evaluate"]>[0] => ({
+  finalText,
+  messages: [],
+  usage: { input: 0, output: 0 },
+  bus: {} as Parameters<RunEvaluation["evaluate"]>[0]["bus"],
+});
+
+describe("emitCli — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 evaluation-service)", () => {
+  const LLM_JUDGE: IrV0["evaluation"] = {
+    grader: {
+      type: "llm_judge",
+      criteria: "answers cite a source",
+      model: "claude-haiku-4-5",
+    },
+    threshold: 0.8,
+    onFail: "retry",
+    maxRetries: 2,
+  };
+
+  test("evaluation: ONE wireEvaluation call carrying the lowered block, threaded into runChatLoop", () => {
+    const ir = baseIr({ evaluation: LLM_JUDGE });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    expect(content).toContain('import { wireEvaluation } from "@crewhaus/evaluation-service";');
     expect(content).toContain(
-      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
+      `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(ir))}, { cwd: process.cwd() });`,
     );
-    expect(content).toContain("const __evaluation: RunEvaluation = {");
-    expect(content).toContain('graderType: "llm_judge",');
-    // 0.6.0 §6.2 (PR 13) — the judge model is stated declaratively beside the
-    // closure so the pool's per-arm quality lineage can fold it.
-    expect(content).toContain('judgeModel: "claude-haiku-4-5",');
-    expect(content).toContain("threshold: 0.8,");
-    expect(content).toContain('onFail: "retry",');
-    expect(content).toContain("maxRetries: 2,");
-    // the evaluate fn scores through createJudgeGrader on the resolved judge model
-    expect(content).toContain('model: "claude-haiku-4-5",');
-    expect(content).toContain('description: "answers cite a source",');
-    // 0.6.0 §6.2 — the evaluate fn receives the RUN bus and hands it to the
-    // judge, so judge spend is priced and budget-metered; the judge's wire
-    // model + priced spend ride back on the verdict for eval_graded.
-    expect(content).toContain("evaluate: async ({ finalText, messages, isSynthetic, bus }) => {");
-    expect(content).toContain("const __verdict = await gradeWithJudgePanel({");
-    // 0.6.0 PR 13b — the turn's own conversation becomes the graded
-    // `RunResult`, so `target: transcript` sees the trajectory.
-    expect(content).toContain("run: inLoopRunResult({ finalText, messages, isSynthetic }),");
-    expect(content).toContain("      bus,\n    });");
-    expect(content).toContain("model: __verdict.judgeModel,");
-    expect(content).toContain(
-      "...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),",
-    );
-    // A3 — an abstaining judge scores 0 (never passes the threshold as a
-    // nominal best-estimate guess); the grader already returns score 0 with a
-    // "judge abstained (…)" rationale, so the site returns it verbatim.
-    expect(content).toContain("score: __verdict.score,");
-    expect(content).toContain("rationale: __verdict.rationale,");
-    // and the option is threaded into runChatLoop
-    expect(content).toContain("evaluation: __evaluation,");
+    expect(content).toContain("\n    evaluation: __gates.evaluation,");
+    // No grader of its own any more: the composition root builds it.
+    expect(content).not.toContain("__evaluation");
+    expect(content).not.toContain("gradeWithJudgePanel");
+    expect(content).not.toContain("@crewhaus/eval-judge");
+    expect(content).not.toContain("import type { RunEvaluation }");
+    // An evaluation-only gate registers no tools and names no footer target.
+    expect(content).not.toContain("__gates.tools");
+    expect(content).not.toContain("footerTarget");
+    expect(content).not.toContain("provability");
   });
 
-  test("llm_judge: the judge model defaults to the shape's primary model", () => {
+  test("the emitted fragment is exactly evaluationFragmentFromIr(ir), knobs included", () => {
+    const ir = baseIr({
+      evaluation: {
+        grader: {
+          type: "llm_judge",
+          criteria: "c",
+          judges: ["claude-sonnet-4-6", "claude-opus-4-8"],
+          repeats: 3,
+          temperature: 0.2,
+          target: "transcript",
+          params: { maxTokens: 512 },
+        },
+        threshold: 0.9,
+        onFail: "escalate",
+        maxRetries: 1,
+        escalateTo: "strong",
+      },
+    });
+    const fragment = emittedGateFragment(emitCli(ir).files[0]?.content ?? "");
+    expect(fragment).toEqual(evaluationFragmentFromIr(ir) as EvaluationFragment);
+    expect(fragment.primaryModel).toBe("claude-sonnet-4-6");
+  });
+
+  test("criteria with quotes / newlines / template delimiters are JSON-escaped into the literal", () => {
+    const criteria = 'say "yes"\nthen stop`${globalThis.x = 1}`';
     const content =
       emitCli(
         baseIr({
           evaluation: {
-            grader: { type: "llm_judge", criteria: "be kind" },
+            grader: { type: "llm_judge", criteria },
             threshold: 0.7,
             onFail: "retry",
             maxRetries: 1,
           },
         }),
       ).files[0]?.content ?? "";
-    expect(content).toContain('model: "claude-sonnet-4-6",');
-    expect(content).toContain('description: "be kind",');
+    expect(content).not.toContain("\nthen stop");
+    const fragment = emittedGateFragment(content);
+    expect(
+      fragment.evaluation?.grader.type === "llm_judge" && fragment.evaluation.grader.criteria,
+    ).toBe(criteria);
   });
 
-  test("llm_judge: the default threshold 0.7 is honored when the IR omits it", () => {
-    const content =
-      emitCli(
-        baseIr({
-          evaluation: {
-            grader: { type: "llm_judge", criteria: "be kind" },
-            onFail: "retry",
-            maxRetries: 1,
-          },
-        }),
-      ).files[0]?.content ?? "";
-    expect(content).toContain("threshold: 0.7,");
+  test("behaviour: each grader type, run from the EMITTED fragment, scores as the inline grader did", async () => {
+    const contains = baseIr({
+      evaluation: { grader: { type: "contains", value: "DONE" }, onFail: "halt", maxRetries: 3 },
+    });
+    const regex = baseIr({
+      evaluation: {
+        grader: { type: "regex", value: "\\d{3}-\\d{4}" },
+        onFail: "note",
+        maxRetries: 1,
+      },
+    });
+    const judge = baseIr({ evaluation: LLM_JUDGE });
+    const wired = async (ir: IrV0) =>
+      (
+        await wireEvaluation(emittedGateFragment(emitCli(ir).files[0]?.content ?? ""), {
+          cwd: "/tmp",
+        })
+      ).evaluation as RunEvaluation;
+
+    const c = await wired(contains);
+    expect([c.graderType, c.threshold, c.onFail, c.maxRetries]).toEqual(["contains", 1, "halt", 3]);
+    expect(await c.evaluate(gateTurn("all DONE"))).toEqual({
+      score: 1,
+      rationale: 'output contains "DONE"',
+    });
+    expect(await c.evaluate(gateTurn("no"))).toEqual({
+      score: 0,
+      rationale: 'output missing "DONE"',
+    });
+
+    const r = await wired(regex);
+    expect([r.graderType, r.threshold, r.onFail]).toEqual(["regex", 1, "note"]);
+    expect(await r.evaluate(gateTurn("555-1234"))).toEqual({
+      score: 1,
+      rationale: "output matches /\\d{3}-\\d{4}/",
+    });
+    expect((await r.evaluate(gateTurn("555-1234"))).score).toBe(1);
+    expect(await r.evaluate(gateTurn("none"))).toEqual({
+      score: 0,
+      rationale: "output does not match /\\d{3}-\\d{4}/",
+    });
+
+    const j = await wired(judge);
+    expect([j.graderType, j.threshold, j.onFail, j.maxRetries, j.judgeModel]).toEqual([
+      "llm_judge",
+      0.8,
+      "retry",
+      2,
+      "claude-haiku-4-5",
+    ]);
+    // The judge defaults to the primary when the spec names none.
+    const defaulted = await wired(
+      baseIr({
+        evaluation: {
+          grader: { type: "llm_judge", criteria: "be kind" },
+          onFail: "retry",
+          maxRetries: 1,
+        },
+      }),
+    );
+    expect(defaulted.judgeModel).toBe("claude-sonnet-4-6");
+    expect(defaulted.threshold).toBe(0.7);
   });
 
-  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
-    const content =
-      emitCli(
-        baseIr({
-          evaluation: {
-            grader: { type: "contains", value: "DONE" },
-            onFail: "halt",
-            maxRetries: 3,
-          },
-        }),
-      ).files[0]?.content ?? "";
-    expect(content).not.toContain("@crewhaus/eval-judge");
-    expect(content).toContain('graderType: "contains",');
-    expect(content).toContain("threshold: 1,");
-    expect(content).toContain('finalText.includes("DONE")');
-    expect(content).toContain('{ score: 1, rationale: "output contains \\"DONE\\"" }');
-    expect(content).toContain('{ score: 0, rationale: "output missing \\"DONE\\"" }');
-    expect(content).toContain('onFail: "halt",');
-    expect(content).toContain("maxRetries: 3,");
-    expect(content).toContain("evaluation: __evaluation,");
-  });
-
-  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
-    const content =
-      emitCli(
-        baseIr({
-          evaluation: {
-            grader: { type: "regex", value: "\\d{3}-\\d{4}" },
-            onFail: "note",
-            maxRetries: 1,
-          },
-        }),
-      ).files[0]?.content ?? "";
-    expect(content).not.toContain("@crewhaus/eval-judge");
-    expect(content).toContain('const __evalRegex = new RegExp("\\\\d{3}-\\\\d{4}");');
-    expect(content).toContain('graderType: "regex",');
-    expect(content).toContain("threshold: 1,");
-    expect(content).toContain("__evalRegex.lastIndex = 0;");
-    expect(content).toContain("__evalRegex.test(finalText)");
-    expect(content).toContain('onFail: "note",');
-    expect(content).toContain("evaluation: __evaluation,");
-  });
-
-  test("criteria with quotes/newlines are escaped into the generated source", () => {
-    const content =
-      emitCli(
-        baseIr({
-          evaluation: {
-            grader: { type: "llm_judge", criteria: 'say "yes"\nthen stop' },
-            threshold: 0.7,
-            onFail: "retry",
-            maxRetries: 1,
-          },
-        }),
-      ).files[0]?.content ?? "";
-    expect(content).toContain('description: "say \\"yes\\"\\nthen stop"');
-    expect(content).not.toContain('\nthen stop"');
-  });
-
-  test("no evaluation block → no evaluation wiring anywhere (byte-identity guard)", () => {
+  test("no gate block → no gate wiring anywhere (byte-identity guard)", () => {
     const content = emitCli(baseIr()).files[0]?.content ?? "";
     expect(content).not.toContain("evaluation:");
-    expect(content).not.toContain("__evaluation");
+    expect(content).not.toContain("__gates");
+    expect(content).not.toContain("@crewhaus/evaluation-service");
     expect(content).not.toContain("@crewhaus/eval-judge");
-    expect(content).not.toContain("__evalRegex");
+    expect(
+      emitCli(baseIr({ evaluation: undefined, provability: undefined })).files[0]?.content,
+    ).toBe(content);
+  });
+});
+
+describe("emitCli — provability (0.8.0 §8: wired on cli)", () => {
+  const PROV = (level: "grounded" | "checked" | "proven" = "grounded") => ({
+    level,
+    onFail: "retry" as const,
+    maxRetries: 1,
+    threshold: 1,
+    scope: "session" as const,
+    assumptions: "allow" as const,
+    render: "footer" as const,
+    sources: { allow: [], deny: [], bibliographic: false, resolve: "off" as const },
+    grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+    execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+    formal: {
+      checkers: ["builtin" as const, "smt" as const],
+      forbid: ["sorry"],
+      timeoutMs: 30_000,
+    },
+  });
+
+  test("the boot line names the catalog and the stream footer; the field; the tool registration", () => {
+    const ir = baseIr({ provability: PROV() });
+    const content = emitCli(ir).files[0]?.content ?? "";
+    expect(content).toContain(
+      `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(ir))}, { cwd: process.cwd(), catalog: defaultCatalog, footerTarget: "stream" });`,
+    );
+    expect(content).toContain("\n    provability: __gates.provability,");
+    expect(content).not.toContain("evaluation: __gates.evaluation");
+    expect(content).toContain(
+      'import { registerGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
+    );
+    expect(content).toContain("\nregisterGateTools(defaultCatalog, __gates);\n");
+  });
+
+  test("a ProofCheck the spec listed below proven: the builtin registers, then the gate's registration call replaces it", async () => {
+    const content =
+      emitCli(baseIr({ tools: ["proofCheck"], provability: PROV("checked") })).files[0]?.content ??
+      "";
+    const builtin = content.indexOf("defaultCatalog.register(proofCheck);");
+    const swap = content.indexOf("registerGateTools(defaultCatalog, __gates);");
+    expect(builtin).toBeGreaterThan(-1);
+    expect(builtin).toBeLessThan(swap);
+    // What that call does with the emitted fragment: the listed ProofCheck becomes the gate's.
+    const gates = await wireEvaluation(emittedGateFragment(content), { cwd: "/tmp" });
+    const listed = { name: "ProofCheck" } as RegisteredTool;
+    const registered = new Map<string, RegisteredTool>([["ProofCheck", listed]]);
+    registerGateTools(
+      {
+        has: (name) => registered.has(name),
+        unregister: (name) => registered.delete(name),
+        register: (tool) => {
+          registered.set(tool.name, tool);
+        },
+      },
+      gates,
+    );
+    expect([...registered.keys()].sort()).toEqual(["ProofCheck", "ProvabilityPreflight"]);
+    expect(registered.get("ProofCheck")).toBe(
+      gates.proofTools.find((t) => t.name === "ProofCheck"),
+    );
+  });
+
+  test("a spec name the spec schema allows but the proofs store does not (a space) compiles and wires", async () => {
+    const content =
+      emitCli(baseIr({ name: "support bot", provability: PROV() })).files[0]?.content ?? "";
+    const fragment = emittedGateFragment(content);
+    expect(fragment.specName).toBe("support bot");
+    const gates = await wireEvaluation(fragment, { cwd: "/tmp" });
+    expect(gates.provability?.level).toBe("grounded");
+  });
+
+  test("ordering: builtins register first, the gate's tools replace them, plugins register last", () => {
+    const content =
+      emitCli(baseIr({ tools: ["provabilityPreflight"], provability: PROV(), plugins: ["p"] }))
+        .files[0]?.content ?? "";
+    const builtin = content.indexOf("defaultCatalog.register(provabilityPreflight);");
+    const boot = content.indexOf("const __gates = await wireEvaluation(");
+    const swap = content.indexOf("registerGateTools(defaultCatalog, __gates);");
+    const plugins = content.indexOf("for (const __t of __plugins.tools)");
+    const run = content.indexOf("await runChatLoop({");
+    expect(builtin).toBeGreaterThan(-1);
+    expect(builtin).toBeLessThan(boot);
+    expect(boot).toBeLessThan(swap);
+    expect(swap).toBeLessThan(plugins);
+    expect(plugins).toBeLessThan(run);
+  });
+
+  test("evaluation + provability: both fields, evaluation first, one boot line", () => {
+    const content =
+      emitCli(
+        baseIr({
+          evaluation: { grader: { type: "contains", value: "x" }, onFail: "retry", maxRetries: 1 },
+          provability: PROV("proven"),
+        }),
+      ).files[0]?.content ?? "";
+    expect(content.match(/await wireEvaluation\(/g)).toHaveLength(1);
+    expect(content).toContain(
+      "\n    evaluation: __gates.evaluation,\n    provability: __gates.provability,",
+    );
+  });
+
+  test("the emitted fragment wires a gate and the proof tools for its level", async () => {
+    const fragment = emittedGateFragment(
+      emitCli(baseIr({ provability: PROV("proven") })).files[0]?.content ?? "",
+    );
+    const gates = await wireEvaluation(fragment, { cwd: "/tmp" });
+    expect(gates.provability?.level).toBe("proven");
+    expect(gates.tools.map((t) => t.name)).toEqual([
+      "ProofCheckers",
+      "ProofCheck",
+      "ProvabilityPreflight",
+    ]);
   });
 });
 

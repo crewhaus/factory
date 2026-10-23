@@ -15,13 +15,34 @@
       "path": "../ir"
     },
     {
-      "path": "../provability"
+      "path": "../logging"
+    },
+    {
+      "path": "../model-service"
     },
     {
       "path": "../proof-checker"
     },
     {
+      "path": "../provability"
+    },
+    {
       "path": "../runtime-core"
+    },
+    {
+      "path": "../tenancy"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-fetch"
+    },
+    {
+      "path": "../tool-proof"
+    },
+    {
+      "path": "../tool-result-store"
     },
     {
       "path": "../trace-event-bus"

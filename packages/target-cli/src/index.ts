@@ -1,4 +1,5 @@
 import { CrewhausError } from "@crewhaus/errors";
+import { type EvaluationWiring, renderEvaluationWiring } from "@crewhaus/evaluation-service";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import {
   type Bundle,
@@ -11,10 +12,7 @@ import {
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
 import {
   HYBRID_WIRING_IMPORT,
-  JUDGE_PANEL_IMPORT,
-  judgeInstrumentId,
   renderHybridWiringFields,
-  renderJudgePanelFields,
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
@@ -469,148 +467,27 @@ function renderJustificationGate(ir: IrV0): {
 }
 
 /**
- * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring.
- * The bundle constructs the evaluate fn from the RESOLVED IR grader and
- * threads it — together with the resolved gate knobs — into runChatLoop's
- * `evaluation` option; the runtime scores each completed assistant turn,
- * compares against `threshold`, applies `onFail` (retry ≤ `maxRetries` with
- * the rationale appended as a system nudge / halt as a classified
- * `evaluation` failure / note as an `eval_graded` trace event only) and
- * emits one `eval_graded` event per grading pass.
- *
- *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` (the offline
- *     eval-judge scoring path: single-criterion rubric from `criteria`,
- *     1–5 score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
- *     sentinels). The judge model resolves through the SAME model-router
- *     adapter wiring the bundle's primary model uses (env credentials,
- *     any provider). 0.6.0 §6.2 — the evaluate fn hands the run bus it
- *     receives to `judge()`, so every judge call publishes
- *     `model_request`/`model_response` with `role: "judge"` and IS metered
- *     exactly like every other model call (priced by cost-tracker, counted
- *     toward `budget.usd` under `budget.judge_share`), and reports the
- *     judge's wire model + priced spend back as `EvaluationResult.judge`
- *     for the `eval_graded` attribution; the model defaults to the shape's primary model when the
- *     spec omitted `grader.model` (`cheapest` already resolved at lower
- *     time). `threshold` was resolved at lower time (default 0.7) — the
- *     `?? 0.7` is a defensive floor for hand-built IR. A3 — an abstaining
- *     judge scores 0 with a `judge abstained: …` rationale (its nominal
- *     best-estimate score is a guess and must never pass the threshold),
- *     so `onFail` applies exactly as for a failed grade.
- *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
- *     fail; no model spend, no import). The regex was validated compilable
- *     at parse time; `lastIndex` is reset per call so a global/sticky flag
- *     can never flip-flop verdicts across turns.
- *
- * The emitted literal is annotated `RunEvaluation` (runtime-core's seam
- * type), so a compiled bundle typechecks against the exact runtime
- * contract: `graderType`/`threshold` are stamped verbatim onto every
- * `eval_graded` event (deterministic graders carry the documented
- * threshold 1 — score is 0|1 and `score >= threshold` is the pass rule).
- * 0.6.0 §6.2 (PR 13b) — the `llm_judge` literal grades through
- * `@crewhaus/eval-judge`'s `gradeWithJudgePanel` (one `createJudgeGrader`
- * fan-out), so a declared `judges` panel / `repeats` / `temperature` /
- * `target` and the judge profile's pinned request `params` are honoured;
- * absent, it is the same single judge call as before. It additionally carries
- * `judgeModel`, the INSTRUMENT `evaluate` grades with (a panel is named by its
- * members joined with `+`), because the pool's per-arm quality lineage folds
- * the judge's identity beside the grader kind — so re-pointing the judge, or
- * changing the panel, starts a new lineage instead of mixing two instruments.
- * Deterministic graders render no such field and stay byte-identical.
- * Empty pieces when the spec omits the block, keeping pre-existing bundles
- * byte-identical. Mirror: target-channel-bot + target-managed render the
- * same wiring — keep the three in sync.
+ * Loop contract 0.4 (Batch B, G02) / 0.8.0 (design/0.8.0-provability-release.md
+ * §4.4) — the in-loop gates: `evaluation:` (the quality judge) and
+ * `provability:` (the proof gate). The bundle no longer renders a grader of
+ * its own: it calls the gate composition root, `@crewhaus/evaluation-service`'s
+ * `wireEvaluation`, with the lowered blocks as one JSON fragment, and threads
+ * `__gates.evaluation` / `__gates.provability` into runChatLoop — the call
+ * `crewhaus run` makes too, so the two cannot drift (they were three
+ * hand-synced copies here, in target-channel-bot and in target-managed, plus
+ * the interpreter's twin). Under `provability:` the proof tools register on
+ * `defaultCatalog` (replacing a same-named builtin the spec also listed), and
+ * the proof footer streams after the answer (`footerTarget: "stream"`).
+ * Empty pieces when the spec declares neither block, keeping those bundles
+ * byte-identical.
  */
-function renderEvaluation(ir: IrV0): { imports: string[]; bootBlock: string; field: string } {
-  const ev = ir.evaluation;
-  if (ev === undefined) return { imports: [], bootBlock: "", field: "" };
-  const field = "\n  evaluation: __evaluation,";
-  const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
-  const onFail = escapeJsonString(ev.onFail);
-  // 0.6.0 §7.3 (PR 9c) — the cascade's escalation rung, resolved at lower
-  // time; rendered only under `on_fail: escalate` so every other bundle stays
-  // byte-identical.
-  const escalateField =
-    ev.escalateTo !== undefined ? `\n  escalateTo: ${escapeJsonString(ev.escalateTo)},` : "";
-  if (ev.grader.type === "llm_judge") {
-    const criteria = escapeJsonString(ev.grader.criteria);
-    const panel = { ...ev.grader, model: ev.grader.model ?? ir.agent.model };
-    const instrument = escapeJsonString(judgeInstrumentId(panel, ir.agent.model));
-    const bootBlock = `const __evaluation: RunEvaluation = {
-  graderType: "llm_judge",
-  judgeModel: ${instrument},
-  threshold: ${ev.threshold ?? 0.7},
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
-    const __verdict = await gradeWithJudgePanel({
-      rubric: {
-        criteria: [
-          {
-            name: "criteria",
-            description: ${criteria},
-            anchors: {
-              "1": "fails the criteria entirely",
-              "2": "mostly fails the criteria",
-              "3": "partially meets the criteria",
-              "4": "meets the criteria with minor gaps",
-              "5": "fully meets the criteria",
-            },
-          },
-        ],
-        passing_score: 3,
-      },
-      sample: { id: "in-loop-evaluation", input: "" },
-      run: inLoopRunResult({ finalText, messages, isSynthetic }),${renderJudgePanelFields(panel, "      ")}
-      // Judge spend rides the run bus (role "judge") so it is priced and
-      // counted toward budget.usd under budget.judge_share — every panelist
-      // and every repeat publishes its own model_request/model_response.
-      bus,
-    });
-    return {
-      score: __verdict.score,
-      rationale: __verdict.rationale,
-      judge: {
-        model: __verdict.judgeModel,
-        ...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),
-      },
-    };
-  },
-};`;
-    return {
-      imports: [typeImport, JUDGE_PANEL_IMPORT],
-      bootBlock,
-      field,
-    };
-  }
-  const value = ev.grader.value;
-  const valueLit = escapeJsonString(value);
-  if (ev.grader.type === "contains") {
-    const bootBlock = `const __evaluation: RunEvaluation = {
-  graderType: "contains",
-  threshold: 1,
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText }) =>
-    finalText.includes(${valueLit})
-      ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
-      : { score: 0, rationale: ${escapeJsonString(`output missing "${value}"`)} },
-};`;
-    return { imports: [typeImport], bootBlock, field };
-  }
-  const bootBlock = `const __evalRegex = new RegExp(${valueLit});
-const __evaluation: RunEvaluation = {
-  graderType: "regex",
-  threshold: 1,
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText }) => {
-    __evalRegex.lastIndex = 0;
-    return __evalRegex.test(finalText)
-      ? { score: 1, rationale: ${escapeJsonString(`output matches /${value}/`)} }
-      : { score: 0, rationale: ${escapeJsonString(`output does not match /${value}/`)} };
-  },
-};`;
-  return { imports: [typeImport], bootBlock, field };
+function renderEvaluation(ir: IrV0): EvaluationWiring {
+  return renderEvaluationWiring(ir, {
+    catalogVar: "defaultCatalog",
+    cwdExpr: "process.cwd()",
+    footerTarget: "stream",
+    indent: "  ",
+  });
 }
 
 /**
@@ -698,8 +575,9 @@ function renderAgent(ir: IrV0): string {
   // both Pillar 3 gates append to, as `crewhaus run` wires them. Empty pieces
   // when the spec declares no justification block.
   const justification = renderJustificationGate(ir);
-  // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation. Empty
-  // pieces when the spec omits the block.
+  // Loop contract 0.4 (Batch B, G02) / 0.8.0 §4.4 — the in-loop gates
+  // (`evaluation:`, `provability:`) through the gate composition root. Empty
+  // pieces when the spec declares neither.
   const evaluation = renderEvaluation(ir);
   // Item 3 (G32) — plugin activation. Empty pieces when the spec omits
   // `plugins:`, keeping bundles byte-identical.
@@ -941,7 +819,12 @@ ${catchBlock}${finallyBlock}`;
     justification.imports.length > 0 ? `${justification.imports.join("\n")}\n` : "";
   const evaluationImportBlock =
     evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
-  const evaluationBoot = evaluation.bootBlock ? `${evaluation.bootBlock}\n\n` : "";
+  // The gates boot after the builtin registrations; under `provability:` the
+  // proof tools register right behind the boot line, before memory, MCP,
+  // knowledge and plugins (whose registration skips a taken name).
+  const evaluationBoot = evaluation.bootBlock
+    ? `${evaluation.bootBlock}\n${evaluation.toolsRegistration ? `${evaluation.toolsRegistration}\n` : ""}\n`
+    : "";
   const memoryImportBlock = memory.imports.length > 0 ? `${memory.imports.join("\n")}\n` : "";
   const memoryBoot = memory.bootBlock ? `${memory.bootBlock}\n\n` : "";
   const knowledgeImportBlock =

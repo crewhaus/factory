@@ -132,6 +132,33 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  proofCheckers: [
+    "proof checker",
+    "which checkers",
+    "prove with",
+    "formal languages",
+    "smt",
+    "lean",
+  ],
+  proofCheck: [
+    "prove",
+    "proof",
+    "formal proof",
+    "certificate",
+    "theorem",
+    "machine-checked",
+    "counterexample",
+    "z3",
+  ],
+  provabilityPreflight: [
+    "preflight",
+    "provability",
+    "check draft",
+    "citations",
+    "grounded",
+    "evidence",
+    "before answering",
+  ],
   toolRegistry: [
     "what tools exist",
     "tools i do not have",
@@ -1781,6 +1808,9 @@ const TOOL_ARG_SAMPLES: Readonly<Record<string, string>> = {
   "PushNotify.to": "topic:ops-*",
   "EvmSendTransaction.to": EVM_ADDRESS,
   "EvmSimulate.to": EVM_ADDRESS,
+  // A proof checker's id: the sandbox-free one is the rule worth copying
+  // (`alwaysAllow ProofCheck(builtin)`, design §7), asking before smt/lean4.
+  "ProofCheck.checker": "builtin",
 };
 
 /**

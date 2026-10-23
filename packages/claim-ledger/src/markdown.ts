@@ -388,10 +388,20 @@ function listMarkerAt(
 /**
  * Does a line under paragraph text open a block of its own, rather than
  * continue the paragraph? Counted from the innermost open item the line is
- * indented into. A list item may interrupt a paragraph only when it has
- * content, and an ordered one only from 1 — CommonMark's rule, so "12." on
- * the line under a sentence is the sentence going on. Inside an open list
- * an item is taken to continue it, whatever its number.
+ * indented into.
+ *
+ * A list item may interrupt a paragraph only when it has content, and an
+ * ordered one only from 1 — CommonMark's rule, so "12." on the line under a
+ * sentence is the sentence going on. The rule holds wherever the line
+ * reaches the paragraph: the paragraph sits in the innermost open item, so
+ * that is a line indented to that item's content, or any line when no item
+ * is open. "- Approval takes\n  1." is one item whose text ends "takes 1.",
+ * and "1. Cut to\n   14. Customers…" one item that reads "cut to 14.":
+ * read as new items, the figure left the sentence it finishes, and a fence
+ * after such an empty item was read at the wrong level and hid the rest of
+ * the list. A marker indented less than that item's content does not reach
+ * the paragraph: it leaves the item for a sibling or an outer one, which any
+ * marker may start (CommonMark's own reference reader does the same).
  */
 function opensBlock(
   text: string,
@@ -400,13 +410,8 @@ function opensBlock(
   lineEnd: number,
   items: ReadonlyArray<number>,
 ): boolean {
-  let container = 0;
-  for (let i = items.length - 1; i >= 0; i--) {
-    if ((items[i] as number) <= column) {
-      container = items[i] as number;
-      break;
-    }
-  }
+  const inner = innermostItem(items, column);
+  const container = inner >= 0 ? (items[inner] as number) : 0;
   if (column - container > 3) return false;
   if (text[offset] === ">" || isAtxHeading(text, offset, lineEnd)) return true;
   if (isThematicBreak(text, offset, lineEnd)) return true;
@@ -418,7 +423,30 @@ function opensBlock(
     isThematicBreak(text, at, lineEnd),
   );
   if (marker === null) return false;
-  return items.length > 0 || (!marker.empty && (marker.start === null || marker.start === 1));
+  if (inner < items.length - 1) return true;
+  return !marker.empty && (marker.start === null || marker.start === 1);
+}
+
+/**
+ * The index of the innermost open item a line at `column` is indented into
+ * (the last content column ≤ `column`), or -1 when it is in none.
+ *
+ * By binary search: the content columns only ever increase inward, and a
+ * scan from the innermost item cost a lazy line the whole stack — "- - … x"
+ * 50,000 deep, then 50,000 lines of text under it, took over a second.
+ */
+function innermostItem(items: ReadonlyArray<number>, column: number): number {
+  let lo = 0;
+  let hi = items.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if ((items[mid] as number) <= column) {
+      found = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found;
 }
 
 /** A membership test over spans, built once: sorted starts plus a running max end. */

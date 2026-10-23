@@ -3,7 +3,14 @@
  * call, claimed vs proven rendered distinctly.
  */
 import { describe, expect, test } from "bun:test";
-import { type HandoffInput, renderHandoff, renderStatus } from "./handoff";
+import {
+  type HandoffInput,
+  PROVEN_UNVERIFIED_LABEL,
+  isProvenByAssertion,
+  renderHandoff,
+  renderLadderStatus,
+  renderStatus,
+} from "./handoff";
 import type { Goal, PlanRecord, Requirement } from "./types";
 
 const proof = {
@@ -133,5 +140,93 @@ describe("renderStatus", () => {
     expect(renderStatus("claimed")).toBe("[claimed — unverified]");
     expect(renderStatus("proven")).toBe("[proven]");
     expect(renderStatus("open")).toBe("[open]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — proven by assertion (`continuity.proof: off`)
+// ---------------------------------------------------------------------------
+
+const asserted = {
+  toolUseId: "tu_said",
+  sessionId: "sess_0123456789abcdef",
+  recordedAt: "2026-10-22T00:00:00.000Z",
+};
+
+describe("renderLadderStatus / isProvenByAssertion", () => {
+  test("matches renderStatus for every record the ladder writes", () => {
+    for (const status of ["open", "in_progress", "claimed", "proven"]) {
+      expect(renderLadderStatus({ status })).toBe(renderStatus(status));
+      expect(renderLadderStatus({ status, unverified: [] })).toBe(renderStatus(status));
+    }
+  });
+
+  test("proven with unverified refs renders apart from a verified ✓", () => {
+    const record = { status: "proven", unverified: [asserted] };
+    expect(isProvenByAssertion(record)).toBe(true);
+    expect(renderLadderStatus(record)).toBe(PROVEN_UNVERIFIED_LABEL);
+    expect(PROVEN_UNVERIFIED_LABEL).toBe("[proven (unverified)]");
+  });
+
+  test("unverified refs on a reopened record do not make it proven", () => {
+    const record = { status: "claimed", unverified: [asserted] };
+    expect(isProvenByAssertion(record)).toBe(false);
+    expect(renderLadderStatus(record)).toBe("[claimed — unverified]");
+  });
+});
+
+describe("renderHandoff — proven by assertion", () => {
+  const offPlan: PlanRecord = {
+    ...plan,
+    steps: [
+      plan.steps[0] as PlanRecord["steps"][number],
+      {
+        index: 2,
+        text: "Write the exporter",
+        status: "proven",
+        proofs: [],
+        unverified: [asserted],
+      },
+      {
+        index: 3,
+        text: "Add tests",
+        status: "proven",
+        proofs: [],
+        unverified: [{ toolUseId: "tu_bare", recordedAt: "2026-10-22T00:00:00.000Z" }],
+      },
+    ],
+  };
+  const offInput: HandoffInput = { ...input, activePlan: offPlan, plans: [offPlan, otherPlan] };
+
+  test("each step says how it was proven; the summary counts the unchecked ones", () => {
+    const out = renderHandoff(offInput);
+    expect(out).toContain("plan-0001 — Ship CSV export (3/3 steps proven, 2 unverified)");
+    expect(out).toContain("1. [proven] Parse the CSV — proof: tu_abc (sess_0123456789abcdef)");
+    expect(out).toContain(
+      "2. [proven (unverified)] Write the exporter — cited, not verified: tu_said (sess_0123456789abcdef)",
+    );
+    expect(out).toContain("3. [proven (unverified)] Add tests — cited, not verified: tu_bare");
+  });
+
+  test("a proven-by-assertion plan is not an open plan and leaves no next action", () => {
+    const out = renderHandoff(offInput);
+    expect(out).not.toContain("Verify or redo");
+    expect(out.slice(out.indexOf("## Next actions"))).toContain("_none_");
+  });
+
+  test("an asserted goal is proven (not listed as open); a reopened one renders by status", () => {
+    const out = renderHandoff({
+      ...offInput,
+      goals: [
+        { ...(goals[0] as Goal), status: "proven", unverified: [asserted] },
+        { ...(goals[0] as Goal), id: "goal-0002", status: "claimed", unverified: [asserted] },
+      ],
+    });
+    expect(out).not.toContain("goal-0001");
+    expect(out).toContain("- goal-0002 [claimed — unverified] Increase coverage (40/80 %)");
+  });
+
+  test("still deterministic", () => {
+    expect(renderHandoff(offInput)).toBe(renderHandoff({ ...offInput }));
   });
 });

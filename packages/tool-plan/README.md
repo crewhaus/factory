@@ -12,6 +12,7 @@ import { defaultCatalog } from "@crewhaus/tool-catalog";
 const bundle = createPlanTools({
   specName: "support-bot",
   appendEvent: (e) => eventLog.append(e), // plan_update / goal_update / action_proof
+  proofMode: "ladder", // continuity.proof — "ladder" (default) | "require" | "off"
 });
 for (const tool of bundle.all) defaultCatalog.register(tool);
 ```
@@ -35,6 +36,52 @@ rejects with `no verified evidence for tu_…: run the action first, then
 complete the step with its toolUseId.` — the *bias toward action*: narration
 can never produce a ✓.
 
+## Proof modes (`continuity.proof`)
+
+`createPlanTools({ proofMode })` — enforced since 0.8.0
+(design/0.8.0-provability-release.md §6.3; memory-service passes the spec's
+`continuity.proof` through):
+
+| Mode | `claimed` | `proven` | Completion below `proven` |
+| --- | --- | --- | --- |
+| `ladder` (default) | free | evidence verified against the session event log | — (the pre-0.8.0 behaviour, byte for byte) |
+| `require` | free — honest progress | verified, exactly as `ladder` | refused, with an error that teaches the proof |
+| `off` | free | the cited toolUseIds are **recorded, not resolved** | — |
+
+**`require`.** Nothing below `proven` completes anything. The store has one
+operation that could mark something achieved below `proven` — a goal's
+progress (`current`, read as 0 when unset, the way every render shows it)
+reaching its `target`, which is how the Thredz mirror completes a goal — so
+`GoalWrite` refuses a goal created at its target (a `target: 0` goal
+included) and `GoalUpdate` refuses progress that reaches it, unless the same
+call proves the goal (`status: "proven"` with evidence). `GoalUpdate`'s
+check runs inside the store lock on the record as written, so two sessions
+cannot each pass it on a stale read. Plans have no close operation: a plan
+is complete exactly when every step is proven, so a claimed step leaves it
+open, and once nothing is left open or in progress the `PlanUpdate` and
+`PlanComplete` replies say which steps still need proof (`plan-0001 is not
+complete: step 3 is claimed, not proven — prove it with
+PlanComplete({step, evidence: [{toolUseId}]}) first.`). A step or goal
+proven by assertion under an earlier `off` run counts as below `proven`
+until a verified proof replaces it, and so does a `proven` record with no
+frozen proof at all, which the store never writes (a hand edit, or a step
+line a multi-line plan title smuggled into a plan file before titles were
+kept to one line). Tool descriptions say so too.
+
+**`off`** exists for harnesses that keep **no session event log** — nothing
+to resolve a toolUseId against. `PlanComplete` and `GoalUpdate({status:
+"proven"})` still require cited evidence, but record it as unverified refs
+(never as frozen proofs) and pin no session for retention. `PlanComplete`
+emits `action_proof` with `verdict: "unverified"`; `GoalUpdate`'s
+`goal_update` event carries `verification: "unverified"` instead, because
+`action_proof` is keyed by plan step. Each cited id must be one token
+(letters, digits, `_ . : -`, at most 256 characters), at most 32 per record,
+so a citation cannot inject a forged line into a render or inflate a state
+file. Every render — `PlanRead`, `GoalList`, the `<current_plan>` tail,
+`handoff.md` — shows `[proven (unverified)]`, never `[proven]`. A step
+already proven with verified evidence keeps it: an unverified proof never
+downgrades a ✓.
+
 ## Event emission (decoupled)
 
 Mutations emit the additive event-log kinds `plan_update`, `goal_update`, and
@@ -42,7 +89,10 @@ Mutations emit the additive event-log kinds `plan_update`, `goal_update`, and
 `appendEvent` callback — this package never imports runtime wiring; emitters
 or memory-service decide where events land (session JSONL, trace bus, both).
 Rejected proof attempts emit `action_proof` too (`missing` / `error_result`),
-so the audit trail records proof pressure, not just wins.
+so the audit trail records proof pressure, not just wins; under
+`proofMode: "off"` the verdict is `unverified` — recorded, never checked —
+and a goal proven that way says `verification: "unverified"` on its
+`goal_update`.
 
 ## Pillar 3 notes
 

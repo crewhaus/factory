@@ -246,12 +246,20 @@ function inputOrigins(toolName: string, input: unknown, roots: PathRoots): strin
   const reader = READERS[toolName];
   if (reader !== undefined) return readerOrigins(reader, toolName, input, roots);
   if (builtinKey(toolName) !== undefined) return [];
-  const out: string[] = [];
+  return namedOrigins(input, roots).map((named) => named.origin);
+}
+
+/** A non-builtin's URL fields, then its path fields: each value that names an origin, with it. */
+function namedOrigins(
+  input: Record<string, unknown>,
+  roots: PathRoots,
+): Array<{ readonly value: string; readonly origin: string }> {
+  const out: Array<{ value: string; origin: string }> = [];
   for (const field of URL_FIELDS) {
     const value = input[field];
     if (typeof value !== "string") continue;
     const origin = originOfValue(value, roots, false);
-    if (origin !== undefined) out.push(origin);
+    if (origin !== undefined) out.push({ value, origin });
   }
   for (const field of PATH_FIELDS) {
     const value = input[field];
@@ -259,9 +267,27 @@ function inputOrigins(toolName: string, input: unknown, roots: PathRoots): strin
     const origin = /^https?:\/\//i.test(value.trim())
       ? normalizeUrl(value)
       : normalizePath(value, roots);
-    if (origin !== undefined) out.push(origin);
+    if (origin !== undefined) out.push({ value, origin });
   }
   return out;
+}
+
+/**
+ * The input strings a tool that is not a builtin names its origins by
+ * (`inputOrigins`), as written: the URL or path the call was pointed at,
+ * not text it was handed. `grounded`'s echo test (verify.ts `echoCheck`)
+ * reads these apart from the call's other strings, because a URL's slug can
+ * spell a claim the page itself states — a reader returns the page, not its
+ * address — and only a body that prints the address can be reflecting it.
+ */
+export function originFieldValues(
+  toolName: string,
+  input: unknown,
+  roots: PathRoots = {},
+): string[] {
+  if (!isRecordObject(input) || READERS[toolName] !== undefined) return [];
+  if (builtinKey(toolName) !== undefined) return [];
+  return namedOrigins(input, roots).map((named) => named.value);
 }
 
 /** A JSON hit's text: its text-bearing fields, or every string field when it has none. */

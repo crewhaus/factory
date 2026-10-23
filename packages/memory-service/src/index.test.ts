@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MAX_TITLE_CHARS } from "@crewhaus/continuity-store";
 import type { HandoffInput, RunChatLoopOptions } from "@crewhaus/runtime-core";
 import { buildTenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -464,6 +465,44 @@ describe("wireMemory — seams behavior", () => {
     expect(goals?.map((g) => g.title)).toEqual(["[gap] EU CSV quirks"]);
   });
 
+  test("a gap topic past the store's title cap is clipped, not refused — the gap still lands (design/0.8.0 §6.3)", async () => {
+    // The store refuses a title over MAX_TITLE_CHARS and log_knowledge_gap's
+    // topic schema has no max, so before the clip this call threw and logged
+    // no gap at all.
+    const { deps: d, catalog } = deps();
+    const wired = await wireMemory(
+      { specName: "seam-gap-long", memory: { wiki: {} }, continuity: {} },
+      d,
+    );
+    const logGap = catalog.registered.find((t) => t.name === "log_knowledge_gap");
+    const topic = `How the EU VAT reverse-charge rules interact with ${"cross-border digital services ".repeat(18)}`;
+    expect(topic.length).toBeGreaterThan(MAX_TITLE_CHARS);
+    const result = String(await logGap?.execute({ topic, priority: "high" }));
+    expect(result).toContain("goal-0001");
+    expect(result).toContain("(the goal title keeps a shortened topic)");
+    const goals = await wired.stores.continuity?.listGoals();
+    expect(goals?.length).toBe(1);
+    const title = goals?.[0]?.title ?? "";
+    expect(title.length).toBeLessThanOrEqual(MAX_TITLE_CHARS);
+    expect(title.startsWith("[gap] How the EU VAT reverse-charge rules interact with")).toBe(true);
+    expect(title.endsWith("…")).toBe(true);
+  });
+
+  test("a gap topic that fits keeps its whole text and says nothing about shortening", async () => {
+    const { deps: d, catalog } = deps();
+    const wired = await wireMemory(
+      { specName: "seam-gap-fits", memory: { wiki: {} }, continuity: {} },
+      d,
+    );
+    const logGap = catalog.registered.find((t) => t.name === "log_knowledge_gap");
+    // Exactly the room the title has after "[gap] ": the longest topic kept whole.
+    const topic = "t".repeat(MAX_TITLE_CHARS - "[gap] ".length);
+    const result = String(await logGap?.execute({ topic }));
+    expect(result).not.toContain("shortened");
+    const goals = await wired.stores.continuity?.listGoals();
+    expect(goals?.map((g) => g.title)).toEqual([`[gap] ${topic}`]);
+  });
+
   test("wiki gaps fall back to the wiki itself without continuity", async () => {
     const { deps: d, catalog } = deps();
     const wired = await wireMemory({ specName: "seam-gap-solo", memory: { wiki: {} } }, d);
@@ -834,14 +873,15 @@ describe("PR 11 — wiki auto-recall fusion (§3.4/§9)", () => {
   });
 });
 
-describe("PR 11 — continuity.proof carried-but-degraded (§2.4)", () => {
-  test('proof "require"/"off" log the degrade note; "ladder"/absent stay silent', async () => {
-    for (const [proof, expectNote] of [
-      ["require", true],
-      ["off", true],
-      ["ladder", false],
-      [undefined, false],
-    ] as const) {
+describe("continuity.proof reaches tool-plan's proofMode (design/0.8.0 §6.3)", () => {
+  function tool(registered: readonly RegisteredTool[], name: string): RegisteredTool {
+    const found = registered.find((t) => t.name === name);
+    if (found === undefined) throw new Error(`${name} not registered`);
+    return found;
+  }
+
+  test("no mode prints a boot note — the pre-0.8.0 degrade note is gone", async () => {
+    for (const proof of ["require", "off", "ladder", undefined] as const) {
       const lines: string[] = [];
       const { deps: d } = deps({ log: (l) => lines.push(l) });
       await wireMemory(
@@ -851,8 +891,145 @@ describe("PR 11 — continuity.proof carried-but-degraded (§2.4)", () => {
         },
         d,
       );
-      expect(lines.some((l) => l.includes("carried but not enforced yet"))).toBe(expectNote);
+      expect(lines.some((l) => l.includes("carried but not enforced"))).toBe(false);
+      expect(lines.some((l) => l.includes("continuity.proof"))).toBe(false);
     }
+  });
+
+  test("each mode reaches the registered tools (their descriptions are the mode's)", async () => {
+    const descriptionFor = async (proof: "ladder" | "require" | "off" | undefined) => {
+      const { deps: d, catalog } = deps();
+      await wireMemory(
+        { specName: `desc-${proof ?? "absent"}`, continuity: proof !== undefined ? { proof } : {} },
+        d,
+      );
+      return tool(catalog.registered, "PlanComplete").description;
+    };
+    const ladder = await descriptionFor("ladder");
+    expect(await descriptionFor(undefined)).toBe(ladder);
+    expect(ladder).toContain("machine-checked");
+    expect(await descriptionFor("require")).toContain("ONLY way a step completes");
+    expect(await descriptionFor("off")).toContain("RECORDED as unverified refs");
+  });
+
+  test("off: PlanComplete proves with no event log; the tail and handoff say proven (unverified)", async () => {
+    const { deps: d, catalog } = deps({ sessionScope: SESSION_ID });
+    const wired = await wireMemory({ specName: "proof-off", continuity: { proof: "off" } }, d);
+    await tool(catalog.registered, "PlanUpdate").execute({
+      action: "create",
+      title: "release",
+      steps: ["deploy", "announce"],
+    });
+    expect(
+      await tool(catalog.registered, "PlanComplete").execute({
+        step: 1,
+        evidence: [{ toolUseId: "tu_ghost" }],
+      }),
+    ).toContain("proven (unverified)");
+
+    const tail = await wired.options.continuity?.loadPlan();
+    expect(tail).toContain("1. [proven (unverified)] deploy");
+    expect(tail).toContain("2. [open] announce");
+
+    await wired.options.continuity?.onHandoff?.({
+      plan: tail ?? null,
+      ledger: [],
+      sessionId: SESSION_ID,
+      stopReason: "complete",
+    });
+    const handoff = readFileSync(
+      join(tmp, ".crewhaus", "state", "proof-off", "handoff.md"),
+      "utf8",
+    );
+    expect(handoff).toContain("plan-0001 — release (1/2 steps proven, 1 unverified)");
+    expect(handoff).toContain(
+      `1. [proven (unverified)] deploy — cited, not verified: tu_ghost (${SESSION_ID})`,
+    );
+    // Nothing pinned: there is no transcript to keep alive.
+    expect(existsSync(join(tmp, ".crewhaus", "retention.json"))).toBe(false);
+  }, 20_000);
+
+  test("require: a goal cannot reach its target unproven; claimed stays free", async () => {
+    const { deps: d, catalog } = deps();
+    const wired = await wireMemory(
+      { specName: "proof-require", continuity: { proof: "require" } },
+      d,
+    );
+    await expect(
+      tool(catalog.registered, "GoalWrite").execute({ title: "adoption", target: 10, current: 10 }),
+    ).rejects.toThrow("cannot start at its target");
+    await tool(catalog.registered, "GoalWrite").execute({ title: "adoption", target: 10 });
+    await expect(
+      tool(catalog.registered, "GoalUpdate").execute({ goalId: "goal-0001", current: 10 }),
+    ).rejects.toThrow("goal-0001 is open, not proven");
+
+    await tool(catalog.registered, "PlanUpdate").execute({
+      action: "create",
+      title: "p",
+      steps: ["a"],
+    });
+    expect(
+      await tool(catalog.registered, "PlanUpdate").execute({
+        action: "set_step_status",
+        step: 1,
+        status: "claimed",
+      }),
+    ).toContain("plan-0001 is not complete: step 1 is claimed, not proven");
+    expect((await wired.stores.continuity?.getPlan("plan-0001"))?.steps[0]?.status).toBe("claimed");
+  }, 20_000);
+
+  test("ladder (explicit or absent): an unresolvable toolUseId is still rejected", async () => {
+    for (const proof of ["ladder", undefined] as const) {
+      const { deps: d, catalog } = deps({ sessionScope: SESSION_ID });
+      await wireMemory(
+        {
+          specName: `proof-l-${proof ?? "absent"}`,
+          continuity: proof !== undefined ? { proof } : {},
+        },
+        d,
+      );
+      await tool(catalog.registered, "PlanUpdate").execute({
+        action: "create",
+        title: "p",
+        steps: ["a"],
+      });
+      await expect(
+        tool(catalog.registered, "PlanComplete").execute({
+          step: 1,
+          evidence: [{ toolUseId: "tu_ghost" }],
+        }),
+      ).rejects.toThrow("no verified evidence for tu_ghost");
+    }
+  }, 20_000);
+
+  test("spec → IR → fragment → tools: memoryFragmentFromIr carries the mode end to end", async () => {
+    const fragment = memoryFragmentFromIr({
+      name: "proof-ir",
+      continuity: {
+        plan: true,
+        proof: "off",
+        ledger: true,
+        handoff: true,
+        scope: "spec",
+      },
+    });
+    expect(fragment.continuity?.proof).toBe("off");
+    const { deps: d, catalog } = deps();
+    await wireMemory(fragment, d);
+    expect(tool(catalog.registered, "PlanComplete").description).toContain("RECORDED");
+  });
+
+  test("a hand-built fragment with a mode that does not exist fails loudly", async () => {
+    const { deps: d } = deps();
+    await expect(
+      wireMemory(
+        {
+          specName: "proof-typo",
+          continuity: { proof: "strict" as unknown as "require" },
+        },
+        d,
+      ),
+    ).rejects.toThrow('proofMode "strict" is not one of ladder | require | off');
   });
 });
 

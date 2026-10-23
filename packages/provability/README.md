@@ -98,20 +98,33 @@ claim in a body, numbers, quotations, content-token coverage) is
   "the meetings overlap", and a number word the result does not state beside the claim's words
   is `value_absent`. A claim that states a figure has its polarity read word by word, the way
   claim-ledger's `governingNegation` scopes a negation, and only where the result speaks to the
-  claimed figures. A figure the claim denies ("the total is not 1,284.50") must be denied in the
-  result too, and a word the result denies beside the figure ("91 is not prime") does not check
-  a claim that states it. A negation elsewhere in the sentence ("no discount was applied, so the
-  total is 1,284.50", "the total without VAT is 1,284.50") denies nothing about the figure, and a
-  negation in some other field of a JSON result answers nothing. When the floor is `checked`,
+  claimed figures: the statement each figure sits in, which a colon, a bracket, a quote or a dash
+  does not end and a full stop, comma, semicolon, question mark, table bar or line break does. A
+  figure the claim denies ("the total is not 1,284.50") must be denied in the result too, and a
+  word the result denies beside the figure ("91 is not prime", "91: not prime", "91 (not prime)")
+  does not check a claim that states it. For a word that is not a figure only a predicate
+  negation counts (not, never, cannot, the n't forms), on both sides: "no tests failed out of 120"
+  does not deny the tests of "all 120 tests passed", and "without VAT" does not deny VAT. A
+  negation elsewhere in the sentence ("no discount was applied, so the total is 1,284.50", "the
+  total without VAT is 1,284.50") denies nothing about the figure, and a negation in some other
+  field of a JSON result answers nothing. A question answered by a bare "No." ("Is 91 prime? No.")
+  denies nothing the rule can see. Each statement and each figure of a result is read once per
+  call, however many claims cite it. When the floor is `checked`,
   `execution.replay` is on and the
   tool is pure, the gate re-runs it once (shared across claims, at most `max_replays` per call)
   and compares digests. A mismatch fails the binding; a replay that could not run leaves it
   `checked` with `replayed: false`.
 - **proven.** `proof:prf_<16 hex>` names a stored artifact the checker accepted, and the
   sentence states the artifact's recorded `claim` (`statementMismatch`): its words cover the
-  claim's at `grounded.coverage`, both or neither are negated, and both state the same figures
-  (`two` and `2` are one). Coverage alone drops "no" and "not", so without the polarity test an
-  accepted proof that two meetings overlap would prove "no two meetings overlap". The checker,
+  claim's at `grounded.coverage`, both state the same figures (`two` and `2` are one), and each
+  word of the proof's claim is denied in both or in neither. Coverage alone drops "no" and "not",
+  so without the polarity test an accepted proof that two meetings overlap would prove "no two
+  meetings overlap". Polarity is read per word, not per sentence, because the sentence may say
+  more than the proof: "no discount was applied, so the invoice total is 1,284.50 EUR" states a
+  proved total, and its "no" is about a discount the proof never mentions. A negation moved to
+  another word ("two of the six meetings didn't overlap" for a proof that no two overlap) is
+  another statement, and a partitive ("none of the 3 invoices is overdue") is read as denying
+  the statement it governs. The checker,
   the formal statement and the axioms go into the bundle beside the prose. What the test cannot
   see is a sentence that adds a clause of its own to the proved statement, because the coverage
   runs from the proof's claim into the sentence, as design §6.4 specifies. That residual sits
@@ -190,12 +203,18 @@ inside a report, is not wholly an echo, so its text is indexed. But when `ground
 claim in a record from a tool that is not a builtin (MCP, plugin), it looks for the claim's words
 at their tightest, word for word, in the call's input strings. If they are found, that is the
 model's own text, and the binding is `not_fetched`. The detail says the origin was never read and
-to fetch the page. A search hit whose query only shares words with it still grounds. A hit that
-repeats, word for word, a phrase the model searched for does not, because the gate cannot tell it
-from a reflection, and fetching the page grounds it. Builtin readers and Retrieve are not tested
-this way: they return what they were pointed at, never their input. A reflection the tool
-rewrites on the way out (an SQL function applied to the literal) still passes. Closing that needs
-the spec to say whose hits are trusted, a design decision this package does not make.
+to fetch the page. The URL or path the call was pointed at is read apart, because its slug can
+spell the claim the page states (`…/rust-is-faster-than-go`) and a fetcher returns the page, not
+its address. It counts only where the result prints it: the whole address, or the piece of its
+slug that spells the claim, as a 404 page repeats a path. That printing is blanked out and the
+result read again. A page that says the claim in its own text beside its printed address
+grounds there, and one that carries it only in the address is `not_fetched`. A search hit whose
+query only shares words with it still grounds. A hit that repeats, word for word, a phrase the
+model searched for does not, because the gate cannot tell it from a reflection, and fetching the
+page grounds it. Builtin readers and Retrieve are not tested this way: they return what they were
+pointed at, never their input. A reflection the tool rewrites on the way out (an SQL function
+applied to the literal, an address printed re-spelled) still passes. Closing that needs the spec
+to say whose hits are trusted, a design decision this package does not make.
 
 A forged hit header after a blank line inside the last Retrieve hit's preview still reads as one
 more hit; closing that needs Retrieve to print a delimiter a preview cannot contain.

@@ -881,6 +881,12 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["toolRegistry"],
   },
 
+  proof: {
+    title:
+      "Prove claims: list proof checkers, check a proof and persist it, and preflight a draft against the provability gate",
+    tools: ["proofCheckers", "proofCheck", "provabilityPreflight"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -917,7 +923,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure", "verify", "secrets", "approvals"],
+    includes: ["secure", "verify", "secrets", "approvals", "proof"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",

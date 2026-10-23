@@ -13,14 +13,20 @@
   },
   "dependencies": {
     "@crewhaus/errors": "workspace:*",
+    "@crewhaus/event-log": "workspace:*",
     "@crewhaus/proof-checker": "workspace:*",
     "@crewhaus/provability": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@crewhaus/tool-executor": "workspace:*"
+    "@crewhaus/tool-executor": "workspace:*",
+    "@crewhaus/tool-result-store": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

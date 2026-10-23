@@ -260,6 +260,9 @@ import {
   runEval as runEvalCore,
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
+// 0.8.0 §4.4 — the in-loop gates' composition root: `gateRunOptions` (./loop-contract)
+// wires them; the proof tools join the run's tool list through this merge.
+import { mergeGateTools } from "@crewhaus/evaluation-service";
 import { openEventLog } from "@crewhaus/event-log";
 // Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
 // threshold rules + suggestions.json/report.html builders), in a
@@ -1112,8 +1115,8 @@ import {
 import {
   type AskMode,
   VALID_ASK_MODES,
-  evaluationRunOptions,
   formatCompileWarning,
+  gateRunOptions,
   isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
@@ -4704,6 +4707,20 @@ async function runRunCli(
     );
   }
 
+  // 0.8.0 (design §4.4, §8) — the in-loop gates (`evaluation:`,
+  // `provability:`) through the composition root a compiled bundle's boot
+  // line calls. Replay finds the run's own pure tools through a view over
+  // this tool list (read at replay time); the proof tools join the list here,
+  // replacing a same-named builtin the spec listed and ahead of the plugins.
+  // The footer streams after a REPL answer and rides the printed `--prompt`
+  // result. Neither block → nothing is built.
+  const gates = await gateRunOptions(ir, {
+    cwd: process.cwd(),
+    catalog: { get: (name) => tools.find((t) => t.name === name) },
+    footerTarget: oneShotPrompt !== undefined ? "reply" : "stream",
+  });
+  if (gates.proofTools.length > 0) tools = mergeGateTools(tools, gates);
+
   // Item 3 (G32) — register the activated plugins' tools LAST so a plugin tool
   // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
   // (first-party wins the collision), mirroring the compiled bundle's
@@ -4822,12 +4839,12 @@ async function runRunCli(
       // the pool's reward and the per-tool cost attribution price with the
       // same table `cost-summary` and `doctor --models` read.
       pricing: loadUserPricing(),
-      // 0.6.0 PR 8b (wave-1 carry-over) — the in-loop `evaluation:` block,
-      // built from the resolved IR exactly as the compiled cli bundle's
-      // `renderEvaluation` does (llm_judge on the run bus with role "judge",
-      // contains / regex pure), so `crewhaus run` grades, retries, halts and
-      // meters judge spend like the bundle. Absent block → spreads nothing.
-      ...evaluationRunOptions(ir),
+      // 0.6.0 PR 8b / 0.8.0 §4.4 — the in-loop gates built above by the
+      // composition root the compiled bundle calls (llm_judge on the run bus
+      // with role "judge", contains / regex pure; the provability gate), so
+      // `crewhaus run` grades, verifies, retries, halts and meters like the
+      // bundle. Neither block → spreads nothing.
+      ...gates.options,
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.
@@ -5881,6 +5898,18 @@ async function buildServeRuntime(
     tools.push(createTaskTool({ subAgents }));
   }
 
+  // 0.8.0 (design §4.4, §8) — the in-loop gates, built ONCE per served
+  // process through the composition root (their closures keep no per-run
+  // state; the HEAD cache is keyed by session). A served reply is the text
+  // the caller receives, so the proof footer rides it (`"reply"`). The proof
+  // tools join the primary agent's list ahead of the plugins.
+  const gates = await gateRunOptions(ir, {
+    cwd,
+    catalog: { get: (name) => tools.find((t) => t.name === name) },
+    footerTarget: "reply",
+  });
+  if (gates.proofTools.length > 0) tools = mergeGateTools(tools, gates);
+
   // Plugin tools register LAST — a plugin tool named after a built-in / skill /
   // MCP tool is skipped so first-party wins the collision.
   addPluginTools(tools, pluginTools);
@@ -5944,16 +5973,16 @@ async function buildServeRuntime(
   //   - routing: the same `wireModels` call runRunCli spreads, so the two
   //     interpreter paths cannot drift (0.6.0 PR 8a; before it this copy
   //     dropped `circuitBreaker` under `--model` while runRunCli kept it).
-  //   - evaluation (0.6.0 PR 8b): the in-loop `evaluation:` block on the
-  //     primary agent only (sub-agent invocations are not graded by the
-  //     parent's evaluation), the same helper runRunCli spreads.
+  //   - evaluation (0.6.0 PR 8b) / provability (0.8.0): the in-loop gates on
+  //     the primary agent only (sub-agent invocations are not graded by the
+  //     parent's gates), the same helper runRunCli spreads, built once above.
   const primaryOptionsForRun = () => ({
     ...commonOptions,
     model,
     instructions: ir.agent.instructions,
     tools,
     ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
-    ...evaluationRunOptions(ir),
+    ...gates.options,
     ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
     ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
     ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),

@@ -1,4 +1,5 @@
 import { CrewhausError } from "@crewhaus/errors";
+import { type EvaluationWiring, renderEvaluationWiring } from "@crewhaus/evaluation-service";
 import {
   renderControlDrain,
   renderControlImports,
@@ -23,10 +24,7 @@ import { memoryFragmentFromIr, renderStudyRotationPreamble } from "@crewhaus/mem
 import { type ParsedModelString, parseModelString } from "@crewhaus/model-router";
 import {
   HYBRID_WIRING_IMPORT,
-  JUDGE_PANEL_IMPORT,
-  judgeInstrumentId,
   renderHybridWiringFields,
-  renderJudgePanelFields,
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
@@ -395,154 +393,40 @@ function renderLimitsFields(ir: IrChannelV0): string {
 }
 
 /**
- * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring
- * for the interactive turn. The bundle constructs the evaluate fn from the
- * RESOLVED IR grader at module scope in agent.ts and threads it — together
- * with the resolved gate knobs — into the interactive `runChatLoop` call's
- * `evaluation` option; the runtime scores each completed assistant turn,
- * compares against `threshold`, applies `onFail` (retry ≤ `maxRetries` with
- * the rationale appended as a system nudge / halt as a classified
- * `evaluation` failure / note as an `eval_graded` trace event only) and
- * emits one `eval_graded` event per grading pass.
+ * Loop contract 0.4 (Batch B, G02) / 0.8.0 (design/0.8.0-provability-release.md
+ * §4.4, §5.4, §8) — the in-loop gates for the interactive turn: `evaluation:`
+ * (the quality judge) and `provability:` (the proof gate). The bundle renders
+ * no grader of its own: `runTurn` calls the gate composition root,
+ * `@crewhaus/evaluation-service`'s `wireEvaluation`, with the lowered blocks
+ * as one JSON fragment and threads `__gates.evaluation` /
+ * `__gates.provability` into the turn's `runChatLoop` — the call `crewhaus
+ * run` makes, so a channel bot gates exactly as the interpreter does (this
+ * was one of three hand-synced inline copies before 0.8.0).
  *
- *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` (the offline
- *     eval-judge scoring path: single-criterion rubric from `criteria`, 1–5
- *     score mapped to [0,1] via (n-1)/4, prompt-injection-hardened
- *     sentinels). The judge model resolves through the SAME model-router
- *     adapter wiring the bundle's primary model uses. 0.6.0 §6.2 — the
- *     evaluate fn hands the run bus it receives to `judge()`, so every
- *     judge call publishes `model_request`/`model_response` with
- *     `role: "judge"` and IS metered exactly like every other model call
- *     (priced by cost-tracker, counted toward `budget.usd` under
- *     `budget.judge_share`), and reports the judge's wire model + priced
- *     spend back as `EvaluationResult.judge` for the `eval_graded`
- *     attribution; the model defaults to
- *     the shape's primary model when the spec omitted `grader.model`
- *     (`cheapest` already resolved at lower time). `threshold` was resolved
- *     at lower time (default 0.7) — the `?? 0.7` is a defensive floor for
- *     hand-built IR. A3 — an abstaining judge scores 0 with a `judge
- *     abstained: …` rationale (its nominal best-estimate score is a guess
- *     and must never pass the threshold), so `onFail` applies exactly as
- *     for a failed grade.
- *   - `contains` / `regex` are emitted as pure fns (score 1 on pass, 0 on
- *     fail; no model spend, no import). `lastIndex` is reset per call so a
- *     global/sticky flag can never flip-flop verdicts across turns.
- *
- * The dream path deliberately carries NO evaluation — its bounded fresh
- * session is a consolidation pass, not a served answer. The emitted literal
- * is annotated `RunEvaluation` (runtime-core's seam type), so a compiled
- * bundle typechecks against the exact runtime contract:
- * `graderType`/`threshold` are stamped verbatim onto every `eval_graded`
- * event (deterministic graders carry the documented threshold 1 — score is
- * 0|1 and `score >= threshold` is the pass rule).
- * 0.6.0 §6.2 (PR 13b) — the `llm_judge` literal grades through
- * `@crewhaus/eval-judge`'s `gradeWithJudgePanel`, so a declared `judges`
- * panel / `repeats` / `temperature` / `target` and the judge profile's pinned
- * request `params` are honoured; it additionally carries `judgeModel`, the
- * INSTRUMENT `evaluate` grades with (a panel is named by its members joined
- * with `+`), so the pool's per-arm quality lineage folds the judge's identity
- * beside the grader kind; deterministic graders render no such field and stay
+ * Wired PER TURN, like the memory fabric: the turn's `cwd` (the eval bridge's
+ * per-sample `fabricRoot` in the eval entry) roots the proof bundles, and the
+ * `sessionRootDir` the daemon (or the bridge) gives the run is where the gate
+ * reads the session log. Under `provability:` the proof tools join the turn's
+ * tool list (`mergeGateTools`, replacing a same-named builtin the spec also
+ * listed), replay looks pure tools up in the same list, and the proof footer
+ * rides the REPLY (`footerTarget: "reply"`) — the text the bot sends — with
+ * `render: none` honoured by the runtime. The dream path carries no gate:
+ * its bounded fresh session is a consolidation pass, not a served answer.
+ * Empty pieces when the spec declares neither block, keeping those bundles
  * byte-identical.
- * Empty pieces when the
- * spec omits the block, keeping pre-existing bundles byte-identical.
- * Mirror: target-cli + target-managed render the same wiring — keep the
- * three in sync.
  */
-function renderEvaluation(ir: IrChannelV0): {
-  imports: string[];
-  bootBlock: string;
-  field: string;
-} {
-  const ev = ir.evaluation;
-  if (ev === undefined) return { imports: [], bootBlock: "", field: "" };
-  const field = "\n        evaluation: __evaluation,";
-  const typeImport = `import type { RunEvaluation } from "@crewhaus/runtime-core";`;
-  const onFail = escapeJsonString(ev.onFail);
-  // 0.6.0 §7.3 (PR 9c) — the cascade's escalation rung, resolved at lower
-  // time; rendered only under `on_fail: escalate` so every other bundle stays
-  // byte-identical.
-  const escalateField =
-    ev.escalateTo !== undefined ? `\n  escalateTo: ${escapeJsonString(ev.escalateTo)},` : "";
-  if (ev.grader.type === "llm_judge") {
-    const criteria = escapeJsonString(ev.grader.criteria);
-    const panel = { ...ev.grader, model: ev.grader.model ?? ir.agent.model };
-    const instrument = escapeJsonString(judgeInstrumentId(panel, ir.agent.model));
-    const bootBlock = `const __evaluation: RunEvaluation = {
-  graderType: "llm_judge",
-  judgeModel: ${instrument},
-  threshold: ${ev.threshold ?? 0.7},
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
-    const __verdict = await gradeWithJudgePanel({
-      rubric: {
-        criteria: [
-          {
-            name: "criteria",
-            description: ${criteria},
-            anchors: {
-              "1": "fails the criteria entirely",
-              "2": "mostly fails the criteria",
-              "3": "partially meets the criteria",
-              "4": "meets the criteria with minor gaps",
-              "5": "fully meets the criteria",
-            },
-          },
-        ],
-        passing_score: 3,
-      },
-      sample: { id: "in-loop-evaluation", input: "" },
-      run: inLoopRunResult({ finalText, messages, isSynthetic }),${renderJudgePanelFields(panel, "      ")}
-      // Judge spend rides the run bus (role "judge") so it is priced and
-      // counted toward budget.usd under budget.judge_share — every panelist
-      // and every repeat publishes its own model_request/model_response.
-      bus,
-    });
-    return {
-      score: __verdict.score,
-      rationale: __verdict.rationale,
-      judge: {
-        model: __verdict.judgeModel,
-        ...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),
-      },
-    };
-  },
-};`;
-    return {
-      imports: [typeImport, JUDGE_PANEL_IMPORT],
-      bootBlock,
-      field,
-    };
-  }
-  const value = ev.grader.value;
-  const valueLit = escapeJsonString(value);
-  if (ev.grader.type === "contains") {
-    const bootBlock = `const __evaluation: RunEvaluation = {
-  graderType: "contains",
-  threshold: 1,
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText }) =>
-    finalText.includes(${valueLit})
-      ? { score: 1, rationale: ${escapeJsonString(`output contains "${value}"`)} }
-      : { score: 0, rationale: ${escapeJsonString(`output missing "${value}"`)} },
-};`;
-    return { imports: [typeImport], bootBlock, field };
-  }
-  const bootBlock = `const __evalRegex = new RegExp(${valueLit});
-const __evaluation: RunEvaluation = {
-  graderType: "regex",
-  threshold: 1,
-  onFail: ${onFail},
-  maxRetries: ${ev.maxRetries},${escalateField}
-  evaluate: async ({ finalText }) => {
-    __evalRegex.lastIndex = 0;
-    return __evalRegex.test(finalText)
-      ? { score: 1, rationale: ${escapeJsonString(`output matches /${value}/`)} }
-      : { score: 0, rationale: ${escapeJsonString(`output does not match /${value}/`)} };
-  },
-};`;
-  return { imports: [typeImport], bootBlock, field };
+function renderEvaluation(
+  ir: IrChannelV0,
+  opts: { readonly toolsVar: string; readonly cwdExpr: string },
+): EvaluationWiring {
+  return renderEvaluationWiring(ir, {
+    catalogVar: opts.toolsVar,
+    cwdExpr: opts.cwdExpr,
+    footerTarget: "reply",
+    indent: "        ",
+    toolsInto: "list",
+    sessionRootDirExpr: "config.sessionRootDir",
+  });
 }
 
 /**
@@ -982,11 +866,6 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
     ? "\n        ...(config._adapter !== undefined ? { _adapter: config._adapter } : {}),"
     : "";
   const fabricCwdExpr = evalEntry ? "config.fabricRoot ?? process.cwd()" : "process.cwd()";
-  // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation for the
-  // interactive turn. Empty pieces when the spec omits the block.
-  const evaluation = renderEvaluation(ir);
-  const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
-  const evaluationBlock = evaluation.bootBlock ? `\n${evaluation.bootBlock}\n` : "";
   const hasRules = ir.permissions.rules.length > 0;
   // 0.6.0 PR 9e — the closure half of the pool (Consult / Escalate, the route
   // classifier, guide / shadow). "" — and no import — when the pool declares
@@ -1026,6 +905,16 @@ function renderAgent(ir: IrChannelV0, evalEntry = false): string {
   // without the opt-in keep the boot snapshot, byte-identically.
   const liveCatalog = Object.values(ir.mcp_servers).some((c) => c.required === false);
   const baseToolsExpr = liveCatalog ? "__liveTools" : "config.tools";
+  // Loop contract 0.4 (Batch B, G02) / 0.8.0 §4.4 — the in-loop gates for the
+  // interactive turn, wired per turn (see renderEvaluation). Empty pieces when
+  // the spec declares neither `evaluation:` nor `provability:`.
+  const evaluation = renderEvaluation(ir, { toolsVar: baseToolsExpr, cwdExpr: fabricCwdExpr });
+  const evalImport = evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
+  const evaluationTurnBlock = evaluation.bootBlock
+    ? `
+      // The in-loop gates, through the ONE composition root (0.8.0 §4.4).
+      ${evaluation.bootBlock}`
+    : "";
   const hbScopeOverride = fabric.continuityOn && ir.heartbeat !== undefined;
   const dreamOn = dreamConfigured(ir);
   // Loop contract 0.4 (Batch E, G23) — the live Thredz connection threads from
@@ -1103,11 +992,13 @@ function __memFragment(scope?: "spec" | "session"): MemoryWiringFragment {
       if (__skills.length > 0) __tools.push(createSkillTool(__skills));`
           : ""
       }`;
-  const toolsExpr = !fabric.wired
-    ? baseToolsExpr
-    : fabric.continuityOn
-      ? "__tools"
-      : `[...${baseToolsExpr}, ...__memTools]`;
+  const toolsExpr = evaluation.toolsExpr(
+    !fabric.wired
+      ? baseToolsExpr
+      : fabric.continuityOn
+        ? "__tools"
+        : `[...${baseToolsExpr}, ...__memTools]`,
+  );
   const skillsExpr = fabric.continuityOn ? "__skills" : "config.skills";
   const slashCommandsExpr = fabric.continuityOn
     ? "__memWired.options.slashCommands ?? config.slashCommands"
@@ -1191,7 +1082,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";${
     liveCatalog ? '\nimport { defaultCatalog } from "@crewhaus/tool-catalog";' : ""
   }
 import type { PromptCacheRotationStore } from "@crewhaus/prompt-cache-manager";
-${fragmentBlock}${memEmbedderBlock}${evaluationBlock}
+${fragmentBlock}${memEmbedderBlock}
 export type AgentConfig = {
   hooks: ReadonlyArray<HookDef>;
   skills: ReadonlyArray<SkillRef>;
@@ -1239,7 +1130,7 @@ export function createAgent(config: AgentConfig): Agent {
       // the text contains. Malicious inbound is replaced by a redaction
       // notice; pass/warn content is tagged into runContext.dataLineage so
       // the egress fabric sees the channel origin on later external calls.
-      const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}
+      const __inbound = await classifyInbound(args.message, runContext, { origin: "channel" });${memTurnBlock}${evaluationTurnBlock}
       return await runChatLoop({
         model: ${escapeJsonString(ir.agent.model)},
         instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentTuningFields(ir)}${renderModelWiringFields(ir.agent, "        ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderCompactionFields(ir)}

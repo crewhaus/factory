@@ -296,6 +296,49 @@ describe("extractClaims — numbered lists", () => {
       ["Revenue rose sharply.", "Margins held."],
     );
   });
+
+  test("inside a list item the same rule holds: an indented 1. or 14. is the item's text", () => {
+    // Indented to the item's content, the line reaches the item's paragraph,
+    // and an empty item or one not numbered 1 cannot interrupt it — what a
+    // renderer shows is "…takes 1." and "…cut to 14. Customers…".
+    expect(texts("- Approval for refunds usually takes\n  1.\n\nThat is the policy.")).toEqual([
+      "Approval for refunds usually takes 1.",
+    ]);
+    expect(texts("1. The refund window was cut to\n   14. Customers were told by email.")).toEqual([
+      "The refund window was cut to 14.",
+      "Customers were told by email.",
+    ]);
+    const cited = extractClaims(
+      "- Refunds are processed within\n  5. Source: the policy page [1].\n\n[1]: https://acme.example/one",
+    );
+    expect(cited.map(({ text, markers }) => ({ text, markers }))).toEqual([
+      { text: "Refunds are processed within 5.", markers: [] },
+      { text: "Source: the policy page.", markers: ["1"] },
+    ]);
+    // Read as a new empty item, "14." put the lazy line under it at the top
+    // level, and the fence after that at column 0, where nothing closed it:
+    // both items after it were hidden as code.
+    const fenced = extractClaims(
+      "- Refunds over 500 dollars need a manager.\n   14.\nMost are approved the same day.\n  ```\n- Refunds take 30 days to clear.\n- Chargebacks cost 15 dollars each [1].\n\n[1]: https://acme.example/fees",
+    );
+    expect(fenced.map(({ text, markers }) => ({ text, markers }))).toEqual([
+      { text: "Refunds over 500 dollars need a manager. 14.", markers: [] },
+      { text: "Most are approved the same day.", markers: [] },
+      { text: "Refunds take 30 days to clear.", markers: [] },
+      { text: "Chargebacks cost 15 dollars each.", markers: ["1"] },
+    ]);
+  });
+
+  test("a marker indented less than the item's content leaves the item, whatever its number", () => {
+    // It starts a sibling or an outer item, which any marker may (CommonMark).
+    expect(
+      texts("- Setup steps for the service:\n  - Install the package [1]\n2. Run the tests [2]"),
+    ).toEqual(["Setup steps for the service:", "Install the package", "Run the tests"]);
+    expect(texts("1. Refunds take 30 days [1].\n   - Approval is manual [2].\n2.\n")).toEqual([
+      "Refunds take 30 days.",
+      "Approval is manual.",
+    ]);
+  });
 });
 
 describe("extractClaims — headings are lines", () => {
@@ -531,6 +574,77 @@ describe("extractClaims — markers and lines", () => {
     expect(texts("Smith et al.[1][2] found that refunds take 14 days.")).toHaveLength(1);
   });
 
+  test("only citation ids make a run: a one-word link opening a sentence keeps its marker", () => {
+    // `[Stripe][2]` is a link whose text is the sentence's subject. Read as
+    // a run like [1][2], its [2] moved onto the uncited sentence before it,
+    // and the sentence that cites [2] was flagged uncited.
+    const defs = "\n\n[1]: https://acme.example/one\n[2]: https://acme.example/two";
+    for (const join of [" ", "\n"]) {
+      const text = `Revenue rose last year in every region we track.${join}[Stripe][2] charges 2.9% per card transaction.${defs}`;
+      const claims = extractClaims(text).map(({ text: t, markers }) => ({ text: t, markers }));
+      expect(claims).toEqual([
+        { text: "Revenue rose last year in every region we track.", markers: [] },
+        { text: "charges 2.9% per card transaction.", markers: ["2"] },
+      ]);
+      // The same sentence and marker citedClaims gives FactCrossCheck.
+      expect(claims.filter((c) => c.markers.length > 0)).toEqual(
+        citedClaims(text).map(({ text: t, markers }) => ({ text: t, markers })),
+      );
+    }
+    // Glued to the full stop, no full stop sits before the run, so nothing
+    // ends there: one sentence citing [2], as citedClaims reads it.
+    const glued = `Revenue rose last year in every region we track.[Stripe][2] charges 2.9% per card transaction.${defs}`;
+    expect(extractClaims(glued).map(({ text, markers }) => ({ text, markers }))).toEqual(
+      citedClaims(glued).map(({ text, markers }) => ({ text, markers })),
+    );
+    expect(extractClaims(glued)).toHaveLength(1);
+    // An id the document defines, an assumption and a footnote still make a run.
+    for (const label of ["smith2020", "A1", "^a"]) {
+      const text = `Revenue rose 12% in 2024. [${label}][2] Costs fell 3% in every region.\n\n[smith2020]: ./smith.md\n[2]: ./b.md`;
+      expect(extractClaims(text).map((c) => c.markers)).toEqual([["2"], []]);
+    }
+  });
+
+  test("a piece that is nothing but brackets cites the sentence before it, whatever the labels", () => {
+    // Left as a piece of its own it has no words, and its marker would
+    // belong to no claim at all.
+    const claims = extractClaims("Revenue rose in every region we track. [x][A5]");
+    expect(claims.map(({ text, markers }) => ({ text, markers }))).toEqual([
+      { text: "Revenue rose in every region we track.", markers: ["A5"] },
+    ]);
+    expect(
+      extractClaims("Revenue rose in every region we track. [Stripe][2]\n- Costs fell 3%.").map(
+        (c) => c.markers,
+      ),
+    ).toEqual([["2"], []]);
+  });
+
+  test("a block quote under a paragraph line is a block of its own", () => {
+    // CommonMark lets `>` interrupt a paragraph; the splitter does not break
+    // there, so the two ran into one claim citing both.
+    const claims = extractClaims(
+      "Revenue rose in every region we track [2]\n> Costs fell 3% in every region [1].",
+    );
+    expect(claims.map(({ text, markers }) => ({ text, markers }))).toEqual([
+      { text: "Revenue rose in every region we track", markers: ["2"] },
+      { text: "Costs fell 3% in every region.", markers: ["1"] },
+    ]);
+    // `---` under the quote is a thematic break, not a setext underline for
+    // the paragraph the piece began in: both claims were excluded as a heading.
+    expect(
+      extractClaims(
+        "Revenue rose in every region we track\n> costs fell 3% in every region [1]\n---\n",
+      ).map(({ text, markers }) => ({ text, markers })),
+    ).toEqual([
+      { text: "Revenue rose in every region we track", markers: [] },
+      { text: "costs fell 3% in every region", markers: ["1"] },
+    ]);
+    // A lazy line after the quote is still the quote's paragraph.
+    expect(
+      texts("> Revenue rose in every region we track\nand costs fell 3% in every region [1]."),
+    ).toEqual(["Revenue rose in every region we track and costs fell 3% in every region."]);
+  });
+
   test("a glued marker after an abbreviation or an initial ends nothing", () => {
     expect(texts("Smith et al.[1] found that refunds take 14 days.")).toEqual([
       "Smith et al. found that refunds take 14 days.",
@@ -623,6 +737,9 @@ describe("extractClaims agrees with citedClaims", () => {
         `${words}. [x${id}]${marker}`,
         // Nothing but inline code, cited.
         `\`${words}\` ${marker}.`,
+        // A one-word link opening the sentence: its marker is the
+        // sentence's, and after a question it was lost with the question.
+        marker === "" ? `${words}.` : `[Stripe]${marker} ${words}.`,
       ]);
     };
     for (let doc = 0; doc < 300; doc++) {
@@ -647,6 +764,21 @@ describe("extractClaims agrees with citedClaims", () => {
         else if (shape < 0.3) lines.push("", `${pick(["  ", "   ", " "])}# Summary`, sentence());
         else if (shape < 0.36) lines.push("", "- item text here", "", `  ${sentence()}`, "---", "");
         else if (shape < 0.42) lines.push("", "refund window days", "1.", "");
+        // The same inside a list item: an indented 1. or 14. that cannot
+        // interrupt the item's paragraph, and a fence after one, which a
+        // reader that took "14." for an item put at column 0 and never closed.
+        else if (shape < 0.48) lines.push("", "- refund window days", "  1.", "", sentence());
+        else if (shape < 0.54)
+          lines.push("", "1. refund window was cut to", `   14. ${sentence()}`, "", sentence());
+        else if (shape < 0.6)
+          lines.push(
+            "",
+            "- refunds need a manager.",
+            "   14.",
+            "most are approved.",
+            "  ```",
+            sentence(),
+          );
       }
       const text = lines.join("\n");
       const all = text.split("\n");
@@ -671,4 +803,26 @@ describe("extractClaims agrees with citedClaims", () => {
     expect(extractClaims("")).toEqual([]);
     expect(extractClaims("\n\n   \n")).toEqual([]);
   });
+});
+
+describe("extractClaims — linear in the document", () => {
+  test("bullets nested deep, then many lazy lines under them", () => {
+    // The gate reads model answers through this, synchronously. The shape
+    // took 1.3 s at 195 KB (readBlocks scanned the open items per lazy
+    // line); timed against the same size with no nesting, the least of
+    // three runs, so a slow machine slows both.
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const n = 50_000;
+    const nested = `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`;
+    const base = fastest(() => extractClaims(`${"y ".repeat(n)}x\n${"y\n".repeat(n)}`));
+    expect(fastest(() => extractClaims(nested))).toBeLessThan(base * 20 + 100);
+  }, 60_000);
 });

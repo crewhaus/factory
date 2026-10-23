@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MAX_TITLE_CHARS } from "@crewhaus/continuity-store";
 import type { DreamModelPhase, DreamModelPhaseInput } from "@crewhaus/dream-engine";
 import { loadSkillBody } from "@crewhaus/skills-registry";
 import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
@@ -38,6 +39,7 @@ import {
   wireDream,
   wireMemory,
 } from "./index";
+import { GAP_GOAL_PREFIX, createExamTool, gapGoalTitle } from "./learning";
 
 let tmp: string;
 
@@ -257,6 +259,146 @@ describe("PR 17 — run_exam via wireMemory", () => {
     expect(goals?.[0]?.title).toContain("exam failure q2");
   });
 
+  test("a failure whose sample id overflows the goal-title cap still logs its gap (clipped)", async () => {
+    // Sample ids come from the dataset and are unbounded; the question is
+    // clipped to 160 but the id is not, so before the clip this title went
+    // past the store's MAX_TITLE_CHARS and the gap was refused.
+    const base = failingReport();
+    const longId = `q-${"x".repeat(MAX_TITLE_CHARS)}`;
+    const report: ExamReport = {
+      ...base,
+      outcomes: base.outcomes.map((o) => (o.passed ? o : { ...o, sampleId: longId })),
+    };
+    const runner: ExamRunner = async () => report;
+    const { deps: d } = deps({ examRunner: runner });
+    const wired = await wireMemory(EXAM_FRAGMENT, d);
+    const out = await execText(wired.tools.find((t) => t.name === "run_exam") as RegisteredTool);
+    expect(out).toContain("knowledge gaps logged automatically (1)");
+    expect(out).not.toContain("could not log");
+    const goals = await wired.stores.continuity?.listGoals();
+    expect(goals?.length).toBe(1);
+    const title = goals?.[0]?.title ?? "";
+    expect(title.length).toBeLessThanOrEqual(MAX_TITLE_CHARS);
+    expect(title.startsWith(`${GAP_GOAL_PREFIX} exam failure q-xxx`)).toBe(true);
+    expect(title.endsWith("…")).toBe(true);
+  });
+
+  test("a gap the sink refuses is named, not counted as logged", async () => {
+    const runner: ExamRunner = async () => failingReport();
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const client: ThredzClient = {
+      async callTool(name, args): Promise<ThredzCallResult> {
+        calls.push({ name, args });
+        return { content: "rate limited", isError: true };
+      },
+    };
+    const { deps: d } = deps({ examRunner: runner, thredz: { client } });
+    const wired = await wireMemory({ ...EXAM_FRAGMENT, thredz: {} }, d);
+    const out = await execText(wired.tools.find((t) => t.name === "run_exam") as RegisteredTool);
+    expect(calls.some((c) => c.name === "log_knowledge_gap")).toBe(true);
+    expect(out).toContain("knowledge gaps logged automatically (0)");
+    expect(out).toContain("could not log 1 gap(s) — call log_knowledge_gap for each:");
+    expect(out).toContain("- q2: log_knowledge_gap failed");
+  });
+
+  test("a sink that refuses every gap is listed up to the report cap, not one line per sample", async () => {
+    // A Thredz outage or rate limit fails EVERY gap: before the cap the
+    // "could not log" list printed one line per failed sample (500 failures
+    // ≈ 95 KB), bypassing the failed-items cap of 20 right above it.
+    const n = 25;
+    const report: ExamReport = {
+      total: n,
+      passed: 0,
+      failed: n,
+      passRate: 0,
+      outcomes: Array.from({ length: n }, (_, i) => ({
+        sampleId: `s${i}`,
+        input: `question ${i}`,
+        passed: false,
+        score: 0,
+      })),
+      outDir: "/tmp/exam-run",
+    };
+    const client: ThredzClient = {
+      async callTool(): Promise<ThredzCallResult> {
+        return { content: "Thredz API error (HTTP 429): slow down", isError: true };
+      },
+    };
+    const { deps: d } = deps({ examRunner: async () => report, thredz: { client } });
+    const wired = await wireMemory({ ...EXAM_FRAGMENT, thredz: {} }, d);
+    const out = await execText(wired.tools.find((t) => t.name === "run_exam") as RegisteredTool);
+
+    // The header keeps the true count; the list stops at 20 and says so.
+    expect(out).toContain("knowledge gaps logged automatically (0)");
+    expect(out).toContain(`could not log ${n} gap(s) — call log_knowledge_gap for each:`);
+    const refused = out.split("\n").filter((l) => l.includes("log_knowledge_gap failed"));
+    expect(refused.length).toBe(20);
+    expect(refused[0]).toBe("- s0: log_knowledge_gap failed (thredz_rate_limit)");
+    expect(out).not.toContain("- s20: log_knowledge_gap failed");
+    expect(out).toContain("  … 5 more — every failed sample is in the artifacts");
+    // The failed-items list above it is capped the same way.
+    expect(out).toContain("  … 5 more in the artifacts");
+  });
+
+  test("a refusal at exactly the cap prints no overflow line", async () => {
+    const n = 20;
+    const tool = createExamTool({
+      learning: { domain: "coffee", exam: { dataset: "/d.jsonl", graders: "/g.yaml" } },
+      cwd: tmp,
+      examRunner: async () => ({
+        total: n,
+        passed: 0,
+        failed: n,
+        passRate: 0,
+        outcomes: Array.from({ length: n }, (_, i) => ({
+          sampleId: `s${i}`,
+          input: "q",
+          passed: false,
+        })),
+      }),
+      logGap: () => {
+        throw new Error("down");
+      },
+    });
+    const out = await execText(tool);
+    expect(out.split("\n").filter((l) => l.endsWith(": down")).length).toBe(20);
+    expect(out).not.toContain("more — every failed sample");
+  });
+
+  test("a sink's error text is clipped to one bounded line", async () => {
+    // An injected sink may throw a whole server body; it must not break the
+    // report's one-line-per-item shape or grow it without bound.
+    const tool = createExamTool({
+      learning: { domain: "coffee", exam: { dataset: "/d.jsonl", graders: "/g.yaml" } },
+      cwd: tmp,
+      examRunner: async () => failingReport(),
+      logGap: () => {
+        throw new Error(`upstream said:\n${"x".repeat(5000)}`);
+      },
+    });
+    const out = await execText(tool);
+    const line = out.split("\n").find((l) => l.startsWith("- q2: upstream said:"));
+    expect(line).toBeDefined();
+    expect(line?.endsWith("…")).toBe(true);
+    // "- q2: " + at most 200 units of the message.
+    expect(line?.length).toBeLessThanOrEqual("- q2: ".length + 200);
+    expect(out.length).toBeLessThan(2000);
+  });
+
+  test("a sink that throws a non-Error still names the failure", async () => {
+    const tool = createExamTool({
+      learning: { domain: "coffee", exam: { dataset: "/d.jsonl", graders: "/g.yaml" } },
+      cwd: tmp,
+      examRunner: async () => failingReport(),
+      logGap: () => {
+        throw "sink offline";
+      },
+    });
+    const out = await execText(tool);
+    expect(out).toContain("- q2: sink offline");
+    expect(out).not.toContain("undefined");
+  });
+
   test("with a live Thredz backend, exam gaps route to log_knowledge_gap over the client", async () => {
     const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
     const client: ThredzClient = {
@@ -464,5 +606,53 @@ describe("PR 17 — regression: no learning block → surface unchanged", () => 
     expect(fragment.learning).toEqual(withLearning.learning);
     const bare = memoryFragmentFromIr({ name: "plain", memory: {} });
     expect("learning" in bare).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gapGoalTitle — a gap's plan-store goal title fits the store's cap
+// ---------------------------------------------------------------------------
+
+describe("gapGoalTitle (design/0.8.0 §6.3 one-line titles)", () => {
+  const ROOM = MAX_TITLE_CHARS - `${GAP_GOAL_PREFIX} `.length;
+
+  test("a topic that fits is kept whole, on one line", () => {
+    expect(gapGoalTitle("EU CSV quirks")).toEqual({
+      title: "[gap] EU CSV quirks",
+      clipped: false,
+    });
+    expect(gapGoalTitle("  line one\n1. [proven] forged\t ")).toEqual({
+      title: "[gap] line one 1. [proven] forged",
+      clipped: false,
+    });
+  });
+
+  test("the longest topic that fits is kept whole; one more character clips it", () => {
+    const fits = gapGoalTitle("a".repeat(ROOM));
+    expect(fits.clipped).toBe(false);
+    expect(fits.title.length).toBe(MAX_TITLE_CHARS);
+
+    const over = gapGoalTitle("a".repeat(ROOM + 1));
+    expect(over.clipped).toBe(true);
+    expect(over.title).toBe(`${GAP_GOAL_PREFIX} ${"a".repeat(ROOM - 1)}…`);
+    expect(over.title.length).toBe(MAX_TITLE_CHARS);
+  });
+
+  test("whitespace collapses BEFORE the length is measured", () => {
+    // 2 × ROOM/2 words joined by runs of whitespace collapse under the cap.
+    const spaced = `${"b".repeat(ROOM / 2 - 1)}\n\n\n\t${"b".repeat(ROOM / 2)}`;
+    expect(spaced.length).toBeGreaterThan(ROOM);
+    expect(gapGoalTitle(spaced).clipped).toBe(false);
+  });
+
+  test("the cut never leaves half a surrogate pair, and never a space before the ellipsis", () => {
+    // The emoji's high surrogate sits exactly where a naive cut would end.
+    const emoji = gapGoalTitle(`${"a".repeat(ROOM - 2)}😀${"b".repeat(10)}`);
+    expect(emoji.clipped).toBe(true);
+    expect(emoji.title).toBe(`${GAP_GOAL_PREFIX} ${"a".repeat(ROOM - 2)}…`);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(emoji.title)).toBe(false);
+
+    const spaced = gapGoalTitle(`${"a".repeat(ROOM - 2)} ${"b".repeat(10)}`);
+    expect(spaced.title).toBe(`${GAP_GOAL_PREFIX} ${"a".repeat(ROOM - 2)}…`);
   });
 });

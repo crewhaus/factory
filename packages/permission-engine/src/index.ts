@@ -161,6 +161,15 @@ export const BUILTIN_BOOKKEEPING_RULES: ReadonlyArray<PermissionRule> = [
   // HEADLESS session — an introspection tool that parks on approval there
   // is useless for exactly the case it exists for.
   { type: "alwaysAllow", pattern: "ListTools", source: "builtin" },
+  // 0.8.0 (design/0.8.0-provability-release.md §7) — the provability gate's
+  // read-only tools. `provability:` installs them without the spec listing
+  // them, and the gate's own retry nudge tells the model to run
+  // ProvabilityPreflight; on a headless surface an unruled call parks the
+  // turn on the gate's bookkeeping. Both only read (the evidence, the
+  // checkers' availability). `ProofCheck` writes a proof artifact and may
+  // start a sandbox container, so it keeps the mode default.
+  { type: "alwaysAllow", pattern: "ProvabilityPreflight", source: "builtin" },
+  { type: "alwaysAllow", pattern: "ProofCheckers", source: "builtin" },
 ];
 
 /**

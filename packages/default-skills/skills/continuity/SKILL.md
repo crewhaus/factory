@@ -64,6 +64,12 @@ claimed → proven`.
   or whose tool result errored. Never fabricate a toolUseId — a rejected
   proof is worse than an honest `claimed`.
 - Narration can never produce a proven step. Only tool results can.
+- Your harness's proof mode may be stricter or looser than this default.
+  Under `require`, nothing below `proven` completes anything: a goal reaches
+  its target only in the same `GoalUpdate` that proves it. Under `off` (a
+  harness with no event log), the ids are recorded without being checked and
+  the step reads `proven (unverified)` — report it as your own account, not
+  as verified work.
 
 ## Bias to action
 

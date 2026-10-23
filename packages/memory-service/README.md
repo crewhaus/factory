@@ -85,7 +85,7 @@ type MemoryWiringFragment = {
   continuity?: {
     enabled?: boolean;
     plan?: boolean;                // false ⇒ only FocusRead/FocusWrite + MemoryClear
-    proof?: "ladder" | "require" | "off"; // §2.4 — require/off carried, degrade to the ladder (boot note)
+    proof?: "ladder" | "require" | "off"; // §2.4 — tool-plan's proofMode (enforced since 0.8.0)
     ledger?: boolean;              // §2.3 requirements ledger flag
     handoff?: boolean;             // deterministic teardown handoff.md
     scope?: "spec" | "session";   // "auto" is resolved by the compiler, not here
@@ -96,10 +96,22 @@ type MemoryWiringFragment = {
 
 The fragment carries **only knobs this root actually wires** — no dead
 config. §9 fields whose engines land later join with their PRs: `dream`
-(PR 14), `backend: "thredz"` implementations (PR 16). The one carried-but-
-degraded field is `continuity.proof`: `require`/`off` need a proof-mode seam
-on tool-plan's `createPlanTools`, so until that lands they run the default
-claimed→proven ladder and say so in a boot note.
+(PR 14), `backend: "thredz"` implementations (PR 16). `continuity.proof`
+passes straight to tool-plan's `createPlanTools({proofMode})` (0.8.0,
+design/0.8.0-provability-release.md §6.3 — before that, `require`/`off`
+degraded to the ladder with a boot note, which is gone):
+
+- `ladder` (default) — `claimed` is free; `proven` is machine-checked
+  against the session event log.
+- `require` — the ladder, and nothing below `proven` completes anything:
+  `claimed` stays settable, but a goal cannot reach its target unproven.
+- `off` — for harnesses with no event log: `PlanComplete` / `GoalUpdate`
+  record the cited toolUseIds without resolving them and pin no session.
+  `PlanComplete` emits `action_proof` with `verdict: "unverified"`, and a
+  goal proven that way has `verification: "unverified"` on its
+  `goal_update`. Every render this package and tool-plan produce (the
+  `<current_plan>` tail, `handoff.md`, `PlanRead`, `GoalList`) says
+  `[proven (unverified)]`, never `[proven]`.
 
 ### The deps
 
@@ -144,7 +156,8 @@ callers that need only one tier — e.g. a dream tick that wants the stores
 without the chat-loop seams. `wireMemory` composes them and additionally:
 
 - routes `log_knowledge_gap` into the plan store as a `[gap]` goal when both
-  wiki and continuity are wired (§3.2);
+  wiki and continuity are wired (§3.2). A topic too long for the store's
+  title cap is shortened to fit, and the tool result says so;
 - assembles the skills/commands surface (the builtin `continuity` skill;
   `/plan /focus /next /handoff /clear-plan /clear-focus`, plus `/forget` when
   facts are on). `/study /reflect /exam /dream` stay out until their

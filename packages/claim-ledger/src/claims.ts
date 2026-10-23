@@ -36,13 +36,20 @@
  *   gives `citedClaims` one sentence citing both. A run "[1][2]" is read
  *   the same way, but the grammar's marker in it is [2] alone: CommonMark
  *   renders it as a reference link to [2], and the marker set stays the one
- *   CitationLint reads, which reports [1] uncited.
+ *   CitationLint reads, which reports [1] uncited. Only citation ids make a
+ *   run — a number, a footnote, an assumption, an id the document defines:
+ *   "[Stripe][2] charges 2.9%" opens its sentence with a link, and [2] is
+ *   that sentence's, as `citedClaims` has it. A piece that is nothing but
+ *   brackets, "Revenue rose. [x][2]", gives all its markers to the sentence
+ *   before it, whatever the labels, rather than to no claim.
  * - A numbered list's marker is not a sentence. The splitter ends one after
  *   "1." as after any full stop; here "1." opening a list item is the item's
  *   bullet. Where it cannot open one — "12.", or "1." with nothing after it,
  *   on the line after a paragraph line, which CommonMark reads as the
  *   paragraph going on — it stays with the sentence above it, so the figure
- *   is still read.
+ *   is still read. That holds inside a list item as at the top level: under
+ *   "- Refunds take" an indented "  5." finishes the item's sentence. Only a
+ *   marker indented less than the item's content leaves it for a new item.
  * - A heading is a line that is one: `#` opening a line (after up to three
  *   spaces, counted inside a list item from its content), or a setext
  *   underline under a paragraph that is not in a list item or a block quote
@@ -78,6 +85,7 @@
  * reader sees goes unread.
  */
 import {
+  citationIdTest,
   definitionEntries,
   definitionItemSource,
   labelRunStart,
@@ -214,10 +222,13 @@ type Lines = {
   /** Where a block starts or ends that the splitter does not know of, so
    *  the text on either side is never one piece: just after a setext
    *  underline, or a thematic break under a list item or quote (the next
-   *  line is a new block), and on both sides of every heading line. The
-   *  splitter breaks around a heading only at column 0, so an indented one,
-   *  or one inside a list item, ran into the line under it, and the whole
-   *  piece — the claim on that line with it — was excluded as a heading. */
+   *  line is a new block), on both sides of every heading line, and where a
+   *  block quote opens under a line outside one. The splitter breaks around
+   *  a heading only at column 0, so an indented one, or one inside a list
+   *  item, ran into the line under it, and the whole piece — the claim on
+   *  that line with it — was excluded as a heading. It never breaks before
+   *  `>`, though a quote interrupts a paragraph (CommonMark): "Revenue rose
+   *  [2]\n> Costs fell [1]." was one claim citing both. */
   readonly blockEnds: ReadonlyArray<number>;
   /** 0-based line of an offset. */
   readonly at: (offset: number) => number;
@@ -247,6 +258,7 @@ function readLines(text: string, blocks: BlockLines): Lines {
       cuts.add(starts[k] as number);
       if (k + 1 < count) cuts.add(starts[k + 1] as number);
     }
+    if (quote && !inQuote && k > 0 && blocks.code[k] === 0) cuts.add(starts[k] as number);
     inList = !blank && blocks.contained[k] === 1;
     inQuote = !blank && (quote || (!previousBlank && inQuote));
     contained[k] = inList || inQuote ? 1 : 0;
@@ -289,9 +301,15 @@ function opensLine(text: string, at: number, lines: Lines): boolean {
  * extractor already found, so no second copy of the marker grammar is
  * written here. A marker's run starts where `labelRunStart` says: in
  * "text.[1][2] Next" the grammar's one marker is [2], and the full stop is
- * before the [1] glued to it.
+ * before the [1] glued to it. In "text.[Stripe][2] Next" the bracket before
+ * [2] is a link's text, not an id (`isCitationId`), so no full stop sits
+ * before the run and the sentence goes on, as `citedClaims` reads it.
  */
-function gluedCuts(text: string, marks: ReadonlyArray<Mark>): number[] {
+function gluedCuts(
+  text: string,
+  marks: ReadonlyArray<Mark>,
+  isCitationId: (label: string) => boolean,
+): number[] {
   const cuts: number[] = [];
   let k = 0;
   while (k < marks.length) {
@@ -303,7 +321,7 @@ function gluedCuts(text: string, marks: ReadonlyArray<Mark>): number[] {
     const after = (marks[last] as Mark).end;
     k = last + 1;
     if (after < text.length && !/[ \t\r\n]/.test(text[after] as string)) continue;
-    const run = labelRunStart(text, first.at);
+    const run = labelRunStart(text, first.at, isCitationId);
     let p = run;
     while (p > 0 && `"')`.includes(text[p - 1] as string)) p--;
     if (p === 0 || !/[.!?]/.test(text[p - 1] as string)) continue;
@@ -411,14 +429,18 @@ function joinListMarkers(text: string, pieces: ReadonlyArray<Piece>, lines: Line
 /**
  * Headings and reference-list items marked excluded, and a setext underline
  * under a list item or a quote cut off: there `---` is a thematic break and
- * `===` is text, so the line above it is a claim, not a heading.
+ * `===` is text, so the line above it is a claim, not a heading. Which it is
+ * depends on the line the underline sits under, the one `readLines` asks
+ * about too, not on where the piece starts: a piece that began in a
+ * paragraph and ran into a quote was excluded whole as a heading.
  */
 function markBlocks(text: string, pieces: Piece[], lines: Lines, bibliographic: boolean): void {
   for (const piece of pieces) {
     const lineOfFirst = lines.at(piece.first);
     const underline = SETEXT_UNDERLINE.exec(text.slice(piece.first, piece.end));
     if (underline !== null) {
-      if (lines.contained[lineOfFirst] === 1) {
+      // The match starts at the line break that ends the line above it.
+      if (lines.contained[lines.at(piece.first + underline.index)] === 1) {
         piece.end = trimEnd(text, piece.first, piece.first + underline.index);
       } else piece.excluded = true;
     }
@@ -497,6 +519,7 @@ export function extractClaims(text: string, options: ExtractClaimsOptions = {}):
   const zones = merge([...fences, ...definitions.map((d) => d.range)]);
   const lineAt = lineIndex(text);
   const lines = readLines(text, blocks);
+  const isCitationId = citationIdTest(text);
   const marks: Mark[] = [];
   for (const { marker, at } of markersOutsideCode(text, inCode)) {
     marks.push({ marker, at, end: text.indexOf("]", at) + 1 });
@@ -505,7 +528,7 @@ export function extractClaims(text: string, options: ExtractClaimsOptions = {}):
   // Sentence ranges with the zones cut out, in document order.
   const cut: Piece[] = [];
   let z = 0;
-  const cuts = [...gluedCuts(text, marks), ...lines.blockEnds].sort((a, b) => a - b);
+  const cuts = [...gluedCuts(text, marks, isCitationId), ...lines.blockEnds].sort((a, b) => a - b);
   // The splitter breaks lines at `\n` alone: in a CRLF document the full
   // stop before `\r` ends nothing and `\r\n\r\n` is no paragraph break, so
   // whole paragraphs would run together. It reads a copy with each break as
@@ -542,15 +565,24 @@ export function extractClaims(text: string, options: ExtractClaimsOptions = {}):
   const joined: Piece[] = [];
   for (const piece of pieces) {
     const prev = joined[joined.length - 1];
-    if (prev !== undefined && !prev.excluded && !piece.excluded) {
+    if (prev !== undefined && !prev.excluded && !piece.excluded && piece.marks.length > 0) {
       let to = piece.first;
       let lead = 0;
-      for (const mark of piece.marks) {
-        // Spaces, then the marker — or the reference-link run it ends,
-        // "[1][2]" (`labelRunStart`).
-        if (!/^\s*$/.test(text.slice(to, labelRunStart(text, mark.at)))) break;
-        to = mark.end;
-        lead++;
+      if (!HAS_WORD.test(plainClaim(text.slice(piece.first, piece.end)))) {
+        // Nothing but brackets: "Revenue rose. [x][2]" says nothing after
+        // its full stop, so every marker in it is the sentence before's,
+        // whatever the labels are. Left here they would cite no claim.
+        lead = piece.marks.length;
+        to = (piece.marks[lead - 1] as Mark).end;
+      } else {
+        for (const mark of piece.marks) {
+          // Spaces, then the marker — or the run of citation ids it ends,
+          // "[1][2]" (`labelRunStart`). "[Stripe][2] charges 2.9%" is a link
+          // opening the sentence, and its [2] stays with that sentence.
+          if (!/^\s*$/.test(text.slice(to, labelRunStart(text, mark.at, isCitationId)))) break;
+          to = mark.end;
+          lead++;
+        }
       }
       if (lead > 0 && SAME_PARAGRAPH.test(text.slice(prev.end, piece.first))) {
         for (let i = 0; i < lead; i++) prev.marks.push(piece.marks[i] as Mark);

@@ -48,6 +48,7 @@ describe("@crewhaus/claim-ledger", () => {
       "commonMarkFences",
       "readBlocks",
       "labelRunStart",
+      "citationIdTest",
     ]) {
       expect(ledger).not.toHaveProperty(name);
     }

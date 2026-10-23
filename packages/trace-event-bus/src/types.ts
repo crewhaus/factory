@@ -1040,6 +1040,13 @@ export type ProvabilityGradedEvent = TraceEventEnvelope & {
   met: number;
   unmet: number;
   assumptions: number;
+  /**
+   * Declared assumptions the config refused (`ProofBundle.assumptionsRefused`),
+   * when any. A refusal fails the verdict whatever the score, so without it a
+   * failing line with `score >= threshold` would not say why. (0.8.0 additive,
+   * W2-A.)
+   */
+  assumptionsRefused?: number;
   /** 0 = the original answer, n = the n-th gate-triggered retry. */
   retryIndex: number;
   maxRetries: number;

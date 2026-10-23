@@ -80,8 +80,10 @@ declarative sentence is a marker of some extracted claim. `extractClaims` also r
 CommonMark renderer does, list items included (`- ```js` opens a fence, and an item's end closes
 one), cuts fenced code and definition lines out of a sentence, gives a marker written after the
 full stop (`text. [1]`, `text.[1]`, or `text.[1][2]`, a reference link whose one marker is `[2]`)
-to the sentence before it, treats a numbered
-list's `1.` as a bullet rather than a sentence, reads a heading only where a line is one (indented
+to the sentence before it — a run only of citation ids, so `[Stripe][2] charges…` keeps its marker
+— treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
+indented `14.` that cannot interrupt a list item's paragraph as that paragraph's text), splits at a
+block quote opening under a paragraph, reads a heading only where a line is one (indented
 or inside a list item too) and never lets it take the line under it, counts a cited or
 figure-bearing line of inline code as a claim, and reports the line where the claim's first
 character sits. Every difference leans toward reading

@@ -736,6 +736,26 @@ describe("#383 — builtin bookkeeping rules", () => {
     expect(evaluate(bookkeepingCall("MemoryClear"), "default", rs)).toBe("ask");
   });
 
+  test("0.8.0 — the provability gate's read-only tools allow; ProofCheck (writes an artifact) still asks", () => {
+    const rs: RuleSet = { ...emptyRuleSet, builtin: [...BUILTIN_DEFAULT_RULES] };
+    const call = (toolName: string, readOnly: boolean): ToolCallContext => ({
+      toolName,
+      input: {},
+      readOnly,
+      destructive: !readOnly,
+    });
+    expect(evaluate(call("ProvabilityPreflight", true), "default", rs)).toBe("allow");
+    expect(evaluate(call("ProofCheckers", true), "default", rs)).toBe("allow");
+    expect(evaluate(call("ProofCheck", false), "default", rs)).toBe("ask");
+    // A spec rule still outranks the builtin grant.
+    const denied: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [rule("alwaysDeny", "ProvabilityPreflight")],
+      builtin: [...BUILTIN_DEFAULT_RULES],
+    };
+    expect(evaluate(call("ProvabilityPreflight", true), "default", denied)).toBe("deny");
+  });
+
   test("a spec-level alwaysAsk still outranks the builtin bookkeeping allow", () => {
     const rs: RuleSet = {
       ...emptyRuleSet,

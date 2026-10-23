@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { commonMarkFences, fencedSpans } from "./markdown";
+import { commonMarkFences, fencedSpans, readBlocks } from "./markdown";
 
 const blocks = (text: string): string[] =>
   commonMarkFences(text).map(([start, end]) => text.slice(start, end));
@@ -85,4 +85,66 @@ describe("commonMarkFences — the claim extractor's code reader", () => {
     expect(fencedSpans(text)).toEqual([[0, text.length]]);
     expect(commonMarkFences(text)).toEqual([[0, "```\ncode\n  ```".length]]);
   });
+});
+
+describe("readBlocks — list items", () => {
+  const items = (text: string): number[] => [...readBlocks(text).item];
+
+  test("a line indented to an item's content cannot open an empty item, or one not numbered 1", () => {
+    // It reaches the item's paragraph, so CommonMark's interruption rule
+    // holds there as at the top level: these are the paragraph going on.
+    expect(items("- Approval for refunds usually takes\n  1.\n")).toEqual([1, 0, 0]);
+    expect(items("1. The refund window was cut to\n   14. Customers were told.")).toEqual([1, 0]);
+    // With content and numbered 1, or a bullet, it may interrupt.
+    expect(items("1. Steps to follow\n   1. Install the package")).toEqual([1, 1]);
+    expect(items("- Steps to follow\n  - Install the package")).toEqual([1, 1]);
+  });
+
+  test("a marker indented less than the item's content leaves it, whatever its number", () => {
+    expect(items("- Setup steps\n  - Install it\n2.")).toEqual([1, 1, 1]);
+    expect(items("1. Refunds take 30 days.\n   - Approval is manual.\n2.")).toEqual([1, 1, 1]);
+  });
+
+  test("a fence after such a line stays in the item, and ends with it", () => {
+    // Read as an empty item, "14." put the lazy line under it at the top
+    // level, and the fence after that at column 0, where nothing closed it.
+    const text =
+      "- Refunds need a manager.\n   14.\nMost are approved.\n  ```\n- Refunds take 30 days.";
+    expect(blocks(text)).toEqual(["  ```"]);
+    expect(items(text)).toEqual([1, 0, 0, 0, 1]);
+  });
+});
+
+describe("readBlocks — linear in the document", () => {
+  // The least of three runs: load only ever adds to a run. Each shape is
+  // timed against a document of its size with no nesting, read the same
+  // way, so a slow machine slows both; the bound is twenty times that.
+  const fastest = (run: () => unknown): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 3; i++) {
+      const t = performance.now();
+      run();
+      best = Math.min(best, performance.now() - t);
+    }
+    return best;
+  };
+  const n = 50_000;
+
+  test("bullets nested deep on one line", () => {
+    // Asking for a thematic break at every bullet rescanned to the line's
+    // end: 14 s for 80 KB of them.
+    const nested = `${"- ".repeat(n)}x`;
+    const base = fastest(() => readBlocks(`${"y ".repeat(n)}x`));
+    expect(readBlocks(nested).item[0]).toBe(1);
+    expect(fastest(() => readBlocks(nested))).toBeLessThan(base * 20 + 100);
+  }, 60_000);
+
+  test("bullets nested deep, then many lazy lines under them", () => {
+    // Finding the item a lazy line is indented into scanned the open items
+    // from the innermost: 1.3 s for this, against 3 ms for the flat one.
+    const nested = `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`;
+    const base = fastest(() => readBlocks(`${"y ".repeat(n)}x\n${"y\n".repeat(n)}`));
+    expect(readBlocks(nested).contained[n]).toBe(1);
+    expect(fastest(() => readBlocks(nested))).toBeLessThan(base * 20 + 100);
+  }, 60_000);
 });

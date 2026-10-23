@@ -561,3 +561,91 @@ describe.skipIf(REAL_SERVER === undefined)("real thredz-mcp v0.2.0 contract (rea
     }
   }, 20000);
 });
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — the mirror forwards the proof options
+// ---------------------------------------------------------------------------
+
+describe("goal mirror × continuity.proof", () => {
+  test("off: a goal proven by assertion passes through the mirror unverified and completes the remote goal", async () => {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-off"}', isError: false }),
+    });
+    const { deps: d } = deps({
+      thredz: { client, serverName: "thredz" },
+      sessionScope: "sess_0123456789abcdef",
+    });
+    const wired = wireContinuity(
+      { specName: "mirror-off", continuity: { proof: "off" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const goalWrite = wired.tools.find((t) => t.name === "GoalWrite");
+    const goalUpdate = wired.tools.find((t) => t.name === "GoalUpdate");
+    await goalWrite?.execute({ title: "ship", target: 2 });
+    // No session log exists: had the wrapper dropped the proof options, this
+    // would verify and fail with "no verified evidence".
+    expect(
+      await goalUpdate?.execute({
+        goalId: "goal-0001",
+        status: "proven",
+        evidence: [{ toolUseId: "tu_said" }],
+      }),
+    ).toContain("[proven (unverified)] ship");
+    const [goal] = await wired.store.listGoals();
+    expect(goal?.unverified?.[0]?.toolUseId).toBe("tu_said");
+    const update = calls.find((c) => c.name === "goal_update");
+    expect(update?.args).toEqual({ id: "tz-goal-off", targetValue: 2, currentValue: 2 });
+  });
+
+  test("require: progress that would complete the remote goal never reaches the mirror", async () => {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-req"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" } });
+    const wired = wireContinuity(
+      { specName: "mirror-require", continuity: { proof: "require" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const goalWrite = wired.tools.find((t) => t.name === "GoalWrite");
+    const goalUpdate = wired.tools.find((t) => t.name === "GoalUpdate");
+    await goalWrite?.execute({ title: "ship", target: 2 });
+    await expect(goalUpdate?.execute({ goalId: "goal-0001", current: 2 })).rejects.toThrow(
+      "goal-0001 is open, not proven",
+    );
+    expect(calls.some((c) => c.name === "goal_update")).toBe(false);
+  });
+
+  test("the mirror forwards the store guard: a refusal under the lock never reaches Thredz", async () => {
+    // require's at-target check runs as a store guard (under the lock, on
+    // the record as written). A wrapper that dropped it would let a racing
+    // session complete the remote goal.
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-guard"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" } });
+    const wired = wireContinuity(
+      { specName: "mirror-guard", continuity: { proof: "require" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    await wired.store.writeGoal({ title: "ship", target: 2 });
+    const seen: number[] = [];
+    await expect(
+      wired.store.updateGoal(
+        "goal-0001",
+        { current: 2 },
+        {
+          guard: (next) => {
+            seen.push(next.current ?? -1);
+            throw new Error("refused under the lock");
+          },
+        },
+      ),
+    ).rejects.toThrow("refused under the lock");
+    expect(seen).toEqual([2]);
+    expect((await wired.store.listGoals())[0]?.current).toBeUndefined();
+    expect(calls.some((c) => c.name === "goal_update")).toBe(false);
+  });
+});

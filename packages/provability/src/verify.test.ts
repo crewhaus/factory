@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { indexSource } from "@crewhaus/claim-ledger";
 import { buildEvidenceIndex, recordFromCall } from "./evidence";
 import { renderFooter } from "./render";
 import { artifact, config, evidenceOf, fetched, memoryArtifacts, now } from "./test-helpers";
@@ -17,6 +18,8 @@ import {
   bundleHash,
   claimReasons,
   isToolAllowed,
+  polarityMeter,
+  statementMismatch,
   unverifiedBundle,
   verifyDocument,
 } from "./verify";
@@ -505,6 +508,99 @@ describe("acceptance B — the hand-computed total (checked)", () => {
     expect(only(partitive).status).toBe("met");
   });
 
+  test("a negation joined to the figure by a colon, a bracket or a dash is beside it", async () => {
+    const opts = (content: string) => ({
+      config: config("checked", { execution: { replay: false } }),
+      evidence: evidenceOf([
+        { id: "toolu_p", name: "Evaluate", input: { expression: "isprime(91)" }, content },
+      ]),
+    });
+    const claim = (sentence: string) => `${sentence} [1].\n\n[1]: tool:toolu_p`;
+    for (const result of [
+      "91: not prime (7 * 13)",
+      "not prime: 91 = 7 * 13",
+      "91 (not prime)",
+      "91 - not prime",
+      '{"91":"not prime"}',
+    ]) {
+      const bundle = await verify(claim("91 is prime"), opts(result));
+      expect([result, only(bundle).bindings[0]?.reason]).toEqual([result, "value_absent"]);
+      expect(only(bundle).bindings[0]?.detail).toContain('denies "prime"');
+    }
+    // The reverse: the result states, beside the figure, what the claim denies.
+    const reverse = await verify(claim("91 is not prime"), opts("91: prime"));
+    expect(only(reverse).bindings[0]?.reason).toBe("value_absent");
+    // A full stop, a comma, a semicolon or a line break ends the statement:
+    // a denial in the next one is about something else.
+    for (const result of [
+      "91 is odd. Not prime-checked yet",
+      "91 is prime, not even",
+      "91 is prime; 93 is not prime",
+      "91 is prime\nnot prime: 93",
+    ]) {
+      const bundle = await verify(claim("91 is prime"), opts(result));
+      expect([result, only(bundle).status]).toEqual([result, "met"]);
+    }
+  });
+
+  test("a determiner or preposition negation in the result does not deny the noun after it", async () => {
+    const opts = (content: string) => ({
+      config: config("checked", { execution: { replay: false } }),
+      evidence: evidenceOf([
+        { id: "toolu_e", name: "Evaluate", input: { expression: "x" }, content },
+      ]),
+    });
+    const claim = (sentence: string) => `${sentence} [1].\n\n[1]: tool:toolu_e`;
+    for (const [sentence, result] of [
+      ["All 120 tests passed", "No tests failed out of 120"],
+      ["The subtotal excluding VAT is 1,284.50 EUR", "The subtotal without VAT is 1284.50 EUR"],
+      ["The subtotal without VAT is 1,284.50 EUR", "The subtotal excluding VAT is 1284.50 EUR"],
+      ["The subtotal without VAT is 1,284.50 EUR", "The subtotal without VAT is 1284.50 EUR"],
+      ["14 refunds were paid", "None of the refunds are pending; 14 refunds were paid"],
+    ] as const) {
+      const bundle = await verify(claim(sentence), opts(result));
+      expect([sentence, only(bundle).status, only(bundle).best]).toEqual([
+        sentence,
+        "met",
+        "checked",
+      ]);
+    }
+    // A predicate negation still denies: "91 is not prime" (3h) stays refused…
+    const predicate = await verify(claim("The number 91 is prime"), opts("91 is not prime"));
+    expect(only(predicate).bindings[0]?.reason).toBe("value_absent");
+    // …and a figure keeps every negation: "no 2 meetings overlap" denies 2.
+    const figure = await verify(
+      claim("2 meetings overlap this week"),
+      opts("No 2 meetings overlap this week"),
+    );
+    expect(only(figure).bindings[0]?.reason).toBe("value_absent");
+  });
+
+  test("a figure common to a large result is read once however many claims state it", async () => {
+    // Every line of a large result holds the figure 1 (a quantity): reading
+    // its statements once per claim made 200 claims cost 200 reads of it.
+    const lines = Array.from(
+      { length: 6_000 },
+      (_, i) => `order ${10_000 + i} shipped 1 unit to the north region`,
+    );
+    const content = lines.join("\n");
+    const opts = {
+      config: config("checked", { execution: { replay: false } }),
+      evidence: evidenceOf([
+        { id: "toolu_rows", name: "mcp__calc__add", input: { q: "orders" }, content },
+      ]),
+    };
+    const claims = Array.from(
+      { length: 200 },
+      (_, i) => `Order ${10_000 + i} shipped 1 unit to the north region [1].`,
+    ).join(" ");
+    const before = polarityMeter.tokens;
+    const bundle = await verify(`${claims}\n\n[1]: tool:toolu_rows`, opts);
+    expect(bundle.met).toBe(200);
+    // Each statement of the result read at most once: never once a claim.
+    expect(polarityMeter.tokens - before).toBeLessThanOrEqual(indexSource(content).tokens.length);
+  }, 20_000);
+
   test("a claim with no numeral: a leading negation or a missing number word in the result is value_absent", async () => {
     const opts = (content: string) => ({
       config: config("checked", { execution: { replay: false } }),
@@ -764,17 +860,30 @@ describe("acceptance C — the overlap claim (proven)", () => {
       { config: config("proven"), artifacts: memoryArtifacts([accepted]) },
     );
     expect(only(flipped).bindings[0]?.reason).toBe("claim_mismatch");
-    // "Didn't" and "no" are both negations: the same statement in other words is proven.
-    const reworded = await verify(
+    // Polarity is read word by word: the same denial in other words is
+    // proven ("do not" and "don't"; "no two" moved within the sentence)…
+    const proofOf = (id: string, proved: string) => ({
+      config: config("proven"),
+      artifacts: memoryArtifacts([artifact({ id, claim: proved })]),
+    });
+    for (const [sentence, proved] of [
+      ["Meetings 2 and 5 don't overlap", "Meetings 2 and 5 do not overlap."],
+      ["Of the six meetings, no two overlap", "No two of the six meetings overlap."],
+    ] as const) {
+      const bundle = await verify(
+        `${sentence} [1].\n\n[1]: proof:prf_dddddddddddddddd`,
+        proofOf("prf_dddddddddddddddd", proved),
+      );
+      expect([sentence, only(bundle).bindings[0]?.ok]).toEqual([sentence, true]);
+    }
+    // …but a negation moved to another word is another statement: "no two
+    // overlap" is about every pair, "two didn't overlap" about two meetings.
+    const moved = await verify(
       "Two of the six meetings didn't overlap at all [1].\n\n[1]: proof:prf_dddddddddddddddd",
-      {
-        config: config("proven"),
-        artifacts: memoryArtifacts([
-          artifact({ id: "prf_dddddddddddddddd", claim: "No two of the six meetings overlap." }),
-        ]),
-      },
+      proofOf("prf_dddddddddddddddd", "No two of the six meetings overlap."),
     );
-    expect(only(reworded).bindings[0]?.ok).toBe(true);
+    expect(only(moved).bindings[0]?.reason).toBe("claim_mismatch");
+    expect(only(moved).bindings[0]?.detail).toContain(`denies "two"`);
     // A proof about meetings 1 and 2 is not a proof about all six.
     const narrower = await verify(`${claim}\n\n[1]: proof:prf_eeeeeeeeeeeeeeee`, {
       config: config("proven"),
@@ -784,6 +893,59 @@ describe("acceptance C — the overlap claim (proven)", () => {
     });
     expect(only(narrower).bindings[0]).toMatchObject({ reason: "claim_mismatch" });
     expect(only(narrower).bindings[0]?.detail).toContain("figures differ");
+  });
+
+  test("a negation the proof's claim does not speak to leaves the proved statement proven", async () => {
+    // The sentence may say more than the proof (design §6.4): its "no" and
+    // "without" deny a discount and VAT, not the proved total.
+    const total = artifact({
+      id: "prf_ffffffffffffffff",
+      claim: "The invoice total is 1,284.50 EUR.",
+    });
+    const opts = { config: config("proven"), artifacts: memoryArtifacts([total]) };
+    for (const sentence of [
+      "No discount was applied, so the invoice total is 1,284.50 EUR",
+      "The invoice total without VAT is 1,284.50 EUR",
+      "Not counting tax, the invoice total is 1,284.50 EUR",
+    ]) {
+      const bundle = await verify(`${sentence} [1].\n\n[1]: proof:prf_ffffffffffffffff`, opts);
+      expect([sentence, only(bundle).status, only(bundle).best]).toEqual([
+        sentence,
+        "met",
+        "proven",
+      ]);
+    }
+    // The proved word itself denied is still the opposite, however far the
+    // denial sits from the rest of the sentence.
+    const denied = await verify(
+      "No discount was applied, and the invoice total is not 1,284.50 EUR [1].\n\n[1]: proof:prf_ffffffffffffffff",
+      opts,
+    );
+    expect(only(denied).bindings[0]?.reason).toBe("claim_mismatch");
+    expect(only(denied).bindings[0]?.detail).toContain("states the opposite");
+    // Two figures with their negations swapped: each word compared on its own.
+    const swapped = statementMismatch(
+      "The total is not 5 and the count is 3.",
+      "The total is 5 and the count is not 3",
+      0.8,
+    );
+    expect(swapped).toContain(`the proof's claim denies "5"`);
+    // A partitive denies the whole statement though it denies no one word.
+    expect(
+      statementMismatch("The 3 invoices are overdue.", "None of the 3 invoices is overdue", 0.8),
+    ).toContain("this sentence is negated");
+    // (At 0.8 this direction already fails on coverage: "none" is a content token.)
+    expect(
+      statementMismatch("None of the 3 invoices is overdue.", "The 3 invoices are overdue", 0.6),
+    ).toContain("the proof's claim is negated");
+    // …unless it governs something the proof never mentions.
+    expect(
+      statementMismatch(
+        "The invoice total is 1,284.50 EUR.",
+        "None of the discounts applied, so the invoice total is 1,284.50 EUR",
+        0.8,
+      ),
+    ).toBeUndefined();
   });
 
   test("missing, malformed, unwired, unreadable and mislabelled artifacts are proof_missing", async () => {
@@ -1177,6 +1339,66 @@ describe("grounded", () => {
       content: `SEO report for https://www.cdc.gov/flu\n- title: "${claimText}" (46 chars, ok)\n- meta description: missing\n- canonical link: missing`,
       isError: false,
     });
+    expect(lint.bindings[0]?.reason).toBe("not_fetched");
+  });
+
+  test("a page an MCP fetcher read grounds though its URL's slug spells the claim; a printed address does not", async () => {
+    const url = "https://blog.example.com/2024/05/rust-is-faster-than-go";
+    const page =
+      "Benchmarks 2024\n\nOur measurements show Rust is faster than Go on every workload.";
+    let asked = 0;
+    const run = async (toolName: string, input: Record<string, unknown>, content: string) =>
+      only(
+        await verify(`Rust is faster than Go [1].\n\n[1]: ${url}`, {
+          config: config("grounded"),
+          evidence: buildEvidenceIndex([
+            recordFromCall({ toolUseId: "m1", toolName, input, content, isError: false }),
+          ]),
+          judgeWaiver: async () => {
+            asked += 1;
+            return { supported: true, costUsdMicros: 1 };
+          },
+        }),
+      );
+    // A reader returns the page, not its address: the slug is not a reflection.
+    for (const [toolName, input] of [
+      ["mcp__fetch__fetch", { url, max_length: 5000 }],
+      ["mcp__firecrawl__scrape", { url, formats: ["markdown"] }],
+    ] as const) {
+      const claim = await run(toolName, input, page);
+      expect([toolName, claim.status, claim.best]).toEqual([toolName, "met", "grounded"]);
+    }
+    // A page headed with its address still grounds in its own text, and the
+    // excerpt is the page's, not the address.
+    const headed = await run("mcp__fetch__fetch", { url }, `Source: ${url}\n\n${page}`);
+    expect(headed.status).toBe("met");
+    expect(headed.bindings[0]?.excerpt).toBe("Rust is faster than Go");
+    // A result whose only copy of the claim is the address it prints — a 404
+    // page repeating the path, a log line — read nothing, and nothing of it
+    // reaches the judge.
+    for (const content of [
+      "<h1>404 Not Found</h1><p>The requested URL /2024/05/rust-is-faster-than-go was not found on this server.</p>",
+      "GET /2024/05/rust-is-faster-than-go -> 404 Not Found",
+      `Fetched ${url.replace("blog.example.com", "BLOG.EXAMPLE.COM")} (binary content omitted)`,
+    ]) {
+      const claim = await run("mcp__fetch__fetch", { url }, content);
+      expect([content, claim.bindings[0]?.reason]).toEqual([content, "not_fetched"]);
+      expect(claim.bindings[0]?.detail).toContain("handed back");
+    }
+    const paraphrase = await run(
+      "mcp__fetch__fetch",
+      { url: "https://blog.example.com/2024/05/rust-beats-go" },
+      "GET /2024/05/rust-beats-go -> 404 Not Found",
+    );
+    expect(paraphrase.status).toBe("unmet");
+    expect(asked).toBe(0);
+    // The printed slug next to a title the call was handed: blanking the
+    // address out leaves the reflected title, which is the input's.
+    const lint = await run(
+      "mcp__seo__lint",
+      { url, html: "<title>Rust is faster than Go</title>" },
+      `SEO report for ${url}\n- title: "Rust is faster than Go" (22 chars, ok)`,
+    );
     expect(lint.bindings[0]?.reason).toBe("not_fetched");
   });
 

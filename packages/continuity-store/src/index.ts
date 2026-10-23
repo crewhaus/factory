@@ -24,7 +24,11 @@
  * sessions via the `sub_agent_start` brackets). On a proven transition the
  * store (a) pins the cited session in `.crewhaus/retention.json` and (b)
  * freezes a `{toolName, inputHash, resultDigest}` proof excerpt into the
- * plan/goal record, so evidence outlives the transcript TTL.
+ * plan/goal record, so evidence outlives the transcript TTL. A caller may
+ * instead ask for an UNVERIFIED proven transition (`ProveOptions`,
+ * `verification: "unverified"` — what tool-plan's `continuity.proof: off`
+ * uses, design/0.8.0 §6.3): the cited refs are recorded as `UnverifiedRef`s
+ * beside the frozen proofs, nothing is resolved, and nothing is pinned.
  *
  * Clearing (§2.6): `clear()` moves files to `.crewhaus/trash/<ts>/…` — never
  * hard-deletes — and `restore(ts)` undoes it. `moveToTrash` is exported for
@@ -48,7 +52,7 @@ import {
   appendRetentionPins,
   verifyEvidence,
 } from "./evidence";
-import { HANDOFF_MARKER, renderHandoff } from "./handoff";
+import { HANDOFF_MARKER, isProvenByAssertion, isProvenVerified, renderHandoff } from "./handoff";
 import { type AcquireLockOptions, withLock } from "./lock";
 import {
   type MoveToTrashResult,
@@ -67,6 +71,7 @@ import type {
   PlanStep,
   Requirement,
   RequirementStatus,
+  UnverifiedRef,
 } from "./types";
 
 export {
@@ -104,7 +109,17 @@ export {
   resolveEvidence,
   verifyEvidence,
 } from "./evidence";
-export { type HandoffInput, HANDOFF_MARKER, renderHandoff, renderStatus } from "./handoff";
+export {
+  type HandoffInput,
+  HANDOFF_MARKER,
+  PROVEN_UNVERIFIED_LABEL,
+  isProvenByAssertion,
+  isProvenVerified,
+  renderHandoff,
+  renderLadderStatus,
+  renderStatus,
+  renderUnverifiedRef,
+} from "./handoff";
 export type {
   ClaimableStatus,
   FocusState,
@@ -114,6 +129,7 @@ export type {
   PlanStep,
   Requirement,
   RequirementStatus,
+  UnverifiedRef,
 } from "./types";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/state";
@@ -126,6 +142,42 @@ export const REQUIREMENTS_LEDGER_MAX_BYTES = 16_384;
  * than buffered whole.
  */
 export const STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The shape a toolUseId must have to be recorded UNVERIFIED (design/0.8.0
+ * §6.3). On the verified path an id is recorded only after it resolved in a
+ * session log, so the log vouches for it. Under `continuity.proof: off`
+ * nothing does: the id is model-supplied text that lands in plan and goal
+ * files and in every render (`PlanRead`, the PlanComplete reply,
+ * `handoff.md`). Holding it to one token of the characters provider
+ * tool-call ids use (Anthropic `toolu_…`, OpenAI `call_…`, Bedrock
+ * `tooluse_…`, Gemini's synthetic `gemini_<name>_<n>`, OpenAI-compatible
+ * servers' `functions.<name>:<n>`) keeps a citation from smuggling in a
+ * newline and a forged `[proven]` line. The length cap keeps it from
+ * inflating a state file towards {@link STATE_FILE_MAX_BYTES}.
+ */
+export const UNVERIFIED_TOOL_USE_ID_REGEX = /^[A-Za-z0-9_.:-]{1,256}$/;
+
+/**
+ * The most unverified refs one step or goal carries (design/0.8.0 §6.3).
+ * Ladder proofs are bounded by what the event log holds; unverified ones are
+ * bounded only by what a model is willing to cite, so the store bounds them.
+ */
+export const MAX_UNVERIFIED_REFS = 32;
+
+/**
+ * The longest plan or goal title the store keeps, in characters (design
+ * §2.2). A title is a label printed INSIDE a line — PlanRead, GoalList, the
+ * `<current_plan>` tail, handoff.md — so the store also holds it to one line
+ * (see {@link oneLine}). The cap keeps one title from inflating a state file
+ * towards {@link STATE_FILE_MAX_BYTES}.
+ */
+export const MAX_TITLE_CHARS = 512;
+
+/** The longest goal unit the store keeps. A unit names what `target` and
+ *  `current` count (`%`, `tests`, `users`) and prints inside the goal's
+ *  progress, `(3/10 tests)`; it is one line for the same reason a title is. */
+export const MAX_UNIT_CHARS = 64;
 
 export const FOCUS_MARKER = "<!-- crewhaus:focus -->";
 const ACTIVE_PLAN_MARKER = "<!-- crewhaus:active-plan -->";
@@ -141,12 +193,56 @@ const REQ_ID_REGEX = /^REQ-\d{3,}$/;
 const REQ_LINE_REGEX =
   /^- (REQ-\d{3,}) \[(open|confirmed|dropped)\] (".*") \(user, (sess_[0-9a-f]{16}), turn (\d+)\)$/;
 const STEP_LINE_REGEX = /^(\d+)\. \[(open|in_progress|claimed|proven)\] (.+)$/;
+const STEPS_HEADING = "## Steps";
 
 export class ContinuityStoreError extends CrewhausError {
   override readonly name = "ContinuityStoreError";
   constructor(message: string, cause?: unknown) {
     super("config", message, cause);
   }
+}
+
+/**
+ * Text the store prints inside a line — a step, a plan or goal title, a goal
+ * unit — collapsed to that one line. Every surface that shows a plan or goal
+ * is line-oriented, and a plan file is parsed by line, so a newline in a
+ * title would otherwise print a forged `1. [proven] …` step or
+ * `- goal-0009 [proven] …` goal beneath it, and a plan file would read the
+ * forged step back as a real one: proven, with no proof, no PlanComplete and
+ * no `action_proof` (design §2.4; it defeated `continuity.proof: require`,
+ * design/0.8.0 §6.3). Step text has been collapsed this way since 0.3.0.
+ */
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** A plan or goal title as the store writes it: one non-empty line of at
+ *  most {@link MAX_TITLE_CHARS}. */
+function storedTitle(raw: string, what: "plan" | "goal", caller: string): string {
+  const title = oneLine(raw);
+  if (title === "") {
+    throw new ContinuityStoreError(`${caller}: title must be non-empty`);
+  }
+  if (title.length > MAX_TITLE_CHARS) {
+    throw new ContinuityStoreError(
+      `continuity-store: a ${what} title is ${title.length} characters; the cap is ${MAX_TITLE_CHARS}. Keep the title to one short line — ${
+        what === "plan" ? "the detail belongs in its steps" : "the detail belongs in a plan"
+      }.`,
+    );
+  }
+  return title;
+}
+
+/** A goal unit as the store writes it: one line of at most
+ *  {@link MAX_UNIT_CHARS}. */
+function storedUnit(raw: string): string {
+  const unit = oneLine(raw);
+  if (unit.length > MAX_UNIT_CHARS) {
+    throw new ContinuityStoreError(
+      `continuity-store: a goal unit is ${unit.length} characters; the cap is ${MAX_UNIT_CHARS}. A unit names what target and current count, such as "%", "tests" or "users".`,
+    );
+  }
+  return unit;
 }
 
 export type ContinuityScope =
@@ -188,6 +284,39 @@ export type AppendRequirementInput = {
   readonly status?: RequirementStatus;
 };
 
+/**
+ * How a `proven` transition treats the evidence it cites (design/0.8.0
+ * §6.3). `"verify"` — the default, and the only behaviour before 0.8.0 —
+ * resolves every ref against the session event logs, freezes proof excerpts
+ * and pins the cited sessions. `"unverified"` resolves nothing: the refs are
+ * recorded as {@link UnverifiedRef}s, no session is pinned, and the record
+ * renders `[proven (unverified)]`. It exists for `continuity.proof: off`,
+ * the mode for harnesses with no event log to resolve against; the store
+ * applies no policy of its own, so which one a call gets is the caller's
+ * (tool-plan's) decision.
+ */
+export type ProofVerification = "verify" | "unverified";
+
+export type ProveOptions = {
+  /** Default `"verify"`. */
+  readonly verification?: ProofVerification;
+};
+
+export type UpdateGoalOptions = ProveOptions & {
+  /**
+   * Runs under the store lock on the record about to be written, after the
+   * patch is merged and before anything (a retention pin, goals.yaml) is
+   * written. Throwing refuses the update and nothing is written. It lets a
+   * caller enforce a rule about the RESULT of an update without racing
+   * another writer: a check on a `listGoals()` snapshot taken outside the
+   * lock can pass in two sessions at once that together break it. tool-plan
+   * uses it for `continuity.proof: require`, where a goal may not reach its
+   * target below proven (design/0.8.0 §6.3). The store applies no policy of
+   * its own here either.
+   */
+  readonly guard?: (next: Goal, previous: Goal) => void;
+};
+
 export type UpdateGoalInput = {
   readonly title?: string;
   readonly status?: LadderStatus;
@@ -210,6 +339,9 @@ export interface ContinuityStore {
   listRequirements(): Promise<readonly Requirement[]>;
 
   // ---- plans ----
+  /** The title and each step are stored as one line (whitespace runs,
+   *  newlines included, collapse to a space); a title over
+   *  {@link MAX_TITLE_CHARS} is refused. */
   createPlan(input: { title: string; steps?: readonly string[] }): Promise<PlanRecord>;
   getPlan(planId: string): Promise<PlanRecord | null>;
   listPlans(): Promise<readonly PlanRecord[]>;
@@ -219,17 +351,32 @@ export interface ContinuityStore {
   setStepStatus(planId: string, step: number, status: ClaimableStatus): Promise<PlanRecord>;
   /** The `proven` transition: verifies evidence against session event logs,
    *  freezes proof excerpts into the plan record, and pins the cited
-   *  sessions in `.crewhaus/retention.json`. */
-  proveStep(planId: string, step: number, evidence: readonly EvidenceRef[]): Promise<PlanRecord>;
+   *  sessions in `.crewhaus/retention.json` — or, with
+   *  `{verification: "unverified"}`, records the refs unresolved and pins
+   *  nothing (see {@link ProofVerification}). */
+  proveStep(
+    planId: string,
+    step: number,
+    evidence: readonly EvidenceRef[],
+    opts?: ProveOptions,
+  ): Promise<PlanRecord>;
 
   // ---- goals ----
+  /** Title and unit are stored as one line, like a plan title; over
+   *  {@link MAX_TITLE_CHARS} / {@link MAX_UNIT_CHARS} is refused. The same
+   *  holds for `updateGoal`'s `title` and `unit`. */
   writeGoal(input: {
     title: string;
     target?: number;
     current?: number;
     unit?: string;
   }): Promise<Goal>;
-  updateGoal(goalId: string, patch: UpdateGoalInput): Promise<Goal>;
+  /** `opts.verification` applies when `patch.status` is `"proven"` (see
+   *  `proveStep`); `opts.guard` applies to every update. A wrapping store
+   *  must forward `opts` whole: one that drops `verification` fails closed
+   *  (the transition verifies), but one that drops `guard` loses the
+   *  caller's check. */
+  updateGoal(goalId: string, patch: UpdateGoalInput, opts?: UpdateGoalOptions): Promise<Goal>;
   listGoals(): Promise<readonly Goal[]>;
 
   // ---- proof ----
@@ -284,8 +431,15 @@ function parseFocusFile(raw: string): FocusState | null {
 
   const activeHeader = `## Active plan\n${ACTIVE_PLAN_MARKER}`;
   const reqHeader = `## Requirements\n${REQUIREMENTS_MARKER}`;
-  const activeIdx = raw.indexOf(activeHeader);
-  const reqIdx = raw.indexOf(reqHeader);
+  // The LAST occurrence of each header is the store's own: renderFocusFile
+  // writes both after the body, and nothing below them can span a line (a
+  // plan id, JSON-quoted requirement lines). The body is model-written and
+  // multi-line, so the first occurrence could be inside it — and a body
+  // carrying a copy of the requirements header would then be read back as a
+  // forged ledger entry attributed to the user, and the rest of the body
+  // lost on the next write.
+  const activeIdx = raw.lastIndexOf(activeHeader);
+  const reqIdx = raw.lastIndexOf(reqHeader);
 
   const afterMarker = raw.indexOf(FOCUS_MARKER) + FOCUS_MARKER.length;
   const bodyEnd = activeIdx >= 0 ? activeIdx : reqIdx >= 0 ? reqIdx : raw.length;
@@ -342,6 +496,9 @@ type PlanFrontmatter = {
   createdAt: string;
   updatedAt: string;
   proofs?: Record<string, FrozenProof[]>;
+  /** Steps proven by assertion (`continuity.proof: off`), keyed like
+   *  `proofs`. Written only when some step has one. */
+  unverified?: Record<string, UnverifiedRef[]>;
 };
 
 function slugify(title: string): string {
@@ -356,8 +513,12 @@ function slugify(title: string): string {
 
 function renderPlanFile(plan: PlanRecord): string {
   const proofs: Record<string, FrozenProof[]> = {};
+  const unverified: Record<string, UnverifiedRef[]> = {};
   for (const step of plan.steps) {
     if (step.proofs.length > 0) proofs[String(step.index)] = [...step.proofs];
+    if (step.unverified !== undefined && step.unverified.length > 0) {
+      unverified[String(step.index)] = [...step.unverified];
+    }
   }
   const frontmatter: PlanFrontmatter = {
     id: plan.id,
@@ -366,6 +527,7 @@ function renderPlanFile(plan: PlanRecord): string {
     createdAt: plan.createdAt,
     updatedAt: plan.updatedAt,
     ...(Object.keys(proofs).length > 0 ? { proofs } : {}),
+    ...(Object.keys(unverified).length > 0 ? { unverified } : {}),
   };
   const stepLines = plan.steps.map((s) => `${s.index}. [${s.status}] ${s.text}`);
   return [
@@ -375,7 +537,7 @@ function renderPlanFile(plan: PlanRecord): string {
     "",
     `# ${plan.title}`,
     "",
-    "## Steps",
+    STEPS_HEADING,
     "",
     ...(stepLines.length > 0 ? stepLines : ["_no steps yet_"]),
     "",
@@ -393,6 +555,43 @@ function isFrozenProofShape(value: unknown): value is FrozenProof {
     typeof v["resultDigest"] === "string" &&
     typeof v["verifiedAt"] === "string"
   );
+}
+
+/** A refused value echoed in an error: JSON-quoted (so a newline shows as
+ *  `\n`, not as a line break) and clipped (so a megabyte id does not come
+ *  back as a megabyte error). */
+function quoteClipped(value: string, max = 64): string {
+  return JSON.stringify(value.length > max ? `${value.slice(0, max)}…` : value);
+}
+
+/** Read back under the rules the write path enforces (see
+ *  {@link UNVERIFIED_TOOL_USE_ID_REGEX}): a hand-edited entry with a
+ *  multi-line or oversized id, or a malformed session, is dropped rather
+ *  than rendered. */
+function isUnverifiedRefShape(value: unknown): value is UnverifiedRef {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v["toolUseId"] === "string" &&
+    UNVERIFIED_TOOL_USE_ID_REGEX.test(v["toolUseId"]) &&
+    typeof v["recordedAt"] === "string" &&
+    (v["sessionId"] === undefined ||
+      (typeof v["sessionId"] === "string" && SESSION_ID_REGEX.test(v["sessionId"])))
+  );
+}
+
+/** Keyed `{"<step>": [...]}` frontmatter map → per-step lists, keeping only
+ *  well-formed entries (a hand-edited file loses the bad entry, not the
+ *  plan). */
+function parseStepMap<T>(value: unknown, keep: (v: unknown) => v is T): Map<number, T[]> {
+  const out = new Map<number, T[]>();
+  if (typeof value !== "object" || value === null) return out;
+  for (const [key, list] of Object.entries(value as Record<string, unknown>)) {
+    const index = Number(key);
+    if (!Number.isInteger(index) || !Array.isArray(list)) continue;
+    out.set(index, list.filter(keep));
+  }
+  return out;
 }
 
 function parsePlanFile(raw: string, path: string): PlanRecord {
@@ -414,33 +613,39 @@ function parsePlanFile(raw: string, path: string): PlanRecord {
   if (!PLAN_ID_REGEX.test(id)) {
     throw new ContinuityStoreError(`continuity-store: ${path} has an invalid plan id "${id}"`);
   }
-  const proofsByStep = new Map<number, FrozenProof[]>();
-  if (typeof f["proofs"] === "object" && f["proofs"] !== null) {
-    for (const [key, value] of Object.entries(f["proofs"] as Record<string, unknown>)) {
-      const index = Number(key);
-      if (!Number.isInteger(index) || !Array.isArray(value)) continue;
-      proofsByStep.set(index, value.filter(isFrozenProofShape));
-    }
-  }
+  const proofsByStep = parseStepMap(f["proofs"], isFrozenProofShape);
+  const unverifiedByStep = parseStepMap(f["unverified"], isUnverifiedRefShape);
 
-  const body = raw.slice(fmMatch[0].length);
+  const body = raw.slice(fmMatch[0].length).split("\n");
+  // Steps are read only below the LAST `## Steps` heading, the one
+  // renderPlanFile writes under the title, so nothing above it can parse as
+  // a step: not the `# title` heading, and not a multi-line title an older
+  // store let through, which may itself carry a `## Steps` line (step lines
+  // never can). A hand-written file with no such heading is read whole, as
+  // before, so its steps are not dropped by the next write.
+  const heading = body.findLastIndex((line) => line.trim() === STEPS_HEADING);
   const steps: PlanStep[] = [];
-  for (const line of body.split("\n")) {
+  for (const line of heading >= 0 ? body.slice(heading + 1) : body) {
     const m = STEP_LINE_REGEX.exec(line.trim());
     if (m === null) continue;
     const index = steps.length + 1;
+    const unverified = unverifiedByStep.get(index) ?? [];
     steps.push({
       index,
       status: m[2] as LadderStatus,
       text: (m[3] as string).trim(),
       proofs: proofsByStep.get(index) ?? [],
+      // Only when present, so a ladder plan parses to the same record shape.
+      ...(unverified.length > 0 ? { unverified } : {}),
     });
   }
 
   return {
     id,
     slug: typeof f["slug"] === "string" ? f["slug"] : slugify(String(f["title"] ?? "")),
-    title: typeof f["title"] === "string" ? f["title"] : id,
+    // One line on read too, so a title written before titles were collapsed
+    // (or hand-edited since) cannot print a forged line in any render.
+    title: typeof f["title"] === "string" ? oneLine(f["title"]) : id,
     createdAt: typeof f["createdAt"] === "string" ? f["createdAt"] : "",
     updatedAt: typeof f["updatedAt"] === "string" ? f["updatedAt"] : "",
     steps,
@@ -460,6 +665,27 @@ function isGoalShape(value: unknown): value is Goal {
     typeof v["status"] === "string" &&
     ["open", "in_progress", "claimed", "proven"].includes(v["status"] as string)
   );
+}
+
+/** A goal read back from YAML with its title and unit on one line (see
+ *  {@link oneLine}; a goals.yaml written before they were collapsed, or
+ *  hand-edited since, may hold either across lines). Unchanged otherwise. */
+function oneLineGoal(goal: Goal): Goal {
+  const title = oneLine(goal.title);
+  const unit = typeof goal.unit === "string" ? oneLine(goal.unit) : goal.unit;
+  if (title === goal.title && unit === goal.unit) return goal;
+  return { ...goal, title, ...(unit !== undefined ? { unit } : {}) };
+}
+
+/** Keep only well-formed `unverified` entries on a goal read back from
+ *  YAML; a goal without the key keeps the ladder's shape. Title and unit
+ *  are read as one line ({@link oneLineGoal}). */
+function normalizeGoal(read: Goal): Goal {
+  const goal = oneLineGoal(read);
+  if (!("unverified" in goal)) return goal;
+  const { unverified, ...rest } = goal;
+  const kept = Array.isArray(unverified) ? unverified.filter(isUnverifiedRefShape) : [];
+  return kept.length > 0 ? { ...rest, unverified: kept } : rest;
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +981,7 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
     }
     const list = (parsed as { goals?: unknown } | null)?.goals;
     if (!Array.isArray(list)) return [];
-    return list.filter(isGoalShape);
+    return list.filter(isGoalShape).map(normalizeGoal);
   }
 
   async function writeGoals(goals: readonly Goal[]): Promise<void> {
@@ -785,6 +1011,80 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   ): readonly FrozenProof[] {
     const seen = new Set(existing.map((p) => p.toolUseId));
     return [...existing, ...incoming.filter((p) => !seen.has(p.toolUseId))];
+  }
+
+  /**
+   * The {@link UnverifiedRef}s an unverified transition records: one per
+   * distinct cited id, stamped now, carrying the session the citation named
+   * (or the store's default). At least one ref is still required — `off`
+   * skips verification, not citation, so the record says what the model
+   * pointed at. Nothing vouches for these ids (no log resolved them), so the
+   * store holds them to {@link UNVERIFIED_TOOL_USE_ID_REGEX}, sessions to
+   * the `sess_<16 hex>` shape the verified path demands, and the count to
+   * {@link MAX_UNVERIFIED_REFS}; anything else is refused with nothing
+   * written.
+   */
+  function unverifiedRefs(evidence: readonly EvidenceRef[], what: string): UnverifiedRef[] {
+    const iso = now().toISOString();
+    const out: UnverifiedRef[] = [];
+    const seen = new Set<string>();
+    for (const ref of evidence) {
+      if (ref.toolUseId === "" || seen.has(ref.toolUseId)) continue;
+      if (!UNVERIFIED_TOOL_USE_ID_REGEX.test(ref.toolUseId)) {
+        throw new ContinuityStoreError(
+          `continuity-store: ${quoteClipped(ref.toolUseId)} is not a toolUseId, so ${what} was not marked proven — cite the id of a call you ran: one token of letters, digits, "_", ".", ":" or "-", at most 256 characters.`,
+        );
+      }
+      seen.add(ref.toolUseId);
+      const sessionId = ref.sessionId ?? opts.sessionId;
+      if (sessionId !== undefined && !SESSION_ID_REGEX.test(sessionId)) {
+        throw new ContinuityStoreError(
+          `continuity-store: ${quoteClipped(sessionId)} is not a valid sessionId (expected sess_<16 hex>), so ${what} was not marked proven.`,
+        );
+      }
+      out.push({
+        toolUseId: ref.toolUseId,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        recordedAt: iso,
+      });
+    }
+    if (out.length === 0) {
+      throw new ContinuityStoreError(
+        `continuity-store: marking ${what} proven requires evidence — cite the toolUseId(s) of the call(s) that did the work.`,
+      );
+    }
+    if (out.length > MAX_UNVERIFIED_REFS) {
+      throw new ContinuityStoreError(
+        `continuity-store: ${out.length} toolUseIds cited for ${what}; at most ${MAX_UNVERIFIED_REFS} are recorded — cite the call(s) that did the work, not every call you ran.`,
+      );
+    }
+    return out;
+  }
+
+  /**
+   * What a record's `unverified` list becomes after an unverified `proven`
+   * transition. A record ALREADY proven by assertion is being cited again
+   * for the same proven state, so the new refs are appended. Any other
+   * record (open, claimed, or reopened after an earlier assertion) starts
+   * over: refs left from a superseded transition back nothing now, and
+   * `PlanStep.unverified` promises the refs of the CURRENT proof. Refused
+   * past {@link MAX_UNVERIFIED_REFS}.
+   */
+  function nextUnverified(
+    record: { readonly status: string; readonly unverified?: readonly UnverifiedRef[] },
+    incoming: readonly UnverifiedRef[],
+    what: string,
+  ): readonly UnverifiedRef[] {
+    if (!isProvenByAssertion(record)) return incoming;
+    const existing = record.unverified ?? [];
+    const seen = new Set(existing.map((r) => r.toolUseId));
+    const merged = [...existing, ...incoming.filter((r) => !seen.has(r.toolUseId))];
+    if (merged.length > MAX_UNVERIFIED_REFS) {
+      throw new ContinuityStoreError(
+        `continuity-store: ${what} is already proven (unverified) with ${existing.length} cited toolUseId(s); at most ${MAX_UNVERIFIED_REFS} are recorded, so nothing was added. It needs no more citations.`,
+      );
+    }
+    return merged;
   }
 
   async function gatherHandoffInput(lastSessionId?: string) {
@@ -892,9 +1192,7 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
     },
 
     async createPlan(input: { title: string; steps?: readonly string[] }): Promise<PlanRecord> {
-      if (input.title.trim() === "") {
-        throw new ContinuityStoreError("createPlan(): title must be non-empty");
-      }
+      const title = storedTitle(input.title, "plan", "createPlan()");
       return locked(async () => {
         const existing = await readPlans();
         const id = nextId(
@@ -904,13 +1202,13 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
         const iso = now().toISOString();
         const plan: PlanRecord = {
           id,
-          slug: slugify(input.title),
-          title: input.title.trim(),
+          slug: slugify(title),
+          title,
           createdAt: iso,
           updatedAt: iso,
           steps: (input.steps ?? []).map((text, i) => ({
             index: i + 1,
-            text: text.replace(/\s+/g, " ").trim(),
+            text: oneLine(text),
             status: "open" as const,
             proofs: [],
           })),
@@ -953,7 +1251,7 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
             ...plan.steps,
             {
               index: plan.steps.length + 1,
-              text: text.replace(/\s+/g, " ").trim(),
+              text: oneLine(text),
               status: "open",
               proofs: [],
             },
@@ -987,16 +1285,40 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       planId: string,
       step: number,
       evidence: readonly EvidenceRef[],
+      proveOpts: ProveOptions = {},
     ): Promise<PlanRecord> {
-      // Verify BEFORE taking the lock — verification reads foreign session
-      // logs and can be slow; the store lock protects only our own writes.
       const { plan: preflight } = await requirePlan(planId);
       requireStep(preflight, step);
+      if (proveOpts.verification === "unverified") {
+        // design/0.8.0 §6.3 — `continuity.proof: off`: nothing is resolved
+        // and nothing is pinned (there is no transcript to keep alive); the
+        // cited refs ride beside the step's frozen proofs, which stay as
+        // history.
+        const refs = unverifiedRefs(evidence, `${planId} step ${step}`);
+        return locked(async () => {
+          const { plan } = await requirePlan(planId);
+          const current = requireStep(plan, step);
+          // A step already proven WITH verification keeps it: an unverified
+          // transition must never downgrade a machine-checked ✓ (the harness
+          // may have run the ladder before it switched to `off`). A `proven`
+          // step with no proof on record has no ✓ to keep, so it takes the
+          // refs and renders as what it is.
+          if (isProvenVerified(current)) return plan;
+          const unverified = nextUnverified(current, refs, `${planId} step ${step}`);
+          const next = withStep(plan, step, (s) => ({ ...s, status: "proven", unverified }));
+          await writePlan(next);
+          return next;
+        });
+      }
+      // Verify BEFORE taking the lock — verification reads foreign session
+      // logs and can be slow; the store lock protects only our own writes.
       const proofs = await verify(evidence);
       return locked(async () => {
         const { plan } = await requirePlan(planId);
         const current = requireStep(plan, step);
-        const next = withStep(plan, step, (s) => ({
+        // A verified transition supersedes an earlier proven-by-assertion:
+        // the step is machine-checked now, so its unverified refs go.
+        const next = withStep(plan, step, ({ unverified: _superseded, ...s }) => ({
           ...s,
           status: "proven",
           proofs: mergeProofs(current.proofs, proofs),
@@ -1023,9 +1345,8 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       current?: number;
       unit?: string;
     }): Promise<Goal> {
-      if (input.title.trim() === "") {
-        throw new ContinuityStoreError("writeGoal(): title must be non-empty");
-      }
+      const title = storedTitle(input.title, "goal", "writeGoal()");
+      const unit = input.unit !== undefined ? storedUnit(input.unit) : undefined;
       return locked(async () => {
         const goals = await readGoals();
         const iso = now().toISOString();
@@ -1034,11 +1355,11 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
             "goal",
             goals.map((g) => g.id),
           ),
-          title: input.title.trim(),
+          title,
           status: "open",
           ...(input.target !== undefined ? { target: input.target } : {}),
           ...(input.current !== undefined ? { current: input.current } : {}),
-          ...(input.unit !== undefined ? { unit: input.unit } : {}),
+          ...(unit !== undefined ? { unit } : {}),
           createdAt: iso,
           updatedAt: iso,
         };
@@ -1047,20 +1368,33 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       });
     },
 
-    async updateGoal(goalId: string, patch: UpdateGoalInput): Promise<Goal> {
+    async updateGoal(
+      goalId: string,
+      patch: UpdateGoalInput,
+      proveOpts: UpdateGoalOptions = {},
+    ): Promise<Goal> {
       if (!GOAL_ID_REGEX.test(goalId)) {
         throw new ContinuityStoreError(`invalid goalId "${goalId}" — expected goal-NNNN`);
       }
+      const title =
+        patch.title !== undefined ? storedTitle(patch.title, "goal", "updateGoal()") : undefined;
+      const unit = patch.unit !== undefined ? storedUnit(patch.unit) : undefined;
       // The proven transition is machine-checked for goals exactly like plan
-      // steps (§2.4: plan steps AND goals carry the ladder).
+      // steps (§2.4: plan steps AND goals carry the ladder) — unless the
+      // caller asked for an unverified one (design/0.8.0 §6.3, see proveStep).
       let proofs: readonly FrozenProof[] = [];
+      let asserted: readonly UnverifiedRef[] = [];
       if (patch.status === "proven") {
         if (patch.evidence === undefined || patch.evidence.length === 0) {
           throw new ContinuityStoreError(
             `continuity-store: marking ${goalId} proven requires evidence — run the action first, then cite its toolUseId(s).`,
           );
         }
-        proofs = await verify(patch.evidence);
+        if (proveOpts.verification === "unverified") {
+          asserted = unverifiedRefs(patch.evidence, goalId);
+        } else {
+          proofs = await verify(patch.evidence);
+        }
       }
       return locked(async () => {
         const goals = await readGoals();
@@ -1068,19 +1402,33 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
         if (idx < 0) {
           throw new ContinuityStoreError(`continuity-store: no goal "${goalId}"`);
         }
-        const existing = goals[idx] as Goal;
+        let existing = goals[idx] as Goal;
+        if (proofs.length > 0 && existing.unverified !== undefined) {
+          // A verified transition supersedes an earlier proven-by-assertion.
+          const { unverified: _superseded, ...rest } = existing;
+          existing = rest;
+        }
         const mergedProofs =
           proofs.length > 0 ? mergeProofs(existing.proofs ?? [], proofs) : existing.proofs;
+        // As in proveStep: an unverified transition never downgrades a goal
+        // already proven with verification (the rest of the patch applies).
+        const keepVerified = isProvenVerified(existing);
         const next: Goal = {
           ...existing,
-          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(asserted.length > 0 && !keepVerified
+            ? { unverified: nextUnverified(existing, asserted, goalId) }
+            : {}),
+          ...(title !== undefined ? { title } : {}),
           ...(patch.status !== undefined ? { status: patch.status } : {}),
           ...(patch.target !== undefined ? { target: patch.target } : {}),
           ...(patch.current !== undefined ? { current: patch.current } : {}),
-          ...(patch.unit !== undefined ? { unit: patch.unit } : {}),
+          ...(unit !== undefined ? { unit } : {}),
           ...(mergedProofs !== undefined ? { proofs: mergedProofs } : {}),
           updatedAt: now().toISOString(),
         };
+        // The caller's check sees the record as it will be written, under
+        // the lock — before the pin, so a refusal leaves nothing behind.
+        proveOpts.guard?.(next, goals[idx] as Goal);
         // Pin the cited sessions BEFORE the proven goal lands, so a retention
         // file that cannot be written fails the transition instead of leaving
         // a proven goal whose evidence can be TTL-evicted (see proveStep).

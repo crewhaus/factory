@@ -585,8 +585,11 @@ export function withThredzGoalMirror(
       }
       return goal;
     },
-    async updateGoal(goalId, patch) {
-      const goal = await store.updateGoal(goalId, patch);
+    async updateGoal(goalId, patch, proveOpts) {
+      // Forward the proof options (design/0.8.0 §6.3): dropping them would
+      // turn a `continuity.proof: off` goal proof into a verified one that
+      // fails against a harness with no event log.
+      const goal = await store.updateGoal(goalId, patch, proveOpts);
       const remoteId = readGoalMap(mapDir, onMapRefused)[goalId];
       if (remoteId === undefined) {
         // The create mirror was skipped (offline/quota) — nothing to address.

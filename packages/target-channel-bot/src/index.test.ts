@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  type EvaluationFragment,
+  evaluationFragmentFromIr,
+  mergeGateTools,
+  wireEvaluation,
+} from "@crewhaus/evaluation-service";
 import type { IrChannelV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitChannelBot } from "./index";
 
@@ -1897,114 +1903,185 @@ describe("emitChannelBot — memory.embedder (loop contract 0.4, Batch A)", () =
   });
 });
 
-describe("emitChannelBot — evaluation block (loop contract 0.4, Batch B, G02)", () => {
-  test("llm_judge: agent.ts carries the eval-judge wiring threaded into the interactive turn", () => {
-    const agent =
-      fileMap({
-        ...MIN_IR,
-        evaluation: {
-          grader: {
-            type: "llm_judge",
-            criteria: "answers cite a source",
-            model: "claude-haiku-4-5",
-          },
-          threshold: 0.8,
-          onFail: "retry",
-          maxRetries: 2,
-        },
-      }).get("agent.ts") ?? "";
-    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
-    expect(agent).toContain(
-      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
-    );
-    expect(agent).toContain("const __evaluation: RunEvaluation = {");
-    expect(agent).toContain('graderType: "llm_judge",');
-    // 0.6.0 §6.2 (PR 13) — the judge model stated declaratively beside the
-    // closure, so the pool's per-arm quality lineage can fold it.
-    expect(agent).toContain('judgeModel: "claude-haiku-4-5",');
-    expect(agent).toContain('model: "claude-haiku-4-5",');
-    expect(agent).toContain('description: "answers cite a source",');
-    expect(agent).toContain("threshold: 0.8,");
-    expect(agent).toContain('onFail: "retry",');
-    expect(agent).toContain("maxRetries: 2,");
-    // 0.6.0 §6.2 — the evaluate fn receives the RUN bus and hands it to the
-    // judge, so judge spend is priced and budget-metered; the judge's wire
-    // model + priced spend ride back on the verdict for eval_graded.
-    expect(agent).toContain("evaluate: async ({ finalText, messages, isSynthetic, bus }) => {");
-    expect(agent).toContain("const __verdict = await gradeWithJudgePanel({");
-    // 0.6.0 PR 13b — the turn's own conversation becomes the graded
-    // `RunResult`, so `target: transcript` sees the trajectory.
-    expect(agent).toContain("run: inLoopRunResult({ finalText, messages, isSynthetic }),");
-    expect(agent).toContain("      bus,\n    });");
-    expect(agent).toContain("model: __verdict.judgeModel,");
-    expect(agent).toContain(
-      "...(__verdict.costUsdMicros !== undefined ? { costUsdMicros: __verdict.costUsdMicros } : {}),",
-    );
-    // A3 — an abstaining judge scores 0; the grader already returns score 0
-    // with a "judge abstained (…)" rationale, returned verbatim.
-    expect(agent).toContain("score: __verdict.score,");
-    expect(agent).toContain("rationale: __verdict.rationale,");
-    expect(agent).toContain("evaluation: __evaluation,");
-  });
+/** The JSON fragment an emitted `wireEvaluation(<fragment>, …)` boot line carries. */
+function emittedGateFragment(content: string): EvaluationFragment {
+  const head = "const __gates = await wireEvaluation(";
+  const line = content
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.startsWith(head));
+  if (line === undefined) throw new Error("no wireEvaluation boot line");
+  return JSON.parse(line.slice(head.length, line.lastIndexOf(", { cwd:"))) as EvaluationFragment;
+}
 
-  test("llm_judge: the judge model defaults to the shape's primary model and the resolved default threshold is honored", () => {
-    const agent =
-      fileMap({
-        ...MIN_IR,
-        evaluation: {
-          grader: { type: "llm_judge", criteria: "be kind" },
-          onFail: "retry",
-          maxRetries: 1,
-        },
-      }).get("agent.ts") ?? "";
-    expect(agent).toContain('model: "claude-sonnet-4-6",');
-    expect(agent).toContain('description: "be kind",');
-    expect(agent).toContain("threshold: 0.7,");
-  });
+type RunEvaluation = NonNullable<Awaited<ReturnType<typeof wireEvaluation>>["evaluation"]>;
 
-  test("contains: emits a pure fn (no eval-judge import; documented threshold 1)", () => {
-    const agent =
-      fileMap({
-        ...MIN_IR,
-        evaluation: {
-          grader: { type: "contains", value: "DONE" },
-          onFail: "halt",
-          maxRetries: 3,
-        },
-      }).get("agent.ts") ?? "";
+/** A completed turn for a deterministic grader (which never reads the bus). */
+const gateTurn = (finalText: string): Parameters<RunEvaluation["evaluate"]>[0] => ({
+  finalText,
+  messages: [],
+  usage: { input: 0, output: 0 },
+  bus: {} as Parameters<RunEvaluation["evaluate"]>[0]["bus"],
+});
+
+const PROVABILITY: NonNullable<IrChannelV0["provability"]> = {
+  level: "grounded",
+  onFail: "retry",
+  maxRetries: 1,
+  threshold: 1,
+  scope: "session",
+  assumptions: "allow",
+  render: "footer",
+  sources: { allow: [], deny: [], bibliographic: false, resolve: "off" },
+  grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+  execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+  formal: { checkers: ["builtin", "smt"], forbid: ["sorry"], timeoutMs: 30_000 },
+};
+
+describe("emitChannelBot — the in-loop gates (loop contract 0.4 G02; 0.8.0 §4.4 evaluation-service)", () => {
+  const LLM_JUDGE: IrChannelV0["evaluation"] = {
+    grader: { type: "llm_judge", criteria: "answers cite a source", model: "claude-haiku-4-5" },
+    threshold: 0.8,
+    onFail: "retry",
+    maxRetries: 2,
+  };
+
+  test("evaluation: runTurn wires the gates per turn through ONE call and threads the field", () => {
+    const ir: IrChannelV0 = { ...MIN_IR, evaluation: LLM_JUDGE };
+    const agent = fileMap(ir).get("agent.ts") ?? "";
+    expect(agent).toContain('import { wireEvaluation } from "@crewhaus/evaluation-service";');
+    expect(agent).toContain(
+      `      const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(ir))}, { cwd: process.cwd() });\n      return await runChatLoop({`,
+    );
+    expect(agent).toContain("\n        evaluation: __gates.evaluation,");
+    expect(agent).not.toContain("__evaluation");
+    expect(agent).not.toContain("gradeWithJudgePanel");
     expect(agent).not.toContain("@crewhaus/eval-judge");
-    expect(agent).toContain('graderType: "contains",');
-    expect(agent).toContain("threshold: 1,");
-    expect(agent).toContain('finalText.includes("DONE")');
-    expect(agent).toContain('onFail: "halt",');
-    expect(agent).toContain("evaluation: __evaluation,");
+    // Evaluation alone adds no tools and leaves the tool list alone.
+    expect(agent).not.toContain("mergeGateTools");
+    expect(agent).toContain("        tools: config.tools,");
+    expect(emittedGateFragment(agent)).toEqual(evaluationFragmentFromIr(ir) as EvaluationFragment);
   });
 
-  test("regex: emits a pure fn with a per-call lastIndex reset", () => {
+  test("behaviour: each grader type, run from the EMITTED fragment, scores as the inline grader did", async () => {
+    const wired = async (evaluation: IrChannelV0["evaluation"]) =>
+      (
+        await wireEvaluation(
+          emittedGateFragment(fileMap({ ...MIN_IR, evaluation }).get("agent.ts") ?? ""),
+          { cwd: "/tmp" },
+        )
+      ).evaluation as RunEvaluation;
+    const c = await wired({
+      grader: { type: "contains", value: "DONE" },
+      onFail: "halt",
+      maxRetries: 3,
+    });
+    expect([c.graderType, c.threshold, c.onFail, c.maxRetries]).toEqual(["contains", 1, "halt", 3]);
+    expect(await c.evaluate(gateTurn("DONE"))).toEqual({
+      score: 1,
+      rationale: 'output contains "DONE"',
+    });
+    const r = await wired({
+      grader: { type: "regex", value: "\\d+ items" },
+      onFail: "note",
+      maxRetries: 1,
+    });
+    expect(await r.evaluate(gateTurn("3 items"))).toEqual({
+      score: 1,
+      rationale: "output matches /\\d+ items/",
+    });
+    expect((await r.evaluate(gateTurn("3 items"))).score).toBe(1);
+    expect((await r.evaluate(gateTurn("none"))).score).toBe(0);
+    const j = await wired(LLM_JUDGE);
+    expect([j.graderType, j.threshold, j.judgeModel]).toEqual([
+      "llm_judge",
+      0.8,
+      "claude-haiku-4-5",
+    ]);
+    const d = await wired({
+      grader: { type: "llm_judge", criteria: "be kind" },
+      onFail: "retry",
+      maxRetries: 1,
+    });
+    expect([d.judgeModel, d.threshold]).toEqual(["claude-sonnet-4-6", 0.7]);
+  });
+
+  test("provability: reply footer, the run's session root, the proof tools merged into the turn's list", () => {
+    const ir: IrChannelV0 = { ...MIN_IR, provability: PROVABILITY };
+    const agent = fileMap(ir).get("agent.ts") ?? "";
+    expect(agent).toContain(
+      'import { mergeGateTools, wireEvaluation } from "@crewhaus/evaluation-service";',
+    );
+    expect(agent).toContain(
+      `const __gates = await wireEvaluation(${JSON.stringify(evaluationFragmentFromIr(ir))}, { cwd: process.cwd(), catalog: config.tools, footerTarget: "reply", ...(config.sessionRootDir !== undefined ? { sessionRootDir: config.sessionRootDir } : {}) });`,
+    );
+    expect(agent).toContain("\n        provability: __gates.provability,");
+    expect(agent).toContain("        tools: mergeGateTools(config.tools, __gates),");
+    // No catalog registration loop on channel: the turn is handed a list.
+    expect(agent).not.toContain("unregister");
+  });
+
+  test("provability with the memory fabric and an optional MCP peer: the merge wraps the live list", () => {
     const agent =
       fileMap({
         ...MIN_IR,
-        evaluation: {
-          grader: { type: "regex", value: "\\d+ items" },
-          onFail: "note",
-          maxRetries: 1,
-        },
-      }).get("agent.ts") ?? "";
-    expect(agent).toContain('const __evalRegex = new RegExp("\\\\d+ items");');
-    expect(agent).toContain('graderType: "regex",');
-    expect(agent).toContain("threshold: 1,");
-    expect(agent).toContain("__evalRegex.lastIndex = 0;");
-    expect(agent).toContain("__evalRegex.test(finalText)");
-    expect(agent).toContain('onFail: "note",');
-    expect(agent).toContain("evaluation: __evaluation,");
+        provability: PROVABILITY,
+        memory: { wiki: { enabled: true } },
+        mcp_servers: { peer: { transport: "stdio", command: "x", args: [], required: false } },
+      } as IrChannelV0).get("agent.ts") ?? "";
+    expect(agent).toContain("catalog: __liveTools,");
+    expect(agent).toContain("tools: mergeGateTools([...__liveTools, ...__memTools], __gates),");
+    // The gates boot after the memory fabric (they read the live list).
+    expect(agent.indexOf("const __gates = await")).toBeGreaterThan(
+      agent.indexOf("const __memWired = await"),
+    );
   });
 
-  test("no evaluation block → no evaluation wiring in any emitted file (byte-identity guard)", () => {
+  test("the emitted merge, run: a ProofCheck the spec listed below proven becomes the gate's own", async () => {
+    const ir: IrChannelV0 = { ...MIN_IR, provability: PROVABILITY };
+    const agent = fileMap(ir).get("agent.ts") ?? "";
+    const head = "const __gates = await wireEvaluation(";
+    const line = agent.split("\n").find((l) => l.trimStart().startsWith(head)) ?? "";
+    const literal = line.trimStart().slice(head.length, line.trimStart().lastIndexOf(", { cwd:"));
+    const gates = await wireEvaluation(JSON.parse(literal), { cwd: "/tmp" });
+    const listed = { name: "ProofCheck" } as Parameters<typeof mergeGateTools>[0][number];
+    const merged = mergeGateTools([listed], gates);
+    expect(merged.map((t) => t.name)).toEqual(["ProofCheck", "ProvabilityPreflight"]);
+    expect(merged[0]).toBe(gates.proofTools.find((t) => t.name === "ProofCheck"));
+  });
+
+  test("a spec name with a space (the spec schema allows one) compiles to a gate that wires", async () => {
+    const ir: IrChannelV0 = { ...MIN_IR, name: "support bot", provability: PROVABILITY };
+    const fragment = evaluationFragmentFromIr(ir);
+    expect(fileMap(ir).get("agent.ts")).toContain(JSON.stringify(fragment));
+    const gates = await wireEvaluation(fragment as NonNullable<typeof fragment>, { cwd: "/tmp" });
+    expect(gates.provability).toBeDefined();
+  });
+
+  test("the eval-bridge entry roots the gates at the per-sample fabric root", () => {
+    const agent =
+      new Map(
+        emitChannelBot({ ...MIN_IR, provability: PROVABILITY }, { evalEntry: true }).files.map(
+          (f) => [f.path, f.content],
+        ),
+      ).get("agent.ts") ?? "";
+    expect(agent).toContain("{ cwd: config.fabricRoot ?? process.cwd(), catalog: config.tools,");
+  });
+
+  test("no gate block → no gate wiring in any emitted file (byte-identity guard)", () => {
     for (const [, content] of fileMap(MIN_IR)) {
       expect(content).not.toContain("evaluation:");
-      expect(content).not.toContain("__evaluation");
+      expect(content).not.toContain("__gates");
+      expect(content).not.toContain("@crewhaus/evaluation-service");
       expect(content).not.toContain("@crewhaus/eval-judge");
     }
+    const plain = emitChannelBot(MIN_IR).files.map((f) => f.content);
+    const undef = emitChannelBot({
+      ...MIN_IR,
+      evaluation: undefined,
+      provability: undefined,
+    }).files.map((f) => f.content);
+    expect(undef).toEqual(plain);
   });
 });
 

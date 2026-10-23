@@ -52,19 +52,18 @@ describe("Batch B smoke — cli evaluation: compiles warning-free with wired eva
   });
 
   test("bundle bytes contain the in-loop evaluate wiring", () => {
-    expect(agent).toContain('import type { RunEvaluation } from "@crewhaus/runtime-core";');
-    // 0.6.0 PR 13b — every judge site grades through `createJudgeGrader`
-    // (via `gradeWithJudgePanel`), so a declared panel is honoured.
+    // 0.8.0 §4.4 — the bundle builds the grader through the gate composition
+    // root (`@crewhaus/evaluation-service`'s `wireEvaluation`, which grades an
+    // llm_judge through `gradeWithJudgePanel`), handing it the lowered block.
+    expect(agent).toContain('import { wireEvaluation } from "@crewhaus/evaluation-service";');
+    expect(agent).toContain("const __gates = await wireEvaluation(");
     expect(agent).toContain(
-      'import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";',
+      '"grader":{"type":"llm_judge","criteria":"helpful and cites a source"}',
     );
-    expect(agent).toContain("const __evaluation: RunEvaluation = {");
-    expect(agent).toContain('graderType: "llm_judge"');
-    expect(agent).toContain("threshold: 0.8");
-    expect(agent).toContain("maxRetries: 2");
-    expect(agent).toContain("helpful and cites a source");
+    expect(agent).toContain('"threshold":0.8');
+    expect(agent).toContain('"maxRetries":2');
     // The run-options field that hands the evaluate fn to the runtime loop.
-    expect(agent).toContain("evaluation: __evaluation,");
+    expect(agent).toContain("evaluation: __gates.evaluation,");
   });
 });
 

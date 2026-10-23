@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../errors" },
+    { "path": "../evaluation-service" },
     { "path": "../gateway-protocol" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
