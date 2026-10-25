@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-state",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic harness state tools: key-value storage, counters, checkpoints, journals, blackboards and lexical search over local notes",
   "main": "src/index.ts",
@@ -40,5 +40,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-capability",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "ToolRegistry: what builtin tools exist, and which of them this harness is actually running",
   "main": "src/index.ts",
@@ -38,5 +38,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

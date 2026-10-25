@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/claim-ledger",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "The one text layer every claim checker reads: sentences, claims, content tokens and coverage, the citation and evidence-reference grammar, and number normalization",
   "main": "src/index.ts",
@@ -29,5 +29,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

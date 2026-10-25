@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/hangar-ui",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "The Hangar web console's static UI — zero-build, dependency-free browser ES modules embedded as text assets for the single-binary CLI to hand to the hangar server",
   "main": "src/index.ts",
@@ -29,5 +29,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "assets", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "assets", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

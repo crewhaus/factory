@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-ledger",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic double-entry ledger: hash-chained postings, queries, reconciliation and invoice rendering",
   "main": "src/index.ts",
@@ -42,5 +42,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

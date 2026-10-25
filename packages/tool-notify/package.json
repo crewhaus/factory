@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-notify",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic messaging tools: send to chat platforms, email and webhooks, render templates, assemble digests and enforce quiet hours",
   "main": "src/index.ts",
@@ -41,5 +41,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

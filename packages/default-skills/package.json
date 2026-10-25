@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/default-skills",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Shipped default skills (continuity, learning-loop, dream, provability) and builtin slash commands",
   "main": "src/index.ts",
@@ -42,5 +42,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "skills", "commands", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "skills", "commands", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

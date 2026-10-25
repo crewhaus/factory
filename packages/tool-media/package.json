@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-media",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic media tools: image inspection and transformation, barcode encoding and decoding, chart and diagram rendering, and audio and video probing",
   "main": "src/index.ts",
@@ -38,5 +38,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }
