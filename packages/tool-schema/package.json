@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-schema",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic validation tools: JSON Schema validation and inference, JSON Patch, deep diffing and assertions",
   "main": "src/index.ts",
@@ -39,5 +39,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

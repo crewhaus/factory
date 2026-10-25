@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/chain-adapter-base",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Chain adapter base: provides the ChainAdapter interface, JSON-RPC envelope helpers, and the §47 classifyBoundary wrap-on-read pattern (Section 47, Slice 0).",
   "main": "src/index.ts",
@@ -33,5 +33,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

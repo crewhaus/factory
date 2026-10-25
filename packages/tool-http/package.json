@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-http",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic HTTP and network tools: pagination, GraphQL, webhooks, SSE, DNS, TLS inspection and link checking over allow-listed origins",
   "main": "src/index.ts",
@@ -40,5 +40,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }

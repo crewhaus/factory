@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-crewhaus",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "type": "module",
   "description": "Deterministic CrewHaus operations tools: spec validation, compilation checks, preflight, eval gates, fleet inventory and audit verification",
   "main": "src/index.ts",
@@ -47,5 +47,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
 }
