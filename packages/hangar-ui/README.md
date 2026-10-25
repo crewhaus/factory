@@ -125,7 +125,10 @@ eight new harness tabs and three new fleet screens:
 - **Memory** (`#/h/<id>/memory`) gains the fabric's write side — facts with
   forget/sweep (tombstones, never a delete), continuity trash + restore, the
   wiki editor with `expectedVersion` and its stale retry, watch-me analytics,
-  reports, intents and the synthesize review.
+  reports, intents and the synthesize review. A plan step or goal proven by
+  assertion under `continuity.proof: off` shows as an amber
+  `proven (unverified)`, with the refs it cited in its tooltip, never as a
+  green proven.
 - **Datasets** (`#/h/<id>/data`), **Feedback** (`#/h/<id>/feedback`) and the
   eval lab inside **Evals** cover the quality loops: registry + hygiene +
   growth, the fewshot/faq/lessons/advice feeds, and the matrix / trends /

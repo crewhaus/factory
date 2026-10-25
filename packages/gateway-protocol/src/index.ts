@@ -96,8 +96,9 @@ export const RunsCreateParams = z
  * `provability:` gate graded the run's final turn against, present only when
  * the spec declares the block — additive and optional, so the protocol
  * version stays `crewhaus.v1` and a run without the block answers exactly as
- * before. The bundle's one-line footer also rides `reply` unless the spec
- * sets `provability.render: none`.
+ * before. `reply` is the answer alone: the managed daemon wires the gate
+ * with `footerTarget: "none"`, so the human footer never lands in text a
+ * program consumes — `proof` is how a client sees the verdict.
  */
 export const RunsCreateResult = z
   .object({

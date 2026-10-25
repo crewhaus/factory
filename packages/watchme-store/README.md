@@ -25,7 +25,13 @@ acquireLock }`. Files (all mode `0600`):
   `<specName>|<target>` key (mean/M2 of turn counts and pooled quality,
   summed token/cost/tool/feedback counters, per-intent counts) and lands
   write-then-rename; aggregates parallel-combine (Chan et al.) with later
-  lines on the next compaction.
+  lines on the next compaction. A digest of a session the provability gate
+  graded carries `factuality.provability` (0.8.0, additive): the floor, the
+  weakest achieved rung, and counts of graded, failing and unverified turns
+  and of unmet claims and assumptions, never claim text. When at least one
+  turn was verified at a floor of `grounded` or above, the factuality counts
+  beside it are the gate's own over those turns rather than the heuristic
+  roll-up.
 - `judgments.jsonl` — append-only `WatchmeJudgment` verdicts from the
   budgeted phase-2 judge. Machine signal stays OUT of the human feedback
   channel; the explicit `--emit-feedback` bridge converts, never this store.
@@ -84,6 +90,7 @@ does for an unknown `costUsd`.
 ## Exports
 
 `openWatchmeStore`, `openHarnessRegistry`, `joinQualityToArms`, and the types
-`WatchmeObservation`, `WatchmeAggregate`, `WatchmeJudgment`, `WatchmeState`,
-`HarnessEntry`, `WatchmeStore`, `WatchmeStoreOptions`, `HarnessRegistry`,
-`HarnessRegistryOptions`, `RouteDecision`, `TurnQuality`, `QualityArmRow`.
+`WatchmeObservation`, `WatchmeProvability`, `WatchmeAggregate`,
+`WatchmeJudgment`, `WatchmeState`, `HarnessEntry`, `WatchmeStore`,
+`WatchmeStoreOptions`, `HarnessRegistry`, `HarnessRegistryOptions`,
+`RouteDecision`, `TurnQuality`, `QualityArmRow`.

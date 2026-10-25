@@ -63,6 +63,23 @@ each file through a temp created with `O_EXCL|O_NOFOLLOW` and renamed into
 place, and refuse a part or destination name that is a symlink, with or
 without `overwrite`. `copy-containment.test.ts` holds these.
 
+The run's own record is out of reach as well (0.8.0). The runtime hands
+each tool call the directories where it keeps that record: the session
+logs, the tool results it saved to a file, and the proof bundles. The
+permission engine already denies a write that names a path inside one, or
+that acts beneath a workspace directory holding one, but it leaves a write
+beneath the workspace root itself to the rules, and lets every call through
+in `bypass` mode. So `CopyPath`, `MovePath`, `RemovePath` and
+`ArchiveExtract` check their own targets against the same directories before
+they write, and refuse in every permission mode, `bypass` included. Their
+check is exact. A file copied onto a directory that holds one is refused; a
+tree is refused only where it has something on the way to one, since a copy
+merges entry by entry; and a copy that lands beside one
+(`CopyPath notes.md .crewhaus/notes.md`) is not refused. A move or removal
+of a directory that holds one is refused, and so is an archive with a
+top-level member that is or holds one. Reading from them is not a write:
+`CopyPath` and `ArchiveCreate` can take `.crewhaus` as their source.
+
 Archives get a second gate. `ArchiveExtract` reads the member list from the
 archive's own structures **in this process** — tar's headers, zip's central
 directory — rather than from `tar -t` or `unzip -Z1` output, because a member

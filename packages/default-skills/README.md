@@ -14,7 +14,7 @@ and every piece of it is overridable or clearable by the user.
 | `continuity` | The session discipline: read `<current_plan>` first, pin user requirements as verbatim REQ entries, keep the plan current with `PlanUpdate`, claimed-vs-proven status honesty (`PlanComplete` + toolUseId evidence is the only path to proven), bias to action, accurate handoffs. |
 | `learning-loop` | The expert demo's four modes, productized: ANSWER (recall first, cite slugs, never bluff, log gaps), STUDY (gaps → curriculum rung → frontier; no source, no commit), REFLECT (stale-first reconcile; supersede, never delete), EXAM (prove it against the configured exam). Templated by `{{domain}}`, `{{curriculum}}`, `{{sources}}`. |
 | `dream` | The consolidation playbook consumed by scheduled dream ticks (not user-invoked): merge/split articles, reconcile contradictions, move confidence with evidence, promote corroborated facts to cited drafts, log gaps, refresh next actions — every mutation through the normal audited tools, within budget. |
-| `provability` | How to answer under the 0.8.0 proof gate: cite with `[n]` and close with a definitions block, read a source before citing it and quote it, cite computations as `tool:<toolUseId>` and proofs as `proof:prf_…`, declare assumptions as `[A1]: assume: …`, run `ProvabilityPreflight` on the draft. Says what the gate checks at each rung. Templated from the block's settings that change what the gate accepts (`{{level}}`, `{{checkers}}`, `{{on_fail}}`, `{{window}}`, `{{assumptions}}`, `{{independent}}`) plus a `{{#proofs}}` section kept only where the proof tools are wired; registered only for a spec with a `provability:` block. |
+| `provability` | How to answer under the 0.8.0 proof gate: cite with `[n]` and close with a definitions block, fetch or read a source before citing it and quote it when you can, cite computations as `tool:<toolUseId>` and proofs as `proof:prf_…`, declare assumptions as `[A1]: assume: …`, run `ProvabilityPreflight` on the draft. Says what the gate checks at each rung. Templated from the block's settings that change what the gate accepts (`{{level}}`, `{{checkers}}`, `{{on_fail}}`, `{{window}}`, `{{assumptions}}`, `{{independent}}`) plus a `{{#proofs}}` section kept only where the proof tools are wired; registered only for a spec with a `provability:` block. |
 
 **Eleven builtin slash commands** (`commands/<name>.md`, standard
 `$ARGUMENTS` templating): `/plan`, `/focus <text>`, `/next`, `/handoff`,
@@ -44,8 +44,10 @@ import { loadCommands } from "@crewhaus/slash-commands";
 
 // Skills: builtins merge at LOWEST precedence — ~/.crewhaus/skills and
 // <cwd>/.crewhaus/skills override by name; an empty-body override
-// effectively disables a builtin.
-const skills = await discoverSkills({ builtinSkills: DEFAULT_SKILLS });
+// effectively disables a builtin. DEFAULT_SKILLS bodies are unrendered:
+// pass the ones a harness's features use, templated ones rendered first.
+const continuity = DEFAULT_SKILLS.filter((s) => s.name === "continuity");
+const skills = await discoverSkills({ builtinSkills: continuity });
 
 // Commands: builtin < user (~/.crewhaus/commands) < project (.crewhaus/commands).
 const commands = await loadCommands({ builtinDirs: [builtinCommandsDir] });
@@ -90,10 +92,11 @@ builds its Skill tool straight over the rendered `provability` skill (that
 shape discovers no skills of its own). Nothing reaches the prompt unread
 there either — the skill's name and description are this package's shipped
 constants (the block substitutes into the body only), and the body is
-classified at load like every other. A content-lint test pins every tool
-name mentioned in the bodies to the real registered tool names (tool-plan,
-tool-wiki, tool-proof) so the prose cannot drift from the tools, and the
-`provability` skill's worked example is read by claim-ledger, the gate's own
-citation parser.
-
-Emitter and interpreter wiring lands in later PRs of the v0.3.0 train.
+classified at load like every other. A content-lint test checks every
+tool-shaped name in a body's code spans against a pinned vocabulary, and
+checks that every tool tool-plan, tool-wiki and tool-proof register is in
+it, so a typo or an unpinned tool name fails the test. The `provability`
+skill's worked example is parsed by
+claim-ledger, the gate's own citation parser, so the example the model is
+shown is well formed by the gate's reading: two claims, each with its own
+marker, and every marker defined.

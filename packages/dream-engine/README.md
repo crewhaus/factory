@@ -8,6 +8,10 @@ on a schedule, not every turn". A dream run is two phases:
   flags (facts unrecalled >90d, wiki unverified >30d — constants exported),
   sessions-index fold-in, proof-excerpt re-validation + retention-pin refresh,
   focus/handoff next-actions refresh, trash purge (>7 days).
+  `createDreamEngine`'s `proofMode` (the spec's `continuity.proof`) decides
+  how the report's `openPlans` counts a step as done, as the plan tools and
+  the handoff do: under `require`, a step proven only by assertion, or with no
+  proof on record, is still open.
 - **Phase 2 — model synthesis** (`mode: full` AND `budget_usd > 0`): ONE
   bounded fresh session (`sessionTarget: "dream"`, singleTurn, capped tool
   loop) seeded with the dream playbook + phase-1 findings, acting ONLY through

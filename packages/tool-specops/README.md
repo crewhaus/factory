@@ -138,9 +138,14 @@ puts the reason in its result:
   were read, and anything standing between it and the whole directory is in
   `incomplete`.
 - `SpecAdvise` reads the proof bundles the provability gate saved for its
-  failing turns, so the provability finding can name the most common reason a
-  claim fell short. `proofBundles` says how many it read, and a bundle it could
-  not read is named in `unreadable` and in `incomplete`.
+  failing turns, because the session log carries only the counts and the
+  provability finding needs the reasons to name the most common one.
+  `proofBundles` gives how many bundles the failing turns' log lines name
+  (`failing`; a turn whose bundle was not saved names none) and how many were
+  read (`read`). A bundle it could not read is named in `unreadable` and
+  in `incomplete`, and bundles past `maxFiles` are counted in `notRead` and
+  noted in `incomplete`: a bundle nobody read is not a bundle with no unmet
+  claims.
 - `SpecAdvise` also reports `routingScoreboard: { read: false, reason }`. The
   reward scoreboard lives in `@crewhaus/routing-store`, which this package
   does not depend on, so the three pool rules did not run — their silence is
@@ -175,13 +180,14 @@ puts the reason in its result:
   interpolated into the YAML. The charset check is the injection floor and not
   the whole gate — the scaffolded document is re-parsed before it is written,
   which is what catches a name YAML types as a number or a boolean.
-- `op: "remove"` is judged by the same rule a `replace` is. `validatePatch`'s
-  block guard asks what a patch's VALUE would change, so it has nothing to say
-  about a removal, and removing the `model_pool.learning` block used to delete
-  the `seed` a routed eval pins — the edit that is refused when it is spelled
-  as a replace. The tool asks the removal question against the same exported
-  `OPTIMIZER_REFUSED_LEAVES` table, and only when the document actually carries
-  the leaf.
+- `op: "remove"` is judged by the same rule a `replace` is. Removing the
+  `model_pool.learning` block used to delete the `seed` a routed eval pins —
+  the edit that is refused when it is spelled as a replace — because
+  `validatePatch`'s block guard asked only what a patch's VALUE would change.
+  Since 0.8.0 `validatePatch` refuses a removal that drops a refused leaf
+  itself, and the tool still asks the same question of the YAML text it was
+  sent, against the same exported `OPTIMIZER_REFUSED_LEAVES` table and only
+  when the document actually carries the leaf.
 - A tool name that is not a plain identifier, or any `mcp__*` dynamic sink,
   stays advisory — those are definitionally external and need a human's
   vetting, not a mechanical stamp.

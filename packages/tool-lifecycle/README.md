@@ -136,6 +136,11 @@ verified.
   `wouldWrite`;
 - a destination path that is a symlink leading out of the workspace, with no
   override;
+- a copy that would land in the running harness's own record — its session
+  logs, the tool results the runtime saved to a file, or its proof bundles,
+  as `to: .crewhaus` would — with no override and in every permission mode
+  (0.8.0). The provability gate and `continuity.proof` read that record as
+  evidence, so a migration onto it could rewrite the evidence;
 - a `targetVersion` different from the source's, and any `targetVersion` at all
   against a store with no version stamp. See below.
 

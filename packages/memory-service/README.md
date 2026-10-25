@@ -106,8 +106,11 @@ degraded to the ladder with a boot note, which is gone):
 - `require` — the ladder, and nothing below `proven` completes anything:
   `claimed` stays settable, but a goal cannot reach its target unproven.
   A step or goal proven by assertion (an earlier `off` run), or `proven`
-  with no frozen proof, counts as below `proven` everywhere: it stays open
-  in the `<current_plan>` tail and `handoff.md` (the teardown write and the
+  with no frozen proof, counts as below `proven` everywhere: such a goal
+  stays among the open goals in the `<current_plan>` tail and `handoff.md`,
+  such a step of the active plan is a `Prove: …` next action in the
+  handoff, another plan holding one stays among the handoff's open plans
+  with the step left out of its proven count (the teardown write and the
   dream's refresh both render under the mode), and the Thredz goal mirror
   sends only the fields an update changed instead of completing the remote
   goal.

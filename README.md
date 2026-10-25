@@ -304,10 +304,21 @@ That's a domain expert that studies, cites, reflects, and sits its own exam — 
 One line sets how much proof a harness's answers must carry:
 
 ```yaml
-provability: grounded   # cited | grounded | checked | proven
+provability: grounded
 ```
 
-Before an answer is served, a deterministic gate checks every claim in it against what the run actually did: a page it fetched, a calculation it ran, a proof a checker accepted. An answer that falls short is retried, marked ✗, or refused, as the spec says, and a short proof footer travels with every answer. `crewhaus provability check` runs the same gate over any document in CI.
+- **`cited`** — every claim names its source.
+- **`grounded`** — the run read that source, and it says what the claim says.
+- **`checked`** — a tool the run called computed the value; a pure tool is re-run to confirm it.
+- **`proven`** — a proof checker accepted a proof of the claim: the built-in one, or Z3 or Lean 4 in a sandbox.
+
+As each answer completes, a deterministic gate checks every claim in it against what the run actually did.
+
+- **An answer that falls short** is retried, and served with a visible ✗ if it still falls short. `on_fail` can instead hand it to a stronger model, serve it with the ✗ at once, or stop the run.
+- **The proof travels with the answer** — a footer line on the cli and in channel replies, a `proof` field in a managed harness's run results, a `## Provability` section in a research report.
+- **To start**, `crewhaus init --provability <rung>` writes a spec with it. After a run, `crewhaus provability show` prints an answer's proof; `crewhaus provability check` runs the gate over any document, so CI can gate a generated report.
+
+It works on cli, channel, managed and research specs and stays off until a spec turns it on; when it is on, the model is taught to cite the way the gate reads.
 
 ## Documentation
 

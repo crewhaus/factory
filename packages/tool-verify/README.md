@@ -224,10 +224,26 @@ because a dot is a decimal point in one locale and a group separator in
 another). And the only word-ending rule is a plural `s`, never stemming —
 "completed" does not answer for "complete".
 
-The matcher, the citation grammar and the sentence splitter live in
-[`@crewhaus/claim-ledger`](../claim-ledger), which the provability gate reads
-too, so a claim the gate checks is the claim `FactCrossCheck` checks.
-`FactCrossCheck` asks for every word of a claim, as it always has.
+Before anything is compared, the claim and the source are read through one
+fold, so a spelling a reader cannot tell from the plain one counts as the
+plain one. A digit of any script (`٣٠`, `३०`), a fullwidth or mathematical
+letter or digit (`３０`, `𝟑𝟎`), a superscript number where a number stands
+(`³⁰ dollars`), and a Cyrillic or Greek letter that looks Latin inside a
+Latin word are read as the plain letter or digit. A soft hyphen or
+zero-width character inside a word is ignored, so a `not` with a zero-width
+space in it is still a negation. A footnote mark on the claim (`…30 days.¹`)
+is not a word the source must hold. A word reported missing is given in the
+plain spelling, and the excerpt is the source's own text. Text with nothing
+outside ASCII is checked exactly as before. The fold is new in 0.8.0, so a
+claim 0.7.x reported `notFound` against such a source can now be
+`supported`, and one it reported `supported` against a hidden or lookalike
+`not` is now a `polarityConflict`.
+
+The matcher, the fold, the citation grammar and the sentence splitter live
+in [`@crewhaus/claim-ledger`](../claim-ledger). The provability gate's
+`grounded` rung locates a claim with the same code, so the gate and
+`FactCrossCheck` read a claim and a source alike. `FactCrossCheck` still
+asks for every word of a claim; the gate asks for the share its spec sets.
 
 `GoldenUpdate` is the only tool here that writes. It overwrites a reviewed
 baseline, so it is destructive and justification-gated, and it writes through
