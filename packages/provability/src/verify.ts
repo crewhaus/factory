@@ -20,6 +20,7 @@ import {
   type Location,
   MIN_CLAIM_TOKENS,
   NEGATIONS,
+  STOPWORDS,
   type SourceIndex,
   type SourceToken,
   citationDefinitions,
@@ -46,6 +47,7 @@ import {
   quotedSpans,
   tightestWindows,
   tokenize,
+  writtenSpan,
 } from "@crewhaus/claim-ledger";
 import { resolveContained } from "@crewhaus/tool-safety/fs";
 import { isProofArtifact, isProofId } from "./artifact";
@@ -59,7 +61,9 @@ import {
 } from "./builtins";
 import {
   ProvabilityError,
+  type WrittenPlace,
   groundingBody,
+  inputPlaces,
   inputStrings,
   isReader,
   originFieldValues,
@@ -67,7 +71,8 @@ import {
   servedFrom,
   servesPage,
   sha256Of,
-  writtenOrigins,
+  writtenPlaces,
+  writtenText,
 } from "./evidence";
 import { isProvabilityLevel, levelRank, maxRung, meetsFloor } from "./levels";
 import {
@@ -96,6 +101,7 @@ import {
   type UnmetReason,
   type VerifyOptions,
 } from "./types";
+import { backstopClaims } from "./vacuous";
 
 /** A claim's text as the bundle carries it (design §5.3). */
 const MAX_CLAIM_CHARS = 400;
@@ -304,6 +310,12 @@ type CallFacts = {
   factCheck?: FactCheckReport | null;
   /** Each supported entry's source text as the checks read it, by entry ({@link factCheckFacts}). */
   factChecks?: Map<number, CallFacts>;
+  /**
+   * A `FactCrossCheck` entry's source text only: the call that wrote it
+   * there, when every file the check found the claim in is one this run
+   * wrote itself before the check ({@link factCheckSupport}).
+   */
+  writtenBy?: EvidenceRecord;
 };
 
 /** How often a word occurs over some stretch of a result, and how often it is denied there. */
@@ -369,10 +381,14 @@ type Run = {
   readonly stateRoots: ReadonlyArray<{ readonly dir: string; readonly shown: string }>;
   /** Text each call sent, in call order, for the stored-text test ({@link storedText}). */
   sent?: SentText;
-  /** The origins each call of {@link SentText} may have written, by its place there ({@link writtenBy}). */
-  writes?: Map<number, readonly string[]>;
-  /** The places in {@link SentText} of every call that may have written somewhere, in order ({@link writtenBy}). */
+  /** The places each call of {@link SentText} may have written, by its place there ({@link writesOf}). */
+  writes?: Map<number, readonly WrittenPlace[]>;
+  /** What each of those calls put where it wrote, by its place there ({@link wroteOf}). */
+  wrote?: Map<number, Wrote>;
+  /** The places in {@link SentText} of every call that may have written somewhere, in order ({@link provenanceOf}). */
   writers?: readonly number[];
+  /** What the run did to the places a body was read from, by the read and the places ({@link provenanceOf}). */
+  provenances?: Map<string, Provenance>;
   readonly replays: Map<string, Promise<ReplayOutcome>>;
   readonly artifacts: Map<string, Promise<ProofArtifact | undefined>>;
   readonly checkers: Map<string, NonNullable<ProofBundle["checkers"]>[number]>;
@@ -763,7 +779,7 @@ type CallInputs = {
 function callInputs(run: Run, record: EvidenceRecord): CallInputs {
   let inputs = run.inputs.get(record);
   if (inputs === undefined) {
-    const values = originFieldValues(record.toolName, record.input, {
+    const values = originFieldValues(record, {
       workspaceRoot: run.workspaceRoot,
     }).filter((value) => value.trim() !== "");
     const pending = [...values];
@@ -1024,7 +1040,7 @@ function sentStrings(
   let strings = sent.strings.get(at);
   if (strings === undefined) {
     const call = sent.calls[at] as EvidenceRecord;
-    const pending = originFieldValues(call.toolName, call.input, {
+    const pending = originFieldValues(call, {
       workspaceRoot: run.workspaceRoot,
     });
     const out: Array<{ index: SourceIndex; words: ReadonlySet<string> }> = [];
@@ -1060,18 +1076,23 @@ function sentStrings(
  *
  * - under a URL or path the call's input named (`mcp__fetch__fetch {url}`),
  *   only text sent to the same server (`mcp__<server>__`): a store hands
- *   back what was written to IT, and text the run sent anywhere else — the
- *   draft given to `ProvabilityPreflight`, a report `Write` saved, an exact
- *   phrase searched for, a comment posted to another server — cannot come
- *   back out of this one. Counting those refused an honest page fetched
- *   over MCP as "never read", in the designed preflight-then-fetch flow;
+ *   back what was written to IT, and text the run merely sent elsewhere —
+ *   the draft given to `ProvabilityPreflight`, an exact phrase searched for,
+ *   a comment posted to another server — is not what the page says.
+ *   Counting those refused an honest page fetched over MCP as "never read",
+ *   in the designed preflight-then-fetch flow. Text another tool WROTE to
+ *   that very URL or path — a PUT to it, a `Write` of the file a file
+ *   server then reads — is the page now, and the run's own: {@link writtenBy}
+ *   marks the binding, as for a builtin reader;
  * - under a hit the result carried (a JSON row's `url`), text sent by any
  *   call but the preflight, which writes nowhere: the row is whatever the
  *   server keeps, and a file `Write` saved is what a filesystem server reads.
  *
  * What stays open is a row stored before the evidence this verification is
- * handed begins — by an earlier session, or under `scope: turn` an earlier
- * turn: no call in it sent the text. Closing that needs the spec to say
+ * handed begins — by an earlier session, or by an earlier turn when the
+ * caller hands a turn-only index rather than the session's with
+ * `turnNumbers` (the gate and its preflight hand the latter): no call in it
+ * sent the text. Closing that needs the spec to say
  * which MCP tools return sources (a design decision; the README names the
  * residual). The words read here count against the grounding budget
  * ({@link MAX_GROUNDING_TOKENS}); past it the record is `"unread"`, not
@@ -1089,11 +1110,7 @@ function storedText(
   const server = mcpServerOf(record.toolName);
   // A hit is a view of the call (`hitView`): its own text, under an origin
   // the result carried rather than one the input named.
-  const whole = sent.calls[at] as EvidenceRecord;
-  const hit =
-    record !== whole &&
-    (record.content !== whole.content ||
-      record.origins.some((origin) => !whole.origins.includes(origin)));
+  const hit = isHitView(run, record);
   const sentHere = (call: EvidenceRecord): boolean =>
     hit ? call.toolName !== PROVABILITY_PREFLIGHT : mcpServerOf(call.toolName) === server;
   const runs = spanRuns(run, query, read.index, read.location);
@@ -1121,23 +1138,93 @@ function storedText(
   return by !== undefined ? { storedBy: by } : read;
 }
 
-/** How many copy or move steps {@link writtenBy} follows back from the cited origin. */
+/** How many copy or move steps {@link provenanceOf} follows back from the places a body was read from. */
 const MAX_WRITE_HOPS = 4;
-/** How many places one cited origin's text may be followed back through. */
+/** How many places one read's text may be followed back through. */
 const MAX_WRITE_ORIGINS = 32;
 
-/** The origins call `at` of {@link SentText} may have written (`writtenOrigins`), read once. */
-function writesOf(run: Run, sent: SentText, at: number): readonly string[] {
+/** The places call `at` of {@link SentText} may have written, or copied from (`writtenPlaces`), read once. */
+function writesOf(run: Run, sent: SentText, at: number): readonly WrittenPlace[] {
   run.writes ??= new Map();
   let named = run.writes.get(at);
   if (named === undefined) {
     const call = sent.calls[at] as EvidenceRecord;
     // Measured as the evidence index measures a reader's path: from the
     // workspace root, where the tools resolve one.
-    named = writtenOrigins(call.toolName, call.input, { workspaceRoot: run.workspaceRoot });
+    named = writtenPlaces(call.toolName, call.input, { workspaceRoot: run.workspaceRoot });
     run.writes.set(at, named);
   }
   return named;
+}
+
+/**
+ * What one call put where it wrote ({@link wroteOf}): every string it sent
+ * but the places it named, indexed (the "one string holds the claim" test),
+ * the strings its content fields carry, as token lists (`writtenText`), and
+ * the words it INTRODUCED — those it added and did not replace, by
+ * {@link wordKey} — that carry content: a figure, or a word of three letters
+ * or more that is no stopword.
+ */
+type Wrote = {
+  readonly strings: ReadonlyArray<SourceIndex>;
+  readonly added: ReadonlyArray<readonly string[]>;
+  /** The texts it replaced (an `Edit`'s `oldString`, a diff's `-` lines), as words. */
+  readonly removed: ReadonlyArray<readonly string[]>;
+  /** Each line it added that carries content, as {@link wordKey}s: where in a body it put words. */
+  readonly lines: ReadonlyArray<readonly string[]>;
+  readonly introduced: ReadonlySet<string>;
+};
+
+/** A word that carries content, for the introduced-words test: a figure, or a non-stopword of three letters or more. */
+const carriesContent = (word: string): boolean =>
+  figureKey(word) !== null || (word.length >= 3 && !STOPWORDS.has(word) && /\p{L}/u.test(word));
+
+/** The words of a text as the locate kernel normalizes them. */
+const wordsOf = (text: string): string[] =>
+  tokenize(foldTypography(text)).map((token) => token.norm);
+
+/** What call `at` of {@link SentText} put where it wrote, read once and counted against the grounding budget. */
+function wroteOf(run: Run, sent: SentText, at: number): Wrote {
+  run.wrote ??= new Map();
+  let wrote = run.wrote.get(at);
+  if (wrote === undefined) {
+    const call = sent.calls[at] as EvidenceRecord;
+    const places = new Set(writesOf(run, sent, at).map((one) => one.place));
+    const strings: SourceIndex[] = [];
+    for (const value of inputStrings(call.input)) {
+      if (value.trim() === "") continue;
+      const trimmed = value.trim();
+      const place = /^https?:\/\//i.test(trimmed)
+        ? normalizeUrl(trimmed)
+        : normalizePath(trimmed, { workspaceRoot: run.workspaceRoot });
+      if (place !== undefined && places.has(place)) continue;
+      const index = indexSource(value);
+      run.groundingTokens += index.tokens.length;
+      strings.push(index);
+    }
+    const text = writtenText(call.input);
+    const added = text.added.map(wordsOf);
+    const removedWords = text.removed.map(wordsOf);
+    const removed = new Set(removedWords.flat().map(wordKey));
+    const introduced = new Set<string>();
+    for (const words of added) {
+      run.groundingTokens += words.length;
+      for (const word of words) {
+        const key = wordKey(word);
+        if (carriesContent(word) && !removed.has(key)) introduced.add(key);
+      }
+    }
+    const lines: string[][] = [];
+    for (const one of text.added) {
+      for (const line of one.split(/\r\n|[\n\r\u2028\u2029\u0085]/)) {
+        const words = wordsOf(line);
+        if (words.some(carriesContent)) lines.push(words.map(wordKey));
+      }
+    }
+    wrote = { strings, added, removed: removedWords, lines, introduced };
+    run.wrote.set(at, wrote);
+  }
+  return wrote;
 }
 
 /** `origin` relative to `place` (`""` when they are one, `/rest` when it lies beneath it), else `undefined`. */
@@ -1147,95 +1234,375 @@ function beneathOf(origin: string, place: string): string | undefined {
 }
 
 /**
- * Did the run write, itself, the text that grounds a claim in a body a
- * builtin reader returned (design §10's residual: "a model that fetches a
- * page it wrote itself")? The call that did, or `undefined`.
- *
- * A `Read` returns the file as it is when read, so a claim the model put
- * there with `Write` grounds like any other — and should: an agent that
- * sets `timeout: 30` in a config and then reports it reports the truth. But
- * the run is then its own source, and the bundle says so rather than
- * letting the ✓ read as an outside source's (`ProofBinding.writtenBy`; the
- * footer counts it, `provability audit` lists it). So the claim at its
- * tightest in the span that grounded it ({@link spanRuns}) is looked for,
- * word for word, in what EARLIER calls of the run sent to that origin:
- * calls that may write ({@link writtenOrigins}: not a reader, not the
- * preflight, not a pure tool — `VerifyOptions.isPureTool` — and not one
- * that errored) and that named it. A copy or a move carries text from one
- * place to another, so the places a call naming the origin also names are
- * followed back too (a directory copied whole maps each file beneath it),
- * at most {@link MAX_WRITE_HOPS} steps. Found — every run of it — the
- * first such call is returned.
- *
- * Only the builtin readers are asked: an MCP server's result is
- * {@link storedText}'s (it is refused there, not marked), and Retrieve
- * returns the operator's corpus. What stays open: text written by `Bash`
- * or `RunCommand` (a command line names no field this reads), or by an
- * earlier session; and past the grounding budget nothing is marked.
+ * What the run did, before a body was read, to the places it was read from
+ * (design §10, §1): the writers into them, and the state root a copy
+ * brought the text here from, if one did.
  */
-function writtenBy(
-  run: Run,
-  record: EvidenceRecord,
-  origin: string,
-  query: ClaimQuery,
-  index: SourceIndex,
-  location: Location,
-): EvidenceRecord | undefined {
-  if (!isReader(record.toolName)) return undefined;
+type Provenance = {
+  /** The places in {@link SentText} of the calls that wrote into those places, or into one a copy then brought here. */
+  readonly into: readonly number[];
+  /** A place under the harness's own state that a copy, a move, a concatenation or an archive brought the text here from. */
+  readonly state?: {
+    readonly place: string;
+    readonly shown: string;
+    /** The call that brought it here — or, for a place the read itself was pointed at, the read. */
+    readonly via: EvidenceRecord;
+    readonly copied: boolean;
+  };
+};
+
+/** {@link Provenance}'s `state`: a place under a state root the text was brought here from. */
+type StateCopy = NonNullable<Provenance["state"]>;
+
+/** Why a body under `origin` that a copy brought out of the harness's own state is no source (§1). */
+function stateCopyDetail(origin: string, state: StateCopy): string {
+  const brought = state.copied
+    ? `${state.via.toolUseId} (${state.via.toolName}) copied ${state.place} there`
+    : `${state.via.toolUseId} (${state.via.toolName}) was pointed at ${state.place}`;
+  return `${origin} is no source: what this run read under it came from ${state.place}, under ${state.shown}, the harness's own state — ${brought}; session logs, proof bundles, spilled results and memory hold the model's own text, so nothing there, or copied from there, is a source; cite the source itself`;
+}
+
+/** Is `record` a view of one hit of a call (`hitView`): its own text, under an origin the result carried? */
+function isHitView(run: Run, record: EvidenceRecord): boolean {
+  const sent = sentText(run);
+  const at = sent.position.get(callOf(record));
+  if (at === undefined) return false;
+  const whole = sent.calls[at] as EvidenceRecord;
+  return (
+    record !== whole &&
+    (record.content !== whole.content ||
+      record.origins.some((origin) => !whole.origins.includes(origin)))
+  );
+}
+
+/**
+ * The places a body under `origin` was read from: the origin itself and,
+ * for a call an MCP server answered, every place its input pointed at,
+ * declared or not (`inputPlaces`) — a file server handed the session log's
+ * path read the session log, whatever address the body was then indexed
+ * under.
+ */
+function readPlaces(run: Run, record: EvidenceRecord, origin: string): string[] {
+  const places = [origin];
+  if (isMcpTool(record.toolName) && !isHitView(run, record)) {
+    for (const place of inputPlaces(record.toolName, record.input, {
+      workspaceRoot: run.workspaceRoot,
+    })) {
+      if (!places.includes(place)) places.push(place);
+    }
+  }
+  return places;
+}
+
+/**
+ * What the run did to `places` before `record` read them ({@link Provenance}),
+ * read once per read and places. The calls that may have written
+ * (`writtenPlaces`: not a reader, not the preflight, not a pure tool —
+ * `VerifyOptions.isPureTool` — and not one that errored) are read back from
+ * the read, through every copy, move, concatenation and archive that
+ * brought text to one of the places from somewhere else (a directory copied
+ * whole maps each file beneath it; at most {@link MAX_WRITE_HOPS} steps):
+ *
+ * - a place the trail reaches under a state root (`stateRootOf`) is a copy
+ *   of the harness's own state — a session log copied into the workspace
+ *   holds every answer verbatim, the one the gate just refused among them —
+ *   and is `state`, with the call that brought it here;
+ * - a call that wrote into a place on the trail (or into a directory one
+ *   lies beneath) is `into`, for the self-written test ({@link selfWriter}).
+ */
+function provenanceOf(run: Run, record: EvidenceRecord, places: readonly string[]): Provenance {
+  const key = `${callOf(record)}\u0000${places.join("\u0000")}`;
+  run.provenances ??= new Map();
+  const known = run.provenances.get(key);
+  if (known !== undefined) return known;
   const sent = sentText(run);
   const at = sent.position.get(callOf(record)) ?? 0;
   if (run.writers === undefined) {
     const all: number[] = [];
     sent.calls.forEach((call, i) => {
-      if (call.isError || run.opts.isPureTool?.(call.toolName) === true) return;
-      if (writesOf(run, sent, i).length > 0) all.push(i);
+      if (call.isError || isPure(run, call.toolName)) return;
+      if (writesOf(run, sent, i).some((one) => !one.source)) all.push(i);
     });
     run.writers = all;
   }
   const writers = run.writers.filter((i) => i < at);
-  if (writers.length === 0) return undefined;
-  // Every place the text could have come to `origin` from.
-  const trail = new Set([origin]);
+  // Every place the text could have come here from, and the copy that brought it.
+  const trail = new Map<string, number | undefined>(places.map((place) => [place, undefined]));
   for (let hop = 0; hop < MAX_WRITE_HOPS && trail.size < MAX_WRITE_ORIGINS; hop++) {
     const before = trail.size;
     for (const i of writers) {
       const named = writesOf(run, sent, i);
-      if (named.length < 2) continue;
-      for (const place of [...trail]) {
-        for (const one of named) {
-          const rest = beneathOf(place, one);
+      const sources = named.filter((one) => one.source);
+      if (sources.length === 0) continue;
+      for (const place of [...trail.keys()]) {
+        for (const target of named) {
+          if (target.source) continue;
+          const rest = beneathOf(place, target.place);
           if (rest === undefined) continue;
-          for (const other of named) {
-            if (other !== one && trail.size < MAX_WRITE_ORIGINS) trail.add(`${other}${rest}`);
+          for (const from of sources) {
+            const copied = `${from.place}${rest}`;
+            if (!trail.has(copied) && trail.size < MAX_WRITE_ORIGINS) trail.set(copied, i);
           }
         }
       }
     }
     if (trail.size === before) break;
   }
-  const into = writers.filter((i) => writesOf(run, sent, i).some((place) => trail.has(place)));
-  if (into.length === 0) return undefined;
-  const runs = spanRuns(run, query, index, location);
-  if (runs.length === 0) return undefined;
-  let by: EvidenceRecord | undefined;
-  for (const words of runs) {
-    let found = false;
-    for (const i of into) {
-      for (const held of sentStrings(run, sent, i)) {
-        if (run.groundingTokens >= groundingBudget) return undefined;
-        if (!words.every((word) => held.words.has(word))) continue;
-        run.groundingTokens += held.index.tokens.length;
-        if (findSequence(held.index, words) !== -1) {
-          found = true;
-          by ??= sent.calls[i];
-          break;
+  let state: Provenance["state"];
+  for (const [place, via] of trail) {
+    if (/^https?:\/\//i.test(place)) continue;
+    const shown = stateRootOf(run, place, path.resolve(run.workspaceRoot, place));
+    if (shown === undefined) continue;
+    // The record's own place is the citation's question (`sourceBinding`
+    // refuses it there); here, a copy of one, or a place an MCP call was
+    // pointed at beside the origin it is indexed under.
+    state =
+      via !== undefined
+        ? { place, shown, via: sent.calls[via] as EvidenceRecord, copied: true }
+        : { place, shown, via: record, copied: false };
+    break;
+  }
+  const into = writers.filter((i) =>
+    writesOf(run, sent, i).some(
+      (one) =>
+        !one.source && [...trail.keys()].some((place) => beneathOf(place, one.place) !== undefined),
+    ),
+  );
+  const provenance: Provenance = { into, ...(state !== undefined ? { state } : {}) };
+  run.provenances.set(key, provenance);
+  return provenance;
+}
+
+/** Does `words` hold `run` as one contiguous stretch? */
+function holdsRun(words: readonly string[], run: readonly string[]): boolean {
+  if (run.length === 0 || run.length > words.length) return false;
+  outer: for (let i = 0; i + run.length <= words.length; i++) {
+    for (let j = 0; j < run.length; j++) if (words[i + j] !== run[j]) continue outer;
+    return true;
+  }
+  return false;
+}
+
+/** Where each word of a body stands, by {@link wordKey}: read once per body. */
+const KEY_POSITIONS = new WeakMap<SourceIndex, Map<string, number[]>>();
+
+function keyPositions(index: SourceIndex): Map<string, number[]> {
+  let positions = KEY_POSITIONS.get(index);
+  if (positions === undefined) {
+    positions = new Map();
+    index.tokens.forEach((token, at) => {
+      const key = wordKey(token.norm);
+      const list = (positions as Map<string, number[]>).get(key);
+      if (list === undefined) (positions as Map<string, number[]>).set(key, [at]);
+      else list.push(at);
+    });
+    KEY_POSITIONS.set(index, positions);
+  }
+  return positions;
+}
+
+/** How many places {@link startsOf} reports, and how many first-word hits it tries. */
+const MAX_STARTS = 64;
+const MAX_START_TRIES = 4_096;
+
+/** The token offsets in `index` where `keys` stands whole, at most {@link MAX_STARTS}. */
+function startsOf(index: SourceIndex, keys: readonly string[]): number[] {
+  const first = keys[0];
+  if (first === undefined) return [];
+  const out: number[] = [];
+  const at = keyPositions(index).get(first) ?? [];
+  for (const start of at.slice(0, MAX_START_TRIES)) {
+    if (start + keys.length > index.tokens.length) break;
+    let whole = true;
+    for (let j = 1; j < keys.length && whole; j++) {
+      whole = wordKey((index.tokens[start + j] as SourceToken).norm) === keys[j];
+    }
+    if (whole) out.push(start);
+    if (out.length >= MAX_STARTS) break;
+  }
+  return out;
+}
+
+/**
+ * Do `run` and `line` share a stretch of at least `min(|line|, 3)` words
+ * that holds a word `introduced` has? For a line no longer in the body as
+ * written (a later edit changed it, a read of part of the file): a word it
+ * shares with the claim in passing ("refund" in an appended "For any refund
+ * question, email support.") is not where it put the claim.
+ */
+function sharesStretch(
+  run: readonly string[],
+  line: readonly string[],
+  introduced: ReadonlySet<string>,
+): boolean {
+  const need = Math.min(line.length, 3);
+  for (let i = 0; i < run.length; i++) {
+    for (let j = 0; j < line.length; j++) {
+      let k = 0;
+      let added = false;
+      while (i + k < run.length && j + k < line.length && run[i + k] === line[j + k]) {
+        if (introduced.has(run[i + k] as string)) added = true;
+        k++;
+      }
+      if (k >= need && added) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Which calls of `into` INTRODUCED a word of the claim's run `keys` where
+ * the run stands in `index` (the body it grounded in). Located, not
+ * counted: a place the run stands in the body is a call's when it overlaps
+ * a line the call added there with one of its introduced words inside the
+ * overlap — so an `Edit` of `14` to `30` in the sentence is the run's, and
+ * an unrelated line it appended that shares a topic word with the claim
+ * ("For any refund question, email support." under "The refund window is
+ * 14 days…") is not. A line not in the body as written counts by
+ * {@link sharesStretch}; so does every line where the run itself is not
+ * found in `index`. `every`: the calls that put it at every place it
+ * stands; `union`: the first call of those that, together, did — or
+ * `undefined` when a place it stands is text no call wrote.
+ */
+function introducedBy(
+  run: Run,
+  sent: SentText,
+  into: readonly number[],
+  index: SourceIndex,
+  keys: readonly string[],
+): { readonly every: ReadonlySet<number>; readonly union: number | undefined } {
+  const places = startsOf(index, keys);
+  const covers = (i: number, place: number | undefined): boolean => {
+    const wrote = wroteOf(run, sent, i);
+    // Only a line holding a word of the run the call introduced can overlap it with one.
+    const wanted = new Set(keys.filter((key) => wrote.introduced.has(key)));
+    if (wanted.size === 0) return false;
+    for (const line of wrote.lines) {
+      if (!line.some((key) => wanted.has(key))) continue;
+      const at = place === undefined ? [] : startsOf(index, line);
+      if (at.length === 0) {
+        if (sharesStretch(keys, line, wrote.introduced)) return true;
+        continue;
+      }
+      for (const start of at) {
+        const from = Math.max(place as number, start);
+        const to = Math.min((place as number) + keys.length, start + line.length);
+        for (let k = from; k < to; k++) {
+          if (wanted.has(wordKey((index.tokens[k] as SourceToken).norm))) return true;
         }
       }
-      if (found) break;
     }
-    if (!found) return undefined;
+    return false;
+  };
+  const every = new Set(into);
+  let union: number | undefined;
+  for (const place of places.length > 0 ? places : [undefined]) {
+    const by = into.filter((i) => covers(i, place));
+    for (const i of [...every]) if (!by.includes(i)) every.delete(i);
+    if (by.length === 0) return { every, union: undefined };
+    union = Math.min(union ?? Number.POSITIVE_INFINITY, ...by);
   }
-  return by;
+  return { every, union };
+}
+
+/**
+ * The first call of `into` that wrote the claim's words where they were
+ * read, or `undefined` (design §10): each tightest run of the claim
+ * (`runs`, found in `index`, the body that grounded it) must be text one of
+ * them put there — by one of three tests, so that the commonest way a run
+ * changes a fact in a file, an `Edit` of part of a sentence, is the run's
+ * own:
+ *
+ * - one string the call sent holds the run whole (a `Write` of the
+ *   sentence, a PUT of the page), and no text it replaced did (an `Edit`
+ *   whose `oldString` already said it kept the sentence, not wrote it);
+ * - where the run stands in the body, it overlaps a line the call added
+ *   with a word the call INTRODUCED ({@link Wrote}, {@link introducedBy}):
+ *   an `Edit` of `14` to `30`, a placeholder later filled in, a sentence
+ *   finished by an `AppendFile`, a diff's `+` line;
+ * - the run holds, whole, a text the call put there that carries content:
+ *   an `Edit` that only took a word out ("is not refundable" → "is
+ *   refundable").
+ *
+ * A claim that also stands, as tightly, in text no call put there (a tie
+ * the run did not write) is not the run's. Past the grounding budget,
+ * nothing is.
+ */
+function selfWriter(
+  run: Run,
+  into: readonly number[],
+  runs: readonly (readonly string[])[],
+  index: SourceIndex,
+): EvidenceRecord | undefined {
+  if (into.length === 0 || runs.length === 0) return undefined;
+  const sent = sentText(run);
+  let by: number | undefined;
+  for (const words of runs) {
+    const keys = words.map(wordKey);
+    const introduced = introducedBy(run, sent, into, index, keys);
+    let found: number | undefined;
+    for (const i of into) {
+      if (run.groundingTokens >= groundingBudget) return undefined;
+      const wrote = wroteOf(run, sent, i);
+      const put =
+        (wrote.strings.some((held) => findSequence(held, words) !== -1) &&
+          !wrote.removed.some((gone) => holdsRun(gone, words))) ||
+        introduced.every.has(i) ||
+        wrote.added.some((added) => added.some(carriesContent) && holdsRun(words, added));
+      if (put) {
+        found = i;
+        break;
+      }
+    }
+    found ??= introduced.union;
+    if (run.groundingTokens >= groundingBudget) return undefined;
+    if (found === undefined) return undefined;
+    by = by === undefined ? found : Math.min(by, found);
+  }
+  return by !== undefined ? (sent.calls[by] as EvidenceRecord) : undefined;
+}
+
+/**
+ * Did the run write, itself, the text that grounds a claim in a body read
+ * from `origin` (design §10's residual: "a model that fetches a page it
+ * wrote itself")? The call that did, or `undefined`.
+ *
+ * A `Read` returns the file as it is when read, so a claim the model put
+ * there with `Write` or `Edit` grounds like any other — and should: an
+ * agent that sets `timeout: 30` in a config and then reports it reports the
+ * truth. But the run is then its own source, and the bundle says so rather
+ * than letting the ✓ read as an outside source's (`ProofBinding.writtenBy`;
+ * the footer counts it, `provability audit` lists it). Decided per origin,
+ * not per call: the calls that wrote into the places the body was read from
+ * before it was read ({@link provenanceOf}) are asked whether the claim at
+ * its tightest in the span that grounded it ({@link spanRuns}) is text they
+ * put there ({@link selfWriter}). A read made before any of them that
+ * grounds the claim does so unmarked (`grounded` reads the origin's records
+ * in call order and stops at the first unmarked one).
+ *
+ * Asked of the builtin readers and of an MCP call whose own input named the
+ * origin (`mcp__fetch__fetch {url}` after a PUT to that URL, a file server's
+ * `read_file` of a file `Write` saved); a hit an MCP result carried is
+ * {@link storedText}'s (refused there, not marked), and Retrieve returns the
+ * operator's corpus. What stays open: text written by `Bash` or
+ * `RunCommand` (a command line names no field this reads), by a call that
+ * names the place in a form this cannot map to the cited one (a repository
+ * path behind a raw-file URL), or by an earlier session; and past the
+ * grounding budget nothing is marked.
+ */
+function writtenBy(
+  run: Run,
+  record: EvidenceRecord,
+  provenance: Provenance,
+  query: ClaimQuery,
+  index: SourceIndex,
+  location: Location,
+): EvidenceRecord | undefined {
+  if (provenance.into.length === 0) return undefined;
+  if (!isReader(record.toolName) && !(isMcpTool(record.toolName) && !isHitView(run, record))) {
+    return undefined;
+  }
+  return selfWriter(run, provenance.into, spanRuns(run, query, index, location), index);
 }
 
 /** The server an MCP tool is served by (`mcp__<server>__<tool>`), lowercased; `undefined` for any other tool. */
@@ -1307,7 +1674,10 @@ function groundedExcerpt(
       break;
     }
   }
-  return clipAround(words.text, from, to, MAX_EXCERPT_CHARS);
+  // Cut from the span as written, not its folded twin the tokens index: an
+  // excerpt of "… هي ٣٠ يوما" says ٣٠ (design §5.3).
+  const cut = writtenSpan(words, from, to);
+  return clipAround(cut.text, cut.from, cut.to, MAX_EXCERPT_CHARS);
 }
 
 /** A source binding as `grounded` leaves it, and the paraphrase miss the judge may still waive. */
@@ -1432,11 +1802,20 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
   // A body that grounds the claim in text the run wrote there itself: kept
   // while a read that grounds it otherwise is looked for ({@link writtenBy}).
   let selfGrounded: SourceOutcome | undefined;
+  // A body read from a copy of the harness's own state ({@link provenanceOf}).
+  let laundered: { readonly record: EvidenceRecord; readonly state: StateCopy } | undefined;
   let unread = false;
   for (const record of usable) {
     if (run.groundingTokens >= groundingBudget) {
       unread = true;
       break;
+    }
+    // A copy of a session log is the session log: what the run copied out
+    // of a state root is the model's own text wherever it now lies (§1).
+    const provenance = provenanceOf(run, record, readPlaces(run, record, origin));
+    if (provenance.state !== undefined) {
+      laundered ??= { record, state: provenance.state };
+      continue;
     }
     const body = bodyOf(run, record);
     run.groundingTokens += body.index.tokens.length;
@@ -1465,7 +1844,7 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
       index = read.index;
     }
     if (location.status === "supported") {
-      const writer = writtenBy(run, record, origin, query, index, location);
+      const writer = writtenBy(run, record, provenance, query, index, location);
       if (writer !== undefined && selfGrounded !== undefined) continue;
       const excerpt = groundedExcerpt(run, query, index, location);
       bodyKey(run, record, origin, body.sha256);
@@ -1518,6 +1897,19 @@ async function grounded(run: Run, claim: ExtractedClaim, origin: string): Promis
         `not checked: grounding this answer would read more than ${groundingBudget.toLocaleString("en-US")} tokens of fetched text, the most one verification reads — cite fewer or shorter sources, or split the answer`,
         { origin },
       ),
+    };
+  }
+  if (
+    laundered !== undefined &&
+    waivable === undefined &&
+    miss === undefined &&
+    echoed === undefined &&
+    stored === undefined &&
+    addressOnly === undefined
+  ) {
+    // Everything under this origin is a copy of the harness's own state.
+    return {
+      reached: fail("cited", "not_fetched", stateCopyDetail(origin, laundered.state), { origin }),
     };
   }
   if (
@@ -2287,7 +2679,7 @@ function factCheckFacts(
   facts.factChecks ??= new Map();
   let entry = facts.factChecks.get(supported.i);
   if (entry === undefined) {
-    const read = factCheckSupport(run, supported.entry.supports, claimText);
+    const read = factCheckSupport(run, record, supported.entry.supports, claimText);
     if (typeof read === "string") return read;
     entry = read;
     facts.factChecks.set(supported.i, entry);
@@ -2307,21 +2699,33 @@ const FACT_SOURCE_BYTES = 1024 * 1024;
  *   claim the model wrote once was found there, verbatim, and served
  *   `checked ✓`. Such a source is dropped; with none left the claim fails,
  *   naming the root.
+ *   So is a COPY of one: a file the run copied, moved, concatenated or
+ *   unpacked out of a state root before the check ({@link provenanceOf}) —
+ *   the session log copied into the workspace held the answer the gate had
+ *   just refused, and FactCrossCheck over the copy served it `checked ✓`.
  * - An excerpt the tool clipped (it ends in `…`, at 240 characters) may stop
  *   short of the claim's figure: the claim is located again in the file the
  *   tool read, with the gate's bar, and checked against that span. Where it
  *   is not located there, the clipped excerpt is what there is.
+ * - A file this run wrote the claim into before the check (design §10,
+ *   {@link selfWriter}) is the run's own text: checking it against itself
+ *   is no check. Where every file the check found the claim in is one, the
+ *   result carries the call that wrote it (`writtenBy`), and the binding
+ *   reaches a marked `grounded` at most — as the file itself, cited, does.
  *
  * A label that names no workspace file (a written reference, a URL the tool
  * did not read) keeps its excerpt as the tool reported it.
  */
 function factCheckSupport(
   run: Run,
+  record: EvidenceRecord,
   supports: FactCheckReport[number]["supports"],
   claimText: string,
 ): CallFacts | string {
   const texts: string[] = [];
   const refused: string[] = [];
+  let writer: EvidenceRecord | undefined;
+  let outside = false;
   // The tool names a file it read by its workspace-relative path, whatever
   // directory the document cited it from.
   const fromRoot: Run = { ...run, baseDir: run.workspaceRoot };
@@ -2346,16 +2750,87 @@ function factCheckSupport(
       refused.push(`${file?.origin ?? source} (under ${state})`);
       continue;
     }
+    const provenance = file !== undefined ? provenanceOf(run, record, [file.origin]) : { into: [] };
+    if (provenance.state !== undefined) {
+      refused.push(
+        `${file?.origin ?? source} (a copy of ${provenance.state.place}, under ${provenance.state.shown})`,
+      );
+      continue;
+    }
     const whole =
       excerpt.endsWith("\u2026") && file !== undefined
         ? relocated(run, file.real, claimText)
         : undefined;
-    texts.push(whole ?? excerpt);
+    const text = whole ?? excerpt;
+    texts.push(text);
+    let own: EvidenceRecord | undefined;
+    if (
+      provenance.into.length > 0 &&
+      file !== undefined &&
+      !readBeforeWriting(run, file.origin, provenance.into, claimText)
+    ) {
+      const claim = claimRunsIn(run, claimText, text);
+      own = selfWriter(run, provenance.into, claim.runs, claim.index);
+    }
+    if (own === undefined) outside = true;
+    else writer ??= own;
   }
   if (texts.length === 0) {
-    return `found this claim only in ${refused.join(", ")}, the harness's own state — session logs, proof bundles, spilled results and memory hold the model's own text, so nothing there is a source; check the claim against the source itself`;
+    return `found this claim only in ${refused.join(", ")}, the harness's own state — session logs, proof bundles, spilled results and memory hold the model's own text, so nothing there, or copied from there, is a source; check the claim against the source itself`;
   }
-  return { content: [...new Set(texts)].join("\n") };
+  return {
+    content: [...new Set(texts)].join("\n"),
+    ...(!outside && writer !== undefined ? { writtenBy: writer } : {}),
+  };
+}
+
+/**
+ * The claim at its tightest in `text` ({@link spanRuns}), for the
+ * self-written test of a source FactCrossCheck read, with the index of
+ * `text` the runs stand in; the claim's own words, as one run, where the
+ * gate's bar does not locate it there.
+ */
+function claimRunsIn(
+  run: Run,
+  claimText: string,
+  text: string,
+): { readonly runs: string[][]; readonly index: SourceIndex } {
+  const query = claimQuery(claimText);
+  const index = indexSource(text);
+  const location = locateClaim(query, index, locateOptions(run));
+  if (location.status === "supported" || isWaivableMiss(location)) {
+    const runs = spanRuns(run, query, index, location);
+    if (runs.length > 0) return { runs, index };
+  }
+  return { runs: [wordsOf(claimText)], index };
+}
+
+/**
+ * Did the run read `origin` before the first of `writers` wrote into it,
+ * and find the claim there (design §10)? Then the file said it before the
+ * run wrote anything, and a FactCrossCheck of it is no check of the run's
+ * own text — as on the path route, where a read made before any writer
+ * grounds unmarked.
+ */
+function readBeforeWriting(
+  run: Run,
+  origin: string,
+  writers: readonly number[],
+  claimText: string,
+): boolean {
+  const sent = sentText(run);
+  const first = Math.min(...writers);
+  const options = locateOptions(run);
+  for (const record of run.evidence.bySource(origin)) {
+    if (record.isError || !servesPage(record.status)) continue;
+    const at = sent.position.get(callOf(record));
+    if (at === undefined || at >= first) continue;
+    if (run.groundingTokens >= groundingBudget) return false;
+    const body = bodyOf(run, record);
+    run.groundingTokens += body.index.tokens.length;
+    if (locateClaim(claimQuery(claimText), body.index, options).status === "supported") return true;
+  }
+  return false;
 }
 
 /** The claim located in a workspace file at the gate's bar, its span unclipped; `undefined` when it is not there. */
@@ -2420,7 +2895,9 @@ function executionExcerpt(
   if (excerpt === undefined) {
     const first = index.tokens[at] as SourceToken;
     const last = index.tokens[at + length - 1] as SourceToken;
-    excerpt = clipAround(index.text, first.at, last.at + last.raw.length, MAX_EXCERPT_CHARS);
+    // The result as written, not the folded text its tokens index (design §5.3).
+    const cut = writtenSpan(index, first.at, last.at + last.raw.length);
+    excerpt = clipAround(cut.text, cut.from, cut.to, MAX_EXCERPT_CHARS);
     facts.excerpts.set(key, excerpt);
   }
   return excerpt;
@@ -2564,6 +3041,24 @@ async function executionBinding(
     // reads the call for the claim (or for the framing of its quotation).
     const opposite = wordPolarity(run, claim.text, own.said.index);
     if (opposite !== undefined) return valueAbsent(opposite);
+  }
+  if (result.writtenBy !== undefined) {
+    // FactCrossCheck found the claim only in files this run wrote it into
+    // (`factCheckSupport`): checking the run's own text against itself is
+    // no check (design §0 B, §10). It grounds as the file itself, cited,
+    // does — and says whose text it is.
+    const by = result.writtenBy;
+    return {
+      rung: "grounded",
+      ...base,
+      excerpt: executionExcerpt(result, claim.text, numbers.length > 0, quotes.length > 0),
+      replayed: false,
+      writtenBy: { toolUseId: by.toolUseId, toolName: by.toolName },
+      failure: {
+        reason: "below_floor",
+        detail: `${toolUseId} (${record.toolName}) found this claim only in text this run wrote there itself — ${by.toolUseId} (${by.toolName}) wrote it before the check — so it reaches grounded at most, marked as written by this run; check the claim against a source the run did not write`,
+      },
+    };
   }
   let replayed = false;
   // Replay only where it decides the floor: at `checked`. Below it the
@@ -3416,6 +3911,32 @@ function claimCeiling(run: Run, claim: ProofClaim): Rung {
 /** A claim to verify, and the definition whose text it is when it is one. */
 type Pending = { readonly claim: ExtractedClaim; readonly definition?: string };
 
+/** One claim bound and settled: every marker's binding, the waiver, `grounded.independent`. */
+async function verifyClaim(
+  run: Run,
+  { claim, definition }: Pending,
+  definitions: ReadonlyMap<string, string>,
+): Promise<ProofClaim> {
+  // Long answers over large bodies are real work: let timers, aborts and
+  // the process's other sessions run between claims.
+  if (performance.now() - run.lastYield >= YIELD_EVERY_MS) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    run.lastYield = performance.now();
+  }
+  const bound: Bound[] = [];
+  for (const id of claim.markers) bound.push(await bindingFor(run, claim, id, definitions));
+  const settled = applyIndependence(run, await waive(run, bound));
+  return {
+    index: claim.index,
+    text: clip(claim.text, MAX_CLAIM_CHARS),
+    ...(claim.line > 0 ? { line: claim.line } : {}),
+    status: statusOf(settled),
+    best: maxRung(...settled.map((b) => b.rung)),
+    bindings: settled,
+    ...(definition !== undefined ? { definition } : {}),
+  };
+}
+
 /**
  * Claims stated INSIDE definition lines. claim-ledger's extractor leaves
  * out the definition `citationDefinitions` keeps for each id — but `[8]:
@@ -3632,25 +4153,16 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
   }
 
   const claims: ProofClaim[] = [];
-  for (const { claim, definition } of all) {
-    // Long answers over large bodies are real work: let timers, aborts and
-    // the process's other sessions run between claims.
-    if (performance.now() - run.lastYield >= YIELD_EVERY_MS) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      run.lastYield = performance.now();
+  for (const pending of all) claims.push(await verifyClaim(run, pending, definitions));
+  // The vacuous-pass backstop (design §2): nothing counted is a pass only
+  // when nothing a reader sees cites or states a figure outside a question
+  // (`backstopClaims`). The extractor's misses are read here, bluntly,
+  // rather than one shape at a time.
+  if (claims.every((claim) => claim.status === "assumption")) {
+    const seen = all.map((pending) => pending.claim);
+    for (const claim of backstopClaims(text, definitions, seen, all.length)) {
+      claims.push(await verifyClaim(run, { claim }, definitions));
     }
-    const bound: Bound[] = [];
-    for (const id of claim.markers) bound.push(await bindingFor(run, claim, id, definitions));
-    const settled = applyIndependence(run, await waive(run, bound));
-    claims.push({
-      index: claim.index,
-      text: clip(claim.text, MAX_CLAIM_CHARS),
-      ...(claim.line > 0 ? { line: claim.line } : {}),
-      status: statusOf(settled),
-      best: maxRung(...settled.map((b) => b.rung)),
-      bindings: settled,
-      ...(definition !== undefined ? { definition } : {}),
-    });
   }
 
   // `max_assumptions` (design §2): assumptions are counted as DECLARED, and
@@ -3758,14 +4270,17 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
   // "0 sources" beside a passing answer that cites a URL in every claim.
   const sourceRung = levelRank(config.level === "cited" ? "cited" : "grounded");
   const sourceOrigins = new Set<string>();
-  // Of those, the ones the run wrote itself (`ProofBinding.writtenBy`).
+  // Of those, the ones the run wrote itself (`ProofBinding.writtenBy`). A
+  // FactCrossCheck of a file the run wrote stands where that file would
+  // (`factCheckSupport`): it counts as a source, the run's own.
   const selfWritten = new Set<string>();
   const hypotheses = new Set<string>();
   const backing = new Set<string>();
   let judgeWaived = 0;
   for (const claim of claims) {
     for (const b of claim.bindings) {
-      if (b.kind === "source" && levelRank(b.rung) >= sourceRung && b.origin) {
+      const asSource = b.kind === "source" || (b.kind === "execution" && b.writtenBy !== undefined);
+      if (asSource && levelRank(b.rung) >= sourceRung && b.origin) {
         sourceOrigins.add(b.origin);
         if (b.writtenBy !== undefined) selfWritten.add(b.origin);
       }

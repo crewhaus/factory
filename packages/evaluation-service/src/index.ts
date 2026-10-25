@@ -14,6 +14,7 @@ export {
   type GateEvidenceInput,
   currentTurnMessages,
   gateEvidence,
+  gateEvidenceScoped,
   startsTurnMessage,
 } from "./evidence";
 export {

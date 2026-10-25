@@ -118,7 +118,7 @@ describe("extractClaims — what is never a claim", () => {
   test("headings are titles, not claims, ATX or setext", () => {
     expect(
       texts(
-        "# Quarterly revenue grew 12 percent\n\nQuarterly revenue summary for leadership\n=======\n\nRevenue grew in every region [1].",
+        "# Quarterly revenue for the 12 regions\n\nQuarterly revenue summary for leadership\n=======\n\nRevenue grew in every region [1].",
       ),
     ).toEqual(["Revenue grew in every region."]);
     expect(texts("## Results [1]\nRevenue grew in every region [1].")).toEqual([
@@ -369,9 +369,18 @@ describe("extractClaims — headings are lines", () => {
   });
 
   test("a heading line is a heading after a full stop inside it too", () => {
+    expect(texts("# Results. Revenue for the 12 regions\nCosts fell in every region [1].")).toEqual(
+      ["Costs fell in every region."],
+    );
+    // A sentence stating a figure there is the heading's claim, read as one.
     expect(
-      texts("# Results. Revenue grew 12 percent everywhere\nCosts fell in every region [1]."),
-    ).toEqual(["Costs fell in every region."]);
+      extractClaims(
+        "# Results. Revenue grew 12 percent everywhere\nCosts fell in every region [1].",
+      ).map(({ text, markers, line }) => [text, markers, line]),
+    ).toEqual([
+      ["Revenue grew 12 percent everywhere", [], 1],
+      ["Costs fell in every region.", ["1"], 2],
+    ]);
   });
 
   test("under a list item or a quote, --- is a thematic break and the line above a claim", () => {
@@ -950,6 +959,19 @@ describe("extractClaims — a claim joined to a question is read (design §0, §
     ]) {
       expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
     }
+    // A restatement is figures and the nouns they count, whatever the noun.
+    for (const doc of [
+      "Got it — 2 king-size beds, right?",
+      "Just to confirm: 3 nights at the Grand Hotel, correct?",
+      "Got it — June 3 for 2 people, right?",
+      "Got it — the meeting at 3pm, right?",
+      "Got it — 2 seats for you and 1 for Sam, right?",
+      "Got it — 2 checked bags, right?",
+      "Got it — one adult and two children, right?",
+      "Thanks for the 3 files you sent, should I merge them?",
+    ]) {
+      expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(`${doc} → []`);
+    }
     // What such a sentence asserts, and what it cites, is still a claim.
     expect(read("Got it — the invoice total is 1,284.60, right?")).toEqual([
       ["Got it — the invoice total is 1,284.60", []],
@@ -961,6 +983,52 @@ describe("extractClaims — a claim joined to a question is read (design §0, §
     expect(read("The invoice total is 1,284.60, right?")).toEqual([
       ["The invoice total is 1,284.60", []],
     ]);
+  });
+
+  test("an acknowledgement before an assertion hides no claim, whatever its verb (design §0)", () => {
+    // Only a closed list of verbs made the clause after "Sure —" a claim, so
+    // "Sure — refunds close after 30 days, anything else?" had none and
+    // passed 0/0 at grounded, checked and proven.
+    const asserted = [
+      ["refunds close after 30 days", "anything else?"],
+      ["your refund window ends after 30 days", "want the link?"],
+      ["you'll get 30 days to return it", "anything else?"],
+      ["the meeting moved to 3pm", "want me to update the invite?"],
+      ["no two of the six meetings overlap", "want me to send the invites?"],
+      ["your order ships in 3 days", "anything else?"],
+      ["that'll be $45", "shall I proceed?"],
+      ["you owe $45", "want the invoice?"],
+      ["I found 3 matching orders", "which one?"],
+      ["I've booked 2 seats for June 3", "anything else?"],
+      ["all 12 tests pass", "want me to open the PR?"],
+      ["you can return it within 30 days", "anything else?"],
+      ["the API returns 404 for that endpoint", "want an example?"],
+      ["the deploy finished in 4 minutes", "anything else?"],
+      ["3 tests failed", "want the log?"],
+      ["1 test fails", "want me to fix it?"],
+      ["total $45", "want the invoice?"],
+      // A demonstrative or a quantifier as the subject (HEAD read these
+      // through the verbs a stated amount is given with; the restatement
+      // test read "that" as an article and served them 0/0).
+      ["that comes to $1,386.26", "want me to send the invoice?"],
+      ["that totals $1,386.26", "shall I charge the card?"],
+      ["that costs $45", "want me to order it?"],
+      ["this takes about 3 days", "anything else?"],
+      ["that came to $45.80", "want the receipt?"],
+      ["each costs $12", "how many do you want?"],
+      ["that equals 1,386.26", "want the PDF?"],
+      ["that runs $49 a month", "want to upgrade?"],
+      ["both ship in 2 days", "want tracking?"],
+      ["all 6 fit in the week", "want the invites?"],
+    ] as const;
+    for (const opener of ["Sure — ", "Got it — ", "Thanks, ", "Okay, ", "Great — ", "Noted — "]) {
+      for (const [claim, question] of asserted) {
+        const doc = `${opener}${claim}, ${question}`;
+        expect(`${doc} → ${JSON.stringify(read(doc))}`).toBe(
+          `${doc} → ${JSON.stringify([[`${opener}${claim}`.replace(/,? $/, ""), []]])}`,
+        );
+      }
+    }
   });
 
   test("a question the answer answers itself is a claim", () => {
@@ -1055,26 +1123,71 @@ describe("extractClaims — a claim joined to a question is read (design §0, §
         "## Step 2: The refund window is 30 days\n\nAnything else?",
         "Step 2: The refund window is 30 days",
       ],
+      ["## Refunds close after 30 days\n\nAnything else?", "Refunds close after 30 days"],
     ] as const) {
       expect(read(doc)).toEqual([[claim, []]]);
     }
-    // Beside another claim, a headline figure is read too.
+    // Beside another claim, a headline figure is read too — with any finite
+    // verb, not only a form of "be": "## Refunds close after 30 days" over a
+    // cited 14-day body was served grounded ✓ 1/1.
     for (const heading of [
       "## The total with tax is 1,386.26",
       "## Total with tax 1,386.26",
       "## Total with tax: $1,386.26",
+      "## The invoice comes to 1,386.26",
+      "## Refunds close after 30 days",
+      "## AWS revenue rose 25% in 2024",
+      "## Revenue grew 18.5% year over year",
+      "## Key finding: revenue grew 19%",
+      "## The refund window lasts 30 days",
+      "## The refund takes 30 days",
+      "## The meeting moved to 3pm",
+      "## Prices start at $10",
+      "## Q3 revenue hit $52B",
+      "### The 6 meetings do not overlap",
+      "### The six meetings never overlap",
+      "### All 6 meetings fit without overlap",
+      "# Quarterly revenue grew 12 percent",
+      // A verb's value behind a preposition, a verb no list holds, a name
+      // that ends in a figure (I5: each passed grounded ✓ over a body that
+      // said otherwise).
+      "## Refund window extended to 30 days",
+      "## Operating margin improved to 37%",
+      "## AWS accounted for 17% of revenue",
+      "## Wait times dropped from 12 to 4 minutes",
+      "## Uptime held at 99.99%",
+      "## Refunds settle within 30 days",
+      "## iPhone 15 costs $799",
+      "## Tier 2 costs $49 a month",
+      "## GPT-5 scores 90% on MMLU",
+      "## Windows 11 requires 4 GB of RAM",
+      "## Plan 2 includes 5 seats",
+      "## AWS made $150B in 2024",
+      "## Cloud drove 60% of operating income",
+      "## Netflix adds 9M subscribers",
+      "## The company employs 1,500 people",
     ]) {
       expect(
         read(`${heading}\n\nThe subtotal is 1,284.50 [1].\n\n[1]: tool:toolu_money1`).map(
           ([text]) => text,
         ),
-      ).toEqual([heading.slice(3), "The subtotal is 1,284.50."]);
+      ).toEqual([heading.replace(/^#+ /, ""), "The subtotal is 1,284.50."]);
     }
+    // The setext form too.
+    expect(
+      read("AWS revenue rose 25% in 2024\n---\n\nAWS revenue was $107.6B in 2024 [1].").map(
+        ([text]) => text,
+      ),
+    ).toEqual(["AWS revenue rose 25% in 2024", "AWS revenue was $107.6B in 2024."]);
     // A declarative heading with no figure is read when the answer only asks
     // in its body.
     expect(read("## Refunds are accepted for every unused item\n\nAnything else?")).toEqual([
       ["Refunds are accepted for every unused item", []],
     ]);
+    // Over a question alone too.
+    for (const heading of ["Refund window extended to 30 days", "Refunds settle within 30 days"]) {
+      expect(read(`## ${heading}\n\nAnything else I can help with?`)).toEqual([[heading, []]]);
+    }
   });
 
   test("a title with a count or a list's label is no claim (design §2, §18)", () => {
@@ -1093,6 +1206,37 @@ describe("extractClaims — a claim joined to a question is read (design §0, §
       "## Price list for 2024",
       "## Top 5 providers by 2024 revenue",
       "## How the 3 plans differ",
+      // A noun phrase, a participle's title or an imperative has no verb of
+      // its own, whatever verb's form it holds.
+      "## Shipping costs for 2024",
+      "## Price increases for 2025",
+      "## Tickets closed in 2024",
+      "## Lessons learned in 2024",
+      "## Getting started in 5 minutes",
+      "## 5 ways to cut costs",
+      "## Cut costs by 30%",
+      "# Compare the 2024 revenue of the top 3 providers",
+      "## The 3 plans compared",
+      "## Year 1 costs",
+      "## Odds and ends for 2024",
+      // A participle's title over a period, a bare singular subject too.
+      "## Revenue earned in 2024",
+      "## Money saved in 2024",
+      "## Capital raised in 2024",
+      "## Decisions made in 2024",
+      "## Mistakes made by startups",
+      // A count behind a preposition is what the noun is about.
+      "## Changes to 2 policies",
+      "## Price changes for 3 plans",
+      "## Features added for 3 plans",
+      "## Updates to 3 plans",
+      "## Top 5 costs to cut",
+      "## Cut 3 costs by 30%",
+      "## 5 ways revenue grew in 2024",
+      "## The 3 reasons churn rose in 2024",
+      "## Sales teams across 30 countries",
+      "## Top stories at 5pm",
+      "## Key metrics for Q3",
     ]) {
       expect(`${title} → ${JSON.stringify(read(`${title}${body}`).map(([text]) => text))}`).toBe(
         `${title} → ["AWS revenue was $107.6B in 2024."]`,

@@ -46,12 +46,13 @@ import {
   renderBundleJson,
   renderFooter,
   renderNudge,
+  restrictToTurns,
   verifyDocument,
 } from "@crewhaus/provability";
 import type { ProvabilityTurn, RunProvability } from "@crewhaus/runtime-core";
 import { proofRecheck, runtimeStateRoots, tenantRootOf } from "@crewhaus/tool-proof";
 import { provabilitySkillText } from "./child-skill";
-import { gateEvidence } from "./evidence";
+import { gateEvidenceScoped } from "./evidence";
 import {
   type HeadDecision,
   type HeadResolver,
@@ -60,7 +61,7 @@ import {
   createHeadResolver,
 } from "./head";
 import { createWaiverJudge } from "./judge";
-import { type GateCatalog, catalogReplay } from "./replay";
+import { type GateCatalog, catalogReplay, schemaLookup } from "./replay";
 import { activeTenant, fencedDir, gateProofsRoot, gateSessionRoot } from "./roots";
 
 const logger = createLogger({ bindings: { module: "evaluation-service" } });
@@ -217,7 +218,10 @@ export function buildRunProvability(
     const tenant = activeTenant();
     const proofs = proofsRootOf(tenant);
     const sessionRootDir = gateSessionRoot(opts.sessionRootDir, tenant);
-    const evidence = await gateEvidence({
+    // Under `scope: turn` the index is the session's with the turn marked
+    // (`turnNumbers`): grounding reads the turn, the self-written trace the
+    // whole session (design §10).
+    const { index: evidence, turnNumbers } = await gateEvidenceScoped({
       scope: config.scope,
       workspaceRoot: cwd,
       // A managed turn's runtime spills under the tenant's own root.
@@ -226,11 +230,15 @@ export function buildRunProvability(
       ...(turn.isSynthetic !== undefined ? { isSynthetic: turn.isSynthetic } : {}),
       ...(turn.sessionId !== undefined ? { sessionId: turn.sessionId } : {}),
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      // An MCP call's origin is a field its schema declares: the run's own catalog's.
+      inputSchemaOf: schemaLookup(opts.catalog),
       onUnreadable: (info) =>
         logger.warn("provability: a session log could not be read to its end", { ...info }),
     });
     const { replay, isPureTool } = catalogReplay(opts.catalog, {
-      logged: loggedResults(evidence),
+      logged: loggedResults(
+        turnNumbers !== undefined ? restrictToTurns(evidence, turnNumbers) : evidence,
+      ),
       workspaceRoot: cwd,
       ...(turn.signal !== undefined ? { signal: turn.signal } : {}),
     });
@@ -243,6 +251,7 @@ export function buildRunProvability(
     const verifyOptions: VerifyOptions = {
       config,
       evidence,
+      ...(turnNumbers !== undefined ? { turnNumbers } : {}),
       workspaceRoot: cwd,
       artifacts: createFileArtifactStore({ rootDir: proofs }),
       // Where this run keeps its own record beyond the workspace's

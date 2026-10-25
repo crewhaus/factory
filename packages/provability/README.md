@@ -100,8 +100,14 @@ claim in a body, numbers, quotations, content-token coverage) is
   session directory, a tenant's root) is cited but never read, as the offline check never reads
   one: a session log holds every answer verbatim, so a `Read` of it would ground the model's own
   earlier text (`not_fetched`). The path is compared as the filesystem spells it, so
-  `.CREWHAUS/sessions/…` on a case-insensitive volume is the same log; and a `FactCrossCheck`
-  that found a claim only in such a path checks nothing at `checked` (`value_absent`). A body a redirect brought from a host `sources.deny` or the
+  `.CREWHAUS/sessions/…` on a case-insensitive volume is the same log. A COPY of one is the same
+  log too: a file the run copied, moved, concatenated or unpacked out of a state root
+  (`CopyPath`, `MovePath`, `ConcatFiles`, `ArchiveCreate`/`ArchiveExtract`, followed back up to
+  four steps, a directory copied whole included) is never read, cited or checked
+  (`not_fetched`, the detail naming the copy), and neither is a body an MCP call read while it
+  was pointed at a state path, whatever address the body was indexed under. A `FactCrossCheck`
+  that found a claim only in such a path, or in a copy of one, checks nothing at `checked`
+  (`value_absent`). A body a redirect brought from a host `sources.deny` or the
   private-address rule refuses does not ground the URL that led there (`host_denied`,
   `private_address`), the rule `resolve: head` holds every hop to. `sources.allow` names what may
   be cited, so a DOI still grounds in the publisher it resolves to.
@@ -120,7 +126,10 @@ claim in a body, numbers, quotations, content-token coverage) is
   checks "the account is suspended". A `FactCrossCheck` result is read by its verdict: only an
   entry that checked this sentence and found it `supported` checks it, against the source text it
   found; `notFound`, `polarityConflict` and `misquoted` are the check saying the source does not
-  carry it, whatever the report repeats. What stays open is a claim a tool reassembles from
+  carry it, whatever the report repeats. A check that found the claim only in files the run wrote
+  it into before the check (see "a source the run wrote itself" below) is no check: the binding
+  reaches `grounded` at most, carries `writtenBy`, and counts as a source the run wrote, as the
+  file itself, cited, would. What stays open is a claim a tool reassembles from
   several input strings, and a draft padded past twice the claim's length. The locate kernel then reads the call for the claim, so a
   result saying "the meetings do not overlap" (or "not one vendor is approved") does not check
   "the meetings overlap", and a number word the result does not state beside the claim's words
@@ -241,7 +250,20 @@ UrlParse returns the model's own URL taken apart. Indexing those would let the m
 as a page the run never read. An MCP server's tool, which the gate cannot see into, gives origins
 through its `url`/`uri`/`href` and `file_path`/`path`/`file`/`filePath` fields, unless its result
 is an echo of its own input: a substring of one of the input's strings, or covered by the input's
-content words at 0.8. A plugin's tool and the runtime's own non-builtins (`Task`, `Recall`,
+content words at 0.8. Only through a field the tool DECLARES: tool-mcp registers every MCP tool
+with a permissive local validator, so a key the server does not declare reaches the log and the
+server, which ignores it, and `mcp__filesystem__read_file {path: "notes.md", url: …}` read a file
+the model wrote under a page nobody fetched. So where the tool's schema is known
+(`EvidenceOptions.inputSchemaOf`, default the schema `defaultCatalog` holds — where a compiled
+harness registers its MCP tools; the gate in evaluation-service hands the schemas of its own
+catalog, where `crewhaus run` and `crewhaus eval` register theirs) a field names an origin only
+when the schema's top-level `properties` lists it, and a schema that lists none names nothing;
+where it is not known (a log read offline), an input names an origin only when it carries
+nothing else a call could have been pointed at: every address field names that one origin, and
+no other field — a `paths` list, a `command`, an id — carries a string (a fetcher's rendering
+options such as `formats` or `method` aside), so `{paths: [...], url}` and `{command, url}`
+name neither. The entries of a `paths` / `files` list are places the call read for the
+state-root test whatever origin it is indexed under. A plugin's tool and the runtime's own non-builtins (`Task`, `Recall`,
 `Consult`, `Escalate`, `Skill`, the plan and goal tools) give none: their results are model
 output, and their schemas strip a `url` the model adds without refusing it, so the key reaches
 the log and a remembered sentence would ground a page nobody fetched (design §8). The URL a WebFetch result's header names on its first line is an origin
@@ -269,17 +291,29 @@ and then find it "in the source". Fetch's status line and headers are removed th
 residuals the design names stay. A model that writes a file and then reads it can ground a
 citation of that file, and should: the file does say it now, and an agent that sets a value and
 then reports it reports the truth. But the run is then its own source, and the bundle says so
-(design §10: the residual is surfaced, not assumed away). When a builtin reader's body grounds a
-claim, `grounded` looks for the claim's words at their tightest, word for word, in what an EARLIER
-call of the run sent to that origin: a call that may write (not a reader, not the preflight, not a
-pure tool, not one that errored) whose input names it (`path`, `url`, `destination`, …), or names
-a place a copy or move then brought here (followed back up to four steps; a directory copied whole
-maps each file beneath it). Found, the binding still grounds and carries `writtenBy: { toolUseId,
-toolName }`, the bundle counts the origin in `selfWritten`, the footer reads `1 source (1 written
-by this run)`, `provability show` names the call, `provability audit` lists it under "sources the
-run wrote itself", and `provability.claimCoverage` names it in its rationale and does not count it
-toward a sample's `expected_sources`. What stays open: text written by `Bash` or `RunCommand`
-(a command line names no place this reads), or by an earlier session.
+(design §10: the residual is surfaced, not assumed away). It is decided per origin, not per
+call. When a body grounds a claim — a builtin reader's, or an MCP call's whose own input named
+the origin (`mcp__fetch__fetch {url}` after a PUT to it, a file server's `read_file` of a file
+`Write` saved) — `grounded` asks every EARLIER call of the run that may write (not a reader, not
+the preflight, not a pure tool, not one that errored) and that wrote there: its input names the
+place (`path`, `url`, `destination`, `out`, a diff's `+++ b/…` files, …), or a place a copy, move,
+concatenation or archive then brought here (followed back up to four steps; a directory copied
+whole maps each file beneath it). The claim at its tightest is the run's own when each tightest
+run of it is text one of them put there: one string it sent holds the run whole, the run holds a
+word it introduced (a figure or a content word its content fields add and do not replace: an
+`Edit` of `14` to `30` introduces `30`, a placeholder filled in, an `AppendFile` finishing the
+sentence, a diff's `+` line), or the run holds a text it put there whole (an `Edit` that only took
+"not" out). A read made before any of those writes that grounds the claim does so unmarked.
+Found, the binding still grounds and carries `writtenBy: { toolUseId, toolName }`, the bundle
+counts the origin in `selfWritten`, the footer reads `1 source (1 written by this run)`,
+`provability show` names the call, `provability audit` lists it under "sources the run wrote
+itself", and `provability.claimCoverage` names it in its rationale and does not count it toward a
+sample's `expected_sources`. What stays open: text written by `Bash` or `RunCommand` (a command
+line names no place this reads), by a call that names the place in a form that cannot be mapped
+to the cited one (a repository path behind a raw-file URL), by an earlier session, or by an
+earlier turn when the caller hands a turn-only index rather than the session's with
+`turnNumbers` (the gate and its preflight hand the latter, so under `scope: turn` they still see
+what an earlier turn wrote).
 
 An MCP server with storage (SQL, a notes or key-value store, a vector index) hands back what was
 written to it. When `grounded` finds the claim in an MCP result, it also looks for the claim's
@@ -287,13 +321,16 @@ words at their tightest, word for word, in what an EARLIER call of the run sent 
 call was pointed at aside): found, it is the model's own text stored and read back, and the
 binding is `not_fetched`, the detail naming the call that sent it. Under a URL the call's own
 input named (`mcp__fetch__fetch {url}`) only calls to the same server count, since only its store
-can hand the text back: the draft given to `ProvabilityPreflight`, a saved report, a searched
-phrase or a comment posted to another server never come out of a page fetched over MCP. Under a
+hands back what was written to it: the draft given to `ProvabilityPreflight`, a searched phrase or
+a comment posted to another server is not what the page says. Text another tool wrote to that
+very URL or path (a PUT, a `Write` of the file) IS the page now, and the run's own: it is marked
+`writtenBy`, as above, not refused. Under a
 hit the result carried (a JSON row's `url`) every call but the preflight counts: the row is
 whatever the server keeps, and a file `Write` saved is what a filesystem server reads. A page the
 run read and then summarised in its notes is still the page. A row stored before the evidence the gate is
-handed begins (by an earlier session, or under `scope: turn` an earlier turn) is the residual: no
-call in it sent the text, and closing that needs the spec to say which MCP tools return sources.
+handed begins (by an earlier session, or by an earlier turn when the caller hands a turn-only
+index rather than the session's with `turnNumbers`; the gate and its preflight hand the latter)
+is the residual: no call in it sent the text, and closing that needs the spec to say which MCP tools return sources.
 
 A reflection padded with other text is caught where the claim is located. A SELECT that appends
 computed text or a real row to a literal, or a linter that repeats a `<title>` it was handed
@@ -334,6 +371,26 @@ a page title out; the retry nudge says so. A bibliographic entry after a URL (`S
 Refund policies in retail. 12(3), 45-67.`) is read: it describes its source, and at `grounded` the
 run must have read that source. `sources.bibliographic: true` spares only a free-text source
 itself, which is then the reference, the way a URL is.
+
+**A vacuous pass is backstopped** (design §2). An answer with no claims passes every floor with
+nothing to prove, which is right for a greeting, a clarifying question or a code block and wrong
+for an answer whose claim the extractor did not see. Review rounds one and two each found new
+shapes that merged a claim into a question or a heading ("30 days [1] — anything else?",
+"1,284.60; want the PDF?", a no-break space, `<br>`, U+2028, a table row), each served scenario A
+or B with a ✓, and each fix left the next shape open. So when nothing counted is extracted
+(`backstopClaims`, `vacuous.ts`), what a reader sees, code and definition lines and URLs aside,
+is cut far more bluntly than the extractor cuts it: at every line break (U+0085, U+2028, U+2029,
+`\f`, `\v` and `<br>` included), every sentence terminator whether a space follows it or it is
+glued to the next word, every semicolon, em dash, en dash (not a range between figures) and table
+pipe, never at a comma. The answer may be vacuous only when no segment carries a citation marker
+and no segment that is not a question states a figure; otherwise each such segment is a claim,
+verified like any other. A piece of text ending in `?` is a question from the segment that opens
+as one (an interrogative, an inverted auxiliary, "want", "any") to the segment that ends as one,
+so "Which of the 4 plans do you mean — Basic or Pro?" and "Do you want 2 or 3 copies?" stay
+questions while "The refund window is 30 days — anything else?" says something first. A heading
+is a title to the figure rule but for what it states after a label (`## Invoice total:
+1,284.50`); claim-ledger's `headingClaim` reads the headings that state one, and a marker in a
+heading still counts.
 
 **The nudge crosses no trust boundary.** `renderNudge` is built from the model's own sentences,
 the identifiers it cited and fixed, plain-words reasons. It never includes a fetched body, an

@@ -85,6 +85,20 @@ follow these.
   new `Requested:` line gives the one the model asked for. The model reads
   this header, so its text changes after a redirect; a fetch that is not
   redirected prints the same header as before.
+- **`FactCrossCheck` reads a lookalike character as the plain one.** It now
+  compares a claim and its source through the gate's fold, in every harness
+  that grants it. A digit of any script (`٣٠`, `३०`), fullwidth and
+  mathematical letters and digits (`３０`, `𝟑𝟎`), a superscript number where
+  a number would stand (`³⁰ dollars`), and a Cyrillic or Greek letter that
+  looks Latin inside a Latin word read as the plain letter or digit; a soft
+  hyphen or zero-width character inside a word is ignored; and a footnote
+  mark on a claim (`…30 days.¹`) is no longer a word the source must hold.
+  So a claim 0.7.x reported `notFound` against such a source can now be
+  `supported`, and one it reported `supported` against a `not` hiding a
+  zero-width character, or spelt with a Cyrillic or fullwidth letter, is now
+  a `polarityConflict`. A word it reports missing is given in the plain
+  spelling; the excerpt is still the source's own text. Text with nothing
+  outside ASCII is checked as before.
 - **`compile --emit-as cf-worker` warns about `evaluation:`.** The
   Cloudflare Worker has never run the in-loop judge, and now says so with
   an `accepted-but-unwired` warning. The edge compile also reports the spec

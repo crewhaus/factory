@@ -623,6 +623,114 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     ).toBe("allow");
   });
 
+  test("Windows spellings: a drive path is absolute, so the workspace root is still the rules' (I2, round 3)", () => {
+    // What runtimeStateRoots hands the floor on Windows (path.win32), and
+    // what the runtime's canonicaliser spells the workspace root as there:
+    // `[".", toPosix(realpath)]`, its prefixes `["", "./", "C:/srv/ws/"]`.
+    const WIN_ROOTS = [
+      "C:\\srv\\ws\\.crewhaus\\sessions",
+      "C:\\srv\\ws\\.crewhaus\\tool-results",
+      "C:\\srv\\ws\\.crewhaus\\proofs",
+      ".crewhaus\\sessions",
+      ".crewhaus\\tool-results",
+      ".crewhaus\\proofs",
+    ];
+    const rules: RuleSet = { ...emptyRuleSet, flag: [rule("alwaysAllow", "*", "flag")] };
+    const at = (
+      toolName: string,
+      operativeValues: NonNullable<ToolCallContext["operativeValues"]>,
+    ): ToolCallContext => ({
+      toolName,
+      input: {},
+      operativeValues,
+      readOnly: false,
+      destructive: true,
+    });
+    const workspaceRoot = {
+      kind: "path" as const,
+      canonical: [".", "C:/srv/ws"],
+      beneath: ["", "./", "C:/srv/ws/"],
+      caseInsensitive: true,
+    };
+    // GitCommit with no paths, GitAdd `.`, Lint, Format, Typecheck: each
+    // acts beneath the workspace root, in default and auto mode alike.
+    for (const tool of ["GitCommit", "GitAdd", "Lint", "Format", "Typecheck", "CopyPath"]) {
+      for (const mode of ["default", "auto"] as const) {
+        const r = evaluateWithReason(at(tool, [workspaceRoot]), mode, rules, {
+          protectedRoots: WIN_ROOTS,
+        });
+        expect({ tool, mode, decision: r.decision, reason: r.reason }).toEqual({
+          tool,
+          mode,
+          decision: "allow",
+          reason: undefined,
+        });
+      }
+    }
+    // A different drive, its root outside the workspace: read inside alone.
+    expect(
+      evaluateWithReason(
+        at("StoreMigrate", [
+          { kind: "path", canonical: ["D:/x"], beneath: ["D:/x/"], caseInsensitive: true },
+        ]),
+        "auto",
+        rules,
+        { protectedRoots: ["D:\\x\\sessions"] },
+      ).decision,
+    ).toBe("allow");
+    // The floor itself holds on Windows: `.crewhaus` named beneath ...
+    const crewhaus = evaluateWithReason(
+      at("StateImport", [
+        {
+          kind: "path",
+          canonical: [".crewhaus", "C:/srv/ws/.crewhaus"],
+          beneath: [".crewhaus/", "./.crewhaus/", "C:/srv/ws/.crewhaus/"],
+          caseInsensitive: true,
+        },
+      ]),
+      "auto",
+      rules,
+      { protectedRoots: WIN_ROOTS },
+    );
+    expect(crewhaus.decision).toBe("deny");
+    expect(crewhaus.reason).toContain("acts on everything beneath `.crewhaus`");
+    // ... and a write into a root, by its drive spelling in any case or a
+    // `..` that cannot climb past the drive (`C:\..` is `C:\`).
+    for (const spelled of [
+      "C:/srv/ws/.crewhaus/sessions/sess_00000000000000aa.jsonl",
+      "c:\\SRV\\ws\\.crewhaus\\Sessions\\x.jsonl",
+      "C:/../../srv/ws/.crewhaus/proofs/x.json",
+    ]) {
+      const write: ToolCallContext = {
+        toolName: "Write",
+        input: { path: spelled, content: "x" },
+        operativeValues: [
+          { kind: "path", canonical: [spelled], outsideWorkspace: true, caseInsensitive: true },
+        ],
+        readOnly: false,
+        destructive: true,
+      };
+      expect({
+        spelled,
+        decision: evaluateWithReason(write, "auto", rules, { protectedRoots: WIN_ROOTS }).decision,
+      }).toEqual({
+        spelled,
+        decision: "deny",
+      });
+    }
+    // On POSIX a name `C:` is a directory: `C:/../` climbs back out of it,
+    // read from a tool's input strings as written.
+    const mcpWrite: ToolCallContext = {
+      toolName: "mcp__fs__write_file",
+      input: { path: `C:/../${LOG}`, content: "x" },
+      readOnly: false,
+      destructive: true,
+    };
+    expect(evaluateWithReason(mcpWrite, "auto", rules, { protectedRoots: ROOTS }).decision).toBe(
+      "deny",
+    );
+  });
+
   test("a tool that declares no operative arguments is read from its input strings", () => {
     const mcpWrite: ToolCallContext = {
       toolName: "mcp__fs__write_file",

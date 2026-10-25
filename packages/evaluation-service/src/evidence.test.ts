@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { restrictToTurns } from "@crewhaus/provability";
 import {
   CHILD,
   type Message,
@@ -13,7 +14,12 @@ import {
   userLine,
   writeLog,
 } from "./__fixtures__/helpers";
-import { currentTurnMessages, gateEvidence, startsTurnMessage } from "./evidence";
+import {
+  currentTurnMessages,
+  gateEvidence,
+  gateEvidenceScoped,
+  startsTurnMessage,
+} from "./evidence";
 
 const dirs = tempDirs();
 afterEach(() => dirs.cleanup());
@@ -204,6 +210,43 @@ describe("gateEvidence", () => {
       messages,
     });
     expect(index.all().map((r) => r.toolUseId)).toEqual(["toolu_2"]);
+  });
+
+  test("scoped for the verifier: under scope turn the whole session in call order, the turn kept by turnNumbers (I9)", async () => {
+    const sessions = dirs.make();
+    await writeLog(sessions, SESSION, [
+      userLine("one"),
+      ...callLines("toolu_1", "WebFetch", { url: URL_A }, fetched(URL_A, "a")),
+      userLine("two"),
+      ...callLines("toolu_2", "WebFetch", { url: URL_B }, fetched(URL_B, "b")),
+    ]);
+    const messages = [
+      user("one"),
+      ...callMessages("toolu_1", "WebFetch", { url: URL_A }, fetched(URL_A, "a")),
+      user("two"),
+      ...callMessages("toolu_2", "WebFetch", { url: URL_B }, fetched(URL_B, "b")),
+    ];
+    const input = {
+      sessionId: SESSION,
+      sessionRootDir: sessions,
+      workspaceRoot: sessions,
+      messages,
+    };
+    const { index, turnNumbers } = await gateEvidenceScoped({ ...input, scope: "turn" });
+    // Every call, in the order the session made them: the self-written trace reads them all.
+    expect(index.all().map((r) => r.toolUseId)).toEqual(["toolu_1", "toolu_2"]);
+    // What grounds is the turn's, exactly as gateEvidence scopes it.
+    expect(turnNumbers).toBeDefined();
+    const kept = restrictToTurns(index, turnNumbers ?? new Set());
+    expect(kept.all().map((r) => r.toolUseId)).toEqual(
+      (await gateEvidence({ ...input, scope: "turn" })).all().map((r) => r.toolUseId),
+    );
+    expect(kept.bySource(URL_A)).toEqual([]);
+    expect(kept.bySource(URL_B).map((r) => r.toolUseId)).toEqual(["toolu_2"]);
+    // Under scope session: gateEvidence's index alone, nothing to restrict.
+    const session = await gateEvidenceScoped({ ...input, scope: "session" });
+    expect(session.turnNumbers).toBeUndefined();
+    expect(session.index.all().map((r) => r.toolUseId)).toEqual(["toolu_1", "toolu_2"]);
   });
 
   test("no session and no transcript: an empty index; a missing log is no throw", async () => {

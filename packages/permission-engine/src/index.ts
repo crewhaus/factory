@@ -318,20 +318,35 @@ function noSandboxReason(toolName: string): string {
   return `tool "${toolName}" requires a sandbox, and the runtime reports none (CREWHAUS_SANDBOX is noop or names no backend — set it to docker or podman, or leave it unset for docker)`;
 }
 
+/** A Windows drive path (`C:\srv\ws`, `C:/srv/ws`, the bare `C:`): absolute, as the runtime's canonicaliser spells a path on Windows. */
+const DRIVE_PATH = /^[A-Za-z]:(?:[\\/]|$)/;
+
 /**
  * A path as the floor compares it: `\\` as `/`, `.` and `..` collapsed, no
  * trailing `/`, in Unicode normal form C (a name spelled with a combining
  * accent is the precomposed one, as on macOS), and lower-cased where the
  * filesystem does not tell names apart by case. One pass over the string, and
  * no `node:path`: the path is model-written and can be long (critic8).
+ *
+ * A drive path is absolute, as a UNC one (`\\host\share`) already is: its
+ * key is `/c:/srv/ws`, the drive lower-cased (a letter names one drive in
+ * either case) and held as the first name, which no `..` pops. Read as
+ * relative, the workspace root's own Windows spelling `C:/srv/ws` was a
+ * directory INSIDE the workspace holding every root, and the `above`
+ * reading refused each writer that acts on `.` — GitCommit, GitAdd `.`,
+ * Lint, Format — on every Windows harness (design §10: the workspace root
+ * is left to the rules). `drives: false` reads one as written, relative —
+ * a directory named `C:` on POSIX, where `C:/../x` is `x`.
  */
-function floorKey(path: string, fold: boolean): string {
-  const absolute = path.startsWith("/") || path.startsWith("\\");
-  const names: string[] = [];
-  for (const name of path.split(/[\\/]/)) {
+function floorKey(path: string, fold: boolean, drives = true): string {
+  const drive = drives && DRIVE_PATH.test(path);
+  const absolute = drive || path.startsWith("/") || path.startsWith("\\");
+  const names: string[] = drive ? [path.slice(0, 2).toLowerCase()] : [];
+  const pinned = names.length;
+  for (const name of (drive ? path.slice(2) : path).split(/[\\/]/)) {
     if (name === "" || name === ".") continue;
     if (name === "..") {
-      if (names.length > 0 && names[names.length - 1] !== "..") names.pop();
+      if (names.length > pinned && names[names.length - 1] !== "..") names.pop();
       else if (!absolute) names.push("..");
       continue;
     }
@@ -417,10 +432,16 @@ function protectedRootHit(
   } else {
     for (const path of inputStrings(call.input)) candidates.push({ path, fold: false });
   }
-  // Each spelling read once, however many roots there are.
-  const keys = candidates
-    .filter(({ path }) => path !== "")
-    .map(({ path, fold }) => ({ key: floorKey(path, fold), fold }));
+  // Each spelling read once, however many roots there are. A drive path is
+  // also read as written, relative: on POSIX `C:/../.crewhaus/sessions/x`
+  // is a path into the logs (a tool read from its input strings carries no
+  // canonical spelling), and on Windows the second reading only denies more.
+  const keys: Array<{ readonly key: string; readonly fold: boolean }> = [];
+  for (const { path, fold } of candidates) {
+    if (path === "") continue;
+    keys.push({ key: floorKey(path, fold), fold });
+    if (DRIVE_PATH.test(path)) keys.push({ key: floorKey(path, fold, false), fold });
+  }
   for (const root of opts.protectedRoots) {
     if (root.trim() === "") continue;
     const plain = floorKey(root, false);

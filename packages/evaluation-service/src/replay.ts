@@ -65,8 +65,12 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { isPureTool } from "@crewhaus/provability";
-import type { ReplayResult } from "@crewhaus/provability";
-import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
+import type { InputSchemaLookup, ReplayResult } from "@crewhaus/provability";
+import {
+  type RegisteredTool,
+  type ToolExecuteResult,
+  defaultCatalog,
+} from "@crewhaus/tool-catalog";
 import {
   DEFAULT_PREVIEW_LINES,
   DEFAULT_THRESHOLD_BYTES,
@@ -98,6 +102,18 @@ export function lookupTool(
     return (catalog as ReadonlyArray<RegisteredTool>).find((tool) => tool.name === name);
   }
   return (catalog as { get(name: string): RegisteredTool | undefined }).get(name);
+}
+
+/**
+ * The input schema a tool of the run declares, for the evidence index
+ * (provability `mcpOrigins`: an MCP call's origin is a field its schema
+ * declares): the gate's own catalog first — the interpreter and the eval
+ * runner register their MCP tools there, not in `defaultCatalog` — then
+ * `defaultCatalog`, where a compiled harness registers them. A tool neither
+ * holds, or one registered with no JSON schema, reads as unknown.
+ */
+export function schemaLookup(catalog: GateCatalog | undefined): InputSchemaLookup {
+  return (name) => lookupTool(catalog, name)?.jsonSchema ?? defaultCatalog.get(name)?.jsonSchema;
 }
 
 /** A tool result's text, the way the evidence index reads one: text blocks joined by newlines. */

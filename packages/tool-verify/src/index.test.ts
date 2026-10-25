@@ -1065,6 +1065,28 @@ describe("FactCrossCheck", () => {
     expect(result.note).toContain("never that the claim is true");
   });
 
+  test("the excerpt is the source's own words, not the fold it was compared in (design §5.3)", async () => {
+    // Every claim is compared through the fold, and the excerpt was cut from
+    // the folded text: a Persian source's "۳۰" came back "30" with its
+    // joiner moved, so the excerpt was in no page a reader could check.
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const persian = `من ${at(0x0645, 0x06cc, 0x200c, 0x062e, 0x0648, 0x0627, 0x0647, 0x0645)} ${at(0x06f3, 0x06f0)} روز`;
+    for (const [source, claim] of [
+      [`${persian} صبر کنم`, persian],
+      [`مدة الاسترداد ${at(0x0663, 0x0660)} يوما`, `مدة الاسترداد ${at(0x0663, 0x0660)}`],
+      [`The refund window is ${at(0xff13, 0xff10)} days.`, "The refund window is 30 days."],
+      [`The re${at(0x00ad)}fund window is 30 days.`, "The refund window is 30 days."],
+    ] as const) {
+      writeFileSync(join(workspace, "sources/src.md"), source);
+      const found = await one(claim, ["sources/src.md"]);
+      expect(found.verdict).toBe("supported");
+      const excerpt = found.foundIn?.excerpt as string;
+      expect(`${JSON.stringify(excerpt)} in source: ${source.includes(excerpt)}`).toBe(
+        `${JSON.stringify(excerpt)} in source: true`,
+      );
+    }
+  });
+
   test("a claim the source does not carry is NOT FOUND, which is not a contradiction", async () => {
     const claim = await one("Adoption doubled in Europe.", ["sources/report.md"]);
     expect(claim.verdict).toBe("notFound");

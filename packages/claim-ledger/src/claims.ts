@@ -120,6 +120,7 @@ import { extractNumbers } from "./numbers";
 import { classifyDefinition, definitionGloss } from "./refs";
 import { ABBREVIATIONS, MIN_CLAIM_TOKENS, isQuestion, splitSentences } from "./sentences";
 import { STOPWORDS } from "./tokens";
+import { restatesRequest, statesAsSentence } from "./verbs";
 
 export type ExtractedClaim = {
   /** 0-based position among the claims returned. */
@@ -687,14 +688,18 @@ const NEGATED = /^(?:no|none|neither)\s/i;
 /**
  * Does a heading read as a sentence rather than a title: a subject and a
  * form of "be" ("The refund window is 30 days", "The invoice total is
- * 1,284.60"), or a denial over a set ("No two of the six meetings overlap")?
- * A title is a noun phrase ("Top 5 providers by 2024 revenue", "Refund
- * options for 2024") or an indirect question ("How the 3 plans differ").
+ * 1,284.60"), a denial over a set ("No two of the six meetings overlap"),
+ * or a subject and any other finite verb (`statesAsSentence`: "Refunds
+ * close after 30 days", "AWS revenue rose 25% in 2024", "The invoice comes
+ * to 1,386.26", "The six meetings never overlap")? A title is a noun phrase
+ * ("Top 5 providers by 2024 revenue", "Refund options for 2024", "Shipping
+ * costs for 2024"), an imperative ("Compare the 2024 revenue of the top 3
+ * providers") or an indirect question ("How the 3 plans differ").
  */
 function declares(plain: string): boolean {
   const said = plain.replace(/’/g, "'");
   if (WH_TITLE.test(said)) return false;
-  return NEGATED.test(said) || COPULA.test(said);
+  return NEGATED.test(said) || COPULA.test(said) || statesAsSentence(said);
 }
 
 /** A heading with a list's label taken off its front: "Step 2: The refund
@@ -720,7 +725,10 @@ function withoutListLabel(plain: string): string {
  *   30 days [1]" a claim;
  * - it states a value after a label (`labelsValue`);
  * - it is a sentence that states a figure (`declares`): "## The invoice
- *   total is 1,284.60", "### No two of the six meetings overlap". A list's
+ *   total is 1,284.60", "### No two of the six meetings overlap", "##
+ *   Refunds close after 30 days", "## AWS revenue rose 25% in 2024" — a
+ *   finite verb of any kind, not only "be": a finding written as a headline
+ *   over a cited body was served under a ✓ with the body's 1/1. A list's
  *   label before it ("Step 2: …") is no figure it states.
  *
  * A figure alone does not make one: "## Step 2: Gather data", "## Top 5
@@ -1297,17 +1305,19 @@ function echoesReader(text: string, from: number, to: number): boolean {
  * question it ends with: "Got it —", "Thanks for the 3 files,", "Okay,",
  * "Just to confirm:", "Quick question about the 2024 report:", "Two quick
  * questions:", "Re:", "Before I book:". What follows such an opening, up to
- * the question, is the reader's request said back ("2 seats", "2 adults and
- * 1 child", "invoice #1042"), not something the answer asserts.
+ * the question, may be the reader's request said back ("2 seats", "2 adults
+ * and 1 child", "invoice #1042") rather than something the answer asserts —
+ * or it may assert ("Sure — refunds close after 30 days"), and then it is a
+ * claim (`restatesRequest`).
  */
 const SETS_UP =
   /^(?:got it|gotcha|understood|noted|ok(?:ay)?|alright|all right|sure(?: thing)?|great|perfect|cool|thanks|thank you|sounds good|makes sense|(?:happy|glad) to help|no problem|of course|will do|(?:just )?to (?:confirm|clarify|be sure|make sure|double[- ]check|recap)|just checking|quick question|(?:one|two|three|four|five|a few|a couple(?: of)?|some|\d{1,2}) (?:quick |more |short )?questions?|re(?=\s*:)|before (?:i|we))(?![\p{L}\p{N}])/iu;
 
 /**
- * A clause that asserts rather than restates: a subject and a finite verb
- * the answer could be wrong about ("the invoice total is 1,284.60", "you
- * have 3 seats left", "the refund came to $45"), with something after the
- * verb — "30 minutes it is" restates.
+ * A clause that asserts with one of the verbs a stated amount or result is
+ * given with ("the invoice total is 1,284.60", "that comes to $45", "the
+ * refund came to $45"), with something after the verb — "30 minutes it is"
+ * restates. A floor under `restatesRequest`: whatever this reads asserts.
  */
 const ASSERTS =
   /(?:^|\s)(?:is|are|was|were|isn't|aren't|wasn't|weren't|it's|that's|there's|has|have|had|hasn't|haven't|will|costs?|took|takes?|came|comes?|totals?|totaled|totalled|equals?|rose|fell|grew|dropped|increased|decreased|remains?|stands?|holds?|reached|runs?|ran|lasts?|expires?|includes?)(?=\s+[^\s])/iu;
@@ -1334,9 +1344,15 @@ const ASSERTS =
  * A sentence that opens by acknowledging the reader or setting the question
  * up (`SETS_UP`: "Got it — 2 seats, correct?", "Just to confirm: 2 adults
  * and 1 child, departing June 3?", "Thanks for the 3 files, should I merge
- * them?") says the reader's request back before it asks; there a clause
- * with a figure is a claim only when it asserts something (`ASSERTS`: "Got
- * it — the invoice total is 1,284.60, right?"), and a marker still makes one.
+ * them?") may say the reader's request back before it asks; there a clause
+ * with a figure is no claim only when, past the opening, it is plainly a
+ * restatement — figures, the nouns they count, and the words between them
+ * (`restatesRequest`). Any other clause asserts and is a claim: "Got it —
+ * the invoice total is 1,284.60, right?", "Sure — refunds close after 30
+ * days, anything else?", "Thanks, you owe $45, shall I send the invoice?".
+ * Only a closed list of verbs made one before, so after "Sure —" any other
+ * verb passed a figure unread at every rung (design §0, tests A, B and C).
+ * A marker still makes one.
  *
  * A sentence that opens as a question (`QUESTION_OPENERS`) is one all
  * through, figures and all: "Is it 30 days, or 14?", "Would you like a
@@ -1396,9 +1412,11 @@ function clauseParts(text: string, part: Piece, inCode: (offset: number) => bool
     i = right - 1;
   }
   if (clauses.length === 0) return [part];
-  const setsUp = SETS_UP.test(
+  // Where the opening that sets the question up ends, if the sentence has one.
+  const setUp = SETS_UP.exec(
     text.slice(firstWord, Math.min(lastWord, firstWord + OPENER_REACH)).replace(/’/g, "'"),
   );
+  const pastOpening = setUp === null ? -1 : firstWord + setUp[0].length;
   // Which clause, short of the last, holds a marker or states a figure — a
   // clause that asks, or says back what the reader wants, holding neither,
   // and a step's number ("Step 6 —") being no figure it states. Each is read
@@ -1420,7 +1438,12 @@ function clauseParts(text: string, part: Piece, inCode: (offset: number) => bool
       const figured =
         !LABEL_INDEX.test(said) &&
         statesFigure(plainClaim(text.slice(from, clause.right))) &&
-        (!setsUp || ASSERTS.test(said.replace(/’/g, "'")));
+        (pastOpening === -1 ||
+          ASSERTS.test(said.replace(/’/g, "'")) ||
+          !restatesRequest(
+            c === 0 ? plainClaim(text.slice(pastOpening, clause.left)) : said,
+            AMOUNT_NOUNS,
+          ));
       if (held || figured) carrying = c;
     }
     from = clause.right;

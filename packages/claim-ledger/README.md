@@ -39,7 +39,7 @@ for (const claim of extractClaims(answer)) {
 | Module | What it answers |
 |---|---|
 | `citations.ts` | The marker grammar (`[1]`, `[^a]`, `[A1]`) and the definition grammar (`[1]: source`, also with the source on the next line). `lintCitations`, `citationDefinitions`, `citedClaims`. The two patterns are module-private, so they have exactly one definition. |
-| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number (a numeral, or a number word other than "one") or has at least `MIN_CLAIM_TOKENS` content words. Code, title headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). A heading is a claim when it cites a source for a figure or a claim's words (`## The refund window is 30 days [1]`), states a measured value after a label (`## Invoice total: 1,284.50`, never a count such as `## Part 2: 5 tips` or a list's label such as `## Step 3: 10 minutes`), or is a sentence stating a figure (`## The invoice total is 1,284.60`, `### No two of the six meetings overlap`) — whatever else the answer says or asks — or is all an answer says. Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
+| `claims.ts` | `extractClaims`: every declarative, non-question sentence that cites something, states a number (a numeral, or a number word other than "one") or has at least `MIN_CLAIM_TOKENS` content words. Code, title headings and definition lines are not claims (a definition-shaped line whose text nothing else reads is, below). A heading is a claim when it cites a source for a figure or a claim's words (`## The refund window is 30 days [1]`), states a measured value after a label (`## Invoice total: 1,284.50`, never a count such as `## Part 2: 5 tips` or a list's label such as `## Step 3: 10 minutes`), or is a sentence stating a figure with any finite verb (`## The invoice total is 1,284.60`, `### No two of the six meetings overlap`, `## Refunds close after 30 days`, `## Refund window extended to 30 days`, `## AWS accounted for 17% of revenue`, `## iPhone 15 costs $799`; not a noun phrase such as `## Shipping costs for 2024`, `## Revenue earned in 2024` or `## Changes to 2 policies`, or an imperative such as `## Cut costs by 30%`) — whatever else the answer says or asks — or is all an answer says. Uncited claims come back with `markers: []`, which is what a `cited` floor refuses. |
 | `markdown.ts` | Code spans, line lookup and link destinations. Two fence readers: `fencedSpans`, the citation grammar's, and `commonMarkFences`, the stricter one the claim extractor reads. |
 | `refs.ts` | `classifyDefinition`: the evidence-reference grammar. A source is a `url`, `doi`, `path` (with its `#fragment`; `%23` and `%25` in a path are `#` and `%`, so `./x%23y.md` names `x#y.md`), `tool:<toolUseId>`, `proof:<prf_id>`, `assume:<text>`, or free `text`. `definitionGloss`: the text a definition line shows past what it names. |
 | `locate.ts` | The FactCrossCheck kernel. `indexSource` a body once, then `locateClaim` returns `supported`, `misquoted`, `polarityConflict` or `notFound`, along with the excerpt, line, coverage and a `cause`. `isWaivableMiss` says whether the gate's judge may be asked about a miss. `governingNegation` and `clauseNumbers` scope a negation to the words it denies. |
@@ -96,7 +96,9 @@ with no marker or figure before the break, stays one question, and so does a cla
 holding a dotted name such as `Array.Sort?`), cuts a claim from a question in the same sentence
 after the last clause that holds a marker or a figure (`…30 days [1] — anything else?`, `…1,284.60;
 want the PDF?`, `…30 days [1], right?`, a table row ending in a question) unless the sentence opens
-as one (`Is it 30 days, or 14?`), reads a question the answer answers itself (`…30 days? Yes.`) as a
+as one (`Is it 30 days, or 14?`) — after an acknowledgement (`Got it — 2 seats, correct?`) a figure
+clause is left to the question only when it is a restatement of figures and the nouns they count,
+so `Sure — refunds close after 30 days, anything else?` is a claim whatever its verb, and so is `Sure — that comes to $1,386.26, want the invoice?` (a demonstrative or quantifier before a verb is a subject, not an article) — reads a question the answer answers itself (`…30 days? Yes.`) as a
 claim, treats a numbered list's `1.` as a bullet rather than a sentence (and, as CommonMark does, an
 indented `14.` that cannot interrupt a list item's paragraph as that paragraph's text), splits at a
 block quote opening under a paragraph, reads a heading only where a line is one (indented
@@ -104,7 +106,8 @@ or inside a list item too) and never lets it take the line under it, counts a ci
 figure-bearing line of inline code as a claim, and reports the line where the claim's first
 character sits. Every difference leans toward reading
 a sentence, because one the extractor skips is one the gate passes unread. `citedClaims` keeps its
-older behaviour so that FactCrossCheck's output does not move. The tests pin both.
+older sentence extraction, so the claims FactCrossCheck reads from a document do not move; its
+matching reads through the fold below. The tests pin both.
 
 **A definition line is a claim only when nothing else reads what it shows.** The definition
 `citationDefinitions` keeps for its id is never one, whatever follows its destination:
@@ -136,7 +139,9 @@ is the day, or whether `3:1` is a score, would be a guess.
 **What the reader cannot tell apart is one spelling.** Every comparison reads through `foldText`:
 `not` with a zero-width space inside it, `ｎｏｔ` and a `nоt` with a Cyrillic `о` are the negation `not`, and a numeral no fold
 reads as digits (`㉚`, `½`) is a figure compared as written. The fold keeps every length, so the
-offsets the kernel reports are the text's own. A word wholly in Cyrillic or Greek letters is left
+offsets the kernel reports are the text's own, and an excerpt is cut from the text as written —
+`٣٠` stays `٣٠`, a Persian joiner stays where it stands — widened to the whole word where the fold
+moved an invisible character inside one (`writtenSpan`). A word wholly in Cyrillic or Greek letters is left
 as written, even one that looks like a Latin word or a number.
 
 ## The two token measures

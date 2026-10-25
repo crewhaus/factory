@@ -93,6 +93,7 @@ export {
   spanExcerpt,
   tightestWindows,
   tokenize,
+  writtenSpan,
 } from "./locate";
 export {
   type CompoundValue,

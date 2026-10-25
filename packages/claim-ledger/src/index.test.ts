@@ -23,6 +23,7 @@ describe("@crewhaus/claim-ledger", () => {
       "definitionGloss",
       "isAssumptionMarker",
       "indexSource",
+      "writtenSpan",
       "locateClaim",
       "governingNegation",
       "clauseNumbers",

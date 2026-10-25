@@ -2045,6 +2045,55 @@ describe("provability audit", () => {
     expect(r.out).toContain("prf_0123456789abcdef (similarity 1)");
   });
 
+  test("gaming: a FactCrossCheck over text the run wrote itself is listed with the sources it wrote", async () => {
+    const cwd = tempDir();
+    await persist(
+      cwd,
+      "support",
+      SESS_A,
+      1,
+      handBundle({
+        level: "grounded",
+        claimCount: 1,
+        met: 1,
+        unmet: 0,
+        sources: 1,
+        selfWritten: 1,
+        claims: [
+          {
+            index: 0,
+            text: "The refund window is 30 days from the date of purchase.",
+            status: "met",
+            best: "grounded",
+            bindings: [
+              {
+                ref: "tool:toolu_fcc",
+                kind: "execution",
+                rung: "grounded",
+                ok: true,
+                origin: "toolu_fcc",
+                writtenBy: { toolUseId: "toolu_w1", toolName: "Write" },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { audit } = await buildAudit({ cwd, sessionRootDir: join(cwd, "none"), now: NOW });
+    expect(audit.gaming.selfWrittenSources).toEqual([
+      {
+        bundle: `.crewhaus/proofs/support/${SESS_A}/turn-1.json`,
+        ref: "tool:toolu_fcc",
+        origin: "toolu_fcc",
+        writtenBy: "toolu_w1 (Write)",
+        claim: "The refund window is 30 days from the date of purchase.",
+      },
+    ]);
+    const r = await run(cwd, ["audit"]);
+    expect(r.out).toContain("sources the run wrote itself (1)");
+    expect(r.out).toContain("tool:toolu_fcc toolu_fcc, written by toolu_w1 (Write)");
+  });
+
   test("gaming: a source the run wrote itself before reading it back is listed (design §10)", async () => {
     const cwd = tempDir();
     await persist(

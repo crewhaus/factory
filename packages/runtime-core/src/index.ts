@@ -3533,28 +3533,227 @@ function gateResultText(content: unknown): string {
 const POINTS_BACK =
   /\b(?:see|as|per)\s+(?:above|before|earlier|(?:my|the)\s+(?:previous|last|earlier|above)\s+(?:answer|reply|message|response))\b|\bas\s+(?:i\s+)?(?:said|stated|mentioned|noted)\b|\b(?:same|unchanged)\s+(?:as\s+)?(?:above|before)\b|^\s*(?:↑+|\^+)\s*$/i;
 
+/** The verbs an agent announces a tool call with, as a bare verb ("I can look …", "Step 1: fetch …"). */
+const ACTION_VERB =
+  "look|check|fetch|pull|search|find|get|read|open|load|query|call|run|grab|retrieve|verify|confirm|review|scan|browse|consult|research|investigate|book|save|write|create|send|update|cancel|schedule|submit|place|add|remove|delete|download|upload|process|prepare|draft|dig|try|start|contact|ping|help|take|see|do";
+
 /**
- * §5.4 — a sentence that only says what the agent is about to do: "Let me
- * fetch the refund policy page first.", "I'll save the note to your notes
- * file now.", "I'm checking the policy page." Printed before a tool call, it
- * is narration, not an answer the reader is handed. One with a figure or a
- * marker in it says more, and stays.
+ * The verbs "I can …" offers a tool call with ("I can look that up."): the
+ * fetch-style ones only. "I can see / confirm / verify / find / review /
+ * help / do / take …" opens what the agent says it knows ("I can confirm
+ * your refund has been processed."), and is read as written.
  */
-const NARRATION =
-  /^(?:(?:ok(?:ay)?|now|next|first|then|alright|all right|sure|great|got it)[,!—–-]?\s+)?(?:let me|let's|let us|i'll|i will|i'm going to|i am going to|i'm gonna|i need to|i want to|i'm (?:now |first )?\w+ing|i am (?:now |first )?\w+ing)\b/i;
+const FETCH_VERB =
+  "look|check|fetch|pull|search|get|grab|retrieve|dig|query|load|open|read|browse|scan|run|try|book|save|draft|prepare|send|schedule|cancel|update|add|remove|create|write|submit|place|start|contact|ping|download|upload";
+
+/** The same verbs as a gerund opener ("Fetching the policy page."). */
+const ACTION_GERUND =
+  "looking|checking|double-checking|fetching|pulling|searching|finding|getting|reading|opening|loading|querying|calling|running|grabbing|retrieving|verifying|confirming|reviewing|scanning|browsing|consulting|researching|investigating|booking|saving|writing|creating|sending|updating|cancel(?:l)?ing|scheduling|submitting|placing|adding|removing|deleting|downloading|uploading|processing|preparing|drafting|digging|trying|starting|contacting|pinging|working";
+
+/**
+ * §5.4 — a sentence that only says what the agent is about to do, whatever
+ * its wording: "Let me fetch the refund policy page first.", "I'll save the
+ * note to your notes file now.", "Fetching the refund policy page.", "One
+ * moment while I look that up.", "Give me a second to check.", "I can look
+ * that up.", "Step 1: fetch the policy page." — an acknowledgement before it
+ * included ("Okay,", "Sure —", "Great question —", "To answer that,").
+ * Printed before a tool call, it is narration, not an answer the reader is
+ * handed. A gerund opener announces only while no verb of its own follows:
+ * "Processing the refund takes a few days." states something.
+ */
+const NARRATION = new RegExp(
+  [
+    "^(?:(?:ok(?:ay)?|now|next|first|then|alright|all right|sure|great|perfect|right|got it|understood|of course|certainly|absolutely|no problem|sounds good|thanks|thank you|good question|great question|happy to help",
+    "|to (?:answer|check|confirm|find|look|do|help|get|figure|see|verify)\\b[^,.!?—–]{0,40})",
+    "(?:\\s*[,!:—–-]\\s*|\\s+)){0,2}",
+    "(?:let me|let's|let us|allow me to|i'll|i will|i'm going to|i am going to|i'm gonna|i'm about to|i am about to",
+    "|i need to|i want to|i'd (?:like|need|want) to",
+    `|i can (?:${FETCH_VERB})\\b`,
+    "|i'm (?:now |first |just )?\\w+ing|i am (?:now |first |just )?\\w+ing",
+    "|(?:just )?(?:one|a) (?:moment|sec(?:ond)?|minute)|give me (?:a|one) (?:moment|sec(?:ond)?|minute)",
+    "|hold on|hang on|bear with me|stand by",
+    `|step \\d+[:.)]\\s+(?:${ACTION_VERB})`,
+    `|(?:now |first |just )?(?:${ACTION_GERUND})\\s+(?:the|your|my|our|a|an|that|this|these|those|it|them|for|up|into|through|over|on|in|at|now|with|out|back|again|some|all)\\b(?!.*\\b(?:is|are|was|were|isn't|aren't|wasn't|weren't|has|have|had|hasn't|haven't|takes?|took|costs?|requires?|means?|needs?|will|would|can|could|should|must|may|might|does|doesn't|did|didn't|gets?|got|makes?|made|includes?|lasts?|shows?|says?|said|returns?|returned)\\b))\\b`,
+  ].join(""),
+  "i",
+);
+
+/**
+ * A word that makes what follows a narration opener a statement: a finite
+ * "be" / "have" / "do", a modal, a negation's contraction, or a verb a
+ * statement of fact is made with ("Of course, I'll note that refunds are not
+ * allowed.", "Let me record that your plan costs $49 per month."). Narration
+ * that only announces a call carries none of these: "Let me fetch the refund
+ * policy page first." Third-person and past forms only, never a base verb
+ * ("Let me take a look.", "I'll have a look."), and not "may", which is a
+ * month as often ("Let me pull up your May invoice."). The list is closed on
+ * purpose — a word it misses is caught by the clause rules below or graded
+ * as written.
+ */
+const STATES =
+  /\b(?:is|are|was|were|isn't|aren't|wasn't|weren't|am|been|has|had|hasn't|haven't|hadn't|does|did|doesn't|don't|didn't|won't|can't|cannot|couldn't|shouldn't|wouldn't|will|would|can|could|should|must|might|shall|(?:it|that|there|here|this|what|who|he|she)'s|\w+'(?:re|ve)|takes|took|costs|requires|means|needs|gets|got|makes|made|includes|lasts|shows|says|said|told|returns|returned|covers|renews|went|came|became|began|owes|equals|totals|remains|seems|appears|looks like|expires|expired|applies|allows|contains|qualifies)\b/i;
+
+/** "that" opening a clause with its own subject ("I'll note that the window …"), not "look that up". */
+const THAT_CLAUSE =
+  /\bthat\s+(?:the|your|my|our|their|his|her|its|it|they|we|you|he|she|there|everything|nothing|all|each|every|no|refunds?|orders?)\b/i;
+
+/** An embedded question: what follows it asks, and asserts nothing ("Let me check whether the refund has gone through."). */
+const ASKS = /\b(?:if|whether|what|which|where|when|how|who|whom)\b/i;
+
+/** Where a clause of its own may begin: a comma, colon or semicolon before a space, or a dash. */
+const CLAUSE_BREAK = /[,;:](?=\s)|\s[-–—]\s|[—–]/;
+
+/** A clause after a break that adds nothing a reader could check ("…, please.", "— one moment."). */
+const AFTERTHOUGHT =
+  /^(?:please|thanks|thank you|for you|now|first|then|again|real quick|quickly|right away|right now|in a (?:moment|sec(?:ond)?|minute)|if (?:that's|that is) (?:ok(?:ay)?|alright|all right|fine)|if you don't mind|if that works|one (?:moment|sec(?:ond)?|minute)|just a (?:moment|sec(?:ond)?|minute)|bear with me|hang on|hold on)$/i;
+
+/** A clause after a break that goes on announcing a call ("…, then save a note."). */
+const ANNOUNCES_MORE = new RegExp(
+  `^(?:and |then |and then |or |so |before |after that )?(?:i'll |i will |i can |let me )?(?:${ACTION_VERB})\\b`,
+  "i",
+);
+
+/** Does `words` assert something, outside an embedded question it may end in? */
+function asserts(words: string): boolean {
+  const asked = ASKS.exec(words);
+  const said = asked === null ? words : words.slice(0, asked.index);
+  return STATES.test(said) || THAT_CLAUSE.test(said);
+}
+
+/**
+ * Does a narration sentence state something beyond its announcement? What
+ * follows the opener {@link NARRATION} matched is read clause by clause:
+ * the announcement's own clause states something when it asserts
+ * ({@link asserts}); every clause after a break ({@link CLAUSE_BREAK}) does
+ * unless it is an afterthought, goes on announcing, or is narration itself.
+ * "Hold on, refunds are not allowed on sale items.", "Looking at your
+ * account, your refund went through yesterday." and "Pulling up your order
+ * — it shipped Tuesday via UPS." state something; "Let me check the policy
+ * page, then save a note." does not.
+ */
+function statesSomething(plain: string, openerEnd: number): boolean {
+  const clauses = plain.slice(openerEnd).split(CLAUSE_BREAK);
+  if (asserts(clauses[0] ?? "")) return true;
+  for (const raw of clauses.slice(1)) {
+    const clause = raw
+      .trim()
+      .replace(/[.!?…]+$/, "")
+      .trim();
+    if (clause === "" || AFTERTHOUGHT.test(clause)) continue;
+    if (asserts(clause)) return true;
+    if (ANNOUNCES_MORE.test(clause)) continue;
+    const opener = NARRATION.exec(clause);
+    if (opener === null || statesSomething(clause, opener[0].length)) return true;
+  }
+  return false;
+}
+
+/** A figure as written: a run of digits with its inner separators ("4512", "10:30", "1,284.50", "2025-01-31"). */
+const FIGURE = /\d+(?:[.,:/-]\d+)*/g;
+
+/**
+ * A figure that names a thing rather than measures one: a label before it
+ * ("section 4", "order #4512", "ticket 88", "v2") or a year ("the 2025
+ * terms"). Narration that names one is still narration.
+ */
+const NAMING_LABEL =
+  /(?:#|\b(?:section|order|ticket|case|invoice|item|step|page|chapter|part|line|row|issue|pr|no\.|number|id|version|v|room|seat|flight|gate|account|ref|reference|clause|article|rule|question|q)\s*)$/i;
+
+/** Is the figure at `index` in `sentence` a name ({@link NAMING_LABEL}, a year)? */
+function namesAThing(sentence: string, figure: string, index: number): boolean {
+  return (
+    /^(?:19|20)\d\d$/.test(figure) ||
+    NAMING_LABEL.test(sentence.slice(Math.max(0, index - 16), index))
+  );
+}
+
+/**
+ * The figures `text` holds, each as written and each run of up to four of
+ * its parts ("10:30:00" holds "10:30" and "30"): a narration's figure is
+ * echoed when it is one of them. Built once, in one pass, so a long input or
+ * tool call costs a set lookup per figure, not a scan.
+ */
+function figuresIn(text: string, into: Set<string> = new Set<string>()): Set<string> {
+  const out = into;
+  for (const [figure] of text.matchAll(FIGURE)) {
+    out.add(figure);
+    // Digit runs at the even indexes, the separators between them at the odd.
+    const parts = figure.split(/([.,:/-])/);
+    for (let from = 0; from < parts.length; from += 2) {
+      let window = parts[from] ?? "";
+      out.add(window);
+      for (let to = from + 2; to < parts.length && to < from + 8; to += 2) {
+        window += `${parts[to - 1] ?? ""}${parts[to] ?? ""}`;
+        out.add(window);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The figures a tool call's input carries as values of their own: a number,
+ * a string that is one figure ("10:30", "4512"), or a string with no space
+ * in it (an id, a time, a URL or a path: "https://…/orders/4512"). A figure
+ * inside free text the call is handed (a note's `text`, a message's
+ * `body`) is the agent's own writing, not the call's argument: "I'll save a
+ * note that the window is 30 days." with `{text: "Refund window: 30 days"}`
+ * is graded. Walked to a bounded depth and breadth.
+ */
+function callFigures(input: unknown, into: Set<string>, depth = 0): void {
+  if (depth > 8) return;
+  if (typeof input === "number" && Number.isFinite(input)) {
+    figuresIn(String(input), into);
+    return;
+  }
+  if (typeof input === "string") {
+    if (input.length <= 2048 && !/\s/.test(input.trim())) figuresIn(input, into);
+    return;
+  }
+  if (typeof input !== "object" || input === null) return;
+  const values = Array.isArray(input) ? input : Object.values(input as Record<string, unknown>);
+  for (const value of values.slice(0, 256)) callFigures(value, into, depth + 1);
+}
 
 /**
  * `text` with its narration sentences ({@link NARRATION}) taken out and the
  * rest exactly as written — its lines too, so a definition line stays one.
+ * A sentence ends at a terminator that whitespace or the end follows, so a
+ * URL's dots or a decimal point do not cut it in two. A narration sentence
+ * with a marker in it stays, as does one with a figure the agent brings
+ * itself ("Let me note: the window is 30 days.", "I'll double-check the
+ * 30-day window."): that is a claim the reader was handed. A figure that
+ * names a thing ({@link namesAThing}: "section 4", "the 2025 terms"), or
+ * that `echo` holds ({@link figuresIn} the turn's own input, and the input
+ * of the tool calls the narration announces) is the reader's or the call's,
+ * not the agent's: "Let me book the 10:30 slot.", "Let me fetch
+ * https://…/policy/2024." stay narration. None of that exempts a sentence
+ * that states something past its announcement ({@link statesSomething}):
+ * "Let me confirm — yes, the refund window is 30 days." is graded however
+ * often the reader asked about 30 days.
+ *
+ * A sentence starts on a character that is no terminator, so a line of
+ * terminators is never re-read from inside (each start position used to
+ * walk the whole run again: quadratic on a long one); a run that opens a
+ * line is kept as written.
  */
-function withoutNarration(text: string): string {
+function withoutNarration(text: string, echo: ReadonlyArray<ReadonlySet<string>>): string {
   return text
-    .replace(/[^\n.!?…]+(?:[.!?…]+|$)/gm, (sentence) => {
+    .replace(/[^\n.!?…]+(?:[.!?…]+(?=[^\s.!?…])[^\n.!?…]*)*(?:[.!?…]+|$)/gm, (sentence) => {
       const plain = sentence
         .trim()
         .replace(/^[*_>#\s-]+/, "")
         .replace(/’/g, "'");
-      return plain !== "" && NARRATION.test(plain) && !/[\d[]/.test(plain) ? "" : sentence;
+      if (plain === "" || plain.includes("[")) return sentence;
+      const opener = NARRATION.exec(plain);
+      if (opener === null || statesSomething(plain, opener[0].length)) return sentence;
+      for (const found of plain.matchAll(FIGURE)) {
+        const figure = found[0];
+        if (!namesAThing(plain, figure, found.index) && !echo.some((held) => held.has(figure))) {
+          return sentence;
+        }
+      }
+      return "";
     })
     .replace(/[ \t]+$/gm, "")
     .trim();
@@ -10354,14 +10553,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * before the final one, a sentence that only says what the agent is about
    * to do (`NARRATION`: "Let me fetch the policy page first.") is no claim
    * the reader was handed, and is left out.
+   *
+   * The final message is the transcript's last one. An empty one is still
+   * final: a model that ends its turn on an empty `end_turn` after a tool
+   * call commits no message at all (the last is the tool results' carrier),
+   * or a blank text block. Either way every assistant message before it
+   * printed ahead of a tool call, and is read for narration — never graded
+   * whole as though it were the answer (I11).
    */
   const streamedTurnText = (
     messages: readonly Anthropic.MessageParam[],
     rejectedThrough: Anthropic.MessageParam | undefined,
   ): string => {
     const texts: string[] = [];
-    let final = true;
     let pointsBack = false;
+    /** The turn's own input: a figure the reader handed the agent is no claim of the agent's. */
+    const input = latestHumanUserMessage(messages);
+    const handed = figuresIn(input !== undefined ? messageText(input) : "");
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const message = messages[i] as Anthropic.MessageParam;
       if (message === rejectedThrough && !pointsBack) break;
@@ -10372,21 +10580,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         if (!isSyntheticMessage(message) && !carriesResults) break;
         continue;
       }
+      const blocks = typeof message.content === "string" ? [] : message.content;
       const text =
         typeof message.content === "string"
           ? message.content
-          : message.content
+          : blocks
               .filter((block): block is Anthropic.TextBlockParam => block.type === "text")
               .map((block) => block.text)
               .join("");
-      if (text.trim() === "") continue;
-      if (final) {
-        final = false;
+      if (i === messages.length - 1) {
         pointsBack = POINTS_BACK.test(text);
-        texts.unshift(text);
+        if (text.trim() !== "") texts.unshift(text);
         continue;
       }
-      const said = withoutNarration(text);
+      if (text.trim() === "") continue;
+      // What the narration announces: the input of the calls this message makes.
+      const calls = new Set<string>();
+      for (const block of blocks) {
+        if (block.type === "tool_use") callFigures(block.input, calls);
+      }
+      const said = withoutNarration(text, [handed, calls]);
       if (said !== "") texts.unshift(said);
     }
     return texts.join("\n\n");

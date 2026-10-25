@@ -40,10 +40,13 @@
  */
 import type { IrProvability } from "@crewhaus/ir";
 import type { SandboxLike } from "@crewhaus/proof-checker";
-import type { EvidenceIndex } from "@crewhaus/provability";
 import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
-import { buildDefaultCheckers, createProofTools } from "@crewhaus/tool-proof";
+import {
+  type ProofToolEvidence,
+  buildDefaultCheckers,
+  createProofTools,
+} from "@crewhaus/tool-proof";
 
 /** The `formal.checkers` the compiler lowers when a spec names none. */
 export const DEFAULT_FORMAL_CHECKERS: ReadonlyArray<string> = ["builtin", "smt"];
@@ -71,8 +74,11 @@ export type GateToolsOptions = {
   readonly workspaceRoot: string;
   /** The proofs root for the tenant a call runs under (the gate's own resolver). */
   readonly proofsRoot: (tenant: Tenant | undefined) => string;
-  /** The evidence a preflight grades against: the gate's builder, without a transcript. */
-  readonly evidence: (ctx: ToolExecuteContext | undefined) => Promise<EvidenceIndex>;
+  /**
+   * The evidence a preflight grades against: the gate's builder, without a
+   * transcript — under `scope: turn` the index with the turn it keeps.
+   */
+  readonly evidence: (ctx: ToolExecuteContext | undefined) => Promise<ProofToolEvidence>;
   readonly sandbox?: SandboxLike;
   readonly now?: () => Date;
 };

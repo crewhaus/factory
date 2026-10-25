@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { EXIT_CODES, type RunFailedError } from "@crewhaus/errors";
 import { type ProofBundle, proofsRoot } from "@crewhaus/provability";
 import { buildTool } from "@crewhaus/tool-builder";
 import { z } from "zod";
@@ -967,5 +968,145 @@ describe("the live loop — no line the model writes passes for the verdict (§1
     expect(lines.findIndex((l) => l.startsWith(MARKED))).toBe(
       lines.findIndex((l) => l.startsWith("── provability")) - 1,
     );
+  });
+});
+
+describe("the live loop — an honest action turn on the cli stream passes as it does on the reply (§5.4)", () => {
+  const bookSlot = buildTool({
+    name: "BookSlot",
+    description: "book a slot",
+    inputSchema: z.object({ time: z.string() }).strict(),
+    readOnly: false,
+    concurrencySafe: false,
+    execute: async () => "booked",
+  });
+
+  /** One cited turn through the real verifier: what it graded, printed, and whether it halted. */
+  const act = async (
+    scripts: Parameters<typeof scriptedModel>[0],
+    footerTarget: "stream" | "reply",
+    onFail: "retry" | "halt",
+    seed?: string,
+  ) => {
+    const cwd = dirs.make();
+    const sessionRootDir = join(cwd, ".crewhaus", "sessions");
+    const gates = await wireEvaluation(
+      { specName: "bot", primaryModel: "test-model", provability: config("cited", { onFail }) },
+      { cwd, sessionRootDir, footerTarget, catalog: [webFetch, bookSlot] },
+    );
+    const model = scriptedModel(scripts);
+    const graded: string[] = [];
+    const out: string[] = [];
+    let caught: unknown;
+    try {
+      await runTurn({
+        model,
+        tools: [webFetch, bookSlot],
+        gates,
+        sessionRootDir,
+        ...(seed !== undefined ? { seed } : {}),
+        onEvent: (e) => {
+          if (e.kind === "provability_graded") {
+            const g = e as typeof e & { verdict: string; claims: number };
+            graded.push(`${g.verdict}:${g.claims}`);
+          }
+        },
+        onStdout: (chunk) => out.push(chunk),
+      });
+    } catch (err) {
+      caught = err;
+    }
+    return { graded, caught, calls: model.calls(), stdout: out.join("") };
+  };
+
+  const fetchAfter = (narration: string): Parameters<typeof scriptedModel>[0] => [
+    [
+      { type: "text", text: narration },
+      { type: "tool_use", id: "toolu_f1", name: "WebFetch", input: { url: URL_A } },
+    ],
+    [{ type: "text", text: "Done." }],
+  ];
+
+  test("narration in any wording before a tool call, then 'Done.': no ✗, no re-run, no halt (I10)", async () => {
+    for (const narration of [
+      "Fetching the refund policy page.",
+      "Searching for the refund policy.",
+      "One moment while I look that up.",
+      "Give me a second to check the policy page.",
+      "I can look that up on the policy page.",
+      "Sure — I'll check the policy page.",
+      "I'll check the policy page for the 2025 terms.",
+      "Let me pull up section 4 of the policy.",
+      `Let me fetch ${URL_A} for you.`,
+    ]) {
+      for (const onFail of ["retry", "halt"] as const) {
+        const run = await act(fetchAfter(narration), "stream", onFail);
+        expect({ narration, onFail, graded: run.graded, calls: run.calls }).toEqual({
+          narration,
+          onFail,
+          graded: ["pass:0"],
+          calls: 2,
+        });
+        expect(run.caught).toBeUndefined();
+        expect(run.stdout).not.toContain("✗");
+      }
+    }
+  });
+
+  test("the booking turn: a figure the reader and the call both carry is no claim — halt does not stop it (I10)", async () => {
+    const scripts: Parameters<typeof scriptedModel>[0] = [
+      [
+        { type: "text", text: "Let me book the 10:30 slot for you." },
+        { type: "tool_use", id: "toolu_b1", name: "BookSlot", input: { time: "10:30" } },
+      ],
+      [{ type: "text", text: "Done — you're booked." }],
+    ];
+    for (const onFail of ["retry", "halt"] as const) {
+      const run = await act(scripts, "stream", onFail, "book me the 10:30 slot");
+      expect({ onFail, graded: run.graded, calls: run.calls }).toEqual({
+        onFail,
+        graded: ["pass:0"],
+        calls: 2,
+      });
+      expect(run.caught).toBeUndefined();
+      expect(run.stdout).toContain("── provability · cited ✓");
+      expect(run.stdout).not.toContain("✗");
+    }
+  });
+
+  test("a figure the agent brings itself before the tool call is still graded: the ✗ stands (I10, the I7 guard)", async () => {
+    const run = await act(
+      fetchAfter("Let me note: the refund window is 30 days."),
+      "stream",
+      "halt",
+    );
+    expect(run.graded).toEqual(["fail:1"]);
+    expect((run.caught as RunFailedError).report.exitCode).toBe(EXIT_CODES.provability);
+  });
+
+  test("an empty final message after a narrated tool call: graded as the final message, the narration left out (I11)", async () => {
+    for (const final of [[], [{ type: "text" as const, text: "" }]]) {
+      for (const onFail of ["retry", "halt"] as const) {
+        const run = await act(
+          [
+            [
+              { type: "text", text: "Let me fetch the refund policy page first." },
+              { type: "tool_use", id: "toolu_f1", name: "WebFetch", input: { url: URL_A } },
+            ],
+            final,
+          ],
+          "stream",
+          onFail,
+        );
+        expect({ final, onFail, graded: run.graded, calls: run.calls }).toEqual({
+          final,
+          onFail,
+          graded: ["pass:0"],
+          calls: 2,
+        });
+        expect(run.caught).toBeUndefined();
+        expect(run.stdout).not.toContain("✗");
+      }
+    }
   });
 });

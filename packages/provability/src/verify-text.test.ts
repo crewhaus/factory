@@ -221,3 +221,84 @@ describe("a range's second end is stated (the review's I14)", () => {
     expect(checked.verdict).toBe("pass");
   });
 });
+
+describe("a frozen excerpt is the source's own text, however long the span (I12)", () => {
+  test("a grounded span past 240 characters keeps its non-ASCII digits as written", async () => {
+    const url = "https://acme.example/ar";
+    const filler = Array.from({ length: 40 }, (_, i) => `كلمة${i}`).join(" ");
+    for (const [body, claim] of [
+      [`سياستنا: مدة الاسترداد ${filler} هي ٣٠ يوما من التسليم`, "مدة الاسترداد هي ٣٠ يوما"],
+      [`سیاست ما: مهلت بازپرداخت ${filler} برابر ۳۰ روز است`, "مهلت بازپرداخت برابر ۳۰ روز است"],
+      [
+        `The refund window ${filler.replace(/كلمة/g, "word")} is 30 days from delivery`,
+        "The refund window is 30 days",
+      ],
+    ] as const) {
+      const evidence = evidenceOf([
+        { id: "toolu_f", name: "WebFetch", input: { url }, content: fetched(url, body) },
+      ]);
+      const bundle = await verifyDocument(`${claim} [1]\n\n[1]: ${url}`, {
+        config: config("grounded"),
+        evidence,
+        now,
+      });
+      const excerpt = bundle.claims[0]?.bindings[0]?.excerpt ?? "";
+      expect([claim, bundle.verdict]).toEqual([claim, "pass"]);
+      // Over the cut, and found in the page as a reader reads it.
+      expect(excerpt.length).toBeGreaterThan(0);
+      const pieces = excerpt.split("…").filter((piece) => piece.trim() !== "");
+      for (const piece of pieces) {
+        expect([claim, body.replace(/\s+/g, " ").includes(piece.trim())]).toEqual([claim, true]);
+      }
+    }
+  });
+});
+
+describe("what an acknowledgement or a headline states is read and checked (I4, I5)", () => {
+  test("checked: a total after 'Sure —' with a demonstrative subject is a claim, uncited", async () => {
+    for (const doc of [
+      "Sure — that comes to $1,386.26, want me to send the invoice?",
+      "Got it — that totals $1,386.26, shall I charge the card?",
+      "Okay — that costs $45, want me to order it?",
+      "Sure — this takes about 3 days, anything else?",
+      "Got it — each costs $12, how many do you want?",
+    ]) {
+      const bundle = await verify(doc, "checked");
+      expect([doc, bundle.verdict, bundle.claimCount]).toEqual([doc, "fail", 1]);
+    }
+  });
+
+  test("proven: what a count's members do is a claim, not a restatement", async () => {
+    const bundle = await verifyDocument("Okay — all 6 fit in the week, want the invites?", {
+      config: config("proven"),
+      evidence: total,
+      workspaceRoot: process.cwd(),
+      now,
+    });
+    expect([bundle.verdict, bundle.claimCount]).toEqual(["fail", 1]);
+  });
+
+  test("grounded: a finding headline over a cited body that says otherwise fails", async () => {
+    const body = `\n\nRefunds are accepted within 14 days of purchase for unused items [1].\n\n[1]: ${POLICY}`;
+    for (const heading of [
+      "## Refund window extended to 30 days",
+      "## Operating margin improved to 37%",
+      "## AWS accounted for 17% of revenue",
+      "## Refunds settle within 30 days",
+      "## iPhone 15 costs $799",
+      "## AWS made $150B in 2024",
+    ]) {
+      const bundle = await verify(`${heading}${body}`, "grounded");
+      expect([heading, bundle.verdict, bundle.claimCount]).toEqual([heading, "fail", 2]);
+    }
+    // Over a question alone, too: no vacuous pass.
+    const alone = await verify(
+      "## Refund window extended to 30 days\n\nAnything else I can help with?",
+      "grounded",
+    );
+    expect([alone.verdict, alone.claimCount]).toEqual(["fail", 1]);
+    // A title stays a title.
+    const titled = await verify(`## Revenue earned in 2024${body}`, "grounded");
+    expect([titled.verdict, titled.claimCount]).toEqual(["pass", 1]);
+  });
+});

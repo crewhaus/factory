@@ -114,8 +114,12 @@ export type ProofBinding = {
    * grounds (the file does say it now: the model may have just set the value
    * it reports), but the run is its own source: design §10's residual "a
    * model that fetches a page it wrote itself", surfaced on every surface and
-   * by `provability audit` rather than assumed away. (0.8.0 additive,
-   * completeness pass.)
+   * by `provability audit` rather than assumed away. Decided per origin: an
+   * `Edit` of one figure is the run's text as a `Write` of the sentence is.
+   * Also on an execution binding whose `FactCrossCheck` found the claim
+   * only in files the run wrote it into: such a check reaches `grounded` at
+   * most, and is counted with the sources (`ProofBundle.selfWritten`).
+   * (0.8.0 additive, completeness pass; convergence pass.)
    */
   readonly writtenBy?: { readonly toolUseId: string; readonly toolName: string };
   /** Formal bindings: the checker id and the formal statement shown beside the prose. */
@@ -198,6 +202,8 @@ export type ProofBundle = {
    * Distinct source origins behind the claims: at a `cited` floor every
    * origin that passed the cited checks, at `grounded` and above every
    * origin that grounded a claim — what "N sources" beside the floor means.
+   * A `FactCrossCheck` of a file the run wrote stands where that file would,
+   * so it counts here, by its call (`ProofBinding.writtenBy`).
    */
   readonly sources: number;
   /**

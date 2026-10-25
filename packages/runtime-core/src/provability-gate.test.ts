@@ -3059,18 +3059,170 @@ describe("provability gate — where the turn streams, the gate answers for what
     expect(graded(run.events).map((e) => e.verdict)).toEqual(["pass"]);
   });
 
-  test("an honest action turn passes: narration before a tool call is no claim", async () => {
+  /** A verifier that fails any text with words in it: only "Done — saved." (or nothing) may pass. */
+  const strict = (turn: ProvabilityTurn): ProofBundle =>
+    /^(?:Done — saved\.)?$/.test(turn.finalText.trim())
+      ? { ...VACUOUS, retryIndex: turn.retryIndex }
+      : bundleOf("fail", { retryIndex: turn.retryIndex });
+
+  test("an honest action turn passes: narration before a tool call is no claim, whatever its wording (I10)", async () => {
+    for (const [narration, input] of [
+      ["Let me fetch the refund policy page first.", {}],
+      ["I'll save the note to your notes file now.", {}],
+      ["I'll pull up the policy page and save the summary for you.", {}],
+      ["Okay, I'm checking the policy page.", {}],
+      // A gerund opener, a moment asked for, an offer, a spaced dash.
+      ["Fetching the refund policy page.", {}],
+      ["Searching for the refund policy.", {}],
+      ["Looking up the refund policy page now.", {}],
+      ["Checking your order status in the system.", {}],
+      ["One moment while I look that up.", {}],
+      ["Give me a second to check the policy page.", {}],
+      ["I can look that up on the policy page.", {}],
+      ["Sure — I'll check the policy page.", {}],
+      ["Great question — let me check the policy page.", {}],
+      ["To answer that, I need to read the refund policy page.", {}],
+      ["Step 1: fetch the policy page.", {}],
+      // A figure that names a thing, or that the call itself carries.
+      ["Let me pull up section 4 of the policy.", {}],
+      ["I'll check the policy page for the 2025 terms.", {}],
+      ["Let me book the 10:30 slot for you.", { time: "10:30" }],
+      ["I'll check the last 3 orders on your account.", { limit: 3 }],
+      [
+        "Let me fetch https://acme.example/policy/2024 for you.",
+        { url: "https://acme.example/policy/2024" },
+      ],
+    ] as const) {
+      const adapter = scriptedAdapter([
+        [text(narration), { type: "tool_use", id: "toolu_l1", name: "Lookup", input }],
+        [text("Done — saved.")],
+      ]);
+      const gate = provGate([strict], { onFail: "halt" });
+      const run = await runSingle({
+        _adapter: adapter,
+        tools: [lookup],
+        provability: gate.provability,
+      });
+      expect([narration, run.caught]).toEqual([narration, undefined]);
+      expect([narration, gate.turns.map((t) => t.finalText)]).toEqual([
+        narration,
+        ["Done — saved."],
+      ]);
+      expect(graded(run.events).map((e) => e.verdict)).toEqual(["pass"]);
+    }
+  });
+
+  test("a figure the reader handed the agent is theirs: narration that repeats it is no claim (I10)", async () => {
+    const adapter = scriptedAdapter([
+      [
+        text("I'll check order 4512 for you."),
+        { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} },
+      ],
+      [text("Done — saved.")],
+    ]);
+    const gate = provGate([strict], { onFail: "halt" });
+    const run = await runSingle({
+      _adapter: adapter,
+      tools: [lookup],
+      provability: gate.provability,
+      seedMessages: [{ role: "user", content: "where is order 4512?" }],
+    });
+    expect(run.caught).toBeUndefined();
+    expect(gate.turns.map((t) => t.finalText)).toEqual(["Done — saved."]);
+  });
+
+  test("narration that carries a figure the agent brings itself is a claim the reader was handed: graded (I10)", async () => {
     for (const narration of [
-      "Let me fetch the refund policy page first.",
-      "I'll save the note to your notes file now.",
-      "I'll pull up the policy page and save the summary for you.",
-      "Okay, I'm checking the policy page.",
+      "Let me note: the window is 30 days.",
+      "I'll double-check the 30-day window.",
+      "Let me check [1].",
     ]) {
-      // A verifier that fails any text with words in it: only "Done." may pass.
-      const strict = (turn: ProvabilityTurn): ProofBundle =>
-        /^Done — saved\.$/.test(turn.finalText.trim())
-          ? { ...VACUOUS, retryIndex: turn.retryIndex }
-          : bundleOf("fail", { retryIndex: turn.retryIndex });
+      const adapter = scriptedAdapter([
+        [text(narration), { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} }],
+        [text("Done — saved.")],
+      ]);
+      const gate = provGate([strict], { onFail: "halt" });
+      const run = await runSingle({
+        _adapter: adapter,
+        tools: [lookup],
+        provability: gate.provability,
+      });
+      expect([narration, gate.turns.map((t) => t.finalText)]).toEqual([
+        narration,
+        ["Done — saved.", `${narration}\n\nDone — saved.`],
+      ]);
+      expect(run.caught).toBeInstanceOf(RunFailedError);
+    }
+  });
+
+  test("a narration opener does not hide what the sentence states: graded, and the run halts", async () => {
+    for (const [said, input, seed] of [
+      ["I can confirm your refund has been processed.", {}, undefined],
+      ["I can see your order has already shipped.", {}, undefined],
+      ["I can verify the warranty covers water damage.", {}, undefined],
+      ["Absolutely — I can confirm the premium plan includes phone support.", {}, undefined],
+      ["I can help with that — your plan includes free returns on every order.", {}, undefined],
+      ["Hold on, refunds are not allowed on sale items.", {}, undefined],
+      ["One moment — the warranty does not cover water damage.", {}, undefined],
+      ["Of course, I'll note that refunds are not allowed on sale items.", {}, undefined],
+      ["Let me note that refunds are not allowed on sale items.", {}, undefined],
+      ["Looking at your account, your refund went through yesterday.", {}, undefined],
+      ["Pulling up your order — it shipped Tuesday via UPS.", {}, undefined],
+      ["Reviewing your plan, everything renews automatically each year.", {}, undefined],
+      ["Thanks — I can see your subscription renews automatically every year.", {}, undefined],
+      // A figure the call's free text carries is the agent's own writing.
+      [
+        "I'll save a note that the refund window is 30 days.",
+        { text: "Refund window: 30 days" },
+        undefined,
+      ],
+      [
+        "Let me record that your plan costs $49 per month.",
+        { text: "plan price 49 per month" },
+        undefined,
+      ],
+      // A figure the reader handed, or one that names a thing, exempts no statement.
+      [
+        "Let me confirm — yes, the refund window is 30 days.",
+        {},
+        "is the refund window 30 days? note it down",
+      ],
+      ["Let me check: order #4512 was refunded in the 2025 audit.", {}, undefined],
+      ["I'll confirm your refunds have been processed.", {}, undefined],
+    ] as const) {
+      const adapter = scriptedAdapter([
+        [text(said), { type: "tool_use", id: "toolu_l1", name: "Lookup", input }],
+        [text("Done — saved.")],
+      ]);
+      const gate = provGate([strict], { onFail: "halt" });
+      const run = await runSingle({
+        _adapter: adapter,
+        tools: [lookup],
+        provability: gate.provability,
+        ...(seed !== undefined ? { seedMessages: [{ role: "user" as const, content: seed }] } : {}),
+      });
+      expect([said, gate.turns.map((t) => t.finalText)]).toEqual([
+        said,
+        ["Done — saved.", `${said}\n\nDone — saved.`],
+      ]);
+      expect([said, run.caught instanceof RunFailedError]).toEqual([said, true]);
+      if (run.caught instanceof RunFailedError) {
+        expect(run.caught.report.exitCode).toBe(EXIT_CODES.provability);
+      }
+    }
+  });
+
+  test("narration that goes on announcing, or ends on an afterthought, is still narration", async () => {
+    for (const narration of [
+      "Let me check the policy page, then save a note.",
+      "Hold on, let me check the policy page.",
+      "I'm looking into this for you — one moment.",
+      "Let me check whether your refund has gone through.",
+      "I'll take a look at the policy page.",
+      "Let me check that for you, please.",
+      "I'll have a look at the policy page.",
+      "Let me pull up your May invoice.",
+    ]) {
       const adapter = scriptedAdapter([
         [text(narration), { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} }],
         [text("Done — saved.")],
@@ -3082,9 +3234,71 @@ describe("provability gate — where the turn streams, the gate answers for what
         provability: gate.provability,
       });
       expect([narration, run.caught]).toEqual([narration, undefined]);
-      expect(gate.turns.map((t) => t.finalText)).toEqual(["Done — saved."]);
+      expect([narration, gate.turns.map((t) => t.finalText)]).toEqual([
+        narration,
+        ["Done — saved."],
+      ]);
+    }
+  });
+
+  test("a long run of terminators before a tool call is read in linear time", async () => {
+    for (const run of [".", "…", "!"]) {
+      for (const after of ["", " ", "\n"]) {
+        const said = `Let me check the policy page.\n${run.repeat(100_000)}${after}`;
+        const adapter = scriptedAdapter([
+          [text(said), { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} }],
+          [text("Done — saved.")],
+        ]);
+        const gate = provGate([(turn) => ({ ...VACUOUS, retryIndex: turn.retryIndex })], {
+          onFail: "halt",
+        });
+        const started = performance.now();
+        await runSingle({ _adapter: adapter, tools: [lookup], provability: gate.provability });
+        // Quadratic took seconds at this length (100K: ~8 s); linear is milliseconds.
+        expect([run, after, performance.now() - started < 1_500]).toEqual([run, after, true]);
+        // The terminator run is kept as written; the narration before it is not.
+        expect(gate.turns.at(-1)?.finalText.startsWith(run.repeat(10))).toBe(true);
+      }
+    }
+  }, 20_000);
+
+  test("an empty final message is still the final one: the narration before its tool call is read for narration, not graded whole (I11)", async () => {
+    // A model that ends the turn on an empty `end_turn` commits no message
+    // (`[]`), or a blank text block: either way the narration printed ahead
+    // of the tool call is not the answer.
+    for (const final of [[], [text("")], [text("\n")]] as ReadonlyArray<ScriptBlock>[]) {
+      const adapter = scriptedAdapter([
+        [
+          text("Let me fetch the refund policy page first."),
+          { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} },
+        ],
+        final,
+      ]);
+      const gate = provGate([strict], { onFail: "halt" });
+      const run = await runSingle({
+        _adapter: adapter,
+        tools: [lookup],
+        provability: gate.provability,
+      });
+      expect([final, run.caught]).toEqual([final, undefined]);
+      expect(gate.turns.map((t) => t.finalText.trim())).toEqual([""]);
       expect(graded(run.events).map((e) => e.verdict)).toEqual(["pass"]);
     }
+    // A claim printed before the tool call is still graded in its place.
+    const adapter = scriptedAdapter([CLAIM_THEN_TOOL, []]);
+    const gate = provGate([strict], { onFail: "halt" });
+    const run = await runSingle({
+      _adapter: adapter,
+      tools: [lookup],
+      provability: gate.provability,
+    });
+    expect(gate.turns.map((t) => t.finalText)).toEqual([
+      "",
+      "The refund window is 30 days from the date of purchase.",
+    ]);
+    expect(run.caught).toBeInstanceOf(RunFailedError);
+    if (!(run.caught instanceof RunFailedError)) return;
+    expect(run.caught.report.exitCode).toBe(EXIT_CODES.provability);
   });
 
   test("a claimless retraction after a rejected attempt passes: the ✗ stays under the attempt it graded", async () => {

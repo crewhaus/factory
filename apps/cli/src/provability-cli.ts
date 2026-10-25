@@ -2067,8 +2067,9 @@ export type ProvabilityAudit = {
     /**
      * Source bindings that grounded in text the run itself wrote to that
      * origin before reading it back (`ProofBinding.writtenBy`, design §10's
-     * "a model that fetches a page it wrote itself"). (0.8.0 additive,
-     * completeness pass.)
+     * "a model that fetches a page it wrote itself"), and execution bindings
+     * whose FactCrossCheck read such text (marked the same way, capped at
+     * `grounded`). (0.8.0 additive, completeness pass.)
      */
     readonly selfWrittenSources: ReadonlyArray<{
       readonly bundle: string;
@@ -2121,7 +2122,10 @@ function gamingSignals(
         group.claims.add(claim.index);
         groups.set(key, group);
       }
-      if (b.kind === "source" && b.writtenBy !== undefined) {
+      // A source that grounded in text the run wrote, and a FactCrossCheck
+      // run over such text (an execution binding capped at a marked
+      // `grounded`): both are the run reading back its own writing.
+      if (b.writtenBy !== undefined && (b.kind === "source" || b.kind === "execution")) {
         into.selfWrittenSources.push({
           bundle: where,
           ref: b.ref,

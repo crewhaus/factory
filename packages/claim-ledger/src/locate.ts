@@ -42,10 +42,11 @@ import {
 export type SourceToken = {
   /** Compared against. */
   readonly norm: string;
-  /** As written, for the excerpt. */
+  /** As folded (`foldTypography`): the token's characters in `text`. */
   readonly raw: string;
-  /** Character offset into the folded text, so an excerpt and a line number
-   *  both come from the same string the tokens were cut from. */
+  /** Character offset into the folded text the tokens were cut from — and
+   *  the written text's own outside a word the fold rearranged, so an
+   *  excerpt is cut from what the source says (`writtenSpan`). */
   readonly at: number;
 };
 
@@ -53,6 +54,9 @@ export type SourceIndex = {
   readonly tokens: ReadonlyArray<SourceToken>;
   /** The typography-folded text the offsets belong to. */
   readonly text: string;
+  /** The text as written, where the fold changed it — what an excerpt is
+   *  cut from (`spanExcerpt`, `writtenSpan`). Absent when the two are one. */
+  readonly written?: string;
   readonly lineStarts: ReadonlyArray<number>;
 };
 
@@ -172,8 +176,10 @@ const STOPWORDS: ReadonlySet<string> = new Set([
  * "٣٠" a figure on both sides of a comparison (design §6.2, §6.4).
  *
  * One character for one character. The 1:1 rule is load-bearing: every
- * offset in the index is an offset into the folded text, so a fold that
- * changed a length would move every excerpt and line number after it.
+ * offset in the index is an offset into the folded text, and the same
+ * offset in the text as written outside the words the fold rearranges, so
+ * a fold that changed a length would move every excerpt and line number
+ * after it.
  */
 export function foldTypography(text: string): string {
   return foldText(text);
@@ -246,7 +252,91 @@ export function indexSource(text: string): SourceIndex {
   for (let i = folded.indexOf("\n"); i !== -1; i = folded.indexOf("\n", i + 1)) {
     lineStarts.push(i + 1);
   }
-  return { tokens: tokenize(folded), text: folded, lineStarts };
+  const index = { tokens: tokenize(folded), text: folded, lineStarts };
+  return folded === text ? index : { ...index, written: text };
+}
+
+/** What the fold reads as one word, and may rearrange inside (`fold.ts`). */
+const FOLD_WORD = /[\p{L}\p{N}\p{M}\p{Default_Ignorable_Code_Point}]/u;
+const FOLD_IGNORABLE = /\p{Default_Ignorable_Code_Point}/u;
+/** How far an excerpt's start or end is widened to the word it sits in, at most. */
+const WORD_REACH = 64;
+
+/** The code point that ends at `at` (one or two code units before it). */
+function charBefore(text: string, at: number): string {
+  const low = text.charCodeAt(at - 1);
+  if (at >= 2 && low >= 0xdc00 && low <= 0xdfff) {
+    const high = text.charCodeAt(at - 2);
+    if (high >= 0xd800 && high <= 0xdbff) return text.slice(at - 2, at);
+  }
+  return text.slice(at - 1, at);
+}
+
+/** Where the folded word around `at` ends, or -1 when that is more than
+ *  {@link WORD_REACH} code units on. */
+function wordEnd(text: string, at: number): number {
+  let end = at;
+  while (end < text.length) {
+    const ch = String.fromCodePoint(text.codePointAt(end) as number);
+    if (!FOLD_WORD.test(ch)) break;
+    end += ch.length;
+    if (end - at > WORD_REACH) return -1;
+  }
+  return end;
+}
+
+/** Where the folded word around `at` starts, or -1 when that is more than
+ *  {@link WORD_REACH} code units back. */
+function wordStart(text: string, at: number): number {
+  let start = at;
+  while (start > 0) {
+    const ch = charBefore(text, start);
+    if (!FOLD_WORD.test(ch)) break;
+    start -= ch.length;
+    if (at - start > WORD_REACH) return -1;
+  }
+  return start;
+}
+
+/**
+ * The written text to cut `[from, to)` of the folded one from, and that
+ * range in it (design §5.3: a frozen excerpt is the source's own words, so a
+ * reader can find it in the page after the body is gone). The fold keeps
+ * every length but moves a word's ignorable characters — a zero-width
+ * joiner, a soft hyphen, the second code unit of a mathematical digit — to
+ * its end ("می‌خواهم", "𝟑𝟎"), so inside such a word an offset of the folded
+ * text is not the same character of the written one. A range that starts or
+ * ends inside one is widened to the whole word, whose extent is the same in
+ * both; anywhere else the offsets are the written text's own. A word longer
+ * than {@link WORD_REACH} is not walked: the range is the folded text's.
+ */
+export function writtenSpan(
+  index: SourceIndex,
+  from: number,
+  to: number,
+): { readonly text: string; readonly from: number; readonly to: number } {
+  const written = index.written;
+  const folded = index.text;
+  if (written === undefined) return { text: folded, from, to };
+  const moved = (end: number): boolean => end > 0 && FOLD_IGNORABLE.test(charBefore(folded, end));
+  let start = from;
+  if (from > 0 && from < folded.length && FOLD_WORD.test(charBefore(folded, from))) {
+    const end = wordEnd(folded, from);
+    if (end === -1) return { text: folded, from, to };
+    if (moved(end)) start = wordStart(folded, from);
+    if (start === -1) return { text: folded, from, to };
+  }
+  let stop = to;
+  if (to > 0 && to < folded.length && FOLD_WORD.test(charBefore(folded, to))) {
+    const end = wordEnd(folded, to);
+    if (end === -1) return { text: folded, from, to };
+    if (end > to && moved(end)) stop = end;
+  }
+  // A zero-width no-break space is ignorable to the fold and whitespace to
+  // an excerpt, so the written word may begin or end with one.
+  while (start < stop && isSpace(written.charCodeAt(start))) start++;
+  while (stop > start && isSpace(written.charCodeAt(stop - 1))) stop--;
+  return { text: written, from: start, to: stop };
 }
 
 /** The 1-based line a character offset falls on. */
@@ -392,20 +482,27 @@ function isSpace(code: number): boolean {
 /**
  * Where each run of whitespace in a source's text ends, by where it starts,
  * found the first time an excerpt crosses it: a run is read once per
- * source, however many excerpts cross it.
+ * source, however many excerpts cross it. Kept per text an excerpt is cut
+ * from, the written one or (for a word too long to widen) the folded one.
  */
-const SPACE_RUN_ENDS = new WeakMap<SourceIndex, Map<number, number>>();
+const SPACE_RUN_ENDS = new WeakMap<SourceIndex, Map<string, Map<number, number>>>();
 
-function spaceRunEnd(index: SourceIndex, start: number): number {
-  let ends = SPACE_RUN_ENDS.get(index);
+function spaceRunEnd(index: SourceIndex, text: string, start: number): number {
+  let byText = SPACE_RUN_ENDS.get(index);
+  if (byText === undefined) {
+    byText = new Map();
+    SPACE_RUN_ENDS.set(index, byText);
+  }
+  const which = text === index.text ? "folded" : "written";
+  let ends = byText.get(which);
   if (ends === undefined) {
     ends = new Map();
-    SPACE_RUN_ENDS.set(index, ends);
+    byText.set(which, ends);
   }
   let end = ends.get(start);
   if (end === undefined) {
     end = start;
-    while (end < index.text.length && isSpace(index.text.charCodeAt(end))) end++;
+    while (end < text.length && isSpace(text.charCodeAt(end))) end++;
     ends.set(start, end);
   }
   return end;
@@ -414,6 +511,12 @@ function spaceRunEnd(index: SourceIndex, start: number): number {
 /**
  * The source's own words over a token range, whitespace collapsed, and cut
  * to `maxChars` with an ellipsis.
+ *
+ * Cut from the text as written (`writtenSpan`), not the folded one the
+ * tokens were read in: an excerpt of "مدة الاسترداد ٣٠ يوما" says ٣٠, and
+ * one of "می‌خواهم" keeps its joiner where it stands — the folded "30" and
+ * "میخواهم‌" are not in the page a reader checks the bundle against
+ * (design §5.3).
  *
  * Read only as far as the cut: cutting the whole range out of the source
  * first charged every excerpt the whole distance between its words, so a
@@ -431,9 +534,11 @@ export function spanExcerpt(
   if (fromToken < 0 || tokens.length === 0) return "";
   const first = tokens[Math.min(fromToken, tokens.length - 1)] as SourceToken;
   const last = tokens[Math.min(Math.max(toToken, fromToken), tokens.length - 1)] as SourceToken;
-  const end = last.at + last.raw.length;
+  const span = writtenSpan(index, first.at, last.at + last.raw.length);
+  const source = span.text;
+  const end = span.to;
   if (maxChars < 1) {
-    const whole = index.text.slice(first.at, end).replace(/\s+/g, " ").trim();
+    const whole = source.slice(span.from, end).replace(/\s+/g, " ").trim();
     return whole.length > maxChars ? `${whole.slice(0, maxChars - 1)}…` : whole;
   }
   // Collapsed text up to one past the cut, which is enough to know whether
@@ -441,19 +546,19 @@ export function spanExcerpt(
   const want = maxChars + 1;
   const parts: string[] = [];
   let length = 0;
-  let at = first.at;
+  let at = span.from;
   while (at < end && length < want) {
-    if (isSpace(index.text.charCodeAt(at))) {
-      at = spaceRunEnd(index, at);
+    if (isSpace(source.charCodeAt(at))) {
+      at = spaceRunEnd(index, source, at);
       parts.push(" ");
       length += 1;
       continue;
     }
     let stop = at + 1;
-    while (stop < end && stop - at < want - length && !isSpace(index.text.charCodeAt(stop))) {
+    while (stop < end && stop - at < want - length && !isSpace(source.charCodeAt(stop))) {
       stop++;
     }
-    parts.push(index.text.slice(at, stop));
+    parts.push(source.slice(at, stop));
     length += stop - at;
     at = stop;
   }

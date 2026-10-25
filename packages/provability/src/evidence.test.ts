@@ -21,6 +21,8 @@ import {
   restrictToTurns,
   servesPage,
   spilledOutput,
+  writtenPlaces,
+  writtenText,
 } from "./evidence";
 import { fetched } from "./test-helpers";
 
@@ -117,24 +119,23 @@ describe("evidenceFromMessages", () => {
 describe("recordFromCall origins", () => {
   const roots = { workspaceRoot: "/work/space" };
 
-  test("url, uri, href and the four path fields are read; values outside the workspace are not", () => {
+  test("url, uri, href and the four path fields are read where the schema declares them; values outside the workspace are not", () => {
+    const input = {
+      url: "https://a.example/x",
+      uri: "doi:10.1000/ABC",
+      href: "not a url",
+      file_path: "/work/space/a.md",
+      path: "b/c.md",
+      file: "/etc/passwd",
+      filePath: "../outside.md",
+    };
+    const schema = {
+      type: "object",
+      properties: Object.fromEntries(Object.keys(input).map((key) => [key, { type: "string" }])),
+    };
     const record = recordFromCall(
-      {
-        toolUseId: "t",
-        toolName: "mcp__files__multi",
-        input: {
-          url: "https://a.example/x",
-          uri: "doi:10.1000/ABC",
-          href: "not a url",
-          file_path: "/work/space/a.md",
-          path: "b/c.md",
-          file: "/etc/passwd",
-          filePath: "../outside.md",
-        },
-        content: "ok",
-        isError: false,
-      },
-      roots,
+      { toolUseId: "t", toolName: "mcp__files__multi", input, content: "ok", isError: false },
+      { ...roots, inputSchemaOf: (name) => (name === "mcp__files__multi" ? schema : undefined) },
     );
     expect(record.origins).toEqual([
       "https://a.example/x",
@@ -142,6 +143,99 @@ describe("recordFromCall origins", () => {
       "a.md",
       "b/c.md",
     ]);
+  });
+
+  describe("an MCP tool's origin is a field it declares (design §0 A, §5.2)", () => {
+    // tool-mcp registers every MCP tool with a permissive local validator,
+    // so a key the server does not declare reaches the log and the server,
+    // which ignores it: read_file reads `notes.md` whatever `url` says.
+    const readFile = {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    };
+    const strayUrl = {
+      toolUseId: "t",
+      toolName: "mcp__filesystem__read_file",
+      input: { path: "notes.md", url: "https://acme.example/policy" },
+      content: "The refund window is 30 days from the date of purchase.",
+      isError: false,
+    };
+    const lookup = (name: string) => (name === "mcp__filesystem__read_file" ? readFile : undefined);
+
+    test("a stray url beside the declared path names no origin: the file is all it read", () => {
+      const record = recordFromCall(strayUrl, { ...roots, inputSchemaOf: lookup });
+      expect(record.origins).toEqual(["notes.md"]);
+      expect(buildEvidenceIndex([record]).bySource("https://acme.example/policy")).toEqual([]);
+    });
+
+    test("with no schema to read, an input naming two places names neither; one place it names alone", () => {
+      const unknown = { ...roots, inputSchemaOf: () => undefined };
+      expect(recordFromCall(strayUrl, unknown).origins).toEqual([]);
+      const plain = recordFromCall(
+        { ...strayUrl, input: { url: "https://acme.example/policy" } },
+        unknown,
+      );
+      expect(plain.origins).toEqual(["https://acme.example/policy"]);
+      // The same address spelled twice is one place.
+      const twice = recordFromCall(
+        {
+          ...strayUrl,
+          input: { url: "https://acme.example/policy", href: "https://acme.example/policy/" },
+        },
+        unknown,
+      );
+      expect(twice.origins).toEqual(["https://acme.example/policy"]);
+    });
+
+    test("a schema that declares nothing at its top level names no origin; a lookup that throws is no schema", () => {
+      for (const schema of [{ type: "object" }, { $ref: "#/defs/x" }, { anyOf: [] }, "x"]) {
+        const record = recordFromCall(
+          { ...strayUrl, input: { url: "https://acme.example/policy" } },
+          { ...roots, inputSchemaOf: () => schema },
+        );
+        expect([schema, record.origins]).toEqual([schema, []]);
+      }
+      const throwing = recordFromCall(
+        { ...strayUrl, input: { url: "https://acme.example/policy" } },
+        {
+          ...roots,
+          inputSchemaOf: () => {
+            throw new Error("no catalog");
+          },
+        },
+      );
+      expect(throwing.origins).toEqual(["https://acme.example/policy"]);
+    });
+
+    test("a call pointed at an address, declared or not, is read for no hits", () => {
+      // A file server handed a JSON file with a stray url: the file's rows
+      // are not hits of a search, whatever they name.
+      const record = recordFromCall(
+        {
+          ...strayUrl,
+          input: { path: "rows.json", url: "https://acme.example/x" },
+          content: JSON.stringify([{ url: "https://acme.example/policy", text: "30 days" }]),
+        },
+        { ...roots, inputSchemaOf: lookup },
+      );
+      expect(record.hits).toBeUndefined();
+    });
+
+    test("the log walk reads with the caller's lookup", async () => {
+      const rootDir = tempDir();
+      await writeLog(rootDir, PARENT, [
+        { kind: "tool_use", payload: { id: "t1", name: strayUrl.toolName, input: strayUrl.input } },
+        { kind: "tool_result", payload: { toolUseId: "t1", content: strayUrl.content } },
+      ]);
+      const records = await evidenceFromSessionLog({
+        sessionId: PARENT,
+        rootDir,
+        workspaceRoot: roots.workspaceRoot,
+        inputSchemaOf: lookup,
+      });
+      expect(records.map((record) => record.origins)).toEqual([["notes.md"]]);
+    });
   });
 
   test("a runtime tool's stray url or path names no origin: its result is model output (design §8)", () => {
@@ -1185,6 +1279,68 @@ describe("buildEvidenceIndex", () => {
         new Set([2]),
       );
       expect(scoped.byToolUseId(ID)?.sessionId).toBe(SIBLING);
+    });
+  });
+});
+
+describe("what a call wrote, and where (design §10)", () => {
+  const roots = { workspaceRoot: "/work/space" };
+
+  test("a target and the places it was copied, moved, concatenated or unpacked from", () => {
+    expect(writtenPlaces("Write", { path: "notes/a.md", content: "x" }, roots)).toEqual([
+      { place: "notes/a.md", source: false },
+    ]);
+    expect(writtenPlaces("CopyPath", { source: "a", destination: "b" }, roots)).toEqual([
+      { place: "b", source: false },
+      { place: "a", source: true },
+    ]);
+    expect(
+      writtenPlaces("ConcatFiles", { paths: ["a.txt", "b.txt"], destination: "c.txt" }, roots),
+    ).toEqual([
+      { place: "c.txt", source: false },
+      { place: "a.txt", source: true },
+      { place: "b.txt", source: true },
+    ]);
+    expect(
+      writtenPlaces("ArchiveExtract", { archive: "x.tar", destination: "out" }, roots),
+    ).toEqual([
+      { place: "out", source: false },
+      { place: "x.tar", source: true },
+    ]);
+    // A list with no target is what the call writes.
+    expect(writtenPlaces("Format", { paths: ["a.ts"] }, roots)).toEqual([
+      { place: "a.ts", source: false },
+    ]);
+    // Readers and the preflight write nowhere.
+    expect(writtenPlaces("Read", { path: "a.md" }, roots)).toEqual([]);
+    expect(writtenPlaces("Fetch", { url: "https://a.example/x" }, roots)).toEqual([]);
+    expect(writtenPlaces("ProvabilityPreflight", { path: "a.md" }, roots)).toEqual([]);
+  });
+
+  test("a diff writes the files its +++ lines name, under the call's cwd", () => {
+    const patch =
+      "--- a/docs/x.md\n+++ b/docs/x.md\n@@ -1 +1 @@\n-old\n+new\n--- /dev/null\n+++ b/new.md\n";
+    expect(writtenPlaces("GitApplyPatch", { cwd: "repo", patch }, roots)).toEqual([
+      { place: "repo/docs/x.md", source: false },
+      { place: "repo/new.md", source: false },
+    ]);
+  });
+
+  test("the text a call put there: its content fields and a diff's + lines added, what an edit replaced removed", () => {
+    expect(
+      writtenText({ path: "a.md", oldString: "14 days", newString: "30 days", pattern: "x" }),
+    ).toEqual({ added: ["30 days"], removed: ["14 days"] });
+    expect(
+      writtenText({ path: "a.md", edits: [{ oldText: "not refundable", newText: "refundable" }] }),
+    ).toEqual({ added: ["refundable"], removed: ["not refundable"] });
+    expect(writtenText({ cwd: ".", patch: "+++ b/x\n-was 14\n+is 30\n context\n" })).toEqual({
+      added: ["is 30"],
+      removed: ["was 14"],
+    });
+    // A search pattern, a commit message, an address: nothing put anywhere.
+    expect(writtenText({ path: "a.md", pattern: "refund", message: "fix" })).toEqual({
+      added: [],
+      removed: [],
     });
   });
 });

@@ -68,8 +68,17 @@ reader watches every attempt print, so the runtime marks a rejected attempt
 ✗ before it re-runs the turn, and grades the turn's printed text when its
 final message states nothing ("Done."): since the last attempt a pass
 rejected (all of it when the final message points back at it, "See
-above."), with the narration of what the agent is about to do ("Let me fetch
-the policy page first.") left out. `streamed: true` says the same of a run
+above."), with the narration of what the agent is about to do left out,
+whatever its wording ("Let me fetch the policy page first.", "Fetching the
+policy page.", "One moment while I look that up.") — unless it carries a
+marker, states something past its announcement ("Hold on, refunds are not
+allowed on sale items.", "Looking at your account, your refund went through
+yesterday.", "I can confirm your refund has been processed." are graded),
+or carries a figure the agent brings itself rather than one the user's
+message or a value of the announced tool call holds ("Let me book the 10:30
+slot" with `{time: "10:30"}` stays narration; "Let me note: the window is 30
+days" is graded, and so is a figure inside a note's free `text`). An empty final
+message is still the final message. `streamed: true` says the same of a run
 whose footer rides the returned text but which prints every attempt as it
 goes (`crewhaus run --prompt`). The gate also names the run's own state
 directories to the verifier (`runtimeStateRoots`: a relocated session root,
@@ -88,7 +97,10 @@ Returns `{ evaluation?, provability?, tools, proofTools }`:
   final text against an evidence index built from the session event log
   (children included) merged with the transcript, scoped by `scope`
   (`turn` = everything after the last real user message — a retry nudge
-  does not start a turn); proof artifacts from the spec's proofs root;
+  does not start a turn; the index then holds the whole session with the
+  turn kept by `turnNumbers`, so grounding reads the turn while the
+  self-written trace still sees a file an earlier turn wrote);
+  proof artifacts from the spec's proofs root;
   `checked` replay of PURE tools through the catalog (bounded, abortable),
   compared in the shape the log holds the call in — a result over the
   tool-result-store threshold against its logged preview — and never read as

@@ -119,4 +119,90 @@ describe("the live loop — a source the run wrote itself (design §10)", () => 
       "── provability · grounded ✓ · 1/1 claim · 1 source · 0 assumptions",
     );
   });
+
+  test("scope: turn — a file the session wrote in an earlier turn, read and cited in this one, is still the run's own (I9)", async () => {
+    const cwd = dirs.make();
+    const sessionRootDir = join(cwd, ".crewhaus", "sessions");
+    const { write, read } = fsTools(cwd);
+    const gates = await wireEvaluation(
+      {
+        specName: "support-bot",
+        primaryModel: "test-model",
+        provability: config("grounded", { scope: "turn" }),
+      },
+      { cwd, sessionRootDir, footerTarget: "reply", catalog: [write, read] },
+    );
+    const first = await runTurn({
+      model: scriptedModel([
+        [
+          {
+            type: "tool_use",
+            id: "toolu_write1",
+            name: "Write",
+            input: { path: "notes/policy.md", content: POLICY },
+          },
+        ],
+        [{ type: "text", text: "Saved." }],
+      ]),
+      tools: [write, read],
+      gates,
+      sessionRootDir,
+      seed: "save our refund policy",
+    });
+    // The thread's next message: the same session, a new turn.
+    const second = await runTurn({
+      model: scriptedModel([
+        [{ type: "tool_use", id: "toolu_read1", name: "Read", input: { path: "notes/policy.md" } }],
+        [{ type: "text", text: ANSWER }],
+      ]),
+      tools: [write, read],
+      gates,
+      sessionRootDir,
+      sessionId: first.sessionId,
+      resume: true,
+    });
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.graded.map((e) => e.verdict)).toEqual(["pass"]);
+    expect((second.graded[0] as { selfWritten?: number }).selfWritten).toBe(1);
+    expect(second.result).toContain("1 source (1 written by this run)");
+  });
+
+  test("scope: turn still grounds on the turn alone: a read an earlier turn made grounds nothing now", async () => {
+    const cwd = dirs.make();
+    const sessionRootDir = join(cwd, ".crewhaus", "sessions");
+    mkdirSync(join(cwd, "notes"), { recursive: true });
+    writeFileSync(join(cwd, "notes", "policy.md"), POLICY);
+    const { write, read } = fsTools(cwd);
+    const gates = await wireEvaluation(
+      {
+        specName: "support-bot",
+        primaryModel: "test-model",
+        provability: config("grounded", { scope: "turn", onFail: "note" }),
+      },
+      { cwd, sessionRootDir, footerTarget: "reply", catalog: [write, read] },
+    );
+    const first = await runTurn({
+      model: scriptedModel([
+        [{ type: "tool_use", id: "toolu_read1", name: "Read", input: { path: "notes/policy.md" } }],
+        [{ type: "text", text: ANSWER }],
+      ]),
+      tools: [write, read],
+      gates,
+      sessionRootDir,
+    });
+    expect(first.graded.map((e) => e.verdict)).toEqual(["pass"]);
+    const second = await runTurn({
+      model: scriptedModel([[{ type: "text", text: ANSWER }]]),
+      tools: [write, read],
+      gates,
+      sessionRootDir,
+      sessionId: first.sessionId,
+      resume: true,
+    });
+    expect(second.graded.map((e) => e.verdict)).toEqual(["fail"]);
+    const bundle = JSON.parse(
+      readFileSync(join(proofsRoot(cwd, "support-bot"), first.sessionId, "turn-2.json"), "utf8"),
+    ) as ProofBundle;
+    expect(bundle.claims[0]?.bindings[0]?.reason).toBe("not_fetched");
+  });
 });

@@ -175,13 +175,17 @@ describe("a source the run wrote itself (design §10)", () => {
     expect(binding(searched)?.writtenBy).toBeUndefined();
   });
 
-  test("a Write of only part of the claim: the claim's words are not the run's, so not marked", async () => {
+  test("a Write of only part of the claim's words: those words are the run's, so it is marked", async () => {
+    // A Write is the file's whole content: what the run put there is part
+    // of the claim, and the rest came from nowhere this can see.
     const bundle = await verify(cite("./notes/policy.md"), [
       write("toolu_w", "notes/policy.md", "from the date of purchase"),
       read("toolu_r", "notes/policy.md"),
     ]);
-    expect(binding(bundle)).toMatchObject({ ok: true });
-    expect(binding(bundle)?.writtenBy).toBeUndefined();
+    expect(binding(bundle)).toMatchObject({
+      ok: true,
+      writtenBy: { toolUseId: "toolu_w", toolName: "Write" },
+    });
   });
 
   test("a read the run did not write beside one it did: the unmarked one grounds", async () => {

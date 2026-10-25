@@ -26,6 +26,7 @@ import { DEFAULT_ROOT_DIR, openEventLog } from "@crewhaus/event-log";
 import {
   type EvidenceIndex,
   type EvidenceRecord,
+  type InputSchemaLookup,
   buildEvidenceIndex,
   evidenceFromSessionLog,
 } from "@crewhaus/provability";
@@ -56,6 +57,13 @@ export type SessionEvidenceOptions = {
   readonly scope: "session" | "turn";
   /** Told when a log could not be read to its end (records before it are kept). */
   readonly onUnreadable?: (info: { readonly sessionId: string; readonly message: string }) => void;
+  /**
+   * The input schema each tool declared (provability's
+   * `EvidenceOptions.inputSchemaOf`), forwarded to every log read: an MCP
+   * call's origin is a field its schema declares. Absent ⇒ provability
+   * looks in `defaultCatalog`.
+   */
+  readonly inputSchemaOf?: InputSchemaLookup;
 };
 
 /** The index, plus what a reader of the preflight should know about how it was built. */
@@ -178,6 +186,7 @@ export async function sessionEvidence(opts: SessionEvidenceOptions): Promise<Ses
     onUnreadable,
     ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
     ...(opts.toolResultsRoot !== undefined ? { toolResultsRoot: opts.toolResultsRoot } : {}),
+    ...(opts.inputSchemaOf !== undefined ? { inputSchemaOf: opts.inputSchemaOf } : {}),
   };
   if (opts.scope === "session") {
     const records = await evidenceFromSessionLog({ sessionId: opts.sessionId, ...common });

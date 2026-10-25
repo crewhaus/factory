@@ -34,10 +34,10 @@ import { type EvidenceIndex, type ProofBundle, isProvabilityLevel } from "@crewh
 import type { RunEvaluation, RunProvability } from "@crewhaus/runtime-core";
 import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { buildRunEvaluation } from "./evaluation";
-import { gateEvidence } from "./evidence";
+import { gateEvidenceScoped } from "./evidence";
 import type { EvaluationFragment } from "./fragment";
 import { buildRunProvability } from "./provability";
-import type { GateCatalog } from "./replay";
+import { type GateCatalog, schemaLookup } from "./replay";
 import { activeTenant, fencedDir, gateProofsRoot, gateSessionRoot } from "./roots";
 import { type GateProofTools, gateTools } from "./tools";
 
@@ -188,8 +188,12 @@ export async function wireEvaluation(
 
   // The preflight's evidence: the gate's own builder over the run's log
   // (the transcript is not reachable from a tool call, and the log already
-  // holds every call the turn has finished), scoped the same way.
-  const evidence = async (ctx: ToolExecuteContext | undefined): Promise<EvidenceIndex> => {
+  // holds every call the turn has finished), scoped the same way — under
+  // `scope: turn` the session's index with the turn it keeps, as the gate
+  // hands the verifier.
+  const evidence = async (
+    ctx: ToolExecuteContext | undefined,
+  ): Promise<{ readonly index: EvidenceIndex; readonly turnNumbers?: ReadonlySet<number> }> => {
     const tenant = activeTenant();
     const callRoot = sessionRootOfCall(ctx);
     const sessionRootDir =
@@ -197,12 +201,14 @@ export async function wireEvaluation(
         ? fencedDir(callRoot, tenant)
         : gateSessionRoot(deps.sessionRootDir, tenant);
     const sessionId = sessionIdOfCall(ctx);
-    return gateEvidence({
+    return gateEvidenceScoped({
       scope: config.scope,
       workspaceRoot: cwd,
       ...(tenant !== undefined ? { toolResultsRoot: tenant.toolResultRoot } : {}),
       ...(sessionId !== undefined ? { sessionId } : {}),
       ...(sessionRootDir !== undefined ? { sessionRootDir } : {}),
+      // The schemas the gate reads MCP origins by, so the preflight sees what it sees.
+      inputSchemaOf: schemaLookup(deps.catalog),
     });
   };
 

@@ -43,11 +43,13 @@
  * the figure rule compares it as written (`figureKey`).
  *
  * One for one is load-bearing: every offset the locate kernel and the
- * number layer report is an offset into the folded text, and a line number
- * or an excerpt is cut from it, so the fold keeps every UTF-16 length. An
- * astral character folded to ASCII (`𝟑` is two code units) keeps its second
- * unit as a zero-width space, which the last step moves to the end of the
- * word. Folding twice is folding once.
+ * number layer report is an offset into the folded text, a line number is
+ * read from it, and an excerpt is cut from the text as written at the same
+ * offsets — widened to the whole word where this moved a character inside
+ * one (`writtenSpan`) — so the fold keeps every UTF-16 length. An astral
+ * character folded to ASCII (`𝟑` is two code units) keeps its second unit
+ * as a zero-width space, which the last step moves to the end of the word.
+ * Folding twice is folding once.
  *
  * Linear in the text, and a text with nothing outside ASCII is returned as
  * it came after one scan: a fetched page and a tool result reach this on

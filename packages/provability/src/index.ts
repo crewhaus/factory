@@ -26,6 +26,7 @@ export {
   type EvidenceIndexOptions,
   type EvidenceMessage,
   type EvidenceOptions,
+  type InputSchemaLookup,
   type SessionLogEvidenceOptions,
   type ToolCall,
   ProvabilityError,

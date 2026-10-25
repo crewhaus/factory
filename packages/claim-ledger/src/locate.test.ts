@@ -23,6 +23,7 @@ import {
   quotedRuns,
   scanMeter,
   tightestWindows,
+  writtenSpan,
 } from "./locate";
 
 const POLICY = "The refund window for orders placed by EU customers is 14 days from delivery.";
@@ -996,5 +997,49 @@ describe("the kernel pieces", () => {
     const before = scanMeter.tokens;
     locateWords(index, ["three"], {});
     expect(scanMeter.tokens - before).toBe(5);
+  });
+
+  test("an excerpt is the source's own words, whatever the fold reads (design §5.3)", () => {
+    // The fold compared these as ASCII, and the excerpt was cut from the
+    // folded text: "30" for ٣٠, a joiner moved to the word's end, "𝟑" for
+    // "𝟑𝟎" when cut from the written text at the folded offsets.
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    for (const [source, claim] of [
+      [
+        `من ${at(0x0645, 0x06cc, 0x200c, 0x062e, 0x0648, 0x0627, 0x0647, 0x0645)} ${at(0x06f3, 0x06f0)} روز صبر کنم`,
+        `من ${at(0x0645, 0x06cc, 0x200c, 0x062e, 0x0648, 0x0627, 0x0647, 0x0645)} ${at(0x06f3, 0x06f0)} روز`,
+      ],
+      [`مدة الاسترداد ${at(0x0663, 0x0660)} يوما`, `مدة الاسترداد ${at(0x0663, 0x0660)}`],
+      [`अवधि ${at(0x0969, 0x0966)} दिन`, `अवधि ${at(0x0969, 0x0966)} दिन`],
+      [`The refund window is ${at(0xff13, 0xff10)} days.`, "The refund window is 30 days."],
+      [`Total ${at(0x1d7d1, 0x1d7ce)} days, then it closes.`, "Total 30 days"],
+      [`The re${at(0x00ad)}fund window is 30 days.`, "The refund window is 30 days."],
+      [
+        "The company\u2019s refund window is \u201c30 days\u201d.",
+        "company's refund window is 30 days",
+      ],
+      [
+        `Refunds are n${at(0x200b)}ot accepted after 30 days.`,
+        "Refunds are not accepted after 30 days.",
+      ],
+    ] as const) {
+      const found = locateClaim(claim, source, { coverage: 1 });
+      expect(`${claim} → ${found.status}`).toBe(`${claim} → supported`);
+      const excerpt = found.excerpt as string;
+      expect(
+        `${JSON.stringify(excerpt)} in ${JSON.stringify(source)}: ${source.includes(excerpt)}`,
+      ).toBe(`${JSON.stringify(excerpt)} in ${JSON.stringify(source)}: true`);
+    }
+    // The whole word the fold rearranged, never cut short at its folded end.
+    const math = indexSource(`Total ${at(0x1d7d1, 0x1d7ce)} days`);
+    expect(writtenSpan(math, 6, 8)).toEqual({ text: math.written, from: 6, to: 10 });
+    // An ASCII source has nothing written apart from what was folded.
+    expect(indexSource("The refund window is 30 days.").written).toBeUndefined();
+    // A token inside a word the fold rearranged starts at the word's start…
+    const marked = indexSource(`x a${at(0x0301)}b${at(0x200b)}c d`);
+    expect(writtenSpan(marked, 4, 6)).toEqual({ text: marked.written, from: 2, to: 7 });
+    // …and a word too long to walk keeps the folded text's offsets.
+    const long = indexSource(`${"a".repeat(80)}${at(0x0301)}b${at(0x200b)} c`);
+    expect(writtenSpan(long, 81, 82)).toEqual({ text: long.text, from: 81, to: 82 });
   });
 });

@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { classifyDefinition, contentTokens, coverage } from "@crewhaus/claim-ledger";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_ROOT_DIR, openEventLog } from "@crewhaus/event-log";
+import { defaultCatalog } from "@crewhaus/tool-catalog";
 import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import {
   FETCH,
@@ -104,11 +105,27 @@ export type ToolCall = {
   readonly turnNumber?: number;
 };
 
+/**
+ * The input schema a tool declared, by the name the log records it under
+ * (`RegisteredTool.jsonSchema`: for an MCP tool, what its server
+ * advertised), or `undefined` when the caller cannot say. Read for an MCP
+ * tool's origins (`inputOrigins`): only a field the schema declares names
+ * one.
+ */
+export type InputSchemaLookup = (toolName: string) => unknown;
+
 /** Where path-shaped inputs are measured from (default `process.cwd()`, the
  *  directory the tools themselves resolve relative paths against). */
 export type EvidenceOptions = Pick<PathRoots, "workspaceRoot"> & {
   /** Stamped onto records built from messages (they carry no session of their own). */
   readonly sessionId?: string;
+  /**
+   * The input schema each tool declared (`InputSchemaLookup`) — the gate
+   * passes its catalog's. Default: the schema `defaultCatalog` holds for the
+   * tool, where a compiled harness registers its MCP tools. (0.8.0
+   * additive, convergence pass.)
+   */
+  readonly inputSchemaOf?: InputSchemaLookup;
   /**
    * Where the runtime spilled results over its threshold (its
    * `toolResultRoot`; default `.crewhaus/tool-results` under the workspace
@@ -303,40 +320,57 @@ function readerOrigins(
 }
 
 /**
- * Origins a call's input names (design §5.2: the bodies the run READ). A
- * builtin names one only when it is a reader (`READERS`). An MCP server's
- * tool (`isMcpTool`) — a fetcher or a file server whose flags the gate
- * cannot see — by its URL fields, then its path fields; whether its result
- * is then an echo of that input rather than a body is `echoesInput`'s
- * question. Any other tool names none: the runtime's own non-builtins
- * return MODEL output — `Task` a sub-agent's final message, `Consult` and
- * `Escalate` a sibling model's reply, `Skill` a skill body, the memory,
- * plan and goal tools what a model stored (design §8: child returns are
- * inputs) — and their schemas strip a key they do not declare without
- * refusing it, so a `url` the model adds to a `Recall` reaches the log
- * whole. Read as an origin, it put a remembered sentence, or a child's
- * wrong summary, under a page nobody fetched. A plugin's tool falls here
- * too: fail closed, it grounds nothing by what its input names.
+ * Origins a call's input names (design §5.2: the bodies the run READ), and
+ * whether it was pointed at an address at all (`pointed`: such a call's
+ * result is that address's body, never hits — `resultHits`). A builtin
+ * names one only when it is a reader (`READERS`). An MCP server's tool
+ * (`isMcpTool`) — a fetcher or a file server whose flags the gate cannot
+ * see — by its URL fields, then its path fields, as far as its declared
+ * schema lets them (`mcpOrigins`); whether its result is then an echo of
+ * that input rather than a body is `echoesInput`'s question. Any other tool
+ * names none: the runtime's own non-builtins return MODEL output — `Task` a
+ * sub-agent's final message, `Consult` and `Escalate` a sibling model's
+ * reply, `Skill` a skill body, the memory, plan and goal tools what a model
+ * stored (design §8: child returns are inputs) — and their schemas strip a
+ * key they do not declare without refusing it, so a `url` the model adds to
+ * a `Recall` reaches the log whole. Read as an origin, it put a remembered
+ * sentence, or a child's wrong summary, under a page nobody fetched. A
+ * plugin's tool falls here too: fail closed, it grounds nothing by what its
+ * input names.
  */
-function inputOrigins(toolName: string, input: unknown, roots: PathRoots): string[] {
-  if (!isRecordObject(input)) return [];
+function inputOrigins(
+  toolName: string,
+  input: unknown,
+  roots: PathRoots,
+  schemaOf: InputSchemaLookup,
+): { readonly origins: string[]; readonly pointed: boolean } {
+  if (!isRecordObject(input)) return { origins: [], pointed: false };
   const reader = READERS[toolName];
-  if (reader !== undefined) return readerOrigins(reader, toolName, input, roots);
-  if (builtinKey(toolName) !== undefined || !isMcpTool(toolName)) return [];
-  return namedOrigins(input, roots).map((named) => named.origin);
+  if (reader !== undefined) {
+    const origins = readerOrigins(reader, toolName, input, roots);
+    return { origins, pointed: origins.length > 0 };
+  }
+  if (builtinKey(toolName) !== undefined || !isMcpTool(toolName)) {
+    return { origins: [], pointed: false };
+  }
+  const named = namedOrigins(input, roots);
+  return {
+    origins: mcpOrigins(toolName, input, named, schemaOf).map((one) => one.origin),
+    pointed: named.length > 0,
+  };
 }
 
+/** One origin an input field names: the field, the value as written, and the origin. */
+type NamedOrigin = { readonly field: string; readonly value: string; readonly origin: string };
+
 /** A non-builtin's URL fields, then its path fields: each value that names an origin, with it. */
-function namedOrigins(
-  input: Record<string, unknown>,
-  roots: PathRoots,
-): Array<{ readonly value: string; readonly origin: string }> {
-  const out: Array<{ value: string; origin: string }> = [];
+function namedOrigins(input: Record<string, unknown>, roots: PathRoots): NamedOrigin[] {
+  const out: NamedOrigin[] = [];
   for (const field of URL_FIELDS) {
     const value = input[field];
     if (typeof value !== "string") continue;
     const origin = originOfValue(value, roots, false);
-    if (origin !== undefined) out.push({ value, origin });
+    if (origin !== undefined) out.push({ field, value, origin });
   }
   for (const field of PATH_FIELDS) {
     const value = input[field];
@@ -344,10 +378,147 @@ function namedOrigins(
     const origin = /^https?:\/\//i.test(value.trim())
       ? normalizeUrl(value)
       : normalizePath(value, roots);
-    if (origin !== undefined) out.push({ value, origin });
+    if (origin !== undefined) out.push({ field, value, origin });
   }
   return out;
 }
+
+/**
+ * The properties a tool's declared input schema lists at its top level, or
+ * `undefined` when no schema is known. A schema that lists none there (a
+ * `$ref`, an `anyOf`, a bare `{ type: "object" }`) declares no field this
+ * can read an address from: the empty set, so nothing its input carries
+ * names an origin (fail closed).
+ */
+export function declaredFields(schema: unknown): ReadonlySet<string> | undefined {
+  if (schema === undefined || schema === null) return undefined;
+  if (!isRecordObject(schema)) return new Set();
+  const properties = schema["properties"];
+  return isRecordObject(properties) ? new Set(Object.keys(properties)) : new Set();
+}
+
+/** The schema the process's `defaultCatalog` holds for a tool (a compiled harness registers its MCP tools there). */
+function catalogSchema(toolName: string): unknown {
+  return defaultCatalog.get(toolName)?.jsonSchema;
+}
+
+/**
+ * The origins an MCP tool's input names that it can have been POINTED at
+ * (design §0 A, §5.2: a body is evidence because the run fetched it).
+ * tool-mcp registers every MCP tool with a permissive local validator, so a
+ * key the server does not declare reaches the log and the server whole, and
+ * the server ignores it: `mcp__filesystem__read_file {path: "notes.md", url:
+ * "https://acme.example/policy"}` reads `notes.md` and succeeds. Read as an
+ * origin, that `url` put a file the model wrote — or the run's own session
+ * log — under a page nobody fetched, served `grounded ✓`. So:
+ *
+ * - where the tool's declared schema is known (`InputSchemaLookup`), a field
+ *   names an origin only when the schema declares it — a fetcher's `url`, a
+ *   file server's `path` — and a key it does not declare names none;
+ * - where it is not known (a log read offline, a tool no catalog holds), the
+ *   input names an origin only when it carries nothing else a call could
+ *   have been pointed at: every address field names that one origin, and no
+ *   other field carries a string at all. A `path` beside a `url` that names
+ *   something else, a `paths` list beside a `url`
+ *   (`read_multiple_files {paths: ["notes.md"], url}`), or a `command`
+ *   beside one (`run_command {command: "cat notes.md", url}`) is a call that
+ *   read one of them, and nothing says which, so it names neither: fail
+ *   closed.
+ *
+ * A lookup that throws reads as an unknown schema.
+ */
+function mcpOrigins(
+  toolName: string,
+  input: Record<string, unknown>,
+  named: readonly NamedOrigin[],
+  schemaOf: InputSchemaLookup,
+): readonly NamedOrigin[] {
+  if (named.length === 0) return named;
+  let schema: unknown;
+  try {
+    schema = schemaOf(toolName);
+  } catch {
+    schema = undefined;
+  }
+  const declared = declaredFields(schema);
+  if (declared !== undefined) return named.filter((one) => declared.has(one.field));
+  if (carriesOtherStrings(input, new Set(named.map((one) => one.field)))) return [];
+  return new Set(named.map((one) => one.origin)).size === 1 ? named : [];
+}
+
+/** How deep {@link carriesOtherStrings} looks into an input. */
+const MAX_INPUT_DEPTH = 6;
+
+/**
+ * A fetcher's rendering options: how to return the page it was pointed at,
+ * never another place (`mcp__firecrawl__scrape {url, formats: ["markdown"]}`,
+ * `{url, method: "GET"}`).
+ */
+const RENDER_OPTIONS: ReadonlySet<string> = new Set([
+  "format",
+  "formats",
+  "method",
+  "mode",
+  "outputFormat",
+  "output_format",
+  "encoding",
+  "lang",
+  "language",
+  "locale",
+  "country",
+  "waitFor",
+  "wait_for",
+]);
+
+/**
+ * Does `input` carry a non-blank string anywhere but in the address fields
+ * `named` read and a fetcher's rendering options ({@link RENDER_OPTIONS}) —
+ * a list entry, a nested field, a command line, an id? Each is something
+ * an undeclared tool may have been pointed at.
+ */
+function carriesOtherStrings(input: unknown, named: ReadonlySet<string>, depth = 0): boolean {
+  if (depth > MAX_INPUT_DEPTH) return true;
+  if (typeof input === "string") return input.trim() !== "";
+  if (Array.isArray(input))
+    return input.some((item) => carriesOtherStrings(item, named, depth + 1));
+  if (!isRecordObject(input)) return false;
+  return Object.entries(input).some(
+    ([field, value]) =>
+      !(depth === 0 && (named.has(field) || RENDER_OPTIONS.has(field))) &&
+      carriesOtherStrings(value, named, depth + 1),
+  );
+}
+
+/**
+ * Every place a call's input points at, whatever its schema declares — a
+ * builtin reader's one field, an MCP tool's URL and path fields and the
+ * entries of its `paths` / `files` lists — for the state-root test
+ * (verify.ts `provenanceOf`): a call whose input names the session log read
+ * it, whichever origin the body was then indexed under
+ * (`read_multiple_files {paths: [".crewhaus/sessions/…"], url}`).
+ */
+export function inputPlaces(toolName: string, input: unknown, roots: PathRoots = {}): string[] {
+  if (!isRecordObject(input)) return [];
+  const reader = READERS[toolName];
+  if (reader !== undefined) return readerOrigins(reader, toolName, input, roots);
+  if (builtinKey(toolName) !== undefined || !isMcpTool(toolName)) return [];
+  const places = namedOrigins(input, roots).map((one) => one.origin);
+  for (const field of LIST_FIELDS) {
+    const list = input[field];
+    if (!Array.isArray(list)) continue;
+    for (const item of list.slice(0, MAX_LISTED_PLACES)) {
+      if (typeof item !== "string" || item.trim() === "") continue;
+      const place = /^https?:\/\//i.test(item.trim())
+        ? normalizeUrl(item)
+        : normalizePath(item, roots);
+      if (place !== undefined) places.push(place);
+    }
+  }
+  return [...new Set(places)];
+}
+
+/** How many entries of one list field {@link inputPlaces} reads. */
+const MAX_LISTED_PLACES = 256;
 
 /** Is `toolName` one of the builtin readers (`WebFetch`, `Fetch`, `Read`: `READERS`)? */
 export function isReader(toolName: string): boolean {
@@ -355,67 +526,229 @@ export function isReader(toolName: string): boolean {
 }
 
 /**
- * Input fields a call that writes may name a place by: the one it writes
- * (`Write`'s and `Edit`'s `path`, `CopyPath`'s `destination`, a PUT's
- * `url`) and the one it copies or moves from (`source`).
+ * Input fields a call that writes names the place it writes by: `Write`'s
+ * and `Edit`'s `path`, `CopyPath`'s `destination`, a PUT's `url`, an
+ * export's `out`, an archive's `output`, a split's `outputDir`.
  */
-const WRITE_FIELDS = [
+const TARGET_FIELDS = [
   ...URL_FIELDS,
   ...PATH_FIELDS,
-  "source",
   "destination",
   "dest",
   "target",
-  "from",
   "to",
-  "src",
   "output",
   "outputPath",
   "output_path",
+  "out",
+  "outFile",
+  "outputFile",
+  "output_file",
+  "outDir",
+  "outputDir",
+  "output_dir",
+  "golden",
+  "manifest",
+  "specFile",
 ] as const;
+/** Input fields a call names the place it copies, moves or unpacks FROM by. */
+const SOURCE_FIELDS = ["source", "from", "src", "archive"] as const;
+/**
+ * List fields that name several places: what a call that also names a
+ * target reads into it (`ConcatFiles`' `paths`), else what it writes. Not
+ * `sources`: FactCrossCheck's `claims[].sources` are what it read.
+ */
+const LIST_FIELDS = ["paths", "files"] as const;
+/** Fields that carry a unified diff: the files it names are written, its `+` lines are the new text. */
+const PATCH_FIELDS = ["patch", "diff"] as const;
+/** Fields that carry the text a call puts where it writes (`Write`'s `content`, `Edit`'s `newString`, a PUT's `body`). */
+const CONTENT_FIELDS: ReadonlySet<string> = new Set([
+  "content",
+  "contents",
+  "text",
+  "body",
+  "data",
+  "value",
+  "newString",
+  "new_string",
+  "newText",
+  "new_text",
+  "new_str",
+  "replacement",
+  "replace",
+  "append",
+  "insert",
+  "lines",
+]);
+/** Fields that carry the text an edit REPLACES (`Edit`'s `oldString`, an MCP file server's `oldText`). */
+const OLD_TEXT_FIELDS: ReadonlySet<string> = new Set([
+  "oldString",
+  "old_string",
+  "oldText",
+  "old_text",
+  "old_str",
+  "search",
+  "find",
+]);
+/** Places read off one list field at most. */
+const MAX_LIST_PLACES = 64;
+/** Files read off one diff at most. */
+const MAX_PATCH_FILES = 64;
+
+/** One place a call names: where it writes, or (`source`) where it copies, moves or unpacks from. */
+export type WrittenPlace = { readonly place: string; readonly source: boolean };
 
 /**
- * The origins a call may have WRITTEN — or copied or moved between — as its
- * input names them, normalized like a citation's (verify.ts `writtenBy`
- * reads them: a source the run wrote itself and then read back). Any tool's
- * input, builtin or not, by {@link WRITE_FIELDS}; none for a call that only
- * reads — a builtin reader (`WebFetch`, `Read`, a GET or HEAD `Fetch`) and
- * `ProvabilityPreflight`, which writes nowhere. Whether the tool can write
- * at all (a pure tool cannot) is the caller's question.
+ * The files a unified diff names as written (`+++ b/<path>`), with `strip`
+ * leading components dropped (git's `-p`, default 1).
  */
-export function writtenOrigins(toolName: string, input: unknown, roots: PathRoots = {}): string[] {
-  if (!isRecordObject(input) || toolName === PROVABILITY_PREFLIGHT) return [];
-  if (toolName === FETCH ? fetchReads(input) : isReader(toolName)) return [];
+function patchFiles(patch: string, strip: number): string[] {
   const out: string[] = [];
-  for (const field of WRITE_FIELDS) {
-    const value = input[field];
-    if (typeof value !== "string") continue;
-    const trimmed = value.trim();
-    const origin = /^https?:\/\//i.test(trimmed)
-      ? normalizeUrl(trimmed)
-      : normalizePath(trimmed, roots);
-    if (origin !== undefined && !out.includes(origin)) out.push(origin);
+  for (const m of patch.matchAll(/^\+\+\+ ([^\t\n\r]+)/gm)) {
+    const named = (m[1] as string).trim();
+    if (named === "/dev/null" || named === "") continue;
+    const parts = named.split("/");
+    const file = parts.slice(Math.min(strip, parts.length - 1)).join("/");
+    if (!out.includes(file)) out.push(file);
+    if (out.length >= MAX_PATCH_FILES) break;
   }
   return out;
 }
 
 /**
- * The input strings a call names its origins by, as written: the URL or
- * path it was pointed at, not text it was handed — a builtin reader's one
- * declared field, any other non-builtin's URL and path fields (what
- * `inputOrigins` reads off an MCP tool, and the address a record built
- * outside the log was fetched under — the research crawler's carry their
- * own origins). `grounded`'s echo test (verify.ts `echoCheck`) reads these apart
- * from the call's other strings, because a URL's slug can spell a claim the
- * page itself states — a reader returns the page, not its address — and
- * only a body that PRINTS the address (a 404 page repeating the path it was
- * asked for, a page headed with its own URL) can be reflecting it.
+ * The places a call may have WRITTEN, and the ones it copied, moved or
+ * unpacked them from, as its input names them, normalized like a
+ * citation's (verify.ts `provenanceOf` reads them: a source the run wrote
+ * itself and then read back, or a copy of the harness's own state). Any
+ * tool's input, builtin or not: the place it writes by
+ * {@link TARGET_FIELDS}; the place it copies from by {@link SOURCE_FIELDS};
+ * a list ({@link LIST_FIELDS}) as sources beside a target (`ConcatFiles`)
+ * and as written places otherwise; and each file a diff
+ * ({@link PATCH_FIELDS}) names, under the call's `cwd` (`GitApplyPatch`).
+ * None for a call that only reads — a builtin reader (`WebFetch`, `Read`, a
+ * GET or HEAD `Fetch`) and `ProvabilityPreflight`, which writes nowhere.
+ * Whether the tool can write at all (a pure tool cannot) is the caller's
+ * question.
  */
-export function originFieldValues(
+export function writtenPlaces(
   toolName: string,
   input: unknown,
   roots: PathRoots = {},
+): WrittenPlace[] {
+  if (!isRecordObject(input) || toolName === PROVABILITY_PREFLIGHT) return [];
+  if (toolName === FETCH ? fetchReads(input) : isReader(toolName)) return [];
+  const out: WrittenPlace[] = [];
+  const add = (value: string, source: boolean): void => {
+    const trimmed = value.trim();
+    if (trimmed === "") return;
+    const place = /^https?:\/\//i.test(trimmed)
+      ? normalizeUrl(trimmed)
+      : normalizePath(trimmed, roots);
+    if (place === undefined) return;
+    if (!out.some((one) => one.place === place && one.source === source)) {
+      out.push({ place, source });
+    }
+  };
+  let target = false;
+  for (const field of TARGET_FIELDS) {
+    const value = input[field];
+    if (typeof value !== "string") continue;
+    add(value, false);
+    target = true;
+  }
+  for (const field of SOURCE_FIELDS) {
+    const value = input[field];
+    if (typeof value === "string") add(value, true);
+  }
+  for (const field of LIST_FIELDS) {
+    const list = input[field];
+    if (!Array.isArray(list)) continue;
+    for (const item of list.slice(0, MAX_LIST_PLACES)) {
+      if (typeof item === "string") add(item, target);
+    }
+  }
+  const cwd = typeof input["cwd"] === "string" ? input["cwd"] : ".";
+  const strip = input["strip"];
+  for (const field of PATCH_FIELDS) {
+    const patch = input[field];
+    if (typeof patch !== "string") continue;
+    const drop = typeof strip === "number" && Number.isInteger(strip) && strip >= 0 ? strip : 1;
+    for (const file of patchFiles(patch, drop)) add(path.posix.join(cwd, file), false);
+  }
+  return out;
+}
+
+/** What a call put where it wrote: the text it added, and the text it replaced. */
+export type WrittenText = {
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
+};
+
+/**
+ * The text a call put where it wrote ({@link writtenPlaces}), read off its
+ * input by field (verify.ts `selfWriter`): what a content field
+ * ({@link CONTENT_FIELDS}) carries, at any depth (`MultiEdit`'s `edits`, an
+ * MCP file server's `edits[].newText`), and a diff's `+` lines, as added;
+ * what an edit replaces ({@link OLD_TEXT_FIELDS}) and a diff's `-` lines, as
+ * removed — so an `Edit` of `14` to `30` added `30`, not `14`. A search's
+ * `pattern`, a commit `message`, an address: none of those is text put
+ * anywhere.
+ */
+export function writtenText(input: unknown): WrittenText {
+  const added: string[] = [];
+  const removed: string[] = [];
+  const diff = (patch: string): void => {
+    const plus: string[] = [];
+    const minus: string[] = [];
+    for (const line of patch.split(/\r?\n/)) {
+      if (line.startsWith("+++") || line.startsWith("---")) continue;
+      if (line.startsWith("+")) plus.push(line.slice(1));
+      else if (line.startsWith("-")) minus.push(line.slice(1));
+    }
+    if (plus.length > 0) added.push(plus.join("\n"));
+    if (minus.length > 0) removed.push(minus.join("\n"));
+  };
+  const walk = (value: unknown, key: string | undefined, depth: number): void => {
+    if (depth > MAX_HIT_DEPTH + 2) return;
+    if (typeof value === "string") {
+      if (key === undefined || value.trim() === "") return;
+      if (OLD_TEXT_FIELDS.has(key)) removed.push(value);
+      else if ((PATCH_FIELDS as readonly string[]).includes(key)) diff(value);
+      else if (CONTENT_FIELDS.has(key)) added.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, key, depth + 1);
+      return;
+    }
+    if (isRecordObject(value)) {
+      for (const [field, item] of Object.entries(value)) walk(item, field, depth + 1);
+    }
+  };
+  walk(input, undefined, 0);
+  return { added, removed };
+}
+
+/**
+ * The input strings a call names its origins by, as written: the URL or
+ * path it was pointed at, not text it was handed — a builtin reader's one
+ * declared field, a non-builtin's URL and path fields whose origin the
+ * record carries (what `inputOrigins` read off an MCP tool, and the address
+ * a record built outside the log was fetched under — the research
+ * crawler's carry their own origins). A key the tool does not declare names
+ * no origin (`mcpOrigins`), so its value is text the call was handed like
+ * any other. `grounded`'s echo test (verify.ts `echoCheck`) reads these
+ * apart from the call's other strings, because a URL's slug can spell a
+ * claim the page itself states — a reader returns the page, not its
+ * address — and only a body that PRINTS the address (a 404 page repeating
+ * the path it was asked for, a page headed with its own URL) can be
+ * reflecting it.
+ */
+export function originFieldValues(
+  record: Pick<EvidenceRecord, "toolName" | "input" | "origins">,
+  roots: PathRoots = {},
 ): string[] {
+  const { toolName, input } = record;
   if (!isRecordObject(input)) return [];
   const reader = READERS[toolName];
   if (reader !== undefined) {
@@ -425,7 +758,9 @@ export function originFieldValues(
       : [];
   }
   if (builtinKey(toolName) !== undefined) return [];
-  return namedOrigins(input, roots).map((named) => named.value);
+  return namedOrigins(input, roots)
+    .filter((one) => record.origins.includes(one.origin))
+    .map((one) => one.value);
 }
 
 /** A JSON hit's text: its text-bearing fields, or every string field when it has none. */
@@ -618,8 +953,9 @@ export function servedFrom(
  * One call as an evidence record: its origins read off the input — a
  * builtin reader's one field (WebFetch's and Fetch's `url`, Read's `path`),
  * or an MCP tool's `url`, `uri`, `href`, `file_path`, `path`, `file`,
- * `filePath` unless its result is an echo of its input (`inputOrigins`,
- * `echoesInput`) — and the URL a WebFetch result's header names on its
+ * `filePath` as far as its declared schema lets them (`mcpOrigins`), unless
+ * its result is an echo of its input (`inputOrigins`, `echoesInput`) — and
+ * the URL a WebFetch result's header names on its
  * first line (indexed BESIDE the requested URL, so that once tool-web
  * prints the final URL there a citation of either grounds — see
  * `webFetchHeader`), and the hits a multi-source result carries (Retrieve;
@@ -637,14 +973,21 @@ export function recordFromCall(call: ToolCall, opts: EvidenceOptions = {}): Evid
     ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
   };
   const text = call.body ?? call.content;
-  const named = inputOrigins(call.toolName, call.input, roots);
+  const { origins: named, pointed } = inputOrigins(
+    call.toolName,
+    call.input,
+    roots,
+    opts.inputSchemaOf ?? catalogSchema,
+  );
   // An MCP tool that names an origin returns whatever it returns; when that
   // is its own input, it read nothing.
   const origins =
     named.length > 0 && READERS[call.toolName] === undefined && echoesInput(text, call.input)
       ? []
-      : named;
-  const fetchedSomething = named.length > 0;
+      : [...named];
+  // A call pointed at an address returns that address's body, whatever the
+  // body looks like — never hits, whether or not the address was declared.
+  const fetchedSomething = pointed;
   // The URL line is tool-web's own header; read off any other tool it would
   // let a file or a page that merely opens with "URL: …" claim a URL.
   const header = call.toolName === WEB_FETCH ? webFetchHeader(text) : undefined;
@@ -834,6 +1177,8 @@ export type SessionLogEvidenceOptions = {
   readonly workspaceRoot?: string;
   /** Where the runtime spilled large results (see `EvidenceOptions.toolResultsRoot`). */
   readonly toolResultsRoot?: string;
+  /** The input schema each tool declared (see `EvidenceOptions.inputSchemaOf`). */
+  readonly inputSchemaOf?: InputSchemaLookup;
   /**
    * Told when a session's log could not be read to its end — a torn last
    * line from a crash mid-append, a malformed line, a link where the log
@@ -891,6 +1236,7 @@ export async function evidenceFromSessionLog(
   const roots: EvidenceOptions = {
     ...(opts.workspaceRoot !== undefined ? { workspaceRoot: opts.workspaceRoot } : {}),
     ...(opts.toolResultsRoot !== undefined ? { toolResultsRoot: opts.toolResultsRoot } : {}),
+    ...(opts.inputSchemaOf !== undefined ? { inputSchemaOf: opts.inputSchemaOf } : {}),
   };
   const visited = new Set<string>();
   const out: EvidenceRecord[] = [];
