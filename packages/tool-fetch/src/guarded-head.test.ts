@@ -34,6 +34,49 @@ function recordingFetch(answer: (req: Request) => Response): {
   };
 }
 
+/**
+ * A DNS lookup that never returns, installed now; resolves once a request
+ * waits on it, so a test stops the request there rather than on a timer.
+ */
+function hungLookup(): Promise<void> {
+  return new Promise((entered) => {
+    _setDnsLookup(() => {
+      entered();
+      return new Promise(() => {});
+    });
+  });
+}
+
+type Settled =
+  | { readonly settled: "pending" }
+  | { readonly settled: "resolved"; readonly value: unknown }
+  | { readonly settled: "rejected"; readonly error: unknown };
+
+/**
+ * Watch `call` from now on; `afterThisTurn()` says where it stands once
+ * everything already queued has run (microtasks drain before an
+ * immediate). No clock: what settles in this turn does so however loaded
+ * the machine is, and a request still waiting on something else is
+ * `pending`.
+ */
+function watch(call: Promise<unknown>): { readonly afterThisTurn: () => Promise<Settled> } {
+  let state: Settled = { settled: "pending" };
+  call.then(
+    (value) => {
+      state = { settled: "resolved", value };
+    },
+    (error: unknown) => {
+      state = { settled: "rejected", error };
+    },
+  );
+  return {
+    afterThisTurn: async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return state;
+    },
+  };
+}
+
 beforeEach(() => {
   _resetFetchConfig();
   _setRawFetch(undefined);
@@ -166,18 +209,29 @@ describe("guardedHead", () => {
   });
 
   test("the bound covers DNS: a lookup that never returns is cut off by the timeout and by the abort", async () => {
-    _setDnsLookup(() => new Promise(() => {}));
+    // No clock, so no load can make it look late: each request is stopped
+    // once it waits on the lookup, and must have answered by a point the
+    // event loop orders, not by a number of milliseconds.
     const raw = recordingFetch(() => new Response(null, { status: 200 }));
     raw.install();
-    const started = Date.now();
-    await expect(guardedHead("https://hung-dns.example/", { timeoutMs: 30 })).rejects.toThrow(
-      /timed out after 30ms/,
-    );
+    // The timeout: a timer armed after the request's own, and for longer,
+    // fires after it however late both are.
+    let inLookup = hungLookup();
+    const timedOut = watch(guardedHead("https://hung-dns.example/", { timeoutMs: 30 }));
+    await inLookup;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const late = await timedOut.afterThisTurn();
+    expect(late.settled).toBe("rejected");
+    expect(late.settled === "rejected" && String(late.error)).toMatch(/timed out after 30ms/);
+    // The abort answers in the turn it fires in — not at the 10 s default.
+    inLookup = hungLookup();
     const ctrl = new AbortController();
-    const pending = guardedHead("https://hung-dns.example/", { signal: ctrl.signal });
-    setTimeout(() => ctrl.abort(new Error("turn over")), 30);
-    await expect(pending).rejects.toThrow(/turn over/);
-    expect(Date.now() - started).toBeLessThan(2_000);
+    const aborted = watch(guardedHead("https://hung-dns.example/", { signal: ctrl.signal }));
+    await inLookup;
+    ctrl.abort(new Error("turn over"));
+    const now = await aborted.afterThisTurn();
+    expect(now.settled).toBe("rejected");
+    expect(now.settled === "rejected" && String(now.error)).toMatch(/turn over/);
     // Nothing was sent: the lookup never vetted an address.
     expect(raw.seen).toEqual([]);
   });

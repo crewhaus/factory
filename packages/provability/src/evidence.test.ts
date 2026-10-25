@@ -444,8 +444,12 @@ describe("recordFromCall origins", () => {
   test("an MCP hit's origin is read in time linear in its length", () => {
     // An MCP response is untrusted (AGENTS.md Pillar 3): a url field of a
     // long run of dots inside angle brackets took quadratic time to classify
-    // (originOfValue → classifyDefinition). Timed against the same size of
-    // plain letters, the least of three runs, so a slow machine slows both.
+    // (originOfValue → classifyDefinition's trailing-punctuation pattern):
+    // 1.7 s for 50 000 dots, where the walk in from the end takes under a
+    // tenth of a millisecond. The regression is inside the regex engine, with
+    // nothing of ours to count, so the bound is absolute: a runner twenty
+    // times slower than a laptop still reads in a fortieth of it, and the
+    // pattern overshoots it thirtyfold on the laptop. The least of three runs.
     const fastest = (run: () => unknown): number => {
       let best = Number.POSITIVE_INFINITY;
       for (let i = 0; i < 3; i++) {
@@ -468,11 +472,7 @@ describe("recordFromCall origins", () => {
           roots,
         ),
       ]);
-    const n = 200_000;
-    const base = fastest(call(`<https://search.example/${"a".repeat(n)}x>`));
-    expect(fastest(call(`<https://search.example/${".".repeat(n)}x>`))).toBeLessThan(
-      base * 20 + 100,
-    );
+    expect(fastest(call(`<https://search.example/${".".repeat(50_000)}x>`))).toBeLessThan(50);
   }, 20_000);
 
   test("hit-shaped output the model could have written is not read as hits or headers", () => {

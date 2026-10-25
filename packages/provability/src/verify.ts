@@ -4061,6 +4061,13 @@ export function unverifiedBundle(
 }
 
 /**
+ * Citations the up-front HEAD collection in {@link verifyDocument} has
+ * examined: for a test to count with, as claim-ledger's `scanMeter` is.
+ * Only ever added to.
+ */
+export const headCollectMeter = { markers: 0 };
+
+/**
  * Verify every claim of `text` against `opts.evidence` at `opts.config`'s
  * floor, and return the proof bundle (design §5.3).
  *
@@ -4143,6 +4150,7 @@ export async function verifyDocument(text: string, opts: VerifyOptions): Promise
     collect: for (const { claim } of all) {
       for (const id of claim.markers) {
         if (urls.size >= MAX_HEAD_REQUESTS) break collect;
+        headCollectMeter.markers += 1;
         const source = definitions.get(id);
         const url = source !== undefined ? definitionUrl(source) : undefined;
         if (url === undefined || urls.has(url) || hostRefusal(run, url) !== undefined) continue;

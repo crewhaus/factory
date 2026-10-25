@@ -291,6 +291,16 @@ function isAtxHeading(text: string, at: number, lineEnd: number): boolean {
   return level >= 1 && level <= 6 && (end === lineEnd || text[end] === " " || text[end] === "\t");
 }
 
+/**
+ * What the block reader's lookups have read: one per character
+ * `isThematicBreak` or `thematicFrom`'s pass reads, one per open item
+ * `innermostItem` probes. These read again what the pass over the lines has
+ * already passed — a bullet's line, the stack of open items — so they are
+ * where nested bullets went quadratic; the pass itself reads each line
+ * once. For a test to count with, as `scanMeter` is. Only ever added to.
+ */
+export const blockMeter = { reads: 0 };
+
 /** Three or more of one of `-`, `*`, `_` from `at` to the line's end, with
  *  nothing else but spaces and tabs. */
 function isThematicBreak(text: string, at: number, lineEnd: number): boolean {
@@ -298,6 +308,7 @@ function isThematicBreak(text: string, at: number, lineEnd: number): boolean {
   if (char !== "-" && char !== "*" && char !== "_") return false;
   let marks = 0;
   for (let i = at; i < lineEnd; i++) {
+    blockMeter.reads += 1;
     const c = text[i];
     if (c === char) marks++;
     else if (c !== " " && c !== "\t") return false;
@@ -320,6 +331,7 @@ function thematicFrom(text: string, from: number, lineEnd: number): (at: number)
       let only = "";
       let count = 0;
       for (let i = lineEnd - 1; i >= from; i--) {
+        blockMeter.reads += 1;
         const c = text[i] as string;
         if (c === " " || c === "\t") continue;
         if (only === "") only = c;
@@ -440,6 +452,7 @@ function innermostItem(items: ReadonlyArray<number>, column: number): number {
   let hi = items.length - 1;
   let found = -1;
   while (lo <= hi) {
+    blockMeter.reads += 1;
     const mid = (lo + hi) >> 1;
     if ((items[mid] as number) <= column) {
       found = mid;

@@ -198,8 +198,11 @@ describe("extractNumbers — a digit of any script is read (design §6.3, §0-B)
 
 describe("extractNumbers — linear in the text", () => {
   // A fetched page and a tool result reach the number layer on every gated
-  // turn (design §10). The least of three runs, each timed against a text of
-  // the same size whose numeral has no zeros, so a slow machine slows both.
+  // turn (design §10). A bound in milliseconds, not against another text:
+  // read once, a numeral of 50,000 zeros takes under a millisecond, some
+  // 20 ms on a runner twenty times slower, and a run held up there while it
+  // waits for a core is still inside the bound; retried, it took 1.2 s here,
+  // six times over. The least of three runs: load only ever adds to a run.
   const fastest = (run: () => unknown): number => {
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < 3; i++) {
@@ -209,26 +212,21 @@ describe("extractNumbers — linear in the text", () => {
     }
     return best;
   };
-  const n = 200_000;
+  const n = 50_000;
   const zeros = `Ref 1${"0".repeat(n)}7 is on file.`;
-  const plain = `Ref 1${"2".repeat(n)}7 is on file.`;
 
   test("a run of zeros inside a numeral is read once", () => {
     // Trimming the trailing zeros with /0+$/ retried from every zero of the
     // run: "1" + 80,000 zeros + "1" took seconds, 200,000 would take minutes.
     expect(extractNumbers(zeros)).toEqual([`1.${"0".repeat(n)}7e${n + 1}`]);
-    const base = fastest(() => extractNumbers(plain));
-    expect(fastest(() => extractNumbers(zeros))).toBeLessThan(base * 20 + 100);
-    expect(fastest(() => containsValue(zeros, "7"))).toBeLessThan(base * 20 + 100);
+    expect(fastest(() => extractNumbers(zeros))).toBeLessThan(200);
+    expect(fastest(() => containsValue(zeros, "7"))).toBeLessThan(200);
   }, 20_000);
 
   test("…and so is the figure rule, which keys every numeral of a source", () => {
     const claim = "The ref is on file.";
-    const base = fastest(() => locateClaim(claim, plain, { coverage: 0.8 }));
     expect(locateClaim(claim, zeros, { coverage: 0.8 }).status).toBe("supported");
-    expect(fastest(() => locateClaim(claim, zeros, { coverage: 0.8 }))).toBeLessThan(
-      base * 20 + 100,
-    );
+    expect(fastest(() => locateClaim(claim, zeros, { coverage: 0.8 }))).toBeLessThan(200);
   }, 20_000);
 });
 

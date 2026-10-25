@@ -80,22 +80,25 @@ describe("stripLean", () => {
 
   test("many strings strip in linear time", () => {
     // Looking back through the kept code for the `!` of `s!"…"` once per
-    // string is quadratic here: billions of steps. Timed against a text of
-    // the same size with no strings, the least of three runs, so a slow
-    // machine slows both (an absolute bound is a flake on a loaded runner).
-    const fastest = (run: () => unknown): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < 3; i++) {
-        const t = performance.now();
-        run();
-        best = Math.min(best, performance.now() - t);
-      }
-      return best;
-    };
-    const many = '"a" '.repeat(50_000);
-    expect(stripLean(many).length).toBe(many.length);
-    const base = fastest(() => stripLean("aaa ".repeat(50_000)));
-    expect(fastest(() => stripLean(many))).toBeLessThan(base * 20 + 100);
+    // string is quadratic here. The same text at n and 16n strings, timed
+    // interleaved, the least of three runs each: linear work grows about 16x
+    // and quadratic about 256x, so a bound of 64x sits 4x from each, and a
+    // loaded runner slows both sizes alike. A baseline of another shape, or
+    // an absolute bound, is a flake there.
+    const small = '"a" '.repeat(1_000);
+    const large = '"a" '.repeat(16_000);
+    expect(stripLean(large).length).toBe(large.length);
+    let smallMs = Number.POSITIVE_INFINITY;
+    let largeMs = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < 3; i++) {
+      let t = performance.now();
+      stripLean(small);
+      smallMs = Math.min(smallMs, performance.now() - t);
+      t = performance.now();
+      stripLean(large);
+      largeMs = Math.min(largeMs, performance.now() - t);
+    }
+    expect(largeMs).toBeLessThan(smallMs * 64 + 20);
   }, 20_000);
 
   test("a «…» name is a name: a quote or comment opener inside it hides nothing", () => {

@@ -260,15 +260,32 @@ describe("createHeadResolver (default: tool-fetch's guarded HEAD)", () => {
   });
 
   test("a hung DNS lookup cannot hold the turn: the abort answers at once", async () => {
-    _setDnsLookup(() => new Promise(() => {}));
+    // No clock, so no load can make it look late: the turn ends while the
+    // lookup (which never returns) is in flight, and the resolver has
+    // answered by the end of that turn — not at the HEAD's own 10 s timeout.
+    const inLookup = new Promise<void>((entered) => {
+      _setDnsLookup(() => {
+        entered();
+        return new Promise(() => {});
+      });
+    });
     _setRawFetch(async () => new Response(null, { status: 200 }));
     const resolve = createHeadResolver(SOURCES);
     const ctrl = new AbortController();
-    const started = Date.now();
-    const pending = resolve("https://slow-dns.example/p", { signal: ctrl.signal });
-    setTimeout(() => ctrl.abort(new Error("turn over")), 30);
-    await expect(pending).rejects.toThrow();
-    expect(Date.now() - started).toBeLessThan(2_000);
+    let settled = "pending";
+    resolve("https://slow-dns.example/p", { signal: ctrl.signal }).then(
+      () => {
+        settled = "resolved";
+      },
+      () => {
+        settled = "rejected";
+      },
+    );
+    await inLookup;
+    ctrl.abort(new Error("turn over"));
+    // Microtasks drain before an immediate: what the abort settles, it settles by then.
+    await new Promise<void>((done) => setImmediate(done));
+    expect(settled).toBe("rejected");
   });
 
   test("the spec's source policy holds on a redirect hop: a hop to a denied host is no answer", async () => {

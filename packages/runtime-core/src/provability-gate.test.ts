@@ -3242,25 +3242,49 @@ describe("provability gate — where the turn streams, the gate answers for what
   });
 
   test("a long run of terminators before a tool call is read in linear time", async () => {
+    // The split is one regex, so there is no loop of ours to count: the
+    // check is the turn's GROWTH, the same turn at n and 8n, never a fixed
+    // budget that a loaded runner can blow. Linear grows at most 8x (1-3x
+    // here: the rest of the turn costs the same at both lengths); the
+    // quadratic splitter grew ~58x (8K: ~0.06 s, 64K: ~3.5 s). The 20x bound
+    // sits 2.5x above linear's worst and ~3x below the quadratic. At n and
+    // 4n the quadratic grew only ~16x, too near any bound linear noise
+    // stays under. Best of three each, interleaved, so one stall on either
+    // side cannot decide it.
+    const N = 8_000;
+    const turn = async (run: string, after: string, length: number): Promise<number> => {
+      const said = `Let me check the policy page.\n${run.repeat(length)}${after}`;
+      const adapter = scriptedAdapter([
+        [text(said), { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} }],
+        [text("Done — saved.")],
+      ]);
+      const gate = provGate([(t) => ({ ...VACUOUS, retryIndex: t.retryIndex })], {
+        onFail: "halt",
+      });
+      const started = performance.now();
+      await runSingle({ _adapter: adapter, tools: [lookup], provability: gate.provability });
+      const ms = performance.now() - started;
+      // The terminator run is kept as written; the narration before it is not.
+      expect([run, after, gate.turns.at(-1)?.finalText.startsWith(run.repeat(10))]).toEqual([
+        run,
+        after,
+        true,
+      ]);
+      return ms;
+    };
     for (const run of [".", "…", "!"]) {
       for (const after of ["", " ", "\n"]) {
-        const said = `Let me check the policy page.\n${run.repeat(100_000)}${after}`;
-        const adapter = scriptedAdapter([
-          [text(said), { type: "tool_use", id: "toolu_l1", name: "Lookup", input: {} }],
-          [text("Done — saved.")],
-        ]);
-        const gate = provGate([(turn) => ({ ...VACUOUS, retryIndex: turn.retryIndex })], {
-          onFail: "halt",
-        });
-        const started = performance.now();
-        await runSingle({ _adapter: adapter, tools: [lookup], provability: gate.provability });
-        // Quadratic took seconds at this length (100K: ~8 s); linear is milliseconds.
-        expect([run, after, performance.now() - started < 1_500]).toEqual([run, after, true]);
-        // The terminator run is kept as written; the narration before it is not.
-        expect(gate.turns.at(-1)?.finalText.startsWith(run.repeat(10))).toBe(true);
+        let small = Number.POSITIVE_INFINITY;
+        let large = Number.POSITIVE_INFINITY;
+        for (let i = 0; i < 3; i++) {
+          small = Math.min(small, await turn(run, after, N));
+          large = Math.min(large, await turn(run, after, 8 * N));
+        }
+        const growth = `${Math.round(small)} ms -> ${Math.round(large)} ms`;
+        expect([run, after, growth, large < 20 * small + 50]).toEqual([run, after, growth, true]);
       }
     }
-  }, 20_000);
+  }, 60_000);
 
   test("an empty final message is still the final one: the narration before its tool call is read for narration, not graded whole (I11)", async () => {
     // A model that ends the turn on an empty `end_turn` commits no message

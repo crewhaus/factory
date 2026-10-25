@@ -87,25 +87,45 @@ describe("foldText â€” what a reader cannot tell apart is one spelling (design Â
   });
 
   test("linear in the text", () => {
-    const fastest = (run: () => unknown): number => {
-      let best = Number.POSITIVE_INFINITY;
+    // One fold of a shape at 16n against sixteen folds of it at n back to
+    // back, the least of three of each, interleaved, from a collected heap,
+    // so load and garbage only ever add to a run. Linear is the same work
+    // both ways, quadratic sixteen times as much at 16n; the bound is four
+    // times, plus 100 ms for a busy runner to hold a run up once. Equal work,
+    // because a loaded runner stretches a run by the time it waits for a
+    // core, and a short run can finish between two waits that a longer one
+    // sits through. Never against a text of another shape, whose cost need
+    // not scale alike on another machine. Each size is one where moving,
+    // replacing or reading each character again from the word's start would
+    // cost far more than reading it once.
+    const linear = (make: (k: number) => string, n: number): string => {
+      const small = make(n);
+      const large = make(16 * n);
+      let sixteen = Number.POSITIVE_INFINITY;
+      let once = Number.POSITIVE_INFINITY;
       for (let i = 0; i < 3; i++) {
-        const t = performance.now();
-        run();
-        best = Math.min(best, performance.now() - t);
+        Bun.gc(true);
+        let start = performance.now();
+        for (let k = 0; k < 16; k++) foldText(small);
+        sixteen = Math.min(sixteen, performance.now() - start);
+        Bun.gc(true);
+        start = performance.now();
+        foldText(large);
+        once = Math.min(once, performance.now() - start);
       }
-      return best;
+      return once < sixteen * 4 + 100
+        ? "linear"
+        : `${sixteen.toFixed(1)} ms for 16 at n, ${once.toFixed(1)} ms for 1 at 16n`;
     };
-    const n = 50_000;
-    const base = fastest(() => foldText(`${"word ".repeat(n)}${at(0xe9)}`));
-    for (const text of [
-      `${`n${ZWSP}`.repeat(n)}t`,
-      at(0x0663).repeat(n),
-      `${`n${at(0x043e)}`.repeat(n)}t`,
-      at(0x1d7d1).repeat(n),
-      at(0x00b3).repeat(n),
-    ]) {
-      expect(fastest(() => foldText(text))).toBeLessThan(base * 20 + 100);
+    const shapes: Array<[string, (k: number) => string, number]> = [
+      ["ignorables in a word", (k) => `${`n${ZWSP}`.repeat(k)}t`, 1_500],
+      ["Arabic-Indic digits", (k) => at(0x0663).repeat(k), 375],
+      ["lookalikes in a word", (k) => `${`n${at(0x043e)}`.repeat(k)}t`, 320],
+      ["astral digits", (k) => at(0x1d7d1).repeat(k), 1_500],
+      ["superscript digits", (k) => at(0x00b3).repeat(k), 500],
+    ];
+    for (const [shape, make, n] of shapes) {
+      expect(`${shape}: ${linear(make, n)}`).toBe(`${shape}: linear`);
     }
   }, 30_000);
 });

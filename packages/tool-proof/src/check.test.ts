@@ -80,6 +80,36 @@ function artifactsIn(root: string): string[] {
   return existsSync(dir) ? readdirSync(dir).sort() : [];
 }
 
+type Settled =
+  | { readonly settled: "pending" }
+  | { readonly settled: "resolved"; readonly value: unknown }
+  | { readonly settled: "rejected"; readonly error: unknown };
+
+/**
+ * Watch `call` from now on; `afterThisTurn()` says where it stands once
+ * everything already queued has run (microtasks drain before an
+ * immediate). No clock: what settles in this turn does so however loaded
+ * the machine is, and a call still waiting on something else — a timer, a
+ * checker — is `pending`.
+ */
+function watch(call: Promise<unknown>): { readonly afterThisTurn: () => Promise<Settled> } {
+  let state: Settled = { settled: "pending" };
+  call.then(
+    (value) => {
+      state = { settled: "resolved", value };
+    },
+    (error: unknown) => {
+      state = { settled: "rejected", error };
+    },
+  );
+  return {
+    afterThisTurn: async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return state;
+    },
+  };
+}
+
 function builtinTools(root: string, extra: Partial<Parameters<typeof createProofTools>[0]> = {}) {
   return createProofTools({
     config: config("proven"),
@@ -605,15 +635,33 @@ describe("a checker that does not settle", () => {
   };
 
   test("an abort ends the call at once, and nothing is saved", async () => {
+    // No clock, so no load can make it look late: the abort comes while the
+    // check is under way, and the call has settled by the end of that turn —
+    // not at the backstop (formal.timeoutMs + the grace, a minute by
+    // default), and not when the checker, which never answers, does.
     const root = dirs.make();
-    const run = fakeRun({ signal: AbortSignal.timeout(50) });
-    const tools = createProofTools({ proofsRoot: root, checkers: [never] });
-    const started = performance.now();
-    const err = await tools.proofCheck
-      .execute({ checker: "stuck", ...MEETINGS }, run.ctx)
-      .catch((e: unknown) => e as Error);
-    expect((err as Error).message).toBe("ProofCheck was cancelled; nothing was saved");
-    expect(performance.now() - started).toBeLessThan(5_000);
+    const ctrl = new AbortController();
+    const run = fakeRun({ signal: ctrl.signal });
+    let entered = (): void => {};
+    const checking = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const stuck: ProofChecker = {
+      ...never,
+      check: (input) => {
+        entered();
+        return never.check(input);
+      },
+    };
+    const tools = createProofTools({ proofsRoot: root, checkers: [stuck] });
+    const call = watch(tools.proofCheck.execute({ checker: "stuck", ...MEETINGS }, run.ctx));
+    await checking;
+    ctrl.abort();
+    const state = await call.afterThisTurn();
+    expect(state.settled).toBe("rejected");
+    expect(state.settled === "rejected" && (state.error as Error).message).toBe(
+      "ProofCheck was cancelled; nothing was saved",
+    );
     expect(artifactsIn(root)).toEqual([]);
     expect(run.events.filter((e) => e.kind === "proof_checked")).toEqual([]);
   });

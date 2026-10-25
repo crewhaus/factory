@@ -6,6 +6,39 @@ import { isQuestion } from "./sentences";
 const texts = (text: string, minTokens?: number) =>
   extractClaims(text, minTokens === undefined ? {} : { minTokens }).map((c) => c.text);
 
+/**
+ * "linear" when one read of `make(16 * n)` takes under four times as long as
+ * sixteen reads of `make(n)` back to back, plus 100 ms for a busy runner to
+ * hold a run up once: the same work when the reading is linear, sixteen
+ * times as much when it is quadratic. Equal work on both sides, because a
+ * loaded runner stretches a run by the time it waits for a core: a short
+ * run can finish between two waits that a run four times as long sits
+ * through, so a short run against a long one fails where nothing is wrong.
+ * The same shape at both sizes, never a different one, whose cost need not
+ * scale alike on another machine; the least of three of each, interleaved,
+ * from a collected heap, so load and garbage only ever add to a run.
+ * Otherwise the two times, for the failure to show.
+ */
+const readsLinearly = (make: (n: number) => string, n: number): string => {
+  const small = make(n);
+  const large = make(16 * n);
+  let sixteen = Number.POSITIVE_INFINITY;
+  let once = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < 3; i++) {
+    Bun.gc(true);
+    let start = performance.now();
+    for (let k = 0; k < 16; k++) extractClaims(small);
+    sixteen = Math.min(sixteen, performance.now() - start);
+    Bun.gc(true);
+    start = performance.now();
+    extractClaims(large);
+    once = Math.min(once, performance.now() - start);
+  }
+  return once < sixteen * 4 + 100
+    ? "linear"
+    : `${sixteen.toFixed(1)} ms for 16 at n, ${once.toFixed(1)} ms for 1 at 16n`;
+};
+
 describe("extractClaims — what is a claim", () => {
   test("cited and uncited claims, in order, with their markers", () => {
     const claims = extractClaims(
@@ -587,16 +620,11 @@ describe("extractClaims — markers and lines", () => {
   });
 
   test("a long token of glued capitals is read in linear time", () => {
-    const size = 100_000;
-    const time = (doc: string): number => {
-      const start = performance.now();
-      extractClaims(doc);
-      return performance.now() - start;
-    };
-    const base = time(`Is ${"a".repeat(size * 3)} fine?`);
-    expect(time(`Is ${".Ab".repeat(size)} fine?`)).toBeLessThan(base * 20 + 100);
-    expect(time(`Is x/${"y.Ab".repeat(size)} fine?`)).toBeLessThan(base * 20 + 100);
-  }, 20_000);
+    // Each full stop asks whether the token before it is a dotted name: read
+    // again from the token's start, that is quadratic in the token.
+    expect(readsLinearly((n) => `Is ${".Ab".repeat(n)} fine?`, 400)).toBe("linear");
+    expect(readsLinearly((n) => `Is x/${"y.Ab".repeat(n)} fine?`, 400)).toBe("linear");
+  }, 60_000);
 
   test("a table or a list before a question stays what it is without the question", () => {
     const table =
@@ -1271,26 +1299,18 @@ describe("extractClaims — a claim joined to a question is read (design §0, §
   });
 
   test("a question piece is read in linear time whatever its clauses and ends", () => {
-    const fastest = (run: () => unknown): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < 3; i++) {
-        const t = performance.now();
-        run();
-        best = Math.min(best, performance.now() - t);
-      }
-      return best;
-    };
-    const n = 20_000;
-    const base = fastest(() => extractClaims(`${"words here 3 ".repeat(n)}done.`));
-    for (const doc of [
-      `${"words, here ".repeat(n)}done?`,
-      `${"Is x.y ".repeat(n)}done?`,
-      `${"is it.it ".repeat(n)}done?`,
-      `${"a 3 — ".repeat(n)}done?`,
-      `${"[1]\n".repeat(n)}done?`,
-      `Is ${"x.Y".repeat(n)} fine?`,
-    ]) {
-      expect(fastest(() => extractClaims(doc))).toBeLessThan(base * 20 + 100);
+    // Each shape at a size where reading its every clause or end again from
+    // the piece's start would cost far more than reading it once.
+    const shapes: Array<[string, (n: number) => string, number]> = [
+      ["clauses", (n) => `${"words, here ".repeat(n)}done?`, 90],
+      ["initialisms", (n) => `${"Is x.y ".repeat(n)}done?`, 500],
+      ["names", (n) => `${"is it.it ".repeat(n)}done?`, 100],
+      ["figures", (n) => `${"a 3 — ".repeat(n)}done?`, 90],
+      ["marker lines", (n) => `${"[1]\n".repeat(n)}done?`, 500],
+      ["glued capitals", (n) => `Is ${"x.Y".repeat(n)} fine?`, 250],
+    ];
+    for (const [shape, make, n] of shapes) {
+      expect(`${shape}: ${readsLinearly(make, n)}`).toBe(`${shape}: linear`);
     }
   }, 60_000);
 });
@@ -1331,6 +1351,8 @@ describe("extractClaims agrees with citedClaims", () => {
   test("every marker citedClaims gives a declarative sentence is a marker of a claim here", () => {
     // A seeded generator of the shapes models write: prose, glued and spaced
     // markers, bullets, numbered items, quotes, headings, questions, code.
+    // Three hundred documents take 0.1 to 0.3 s here, so a runner twenty
+    // times slower can run past the default five seconds.
     let seed = 7;
     const rnd = (): number => {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -1416,7 +1438,7 @@ describe("extractClaims agrees with citedClaims", () => {
         }
       }
     }
-  });
+  }, 20_000);
 
   test("every marker on a line before a question is a marker of a claim", () => {
     // The shapes a question runs into: a figure line with no full stop, a
@@ -1474,40 +1496,17 @@ describe("extractClaims — linear in the document", () => {
   test("bullets nested deep, then many lazy lines under them", () => {
     // The gate reads model answers through this, synchronously. The shape
     // took 1.3 s at 195 KB (readBlocks scanned the open items per lazy
-    // line); timed against the same size with no nesting, the least of
-    // three runs, so a slow machine slows both.
-    const fastest = (run: () => unknown): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < 3; i++) {
-        const t = performance.now();
-        run();
-        best = Math.min(best, performance.now() - t);
-      }
-      return best;
-    };
-    const n = 50_000;
-    const nested = `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`;
-    const base = fastest(() => extractClaims(`${"y ".repeat(n)}x\n${"y\n".repeat(n)}`));
-    expect(fastest(() => extractClaims(nested))).toBeLessThan(base * 20 + 100);
+    // line).
+    expect(readsLinearly((n) => `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`, 3_000)).toBe("linear");
   }, 60_000);
 
   test("a question run into many lines, markers and glued questions", () => {
     // A question piece is cut from its end, each cut and marker read once.
-    const fastest = (run: () => unknown): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < 3; i++) {
-        const t = performance.now();
-        run();
-        best = Math.min(best, performance.now() - t);
-      }
-      return best;
-    };
-    const n = 10_000;
-    const base = fastest(() => extractClaims(`${"words here [1] ".repeat(n)}done.`));
-    const wrapped = `${"words here [1] ".repeat(n)}\n${"more\n".repeat(n)}more?`;
-    const glued = `Total is 5.${"Is it?".repeat(n)}`;
-    expect(extractClaims(glued).map((c) => c.text)).toEqual(["Total is 5."]);
-    expect(fastest(() => extractClaims(wrapped))).toBeLessThan(base * 20 + 100);
-    expect(fastest(() => extractClaims(glued))).toBeLessThan(base * 20 + 100);
+    const glued = (n: number): string => `Total is 5.${"Is it?".repeat(n)}`;
+    expect(extractClaims(glued(10_000)).map((c) => c.text)).toEqual(["Total is 5."]);
+    const wrapped = (n: number): string =>
+      `${"words here [1] ".repeat(n)}\n${"more\n".repeat(n)}more?`;
+    expect(readsLinearly(wrapped, 125)).toBe("linear");
+    expect(readsLinearly(glued, 500)).toBe("linear");
   }, 60_000);
 });

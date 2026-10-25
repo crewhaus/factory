@@ -68,8 +68,13 @@ describe("normalizeUrl", () => {
   });
 
   test("a long run of slashes inside the path is folded in linear time", () => {
-    // `/\/+$/` restarted at every slash of a run that does not end the path:
-    // 3 s for 80 000 of them, in a URL the model (or an MCP result) wrote.
+    // `/\/+$/` restarted at every slash of a run that does not end the path,
+    // in a URL the model (or an MCP result) wrote: 1.5 s for 50 000 of them,
+    // where the walk in from the end takes a quarter of a millisecond. The
+    // regression is inside the regex engine, with nothing of ours to count,
+    // so the bound is absolute: a runner twenty times slower than a laptop
+    // still folds in a tenth of it, and the pattern overshoots it twentyfold
+    // on the laptop. The least of three runs.
     const fastest = (run: () => unknown): number => {
       let best = Number.POSITIVE_INFINITY;
       for (let i = 0; i < 3; i++) {
@@ -79,12 +84,9 @@ describe("normalizeUrl", () => {
       }
       return best;
     };
-    const n = 200_000;
-    const base = fastest(() => normalizeUrl(`https://a.example/${"a".repeat(n)}x`));
-    expect(fastest(() => normalizeUrl(`https://a.example/${"/".repeat(n)}x`))).toBeLessThan(
-      base * 20 + 100,
-    );
-  });
+    const url = `https://a.example/${"/".repeat(50_000)}x`;
+    expect(fastest(() => normalizeUrl(url))).toBeLessThan(50);
+  }, 20_000);
 
   test("http and https stay distinct; non-http schemes and junk are not URLs", () => {
     expect(normalizeUrl("http://acme.example/x")).not.toBe(normalizeUrl("https://acme.example/x"));

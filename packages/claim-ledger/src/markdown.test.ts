@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { commonMarkFences, fencedSpans, readBlocks } from "./markdown";
+import { blockMeter, commonMarkFences, fencedSpans, readBlocks } from "./markdown";
 
 const blocks = (text: string): string[] =>
   commonMarkFences(text).map(([start, end]) => text.slice(start, end));
@@ -116,35 +116,33 @@ describe("readBlocks — list items", () => {
 });
 
 describe("readBlocks — linear in the document", () => {
-  // The least of three runs: load only ever adds to a run. Each shape is
-  // timed against a document of its size with no nesting, read the same
-  // way, so a slow machine slows both; the bound is twenty times that.
-  const fastest = (run: () => unknown): number => {
-    let best = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < 3; i++) {
-      const t = performance.now();
-      run();
-      best = Math.min(best, performance.now() - t);
-    }
-    return best;
+  // Counted, not timed (`blockMeter`): what the lookups read for a document
+  // and for one four times its size. Read once, that is at most five times
+  // as much — the open items are found by a binary search, two probes more
+  // per line at four times the depth — and read again per bullet or per
+  // line, sixteen times. No clock, so no machine is too slow for it.
+  const reads = (text: string): number => {
+    const before = blockMeter.reads;
+    readBlocks(text);
+    return blockMeter.reads - before;
   };
-  const n = 50_000;
+  const n = 5_000;
 
   test("bullets nested deep on one line", () => {
     // Asking for a thematic break at every bullet rescanned to the line's
     // end: 14 s for 80 KB of them.
-    const nested = `${"- ".repeat(n)}x`;
-    const base = fastest(() => readBlocks(`${"y ".repeat(n)}x`));
-    expect(readBlocks(nested).item[0]).toBe(1);
-    expect(fastest(() => readBlocks(nested))).toBeLessThan(base * 20 + 100);
-  }, 60_000);
+    const nested = (k: number): string => `${"- ".repeat(k)}x`;
+    expect(readBlocks(nested(n)).item[0]).toBe(1);
+    expect(reads(nested(n))).toBeGreaterThan(0);
+    expect(reads(nested(4 * n))).toBeLessThanOrEqual(5 * reads(nested(n)));
+  });
 
   test("bullets nested deep, then many lazy lines under them", () => {
     // Finding the item a lazy line is indented into scanned the open items
-    // from the innermost: 1.3 s for this, against 3 ms for the flat one.
-    const nested = `${"- ".repeat(n)}x\n${"y\n".repeat(n)}`;
-    const base = fastest(() => readBlocks(`${"y ".repeat(n)}x\n${"y\n".repeat(n)}`));
-    expect(readBlocks(nested).contained[n]).toBe(1);
-    expect(fastest(() => readBlocks(nested))).toBeLessThan(base * 20 + 100);
-  }, 60_000);
+    // from the innermost: 1.3 s for 50,000 lines under 50,000 bullets.
+    const nested = (k: number): string => `${"- ".repeat(k)}x\n${"y\n".repeat(k)}`;
+    expect(readBlocks(nested(n)).contained[n]).toBe(1);
+    expect(reads(nested(n))).toBeGreaterThan(n);
+    expect(reads(nested(4 * n))).toBeLessThanOrEqual(5 * reads(nested(n)));
+  });
 });

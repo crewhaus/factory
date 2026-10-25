@@ -30,12 +30,14 @@ import type {
 } from "./types";
 import {
   HEAD_CONCURRENCY,
+  HEAD_DEADLINE_MS,
   MAX_HEAD_REQUESTS,
   _setGroundingBudgetForTest,
   bareId,
   bundleHash,
   claimReasons,
   clipAround,
+  headCollectMeter,
   isToolAllowed,
   polarityMeter,
   statementMismatch,
@@ -2673,38 +2675,39 @@ describe("proven: a proof's hypotheses are assumptions, and a checker accepted i
 });
 
 describe("bounded work on what the model writes", () => {
-  const fastest = (run: () => unknown): number => {
+  // What the two linear-time tests below time is inside the regex engine
+  // when it regresses, so there is nothing of ours to count: each bound is
+  // absolute. On a CI runner twenty times slower than a laptop the linear
+  // code still takes a tenth of it at most; on the laptop the end-anchored
+  // pattern it replaced overshoots it fourfold at least, and on the runner
+  // far more. The least of three runs, so one descheduled run does not decide.
+  const fastest = async (run: () => unknown): Promise<number> => {
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < 3; i++) {
       const t = performance.now();
-      run();
+      await run();
       best = Math.min(best, performance.now() - t);
     }
     return best;
   };
 
-  test("a dressed id is trimmed in linear time, whatever the run of punctuation", () => {
+  test("a dressed id is trimmed in linear time, whatever the run of punctuation", async () => {
     expect(bareId("`toolu_01`.")).toBe("toolu_01");
     expect(bareId("<(prf_0123456789abcdef)>!?")).toBe("prf_0123456789abcdef");
     expect(bareId("(.)")).toBe("");
-    // An end-anchored class took 6 s on 80 000 dots that do not end the id.
-    const n = 200_000;
-    const base = fastest(() => bareId(`toolu_${"a".repeat(n)}x`));
-    expect(fastest(() => bareId(`toolu_${".".repeat(n)}x`))).toBeLessThan(base * 20 + 100);
-  });
+    // An end-anchored class took 2 s on 50 000 dots that do not end the id;
+    // walked in from each end, microseconds.
+    const id = `toolu_${".".repeat(50_000)}x`;
+    expect(await fastest(() => bareId(id))).toBeLessThan(50);
+  }, 20_000);
 
   test("a tool id or a URL with a long internal run is verified in linear time", async () => {
-    const n = 200_000;
-    const timed = async (text: string): Promise<number> => {
-      const t = performance.now();
-      await verify(text, { config: config("checked") });
-      return performance.now() - t;
-    };
-    const idBase = await timed(`The total is 4 [1].\n\n[1]: tool:toolu_${"a".repeat(n)}x`);
-    expect(await timed(`The total is 4 [1].\n\n[1]: tool:toolu_${".".repeat(n)}x`)).toBeLessThan(
-      idBase * 20 + 200,
-    );
-  }, 20_000);
+    // The whole verification of an 80 000-dot id: 5 ms on a laptop, so some
+    // 100 ms on a runner twenty times slower; through the end-anchored class,
+    // 4.2 s on the laptop.
+    const text = `The total is 4 [1].\n\n[1]: tool:toolu_${".".repeat(80_000)}x`;
+    expect(await fastest(() => verify(text, { config: config("checked") }))).toBeLessThan(1_000);
+  }, 30_000);
 
   test("HEADs go out a few at a time, under one deadline for the whole verification", async () => {
     const urls = Array.from({ length: 12 }, (_, i) => `https://h${i}.example/p`);
@@ -2713,7 +2716,6 @@ describe("bounded work on what the model writes", () => {
       .join("\n")}`;
     let inFlight = 0;
     let most = 0;
-    const t = performance.now();
     const bundle = await verify(text, {
       config: config("cited", { sources: { resolve: "head" } }),
       resolveHead: async () => {
@@ -2725,9 +2727,9 @@ describe("bounded work on what the model writes", () => {
       },
     });
     expect(bundle.met).toBe(12);
-    expect(most).toBeGreaterThan(1);
-    expect(most).toBeLessThanOrEqual(HEAD_CONCURRENCY);
-    expect(performance.now() - t).toBeLessThan(12 * 40);
+    // Counted, not timed: the pool fills to its width at once, so twelve
+    // HEADs take two waves of the slowest, not twelve.
+    expect(most).toBe(Math.min(HEAD_CONCURRENCY, urls.length));
     // Hosts that never answer: unresolved at the deadline, the rest checked.
     const aborted: string[] = [];
     const t2 = performance.now();
@@ -2744,13 +2746,18 @@ describe("bounded work on what the model writes", () => {
             )
           : Promise.resolve(200),
     });
-    expect(performance.now() - t2).toBeLessThan(2_000);
+    // The 150 ms asked for ends it, not the 15 s default. The bound, a
+    // quarter of the default, is some twenty-five times what this takes on
+    // a laptop, so a loaded runner's late timer still passes. The detail
+    // below is written from the option, not by the timer: only the clock
+    // tells which one fired.
+    expect(performance.now() - t2).toBeLessThan(HEAD_DEADLINE_MS / 4);
     expect(stalled.met).toBe(10);
     const late = stalled.claims.filter((c) => c.status === "unmet").map((c) => c.bindings[0]);
     expect(late.map((b) => b?.reason)).toEqual(["unresolved", "unresolved"]);
     expect(late[0]?.detail).toContain("ran past 150 ms");
     expect(aborted.sort()).toEqual(["https://h3.example/p", "https://h7.example/p"]);
-  });
+  }, 20_000);
 
   test("grounding reads at most its budget of fetched text, and yields between claims", async () => {
     const body = "The refund window is 30 days for every order placed online. ".repeat(50);
@@ -3688,34 +3695,32 @@ describe("proven: a frame that negates the proved statement", () => {
 });
 
 describe("bounded work: the HEADs an answer asks for", () => {
-  test("are collected in time linear in the URLs it cites", async () => {
-    const timed = async (n: number): Promise<number> => {
+  test("are collected no further than the cap, so in time linear in the URLs it cites", async () => {
+    // Counted, not timed. A list holding every URL the answer cites, searched
+    // once per URL, was quadratic in them (47 ms to 3.2 s for sixteen times
+    // the URLs). Collected no further than the cap, the collection reads the
+    // same few citations however long the answer grows.
+    const examined = async (n: number): Promise<number> => {
       const text = [
         Array.from({ length: n }, (_, i) => `Fact ${i} is here [${i + 1}].`).join(" "),
         "",
         ...Array.from({ length: n }, (_, i) => `[${i + 1}]: https://s${i}.example/t`),
       ].join("\n");
-      let best = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < 2; i++) {
-        let sent = 0;
-        const t = performance.now();
-        const bundle = await verify(text, {
-          config: config("cited", { sources: { resolve: "head" } }),
-          resolveHead: async () => {
-            sent += 1;
-            return 200;
-          },
-        });
-        best = Math.min(best, performance.now() - t);
-        expect([sent, bundle.met]).toEqual([MAX_HEAD_REQUESTS, MAX_HEAD_REQUESTS]);
-      }
-      return best;
+      let sent = 0;
+      const before = headCollectMeter.markers;
+      const bundle = await verify(text, {
+        config: config("cited", { sources: { resolve: "head" } }),
+        resolveHead: async () => {
+          sent += 1;
+          return 200;
+        },
+      });
+      expect([sent, bundle.met]).toEqual([MAX_HEAD_REQUESTS, MAX_HEAD_REQUESTS]);
+      return headCollectMeter.markers - before;
     };
-    const small = await timed(2_000);
-    // Sixteen times the URLs: a list searched once per URL took some seventy
-    // times as long (47 ms to 3.2 s); linear, about fifteen.
-    expect(await timed(32_000)).toBeLessThan(small * 30 + 100);
-  }, 30_000);
+    expect(await examined(200)).toBe(MAX_HEAD_REQUESTS);
+    expect(await examined(800)).toBe(MAX_HEAD_REQUESTS);
+  });
 });
 
 test("every UnmetReason is produced by some realistic input above", () => {

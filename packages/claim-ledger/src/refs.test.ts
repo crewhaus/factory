@@ -4,29 +4,31 @@ import { classifyDefinition, definitionGloss, isAssumptionMarker } from "./refs"
 
 describe("classifyDefinition — linear in the source", () => {
   // A source reaches this from the answer's definition lines and from every
-  // url/link field of an MCP result (design §10; AGENTS.md pillar 3). The
-  // least of three runs, timed against a URL of the same size with no
-  // punctuation run, so a slow machine slows both.
-  const fastest = (run: () => unknown): number => {
-    let best = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < 3; i++) {
-      const t = performance.now();
-      run();
-      best = Math.min(best, performance.now() - t);
-    }
-    return best;
-  };
+  // url/link field of an MCP result (design §10; AGENTS.md pillar 3).
   const n = 200_000;
 
   test("a punctuation run inside a URL is read once", () => {
     // Trimming with /[.,;:!?]+$/ retried from every character of the run:
-    // 80,000 dots then an "x" took four seconds.
-    const dotted = `https://a.example/${".".repeat(n)}x`;
-    const base = fastest(() => classifyDefinition(`https://a.example/${"y".repeat(n)}x`));
+    // 80,000 dots then an "x" took four seconds. A bound in milliseconds,
+    // not against another text: read once, a run of 50,000 takes a few
+    // microseconds, so a runner twenty times slower is still far inside it;
+    // retried, it took 1.6 s here, thirty times over. The least of three
+    // runs: load only ever adds to a run.
+    const fastest = (run: () => unknown): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i++) {
+        const t = performance.now();
+        run();
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const size = 50_000;
+    const dotted = `https://a.example/${".".repeat(size)}x`;
     expect(classifyDefinition(dotted)).toEqual({ kind: "url", url: dotted });
-    expect(fastest(() => classifyDefinition(dotted))).toBeLessThan(base * 20 + 100);
-    const bracketed = `<https://a.example/${";".repeat(n)}x>`;
-    expect(fastest(() => classifyDefinition(bracketed))).toBeLessThan(base * 20 + 100);
+    expect(fastest(() => classifyDefinition(dotted))).toBeLessThan(50);
+    const bracketed = `<https://a.example/${";".repeat(size)}x>`;
+    expect(fastest(() => classifyDefinition(bracketed))).toBeLessThan(50);
   }, 20_000);
 
   test("the trailing run is still dropped, whatever its length", () => {

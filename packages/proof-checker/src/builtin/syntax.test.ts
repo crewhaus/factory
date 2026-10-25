@@ -186,15 +186,31 @@ describe("parser — refusals carry a position", () => {
     // Each `let` doubles the expansion. The parser used to walk every use's
     // value for its free variables before the size cap ran: 26 lets took 3 s,
     // and each more doubled it (adversarial review, W1-D).
-    const lets = Array.from({ length: 40 }, (_, i) => `a${i + 1} = a${i} + a${i}`).join(", ");
-    const started = performance.now();
-    expect(failure(() => p(`let a0 = x, ${lets} in a40 = 0`))).toMatch(/expands to more than/);
+    const chain = (n: number): string =>
+      `let a0 = x, ${Array.from({ length: n }, (_, i) => `a${i + 1} = a${i} + a${i}`).join(", ")}`;
+    // An absolute bound on the best of up to three parses, sized from both
+    // sides where this was measured: the walk took 2.4 s at 26 lets, 24x the
+    // bound, and the parse takes about 0.2 ms, so a runner 20x slower passes.
+    // At 40 lets the walk would not finish, so this runs first.
+    const BOUND_MS = 100;
+    const fastest = (src: string): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3 && best >= BOUND_MS; i++) {
+        const started = performance.now();
+        const msg = failure(() => p(src));
+        best = Math.min(best, performance.now() - started);
+        expect(msg).toMatch(/expands to more than/);
+      }
+      return best;
+    };
+    expect(fastest(`${chain(26)} in a26 = 0`)).toBeLessThan(BOUND_MS);
     // Inside a quantifier domain, and with the capture check exercised.
-    expect(
-      failure(() => p(`let a0 = x, ${lets} in forall i in {a40}: forall y in {1}: a40 = i`)),
-    ).toMatch(/expands to more than/);
-    expect(performance.now() - started).toBeLessThan(1_000);
-  });
+    const inDomain = (n: number): string =>
+      `${chain(n)} in forall i in {a${n}}: forall y in {1}: a${n} = i`;
+    expect(fastest(inDomain(26))).toBeLessThan(BOUND_MS);
+    expect(failure(() => p(`${chain(40)} in a40 = 0`))).toMatch(/expands to more than/);
+    expect(failure(() => p(inDomain(40)))).toMatch(/expands to more than/);
+  }, 20_000);
 
   test("parsing spends from the budget: a cancelled signal stops it", () => {
     const ac = new AbortController();

@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { BUILTIN_LIMITS } from "./budget";
+import { BUILTIN_LIMITS, Budget } from "./budget";
 import {
   BUILTIN_CHECKER_ID,
   BUILTIN_LANGUAGE,
@@ -846,27 +846,59 @@ describe("rule: cases", () => {
       { id: "a", stmt: big, by: "given" },
       { id: "c", stmt: statement, by: "cases", from: Array.from({ length: n }, () => "a") },
     ];
+    // The bound is on the overrun, the time a check runs past its deadline,
+    // never on the budgeted time a loaded runner stretches up to it. Printing
+    // every premise outside the budget overran by 3 to 4 s where this was
+    // measured; a budgeted check stops within a few ms of its deadline. So
+    // 400 ms fails the first by 5x on a machine twice as fast and holds on a
+    // runner 20x slower, and the best of up to three runs rides out a stall.
+    const OVERRUN_MS = 400;
+    type Run = { verdict: BuiltinVerdict; overrunMs: number };
+    const once = (statement: string, proof: string, timeoutMs: number): Run => {
+      const started = performance.now();
+      const verdict = checkCertificate({ statement, proof, timeoutMs });
+      return { verdict, overrunMs: performance.now() - started - timeoutMs };
+    };
+    const leastOverrun = (
+      statement: string,
+      proof: string,
+      timeoutMs: number,
+      first: Run = once(statement, proof, timeoutMs),
+    ): Run => {
+      let best = first;
+      for (let i = 1; i < 3 && best.overrunMs >= OVERRUN_MS; i++) {
+        const next = once(statement, proof, timeoutMs);
+        if (next.overrunMs < best.overrunMs) best = next;
+      }
+      return best;
+    };
     // The original shape (a closed statement) now stops at the open given.
-    let started = performance.now();
-    const closed = checkCertificate({
-      statement: "forall i in {}: true",
-      proof: JSON.stringify(steps(2_000, "forall i in {}: true")),
-      timeoutMs: 1_000,
-    });
-    expect(closed.reason).toMatch(/the statement is closed/);
-    expect(performance.now() - started).toBeLessThan(1_000);
+    const closed = leastOverrun(
+      "forall i in {}: true",
+      JSON.stringify(steps(2_000, "forall i in {}: true")),
+      1_000,
+    );
+    expect(closed.overrunMs).toBeLessThan(OVERRUN_MS);
+    expect(closed.verdict.reason).toMatch(/the statement is closed/);
     // An open statement with a domain as long as the premise list: every
-    // comparison spends from the budget, so the deadline holds.
+    // comparison spends from the budget, so the check stops at its deadline.
+    // The steps before `cases` take about 50 ms where this was measured; a
+    // deadline that falls inside them never runs the rule under test, so a
+    // slower machine doubles the deadline until the rejection names step c.
     const statement = `forall i in 0..1999: ${body}`;
-    started = performance.now();
-    const open = checkCertificate({
-      statement,
-      proof: JSON.stringify(steps(2_000, statement)),
-      timeoutMs: 1_000,
-    });
-    expect(open.ok).toBe(false);
-    expect(open.reason).toMatch(/ran out of time|steps of work|no premise is the case/);
-    expect(performance.now() - started).toBeLessThan(3_000);
+    const proof = JSON.stringify(steps(2_000, statement));
+    const inCases =
+      /^step c \(cases\): (the check ran out of time|the check needs more than|no premise is the case)/;
+    let timeoutMs = 100;
+    let first = once(statement, proof, timeoutMs);
+    while (!inCases.test(first.verdict.reason ?? "") && timeoutMs < 3_200) {
+      timeoutMs *= 2;
+      first = once(statement, proof, timeoutMs);
+    }
+    const open = leastOverrun(statement, proof, timeoutMs, first);
+    expect(open.verdict.ok).toBe(false);
+    expect(open.verdict.reason).toMatch(inCases);
+    expect(open.overrunMs).toBeLessThan(OVERRUN_MS);
   }, 20_000);
 
   test("the domain must be closed", () => {
@@ -1075,16 +1107,29 @@ describe("rejection extras", () => {
     const heavy = "forall i in 1..10000: forall j in 1..99: i * j > 0";
     const ac = new AbortController();
     ac.abort();
-    const started = performance.now();
-    const v = checkCertificate({
-      statement: heavy,
-      proof: JSON.stringify([{ id: "a", stmt: "1 = 1", by: "mp" }]),
-      signal: ac.signal,
-    });
+    // Counted, not timed: the work units every Budget spends, the rejection
+    // path's own included. Evaluating `heavy` is about 6M of them; a budget
+    // tied to the aborted signal sees it within one 4 096-unit clock stride.
+    const tick = Budget.prototype.tick;
+    let work = 0;
+    Budget.prototype.tick = function (this: Budget, n = 1): void {
+      work += n;
+      tick.call(this, n);
+    };
+    let v: BuiltinVerdict;
+    try {
+      v = checkCertificate({
+        statement: heavy,
+        proof: JSON.stringify([{ id: "a", stmt: "1 = 1", by: "mp" }]),
+        signal: ac.signal,
+      });
+    } finally {
+      Budget.prototype.tick = tick;
+    }
+    expect(work).toBeLessThan(4_096);
     expect(v.reason).toMatch(/cancelled/);
     expect(v.counterexample).toBeUndefined();
     expect(v.output).not.toMatch(/hint/);
-    expect(performance.now() - started).toBeLessThan(500);
   });
 
   test("the deadline is capped at maxTimeoutMs whatever the caller asks", () => {
