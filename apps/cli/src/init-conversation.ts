@@ -49,7 +49,12 @@ import { type Spec, parseSpec } from "@crewhaus/spec";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
-import { ASK_USER_TOOL, EMIT_SPEC_TOOL, buildInterviewSystemPrompt } from "./init-interactive";
+import {
+  ASK_USER_TOOL,
+  EMIT_SPEC_TOOL,
+  type InitProvabilityLevel,
+  buildInterviewSystemPrompt,
+} from "./init-interactive";
 import { mapsARequirement } from "./model-reply-text";
 
 /** The saved-interview hint appended to every terminal-failure report and to
@@ -181,6 +186,12 @@ export type ConversationalInterviewOptions = {
   readonly model: string;
   /** `--resume`: restart the most recent persisted interview session. */
   readonly resume?: boolean;
+  /**
+   * 0.8.0 §11 — `--provability <rung>`: the proof question's answer, given up
+   * front. The interviewer is told it instead of asking (the caller still
+   * applies the flag to the emitted spec with `setProvability`).
+   */
+  readonly provability?: InitProvabilityLevel;
   /** Status-line sink; defaults to process.stdout. */
   readonly log?: (line: string) => void;
   // ---- injection seams (tests) ------------------------------------------
@@ -318,7 +329,9 @@ export async function runConversationalInterview(
 
   const common = {
     model: opts.model,
-    instructions: buildInterviewSystemPrompt(),
+    instructions: buildInterviewSystemPrompt(
+      opts.provability !== undefined ? { provability: opts.provability } : {},
+    ),
     tools,
     permissionMode: "default" as const,
     permissionRules: interviewRuleSet(),

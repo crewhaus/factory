@@ -2626,6 +2626,17 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "codegraphImpact",
     name: "CodeGraphImpact",
   },
+  proofCheckers: {
+    package: "@crewhaus/tool-proof",
+    export: "proofCheckers",
+    name: "ProofCheckers",
+  },
+  proofCheck: { package: "@crewhaus/tool-proof", export: "proofCheck", name: "ProofCheck" },
+  provabilityPreflight: {
+    package: "@crewhaus/tool-proof",
+    export: "provabilityPreflight",
+    name: "ProvabilityPreflight",
+  },
   // ---- scripts/wire-tool-package.ts inserts new builtins above this line ----
 
   // Shape-specific builtins. None of these is in a category or in the cli

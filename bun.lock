@@ -24,6 +24,7 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
         "@crewhaus/chunker": "workspace:*",
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/cloud-adapter-flyio": "workspace:*",
         "@crewhaus/cloud-adapter-heroku": "workspace:*",
         "@crewhaus/cloud-adapter-railway": "workspace:*",
@@ -50,6 +51,7 @@
         "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/evaluation-service": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/federation-discovery": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
@@ -88,6 +90,8 @@
         "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/prompt-optimizer-claude": "workspace:*",
+        "@crewhaus/proof-checker": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
         "@crewhaus/qr-code": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/regression-runner": "workspace:*",
@@ -176,10 +180,12 @@
         "@crewhaus/tool-pkg": "workspace:*",
         "@crewhaus/tool-pkgmgr": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
+        "@crewhaus/tool-proof": "workspace:*",
         "@crewhaus/tool-registry": "workspace:*",
         "@crewhaus/tool-registry-manifest": "workspace:*",
         "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-routing": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
         "@crewhaus/tool-secrets": "workspace:*",
@@ -465,6 +471,10 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/claim-ledger": {
+      "name": "@crewhaus/claim-ledger",
+      "version": "0.7.0",
+    },
     "packages/cloud-adapter-flyio": {
       "name": "@crewhaus/cloud-adapter-flyio",
       "version": "0.7.0",
@@ -714,8 +724,10 @@
       },
       "devDependencies": {
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-plan": "workspace:*",
+        "@crewhaus/tool-proof": "workspace:*",
         "@crewhaus/tool-wiki": "workspace:*",
       },
     },
@@ -813,6 +825,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "yaml": "^2.6.0",
@@ -890,11 +903,13 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/evaluation-service": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/grader-12-metric-rubric": "workspace:*",
         "@crewhaus/grader-continuity": "workspace:*",
         "@crewhaus/grader-multimodal": "workspace:*",
         "@crewhaus/grader-nlg-metrics": "workspace:*",
+        "@crewhaus/grader-provability": "workspace:*",
         "@crewhaus/grader-registry": "workspace:*",
         "@crewhaus/grader-safety-classifiers": "workspace:*",
         "@crewhaus/grader-semantic-similarity": "workspace:*",
@@ -907,6 +922,7 @@
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -930,6 +946,37 @@
         "@crewhaus/tool-web": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
+        "zod": "^3.23.8",
+      },
+    },
+    "packages/evaluation-service": {
+      "name": "@crewhaus/evaluation-service",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/default-skills": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/logging": "workspace:*",
+        "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/proof-checker": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/skills-registry": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-proof": "workspace:*",
+        "@crewhaus/tool-result-store": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "@crewhaus/tool-flow": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -1020,6 +1067,9 @@
         "@crewhaus/event-log": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/provability": "workspace:*",
+      },
     },
     "packages/gateway-server": {
       "name": "@crewhaus/gateway-server",
@@ -1038,6 +1088,7 @@
       "name": "@crewhaus/grader-12-metric-rubric",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
@@ -1049,6 +1100,7 @@
       "name": "@crewhaus/grader-continuity",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
@@ -1072,6 +1124,17 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
+      },
+    },
+    "packages/grader-provability": {
+      "name": "@crewhaus/grader-provability",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
     "packages/grader-registry": {
@@ -1151,6 +1214,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
@@ -1549,6 +1613,29 @@
         "@crewhaus/eval-dataset": "workspace:*",
       },
     },
+    "packages/proof-checker": {
+      "name": "@crewhaus/proof-checker",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-lean4": "workspace:*",
+        "@crewhaus/sandbox-image-z3": "workspace:*",
+      },
+    },
+    "packages/provability": {
+      "name": "@crewhaus/provability",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/claim-ledger": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+      },
+    },
     "packages/qr-code": {
       "name": "@crewhaus/qr-code",
       "version": "0.7.0",
@@ -1596,7 +1683,14 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/citation-tracker": "workspace:*",
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/crawler": "workspace:*",
       },
     },
     "packages/routing-store": {
@@ -1646,6 +1740,7 @@
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/prompt-cache-manager": "workspace:*",
         "@crewhaus/prompt-injection-detector": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
         "@crewhaus/rate-limiter": "workspace:*",
         "@crewhaus/recovery-engine": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
@@ -1713,6 +1808,15 @@
         "@crewhaus/sandbox-image-registry": "workspace:*",
       },
     },
+    "packages/sandbox-image-lean4": {
+      "name": "@crewhaus/sandbox-image-lean4",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
     "packages/sandbox-image-php": {
       "name": "@crewhaus/sandbox-image-php",
       "version": "0.7.0",
@@ -1750,6 +1854,15 @@
     },
     "packages/sandbox-image-rust": {
       "name": "@crewhaus/sandbox-image-rust",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/sandbox-image-registry": "workspace:*",
+      },
+    },
+    "packages/sandbox-image-z3": {
+      "name": "@crewhaus/sandbox-image-z3",
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
@@ -2011,6 +2124,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/evaluation-service": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
@@ -2054,6 +2168,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/evaluation-service": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
@@ -2122,12 +2237,16 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/evaluation-service": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/gateway-server": "workspace:*",
       },
     },
     "packages/target-onchain": {
@@ -2972,6 +3091,7 @@
         "@crewhaus/harness-lifecycle": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3230,6 +3350,27 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-proof": {
+      "name": "@crewhaus/tool-proof",
+      "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/proof-checker": "workspace:*",
+        "@crewhaus/provability": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/trace-event-bus": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-result-store": "workspace:*",
+      },
+    },
     "packages/tool-registry": {
       "name": "@crewhaus/tool-registry",
       "version": "0.7.0",
@@ -3403,6 +3544,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/vector-store": "workspace:*",
         "zod": "^3.23.8",
       },
@@ -3521,6 +3663,7 @@
       "name": "@crewhaus/tool-verify",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -3790,6 +3933,8 @@
 
     "@crewhaus/citation-tracker": ["@crewhaus/citation-tracker@workspace:packages/citation-tracker"],
 
+    "@crewhaus/claim-ledger": ["@crewhaus/claim-ledger@workspace:packages/claim-ledger"],
+
     "@crewhaus/cloud-adapter-flyio": ["@crewhaus/cloud-adapter-flyio@workspace:packages/cloud-adapter-flyio"],
 
     "@crewhaus/cloud-adapter-heroku": ["@crewhaus/cloud-adapter-heroku@workspace:packages/cloud-adapter-heroku"],
@@ -3866,6 +4011,8 @@
 
     "@crewhaus/eval-runner": ["@crewhaus/eval-runner@workspace:packages/eval-runner"],
 
+    "@crewhaus/evaluation-service": ["@crewhaus/evaluation-service@workspace:packages/evaluation-service"],
+
     "@crewhaus/event-log": ["@crewhaus/event-log@workspace:packages/event-log"],
 
     "@crewhaus/exporter-datadog": ["@crewhaus/exporter-datadog@workspace:packages/exporter-datadog"],
@@ -3895,6 +4042,8 @@
     "@crewhaus/grader-multimodal": ["@crewhaus/grader-multimodal@workspace:packages/grader-multimodal"],
 
     "@crewhaus/grader-nlg-metrics": ["@crewhaus/grader-nlg-metrics@workspace:packages/grader-nlg-metrics"],
+
+    "@crewhaus/grader-provability": ["@crewhaus/grader-provability@workspace:packages/grader-provability"],
 
     "@crewhaus/grader-registry": ["@crewhaus/grader-registry@workspace:packages/grader-registry"],
 
@@ -3988,6 +4137,10 @@
 
     "@crewhaus/prompt-optimizer-claude": ["@crewhaus/prompt-optimizer-claude@workspace:packages/prompt-optimizer-claude"],
 
+    "@crewhaus/proof-checker": ["@crewhaus/proof-checker@workspace:packages/proof-checker"],
+
+    "@crewhaus/provability": ["@crewhaus/provability@workspace:packages/provability"],
+
     "@crewhaus/qr-code": ["@crewhaus/qr-code@workspace:packages/qr-code"],
 
     "@crewhaus/queue-consumer": ["@crewhaus/queue-consumer@workspace:packages/queue-consumer"],
@@ -4018,6 +4171,8 @@
 
     "@crewhaus/sandbox-image-java": ["@crewhaus/sandbox-image-java@workspace:packages/sandbox-image-java"],
 
+    "@crewhaus/sandbox-image-lean4": ["@crewhaus/sandbox-image-lean4@workspace:packages/sandbox-image-lean4"],
+
     "@crewhaus/sandbox-image-php": ["@crewhaus/sandbox-image-php@workspace:packages/sandbox-image-php"],
 
     "@crewhaus/sandbox-image-r": ["@crewhaus/sandbox-image-r@workspace:packages/sandbox-image-r"],
@@ -4027,6 +4182,8 @@
     "@crewhaus/sandbox-image-ruby": ["@crewhaus/sandbox-image-ruby@workspace:packages/sandbox-image-ruby"],
 
     "@crewhaus/sandbox-image-rust": ["@crewhaus/sandbox-image-rust@workspace:packages/sandbox-image-rust"],
+
+    "@crewhaus/sandbox-image-z3": ["@crewhaus/sandbox-image-z3@workspace:packages/sandbox-image-z3"],
 
     "@crewhaus/secrets-manager": ["@crewhaus/secrets-manager@workspace:packages/secrets-manager"],
 
@@ -4245,6 +4402,8 @@
     "@crewhaus/tool-plan": ["@crewhaus/tool-plan@workspace:packages/tool-plan"],
 
     "@crewhaus/tool-proc": ["@crewhaus/tool-proc@workspace:packages/tool-proc"],
+
+    "@crewhaus/tool-proof": ["@crewhaus/tool-proof@workspace:packages/tool-proof"],
 
     "@crewhaus/tool-registry": ["@crewhaus/tool-registry@workspace:packages/tool-registry"],
 

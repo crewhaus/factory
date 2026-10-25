@@ -7,10 +7,14 @@ For day-to-day visibility on what's in flight, see the [GitHub Project](https://
 ## Versioning policy
 
 - Pre-1.0: minor versions can include breaking changes; we document them in the changelog.
-- The spec schema is versioned from day one (`spec_version: v0`).
+- The spec schema is versioned from day one (the optional top-level `version:` key, read as 0 when a spec leaves it out; the current schema version is 2, since v0.6.0, and `crewhaus upgrade` stamps and migrates older specs).
 - 1.0 ships when: schema is stable, the eval-driven optimization loop is documented and tested for at least three target shapes, and the boundary-classifier inventory is complete.
 
-## What's shipped (current: v0.6.0)
+## What's shipped (current: v0.8.0)
+
+**v0.8.0 — the provability release:** a spec can say how much proof its answers carry. The `provability:` block sets a floor on a four-rung ladder — `cited`, `grounded`, `checked`, `proven` — and as each answer completes, a deterministic gate checks every claim in it against the evidence the run recorded: sources it actually fetched, tool results it actually logged (pure tools are re-run to confirm them), and proofs a checker accepted. An answer that falls short is retried and, if it still falls short, served with a visible ✗; or escalated, served with the ✗ at once, or halted, as the spec says; and a proof bundle travels with every gated answer: a footer, a gateway `proof` field, a research report section, a trace line and a JSON file on disk. The gate runs on cli, channel, managed and research, and is off unless a spec turns it on. Around it: the `ProofCheckers`, `ProofCheck` and `ProvabilityPreflight` tools and three checkers (a built-in certificate checker, and Z3 and Lean 4 in curated sandbox images), the `crewhaus provability show | check | audit | checkers | prune` verbs, `init --provability`, `eval --provability`, the `provability.*` graders, and one composition root for both in-loop gates (`@crewhaus/evaluation-service`). Among the changes that reach every harness: `continuity.proof: require | off`, carried since v0.3.0, is enforced, and the agent's tools can no longer write the run's own record (its session logs, spilled tool results and proof bundles), shell commands and `--permission-mode bypass` aside. v0.8.0 also ships the v0.7.1 hardening, which was never tagged on its own. Design: [design/0.8.0-provability-release.md](design/0.8.0-provability-release.md); the [changelog](CHANGELOG.md) lists every change that affects a harness without the block.
+
+**v0.7.x — tools a harness can run without spending a token:** v0.7.0 grew the builtin catalog to hundreds of tools — text, structured data, dates, exact money, git and packages, chain and ledger reads, fleet and eval operations — almost none of which makes a model call, and `tools:` gained a grammar for granting a capability group at a time (`all-code`, `-bash`), with `crewhaus tools categories | show | search` to look inside it. It also brought `crewhaus hangar --lan` with a scannable QR code, and `crewhaus services setup`, which creates the Slack app, Cloudflare tunnel and Thredz space a spec declares. The 0.7.1 hardening, shipped inside v0.8.0, makes those tools safe to grant: a permission rule can no longer be dodged by spelling a call another way, tools stay inside the workspace, crafted input cannot freeze the harness, the model no longer picks which environment variable is sent as a credential, and every shape that runs tools can call them, with their `tool_config` (the [changelog](CHANGELOG.md) names the exceptions).
 
 **v0.6.0 — per-model settings and hybrid setups:** a spec names every model it uses in a top-level `models:` registry, references any of them as `$profile` at any model slot, and gives each its own tools, request parameters and permissions. Several models can then work in one loop — a cheap one drafting and a strong one checking (`evaluation.on_fail: escalate`), a guide briefing the turn, a committee voting, a shadow candidate auditioning off to the side, or the model itself calling `Consult` / `Escalate`. Routing decisions are durable and replayable (`crewhaus route explain`), learned routing gains profile-keyed arms, a quality floor and a freeze switch, and `crewhaus eval --routing` measures what production actually serves, per arm, with a leaderboard that declines to name a winner on underpowered data. New verbs: the `crewhaus models` family and a grown `crewhaus route`. Specs move to `version: 2` — run `crewhaus upgrade`. See the [changelog](CHANGELOG.md) for the behaviour changes this release sanctions.
 
@@ -27,7 +31,7 @@ Releases between v0.3.1 and v0.6.0 — the v0.4.x agent-loops line and the v0.5.
 - `crewhaus-runtime-core` — runtime-thin imports for generated bundles
 - The CLI surface, grown well past the original six (`init`, `compile`, `run`, `optimize`, `validate`, `doctor`) to include `eval`, `lint`, `flywheel`, `advise`, `route`, `deploy`/`propose`, `fleet`, and more — see the [CLI reference](https://github.com/crewhaus/docs/blob/main/CLI-REFERENCE.md)
 - Eval-driven optimization: rule-based and Claude-driven `MutationProvider`s; spec-patch with YAML CST round-trip
-- Boundary classifier with `TrustOrigin` metadata across the nine boundary sites (MCP, sub-agent, channel, federation, skill, compaction, tool, chain, memory — recalled wiki/fact bodies via tool-wiki)
+- Boundary classifier with `TrustOrigin` metadata across every boundary site (MCP, sub-agent, channel, federation, skill, compaction, tool, chain, memory for recalled wiki/fact bodies via tool-wiki, and since v0.6.0 consult for a roster sibling's reply)
 - Hello-world examples for: CLI, workflow, channel-{discord,telegram,whatsapp}, federation, graph, sandbox-image (multiple language variants)
 
 **v0.2.0 — the automation release** (the feedback loops now run themselves):
@@ -55,8 +59,7 @@ Releases between v0.3.1 and v0.6.0 — the v0.4.x agent-loops line and the v0.5.
 
 Still on the 0.3.x line:
 
-- Thredz backend wiring on the channel/managed/research/crew shapes (the `thredz:` block is carried there today; cli is emit-wired)
-- `proof: require | off` enforcement in tool-plan (carried; degrades to the ladder with a boot note)
+- Thredz backend wiring on the research shape (the `thredz:` block is carried there with a note; cli, channel, managed and crew are wired)
 - `crewhaus wiki push | pull --thredz` — the explicit local ↔ hosted knowledge bridge
 - Better integration with the Anthropic, OpenAI, Google, and open-source model providers
 
@@ -82,6 +85,22 @@ The underlying plugin/template marketplace primitives — `packages/plugin-regis
 - Improved active-eval optimization (more sophisticated mutation operators, better budget management)
 - Hardened boundary classifier with custom-policy support
 
+### v0.8.x — provability
+
+**Shipped in v0.8.0 — the provability release** (summarised under "What's shipped" above; design: [design/0.8.0-provability-release.md](design/0.8.0-provability-release.md)). The gate shares the turn-completion seam the `evaluation:` judge uses and runs before it; one composition root, `@crewhaus/evaluation-service`, builds both; and `continuity.proof: require | off`, deferred by v0.3.0, is enforced in tool-plan.
+
+Still on the 0.8.x line — each a seam the design names (§12), not an open question:
+
+- The pipeline (RAG) answer stage: verify the answer against the `Retrieve` hits it was given (until then the pipeline schema rejects `provability:`)
+- The crew orchestrator's synthesis turn (crew accepts the block today with an `accepted-but-unwired` warning)
+- `on_fail: retry` on research, as a per-branch re-run with the nudge (research degrades `retry` and `escalate` to `note` today, with a warning)
+- `kind: provability` gate steps on workflow and gate nodes on graph, beside `kind: judge`
+- The Hangar console's rung badge and bundle viewer (the server's `GET /api/runs/:sessionId/proof` ships)
+- Third-party proof checkers, registered through a plugin once the plugin loader exposes a `proofCheckers` slot
+- Evidence shared across a channel daemon's threads (`scope: session` follows the per-thread session today)
+
+And one direction the design leaves open (§10): keyed integrity on session-log lines, so a `Bash` or `RunCommand` write into the log cannot pass for recorded evidence. The runtime-state floor cannot see where a shell command writes, and `--permission-mode bypass` lifts it.
+
 ## v1.0 (target: Q4 2026, but driven by stability, not date)
 
 - Schema and CLI commands stable
@@ -105,4 +124,4 @@ Open an RFC issue. See [`CONTRIBUTING.md`](CONTRIBUTING.md). We expect to revise
 
 ---
 
-*Last updated: 2026-09-08. Subject to change.*
+*Last updated: 2026-10-24. Subject to change.*

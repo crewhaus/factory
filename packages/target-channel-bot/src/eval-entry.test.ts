@@ -188,3 +188,38 @@ describe("emitChannelBot — evalEntry variant (cluster S)", () => {
     expect(() => t.transformSync(entryOf(MIN_IR))).not.toThrow();
   });
 });
+
+describe("emitChannelBot — evalEntry under provability (0.8.0 §5.4, §9.1)", () => {
+  const PROVABILITY: NonNullable<IrChannelV0["provability"]> = {
+    level: "cited",
+    onFail: "note",
+    maxRetries: 1,
+    threshold: 1,
+    scope: "session",
+    assumptions: "allow",
+    render: "footer",
+    sources: { allow: [], deny: [], bibliographic: false, resolve: "off" },
+    grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+    execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+    formal: { checkers: ["builtin"], forbid: ["sorry"], timeoutMs: 30_000 },
+  };
+  const gated: IrChannelV0 = { ...MIN_IR, provability: PROVABILITY };
+
+  test("the shared agent.ts reads the footer target from its config; the bridge entry asks for none", () => {
+    const agent = agentOf(gated, { evalEntry: true });
+    expect(agent).toContain('  footerTarget?: "stream" | "reply" | "none";');
+    expect(agent).toContain('footerTarget: config.footerTarget ?? "reply"');
+    expect(entryOf(gated)).toContain('    footerTarget: "none",');
+    const t = new Bun.Transpiler({ loader: "ts" });
+    expect(() => t.transformSync(agent)).not.toThrow();
+    expect(() => t.transformSync(entryOf(gated))).not.toThrow();
+  });
+
+  test("the daemon's own agent.ts keeps the reply footer, and an ungated bridge gains nothing", () => {
+    const plain = agentOf(gated);
+    expect(plain).toContain('footerTarget: "reply"');
+    expect(plain).not.toContain("config.footerTarget");
+    expect(agentOf(MIN_IR, { evalEntry: true })).not.toContain("footerTarget");
+    expect(entryOf(MIN_IR)).not.toContain("footerTarget");
+  });
+});

@@ -25,7 +25,13 @@
       "path": "../eval-judge"
     },
     {
+      "path": "../evaluation-service"
+    },
+    {
       "path": "../event-log"
+    },
+    {
+      "path": "../grader-provability"
     },
     {
       "path": "../hooks-engine"
@@ -44,6 +50,9 @@
     },
     {
       "path": "../permission-engine"
+    },
+    {
+      "path": "../provability"
     },
     {
       "path": "../run-context"

@@ -96,6 +96,28 @@ describe("WebFetch — happy path", () => {
     expect(result).toContain("Example Domain");
   });
 
+  test("after a redirect the header names the page served first, then the URL asked for", async () => {
+    const asked: string[] = [];
+    _setRawFetch(async (req: Request) => {
+      asked.push(req.url);
+      return req.url === "http://acme.example/old"
+        ? new Response(null, { status: 301, headers: { location: "https://acme.example/new/" } })
+        : new Response("Refunds are accepted within 14 days.", {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          });
+    });
+    const result = await webFetch.execute({ url: "http://acme.example/old" });
+    if (typeof result !== "string") throw new Error("expected string result");
+    expect(asked).toEqual(["http://acme.example/old", "https://acme.example/new/"]);
+    expect(result).toBe(
+      "URL: https://acme.example/new/\nRequested: http://acme.example/old\nStatus: 200\nContent-Type: text/plain\n\nRefunds are accepted within 14 days.",
+    );
+    // No redirect: the URL asked for is the page, named once.
+    const direct = await webFetch.execute({ url: "https://acme.example/new/" });
+    expect(direct).toStartWith("URL: https://acme.example/new/\nStatus: 200\n");
+  });
+
   test("plain text passes through unchanged", async () => {
     _setRawFetch(
       async () =>

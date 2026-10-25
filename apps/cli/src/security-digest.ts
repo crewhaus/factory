@@ -105,8 +105,11 @@ const TOP_N = 10;
  * valid `AuditKind` — it is a subset check, not an exhaustiveness check. It
  * does NOT catch a NEW kind added to the `AuditKind` union that this list
  * forgets to list (F7: `alert_raised`, added by the item-31 alert watchdog,
- * compiled cleanly for a while despite being absent here). Keep this list in
- * sync BY HAND whenever `AuditKind` gains a member.
+ * compiled cleanly for a while despite being absent here; 0.8.0's
+ * `provability_evaluated` and the earlier `feedback_recorded` were missed the
+ * same way). Keep this list in sync BY HAND whenever `AuditKind` gains a
+ * member — {@link DECLARED_AUDIT_KINDS_COMPLETE} below is the completeness
+ * check, so `tsc -b` fails on the next kind this list forgets.
  */
 export const DECLARED_AUDIT_KINDS = [
   "policy_decision",
@@ -120,13 +123,33 @@ export const DECLARED_AUDIT_KINDS = [
   "deployment_action",
   "egress_decision",
   "permission_justification_evaluated",
+  // 0.8.0 (design §5.3) — one record per provability verification pass;
+  // absent in a window where a gated harness ran means the sink is unwired.
+  "provability_evaluated",
   "retention_enforcement",
   "governance_approval",
   "governance_proposal",
   "alert_raised",
   "slo_mitigation",
+  "feedback_recorded",
   "routing_promotion",
 ] as const satisfies ReadonlyArray<AuditKind>;
+
+/** Every `AuditKind` {@link DECLARED_AUDIT_KINDS} leaves out: `never` while the list is complete. */
+type UndeclaredAuditKind = Exclude<AuditKind, (typeof DECLARED_AUDIT_KINDS)[number]>;
+
+/**
+ * The completeness check `satisfies` cannot make. Its type is `true` only
+ * while {@link UndeclaredAuditKind} is `never`; otherwise it is the missing
+ * kind's name, and this `true` stops type-checking — `tsc -b` (the build and
+ * the CI typecheck; test files are not type-checked) fails HERE on the next
+ * kind added to the union, instead of the digest compiling cleanly and never
+ * reporting it absent (F7 `alert_raised`, `feedback_recorded`, 0.8.0's
+ * `provability_evaluated`).
+ */
+export const DECLARED_AUDIT_KINDS_COMPLETE: [UndeclaredAuditKind] extends [never]
+  ? true
+  : UndeclaredAuditKind = true;
 
 /** Thrown by `parseSinceFlag` on an unparseable `--since`. The CLI entry
  *  file catches it and routes the message through `die()`; tests assert on

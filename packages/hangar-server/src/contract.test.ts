@@ -41,6 +41,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createContinuityStore } from "@crewhaus/continuity-store";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -658,11 +659,23 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["items[].expiresInMs", "number|null"],
     ["items[].supersededBy", "string|null"],
   ),
+  // design/0.8.0 §6.3 — a step or goal is drawn from `statusLabel` and
+  // `provenByAssertion`, never `status` alone: a step proven by assertion
+  // (`continuity.proof: off`) carries `status: "proven"` too, and read bare
+  // it is a green proven nobody checked. The fixture seeds one of each.
   continuity: m3Read(
     ["specName", "string"],
     ["focus", "object|null"],
     ["plans", "array"],
+    ["plans[].steps[].status", "string"],
+    ["plans[].steps[].statusLabel", "string"],
+    ["plans[].steps[].provenByAssertion", "boolean"],
+    ["plans[].steps[].unverified", "array"],
     ["goals", "array"],
+    ["goals[].status", "string"],
+    ["goals[].statusLabel", "string"],
+    ["goals[].provenByAssertion", "boolean"],
+    ["goals[].unverified", "array"],
     ["trash", "object"],
     ["degraded", "string|null"],
   ),
@@ -1746,6 +1759,34 @@ function contractHarness(t: TestServer): string {
   });
 }
 
+/**
+ * A plan and a goal in the contract harness's continuity store, so the
+ * `continuity` read's step and goal rows exist to be checked: one step proven
+ * by assertion (`continuity.proof: off` — the row the Memory view must not
+ * draw as plain proven), one left open, and a goal proven the same way.
+ */
+async function seedContinuity(dir: string): Promise<void> {
+  const store = createContinuityStore({
+    specName: "contract-harness",
+    rootDir: join(dir, ".crewhaus", "state"),
+    sessionRootDir: join(dir, ".crewhaus", "sessions"),
+    now: () => new Date(NOW),
+  });
+  const plan = await store.createPlan({ title: "contract plan", steps: ["read", "write"] });
+  await store.proveStep(
+    plan.id,
+    1,
+    [{ toolUseId: "toolu_contract01", sessionId: "sess_00000000000000aa" }],
+    { verification: "unverified" },
+  );
+  const goal = await store.writeGoal({ title: "contract goal" });
+  await store.updateGoal(
+    goal.id,
+    { status: "proven", evidence: [{ toolUseId: "toolu_contract02" }] },
+    { verification: "unverified" },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // the drive
 // ---------------------------------------------------------------------------
@@ -1770,6 +1811,7 @@ describe("UI route contract", () => {
     const driven = new Set<string>();
     try {
       const dir = contractHarness(t);
+      await seedContinuity(dir);
       const fill = (template: string, params: Record<string, string>): string =>
         template.replace(/:([A-Za-z][A-Za-z0-9]*)/g, (_m, name: string) => {
           const v = params[name];

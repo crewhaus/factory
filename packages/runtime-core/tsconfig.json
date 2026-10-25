@@ -20,6 +20,7 @@
     { "path": "../model-router" },
     { "path": "../permission-engine" },
     { "path": "../prompt-injection-detector" },
+    { "path": "../provability" },
     { "path": "../recovery-engine" },
     { "path": "../routing-store" },
     { "path": "../run-context" },

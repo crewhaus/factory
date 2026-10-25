@@ -301,6 +301,7 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
         skills: [],
         failureTaxonomy: [],
         continuity: { loadPlan: async () => null },
+        provability: { level: "grounded", skill: "cite with [n]" },
         askMode: "pause",
         approvals: approvals as unknown as NonNullable<ParentRunHandle["approvals"]>,
         sandboxAvailable: true,
@@ -319,6 +320,8 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
       expect(handle.skills).toBe(bridge.skills);
       expect(handle.failureTaxonomy).toBe(bridge.failureTaxonomy);
       expect(handle.continuity).toBe(bridge.continuity);
+      // 0.8.0 §8 — the read-only provability seam reaches the child.
+      expect(handle.provability).toBe(bridge.provability);
       expect(handle.askMode).toBe("pause");
       expect(handle.approvals).toBe(bridge.approvals);
       // 0.7.1 — a child runs against the parent's sandbox backend.

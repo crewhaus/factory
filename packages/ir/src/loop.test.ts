@@ -7,7 +7,15 @@
  * hand-built (non-parseSpec) IR can express.
  */
 import { describe, expect, test } from "bun:test";
-import type { IrCrewV0, IrGraphV0, IrNode, IrV0, IrVoiceV0, IrWorkflowV0 } from "./index";
+import type {
+  IrCrewV0,
+  IrGraphV0,
+  IrNode,
+  IrProvability,
+  IrV0,
+  IrVoiceV0,
+  IrWorkflowV0,
+} from "./index";
 import { NO_BUDGET_WARNING, RING_TARGETS, SEGMENT_ORDER, projectLoop } from "./index";
 
 const minimalCli = (overrides: Partial<IrV0> = {}): IrV0 => ({
@@ -65,6 +73,49 @@ describe("projectLoop — ring basics", () => {
     expect(stop?.summary).toBe(
       "budget $1 (on exceed: degrade → cheap-model) · limits (max_tool_iterations)",
     );
+  });
+
+  // 0.8.0 (design §5.1) — the provability gate runs at the evaluation seam.
+  test("provability lights evaluate beside evaluation; its summary names the rung and on_fail", () => {
+    const provability: IrProvability = {
+      level: "grounded",
+      onFail: "retry",
+      maxRetries: 1,
+      threshold: 1,
+      scope: "session",
+      assumptions: "allow",
+      render: "footer",
+      sources: { allow: [], deny: [], bibliographic: false, resolve: "off" },
+      grounded: { coverage: 0.8, windowTokens: 60, independent: 1 },
+      execution: { allow: ["evaluate"], replay: true, maxReplays: 20 },
+      formal: { checkers: ["builtin", "smt"], forbid: ["sorry"], timeoutMs: 30_000 },
+    };
+    const alone = projectLoop(minimalCli({ provability })).ring?.segments.find(
+      (s) => s.id === "evaluate",
+    );
+    expect(alone?.active).toBe(true);
+    expect(alone?.keys).toEqual(["provability"]);
+    expect(alone?.summary).toBe("provability gate (grounded, on fail: retry)");
+
+    const both = projectLoop(
+      minimalCli({
+        evaluation: {
+          grader: { type: "contains", value: "ok" },
+          onFail: "halt",
+          maxRetries: 1,
+        },
+        provability: { ...provability, level: "checked", threshold: 0.9, maxRetries: 3 },
+      }),
+    ).ring?.segments.find((s) => s.id === "evaluate");
+    expect(both?.keys).toEqual(["evaluation", "provability"]);
+    expect(both?.summary).toBe(
+      "in-loop evaluation (contains, on fail: halt) · provability gate (checked, threshold 0.9, on fail: retry, ≤ 3 retries)",
+    );
+    // A retry cap means nothing when the gate does not retry.
+    const halt = projectLoop(
+      minimalCli({ provability: { ...provability, onFail: "halt", maxRetries: 3 } }),
+    ).ring?.segments.find((s) => s.id === "evaluate");
+    expect(halt?.summary).toBe("provability gate (grounded, on fail: halt)");
   });
 
   // 0.6.0 §7.12 — `budget.scope` shows in the stop summary only when declared.

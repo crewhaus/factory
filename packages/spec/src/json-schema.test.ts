@@ -24,6 +24,10 @@ const FIXTURES: Record<string, string> = {
     "evaluation:",
     "  grader: {type: llm_judge, criteria: helpful}",
     "limits: {max_tool_iterations: 10}",
+    "provability:",
+    "  level: grounded",
+    "  sources: {allow: ['*.gov']}",
+    "  grounded: {coverage: 0.7}",
   ].join("\n"),
   workflow: [
     "name: w",
@@ -89,6 +93,7 @@ const FIXTURES: Record<string, string> = {
     "target: research",
     "agent: {model: m, instructions: i}",
     "goal: learn",
+    "provability: cited",
   ].join("\n"),
   batch: [
     "name: b",
@@ -243,6 +248,83 @@ describe("specJsonSchema — document structure", () => {
     const evaluation = asRec(asRec(asRec(cli["properties"])["evaluation"])["properties"]);
     expect(asRec(evaluation["on_fail"])["enum"]).toEqual(["retry", "halt", "note", "escalate"]);
     expect(evaluation["allow_self_judge"]).toBeDefined();
+  });
+
+  test("0.8.0: provability is a property of exactly the five carrier shapes — a rung name or a strict object", () => {
+    const deref = (node: Rec): Rec => {
+      const ref = node["$ref"];
+      if (typeof ref !== "string") return node;
+      let cursor: unknown = schema;
+      for (const segment of ref.slice(2).split("/")) {
+        // `level` refs the shorthand arm: `…/provability/anyOf/0`.
+        cursor = Array.isArray(cursor) ? cursor[Number(segment)] : asRec(cursor)[segment];
+      }
+      return asRec(cursor);
+    };
+    const carriers = ["cli", "channel", "managed", "research", "crew"];
+    for (const target of Object.keys(FIXTURES)) {
+      const props = asRec(asRec(definitions[target])["properties"]);
+      expect({ target, carried: props["provability"] !== undefined }).toEqual({
+        target,
+        carried: carriers.includes(target),
+      });
+    }
+    const block = deref(asRec(asRec(asRec(definitions["cli"])["properties"])["provability"]));
+    expect(String(block["description"] ?? "")).toContain("0.8.0 provability");
+    const arms = block["anyOf"];
+    if (!Array.isArray(arms) || arms.length !== 2) throw new Error("expected 2 provability arms");
+    const shorthand = asRec(arms[0]);
+    expect(shorthand["enum"]).toEqual(["off", "cited", "grounded", "checked", "proven"]);
+    const object = asRec(arms[1]);
+    expect(object["additionalProperties"]).toBe(false);
+    expect(object["required"]).toEqual(["level"]);
+    const props = asRec(object["properties"]);
+    expect(Object.keys(props).sort()).toEqual(
+      [
+        "level",
+        "on_fail",
+        "max_retries",
+        "threshold",
+        "scope",
+        "assumptions",
+        "max_assumptions",
+        "render",
+        "sources",
+        "grounded",
+        "execution",
+        "formal",
+        "judge",
+      ].sort(),
+    );
+    // Every leaf carries a description (the VS Code forms read them), and
+    // every sub-block is strict.
+    for (const [key, raw] of Object.entries(props)) {
+      const node = deref(asRec(raw));
+      expect({ key, described: String(node["description"] ?? "").length > 0 }).toEqual({
+        key,
+        described: true,
+      });
+      if (node["type"] === "object") {
+        expect({ key, strict: node["additionalProperties"] }).toEqual({ key, strict: false });
+        for (const [leaf, leafRaw] of Object.entries(asRec(node["properties"]))) {
+          const leafNode = deref(asRec(leafRaw));
+          expect({ leaf, described: String(leafNode["description"] ?? "").length > 0 }).toEqual({
+            leaf,
+            described: true,
+          });
+        }
+      }
+    }
+    expect(asRec(props["on_fail"])["enum"]).toEqual(["retry", "halt", "note", "escalate"]);
+    expect(asRec(props["max_retries"])["maximum"]).toBe(5);
+    // The editor forms say what the formal keys DO (design §3, §6.4): the
+    // image overrides lean4 alone, and builtin is always among the checkers.
+    const formal = asRec(deref(asRec(props["formal"]))["properties"]);
+    const describe = (key: string): string =>
+      String(deref(asRec(formal[key]))["description"] ?? "");
+    expect(describe("image")).toContain("lean4 checker only");
+    expect(describe("image")).not.toContain("sandboxed checkers");
+    expect(describe("checkers")).toContain("added last when the list leaves it out");
   });
 
   test("key descriptions surface (Batch B blocks carry them)", () => {

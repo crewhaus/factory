@@ -45,6 +45,7 @@ import {
 import {
   type EgressMatcher,
   type EgressVerdict,
+  MIN_MATCH_LENGTH,
   type SinkScope,
   classifyEgress,
   summarizeEgress,
@@ -115,6 +116,15 @@ import {
   classifyText,
   llmClassifierEnabled,
 } from "@crewhaus/prompt-injection-detector";
+import {
+  type ProofBundle,
+  type ProvabilityLevel,
+  type UnmetReason,
+  claimReasons,
+  isProvabilityLevel,
+  summarizeBundle,
+  unverifiedBundle,
+} from "@crewhaus/provability";
 import { type BucketConfig, type RateLimiter, createRateLimiter } from "@crewhaus/rate-limiter";
 import {
   BUILTIN_FAILURE_CLASSES,
@@ -168,7 +178,7 @@ import {
   withJustificationField,
 } from "@crewhaus/tool-catalog";
 import { LOOP_TOOL_NAMES, resolveToolConfigEnv } from "@crewhaus/tool-categories";
-import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
+import { executeTool, operativeValuesFor, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
@@ -195,6 +205,7 @@ import {
 import { createMemoryEventLog, createMemorySessionStore } from "./ephemeral";
 import { type ExitRatingFeedback, FEEDBACK_EVENT_KIND, runExitRating } from "./exit-rating";
 import { type JsonSchemaLike, flattenUnionToObject } from "./flatten-union";
+import { createFooterLineGuard, neutralizeFooterLines } from "./forged-footer";
 import { attachIncidentCollector } from "./incident-collector";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
@@ -225,6 +236,7 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
+import { runtimeStateRoots } from "./state-roots";
 import {
   type ServingModel,
   type ToolLimitVerdict,
@@ -667,6 +679,11 @@ export type {
 // own module (`./janitor`) but is re-exported here because emitted bundles
 // only import the package root.
 export { createJanitor } from "./janitor";
+export {
+  GATE_RESOLVE_SINK_ID,
+  type LineageScreenOptions,
+  lineageEgressScreen,
+} from "./lineage-screen";
 export { JANITOR_BUILTIN_STEPS } from "./janitor";
 export type {
   CreateJanitorOptions,
@@ -1115,6 +1132,33 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
 }
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.3) — how many turns a
+ * replayed transcript (`replayMessageHistory`) already holds: its user
+ * messages that opened one, the ones `runContext.turnNumber` counted when
+ * they ran. A runtime-injected message (a retry nudge, a cascade correction,
+ * a continue prompt — still marked synthetic after the replay) opens none,
+ * nor does the carrier of a batch of tool results; a directive-only input
+ * never reaches the replay (it ran no turn). Nested transcripts (a peer's, a
+ * sub-agent's) are already outside it.
+ */
+function openedTurnCount(messages: ReadonlyArray<Anthropic.MessageParam>): number {
+  let opened = 0;
+  for (const message of messages) {
+    if (message.role !== "user" || isSyntheticMessage(message)) continue;
+    const content = message.content;
+    if (
+      typeof content !== "string" &&
+      content.length > 0 &&
+      content.every((block) => block.type === "tool_result")
+    ) {
+      continue;
+    }
+    opened += 1;
+  }
+  return opened;
+}
+
+/**
  * Pillar 3 (FR-004) intent gate — the durable audit sink the justification
  * gate appends to. Structurally a subset of `@crewhaus/audit-log`'s
  * `AuditLog` (its `append({ kind, payload })`), declared here as a minimal
@@ -1130,10 +1174,17 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
  * the documented verbatim shape `{ toolName, justification, verdict, reason,
  * judgeModel, confidence? }` (the justification IS the audit artifact — stored
  * verbatim, never redacted).
+ *
+ * 0.8.0 (design/0.8.0-provability-release.md §5.3) — the provability gate
+ * appends to the same hash-chained log: one `provability_evaluated` record
+ * per verification pass, carrying the bundle SUMMARY (`{ level, verdict,
+ * score, …, bundleHash, turnNumber, sessionId }`), never the bundle. Both
+ * kinds are AuditKinds `@crewhaus/audit-log` accepts, so a real `AuditLog`
+ * satisfies the widened union unchanged.
  */
 export type JustificationAuditSink = {
   append(input: {
-    readonly kind: "permission_justification_evaluated";
+    readonly kind: "permission_justification_evaluated" | "provability_evaluated";
     readonly payload: unknown;
   }): Promise<unknown>;
 };
@@ -1265,6 +1316,166 @@ export type AuxRequestParams = {
   readonly thinking?: ModelThinking;
   readonly maxTokens?: number;
   readonly temperature?: number;
+};
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.1) — what the injected
+ * provability verifier receives: the same completed-turn view the in-loop
+ * judge gets, plus where the turn sits (for the session-scoped evidence index
+ * and the bundle's file name) and which gate-triggered retry this is.
+ */
+export type ProvabilityTurn = EvaluationTurn & {
+  readonly turnNumber: number;
+  readonly retryIndex: number;
+  /** The run's session id, when it has one (evidence is read from its log). */
+  readonly sessionId?: string;
+  readonly signal?: AbortSignal;
+  /**
+   * 0.8.0 (design §6.2) — whether auxiliary spend has reached
+   * `budget.judge_share`, read live: past the share the paraphrase-waiver
+   * judge is skipped, not guessed. Absent (an unbudgeted run) ⇒ never.
+   */
+  readonly judgeShareExhausted?: () => boolean;
+  /**
+   * 0.8.0 (design §6.1, §10) — the run's durable egress sink, when one is
+   * wired: a `sources.resolve: head` request is an egress, and the verifier
+   * records each one it decides as an `egress_decision` (sink
+   * `provability.resolve`).
+   */
+  readonly egressAuditSink?: EgressAuditSink;
+  /**
+   * 0.8.0 (design §6.1, §10; AGENTS.md Pillar 3) — the sink-side check an
+   * egress the VERIFIER makes goes through before it is sent: `payload` (a
+   * cited URL, path and query included) is classified against the run's
+   * data lineage like a tool call to a destination the model chose
+   * (`external-dynamic`, the run's egress matcher), and the screen
+   * publishes the `permission_decision` trace event. On `block` the
+   * verifier sends nothing. The runtime always supplies it; a hand-wired
+   * verifier without it has no lineage to screen with.
+   */
+  readonly screenEgress?: (payload: string, sinkId: string) => Promise<GateEgressScreen>;
+};
+
+/** 0.8.0 — what {@link ProvabilityTurn.screenEgress} decided about one outbound payload. */
+export type GateEgressScreen = {
+  readonly verdict: "pass" | "warn" | "block";
+  /** Always `external-dynamic`: the destination is one the model wrote. */
+  readonly sinkScope: "external-configured" | "external-dynamic";
+  /** Origins of tagged content found in the payload (empty when none). */
+  readonly originsFound: ReadonlyArray<string>;
+  readonly matchCount: number;
+};
+
+/**
+ * 0.8.0 (design §5.1) — the provability gate seam (spec `provability:` on
+ * cli/channel/managed). After a turn COMPLETES, and BEFORE the `evaluation:`
+ * gate (if any) grades it — provability first, it is free and deterministic;
+ * the judge may spend — the injected `verify` checks every claim in the final
+ * text against the declared floor and returns a `ProofBundle`. Every attempt
+ * the turn produces is verified, an evaluation retry's and an escalation's
+ * included, and the judge grades only an answer the gate accepted or ran out
+ * of retries on. One `provability_graded` trace event + event-log line is
+ * published per pass. On `verdict: "fail"`:
+ *
+ *  - `onFail: "retry"` — the runtime appends a synthetic corrective user
+ *    message composed from the bundle (the unmet claims, the evidence each
+ *    cited, the reason — never fetched content) and re-runs the turn, up to
+ *    `maxRetries` times (re-runs the judge asks for are not counted here:
+ *    each gate keeps its own cap).
+ *  - `onFail: "halt"` — classified terminal stop: `run_failed` (class
+ *    `"provability"`, exit {@link EXIT_CODES.provability}).
+ *  - `onFail: "note"` — the failing event is the whole story; the answer stands.
+ *  - `onFail: "escalate"` — re-run the turn on the pool's escalation rung
+ *    (`escalateTo`, else the strongest candidate), then grade it like any
+ *    answer; it counts against `maxRetries` AND the turn's `max_escalations`
+ *    (shared with the evaluation cascade). Without a pool, note semantics
+ *    with one warning.
+ *
+ * Bundles are filed per SESSION turn: a resumed run (every channel message
+ * after a thread's first, a managed `runs.continue`, `--resume`) numbers its
+ * turns after the ones the session already ran.
+ *
+ * A verifier that THROWS is grading-infrastructure failure, not a verdict:
+ * logged, fail-open (the answer stands), and the bundle records
+ * `verdict: "unverified"` so no surface prints a ✓. Runtime-core never builds
+ * the verifier itself (`@crewhaus/evaluation-service` does), so it gains no
+ * dependency beyond the bundle TYPE. Absent → zero behaviour change.
+ */
+export type RunProvability = {
+  readonly level: ProvabilityLevel;
+  readonly onFail: "retry" | "halt" | "note" | "escalate";
+  /** Hard cap on gate-triggered re-runs (>= 0; resolved default 1). */
+  readonly maxRetries: number;
+  readonly threshold: number;
+  /** Under `onFail: "escalate"`: the roster arm to re-run on (resolved like `RunEvaluation.escalateTo`). */
+  readonly escalateTo?: string;
+  /** How the bundle shows beside the answer (`render`): a one-line footer, the JSON, or nothing. */
+  readonly render: "footer" | "none" | "json";
+  /**
+   * Where the rendered bundle goes: `"stream"` writes it to the run's output
+   * after the answer (cli); `"reply"` appends it to the text the run returns
+   * (a channel bot sends that text); `"none"` renders it nowhere — the caller
+   * carries the bundle itself (`onBundle`: the managed gateway's `proof`
+   * field, an eval bridge's artifact), so the returned text is the answer
+   * alone, the text a program consumes and a token meter counts. Default
+   * `"stream"`. Where there is no returned text to carry it — the REPL, and
+   * a `halt` — a `"reply"` footer is written to the output instead. It never
+   * enters the transcript either way.
+   *
+   * Where the reader reads the turn as it streams (the REPL, `"stream"`),
+   * every attempt is on screen before it is graded, so the gate answers for
+   * all of it: a rejected attempt gets its ✗ footer before the turn is
+   * re-run, and a final message that states nothing has the turn's whole
+   * printed text graded in its place (a claim made before a tool call, an
+   * earlier attempt it points back at). A `halt` there stops the run under
+   * the ✗ of an answer that has already printed — the classified stop and
+   * exit code are what refuse it.
+   */
+  readonly footerTarget?: "stream" | "reply" | "none";
+  /**
+   * Does the reader read this turn as it streams, whatever `footerTarget`
+   * says? `crewhaus run --prompt` prints every attempt to stdout as it is
+   * written and the footer rides the returned result (`"reply"`): there the
+   * turn streams too, so a rejected attempt is marked ✗ under it and a
+   * claimless final message has the turn's printed text graded. Absent ⇒
+   * read off `footerTarget` and the loop's mode (the REPL, or `"stream"`).
+   */
+  readonly streamed?: boolean;
+  /**
+   * The verifier. `turn.finalText` is the text graded: the terminal
+   * assistant message's, or — where the turn streams to its reader and that
+   * message states nothing — everything the turn printed (see
+   * `footerTarget`).
+   */
+  readonly verify: (turn: ProvabilityTurn) => Promise<ProofBundle>;
+  /** Render the bundle for `render` (footer line / JSON). Absent ⇒ nothing is rendered. */
+  readonly renderBundle?: (bundle: ProofBundle, bundlePath?: string) => string | undefined;
+  /** Compose the retry nudge from a failing bundle. */
+  readonly nudge: (bundle: ProofBundle) => string;
+  /**
+   * How a persisted bundle's path is shown on the run's LIVE surfaces — the
+   * `provability_graded` trace event (which `runs.subscribe` streams to a
+   * gateway client) and a `halt`'s failure detail — the footer's rule
+   * (design §5.3, §8): relative to the tenant's root inside a tenant scope,
+   * else the workspace. The durable event-log line keeps the path as
+   * persisted. Absent ⇒ shown as persisted.
+   */
+  readonly displayPath?: (bundlePath: string) => string;
+  /** Persist the bundle; returns where it landed. Failures are logged, never fatal. */
+  readonly persist?: (
+    bundle: ProofBundle,
+    at: { readonly sessionId?: string; readonly turnNumber: number },
+  ) => Promise<string | undefined>;
+  /** Observe every bundle (the gateway envelope, the research report, tests). */
+  readonly onBundle?: (bundle: ProofBundle, bundlePath?: string) => void;
+  /**
+   * 0.8.0 (design §8) — the rendered `provability` skill text. Never read by
+   * this loop's own gate: the bridge projects it, with `level`, as the
+   * READ-ONLY provability seam a Task child receives, so researcher children
+   * cite the way the parent's gate reads. Absent ⇒ children get the floor
+   * alone (the spawner's own framing).
+   */
+  readonly skill?: string;
 };
 
 /**
@@ -2712,6 +2923,15 @@ export type RunChatLoopOptions = {
    */
   evaluation?: RunEvaluation;
   /**
+   * 0.8.0 (design/0.8.0-provability-release.md §5.1) — the provability gate.
+   * See {@link RunProvability}. Runs on every completed attempt BEFORE
+   * `evaluation` grades it (provability first: free and deterministic, the
+   * judge may spend); a failing verdict re-runs the turn without a judge
+   * call, so a served answer has passed both gates when retries allow.
+   * Absent → zero behaviour change.
+   */
+  provability?: RunProvability;
+  /**
    * Loop contract 0.4 (Batch C, item 4) — the publishing agent's identity
    * fingerprint (the `agentId` from `loadOrCreateAgentIdentity`). When set AND
    * runChatLoop constructs the run context itself (no `opts.runContext`), the
@@ -3292,6 +3512,253 @@ function ownLimit(limits: Readonly<Record<string, unknown>>, toolName: string): 
   return Object.hasOwn(limits, toolName) && limits[toolName] !== undefined;
 }
 
+/** A transcript `tool_result` block's text: a string as is, the text blocks of an array joined. */
+function gateResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const texts: string[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const b = block as Record<string, unknown>;
+    if (b["type"] === "text" && typeof b["text"] === "string") texts.push(b["text"]);
+  }
+  return texts.join("\n");
+}
+
+/**
+ * §5.4 — a claimless final message that hands the reader an earlier answer
+ * again: "See above.", "As I said before.", "Same as my previous answer.".
+ * Where that earlier answer was rejected, its ✗ stands with it.
+ */
+const POINTS_BACK =
+  /\b(?:see|as|per)\s+(?:above|before|earlier|(?:my|the)\s+(?:previous|last|earlier|above)\s+(?:answer|reply|message|response))\b|\bas\s+(?:i\s+)?(?:said|stated|mentioned|noted)\b|\b(?:same|unchanged)\s+(?:as\s+)?(?:above|before)\b|^\s*(?:↑+|\^+)\s*$/i;
+
+/** The verbs an agent announces a tool call with, as a bare verb ("I can look …", "Step 1: fetch …"). */
+const ACTION_VERB =
+  "look|check|fetch|pull|search|find|get|read|open|load|query|call|run|grab|retrieve|verify|confirm|review|scan|browse|consult|research|investigate|book|save|write|create|send|update|cancel|schedule|submit|place|add|remove|delete|download|upload|process|prepare|draft|dig|try|start|contact|ping|help|take|see|do";
+
+/**
+ * The verbs "I can …" offers a tool call with ("I can look that up."): the
+ * fetch-style ones only. "I can see / confirm / verify / find / review /
+ * help / do / take …" opens what the agent says it knows ("I can confirm
+ * your refund has been processed."), and is read as written.
+ */
+const FETCH_VERB =
+  "look|check|fetch|pull|search|get|grab|retrieve|dig|query|load|open|read|browse|scan|run|try|book|save|draft|prepare|send|schedule|cancel|update|add|remove|create|write|submit|place|start|contact|ping|download|upload";
+
+/** The same verbs as a gerund opener ("Fetching the policy page."). */
+const ACTION_GERUND =
+  "looking|checking|double-checking|fetching|pulling|searching|finding|getting|reading|opening|loading|querying|calling|running|grabbing|retrieving|verifying|confirming|reviewing|scanning|browsing|consulting|researching|investigating|booking|saving|writing|creating|sending|updating|cancel(?:l)?ing|scheduling|submitting|placing|adding|removing|deleting|downloading|uploading|processing|preparing|drafting|digging|trying|starting|contacting|pinging|working";
+
+/**
+ * §5.4 — a sentence that only says what the agent is about to do, whatever
+ * its wording: "Let me fetch the refund policy page first.", "I'll save the
+ * note to your notes file now.", "Fetching the refund policy page.", "One
+ * moment while I look that up.", "Give me a second to check.", "I can look
+ * that up.", "Step 1: fetch the policy page." — an acknowledgement before it
+ * included ("Okay,", "Sure —", "Great question —", "To answer that,").
+ * Printed before a tool call, it is narration, not an answer the reader is
+ * handed. A gerund opener announces only while no verb of its own follows:
+ * "Processing the refund takes a few days." states something.
+ */
+const NARRATION = new RegExp(
+  [
+    "^(?:(?:ok(?:ay)?|now|next|first|then|alright|all right|sure|great|perfect|right|got it|understood|of course|certainly|absolutely|no problem|sounds good|thanks|thank you|good question|great question|happy to help",
+    "|to (?:answer|check|confirm|find|look|do|help|get|figure|see|verify)\\b[^,.!?—–]{0,40})",
+    "(?:\\s*[,!:—–-]\\s*|\\s+)){0,2}",
+    "(?:let me|let's|let us|allow me to|i'll|i will|i'm going to|i am going to|i'm gonna|i'm about to|i am about to",
+    "|i need to|i want to|i'd (?:like|need|want) to",
+    `|i can (?:${FETCH_VERB})\\b`,
+    "|i'm (?:now |first |just )?\\w+ing|i am (?:now |first |just )?\\w+ing",
+    "|(?:just )?(?:one|a) (?:moment|sec(?:ond)?|minute)|give me (?:a|one) (?:moment|sec(?:ond)?|minute)",
+    "|hold on|hang on|bear with me|stand by",
+    `|step \\d+[:.)]\\s+(?:${ACTION_VERB})`,
+    `|(?:now |first |just )?(?:${ACTION_GERUND})\\s+(?:the|your|my|our|a|an|that|this|these|those|it|them|for|up|into|through|over|on|in|at|now|with|out|back|again|some|all)\\b(?!.*\\b(?:is|are|was|were|isn't|aren't|wasn't|weren't|has|have|had|hasn't|haven't|takes?|took|costs?|requires?|means?|needs?|will|would|can|could|should|must|may|might|does|doesn't|did|didn't|gets?|got|makes?|made|includes?|lasts?|shows?|says?|said|returns?|returned)\\b))\\b`,
+  ].join(""),
+  "i",
+);
+
+/**
+ * A word that makes what follows a narration opener a statement: a finite
+ * "be" / "have" / "do", a modal, a negation's contraction, or a verb a
+ * statement of fact is made with ("Of course, I'll note that refunds are not
+ * allowed.", "Let me record that your plan costs $49 per month."). Narration
+ * that only announces a call carries none of these: "Let me fetch the refund
+ * policy page first." Third-person and past forms only, never a base verb
+ * ("Let me take a look.", "I'll have a look."), and not "may", which is a
+ * month as often ("Let me pull up your May invoice."). The list is closed on
+ * purpose — a word it misses is caught by the clause rules below or graded
+ * as written.
+ */
+const STATES =
+  /\b(?:is|are|was|were|isn't|aren't|wasn't|weren't|am|been|has|had|hasn't|haven't|hadn't|does|did|doesn't|don't|didn't|won't|can't|cannot|couldn't|shouldn't|wouldn't|will|would|can|could|should|must|might|shall|(?:it|that|there|here|this|what|who|he|she)'s|\w+'(?:re|ve)|takes|took|costs|requires|means|needs|gets|got|makes|made|includes|lasts|shows|says|said|told|returns|returned|covers|renews|went|came|became|began|owes|equals|totals|remains|seems|appears|looks like|expires|expired|applies|allows|contains|qualifies)\b/i;
+
+/** "that" opening a clause with its own subject ("I'll note that the window …"), not "look that up". */
+const THAT_CLAUSE =
+  /\bthat\s+(?:the|your|my|our|their|his|her|its|it|they|we|you|he|she|there|everything|nothing|all|each|every|no|refunds?|orders?)\b/i;
+
+/** An embedded question: what follows it asks, and asserts nothing ("Let me check whether the refund has gone through."). */
+const ASKS = /\b(?:if|whether|what|which|where|when|how|who|whom)\b/i;
+
+/** Where a clause of its own may begin: a comma, colon or semicolon before a space, or a dash. */
+const CLAUSE_BREAK = /[,;:](?=\s)|\s[-–—]\s|[—–]/;
+
+/** A clause after a break that adds nothing a reader could check ("…, please.", "— one moment."). */
+const AFTERTHOUGHT =
+  /^(?:please|thanks|thank you|for you|now|first|then|again|real quick|quickly|right away|right now|in a (?:moment|sec(?:ond)?|minute)|if (?:that's|that is) (?:ok(?:ay)?|alright|all right|fine)|if you don't mind|if that works|one (?:moment|sec(?:ond)?|minute)|just a (?:moment|sec(?:ond)?|minute)|bear with me|hang on|hold on)$/i;
+
+/** A clause after a break that goes on announcing a call ("…, then save a note."). */
+const ANNOUNCES_MORE = new RegExp(
+  `^(?:and |then |and then |or |so |before |after that )?(?:i'll |i will |i can |let me )?(?:${ACTION_VERB})\\b`,
+  "i",
+);
+
+/** Does `words` assert something, outside an embedded question it may end in? */
+function asserts(words: string): boolean {
+  const asked = ASKS.exec(words);
+  const said = asked === null ? words : words.slice(0, asked.index);
+  return STATES.test(said) || THAT_CLAUSE.test(said);
+}
+
+/**
+ * Does a narration sentence state something beyond its announcement? What
+ * follows the opener {@link NARRATION} matched is read clause by clause:
+ * the announcement's own clause states something when it asserts
+ * ({@link asserts}); every clause after a break ({@link CLAUSE_BREAK}) does
+ * unless it is an afterthought, goes on announcing, or is narration itself.
+ * "Hold on, refunds are not allowed on sale items.", "Looking at your
+ * account, your refund went through yesterday." and "Pulling up your order
+ * — it shipped Tuesday via UPS." state something; "Let me check the policy
+ * page, then save a note." does not.
+ */
+function statesSomething(plain: string, openerEnd: number): boolean {
+  const clauses = plain.slice(openerEnd).split(CLAUSE_BREAK);
+  if (asserts(clauses[0] ?? "")) return true;
+  for (const raw of clauses.slice(1)) {
+    const clause = raw
+      .trim()
+      .replace(/[.!?…]+$/, "")
+      .trim();
+    if (clause === "" || AFTERTHOUGHT.test(clause)) continue;
+    if (asserts(clause)) return true;
+    if (ANNOUNCES_MORE.test(clause)) continue;
+    const opener = NARRATION.exec(clause);
+    if (opener === null || statesSomething(clause, opener[0].length)) return true;
+  }
+  return false;
+}
+
+/** A figure as written: a run of digits with its inner separators ("4512", "10:30", "1,284.50", "2025-01-31"). */
+const FIGURE = /\d+(?:[.,:/-]\d+)*/g;
+
+/**
+ * A figure that names a thing rather than measures one: a label before it
+ * ("section 4", "order #4512", "ticket 88", "v2") or a year ("the 2025
+ * terms"). Narration that names one is still narration.
+ */
+const NAMING_LABEL =
+  /(?:#|\b(?:section|order|ticket|case|invoice|item|step|page|chapter|part|line|row|issue|pr|no\.|number|id|version|v|room|seat|flight|gate|account|ref|reference|clause|article|rule|question|q)\s*)$/i;
+
+/** Is the figure at `index` in `sentence` a name ({@link NAMING_LABEL}, a year)? */
+function namesAThing(sentence: string, figure: string, index: number): boolean {
+  return (
+    /^(?:19|20)\d\d$/.test(figure) ||
+    NAMING_LABEL.test(sentence.slice(Math.max(0, index - 16), index))
+  );
+}
+
+/**
+ * The figures `text` holds, each as written and each run of up to four of
+ * its parts ("10:30:00" holds "10:30" and "30"): a narration's figure is
+ * echoed when it is one of them. Built once, in one pass, so a long input or
+ * tool call costs a set lookup per figure, not a scan.
+ */
+function figuresIn(text: string, into: Set<string> = new Set<string>()): Set<string> {
+  const out = into;
+  for (const [figure] of text.matchAll(FIGURE)) {
+    out.add(figure);
+    // Digit runs at the even indexes, the separators between them at the odd.
+    const parts = figure.split(/([.,:/-])/);
+    for (let from = 0; from < parts.length; from += 2) {
+      let window = parts[from] ?? "";
+      out.add(window);
+      for (let to = from + 2; to < parts.length && to < from + 8; to += 2) {
+        window += `${parts[to - 1] ?? ""}${parts[to] ?? ""}`;
+        out.add(window);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The figures a tool call's input carries as values of their own: a number,
+ * a string that is one figure ("10:30", "4512"), or a string with no space
+ * in it (an id, a time, a URL or a path: "https://…/orders/4512"). A figure
+ * inside free text the call is handed (a note's `text`, a message's
+ * `body`) is the agent's own writing, not the call's argument: "I'll save a
+ * note that the window is 30 days." with `{text: "Refund window: 30 days"}`
+ * is graded. Walked to a bounded depth and breadth.
+ */
+function callFigures(input: unknown, into: Set<string>, depth = 0): void {
+  if (depth > 8) return;
+  if (typeof input === "number" && Number.isFinite(input)) {
+    figuresIn(String(input), into);
+    return;
+  }
+  if (typeof input === "string") {
+    if (input.length <= 2048 && !/\s/.test(input.trim())) figuresIn(input, into);
+    return;
+  }
+  if (typeof input !== "object" || input === null) return;
+  const values = Array.isArray(input) ? input : Object.values(input as Record<string, unknown>);
+  for (const value of values.slice(0, 256)) callFigures(value, into, depth + 1);
+}
+
+/**
+ * `text` with its narration sentences ({@link NARRATION}) taken out and the
+ * rest exactly as written — its lines too, so a definition line stays one.
+ * A sentence ends at a terminator that whitespace or the end follows, so a
+ * URL's dots or a decimal point do not cut it in two. A narration sentence
+ * with a marker in it stays, as does one with a figure the agent brings
+ * itself ("Let me note: the window is 30 days.", "I'll double-check the
+ * 30-day window."): that is a claim the reader was handed. A figure that
+ * names a thing ({@link namesAThing}: "section 4", "the 2025 terms"), or
+ * that `echo` holds ({@link figuresIn} the turn's own input, and the input
+ * of the tool calls the narration announces) is the reader's or the call's,
+ * not the agent's: "Let me book the 10:30 slot.", "Let me fetch
+ * https://…/policy/2024." stay narration. None of that exempts a sentence
+ * that states something past its announcement ({@link statesSomething}):
+ * "Let me confirm — yes, the refund window is 30 days." is graded however
+ * often the reader asked about 30 days.
+ *
+ * A sentence starts on a character that is no terminator, so a line of
+ * terminators is never re-read from inside (each start position used to
+ * walk the whole run again: quadratic on a long one); a run that opens a
+ * line is kept as written.
+ */
+function withoutNarration(text: string, echo: ReadonlyArray<ReadonlySet<string>>): string {
+  return text
+    .replace(/[^\n.!?…]+(?:[.!?…]+(?=[^\s.!?…])[^\n.!?…]*)*(?:[.!?…]+|$)/gm, (sentence) => {
+      const plain = sentence
+        .trim()
+        .replace(/^[*_>#\s-]+/, "")
+        .replace(/’/g, "'");
+      if (plain === "" || plain.includes("[")) return sentence;
+      const opener = NARRATION.exec(plain);
+      if (opener === null || statesSomething(plain, opener[0].length)) return sentence;
+      for (const found of plain.matchAll(FIGURE)) {
+        const figure = found[0];
+        if (!namesAThing(plain, figure, found.index) && !echo.some((held) => held.has(figure))) {
+          return sentence;
+        }
+      }
+      return "";
+    })
+    .replace(/[ \t]+$/gm, "")
+    .trim();
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
@@ -3608,6 +4075,61 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     );
   }
   const sessionRootDir = resolveSessionRootDir(opts.sessionRootDir);
+  // 0.8.0 (design §1 principle 1, §5.2) — the session logs, the spilled
+  // tool results and the proof bundles this run's gates read as evidence: no
+  // tool call the agent makes may write there, whatever a rule says
+  // (permission-engine's runtime-state floor, `./state-roots`).
+  const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  /**
+   * The floor's reading of a call: where it WRITES. Two kinds of field are
+   * left out, field by field:
+   *
+   *  - one declared `relocates` names the store a tool works in through its
+   *    own format (EmitTraceEvent's namespaced `custom.*` lines,
+   *    IncidentBundle's sessions it reads whole), not a file the call names;
+   *  - one declared `source` holds where the tool takes a value FROM (the
+   *    files IndexBuild indexes, the file DatasetPut reads, the reference
+   *    EnvFileUpsert copies a secret out of): reading a spilled output or a
+   *    session log forges nothing, and the runtime itself points the model
+   *    at a spill (`[truncated, full output at …]`), so a copy, an index or
+   *    an import of one is no write into the record (§1 principle 3: the
+   *    floor must not refuse what a harness without the block could do).
+   *
+   *  - one declared `reads` (or `readsWhen`, when the call names the field
+   *    it names) the tool only reads, writing where another field says:
+   *    CopyPath's and ArchiveCreate's `source`, ArchiveExtract's `archive`,
+   *    an importer's `file`. A backup of `.crewhaus` copies the record; it
+   *    writes none of it. MovePath's `source` is not one: a move takes it
+   *    away.
+   *
+   * Every other operative value counts — a secret reference's file included
+   * (SecretRotate's `ref` names the file it writes). `undefined` ⇒ the
+   * call's operative values as they are (a tool with neither kind of field).
+   */
+  const floorValuesOf = (
+    tool: RegisteredTool,
+    parsedInput: unknown,
+  ): ReturnType<typeof operativeValuesFor> => {
+    const args = tool.operativeArgs;
+    const named = (name: string): boolean => {
+      if (typeof parsedInput !== "object" || parsedInput === null) return false;
+      const value = (parsedInput as Record<string, unknown>)[name];
+      return value !== undefined && value !== null && value !== "";
+    };
+    const skipped = (arg: NonNullable<typeof args>[number]): boolean =>
+      arg.relocates === true ||
+      arg.source === true ||
+      arg.reads === true ||
+      (arg.readsWhen !== undefined && named(arg.readsWhen));
+    if (args === undefined || !args.some(skipped)) return undefined;
+    const written = args.filter((arg) => !skipped(arg));
+    if (written.length === 0) return [];
+    return (
+      operativeValuesFor({ ...tool, operativeArgs: written }, parsedInput, {
+        canonicalizePath: placeRecordingCanonicalizer().canonicalizePath,
+      }) ?? []
+    );
+  };
   const sessionStore: SessionStore = persistSession
     ? createSessionStore({ rootDir: sessionRootDir })
     : createMemorySessionStore();
@@ -4068,6 +4590,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // the cap bounds the conversation rather than one resumed run. Stays 0
   // under the default `run` scope.
   let resumedCostUsdMicros = 0;
+  // 0.8.0 (design §5.3) — the turns the resumed session already ran. The
+  // run's own counter (`runContext.turnNumber`) restarts at 0 on every run,
+  // and every channel message after a thread's first, every managed
+  // `runs.continue` and every `--resume` is a new run; a proof bundle is
+  // filed per SESSION turn (`<sessionId>/turn-<n>.json`, the audit artifact),
+  // so the gate numbers its turns from here (`provabilityTurn`). Nothing else
+  // reads it: the run-local counter keeps its meaning everywhere else.
+  let resumedTurns = 0;
   const budgetSessionScoped = opts.budget?.scope === "session";
   if (opts.resume) {
     const existing = await sessionStore.get(opts.resume.sessionId);
@@ -4081,6 +4611,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     resumedPin = existing.pin;
     const replayLog = await openEventLog(sessionId, { rootDir: sessionRootDir });
     resumedMessages = await replayMessageHistory(replayLog);
+    resumedTurns = openedTurnCount(resumedMessages);
     // One pass gathers both resume-time reads: the continuity ledger seed
     // (conditional) and the LAST recorded toolset (#405 — unconditional, so
     // the marker below can tell a resumed session its capabilities changed
@@ -4478,16 +5009,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const mdRenderer: StreamRenderer | undefined = isCliMarkdownEnabled()
     ? createCliMarkdownRenderer({ write: (s) => out.write(s) })
     : undefined;
+  const printText = (chunk: string): void => {
+    if (mdRenderer) mdRenderer.push(chunk);
+    else out.write(chunk);
+  };
+  // 0.8.0 (design §1 principle 2, §5.4) — under `provability:` a line of the
+  // answer shaped like the gate's footer streams with a mark saying the model
+  // wrote it (`./forged-footer`): the one verdict line the reader sees is the
+  // gate's. Without the block the text streams exactly as before.
+  const footerGuard = opts.provability !== undefined ? createFooterLineGuard(printText) : undefined;
   const writeText = (chunk: string): void => {
     // First real assistant text ends the "thinking" wait; clear the spinner
     // (idempotent on later chunks) before the answer streams.
     out.spinner.stop();
-    if (mdRenderer) mdRenderer.push(chunk);
-    else out.write(chunk);
+    if (footerGuard !== undefined) footerGuard.push(chunk);
+    else printText(chunk);
   };
   const endTurn = (): void => {
     // Covers the no-text/no-tool case where the spinner is still up.
     out.spinner.stop();
+    footerGuard?.end();
     if (mdRenderer) mdRenderer.end();
     out.write("\n");
   };
@@ -5078,6 +5619,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const bridgeContinuitySeam =
     opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+  //   - provability: READ-ONLY (0.8.0 §8). The floor and the skill text cross;
+  //     the verifier, the retry policy and the bundle store stay parent-side,
+  //     so only this loop's final text is ever gated.
+  const bridgeProvabilitySeam =
+    opts.provability !== undefined
+      ? {
+          level: opts.provability.level,
+          ...(opts.provability.skill !== undefined ? { skill: opts.provability.skill } : {}),
+        }
+      : undefined;
   // 0.7.1 — the models this run may name, so a sub-agent read from disk can
   // run on the parent's fallback or tier model, and on nothing unnamed.
   const bridgeSpecModels = specModelsOf(opts);
@@ -6042,6 +6593,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
     // (a decision-level meet — a profile can only tighten). The primary plan
     // carries the run's rules by reference, so a single-model run is unchanged.
+    const floorValues = tool.readOnly ? undefined : floorValuesOf(tool, subject.input);
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
@@ -6049,13 +6601,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ...(subject.operativeValues !== undefined
           ? { operativeValues: subject.operativeValues }
           : {}),
+        ...(floorValues !== undefined ? { floorValues } : {}),
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
       },
       permissionMode,
       servingPlan.permissionRules,
-      { sandboxAvailable: opts.sandboxAvailable === true },
+      { sandboxAvailable: opts.sandboxAvailable === true, protectedRoots },
     );
     const decision = decisionDetails.decision;
     bus.publish({
@@ -6217,6 +6770,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 readProgramPath: approvedView.readProgramPath,
                 ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
               });
+            const approvedFloor =
+              approvedSubject.ok && !tool.readOnly
+                ? floorValuesOf(tool, approvedSubject.input)
+                : undefined;
             const recheck = approvedSubject.ok
               ? evaluateWithReason(
                   {
@@ -6225,13 +6782,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     ...(approvedSubject.operativeValues !== undefined
                       ? { operativeValues: approvedSubject.operativeValues }
                       : {}),
+                    ...(approvedFloor !== undefined ? { floorValues: approvedFloor } : {}),
                     readOnly: tool.readOnly,
                     destructive: tool.destructive,
                     requiresSandbox: tool.requiresSandbox,
                   },
                   permissionMode,
                   servingPlan.permissionRules,
-                  { sandboxAvailable: opts.sandboxAvailable === true },
+                  { sandboxAvailable: opts.sandboxAvailable === true, protectedRoots },
                 )
               : { decision: "deny" as const, reason: approvedSubject.reason };
             if (recheck.decision === "deny") {
@@ -6648,6 +7206,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const bridge: RuntimeBridge = {
       runContext,
       eventLog,
+      // 0.8.0 — the runtime-state roots, for the tools that write beneath a
+      // directory they name and must not reach one (see RuntimeBridge).
+      ...(protectedRoots.length > 0 ? { protectedRoots } : {}),
       permissionMode,
       permissionRules: servingPlan.permissionRules,
       tools: bridgeTools,
@@ -6678,6 +7239,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(skills.length > 0 ? { skills } : {}),
       ...(opts.failureTaxonomy !== undefined ? { failureTaxonomy: opts.failureTaxonomy } : {}),
       ...(bridgeContinuitySeam !== undefined ? { continuity: bridgeContinuitySeam } : {}),
+      // 0.8.0 §8 — the read-only provability seam (projected above).
+      ...(bridgeProvabilitySeam !== undefined ? { provability: bridgeProvabilitySeam } : {}),
       // Loop contract 0.4 (G11) — the approval seam, so a Task child's
       // headless `ask` parks against the SAME store the parent parks against
       // instead of collapsing to a denial. `askMode` is spread only when the
@@ -7179,6 +7742,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     /** The serving pool candidate's profile, when any. */
     profile?: string;
   };
+  /**
+   * 0.8.0 (design §5.1) — what a gated turn hands its caller: the answer, the
+   * attempt's usage, and (when the attempt knows them) the arm that served it.
+   * `runEvaluatedTurn` returns a full {@link TurnAttempt}; a committee turn
+   * returns the first two. The provability gate reads the optional pair so
+   * its verifier sees the same `servedModel` / `profile` the judge does.
+   */
+  type ServedTurn = {
+    terminalContent: Anthropic.ContentBlock[];
+    usage: ModelUsage;
+    servedModel?: string;
+    profile?: string;
+  };
+  /**
+   * 0.8.0 (design §5.1, §5.4) — a turn the provability gate already ran its
+   * ladder over (`gated`), with the standing pass's footer when the run
+   * returns it (`footerTarget: "reply"`). The evaluated turn verifies its own
+   * attempts (provability before the judge), so the wrapper around it only
+   * hands such a turn on.
+   */
+  type GatedTurn = ServedTurn & { readonly footer?: string; readonly gated?: true };
 
   // -------------------------------------------------------------------------
   // 0.6.0 PR 9d — the side-call lifecycle (guide / shadow / committee). The
@@ -9173,10 +9757,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     return served;
   };
 
-  async function runEvaluatedTurn(
-    messages: Anthropic.MessageParam[],
-  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+  async function runEvaluatedTurn(messages: Anthropic.MessageParam[]): Promise<GatedTurn> {
     const evaluation = opts.evaluation;
+    const provability = opts.provability;
     const cascade = resolveCascade();
     const turnStartMs = performance.now();
     // The pre-draft snapshot is a COPY of the messages, not a length: the
@@ -9189,72 +9772,195 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // successful observations so the grade can be stamped on them; without
     // a judge the line count is unchanged and nothing is deferred.
     const deferForGrade = qualityIntoReward && evaluation !== undefined;
-    // §6.2 — past the judge share a cascade serves the strong rung DIRECTLY:
-    // the draft it cannot afford to grade is not drafted, the judge is not
-    // skipped silently — the route reason and the stage cause both say why.
-    if (cascade !== undefined && forcedRunCandidate === undefined && judgeShareExhausted()) {
-      const served = await runEscalationStage(
-        messages,
-        cascade.target,
-        "judge_share_exhausted",
-        "judge_share_exhausted",
-        true,
-      );
-      // §6.3 — folded through the same quality gate as every cascade line:
-      // the calls are un-judged, so under `in_loop` the strong arm is counted
-      // `ungraded` rather than credited a perfect 1.0 for the rest of the
-      // run; no strategy line (there is no final quality to fold).
-      flushCascade(
-        [
-          {
-            stage: "escalate",
-            attributedTo: "escalation",
-            observations: served.observations,
-            costUsd: served.costUsd,
-          },
-        ],
-        { success: true },
-        performance.now() - turnStartMs,
-      );
-      return served;
-    }
-    let attempt: TurnAttempt =
-      forcedRunCandidate !== undefined
-        ? await runEscalationStage(
-            messages,
-            forcedRunCandidate,
-            "retry_previous",
-            `forced onto ${armIdOf(forcedRunCandidate)} (forcedCandidate)`,
-            cascade !== undefined || deferForGrade,
-          )
-        : await runOneTurn(
-            messages,
-            cascade !== undefined
-              ? { role: "draft", stage: "draft", strategy: "cascade", defer: true }
-              : deferForGrade
-                ? { defer: true }
-                : {},
-          );
-    if (evaluation === undefined) return attempt;
+    // 0.8.0 (design/0.8.0-provability-release.md §5.1) — provability FIRST
+    // (it is free and deterministic), then the judge (which may spend). Under
+    // `provability:` every attempt this turn produces — the first, an
+    // evaluation retry, a cascade escalation — is verified BEFORE the judge
+    // grades it: a failing verdict retries, halts or escalates without a
+    // judge call, and the judge grades only an answer the gate accepted (or
+    // ran out of retries on). The ladder is the turn's (`runProvableTurn`
+    // opened it); each gate keeps its own `maxRetries`, and both draw on one
+    // `max_escalations`.
+    const ladder = provability === undefined ? undefined : (activeLadder ?? newProvabilityLadder());
+    /** The turn's escalations: the ladder's under `provability:`, so both gates count them. */
+    const turnEscalations: { escalations: number } = ladder ?? { escalations: 0 };
+    /**
+     * The rung the turn was handed to — by a provability escalation, by the
+     * cascade's, or by the judge share serving the strong rung directly. A
+     * later re-run of THIS turn stays on it instead of going back to the
+     * router (the escalated answer is the one being corrected).
+     */
+    let heldRung: PoolCandidate | undefined;
+    const heldRungTurn = (rung: PoolCandidate): TurnRunOptions => ({
+      force: rung,
+      forceReason: `the turn stays on ${armIdOf(rung)}, the rung it was escalated to`,
+      role: "escalation",
+      stage: "escalate",
+      strategy: "cascade",
+      defer: cascade !== undefined || deferForGrade,
+    });
+    /** An attempt handed back to the call site — with its proof footer under `provability:`. */
+    const served = (a: TurnAttempt): GatedTurn =>
+      provability === undefined || ladder === undefined ? a : finishGated(provability, ladder, a);
     /** Fold a non-cascade attempt's deferred lines with the grade it earned (none ⇒ the §6.3 gate). */
     const foldGraded = (a: TurnAttempt, quality?: number): void => {
       for (const { turn, obs } of a.observations) {
         recordPoolOutcome(turn, quality !== undefined ? { ...obs, quality } : obs);
       }
     };
-    const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
+    // §6.2 — past the judge share a cascade serves the strong rung DIRECTLY:
+    // the draft it cannot afford to grade is not drafted, the judge is not
+    // skipped silently — the route reason and the stage cause both say why.
+    const judgeShareServes =
+      cascade !== undefined && forcedRunCandidate === undefined && judgeShareExhausted();
+    let attempt: TurnAttempt;
+    if (judgeShareServes && cascade !== undefined) {
+      attempt = await runEscalationStage(
+        messages,
+        cascade.target,
+        "judge_share_exhausted",
+        "judge_share_exhausted",
+        true,
+      );
+      heldRung = cascade.target;
+    } else {
+      attempt =
+        forcedRunCandidate !== undefined
+          ? await runEscalationStage(
+              messages,
+              forcedRunCandidate,
+              "retry_previous",
+              `forced onto ${armIdOf(forcedRunCandidate)} (forcedCandidate)`,
+              cascade !== undefined || deferForGrade,
+            )
+          : await runOneTurn(
+              messages,
+              cascade !== undefined
+                ? { role: "draft", stage: "draft", strategy: "cascade", defer: true }
+                : deferForGrade
+                  ? { defer: true }
+                  : {},
+            );
+    }
     const stages: StageRecord[] = [];
     let current: StageRecord | undefined;
     if (cascade !== undefined) {
       current = {
-        stage: "draft",
-        attributedTo: "draft",
+        stage: judgeShareServes ? "escalate" : "draft",
+        attributedTo: judgeShareServes ? "escalation" : "draft",
         observations: attempt.observations,
         costUsd: attempt.costUsd,
       };
       stages.push(current);
     }
-    let escalations = 0;
+    /** A provability retry: the turn again, in the lane its current attempt ran in. */
+    const rerunTurn = async (): Promise<TurnAttempt> => {
+      if (heldRung !== undefined) return runOneTurn(messages, heldRungTurn(heldRung));
+      if (forcedRunCandidate !== undefined) {
+        return runEscalationStage(
+          messages,
+          forcedRunCandidate,
+          "retry_previous",
+          `forced onto ${armIdOf(forcedRunCandidate)} (forcedCandidate)`,
+          cascade !== undefined || deferForGrade,
+        );
+      }
+      if (cascade !== undefined) {
+        return runOneTurn(messages, {
+          role: "draft",
+          stage: "draft",
+          strategy: "cascade",
+          defer: true,
+        });
+      }
+      return runOneTurn(messages, deferForGrade ? { defer: true } : {});
+    };
+    /**
+     * §5.1 — the provability ladder over `attempt`, before any judge call.
+     * `"stands"`: the answer goes on (to the judge, when there is one) — it
+     * passed, failed under `note`, ran out of retries, or had no rung to
+     * escalate to. `"stopped"`: the abort tree stopped the turn while the
+     * gate worked, and the attempt is handed back as it is. A retry or an
+     * escalation re-runs the turn right here; the rejected answer never
+     * reaches the judge, and its deferred routing lines fold ungraded (the
+     * §6.3 gate). A `halt` folds what the turn holds and throws the
+     * classified stop.
+     */
+    const provabilityFirst = async (): Promise<"stands" | "stopped"> => {
+      if (provability === undefined || ladder === undefined) return "stands";
+      for (;;) {
+        const step = await provabilityPass(
+          provability,
+          ladder,
+          messages,
+          attempt,
+          current?.stage ?? (heldRung !== undefined ? "escalate" : undefined),
+        );
+        if (step.kind === "stopped") return "stopped";
+        if (step.kind === "stands") return step.aborted ? "stopped" : "stands";
+        if (step.kind === "halt") {
+          if (cascade !== undefined) {
+            flushCascade(stages, { success: false }, performance.now() - turnStartMs);
+          } else {
+            foldGraded(attempt);
+          }
+          return haltOnProvability(provability, step);
+        }
+        const rejected = attempt;
+        const rejectedStage = current;
+        ladder.reruns += 1;
+        if (step.kind === "escalate") {
+          turnEscalations.escalations += 1;
+          const escalated = await escalateOnProvability(
+            messages,
+            step,
+            cascade !== undefined || deferForGrade,
+          );
+          // The rung unavailable: the verified answer stands with its failing
+          // verdict (note semantics) and goes on to the judge.
+          if (escalated === undefined) return "stands";
+          attempt = escalated;
+          heldRung = step.target;
+          if (cascade !== undefined) {
+            current = {
+              stage: "escalate",
+              attributedTo: "escalation",
+              observations: attempt.observations,
+              costUsd: attempt.costUsd,
+            };
+            stages.push(current);
+          }
+        } else {
+          messages.push(markSynthetic({ role: "user", content: step.nudge }));
+          await logEvent("user_message", { content: step.nudge, synthetic: true });
+          attempt = await rerunTurn();
+          if (current !== undefined) current.costUsd += attempt.costUsd;
+        }
+        // The rejected answer's lines fold ungraded; its stage keeps its
+        // spend (the strategy line counts it) and, on a retry, takes the new
+        // attempt's lines.
+        foldGraded(rejected);
+        if (rejectedStage !== undefined) {
+          rejectedStage.observations = rejectedStage === current ? attempt.observations : [];
+        }
+      }
+    };
+    if (judgeShareServes) {
+      // 0.8.0 §5.1 — what the judge share cannot afford to grade, the free
+      // gate still verifies.
+      await provabilityFirst();
+      // §6.3 — folded through the same quality gate as every cascade line:
+      // the calls are un-judged, so under `in_loop` the strong arm is counted
+      // `ungraded` rather than credited a perfect 1.0 for the rest of the
+      // run; no strategy line (there is no final quality to fold).
+      flushCascade(stages, { success: true }, performance.now() - turnStartMs);
+      return served(attempt);
+    }
+    if (evaluation === undefined) {
+      await provabilityFirst();
+      return served(attempt);
+    }
+    const maxRetries = Math.max(0, Math.floor(evaluation.maxRetries));
     const gradedStages = (): StageRecord[] => stages.filter((st) => st.score !== undefined);
     for (let retryIndex = 0; ; retryIndex += 1) {
       // A turn the abort tree stopped (SIGINT, turn/model-call/run timer)
@@ -9269,7 +9975,18 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         } else {
           foldGraded(attempt);
         }
-        return attempt;
+        return served(attempt);
+      }
+      // 0.8.0 §5.1 — the free gate before the judge: a failing verdict is
+      // retried, escalated or halted here, without a judge call. A stop that
+      // lands while it works hands the attempt back ungraded, as above.
+      if ((await provabilityFirst()) === "stopped") {
+        if (cascade !== undefined) {
+          flushCascade(stages, { success: false }, performance.now() - turnStartMs);
+        } else {
+          foldGraded(attempt);
+        }
+        return served(attempt);
       }
       let graded: EvaluationResult;
       out.spinner.start("evaluating");
@@ -9310,7 +10027,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // strategy line is withheld (see `flushCascade`).
           flushCascade(gradedStages(), { success: true }, performance.now() - turnStartMs);
         }
-        return attempt;
+        return served(attempt);
       } finally {
         out.spinner.stop();
       }
@@ -9333,7 +10050,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         verdict === "fail" &&
         evaluation.onFail === "escalate" &&
         cascade !== undefined &&
-        escalations < cascade.maxEscalations;
+        turnEscalations.escalations < cascade.maxEscalations;
       bus.publish({
         ...bus.envelope(),
         kind: "eval_graded",
@@ -9374,10 +10091,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
         return attempt;
       };
-      if (verdict === "pass" || evaluation.onFail === "note") return standing();
+      if (verdict === "pass" || evaluation.onFail === "note") return served(standing());
       // `escalate` without a pool has nothing to escalate to (warned once at
       // resolve time): the verdict stands, note semantics.
-      if (evaluation.onFail === "escalate" && cascade === undefined) return standing();
+      if (evaluation.onFail === "escalate" && cascade === undefined) return served(standing());
       const rationaleNote =
         rationale !== undefined && rationale.trim().length > 0 ? ` — ${rationale.trim()}` : "";
       if (evaluation.onFail === "halt") {
@@ -9421,9 +10138,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             outcome: "skipped",
             cause: "max_escalations",
           });
-          return standing();
+          return served(standing());
         }
-        escalations += 1;
+        turnEscalations.escalations += 1;
         // The transcript as graded — restored should the escalation rung be
         // unavailable (§7.13: the draft answer stands).
         const draftTranscript = messages.slice();
@@ -9472,20 +10189,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             { escalateTo: cascade.target.modelString, message },
           );
           messages.splice(0, messages.length, ...draftTranscript);
-          return standing();
+          return served(standing());
         }
         stage.observations = attempt.observations;
         stage.costUsd = attempt.costUsd;
         stages.push(stage);
         current = stage;
+        // A provability retry of the escalated answer stays on the rung.
+        heldRung = cascade.target;
         continue;
       }
       // onFail: "retry" — bounded by the resolved cap; when spent, the last
       // attempt stands (the failing eval_graded trail tells the story).
-      if (retryIndex >= maxRetries) return attempt;
+      if (retryIndex >= maxRetries) return served(attempt);
       messages.push(markSynthetic({ role: "user", content: correction }));
       await logEvent("user_message", { content: correction, synthetic: true });
-      attempt = await runOneTurn(messages, deferForGrade ? { defer: true } : {});
+      // An answer a provability escalation produced is corrected on its rung.
+      attempt =
+        heldRung !== undefined
+          ? await runOneTurn(messages, heldRungTurn(heldRung))
+          : await runOneTurn(messages, deferForGrade ? { defer: true } : {});
     }
   }
 
@@ -9507,9 +10230,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // records no `model_route` and no arm line — its members carry cost only,
   // like the judge, guide, classifier and consult calls (§7.10). The winner's
   // identity rides the committee `model_stage` line for attribution.
-  async function runCommitteeOrTurn(
-    messages: Anthropic.MessageParam[],
-  ): Promise<{ terminalContent: Anthropic.ContentBlock[]; usage: ModelUsage }> {
+  async function runCommitteeOrTurn(messages: Anthropic.MessageParam[]): Promise<GatedTurn> {
     const committee = opts.sideCalls?.committee;
     if (committee === undefined) return runEvaluatedTurn(messages);
     const stage = {
@@ -9550,7 +10271,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const block: Anthropic.TextBlock = { type: "text", text: verdict.text, citations: null };
     messages.push({ role: "assistant", content: [block] });
     await logEvent("assistant_message", { content: [block] });
-    out.write(`agent> ${verdict.text}\n`);
+    // §5.4 — printed as the stream prints an answer: no footer-shaped line of
+    // it passes for the gate's verdict under `provability:`.
+    out.write(
+      `agent> ${opts.provability !== undefined ? neutralizeFooterLines(verdict.text) : verdict.text}\n`,
+    );
     lastResponseWireModel = verdict.winner.model;
     await recordServedModel(verdict.winner.model);
     publishStage({
@@ -9563,6 +10288,978 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         (verdict.escalated ? "escalated" : verdict.agreed ? "agreed" : "disagreement"),
     });
     return { terminalContent: [block], usage: verdict.usage };
+  }
+
+  // -------------------------------------------------------------------------
+  // 0.8.0 (design/0.8.0-provability-release.md §5.1, §5.3, §5.4) — the
+  // provability gate. §5.1 orders the two gates: provability FIRST (it is
+  // free and deterministic), then `evaluation:` (which may spend). So the
+  // evaluated turn above runs the ladder on every attempt BEFORE its judge
+  // (`provabilityFirst`): a failing verdict retries, halts or escalates
+  // without a judge call, a re-run the judge asks for is verified again
+  // first, an escalated answer goes on to the judge like any other, and both
+  // gates draw on one `max_escalations`. `runProvableTurn` verifies what no
+  // evaluated turn produced: a committee verdict. The verifier is injected
+  // (`@crewhaus/evaluation-service` builds it); runtime-core only decides what
+  // a verdict does, and builds the fail-open bundle when the verifier throws.
+  // -------------------------------------------------------------------------
+  let warnedProvabilityEscalateWithoutPool = false;
+  /**
+   * §5.1 — `on_fail: escalate`: the roster arm a failing verdict hands the
+   * turn to — `escalateTo` (a spec model string, `$profile` or tag; the
+   * compiler already folded `strategy.cascade.escalate_to` into it, the pool's
+   * own cascade target is the fallback for a hand-wired caller), else the
+   * pool's strongest candidate. Without a pool there is nothing to escalate
+   * to: warned once per run, and the verdict stands (note semantics) — how
+   * `resolveCascade` treats `evaluation.on_fail: escalate`.
+   */
+  const resolveProvabilityEscalation = (provability: RunProvability): PoolCandidate | undefined => {
+    if (poolRouter === undefined) {
+      if (!warnedProvabilityEscalateWithoutPool) {
+        warnedProvabilityEscalateWithoutPool = true;
+        runContext.logger.warn(
+          "provability.on_fail: escalate needs a model_pool to escalate to — no pool is active, so a failing verdict leaves the answer standing (note semantics)",
+        );
+      }
+      return undefined;
+    }
+    const declared = provability.escalateTo ?? opts.modelPool?.strategy?.cascade?.escalateTo;
+    const resolved = declared !== undefined ? resolveRosterArm(declared) : undefined;
+    if (declared !== undefined && resolved === undefined) {
+      runContext.logger.warn(
+        "provability.escalateTo names no roster arm — escalating to the strongest candidate",
+        { escalateTo: declared },
+      );
+    }
+    return resolved ?? poolRouter.escalation();
+  };
+  /** A thrown value's name and message, whatever was thrown. */
+  const describeThrown = (
+    err: unknown,
+    fallbackName: string,
+  ): { name: string; message: string } => {
+    const errObj = (typeof err === "object" && err !== null ? err : {}) as {
+      name?: unknown;
+      message?: unknown;
+    };
+    return {
+      name: typeof errObj.name === "string" ? errObj.name : fallbackName,
+      message: typeof errObj.message === "string" ? errObj.message : String(err),
+    };
+  };
+  /**
+   * A verifier result is only trusted as a verdict when every field the gate
+   * reads is there and well-typed: the summary the `provability_graded` line,
+   * the event-log twin and the audit record carry (all required fields of
+   * `ProvabilityGradedEvent`), and each claim's `bindings` the halt detail
+   * tallies. Anything less — a bare `{ verdict, claims }`, a NaN score, a
+   * claim without bindings — is not a verdict to act on: it fails open as
+   * `unverified`, exactly like a verifier that threw (a halt on it would
+   * print `undefined/NaN claims` or crash on `claim.bindings`).
+   */
+  const isGradedBundle = (value: unknown): value is ProofBundle => {
+    if (typeof value !== "object" || value === null) return false;
+    const bundle = value as Partial<Record<keyof ProofBundle, unknown>>;
+    const finite = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v);
+    const isObject = (v: unknown): boolean => typeof v === "object" && v !== null;
+    return (
+      (bundle.verdict === "pass" || bundle.verdict === "fail" || bundle.verdict === "unverified") &&
+      isProvabilityLevel(bundle.level) &&
+      (bundle.achieved === "none" || isProvabilityLevel(bundle.achieved)) &&
+      finite(bundle.score) &&
+      finite(bundle.threshold) &&
+      finite(bundle.claimCount) &&
+      finite(bundle.met) &&
+      finite(bundle.unmet) &&
+      finite(bundle.assumptions) &&
+      (bundle.assumptionsRefused === undefined || finite(bundle.assumptionsRefused)) &&
+      (bundle.judgeModel === undefined || typeof bundle.judgeModel === "string") &&
+      (bundle.spentUsdMicros === undefined || finite(bundle.spentUsdMicros)) &&
+      typeof bundle.bundleHash === "string" &&
+      Array.isArray(bundle.claims) &&
+      bundle.claims.every(
+        (claim: unknown) =>
+          isObject(claim) &&
+          Array.isArray((claim as { bindings?: unknown }).bindings) &&
+          (claim as { bindings: unknown[] }).bindings.every(isObject),
+      )
+    );
+  };
+  /**
+   * §5.1 — the classified terminal stop of `on_fail: halt`, mirroring the
+   * evaluation halt: class `"provability"`, exit {@link EXIT_CODES.provability}.
+   * The detail names the score, every refused assumption and the reasons the
+   * unmet claims fell short (stable `UnmetReason` tokens, tallied), so the
+   * operator reads why without opening the bundle — and where the bundle is.
+   */
+  const provabilityFailureReport = (bundle: ProofBundle, bundlePath?: string): FailureReport => {
+    const counted = Math.max(0, bundle.claimCount - bundle.assumptions);
+    const parts = [
+      `${bundle.met}/${counted} ${counted === 1 ? "claim" : "claims"} met the ${bundle.level} floor (threshold ${bundle.threshold})`,
+    ];
+    const refused = bundle.assumptionsRefused ?? 0;
+    if (refused > 0) {
+      parts.push(
+        `${refused} declared ${refused === 1 ? "assumption was" : "assumptions were"} refused`,
+      );
+    }
+    const tally = new Map<UnmetReason, number>();
+    for (const claim of bundle.claims) {
+      for (const reason of claimReasons(claim)) tally.set(reason, (tally.get(reason) ?? 0) + 1);
+    }
+    if (tally.size > 0) {
+      const reasons = [...tally].map(([reason, n]) => (n > 1 ? `${reason} ×${n}` : reason));
+      parts.push(`unmet: ${reasons.join(", ")}`);
+    }
+    if (bundlePath !== undefined) parts.push(`proof bundle: ${bundlePath}`);
+    return {
+      class: "provability",
+      title: "provability gate failed",
+      detail: parts.join("; "),
+      remediation:
+        "cite the evidence each claim rests on, lower provability.threshold, or soften provability.on_fail to retry/note",
+      exitCode: EXIT_CODES.provability,
+    };
+  };
+
+  /**
+   * 0.8.0 (design §5.1) — one turn's provability ladder. Every attempt the
+   * turn produces is verified against it, whichever gate re-ran the turn:
+   *
+   *  - `passes` — the verification passes recorded so far: the next pass's
+   *    `retryIndex` (0 = the turn's first answer, one more per re-run);
+   *  - `reruns` — the re-runs THIS gate asked for (retry or escalate), the
+   *    ones its `maxRetries` caps. Each gate keeps its own: a re-run the
+   *    judge asks for is verified, but is not provability's to count;
+   *  - `escalations` — the turn's escalations, the evaluation cascade's
+   *    included: `escalate` shares the cascade's `max_escalations`;
+   *  - `escalation` — the rung a failing verdict hands the turn to,
+   *    resolved once per turn;
+   *  - `standing` — the last recorded pass and the attempt it graded. Only
+   *    that attempt's bundle is ever rendered beside the answer.
+   */
+  type ProvabilityLadder = {
+    passes: number;
+    reruns: number;
+    escalations: number;
+    escalation?: { readonly target: PoolCandidate | undefined };
+    standing?: {
+      readonly attempt: ServedTurn;
+      readonly bundle: ProofBundle;
+      readonly bundlePath?: string;
+    };
+    /** The rejected pass whose ✗ is already on the output (`markRejected`): never rendered twice. */
+    marked?: ProofBundle;
+    /**
+     * The last message of the latest failing pass's attempt: the streamed
+     * text graded in a claimless final message's place starts after it
+     * (`streamedTurnText`), so an attempt already graded — and, where it
+     * streamed, already marked ✗ — is not graded again.
+     */
+    rejectedThrough?: Anthropic.MessageParam;
+  };
+  const newProvabilityLadder = (): ProvabilityLadder => ({
+    passes: 0,
+    reruns: 0,
+    escalations: 0,
+  });
+  /**
+   * The ladder of the turn in flight: `runProvableTurn` opens it, and an
+   * evaluated turn inside verifies its attempts against the same one, so a
+   * committee verdict's retry that falls back to the evaluated turn does not
+   * start the counts over.
+   */
+  let activeLadder: ProvabilityLadder | undefined;
+  /** A non-finite cap would make the retry ladder unbounded; 0 is the only safe reading of a value nobody meant. */
+  const provabilityRetryCap = (provability: RunProvability): number =>
+    Number.isFinite(provability.maxRetries) ? Math.max(0, Math.floor(provability.maxRetries)) : 0;
+  /**
+   * §5.1 — the escalations one turn may make: the evaluation cascade's
+   * `max_escalations` when there is a cascade (both gates draw on it), else
+   * the pool's own (`strategy.max_escalations`, default 1). A non-finite
+   * value reads as 0, as the retry cap does.
+   */
+  const turnEscalationCap = (): number => {
+    const cap =
+      resolveCascade()?.maxEscalations ?? Math.floor(opts.modelPool?.strategy?.maxEscalations ?? 1);
+    return Number.isFinite(cap) ? Math.max(0, cap) : 0;
+  };
+  /**
+   * §5.3, §8 — a bundle path as the run's LIVE surfaces show it (the trace
+   * event a `runs.subscribe` stream carries, the halt detail a gateway
+   * returns): through the gate's display rule, the footer's (relative to
+   * the tenant's root inside a tenant scope, else the workspace), so a
+   * tenant is never told the server's directory layout above its root. The
+   * durable event-log line keeps the path as persisted. No rule → as given;
+   * a rule that throws → no path at all.
+   */
+  const shownBundlePath = (
+    provability: RunProvability,
+    bundlePath: string | undefined,
+  ): string | undefined => {
+    if (bundlePath === undefined || provability.displayPath === undefined) return bundlePath;
+    try {
+      const shown = provability.displayPath(bundlePath);
+      return typeof shown === "string" && shown.length > 0 ? shown : undefined;
+    } catch (err) {
+      runContext.logger.warn("provability: showing the bundle path failed — it is left out", {
+        message: describeThrown(err, "Error").message,
+      });
+      return undefined;
+    }
+  };
+  /** The standing pass's rendering, or undefined (`render: none`, no renderer, empty). */
+  const renderStanding = (
+    provability: RunProvability,
+    bundle: ProofBundle,
+    bundlePath?: string,
+  ): string | undefined => {
+    if (provability.render === "none" || provability.renderBundle === undefined) return undefined;
+    let rendered: unknown;
+    try {
+      rendered = provability.renderBundle(bundle, bundlePath);
+    } catch (err) {
+      runContext.logger.warn("provability: rendering the proof bundle failed — no footer", {
+        message: describeThrown(err, "Error").message,
+      });
+      return undefined;
+    }
+    // trimEnd, not a regex: a footer is printed on its own line, and a
+    // `\s+$` pattern backtracks quadratically over a long whitespace run.
+    const trimmed = typeof rendered === "string" ? rendered.trimEnd() : "";
+    return trimmed.length > 0 ? trimmed : undefined;
+  };
+  /**
+   * §5.4 — does the reader read this turn as it streams? The REPL prints
+   * every attempt as it is made, and so does any run whose footer goes to the
+   * stream (the cli); a run that hands its text back (`"reply"` on a channel
+   * bot, `"none"` on the gateway) serves the final answer alone, and its
+   * output is an operator's log.
+   */
+  const streamsTheTurn = (provability: RunProvability): boolean =>
+    provability.streamed ??
+    (opts.singleTurn !== true || (provability.footerTarget ?? "stream") === "stream");
+  /**
+   * The text the turn in flight has printed so far, as the gate grades it in
+   * a claimless final message's place: every assistant message's text since
+   * the turn's own input — the last user message that is neither
+   * runtime-injected (a retry nudge, a correction) nor a tool result — and
+   * since the last attempt a failing pass graded (`rejectedThrough`), joined
+   * as paragraphs. A rejected attempt was graded once, and where it
+   * streamed its ✗ is already under it: grading it again would fail every
+   * honest retraction after it ("I'm not able to confirm that."), unless
+   * the final message points back at it (`POINTS_BACK`: "See above."),
+   * when it is the answer the reader is handed again. In the messages
+   * before the final one, a sentence that only says what the agent is about
+   * to do (`NARRATION`: "Let me fetch the policy page first.") is no claim
+   * the reader was handed, and is left out.
+   *
+   * The final message is the transcript's last one. An empty one is still
+   * final: a model that ends its turn on an empty `end_turn` after a tool
+   * call commits no message at all (the last is the tool results' carrier),
+   * or a blank text block. Either way every assistant message before it
+   * printed ahead of a tool call, and is read for narration — never graded
+   * whole as though it were the answer (I11).
+   */
+  const streamedTurnText = (
+    messages: readonly Anthropic.MessageParam[],
+    rejectedThrough: Anthropic.MessageParam | undefined,
+  ): string => {
+    const texts: string[] = [];
+    let pointsBack = false;
+    /** The turn's own input: a figure the reader handed the agent is no claim of the agent's. */
+    const input = latestHumanUserMessage(messages);
+    const handed = figuresIn(input !== undefined ? messageText(input) : "");
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i] as Anthropic.MessageParam;
+      if (message === rejectedThrough && !pointsBack) break;
+      if (message.role === "user") {
+        const carriesResults =
+          Array.isArray(message.content) &&
+          message.content.some((block) => block.type === "tool_result");
+        if (!isSyntheticMessage(message) && !carriesResults) break;
+        continue;
+      }
+      const blocks = typeof message.content === "string" ? [] : message.content;
+      const text =
+        typeof message.content === "string"
+          ? message.content
+          : blocks
+              .filter((block): block is Anthropic.TextBlockParam => block.type === "text")
+              .map((block) => block.text)
+              .join("");
+      if (i === messages.length - 1) {
+        pointsBack = POINTS_BACK.test(text);
+        if (text.trim() !== "") texts.unshift(text);
+        continue;
+      }
+      if (text.trim() === "") continue;
+      // What the narration announces: the input of the calls this message makes.
+      const calls = new Set<string>();
+      for (const block of blocks) {
+        if (block.type === "tool_use") callFigures(block.input, calls);
+      }
+      const said = withoutNarration(text, [handed, calls]);
+      if (said !== "") texts.unshift(said);
+    }
+    return texts.join("\n\n");
+  };
+  /**
+   * §5.4 — a failing pass the gate is about to re-run: where the reader has
+   * already seen the rejected attempt stream past (`streamsTheTurn`, a
+   * footer that goes to the output), its ✗ footer is written under it now,
+   * so no answer the reader saw stands unmarked above the next one. The
+   * standing pass renders as before; this bundle is never rendered twice
+   * (`ladder.marked`).
+   */
+  const markRejected = (
+    provability: RunProvability,
+    ladder: ProvabilityLadder,
+    bundle: ProofBundle,
+    bundlePath: string | undefined,
+  ): void => {
+    const target = provability.footerTarget ?? "stream";
+    if (target === "none" || !streamsTheTurn(provability)) return;
+    const footer = renderStanding(provability, bundle, bundlePath);
+    if (footer === undefined) return;
+    out.write(`${footer}\n`);
+    ladder.marked = bundle;
+  };
+  /** The retry nudge; a composer that throws or says nothing still leaves the verdict. */
+  const composeNudge = (provability: RunProvability, bundle: ProofBundle): string => {
+    try {
+      const nudge = provability.nudge(bundle);
+      if (typeof nudge === "string" && nudge.trim().length > 0) return nudge;
+    } catch (err) {
+      runContext.logger.warn(
+        "provability: composing the retry nudge failed — nudging with the score alone",
+        {
+          message: describeThrown(err, "Error").message,
+        },
+      );
+    }
+    const counted = Math.max(0, bundle.claimCount - bundle.assumptions);
+    return `[provability failed: ${bundle.met}/${counted} claims met the ${bundle.level} floor, threshold ${bundle.threshold}]\nCite the evidence each claim rests on, then give the corrected answer in full.`;
+  };
+  /**
+   * Whether the abort tree has stopped this turn. A stopped turn did not
+   * complete inside its window: it is never retried or escalated, and a
+   * verdict that had not settled when it stopped is discarded (the turn
+   * stands un-verified). When a fired wall-clock limit is what stopped it, the stop
+   * is classified exactly as `runOneTurn` classifies one (G10): terminal
+   * for the run deadline in any mode and for every limit on the
+   * single-turn path (the turn IS the run) — `throwTimeout`, class
+   * `"timeout"` — so neither a slow verifier nor a slow evaluation judge
+   * can turn a timed-out run into a served, un-verified answer, and
+   * `on_fail: halt` cannot be skipped by running out the clock. A REPL
+   * turn/model-call timeout, a SIGINT or a host abort is not terminal: the
+   * caller hands the turn back. `firedInGate` — the abort landed during
+   * the gate's own work, where no `runOneTurn` was running to write the
+   * REPL's named timeout `error` line, so the gate writes it.
+   */
+  const stoppedByAbort = async (firedInGate: boolean): Promise<boolean> => {
+    if (!turnAbort.signal.aborted && !runAbort.signal.aborted) return false;
+    const timedOut = timeoutAbortReason(turnAbort.signal) ?? timeoutAbortReason(runAbort.signal);
+    if (timedOut !== undefined) {
+      if (timedOut.crewhausTimeout === "run" || opts.singleTurn === true) {
+        await throwTimeout(timedOut);
+      }
+      if (firedInGate) {
+        await logEvent("error", {
+          name: timedOut.crewhausTimeout === "turn" ? "TurnTimeout" : "ModelCallTimeout",
+          message: `turn aborted: the configured ${TIMEOUT_SPEC_KEYS[timedOut.crewhausTimeout]} (${timedOut.limitMs}ms) elapsed`,
+        });
+      }
+    }
+    return true;
+  };
+  /**
+   * Did the OUTSIDE WORLD hand the run `url` whole, and nothing else put the
+   * tagged content it carries there? Only then does a HEAD to it carry
+   * nothing new back, and a lineage match on it is let through (§6.1, §10;
+   * Pillar 3). `egress` is what the screen's classification found. Both must
+   * hold:
+   *
+   *  1. a non-error result of an OUTSIDE READER holds the URL verbatim — a
+   *     tool that crosses the network (`ioCapability: "network"`) and writes
+   *     nothing (`readOnly`), or an MCP server (`mcp__*`, whose flags a spec
+   *     can only tighten, so none is ever `readOnly`): a search hit, a
+   *     fetched page's own address, an MCP server's answer. Its request
+   *     passed the egress fabric, and its answer is the outside world's.
+   *     `scope` is no test of that: a
+   *     local process tool is `external` too (GitCommit, GitDiff, Bash,
+   *     Format), and its result is text the model wrote — a commit message,
+   *     the diff of a file it edited — so a secret the model composed into a
+   *     URL comes back "handed" (the laundering the round-2 review found
+   *     through GitCommit, as round 1's did through UrlNormalize). A tool
+   *     that writes can echo what it sent, wherever it sent it;
+   *  2. every tagged string the URL carries came in only inside results that
+   *     hand the URL whole: no other tool result holds it, and it was tagged
+   *     as a tool's or an MCP server's answer. A secret a tool read sits in
+   *     that tool's result without the URL, so a reader that hands back a
+   *     file or a record the model wrote the URL into (an MCP filesystem
+   *     read) still hands nothing new: the secret came from elsewhere.
+   *     Content tagged from memory, a skill, a channel, a sub-agent or a
+   *     consult is never excused, and nor is a match the plain substring
+   *     reading cannot account for (a decoded view's, a custom matcher's).
+   */
+  const handedByBoundary = (
+    messages: readonly Anthropic.MessageParam[],
+    url: string,
+    egress: { readonly matchCount: number },
+  ): boolean => {
+    const readerCall = new Map<string, boolean>();
+    const results: Array<{ readonly text: string; readonly handed: boolean }> = [];
+    for (const message of messages) {
+      if (!Array.isArray(message.content)) continue;
+      for (const block of message.content as ReadonlyArray<unknown>) {
+        if (typeof block !== "object" || block === null) continue;
+        const b = block as Record<string, unknown>;
+        if (b["type"] === "tool_use" && typeof b["id"] === "string") {
+          const name = typeof b["name"] === "string" ? b["name"] : "";
+          const tool = toolByName.get(name);
+          // An MCP server's answer is the outside world's whatever its flags
+          // say: a spec's MCP tool is never `readOnly` (its flags can only
+          // tighten), so reading it by the flag counted no search hit an MCP
+          // server returned. Condition 2 is what refuses a server that echoes
+          // what the model wrote. A local process tool never hands anything.
+          const outside =
+            tool?.ioCapability !== "process" &&
+            (name.startsWith("mcp__") ||
+              (tool?.readOnly === true && tool.ioCapability === "network"));
+          readerCall.set(b["id"], outside);
+        } else if (b["type"] === "tool_result" && typeof b["tool_use_id"] === "string") {
+          const text = gateResultText(b["content"]);
+          const reader = readerCall.get(b["tool_use_id"]) === true && b["is_error"] !== true;
+          results.push({ text, handed: reader && text.includes(url) });
+        }
+      }
+    }
+    // 1 — handed whole by an outside reader.
+    if (!results.some((r) => r.handed)) return false;
+    // 2 — what the URL carries, as the plain substring reading finds it.
+    const carried: string[] = [];
+    let found = 0;
+    for (const [tagged, origin] of runContext.dataLineage ?? []) {
+      if (tagged.length < MIN_MATCH_LENGTH || !url.includes(tagged)) continue;
+      found += 1;
+      if (origin === "user") continue;
+      if (origin !== "tool" && origin !== "mcp") return false;
+      carried.push(tagged);
+    }
+    if (carried.length === 0 || egress.matchCount > found) return false;
+    return carried.every(
+      (tagged) =>
+        results.some((r) => r.handed && r.text.includes(tagged)) &&
+        results.every((r) => r.handed || !r.text.includes(tagged)),
+    );
+  };
+  /**
+   * Pillar 3 sink-side fabric (design §6.1, §10) — the gate's own egress:
+   * a `sources.resolve: head` request to a URL the model wrote. It is
+   * classified like an external tool call to a destination the model chose
+   * (`external-dynamic`, the run's egress matcher): content a boundary
+   * tagged from a non-user origin — a secret a tool read — refuses the
+   * request, and the verifier sends nothing. One `permission_decision`
+   * trace event per screen, as on the tool path; the durable
+   * `egress_decision` record is the verifier's, which also knows what the
+   * request came to. A URL an outside reader's result handed the run
+   * VERBATIM (a search hit, a fetched page's own address), carrying nothing
+   * that reached the run any other way ({@link handedByBoundary}), carries
+   * nothing new back to its host, so a match on it is let through, and the
+   * event says why: refusing it would fail an honest citation of a search
+   * result. Built per verification over the transcript it reads.
+   */
+  const gateEgressScreen =
+    (messages: readonly Anthropic.MessageParam[]) =>
+    async (payload: string, sinkId: string): Promise<GateEgressScreen> => {
+      const egress = await classifyEgress(payload, runContext, {
+        sinkId,
+        sinkScope: "external-dynamic",
+        ...(opts.egressMatcher !== undefined ? { matcher: opts.egressMatcher } : {}),
+      });
+      const handed = egress.verdict === "block" && handedByBoundary(messages, payload, egress);
+      const verdict = handed ? "pass" : egress.verdict;
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: sinkId,
+        decision: verdict === "block" ? "deny" : "allow",
+        mode: permissionMode,
+        outcome:
+          verdict === "pass"
+            ? "egress-passed"
+            : verdict === "warn"
+              ? "egress-warned"
+              : "egress-blocked",
+        ...(egress.originsFound.length > 0
+          ? {
+              reason: handed
+                ? `egress: the URL was handed to the run verbatim (${summarizeEgress(egress)})`
+                : `egress: ${summarizeEgress(egress)}`,
+            }
+          : {}),
+      });
+      if (verdict !== "pass") {
+        runContext.logger.warn("egress classification non-clean", {
+          sinkId,
+          verdict,
+          originsFound: egress.originsFound,
+          matchCount: egress.matchCount,
+        });
+      }
+      return {
+        verdict,
+        sinkScope: egress.sinkScope,
+        originsFound: egress.originsFound,
+        matchCount: egress.matchCount,
+      };
+    };
+
+  /** What one verification pass leaves the caller to do. */
+  type ProvabilityStep =
+    /** The abort tree stopped the turn before a verdict was recorded: the attempt stands un-verified. */
+    | { readonly kind: "stopped" }
+    /**
+     * The answer stands as far as this gate goes: a pass, `unverified`,
+     * `note`, a spent ladder, no rung to escalate to, or `max_escalations`
+     * reached. `aborted` — a stop landed while the pass was recorded: the
+     * verdict stands and nothing re-runs.
+     */
+    | { readonly kind: "stands"; readonly aborted: boolean }
+    /** `halt` on a failing verdict: the caller folds what it holds, then `haltOnProvability`. */
+    | { readonly kind: "halt"; readonly bundle: ProofBundle; readonly bundlePath?: string }
+    | { readonly kind: "retry"; readonly nudge: string }
+    | { readonly kind: "escalate"; readonly nudge: string; readonly target: PoolCandidate };
+
+  /**
+   * 0.8.0 (design §5.1, §5.3) — ONE verification pass over a completed
+   * attempt, recorded, and what its verdict asks for. The caller acts on the
+   * step: it owns the attempt, the transcript and the routing lines a re-run
+   * touches.
+   *
+   *  1. a turn the abort tree stopped did not complete — it is handed back
+   *     un-verified, exactly as the evaluation loop hands one back
+   *     un-graded, unless a fired wall-clock limit makes the stop terminal
+   *     (G10: the run deadline anywhere, any limit on the single-turn path),
+   *     which throws the classified `timeout` stop as `runOneTurn` does. The
+   *     same check runs again when `verify` settles and once the pass is
+   *     recorded, so a limit that fires WHILE the gate works is classified
+   *     too;
+   *  2. `verify` — a THROW is grading-infrastructure failure, not a verdict:
+   *     logged (a warning + an `error` event-log line), and the bundle is
+   *     `unverifiedBundle(…)` so no surface prints a ✓; the answer stands;
+   *  3. `persist` (failure warned, never fatal), under the SESSION's turn
+   *     number (`resumedTurns` + the run's own), so a resumed session's turn
+   *     never files over an earlier turn's bundle (§5.3);
+   *  4. one `provability_graded` trace event + event-log line, the
+   *     `provability_evaluated` audit record when the sink is wired, and
+   *     `onBundle`;
+   *  5. the verdict: pass / unverified / `note` → stands; `halt` → the
+   *     caller's classified stop; `retry` → the nudge composed from the
+   *     bundle, for the caller to re-run the turn with; `escalate` → the same
+   *     nudge and the rung (an unavailable rung leaves the answer standing,
+   *     note semantics; a rung the abort tree stopped before it ran is
+   *     recorded as `model_stage{escalate, skipped, cause: "aborted"}`, and
+   *     is named `escalatedTo` only when that announcement went out before
+   *     the stop; a turn that already made `max_escalations` escalations is
+   *     recorded as `skipped, cause: "max_escalations"`, as the cascade's
+   *     is). Both re-runs count against `maxRetries`; spent, the last answer
+   *     stands and the failing event trail tells the story.
+   */
+  async function provabilityPass(
+    provability: RunProvability,
+    ladder: ProvabilityLadder,
+    messages: Anthropic.MessageParam[],
+    attempt: ServedTurn,
+    stage: string | undefined,
+  ): Promise<ProvabilityStep> {
+    const maxRetries = provabilityRetryCap(provability);
+    // 1 — an aborted turn never completed: verifying its partial output
+    // would be noise, and a retry would fight the very signal that stopped
+    // it. The stop landed in the turn (whose `runOneTurn` writes the REPL's
+    // timeout line when it fired there), not in the gate.
+    if (await stoppedByAbort(false)) return { kind: "stopped" };
+    const retryIndex = ladder.passes;
+    const turnNumber = resumedTurns + runContext.turnNumber;
+    const servedModel = attempt.servedModel ?? lastResponseWireModel;
+    // 2 — verify.
+    let verified: unknown;
+    let verifyFailure: { readonly error: unknown } | undefined;
+    const finalText = terminalText(attempt.terminalContent);
+    const verifyText = (text: string): Promise<ProofBundle> =>
+      provability.verify({
+        finalText: text,
+        messages,
+        isSynthetic: isSyntheticMessage,
+        usage: attempt.usage,
+        // A waiver judge meters itself on THIS bus (role "judge"), so its
+        // spend lands in the run's budget like the quality judge's.
+        bus,
+        ...(servedModel !== undefined ? { servedModel } : {}),
+        ...(attempt.profile !== undefined ? { profile: attempt.profile } : {}),
+        ...(stage !== undefined ? { stage } : {}),
+        turnNumber,
+        retryIndex,
+        // The session whose event log holds the evidence — on `--resume`
+        // the resumed one. The loop's resolved id: boot binds the run
+        // context to it (a caller-built context naming another session is
+        // refused), so this always equals `runContext.sessionId`.
+        sessionId,
+        signal: turnAbort.signal,
+        // The waiver judge stops asking once the share is spent (§6.2), and
+        // a HEAD the verifier sends is screened and audited like any egress
+        // (§6.1, §10).
+        ...(opts.budget !== undefined ? { judgeShareExhausted } : {}),
+        ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
+        screenEgress: gateEgressScreen(messages),
+      });
+    out.spinner.start("verifying");
+    try {
+      verified = await verifyText(finalText);
+      // §5.4 — where the turn streams to its reader, a final message that
+      // states nothing ("Done.", "See above.") is not the answer the reader
+      // holds: what the turn printed above it is. Its vacuous pass would put
+      // a ✓ under claims nobody graded — a claim made before a tool call, a
+      // rejected attempt the next one points back at — so that text is
+      // graded instead. A final message that makes a claim is the answer,
+      // graded alone, as on every surface.
+      const shown = streamsTheTurn(provability)
+        ? streamedTurnText(messages, ladder.rejectedThrough)
+        : undefined;
+      if (
+        shown !== undefined &&
+        shown.trim() !== "" &&
+        shown !== finalText &&
+        isGradedBundle(verified) &&
+        verified.verdict === "pass" &&
+        verified.claimCount === 0
+      ) {
+        verified = await verifyText(shown);
+      }
+    } catch (err) {
+      verifyFailure = { error: err };
+    } finally {
+      out.spinner.stop();
+    }
+    // A verdict — or a throw — that settles after the abort tree fired
+    // belongs to a turn that did not complete inside its window. It is
+    // neither recorded nor acted on: a verifier that ignores the signal
+    // would otherwise retry an aborted turn (a nudge nothing answers) or
+    // reclassify a timed-out run as a provability halt, and a verifier
+    // that stopped BECAUSE of the abort is the abort, not an outage.
+    if (await stoppedByAbort(true)) return { kind: "stopped" };
+    ladder.passes += 1;
+    let bundle: ProofBundle;
+    if (verifyFailure === undefined && isGradedBundle(verified)) {
+      bundle = verified;
+    } else {
+      // A THROW — or a result that is not a well-formed bundle — is
+      // grading-INFRASTRUCTURE failure, not a verdict: fail open.
+      const err =
+        verifyFailure !== undefined
+          ? verifyFailure.error
+          : new Error("the verifier returned no proof bundle");
+      const { name, message } = describeThrown(err, "ProvabilityError");
+      runContext.logger.warn("provability: verifier threw — the answer stands unverified", {
+        name,
+        message,
+      });
+      await logEvent("error", { name, message: `provability verifier failed: ${message}` });
+      bundle = unverifiedBundle(provability, err, retryIndex);
+    }
+    // 3 — persist.
+    let bundlePath: string | undefined;
+    if (provability.persist !== undefined) {
+      try {
+        bundlePath = await provability.persist(bundle, { sessionId, turnNumber });
+      } catch (err) {
+        runContext.logger.warn(
+          "provability: persisting the proof bundle failed — the verdict stands",
+          {
+            turnNumber,
+            retryIndex,
+            message: describeThrown(err, "Error").message,
+          },
+        );
+      }
+    }
+    // Decided BEFORE the publish so a failing pass names the rung it hands
+    // the turn to (`escalatedTo`), as the evaluation cascade's does.
+    const failing = bundle.verdict === "fail";
+    // What this pass graded is graded: a later claimless message's streamed
+    // text starts after it (`streamedTurnText`).
+    if (failing) ladder.rejectedThrough = messages[messages.length - 1];
+    const spent = ladder.reruns >= maxRetries;
+    if (failing && provability.onFail === "escalate" && ladder.escalation === undefined) {
+      ladder.escalation = { target: resolveProvabilityEscalation(provability) };
+    }
+    const rung =
+      failing && provability.onFail === "escalate" && !spent
+        ? ladder.escalation?.target
+        : undefined;
+    // §5.1 — `escalate` shares the cascade's `max_escalations`: a turn that
+    // has made them all keeps its answer, as the cascade's last rung does.
+    const capped = rung !== undefined && ladder.escalations >= turnEscalationCap();
+    /** The rung this failing pass hands the turn to, the abort tree aside. */
+    const wantedRung = capped ? undefined : rung;
+    // Announced only while the abort tree is quiet: a timer that fired
+    // while the bundle was persisted means the rung will never run (the
+    // abort check below returns or throws first), and the durable line must
+    // not name an escalation that did not happen.
+    const escalateTo =
+      wantedRung !== undefined && !turnAbort.signal.aborted && !runAbort.signal.aborted
+        ? wantedRung
+        : undefined;
+    // 4 — publish. The gate's own pass counter is authoritative for
+    // `retryIndex` (a verifier that ignores the one it was handed cannot
+    // make two passes read as the original answer).
+    const summary = { ...summarizeBundle(bundle), retryIndex };
+    const shownPath = shownBundlePath(provability, bundlePath);
+    bus.publish({
+      ...bus.envelope(),
+      kind: "provability_graded",
+      ...summary,
+      maxRetries,
+      ...(shownPath !== undefined ? { bundlePath: shownPath } : {}),
+      ...(escalateTo !== undefined ? { escalatedTo: escalateTo.modelString } : {}),
+    });
+    // The durable twin (event-log kind `provability_graded`): the trace
+    // line minus its envelope, plus the session turn it graded, with the
+    // bundle path as persisted.
+    await logEvent("provability_graded", {
+      ...summary,
+      maxRetries,
+      turnNumber,
+      ...(bundlePath !== undefined ? { bundlePath } : {}),
+      ...(escalateTo !== undefined ? { escalatedTo: escalateTo.modelString } : {}),
+    });
+    // §5.3 — the hash-chained audit record beside the justification gate's,
+    // best-effort but surfaced exactly like that path: a full audit disk
+    // must not crash a governed run.
+    if (opts.justificationAuditSink !== undefined) {
+      try {
+        await opts.justificationAuditSink.append({
+          kind: "provability_evaluated",
+          payload: { ...summary, turnNumber, sessionId },
+        });
+      } catch (err) {
+        runContext.logger.warn("provability audit append failed", {
+          turnNumber,
+          retryIndex,
+          error: describeThrown(err, "Error").message,
+        });
+      }
+    }
+    if (provability.onBundle !== undefined) {
+      try {
+        provability.onBundle(bundle, bundlePath);
+      } catch (err) {
+        runContext.logger.warn("provability: the onBundle observer threw — ignored", {
+          message: describeThrown(err, "Error").message,
+        });
+      }
+    }
+    // A rung the recorded failing pass wanted but the abort tree stopped
+    // first never runs: say so on the routing record, as the cascade's
+    // `max_escalations` skip does — before the abort check below can throw.
+    // When the abort landed during the event-log line or the audit append
+    // this also retracts the `escalatedTo` those lines already carry; a
+    // `model_stage{started}` or this `skipped` always follows one.
+    if (wantedRung !== undefined && (turnAbort.signal.aborted || runAbort.signal.aborted)) {
+      publishStage({
+        stage: "escalate",
+        strategy: "cascade",
+        role: "escalation",
+        candidate: wantedRung,
+        outcome: "skipped",
+        cause: "aborted",
+      });
+    }
+    if (capped && rung !== undefined) {
+      publishStage({
+        stage: "escalate",
+        strategy: "cascade",
+        role: "escalation",
+        candidate: rung,
+        outcome: "skipped",
+        cause: "max_escalations",
+      });
+    }
+    // 5 — the verdict. A stop that landed while the pass was being
+    // recorded (persist, the event-log line, the audit append): a terminal
+    // timeout throws here whatever the verdict; any other abort leaves the
+    // recorded verdict standing but never re-runs the turn on a signal
+    // that is already aborted.
+    const stopped = await stoppedByAbort(true);
+    ladder.standing = { attempt, bundle, ...(bundlePath !== undefined ? { bundlePath } : {}) };
+    if (!failing || provability.onFail === "note") return { kind: "stands", aborted: stopped };
+    if (provability.onFail === "halt") {
+      return { kind: "halt", bundle, ...(bundlePath !== undefined ? { bundlePath } : {}) };
+    }
+    // `escalate` without a pool (warned once at resolve time): note semantics.
+    if (provability.onFail === "escalate" && ladder.escalation?.target === undefined) {
+      return { kind: "stands", aborted: stopped };
+    }
+    if (spent || stopped || capped) return { kind: "stands", aborted: stopped };
+    const nudge = composeNudge(provability, bundle);
+    markRejected(provability, ladder, bundle, bundlePath);
+    if (escalateTo !== undefined) return { kind: "escalate", nudge, target: escalateTo };
+    return { kind: "retry", nudge };
+  }
+
+  /**
+   * §5.1 — the classified terminal stop of `on_fail: halt` (class
+   * `"provability"`, exit {@link EXIT_CODES.provability}), the ✗ footer
+   * first: a halted run returns no reply to carry it, so it goes to the
+   * output whatever `footerTarget` says — unless the caller carries the
+   * bundle itself (`"none"`). The detail names the bundle the way the
+   * run's live surfaces show it.
+   */
+  const haltOnProvability = async (
+    provability: RunProvability,
+    halted: { readonly bundle: ProofBundle; readonly bundlePath?: string },
+  ): Promise<never> => {
+    const report = provabilityFailureReport(
+      halted.bundle,
+      shownBundlePath(provability, halted.bundlePath),
+    );
+    if ((provability.footerTarget ?? "stream") !== "none") {
+      const footer = renderStanding(provability, halted.bundle, halted.bundlePath);
+      if (footer !== undefined) out.write(`${footer}\n`);
+    }
+    await publishRunFailed(report);
+    throw new RunFailedError(report);
+  };
+
+  /**
+   * §5.1 — `escalate`: the nudge, then the turn on the rung (`defer` as the
+   * caller folds the attempt's routing lines). An unavailable rung leaves
+   * the answer standing with its failing verdict (note semantics) and
+   * withdraws the nudge from the live transcript: `undefined`. A classified
+   * halt or an abort on the rung is terminal for the RUN and propagates, as
+   * it does out of the cascade.
+   */
+  const escalateOnProvability = async (
+    messages: Anthropic.MessageParam[],
+    step: { readonly nudge: string; readonly target: PoolCandidate },
+    defer: boolean,
+  ): Promise<TurnAttempt | undefined> => {
+    // The transcript as verified — restored should the rung be unavailable.
+    const verifiedTranscript = messages.slice();
+    messages.push(markSynthetic({ role: "user", content: step.nudge }));
+    await logEvent("user_message", { content: step.nudge, synthetic: true });
+    try {
+      return await runEscalationStage(
+        messages,
+        step.target,
+        undefined,
+        "provability: escalated after a failing verdict",
+        defer,
+        true,
+      );
+    } catch (err) {
+      if (isAbortError(err) || isRunFailedError(err)) throw err;
+      runContext.logger.warn(
+        "provability: escalation rung unavailable — the answer stands with its failing verdict (note semantics)",
+        { escalateTo: step.target.modelString, message: describeThrown(err, "Error").message },
+      );
+      // Withdrawn from the LIVE transcript only: the nudge's synthetic
+      // `user_message` line is already on disk, so a `--resume` replays
+      // it ahead of the next input — the same live/resume divergence as
+      // the cascade's withdrawn correction above, which a replay-side
+      // withdrawal marker would fix for both at once.
+      messages.splice(0, messages.length, ...verifiedTranscript);
+      return undefined;
+    }
+  };
+
+  /**
+   * §5.4 — a gated attempt handed back to its call site. The STANDING pass
+   * is rendered, and only when it graded this very attempt (one the abort
+   * tree stopped before its pass was recorded shows nothing). A rejected
+   * attempt the reader never saw is never shown; one the reader saw stream
+   * past already carries its ✗ (`markRejected`), and an escalation that could
+   * not run leaves that same verdict standing, which is not written twice.
+   * `footerTarget: "stream"` writes it to the run's output after the answer,
+   * on its own line; `"reply"` hands it back as `footer` for the caller to
+   * append to the text the run returns; `"none"` renders nothing (the caller
+   * carries the bundle itself, as the managed gateway's `proof` field does).
+   * It never enters `messages`: the model must not read its own footer next
+   * turn.
+   */
+  const finishGated = (
+    provability: RunProvability,
+    ladder: ProvabilityLadder,
+    attempt: ServedTurn,
+  ): GatedTurn => {
+    const target = provability.footerTarget ?? "stream";
+    const standing = ladder.standing;
+    const footer =
+      target !== "none" &&
+      standing !== undefined &&
+      standing.attempt === attempt &&
+      standing.bundle !== ladder.marked
+        ? renderStanding(provability, standing.bundle, standing.bundlePath)
+        : undefined;
+    if (footer === undefined) return { ...attempt, gated: true };
+    if (target === "reply") return { ...attempt, footer, gated: true };
+    out.write(`${footer}\n`);
+    return { ...attempt, gated: true };
+  };
+
+  /**
+   * 0.8.0 (design §5.1) — one COMPLETED turn through the provability gate.
+   * `inner` is what the call site ran before the gate existed
+   * (`runCommitteeOrTurn` on the single-turn path, `runEvaluatedTurn` on the
+   * REPL). Without `opts.provability` this IS `inner(messages)`.
+   *
+   * The evaluated turn runs the ladder itself, on every attempt and before
+   * every grade (provability first, §5.1), and comes back `gated`; it is
+   * handed on as it is. What this verifies is the one answer no evaluated
+   * turn produced — a committee verdict — pass by pass (`provabilityPass`):
+   * a retry runs `inner` again, an escalation runs the turn on the rung,
+   * and a halt is the classified stop. A stop the abort tree made inside
+   * `inner` hands the turn back un-verified, or throws the classified
+   * timeout (G10), before anything else.
+   */
+  async function runProvableTurn(
+    messages: Anthropic.MessageParam[],
+    inner: (messages: Anthropic.MessageParam[]) => Promise<GatedTurn>,
+  ): Promise<GatedTurn> {
+    const provability = opts.provability;
+    if (provability === undefined) return inner(messages);
+    const ladder = newProvabilityLadder();
+    activeLadder = ladder;
+    try {
+      let attempt: GatedTurn = await inner(messages);
+      /** The cascade stage of the attempt being verified: set when it came off the escalation rung. */
+      let stage: "escalate" | undefined;
+      for (;;) {
+        if (await stoppedByAbort(false)) return attempt;
+        if (attempt.gated === true) return attempt;
+        const step = await provabilityPass(provability, ladder, messages, attempt, stage);
+        if (step.kind === "stopped") return attempt;
+        if (step.kind === "stands") return finishGated(provability, ladder, attempt);
+        if (step.kind === "halt") return await haltOnProvability(provability, step);
+        ladder.reruns += 1;
+        if (step.kind === "escalate") {
+          ladder.escalations += 1;
+          const escalated = await escalateOnProvability(messages, step, false);
+          if (escalated === undefined) return finishGated(provability, ladder, attempt);
+          attempt = escalated;
+          stage = "escalate";
+          continue;
+        }
+        // onFail: "retry".
+        messages.push(markSynthetic({ role: "user", content: step.nudge }));
+        await logEvent("user_message", { content: step.nudge, synthetic: true });
+        attempt = await inner(messages);
+        stage = undefined;
+      }
+    } finally {
+      activeLadder = undefined;
+    }
   }
 
   // Single-shot path used by the workflow target and (Section 12) the
@@ -9669,16 +11366,30 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       armTurnTimer();
       // 0.6.0 §7.8 — the shadow re-runs exactly what the primary answered.
       const shadowSeed = [...messages];
-      const { terminalContent } = await runCommitteeOrTurn(messages);
+      // 0.8.0 §5.1 — the provability gate wraps the (committee or evaluated)
+      // turn; without `opts.provability` it is exactly `runCommitteeOrTurn`.
+      const { terminalContent, footer } = await runProvableTurn(messages, runCommitteeOrTurn);
       clearTurnTimer();
-      maybeScheduleShadow(shadowSeed, terminalText(terminalContent));
+      const answer = terminalText(terminalContent);
+      maybeScheduleShadow(shadowSeed, answer);
       bus.publish({
         ...bus.envelope(),
         kind: "turn_end",
         turn: runContext.turnNumber,
         durationMs: performance.now() - t0SingleTurn,
       });
-      return terminalText(terminalContent);
+      // §5.4 — `footerTarget: "reply"`: the proof footer travels in the text
+      // the run RETURNS (what a channel bot sends, what the gateway answers),
+      // after a blank line — never in `messages`, so the transcript the model
+      // reads next turn holds the answer alone. An empty answer carries the
+      // footer alone (no leading blank line). Under `provability:` the text
+      // served is the answer with every footer-shaped line of it marked as
+      // the model's (`./forged-footer`, §1 principle 2): whatever `render`
+      // and the target say, no line the model wrote passes for the verdict.
+      // The transcript and the shadow keep its own words.
+      const served = opts.provability !== undefined ? neutralizeFooterLines(answer) : answer;
+      if (footer === undefined) return served;
+      return served === "" ? footer : `${served}\n\n${footer}`;
     } finally {
       // 0.6.0 §7.8 — the single turn IS the run. A per-message host
       // (`sideCallDrain`) takes the in-flight shadow and the served text
@@ -9973,7 +11684,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       try {
         // 0.6.0 §7.8 — the shadow re-runs exactly what the primary answered.
         const shadowSeed = [...messages];
-        const { terminalContent } = await runEvaluatedTurn(messages);
+        // 0.8.0 §5.1 — the provability gate wraps the evaluated turn; without
+        // `opts.provability` it is exactly `runEvaluatedTurn`. The REPL
+        // returns no per-turn reply, so a `footerTarget: "reply"` footer has
+        // nothing to ride on and is written to the output like `"stream"`.
+        const { terminalContent, footer } = await runProvableTurn(messages, runEvaluatedTurn);
+        if (footer !== undefined) out.write(`${footer}\n`);
         // Item 1 — the exit rating prompt's "worth rating" floor: count only
         // turns that ended in a real assistant answer.
         if (terminalText(terminalContent).trim() !== "") assistantAnswers += 1;

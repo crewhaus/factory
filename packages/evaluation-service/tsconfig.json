@@ -1,0 +1,58 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../default-skills"
+    },
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../eval-judge"
+    },
+    {
+      "path": "../ir"
+    },
+    {
+      "path": "../logging"
+    },
+    {
+      "path": "../model-service"
+    },
+    {
+      "path": "../proof-checker"
+    },
+    {
+      "path": "../provability"
+    },
+    {
+      "path": "../runtime-core"
+    },
+    {
+      "path": "../skills-registry"
+    },
+    {
+      "path": "../tenancy"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-fetch"
+    },
+    {
+      "path": "../tool-proof"
+    },
+    {
+      "path": "../tool-result-store"
+    },
+    {
+      "path": "../trace-event-bus"
+    }
+  ],
+  "include": ["src/**/*"]
+}

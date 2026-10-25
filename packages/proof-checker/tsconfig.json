@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../sandbox"
+    },
+    {
+      "path": "../sandbox-image-lean4"
+    },
+    {
+      "path": "../sandbox-image-z3"
+    }
+  ],
+  "include": ["src/**/*"]
+}

@@ -4,7 +4,7 @@ What a harness's own logs say it should change.
 
 | Module | Answers |
 |---|---|
-| `advise-rules` | which routing, tool and context changes the session logs actually support |
+| `advise-rules` | which routing, tool and context changes the session logs actually support, and why the provability gate keeps failing |
 | `shadow-lane` | which side of a shadow audition an arm was on |
 | `doctor-checks` | whether this spec can run here: model credentials, channel env |
 | `doctor-fix` | a doctor finding turned into the edit that closes it |
@@ -27,6 +27,16 @@ own permissions. `permissions-suggest` only ever proposes — read-only tools
 get an `alwaysAllow` first (lowest blast radius), and a repeatedly *denied*
 ask gets a tightening to `alwaysAsk`, never a blanket `alwaysDeny`: a human
 denied that call, not every future one.
+
+The provability floor is another. When, by default, a fifth or more of at
+least five verified gated turns still fail the gate after their retries, the
+pressure finding may patch `provability.max_retries` and gives advice keyed
+to the most common unmet reason (read from the proof bundles the caller
+passes to `withProvabilityBundles`), but it never suggests lowering
+`provability.level`, and says why: the floor is the bar the provability
+graders measure against. A separate `provability-unverified` finding fires
+when that share of the gated turns stood unverified instead: the gate's
+verifier failed open, so those answers were served unchecked.
 
 ## Both sides of a shadow audition are in the same lane
 

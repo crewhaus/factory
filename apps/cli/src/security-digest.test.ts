@@ -7,9 +7,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openAuditLog } from "@crewhaus/audit-log";
+import { type AuditKind, openAuditLog } from "@crewhaus/audit-log";
 import {
   DECLARED_AUDIT_KINDS,
+  DECLARED_AUDIT_KINDS_COMPLETE,
   InvalidSinceFlagError,
   NotifyError,
   buildSecurityDigest,
@@ -340,6 +341,47 @@ describe("buildSecurityDigest — audit rollup", () => {
     expect(d.audit.countsByKind).toEqual({ routing_promotion: 1 });
     expect(d.audit.absentDeclaredKinds).not.toContain("routing_promotion");
     expect(DECLARED_AUDIT_KINDS).toContain("routing_promotion");
+  });
+
+  // 0.8.0 (design §5.3, §15) — the provability gate's `provability_evaluated`
+  // is a closed-union member like every kind above: a gated harness whose sink
+  // was never wired must show it under "declared kinds with no records".
+  test("a provability_evaluated record is counted, and its absence is reported", async () => {
+    const empty = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    expect(empty.audit.absentDeclaredKinds).toContain("provability_evaluated");
+    await seedAudit([
+      {
+        kind: "provability_evaluated",
+        payload: {
+          level: "grounded",
+          verdict: "pass",
+          score: 1,
+          achieved: "grounded",
+          claimCount: 2,
+          met: 2,
+          retryIndex: 0,
+          bundleHash: "0".repeat(64),
+          turnNumber: 1,
+        },
+        atMs: NOW - MS_PER_DAY,
+      },
+    ]);
+    const d = buildSecurityDigest({ rootDir: root, window: window(7), now: () => NOW });
+    expect(d.audit.countsByKind).toEqual({ provability_evaluated: 1 });
+    expect(d.audit.absentDeclaredKinds).not.toContain("provability_evaluated");
+  });
+
+  // F7 recurred twice (`feedback_recorded`, then 0.8.0's
+  // `provability_evaluated`): `satisfies ReadonlyArray<AuditKind>` is a subset
+  // check. The completeness check is a type in security-digest.ts, so the
+  // build (`tsc -b`, which skips test files) fails on a missing kind; this
+  // pins that it exists and that the list holds no duplicate.
+  test("DECLARED_AUDIT_KINDS lists every AuditKind (the type-level completeness check holds)", () => {
+    const complete: true = DECLARED_AUDIT_KINDS_COMPLETE;
+    expect(complete).toBe(true);
+    const kinds: readonly AuditKind[] = DECLARED_AUDIT_KINDS;
+    expect(new Set(kinds).size).toBe(kinds.length);
+    expect(kinds).toContain("provability_evaluated");
   });
 
   test("F1 defense in depth: control chars in audit payload strings are stripped and clamped", async () => {

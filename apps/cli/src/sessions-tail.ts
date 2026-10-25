@@ -25,8 +25,8 @@ export type FormatSessionEventOptions = {
   readonly maxChars?: number;
   /**
    * 0.6.0 (design §8.2) — when true, render ONLY the conversational
-   * transcript (the 0.5.x behaviour): the route / cost / eval / stage lines
-   * below are skipped. Default false: a hybrid turn shows its shape — which
+   * transcript (the 0.5.x behaviour): the route / cost / eval / stage /
+   * provability lines below are skipped. Default false: a hybrid turn shows its shape — which
    * candidate served, what it cost, how the judge graded it, which stage ran.
    */
   readonly transcriptOnly?: boolean;
@@ -73,7 +73,9 @@ function modelWithProfile(payload: Record<string, unknown>, maxChars: number): s
 /**
  * 0.6.0 (design §8.2) — render the durable routing / cost / eval / stage
  * lines the session JSONL now carries, one indented line each, so `sessions
- * tail` shows the shape of a hybrid turn beside its transcript. Every field
+ * tail` shows the shape of a hybrid turn beside its transcript. 0.8.0 adds
+ * the provability gate's verdict (`provability_graded`) and each ProofCheck
+ * run (`proof_checked`). Every field
  * is duck-typed and optional (0.5.x lines carry fewer of them); a payload
  * that names nothing renderable still yields a line naming the kind. Every
  * string field is passed through {@link field} (one line, capped at
@@ -170,6 +172,62 @@ function formatRoutingEvent(
       if (retry !== undefined && retry > 0) parts.push(`retry ${retry}`);
       return parts.join(" ");
     }
+    case "provability_graded": {
+      // 0.8.0 (design §2 principle 2, §5.3) — the gate's verdict on one
+      // pass, the line that explains a provability retry nudge (`sys>`) and
+      // the footer. ✓ pass, ✗ fail, ? unverified (a verifier that threw), as
+      // the footer marks them; the claim count leaves assumptions out, as
+      // the score does. A proof's hypotheses are assumptions too (design
+      // §6.4, §10): shown beside them, as the footer, `show` and `audit`
+      // count them, but never taken off the claims (they are not claims).
+      const verdict = f(payload["verdict"]);
+      const mark = verdict === "pass" ? "✓" : verdict === "fail" ? "✗" : "?";
+      const parts = [`  ⚖ provability ${f(payload["level"]) ?? "?"} ${mark}`];
+      if (verdict !== undefined && verdict !== "pass" && verdict !== "fail") parts.push(verdict);
+      const claims = num(payload["claims"]);
+      const met = num(payload["met"]);
+      const assumptions = num(payload["assumptions"]) ?? 0;
+      if (claims !== undefined && met !== undefined) {
+        const counted = Math.max(0, claims - assumptions);
+        parts.push(`${met}/${counted} ${counted === 1 ? "claim" : "claims"}`);
+      }
+      const shown = assumptions + (num(payload["hypotheses"]) ?? 0);
+      if (shown > 0) {
+        parts.push(`${shown} ${shown === 1 ? "assumption" : "assumptions"}`);
+      }
+      const achieved = f(payload["achieved"]);
+      if (verdict === "fail" && achieved !== undefined) parts.push(`(reached ${achieved})`);
+      const judgeModel = f(payload["judgeModel"]);
+      if (judgeModel !== undefined) parts.push(`waiver by ${judgeModel}`);
+      const escalatedTo = f(payload["escalatedTo"]);
+      if (escalatedTo !== undefined) parts.push(`→ escalate ${escalatedTo}`);
+      const retry = num(payload["retryIndex"]);
+      if (retry !== undefined && retry > 0) parts.push(`retry ${retry}`);
+      const bundlePath = f(payload["bundlePath"]);
+      if (bundlePath !== undefined) parts.push(`· ${bundlePath}`);
+      return parts.join(" ");
+    }
+    case "proof_checked": {
+      // 0.8.0 (design §7) — one ProofCheck run: the checker, whether it
+      // accepted the proof, and the artifact a `proof:` citation names.
+      const parts = [
+        `  ∎ proof ${f(payload["checker"]) ?? "?"} ${
+          payload["ok"] === true ? "✓ accepted" : "✗ rejected"
+        }`,
+      ];
+      const artifact = f(payload["artifactId"]);
+      if (artifact !== undefined) parts.push(artifact);
+      const ms = num(payload["durationMs"]);
+      if (ms !== undefined) parts.push(`(${Math.round(ms)}ms)`);
+      const axioms = Array.isArray(payload["axioms"])
+        ? (payload["axioms"] as unknown[]).map((a) => f(a)).filter((a) => a !== undefined)
+        : [];
+      if (axioms.length > 0) {
+        const listed = f(axioms.join(", "));
+        if (listed !== undefined) parts.push(`axioms: ${listed}`);
+      }
+      return parts.join(" ");
+    }
     default:
       return undefined;
   }
@@ -185,6 +243,8 @@ export const ROUTING_TAIL_KINDS: ReadonlySet<string> = new Set([
   "model_stage",
   "eval_graded",
   "judge_verdict",
+  "provability_graded",
+  "proof_checked",
 ]);
 
 /** UTC HH:MM:SS for a session event's epoch-ms `ts` (deterministic across TZs). */

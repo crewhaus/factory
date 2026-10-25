@@ -23,7 +23,11 @@
  *
  * Deliberate scope: only tool EXECUTION is recorded/replayed. The agent stack
  * is still wired (MCP servers still boot, so their tool schemas exist) and the
- * model still runs live — this is a tool-side cassette, not a full VCR.
+ * model still runs live — this is a tool-side cassette, not a full VCR. The
+ * one exception is a call whose result NAMES state it left behind for
+ * something other than the model to read ({@link ToolCallEffects}): that
+ * state is filed with the call's record and put back on a replay hit, or the
+ * replay would serve a result that points at nothing.
  *
  * SENSITIVITY: a recording holds tool args and results VERBATIM — bash stdout,
  * file contents, MCP responses, whatever a credentialed tool returned. Treat a
@@ -77,8 +81,52 @@ export type ToolRecord = {
   readonly result?: ToolExecuteResult;
   /** The thrown error's message when the call threw. Absent on success. */
   readonly error?: string;
+  /**
+   * What {@link ToolCallEffects.capture} filed for this call — the state its
+   * result names (a proof artifact, for the gate's `ProofCheck`). Absent for
+   * every tool that has none, and on every cassette recorded before 0.8.0.
+   * Verbatim like `args`/`result`.
+   */
+  readonly effects?: unknown;
   readonly ts: string;
 };
+
+/**
+ * Stable prefix of the failure a replay raises when a recorded call's
+ * {@link ToolRecord.effects} cannot be put back. Deterministic for the same
+ * reason a miss is (same entry, same cassette), so the runner withholds its
+ * noise retry for it too.
+ */
+export const TOOL_REPLAY_RESTORE_MARKER = "tool replay restore failed";
+
+/**
+ * A tool whose result NAMES state it left behind, read later by something
+ * other than the model. Replaying the result alone is not a faithful replay
+ * of such a call: the model is told the state exists, and the reader finds
+ * nothing. The one such tool today is the provability gate's `ProofCheck`
+ * (0.8.0, design §9.1): its result carries a `prf_…` id, and the gate
+ * resolves a `proof:` citation against the artifact FILE that id names —
+ * see the eval runner's `proofCassetteEffects`.
+ */
+export type ToolCallEffects = {
+  /**
+   * RECORD: after the live call returned, the state to file with its record
+   * (JSON-serializable), or `undefined` for none. A throw means the cassette
+   * could not carry this call: it is recorded as the call's ERROR and
+   * re-raised, so the recorded run and every replay of it see the same failed
+   * call — never a recorded success whose state a replay cannot restore.
+   */
+  readonly capture: (result: ToolExecuteResult) => Promise<unknown>;
+  /**
+   * REPLAY: on a hit whose record carries `effects`, re-create that state
+   * before the recorded result is returned. A throw is terminal for the
+   * sample ({@link toolReplayRestoreError}).
+   */
+  readonly restore: (effects: unknown) => Promise<void>;
+};
+
+/** Per tool NAME, the {@link ToolCallEffects} its calls carry through a cassette. */
+export type ToolEffectsByName = ReadonlyMap<string, ToolCallEffects>;
 
 /**
  * Deterministic JSON encoding: object keys sorted recursively so the same
@@ -354,24 +402,56 @@ export function toolReplayMissError(args: {
   });
 }
 
+/** The terminal failure a replay raises when a recorded call's effects cannot be put back. */
+export function toolReplayRestoreError(args: {
+  readonly sampleId: string;
+  readonly toolName: string;
+  readonly argsHash: string;
+  readonly recordingPath: string;
+  readonly reason: string;
+}): RunFailedError {
+  return new RunFailedError({
+    class: "config",
+    title: TOOL_REPLAY_RESTORE_MARKER,
+    detail:
+      `sample "${args.sampleId}" replayed tool "${args.toolName}" (args-sha256 ${args.argsHash}) ` +
+      `from ${args.recordingPath}, but the state its result names could not be put back: ${clip(args.reason, 300)}`,
+    remediation: "re-record with `crewhaus eval ... --record-tools <dir>`",
+    exitCode: EXIT_CODES.config,
+  });
+}
+
 /**
  * Wrap a sample's tool list so every execution is recorded. Additive by
  * construction: the wrapper delegates to the real `execute` and returns its
  * value untouched (a throw is recorded as `error` and re-thrown verbatim), so
- * a recorded run behaves exactly like an unrecorded one.
+ * a recorded run behaves exactly like an unrecorded one. A tool named in
+ * `effects` also files what its {@link ToolCallEffects.capture} returns.
  */
 export function recordingTools(
   tools: ReadonlyArray<RegisteredTool>,
   sampleId: string,
   recorder: ToolRecorder,
+  effects?: ToolEffectsByName,
 ): RegisteredTool[] {
   return tools.map((tool) => ({
     ...tool,
     execute: async (input: unknown, ctx?: Parameters<RegisteredTool["execute"]>[1]) => {
       const argsHash = hashToolArgs(input);
+      const capture = effects?.get(tool.name)?.capture;
       try {
         const result = await tool.execute(input, ctx);
-        recorder.record({ sampleId, toolName: tool.name, argsHash, args: input, result });
+        // Inside the try: a capture that throws is recorded as the call's
+        // error and re-raised (see ToolCallEffects.capture).
+        const captured = capture !== undefined ? await capture(result) : undefined;
+        recorder.record({
+          sampleId,
+          toolName: tool.name,
+          argsHash,
+          args: input,
+          result,
+          ...(captured !== undefined ? { effects: captured } : {}),
+        });
         return result;
       } catch (err) {
         recorder.record({
@@ -393,13 +473,21 @@ export function recordingTools(
  * (the tool-executor boundary turns it into the same `is_error` tool result
  * the live run produced). A miss follows the policy: `error` throws the
  * terminal {@link toolReplayMissError}; `live` executes the real tool — and
- * records nothing, because a replay directory is read-only evidence.
+ * records nothing, because a replay directory is read-only evidence (a live
+ * call leaves its own state behind, so nothing needs restoring).
+ *
+ * A hit whose record carries {@link ToolRecord.effects} has them put back
+ * through `effects`' restorer for that tool BEFORE the recorded result is
+ * returned, so whatever reads the state the result names finds it. A tool
+ * with no restorer here leaves them unread: nothing in this run reads that
+ * state (a gated recording replayed by an ungated spec, say).
  */
 export function replayingTools(
   tools: ReadonlyArray<RegisteredTool>,
   sampleId: string,
   replayer: ToolReplayer,
   missPolicy: ToolReplayMissPolicy,
+  effects?: ToolEffectsByName,
 ): RegisteredTool[] {
   return tools.map((tool) => ({
     ...tool,
@@ -417,6 +505,20 @@ export function replayingTools(
         });
       }
       if (hit.error !== undefined) throw new Error(hit.error);
+      const restore = effects?.get(tool.name)?.restore;
+      if (hit.effects !== undefined && restore !== undefined) {
+        try {
+          await restore(hit.effects);
+        } catch (err) {
+          throw toolReplayRestoreError({
+            sampleId,
+            toolName: tool.name,
+            argsHash,
+            recordingPath: replayer.recording.path,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       return hit.result ?? "";
     },
   }));

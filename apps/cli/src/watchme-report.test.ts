@@ -13,12 +13,13 @@
  * test files are excluded from `tsc -b`, so the relative import is safe), the
  * real routing-store scoreboard, and the real defaultGraderRegistry.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -43,8 +44,10 @@ import {
   judgmentsToFeedback,
   nodeReportFs,
   rollupContinuity,
+  rollupProvability,
   runWatchmeAllReport,
   runWatchmeReport,
+  sessionProvability,
 } from "./watchme-report";
 import type { WatchmeJudgePhase, WatchmeReportDeps, WatchmeReportOptions } from "./watchme-report";
 
@@ -149,8 +152,24 @@ type Harness = {
   store: ReturnType<typeof openWatchmeStore>;
 };
 
+// Every temp root a test makes, removed after it: the suite left one
+// directory per harness in $TMPDIR on every run (review I40). `made` keeps
+// them all for the last test's check that none outlived its test.
+const made: string[] = [];
+let live: string[] = [];
+function tempRoot(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  made.push(root);
+  live.push(root);
+  return root;
+}
+afterEach(() => {
+  for (const root of live) rmSync(root, { recursive: true, force: true });
+  live = [];
+});
+
 function makeHarness(): Harness {
-  const root = mkdtempSync(join(tmpdir(), "watchme-report-"));
+  const root = tempRoot("watchme-report-");
   const crewhausDir = join(root, ".crewhaus");
   const sessionsDir = join(crewhausDir, "sessions");
   mkdirSync(sessionsDir, { recursive: true });
@@ -625,9 +644,552 @@ describe("rollupContinuity", () => {
   });
 });
 
+// -- 0.8.0 §9.3 — the provability gate's verdicts ---------------------------
+
+/** One `provability_graded` event-log line as runtime-core's gate writes it. */
+function gradedLine(
+  turnNumber: number,
+  verdict: "pass" | "fail" | "unverified",
+  extra: Record<string, unknown> = {},
+): unknown {
+  return ev("provability_graded", {
+    level: "grounded",
+    verdict,
+    score: verdict === "pass" ? 1 : 0.5,
+    threshold: 1,
+    achieved: verdict === "pass" ? "grounded" : "cited",
+    claims: verdict === "unverified" ? 0 : 2,
+    met: verdict === "pass" ? 2 : verdict === "fail" ? 1 : 0,
+    unmet: verdict === "fail" ? 1 : 0,
+    assumptions: 0,
+    retryIndex: 0,
+    maxRetries: 1,
+    turnNumber,
+    bundleHash: `sha256:${turnNumber}`,
+    ...extra,
+  });
+}
+
+const asLogged = (lines: ReadonlyArray<unknown>): LoggedEvent[] => lines as LoggedEvent[];
+
+describe("sessionProvability", () => {
+  test("no provability_graded line: undefined (the heuristic stays in charge)", () => {
+    expect(sessionProvability(asLogged([userMsg("hi"), assistantMsg("hello")]))).toBeUndefined();
+  });
+
+  test("each turn's STANDING pass is its last: a failed-then-passed retry ends passing", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "fail"),
+        gradedLine(1, "pass", { retryIndex: 1 }),
+        gradedLine(2, "fail", { bundlePath: "/proofs/turn-2.json" }),
+      ]),
+    );
+    expect(got?.digest).toEqual({
+      level: "grounded",
+      achieved: "cited",
+      unmet: 1,
+      turns: 2,
+      failing: 1,
+    });
+    expect(got).toMatchObject({ claims: 4, met: 3, counted: 4 });
+    expect(got?.failingBundlePaths).toEqual(["/proofs/turn-2.json"]);
+  });
+
+  test("unverified turns are gated turns but carry no claims, failure or rung — tallied apart", () => {
+    const got = sessionProvability(asLogged([gradedLine(1, "pass"), gradedLine(2, "unverified")]));
+    expect(got?.digest).toEqual({
+      level: "grounded",
+      achieved: "grounded",
+      unmet: 0,
+      turns: 2,
+      failing: 0,
+      unverified: 1,
+    });
+    expect(got?.verified).toBe(1);
+    const only = sessionProvability(asLogged([gradedLine(1, "unverified")]));
+    expect(only?.digest).toMatchObject({ achieved: "none", turns: 1, unverified: 1 });
+    expect(only?.verified).toBe(0);
+    // A session with no unverified turn carries no `unverified` key (additive).
+    const clean = sessionProvability(asLogged([gradedLine(1, "pass")]));
+    expect(clean?.digest).not.toHaveProperty("unverified");
+  });
+
+  test("assumptions leave the counted denominator; malformed lines are skipped", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { claims: 3, met: 2, assumptions: 1 }),
+        ev("provability_graded", { verdict: "pass" }),
+        ev("provability_graded", { turnNumber: 5, level: "off", verdict: "pass" }),
+      ]),
+    );
+    expect(got).toMatchObject({ claims: 3, met: 2, counted: 2 });
+    expect(got?.digest.turns).toBe(1);
+  });
+
+  test("cited-floor turns keep their failure and rung but never enter the grounded counts (review I33)", () => {
+    // Design §2, cited row: "a fabricated-but-well-formed reference passes
+    // this rung" — a met claim at `cited` is not a grounded one.
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { level: "cited", achieved: "cited" }),
+        gradedLine(2, "fail", { level: "cited", achieved: "none", met: 1, unmet: 1 }),
+        gradedLine(3, "pass"),
+      ]),
+    );
+    expect(got?.digest).toEqual({
+      level: "cited",
+      achieved: "none",
+      unmet: 1,
+      turns: 3,
+      failing: 1,
+      citedFloor: 2,
+    });
+    expect(got).toMatchObject({ verified: 3, grounding: 1, claims: 2, met: 2, counted: 2 });
+    const citedOnly = sessionProvability(
+      asLogged([gradedLine(1, "pass", { level: "cited", achieved: "cited" })]),
+    );
+    expect(citedOnly).toMatchObject({ verified: 1, grounding: 0, claims: 0, met: 0 });
+  });
+
+  test("declared assumptions, accepted and refused, are tallied over the verified passes (review I61)", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { claims: 2, met: 0, assumptions: 2 }),
+        gradedLine(2, "fail", { claims: 1, met: 0, unmet: 1, assumptionsRefused: 1 }),
+        gradedLine(3, "unverified", { assumptions: 5 }),
+      ]),
+    );
+    expect(got?.digest).toMatchObject({ assumptions: 2, assumptionsRefused: 1, unverified: 1 });
+    expect(got).toMatchObject({ claims: 3, met: 0, counted: 1 });
+    // None declared: no key (additive).
+    expect(sessionProvability(asLogged([gradedLine(1, "pass")]))?.digest).not.toHaveProperty(
+      "assumptions",
+    );
+  });
+
+  test("a proof's hypotheses are assumptions too — tallied, never claims (design §6.4, §10; review I35)", () => {
+    // summarizeBundle carries the hypotheses accepted proofs rest on as
+    // `hypotheses`, apart from the declared `assumptions`.
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", {
+          level: "proven",
+          achieved: "proven",
+          claims: 1,
+          met: 1,
+          hypotheses: 2,
+        }),
+        gradedLine(2, "pass", { claims: 2, met: 1, assumptions: 1, hypotheses: 1 }),
+        gradedLine(3, "unverified", { hypotheses: 4 }),
+      ]),
+    );
+    expect(got?.digest).toMatchObject({ assumptions: 4, unverified: 1 });
+    // Not claims: the counted claims leave out only the declared assumption.
+    expect(got).toMatchObject({ claims: 3, met: 2, counted: 2 });
+  });
+
+  test("the floor is the most common one", () => {
+    const got = sessionProvability(
+      asLogged([
+        gradedLine(1, "pass", { level: "cited", achieved: "cited" }),
+        gradedLine(2, "pass", { level: "checked", achieved: "checked" }),
+        gradedLine(3, "pass", { level: "checked", achieved: "checked" }),
+      ]),
+    );
+    expect(got?.digest).toMatchObject({ level: "checked", achieved: "cited" });
+  });
+});
+
+describe("rollupProvability", () => {
+  const obs = (provability?: Record<string, unknown>) =>
+    ({
+      v: 1,
+      sessionId: "sess_0000000000000001",
+      specName: "s",
+      target: "cli",
+      ts: 0,
+      turnCount: 1,
+      joinConfidence: "ordered",
+      models: [],
+      toolStats: [],
+      intentKeys: [],
+      ...(provability !== undefined ? { factuality: { claims: 1, grounded: 1, provability } } : {}),
+    }) as never;
+
+  test("sums the gated sessions and tallies floors and weakest rungs; none ⇒ undefined", () => {
+    expect(rollupProvability([obs()])).toBeUndefined();
+    expect(
+      rollupProvability([
+        obs({ level: "grounded", achieved: "cited", unmet: 2, turns: 3, failing: 1 }),
+        obs({ level: "grounded", achieved: "grounded", unmet: 0, turns: 2, failing: 0 }),
+        obs(),
+      ]),
+    ).toEqual({
+      sessions: 2,
+      exactSessions: 2,
+      turns: 5,
+      failing: 1,
+      unverified: 0,
+      citedFloor: 0,
+      unmet: 2,
+      assumptions: 0,
+      assumptionsRefused: 0,
+      levels: { grounded: 2 },
+      weakestAchieved: { cited: 1, grounded: 1 },
+    });
+  });
+
+  test("sums the unverified turns", () => {
+    expect(
+      rollupProvability([
+        obs({ level: "grounded", achieved: "none", unmet: 0, turns: 3, failing: 0, unverified: 3 }),
+        obs({
+          level: "grounded",
+          achieved: "cited",
+          unmet: 1,
+          turns: 2,
+          failing: 1,
+          unverified: 1,
+        }),
+      ]),
+    ).toMatchObject({ sessions: 2, turns: 5, failing: 1, unverified: 4 });
+  });
+
+  test("a session with no grounding turn is gated but not exact; cited and assumption counts sum (reviews I33/I61)", () => {
+    expect(
+      rollupProvability([
+        obs({ level: "cited", achieved: "cited", unmet: 0, turns: 2, failing: 0, citedFloor: 2 }),
+        obs({ level: "grounded", achieved: "none", unmet: 0, turns: 1, failing: 0, unverified: 1 }),
+        obs({
+          level: "grounded",
+          achieved: "grounded",
+          unmet: 1,
+          turns: 3,
+          failing: 1,
+          citedFloor: 1,
+          assumptions: 2,
+          assumptionsRefused: 1,
+        }),
+      ]),
+    ).toMatchObject({
+      sessions: 3,
+      exactSessions: 1,
+      citedFloor: 3,
+      unverified: 1,
+      assumptions: 2,
+      assumptionsRefused: 1,
+    });
+  });
+});
+
 // -- full report ------------------------------------------------------------
 
 describe("runWatchmeReport", () => {
+  test("0.8.0 §9.3 — a gated session's factuality is the gate's exact verdict; ungated keeps the heuristic", async () => {
+    const harness = makeHarness();
+    const gatedId = freshSessionId();
+    const bundlePath = join(harness.crewhausDir, "proofs", "fx", gatedId, "turn-1.json");
+    mkdirSync(join(harness.crewhausDir, "proofs", "fx", gatedId), { recursive: true });
+    writeFileSync(
+      bundlePath,
+      JSON.stringify({
+        version: 1,
+        verdict: "fail",
+        claims: [
+          { index: 0, text: "Refunds take 14 days.", status: "met", bindings: [] },
+          { index: 1, text: `The fee is waived for ${SECRET}.`, status: "unmet", bindings: [] },
+        ],
+      }),
+    );
+    writeFileSync(
+      join(harness.sessionsDir, `${gatedId}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window and the fee?"),
+        assistantMsg("Refunds take 14 days [1]. The fee is waived [2]."),
+        gradedLine(1, "fail", { retryIndex: 0 }),
+        gradedLine(1, "fail", { retryIndex: 1, bundlePath }),
+      ]),
+    );
+    seedExactSession(harness); // ungated: the heuristic roll-up
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.outcome).toBe("written");
+    const observations = harness.store.readObservations();
+    const gated = observations.find((o) => o.sessionId === gatedId);
+    expect(gated?.factuality).toEqual({
+      claims: 2,
+      grounded: 1,
+      faithfulness: 0.5,
+      provability: { level: "grounded", achieved: "cited", unmet: 1, turns: 1, failing: 1 },
+    });
+    const ungated = observations.find((o) => o.sessionId !== gatedId);
+    expect(ungated?.factuality?.provability).toBeUndefined();
+    expect(ungated?.factuality?.claims).toBeGreaterThan(0);
+
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.provability).toEqual({
+      sessions: 1,
+      exactSessions: 1,
+      turns: 1,
+      failing: 1,
+      unverified: 0,
+      citedFloor: 0,
+      unmet: 1,
+      assumptions: 0,
+      assumptionsRefused: 0,
+      levels: { grounded: 1 },
+      weakestAchieved: { cited: 1 },
+    });
+    // The unmet claim from the persisted bundle is the example — redacted.
+    expect(report.factuality.exampleUngrounded).toContain("The fee is waived for [REDACTED].");
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("- Provability gate (exact, per turn");
+    expect(md).toContain("replaces the heuristic for 1 of 1 gated session(s)");
+    expect(md).toContain("1 still failing after retries");
+    expect(md).toContain("0 assumption(s)");
+    expect(md).not.toContain(SECRET);
+  });
+
+  test("a gated session whose every turn stood UNVERIFIED is never read as 100% faithful (review W3-C2)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window?"),
+        assistantMsg("Refunds take 14 days [1]."),
+        gradedLine(1, "unverified"),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.outcome).toBe("written");
+    const obs = harness.store.readObservations().find((o) => o.sessionId === id);
+    const f = obs?.factuality;
+    // The digest says what happened…
+    expect(f?.provability).toEqual({
+      level: "grounded",
+      achieved: "none",
+      unmet: 0,
+      turns: 1,
+      failing: 0,
+      unverified: 1,
+    });
+    // …and nothing claims the gate found the answer faithful.
+    expect(f?.vacuous).not.toBe(true);
+    expect(f?.faithfulness).not.toBe(1);
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.meanFaithfulness).not.toBe(1);
+    expect(report.factuality.vacuousSessions).toBe(0);
+    expect(report.factuality.provability).toMatchObject({ unverified: 1, failing: 0 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("1 turn(s) UNVERIFIED");
+  });
+
+  test("a mixed session: the verified turns are the verdict, the unverified ones are tallied", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window?"),
+        assistantMsg("Refunds take 14 days [1]."),
+        gradedLine(1, "pass"),
+        gradedLine(2, "unverified"),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const obs = harness.store.readObservations().find((o) => o.sessionId === id);
+    expect(obs?.factuality).toEqual({
+      claims: 2,
+      grounded: 2,
+      faithfulness: 1,
+      provability: {
+        level: "grounded",
+        achieved: "grounded",
+        unmet: 0,
+        turns: 2,
+        failing: 0,
+        unverified: 1,
+      },
+    });
+    expect(result.report?.factuality.provability).toMatchObject({ turns: 2, unverified: 1 });
+  });
+
+  test("a session gated at CITED keeps the heuristic: the lowest rung never reads as grounded (review I33)", async () => {
+    // One answer citing two URLs, nothing fetched. At `cited` the gate meets
+    // both claims (well-formed references) — design §2: that establishes
+    // nothing about what the sources say.
+    const transcript = [
+      userMsg("What is the refund window and the restocking fee?"),
+      assistantMsg(
+        "Refunds take 14 days [1]. The restocking fee is 15 percent [2].\n\n[1]: https://acme.example/refunds\n[2]: https://acme.example/fees",
+      ),
+    ];
+    const harness = makeHarness();
+    const ungatedId = freshSessionId();
+    writeFileSync(join(harness.sessionsDir, `${ungatedId}.jsonl`), jsonl(transcript));
+    const citedId = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${citedId}.jsonl`),
+      jsonl([
+        ...transcript,
+        gradedLine(1, "pass", { level: "cited", achieved: "cited", claims: 2, met: 2 }),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.outcome).toBe("written");
+    const observations = harness.store.readObservations();
+    const ungated = observations.find((o) => o.sessionId === ungatedId)?.factuality;
+    const cited = observations.find((o) => o.sessionId === citedId)?.factuality;
+    // The heuristic finds the unfetched answer poorly grounded …
+    expect(ungated?.claims).toBe(4);
+    expect(ungated?.faithfulness).toBeLessThan(0.5);
+    // … and turning the cited gate on must not make the same answer look
+    // grounded: before the fix this was {claims: 2, grounded: 2, faithfulness: 1}.
+    const { provability, ...heuristic } = cited ?? { claims: -1, grounded: -1 };
+    expect(heuristic).toEqual(ungated ?? {});
+    expect(provability).toEqual({
+      level: "cited",
+      achieved: "cited",
+      unmet: 0,
+      turns: 1,
+      failing: 0,
+      citedFloor: 1,
+    });
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.meanFaithfulness).toBe(ungated?.faithfulness as number);
+    expect(report.factuality.provability).toMatchObject({
+      sessions: 1,
+      exactSessions: 0,
+      citedFloor: 1,
+    });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("replaces the heuristic for 0 of 1 gated session(s)");
+    expect(md).toContain("1 turn(s) at the cited floor");
+    expect(md).not.toContain("2/2 claim(s) grounded");
+  });
+
+  test("a session mixing floors counts only its grounded-or-higher turns as grounded (review I33)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("What is the refund window?"),
+        assistantMsg("Refunds take 14 days [1]."),
+        gradedLine(1, "pass", { level: "cited", achieved: "cited", claims: 3, met: 3 }),
+        gradedLine(2, "pass"),
+      ]),
+    );
+    await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const obs = harness.store.readObservations().find((o) => o.sessionId === id);
+    expect(obs?.factuality).toMatchObject({ claims: 2, grounded: 2, faithfulness: 1 });
+    expect(obs?.factuality?.provability).toMatchObject({ turns: 2, citedFloor: 1 });
+  });
+
+  test("a gated session whose every claim is a declared assumption is a vacuous pass, never 100% faithful (review I61)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("Was the order placed after the sale?"),
+        assistantMsg(
+          "The order was placed after the sale [A1]. It ships next week [A2].\n\n[A1]: assume: the order date\n[A2]: assume: the shipping date",
+        ),
+        // verify.ts: counted === 0 → "every claim is an assumption", score 1, pass.
+        gradedLine(1, "pass", { claims: 2, met: 0, unmet: 0, assumptions: 2 }),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const f = harness.store.readObservations().find((o) => o.sessionId === id)?.factuality;
+    expect(f).toEqual({
+      claims: 2,
+      grounded: 0,
+      vacuous: true,
+      provability: {
+        level: "grounded",
+        achieved: "grounded",
+        unmet: 0,
+        turns: 1,
+        failing: 0,
+        assumptions: 2,
+      },
+    });
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.vacuousSessions).toBe(1);
+    expect(report.factuality.meanFaithfulness).toBeUndefined();
+    expect(report.factuality.provability).toMatchObject({ assumptions: 2, assumptionsRefused: 0 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("faithfulness n/a");
+    expect(md).toContain("1 vacuous pass(es)");
+    expect(md).toContain("2 assumption(s)");
+  });
+
+  test("refused assumptions are shown beside the accepted ones (review I61)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("Was the order placed after the sale?"),
+        assistantMsg("The order was placed after the sale [A1].\n\n[A1]: assume: the order date"),
+        gradedLine(1, "fail", { claims: 1, met: 0, unmet: 1, assumptionsRefused: 1 }),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const f = harness.store.readObservations().find((o) => o.sessionId === id)?.factuality;
+    expect(f).toMatchObject({ claims: 1, grounded: 0, faithfulness: 0 });
+    expect(f?.vacuous).toBeUndefined();
+    expect(f?.provability).toMatchObject({ assumptionsRefused: 1 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("0 assumption(s) (+1 refused)");
+  });
+
+  test("a proven turn whose proof rests on hypotheses reads as resting on assumptions (design §6.4, §10; review I35)", async () => {
+    const harness = makeHarness();
+    const id = freshSessionId();
+    writeFileSync(
+      join(harness.sessionsDir, `${id}.jsonl`),
+      jsonl([
+        userMsg("Does the discount apply to the order?"),
+        assistantMsg("It applies [1].\n\n[1]: proof:prf_0001"),
+        // The footer reads `1/1 claim · 0 sources · 2 assumptions` for this pass.
+        gradedLine(1, "pass", {
+          level: "proven",
+          achieved: "proven",
+          claims: 1,
+          met: 1,
+          hypotheses: 2,
+        }),
+      ]),
+    );
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    const f = harness.store.readObservations().find((o) => o.sessionId === id)?.factuality;
+    // The hypotheses are not claims: the one claim is met, faithfully.
+    expect(f).toMatchObject({ claims: 1, grounded: 1, faithfulness: 1 });
+    expect(f?.vacuous).toBeUndefined();
+    expect(f?.provability).toMatchObject({ level: "proven", achieved: "proven", assumptions: 2 });
+    const report = result.report;
+    if (report === undefined) throw new Error("unreachable");
+    expect(report.factuality.provability).toMatchObject({ assumptions: 2, assumptionsRefused: 0 });
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).toContain("2 assumption(s)");
+  });
+
+  test("an ungated window renders no provability line and no report key", async () => {
+    const harness = makeHarness();
+    seedExactSession(harness);
+    const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
+    expect(result.report?.factuality.provability).toBeUndefined();
+    const md = readFileSync(join(result.outDir as string, "report.md"), "utf8");
+    expect(md).not.toContain("Provability gate");
+  });
+
   test("no sessions at all → no-sessions outcome", async () => {
     const harness = makeHarness();
     const result = await runWatchmeReport(baseOpts(harness), makeDeps(harness));
@@ -1303,7 +1865,7 @@ describe("runWatchmeAllReport", () => {
       lastSeen: 2,
     };
 
-    const outDir = mkdtempSync(join(tmpdir(), "watchme-all-"));
+    const outDir = tempRoot("watchme-all-");
     const { report, files } = await runWatchmeAllReport(
       { harnesses: [entry(a, "alpha"), entry(b, "beta"), dead], outDir },
       {
@@ -1349,5 +1911,12 @@ describe("runWatchmeAllReport", () => {
     expect(md).toContain("alpha");
     expect(md).toContain("beta");
     expect(md).toContain("[peer-high]");
+  });
+});
+
+// Last in the file, so every test above has run (in order) and been cleaned up.
+describe("temp roots", () => {
+  test("no temp root a test made outlives it (review I40)", () => {
+    expect(made.filter((root) => existsSync(root))).toEqual([]);
   });
 });

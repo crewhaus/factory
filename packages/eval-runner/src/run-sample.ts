@@ -11,6 +11,7 @@ import {
   combineCompiledGraders,
 } from "@crewhaus/eval-grader";
 import { type Event as TranscriptEvent, openEventLog } from "@crewhaus/event-log";
+import type { ProofBundle } from "@crewhaus/provability";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { toolListEntryNames } from "@crewhaus/tool-catalog";
 import type {
@@ -20,6 +21,11 @@ import type {
   TraceEvent,
 } from "@crewhaus/trace-event-bus";
 import { RunnerError } from "./errors";
+import {
+  PROOF_FILENAME,
+  standingBundleFromEvents,
+  standingBundleFromTranscript,
+} from "./provability";
 import { sampleArtifactDirName } from "./resume";
 import { foldRouteDecisions, foldServedModels } from "./routing";
 import type {
@@ -90,6 +96,13 @@ export async function runSample(args: {
     readonly routes?: ReadonlyArray<EvalRouteDecision>;
     readonly servedModels?: ReadonlyArray<ServedModel>;
   }) => ReadonlyArray<GraderEntry>;
+  /**
+   * 0.8.0 §9.1 — observes what the invoker THREW (the result only keeps its
+   * message), so the run loop can tell a classified terminal stop — a
+   * provability `halt` — from infra noise before it spends a retry. Not
+   * persisted anywhere: the artifacts stay byte-identical.
+   */
+  onInvokerError?: (err: unknown) => void;
 }): Promise<SampleResult> {
   const { sample, invoker, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
@@ -108,6 +121,7 @@ export async function runSample(args: {
   let agentOutput = "";
   let transcript: TranscriptEvent[] = [];
   let invokerEvents: ReadonlyArray<TraceEvent> | undefined;
+  let invokerProof: ProofBundle | undefined;
   let error: string | undefined;
   try {
     const result = await invoker({
@@ -119,8 +133,10 @@ export async function runSample(args: {
     agentOutput = result.agentOutput;
     transcript = result.transcript ? [...result.transcript] : [];
     invokerEvents = result.events;
+    invokerProof = result.proof;
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
+    args.onInvokerError?.(err);
   } finally {
     unsubscribe();
   }
@@ -157,6 +173,22 @@ export async function runSample(args: {
     join(sampleDir, "events.jsonl"),
     finalEvents.map((e) => JSON.stringify(e)).join("\n") + (finalEvents.length > 0 ? "\n" : ""),
   );
+
+  // 0.8.0 §9.1 — the provability gate's STANDING bundle: what the invoker
+  // captured, else the file the run's last `provability_graded` event points
+  // at (an `on_fail: halt` throws before the invoker can return it), else the
+  // one the session log's last `provability_graded` line names (a runtime
+  // entry whose own RunContext keeps its events off this bus — the bridged
+  // channel bot's runTurn). Persisted beside the transcript as proof.json and
+  // handed to the graders. A run the gate never saw writes nothing, so its
+  // artifacts are byte-identical.
+  const proof =
+    invokerProof ??
+    standingBundleFromEvents(finalEvents) ??
+    standingBundleFromTranscript(transcriptPath);
+  if (proof !== undefined) {
+    await Bun.write(join(sampleDir, PROOF_FILENAME), `${JSON.stringify(proof, null, 2)}\n`);
+  }
 
   // B14 — count only the assistant turns THIS invocation produced. A
   // multi-turn sample's seeded `history` assistant messages land in the
@@ -204,6 +236,7 @@ export async function runSample(args: {
       transcriptPath,
       stateRootDir: join(sampleDir, ".crewhaus"),
       ...(args.specName !== undefined ? { specName: args.specName } : {}),
+      ...(proof !== undefined ? { proof } : {}),
     },
   };
 
@@ -404,6 +437,57 @@ function computeMetrics(
 }
 
 /**
+ * 0.8.0 §9.1 — the sample's overall grade when some entries carry a
+ * {@link GraderEntry.role}: the `combine:` policy over the role-less entries
+ * (the user's own graders), AND-ed with every `"requirement"` entry's pass;
+ * `"report"` entries are left out. The score is the policy's — or, with no
+ * role-less entry to combine, the fraction of requirements met (a 0..1
+ * number, never a mean over scores of different scales and directions).
+ * No role anywhere ⇒ exactly {@link combinePolicy}, byte for byte.
+ */
+function combineOverall(
+  perGrader: ReadonlyArray<{ name: string } & GradeResult>,
+  graders: ReadonlyArray<GraderEntry>,
+  policy: GraderCombinePolicy | undefined,
+  error: string | undefined,
+): GradeResult {
+  if (graders.every((g) => g.role === undefined)) {
+    return combinePolicy(perGrader, graders, policy, error);
+  }
+  const own: Array<{ name: string } & GradeResult> = [];
+  const ownGraders: GraderEntry[] = [];
+  const required: Array<{ name: string } & GradeResult> = [];
+  perGrader.forEach((result, i) => {
+    const role = graders[i]?.role;
+    if (role === undefined) {
+      own.push(result);
+      ownGraders.push(graders[i] as GraderEntry);
+    } else if (role === "requirement") {
+      required.push(result);
+    }
+  });
+  const met = required.filter((g) => g.passed).length;
+  const base: GradeResult =
+    own.length > 0
+      ? combinePolicy(own, ownGraders, policy, error)
+      : {
+          passed: error === undefined,
+          score: required.length === 0 ? 0 : met / required.length,
+          rationale: error !== undefined ? `agent invocation error: ${error}` : "",
+        };
+  if (error !== undefined) return { ...base, passed: false };
+  const parts = [
+    ...(base.rationale !== "" ? [base.rationale] : []),
+    ...required.map((g) => `[${g.name}: ${g.passed ? "✓" : "✗"}] ${g.rationale}`),
+  ];
+  return {
+    passed: base.passed && met === required.length,
+    score: base.score,
+    rationale: parts.join(" & "),
+  };
+}
+
+/**
  * A4/A5 — merge the per-grader results into the sample's overall grade
  * under the graders config's `combine:` policy.
  *   all       (default) passed = AND of graders, score = unweighted mean —
@@ -416,7 +500,7 @@ function computeMetrics(
  * contributes its failed zero-score `perGrader` entry — the infra-noise
  * evidence lives in `graderError`, unchanged by the combination mode.
  */
-function combineOverall(
+function combinePolicy(
   perGrader: ReadonlyArray<{ name: string } & GradeResult>,
   graders: ReadonlyArray<GraderEntry>,
   policy: GraderCombinePolicy | undefined,

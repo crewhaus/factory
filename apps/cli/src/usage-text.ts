@@ -136,6 +136,8 @@ export function usageText(): string {
     "                                       job that opens a PR and never merges (0.6.0 §9.1)",
     "  init [name]                          scaffold a new crewhaus.yaml (--hybrid writes the",
     "       [--hybrid]                       models: registry + two-arm pool + cascade instead)",
+    "       [--provability <rung>]          declare how much proof answers carry: off | cited |",
+    "                                       grounded | checked | proven (0.8.0)",
     "       [--interactive] [--detect]      interview-driven spec authoring (model, or scripted",
     "                                       fallback with no credentials); validated via parseSpec (item 39)",
     "       [--ci]                          also scaffold .github/workflows/crewhaus-eval.yml —",
@@ -260,6 +262,22 @@ export function usageText(): string {
     "  watchme intents [--all]        recurring-intent digest for this harness or all registered ones",
     "  watchme synthesize             draft an agent-loop spec that mimics observed usage (proposal only)",
     "  watchme publish                distill findings into this harness's local wiki (report --all recalls opted-in peers)",
+    "  provability show [<spec.yaml>]       a persisted proof bundle in long form (default: the",
+    "       [--session <id>]                latest); --json prints it as persisted",
+    "       [--turn N [--pass K]]           a retried turn keeps every pass: --pass K reads its",
+    "                                       K-th (default: the last)",
+    "       [--tenants-root <dir>] [--json] (managed bundles: <dir>/<tenant>/proofs/)",
+    "  provability check <answer.md>        the provability gate, offline, over any document: exit 1",
+    "       --level <rung>                  on fail, so a generated report can be gated in CI",
+    "       [--evidence <dir>] [--session <id>] [--spec <s.yaml>] [--json]",
+    "       [--report]                      a research report.md: grade what its gate verified",
+    "       [--tenant <id>                  a managed answer: read that tenant's log + proofs",
+    "         [--tenants-root <dir>]]       under <dir> (default: CREWHAUS_TENANTS_ROOT)",
+    "  provability audit [<spec.yaml>]      roll-up of proof bundles: achieved rungs, unmet reasons,",
+    "       [--since 7d] [--tenants-root <dir>] [--json]  assumption + judge-waiver rates, gaming signals",
+    "  provability checkers [--json]        every proof checker: available or why not, its language",
+    "  provability prune --older-than 90d   delete old proof bundles (proof artifacts are kept)",
+    "       [--dry-run] [--tenants-root <dir>] [--json]",
     "  datasets list                        all registered datasets + versions (Section 29)",
     "  datasets get <name>[@version]        print a dataset's samples as JSONL",
     "       [--split train|dev|test]",
@@ -298,7 +316,8 @@ export function usageText(): string {
     "       [--dataset <file|registry:ref>]     also pair the golden verdicts a distilled dataset",
     "                                           carries (metadata.user_rating + the rated answer)",
     "  state backup [-o <file.tar.gz>]      snapshot the cwd .crewhaus state dir to a tarball (item 69)",
-    "       [--exclude <glob,glob>]",
+    "       [--exclude <glob,glob>]         managed proof bundles live under CREWHAUS_TENANTS_ROOT",
+    "                                       (default /tmp/crewhaus-tenants) and are not included",
     "  state restore <file.tar.gz>          restore a snapshot (refuses a non-empty .crewhaus)",
     "       [--into <dir>] [--force] [--merge feedback|all]",
     "  services setup <spec.yaml>           provision the external services the spec asks for:",
@@ -432,6 +451,7 @@ export const EVAL_USAGE =
   "[--sample-timeout-ms N] [--budget-usd F] " +
   "[--record-tools <dir> | --replay-tools <dir> [--replay-miss error|live]] " +
   "[--resume <runDir>] " +
+  "[--provability <level>] " +
   "[--models <m1,m2,...>]\n" +
   "  Before any model spend, an OFFLINE preflight lint-lite refuses runs with\n" +
   "  duplicate sample ids (artifact dirs collide, flip detection corrupts) or\n" +
@@ -575,8 +595,9 @@ export const EVAL_USAGE =
   "  + labels/passing_labels — the judge picks exactly one label; the label's\n" +
   "  declared 0..1 score is the grade).\n" +
   "  Graders with `type: registry` resolve against the default grader registry —\n" +
-  "  the specialty packs (continuity.*, twelve.*, nlg.*, semantic.similarity,\n" +
-  "  multimodal.*, safety.*, calibration.*, consistency.*) plus .crewhaus/graders\n" +
+  "  the specialty packs (continuity.*, twelve.*, provability.*, nlg.*,\n" +
+  "  semantic.similarity, multimodal.*, safety.*, calibration.*, consistency.*)\n" +
+  "  plus .crewhaus/graders\n" +
   "  plugins, which win on name collisions. Constructed once per run and shared\n" +
   "  with every matrix cell.\n" +
   "  Registry entries may carry `opts:` — pack construction options (thresholds,\n" +
@@ -616,6 +637,20 @@ export const EVAL_USAGE =
   "  non-zero — a mis-pointed sentinel is loud, never silently green). Sentinel mode\n" +
   "  skips the run-history index/baselines/triage and the regression union (a probe,\n" +
   "  not lineage); --gate/--no-promote/--models are rejected with it.\n" +
+  "  --provability <level> measures a provability rung (cited | grounded |\n" +
+  "  checked | proven) without editing the spec: the spec's provability: block\n" +
+  "  runs at that level, or `provability: <level>` with defaults when it has none.\n" +
+  "  The gate runs in every sample exactly as in production, so the cost line\n" +
+  "  shows what the rung costs, and the provability.* graders join the run at\n" +
+  "  that level: a sample passes only when your graders pass AND every\n" +
+  "  provability.* bar holds (costPerProvenClaim is reported, never a bar). A\n" +
+  "  sample's metadata.provability.level gates and grades it at its own level;\n" +
+  "  metadata.provability.expected_sources lists sources that must back the\n" +
+  "  answer. Each sample's proof bundle lands in <sample>/proof.json. A spec that\n" +
+  "  already declares provability: is gated the same way without the flag — name\n" +
+  "  the graders with type: registry. A --provability run is recorded but never\n" +
+  "  becomes the baseline: --gate, --sentinel and --models are refused with it,\n" +
+  "  and --resume must repeat it.\n" +
   "  --voice [--replay-dir <dir>] replays recorded call sessions through the voice\n" +
   "  grader pack (latency / barge-in / transcript coverage) with the --max-ttft-ms /\n" +
   "  --max-turn-latency-ms / --max-barge-in-yield-ms budgets. Adding --graders\n" +

@@ -360,6 +360,27 @@ describe("continuity.proofHonesty", () => {
     expect(res.passed).toBe(true);
     expect(res.rationale).toContain("1 rejected proof attempt(s)");
   });
+
+  test("a proof by assertion (verdict unverified, continuity.proof: off) is an anomaly, never a rejected attempt", async () => {
+    const dir = newSampleDir();
+    writeSessionFile(
+      dir,
+      S1,
+      [
+        asst("I have implemented the parser."),
+        proof("plan-0001", 1, "unverified"),
+        planUpdate("plan-0001", "prove_step", 1),
+      ],
+      1000,
+    );
+    const res = await proofHonesty(SAMPLE, makeRun(dir, S1));
+    expect(res.passed).toBe(false);
+    expect(res.score).toBe(0);
+    expect(res.rationale).toContain("ANOMALY");
+    expect(res.rationale).toContain("plan-0001#1");
+    expect(res.rationale).toContain("1 of them proven by assertion");
+    expect(res.rationale).not.toContain("rejected proof attempt");
+  });
 });
 
 // ---------------------------------------------------------------------------

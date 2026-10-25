@@ -10,9 +10,11 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildEvidenceIndex, verifyDocument } from "@crewhaus/provability";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { RunnerError } from "./errors";
 import { EXAM_SESSION_PREAMBLE, type ExamChatLoopOptions, createExamRunner } from "./exam";
+import { defaultProvabilityBlock } from "./provability";
 
 let tmp: string;
 
@@ -282,6 +284,51 @@ graders:
     expect(logged).toContain("graders.weight_ignored");
     expect(logged).toContain("cites_wiki");
     expect(logged).toContain("graders.passing_threshold_ignored");
+  });
+
+  test("a registry-named provability.* grader takes its --provability role on the exam too (review I32)", async () => {
+    // design §9.1: costPerProvenClaim is reported, never a vote — under
+    // `combine: any` its always-pass must not carry a failing sample.
+    const { datasetPath } = writeExamFiles();
+    const anyGradersPath = join(tmp, "eval", "graders-provability.yaml");
+    writeFileSync(
+      anyGradersPath,
+      `combine: any
+graders:
+  - name: cites_wiki
+    type: contains
+    substring: "(coffee/"
+  - name: cost
+    type: registry
+    grader: provability.costPerProvenClaim
+`,
+    );
+    const proof = await verifyDocument(
+      "Extraction yield is about 20 percent [1].\n\n[1]: https://sca.example/yield",
+      {
+        config: defaultProvabilityBlock("cited"),
+        evidence: buildEvidenceIndex([]),
+      },
+    );
+    const writes: string[] = [];
+    const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    let report: Awaited<ReturnType<ReturnType<typeof createExamRunner>>>;
+    try {
+      const runner = createExamRunner(
+        runnerOpts({
+          invoker: async () => ({ agentOutput: "roughly 8-12%", proof }),
+          outDir: join(tmp, "exam-provability"),
+        }),
+      );
+      report = await runner({ datasetPath, gradersPath: anyGradersPath });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(report.passed).toBe(0);
+    expect(writes.join("")).toContain("graders.provability_outside_policy");
   });
 
   test("an invoker error becomes a failed outcome with the error surfaced", async () => {

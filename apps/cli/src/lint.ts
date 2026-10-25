@@ -1,6 +1,23 @@
-import { type IrNode, checkShapeTools, collectCompileWarnings, lower } from "@crewhaus/compiler";
+import {
+  type CompileWarning,
+  type IrNode,
+  checkShapeTools,
+  collectCompileWarnings,
+  lower,
+  lowerWithWarnings,
+  provabilityOf,
+  sandboxOnlyProvabilityCheckers,
+} from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
+import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
+import type { IrPermissions, IrProvability } from "@crewhaus/ir";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
+import {
+  BUILTIN_DEFAULT_RULES,
+  type PermissionRule,
+  emptyRuleSet,
+  evaluate,
+} from "@crewhaus/permission-engine";
 import {
   type Spec,
   SpecParseError,
@@ -17,6 +34,7 @@ import {
   type ToolShape,
   builtinKeyForName,
   builtinToolsFor,
+  toolsInCategory,
 } from "@crewhaus/tool-categories";
 import {
   type PermissionRuleProblem,
@@ -106,10 +124,15 @@ export function runLint(
   }
 
   // Stage 2 — lower. lower() can throw CompilerError (e.g. a malformed
-  // credential env-ref); treat as terminal for the IR-pass stage.
+  // credential env-ref); treat as terminal for the IR-pass stage. The
+  // lowering's own warnings are kept for Stage 8 (`lower()` is exactly
+  // `lowerWithWarnings().ir`, so the IR is the same either way).
   let ir: IrNode;
+  let loweredWarnings: ReadonlyArray<CompileWarning>;
   try {
-    ir = lower(spec);
+    const lowered = lowerWithWarnings(spec);
+    ir = lowered.ir;
+    loweredWarnings = lowered.warnings;
   } catch (err) {
     const message = err instanceof CrewhausError ? err.message : (err as Error).message;
     findings.push({ message, path: "<lower>", severity: "error", rule: "lower" });
@@ -228,8 +251,312 @@ export function runLint(
     });
   }
 
+  // Stage 8 — 0.8.0 (design §3 / §11): the provability block. The compile
+  // warnings its lowering prints (an inert `level: off` block, an `on_fail`
+  // the shape cannot honour, an execution allowlist the catalog cannot
+  // resolve offline, a `formal.image` no checker runs, a research floor no
+  // report can meet) fail `compile --strict`, so lint reports them in the
+  // same words rather than saying "clean"; then the lint-only rules, which
+  // describe valid specs unlikely to do what their author meant. The
+  // self-judging waiver is Stage 6's `provability-self-judge`.
+  for (const w of loweredWarnings) {
+    if (!w.code.startsWith("provability-")) continue;
+    findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
+  }
+  findings.push(...auditProvability(ir, spec));
+
   // Warnings inform; only errors gate (`ok` drives the CLI exit code).
   return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
+}
+
+/**
+ * The leaf tool categories whose tools read a SOURCE BODY a claim can be
+ * grounded in (design §5.2: the evidence index takes a source's body from a
+ * tool call whose input names a URL or a path): workspace files (`fs`, and
+ * `fsx`'s readLines / frontmatterRead / notebookRead), ingested and office
+ * documents, the web and raw HTTP, and code-host pages. Deliberately
+ * generous, because `provability-no-source-tool` warns only when NOTHING
+ * could read a source: a category that sometimes reads one keeps the rule
+ * quiet rather than crying wolf. `html` is not here — its tools parse HTML
+ * they are handed and fetch nothing.
+ */
+export const PROVABILITY_SOURCE_CATEGORIES: ReadonlyArray<string> = Object.freeze([
+  "fs",
+  "fsx",
+  "ingest",
+  "documents",
+  "web",
+  "http",
+  "codehost",
+]);
+
+/** A builtin spec key for `name` (a key, or a registered name a sub-agent list uses). */
+function builtinKeyOf(name: string): string {
+  return Object.hasOwn(BUILTIN_TOOLS, name) ? name : (builtinKeyForName(name) ?? name);
+}
+
+let sourceToolKeys: ReadonlySet<string> | undefined;
+/** Every builtin key in {@link PROVABILITY_SOURCE_CATEGORIES}, expanded once. */
+function provabilitySourceToolKeys(): ReadonlySet<string> {
+  sourceToolKeys ??= new Set(PROVABILITY_SOURCE_CATEGORIES.flatMap((c) => toolsInCategory(c)));
+  return sourceToolKeys;
+}
+
+/**
+ * 0.8.0 (design §3, §11 lint rules) — the lint-only provability rules over a
+ * lowered IR. Each is a WARNING: the spec is valid, it just cannot do what
+ * its author meant.
+ *
+ * The two reachability rules ask the question a floor asks: can ANY
+ * evidence at or above it ever be produced? Higher-rung evidence satisfies a
+ * lower floor (design §2), so a rule stays quiet while any of these is in
+ * reach:
+ *
+ *  - a SOURCE (meets `grounded`): a tool in
+ *    {@link PROVABILITY_SOURCE_CATEGORIES} (sub-agents' tools count: the
+ *    parent's evidence index walks child logs, §8), any `mcp_servers`, or
+ *    `knowledge:` (it registers Retrieve);
+ *  - an EXECUTION result (meets `checked` and below): an agent or sub-agent
+ *    tool on `execution.allow`, or an allowlisted `mcp__<server>__…` of a
+ *    declared server ({@link reachesExecution});
+ *  - a PROOF (meets every floor): ProofCheck is wired — the gate adds it
+ *    exactly when evaluation-service's `wantsProofCheckTools` says so (it
+ *    reads the level and `formal.checkers`, both on the IR), and binds a
+ *    `proofCheck` the agent lists itself at any level ({@link reachesProof}).
+ *
+ * The rules:
+ *
+ *  - `provability-no-source-tool` — a `grounded` floor on a cli / channel /
+ *    managed spec with none of the three in reach. Read off the LOWERED IR,
+ *    so `all-<category>` lists are already expanded. Research always
+ *    registers its own Source tool, and crew carries the block unwired, so
+ *    neither is checked.
+ *  - `provability-no-execution-tool` — the `checked` counterpart: no
+ *    execution result and no proof in reach. Design §3 words the source rule
+ *    as `level ≥ grounded`, but a source cannot satisfy a `checked` floor —
+ *    higher-rung evidence satisfies a lower floor, never the reverse (§2) —
+ *    so warning about sources there would flag a correctly built
+ *    computation-only harness; this rule asks the question that floor does.
+ *    `proven` needs no rule: the gate always wires ProofCheck there.
+ *  - `provability-execution-unknown-tool` — an `execution.allow` entry no
+ *    tool call can ever match: not a builtin (the IR carries builtins as
+ *    their spec keys), not a tool the runtime registers itself, and not an
+ *    `mcp__<server>__…` name of a declared server. At every live floor: a
+ *    `tool:` citation under `cited` / `grounded` is still checked against the
+ *    list, so a typo there silently stops the tool counting as evidence, and
+ *    the compile says nothing below `checked`. A near-miss names the builtin
+ *    it is closest to. (At `checked` / `proven` the compile's own
+ *    `provability-execution-unresolved` also fires, about `--strict`.)
+ *  - `provability-sandbox-only-checkers` — `formal.checkers` as WRITTEN names
+ *    only sandbox checkers. Read off `spec`, because the lowered list always
+ *    carries builtin (the compiler appends it, as tool-proof does —
+ *    `sandboxOnlyProvabilityCheckers`); without `spec` the rule is skipped.
+ *    smt and lean4 run in the code-execution sandbox, which lint cannot see
+ *    from the spec, so it says what happens without one (design §18): they
+ *    are unavailable and proofs fall back to builtin. Nothing fails — the
+ *    list is a preference order, not an allowlist.
+ *  - `provability-proofcheck-asks` — a channel or managed harness, where no
+ *    one can answer an approval, whose ProofCheck would ask before running a
+ *    sandbox checker it lists (the lowered `formal.checkers`, so the default
+ *    `smt` counts). permission-engine allows `ProofCheck(builtin)` by default
+ *    — no container, nothing written but the artifact — and leaves `smt` and
+ *    `lean4`, which start a container, to the mode default; the spec's own
+ *    rules are read the way the runtime reads them. Under `ask_mode: pause`
+ *    (the default) the turn parks on such a proof; under `deny` it is
+ *    refused. The cli shape is not checked: its REPL can ask.
+ */
+export function auditProvability(ir: IrNode, spec?: Spec): LintFinding[] {
+  const p = provabilityOf(ir);
+  if (p === undefined || ir.target === "crew") return [];
+  const out: LintFinding[] = [];
+  const node = ir as {
+    readonly mcp_servers?: Readonly<Record<string, unknown>>;
+    readonly knowledge?: unknown;
+  };
+  const mcpServers = Object.keys(node.mcp_servers ?? {});
+  const interactive = ir.target === "cli" || ir.target === "channel" || ir.target === "managed";
+  // Every tool name the IR lists — the agent's, the sub-agents', a model
+  // profile's (a profile only narrows, so it adds nothing new).
+  const tools = collectToolNames(ir);
+
+  if (interactive && p.level === "grounded") {
+    const readsSource =
+      mcpServers.length > 0 ||
+      node.knowledge !== undefined ||
+      tools.some((name) => provabilitySourceToolKeys().has(builtinKeyOf(name)));
+    if (!readsSource && !reachesExecution(p, tools, mcpServers) && !reachesProof(p, ir)) {
+      out.push({
+        rule: "provability-no-source-tool",
+        severity: "warning",
+        path: "provability.level",
+        message: `provability.level: grounded needs a source the run read, a result of a tool on provability.execution.allow, or a proof, and this spec can produce none of them: no tool that reads a source (no file, web, HTTP, document or code-host tool, no mcp_servers, no knowledge: block), none of its tools on that list, and no ProofCheck. ${unreachableFloorConsequence(p)} Add a source-reading tool (e.g. read, webFetch, all-web), or set level: cited.`,
+      });
+    }
+  }
+
+  if (interactive && p.level === "checked") {
+    if (!reachesExecution(p, tools, mcpServers) && !reachesProof(p, ir)) {
+      out.push({
+        rule: "provability-no-execution-tool",
+        severity: "warning",
+        path: "provability.execution.allow",
+        message: `provability.level: checked needs claims bound to tool:<toolUseId> results of a tool on provability.execution.allow, or to proof:prf_… artifacts, and this spec can produce neither: none of its tools is on that list, and no ProofCheck is wired. ${unreachableFloorConsequence(p)} Give the agent a tool from the allowlist (e.g. evaluate, moneyAdd or all-math), or widen execution.allow to a tool the agent has.`,
+      });
+    }
+  }
+
+  out.push(...unknownExecutionTools(ir, p.execution.allow, mcpServers));
+
+  if ((ir.target === "channel" || ir.target === "managed") && reachesProof(p, ir)) {
+    const permissions = (ir as { readonly permissions?: IrPermissions }).permissions;
+    const asking = p.formal.checkers.filter(
+      (checker) => checker !== "builtin" && proofCheckAsks(checker, permissions),
+    );
+    if (asking.length > 0) {
+      const named = asking.join(" and ");
+      const refused = permissions?.askMode === "deny";
+      out.push({
+        rule: "provability-proofcheck-asks",
+        severity: "warning",
+        path: "provability.formal.checkers",
+        message: `ProofCheck asks for approval before it runs the ${named} checker (a sandbox checker starts a container; only builtin is allowed by default), and a ${ir.target} harness has no one to ask: a proof that picks it ${
+          refused ? "is refused (ask_mode: deny)" : "parks the turn until someone approves it"
+        }. Allow it with a permissions rule — alwaysAllow ${asking
+          .map((checker) => `ProofCheck(${checker})`)
+          .join(", ")} — or set provability.formal.checkers to [builtin].`,
+      });
+    }
+  }
+
+  const sandboxOnly = spec === undefined ? [] : sandboxOnlyProvabilityCheckers(spec);
+  if (sandboxOnly.length > 0) {
+    out.push({
+      rule: "provability-sandbox-only-checkers",
+      severity: "warning",
+      path: "provability.formal.checkers",
+      message: `provability.formal.checkers names only sandbox checkers (${sandboxOnly.join(", ")}): with no container sandbox (CREWHAUS_SANDBOX=noop, or no docker or podman) they are unavailable, and proofs fall back to the builtin checker, which needs none and is always added last — the list is a preference order, not an allowlist. List builtin yourself to choose where it sits.`,
+    });
+  }
+  return out;
+}
+
+/**
+ * Whether any tool the spec gives the agent (or a sub-agent) is on
+ * `execution.allow`, or the list names an `mcp__<server>__…` tool of a
+ * declared server — so a claim can bind to a `tool:<toolUseId>` result, the
+ * evidence that meets `checked` and every floor below it (design §2, §6.3).
+ * The IR carries each builtin as its spec key and anything else exactly as
+ * written, so a tool matches by its key, or by its exact name.
+ */
+function reachesExecution(
+  p: IrProvability,
+  tools: ReadonlyArray<string>,
+  mcpServers: ReadonlyArray<string>,
+): boolean {
+  const allow = new Set(p.execution.allow);
+  return (
+    tools.some((name) => allow.has(name) || allow.has(builtinKeyOf(name))) ||
+    p.execution.allow.some((key) => {
+      const server = /^mcp__(.+?)__/.exec(key)?.[1];
+      return server !== undefined && mcpServers.includes(server);
+    })
+  );
+}
+
+/**
+ * Whether the run has ProofCheck, so a claim can bind to a `proof:prf_…`
+ * artifact — evidence that meets every floor (design §2). The gate adds it
+ * exactly when `wantsProofCheckTools` says so, and swaps a `proofCheck` the
+ * agent lists itself for its own bound twin at any level (evaluation-service).
+ * The AGENT's list only: a sub-agent's tools are filtered from its parent's
+ * catalog (tool-task), so a sub-agent that lists ProofCheck gets it only when
+ * the parent already has it — and `checkShapeTools` warns when it does not.
+ */
+function reachesProof(p: IrProvability, ir: IrNode): boolean {
+  const own = (ir as { readonly tools?: ReadonlyArray<string> }).tools ?? [];
+  return wantsProofCheckTools(p) || own.some((name) => builtinKeyOf(name) === "proofCheck");
+}
+
+/**
+ * Whether `ProofCheck` with `checker` would ASK under `permissions` (the
+ * spec's rules above the builtin defaults, at the spec's mode), read by the
+ * engine the runtime uses, with the checker as the call's one operative
+ * value — the tool declares `checker` its `id` operative arg.
+ */
+function proofCheckAsks(checker: string, permissions: IrPermissions | undefined): boolean {
+  const yaml: PermissionRule[] = (permissions?.rules ?? []).map((rule) => ({
+    type: rule.type,
+    pattern: rule.pattern,
+    source: "yaml",
+  }));
+  const decision = evaluate(
+    {
+      toolName: "ProofCheck",
+      input: { checker },
+      readOnly: false,
+      destructive: true,
+      operativeValues: [{ kind: "id", canonical: [checker] }],
+    },
+    permissions?.mode ?? "default",
+    { ...emptyRuleSet, yaml, builtin: [...BUILTIN_DEFAULT_RULES] },
+  );
+  return decision === "ask";
+}
+
+/**
+ * What a floor no evidence can reach does to answers, worded to stay true
+ * at every threshold: no claim meets it, yet an assumption is never graded,
+ * an answer with no claims passes vacuously, and under `threshold: 0` a
+ * score of 0 still passes (design §2).
+ */
+function unreachableFloorConsequence(p: IrProvability): string {
+  return p.threshold > 0
+    ? "So no claim can meet the floor, and an answer fails the gate unless every claim in it is a declared assumption."
+    : "So no claim can meet the floor; threshold: 0 keeps that from failing an answer, but every claim is reported unmet.";
+}
+
+/**
+ * `provability-execution-unknown-tool` (see {@link auditProvability}): the
+ * canonical `execution.allow` entries no tool call can ever match, one
+ * finding each, with the nearest builtin key for a near miss.
+ */
+function unknownExecutionTools(
+  ir: IrNode,
+  allow: ReadonlyArray<string>,
+  mcpServers: ReadonlyArray<string>,
+): LintFinding[] {
+  const out: LintFinding[] = [];
+  let runtimeNames: ReadonlySet<string> | undefined;
+  for (const key of allow) {
+    if (Object.hasOwn(BUILTIN_TOOLS, key)) continue;
+    const server = /^mcp__(.+?)__./.exec(key)?.[1];
+    if (server !== undefined) {
+      if (mcpServers.includes(server)) continue;
+      out.push({
+        rule: "provability-execution-unknown-tool",
+        severity: "warning",
+        path: "provability.execution.allow",
+        message: `provability.execution.allow names "${key}", but mcp_servers declares no server "${server}" — no tool call can ever match it, so it never counts as execution evidence. Declare the server, or remove the entry.`,
+      });
+      continue;
+    }
+    runtimeNames ??= new Set([...KNOWN_TOOLS.map((t) => t.name), ...thredzToolNamesOf(ir)]);
+    if (runtimeNames.has(key)) continue;
+    const near = nearestToolName(key, Object.keys(BUILTIN_TOOLS));
+    const hint =
+      near === undefined
+        ? " Name a builtin tool (or the all-<category> grammar), or an mcp__<server>__<tool> of a declared server."
+        : near.kind === "match"
+          ? ` Did you mean ${near.name}?`
+          : ` Did you mean one of: ${near.candidates.join(", ")}?`;
+    out.push({
+      rule: "provability-execution-unknown-tool",
+      severity: "warning",
+      path: "provability.execution.allow",
+      message: `provability.execution.allow names "${key}", which is not a builtin tool, a tool the runtime registers, or an MCP tool — no tool call can ever match it, so it never counts as execution evidence.${hint}`,
+    });
+  }
+  return out;
 }
 
 /**

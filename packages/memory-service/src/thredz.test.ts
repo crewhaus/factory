@@ -561,3 +561,200 @@ describe.skipIf(REAL_SERVER === undefined)("real thredz-mcp v0.2.0 contract (rea
     }
   }, 20000);
 });
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — the mirror forwards the proof options
+// ---------------------------------------------------------------------------
+
+describe("goal mirror × continuity.proof", () => {
+  test("off: a goal proven by assertion passes through the mirror unverified and completes the remote goal", async () => {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-off"}', isError: false }),
+    });
+    const { deps: d } = deps({
+      thredz: { client, serverName: "thredz" },
+      sessionScope: "sess_0123456789abcdef",
+    });
+    const wired = wireContinuity(
+      { specName: "mirror-off", continuity: { proof: "off" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const goalWrite = wired.tools.find((t) => t.name === "GoalWrite");
+    const goalUpdate = wired.tools.find((t) => t.name === "GoalUpdate");
+    await goalWrite?.execute({ title: "ship", target: 2 });
+    // No session log exists: had the wrapper dropped the proof options, this
+    // would verify and fail with "no verified evidence".
+    expect(
+      await goalUpdate?.execute({
+        goalId: "goal-0001",
+        status: "proven",
+        evidence: [{ toolUseId: "tu_said" }],
+      }),
+    ).toContain("[proven (unverified)] ship");
+    const [goal] = await wired.store.listGoals();
+    expect(goal?.unverified?.[0]?.toolUseId).toBe("tu_said");
+    const update = calls.find((c) => c.name === "goal_update");
+    expect(update?.args).toEqual({ id: "tz-goal-off", targetValue: 2, currentValue: 2 });
+  });
+
+  test("require: progress that would complete the remote goal never reaches the mirror", async () => {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-req"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" } });
+    const wired = wireContinuity(
+      { specName: "mirror-require", continuity: { proof: "require" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const goalWrite = wired.tools.find((t) => t.name === "GoalWrite");
+    const goalUpdate = wired.tools.find((t) => t.name === "GoalUpdate");
+    await goalWrite?.execute({ title: "ship", target: 2 });
+    await expect(goalUpdate?.execute({ goalId: "goal-0001", current: 2 })).rejects.toThrow(
+      "goal-0001 is open, not proven",
+    );
+    expect(calls.some((c) => c.name === "goal_update")).toBe(false);
+  });
+
+  test("the mirror forwards the store guard: a refusal under the lock never reaches Thredz", async () => {
+    // require's at-target check runs as a store guard (under the lock, on
+    // the record as written). A wrapper that dropped it would let a racing
+    // session complete the remote goal.
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-guard"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" } });
+    const wired = wireContinuity(
+      { specName: "mirror-guard", continuity: { proof: "require" }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    await wired.store.writeGoal({ title: "ship", target: 2 });
+    const seen: number[] = [];
+    await expect(
+      wired.store.updateGoal(
+        "goal-0001",
+        { current: 2 },
+        {
+          guard: (next) => {
+            seen.push(next.current ?? -1);
+            throw new Error("refused under the lock");
+          },
+        },
+      ),
+    ).rejects.toThrow("refused under the lock");
+    expect(seen).toEqual([2]);
+    expect((await wired.store.listGoals())[0]?.current).toBeUndefined();
+    expect(calls.some((c) => c.name === "goal_update")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — under require the mirror completes only a VERIFIED goal
+// ---------------------------------------------------------------------------
+
+describe("goal mirror × continuity.proof: require completes only a verified goal", () => {
+  const SESS = "sess_0123456789abcdef";
+
+  /** Wire continuity over the same `tmp` store; `down` makes goal_update 503. */
+  function wire(proof: "off" | "require" | "ladder", state: { down: boolean }) {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-1"}', isError: false }),
+      goal_update: () =>
+        state.down
+          ? { content: "goal_update failed (HTTP 503) — Service Unavailable", isError: true }
+          : { content: '{"_id":"tz-goal-1"}', isError: false },
+    });
+    const { deps: d } = deps({ thredz: { client, serverName: "thredz" }, sessionScope: SESS });
+    const wired = wireContinuity(
+      { specName: "mirror-proof", continuity: { proof }, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const tool = (name: string): RegisteredTool => {
+      const found = wired.tools.find((t) => t.name === name);
+      if (found === undefined) throw new Error(`${name} not registered`);
+      return found;
+    };
+    return { wired, calls, tool };
+  }
+
+  const updates = (calls: ReturnType<typeof fakeClient>["calls"]) =>
+    calls.filter((c) => c.name === "goal_update").map((c) => c.args);
+
+  test("a goal proven by assertion (off run, Thredz down) is never completed by a later require update", async () => {
+    const state = { down: false };
+    const off = wire("off", state);
+    await off.tool("GoalWrite").execute({ title: "ship 10 releases", target: 10 });
+    state.down = true; // the off run's completing mirror update never lands
+    await off.tool("GoalUpdate").execute({
+      goalId: "goal-0001",
+      status: "proven",
+      evidence: [{ toolUseId: "tu_said" }],
+    });
+    state.down = false;
+
+    const req = wire("require", state);
+    await expect(
+      req.tool("GoalUpdate").execute({ goalId: "goal-0001", current: 10 }),
+    ).rejects.toThrow("goal-0001 is proven (unverified)");
+    // Progress below the target is allowed, and mirrors as progress.
+    expect(await req.tool("GoalUpdate").execute({ goalId: "goal-0001", current: 3 })).toContain(
+      "[proven (unverified)] ship 10 releases (3/10)",
+    );
+    // A title edit mirrors as a title edit.
+    await req.tool("GoalUpdate").execute({ goalId: "goal-0001", title: "ship ten releases" });
+    expect(updates(req.calls)).toEqual([
+      { id: "tz-goal-1", currentValue: 3 },
+      { id: "tz-goal-1", title: "ship ten releases" },
+    ]);
+  });
+
+  test("a goal hand-edited to proven with no proof completes nothing remote under require", async () => {
+    const state = { down: false };
+    const req = wire("require", state);
+    await req.tool("GoalWrite").execute({ title: "ship", target: 10 });
+    const goalsPath = join(req.wired.store.dir(), "goals.yaml");
+    writeFileSync(
+      goalsPath,
+      readFileSync(goalsPath, "utf8").replace("status: open", "status: proven"),
+    );
+    expect((await req.wired.store.listGoals())[0]?.status).toBe("proven");
+    await req.tool("GoalUpdate").execute({ goalId: "goal-0001", title: "ship it" });
+    expect(updates(req.calls)).toEqual([{ id: "tz-goal-1", title: "ship it" }]);
+  });
+
+  test("a goal proven with VERIFIED evidence still completes its mirror under require", async () => {
+    const dir = join(tmp, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${SESS}.jsonl`),
+      `${JSON.stringify({ ts: 1, version: 1, kind: "tool_use", payload: { id: "tu_rel", name: "Bash", input: { cmd: "release" } } })}\n` +
+        `${JSON.stringify({ ts: 2, version: 1, kind: "tool_result", payload: { toolUseId: "tu_rel", content: "10 shipped", isError: false } })}\n`,
+    );
+    const req = wire("require", { down: false });
+    await req.tool("GoalWrite").execute({ title: "ship", target: 10 });
+    await req.tool("GoalUpdate").execute({
+      goalId: "goal-0001",
+      current: 10,
+      status: "proven",
+      evidence: [{ toolUseId: "tu_rel" }],
+    });
+    expect(updates(req.calls)).toEqual([{ id: "tz-goal-1", targetValue: 10, currentValue: 10 }]);
+  });
+
+  test("ladder: the same hand-edited proven goal completes its mirror, as before 0.8.0", async () => {
+    const lad = wire("ladder", { down: false });
+    await lad.tool("GoalWrite").execute({ title: "ship", target: 10 });
+    const goalsPath = join(lad.wired.store.dir(), "goals.yaml");
+    writeFileSync(
+      goalsPath,
+      readFileSync(goalsPath, "utf8").replace("status: open", "status: proven"),
+    );
+    await lad.tool("GoalUpdate").execute({ goalId: "goal-0001", title: "ship it" });
+    expect(updates(lad.calls)).toEqual([
+      { id: "tz-goal-1", title: "ship it", targetValue: 10, currentValue: 10 },
+    ]);
+  });
+});

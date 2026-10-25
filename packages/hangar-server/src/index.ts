@@ -82,6 +82,18 @@ export {
 } from "./m3-routes";
 export { INSPECT_STORES, isInspectStore, type InspectStore } from "./inspect";
 export {
+  isProofRunId,
+  isProofSpecDir,
+  MANAGED_TENANTS_ROOT_DEFAULT,
+  proofCliTwin,
+  proofTenants,
+  proofView,
+  type ProofBundleRow,
+  type ProofHarness,
+  type ProofTenants,
+  type ProofView,
+} from "./proofs";
+export {
   GUTTER_KINDS,
   isSessionId,
   listSessions,

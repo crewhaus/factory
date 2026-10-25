@@ -99,6 +99,39 @@ describe("emitCfWorkerBundle", () => {
     expect(readme).toContain("| `gitStatus` | agent | not wired |");
   });
 
+  // 0.8.0 §1, §3 (review I40) — the edge serves answers ungated: a declared
+  // provability: or evaluation: block is said, and --strict (which escalates
+  // accepted-but-unwired) fails, instead of a byte-identical silent worker.
+  test("a provability: or evaluation: block the edge does not run is an accepted-but-unwired warning", () => {
+    const base =
+      "name: w\ntarget: cli\nagent: { model: claude-sonnet-4-6, instructions: i }\ntools: [webFetch]\n";
+    expect(emitCfWorkerBundle(ir(base)).warnings).toEqual([]);
+
+    const gated = emitCfWorkerBundle(ir(`${base}provability: { level: grounded }\n`));
+    expect(gated.warnings).toEqual([
+      {
+        code: "accepted-but-unwired",
+        path: "provability",
+        message: expect.stringContaining("the worker serves every answer ungated"),
+      },
+    ]);
+    // Said, not wired: the worker itself is the ungated one.
+    expect(gated.files.find((f) => f.path === "worker.js")?.content).toBe(
+      emitCfWorkerBundle(ir(base)).files.find((f) => f.path === "worker.js")?.content,
+    );
+
+    const judged = emitCfWorkerBundle(
+      ir(`${base}evaluation:\n  grader:\n    type: llm_judge\n    criteria: helpful\n`),
+    );
+    expect(judged.warnings.map((w) => [w.code, w.path])).toEqual([
+      ["accepted-but-unwired", "evaluation"],
+    ]);
+    // A block parked at level: off lowers to none: nothing on the edge to warn about.
+    expect(emitCfWorkerBundle(ir(`${base}provability: off\n`)).warnings.map((w) => w.path)).toEqual(
+      [],
+    );
+  });
+
   test("threads allowedOrigins into the emitted worker", () => {
     const bundle = emitCfWorkerBundle(ir(CLI_SPEC), {
       allowedOrigins: ["https://example.test"],

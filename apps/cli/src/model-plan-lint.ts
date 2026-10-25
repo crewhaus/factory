@@ -23,6 +23,15 @@
  *      profile. The spec cross-field checks and the ir-pass refuse these at
  *      parse / lower time; this is the DRIFT GUARD that keeps refusing them
  *      from the lowered IR should either layer ever be relaxed. ERROR.
+ *   4. `provability-self-judge` (0.8.0, design §3 / §6.2) — the provability
+ *      WAIVER judge (`provability.judge.model`) resolving to one of the
+ *      agent's own serving arms. The waiver judge rules on whether an excerpt
+ *      supports a claim the serving model wrote, so this is check 1's hazard
+ *      in a new slot, worded the same way. Unlike check 1 it is not limited
+ *      to pooled blocks: that limit keeps a 0.5.8 spec whose judge silently
+ *      defaulted to its only model quiet, and the waiver judge is new and
+ *      always declared explicitly. `judge.allow_self_judge: true` silences
+ *      it. WARNING (the compiler reports it too, as `model-plan-self-judge`).
  *
  * The fourth §10.1 check — a Consult / guide / verifier reply path without
  * `classifyBoundary` + `tagContent` — is a CODEBASE check and lives in
@@ -38,6 +47,7 @@ import type {
   IrModelProfiles,
   IrModelTiers,
   IrNode,
+  IrProvability,
   IrSubAgentDefinition,
   IrWorkflowStep,
 } from "@crewhaus/ir";
@@ -47,7 +57,11 @@ export type ModelPlanFinding = {
   /** Dot-joined spec location. */
   readonly path: string;
   readonly severity: "error" | "warning";
-  readonly rule: "model-plan:self-judge" | "model-plan:profile-tools" | "model-plan:roster-ref";
+  readonly rule:
+    | "model-plan:self-judge"
+    | "model-plan:profile-tools"
+    | "model-plan:roster-ref"
+    | "provability-self-judge";
 };
 
 /** The routing surface every agent-like IR block carries. */
@@ -81,6 +95,25 @@ function selfJudge(path: string, judgeModel: string, gated: string): ModelPlanFi
     path,
     message: `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set evaluation.allow_self_judge: true to accept it)`,
   };
+}
+
+/** Check 4 — the provability waiver judge against the agent's serving arms. */
+function provabilityJudgeFindings(
+  agent: RoutedBlock,
+  provability: IrProvability | undefined,
+): ModelPlanFinding[] {
+  const judge = provability?.judge;
+  if (judge === undefined || judge.allowSelfJudge === true) return [];
+  if (!servingModels(agent).has(judge.model)) return [];
+  const path = "provability.judge.model";
+  return [
+    {
+      rule: "provability-self-judge",
+      severity: "warning",
+      path,
+      message: `${path}: the waiver judge model "${judge.model}" is also a serving arm of agent.model / model_pool — it would rule on whether a source supports claims its own model wrote, a measurement-integrity hazard; point the judge at an independent model (or set provability.judge.allow_self_judge: true to accept it)`,
+    },
+  ];
 }
 
 /** The strategy's judge slots (committee judge, shadow grader) against the pool's own arms. */
@@ -270,7 +303,7 @@ function profileToolFindings(ir: IrNode): ModelPlanFinding[] {
 }
 
 /**
- * Run the three spec-level model-plan checks over a lowered IR (every fact
+ * Run the four spec-level model-plan checks over a lowered IR (every fact
  * they need — resolved `$refs`, arm ids, the resolved toolset, the
  * `allow_self_judge` waiver — is on the IR). Findings carry stable rule ids
  * and dot-joined SPEC paths.
@@ -317,10 +350,14 @@ export function auditModelPlan(ir: IrNode): ModelPlanFinding[] {
           );
         }
       }
+      out.push(...provabilityJudgeFindings(ir.agent, ir.provability));
       return out;
     }
-    case "pipeline":
     case "research":
+      pooledBlock("agent", ir.agent);
+      out.push(...provabilityJudgeFindings(ir.agent, ir.provability));
+      return out;
+    case "pipeline":
     case "batch":
     case "browser":
       pooledBlock("agent", ir.agent);

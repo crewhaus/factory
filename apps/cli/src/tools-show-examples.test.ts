@@ -410,6 +410,7 @@ const CALLS: Readonly<Record<string, Record<string, unknown>>> = {
   ProcessOutput: { id: "p1" },
   ProcessStart: { argv: ["git", "status"] },
   ProcessStop: { id: "p1" },
+  ProofCheck: { checker: "builtin", claim: "2 + 2 is 4.", statement: "2 + 2 = 4", proof: "eval" },
   PushNotify: { provider: "gateway", to: "topic:ops-alerts", body: "deploy done" },
   Python: { code: "import subprocess" },
   QrEncode: { text: "https://example.com", path: "src/qr.png" },

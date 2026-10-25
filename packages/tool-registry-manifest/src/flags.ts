@@ -129,7 +129,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path", beneath: "all" },
+      { field: "source", kind: "path", beneath: "all", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -143,7 +143,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "archive", kind: "path" },
+      { field: "archive", kind: "path", reads: true },
       { field: "destination", kind: "path", beneath: "all" },
     ],
   },
@@ -634,7 +634,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "paths", kind: "path" },
+      { field: "paths", kind: "path", reads: true },
       { field: "destination", kind: "path" },
     ],
   },
@@ -707,7 +707,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "source", kind: "path", beneath: "all" },
+      { field: "source", kind: "path", beneath: "all", reads: true },
       { field: "destination", kind: "path", beneath: "all" },
     ],
   },
@@ -1805,7 +1805,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -2805,7 +2805,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -2856,7 +2856,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -2870,7 +2870,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "database", kind: "path" },
-      { field: "file", kind: "path" },
+      { field: "file", kind: "path", reads: true },
     ],
   },
   importGraph: {
@@ -2893,7 +2893,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "database", kind: "path" },
-      { field: "file", kind: "path" },
+      { field: "file", kind: "path", reads: true },
     ],
   },
   incidentBundle: {
@@ -3828,7 +3828,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "inputs.path", kind: "path" },
+      { field: "inputs.path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -3841,7 +3841,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", reads: true },
       { field: "output", kind: "path" },
     ],
   },
@@ -4167,6 +4167,34 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   promptInjectionScan: {
     key: "promptInjectionScan",
     name: "PromptInjectionScan",
+    readOnly: true,
+    destructive: false,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+  },
+  proofCheck: {
+    key: "proofCheck",
+    name: "ProofCheck",
+    readOnly: false,
+    destructive: true,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "checker", kind: "id" }],
+  },
+  proofCheckers: {
+    key: "proofCheckers",
+    name: "ProofCheckers",
+    readOnly: true,
+    destructive: false,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+  },
+  provabilityPreflight: {
+    key: "provabilityPreflight",
+    name: "ProvabilityPreflight",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -4947,7 +4975,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "path", kind: "path" },
+      { field: "path", kind: "path", readsWhen: "outputDir" },
       { field: "outputDir", kind: "path", beneath: "all" },
     ],
   },

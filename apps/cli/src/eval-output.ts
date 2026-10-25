@@ -39,6 +39,7 @@ import type { CompiledGrader } from "@crewhaus/eval-grader";
 import { defaultGraderRegistry } from "@crewhaus/eval-runner";
 import type {
   EvalAggregates,
+  EvalPricingFn,
   EvalRunSummary,
   GraderLookup,
   SampleResult,
@@ -48,13 +49,16 @@ import type {
  * G14 — the shared registry-construction rule: a graders file that resolves
  * at least one grader by registry name gets the default registry (six
  * specialty packs + `.crewhaus/graders` plugins); a file with none returns
- * `undefined` so the packs are never imported on the common path.
+ * `undefined` so the packs are never imported on the common path. 0.8.0
+ * §9.1 — `pricing` (the eval's own) prices `provability.costPerProvenClaim`'s
+ * gate re-runs when no cost-tracker metered them.
  */
 export async function graderRegistryForCompiled(
   compiled: ReadonlyArray<CompiledGrader>,
+  opts: { readonly pricing?: EvalPricingFn } = {},
 ): Promise<GraderLookup | undefined> {
   if (!compiled.some((g) => g.registrySpec !== undefined)) return undefined;
-  return defaultGraderRegistry();
+  return defaultGraderRegistry(opts.pricing !== undefined ? { pricing: opts.pricing } : {});
 }
 
 /** G56 — the fitness figure the optimize/flywheel search ranks candidates

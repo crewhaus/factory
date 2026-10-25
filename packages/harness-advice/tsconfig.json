@@ -18,6 +18,9 @@
       "path": "../preflight"
     },
     {
+      "path": "../provability"
+    },
+    {
       "path": "../routing-store"
     },
     {

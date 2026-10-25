@@ -369,7 +369,17 @@ describe("findSequence reads a source once", () => {
 });
 
 describe("an excerpt reads only as far as it is cut", () => {
-  /** The excerpt as it was made: the whole range cut out, collapsed, then clipped. */
+  /** What the fold reads as one word, and how far a word is widened. */
+  const WORD_RUN = /[\p{L}\p{N}\p{M}\p{Default_Ignorable_Code_Point}]+/gu;
+  const IGNORABLE = /\p{Default_Ignorable_Code_Point}$/u;
+  const REACH = 64;
+  /**
+   * The excerpt as it was made: the whole range cut out of the text as
+   * written, collapsed, then clipped — where the fold changed the text, the
+   * range widened to the whole word where it starts or ends inside one the
+   * fold rearranged (its ignorables moved to its end), and cut from the
+   * folded text when that word is longer than the reach (`writtenSpan`).
+   */
   const cutWhole = (index: SourceIndex, from: number, to: number, maxChars: number): string => {
     const tokens = index.tokens;
     if (from < 0 || tokens.length === 0) return "";
@@ -377,10 +387,28 @@ describe("an excerpt reads only as far as it is cut", () => {
     const last = tokens[
       Math.min(Math.max(to, from), tokens.length - 1)
     ] as SourceIndex["tokens"][number];
-    const text = index.text
-      .slice(first.at, last.at + last.raw.length)
-      .replace(/\s+/g, " ")
-      .trim();
+    const words = [...index.text.matchAll(WORD_RUN)].map(
+      (m) => [m.index as number, (m.index as number) + m[0].length] as const,
+    );
+    const inside = (at: number) => words.find(([a, b]) => a < at && at < b);
+    const moved = (word: readonly [number, number]): boolean =>
+      IGNORABLE.test(index.text.slice(0, word[1]));
+    let source = index.written ?? index.text;
+    let start = first.at;
+    let end = last.at + last.raw.length;
+    const head = index.written === undefined ? undefined : inside(start);
+    const tail = index.written === undefined ? undefined : inside(end);
+    if (
+      (head !== undefined &&
+        (head[1] - start > REACH || (moved(head) && start - head[0] > REACH))) ||
+      (tail !== undefined && tail[1] - end > REACH)
+    ) {
+      source = index.text;
+    } else {
+      if (head !== undefined && moved(head)) start = head[0];
+      if (tail !== undefined && moved(tail)) end = tail[1];
+    }
+    const text = source.slice(start, end).replace(/\s+/g, " ").trim();
     return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
   };
 

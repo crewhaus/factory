@@ -2,12 +2,23 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { IrNode } from "@crewhaus/compiler";
+import { type IrNode, provabilityOf } from "@crewhaus/compiler";
+import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
+import {
+  buildEvidenceIndex,
+  meetsFloor,
+  recordFromCall,
+  verifyDocument,
+} from "@crewhaus/provability";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { rateLimitStatus } from "@crewhaus/tool-codehost";
 import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
+import { INFORMATIONAL_COMPILE_WARNING_CODES } from "./compile-warnings";
 import {
+  type LintFinding,
+  PROVABILITY_SOURCE_CATEGORIES,
   applyLintFixes,
+  auditProvability,
   formatLintJson,
   formatLintText,
   levenshtein,
@@ -995,5 +1006,562 @@ describe("toolListPaths — where a spec holds a tools: list, from the spec's sc
     expect(toolListPaths("crew").map((p) => p.join("."))).toContain("roles.*.sub_agents.*.tools");
     // `expose.mcp.tools` is a mode word, not a list of tools.
     expect(cli.some((p) => p.startsWith("expose"))).toBe(false);
+  });
+});
+
+describe("runLint — the provability: block (0.8.0, design §3 / §11)", () => {
+  const cli = (tools: string, block: string, extra = ""): string =>
+    `${validCli}${tools === "" ? "" : `tools: ${tools}\n`}${extra}${block}\n`;
+  const provabilityRules = (yaml: string): string[] =>
+    runLint(yaml, noTools)
+      .findings.filter((f) => f.rule.startsWith("provability-"))
+      .map((f) => f.rule);
+
+  test("a well-built grounded spec has no provability finding", () => {
+    expect(provabilityRules(cli("[read, webFetch]", "provability: grounded"))).toEqual([]);
+  });
+
+  describe("the compile warnings --strict escalates are reported in compile's words", () => {
+    test.each([
+      [
+        "an inert level: off block",
+        cli("[read]", "provability: { level: off, on_fail: halt }"),
+        "provability-inert-block",
+      ],
+      [
+        "an execution allowlist the catalog cannot resolve offline",
+        cli(
+          "[moneyAdd]",
+          "provability: { level: checked, execution: { allow: [mcp__calc__add, moneyAdd] } }",
+          "mcp_servers:\n  calc:\n    transport: stdio\n    command: calc\n",
+        ),
+        "provability-execution-unresolved",
+      ],
+      [
+        "an on_fail the research shape cannot honour",
+        "name: r\ntarget: research\nagent:\n  model: claude-opus-4-7\n  instructions: hi\ngoal: learn\nprovability: { level: cited, on_fail: retry }\n",
+        "provability-on-fail-degraded",
+      ],
+      [
+        "a research floor no report can meet",
+        "name: r\ntarget: research\nagent:\n  model: claude-opus-4-7\n  instructions: hi\ngoal: learn\nprovability: checked\n",
+        "provability-research-rung-unreachable",
+      ],
+      [
+        "a formal.image no lean4 checker runs",
+        cli(
+          "[read]",
+          "provability: { level: proven, formal: { checkers: [builtin, smt], image: ghcr.io/acme/z3:1 } }",
+        ),
+        "provability-image-unused",
+      ],
+    ])("%s", async (_label, yaml, code) => {
+      const { compile } = await import("@crewhaus/compiler");
+      const want = compile(yaml).warnings.filter((w) => w.code === code);
+      const got = runLint(yaml, noTools).findings.filter((f) => f.rule === code);
+      expect(want).toHaveLength(1);
+      expect(got.map((f) => [f.path, f.severity, f.message])).toEqual(
+        want.map((w) => [w.path, "warning", w.message]),
+      );
+      // Warnings inform; only errors gate.
+      expect(runLint(yaml, noTools).ok).toBe(true);
+    });
+  });
+
+  test("none of the provability compile codes is informational, so `compile --strict` fails on each", () => {
+    for (const code of [
+      "provability-inert-block",
+      "provability-execution-unresolved",
+      "provability-on-fail-degraded",
+      "provability-research-rung-unreachable",
+      "provability-image-unused",
+    ]) {
+      expect(INFORMATIONAL_COMPILE_WARNING_CODES).not.toContain(code);
+    }
+  });
+
+  describe("provability-no-source-tool — a grounded floor no evidence can reach", () => {
+    test("no source, no allowlisted tool and no ProofCheck warns, naming the level", () => {
+      const findings = runLint(cli("[bash]", "provability: grounded"), noTools).findings;
+      const hit = findings.filter((f) => f.rule === "provability-no-source-tool");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]?.severity).toBe("warning");
+      expect(hit[0]?.path).toBe("provability.level");
+      expect(hit[0]?.message).toContain("this spec can produce none of them");
+      // True at every threshold: an assumption is never graded, and an
+      // answer with no claims passes vacuously (design §2).
+      expect(hit[0]?.message).toContain(
+        "an answer fails the gate unless every claim in it is a declared assumption",
+      );
+      expect(hit[0]?.message).not.toContain("every answer fails");
+      // An empty toolset too.
+      expect(provabilityRules(cli("", "provability: grounded"))).toEqual([
+        "provability-no-source-tool",
+      ]);
+      // Under threshold: 0 a score of 0 passes, and the message says so.
+      const lax = runLint(
+        cli("[bash]", "provability: { level: grounded, threshold: 0 }"),
+        noTools,
+      ).findings.filter((f) => f.rule === "provability-no-source-tool");
+      expect(lax[0]?.message).toContain("threshold: 0 keeps that from failing an answer");
+    });
+
+    test("higher-rung evidence in reach keeps it quiet: an allowlisted tool, or ProofCheck (design §2)", () => {
+      const subAgent = `name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    calc:
+      description: d
+      instructions: add it up
+      tools: [MoneyAdd]
+provability: grounded
+`;
+      for (const yaml of [
+        // An execution result meets a grounded floor…
+        cli("[moneyAdd, evaluate]", "provability: grounded"),
+        cli(
+          "[bash, Evaluate]",
+          "provability: { level: grounded, execution: { allow: [evaluate] } }",
+        ),
+        subAgent,
+        // …and so does a proof: the gate wires ProofCheck for these checkers,
+        cli("[bash]", "provability: { level: grounded, formal: { checkers: [builtin] } }"),
+        // and binds a proofCheck the agent lists, whatever the allowlist says.
+        cli(
+          "[bash, proofCheck]",
+          "provability: { level: grounded, execution: { allow: [evaluate] } }",
+        ),
+      ]) {
+        expect({ yaml, rules: provabilityRules(yaml) }).toEqual({ yaml, rules: [] });
+      }
+      // A computation tool the allowlist leaves out is no evidence.
+      expect(
+        provabilityRules(
+          cli("[moneyAdd]", "provability: { level: grounded, execution: { allow: [evaluate] } }"),
+        ),
+      ).toEqual(["provability-no-source-tool"]);
+    });
+
+    test("the gate agrees: a computation-only grounded harness passes on a tool: citation", async () => {
+      const result = runLint(cli("[moneyAdd, evaluate]", "provability: grounded"), noTools);
+      expect(result.findings.filter((f) => f.rule.startsWith("provability-"))).toEqual([]);
+      const config = provabilityOf(result.ir as IrNode);
+      if (config === undefined) throw new Error("expected a provability block");
+      const evidence = buildEvidenceIndex([
+        recordFromCall({
+          toolUseId: "toolu_01ABC",
+          toolName: "Evaluate",
+          input: { expression: "1200 + 84.5" },
+          content: "1284.5",
+          isError: false,
+        }),
+      ]);
+      const bundle = await verifyDocument("The total is 1,284.50 [1].\n\n[1]: tool:toolu_01ABC\n", {
+        config,
+        evidence,
+      });
+      expect([bundle.verdict, bundle.score, bundle.achieved]).toEqual(["pass", 1, "checked"]);
+    });
+
+    test("any source reader keeps it quiet: a file, web, HTTP, document or code-host tool, a category, mcp, knowledge, a sub-agent", () => {
+      for (const tools of [
+        "[read]",
+        "[webFetch]",
+        "[fetch]",
+        "[pdfText]",
+        "[prGet]",
+        "[all-web]",
+        "[readLines]",
+      ]) {
+        expect({ tools, rules: provabilityRules(cli(tools, "provability: grounded")) }).toEqual({
+          tools,
+          rules: [],
+        });
+      }
+      const mcp = cli(
+        "",
+        "provability: grounded",
+        "mcp_servers:\n  docs:\n    transport: stdio\n    command: docs-mcp\n",
+      );
+      expect(provabilityRules(mcp)).toEqual([]);
+      const knowledge = cli(
+        "",
+        "provability: grounded",
+        "knowledge:\n  sources:\n    - path: ./docs\n",
+      );
+      expect(provabilityRules(knowledge)).toEqual([]);
+      const subAgent = `name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    researcher:
+      description: d
+      instructions: look it up
+      tools: [WebFetch]
+provability: grounded
+`;
+      expect(provabilityRules(subAgent)).toEqual([]);
+    });
+
+    test("cited never needs a fetched source, and research always registers its own Source tool", () => {
+      expect(provabilityRules(cli("[moneyAdd]", "provability: cited"))).toEqual([]);
+      const research =
+        "name: r\ntarget: research\nagent:\n  model: claude-opus-4-7\n  instructions: hi\ngoal: learn\nprovability: { level: grounded, on_fail: note }\n";
+      expect(provabilityRules(research)).toEqual([]);
+    });
+
+    test("the source categories are real categories (a renamed one would silence the rule)", async () => {
+      const { CATEGORIES } = await import("@crewhaus/tool-categories");
+      for (const category of PROVABILITY_SOURCE_CATEGORIES) {
+        expect({ category, known: Object.hasOwn(CATEGORIES, category) }).toEqual({
+          category,
+          known: true,
+        });
+      }
+    });
+  });
+
+  describe("provability-no-execution-tool — a checked floor no evidence can reach", () => {
+    test("a toolset with nothing on execution.allow and no ProofCheck warns", () => {
+      const findings = runLint(cli("[read, webFetch]", "provability: checked"), noTools).findings;
+      const hit = findings.filter((f) => f.rule === "provability-no-execution-tool");
+      expect(hit).toHaveLength(1);
+      expect(hit[0]?.path).toBe("provability.execution.allow");
+      expect(hit[0]?.message).toContain("this spec can produce neither");
+      expect(hit[0]?.message).toContain(
+        "an answer fails the gate unless every claim in it is a declared assumption",
+      );
+      expect(hit[0]?.message).not.toContain("every answer fails");
+      // A source tool cannot satisfy a checked floor, so the source rule is silent.
+      expect(provabilityRules(cli("[read]", "provability: checked"))).toEqual([
+        "provability-no-execution-tool",
+      ]);
+    });
+
+    test("ProofCheck in reach keeps it quiet — a proof: binding meets any floor (design §2)", () => {
+      const rule = (yaml: string): string[] =>
+        provabilityRules(yaml).filter((r) => r === "provability-no-execution-tool");
+      for (const yaml of [
+        // Checkers the spec chose: the gate wires ProofCheck below proven.
+        cli("[read]", "provability: { level: checked, formal: { checkers: [builtin] } }"),
+        cli("[read]", "provability: { level: checked, formal: { checkers: [smt] } }"),
+        // A proofCheck the agent lists is swapped for the gate's bound twin.
+        cli(
+          "[read, proofCheck]",
+          "provability: { level: checked, execution: { allow: [evaluate] } }",
+        ),
+      ]) {
+        expect({ yaml, rules: rule(yaml) }).toEqual({ yaml, rules: [] });
+      }
+      // A sub-agent's tools come from its parent's catalog, so its ProofCheck
+      // adds nothing the parent does not have.
+      const subAgent = `name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    prover:
+      description: d
+      instructions: prove it
+      tools: [ProofCheck]
+provability: { level: checked, execution: { allow: [evaluate] } }
+`;
+      expect(rule(subAgent)).toEqual(["provability-no-execution-tool"]);
+    });
+
+    test("the gate agrees: it wires ProofCheck there, and a proof: binding's rung meets a checked floor", () => {
+      const result = runLint(
+        cli("[read]", "provability: { level: checked, formal: { checkers: [builtin] } }"),
+        noTools,
+      );
+      expect(result.findings.filter((f) => f.rule.startsWith("provability-"))).toEqual([]);
+      const config = provabilityOf(result.ir as IrNode);
+      if (config === undefined) throw new Error("expected a provability block");
+      // evaluation-service adds ProofCheckers + ProofCheck for this block …
+      expect(wantsProofCheckTools(config)).toBe(true);
+      // … and the verifier ranks a proof: binding `proven`, which meets `checked`.
+      expect(meetsFloor("proven", config.level)).toBe(true);
+      // Without either, the same toolset warns.
+      const plain = runLint(cli("[read]", "provability: checked"), noTools);
+      const plainConfig = provabilityOf(plain.ir as IrNode);
+      if (plainConfig === undefined) throw new Error("expected a provability block");
+      expect(wantsProofCheckTools(plainConfig)).toBe(false);
+      expect(plain.findings.map((f) => f.rule)).toContain("provability-no-execution-tool");
+    });
+
+    test("an allowlisted tool, in any spelling or through a sub-agent, keeps it quiet", () => {
+      expect(provabilityRules(cli("[read, moneyAdd]", "provability: checked"))).toEqual([]);
+      expect(
+        provabilityRules(
+          cli(
+            "[read, evaluate]",
+            "provability: { level: checked, execution: { allow: [Evaluate] } }",
+          ),
+        ),
+      ).toEqual([]);
+      const subAgent = `name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    calc:
+      description: d
+      instructions: add it up
+      tools: [MoneyAdd]
+provability: checked
+`;
+      expect(provabilityRules(subAgent)).toEqual([]);
+    });
+
+    test("an allowlisted mcp tool of a declared server keeps it quiet (and is reported unresolved instead)", () => {
+      const yaml = cli(
+        "[read]",
+        "provability: { level: checked, execution: { allow: [mcp__calc__add] } }",
+        "mcp_servers:\n  calc:\n    transport: stdio\n    command: calc\n",
+      );
+      expect(provabilityRules(yaml)).toEqual(["provability-execution-unresolved"]);
+    });
+
+    test("an allowlist that omits the agent's only computation tool warns", () => {
+      expect(
+        provabilityRules(
+          cli("[moneyAdd]", "provability: { level: checked, execution: { allow: [evaluate] } }"),
+        ),
+      ).toEqual(["provability-no-execution-tool"]);
+    });
+  });
+
+  describe("provability-execution-unknown-tool — an execution.allow entry nothing can ever call", () => {
+    const MCP = "mcp_servers:\n  calc:\n    transport: stdio\n    command: calc\n";
+    const unknown = (yaml: string): LintFinding[] =>
+      runLint(yaml, noTools).findings.filter(
+        (f) => f.rule === "provability-execution-unknown-tool",
+      );
+
+    test("a typo under a grounded floor warns with the builtin it is closest to", () => {
+      // Below `checked` the compile says nothing, yet a `tool:` citation is
+      // still checked against the list: the typo silently stops moneyAdd
+      // counting as evidence.
+      const yaml = cli(
+        "[read, moneyAdd]",
+        "provability: { level: grounded, execution: { allow: [moneyAd] } }",
+      );
+      expect(provabilityRules(yaml)).toEqual(["provability-execution-unknown-tool"]);
+      const hit = unknown(yaml);
+      expect(hit).toHaveLength(1);
+      expect(hit[0]?.severity).toBe("warning");
+      expect(hit[0]?.path).toBe("provability.execution.allow");
+      expect(hit[0]?.message).toContain('names "moneyAd"');
+      expect(hit[0]?.message).toContain("never counts as execution evidence");
+      expect(hit[0]?.message).toContain("Did you mean moneyAdd?");
+      expect(runLint(yaml, noTools).ok).toBe(true);
+    });
+
+    test("a name close to nothing says what may go there instead", () => {
+      const hit = unknown(
+        cli("[read]", "provability: { level: cited, execution: { allow: [totallyMadeUpTool] } }"),
+      );
+      expect(hit).toHaveLength(1);
+      expect(hit[0]?.message).toContain("Name a builtin tool");
+    });
+
+    test("an mcp tool warns only when its server is not declared", () => {
+      const undeclared = unknown(
+        cli("[read]", "provability: { level: cited, execution: { allow: [mcp__calc__add] } }"),
+      );
+      expect(undeclared).toHaveLength(1);
+      expect(undeclared[0]?.message).toContain('mcp_servers declares no server "calc"');
+      expect(
+        unknown(
+          cli(
+            "[read]",
+            "provability: { level: cited, execution: { allow: [mcp__calc__add] } }",
+            MCP,
+          ),
+        ),
+      ).toEqual([]);
+    });
+
+    test("builtins in any spelling, the default list, categories and runtime tools are quiet", () => {
+      for (const block of [
+        "provability: grounded",
+        "provability: { level: grounded, execution: { allow: [MoneyAdd, evaluate, moneyadd] } }",
+        "provability: { level: grounded, execution: { allow: [all-math, -moneyAdd] } }",
+        "provability: { level: grounded, execution: { allow: [CiteFact] } }",
+      ]) {
+        expect({ block, hit: unknown(cli("[read]", block)) }).toEqual({ block, hit: [] });
+      }
+    });
+
+    test("at checked it fires beside the compile's --strict warning, which says something else", () => {
+      const yaml = cli(
+        "[evaluate, moneyAdd]",
+        "provability: { level: checked, execution: { allow: [evaluate, moneyAd] } }",
+      );
+      expect(provabilityRules(yaml)).toEqual([
+        "provability-execution-unresolved",
+        "provability-execution-unknown-tool",
+      ]);
+    });
+
+    test("an inert block and crew are not audited", () => {
+      expect(
+        unknown(cli("[read]", "provability: { level: off, execution: { allow: [moneyAd] } }")),
+      ).toEqual([]);
+      const crew =
+        "name: cr\ntarget: crew\nmodel: m\nentry: lead\nroles:\n  lead: { instructions: x }\nprovability: { level: grounded, execution: { allow: [moneyAd] } }\n";
+      expect(unknown(crew)).toEqual([]);
+    });
+  });
+
+  describe("provability-sandbox-only-checkers — formal.checkers written without builtin", () => {
+    test("sandbox-only lists warn, naming them and the builtin fallback; a list with builtin and the default do not", () => {
+      for (const [checkers, named] of [
+        ["[smt]", "smt"],
+        ["[lean4]", "lean4"],
+        ["[smt, lean4]", "smt, lean4"],
+      ] as const) {
+        const findings = runLint(
+          cli("[read]", `provability: { level: proven, formal: { checkers: ${checkers} } }`),
+          noTools,
+        ).findings.filter((f) => f.rule === "provability-sandbox-only-checkers");
+        expect(findings).toHaveLength(1);
+        expect(findings[0]?.severity).toBe("warning");
+        expect(findings[0]?.path).toBe("provability.formal.checkers");
+        expect(findings[0]?.message).toContain(`names only sandbox checkers (${named})`);
+        expect(findings[0]?.message).toContain("proofs fall back to the builtin checker");
+        // The model always has a checker, so nothing is said to fail.
+        expect(findings[0]?.message).not.toContain("fails");
+        expect(findings[0]?.message).not.toContain("no checker");
+      }
+      expect(
+        provabilityRules(
+          cli("[read]", "provability: { level: proven, formal: { checkers: [lean4, builtin] } }"),
+        ),
+      ).toEqual([]);
+      expect(provabilityRules(cli("[read]", "provability: proven"))).toEqual([]);
+    });
+
+    test("it fires exactly when the lowered list gained builtin, and that list is the one tool-proof runs", async () => {
+      const { defaultCheckerIds } = await import("@crewhaus/tool-proof");
+      const { provabilitySkillSubstitutions } = await import("@crewhaus/evaluation-service");
+      for (const [written, lowered] of [
+        ["[smt]", ["smt", "builtin"]],
+        ["[lean4]", ["lean4", "builtin"]],
+        ["[smt, lean4]", ["smt", "lean4", "builtin"]],
+        ["[lean4, builtin]", ["lean4", "builtin"]],
+        ["[builtin]", ["builtin"]],
+        ["[builtin, smt]", ["builtin", "smt"]],
+      ] as const) {
+        const result = runLint(
+          cli("[read]", `provability: { level: proven, formal: { checkers: ${written} } }`),
+          noTools,
+        );
+        const config = provabilityOf(result.ir as IrNode);
+        if (config === undefined) throw new Error("expected a provability block");
+        // The IR lists every checker that runs (design §4.2) …
+        expect(config.formal.checkers).toEqual(lowered);
+        expect(defaultCheckerIds(config)).toEqual([...lowered]);
+        // … so the skill tells the model the list ProofCheckers will show.
+        expect(provabilitySkillSubstitutions(config)["checkers"]).toBe(lowered.join(", "));
+        const fired = result.findings.some((f) => f.rule === "provability-sandbox-only-checkers");
+        expect({ written, fired }).toEqual({ written, fired: !written.includes("builtin") });
+      }
+    });
+
+    test("an inert block is the inert-block warning's alone; auditProvability without the spec skips the rule", async () => {
+      expect(
+        provabilityRules(cli("[read]", "provability: { level: off, formal: { checkers: [smt] } }")),
+      ).toEqual(["provability-inert-block"]);
+      const { lower } = await import("@crewhaus/compiler");
+      const { parseSpec } = await import("@crewhaus/spec");
+      const spec = parseSpec(
+        cli("[read]", "provability: { level: proven, formal: { checkers: [smt] } }"),
+      );
+      expect(auditProvability(lower(spec), spec).map((f) => f.rule)).toEqual([
+        "provability-sandbox-only-checkers",
+      ]);
+      expect(auditProvability(lower(spec))).toEqual([]);
+    });
+  });
+
+  describe("provability-proofcheck-asks — a headless shape whose ProofCheck would park", () => {
+    const channel = (block: string, permissions = ""): string =>
+      [
+        "name: support-bot",
+        "target: channel",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: help",
+        "channels:",
+        "  slack:",
+        "    botToken: $SLACK_BOT_TOKEN",
+        "    signingSecret: $SLACK_SIGNING_SECRET",
+        "routing:",
+        "  sessionKey: thread",
+        ...(permissions !== "" ? [permissions] : []),
+        block,
+        "",
+      ].join("\n");
+    const asks = (yaml: string) =>
+      runLint(yaml, noTools).findings.filter((f) => f.rule === "provability-proofcheck-asks");
+
+    test("proven on a channel bot: the default smt checker asks, and the finding says how to allow it", () => {
+      const findings = asks(channel("provability: proven"));
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.severity).toBe("warning");
+      expect(findings[0]?.path).toBe("provability.formal.checkers");
+      expect(findings[0]?.message).toContain("before it runs the smt checker");
+      expect(findings[0]?.message).toContain("parks the turn until someone approves it");
+      expect(findings[0]?.message).toContain("alwaysAllow ProofCheck(smt)");
+      // Under ask_mode: deny the same call is refused, and the finding says so.
+      const denied = asks(channel("provability: proven", "permissions:\n  ask_mode: deny"));
+      expect(denied[0]?.message).toContain("is refused (ask_mode: deny)");
+    });
+
+    test("quiet when the sandbox checkers are allowed, when only builtin is listed, and on cli", () => {
+      expect(
+        asks(
+          channel(
+            "provability: proven",
+            'permissions:\n  rules:\n    - { type: alwaysAllow, pattern: "ProofCheck(smt)" }',
+          ),
+        ),
+      ).toEqual([]);
+      expect(
+        asks(channel("provability: { level: proven, formal: { checkers: [builtin] } }")),
+      ).toEqual([]);
+      expect(asks(cli("[read]", "provability: proven"))).toEqual([]);
+      // Below proven no ProofCheck is wired at all.
+      expect(asks(channel("provability: cited"))).toEqual([]);
+    });
+
+    test("lean4 too, each one named", () => {
+      const findings = asks(
+        channel("provability: { level: proven, formal: { checkers: [builtin, smt, lean4] } }"),
+      );
+      expect(findings[0]?.message).toContain("the smt and lean4 checker");
+      expect(findings[0]?.message).toContain("ProofCheck(smt), ProofCheck(lean4)");
+    });
+  });
+
+  test("auditProvability: no block, the off shorthand and crew yield nothing", async () => {
+    const { lower } = await import("@crewhaus/compiler");
+    const { parseSpec } = await import("@crewhaus/spec");
+    const lowerIr = (yaml: string): IrNode => lower(parseSpec(yaml));
+    expect(auditProvability(lowerIr(validCli))).toEqual([]);
+    expect(auditProvability(lowerIr(`${validCli}provability: off\n`))).toEqual([]);
+    // Crew carries the block unwired: the accepted-but-unwired warning says
+    // all there is to say.
+    const crew =
+      "name: cr\ntarget: crew\nmodel: m\nentry: lead\nroles:\n  lead: { instructions: x }\nprovability: { level: grounded, formal: { checkers: [smt] } }\n";
+    expect(auditProvability(lowerIr(crew))).toEqual([]);
   });
 });

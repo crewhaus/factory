@@ -79,6 +79,11 @@ import {
 } from "@crewhaus/harness-lifecycle";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   NO_PII_PASS_REASON,
@@ -573,7 +578,7 @@ export const storeMigrate: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "StoreMigrate";
     const dryRun = input.dryRun ?? true;
     const harness = containExistingDir(tool, input.dir ?? ".");
@@ -686,6 +691,20 @@ export const storeMigrate: RegisteredTool = buildTool({
     // the run that would have written through it.
     const escaping = containWritePaths(tool, dest.value, written);
     if (escaping !== undefined) return refusal(tool, escaping.code, escaping.reason);
+    // 0.8.0 — no copy lands in the run's own record (`RuntimeBridge
+    // .protectedRoots`): a destination of `.crewhaus` would write
+    // `.crewhaus/sessions/<id>.jsonl` over the live session log. Refused in
+    // every mode, as StateImport and CopyPath refuse.
+    const protectedRoots = protectedRootsOf(ctx);
+    if (protectedRoots.length > 0) {
+      const into = written.find(
+        (rel) =>
+          protectedRootHolding(path.join(dest.value.real, rel), protectedRoots) !== undefined,
+      );
+      if (into !== undefined) {
+        return protectedWriteRefusal(tool, `migrating onto ${input.to} (${into})`);
+      }
+    }
     const destState = inspectDestination(dest.value.real, written);
     if (!destState.ok) return refusal(tool, destState.code, destState.reason);
     const previousReceipt = destState.value.receipt;

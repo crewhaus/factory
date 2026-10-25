@@ -58,6 +58,7 @@ import type {
   IrModelTiers,
   IrNode,
   IrPermissions,
+  IrProvability,
   IrSecurity,
   IrSubAgentDefinition,
   IrThinking,
@@ -235,6 +236,17 @@ function describeEvaluation(e: IrEvaluation): string {
   return `in-loop evaluation (${e.grader.type}${threshold}, on fail: ${e.onFail}${retries})`;
 }
 
+/**
+ * 0.8.0 (design §5.1) — the provability gate runs at the evaluation seam, so
+ * it lights the same segment: "provability gate (grounded, on fail: retry)".
+ * A threshold below 1 and more than one retry are named, as for evaluation.
+ */
+function describeProvability(p: IrProvability): string {
+  const threshold = p.threshold < 1 ? `, threshold ${p.threshold}` : "";
+  const retries = p.onFail === "retry" && p.maxRetries > 1 ? `, ≤ ${p.maxRetries} retries` : "";
+  return `provability gate (${p.level}${threshold}, on fail: ${p.onFail}${retries})`;
+}
+
 function describeJudge(j: IrJudge): string {
   return `judge gate (threshold ${j.threshold}, on fail: ${j.onFail})`;
 }
@@ -275,6 +287,8 @@ type RingView = {
   readonly models?: IrModelProfiles;
   readonly modelProfile?: string;
   readonly evaluation?: IrEvaluation;
+  /** 0.8.0 — the provability gate (cli / channel / managed rings). */
+  readonly provability?: IrProvability;
   readonly learning?: IrLearning;
   readonly security?: IrSecurity;
   readonly memory?: IrMemory;
@@ -373,12 +387,16 @@ function ringSegmentsFromView(view: RingView): LoopSegment[] {
     "no tools, MCP servers, or sub-agents — replies in text only",
   );
 
-  // evaluate ← evaluation / learning.exam / security.justification.
+  // evaluate ← evaluation / provability / learning.exam / security.justification.
   const evalKeys: string[] = [];
   const evalParts: string[] = [];
   if (view.evaluation !== undefined) {
     evalKeys.push("evaluation");
     evalParts.push(describeEvaluation(view.evaluation));
+  }
+  if (view.provability !== undefined) {
+    evalKeys.push("provability");
+    evalParts.push(describeProvability(view.provability));
   }
   if (view.learning?.exam !== undefined) {
     evalKeys.push("learning.exam");
@@ -849,6 +867,7 @@ function cliRingView(ir: IrV0): RingView {
     ...(ir.models !== undefined ? { models: ir.models } : {}),
     ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
+    ...(ir.provability !== undefined ? { provability: ir.provability } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.security !== undefined ? { security: ir.security } : {}),
     ...(ir.memory !== undefined ? { memory: ir.memory } : {}),
@@ -882,6 +901,7 @@ function channelRingView(ir: IrChannelV0): RingView {
     ...(ir.models !== undefined ? { models: ir.models } : {}),
     ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
+    ...(ir.provability !== undefined ? { provability: ir.provability } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.memory !== undefined ? { memory: ir.memory } : {}),
     ...(ir.continuity !== undefined ? { continuity: ir.continuity } : {}),
@@ -905,6 +925,7 @@ function managedRingView(ir: IrManagedV0): RingView {
     ...(ir.models !== undefined ? { models: ir.models } : {}),
     ...(ir.agent.modelProfile !== undefined ? { modelProfile: ir.agent.modelProfile } : {}),
     ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
+    ...(ir.provability !== undefined ? { provability: ir.provability } : {}),
     ...(ir.learning !== undefined ? { learning: ir.learning } : {}),
     ...(ir.memory !== undefined ? { memory: ir.memory } : {}),
     ...(ir.continuity !== undefined ? { continuity: ir.continuity } : {}),

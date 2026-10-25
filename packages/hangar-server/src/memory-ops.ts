@@ -56,9 +56,12 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   type FrozenProof,
   type PlanRecord,
+  type UnverifiedRef,
   createContinuityStore,
+  isProvenByAssertion,
   listTrash,
   parseTrashTimestamp,
+  renderLadderStatus,
   restoreFromTrash,
 } from "@crewhaus/continuity-store";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
@@ -825,6 +828,36 @@ function proofRow(p: FrozenProof): Record<string, unknown> {
   };
 }
 
+/** A ref a `continuity.proof: off` transition cited and nothing resolved. */
+function unverifiedRow(ref: UnverifiedRef): Record<string, unknown> {
+  return {
+    toolUseId: ref.toolUseId,
+    sessionId: ref.sessionId ?? null,
+    recordedAt: ref.recordedAt,
+  };
+}
+
+/**
+ * The ladder fields of a step or goal row (design/0.8.0 §6.3). `status` stays
+ * the store's ladder value, so every reader that switches on it keeps
+ * working; what a step proven BY ASSERTION adds is said beside it, never
+ * folded away: the refs it cited (`unverified`), whether its `proven` is that
+ * kind (`provenByAssertion`), and the label continuity's own renderers give
+ * it (`[proven (unverified)]`, never `[proven]`). Dropping `unverified` is how
+ * the Memory view came to show a step nobody checked as plain proven.
+ */
+function ladderFields(record: {
+  readonly status: string;
+  readonly unverified?: readonly UnverifiedRef[];
+}): Record<string, unknown> {
+  return {
+    status: record.status,
+    statusLabel: renderLadderStatus(record),
+    provenByAssertion: isProvenByAssertion(record),
+    unverified: (record.unverified ?? []).map(unverifiedRow),
+  };
+}
+
 function planRow(plan: PlanRecord): Record<string, unknown> {
   return {
     id: plan.id,
@@ -834,7 +867,7 @@ function planRow(plan: PlanRecord): Record<string, unknown> {
     steps: plan.steps.map((s) => ({
       index: s.index,
       text: maskText(s.text),
-      status: s.status,
+      ...ladderFields(s),
       proofs: s.proofs.map(proofRow),
     })),
   };
@@ -955,7 +988,7 @@ export const continuity: M3Handler = async (ctx) => {
       goals = (await store.listGoals()).map((g) => ({
         id: g.id,
         title: maskText(g.title),
-        status: g.status,
+        ...ladderFields(g),
         target: g.target ?? null,
         current: g.current ?? null,
         unit: g.unit ?? null,
@@ -1264,7 +1297,9 @@ export const learning: M3Handler = async (ctx) => {
         gapGoals.push({
           id: g.id,
           title: maskText(g.title),
-          status: g.status,
+          // The ladder fields, as every goal row carries them: a `[gap]` goal
+          // closed by assertion is `[proven (unverified)]`, never plain proven.
+          ...ladderFields(g),
           updatedAt: g.updatedAt,
         });
       }

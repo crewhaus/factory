@@ -162,6 +162,7 @@ describe("EXIT_CODES", () => {
       timeout: 34,
       evaluation: 35,
       approval_pending: 36,
+      provability: 37,
       tool: 40,
     });
   });

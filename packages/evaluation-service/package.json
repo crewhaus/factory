@@ -1,0 +1,60 @@
+{
+  "name": "@crewhaus/evaluation-service",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "The composition root for in-loop gates: wireEvaluation builds the evaluation judge and the provability gate for every emitter and the interpreter",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/default-skills": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/logging": "workspace:*",
+    "@crewhaus/model-service": "workspace:*",
+    "@crewhaus/proof-checker": "workspace:*",
+    "@crewhaus/provability": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/skills-registry": "workspace:*",
+    "@crewhaus/tenancy": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-fetch": "workspace:*",
+    "@crewhaus/tool-proof": "workspace:*",
+    "@crewhaus/tool-result-store": "workspace:*",
+    "@crewhaus/trace-event-bus": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/event-log": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-encode": "workspace:*",
+    "@crewhaus/tool-flow": "workspace:*",
+    "@crewhaus/tool-math": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/evaluation-service"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/evaluation-service#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

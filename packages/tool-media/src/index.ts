@@ -660,7 +660,7 @@ export const pngWrite: RegisteredTool = buildTool({
 export const imageResize: RegisteredTool = buildTool({
   name: "ImageResize",
   operativeArgs: [
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", reads: true },
     { field: "output", kind: "path" },
   ],
   description:
@@ -717,7 +717,7 @@ export const imageResize: RegisteredTool = buildTool({
 export const imageCrop: RegisteredTool = buildTool({
   name: "ImageCrop",
   operativeArgs: [
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", reads: true },
     { field: "output", kind: "path" },
   ],
   description:
@@ -754,7 +754,7 @@ export const imageCrop: RegisteredTool = buildTool({
 export const exifStrip: RegisteredTool = buildTool({
   name: "ExifStrip",
   operativeArgs: [
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", reads: true },
     { field: "output", kind: "path" },
   ],
   description:

@@ -72,7 +72,8 @@ describe("RUNTIME_TOOL_NAMES", () => {
 
   test("carries every tool the runtime's own lists say it adds", () => {
     const known = new Set([...builtinNames, ...RUNTIME_TOOL_NAMES]);
-    const bookkeeping = BUILTIN_BOOKKEEPING_RULES.map((r) => r.pattern);
+    // A rule scoped to an argument (`ProofCheck(builtin)`) names its tool before the `(`.
+    const bookkeeping = BUILTIN_BOOKKEEPING_RULES.map((r) => r.pattern.replace(/\(.*\)$/, ""));
     expect(bookkeeping.length).toBeGreaterThan(0);
     expect(RETAINED_LOOP_TOOL_NAMES.length).toBeGreaterThan(0);
     const missing = [...bookkeeping, ...RETAINED_LOOP_TOOL_NAMES].filter((n) => !known.has(n));

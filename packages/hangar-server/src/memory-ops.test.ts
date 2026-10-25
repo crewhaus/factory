@@ -506,6 +506,70 @@ describe("continuity panel", () => {
     expect((body["goals"] as unknown[]).length).toBe(1);
   });
 
+  // 0.8.0 §6.3 — under `continuity.proof: off` a step or goal reaches
+  // `proven` by assertion: the store records the cited refs as `unverified`
+  // and renders `[proven (unverified)]`. The panel used to drop the field, so
+  // such a step read exactly like one the event log proves.
+  test("a step or goal proven by assertion carries its unverified refs, not a plain proven", async () => {
+    const t = boot();
+    const dir = fabricHarness(t);
+    const store = createContinuityStore({
+      specName: "fabric",
+      rootDir: join(dir, ".crewhaus", "state"),
+      sessionRootDir: join(dir, ".crewhaus", "sessions"),
+      now: () => new Date(NOW),
+    });
+    const plan = await store.createPlan({ title: "land M3", steps: ["read", "write"] });
+    await store.proveStep(
+      plan.id,
+      1,
+      [{ toolUseId: "toolu_asserted01", sessionId: "sess_00000000000000aa" }],
+      { verification: "unverified" },
+    );
+    const goal = await store.writeGoal({ title: "ship it" });
+    await store.updateGoal(
+      goal.id,
+      { status: "proven", evidence: [{ toolUseId: "toolu_asserted02" }] },
+      { verification: "unverified" },
+    );
+    const id = await register(t, dir);
+
+    const { status, body } = await t.api(`/api/h/${id}/memory/continuity`);
+    expect(status).toBe(200);
+    const steps = (body["plans"] as Array<Record<string, unknown>>)[0]?.["steps"] as Array<
+      Record<string, unknown>
+    >;
+    const asserted = steps[0] as Record<string, unknown>;
+    // The ladder value is unchanged — readers that switch on it keep working —
+    // and what makes it different is said beside it.
+    expect(asserted["status"]).toBe("proven");
+    expect(asserted["provenByAssertion"]).toBe(true);
+    expect(asserted["statusLabel"]).toBe("[proven (unverified)]");
+    expect(asserted["unverified"]).toEqual([
+      {
+        toolUseId: "toolu_asserted01",
+        sessionId: "sess_00000000000000aa",
+        recordedAt: iso(NOW),
+      },
+    ]);
+    expect(asserted["proofs"]).toEqual([]);
+    // An untouched step carries the same fields, empty.
+    expect(steps[1]).toMatchObject({
+      status: "open",
+      provenByAssertion: false,
+      statusLabel: "[open]",
+      unverified: [],
+    });
+
+    const goals = body["goals"] as Array<Record<string, unknown>>;
+    expect(goals[0]).toMatchObject({
+      status: "proven",
+      provenByAssertion: true,
+      statusLabel: "[proven (unverified)]",
+      unverified: [{ toolUseId: "toolu_asserted02", sessionId: null, recordedAt: iso(NOW) }],
+    });
+  });
+
   test("an older flat tree degrades to documents instead of an empty panel", async () => {
     const t = boot();
     const dir = makeFixtureHarness(join(t.harnessesRoot, "flat"), {
@@ -605,6 +669,38 @@ describe("learning panel", () => {
     const gaps = body["gaps"] as Record<string, unknown>;
     expect(gaps["total"]).toBe(1);
     expect((gaps["goals"] as Array<Record<string, unknown>>)[0]?.["title"]).toContain("[gap]");
+  });
+
+  // 0.8.0 §6.3 — the third goal-row site: a `[gap]` goal closed by assertion
+  // under `continuity.proof: off` reads `[proven (unverified)]` here too.
+  test("a gap goal proven by assertion carries its unverified refs, not a plain proven", async () => {
+    const t = boot();
+    const dir = fabricHarness(t);
+    const store = createContinuityStore({
+      specName: "fabric",
+      rootDir: join(dir, ".crewhaus", "state"),
+      sessionRootDir: join(dir, ".crewhaus", "sessions"),
+      now: () => new Date(NOW),
+    });
+    const gap = await store.writeGoal({ title: "[gap] canary rollouts" });
+    await store.updateGoal(
+      gap.id,
+      { status: "proven", evidence: [{ toolUseId: "toolu_asserted03" }] },
+      { verification: "unverified" },
+    );
+    const id = await register(t, dir);
+
+    const { status, body } = await t.api(`/api/h/${id}/memory/learning`);
+    expect(status).toBe(200);
+    const goals = (body["gaps"] as Record<string, unknown>)["goals"] as Array<
+      Record<string, unknown>
+    >;
+    expect(goals[0]).toMatchObject({
+      status: "proven",
+      provenByAssertion: true,
+      statusLabel: "[proven (unverified)]",
+      unverified: [{ toolUseId: "toolu_asserted03", sessionId: null, recordedAt: iso(NOW) }],
+    });
   });
 
   test("a spec with no learning block says so instead of drawing an empty panel", async () => {

@@ -22,6 +22,8 @@ export type {
   EffectiveParams,
   ErrorRecoveredEvent,
   EvalGradedEvent,
+  ProvabilityGradedEvent,
+  ProofCheckedEvent,
   HandoffEvent,
   HookFiredEvent,
   JanitorActionEvent,

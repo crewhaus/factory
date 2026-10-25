@@ -271,6 +271,19 @@ describe("eval bridge smoke — channel (channel-resume-turn)", () => {
   }, 240_000);
 });
 
+describe("eval bridge smoke — a gated channel bot's proof reaches the graders (§9.1)", () => {
+  test("runEval through the bridge: proof.json is the gate's standing bundle and provability.claimCoverage passes", async () => {
+    const out = await compileBridged("minimal-channel-provability");
+    const r = await drive("channel-proof", out);
+    // The sample's output is the answer alone: the eval entry asks for no footer.
+    expect(String(r["agentOutput"])).not.toContain("── provability");
+    expect(r["files"]).toContain("proof.json");
+    expect(r["proof"]).toEqual({ level: "cited", verdict: "pass", met: 1 });
+    expect(r["coverage"]).toMatchObject({ passed: true, score: 1 });
+    expect(r["passRate"]).toBe(1);
+  }, 240_000);
+});
+
 describe("eval bridge smoke — managed (gateway-request)", () => {
   test("both sample kinds run through the gateway's runOneTurn dispatcher", async () => {
     const out = await compileBridged("minimal-managed");

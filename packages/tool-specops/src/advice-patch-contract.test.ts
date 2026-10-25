@@ -37,6 +37,7 @@ import {
   ruleFailureTaxonomy,
   rulePoolPolicyUpgrade,
   rulePoolStaleExploitation,
+  ruleProvabilityPressure,
   ruleTruncationPressure,
   runAdviceRules,
 } from "@crewhaus/harness-advice/advise-rules";
@@ -74,6 +75,48 @@ async function applyThroughTool(
     }),
   );
   return JSON.parse(out) as Record<string, unknown>;
+}
+
+/**
+ * 0.8.0 §9.3 — a gated cli spec whose provability block is in object form
+ * (the shorthand has no key to patch), so the pressure rule can propose its
+ * `max_retries` patch.
+ */
+const PROVABILITY_SPEC_YAML = [
+  "# a spec a human maintains",
+  "name: hello",
+  "target: cli",
+  "agent:",
+  "  model: claude-sonnet-4-6",
+  "  instructions: help",
+  "provability:",
+  "  # the floor is human-owned",
+  "  level: grounded",
+  "  on_fail: retry",
+  "",
+].join("\n");
+
+/** `failing` turns that fail, retry once and fail again; `passing` turns that pass. */
+function provabilityLines(failing: number, passing: number): unknown[] {
+  const graded = (turnNumber: number, verdict: "pass" | "fail", retryIndex: number) =>
+    fx.line("provability_graded", {
+      level: "grounded",
+      verdict,
+      claims: 2,
+      met: verdict === "pass" ? 2 : 0,
+      unmet: verdict === "pass" ? 0 : 2,
+      assumptions: 0,
+      retryIndex,
+      maxRetries: 1,
+      turnNumber,
+      bundleHash: `sha256:${turnNumber}-${retryIndex}`,
+    });
+  const out: unknown[] = [];
+  let turn = 1;
+  for (let i = 0; i < failing; i++, turn++)
+    out.push(graded(turn, "fail", 0), graded(turn, "fail", 1));
+  for (let i = 0; i < passing; i++, turn++) out.push(graded(turn, "pass", 0));
+  return out;
 }
 
 type PatchCase = {
@@ -130,6 +173,14 @@ const PATCH_CASES: ReadonlyArray<PatchCase> = [
     rule: ruleEscalationPrecision,
     specYaml: fx.RULED_SPEC_YAML,
     sessions: [session("sess_a", fx.noisyCascadeLines())],
+    arms: [],
+  },
+  {
+    // 0.8.0 §9.3 — 2 of 5 gated turns end failing (≥ 20 %): +1 retry.
+    findingId: "provability-pressure",
+    rule: ruleProvabilityPressure,
+    specYaml: PROVABILITY_SPEC_YAML,
+    sessions: [session("sess_a", provabilityLines(2, 3))],
     arms: [],
   },
 ];
@@ -247,7 +298,7 @@ describe("every rule that proposes a patch proposes one the applier accepts", ()
  * paths are checked: a scan that matched nothing would otherwise report every
  * path as fine, which is how a guard becomes decorative.
  */
-const EXPECTED_PATCH_SITES = 6;
+const EXPECTED_PATCH_SITES = 7;
 
 const PATCH_SITE_RE = /path:\s*\[([^\]]*)\]/g;
 const QUOTED_SEGMENT_RE = /^"([^"]*)"$/;

@@ -943,6 +943,10 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   goal_update: true,
   action_proof: true,
   dream_run: true,
+  // 0.8.0 (design/0.8.0-provability-release.md §5.3) — the provability gate's
+  // verdict summary and ProofCheck's checker runs, both mirrored durably.
+  provability_graded: true,
+  proof_checked: true,
 };
 export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
   Object.keys(WATCHME_MIRRORED_KIND_RECORD),

@@ -32,5 +32,6 @@ export type {
   WatchmeAggregate,
   WatchmeJudgment,
   WatchmeObservation,
+  WatchmeProvability,
   WatchmeState,
 } from "./types.js";

@@ -577,7 +577,7 @@ async function performFetch(
   initialBody: string | undefined,
   callHeaders: Record<string, string> | undefined,
   signal: AbortSignal,
-  cfg: FetchConfig,
+  checkOrigin: (url: URL) => void,
 ): Promise<Response> {
   let currentUrl = initialUrl;
   let method = initialMethod;
@@ -590,7 +590,7 @@ async function performFetch(
         `[fetch denied] scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
-    checkOriginAllowed(currentUrl, cfg);
+    checkOrigin(currentUrl);
     // Re-validate every hop and pin the connection to the exact IP we just
     // vetted, so a rebinding resolver can't swap in a private address between
     // this check and the socket connect (CWE-367 TOCTOU).
@@ -679,13 +679,14 @@ export const fetch: RegisteredTool = buildTool({
         });
     }
     try {
+      const cfg = resolveFetchConfig(ctx?.toolConfig);
       const res = await performFetch(
         url,
         input.method ?? "GET",
         input.body,
         input.headers,
         ctrl.signal,
-        resolveFetchConfig(ctx?.toolConfig),
+        (hop) => checkOriginAllowed(hop, cfg),
       );
       const body = await readBodyCapped(res);
       return formatResponse(res, body.text, body.decodedFrom);
@@ -694,3 +695,92 @@ export const fetch: RegisteredTool = buildTool({
     }
   },
 });
+
+/** How long one {@link guardedHead} may take, redirects included. */
+export const GUARDED_HEAD_TIMEOUT_MS = 10_000;
+
+export type GuardedHeadOptions = {
+  /** Aborts the request (the caller's turn ending, say). */
+  readonly signal?: AbortSignal;
+  /** Bound on the whole request, redirects included. Default {@link GUARDED_HEAD_TIMEOUT_MS}. */
+  readonly timeoutMs?: number;
+  /**
+   * The caller's own host policy, applied to the first URL AND to every hop a
+   * redirect names: return false to refuse the hop. Absent ⇒ any public host
+   * (the SSRF guard below still applies to every hop).
+   */
+  readonly allowHost?: (hostname: string) => boolean;
+};
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §6.1, `provability.sources.
+ * resolve: head`) — one HEAD request through the same guarded path the Fetch
+ * tool takes, for a caller that only needs to know whether a URL answers:
+ * http(s) only, the private-address classifier on the literal AND the
+ * DNS-resolved address of every hop, the connection pinned to the vetted IP
+ * (no rebinding between check and connect), at most five redirects with
+ * every hop re-checked, a bounded wait (DNS lookups included), and no body
+ * read. Returns the final status; throws `FetchPermissionError` for a URL or
+ * hop it refuses, and rejects on a network failure, the timeout or the
+ * caller's abort.
+ *
+ * The Fetch tool's `allowed_origins` list does not apply: that list is what
+ * the MODEL may call, and a HEAD here is the provability gate checking a
+ * citation, under the spec's own `sources.allow` / `sources.deny` — which the
+ * caller passes as `allowHost`, so a redirect cannot carry the request to a
+ * host the spec refused. Exported here rather than reimplemented because the
+ * redirect loop and the IP pinning are the defences, and two copies of them
+ * drift.
+ */
+export async function guardedHead(rawUrl: string, opts: GuardedHeadOptions = {}): Promise<number> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new FetchPermissionError(`invalid URL "${rawUrl}"`);
+  }
+  const allowHost = opts.allowHost;
+  const ctrl = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? GUARDED_HEAD_TIMEOUT_MS;
+  const timer = setTimeout(
+    () => ctrl.abort(new Error(`the HEAD request timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
+  const signal = opts.signal;
+  const onAbort = (): void => ctrl.abort(signal?.reason);
+  if (signal !== undefined) {
+    if (signal.aborted) ctrl.abort(signal.reason);
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  // The bound must hold over the WHOLE request: the abort reaches the socket,
+  // but not the DNS lookup each hop's SSRF check awaits, so a hung resolver
+  // would otherwise outlive both the timeout and the caller's abort. Racing
+  // the request against the abort answers on time; the stranded lookup, if
+  // it ever returns, meets an aborted signal and sends nothing.
+  let onStop: (() => void) | undefined;
+  const stopped = new Promise<never>((_resolve, reject) => {
+    onStop = () => reject(ctrl.signal.reason);
+    if (ctrl.signal.aborted) onStop();
+    else ctrl.signal.addEventListener("abort", onStop, { once: true });
+  });
+  try {
+    const res = await Promise.race([
+      performFetch(url, "HEAD", undefined, undefined, ctrl.signal, (hop) => {
+        if (allowHost !== undefined && !allowHost(hop.hostname.toLowerCase())) {
+          throw new FetchPermissionError(`[head denied] host "${hop.hostname}" is not allowed`);
+        }
+      }),
+      stopped,
+    ]);
+    try {
+      await res.body?.cancel();
+    } catch {
+      // A HEAD has no body to drain; a runtime that hands one anyway is ignored.
+    }
+    return res.status;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+    if (onStop !== undefined) ctrl.signal.removeEventListener("abort", onStop);
+  }
+}

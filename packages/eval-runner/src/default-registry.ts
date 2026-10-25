@@ -14,6 +14,12 @@
  *
  *   continuity.*             — `registerContinuityGraders` (5 graders)
  *   twelve.*                 — `register12MetricRubric` (12 metrics)
+ *   provability.*            — 0.8.0 §9.1 `createProvabilityGraders` (6
+ *                              deterministic graders over the sample's proof
+ *                              bundle; the flywheel canary can name them like
+ *                              any registered grader). A `type: registry`
+ *                              entry naming one gates beside the `combine:`
+ *                              policy, never in it (`registryProvabilityRoles`)
  *   nlg.rouge1/rouge2/rougeL/bleu1..4/meteor — pack defaults (threshold 0.5)
  *   semantic.similarity      — embedder resolved lazily from
  *                              `CREWHAUS_EVAL_EMBEDDER` (a model spec for
@@ -77,7 +83,7 @@
  *     documented plugin contract; the registry cannot know a plugin's
  *     vocabulary, so it validates nothing and drops nothing;
  *   - registered names with no YAML-settable construction (`twelve.*` /
- *     `continuity.*` constants, the wiring throwers above) reject ALL
+ *     `continuity.*` / `provability.*` constants, the wiring throwers above) reject ALL
  *     opts, pointing at the plugin override path.
  */
 import { join } from "node:path";
@@ -98,7 +104,7 @@ import {
   judgeBackedClassifier,
 } from "./judge-classifier";
 import { PARAPHRASE_GROUP_GRADER, paraphraseGroupConsistency } from "./paraphrase-consistency";
-import type { GraderLookup } from "./types";
+import type { EvalPricingFn, GraderEntry, GraderLookup } from "./types";
 import { EVAL_VISION_MODEL_ENV, visionOcr } from "./vision-ocr";
 
 /** Env var naming the embedder model spec for `semantic.similarity`
@@ -110,6 +116,12 @@ export type DefaultGraderRegistryOptions = {
   readonly cwd?: string;
   /** Full override of the plugin discovery root (tests). */
   readonly pluginRoot?: string;
+  /**
+   * 0.8.0 §9.1 — prices `provability.costPerProvenClaim`'s gate re-runs on a
+   * run no cost-tracker metered (`runEval` passes its own
+   * `RunEvalOptions.pricing`). Absent ⇒ those tokens are reported unpriced.
+   */
+  readonly pricing?: EvalPricingFn;
 };
 
 /**
@@ -398,16 +410,22 @@ export async function defaultGraderRegistry(
 ): Promise<DefaultGraderRegistry> {
   const registry = new DefaultGraderRegistry();
 
-  const [nlg, multimodal, safety, twelve, continuity] = await Promise.all([
+  const [nlg, multimodal, safety, twelve, continuity, provability] = await Promise.all([
     import("@crewhaus/grader-nlg-metrics"),
     import("@crewhaus/grader-multimodal"),
     import("@crewhaus/grader-safety-classifiers"),
     import("@crewhaus/grader-12-metric-rubric"),
     import("@crewhaus/grader-continuity"),
+    import("@crewhaus/grader-provability"),
   ]);
 
   continuity.registerContinuityGraders(registry);
   twelve.register12MetricRubric(registry);
+  for (const [name, grader] of provability.createProvabilityGraders(
+    opts.pricing !== undefined ? { pricing: opts.pricing } : {},
+  )) {
+    registry.register(name, grader);
+  }
 
   registry.register("nlg.rouge1", nlg.rouge1());
   registry.register("nlg.rouge2", nlg.rouge2());
@@ -580,4 +598,43 @@ export function resolveRegistryGrader(
       err,
     );
   }
+}
+
+/** How an entry joins a sample's overall grade when not through the `combine:` policy. */
+type GraderRole = NonNullable<GraderEntry["role"]>;
+
+/** The registry namespace the six graders live under. */
+const PROVABILITY_NAMESPACE = "provability.";
+
+/**
+ * 0.8.0 §9.1 (review I32) — the {@link GraderEntry.role} a graders-file
+ * `type: registry` entry takes, keyed on the registry name it resolves
+ * (`registrySpec.grader`). An entry naming one of the six `provability.*`
+ * graders takes the role `--provability` gives that grader — the five with a
+ * bar REQUIREMENTS beside the file's `combine:` policy, `costPerProvenClaim`
+ * a REPORT — so a spec that declares `provability:` and names the graders by
+ * hand is "gated the same way without the flag" (`crewhaus eval --help`): a
+ * reported dollar figure (§9.1: "reported, no threshold"), a vacuous pass or
+ * a lower-is-better rate never votes in a `combine: any` / `weighted` policy
+ * written for the user's own graders. A name outside the six — another
+ * pack's, a plugin's own metric under the namespace — is absent from the map
+ * and joins the file's policy, as before. The pack is imported only when an
+ * entry names something under `provability.`.
+ */
+export async function registryProvabilityRoles(
+  compiled: ReadonlyArray<{ readonly registrySpec?: { readonly grader: string } | undefined }>,
+): Promise<ReadonlyMap<string, GraderRole>> {
+  const names = compiled.flatMap((g) =>
+    g.registrySpec?.grader.startsWith(PROVABILITY_NAMESPACE) === true
+      ? [g.registrySpec.grader]
+      : [],
+  );
+  const roles = new Map<string, GraderRole>();
+  if (names.length === 0) return roles;
+  const { provabilityGraderRole } = await import("@crewhaus/grader-provability");
+  for (const name of names) {
+    const role = provabilityGraderRole(name);
+    if (role !== undefined) roles.set(name, role);
+  }
+  return roles;
 }

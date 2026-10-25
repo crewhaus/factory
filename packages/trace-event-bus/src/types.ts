@@ -1019,6 +1019,80 @@ export type ModelDirectiveEvent = TraceEventEnvelope & {
 };
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §5.3) — published by the
+ * in-loop provability gate each time a completed answer is verified against
+ * the spec's `provability:` floor. One event per verification pass, including
+ * the re-verification of gate-triggered retries (`retryIndex`). Carries the
+ * bundle SUMMARY, never the bundle: the full `ProofBundle` lives under
+ * `.crewhaus/proofs/` (`bundlePath`) and is pinned here by `bundleHash`.
+ * `verdict: "unverified"` means the verifier threw and the gate failed open.
+ */
+export type ProvabilityGradedEvent = TraceEventEnvelope & {
+  kind: "provability_graded";
+  level: "cited" | "grounded" | "checked" | "proven";
+  verdict: "pass" | "fail" | "unverified";
+  /** met / (claims − assumptions); 1 on a vacuous zero-claim answer. */
+  score: number;
+  threshold: number;
+  /** The highest floor the answer would have passed. */
+  achieved: "none" | "cited" | "grounded" | "checked" | "proven";
+  claims: number;
+  met: number;
+  unmet: number;
+  assumptions: number;
+  /**
+   * Declared assumptions the config refused (`ProofBundle.assumptionsRefused`),
+   * when any. A refusal fails the verdict whatever the score, so without it a
+   * failing line with `score >= threshold` would not say why. (0.8.0 additive,
+   * W2-A.)
+   */
+  assumptionsRefused?: number;
+  /**
+   * The hypotheses accepted proofs rest on (`ProofBundle.hypotheses`), when
+   * any: assumptions too, counted on every surface (design §6.4, §10).
+   * (0.8.0 additive, fix pass.)
+   */
+  hypotheses?: number;
+  /**
+   * Source origins whose grounding text the run wrote itself before reading
+   * it back (`ProofBundle.selfWritten`), when any — design §10's residual,
+   * surfaced. (0.8.0 additive, completeness pass.)
+   */
+  selfWritten?: number;
+  /** 0 = the original answer, n = the n-th gate-triggered retry. */
+  retryIndex: number;
+  maxRetries: number;
+  bundleHash: string;
+  /**
+   * Where the bundle was persisted, when it was — as the gate's display rule
+   * shows it (relative to the tenant's root inside a tenant scope, else the
+   * workspace: a `runs.subscribe` client never learns the server's layout).
+   * The durable event-log twin keeps the path as persisted.
+   */
+  bundlePath?: string;
+  /** The waiver judge's model and spend, when it ran. */
+  judgeModel?: string;
+  judgeCostUsdMicros?: number;
+  /** Under `on_fail: escalate`, the spec model string the turn was handed to. */
+  escalatedTo?: string;
+};
+
+/**
+ * 0.8.0 (§7) — published by `ProofCheck` once per checker run, accepted or
+ * rejected: a rejected proof is persisted and reported too, because proof
+ * pressure is signal (the `action_proof` rule from tool-plan).
+ */
+export type ProofCheckedEvent = TraceEventEnvelope & {
+  kind: "proof_checked";
+  checker: string;
+  ok: boolean;
+  /** The persisted artifact id (`prf_<16 hex>`). */
+  artifactId: string;
+  durationMs: number;
+  axioms: readonly string[];
+};
+
+/**
  * Loop contract 0.4 (Batch B, G62) — published by the in-loop `evaluation:`
  * machinery each time a completed assistant turn's final text is scored
  * (cli/channel/managed shapes). One event per grading pass, INCLUDING the
@@ -1155,7 +1229,9 @@ export type TraceEvent =
   | SanitizerReportEvent
   | AlertRaisedEvent
   | EvalGradedEvent
-  | JudgeVerdictEvent;
+  | JudgeVerdictEvent
+  | ProvabilityGradedEvent
+  | ProofCheckedEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

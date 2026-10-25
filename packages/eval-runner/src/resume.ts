@@ -92,6 +92,13 @@ export type ResumeManifest = {
    */
   readonly routing?: ResumeRouting;
   /**
+   * 0.8.0 §9.1 — the `--provability` floor the recorded run imposed. Absent
+   * means the spec's own block (or none) was measured, so absence is a known
+   * value: resuming a floor-overridden run without the flag (or at another
+   * floor) would grade the remaining samples against a different gate.
+   */
+  readonly provability?: string;
+  /**
    * Every attempt that re-opened this directory, oldest first (the run's own
    * first pass is not an attempt). Tolerates the legacy scalar form.
    */
@@ -167,6 +174,7 @@ export function readRunManifest(
     ...(typeof obj.seed === "number" ? { seed: obj.seed } : {}),
     ...(toolRecording !== undefined ? { toolRecording } : {}),
     ...(routing !== undefined ? { routing } : {}),
+    ...(typeof obj.provability === "string" ? { provability: obj.provability } : {}),
     ...(resumedAt.length > 0 ? { resumedAt } : {}),
     ...(typeof obj.spentUsd === "number" && Number.isFinite(obj.spentUsd) && obj.spentUsd > 0
       ? { spentUsd: obj.spentUsd }
@@ -223,6 +231,8 @@ export type ResumeIdentity = {
   readonly toolRecording?: EvalToolRecordingConfig;
   /** How THIS attempt routes; absent = `static` (see the manifest field). */
   readonly routing?: ResumeRouting;
+  /** THIS attempt's `--provability` floor; absent = the spec's own (see the manifest field). */
+  readonly provability?: string;
 };
 
 /**
@@ -265,9 +275,10 @@ function routingLabel(value: ResumeRouting | undefined): string {
  * whether the samples faced the world or a cassette. Resuming across any of
  * them would splice two different measurements into one run.
  *
- * `repeats`, `seed`, `toolRecording` and `routing` are NORMALIZED rather than
- * skipped-when-absent: run.json omits them only for the known defaults (1, no
- * seed, live tools, static routing), so an absent value is a KNOWN value —
+ * `repeats`, `seed`, `toolRecording`, `routing` and `provability` are
+ * NORMALIZED rather than skipped-when-absent: run.json omits them only for the
+ * known defaults (1, no seed, live tools, static routing, the spec's own
+ * provability block), so an absent value is a KNOWN value —
  * and ADDING `--seed 7`, dropping `--repeats 3`, or resuming a static run
  * under `--routing as-declared` on the resume is caught just like editing the
  * rubric is.
@@ -314,6 +325,14 @@ export function resumeMismatches(manifest: ResumeManifest, current: ResumeIdenti
   const nowRouting = routingLabel(current.routing);
   if (wasRouting !== nowRouting) {
     out.push(`routing: ${wasRouting} (recorded) → ${nowRouting} (this run)`);
+  }
+  // 0.8.0 §9.1 — and once more for the provability floor: absent means the
+  // spec's own gate, a known value, so adding, dropping or changing
+  // `--provability` between attempts is a mismatch.
+  const wasFloor = manifest.provability ?? "(spec)";
+  const nowFloor = current.provability ?? "(spec)";
+  if (wasFloor !== nowFloor) {
+    out.push(`provability: ${wasFloor} (recorded) → ${nowFloor} (this run)`);
   }
   return out;
 }

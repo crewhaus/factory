@@ -47,6 +47,12 @@ import { readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
+import {
+  protectedRootBeneath,
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   DEFAULT_B,
@@ -1841,10 +1847,24 @@ export const stateImport: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const root = stateRoot("StateImport", input.stateDir);
     const mode = input.mode ?? "merge";
     const dryRun = input.dryRun === true;
+    // 0.8.0 — the run's own record (`RuntimeBridge.protectedRoots`: the
+    // session logs, spilled tool results, proof bundles) is never written:
+    // a `stateDir` at the workspace root or above `.crewhaus` would put an
+    // entry such as `.crewhaus/sessions/<id>.jsonl` in the live log, where a
+    // forged fetch grounds any text. Refused in every mode, before anything
+    // is written, as CopyPath and MovePath refuse.
+    const protectedRoots = protectedRootsOf(ctx);
+    if (
+      mode === "replace" &&
+      protectedRoots.length > 0 &&
+      protectedRootBeneath(root.abs, protectedRoots) !== undefined
+    ) {
+      return protectedWriteRefusal("StateImport", `replacing ${root.rel}`);
+    }
 
     // Validate every path BEFORE writing anything, so a document with one bad
     // entry cannot leave the state directory half-replaced.
@@ -1866,6 +1886,9 @@ export const stateImport: RegisteredTool = stateTool({
           continue;
         }
         throw err;
+      }
+      if (protectedRoots.length > 0 && protectedRootHolding(target, protectedRoots) !== undefined) {
+        return protectedWriteRefusal("StateImport", `importing ${file.path}`);
       }
       const body =
         file.encoding === "utf8"

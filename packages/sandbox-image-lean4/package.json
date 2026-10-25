@@ -1,0 +1,38 @@
+{
+  "name": "@crewhaus/sandbox-image-lean4",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "Lean 4 sandbox image: registry registration for the proven rung's lean4 checker",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/sandbox-image-registry": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/sandbox-image-lean4"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/sandbox-image-lean4#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

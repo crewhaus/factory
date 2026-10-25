@@ -27,6 +27,7 @@
  */
 import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { MAX_TITLE_CHARS } from "@crewhaus/continuity-store";
 import { DEFAULT_SKILLS, renderSkill } from "@crewhaus/default-skills";
 import type { DreamModelPhase } from "@crewhaus/dream-engine";
 import type { LoadedSkill } from "@crewhaus/skills-registry";
@@ -255,6 +256,22 @@ export function withLearningDreamSeed(
  *  (see wireMemory's gap sink) and the dream seed / study listing read. */
 export const GAP_GOAL_PREFIX = "[gap]";
 
+/**
+ * The plan-store goal a knowledge gap becomes: `[gap] <topic>`, the topic
+ * collapsed to one line and clipped with `…` so the whole title fits the
+ * store's {@link MAX_TITLE_CHARS}. The store REFUSES a longer title (titles
+ * are one short line, design/0.8.0 §6.3) and `log_knowledge_gap`'s topic has
+ * no length bound in its schema, so an unclipped long topic logged no gap at
+ * all — the tool threw and the study queue never saw it. `clipped` lets the
+ * sink say so; the dream seed reads the clipped topic back by stripping the
+ * prefix.
+ */
+export function gapGoalTitle(topic: string): { readonly title: string; readonly clipped: boolean } {
+  const budget = MAX_TITLE_CHARS - (GAP_GOAL_PREFIX.length + 1);
+  const flat = topic.replace(/\s+/g, " ").trim();
+  return { title: `${GAP_GOAL_PREFIX} ${truncate(flat, budget)}`, clipped: flat.length > budget };
+}
+
 // ---------------------------------------------------------------------------
 // the first-class exam (§3.3 EXAM — the run_exam tool + the injected runner)
 // ---------------------------------------------------------------------------
@@ -308,7 +325,10 @@ export type ExamRunner = (req: ExamRunnerRequest) => Promise<ExamReport>;
 const runExamInput = z.object({}).strict();
 
 /** Cap on failed items rendered verbatim into the tool result — the full
- *  list persists in the runner's artifacts. */
+ *  list persists in the runner's artifacts. The same cap bounds the
+ *  "could not log" list: when the gap sink is down (a Thredz outage or rate
+ *  limit) every failed sample fails to log, and an uncapped list would put
+ *  the whole failure set back into the tool result. */
 const EXAM_REPORT_MAX_FAILURES = 20;
 
 export type CreateExamToolOptions = {
@@ -357,20 +377,25 @@ export function createExamTool(opts: CreateExamToolOptions): RegisteredTool {
       }
 
       const failures = report.outcomes.filter((o) => !o.passed);
-      const gapResults: string[] = [];
+      // Count only the gaps that actually landed: a sink that throws is named
+      // below, so the report never claims a gap the study queue cannot see.
+      let gapsLogged = 0;
+      const gapFailures: string[] = [];
       if (opts.logGap !== undefined) {
         for (const failure of failures) {
           try {
-            gapResults.push(
-              await opts.logGap({
-                topic: `exam failure ${failure.sampleId}: ${truncate(failure.input, 160)}`,
-                detail: failure.rationale ?? failure.error ?? "failed the competency exam",
-                tags: ["exam"],
-                priority: "high",
-              }),
-            );
+            await opts.logGap({
+              topic: `exam failure ${failure.sampleId}: ${truncate(failure.input, 160)}`,
+              detail: failure.rationale ?? failure.error ?? "failed the competency exam",
+              tags: ["exam"],
+              priority: "high",
+            });
+            gapsLogged += 1;
           } catch (err) {
-            gapResults.push(`failed to log gap for ${failure.sampleId}: ${(err as Error).message}`);
+            // The sink's message is server-shaped and unbounded (a Thredz
+            // error body); clip it like every other line of this report.
+            const message = err instanceof Error ? err.message : String(err);
+            gapFailures.push(`- ${truncate(failure.sampleId, 80)}: ${truncate(message, 200)}`);
           }
         }
       }
@@ -394,9 +419,22 @@ export function createExamTool(opts: CreateExamToolOptions): RegisteredTool {
         lines.push(
           "",
           opts.logGap !== undefined
-            ? `knowledge gaps logged automatically (${gapResults.length}) — the next study pass picks them up`
+            ? `knowledge gaps logged automatically (${gapsLogged}) — the next study pass picks them up`
             : "no gap sink is wired — call log_knowledge_gap for each failure so the next study pass picks them up",
         );
+        if (gapFailures.length > 0) {
+          // The header keeps the true count; the list stops at the cap and
+          // points at the artifacts, which name every failed sample.
+          lines.push(
+            `could not log ${gapFailures.length} gap(s) — call log_knowledge_gap for each:`,
+            ...gapFailures.slice(0, EXAM_REPORT_MAX_FAILURES),
+          );
+          if (gapFailures.length > EXAM_REPORT_MAX_FAILURES) {
+            lines.push(
+              `  … ${gapFailures.length - EXAM_REPORT_MAX_FAILURES} more — every failed sample is in the artifacts`,
+            );
+          }
+        }
       } else if (report.total > 0) {
         lines.push(
           "every sample passed — consider adding questions for newly mastered topics so the exam keeps pace",
@@ -407,7 +445,14 @@ export function createExamTool(opts: CreateExamToolOptions): RegisteredTool {
   });
 }
 
+/** `text` on one line, at most `cap` UTF-16 units, ending `…` when cut. The
+ *  cut never splits a surrogate pair: a lone half is not text, and is written
+ *  to disk as U+FFFD. */
 function truncate(text: string, cap: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > cap ? `${flat.slice(0, cap - 1)}…` : flat;
+  if (flat.length <= cap) return flat;
+  let end = cap - 1;
+  const last = flat.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${flat.slice(0, end).trimEnd()}…`;
 }

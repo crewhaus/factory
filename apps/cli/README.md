@@ -76,7 +76,8 @@ Run `crewhaus` with no arguments for the full usage text, or any subcommand with
 | `eval <spec.yaml> --dataset <data> --graders <graders.yaml>` | Run the agent against a dataset and grade (deterministic graders + LLM-as-judge); every run is indexed and auto-diffed against the pinned baseline (`--gate` exits non-zero on regression, `--no-promote` keeps the pin); the per-spec `<specName>-regressions` suite is unioned in by default (`--no-regressions` skips) |
 | `eval-report diff <prev> <new>` | Compare two eval runs and emit a diff report; `history` lists recorded runs, `baseline show\|set <runId>` inspects or pins baselines |
 | `optimize <spec.yaml> --dataset <data> --graders <graders.yaml>` | Active eval-driven optimization; `--write-back` rewrites the spec in place; accepted patches pin their fail→pass recoveries into `<specName>-regressions` (`--no-pin-regressions` skips) |
-| `init [name]` | Scaffold a new `crewhaus.yaml` |
+| `init [name]` | Scaffold a new `crewhaus.yaml`; `--provability <rung>` declares how much proof its answers carry |
+| `provability show\|check\|audit\|checkers\|prune` | Inspect what the provability gate checked: `show` one turn's proof bundle, `audit` them across sessions, `prune` old ones, list the proof `checkers`; `check <answer.md> --level <rung>` runs the gate offline over any document and exits 1 unless it passes, so a generated report can be gated in CI |
 | `doctor` | Check environment health |
 | `context --bundle` | Emit a single-markdown orientation manifest |
 | `cost-summary --session <id>` | Summarize cost-accrual events for a session |

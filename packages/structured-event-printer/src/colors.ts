@@ -71,6 +71,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   // beside test_verdict in the green verdict family.
   eval_graded: "\x1b[32m", // green
   judge_verdict: "\x1b[32m", // green
+  provability_graded: "\x1b[32m", // green
+  proof_checked: "\x1b[32m", // green
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

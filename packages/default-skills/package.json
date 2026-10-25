@@ -2,7 +2,7 @@
   "name": "@crewhaus/default-skills",
   "version": "0.7.0",
   "type": "module",
-  "description": "Shipped default skills (continuity, learning-loop, dream) and builtin slash commands",
+  "description": "Shipped default skills (continuity, learning-loop, dream, provability) and builtin slash commands",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -18,8 +18,10 @@
   },
   "devDependencies": {
     "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/claim-ledger": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tool-plan": "workspace:*",
+    "@crewhaus/tool-proof": "workspace:*",
     "@crewhaus/tool-wiki": "workspace:*"
   },
   "license": "Apache-2.0",

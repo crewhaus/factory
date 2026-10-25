@@ -7,6 +7,7 @@
   "include": ["src/**/*"],
   "references": [
     { "path": "../errors" },
+    { "path": "../evaluation-service" },
     { "path": "../infra-utils" },
     { "path": "../ir" },
     { "path": "../memory-service" },

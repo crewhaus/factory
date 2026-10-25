@@ -19,16 +19,23 @@
  * `compactionThreshold`, `compaction.snip_keep_head`/`snip_keep_tail` →
  * `snipKeepHead`/`snipKeepTail`, (0.6.0 PR 9a) `agent.temperature` →
  * `temperature`, and (0.6.0 PR 8b) `evaluation:` →
- * `evaluation` through {@link evaluationRunOptions}.
+ * `evaluation` — since 0.8.0 together with `provability:` → `provability`,
+ * through {@link gateRunOptions}.
  */
 import type { CompileWarning } from "@crewhaus/compiler";
-import { gradeWithJudgePanel, inLoopRunResult } from "@crewhaus/eval-judge";
+import {
+  type GateProofTools,
+  type WireEvaluationDeps,
+  evaluationFragmentFromIr,
+  wireEvaluation,
+} from "@crewhaus/evaluation-service";
 import type { HookDef } from "@crewhaus/hooks-engine";
 import type {
   IrCompaction,
   IrEvaluation,
   IrHook,
   IrLimits,
+  IrProvability,
   IrRateLimits,
   IrThinking,
 } from "@crewhaus/ir";
@@ -36,11 +43,10 @@ import {
   type ModelWiringFragment,
   type ModelWiringRunOptions,
   type WireModelsDeps,
-  judgeInstrumentId,
   modelWiringFragmentFromIr,
   wireModels,
 } from "@crewhaus/model-service";
-import type { RunChatLoopOptions, RunEvaluation } from "@crewhaus/runtime-core";
+import type { RunChatLoopOptions } from "@crewhaus/runtime-core";
 
 /**
  * The loop-contract fragment spread into `runChatLoop(...)` — a `Pick` over
@@ -218,138 +224,83 @@ export function modelRoutingRunOptions(
 
 /** The IR slice {@link evaluationRunOptions} reads. */
 export type EvaluationIrSlice = {
+  readonly name?: string;
   readonly evaluation?: IrEvaluation;
   readonly agent: { readonly model: string };
 };
 
 /**
- * 0.6.0 PR 8b (plan §4.4 "interpreter parity"; the PR 2 wave-1 carry-over) —
- * the in-loop `evaluation:` option for `runChatLoop(...)`, built from the
- * RESOLVED IR exactly as `@crewhaus/target-cli`'s `renderEvaluation` renders
- * it into a compiled bundle, so `crewhaus run` grades, retries, halts and
- * meters like the bundle instead of silently skipping the block (which it
- * did until this helper: the interpreter built no `RunEvaluation` at all).
+ * 0.6.0 PR 8b (plan §4.4 "interpreter parity") — the in-loop `evaluation:`
+ * option for `runChatLoop(...)` alone, built by THE gate composition root
+ * (`@crewhaus/evaluation-service`'s `wireEvaluation`, 0.8.0 §4.4) from the
+ * resolved IR — the call a compiled bundle's boot line makes, so `crewhaus
+ * run` grades, retries, halts and meters judge spend exactly like the bundle:
  *
- *   - `llm_judge` rides `@crewhaus/eval-judge`'s `judge()` with the run bus
- *     the runtime hands the grader, so every judge call publishes
- *     `model_request` / `model_response` with `role: "judge"` and IS metered
- *     (priced by cost-tracker, counted toward `budget.usd` under
- *     `budget.judge_share`); the judge's wire model and priced spend come
- *     back as `EvaluationResult.judge` for the `eval_graded` attribution. The
- *     model defaults to the shape's primary when the spec omitted
- *     `grader.model` (`cheapest` / `$profile` already resolved at lower
- *     time). An abstaining judge scores 0 with a `judge abstained:` rationale.
- *   - `contains` / `regex` are pure (score 1|0, no model spend); the regex's
- *     `lastIndex` is reset per call so a global flag cannot flip verdicts.
+ *   - `llm_judge` grades through `gradeWithJudgePanel` on the run bus the
+ *     runtime hands the grader (`role: "judge"`, priced and counted under
+ *     `budget.judge_share`), honouring a declared panel / repeats /
+ *     temperature / target / profile params; the judge defaults to the
+ *     shape's primary and `judgeModel` names the instrument;
+ *   - `contains` / `regex` are pure (score 1|0, threshold 1).
  *
- * `threshold`, `onFail` and `maxRetries` are the IR's resolved values,
- * threaded verbatim, and so is the cascade's lower-time-resolved `escalateTo`
- * under `onFail: "escalate"` (PR 9c — runtime-core re-runs the failing turn on
- * that rung through `runOneTurn(messages, { force })`). Spread-return-`{}`: a
- * spec without `evaluation:` spreads NOTHING.
+ * `threshold`, `onFail`, `maxRetries` and the cascade's `escalateTo` are the
+ * IR's resolved values. Async since 0.8.0 (the composition root is). The two
+ * interpreter sites use {@link gateRunOptions}, which also builds the
+ * provability gate and its tools; this is its evaluation-only face.
+ * Spread-return-`{}`: a spec without `evaluation:` spreads NOTHING.
  */
-export function evaluationRunOptions(
+export async function evaluationRunOptions(
   ir: EvaluationIrSlice,
-): Pick<RunChatLoopOptions, "evaluation"> {
-  const ev = ir.evaluation;
-  if (ev === undefined) return {};
-  return { evaluation: buildRunEvaluation(ev, ir.agent.model) };
+): Promise<Pick<RunChatLoopOptions, "evaluation">> {
+  if (ir.evaluation === undefined) return {};
+  const { evaluation } = await wireEvaluation(
+    { specName: ir.name ?? "", primaryModel: ir.agent.model, evaluation: ir.evaluation },
+    { cwd: process.cwd() },
+  );
+  return evaluation !== undefined ? { evaluation } : {};
 }
 
-function buildRunEvaluation(ev: IrEvaluation, primaryModel: string): RunEvaluation {
-  const grader = ev.grader;
-  // 0.6.0 §7.3 (PR 9c) — the cascade's escalation rung, resolved at lower
-  // time; spread only under `on_fail: escalate`, exactly as the bundle renders it.
-  const escalate = ev.escalateTo !== undefined ? { escalateTo: ev.escalateTo } : {};
-  if (grader.type === "llm_judge") {
-    const model = grader.model ?? primaryModel;
-    const criteria = grader.criteria;
-    // 0.6.0 §6.2 (PR 13b) — the declared panel, exactly the knob set the
-    // three `renderEvaluation` copies render into a compiled bundle.
-    const panel = { ...grader, model };
-    return {
-      graderType: "llm_judge",
-      // 0.6.0 §6.2 (PR 13) — state the judge INSTRUMENT at the seam so the
-      // pool's per-arm quality lineage can fold it
-      // (`reset_on_profile_change`); a panel is named by its members joined
-      // with `+`, because two panels are two instruments. The bundle's
-      // `renderEvaluation` copies emit the same field.
-      judgeModel: judgeInstrumentId(panel, primaryModel),
-      threshold: ev.threshold ?? 0.7,
-      onFail: ev.onFail,
-      maxRetries: ev.maxRetries,
-      ...escalate,
-      evaluate: async ({ finalText, messages, isSynthetic, bus }) => {
-        const verdict = await gradeWithJudgePanel({
-          rubric: {
-            criteria: [
-              {
-                name: "criteria",
-                description: criteria,
-                anchors: {
-                  "1": "fails the criteria entirely",
-                  "2": "mostly fails the criteria",
-                  "3": "partially meets the criteria",
-                  "4": "meets the criteria with minor gaps",
-                  "5": "fully meets the criteria",
-                },
-              },
-            ],
-            passing_score: 3,
-          },
-          sample: { id: "in-loop-evaluation", input: "" },
-          run: inLoopRunResult({ finalText, messages, isSynthetic }),
-          model,
-          ...(grader.judges !== undefined ? { judges: grader.judges } : {}),
-          ...(grader.repeats !== undefined ? { repeats: grader.repeats } : {}),
-          ...(grader.temperature !== undefined ? { temperature: grader.temperature } : {}),
-          ...(grader.target !== undefined ? { target: grader.target } : {}),
-          ...(grader.params !== undefined ? { params: grader.params } : {}),
-          // Judge spend rides the run bus (role "judge") so it is priced and
-          // counted toward budget.usd under budget.judge_share — every
-          // panelist and every repeat publishes its own model_request pair.
-          bus,
-        });
-        return {
-          score: verdict.score,
-          rationale: verdict.rationale,
-          judge: {
-            model: verdict.judgeModel,
-            ...(verdict.costUsdMicros !== undefined
-              ? { costUsdMicros: verdict.costUsdMicros }
-              : {}),
-          },
-        };
-      },
-    };
-  }
-  const value = grader.value;
-  if (grader.type === "contains") {
-    return {
-      graderType: "contains",
-      threshold: 1,
-      onFail: ev.onFail,
-      maxRetries: ev.maxRetries,
-      ...escalate,
-      evaluate: async ({ finalText }) =>
-        finalText.includes(value)
-          ? { score: 1, rationale: `output contains "${value}"` }
-          : { score: 0, rationale: `output missing "${value}"` },
-    };
-  }
-  const regex = new RegExp(value);
+/** The IR slice {@link gateRunOptions} reads. */
+export type GateIrSlice = {
+  readonly name: string;
+  readonly agent: { readonly model: string };
+  readonly evaluation?: IrEvaluation;
+  readonly provability?: IrProvability;
+};
+
+/** The gate options for `runChatLoop` — a `Pick` over runtime-core's own names. */
+export type GateRunOptions = Pick<RunChatLoopOptions, "evaluation" | "provability">;
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §4.4, §8) — both in-loop gates
+ * for the interpreter, through the composition root every emitter renders a
+ * call to: `options` spreads into `runChatLoop` (`evaluation` and/or
+ * `provability`, only the keys the spec declares), and the proof tools under
+ * `provability:` go into the run's tool list: the caller hands the whole
+ * result to `mergeGateTools`, which adds `tools` (what the level adds) and
+ * swaps the bound twin in for any proof tool the spec also listed, from
+ * `proofTools` (all three) — before the plugin tools, so first-party still
+ * wins. `deps` is the
+ * run's: its cwd, a catalog view over the run's tool list (so `checked`
+ * replay finds the pure tools the run registered) and where the proof footer
+ * goes (`"stream"` on the REPL, `"reply"` when the run's returned text is
+ * what gets printed or sent). Neither block → `{ options: {}, tools: [],
+ * proofTools: [] }`.
+ */
+export async function gateRunOptions(
+  ir: GateIrSlice,
+  deps: WireEvaluationDeps,
+): Promise<GateProofTools & { readonly options: GateRunOptions }> {
+  const fragment = evaluationFragmentFromIr(ir);
+  if (fragment === undefined) return { options: {}, tools: [], proofTools: [] };
+  const gates = await wireEvaluation(fragment, deps);
   return {
-    graderType: "regex",
-    threshold: 1,
-    onFail: ev.onFail,
-    maxRetries: ev.maxRetries,
-    ...escalate,
-    evaluate: async ({ finalText }) => {
-      regex.lastIndex = 0;
-      return regex.test(finalText)
-        ? { score: 1, rationale: `output matches /${value}/` }
-        : { score: 0, rationale: `output does not match /${value}/` };
+    options: {
+      ...(gates.evaluation !== undefined ? { evaluation: gates.evaluation } : {}),
+      ...(gates.provability !== undefined ? { provability: gates.provability } : {}),
     },
+    tools: gates.tools,
+    proofTools: gates.proofTools,
   };
 }
 

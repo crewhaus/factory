@@ -112,6 +112,58 @@ describe("dreamTone", () => {
   });
 });
 
+describe("ladderStatus", () => {
+  // design/0.8.0 §6.3 — under `continuity.proof: off` a step or goal reaches
+  // `proven` by assertion. The server says so beside `status`; the panel used
+  // to render `status` alone, so nobody-checked read as a plain green proven.
+  test("a step proven by assertion is amber and says unverified, naming the refs it cited", () => {
+    const shown = fabric.ladderStatus({
+      status: "proven",
+      statusLabel: "[proven (unverified)]",
+      provenByAssertion: true,
+      unverified: [
+        { toolUseId: "toolu_asserted01", sessionId: "sess_00000000000000aa", recordedAt: "x" },
+        { toolUseId: "toolu_asserted02", sessionId: null, recordedAt: "x" },
+      ],
+    });
+    expect(shown.tone).toBe("warn");
+    expect(shown.text).toBe("proven (unverified)");
+    expect(shown.title).toContain("continuity.proof: off");
+    expect(shown.title).toContain("toolu_asserted01 (sess_00000000000000aa), toolu_asserted02");
+    // The flag alone is enough: a label the server left out never turns it green.
+    expect(fabric.ladderStatus({ status: "proven", provenByAssertion: true })).toMatchObject({
+      tone: "warn",
+      text: "proven (unverified)",
+    });
+  });
+
+  test("a step the event log proves stays green; every other rung keeps its light", () => {
+    expect(
+      fabric.ladderStatus({ status: "proven", statusLabel: "[proven]", provenByAssertion: false }),
+    ).toEqual({ tone: "ok", text: "proven", title: null });
+    expect(fabric.ladderStatus({ status: "claimed", statusLabel: "[claimed]" }).tone).toBe("warn");
+    expect(fabric.ladderStatus({ status: "open", statusLabel: "[open]" })).toEqual({
+      tone: "off",
+      text: "open",
+      title: null,
+    });
+    // A server that predates the fields reads exactly as before.
+    expect(fabric.ladderStatus({ status: "in_progress" })).toEqual({
+      tone: "unknown",
+      text: "in_progress",
+      title: null,
+    });
+  });
+
+  test("steps and goals both render through it, never through the bare status", async () => {
+    const source = await Bun.file(
+      new URL("../assets/js/views/memory-fabric.js", import.meta.url),
+    ).text();
+    expect(source).not.toMatch(/dot\(ladderTone\((?:step|g)\.status\)/);
+    expect(source.match(/ladderDot\((?:step|g)\)/g)?.length).toBe(2);
+  });
+});
+
 describe("staleLabel", () => {
   test("says how long since the last touch, and marks the stale ones", () => {
     expect(fabric.staleLabel({ staleMs: 45 * DAY, stale: true })).toBe(

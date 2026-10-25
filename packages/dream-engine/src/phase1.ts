@@ -38,9 +38,11 @@ import { existsSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  type ContinuityProofMode,
   type ContinuityStore,
   type FrozenProof,
   appendRetentionPins,
+  countsAsProven,
   purgeTrash,
   resolveEvidence,
 } from "@crewhaus/continuity-store";
@@ -101,6 +103,12 @@ export type DreamPhase1Options = {
   readonly memoryStore?: MemoryStore;
   readonly wikiStore?: WikiStore;
   readonly continuityStore?: ContinuityStore;
+  /**
+   * `continuity.proof` — how `openPlans` counts a step as done, as the plan
+   * tools and `handoff.md` do (`countsAsProven`): under `"require"` a step
+   * proven by assertion is still open. Default `"ladder"`.
+   */
+  readonly proofMode?: ContinuityProofMode;
   readonly now?: () => Date;
 };
 
@@ -298,7 +306,11 @@ export async function runDreamPhase1(opts: DreamPhase1Options): Promise<DreamPha
     });
     await fenced("handoff-refresh", async () => {
       const plans = await continuityStore.listPlans();
-      openPlans = plans.filter((p) => p.steps.some((s) => s.status !== "proven")).length;
+      // One rule with the handoff written beside it: a step counts as done
+      // only as the run's `continuity.proof` counts it.
+      openPlans = plans.filter((p) =>
+        p.steps.some((s) => !countsAsProven(s, opts.proofMode)),
+      ).length;
       await continuityStore.writeHandoff();
     });
   }

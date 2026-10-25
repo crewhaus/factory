@@ -34,12 +34,14 @@ import studyCommand from "../commands/study.md" with { type: "text" };
 import continuitySkill from "../skills/continuity/SKILL.md" with { type: "text" };
 import dreamSkill from "../skills/dream/SKILL.md" with { type: "text" };
 import learningLoopSkill from "../skills/learning-loop/SKILL.md" with { type: "text" };
+import provabilitySkill from "../skills/provability/SKILL.md" with { type: "text" };
 
 /** Raw body text of each default skill's `SKILL.md`, keyed by skill name. */
 export const SKILL_BODIES: Readonly<Record<string, string>> = {
   continuity: continuitySkill,
   "learning-loop": learningLoopSkill,
   dream: dreamSkill,
+  provability: provabilitySkill,
 };
 
 /** Raw body text of each builtin slash command's `.md`, keyed by command name. */

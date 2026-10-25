@@ -71,6 +71,7 @@ import type {
   IrPermissions,
   IrPipelineV0,
   IrProfilePermissions,
+  IrProvability,
   IrResearchV0,
   IrSchedule,
   IrSecretRef,
@@ -111,6 +112,7 @@ import {
   type SpecModelProfile,
   type SpecModelsBlock,
   type SpecObservabilityBlock,
+  type SpecProvabilityBlock,
   type SpecSlackChannel,
   type SpecSubAgentDefinition,
   type SpecTelegramChannel,
@@ -118,6 +120,8 @@ import {
   type SpecWhatsAppChannel,
   mcpServerNameWarnings,
   parseSpec,
+  provabilityLevelOf,
+  provabilityObjectOf,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
 import { emitBrowserDriver } from "@crewhaus/target-browser-driver";
@@ -148,6 +152,7 @@ import {
   checkToolConfigs,
   expandToolSelectors,
   malformedToolConfigRefs,
+  parseSelector,
   registeredToolName,
   toolConfigBlockFor,
   toolConfigProblems,
@@ -268,7 +273,17 @@ export type LowerOptions = {
  * `"model-plan-tool-config-widens"`, `"provider-tool-cap"` for a model whose
  * provider refuses the site's tool count and `"provider-tool-cap-unverified"`
  * for an `openai/` model over OpenAI's limit, which `OPENAI_BASE_URL` may send
- * elsewhere; all informational), `path` the spec key it concerns
+ * elsewhere; all informational), and from 0.8.0 the provability block's
+ * `"provability-on-fail-degraded"` (a declared `on_fail` the shape cannot
+ * honour, lowered to `note`), `"provability-execution-unresolved"` (a
+ * `checked`/`proven` floor whose `execution.allow` names a tool the catalog
+ * cannot resolve offline), `"provability-inert-block"` (a `level: off`
+ * block that sets other keys), `"provability-image-unused"` (a
+ * `formal.image` with no lean4 checker to run it) and
+ * `"provability-research-rung-unreachable"` (a research floor of `checked` /
+ * `proven`, which no report can meet) — all five remediable, so `crewhaus
+ * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
+ * the informational codes that it does not), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -441,6 +456,18 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // 0.5.0 — crew's row is DELETED, not silenced: thredz is emit-wired on crew
   // now, with the per-role fan-out. The table's contract is that a row exists
   // only while the shape really does ignore the block.
+  // 0.8.0 (design §3 / §8) — crew rejoins the table for `provability:`: the
+  // block parses and lowers onto IrCrewV0 so a crew spec can declare it today,
+  // but the orchestrator's final synthesis is not a completed turn the gate
+  // can wrap. Delete this row when crew-orchestrator exposes that seam
+  // (§12 item 2). `provability: off` is not a declaration (see specDeclares).
+  crew: [
+    unwired(
+      "provability",
+      "crew",
+      "the crew orchestrator's synthesis turn is not exposed to the gate yet, so no answer is verified and no proof bundle is written (design/0.8.0-provability-release.md §12 item 2)",
+    ),
+  ],
   // Loop contract 0.4 (Batch F) — the `schedule:` block is now emit-WIRED on
   // channel/managed/batch: each daemon arms its wake loop (channel + batch via
   // durable-execution's `armSchedule`, managed via its per-tenant
@@ -503,11 +530,16 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
  * and not an explicit opt-out (`false` / `{enabled: false}`) or an empty
  * collection. Only meaningful declarations warn: `continuity: false` is a
  * live opt-out, not dead config, and an empty `mcp_servers: {}` configures
- * nothing worth warning about.
+ * nothing worth warning about. 0.8.0: `provability: off` and
+ * `{ level: off, … }` are that block's opt-out — the latter is reported as
+ * `provability-inert-block` instead, never twice.
  */
 function specDeclares(spec: Spec, path: string): boolean {
   const value = (spec as unknown as Record<string, unknown>)[path];
   if (value === undefined || value === false) return false;
+  if (path === "provability") {
+    return provabilityLevelOf(value as SpecProvabilityBlock) !== "off";
+  }
   if (typeof value === "object" && value !== null) {
     if ((value as { enabled?: unknown }).enabled === false) return false;
     if (Array.isArray(value)) return value.length > 0;
@@ -1270,6 +1302,46 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
   };
   visit(ir, "");
   return out;
+}
+
+/**
+ * 0.8.0 (design/0.8.0-provability-release.md §0, §1, §3; review I40) — the
+ * answer gates a spec declares that the edge worker does not run, said
+ * rather than dropped. The cf-worker emitters wire tools, budget, limits and
+ * trace; a `provability:` block lowers onto the IR and the worker never reads
+ * it, so a spec that says `grounded` deployed a worker serving every answer
+ * unverified — no gate, no footer, no bundle — with no word from the CLI,
+ * the hosted compiler or `--strict`. §1: an answer that does not carry proof
+ * is not served; §3: loud rejection beats dead config. `evaluation:` (the
+ * in-loop judge) is left out the same way. Each is an `accepted-but-unwired`
+ * warning — the code the compiler gives a block a shape carries but does
+ * not wire (crew's `provability:`), which `--strict` escalates — so a strict
+ * edge compile fails instead of shipping ungated.
+ *
+ * Called beside {@link assertCfWorkerToolsEdgeSafe} by both cf-worker emit
+ * paths (`crewhaus compile --emit-as cf-worker` and the compiler-worker's
+ * `POST /compile { emitAs: "cf-worker" }`), so the rule has one home.
+ */
+export function cfWorkerUnwiredBlockWarnings(ir: IrNode): CompileWarning[] {
+  const blocks = ir as { readonly provability?: unknown; readonly evaluation?: unknown };
+  const warnings: CompileWarning[] = [];
+  if (blocks.provability !== undefined) {
+    warnings.push({
+      code: "accepted-but-unwired",
+      path: "provability",
+      message:
+        "the cf-worker edge does not run the provability gate: the worker serves every answer ungated — no claim checked, no footer, no proof bundle. Compile without --emit-as to serve gated answers, or remove the block",
+    });
+  }
+  if (blocks.evaluation !== undefined) {
+    warnings.push({
+      code: "accepted-but-unwired",
+      path: "evaluation",
+      message:
+        "the cf-worker edge does not run the in-loop evaluation judge: the worker's answers are served ungraded. Compile without --emit-as to grade them, or remove the block",
+    });
+  }
+  return warnings;
 }
 
 /**
@@ -3728,12 +3800,19 @@ function lowerEvaluation(
  * `agent.model_pool` is a CompilerError here (`parseSpec` already refuses it
  * cross-field; this guards direct `lower()` callers).
  */
-function resolveCascadeTarget(spec: SpecWithEvaluation, ctx: LowerContext): string {
-  const agent = asLooseBlock((spec as unknown as LooseBlock)["agent"]);
+function resolveCascadeTarget(
+  spec: object,
+  ctx: LowerContext,
+  // 0.8.0 §4.2 — `provability.on_fail: escalate` resolves through this same
+  // helper (`IrProvability.escalateTo` is resolved exactly as
+  // `IrEvaluation.escalateTo` is); the label only names the key in errors.
+  label = "evaluation.on_fail",
+): string {
+  const agent = asLooseBlock((spec as LooseBlock)["agent"]);
   const pool = asLooseBlock(agent?.["model_pool"]);
   if (pool === undefined) {
     throw new CompilerError(
-      "evaluation.on_fail: escalate re-runs a failing turn on a stronger pool candidate, so agent.model_pool must be declared (strategy.cascade.escalate_to names the rung; without it the strongest candidate serves)",
+      `${label}: escalate re-runs a failing turn on a stronger pool candidate, so agent.model_pool must be declared (strategy.cascade.escalate_to names the rung; without it the strongest candidate serves)`,
     );
   }
   const cascade = asLooseBlock(asLooseBlock(pool["strategy"])?.["cascade"]);
@@ -3760,7 +3839,7 @@ function resolveCascadeTarget(spec: SpecWithEvaluation, ctx: LowerContext): stri
   const last = enabled[enabled.length - 1];
   if (last === undefined) {
     throw new CompilerError(
-      "evaluation.on_fail: escalate needs at least one enabled agent.model_pool candidate to escalate to",
+      `${label}: escalate needs at least one enabled agent.model_pool candidate to escalate to`,
     );
   }
   const lastModel = last["model"] as string;
@@ -4800,6 +4879,400 @@ function lowerWatchme(spec: SpecWithWatchme, ctx: LowerContext): { watchme?: IrW
 }
 
 /**
+ * 0.8.0 (design §3 / §4.2 / §6.3) — the `execution.allow` default: every
+ * in-process, zero-token computation plus the verification gates. Category
+ * grammar, so it expands through `@crewhaus/tool-categories` exactly as a
+ * written list does, and a tool added to either category joins the default
+ * with no edit here. `bash` is deliberately not in it (design §3), and
+ * neither is any tool that writes: §6.3 keeps every destructive tool out of
+ * the default, so a result counts as `checked` evidence by default only when
+ * the tool is read-only. `goldenUpdate` (it rewrites a golden file) is the
+ * one such tool in `verify`. A spec that wants it lists it, and the binding
+ * says `replayed: false`. `apps/cli/src/provability-default-allow.test.ts`
+ * reads every expanded entry's safety flags, so a destructive tool added to
+ * either category fails a test instead of joining the default quietly.
+ */
+export const PROVABILITY_DEFAULT_EXECUTION_ALLOW: ReadonlyArray<string> = Object.freeze([
+  "all-compute",
+  "all-verify",
+  "-goldenUpdate",
+]);
+
+/** The lean pre-scan's default refusals (design §6.4); smt forbids nothing, its input is data. */
+const PROVABILITY_DEFAULT_FORBID: ReadonlyArray<string> = ["sorry", "axiom", "native_decide"];
+
+type ProvabilityCheckerId = IrProvability["formal"]["checkers"][number];
+
+/** `formal.checkers`' default (design §3): the in-process checker first, then Z3. */
+const PROVABILITY_DEFAULT_CHECKERS: ReadonlyArray<ProvabilityCheckerId> = ["builtin", "smt"];
+
+/** The checker that needs no sandbox (design §6.4) — the one the gate always has. */
+const PROVABILITY_BUILTIN_CHECKER = "builtin";
+
+/**
+ * 0.8.0 (design §3, §4.2, §6.4) — `formal.checkers` as the gate RUNS them:
+ * the spec's preference order, then `builtin` when the spec left it out
+ * (default `[builtin, smt]`). The builtin certificate checker needs no
+ * sandbox, so the proof tools always carry it — tool-proof appends it the
+ * same way (`defaultCheckerIds`), "so a harness can always prove something".
+ * Resolving that here keeps the IR the list that runs, so the provability
+ * skill's `{{checkers}}`, `ProofCheckers`, `crewhaus provability checkers`
+ * and `crewhaus lint` all read one list (§4.2: no consumer re-derives it).
+ * The list is a preference order, not an allowlist: `[lean4]` prefers Lean
+ * and falls back to builtin; it cannot exclude builtin, whose accepted
+ * certificate is a sound proof, and a `proof:` binding meets any floor (§2).
+ */
+function resolveFormalCheckers(
+  listed: ReadonlyArray<ProvabilityCheckerId> | undefined,
+): ProvabilityCheckerId[] {
+  const checkers = [...(listed ?? PROVABILITY_DEFAULT_CHECKERS)];
+  return checkers.includes(PROVABILITY_BUILTIN_CHECKER)
+    ? checkers
+    : [...checkers, PROVABILITY_BUILTIN_CHECKER];
+}
+
+/**
+ * 0.8.0 (design §3, §18) — the checkers a LIVE block's `formal.checkers`
+ * names when it leaves `builtin` out: sandbox checkers only (`smt`, `lean4`),
+ * the list {@link resolveFormalCheckers} appends `builtin` to. `[]` when the
+ * list names `builtin` or is not declared, and for an absent or `level: off`
+ * block. Read off the SPEC because the lowered list always carries builtin:
+ * `crewhaus lint`'s `provability-sandbox-only-checkers` reports what the
+ * author wrote against what runs.
+ */
+export function sandboxOnlyProvabilityCheckers(spec: object): ReadonlyArray<string> {
+  const provability = (spec as { readonly provability?: SpecProvabilityBlock }).provability;
+  if (provabilityLevelOf(provability) === "off") return [];
+  const listed = provabilityObjectOf(provability)?.formal?.checkers;
+  if (listed === undefined || listed.includes(PROVABILITY_BUILTIN_CHECKER)) return [];
+  return [...listed];
+}
+
+/** The provability block of any IR variant that carries one (cli/channel/managed/research/crew). */
+export function provabilityOf(ir: IrNode): IrProvability | undefined {
+  return (ir as { readonly provability?: IrProvability }).provability;
+}
+
+/**
+ * The canonical `execution.allow` entry for `entry`: a builtin written as its
+ * spec key (`moneyAdd`), its registered name (`MoneyAdd`) or in any other case
+ * (`moneyadd`) lowers to its SPEC KEY — the two lookups the FR-002 gate does
+ * before it calls a name unverifiable (`auditSpecToolNames` resolves by key,
+ * then by registered name). Anything else (an `mcp__*` tool, a custom tool
+ * registered in code, a typo) is kept EXACTLY as written: MCP tool names are
+ * case-sensitive, so folding case there would allowlist a tool the author
+ * never named. The IR therefore carries one spelling per builtin, and the
+ * verifier maps a recorded name to its key (`builtinKeyForName`) and matches
+ * exactly (the IR doc).
+ */
+function canonicalExecutionKey(entry: string): string {
+  return Object.hasOwn(BUILTIN_TOOLS, entry) ? entry : (builtinKeyForName(entry) ?? entry);
+}
+
+/**
+ * `execution.allow` canonicalised ({@link canonicalExecutionKey}) with
+ * repeats dropped after canonicalising, keeping first-seen order: an identity
+ * expansion (no category syntax) keeps the author's order, and
+ * `[moneyAdd, MoneyAdd]` is one entry. Non-builtin names dedupe exactly.
+ */
+function canonicalExecutionAllow(keys: ReadonlyArray<string>): string[] {
+  return [...new Set(keys.map(canonicalExecutionKey))];
+}
+
+/**
+ * One `execution.allow` selector with its tool name canonicalised
+ * ({@link canonicalExecutionKey}) BEFORE the category grammar runs, keeping a
+ * leading `-`; a category selector (`all-*` / `-all-*`) is returned as
+ * written. Canonicalising only the expanded output let a builtin written by
+ * its registered name escape an exclusion its key spelling obeys
+ * (`[all-compute, MoneyAdd, -all-math]` kept moneyAdd, `[all-compute,
+ * moneyAdd, -all-math]` dropped it), and refused `-MoneyAdd` as excluding
+ * "a tool that nothing includes" while `-moneyAdd` was accepted. This list
+ * decides which tool results count as `checked` evidence, so two spellings of
+ * one tool must expand identically.
+ */
+function canonicalExecutionSelector(selector: string): string {
+  const parsed = parseSelector(selector);
+  if (parsed.kind === "category") return selector;
+  const key = canonicalExecutionKey(parsed.key);
+  return parsed.exclude ? `-${key}` : key;
+}
+
+/**
+ * Expand an `execution.allow` list through the `tools:` category grammar,
+ * failing the compile on an unknown category or an exclusion that removes
+ * nothing exactly as `tools:` does. Tool names are canonicalised first
+ * ({@link canonicalExecutionSelector}) so exclusions match whatever spelling
+ * the author used, and repeats are dropped after expansion
+ * ({@link canonicalExecutionAllow}).
+ */
+function expandExecutionAllow(selectors: ReadonlyArray<string>): string[] {
+  try {
+    return canonicalExecutionAllow(
+      expandToolSelectors(selectors.map(canonicalExecutionSelector), {
+        path: "provability.execution.allow",
+      }).tools,
+    );
+  } catch (err) {
+    if (err instanceof ToolCategoryError) throw new CompilerError(err.message, err);
+    throw err;
+  }
+}
+
+/**
+ * The entries of a canonical `execution.allow` the builtin catalog cannot
+ * resolve OFFLINE, at a `checked` / `proven` floor (`[]` below it). After
+ * canonicalisation every builtin is a spec key, so only a name written out by
+ * hand can miss: an `mcp__*` tool, a custom tool registered in code, or a
+ * typo. The one predicate behind both the lowering's warning and
+ * {@link unresolvedProvabilityExecutionTools}.
+ */
+function unresolvedExecutionKeys(
+  level: IrProvability["level"],
+  allow: ReadonlyArray<string>,
+): string[] {
+  if (level !== "checked" && level !== "proven") return [];
+  return allow.filter((key) => !Object.hasOwn(BUILTIN_TOOLS, key));
+}
+
+/**
+ * 0.8.0 (design §4.3) — the `execution.allow` entries of a `checked` /
+ * `proven` floor the builtin catalog cannot resolve offline. At those floors
+ * execution evidence is what most claims bind to, and the gate REPLAYS pure
+ * tools and trusts their results, so a name whose purity and scope nobody can
+ * check at compile time is the FR-002 posture's "unverifiable sink" for
+ * evidence. Scoped to `checked | proven` because that is where §4.3 puts the
+ * strict posture: a `tool:` citation under a `cited` / `grounded` floor is
+ * still checked against `execution.allow` (higher-rung evidence satisfies a
+ * lower floor, §2), but there it is one way among several to meet the floor,
+ * not the one the floor demands. `[]` below `checked` and when nothing is
+ * unresolved. The lowering's compile warning
+ * (`provability-execution-unresolved`, which `crewhaus compile --strict`
+ * escalates like any remediable code, and which `crewhaus lint` reports in
+ * the same words) is computed by the same predicate over the same list, so
+ * this read of an IR and the warning cannot disagree.
+ *
+ * Deliberately NOT a `compile({ strict: true })` refusal: that option is
+ * FR-002's DEFAULT-ON scope gate (`crewhaus compile`, `run --watch` and the
+ * compiler worker all set it without any `--strict` flag), so refusing there
+ * would reject on those paths a spec that a plain `crewhaus run` accepts —
+ * and the IR doc names `mcp__calc__add` as a valid entry.
+ */
+export function unresolvedProvabilityExecutionTools(ir: IrNode): ReadonlyArray<string> {
+  const p = provabilityOf(ir);
+  return p === undefined ? [] : unresolvedExecutionKeys(p.level, p.execution.allow);
+}
+
+function unresolvedExecutionMessage(level: string, keys: ReadonlyArray<string>): string {
+  return [
+    `provability.execution.allow names ${keys.map((k) => `"${k}"`).join(", ")}, which the builtin`,
+    `catalog cannot resolve offline. At level: ${level} the gate accepts those tools' results as`,
+    "evidence (and replays the pure ones), so a tool whose purity and scope cannot be verified at",
+    "compile time fails `crewhaus compile --strict`. Name builtin tools (or the all-<category>",
+    "grammar), or lower the floor.",
+  ].join(" ");
+}
+
+/**
+ * 0.8.0 (design §3) — the keys a `level: off` block sets beside `level`. Such
+ * a block is accepted (turning the gate off without deleting its config is a
+ * legitimate edit) but lowers to NOTHING, so the compiler says so rather than
+ * silently dropping config: `provability-inert-block`. `[]` for a live block,
+ * the `off` shorthand, or an absent one.
+ */
+export function inertProvabilityKeys(spec: object): ReadonlyArray<string> {
+  const block = provabilityObjectOf(
+    (spec as { readonly provability?: SpecProvabilityBlock }).provability,
+  );
+  if (block === undefined || block.level !== "off") return [];
+  return Object.keys(block)
+    .filter((k) => k !== "level")
+    .sort();
+}
+
+type SpecWithProvability = { readonly provability?: SpecProvabilityBlock };
+
+/**
+ * 0.8.0 (design §4.2–§4.3) — lower the `provability:` block, the `lowerWatchme`
+ * template: spread-return-{}, so an absent block or `level: off` spreads
+ * NOTHING and a provability-less spec compiles byte-identically. Every field
+ * RESOLVES here (a bare `provability: cited` arrives fully populated), so no
+ * emitter or interpreter re-derives a default:
+ *
+ *   - `execution.allow` expands through the `tools:` category grammar at
+ *     lower time (default `[all-compute, all-verify, -goldenUpdate]`), so the IR carries
+ *     concrete names only — each builtin as its spec key, anything else
+ *     exactly as written; an unknown category or an exclusion that removes
+ *     nothing fails the compile exactly as it does in `tools:`, on an inert
+ *     `level: off` block too.
+ *   - `sources.allow` / `deny` host globs are lowercased (hosts are
+ *     case-insensitive).
+ *   - `judge.model` is an auxiliary slot (`$profile` / `cheapest` /
+ *     `strongest`), the watchme precedent.
+ *   - `on_fail: escalate` resolves `escalateTo` with the cascade helper
+ *     `IrEvaluation` uses.
+ *   - `formal.checkers` gains `builtin` last when the spec left it out
+ *     ({@link resolveFormalCheckers}), so the IR lists every checker the
+ *     proof tools run.
+ *
+ * Per shape (design §8): research's report gate runs once over the rendered
+ * report, not per turn, so `retry` / `escalate` are not supported there in
+ * 0.8.0 — a DECLARED one lowers to `note` with `provability-on-fail-degraded`.
+ * An UNDECLARED `on_fail` resolves to `note` on research SILENTLY: `note` is
+ * that shape's default, not a degraded `retry`. Warning there would fire on
+ * every bare `provability: cited` research spec (the researcher starter
+ * ships exactly that, design §11), and `crewhaus compile --strict` would
+ * then refuse a spec that says nothing wrong. Research's report evidence is
+ * the citation tracker's fetched bodies alone, which reach `grounded` at
+ * most, so a `checked` / `proven` floor there can never pass:
+ * `provability-research-rung-unreachable`. Crew carries the block unwired
+ * (the table row); it has no `agent.model_pool` to escalate on, so a declared
+ * `escalate` degrades to `note` there with the same code.
+ *
+ * More compile warnings, all remediable (so `--strict` escalates them):
+ * `provability-inert-block` for a `level: off` object that sets other keys
+ * (it lowers to nothing, and saying so beats silently dropping config),
+ * `provability-execution-unresolved` for a `checked`/`proven` floor whose
+ * `execution.allow` names a tool the catalog cannot resolve offline, and
+ * `provability-image-unused` for a `formal.image` with no `lean4` in
+ * `formal.checkers` — the image overrides the lean4 checker's alone (smt
+ * always runs the curated Z3 image), so without lean4 it would be config that
+ * silently does nothing (design §3).
+ */
+function lowerProvability(
+  spec: SpecWithProvability,
+  ctx: LowerContext,
+): { provability?: IrProvability } {
+  const level = provabilityLevelOf(spec.provability);
+  if (level === "off") {
+    // An inert block's allowlist is still checked against the category
+    // grammar (and discarded): a typo'd category is a typo whether or not the
+    // gate is on today — the rule the spec applies to `judge.model`.
+    const inertAllow = provabilityObjectOf(spec.provability)?.execution?.allow;
+    if (inertAllow !== undefined) expandExecutionAllow(inertAllow);
+    const inert = inertProvabilityKeys(spec);
+    if (inert.length > 0) {
+      warn(
+        ctx,
+        "provability-inert-block",
+        "provability",
+        `provability: level: off turns the gate off, so ${inert.map((k) => `provability.${k}`).join(", ")} ${inert.length === 1 ? "has" : "have"} no effect — nothing is verified and no proof bundle is written. Set a level (cited | grounded | checked | proven) to turn the gate on, or delete the other keys.`,
+      );
+    }
+    return {};
+  }
+  const block = provabilityObjectOf(spec.provability);
+
+  let onFail: IrProvability["onFail"] = block?.on_fail ?? "retry";
+  if (ctx.target === "research") {
+    if (block?.on_fail === undefined) {
+      onFail = "note";
+    } else if (block.on_fail === "retry" || block.on_fail === "escalate") {
+      onFail = "note";
+      warn(
+        ctx,
+        "provability-on-fail-degraded",
+        "provability.on_fail",
+        `provability.on_fail: ${block.on_fail} is not supported on the research shape in 0.8.0 — the research report gate runs once over the rendered report (the research loop is per-branch, not per-turn), so it supports halt | note; lowered to note. Set on_fail: note or on_fail: halt to say which you mean.`,
+      );
+    }
+  } else if (ctx.target === "crew" && onFail === "escalate") {
+    onFail = "note";
+    warn(
+      ctx,
+      "provability-on-fail-degraded",
+      "provability.on_fail",
+      "provability.on_fail: escalate re-runs a failing turn on a stronger agent.model_pool candidate, and the crew shape has no agent block to escalate on — lowered to note (the block is carried unwired on crew in 0.8.0 regardless).",
+    );
+  }
+  const escalateTo =
+    onFail === "escalate" ? resolveCascadeTarget(spec, ctx, "provability.on_fail") : undefined;
+  if (ctx.target === "research" && (level === "checked" || level === "proven")) {
+    warn(
+      ctx,
+      "provability-research-rung-unreachable",
+      "provability.level",
+      `provability.level: ${level} cannot be met on the research shape in 0.8.0 — the report gate's only evidence is the sources the run fetched, which reach grounded at most, so no claim in a report can meet this floor. Set level: grounded or level: cited.`,
+    );
+  }
+
+  const allow = expandExecutionAllow(
+    block?.execution?.allow ?? PROVABILITY_DEFAULT_EXECUTION_ALLOW,
+  );
+
+  const judge =
+    block?.judge !== undefined
+      ? resolveAuxSlot(block.judge.model, ctx, "provability.judge.model")
+      : undefined;
+
+  const checkers = resolveFormalCheckers(block?.formal?.checkers);
+  if (block?.formal?.image !== undefined && !checkers.includes("lean4")) {
+    warn(
+      ctx,
+      "provability-image-unused",
+      "provability.formal.image",
+      `provability.formal.image overrides the lean4 checker's image only, and provability.formal.checkers (${checkers.join(", ")}) does not list lean4, so the image is never used. Add lean4 to formal.checkers, or delete formal.image.`,
+    );
+  }
+
+  const provability: IrProvability = {
+    level,
+    onFail,
+    maxRetries: block?.max_retries ?? 1,
+    threshold: block?.threshold ?? 1,
+    scope: block?.scope ?? "session",
+    assumptions: block?.assumptions ?? "allow",
+    ...(block?.max_assumptions !== undefined ? { maxAssumptions: block.max_assumptions } : {}),
+    render: block?.render ?? "footer",
+    sources: {
+      // Host globs (the spec refuses anything else); hosts are
+      // case-insensitive, so the IR carries them lowercased.
+      allow: (block?.sources?.allow ?? []).map((glob) => glob.toLowerCase()),
+      deny: (block?.sources?.deny ?? []).map((glob) => glob.toLowerCase()),
+      bibliographic: block?.sources?.bibliographic ?? false,
+      resolve: block?.sources?.resolve ?? "off",
+    },
+    grounded: {
+      coverage: block?.grounded?.coverage ?? 0.8,
+      windowTokens: block?.grounded?.window_tokens ?? 60,
+      independent: block?.grounded?.independent ?? 1,
+    },
+    execution: {
+      allow,
+      replay: block?.execution?.replay ?? true,
+      maxReplays: block?.execution?.max_replays ?? 20,
+    },
+    formal: {
+      checkers,
+      ...(block?.formal?.image !== undefined ? { image: block.formal.image } : {}),
+      forbid: [...(block?.formal?.forbid ?? PROVABILITY_DEFAULT_FORBID)],
+      timeoutMs: block?.formal?.timeout_ms ?? 30_000,
+    },
+    ...(judge !== undefined && block?.judge !== undefined
+      ? {
+          judge: {
+            model: judge.model,
+            ...auxSlotFields(judge),
+            ...(block.judge.allow_self_judge === true ? { allowSelfJudge: true as const } : {}),
+          },
+        }
+      : {}),
+    ...(escalateTo !== undefined ? { escalateTo } : {}),
+  };
+
+  const unresolved = unresolvedExecutionKeys(level, allow);
+  if (unresolved.length > 0) {
+    warn(
+      ctx,
+      "provability-execution-unresolved",
+      "provability.execution.allow",
+      unresolvedExecutionMessage(level, unresolved),
+    );
+  }
+  return { provability };
+}
+
+/**
  * Section 47 — normalise the cross-cutting blockchain subsystem blocks
  * (chains / wallets / contracts / transaction_policy). Each block is
  * optional; the helper returns a partial that's spread into the IR
@@ -4990,32 +5463,73 @@ function specDeclaresStrategy(value: unknown): boolean {
   return Object.values(block).some(specDeclaresStrategy);
 }
 
+/** Every model that may SERVE a block's turns: its primary, its pool candidates, its tiers. */
+function servingArms(block: {
+  readonly model: string;
+  readonly modelPool?: IrModelPool;
+  readonly modelTiers?: IrModelTiers;
+}): Set<string> {
+  const out = new Set<string>([block.model]);
+  for (const c of block.modelPool?.candidates ?? []) out.add(c.model);
+  if (block.modelTiers !== undefined) {
+    out.add(block.modelTiers.fast);
+    out.add(block.modelTiers.default);
+  }
+  return out;
+}
+
+function reportSelfJudge(ctx: LowerContext, path: string, judgeModel: string, gated: string): void {
+  warn(
+    ctx,
+    "model-plan-self-judge",
+    path,
+    `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set allow_self_judge: true to accept it)`,
+  );
+}
+
+/**
+ * 0.8.0 (design §3 / §6.2) — the judge-independence check for the
+ * provability WAIVER judge: it decides whether an excerpt supports a claim
+ * the serving model wrote, so the serving model judging it is the §4.3
+ * hazard. Unlike the in-loop grader, it is NOT gated on the 0.6.0 opt-in:
+ * that gate exists so a 0.5.x spec whose judge silently defaulted to the
+ * serving model does not compile noisily now, and the waiver judge is a new
+ * slot that is always declared explicitly (`judge.model` is required), so
+ * there is no older spec to keep quiet. `judge.allow_self_judge: true`
+ * silences it. Crew carries the block unwired and has no agent, so it is not
+ * checked; `crewhaus lint` reports the same fact as `provability-self-judge`.
+ */
+function noteProvabilitySelfJudge(ir: IrNode, ctx: LowerContext): void {
+  if (
+    ir.target !== "cli" &&
+    ir.target !== "channel" &&
+    ir.target !== "managed" &&
+    ir.target !== "research"
+  ) {
+    return;
+  }
+  const judge = ir.provability?.judge;
+  if (judge === undefined || judge.allowSelfJudge === true) return;
+  if (servingArms(ir.agent).has(judge.model)) {
+    reportSelfJudge(
+      ctx,
+      "provability.judge.model",
+      judge.model,
+      "a serving arm of agent.model / model_pool (the waiver judge would rule on claims its own model wrote)",
+    );
+  }
+}
+
 function noteSelfJudge(spec: Spec, ir: IrNode, ctx: LowerContext): void {
+  noteProvabilitySelfJudge(ir, ctx);
   if (!ctx.optedIn) return;
   const s = spec as unknown as LooseBlock;
   /** TRUE when the spec itself names the judge model at `block.judge.model` / `grader.model`. */
   const declaredJudge = (block: unknown, key: "judge" | "grader"): boolean =>
     asLooseBlock(asLooseBlock(block)?.[key])?.["model"] !== undefined;
-  const arms = (block: {
-    readonly model: string;
-    readonly modelPool?: IrModelPool;
-    readonly modelTiers?: IrModelTiers;
-  }): Set<string> => {
-    const out = new Set<string>([block.model]);
-    for (const c of block.modelPool?.candidates ?? []) out.add(c.model);
-    if (block.modelTiers !== undefined) {
-      out.add(block.modelTiers.fast);
-      out.add(block.modelTiers.default);
-    }
-    return out;
-  };
+  const arms = servingArms;
   const report = (path: string, judgeModel: string, gated: string): void =>
-    warn(
-      ctx,
-      "model-plan-self-judge",
-      path,
-      `${path}: the judge model "${judgeModel}" is also ${gated} — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set allow_self_judge: true to accept it)`,
-    );
+    reportSelfJudge(ctx, path, judgeModel, gated);
   if (ir.target === "cli" || ir.target === "channel" || ir.target === "managed") {
     const ev = ir.evaluation;
     if (ev === undefined || ev.grader.type !== "llm_judge" || ev.allowSelfJudge === true) return;
@@ -5217,6 +5731,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         ...lowerSecurity(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -5373,6 +5889,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         ...lowerFeedback(spec),
         ...memoryLowered,
         // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -5564,6 +6082,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...lowerSchedule(spec.schedule),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
         ...lowerEvaluation(spec, ctx),
+        // 0.8.0 (design §4.3) — the provability ladder, beside evaluation.
+        ...lowerProvability(spec, ctx),
         // NEW-inloop-coverage — rating capture on the gateway shape.
         ...lowerFeedback(spec),
         ...memoryLowered,
@@ -5698,6 +6218,9 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
           learning.learning !== undefined,
         ),
         ...continuity,
+        // 0.8.0 (design §8) — carried with an accepted-but-unwired warning
+        // until the orchestrator exposes its synthesis turn (§12 item 2).
+        ...lowerProvability(spec, ctx),
         // 0.5.0 — thredz is EMIT-WIRED on crew, with the per-role fan-out:
         // one key (and therefore one space, and one npx process) per role
         // that overrides the crew-wide block.
@@ -5748,6 +6271,8 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         ...applyLearningWikiGovernance(lowerMemory(spec), learning.learning !== undefined),
         // v0.3.0 Goal 1 — DEFAULT-ON continuity, `spec` scope (§2.7).
         ...continuity,
+        // 0.8.0 (design §8) — the report gate (on_fail halt | note here).
+        ...lowerProvability(spec, ctx),
         // v0.3.0 Goal 3 — thredz is CARRIED on this shape (ignored-note in
         // the emitted daemon), not emit-wired yet.
         ...lowerThredzCarried(spec, continuity.continuity?.plan === true, "research"),

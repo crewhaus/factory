@@ -1065,6 +1065,28 @@ describe("FactCrossCheck", () => {
     expect(result.note).toContain("never that the claim is true");
   });
 
+  test("the excerpt is the source's own words, not the fold it was compared in (design §5.3)", async () => {
+    // Every claim is compared through the fold, and the excerpt was cut from
+    // the folded text: a Persian source's "۳۰" came back "30" with its
+    // joiner moved, so the excerpt was in no page a reader could check.
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const persian = `من ${at(0x0645, 0x06cc, 0x200c, 0x062e, 0x0648, 0x0627, 0x0647, 0x0645)} ${at(0x06f3, 0x06f0)} روز`;
+    for (const [source, claim] of [
+      [`${persian} صبر کنم`, persian],
+      [`مدة الاسترداد ${at(0x0663, 0x0660)} يوما`, `مدة الاسترداد ${at(0x0663, 0x0660)}`],
+      [`The refund window is ${at(0xff13, 0xff10)} days.`, "The refund window is 30 days."],
+      [`The re${at(0x00ad)}fund window is 30 days.`, "The refund window is 30 days."],
+    ] as const) {
+      writeFileSync(join(workspace, "sources/src.md"), source);
+      const found = await one(claim, ["sources/src.md"]);
+      expect(found.verdict).toBe("supported");
+      const excerpt = found.foundIn?.excerpt as string;
+      expect(`${JSON.stringify(excerpt)} in source: ${source.includes(excerpt)}`).toBe(
+        `${JSON.stringify(excerpt)} in source: true`,
+      );
+    }
+  });
+
   test("a claim the source does not carry is NOT FOUND, which is not a contradiction", async () => {
     const claim = await one("Adoption doubled in Europe.", ["sources/report.md"]);
     expect(claim.verdict).toBe("notFound");
@@ -1096,6 +1118,27 @@ describe("FactCrossCheck", () => {
       "sources/report.md",
     ]);
     expect(claim.verdict).toBe("supported");
+  });
+
+  test("a figure or a negation in a spelling the reader cannot tell apart reads as the plain one", async () => {
+    // claim-ledger's fold (design §4.1: one kernel for FactCrossCheck and the
+    // gate): fullwidth digits are 4.5, and a zero-width space hides no "not".
+    const at = (...points: number[]): string => String.fromCodePoint(...points);
+    const fullwidth = await one(
+      `Revenue rose ${at(0xff14)}.${at(0xff15)}% in the second quarter.`,
+      ["sources/report.md"],
+    );
+    expect(fullwidth.verdict).toBe("supported");
+    const hidden = await one(`The migration did n${at(0x200b)}ot complete on schedule.`, [
+      "sources/report.md",
+    ]);
+    expect(hidden.verdict).toBe("supported");
+    const flipped = await one(`The budget was n${at(0x200b)}ot approved by the board.`, [
+      "sources/report.md",
+    ]);
+    expect(flipped.verdict).toBe("supported");
+    const dropped = await one("The migration did complete on schedule.", ["sources/report.md"]);
+    expect(dropped.verdict).toBe("polarityConflict");
   });
 
   test("an unreadable source leaves the claim undetermined rather than unsupported", async () => {

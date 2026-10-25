@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -208,6 +209,103 @@ describe("resolveEvidence (non-throwing)", () => {
     expect(res.map((r) => r.verdict)).toEqual(["verified", "error_result", "missing"]);
     expect(res[0]?.proof?.toolUseId).toBe("tu_ok");
     expect(res[1]?.proof).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// design/0.8.0 §6.3 — a log that cannot be read to its end is read up to the
+// bad line, as provability's `checked` rung reads it; never a raw throw
+// ---------------------------------------------------------------------------
+
+/** A crash mid-append: half a JSON line, no newline. */
+function tearLog(sessionId: string): void {
+  appendFileSync(
+    join(sessionsDir, `${sessionId}.jsonl`),
+    '{"ts":9,"version":1,"kind":"assistant_mess',
+  );
+}
+
+describe("resolveEvidence — a session log that cannot be read to its end", () => {
+  test("a torn line AFTER a verified pair: the id still verifies, and the log is reported once", async () => {
+    logEvents(PARENT, toolPair("tu_sum", { name: "MoneyAdd", content: "1284.50" }));
+    tearLog(PARENT);
+    const unreadable: Array<{ sessionId: string; message: string }> = [];
+    const res = await resolveEvidence(
+      [
+        { toolUseId: "tu_sum", sessionId: PARENT },
+        { toolUseId: "tu_sum", sessionId: PARENT },
+      ],
+      { sessionRootDir: sessionsDir, onUnreadable: (i) => unreadable.push(i) },
+    );
+    expect(res.map((r) => r.verdict)).toEqual(["verified", "verified"]);
+    expect(res[0]?.proof?.resultDigest).toBe("1284.50");
+    expect(unreadable).toHaveLength(1);
+    expect(unreadable[0]?.sessionId).toBe(PARENT);
+    expect(unreadable[0]?.message).toMatch(/malformed JSON on line 3/);
+    // The throwing wrapper the proven transition uses agrees.
+    const proofs = await verifyEvidence([{ toolUseId: "tu_sum", sessionId: PARENT }], {
+      sessionRootDir: sessionsDir,
+    });
+    expect(proofs[0]?.toolName).toBe("MoneyAdd");
+  });
+
+  test("an id the torn line cuts off is missing — a verdict naming the log, not a RuntimeError", async () => {
+    logEvents(PARENT, [{ kind: "tool_use", payload: { id: "tu_cut", name: "Bash", input: {} } }]);
+    tearLog(PARENT);
+    // The result was appended after the tear; the reader never gets to it.
+    appendFileSync(
+      join(sessionsDir, `${PARENT}.jsonl`),
+      `\n${JSON.stringify({ ts: 10, version: 1, kind: "tool_result", payload: { toolUseId: "tu_cut", content: "ok", isError: false } })}\n`,
+    );
+    const [res] = await resolveEvidence([{ toolUseId: "tu_cut", sessionId: PARENT }], {
+      sessionRootDir: sessionsDir,
+    });
+    expect(res?.verdict).toBe("missing");
+    expect(res?.detail).toContain(
+      `no verified evidence for tu_cut: the session log ${PARENT} could not be read to its end (event-log: malformed JSON on line 2 of`,
+    );
+    expect(res?.detail).toContain(
+      "and tu_cut does not resolve before that point. Run the action again, then complete the step with the new toolUseId.",
+    );
+    const err = await verifyEvidence([{ toolUseId: "tu_cut", sessionId: PARENT }], {
+      sessionRootDir: sessionsDir,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EvidenceError);
+    expect((err as EvidenceError).verdict).toBe("missing");
+    expect((err as EvidenceError).toolUseId).toBe("tu_cut");
+  });
+
+  test("a torn child log does not stop the walk: a sibling child still resolves", async () => {
+    logEvents(PARENT, [
+      { kind: "sub_agent_start", payload: { name: "a", childSessionId: CHILD } },
+      { kind: "sub_agent_start", payload: { name: "b", childSessionId: GRANDCHILD } },
+    ]);
+    logEvents(CHILD, [{ kind: "tool_use", payload: { id: "tu_x", name: "Bash", input: {} } }]);
+    tearLog(CHILD);
+    logEvents(GRANDCHILD, toolPair("tu_fetch", { name: "Fetch", content: "fetched" }));
+    const unreadable: string[] = [];
+    const proofs = await verifyEvidence([{ toolUseId: "tu_fetch", sessionId: PARENT }], {
+      sessionRootDir: sessionsDir,
+      onUnreadable: (i) => unreadable.push(i.sessionId),
+    });
+    expect(proofs[0]?.sessionId).toBe(GRANDCHILD);
+    expect(unreadable).toEqual([CHILD]);
+  });
+
+  test("a link where the log should be is refused by event-log — reported as missing, not thrown", async () => {
+    const real = join(tmp, "elsewhere.jsonl");
+    writeFileSync(
+      real,
+      toolPair("tu_linked")
+        .map((ev, i) => JSON.stringify({ ts: i, version: 1, ...ev }))
+        .join("\n"),
+    );
+    symlinkSync(real, join(sessionsDir, `${PARENT}.jsonl`));
+    const [res] = await resolveEvidence([{ toolUseId: "tu_linked", sessionId: PARENT }], {
+      sessionRootDir: sessionsDir,
+    });
+    expect(res?.verdict).toBe("missing");
+    expect(res?.detail).toContain(`the session log ${PARENT} could not be read to its end`);
   });
 });
 

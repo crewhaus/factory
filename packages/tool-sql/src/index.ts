@@ -1069,7 +1069,7 @@ export const importCsv: RegisteredTool = buildTool({
   name: "ImportCsv",
   operativeArgs: [
     { field: "database", kind: "path" },
-    { field: "file", kind: "path" },
+    { field: "file", kind: "path", reads: true },
   ],
   description:
     "Load a CSV file into a SQLite table in one transaction, creating the table from inferred column types if asked. Use to get a delimited export into a database without hand-writing thousands of INSERTs; it reports rows inserted and every rejected row with the reason it was rejected. A cell whose text does not fit its column's declared type is a rejection rather than a value silently stored as text, which is what SQLite would otherwise do.",
@@ -1211,7 +1211,7 @@ export const importJson: RegisteredTool = buildTool({
   name: "ImportJson",
   operativeArgs: [
     { field: "database", kind: "path" },
-    { field: "file", kind: "path" },
+    { field: "file", kind: "path", reads: true },
   ],
   description:
     "Load JSON records into a SQLite table in one transaction, from a file or from records passed inline. Use for an API dump or a computed result set that needs to become queryable; it accepts a JSON array or newline-delimited JSON, creates the table from inferred types if asked, and reports every rejected record with its reason. Booleans become 1 and 0 and nested objects become JSON text, because SQLite has neither type.",

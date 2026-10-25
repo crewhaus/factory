@@ -18,6 +18,7 @@ import {
   type SubAgentDefinition,
   subAgentDefinitionFromIr,
 } from "@crewhaus/agent-context-isolation";
+import { provabilitySkills } from "@crewhaus/evaluation-service";
 import { type HookDef, loadHooks } from "@crewhaus/hooks-engine";
 import type { IrV0 } from "@crewhaus/ir";
 import { createLogger } from "@crewhaus/logging";
@@ -197,10 +198,14 @@ export async function wireRunOnce(
   // Permission rules.
   const permissionRules = buildRuleSet(ir.permissions.rules, cwd);
 
-  // Hooks / skills / slash-commands.
+  // Hooks / skills / slash-commands. 0.8.0 §11 — under `provability:` the
+  // gate's `provability` skill is a builtin of this discovery (lowest
+  // precedence, as in a compiled bundle and `crewhaus run`); a spec without
+  // the block passes nothing and discovers exactly what it did before.
+  const gateSkills = provabilitySkills(ir.provability);
   const [hooks, skills, slashCommands] = await Promise.all([
     loadHooks({ cwd }),
-    discoverSkills({ cwd }),
+    discoverSkills({ cwd, ...(gateSkills.length > 0 ? { builtinSkills: gateSkills } : {}) }),
     loadCommands({ cwd }),
   ]);
   if (skills.length > 0) tools.push(createSkillTool(skills));

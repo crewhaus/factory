@@ -164,6 +164,15 @@ function unquote(s: string): string {
 }
 
 /**
+ * Operational variables Hangar's payloads quote, on top of
+ * harness-supervisor's `NON_SECRET_ENV_KEYS`: `CREWHAUS_TENANTS_ROOT` is a
+ * directory, as `CREWHAUS_SESSION_DIR` (exempt there) is, and the proof
+ * route's rows and CLI twins name it (0.8.0 §12 item 5) — masked to
+ * `«CREWHAUS_TENANTS_ROOT»`, a twin would not run when pasted.
+ */
+const HANGAR_NON_SECRET_KEYS: readonly string[] = ["CREWHAUS_TENANTS_ROOT"];
+
+/**
  * {@link spawnEnvScrubber} widened with {@link specCredentialValues}, and
  * degrading to the identity scrubber rather than throwing: an unreadable
  * `.env` chain must not take a read down, and the shape masker still runs
@@ -188,7 +197,7 @@ export function safeSpawnEnvScrubber(
     for (const [key, value] of Object.entries(specCredentialValues(harnessDir))) {
       if (!known.has(value)) merged[key] = value;
     }
-    return createEnvScrubber(merged);
+    return createEnvScrubber(merged, { allowKeys: HANGAR_NON_SECRET_KEYS });
   } catch {
     try {
       return createEnvScrubber(specCredentialValues(harnessDir));

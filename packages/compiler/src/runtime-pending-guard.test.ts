@@ -240,9 +240,10 @@ const CASCADE: ReadonlyArray<
       "  on_fail: escalate",
     ),
     (j) => j.includes('"onFail":"escalate","maxRetries":1,"escalateTo":"strong"'),
+    // 0.8.0 §4.4 — the bundle hands the lowered block to `wireEvaluation`
+    // as one JSON fragment instead of rendering an inline grader.
     (b) =>
-      b.includes('onFail: "escalate",') &&
-      b.includes('escalateTo: "strong",') &&
+      b.includes('"onFail":"escalate","maxRetries":1,"escalateTo":"strong"') &&
       b.includes('"cascade":{"draft":"cheap","escalateTo":"strong","cleanPrompt":true}') &&
       b.includes('"maxEscalations":2'),
   ],
@@ -258,7 +259,7 @@ const CASCADE: ReadonlyArray<
       "  on_fail: escalate",
     ),
     (j) => j.includes('"escalateTo":"strong"'),
-    (b) => b.includes('escalateTo: "strong",'),
+    (b) => b.includes('"onFail":"escalate","maxRetries":1,"escalateTo":"strong"'),
   ],
   [
     "evaluation.on_fail: escalate with no strong tag defaults escalateTo to the LAST candidate's arm id ($profile → its name)",
@@ -279,7 +280,7 @@ const CASCADE: ReadonlyArray<
       "  on_fail: escalate",
     ].join("\n"),
     (j) => j.includes('"escalateTo":"big"'),
-    (b) => b.includes('escalateTo: "big",'),
+    (b) => b.includes('"onFail":"escalate","maxRetries":1,"escalateTo":"big"'),
   ],
   [
     "steps[].judge.escalate_to (workflow) rides the IR and forces the retry closure",
@@ -344,7 +345,8 @@ describe("0.6.0 PR 9c — the cascade keys compile through to the runtime", () =
       expect(ir.evaluation?.escalateTo).toBeUndefined();
       expect("escalateTo" in (ir.evaluation ?? {})).toBe(false);
       const agentTs = compile(yaml).files.find((f) => f.path === "agent.ts")?.content ?? "";
-      expect(agentTs).toContain(`onFail: "${onFail}",\n  maxRetries: 1,\n  evaluate:`);
+      // 0.8.0 §4.4 — the evaluation block rides the wireEvaluation fragment.
+      expect(agentTs).toContain(`"onFail":"${onFail}","maxRetries":1}`);
       expect(agentTs).not.toContain("escalateTo");
     }
   });

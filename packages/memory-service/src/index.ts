@@ -24,8 +24,8 @@
  * {@link memoryFragmentFromIr} (PR 11); this package stays structural and
  * deliberately does not import `@crewhaus/ir`. The fragment carries only
  * knobs this root actually wires — no dead config: `dream` joins with its
- * engine (PR 14); continuity `proof` is the one carried-but-degraded field
- * (see {@link ContinuityWiringFragment.proof}).
+ * engine (PR 14), and continuity `proof` reaches tool-plan's proof-mode seam
+ * (see {@link ContinuityWiringFragment.proof}; enforced since 0.8.0).
  *
  * ## What gets wired (feature → stores/tools/seams)
  *
@@ -51,7 +51,9 @@
  *                      merged at LOWEST precedence via `discoverSkills`'
  *                      `builtinSkills` / `loadCommands`' `builtinDirs` —
  *                      user (`~/.crewhaus`) and project (`<cwd>/.crewhaus`)
- *                      entries override by name
+ *                      entries override by name; skills another root brings
+ *                      (`deps.builtinSkills`, e.g. the provability gate's)
+ *                      merge the same way
  *   wiki on        → `WikiStore` (`.crewhaus/wiki/<spec>/`)
  *                    · the ten thredz-vocabulary `wiki_*` tools
  *                    · `log_knowledge_gap` routed into the plan store as a
@@ -87,10 +89,12 @@ import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
+  type ContinuityProofMode,
   type ContinuityScope,
   type ContinuityStore,
+  countsAsProven,
   createContinuityStore,
-  renderStatus,
+  renderLadderStatus,
 } from "@crewhaus/continuity-store";
 import {
   DEFAULT_COMMANDS,
@@ -133,6 +137,7 @@ import {
   type IrLearningLike,
   type LearningWiringFragment,
   createExamTool,
+  gapGoalTitle,
   renderedLearningSkill,
   withLearningDreamSeed,
 } from "./learning.js";
@@ -283,12 +288,15 @@ export type ContinuityWiringFragment = {
   /** Plan/goal persistence + the Plan/Goal tool families. `false` keeps
    *  only focus (FocusRead/FocusWrite) + MemoryClear. Default true. */
   readonly plan?: boolean;
-  /** §2.4 proof-of-action mode. `"ladder"` (the lowered default) is what
-   *  tool-plan implements: `claimed` is free, the `proven` transition is
-   *  machine-checked. `"require"`/`"off"` are CARRIED for forward compat but
-   *  degrade to the ladder with a boot note — enforcement needs a proof-mode
-   *  seam on tool-plan's `createPlanTools` (noted follow-up; this package
-   *  consumes the store/tool packages, it does not modify them). */
+  /** §2.4 proof-of-action mode, passed straight to tool-plan's
+   *  `createPlanTools({proofMode})` (enforced since 0.8.0, design/0.8.0 §6.3;
+   *  until then `require`/`off` degraded to the ladder with a boot note).
+   *  `"ladder"` (the lowered default; absent means the same): `claimed` is
+   *  free, `proven` is machine-checked against the session event log.
+   *  `"require"`: the ladder, and nothing below `proven` completes anything —
+   *  a goal cannot reach its target unproven. `"off"`: for harnesses with no
+   *  event log — `proven` records the cited toolUseIds WITHOUT resolving
+   *  them, pins no session, and renders `[proven (unverified)]`. */
   readonly proof?: "ladder" | "require" | "off";
   /** The §2.3 requirements ledger — threaded to the runtime seam. Default
    *  true. */
@@ -550,6 +558,17 @@ export type WireMemoryDeps = {
   readonly log?: (line: string) => void;
   /** Home directory override for skill/command discovery (tests). */
   readonly homeDir?: string;
+  /**
+   * Shipped skills another composition root brings, merged with this one's
+   * builtins at the SAME lowest precedence (a user or project skill with the
+   * same name overrides; one named like a default skill replaces it). Used
+   * only when the fabric owns the skill surface (continuity or learning on),
+   * which is when the caller takes its skill list from here — so a feature
+   * outside the fabric still reaches the prompt. Today: the provability
+   * gate's skill (`@crewhaus/evaluation-service`'s `provabilitySkills`,
+   * 0.8.0 design §11).
+   */
+  readonly builtinSkills?: ReadonlyArray<LoadedSkill>;
   readonly now?: () => Date;
   /** v0.3.0 Goal 3 — the live Thredz connection from {@link connectThredz}.
    *  `null` means "configured but boot failed" — wireMemory then DEGRADES to
@@ -838,15 +857,20 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
 
 /** Render the `<current_plan>` tail content from store state: focus, the
  *  active plan's ladder, open goals. Deterministic; null when the store has
- *  nothing to say (the runtime then omits the block). */
+ *  nothing to say (the runtime then omits the block). A goal is open until
+ *  it counts as proven under `continuity.proof` (`countsAsProven`): under
+ *  `require` one proven by assertion, or with no proof on record, stays in
+ *  the tail, because the tools still say it needs a verified proof
+ *  (design/0.8.0 §6.3) — the same rule `handoff.md` renders by. */
 async function renderPlanTail(
   store: ContinuityStore,
   includePlans: boolean,
+  proofMode: ContinuityProofMode | undefined,
 ): Promise<string | null> {
   const focus = await store.readFocus();
   const activePlan = includePlans ? await store.getActivePlan() : null;
   const goals = includePlans ? await store.listGoals() : [];
-  const openGoals = goals.filter((g) => g.status !== "proven");
+  const openGoals = goals.filter((g) => !countsAsProven(g, proofMode));
 
   const lines: string[] = [];
   if (focus !== null && focus.body !== "") {
@@ -856,7 +880,8 @@ async function renderPlanTail(
     if (lines.length > 0) lines.push("");
     lines.push(`${activePlan.id} — ${activePlan.title}`);
     for (const step of activePlan.steps) {
-      lines.push(`${step.index}. ${renderStatus(step.status)} ${step.text}`);
+      // Proven-by-assertion (`proof: off`) renders apart from a verified ✓.
+      lines.push(`${step.index}. ${renderLadderStatus(step)} ${step.text}`);
     }
   }
   if (openGoals.length > 0) {
@@ -867,7 +892,7 @@ async function renderPlanTail(
         goal.target !== undefined
           ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
           : "";
-      lines.push(`- ${goal.id} ${renderStatus(goal.status)} ${goal.title}${progress}`);
+      lines.push(`- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progress}`);
     }
   }
   return lines.length > 0 ? lines.join("\n") : null;
@@ -912,6 +937,8 @@ export function wireContinuity(
     ...(deps.sessionScope !== undefined ? { sessionId: deps.sessionScope } : {}),
     ...(cont.focusMaxChars !== undefined ? { focusMaxChars: cont.focusMaxChars } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
+    // handoff.md counts `proven` the way the tools do (design/0.8.0 §6.3).
+    ...(cont.proof !== undefined ? { proofMode: cont.proof } : {}),
   });
 
   // v0.3.0 Goal 3 (§4.4) — the Thredz goal mirror. SPEC scope only (§14.5
@@ -933,34 +960,29 @@ export function wireContinuity(
           client: deps.thredz.client,
           specName: fragment.specName,
           ...(deps.log !== undefined ? { log: deps.log } : {}),
+          // Under require only a verified goal completes its remote twin.
+          ...(cont.proof !== undefined ? { proofMode: cont.proof } : {}),
         })
       : localStore;
 
+  // §2.4 proof mode (design/0.8.0 §6.3): the fragment's `proof` is the
+  // tools' `proofMode` — tool-plan enforces it, so there is nothing left to
+  // announce at boot (the pre-0.8.0 "carried but not enforced" note is gone).
   const bundle = createPlanTools({
     specName: fragment.specName,
     store,
     ...(deps.sessionScope !== undefined ? { sessionId: deps.sessionScope } : {}),
     ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...(cont.proof !== undefined ? { proofMode: cont.proof } : {}),
   });
-
-  // §2.4 proof mode: the ladder is what tool-plan implements today. The
-  // stricter/looser modes are carried through the fragment (spec → IR →
-  // here) but degrade to the ladder until tool-plan grows a proof-mode
-  // option — say so at boot instead of silently pretending (this package
-  // consumes the plan-store packages; it does not modify them).
-  if (cont.proof === "require" || cont.proof === "off") {
-    deps.log?.(
-      `[memory] continuity.proof "${cont.proof}" is carried but not enforced yet — running the default claimed→proven ladder (enforcement lands with tool-plan's proof-mode seam)\n`,
-    );
-  }
 
   const plan = cont.plan !== false;
   const tools = plan ? bundle.all : [bundle.focusRead, bundle.focusWrite, bundle.memoryClear];
 
   const continuity: ContinuitySeam = {
-    loadPlan: () => renderPlanTail(store, plan),
-    onPlanDirty: () => renderPlanTail(store, plan),
+    loadPlan: () => renderPlanTail(store, plan, cont.proof),
+    onPlanDirty: () => renderPlanTail(store, plan, cont.proof),
     ledger: cont.ledger !== false,
     // 0.6.0 §7.4 — plan-execute: a first-turn guide's plan lands in the store
     // (only when plans are on; `plan: false` keeps the store plan-free).
@@ -990,6 +1012,21 @@ export function wireContinuity(
 // ---------------------------------------------------------------------------
 // wiki — store + tools
 // ---------------------------------------------------------------------------
+
+/**
+ * Log a knowledge gap as a `[gap]` goal in the plan store (§3.2) — the one
+ * local sink `log_knowledge_gap` and run_exam's failure log share. The title
+ * is clipped to the store's cap (see {@link gapGoalTitle}); `note` tells the
+ * model when it was, since GoalList will then show a shortened topic.
+ */
+async function logGapAsGoal(
+  store: ContinuityStore,
+  gap: KnowledgeGap,
+): Promise<{ readonly id: string; readonly note: string }> {
+  const { title, clipped } = gapGoalTitle(gap.topic);
+  const goal = await store.writeGoal({ title });
+  return { id: goal.id, note: clipped ? " (the goal title keeps a shortened topic)" : "" };
+}
 
 export type WireWikiExtras = {
   /** Gap sink override — `wireMemory` routes gaps into the plan store when
@@ -1150,8 +1187,9 @@ async function loadSkillsAndCommands(
   // continuity is on), the learning-loop skill RENDERED with the fragment's
   // domain/curriculum/sources substitutions (when learning is on, §3.3), and
   // the dream skill when a dream schedule is configured (its /dream command
-  // loads it in-session, §6.3). All merge at LOWEST precedence — a user or
-  // project skill with the same name overrides.
+  // loads it in-session, §6.3), then any the caller brings from another root
+  // (`deps.builtinSkills` — the provability gate's skill). All merge at
+  // LOWEST precedence — a user or project skill with the same name overrides.
   const builtinSkills: LoadedSkill[] = [];
   for (const skill of DEFAULT_SKILLS) {
     if (skill.name === "continuity" && features.continuity) builtinSkills.push(skill);
@@ -1160,6 +1198,7 @@ async function loadSkillsAndCommands(
     }
     if (skill.name === "dream" && features.dream) builtinSkills.push(skill);
   }
+  builtinSkills.push(...(deps.builtinSkills ?? []));
   const skills = await discoverSkills({
     cwd: deps.cwd,
     ...(deps.homeDir !== undefined ? { homeDir: deps.homeDir } : {}),
@@ -1249,8 +1288,8 @@ export async function wireMemory(
     ...(continuity !== null
       ? {
           logGap: async (gap: KnowledgeGap): Promise<string> => {
-            const goal = await continuity.store.writeGoal({ title: `[gap] ${gap.topic}` });
-            return `logged knowledge gap "${gap.topic}" → ${goal.id} (priority ${gap.priority}) — it is now a goal in the plan store; aim the next study pass at it`;
+            const { id, note } = await logGapAsGoal(continuity.store, gap);
+            return `logged knowledge gap "${gap.topic}" → ${id} (priority ${gap.priority})${note} — it is now a goal in the plan store; aim the next study pass at it`;
           },
         }
       : {}),
@@ -1358,10 +1397,8 @@ export async function wireMemory(
           }
         : continuity !== null
           ? async (gap: KnowledgeGap): Promise<string> => {
-              const goal = await continuity.store.writeGoal({
-                title: `${GAP_GOAL_PREFIX} ${gap.topic}`,
-              });
-              return `logged knowledge gap "${gap.topic}" → ${goal.id} — the next study pass picks it up`;
+              const { id, note } = await logGapAsGoal(continuity.store, gap);
+              return `logged knowledge gap "${gap.topic}" → ${id}${note} — the next study pass picks it up`;
             }
           : undefined;
     if (learning.exam !== undefined && deps.examRunner !== undefined) {
@@ -1510,6 +1547,12 @@ function buildDreamEngine(
         sessionRootDir,
         scope: { kind: "spec" },
         ...(deps.now !== undefined ? { now: deps.now } : {}),
+        // The dream's handoff refresh renders as the teardown one does: under
+        // `continuity.proof: require` an unverified `proven` stays open
+        // (design/0.8.0 §6.3).
+        ...(fragment.continuity?.proof !== undefined
+          ? { proofMode: fragment.continuity.proof }
+          : {}),
       })
     : undefined;
   // v0.3.0 Goal 2 (§3.3 study.on_dream, PR 17): with learning on, the model
@@ -1526,8 +1569,13 @@ function buildDreamEngine(
           listGaps: async (): Promise<readonly string[]> => {
             if (continuityStore === undefined) return [];
             const goals = await continuityStore.listGoals();
+            // A gap closes as `continuity.proof` counts it, as handoff.md does.
             return goals
-              .filter((g) => g.status !== "proven" && g.title.startsWith(GAP_GOAL_PREFIX))
+              .filter(
+                (g) =>
+                  !countsAsProven(g, fragment.continuity?.proof) &&
+                  g.title.startsWith(GAP_GOAL_PREFIX),
+              )
               .map((g) => g.title.slice(GAP_GOAL_PREFIX.length).trim());
           },
         })
@@ -1540,6 +1588,7 @@ function buildDreamEngine(
     memoryStore,
     ...(wikiStore !== undefined ? { wikiStore } : {}),
     ...(continuityStore !== undefined ? { continuityStore } : {}),
+    ...(fragment.continuity?.proof !== undefined ? { proofMode: fragment.continuity.proof } : {}),
     ...(modelPhase !== undefined ? { modelPhase } : {}),
     playbook: DREAM_SKILL_BODY,
     ...(deps.appendEvent !== undefined ? { appendEvent: deps.appendEvent } : {}),

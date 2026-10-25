@@ -1,0 +1,46 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../event-log"
+    },
+    {
+      "path": "../proof-checker"
+    },
+    {
+      "path": "../provability"
+    },
+    {
+      "path": "../sandbox"
+    },
+    {
+      "path": "../tenancy"
+    },
+    {
+      "path": "../tool-builder"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-categories"
+    },
+    {
+      "path": "../tool-executor"
+    },
+    {
+      "path": "../tool-result-store"
+    },
+    {
+      "path": "../trace-event-bus"
+    }
+  ],
+  "include": ["src/**/*"]
+}

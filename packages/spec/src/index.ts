@@ -2332,6 +2332,324 @@ const watchmeBlock = z
   .optional();
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §2–§3) — the provability ladder's
+ * rungs, lowest first. `off` is the explicit opt-out: it lowers to NO IR key,
+ * exactly like an absent block (§4.3). The order is the ladder's total order
+ * (a higher rung's evidence satisfies a lower floor), so it doubles as the
+ * comparison table `crewhaus lint` reads.
+ */
+export const SPEC_PROVABILITY_LEVELS = ["off", "cited", "grounded", "checked", "proven"] as const;
+
+const provabilityLevel = z
+  .enum(SPEC_PROVABILITY_LEVELS, {
+    // Only the object form can omit it (the block itself is optional), so
+    // say what an author who left it out most likely meant.
+    required_error:
+      "the object form must say which rung it sets (off | cited | grounded | checked | proven); an absent provability: block is off",
+  })
+  .describe(
+    "the floor every claim in an answer must meet: off | cited (a defined [n] source) | grounded (the source's body was read this run and holds the claim) | checked (a tool:<toolUseId> result that contains the value) | proven (a proof:prf_… artifact a checker accepted)",
+  );
+
+/**
+ * 0.8.0 (design §3, §6.1) — one `sources.allow` / `sources.deny` entry is a
+ * HOST glob, matched against the host of a cited URL: `*` (any host),
+ * `*.<host>` (that host's subdomains) or an exact host (`arxiv.org`, an IPv4
+ * literal). Anything else is refused at parse, because an entry written as a
+ * URL (`https://evil.example/`), with a port or with a path can never equal a
+ * host: on `deny` it fails OPEN (the block the author wrote never fires) and
+ * on `allow` it fails every citation closed. Hosts are case-insensitive, so
+ * the pattern is too; the compiler lowers each entry to lowercase. A
+ * non-ASCII host is written in its punycode (`xn--…`) form, the form a
+ * parsed URL's host takes.
+ */
+const PROVABILITY_HOST_GLOB = /^(?:\*|(?:\*\.)?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*)$/i;
+
+function provabilityHostGlobs(list: "allow" | "deny") {
+  return z.array(
+    z
+      .string()
+      .min(1)
+      .refine(
+        (entry) => PROVABILITY_HOST_GLOB.test(entry),
+        (entry) => ({
+          message: `${JSON.stringify(entry)} is not a host glob — ${list} entries are a host (arxiv.org), *.<host> (*.gov) or *, with no scheme, port, path or spaces`,
+        }),
+      ),
+  );
+}
+
+/** design §3 `sources:` — the cited rung's allowlist. NOT optimizable (an allowlist is policy). */
+const provabilitySourcesBlock = z
+  .object({
+    allow: provabilityHostGlobs("allow")
+      .optional()
+      .describe(
+        "host globs a cited URL must match (e.g. *.gov, arxiv.org); absent = any public host",
+      ),
+    deny: provabilityHostGlobs("deny")
+      .optional()
+      .describe("host globs a cited URL must not match; deny wins over allow"),
+    bibliographic: z
+      .boolean()
+      .optional()
+      .describe("accept un-locatable free-text references at the cited rung (default false)"),
+    resolve: z
+      .enum(["off", "head"])
+      .optional()
+      .describe(
+        "reachability check at gate time: off (default) or one guarded HEAD request per distinct URL",
+      ),
+  })
+  .strict()
+  .describe("which sources a citation may name (the cited rung)");
+
+/** design §3 `grounded:` — how close the claim's words must sit in the source body. */
+const provabilityGroundedBlock = z
+  .object({
+    coverage: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe("per-claim content-token coverage required inside one window (default 0.8)"),
+    window_tokens: z
+      .number()
+      .int()
+      .min(4)
+      .max(2000)
+      .optional()
+      .describe("how far apart, in tokens, the claim's words may sit in the source (default 60)"),
+    independent: z
+      .number()
+      .int()
+      .min(1)
+      .max(5)
+      .optional()
+      .describe(
+        "distinct origins (eTLD+1 or distinct files) each claim needs; 2 = corroborated (default 1)",
+      ),
+  })
+  .strict()
+  .describe("the grounded rung: the claim's words inside a body this run read");
+
+/** design §3 `execution:` — the checked rung. */
+const provabilityExecutionBlock = z
+  .object({
+    allow: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(
+        "tools whose results count as execution evidence — tool keys, exact tool names, or the tools: category grammar (all-<category>, -<tool>, -all-<category>), expanded at compile time (default [all-compute, all-verify, -goldenUpdate])",
+      ),
+    replay: z
+      .boolean()
+      .optional()
+      .describe(
+        "re-run pure tools with the logged input and compare output digests (default true)",
+      ),
+    max_replays: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe("replays per turn (default 20)"),
+  })
+  .strict()
+  .describe("the checked rung: claims bound to tool:<toolUseId> results");
+
+const PROVABILITY_CHECKERS = ["builtin", "smt", "lean4"] as const;
+
+/** design §3 `formal:` — the proven rung. */
+const provabilityFormalBlock = z
+  .object({
+    checkers: z
+      .array(z.enum(PROVABILITY_CHECKERS))
+      .min(1)
+      .refine((list) => new Set(list).size === list.length, {
+        message: "provability.formal.checkers lists a checker twice — each checker appears once",
+      })
+      .optional()
+      .describe(
+        "proof checkers in preference order: builtin (in-process) | smt | lean4 (sandboxed); builtin is always available and is added last when the list leaves it out (default [builtin, smt])",
+      ),
+    image: z
+      .string({
+        // design §3's example writes `image: null` for "no override"; the
+        // key is simply omitted for that, and the message says so.
+        invalid_type_error:
+          "expected a sandbox image name; omit the key to use the checker's default image",
+      })
+      .min(1)
+      .optional()
+      .describe(
+        "image override for the lean4 checker only (e.g. a Mathlib-equipped lean image); smt always runs the curated Z3 image, so without lean4 in checkers this is unused",
+      ),
+    forbid: z
+      .array(z.string().min(1))
+      .optional()
+      .describe(
+        "tokens the lean4 pre-scan refuses in a proof (default [sorry, axiom, native_decide])",
+      ),
+    timeout_ms: z
+      .number()
+      .int()
+      .min(1000)
+      .max(600_000)
+      .optional()
+      .describe("per-check budget in milliseconds (default 30000)"),
+  })
+  .strict()
+  .describe("the proven rung: claims bound to proof:prf_… artifacts a checker accepted");
+
+/** design §3 / §6.2 `judge:` — the optional paraphrase waiver; absent = zero model spend. */
+const provabilityJudgeBlock = z
+  .object({
+    model: z
+      .string()
+      .min(1)
+      .describe(
+        "the waiver judge's model id or $profile; metered as role judge under budget.judge_share",
+      ),
+    /**
+     * Silences the `provability-self-judge` lint (the judge-independence
+     * rule). Never optimizer-tunable: it is a measurement-integrity waiver,
+     * not a quality knob — the `evaluation.allow_self_judge` precedent.
+     */
+    allow_self_judge: z
+      .boolean()
+      .optional()
+      .describe(
+        "accept a waiver judge that is also the agent's serving model (silences the provability-self-judge lint)",
+      ),
+  })
+  .strict()
+  .describe(
+    "optional model waiver for a paraphrase miss at the grounded rung; it can only waive that one sub-check, never raise a rung",
+  );
+
+/**
+ * 0.8.0 — the message `parseSpec` (and so `crewhaus compile`, `run` and
+ * `lint`) prints when the `provability:` union fails as a whole. zod reports a
+ * union's own message ("Invalid input" by default), and an enum or type error
+ * inside the object form fails the union as a whole, so without this every
+ * such typo (`on_fail: retries`, `formal: { checkers: [z3] }`,
+ * `execution: { replay: "yes" }`) printed one generic line that never named
+ * the key. For an object it now names every failing key with its own message,
+ * from the branch `parseSpecIssues` reports ({@link plausibleUnionBranch}),
+ * so the two cannot disagree about which field is wrong. Range errors and
+ * unknown keys never reach here: they leave the object branch dirty rather
+ * than failed, and zod reports them with their own paths.
+ */
+function provabilityUnionError(
+  issue: z.ZodIssueOptionalMessage,
+  ctx: z.ErrorMapCtx,
+): { message: string } {
+  if (issue.code !== z.ZodIssueCode.invalid_union) return { message: ctx.defaultError };
+  const data: unknown = ctx.data;
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    const branch = plausibleUnionBranch(issue.unionErrors, issue.path);
+    const inner = branch === undefined ? [] : zodIssuesToSpecIssues(branch.issues);
+    if (inner.length > 0) {
+      return { message: inner.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+    }
+  }
+  // `null` first: `typeof null` is "object", and an empty `provability:` key
+  // (every child commented out) parses to null, so without this the message
+  // said it wanted an object and then that it received one.
+  const received =
+    data === null
+      ? "nothing (an empty provability: key)"
+      : typeof data === "string"
+        ? JSON.stringify(data)
+        : Array.isArray(data)
+          ? "a list"
+          : typeof data;
+  return {
+    message: `expected a rung name (off | cited | grounded | checked | proven) or an object { level: <rung>, … }, received ${received}`,
+  };
+}
+
+/**
+ * 0.8.0 (design §3) — the `provability:` block. A string shorthand sets the
+ * floor and takes every default (`provability: grounded` ≡
+ * `{ level: grounded }`); the object form is `.strict()` throughout so a
+ * typo'd key fails the build. `level` is REQUIRED in the object form: a block
+ * that configures the gate without saying how high it sits is a mistake, not
+ * an implicit `off`.
+ *
+ * Every knob defaults (the compiler resolves them, §4.2), so the shorthand is
+ * a complete declaration. Carried on cli, channel, managed, research and crew
+ * (crew with an `accepted-but-unwired` warning, §8); the strict unions reject
+ * it on graph, workflow, pipeline, batch, voice, browser, eval, onchain and
+ * onchain-game — dead config fails loudly there.
+ *
+ * Parse-time invariants live in `crossFieldIssues()` (appended last):
+ * `on_fail: escalate` without `agent.model_pool` on the interactive shapes,
+ * and an unknown `judge.model` profile. The softer findings — no tool that can
+ * read a source at `level ≥ grounded`, sandbox-only checkers, an inert
+ * `level: off` block, a `formal.image` no lean4 checker runs, a self-judging
+ * waiver — are `crewhaus lint` rules and compile warnings, never parse
+ * errors: each describes a spec that is valid, just unlikely to do what its
+ * author meant.
+ */
+const provabilityObject = z
+  .object({
+    level: provabilityLevel,
+    on_fail: z
+      .enum(["retry", "halt", "note", "escalate"])
+      .optional()
+      .describe(
+        "below-floor behaviour: retry re-prompts with the unmet reasons (default), halt aborts the turn classified, note serves the answer with a visible ✗ footer, escalate re-runs the turn on a stronger model_pool candidate",
+      ),
+    max_retries: z
+      .number()
+      .int()
+      .min(0)
+      .max(5)
+      .optional()
+      .describe("hard cap on gate-triggered re-runs per turn (default 1)"),
+    threshold: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe("fraction of non-assumption claims that must meet the floor (default 1.0)"),
+    scope: z
+      .enum(["session", "turn"])
+      .optional()
+      .describe("how far back evidence may come from: the whole session (default) or this turn"),
+    assumptions: z
+      .enum(["allow", "forbid"])
+      .optional()
+      .describe("whether [A1]: assume: … bindings are accepted (default allow); always counted"),
+    max_assumptions: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("cap on assumptions per answer; absent = uncapped (they are still counted)"),
+    render: z
+      .enum(["footer", "none", "json"])
+      .optional()
+      .describe("how the proof bundle shows beside the answer (default footer)"),
+    sources: provabilitySourcesBlock.optional(),
+    grounded: provabilityGroundedBlock.optional(),
+    execution: provabilityExecutionBlock.optional(),
+    formal: provabilityFormalBlock.optional(),
+    judge: provabilityJudgeBlock.optional(),
+  })
+  .strict();
+
+const provabilityBlock = z
+  .union([provabilityLevel, provabilityObject], { errorMap: provabilityUnionError })
+  .describe(
+    "0.8.0 provability: every claim in an answer must bind to evidence at or above this floor before the answer is served (a rung name is shorthand for { level: <rung> })",
+  )
+  .optional();
+
+/**
  * Section 47 — blockchain subsystem blocks (cross-cutting). Any shape may
  * declare any subset of `chains` / `wallets` / `contracts` /
  * `transaction_policy`. Authoring rules:
@@ -2634,6 +2952,8 @@ const cliSchema = z
     plugins: pluginsBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
+    // 0.8.0 (design §3) — the provability ladder, gated beside evaluation.
+    provability: provabilityBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -2863,6 +3183,8 @@ const channelSchema = z
     plugins: pluginsBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
+    // 0.8.0 (design §3) — the provability ladder, gated beside evaluation.
+    provability: provabilityBlock,
     feedback: feedbackBlock,
     memory: memoryBlock,
     // Loop contract 0.4 (Batch E, G22) — agent-shape RAG over doc sources.
@@ -3112,6 +3434,8 @@ const managedSchema = z
     expose: exposeBlock,
     // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
     evaluation: evaluationBlock,
+    // 0.8.0 (design §3) — the provability ladder, gated beside evaluation.
+    provability: provabilityBlock,
     // NEW-inloop-coverage — human-rating capture on the GATEWAY shape.
     //
     // WHAT MANAGED SUPPORTS: the daemon serves a `feedback.submit` JSON-RPC
@@ -3316,6 +3640,9 @@ const crewSchema = z
     // surface, §2.7).
     memory: memoryBlock,
     continuity: continuityBlock,
+    // 0.8.0 (design §8) — carried with an accepted-but-unwired warning: the
+    // orchestrator's synthesis turn is a deferred seam (§12 item 2).
+    provability: provabilityBlock,
     thredz: crewThredzBlock,
     learning: learningBlock,
     // Loop contract 0.4 (Batch C, G26) — crew joins the observability-carrying
@@ -3368,6 +3695,9 @@ const researchSchema = z
     hooks: hooksBlock,
     memory: memoryBlock,
     continuity: continuityBlock,
+    // 0.8.0 (design §8) — the report gate: the rendered report is verified
+    // against the citation tracker's cache (on_fail halt | note on this shape).
+    provability: provabilityBlock,
     thredz: thredzBlock,
     learning: learningBlock,
     chains: chainsBlock,
@@ -3794,6 +4124,13 @@ export type SpecObservabilityBlock = z.infer<typeof observabilityBlock>;
 /** "Watch me" — the observe-and-learn `watchme:` block, carried on
  *  cli/channel/managed (design/watch-me.md §4.1). */
 export type SpecWatchmeBlock = z.infer<typeof watchmeBlock>;
+/** 0.8.0 (design §3) — the full `provability:` surface: a rung-name shorthand
+ *  or the strict object form, carried on cli/channel/managed/research/crew. */
+export type SpecProvabilityBlock = z.infer<typeof provabilityBlock>;
+/** 0.8.0 — the `provability:` object form. */
+export type SpecProvabilityObject = z.infer<typeof provabilityObject>;
+/** 0.8.0 — one rung name, `off` included (see {@link SPEC_PROVABILITY_LEVELS}). */
+export type SpecProvabilityLevel = (typeof SPEC_PROVABILITY_LEVELS)[number];
 export type SpecSecurityBlock = z.infer<typeof securityBlock>;
 export type SpecFeedbackBlock = z.infer<typeof feedbackBlock>;
 export type SpecMemoryBlock = z.infer<typeof memoryBlock>;
@@ -4105,7 +4442,88 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
   // 0.6.0 §4.1 / §7.1 — the model-profile registry, `$profile` references
   // and the hybrid pool blocks (appended last: check order is load-bearing).
   modelSurfaceIssues(data, custom);
+  // 0.8.0 (design §3) — the provability block's genuine contradictions,
+  // appended after every existing check so no 0.7.x spec's first error moves.
+  provabilityIssues(data, custom);
   return issues;
+}
+
+/**
+ * The object form of a `provability:` value, or undefined for the shorthand /
+ * an absent block. Exported so the compiler and `crewhaus lint` read the
+ * block's two forms through one helper rather than re-deriving the union.
+ */
+export function provabilityObjectOf(
+  block: SpecProvabilityBlock | undefined,
+): SpecProvabilityObject | undefined {
+  return typeof block === "object" && block !== null ? block : undefined;
+}
+
+/** The rung a `provability:` value sets, `off` when the block is absent. */
+export function provabilityLevelOf(block: SpecProvabilityBlock | undefined): SpecProvabilityLevel {
+  if (block === undefined) return "off";
+  return typeof block === "string" ? block : block.level;
+}
+
+/**
+ * 0.8.0 (design §3) — the provability block's PARSE-TIME invariants. Only
+ * genuine contradictions belong here, because they throw from `parseSpec`:
+ *
+ *   - `on_fail: escalate` without `agent.model_pool` on the interactive
+ *     shapes (cli/channel/managed): escalate re-runs the failing turn on a
+ *     stronger pool candidate, and there is no roster to escalate on. Worded
+ *     as the `evaluation.on_fail: escalate` check is. Research degrades
+ *     escalate to `note` at lower time (its report gate is not per-turn), and
+ *     crew carries the block unwired, so neither is refused here. Nor is a
+ *     `level: off` block: design §3 accepts an off block with other keys set
+ *     (turning the gate off without deleting its config is a legitimate edit)
+ *     and the compiler reports it `provability-inert-block` instead — an
+ *     escalate that never runs contradicts nothing.
+ *   - `judge.model` naming an undeclared `$profile` (the aux-slot check every
+ *     other judge slot gets). Checked at every level, off included: a typo is
+ *     a typo whether or not the gate is on today.
+ *
+ * The rest — no source-reading tool at `level ≥ grounded`, sandbox-only
+ * checkers, an inert `level: off` block, a `formal.image` no lean4 checker
+ * runs, a self-judging waiver — describe valid specs and are `crewhaus lint`
+ * findings / compile warnings instead.
+ */
+function provabilityIssues(data: Spec, custom: SpecAddIssue): void {
+  if (
+    data.target !== "cli" &&
+    data.target !== "channel" &&
+    data.target !== "managed" &&
+    data.target !== "research" &&
+    data.target !== "crew"
+  ) {
+    return;
+  }
+  const block = provabilityObjectOf(data.provability);
+  if (block === undefined) return;
+  if (
+    (data.target === "cli" || data.target === "channel" || data.target === "managed") &&
+    block.level !== "off" &&
+    block.on_fail === "escalate" &&
+    data.agent.model_pool === undefined
+  ) {
+    custom(
+      ["provability", "on_fail"],
+      "provability.on_fail: escalate re-runs a failing turn on a stronger pool candidate (strategy.cascade.escalate_to, else the strongest candidate), so agent.model_pool must be declared",
+    );
+  }
+  if (block.judge !== undefined) {
+    checkModelSlot(
+      {
+        custom,
+        registry: data.models ?? {},
+        mcpServers: new Set(),
+        modelDirected: false,
+        gradedInLoop: false,
+      },
+      ["provability", "judge", "model"],
+      block.judge.model,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4979,9 +5397,10 @@ function yamlSyntaxIssue(err: unknown): SpecIssue {
 
 /**
  * Flatten zod issues to `SpecIssue`s. `invalid_union` issues (the workflow
- * step / graph node / continuity / thredz unions) are replaced by the most
- * plausible branch's issues — the branch that failed with the FEWEST
- * problems, ties broken by the fewest unrecognized KEYS (so a step that
+ * step / graph node / continuity / thredz / provability unions) are replaced
+ * by the most plausible branch's issues ({@link plausibleUnionBranch}) — a
+ * branch whose type matched the value, then the one that failed with the
+ * FEWEST problems, ties broken by the fewest unrecognized KEYS (so a step that
  * declares `kind: judge` with a typo inside `judge:` reports the judge
  * branch's problem, not the regular branch's "unrecognized 'kind'") — so a
  * malformed union member reports its actual problem instead of an opaque
@@ -4996,14 +5415,53 @@ function unrecognizedKeyCount(err: z.ZodError): number {
   return count;
 }
 
+/**
+ * 1 when the branch failed because the value is the wrong TYPE for it
+ * altogether (an `invalid_type` AT the union's own path) — the least
+ * plausible branch, which {@link plausibleUnionBranch} ranks LAST before it
+ * compares anything else. 0.8.0:
+ * `provability: { level: bogus }` used to report the shorthand branch's
+ * "expected a rung name, received object" rather than the object branch's
+ * bad `level`, because both fail once.
+ */
+function rootTypeMismatch(err: z.ZodError, unionPath: ReadonlyArray<string | number>): number {
+  return err.issues.some(
+    (i) =>
+      i.code === z.ZodIssueCode.invalid_type &&
+      i.path.length === unionPath.length &&
+      i.path.every((seg, k) => seg === unionPath[k]),
+  )
+    ? 1
+    : 0;
+}
+
+/**
+ * The most plausible failed branch of a union: one whose TYPE matched the
+ * value first (a scalar-or-object union fed an object is about the object
+ * branch, however many of its keys are wrong — 0.8.0: `provability:
+ * { level: cited, on_fail: retries, render: markdown }` used to report the
+ * shorthand branch's single "expected a rung name, received object" because
+ * the object branch failed twice), then the fewest problems, then the fewest
+ * unrecognized keys. Shared by `parseSpecIssues` and the provability union's
+ * `parseSpec` message, so both name the same field.
+ */
+function plausibleUnionBranch(
+  unionErrors: ReadonlyArray<z.ZodError>,
+  unionPath: ReadonlyArray<string | number>,
+): z.ZodError | undefined {
+  return [...unionErrors].sort(
+    (a, b) =>
+      rootTypeMismatch(a, unionPath) - rootTypeMismatch(b, unionPath) ||
+      a.issues.length - b.issues.length ||
+      unrecognizedKeyCount(a) - unrecognizedKeyCount(b),
+  )[0];
+}
+
 function zodIssuesToSpecIssues(zodIssues: ReadonlyArray<z.ZodIssue>): SpecIssue[] {
   const out: SpecIssue[] = [];
   for (const issue of zodIssues) {
     if (issue.code === z.ZodIssueCode.invalid_union && issue.unionErrors.length > 0) {
-      const best = [...issue.unionErrors].sort(
-        (a, b) =>
-          a.issues.length - b.issues.length || unrecognizedKeyCount(a) - unrecognizedKeyCount(b),
-      )[0];
+      const best = plausibleUnionBranch(issue.unionErrors, issue.path);
       if (best !== undefined && best.issues.length > 0) {
         out.push(...zodIssuesToSpecIssues(best.issues));
         continue;

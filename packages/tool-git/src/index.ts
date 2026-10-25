@@ -26,6 +26,11 @@
 import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  protectedRootHolding,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { blameIgnoreRevs } from "./blame-ignore";
 import {
@@ -1206,6 +1211,23 @@ function escapingSymlink(
   return undefined;
 }
 
+/**
+ * The paths `git apply --numstat -z` names: one `added\tdeleted\tpath` record
+ * per file, NUL-terminated (a rename names its new path forward, its old one
+ * under `-R`).
+ */
+function numstatPaths(stdout: string): string[] {
+  const out: string[] = [];
+  for (const record of stdout.split("\0")) {
+    const tab = record.indexOf("\t");
+    const second = tab === -1 ? -1 : record.indexOf("\t", tab + 1);
+    if (second === -1) continue;
+    const name = record.slice(second + 1);
+    if (name !== "") out.push(name);
+  }
+  return out;
+}
+
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
   operativeArgs: [{ field: "cwd", kind: "path", default: ".", beneath: "all" }],
@@ -1274,6 +1296,54 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     }
     const skippedSources = skippedPatchPaths(sources.stderr).map(unreverseRename);
     if (skippedSources.length > 0) return refuseSkipped(skippedSources);
+
+    // The runtime-state floor reads the call's `cwd`, never the files the
+    // patch names: a patch can write a session log line, a spilled result or
+    // a proof bundle the gates read as evidence (design/0.8.0 §1 principle
+    // 1). Every name it writes — each file's new name, and each rename's or
+    // deletion's old one — is checked against the run's roots, read from
+    // the repository's top and from cwd alike, before anything is written.
+    const roots = protectedRootsOf(ctx);
+    if (roots.length > 0) {
+      const named: string[] = [];
+      for (const reverse of [false, true]) {
+        const listed = await repo.run(
+          ["apply", "--numstat", "-z", ...(reverse ? ["-R"] : []), ...strip, "-"],
+          { stdin: patchText, readOnly: true },
+        );
+        if (listed.code !== 0) {
+          return json({
+            applied: false,
+            checkedOnly,
+            reason: failure("GitApplyPatch", withoutApplyProgress(listed)),
+          });
+        }
+        if (listed.truncated === true) {
+          // A name cut off is a name not checked.
+          return json({
+            applied: false,
+            checkedOnly,
+            wouldApply: false,
+            reason:
+              "GitApplyPatch: the patch names more files than could be checked against the run's own record (session logs, spilled tool results, proof bundles). Nothing was applied. Apply it in smaller patches.",
+          });
+        }
+        named.push(...numstatPaths(listed.stdout));
+      }
+      const hit = named.find((name) =>
+        [repo.root, repo.cwd].some(
+          (base) => protectedRootHolding(nodePath.resolve(base, name), roots) !== undefined,
+        ),
+      );
+      if (hit !== undefined) {
+        return json({
+          applied: false,
+          checkedOnly,
+          wouldApply: false,
+          reason: protectedWriteRefusal("GitApplyPatch", `the patch's ${hit}`),
+        });
+      }
+    }
 
     // A symlink git creates inside the working tree may still point OUT of it:
     // git stores the target as the file's content and never rejects one, so

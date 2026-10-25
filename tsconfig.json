@@ -290,6 +290,14 @@
     { "path": "./packages/harness-lifecycle" },
     { "path": "./packages/spec-changelog" },
     { "path": "./packages/qr-code" },
+    { "path": "./packages/claim-ledger" },
+    { "path": "./packages/provability" },
+    { "path": "./packages/proof-checker" },
+    { "path": "./packages/tool-proof" },
+    { "path": "./packages/evaluation-service" },
+    { "path": "./packages/sandbox-image-z3" },
+    { "path": "./packages/sandbox-image-lean4" },
+    { "path": "./packages/grader-provability" },
     { "path": "./apps/cli" }
   ]
 }

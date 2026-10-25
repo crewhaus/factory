@@ -103,6 +103,9 @@ GET  /api/h/:id/{schedulers,deployments}
 GET  /api/approvals[?all=1]                POST /api/h/:id/approvals/:apprId/{grant,deny}
 GET  /api/review[?all=1]                   POST /api/h/:id/review/:itemId {verdict}
 GET  /api/activity[?since=]                GET  /api/jobs   POST /api/h/:id/jobs {kind}
+
+# 0.8.0 — the proof bundles the provability gate saved (see *Proof bundles*)
+GET  /api/runs/:sessionId/proof[?harness=:id]
 ```
 
 ### M3 — the detail surface
@@ -383,6 +386,32 @@ entries out of the default view — curation, not removal. `GET
 yet registered as candidates, registering nothing: the "find harnesses on
 this machine" flow, distinct from `POST /api/scan` (which registers
 everything it finds).
+
+### Proof bundles (0.8.0)
+
+`GET /api/runs/:sessionId/proof` returns the proof bundles a run's
+provability gate saved: one row per graded pass of each turn, oldest turn
+first, with `standing: true` on the pass the answer was served under. The id
+is the session id a gateway run answers with (`sess_<16 hex>`), or a
+research run's id (`run_<16 hex>`), whose one bundle sits beside its
+`report.md`. A session id names its harness only implicitly, so every live
+registered harness is searched; `?harness=<id>` narrows the search to one.
+
+It reads the way every Hangar read does. The id's shape is checked before
+any path is built, and every bundle file is re-resolved inside its harness,
+so a link out of it is never read. A bundle that is too large, does not
+parse or is not bundle-shaped is listed under `skipped` with the reason, and
+nothing is written or pruned. Each harness's rows are masked with that
+harness's own scrubber, because claim text is model prose and an excerpt is
+a fetched page's words. Each row carries its CLI twin, `cd <harness dir> &&
+crewhaus provability show --session <id> --turn <n> --json`, with
+`--pass <k>` for a turn that was retried (`show` reads a turn's last pass by
+default) and `--tenants-root <dir>` for a managed tenant's bundle. A managed
+harness files its bundles under its tenants root (`CREWHAUS_TENANTS_ROOT`,
+by default `/tmp/crewhaus-tenants`). Hangar reads nothing outside a
+registered harness, so a tenants root outside the
+harness directory is named in `tenantRootsNotRead` (and in the 404 a run
+with no bundle gets) rather than answered with a silent "none".
 
 ## Library use
 

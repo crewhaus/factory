@@ -16,6 +16,14 @@
  * resultDigest}` — that the store writes into the citing plan/goal record,
  * and the store additionally pins the cited session in
  * `.crewhaus/retention.json` (see `appendRetentionPins`).
+ *
+ * A log that cannot be read to its end (a torn last line from a crash
+ * mid-append, a malformed line, a link where the log should be) keeps the
+ * events read before that point, exactly as provability's `checked` rung
+ * reads the same log (design/0.8.0 §6.3: one resolver for PlanComplete and
+ * the rung). An id found before the bad line resolves as usual; one that is
+ * not is `missing`, with a detail naming the unreadable log — a verdict,
+ * never a raw throw, so PlanComplete audits the rejection like any other.
  */
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
@@ -88,6 +96,12 @@ export type VerifyEvidenceOptions = {
   /** Bracket-walk depth cap. Default 8. */
   readonly maxDepth?: number;
   readonly now?: () => Date;
+  /**
+   * Told once per session per call when its log could not be read to its
+   * end (provability's `SessionLogEvidenceOptions.onUnreadable` twin). The
+   * events read before the bad line are kept either way.
+   */
+  readonly onUnreadable?: (info: { readonly sessionId: string; readonly message: string }) => void;
 };
 
 function collapse(text: string, maxChars: number): string {
@@ -110,6 +124,9 @@ type SessionScan = {
   readonly toolUse?: { readonly name: string; readonly input: unknown };
   readonly toolResult?: { readonly content: unknown; readonly isError: boolean };
   readonly childSessionIds: readonly string[];
+  /** Why the log could not be read to its end; the fields above hold what
+   *  was read before that point. */
+  readonly unreadable?: string;
 };
 
 async function scanSession(
@@ -121,29 +138,48 @@ async function scanSession(
   let toolUse: SessionScan["toolUse"];
   let toolResult: SessionScan["toolResult"];
   const childSessionIds: string[] = [];
-  for await (const ev of log.read()) {
-    if (ev.kind === "tool_use") {
-      const p = ev.payload as { id?: unknown; name?: unknown; input?: unknown };
-      if (p.id === toolUseId) {
-        toolUse = { name: typeof p.name === "string" ? p.name : "unknown", input: p.input };
-      }
-    } else if (ev.kind === "tool_result") {
-      const p = ev.payload as { toolUseId?: unknown; content?: unknown; isError?: unknown };
-      if (p.toolUseId === toolUseId) {
-        toolResult = { content: p.content, isError: p.isError === true };
-      }
-    } else if (ev.kind === "sub_agent_start") {
-      const p = ev.payload as { childSessionId?: unknown };
-      if (typeof p.childSessionId === "string" && SESSION_ID_REGEX.test(p.childSessionId)) {
-        childSessionIds.push(p.childSessionId);
+  let unreadable: string | undefined;
+  try {
+    for await (const ev of log.read()) {
+      // A payload-less line carries nothing to resolve: skip it, as the
+      // `checked` rung does, rather than stop reading at it.
+      if (ev.kind === "tool_use") {
+        const p = (ev.payload ?? {}) as { id?: unknown; name?: unknown; input?: unknown };
+        if (p.id === toolUseId) {
+          toolUse = { name: typeof p.name === "string" ? p.name : "unknown", input: p.input };
+        }
+      } else if (ev.kind === "tool_result") {
+        const p = (ev.payload ?? {}) as {
+          toolUseId?: unknown;
+          content?: unknown;
+          isError?: unknown;
+        };
+        if (p.toolUseId === toolUseId) {
+          toolResult = { content: p.content, isError: p.isError === true };
+        }
+      } else if (ev.kind === "sub_agent_start") {
+        const p = (ev.payload ?? {}) as { childSessionId?: unknown };
+        if (typeof p.childSessionId === "string" && SESSION_ID_REGEX.test(p.childSessionId)) {
+          childSessionIds.push(p.childSessionId);
+        }
       }
     }
+  } catch (err) {
+    // `@crewhaus/event-log` throws at the first malformed line (a crash
+    // mid-append leaves a torn one) and refuses a link at the log's name.
+    // Keep what was read before it: fewer events fails closed — the id is
+    // `missing` unless it resolved before the bad line — where a throw
+    // escaped PlanComplete as a raw RuntimeError with no `action_proof`,
+    // and disagreed with the `checked` rung on the same log (§6.3).
+    unreadable = err instanceof Error ? err.message : String(err);
+  } finally {
+    await log.close();
   }
-  await log.close();
   return {
     ...(toolUse !== undefined ? { toolUse } : {}),
     ...(toolResult !== undefined ? { toolResult } : {}),
     childSessionIds,
+    ...(unreadable !== undefined ? { unreadable } : {}),
   };
 }
 
@@ -151,7 +187,9 @@ async function scanSession(
  * Resolve each ref against the session logs WITHOUT throwing — one verdict
  * per ref, in input order. `verifyEvidence` is the throwing wrapper the
  * `proven` transition uses; this form exists so callers can audit rejected
- * attempts (`action_proof` events with `verdict: "missing"`).
+ * attempts (`action_proof` events with `verdict: "missing"`). A log that
+ * cannot be read to its end is read up to the bad line (see the module
+ * docblock) and reported through `opts.onUnreadable`.
  */
 export async function resolveEvidence(
   refs: readonly EvidenceRef[],
@@ -161,6 +199,7 @@ export async function resolveEvidence(
   const maxDepth = opts.maxDepth ?? DEFAULT_MAX_DEPTH;
   const now = opts.now ?? (() => new Date());
   const resolutions: EvidenceResolution[] = [];
+  const reportedUnreadable = new Set<string>();
 
   for (const ref of refs) {
     const rootSession = ref.sessionId ?? opts.defaultSessionId;
@@ -187,11 +226,21 @@ export async function resolveEvidence(
     ];
     const visited = new Set<string>();
     let resolution: EvidenceResolution | undefined;
+    // The first log on this ref's walk that could not be read to its end.
+    let unreadable: { readonly sessionId: string; readonly message: string } | undefined;
     while (queue.length > 0 && resolution === undefined) {
       const item = queue.shift() as { sessionId: string; depth: number };
       if (visited.has(item.sessionId)) continue;
       visited.add(item.sessionId);
       const scan = await scanSession(item.sessionId, ref.toolUseId, sessionRootDir);
+      if (scan.unreadable !== undefined) {
+        const info = { sessionId: item.sessionId, message: scan.unreadable };
+        unreadable ??= info;
+        if (!reportedUnreadable.has(item.sessionId)) {
+          reportedUnreadable.add(item.sessionId);
+          opts.onUnreadable?.(info);
+        }
+      }
       if (scan.toolUse !== undefined && scan.toolResult !== undefined) {
         if (scan.toolResult.isError) {
           resolution = {
@@ -227,7 +276,10 @@ export async function resolveEvidence(
       resolution ?? {
         ref,
         verdict: "missing",
-        detail: `no verified evidence for ${ref.toolUseId}: run the action first, then complete the step with its toolUseId.`,
+        detail:
+          unreadable !== undefined
+            ? `no verified evidence for ${ref.toolUseId}: the session log ${unreadable.sessionId} could not be read to its end (${unreadable.message}), and ${ref.toolUseId} does not resolve before that point. Run the action again, then complete the step with the new toolUseId.`
+            : `no verified evidence for ${ref.toolUseId}: run the action first, then complete the step with its toolUseId.`,
       },
     );
   }

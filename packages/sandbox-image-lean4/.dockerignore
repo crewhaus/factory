@@ -1,0 +1,3 @@
+# The image is built from release downloads alone (see Dockerfile); nothing in
+# this checkout belongs in it, so the build context is empty.
+*

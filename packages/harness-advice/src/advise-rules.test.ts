@@ -10,6 +10,7 @@ import { validatePatch } from "@crewhaus/spec-patch";
 import {
   type AdviceFinding,
   LOOP_NUDGE_PREFIX,
+  PROVABILITY_NEVER_LOWER,
   type SessionEvents,
   type WatchmeAdviceSlice,
   buildAdviceContext,
@@ -29,6 +30,7 @@ import {
   rulePoolCandidateDemotion,
   rulePoolPolicyUpgrade,
   rulePoolStaleExploitation,
+  ruleProvabilityPressure,
   ruleRepeatedToolFailures,
   ruleStopReasonAnomalies,
   ruleSubAgentSplit,
@@ -37,6 +39,7 @@ import {
   runAdviceRules,
   subAgentFragment,
   taxonomyPatternTooBroad,
+  withProvabilityBundles,
 } from "./advise-rules";
 
 const SESSION_A = "sess_00000000000000aa";
@@ -1479,5 +1482,375 @@ describe("rulePolicyFlipReady", () => {
       [arm("hard", "claude-opus-4-1", 200, 0.95), arm("hard", "claude-haiku-4-5", 200, 0.3)],
     );
     expect(rulePolicyFlipReady(ctx, { spec: learned })).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.8.0 §9.3 — ruleProvabilityPressure.
+// ---------------------------------------------------------------------------
+
+/** One `provability_graded` line as runtime-core's gate writes it. */
+function gradedLine(
+  turnNumber: number,
+  verdict: "pass" | "fail" | "unverified",
+  retryIndex = 0,
+  extra: Record<string, unknown> = {},
+): unknown {
+  return line("provability_graded", {
+    level: "grounded",
+    verdict,
+    score: verdict === "pass" ? 1 : 0,
+    threshold: 1,
+    achieved: verdict === "pass" ? "grounded" : "cited",
+    claims: 2,
+    met: verdict === "pass" ? 2 : 0,
+    unmet: verdict === "pass" ? 0 : 2,
+    assumptions: 0,
+    retryIndex,
+    maxRetries: 1,
+    turnNumber,
+    bundleHash: `sha256:${turnNumber}-${retryIndex}`,
+    bundlePath: `/proofs/sess/turn-${turnNumber}.json`,
+    ...extra,
+  });
+}
+
+/**
+ * `failing` turns that fail, are retried once, and fail again; `passing`
+ * turns that pass first time. One session.
+ */
+function gatedSession(failing: number, passing: number, extra: Record<string, unknown> = {}) {
+  const lines: unknown[] = [];
+  let turn = 1;
+  for (let i = 0; i < failing; i++, turn++) {
+    lines.push(gradedLine(turn, "fail", 0, extra), gradedLine(turn, "fail", 1, extra));
+  }
+  for (let i = 0; i < passing; i++, turn++) lines.push(gradedLine(turn, "pass", 0, extra));
+  return session(SESSION_A, lines);
+}
+
+/** A failing bundle whose claims fell short for `reasons` (one claim each). */
+function failingBundle(...reasons: string[]): unknown {
+  return {
+    version: 1,
+    verdict: "fail",
+    claims: reasons.map((reason, index) =>
+      reason === "no_citation"
+        ? { index, text: "x", status: "unmet", best: "none", bindings: [] }
+        : {
+            index,
+            text: "x",
+            status: "unmet",
+            best: "cited",
+            bindings: [{ ref: "[1]", kind: "source", rung: "cited", ok: false, reason }],
+          },
+    ),
+  };
+}
+
+const provabilitySpec = (block: string): Spec =>
+  parseSpec(
+    [
+      "name: support",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: answer from the policy",
+      "tools: [WebFetch]",
+      block,
+    ].join("\n"),
+  );
+
+describe("buildAdviceContext — the provability slice", () => {
+  it("folds each turn's STANDING pass: retried failures, first-time passes, the cap and the paths", () => {
+    const ctx = buildAdviceContext([gatedSession(2, 3)]);
+    expect(ctx.provability).toMatchObject({
+      gatedTurns: 5,
+      failedTurns: 2,
+      unverifiedTurns: 0,
+      retries: 2,
+      maxRetries: 1,
+      failingBundlePaths: ["/proofs/sess/turn-1.json", "/proofs/sess/turn-2.json"],
+    });
+    expect([...(ctx.provability?.levels ?? [])]).toEqual([["grounded", 5]]);
+  });
+
+  it("a turn that fails and then PASSES its retry ends passing", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [gradedLine(1, "fail", 0), gradedLine(1, "pass", 1)]),
+    ]);
+    expect(ctx.provability).toMatchObject({ gatedTurns: 1, failedTurns: 0, retries: 1 });
+  });
+
+  it("turns are keyed per session, and unverified passes are not failures", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [gradedLine(1, "fail"), gradedLine(2, "unverified")]),
+      session(SESSION_B, [gradedLine(1, "pass")]),
+    ]);
+    expect(ctx.provability).toMatchObject({ gatedTurns: 3, failedTurns: 1, unverifiedTurns: 1 });
+  });
+
+  it("reads a line's own unmetReasons record when one is carried, tolerantly", () => {
+    const ctx = buildAdviceContext([
+      session(SESSION_A, [
+        gradedLine(1, "fail", 0, { unmetReasons: { not_fetched: 2, junk: "x", neg: -1 } }),
+      ]),
+    ]);
+    expect([...(ctx.provability?.unmetReasons ?? [])]).toEqual([["not_fetched", 2]]);
+  });
+
+  it("is absent on logs without the kind (old vintage) and ignores malformed lines", () => {
+    expect(buildAdviceContext([session(SESSION_A, OLD_VINTAGE)]).provability).toBeUndefined();
+    expect(
+      buildAdviceContext([
+        session(SESSION_A, [
+          line("provability_graded", { verdict: "fail" }),
+          line("provability_graded", null),
+        ]),
+      ]).provability,
+    ).toBeUndefined();
+  });
+});
+
+describe("withProvabilityBundles", () => {
+  it("tallies each unmet claim's reasons from the bundles, skipping junk", () => {
+    const ctx = withProvabilityBundles(buildAdviceContext([gatedSession(1, 0)]), [
+      failingBundle("not_fetched", "not_fetched", "no_citation"),
+      null,
+      "nope",
+      { claims: "x" },
+      { claims: [{ status: "unmet" }, { status: "met", bindings: [] }] },
+    ]);
+    expect(Object.fromEntries(ctx.provability?.unmetReasons ?? [])).toEqual({
+      not_fetched: 2,
+      no_citation: 1,
+    });
+  });
+
+  it("is the identity without a provability slice or bundles", () => {
+    const quiet = buildAdviceContext([session(SESSION_A, OLD_VINTAGE)]);
+    expect(withProvabilityBundles(quiet, [failingBundle("not_fetched")])).toBe(quiet);
+    const gated = buildAdviceContext([gatedSession(1, 0)]);
+    expect(withProvabilityBundles(gated, [])).toBe(gated);
+  });
+});
+
+describe("ruleProvabilityPressure", () => {
+  const OBJECT_SPEC = provabilitySpec("provability:\n  level: grounded\n  max_retries: 1");
+
+  it("fires at ≥20% of gated turns ending failing, with a whitelisted max_retries patch", () => {
+    const ctx = withProvabilityBundles(buildAdviceContext([gatedSession(2, 8)]), [
+      failingBundle("not_fetched", "not_fetched"),
+      failingBundle("not_fetched", "no_citation"),
+    ]);
+    const findings = ruleProvabilityPressure(ctx, { spec: OBJECT_SPEC });
+    expect(findings).toHaveLength(1);
+    const f = findings[0] as AdviceFinding;
+    expect(f).toMatchObject({ id: "provability-pressure", severity: "warn" });
+    expect(f.summary).toContain("2/10 gated turns ended failing the grounded floor");
+    expect(f.counts).toMatchObject({ gatedTurns: 10, failedTurns: 2, dominantReasonClaims: 3 });
+    expect(f.suggestion.kind).toBe("spec-patch");
+    if (f.suggestion.kind !== "spec-patch") throw new Error("expected a patch");
+    const patch = f.suggestion.patch;
+    expect(patch).toMatchObject({
+      path: ["provability", "max_retries"],
+      op: "replace",
+      value: 2,
+    });
+    expect(() => validatePatch(OBJECT_SPEC, patch)).not.toThrow();
+    // The reason-keyed advice rides the evidence and the patch rationale.
+    expect(f.evidence.join("\n")).toContain("Dominant unmet reason: not_fetched (3 claims)");
+    expect(f.evidence.join("\n")).toContain("fetch- or read-capable tool");
+    expect(patch.rationale).toContain("not_fetched");
+    expect(f.evidence).toContain(PROVABILITY_NEVER_LOWER);
+  });
+
+  it("an undeclared max_retries is ADDED at the default cap + 1", () => {
+    const spec = provabilitySpec("provability:\n  level: grounded\n  threshold: 1");
+    const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(5, 0)]), { spec });
+    expect(f?.suggestion.kind === "spec-patch" && f.suggestion.patch).toMatchObject({
+      op: "add",
+      value: 2,
+    });
+  });
+
+  it("keys the advice to whichever reason dominates", () => {
+    for (const [reason, phrase] of [
+      ["no_citation", "cite every claim"],
+      ["value_absent", "copying values from the tool result"],
+      ["proof_missing", "ProofCheck"],
+      ["host_denied", "that allowlist is policy"],
+    ] as const) {
+      const ctx = withProvabilityBundles(buildAdviceContext([gatedSession(3, 2)]), [
+        failingBundle(reason, reason),
+        failingBundle("not_found_in_source"),
+      ]);
+      const [f] = ruleProvabilityPressure(ctx, { spec: OBJECT_SPEC });
+      expect(f?.evidence.join("\n")).toContain(`Dominant unmet reason: ${reason}`);
+      expect(f?.evidence.join("\n")).toContain(phrase);
+    }
+  });
+
+  it("NEVER suggests lowering level — and says why — whatever the inputs", () => {
+    const cases: Array<[AdviceFinding[]]> = [
+      [ruleProvabilityPressure(buildAdviceContext([gatedSession(10, 0)]), { spec: OBJECT_SPEC })],
+      [ruleProvabilityPressure(buildAdviceContext([gatedSession(10, 0)]))],
+      [
+        ruleProvabilityPressure(buildAdviceContext([gatedSession(10, 0)]), {
+          spec: provabilitySpec("provability: proven"),
+        }),
+      ],
+    ];
+    for (const [findings] of cases) {
+      const f = findings[0] as AdviceFinding;
+      if (f.suggestion.kind === "spec-patch") {
+        expect(f.suggestion.patch.path).not.toContain("level");
+      } else {
+        expect(f.suggestion.text).toContain(PROVABILITY_NEVER_LOWER);
+        expect(f.suggestion.text).not.toMatch(/level: (cited|grounded|checked)\b/);
+      }
+      expect(f.evidence).toContain(PROVABILITY_NEVER_LOWER);
+    }
+    expect(PROVABILITY_NEVER_LOWER).toContain("never suggested");
+  });
+
+  it("the string shorthand has no key to patch: advice says how to expand it", () => {
+    const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 1)]), {
+      spec: provabilitySpec("provability: grounded"),
+    });
+    expect(f?.suggestion.kind).toBe("advice");
+    expect(f?.suggestion.kind === "advice" && f.suggestion.text).toContain(
+      "provability: { level: grounded, max_retries: 2 }",
+    );
+  });
+
+  it("on_fail note/halt never re-runs: advice only, saying max_retries moves nothing", () => {
+    for (const onFail of ["note", "halt"]) {
+      const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 1)]), {
+        spec: provabilitySpec(`provability:\n  level: grounded\n  on_fail: ${onFail}`),
+      });
+      expect(f?.suggestion.kind).toBe("advice");
+      expect(f?.suggestion.kind === "advice" && f.suggestion.text).toContain(
+        `on_fail is ${onFail}`,
+      );
+    }
+  });
+
+  it("a cap already at the schema's 5 is advice, not a patch", () => {
+    const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 1)]), {
+      spec: provabilitySpec("provability:\n  level: grounded\n  max_retries: 5"),
+    });
+    expect(f?.suggestion.kind).toBe("advice");
+    expect(f?.suggestion.kind === "advice" && f.suggestion.text).toContain("already at its cap");
+  });
+
+  it("without a spec (or reasons) it still fires, as advice", () => {
+    const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 1)]));
+    expect(f?.suggestion.kind).toBe("advice");
+    expect(f?.suggestion.kind === "advice" && f.suggestion.text).toContain(
+      "crewhaus provability audit",
+    );
+  });
+
+  it("stays silent below 20%, below the turn floor, and on logs without the kind", () => {
+    // 1 of 6 = 16.7% — under the bar.
+    expect(
+      ruleProvabilityPressure(buildAdviceContext([gatedSession(1, 5)]), { spec: OBJECT_SPEC }),
+    ).toEqual([]);
+    // 1 of 5 = 20% — exactly at the bar fires.
+    expect(
+      ruleProvabilityPressure(buildAdviceContext([gatedSession(1, 4)]), { spec: OBJECT_SPEC }),
+    ).toHaveLength(1);
+    // 4 of 4 — but under the 5-turn floor.
+    expect(
+      ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 0)]), { spec: OBJECT_SPEC }),
+    ).toEqual([]);
+    // Old vintage: no slice at all.
+    expect(ruleProvabilityPressure(buildAdviceContext([session(SESSION_A, OLD_VINTAGE)]))).toEqual(
+      [],
+    );
+    // Thresholds are tunable like every rule's.
+    expect(
+      ruleProvabilityPressure(buildAdviceContext([gatedSession(1, 5)]), {
+        spec: OBJECT_SPEC,
+        thresholds: { provabilityFailRate: 0.1 },
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("divides by VERIFIED turns: a verifier that mostly throws cannot dilute the fail rate (review W3-C2)", () => {
+    // 5 verified turns, 1 failing (20%) + 20 unverified: over all 25 turns
+    // the rate would read 4% and stay silent.
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 20; turn++) lines.push(gradedLine(turn, "unverified"));
+    lines.push(gradedLine(21, "fail"));
+    for (let turn = 22; turn <= 25; turn++) lines.push(gradedLine(turn, "pass"));
+    const findings = ruleProvabilityPressure(buildAdviceContext([session(SESSION_A, lines)]), {
+      spec: OBJECT_SPEC,
+    });
+    const pressure = findings.find((f) => f.id === "provability-pressure");
+    expect(pressure?.summary).toContain("1/5 gated turns ended failing");
+    expect(pressure?.counts).toMatchObject({
+      gatedTurns: 25,
+      verifiedTurns: 5,
+      unverifiedTurns: 20,
+      failedTurns: 1,
+    });
+    // …and the broken verifier is a finding of its own.
+    const unverified = findings.find((f) => f.id === "provability-unverified");
+    expect(unverified).toMatchObject({ severity: "warn", suggestion: { kind: "advice" } });
+    expect(unverified?.summary).toContain("20/25 gated turns stood UNVERIFIED");
+    expect(unverified?.evidence).toContain(PROVABILITY_NEVER_LOWER);
+  });
+
+  it("9 unverified + 1 failing: no pressure verdict on one verified turn, but the verifier finding fires", () => {
+    const lines: unknown[] = [];
+    for (let turn = 1; turn <= 9; turn++) lines.push(gradedLine(turn, "unverified"));
+    lines.push(gradedLine(10, "fail"));
+    const findings = ruleProvabilityPressure(buildAdviceContext([session(SESSION_A, lines)]), {
+      spec: OBJECT_SPEC,
+    });
+    expect(findings.map((f) => f.id)).toEqual(["provability-unverified"]);
+  });
+
+  it("unverified turns under the share stay out of the findings", () => {
+    const lines: unknown[] = [gradedLine(1, "unverified")];
+    for (let turn = 2; turn <= 10; turn++) lines.push(gradedLine(turn, "pass"));
+    expect(
+      ruleProvabilityPressure(buildAdviceContext([session(SESSION_A, lines)]), {
+        spec: OBJECT_SPEC,
+      }),
+    ).toEqual([]);
+  });
+
+  it("research: the report gate never re-runs, so max_retries is never proposed (review W3-C2)", () => {
+    const research = parseSpec(
+      [
+        "name: brief",
+        "target: research",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: research the question",
+        "goal: answer the question",
+        "provability:",
+        "  level: grounded",
+        "  max_retries: 1",
+      ].join("\n"),
+    );
+    const [f] = ruleProvabilityPressure(buildAdviceContext([gatedSession(4, 1)]), {
+      spec: research,
+    });
+    expect(f?.suggestion.kind).toBe("advice");
+    const text = f?.suggestion.kind === "advice" ? f.suggestion.text : "";
+    expect(text).not.toContain("raise provability.max_retries");
+    expect(text).toContain("max_retries is not a dial here");
+    expect(text).toContain(PROVABILITY_NEVER_LOWER);
+  });
+
+  it("is appended to ADVICE_RULES and ranks through runAdviceRules", () => {
+    const findings = runAdviceRules(buildAdviceContext([gatedSession(3, 2)]), {
+      spec: OBJECT_SPEC,
+    });
+    expect(findings.map((f) => f.id)).toEqual(["provability-pressure"]);
   });
 });

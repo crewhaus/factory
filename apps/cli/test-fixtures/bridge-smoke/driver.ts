@@ -16,8 +16,13 @@
  *              history-less AND history-carrying (the resume path);
  *   managed  — createBridgeInvoker over the gateway's runOneTurn dispatcher,
  *              history-less AND history-carrying (extraOptions.seedMessages).
+ *   channel-proof — a full runEval over a GATED channel bot (`provability:`)
+ *              through the same invoker, graded by provability.claimCoverage:
+ *              the bot's runTurn keeps its trace events on its own bus, so
+ *              the standing bundle reaches the graders through the session
+ *              log the gate wrote into the sample directory.
  */
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
@@ -69,13 +74,45 @@ function scriptedAdapter(prefix: string): ProviderAdapter {
   };
 }
 
+/** A provider that answers every call with `text`, whatever it was asked. */
+function fixedAdapter(text: string): ProviderAdapter {
+  return {
+    providerId: "anthropic",
+    features: {
+      caching: "explicit",
+      tool_use: true,
+      vision: true,
+      thinking: true,
+      web_search: true,
+    },
+    estimateTokens: () => 0,
+    stream: () =>
+      (async function* () {
+        yield { kind: "message_start" } as StreamEvent;
+        yield {
+          kind: "content_block_start",
+          index: 0,
+          block: { type: "text", text: "" },
+        } as StreamEvent;
+        yield {
+          kind: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        } as StreamEvent;
+        yield { kind: "content_block_stop", index: 0 } as StreamEvent;
+        yield { kind: "message_delta", stopReason: "end_turn" } as StreamEvent;
+        yield { kind: "message_stop" } as StreamEvent;
+      })(),
+  };
+}
+
 type RunForEvalFn = (input: string, opts?: Record<string, unknown>) => Promise<string>;
 
 const mode = process.argv[2];
 const bundleDir = process.argv[3];
 if (mode === undefined || bundleDir === undefined) {
   throw new Error(
-    "usage: bun driver.ts <workflow|graph|crew|pipeline|channel|managed> <bundleDir>",
+    "usage: bun driver.ts <workflow|graph|crew|pipeline|channel|managed|channel-proof> <bundleDir>",
   );
 }
 
@@ -313,6 +350,68 @@ if (mode === "workflow") {
   result["historyFiles"] = readdirSync(histDir).sort();
   result["historySessionId"] = histCtx.sessionId;
   result["historyUserMessages"] = transcriptUserMessages(histDir, histCtx.sessionId);
+} else if (mode === "channel-proof") {
+  // A gated channel bot evaluated through the bridge: the sample's standing
+  // proof bundle must reach proof.json and the provability.* graders.
+  const entry = (await import(join(bundleDir, "eval-entry.ts"))) as Record<string, unknown>;
+  const bridge = {
+    sourceTarget: "channel",
+    kind: "channel-resume-turn",
+    chatCapable: true,
+    entryImport: "../eval-entry.ts",
+  } as const;
+  const answer = "The refund window is 14 days [1].\n\n[1]: https://acme.example/policy";
+  const { compiled } = parseGradersConfig(
+    "graders:\n  - name: coverage\n    type: registry\n    grader: provability.claimCoverage\n",
+  );
+  const ir: IrV0 = {
+    version: 0,
+    name: "support-bot",
+    target: "cli",
+    agent: { model: "claude-sonnet-4-6", instructions: "(bridge descriptor)" },
+    tools: [],
+    toolConfigs: {},
+    mcp_servers: {},
+    permissions: { rules: [] },
+    subAgents: [],
+    compaction: {},
+  };
+  const evalOut = mkdtempSync(join(tmpdir(), "chan-proof-eval-"));
+  const summary = await runEval({
+    ir,
+    dataset: {
+      name: "chan-proof",
+      samples: (async function* () {
+        yield { id: "a", input: "what is the refund window?" };
+      })(),
+    },
+    compiledGraders: compiled,
+    opts: {
+      invoker: createBridgeInvoker(bridge, entry, { _adapter: fixedAdapter(answer) }),
+      outDir: evalOut,
+      concurrency: 1,
+    },
+  });
+  const sampleDir = join(evalOut, "a");
+  result["files"] = readdirSync(sampleDir).sort();
+  result["passRate"] = summary.aggregates.passRate;
+  result["agentOutput"] = summary.samples[0]?.agentOutput;
+  const coverage = summary.samples[0]?.grades.perGrader.find((g) => g.name === "coverage");
+  result["coverage"] =
+    coverage === undefined
+      ? null
+      : { passed: coverage.passed, score: coverage.score, rationale: coverage.rationale };
+  const proofPath = join(sampleDir, "proof.json");
+  result["proof"] = existsSync(proofPath)
+    ? (() => {
+        const p = JSON.parse(readFileSync(proofPath, "utf-8")) as {
+          level: string;
+          verdict: string;
+          met: number;
+        };
+        return { level: p.level, verdict: p.verdict, met: p.met };
+      })()
+    : null;
 } else {
   throw new Error(`unknown mode "${mode}"`);
 }

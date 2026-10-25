@@ -1421,6 +1421,27 @@ describe("crewhaus doctor", () => {
     expect(result.stdout).toContain("~ Bedrock (AWS) credentials");
   }, 20_000);
 
+  // 0.8.0 §11 — healthchecking a checker image on docker pulls it when it is
+  // not local, so the proof-checker probe is a --probe check; a plain doctor
+  // says it did not run. CREWHAUS_SANDBOX=noop keeps both runs container-free.
+  test("the proof-checker probe runs under --probe only; plain doctor says so", async () => {
+    writeFileSync(
+      join(tmp, "crewhaus.yaml"),
+      "name: t\ntarget: cli\nagent:\n  model: claude-opus-5\n  instructions: hi\nprovability:\n  level: proven\n  formal:\n    checkers: [builtin, smt]\n",
+    );
+    const env = { CREWHAUS_SANDBOX: "noop" };
+    const plain = await runCli(["doctor"], { cwd: tmp, env });
+    expect(plain.stdout).toContain(
+      "~ provability checker smt: not probed — `crewhaus doctor --probe` runs each checker image's healthcheck",
+    );
+    expect(plain.stdout).not.toContain("✓ provability checker builtin");
+    const probed = await runCli(["doctor", "--probe"], { cwd: tmp, env });
+    expect(probed.stdout).toContain("~ provability checker smt (");
+    expect(probed.stdout).toContain("claims at proven fall back to the builtin checker");
+    expect(probed.stdout).toContain("✓ provability checker builtin");
+    expect(probed.stdout).not.toContain("not probed");
+  }, 30_000);
+
   test("doctor --help documents --liveness and the model-aware checks", async () => {
     const result = await runCli(["doctor", "--help"], { cwd: tmp, env: {} });
     expect(result.exitCode).toBe(0);
@@ -3525,6 +3546,79 @@ describe("crewhaus compile --emit-as cf-worker (item 6)", () => {
     ]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("cannot combine with --check");
+  }, 20_000);
+
+  // 0.8.0 §1, §3 (review I40) — the edge runs no provability gate: a spec
+  // that declares one is told so, and --strict refuses to ship the worker.
+  test("a provability: block is an accepted-but-unwired warning, and --strict writes nothing", async () => {
+    const spec = join(tmp, "gated.yaml");
+    writeFileSync(
+      spec,
+      "name: gated\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [webFetch]\nprovability: { level: grounded }\n",
+    );
+    const out = join(tmp, "edge");
+    const loose = await runCli([
+      "compile",
+      spec,
+      "-o",
+      out,
+      "--emit-as",
+      "cf-worker",
+      "--no-register",
+    ]);
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain("warning[accepted-but-unwired] provability:");
+    expect(loose.stderr).toContain("the worker serves every answer ungated");
+    const strictOut = join(tmp, "edge-strict");
+    const strict = await runCli([
+      "compile",
+      spec,
+      "-o",
+      strictOut,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    expect(existsSync(join(strictOut, "worker.js"))).toBe(false);
+  }, 20_000);
+
+  // §3 — a parked block (level: off with other keys) is warned on the edge
+  // path as on the local one: the lowering's warnings ride along, and
+  // --strict fails on them before a file is written.
+  test("a parked provability block is warned, and fails --strict, as on the local compile", async () => {
+    const spec = join(tmp, "parked.yaml");
+    writeFileSync(
+      spec,
+      "name: parked\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [webFetch]\nprovability: { level: off, threshold: 0.5 }\n",
+    );
+    const loose = await runCli([
+      "compile",
+      spec,
+      "-o",
+      join(tmp, "parked-edge"),
+      "--emit-as",
+      "cf-worker",
+      "--no-register",
+    ]);
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain("warning[provability-inert-block]");
+    const strictOut = join(tmp, "parked-strict");
+    const strict = await runCli([
+      "compile",
+      spec,
+      "-o",
+      strictOut,
+      "--emit-as",
+      "cf-worker",
+      "--strict",
+      "--no-register",
+    ]);
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("warning[provability-inert-block]");
+    expect(existsSync(join(strictOut, "worker.js"))).toBe(false);
   }, 20_000);
 
   test("--emit-as local is the default bundle (byte path unchanged)", async () => {

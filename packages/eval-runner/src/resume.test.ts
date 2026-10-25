@@ -134,6 +134,15 @@ describe("readRunManifest", () => {
     expect(readRunManifest(junk).routing).toBeUndefined();
   });
 
+  test("0.8.0 — reads back the --provability floor; a non-string is ignored", () => {
+    const runDir = newTempRoot();
+    writeManifest(runDir, { runId: "run_p", specHash: "sp", provability: "checked" });
+    expect(readRunManifest(runDir).provability).toBe("checked");
+    const junk = newTempRoot();
+    writeManifest(junk, { runId: "run_pj", specHash: "sp", provability: 3 });
+    expect(readRunManifest(junk).provability).toBeUndefined();
+  });
+
   test("refuses a directory that is not a run directory", () => {
     const runDir = newTempRoot();
     expect(() => readRunManifest(runDir)).toThrow(/no run\.json there/);
@@ -279,6 +288,25 @@ describe("resume identity guard", () => {
         { ...manifest, routing: { mode: "as-declared", armsDigest: "aaaa" } },
         { ...base, routing: { mode: "as-declared", armsDigest: "aaaa" } },
       ),
+    ).toEqual([]);
+  });
+
+  test("0.8.0 §9.1 — the --provability floor is part of the instrument, absent meaning the spec's", () => {
+    const base = { specHash: "sp", datasetHash: "ds", gradersHash: "gr" } as const;
+    expect(resumeMismatches(manifest, { ...base, provability: "grounded" })).toEqual([
+      "provability: (spec) (recorded) → grounded (this run)",
+    ]);
+    expect(resumeMismatches({ ...manifest, provability: "grounded" }, base)).toEqual([
+      "provability: grounded (recorded) → (spec) (this run)",
+    ]);
+    expect(
+      resumeMismatches(
+        { ...manifest, provability: "grounded" },
+        { ...base, provability: "checked" },
+      ),
+    ).toEqual(["provability: grounded (recorded) → checked (this run)"]);
+    expect(
+      resumeMismatches({ ...manifest, provability: "cited" }, { ...base, provability: "cited" }),
     ).toEqual([]);
   });
 

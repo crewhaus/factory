@@ -262,6 +262,26 @@ export type SubAgentContinuitySeam = {
 };
 
 /**
+ * 0.8.0 (design/0.8.0-provability-release.md §8) — the parent's provability
+ * gate as projected for children: READ-ONLY guidance, never a gate. A child
+ * learns the floor the parent's answer is held to and how to cite so the
+ * parent can carry its sources forward; only the PARENT's final text is
+ * verified (its evidence index already walks child session logs), and a
+ * child's return stays classified at `subagent` as before. The verifier, the
+ * retry policy and the bundle store are deliberately unrepresentable here.
+ */
+export type SubAgentProvabilitySeam = {
+  readonly level: "cited" | "grounded" | "checked" | "proven";
+  /**
+   * The rendered `provability` skill text, when the parent's wiring has one —
+   * written to the parent. The spawner shows a child only the parts true for
+   * it (`childProvabilityGuidance`): never what happens to a failing answer,
+   * and a provability tool only when the child's own tool set has it.
+   */
+  readonly skill?: string;
+};
+
+/**
  * Everything the spawner / Task tool needs from the parent runtime to start
  * a child. The runtime constructs one of these per-`runChatLoop` invocation
  * and passes it through `ToolExecuteContext.bridge`.
@@ -293,6 +313,8 @@ export type ParentRunHandle = {
   readonly skills?: ReadonlyArray<SkillRef>;
   readonly failureTaxonomy?: ReadonlyArray<NamedFailureClass>;
   readonly continuity?: SubAgentContinuitySeam;
+  /** 0.8.0 §8 — the parent's provability floor + guidance, read-only (see the type). */
+  readonly provability?: SubAgentProvabilitySeam;
   /**
    * Loop contract 0.4 (G11) — the parent's `permissions.ask_mode`, inherited
    * verbatim. A child loop is `singleTurn` with no readline, so its `ask`
@@ -378,6 +400,8 @@ export type ParentServedArm = {
  *     tool catalog, `maxTokens` when the child declares none, the recall-only
  *     memory seam, skills, the failure taxonomy, the read-only continuity seam,
  *     `askMode` and the approval store, and `sessionRootDir`;
+ *   - 0.8.0: the read-only provability seam (the floor and its guidance —
+ *     never the gate itself);
  *   - 0.7.1: whether a sandbox backend is wired (`sandboxAvailable`), since
  *     the child runs in the parent's process against the same backend; and
  *     the parent's justification judge and security audit sinks, so a
@@ -508,6 +532,18 @@ export type RuntimeBridge = ParentRunHandle & {
    * own. Optional — a bridge built elsewhere falls back to `model` alone.
    */
   readonly specModels?: ReadonlyArray<string>;
+  /**
+   * 0.8.0 (design §1 principle 1, §5.2) — the run's runtime-state roots:
+   * its session logs, spilled tool results and proof bundles, every way the
+   * runtime spells them (runtime-core's `runtimeStateRoots`). The permission
+   * floor denies a call that names a path inside one; a tool that writes
+   * beneath a directory it names (CopyPath, MovePath, RemovePath,
+   * ArchiveExtract, GitApplyPatch) reads them here to refuse a write that
+   * would land in one through a name the floor never sees
+   * (`@crewhaus/tool-safety/fs` `protectedRootsOf`). Optional — a bridge
+   * built elsewhere carries none, and the tools then rely on the floor.
+   */
+  readonly protectedRoots?: ReadonlyArray<string>;
 };
 
 /**
@@ -538,6 +574,7 @@ export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
     ...(bridge.skills !== undefined ? { skills: bridge.skills } : {}),
     ...(bridge.failureTaxonomy !== undefined ? { failureTaxonomy: bridge.failureTaxonomy } : {}),
     ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
+    ...(bridge.provability !== undefined ? { provability: bridge.provability } : {}),
     ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
     ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
     ...(bridge.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),

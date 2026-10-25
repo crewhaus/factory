@@ -29,8 +29,11 @@ import {
   type IrNode,
   SpecParseError,
   checkShapeTools,
+  collectCompileWarnings,
   compile,
   lower,
+  lowerWithWarnings,
+  provabilityOf,
   toolSitesOf,
 } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
@@ -260,6 +263,10 @@ import {
   runEval as runEvalCore,
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
+// 0.8.0 §4.4 — the in-loop gates' composition root: `gateRunOptions` (./loop-contract)
+// wires them; the proof tools join the run's tool list through this merge, and
+// the gate's `provability` skill joins the run's skill discovery (§11).
+import { mergeGateTools, provabilitySkills } from "@crewhaus/evaluation-service";
 import { openEventLog } from "@crewhaus/event-log";
 // Item 14 — `crewhaus advise` rule library (session-JSONL aggregation +
 // threshold rules + suggestions.json/report.html builders), in a
@@ -274,6 +281,7 @@ import {
   parseJsonlObjects as parseAdviseJsonl,
   renderAdviceHtml,
   runAdviceRules,
+  withProvabilityBundles,
 } from "@crewhaus/harness-advice/advise-rules";
 // Model-aware doctor credential checks (provider parsed from the cwd spec's
 // agent.model via the model-router grammar), in a side-effect-free module so
@@ -429,6 +437,12 @@ import {
 // `plugins:` (and the `--plugins` override) in-process exactly like a compiled
 // bundle's boot (`renderPlugins` in @crewhaus/target-cli).
 import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";
+// 0.8.0 §9.1 — `crewhaus eval --provability <level>` validates the rung here.
+import {
+  PROVABILITY_LEVELS,
+  type ProvabilityLevel,
+  isProvabilityLevel,
+} from "@crewhaus/provability";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
@@ -450,7 +464,12 @@ import {
 } from "@crewhaus/session-store";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
-import { type Spec, parseSpec } from "@crewhaus/spec";
+import {
+  type Spec,
+  type SpecProvabilityBlock,
+  parseSpec,
+  provabilityLevelOf,
+} from "@crewhaus/spec";
 // Item 43 — `crewhaus upgrade`: single-spec version-drift detection + validated
 // migration chain, in a side-effect-free module so this entry file stays
 // testable.
@@ -603,6 +622,7 @@ import {
   PLUGINS_SCHEMA,
   PRICING_SCHEMA,
   PROPOSE_SCHEMA,
+  PROVABILITY_SCHEMA,
   RATE_SCHEMA,
   REDTEAM_SCHEMA,
   RETENTION_SCHEMA,
@@ -767,6 +787,14 @@ import {
 // v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
 // configured provider, catching unfunded/invalid keys before a long run.
 import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
+// 0.8.0 (design §10) — the three provability findings `doctor
+// --philosophy-alignment` gained, and (§11) the `crewhaus provability` verbs
+// plus doctor's proof-checker probe. Side-effect-free modules, unit-tested
+// without this entry file's argv switch.
+import { provabilityPhilosophyFindings } from "./doctor-provability";
+// 0.8.0 §11 — writes a verb awaits before its hard exit, so a pipe gets every
+// byte (`provability … --json | jq`), side-effect-free and subprocess-tested.
+import { drainedOutput } from "./drained-output";
 // v0.3.0 PR 14 — `crewhaus dream run|status|init` (design §6.3), in a
 // side-effect-free module; only the dispatch registration lives here.
 import { DREAM_CLI_SCHEMA, runDreamCommand } from "./dream-cli";
@@ -846,6 +874,9 @@ import {
 // C28 — `crewhaus eval plan`: the offline sample-size helper (pure
 // arithmetic + the pilot reader), in its own side-effect-free module.
 import { EvalPlanError, planSampleSize, renderEvalPlan } from "./eval-plan";
+// 0.8.0 §9.1 — the block `eval --provability <level>` measures when the spec
+// parks its provability: block at level: off (lowered to none otherwise).
+import { parkedProvabilityBlock } from "./eval-provability";
 // Item 30 — model-drift sentinel comparison logic, in a side-effect-free
 // module so it is unit-testable (this entry file runs an argv switch on
 // import). The fresh run + baseline load happen in index.ts; this decides drift.
@@ -1001,12 +1032,26 @@ import {
 import {
   HYBRID_INTERVIEW_QUESTION,
   type HybridPair,
+  InitProvabilityError,
+  type InitProvabilityLevel,
+  PROVABILITY_LEVEL_LINES,
+  RESEARCH_DEFAULT_PROVABILITY,
   type ScriptedAnswers,
   type ScriptedShape,
+  askProvability,
   buildHybridSpec,
   buildScriptedSpec,
+  carriesProvability,
   isHybridYes,
   isScriptedShape,
+  parseProvabilityFlag,
+  provabilityAnswer,
+  provabilityScaffoldNotes,
+  provabilityScaffoldTools,
+  provabilityShapeRefusal,
+  renderProvabilityBlock,
+  renderProvabilityToolsBlock,
+  setProvability,
 } from "./init-interactive";
 // Item 67 — `crewhaus intents`: cluster user_message inputs across sessions +
 // rank by frequency / satisfaction / failure. Side-effect-free (this entry file
@@ -1112,8 +1157,8 @@ import {
 import {
   type AskMode,
   VALID_ASK_MODES,
-  evaluationRunOptions,
   formatCompileWarning,
+  gateRunOptions,
   isValidAskMode,
   loopContractRunOptions,
   mergeSpecHooks,
@@ -1279,6 +1324,12 @@ import {
   buildProposalAuditPayload,
   buildProposalPrPlan,
 } from "./propose";
+import {
+  ProvabilityCliError,
+  irToolKeys,
+  provabilityDoctorChecks,
+  runProvabilityCommand,
+} from "./provability-cli";
 import { redactInTurn } from "./redact-in-turn";
 // E49 — `crewhaus redteam generate|report`: the behaviour-taxonomy attack
 // generator (deterministic + offline; attack strings composed from inert
@@ -2118,10 +2169,19 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // the Worker applies), and any emitter refusal (an unsupported target, a
     // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
     try {
-      const cfIr = lower(parseSpec(yamlText));
+      const cfSpec = parseSpec(yamlText);
+      // Lowered with its warnings, as compile() lowers: a parked
+      // `provability: { level: off, … }` block (provability-inert-block) or
+      // any other lowering notice is said here too, and --strict fails on it
+      // on the edge path exactly as on the local one.
+      const cfLowered = lowerWithWarnings(cfSpec);
+      const emitted = emitCfWorkerBundle(cfLowered.ir, { readme });
       // Warnings ride along like compile()'s: printed below, and escalated by
       // --strict before any file is written.
-      bundle = emitCfWorkerBundle(cfIr, { readme });
+      bundle = {
+        ...emitted,
+        warnings: [...collectCompileWarnings(cfSpec), ...cfLowered.warnings, ...emitted.warnings],
+      };
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;
@@ -2650,10 +2710,60 @@ function chooseHybridPair(seedModel: string): HybridPair {
   return { fast: "claude-haiku-4-5", strong: "claude-opus-5" };
 }
 
+/**
+ * 0.8.0 §11 — `init --provability <rung>`, validated: undefined when the flag
+ * is absent, a clean exit naming every rung when it is not one.
+ */
+function initProvabilityFlag(args: ParsedArgs): InitProvabilityLevel | undefined {
+  const value = strFlag(args, "provability");
+  if (value === undefined) return undefined;
+  try {
+    return parseProvabilityFlag(value);
+  } catch (err) {
+    if (err instanceof InitProvabilityError) die(err.message);
+    throw err;
+  }
+}
+
+/**
+ * 0.8.0 §11 — after a scaffold declares a proof floor: the rung in one line,
+ * then anything it still needs, in `crewhaus lint`'s words (a source-reading
+ * tool at grounded, an allowlisted tool at checked) — so the first run does
+ * not fail every answer for a reason init could have named.
+ */
+function writeProvabilityNotes(yamlText: string, level: InitProvabilityLevel): void {
+  const line = PROVABILITY_LEVEL_LINES.find((l) => l.level === level)?.line ?? "";
+  if (level === "off") {
+    process.stdout.write(`provability: off — ${line} (absent is off, so nothing was written)\n`);
+    return;
+  }
+  process.stdout.write(
+    `provability: ${level} — ${line}. After a run, \`crewhaus provability show\` renders an answer's proof.\n`,
+  );
+  // The TEXT, not a parsed spec: the plain scaffold is written unvalidated
+  // (`init ./bot` writes a name `parseSpec` refuses), and these notes are
+  // advisory — the parse belongs inside their guard, never ahead of it.
+  for (const note of provabilityScaffoldNotes(yamlText)) {
+    process.stdout.write(`  note: ${note}\n`);
+  }
+}
+
+/**
+ * 0.8.0 §11 — what `init --provability <rung>` appends to the plain scaffold:
+ * the tool the rung needs to be reachable (a source reader at grounded, an
+ * allowlisted tool at checked — `renderProvabilityToolsBlock`), set off by a
+ * blank line, then the commented block.
+ */
+function scaffoldProvabilitySection(level: InitProvabilityLevel): string {
+  const tools = renderProvabilityToolsBlock(level);
+  return `${tools}${tools !== "" ? "\n" : ""}${renderProvabilityBlock(level)}`;
+}
+
 function runInit(args: ParsedArgs): void {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init [name] [--ci] [--with-evals] [--sentinel] [--suite <s.yaml>] [--force]\n" +
+      "usage: crewhaus init [name] [--ci] [--with-evals] [--sentinel] [--suite <s.yaml>]\n" +
+        "                     [--hybrid] [--provability <rung>] [--force]\n" +
         "  --ci     Also scaffold .github/workflows/crewhaus-eval.yml — the eval-on-PR\n" +
         "           gate (item 44): PRs touching crewhaus.yaml or eval/** run the base\n" +
         "           branch's spec and the PR's spec on the PR's dataset+graders (two\n" +
@@ -2686,6 +2796,11 @@ function runInit(args: ParsedArgs): void {
         "           The path is harness-relative (the jobs' working-directory), and a\n" +
         "           manifest you have not written yet warns rather than failing init.\n" +
         "           Without --suite both scaffolds are byte-identical to before.\n" +
+        "  --provability <rung>  Declare how much proof every answer carries (0.8.0):\n" +
+        "           off | cited | grounded | checked | proven. The proof gate checks each\n" +
+        "           claim at that rung before an answer is served. The scaffold declares\n" +
+        "           the tool the rung needs (read + webFetch at grounded, evaluate at\n" +
+        "           checked). off writes nothing — no block is off.\n" +
         "  --hybrid  Scaffold the HYBRID setup instead of the single-model spec (0.6.0\n" +
         "           §9.2): a three-line `models:` registry, a two-arm `model_pool`, the\n" +
         "           cascade (cheap drafts → a stronger checker grades → the strong model\n" +
@@ -2724,6 +2839,16 @@ function runInit(args: ParsedArgs): void {
   }
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
   const targetFile = join(targetDir, "crewhaus.yaml");
+  // 0.8.0 §11 — the proof floor the NEW spec declares. Validated before
+  // anything is written; `off` resolves to no block (absent is off).
+  const provabilityLevel = initProvabilityFlag(args);
+  const provability =
+    provabilityLevel !== undefined ? provabilityAnswer("cli", provabilityLevel) : undefined;
+  if (provabilityLevel !== undefined && existsSync(targetFile)) {
+    die(
+      `${targetFile} already exists — --provability sets the proof floor of a new spec; add \`provability: ${provabilityLevel}\` to this one by hand`,
+    );
+  }
 
   if (existsSync(targetFile)) {
     // Item 44 — `init --ci` composes with an existing harness: keep the
@@ -2748,6 +2873,11 @@ function runInit(args: ParsedArgs): void {
           model: pair.fast,
           instructions,
           pair,
+          // 0.8.0 §11 — a floor the scaffold's tools cannot meet fails every
+          // answer: declare the tool the rung needs (none at cited/proven).
+          ...(provability !== undefined
+            ? { provability, tools: provabilityScaffoldTools(provability) }
+            : {}),
         }).yaml;
       } catch (err) {
         // The scaffold is validated through `parseSpec`; a failure here is a
@@ -2765,10 +2895,11 @@ agent:
   instructions: |
     You are a helpful assistant. Replace these instructions with your
     agent's actual behavior, persona, and constraints.
-`;
+${provability !== undefined ? `\n${scaffoldProvabilitySection(provability)}` : ""}`;
     }
     writeFileSync(targetFile, yamlText);
     process.stdout.write(`wrote ${targetFile}\n`);
+    if (provabilityLevel !== undefined) writeProvabilityNotes(yamlText, provabilityLevel);
     if (hybrid) {
       process.stdout.write(
         "hybrid: the spec declares a $fast/$strong registry, a two-arm pool and the cascade.\n" +
@@ -3344,14 +3475,16 @@ function createLineReader(): { ask(prompt: string): Promise<string>; close(): vo
 async function runInitInteractive(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
     process.stdout.write(
-      "usage: crewhaus init --interactive [name] [--detect] [--resume] [--yes]\n" +
+      "usage: crewhaus init --interactive [name] [--detect] [--resume] [--yes] [--provability <rung>]\n" +
         "  Interview-driven spec authoring. With credentials and a TTY, an agent runs a\n" +
         "  real multi-turn interview (persisted + resumable; every draft is validated\n" +
         "  against the live spec schema in-conversation). Without credentials, a scripted\n" +
         "  questionnaire (name/shape/model/tools) still emits a validated spec.\n" +
         "  --detect  prefill the default model from a reachable local endpoint/provider.\n" +
         "  --resume  continue a saved interview session where it stopped.\n" +
-        "  --yes     skip the conversation; use the scripted questionnaire.\n",
+        "  --yes     skip the conversation; use the scripted questionnaire.\n" +
+        "  --provability <rung>  answer the proof question up front (off | cited | grounded |\n" +
+        "            checked | proven); applied to the interview's spec as well.\n",
     );
     return;
   }
@@ -3359,6 +3492,8 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
   const targetDir = typeof nameArg === "string" ? resolve(nameArg) : process.cwd();
   const specName = typeof nameArg === "string" ? nameArg : basename(targetDir);
   const targetFile = join(targetDir, "crewhaus.yaml");
+  // 0.8.0 §11 — `--provability` answers the proof question before it is asked.
+  const provabilityLevel = initProvabilityFlag(args);
 
   // Reuse runInit's refuse-overwrite invariant: --interactive must never
   // clobber existing work.
@@ -3400,9 +3535,26 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
         specName: `init-${basename(targetDir)}`,
         model: defaultModel,
         resume: args.flags["resume"] === true,
+        // 0.8.0 §11 — the interviewer is told the proof answer, not to ask it.
+        ...(provabilityLevel !== undefined ? { provability: provabilityLevel } : {}),
       });
       yaml = result.yaml;
       mappingLines = result.mappingLines;
+      // 0.8.0 §11 — the flag outranks what the interview wrote. A target that
+      // cannot carry the block keeps the interview's spec (it is validated
+      // and paid for) and says why the flag did nothing. ANY failure to set
+      // the rung does the same, not only the refusal: the flag is one answer
+      // to one question, and losing the whole paid interview to it (a
+      // rethrow here reaches no handler that writes the spec) is the worse
+      // outcome by far.
+      if (provabilityLevel !== undefined) {
+        try {
+          yaml = setProvability(yaml, provabilityLevel).yaml;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`--provability ignored: ${message}\n`);
+        }
+      }
     } catch (err) {
       // A classified terminal failure (billing/auth/token exhaustion) prints
       // the PR-3 FailureReport with the saved-interview hint and the coded
@@ -3431,7 +3583,14 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
           `${conversational.reason ?? "conversational interview unavailable"} — falling back to the scripted questionnaire.\n`,
         );
       }
-      yaml = (await runScriptedQuestionnaire({ reader, specName, defaultModel })).yaml;
+      yaml = (
+        await runScriptedQuestionnaire({
+          reader,
+          specName,
+          defaultModel,
+          ...(provabilityLevel !== undefined ? { provability: provabilityLevel } : {}),
+        })
+      ).yaml;
     } finally {
       reader.close();
     }
@@ -3440,6 +3599,11 @@ async function runInitInteractive(args: ParsedArgs): Promise<void> {
   mkdirSync(targetDir, { recursive: true });
   writeFileSync(targetFile, yaml);
   process.stdout.write(`wrote ${targetFile}\n`);
+  // 0.8.0 §11 — whichever path chose a proof floor, say what it still needs.
+  const declared = provabilityLevelOf(
+    (parseSpec(yaml) as { readonly provability?: SpecProvabilityBlock }).provability,
+  );
+  if (declared !== "off") writeProvabilityNotes(yaml, declared);
   // v0.3.0 §2.9 — the REQ → spec-field mapping the model produced before
   // emit_spec, surfaced as the interview's closing summary.
   if (mappingLines.length > 0) {
@@ -3462,6 +3626,8 @@ async function runScriptedQuestionnaire(opts: {
   readonly reader: { ask(prompt: string): Promise<string> };
   readonly specName: string;
   readonly defaultModel: string;
+  /** 0.8.0 §11 — `--provability`: answers the proof question instead of asking it. */
+  readonly provability?: InitProvabilityLevel;
 }): Promise<{ yaml: string }> {
   const { ask } = opts.reader;
   const name = (await ask(`harness name [${opts.specName}]: `)) || opts.specName;
@@ -3481,7 +3647,10 @@ async function runScriptedQuestionnaire(opts: {
     .map((t) => t.trim())
     .filter((t) => t !== "");
   const goal = shape === "research" ? (await ask("research goal: ")) || instructions : undefined;
-  const answers: ScriptedAnswers = {
+  if (opts.provability !== undefined && !carriesProvability(shape)) {
+    die(`--provability: ${provabilityShapeRefusal(shape)}`);
+  }
+  const base: ScriptedAnswers = {
     name,
     shape,
     model,
@@ -3493,19 +3662,32 @@ async function runScriptedQuestionnaire(opts: {
   // actually deliver it (the cli shape hosts the cascade; workflow/research
   // do not carry `evaluation.on_fail: escalate`), and answered from the
   // pricing table so the user never has to name two models.
+  let pair: HybridPair | undefined;
   if (shape === "cli") {
     const wantsHybrid = isHybridYes(await ask(HYBRID_INTERVIEW_QUESTION));
     if (wantsHybrid) {
-      const pair = chooseHybridPair(model);
+      pair = chooseHybridPair(model);
       process.stdout.write(
         `  hybrid: $fast = ${pair.fast}, $strong = ${pair.strong} (one provider — a cross-provider pair needs a second credential).\n`,
       );
-      return buildHybridSpec({ ...answers, pair });
     }
   }
-  // buildScriptedSpec validates via parseSpec; a bad answer throws
-  // SpecParseError, which the caller's CrewhausError catch routes through die().
-  return buildScriptedSpec(answers);
+  // 0.8.0 §11 — the ONE proof question, on the shapes that carry the block
+  // (cli defaults to off; the researcher template to cited). Asked last, so
+  // an answer script written for the earlier questions still lines up.
+  const level = carriesProvability(shape)
+    ? (opts.provability ??
+      (await askProvability(ask, shape === "research" ? RESEARCH_DEFAULT_PROVABILITY : "off")))
+    : undefined;
+  const provability = level !== undefined ? provabilityAnswer(shape, level) : undefined;
+  const answers: ScriptedAnswers = {
+    ...base,
+    ...(provability !== undefined ? { provability } : {}),
+  };
+  // buildScriptedSpec / buildHybridSpec validate via parseSpec; a bad answer
+  // throws SpecParseError, which the caller's CrewhausError catch routes
+  // through die().
+  return pair !== undefined ? buildHybridSpec({ ...answers, pair }) : buildScriptedSpec(answers);
 }
 
 /**
@@ -4395,11 +4577,19 @@ async function runRunCli(
   // skills from `~/.crewhaus/skills/*/SKILL.md` + project-equivalent (plus the
   // activated plugins' skill dirs); slash commands from `<cwd>/.crewhaus/commands/*.md`.
   // When skills are present, a synthetic `Skill(name)` tool is appended to the
-  // tool list so the model can lazily fetch each skill's body.
+  // tool list so the model can lazily fetch each skill's body. 0.8.0 §11 —
+  // under `provability:` the gate's skill is a builtin of whichever discovery
+  // builds the list (this one, or wireMemory's below), as in a compiled bundle.
   const cwd = process.cwd();
+  const gateSkills = provabilitySkills(ir.provability);
+  const gateBuiltins = gateSkills.length > 0 ? { builtinSkills: gateSkills } : {};
   const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
-    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
+    discoverSkills({
+      cwd,
+      ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}),
+      ...gateBuiltins,
+    }),
     loadCommands({ cwd }),
   ]);
   // Loop contract 0.4 (Batch A) — spec-declared `hooks:` layer BELOW the
@@ -4441,6 +4631,7 @@ async function runRunCli(
       },
       cwd: process.cwd(),
       log: (line) => process.stdout.write(line),
+      ...gateBuiltins,
       // Loop contract 0.4 (Batch A) — top-level fact-store embedder (spec
       // `memory.embedder`): constructed here and handed to wireMemory as
       // `deps.embedder`, which memory-service's resolveEmbedder prefers
@@ -4704,6 +4895,25 @@ async function runRunCli(
     );
   }
 
+  // 0.8.0 (design §4.4, §8) — the in-loop gates (`evaluation:`,
+  // `provability:`) through the composition root a compiled bundle's boot
+  // line calls. Replay finds the run's own pure tools through a view over
+  // this tool list (read at replay time); the proof tools join the list here,
+  // replacing a same-named builtin the spec listed and ahead of the plugins.
+  // The footer streams after a REPL answer and rides the printed `--prompt`
+  // result. `--prompt` still prints every attempt to stdout as it is
+  // written, so its reader reads the turn as it streams (`streamed`): a
+  // rejected attempt is marked ✗ under it, and a claimless final message has
+  // the printed turn graded in its place, as in the REPL (design §5.4).
+  // Neither block → nothing is built.
+  const gates = await gateRunOptions(ir, {
+    cwd: process.cwd(),
+    catalog: { get: (name) => tools.find((t) => t.name === name) },
+    footerTarget: oneShotPrompt !== undefined ? "reply" : "stream",
+    ...(oneShotPrompt !== undefined ? { streamed: true } : {}),
+  });
+  if (gates.proofTools.length > 0) tools = mergeGateTools(tools, gates);
+
   // Item 3 (G32) — register the activated plugins' tools LAST so a plugin tool
   // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
   // (first-party wins the collision), mirroring the compiled bundle's
@@ -4822,12 +5032,12 @@ async function runRunCli(
       // the pool's reward and the per-tool cost attribution price with the
       // same table `cost-summary` and `doctor --models` read.
       pricing: loadUserPricing(),
-      // 0.6.0 PR 8b (wave-1 carry-over) — the in-loop `evaluation:` block,
-      // built from the resolved IR exactly as the compiled cli bundle's
-      // `renderEvaluation` does (llm_judge on the run bus with role "judge",
-      // contains / regex pure), so `crewhaus run` grades, retries, halts and
-      // meters judge spend like the bundle. Absent block → spreads nothing.
-      ...evaluationRunOptions(ir),
+      // 0.6.0 PR 8b / 0.8.0 §4.4 — the in-loop gates built above by the
+      // composition root the compiled bundle calls (llm_judge on the run bus
+      // with role "judge", contains / regex pure; the provability gate), so
+      // `crewhaus run` grades, verifies, retries, halts and meters like the
+      // bundle. Neither block → spreads nothing.
+      ...gates.options,
       // Section 55 / item 23 — thread the spec's failure_taxonomy so
       // recovery-engine consults the user's named error classes (including
       // the `switch-model` verdict) before its built-in flow.
@@ -5828,11 +6038,18 @@ async function buildServeRuntime(
   const justificationJudge = await resolveJustificationJudge(args, ir.security?.justification);
   const egressMatcher = await resolveEgressMatcher(args, ir.security?.egressMatcher);
 
-  // Skills / hooks / slash commands — plugin skill dirs feed skill discovery.
+  // Skills / hooks / slash commands — plugin skill dirs feed skill discovery,
+  // and under `provability:` so does the gate's skill (0.8.0 §11).
   const cwd = process.cwd();
+  const gateSkills = provabilitySkills(ir.provability);
+  const gateBuiltins = gateSkills.length > 0 ? { builtinSkills: gateSkills } : {};
   const [settingsHooks, discoveredSkills, discoveredCommands] = await Promise.all([
     loadHooks({ cwd }),
-    discoverSkills({ cwd, ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}) }),
+    discoverSkills({
+      cwd,
+      ...(pluginSkillDirs.length > 0 ? { pluginDirs: pluginSkillDirs } : {}),
+      ...gateBuiltins,
+    }),
     loadCommands({ cwd }),
   ]);
   const hooks = mergeSpecHooks(ir.hooks, settingsHooks);
@@ -5856,6 +6073,7 @@ async function buildServeRuntime(
       },
       cwd,
       log: (line) => process.stdout.write(line),
+      ...gateBuiltins,
       ...(ir.memory !== undefined && ir.memory.enabled !== false && ir.memory.embedder !== undefined
         ? { embedder: createEmbedder({ model: ir.memory.embedder }) }
         : {}),
@@ -5880,6 +6098,18 @@ async function buildServeRuntime(
     subAgents = new Map(ir.subAgents.map((d) => [d.name, subAgentDefinitionFromIr(d)]));
     tools.push(createTaskTool({ subAgents }));
   }
+
+  // 0.8.0 (design §4.4, §8) — the in-loop gates, built ONCE per served
+  // process through the composition root (their closures keep no per-run
+  // state; the HEAD cache is keyed by session). A served reply is the text
+  // the caller receives, so the proof footer rides it (`"reply"`). The proof
+  // tools join the primary agent's list ahead of the plugins.
+  const gates = await gateRunOptions(ir, {
+    cwd,
+    catalog: { get: (name) => tools.find((t) => t.name === name) },
+    footerTarget: "reply",
+  });
+  if (gates.proofTools.length > 0) tools = mergeGateTools(tools, gates);
 
   // Plugin tools register LAST — a plugin tool named after a built-in / skill /
   // MCP tool is skipped so first-party wins the collision.
@@ -5944,16 +6174,16 @@ async function buildServeRuntime(
   //   - routing: the same `wireModels` call runRunCli spreads, so the two
   //     interpreter paths cannot drift (0.6.0 PR 8a; before it this copy
   //     dropped `circuitBreaker` under `--model` while runRunCli kept it).
-  //   - evaluation (0.6.0 PR 8b): the in-loop `evaluation:` block on the
-  //     primary agent only (sub-agent invocations are not graded by the
-  //     parent's evaluation), the same helper runRunCli spreads.
+  //   - evaluation (0.6.0 PR 8b) / provability (0.8.0): the in-loop gates on
+  //     the primary agent only (sub-agent invocations are not graded by the
+  //     parent's gates), the same helper runRunCli spreads, built once above.
   const primaryOptionsForRun = () => ({
     ...commonOptions,
     model,
     instructions: ir.agent.instructions,
     tools,
     ...modelRoutingRunOptions(ir.agent, modelOverride, { sessionName: ir.name }),
-    ...evaluationRunOptions(ir),
+    ...gates.options,
     ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
     ...(memoryRunOpt !== undefined ? { memory: memoryRunOpt } : {}),
     ...(continuityRunOpt !== undefined ? { continuity: continuityRunOpt } : {}),
@@ -6051,6 +6281,11 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         "                           disabled keys (thredz_billing) and plan caps (thredz_quota)\n" +
         "                           surface here instead of degrading a long run.\n" +
         "\n" +
+        "  When the cwd spec's provability: block lists a sandbox proof checker (smt, lean4),\n" +
+        "  --probe also probes every checker it lists (sandbox backend + image health, ~ when\n" +
+        "  one cannot run: the builtin checker is always there; a first run may pull the\n" +
+        "  image) — `crewhaus provability checkers`. Without --probe, doctor says it did not.\n" +
+        "\n" +
         "  Credential checks are model-aware: doctor parses the cwd crewhaus.yaml's\n" +
         "  agent.model (claude-*, openai/*, gemini/*, bedrock/*, local/<m>@<url>) and\n" +
         "  checks the matching provider's env; other providers report informationally.\n",
@@ -6147,6 +6382,34 @@ async function runDoctor(args: ParsedArgs): Promise<void> {
         checks.push(thredzProbeToCheck(await probeThredz(thredzTarget)));
       }
     }
+  }
+
+  // 0.8.0 §11 — the proof checkers' availability probe, when the cwd spec's
+  // harness runs a checker at all (a proven floor, formal.checkers of its
+  // own, or proofCheck in tools: — never a cited floor on the lowered
+  // defaults) and lists a sandbox one (smt / lean4): the same available()
+  // `crewhaus provability checkers` and the ProofCheckers tool report
+  // (sandbox backend + image health), bounded per checker. Behind --probe
+  // with the other live checks: on docker, healthchecking an image that is
+  // not local pulls it. Without --probe, one ~ line says so; probed, an
+  // unavailable checker is a warning — builtin is always there.
+  if (specText !== undefined) {
+    let provability: ReturnType<typeof provabilityOf>;
+    let tools: string[] = [];
+    try {
+      const ir = lower(parseSpec(specText));
+      provability = provabilityOf(ir);
+      tools = irToolKeys(ir);
+    } catch {
+      provability = undefined; // doctor's spec checks report a spec that does not lower
+    }
+    checks.push(
+      ...(await provabilityDoctorChecks(
+        provability,
+        { env: process.env },
+        { probe: args.flags["probe"] === true, tools },
+      )),
+    );
   }
 
   const bunCheck = checkBunVersion(Bun.version);
@@ -6694,6 +6957,13 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
       });
     }
   }
+
+  // 0.8.0 §10 — provability's three invariants: the citation-marker regex is
+  // defined once (claim-ledger), @crewhaus/provability imports no model
+  // adapter, and provability.level is never optimizable. Stable
+  // (class, file, symbol) ids, so a NEW copy of the regex is a NEW finding
+  // the --baseline gate fails on.
+  findings.push(...provabilityPhilosophyFindings(process.cwd()));
 
   // Contributor compass exists at project root. AGENTS.md is the canonical
   // vendor-neutral convention (agents.md); CLAUDE.md is accepted as a fallback
@@ -9308,6 +9578,13 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
         );
       }
     }
+    // 0.8.0 §9.1 — likewise: a replayed call session ran no provability gate,
+    // so there is no floor to impose and no bundle to grade.
+    if (args.flags["provability"] !== undefined) {
+      die(
+        "--voice does not support --provability: --voice replays recorded call sessions, which no provability gate ran — measure a rung on a text eval",
+      );
+    }
     await runVoiceEval(args);
     return;
   }
@@ -9396,6 +9673,39 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     die(
       "--sentinel and --routing are mutually exclusive — a sentinel probes PROVIDER drift against a frozen baseline, so its routing must be identical to the baseline's",
     );
+  }
+
+  // 0.8.0 §9.1 — `--provability <level>`: measure the ladder at a floor without
+  // editing the spec (the runner re-levels the spec's block, or injects the
+  // shorthand's defaults, and adds the six provability.* graders). Validated
+  // here, loudly, before any dataset load or spend. A what-if floor is a
+  // MEASUREMENT, never lineage: it is not gated against or promoted over the
+  // (spec, dataset) baseline, so the flags that would make it one are refused
+  // rather than silently half-honoured.
+  const provabilityFlag = args.flags["provability"];
+  let evalProvability: ProvabilityLevel | undefined;
+  if (provabilityFlag !== undefined) {
+    if (typeof provabilityFlag !== "string" || !isProvabilityLevel(provabilityFlag)) {
+      die(
+        `invalid --provability "${String(provabilityFlag)}" — must be one of ${PROVABILITY_LEVELS.join(", ")} (to measure the spec's own block, omit the flag)`,
+      );
+    }
+    if (gateRequested) {
+      die(
+        "--provability and --gate are mutually exclusive — a what-if floor is measured, never gated against (or promoted over) the pinned baseline",
+      );
+    }
+    if (sentinel) {
+      die(
+        "--provability and --sentinel are mutually exclusive — a sentinel must run the exact instrument its baseline ran",
+      );
+    }
+    if (matrixModels !== undefined) {
+      die(
+        "--provability and --models are mutually exclusive — measure a rung on one model at a time (--models runs the spec as declared)",
+      );
+    }
+    evalProvability = provabilityFlag;
   }
 
   const concurrencyFlag = args.flags["concurrency"];
@@ -9552,8 +9862,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
   let ir: ReturnType<typeof lower>;
+  let evalSpec: ReturnType<typeof parseSpec>;
   try {
-    ir = lower(parseSpec(yamlText));
+    evalSpec = parseSpec(yamlText);
+    ir = lower(evalSpec);
   } catch (err) {
     if (err instanceof SpecParseError) die(err.message);
     throw err;
@@ -9565,6 +9877,24 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   if (ir.target !== "cli") {
     die(`crewhaus eval only supports target: cli (got "${ir.target}")`);
   }
+  // 0.8.0 §9.1 / §3 — a block PARKED at `level: off` lowers to none, so the
+  // runner would measure the shorthand's defaults instead of the declared
+  // threshold, on_fail and sources: re-validate it at the --provability rung
+  // and hand the runner THAT block to re-level (eval-provability.ts).
+  let parkedBlock: ReturnType<typeof parkedProvabilityBlock>;
+  if (evalProvability !== undefined) {
+    try {
+      parkedBlock = parkedProvabilityBlock(yamlText, evalSpec, evalProvability);
+    } catch (err) {
+      if (err instanceof SpecParseError) {
+        die(
+          `--provability ${evalProvability}: the spec's provability block is parked at level: off, and does not hold at ${evalProvability} — ${err.message}`,
+        );
+      }
+      throw err;
+    }
+  }
+  const evalIr: typeof ir = parkedBlock !== undefined ? { ...ir, provability: parkedBlock } : ir;
 
   let gradersYaml: string;
   try {
@@ -9581,7 +9911,10 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // (the specialty packs + .crewhaus/graders plugins), constructed ONCE here
   // and shared with every matrix cell; `runEval` has the identical fallback,
   // so the vocabulary cannot differ between the CLI and library paths.
-  const graderRegistry = await graderRegistryForCompiled(compiled);
+  // 0.8.0 §9.1 — with the same pricing runEval gets, for provability.* costs.
+  const graderRegistry = await graderRegistryForCompiled(compiled, {
+    pricing: defaultMatrixPricing(),
+  });
 
   // Item 12 — `--dataset registry:<name>[@version][#split]` resolves via the
   // Section 29 dataset registry instead of loadDataset. datasetName becomes
@@ -9744,6 +10077,17 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     resumeDir ??
     (typeof outDirArg === "string" ? resolve(outDirArg) : join(".crewhaus", "evals", "<runId>"));
   process.stdout.write(`[eval] running ${dataset.name}: ${compiled.length} graders → ${outDest}\n`);
+  if (evalProvability !== undefined) {
+    const declared =
+      parkedBlock !== undefined
+        ? "parks its block at level: off — that block runs at this rung"
+        : ir.provability !== undefined
+          ? `declares ${ir.provability.level}`
+          : "declares none — the defaults run";
+    process.stdout.write(
+      `[eval] provability: gating every sample at ${evalProvability} (spec ${declared}) + the six provability.* graders — recorded, never promoted\n`,
+    );
+  }
   if (resumeDir !== undefined) {
     process.stdout.write(`[eval] resuming run at ${resumeDir}\n`);
   }
@@ -9764,7 +10108,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   const cassetteOrResume =
     resumeDir !== undefined || recordToolsDir !== undefined || replayToolsDir !== undefined;
   const summary = await runEvalLib({
-    ir,
+    ir: evalIr,
     dataset,
     compiledGraders: compiled,
     opts: {
@@ -9799,6 +10143,8 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       // all, so an un-flagged run is byte-identical.
       ...(evalRouting !== undefined ? { routing: evalRouting } : {}),
       ...(warmArms ? { warmArms: true } : {}),
+      // 0.8.0 §9.1 — the what-if floor (absent: the spec's own block, if any).
+      ...(evalProvability !== undefined ? { provability: evalProvability } : {}),
       pricing: defaultMatrixPricing(),
     },
   }).catch((err: unknown) => {
@@ -10020,7 +10366,9 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     datasetHash,
     outDir: absOut,
     gateRequested,
-    promote,
+    // 0.8.0 §9.1 — a `--provability` what-if run is recorded, never promoted:
+    // its grader set and gate differ from the lineage's.
+    promote: promote && evalProvability === undefined,
     // C30 — the run's estimated cost + the pre-declared ops thresholds.
     ...(costUsd !== undefined ? { costUsd } : {}),
     // C35 — the halves behind that total, recorded additively so trends can
@@ -14210,7 +14558,10 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
         "  failure_taxonomy + loop-break rules, sub-agent splits under\n" +
         "  chronic context pressure, and model_pool scoreboard mining\n" +
         "  (flip policy to learned once every candidate has enough samples;\n" +
-        "  name consistently-losing candidates — roster edits stay human)\n" +
+        "  name consistently-losing candidates — roster edits stay human), and\n" +
+        "  provability pressure (gated turns still failing after retries: a\n" +
+        "  max_retries patch + advice keyed to the dominant unmet reason; the\n" +
+        "  floor itself is never lowered)\n" +
         "\n" +
         "  --session <id>  mine one session (default: all sessions)\n" +
         "  --json          print machine-readable findings to stdout\n" +
@@ -14282,7 +14633,21 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
     // Corrupt store must not block mining the sessions.
   }
 
-  const ctx = buildAdviceContext(sessions, auditObjects, routingArms);
+  // 0.8.0 §9.3 — the provability gate's unmet reasons live in the proof
+  // bundles its `provability_graded` lines point at; read the failing ones so
+  // the pressure rule can key its advice to the dominant reason. A pruned or
+  // unreadable bundle is skipped, never fatal.
+  const baseCtx = buildAdviceContext(sessions, auditObjects, routingArms);
+  const ctx = withProvabilityBundles(
+    baseCtx,
+    (baseCtx.provability?.failingBundlePaths ?? []).flatMap((path) => {
+      try {
+        return [JSON.parse(readFileSync(resolve(path), "utf-8")) as unknown];
+      } catch {
+        return [];
+      }
+    }),
+  );
   const specTextForOps = specText;
   const findings: AdviceFinding[] = runAdviceRules(ctx, {
     ...(spec !== undefined ? { spec } : {}),
@@ -15931,8 +16296,9 @@ async function runSessions(args: ParsedArgs): Promise<void> {
         "  the per-turn view `crewhaus dev` points at). With no <session>, tails the\n" +
         "  most-recently-updated one under .crewhaus/sessions. Each user/assistant turn,\n" +
         "  tool call + result, and failure prints one line as it lands, and so does each\n" +
-        "  routing decision (⇢), cost accrual ($), judge verdict (⚖) and hybrid-strategy\n" +
-        "  stage (◇) the session recorded — the shape of a hybrid turn beside its text.\n" +
+        "  routing decision (⇢), cost accrual ($), judge or provability verdict (⚖),\n" +
+        "  proof check (∎) and hybrid-strategy stage (◇) the session recorded — the\n" +
+        "  shape of a hybrid turn beside its text.\n" +
         "  --transcript-only hides those. --no-follow dumps the current transcript and\n" +
         "  exits (scriptable/CI); --interval sets the poll ms (default 500). --dir points\n" +
         "  at a session store other than cwd/.crewhaus/sessions.\n" +
@@ -23907,6 +24273,44 @@ switch (subcommand) {
       ) {
         die(err.message);
       }
+      throw err;
+    }
+    break;
+  }
+  case "provability": {
+    // 0.8.0 (design §11) — the proof bundles: show | check | audit | checkers
+    // | prune. A bare verb or a leading -h/--help prints the usage (stdout,
+    // exit 0); the verbs live in provability-cli.ts and return their exit
+    // code (`check`: 0 pass, 1 otherwise, so CI can gate on a report).
+    const first = rest[0] ?? "";
+    const isHelp = first === "--help" || first === "-h";
+    const action = isHelp ? "" : first;
+    // Every write is awaited before the exit below: Bun drops what a pipe has
+    // not taken when the process exits, which cut piped `--json` (and a long
+    // report in a CI log) at 64 KiB (drained-output.ts).
+    const stdio = drainedOutput();
+    try {
+      const code = await runProvabilityCommand(
+        action,
+        parseFor(isHelp || action === "" ? rest : rest.slice(1), PROVABILITY_SCHEMA),
+        {
+          cwd: process.cwd(),
+          env: process.env,
+          now: () => new Date(),
+          out: stdio.out,
+          err: stdio.err,
+          // `checked` replay re-runs pure tools from the same literal loader
+          // table `crewhaus run` wires — built only when a check needs it.
+          loadCatalog: async () => Object.values(await loadToolMap()),
+        },
+      );
+      await stdio.drained();
+      // Exit explicitly, as doctor does: a probed sandbox or an imported tool
+      // package must not hold the process open past its answer.
+      process.exit(code);
+    } catch (err) {
+      await stdio.drained();
+      if (err instanceof ProvabilityCliError || err instanceof CrewhausError) die(err.message);
       throw err;
     }
     break;
