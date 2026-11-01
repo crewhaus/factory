@@ -25,9 +25,11 @@
  *
  * The guard reads 0.8.0's list, under `PROVABILITY_HEADING`, and every later
  * release's list, under `DEFAULT_ON_HEADING`, which sits in `## [Unreleased]`
- * until the release is cut. 0.8.0's list is released and does not change. A
- * new kind of default-on change adds a check here and a bullet in the
- * `## [Unreleased]` list.
+ * until the release is cut. 0.8.0's list is released and does not change. It
+ * names more than 0.8.0 shipped, so the roots and tools checks count a name in
+ * it only for what 0.8.0 shipped: a root or tool found since must be named in
+ * a later list. A new kind of default-on change adds a check here and a bullet
+ * in the `## [Unreleased]` list.
  */
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -50,6 +52,27 @@ const DEFAULT_ON_HEADING = "**Changes that can affect a harness without opting i
  * silently.
  */
 const HEADINGS = [PROVABILITY_HEADING, DEFAULT_ON_HEADING] as const;
+/** Every list but 0.8.0's: where a root or tool 0.8.0 did not ship is listed. */
+const LATER_HEADINGS = HEADINGS.filter((heading) => heading !== PROVABILITY_HEADING);
+/**
+ * What 0.8.0's list was written for: the roots the runtime-state floor
+ * protects in a run without the block, and the tools that check their own
+ * writes against them. The list names more than these: `.crewhaus` itself,
+ * the directory that holds the roots, and tools it names only to say they run
+ * as before, such as `ArchiveCreate` and `GitCommit`. So the roots and tools
+ * checks count a name in it only for these (`unlisted`). The other checks
+ * still count a name in any list.
+ */
+const SHIPPED_ROOTS = [".crewhaus/sessions", ".crewhaus/tool-results", ".crewhaus/proofs"] as const;
+const SHIPPED_TOOLS = [
+  "ArchiveExtract",
+  "CopyPath",
+  "GitApplyPatch",
+  "MovePath",
+  "RemovePath",
+  "StateImport",
+  "StoreMigrate",
+] as const;
 
 /**
  * The bullets of every list in `text` that one of `headings` opens, in
@@ -90,9 +113,22 @@ function defaultOnBullets(text: string, headings: readonly string[] = HEADINGS):
   return bullets;
 }
 
-/** The items in `found` that `notes` does not name as `` `item` ``, in the order given. */
-function unlisted(found: Iterable<string>, notes: string): string[] {
-  return [...found].filter((item) => !notes.includes(`\`${item}\``));
+/**
+ * The items in `found` the notes do not name as `` `item` ``, in the order
+ * given. An item 0.8.0 shipped, one of `shipped`, may be named in any list
+ * (`notes`); any other item must be named in a later list (`laterNotes`). The
+ * third argument is required, so no check falls back to 0.8.0's list for a
+ * name 0.8.0 did not ship.
+ */
+function unlisted(
+  found: Iterable<string>,
+  notes: string,
+  { shipped, laterNotes }: { readonly shipped: readonly string[]; readonly laterNotes: string },
+): string[] {
+  return [...found].filter((item) => {
+    const listing = shipped.includes(item) ? notes : laterNotes;
+    return !listing.includes(`\`${item}\``);
+  });
 }
 
 /** The real notes, read once. */
@@ -100,6 +136,8 @@ const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
 /** Every bullet of every default-on list, 0.8.0's and every later release's. */
 const bullets = defaultOnBullets(changelog);
 const notes = bullets.join("\n");
+/** Every later release's list alone: where a root or tool 0.8.0 did not ship must be named. */
+const laterNotes = defaultOnBullets(changelog, LATER_HEADINGS).join("\n");
 
 /** Workspace source files (tracked or new, never dist or a test) that contain `needle`. */
 function sourcesContaining(needle: string): string[] {
@@ -444,19 +482,36 @@ describe("the guard reads every release's default-on list", () => {
     expect(PLACES.filter((place) => notesNaming(place).includes(`\`${PLANTED}\``))).toEqual(
       PLACES.filter((place) => place !== "nowhere"),
     );
-    const unlistedIn = (place: Place): string[] =>
-      unlisted([PLANTED], defaultOnBullets(notesNaming(place)).join("\n"));
-    expect(Object.fromEntries(PLACES.map((place) => [place, unlistedIn(place)]))).toEqual({
+    /** The floor test's call, on notes written here rather than the real file. */
+    const unlistedIn = (found: readonly string[], text: string): string[] =>
+      unlisted(found, defaultOnBullets(text).join("\n"), {
+        shipped: SHIPPED_ROOTS,
+        laterNotes: defaultOnBullets(text, LATER_HEADINGS).join("\n"),
+      });
+    expect(
+      Object.fromEntries(PLACES.map((place) => [place, unlistedIn([PLANTED], notesNaming(place))])),
+    ).toEqual({
       nowhere: [PLANTED],
       "the list": [],
       "### Fixed": [PLANTED],
       "the intro": [PLANTED],
       "the 0.7.1 hardening": [PLANTED],
-      // The parser reads 0.8.0's list too, so a name there passes here. In
-      // the real file, the test that holds 0.8.0's list to what shipped
-      // refuses it.
-      "0.8.0's list": [],
+      // 0.8.0's list counts only for what 0.8.0 shipped. In the real file,
+      // the test that holds that list to what shipped refuses the bullet too.
+      "0.8.0's list": [PLANTED],
     });
+    // One more place: a name 0.8.0's list already carries. Its floor bullet
+    // names `.crewhaus` itself, the directory that holds the roots, so a root
+    // found at `.crewhaus` is unlisted until the newest list names it, while
+    // the roots 0.8.0 shipped are still listed by that bullet.
+    const shippedFloor = [
+      ...unreleasedEntry(),
+      ...releasedEntry(
+        `- **The floor.** It protects ${SHIPPED_ROOTS.map((root) => `\`${root}\``).join(", ")}.`,
+        "  Other paths under `.crewhaus` are unaffected.",
+      ),
+    ].join("\n");
+    expect(unlistedIn([...SHIPPED_ROOTS, ".crewhaus"], shippedFloor)).toEqual([".crewhaus"]);
   });
 });
 
@@ -474,7 +529,7 @@ describe("the release notes name every change a harness without provability: see
       .filter((root) => !isAbsolute(root))
       .map((root) => root.split(sep).join("/"));
     expect(roots.length).toBeGreaterThan(0);
-    const unnamed = unlisted(roots, notes);
+    const unnamed = unlisted(roots, notes, { shipped: SHIPPED_ROOTS, laterNotes });
     expect(unnamed).toEqual([]);
     // The bullet that names them says how far bypass reaches and what the
     // floor cannot see (permission-engine `EvaluateOptions.protectedRoots`).
@@ -504,7 +559,7 @@ describe("the release notes name every change a harness without provability: see
     // GitApplyPatch (tool-git), StateImport (tool-state) and StoreMigrate
     // (tool-lifecycle) today.
     expect(tools.size).toBe(7);
-    const unnamed = unlisted(tools, notes).sort();
+    const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
   });
 
