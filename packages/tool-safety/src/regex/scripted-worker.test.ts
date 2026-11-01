@@ -2,25 +2,40 @@
  * The scripted regex worker the give-up and deadline tests run on (see
  * scriptWorkerClock): a cost lands on exactly the input it names, an input
  * scripted to hang holds its run until the deadline, and one scripted to
- * hold keeps its thread, through terminate(), until the test releases it.
+ * hold keeps its thread, through terminate(), until the test releases it,
+ * also when the terminate() lands before the hold's wait has begun.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { restoreWorkerClock, scriptWorkerClock } from "./__test__/scripted-worker-clock";
 import { REGEX_RUN_DEFAULTS, regexWorkerCounts, runRegex } from "./run";
 
+/** Spies a test installed, restored after it. */
+const spies: Array<{ mockRestore(): void }> = [];
+
 // A body abandoned at its budget never reaches a finally of its own.
-afterEach(restoreWorkerClock);
+afterEach(() => {
+  for (const spy of spies.splice(0)) spy.mockRestore();
+  restoreWorkerClock();
+});
 
 const GIVE_UP_MS = REGEX_RUN_DEFAULTS.giveUpMs;
 
-/** Wait (bounded) for every regex worker to exit; only a hang reaches the bound. */
-async function workersExited(budgetMs: number): Promise<{ live: number; runaway: number }> {
+type Counts = { readonly live: number; readonly runaway: number };
+
+/** Wait (bounded) until the regex worker counts are `want`; only a hang reaches the bound. */
+async function workersAt(want: Counts, budgetMs: number): Promise<Counts> {
   const until = performance.now() + budgetMs;
   for (;;) {
     const counts = regexWorkerCounts();
-    if ((counts.live === 0 && counts.runaway === 0) || performance.now() > until) return counts;
+    const there = counts.live === want.live && counts.runaway === want.runaway;
+    if (there || performance.now() > until) return counts;
     await Bun.sleep(20);
   }
+}
+
+/** Wait (bounded) for every regex worker to exit; only a hang reaches the bound. */
+function workersExited(budgetMs: number): Promise<Counts> {
+  return workersAt({ live: 0, runaway: 0 }, budgetMs);
 }
 
 describe("the scripted worker", () => {
@@ -73,13 +88,97 @@ describe("the scripted worker", () => {
     expect(scripted.execs()).toBe(2);
     controller.abort();
     expect(await pending).toMatchObject({ status: "error", code: "aborted" });
-    // terminate() was called and cannot end an untimed wait: a hang would
-    // let the thread go within one 10 ms wait, and only a broken hold can
-    // exit here, whatever the wait.
+    // terminate() was called with the thread inside the held exec, so it was
+    // put off: a hang would let the thread go within one 10 ms wait, and
+    // only a broken hold can exit here, whatever the wait.
     expect(await workersExited(500)).toEqual({ live: 1, runaway: 1 });
     scripted.release();
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
-    // It exited before "b".
+    // It exited inside the held exec, which never returned, so before "b".
+    expect(scripted.heldReturns()).toBe(0);
+    expect(scripted.execs()).toBe(2);
+  }, 90_000);
+
+  test("a hold outlives a terminate() that lands before its wait has begun", async () => {
+    // Stopped between announcing the hold and starting its wait, the thread
+    // sits where one descheduled right after it posted does. A terminate()
+    // that landed there was honoured at the wait loop's header, and the
+    // thread exited, so the test above found none left (on CI, once in many
+    // runs). Here it lands there every time.
+    const scripted = scriptWorkerClock({}, [], ["held"], { pauseHolds: true });
+    const controller = new AbortController();
+    const pending = runRegex({
+      op: "testEach",
+      pattern: "z",
+      inputs: ["a", "held", "b", "c"],
+      signal: controller.signal,
+      deadlineMs: 60_000,
+    });
+    expect(await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))])).toBe("held");
+    expect(scripted.execs()).toBe(2);
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "error", code: "aborted" });
+    // Only now does the thread go on, into its wait.
+    scripted.resume();
+    expect(await workersExited(500)).toEqual({ live: 1, runaway: 1 });
+    scripted.release();
+    expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
+    expect(scripted.heldReturns()).toBe(0);
+    expect(scripted.execs()).toBe(2);
+  }, 90_000);
+
+  test("only a thread inside a held exec outlives terminate(); another worker's ends at once", async () => {
+    const scripted = scriptWorkerClock({}, [], ["held"]);
+    const controller = new AbortController();
+    const pending = runRegex({
+      op: "test",
+      pattern: "z",
+      input: "held",
+      signal: controller.signal,
+      deadlineMs: 60_000,
+    });
+    expect(await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))])).toBe("held");
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "error", code: "aborted" });
+    // A run on a worker of its own, terminated once it has answered. Its
+    // thread is not inside a held exec, so that terminate() goes through,
+    // and only the held thread is left.
+    const other = await runRegex({ op: "test", pattern: "a", input: "a", deadlineMs: 60_000 });
+    expect(other).toMatchObject({ status: "ok", result: { matched: true } });
+    expect(await workersAt({ live: 1, runaway: 1 }, 60_000)).toEqual({ live: 1, runaway: 1 });
+    scripted.release();
+    expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+
+  test("released, a put-off terminate() goes through before the thread is let go", async () => {
+    // The real terminate() takes its time here. A thread let go before it
+    // went through would run on past the held exec meanwhile, through "b"
+    // and "c"; one still held cannot move.
+    const realTerminate = Worker.prototype.terminate;
+    const slowTerminate = spyOn(Worker.prototype, "terminate").mockImplementation(function (
+      this: Worker,
+    ) {
+      Bun.sleepSync(200);
+      realTerminate.call(this);
+    });
+    spies.push(slowTerminate);
+    const scripted = scriptWorkerClock({}, [], ["held"]);
+    const controller = new AbortController();
+    const pending = runRegex({
+      op: "testEach",
+      pattern: "z",
+      inputs: ["a", "held", "b", "c"],
+      signal: controller.signal,
+      deadlineMs: 60_000,
+    });
+    expect(await Promise.race([scripted.hung, pending.then((ended) => ({ ended }))])).toBe("held");
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "error", code: "aborted" });
+    // Put off: the real one has not been called yet.
+    expect(slowTerminate).toHaveBeenCalledTimes(0);
+    scripted.release();
+    expect(slowTerminate).toHaveBeenCalledTimes(1);
+    expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
     expect(scripted.execs()).toBe(2);
   }, 90_000);
 
@@ -91,6 +190,8 @@ describe("the scripted worker", () => {
     );
     scripted.release();
     expect(await pending).toMatchObject({ status: "ok", result: { matched: true } });
+    // Not terminated, the held exec returned.
+    expect(scripted.heldReturns()).toBe(1);
     expect(scripted.execs()).toBe(1);
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
