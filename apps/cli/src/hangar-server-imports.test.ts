@@ -11,8 +11,9 @@
  *
  * So this guard reads every non-test source under `src/` with the statement
  * grammar `manifest.test.ts` uses (an `import`/`export … from "…"` whose
- * specifier list may span lines, and a bare `import "…"`), and allows
- * exactly:
+ * specifier list may span lines, and a bare `import "…"`), extended to step
+ * over a comment in that list whole, whatever the comment holds, and to leave
+ * an `export` that declares something alone. It allows exactly:
  *   - from `.`: what `crewhaus hangar` needs to start the server — the
  *     function, its two types, the default port, and the token file name;
  *   - from `./scaffolded-workflows`: the workflow file names the flywheel
@@ -62,10 +63,27 @@ function sourceFiles(dir: string): string[] {
   return out;
 }
 
-// `manifest.test.ts`'s grammar, with the clause and the keyword captured: the
-// match runs to `from "…"` across newlines, but never across a quote, a
-// backtick or a `;`, so it cannot run from one statement into the next.
-const STATEMENT_RE = /^(import|export)\s([^;"'`]*?)\bfrom\s+"([^"]+)"|^import\s+"([^"]+)"/gm;
+// `manifest.test.ts`'s grammar, extended twice. It captures the keyword
+// (group 1), the clause (2), the specifier (5) and a bare `import "…"`'s
+// specifier (6). The clause runs to `from "…"` across newlines, but never
+// across a quote, a backtick or a `;` outside a comment, so it cannot run from
+// one statement into the next.
+//
+// First, a comment is taken whole, so nothing in it (an apostrophe, a quote, a
+// `;`, a `from "…"`) ends the clause early or is read as code. Each comment is
+// atomic as well: a lookahead captures it (3, 4) and a backreference consumes
+// it, and JavaScript never backtracks into a lookahead. Without that, a
+// statement that fails to match goes back into its comments to try other
+// readings of them: it can then take a `from "…"` inside one as its own, and a
+// run of block comments costs time exponential in their number.
+//
+// Second, an `export` starts a clause only where a re-export can: before `{`,
+// `*`, `type {`, `type *` or a comment. An `export` that declares something
+// (`export const …`, `export function …`) never does. Its body may hold a regex
+// literal, and a `//` or `/*` in one would read as a comment and carry the
+// clause on into the statements after it.
+const STATEMENT_RE =
+  /^(import|export(?=\s+(?:type\s+)?[{*/]))\s((?:[^;"'`/]|\/(?![/*])|(?=(\/\/[^\n]*))\3|(?=(\/\*[\s\S]*?\*\/))\4)*?)\bfrom\s+"([^"]+)"|^import\s+"([^"]+)"/gm;
 // A dynamic `import("…")` or `require("…")` of the server: never allowed.
 const DYNAMIC_RE =
   /\b(?:import|require)\s*\(\s*["'`](@crewhaus\/hangar-server(?:\/[^"'`]*)?)["'`]/g;
@@ -75,12 +93,17 @@ const isServerSpecifier = (specifier: string): boolean =>
 
 type Hit = { readonly file: string; readonly specifier: string; readonly names: string[] };
 
-/** The names a `{ … }` clause binds, `type ` prefixes, `as` aliases and
- *  comments off. */
+/** A clause with each comment replaced by a space. Outside a comment a clause
+ *  holds no quote (the grammar refuses one), so a single left-to-right pass
+ *  reads the comments the way the grammar does: a `/*` inside a `//` comment
+ *  belongs to that comment, and a `//` inside a block comment to the block. */
+const withoutComments = (clause: string): string =>
+  clause.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, " ");
+
+/** The names a `{ … }` clause binds (its comments already gone), with `type `
+ *  prefixes and `as` aliases off. */
 function namedBindings(inner: string): string[] {
   return inner
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/[^\n]*/g, "")
     .split(",")
     .map((part) => part.trim())
     .filter((part) => part !== "")
@@ -99,17 +122,20 @@ function scan(file: string, text: string): { hits: Hit[]; violations: string[] }
   const violations: string[] = [];
   const banned = NO_SERVER_AT_ALL.includes(file);
   for (const match of text.matchAll(STATEMENT_RE)) {
-    const sideEffect = match[4];
+    // Groups 3 and 4 only hold a comment while it is consumed.
+    const [, keywordGroup, clauseGroup, , , specifierGroup, sideEffect] = match;
     if (sideEffect !== undefined) {
       if (isServerSpecifier(sideEffect)) {
         violations.push(`${file}: side-effect import of ${sideEffect}`);
       }
       continue;
     }
-    const keyword = match[1] as string;
-    const specifier = match[3] as string;
+    const keyword = keywordGroup as string;
+    const specifier = specifierGroup as string;
     if (!isServerSpecifier(specifier)) continue;
-    const clause = (match[2] as string).trim().replace(/^type\s+/, "");
+    const clause = withoutComments(clauseGroup as string)
+      .trim()
+      .replace(/^type\s+/, "");
     const braces = clause.match(/^([^{]*)\{([^}]*)\}\s*$/);
     if (braces === null) {
       // `* as h`, `*` (an `export *`), or a bare default binding.
@@ -215,13 +241,72 @@ describe("what the CLI takes from @crewhaus/hangar-server", () => {
     expect(
       scan("planted.ts", 'import { HttpError } from "@crewhaus/hangar-server/http";\n').violations,
     ).toEqual(["planted.ts: imports @crewhaus/hangar-server/http, which no exemption names"]);
-    // daemon-cmd.ts may not take even an allowed name.
+    // A comment in the list hides nothing, whatever it holds: an apostrophe, a
+    // quote or a `;` (a grammar that read it as code would stop there and never
+    // see the statement), a `from "…"` (it would be taken as the statement's
+    // specifier), a `/*` inside a `//` comment, or a `}`.
+    for (const list of [
+      "  runDetail, // the server's wrapper\n",
+      '  /* "x"; */ runDetail,\n',
+      '  startHangarServer, // from "./boot"\n  runDetail,\n',
+      "  // reads logs/*.log\n  runDetail,\n  /* boots it */ startHangarServer,\n",
+      "  // see {@link runsView}\n  runDetail,\n",
+    ]) {
+      const { violations: found } = scan(
+        "planted.ts",
+        `import {\n${list}} from "@crewhaus/hangar-server";\n`,
+      );
+      expect({ list, found }).toEqual({
+        list,
+        found: ["planted.ts: imports runDetail from @crewhaus/hangar-server"],
+      });
+    }
+    // A comment is never read as code, even in a statement that fails to
+    // match: a local `export { … };` whose comment names the server re-exports
+    // nothing, and no statement stretches a block comment past its `;`.
+    expect(
+      scan("planted.ts", 'export {\n  limits, // from "@crewhaus/hangar-server"\n};\n'),
+    ).toEqual({ hits: [], violations: [] });
+    expect(
+      scan(
+        "planted.ts",
+        'export { limits /* one */ };\n/* two */\nimport { runDetail } from "@crewhaus/hangar-server";\n',
+      ).violations,
+    ).toEqual(["planted.ts: imports runDetail from @crewhaus/hangar-server"]);
+    // An `export` that declares something is no statement of this grammar, so
+    // a `//` or `/*` in its regex literal cannot carry it into the import that
+    // follows: that import is read on its own, allowed or refused.
+    expect(
+      scan(
+        "planted.ts",
+        'export const URL_RE = /^https?:\\/\\//;\nimport { startHangarServer } from "@crewhaus/hangar-server";\n',
+      ),
+    ).toEqual({
+      hits: [
+        { file: "planted.ts", specifier: "@crewhaus/hangar-server", names: ["startHangarServer"] },
+      ],
+      violations: [],
+    });
+    expect(
+      scan(
+        "planted.ts",
+        'export const SLASHES = /\\/*$/;\nimport { runDetail } from "@crewhaus/hangar-server";\n/** docs */\nimport { z } from "zod";\n',
+      ).violations,
+    ).toEqual(["planted.ts: imports runDetail from @crewhaus/hangar-server"]);
+    // daemon-cmd.ts may not take even an allowed name…
     expect(
       scan("daemon-cmd.ts", 'import { startHangarServer } from "@crewhaus/hangar-server";\n')
         .violations,
     ).toEqual([
       "daemon-cmd.ts: imports @crewhaus/hangar-server (startHangarServer) — it may not at all",
     ]);
+    // …nor hide one behind a comment.
+    expect(
+      scan(
+        "daemon-cmd.ts",
+        'import {\n  // the server\'s run detail, borrowed again\n  runDetail as serverRunDetail,\n} from "@crewhaus/hangar-server";\n',
+      ).violations,
+    ).toEqual(["daemon-cmd.ts: imports @crewhaus/hangar-server (runDetail) — it may not at all"]);
     // …and an allowed import, a `type` one or a commented one included, passes.
     expect(
       scan(
