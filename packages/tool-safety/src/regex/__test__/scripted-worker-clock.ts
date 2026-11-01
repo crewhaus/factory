@@ -18,14 +18,15 @@ const installed: {
 } = { worker: undefined, url: undefined, release: undefined };
 
 /**
- * The gate's slots: shared memory, so a terminated thread's count is still
+ * The gate's slots: shared memory, so a terminated thread's counts are still
  * read exactly. `PAUSE` is 1 while holds stop before their wait
  * ({@link ScriptedWorkerOptions.pauseHolds}).
  */
 const OPEN = 0;
 const EXECS = 1;
 const PAUSE = 2;
-const SLOTS = 3;
+const HELD_RETURNS = 3;
+const SLOTS = 4;
 
 /** How the scripted worker runs its holds. */
 export type ScriptedWorkerOptions = {
@@ -54,6 +55,13 @@ export type ScriptedWorker = {
    */
   execs(): number;
   /**
+   * How many `exec` calls over one of the `holds` have returned, counted as
+   * they return, in the memory {@link ScriptedWorker.execs} reads. One whose
+   * thread was terminated while it was held never returns: released, the
+   * thread stops at the held wait.
+   */
+  heldReturns(): number;
+  /**
    * Let every thread stopped before a hold's wait (`pauseHolds`) go on into
    * the wait, now and from now on; it is still held until
    * {@link ScriptedWorker.release}. Without `pauseHolds` there is nothing to
@@ -64,8 +72,9 @@ export type ScriptedWorker = {
    * Let every `exec` waiting on a hang or a hold go on, now and from now on:
    * a thread that was not terminated returns the engine's real answer, and
    * one whose `terminate()` a hold put off is terminated first and let go
-   * second, so it exits without starting another `exec`. Also done by
-   * {@link restoreWorkerClock}, so no test leaves a thread held.
+   * second, so it stops at the held wait, inside that `exec`, and starts no
+   * other. Also done by {@link restoreWorkerClock}, so no test leaves a
+   * thread held.
    */
   release(): void;
 };
@@ -100,11 +109,14 @@ export type ScriptedWorker = {
  * landed after the announcement and before the wait began (the thread
  * descheduled right after it posted) was honoured at the wait loop's header,
  * and the thread exited. Released, the put-off `terminate()` goes first and
- * the gate opens second, so the woken thread meets its termination where
- * JavaScriptCore next checks for it, after the held `exec` returns, and
- * starts no other, which `execs()` shows. Any other `terminate()` (a hang's,
- * a worker's whose thread is not inside a held exec, or one after the
- * release) is passed on at once. That is how a test keeps an abandoned
+ * the gate opens second, so the thread wakes with its termination already
+ * pending and meets it at the held wait. Unlike a real slow match, the held
+ * `exec` never returns: the thread computes no answer and starts no other
+ * `exec`, which `heldReturns()` and `execs()` show. (Opened first, the gate
+ * could let the thread return from the held `exec`, and run the next
+ * inputs, before the termination landed.) Any other `terminate()` (a
+ * hang's, a worker's whose thread is not inside a held exec, or one after
+ * the release) is passed on at once. That is how a test keeps an abandoned
  * thread a runaway for exactly as long as it needs, on any engine.
  *
  * All three lists are matched literally, `$` included. The rest of the
@@ -160,7 +172,9 @@ export function scriptWorkerClock(
     "  }",
     "  var cost = scriptedCosts.get(s);",
     "  if (cost !== undefined) scriptedNow += cost;",
-    "  return nativeExec.call(this, s);",
+    "  var answer = nativeExec.call(this, s);",
+    `  if (held) Atomics.add(scriptedGate, ${HELD_RETURNS}, 1);`,
+    "  return answer;",
     "};",
     "",
   ].join("\n");
@@ -203,9 +217,11 @@ export function scriptWorkerClock(
     }
   }
   const release = (): void => {
-    // Terminate first, open second: woken, a thread then meets its
-    // termination where JavaScriptCore next checks for it, after the held
-    // exec returns, and starts no other.
+    // Terminate first, open second: a thread then wakes with its termination
+    // pending and meets it at the held wait, so the held exec never returns
+    // and the thread starts no other. Opened first, the gate could let it
+    // return from the held exec and run the next inputs before the
+    // termination landed.
     for (const terminate of putOff.splice(0)) terminate();
     Atomics.store(gate, OPEN, 1);
     Atomics.store(gate, PAUSE, 0);
@@ -219,6 +235,7 @@ export function scriptWorkerClock(
   return {
     hung,
     execs: () => Atomics.load(gate, EXECS),
+    heldReturns: () => Atomics.load(gate, HELD_RETURNS),
     resume: () => {
       Atomics.store(gate, PAUSE, 0);
       Atomics.notify(gate, PAUSE);

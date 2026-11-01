@@ -94,7 +94,8 @@ describe("the scripted worker", () => {
     expect(await workersExited(500)).toEqual({ live: 1, runaway: 1 });
     scripted.release();
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
-    // It exited before "b".
+    // It exited inside the held exec, which never returned, so before "b".
+    expect(scripted.heldReturns()).toBe(0);
     expect(scripted.execs()).toBe(2);
   }, 90_000);
 
@@ -122,6 +123,7 @@ describe("the scripted worker", () => {
     expect(await workersExited(500)).toEqual({ live: 1, runaway: 1 });
     scripted.release();
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
+    expect(scripted.heldReturns()).toBe(0);
     expect(scripted.execs()).toBe(2);
   }, 90_000);
 
@@ -188,6 +190,8 @@ describe("the scripted worker", () => {
     );
     scripted.release();
     expect(await pending).toMatchObject({ status: "ok", result: { matched: true } });
+    // Not terminated, the held exec returned.
+    expect(scripted.heldReturns()).toBe(1);
     expect(scripted.execs()).toBe(1);
     expect(await workersExited(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
