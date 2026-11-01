@@ -8,7 +8,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./control": "./src/control.ts",
-    "./control-codegen": "./src/control-codegen.ts"
+    "./control-codegen": "./src/control-codegen.ts",
+    "./control-client": "./src/control-client.ts"
   },
   "scripts": {
     "test": "bun test src"

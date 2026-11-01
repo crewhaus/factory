@@ -249,7 +249,7 @@ export function parseEnvText(text: string): Record<string, string> {
  * Turn one raw `.env` scalar back into its value.
  *
  * Inside DOUBLE quotes, `\\` and `\"` are unescaped — the exact reverse of
- * the writer in `@crewhaus/hangar-server`'s `encodeEnvValue`, which escapes
+ * the writer's `encodeEnvValue` in `env-writer.ts` beside it, which escapes
  * both when it has to quote. Without that step the two halves disagreed and
  * a value containing a backslash or a double quote came back altered:
  * `K="a\"b"` read as `a\"b`, not `a"b`. Nothing in the current credential

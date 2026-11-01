@@ -314,3 +314,22 @@ export type {
   SupervisorSnapshot,
 } from "./supervisor";
 export { createHarnessSupervisor, DEFAULT_PUMP_INTERVAL_MS } from "./supervisor";
+
+// The manager-side helpers `@crewhaus/hangar-server` used to own, moved down
+// so that `crewhaus daemon` and the other heads reach them without depending
+// on the HTTP server (hangar-server re-exports them for one release). Run
+// detail and the job vocabulary are the `./run-detail` and `./job-kinds`
+// subpaths.
+export type { HarnessEnvFiles } from "./env-file";
+export { mergedSpawnEnv, readHarnessEnvFiles } from "./env-file";
+export type { EnvWriteResult } from "./env-writer";
+export {
+  ENV_ASSIGN_RE,
+  ENV_KEY_RE,
+  ENV_STUB_RE,
+  EnvWriteError,
+  unsetEnvVar,
+  upsertEnvVar,
+} from "./env-writer";
+export { harnessScrubber, spawnEnvScrubber } from "./harness-scrub";
+export { isSafePathSegment, resolveContained, resolveInside } from "./containment";

@@ -26,22 +26,36 @@
  * is `run_<16hex>` and therefore safe as a path segment on its face, but
  * "safe on its face" is exactly the assumption a planted symlink inside the
  * run dir defeats.
+ *
+ * WHERE THE HISTORY READERS LIVE. The ledger view, run detail, the log-path
+ * lookup and the two env scrubbers moved to `@crewhaus/harness-supervisor`
+ * (run detail is its `./run-detail` subpath), so `crewhaus daemon` reads run
+ * history without depending on this HTTP server. They are re-exported here,
+ * as the same bindings, for one release. `runDetail` is the exception: it
+ * stays a wrapper, because the masker stays at this server's exit — it
+ * injects {@link safeSpawnEnvScrubber} and `maskDeep` into the moved reader.
+ * Exit masking (the spec-credential scrubber and the Hangar allow-list) and
+ * the SSE bridge stay here.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type ExitClassification,
-  RUN_ID_RE,
-  type RunLedgerEntry,
-  type Scrubber,
   type SupervisionState,
   type SupervisorEvent,
   createEnvScrubber,
-  loadEnvChain,
-  readLogTail,
-  readRunLedger,
-  replayRunEvents,
+  harnessScrubber,
+  spawnEnvScrubber,
 } from "@crewhaus/harness-supervisor";
+import {
+  MAX_LEDGER_ROWS,
+  type RunDetail,
+  type RunsView,
+  isSupervisorRunId,
+  runDetail as readRunDetail,
+  runLogFile,
+  runsView,
+} from "@crewhaus/harness-supervisor/run-detail";
 import { REDACTED_VALUE, isCredentialKey } from "@crewhaus/spec-patch";
 import { MAX_JSONL_LINES } from "./constants";
 import { mergedSpawnEnv } from "./env-file";
@@ -49,64 +63,16 @@ import { hasLineBreak } from "./linear-mask";
 import { type TextScrubber, maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 
-export function isSupervisorRunId(id: string): boolean {
-  return RUN_ID_RE.test(id);
-}
-
-/** Newest-first ledger rows, capped. */
-export const MAX_LEDGER_ROWS = 200;
-
-export type RunsView = {
-  readonly runs: readonly RunLedgerEntry[];
-  readonly truncated: boolean;
+export {
+  harnessScrubber,
+  isSupervisorRunId,
+  MAX_LEDGER_ROWS,
+  runLogFile,
+  runsView,
+  spawnEnvScrubber,
+  type RunDetail,
+  type RunsView,
 };
-
-/** The run ledger, newest first. Torn lines are already tolerated by the
- *  supervisor's folding reader. */
-export function runsView(harnessDir: string, limit: number = MAX_LEDGER_ROWS): RunsView {
-  let all: RunLedgerEntry[];
-  try {
-    all = readRunLedger(harnessDir);
-  } catch {
-    return { runs: [], truncated: false };
-  }
-  all.reverse();
-  return { runs: all.slice(0, limit), truncated: all.length > limit };
-}
-
-export type RunDetail = {
-  readonly runId: string;
-  readonly entry: RunLedgerEntry | null;
-  /** Whether the run is the supervisor's CURRENT run (live feed available). */
-  readonly live: boolean;
-  /** Scrubbed TraceEvents the pump extracted, capped. */
-  readonly events: readonly unknown[];
-  readonly eventsTruncated: boolean;
-  /** Scrubbed trailing prose lines from the captured log. */
-  readonly proseTail: readonly string[];
-};
-
-/** A scrubber built from the harness's own `.env` chain — the supervisor's
- *  fallback default, and the weakest of the two. Kept exported because an
- *  adopted run's spawn env was never built by this process; prefer
- *  {@link spawnEnvScrubber}, which is a strict superset of it. */
-export function harnessScrubber(harnessDir: string): Scrubber {
-  return createEnvScrubber(loadEnvChain(harnessDir).vars);
-}
-
-/**
- * The scrubber the LIVE pump runs: the harness `.env` chain UNDER the
- * manager's own environment — `buildSpawnEnv`'s precedence, via the same
- * function the spawn plan uses. Serving history with anything weaker means a
- * key exported in the shell that launched the manager is `«KEY»` in the live
- * `output` frame and verbatim in the `replay` frame of the same stream.
- */
-export function spawnEnvScrubber(
-  harnessDir: string,
-  processEnv: Readonly<Record<string, string | undefined>>,
-): Scrubber {
-  return createEnvScrubber(mergedSpawnEnv(processEnv, harnessDir).env);
-}
 
 /**
  * Credential VALUES written as literals in the harness's own spec, keyed by
@@ -207,7 +173,16 @@ export function safeSpawnEnvScrubber(
   }
 }
 
-/** One run: ledger row + scrubbed events + scrubbed prose tail. */
+/**
+ * One run: ledger row + scrubbed events + scrubbed prose tail.
+ *
+ * The reader is `@crewhaus/harness-supervisor/run-detail`'s; this wrapper
+ * keeps the signature it had before the reader moved, and supplies the two
+ * things that stay at this server's exit: {@link safeSpawnEnvScrubber} (the
+ * spawn env widened with the spec's own credential values) and `maskDeep`, so
+ * `GET /runs/:runId` and the SSE `replay` frame are byte-identical to what
+ * they were.
+ */
 export function runDetail(
   harnessDir: string,
   runId: string,
@@ -219,38 +194,14 @@ export function runDetail(
     readonly env?: Readonly<Record<string, string | undefined>>;
   } = {},
 ): RunDetail | undefined {
-  if (!isSupervisorRunId(runId)) return undefined;
-  const eventsFile = resolveInside(harnessDir, [
-    ".crewhaus",
-    "run",
-    "logs",
-    `${runId}.events.jsonl`,
-  ]);
-  const logFile = resolveInside(harnessDir, [".crewhaus", "run", "logs", `${runId}.log`]);
-  const entry = readRunLedger(harnessDir).find((r) => r.runId === runId) ?? null;
-  // A run with no ledger row AND no captured artifacts never existed here.
-  if (entry === null && (eventsFile === undefined || !existsSync(eventsFile))) return undefined;
-  const maxEvents = opts.maxEvents ?? MAX_JSONL_LINES;
-  const all = eventsFile === undefined ? [] : replayRunEvents(eventsFile);
-  const events = all.slice(Math.max(0, all.length - maxEvents));
-  // ONE scrubber for BOTH halves of this payload. It sat on `proseTail` alone
-  // once, so the same response contradicted itself: an opaque credential this
-  // manager holds came back as `«NAME»` in the tail and verbatim in the
-  // events array beside it. The events were persisted by a pump that scrubbed
-  // with the SPAWN env — but an adopted run's events were written by a pump
-  // this process never built, so "already scrubbed" is an assumption, not a
-  // guarantee, and re-scrubbing a scrubbed string costs nothing.
-  const scrub = safeSpawnEnvScrubber(harnessDir, opts.env ?? process.env);
-  return {
-    runId,
-    entry,
-    live: opts.live === true,
+  return readRunDetail(harnessDir, runId, {
+    ...(opts.live !== undefined ? { live: opts.live } : {}),
+    maxEvents: opts.maxEvents ?? MAX_JSONL_LINES,
+    makeScrubber: () => safeSpawnEnvScrubber(harnessDir, opts.env ?? process.env),
     // maskDeep on top of the env scrubbing: the scrubber knows the harness's
     // own credential VALUES, the masker knows credential SHAPES.
-    events: events.map((e) => maskDeep(e, scrub)),
-    eventsTruncated: all.length > events.length,
-    proseTail: logFile === undefined ? [] : readLogTail(logFile, scrub).map(String),
-  };
+    mapEvent: maskDeep,
+  });
 }
 
 /** Whether a runId names a run that produced captured artifacts. */
@@ -448,13 +399,6 @@ export function runEventStream(options: RunStreamOptions): Response {
     },
   });
   return new Response(stream, { headers: SSE_HEADERS });
-}
-
-/** Path of a run's captured log, containment-checked. Exported for the
- *  `crewhaus daemon logs` verb, which reads it through the same scrubber. */
-export function runLogFile(harnessDir: string, runId: string): string | undefined {
-  if (!isSupervisorRunId(runId)) return undefined;
-  return resolveInside(harnessDir, [".crewhaus", "run", "logs", `${runId}.log`]) ?? undefined;
 }
 
 /** `.crewhaus/run` under a harness, containment-checked. */

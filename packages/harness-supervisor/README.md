@@ -142,6 +142,34 @@ reopens them as `interrupted`. Every stop is bounded by a deadline — a child
 that will not die must not stop the manager from exiting — and the report
 names what survived and what the next manager will do with it.
 
+## Manager helpers
+
+What a manager needs on top of supervision lives here as well, so the console
+and `crewhaus daemon` share one implementation and neither depends on the
+other. `@crewhaus/hangar-server` still re-exports every one of these names, for
+one release.
+
+| Import | What it gives you |
+|---|---|
+| `@crewhaus/harness-supervisor/run-detail` | `runsView` (the run ledger, newest first), `runDetail` (one run: its ledger row, its events and the scrubbed tail of its log), `runLogFile`, `isSupervisorRunId` |
+| `@crewhaus/harness-supervisor/job-kinds` | the closed job vocabulary: `JOB_KINDS`, `isJobKind`, and `jobArgv`, which builds a job's `crewhaus` argv and throws `JobArgumentError` for an argument that is not a plain name or harness-relative path |
+| `@crewhaus/harness-supervisor` | `mergedSpawnEnv` and `readHarnessEnvFiles` (the env a spawn would get, and the chain it comes from), the scrubbers `harnessScrubber` and `spawnEnvScrubber`, the path checks `resolveInside`, `resolveContained` and `isSafePathSegment`, and the `.env` writer |
+
+`runDetail` replaces the values it knows (the merged spawn env) by default. A
+server that also masks credential *shapes* passes its own `makeScrubber` and
+`mapEvent`.
+
+### The `.env` writer
+
+`upsertEnvVar(path, key, value)` and `unsetEnvVar(path, key)` are the only
+writers of env values, and they sit beside `parseEnvText`, the reader every
+spawn environment is built with, so a value comes back byte for byte. They keep
+comments and line order, promote a `# KEY=` stub in place, never delete a line
+(unset leaves a `# KEY=` stub), and leave the file at mode 0600. A name that is
+not a variable name, or a value with a newline or a NUL, is refused with an
+`EnvWriteError` that names the variable and never the value. Any other failure
+is thrown as it came.
+
 ## Testing
 
 Every seam is injectable — `ProcessOps`, `Clock`, the plan builder, the gate,

@@ -10,9 +10,26 @@
  *
  * Values only: `Object.keys` cannot see a type. Every type name `src/index.ts`
  * lists is checked by `tsc -b` instead, which fails if one stops resolving.
+ *
+ * A moved name must also be the SAME binding as at its new home, never a
+ * copy: `server.ts` catches `JobArgumentError` with `instanceof`, and a
+ * second copy of any helper is how two readers drift apart. The identity
+ * table below holds every value this entry reaches that now lives lower.
  */
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME } from "@crewhaus/gateway-protocol/control";
+import * as controlClientHome from "@crewhaus/gateway-protocol/control-client";
+import * as supervisorHome from "@crewhaus/harness-supervisor";
+import * as jobKindsHome from "@crewhaus/harness-supervisor/job-kinds";
+import * as runDetailHome from "@crewhaus/harness-supervisor/run-detail";
+import * as controlClientModule from "./control-client";
+import * as credsOpsModule from "./creds-ops";
+import * as envFileModule from "./env-file";
 import * as entry from "./index";
+import * as processModule from "./process";
+import * as runsModule from "./runs";
+import * as safetyModule from "./safety";
 import * as scaffolded from "./scaffolded-workflows";
 
 /** `Object.keys(await import("./index")).sort()`, captured before the move. */
@@ -263,5 +280,120 @@ describe("the export surface", () => {
     const live = Object.keys(scaffolded).sort();
     expect(live).toHaveLength(5);
     expect(live).toEqual([...SCAFFOLDED_VALUES]);
+  });
+});
+
+type Namespace = Readonly<Record<string, unknown>>;
+
+/**
+ * Every value `./index` reaches that now lives in a lower package, with that
+ * home. `parseEnvText` already lived in harness-supervisor before the move.
+ */
+const MOVED: ReadonlyArray<readonly [name: string, home: Namespace]> = [
+  ["createControlClient", controlClientHome],
+  ["isControlLane", controlClientHome],
+  ["knownControlPort", controlClientHome],
+  ["parseControlPort", controlClientHome],
+  ["CONTROL_LANES", controlClientHome],
+  ["CONTROL_LISTENING_RE", controlClientHome],
+  ["mergedSpawnEnv", supervisorHome],
+  ["readHarnessEnvFiles", supervisorHome],
+  ["parseEnvText", supervisorHome],
+  ["harnessScrubber", supervisorHome],
+  ["spawnEnvScrubber", supervisorHome],
+  ["isSupervisorRunId", runDetailHome],
+  ["runsView", runDetailHome],
+  ["runLogFile", runDetailHome],
+  ["isSafePathSegment", supervisorHome],
+  ["resolveContained", supervisorHome],
+  ["resolveInside", supervisorHome],
+  ["jobArgv", jobKindsHome],
+  ["isJobKind", jobKindsHome],
+  ["JOB_KINDS", jobKindsHome],
+  ["JobArgumentError", jobKindsHome],
+];
+
+/** The same, module by module: the re-export modules keep every value they
+ *  defined, and the modules that keep code re-export the rest. */
+const MODULE_MOVES: ReadonlyArray<
+  readonly [module: string, ns: Namespace, name: string, home: Namespace]
+> = [
+  ["control-client", controlClientModule, "DEFAULT_CONTROL_TIMEOUT_MS", controlClientHome],
+  ["runs", runsModule, "MAX_LEDGER_ROWS", runDetailHome],
+  ["creds-ops", credsOpsModule, "ENV_KEY_RE", supervisorHome],
+];
+
+/** Pure re-export modules: exactly the values each defined before the move. */
+const REEXPORT_MODULES: ReadonlyArray<
+  readonly [module: string, ns: Namespace, values: readonly string[]]
+> = [
+  [
+    "control-client",
+    controlClientModule,
+    [
+      "CONTROL_LANES",
+      "CONTROL_LISTENING_RE",
+      "DEFAULT_CONTROL_TIMEOUT_MS",
+      "createControlClient",
+      "isControlLane",
+      "knownControlPort",
+      "parseControlPort",
+    ],
+  ],
+  ["env-file", envFileModule, ["mergedSpawnEnv", "parseEnvText", "readHarnessEnvFiles"]],
+  ["safety", safetyModule, ["isSafePathSegment", "resolveContained", "resolveInside"]],
+];
+
+describe("moved names are re-exported, not copied", () => {
+  test("each of the 21 is the same binding as at its new home", () => {
+    expect(MOVED).toHaveLength(21);
+    for (const [name, home] of MOVED) {
+      // The name must exist at the home: two undefineds would compare equal.
+      expect(`${name}:${home[name] !== undefined}`).toBe(`${name}:true`);
+      expect(`${name}:${(entry as Namespace)[name] === home[name]}`).toBe(`${name}:true`);
+    }
+  });
+
+  test("the module-level re-exports are the same bindings too", () => {
+    for (const [module, ns, name, home] of MODULE_MOVES) {
+      expect(`${module}.${name}:${home[name] !== undefined}`).toBe(`${module}.${name}:true`);
+      expect(`${module}.${name}:${ns[name] === home[name]}`).toBe(`${module}.${name}:true`);
+    }
+    // The process layer re-exports the job vocabulary it used to define.
+    for (const name of ["jobArgv", "isJobKind", "JOB_KINDS", "JobArgumentError"]) {
+      expect(
+        `process.${name}:${(processModule as Namespace)[name] === (jobKindsHome as Namespace)[name]}`,
+      ).toBe(`process.${name}:true`);
+    }
+  });
+
+  test("the re-export modules keep exactly the values they defined", () => {
+    for (const [module, ns, values] of REEXPORT_MODULES) {
+      expect(`${module}:${JSON.stringify(Object.keys(ns).sort())}`).toBe(
+        `${module}:${JSON.stringify(values)}`,
+      );
+    }
+  });
+
+  test("a job-argument refusal thrown below is still caught by the class the server checks", () => {
+    let caught: unknown;
+    try {
+      jobKindsHome.jobArgv("eval", { dataset: "../outside" });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(entry.JobArgumentError);
+    expect(caught).toBeInstanceOf(processModule.JobArgumentError);
+  });
+
+  test("the control client reads the token from the path the supervisor records", () => {
+    // The client builds the path from the protocol's own constants (the ones
+    // the daemon writes it with); the supervisor's `controlTokenPath` is what
+    // a runfile records. If they ever diverge, every wake and drain answers
+    // `no_control_token` against a daemon that minted one.
+    const dir = join("some", "harness");
+    expect(join(dir, CONTROL_RUN_DIR, CONTROL_TOKEN_FILENAME)).toBe(
+      supervisorHome.controlTokenPath(dir),
+    );
   });
 });

@@ -52,9 +52,18 @@
  * harness through that harness's own `upsertEnvVar`, it reports per-harness
  * outcomes, and it keeps NOTHING.
  */
-import { chmodSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename } from "node:path";
-import { unquoteEnvValue as supervisorUnquoteEnvValue } from "@crewhaus/harness-supervisor";
+import {
+  ENV_ASSIGN_RE,
+  ENV_KEY_RE,
+  ENV_STUB_RE,
+  EnvWriteError,
+  type EnvWriteResult,
+  unquoteEnvValue as supervisorUnquoteEnvValue,
+  unsetEnvVar as supervisorUnsetEnvVar,
+  upsertEnvVar as supervisorUpsertEnvVar,
+} from "@crewhaus/harness-supervisor";
 import {
   CHANNEL_ENV_PLATFORMS,
   type ChannelEnvPlatform,
@@ -182,16 +191,14 @@ export function loweredChannels(doc: YamlNode): ReturnType<typeof lowerSpecChann
 // ---------------------------------------------------------------------------
 
 /** A syntactically valid environment variable name. Checked before any name
- *  becomes an `.env` line or a grid column. */
-export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+ *  becomes an `.env` line or a grid column. It lives with the writer in
+ *  `@crewhaus/harness-supervisor`, and is re-exported here for one release;
+ *  the `.env` line grammar `readEnvFileFacts` matches lives there too. */
+export { ENV_KEY_RE };
 
 /** The harness env-file chain, in precedence order (later wins). Mirrors
  *  `env-file.ts`'s chain so the editor edits the file the reader reads. */
 export const ENV_CHAIN = [".env", ".env.local"] as const;
-
-const ENV_ASSIGN_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/;
-const ENV_STUB_RE = /^[ \t]*#[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/;
-const ENV_EXPORT_PREFIX_RE = /^[ \t]*export[ \t]+/;
 
 /** What the harness's own env files say — the RAW file view, distinct from
  *  the merged spawn environment. Values stay inside this object. */
@@ -245,8 +252,9 @@ export function readEnvFileFacts(
 }
 
 /**
- * Turn one raw `.env` scalar back into its value — the exact inverse of
- * {@link encodeEnvValue}, which is the property that matters here.
+ * Turn one raw `.env` scalar back into its value — the exact inverse of the
+ * writer's `encodeEnvValue` (in `@crewhaus/harness-supervisor`, beside this
+ * reader's implementation), which is the property that matters here.
  *
  * It is the supervisor's `unquoteEnvValue`, imported rather than restated so
  * the reader that answers "what is this variable set to?" cannot drift from
@@ -493,139 +501,47 @@ export function anthropicPrecedence(env: Readonly<Record<string, string | undefi
 // The writer — the ONLY path a value takes into a file
 // ---------------------------------------------------------------------------
 
-/** Encode a value as one `.env` scalar. Quoted whenever bare text would be
- *  re-read differently (whitespace, `#`, quotes); `\` and `"` escaped. */
-function encodeEnvValue(value: string): string {
-  if (value === "") return "";
-  if (/^[A-Za-z0-9_./:@+-]+$/.test(value)) return value;
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+/**
+ * Result of one env write — presence only. The writer lives in
+ * `@crewhaus/harness-supervisor`; re-exported here for one release.
+ */
+export type { EnvWriteResult };
+
+/**
+ * The writer's refusal, answered as a 400 — and nothing else.
+ *
+ * The writer (`@crewhaus/harness-supervisor`'s `upsertEnvVar`) is a library
+ * and cannot speak HTTP: it refuses with an `EnvWriteError` whose message
+ * names the variable and never the value. Exactly that error becomes
+ * `HttpError(400, message)`. Every other error passes through untouched, so
+ * a filesystem failure still reads "write failed" in set-across instead of
+ * repeating a path in a 400.
+ */
+function asHttpRefusal<T>(write: () => T): T {
+  try {
+    return write();
+  } catch (err) {
+    if (err instanceof EnvWriteError) throw new HttpError(400, err.message);
+    throw err;
+  }
 }
 
 /**
- * Result of one env write — presence only, and deliberately so.
- *
- * The field is `variable`, not `key`: `maskDeep` redacts every value under a
- * key literally NAMED `key` (that is what keeps a spec's `api_key` out of a
- * response), so a field called `key` would come back as `[redacted]` and the
- * panel would lose the very NAME it is trying to report.
- */
-export type EnvWriteResult = {
-  readonly variable: string;
-  /** `set` when a live assignment now exists, `commented-stub` after unset. */
-  readonly state: "set" | "commented-stub";
-  /** How the line got there. */
-  readonly how: "replaced" | "uncommented" | "appended" | "commented";
-  readonly file: string;
-};
-
-/**
- * Write `KEY=value` into `path`, the ONE writer for env values.
- *
- * Ordering and comments are preserved: an existing live assignment is
- * rewritten in place (keeping any `export ` prefix), a `# KEY=` stub is
- * promoted in place so the key stays where the operator left it, and only a
- * genuinely new key is appended. The file is written 0600 AND chmod'ed to
- * 0600 afterwards — `writeFileSync`'s `mode` only applies at CREATION, so an
- * already-loose `.env` would otherwise stay loose.
- *
- * The value is a parameter and a local. It is never returned, never logged,
- * and never stored.
+ * Write `KEY=value` into `path`, the ONE writer for env values: ordering and
+ * comments preserved, a `# KEY=` stub promoted in place, 0600 enforced. The
+ * value is a parameter and a local — never returned, logged or stored.
+ * Refuses a bad name or an unrepresentable value with a 400.
  */
 export function upsertEnvVar(path: string, key: string, value: string): EnvWriteResult {
-  if (!ENV_KEY_RE.test(key)) throw new HttpError(400, `"${key}" is not a valid variable name`);
-  if (value.includes("\n") || value.includes("\0")) {
-    throw new HttpError(
-      400,
-      `the value for ${key} contains a newline — .env cannot represent that`,
-    );
-  }
-  const lines = readEnvLines(path);
-  const encoded = encodeEnvValue(value);
-  let how: EnvWriteResult["how"] = "appended";
-  let written = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] as string;
-    if (line.match(ENV_ASSIGN_RE)?.[1] === key) {
-      const prefix = ENV_EXPORT_PREFIX_RE.test(line) ? "export " : "";
-      lines[i] = `${prefix}${key}=${encoded}`;
-      how = "replaced";
-      written = true;
-      break;
-    }
-    if (line.match(ENV_STUB_RE)?.[1] === key) {
-      lines[i] = `${key}=${encoded}`;
-      how = "uncommented";
-      written = true;
-      break;
-    }
-  }
-  if (!written) appendEnvLine(lines, `${key}=${encoded}`);
-  writeEnvFile(path, lines);
-  return { variable: key, state: "set", how, file: basename(path) };
+  return asHttpRefusal(() => supervisorUpsertEnvVar(path, key, value));
 }
 
 /**
- * Unset `key` by rewriting its line as a `# KEY=` stub.
- *
- * There is no delete. A removed line takes the requirement's NAME with it,
- * and the next doctor run has to rediscover it; a stub keeps the checklist
- * honest and is exactly what `doctor --fix` appends.
+ * Unset `key` by rewriting its line as a `# KEY=` stub — there is no delete,
+ * so the required name stays visible. Refuses a bad name with a 400.
  */
 export function unsetEnvVar(path: string, key: string): EnvWriteResult {
-  if (!ENV_KEY_RE.test(key)) throw new HttpError(400, `"${key}" is not a valid variable name`);
-  const lines = readEnvLines(path);
-  let how: EnvWriteResult["how"] = "appended";
-  let written = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] as string;
-    if (line.match(ENV_ASSIGN_RE)?.[1] === key) {
-      lines[i] = `# ${key}=`;
-      how = "commented";
-      written = true;
-      break;
-    }
-    if (line.match(ENV_STUB_RE)?.[1] === key) {
-      how = "commented";
-      written = true;
-      break; // already a stub — idempotent
-    }
-  }
-  if (!written) appendEnvLine(lines, `# ${key}=`);
-  writeEnvFile(path, lines);
-  return { variable: key, state: "commented-stub", how, file: basename(path) };
-}
-
-/**
- * The file's lines WITHOUT the empty element a trailing newline produces.
- *
- * `writeEnvFile` re-adds exactly one terminating newline, so carrying that
- * empty element through would append a blank line on every single write —
- * a `.env` that grows a line each time the operator touches a variable.
- */
-function readEnvLines(path: string): string[] {
-  if (!existsSync(path)) return [];
-  try {
-    const text = readFileSync(path, "utf8");
-    if (text === "") return [];
-    const lines = text.split("\n");
-    if (lines[lines.length - 1] === "") lines.pop();
-    return lines;
-  } catch {
-    return [];
-  }
-}
-
-function appendEnvLine(lines: string[], line: string): void {
-  lines.push(line);
-}
-
-function writeEnvFile(path: string, lines: readonly string[]): void {
-  writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
-  try {
-    chmodSync(path, 0o600);
-  } catch {
-    // a filesystem without POSIX modes — the write itself still succeeded
-  }
+  return asHttpRefusal(() => supervisorUnsetEnvVar(path, key));
 }
 
 // ---------------------------------------------------------------------------
