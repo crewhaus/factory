@@ -35,13 +35,9 @@ import {
   type ControlLane,
   type ControlResult,
   createControlClient,
-  harnessScrubber,
   isControlLane,
   knownControlPort,
-  mergedSpawnEnv,
-  runDetail,
-  runLogFile,
-} from "@crewhaus/hangar-server";
+} from "@crewhaus/gateway-protocol/control-client";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { type HangarRegistry, openHangarRegistry } from "@crewhaus/harness-registry";
 import {
@@ -58,7 +54,9 @@ import {
   createProcessOps,
   formatGateRefusal,
   formatPrepareRefusal,
+  harnessScrubber,
   loadEnvChain,
+  mergedSpawnEnv,
   readHookRunLog,
   readLogTail,
   readManagerSettings,
@@ -71,6 +69,7 @@ import {
   runPreflightGate,
   systemClock,
 } from "@crewhaus/harness-supervisor";
+import { runDetail, runLogFile } from "@crewhaus/harness-supervisor/run-detail";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { hashSpecSource, readBundleSpecStamp } from "./bundle-manifest";
 import { envChainLines } from "./env-chain-view";

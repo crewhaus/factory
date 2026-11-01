@@ -423,6 +423,12 @@ console.log(`${server.url}/#t=${server.token}`); // token travels as a URL fragm
 await server.stop();
 ```
 
+The helpers `crewhaus daemon` shares with this server now live in
+`@crewhaus/gateway-protocol/control-client` (the control.v1 client) and
+`@crewhaus/harness-supervisor` (run detail, the job vocabulary, the env merge and
+`.env` writer, the scrubbers, path containment); this package re-exports them
+for one release.
+
 Options cover the bind host/port, hangar root, registry root, explicit
 token / `noAuth`, prebuilt static `assets` (the CLI injects the embedded
 UI; absent assets get a minimal built-in index page), an injectable

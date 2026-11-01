@@ -50,6 +50,7 @@
     { "path": "../../packages/cloud-adapter-railway" },
     { "path": "../../packages/cloud-adapter-heroku" },
     { "path": "../../packages/event-log" },
+    { "path": "../../packages/gateway-protocol" },
     { "path": "../../packages/gateway-server" },
     { "path": "../../packages/tenancy" },
     { "path": "../../packages/hooks-engine" },
