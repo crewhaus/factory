@@ -519,10 +519,10 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
       undetermined: [],
     });
     // The terminated thread is still inside the held exec, as one inside a
-    // slow real match is. Once that exec returns, terminate() stops the
-    // batch before its next line, and the thread exits: not one of the 149
-    // lines after it runs. Without terminate() it would run them all, and
-    // never exit.
+    // slow real match is. Released, it stops there: the scripted worker
+    // passes the terminate() on before it opens the gate, so that exec never
+    // returns, and not one of the 149 lines after it runs. Without
+    // terminate() it would run them all, and never exit.
     expect(regexWorkerCounts().runaway).toBe(1);
     scripted.release();
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
