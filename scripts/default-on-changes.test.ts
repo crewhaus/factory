@@ -12,7 +12,7 @@
  * tool's verdicts in every harness that grants it, and that missed the list
  * too.
  *
- * So each change is FOUND in the code that makes it, and the list must name
+ * So each change is FOUND in the code that makes it, and a list must name
  * what was found: the roots the runtime protects in a run without the block,
  * every tool that checks its own writes against them, every WebFetch header
  * line 0.7.x did not print, every block the edge says it does not run
@@ -23,9 +23,16 @@
  * asserts it found something, so a scan that silently matches nothing fails
  * too.
  *
- * A default-on change of another kind adds a check here and a bullet there.
+ * The guard reads 0.8.0's list, under `PROVABILITY_HEADING`, and every later
+ * release's list, under `DEFAULT_ON_HEADING`, which sits in `## [Unreleased]`
+ * until the release is cut. 0.8.0's list is released and does not change. It
+ * names more than 0.8.0 shipped, so the roots and tools checks count a name in
+ * it only for what 0.8.0 shipped: a root or tool found since must be named in
+ * a later list. A new kind of default-on change adds a check here and a bullet
+ * in the `## [Unreleased]` list.
  */
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
@@ -34,32 +41,103 @@ import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 
 const ROOT = dirname(import.meta.dir);
-const HEADING = "**Changes that can affect a harness without `provability:`.**";
+/** 0.8.0's list, as released. It does not change. */
+const PROVABILITY_HEADING = "**Changes that can affect a harness without `provability:`.**";
+/** Every later release's list, in `## [Unreleased]` until the release is cut. */
+const DEFAULT_ON_HEADING = "**Changes that can affect a harness without opting in.**";
+/**
+ * The headings that open a list, each matched byte for byte. An explicit
+ * list, not a prefix or a pattern: a release that writes a heading of its own
+ * has to add it here on purpose, rather than have the guard match it
+ * silently.
+ */
+const HEADINGS = [PROVABILITY_HEADING, DEFAULT_ON_HEADING] as const;
+/** Every list but 0.8.0's: where a root or tool 0.8.0 did not ship is listed. */
+const LATER_HEADINGS = HEADINGS.filter((heading) => heading !== PROVABILITY_HEADING);
+/**
+ * What 0.8.0's list was written for: the roots the runtime-state floor
+ * protects in a run without the block, and the tools that check their own
+ * writes against them. The list names more than these: `.crewhaus` itself,
+ * the directory that holds the roots, and tools it names only to say they run
+ * as before, such as `ArchiveCreate` and `GitCommit`. So the roots and tools
+ * checks count a name in it only for these (`unlisted`). The other checks
+ * still count a name in any list.
+ */
+const SHIPPED_ROOTS = [".crewhaus/sessions", ".crewhaus/tool-results", ".crewhaus/proofs"] as const;
+const SHIPPED_TOOLS = [
+  "ArchiveExtract",
+  "CopyPath",
+  "GitApplyPatch",
+  "MovePath",
+  "RemovePath",
+  "StateImport",
+  "StoreMigrate",
+] as const;
 
 /**
- * The bullets under every copy of the heading (each release that makes such
- * changes lists its own), each folded onto one line. A bullet runs to the
- * next one; the list ends at the next bold paragraph (`**What's new.**`).
+ * The bullets of every list in `text` that one of `headings` opens, in
+ * document order, each folded onto one line. A heading opens a list only
+ * where a line starts with it: a mention mid-line opens nothing, and the
+ * rest of the heading's line is the list's intro, not a bullet. A bullet
+ * starts at a line that begins `- ` and takes in the lines after it up to a
+ * blank line or the next bullet. A list ends at the next bold paragraph
+ * (0.8.0's ends at `**The 0.7.1 hardening.**`) or at the next Markdown
+ * heading, such as a `### Fixed` after it or the `## [` of the entry below,
+ * so a bullet outside a list cannot satisfy a check.
  */
-function withoutBlockBullets(): string[] {
-  const text = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8").replace(/\r\n/g, "\n");
+function defaultOnBullets(text: string, headings: readonly string[] = HEADINGS): string[] {
   const bullets: string[] = [];
-  for (let at = text.indexOf(HEADING); at >= 0; at = text.indexOf(HEADING, at + 1)) {
-    let open = false;
-    for (const line of text.slice(at + HEADING.length).split("\n")) {
-      if (line.startsWith("**")) break;
-      if (line.startsWith("- ")) {
-        bullets.push(line.slice(2).trim());
-        open = true;
-      } else if (line.trim() === "") {
-        open = false;
-      } else if (open) {
-        bullets[bullets.length - 1] += ` ${line.trim()}`;
-      }
+  let inList = false;
+  let open = false;
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    if (headings.some((heading) => line.startsWith(heading))) {
+      inList = true;
+      open = false;
+      continue;
+    }
+    if (!inList) continue;
+    if (line.startsWith("**") || /^#{1,6}(\s|$)/.test(line)) {
+      inList = false;
+      open = false;
+      continue;
+    }
+    if (line.startsWith("- ")) {
+      bullets.push(line.slice(2).trim());
+      open = true;
+    } else if (line.trim() === "") {
+      open = false;
+    } else if (open) {
+      bullets[bullets.length - 1] += ` ${line.trim()}`;
     }
   }
   return bullets;
 }
+
+/**
+ * The items in `found` the notes do not name as `` `item` ``, in the order
+ * given. An item 0.8.0 shipped, one of `shipped`, may be named in any list
+ * (`notes`); any other item must be named in a later list (`laterNotes`). The
+ * third argument is required, so no check falls back to 0.8.0's list for a
+ * name 0.8.0 did not ship.
+ */
+function unlisted(
+  found: Iterable<string>,
+  notes: string,
+  { shipped, laterNotes }: { readonly shipped: readonly string[]; readonly laterNotes: string },
+): string[] {
+  return [...found].filter((item) => {
+    const listing = shipped.includes(item) ? notes : laterNotes;
+    return !listing.includes(`\`${item}\``);
+  });
+}
+
+/** The real notes, read once. */
+const changelog = readFileSync(join(ROOT, "CHANGELOG.md"), "utf8");
+/** Every bullet of every default-on list, 0.8.0's and every later release's. */
+const bullets = defaultOnBullets(changelog);
+const notes = bullets.join("\n");
+/** Every later release's list alone: where a root or tool 0.8.0 did not ship must be named. */
+const laterNotes = defaultOnBullets(changelog, LATER_HEADINGS).join("\n");
 
 /** Workspace source files (tracked or new, never dist or a test) that contain `needle`. */
 function sourcesContaining(needle: string): string[] {
@@ -180,10 +258,264 @@ async function crossCheck(
   }
 }
 
-describe("the release notes name every change a harness without provability: sees", () => {
-  const bullets = withoutBlockBullets();
-  const notes = bullets.join("\n");
+describe("the guard reads every release's default-on list", () => {
+  test("both headings are in the CHANGELOG, each where it belongs", () => {
+    // Line by line, as the parser reads it. This never looks for
+    // `## [Unreleased]` itself, so the release can retitle that entry with
+    // its version and this still holds.
+    const lines = changelog.replace(/\r\n/g, "\n").split("\n");
+    const startingWith = (heading: string): number[] =>
+      lines.flatMap((line, i) => (line.startsWith(heading) ? [i] : []));
+    const entry = lines.indexOf("## [0.8.0] - 2026-10-25");
+    expect(entry).toBeGreaterThan(-1);
+    const nextEntry = lines.findIndex((line, i) => i > entry && line.startsWith("## ["));
+    expect(nextEntry).toBeGreaterThan(entry);
+    // 0.8.0's list: once, inside 0.8.0's entry.
+    const provability = startingWith(PROVABILITY_HEADING);
+    expect(provability).toHaveLength(1);
+    expect(provability[0]).toBeGreaterThan(entry);
+    expect(provability[0]).toBeLessThan(nextEntry);
+    // Every later release's list: inside an entry above 0.8.0's, never in
+    // the preamble. The line numbers of any copy out of place:
+    const firstEntry = lines.findIndex((line) => line.startsWith("## ["));
+    const defaultOn = startingWith(DEFAULT_ON_HEADING);
+    expect(defaultOn.length).toBeGreaterThan(0);
+    expect(defaultOn.filter((i) => i < firstEntry || i > entry).map((i) => i + 1)).toEqual([]);
+  });
 
+  test("0.8.0's list is released, so it neither grows nor changes", () => {
+    // The 13 bullets 0.8.0 shipped with, folded and joined as the parser
+    // reads them. A later default-on change is listed under
+    // DEFAULT_ON_HEADING, in `## [Unreleased]`, and a correction goes in the
+    // newest entry, as `### Corrections to the 0.7.0 notes` did. Without
+    // this, a change could pass every check in this file by joining a list
+    // that has already shipped, or by editing one of its bullets.
+    const shipped = defaultOnBullets(changelog, [PROVABILITY_HEADING]);
+    expect(shipped).toHaveLength(13);
+    expect(createHash("sha256").update(shipped.join("\n")).digest("hex")).toBe(
+      "a671f6e37147a2bc254c9a9923d438917b20f256cd58f37ebb50f6e81528ea71",
+    );
+  });
+
+  // The parser on notes written here, so each rule is tested alone.
+
+  /** An `## [Unreleased]` entry shaped like the real one, its list holding `items`. */
+  const unreleasedEntry = (...items: string[]): string[] => [
+    "## [Unreleased]",
+    "",
+    "### Changed",
+    "",
+    "#### Before you upgrade",
+    "",
+    `${DEFAULT_ON_HEADING} No spec has to turn`,
+    "these on: they reach every harness that uses what each one names.",
+    "",
+    ...items,
+    "",
+  ];
+  /** 0.8.0's entry shaped like the real one, its list holding `items`, then the 0.7.1 hardening. */
+  const releasedEntry = (...items: string[]): string[] => [
+    "## [0.8.0] - 2026-10-25",
+    "",
+    "### Changed",
+    "",
+    "#### Before you upgrade",
+    "",
+    `${PROVABILITY_HEADING} The gate is off`,
+    "until a spec turns it on, but these changes reach every harness that uses",
+    "what each one names.",
+    "",
+    ...items,
+    "",
+    "**The 0.7.1 hardening.** Most 0.7.0 specs compile and run unchanged.",
+    "",
+    "- **Bun 1.3.14 or later.** A hardening change, in no default-on list.",
+    "",
+  ];
+
+  test("both lists are read, in document order, and `headings` chooses which", () => {
+    const text = [
+      ...unreleasedEntry("- **New one.** Listed first.", "- **New two.** Listed second."),
+      ...releasedEntry("- **Old one.** Listed in 0.8.0."),
+    ].join("\n");
+    expect(defaultOnBullets(text)).toEqual([
+      "**New one.** Listed first.",
+      "**New two.** Listed second.",
+      "**Old one.** Listed in 0.8.0.",
+    ]);
+    expect(defaultOnBullets(text, [DEFAULT_ON_HEADING])).toEqual([
+      "**New one.** Listed first.",
+      "**New two.** Listed second.",
+    ]);
+    expect(defaultOnBullets(text, [PROVABILITY_HEADING])).toEqual([
+      "**Old one.** Listed in 0.8.0.",
+    ]);
+  });
+
+  test("a list ends at the next bold paragraph and at the next heading", () => {
+    // A bullet after each end, with no list heading in between, is not the
+    // list's. Keyed by the end, so a failure names the rule that broke.
+    const ends = [
+      "**The 0.7.1 hardening.** Most 0.7.0 specs compile and run unchanged.",
+      "### Fixed",
+      "## [0.8.0] - 2026-10-25",
+    ];
+    const listEndingAt = (end: string): string =>
+      [
+        `${DEFAULT_ON_HEADING} No spec has to turn these on.`,
+        "",
+        "- **Listed.** It is in the list.",
+        "",
+        end,
+        "",
+        "- **After the end.** It is not.",
+        "",
+      ].join("\n");
+    expect(
+      Object.fromEntries(ends.map((end) => [end, defaultOnBullets(listEndingAt(end))])),
+    ).toEqual(Object.fromEntries(ends.map((end) => [end, ["**Listed.** It is in the list."]])));
+  });
+
+  test("a heading opens a list only at the start of a line", () => {
+    // A bullet that quotes the heading mid-line, or wraps so that its
+    // continuation line starts with it, opens nothing, and the bullets after
+    // it are in no list.
+    const text = [
+      "### Changed",
+      "",
+      `- **The notes moved.** A default-on change is listed under ${DEFAULT_ON_HEADING}`,
+      "- **It wraps.** A default-on change is listed under",
+      `  ${DEFAULT_ON_HEADING} as well.`,
+      "- **Another change.** It is in no list.",
+      "",
+    ].join("\n");
+    expect(defaultOnBullets(text)).toEqual([]);
+  });
+
+  test("a bullet folds onto one line, a blank line closes it, and the intro is no bullet", () => {
+    const text = [
+      `${DEFAULT_ON_HEADING} The intro on the heading's line,`,
+      "and the intro's next line, are not bullets.",
+      "",
+      "- **Folded.** A bullet's first line",
+      "  and its continuation come back as one line.",
+      "- **Closed.** A blank line closes this bullet.",
+      "",
+      "A paragraph after the blank line is not appended to it.",
+      "",
+      "- **Also closed.** So does a line of spaces.",
+      "   ",
+      "Nor is a paragraph after that.",
+      "",
+      "- **Next.** A bullet after the paragraphs.",
+      "",
+    ].join("\n");
+    const expected = [
+      "**Folded.** A bullet's first line and its continuation come back as one line.",
+      "**Closed.** A blank line closes this bullet.",
+      "**Also closed.** So does a line of spaces.",
+      "**Next.** A bullet after the paragraphs.",
+    ];
+    expect(defaultOnBullets(text)).toEqual(expected);
+    expect(defaultOnBullets(text.replace(/\n/g, "\r\n"))).toEqual(expected);
+  });
+
+  test("an empty list reads nothing, and swallows nothing after it", () => {
+    const text = [
+      ...unreleasedEntry(),
+      "## [0.8.0] - 2026-10-25",
+      "",
+      "- **A summary bullet.** It is in no list.",
+      "",
+      "### Changed",
+      "",
+      "- **A change.** Nor is this one.",
+      "",
+    ].join("\n");
+    expect(defaultOnBullets(text)).toEqual([]);
+  });
+
+  test("a planted default-on change fails until the newest list names it", () => {
+    // The floor test's check, against notes that name a planted root in one
+    // place, or in none.
+    const PLANTED = ".crewhaus/planted";
+    const PLACES = [
+      "nowhere",
+      "the list",
+      "### Fixed",
+      "the intro",
+      "the 0.7.1 hardening",
+      "0.8.0's list",
+    ] as const;
+    type Place = (typeof PLACES)[number];
+    const notesNaming = (place: Place): string => {
+      const name = (here: Place): string => (here === place ? `\`${PLANTED}\`` : "a path");
+      return [
+        "## [Unreleased]",
+        "",
+        "### Changed",
+        "",
+        "#### Before you upgrade",
+        "",
+        `${DEFAULT_ON_HEADING} No spec has to turn on ${name("the intro")}.`,
+        "",
+        `- **A new root.** The runtime now protects ${name("the list")}.`,
+        "",
+        "### Fixed",
+        "",
+        `- **A fix.** It touches ${name("### Fixed")}.`,
+        "",
+        "## [0.8.0] - 2026-10-25",
+        "",
+        `${PROVABILITY_HEADING} The gate is off until a spec turns it on.`,
+        "",
+        `- **A released change.** It names ${name("0.8.0's list")}.`,
+        "",
+        "**The 0.7.1 hardening.** Most 0.7.0 specs compile and run unchanged.",
+        "",
+        `- **A hardening change.** It names ${name("the 0.7.1 hardening")}.`,
+        "",
+      ].join("\n");
+    };
+    // Every place but "nowhere" plants the name, so no case passes by
+    // leaving it out.
+    expect(PLACES.filter((place) => notesNaming(place).includes(`\`${PLANTED}\``))).toEqual(
+      PLACES.filter((place) => place !== "nowhere"),
+    );
+    /** The floor test's call, on notes written here rather than the real file. */
+    const unlistedIn = (found: readonly string[], text: string): string[] =>
+      unlisted(found, defaultOnBullets(text).join("\n"), {
+        shipped: SHIPPED_ROOTS,
+        laterNotes: defaultOnBullets(text, LATER_HEADINGS).join("\n"),
+      });
+    expect(
+      Object.fromEntries(PLACES.map((place) => [place, unlistedIn([PLANTED], notesNaming(place))])),
+    ).toEqual({
+      nowhere: [PLANTED],
+      "the list": [],
+      "### Fixed": [PLANTED],
+      "the intro": [PLANTED],
+      "the 0.7.1 hardening": [PLANTED],
+      // 0.8.0's list counts only for what 0.8.0 shipped. In the real file,
+      // the test that holds that list to what shipped refuses the bullet too.
+      "0.8.0's list": [PLANTED],
+    });
+    // One more place: a name 0.8.0's list already carries. Its floor bullet
+    // names `.crewhaus` itself, the directory that holds the roots, so a root
+    // found at `.crewhaus` is unlisted until the newest list names it, while
+    // the roots 0.8.0 shipped are still listed by that bullet.
+    const shippedFloor = [
+      ...unreleasedEntry(),
+      ...releasedEntry(
+        `- **The floor.** It protects ${SHIPPED_ROOTS.map((root) => `\`${root}\``).join(", ")}.`,
+        "  Other paths under `.crewhaus` are unaffected.",
+      ),
+    ].join("\n");
+    expect(unlistedIn([...SHIPPED_ROOTS, ".crewhaus"], shippedFloor)).toEqual([".crewhaus"]);
+  });
+});
+
+describe("the release notes name every change a harness without provability: sees", () => {
   test("the list is there to check", () => {
     expect(bullets.length).toBeGreaterThan(0);
   });
@@ -197,7 +529,7 @@ describe("the release notes name every change a harness without provability: see
       .filter((root) => !isAbsolute(root))
       .map((root) => root.split(sep).join("/"));
     expect(roots.length).toBeGreaterThan(0);
-    const unnamed = roots.filter((root) => !notes.includes(`\`${root}\``));
+    const unnamed = unlisted(roots, notes, { shipped: SHIPPED_ROOTS, laterNotes });
     expect(unnamed).toEqual([]);
     // The bullet that names them says how far bypass reaches and what the
     // floor cannot see (permission-engine `EvaluateOptions.protectedRoots`).
@@ -227,7 +559,7 @@ describe("the release notes name every change a harness without provability: see
     // GitApplyPatch (tool-git), StateImport (tool-state) and StoreMigrate
     // (tool-lifecycle) today.
     expect(tools.size).toBe(7);
-    const unnamed = [...tools].filter((tool) => !notes.includes(`\`${tool}\``)).sort();
+    const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
   });
 
