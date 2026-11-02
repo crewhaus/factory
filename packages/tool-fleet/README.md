@@ -12,6 +12,10 @@ hooks that wrap a start.
 | `CliVersionPin` | which CLI each harness would run, which one built its bundle | `harness-supervisor` (`resolveCrewhausBin`, the bundle stamp) |
 | `HooksManage` | list / set / remove the manager hooks in `.crewhaus/settings.json` | `harness-supervisor` (`parseManagerHook`, `readManagerSettings`) |
 
+On the harness it runs in, `HooksManage` is refused by the runtime-state floor, `list` included
+(the tool is not read-only), and `Read .crewhaus/settings.json` still shows those hooks; it manages
+other harnesses as before.
+
 ## These tools are thin on purpose
 
 Everything they enforce belongs to a package they depend on. The registry file is written by

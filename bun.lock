@@ -1733,6 +1733,7 @@
         "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
         "@crewhaus/metrics-collector": "workspace:*",
         "@crewhaus/model-plan": "workspace:*",

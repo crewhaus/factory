@@ -1205,6 +1205,9 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
       );
     }
     writeFileSync(join(sessions, "sess_private.jsonl"), `${lines.join("\n")}\n`);
+    // A harness this one manages, inside the workspace: its settings file is
+    // the rules' to guard, where the run's own is the runtime-state floor's.
+    mkdirSync(join(ws, "managed"));
     const input = { path: `${MARK}.md` };
     await createPendingApprovalStore({ rootDir: sessions }).persist({
       id: "appr_0123456789abcdef",
@@ -1240,7 +1243,7 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
         { action: "status", justification: "permission hardening: read the routing store" },
         [".crewhaus/routing/arms.jsonl", ".crewhaus/routing/freeze.json"],
       ],
-      ["HooksManage", { action: "list" }, [".crewhaus/settings.json"]],
+      ["HooksManage", { action: "list", dir: "managed" }, ["managed/.crewhaus/settings.json"]],
     ];
 
   test("a deny on a file the tool opens fires on its ordinary call; one elsewhere does not", async () => {
@@ -1272,6 +1275,13 @@ describe("critic9 — a harness's own records a tool opens inside its directory"
     expect(leaked()).toBe(true);
     await gate("PermissionsSuggest", {}, rules(["alwaysAllow", "PermissionsSuggest"]));
     expect(leaked()).toBe(true);
+    // On the harness it runs in, HooksManage opens the run's own settings
+    // file, which the runtime-state floor answers before any rule: `list`
+    // too, since the tool is not read-only.
+    expect(
+      await gate("HooksManage", { action: "list" }, rules(["alwaysAllow", "HooksManage"])),
+    ).toBe("deny");
+    expect(lastReason).toContain("or the files that control it");
   }, 120_000);
 
   test("a deny on the session store holds in every mode, as it does for EventQuery", async () => {
@@ -1755,19 +1765,33 @@ describe("final review — an allow of `*` does not grant the read of every qual
 });
 
 describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (permission-integration#1, #2)", () => {
-  test("Write(src/**) does not reach .crewhaus/settings.json by a decoy or by `..`", async () => {
+  test("Write(src/**) does not reach config/settings.json by a decoy or by `..`", async () => {
+    // A file no runtime-state root covers, so the rule is what decides.
     const rs = rules(["alwaysAllow", "Write(src/**)"]);
     const settings = '{"permissions":{"rules":[{"type":"alwaysAllow","pattern":"Bash"}]}}';
     expect(
       await gate(
         "Write",
-        { file_path: "src/ok.ts", path: ".crewhaus/settings.json", content: settings },
+        { file_path: "src/ok.ts", path: "config/settings.json", content: settings },
         rs,
       ),
     ).toBe("ask");
     expect(
-      await gate("Write", { path: "src/../.crewhaus/settings.json", content: settings }, rs),
+      await gate("Write", { path: "src/../config/settings.json", content: settings }, rs),
     ).toBe("ask");
+    expect(existsSync(join(ws, "config", "settings.json"))).toBe(false);
+    // The harness's own settings file is the runtime-state floor's: denied
+    // before any rule is read, by the decoy and by `..` alike.
+    for (const input of [
+      { file_path: "src/ok.ts", path: ".crewhaus/settings.json", content: settings },
+      { path: "src/../.crewhaus/settings.json", content: settings },
+    ]) {
+      expect({ input, decision: await gate("Write", input, rs) }).toEqual({
+        input,
+        decision: "deny",
+      });
+      expect(lastReason).toContain("or the files that control it");
+    }
     expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
     // The honest in-scope write still runs.
     expect(await gate("Write", { path: "src/new.ts", content: "ok" }, rs)).toBe("allow");
@@ -1810,12 +1834,13 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
         decision: "deny",
       });
     }
-    const writeRules = rules(["alwaysDeny", "Write(.crewhaus/**)"], ["alwaysAllow", "Write"]);
+    // A file no runtime-state root covers, so the deny rule is what fires.
+    const writeRules = rules(["alwaysDeny", "Write(config/**)"], ["alwaysAllow", "Write"]);
     const settingsSpellings = [
-      "./.crewhaus/settings.json",
-      "src/../.crewhaus/settings.json",
-      ".crewhaus//settings.json",
-      join(ws, ".crewhaus", "settings.json"),
+      "./config/settings.json",
+      "src/../config/settings.json",
+      "config//settings.json",
+      join(ws, "config", "settings.json"),
     ];
     for (const path of settingsSpellings) {
       expect({ path, decision: await gate("Write", { path, content: "{}" }, writeRules) }).toEqual({
@@ -1823,7 +1848,7 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
         decision: "deny",
       });
     }
-    expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
+    expect(existsSync(join(ws, "config", "settings.json"))).toBe(false);
     // Control: the bare allow still grants a file the deny does not name.
     expect(await gate("Read", { path: "./src/app.ts" }, readRules)).toBe("allow");
   }, 30_000);
@@ -3107,11 +3132,13 @@ describe("critic8 — a program path read where the kernel finds it", () => {
     marker = join(state, "ran.log");
     writeFileSync(marker, "");
     outside = realpathSync(mkdtempSync(join(tmpdir(), "perm-real-outside-")));
-    for (const d of ["scripts", "secrets/deep", "safe", "evil", "node_modules/.bin"]) {
+    for (const d of ["scripts", "secrets/deep", "safe", "evil", "node_modules/.bin", "managed"]) {
       mkdirSync(join(ws, d), { recursive: true });
     }
     mkdirSync(join(outside, "real"));
     symlinkSync("secrets/deep", join(ws, "link"));
+    // A harness this one manages: HooksManage reads `command` within its `dir`.
+    symlinkSync("../secrets/deep", join(ws, "managed", "link"));
     symlinkSync("safe", join(ws, "tools"));
     symlinkSync("evil", join(ws, "ev"));
     symlinkSync("../evil", join(ws, "scripts", "lnk"));
@@ -3232,7 +3259,9 @@ describe("critic8 — a program path read where the kernel finds it", () => {
   }, 60_000);
 
   test("the code runners and the hook manager read their command the same way", async () => {
-    const hook = { action: "set", hook: "postCompile" };
+    // Pointed at a harness it manages: on the one it runs in, the
+    // runtime-state floor answers before any rule (below).
+    const hook = { action: "set", hook: "postCompile", dir: "managed" };
     const denied = await decide(
       [
         ["RunBuild", { command: ["link/../run.sh"] }],
@@ -3254,6 +3283,17 @@ describe("critic8 — a program path read where the kernel finds it", () => {
       (tool) => rules(["alwaysAllow", `${tool}(./scripts/**)`]),
     );
     expectAll(asked, "ask");
+    expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
+    expect(existsSync(join(ws, "managed", ".crewhaus", "settings.json"))).toBe(false);
+    // With `dir` left out it sets the hooks of the harness it runs in, whose
+    // settings file no rule can open to it.
+    const own = await gate(
+      "HooksManage",
+      { action: "set", hook: "postCompile", command: "./scripts/ok.sh" },
+      rules(["alwaysAllow", "HooksManage"]),
+    );
+    expect(own).toBe("deny");
+    expect(lastReason).toContain("or the files that control it");
     expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
   }, 60_000);
 
