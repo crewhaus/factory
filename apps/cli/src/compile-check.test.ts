@@ -98,28 +98,110 @@ describe("resolveBootEntry", () => {
 });
 
 describe("classifyBootOutcome", () => {
+  // An unset tool-config variable. A workflow bundle stops on the registration's
+  // error: the verbatim stderr of a real boot (paths replaced), exit 1.
+  const TOOL_ENV_REGISTRATION_STDERR = [
+    '706 |     if (typeof node === "string") {',
+    "707 |       const name = envRefName(node);",
+    "708 |       if (name === undefined) return node;",
+    "709 |       const read = env[name];",
+    '710 |       if (read === undefined || read === "") {',
+    "711 |         throw new BuiltinToolError(unsetToolConfigEnvMessage(path, name));",
+    "                    ^",
+    "BuiltinToolError: chains[0].rpcUrls[0] reads $TOOL_GATE_RPC, but TOOL_GATE_RPC is not set. Set TOOL_GATE_RPC in the environment the harness starts in.",
+    ' code: "tool"',
+    "",
+    "      at visit (/x/packages/tool-categories/src/config.ts:711:15)",
+    "      at map (1:11)",
+    "      at visit (/x/packages/tool-categories/src/config.ts:720:18)",
+    "      at map (1:11)",
+    "      at visit (/x/packages/tool-categories/src/config.ts:720:18)",
+    "      at resolveToolConfigEnv (/x/packages/tool-categories/src/config.ts:726:19)",
+    "      at applyToolConfig (/x/packages/tool-categories/src/config.ts:742:30)",
+    "      at /x/agent.ts:11:1",
+    "",
+    "Bun v1.3.14 (macOS arm64)",
+  ].join("\n");
+  // A daemon shape's check prints the same sentence on its own, exit 2.
+  const TOOL_ENV_DAEMON_LINE =
+    "chains[0].rpcUrls[0] reads $TOOL_GATE_RPC, but TOOL_GATE_RPC is not set. Set TOOL_GATE_RPC in the environment the harness starts in.\n";
+
+  // Real messages captured by booting each fixture bundle credential-free.
+  const KNOWN_GATES = [
+    "ProviderAuthError: no Anthropic credentials found: set ANTHROPIC_AUTH_TOKEN",
+    "error: missing required env var SMOKE_BASE_RPC",
+    "[crew] no input on stdin",
+    "[voice-daemon] no --smoke <pcm-path> provided.",
+    "[browser-driver] no prompt (pass --prompt <text> or pipe stdin)",
+    'eval bundle error: DatasetRegistryError: dataset "smoke-eval@v1" not found at /x',
+    TOOL_ENV_REGISTRATION_STDERR,
+    TOOL_ENV_DAEMON_LINE,
+  ];
+
   test("clean exit and daemon-alive-at-window-end are both ok", () => {
     expect(classifyBootOutcome(run()).status).toBe("ok");
     expect(classifyBootOutcome(run({ exitCode: 137, timedOut: true })).status).toBe("ok");
   });
 
   test("every known first-boot gate classifies as gated (green)", () => {
-    // Real messages captured by booting each fixture bundle credential-free.
-    const gates = [
-      "ProviderAuthError: no Anthropic credentials found: set ANTHROPIC_AUTH_TOKEN",
-      "error: missing required env var SMOKE_BASE_RPC",
-      "[crew] no input on stdin",
-      "[voice-daemon] no --smoke <pcm-path> provided.",
-      "[browser-driver] no prompt (pass --prompt <text> or pipe stdin)",
-      'eval bundle error: DatasetRegistryError: dataset "smoke-eval@v1" not found at /x',
-    ];
-    for (const stderr of gates) {
-      const outcome = classifyBootOutcome(run({ exitCode: 1, stderr }));
-      expect(outcome.status).toBe("gated");
-      expect(outcome.detail).toContain("gate");
+    for (const stderr of KNOWN_GATES) {
+      // Daemons exit 2 at their gates; agent bundles exit 1.
+      for (const exitCode of [1, 2]) {
+        const outcome = classifyBootOutcome(run({ exitCode, stderr }));
+        expect(outcome.status).toBe("gated");
+        expect(outcome.detail).toContain("gate");
+      }
     }
     // Sanity: the table drives the classification.
-    expect(BOOT_GATE_PATTERNS.length).toBeGreaterThanOrEqual(6);
+    expect(BOOT_GATE_PATTERNS.length).toBeGreaterThanOrEqual(8);
+  });
+
+  test("each known gate matches exactly one pattern, so the table's order decides nothing", () => {
+    let checked = 0;
+    for (const sample of KNOWN_GATES) {
+      const gates = BOOT_GATE_PATTERNS.filter((p) => p.pattern.test(sample)).map((p) => p.gate);
+      expect({ sample, gates: gates.length }).toEqual({ sample, gates: 1 });
+      checked += 1;
+    }
+    expect(checked).toBe(8);
+  });
+
+  test("an unset tool-config variable reads as its own gate, in the verdict line too", () => {
+    const detail =
+      "boot reached its tool config env refs gate — full boot needs the env vars the spec's tool_config and chains blocks read";
+    const daemon = classifyBootOutcome(run({ exitCode: 2, stderr: TOOL_ENV_DAEMON_LINE }));
+    expect(daemon).toEqual({ status: "gated", detail });
+    expect(classifyBootOutcome(run({ exitCode: 1, stderr: TOOL_ENV_REGISTRATION_STDERR }))).toEqual(
+      { status: "gated", detail },
+    );
+    expect(
+      buildVerdict([
+        { step: "assertion", status: "ok", detail: "4 anchors" },
+        { step: "install", status: "ok" },
+        { step: "boot", ...daemon },
+      ]),
+    ).toEqual({
+      green: true,
+      line: "compile --check: GREEN — assertion ok (4 anchors); install ok; boot gated (boot reached its tool config env refs gate — full boot needs the env vars the spec's tool_config and chains blocks read)",
+    });
+  });
+
+  test("a tool config the bundle cannot apply, or a missing export, stays red and names itself", () => {
+    const breaks = [
+      // The edge refuses a `$VAR`: a Worker has no environment at boot.
+      "BuiltinToolError: tool_config.fetch.allowed_origins[0] reads $ORIGIN from the environment, but a Cloudflare Worker has no environment at boot. Write the value itself, or compile without --emit-as cf-worker.",
+      // A registrar the builtin table names, missing from its package.
+      "BuiltinToolError: @crewhaus/tool-http does not export registerHttpConfig, the registrar the builtin table names for tool_config.http",
+      // Two different blocks for one registrar.
+      "BuiltinToolError: tool_config.http and tool_config.httpRequest both configure the http tools, and they differ. Keep one block, under tool_config.http.",
+      // A bundle importing a name its installed package lacks.
+      "SyntaxError: Export named 'registerHttpConfig' not found in module '/x/node_modules/@crewhaus/tool-http/src/index.ts'.",
+    ];
+    for (const stderr of breaks) {
+      const outcome = classifyBootOutcome(run({ exitCode: 1, stderr }));
+      expect({ stderr, status: outcome.status }).toEqual({ stderr, status: "failed" });
+      expect(outcome.detail).toContain(stderr);
+    }
   });
 
   // ── Audit item 9 — a declared MCP env ref is a credential GATE, not a break ─
@@ -583,6 +665,13 @@ describe("BOOT_GATE_PATTERNS ↔ emitting workspace sources (F6)", () => {
       // that names the unset variable lives in resolve.ts.
       gate: "MCP server credentials",
       files: ["packages/mcp-host/src/resolve.ts"],
+    },
+    {
+      // A `$VAR` a tool_config or chains block reads: one helper in config.ts
+      // builds the sentence the registration throws and a daemon shape's
+      // boot check prints.
+      gate: "tool config env refs",
+      files: ["packages/tool-categories/src/config.ts"],
     },
     { gate: "stdin input", files: ["packages/target-crew/src/index.ts"] },
     { gate: "--smoke fixture", files: ["packages/target-voice/src/index.ts"] },
