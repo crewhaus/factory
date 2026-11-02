@@ -15,6 +15,7 @@
  * API.
  */
 export { HARNESS_ID_RE, REGISTRY_FILENAME } from "./doc.js";
+export { hangarStateRoots, resolveHangarRoot } from "./hangar-root.js";
 export {
   openHangarRegistry,
   registerHarnessHook,

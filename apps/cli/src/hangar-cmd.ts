@@ -71,7 +71,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { networkInterfaces } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import {
   DEFAULT_HANGAR_PORT,
   type HangarServer,
@@ -83,7 +83,7 @@ import { hangarAssets } from "@crewhaus/hangar-ui";
 import {
   type HangarRegistry,
   openHangarRegistry,
-  resolveRegistryRoot,
+  resolveHangarRoot,
 } from "@crewhaus/harness-registry";
 import {
   type ShutdownSupervisor,
@@ -331,12 +331,10 @@ export function releaseHangarLock(hangarRoot: string, pid: number): void {
 
 /** The hangar root: `CREWHAUS_HANGAR_ROOT`, else `<registryRoot>/hangar` —
  *  which is the server's own `~/.crewhaus/hangar` default under the default
- *  registry root, and keeps everything under one temp root in tests. */
-export function resolveHangarRoot(env: Readonly<Record<string, string | undefined>>): string {
-  const explicit = env["CREWHAUS_HANGAR_ROOT"];
-  if (explicit !== undefined && explicit !== "") return resolve(explicit);
-  return join(resolveRegistryRoot(env), "hangar");
-}
+ *  registry root, and keeps everything under one temp root in tests. This is
+ *  `@crewhaus/harness-registry`'s resolver, the one the fleet tools and the
+ *  runtime-state floor use too. */
+export { resolveHangarRoot };
 
 // ---------------------------------------------------------------------------
 // Tiny per-verb flag parsing (harness-cmd posture: throw plain Errors)

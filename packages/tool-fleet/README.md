@@ -120,8 +120,10 @@ path so one harness cannot be counted twice in the version roll-up.
 
 The exception is deliberate and no input can move it. The two machine-wide files —
 `<registryRoot>/harnesses.json` and `<hangarRoot>/jobs.jsonl` — are resolved from the environment
-(`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`), because a registry that only ever saw the
-current workspace would not be a registry. Their absolute paths are reported in every result.
+(`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`) by `@crewhaus/harness-registry`'s
+`resolveRegistryRoot` and `resolveHangarRoot`, the resolvers the CLI uses, because a registry that
+only ever saw the current workspace would not be a registry. Their absolute paths are reported in
+every result.
 
 `CompileBundle` executes `crewhaus compile`. The binary comes from the supervisor's own resolver —
 harness-local `node_modules/.bin/crewhaus` first, then `PATH` — and a binary that resolves OUTSIDE
