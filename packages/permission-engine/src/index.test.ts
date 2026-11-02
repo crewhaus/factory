@@ -522,7 +522,7 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     });
     expect(above.decision).toBe("deny");
     expect(above.reason).toBe(
-      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) — no rule can allow that",
+      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Home's directory) — no rule can allow that",
     );
   });
 
@@ -810,6 +810,200 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
 });
 
 const BUILTIN_RULES_ONLY: RuleSet = { ...emptyRuleSet, builtin: BUILTIN_DEFAULT_RULES };
+
+describe("the runtime-state floor: the files that control a run, one root an exact file", () => {
+  // What the runtime hands the floor for them, built by hand (this package
+  // cannot import runtime-core; runtime-core's own roots go through this
+  // engine in scripts/control-files-floor.test.ts): the run directory whole
+  // and the settings file exactly, absolute and workspace-relative, and
+  // Home's directory outside the workspace, which is spelled absolute alone.
+  const ROOTS = [
+    "/srv/ws/.crewhaus/run",
+    "/srv/ws/.crewhaus/settings.json",
+    "/home/u/.crewhaus/hangar",
+    ".crewhaus/run",
+    ".crewhaus/settings.json",
+  ];
+  const RECORD = "where the runtime keeps its own record of the run";
+  const CONTROL =
+    "or the files that control it (the harness's run files and settings, Home's directory) — no rule can allow that";
+  type Value = NonNullable<ToolCallContext["operativeValues"]>[number];
+  const writing = (name: string, value: Value, toolName = "Write"): ToolCallContext => ({
+    toolName,
+    input: { path: name, content: "{}" },
+    operativeValues: [value],
+    readOnly: false,
+    destructive: true,
+  });
+  /** A path as a tool spells it inside the workspace: the name as sent, which the floor normalises. */
+  const inside = (name: string, over: Partial<Value> = {}): ToolCallContext =>
+    writing(name, { kind: "path", canonical: [name], ...over });
+  /** A path outside the workspace: no canonical spelling, its lexical ones only. */
+  const outside = (abs: string): ToolCallContext =>
+    writing(abs, { kind: "path", canonical: [], spellings: [abs], outsideWorkspace: true });
+  const allowWrite: RuleSet = {
+    ...emptyRuleSet,
+    flag: [rule("alwaysAllow", "Write", "flag")],
+    settings: [rule("alwaysAllow", "Write(**)", "settings")],
+    yaml: [rule("alwaysAllow", "Write(**)")],
+  };
+  const decide = (call: ToolCallContext, mode: "default" | "auto" | "plan" = "auto") =>
+    evaluateWithReason(call, mode, allowWrite, { protectedRoots: ROOTS });
+
+  test("the settings file is one exact file: every spelling of it, and anything under it, is denied", () => {
+    for (const name of [
+      ".crewhaus/settings.json",
+      "./.crewhaus/settings.json",
+      "src/../.crewhaus/settings.json",
+      ".crewhaus//settings.json",
+      ".crewhaus/settings.json/x",
+      "/srv/ws/.crewhaus/settings.json",
+    ]) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        const r = decide(inside(name), mode);
+        expect({ name, mode, decision: r.decision }).toEqual({ name, mode, decision: "deny" });
+        expect(r.reason).toContain(RECORD);
+        expect(r.reason).toContain(CONTROL);
+      }
+    }
+  });
+
+  test("its neighbours are not the file: a name it is a prefix of is the rules' to decide", () => {
+    for (const name of [
+      ".crewhaus/settings.json.bak",
+      ".crewhaus/settings.jsonx",
+      ".crewhaus/settings",
+      ".crewhaus/notes.md",
+      "src/.crewhaus/settings.json",
+    ]) {
+      const r = decide(inside(name));
+      expect({ name, decision: r.decision, reason: r.reason }).toEqual({
+        name,
+        decision: "allow",
+        reason: undefined,
+      });
+    }
+  });
+
+  test("a folded spelling is the file where the filesystem folds case, and another file where it does not", () => {
+    const shouted = ".CREWHAUS/Settings.JSON";
+    const folded = decide(inside(shouted, { caseInsensitive: true }));
+    expect(folded.decision).toBe("deny");
+    expect(folded.reason).toContain(CONTROL);
+    expect(decide(inside(shouted)).decision).toBe("allow");
+  });
+
+  test("the run directory is protected whole, and a sibling it is a prefix of is not", () => {
+    for (const name of [
+      ".crewhaus/run",
+      ".crewhaus/run/control-token",
+      ".crewhaus/run/logs/a.log",
+    ]) {
+      const r = decide(inside(name));
+      expect({ name, decision: r.decision }).toEqual({ name, decision: "deny" });
+      expect(r.reason).toContain(CONTROL);
+    }
+    for (const name of [".crewhaus/runbook/x", ".crewhaus/run.md", ".crewhaus/running"]) {
+      expect({ name, decision: decide(inside(name)).decision }).toEqual({
+        name,
+        decision: "allow",
+      });
+    }
+  });
+
+  test("Home's directory outside the workspace is read as written, and only it", () => {
+    for (const abs of [
+      "/home/u/.crewhaus/hangar",
+      "/home/u/.crewhaus/hangar/token",
+      "/home/u/.crewhaus/hangar/access/members.json",
+      "/home/u/.crewhaus/hangar/../hangar/settings.json",
+    ]) {
+      const r = decide(outside(abs));
+      expect({ abs, decision: r.decision }).toEqual({ abs, decision: "deny" });
+      expect(r.reason).toContain(CONTROL);
+    }
+    for (const abs of ["/home/u/.crewhaus/hangar-old/token", "/home/u/.crewhaus/settings.json"]) {
+      expect({ abs, decision: decide(outside(abs)).decision }).toEqual({ abs, decision: "allow" });
+    }
+  });
+
+  test("an alwaysAllow in any of the five sources does not lift it, and bypass consults nothing", () => {
+    const sources = ["flag", "settings", "yaml", "hooks", "builtin"] as const;
+    for (const source of sources) {
+      const rules: RuleSet = { ...emptyRuleSet, [source]: [rule("alwaysAllow", "Write", source)] };
+      for (const mode of ["default", "auto"] as const) {
+        const r = evaluateWithReason(inside(".crewhaus/settings.json"), mode, rules, {
+          protectedRoots: ROOTS,
+        });
+        expect({ source, mode, decision: r.decision }).toEqual({ source, mode, decision: "deny" });
+        expect(r.reason).toContain(CONTROL);
+      }
+    }
+    expect(
+      evaluateWithReason(inside(".crewhaus/settings.json"), "bypass", emptyRuleSet, {
+        protectedRoots: ROOTS,
+      }),
+    ).toEqual({ decision: "allow" });
+  });
+
+  test("a writer that acts beneath `.crewhaus` is denied with the roots of the record moved out (a tenant's)", () => {
+    // No session, tool-result or proof root under `.crewhaus` here: the
+    // control files alone put a root beneath it.
+    const stateImport: ToolCallContext = {
+      toolName: "StateImport",
+      input: { stateDir: ".crewhaus" },
+      operativeValues: [
+        {
+          kind: "path",
+          canonical: [".crewhaus", "/srv/ws/.crewhaus"],
+          beneath: [".crewhaus/", "./.crewhaus/", "/srv/ws/.crewhaus/"],
+        },
+      ],
+      readOnly: false,
+      destructive: true,
+    };
+    const rules: RuleSet = { ...emptyRuleSet, flag: [rule("alwaysAllow", "StateImport", "flag")] };
+    const r = evaluateWithReason(stateImport, "auto", rules, { protectedRoots: ROOTS });
+    expect(r.decision).toBe("deny");
+    expect(r.reason).toContain("acts on everything beneath `.crewhaus`, where");
+    expect(r.reason).toContain(RECORD);
+    expect(r.reason).toContain(CONTROL);
+  });
+
+  test("reads of every root stay allowed, and other writes are the rules' to decide", () => {
+    for (const toolName of ["Read", "Grep", "Glob"]) {
+      for (const name of [".crewhaus/settings.json", ".crewhaus/run/daemon.json"]) {
+        const read: ToolCallContext = {
+          toolName,
+          input: { path: name },
+          operativeValues: [{ kind: "path", canonical: [name] }],
+          readOnly: true,
+          destructive: false,
+        };
+        expect({
+          toolName,
+          name,
+          decision: evaluateWithReason(read, "default", BUILTIN_RULES_ONLY, {
+            protectedRoots: ROOTS,
+          }).decision,
+        }).toEqual({ toolName, name, decision: "allow" });
+      }
+    }
+    // Unruled, a write beside the roots asks; a rule decides it either way.
+    const notes = inside(".crewhaus/notes.md");
+    expect(
+      evaluateWithReason(notes, "default", emptyRuleSet, { protectedRoots: ROOTS }).decision,
+    ).toBe("ask");
+    const denied = evaluateWithReason(
+      notes,
+      "default",
+      { ...emptyRuleSet, yaml: [rule("alwaysDeny", "Write(.crewhaus/**)")] },
+      { protectedRoots: ROOTS },
+    );
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason ?? "").not.toContain(RECORD);
+  });
+});
 
 describe("Pillar 3 — ruleBasedJustificationJudge", () => {
   test("denies brief justifications", async () => {

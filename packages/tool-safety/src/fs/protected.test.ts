@@ -13,6 +13,7 @@ import {
   protectedRootHolding,
   protectedRootsBeneath,
   protectedRootsOf,
+  protectedWriteRefusal,
 } from "./protected";
 
 let ws: string;
@@ -57,5 +58,42 @@ describe("protected roots", () => {
     expect(protectedRootsBeneath(join(ws, "state-link"), roots, ws)).toEqual([
       { root: roots[0] as string, rel: "sessions" },
     ]);
+  });
+
+  test("an exact-file root holds that file and nothing it is a prefix of", () => {
+    // The settings file is protected as one file: a directory root and a
+    // file root are compared the same way, name by name, never as strings.
+    const settings = join(".crewhaus", "settings.json");
+    const roots = [settings, join(ws, settings)];
+    expect(protectedRootHolding(join(ws, settings), roots, ws)).toBe(settings);
+    expect(protectedRootHolding(settings, roots, ws)).toBe(settings);
+    for (const neighbour of [
+      join(".crewhaus", "settings.json.bak"),
+      join(".crewhaus", "settings.jsonx"),
+      join(".crewhaus", "notes.md"),
+    ]) {
+      expect({ neighbour, held: protectedRootHolding(neighbour, roots, ws) }).toEqual({
+        neighbour,
+        held: undefined,
+      });
+    }
+    // The directory that holds it: removing or replacing `.crewhaus` removes it.
+    expect(protectedRootBeneath(join(ws, ".crewhaus"), roots, ws)).toBe(settings);
+    expect(protectedRootBeneath(".crewhaus", roots, ws)).toBe(settings);
+    expect(protectedRootBeneath(join(ws, "src"), roots, ws)).toBeUndefined();
+  });
+
+  test("the refusal names the record and the files that control the run, and says nothing was written", () => {
+    const text = protectedWriteRefusal("MovePath", "moving onto .crewhaus/settings.json");
+    expect(text).toContain(
+      "would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)",
+    );
+    expect(text).toContain(
+      "or the files that control it (the harness's run files and settings, Home's directory)",
+    );
+    expect(text).toContain("Nothing was written.");
+    expect(
+      text.startsWith("MovePath: refused — moving onto .crewhaus/settings.json would write"),
+    ).toBe(true);
   });
 });

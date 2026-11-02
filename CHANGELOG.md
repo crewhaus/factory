@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Changes that can affect a harness without opting in.** No spec has to turn
 these on: they reach every harness that uses what each one names.
 
+- **The runtime-state floor also covers a harness's settings, its run files
+  and Home's directory.** Beside `.crewhaus/sessions`,
+  `.crewhaus/tool-results` and `.crewhaus/proofs`, no permission rule lets an
+  agent's tool write `.crewhaus/run` (the runfiles, logs and control files a
+  daemon keeps there), the settings file `.crewhaus/settings.json` (permission
+  rules, hooks and manager settings) or Home's directory, where
+  `crewhaus hangar` keeps its token and settings: `~/.crewhaus/hangar` always,
+  and wherever the run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT`
+  puts it. Only `bypass` mode skips the floor, and the file tools that check
+  their own targets refuse even then. CrewHaus itself still writes these
+  files, and agents can still read them. The floor refuses `HooksManage` on
+  the harness it runs in; it manages other harnesses as before. `Bash` and
+  `RunCommand` remain outside what the floor can see. Recompile a daemon to
+  pick this up.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

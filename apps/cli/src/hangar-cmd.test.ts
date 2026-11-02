@@ -18,7 +18,10 @@ import {
   type HangarServerOptions,
   startHangarServer,
 } from "@crewhaus/hangar-server";
-import { openHangarRegistry } from "@crewhaus/harness-registry";
+import {
+  openHangarRegistry,
+  resolveHangarRoot as registryHangarRoot,
+} from "@crewhaus/harness-registry";
 import type { JobRecord, SupervisedChild } from "@crewhaus/harness-supervisor";
 import { encodeQr, renderQrLines } from "@crewhaus/qr-code";
 import {
@@ -147,6 +150,12 @@ describe("hangar lock helpers", () => {
   test("resolveHangarRoot: explicit env wins, else <registryRoot>/hangar", () => {
     expect(resolveHangarRoot({ CREWHAUS_HANGAR_ROOT: "/tmp/hr" })).toBe("/tmp/hr");
     expect(resolveHangarRoot({ CREWHAUS_REGISTRY_ROOT: "/tmp/reg" })).toBe("/tmp/reg/hangar");
+  });
+
+  test("resolveHangarRoot is the registry package's resolver itself, not a copy of it", () => {
+    // The fleet tools and the runtime-state floor resolve Home's directory with
+    // the same function, so a copy reintroduced here, however faithful, fails.
+    expect(resolveHangarRoot).toBe(registryHangarRoot);
   });
 });
 

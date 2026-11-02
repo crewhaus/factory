@@ -17,8 +17,12 @@
  * directory, a settings file — still goes through `resolveSafe` and stays
  * inside the workspace.
  */
-import { join, resolve } from "node:path";
-import { REGISTRY_FILENAME, resolveRegistryRoot } from "@crewhaus/harness-registry";
+import { join } from "node:path";
+import {
+  REGISTRY_FILENAME,
+  resolveHangarRoot,
+  resolveRegistryRoot,
+} from "@crewhaus/harness-registry";
 
 /** `<registryRoot>/harnesses.json` — the file `openHangarRegistry` opens. */
 export function registryFilePath(
@@ -28,26 +32,10 @@ export function registryFilePath(
 }
 
 /**
- * The hangar root: `CREWHAUS_HANGAR_ROOT`, else `<registryRoot>/hangar`.
- *
- * MIRRORED, not imported. `resolveHangarRoot` lives in
- * `apps/cli/src/hangar-cmd.ts` and a package cannot depend on the app — the
- * same reason `harness-supervisor/src/bundle-freshness.ts` mirrors the
- * bundle manifest shape instead of importing it. The second half of the rule
- * is not re-derived: `resolveRegistryRoot` is the registry package's own.
- * `roots.test.ts` pins both halves, so a change in the app fails a test here
- * rather than silently pointing this tool at a ledger nobody writes.
+ * The hangar root (`CREWHAUS_HANGAR_ROOT`, else `<registryRoot>/hangar`),
+ * resolved by the registry package's own resolver, the one the CLI uses.
  */
-export function resolveHangarRoot(
-  env: Readonly<Record<string, string | undefined>> = process.env,
-): string {
-  const explicit = env["CREWHAUS_HANGAR_ROOT"];
-  // `resolve`, like the app's copy: a relative CREWHAUS_HANGAR_ROOT must
-  // become the same absolute path the manager opened, not one relative to
-  // whatever directory this tool happens to run in.
-  if (explicit !== undefined && explicit !== "") return resolve(explicit);
-  return join(resolveRegistryRoot(env), "hangar");
-}
+export { resolveHangarRoot };
 
 /** The durable job ledger the manager appends to. */
 export const JOB_LEDGER_FILENAME = "jobs.jsonl";

@@ -73,10 +73,11 @@ directory that is not ours.
 
 `StateImport` never writes the run's own record either (0.8.0): the session
 logs, the tool results the runtime saved to a file, and the proof bundles,
-which the runtime hands each call on its bridge. An import with an entry
-that would land in one is refused, and so is a `replace` of a directory that
-holds one, in every permission mode and before anything is written. A
-`stateDir` of `.crewhaus` would otherwise put an entry such as
+which the runtime hands each call on its bridge with the files that control
+the run (the harness's run files and settings, Home's directory). An import
+with an entry that would land in one is refused, and so is a `replace` of a
+directory that holds one, in every permission mode and before anything is
+written. A `stateDir` of `.crewhaus` would otherwise put an entry such as
 `sessions/<id>.jsonl` in the live session log.
 
 **Determinism.** Same inputs against the same state, same bytes out. Listings

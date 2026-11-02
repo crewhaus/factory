@@ -15,6 +15,13 @@ Pure registry-file layer by design: it never parses specs (callers supply
 - Registry root: the directory containing `harnesses.json` —
   `CREWHAUS_REGISTRY_ROOT`, default `~/.crewhaus`. An explicit `root`
   option wins over the env var.
+- Hangar root: where Home (`crewhaus hangar`) keeps its token, settings,
+  cache and job ledger — `CREWHAUS_HANGAR_ROOT`, else
+  `<registryRoot>/hangar`, so `~/.crewhaus/hangar` by default. The CLI, the
+  fleet tools and the runtime-state floor all resolve it with this package's
+  `resolveHangarRoot`. The floor protects every Hangar root the run's
+  environment names and `~/.crewhaus/hangar` always, so these two variables
+  can add a protected root and never move one.
 - `CREWHAUS_NO_REGISTRY=1` — global opt-out: every write becomes a no-op
   while reads keep working.
 
@@ -66,6 +73,12 @@ registerHook, seedFromWatchme }`.
   self-registration entry point for CLI hooks: it never throws (any failure
   collapses into `{ ok: false }`, because a registry write must never fail
   the command that triggered it) and respects `CREWHAUS_NO_REGISTRY`.
+- `resolveRegistryRoot(env?)` and `resolveHangarRoot(env?)` return the two
+  roots above for an environment (default `process.env`).
+- `hangarStateRoots(env?)` lists every Hangar root that environment names,
+  absolute and without repeats: `resolveHangarRoot(env)`,
+  `<registryRoot>/hangar` and `~/.crewhaus/hangar`. It is the list the
+  runtime-state floor protects.
 
 ## watchme interop
 

@@ -3,8 +3,13 @@
  * runtime-state roots a run hands its tools on the bridge
  * (`RuntimeBridge.protectedRoots`, runtime-core's `runtimeStateRoots`): the
  * session logs, the spilled tool results and the proof bundles, which the
- * provability gate and `continuity.proof` read as evidence. Evidence is
- * checked only while the agent cannot write it.
+ * provability gate and `continuity.proof` read as evidence, and the files
+ * that control the run, which decide what the agent may do next — the
+ * harness's run files (`.crewhaus/run`) and settings file
+ * (`.crewhaus/settings.json`), and Home's directory. Evidence is checked only
+ * while the agent cannot write it, and no agent's tool writes the files that
+ * control it. A root is a directory, holding everything under it, or an
+ * exact file, holding only itself.
  *
  * permission-engine's runtime-state floor denies a call that NAMES a path
  * inside one. A tool that writes BENEATH a directory it names reaches past
@@ -126,5 +131,5 @@ export function protectedRootsBeneath(
 
 /** The refusal a tool returns for a write into a protected root. */
 export function protectedWriteRefusal(tool: string, what: string): string {
-  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles), which no tool may change. Nothing was written.`;
+  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Home's directory), which no tool may change. Nothing was written.`;
 }

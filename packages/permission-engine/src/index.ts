@@ -14,9 +14,11 @@
  *   sandbox       — a `requiresSandbox` tool needs a real sandbox backend and,
  *                   outside plan mode, an explicit alwaysAllow
  *   runtime state — a call that is not read-only never writes inside
- *                   `EvaluateOptions.protectedRoots` (0.8.0: the session logs
- *                   and proof bundles the gates read as evidence), nor acts
- *                   beneath a workspace directory that holds one
+ *                   `EvaluateOptions.protectedRoots` (the session logs,
+ *                   spilled tool results and proof bundles the gates read as
+ *                   evidence, and the files that control the run: the
+ *                   harness's run files and settings, Home's directory), nor
+ *                   acts beneath a workspace directory that holds one
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -117,26 +119,34 @@ export type EvaluateOptions = {
   readonly sandboxAvailable?: boolean;
   /**
    * 0.8.0 (design/0.8.0-provability-release.md §1 principle 1, §5.2) — the
-   * runtime's own record of the run: directories (absolute, or relative to
-   * the workspace) the runtime writes and the gates read as evidence — the
-   * session event logs (every `tool_use` and `tool_result` the provability
-   * gate grounds a claim on, and `continuity.proof` resolves), the tool
-   * results the runtime spilled to a file (read whole as a long fetch's
-   * body) and the proof bundles. A call that is not read-only and names a path inside one is
-   * DENIED whatever a rule says — the runtime-state floor, beside the
-   * sandbox floor: a hand-written log line holding a fetch that never ran
-   * would otherwise ground any text under any URL. Only `bypass` mode, which
-   * consults nothing, lets such a call through. Absent ⇒ no floor.
+   * runtime's own record of the run, and the files that control it: paths
+   * (absolute, or relative to the workspace) that the runtime and CrewHaus's
+   * own code write and no agent tool may. A root is a directory, protecting
+   * everything under it, or an exact file, protecting that file alone. The
+   * record is what the gates read as evidence — the session event logs
+   * (every `tool_use` and `tool_result` the provability gate grounds a claim
+   * on, and `continuity.proof` resolves), the tool results the runtime
+   * spilled to a file (read whole as a long fetch's body) and the proof
+   * bundles. The files that control the run decide what the agent may do
+   * next — the harness's run files (`.crewhaus/run`), its settings file
+   * (`.crewhaus/settings.json`: permission rules, runtime hooks and the
+   * manager's spawn hooks) and Home's directory (the Hangar root). A call
+   * that is not read-only and names a path inside one is DENIED whatever a
+   * rule says — the runtime-state floor, beside the sandbox floor: a
+   * hand-written log line holding a fetch that never ran would otherwise
+   * ground any text under any URL. Only `bypass` mode, which consults
+   * nothing, lets such a call through. Absent ⇒ no floor.
    *
    * The floor reads the call's operative values, so it covers every tool that
    * names where it writes (Write, Edit, MultiEdit, the fsx writers' paths).
    * A writer that acts BENEATH a directory it names (`beneath`) — a tree
    * removed, emptied, imported into, migrated, copied, moved or extracted
    * onto it — is denied when a root lies under that directory and the
-   * directory is inside the workspace (`.crewhaus` holds `.crewhaus/sessions`:
-   * StateImport's `stateDir`, StoreMigrate's `to`). The workspace root itself
-   * is left to the rules, since a git pathspec, a patch's `cwd` or a harness
-   * directory defaults to `.` and every such call would otherwise be refused;
+   * directory is inside the workspace (`.crewhaus` holds `.crewhaus/run` and
+   * `.crewhaus/settings.json`: StateImport's `stateDir`, StoreMigrate's
+   * `to`). The workspace root itself is left to the rules, since a git
+   * pathspec, a patch's `cwd` or a harness directory defaults to `.` and
+   * every such call would otherwise be refused;
    * a writer that acts beneath it checks its own targets against the same
    * roots, which the runtime hands it on the bridge
    * (`RuntimeBridge.protectedRoots`; CopyPath, MovePath, RemovePath,
@@ -486,14 +496,14 @@ export function evaluateWithReason(
   if (mode === "bypass") return { decision: "allow" };
   // 0.8.0 — the runtime-state floor (`EvaluateOptions.protectedRoots`): no
   // rule, in any source, lets the agent's own tools write the record the
-  // gates read as evidence. The reason says what the floor saw — a path
-  // inside the record, or a directory the call acts beneath that holds it —
-  // and that the tool is not read-only; it does not guess whether the call
-  // reads or writes there.
+  // gates read as evidence, or the files that decide what the agent may do
+  // next. The reason says what the floor saw — a path inside a root, or a
+  // directory the call acts beneath that holds one — and that the tool is
+  // not read-only; it does not guess whether the call reads or writes there.
   const floorHit = protectedRootHit(call, opts);
   if (floorHit !== undefined) {
     const RECORD =
-      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles)";
+      "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Home's directory)";
     return {
       decision: "deny",
       reason:
