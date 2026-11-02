@@ -20,6 +20,7 @@ import {
   applyToolConfig,
   planChainInits,
   planToolConfigInits,
+  renderToolConfigEnvGate,
   renderToolConfigInit,
   toolConfigEnvRefs,
 } from "./config";
@@ -73,6 +74,14 @@ export type ShapeToolProfile = {
   readonly sandbox: boolean;
   /** Tools the shape supplies itself; naming one in `tools:` is refused with this reason. */
   readonly provides?: Readonly<Record<string, string>>;
+  /**
+   * The shape's bundle boots from `daemon.ts` (channel, managed, crew). Before
+   * its registrations run it checks every `$VAR` its tool_config and chains
+   * blocks read, and an unset one stops the boot with exit 2 and one line naming
+   * it, like its other boot gates. Other shapes stop with the registration's own
+   * error, as before.
+   */
+  readonly daemonEntry?: boolean;
 };
 
 const host = (label: string): ShapeToolProfile => ({ label, runtime: "host", sandbox: true });
@@ -81,11 +90,12 @@ const none = (label: string): ShapeToolProfile => ({ label, runtime: "none", san
 export const SHAPE_TOOL_PROFILES: Readonly<Record<ToolShape, ShapeToolProfile>> = Object.freeze({
   cli: host("the cli shape"),
   workflow: host("the workflow shape"),
-  channel: host("the channel shape"),
+  channel: { ...host("the channel shape"), daemonEntry: true },
   graph: host("the graph shape"),
-  managed: host("the managed shape"),
+  managed: { ...host("the managed shape"), daemonEntry: true },
   crew: {
     ...host("the crew shape"),
+    daemonEntry: true,
     provides: {
       sendMessage:
         "every crew role already gets SendMessage and Handoff from the orchestrator, for talking to the other roles",
@@ -282,7 +292,10 @@ export async function registerToolConfigs(
 export type ResolvedTools = {
   /** `import { a, b } from "@crewhaus/tool-x";`, one line per package, sorted. */
   readonly imports: ReadonlyArray<string>;
-  /** `registerXConfig({...});` lines, to run before any tool is registered. */
+  /**
+   * Statements to run, in order, before any tool is registered: a daemon
+   * shape's variable check, then the registrar calls (`registerXConfig({...});`).
+   */
   readonly inits: ReadonlyArray<string>;
   /** Per site, the identifiers to register, in the site's order. */
   readonly sites: ReadonlyArray<ReadonlyArray<string>>;
@@ -304,7 +317,10 @@ export type ResolvedTools = {
  * each wired tool is imported as `__t_<key>` so it cannot collide with a
  * Worker global such as `fetch`. On every shape, two different `tool_config`
  * blocks for one registrar throw, and so does a `$VAR` reference on the edge,
- * which has no process environment to read it from at boot.
+ * which has no process environment to read it from at boot. On a daemon shape
+ * ({@link ShapeToolProfile.daemonEntry}) `inits` starts with a check of every
+ * variable the blocks read, so an unset one stops the boot with exit 2 and one
+ * line naming it before any registrar runs.
  *
  * `chains` is the spec's chain blocks; a tool that reads a chain gets its
  * registrar called with them, and without them it refuses every call.
@@ -382,6 +398,7 @@ export function resolveBuiltinTools(
       chains,
     ),
   ];
+  if (SHAPE_TOOL_PROFILES[shape].daemonEntry === true) inits.push(...renderToolConfigEnvGate(plan));
   for (const init of plan) {
     const ref = edge ? toolConfigEnvRefs(init.config, init.where)[0] : undefined;
     if (ref !== undefined) {

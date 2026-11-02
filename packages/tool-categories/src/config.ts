@@ -14,7 +14,10 @@
  *
  * A string value written as `$UPPER_SNAKE` is read from the environment when
  * the bundle starts, never compiled in, the way `mcp_servers` env values
- * work. A value read that way is never repeated in an error.
+ * work. A value read that way is never repeated in an error. A daemon shape's
+ * bundle (channel, managed, crew) checks every variable its blocks read before
+ * any registration runs, and stops with exit 2 and one line naming the first
+ * one unset ({@link renderToolConfigEnvGate}).
  *
  * Pure functions over data, except {@link applyToolConfig}, which calls the
  * registrar it is handed. Nothing here imports a tool package.
@@ -680,6 +683,11 @@ function originProblem(entry: unknown, httpsOnly: boolean): string | undefined {
 /** An environment to read references from: `process.env`, or a test's map. */
 export type ToolConfigEnv = Readonly<Record<string, string | undefined>>;
 
+/** The sentence an unset `$VAR` stops a boot with: thrown by {@link resolveToolConfigEnv}, printed by a daemon's boot check. */
+function unsetToolConfigEnvMessage(path: string, name: string): string {
+  return `${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.`;
+}
+
 /**
  * Replace every `$VAR` string in a block with the variable's value. Throws
  * `BuiltinToolError` naming the variable (never a value) when one is unset or
@@ -700,9 +708,7 @@ export function resolveToolConfigEnv(
       if (name === undefined) return node;
       const read = env[name];
       if (read === undefined || read === "") {
-        throw new BuiltinToolError(
-          `${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.`,
-        );
+        throw new BuiltinToolError(unsetToolConfigEnvMessage(path, name));
       }
       secrets.push({ name, value: read });
       return read;
@@ -764,6 +770,40 @@ export function renderToolConfigInit(init: ToolConfigInit): {
     line: `applyToolConfig(${init.initSymbol}, ${json}, ${JSON.stringify(init.where)}, process.env);`,
     readsEnv: true,
   };
+}
+
+/**
+ * The check a daemon shape's bundle runs before its registrations: one
+ * statement per variable the plan's blocks read, in registration order,
+ * naming the first place each is read. An unset or empty variable prints the
+ * sentence {@link resolveToolConfigEnv} throws and exits 2, as the daemons'
+ * other boot gates do (a channel's missing secrets, a crew's empty stdin),
+ * instead of exiting 1 with an uncaught error's stack. The checks come before
+ * the registrations beside them, so no registrar runs with a variable missing.
+ * Empty when no block reads a variable, so such a bundle keeps its bytes.
+ *
+ * Plain code with no import, on purpose: a compiled bundle runs the
+ * `@crewhaus` packages of the version that compiled it, so a check inside a
+ * package would reach bundles only once that version is published, and a new
+ * import would break them. Written into the bundle, it needs nothing new from
+ * any package.
+ */
+export function renderToolConfigEnvGate(
+  plan: ReadonlyArray<ToolConfigInit>,
+): ReadonlyArray<string> {
+  const lines: string[] = [];
+  const named = new Set<string>();
+  for (const init of plan) {
+    for (const { path, name } of toolConfigEnvRefs(init.config, init.where)) {
+      if (named.has(name)) continue;
+      named.add(name);
+      const sentence = JSON.stringify(`${unsetToolConfigEnvMessage(path, name)}\n`);
+      lines.push(
+        `if (!process.env[${JSON.stringify(name)}]) { process.stderr.write(${sentence}); process.exit(2); }`,
+      );
+    }
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------

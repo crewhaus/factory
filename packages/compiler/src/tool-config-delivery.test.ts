@@ -338,6 +338,170 @@ describe("$VAR in tool_config", () => {
   });
 });
 
+describe("a daemon bundle checks its tool-config variables before any registration", () => {
+  const check = (path: string, name: string): string =>
+    `if (!process.env["${name}"]) { process.stderr.write("${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.\\n"); process.exit(2); }`;
+  const RPC_CHECK = check("chains[0].rpcUrls[0]", "TOOL_GATE_RPC");
+  const ORIGIN_CHECK = check("agent.tool_config.http.allowed_origins[0]", "TOOL_GATE_ORIGIN");
+  const CHAINS = [
+    "chains:",
+    "  - id: ethereum-mainnet",
+    "    kind: evm",
+    '    rpcUrls: ["$TOOL_GATE_RPC"]',
+    "    finality: { kind: confirmations, count: 12 }",
+  ];
+  const AGENT_HTTP = (origin: string) => [
+    "agent:",
+    "  model: claude-sonnet-4-6",
+    "  instructions: i",
+    "  tools: [httpRequest]",
+    "  tool_config:",
+    "    http:",
+    `      allowed_origins: [${origin}]`,
+  ];
+  const CREW = [
+    "name: dao-voter",
+    "target: crew",
+    "model: claude-sonnet-4-6",
+    "entry: triage",
+    ...CHAINS,
+    "roles:",
+    "  triage:",
+    "    instructions: Read the proposal id.",
+    "    tools: [evmCall]",
+  ].join("\n");
+  const managed = (origin: string) =>
+    [
+      "name: m",
+      "target: managed",
+      ...AGENT_HTTP(origin),
+      "tenants:",
+      "  - id: t1",
+      "    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }",
+    ].join("\n");
+  const CHANNEL = [
+    "name: ch",
+    "target: channel",
+    ...AGENT_HTTP("$TOOL_GATE_ORIGIN"),
+    "channels:",
+    "  slack:",
+    "    botToken: $SLACK_BOT_TOKEN",
+    "    signingSecret: $SLACK_SIGNING_SECRET",
+    "routing:",
+    "  sessionKey: thread",
+  ].join("\n");
+  const content = (files: ReadonlyArray<{ path: string; content: string }>, path: string) =>
+    files.find((f) => f.path === path)?.content ?? "";
+  /** `first` sits before `second` in `text`, and both are there. */
+  const inOrder = (text: string, first: string, second: string): void => {
+    expect(text.indexOf(first)).toBeGreaterThan(-1);
+    expect(text.indexOf(second)).toBeGreaterThan(-1);
+    expect(text.indexOf(first)).toBeLessThan(text.indexOf(second));
+  };
+
+  test("crew: each role module checks at load, before its chain registration", () => {
+    const { files } = compile(CREW);
+    const role = content(files, "agent_triage.ts");
+    // At module scope: a line of its own, not indented.
+    inOrder(role, `\n${RPC_CHECK}\n`, "applyToolConfig(bindEvmChains, ");
+    for (const path of ["daemon.ts", "orchestrator.ts"]) {
+      expect({ path, check: content(files, path).includes("if (!process.env[") }).toEqual({
+        path,
+        check: false,
+      });
+    }
+  });
+
+  test("managed: agent.ts checks at load, before its registration", () => {
+    const agent = content(compile(managed("$TOOL_GATE_ORIGIN")).files, "agent.ts");
+    inOrder(agent, `\n${ORIGIN_CHECK}\n`, "applyToolConfig(registerHttpConfig, ");
+  });
+
+  test("channel: main() checks after the channel secrets, before any registration", () => {
+    const { files } = compile(CHANNEL);
+    const daemon = content(files, "daemon.ts");
+    // The startup check names the channel secrets first; the variable check
+    // runs inside main(), indented one level.
+    inOrder(daemon, "missing required env vars", "async function main()");
+    inOrder(daemon, "async function main()", `\n  ${ORIGIN_CHECK}\n`);
+    inOrder(daemon, `\n  ${ORIGIN_CHECK}\n`, "applyToolConfig(registerHttpConfig, ");
+    // The eval bridge's entry checks at module scope, before its registration.
+    const entry = content(compile(CHANNEL, { evalEntry: true }).files, "eval-entry.ts");
+    inOrder(entry, `\n${ORIGIN_CHECK}\n`, "applyToolConfig(registerHttpConfig, ");
+    inOrder(entry, `\n${ORIGIN_CHECK}\n`, "export async function runForEval(");
+  });
+
+  test("workflow, graph and cli bundles carry no check: they stop with the registration's error", () => {
+    const workflow = [
+      "name: usdc-payout",
+      "target: workflow",
+      "model: claude-sonnet-4-6",
+      ...CHAINS,
+      "steps:",
+      "  - name: simulate",
+      "    instructions: i",
+      "    tools: [evmCall]",
+    ].join("\n");
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-4-6",
+      "entry: plan",
+      ...CHAINS,
+      "nodes:",
+      "  plan:",
+      "    instructions: plan it",
+      "    tools: [evmCall]",
+      "  write:",
+      "    instructions: write it",
+      "edges:",
+      "  - { from: plan, to: write }",
+    ].join("\n");
+    const cliSpec = cli(
+      "tools: [httpRequest]\ntool_config:\n  http:\n    allowed_origins: [$TOOL_GATE_ORIGIN]\n",
+    );
+    for (const [shape, yaml] of [
+      ["workflow", workflow],
+      ["graph", graph],
+      ["cli", cliSpec],
+    ] as const) {
+      const code = compile(yaml)
+        .files.filter((f) => f.path.endsWith(".ts"))
+        .map((f) => f.content)
+        .join("\n");
+      // The variable is read at boot, so the comparison below is not vacuous.
+      expect({ shape, reads: code.includes("process.env);") }).toEqual({ shape, reads: true });
+      expect({ shape, check: code.includes("if (!process.env[") }).toEqual({ shape, check: false });
+    }
+  });
+
+  test("a variable changes a daemon bundle by the check, the read and its import, and nothing else", () => {
+    const literal = compile(managed('"https://origin.example.invalid"'));
+    const variable = compile(managed("$TOOL_GATE_ORIGIN"));
+    expect(variable.files.map((f) => f.path).sort()).toEqual(
+      literal.files.map((f) => f.path).sort(),
+    );
+    expect(content(variable.files, "daemon.ts")).toBe(content(literal.files, "daemon.ts"));
+    const plainCall = 'registerHttpConfig({"allowed_origins":["https://origin.example.invalid"]});';
+    const toolImport = 'import { httpRequest, registerHttpConfig } from "@crewhaus/tool-http";';
+    const was = content(literal.files, "agent.ts");
+    for (const line of [plainCall, toolImport]) {
+      expect({ line, times: was.split(line).length - 1 }).toEqual({ line, times: 1 });
+    }
+    expect(content(variable.files, "agent.ts")).toBe(
+      was
+        .replace(
+          plainCall,
+          `${ORIGIN_CHECK}\napplyToolConfig(registerHttpConfig, {"allowed_origins":["$TOOL_GATE_ORIGIN"]}, "agent.tool_config.http", process.env);`,
+        )
+        .replace(
+          toolImport,
+          `import { applyToolConfig } from "@crewhaus/tool-categories";\n${toolImport}`,
+        ),
+    );
+  });
+});
+
 describe("a block its registrar would refuse at boot fails the compile", () => {
   // 0.7.0 ignored these blocks, so the bundle booted; 0.7.1 applies them, and
   // the registrar refuses them. Compile says so, with the key and the fix,
