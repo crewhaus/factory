@@ -11,12 +11,20 @@
  * one is untouched — `CopyPath notes.md .` writes `./notes.md`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { buildTar } from "./archive-fixtures";
-import { archiveExtract, copyPath, movePath, removePath } from "./index";
+import { _setExtractCommandForTest, archiveExtract, copyPath, movePath, removePath } from "./index";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -35,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _setExtractCommandForTest(undefined);
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
 });
@@ -121,5 +130,130 @@ describe("the runtime-state roots, beneath a directory a writer names", () => {
     // The same archive into a directory of its own is extracted.
     const fine = await text(archiveExtract, { archive: "evil.tar", destination: "unpacked" });
     expect(fine).toContain('"extracted":true');
+  });
+});
+
+describe("a repository's git directory, beneath a directory a writer names", () => {
+  const GIT_REFUSED = "would write inside a repository's git directory";
+  const tarOf = (name: string): void => {
+    writeFileSync(
+      path.join(tmp, "repo.tar"),
+      buildTar([
+        { name: "notes.md", data: "kept out too\n" },
+        { name, data: "[core]\n" },
+      ]),
+    );
+  };
+
+  test("ArchiveExtract refuses a member with such a name at any depth, and writes nothing", async () => {
+    for (const name of ["n/.git/config", "a/b/.git/HEAD", ".GIT/config", "n/.git./config"]) {
+      tarOf(name);
+      const out = await text(archiveExtract, { archive: "repo.tar", destination: "x" });
+      expect({ name, refused: out.includes(GIT_REFUSED), named: out.includes(name) }).toEqual({
+        name,
+        refused: true,
+        named: true,
+      });
+      expect(existsSync(path.join(tmp, "x"))).toBe(false);
+    }
+    // The dry run is refused with it: it reports a plan that would write there.
+    tarOf("n/.git/config");
+    expect(
+      await text(archiveExtract, { archive: "repo.tar", destination: "x", dryRun: true }),
+    ).toContain(GIT_REFUSED);
+  });
+
+  test("ArchiveExtract reads the destination in front of each member", async () => {
+    mkdirSync(path.join(tmp, ".git"));
+    writeFileSync(path.join(tmp, ".git", "config"), "[core]\n");
+    writeFileSync(path.join(tmp, "repo.tar"), buildTar([{ name: "config", data: "changed\n" }]));
+    const out = await text(archiveExtract, {
+      archive: "repo.tar",
+      destination: ".git",
+      overwrite: true,
+    });
+    expect(out).toContain(GIT_REFUSED);
+    expect(readFileSync(path.join(tmp, ".git", "config"), "utf8")).toBe("[core]\n");
+    // A path through a link to it is read by where it leads.
+    symlinkSync(".git", path.join(tmp, "lnk"));
+    expect(
+      await text(archiveExtract, {
+        archive: "repo.tar",
+        destination: "lnk/hooks",
+        overwrite: true,
+      }),
+    ).toContain(GIT_REFUSED);
+    expect(existsSync(path.join(tmp, ".git", "hooks"))).toBe(false);
+  });
+
+  test("ArchiveExtract reads what the extractor wrote, not only what the index lists", async () => {
+    // An extractor that reads the archive differently from the index, stood in
+    // for by a shell line after the real extraction.
+    const extractorThat = (extra: string): void => {
+      _setExtractCommandForTest((argv, staging) => [
+        "sh",
+        "-c",
+        `"$@" && cd "${staging}" && ${extra}`,
+        "sh",
+        ...argv,
+      ]);
+    };
+    writeFileSync(path.join(tmp, "plain.tar"), buildTar([{ name: "n/ok.txt", data: "ok\n" }]));
+    for (const [member, extra] of [
+      ["n/.git", "mkdir n/.git && echo x > n/.git/config"],
+      ["n/.git", "echo gitdir: ../store > n/.git"],
+      ["n/.git", "mkdir n/store && ln -s store n/.git"],
+      ["n/deep/.GIT", "mkdir -p n/deep/.GIT && echo x > n/deep/.GIT/HEAD"],
+    ] as const) {
+      extractorThat(extra);
+      const out = await text(archiveExtract, { archive: "plain.tar", destination: "x" });
+      expect({ extra, refused: out.includes(GIT_REFUSED), named: out.includes(member) }).toEqual({
+        extra,
+        refused: true,
+        named: true,
+      });
+      // Nothing promoted, and the staging directory is gone.
+      expect(existsSync(path.join(tmp, "x", "n"))).toBe(false);
+      expect(existsSync(path.join(tmp, "x", ".crewhaus-extract"))).toBe(false);
+    }
+    // A neighbour's name written the same way is promoted, as it is from the index.
+    extractorThat("echo x > n/.gitignore");
+    expect(await text(archiveExtract, { archive: "plain.tar", destination: "y" })).toContain(
+      '"extracted":true',
+    );
+    expect(existsSync(path.join(tmp, "y", "n", ".gitignore"))).toBe(true);
+    // The check belongs to a run with roots, as the first one does.
+    extractorThat("mkdir n/.git && echo x > n/.git/config");
+    expect(await text(archiveExtract, { archive: "plain.tar", destination: "z" }, {})).toContain(
+      '"extracted":true',
+    );
+    expect(existsSync(path.join(tmp, "z", "n", ".git", "config"))).toBe(true);
+  });
+
+  test("ArchiveExtract: a neighbour's name extracts, and a run with no roots is not checked", async () => {
+    writeFileSync(
+      path.join(tmp, "repo.tar"),
+      buildTar([
+        { name: "n/.gitignore", data: "x\n" },
+        { name: "n/.github/y", data: "y\n" },
+        { name: "foo.git/z", data: "z\n" },
+      ]),
+    );
+    expect(await text(archiveExtract, { archive: "repo.tar", destination: "x" })).toContain(
+      '"extracted":true',
+    );
+    expect(existsSync(path.join(tmp, "x", "foo.git", "z"))).toBe(true);
+    tarOf("n/.git/config");
+    expect(await text(archiveExtract, { archive: "repo.tar", destination: "bare" }, {})).toContain(
+      '"extracted":true',
+    );
+    expect(existsSync(path.join(tmp, "bare", "n", ".git", "config"))).toBe(true);
+  });
+
+  test("CopyPath of a tree holding one copies it as it is", async () => {
+    write("r/.git/config", "[core]\n");
+    write("r/x", "x\n");
+    expect(await text(copyPath, { source: "r", destination: "r2" })).toContain('"copied":true');
+    expect(readFileSync(path.join(tmp, "r2", ".git", "config"), "utf8")).toBe("[core]\n");
   });
 });

@@ -93,6 +93,16 @@ these on: they reach every harness that uses what each one names.
   work on other files and other harnesses as before. `Bash` and `RunCommand`
   remain outside what the floor can see. Recompile a daemon to pick this up.
 
+- **The runtime-state floor also denies a tool call that writes a path named
+  `.git`, and read-only git tools fetch nothing.** A non-read-only call that
+  names a path with a `.git` name is denied before any rule is read, in every
+  mode but `bypass`, and `ArchiveExtract` and `StateImport` refuse such an entry
+  in every mode. Git itself, and people, still change a repository's config and
+  hooks; a tree copied with its `.git` is copied as before. In a partial clone,
+  `GitShow`, `GitLog`, `GitDiff`, `GitBlame` and the other read-only git tools
+  report an object that is not on disk as missing. `Bash` and `RunCommand` remain
+  outside what the floor can see.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

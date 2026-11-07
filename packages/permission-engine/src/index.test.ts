@@ -1005,6 +1005,183 @@ describe("the runtime-state floor: the files that control a run, one root an exa
   });
 });
 
+describe("the runtime-state floor: a path with a name git treats as its own directory", () => {
+  const ROOTS = [".crewhaus/sessions"];
+  const REASON =
+    "is not read-only and names a path inside a repository's git directory, which belongs to git and to the person running it — no rule can allow that";
+  const allow: RuleSet = {
+    ...emptyRuleSet,
+    flag: [
+      rule("alwaysAllow", "Write", "flag"),
+      rule("alwaysAllow", "Post", "flag"),
+      rule("alwaysAllow", "mcp__fs__search", "flag"),
+    ],
+  };
+  const writing = (rel: string, over: Record<string, unknown> = {}): ToolCallContext => ({
+    toolName: "Write",
+    input: { path: rel },
+    operativeValues: [{ kind: "path", canonical: [rel], ...over }],
+    readOnly: false,
+    destructive: true,
+  });
+  /** A tool that declares no paths: the floor reads the strings in its input. */
+  const posting = (text: string): ToolCallContext => ({
+    toolName: "Post",
+    input: { text },
+    readOnly: false,
+    destructive: false,
+  });
+  const floor = (call: ToolCallContext, protectedRoots: readonly string[] = ROOTS) =>
+    evaluateWithReason(call, "auto", allow, { protectedRoots });
+
+  test("denied before any rule, with its own reason, in every mode but bypass", () => {
+    for (const rel of [
+      ".git/config",
+      ".git/hooks/pre-commit",
+      "n/.git/config",
+      "n/.git",
+      ".GIT/config",
+      ".git./config",
+      "git~1/config",
+      "n\\.git\\config",
+    ]) {
+      for (const over of [{}, { caseInsensitive: true }]) {
+        const r = floor(writing(rel, over));
+        expect({ rel, decision: r.decision, reason: r.reason }).toEqual({
+          rel,
+          decision: "deny",
+          reason: `\`Write\` ${REASON}`,
+        });
+      }
+    }
+    for (const mode of ["default", "plan"] as const) {
+      const r = evaluateWithReason(writing(".git/config"), mode, allow, { protectedRoots: ROOTS });
+      expect({ mode, reason: r.reason }).toEqual({ mode, reason: `\`Write\` ${REASON}` });
+    }
+    expect(
+      evaluateWithReason(writing(".git/config"), "bypass", allow, { protectedRoots: ROOTS })
+        .decision,
+    ).toBe("allow");
+  });
+
+  test("a name that only starts or ends like one is the rules' to decide", () => {
+    for (const rel of [".gitignore", ".gitattributes", ".github/x", "foo.git/x", ".gitmodules"]) {
+      const r = floor(writing(rel));
+      expect({ rel, decision: r.decision }).toEqual({ rel, decision: "allow" });
+    }
+  });
+
+  test("a read-only call on one is the rules' to decide", () => {
+    const read: ToolCallContext = {
+      ...writing(".git/config"),
+      toolName: "Read",
+      readOnly: true,
+      destructive: false,
+    };
+    expect(evaluateWithReason(read, "auto", emptyRuleSet, { protectedRoots: ROOTS }).decision).toBe(
+      "allow",
+    );
+  });
+
+  test("a value is read by its workspace-relative spellings", () => {
+    // The workspace's absolute path to the file, as the canonicaliser gives it.
+    const absolute = writing("/srv/ws/.git/config", { spellings: [".git/config"] });
+    expect(floor(absolute).reason).toBe(`\`Write\` ${REASON}`);
+    // A link to a git directory, caught by where it leads.
+    const linked = writing("lnk/config", { spellings: [".git/config"] });
+    expect(floor(linked).reason).toBe(`\`Write\` ${REASON}`);
+    // A workspace that itself sits under such a name is not walled off.
+    const under = writing("/srv/.git/ws/notes.md", { spellings: ["notes.md"] });
+    expect(floor(under).decision).toBe("allow");
+    // Nor is a path that is not in the workspace read by its names.
+    expect(floor(writing("../other/.git/config")).decision).toBe("allow");
+    // A name that resolves away is not there.
+    expect(floor(writing(".git/../notes.md")).decision).toBe("allow");
+  });
+
+  test("a field that only relocates the tool is left out: its writer adds its own layout", () => {
+    const store = writing(".git", { relocates: true });
+    expect(floor(store).decision).toBe("allow");
+    const named: ToolCallContext = {
+      ...writing("record"),
+      operativeValues: [
+        { kind: "path", canonical: ["n/.git"], relocates: true },
+        { kind: "path", canonical: [".git/config"] },
+      ],
+    };
+    expect(floor(named).reason).toBe(`\`Write\` ${REASON}`);
+  });
+
+  test("a string from a tool with no declared paths: a path, not a URL or a sentence", () => {
+    for (const text of [".git/config", "foo/.git/config", ".GIT/config", "/srv/ws/.git/config"]) {
+      const r = floor(posting(text));
+      expect({ text, reason: r.reason }).toEqual({ text, reason: `\`Post\` ${REASON}` });
+    }
+    for (const text of [
+      "https://h/r/.git/x",
+      "see foo/.git/config now",
+      "a\n.git/config",
+      ".gitignore",
+      // No name follows it, or it is a pattern: an exclude argument, a search term.
+      ".git",
+      ".git/",
+      "n/.git",
+      "**/.git/**",
+      ".git/*",
+      ".git/[ch]*",
+      "{.git,dist}/config",
+    ]) {
+      const r = floor(posting(text));
+      expect({ text, decision: r.decision }).toEqual({ text, decision: "allow" });
+    }
+  });
+
+  test("an undeclared tool's exclude arguments are the rules' to decide, at any depth of its input", () => {
+    const calling = (input: Record<string, unknown>): ToolCallContext => ({
+      toolName: "mcp__fs__search",
+      input,
+      readOnly: false,
+      destructive: false,
+    });
+    for (const input of [
+      { path: "src", excludePatterns: ["node_modules", ".git"] },
+      { excludePatterns: ["**/.git/**"] },
+      { exclude: ".git/" },
+      { query: ".git" },
+      { filter: { skip: [{ name: "vendor/.git" }] } },
+    ]) {
+      expect({ input, decision: floor(calling(input)).decision }).toEqual({
+        input,
+        decision: "allow",
+      });
+    }
+    // A rule still decides them.
+    const denied = evaluateWithReason(
+      calling({ exclude: ".git" }),
+      "auto",
+      { ...emptyRuleSet, yaml: [rule("alwaysDeny", "mcp__fs__search")] },
+      { protectedRoots: ROOTS },
+    );
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason ?? "").not.toContain("git directory");
+    // A file in one, however deep in the input, is still denied.
+    expect(floor(calling({ edits: [{ file: "n/.git/config" }] })).reason).toBe(
+      `\`mcp__fs__search\` ${REASON}`,
+    );
+  });
+
+  test("with no protected roots the run has no floor", () => {
+    expect(floor(writing(".git/config"), []).decision).toBe("allow");
+    expect(evaluateWithReason(writing(".git/config"), "auto", allow).decision).toBe("allow");
+  });
+
+  test("a root's own reason is unchanged", () => {
+    expect(floor(writing(".crewhaus/sessions/x.jsonl")).reason).toContain(
+      "the runtime keeps its own record of the run",
+    );
+  });
+});
+
 describe("Pillar 3 — ruleBasedJustificationJudge", () => {
   test("denies brief justifications", async () => {
     const v = await evaluateJustification({

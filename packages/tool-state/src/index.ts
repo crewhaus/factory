@@ -48,6 +48,8 @@ import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 import {
+  gitDirectoryWriteRefusal,
+  landsInGitDirectory,
   protectedRootBeneath,
   protectedRootHolding,
   protectedRootsOf,
@@ -1889,6 +1891,11 @@ export const stateImport: RegisteredTool = stateTool({
       }
       if (protectedRoots.length > 0 && protectedRootHolding(target, protectedRoots) !== undefined) {
         return protectedWriteRefusal("StateImport", `importing ${file.path}`);
+      }
+      // Read with the state directory in front: `config` imported to `.git` has
+      // no such name of its own, and neither does an entry behind a link.
+      if (protectedRoots.length > 0 && landsInGitDirectory(target)) {
+        return gitDirectoryWriteRefusal("StateImport", `importing ${file.path}`);
       }
       const body =
         file.encoding === "utf8"

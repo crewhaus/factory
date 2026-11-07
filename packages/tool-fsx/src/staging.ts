@@ -18,14 +18,16 @@
  *     appears, so one planted as `data.csv` freezes the next tool to read it;
  *   - the bytes written are measured, each inode once, because a zip's
  *     declared sizes are not what `unzip` writes (a 65 KB archive whose
- *     headers both claim 1000 bytes wrote 64 MiB).
+ *     headers both claim 1000 bytes wrote 64 MiB);
+ *   - every entry with a name git treats as its own directory is listed, of
+ *     any kind and at any depth, for a caller that keeps those out.
  *
  * A scan that could not see the whole tree is "incomplete", and the caller
  * refuses it: "we did not look" is not "nothing is there".
  */
 import { type Dirent, lstatSync, readdirSync } from "node:fs";
 import * as path from "node:path";
-import { walkContained } from "@crewhaus/tool-safety/fs";
+import { namesGitDirectory, walkContained } from "@crewhaus/tool-safety/fs";
 
 /** How many staged entries the post-extraction scan will look at. */
 export const STAGING_SCAN_BUDGET = 500_000;
@@ -43,6 +45,8 @@ export type StagingScan = {
    * FIFO blocks until a writer appears.
    */
   readonly special: string[];
+  /** Every entry whose path has a name git treats as its own directory (`namesGitDirectory`). */
+  readonly gitNamed: string[];
   /** Apparent bytes of regular files, each inode counted once. */
   readonly bytes: number;
   /**
@@ -63,12 +67,16 @@ export function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): Stag
     maxDepth: STAGING_MAX_DEPTH,
     maxVisited: budget + 1,
   });
-  if (!walked.ok) return { escaping: [], linkedOut: [], special: [], bytes: 0, incomplete: true };
+  if (!walked.ok) {
+    return { escaping: [], linkedOut: [], special: [], gitNamed: [], bytes: 0, incomplete: true };
+  }
   let incomplete = walked.truncated || walked.unreadable.length > 0;
   const escaping: string[] = [];
   const special: string[] = [];
+  const gitNamed: string[] = [];
   const inodes = new Map<string, { names: number; nlink: number; size: number; rel: string }>();
   for (const entry of walked.entries) {
+    if (namesGitDirectory(entry.rel)) gitNamed.push(entry.rel);
     if (entry.kind === "symlink") {
       if (entry.link === undefined || !entry.link.inside) {
         escaping.push(`${entry.rel} -> ${entry.link?.text ?? "?"}`);
@@ -105,6 +113,7 @@ export function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): Stag
     escaping: escaping.sort(sort),
     linkedOut: linkedOut.sort(sort),
     special: special.sort(sort),
+    gitNamed: gitNamed.sort(sort),
     bytes,
     incomplete,
   };

@@ -522,6 +522,100 @@ describe("a read's environment", () => {
   }, 20_000);
 });
 
+describe("a read answers from what is on disk", () => {
+  /** One blob per caller, so one read's result cannot stand in for another's. */
+  const NAMES = ["live", "show", "diff", "blame", "mergebase", "revparse", "log"] as const;
+  let clone: string;
+  const blobs = new Map<string, string>();
+
+  /** A git that does not fetch either: asking the clone must not change the answer. */
+  function holds(hash: string): boolean {
+    const r = Bun.spawnSync(["git", "cat-file", "-e", hash], {
+      cwd: clone,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return r.exitCode === 0;
+  }
+
+  function blobOf(name: (typeof NAMES)[number]): string {
+    return blobs.get(name) as string;
+  }
+
+  beforeEach(() => {
+    const source = join(workspace, "source");
+    mkdirSync(source);
+    git(["init", "-q", "-b", "main"], source);
+    git(["config", "user.name", "A U Thor"], source);
+    git(["config", "user.email", "author@example.com"], source);
+    git(["config", "commit.gpgsign", "false"], source);
+    git(["config", "uploadpack.allowFilter", "true"], source);
+    git(["config", "uploadpack.allowAnySHA1InWant", "true"], source);
+    for (const name of NAMES) writeFileSync(join(source, `${name}.txt`), `${name}\n`);
+    git(["add", "."], source);
+    git(["commit", "-qm", "base"], source);
+    for (const name of NAMES) {
+      blobs.set(name, git(["rev-parse", `HEAD:${name}.txt`], source).out.trim());
+    }
+    git(["clone", "-q", "--no-checkout", "--filter=blob:none", `file://${source}`, "c"], workspace);
+    clone = join(workspace, "c");
+  });
+
+  const inClone = async (tool: RegisteredTool, input: Record<string, unknown>): Promise<string> =>
+    call(tool, { cwd: "c", ...input });
+
+  test("the fixture is live: plain git fetches a blob the clone does not hold", () => {
+    const hash = blobOf("live");
+    expect(holds(hash)).toBe(false);
+    expect(git(["show", hash], clone).code).toBe(0);
+    expect(holds(hash)).toBe(true);
+  }, 20_000); // slow by construction: a local fetch through a child git
+
+  const READS: ReadonlyArray<
+    readonly [
+      (typeof NAMES)[number],
+      RegisteredTool,
+      (blob: string) => Record<string, unknown>,
+      RegExp,
+    ]
+  > = [
+    ["show", gitShow, (blob) => ({ ref: blob }), /bad object/i],
+    ["diff", gitDiff, (blob) => ({ ref: blob }), /bad object/i],
+    ["blame", gitBlame, () => ({ path: "blame.txt", ref: "HEAD" }), /GitBlame failed/i],
+    ["mergebase", gitMergeBase, (blob) => ({ a: blob, b: "HEAD" }), /GitMergeBase failed/i],
+    ["revparse", gitRevParse, (blob) => ({ refs: [blob] }), /missing/i],
+  ];
+  for (const [name, tool, input, reported] of READS) {
+    test(`${tool.name} reports an object that is not on disk, and fetches nothing`, async () => {
+      const hash = blobOf(name);
+      const out = await inClone(tool, input(hash));
+      expect(out).toMatch(reported);
+      expect(holds(hash)).toBe(false);
+    }, 20_000); // slow by construction: a clone in the fixture, several git spawns
+  }
+
+  test("GitLog of HEAD still returns: the history is on disk", async () => {
+    const out = await inClone(gitLog, { ref: "HEAD" });
+    expect(out).toContain("base");
+    expect(holds(blobOf("log"))).toBe(false);
+  });
+
+  test("every read carries both settings; a write carries neither", async () => {
+    const out = join(workspace, "env.txt");
+    const alias = ["-c", `alias.envdump=!env > ${JSON.stringify(out)}`, "envdump"];
+    await runGit(alias, { cwd: repo, timeoutMs: 10_000, readOnly: true });
+    const readEnv = readFileSync(out, "utf8");
+    expect(/^GIT_NO_LAZY_FETCH=1$/m.test(readEnv)).toBe(true);
+    expect(/^GIT_ALLOW_PROTOCOL=$/m.test(readEnv)).toBe(true);
+    rmSync(out);
+    await runGit(alias, { cwd: repo, timeoutMs: 10_000 });
+    const writeEnv = readFileSync(out, "utf8");
+    expect(/^GIT_NO_LAZY_FETCH=/m.test(writeEnv)).toBe(false);
+    expect(/^GIT_ALLOW_PROTOCOL=/m.test(writeEnv)).toBe(false);
+  }, 20_000); // slow by construction: two child gits, each running a shell
+});
+
 describe("the index a commit hook is handed", () => {
   function cleanRepo(name: string): string {
     const dir = join(workspace, name);

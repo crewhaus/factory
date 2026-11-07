@@ -509,11 +509,15 @@ export async function runGit(args: readonly string[], opts: RunOptions): Promise
   // LC_ALL=C pins git's own diagnostics to one language, so a message this
   // package matches on does not change with the operator's locale.
   // GIT_TERMINAL_PROMPT=0 guarantees git never blocks waiting on a terminal.
+  // A read answers from what is on disk: lazy fetch is off, and no transport is
+  // allowed for a git older than 2.45, which does not read GIT_NO_LAZY_FETCH.
   const ceiling = discoveryCeiling();
   const pinned: Record<string, string> = {
     LC_ALL: "C",
     GIT_TERMINAL_PROMPT: "0",
-    ...(readOnly ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
+    ...(readOnly
+      ? { GIT_OPTIONAL_LOCKS: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "" }
+      : {}),
     ...(opts.discoverAboveRoot !== true && ceiling !== undefined
       ? { GIT_CEILING_DIRECTORIES: ceiling }
       : {}),

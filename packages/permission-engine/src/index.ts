@@ -51,7 +51,7 @@ import {
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
-import { foldedName, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { foldedName, namesGitDirectory, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
@@ -164,6 +164,19 @@ export type EvaluateOptions = {
    * compares exactly. The text of a tool that declares no paths is not compared
    * with the relative roots of {@link NAMES_IN_TEXT}, which are ordinary words
    * and file names there; their absolute spellings still are.
+   *
+   * When the list is not empty the floor also denies a call that is not
+   * read-only and names a path with a name git treats as its own directory
+   * (`namesGitDirectory`), wherever it lies in the workspace: that directory
+   * belongs to git and to the person running it. A value is read by its
+   * workspace-relative spellings, so a link to one is caught by where it leads
+   * and a workspace that itself sits under such a name is not walled off. A
+   * field declared `relocates` is left out, as its writer adds fixed
+   * subdirectories and suffixes. A string from a tool that declares no paths
+   * counts only when a name follows that one and it holds no `://`, whitespace
+   * or glob characters: a URL, a sentence, a search term or an exclude pattern
+   * is not a path being written, and that tool may be a chat post, where the
+   * deny would have no rule to lift it. Any other such string goes to the rules.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
 };
@@ -401,6 +414,18 @@ function insideWorkspace(key: string): boolean {
   return key !== "." && !key.startsWith("/") && key !== ".." && !key.startsWith("../");
 }
 
+/** What {@link protectedRootHit} reports for a path with a name git treats as its own directory. */
+const GIT_DIRECTORY = ".git";
+
+/** A string from a tool with no declared paths that reads as a URL, a sentence or a pattern, not a path. */
+const NOT_A_PATH = /:\/\/|\s|[*?[\]{}]/;
+
+/** Does a name follow a git directory's name in this floor key? `.git` and `n/.git` name no file in it. */
+function namesInsideGitDirectory(key: string): boolean {
+  const last = key.lastIndexOf("/");
+  return last > 0 && namesGitDirectory(key.slice(0, last));
+}
+
 /**
  * Relative roots that mean something else in the text of a tool that declares no
  * paths: words for a label, a channel or a branch, and file names that every
@@ -439,7 +464,9 @@ const NAMES_IN_TEXT: ReadonlySet<string> = new Set([
  * that acts beneath the workspace root checks its own targets against the
  * roots on the bridge, and a shell command stays a residual. The `above`
  * reading compares workspace-relative spellings only, so a root outside the
- * workspace (where no in-workspace writer reaches) is read `inside` alone.
+ * workspace (where no in-workspace writer reaches) is read `inside` alone. A
+ * path with a name git treats as its own directory is reported as
+ * {@link GIT_DIRECTORY}, before any root is compared.
  */
 function protectedRootHit(
   call: ToolCallContext,
@@ -448,7 +475,12 @@ function protectedRootHit(
   if (call.readOnly || opts.protectedRoots === undefined || opts.protectedRoots.length === 0) {
     return undefined;
   }
-  const candidates: Array<{ readonly path: string; readonly fold: boolean }> = [];
+  const candidates: Array<{
+    readonly path: string;
+    readonly fold: boolean;
+    /** How the git-directory name check reads this spelling: only inside the workspace, or as text. */
+    readonly gitName: "workspace" | "text" | "none";
+  }> = [];
   /** Directories the call acts beneath, as workspace-relative keys. */
   const walked: Array<{
     readonly key: string;
@@ -462,8 +494,9 @@ function protectedRootHit(
       // A path outside the workspace was not walked: how its volume compares
       // names is not known, and folding it only widens what the floor catches.
       const fold = value.caseInsensitive === true || value.outsideWorkspace === true;
+      const gitName = value.relocates === true ? "none" : "workspace";
       for (const path of [...value.canonical, ...(value.spellings ?? [])]) {
-        candidates.push({ path, fold });
+        candidates.push({ path, fold, gitName });
       }
       for (const prefix of value.beneath ?? []) {
         const key = floorKey(prefix, fold);
@@ -474,16 +507,25 @@ function protectedRootHit(
     }
   } else {
     // Text as written: nothing says how the volume it lands on compares names.
-    for (const path of inputStrings(call.input)) candidates.push({ path, fold: true });
+    for (const path of inputStrings(call.input)) {
+      candidates.push({ path, fold: true, gitName: NOT_A_PATH.test(path) ? "none" : "text" });
+    }
   }
   // Each spelling read once, however many roots there are. A drive path is
   // also read as written, relative: on POSIX `C:/../.crewhaus/sessions/x`
   // is a path into the logs (a tool read from its input strings carries no
   // canonical spelling), and on Windows the second reading only denies more.
   const keys: Array<{ readonly key: string; readonly fold: boolean }> = [];
-  for (const { path, fold } of candidates) {
+  for (const { path, fold, gitName } of candidates) {
     if (path === "") continue;
-    keys.push({ key: floorKey(path, fold), fold });
+    const key = floorKey(path, fold);
+    if (
+      (gitName === "text" && namesInsideGitDirectory(key)) ||
+      (gitName === "workspace" && insideWorkspace(key) && namesGitDirectory(key))
+    ) {
+      return { root: GIT_DIRECTORY };
+    }
+    keys.push({ key, fold });
     if (DRIVE_PATH.test(path)) keys.push({ key: floorKey(path, fold, false), fold });
   }
   for (const root of opts.protectedRoots) {
@@ -536,6 +578,12 @@ export function evaluateWithReason(
   // directory the call acts beneath that holds one — and that the tool is
   // not read-only; it does not guess whether the call reads or writes there.
   const floorHit = protectedRootHit(call, opts);
+  if (floorHit?.root === GIT_DIRECTORY) {
+    return {
+      decision: "deny",
+      reason: `\`${call.toolName}\` is not read-only and names a path inside a repository's git directory, which belongs to git and to the person running it — no rule can allow that`,
+    };
+  }
   if (floorHit !== undefined) {
     const RECORD =
       "the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory)";

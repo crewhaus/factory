@@ -1051,6 +1051,76 @@ describe("StateImport never writes the run's own record (0.8.0, I12)", () => {
   });
 });
 
+describe("StateImport never writes a repository's git directory", () => {
+  const GIT_REFUSED = "would write inside a repository's git directory";
+  const importing = async (
+    input: Record<string, unknown>,
+    protectedRoots: readonly string[] = [".crewhaus/sessions"],
+  ): Promise<string> => {
+    const out = await stateImport.execute(input, { bridge: { protectedRoots } });
+    return typeof out === "string" ? out : JSON.stringify(out);
+  };
+  const documentOf = (...paths: string[]) => ({
+    version: 1,
+    files: paths.map((p) => ({ path: p, encoding: "utf8", content: "[core]\n" })),
+  });
+
+  test("an entry with such a name is refused, and nothing in the document is written", async () => {
+    for (const entry of ["n/.git/config", ".GIT/config", "a/b/.git/HEAD"]) {
+      const out = await importing({
+        document: documentOf("kept.txt", entry),
+        stateDir: ".",
+      });
+      expect({ entry, refused: out.includes(GIT_REFUSED), named: out.includes(entry) }).toEqual({
+        entry,
+        refused: true,
+        named: true,
+      });
+      expect(existsSync(path.join(tmp, "kept.txt"))).toBe(false);
+      expect(existsSync(path.join(tmp, entry))).toBe(false);
+    }
+  });
+
+  test("the state directory is read in front of each entry", async () => {
+    for (const stateDir of [".git", "n/.git/hooks"]) {
+      const out = await importing({ document: documentOf("config"), stateDir });
+      expect({ stateDir, refused: out.includes(GIT_REFUSED) }).toEqual({ stateDir, refused: true });
+      expect(existsSync(path.join(tmp, stateDir))).toBe(false);
+    }
+    // The dry run is refused too: it reports a plan that would write there.
+    expect(
+      await importing({ document: documentOf("config"), stateDir: ".git", dryRun: true }),
+    ).toContain(GIT_REFUSED);
+  });
+
+  test("an entry behind a link is read by where it leads", async () => {
+    mkdirSync(path.join(tmp, ".git"));
+    writeFileSync(path.join(tmp, ".git", "config"), "kept\n");
+    symlinkSync(".git", path.join(tmp, "lnk"));
+    const out = await importing({ document: documentOf("lnk/config"), stateDir: "." });
+    expect(out).toContain(GIT_REFUSED);
+    expect(readFileSync(path.join(tmp, ".git", "config"), "utf8")).toBe("kept\n");
+  });
+
+  test("a store's own entries and a neighbour's name are imported", async () => {
+    const out = JSON.parse(
+      await importing({
+        document: documentOf("kv/x.json", "n/.gitignore", "n/.github/y", "foo.git/z"),
+        stateDir: "backup",
+      }),
+    );
+    expect(out.written).toBe(4);
+    expect(existsSync(path.join(tmp, "backup", "kv", "x.json"))).toBe(true);
+  });
+
+  test("a run with no roots is not checked", async () => {
+    const out = JSON.parse(
+      await importing({ document: documentOf("n/.git/config"), stateDir: "backup" }, []),
+    );
+    expect(out.written).toBe(1);
+  });
+});
+
 describe("StateExport / StateImport", () => {
   beforeEach(async () => {
     await run(kvSet, { namespace: "n", key: "k", value: { a: 1 } });

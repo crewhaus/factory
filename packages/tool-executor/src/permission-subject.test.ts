@@ -3258,3 +3258,18 @@ describe("an owner's own copy of a value (overlay)", () => {
     expect(build({ field: "env", kind: "id", within: "name", overlay: "tenant" })).not.toThrow();
   });
 });
+
+describe("a value of a field that only relocates the tool", () => {
+  const store: ReadonlyArray<OperativeArg> = [
+    { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+    { field: "path", kind: "path" },
+  ];
+
+  test("is marked when the call names it, and only then", () => {
+    const named = operativeValuesOf(store, { stateDir: ".git", path: "a" }) ?? [];
+    expect(named.filter((v) => v.relocates === true).map((v) => v.canonical[0])).toEqual([".git"]);
+    expect(named.some((v) => v.canonical[0] === "a" && v.relocates !== true)).toBe(true);
+    const left = operativeValuesOf(store, { path: "a" }) ?? [];
+    expect(left.some((v) => v.relocates === true)).toBe(false);
+  });
+});
