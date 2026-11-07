@@ -146,6 +146,9 @@ instead of reporting: a version written from a partial read is a version that si
 - **`DatasetMine` writes nothing.** Candidates come back for review and `DatasetPut` is the only
   writer, so there is one write path to reason about. Hand `candidates[].sample` straight to
   `DatasetPut`.
+- **`DatasetPut` does not write into the runtime's own files.** A dataset that would land in one of
+  the roots on the tool's bridge (the run's record, or the files that control it) is refused in
+  every permission mode, by name or through a link, and nothing is written.
 - **An egress block does not become a sample.** The audit record carries no turn input, and a
   sample whose input is an error string teaches nothing. Blocks are reported under
   `signals["egress-block"].blocks` so they can be joined by hand.

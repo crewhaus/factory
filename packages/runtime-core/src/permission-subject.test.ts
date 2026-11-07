@@ -257,6 +257,21 @@ async function expectBlocked(call: Call, ruleSet: RuleSet, want: Record<Permissi
   }
 }
 
+/** For each mode, the runtime-state floor denies the call before any rule is read, and it does not run. */
+async function expectFloorDenied(call: Call, ruleSet: RuleSet) {
+  for (const mode of MODES) {
+    ran = [];
+    const r = await run(call, ruleSet, mode);
+    expect({ mode, ran: r.ran, decision: r.decision }).toEqual({
+      mode,
+      ran: false,
+      decision: "deny",
+    });
+    expect(r.reason).toContain("or the files that control it");
+    expect(r.reason).toContain("no rule can allow that");
+  }
+}
+
 async function expectRuns(call: Call, ruleSet: RuleSet, modes: readonly PermissionMode[]) {
   for (const mode of modes) {
     ran = [];
@@ -270,15 +285,26 @@ async function expectRuns(call: Call, ruleSet: RuleSet, modes: readonly Permissi
 }
 
 describe("decoy file_path next to the path the tool reads (security-1#0, flag-truth-1#0)", () => {
+  // The decoy is aimed at a file no runtime-state root covers, so these test
+  // the matcher; the harness's own settings file is the floor's (below).
   const allowSrc = rules(["alwaysAllow", "Write(src/**)"]);
   test("allow: the decoy does not authorise the real path", async () => {
     await expectBlocked(
       {
         name: "Write",
-        input: { file_path: "src/ok.ts", path: ".crewhaus/settings.json", content: "{}" },
+        input: { file_path: "src/ok.ts", path: "config/settings.json", content: "{}" },
       },
       allowSrc,
       { default: "ask", auto: "ask", plan: "deny" },
+    );
+  });
+  test("floor: the harness's own settings file is denied before any rule, whatever the decoy says", async () => {
+    await expectFloorDenied(
+      {
+        name: "Write",
+        input: { file_path: "src/ok.ts", path: ".crewhaus/settings.json", content: "{}" },
+      },
+      allowSrc,
     );
   });
   test("control: the in-scope call runs, and the tool never sees the decoy key", async () => {
@@ -293,9 +319,9 @@ describe("decoy file_path next to the path the tool reads (security-1#0, flag-tr
     await expectBlocked(
       {
         name: "Write",
-        input: { file_path: "src/ok.ts", path: ".crewhaus/settings.json", content: "{}" },
+        input: { file_path: "src/ok.ts", path: "config/settings.json", content: "{}" },
       },
-      rules(["alwaysDeny", "Write(.crewhaus/**)"], ["alwaysAllow", "Write"]),
+      rules(["alwaysDeny", "Write(config/**)"], ["alwaysAllow", "Write"]),
       { default: "deny", auto: "deny", plan: "deny" },
     );
   });
@@ -353,18 +379,26 @@ describe("a left-out field the tool fills with a default (permission-integration
 });
 
 describe("`..` traversal and symlinked directories (permission-integration#1)", () => {
+  // `config/settings.json` is a file no runtime-state root covers, so the
+  // rule decides; the harness's own settings file is the floor's.
   test("allow: src/../ does not stay inside src/**", async () => {
     await expectBlocked(
-      { name: "Write", input: { path: "src/../.crewhaus/settings.json", content: "{}" } },
+      { name: "Write", input: { path: "src/../config/settings.json", content: "{}" } },
       rules(["alwaysAllow", "Write(src/**)"]),
       { default: "ask", auto: "ask", plan: "deny" },
     );
   });
-  test("deny: src/../.crewhaus is still .crewhaus", async () => {
+  test("deny: src/../config is still config", async () => {
     await expectBlocked(
-      { name: "Write", input: { path: "src/../.crewhaus/settings.json", content: "{}" } },
-      rules(["alwaysDeny", "Write(.crewhaus/**)"], ["alwaysAllow", "Write"]),
+      { name: "Write", input: { path: "src/../config/settings.json", content: "{}" } },
+      rules(["alwaysDeny", "Write(config/**)"], ["alwaysAllow", "Write"]),
       { default: "deny", auto: "deny", plan: "deny" },
+    );
+  });
+  test("floor: src/../.crewhaus/settings.json is the harness's own settings file", async () => {
+    await expectFloorDenied(
+      { name: "Write", input: { path: "src/../.crewhaus/settings.json", content: "{}" } },
+      rules(["alwaysAllow", "Write(src/**)"], ["alwaysAllow", "Write"]),
     );
   });
   test("allow: build/link/ lands in src/, which build/** does not cover", async () => {

@@ -236,7 +236,7 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
-import { runtimeStateRoots } from "./state-roots";
+import { relocatingFieldLeftOut, runtimeRecordRoots, runtimeStateRoots } from "./state-roots";
 import {
   type ServingModel,
   type ToolLimitVerdict,
@@ -4080,13 +4080,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // tool call the agent makes may write there, whatever a rule says
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  const recordRoots = runtimeRecordRoots(sessionRootDir, currentTenantContext()?.tenant);
   /**
    * The floor's reading of a call: where it WRITES. Two kinds of field are
    * left out, field by field:
    *
-   *  - one declared `relocates` names the store a tool works in through its
-   *    own format (EmitTraceEvent's namespaced `custom.*` lines,
-   *    IncidentBundle's sessions it reads whole), not a file the call names;
+   *  - one declared `relocates` that names a store the tool works in through
+   *    its own format inside the run's record (EmitTraceEvent's namespaced
+   *    `custom.*` lines), or one it reads whole (IncidentBundle's sessions).
+   *    A store anywhere else is read as any path is
+   *    (`relocatingFieldLeftOut`, `./state-roots`);
    *  - one declared `source` holds where the tool takes a value FROM (the
    *    files IndexBuild indexes, the file DatasetPut reads, the reference
    *    EnvFileUpsert copies a secret out of): reading a spilled output or a
@@ -4117,7 +4120,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       return value !== undefined && value !== null && value !== "";
     };
     const skipped = (arg: NonNullable<typeof args>[number]): boolean =>
-      arg.relocates === true ||
+      (arg.relocates === true &&
+        relocatingFieldLeftOut(arg, parsedInput, recordRoots, protectedRoots)) ||
       arg.source === true ||
       arg.reads === true ||
       (arg.readsWhen !== undefined && named(arg.readsWhen));
