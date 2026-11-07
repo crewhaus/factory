@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { buildTenant } from "@crewhaus/tenancy";
 import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
 import {
+  credentialFileRoots,
   declaredEnvFiles,
   relocatingFieldLeftOut,
   runtimeRecordRoots,
@@ -1152,5 +1153,78 @@ describe("what a harness's next start runs", () => {
       expect(roots).toContain("dist");
       expect(roots).not.toContain("package.json");
     });
+  });
+});
+
+describe("the credential file roots", () => {
+  const NAMES = [
+    ".env",
+    join(".crewhaus", "secrets"),
+    join(".crewhaus", "identity.json"),
+    join(".crewhaus", "run", "control-token"),
+    join(".crewhaus", "run", "mcp-token"),
+    join(".crewhaus", "run", "gateway-jwt-secret"),
+    join(".crewhaus", "run", "logs"),
+    join(".crewhaus", "run", "control", "keys"),
+  ];
+  const settle = (cwd: string, envFiles: readonly string[]): void => {
+    mkdirSync(join(cwd, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { envFiles } }),
+    );
+  };
+
+  test("are these names, word for word, resolved and workspace-relative", () => {
+    const cwd = tempDir("crewhaus-credential-roots-");
+    expect(credentialFileRoots(cwd).sort()).toEqual(
+      [...NAMES, ...NAMES.map((name) => join(cwd, name))].sort(),
+    );
+  });
+
+  test("the working directory is the process's by default", () => {
+    expect(credentialFileRoots()).toEqual(credentialFileRoots(process.cwd()));
+  });
+
+  test("a link an operator made adds where it leads", () => {
+    const cwd = tempDir("crewhaus-credential-roots-");
+    const elsewhere = tempDir("crewhaus-credential-elsewhere-");
+    symlinkSync(elsewhere, join(cwd, ".crewhaus"));
+    const roots = credentialFileRoots(cwd);
+    expect(roots).toContain(join(cwd, ".crewhaus", "secrets"));
+    expect(roots).toContain(join(".crewhaus", "secrets"));
+    expect(roots).toContain(join(elsewhere, "secrets"));
+    // A protected file behind that link is held under its own name.
+    expect(protectedRootHolding(join(elsewhere, "secrets", "x"), roots, cwd)).toBeDefined();
+  });
+
+  test("a file manager.envFiles declares joins them, inside the working directory or out", () => {
+    const cwd = tempDir("crewhaus-credential-roots-");
+    const outside = join(tempDir("crewhaus-credential-elsewhere-"), "fleet.env");
+    settle(cwd, ["config/app.conf", outside]);
+    const roots = credentialFileRoots(cwd);
+    expect(roots).toContain(join(cwd, "config", "app.conf"));
+    expect(roots).toContain(join("config", "app.conf"));
+    expect(roots).toContain(outside);
+    // Outside, it has no relative spelling.
+    expect(roots.filter((root) => !isAbsolute(root)).sort()).toEqual(
+      [...NAMES, join("config", "app.conf")].sort(),
+    );
+  });
+
+  test("a declared `.` or `..` is left out, and the entries beside it stay", () => {
+    const cwd = tempDir("crewhaus-credential-roots-");
+    settle(cwd, [".", "..", "config/app.conf"]);
+    const roots = credentialFileRoots(cwd);
+    expect(roots).not.toContain(cwd);
+    expect(roots).not.toContain(dirname(cwd));
+    expect(roots).toContain(join(cwd, "config", "app.conf"));
+  });
+
+  test("reading these leaves runtimeStateRoots as it reads", () => {
+    const cwd = tempDir("crewhaus-credential-roots-");
+    const before = runtimeStateRoots(undefined, undefined, cwd, {});
+    credentialFileRoots(cwd);
+    expect(runtimeStateRoots(undefined, undefined, cwd, {})).toEqual(before);
   });
 });

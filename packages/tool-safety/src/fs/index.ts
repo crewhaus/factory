@@ -36,6 +36,10 @@
  * - {@link namesGitDirectory} / {@link landsInGitDirectory}: whether a path
  *   lies in a repository's git directory, which a tool that writes beneath a
  *   directory also refuses to reach ({@link gitDirectoryWriteRefusal}).
+ * - {@link credentialRootsOf} / {@link isCredentialFileName}: the files a run
+ *   keeps from its tools, by the roots on its bridge and by name;
+ *   {@link isHeldFile} and {@link heldInTree} ask of one path and of a tree, and
+ *   {@link heldFileRefusal} is the refusal.
  *
  * Every refusal is a {@link SafeFsFailure} naming the caller's path and the
  * reason, never where an escaping path led or what is there.
@@ -104,8 +108,13 @@ export {
   copyTreeSafe,
 } from "./copy";
 export {
+  credentialRootsOf,
   foldedName,
   gitDirectoryWriteRefusal,
+  heldFileRefusal,
+  heldInTree,
+  isCredentialFileName,
+  isHeldFile,
   landsInGitDirectory,
   namesGitDirectory,
   protectedRootBeneath,

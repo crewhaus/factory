@@ -26,10 +26,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   MAX_OUTPUT_CHARS,
+  credentialExcludes,
   failure,
   runGit,
   skippedPatchPaths,
@@ -1546,6 +1547,54 @@ describe("GitApplyPatch", () => {
     expect(fine.applied).toBe(true);
   });
 
+  test("credentialExcludes: each held name goes, and a name the bullet calls fine stays", () => {
+    const names = [
+      ".env",
+      ".ENV",
+      ".env.local",
+      ".env.e",
+      ".env.ex",
+      ".env.exampl",
+      ".env.examples",
+      ".env.example.local",
+      ".env.s",
+      ".env.sampler",
+      ".env.t",
+      ".env.templates",
+      ".npmrc",
+      "deep/er/.env",
+      "deep/er/.env.staging",
+      "deep/.npmrc",
+      "held/file",
+      "HELD/other",
+    ];
+    const open = [
+      ".env.example",
+      ".env.sample",
+      ".env.template",
+      "deep/.env.sample",
+      ".envrc",
+      "env",
+      "my.npmrc",
+      "notes.env",
+      "held2/file",
+    ];
+    for (const name of [...names, ...open]) {
+      mkdirSync(dirname(join(repo, name)), { recursive: true });
+      writeFileSync(join(repo, name), "x\n");
+    }
+    const excludes = credentialExcludes(repo, [join(repo, "held"), "/elsewhere/entirely"]);
+    expect(excludes.some((spec) => spec.includes("elsewhere"))).toBe(false);
+    const listed = git(["ls-files", "-o", "--", ...excludes], repo).stdout.split("\n");
+    expect(names.filter((name) => listed.includes(name))).toEqual([]);
+    expect(open.filter((name) => !listed.includes(name))).toEqual([]);
+    // From a subdirectory the names are read from the top all the same.
+    const below = git(["ls-files", "-o", "--", ...excludes], join(repo, "deep")).stdout;
+    expect(below).not.toContain(".npmrc");
+    expect(below).toContain(".env.sample");
+    expect(credentialExcludes(repo, [])).toEqual([]);
+  });
+
   test("a patch writing into the run's own record (session logs, spilled results, proofs) is refused whole", async () => {
     // The floor reads `cwd`, never the files a patch names: these are the
     // names it would otherwise write unseen (design/0.8.0 §1 principle 1).
@@ -2288,7 +2337,9 @@ describe("a caller's pathspec is literal, never a glob", () => {
     const callers = [...source.matchAll(/checkPathspecs\("(\w+)"/g)].map((m) => m[1]).sort();
     expect(callers).toEqual([...PATHSPEC_TOOLS, "GitShow", "GitBlame"].sort());
     // And each pathspec tool hands git the checked value, not its input.
-    expect(source.match(/\.\.\.checked\.value/g)?.length).toBe(PATHSPEC_TOOLS.length);
+    expect(source.match(/\.\.\.checked\.value|pathspecArgs\(checked\.value/g)?.length).toBe(
+      PATHSPEC_TOOLS.length,
+    );
   });
 });
 

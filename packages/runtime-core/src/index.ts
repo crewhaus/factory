@@ -241,7 +241,13 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
-import { relocatingFieldLeftOut, runtimeRecordRoots, runtimeStateRoots } from "./state-roots";
+import {
+  credentialFileRoots,
+  credentialFloorScope,
+  relocatingFieldLeftOut,
+  runtimeRecordRoots,
+  runtimeStateRoots,
+} from "./state-roots";
 import {
   type ServingModel,
   type ToolLimitVerdict,
@@ -3819,6 +3825,15 @@ function withoutNarration(text: string, echo: ReadonlyArray<ReadonlySet<string>>
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
+  // A `channel` or `managed` run answers people other than its operator, so it
+  // and the loops it starts (a sub-agent, a consult) share one scope, and each
+  // keeps the credential files from its tools (`./state-roots`).
+  if (
+    (opts.sessionTarget === "channel" || opts.sessionTarget === "managed") &&
+    credentialFloorScope.getStore() !== true
+  ) {
+    return credentialFloorScope.run(true, () => runChatLoop(opts));
+  }
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
   // per-turn advertisement below read the same list.
@@ -4139,6 +4154,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // tool call the agent makes may write there, whatever a rule says
   // (permission-engine's runtime-state floor, `./state-roots`).
   const protectedRoots = runtimeStateRoots(sessionRootDir, currentTenantContext()?.tenant);
+  const credentialRoots =
+    credentialFloorScope.getStore() === true ? credentialFileRoots() : undefined;
   const recordRoots = runtimeRecordRoots(sessionRootDir, currentTenantContext()?.tenant);
   /**
    * The floor's reading of a call: where it WRITES. Two kinds of field are
@@ -4200,6 +4217,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }) ?? []
     );
   };
+  /**
+   * `floorValues` as a gate hands them to the engine: `floorValuesOf` for a call
+   * that writes, and for a tool that declares `[]` whatever it does, since the
+   * engine reads that empty list as "this call carries text" when it looks for a
+   * credential file.
+   */
+  const gateFloorValues = (
+    tool: RegisteredTool,
+    parsedInput: unknown,
+  ): ReturnType<typeof operativeValuesFor> =>
+    tool.readOnly && tool.operativeArgs?.length !== 0
+      ? undefined
+      : floorValuesOf(tool, parsedInput);
   const sessionStore: SessionStore = persistSession
     ? createSessionStore({ rootDir: sessionRootDir })
     : createMemorySessionStore();
@@ -6680,7 +6710,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
     // (a decision-level meet — a profile can only tighten). The primary plan
     // carries the run's rules by reference, so a single-model run is unchanged.
-    const floorValues = tool.readOnly ? undefined : floorValuesOf(tool, subject.input);
+    const floorValues = gateFloorValues(tool, subject.input);
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
@@ -6695,7 +6725,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       },
       permissionMode,
       servingPlan.permissionRules,
-      { sandboxAvailable: opts.sandboxAvailable === true, protectedRoots },
+      {
+        sandboxAvailable: opts.sandboxAvailable === true,
+        protectedRoots,
+        ...(credentialRoots !== undefined ? { credentialRoots } : {}),
+      },
     );
     const decision = decisionDetails.decision;
     bus.publish({
@@ -6887,10 +6921,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 readProgramPath: approvedView.readProgramPath,
                 ...(gateToolConfig !== undefined ? { toolConfig: gateToolConfig } : {}),
               });
-            const approvedFloor =
-              approvedSubject.ok && !tool.readOnly
-                ? floorValuesOf(tool, approvedSubject.input)
-                : undefined;
+            const approvedFloor = approvedSubject.ok
+              ? gateFloorValues(tool, approvedSubject.input)
+              : undefined;
             const recheck = approvedSubject.ok
               ? evaluateWithReason(
                   {
@@ -6906,7 +6939,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   },
                   permissionMode,
                   servingPlan.permissionRules,
-                  { sandboxAvailable: opts.sandboxAvailable === true, protectedRoots },
+                  {
+                    sandboxAvailable: opts.sandboxAvailable === true,
+                    protectedRoots,
+                    ...(credentialRoots !== undefined ? { credentialRoots } : {}),
+                  },
                 )
               : { decision: "deny" as const, reason: approvedSubject.reason };
             if (recheck.decision === "deny") {
@@ -7403,6 +7440,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // 0.8.0 — the runtime-state roots, for the tools that write beneath a
       // directory they name and must not reach one (see RuntimeBridge).
       ...(protectedRoots.length > 0 ? { protectedRoots } : {}),
+      // The files a `channel` or `managed` run keeps from its tools, for the tools
+      // RuntimeBridge names.
+      ...(credentialRoots !== undefined ? { credentialRoots } : {}),
       permissionMode,
       permissionRules: servingPlan.permissionRules,
       tools: bridgeTools,

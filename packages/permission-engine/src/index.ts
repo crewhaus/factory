@@ -20,6 +20,10 @@
  *                   harness's run files, settings, gate records, environment
  *                   files, compiled bundle and dependencies, Hangar's directory),
  *                   nor acts beneath a workspace directory that holds one
+ *   credentials   — on a run that sets `EvaluateOptions.credentialRoots`, a call
+ *                   that names one of those files, or a file
+ *                   `isCredentialFileName` matches, is denied, read-only or
+ *                   not; `Bash` and `RunCommand` stay outside it
  *
  * Rule sources (priority high → low)
  *   flag → settings → yaml → hooks → builtin
@@ -51,7 +55,12 @@ import {
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
-import { foldedName, namesGitDirectory, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import {
+  foldedName,
+  isCredentialFileName,
+  namesGitDirectory,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
@@ -94,7 +103,8 @@ export type ToolCallContext = {
    * run's record, which the tool works in through its own format
    * (EmitTraceEvent's namespaced `custom.*` lines), or one the tool reads whole
    * (IncidentBundle's sessions), and one declared `source`, where the tool
-   * takes a value FROM (the files IndexBuild indexes). Absent ⇒
+   * takes a value FROM (the files IndexBuild indexes). Empty for a tool that
+   * declares `[]`, read-only or not: what it carries is text. Absent ⇒
    * `operativeValues`.
    */
   readonly floorValues?: ReadonlyArray<OperativeValue>;
@@ -179,6 +189,14 @@ export type EvaluateOptions = {
    * deny would have no rule to lift it. Any other such string goes to the rules.
    */
   readonly protectedRoots?: ReadonlyArray<string>;
+  /**
+   * The files a run keeps from its agent's tools. A call that names one, or a
+   * file `isCredentialFileName` matches, is denied whatever a rule says,
+   * read-only or not. The runtime sets this on a `channel` or `managed` run.
+   * Only `bypass` skips it, and `Bash` and `RunCommand` stay outside it.
+   * Absent ⇒ no check.
+   */
+  readonly credentialRoots?: ReadonlyArray<string>;
 };
 
 /**
@@ -475,9 +493,73 @@ function protectedRootHit(
   if (call.readOnly || opts.protectedRoots === undefined || opts.protectedRoots.length === 0) {
     return undefined;
   }
+  return rootHit(call.floorValues ?? call.operativeValues, call.input, opts.protectedRoots);
+}
+
+/**
+ * What a call names among the files a run keeps from its tools (see
+ * `EvaluateOptions.credentialRoots`), read-only or not, or `undefined`. It reads
+ * all of the call's operative values, a field the call only reads from included,
+ * so a tool's `reads`, `source` and `relocates` fields count here. A tool that
+ * declares `[]` has no such values (`floorValues` is empty for it), and what it
+ * carries is text. A string from a tool that declares nothing counts as a path
+ * unless it reads as text ({@link readsAsText}): that tool may be a chat post,
+ * where the deny would have no rule to lift it.
+ */
+function credentialHit(
+  call: ToolCallContext,
+  opts: EvaluateOptions,
+): { readonly root: string; readonly above?: string } | undefined {
+  if (opts.credentialRoots === undefined) return undefined;
+  return rootHit(
+    call.operativeValues ?? call.floorValues,
+    call.input,
+    opts.credentialRoots,
+    isCredentialFileName,
+  );
+}
+
+/** Punctuation a sentence or clause ends on, and a file name rarely does. */
+const ENDS_A_CLAUSE = /[.,:;!?)\]'"`]$/;
+
+/**
+ * Whether a string from a tool that declares no paths reads as text, not as a
+ * file: a URL, or one whose last written name holds whitespace, or one with
+ * whitespace in it whose last name ends on a clause's punctuation. The name is
+ * taken as written, since {@link foldedName} cuts it at `:` and trims its end. A
+ * name's own trailing dots and spaces do not count as whitespace in it, and a
+ * string that climbs with `..` is read as a path, URL-shaped or not. One pass
+ * over the string.
+ */
+function readsAsText(written: string): boolean {
+  const names = written.split(/[\\/]/).filter((name) => name !== "" && name !== ".");
+  const last = names[names.length - 1] ?? "";
+  if (written.includes("://") && !names.includes("..")) return true;
+  let end = last.length;
+  while (end > 0 && (last[end - 1] === "." || last[end - 1] === " ")) end--;
+  if (/\s/.test(last.slice(0, end))) return true;
+  return ENDS_A_CLAUSE.test(last) && /\s/.test(written);
+}
+
+/**
+ * The walk both checks share: `values` (or `input`'s strings, when there are
+ * none) against `roots`, and, when `names` is given, each spelling's last name
+ * against it. A name is read as the spelling folds, so a folding volume's other
+ * spellings of it are caught. When `names` is given, a string that reads as text
+ * is compared to the roots whole, its case aside, and its last name goes unread.
+ * The git-directory name check is the floor's alone: it runs when `names` is not
+ * given, so the credential check never answers {@link GIT_DIRECTORY}.
+ */
+function rootHit(
+  values: ReadonlyArray<OperativeValue> | undefined,
+  input: unknown,
+  roots: ReadonlyArray<string>,
+  names?: (name: string) => boolean,
+): { readonly root: string; readonly above?: string } | undefined {
   const candidates: Array<{
     readonly path: string;
     readonly fold: boolean;
+    readonly text?: boolean;
     /** How the git-directory name check reads this spelling: only inside the workspace, or as text. */
     readonly gitName: "workspace" | "text" | "none";
   }> = [];
@@ -487,7 +569,6 @@ function protectedRootHit(
     readonly fold: boolean;
     readonly opensHidden: boolean;
   }> = [];
-  const values = call.floorValues ?? call.operativeValues;
   if (values !== undefined) {
     for (const value of values) {
       if (value.kind !== "path" || value.globPattern === true) continue;
@@ -507,28 +588,43 @@ function protectedRootHit(
     }
   } else {
     // Text as written: nothing says how the volume it lands on compares names.
-    for (const path of inputStrings(call.input)) {
-      candidates.push({ path, fold: true, gitName: NOT_A_PATH.test(path) ? "none" : "text" });
+    for (const path of inputStrings(input)) {
+      candidates.push({
+        path,
+        fold: true,
+        text: true,
+        gitName: NOT_A_PATH.test(path) ? "none" : "text",
+      });
     }
   }
   // Each spelling read once, however many roots there are. A drive path is
   // also read as written, relative: on POSIX `C:/../.crewhaus/sessions/x`
   // is a path into the logs (a tool read from its input strings carries no
   // canonical spelling), and on Windows the second reading only denies more.
-  const keys: Array<{ readonly key: string; readonly fold: boolean }> = [];
-  for (const { path, fold, gitName } of candidates) {
+  const keys: Array<{ readonly key: string; readonly fold: boolean; readonly named: boolean }> = [];
+  for (const { path, fold, text, gitName } of candidates) {
     if (path === "") continue;
+    if (names !== undefined && text === true && readsAsText(path)) {
+      keys.push({ key: floorKey(path, false).toLowerCase(), fold, named: false });
+      continue;
+    }
     const key = floorKey(path, fold);
     if (
-      (gitName === "text" && namesInsideGitDirectory(key)) ||
-      (gitName === "workspace" && insideWorkspace(key) && namesGitDirectory(key))
+      names === undefined &&
+      ((gitName === "text" && namesInsideGitDirectory(key)) ||
+        (gitName === "workspace" && insideWorkspace(key) && namesGitDirectory(key)))
     ) {
       return { root: GIT_DIRECTORY };
     }
-    keys.push({ key, fold });
-    if (DRIVE_PATH.test(path)) keys.push({ key: floorKey(path, fold, false), fold });
+    keys.push({ key, fold, named: true });
+    if (DRIVE_PATH.test(path)) keys.push({ key: floorKey(path, fold, false), fold, named: true });
   }
-  for (const root of opts.protectedRoots) {
+  if (names !== undefined) {
+    for (const { key, named } of keys) {
+      if (named && names(key.slice(key.lastIndexOf("/") + 1))) return { root: key };
+    }
+  }
+  for (const root of roots) {
     if (root.trim() === "") continue;
     const plain = floorKey(root, false);
     if (values === undefined && NAMES_IN_TEXT.has(plain)) continue;
@@ -593,6 +689,14 @@ export function evaluateWithReason(
         floorHit.above !== undefined
           ? `\`${call.toolName}\` is not read-only and acts on everything beneath \`${floorHit.above}\`, where ${RECORD} — no rule can allow that`
           : `\`${call.toolName}\` is not read-only and names a path where ${RECORD} — no rule can allow that`,
+    };
+  }
+  // A run that answers people other than its operator keeps these files from
+  // its tools (`EvaluateOptions.credentialRoots`), read-only calls included.
+  if (credentialHit(call, opts) !== undefined) {
+    return {
+      decision: "deny",
+      reason: `\`${call.toolName}\` names a credential file this run keeps from its tools — no rule can allow that`,
     };
   }
   if (mode === "plan") {

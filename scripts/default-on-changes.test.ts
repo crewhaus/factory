@@ -61,7 +61,7 @@ import {
   evaluateWithReason,
 } from "../packages/permission-engine/src/index";
 import { createRunContext, tagContent } from "../packages/run-context/src/index";
-import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import { credentialFileRoots, runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
 import { emitManaged } from "../packages/target-managed/src/index";
@@ -1142,6 +1142,39 @@ describe("the release notes name every change a harness without provability: see
     // The boot line about the tenants root rides the same bullet.
     expect(daemonOf({ tools: ["read"] })).toContain("keep CREWHAUS_TENANTS_ROOT outside");
     expect(bullet).toContain("`CREWHAUS_TENANTS_ROOT` belongs");
+  });
+
+  test("credential files on channel and managed: each listed file is named in one bullet", () => {
+    // The roots of a run with no settings file; a path that does not exist only
+    // spells them, nothing is created. The file names the engine matches, and
+    // the tools that hold them back, are not roots, so they are asked for here.
+    const cwd = join(tmpdir(), "crewhaus-default-on-changes");
+    const roots = credentialFileRoots(cwd)
+      .filter((root) => !isAbsolute(root))
+      .map((root) => root.split(sep).join("/"));
+    expect(roots).toContain(".crewhaus/run/control-token");
+    const names = [
+      ...roots,
+      ".npmrc",
+      "StateExport",
+      "Grep",
+      "IndexSearch",
+      "GitAdd",
+      "GitStashPush",
+      "GitDiff",
+      "GitShow",
+      "GitApplyPatch",
+      "StateImport",
+      "channel",
+      "managed",
+      "Bash",
+    ].map((name) => `\`${name}\``);
+    // Named in a later list, since 0.8.0 did not ship it.
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet =
+      later.find((b) => b.includes("`.crewhaus/secrets`") && b.includes("`StateExport`")) ?? "";
+    expect(bullet).not.toBe("");
+    expect(names.filter((name) => !bullet.includes(name))).toEqual([]);
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

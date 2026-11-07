@@ -19,8 +19,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  credentialRootsOf,
   foldedName,
   gitDirectoryWriteRefusal,
+  heldFileRefusal,
+  heldInTree,
+  isCredentialFileName,
+  isHeldFile,
   landsInGitDirectory,
   namesGitDirectory,
   protectedRootBeneath,
@@ -458,5 +463,106 @@ describe("gitDirectoryWriteRefusal", () => {
     expect(out).toContain("StateImport: refused — importing n/.git/config");
     expect(out).toContain("a repository's git directory");
     expect(out).toContain("Nothing was written.");
+  });
+});
+
+describe("credential files", () => {
+  test("isHeldFile: by name, written or where a link leads, and inside a held root", () => {
+    const cwd = realpathSync(ws);
+    mkdirSync(join(cwd, "sub"), { recursive: true });
+    mkdirSync(join(cwd, "kept"), { recursive: true });
+    writeFileSync(join(cwd, "sub", ".env"), "x");
+    writeFileSync(join(cwd, "kept", "file"), "x");
+    writeFileSync(join(cwd, "notes.md"), "x");
+    symlinkSync(join(cwd, "sub", ".env"), join(cwd, "linked"));
+    const held = ["kept"];
+    for (const path of ["sub/.env", ".ENV", ".env.", ".env.local", "linked", "kept/file", "kept"]) {
+      expect([path, isHeldFile(path, held, cwd)]).toEqual([path, true]);
+    }
+    for (const path of ["notes.md", ".env.example", "kept2"]) {
+      expect([path, isHeldFile(path, held, cwd)]).toEqual([path, false]);
+    }
+  });
+
+  test("heldInTree: a tree's files against the roots, by name and by place", () => {
+    const cwd = realpathSync(ws);
+    const held = ["a/secret.conf", "a/dir", "elsewhere/x"];
+    const inA = heldInTree("a", held, cwd);
+    for (const rel of ["secret.conf", "SECRET.CONF", "dir/one", "b/.env", ".npmrc"]) {
+      expect([rel, inA(rel)]).toEqual([rel, true]);
+    }
+    for (const rel of ["secret.conf.bak", "dirt/one", "notes.md", ".env.example"]) {
+      expect([rel, inA(rel)]).toEqual([rel, false]);
+    }
+    const atTop = heldInTree(".", held, cwd);
+    expect(atTop("a/secret.conf")).toBe(true);
+    expect(atTop("a/secret.conf.bak")).toBe(false);
+    expect(atTop("elsewhere/x")).toBe(true);
+    // Inside a root, all of it is held; with no roots, nothing is.
+    expect(heldInTree("a/dir", held, cwd)("anything")).toBe(true);
+    expect(heldInTree("a", [], cwd)(".env")).toBe(false);
+  });
+
+  test("the refusal says what was named and that nothing was written", () => {
+    const text = heldFileRefusal("Tool", "importing x");
+    expect(text).toContain("importing x names a credential file");
+    expect(text).toContain("Nothing was written.");
+  });
+
+  test("the name table", () => {
+    const named = (name: string): readonly [string, boolean] => [name, isCredentialFileName(name)];
+    for (const name of [
+      ".env",
+      ".env.local",
+      ".env.staging",
+      ".env.production.local",
+      ".env.example.local",
+      ".env.a",
+      ".npmrc",
+      ".ENV",
+      ".Env.Local",
+      ".NPMRC",
+    ]) {
+      expect(named(name)).toEqual([name, true]);
+    }
+    for (const name of [
+      "",
+      "env",
+      ".env.",
+      ".env.example",
+      ".env.sample",
+      ".env.template",
+      ".ENV.EXAMPLE",
+      ".envrc",
+      ".env-local",
+      "notes.env",
+      "my.npmrc",
+      ".npmrc.bak",
+      "sub/.env",
+      "sub\\.env",
+      ".env.a/b",
+      ".env.a\\b",
+    ]) {
+      expect(named(name)).toEqual([name, false]);
+    }
+  });
+
+  test("the roots are read off the bridge; anything else is none", () => {
+    expect(credentialRootsOf({ bridge: { credentialRoots: ["a", "", 3, "b"] } })).toEqual([
+      "a",
+      "b",
+    ]);
+    for (const ctx of [
+      undefined,
+      {},
+      { bridge: null },
+      { bridge: {} },
+      { bridge: { credentialRoots: "a" } },
+      { bridge: { protectedRoots: ["a"] } },
+    ]) {
+      expect(credentialRootsOf(ctx)).toEqual([]);
+    }
+    // The two lists stay apart.
+    expect(protectedRootsOf({ bridge: { credentialRoots: ["a"] } })).toEqual([]);
   });
 });
