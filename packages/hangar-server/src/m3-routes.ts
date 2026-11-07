@@ -86,7 +86,7 @@ import {
   datasetVerify,
   datasets,
 } from "./data-ops";
-import { isRunId } from "./evals";
+import { isOptRunId, isRunId } from "./evals";
 import {
   annotateSample,
   annotations,
@@ -284,7 +284,7 @@ export type M3Route = {
  */
 export const PARAM_GUARDS: Readonly<Record<string, (value: string) => boolean>> = {
   runId: isRunId,
-  optRunId: isRunId,
+  optRunId: isOptRunId,
 };
 
 /** True when `value` satisfies the guard for `name`. */

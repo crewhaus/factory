@@ -42,6 +42,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { runCorpusEval } from "./__test__/eval-corpus";
+import { EVAL_JOB_ARGV } from "./eval-inputs";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { M3_ROUTES } from "./m3-routes";
 import { type TestServer, bootTestServer } from "./testkit";
@@ -130,6 +132,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["health.registered", "boolean"],
     ["health.evalHealthy", "boolean"],
     ["health.evalNote", "string"],
+    ["health.evalState", "string"],
     ["health.openIncidents", "number"],
     ["health.hasAudit", "boolean"],
     ["health.pinnedEnvs", "array"],
@@ -196,19 +199,46 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["runs[].meanScore", "number"],
     ["runs[].sampleCount", "number"],
     ["runs[].ts", "string"],
+    ["runs[].pinRefusal", "string|undefined"],
     ["baselines", "object"],
+    ["unreadable", "string|null"],
+    ["launch.offered", "boolean"],
+    ["launch.note", "string|null"],
+    ["launch.verb", "string|null"],
   ],
   // views/evals.js run drill-down
   evalRun: [
     ["runId", "string"],
     ["summary", "object"],
+    ["summary.aggregates.passRate", "number"],
     ["sampleIds[]", "string"],
+    ["stats.passRate", "number|null"],
+    ["stats.meanScore", "number|null"],
+    ["stats.sampleCount", "number|null"],
+    ["stats.errorCount", "number|null"],
+    ["stats.measuredCount", "number|null"],
+    ["stats.costUsd", "number|null"],
+    ["stats.partial", "boolean"],
+    ["stats.replayed", "boolean"],
+    ["stats.flakyCount", "number"],
+    ["rows[].sampleId", "string"],
+    ["rows[].dir", "string|null"],
+    ["rows[].verdict", "string"],
+    ["rows[].score", "number|null"],
+    ["rows[].note", "string"],
+    ["rows[].flaky", "boolean"],
+    ["rows[].needsReview", "boolean"],
   ],
   // views/evals.js sample drill-down
   evalSample: [
     ["runId", "string"],
     ["sampleId", "string"],
     ["grades", "object"],
+    ["grades.overall.passed", "boolean"],
+    ["grades.perGrader[].name", "string"],
+    ["grades.perGrader[].passed", "boolean"],
+    ["grades.perGrader[].score", "number"],
+    ["grades.perGrader[].rationale", "string"],
     ["meta", "object"],
     ["transcript", "array"],
     ["transcriptTruncated", "boolean"],
@@ -777,6 +807,13 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["workflows", "array"],
     ["datasetPrecedence.shadowing", "boolean"],
     ["datasetPrecedence.note", "string"],
+    ["launches.eval.offered", "boolean"],
+    ["launches.eval.note", "string|null"],
+    ["launches.eval.verb", "string|null"],
+    ["launches.optimize.offered", "boolean"],
+    ["launches.optimize.note", "string|null"],
+    ["launches.flywheel.offered", "boolean"],
+    ["launches.flywheel.note", "string|null"],
   ),
   experiments: m3Read(["experiments", "array"], ["boundary", "string"]),
   // F-7 is reported, never faked: how many annotations exist, how many the
@@ -1279,7 +1316,7 @@ const ALL_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> =
 const M3_PARAMS: Record<string, string> = {
   runId: "run_00000000000000aa",
   sess: "sess_00000000000000aa",
-  optRunId: "run_00000000000000aa",
+  optRunId: "opt_19a3f0c2b11",
   sampleId: "s1",
   version: "1.0.0",
   name: "smoke",
@@ -1441,6 +1478,8 @@ function typeOk(expected: string, v: unknown): boolean {
     switch (t) {
       case "null":
         return v === null;
+      case "undefined":
+        return v === undefined;
       case "array":
         return Array.isArray(v);
       case "object":
@@ -1719,20 +1758,6 @@ function contractHarness(t: TestServer): string {
     dreamState: { "contract-harness": { lastRunAt: iso(NOW - DAY) } },
     watchmeState: { schemaVersion: 1, watching: true },
     watchmeObservations: [{ sessionId: "sess_00000000000000aa", digest: "d1" }],
-    evalIndex: [
-      {
-        runId: "run_00000000000000aa",
-        specName: "contract-harness",
-        specHash: "h",
-        datasetName: "smoke",
-        datasetHash: "d",
-        passRate: 0.5,
-        meanScore: 0.5,
-        sampleCount: 1,
-        ts: iso(NOW - DAY),
-        outDir: "/gone",
-      },
-    ],
     baselines: {
       "contract-harness::smoke": {
         specName: "contract-harness",
@@ -1743,20 +1768,26 @@ function contractHarness(t: TestServer): string {
         ts: iso(NOW - DAY),
       },
     },
-    evalRuns: [
-      {
-        runId: "run_00000000000000aa",
-        results: { passRate: 0.5, sampleCount: 1, results: [{ sampleId: "s1", pass: false }] },
-        samples: {
-          s1: {
-            grades: { pass: false, rationale: "missed" },
-            meta: { latencyMs: 9 },
-            transcript: [{ kind: "user_message", payload: { content: "q" } }],
-          },
-        },
-      },
-    ],
   });
+}
+
+/**
+ * The contract harness's eval history, out of the real runner: a view must be
+ * held to what the eval stack writes, not to what a fixture says it writes.
+ * The jobs need the conventional inputs on disk before they can be queued.
+ */
+async function seedEvals(dir: string): Promise<void> {
+  await runCorpusEval(
+    dir,
+    { s1: "fail" },
+    { runId: "run_00000000000000aa", specName: "contract-harness", datasetName: "smoke" },
+  );
+  mkdirSync(join(dir, "eval"), { recursive: true });
+  writeFileSync(join(dir, "eval", "dataset.jsonl"), '{"id":"s1","input":"q"}\n');
+  writeFileSync(
+    join(dir, "eval", "graders.yaml"),
+    "graders:\n  - name: m\n    type: exact_match\n",
+  );
 }
 
 /**
@@ -1812,6 +1843,7 @@ describe("UI route contract", () => {
     try {
       const dir = contractHarness(t);
       await seedContinuity(dir);
+      await seedEvals(dir);
       const fill = (template: string, params: Record<string, string>): string =>
         template.replace(/:([A-Za-z][A-Za-z0-9]*)/g, (_m, name: string) => {
           const v = params[name];
@@ -2247,6 +2279,33 @@ describe("UI route contract", () => {
       rmSync(pluginsDir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("the checker refuses a payload in a shape no writer emits", () => {
+    // The drill-downs once read `results[]`, `.pass` and a top-level `passRate`,
+    // and this contract passed because its fixture wrote them by hand.
+    const fictional = {
+      runId: "run_00000000000000aa",
+      summary: { passRate: 0.5, results: [{ sampleId: "s1", pass: false }] },
+      sampleIds: ["s1"],
+    };
+    expect(() => assertViewReads("evalRun", fictional)).toThrow(/stats\.passRate|aggregates/);
+    expect(() =>
+      assertViewReads("evalSample", {
+        runId: "run_00000000000000aa",
+        sampleId: "s1",
+        grades: { pass: false, rationale: "missed" },
+        meta: {},
+        transcript: [],
+        transcriptTruncated: false,
+      }),
+    ).toThrow(/grades\.overall\.passed/);
+  });
+
+  test("the console's eval job twin is the command the server queues", async () => {
+    const url = new URL("../../hangar-ui/assets/js/supervision.js", import.meta.url).href;
+    const mod = (await import(url)) as { JOB_COMMANDS: Record<string, string> };
+    expect(mod.JOB_COMMANDS["eval"]).toBe(`crewhaus ${EVAL_JOB_ARGV.join(" ")}`);
+  });
 
   test("the server's M3 dispatch table IS the console's grouped route map", async () => {
     // Three files, one truth: `routes.js` (what the client calls),

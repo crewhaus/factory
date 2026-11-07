@@ -145,7 +145,6 @@ import {
   type DatasetRecord,
   type DatasetSplit,
   type ReleaseEntry,
-  appendReleaseEntry,
   compareVersions,
   createFileBackedRegistry,
   latestVersion,
@@ -241,6 +240,7 @@ import {
   formatUsd,
   hashDatasetFile,
   loadRun,
+  pinRun,
   readBaselines,
   readRunIndexLatest,
   renderMatrix,
@@ -248,7 +248,6 @@ import {
   renderTrends,
   rowsToCsv,
   rowsToJsonl,
-  setBaseline,
   trendTable,
 } from "@crewhaus/eval-report";
 import {
@@ -743,6 +742,7 @@ import {
   buildContextPressureReport,
   formatContextPressureLines,
 } from "./context-pressure";
+import { recordRelease } from "./datasets-release";
 // Wave 3 cluster C (B17/B21) — the `datasets status` freshness/saturation
 // report + the `datasets card` markdown datasheet, side-effect-free (run
 // history + per-run outcomes injected here).
@@ -7158,8 +7158,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         "  whose dependencies are installed (the default -o keeps candidates under\n" +
         "  .crewhaus/optimize/<runId>/, which is exactly that).\n" +
         "  MUTATORS (--mutator, default rule-based).\n" +
-        "    rule-based    offline, deterministic, $0 — bounded edits over the prompt plus\n" +
-        "                  numeric-knob proposals on OPTIMIZABLE_PATHS dial entries. No\n" +
+        "    rule-based    offline, deterministic, $0 — bounded edits over the prompt. No\n" +
         "                  provider credentials, no model calls.\n" +
         "    claude        a model rewrites the prompt from the current best + the failing\n" +
         "                  dev samples' grader rationales. Needs credentials for the spec's\n" +
@@ -7466,7 +7465,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     devSet = registrySplits.dev;
   } else {
     if (samples.length === 0) die(`dataset "${datasetName}" yielded zero samples`);
-    // Train/dev split: 70/30 deterministic split by sample id ordering.
+    // Train/dev split: 70/30 deterministic split in file order.
     const splitIdx = Math.max(1, Math.floor(samples.length * 0.7));
     trainSet = samples.slice(0, splitIdx);
     devSet = samples.slice(splitIdx);
@@ -12215,31 +12214,11 @@ function runEvalReportBaseline(args: ParsedArgs): void {
             `${join(".crewhaus", "evals", "index.jsonl")} — run \`crewhaus eval-report history\``,
         );
       }
-      setBaseline({
-        specName: entry.specName,
-        datasetName: entry.datasetName,
-        runId: entry.runId,
-        // Carry the spec source forward from the index entry (when present)
-        // so manual pins keep collision detection working — and the
-        // instrument identity so gradersHash/judgeModel mismatch detection
-        // keeps working too.
-        ...(entry.specSource !== undefined ? { specSource: entry.specSource } : {}),
-        outDir: entry.outDir,
-        datasetHash: entry.datasetHash,
-        ...(entry.gradersHash !== undefined ? { gradersHash: entry.gradersHash } : {}),
-        ...(entry.judgeModel !== undefined ? { judgeModel: entry.judgeModel } : {}),
-        // 0.6.0 §6.1 — carry the LINEAGE columns forward too. `setBaseline`
-        // keys on `baselineKeyFor(lineageOfEntry(entry))`, so dropping them
-        // here would write a routed run's pin under the legacy
-        // `spec::dataset` key and clobber the primary's baseline with a cheap
-        // candidate's run. policyVersion/armsDigest ride along for the
-        // instrument guard, exactly as `finishEvalRun` and Hangar's pin do.
-        ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
-        ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
-        ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
-        ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
-        ts: new Date().toISOString(),
-      });
+      // Carries the spec source, the instrument identity and the lineage columns
+      // forward: `setBaseline` keys on the lineage, so a pin that dropped them
+      // would clobber the primary's baseline with a cheap candidate's run.
+      const pinned = pinRun(entry, new Date().toISOString());
+      if (!pinned.ok) die(`eval-report baseline set: ${pinned.refusal.reason}`);
       const armLabel =
         entry.armId ?? (entry.routing !== undefined && entry.routing !== "static" ? "routed" : "");
       process.stdout.write(
@@ -12616,12 +12595,13 @@ async function runDatasetsRelease(args: ParsedArgs): Promise<void> {
       `datasets release: eval completed but no run-history entry for ${expectedName} was found — release not recorded`,
     );
   }
-  const updated = appendReleaseEntry({
-    rootDir: defaultDatasetsRoot(),
-    name,
-    version,
-    entry: { version, runId: entry.runId, ts: entry.ts, passRate: entry.passRate },
-  });
+  const recorded = recordRelease({ entry, rootDir: defaultDatasetsRoot(), name, version });
+  if (!recorded.ok) {
+    die(
+      `datasets release: ${recorded.reason} — release not recorded. The run did read the test split.`,
+    );
+  }
+  const updated = recorded.record;
   process.stdout.write(
     `[datasets] release recorded: ${name}@${version} run ${entry.runId} ` +
       `pass_rate ${(entry.passRate * 100).toFixed(1)}% — burn count ${(updated.releases ?? []).length}\n`,

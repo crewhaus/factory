@@ -15,7 +15,7 @@
  *      does not know about; a rewrite that dropped `auditWindows` would
  *      quietly re-arm deletion during a compliance hold.
  *
- * BASELINE RE-PIN → `@crewhaus/eval-report`'s `setBaseline`. The baseline
+ * BASELINE RE-PIN → `@crewhaus/eval-report`'s `pinRun`. The baseline
  * key is `(specName, datasetName)` BY DESIGN — that is what keeps a spec
  * edit gated against the same measurement — so the run being pinned supplies
  * both, and a run that is not in this harness's index cannot be pinned.
@@ -26,9 +26,9 @@ import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import {
   type BaselineEntry,
   ReportError,
+  pinRun,
   readBaselines,
   readRunIndex,
-  setBaseline,
 } from "@crewhaus/eval-report";
 import { SESSION_ID_RE } from "./constants";
 import { resolveInside } from "./safety";
@@ -162,29 +162,9 @@ export function pinBaseline(args: {
       reason: `run ${args.runId} is not in this harness's eval index — only a recorded run can be a baseline`,
     };
   }
-  const entry: BaselineEntry = {
-    specName: run.specName,
-    datasetName: run.datasetName,
-    runId: run.runId,
-    outDir: run.outDir,
-    datasetHash: run.datasetHash,
-    ...(run.specSource !== undefined ? { specSource: run.specSource } : {}),
-    ...(run.gradersHash !== undefined ? { gradersHash: run.gradersHash } : {}),
-    ...(run.judgeModel !== undefined ? { judgeModel: run.judgeModel } : {}),
-    ...(run.p95LatencyMs !== undefined ? { p95LatencyMs: run.p95LatencyMs } : {}),
-    ...(run.costUsd !== undefined ? { costUsd: run.costUsd } : {}),
-    // 0.6.0 §6.1 — the per-arm lineage (`setBaseline` KEYS on armId/routing)
-    // plus the routed instrument guard. Rebuilding the pin field-by-field
-    // without these would re-pin a routed run under the legacy key and
-    // silently overwrite the primary's baseline.
-    ...(run.armId !== undefined ? { armId: run.armId } : {}),
-    ...(run.routing !== undefined ? { routing: run.routing } : {}),
-    ...(run.policyVersion !== undefined ? { policyVersion: run.policyVersion } : {}),
-    ...(run.armsDigest !== undefined ? { armsDigest: run.armsDigest } : {}),
-    ts: args.nowIso,
-  };
+  let pinned: ReturnType<typeof pinRun>;
   try {
-    setBaseline(entry, evalsDir);
+    pinned = pinRun(run, args.nowIso, evalsDir);
   } catch (err) {
     // eval-report refuses a pin file that is a link, a FIFO or not a JSON
     // object, by name and reason: that is the operator's answer (a 409), not
@@ -192,7 +172,8 @@ export function pinBaseline(args: {
     if (err instanceof ReportError) return { outcome: "rejected", reason: err.message };
     throw err;
   }
-  return { outcome: "ok", baseline: entry };
+  if (!pinned.ok) return { outcome: "rejected", reason: pinned.refusal.reason };
+  return { outcome: "ok", baseline: pinned.pin };
 }
 
 /** The currently pinned baselines, for the effect check after a re-pin. */

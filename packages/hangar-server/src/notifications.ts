@@ -203,7 +203,7 @@ export type HarnessSignal = {
   readonly pendingApprovals: number;
   /** Supervision state, or null when unsupervised. */
   readonly procState: string | null;
-  /** `evalHealth().healthy`, or null when unread. */
+  /** `evalHealthyFlag(evalHealth())`: null when nothing has been measured. */
   readonly evalHealthy: boolean | null;
   readonly openIncidents: number;
   /** Dream specs overdue by more than two windows. */

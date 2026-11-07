@@ -43,7 +43,15 @@ import { pendingApprovalCount } from "./approvals";
 import { SAFE_SEGMENT_RE } from "./constants";
 import { foldHarnessCosts } from "./costs";
 import { mergedSpawnEnv } from "./env-file";
-import { evalHealth, evalsView } from "./evals";
+import {
+  EVAL_COMMAND,
+  EVAL_JOB_ARGV,
+  type LaunchOffer,
+  OPTIMIZE_COMMAND,
+  OPTIMIZE_JOB_ARGV,
+  launchOffers,
+} from "./eval-inputs";
+import { type EvalHealthState, evalHealth, evalsView } from "./evals";
 import {
   absent,
   found,
@@ -137,9 +145,9 @@ export type AdvisorItem = {
 export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
   doctor: ["doctor"],
   compile: ["compile", "crewhaus.yaml", "-o", "dist"],
-  eval: ["eval", "crewhaus.yaml"],
+  eval: EVAL_JOB_ARGV,
   "dream-run": ["dream", "run", "crewhaus.yaml"],
-  optimize: ["optimize", "crewhaus.yaml"],
+  optimize: OPTIMIZE_JOB_ARGV,
   advise: ["advise", "--all"],
   // 0.6.0 (design §8.3) — the routing/model verbs the hybrid items name.
   // Still a CLOSED vocabulary: an item picks a KEY, never an argv.
@@ -152,9 +160,9 @@ export const ADVISOR_JOB_ARGV: Readonly<Record<string, readonly string[]>> = {
 const CLI_TWIN: Readonly<Record<string, string>> = {
   doctor: "crewhaus doctor",
   compile: "crewhaus compile crewhaus.yaml -o dist",
-  eval: "crewhaus eval crewhaus.yaml",
+  eval: EVAL_COMMAND,
   "dream-run": "crewhaus dream run crewhaus.yaml",
-  optimize: "crewhaus optimize crewhaus.yaml",
+  optimize: OPTIMIZE_COMMAND,
   advise: "crewhaus advise --all",
   "route-status": "crewhaus route status",
   "route-propose": "crewhaus route propose",
@@ -206,10 +214,14 @@ export type AdvisorInputs = {
   readonly preflight: { readonly items: readonly HealthPreflightItem[] } | null;
   readonly specUnreadable: boolean;
   readonly specIssues: ReadonlyArray<{ readonly message: string }>;
-  readonly evalHealth: { readonly healthy: boolean; readonly note: string } | null;
+  readonly evalHealth: { readonly state: EvalHealthState; readonly note: string } | null;
   /** Recorded eval runs (0 = no signal yet). */
   readonly evalRuns: number;
+  /** The history could not be read, so `evalRuns` and `baselinePinned` say nothing. */
+  readonly evalsUnreadable: boolean;
   readonly baselinePinned: boolean;
+  /** Which measuring jobs can start here. An item never offers one that cannot. */
+  readonly offers: { readonly eval: LaunchOffer; readonly optimize: LaunchOffer };
   readonly openIncidents: number;
   readonly procState: string | null;
   readonly pendingApprovals: number;
@@ -398,7 +410,8 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
   }
 
   // --- is it healthy -------------------------------------------------------
-  if (inputs.evalHealth !== null && !inputs.evalHealth.healthy) {
+  if (inputs.evalHealth?.state === "regressed") {
+    const offer = inputs.offers.optimize;
     open({
       id: "eval-below-baseline",
       severity: "warn",
@@ -406,11 +419,14 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
       detail: inputs.evalHealth.note,
       explain:
         "the latest eval run scored under the run you pinned as acceptable — users are seeing worse answers than the ones you signed off on",
-      guidance:
-        "queue an optimize run: the eval→patch loop searches the spec's tunable paths and emits an update ready to review and run",
+      guidance: offer.offered
+        ? "queue an optimize run: the eval→patch loop searches the spec's tunable paths and emits an update ready to review and run"
+        : (offer.note ?? ""),
       screen: "evals",
       source: "evals",
-      action: jobAction("optimize", "Queue an optimize run"),
+      action: offer.offered
+        ? jobAction("optimize", "Queue an optimize run")
+        : linkAction("Open evals", offer.verb),
     });
   }
   if (inputs.openIncidents > 0) {
@@ -517,7 +533,10 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
       });
     }
   }
-  if (inputs.evalRuns === 0 && !inputs.specUnreadable) {
+  if (inputs.evalsUnreadable) {
+    // A history nobody can read is not an empty one, so nothing here can be said.
+  } else if (inputs.evalRuns === 0 && !inputs.specUnreadable) {
+    const offer = inputs.offers.eval;
     open({
       id: "evals-none",
       severity: "suggestion",
@@ -525,10 +544,14 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
       detail: "no eval run is recorded for this harness",
       explain:
         "without an eval history there is no way to see a regression, no baseline to pin, and nothing for the optimizer to improve against",
-      guidance: "queue a first eval run; once it lands, pin it as the baseline",
+      guidance: offer.offered
+        ? "queue a first eval run; once it lands, pin it as the baseline"
+        : (offer.note ?? ""),
       screen: "evals",
       source: "evals",
-      action: jobAction("eval", "Queue an eval run"),
+      action: offer.offered
+        ? jobAction("eval", "Queue an eval run")
+        : linkAction("Open evals", offer.verb),
     });
   } else if (inputs.evalRuns > 0 && !inputs.baselinePinned) {
     open({
@@ -830,7 +853,7 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
     procState = null; // a fleet fold has no process handle for this harness
   }
   const costs = foldHarnessCosts(dir, ctx.now());
-  let health: { healthy: boolean; note: string } | null = null;
+  let health: { state: EvalHealthState; note: string } | null = null;
   try {
     health = evalHealth(`${dir}/.crewhaus/evals`, view.specName);
   } catch {
@@ -874,7 +897,9 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
     specIssues: view.issues,
     evalHealth: health,
     evalRuns: evals.runs.length,
+    evalsUnreadable: evals.unreadable !== null,
     baselinePinned: Object.keys(evals.baselines).length > 0,
+    offers: launchOffers(dir, ctx.entry?.target),
     openIncidents: countOpenIncidents(dir),
     procState,
     pendingApprovals: pendingApprovalCount(dir),
@@ -1139,7 +1164,7 @@ export const advisorTrend: M3Handler = (ctx) => {
   return {
     ...found(
       "folded from the eval index, the session cost ledger and the advisor's own decisions — nothing here is a stored snapshot",
-      "crewhaus eval crewhaus.yaml",
+      EVAL_COMMAND,
     ),
     evalSeries,
     spendDays: costs.days,
@@ -1476,7 +1501,7 @@ function readIssues(ctx: M3Context): IssueRecord[] {
  * queueing anything. The issue text itself never reaches a command line.
  */
 export const advisorIssueSubmit: M3Handler = (ctx) => {
-  requireDir(ctx);
+  const dir = requireDir(ctx);
   const title = requireString(ctx.body, "title");
   const detail = typeof ctx.body["detail"] === "string" ? (ctx.body["detail"] as string) : "";
   const kindRaw = ctx.body["kind"] ?? "optimize";
@@ -1486,6 +1511,10 @@ export const advisorIssueSubmit: M3Handler = (ctx) => {
   const kind: IssueKind = kindRaw;
   let jobId: string | null = null;
   let jobRecord: unknown = null;
+  if (kind === "eval" || kind === "optimize") {
+    const offer = launchOffers(dir, ctx.entry?.target)[kind];
+    if (!offer.offered) throw new HttpError(409, offer.note ?? "this job cannot run here");
+  }
   if (kind !== "note") {
     const argv = ADVISOR_JOB_ARGV[kind];
     if (argv === undefined) throw new HttpError(500, "issue kind names an unknown job kind");

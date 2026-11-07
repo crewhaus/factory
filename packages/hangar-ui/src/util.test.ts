@@ -226,6 +226,89 @@ describe("usdFromMicros / oldestCachedAt", () => {
   });
 });
 
+describe("healthChecks: eval state", () => {
+  test("not measured is off with its word and its reason, never a pass or a fault", () => {
+    const checks = util.healthChecks({
+      evalHealthy: true,
+      evalNote: "no baseline pinned",
+      evalState: "not_measured",
+    });
+    expect(checks).toEqual([
+      { state: "off", label: "evals not measured", reason: "no baseline pinned" },
+    ]);
+  });
+
+  test("a measured answer reads as it always did", () => {
+    expect(
+      util.healthChecks({ evalHealthy: false, evalNote: "fell", evalState: "regressed" })[0],
+    ).toEqual({ state: "bad", label: "eval regression", reason: "fell" });
+    expect(
+      util.healthChecks({ evalHealthy: true, evalNote: "holds", evalState: "healthy" })[0],
+    ).toEqual({ state: "ok", label: "evals healthy", reason: "holds" });
+  });
+
+  test("a null flag on a fleet row stays unknown instead of reading as healthy", () => {
+    const [row] = util.normalizeRows([
+      { id: "h", dir: "/h", evalHealthy: null, rollup: { lastEval: { passRate: 1 } } },
+    ]);
+    expect(row.lastEval.healthy).toBeUndefined();
+    expect(util.evalHealth(row.lastEval).state).toBe("unknown");
+    expect(util.needsAttention(row)).toBe(false);
+  });
+});
+
+describe("notMeasuredCopy", () => {
+  test("an unreadable history says so, and offers no command that would not help", () => {
+    expect(
+      util.notMeasuredCopy({
+        unreadable: "Couldn't read the eval history: .crewhaus/evals/index.jsonl is not readable.",
+        launch: { offered: true, note: null, verb: "crewhaus eval crewhaus.yaml" },
+      }),
+    ).toEqual({
+      message: "Couldn't read the eval history: .crewhaus/evals/index.jsonl is not readable.",
+      verb: null,
+    });
+  });
+
+  test("never run, and it can be: the exact command", () => {
+    const verb =
+      "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml";
+    expect(
+      util.notMeasuredCopy({ unreadable: null, launch: { offered: true, note: null, verb } }),
+    ).toEqual({ message: "Not measured yet.", verb });
+  });
+
+  test("never run, and it cannot be: why, and only a command that applies", () => {
+    expect(
+      util.notMeasuredCopy({
+        unreadable: null,
+        launch: {
+          offered: false,
+          note: "No test cases yet: add eval/dataset.jsonl.",
+          verb: null,
+        },
+      }),
+    ).toEqual({
+      message: "Not measured yet. No test cases yet: add eval/dataset.jsonl.",
+      verb: null,
+    });
+    const compile = "crewhaus compile crewhaus.yaml --with-eval-harness";
+    expect(
+      util.notMeasuredCopy({
+        launch: {
+          offered: false,
+          note: "Checks for this harness type run inside its compiled test bundle.",
+          verb: compile,
+        },
+      }).verb,
+    ).toBe(compile);
+  });
+
+  test("a payload that says nothing still says something true", () => {
+    expect(util.notMeasuredCopy(null)).toEqual({ message: "Not measured yet.", verb: null });
+  });
+});
+
 describe("healthChecks", () => {
   test("maps the server's HarnessHealth fields into checklist rows", () => {
     const checks = util.healthChecks({

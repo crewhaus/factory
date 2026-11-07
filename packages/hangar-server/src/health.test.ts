@@ -34,7 +34,7 @@ const HOUR = 3_600_000;
 
 const clean: HealthInputs = {
   preflight: { items: [] },
-  evalHealth: { healthy: true, note: "no eval runs recorded" },
+  evalHealth: { state: "healthy", note: "latest 90.0% holds baseline 90.0%" },
   openIncidents: 0,
   procState: "stopped",
   specIssues: [],
@@ -78,7 +78,7 @@ describe("computeHealth", () => {
           },
         ],
       },
-      evalHealth: { healthy: false, note: "40% below baseline 90%" },
+      evalHealth: { state: "regressed", note: "40% below baseline 90%" },
       openIncidents: 2,
       procState: "crash-looping",
       specIssues: [{ message: "unknown key" }],
@@ -95,7 +95,10 @@ describe("computeHealth", () => {
   });
 
   test("a score below 100 always carries deductions summing to the gap", () => {
-    const result = computeHealth({ ...clean, evalHealth: { healthy: false, note: "regressed" } });
+    const result = computeHealth({
+      ...clean,
+      evalHealth: { state: "regressed", note: "regressed" },
+    });
     const total = result.deductions.reduce((n, d) => n + d.points, 0);
     expect(result.score).toBe(100 - total);
     expect(result.deductions).not.toEqual([]);
@@ -298,6 +301,16 @@ describe("computeHealth", () => {
     expect(unknown.unknowns[0]).toContain("no readable cadence");
   });
 
+  test("not measured adds an unknown and takes no points", () => {
+    const result = computeHealth({
+      ...clean,
+      evalHealth: { state: "not_measured", note: "no baseline pinned" },
+    });
+    expect(result.score).toBe(100);
+    expect(result.deductions).toEqual([]);
+    expect(result.unknowns).toEqual(["no baseline pinned"]);
+  });
+
   test("inputs that could not be read become unknowns, never silent passes", () => {
     const result = computeHealth({ ...clean, preflight: null, evalHealth: null });
     expect(result.score).toBe(100);
@@ -315,7 +328,7 @@ describe("computeHealth", () => {
           message: "m",
         })),
       },
-      evalHealth: { healthy: false, note: "regressed" },
+      evalHealth: { state: "regressed", note: "regressed" },
       openIncidents: 9,
       procState: "crash-looping",
       specIssues: Array.from({ length: 9 }, () => ({ message: "bad" })),

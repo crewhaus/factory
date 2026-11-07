@@ -313,6 +313,22 @@ export function deriveSmartGroups(rows, nowMs) {
 }
 
 /**
+ * What an empty eval history says, from the `evals` payload. A history nobody
+ * could read is not an empty one. An offered launch names its exact command; on
+ * a harness that cannot run one, the note says why, with the command that does
+ * apply if there is one.
+ */
+export function notMeasuredCopy(evals) {
+  if (typeof evals?.unreadable === "string") return { message: evals.unreadable, verb: null };
+  const launch = evals?.launch && typeof evals.launch === "object" ? evals.launch : {};
+  const note = launch.offered !== true && typeof launch.note === "string" ? launch.note : "";
+  return {
+    message: note === "" ? "Not measured yet." : `Not measured yet. ${note}`,
+    verb: typeof launch.verb === "string" ? launch.verb : null,
+  };
+}
+
+/**
  * Map the server's `HarnessHealth` detail field (registered / pinnedEnvs /
  * evalHealthy / evalNote / openIncidents / hasAudit) into the Overview
  * health checklist: `[{ state, label, reason }]` with dot states matching
@@ -331,7 +347,14 @@ export function healthChecks(health) {
       reason: pins.length > 0 ? `pinned envs: ${pins.join(", ")}` : "",
     });
   }
-  if (typeof health.evalHealthy === "boolean") {
+  if (health.evalState === "not_measured") {
+    // Nobody has measured this: not a pass, and not a fault.
+    checks.push({
+      state: "off",
+      label: "evals not measured",
+      reason: typeof health.evalNote === "string" ? health.evalNote : "",
+    });
+  } else if (typeof health.evalHealthy === "boolean") {
     checks.push({
       state: health.evalHealthy ? "ok" : "bad",
       label: health.evalHealthy ? "evals healthy" : "eval regression",

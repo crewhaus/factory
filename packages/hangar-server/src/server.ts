@@ -108,7 +108,16 @@ import {
 import { foldHarnessCosts } from "./costs";
 import { deploymentsView } from "./deployments";
 import { mergedSpawnEnv } from "./env-file";
-import { evalHealth, evalRunView, evalSampleView, evalsView, isRunId } from "./evals";
+import { evalJobOptions, launchOffers } from "./eval-inputs";
+import {
+  type EvalHealth,
+  evalHealth,
+  evalHealthyFlag,
+  evalRunView,
+  evalSampleView,
+  evalsView,
+  isRunId,
+} from "./evals";
 import { GROUP_VERBS, groupPlan, isGroupVerb, runGroup } from "./group-ops";
 import {
   type HealthPreflightItem,
@@ -484,7 +493,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const capabilities = BADGE_KEYS.filter((k) => badges[k]);
       const evalHealthy = missing
         ? null
-        : evalHealth(join(entry.dir, ".crewhaus", "evals"), header.name ?? entry.specName).healthy;
+        : evalHealthyFlag(
+            evalHealth(join(entry.dir, ".crewhaus", "evals"), header.name ?? entry.specName),
+          );
       return {
         id: entry.id,
         dir: entry.dir,
@@ -527,9 +538,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       { dir, specPath: join(dir, "crewhaus.yaml") },
       inventoryDeps,
     );
-    const health = await buildHarnessHealth(inventory, (evalsDir, specName) =>
-      evalHealth(evalsDir, specName),
-    );
+    const health = await buildHarnessHealth(inventory, (evalsDir, specName) => {
+      const { state, note } = evalHealth(evalsDir, specName);
+      return { healthy: state !== "regressed", note, state };
+    });
     const merged = mergedSpawnEnv(env, dir);
     const report = await runPreflight({ harnessDir: dir, env: merged.env });
     const counts = { blocking: 0, warn: 0, info: 0 };
@@ -686,7 +698,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         `hangar-server: preflight failed for ${dir}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    let evals: { healthy: boolean; note: string } | null = null;
+    let evals: EvalHealth | null = null;
     try {
       evals = evalHealth(join(dir, ".crewhaus", "evals"), view.specName);
     } catch {
@@ -758,7 +770,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           groups: entry.groups,
           pendingApprovals: pendingApprovalCount(dir),
           procState: processes.peek(dir)?.snapshot().state ?? null,
-          evalHealthy: evalHealth(join(dir, ".crewhaus", "evals"), view.specName).healthy,
+          evalHealthy: evalHealthyFlag(evalHealth(join(dir, ".crewhaus", "evals"), view.specName)),
           openIncidents: countOpenIncidents(dir),
           overdueDreams,
           recentExits: runsView(dir, 20)
@@ -1450,10 +1462,15 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         }
         let argv: string[];
         try {
-          argv = jobArgv(kind, {
-            ...(typeof body["dataset"] === "string" ? { dataset: body["dataset"] } : {}),
-            ...(typeof body["graders"] === "string" ? { graders: body["graders"] } : {}),
-          });
+          argv = jobArgv(
+            kind,
+            kind === "eval"
+              ? evalJobOptions(body, launchOffers(dir, entry.target))
+              : {
+                  ...(typeof body["dataset"] === "string" ? { dataset: body["dataset"] } : {}),
+                  ...(typeof body["graders"] === "string" ? { graders: body["graders"] } : {}),
+                },
+          );
         } catch (err) {
           if (err instanceof JobArgumentError) throw new HttpError(400, err.message);
           throw err;

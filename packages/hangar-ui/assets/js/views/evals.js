@@ -8,7 +8,7 @@
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { fmtPct, fmtRelativeTime, fmtUsd } from "../util.js";
+import { fmtPct, fmtRelativeTime, fmtUsd, notMeasuredCopy } from "../util.js";
 import { actionTwin } from "./control.js";
 
 export async function renderEvals(root, ctx) {
@@ -32,11 +32,21 @@ function runsOf(data) {
 async function renderHistory(root, ctx) {
   clear(root).appendChild(skeleton(6));
   const data = await api.evals(ctx.id);
+  drawHistory(root, ctx, data, () => renderHistory(root, ctx));
+}
+
+/** The history table, drawn from one `evals` payload. */
+export function drawHistory(root, ctx, data, reload) {
   clear(root);
   const runs = runsOf(data);
   if (runs.length === 0) {
-    root.appendChild(emptyState("No evals yet", "crewhaus eval"));
+    const copy = notMeasuredCopy(data);
+    root.appendChild(emptyState(copy.message, copy.verb));
     return;
+  }
+  // The runs were readable but the pin file was not: say so above the table.
+  if (typeof data?.unreadable === "string") {
+    root.appendChild(el("p", { class: "muted", text: data.unreadable }));
   }
   // Baselines are keyed `<spec>::<dataset>` → the pinned run; star any run
   // that IS a pinned baseline.
@@ -47,7 +57,6 @@ async function renderHistory(root, ctx) {
       .filter((id) => typeof id === "string"),
   );
   const nowMs = Date.now();
-  const reload = () => renderHistory(root, ctx);
   const tbody = el("tbody");
   for (const run of runs) {
     const runId = String(run.runId ?? run.id ?? "");
@@ -67,7 +76,7 @@ async function renderHistory(root, ctx) {
           }),
         ]),
         el("td", { class: "mono", text: String(run.datasetName ?? run.dataset ?? "—") }),
-        el("td", null, [passDot(run.passRate, run.gatePassed)]),
+        el("td", null, [passDot(run)]),
         el("td", { class: "num", text: fmtScore(run.meanScore) }),
         el("td", {
           class: "num",
@@ -79,7 +88,7 @@ async function renderHistory(root, ctx) {
           run.replayed === true ? el("span", { class: "chip", text: "replayed" }) : null,
         ]),
         el("td", { class: "cell-edit" }, [
-          baselineBtn(ctx.id, runId, baselineRunIds.has(runId), ctx.dir ?? "", reload),
+          baselineCell(ctx.id, run, runId, baselineRunIds.has(runId), ctx.dir ?? "", reload),
         ]),
       ]),
     );
@@ -109,9 +118,15 @@ async function renderHistory(root, ctx) {
  * `(specName, datasetName)` BY DESIGN — that is what keeps a spec edit gated
  * against the same measurement — so the server copies both off the run's own
  * index entry and this button only names the run.
+ *
+ * A run that cannot be a baseline gets the reason as visible text and no button:
+ * a tooltip would be out of reach from a keyboard.
  */
-function baselineBtn(harnessId, runId, isBaseline, dir, reload) {
+export function baselineCell(harnessId, run, runId, isBaseline, dir, reload) {
   if (isBaseline) return el("span", { class: "chip chip-group", text: "baseline" });
+  if (typeof run.pinRefusal === "string") {
+    return el("span", { class: "muted gated-why", text: run.pinRefusal });
+  }
   const btn = el("button", {
     class: "btn btn-ghost",
     type: "button",
@@ -136,6 +151,37 @@ function baselineBtn(harnessId, runId, isBaseline, dir, reload) {
 async function renderRun(root, ctx, runId) {
   clear(root).appendChild(skeleton(6));
   const data = await api.evalRun(ctx.id, runId);
+  drawRun(root, ctx, runId, data);
+}
+
+/** The sample filters: a verdict falls in exactly one besides "all". */
+export const SAMPLE_FILTERS = [
+  { id: "all", label: "all", verdicts: null, none: "No per-sample results recorded for this run." },
+  { id: "pass", label: "pass", verdicts: ["pass"], none: "No case in this run passed." },
+  {
+    id: "fail",
+    label: "fail",
+    verdicts: ["fail", "error"],
+    none: "No case in this run failed or errored.",
+  },
+  {
+    id: "other",
+    label: "no verdict",
+    verdicts: ["abstained", "canary", "unknown"],
+    none: "Every case in this run has a verdict.",
+  },
+];
+
+/** The rows one filter shows. */
+export function filterRows(rows, filterId) {
+  const filter = SAMPLE_FILTERS.find((f) => f.id === filterId);
+  if (filter === undefined || filter.verdicts === null) return rows;
+  return rows.filter((r) => filter.verdicts.includes(r.verdict));
+}
+
+/** One run, drawn from its `evalRun` payload: `stats` and `rows` are the
+ *  server's join of `results.json`, the index row and the sample directories. */
+export function drawRun(root, ctx, runId, data) {
   clear(root);
   root.appendChild(
     el("div", { class: "crumb-line" }, [
@@ -147,68 +193,66 @@ async function renderRun(root, ctx, runId) {
     root.appendChild(emptyState("Nothing here yet — no run with that id"));
     return;
   }
-  // The run view is { runId, summary, sampleIds }: `summary` is the run's
-  // parsed results.json (tolerated shape), `sampleIds` the on-disk sample
-  // dirs — the navigable authority for the drill-down table.
-  const summary = data.summary && typeof data.summary === "object" ? data.summary : {};
+  const stats = data.stats && typeof data.stats === "object" ? data.stats : {};
   root.appendChild(
     el("div", { class: "card" }, [
       el("div", { class: "mini-row" }, [
-        miniStat("pass rate", fmtPct(numOr(summary.passRate))),
-        miniStat("mean score", fmtScore(summary.meanScore)),
-        miniStat("samples", String(summary.sampleCount ?? summary.samples ?? "—")),
-        miniStat("cost", fmtUsd(numOr(summary.costUsd))),
+        miniStat("pass rate", passRateWord(stats)),
+        miniStat("mean score", fmtScore(stats.meanScore)),
+        miniStat(
+          "samples",
+          typeof stats.sampleCount === "number" ? String(stats.sampleCount) : "—",
+        ),
+        miniStat("cost", fmtUsd(numOr(stats.costUsd))),
+      ]),
+      el("div", { class: "cell-caps" }, [
+        stats.partial === true ? el("span", { class: "chip chip-warn", text: "partial" }) : null,
+        stats.replayed === true ? el("span", { class: "chip", text: "replayed" }) : null,
+        stats.flakyCount > 0 ? el("span", { class: "chip chip-warn", text: "flaky" }) : null,
       ]),
     ]),
   );
 
-  const sampleIds = Array.isArray(data.sampleIds) ? data.sampleIds.map(String) : [];
-  if (sampleIds.length === 0) {
-    root.appendChild(emptyState("No per-sample results recorded for this run"));
+  const rows = Array.isArray(data.rows) ? data.rows : [];
+  if (rows.length === 0) {
+    root.appendChild(emptyState(SAMPLE_FILTERS[0].none));
     return;
   }
-  // Join per-sample verdicts out of the summary when it carries them.
-  const verdicts = new Map();
-  const summaryRows = Array.isArray(summary.results)
-    ? summary.results
-    : Array.isArray(summary.samples)
-      ? summary.samples
-      : [];
-  for (const s of summaryRows) {
-    if (!s || typeof s !== "object") continue;
-    const sid = String(s.sampleId ?? s.id ?? "");
-    if (sid !== "") verdicts.set(sid, s);
-  }
-  const known = sampleIds.some((sid) => typeof verdicts.get(sid)?.pass === "boolean");
+  const known = rows.some((r) => r.verdict !== "unknown");
 
   let filter = "all";
   const listWrap = el("div");
   const drawList = () => {
     clear(listWrap);
-    const visible = sampleIds.filter((sid) => {
-      if (filter === "all") return true;
-      const pass = verdicts.get(sid)?.pass;
-      return filter === "pass" ? pass === true : pass !== true;
-    });
+    const visible = filterRows(rows, filter);
     if (visible.length === 0) {
-      listWrap.appendChild(emptyState(`No ${filter} samples`));
+      const chosen = SAMPLE_FILTERS.find((f) => f.id === filter);
+      listWrap.appendChild(emptyState(chosen?.none ?? SAMPLE_FILTERS[0].none));
       return;
     }
     const tbody = el("tbody");
-    for (const sid of visible) {
-      const s = verdicts.get(sid) ?? {};
+    for (const row of visible) {
+      const sid = String(row.sampleId ?? "");
       tbody.appendChild(
         el("tr", null, [
           el("td", null, [
-            el("a", {
-              class: "mono name-link",
-              href: hrefHarness(ctx.id, "evals", runId, sid),
-              text: sid || "(sample)",
-            }),
+            typeof row.dir === "string"
+              ? el("a", {
+                  class: "mono name-link",
+                  href: hrefHarness(ctx.id, "evals", runId, row.dir),
+                  text: sid || "(sample)",
+                })
+              : el("span", { class: "mono", text: sid || "(sample)" }),
           ]),
-          el("td", null, [passFailDot(s.pass)]),
-          el("td", { class: "num", text: fmtScore(s.score) }),
-          el("td", { class: "muted", text: String(s.reason ?? s.verdict ?? "") }),
+          el("td", null, [
+            verdictDot(row.verdict),
+            row.flaky === true ? el("span", { class: "chip chip-warn", text: "flaky" }) : null,
+            row.needsReview === true
+              ? el("span", { class: "chip chip-warn", text: "needs a person" })
+              : null,
+          ]),
+          el("td", { class: "num", text: fmtScore(row.score) }),
+          el("td", { class: "muted", text: String(row.note ?? "") }),
         ]),
       );
     }
@@ -233,15 +277,24 @@ async function renderRun(root, ctx, runId) {
     const filterBar = el(
       "div",
       { class: "filter-bar", role: "group", "aria-label": "sample filter" },
-      ["all", "pass", "fail"].map((f) => {
-        const btn = el("button", { class: "btn btn-ghost", type: "button", text: f });
+      SAMPLE_FILTERS.map((f) => {
+        const btn = el("button", {
+          class: "btn btn-ghost",
+          type: "button",
+          text: f.label,
+          "aria-pressed": f.id === filter ? "true" : "false",
+        });
         btn.addEventListener("click", () => {
-          filter = f;
-          for (const b of filterBar.querySelectorAll("button")) b.classList.remove("active");
+          filter = f.id;
+          for (const b of filterBar.querySelectorAll("button")) {
+            b.classList.remove("active");
+            b.setAttribute("aria-pressed", "false");
+          }
           btn.classList.add("active");
+          btn.setAttribute("aria-pressed", "true");
           drawList();
         });
-        if (f === "all") btn.classList.add("active");
+        if (f.id === "all") btn.classList.add("active");
         return btn;
       }),
     );
@@ -254,6 +307,28 @@ async function renderRun(root, ctx, runId) {
 async function renderSample(root, ctx, runId, sampleId) {
   clear(root).appendChild(skeleton(6));
   const data = await api.evalSample(ctx.id, runId, sampleId);
+  drawSample(root, ctx, runId, sampleId, data);
+}
+
+/**
+ * `grades.json` as the runner writes it: `overall` plus one `perGrader` entry
+ * per grader. Anything else reads as no grades, never as a verdict.
+ */
+export function gradeRowsOf(grades) {
+  const perGrader = Array.isArray(grades?.perGrader) ? grades.perGrader : [];
+  return perGrader
+    .filter((g) => g && typeof g === "object")
+    .map((g) => ({
+      name: String(g.name ?? "grader"),
+      passed: g.passed,
+      abstained: g.abstained === true,
+      score: g.score,
+      rationale: typeof g.rationale === "string" ? g.rationale : "",
+    }));
+}
+
+/** One sample, drawn from its `evalSample` payload. */
+export function drawSample(root, ctx, runId, sampleId, data) {
   clear(root);
   root.appendChild(
     el("div", { class: "crumb-line" }, [
@@ -265,15 +340,14 @@ async function renderSample(root, ctx, runId, sampleId) {
     root.appendChild(emptyState("Nothing here yet — no sample with that id"));
     return;
   }
-  // grades.json is passed through tolerantly: a list of grader results or
-  // one bare result object.
-  const grades = Array.isArray(data.grades)
-    ? data.grades
-    : data.grades && typeof data.grades === "object"
-      ? [data.grades]
-      : [];
+  const overall =
+    data.grades?.overall && typeof data.grades.overall === "object" ? data.grades.overall : null;
+  const grades = gradeRowsOf(data.grades);
   const gradeCard = el("div", { class: "card" }, [
-    el("h3", { class: "card-title", text: "Grades" }),
+    el("h3", { class: "card-title" }, [
+      el("span", { text: "Grades" }),
+      overall === null ? null : passFailDot(overall.passed, overall.abstained === true),
+    ]),
     grades.length === 0
       ? el("p", { class: "muted", text: "No grades recorded." })
       : el(
@@ -281,10 +355,10 @@ async function renderSample(root, ctx, runId, sampleId) {
           { class: "check-list" },
           grades.map((g) =>
             el("li", null, [
-              passFailDot(g.pass),
-              el("span", { text: ` ${String(g.grader ?? g.name ?? "grader")}` }),
+              passFailDot(g.passed, g.abstained),
+              el("span", { text: ` ${g.name}` }),
               el("span", { class: "num muted", text: ` ${fmtScore(g.score)}` }),
-              g.rationale ? el("div", { class: "muted reason", text: String(g.rationale) }) : null,
+              g.rationale ? el("div", { class: "muted reason", text: g.rationale }) : null,
             ]),
           ),
         ),
@@ -323,20 +397,56 @@ function fmtScore(v) {
   return typeof v === "number" && Number.isFinite(v) ? v.toFixed(2) : "—";
 }
 
-function passDot(passRate, gatePassed) {
-  const pct = fmtPct(numOr(passRate));
-  if (
-    gatePassed === false ||
-    (typeof passRate === "number" && passRate < 1 && gatePassed !== true)
-  ) {
-    return dot(typeof passRate === "number" && passRate < 1 ? "warn" : "unknown", pct);
-  }
-  if (typeof passRate !== "number") return dot("unknown", pct);
-  return dot(passRate >= 1 ? "ok" : "warn", pct);
+/**
+ * What a run's pass rate may honestly be called. A run stopped at its budget or
+ * with no verdict at all has no rate worth printing: its 0% would read as a
+ * score.
+ */
+export function passRateWord(run) {
+  if (run?.partial === true) return "partial";
+  if (run?.measuredCount === 0) return "not measured";
+  return fmtPct(numOr(run?.passRate));
 }
 
-function passFailDot(pass) {
-  if (pass === true) return dot("ok", "pass");
-  if (pass === false) return dot("bad", "fail");
-  return dot("unknown", "?");
+/** The dot beside a run's pass rate. */
+export function passDotState(run) {
+  if (run?.partial === true) return "warn";
+  if (run?.measuredCount === 0 || typeof run?.passRate !== "number") return "unknown";
+  return run.passRate >= 1 ? "ok" : "warn";
+}
+
+function passDot(run) {
+  return dot(passDotState(run), passRateWord(run));
+}
+
+/** Every verdict's dot and its word. Status is never colour alone. */
+export const VERDICT_FACES = {
+  pass: { state: "ok", word: "pass" },
+  fail: { state: "bad", word: "fail" },
+  error: { state: "bad", word: "error" },
+  abstained: { state: "warn", word: "needs a person" },
+  canary: { state: "off", word: "canary" },
+  unknown: { state: "unknown", word: "no result" },
+};
+
+/** A sample verdict's face. Anything unrecognised has no result. */
+export function verdictFace(verdict) {
+  return Object.hasOwn(VERDICT_FACES, verdict) ? VERDICT_FACES[verdict] : VERDICT_FACES.unknown;
+}
+
+function verdictDot(verdict) {
+  const face = verdictFace(verdict);
+  return dot(face.state, face.word);
+}
+
+/** One grader's verdict as `grades.json` records it. */
+export function gradeVerdict(passed, abstained) {
+  if (abstained === true) return "abstained";
+  if (passed === true) return "pass";
+  if (passed === false) return "fail";
+  return "unknown";
+}
+
+function passFailDot(passed, abstained) {
+  return verdictDot(gradeVerdict(passed, abstained));
 }

@@ -495,6 +495,9 @@ export type HarnessHealth = {
   /** True when a pinned eval baseline exists AND the last run met/held it. */
   readonly evalHealthy: boolean;
   readonly evalNote: string;
+  /** The reader's finer answer, when it has one: `evalHealthy` cannot say "nobody
+   *  has measured this". Absent for a reader that only knows healthy or not. */
+  readonly evalState?: string;
   /** Open incidents from the ops-batch incidents dir, if present. */
   readonly openIncidents: number;
   /** Whether `.crewhaus/audit` exists (tamper-evidence available). */
@@ -505,7 +508,7 @@ export type HarnessHealth = {
 export type EvalHealthReader = (
   evalsDir: string,
   specName: string,
-) => { healthy: boolean; note: string };
+) => { healthy: boolean; note: string; state?: string };
 
 /** Count open incidents under `.crewhaus/incidents` (files not ending
  *  `.resolved.json`). Absent dir → 0. The ops batch writes one JSON per
@@ -532,6 +535,7 @@ export async function buildHarnessHealth(
     pinnedEnvs: Object.keys(inv.registry.pins).sort(),
     evalHealthy: evalHealth.healthy,
     evalNote: evalHealth.note,
+    ...(evalHealth.state !== undefined ? { evalState: evalHealth.state } : {}),
     openIncidents: countOpenIncidents(inv.dir),
     hasAudit: existsSync(join(inv.dir, ".crewhaus", "audit")),
   };

@@ -13,6 +13,7 @@ import {
   fmtPct,
   fmtUsd,
   healthChecks,
+  notMeasuredCopy,
   sparklinePath,
   usdFromMicros,
 } from "../util.js";
@@ -74,7 +75,8 @@ function healthCard(detail) {
 function evalTrendCard(evals) {
   const runs = Array.isArray(evals) ? evals : Array.isArray(evals?.runs) ? evals.runs : [];
   if (runs.length === 0) {
-    return card("Eval trend", emptyState("No evals yet", "crewhaus eval"));
+    const copy = notMeasuredCopy(evals);
+    return card("Eval trend", emptyState(copy.message, copy.verb));
   }
   const chronological = [...runs].reverse();
   const rates = chronological

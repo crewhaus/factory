@@ -360,7 +360,7 @@ function trendCard(trend) {
     ]),
   );
   if (trend === null) {
-    card.appendChild(emptyState("The trend could not be read", "crewhaus eval crewhaus.yaml"));
+    card.appendChild(emptyState("The trend could not be read"));
     return card;
   }
   card.appendChild(el("p", { class: "adv-note", text: String(trend.summary ?? "") }));

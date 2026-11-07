@@ -30,7 +30,8 @@
  *     collision, gradersHash/judgeModel instrument change, and dataset
  *     keyset change are first-class banners, not buried stderr.
  *   - THE TEST SPLIT IS LOCKED. `--allow-test-split` is a visibly gated
- *     release-flow gesture with a burn count, never a convenience flag.
+ *     release-flow gesture, never a convenience flag. Only `crewhaus datasets
+ *     release` counts a use; a direct run reads the split without counting.
  *   - SENTINEL ATTRIBUTION IS CONDITIONAL. A flip is provider drift ONLY
  *     when specHash + datasetHash + gradersHash + judgeModel all match the
  *     frozen baseline. Otherwise say what changed instead.
@@ -57,6 +58,20 @@ import {
 } from "@crewhaus/eval-report";
 import { buildFeedbackRecord } from "@crewhaus/feedback-distill";
 import { MAX_JSONL_LINES, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
+import {
+  EVAL_COMMAND,
+  type LaunchOffers,
+  OPTIMIZE_COMMAND,
+  SENTINEL_BASELINE_PATH,
+  evalArgv,
+  flywheelArgv,
+  launchOffers,
+  optimizeArgv,
+  positiveInt,
+  positiveNumber,
+  sentinelArgv,
+} from "./eval-inputs";
+import { isOptRunId } from "./evals";
 import { HttpError } from "./http";
 import { readJsonlCapped, readTextCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
@@ -337,31 +352,9 @@ const specNameOf = (ctx: M3Context): string => ctx.entry?.specName ?? "spec";
 // The launcher
 // ---------------------------------------------------------------------------
 
-/** The eval launcher's closed flag vocabulary. Nothing outside this record
- *  can reach a command line, and every interpolated value is `jobArg`-shaped
- *  before it gets there. */
-type LaunchPlan = {
-  readonly argv: readonly string[];
-  readonly warnings: readonly string[];
-};
-
-function positiveInt(body: Readonly<Record<string, unknown>>, key: string): number | undefined {
-  const value = body[key];
-  if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    throw new HttpError(400, `"${key}" must be a positive integer`);
-  }
-  return value;
-}
-
-function positiveNumber(body: Readonly<Record<string, unknown>>, key: string): number | undefined {
-  const value = body[key];
-  if (value === undefined) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    throw new HttpError(400, `"${key}" must be a positive number`);
-  }
-  return value;
-}
+/** What this harness can run, from its live spec and the files on disk. */
+const offersOf = (ctx: M3Context): LaunchOffers =>
+  launchOffers(ctx.harnessDir ?? "", ctx.entry?.target);
 
 /**
  * Detect a run directory that can be RESUMED: `run.json` exists (the run
@@ -400,76 +393,28 @@ function datasetPrecedenceWarning(ctx: M3Context): string | null {
   )}-ratings, so ratings-driven loops will silently replay that file instead. Pass an explicit dataset, or move the file.`;
 }
 
-function buildLaunchPlan(ctx: M3Context): LaunchPlan {
-  const body = ctx.body;
-  const argv: string[] = ["eval", "crewhaus.yaml"];
-  const warnings: string[] = [];
-
-  const dataset = body["dataset"];
-  if (dataset !== undefined) argv.push("--dataset", jobArg("dataset", dataset));
-  const graders = body["graders"];
-  if (graders !== undefined) argv.push("--graders", jobArg("graders", graders));
-  const slice = body["slice"];
-  if (slice !== undefined) argv.push("--slice", jobArg("slice", slice));
-
-  const models = body["models"];
-  if (models !== undefined) {
-    if (!Array.isArray(models) || models.length === 0) {
-      throw new HttpError(400, '"models" must be a non-empty array of model ids');
-    }
-    argv.push("--models", models.map((m, i) => jobArg(`models[${i}]`, m)).join(","));
-  }
-
-  const repeats = positiveInt(body, "repeats");
-  if (repeats !== undefined) argv.push("--repeats", String(repeats));
-  const seed = positiveInt(body, "seed");
-  if (seed !== undefined) argv.push("--seed", String(seed));
-  const budgetUsd = positiveNumber(body, "budgetUsd");
-  if (budgetUsd !== undefined) argv.push("--budget-usd", String(budgetUsd));
-  const maxCostUsd = positiveNumber(body, "maxCostUsd");
-  if (maxCostUsd !== undefined) argv.push("--max-cost-usd", String(maxCostUsd));
-
-  if (body["gate"] === true) argv.push("--gate");
-  if (body["resume"] === true) argv.push("--resume");
-
-  // The locked holdout. `--allow-test-split` is not a convenience flag: it
-  // SPENDS a version's held-out split, and every spend is counted in the
-  // record's `releases[]`. The server refuses it unless the caller also sent
-  // the release-flow confirmation, so a stray checkbox cannot burn a holdout.
-  if (body["allowTestSplit"] === true) {
-    if (body["releaseConfirm"] !== true) {
-      throw new HttpError(
-        409,
-        'the test split is locked to the release flow — send "releaseConfirm": true alongside "allowTestSplit" to spend the holdout (the spend is recorded as a burn)',
-      );
-    }
-    argv.push("--allow-test-split");
-    warnings.push(
-      "this run spends the locked test split — the burn is recorded in the dataset record's releases[]",
-    );
-  }
-
-  const precedence = datasetPrecedenceWarning(ctx);
-  if (precedence !== null && dataset === undefined) warnings.push(precedence);
-  return { argv, warnings };
-}
-
 /**
  * `POST /api/h/:id/evals/run` — the typed eval launcher.
  *
  * Conventional paths default from the harness dir (`crewhaus.yaml`,
- * `eval/dataset.jsonl`, `eval/graders.yaml`), so the common launch carries no
- * flags at all. Live progress is the `[eval]` stdout block on the job's run
- * feed — this route returns the accepted job, never a stream of its own.
+ * `eval/dataset.jsonl`, `eval/graders.yaml`), so the common launch names no
+ * paths at all, and a request neither names nor finds answers 409 saying what
+ * is missing. Live progress is the `[eval]` stdout block on the job's run feed
+ * — this route returns the accepted job, never a stream of its own.
  */
 export const evalLaunch: M3Handler = (ctx) => {
-  const plan = buildLaunchPlan(ctx);
+  const plan = evalArgv(ctx.body, offersOf(ctx));
+  const precedence = datasetPrecedenceWarning(ctx);
+  const warnings =
+    precedence !== null && ctx.body["dataset"] === undefined
+      ? [...plan.warnings, precedence]
+      : plan.warnings;
   const job = ctx.submitJob("eval", plan.argv);
   return {
-    ...found("eval submitted to the job queue", "crewhaus eval"),
+    ...found("eval submitted to the job queue", `crewhaus ${plan.argv.join(" ")}`),
     job,
     argv: plan.argv,
-    warnings: plan.warnings,
+    warnings,
     resumable: resumableRuns(ctx),
   };
 };
@@ -761,7 +706,7 @@ export const evalTrends: M3Handler = (ctx) => {
         filter === null || filter === ""
           ? "no eval runs recorded yet"
           : `no eval runs match dataset filter "${filter}" (the filter also matches regression unions like "${filter}+regressions@v1")`,
-        "crewhaus eval",
+        EVAL_COMMAND,
       ),
       series,
       spend: { agentUsd: 0, judgeUsd: 0, judgeShare: null },
@@ -769,7 +714,7 @@ export const evalTrends: M3Handler = (ctx) => {
     };
   }
   return {
-    ...found(null, "crewhaus eval"),
+    ...found(null, EVAL_COMMAND),
     series,
     spend: {
       agentUsd,
@@ -1170,7 +1115,7 @@ export const sentinel: M3Handler = (ctx) => {
     return {
       ...absent(
         "no frozen sentinel baseline — freeze one, commit it, then run the sentinel against it",
-        "crewhaus eval crewhaus.yaml --seed 1 -o eval/sentinel-baseline",
+        `${EVAL_COMMAND} --seed 1 -o ${SENTINEL_BASELINE_PATH}`,
       ),
       baseline: null,
       lastRun: null,
@@ -1206,7 +1151,7 @@ export const sentinel: M3Handler = (ctx) => {
   }
   const comparable = lastRun !== null && mismatches.length === 0;
   return {
-    ...found(null, "crewhaus eval crewhaus.yaml --sentinel --baseline eval/sentinel-baseline"),
+    ...found(null, `${EVAL_COMMAND} --sentinel --baseline ${SENTINEL_BASELINE_PATH}`),
     baseline,
     lastRun,
     attribution: {
@@ -1226,11 +1171,9 @@ export const sentinel: M3Handler = (ctx) => {
 /** `POST /api/h/:id/evals/sentinel` — run the sentinel against the frozen
  *  baseline through the job queue. */
 export const sentinelRun: M3Handler = (ctx) => {
-  const baseline = ctx.body["baseline"];
-  const baselinePath = jobArg("baseline", baseline ?? SENTINEL_BASELINE.join("/"));
-  const argv = ["eval", "crewhaus.yaml", "--sentinel", "--baseline", baselinePath];
+  const { argv, baseline } = sentinelArgv(ctx.body, offersOf(ctx));
   return {
-    ...found(`sentinel queued against ${baselinePath}`, "crewhaus eval --sentinel"),
+    ...found(`sentinel queued against ${baseline}`, `crewhaus ${argv.join(" ")}`),
     job: ctx.submitJob("eval sentinel", argv),
     argv,
   };
@@ -1299,7 +1242,7 @@ const optimizeSegments = (...rest: string[]): string[] => [".crewhaus", "optimiz
  */
 export const optimizer: M3Handler = (ctx) => {
   const runs = listNames(safeContain(ctx, optimizeSegments()))
-    .filter((runId) => isDirAt(safeContain(ctx, optimizeSegments(runId))))
+    .filter((runId) => isOptRunId(runId) && isDirAt(safeContain(ctx, optimizeSegments(runId))))
     .map((runId) => ({
       optRunId: runId,
       at: mtimeIso(safeContain(ctx, optimizeSegments(runId))),
@@ -1311,44 +1254,27 @@ export const optimizer: M3Handler = (ctx) => {
     .sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")));
   if (runs.length === 0) {
     return {
-      ...absent("no optimizer runs recorded", "crewhaus optimize crewhaus.yaml"),
+      ...absent("no optimizer runs recorded", OPTIMIZE_COMMAND),
       runs,
       acceptance:
         "strict acceptance: a proposal that does not beat the baseline is REJECTED — that is the feature, not a failure",
     };
   }
   return {
-    ...found(null, "crewhaus optimize crewhaus.yaml"),
+    ...found(null, OPTIMIZE_COMMAND),
     runs,
     acceptance:
       "strict acceptance: a proposal that does not beat the baseline is REJECTED — that is the feature, not a failure",
   };
 };
 
-const OPTIMIZER_MUTATORS = new Set(["rule-based", "claude", "meta-harness"]);
-
 /** `POST /api/h/:id/evals/optimize` — launch `optimize`. */
 export const optimizerRun: M3Handler = (ctx) => {
-  const mutator = requireString(ctx.body, "mutator");
-  if (!OPTIMIZER_MUTATORS.has(mutator)) {
-    throw new HttpError(400, '"mutator" must be one of rule-based, claude, meta-harness');
-  }
-  const argv = ["optimize", "crewhaus.yaml", "--mutator", mutator];
-  const dataset = ctx.body["dataset"];
-  if (dataset !== undefined) argv.push("--dataset", jobArg("dataset", dataset));
-  const graders = ctx.body["graders"];
-  if (graders !== undefined) argv.push("--graders", jobArg("graders", graders));
-  const budgetUsd = positiveNumber(ctx.body, "budgetUsd");
-  if (budgetUsd !== undefined) argv.push("--budget-usd", String(budgetUsd));
-  const concurrency = positiveInt(ctx.body, "concurrency");
-  if (concurrency !== undefined) argv.push("--concurrency", String(concurrency));
-  const fromAdvice = ctx.body["fromAdvice"];
-  if (fromAdvice === true) argv.push("--from-advice");
-  else if (fromAdvice !== undefined) argv.push("--from-advice", jobArg("fromAdvice", fromAdvice));
+  const { argv, mutator } = optimizeArgv(ctx.body, offersOf(ctx));
   return {
     ...found(
       "queued — proposals that do not beat the baseline are REJECTED, so a run that changes nothing is a working run",
-      "crewhaus optimize",
+      `crewhaus ${argv.join(" ")}`,
     ),
     job: ctx.submitJob("optimize", argv),
     argv,
@@ -1363,10 +1289,7 @@ export const optimizerArtifacts: M3Handler = (ctx) => {
   const runDir = safeContain(ctx, optimizeSegments(optRunId));
   if (!isDirAt(runDir)) {
     return {
-      ...absent(
-        `no optimizer run "${optRunId}" on this harness`,
-        "crewhaus optimize crewhaus.yaml",
-      ),
+      ...absent(`no optimizer run "${optRunId}" on this harness`, OPTIMIZE_COMMAND),
       optRunId,
       files: [],
       decisions: null,
@@ -1400,7 +1323,7 @@ export const optimizerArtifacts: M3Handler = (ctx) => {
   walk([], 0);
   const patched = readProse(ctx, optimizeSegments(optRunId, "advice", "patched.yaml"));
   return {
-    ...found(null, "crewhaus optimize crewhaus.yaml"),
+    ...found(null, OPTIMIZE_COMMAND),
     optRunId,
     files,
     decisions: readJson(ctx, optimizeSegments(optRunId, "advice", "decisions.json")) ?? null,
@@ -1436,6 +1359,8 @@ export const flywheel: M3Handler = (ctx) => {
     isScaffoldedWorkflow,
   );
   const precedence = datasetPrecedenceWarning(ctx);
+  const offers = offersOf(ctx);
+  const launches = { eval: offers.eval, optimize: offers.optimize, flywheel: offers.flywheel };
   const shadow = {
     shadowing: precedence !== null,
     conventionalPath: "eval/dataset.jsonl",
@@ -1451,6 +1376,7 @@ export const flywheel: M3Handler = (ctx) => {
       workflows,
       state: null,
       datasetPrecedence: shadow,
+      launches,
     };
   }
   return {
@@ -1460,23 +1386,14 @@ export const flywheel: M3Handler = (ctx) => {
     state: readJson(ctx, [".crewhaus", "flywheel", "state.json"]) ?? null,
     lastRunAt: mtimeIso(stateDir),
     datasetPrecedence: shadow,
+    launches,
   };
 };
 
 /** `POST /api/h/:id/evals/flywheel` — `flywheel run|init`. `init` is
  *  scaffolding (it writes workflow files); `run` is the loop itself. */
 export const flywheelRun: M3Handler = (ctx) => {
-  const action = ctx.body["action"] ?? "run";
-  if (action !== "run" && action !== "init") {
-    throw new HttpError(400, '"action" must be "run" or "init"');
-  }
-  const argv = ["flywheel", action];
-  if (action === "run") {
-    const budgetUsd = positiveNumber(ctx.body, "budgetUsd");
-    if (budgetUsd !== undefined) argv.push("--budget-usd", String(budgetUsd));
-    const iterations = positiveInt(ctx.body, "iterations");
-    if (iterations !== undefined) argv.push("--iterations", String(iterations));
-  }
+  const { argv, action } = flywheelArgv(ctx.body, offersOf(ctx));
   const precedence = datasetPrecedenceWarning(ctx);
   return {
     ...found(
