@@ -4,8 +4,9 @@
  * while another shard never ran, and a wrong runner image cannot install a browser.
  * So the workflow's shape is held here, and the aggregate's own script is executed.
  */
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const ROOT = dirname(import.meta.dir);
@@ -99,10 +100,11 @@ describe("the shards", () => {
 
 describe("the sweep's condition", () => {
   test("a failed scope job runs the sweep rather than skipping into a false green", () => {
-    const condition = job("ui-e2e-axe").if ?? "";
-    expect(condition).toContain("!cancelled()");
-    expect(condition).toContain("needs.ui-e2e-scope.result != 'success'");
-    expect(condition).toContain("needs.ui-e2e-scope.outputs.axe != 'false'");
+    // Whole, because the operators are the logic: `&&` for `||` would skip the sweep
+    // on every in-scope pull request, and the aggregate would read that as green.
+    expect(job("ui-e2e-axe").if).toBe(
+      "${{ !cancelled() && (needs.ui-e2e-scope.result != 'success' || needs.ui-e2e-scope.outputs.axe != 'false') }}",
+    );
     expect([job("ui-e2e-axe").needs].flat()).toEqual(["ui-e2e-scope"]);
   });
 });
@@ -121,13 +123,108 @@ describe("the scope job", () => {
     expect(step?.run).toContain("git diff --name-only --no-renames -z HEAD^1 HEAD");
   });
 
-  test("anything but a pull request runs the sweep without looking", () => {
-    expect(step?.run).toContain('"pull_request"');
-    expect(step?.run).toContain("axe=true");
-  });
-
   test("no event data is interpolated into its script", () => {
     expect(step?.run).not.toContain("${{");
+    expect(step?.env).toEqual({ EVENT_NAME: "${{ github.event_name }}" });
+  });
+
+  describe("its script, run the way the runner runs it, over a real repository", () => {
+    const repos: string[] = [];
+    afterAll(() => {
+      for (const repo of repos) rmSync(repo, { recursive: true, force: true });
+    });
+
+    const git = (repo: string, ...args: string[]): void => {
+      const identity = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
+      const done = Bun.spawnSync(["git", "-c", "commit.gpgsign=false", ...identity, ...args], {
+        cwd: repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (done.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${done.stderr}`);
+    };
+    const commit = (repo: string, path: string): void => {
+      mkdirSync(dirname(join(repo, path)), { recursive: true });
+      writeFileSync(join(repo, path), path);
+      git(repo, "add", path);
+      git(repo, "commit", "-m", path);
+    };
+    /** A pull request's merge commit: its first parent has moved on with `onMain`. */
+    const mergeCommit = (prChanges: string, onMain: string): string => {
+      const repo = mkdtempSync(join(tmpdir(), "ui-e2e-scope-"));
+      repos.push(repo);
+      git(repo, "init", "-q", "-b", "main");
+      commit(repo, "README.md");
+      git(repo, "checkout", "-q", "-b", "pr");
+      commit(repo, prChanges);
+      git(repo, "checkout", "-q", "main");
+      commit(repo, onMain);
+      git(repo, "merge", "-q", "--no-ff", "-m", "merge", "pr");
+      return repo;
+    };
+    const answer = (repo: string, event: string): string => {
+      const script = readFileSync(join(ROOT, "scripts", "ui-e2e-scope.ts"), "utf8");
+      mkdirSync(join(repo, "scripts"), { recursive: true });
+      writeFileSync(join(repo, "scripts", "ui-e2e-scope.ts"), script);
+      const output = join(repo, "github-output");
+      writeFileSync(output, "");
+      // `bash -e` is what a run step without a `shell` gets.
+      const done = Bun.spawnSync(["bash", "-e", "-c", step?.run ?? ""], {
+        cwd: repo,
+        env: {
+          PATH: `${dirname(process.execPath)}:${process.env["PATH"] ?? ""}`,
+          EVENT_NAME: event,
+          GITHUB_OUTPUT: output,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(done.exitCode).toBe(0);
+      return readFileSync(output, "utf8").trim();
+    };
+
+    // git and bun, several times over; slow by construction on a loaded runner.
+    const DEADLINE = 20_000;
+
+    test(
+      "a pull request outside the scope skips, whatever its base did",
+      () => {
+        const repo = mergeCommit("docs/x.md", "packages/hangar-ui/moved-on.js");
+        expect(answer(repo, "pull_request")).toBe("axe=false");
+      },
+      DEADLINE,
+    );
+
+    test(
+      "a pull request inside the scope sweeps",
+      () => {
+        const repo = mergeCommit("packages/hangar-ui/a.js", "docs/moved-on.md");
+        expect(answer(repo, "pull_request")).toBe("axe=true");
+      },
+      DEADLINE,
+    );
+
+    test(
+      "anything but a pull request sweeps without looking",
+      () => {
+        const repo = mergeCommit("docs/x.md", "docs/moved-on.md");
+        expect(answer(repo, "push")).toBe("axe=true");
+        expect(answer(repo, "workflow_call")).toBe("axe=true");
+      },
+      DEADLINE,
+    );
+
+    test(
+      "a diff that fails sweeps: could not determine is not no",
+      () => {
+        const repo = mkdtempSync(join(tmpdir(), "ui-e2e-scope-"));
+        repos.push(repo);
+        git(repo, "init", "-q", "-b", "main");
+        commit(repo, "docs/only-commit.md");
+        expect(answer(repo, "pull_request")).toBe("axe=true");
+      },
+      DEADLINE,
+    );
   });
 });
 

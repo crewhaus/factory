@@ -18,4 +18,4 @@ for (const journey of selectJourneys(JOURNEYS, process.env["HANGAR_E2E_SHARD"]))
 
 afterAll(async () => {
   await closeSharedBrowser();
-});
+}, 60_000); // a browser shutting down on a loaded runner

@@ -8,15 +8,80 @@
 /** Header names a recording never keeps, whatever their value. */
 const DROPPED_HEADER = /^(authorization|x-api-key|cookie|set-cookie)$/i;
 /**
- * A name holding any of these anywhere is treated as a credential. This is wider
- * than the product's classifier on purpose: a recording only has to err towards
- * losing a field, and a test that wants one back can read it from another name.
+ * What makes a name a credential, in the vocabulary the product's own name
+ * classifier uses. `record.test.ts` pins this with a corpus of such names. A test
+ * that wants a masked field back can read it from another name.
  */
-const CREDENTIAL_WORDS = ["key", "token", "secret", "password"];
+/** Credential words wherever they appear, even run together (`PGPASSWORD`). */
+const CREDENTIAL_WORDS = [
+  "key",
+  "token",
+  "secret",
+  "password",
+  "passwd",
+  "passphrase",
+  "credential",
+  "authorization",
+  "bearer",
+  "cookie",
+  "mnemonic",
+  "seedphrase",
+  "recoveryphrase",
+  "connectionstring",
+  "connstr",
+  "webhook",
+];
+/** Credential words only when whole: inside others they would take `author`, `path`, `bypass`. */
+const WHOLE_CREDENTIAL_WORDS = new Set([
+  "auth",
+  "auths",
+  "pass",
+  "pwd",
+  "pat",
+  "pats",
+  "creds",
+  "dsn",
+  "otp",
+  "salt",
+]);
+/** A URL under one of these names carries a password in it. */
+const URL_WORDS = new Set(["url", "urls", "uri", "uris"]);
+const URL_OWNERS_WITH_PASSWORDS = new Set([
+  "database",
+  "db",
+  "postgres",
+  "postgresql",
+  "pg",
+  "mysql",
+  "mariadb",
+  "mongo",
+  "mongodb",
+  "redis",
+  "amqp",
+  "rabbitmq",
+  "broker",
+  "smtp",
+]);
+
+/** A name's words, lower-cased: split on separators and camelCase, trailing digits dropped. */
+const wordsOf = (name: string): string[] =>
+  name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z])([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((word) => word.replace(/[0-9]+$/, ""))
+    .filter((word) => word !== "");
 
 const namesCredential = (name: string): boolean => {
-  const lower = name.toLowerCase();
-  return CREDENTIAL_WORDS.some((word) => lower.includes(word));
+  const words = wordsOf(name);
+  const joined = words.join("");
+  return (
+    CREDENTIAL_WORDS.some((word) => joined.includes(word)) ||
+    words.some((word) => WHOLE_CREDENTIAL_WORDS.has(word)) ||
+    (words.some((word) => URL_WORDS.has(word)) &&
+      words.some((word) => URL_OWNERS_WITH_PASSWORDS.has(word)))
+  );
 };
 
 export const MASKED = "[masked]";

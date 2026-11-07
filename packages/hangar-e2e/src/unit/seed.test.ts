@@ -1,5 +1,5 @@
-import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
@@ -8,7 +8,14 @@ import { createSessionStore } from "@crewhaus/session-store";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { loadConsoleGrammar } from "../console-routes";
 import { MARKUP_PAYLOAD, digestFleet, digestTree, seedFleet } from "../seed/fleet";
-import { childEnv, crewhausArgv, parsePrintedUrl, sandboxEnv } from "../system";
+import {
+  childEnv,
+  crewhausArgv,
+  parsePrintedUrl,
+  runCrewhaus,
+  sandboxEnv,
+  spawnHangar,
+} from "../system";
 
 const NOW = Date.UTC(2026, 10, 7, 12, 0, 0);
 const dirs: string[] = [];
@@ -164,6 +171,43 @@ describe("the system half", () => {
     expect(fromSource[1]).toEndWith(join("apps", "cli", "src", "index.ts"));
     expect(crewhausArgv({ CREWHAUS_E2E_BIN: "/opt/crewhaus" })).toEqual(["/opt/crewhaus"]);
     expect(crewhausArgv({ CREWHAUS_E2E_BIN: "" })).toEqual(fromSource);
+  });
+
+  describe("with CREWHAUS_E2E_BIN set in this process, the spawn sites run that binary", () => {
+    /** A stand-in CLI that notes its arguments, so what ran cannot be mistaken. */
+    const standIn = (body: string): { readonly dir: string; readonly marker: string } => {
+      const dir = tempDir();
+      const marker = join(dir, "ran");
+      const bin = join(dir, "crewhaus-stand-in");
+      writeFileSync(bin, `#!/bin/sh\nprintf '%s' "$*" > '${marker}'\n${body}\n`);
+      chmodSync(bin, 0o755);
+      process.env["CREWHAUS_E2E_BIN"] = bin;
+      return { dir, marker };
+    };
+    afterEach(() => {
+      Reflect.deleteProperty(process.env, "CREWHAUS_E2E_BIN");
+    });
+
+    test("runCrewhaus", async () => {
+      const { dir, marker } = standIn("cat > /dev/null\necho from-the-stand-in");
+      const run = await runCrewhaus(dir, childEnv(dir), "hello");
+      expect(run.exitCode).toBe(0);
+      expect(run.stdout).toContain("from-the-stand-in");
+      expect(readFileSync(marker, "utf8")).toBe("run crewhaus.yaml");
+    });
+
+    test("spawnHangar", async () => {
+      const { dir, marker } = standIn(
+        "echo 'http://127.0.0.1:43210/#t=abc123'\ntrap 'exit 0' TERM\nwhile :; do sleep 0.05; done",
+      );
+      const hangar = await spawnHangar(childEnv(dir), dir);
+      try {
+        expect(hangar.port).toBe(43210);
+        expect(readFileSync(marker, "utf8")).toBe("hangar --no-open --port 0");
+      } finally {
+        expect(await hangar.stop()).toBe(0);
+      }
+    });
   });
 
   test("a child's environment keeps registration on and sessions where the console reads them", () => {

@@ -42,11 +42,53 @@ const PAGES = {
       `${sheet}${code}`,
     ),
   },
+  "trap-last": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button>One</button> <button id="trap">Two</button></main>`,
+      `${sheet}${code}`,
+    ),
+  },
+  "trap-only": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button id="trap">Only</button></main>`,
+      `${sheet}${code}`,
+    ),
+  },
+  "trap-cycle": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button id="cycle-first">One</button> <button id="cycle-last">Two</button> <button>Three</button></main>`,
+      `${sheet}${code}`,
+    ),
+  },
+  "negative-tabindex": {
+    html: plantedHtml(
+      `<main><h1>Clean</h1><button>One</button> <button tabindex="-1">Skipped</button> <a tabindex="-1" href="#x">Skipped</a></main>`,
+      sheet,
+    ),
+  },
+  "radio-group": {
+    html: plantedHtml(
+      `<main><h1>Clean</h1><button>One</button> <input type="radio" name="r" aria-label="A"> <input type="radio" name="r" aria-label="B"> <input type="radio" name="r" aria-label="C"></main>`,
+      sheet,
+    ),
+  },
   "no-focus-ring": {
     html: plantedHtml(`<main><h1>Plant</h1><button class="bare">One</button></main>`, sheet),
   },
   "faint-focus-ring": {
     html: plantedHtml(`<main><h1>Plant</h1><button class="faint">One</button></main>`, sheet),
+  },
+  "transparent-focus-ring": {
+    html: plantedHtml(`<main><h1>Plant</h1><button class="clear">One</button></main>`, sheet),
+  },
+  "low-alpha-focus-ring": {
+    html: plantedHtml(`<main><h1>Plant</h1><button class="low-alpha">One</button></main>`, sheet),
+  },
+  "decorative-shadow": {
+    html: plantedHtml(`<main><h1>Plant</h1><button class="decorative">One</button></main>`, sheet),
+  },
+  "shadow-ring": {
+    html: plantedHtml(`<main><h1>Clean</h1><button class="shadow-ring">One</button></main>`, sheet),
   },
   "wide-element": {
     html: plantedHtml(`<main><h1>Plant</h1><div class="too-wide">Wide</div></main>`, sheet),
@@ -95,6 +137,11 @@ const ASSETS = {
     .tiny { width: 8px; height: 8px; padding: 0; border: 0; margin: 0; display: inline-block; }
     .bare:focus, .bare:focus-visible { outline: none; box-shadow: none; }
     .faint:focus, .faint:focus-visible { outline: 2px solid rgb(250, 250, 250); box-shadow: none; }
+    .clear:focus, .clear:focus-visible { outline: 2px solid transparent; box-shadow: none; }
+    .low-alpha:focus, .low-alpha:focus-visible { outline: 2px solid rgba(0, 0, 0, 0.1); box-shadow: none; }
+    .decorative { box-shadow: 0 1px 3px rgb(0, 0, 0); }
+    .decorative:focus, .decorative:focus-visible { outline: none; }
+    .shadow-ring:focus, .shadow-ring:focus-visible { outline: none; box-shadow: 0 0 0 3px rgb(0, 0, 0); }
     .too-wide { width: 400px; }
     .clip { width: 200px; height: 16px; line-height: 16px; overflow: hidden; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -110,6 +157,14 @@ const ASSETS = {
     if (trap !== null) {
       trap.addEventListener("keydown", (event) => {
         if (event.key === "Tab") event.preventDefault();
+      });
+    }
+    const cycleLast = document.getElementById("cycle-last");
+    if (cycleLast !== null) {
+      cycleLast.addEventListener("keydown", (event) => {
+        if (event.key !== "Tab") return;
+        event.preventDefault();
+        document.getElementById("cycle-first")?.focus();
       });
     }
     const open = document.getElementById("open");
@@ -204,26 +259,40 @@ export const a11ySelfTest: Journey = {
       fail("axe", "the blocked inline script raised no CSP violation");
     }
 
-    // keyboard: a trap
-    expectRule(
-      "keyboardTrapFinding",
-      [(await onPage("trap", keyboardTrapFinding)).result],
-      "keyboard-trap",
-    );
-    expectNothing("keyboardTrapFinding", [(await clean(keyboardTrapFinding)).result]);
+    // keyboard: a trap, wherever it sits and whatever shape it takes
+    for (const name of ["trap", "trap-last", "trap-only", "trap-cycle"] as const) {
+      expectRule(
+        `keyboardTrapFinding on ${name}`,
+        [(await onPage(name, keyboardTrapFinding)).result],
+        "keyboard-trap",
+      );
+    }
+    // A negative tabindex is no stop, and a radio group is one.
+    for (const name of ["clean", "negative-tabindex", "radio-group"] as const) {
+      expectNothing(`keyboardTrapFinding on ${name}`, [
+        (await onPage(name, keyboardTrapFinding)).result,
+      ]);
+    }
 
     // keyboard: a visible focus
-    expectRule(
-      "focusVisibleFinding",
-      [(await onPage("no-focus-ring", focusVisibleFinding)).result],
-      "focus-not-visible",
-    );
-    expectRule(
-      "focusVisibleFinding",
-      [(await onPage("faint-focus-ring", focusVisibleFinding)).result],
-      "focus-not-visible",
-    );
-    expectNothing("focusVisibleFinding", [(await clean(focusVisibleFinding)).result]);
+    for (const name of [
+      "no-focus-ring",
+      "faint-focus-ring",
+      "transparent-focus-ring",
+      "low-alpha-focus-ring",
+      "decorative-shadow",
+    ] as const) {
+      expectRule(
+        `focusVisibleFinding on ${name}`,
+        [(await onPage(name, focusVisibleFinding)).result],
+        "focus-not-visible",
+      );
+    }
+    for (const name of ["clean", "shadow-ring"] as const) {
+      expectNothing(`focusVisibleFinding on ${name}`, [
+        (await onPage(name, focusVisibleFinding)).result,
+      ]);
+    }
 
     // keyboard: Escape
     const pressEscape = (page: Page) => escapeFinding(page, "#open", "#overlay");

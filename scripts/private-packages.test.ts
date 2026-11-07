@@ -11,11 +11,11 @@
  *     `@crewhaus/*` and `crewhaus` filters.
  *  2. No publishable package names a private package in `dependencies`,
  *     `peerDependencies` or `optionalDependencies`. Publishing rewrites every
- *     `workspace:` range to the cut version, so such a package would ship pinned to
- *     a name anyone can register.
+ *     `workspace:` range to the cut version, so such a package would ship a
+ *     dependency nobody can install.
  *  3. Any workspace manifest, devDependencies included, names a private package
- *     only as exactly `workspace:*`. These names are unclaimed on npm, so any other
- *     range could resolve to whoever registers one.
+ *     only as exactly `workspace:*`, because a private name resolves only from the
+ *     workspace.
  *
  * The real scripts are run below, so the guard's idea of a stamped name cannot
  * drift from what release-prep does.

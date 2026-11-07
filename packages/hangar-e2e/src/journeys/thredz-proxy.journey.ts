@@ -1,13 +1,14 @@
 /** The console reaches Thredz through the server, and the key stays there. */
 import { fakeThredz } from "service-fakes";
 import { harnessRoute } from "../console-routes";
+import { responseRecorder, unreadResponses, whereReceived } from "../responses";
 import type { Journey } from "./journey";
 
 export const thredzProxy: Journey = {
   id: "thredz-proxy",
   shard: "smoke",
   proves:
-    "A harness wired to Thredz shows its tab through the server's proxy, the server sends the key upstream, and the key never appears in anything the browser receives.",
+    "A harness wired to Thredz shows its tab through the server's proxy, the server sends the key upstream, and from before sign-in on the key is in no response header or body the browser receives.",
   run: async (scope) => {
     // The tab opens on the wiki list, which the status defaults do not cover.
     const thredz = fakeThredz({
@@ -26,14 +27,9 @@ export const thredzProxy: Journey = {
     });
     const [harness] = fleet.harnesses;
     if (harness === undefined) throw new Error("the Thredz fleet has no harness");
-    const session = await scope.session(scope.home(fleet));
-
-    const bodies: Array<Promise<string>> = [];
-    session.page.on("response", (response) => {
-      if (new URL(response.url()).pathname.startsWith("/api/")) {
-        bodies.push(response.text().catch(() => ""));
-      }
-    });
+    // From before sign-in, because the first load is when the harness list arrives.
+    const recorder = responseRecorder();
+    const session = await scope.session(scope.home(fleet), { onResponse: recorder.observe });
     await session.visit(harnessRoute(harness.id, "thredz"));
     session.assertClean();
     // With a key and an answering workspace, there is no refusal to show.
@@ -50,11 +46,20 @@ export const thredzProxy: Journey = {
     if (stats.apiKeyHeader !== "present" && stats.authorization !== "present") {
       throw new Error("the server called Thredz without the key");
     }
-    const responses = await Promise.all(bodies);
-    if (responses.length === 0) throw new Error("no API response was read, so nothing was checked");
-    if (responses.some((body) => body.includes(key))) {
-      throw new Error("the key reached the browser in an API response");
+
+    const responses = await recorder.received();
+    const unread = unreadResponses(responses);
+    if (unread.length > 0) throw new Error(`these responses went unread: ${unread.join(", ")}`);
+    // The search that finds nothing below must be able to find something: the
+    // harness list carries the id, and every response carries a content type.
+    if (!whereReceived(responses, harness.id).includes("body of /api/harnesses")) {
+      throw new Error("the harness list was not read, so the first load was not checked");
     }
+    if (!whereReceived(responses, "text/html").some((place) => place.includes(" header of "))) {
+      throw new Error("no response header was read, so headers were not checked");
+    }
+    const leaks = whereReceived(responses, key);
+    if (leaks.length > 0) throw new Error(`the key reached the browser: ${leaks.join(", ")}`);
     if ((await session.page.content()).includes(key)) {
       throw new Error("the key reached the browser in the document");
     }

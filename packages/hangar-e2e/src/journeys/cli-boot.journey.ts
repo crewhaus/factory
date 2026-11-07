@@ -30,6 +30,8 @@ export const cliBoot: Journey = {
       throw new Error(`the Library does not show ${specName}`);
     }
     session.assertClean();
+    // Before the server goes, or the page's next request failing would be a failure.
+    await session.close();
 
     stopped = true;
     const exitCode = await hangar.stop();

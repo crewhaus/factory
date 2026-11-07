@@ -25,13 +25,17 @@ export type JourneyScope = {
   fleet(opts: Omit<SeedFleetOptions, "now"> & { readonly now?: number }): Promise<Fleet>;
   /** Boot Home over a fleet. */
   home(fleet: Fleet): Home;
-  /** Open a session, closed afterwards. A failed journey keeps its trace. */
+  /**
+   * Open a session, closed afterwards. A failed journey keeps its trace. When the
+   * journey ends, the session failing fails the journey, even if the journey never
+   * asked or the failure came after it last asked.
+   */
   session(home: HomeAddress, opts?: OpenSessionOptions): Promise<Session>;
   /** Run this when the journey ends. */
   defer(cleanup: () => Promise<void> | void): void;
 };
 
-/** Run a journey in a fresh scope, and close everything it opened. */
+/** Run a journey in a fresh scope, check every session it opened, and close everything. */
 export async function runJourney(journey: Journey): Promise<void> {
   const cleanups: Array<() => Promise<void> | void> = [];
   const sessions: Session[] = [];
@@ -59,6 +63,7 @@ export async function runJourney(journey: Journey): Promise<void> {
   let failed = false;
   try {
     await journey.run(scope);
+    for (const session of sessions) session.assertClean();
   } catch (error) {
     failed = true;
     throw error;

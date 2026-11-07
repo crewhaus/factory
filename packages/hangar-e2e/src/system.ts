@@ -8,7 +8,10 @@ import type { HomeAddress } from "./session";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 
-/** How to start the CLI. */
+/**
+ * How to start the CLI. Callers leave `env` alone so it reads this process's
+ * environment: a child's is spelled out, and does not carry the variable.
+ */
 export function crewhausArgv(env: Readonly<Record<string, string | undefined>> = process.env) {
   const bin = env["CREWHAUS_E2E_BIN"];
   if (bin !== undefined && bin !== "") return [bin];
@@ -68,7 +71,7 @@ export async function spawnHangar(
   env: Readonly<Record<string, string>>,
   cwd?: string,
 ): Promise<SpawnedHangar> {
-  const child = Bun.spawn([...crewhausArgv(env), "hangar", "--no-open", "--port", "0"], {
+  const child = Bun.spawn([...crewhausArgv(), "hangar", "--no-open", "--port", "0"], {
     env: { ...env },
     ...(cwd !== undefined ? { cwd } : {}),
     stdout: "pipe",
@@ -121,7 +124,7 @@ export async function runCrewhaus(
   env: Readonly<Record<string, string>>,
   prompt: string,
 ): Promise<CompletedRun> {
-  const child = Bun.spawn([...crewhausArgv(env), "run", "crewhaus.yaml"], {
+  const child = Bun.spawn([...crewhausArgv(), "run", "crewhaus.yaml"], {
     cwd: harnessDir,
     env: { ...env },
     stdin: "pipe",

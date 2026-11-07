@@ -6,7 +6,7 @@
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { Browser, BrowserContext, Page } from "playwright";
+import type { Browser, BrowserContext, Page, Response } from "playwright";
 import { settle, trackInFlight } from "./settle";
 
 /** All a session reads from a Home. `session-self-test` aims it at its own server. */
@@ -37,6 +37,8 @@ export type OpenSessionOptions = {
   readonly reducedMotion?: "reduce" | "no-preference";
   /** The console theme, set before the app reads it. */
   readonly theme?: "dark" | "light";
+  /** Sees every response from before sign-in, which a listener added later would miss. */
+  readonly onResponse?: (response: Response) => void;
 };
 
 export type Session = {
@@ -177,6 +179,7 @@ export async function openSession(
 
   const page = await context.newPage();
   trackInFlight(page);
+  if (opts.onResponse !== undefined) page.on("response", opts.onResponse);
   page.on("request", (request) => {
     requests += 1;
     if (request.resourceType() === "script") jsModules += 1;

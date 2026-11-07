@@ -10,8 +10,8 @@ It has no dependencies, so any package's own tests can start a fake with no cycl
 { "devDependencies": { "service-fakes": "workspace:*" } }
 ```
 
-Always `workspace:*`. The name is not claimed on npm, so a semver range could resolve to whoever
-registers it, and `scripts/private-packages.test.ts` fails on anything else.
+Always `workspace:*`, so this package only ever resolves to the copy in this repo;
+`scripts/private-packages.test.ts` fails on anything else.
 
 ## The fakes
 

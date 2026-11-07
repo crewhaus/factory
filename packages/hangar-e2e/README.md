@@ -21,8 +21,9 @@ which runs each shard beside `ci`. `HANGAR_E2E_ARTIFACTS` names where traces and
   and recording notification sinks. **`system.ts`** runs the real CLI instead, from source or from
   the binary `CREWHAUS_E2E_BIN` names.
 - **`session.ts`** is the one file that knows how sign-in works. A session fails on a console error, a
-  page error, a CSP violation, a failed asset, any 5xx, or the script-execution sentinel, so a journey
-  cannot pass over a page that broke along the way.
+  page error, a CSP violation, a failed asset, any 5xx, or the script-execution sentinel. `runJourney`
+  checks every session a journey opened through its scope when the journey ends, so a journey cannot
+  pass over a page that broke along the way.
 - **`settle.ts`** is the one function that knows when a screen has finished arriving.
   **`console-routes.ts`** is the one file that knows the route grammar, and takes its lists from the
   real router.
