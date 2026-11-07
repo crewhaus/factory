@@ -11,7 +11,6 @@ import { randomBytes } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { withFileLock } from "@crewhaus/infra-utils";
 import {
   type SafeFsFailure,
   ensureDirContained,
@@ -19,7 +18,7 @@ import {
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import { readWholeRecord } from "./fail-closed";
-import { refusal } from "./io";
+import { refusal, withControlLock } from "./io";
 import { controlPaths } from "./paths";
 
 const LEASE_MAX_BYTES = 64 * 1024;
@@ -183,20 +182,16 @@ async function breakAndPublish(
   const dir = ensureDirContained(harnessDir, dirname(paths.lockFile), { mode: 0o700 });
   if (!dir.ok) return dir;
   try {
-    return await withFileLock(
-      join(dir.real, basename(paths.lockFile)),
-      async () => {
-        const now = readMutatingLease(harnessDir);
-        if (now.state === "present" && now.lease.leaseRef === judged.leaseRef) {
-          removeLeaseFile(harnessDir, paths.mutatingLeaseFile);
-        }
-        return writeFileSafe(harnessDir, paths.mutatingLeaseFile, text, {
-          overwrite: false,
-          mode: 0o600,
-        });
-      },
-      { label: "control-records" },
-    );
+    return await withControlLock(join(dir.real, basename(paths.lockFile)), async () => {
+      const now = readMutatingLease(harnessDir);
+      if (now.state === "present" && now.lease.leaseRef === judged.leaseRef) {
+        removeLeaseFile(harnessDir, paths.mutatingLeaseFile);
+      }
+      return writeFileSafe(harnessDir, paths.mutatingLeaseFile, text, {
+        overwrite: false,
+        mode: 0o600,
+      });
+    });
   } catch (err) {
     // The lock is refused or held past its wait: its message names the path and the holder.
     return refusal(

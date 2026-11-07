@@ -5,7 +5,7 @@ import { type CursorSources, decodeCursor, encodeCursor } from "@crewhaus/contro
 import { resume, snapshotAt } from "./cursor";
 import { _setIoTapForTest } from "./io";
 import { append } from "./ledger";
-import { _setRollBytesForTest } from "./segments";
+import { _setRollBytesForTest, segmentRel } from "./segments";
 import { readPage } from "./tail";
 import {
   deploymentsLedger,
@@ -376,7 +376,7 @@ describe("resume", () => {
 });
 
 describe("snapshotAt", () => {
-  test("list, then resume from snapshotAt, with an append between: no gap and no duplicate", () => {
+  test("list, then resume from snapshotAt, with an append after the page: no gap and no duplicate", () => {
     const root = tempDir();
     const runs = runsLedger(root);
     for (const n of [1, 2]) append(runs, { n });
@@ -387,17 +387,42 @@ describe("snapshotAt", () => {
     expect(answer.items.map((i) => i.kind === "line" && i.record["n"])).toEqual([3]);
   });
 
-  test("a line landing between the snapshot and the page is ignored by the page", () => {
+  test("a line landing between the snapshot and the page's scan is ignored by the page, and resumed once", () => {
     const root = tempDir();
     const runs = runsLedger(root);
-    append(runs, { n: 1 });
-    const before = readPage(runs, { limit: 10 });
-    append(runs, { n: 2 });
-    // The next page's own snapshot includes it; the first one's did not.
-    const after = readPage(runs, { limit: 10 });
-    expect(before.items).toHaveLength(1);
-    expect(after.items).toHaveLength(2);
-    expect(before.snapshotAt[0]?.off).toBeLessThan(after.snapshotAt[0]?.off ?? 0);
+    for (const n of [1, 2]) append(runs, { n });
+    const rel = segmentRel(runs.records, 1);
+    // How many times one page opens the newest segment: its snapshot first, its scan last.
+    let opens = 0;
+    _setIoTapForTest({
+      open: (given) => {
+        if (given === rel) opens += 1;
+      },
+    });
+    readPage(runs, { limit: 10 });
+    expect(opens).toBeGreaterThanOrEqual(2);
+    const scanOpen = opens;
+
+    // Now land a line just before the scan opens the segment, after the snapshot was taken.
+    let seen = 0;
+    let appending = false;
+    _setIoTapForTest({
+      open: (given) => {
+        if (appending || given !== rel) return;
+        seen += 1;
+        if (seen !== scanOpen) return;
+        appending = true;
+        expect(append(runs, { n: 3 })).toMatchObject({ ok: true, seg: 1 });
+        appending = false;
+      },
+    });
+    const page = readPage(runs, { limit: 10 });
+    _setIoTapForTest(undefined);
+    expect(seen).toBe(scanOpen);
+    expect(page.items.map((i) => i.record["n"])).toEqual([2, 1]);
+    const answer = resume({ runs }, { runs: page.snapshotAt }, CAPS);
+    expect(answer.items.map((i) => i.kind === "line" && i.record["n"])).toEqual([3]);
+    expect(resume({ runs }, answer.next, CAPS).items).toEqual([]);
   });
 
   test("the snapshot ends at the last complete line, before a torn one", () => {

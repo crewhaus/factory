@@ -11,12 +11,13 @@
  * the first line, and only the caller answered `won: true` may perform the effect.
  *
  * A refused publish or append answers tool-safety's `SafeFsFailure`. A lock that cannot
- * be taken rejects with `withFileLock`'s own error, its message intact.
+ * be taken rejects with `withFileLock`'s own error, its message intact; anything but a
+ * regular file at the lock's name is refused before the lock is created, in the same words.
  */
 import { closeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { MACHINES, canTransition } from "@crewhaus/control-contract";
-import { type AcquireFileLockOptions, withFileLock } from "@crewhaus/infra-utils";
+import type { AcquireFileLockOptions } from "@crewhaus/infra-utils";
 import {
   type SafeFsFailure,
   appendContained,
@@ -31,6 +32,7 @@ import {
   readAt,
   readRecordFile,
   refusal,
+  withControlLock,
 } from "./io";
 import { classifyLine, scanForward } from "./lines";
 import type { Ledger } from "./paths";
@@ -146,13 +148,13 @@ export async function withLedgerLock<T>(
   const seam = seams;
   const dir = ensureDirContained(ledger.root, dirname(ledger.lock), { mode: 0o700 });
   if (!dir.ok) return dir;
-  return withFileLock(
+  return withControlLock(
     join(dir.real, basename(ledger.lock)),
     async () => {
       await seam.afterLock?.();
       return fn(lockedAppendFor(ledger));
     },
-    { label: "control-records", ...seam.lockOptions },
+    seam.lockOptions,
   );
 }
 

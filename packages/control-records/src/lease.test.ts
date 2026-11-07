@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { join } from "node:path";
 import {
   type LeaseProbe,
   type LeaseRecord,
@@ -350,6 +351,21 @@ describe("readMutatingLease", () => {
     const root = tempDir();
     plant(leaseFile(root), "garbage");
     expect(readMutatingLease(root).state).toBe("unreadable");
+  });
+
+  test("a file anywhere up its path is unreadable, not absent", () => {
+    const places = [
+      (root: string) => controlFile(root, "leases"),
+      (root: string) => controlFile(root),
+      (root: string) => join(root, ".crewhaus", "run"),
+      (root: string) => join(root, ".crewhaus"),
+    ];
+    for (const place of places) {
+      const root = tempDir();
+      plant(place(root), "not a directory");
+      const read = readMutatingLease(root);
+      expect(read.state === "unreadable" && read.reason).toContain("is not a directory");
+    }
   });
 
   test("each malformed field is unreadable", () => {

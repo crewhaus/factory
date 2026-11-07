@@ -60,7 +60,8 @@ next touch, and that repair can race a slow but live winner, so a claim's record
 
 Generation claims are keyed by `id` alone, so ledgers that share a claims directory must not reuse an
 id. A refused publish or append answers tool-safety's `SafeFsFailure`. A lock that cannot be taken rejects
-with `withFileLock`'s own error, its message intact.
+with `withFileLock`'s own error, its message intact. Anything but a regular file at the lock's name is
+refused in the same words before the lock is created, so no OS creates the lock through a link.
 
 **Segments.** A writer appends to the highest-numbered `NNNNNN.jsonl`. Past 8 MiB, the writer targets
 the next number and creates it exclusively; a racing roller appends to the same new file. Nothing is
@@ -88,8 +89,8 @@ the HTTP layer.
 
 Both readers are synchronous, take no lock, create nothing and consult no environment variable. Each
 caches for one second per path by an injected clock, through its `create…Reader`. Absent is not an error. A file that is empty, torn, over its cap, a
-link, a directory or otherwise not the record is **unreadable**, and the reason names the file and the
-fault, never a value from it.
+link, a directory or otherwise not the record is **unreadable**, and so is a missing file with a regular
+file anywhere up its path inside the root. The reason names the file and the fault, never a value from it.
 
 | Export | Contract | First consumer |
 |---|---|---|
@@ -141,7 +142,7 @@ harness-supervisor's `ProcessOps`. This package never imports harness-supervisor
 2. Every path is resolved inside its root through `@crewhaus/tool-safety/fs`. Nothing is written
    through a link planted at a record's name.
 3. No `mkdirSync({recursive: true})` on a record path. Directories are made one contained component at
-   a time, and the lock is handed a physical path.
+   a time, and the lock is handed a physical path, checked to be a regular file or nothing.
 4. Time, sleep, process probes and the roll threshold are injected or seamed, so tests count work and
    never wait on a clock.
 5. Every refusal is typed and names its reason.

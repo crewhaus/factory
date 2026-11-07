@@ -119,6 +119,7 @@ export const UNREADABLE_OPERATOR: Readonly<Record<string, (root: string) => void
   directory: (root) => mkdirSync(controlFile(root, "operator.json"), { recursive: true }),
   "a file where its directory goes": (root) => plant(controlFile(root), "not a directory"),
   "a file further up its path": (root) => plant(join(root, ".crewhaus", "run"), "not a directory"),
+  "a file at the top of its path": (root) => plant(join(root, ".crewhaus"), "not a directory"),
 };
 
 /** A promise a test opens by hand, to hold a writer at a hook. */

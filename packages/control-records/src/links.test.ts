@@ -5,6 +5,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { linkSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { createApproverReader } from "./approvers";
 import { resume } from "./cursor";
@@ -122,6 +123,29 @@ for (const target of ["dangling", "existing"] as const) {
         /not a lock file/,
       );
       await expect(casAppend(ledger, "x", null, { state: "a" })).rejects.toThrow(/not a lock file/);
+      at.nothingEscaped();
+    });
+
+    test("at the lock: breaking a dead lease holder is refused, message intact", async () => {
+      const at = plantLink((root) => controlFile(root, "lock"), target);
+      const dead = {
+        v: 1,
+        pid: 4242,
+        host: hostname(),
+        head: "cli",
+        kind: "optimize",
+        acquiredAt: "2026-11-07T00:00:00.000Z",
+        leaseRef: "aaaa",
+      };
+      plant(controlFile(at.root, "leases/mutating.json"), jsonLine(dead));
+      const answer = await acquireMutatingLease(
+        at.root,
+        { head: "cli", kind: "eval" },
+        { waitMs: 0, probe: { isAlive: () => false, startTimeMs: () => undefined } },
+      );
+      expect(answer).toMatchObject({ ok: false, code: "io-error" });
+      expect("reason" in answer && answer.reason).toMatch(/not a lock file/);
+      expect(readMutatingLease(at.root)).toMatchObject({ state: "present", lease: dead });
       at.nothingEscaped();
     });
 

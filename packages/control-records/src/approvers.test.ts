@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   type ApproverProjection,
   type DecisionRecordView,
@@ -61,6 +62,8 @@ const UNREADABLE: Readonly<Record<string, (root: string) => void>> = {
   },
   directory: (root) => mkdirSync(controlFile(root, "approvers.json"), { recursive: true }),
   "a file where its directory goes": (root) => plant(controlFile(root), "not a directory"),
+  "a file further up its path": (root) => plant(join(root, ".crewhaus", "run"), "not a directory"),
+  "a file at the top of its path": (root) => plant(join(root, ".crewhaus"), "not a directory"),
 };
 
 const BAD_BODIES: Readonly<Record<string, unknown>> = {

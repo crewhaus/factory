@@ -5,7 +5,7 @@
  * unreadable, and its reason names the file and the fault, never a value from it.
  */
 import { lstatSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { resolveContained } from "@crewhaus/tool-safety/fs";
 import { decodeStrict, parseObject, readRecordFile } from "./io";
 
@@ -16,15 +16,30 @@ export type WholeFileRead =
   | { readonly state: "body"; readonly body: Record<string, unknown> }
   | { readonly state: "unreadable"; readonly reason: string };
 
-/** Something else stands where the record's directory goes, so "not there" would be a guess. */
+/**
+ * Something else stands where the record's directory goes, so "not there" would be a
+ * guess. Every ancestor of the record inside the root is judged, shallowest first, each
+ * realpath-contained: the first that is missing makes the record absent, and the first
+ * that exists and is not a directory makes it unreadable. Walking the path, rather than
+ * judging the record's own directory, gives one answer on every OS: a path through a
+ * regular file is ENOTDIR on POSIX and ENOENT on Windows.
+ */
 function parentIsNotDirectory(root: string, rel: string): boolean {
-  const at = resolveContained(root, dirname(rel));
-  if (!at.ok) return false;
-  try {
-    return !lstatSync(at.real).isDirectory();
-  } catch (err) {
-    return (err as { code?: unknown }).code === "ENOTDIR";
+  const parts = dirname(rel)
+    .split(/[\\/]/)
+    .filter((part) => part !== "" && part !== ".");
+  let prefix = "";
+  for (const part of parts) {
+    prefix = prefix === "" ? part : join(prefix, part);
+    const at = resolveContained(root, prefix, { followLeaf: true });
+    if (!at.ok) return false;
+    try {
+      if (!lstatSync(at.real).isDirectory()) return true;
+    } catch (err) {
+      return (err as { code?: unknown }).code === "ENOTDIR";
+    }
   }
+  return false;
 }
 
 /** One JSON object file, up to `maxBytes`. A link, a directory or a torn file is unreadable. */

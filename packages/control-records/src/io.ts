@@ -3,7 +3,8 @@
  * the work. tool-safety's own hooks are not reachable from `./fs`, so the count
  * is taken here, one step before them.
  */
-import { readSync } from "node:fs";
+import { type Stats, lstatSync, readSync } from "node:fs";
+import { type AcquireFileLockOptions, withFileLock } from "@crewhaus/infra-utils";
 import {
   type ContainedFd,
   type ContainedRead,
@@ -100,4 +101,42 @@ export function requireCap(name: string, value: number): void {
   if (typeof value !== "number" || Number.isNaN(value) || value < 0) {
     throw new RangeError(`control-records: ${name} must be a number >= 0, got ${String(value)}`);
   }
+}
+
+const LOCK_LABEL = "control-records";
+
+function describeEntry(entry: Stats): string {
+  if (entry.isSymbolicLink()) return "a symbolic link";
+  if (entry.isFIFO()) return "a FIFO";
+  if (entry.isDirectory()) return "a directory";
+  if (entry.isSocket()) return "a socket";
+  if (entry.isCharacterDevice() || entry.isBlockDevice()) return "a device";
+  return "not a regular file";
+}
+
+/**
+ * `withFileLock` at `lockPath`, the physical path inside a directory the caller made
+ * contained. Anything but a regular file at the lock's name is refused BEFORE the lock
+ * is created, with file-lock's own wording: file-lock judges the name only after its
+ * exclusive create fails, and on Windows that create follows a dangling link and makes
+ * the file the link points at, outside the root.
+ */
+export async function withControlLock<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+  options: AcquireFileLockOptions = {},
+): Promise<T> {
+  let entry: Stats | undefined;
+  try {
+    entry = lstatSync(lockPath);
+  } catch {
+    // Nothing there (or nothing judgeable): file-lock's exclusive create decides.
+  }
+  if (entry !== undefined && !entry.isFile()) {
+    const label = options.label ?? LOCK_LABEL;
+    throw new Error(
+      `${label}: ${lockPath} is ${describeEntry(entry)}, not a lock file — refusing to wait on it, remove it or read it. If nothing should be there, delete it and retry.`,
+    );
+  }
+  return withFileLock(lockPath, fn, { label: LOCK_LABEL, ...options });
 }
