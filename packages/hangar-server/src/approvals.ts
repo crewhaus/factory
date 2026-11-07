@@ -7,8 +7,11 @@
  * exactly like `SessionStore.list()`'s TTL eviction. An inbox is polled;
  * polling must never rewrite an operator's approvals ledger. So reads fold
  * the JSONL directly — last-wins by `id`, the upsert rule `persist`
- * documents — through the capped, torn-tolerant reader every other view in
- * this package uses.
+ * documents — through control-records' tail reader, under the same caps as
+ * every other view in this package but from the file's NEWEST end, so a large
+ * file shows its latest asks, and an ask decided near the end of the file
+ * never reads as pending. A final line with no newline is a write still
+ * landing: it waits for the next read.
  *
  * WRITES GO THROUGH THE SANCTIONED STORE. Grant and deny call
  * `createPendingApprovalStore(...).resolve(id, decision, by)`, which appends
@@ -24,15 +27,15 @@
  * the root the same env-override-aware, containment-checked way the sessions
  * browser does (§3.7).
  */
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVAL_ID_RE } from "@crewhaus/control-contract";
+import { readTail } from "@crewhaus/control-records";
 import {
   type ApprovalDecision,
   type PendingApproval,
   createPendingApprovalStore,
 } from "@crewhaus/session-store";
-import { readJsonlCapped } from "./jsonl";
+import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
 import { maskDeep } from "./mask";
 import { resolveContained } from "./safety";
 import { resolveSessionRoot } from "./sessions";
@@ -105,23 +108,21 @@ function statusOf(a: PendingApproval): ApprovalRow["status"] {
   return "pending";
 }
 
-/** The approvals log for a harness, containment-checked at its RESOLVED
- *  session root (undefined when the root escapes the harness dir). */
-export function approvalsPathFor(harnessDir: string): string | undefined {
-  const { root } = resolveSessionRoot(harnessDir);
-  return resolveContained(root, APPROVALS_FILENAME);
-}
-
-/** Fold one harness's approvals log. Never compacts, never evicts. */
+/** Fold one harness's approvals log. Never compacts, never evicts. The log is
+ *  contained at its RESOLVED session root, which may itself be a link, as the
+ *  sessions browser's is; a log that is a link out of that root lists nothing. */
 export function foldApprovals(harnessDir: string): {
   readonly approvals: readonly PendingApproval[];
   readonly truncated: boolean;
 } {
-  const path = approvalsPathFor(harnessDir);
-  if (path === undefined || !existsSync(path)) return { approvals: [], truncated: false };
-  const read = readJsonlCapped(path);
+  const read = readTail(resolveSessionRoot(harnessDir).root, APPROVALS_FILENAME, {
+    maxLines: MAX_JSONL_LINES,
+    maxBytes: MAX_JSONL_BYTES,
+    followLeafSymlink: true,
+  });
+  if (read.state !== "read") return { approvals: [], truncated: false };
   const byId = new Map<string, PendingApproval>();
-  for (const obj of read.objects) {
+  for (const obj of read.records) {
     if (isApprovalShape(obj)) byId.set(obj.id, obj);
   }
   return { approvals: [...byId.values()], truncated: read.truncated };
