@@ -34,12 +34,14 @@ import { CrewhausError } from "@crewhaus/errors";
 import { type Spec, parseSpec } from "@crewhaus/spec";
 import { isCollection, isSeq, parse, parseDocument } from "yaml";
 import { z } from "zod";
+import { DELTA_090_KEYS } from "./owner-keys";
 import { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
 
 // Re-exported so downstream renderers (the CLI changelog, future reporters)
 // can apply the SAME redaction to strings the differ never sees (rationales,
 // free-form provenance) without duplicating the pattern table a third time.
 export { REDACTED_VALUE, isCredentialKey, maskCredentialTokens } from "./redact";
+export { DELTA_090_KEYS, type OwnerKey } from "./owner-keys";
 
 export class SpecPatchError extends CrewhausError {
   override readonly name = "SpecPatchError";
@@ -225,7 +227,11 @@ export function validatePatch(spec: Spec, patch: SpecPatch): void {
   const refused = refusedLeafIn(patch.path);
   if (refused !== undefined) {
     throw new SpecPatchError(
-      `path ${formatPath(patch.path)} is not optimizable on any target: ${refusedLeafReason(refused)} (an OPTIMIZER_REFUSED_LEAVES row — no OPTIMIZABLE_PATHS entry can admit it)`,
+      `path ${formatPath(patch.path)} is not optimizable on any target: ${refusedLeafReason(refused)} (an ${
+        OPTIMIZER_REFUSED_ROOTS.includes(refused)
+          ? "OPTIMIZER_REFUSED_ROOTS"
+          : "OPTIMIZER_REFUSED_LEAVES"
+      } row — no OPTIMIZABLE_PATHS entry can admit it)`,
     );
   }
   if (!isOptimizable(spec.target, patch.path)) {
@@ -1202,6 +1208,8 @@ export const STRUCTURAL_SEGMENTS: ReadonlyArray<string> = Object.freeze([
 export const HUMAN_OWNED_PATHS: ReadonlyArray<{
   readonly pattern: ReadonlyArray<string>;
   readonly reason: string;
+  /** Match from the document root only, instead of a contiguous run anywhere. */
+  readonly root?: true;
 }> = Object.freeze([
   // -- the roster (already excluded today; the 0.6.0 per-candidate fields
   //    ride inside it, including `enabled`) --
@@ -1478,12 +1486,20 @@ export const HUMAN_OWNED_PATHS: ReadonlyArray<{
     reason:
       "the waiver judge's roster is never auto-patched, its model is spend, and allow_self_judge is a measurement waiver",
   },
+  // Every owner-keys row, derived: a new key adds its row to that table only.
+  ...DELTA_090_KEYS.map((key) => ({
+    pattern: key.pattern,
+    reason: key.reason,
+    ...(key.root === true ? { root: true as const } : {}),
+  })),
 ]);
 
 /** A leaf path is human-owned when some {@link HUMAN_OWNED_PATHS} row matches it. */
 export function humanOwnedReason(path: ReadonlyArray<SpecEditPathSegment>): string | undefined {
   for (const row of HUMAN_OWNED_PATHS) {
-    if (containsPattern(path, row.pattern)) return row.reason;
+    const matches =
+      row.root === true ? entryIsPrefixOf(row.pattern, path) : containsPattern(path, row.pattern);
+    if (matches) return row.reason;
   }
   return undefined;
 }
@@ -1622,7 +1638,18 @@ export const OPTIMIZER_REFUSED_LEAVES: ReadonlyArray<ReadonlyArray<string>> = Ob
   Object.freeze(["model_pool", "learning", "seed"]),
   Object.freeze(["provability", "level"]),
   Object.freeze(["provability", "on_fail"]),
+  ...DELTA_090_KEYS.filter((key) => key.refused && key.root !== true).map((key) => key.pattern),
 ]);
+
+/**
+ * The refused paths matched from the document ROOT, derived from the owner-keys
+ * table: a patch at the row or anywhere inside it is refused on every target,
+ * while the same name deeper down (a graph node or crew role called `intent`)
+ * is not. {@link OPTIMIZER_REFUSED_LEAVES} keeps its contiguous-run meaning.
+ */
+export const OPTIMIZER_REFUSED_ROOTS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze(
+  DELTA_090_KEYS.filter((key) => key.refused && key.root === true).map((key) => key.pattern),
+);
 
 /**
  * Why each {@link OPTIMIZER_REFUSED_LEAVES} row is refused — what
@@ -1636,6 +1663,9 @@ const REFUSED_LEAF_REASONS: Readonly<Record<string, string>> = Object.freeze({
     "the provability floor is the bar the optimizer is graded against — moving it would blind the critic (design §9.2)",
   "provability.on_fail":
     "what a below-floor answer becomes (retry / halt / note / escalate) is human-owned semantics the optimizer is graded under (design §9.2)",
+  ...Object.fromEntries(
+    DELTA_090_KEYS.filter((key) => key.refused).map((key) => [key.pattern.join("."), key.reason]),
+  ),
 });
 
 function refusedLeafReason(pattern: ReadonlyArray<string>): string {
@@ -1644,17 +1674,22 @@ function refusedLeafReason(pattern: ReadonlyArray<string>): string {
   );
 }
 
-/** The {@link OPTIMIZER_REFUSED_LEAVES} row `path` contains as a contiguous run, if any. */
+/**
+ * The {@link OPTIMIZER_REFUSED_LEAVES} row `path` contains as a contiguous run,
+ * or the {@link OPTIMIZER_REFUSED_ROOTS} row `path` starts with, if any.
+ */
 function refusedLeafIn(
   path: ReadonlyArray<SpecEditPathSegment>,
 ): ReadonlyArray<string> | undefined {
   const segs = path.map((s) => String(s));
-  return OPTIMIZER_REFUSED_LEAVES.find((pattern) =>
-    segs.some((_s, i) => pattern.every((p, j) => segs[i + j] === p)),
+  return (
+    OPTIMIZER_REFUSED_LEAVES.find((pattern) =>
+      segs.some((_s, i) => pattern.every((p, j) => segs[i + j] === p)),
+    ) ?? OPTIMIZER_REFUSED_ROOTS.find((pattern) => pattern.every((p, j) => segs[j] === p))
   );
 }
 
-/** True when `path` contains one of {@link OPTIMIZER_REFUSED_LEAVES} as a contiguous run. */
+/** True when {@link refusedLeafIn} finds a row for `path`. */
 function isRefusedLeaf(path: ReadonlyArray<SpecEditPathSegment>): boolean {
   return refusedLeafIn(path) !== undefined;
 }
