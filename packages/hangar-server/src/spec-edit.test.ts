@@ -22,6 +22,7 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
 import {
   lintMcpEnv,
   looksLikeCredential,
@@ -32,6 +33,7 @@ import {
 } from "./builders";
 import { makeFixtureHarness } from "./fixture";
 import {
+  SECURITY_SURFACES,
   classifyPath,
   declaredPaths,
   effectiveConfig,
@@ -149,6 +151,41 @@ describe("trust tiers", () => {
     // different questions, and the badge's reason says which is which.
     expect(isAutoTunable("cli", ["transaction_policy"])).toBe(true);
     expect(classifyPath("cli", ["transaction_policy"]).reason).toContain("typed confirmation");
+  });
+
+  test("tool_config and intent are security surfaces wherever a shape places them", () => {
+    const surfaces: ReadonlyArray<readonly [string, readonly string[]]> = [
+      ["cli", ["intent", "purpose"]],
+      ["cli", ["intent"]],
+      ["cli", ["tool_config", "http"]],
+      ["channel", ["agent", "tool_config", "http"]],
+      ["managed", ["agent", "tool_config", "http"]],
+      ["workflow", ["steps", "0", "tool_config", "http"]],
+      ["graph", ["nodes", "classify", "tool_config", "http"]],
+      ["crew", ["roles", "writer", "tool_config", "http"]],
+      ["cli", ["agent", "sub_agents", "helper", "tool_config", "http"]],
+    ];
+    for (const [target, path] of surfaces) {
+      expect(classifyPath(target, path).securitySurface, path.join(".")).toBe(true);
+    }
+  });
+
+  test("a graph node called intent is not the intent block", () => {
+    expect(classifyPath("graph", ["nodes", "intent", "instructions"]).securitySurface).toBe(false);
+    expect(classifyPath("crew", ["roles", "intent", "instructions"]).securitySurface).toBe(false);
+  });
+
+  test("the security rows of the owner-keys table are the tail of SECURITY_SURFACES", () => {
+    const rows = DELTA_090_KEYS.filter((key) => key.security);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(SECURITY_SURFACES.slice(-rows.length)).toEqual(
+      rows.map((key) => ({
+        prefix: key.pattern,
+        reason: key.reason,
+        ...(key.root === true ? {} : { anywhere: true as const }),
+      })),
+    );
+    expect(SECURITY_SURFACES.filter((row) => row.prefix.join(".") === "intent").length).toBe(1);
   });
 
   test("a container of tunable fields is itself human-owned, and says why", () => {
@@ -478,6 +515,44 @@ describe("the structured editor", () => {
       expect(String(body["error"])).toContain("permissions.mode");
       expect(String(body["error"])).toContain("/spec/propose");
       expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("an intent edit is refused without the typed confirmation, and leaves the file as it was", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "intent-gate");
+      const id = await register(t, dir);
+      const before = readFileSync(join(dir, "crewhaus.yaml"), "utf8");
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({ edits: [{ path: "intent.purpose", value: "Keep it fast." }] }),
+      );
+      expect(status).toBe(409);
+      expect(String(body["error"])).toContain("intent.purpose");
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toBe(before);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the intent edit applies once the operator types the spec name", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "intent-confirmed");
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/spec`,
+        put({
+          edits: [{ path: "intent.purpose", value: "Keep it fast." }],
+          confirmName: "spec-edit-fixture",
+        }),
+      );
+      expect(status).toBe(200);
+      expect(body["applied"]).toBe(1);
+      expect(readFileSync(join(dir, "crewhaus.yaml"), "utf8")).toContain("purpose: Keep it fast.");
     } finally {
       await t.stop();
     }

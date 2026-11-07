@@ -208,9 +208,17 @@ for destructive verbs.
 
 **Every M3 read answers `{present, note, verb, …}`.** Those three fields are
 the arguments the console's `emptyState(message, verb)` already takes: is
-there anything to show, why is it empty, and which CLI verb creates it. Most
-of this surface is normally empty on a given harness, and without them an
-empty panel is indistinguishable from a broken one.
+there anything to show, why is it empty, and which CLI verb creates it, with
+`verb` null when no command does. Most of this surface is normally empty on a
+given harness, and without them an empty panel is indistinguishable from a
+broken one. The memory reads also carry `reason`
+(`no-data`, `no-access`, `unsupported`, `filtered`, or null when there is data).
+
+**A wiki kept in Thredz is edited in Thredz.** `PUT /memory/wiki/:slug` and its
+`signals` and `archive` routes write the local store, so they answer 409 on a
+harness whose spec keeps its wiki in Thredz, or whose spec cannot be read. The
+local wiki reads say which backend answered (`backend`) and where the wiki
+lives (`authority`).
 
 Absence is not an error: missing state renders as "nothing yet" shapes,
 and a vanished harness dir keeps its registry row (`missingSince`) with a

@@ -18,7 +18,8 @@
  * dispatch, two ways:
  *
  *   1. a table of accepted nouns → verbs → flags, transcribed from
- *      `apps/cli/src/{harness,daemon}-cmd.ts`; and
+ *      `apps/cli/src/{harness,daemon}-cmd.ts` and, for the memory screens'
+ *      commands, `apps/cli/src/{index,arg-schemas,dream-cli}.ts`; and
  *   2. a drift guard that re-reads those files and fails if the dispatch
  *      grew or lost a verb without this table following — because a table
  *      that silently goes stale is the same defect one layer up.
@@ -28,9 +29,13 @@
  * build would have to be bent around.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createContinuityStore } from "@crewhaus/continuity-store";
+import { createWikiStore } from "@crewhaus/wiki-store";
+import { MAX_FACT_FILE_BYTES } from "./constants";
 import { makeFixtureHarness } from "./fixture";
+import { M3_ROUTES } from "./m3-routes";
 import { actionCliTwins, matchActions } from "./omnibox";
 import { demoAvailability, onboardingView } from "./onboarding";
 import { bootTestServer } from "./testkit";
@@ -47,11 +52,39 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  *   · harness — `apps/cli/src/harness-cmd.ts`, the `switch (verb)` dispatch
  *     and each verb's `parseVerbArgs` spec.
  *   · daemon  — `apps/cli/src/daemon-cmd.ts`, `DAEMON_VERBS` and the same.
+ *   · memory, wiki, knowledge, dream, migrate, watchme — the dispatch in
+ *     `apps/cli/src/index.ts`, with one flag schema per noun
+ *     (`arg-schemas.ts`, `DREAM_CLI_SCHEMA` in `dream-cli.ts`).
  *
  * Flags are listed per verb because `parseVerbArgs` THROWS on any flag
  * outside the verb's own spec — an unknown flag is not ignored, it is a
- * non-zero exit with an "unknown flag" message.
+ * non-zero exit with an "unknown flag" message. A noun with one schema accepts
+ * the same flags on every verb.
  */
+const MEMORY_FLAGS = ["spec", "query", "yes", "compact", "help"];
+const WIKI_FLAGS = ["spec", "tags", "status", "k", "help"];
+const KNOWLEDGE_FLAGS = ["root", "shared", "pull", "push", "dry-run", "no-redact", "help"];
+const DREAM_FLAGS = ["force", "help"];
+const MIGRATE_MEMORIES_FLAGS = ["dry-run", "help"];
+const WATCHME_FLAGS = [
+  "spec",
+  "root",
+  "session",
+  "all",
+  "out",
+  "json",
+  "name",
+  "force",
+  "interactive",
+  "propose",
+  "feed-routing",
+  "emit-feedback",
+  "no-model",
+  "dry-run",
+  "forget",
+  "help",
+];
+
 const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   harness: {
     list: ["group", "json"],
@@ -75,7 +108,34 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     wake: ["lane", "reason"],
     drain: [],
   },
+  memory: {
+    list: MEMORY_FLAGS,
+    show: MEMORY_FLAGS,
+    forget: MEMORY_FLAGS,
+    sweep: MEMORY_FLAGS,
+  },
+  wiki: { list: WIKI_FLAGS, show: WIKI_FLAGS, search: WIKI_FLAGS, stats: WIKI_FLAGS },
+  knowledge: { sync: KNOWLEDGE_FLAGS },
+  dream: { run: DREAM_FLAGS, status: DREAM_FLAGS, init: DREAM_FLAGS },
+  migrate: { memories: MIGRATE_MEMORIES_FLAGS },
+  watchme: {
+    start: WATCHME_FLAGS,
+    stop: WATCHME_FLAGS,
+    status: WATCHME_FLAGS,
+    report: WATCHME_FLAGS,
+    intents: WATCHME_FLAGS,
+    synthesize: WATCHME_FLAGS,
+    publish: WATCHME_FLAGS,
+  },
 };
+
+/** The flag names one `ParseArgsSchema` constant declares, read from source. */
+function schemaFlags(source: string, schema: string): readonly string[] {
+  const start = source.indexOf(`export const ${schema}: ParseArgsSchema = {`);
+  expect(`${schema}: ${start >= 0}`).toBe(`${schema}: true`);
+  const block = source.slice(start, source.indexOf("\n};", start));
+  return [...block.matchAll(/\{ name: "([a-z-]+)"/g)].map((m) => m[1] as string);
+}
 
 /** A twin may be a `&&` chain (`cp -R … && crewhaus harness add <dir>`), and
  *  may carry a trailing `# comment`. Pull out the `crewhaus …` commands. */
@@ -151,6 +211,51 @@ describe("the dispatch table matches the CLI", () => {
     );
   });
 
+  test("the memory screens' nouns match the CLI's own lists", () => {
+    const index = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
+    const verbsOf = (noun: string): readonly string[] =>
+      Object.keys(CLI_DISPATCH[noun] as Record<string, readonly string[]>);
+
+    const memory = index.match(/memory: unknown action [^\n]*supported: ([a-z, ]+)`/);
+    expect(memory?.[1]?.split(", ")).toEqual([...verbsOf("memory")]);
+    const wiki = index.match(/wiki: unknown action [^\n]*supported: ([a-z, ]+)`/);
+    expect(wiki?.[1]?.split(", ")).toEqual([...verbsOf("wiki")]);
+    expect(index).toContain('knowledge action must be "sync"');
+    expect(verbsOf("knowledge")).toEqual(["sync"]);
+    expect(index).toContain(
+      'dreamFirst === "run" || dreamFirst === "status" || dreamFirst === "init"',
+    );
+    expect(verbsOf("dream")).toEqual(["run", "status", "init"]);
+    expect(index).toContain('migrate action must be "memories"');
+    expect(verbsOf("migrate")).toEqual(["memories"]);
+    const watchme = index.match(/const allowed = \["", ([^\]]+)\];/);
+    expect([...(watchme?.[1] ?? "").matchAll(/"([a-z]+)"/g)].map((m) => m[1])).toEqual([
+      ...verbsOf("watchme"),
+    ]);
+  });
+
+  test("their flags match the CLI's own schemas", () => {
+    const schemas = readFileSync(join(CLI_SRC, "arg-schemas.ts"), "utf8");
+    const dream = readFileSync(join(CLI_SRC, "dream-cli.ts"), "utf8");
+    expect(schemaFlags(schemas, "MEMORY_SCHEMA")).toEqual(MEMORY_FLAGS);
+    expect(schemaFlags(schemas, "WIKI_SCHEMA")).toEqual(WIKI_FLAGS);
+    expect(schemaFlags(schemas, "KNOWLEDGE_SCHEMA")).toEqual(KNOWLEDGE_FLAGS);
+    expect(schemaFlags(schemas, "MIGRATE_MEMORIES_SCHEMA")).toEqual(MIGRATE_MEMORIES_FLAGS);
+    expect(schemaFlags(schemas, "WATCHME_SCHEMA")).toEqual(WATCHME_FLAGS);
+    expect(schemaFlags(dream, "DREAM_CLI_SCHEMA")).toEqual(DREAM_FLAGS);
+  });
+
+  test("the checker rejects the memory commands that never existed", () => {
+    expect(rejectionReason("crewhaus memory remember")).toContain('unknown memory verb "remember"');
+    expect(rejectionReason("crewhaus remember")).toContain("no dispatch table");
+    expect(rejectionReason("crewhaus wiki write")).toContain('unknown wiki verb "write"');
+    expect(rejectionReason("crewhaus run (then /reflect)")).toContain("no dispatch table");
+    expect(rejectionReason("crewhaus memory list --nope")).toContain('unknown flag "--nope"');
+    // …and accepts the forms the screens show.
+    expect(rejectionReason("crewhaus memory list --spec fabric")).toBeNull();
+    expect(rejectionReason("crewhaus dream init crewhaus.yaml")).toBeNull();
+  });
+
   test("the checker actually rejects the two commands that shipped", () => {
     // A validator that passes everything proves nothing.
     expect(rejectionReason("crewhaus daemon start --dir /h/poly")).toContain(
@@ -222,6 +327,67 @@ describe("every twin this server proposes would run if pasted", () => {
       }>;
       expect(search.length).toBeGreaterThan(0);
       for (const action of search) expectRunnable(`GET /api/search ${action.id}`, action.cliTwin);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("every verb the memory reads answer with, empty or filled", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const reads = M3_ROUTES.filter((r) => r.method === "GET" && r.path.includes("/memory/"));
+      const emptyDir = makeFixtureHarness(join(t.harnessesRoot, "bare"), { specName: "bare" });
+      const filledDir = makeFixtureHarness(join(t.harnessesRoot, "filled"), {
+        specName: "filled",
+        specExtra: "memory:\n  dream:\n    every: 24h",
+      });
+      const stores = { rootDir: join(filledDir, ".crewhaus", "wiki"), specName: "filled" };
+      await createWikiStore(stores).write({ slug: "one", title: "One", body: "first" });
+      await createWikiStore(stores).write({
+        slug: "one",
+        title: "One",
+        body: "second",
+        expectedVersion: 1,
+      });
+      await createContinuityStore({
+        specName: "filled",
+        rootDir: join(filledDir, ".crewhaus", "state"),
+        sessionRootDir: join(filledDir, ".crewhaus", "sessions"),
+      }).writeFocus("ship it");
+      const memories = join(filledDir, ".crewhaus", "memories");
+      mkdirSync(memories, { recursive: true });
+      const big = join(memories, "big.jsonl");
+      writeFileSync(big, "");
+      truncateSync(big, MAX_FACT_FILE_BYTES + 1);
+
+      const seen: string[] = [];
+      for (const [dir, spec] of [
+        [emptyDir, "bare"],
+        [filledDir, "big"],
+      ] as const) {
+        const { body } = await t.api("/api/harnesses", {
+          method: "POST",
+          body: JSON.stringify({ dir }),
+        });
+        const id = (body["entry"] as { id: string }).id;
+        for (const route of reads) {
+          const url = route.path
+            .replace(":id", id)
+            .replace(":spec", spec)
+            .replace(":slug", "one")
+            .replace(":version", "1")
+            .replace(":stamp", "20260101");
+          const res = await t.api(url);
+          expect(`${url} ${res.status}`).toBe(`${url} 200`);
+          const verb = res.body["verb"];
+          if (typeof verb !== "string") continue;
+          expectRunnable(`${route.key} on ${spec}`, verb);
+          seen.push(`${route.key}: ${verb}`);
+        }
+      }
+      // Pinned, so this guard cannot go quiet: fifteen reads swept twice.
+      expect(reads.length).toBe(15);
+      expect(seen.length).toBe(15);
     } finally {
       await t.stop();
     }

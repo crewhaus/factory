@@ -784,6 +784,7 @@ import {
   claudeDesktopConfigPath,
   formatInventory,
 } from "./doctor-detect";
+import { ownerKeyPhilosophyFindings } from "./doctor-owner-keys";
 // v0.3.0 Goal 6 — `doctor --probe`: opt-in ~1-token live call per
 // configured provider, catching unfunded/invalid keys before a long run.
 import { buildProbePlan, probeResultsToChecks, runProviderProbes } from "./doctor-probe";
@@ -6964,6 +6965,7 @@ async function collectPhilosophyFindings(): Promise<PhilosophyFinding[]> {
   // (class, file, symbol) ids, so a NEW copy of the regex is a NEW finding
   // the --baseline gate fails on.
   findings.push(...provabilityPhilosophyFindings(process.cwd()));
+  findings.push(...ownerKeyPhilosophyFindings(process.cwd()));
 
   // Contributor compass exists at project root. AGENTS.md is the canonical
   // vendor-neutral convention (agents.md); CLAUDE.md is accepted as a fallback

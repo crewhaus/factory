@@ -142,7 +142,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["preflight.warn", "number"],
     ["preflight.info", "number"],
     ["envFiles", "array"],
-    ["memory.facts", "number"],
+    ["memory.facts", "number|null"],
     ["memory.articles", "number"],
     ["rollup", "object"],
   ],
@@ -248,10 +248,11 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   // views/memory.js cards
   "memory:facts": [
     ["files[].specName", "string"],
-    ["files[].live", "number"],
-    ["files[].superseded", "number"],
-    ["files[].expired", "number"],
+    ["files[].live", "number|null"],
+    ["files[].superseded", "number|null"],
+    ["files[].expired", "number|null"],
     ["files[].truncated", "boolean"],
+    ["files[].tooLarge", "boolean"],
     ["files[].items[].id", "string"],
     ["files[].items[].text", "string"],
     ["files[].items[].status", "string"],
@@ -260,6 +261,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   "memory:wiki": [
     ["index", "object|null"],
     ["articles[]", "string"],
+    ["authority", "string"],
   ],
   "memory:state": [
     ["focus", "string|null"],
@@ -277,7 +279,9 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
   ],
   wikiArticle: [
     ["slug", "string"],
+    ["title", "string"],
     ["body", "string"],
+    ["version", "number|null"],
     ["truncated", "boolean"],
   ],
   // ---- M2 ---------------------------------------------------------------
@@ -569,6 +573,13 @@ function m3Read(
   return [...M3_READ_BASE, ...extra];
 }
 
+/** A read answered through the memory area's `readBase`, which adds `reason`. */
+function memoryRead(
+  ...extra: Array<readonly [string, string]>
+): ReadonlyArray<readonly [string, string]> {
+  return m3Read(["reason", "string|null"], ...extra);
+}
+
 /**
  * TARGET shapes for the M3 reads, one section per implementer area.
  *
@@ -681,10 +692,11 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
   // and the session join), the wiki's `currentVersion` (the optimistic
   // concurrency token), and watchme's `unpriced` bucket (a measurement gap
   // that must never render as $0).
-  memoryFacts: m3Read(
+  memoryFacts: memoryRead(
     ["specName", "string"],
     ["specs", "array"],
-    ["counts", "object"],
+    ["counts", "object|null"],
+    ["tooLarge", "boolean"],
     ["items", "array"],
     ["items[].status", "string"],
     ["items[].provenance", "object|null"],
@@ -695,7 +707,7 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
   // `provenByAssertion`, never `status` alone: a step proven by assertion
   // (`continuity.proof: off`) carries `status: "proven"` too, and read bare
   // it is a green proven nobody checked. The fixture seeds one of each.
-  continuity: m3Read(
+  continuity: memoryRead(
     ["specName", "string"],
     ["focus", "object|null"],
     ["plans", "array"],
@@ -711,22 +723,22 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["trash", "object"],
     ["degraded", "string|null"],
   ),
-  continuityTrash: m3Read(["snapshots", "array"], ["purgeAfterDays", "number"]),
-  learning: m3Read(
+  continuityTrash: memoryRead(["snapshots", "array"], ["purgeAfterDays", "number"]),
+  learning: memoryRead(
     ["declared", "boolean"],
     ["enabled", "boolean"],
     ["sources", "array"],
     ["study", "object"],
     ["gaps", "object"],
   ),
-  knowledge: m3Read(
+  knowledge: memoryRead(
     ["share", "boolean"],
     ["sharedDir", "string|null"],
     ["candidates", "array"],
     ["counts", "object"],
     ["manifest", "array"],
   ),
-  dreamScaffold: m3Read(
+  dreamScaffold: memoryRead(
     ["declared", "boolean"],
     ["cadence", "string|null"],
     ["specs", "array"],
@@ -734,34 +746,40 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["cron", "string"],
     ["workflow", "string"],
   ),
-  wikiVersions: m3Read(
+  wikiVersions: memoryRead(
     ["slug", "string"],
     ["versions", "array"],
     ["currentVersion", "number|null"],
+    ["backend", "string"],
+    ["authority", "string"],
   ),
-  wikiVersion: m3Read(
+  wikiVersion: memoryRead(
     ["slug", "string"],
     ["version", "string"],
     ["body", "string"],
     ["diff", "string"],
     ["currentVersion", "number|null"],
+    ["backend", "string"],
+    ["authority", "string"],
   ),
-  wikiLinks: m3Read(
+  wikiLinks: memoryRead(
     ["slug", "string"],
     ["links", "array"],
     ["outbound", "number"],
     ["backlinks", "number"],
     ["indexStale", "boolean"],
   ),
-  wikiReflect: m3Read(
+  wikiReflect: memoryRead(
     ["articles", "array"],
     ["total", "number"],
     ["stale", "number"],
     ["filters", "object"],
     ["thresholdSource", "string"],
     ["sourcesGate", "boolean"],
+    ["backend", "string"],
+    ["authority", "string"],
   ),
-  watchmeAnalytics: m3Read(
+  watchmeAnalytics: memoryRead(
     ["watching", "boolean"],
     ["sessions", "number"],
     ["models", "array"],
@@ -771,15 +789,15 @@ const M3_VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = 
     ["judgments", "object"],
     ["asOf", "string|null"],
   ),
-  watchmeReports: m3Read(["reports", "array"]),
-  watchmeReport: m3Read(
+  watchmeReports: memoryRead(["reports", "array"]),
+  watchmeReport: memoryRead(
     ["stamp", "string"],
     ["body", "string"],
     ["summary", "string|null"],
     ["files", "array"],
   ),
-  watchmeIntents: m3Read(["intents", "array"]),
-  watchmeSynthesized: m3Read(["proposals", "array"], ["advisory", "boolean"]),
+  watchmeIntents: memoryRead(["intents", "array"]),
+  watchmeSynthesized: memoryRead(["proposals", "array"], ["advisory", "boolean"]),
 
   // ---- M3 · evals + data + feedback (owner: the Evals+Data implementer) -
   // Every field below is present WHATEVER the harness holds — the normal

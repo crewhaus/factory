@@ -66,6 +66,6 @@ describe("GET /memory/facts/:spec", () => {
     const { body } = await t.api(`/api/h/${id}/memory/facts/nosuch`);
     expect(body["present"]).toBe(false);
     expect(String(body["note"])).toContain("no memories/nosuch.jsonl");
-    expect(body["verb"]).toBe("crewhaus memory remember");
+    expect(body["verb"]).toBeNull();
   });
 });
