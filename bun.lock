@@ -633,6 +633,17 @@
         "@crewhaus/specialization-registry": "workspace:*",
       },
     },
+    "packages/control-contract": {
+      "name": "@crewhaus/control-contract",
+      "version": "0.8.0",
+      "dependencies": {
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/spec-patch": "workspace:*",
+        "typescript": "^5.7.0",
+      },
+    },
     "packages/cost-tracker": {
       "name": "@crewhaus/cost-tracker",
       "version": "0.8.0",
@@ -894,6 +905,11 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
       },
     },
     "packages/eval-runner": {
@@ -1199,6 +1215,7 @@
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
@@ -1220,6 +1237,11 @@
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/watchme-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
       },
     },
     "packages/hangar-ui": {
@@ -1917,6 +1939,7 @@
       "name": "@crewhaus/session-store",
       "version": "0.8.0",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
@@ -3986,6 +4009,8 @@
     "@crewhaus/continuity-store": ["@crewhaus/continuity-store@workspace:packages/continuity-store"],
 
     "@crewhaus/contract-compiler": ["@crewhaus/contract-compiler@workspace:packages/contract-compiler"],
+
+    "@crewhaus/control-contract": ["@crewhaus/control-contract@workspace:packages/control-contract"],
 
     "@crewhaus/cost-tracker": ["@crewhaus/cost-tracker@workspace:packages/cost-tracker"],
 

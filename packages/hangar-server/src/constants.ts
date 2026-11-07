@@ -16,6 +16,7 @@ export const PROTOCOL_V = 1;
  * a literal: the release train bumps package.json, and a hand-maintained
  * copy would silently drift. Static import — a compiled binary embeds it.
  */
+import { SESSION_ID_PATTERN, SESSION_ID_RE } from "@crewhaus/control-contract";
 import pkg from "../package.json" with { type: "json" };
 
 export const HANGAR_SERVER_VERSION: string =
@@ -63,12 +64,15 @@ export const MAX_MEMORY_ITEMS = 500;
 export const MAX_TAIL_LINES = 50;
 
 /** Session file-name shapes (the session-store on-disk contract). */
-export const SESSION_ID_RE = /^sess_[0-9a-f]{16}$/;
-export const SESSION_JSON_RE = /^sess_[0-9a-f]{16}\.json$/;
-export const SESSION_JSONL_RE = /^sess_[0-9a-f]{16}\.jsonl$/;
+export { SESSION_ID_RE };
+export const SESSION_JSON_RE = new RegExp(`^${SESSION_ID_PATTERN}\\.json$`);
+export const SESSION_JSONL_RE = new RegExp(`^${SESSION_ID_PATTERN}\\.jsonl$`);
 
 /** Eval run-directory id shape (the eval-runner on-disk contract). */
 export const RUN_ID_RE = /^run_[0-9a-f]{16}$/;
+
+/** Optimizer run-directory id shape (`opt_` + the hex clock the CLI mints). */
+export const OPT_RUN_ID_RE = /^opt_[0-9a-f]{1,32}$/;
 
 /** Conservative shape for ids that name a file/dir INSIDE a harness tree
  *  (eval sample ids, wiki slugs, dream spec dirs, memory file stems): one

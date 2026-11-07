@@ -1071,11 +1071,11 @@ describe("CLI twins", () => {
     expect(sup.JOB_COMMANDS).toEqual({
       doctor: "crewhaus doctor",
       compile: "crewhaus compile crewhaus.yaml -o dist",
-      eval: "crewhaus eval crewhaus.yaml",
+      eval: "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
       "dream-run": "crewhaus dream run crewhaus.yaml",
     });
     expect(sup.cliTwinFor("job", { dir: "/h", kind: "eval" })).toBe(
-      "cd /h && crewhaus eval crewhaus.yaml",
+      "cd /h && crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
     );
     expect(sup.cliTwinFor("job", { kind: "nope" })).toBeNull();
   });

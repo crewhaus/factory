@@ -39,12 +39,14 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { lookupBaseline } from "../packages/eval-report/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import {
   SHAPE_TOOL_PROFILES,
   type ToolShape,
   resolveBuiltinTools,
 } from "../packages/tool-categories/src/index";
+import { planPin } from "../packages/tool-evalops/src/lib/pin";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 
 const ROOT = dirname(import.meta.dir);
@@ -636,5 +638,42 @@ describe("the release notes name every change a harness without provability: see
     const crossCheckNotes = bullets.filter((b) => b.includes("`FactCrossCheck`")).join("\n");
     const unnamed = [...new Set(moved)].filter((kind) => !crossCheckNotes.includes(kind));
     expect(unnamed).toEqual([]);
+  });
+
+  test("a run that measured nothing is no longer a baseline: the pin plan refuses it, and the list says so", () => {
+    const lineage = { specName: "shop", datasetName: "smoke" };
+    const base = {
+      runId: "run_a",
+      specName: "shop",
+      specHash: "h",
+      datasetName: "smoke",
+      datasetHash: "d",
+      passRate: 0,
+      meanScore: 0,
+      sampleCount: 2,
+      ts: "2026-11-01T00:00:00.000Z",
+      outDir: ".crewhaus/evals/run_a",
+    };
+    // The refusal comes before the run directory is looked at, so none is needed.
+    const refused = (extra: Record<string, number>) =>
+      planPin({
+        action: "set",
+        lineage,
+        lookup: lookupBaseline({}, lineage),
+        baselines: {},
+        row: { ...base, ...extra },
+        evalsDir: { abs: "", real: "", given: "", rel: ".crewhaus/evals" },
+      });
+    const allErrored = refused({ errorCount: 2, measuredCount: 0 });
+    const nothing = refused({ measuredCount: 0 });
+    expect(allErrored).toMatchObject({ ok: false });
+    expect(nothing).toMatchObject({ ok: false });
+    expect(JSON.stringify(allErrored)).toContain("every case errored");
+    expect(JSON.stringify(nothing)).toContain("measured nothing");
+    const bullet =
+      defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes("`EvalBaselinePin`")) ??
+      "";
+    expect(bullet).toContain("measured nothing");
+    expect(bullet).toContain("every case errored");
   });
 });

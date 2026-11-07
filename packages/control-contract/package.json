@@ -1,0 +1,44 @@
+{
+  "name": "@crewhaus/control-contract",
+  "version": "0.8.0",
+  "type": "module",
+  "description": "The one description of the control plane every surface shares: ids, state machines, permissions, envelopes and the crewhaus.hangar.v1 operation table, one module per area. The main entry imports nothing; zod lives in ./schemas.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schemas": "./src/schemas/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/spec-patch": "workspace:*",
+    "typescript": "^5.7.0"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/control-contract"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/control-contract#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

@@ -4,7 +4,8 @@
  * Rules the screen carries rather than hides: a verify MISMATCH means
  * TAMPERED (not stale); `<spec>-ratings` and `<spec>-regressions` are
  * auto-maintained and invite no hand edit the next distill would overwrite;
- * the test split is locked to the release flow with a visible burn count;
+ * held-out test cases stay out of normal runs, and only `crewhaus datasets
+ * release` records a use;
  * and quarantined samples appear beside the registry with their provenance,
  * because a quarantined sample nobody can see is a bug nobody can file.
  *
@@ -164,12 +165,15 @@ function registryCard(ctx, res, reload) {
       ]),
     );
     card.appendChild(
-      table(["Dataset", "Latest", "Splits", "Provenance", "Verify", "Holdout burn", ""], rows),
+      table(
+        ["Dataset", "Latest", "Splits", "Provenance", "Verify", "Test-split releases", ""],
+        rows,
+      ),
     );
     card.appendChild(
       el("p", {
         class: "muted",
-        text: "The held-out test split is locked to the release flow; every spend is counted as a burn.",
+        text: "Held-out test cases stay out of normal runs. Only crewhaus datasets release records a use.",
       }),
     );
   });
@@ -194,7 +198,7 @@ function detailBtn(ctx, name) {
     }
     holder.appendChild(
       table(
-        ["Version", "Created", "Splits", "Verify", "Burn"],
+        ["Version", "Created", "Splits", "Verify", "Releases"],
         (data.versions ?? []).map((v) =>
           el("tr", null, [
             el("td", { class: "mono", text: String(v.version) }),
@@ -240,10 +244,10 @@ function verifyBtn(ctx, name, reload) {
 // ---------------------------------------------------------------------------
 
 function statusCard(res) {
-  return panel("Freshness, saturation and burn", res, (card, data) => {
+  return panel("Freshness, saturation and releases", res, (card, data) => {
     card.appendChild(
       table(
-        ["Dataset", "Version", "Age", "Runs", "Last run", "Always-passing", "Burn"],
+        ["Dataset", "Version", "Age", "Runs", "Last run", "Always-passing", "Releases"],
         (data.datasets ?? []).map((row) => {
           const saturated = row.saturation?.alwaysPassing ?? [];
           return el("tr", null, [

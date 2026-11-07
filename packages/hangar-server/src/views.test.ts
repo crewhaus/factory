@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { runCorpusEval } from "./__test__/eval-corpus";
 import { logLine, makeFixtureHarness } from "./fixture";
 import { type TestServer, bootTestServer } from "./testkit";
 
@@ -110,19 +112,6 @@ function richHarness(t: TestServer): string {
         ts: iso(NOW - 2 * DAY),
       },
     },
-    evalRuns: [
-      {
-        runId: "run_00000000000000ab",
-        results: { passRate: 0.5, results: [{ sampleId: "s1", pass: false }] },
-        samples: {
-          s1: {
-            grades: { pass: false, rationale: "missed the point" },
-            meta: { latencyMs: 12 },
-            transcript: [{ kind: "user_message", payload: { content: "q" } }],
-          },
-        },
-      },
-    ],
   });
 }
 
@@ -274,10 +263,37 @@ describe("memory areas", () => {
 });
 
 describe("eval routes", () => {
+  test("a run that measured nothing cannot be pinned, and the history says why", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "unpinnable"), { specName: "unpinnable" });
+    const id = await register(t, dir);
+    const runId = "run_00000000000000e1";
+    await runCorpusEval(
+      dir,
+      { s1: "error", s2: "error" },
+      { runId, specName: "unpinnable", datasetName: "smoke" },
+    );
+    const pinned = await t.api(`/api/h/${id}/evals/baseline`, {
+      method: "POST",
+      body: JSON.stringify({ runId }),
+    });
+    expect(pinned.status).toBe(409);
+    expect(String(pinned.body["error"])).toContain("every case errored");
+    expect(existsSync(join(dir, ".crewhaus", "evals", "baselines.json"))).toBe(false);
+
+    const runs = (await t.api(`/api/h/${id}/evals`)).body["runs"] as Array<Record<string, unknown>>;
+    expect(runs[0]?.["pinRefusal"]).toBe("Every case errored, so it can't be a baseline.");
+  }, 20_000); // loads the whole eval runner
+
   test("history rows newest-first + baselines; run view; per-sample artifacts", async () => {
     const t = boot();
     const dir = richHarness(t);
     const id = await register(t, dir);
+    await runCorpusEval(
+      dir,
+      { s1: "fail" },
+      { runId: "run_00000000000000ab", specName: "rich", datasetName: "smoke" },
+    );
 
     const evals = await t.api(`/api/h/${id}/evals`);
     expect(evals.status).toBe(200);
@@ -290,12 +306,24 @@ describe("eval routes", () => {
     const run = await t.api(`/api/h/${id}/evals/run_00000000000000ab`);
     expect(run.status).toBe(200);
     expect(run.body["sampleIds"]).toEqual(["s1"]);
-    expect((run.body["summary"] as Record<string, unknown>)["passRate"]).toBe(0.5);
+    const aggregates = (run.body["summary"] as Record<string, Record<string, unknown>>)[
+      "aggregates"
+    ];
+    expect(aggregates?.["passRate"]).toBe(0);
+    expect(run.body["stats"]).toMatchObject({ passRate: 0, sampleCount: 1, measuredCount: 1 });
+    expect(run.body["rows"]).toEqual([
+      expect.objectContaining({ sampleId: "s1", dir: "s1", verdict: "fail" }),
+    ]);
 
     const sample = await t.api(`/api/h/${id}/evals/run_00000000000000ab/s1`);
     expect(sample.status).toBe(200);
-    expect((sample.body["grades"] as Record<string, unknown>)["pass"]).toBe(false);
-    expect((sample.body["meta"] as Record<string, unknown>)["latencyMs"]).toBe(12);
+    const grades = sample.body["grades"] as {
+      overall: { passed: boolean };
+      perGrader: Array<{ name: string }>;
+    };
+    expect(grades.overall.passed).toBe(false);
+    expect(grades.perGrader.map((g) => g.name)).toEqual(["exact", "judge"]);
+    expect(typeof (sample.body["meta"] as Record<string, unknown>)["latencyMs"]).toBe("number");
     expect((sample.body["transcript"] as unknown[]).length).toBe(1);
 
     expect((await t.api(`/api/h/${id}/evals/run_00000000000000ff`)).status).toBe(404);

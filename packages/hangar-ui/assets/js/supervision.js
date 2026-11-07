@@ -1337,7 +1337,7 @@ function quoteArg(value) {
 export const JOB_COMMANDS = {
   doctor: "crewhaus doctor",
   compile: "crewhaus compile crewhaus.yaml -o dist",
-  eval: "crewhaus eval crewhaus.yaml",
+  eval: "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
   "dream-run": "crewhaus dream run crewhaus.yaml",
 };
 

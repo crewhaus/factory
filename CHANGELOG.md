@@ -19,6 +19,10 @@ these on: they reach every harness that uses what each one names.
   `chains` block reads an unset variable exits 2 with one line naming the
   variable, where it exited 1. Supervision still counts it as a crash, and its
   status reads "crashed (exit 2)" instead of "unclassified failure".
+- **A run that measured nothing is no longer a baseline.** `EvalBaselinePin` and
+  `crewhaus eval`'s automatic pin refuse a run that measured nothing or in which
+  every case errored, as they already refused a budget-aborted run. The eval
+  still prints its result and keeps the baseline it had.
 
 ## [0.8.0] - 2026-10-25
 

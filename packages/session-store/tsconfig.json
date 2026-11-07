@@ -4,6 +4,11 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../tenancy" }, { "path": "../tool-safety" }],
+  "references": [
+    { "path": "../control-contract" },
+    { "path": "../errors" },
+    { "path": "../tenancy" },
+    { "path": "../tool-safety" }
+  ],
   "include": ["src/**/*"]
 }

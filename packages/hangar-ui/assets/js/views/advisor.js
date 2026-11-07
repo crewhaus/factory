@@ -180,7 +180,7 @@ function feedCard(feed, ctx, reload) {
   return card;
 }
 
-function itemRow(item, ctx, reload) {
+export function itemRow(item, ctx, reload) {
   const severity = String(item.severity ?? "suggestion");
   const model = itemActionModel(item, ctx.id);
   const row = el("div", { class: `adv-item adv-${severity}` });
@@ -223,10 +223,7 @@ function itemRow(item, ctx, reload) {
   } else {
     actions.appendChild(el("span", { class: "muted", text: model.label }));
   }
-  if (model.cliTwin)
-    actions.appendChild(
-      el("span", { class: "adv-cli", title: model.cliTwin, text: model.cliTwin }),
-    );
+  if (model.cliTwin) actions.appendChild(el("span", { class: "adv-cli", text: model.cliTwin }));
   const dismissBtn = el("button", { class: "btn btn-ghost", type: "button", text: "Dismiss…" });
   dismissBtn.addEventListener("click", () => openDismissForm(row, item, ctx, reload));
   actions.appendChild(
@@ -360,7 +357,7 @@ function trendCard(trend) {
     ]),
   );
   if (trend === null) {
-    card.appendChild(emptyState("The trend could not be read", "crewhaus eval crewhaus.yaml"));
+    card.appendChild(emptyState("The trend could not be read"));
     return card;
   }
   card.appendChild(el("p", { class: "adv-note", text: String(trend.summary ?? "") }));
@@ -558,7 +555,6 @@ function issuesCard(issues, ctx, reload) {
         update.cliTwin
           ? el("span", {
               class: "adv-cli",
-              title: String(update.cliTwin),
               text: String(update.cliTwin),
             })
           : null,
