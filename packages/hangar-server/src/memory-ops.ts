@@ -31,10 +31,10 @@
  * across user think-time — an editor open in a browser tab is think-time, so
  * no route here holds a lock between requests.
  *
- * Provenance is the point of the facts browser: every fact carries its
- * `sessionId` and evidence `toolUseId`s, and both come back as ids the
- * console turns into links into the session viewer. That join is what makes
- * a memory auditable.
+ * Provenance is what makes a memory auditable: when auto-capture recorded a
+ * fact's `sessionId` and evidence `toolUseId`s, both come back as ids the
+ * console turns into links into the session viewer. The Remember tool records
+ * neither, and `provenance` is null then.
  *
  * ---------------------------------------------------------------------------
  * TWO ON-DISK LAYOUTS, ONE READER
@@ -42,10 +42,10 @@
  * `continuity-store` and `wiki-store` nest their state under the SPEC name
  * (`state/<spec>/`, `wiki/<spec>/`) — that is what a live harness has. Older
  * trees (and this server's own fixtures) carry the FLAT shape `state/…`,
- * `wiki/…`, which the M1 read side renders. Every reader here resolves the
- * spec-scoped directory first and falls back to the flat one, so a harness
- * from either era browses instead of reading as empty. Writes always go
- * through the store, i.e. always into the spec-scoped layout.
+ * `wiki/…`. Every reader, here and on the M1 side, resolves the store through
+ * `store-layout.ts`: the spec-scoped directory first, then the flat one, so a
+ * harness from either era browses instead of reading as empty. Writes always
+ * go through the store.
  *
  * FREE TEXT IS MASKED HERE, not only by the dispatcher: fact bodies, focus
  * prose, plan steps, goals and handoffs are paragraphs, and `maskDeep`'s
@@ -66,9 +66,14 @@ import {
 } from "@crewhaus/continuity-store";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { createMemoryStore } from "@crewhaus/memory-store";
-import { MAX_MEMORY_ITEMS, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
+import {
+  MAX_FACT_FILE_BYTES,
+  MAX_MEMORY_ITEMS,
+  MAX_TEXT_BYTES,
+  SAFE_SEGMENT_RE,
+} from "./constants";
 import { HttpError } from "./http";
-import { readJsonlCapped, readTextCapped } from "./jsonl";
+import { readJsonlCapped, readJsonlWhole, readTextCapped } from "./jsonl";
 import { checkboxParts } from "./line-parts";
 import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, requireBoolean, requireString, requireTypedConfirm } from "./m3";
@@ -77,6 +82,15 @@ import { resolveInside } from "./safety";
 import { SCAFFOLDED_WORKFLOWS, scaffoldedWorkflowPath } from "./scaffolded-workflows";
 import { readSpecYaml } from "./schedulers";
 import { keyedScalar } from "./spec-lines";
+import {
+  STATE_STORE_PROBE,
+  WIKI_STORE_PROBE,
+  isStoreName,
+  liveStore,
+  readHarnessSpec,
+} from "./store-layout";
+
+export { isStoreName };
 
 // ---------------------------------------------------------------------------
 // shared helpers (wiki-ops.ts and watchme-ops.ts import these)
@@ -85,16 +99,25 @@ import { keyedScalar } from "./spec-lines";
 /**
  * The baseline every M3 read answers with. A memory screen's normal state is
  * EMPTY — a harness with no wiki, no watchme, no continuity — so absence has
- * to carry its own explanation and the verb that would create the data.
+ * to carry its own explanation, the verb that would create the data when one
+ * exists, and why the screen is empty.
  */
+export type M3ReadReason = "no-data" | "no-access" | "unsupported" | "filtered";
+
 export type M3ReadBase = {
   readonly present: boolean;
   readonly note: string | null;
   readonly verb: string | null;
+  readonly reason: M3ReadReason | null;
 };
 
-export function readBase(present: boolean, note: string | null, verb: string | null): M3ReadBase {
-  return { present, note, verb };
+export function readBase(
+  present: boolean,
+  note: string | null,
+  verb: string | null,
+  reason: M3ReadReason | null = present ? null : "no-data",
+): M3ReadBase {
+  return { present, note, verb, reason };
 }
 
 /** The harness dir, narrowed. Every route in this area is per-harness. */
@@ -163,14 +186,6 @@ export function describeFailure(err: unknown): string {
   return maskText(err instanceof Error ? err.message : String(err));
 }
 
-/** The shape both `memory-store` and `wiki-store` accept as a spec name. */
-const STORE_NAME_RE = /^[A-Za-z0-9_.-]+$/;
-
-/** True when a spec name may be handed to a store constructor. */
-export function isStoreName(name: string): boolean {
-  return STORE_NAME_RE.test(name) && !/^\.+$/.test(name);
-}
-
 /**
  * This harness's spec name — the key the memory/wiki/continuity stores scope
  * their files under. The live spec wins over the registry's cached row (the
@@ -179,7 +194,7 @@ export function isStoreName(name: string): boolean {
  */
 export function harnessSpecName(ctx: M3Context): string {
   const dir = harnessDirOf(ctx);
-  const header = readSpecHeader(readSpecYaml(dir));
+  const header = readSpecHeader(readHarnessSpec(dir) ?? "");
   if (typeof header.name === "string" && header.name !== "") return header.name;
   const cached = ctx.entry?.specName;
   if (typeof cached === "string" && cached !== "") return cached;
@@ -189,7 +204,8 @@ export function harnessSpecName(ctx: M3Context): string {
 /**
  * Resolve a store directory that may sit under the spec name or flat.
  * Returns the contained path plus which layout answered, or `undefined` when
- * neither exists (the caller renders the empty state).
+ * neither exists (the caller renders the empty state). The rule itself is
+ * `liveStore`, shared with the M1 reads.
  */
 export function resolveStoreDir(
   ctx: M3Context,
@@ -197,17 +213,10 @@ export function resolveStoreDir(
   specName: string,
   probe: readonly string[],
 ): { dir: string; layout: "spec-scoped" | "flat" } | undefined {
-  if (isStoreName(specName) && SAFE_SEGMENT_RE.test(specName)) {
-    const scoped = containedPath(ctx, [".crewhaus", area, specName]);
-    if (scoped !== undefined && probe.some((p) => existsSync(join(scoped, p)))) {
-      return { dir: scoped, layout: "spec-scoped" };
-    }
-  }
-  const flat = containedPath(ctx, [".crewhaus", area]);
-  if (flat !== undefined && probe.some((p) => existsSync(join(flat, p)))) {
-    return { dir: flat, layout: "flat" };
-  }
-  return undefined;
+  const found = liveStore(harnessDirOf(ctx), area, specName, probe);
+  if (found === undefined) return undefined;
+  const dir = containedPath(ctx, found.segments);
+  return dir === undefined ? undefined : { dir, layout: found.layout };
 }
 
 // ---- lenient spec scanning -------------------------------------------------
@@ -416,30 +425,90 @@ function provenanceOf(value: unknown): FactProvenance | null {
   return { sessionId, evidence };
 }
 
-export type FoldedFacts = {
-  readonly items: readonly FactRow[];
-  readonly counts: {
-    readonly live: number;
-    readonly superseded: number;
-    readonly expired: number;
-    readonly total: number;
-  };
-  readonly truncated: boolean;
-  readonly torn: number;
+export type FactCounts = {
+  readonly live: number;
+  readonly superseded: number;
+  readonly expired: number;
+  readonly total: number;
 };
 
-/** Fold one `memories/<spec>.jsonl`: entries + append-only tombstones. */
-export function foldFacts(path: string, nowMs: number): FoldedFacts {
-  const read = readJsonlCapped(path);
+/** A fact a sweep would tombstone. */
+export type SweepableFact = {
+  readonly id: string;
+  readonly text: string;
+  readonly expiresAt: string;
+};
+
+export type FoldedFacts = {
+  /** The newest {@link MAX_MEMORY_ITEMS} entries, in file order. */
+  readonly items: readonly FactRow[];
+  /** Exact, over every line. null only when the file was too large to read:
+   *  a count nobody took is unknown, not zero. */
+  readonly counts: FactCounts | null;
+  /** True when rows were left out of `items`. */
+  readonly truncated: boolean;
+  readonly torn: number;
+  readonly tooLarge: boolean;
+  /**
+   * What `store.sweep` would tombstone, over the whole file: expired facts are
+   * usually the oldest, so `items` cannot answer this. `rows` is oldest first
+   * and capped; `total` is exact, null when the file was too large to read.
+   */
+  readonly sweepable: { readonly rows: readonly SweepableFact[]; readonly total: number | null };
+};
+
+/** The furthest epoch-ms value from zero that a `Date` can hold. */
+const MAX_DATE_MS = 8.64e15;
+
+/** A fact's `expiresAt`, or null when no `Date` can hold it (`1e30`, or `1e400`
+ *  which parses as Infinity). One bad line must neither take the whole read
+ *  down, because `toISOString` throws on it, nor mark its fact expired. */
+function expiryOf(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= MAX_DATE_MS
+    ? value
+    : null;
+}
+
+function isFactEntry(line: RawFactLine): line is RawFactLine & { id: string; text: string } {
+  return (
+    line.tombstone === undefined && typeof line.id === "string" && typeof line.text === "string"
+  );
+}
+
+/**
+ * Fold one `memories/<spec>.jsonl`: entries + append-only tombstones. Status
+ * and counts come from every line, because a tombstone can sit anywhere after
+ * its target. Rows are built and masked only for what is returned.
+ */
+export function foldFacts(
+  path: string,
+  nowMs: number,
+  maxBytes: number = MAX_FACT_FILE_BYTES,
+): FoldedFacts {
+  const read = readJsonlWhole(path, maxBytes);
+  if (read.tooLarge) {
+    return {
+      items: [],
+      counts: null,
+      truncated: true,
+      torn: 0,
+      tooLarge: true,
+      sweepable: { rows: [], total: null },
+    };
+  }
+  const lines = read.objects.filter(
+    (obj): obj is RawFactLine => typeof obj === "object" && obj !== null,
+  );
   const supersedes = new Map<string, { at: string | null; reason: string | null; by: string }>();
   const expired = new Set<string>();
-  for (const obj of read.objects) {
-    const line = obj as RawFactLine;
+  let entryCount = 0;
+  for (const line of lines) {
+    if (isFactEntry(line)) entryCount += 1;
     if (typeof line.target !== "string") continue;
     if (line.tombstone === "superseded") {
       supersedes.set(line.target, {
         at: typeof line.at === "string" ? line.at : null,
-        reason: typeof line.reason === "string" ? maskText(line.reason) : null,
+        reason: typeof line.reason === "string" ? line.reason : null,
         by: typeof line.supersededBy === "string" ? line.supersededBy : "",
       });
     } else if (line.tombstone === "expired") {
@@ -447,20 +516,35 @@ export function foldFacts(path: string, nowMs: number): FoldedFacts {
     }
   }
 
+  const firstRow = Math.max(0, entryCount - MAX_MEMORY_ITEMS);
   const items: FactRow[] = [];
+  const sweepRows: SweepableFact[] = [];
+  let sweepTotal = 0;
   const counts = { live: 0, superseded: 0, expired: 0, total: 0 };
-  for (const obj of read.objects) {
-    const line = obj as RawFactLine;
-    if (line.tombstone !== undefined) continue;
-    if (typeof line.id !== "string" || typeof line.text !== "string") continue;
+  let entryIndex = -1;
+  for (const line of lines) {
+    if (!isFactEntry(line)) continue;
+    entryIndex += 1;
     const tomb = supersedes.get(line.id);
-    const expiresAt = typeof line.expiresAt === "number" ? line.expiresAt : null;
+    const expiresAt = expiryOf(line.expiresAt);
     let status: FactRow["status"] = "live";
     if (tomb !== undefined || typeof line.supersededBy === "string") status = "superseded";
     else if (expired.has(line.id) || (expiresAt !== null && expiresAt <= nowMs)) status = "expired";
     counts[status] += 1;
     counts.total += 1;
-    if (items.length >= MAX_MEMORY_ITEMS) continue;
+    // The same rule as `store.sweep`: past TTL and carrying no tombstone yet,
+    // so the preview does not count what an earlier sweep already handled.
+    if (status === "expired" && expiresAt !== null && expiresAt <= nowMs && !expired.has(line.id)) {
+      sweepTotal += 1;
+      if (sweepRows.length < MAX_MEMORY_ITEMS) {
+        sweepRows.push({
+          id: line.id,
+          text: maskText(line.text),
+          expiresAt: new Date(expiresAt).toISOString(),
+        });
+      }
+    }
+    if (entryIndex < firstRow) continue;
     const createdAt = typeof line.createdAt === "string" ? line.createdAt : "";
     const createdMs = createdAt === "" ? Number.NaN : Date.parse(createdAt);
     items.push({
@@ -480,7 +564,7 @@ export function foldFacts(path: string, nowMs: number): FoldedFacts {
           : tomb !== undefined && tomb.by !== ""
             ? tomb.by
             : null,
-      supersedeReason: tomb?.reason ?? null,
+      supersedeReason: tomb?.reason === null || tomb === undefined ? null : maskText(tomb.reason),
       supersededAt: tomb?.at ?? null,
       provenance: provenanceOf(line.provenance),
       schemaVersion: typeof line.schemaVersion === "number" ? line.schemaVersion : null,
@@ -489,9 +573,17 @@ export function foldFacts(path: string, nowMs: number): FoldedFacts {
   return {
     items,
     counts,
-    truncated: read.truncated || counts.total > items.length,
+    truncated: counts.total > items.length,
     torn: read.tornCount,
+    tooLarge: false,
+    sweepable: { rows: sweepRows, total: sweepTotal },
   };
+}
+
+/** A `crewhaus memory <verb>` line. `spec` is a URL segment, so it reaches a
+ *  shown command only when it is a name the CLI would accept. */
+function memoryVerb(verb: "list" | "sweep", spec: string): string {
+  return isStoreName(spec) ? `crewhaus memory ${verb} --spec ${spec}` : `crewhaus memory ${verb}`;
 }
 
 /** Every `memories/*.jsonl` stem in the harness (the file picker's options). */
@@ -508,8 +600,9 @@ function factStems(ctx: M3Context): string[] {
  *
  * Beyond the M1 summary: TTL expiry countdowns, `supersededBy` chains with
  * the recorded reason, and provenance (`sessionId` + evidence `toolUseId`s)
- * for the session deep links. Capped and torn-line tolerant like every other
- * JSONL reader here.
+ * for the session deep links. Torn-line tolerant like every other JSONL reader
+ * here, and read whole up to `MAX_FACT_FILE_BYTES`: the rows are capped, the
+ * status and the counts are not.
  */
 export const memoryFacts: M3Handler = (ctx) => {
   const spec = ctx.params["spec"] ?? "";
@@ -526,6 +619,7 @@ export const memoryFacts: M3Handler = (ctx) => {
         false,
         `memories/${spec}.jsonl resolves outside the harness directory and is not readable from here`,
         null,
+        "no-access",
       ),
       specName: spec,
       specs: stems,
@@ -533,6 +627,7 @@ export const memoryFacts: M3Handler = (ctx) => {
       items: [],
       truncated: false,
       torn: 0,
+      tooLarge: false,
     };
   }
   if (!existsSync(path)) {
@@ -540,9 +635,9 @@ export const memoryFacts: M3Handler = (ctx) => {
       ...readBase(
         false,
         stems.length === 0
-          ? "no fact store yet — nothing has been remembered in this harness"
+          ? "No facts yet. Facts appear when the harness remembers something while it works."
           : `no memories/${spec}.jsonl — this harness stores facts under: ${stems.join(", ")}`,
-        "crewhaus memory remember",
+        null,
       ),
       specName: spec,
       specs: stems,
@@ -550,18 +645,36 @@ export const memoryFacts: M3Handler = (ctx) => {
       items: [],
       truncated: false,
       torn: 0,
+      tooLarge: false,
     };
   }
   const folded = foldFacts(path, ctx.now());
+  if (folded.counts === null) {
+    return {
+      ...readBase(
+        true,
+        "This fact store is too large to browse here.",
+        memoryVerb("list", spec),
+        "unsupported",
+      ),
+      specName: spec,
+      specs: stems,
+      counts: null,
+      items: [],
+      truncated: true,
+      torn: 0,
+      tooLarge: true,
+    };
+  }
   return {
     ...readBase(
       folded.counts.total > 0,
       folded.counts.total === 0
         ? "the fact store exists but holds no entries yet"
         : folded.truncated
-          ? "long store — the first entries only; the counts are floors, not lies"
+          ? "Showing the newest facts. The counts cover all of them."
           : null,
-      "crewhaus memory remember",
+      null,
     ),
     specName: spec,
     specs: stems,
@@ -569,6 +682,7 @@ export const memoryFacts: M3Handler = (ctx) => {
     items: folded.items,
     truncated: folded.truncated,
     torn: folded.torn,
+    tooLarge: false,
   };
 };
 
@@ -653,23 +767,27 @@ export const memorySweep: M3Handler = async (ctx) => {
           counts: { live: 0, superseded: 0, expired: 0, total: 0 },
           truncated: false,
           torn: 0,
+          tooLarge: false,
+          sweepable: { rows: [], total: 0 },
         }
       : foldFacts(path, nowMs);
-  const plan = folded.items
-    .filter((i) => i.status === "expired" && i.supersededBy === null && i.expiresAt !== null)
-    .map((i) => ({ id: i.id, text: i.text, expiresAt: i.expiresAt }));
+  const plan = folded.sweepable.rows;
+  const planTotal = folded.sweepable.total;
   if (dryRun) {
     return {
       ok: true,
       dryRun: true,
       specName: spec,
       plan,
+      planTotal,
       swept: 0,
-      live: folded.counts.live,
+      live: folded.counts?.live ?? null,
       note:
-        plan.length === 0
-          ? "nothing is past its TTL — a real sweep would append no tombstones"
-          : `${plan.length} fact(s) past TTL would be tombstoned as expired (never deleted)`,
+        planTotal === null
+          ? `This fact store is too large to preview here. Run ${memoryVerb("sweep", spec)} to sweep it.`
+          : planTotal === 0
+            ? "nothing is past its TTL — a real sweep would append no tombstones"
+            : `${planTotal} fact(s) past TTL would be tombstoned as expired (never deleted)`,
     };
   }
   const store = factStore(ctx, spec);
@@ -680,12 +798,13 @@ export const memorySweep: M3Handler = async (ctx) => {
       dryRun: false,
       specName: spec,
       plan,
+      planTotal,
       swept: result.swept,
       live: result.live,
       note: "expired facts were tombstoned; every original line is still on disk",
     };
   } catch (err) {
-    return { ok: false, code: "sweep_refused", message: describeFailure(err), plan };
+    return { ok: false, code: "sweep_refused", message: describeFailure(err), plan, planTotal };
   }
 };
 
@@ -917,18 +1036,16 @@ function flatContinuity(
  */
 export const continuity: M3Handler = async (ctx) => {
   const specName = harnessSpecName(ctx);
-  const resolved = resolveStoreDir(ctx, "state", specName, [
-    "focus.md",
-    "goals.yaml",
-    "plans",
-    "handoff.md",
-  ]);
+  const resolved = resolveStoreDir(ctx, "state", specName, STATE_STORE_PROBE);
   const trashDir = containedPath(ctx, [".crewhaus", "trash"]);
   const trashCount = listSubdirs(trashDir).length;
-  const verb = "crewhaus run (then /focus, /plan, /goal)";
   if (resolved === undefined) {
     return {
-      ...readBase(false, "no continuity state yet for this spec", verb),
+      ...readBase(
+        false,
+        "No focus, plans or goals yet. They appear when the harness works on them.",
+        null,
+      ),
       dir: null,
       layout: null,
       specName,
@@ -1026,7 +1143,7 @@ export const continuity: M3Handler = async (ctx) => {
   }
 
   return {
-    ...readBase(true, degraded, verb),
+    ...readBase(true, degraded, null),
     dir: resolved.dir,
     layout: resolved.layout,
     specName,
@@ -1050,10 +1167,9 @@ export const continuity: M3Handler = async (ctx) => {
 export const continuityTrash: M3Handler = async (ctx) => {
   const dir = harnessDirOf(ctx);
   const crewhaus = containedPath(ctx, [".crewhaus"]);
-  const verb = "crewhaus run (then /clear — clearing is what fills the trash)";
   if (crewhaus === undefined || !existsSync(join(crewhaus, "trash"))) {
     return {
-      ...readBase(false, "nothing has been cleared in this harness yet", verb),
+      ...readBase(false, "Nothing has been cleared yet.", null),
       snapshots: [],
       purgeAfterDays: 7,
     };
@@ -1062,7 +1178,7 @@ export const continuityTrash: M3Handler = async (ctx) => {
   try {
     listed = await listTrash(crewhaus);
   } catch (err) {
-    return { ...readBase(false, describeFailure(err), verb), snapshots: [], purgeAfterDays: 7 };
+    return { ...readBase(false, describeFailure(err), null), snapshots: [], purgeAfterDays: 7 };
   }
   const nowMs = ctx.now();
   const snapshots = listed
@@ -1088,7 +1204,7 @@ export const continuityTrash: M3Handler = async (ctx) => {
     ...readBase(
       snapshots.length > 0,
       snapshots.length === 0 ? "the trash directory exists but holds no snapshots" : null,
-      verb,
+      null,
     ),
     snapshots,
     purgeAfterDays: 7,
@@ -1192,7 +1308,7 @@ export function curriculumRungs(text: string): Array<{ text: string; done: boole
 
 /** `gap-*` wiki articles (the standalone gap sink, tagged `gaps/`). */
 function gapArticles(ctx: M3Context, specName: string): Array<{ slug: string; title: string }> {
-  const resolved = resolveStoreDir(ctx, "wiki", specName, ["articles", "index.json"]);
+  const resolved = resolveStoreDir(ctx, "wiki", specName, WIKI_STORE_PROBE);
   if (resolved === undefined) return [];
   const index = readJsonSafe(join(resolved.dir, "index.json"));
   const articles =
@@ -1239,13 +1355,12 @@ export const learning: M3Handler = async (ctx) => {
   const yamlText = readSpecYaml(harnessDirOf(ctx));
   const block = specBlock(yamlText, ["learning"]);
   const declared = specDeclares(yamlText, "learning");
-  const verb = "crewhaus run (then /study and /reflect)";
   if (!declared || block === undefined) {
     return {
       ...readBase(
         false,
         "this spec declares no learning: block — the study/reflect loop is off",
-        verb,
+        null,
       ),
       declared,
       enabled: false,
@@ -1313,7 +1428,7 @@ export const learning: M3Handler = async (ctx) => {
     ...readBase(
       true,
       enabled ? null : "learning: enabled is false — the loop is declared but off",
-      verb,
+      null,
     ),
     declared: true,
     enabled,

@@ -66,6 +66,7 @@ import { join } from "node:path";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
 import {
+  DELTA_090_KEYS,
   OPTIMIZABLE_PATHS,
   REDACTED_VALUE,
   type SpecDiffEntry,
@@ -417,7 +418,11 @@ export const SECURITY_SURFACES: ReadonlyArray<{
     prefix: ["sandbox"],
     reason: "the sandbox is the isolation boundary code execution runs inside",
   },
-  { prefix: ["tool_config"], reason: "tool config decides what the agent's tools may reach" },
+  {
+    prefix: ["tool_config"],
+    anywhere: true,
+    reason: "tool config decides what the agent's tools may reach",
+  },
   {
     prefix: ["transaction_policy"],
     reason: "the transaction policy gates on-chain writes and approvals",
@@ -465,6 +470,12 @@ export const SECURITY_SURFACES: ReadonlyArray<{
     reason:
       "the profile allowlist is what a model-filled Task profile argument is validated against — a roster decision for the child",
   },
+  // Every security row of the owner-keys table, derived, never a hand copy.
+  ...DELTA_090_KEYS.filter((key) => key.security).map((key) => ({
+    prefix: key.pattern,
+    reason: key.reason,
+    ...(key.root === true ? {} : { anywhere: true as const }),
+  })),
 ];
 
 /** `prefix` matches the path from segment `start` (`"*"` = any one segment). */

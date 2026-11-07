@@ -63,6 +63,14 @@ const DAY_MS = 86_400_000;
  *  not safe to write back — the mask would replace what it hid. */
 const MASK_MARK = "***";
 
+/**
+ * What the harness env scrubber leaves behind: a value from the harness's env,
+ * secret or not, served as its variable's name in guillemets. Any name without
+ * a space counts, because an inherited variable can be `ProgramFiles(x86)`.
+ * A real `«word»` also matches, and refusing that costs only an edit here.
+ */
+const SCRUB_MARK = /«[^«»\s]+»/;
+
 /** Human TTL countdown for a fact. Null when the fact has no expiry. */
 export function ttlLabel(expiresInMs) {
   if (typeof expiresInMs !== "number") return null;
@@ -92,6 +100,71 @@ export function costSummary(analytics) {
     unpricedModels: models.length,
     unpricedTurns: typeof unpriced.turns === "number" ? unpriced.turns : 0,
     note: models.length === 0 ? null : (unpriced.note ?? "some models are unpriced"),
+  };
+}
+
+/**
+ * What the editor may do with an article it tried to open. A body it could not
+ * load in full must not be saved back: an empty box, a cut-off read or hidden
+ * text would each replace what is on disk.
+ */
+export function editorGate({ existing, article }) {
+  if (existing !== true) return { canSave: true, status: null, why: null };
+  if (article === null || typeof article !== "object" || typeof article.body !== "string") {
+    return {
+      canSave: false,
+      status: "couldn't load",
+      why: "Couldn't load this article, so it can't be edited here. Reload and try again.",
+    };
+  }
+  if (article.truncated === true) {
+    return { canSave: false, status: "too long", why: "This article is too long to edit here." };
+  }
+  const title = typeof article.title === "string" ? article.title : "";
+  const hidden = (text) => text.includes(MASK_MARK) || SCRUB_MARK.test(text);
+  if (hidden(article.body) || hidden(title)) {
+    return {
+      canSave: false,
+      status: "hidden text",
+      why: "Part of this article is hidden because it looks like a credential or matches one of this harness's settings, so it is read-only here.",
+    };
+  }
+  return { canSave: true, status: null, why: null };
+}
+
+/**
+ * Which wiki controls a harness gets. Only a local wiki is edited from here;
+ * anything else gets a notice in their place, including an answer that does
+ * not say where the wiki lives.
+ */
+export function wikiControls(authority) {
+  const local = authority === "local";
+  return {
+    editor: local,
+    rowEdit: local,
+    rowArchive: local,
+    notice: local ? null : authority === "thredz" ? "thredz" : "unknown",
+  };
+}
+
+/**
+ * What a harness whose wiki is not local says about it. `rowsLine` is for when
+ * local rows are on screen too, so they are not taken for the wiki itself.
+ */
+export function wikiNoticeCopy(authority, hasRows) {
+  const thredz = authority === "thredz";
+  return {
+    tone: thredz ? "off" : "warn",
+    status: thredz ? "kept in Thredz" : "can't tell",
+    sentence: thredz
+      ? "This harness keeps its wiki in Thredz."
+      : "Can't read this harness's spec, so its wiki can't be changed from here.",
+    rowsLine: !hasRows
+      ? null
+      : thredz
+        ? "Articles listed here are local copies, not the Thredz wiki."
+        : "Articles listed here come from this harness's local store.",
+    linksToThredz: thredz,
   };
 }
 
@@ -239,6 +312,27 @@ function empty(payload, fallback) {
   return emptyState(note ?? fallback, verb);
 }
 
+/** Why this harness's wiki can't be edited here, and where it can. */
+export function wikiNotice(authority, harnessId, hasRows = false) {
+  const copy = wikiNoticeCopy(authority, hasRows);
+  return el("div", { class: "gated" }, [
+    dot(copy.tone, copy.status),
+    el("span", { class: "muted gated-why", text: copy.sentence }),
+    copy.rowsLine === null ? null : el("span", { class: "muted gated-why", text: copy.rowsLine }),
+    copy.linksToThredz
+      ? el("a", { href: hrefHarness(harnessId, "thredz"), text: "Open the Thredz wiki" })
+      : null,
+  ]);
+}
+
+/** A fact store too large to fold: what happened, and the command that lists it. */
+export function factsTooLarge(note, verb) {
+  return el("div", { class: "empty" }, [
+    el("div", { class: "empty-msg", text: note }),
+    el("div", { class: "empty-verb" }, ["See them with ", el("code", { text: verb })]),
+  ]);
+}
+
 /** A text input with a label. */
 function field(label, attrs = {}) {
   const input = el("input", { class: "input", type: "text", ...attrs });
@@ -337,7 +431,14 @@ async function factsPanel(host, ctx, reload, spec) {
 
   const items = Array.isArray(data.items) ? data.items : [];
   if (items.length === 0) {
-    host.appendChild(card("Facts", empty(data, "No facts yet")));
+    host.appendChild(
+      card(
+        "Facts",
+        data.tooLarge === true
+          ? factsTooLarge(String(data.note ?? ""), String(data.verb ?? "crewhaus memory list"))
+          : empty(data, "No facts yet"),
+      ),
+    );
   } else {
     const counts = data.counts && typeof data.counts === "object" ? data.counts : {};
     const live = items.filter((i) => i.status === "live");
@@ -348,7 +449,7 @@ async function factsPanel(host, ctx, reload, spec) {
         dot("off", `${fmtCount(counts.superseded ?? 0)} superseded`),
         dot("warn", `${fmtCount(counts.expired ?? 0)} expired`),
         data.truncated === true
-          ? el("span", { class: "chip chip-warn", text: "capped — counts are floors" })
+          ? el("span", { class: "chip", text: "Newest shown · counts are exact" })
           : null,
       ]),
       el(
@@ -737,7 +838,7 @@ async function continuityPanel(host, ctx, reload) {
 function plansCard(data, ctx) {
   const plans = Array.isArray(data.plans) ? data.plans : [];
   if (plans.length === 0) {
-    return card("Plans", emptyState("No plans yet", "crewhaus run (then /plan)"));
+    return card("Plans", emptyState("No plans yet. They appear when the harness works on them."));
   }
   return card(
     "Plans",
@@ -822,7 +923,7 @@ function ladderDot(row) {
 function goalsCard(data) {
   const goals = Array.isArray(data.goals) ? data.goals : [];
   if (goals.length === 0)
-    return card("Goals", emptyState("No goals yet", "crewhaus run (then /goal)"));
+    return card("Goals", emptyState("No goals yet. They appear when the harness works on them."));
   return card(
     "Goals",
     table(
@@ -917,6 +1018,12 @@ async function drawReflect(host, ctx, reload, state) {
   if (data === null) return;
 
   const filters = data.filters && typeof data.filters === "object" ? data.filters : {};
+  const controls = wikiControls(data.authority);
+  const noRows = (Array.isArray(data.articles) ? data.articles : []).length === 0;
+  const notice = controls.notice === null ? null : wikiNotice(data.authority, ctx.id, !noRows);
+  // With nothing to list the notice stands in for the empty state, so its
+  // sentence does not print twice. A filter that hid the rows still says so.
+  const noticeIsEnough = notice !== null && noRows && data.reason !== "filtered";
   const tagInput = field("tags (comma separated)", { value: state.tags });
   const qInput = field("search", { value: state.q });
   const statusSelect = el(
@@ -936,6 +1043,7 @@ async function drawReflect(host, ctx, reload, state) {
 
   host.appendChild(
     card("REFLECT queue", [
+      notice,
       el("p", {
         class: "muted",
         text: `stale-first over ${String(data.total ?? 0)} article(s); the threshold comes from ${String(data.thresholdSource ?? "the default")}`,
@@ -943,7 +1051,7 @@ async function drawReflect(host, ctx, reload, state) {
       el("div", { class: "filter-bar" }, [
         tagInput.node,
         qInput.node,
-        statusSelect,
+        el("label", { class: "field" }, [el("span", { text: "status" }), statusSelect]),
         apply,
         data.sourcesGate === true
           ? el("span", {
@@ -955,9 +1063,11 @@ async function drawReflect(host, ctx, reload, state) {
           : null,
         dot(Number(data.stale ?? 0) > 0 ? "warn" : "ok", `${fmtCount(data.stale ?? 0)} stale`),
       ]),
-      (Array.isArray(data.articles) ? data.articles : []).length === 0
-        ? empty(data, "No wiki articles yet")
-        : reflectTable(data, ctx, host, reload, state),
+      noticeIsEnough
+        ? null
+        : noRows
+          ? empty(data, "No wiki articles yet")
+          : reflectTable(data, ctx, host, reload, state, controls),
       ...(Array.isArray(filters.available) && filters.available.length > 0
         ? [
             el("p", {
@@ -968,21 +1078,23 @@ async function drawReflect(host, ctx, reload, state) {
         : []),
     ]),
   );
-  host.appendChild(editorCard(ctx, host, reload, state, null));
+  if (controls.editor) host.appendChild(editorCard(ctx, host, reload, state, null));
 }
 
-function reflectTable(data, ctx, host, reload, state) {
+function reflectTable(data, ctx, host, reload, state, controls) {
   const rows = (Array.isArray(data.articles) ? data.articles : []).map((row) => {
     const actions = el("div", { class: "cell-actions" }, [
-      el("button", {
-        class: "btn btn-ghost",
-        type: "button",
-        text: "Edit",
-        onClick: () => {
-          clear(host);
-          host.appendChild(editorCard(ctx, host, reload, state, row));
-        },
-      }),
+      controls.rowEdit
+        ? el("button", {
+            class: "btn btn-ghost",
+            type: "button",
+            text: "Edit",
+            onClick: () => {
+              clear(host);
+              host.appendChild(editorCard(ctx, host, reload, state, row));
+            },
+          })
+        : null,
       el("button", {
         class: "btn btn-ghost",
         type: "button",
@@ -995,7 +1107,7 @@ function reflectTable(data, ctx, host, reload, state) {
         text: "Links",
         onClick: () => void linksPanel(host, ctx, reload, state, String(row.slug)),
       }),
-      archiveButton(ctx, host, reload, state, row),
+      controls.rowArchive ? archiveButton(ctx, host, reload, state, row) : null,
     ]);
     return el("tr", null, [
       el("td", null, [
@@ -1064,16 +1176,28 @@ function archiveButton(ctx, host, reload, state, row) {
  * re-read-then-reapply contract, identical for the local and Thredz
  * backends.
  */
+let editorCount = 0;
+
 function editorCard(ctx, host, reload, state, row) {
   const slugField = field("slug", {
     value: row ? String(row.slug) : "",
     placeholder: "kebab-case-slug",
   });
   const titleField = field("title", { value: row ? String(row.title ?? "") : "" });
-  const area = el("textarea", { class: "input", rows: "12", spellcheck: "false" });
+  editorCount += 1;
+  // Why Save is held. Announced when it changes, and read with the fields it
+  // describes, so a keyboard or screen reader user gets the reason too.
+  const guardId = `wiki-editor-guard-${editorCount}`;
+  const guard = el("div", { id: guardId, role: "status" });
+  const area = el("textarea", {
+    class: "input editor-body",
+    rows: "12",
+    spellcheck: "false",
+    "aria-describedby": guardId,
+  });
   const versionLabel = el("span", { class: "muted" });
-  const guard = el("div");
-  const status = el("div");
+  const status = el("div", { role: "status" });
+  const conflict = el("div");
   const expected = { version: row ? Number(row.version ?? 0) : 0 };
 
   const setVersion = (v) => {
@@ -1083,12 +1207,54 @@ function editorCard(ctx, host, reload, state, row) {
   };
   setVersion(row ? Number(row.version ?? 0) : 0);
 
-  const save = el("button", { class: "btn btn-primary", type: "button", text: "Save" });
+  // Held with aria-disabled rather than `disabled`: Save stays in the Tab order
+  // and describes why, and a click says so instead of doing nothing.
+  const save = el("button", {
+    class: "btn btn-primary",
+    type: "button",
+    text: "Save",
+    "aria-describedby": guardId,
+  });
+  let heldBecause = null;
+  let conflictActions = null;
+
+  const holdEditor = (why) => {
+    heldBecause = why;
+    if (why === null) save.removeAttribute("aria-disabled");
+    else save.setAttribute("aria-disabled", "true");
+    const readOnly = why !== null;
+    area.readOnly = readOnly;
+    titleField.input.readOnly = readOnly;
+    slugField.input.readOnly = readOnly;
+  };
+
+  const applyGate = (gate) => {
+    holdEditor(gate.why);
+    area.removeAttribute("aria-busy");
+    clear(guard);
+    if (gate.canSave) return;
+    // A retry goes through the same hold, so there is nothing left to offer.
+    conflictActions?.remove();
+    conflictActions = null;
+    guard.appendChild(
+      el("div", { class: "gated" }, [
+        dot("warn", gate.status),
+        el("span", { class: "muted gated-why", text: gate.why }),
+      ]),
+    );
+  };
 
   if (row) {
-    // Load the live body to edit, and re-read the CURRENT version rather than
-    // trusting the row the queue was painted from — the article may have
-    // moved while the operator was reading the list.
+    // Nothing to save or type until the load settles: a click during it would
+    // write whatever is in the box over the article, and the load would replace
+    // anything typed.
+    holdEditor("Loading this article…");
+    area.setAttribute("aria-busy", "true");
+    guard.appendChild(el("span", { class: "muted", text: "Loading this article…" }));
+    const titleBeforeLoad = titleField.input.value;
+    // Body, title and version come from ONE read, not the row the queue was
+    // painted from. A write landing between two reads would otherwise save an
+    // old body as the newest.
     void (async () => {
       let article = null;
       try {
@@ -1096,29 +1262,21 @@ function editorCard(ctx, host, reload, state, row) {
       } catch {
         article = null;
       }
-      if (article !== null && typeof article.body === "string") area.value = article.body;
-      const versions = await api.wikiVersions({ id: ctx.id, slug: String(row.slug) });
-      if (versions.ok && typeof versions.body?.currentVersion === "number") {
-        setVersion(versions.body.currentVersion);
+      if (article !== null && typeof article.body === "string") {
+        if (area.value === "") area.value = article.body;
+        if (typeof article.title === "string" && titleField.input.value === titleBeforeLoad) {
+          titleField.input.value = article.title;
+        }
+        if (typeof article.version === "number") setVersion(article.version);
       }
-      // Served text is MASKED. Saving a masked span back would persist the
-      // mask over whatever it hid, which is silent data loss — so this one
-      // article is read-only here and says why.
-      if (area.value.includes(MASK_MARK)) {
-        save.disabled = true;
-        clear(guard).appendChild(
-          el("div", { class: "gated" }, [
-            dot("warn", "read-only here"),
-            el("span", {
-              class: "muted gated-why",
-              text: "this body contains a masked credential-shaped span; saving from the console would persist the mask — edit it with `crewhaus wiki write`",
-            }),
-          ]),
-        );
-      }
+      applyGate(editorGate({ existing: true, article }));
     })();
   }
   save.addEventListener("click", () => {
+    if (heldBecause !== null) {
+      toast(heldBecause);
+      return;
+    }
     const slug = slugField.input.value.trim();
     if (slug === "") {
       toast("a slug is required");
@@ -1138,6 +1296,8 @@ function editorCard(ctx, host, reload, state, row) {
         ),
       (res) => {
         clear(status);
+        clear(conflict);
+        conflictActions = null;
         if (!res.ok) return;
         const outcome = writeOutcome(res.body);
         if (outcome.kind === "ok") {
@@ -1163,7 +1323,7 @@ function editorCard(ctx, host, reload, state, row) {
         );
         if (outcome.kind === "stale") {
           const diff = String(res.body?.diff ?? "");
-          if (diff !== "") status.appendChild(el("pre", { class: "rawjson", text: diff }));
+          if (diff !== "") conflict.appendChild(el("pre", { class: "rawjson", text: diff }));
           const retry = el("button", {
             class: "btn",
             type: "button",
@@ -1179,10 +1339,20 @@ function editorCard(ctx, host, reload, state, row) {
             text: "Load what is on disk now",
           });
           takeTheirs.addEventListener("click", () => {
-            area.value = outcome.currentBody ?? "";
+            // `current` is the same masked, capped read as the first load, so
+            // it passes the same gate BEFORE it may replace the draft.
+            const gate = editorGate({ existing: true, article: res.body?.current ?? null });
+            if (!gate.canSave) {
+              applyGate({ ...gate, why: `${gate.why} Your draft is still here to copy.` });
+              area.focus();
+              return;
+            }
+            area.value = outcome.currentBody;
             setVersion(outcome.retryVersion);
+            applyGate(gate);
           });
-          status.appendChild(el("div", { class: "editor-actions" }, [takeTheirs, retry]));
+          conflictActions = el("div", { class: "editor-actions" }, [takeTheirs, retry]);
+          conflict.appendChild(conflictActions);
         }
       },
     );
@@ -1202,7 +1372,7 @@ function editorCard(ctx, host, reload, state, row) {
         ])
       : null,
     el("div", { class: "editor-actions" }, [slugField.node, titleField.node, versionLabel]),
-    area,
+    el("label", { class: "field" }, [el("span", { text: "article text" }), area]),
     guard,
     el("div", { class: "editor-actions" }, [
       save,
@@ -1212,6 +1382,7 @@ function editorCard(ctx, host, reload, state, row) {
       }),
     ]),
     status,
+    conflict,
     signals,
   ]);
 }
@@ -1432,7 +1603,7 @@ async function dreamPanel(host, ctx) {
     card("Nightly cron scaffold", [
       el("p", {
         class: "muted",
-        text: `print-only — this is what \`${String(data.verb ?? "crewhaus dream init")}\` would write to ${String(data.workflowPath ?? "")}`,
+        text: `print-only — this is what \`${String(data.verb ?? "crewhaus dream init crewhaus.yaml")}\` would write to ${String(data.workflowPath ?? "")}`,
       }),
       el("div", { class: "editor-actions" }, [
         el("span", { class: "mono", text: `cron: ${String(data.cron ?? "")}` }),
@@ -1916,7 +2087,7 @@ async function learningPanel(host, ctx) {
   host.appendChild(
     card("Knowledge gaps (the study queue)", [
       goals.length + articles.length === 0
-        ? emptyState("No open gaps", "crewhaus run (the agent logs gaps as it studies)")
+        ? emptyState("No open gaps. The harness logs them as it studies.")
         : el("ul", { class: "check-list" }, [
             ...goals.map((g) =>
               el("li", null, [

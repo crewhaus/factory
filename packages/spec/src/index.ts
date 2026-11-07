@@ -8,6 +8,10 @@ import {
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
+import { intentBlock } from "./blocks/intent";
+
+export { DELTA_090_ISSUES, type SpecAddIssue };
 
 // SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
 // flow verbatim into generated source across ~14 emitters — `//` and `/* */`
@@ -2905,6 +2909,7 @@ const cliSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("cli"),
     // 0.6.0 §4.1 — the model-profile registry (all 14 shapes).
     models: modelsBlock,
@@ -3023,6 +3028,7 @@ const workflowSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("workflow"),
     models: modelsBlock,
     model: z.string().min(1),
@@ -3165,6 +3171,7 @@ const channelSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("channel"),
     models: modelsBlock,
     agent: channelAgentSchema,
@@ -3340,6 +3347,7 @@ const graphSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("graph"),
     models: modelsBlock,
     model: z.string().min(1),
@@ -3417,6 +3425,7 @@ const managedSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("managed"),
     models: modelsBlock,
     agent: managedAgentSchema,
@@ -3524,6 +3533,7 @@ const pipelineSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("pipeline"),
     models: modelsBlock,
     agent: pooledSingleAgentSchema,
@@ -3619,6 +3629,7 @@ const crewSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("crew"),
     models: modelsBlock,
     /** Crew-wide model fallback used by any role that omits `role.model`. */
@@ -3677,6 +3688,7 @@ const researchSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("research"),
     models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
@@ -3725,6 +3737,7 @@ const batchSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("batch"),
     models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
@@ -3774,6 +3787,7 @@ const voiceSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("voice"),
     models: modelsBlock,
     agent: z
@@ -3831,6 +3845,7 @@ const browserSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("browser"),
     models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
@@ -3864,6 +3879,7 @@ const evalSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("eval"),
     models: modelsBlock,
     agent: z
@@ -3934,6 +3950,7 @@ const onchainSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("onchain"),
     models: modelsBlock,
     agent: z
@@ -3971,6 +3988,7 @@ const onchainGameSchema = z
   .object({
     name: safeName,
     version: versionField,
+    intent: intentBlock,
     target: z.literal("onchain-game"),
     models: modelsBlock,
     agent: z
@@ -4126,6 +4144,8 @@ export type SpecObservabilityBlock = z.infer<typeof observabilityBlock>;
 export type SpecWatchmeBlock = z.infer<typeof watchmeBlock>;
 /** 0.8.0 (design §3) — the full `provability:` surface: a rung-name shorthand
  *  or the strict object form, carried on cli/channel/managed/research/crew. */
+/** `intent:` — what this harness is for, in its owner's words, on every shape (#514). */
+export type SpecIntentBlock = z.infer<typeof intentBlock>;
 export type SpecProvabilityBlock = z.infer<typeof provabilityBlock>;
 /** 0.8.0 — the `provability:` object form. */
 export type SpecProvabilityObject = z.infer<typeof provabilityObject>;
@@ -4445,6 +4465,8 @@ function crossFieldIssues(data: Spec): SpecIssue[] {
   // 0.8.0 (design §3) — the provability block's genuine contradictions,
   // appended after every existing check so no 0.7.x spec's first error moves.
   provabilityIssues(data, custom);
+  // The keys added since 0.9.0, after every older check, so no first error moves.
+  for (const check of DELTA_090_ISSUES) check(data, custom);
   return issues;
 }
 
@@ -4537,7 +4559,6 @@ function provabilityIssues(data: Spec, custom: SpecAddIssue): void {
 
 type SpecModelsRegistry = NonNullable<SpecModelsBlock>;
 type SpecModelPool = NonNullable<SpecModelPoolBlock>;
-type SpecAddIssue = (path: (string | number)[], message: string) => void;
 
 /** The fields a `models:` profile and an inline pool candidate share. */
 type SpecProfileLike = {

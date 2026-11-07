@@ -10,7 +10,7 @@
  *   | eval          | `.crewhaus/evals/index.jsonl` `ts` fields  | capped |
  *   | spec change   | `.crewhaus/specs/<spec>/CHANGELOG.md` mtime | stat |
  *   | dream         | `.crewhaus/dream/<spec>/state.json`        | small  |
- *   | wiki          | `.crewhaus/wiki/articles/*.md` mtimes      | stat   |
+ *   | wiki          | the live wiki store's `articles/*.md` mtimes | stat |
  *   | incident      | `.crewhaus/incidents/<dir>` mtimes         | stat   |
  *   | deploy        | `.crewhaus/deployments.json` mtime         | stat   |
  *   | approval      | folded `approvals.jsonl` timestamps        | capped |
@@ -32,6 +32,7 @@ import { readJsonlCapped } from "./jsonl";
 import { maskText } from "./mask";
 import { resolveContained, resolveInside } from "./safety";
 import { resolveSessionRoot } from "./sessions";
+import { liveWikiSegments } from "./store-layout";
 
 /** The activity kinds a digest emits. */
 export const ACTIVITY_KINDS = [
@@ -189,7 +190,8 @@ export function harnessActivity(
   }
 
   // wiki — article mtimes
-  const articlesDir = resolveInside(dir, [".crewhaus", "wiki", "articles"]);
+  const wikiStore = liveWikiSegments(dir);
+  const articlesDir = wikiStore && resolveInside(dir, [...wikiStore, "articles"]);
   if (articlesDir !== undefined) {
     for (const name of listSafe(articlesDir)) {
       if (!name.endsWith(".md")) continue;

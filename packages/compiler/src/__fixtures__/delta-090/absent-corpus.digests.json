@@ -1,0 +1,66 @@
+{
+  "batch": {
+    "agent.ts": "f6e6c7cd0e8bea8a389fe5adf4df364fdb4d0bd53ab026047d70e63a0c61552f",
+    "README.md": "2137bf49f0fdb845998cf61a7a66224bc99b64109562b730934d4a16e035614d"
+  },
+  "browser": {
+    "agent.ts": "897d7fb569cae92a437fb5b3a3da1c0f3c360760a52edc303fae6a9b53e506ca",
+    "README.md": "49055e61deddcb5732017df72c120217bb9e3937e1766d417e1fb6bf672d03bb"
+  },
+  "channel": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "f32b3b88f791c7db4d0438a7e03b675060a28f015ccf5492451ab46de2c9aa29",
+    "daemon.ts": "5fd37b64065192fb8fe355de5a29537a56e0665dd5976d9cd817889e231d4c03",
+    "README.md": "5e4ef406ed614d645422bf50c0cb484b5b3a6b48439be80be60df3d662b7e04f"
+  },
+  "cli": {
+    "agent.ts": "d8c938e8cac31a405bb844b1250d288890883316d250efbf714b517f046e7251",
+    "README.md": "90a1da88dc7a62c525ee8d2e94852a3183a256cd64dd1643210867ce6f937f2c"
+  },
+  "crew": {
+    "orchestrator.ts": "48a0bf633fb1fde95fbb8bb4affbefffa9c99bc875ecfdb8b1c6b25d73dfd8fd",
+    "daemon.ts": "2e45d3494c2b09d033e53c7b58fc70c12e442e2d592032cec18efa070499c986",
+    "agent_editor.ts": "69839d6fe43efeac8f4eb297de7ea878f84335f0c10015da3658e452b7426e01",
+    "README.md": "9f2ca7722f568d40be29827ff6fc0663f03b74f7a83f3e26e16c2cd7756b6b4b"
+  },
+  "eval": {
+    "agent.ts": "a2000c80a651624b420d35d5264944244633ce3058a4e9f56b1d78f0105033ab",
+    "README.md": "b8afa3297cdedee0ff4267d6aefc4082de695f06d6774c3e8fe772f2445df3aa"
+  },
+  "graph": {
+    "agent.ts": "a2ab302eeacba4600bbf6b82d125547c23de809dd3c8bf57f227223727f25fda",
+    "README.md": "14dfb9727493f4009608cad7c9def61368b2a842e2531021675a1ca85e4c5cda"
+  },
+  "managed": {
+    "agent.ts": "1385df3f2d18c5b902d3ba57f8079fbe317facd1b3a73a3bef2324425f0452c6",
+    "daemon.ts": "564a528c062a414e04b444a7c2cadd50795ab56bcddff4f152fa4c4a578aa97e",
+    "README.md": "79ed7c2dd168a6922763833103f033dff5d08c6f20b0d35b560cb85bd037ce90"
+  },
+  "onchain": {
+    "agent.ts": "6e7889adb7ba5ae498efeef9b82dc5b7fe18cb2692cd09137449cb5b7c59a727",
+    "README.md": "2ebf3bbddf9af2636b79783af005fc9e8fe4e56c3fe089ea01c1801fe15c88cc"
+  },
+  "onchain-game": {
+    "agent.ts": "72fe0ca99cf67fa05d8f615b2c115ed7cc34f4e35fa03c60bd3c5c411e981fc6",
+    "README.md": "87f1023904fc0c856784a3c81c0487068c5bd4b44c886213b0664d566a8bf831"
+  },
+  "pipeline": {
+    "agent.ts": "2fbb8a732d65197e3e5c60bbda414c282dd1edce9fd9788c6349ad41527704bb",
+    "README.md": "8ea7d838b63375c3f7f6b509ddc48fecae9fdc1948f0d8caadb8f5ff4d325775"
+  },
+  "research": {
+    "agent.ts": "f549bc46ee46cc0b8b80ecd1d207b63fd1094cafd2269af2ad1f5e5d391def9d",
+    "README.md": "c8b7b7cc98195e75705194da6b7da45e1e12967c902d597107c1e62acc4c2c94"
+  },
+  "voice": {
+    "agent.ts": "6e81b50ee09aabb9d22d2757284649f52c11050da5679d270c40ebf57ebaaf57",
+    "voice-loop.ts": "8b77ecbd2136d9cb5678b65b6461f2571a59280e2c6d89cdb5249c5ca4cd2302",
+    "daemon.ts": "ec71d96297447ce593a63b4ec4e7ac559aa14984960c737d81fad252d8144260",
+    "README.md": "9d9563e74c18260e72f637acb27d72bfde797e735d21ca13c9fd915a15da9b52"
+  },
+  "workflow": {
+    "agent.ts": "59a1c37ce67dfa9c777d58cc29a4dda5963f385d9cfdace686e31cd620962918",
+    "README.md": "b1c80e63f4c6480c0598179bcb194f2f068dfb751286a771df00f532f9d5c419"
+  }
+}

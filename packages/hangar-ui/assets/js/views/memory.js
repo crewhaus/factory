@@ -13,6 +13,7 @@ import { clear, collapsible, dot, el, emptyState, jsonPre, mdBlocks, skeleton } 
 import { hrefHarness } from "../router.js";
 import { fmtRelativeTime } from "../util.js";
 import { jobButton } from "./jobs.js";
+import { factsTooLarge, wikiNotice } from "./memory-fabric.js";
 
 export async function renderMemory(root, ctx) {
   if (ctx.route.wikiSlug !== undefined) {
@@ -56,8 +57,25 @@ function factsCard(data) {
       ? f.items.map((i) => ({ ...i, specName: String(f.specName ?? "") }))
       : [],
   );
+  // A store too large to fold has no rows of its own but is not empty, and it
+  // gets its line even when another store has rows.
+  const tooLarge = files
+    .filter((f) => f?.tooLarge === true)
+    .map((f) =>
+      factsTooLarge(
+        "This fact store is too large to browse here.",
+        `crewhaus memory list --spec ${String(f.specName ?? "")}`,
+      ),
+    );
   if (items.length === 0) {
-    return card("Facts", emptyState("No facts yet", "crewhaus remember"));
+    return card(
+      "Facts",
+      tooLarge.length > 0
+        ? tooLarge
+        : emptyState(
+            "No facts yet. Facts appear when the harness remembers something while it works.",
+          ),
+    );
   }
   const live = items.filter((i) => i.status === "live");
   const folded = items.filter((i) => i.status !== "live");
@@ -87,11 +105,10 @@ function factsCard(data) {
       ),
     );
   }
-  if (files.some((f) => f?.truncated === true)) {
-    children.push(
-      el("p", { class: "muted", text: "Long store — showing the first entries only." }),
-    );
+  if (files.some((f) => f?.truncated === true && f?.tooLarge !== true)) {
+    children.push(el("p", { class: "muted", text: "Long store — showing the newest entries." }));
   }
+  children.push(...tooLarge);
   return card("Facts", children, true);
 }
 
@@ -99,12 +116,20 @@ function wikiCard(data, ctx) {
   // Articles are slugs (the on-disk authority); titles come from the
   // tolerant index.json cache when it has them.
   const slugs = Array.isArray(data?.articles) ? data.articles.map(String) : [];
+  const notice =
+    data?.authority === "thredz" || data?.authority === "unknown"
+      ? wikiNotice(data.authority, ctx.id, slugs.length > 0)
+      : null;
   if (slugs.length === 0) {
-    return card("Wiki", emptyState("No wiki articles yet", "crewhaus wiki write"));
+    return card(
+      "Wiki",
+      notice ??
+        emptyState("No articles yet. The harness writes them as it works, or add one here."),
+    );
   }
   const index = data?.index && typeof data.index === "object" ? data.index : {};
-  return card(
-    "Wiki",
+  return card("Wiki", [
+    notice,
     el(
       "ul",
       { class: "wiki-list" },
@@ -122,7 +147,7 @@ function wikiCard(data, ctx) {
         ]);
       }),
     ),
-  );
+  ]);
 }
 
 async function renderWikiArticle(root, ctx, slug) {
@@ -141,7 +166,7 @@ async function renderWikiArticle(root, ctx, slug) {
   }
   root.appendChild(
     el("article", { class: "card wiki-article" }, [
-      el("h2", { text: slug }),
+      el("h2", { text: typeof data.title === "string" && data.title !== "" ? data.title : slug }),
       data.truncated === true
         ? el("p", { class: "muted", text: "Long article — showing the first part only." })
         : null,
@@ -155,7 +180,10 @@ function continuityCard(data) {
   const goals = typeof data?.goals === "string" ? data.goals : "";
   const plans = Array.isArray(data?.plans) ? data.plans : [];
   if (focus === "" && goals === "" && plans.length === 0) {
-    return card("Continuity", emptyState("No continuity state yet", "crewhaus /focus (or /plan)"));
+    return card(
+      "Continuity",
+      emptyState("No focus, plans or goals yet. They appear when the harness works on them."),
+    );
   }
   const children = [];
   if (focus !== "") {
@@ -183,7 +211,10 @@ function dreamCard(data, ctx, reload) {
   // so "Run now" goes through the job queue, exactly as the CLI would.
   const runNow = jobButton("Run now", ctx.id, "dream-run", undefined, reload);
   if (specs.length === 0) {
-    return card("Dream", [emptyState("No dream state yet", "crewhaus dream run"), runNow]);
+    return card("Dream", [
+      emptyState("No dream state yet", "crewhaus dream run crewhaus.yaml"),
+      runNow,
+    ]);
   }
   const children = specs.map((s) => {
     const state = s?.state && typeof s.state === "object" ? s.state : {};

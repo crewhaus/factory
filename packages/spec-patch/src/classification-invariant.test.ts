@@ -22,7 +22,13 @@
 import { describe, expect, test } from "bun:test";
 import { Spec } from "@crewhaus/spec";
 import type { ZodTypeAny } from "zod";
-import { STRUCTURAL_SEGMENTS, WILDCARD_SEGMENT, humanOwnedReason, isOptimizable } from "./index";
+import {
+  DELTA_090_KEYS,
+  STRUCTURAL_SEGMENTS,
+  WILDCARD_SEGMENT,
+  humanOwnedReason,
+  isOptimizable,
+} from "./index";
 
 type Path = ReadonlyArray<string>;
 
@@ -304,4 +310,60 @@ describe("§9.2 closing invariant — every provability leaf is classified exact
       expect(twice, "CLAIMED TWICE").toEqual([]);
     });
   }
+});
+
+/**
+ * #514 — every leaf under an owner-keys row, on every shape that carries it, is
+ * out of the optimizer's reach and reads as human-owned with the row's reason.
+ * A row that names no leaf on any shape is stale, and fails.
+ */
+describe("the owner-keys table — every leaf under a row is human-owned", () => {
+  const shapes = Spec.options as ReadonlyArray<ZodTypeAny>;
+
+  /** A row matches by its own rule: from the document root, or as a contiguous run anywhere. */
+  const underRow = (path: Path, row: (typeof DELTA_090_KEYS)[number]): boolean =>
+    row.root === true
+      ? matchesAt(path, row.pattern, 0)
+      : path.some((_, i) => matchesAt(path, row.pattern, i));
+
+  /** The leaves a row names on one shape. */
+  const leavesUnder = (shape: ZodTypeAny, row: (typeof DELTA_090_KEYS)[number]): Path[] => {
+    const all = new Set<string>();
+    leaves(shape, [], all);
+    return [...all].map((key) => key.split(" ")).filter((path) => underRow(path, row));
+  };
+
+  for (const row of DELTA_090_KEYS) {
+    const name = row.pattern.join(".");
+
+    test(`${name} names at least one leaf on some shape`, () => {
+      expect(shapes.some((shape) => leavesUnder(shape, row).length > 0)).toBe(true);
+    });
+
+    for (const shape of shapes) {
+      const target = targetOf(shape);
+      test(`${name} on ${target}: no leaf is reachable, and each carries the row's reason`, () => {
+        const reachableLeaves: string[] = [];
+        const wrongReason: string[] = [];
+        for (const path of leavesUnder(shape, row)) {
+          if (reachable(target, path)) reachableLeaves.push(path.join("."));
+          if (humanOwnedReason(concrete(path)) !== row.reason) wrongReason.push(path.join("."));
+        }
+        expect(reachableLeaves).toEqual([]);
+        expect(wrongReason).toEqual([]);
+      });
+    }
+  }
+
+  test("intent yields leaves on all fourteen shapes", () => {
+    const intent = DELTA_090_KEYS.find((row) => row.pattern.join(".") === "intent");
+    expect(intent).toBeDefined();
+    const carrying = shapes.filter(
+      (shape) => leavesUnder(shape, intent as (typeof DELTA_090_KEYS)[number]).length > 0,
+    );
+    expect(carrying.length).toBe(14);
+    expect(
+      leavesUnder(shapes[0] as ZodTypeAny, intent as (typeof DELTA_090_KEYS)[number]).length,
+    ).toBe(4);
+  });
 });

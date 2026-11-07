@@ -543,7 +543,12 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     // Small memory-fabric counts for the Overview mini-cards: live facts +
     // wiki articles on disk. Counts only — the full views stay on their own
     // /memory/* routes.
-    const facts = factsView(dir, now()).files.reduce((n, f) => n + f.live, 0);
+    // A file too large to read has an unknown count, and a sum over it would
+    // be a floor printed as a total.
+    const factFiles = factsView(dir, now()).files;
+    const facts = factFiles.some((f) => f.live === null)
+      ? null
+      : factFiles.reduce((n, f) => n + (f.live ?? 0), 0);
     const articles = wikiView(dir).articles.length;
     return {
       entry,

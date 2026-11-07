@@ -285,7 +285,9 @@ export type LowerOptions = {
  * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
  * the informational codes that it does not), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
- * `compile()` consumer that only reads `.files` keeps working unchanged.
+ * `compile()` consumer that only reads `.files` keeps working unchanged. A
+ * warning code added from 0.9.0 is classified on purpose in
+ * apps/cli/src/compile-warnings.ts, as informational or failing `--strict`.
  */
 export type CompileWarning = {
   readonly code: string;
@@ -413,8 +415,8 @@ function ruleOrderWarnings(spec: Spec): CompileWarning[] {
  * trace SSE) — so they are deliberately NOT listed. `observability` is a
  * top-level key already lowered on all four shapes (crew joins them here);
  * `ask_mode` is a sub-key of the universally-wired `permissions` block, and
- * the ACCEPTED_BUT_UNWIRED mechanism tracks top-level keys only, so there is
- * no nested-path row for it — its absent default (`"pause"`) is the safe
+ * the ACCEPTED_BUT_UNWIRED mechanism tracked top-level keys only then, so there
+ * is no nested-path row for it — its absent default (`"pause"`) is the safe
  * runtime behaviour on every shape regardless.
  *
  * Batch G: `expose:` (G30, the MCP-server projection) and `plugins:` (G32,
@@ -423,10 +425,10 @@ function ruleOrderWarnings(spec: Spec): CompileWarning[] {
  * deliberately NOT listed (declaring them must not warn). `federation`
  * (G31) is a sub-key of the universally-wired `sub_agents` block and
  * `thredz.messaging` (G44) a sub-key of the `thredz` block; both are nested
- * paths the top-level-only mechanism does not track, and both are wired this
+ * paths the then top-level-only mechanism did not track, and both are wired this
  * batch regardless. Item 9's per-role/step `model_pool`/`model_tiers`/
- * `model_fallbacks` are nested under `roles`/`steps`, so the top-level-only
- * mechanism cannot carry a row for them. They lower onto `IrWorkflowStep` /
+ * `model_fallbacks` are nested under `roles`/`steps`, so the then top-level-only
+ * mechanism could not carry a row for them. They lower onto `IrWorkflowStep` /
  * `IrCrewRole` and are emit-wired: per step since 0.4 (target-workflow spreads
  * them into the step's `runChatLoop`), per role since 0.6.0 — target-crew has
  * rendered them onto the role's `RoleDefinition` literal since 0.4, but
@@ -435,14 +437,18 @@ function ruleOrderWarnings(spec: Spec): CompileWarning[] {
  * routing was emitted-but-dead config. Lowering alone never wires anything;
  * the consumer does.
  */
-type UnwiredKey = {
+export type UnwiredKey = {
+  /** The spec key the row is about. A dotted path names a nested key. */
   readonly path: string;
   readonly message: string;
+  /** The release a row added from 0.9.0 landed in. */
+  readonly since?: "0.9.0";
 };
 
-const unwired = (path: string, shape: string, detail: string): UnwiredKey => ({
+const unwired = (path: string, shape: string, detail: string, since?: "0.9.0"): UnwiredKey => ({
   path,
   message: `${path} is accepted on the ${shape} shape but its emitter does not wire it yet — ${detail}`,
+  ...(since !== undefined ? { since } : {}),
 });
 
 const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArray<UnwiredKey>>>> = {
@@ -475,9 +481,9 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   // delete-when-wired contract — schedule carries NO accepted-but-unwired row
   // on any shape. channel + managed have no other unwired top-level keys, so
   // they drop out of the table entirely; batch keeps only its continuity row.
-  // Managed `agent.tools`/`tool_config` are NESTED keys the top-level-only
-  // ACCEPTED_BUT_UNWIRED mechanism does not track, matching how the other
-  // shapes' nested `agent.tools` are handled.
+  // Managed `agent.tools`/`tool_config` are NESTED keys the then top-level-only
+  // ACCEPTED_BUT_UNWIRED mechanism did not track, matching how the other
+  // shapes' nested `agent.tools` were handled.
   batch: [unwired("continuity", "batch", "the generated bundle prints the ignored-note comment")],
   // "Watch me" (design/watch-me.md §6.3) — the `watchme:` block is WIRED on
   // cli (interpreter env stamp + target-cli bundle preamble) and channel
@@ -533,9 +539,29 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
  * nothing worth warning about. 0.8.0: `provability: off` and
  * `{ level: off, … }` are that block's opt-out — the latter is reported as
  * `provability-inert-block` instead, never twice.
+ *
+ * A dotted path walks down first: an ancestor that is absent, `null`, `false`,
+ * `{enabled: false}`, not an object, an array, or a `provability` block at level
+ * off declares nothing beneath it. The rules above then read the last key.
  */
-function specDeclares(spec: Spec, path: string): boolean {
-  const value = (spec as unknown as Record<string, unknown>)[path];
+export function specDeclares(spec: Spec, path: string): boolean {
+  const segments = path.split(".");
+  const leaf = segments.pop() as string;
+  let holder = spec as unknown as Record<string, unknown>;
+  for (const [depth, segment] of segments.entries()) {
+    const ancestor = holder[segment];
+    if (typeof ancestor !== "object" || ancestor === null || Array.isArray(ancestor)) return false;
+    if ((ancestor as { enabled?: unknown }).enabled === false) return false;
+    if (
+      depth === 0 &&
+      segment === "provability" &&
+      provabilityLevelOf(ancestor as SpecProvabilityBlock) === "off"
+    ) {
+      return false;
+    }
+    holder = ancestor as Record<string, unknown>;
+  }
+  const value = holder[leaf];
   if (value === undefined || value === false) return false;
   if (path === "provability") {
     return provabilityLevelOf(value as SpecProvabilityBlock) !== "off";
@@ -548,6 +574,22 @@ function specDeclares(spec: Spec, path: string): boolean {
   return true;
 }
 
+/** An `accepted-but-unwired` warning for each row whose key the spec declares. */
+export function unwiredWarnings(spec: Spec, rows: ReadonlyArray<UnwiredKey>): CompileWarning[] {
+  const out: CompileWarning[] = [];
+  for (const row of rows) {
+    if (specDeclares(spec, row.path)) {
+      out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
+    }
+  }
+  return out;
+}
+
+/** A shape's accepted-but-unwired rows, as copies: the table itself stays private. */
+export function unwiredRows(target: Spec["target"]): ReadonlyArray<UnwiredKey> {
+  return (ACCEPTED_BUT_UNWIRED[target] ?? []).map((row) => ({ ...row }));
+}
+
 /**
  * The spec-key warnings `compile()` prints before it lowers anything: a key
  * the shape accepts but does not wire (`accepted-but-unwired`) and the other
@@ -555,13 +597,7 @@ function specDeclares(spec: Spec, path: string): boolean {
  * them too, rather than saying "clean" for a spec `compile --strict` refuses.
  */
 export function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
-  const rows = ACCEPTED_BUT_UNWIRED[spec.target] ?? [];
-  const out: CompileWarning[] = [];
-  for (const row of rows) {
-    if (specDeclares(spec, row.path)) {
-      out.push({ code: "accepted-but-unwired", path: row.path, message: row.message });
-    }
-  }
+  const out = unwiredWarnings(spec, ACCEPTED_BUT_UNWIRED[spec.target] ?? []);
   // Item 1 (G30) / #394 — `expose:` is wired on cli (via `crewhaus serve
   // --mcp`) and, from 0.5.4, on channel (the bundle mounts its own endpoint).
   // MANAGED still carries it unwired, and the gap is not incidental: the
