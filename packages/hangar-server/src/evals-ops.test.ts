@@ -9,15 +9,19 @@
  *   - a billing-class matrix crash must NOT offer Retry — a real
  *     out-of-funds arrives as a 429 that no amount of retrying fixes;
  *   - a PARTIAL suite entry fails even when the suite file recorded a pass;
- *   - the locked test split cannot be spent without the release-flow
+ *   - the held-out test cases cannot be used without the typed
  *     confirmation, and nothing from a request body can append a flag;
  *   - sentinel attribution is conditional on all four hashes matching;
  *   - an eval-sample annotation is never dropped, and the F-7 join state is
  *     reported honestly rather than faked.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+import { Glob } from "bun";
+import { runCorpusEval } from "./__test__/eval-corpus";
+import { evalArgv } from "./eval-inputs";
 import { classifyCellError, datasetFilterMatches, describeCellCrash, wilson95 } from "./evals-ops";
 import { makeFixtureHarness } from "./fixture";
 import { SCAFFOLDED_WORKFLOWS, WORKFLOWS_DIR_SEGMENTS } from "./scaffolded-workflows";
@@ -49,8 +53,23 @@ function writeJson(dir: string, relative: readonly string[], value: unknown): vo
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+/** One real run's artifacts, out of the real runner, for {@link labHarness} to
+ *  copy: a fixture's own idea of `results.json` proves nothing about a reader. */
+let corpusRoot = "";
+const CORPUS_RUN = "run_000000000000aa01";
+beforeAll(async () => {
+  corpusRoot = mkdtempSync(join(tmpdir(), "hangar-evals-ops-"));
+  await runCorpusEval(corpusRoot, { s1: "pass" }, { runId: CORPUS_RUN, specName: "lab" });
+}, 20_000); // loads the whole eval runner
+afterAll(() => {
+  rmSync(corpusRoot, { recursive: true, force: true });
+});
+
+const CONVENTIONAL_DATASET_LINE = '{"id":"a","input":"x"}\n';
+
 /** A harness with matrix cells, a suite run, a sentinel baseline and a
- *  resumed + partial eval history. */
+ *  resumed + partial eval history. Its graders file is on disk; its dataset
+ *  is not, so a test can say which it is holding. */
 function labHarness(t: TestServer): string {
   const dir = makeFixtureHarness(join(t.harnessesRoot, "lab"), {
     specName: "lab",
@@ -105,14 +124,19 @@ function labHarness(t: TestServer): string {
         outDir: "/gone",
       },
     ],
-    evalRuns: [
-      {
-        runId: "run_000000000000aa01",
-        results: { passRate: 0.9, sampleCount: 10 },
-        samples: { s1: { grades: { pass: true }, meta: { latencyMs: 5 } } },
-      },
-    ],
   });
+  cpSync(
+    join(corpusRoot, ".crewhaus", "evals", CORPUS_RUN),
+    join(dir, ".crewhaus", "evals", CORPUS_RUN),
+    {
+      recursive: true,
+    },
+  );
+  mkdirSync(join(dir, "eval"), { recursive: true });
+  writeFileSync(
+    join(dir, "eval", "graders.yaml"),
+    "graders:\n  - name: m\n    type: exact_match\n",
+  );
   // A matrix run whose one cell died on a quota exhaustion.
   writeJson(dir, [".crewhaus", "evals", "matrix_00ff00ff", "matrix.json"], {
     generatedAt: iso(NOW - DAY),
@@ -307,6 +331,8 @@ describe("the launcher", () => {
       "crewhaus.yaml",
       "--dataset",
       "smoke",
+      "--graders",
+      "eval/graders.yaml",
       "--repeats",
       "3",
       "--seed",
@@ -321,7 +347,7 @@ describe("the launcher", () => {
     expect(injected.status).toBe(400);
   });
 
-  test("the locked test split needs the release-flow confirmation", async () => {
+  test("the held-out test cases need the typed confirmation", async () => {
     const t = boot();
     const id = await register(t, labHarness(t));
     const refused = await t.api(`/api/h/${id}/evals/run`, {
@@ -329,7 +355,10 @@ describe("the launcher", () => {
       body: JSON.stringify({ dataset: "smoke", allowTestSplit: true }),
     });
     expect(refused.status).toBe(409);
-    expect(String(refused.body["error"])).toContain("releaseConfirm");
+    // The person at the form has a word to type, not a field to send.
+    expect(String(refused.body["error"])).toBe(
+      'Type "release" to confirm using the held-out test cases.',
+    );
 
     const spent = await t.api(`/api/h/${id}/evals/run`, {
       method: "POST",
@@ -337,14 +366,17 @@ describe("the launcher", () => {
     });
     expect(spent.status).toBe(200);
     expect(spent.body["argv"]).toContain("--allow-test-split");
-    expect((spent.body["warnings"] as string[]).join(" ")).toContain("burn");
+    const warned = (spent.body["warnings"] as string[]).join(" ");
+    expect(warned).toContain("is not recorded");
+    expect(warned).toContain("Only crewhaus datasets release records a use.");
+    expect(warned).not.toContain("burn");
   });
 
   test("warns when a conventional dataset file shadows the ratings registry", async () => {
     const t = boot();
     const dir = labHarness(t);
     mkdirSync(join(dir, "eval"), { recursive: true });
-    writeFileSync(join(dir, "eval", "dataset.jsonl"), '{"id":"a","input":"x"}\n');
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
     const id = await register(t, dir);
     const { body } = await t.api(`/api/h/${id}/evals/run`, {
       method: "POST",
@@ -353,6 +385,510 @@ describe("the launcher", () => {
     expect((body["warnings"] as string[]).join(" ")).toContain("lab-ratings");
     const fly = await t.api(`/api/h/${id}/evals/flywheel`);
     expect((fly.body["datasetPrecedence"] as { shadowing: boolean }).shadowing).toBe(true);
+  });
+
+  test("a launch with no paths uses the conventional files, and shows the real command", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    const id = await register(t, dir);
+    const { status, body } = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(status).toBe(200);
+    const command = "eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml";
+    expect((body["argv"] as string[]).join(" ")).toBe(command);
+    expect(body["verb"]).toBe(`crewhaus ${command}`);
+  });
+
+  test("missing files answer 409 naming them, dataset first, and queue nothing", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    rmSync(join(dir, "eval", "graders.yaml"));
+    const id = await register(t, dir);
+    const { status, body } = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(status).toBe(409);
+    expect(body["error"]).toBe(
+      "No test cases yet: add eval/dataset.jsonl. No checks yet: add eval/graders.yaml.",
+    );
+    const queue = (await t.api("/api/jobs")).body;
+    expect(queue["pending"]).toEqual([]);
+    expect(queue["running"]).toEqual([]);
+  });
+
+  test("an explicit dataset stands in for the file, but an unset graders still needs one", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    const id = await register(t, dir);
+    const named = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({ dataset: "smoke" }),
+    });
+    expect(named.status).toBe(200);
+
+    rmSync(join(dir, "eval", "graders.yaml"));
+    const noGraders = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({ dataset: "smoke" }),
+    });
+    expect(noGraders.status).toBe(409);
+    expect(noGraders.body["error"]).toBe("No checks yet: add eval/graders.yaml.");
+  });
+
+  test("resume takes a run id and builds its path; anything else is a 400", async () => {
+    const t = boot();
+    const id = await register(t, labHarness(t));
+    const ok = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({ dataset: "smoke", resume: CORPUS_RUN }),
+    });
+    expect(ok.status).toBe(200);
+    const argv = ok.body["argv"] as string[];
+    expect(argv[argv.indexOf("--resume") + 1]).toBe(`.crewhaus/evals/${CORPUS_RUN}`);
+
+    for (const resume of [true, "not-a-run", "../run_000000000000aa01"]) {
+      const refused = await t.api(`/api/h/${id}/evals/run`, {
+        method: "POST",
+        body: JSON.stringify({ dataset: "smoke", resume }),
+      });
+      expect(refused.status).toBe(400);
+      expect(String(refused.body["error"])).toContain('"resume"');
+    }
+  });
+
+  test("POST /jobs fills an eval's inputs the same way, or refuses the same way", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    const id = await register(t, dir);
+    const refused = await t.api(`/api/h/${id}/jobs`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "eval" }),
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body["error"]).toBe("No test cases yet: add eval/dataset.jsonl.");
+
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    const queued = await t.api(`/api/h/${id}/jobs`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "eval" }),
+    });
+    expect(queued.status).toBe(202);
+    expect((queued.body["job"] as { argv: string[] }).argv.join(" ")).toBe(
+      "eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+    );
+  });
+
+  test("the test-split warning names the one verb that records a use", () => {
+    const { warnings } = evalArgv(
+      { dataset: "smoke", graders: "g.yaml", allowTestSplit: true, releaseConfirm: true },
+      {
+        eval: { offered: false, shapeOk: true, note: "x", verb: null },
+        optimize: { offered: false, shapeOk: true, note: "x", verb: null },
+        flywheel: { offered: false, shapeOk: true, note: "x", verb: null },
+        conventional: { dataset: false, graders: false },
+      },
+    );
+    expect(warnings.join(" ")).toContain("datasets release");
+    expect(warnings.join(" ")).toContain("is not recorded");
+  });
+});
+
+describe("what each harness shape is offered", () => {
+  const launchesOf = async (t: TestServer, id: string) =>
+    (await t.api(`/api/h/${id}/evals/flywheel`)).body["launches"] as Record<
+      string,
+      { offered: boolean; shapeOk: boolean; note: string | null; verb: string | null }
+    >;
+
+  test("a workflow gets no eval and no flywheel, but can optimize", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf"), {
+      specName: "wf",
+      target: "workflow",
+    });
+    mkdirSync(join(dir, "eval"), { recursive: true });
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+    const id = await register(t, dir);
+    const launches = await launchesOf(t, id);
+    expect(launches["eval"]).toEqual({
+      offered: false,
+      shapeOk: false,
+      note: "Checks for this harness type run inside its compiled test bundle.",
+      verb: "crewhaus compile crewhaus.yaml --with-eval-harness",
+    });
+    expect(launches["optimize"]?.offered).toBe(true);
+    expect(launches["flywheel"]?.offered).toBe(false);
+
+    // An explicit dataset can fill in for a file, never for a shape.
+    const refused = await t.api(`/api/h/${id}/evals/run`, {
+      method: "POST",
+      body: JSON.stringify({ dataset: "smoke", graders: "eval/graders.yaml" }),
+    });
+    expect(refused.status).toBe(409);
+    const advice = await t.api(`/api/h/${id}/evals/optimize`, {
+      method: "POST",
+      body: JSON.stringify({ fromAdvice: true }),
+    });
+    expect(advice.status).toBe(409);
+    expect(String(advice.body["error"])).toContain("command-line");
+  });
+
+  test("a shape nothing optimizes says so, with no command to paste", async () => {
+    const t = boot();
+    const id = await register(
+      t,
+      makeFixtureHarness(join(t.harnessesRoot, "ch"), { specName: "ch", target: "channel" }),
+    );
+    const launches = await launchesOf(t, id);
+    expect(launches["optimize"]).toEqual({
+      offered: false,
+      shapeOk: false,
+      note: "Automatic prompt search isn't available for this harness type.",
+      verb: null,
+    });
+    expect(launches["flywheel"]?.note).toBe(
+      "The improvement loop runs on command-line harnesses only.",
+    );
+  });
+
+  test("a spec nobody can read offers nothing", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "nospec"), { specName: "nospec" });
+    const id = await register(t, dir);
+    rmSync(join(dir, "crewhaus.yaml"));
+    const launches = await launchesOf(t, id);
+    for (const name of ["eval", "optimize", "flywheel"]) {
+      expect(launches[name]).toEqual({
+        offered: false,
+        shapeOk: false,
+        note: "The spec could not be read.",
+        verb: null,
+      });
+    }
+  });
+
+  test("the evals read carries the eval offer, so an empty history can name its command", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "fresh"), { specName: "fresh" });
+    const id = await register(t, dir);
+    const empty = (await t.api(`/api/h/${id}/evals`)).body;
+    expect(empty["launch"]).toMatchObject({
+      offered: false,
+      note: "No test cases yet: add eval/dataset.jsonl. No checks yet: add eval/graders.yaml.",
+      verb: null,
+    });
+    mkdirSync(join(dir, "eval"), { recursive: true });
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+    const ready = (await t.api(`/api/h/${id}/evals`)).body;
+    expect(ready["launch"]).toEqual({
+      offered: true,
+      shapeOk: true,
+      note: null,
+      verb: "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+    });
+  });
+});
+
+describe("the optimizer launcher", () => {
+  test("missing files answer 409; present ones travel with the mutator", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    const id = await register(t, dir);
+    const refused = await t.api(`/api/h/${id}/evals/optimize`, {
+      method: "POST",
+      body: JSON.stringify({ mutator: "rule-based" }),
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body["error"]).toBe("No test cases yet: add eval/dataset.jsonl.");
+
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    const ok = await t.api(`/api/h/${id}/evals/optimize`, {
+      method: "POST",
+      body: JSON.stringify({ mutator: "rule-based" }),
+    });
+    expect(ok.status).toBe(200);
+    expect((ok.body["argv"] as string[]).join(" ")).toBe(
+      "optimize crewhaus.yaml --mutator rule-based --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+    );
+  });
+
+  test("applying saved suggestions needs no mutator, and sends none", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    const id = await register(t, dir);
+    const { status, body } = await t.api(`/api/h/${id}/evals/optimize`, {
+      method: "POST",
+      body: JSON.stringify({ fromAdvice: true, mutator: "claude" }),
+    });
+    expect(status).toBe(200);
+    const argv = body["argv"] as string[];
+    expect(argv).not.toContain("--mutator");
+    expect(argv[argv.indexOf("--from-advice") + 1]).toBe("suggestions.json");
+  });
+});
+
+describe("the sentinel launcher", () => {
+  test("carries the inputs eval asks for before it reads --sentinel", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    const id = await register(t, dir);
+    const refused = await t.api(`/api/h/${id}/evals/sentinel`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(refused.status).toBe(409);
+
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    const ok = await t.api(`/api/h/${id}/evals/sentinel`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(ok.status).toBe(200);
+    const command =
+      "eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml --sentinel --baseline eval/sentinel-baseline";
+    expect((ok.body["argv"] as string[]).join(" ")).toBe(command);
+    expect(ok.body["verb"]).toBe(`crewhaus ${command}`);
+  });
+});
+
+describe("the flywheel launcher", () => {
+  test("a ratings-driven harness runs with no dataset file, and no flag is added for it", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    mkdirSync(join(dir, ".crewhaus", "datasets", "lab-ratings"), { recursive: true });
+    const id = await register(t, dir);
+    const launches = (await t.api(`/api/h/${id}/evals/flywheel`)).body["launches"] as Record<
+      string,
+      { offered: boolean; verb: string | null }
+    >;
+    expect(launches["flywheel"]).toMatchObject({ offered: true, verb: "crewhaus flywheel run" });
+    expect(launches["eval"]?.offered).toBe(false);
+
+    const { status, body } = await t.api(`/api/h/${id}/evals/flywheel`, {
+      method: "POST",
+      body: JSON.stringify({ iterations: 2 }),
+    });
+    expect(status).toBe(200);
+    expect(body["argv"]).toEqual(["flywheel", "run", "--iterations", "2"]);
+  });
+
+  test("with neither a dataset file nor ratings it refuses, but scaffolding still runs", async () => {
+    const t = boot();
+    const id = await register(t, labHarness(t));
+    const refused = await t.api(`/api/h/${id}/evals/flywheel`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body["error"]).toBe("No test cases yet: add eval/dataset.jsonl.");
+    const init = await t.api(`/api/h/${id}/evals/flywheel`, {
+      method: "POST",
+      body: JSON.stringify({ action: "init" }),
+    });
+    expect(init.status).toBe(200);
+    expect(init.body["argv"]).toEqual(["flywheel", "init"]);
+  });
+});
+
+describe("optimizer run ids", () => {
+  const OPT_ID = `opt_${Date.now().toString(16)}`;
+
+  test("artifacts open for the id the CLI mints, and a run_ id no longer resolves", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    writeJson(dir, [".crewhaus", "optimize", OPT_ID, "patch.json"], { patches: [] });
+    const id = await register(t, dir);
+    const ok = await t.api(`/api/h/${id}/evals/optimize/${OPT_ID}`);
+    expect(ok.status).toBe(200);
+    expect(ok.body["optRunId"]).toBe(OPT_ID);
+    expect(ok.body["patch"]).toEqual({ patches: [] });
+    const legacy = await t.api(`/api/h/${id}/evals/optimize/run_00000000000000aa`);
+    expect(legacy.status).toBe(400);
+  });
+
+  test("the list shows no row the artifacts route would refuse", async () => {
+    const t = boot();
+    const dir = labHarness(t);
+    writeJson(dir, [".crewhaus", "optimize", OPT_ID, "patch.json"], {});
+    writeJson(dir, [".crewhaus", "optimize", "not-an-opt-id", "patch.json"], {});
+    const id = await register(t, dir);
+    const runs = (await t.api(`/api/h/${id}/evals/optimize`)).body["runs"] as Array<{
+      optRunId: string;
+    }>;
+    expect(runs.map((r) => r.optRunId)).toEqual([OPT_ID]);
+  });
+
+  test("every place that mints an optimizer id is one this guard was checked against", () => {
+    // A new id format, or a new minter, fails here before it fails a person.
+    const minter = "opt_${";
+    const root = join(import.meta.dir, "..", "..", "..");
+    const sources = new Glob("{packages,apps}/*/src/**/*.ts");
+    const hits: string[] = [];
+    let scanned = 0;
+    for (const raw of sources.scanSync({ cwd: root })) {
+      // The scan answers in the platform's separator; the list below is not.
+      const rel = raw.split(sep).join("/");
+      if (rel.endsWith(".test.ts") || rel.includes("__test__")) continue;
+      scanned += 1;
+      if (readFileSync(join(root, rel), "utf8").includes(minter)) hits.push(rel);
+    }
+    expect(scanned).toBeGreaterThan(100);
+    expect(hits.sort()).toEqual([
+      "apps/cli/src/index.ts",
+      "packages/eval-optimizer-orchestrator/src/index.ts",
+      "packages/prompt-optimizer/src/index.ts",
+    ]);
+  }, 20_000); // reads every package's source
+});
+
+describe("a read names only a command that can run on this harness", () => {
+  const COMPILE = "crewhaus compile crewhaus.yaml --with-eval-harness";
+  const seedInputs = (dir: string): void => {
+    mkdirSync(join(dir, "eval"), { recursive: true });
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+  };
+  type Read = { present: boolean; note: string | null; verb: string | null };
+  const read = async (t: TestServer, id: string, path: string): Promise<Read> =>
+    (await t.api(`/api/h/${id}/${path}`)).body as unknown as Read;
+  /** Every read whose verb fills it, in its empty state. */
+  const EVAL_READS = ["evals/trends", "evals/sentinel"];
+  const OPTIMIZE_READS = ["evals/optimize", "evals/optimize/opt_abc123"];
+
+  const harnessOf = async (t: TestServer, target: string, inputs: boolean): Promise<string> => {
+    const dir = makeFixtureHarness(join(t.harnessesRoot, `h-${target}`), {
+      specName: `h-${target}`,
+      target,
+    });
+    if (inputs) seedInputs(dir);
+    return register(t, dir);
+  };
+
+  for (const target of ["workflow", "voice", "channel", "chat"]) {
+    test(`target ${target}: nothing says crewhaus eval, and the reason is what shows`, async () => {
+      const t = boot();
+      const id = await harnessOf(t, target, true);
+      for (const path of EVAL_READS) {
+        const body = await read(t, id, path);
+        expect(body.present).toBe(false);
+        expect(body.verb).toBe(COMPILE);
+        expect(body.note).toBe("Checks for this harness type run inside its compiled test bundle.");
+      }
+    });
+  }
+
+  for (const target of ["voice", "channel", "chat"]) {
+    test(`target ${target}: nothing says crewhaus optimize`, async () => {
+      const t = boot();
+      const id = await harnessOf(t, target, true);
+      const empty = await read(t, id, "evals/optimize");
+      expect(empty.verb).toBeNull();
+      expect(empty.note).toBe("Automatic prompt search isn't available for this harness type.");
+      const one = await read(t, id, "evals/optimize/opt_abc123");
+      expect(one.verb).toBeNull();
+      expect(one.note).toContain("opt_abc123");
+    });
+  }
+
+  test("a workflow, which can optimize, names the command with its inputs", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "workflow", true);
+    for (const path of OPTIMIZE_READS) {
+      expect((await read(t, id, path)).verb).toBe(
+        "crewhaus optimize crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+      );
+    }
+  });
+
+  test("a command-line harness with no inputs gets what to add, not a command that dies", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "cli", false);
+    const both = "No test cases yet: add eval/dataset.jsonl. No checks yet: add eval/graders.yaml.";
+    for (const path of [...EVAL_READS, "evals/optimize"]) {
+      const body = await read(t, id, path);
+      expect(body.verb).toBeNull();
+      expect(body.note).toBe(both);
+    }
+  });
+
+  test("a command-line harness with its inputs gets the exact commands", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "cli", true);
+    const evalCommand =
+      "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml";
+    const trends = await read(t, id, "evals/trends");
+    expect(trends.verb).toBe(evalCommand);
+    expect(trends.note).toBe("no eval runs recorded yet");
+    const sentinel = await read(t, id, "evals/sentinel");
+    expect(sentinel.verb).toBe(`${evalCommand} --seed 1 -o eval/sentinel-baseline`);
+    expect(sentinel.note).toContain("no frozen sentinel baseline");
+    const optimizer = await read(t, id, "evals/optimize");
+    expect(optimizer.note).toBe("no optimizer runs recorded");
+  });
+
+  test("the same holds where the read has something to show", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-runs"), {
+      specName: "wf-runs",
+      target: "workflow",
+      evalIndex: [
+        {
+          runId: "run_000000000000bb01",
+          specName: "wf-runs",
+          specHash: "s",
+          datasetName: "smoke",
+          datasetHash: "d",
+          passRate: 1,
+          meanScore: 1,
+          sampleCount: 1,
+          ts: iso(NOW - DAY),
+          outDir: "/gone",
+        },
+      ],
+    });
+    writeJson(dir, ["eval", "sentinel-baseline", "run.json"], { runId: "run_x", config: {} });
+    mkdirSync(join(dir, ".crewhaus", "optimize", "opt_abc123"), { recursive: true });
+    const id = await register(t, dir);
+    for (const path of EVAL_READS) {
+      const body = await read(t, id, path);
+      expect(body.present).toBe(true);
+      expect(body.verb).toBe(COMPILE);
+    }
+    // No inputs on disk, so nothing here would run.
+    for (const path of OPTIMIZE_READS) {
+      const body = await read(t, id, path);
+      expect(body.present).toBe(true);
+      expect(body.verb).toBeNull();
+    }
+  });
+
+  test("a filter that matched nothing keeps saying so, on a harness that cannot run evals", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "workflow", true);
+    const body = await read(t, id, "evals/trends?dataset=smoke");
+    expect(body.note).toContain('dataset filter "smoke"');
+    expect(body.verb).toBe(COMPILE);
+  });
+
+  test("the flywheel's read says crewhaus flywheel run only where it runs", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-fly"), {
+      specName: "wf-fly",
+      target: "workflow",
+    });
+    mkdirSync(join(dir, ".crewhaus", "flywheel"), { recursive: true });
+    writeJson(dir, [".crewhaus", "flywheel", "state.json"], {});
+    const id = await register(t, dir);
+    const body = await read(t, id, "evals/flywheel");
+    expect(body.present).toBe(true);
+    expect(body.verb).toBeNull();
   });
 });
 
@@ -377,7 +913,12 @@ describe("the drift sentinel", () => {
 describe("F-7 — the annotation → distill join", () => {
   test("records the annotation run-scoped and reports why distill cannot reach it", async () => {
     const t = boot();
-    const id = await register(t, labHarness(t));
+    const dir = labHarness(t);
+    // A sample whose meta recorded no session, as an older run's may not.
+    writeJson(dir, [".crewhaus", "evals", "run_000000000000aa01", "s1", "meta.json"], {
+      latencyMs: 5,
+    });
+    const id = await register(t, dir);
     const res = await t.api(`/api/h/${id}/evals/run_000000000000aa01/s1/annotate`, {
       method: "POST",
       body: JSON.stringify({ verdict: "fail", note: "missed the constraint" }),

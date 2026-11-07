@@ -347,6 +347,75 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
   }, 20_000);
 
+  test("baseline set refuses a run that measured nothing, says why, and writes no file", async () => {
+    const proc = async (args: string[], cwd: string) => {
+      const child = Bun.spawn([process.execPath, CLI_PATH, ...args], {
+        cwd,
+        env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      return { stderr, exitCode };
+    };
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ["partial", { partial: true }, /partial \(budget-aborted\)/],
+      ["errored", { errorCount: 5, measuredCount: 0 }, /every case errored/],
+      ["nothing", { measuredCount: 0 }, /measured nothing/],
+    ];
+    for (const [, columns, reason] of cases) {
+      const root = newTempRoot();
+      const evalsDir = join(root, ".crewhaus", "evals");
+      mkdirSync(evalsDir, { recursive: true });
+      const line = { ...JSON.parse(indexEntry("run_aaaa1111aaaa1111")), ...columns };
+      writeFileSync(join(evalsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+      const result = await proc(["eval-report", "baseline", "set", "run_aaaa1111aaaa1111"], root);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("eval-report baseline set:");
+      expect(result.stderr).toMatch(reason);
+      expect(existsSync(join(evalsDir, "baselines.json"))).toBe(false);
+    }
+  }, 30_000);
+
+  test("a manual pin carries the run's latency and cost, as Hangar's always did", async () => {
+    const root = newTempRoot();
+    const evalsDir = join(root, ".crewhaus", "evals");
+    mkdirSync(evalsDir, { recursive: true });
+    const line = {
+      ...JSON.parse(indexEntry("run_aaaa1111aaaa1111")),
+      p95LatencyMs: 120,
+      costUsd: 0.25,
+    };
+    writeFileSync(join(evalsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+    const result = await runCli(["eval-report", "baseline", "set", "run_aaaa1111aaaa1111"], root);
+    expect(result.exitCode).toBe(0);
+    const baselines = JSON.parse(readFileSync(join(evalsDir, "baselines.json"), "utf-8"));
+    expect(baselines["concierge::smoke"]).toMatchObject({ p95LatencyMs: 120, costUsd: 0.25 });
+  }, 20_000);
+
+  test("optimize --help does not promise numeric-knob proposals", async () => {
+    const child = Bun.spawn([process.execPath, CLI_PATH, "optimize", "--help"], {
+      cwd: newTempRoot(),
+      env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(exitCode).toBe(0);
+    const help = stdout + stderr;
+    expect(help).toContain("rule-based");
+    expect(help).not.toContain("numeric-knob");
+  }, 20_000);
+
   test("baseline set pins a ROUTED run under its own lineage key, not the legacy one", async () => {
     // 0.6.0 §6.1 — `setBaseline` keys on the entry's lineage, so a manual pin
     // that dropped armId/routing would write a cheap arm's run under

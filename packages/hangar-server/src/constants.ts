@@ -70,6 +70,9 @@ export const SESSION_JSONL_RE = /^sess_[0-9a-f]{16}\.jsonl$/;
 /** Eval run-directory id shape (the eval-runner on-disk contract). */
 export const RUN_ID_RE = /^run_[0-9a-f]{16}$/;
 
+/** Optimizer run-directory id shape (`opt_` + the hex clock the CLI mints). */
+export const OPT_RUN_ID_RE = /^opt_[0-9a-f]{1,32}$/;
+
 /** Conservative shape for ids that name a file/dir INSIDE a harness tree
  *  (eval sample ids, wiki slugs, dream spec dirs, memory file stems): one
  *  path segment, no leading dot, no separators — checked BEFORE the

@@ -151,7 +151,7 @@ Both are reported by the tools rather than worked around silently:
    disagreement rather than picking one.
 
 Both `set` and `clear` write through `@crewhaus/eval-report`'s own writers
-(`setBaseline`, `clearBaseline`), which own the key and the file format and
+(`pinRun`, `clearBaseline`), which own the key and the file format and
 write only a regular file, through a temp renamed into place.
 
 ## Testing

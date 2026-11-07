@@ -891,6 +891,11 @@
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
       },
+      "devDependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+      },
     },
     "packages/eval-runner": {
       "name": "@crewhaus/eval-runner",
@@ -1201,6 +1206,11 @@
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/watchme-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
       },
     },
     "packages/hangar-ui": {

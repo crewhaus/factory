@@ -23,14 +23,20 @@
  * the agent-facing `tool-evalops` — can parse the bytes it read instead of
  * handing this module a path to open a second time.
  *
- * These helpers are deliberately dependency-free (node:fs + node:crypto)
- * so other features — auto-baseline diff in the CLI, the future dataset
- * drift sentinel — can reuse them without pulling in the renderer.
+ * These helpers deliberately stay clear of the renderer, so other features —
+ * auto-baseline diff in the CLI, the future dataset drift sentinel — can reuse
+ * them without pulling it in.
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
+import {
+  type EvalRoutingMode,
+  type EvalRunSummary,
+  type SampleResult,
+  sampleAbstained,
+  sampleIsCanary,
+} from "@crewhaus/eval-runner";
 import {
   type SafeFsFailure,
   appendContained,
@@ -135,6 +141,22 @@ export type RunIndexEntry = {
    * before the field existed (read as 0).
    */
   readonly flakyCount?: number;
+  /**
+   * Samples whose invoker or grader threw (`error` or `graderError`). An
+   * errored sample carries a placeholder verdict, so `passRate` cannot say
+   * how much of the run was really graded; this column can. Additive — present
+   * only when above 0, so a run with no errors writes the row it always did,
+   * and absent on entries written before the field existed.
+   */
+  readonly errorCount?: number;
+  /**
+   * Samples that produced a verdict about the spec: neither errored, nor
+   * abstained, nor a contamination canary. Additive — present only when below
+   * {@link sampleCount}, so a fully measured run writes the row it always did,
+   * and absent on entries written before the field existed (such a row cannot
+   * be told from a fully measured one).
+   */
+  readonly measuredCount?: number;
   /**
    * NEW-HUNT-3 — true when the run was cut short by its run-level budget
    * cap (`EvalRunSummary.partial`): samples still queued at abort were
@@ -523,6 +545,12 @@ export function runIndexEntryFromSummary(
   }
   const gradersHash = summary.config.gradersHash;
   const judgeModel = summary.config.judgeModel;
+  const errored = (s: SampleResult): boolean =>
+    s.error !== undefined || s.graderError !== undefined;
+  const errorCount = summary.samples.filter(errored).length;
+  const measuredCount = summary.samples.filter(
+    (s) => !errored(s) && !sampleAbstained(s) && !sampleIsCanary(s),
+  ).length;
   return {
     runId: summary.runId,
     specName: opts.specName,
@@ -547,6 +575,10 @@ export function runIndexEntryFromSummary(
     // C34 — flake count straight off the aggregates (absent = no flakes, so
     // the field only appears on runs that actually measured instability).
     ...(summary.aggregates.flaky !== undefined ? { flakyCount: summary.aggregates.flaky } : {}),
+    // What the run really measured. Both columns appear only when they say
+    // something, so a clean run's row does not move by a byte.
+    ...(errorCount > 0 ? { errorCount } : {}),
+    ...(measuredCount < summary.samples.length ? { measuredCount } : {}),
     // NEW-HUNT-3 — mark budget-aborted runs so history readers can tell this
     // entry's deflated passRate (aborted samples count as errors) from a
     // genuinely measured one.

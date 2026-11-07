@@ -53,6 +53,7 @@
  * `durability.budget` finding. Preflight is the authority on what a start
  * actually needs; this module only prices it.
  */
+import type { EvalHealthState } from "./evals";
 import { withoutTrailingComment } from "./spec-lines";
 
 /** The console tab a deduction is fixed on — every value is a real tab in
@@ -155,7 +156,7 @@ export type HealthInputs = {
    */
   readonly preflight: { readonly items: readonly HealthPreflightItem[] } | null;
   /** `evalHealth()` for this harness, or null when unread. */
-  readonly evalHealth: { readonly healthy: boolean; readonly note: string } | null;
+  readonly evalHealth: { readonly state: EvalHealthState; readonly note: string } | null;
   readonly openIncidents: number;
   /** Supervision state (`running`, `crash-looping`, `terminal`, …) or null
    *  when the process layer holds no handle for this harness. */
@@ -254,7 +255,7 @@ export function computeHealth(inputs: HealthInputs): HealthResult {
   // --- eval health vs the pinned baseline ---------------------------------
   if (inputs.evalHealth === null) {
     unknowns.push("eval history unread — quality vs baseline is unknown");
-  } else if (!inputs.evalHealth.healthy) {
+  } else if (inputs.evalHealth.state === "regressed") {
     deductions.push({
       id: "eval:baseline",
       points: HEALTH_WEIGHTS.evalBelowBaseline,
@@ -262,6 +263,9 @@ export function computeHealth(inputs: HealthInputs): HealthResult {
       detail: inputs.evalHealth.note,
       screen: "evals",
     });
+  } else if (inputs.evalHealth.state === "not_measured") {
+    // Not a pass and not a fault: nobody has measured this.
+    unknowns.push(inputs.evalHealth.note);
   }
 
   // --- open incidents ------------------------------------------------------

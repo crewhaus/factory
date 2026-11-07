@@ -17,7 +17,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getBaseline, readBaselines, readRunIndex, resolveBaseline } from "@crewhaus/eval-report";
+import {
+  type RunIndexEntry,
+  getBaseline,
+  pinFromIndexEntry,
+  readBaselines,
+  readRunIndex,
+  resolveBaseline,
+} from "@crewhaus/eval-report";
 import type { EvalRoutingMode, EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import {
   abstainedSampleIds,
@@ -928,6 +935,59 @@ describe("finishEvalRun — C30 latency/cost gate thresholds + additive ops fiel
     expect(costGateReason(4.9999, 5)).toBeUndefined();
     expect(costGateReason(5, 5)).toBeUndefined();
     expect(costGateReason(5.0001, 5)).toContain("exceeded --max-cost-usd");
+  });
+});
+
+describe("finishEvalRun — a run that measured nothing never becomes a baseline", () => {
+  const errored = (id: string): SampleResult => ({
+    ...makeSample(id, false, 0),
+    error: "invoker crashed",
+  });
+
+  test("a first run in which every case errored pins nothing and says so", async () => {
+    const ctx = newCtx();
+    const summary = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [errored("a"), errored("b")],
+      join(ctx.root, "evals", "run_aaaa1111aaaa1111"),
+    );
+    persistRun(summary);
+    const result = await finish(ctx, summary, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    expect(getBaseline("concierge", "smoke", ctx.evalsDir)).toBeUndefined();
+    expect(ctx.lines).toContain(
+      "[eval] run measured nothing — baseline not pinned (first run for concierge/smoke)",
+    );
+    expect(readRunIndex(ctx.evalsDir)[0]).toMatchObject({ errorCount: 2, measuredCount: 0 });
+  });
+
+  test("--no-promote on such a run reads the same: the refusal comes first", async () => {
+    const ctx = newCtx();
+    const summary = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [errored("a")],
+      join(ctx.root, "evals", "run_aaaa1111aaaa1111"),
+    );
+    persistRun(summary);
+    await finish(ctx, summary, { promote: false });
+    expect(ctx.lines.join("\n")).toContain("run measured nothing — baseline not pinned");
+    expect(ctx.lines.join("\n")).not.toContain("--no-promote");
+  });
+
+  test("a clean run's pin is byte for byte the shared builder's", async () => {
+    const ctx = newCtx();
+    const summary = makeSummary(
+      "run_aaaa1111aaaa1111",
+      [makeSample("a", true, 1)],
+      join(ctx.root, "evals", "run_aaaa1111aaaa1111"),
+    );
+    persistRun(summary);
+    await finish(ctx, summary, {});
+    const row = readRunIndex(ctx.evalsDir)[0] as RunIndexEntry;
+    const expected = pinFromIndexEntry(row, row.ts);
+    if (!expected.ok) throw new Error("expected a pin");
+    const written = JSON.parse(readFileSync(join(ctx.evalsDir, "baselines.json"), "utf8"));
+    expect(JSON.stringify(written["concierge::smoke"])).toBe(JSON.stringify(expected.pin));
   });
 });
 

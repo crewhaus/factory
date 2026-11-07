@@ -161,3 +161,24 @@ export {
   setBaseline,
   writeBaselines,
 } from "./history";
+// The one way a run becomes a baseline: every pin path refuses the same runs
+// for the same reasons, through these.
+export {
+  type MeasurementProblem,
+  type PinOptions,
+  type PinOutcome,
+  type PinRefusal,
+  measurementProblem,
+  pinFromIndexEntry,
+  pinRefusal,
+  pinRun,
+} from "./pin";
+// What the console's run and sample views show, read from the records the
+// eval stack really writes.
+export {
+  type RunStats,
+  type SampleRow,
+  type SampleVerdict,
+  runStatsOf,
+  sampleRowsOf,
+} from "./run-rows";

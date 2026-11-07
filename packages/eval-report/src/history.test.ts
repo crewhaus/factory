@@ -308,6 +308,69 @@ function makeSummary(
  * ONE history whichever way it was launched.
  */
 describe("recordEvalRun / runIndexEntryFromSummary", () => {
+  describe("what a run measured", () => {
+    const opts = { specName: "s", datasetHash: "d", outDir: "/abs/out" };
+    const counts = (samples: SampleResult[]) => {
+      const { errorCount, measuredCount } = runIndexEntryFromSummary(makeSummary(samples), opts);
+      return { errorCount, measuredCount };
+    };
+
+    test("a clean run's row has neither column, so its bytes do not move", () => {
+      const samples = [makeSampleResult("a", true), makeSampleResult("b", false)];
+      const entry = runIndexEntryFromSummary(makeSummary(samples), opts);
+      expect(Object.keys(entry)).not.toContain("errorCount");
+      expect(Object.keys(entry)).not.toContain("measuredCount");
+      expect(entry).toEqual({
+        runId: "run_cccc3333cccc3333",
+        specName: "s",
+        specHash: "spec-hash-1",
+        datasetName: "smoke",
+        datasetHash: "d",
+        passRate: 0.5,
+        meanScore: entry.meanScore,
+        sampleCount: 2,
+        p95LatencyMs: 100,
+        retriedCount: 0,
+        ts: "2026-07-01T00:00:30.000Z",
+        outDir: "/abs/out",
+      });
+    });
+
+    test("an invoker error and a grader throw both count as errored, and neither as measured", () => {
+      expect(
+        counts([
+          { ...makeSampleResult("a", false), error: "boom" },
+          { ...makeSampleResult("b", false), graderError: "429" },
+          makeSampleResult("c", true),
+        ]),
+      ).toEqual({ errorCount: 2, measuredCount: 1 });
+    });
+
+    test("an abstained sample and a canary leave the measured count, without being errors", () => {
+      const abstained = makeSampleResult("a", false);
+      expect(
+        counts([
+          {
+            ...abstained,
+            grades: {
+              ...abstained.grades,
+              overall: { ...abstained.grades.overall, abstained: true },
+            },
+          },
+          { ...makeSampleResult("b", true), metadata: { source: "canary" } },
+          makeSampleResult("c", true),
+        ]),
+      ).toEqual({ errorCount: undefined, measuredCount: 1 });
+    });
+
+    test("every case errored", () => {
+      expect(counts([{ ...makeSampleResult("a", false), error: "boom" }])).toEqual({
+        errorCount: 1,
+        measuredCount: 0,
+      });
+    });
+  });
+
   test("projects a summary onto the index entry the CLI records", () => {
     const entry = runIndexEntryFromSummary(
       makeSummary([makeSampleResult("a", true), makeSampleResult("b", false, true)]),
