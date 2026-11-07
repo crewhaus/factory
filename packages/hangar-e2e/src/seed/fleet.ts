@@ -116,12 +116,6 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
           ],
         },
       ],
-      // The console's article route reads this flat layout, not the per-spec one
-      // the wiki store writes below, so this is the copy its markdown renderer sees.
-      wikiIndex: { version: 1, articles: {} },
-      wikiArticles: {
-        [wikiSlug]: wikiBody,
-      },
       // The memory store mints its ids with Math.random and has no seam for them,
       // so its entries go through the fixture option. They are read back through
       // the real store below, which holds this to the format that store writes.

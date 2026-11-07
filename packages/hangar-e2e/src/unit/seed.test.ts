@@ -113,8 +113,7 @@ describe("seedFleet", () => {
       const planted: Array<[string, string]> = [
         ["session name", join("sessions", `${harness.sessionIds[0]}.json`)],
         ["session log", join("sessions", `${harness.sessionIds[0]}.jsonl`)],
-        ["wiki, flat", join("wiki", "articles", `${harness.wikiSlug}.md`)],
-        ["wiki, per spec", join("wiki", harness.specName, "articles", `${harness.wikiSlug}.md`)],
+        ["wiki", join("wiki", harness.specName, "articles", `${harness.wikiSlug}.md`)],
         ["memory", join("memories", `${harness.specName}.jsonl`)],
         ["feedback", join("feedback", "seed.jsonl")],
         ["run log", join("run", "logs", `${harness.runId}.log`)],
@@ -130,14 +129,12 @@ describe("seedFleet", () => {
           link: text.includes("](javascript:"),
         }).toEqual({ what, script: true, link: true });
       }
-      const article = readFileSync(join(crewhaus, "wiki", "articles", `${harness.wikiSlug}.md`));
-      expect(article.toString()).toContain(MARKUP_PAYLOAD);
-      expect(article.toString()).toContain("](javascript:");
+      const articlePath = join("wiki", harness.specName, "articles", `${harness.wikiSlug}.md`);
+      expect(readFileSync(join(crewhaus, articlePath), "utf8")).toContain(MARKUP_PAYLOAD);
 
       const plain = await seedFleet(tempDir(), { seed: "s", now: NOW, shapes: ["cli"] });
-      const plainDir = plain.harnesses[0]?.dir ?? "";
-      const flat = join(plainDir, ".crewhaus", "wiki", "articles", `${harness.wikiSlug}.md`);
-      expect(readFileSync(flat, "utf8")).not.toContain("__e2eSentinel");
+      const plainCrewhaus = join(plain.harnesses[0]?.dir ?? "", ".crewhaus");
+      expect(readFileSync(join(plainCrewhaus, articlePath), "utf8")).not.toContain("__e2eSentinel");
     });
   });
 });
