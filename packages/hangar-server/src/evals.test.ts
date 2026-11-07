@@ -15,7 +15,14 @@ import {
   runCorpusPartial,
   runCorpusResumed,
 } from "./__test__/eval-corpus";
-import { evalHealth, evalHealthyFlag, evalRunView, evalsView, isOptRunId } from "./evals";
+import {
+  evalHealth,
+  evalHealthyFlag,
+  evalRunView,
+  evalSampleView,
+  evalsView,
+  isOptRunId,
+} from "./evals";
 
 const TMP_ROOTS: string[] = [];
 function harness(): string {
@@ -163,8 +170,27 @@ describe("evalsView", () => {
     await runCorpusCase(dir, "all-errored", { runId: "run_00000000000000e1" });
     await runCorpusCase(dir, "pass", { runId: "run_00000000000000e2" });
     const byId = new Map(evalsView(dir).runs.map((r) => [r.runId, r]));
-    expect(byId.get("run_00000000000000e1")?.pinRefusal).toContain("every case errored");
+    expect(byId.get("run_00000000000000e1")?.pinRefusal).toBe(
+      "Every case errored, so it can't be a baseline.",
+    );
     expect(byId.get("run_00000000000000e2")).not.toHaveProperty("pinRefusal");
+  }, 20_000); // loads the whole eval runner
+
+  test("the console's reason is plain words, whatever a tool is told", async () => {
+    const dir = harness();
+    await runCorpusPartial(dir, { runId: "run_00000000000000e3" });
+    await runCorpusCase(dir, "zero-measured", { runId: "run_00000000000000e4" });
+    const byId = new Map(evalsView(dir).runs.map((r) => [r.runId, r]));
+    expect(byId.get("run_00000000000000e3")?.pinRefusal).toBe(
+      "Stopped at its budget, so it can't be a baseline.",
+    );
+    expect(byId.get("run_00000000000000e4")?.pinRefusal).toBe(
+      "No case got a verdict, so it can't be a baseline.",
+    );
+    for (const run of evalsView(dir).runs) {
+      expect(run.pinRefusal).not.toContain(run.runId);
+      expect(run.pinRefusal).not.toContain("budget-aborted");
+    }
   }, 20_000); // loads the whole eval runner
 });
 
@@ -234,4 +260,57 @@ test("optimizer ids are the minted shape, and only that", () => {
   expect(isOptRunId("opt_")).toBe(false);
   expect(isOptRunId("opt_XYZ")).toBe(false);
   expect(isOptRunId(`opt_${"a".repeat(33)}`)).toBe(false);
+});
+
+describe("a sample's page and its run's table say the same thing", () => {
+  const RUN = "run_00000000000000f1";
+
+  test("for every verdict, read from what the runner really wrote", async () => {
+    const dir = harness();
+    await runCorpusEval(
+      dir,
+      { good: "pass", bad: "fail", broken: "error", unsure: "abstain" },
+      { runId: RUN, canaries: { planted: "pass" } },
+    );
+    const rows = evalRunView(dir, RUN)?.rows ?? [];
+    expect(rows.map((r) => [r.sampleId, r.verdict]).sort()).toEqual([
+      ["bad", "fail"],
+      ["broken", "error"],
+      ["good", "pass"],
+      ["planted", "canary"],
+      ["unsure", "abstained"],
+    ]);
+    for (const row of rows) {
+      const view = evalSampleView(dir, RUN, row.dir as string);
+      expect(view?.verdict).toBe(row.verdict);
+      expect(view?.note).toBe(row.note);
+    }
+  }, 20_000); // loads the whole eval runner
+
+  test("a crash says so, though its grades.json reads as a plain failure", async () => {
+    const dir = harness();
+    await runCorpusCase(dir, "all-errored", { runId: RUN });
+    const view = evalSampleView(dir, RUN, "s1");
+    expect((view?.grades as { overall: { passed: boolean } }).overall.passed).toBe(false);
+    expect(view?.verdict).toBe("error");
+    expect(view?.note).toContain("invoker failed on s1");
+  }, 20_000); // loads the whole eval runner
+
+  test("a torn results file falls back to the sample's own record of a crash", async () => {
+    const dir = harness();
+    await runCorpusCase(dir, "all-errored", { runId: RUN });
+    writeFileSync(join(evalsDirOf(dir), RUN, "results.json"), "{ torn");
+    const view = evalSampleView(dir, RUN, "s1");
+    expect(view?.verdict).toBe("error");
+    expect(view?.note).toContain("invoker failed on s1");
+  }, 20_000); // loads the whole eval runner
+
+  test("with nothing recorded about it, a sample claims no verdict", async () => {
+    const dir = harness();
+    await runCorpusEval(dir, { s1: "fail" }, { runId: RUN });
+    writeFileSync(join(evalsDirOf(dir), RUN, "results.json"), "{ torn");
+    const view = evalSampleView(dir, RUN, "s1");
+    expect(view?.verdict).toBeNull();
+    expect(typeof view?.note).toBe("string");
+  }, 20_000); // loads the whole eval runner
 });

@@ -63,6 +63,23 @@ export function fmtPct(rate) {
   return `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%`;
 }
 
+/** True for a run with no verdict at all: its recorded rate and score are only
+ *  the placeholders an empty aggregate defaults to. */
+export function measuredNothing(run) {
+  return run?.measuredCount === 0 || run?.sampleCount === 0;
+}
+
+/**
+ * What a run's pass rate may honestly be called. A run stopped at its budget or
+ * with no verdict at all has no rate worth printing: its 0% would read as a
+ * score.
+ */
+export function passRateWord(run) {
+  if (run?.partial === true) return "partial";
+  if (measuredNothing(run)) return "not measured";
+  return fmtPct(typeof run?.passRate === "number" ? run.passRate : null);
+}
+
 /** Format an integer count; "—" when unknown. */
 export function fmtCount(n) {
   return typeof n === "number" && Number.isFinite(n) ? String(n) : "—";
@@ -249,11 +266,11 @@ export function oldestCachedAt(rows) {
  */
 export function evalHealth(lastEval) {
   if (!lastEval || typeof lastEval !== "object") return { state: "none", label: "no evals" };
-  const rate = typeof lastEval.passRate === "number" ? lastEval.passRate : null;
-  const pct = rate !== null ? fmtPct(rate) : "—";
-  if (lastEval.healthy === true) return { state: "pass", label: pct };
-  if (lastEval.healthy === false) return { state: "fail", label: pct };
-  return { state: "unknown", label: pct };
+  const label = passRateWord(lastEval);
+  if (measuredNothing(lastEval)) return { state: "unknown", label };
+  if (lastEval.healthy === true) return { state: "pass", label };
+  if (lastEval.healthy === false) return { state: "fail", label };
+  return { state: "unknown", label };
 }
 
 /** True when a Library row warrants a "needs attention" flag in M1 terms. */

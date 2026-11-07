@@ -15,7 +15,7 @@
  *     more than the thing it is judging;
  *   - a matrix cell's crash class decides whether Retry is even offered: a
  *     billing failure is NOT retryable, however much it looks like a 429;
- *   - reading the locked test split is a typed, visible gesture;
+ *   - using the held-out test cases takes a typed confirmation;
  *   - a control is drawn only where its job can start: where it cannot, the
  *     server's sentence says why instead.
  *
@@ -118,6 +118,14 @@ function launchNote(offer) {
     text(String(offer.note ?? "This can't run here yet.")),
     offer.verb ? el("code", { class: "mono", text: ` ${offer.verb}` }) : null,
   ]);
+}
+
+/** The refusal under a panel. An empty read already says it, in its own empty
+ *  state, so it is not said twice. */
+function appendRefusal(card, res, offer) {
+  const data = payload(res);
+  if (data.present === false && data.note === offer.note) return;
+  card.appendChild(launchNote(offer));
 }
 
 /** A card whose body is only drawn when the server said something IS there;
@@ -223,10 +231,10 @@ function refusalText(res) {
 
 /**
  * Conventional paths default from the harness dir, so the common launch is
- * one click. `--allow-test-split` is deliberately NOT a checkbox beside the
- * others: it reads a held-out split, and the server refuses it unless the
- * release confirmation rides along. Only `crewhaus datasets release` counts a
- * use; a direct run reads the split without counting.
+ * one click. `--allow-test-split` is deliberately NOT a checkbox like the others:
+ * it reads the held-out test cases, and the server refuses it without the typed
+ * confirmation. Only `crewhaus datasets release` records a use; a run from here
+ * is not recorded.
  */
 export function launcherCard(ctx, flywheelRes, reload) {
   const offer = launchOf(flywheelRes, "eval");
@@ -246,11 +254,10 @@ export function launcherCard(ctx, flywheelRes, reload) {
   ]);
   const gate = el("input", { type: "checkbox", name: "gate" });
   const holdout = el("input", { type: "checkbox", name: "allowTestSplit" });
-  const confirmField = el("div", { class: "gated" }, [
-    el("span", {
-      class: "gated-why",
-      text: 'reading the held-out split is a release gesture — type "release" to confirm',
-    }),
+  // The sentence names the input. Right after the checkbox in the DOM, so it is
+  // the next stop in tab order the moment it appears.
+  const confirmField = el("label", { class: "gated" }, [
+    el("span", { class: "gated-why", text: 'Type "release" to confirm.' }),
     input("releaseConfirm", { placeholder: "release" }),
   ]);
   confirmField.hidden = true;
@@ -261,9 +268,7 @@ export function launcherCard(ctx, flywheelRes, reload) {
   form.appendChild(
     el("label", { class: "check" }, [
       holdout,
-      el("span", {
-        text: " read the locked test split (not counted: only crewhaus datasets release counts a use)",
-      }),
+      el("span", { text: " Use the held-out test cases (this run is not recorded)" }),
     ]),
   );
   form.appendChild(confirmField);
@@ -794,7 +799,7 @@ export function sentinelCard(ctx, res, reload, flywheelRes) {
   });
   const offer = launchOf(flywheelRes, "eval");
   if (launchRefused(offer)) {
-    card.appendChild(launchNote(offer));
+    appendRefusal(card, res, offer);
     return card;
   }
   const run = el("button", { class: "btn btn-ghost", type: "button", text: "Run sentinel" });
@@ -842,7 +847,7 @@ export function optimizerCard(ctx, res, reload, flywheelRes) {
   });
   const offer = launchOf(flywheelRes, "optimize");
   if (launchRefused(offer)) {
-    card.appendChild(launchNote(offer));
+    appendRefusal(card, res, offer);
     return card;
   }
   const form = el("form", { class: "row-editor" }, [

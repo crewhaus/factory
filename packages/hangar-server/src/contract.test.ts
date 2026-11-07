@@ -242,6 +242,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["meta", "object"],
     ["transcript", "array"],
     ["transcriptTruncated", "boolean"],
+    ["verdict", "string|null"],
+    ["note", "string"],
   ],
   // views/memory.js cards
   "memory:facts": [

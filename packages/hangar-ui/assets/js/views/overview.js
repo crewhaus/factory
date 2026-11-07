@@ -10,10 +10,11 @@ import { clear, collapsible, dot, el, emptyState, skeleton, svgEl } from "../dom
 import {
   barRects,
   fmtCount,
-  fmtPct,
   fmtUsd,
   healthChecks,
+  measuredNothing,
   notMeasuredCopy,
+  passRateWord,
   sparklinePath,
   usdFromMicros,
 } from "../util.js";
@@ -72,7 +73,10 @@ function healthCard(detail) {
   );
 }
 
-function evalTrendCard(evals) {
+/** The trend card. Runs come newest first. A run with no measurement, or one
+ *  stopped at its budget, has no rate to plot; the headline still says what the
+ *  newest run was. */
+export function evalTrendCard(evals) {
   const runs = Array.isArray(evals) ? evals : Array.isArray(evals?.runs) ? evals.runs : [];
   if (runs.length === 0) {
     const copy = notMeasuredCopy(evals);
@@ -80,15 +84,19 @@ function evalTrendCard(evals) {
   }
   const chronological = [...runs].reverse();
   const rates = chronological
+    .filter((r) => r.partial !== true && !measuredNothing(r))
     .map((r) => (typeof r.passRate === "number" ? r.passRate : null))
     .filter((v) => v !== null)
     .slice(-12);
-  const latest = rates.length > 0 ? rates[rates.length - 1] : null;
+  const latest = passRateWord(runs[0]);
   const path = sparklinePath(rates, 220, 44);
   const children = [
     el("div", { class: "big-stat" }, [
-      el("span", { class: "stat-num", text: fmtPct(latest) }),
-      el("span", { class: "muted", text: ` latest pass rate · ${runs.length} runs` }),
+      el("span", { class: "stat-num", text: latest }),
+      el("span", {
+        class: "muted",
+        text: ` ${latest.endsWith("%") ? "latest pass rate" : "latest run"} · ${runs.length} runs`,
+      }),
     ]),
   ];
   if (path !== "") {

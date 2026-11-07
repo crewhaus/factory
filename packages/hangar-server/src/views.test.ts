@@ -282,7 +282,7 @@ describe("eval routes", () => {
     expect(existsSync(join(dir, ".crewhaus", "evals", "baselines.json"))).toBe(false);
 
     const runs = (await t.api(`/api/h/${id}/evals`)).body["runs"] as Array<Record<string, unknown>>;
-    expect(String(runs[0]?.["pinRefusal"])).toContain("every case errored");
+    expect(runs[0]?.["pinRefusal"]).toBe("Every case errored, so it can't be a baseline.");
   }, 20_000); // loads the whole eval runner
 
   test("history rows newest-first + baselines; run view; per-sample artifacts", async () => {

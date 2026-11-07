@@ -29,9 +29,9 @@
  *   - THE BASELINE'S LINEAGE WARNINGS ARE UI STATES. specSource name
  *     collision, gradersHash/judgeModel instrument change, and dataset
  *     keyset change are first-class banners, not buried stderr.
- *   - THE TEST SPLIT IS LOCKED. `--allow-test-split` is a visibly gated
- *     release-flow gesture, never a convenience flag. Only `crewhaus datasets
- *     release` counts a use; a direct run reads the split without counting.
+ *   - HELD-OUT TEST CASES STAY OUT OF NORMAL RUNS. `--allow-test-split` needs a
+ *     typed confirmation, never a stray checkbox. Only `crewhaus datasets
+ *     release` records a use; a direct run with the flag is not recorded.
  *   - SENTINEL ATTRIBUTION IS CONDITIONAL. A flip is provider drift ONLY
  *     when specHash + datasetHash + gradersHash + judgeModel all match the
  *     frozen baseline. Otherwise say what changed instead.
@@ -59,9 +59,8 @@ import {
 import { buildFeedbackRecord } from "@crewhaus/feedback-distill";
 import { MAX_JSONL_LINES, MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import {
-  EVAL_COMMAND,
+  type LaunchOffer,
   type LaunchOffers,
-  OPTIMIZE_COMMAND,
   SENTINEL_BASELINE_PATH,
   evalArgv,
   flywheelArgv,
@@ -355,6 +354,18 @@ const specNameOf = (ctx: M3Context): string => ctx.entry?.specName ?? "spec";
 /** What this harness can run, from its live spec and the files on disk. */
 const offersOf = (ctx: M3Context): LaunchOffers =>
   launchOffers(ctx.harnessDir ?? "", ctx.entry?.target);
+
+/**
+ * What an empty read says when the job that would fill it cannot start: the
+ * offer's reason, which is the thing to do next, in place of "nothing yet".
+ */
+const emptyNote = (offer: LaunchOffer, note: string): string =>
+  offer.offered ? note : (offer.note ?? note);
+
+/** The eval command with a read's own flags. Those flags mean nothing to the
+ *  command a refused offer names instead, so they travel only with a real eval. */
+const evalVerbWith = (offer: LaunchOffer, flags: string): string | null =>
+  offer.offered && offer.verb !== null ? `${offer.verb} ${flags}` : offer.verb;
 
 /**
  * Detect a run directory that can be RESUMED: `run.json` exists (the run
@@ -700,13 +711,14 @@ export const evalTrends: M3Handler = (ctx) => {
   const agentUsd = sum((e) => e.agentCostUsd);
   const judgeUsd = sum((e) => e.judgeCostUsd);
   const total = agentUsd + judgeUsd;
+  const evalOffer = offersOf(ctx).eval;
   if (series.length === 0) {
     return {
       ...absent(
         filter === null || filter === ""
-          ? "no eval runs recorded yet"
+          ? emptyNote(evalOffer, "no eval runs recorded yet")
           : `no eval runs match dataset filter "${filter}" (the filter also matches regression unions like "${filter}+regressions@v1")`,
-        EVAL_COMMAND,
+        evalOffer.verb,
       ),
       series,
       spend: { agentUsd: 0, judgeUsd: 0, judgeShare: null },
@@ -714,7 +726,7 @@ export const evalTrends: M3Handler = (ctx) => {
     };
   }
   return {
-    ...found(null, EVAL_COMMAND),
+    ...found(null, evalOffer.verb),
     series,
     spend: {
       agentUsd,
@@ -1111,11 +1123,15 @@ const SENTINEL_BASELINE: readonly string[] = ["eval", "sentinel-baseline"];
 export const sentinel: M3Handler = (ctx) => {
   const baselineDir = safeContain(ctx, SENTINEL_BASELINE);
   const baselineRun = asObject(readJson(ctx, [...SENTINEL_BASELINE, "run.json"]));
+  const evalOffer = offersOf(ctx).eval;
   if (!isDirAt(baselineDir)) {
     return {
       ...absent(
-        "no frozen sentinel baseline — freeze one, commit it, then run the sentinel against it",
-        `${EVAL_COMMAND} --seed 1 -o ${SENTINEL_BASELINE_PATH}`,
+        emptyNote(
+          evalOffer,
+          "no frozen sentinel baseline — freeze one, commit it, then run the sentinel against it",
+        ),
+        evalVerbWith(evalOffer, `--seed 1 -o ${SENTINEL_BASELINE_PATH}`),
       ),
       baseline: null,
       lastRun: null,
@@ -1151,7 +1167,7 @@ export const sentinel: M3Handler = (ctx) => {
   }
   const comparable = lastRun !== null && mismatches.length === 0;
   return {
-    ...found(null, `${EVAL_COMMAND} --sentinel --baseline ${SENTINEL_BASELINE_PATH}`),
+    ...found(null, evalVerbWith(evalOffer, `--sentinel --baseline ${SENTINEL_BASELINE_PATH}`)),
     baseline,
     lastRun,
     attribution: {
@@ -1252,16 +1268,17 @@ export const optimizer: M3Handler = (ctx) => {
       files: listNames(safeContain(ctx, optimizeSegments(runId))).length,
     }))
     .sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")));
+  const optimizeOffer = offersOf(ctx).optimize;
   if (runs.length === 0) {
     return {
-      ...absent("no optimizer runs recorded", OPTIMIZE_COMMAND),
+      ...absent(emptyNote(optimizeOffer, "no optimizer runs recorded"), optimizeOffer.verb),
       runs,
       acceptance:
         "strict acceptance: a proposal that does not beat the baseline is REJECTED — that is the feature, not a failure",
     };
   }
   return {
-    ...found(null, OPTIMIZE_COMMAND),
+    ...found(null, optimizeOffer.verb),
     runs,
     acceptance:
       "strict acceptance: a proposal that does not beat the baseline is REJECTED — that is the feature, not a failure",
@@ -1287,9 +1304,10 @@ export const optimizerRun: M3Handler = (ctx) => {
 export const optimizerArtifacts: M3Handler = (ctx) => {
   const optRunId = ctx.params["optRunId"] as string;
   const runDir = safeContain(ctx, optimizeSegments(optRunId));
+  const optimizeVerb = offersOf(ctx).optimize.verb;
   if (!isDirAt(runDir)) {
     return {
-      ...absent(`no optimizer run "${optRunId}" on this harness`, OPTIMIZE_COMMAND),
+      ...absent(`no optimizer run "${optRunId}" on this harness`, optimizeVerb),
       optRunId,
       files: [],
       decisions: null,
@@ -1323,7 +1341,7 @@ export const optimizerArtifacts: M3Handler = (ctx) => {
   walk([], 0);
   const patched = readProse(ctx, optimizeSegments(optRunId, "advice", "patched.yaml"));
   return {
-    ...found(null, OPTIMIZE_COMMAND),
+    ...found(null, optimizeVerb),
     optRunId,
     files,
     decisions: readJson(ctx, optimizeSegments(optRunId, "advice", "decisions.json")) ?? null,
@@ -1380,7 +1398,7 @@ export const flywheel: M3Handler = (ctx) => {
     };
   }
   return {
-    ...found(precedence, "crewhaus flywheel run"),
+    ...found(precedence, offers.flywheel.verb),
     scaffolded,
     workflows,
     state: readJson(ctx, [".crewhaus", "flywheel", "state.json"]) ?? null,

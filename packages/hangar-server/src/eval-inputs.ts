@@ -315,19 +315,17 @@ export function evalArgv(body: Body, offers: LaunchOffers): EvalPlan {
     argv.push("--resume", `.crewhaus/evals/${resume}`);
   }
 
-  // The locked holdout. `--allow-test-split` is not a convenience flag: it reads
-  // a version's held-out split. The server refuses it unless the caller also
-  // sent the release-flow confirmation, so a stray checkbox cannot reach it.
+  // The held-out test cases. `--allow-test-split` is not a convenience flag: the
+  // server refuses it without `releaseConfirm: true`, which the form sends only
+  // for the typed word, so a stray checkbox cannot reach it. The refusal is for the
+  // person at that form, who has no fields to send.
   if (body["allowTestSplit"] === true) {
     if (body["releaseConfirm"] !== true) {
-      throw new HttpError(
-        409,
-        'the test split is locked to the release flow — send "releaseConfirm": true alongside "allowTestSplit" to read it. Only `crewhaus datasets release` counts a use; a direct run reads the split without counting.',
-      );
+      throw new HttpError(409, 'Type "release" to confirm using the held-out test cases.');
     }
     argv.push("--allow-test-split");
     warnings.push(
-      "this run reads the locked test split without counting it: only `crewhaus datasets release` counts a use",
+      "This run uses the held-out test cases and is not recorded. Only crewhaus datasets release records a use.",
     );
   }
   return { argv, warnings };

@@ -18,10 +18,10 @@
  *   - `<spec>-ratings` and `<spec>-regressions` are AUTO-MAINTAINED. They are
  *     rendered as such; this surface offers no hand edit that the next
  *     distill would overwrite.
- *   - THE TEST SPLIT IS LOCKED to the release flow, and `releases[]` counts
- *     each `crewhaus datasets release`. Using it is a visible, gated gesture
- *     (the launcher in `eval-inputs.ts` enforces the gate server-side). A direct
- *     run reads the split without counting.
+ *   - HELD-OUT TEST CASES STAY OUT OF NORMAL RUNS, and `releases[]` holds each
+ *     `crewhaus datasets release`, the only thing that records a use. A direct
+ *     run needs a typed confirmation (`eval-inputs.ts` enforces it server-side)
+ *     and is not recorded.
  *   - QUARANTINE IS EVIDENCE. `_quarantine/` entries surface beside the
  *     registry WITH their provenance — a quarantined sample that vanishes
  *     from the UI is a bug report nobody can file.
@@ -152,7 +152,7 @@ function verifyRecord(record: DatasetRecord): VerifyState {
 }
 
 /** Release entries: how many times `crewhaus datasets release` used this
- *  version's test split. A direct run reads the split without counting. */
+ *  version's test split. A direct run is not recorded. */
 function burn(record: DatasetRecord): { count: number; releases: ReadonlyArray<unknown> } {
   const releases = record.releases ?? [];
   return { count: releases.length, releases: releases.map((r) => ({ ...r })) };
@@ -277,7 +277,7 @@ export const dataset: M3Handler = async (ctx) => {
     autoMaintained: autoMaintained(ctx, name),
     testSplit: {
       locked: true,
-      note: "the held-out test split is locked to the release flow. Only crewhaus datasets release counts a use; a direct run reads the split without counting.",
+      note: "Held-out test cases stay out of normal runs. Only crewhaus datasets release records a use.",
       verb: "crewhaus datasets release",
     },
   };

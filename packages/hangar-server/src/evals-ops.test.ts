@@ -9,7 +9,7 @@
  *   - a billing-class matrix crash must NOT offer Retry — a real
  *     out-of-funds arrives as a 429 that no amount of retrying fixes;
  *   - a PARTIAL suite entry fails even when the suite file recorded a pass;
- *   - the locked test split cannot be read without the release-flow
+ *   - the held-out test cases cannot be used without the typed
  *     confirmation, and nothing from a request body can append a flag;
  *   - sentinel attribution is conditional on all four hashes matching;
  *   - an eval-sample annotation is never dropped, and the F-7 join state is
@@ -18,7 +18,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { Glob } from "bun";
 import { runCorpusEval } from "./__test__/eval-corpus";
 import { evalArgv } from "./eval-inputs";
@@ -347,7 +347,7 @@ describe("the launcher", () => {
     expect(injected.status).toBe(400);
   });
 
-  test("the locked test split needs the release-flow confirmation", async () => {
+  test("the held-out test cases need the typed confirmation", async () => {
     const t = boot();
     const id = await register(t, labHarness(t));
     const refused = await t.api(`/api/h/${id}/evals/run`, {
@@ -355,7 +355,10 @@ describe("the launcher", () => {
       body: JSON.stringify({ dataset: "smoke", allowTestSplit: true }),
     });
     expect(refused.status).toBe(409);
-    expect(String(refused.body["error"])).toContain("releaseConfirm");
+    // The person at the form has a word to type, not a field to send.
+    expect(String(refused.body["error"])).toBe(
+      'Type "release" to confirm using the held-out test cases.',
+    );
 
     const spent = await t.api(`/api/h/${id}/evals/run`, {
       method: "POST",
@@ -364,7 +367,8 @@ describe("the launcher", () => {
     expect(spent.status).toBe(200);
     expect(spent.body["argv"]).toContain("--allow-test-split");
     const warned = (spent.body["warnings"] as string[]).join(" ");
-    expect(warned).toContain("datasets release");
+    expect(warned).toContain("is not recorded");
+    expect(warned).toContain("Only crewhaus datasets release records a use.");
     expect(warned).not.toContain("burn");
   });
 
@@ -478,7 +482,7 @@ describe("the launcher", () => {
     );
   });
 
-  test("the test-split warning names the one verb that counts a use", () => {
+  test("the test-split warning names the one verb that records a use", () => {
     const { warnings } = evalArgv(
       { dataset: "smoke", graders: "g.yaml", allowTestSplit: true, releaseConfirm: true },
       {
@@ -489,7 +493,7 @@ describe("the launcher", () => {
       },
     );
     expect(warnings.join(" ")).toContain("datasets release");
-    expect(warnings.join(" ")).not.toContain("recorded");
+    expect(warnings.join(" ")).toContain("is not recorded");
   });
 });
 
@@ -728,7 +732,9 @@ describe("optimizer run ids", () => {
     const sources = new Glob("{packages,apps}/*/src/**/*.ts");
     const hits: string[] = [];
     let scanned = 0;
-    for (const rel of sources.scanSync({ cwd: root })) {
+    for (const raw of sources.scanSync({ cwd: root })) {
+      // The scan answers in the platform's separator; the list below is not.
+      const rel = raw.split(sep).join("/");
       if (rel.endsWith(".test.ts") || rel.includes("__test__")) continue;
       scanned += 1;
       if (readFileSync(join(root, rel), "utf8").includes(minter)) hits.push(rel);
@@ -740,6 +746,150 @@ describe("optimizer run ids", () => {
       "packages/prompt-optimizer/src/index.ts",
     ]);
   }, 20_000); // reads every package's source
+});
+
+describe("a read names only a command that can run on this harness", () => {
+  const COMPILE = "crewhaus compile crewhaus.yaml --with-eval-harness";
+  const seedInputs = (dir: string): void => {
+    mkdirSync(join(dir, "eval"), { recursive: true });
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), CONVENTIONAL_DATASET_LINE);
+    writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+  };
+  type Read = { present: boolean; note: string | null; verb: string | null };
+  const read = async (t: TestServer, id: string, path: string): Promise<Read> =>
+    (await t.api(`/api/h/${id}/${path}`)).body as unknown as Read;
+  /** Every read whose verb fills it, in its empty state. */
+  const EVAL_READS = ["evals/trends", "evals/sentinel"];
+  const OPTIMIZE_READS = ["evals/optimize", "evals/optimize/opt_abc123"];
+
+  const harnessOf = async (t: TestServer, target: string, inputs: boolean): Promise<string> => {
+    const dir = makeFixtureHarness(join(t.harnessesRoot, `h-${target}`), {
+      specName: `h-${target}`,
+      target,
+    });
+    if (inputs) seedInputs(dir);
+    return register(t, dir);
+  };
+
+  for (const target of ["workflow", "voice", "channel", "chat"]) {
+    test(`target ${target}: nothing says crewhaus eval, and the reason is what shows`, async () => {
+      const t = boot();
+      const id = await harnessOf(t, target, true);
+      for (const path of EVAL_READS) {
+        const body = await read(t, id, path);
+        expect(body.present).toBe(false);
+        expect(body.verb).toBe(COMPILE);
+        expect(body.note).toBe("Checks for this harness type run inside its compiled test bundle.");
+      }
+    });
+  }
+
+  for (const target of ["voice", "channel", "chat"]) {
+    test(`target ${target}: nothing says crewhaus optimize`, async () => {
+      const t = boot();
+      const id = await harnessOf(t, target, true);
+      const empty = await read(t, id, "evals/optimize");
+      expect(empty.verb).toBeNull();
+      expect(empty.note).toBe("Automatic prompt search isn't available for this harness type.");
+      const one = await read(t, id, "evals/optimize/opt_abc123");
+      expect(one.verb).toBeNull();
+      expect(one.note).toContain("opt_abc123");
+    });
+  }
+
+  test("a workflow, which can optimize, names the command with its inputs", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "workflow", true);
+    for (const path of OPTIMIZE_READS) {
+      expect((await read(t, id, path)).verb).toBe(
+        "crewhaus optimize crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+      );
+    }
+  });
+
+  test("a command-line harness with no inputs gets what to add, not a command that dies", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "cli", false);
+    const both = "No test cases yet: add eval/dataset.jsonl. No checks yet: add eval/graders.yaml.";
+    for (const path of [...EVAL_READS, "evals/optimize"]) {
+      const body = await read(t, id, path);
+      expect(body.verb).toBeNull();
+      expect(body.note).toBe(both);
+    }
+  });
+
+  test("a command-line harness with its inputs gets the exact commands", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "cli", true);
+    const evalCommand =
+      "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml";
+    const trends = await read(t, id, "evals/trends");
+    expect(trends.verb).toBe(evalCommand);
+    expect(trends.note).toBe("no eval runs recorded yet");
+    const sentinel = await read(t, id, "evals/sentinel");
+    expect(sentinel.verb).toBe(`${evalCommand} --seed 1 -o eval/sentinel-baseline`);
+    expect(sentinel.note).toContain("no frozen sentinel baseline");
+    const optimizer = await read(t, id, "evals/optimize");
+    expect(optimizer.note).toBe("no optimizer runs recorded");
+  });
+
+  test("the same holds where the read has something to show", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-runs"), {
+      specName: "wf-runs",
+      target: "workflow",
+      evalIndex: [
+        {
+          runId: "run_000000000000bb01",
+          specName: "wf-runs",
+          specHash: "s",
+          datasetName: "smoke",
+          datasetHash: "d",
+          passRate: 1,
+          meanScore: 1,
+          sampleCount: 1,
+          ts: iso(NOW - DAY),
+          outDir: "/gone",
+        },
+      ],
+    });
+    writeJson(dir, ["eval", "sentinel-baseline", "run.json"], { runId: "run_x", config: {} });
+    mkdirSync(join(dir, ".crewhaus", "optimize", "opt_abc123"), { recursive: true });
+    const id = await register(t, dir);
+    for (const path of EVAL_READS) {
+      const body = await read(t, id, path);
+      expect(body.present).toBe(true);
+      expect(body.verb).toBe(COMPILE);
+    }
+    // No inputs on disk, so nothing here would run.
+    for (const path of OPTIMIZE_READS) {
+      const body = await read(t, id, path);
+      expect(body.present).toBe(true);
+      expect(body.verb).toBeNull();
+    }
+  });
+
+  test("a filter that matched nothing keeps saying so, on a harness that cannot run evals", async () => {
+    const t = boot();
+    const id = await harnessOf(t, "workflow", true);
+    const body = await read(t, id, "evals/trends?dataset=smoke");
+    expect(body.note).toContain('dataset filter "smoke"');
+    expect(body.verb).toBe(COMPILE);
+  });
+
+  test("the flywheel's read says crewhaus flywheel run only where it runs", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-fly"), {
+      specName: "wf-fly",
+      target: "workflow",
+    });
+    mkdirSync(join(dir, ".crewhaus", "flywheel"), { recursive: true });
+    writeJson(dir, [".crewhaus", "flywheel", "state.json"], {});
+    const id = await register(t, dir);
+    const body = await read(t, id, "evals/flywheel");
+    expect(body.present).toBe(true);
+    expect(body.verb).toBeNull();
+  });
 });
 
 describe("the drift sentinel", () => {

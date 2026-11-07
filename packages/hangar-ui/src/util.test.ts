@@ -397,6 +397,17 @@ describe("evalHealth / needsAttention / rollupLine", () => {
       label: "60%",
     });
     expect(util.evalHealth({ passRate: 0.8 }).state).toBe("unknown");
+    // A rate no case earned is no rate: never a bare 0%, and never a red dot.
+    for (const healthy of [undefined, false]) {
+      expect(util.evalHealth({ passRate: 0, measuredCount: 0, healthy })).toEqual({
+        state: "unknown",
+        label: "not measured",
+      });
+    }
+    expect(util.evalHealth({ passRate: 0.25, partial: true })).toEqual({
+      state: "unknown",
+      label: "partial",
+    });
     expect(util.evalHealth(null)).toEqual({ state: "none", label: "no evals" });
   });
 

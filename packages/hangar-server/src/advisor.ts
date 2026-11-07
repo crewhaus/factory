@@ -1164,7 +1164,7 @@ export const advisorTrend: M3Handler = (ctx) => {
   return {
     ...found(
       "folded from the eval index, the session cost ledger and the advisor's own decisions — nothing here is a stored snapshot",
-      EVAL_COMMAND,
+      launchOffers(dir, ctx.entry?.target).eval.verb,
     ),
     evalSeries,
     spendDays: costs.days,

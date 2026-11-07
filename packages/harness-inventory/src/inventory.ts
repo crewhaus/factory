@@ -218,6 +218,11 @@ export type LastEval = {
    * happened to run last. Absent on every unrouted harness.
    */
   readonly armId?: string;
+  /** The run stopped at its budget, so `passRate` counts what never ran as failed. */
+  readonly partial?: boolean;
+  /** Samples that got a verdict, carried only when that is fewer than ran. At 0,
+   *  `passRate` is a placeholder rather than a score. */
+  readonly measuredCount?: number;
 };
 
 /** Minimal shape of an eval index entry the fleet row needs. */
@@ -227,6 +232,11 @@ export type LastEvalEntry = {
   readonly ts: string;
   /** 0.6.0 §6.1 — see {@link LastEval.armId}. */
   readonly armId?: string;
+  /** See {@link LastEval.partial}. */
+  readonly partial?: boolean;
+  /** See {@link LastEval.measuredCount}. */
+  readonly measuredCount?: number;
+  readonly sampleCount?: number;
 };
 
 /** One harness's rolled-up inventory row. */
@@ -350,6 +360,13 @@ export function lastEvalFor(evalEntries: ReadonlyArray<LastEvalEntry>): LastEval
     passRate: best.passRate,
     ts: best.ts,
     ...(best.armId !== undefined ? { armId: best.armId } : {}),
+    ...(best.partial === true ? { partial: true } : {}),
+    // A run of no samples measured nothing too, though its row has no column to say so.
+    ...(best.sampleCount === 0
+      ? { measuredCount: 0 }
+      : best.measuredCount !== undefined
+        ? { measuredCount: best.measuredCount }
+        : {}),
   };
 }
 

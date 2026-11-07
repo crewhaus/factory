@@ -13,9 +13,11 @@ import {
   type BaselinesFile,
   INDEX_FILENAME,
   type MeasurementProblem,
+  type PinRefusal,
   type RunIndexEntry,
   type RunStats,
   type SampleRow,
+  type SampleVerdict,
   lineageOfEntry,
   measurementProblem,
   pinRefusal,
@@ -49,6 +51,18 @@ const unreadableNote = (file: string): string =>
 /** An index row, plus why it cannot be a baseline when it cannot. */
 export type EvalsViewRun = RunIndexEntry & { readonly pinRefusal?: string };
 
+/**
+ * What the console says about a run that cannot be a baseline. `pinRefusal`'s own
+ * sentence is written for tools and the CLI, which keep it; this is the same
+ * refusal for someone reading a table, in a row that already names the run.
+ */
+const PIN_REFUSAL_COPY: Readonly<Record<PinRefusal["code"], string>> = {
+  partial: "Stopped at its budget, so it can't be a baseline.",
+  all_errored: "Every case errored, so it can't be a baseline.",
+  nothing_measured: "No case got a verdict, so it can't be a baseline.",
+  lineage_mismatch: "It measured something else, so it can't be this baseline.",
+};
+
 export type EvalsView = {
   readonly runs: readonly EvalsViewRun[];
   readonly baselines: BaselinesFile;
@@ -79,7 +93,7 @@ export function evalsView(harnessDir: string): EvalsView {
   return {
     runs: runs.map((run) => {
       const refusal = pinRefusal(run);
-      return refusal === undefined ? run : { ...run, pinRefusal: refusal.reason };
+      return refusal === undefined ? run : { ...run, pinRefusal: PIN_REFUSAL_COPY[refusal.code] };
     }),
     baselines,
     unreadable,
@@ -99,18 +113,22 @@ export type EvalRunView = {
   readonly rows: readonly SampleRow[];
 };
 
+/** A run's parsed `results.json`, or `null` when it is absent or torn. */
+function readRunSummary(runDir: string): unknown {
+  try {
+    return JSON.parse(readFileSync(join(runDir, "results.json"), "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 /** One run's summary + sample ids. RunId is shape-validated and re-rooted. */
 export function evalRunView(harnessDir: string, runId: string): EvalRunView | undefined {
   if (!isRunId(runId)) return undefined;
   const runDir = resolveInside(harnessDir, [".crewhaus", "evals", runId]);
   if (runDir === undefined || !existsSync(runDir)) return undefined;
-  const resultsPath = join(runDir, "results.json");
-  let summary: unknown = null;
-  try {
-    summary = JSON.parse(readFileSync(resultsPath, "utf8")) as unknown;
-  } catch {
-    summary = null; // absent/torn results — the sample list still renders
-  }
+  // Absent or torn results still leave the sample list to render.
+  const summary = readRunSummary(runDir);
   const sampleIds: string[] = [];
   try {
     for (const entry of readdirSync(runDir).sort()) {
@@ -144,12 +162,49 @@ export function evalRunView(harnessDir: string, runId: string): EvalRunView | un
 export type EvalSampleView = {
   readonly runId: string;
   readonly sampleId: string;
+  /** What the run page says about this sample: the same join, so the two agree.
+   *  `null` when the run recorded nothing about it. */
+  readonly verdict: SampleVerdict | null;
+  /** Why, in the run's own words. An errored sample's error lands here. */
+  readonly note: string;
   readonly grades: unknown;
   readonly meta: unknown;
   /** Transcript lines, capped + torn-tolerant. */
   readonly transcript: readonly unknown[];
   readonly transcriptTruncated: boolean;
 };
+
+const textField = (record: unknown, key: string): string | undefined => {
+  const value =
+    typeof record === "object" && record !== null
+      ? (record as Record<string, unknown>)[key]
+      : undefined;
+  return typeof value === "string" ? value : undefined;
+};
+
+/**
+ * This directory's row from the run's own join. A sample its run has no word on
+ * (a torn results file, a repeat run's extra trial) falls back to what its own
+ * `meta.json` recorded, so a crash never reads as a graded failure.
+ */
+function sampleVerdictOf(
+  runDir: string,
+  sampleId: string,
+  grades: unknown,
+  meta: unknown,
+): Pick<EvalSampleView, "verdict" | "note"> {
+  const row = sampleRowsOf(readRunSummary(runDir), [sampleId]).find((r) => r.dir === sampleId);
+  if (row !== undefined && row.verdict !== "unknown") {
+    return { verdict: row.verdict, note: row.note };
+  }
+  const failure = textField(meta, "error") ?? textField(meta, "graderError");
+  if (failure !== undefined) return { verdict: "error", note: failure };
+  const overall =
+    typeof grades === "object" && grades !== null
+      ? (grades as Record<string, unknown>)["overall"]
+      : undefined;
+  return { verdict: null, note: textField(overall, "rationale") ?? "" };
+}
 
 /** Per-sample artifacts: grades.json, meta.json, capped transcript lines. */
 export function evalSampleView(
@@ -158,8 +213,9 @@ export function evalSampleView(
   sampleId: string,
 ): EvalSampleView | undefined {
   if (!isRunId(runId) || !SAFE_SEGMENT_RE.test(sampleId)) return undefined;
+  const runDir = resolveInside(harnessDir, [".crewhaus", "evals", runId]);
   const sampleDir = resolveInside(harnessDir, [".crewhaus", "evals", runId, sampleId]);
-  if (sampleDir === undefined || !existsSync(sampleDir)) return undefined;
+  if (runDir === undefined || sampleDir === undefined || !existsSync(sampleDir)) return undefined;
   const readJson = (name: string): unknown => {
     try {
       const { text } = readTextCapped(join(sampleDir, name), MAX_TEXT_BYTES);
@@ -169,11 +225,14 @@ export function evalSampleView(
     }
   };
   const transcript = readJsonlCapped(join(sampleDir, "transcript.jsonl"), MAX_JSONL_LINES);
+  const grades = readJson("grades.json");
+  const meta = readJson("meta.json");
   return {
     runId,
     sampleId,
-    grades: readJson("grades.json"),
-    meta: readJson("meta.json"),
+    ...sampleVerdictOf(runDir, sampleId, grades, meta),
+    grades,
+    meta,
     transcript: transcript.objects,
     transcriptTruncated: transcript.truncated,
   };

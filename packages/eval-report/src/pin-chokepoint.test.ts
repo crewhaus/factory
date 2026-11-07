@@ -5,7 +5,7 @@
  */
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { Glob } from "bun";
 import { isTestOnly } from "../../../scripts/test-only";
 
@@ -15,7 +15,9 @@ test("no non-test code outside eval-report writes a pin, and four known paths pi
   const setters: string[] = [];
   const pinners: string[] = [];
   let scanned = 0;
-  for (const rel of new Glob("{packages,apps}/*/src/**/*.ts").scanSync({ cwd: ROOT })) {
+  for (const raw of new Glob("{packages,apps}/*/src/**/*.ts").scanSync({ cwd: ROOT })) {
+    // The scan answers in the platform's separator; the list below is not.
+    const rel = raw.split(sep).join("/");
     if (rel.endsWith(".test.ts") || rel.endsWith(".d.ts") || isTestOnly(rel)) continue;
     scanned += 1;
     if (rel.startsWith("packages/eval-report/")) continue;

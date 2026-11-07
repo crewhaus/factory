@@ -4,8 +4,8 @@
  * Rules the screen carries rather than hides: a verify MISMATCH means
  * TAMPERED (not stale); `<spec>-ratings` and `<spec>-regressions` are
  * auto-maintained and invite no hand edit the next distill would overwrite;
- * the test split is locked to the release flow, and only `crewhaus datasets
- * release` counts a use (a direct run reads the split without counting);
+ * held-out test cases stay out of normal runs, and only `crewhaus datasets
+ * release` records a use;
  * and quarantined samples appear beside the registry with their provenance,
  * because a quarantined sample nobody can see is a bug nobody can file.
  *
@@ -173,7 +173,7 @@ function registryCard(ctx, res, reload) {
     card.appendChild(
       el("p", {
         class: "muted",
-        text: "The held-out test split is locked to the release flow. Only crewhaus datasets release counts a use; a direct run reads the split without counting.",
+        text: "Held-out test cases stay out of normal runs. Only crewhaus datasets release records a use.",
       }),
     );
   });

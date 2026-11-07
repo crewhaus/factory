@@ -8,7 +8,13 @@
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { fmtPct, fmtRelativeTime, fmtUsd, notMeasuredCopy } from "../util.js";
+import {
+  fmtRelativeTime,
+  fmtUsd,
+  measuredNothing,
+  notMeasuredCopy,
+  passRateWord,
+} from "../util.js";
 import { actionTwin } from "./control.js";
 
 export async function renderEvals(root, ctx) {
@@ -77,7 +83,7 @@ export function drawHistory(root, ctx, data, reload) {
         ]),
         el("td", { class: "mono", text: String(run.datasetName ?? run.dataset ?? "—") }),
         el("td", null, [passDot(run)]),
-        el("td", { class: "num", text: fmtScore(run.meanScore) }),
+        el("td", { class: "num", text: meanScoreWord(run) }),
         el("td", {
           class: "num",
           text: fmtUsd(typeof run.costUsd === "number" ? run.costUsd : null),
@@ -179,6 +185,14 @@ export function filterRows(rows, filterId) {
   return rows.filter((r) => filter.verdicts.includes(r.verdict));
 }
 
+/** What one filter found, in words: the count, or the reason there is nothing. */
+export function filterOutcome(rows, filterId) {
+  const shown = filterRows(rows, filterId).length;
+  if (shown > 0) return `${shown} of ${rows.length} cases shown`;
+  const chosen = SAMPLE_FILTERS.find((f) => f.id === filterId);
+  return chosen?.none ?? SAMPLE_FILTERS[0].none;
+}
+
 /** One run, drawn from its `evalRun` payload: `stats` and `rows` are the
  *  server's join of `results.json`, the index row and the sample directories. */
 export function drawRun(root, ctx, runId, data) {
@@ -198,7 +212,7 @@ export function drawRun(root, ctx, runId, data) {
     el("div", { class: "card" }, [
       el("div", { class: "mini-row" }, [
         miniStat("pass rate", passRateWord(stats)),
-        miniStat("mean score", fmtScore(stats.meanScore)),
+        miniStat("mean score", meanScoreWord(stats)),
         miniStat(
           "samples",
           typeof stats.sampleCount === "number" ? String(stats.sampleCount) : "—",
@@ -222,14 +236,14 @@ export function drawRun(root, ctx, runId, data) {
 
   let filter = "all";
   const listWrap = el("div");
+  // Outside `listWrap`, so it outlives each redraw: a live region has to exist
+  // before its text changes, or a screen reader hears nothing of the result.
+  const status = el("p", { class: "muted", role: "status" });
   const drawList = () => {
     clear(listWrap);
     const visible = filterRows(rows, filter);
-    if (visible.length === 0) {
-      const chosen = SAMPLE_FILTERS.find((f) => f.id === filter);
-      listWrap.appendChild(emptyState(chosen?.none ?? SAMPLE_FILTERS[0].none));
-      return;
-    }
+    status.textContent = filterOutcome(rows, filter);
+    if (visible.length === 0) return;
     const tbody = el("tbody");
     for (const row of visible) {
       const sid = String(row.sampleId ?? "");
@@ -299,6 +313,7 @@ export function drawRun(root, ctx, runId, data) {
       }),
     );
     root.appendChild(filterBar);
+    root.appendChild(status);
   }
   drawList();
   root.appendChild(listWrap);
@@ -327,6 +342,25 @@ export function gradeRowsOf(grades) {
     }));
 }
 
+/**
+ * Why a sample's per-grader results are not its verdict. An errored case was
+ * graded on no real output, and a canary has no right answer by construction, so
+ * what those graders recorded must not read as a result.
+ */
+export const GRADES_DO_NOT_COUNT = {
+  error: "This case errored, so these checks don't count.",
+  canary: "This is a canary, a planted case with no right answer, so these checks don't count.",
+};
+
+/** A sample's headline verdict: the run's word for it, the same one the run page
+ *  shows, else what its own grades record. */
+export function sampleVerdict(data) {
+  if (typeof data?.verdict === "string") return data.verdict;
+  const overall = data?.grades?.overall;
+  if (!overall || typeof overall !== "object") return null;
+  return gradeVerdict(overall.passed, overall.abstained === true);
+}
+
 /** One sample, drawn from its `evalSample` payload. */
 export function drawSample(root, ctx, runId, sampleId, data) {
   clear(root);
@@ -340,14 +374,23 @@ export function drawSample(root, ctx, runId, sampleId, data) {
     root.appendChild(emptyState("Nothing here yet — no sample with that id"));
     return;
   }
-  const overall =
-    data.grades?.overall && typeof data.grades.overall === "object" ? data.grades.overall : null;
+  const verdict = sampleVerdict(data);
   const grades = gradeRowsOf(data.grades);
+  const doesNotCount =
+    verdict !== null && Object.hasOwn(GRADES_DO_NOT_COUNT, verdict)
+      ? GRADES_DO_NOT_COUNT[verdict]
+      : null;
   const gradeCard = el("div", { class: "card" }, [
     el("h3", { class: "card-title" }, [
       el("span", { text: "Grades" }),
-      overall === null ? null : passFailDot(overall.passed, overall.abstained === true),
+      verdict === null ? null : verdictDot(verdict),
     ]),
+    typeof data.note === "string" && data.note !== ""
+      ? el("p", { class: "muted", text: data.note })
+      : null,
+    doesNotCount !== null && grades.length > 0
+      ? el("p", { class: "muted", text: doesNotCount })
+      : null,
     grades.length === 0
       ? el("p", { class: "muted", text: "No grades recorded." })
       : el(
@@ -355,9 +398,11 @@ export function drawSample(root, ctx, runId, sampleId, data) {
           { class: "check-list" },
           grades.map((g) =>
             el("li", null, [
-              passFailDot(g.passed, g.abstained),
+              doesNotCount === null ? passFailDot(g.passed, g.abstained) : null,
               el("span", { text: ` ${g.name}` }),
-              el("span", { class: "num muted", text: ` ${fmtScore(g.score)}` }),
+              doesNotCount === null
+                ? el("span", { class: "num muted", text: ` ${fmtScore(g.score)}` })
+                : null,
               g.rationale ? el("div", { class: "muted reason", text: g.rationale }) : null,
             ]),
           ),
@@ -397,21 +442,16 @@ function fmtScore(v) {
   return typeof v === "number" && Number.isFinite(v) ? v.toFixed(2) : "—";
 }
 
-/**
- * What a run's pass rate may honestly be called. A run stopped at its budget or
- * with no verdict at all has no rate worth printing: its 0% would read as a
- * score.
- */
-export function passRateWord(run) {
-  if (run?.partial === true) return "partial";
-  if (run?.measuredCount === 0) return "not measured";
-  return fmtPct(numOr(run?.passRate));
+/** A run's mean score. With no verdict at all, the recorded figure is only the
+ *  aggregate's default, and a bare zero would read as a measured score. */
+export function meanScoreWord(run) {
+  return measuredNothing(run) ? "—" : fmtScore(run?.meanScore);
 }
 
 /** The dot beside a run's pass rate. */
 export function passDotState(run) {
   if (run?.partial === true) return "warn";
-  if (run?.measuredCount === 0 || typeof run?.passRate !== "number") return "unknown";
+  if (measuredNothing(run) || typeof run?.passRate !== "number") return "unknown";
   return run.passRate >= 1 ? "ok" : "warn";
 }
 
