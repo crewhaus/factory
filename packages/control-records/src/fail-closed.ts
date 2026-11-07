@@ -1,0 +1,77 @@
+/**
+ * What the two fail-closed readers share: a whole-file read with no lock, no write and
+ * no environment variable, and a one-second cache per path through an injected clock.
+ * Absent means the file is not there. Everything else that is not a good record is
+ * unreadable, and its reason names the file and the fault, never a value from it.
+ */
+import { lstatSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { resolveContained } from "@crewhaus/tool-safety/fs";
+import { decodeStrict, parseObject, readRecordFile } from "./io";
+
+const CACHE_MS = 1000;
+
+export type WholeFileRead =
+  | { readonly state: "absent" }
+  | { readonly state: "body"; readonly body: Record<string, unknown> }
+  | { readonly state: "unreadable"; readonly reason: string };
+
+/** Something else stands where the record's directory goes, so "not there" would be a guess. */
+function parentIsNotDirectory(root: string, rel: string): boolean {
+  const at = resolveContained(root, dirname(rel));
+  if (!at.ok) return false;
+  try {
+    return !lstatSync(at.real).isDirectory();
+  } catch (err) {
+    return (err as { code?: unknown }).code === "ENOTDIR";
+  }
+}
+
+/** One JSON object file, up to `maxBytes`. A link, a directory or a torn file is unreadable. */
+export function readWholeRecord(root: string, rel: string, maxBytes: number): WholeFileRead {
+  const read = readRecordFile(root, rel, maxBytes);
+  if (!read.ok) {
+    if (read.code !== "not-found") return { state: "unreadable", reason: read.reason };
+    return parentIsNotDirectory(root, rel)
+      ? { state: "unreadable", reason: `the directory of ${rel} is not a directory` }
+      : { state: "absent" };
+  }
+  if (read.truncated) {
+    return { state: "unreadable", reason: `${rel} is larger than ${maxBytes} bytes` };
+  }
+  if (read.bytes.length === 0) return { state: "unreadable", reason: `${rel} is empty` };
+  const text = decodeStrict(read.bytes);
+  const body = text === undefined ? undefined : parseObject(text);
+  return body === undefined
+    ? { state: "unreadable", reason: `${rel} is not a JSON object` }
+    : { state: "body", body };
+}
+
+/** The reader the injected clock drives. Expired entries are dropped on insert. */
+export function cachedPerPath<T>(
+  readNow: (harnessDir: string) => T,
+  now: () => number,
+): (harnessDir: string) => T {
+  const cache = new Map<string, { readonly at: number; readonly answer: T }>();
+  const fresh = (at: number, t: number): boolean => t >= at && t - at < CACHE_MS;
+  return (harnessDir) => {
+    const key = resolve(harnessDir);
+    const t = now();
+    const hit = cache.get(key);
+    if (hit !== undefined && fresh(hit.at, t)) return hit.answer;
+    const answer = readNow(harnessDir);
+    for (const [path, entry] of cache) {
+      if (!fresh(entry.at, t)) cache.delete(path);
+    }
+    cache.set(key, { at: t, answer });
+    return answer;
+  };
+}
+
+export function isText(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+export function isCount(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}

@@ -301,6 +301,7 @@
     { "path": "./packages/sandbox-image-lean4" },
     { "path": "./packages/grader-provability" },
     { "path": "./packages/control-contract" },
+    { "path": "./packages/control-records" },
     { "path": "./apps/cli" }
   ]
 }
