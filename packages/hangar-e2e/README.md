@@ -34,7 +34,7 @@ which runs each shard beside `ci`. `HANGAR_E2E_ARTIFACTS` names where traces and
   in `registry.ts`, and a guard fails if one is missing.
 - **`a11y/`** holds the accessibility toolkit: axe injected through `page.evaluate`, never `bypassCSP`,
   the gate's verdict, and helpers for keyboard operation (a whole-page focus tour, a trap, Escape,
-  containment inside a dialog), reflow, text spacing, reduced motion, an obscured focus and ARIA
+  containment inside a dialog, including focus that Tab cannot move), reflow, text spacing, reduced motion, an obscured focus and ARIA
   snapshots. Each returns findings rather than throwing, and `a11y-self-test` proves each one reports a
   planted fault and stays quiet on a clean page.
 - **`perf/`** holds the benchmark's machinery. The smoke profile checks only that a well-formed report

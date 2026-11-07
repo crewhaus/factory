@@ -120,4 +120,24 @@ describe("the view module's own hygiene", () => {
     expect(source.includes("body.autoApplicable === true")).toBe(true);
     expect(source.includes("confirmName")).toBe(true);
   });
+
+  test("a conflict never re-sends a typed confirmation", async () => {
+    const source = await Bun.file(
+      new URL("../assets/js/views/spec-edit.js", import.meta.url),
+    ).text();
+    // A re-send without asking is for auto-tunable writes only: a `retry`
+    // closure that carried `confirmName` would apply a human-owned edit, with
+    // one click, on top of a version nobody confirmed it against.
+    const retries = [...source.matchAll(/retry(?::| =) \(rev\) =>\s*api\.\w+\([^)]*\)/g)].map(
+      (m) => m[0],
+    );
+    expect(retries.length).toBe(2);
+    for (const retry of retries) {
+      expect(retry.includes("confirmName")).toBe(false);
+      expect(retry.includes("...extra")).toBe(false);
+    }
+    // The typed writes ask again, over a fresh diff.
+    expect(source.match(/conflict\.reconfirm = \(rev\) =>/g)?.length).toBe(2);
+    expect(source.includes("async function reconfirmEdit(")).toBe(true);
+  });
 });

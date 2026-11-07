@@ -23,42 +23,66 @@ import { mountTriage } from "./inbox.js";
 
 export async function renderReview(root) {
   clear(root).appendChild(skeleton(6));
-  await draw(root, false);
+  await draw(root, { showResolved: false, seq: 0, toolbar: null, rollup: null, body: null });
 }
 
-async function draw(host, showResolved) {
+/**
+ * The toolbar, and the "Show resolved" toggle in it, are built once per mount and
+ * kept; only the body under them is repainted. A toggle rebuilt by its own
+ * redraw would drop focus to the page.
+ */
+function frame(host, view) {
+  if (view.body !== null) {
+    clear(view.body);
+    return view.body;
+  }
+  view.rollup = el("span", { class: "rollup" });
+  view.toolbar = el("div", { class: "toolbar" }, [
+    view.rollup,
+    el("span", { class: "spacer" }),
+    toggleBtn({
+      label: "Show resolved",
+      pressed: view.showResolved,
+      onToggle: (next) => {
+        view.showResolved = next;
+        void draw(host, view);
+      },
+    }),
+  ]);
+  view.body = el("div");
+  clear(host).append(view.toolbar, view.body);
+  return view.body;
+}
+
+async function draw(host, view) {
+  const { showResolved } = view;
+  view.seq = (view.seq ?? 0) + 1;
+  const mine = view.seq;
   let payload;
   try {
     payload = await api.review(showResolved);
   } catch (err) {
-    clear(host).appendChild(
-      el("div", { class: "card error-card" }, [
-        el("p", { class: "muted", text: err instanceof Error ? err.message : String(err) }),
-      ]),
-    );
+    const failed = el("div", { class: "card error-card" }, [
+      el("p", { class: "muted", text: err instanceof Error ? err.message : String(err) }),
+    ]);
+    if (mine !== view.seq) return;
+    if (view.body === null) clear(host).appendChild(failed);
+    else frame(host, view).appendChild(failed);
     return;
   }
-  clear(host);
+  // A newer toggle or reload already asked: this answer is out of date.
+  if (mine !== view.seq) return;
+  const body = frame(host, view);
   const nowMs = Date.now();
   const rows = (payload && Array.isArray(payload.items) ? payload.items : []).map((r) =>
     reviewRow(r, nowMs),
   );
   const open = payload && typeof payload.open === "number" ? payload.open : 0;
-  const reload = () => draw(host, showResolved);
+  const reload = () => draw(host, view);
 
-  host.appendChild(
-    el("div", { class: "toolbar" }, [
-      el("span", { class: "rollup", text: `${open} open · ${rows.length} shown` }),
-      el("span", { class: "spacer" }),
-      toggleBtn({
-        label: "Show resolved",
-        pressed: showResolved,
-        onToggle: (next) => draw(host, next),
-      }),
-    ]),
-  );
+  view.rollup.textContent = `${open} open · ${rows.length} shown`;
   if (rows.length === 0) {
-    host.appendChild(
+    body.appendChild(
       emptyFor({
         cause: "no-data",
         detail: showResolved
@@ -69,7 +93,7 @@ async function draw(host, showResolved) {
     );
     return;
   }
-  mountTriage(host, rows, {
+  mountTriage(body, rows, {
     name: "review",
     label: "Review queue",
     keys: REVIEW_KEYS,

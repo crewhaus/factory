@@ -1,10 +1,15 @@
 /**
  * The console by keyboard alone: the skip link, a focus ring and no trap on
  * every gated screen, dialogs that hold focus and give it back, the command
- * menu as a combobox, inbox verdicts that take two keys and only while the
- * list has focus, tooltips, controls that keep focus across their own
- * updates, a refresh that keeps an open editor, and the Readability choices.
+ * menu as a combobox whose armed action the keyboard can confirm, inbox
+ * verdicts that take two keys and only while the list has focus, tooltips,
+ * controls that keep focus across their own updates, a refresh that keeps an
+ * open editor, and the Readability choices. Two edits that must not slip past
+ * a newer version close it: a conflict asks for the typed confirmation again,
+ * and a restored wiki draft saves against the version it was typed on.
  */
+import { join } from "node:path";
+import { createWikiStore } from "@crewhaus/wiki-store";
 import type { JSHandle, Page } from "playwright";
 import type { A11yFinding } from "../a11y/finding";
 import { GATED_TEMPLATES } from "../a11y/gate";
@@ -15,13 +20,14 @@ import { settle } from "../settle";
 import {
   a11yFleet,
   clearPrefs,
+  conflictBody,
   freshVisit,
   mockRefusals,
   resetOverlays,
   setPrefs,
   waitFor,
 } from "./a11y-states";
-import type { Journey } from "./journey";
+import type { Journey, JourneyScope } from "./journey";
 
 const fail = (what: string): never => {
   throw new Error(what);
@@ -191,17 +197,20 @@ async function commandMenu(session: Session, starts: () => number): Promise<void
   await waitFor(page, "dialog.omni-panel[open]", "the command menu");
   await page.keyboard.type("start fleet");
   await waitFor(page, ".omni-action", "a proposed action");
-  for (let i = 0; i < 20; i += 1) {
-    const active = await input.getAttribute("aria-activedescendant");
-    if (
-      active !== null &&
-      (await page.locator(`#${active}`).getAttribute("class"))?.includes("omni-action")
-    )
-      break;
-    await page.keyboard.press("ArrowDown");
-  }
-  await page.keyboard.press("Enter");
-  await waitFor(page, ".omni-confirm-row", "the action's confirm row");
+  const armAction = async (): Promise<void> => {
+    for (let i = 0; i < 20; i += 1) {
+      const active = await input.getAttribute("aria-activedescendant");
+      if (
+        active !== null &&
+        (await page.locator(`#${active}`).getAttribute("class"))?.includes("omni-action")
+      )
+        break;
+      await page.keyboard.press("ArrowDown");
+    }
+    await page.keyboard.press("Enter");
+    await waitFor(page, ".omni-confirm-row", "the action's confirm row");
+  };
+  await armAction();
   if (starts() !== 0) fail("Enter on an action started it without a second step");
   await page.keyboard.press("Escape");
   if (await page.locator(".omni-confirm-row").isVisible())
@@ -217,6 +226,35 @@ async function commandMenu(session: Session, starts: () => number): Promise<void
   if (!(await activeMatches(page, "button.omni-open")))
     fail("focus did not return to the command menu button");
   if (starts() !== 0) fail("the command menu started something");
+
+  // …and the keyboard alone can confirm it: Tab reaches "Run it", Enter
+  // presses it once. The start is answered with a refusal (mocked).
+  await page.locator("button.omni-open").focus();
+  await page.keyboard.press("Enter");
+  await waitFor(page, "dialog.omni-panel[open]", "the command menu");
+  await page.keyboard.type("start fleet");
+  await waitFor(page, ".omni-action", "a proposed action");
+  await armAction();
+  // The confirm row's danger button is its "Run it".
+  const runIt = ".omni-confirm-row button.btn-danger";
+  for (let i = 0; i < 6 && !(await activeMatches(page, runIt)); i += 1) {
+    await page.keyboard.press("Tab");
+  }
+  if (!(await activeMatches(page, runIt))) {
+    const focus = await page.evaluate(
+      () =>
+        `<${document.activeElement?.tagName.toLowerCase()}> ${document.activeElement?.className}`,
+    );
+    fail(`Tab never reached the armed action's Run it (focus stayed on ${focus})`);
+  }
+  await page.keyboard.press("Enter");
+  await until(page, "Enter on Run it to send one start", async () => starts() === 1);
+  await until(
+    page,
+    "the menu to close after Run it",
+    async () => (await page.locator("dialog.omni-panel[open]").count()) === 0,
+  );
+  if (starts() !== 1) fail(`Run it sent ${starts()} starts, not 1`);
 }
 
 async function inbox(session: Session, harnessId: string): Promise<void> {
@@ -379,6 +417,11 @@ async function panelsAndToggles(session: Session, harnessId: string): Promise<vo
     '[aria-label="digest window"] button:has-text("7 days")',
     "the window toggle",
   );
+  // The inboxes repaint their list on a toggle; the toggle itself is kept.
+  await freshVisit(session, globalRoute("approvals"));
+  await keepsFocus(page, 'button.toggle:has-text("Show settled")', "the Show settled toggle");
+  await freshVisit(session, globalRoute("review"));
+  await keepsFocus(page, 'button.toggle:has-text("Show resolved")', "the Show resolved toggle");
 }
 
 async function keyedRefresh(session: Session): Promise<void> {
@@ -467,11 +510,141 @@ async function firstRunAndReadability(session: Session, harnessId: string): Prom
     fail("the draft did not survive a reload");
 }
 
+/** The spec's own write route: a human-owned edit is a PUT to it. */
+const specEditPath = (id: string): string => `/api/h/${encodeURIComponent(id)}/spec`;
+
+/**
+ * A typed confirmation holds for the version of the spec it was typed
+ * against. When the write comes back as a conflict, "Re-apply my changes on
+ * top" opens the typed dialog again over the new diff, and nothing is sent
+ * until the name is typed again.
+ */
+async function conflictAsksAgain(session: Session, harnessId: string): Promise<void> {
+  const { page } = session;
+  let edits = 0;
+  await page.route(`**${specEditPath(harnessId)}`, (route) => {
+    if (route.request().method() !== "PUT") return route.continue();
+    edits += 1;
+    return edits === 1
+      ? route.fulfill({
+          status: 412,
+          contentType: "application/json",
+          body: JSON.stringify(
+            conflictBody("-  model: claude-opus-5\n+  model: claude-sonnet-5\n"),
+          ),
+        })
+      : route.fulfill({ status: 200, contentType: "application/json", body: '{"ok":true}' });
+  });
+  try {
+    await freshVisit(session, harnessRoute(harnessId, "spec"));
+    const row = page.locator("tr", { has: page.locator("td.mono", { hasText: /^agent\.model$/ }) });
+    await row.getByRole("button", { name: "Review & apply" }).click();
+    const typed = "dialog[open] input[placeholder]";
+    await waitFor(page, typed, "the typed confirm for a human-owned field");
+    const name = (await page.locator(typed).getAttribute("placeholder")) ?? "";
+    await page.locator(typed).fill(name);
+    await page.locator('dialog[open] button:text-is("Apply to the live spec")').click();
+    await waitFor(page, "dialog[open] .conflict", "the conflict view");
+    if (edits !== 1) fail(`the typed apply sent ${edits} writes, not 1`);
+    await page.locator('dialog[open] button:text-is("Re-apply my changes on top")').click();
+    await waitFor(page, typed, "the typed confirm asked again after a conflict");
+    await settle(page, "the diff against the version on disk");
+    if (edits !== 1) fail(`Re-apply sent ${edits - 1} writes before the name was typed again`);
+    if ((await page.locator(typed).inputValue()) !== "")
+      fail("Re-apply reopened the typed confirm with the name already in it");
+    if (!(await page.locator('dialog[open] button:text-is("Apply to the live spec")').isDisabled()))
+      fail("Re-apply offered Apply before the name was typed again");
+    await page.locator(typed).fill(name);
+    await page.locator('dialog[open] button:text-is("Apply to the live spec")').click();
+    await until(page, "the name typed again to send the write", async () => edits === 2);
+    await settle(page, "the re-applied write");
+  } finally {
+    await page.unroute(`**${specEditPath(harnessId)}`);
+    await resetOverlays(page);
+  }
+}
+
+/**
+ * An unsent wiki draft is saved against the version it was typed on. When
+ * someone else wrote a newer version meanwhile, Save comes back stale and
+ * the newer version stays on disk; it is never silently written over.
+ */
+async function wikiDraftAgainstNewer(scope: JourneyScope): Promise<void> {
+  const fleet = await scope.fleet({ seed: "keyboard-tour-wiki", shapes: ["cli"], rich: true });
+  const [harness] = fleet.harnesses;
+  if (harness === undefined) fail("the wiki fleet has no harness");
+  const h = harness as NonNullable<typeof harness>;
+  const session = await scope.session(scope.home(fleet), { label: "keyboard-tour-wiki" });
+  const { page } = session;
+  const writes: unknown[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "PUT" && /\/memory\/wiki\//.test(new URL(request.url()).pathname)) {
+      writes.push(JSON.parse(request.postData() ?? "{}"));
+    }
+  });
+  const area = page.locator('textarea[aria-label="article body"]');
+  const openEditor = async (): Promise<void> => {
+    await freshVisit(session, harnessRoute(h.id, "memory"));
+    await page
+      .locator('nav[aria-label="memory fabric panels"] button', { hasText: "Wiki" })
+      .click();
+    await settle(page, "the wiki panel");
+    await page.getByRole("button", { name: "Edit", exact: true }).first().click();
+    await waitFor(page, 'textarea[aria-label="article body"]', "the wiki editor");
+    await until(page, "the article to load", async () =>
+      area.evaluate((node) => !(node as HTMLTextAreaElement).readOnly),
+    );
+  };
+  await openEditor();
+  await area.focus();
+  await page.keyboard.press("End");
+  await page.keyboard.type(" an unsent edit");
+  const draft = await area.inputValue();
+  await session.visit("#/");
+  // Another writer lands a newer version while the draft waits.
+  const wiki = createWikiStore({
+    specName: h.specName,
+    rootDir: join(h.dir, ".crewhaus", "wiki"),
+  });
+  const before = await wiki.get(h.wikiSlug);
+  const theirs = "Someone else's newer body.";
+  await wiki.write({
+    slug: h.wikiSlug,
+    title: before?.title ?? h.wikiSlug,
+    body: theirs,
+    tags: before?.tags ?? [],
+    expectedVersion: before?.version ?? 1,
+  });
+  await openEditor();
+  if ((await area.inputValue()) !== draft) fail("the unsent wiki draft was not restored");
+  await waitFor(page, 'button:text-is("Discard draft")', "the restored-draft note");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await until(
+    page,
+    "the save to come back stale",
+    async () => (await page.locator('button:has-text("Retry against version")').count()) > 0,
+  );
+  const sent = writes.at(-1) as { expectedVersion?: number } | undefined;
+  if (sent?.expectedVersion !== before?.version) {
+    fail(
+      `the restored draft was saved against version ${sent?.expectedVersion}, not the ${before?.version} it was typed on`,
+    );
+  }
+  const now = await wiki.get(h.wikiSlug);
+  if (now?.body.trim() !== theirs || now.version !== (before?.version ?? 1) + 1) {
+    fail(
+      `a restored draft wrote over a newer version: on disk ${JSON.stringify(now?.body)} at version ${now?.version}`,
+    );
+  }
+  session.assertClean();
+  await session.close();
+}
+
 export const keyboardTour: Journey = {
   id: "keyboard-tour",
   shard: "axe",
   proves:
-    "Every gated screen works by keyboard alone: a skip link first, a visible unobscured focus and no trap, dialogs that hold focus and give it back on Escape, a command menu that arms actions rather than running them, inbox verdicts that take two keys and only in the list, tooltips, controls that keep focus across their updates, a refresh that keeps an open editor, the first-run card, Readability and drafts.",
+    "Every gated screen works by keyboard alone: a skip link first, a visible unobscured focus and no trap, dialogs that hold focus and give it back on Escape, a command menu that arms actions rather than running them and confirms them by keyboard, inbox verdicts that take two keys and only in the list, tooltips, controls that keep focus across their updates, a refresh that keeps an open editor, the first-run card, Readability and drafts; a conflict asks for a typed confirmation again, and a restored wiki draft never writes over a newer version.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "keyboard-tour");
     const id = world.harness.id;
@@ -481,7 +654,8 @@ export const keyboardTour: Journey = {
         label: `keyboard-tour-${theme}`,
         theme,
         viewport: { width: 1280, height: 800 },
-        expectedStatuses: world.expectedStatuses,
+        // The typed-confirm conflict is mocked here too.
+        expectedStatuses: [...world.expectedStatuses, { pathname: specEditPath(id), status: 412 }],
       });
       await mockRefusals(session.page, id);
       session.page.on("request", (request) => {
@@ -503,9 +677,11 @@ export const keyboardTour: Journey = {
         await keyedRefresh(session);
         await inbox(session, id);
         await firstRunAndReadability(session, id);
+        await conflictAsksAgain(session, id);
       }
       session.assertClean();
       await session.close();
     }
+    await wikiDraftAgainstNewer(scope);
   },
 };

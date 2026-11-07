@@ -29,8 +29,12 @@
  *      it are claimed even in a field, and nothing else is.
  *   2. ⌘K / Ctrl-K opens the command menu from anywhere else, and toggles it
  *      closed when it is already open.
- *   3. While the command menu is OPEN it owns every key: the list beneath it
- *      must not scroll while a query is being typed.
+ *   3. While the command menu is OPEN no other shortcut fires: `/` and `?`
+ *      would stack a second overlay on it. Every other key is left to the
+ *      control that has focus, unclaimed: Tab, Enter and Space must reach an
+ *      armed action's "Run it" and "Cancel", or the action could be armed by
+ *      keyboard and never confirmed. Typing in the menu's field never gets
+ *      here (rule 1).
  *   4. Escape closes the topmost overlay — the menu first, then the sheet.
  *   5. With single-key shortcuts off (Readability), no character key is
  *      claimed — not here, and not in an inbox. Arrows, Enter, Escape and
@@ -152,12 +156,13 @@ export function globalKey(state, shape) {
   // Any other modifier chord belongs to the browser (⌘R, ⌘L, ⌘T…).
   if (k.meta || k.ctrl || k.alt) return keep;
 
-  // 3. While the menu is open it owns everything except Escape.
+  // 3. While the menu is open, Escape closes it and no other shortcut fires.
+  //    Nothing else is claimed: the focused control keeps Tab, Enter and Space.
   if (s.omniboxOpen) {
     if (k.key === "Escape") {
       return { state: { ...s, omniboxOpen: false }, effect: "close-omnibox", claimed: true };
     }
-    return { state: s, effect: null, claimed: true };
+    return keep;
   }
 
   // 4. Escape closes the sheet when it is the topmost overlay.

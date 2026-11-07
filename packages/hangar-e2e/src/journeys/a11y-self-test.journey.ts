@@ -157,6 +157,13 @@ const PAGES = {
       `${sheet}${code}`,
     ),
   },
+  "dialog-stuck": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button class="wide">Behind</button>
+       <dialog id="stuck" aria-label="Plant"><div id="stuck-row" tabindex="-1">Armed</div><button class="wide">One</button> <button class="wide">Two</button></dialog></main>`,
+      `${sheet}${code}`,
+    ),
+  },
   "motion-attr": {
     html: plantedHtml(
       `<main><h1>Clean</h1><div class="attr-gated">Spin</div></main>`,
@@ -225,6 +232,15 @@ const ASSETS = {
       });
     }
     document.getElementById("modal")?.showModal();
+    // A modal whose page swallows every Tab: focus can never move off the row.
+    const stuck = document.getElementById("stuck");
+    if (stuck !== null) {
+      stuck.showModal();
+      document.getElementById("stuck-row")?.focus();
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Tab") event.preventDefault();
+      });
+    }
     // Opened without showModal: nothing holds focus inside it.
     document.getElementById("leaky")?.show();
     const open = document.getElementById("open");
@@ -440,6 +456,11 @@ export const a11ySelfTest: Journey = {
       "dialogContainmentFinding",
       [(await onPage("dialog-leaky", (page) => dialogContainmentFinding(page, "#leaky"))).result],
       "focus-escapes-dialog",
+    );
+    expectRule(
+      "dialogContainmentFinding",
+      [(await onPage("dialog-stuck", (page) => dialogContainmentFinding(page, "#stuck"))).result],
+      "focus-stuck-in-dialog",
     );
     expectNothing("dialogContainmentFinding", [
       (await onPage("dialog-modal", (page) => dialogContainmentFinding(page, "#modal"))).result,

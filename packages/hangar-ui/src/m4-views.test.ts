@@ -40,6 +40,7 @@ type KeyShape = {
   meta?: boolean;
   ctrl?: boolean;
   alt?: boolean;
+  shift?: boolean;
   inField?: boolean;
   inboxFocused?: boolean;
   dialogOpen?: boolean;
@@ -77,11 +78,29 @@ describe("globalKey — HM-190 ownership", () => {
     }
   });
 
-  test("while the omnibox is open it owns every key except Escape", () => {
+  // Changed deliberately: the open menu used to claim every key outside its
+  // field, so an armed action's "Run it" could be reached only by a mouse —
+  // Tab never moved and Enter and Space never pressed it.
+  test("while the omnibox is open no shortcut fires, and its controls keep their keys", () => {
     const open = { ...initialKeyState(), omniboxOpen: true };
-    const j = press(open, { key: "j" });
-    expect(j.claimed).toBe(true);
-    expect(j.effect).toBeNull();
+    for (const shape of [
+      { key: "Tab" },
+      { key: "Tab", shift: true },
+      { key: "Enter" },
+      { key: " " },
+      { key: "j" },
+    ] as KeyShape[]) {
+      const r = press(open, shape);
+      expect(`${shape.key}:${r.claimed}:${r.effect}`).toBe(`${shape.key}:false:null`);
+      expect(r.state.omniboxOpen).toBe(true);
+    }
+    // `/` and `?` stack nothing on the menu.
+    for (const key of ["/", "?"]) {
+      const r = press(open, { key });
+      expect(`${key}:${r.effect}`).toBe(`${key}:null`);
+      expect(r.state.sheetOpen).toBe(false);
+      expect(r.state.omniboxOpen).toBe(true);
+    }
     const esc = press(open, { key: "Escape" });
     expect(esc.effect).toBe("close-omnibox");
     expect(esc.state.omniboxOpen).toBe(false);

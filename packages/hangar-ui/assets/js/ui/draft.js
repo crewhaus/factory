@@ -114,16 +114,53 @@ export function clearDraft(key, opts = {}) {
 }
 
 /**
- * Keep a field's text as it is typed, and put a kept draft back into an
- * empty field. Returns `{ clear }`, called once the text has been sent. A
- * field that may hold a secret is left alone.
+ * A draft of something that has versions (a wiki article) keeps the version
+ * it was typed against, so restoring it can never pass it off as an edit of
+ * a newer one. Encoded as one JSON string; an empty body encodes as "" so
+ * {@link stash} clears it.
  */
-export function bindDraft(field, key) {
-  if (!canStash(field)) return { clear: () => {} };
-  const kept = restore(key);
-  if (kept !== null && String(field.value ?? "") === "") field.value = kept;
+export function encodeVersioned(base, body) {
+  const text = String(body ?? "");
+  if (text === "") return "";
+  const version = Number.isInteger(base) && base >= 0 ? base : 0;
+  return JSON.stringify({ v: 1, base: version, body: text });
+}
+
+/** `{ base, body }` from {@link encodeVersioned}, or null for anything else
+ *  — a plain-text draft has no version, so it is never adopted as one. */
+export function decodeVersioned(text) {
+  if (typeof text !== "string" || text === "") return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || parsed.v !== 1) return null;
+  if (!Number.isInteger(parsed.base) || parsed.base < 0) return null;
+  if (typeof parsed.body !== "string" || parsed.body === "") return null;
+  return { base: parsed.base, body: parsed.body };
+}
+
+/**
+ * Keep a field's text as it is typed. Returns `{ clear, kept }`: `clear()`
+ * once the text has been sent, and the draft that was kept, if any. A field
+ * that may hold a secret is left alone.
+ *
+ * Plain prose (no `opts.base`) goes straight back into an empty field.
+ * With `opts.base` — a function returning the version the text is being
+ * typed against — each stash carries that version, `kept` is
+ * `{ base, body }`, and nothing is put back: the caller decides, because
+ * only it knows whether the thing changed since.
+ */
+export function bindDraft(field, key, opts = {}) {
+  if (!canStash(field)) return { clear: () => {}, kept: null };
+  const versioned = typeof opts.base === "function";
+  const raw = restore(key);
+  const kept = versioned ? decodeVersioned(raw) : raw;
+  if (!versioned && kept !== null && String(field.value ?? "") === "") field.value = kept;
   field.addEventListener("input", () => {
-    stash(key, field.value, { field });
+    stash(key, versioned ? encodeVersioned(opts.base(), field.value) : field.value, { field });
   });
-  return { clear: () => clearDraft(key) };
+  return { clear: () => clearDraft(key), kept };
 }

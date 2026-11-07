@@ -203,7 +203,10 @@ The target is WCAG 2.2 AA, held by tests rather than intentions:
   reflows at 320 px. A background refresh updates rows in place
   (`js/ui/keyed.js`), so an open editor and its typing survive; unsent prose
   survives a reload in this tab (`js/ui/draft.js`), and a field that can
-  hold a secret is never kept.
+  hold a secret is never kept. A wiki draft keeps the version it was typed
+  against, so a restored one saves against that version and a newer one
+  comes back as a conflict instead of being written over. After a spec
+  conflict, an edit that needed the spec's name typed asks for it again.
 
 `packages/hangar-e2e` drives all of this in a browser: an axe sweep that
 fails the build on any violation on the screens moved onto these
@@ -299,10 +302,12 @@ background `?hydrate=1` refetch with freshly computed rollups.
 **Keyboard ownership is a reducer, not a race.** M2 shipped the inbox half of
 HM-190 (`triageKey` in `supervision.js`: j/k, one-key verdicts, `.`, `?`).
 `keys.js` adds the layer above it and decides between them: a field owns its
-keys (including ⌘K), the open omnibox owns everything but Escape, and `?`
-goes to the app sheet only when no inbox is mounted — two sheets opening on
-one keypress is the bug that rule exists to prevent. The reducer claims
-nothing else, so the inbox keeps receiving j/k/g/d untouched.
+keys (including ⌘K), the open omnibox lets no other shortcut fire and leaves
+Tab, Enter and Space to its own controls (so an armed action's "Run it" is
+reachable by keyboard), and `?` goes to the app sheet unless focus is inside
+an inbox list — two sheets opening on one keypress is the bug that rule
+exists to prevent. The reducer claims nothing else, so the inbox keeps
+receiving j/k/g/d untouched.
 
 The field rule has exactly one exception, and the omnibox is it: the overlay
 focuses its own input, so from the moment it opens every key arrives from a

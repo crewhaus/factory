@@ -326,11 +326,20 @@ export async function focusTour(page: Page): Promise<FocusTour> {
   return { findings, stops, reached: seen.size };
 }
 
+/** Tab presses in a row that may leave focus where it was before focus
+ *  counts as stuck. One press can: the step out to the browser's own
+ *  controls on the way round leaves the last control active. Only a dialog
+ *  with two or more controls is judged, since Tab round a single control
+ *  lands back on it. */
+const STUCK_PRESSES = 3;
+
 /**
  * Tab past the end of an open dialog, again and again, and report the first
  * element OUTSIDE it that takes focus. Focus passing through `<body>` (or the
  * browser's own controls) on the way round is no finding: only a control of
- * the page behind is.
+ * the page behind is. Focus that Tab cannot move at all is a finding too: a
+ * dialog with controls in it that swallows Tab holds the keyboard as surely
+ * as one that lets it out.
  */
 export async function dialogContainmentFinding(
   page: Page,
@@ -344,15 +353,53 @@ export async function dialogContainmentFinding(
   if (!(await page.locator(dialog).isVisible())) {
     return { rule: "containment-undetermined", detail: `${dialog} is not open` };
   }
+  const marker = "data-containment-was";
+  const unmark = () =>
+    page.evaluate((attr) => {
+      for (const node of document.querySelectorAll(`[${attr}]`)) node.removeAttribute(attr);
+    }, marker);
+  try {
+    return await tabRound(page, dialog, inside, marker);
+  } finally {
+    await unmark();
+  }
+}
+
+async function tabRound(
+  page: Page,
+  dialog: string,
+  inside: number,
+  marker: string,
+): Promise<A11yFinding | undefined> {
+  let still = 0;
   for (let press = 0; press < inside * 2 + 4; press++) {
+    // Mark where focus is, so the next read can tell whether Tab moved it.
+    await page.evaluate((attr) => {
+      for (const node of document.querySelectorAll(`[${attr}]`)) node.removeAttribute(attr);
+      document.activeElement?.setAttribute(attr, "");
+    }, marker);
     await page.keyboard.press("Tab");
-    const escaped = await page.locator(dialog).evaluate((node) => {
+    const step = await page.locator(dialog).evaluate((node, attr) => {
       const active = document.activeElement;
-      if (active === null || active === document.body || node.contains(active)) return null;
-      return `<${active.tagName.toLowerCase()}> ${(active.textContent ?? "").trim().slice(0, 40)}`;
-    });
-    if (escaped !== null) {
-      return { rule: "focus-escapes-dialog", detail: `Tab left ${dialog} for ${escaped}` };
+      const label =
+        active === null
+          ? "nothing"
+          : `<${active.tagName.toLowerCase()}> ${(active.textContent ?? "").trim().slice(0, 40)}`;
+      const moved = active === null || !active.hasAttribute(attr);
+      if (active === null || active === document.body || node.contains(active)) {
+        return { escaped: null, moved, label };
+      }
+      return { escaped: label, moved, label };
+    }, marker);
+    if (step.escaped !== null) {
+      return { rule: "focus-escapes-dialog", detail: `Tab left ${dialog} for ${step.escaped}` };
+    }
+    still = step.moved ? 0 : still + 1;
+    if (inside >= 2 && still >= STUCK_PRESSES) {
+      return {
+        rule: "focus-stuck-in-dialog",
+        detail: `Tab did not move focus off ${step.label} in ${dialog}, ${still} presses in a row`,
+      };
     }
   }
   return undefined;

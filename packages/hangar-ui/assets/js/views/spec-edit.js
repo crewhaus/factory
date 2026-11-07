@@ -113,6 +113,12 @@ function tierBadge(row) {
  * `conflict.retry(rev)` re-sends the same edit against the new revision,
  * `conflict.reload()` takes the version on disk, and `conflict.draft` is
  * what "Download my draft" saves.
+ *
+ * Only an auto-tunable write may be re-sent as it was. A write that needed
+ * the spec's name typed carries `conflict.reconfirm(rev)` instead, which
+ * shows the diff against the version on disk now and asks for the name
+ * again: a confirmation typed against one version of the spec never applies
+ * an edit on top of another.
  */
 function reportWrite(res, okMessage, conflict = null) {
   if (res === null || res === undefined) {
@@ -146,6 +152,10 @@ function openConflict(current, okMessage, conflict) {
     current: { ...current, draft: typeof c.draft === "string" ? c.draft : current.draft },
     onReapply: async (rev) => {
       dialog?.close();
+      if (typeof c.reconfirm === "function") {
+        await c.reconfirm(rev);
+        return;
+      }
       if (typeof c.retry !== "function") return;
       const again = await c.retry(rev);
       if (reportWrite(again, okMessage, c) && typeof c.done === "function") c.done();
@@ -188,6 +198,42 @@ function confirmModal({ title, lead, detail, confirmName, action, onConfirm }) {
     confirmName,
     action,
     onConfirm: () => onConfirm(),
+  });
+}
+
+/**
+ * Re-apply a typed-confirm edit after a conflict: diff it against the spec
+ * as it is on disk now, then ask for the spec's name again. Nothing is sent
+ * until the name is typed; the name the first dialog took is never reused.
+ */
+async function reconfirmEdit(ctx, { edits, rev, label, okMessage, conflict }) {
+  const preview = await api.specDiff({ id: ctx.id }, { edits });
+  if (!preview?.ok) {
+    toast(preview?.body?.error ?? `HTTP ${preview?.status ?? "?"}`);
+    return;
+  }
+  const body = preview.body ?? {};
+  if (body.ok === false) {
+    toast(`${body.code ?? "refused"}: ${body.reason ?? "this edit does not apply"}`);
+    return;
+  }
+  const confirmName = String(body.confirmName ?? "");
+  if (confirmName === "") {
+    toast("The manager sent no spec name to confirm, so nothing was applied");
+    return;
+  }
+  confirmModal({
+    title: `Re-apply ${label}`,
+    lead: "The spec changed since you confirmed this edit. Read the diff against the version on disk now, then type the spec name again to apply it on top.",
+    detail: [pre(String(body.diff ?? ""))],
+    confirmName,
+    action: "Apply to the live spec",
+    onConfirm: async () => {
+      const res = await api.specEdit({ id: ctx.id }, { edits, confirmName, expectedRev: rev });
+      if (reportWrite(res, okMessage, conflict) && typeof conflict.done === "function") {
+        conflict.done();
+      }
+    },
   });
 }
 
@@ -551,13 +597,25 @@ function valueDialog(ctx, { path, value, pathEditable, reload }) {
     out.appendChild(pre(String(body.diff ?? "")));
     const apply = async (extra) => {
       const wrote = await api.specEdit({ id: ctx.id }, { edits: batch.edits, ...extra });
+      const typed = typeof extra.confirmName === "string";
       const conflict = {
         draft: JSON.stringify(batch.edits, null, 2),
-        retry: (rev) =>
-          api.specEdit({ id: ctx.id }, { edits: batch.edits, ...extra, expectedRev: rev }),
         reload,
         done: reload,
       };
+      if (typed) {
+        conflict.reconfirm = (rev) =>
+          reconfirmEdit(ctx, {
+            edits: batch.edits,
+            rev,
+            label: target,
+            okMessage: `Applied ${target}`,
+            conflict,
+          });
+      } else {
+        conflict.retry = (rev) =>
+          api.specEdit({ id: ctx.id }, { edits: batch.edits, expectedRev: rev });
+      }
       if (reportWrite(wrote, `Applied ${target}`, conflict)) {
         if (dialog !== null) dialog.close();
         reload();
@@ -686,10 +744,11 @@ function humanOwnedActions(ctx, path, current, confirmName, reload) {
         const res = await api.specEdit({ id: ctx.id }, { edits, confirmName });
         const conflict = {
           draft: JSON.stringify(edits, null, 2),
-          retry: (rev) => api.specEdit({ id: ctx.id }, { edits, confirmName, expectedRev: rev }),
           reload,
           done: reload,
         };
+        conflict.reconfirm = (rev) =>
+          reconfirmEdit(ctx, { edits, rev, label: path, okMessage: `Applied ${path}`, conflict });
         if (reportWrite(res, `Applied ${path}`, conflict)) reload();
       },
     });

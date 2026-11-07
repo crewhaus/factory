@@ -1173,14 +1173,10 @@ function editorCard(ctx, host, reload, state, row) {
     "aria-label": "article body",
     "aria-describedby": guardId,
   });
-  // An unsent article survives a reload of this tab; it is cleared once saved.
-  const bodyDraft = bindDraft(
-    area,
-    draftKey(`h/${ctx.id}/memory/wiki/${row ? String(row.slug) : "new"}`, "body"),
-  );
   const versionLabel = el("span", { class: "muted" });
   const status = el("div", { role: "status" });
   const conflict = el("div");
+  const draftNote = el("div", { role: "status" });
   const expected = { version: row ? Number(row.version ?? 0) : 0 };
 
   const setVersion = (v) => {
@@ -1189,6 +1185,43 @@ function editorCard(ctx, host, reload, state, row) {
       expected.version > 0 ? `saving against version ${expected.version}` : "new article";
   };
   setVersion(row ? Number(row.version ?? 0) : 0);
+
+  // An unsent article survives a reload of this tab; it is cleared once saved.
+  // It keeps the version it was typed against, and a restored draft saves
+  // against THAT version: if someone wrote a newer one meanwhile, Save comes
+  // back stale and shows what moved, instead of writing over it.
+  const bodyDraft = bindDraft(
+    area,
+    draftKey(`h/${ctx.id}/memory/wiki/${row ? String(row.slug) : "new"}`, "body"),
+    { base: () => expected.version },
+  );
+  const showRestored = (draft, current, onDiscard) => {
+    const moved = current !== null && current !== draft.base;
+    const discard = el("button", { class: "btn btn-ghost", type: "button", text: "Discard draft" });
+    discard.addEventListener("click", () => {
+      bodyDraft.clear();
+      onDiscard();
+      clear(draftNote);
+      area.focus();
+    });
+    draftNote.replaceChildren(
+      el("p", { class: "muted" }, [
+        el("span", {
+          text: moved
+            ? `Restored your unsent draft, written against version ${draft.base}. This article is at version ${current} now, so Save will show you what changed before anything is written.`
+            : "Restored your unsent draft.",
+        }),
+        " ",
+        discard,
+      ]),
+    );
+  };
+  if (!row && bodyDraft.kept !== null) {
+    area.value = bodyDraft.kept.body;
+    showRestored(bodyDraft.kept, null, () => {
+      area.value = "";
+    });
+  }
 
   // Held with aria-disabled rather than `disabled`: Save stays in the Tab order
   // and describes why, and a click says so instead of doing nothing.
@@ -1246,11 +1279,22 @@ function editorCard(ctx, host, reload, state, row) {
         article = null;
       }
       if (article !== null && typeof article.body === "string") {
-        if (area.value === "") area.value = article.body;
+        const loaded = typeof article.version === "number" ? article.version : null;
+        const draft = bodyDraft.kept;
+        if (draft !== null && draft.base > 0) {
+          area.value = draft.body;
+          setVersion(draft.base);
+          showRestored(draft, loaded, () => {
+            area.value = article.body;
+            if (loaded !== null) setVersion(loaded);
+          });
+        } else {
+          if (area.value === "") area.value = article.body;
+          if (loaded !== null) setVersion(loaded);
+        }
         if (typeof article.title === "string" && titleField.input.value === titleBeforeLoad) {
           titleField.input.value = article.title;
         }
-        if (typeof article.version === "number") setVersion(article.version);
       }
       applyGate(editorGate({ existing: true, article }));
     })();
@@ -1285,6 +1329,7 @@ function editorCard(ctx, host, reload, state, row) {
         const outcome = writeOutcome(res.body);
         if (outcome.kind === "ok") {
           bodyDraft.clear();
+          clear(draftNote);
           status.appendChild(
             el("p", { class: "muted" }, [
               dot("ok", "saved"),
@@ -1335,6 +1380,9 @@ function editorCard(ctx, host, reload, state, row) {
             }
             area.value = outcome.currentBody;
             setVersion(outcome.retryVersion);
+            // The version on disk replaced the draft: nothing is unsent now.
+            bodyDraft.clear();
+            clear(draftNote);
             applyGate(gate);
           });
           conflictActions = el("div", { class: "editor-actions" }, [takeTheirs, retry]);
@@ -1359,6 +1407,7 @@ function editorCard(ctx, host, reload, state, row) {
       : null,
     el("div", { class: "editor-actions" }, [slugField.node, titleField.node, versionLabel]),
     el("label", { class: "field" }, [el("span", { text: "article text" }), area]),
+    draftNote,
     guard,
     el("div", { class: "editor-actions" }, [
       save,
