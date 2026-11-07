@@ -71,9 +71,10 @@
  *   - FREE-PLAN QUOTAS ARE REAL (3 goals; listeners are plan-quota'd).
  *     Render the quota refusal as a fact, not a failure.
  *   - LISTENER INGEST IS IDEMPOTENCY-KEYED. Preserve the key when replaying.
- *   - THE LOCAL STORE STAYS AUTHORITATIVE. When a harness mirrors its wiki
- *     to Thredz, a degraded mirror is a BADGE — the local store is still the
- *     source of truth and the panel says which backend it is showing.
+ *   - A THREDZ-BACKED WIKI LIVES IN THREDZ. Nothing mirrors it: the agent
+ *     reads and writes Thredz, and Hangar's local wiki routes refuse there.
+ *     Only goals mirror, from the local continuity store. A degraded mirror
+ *     is a BADGE, and the local store stays the source of truth for goals.
  *
  * ---------------------------------------------------------------------------
  * THE ANSWER SHAPE — why an upstream refusal is still a 200
@@ -858,7 +859,7 @@ export function declaresLocalWiki(specText: string): boolean {
  *
  * Key PRESENCE (never the key), the resolved workspace, the permission tier
  * the key carries, the wiki backend badge (local vs thredz), plan quotas, and
- * the mirror's degraded state if it has one.
+ * the goals mirror's degraded state if it has one. A wiki is never mirrored.
  *
  * The tier is PROBED rather than declared, because the API has no "describe
  * me" route: `/wiki/stats` answering proves a wiki grant, `/keys` answering

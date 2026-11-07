@@ -20,10 +20,13 @@
  * code: "stale_article_version", currentVersion, current, diff }` — not as a
  * bare status the client has to reverse-engineer. The refusal IS the
  * payload the screen renders; a status code cannot carry the diff, and the
- * console must never have to guess what moved. The UX is identical for the
- * local store and the Thredz backend (`thredz.ts`), deliberately: an
- * operator must not have to learn which backend a harness uses to save an
- * edit.
+ * console must never have to guess what moved. The editor's conflict UX is
+ * shared with the Thredz backend (`thredz.ts`).
+ *
+ * WHICH ROUTES MAY WRITE is a separate question, and the local ones refuse
+ * with a 409 on a Thredz-backed harness or one whose spec cannot be read. That
+ * is a refusal, not a race: the agent there does not read this store, and a
+ * script that checks only the status must not take the answer as saved.
  *
  * Other wiki rules that are easy to get wrong:
  *   - ARCHIVE, NEVER DELETE. An article leaves the live list by taking the
@@ -92,6 +95,12 @@ import {
   specScalar,
 } from "./memory-ops";
 import { readSpecYaml } from "./schedulers";
+import {
+  WIKI_STORE_PROBE,
+  type WikiAuthority,
+  wikiAuthorityOf,
+  wikiIndexArticles,
+} from "./store-layout";
 
 /** Cap on articles folded into one screen (a REFLECT queue is a screen). */
 const MAX_WIKI_ARTICLES = 500;
@@ -101,7 +110,8 @@ const MAX_WIKI_VERSIONS = 200;
 /** Slugs are kebab-case AND double as file names (the store's own rule). */
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,127}$/;
 
-const VERB = "crewhaus run (the agent's wiki_write tool), or edit an article here";
+const THREDZ_WIKI_NOTE = "This harness keeps its wiki in Thredz.";
+const UNKNOWN_WIKI_NOTE = "Can't read this harness's spec, so its wiki can't be changed from here.";
 
 // ---------------------------------------------------------------------------
 // where the wiki lives
@@ -121,7 +131,7 @@ type WikiTarget = {
  * which is what the store itself does.
  */
 function wikiTarget(ctx: M3Context, specName: string): WikiTarget {
-  const found = resolveStoreDir(ctx, "wiki", specName, ["articles", "index.json"]);
+  const found = resolveStoreDir(ctx, "wiki", specName, WIKI_STORE_PROBE);
   if (found !== undefined) {
     return {
       dir: found.dir,
@@ -159,6 +169,24 @@ function validSlug(ctx: M3Context): string {
     throw new HttpError(400, "invalid slug — wiki slugs are kebab-case ([a-z0-9][a-z0-9-]*)");
   }
   return slug;
+}
+
+/**
+ * The one gate on the local write routes. It runs before the body is looked
+ * at and before a store is built, so a refused write leaves nothing behind.
+ */
+function requireLocalWiki(ctx: M3Context): void {
+  const authority = wikiAuthorityOf(harnessDirOf(ctx));
+  if (authority === "thredz") throw new HttpError(409, `${THREDZ_WIKI_NOTE} Edit it there.`);
+  if (authority === "unknown") throw new HttpError(409, UNKNOWN_WIKI_NOTE);
+}
+
+/** The fields every wiki read carries: what answered, and where the wiki lives. */
+function wikiSource(authority: WikiAuthority): {
+  readonly backend: "local";
+  readonly authority: WikiAuthority;
+} {
+  return { backend: "local", authority };
 }
 
 // ---------------------------------------------------------------------------
@@ -273,17 +301,7 @@ function articleSlugs(target: WikiTarget): string[] {
 
 /** `index.json`'s article map, whichever of the two shapes it carries. */
 function indexArticles(target: WikiTarget): Record<string, Record<string, unknown>> {
-  const raw = readJsonSafe(join(target.dir, "index.json"));
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
-  const holder = (raw as Record<string, unknown>)["articles"] ?? raw;
-  if (typeof holder !== "object" || holder === null || Array.isArray(holder)) return {};
-  const out: Record<string, Record<string, unknown>> = {};
-  for (const [slug, entry] of Object.entries(holder as Record<string, unknown>)) {
-    if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
-      out[slug] = entry as Record<string, unknown>;
-    }
-  }
-  return out;
+  return wikiIndexArticles(readJsonSafe(join(target.dir, "index.json"))) ?? {};
 }
 
 export type WikiRow = {
@@ -400,6 +418,7 @@ function writeRefusal(
  */
 export const wikiWrite: M3Handler = async (ctx) => {
   const slug = validSlug(ctx);
+  requireLocalWiki(ctx);
   const body = requireString(ctx.body, "body");
   const specName = harnessSpecName(ctx);
   const target = wikiTarget(ctx, specName);
@@ -527,16 +546,22 @@ export const wikiVersions: M3Handler = (ctx) => {
     });
   }
   versions.sort((a, b) => Number(b["version"]) - Number(a["version"]));
+  const authority = wikiAuthorityOf(harnessDirOf(ctx));
+  const onThredz = authority === "thredz";
   return {
     ...readBase(
       versions.length > 0,
-      versions.length === 0
-        ? current === null
-          ? "no article with that slug yet"
-          : "this article has never been edited — version 1 is still the live file"
-        : null,
-      VERB,
+      onThredz
+        ? THREDZ_WIKI_NOTE
+        : versions.length === 0
+          ? current === null
+            ? "no article with that slug yet"
+            : "this article has never been edited — version 1 is still the live file"
+          : null,
+      null,
+      versions.length > 0 ? null : onThredz ? "unsupported" : "no-data",
     ),
+    ...wikiSource(authority),
     slug,
     currentVersion: current?.version ?? null,
     versions,
@@ -557,9 +582,12 @@ export const wikiVersion: M3Handler = (ctx) => {
     containedPath(ctx, [...target.prefix, "articles", `${slug}.md`]),
     slug,
   );
+  const authority = wikiAuthorityOf(harnessDirOf(ctx));
+  const onThredz = authority === "thredz";
   if (!/^\d+$/.test(version)) {
     return {
-      ...readBase(false, "wiki versions are integers — `1`, `2`, `3`", VERB),
+      ...readBase(false, "wiki versions are integers — `1`, `2`, `3`", null),
+      ...wikiSource(authority),
       slug,
       version,
       body: "",
@@ -575,7 +603,13 @@ export const wikiVersion: M3Handler = (ctx) => {
   );
   if (snapshot === null) {
     return {
-      ...readBase(false, `no frozen version ${version} for this article`, VERB),
+      ...readBase(
+        false,
+        onThredz ? THREDZ_WIKI_NOTE : `no frozen version ${version} for this article`,
+        null,
+        onThredz ? "unsupported" : "no-data",
+      ),
+      ...wikiSource(authority),
       slug,
       version,
       body: "",
@@ -586,7 +620,8 @@ export const wikiVersion: M3Handler = (ctx) => {
     };
   }
   return {
-    ...readBase(true, null, VERB),
+    ...readBase(true, onThredz ? THREDZ_WIKI_NOTE : null, null),
+    ...wikiSource(authority),
     slug,
     version,
     title: snapshot.title,
@@ -647,7 +682,7 @@ export const wikiLinks: M3Handler = (ctx) => {
         : links.length === 0
           ? "this article neither links out nor is linked to — [[wikilinks]] in a body make the graph"
           : null,
-      VERB,
+      null,
     ),
     slug,
     links,
@@ -669,6 +704,7 @@ export const wikiLinks: M3Handler = (ctx) => {
  */
 export const wikiSignals: M3Handler = async (ctx) => {
   const slug = validSlug(ctx);
+  requireLocalWiki(ctx);
   for (const forbidden of ["body", "title", "tags", "status", "sources"]) {
     if (ctx.body[forbidden] !== undefined) {
       throw new HttpError(
@@ -731,10 +767,12 @@ export const wikiSignals: M3Handler = async (ctx) => {
  * body kept byte-identical — it takes a version, which is the store's whole
  * supersede-never-delete model. A content write also RESETS `verified`, so
  * the prior signals are re-applied afterwards through `setSignals`:
- * archiving must not silently un-verify an article.
+ * archiving must not silently un-verify an article. An article too long to
+ * read whole is refused, because that write would cut its body at the read cap.
  */
 export const wikiArchive: M3Handler = async (ctx) => {
   const slug = validSlug(ctx);
+  requireLocalWiki(ctx);
   const archived = requireBoolean(ctx.body, "archived");
   if (requireBoolean(ctx.body, "confirm") !== true) {
     throw new HttpError(409, 'archiving an article needs "confirm": true');
@@ -753,6 +791,9 @@ export const wikiArchive: M3Handler = async (ctx) => {
       slug,
       note: "no article with that slug — nothing to archive",
     };
+  }
+  if (raw.truncated) {
+    throw new HttpError(409, "This article is too long to archive from here.");
   }
   const store = wikiStoreFor(ctx, target);
   try {
@@ -828,22 +869,34 @@ export const wikiReflect: M3Handler = (ctx) => {
     .map((r) => ({ ...r, stale: r.staleMs !== null && r.staleMs > thresholdMs }));
 
   const allTags = [...new Set(rows.flatMap((r) => r.tags))].sort();
+  const authority = wikiAuthorityOf(harnessDirOf(ctx));
+  const filteredOut = rows.length > 0 && articles.length === 0;
+  const authorityNote =
+    authority === "thredz" ? THREDZ_WIKI_NOTE : authority === "unknown" ? UNKNOWN_WIKI_NOTE : null;
   return {
     ...readBase(
       rows.length > 0,
-      rows.length === 0
-        ? "no wiki articles yet — the REFLECT queue is what the agent maintains once there are"
-        : articles.length === 0
-          ? "no article matches these filters"
-          : null,
-      "crewhaus run (then /reflect)",
+      filteredOut
+        ? "no article matches these filters"
+        : (authorityNote ??
+            (rows.length === 0
+              ? "No articles yet. The harness writes them as it works, or add one here."
+              : null)),
+      null,
+      filteredOut
+        ? "filtered"
+        : rows.length > 0
+          ? null
+          : authority === "thredz"
+            ? "unsupported"
+            : "no-data",
     ),
     articles,
     total: rows.length,
     filters: { tags: wantTags, status: wantStatus, q, available: allTags },
     thresholdMs,
     thresholdSource: cadence !== undefined ? "memory.dream.every" : "default (30d)",
-    backend: "local",
+    ...wikiSource(authority),
     layout: target.layout,
     // The `## Sources` gate is a LOCAL rule — badged, never implied of Thredz.
     sourcesGate: sourcesRequired(ctx),
