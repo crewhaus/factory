@@ -63,6 +63,7 @@ import {
   resolveBuiltinTools,
 } from "../packages/tool-categories/src/index";
 import { planPin } from "../packages/tool-evalops/src/lib/pin";
+import { TOOL_REGISTRY } from "../packages/tool-registry-manifest/src/generated";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 
 const ROOT = dirname(import.meta.dir);
@@ -805,14 +806,25 @@ describe("the release notes name every change a harness without provability: see
       }
     }
     expect(unattributed).toEqual([]);
-    // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx), GitApplyPatch
-    // (tool-git), StateImport and the nine tools that keep a store through it
-    // (tool-state), StoreMigrate (tool-lifecycle), EmitTraceEvent (tool-obs),
+    // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx), GitApplyPatch,
+    // GitSwitch, GitCherryPick, GitStashPush, GitStashPop (tool-git), StateImport
+    // and the nine tools that keep a store through it (tool-state), StoreMigrate,
+    // HarnessRetire, KnowledgeSync (tool-lifecycle), EmitTraceEvent (tool-obs),
     // DatasetPut (tool-dataset), SpecPin and DeployRollback (tool-deploy),
-    // ExperimentLedger (tool-routing) and CompileBundle (tool-fleet) today.
-    expect(tools.size).toBe(22);
+    // ExperimentLedger, RouteControl (tool-routing), CompileBundle (tool-fleet),
+    // ManifestDependencySet (tool-registry) and SecretRotate (tool-secrets) today.
+    expect(tools.size).toBe(31);
     const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
+  });
+
+  test("GitWorktreeAdd: the floor reads its path as a directory that may hold a root, and the list says so", () => {
+    expect(TOOL_REGISTRY["gitWorktreeAdd"]?.operativeArgs?.[0]).toEqual({
+      field: "path",
+      kind: "path",
+      beneath: "all",
+    });
+    expect(laterNotes).toContain("`GitWorktreeAdd`");
   });
 
   test("WebFetch: a header line 0.7.x did not print is named", () => {

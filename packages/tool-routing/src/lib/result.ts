@@ -14,6 +14,7 @@
  */
 import { realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { protectedRootHolding, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
 import { MAX_PATH_CHARS, type SafePath, ToolPermissionError, resolveSafe } from "../paths";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -172,11 +173,16 @@ export function contain(toolName: string, rel: string): Loaded<SafePath> {
  * through — symlink-aware, dangling links followed by hand — rather than a
  * second symlink walker written here. Returns the refusal, or `undefined`
  * when every path stays inside the workspace.
+ *
+ * With `protectedRoots` (`RuntimeBridge.protectedRoots`, for a call that writes
+ * these paths), a path also has to land outside each of them. The landing place
+ * is the one `resolveSafe` worked out, which a dangling link's target counts in.
  */
 export function containWritePaths(
   toolName: string,
   root: SafePath,
   rels: ReadonlyArray<string>,
+  protectedRoots: readonly string[] = [],
 ): Failure | undefined {
   const shownRoot = root.rel === "" ? "." : root.rel;
   for (const rel of rels) {
@@ -184,7 +190,13 @@ export function containWritePaths(
     // Too long to open or create: it leads nowhere, so it is no escape.
     if (pastPathLimit(under)) continue;
     const resolved = contain(toolName, under);
-    if (resolved.ok) continue;
+    if (resolved.ok) {
+      if (protectedRootHolding(resolved.value.real, protectedRoots) === undefined) continue;
+      return fail(
+        "refused",
+        protectedWriteRefusal(toolName, `"${renderPath(rel)}" under "${renderPath(shownRoot)}"`),
+      );
+    }
     // The CODE comes from `contain`, which already separated "this leads out
     // of the workspace" from "this could not be resolved at all". Flattening
     // them here would put the reader back to hunting for a symlink that is

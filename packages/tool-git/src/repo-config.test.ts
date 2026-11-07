@@ -49,6 +49,7 @@ import {
   gitRevParse,
   gitShow,
   gitStashList,
+  gitStashPush,
   gitStatus,
   gitTagList,
   gitWorktreeList,
@@ -454,6 +455,29 @@ describe("a submodule's config cannot make a read run a program", () => {
       String(await gitDiff.execute({ cwd: "sup", range: "HEAD~1..HEAD", mode: "patch" })),
     ) as Record<string, unknown>;
     expect(String(patch["patch"])).toContain("+Subproject commit ");
+  }, 30_000);
+
+  test("GitStashPush, checking what it would change, stays out of a submodule's working tree", async () => {
+    const sup = plantSubmodule();
+    const subDir = join(sup, ".git", "modules", "sub");
+    const subConfig = join(subDir, "config");
+    git(["config", "-f", subConfig, "--unset", "diff.external"], sup);
+    git(["config", "-f", subConfig, "filter.x.clean", hook("subclean", "sub-clean", "cat")], sup);
+    writeFileSync(join(subDir, "info", "attributes"), "* filter=x\n");
+    // The committed size, so git has to read the file to say whether it changed.
+    writeFileSync(join(sup, "sub", "f.txt"), "six\n");
+    // The fixture is live: asked to look inside the submodule, git runs its program.
+    rmSync(marker, { force: true });
+    git(["diff", "--ignore-submodules=none", "--name-only", "HEAD"], sup);
+    expect(ran().some((line) => line.startsWith("sub-clean"))).toBe(true);
+
+    writeFileSync(join(sup, "sub", "f.txt"), "ten\n");
+    writeFileSync(join(sup, "top.txt"), "changed\n");
+    rmSync(marker, { force: true });
+    const ctx = { bridge: { protectedRoots: [join(sup, "top.txt")] } };
+    const out = String(await gitStashPush.execute({ cwd: "sup" }, ctx as never));
+    expect(out).toContain("the change to top.txt");
+    expect(ran()).toEqual([]);
   }, 30_000);
 });
 

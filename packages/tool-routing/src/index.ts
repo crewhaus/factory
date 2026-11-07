@@ -59,11 +59,7 @@ import {
 } from "@crewhaus/routing-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import {
-  protectedRootLinkedInto,
-  protectedRootsOf,
-  protectedWriteRefusal,
-} from "@crewhaus/tool-safety/fs";
+import { protectedRootsOf } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   DEFAULT_EXPERIMENTS_DIR,
@@ -141,7 +137,7 @@ import {
   tallyWindows,
   turnId,
 } from "./lib/watchme";
-import { type SafePath, workspaceRoot } from "./paths";
+import type { SafePath } from "./paths";
 
 // ---------------------------------------------------------------------------
 // shared plumbing
@@ -197,13 +193,18 @@ type Rooted = {
   readonly state: SafePath;
 };
 
-function rootState(tool: string, dirRel: string, relPaths: ReadonlyArray<string>): Loaded<Rooted> {
+function rootState(
+  tool: string,
+  dirRel: string,
+  relPaths: ReadonlyArray<string>,
+  protectedRoots: readonly string[] = [],
+): Loaded<Rooted> {
   const harness = containExistingDir(tool, dirRel);
   if (!harness.ok) return harness;
   const stateRel = path.join(dirRel, STATE_RELDIR);
   const state = contain(tool, stateRel);
   if (!state.ok) return state;
-  const escaped = containWritePaths(tool, state.value, relPaths);
+  const escaped = containWritePaths(tool, state.value, relPaths, protectedRoots);
   if (escaped !== undefined) return escaped;
   return { ok: true, value: { dirRel, stateRoot: state.value.real, stateRel, state: state.value } };
 }
@@ -307,7 +308,7 @@ export const routeControl: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "RouteControl";
     const dryRun = input.dryRun ?? true;
     const limit = input.limit ?? DEFAULT_LIMIT;
@@ -316,6 +317,7 @@ export const routeControl: RegisteredTool = buildTool({
       tool,
       input.dir ?? ".",
       readOnlyAction ? ROUTING_READ_RELPATHS : ROUTING_TOUCHED_RELPATHS,
+      readOnlyAction ? [] : protectedRootsOf(ctx),
     );
     if (!rooted.ok) return refusal(tool, rooted.code, rooted.reason);
     const { stateRoot, stateRel } = rooted.value;
@@ -960,28 +962,9 @@ export const experimentLedger: RegisteredTool = buildTool({
         tool,
         expDir.value,
         targets.value.map((n) => `${n}.jsonl`),
+        protectedRootsOf(ctx),
       );
       if (targetEscape !== undefined) return refusal(tool, targetEscape.code, targetEscape.reason);
-      // The floor reads the directories the call names. A ledger lands where its
-      // own name resolves, and the line follows a link there.
-      for (const n of targets.value) {
-        const ledger = contain(tool, path.join(expRel, `${n}.jsonl`));
-        if (
-          ledger.ok &&
-          protectedRootLinkedInto(
-            ledger.value.abs,
-            ledger.value.real,
-            protectedRootsOf(ctx),
-            workspaceRoot(),
-          ) !== undefined
-        ) {
-          return refusal(
-            tool,
-            "refused",
-            protectedWriteRefusal(tool, `the ledger "${renderPath(`${n}.jsonl`)}"`),
-          );
-        }
-      }
       if (dryRun) {
         return json({
           tool,

@@ -3577,7 +3577,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "path", kind: "path" }],
+    operativeArgs: [{ field: "path", kind: "path", beneath: "all" }],
     categories: ["git", "code"],
     package: "@crewhaus/tool-git",
     keywords: ["add a worktree", "second checkout"],

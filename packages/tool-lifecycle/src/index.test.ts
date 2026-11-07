@@ -18,6 +18,7 @@
  * time, only on work done.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -212,6 +213,36 @@ test("HarnessRetire dry run previews the plan and touches nothing", async () => 
   expect(r["wouldNeed"]).toEqual(["acceptUnverified"]);
   // Nothing on disk moved, and the archive was not even created.
   expect(existsSync(path.join(tmp, "archive"))).toBe(false);
+  expect(existsSync(path.join(tmp, ".crewhaus"))).toBe(true);
+});
+
+test("HarnessRetire refuses the harness it runs in, as a preview and for real, and retires another", async () => {
+  harness();
+  write("fleet/other/.crewhaus/sessions/sess_00000000000000bb.json", '{"id":"b"}');
+  // A root in the state directory, spelled as the runtime spells it.
+  const ctx = { bridge: { protectedRoots: [".crewhaus/settings.json"] } };
+  const real = { dryRun: false, acceptUnverified: true };
+  for (const input of [{}, real]) {
+    const out = String(
+      await harnessRetire.execute(
+        { spec: "demo", archiveDir: "archive", ...input } as never,
+        ctx as never,
+      ),
+    );
+    expect(out).toContain("retiring . would write where the runtime keeps its own record");
+    expect(existsSync(path.join(tmp, ".crewhaus"))).toBe(true);
+    expect(existsSync(path.join(tmp, "archive"))).toBe(false);
+  }
+  const other = JSON.parse(
+    String(
+      await harnessRetire.execute(
+        { spec: "demo", dir: "fleet/other", archiveDir: "archive", ...real } as never,
+        ctx as never,
+      ),
+    ),
+  ) as Json;
+  expect(other["harnessDir"]).toBe("fleet/other");
+  expect(existsSync(path.join(tmp, "fleet/other/.crewhaus"))).toBe(false);
   expect(existsSync(path.join(tmp, ".crewhaus"))).toBe(true);
 });
 
@@ -1249,4 +1280,160 @@ test("a harness directory that does not exist is a missing directory, not an emp
   const escaped = await callJson(retentionEnforce, { action: "sweep", dir: outsideTarget });
   expect(escaped["status"]).toBe("refused");
   expect(escaped["code"]).toBe("refused");
+});
+
+// ---------------------------------------------------------------------------
+// a write that lands in a root on the bridge
+// ---------------------------------------------------------------------------
+
+const FLOOR_CTX = { bridge: { protectedRoots: [".crewhaus/settings.json", ".crewhaus/run"] } };
+const SETTINGS_BYTES = '{"permissions":{"rules":[{"type":"alwaysDeny","pattern":"Bash"}]}}\n';
+const SETTINGS_REL = ".crewhaus/settings.json";
+
+/** A link at `rel` leading to `target`, a workspace-relative path that may not exist yet. */
+function linkTo(rel: string, target: string): void {
+  const abs = path.join(tmp, rel);
+  mkdirSync(path.dirname(abs), { recursive: true });
+  symlinkSync(path.relative(path.dirname(abs), path.join(tmp, target)), abs);
+}
+
+/** `call` refused for landing in a root, with the target as it was: its bytes, or still absent. */
+async function refusedOnFloor(tool: RegisteredTool, input: unknown, target: string): Promise<void> {
+  const at = path.join(tmp, target);
+  const before = existsSync(at) ? readFileSync(at, "utf8") : "(absent)";
+  const out = String(await tool.execute(input as never, FLOOR_CTX as never));
+  expect(out).toContain("where the runtime keeps its own record");
+  expect(existsSync(at) ? readFileSync(at, "utf8") : "(absent)").toBe(before);
+}
+
+/** A shared store holding one prompt fragment, and the name a pull lands it under. */
+function sharedPrompt(): { readonly landing: string } {
+  const body = "a shared prompt\n";
+  const hash = createHash("sha256").update(body.trim()).digest("hex");
+  write(`shared/prompts/${hash}.md`, body);
+  return { landing: `.crewhaus/prompts/shared-${hash.slice(0, 12)}.md` };
+}
+
+const PULL = { direction: "pull", sharedDir: "shared", dryRun: false };
+
+for (const [state, settings] of [
+  ["that exists", SETTINGS_BYTES],
+  ["that does not exist yet", undefined],
+] as const) {
+  const seedSettings = (): void => {
+    if (settings !== undefined) write(SETTINGS_REL, settings);
+  };
+
+  test(`KnowledgeSync pull refuses a landing name that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    const { landing } = sharedPrompt();
+    linkTo(`fleet/other/${landing}`, SETTINGS_REL);
+    const pull = async (input: Record<string, unknown>): Promise<void> => {
+      // A link with nothing at its target stops the read of the harness's own
+      // prompts first, and that is a refusal as well.
+      if (settings !== undefined) return refusedOnFloor(knowledgeSync, input, SETTINGS_REL);
+      const out = JSON.parse(
+        String(await knowledgeSync.execute(input as never, FLOOR_CTX as never)),
+      ) as Json;
+      expect(out["status"]).toBe("refused");
+      expect(existsSync(path.join(tmp, SETTINGS_REL))).toBe(false);
+    };
+    for (const dryRun of [true, false]) await pull({ ...PULL, dir: "fleet/other", dryRun });
+    rmSync(path.join(tmp, "fleet"), { recursive: true });
+    linkTo(landing, SETTINGS_REL);
+    await pull(PULL);
+  });
+
+  test(`KnowledgeSync push refuses a store file that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    knowledgeHarness();
+    for (const file of ["manifest.jsonl", "memories.jsonl"]) {
+      linkTo(`shared/${file}`, SETTINGS_REL);
+      for (const dryRun of [true, false]) {
+        await refusedOnFloor(
+          knowledgeSync,
+          { direction: "push", sharedDir: "shared", allowWithoutPiiRedaction: true, dryRun },
+          SETTINGS_REL,
+        );
+      }
+      rmSync(path.join(tmp, "shared", file));
+    }
+  });
+
+  test(`HarnessRetire refuses an archive name that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    write("fleet/other/.crewhaus/sessions/sess_00000000000000bb.json", '{"id":"b"}');
+    const input = {
+      spec: "other",
+      dir: "fleet/other",
+      archiveDir: "arch",
+      acceptUnverified: true,
+      overwriteArchive: true,
+    };
+    for (const name of ["state-manifest.json", "retirement.json"]) {
+      linkTo(`arch/${name}`, SETTINGS_REL);
+      for (const dryRun of [true, false]) {
+        await refusedOnFloor(harnessRetire, { ...input, dryRun }, SETTINGS_REL);
+      }
+      expect(existsSync(path.join(tmp, "fleet/other/.crewhaus"))).toBe(true);
+      rmSync(path.join(tmp, "arch", name));
+    }
+  });
+
+  test(`StoreMigrate refuses a store file that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    session(1, 1);
+    linkTo(`moved/sessions/${sessionId(1)}.json`, SETTINGS_REL);
+    for (const dryRun of [true, false]) {
+      await refusedOnFloor(storeMigrate, { to: "moved", overwrite: true, dryRun }, SETTINGS_REL);
+    }
+  });
+}
+
+test("HarnessRetire refuses an archived state directory that leads into a root", async () => {
+  write(SETTINGS_REL, SETTINGS_BYTES);
+  write(".crewhaus/run/daemon.json", '{"pid":1}\n');
+  write("fleet/other/.crewhaus/sessions/sess_00000000000000bb.json", '{"id":"b"}');
+  linkTo("arch/crewhaus-state", ".crewhaus/run");
+  await refusedOnFloor(
+    harnessRetire,
+    {
+      spec: "other",
+      dir: "fleet/other",
+      archiveDir: "arch",
+      dryRun: false,
+      acceptUnverified: true,
+      overwriteArchive: true,
+    },
+    ".crewhaus/run/daemon.json",
+  );
+  expect(existsSync(path.join(tmp, "fleet/other/.crewhaus"))).toBe(true);
+});
+
+test("KnowledgeSync and HarnessRetire with those roots write everywhere else", async () => {
+  write(SETTINGS_REL, SETTINGS_BYTES);
+  const { landing } = sharedPrompt();
+  const pulled = JSON.parse(
+    String(await knowledgeSync.execute({ ...PULL, dir: "." } as never, FLOOR_CTX as never)),
+  ) as Json;
+  expect(pulled["status"]).toBe("applied");
+  expect(existsSync(path.join(tmp, landing))).toBe(true);
+  write("fleet/other/.crewhaus/sessions/sess_00000000000000bb.json", '{"id":"b"}');
+  const retired = JSON.parse(
+    String(
+      await harnessRetire.execute(
+        {
+          spec: "other",
+          dir: "fleet/other",
+          archiveDir: "arch",
+          dryRun: false,
+          acceptUnverified: true,
+        } as never,
+        FLOOR_CTX as never,
+      ),
+    ),
+  ) as Json;
+  expect(retired["harnessDir"]).toBe("fleet/other");
+  expect(existsSync(path.join(tmp, "arch/retirement.json"))).toBe(true);
+  expect(readFileSync(path.join(tmp, SETTINGS_REL), "utf8")).toBe(SETTINGS_BYTES);
 });

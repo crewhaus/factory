@@ -1547,3 +1547,87 @@ test("ExperimentLedger refuses a ledger a link carries into a root on the bridge
   expect(plain["status"]).toBe("ok");
   expect(existsSync(path.join(tmp, "plain", "x.jsonl"))).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// a write that lands in a root on the bridge
+// ---------------------------------------------------------------------------
+
+const FLOOR_CTX = { bridge: { protectedRoots: [".crewhaus/settings.json", ".crewhaus/run"] } };
+const SETTINGS_REL = ".crewhaus/settings.json";
+const SETTINGS_BYTES = '{"permissions":{"rules":[{"type":"alwaysDeny","pattern":"Bash"}]}}\n';
+
+/** A link at `rel` leading to `target`, a workspace-relative path that may not exist yet. */
+function linkTo(rel: string, target: string): void {
+  const abs = path.join(tmp, rel);
+  mkdirSync(path.dirname(abs), { recursive: true });
+  symlinkSync(path.relative(path.dirname(abs), path.join(tmp, target)), abs);
+}
+
+/** A call refused for landing in a root, with the target as it was: its bytes, or still absent. */
+async function refusedOnFloor(tool: RegisteredTool, input: unknown, target: string): Promise<void> {
+  const at = path.join(tmp, target);
+  const before = existsSync(at) ? readFileSync(at, "utf8") : "(absent)";
+  const out = JSON.parse(String(await tool.execute(input as never, FLOOR_CTX as never))) as Json;
+  expect(out["status"]).toBe("refused");
+  expect(String(out["reason"])).toContain("where the runtime keeps its own record");
+  expect(existsSync(at) ? readFileSync(at, "utf8") : "(absent)").toBe(before);
+}
+
+const RECORD = {
+  action: "record",
+  name: "e",
+  experimentsDir: "s",
+  version: "v",
+  outcome: "success",
+  allowUnknownVersion: true,
+};
+
+for (const [state, settings] of [
+  ["that exists", SETTINGS_BYTES],
+  ["that does not exist yet", undefined],
+] as const) {
+  const seedSettings = (): void => {
+    if (settings === undefined) return;
+    mkdirSync(path.join(tmp, ".crewhaus"), { recursive: true });
+    writeFileSync(path.join(tmp, SETTINGS_REL), settings);
+  };
+
+  test(`ExperimentLedger record refuses a ledger that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    linkTo("s/e.jsonl", SETTINGS_REL);
+    for (const dryRun of [true, false]) {
+      await refusedOnFloor(experimentLedger, { ...RECORD, dryRun }, SETTINGS_REL);
+    }
+  });
+
+  test(`RouteControl refuses a routing file that leads to a settings file ${state}`, async () => {
+    seedSettings();
+    for (const leaf of ["freeze.json", "freeze.json.tmp", "arms.jsonl", "arms.jsonl.tmp"]) {
+      linkTo(`fleet/other/.crewhaus/routing/${leaf}`, SETTINGS_REL);
+      for (const dryRun of [true, false]) {
+        await refusedOnFloor(
+          routeControl,
+          { action: "freeze", dir: "fleet/other", policyVersion: "p", dryRun },
+          SETTINGS_REL,
+        );
+      }
+      rmSync(path.join(tmp, "fleet/other/.crewhaus/routing", leaf));
+    }
+  });
+}
+
+test("what only reads through those names, and a write elsewhere, go on with those roots", async () => {
+  mkdirSync(path.join(tmp, ".crewhaus"), { recursive: true });
+  writeFileSync(path.join(tmp, SETTINGS_REL), SETTINGS_BYTES);
+  const run = async (tool: RegisteredTool, input: unknown): Promise<Json> =>
+    JSON.parse(String(await tool.execute(input as never, FLOOR_CTX as never))) as Json;
+  expect((await run(experimentLedger, { ...RECORD, dryRun: false }))["status"]).toBe("ok");
+  expect(readFileSync(path.join(tmp, "s/e.jsonl"), "utf8")).toContain('"success"');
+  linkTo("t/e.jsonl", SETTINGS_REL);
+  const tally = await run(experimentLedger, { action: "tally", name: "e", experimentsDir: "t" });
+  expect(String(tally["reason"])).not.toContain("where the runtime keeps its own record");
+  linkTo("fleet/other/.crewhaus/routing/freeze.json", SETTINGS_REL);
+  const status = await run(routeControl, { action: "status", dir: "fleet/other" });
+  expect(String(status["reason"])).not.toContain("where the runtime keeps its own record");
+  expect(readFileSync(path.join(tmp, SETTINGS_REL), "utf8")).toBe(SETTINGS_BYTES);
+});
