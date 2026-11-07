@@ -19,7 +19,8 @@
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/memory-service": "workspace:*",
     "@crewhaus/model-service": "workspace:*",
-    "@crewhaus/tool-categories": "workspace:*"
+    "@crewhaus/tool-categories": "workspace:*",
+    "@crewhaus/tool-registry-manifest": "workspace:*"
   },
   "devDependencies": {
     "@crewhaus/gateway-server": "workspace:*"

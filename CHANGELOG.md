@@ -156,6 +156,18 @@ these on: they reach every harness that uses what each one names.
   one, name this computer. To reach it from another machine, use an SSH tunnel,
   or a channel bundle's `/mcp`, which takes a bearer.
 
+- **A managed daemon saves a signing secret it generates to
+  `.crewhaus/run/gateway-jwt-secret`.** With no `CREWHAUS_GATEWAY_JWT_SECRET`,
+  the secret goes to that file, mode 0600, replaced each boot, and the log names
+  the path. Mint a token from the file, or set the variable to keep tokens valid
+  across restarts. A daemon that cannot save the file exits and names the
+  variable. Recompile a daemon to pick this up. `CREWHAUS_TENANTS_ROOT` belongs
+  at an absolute path outside the harness directory, such as
+  `/home/you/.crewhaus/tenants/<harness>`, in place of the example in 0.8.0's
+  notes, so tenant data stays apart from the harness's own files: a managed
+  daemon whose spec declares a tool that may work on files says so at boot when
+  the root lies inside.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

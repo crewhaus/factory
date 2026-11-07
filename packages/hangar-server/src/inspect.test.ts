@@ -102,6 +102,9 @@ describe("inspect — pure helpers", () => {
     expect(exclusionFor([".crewhaus", "run", "logs"])?.path).toBe(".crewhaus/run/logs/");
     expect(exclusionFor([".crewhaus", "run", "logs", "run_00000000000000aa.log"])).not.toBeNull();
     // …but the ledger beside it is ordinary, masked state.
+    expect(exclusionFor([".crewhaus", "run", "gateway-jwt-secret"])?.path).toBe(
+      ".crewhaus/run/gateway-jwt-secret",
+    );
     expect(exclusionFor([".crewhaus", "run", "runs.jsonl"])).toBeNull();
     // A nested `secrets/` anywhere is refused too — over-refusing a browser
     // is recoverable, under-refusing it is not.
@@ -121,6 +124,7 @@ describe("inspect — pure helpers", () => {
       [".CREWHAUS", "audit", "2026-08-01.jsonl"],
       [".crewhaus", "run", "LOGS", "run_00000000000000aa.log"],
       [".crewhaus", "Run", "Logs"],
+      [".crewhaus", "RUN", "Gateway-JWT-Secret"],
       [".CrewHaus", "RUN", "logs"],
       [".crewhaus", "SECRETS", "vault.json"],
       [".ENV"],
@@ -212,9 +216,10 @@ describe("inspect — the store index", () => {
 
       // The exclusions are DATA, so the console can say why they are absent.
       const excluded = body["excluded"] as Array<Record<string, unknown>>;
-      expect(excluded).toHaveLength(4);
+      expect(excluded).toHaveLength(5);
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/secrets/");
       expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/logs/");
+      expect(excluded.map((e) => e["path"])).toContain(".crewhaus/run/gateway-jwt-secret");
 
       // …and the "we have no rich view for this yet" list names the rest of
       // the tree without pretending it is empty.
@@ -403,6 +408,7 @@ describe("inspect — the generic raw browser", () => {
         ".env.local",
         ".crewhaus/run/logs",
         ".crewhaus/run/logs/run_00000000000000aa.log",
+        ".crewhaus/run/gateway-jwt-secret",
       ];
       for (const path of refused) {
         const { status, body } = await t.api(
@@ -557,6 +563,33 @@ describe("inspect — the generic raw browser", () => {
       expect(status).toBe(200);
       expect((body["entries"] as Array<{ name: string }>).map((e) => e.name)).not.toContain("logs");
       expect(body["excludedHere"]).toEqual(["logs"]);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a managed daemon's generated signing secret is refused and left out of the listing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const value = "9c".repeat(24);
+      writeFileSync(join(dir, ".crewhaus", "run", "gateway-jwt-secret"), `${value}\n`);
+      const id = await register(t, dir);
+      for (const path of [".crewhaus/run/gateway-jwt-secret", ".CREWHAUS/Run/Gateway-JWT-Secret"]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}:${status}`).toBe(`${path}:403`);
+        expect(String(body["error"])).toContain("generated signing secret");
+        expect(JSON.stringify(body)).not.toContain(value);
+      }
+      const listing = await t.api(`/api/h/${id}/inspect/raw?path=.crewhaus%2Frun`);
+      expect(listing.status).toBe(200);
+      const names = (listing.body["entries"] as Array<{ name: string }>).map((e) => e.name);
+      expect(names).not.toContain("gateway-jwt-secret");
+      expect(listing.body["excludedHere"]).toEqual(
+        expect.arrayContaining(["gateway-jwt-secret", "logs"]),
+      );
     } finally {
       await t.stop();
     }

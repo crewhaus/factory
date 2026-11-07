@@ -73,6 +73,7 @@ import {
   readRunfile,
   resolveBundle,
   runClassFor,
+  shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { runPreflight } from "@crewhaus/preflight";
 import { currentBaselines, pinBaseline, pinSession, readPins } from "./actions";
@@ -2156,16 +2157,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       });
       const view = proofView(harnesses, runId);
       if (view.bundles.length === 0 && view.skipped.length === 0) {
-        const outside = view.tenantRootsNotRead ?? [];
+        const roots = [...new Set((view.tenantRootsNotRead ?? []).map((o) => o.root))];
+        const [onlyRoot] = roots;
+        const rootFlag =
+          onlyRoot !== undefined && roots.length === 1 ? shellQuote(onlyRoot) : "<root>";
         throw new HttpError(
           404,
-          outside.length === 0
+          roots.length === 0
             ? `no proof bundle persisted for ${runId}`
-            : `no proof bundle persisted for ${runId} under a harness directory — a managed harness files its bundles under its tenants root (${[
-                ...new Set(outside.map((o) => o.root)),
-              ].join(
+            : `no proof bundle persisted for ${runId} under a harness directory — a managed harness files its bundles under its tenants root (${roots.join(
                 ", ",
-              )}), outside the harness directory, which Hangar does not read: run \`crewhaus provability show --session ${runId}\` from the harness directory, or set CREWHAUS_TENANTS_ROOT inside it`,
+              )}), outside the harness directory, which Hangar does not read: run \`crewhaus provability show --session ${runId} --tenants-root ${rootFlag}\` from the harness directory`,
         );
       }
       // One scrubber per harness (each reads that harness's `.env` chain),

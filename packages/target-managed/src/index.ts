@@ -33,12 +33,14 @@ import {
   readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
+import { TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 
 /**
  * Emit a managed-daemon bundle. Generates `daemon.ts` that wires:
  *   - `@crewhaus/gateway-server` listening on `process.env.PORT`
  *     (default 3000) with the JWT secret from
- *     `process.env.CREWHAUS_GATEWAY_JWT_SECRET`,
+ *     `process.env.CREWHAUS_GATEWAY_JWT_SECRET`, or one generated for this
+ *     boot and saved to `.crewhaus/run/gateway-jwt-secret` (0600),
  *   - per-tenant routing via `@crewhaus/tenancy`,
  *   - per-tenant audit log via `@crewhaus/audit-log`,
  *   - the runChatLoop dispatcher inside `runs.create` / `runs.continue`,
@@ -132,6 +134,21 @@ function resolveManagedTools(
     registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
     sandbox: resolved.sandbox,
   };
+}
+
+/**
+ * True when the spec declares a builtin that may work on files named relative
+ * to the harness directory: its manifest row names a path or a command, or does
+ * not say. An absent `operativeArgs` is "not declared", and `[]` is how a tool
+ * declares that no argument decides where it acts. The boot warning about where
+ * the tenants root belongs is emitted for these specs, and a spec with none
+ * compiles without a byte of it.
+ */
+function declaresPathTool(ir: IrManagedV0): boolean {
+  return (ir.tools ?? []).some((key) => {
+    const args = TOOL_FLAGS[key]?.operativeArgs;
+    return args === undefined || args.some((arg) => arg.kind === "path" || arg.kind === "command");
+  });
 }
 
 /**
@@ -1223,10 +1240,10 @@ const DREAM_STEP = createDreamJanitorStep(${memoryFabric(ir).fragmentJson}, {
   // teardown and its ratings would otherwise accumulate forever.
   const feedbackOn = ir.feedback !== undefined && ir.feedback.enabled !== false;
   const distillOn = feedbackOn && ir.feedback?.autoDistill === true;
-  // `randomBytes` is already in the unconditional preamble below, so this
-  // adds only what the handler needs on top of it.
+  // `randomBytes` and `mkdirSync` are already in the unconditional preamble
+  // below, so this adds only what the handler needs on top of them.
   const feedbackImport = feedbackOn
-    ? 'import { appendFileSync, existsSync, mkdirSync } from "node:fs";\nimport { buildFeedbackRecord } from "@crewhaus/feedback-distill";\n'
+    ? 'import { appendFileSync, existsSync } from "node:fs";\nimport { buildFeedbackRecord } from "@crewhaus/feedback-distill";\n'
     : "";
   // GatewayServerError rides the existing gateway-server import so the emitted
   // module never names one specifier twice.
@@ -1405,9 +1422,39 @@ await runDrainSweep(() => janitor.runOnce(), {
       : `
 if (process.env.CREWHAUS_TENANTS_ROOT === undefined) {
   console.error(
-    \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to keep them (for example .crewhaus/tenants).\`,
+    \`[managed] provability: proof bundles go to \${TENANTS_ROOT}/<tenant>/proofs/ — outside .crewhaus/, so crewhaus state backup does not carry them, and an OS tmp cleaner may delete them. Set CREWHAUS_TENANTS_ROOT to an absolute path outside the harness directory to keep them, such as /home/you/.crewhaus/tenants/<harness>.\`,
   );
 }`;
+  // Where the tenants root belongs, said at boot to a spec that declares a tool
+  // working on harness files. A root named through a symlink, or one that does
+  // not exist yet, is compared by where it lands on disk.
+  const pathToolDeclared = declaresPathTool(ir);
+  const tenantsRootPlacement = pathToolDeclared
+    ? `
+function onDisk(path: string): string {
+  const at = resolve(path);
+  try {
+    return realpathSync(at);
+  } catch {}
+  const up = dirname(at);
+  return up === at ? at : join(onDisk(up), basename(at));
+}
+const tenantsRootFromCwd = relative(onDisk(process.cwd()), onDisk(TENANTS_ROOT));
+if (
+  tenantsRootFromCwd === "" ||
+  (!tenantsRootFromCwd.startsWith("..") && !isAbsolute(tenantsRootFromCwd))
+) {
+  console.error(
+    "[managed] keep CREWHAUS_TENANTS_ROOT outside the harness directory, so tenant data stays apart from the harness's own files.",
+  );
+}`
+    : "";
+  const fsImports = pathToolDeclared
+    ? "lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync"
+    : "lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync";
+  const pathImports = pathToolDeclared
+    ? "basename, dirname, isAbsolute, join, relative, resolve"
+    : "dirname";
 
   const tenantList = ir.tenants
     .map(
@@ -1437,8 +1484,9 @@ import { buildTenant, withTenant, type Tenant } from "@crewhaus/tenancy";
 import { runOneTurn } from "./agent.ts";
 ${proofResult.importLine}
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";${tenantsRootWarning}
+import { ${fsImports} } from "node:fs";
+import { ${pathImports} } from "node:path";
+${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";${tenantsRootWarning}${tenantsRootPlacement}
 const PORT = Number(process.env.PORT ?? 3000);
 // Bind every interface unless told otherwise. gateway.listen defaults to
 // 127.0.0.1 — right for a library, wrong here: this is the daemon's only
@@ -1455,12 +1503,31 @@ if (ENV_JWT_SECRET !== undefined && ENV_JWT_SECRET.length < 16) {
 }
 const JWT_SECRET: string = ENV_JWT_SECRET ?? randomBytes(24).toString("hex");
 if (ENV_JWT_SECRET === undefined) {
-  // Dev-mode autogeneration. The doc-side contract is that the operator
-  // copies this line and re-exports it for subsequent runs (otherwise
-  // every restart invalidates previously-minted tokens). In production,
-  // set CREWHAUS_GATEWAY_JWT_SECRET explicitly.
+  // Generated for this boot and saved for the operator, who mints a token
+  // from it. Production sets CREWHAUS_GATEWAY_JWT_SECRET.
+  const secretFile = \`\${process.cwd()}/.crewhaus/run/gateway-jwt-secret\`;
+  try {
+    mkdirSync(dirname(secretFile), { recursive: true, mode: 0o700 });
+    rmSync(secretFile, { force: true });
+    const ignoreFile = \`\${dirname(secretFile)}/.gitignore\`;
+    try {
+      writeFileSync(ignoreFile, "*\\n", { flag: "wx" });
+    } catch {}
+    // An operator's own file stays. Anything else at that name is not a
+    // .gitignore git reads, so it gives way to one.
+    if (!lstatSync(ignoreFile).isFile()) {
+      rmSync(ignoreFile, { force: true, recursive: true });
+      writeFileSync(ignoreFile, "*\\n", { flag: "wx" });
+    }
+    writeFileSync(secretFile, \`\${JWT_SECRET}\\n\`, { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    console.error(
+      \`[managed] set CREWHAUS_GATEWAY_JWT_SECRET (at least 16 chars): no secret is set, and one could not be saved to \${secretFile}: \${(err as Error).message}\`,
+    );
+    process.exit(1);
+  }
   console.error(
-    \`[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env — generated a one-shot dev secret. Export it to re-use:\\n  export CREWHAUS_GATEWAY_JWT_SECRET=\${JWT_SECRET}\`,
+    "[managed] no CREWHAUS_GATEWAY_JWT_SECRET in env, so this run generated one and saved it to .crewhaus/run/gateway-jwt-secret. Set the variable to keep tokens valid across restarts.",
   );
 }
 
