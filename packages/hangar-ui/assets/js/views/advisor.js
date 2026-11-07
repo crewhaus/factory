@@ -26,6 +26,7 @@ import {
   emptyState,
   jsonPre,
   skeleton,
+  statusBadge,
   tipIcon,
   toast,
   withTip,
@@ -202,7 +203,9 @@ export function itemRow(item, ctx, reload) {
   const model = itemActionModel(item, ctx.id);
   const explain = String(item.explain ?? "");
   const row = el("div", { class: `adv-item adv-${severity}` });
-  row.appendChild(el("div", null, [dot(severityDot(severity), severity)]));
+  // The severity is a word in a badge; its colour only repeats the word.
+  const tone = severityDot(severity);
+  row.appendChild(el("div", null, [statusBadge(tone === "unknown" ? "info" : tone, severity)]));
   // The why is inline and folded, not a hover: a keyboard reaches a
   // disclosure, and nobody has to find it by pointing at the title.
   const main = el("div", { class: "adv-main" }, [
