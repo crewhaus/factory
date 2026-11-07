@@ -15,6 +15,10 @@ hooks that wrap a start.
 On the harness it runs in, `HooksManage` is refused by the runtime-state floor, `list` included
 (the tool is not read-only); it manages other harnesses as before.
 
+`CompileBundle` of the working directory goes by the rules. Of another directory, it refuses, in
+the preview and the real call alike, when the output, the entry or the manifest resolves into one
+of the floor's roots, or when the output directory holds one.
+
 ## These tools are thin on purpose
 
 Everything they enforce belongs to a package they depend on. The registry file is written by

@@ -6,8 +6,8 @@
  * provability gate and `continuity.proof` read as evidence, and the files
  * that control the run, which decide what the agent may do next — the
  * harness's run files (`.crewhaus/run`), settings file
- * (`.crewhaus/settings.json`), gate records and environment files, and Hangar's
- * directory. Evidence is checked only while the agent cannot write it, and the
+ * (`.crewhaus/settings.json`), gate records, environment files, compiled bundle
+ * and dependencies, and Hangar's directory. Evidence is checked only while the agent cannot write it, and the
  * files that control the run are not its tools' to write. A root is a
  * directory, holding everything under it, or an exact file, holding only
  * itself.
@@ -225,5 +225,5 @@ export function rootsBesideStore(
 
 /** The refusal a tool returns for a write into a protected root. */
 export function protectedWriteRefusal(tool: string, what: string): string {
-  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory), which no tool may change. Nothing was written.`;
+  return `${tool}: refused — ${what} would write where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records, environment files, compiled bundle and dependencies, Hangar's directory), which no tool may change. Nothing was written.`;
 }

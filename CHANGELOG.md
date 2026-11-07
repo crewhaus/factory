@@ -63,9 +63,25 @@ these on: they reach every harness that uses what each one names.
   a managed run's whole tenants root; and Hangar's directory and registry:
   `~/.crewhaus/hangar` and `~/.crewhaus/harnesses.json` always, and wherever the
   run's `CREWHAUS_HANGAR_ROOT` or `CREWHAUS_REGISTRY_ROOT` puts them. The floor
-  also reads the directory a call keeps a tool's store in. Only `bypass` mode
-  skips the floor, and the file tools that check their own targets refuse even
-  then, as `DatasetPut`, `SpecPin` and `DeployRollback` do for what lands in one
+  also reads the directory a call keeps a tool's store in. In a working directory
+  that holds `crewhaus.yaml` or `crewhaus.yml`, it also covers `dist`, `build` and
+  `node_modules`; in a compiled non-interactive bundle running from that
+  directory, it also covers `crewhaus.yaml`, `crewhaus.yml`, `tsconfig.json`,
+  `jsconfig.json` and `package.json`; a bundle started from inside its own
+  directory covers its own code files and the other spellings of their names,
+  `package.json`, `bun.lock`, `bun.lockb`, `node_modules`, `tsconfig.json`,
+  `jsconfig.json`, `crewhaus.yaml` and `crewhaus.yml`; and a compiled
+  non-interactive bundle in a directory below covers that directory, the spec's
+  names at the working directory, and `node_modules`, `package.json`,
+  `tsconfig.json` and `jsconfig.json` from its parent up to the working directory.
+  `CompileBundle` refuses another directory whose output leads into one of these
+  or holds one.
+  Read from a tool that declares no paths, a relative `dist`, `build`,
+  `node_modules`, `package.json`, `tsconfig.json` or `jsconfig.json`, or a name
+  below one, is not taken for a path; an absolute one is. The compiled CLI is built
+  with `--no-compile-autoload-bunfig`, so it reads no `bunfig.toml` from the working
+  directory. Only `bypass` mode skips the floor, and the file tools that check
+  their own targets refuse even then, as `DatasetPut`, `SpecPin` and `DeployRollback` do for what lands in one
   of these, and `EmitTraceEvent`, `ExperimentLedger`, `KvSet`, `KvDelete`,
   `CounterIncrement`, `CheckpointSave`, `JournalAppend`, `BlackboardPost`,
   `NoteWrite`, `IndexBuild` and `DedupeMark` for a record a link leads to one.

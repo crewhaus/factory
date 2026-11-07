@@ -689,3 +689,468 @@ describe("runtimeRecordRoots and the store a relocating field names", () => {
     expect(relocatingFieldLeftOut(nested, {}, record, all, cwd)).toBe(false);
   });
 });
+
+describe("what a harness's next start runs", () => {
+  const TREES = ["dist", "build", "node_modules"];
+  const INPUTS = [
+    "crewhaus.yaml",
+    "crewhaus.yml",
+    "tsconfig.json",
+    "jsconfig.json",
+    "package.json",
+  ];
+  const BUNDLE_MANIFEST = JSON.stringify({ name: "crewhaus-compiled-bundle" });
+  /** Every name a run in this directory could add, to read each answer against. */
+  const NAMED = [...TREES, ...INPUTS, "daemon.ts", "agent.ts", "README.md", "out"];
+
+  /** A new working directory holding `files`, by relative path. */
+  function dirWith(files: Readonly<Record<string, string>> = {}): string {
+    const cwd = tempDir("crewhaus-state-roots-bundle-");
+    for (const [rel, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(cwd, rel)), { recursive: true });
+      writeFileSync(join(cwd, rel), body);
+    }
+    return cwd;
+  }
+  /** The names of {@link NAMED} the run protects, in that order. */
+  function protectedNames(cwd: string, entry: string): string[] {
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {}, entry);
+    return NAMED.filter((name) => roots.includes(name));
+  }
+
+  describe("a spec at the working directory, and the process's entry", () => {
+    test("a compiled daemon's entry inside it: the trees and the compiled inputs", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual([...TREES, ...INPUTS]);
+    });
+
+    test("each is spelled absolute and relative", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      const roots = runtimeStateRoots(
+        undefined,
+        undefined,
+        cwd,
+        {},
+        join(cwd, "dist", "daemon.ts"),
+      );
+      for (const name of [...TREES, ...INPUTS]) {
+        expect({ name, absolute: roots.includes(join(cwd, name)) }).toEqual({
+          name,
+          absolute: true,
+        });
+        expect({ name, relative: roots.includes(name) }).toEqual({ name, relative: true });
+      }
+    });
+
+    test("the entry outside it: the trees alone", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      const elsewhere = dirWith({ "dist/agent.ts": "" });
+      expect(protectedNames(cwd, join(elsewhere, "dist", "agent.ts"))).toEqual(TREES);
+    });
+
+    test("the spec by its other name counts the same", () => {
+      const cwd = dirWith({ "crewhaus.yml": "name: h\ntarget: managed\n", "dist/daemon.ts": "" });
+      expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual([...TREES, ...INPUTS]);
+    });
+
+    for (const line of [
+      "target: channel",
+      'target: "channel"',
+      "target: 'managed'",
+      "target: workflow # a comment",
+      "target: my-target",
+    ]) {
+      test(`the target read from \`${line}\` is a non-interactive one`, () => {
+        const cwd = dirWith({ "crewhaus.yaml": `name: h\n${line}\n`, "dist/daemon.ts": "" });
+        expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual([...TREES, ...INPUTS]);
+      });
+    }
+
+    for (const target of ["cli", "browser", '"cli"', "'browser'"]) {
+      test(`\`target: ${target}\` with the entry inside: the trees alone`, () => {
+        const cwd = dirWith({
+          "crewhaus.yaml": `name: h\ntarget: ${target}\n`,
+          "dist/agent.ts": "",
+          "dist/package.json": BUNDLE_MANIFEST,
+        });
+        expect(protectedNames(cwd, join(cwd, "dist", "agent.ts"))).toEqual(TREES);
+      });
+    }
+
+    for (const [label, spec] of [
+      ["no target line", "name: h\n"],
+      ["a commented target", "name: h\n# target: channel\n"],
+      ["a nested target", "name: h\ndeploy:\n  target: channel\n"],
+    ] as const) {
+      test(`${label}: the trees alone`, () => {
+        const cwd = dirWith({ "crewhaus.yaml": spec, "dist/daemon.ts": "" });
+        expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual(TREES);
+      });
+    }
+
+    test("an entry under node_modules (a harness-local CLI): the trees alone", () => {
+      const cwd = dirWith({
+        "crewhaus.yaml": "name: h\ntarget: channel\n",
+        "node_modules/crewhaus/src/index.ts": "",
+        "node_modules/crewhaus/src/package.json": BUNDLE_MANIFEST,
+      });
+      expect(protectedNames(cwd, join(cwd, "node_modules", "crewhaus", "src", "index.ts"))).toEqual(
+        TREES,
+      );
+    });
+
+    test("a compiled binary's virtual entry, and an entry that is gone: the trees alone", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      expect(protectedNames(cwd, "/$bunfs/root/x")).toEqual(TREES);
+      expect(protectedNames(cwd, join(cwd, "dist", "gone.ts"))).toEqual(TREES);
+    });
+
+    test("an entry read by where it really lies, through a link either way", () => {
+      const elsewhere = dirWith({ "dist/daemon.ts": "" });
+      const out = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      symlinkSync(join(elsewhere, "dist", "daemon.ts"), join(out, "daemon.ts"));
+      expect(protectedNames(out, join(out, "daemon.ts"))).toEqual(TREES);
+      const inside = dirWith({
+        "crewhaus.yaml": "name: h\ntarget: channel\n",
+        "dist/daemon.ts": "",
+      });
+      const link = join(dirWith(), "daemon.ts");
+      symlinkSync(join(inside, "dist", "daemon.ts"), link);
+      expect(protectedNames(inside, link)).toEqual([...TREES, ...INPUTS]);
+    });
+
+    test("a working directory named through a link keeps both its names", () => {
+      const real = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      const named = join(dirWith(), "named");
+      symlinkSync(real, named);
+      const roots = runtimeStateRoots(
+        undefined,
+        undefined,
+        named,
+        {},
+        join(real, "dist", "daemon.ts"),
+      );
+      for (const root of [
+        "package.json",
+        join(named, "package.json"),
+        join(real, "package.json"),
+      ]) {
+        expect({ root, held: roots.includes(root) }).toEqual({ root, held: true });
+      }
+    });
+  });
+
+  describe("no spec at the working directory", () => {
+    test("a plain project, whichever the entry: neither the trees nor the inputs", () => {
+      const cwd = dirWith({ "dist/daemon.ts": "", "package.json": '{"name":"mine"}' });
+      expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual([]);
+      expect(protectedNames(dirWith(), "/opt/elsewhere/agent.ts")).toEqual([]);
+    });
+
+    test("a bundle started from inside itself: its code, its manifest, its dependencies and its resolver config", () => {
+      const cwd = dirWith({
+        "daemon.ts": "",
+        "agent.ts": "",
+        "package.json": BUNDLE_MANIFEST,
+        "README.md": "",
+      });
+      expect(protectedNames(cwd, join(cwd, "daemon.ts"))).toEqual([
+        "node_modules",
+        "crewhaus.yaml",
+        "crewhaus.yml",
+        "tsconfig.json",
+        "jsconfig.json",
+        "package.json",
+        "daemon.ts",
+        "agent.ts",
+      ]);
+    });
+
+    test("every other spelling of a code file's name is held, whether or not it exists yet", () => {
+      const cwd = dirWith({ "daemon.ts": "", "agent.ts": "", "package.json": BUNDLE_MANIFEST });
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {}, join(cwd, "daemon.ts"));
+      const extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
+      expect(extensions.length).toBeGreaterThan(0);
+      for (const stem of ["agent", "daemon"]) {
+        for (const name of [
+          ...extensions.map((extension) => `${stem}${extension}`),
+          ...[...extensions, ".json"].map((extension) => `${stem}.js${extension}`),
+        ]) {
+          expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+        }
+      }
+      for (const name of ["new.ts", "new.js", "agent.md", "agents.js", "agent.json"]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: false });
+      }
+    });
+
+    test("the lockfile's names are held, whether or not one exists yet", () => {
+      const cwd = dirWith({ "daemon.ts": "", "package.json": BUNDLE_MANIFEST });
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {}, join(cwd, "daemon.ts"));
+      expect(roots).toContain("bun.lock");
+      expect(roots).toContain("bun.lockb");
+    });
+
+    test("every kind of code file and manifest at the top is held, once, and nothing else", () => {
+      const cwd = dirWith({
+        "daemon.ts": "",
+        "view.tsx": "",
+        "a.js": "",
+        "b.mjs": "",
+        "c.cjs": "",
+        "d.jsx": "",
+        "e.mts": "",
+        "f.cts": "",
+        "data.json": "",
+        "other.lock": "",
+        "package.json": BUNDLE_MANIFEST,
+        "tsconfig.json": "{}",
+        "GOAL.md": "",
+        "notes.md": "",
+        "run.sh": "",
+        "sub/deep.ts": "",
+        "named.json/inside": "",
+      });
+      symlinkSync(join(cwd, "sub", "deep.ts"), join(cwd, "link.ts"));
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {}, join(cwd, "daemon.ts"));
+      for (const name of [
+        "daemon.ts",
+        "view.tsx",
+        "a.js",
+        "b.mjs",
+        "c.cjs",
+        "d.jsx",
+        "e.mts",
+        "f.cts",
+        "other.lock",
+        "bun.lock",
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "node_modules",
+      ]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+        expect({ name, times: roots.filter((root) => root === name).length }).toEqual({
+          name,
+          times: 1,
+        });
+      }
+      for (const name of [
+        "data.json",
+        "GOAL.md",
+        "notes.md",
+        "run.sh",
+        join("sub", "deep.ts"),
+        "named.json",
+        "link.ts",
+      ]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: false });
+      }
+    });
+
+    for (const [label, manifest] of [
+      ["another name in the manifest", '{"name":"mine"}'],
+      ["no name in the manifest", "{}"],
+      ["a manifest that does not parse", "{"],
+      ["a manifest that is no object", "[]"],
+    ] as const) {
+      test(`${label}: nothing beyond the working directory's usual roots`, () => {
+        const cwd = dirWith({ "daemon.ts": "", "agent.ts": "", "package.json": manifest });
+        expect(protectedNames(cwd, join(cwd, "daemon.ts"))).toEqual([]);
+      });
+    }
+
+    test("no manifest: nothing beyond the working directory's usual roots", () => {
+      const cwd = dirWith({ "daemon.ts": "", "agent.ts": "" });
+      expect(protectedNames(cwd, join(cwd, "daemon.ts"))).toEqual([]);
+    });
+
+    const CONFIG = ["node_modules", "tsconfig.json", "jsconfig.json", "package.json"];
+    const SPECS = ["crewhaus.yaml", "crewhaus.yml"];
+    const header = (target: string): string =>
+      `// GENERATED\n//\n// Source spec: "a (target: cli, b)" (target: ${target}, ir version: 1)\n`;
+
+    test("a daemon's bundle in a directory below: that directory, what is above it, and the spec's names", () => {
+      const cwd = dirWith({ "out/daemon.ts": "", "out/package.json": BUNDLE_MANIFEST });
+      expect(protectedNames(cwd, join(cwd, "out", "daemon.ts")).sort()).toEqual(
+        [...CONFIG, ...SPECS, "out"].sort(),
+      );
+    });
+
+    for (const target of ["channel", "workflow", "graph", "batch", "pipeline"]) {
+      test(`a non-interactive target named by the entry's header (\`${target}\`) counts`, () => {
+        const cwd = dirWith({
+          "out/agent.ts": header(target),
+          "out/package.json": BUNDLE_MANIFEST,
+        });
+        expect(protectedNames(cwd, join(cwd, "out", "agent.ts")).sort()).toEqual(
+          [...CONFIG, ...SPECS, "out"].sort(),
+        );
+      });
+    }
+
+    for (const target of ["cli", "browser"]) {
+      test(`an interactive target's bundle below (\`${target}\`): that directory alone`, () => {
+        const cwd = dirWith({
+          "out/agent.ts": header(target),
+          "out/package.json": BUNDLE_MANIFEST,
+        });
+        expect(protectedNames(cwd, join(cwd, "out", "agent.ts"))).toEqual(["out"]);
+      });
+    }
+
+    test("an entry with no header goes by its file name", () => {
+      const cwd = dirWith({ "out/agent.ts": "", "out/package.json": BUNDLE_MANIFEST });
+      expect(protectedNames(cwd, join(cwd, "out", "agent.ts"))).toEqual(["out"]);
+    });
+
+    test("a daemon's bundle two directories below holds each directory on the way up", () => {
+      const cwd = dirWith({ "a/b/daemon.ts": "", "a/b/package.json": BUNDLE_MANIFEST });
+      const roots = runtimeStateRoots(
+        undefined,
+        undefined,
+        cwd,
+        {},
+        join(cwd, "a", "b", "daemon.ts"),
+      );
+      expect(roots).toContain(join("a", "b"));
+      expect(roots).not.toContain("a");
+      for (const name of CONFIG) {
+        for (const at of [name, join("a", name)]) {
+          expect({ at, held: roots.includes(at) }).toEqual({ at, held: true });
+        }
+        const inside = join("a", "b", name);
+        expect({ inside, named: roots.includes(inside) }).toEqual({ inside, named: false });
+      }
+    });
+
+    test("with a compiled daemon's spec at the working directory, the directory between is held too", () => {
+      const cwd = dirWith({
+        "crewhaus.yaml": "name: h\ntarget: channel\n",
+        "a/b/agent.ts": "",
+        "a/b/package.json": BUNDLE_MANIFEST,
+      });
+      const roots = runtimeStateRoots(
+        undefined,
+        undefined,
+        cwd,
+        {},
+        join(cwd, "a", "b", "agent.ts"),
+      );
+      expect(roots).toContain(join("a", "package.json"));
+    });
+
+    test("a manifest under node_modules, or above the entry only, is no bundle's", () => {
+      const nested = dirWith({
+        "node_modules/x/index.ts": "",
+        "node_modules/x/package.json": BUNDLE_MANIFEST,
+      });
+      expect(protectedNames(nested, join(nested, "node_modules", "x", "index.ts"))).toEqual([]);
+      const above = dirWith({ "package.json": BUNDLE_MANIFEST, "src/main.ts": "" });
+      expect(protectedNames(above, join(above, "src", "main.ts"))).toEqual([]);
+    });
+  });
+
+  describe("a bundle written at the spec's own directory", () => {
+    const LAYOUT = { "daemon.ts": "", "agent.ts": "", "package.json": BUNDLE_MANIFEST };
+
+    test("a non-interactive target: the code files too", () => {
+      const cwd = dirWith({ ...LAYOUT, "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      expect(protectedNames(cwd, join(cwd, "daemon.ts"))).toEqual([
+        ...TREES,
+        ...INPUTS,
+        "daemon.ts",
+        "agent.ts",
+      ]);
+    });
+
+    test("a non-interactive target: the other spellings of the code files too", () => {
+      const cwd = dirWith({ ...LAYOUT, "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {}, join(cwd, "daemon.ts"));
+      for (const name of ["agent.js", "agent.tsx", "agent.js.ts", "bun.lock", "bun.lockb"]) {
+        expect({ name, held: roots.includes(name) }).toEqual({ name, held: true });
+      }
+    });
+
+    test("`target: cli`: the trees alone", () => {
+      const cwd = dirWith({ ...LAYOUT, "crewhaus.yaml": "name: h\ntarget: cli\n" });
+      expect(protectedNames(cwd, join(cwd, "agent.ts"))).toEqual(TREES);
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {}, join(cwd, "agent.ts"));
+      expect(roots).not.toContain("agent.js");
+      expect(roots).not.toContain("bun.lock");
+    });
+  });
+
+  describe("the answer is kept for the life of the process", () => {
+    test("a spec removed after the first answer does not change the next", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      const entry = join(cwd, "dist", "daemon.ts");
+      const first = protectedNames(cwd, entry);
+      expect(first).toEqual([...TREES, ...INPUTS]);
+      rmSync(join(cwd, "crewhaus.yaml"));
+      expect(protectedNames(cwd, entry)).toEqual(first);
+    });
+
+    test("a spec added after the first answer does not change the next", () => {
+      const cwd = dirWith();
+      expect(protectedNames(cwd, "/opt/elsewhere/agent.ts")).toEqual([]);
+      writeFileSync(join(cwd, "crewhaus.yaml"), "name: h\ntarget: channel\n");
+      expect(protectedNames(cwd, "/opt/elsewhere/agent.ts")).toEqual([]);
+    });
+
+    test("a target changed after the first answer does not change the next", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      const entry = join(cwd, "dist", "daemon.ts");
+      expect(protectedNames(cwd, entry)).toEqual([...TREES, ...INPUTS]);
+      writeFileSync(join(cwd, "crewhaus.yaml"), "name: h\ntarget: cli\n");
+      expect(protectedNames(cwd, entry)).toEqual([...TREES, ...INPUTS]);
+    });
+
+    test("a bundle's files are named as they stood at the first answer", () => {
+      const cwd = dirWith({ "daemon.ts": "", "package.json": BUNDLE_MANIFEST });
+      const entry = join(cwd, "daemon.ts");
+      expect(runtimeStateRoots(undefined, undefined, cwd, {}, entry)).toContain("daemon.ts");
+      writeFileSync(join(cwd, "added.ts"), "");
+      const later = runtimeStateRoots(undefined, undefined, cwd, {}, entry);
+      expect(later).toContain("daemon.ts");
+      expect(later).not.toContain("added.ts");
+    });
+
+    test("another working directory or another entry gets an answer of its own", () => {
+      const spec = { "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" };
+      const cwd = dirWith(spec);
+      const other = dirWith();
+      expect(protectedNames(cwd, join(cwd, "dist", "daemon.ts"))).toEqual([...TREES, ...INPUTS]);
+      expect(protectedNames(cwd, "/opt/elsewhere/agent.ts")).toEqual(TREES);
+      expect(protectedNames(other, join(cwd, "dist", "daemon.ts"))).toEqual([]);
+    });
+  });
+
+  describe("the entry a run reads when none is named", () => {
+    const bun = Bun as unknown as { main: string };
+    const savedMain = bun.main;
+    const withMain = <T>(main: string, body: () => T): T => {
+      bun.main = main;
+      try {
+        return body();
+      } finally {
+        bun.main = savedMain;
+      }
+    };
+
+    test("is the process's own", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n", "dist/daemon.ts": "" });
+      const roots = withMain(join(cwd, "dist", "daemon.ts"), () =>
+        runtimeStateRoots(undefined, undefined, cwd, {}),
+      );
+      expect(roots).toContain("package.json");
+    });
+
+    test("this test file, outside the working directory, adds the trees alone", () => {
+      const cwd = dirWith({ "crewhaus.yaml": "name: h\ntarget: channel\n" });
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+      expect(roots).toContain("dist");
+      expect(roots).not.toContain("package.json");
+    });
+  });
+});

@@ -35,12 +35,21 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { buildTenant } from "../packages/tenancy/src/index";
 import {
   SHAPE_TOOL_PROFILES,
@@ -583,6 +592,128 @@ describe("the release notes name every change a harness without provability: see
     expect(floor).toContain("`RunCommand`");
   });
 
+  test("the runtime-state floor: what a harness's own directory adds is named with the rest", async () => {
+    // Only a spec at the working directory, or a bundle's manifest beside the
+    // process's entry, adds these, so the check above never sees them. The sets
+    // are written out here, not read from the code that makes them: a root added
+    // there fails this until the notes and this list name it.
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-compiled-")));
+    const relativeRoots = (cwd: string, entry: string): string[] =>
+      runtimeStateRoots(undefined, undefined, cwd, {}, entry)
+        .filter((root) => !isAbsolute(root))
+        .map((root) => root.split(sep).join("/"));
+    try {
+      for (const dir of ["plain", "harness", join("harness", "dist"), "inside"]) {
+        mkdirSync(join(base, dir));
+      }
+      const elsewhere = join(base, "elsewhere.ts");
+      const noSpec = relativeRoots(join(base, "plain"), elsewhere);
+      expect(noSpec.length).toBeGreaterThan(0);
+
+      const harness = join(base, "harness");
+      writeFileSync(join(harness, "crewhaus.yaml"), "name: h\ntarget: managed\n");
+      writeFileSync(join(harness, "dist", "daemon.ts"), "");
+      const compiled = relativeRoots(harness, join(harness, "dist", "daemon.ts"));
+      const added = compiled.filter((root) => !noSpec.includes(root)).sort();
+      const expected = [
+        "build",
+        "crewhaus.yaml",
+        "crewhaus.yml",
+        "dist",
+        "jsconfig.json",
+        "node_modules",
+        "package.json",
+        "tsconfig.json",
+      ];
+      expect(added).toEqual(expected);
+      expect(unlisted(added, notes, { shipped: SHIPPED_ROOTS, laterNotes })).toEqual([]);
+
+      const inside = join(base, "inside");
+      writeFileSync(join(inside, "package.json"), '{"name":"crewhaus-compiled-bundle"}');
+      writeFileSync(join(inside, "daemon.ts"), "");
+      const ownBundle = relativeRoots(inside, join(inside, "daemon.ts"))
+        .filter((root) => !noSpec.includes(root))
+        .sort();
+      const spellings = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
+      expect(ownBundle).toEqual(
+        [
+          ...spellings.map((extension) => `daemon${extension}`),
+          ...[...spellings, ".json"].map((extension) => `daemon.js${extension}`),
+          "bun.lock",
+          "bun.lockb",
+          "crewhaus.yaml",
+          "crewhaus.yml",
+          "jsconfig.json",
+          "node_modules",
+          "package.json",
+          "tsconfig.json",
+        ].sort(),
+      );
+
+      // The bullet that names every root a run with no spec protects names these too.
+      const floor = bullets.find((b) => noSpec.every((root) => b.includes(`\`${root}\``))) ?? "";
+      expect(floor).toContain("bypass");
+      for (const name of [...expected, "--no-compile-autoload-bunfig"]) {
+        expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+      }
+      expect(floor).toContain("own code files");
+      for (const name of ["bun.lock", "bun.lockb"]) {
+        expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+      }
+      expect(floor).toContain("is not taken for a path");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+    // The argv a release builds the compiled CLI with carries the flag the bullet names.
+    let argv: readonly string[] = [];
+    await buildBinary({
+      target: { platform: "linux", arch: "x64" },
+      outDir: join(tmpdir(), "crewhaus-default-on-binary"),
+      runner: async (given) => {
+        argv = given;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    expect(argv).toContain("--compile");
+    expect(argv).toContain("--no-compile-autoload-bunfig");
+  });
+
+  test("CompileBundle: another directory whose output directory holds a root is refused, and named", async () => {
+    // The real tool, in a workspace of its own. A sibling with a `dist` of its
+    // own previews (the control); one whose `dist` leads to the working
+    // directory, which holds the root, is refused in the preview.
+    const { compileBundle } = await import("../packages/tool-fleet/src/index");
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-compile-")));
+    const cwd = process.cwd();
+    try {
+      process.chdir(base);
+      mkdirSync(join(base, "dist"));
+      for (const dir of ["plain", "linked"]) {
+        mkdirSync(join(base, dir));
+        writeFileSync(join(base, dir, "crewhaus.yaml"), `name: ${dir}\ntarget: channel\n`);
+      }
+      mkdirSync(join(base, "plain", "dist"));
+      writeFileSync(join(base, "plain", "dist", "daemon.ts"), "");
+      symlinkSync("..", join(base, "linked", "dist"));
+      const status = async (dir: string): Promise<unknown> => {
+        const raw = await compileBundle.execute(
+          { dir, target: "channel", dryRun: true } as never,
+          { bridge: { protectedRoots: ["dist"] } } as never,
+        );
+        return (JSON.parse(String(raw)) as { status?: unknown }).status;
+      };
+      expect(await status("plain")).toBe("preview");
+      if ((await status("linked")) === "refused") {
+        expect(laterNotes).toContain(
+          "`CompileBundle` refuses another directory whose output leads into one of these or holds one.",
+        );
+      }
+    } finally {
+      process.chdir(cwd);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test("the runtime-state floor: Hangar's directory is every root the environment names, and the default", () => {
     // Each variable names a root of its own, outside the workspace, so the
     // roots the run protects there are exactly Hangar's. The expected set is
@@ -671,9 +802,9 @@ describe("the release notes name every change a harness without provability: see
     // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx), GitApplyPatch
     // (tool-git), StateImport and the nine tools that keep a store through it
     // (tool-state), StoreMigrate (tool-lifecycle), EmitTraceEvent (tool-obs),
-    // DatasetPut (tool-dataset), SpecPin and DeployRollback (tool-deploy) and
-    // ExperimentLedger (tool-routing) today.
-    expect(tools.size).toBe(21);
+    // DatasetPut (tool-dataset), SpecPin and DeployRollback (tool-deploy),
+    // ExperimentLedger (tool-routing) and CompileBundle (tool-fleet) today.
+    expect(tools.size).toBe(22);
     const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
   });

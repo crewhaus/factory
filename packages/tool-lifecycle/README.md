@@ -142,7 +142,8 @@ verified.
   (0.8.0). The provability gate and `continuity.proof` read that record as
   evidence, so a migration onto it could rewrite the evidence. A copy that
   would land in the files that control the run (its run files, settings, gate
-  records and environment files, Hangar's directory), which decide what the agent
+  records, environment files, compiled bundle and dependencies, Hangar's
+  directory), which decide what the agent
   may do next, is refused the
   same way;
 - a `targetVersion` different from the source's, and any `targetVersion` at all
