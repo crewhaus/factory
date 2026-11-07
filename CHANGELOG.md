@@ -126,6 +126,14 @@ these on: they reach every harness that uses what each one names.
   or the Library in `crewhaus hangar`. `tags`, `notes` and `pinned` work on every
   row.
 
+- **An optimizer patch leaves who approves a write as it stands.** A patch from
+  `crewhaus optimize` or `optimize --from-advice` that changes
+  `transaction_policy.defaultWriteApproval`, at that path or through its block,
+  is refused with the reason, because an eval cannot see a human approval go
+  away. A block patch carries the spec's value, as `crewhaus onchain tune`'s
+  does. `maxValueWei` and `simulationRequired` stay tunable. Change who approves
+  a write by hand or with `crewhaus propose`.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what

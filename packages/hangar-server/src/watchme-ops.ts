@@ -48,13 +48,7 @@
 import { existsSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseSpec } from "@crewhaus/spec";
-import {
-  OPTIMIZABLE_PATHS,
-  type SpecEdit,
-  applySpecEdits,
-  diffSpecYaml,
-  isOptimizable,
-} from "@crewhaus/spec-patch";
+import { type SpecEdit, applySpecEdits, diffSpecYaml } from "@crewhaus/spec-patch";
 import type {
   WatchmeAggregate,
   WatchmeJudgment,
@@ -80,6 +74,7 @@ import {
   specScalar,
 } from "./memory-ops";
 import { readSpecYaml } from "./schedulers";
+import { classifyPath } from "./spec-edit";
 
 const START_VERB = "crewhaus watchme start";
 const REPORT_VERB = "crewhaus watchme report";
@@ -544,12 +539,10 @@ export function diffPathSegments(path: string): Array<string | number> {
   return out;
 }
 
-/** True when a path is inside this target's `OPTIMIZABLE_PATHS` whitelist —
- *  through spec-patch's own matcher (wildcard + structural rule), the one
- *  `applySpecEdits({ restrictToOptimizable })` enforces on write. */
+/** The editor's answer (`classifyPath`), for the label and for the write gate,
+ *  so a security surface stays human-owned even where the optimizer may tune it. */
 export function isAutoTunable(target: string, segments: ReadonlyArray<string | number>): boolean {
-  if (!(target in OPTIMIZABLE_PATHS)) return false;
-  return isOptimizable(target as keyof typeof OPTIMIZABLE_PATHS, segments);
+  return classifyPath(target, segments.map(String)).tier === "auto-tunable";
 }
 
 /**
@@ -587,7 +580,8 @@ type EditOutcome = {
  * Apply spec edits, or PROPOSE them.
  *
  * Human-owned paths (everything outside `OPTIMIZABLE_PATHS` — and every
- * `watchme.*` path is deliberately outside it) need the typed confirmation.
+ * `watchme.*` path is deliberately outside it — plus every row of
+ * `SECURITY_SURFACES`) need the typed confirmation.
  * Without one this returns the credential-redacted diff and writes nothing:
  * a proposal, which is the fallback the write covenant names. Rendering a
  * proposal is never applying it.
@@ -895,9 +889,9 @@ export const watchmeApply: M3Handler = (ctx) => {
     };
   }
   // The same two tiers a hand edit gets: an auto-tunable batch needs only the
-  // confirm already checked above and runs under the OPTIMIZER's own
-  // restriction; anything human-owned needs the typed confirmation, or it
-  // comes back as a proposal.
+  // confirm already checked above and runs under the optimizer's path check;
+  // anything human-owned needs the typed confirmation, or it comes back as a
+  // proposal.
   const outcome = applyOrPropose(ctx, edits, {
     confirmed: allAutoTunable || ctx.body["confirmName"] === specName,
     restrict: allAutoTunable,

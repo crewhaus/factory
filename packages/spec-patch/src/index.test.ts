@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { Spec } from "@crewhaus/spec";
+import { type Spec, parseSpec } from "@crewhaus/spec";
 import {
   DIFF_VALUE_MAX_LENGTH,
   OPTIMIZABLE_PATHS,
@@ -709,6 +709,8 @@ agent:
       // 0.8.0 §9.2 — the provability floor and its failure mode.
       ["provability", "level"],
       ["provability", "on_fail"],
+      // Who approves an on-chain write.
+      ["transaction_policy", "defaultWriteApproval"],
     ]);
   });
 
@@ -1391,5 +1393,80 @@ provability: grounded
     }
     for (const path of DIALS) expect(humanOwnedReason([...path])).toBeUndefined();
     expect(humanOwnedReason(["provability", "level"])).toContain("blind the critic");
+  });
+});
+
+describe("who approves a write stays as the spec has it", () => {
+  const POLICY_YAML = `${CLI_YAML}transaction_policy:
+  defaultWriteApproval: policy
+  maxValueWei: "1000"
+  allowedContracts: []
+`;
+  const LEAF = ["transaction_policy", "defaultWriteApproval"];
+  const BLOCK = ["transaction_policy"];
+
+  test("the leaf is refused on every target, with its own reason", () => {
+    for (const target of Object.keys(OPTIMIZABLE_PATHS) as Array<keyof typeof OPTIMIZABLE_PATHS>) {
+      expect(isOptimizable(target, LEAF)).toBe(false);
+    }
+    const spec = parseSpec(POLICY_YAML);
+    let message = "";
+    try {
+      validatePatch(spec, { target: "cli", path: LEAF, op: "replace", value: "none" });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("who approves a write is human-owned");
+    expect(message).toContain("OPTIMIZER_REFUSED_LEAVES");
+    expect(message).not.toContain("add it to");
+  });
+
+  test("a block patch that changes, drops or removes the value is refused", () => {
+    const spec = parseSpec(POLICY_YAML);
+    for (const patch of [
+      { op: "replace", value: { defaultWriteApproval: "none", allowedContracts: [] } },
+      { op: "replace", value: { allowedContracts: [] } },
+      { op: "remove" },
+    ] as const) {
+      expect(() => validatePatch(spec, { target: "cli", path: BLOCK, ...patch })).toThrow(
+        /would change "transaction_policy.defaultWriteApproval".*who approves a write/,
+      );
+    }
+  });
+
+  test("a block patch that carries the value passes, and the tunable fields stay tunable", () => {
+    const spec = parseSpec(POLICY_YAML);
+    const carried = { defaultWriteApproval: "policy", maxValueWei: "2000", allowedContracts: [] };
+    expect(() =>
+      validatePatch(spec, { target: "cli", path: BLOCK, op: "replace", value: carried }),
+    ).not.toThrow();
+    for (const [leaf, value] of [
+      ["maxValueWei", "2000"],
+      ["simulationRequired", false],
+    ] as const) {
+      expect(() =>
+        validatePatch(spec, { target: "cli", path: [...BLOCK, leaf], op: "add", value }),
+      ).not.toThrow();
+    }
+  });
+
+  test("a spec with no block takes a block that does not set the value, and only that", () => {
+    const spec = parseSpec(CLI_YAML);
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: BLOCK,
+        op: "add",
+        value: { maxValueWei: "1000" },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validatePatch(spec, {
+        target: "cli",
+        path: BLOCK,
+        op: "add",
+        value: { defaultWriteApproval: "none" },
+      }),
+    ).toThrow(/would change "transaction_policy.defaultWriteApproval"/);
   });
 });

@@ -70,6 +70,19 @@ describe("proposePolicy (#66)", () => {
     expect(proposal.patch?.value["simulationRequired"]).toBe(true);
   });
 
+  test("the block carries who approves a write as the spec has it", () => {
+    const recs = parseReceiptHistory(HISTORY);
+    const carried = proposePolicy(
+      recs,
+      { defaultWriteApproval: "policy" },
+      { optimizable: true, target: "onchain" },
+    );
+    expect(carried.patch?.value["defaultWriteApproval"]).toBe("policy");
+    // Nothing to carry, nothing added.
+    const bare = proposePolicy(recs, {}, { optimizable: true, target: "onchain" });
+    expect(bare.patch?.value).not.toHaveProperty("defaultWriteApproval");
+  });
+
   test("advice-only (no patch) for a non-whitelisted target", () => {
     const recs = parseReceiptHistory(HISTORY);
     const proposal = proposePolicy(recs, {}, { optimizable: false, target: "cli" });

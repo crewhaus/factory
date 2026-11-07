@@ -65,6 +65,7 @@ describe("the lists derive from the table", () => {
       ["model_pool", "learning", "seed"],
       ["provability", "level"],
       ["provability", "on_fail"],
+      ["transaction_policy", "defaultWriteApproval"],
     ]);
   });
 
