@@ -219,7 +219,7 @@ export function findCitationMarkerDefinitions(repoRoot: string): MarkerDefinitio
 }
 
 /** The whole audit runs against a factory checkout; anywhere else it says so and passes. */
-function notACheckout(
+export function notACheckout(
   cls: PhilosophyFinding["class"],
   symbol: string,
   label: string,
@@ -487,7 +487,7 @@ export const PROVABILITY_LEVEL_PATH: ReadonlyArray<string> = ["provability", "le
 const LEVEL_LABEL = "Pillar 2 — provability.level is not optimizable (OPTIMIZABLE_PATHS)";
 
 /** An entry that names the path exactly — a literal or a one-segment wildcard per segment. */
-function namesExactly(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
+export function namesExactly(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
   return entry.length === path.length && entry.every((seg, i) => seg === "*" || seg === path[i]);
 }
 
@@ -496,7 +496,7 @@ function namesExactly(entry: ReadonlyArray<string>, path: ReadonlyArray<string>)
  * honoured (`["provability"]`, `["*"]`): it admits a patch that replaces or
  * removes the whole block, and the block carries the level.
  */
-function coversByPrefix(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
+export function coversByPrefix(entry: ReadonlyArray<string>, path: ReadonlyArray<string>): boolean {
   return (
     entry.length > 0 &&
     entry.length < path.length &&
