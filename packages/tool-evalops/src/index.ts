@@ -679,7 +679,7 @@ export const evalBaselinePin: RegisteredTool = buildTool({
     const dryRun = input.dryRun === true;
     const committed = plan.value.changes && !dryRun && input.action !== "show";
     if (committed) {
-      const wrote = commitPin("EvalBaselinePin", plan.value, index.value.dir, dirRel);
+      const wrote = commitPin("EvalBaselinePin", plan.value, index.value.dir, dirRel, row);
       if (!wrote.ok) return refusal(wrote);
     }
 

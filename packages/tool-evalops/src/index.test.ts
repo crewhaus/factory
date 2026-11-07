@@ -1222,3 +1222,68 @@ test("the agreement floor holds exactly AT the threshold", async () => {
   });
   expect((above["gate"] as Json)["verdict"]).toBe("fail");
 });
+
+test("a run in which every case errored cannot be pinned, by the reason", async () => {
+  writeRun(root, "r1", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({
+      runId: "r1",
+      ts: "2026-01-01T00:00:00Z",
+      sampleCount: 2,
+      errorCount: 2,
+      measuredCount: 0,
+    }),
+  ]);
+  for (const dryRun of [false, true]) {
+    const out = await call(evalBaselinePin, {
+      action: "set",
+      spec: "shop",
+      dataset: "smoke",
+      runId: "r1",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(String(out["error"])).toMatch(/every case errored/);
+  }
+  expect(() => readFileSync(baselinesPath(), "utf8")).toThrow();
+});
+
+test("a run that produced no verdict cannot be pinned, by the reason", async () => {
+  writeRun(root, "r1", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({ runId: "r1", ts: "2026-01-01T00:00:00Z", sampleCount: 2, measuredCount: 0 }),
+  ]);
+  for (const dryRun of [false, true]) {
+    const out = await call(evalBaselinePin, {
+      action: "set",
+      spec: "shop",
+      dataset: "smoke",
+      runId: "r1",
+      dryRun,
+    });
+    expect(out["ok"]).toBe(false);
+    expect(String(out["error"])).toMatch(/measured nothing/);
+  }
+  expect(() => readFileSync(baselinesPath(), "utf8")).toThrow();
+});
+
+test("a run with one real verdict among the errors can be pinned", async () => {
+  writeRun(root, "r1", { samples: [sample({ sampleId: "a" })] });
+  writeIndex(root, [
+    row({
+      runId: "r1",
+      ts: "2026-01-01T00:00:00Z",
+      sampleCount: 3,
+      errorCount: 2,
+      measuredCount: 1,
+    }),
+  ]);
+  const out = await call(evalBaselinePin, {
+    action: "set",
+    spec: "shop",
+    dataset: "smoke",
+    runId: "r1",
+  });
+  expect(out["ok"]).toBe(true);
+  expect(JSON.parse(readFileSync(baselinesPath(), "utf8"))["shop::smoke"]["runId"]).toBe("r1");
+});

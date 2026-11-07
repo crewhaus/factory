@@ -250,6 +250,20 @@ describe("lastEvalFor", () => {
   test("undefined for an empty index", () => {
     expect(lastEvalFor([])).toBeUndefined();
   });
+
+  const AT = "2026-07-01T00:00:00Z";
+
+  test("carries what makes a rate meaningless, so a fleet row need not call it 0%", () => {
+    const base = { datasetName: "smoke", passRate: 0, ts: AT };
+    expect(lastEvalFor([{ ...base, sampleCount: 2, measuredCount: 0 }])?.measuredCount).toBe(0);
+    expect(lastEvalFor([{ ...base, sampleCount: 0 }])?.measuredCount).toBe(0);
+    expect(lastEvalFor([{ ...base, partial: true }])?.partial).toBe(true);
+  });
+
+  test("a clean run's row gains nothing", () => {
+    const clean = { datasetName: "smoke", passRate: 1, ts: AT };
+    expect(lastEvalFor([{ ...clean, sampleCount: 2, partial: false }])).toEqual(clean);
+  });
 });
 
 describe("buildFleetInventory", () => {

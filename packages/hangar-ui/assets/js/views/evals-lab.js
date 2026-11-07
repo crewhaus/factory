@@ -15,14 +15,27 @@
  *     more than the thing it is judging;
  *   - a matrix cell's crash class decides whether Retry is even offered: a
  *     billing failure is NOT retryable, however much it looks like a 429;
- *   - spending the locked test split is a typed, visible gesture.
+ *   - using the held-out test cases takes a typed confirmation;
+ *   - a control is drawn only where its job can start: where it cannot, the
+ *     server's sentence says why instead.
  *
  * Every node is built with el()/text() — markup strings are banned app-wide,
  * so nothing a grader, a model or a provider wrote can inject into this page.
  */
 
 import { api } from "../api.js";
-import { asOf, clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import {
+  asOf,
+  clear,
+  collapsible,
+  dot,
+  el,
+  emptyState,
+  jsonPre,
+  skeleton,
+  text,
+  toast,
+} from "../dom.js";
 import { fmtCount, fmtPct, fmtRelativeTime, fmtUsd } from "../util.js";
 
 export async function renderEvalsLab(root, ctx) {
@@ -69,9 +82,9 @@ export async function renderEvalsLab(root, ctx) {
   root.appendChild(gradersCard(ctx, graders, reload));
   root.appendChild(redteamCard(ctx, redteam, reload));
   root.appendChild(coverageCard(ctx, coverage, reload));
-  root.appendChild(sentinelCard(ctx, sentinel, reload));
+  root.appendChild(sentinelCard(ctx, sentinel, reload, flywheel));
   if (payload(voice).applicable === true) root.appendChild(voiceCard(voice));
-  root.appendChild(optimizerCard(ctx, optimize, reload));
+  root.appendChild(optimizerCard(ctx, optimize, reload, flywheel));
   root.appendChild(flywheelCard(ctx, flywheel, reload));
   root.appendChild(experimentsCard(ctx, experiments, reload));
   root.appendChild(annotationsCard(annotations));
@@ -84,6 +97,35 @@ export async function renderEvalsLab(root, ctx) {
 /** The `{ok, status, body}` envelope's payload, tolerant of a failed call. */
 function payload(res) {
   return res && typeof res === "object" && res.body && typeof res.body === "object" ? res.body : {};
+}
+
+/** One offer from the flywheel read's `launches`, when that read answered. A
+ *  failed read draws the control: the server still refuses what cannot run. */
+export function launchOf(flywheelRes, name) {
+  const offer = payload(flywheelRes).launches?.[name];
+  return offer && typeof offer === "object" ? offer : null;
+}
+
+/** True when the server said this job cannot start here. */
+export function launchRefused(offer) {
+  return offer !== null && offer.offered === false;
+}
+
+/** The sentence that stands where a control would: why not, and the command
+ *  that does apply if there is one. */
+function launchNote(offer) {
+  return el("p", { class: "muted gated-why" }, [
+    text(String(offer.note ?? "This can't run here yet.")),
+    offer.verb ? el("code", { class: "mono", text: ` ${offer.verb}` }) : null,
+  ]);
+}
+
+/** The refusal under a panel. An empty read already says it, in its own empty
+ *  state, so it is not said twice. */
+function appendRefusal(card, res, offer) {
+  const data = payload(res);
+  if (data.present === false && data.note === offer.note) return;
+  card.appendChild(launchNote(offer));
 }
 
 /** A card whose body is only drawn when the server said something IS there;
@@ -189,11 +231,19 @@ function refusalText(res) {
 
 /**
  * Conventional paths default from the harness dir, so the common launch is
- * one click. `--allow-test-split` is deliberately NOT a checkbox beside the
- * others: it spends a held-out split, the spend is counted as a burn, and the
- * server refuses it unless the release confirmation rides along.
+ * one click. `--allow-test-split` is deliberately NOT a checkbox like the others:
+ * it reads the held-out test cases, and the server refuses it without the typed
+ * confirmation. Only `crewhaus datasets release` records a use; a run from here
+ * is not recorded.
  */
-function launcherCard(ctx, flywheelRes, reload) {
+export function launcherCard(ctx, flywheelRes, reload) {
+  const offer = launchOf(flywheelRes, "eval");
+  if (launchRefused(offer)) {
+    return el("div", { class: "card" }, [
+      el("h3", { class: "card-title" }, [el("span", { text: "Launch an eval" })]),
+      launchNote(offer),
+    ]);
+  }
   const form = el("form", { class: "row-editor" }, [
     field("dataset", input("dataset", { placeholder: "eval/dataset.jsonl (default)" })),
     field("graders", input("graders", { placeholder: "eval/graders.yaml (default)" })),
@@ -204,11 +254,10 @@ function launcherCard(ctx, flywheelRes, reload) {
   ]);
   const gate = el("input", { type: "checkbox", name: "gate" });
   const holdout = el("input", { type: "checkbox", name: "allowTestSplit" });
-  const confirmField = el("div", { class: "gated" }, [
-    el("span", {
-      class: "gated-why",
-      text: 'spending the held-out split is a release gesture — type "release" to confirm',
-    }),
+  // The sentence names the input. Right after the checkbox in the DOM, so it is
+  // the next stop in tab order the moment it appears.
+  const confirmField = el("label", { class: "gated" }, [
+    el("span", { class: "gated-why", text: 'Type "release" to confirm.' }),
     input("releaseConfirm", { placeholder: "release" }),
   ]);
   confirmField.hidden = true;
@@ -219,7 +268,7 @@ function launcherCard(ctx, flywheelRes, reload) {
   form.appendChild(
     el("label", { class: "check" }, [
       holdout,
-      el("span", { text: " spend the locked test split (recorded as a burn)" }),
+      el("span", { text: " Use the held-out test cases (this run is not recorded)" }),
     ]),
   );
   form.appendChild(confirmField);
@@ -725,7 +774,7 @@ function coverageCard(ctx, res, reload) {
  * spec, dataset, graders and judge all still match the frozen baseline. When
  * one moved, the panel names it instead of blaming the provider.
  */
-function sentinelCard(ctx, res, reload) {
+export function sentinelCard(ctx, res, reload, flywheelRes) {
   const card = panel("Provider-drift sentinel", res, (node, data) => {
     const attribution = data.attribution ?? {};
     node.appendChild(
@@ -748,6 +797,11 @@ function sentinelCard(ctx, res, reload) {
     }
     if (data.baseline) node.appendChild(jsonPre(data.baseline));
   });
+  const offer = launchOf(flywheelRes, "eval");
+  if (launchRefused(offer)) {
+    appendRefusal(card, res, offer);
+    return card;
+  }
   const run = el("button", { class: "btn btn-ghost", type: "button", text: "Run sentinel" });
   run.addEventListener("click", async () => {
     run.disabled = true;
@@ -771,7 +825,7 @@ function voiceCard(res) {
 // optimizer, flywheel, experiments, annotations
 // ---------------------------------------------------------------------------
 
-function optimizerCard(ctx, res, reload) {
+export function optimizerCard(ctx, res, reload, flywheelRes) {
   const card = panel("Optimizer", res, (node, data) => {
     node.appendChild(el("p", { class: "muted", text: String(data.acceptance ?? "") }));
     node.appendChild(
@@ -791,6 +845,11 @@ function optimizerCard(ctx, res, reload) {
       ),
     );
   });
+  const offer = launchOf(flywheelRes, "optimize");
+  if (launchRefused(offer)) {
+    appendRefusal(card, res, offer);
+    return card;
+  }
   const form = el("form", { class: "row-editor" }, [
     field(
       "mutator",
@@ -855,7 +914,7 @@ function artifactsBtn(ctx, optRunId) {
   return el("div", { class: "job-action" }, [btn, holder]);
 }
 
-function flywheelCard(ctx, res, reload) {
+export function flywheelCard(ctx, res, reload) {
   const card = panel("Flywheel", res, (node, data) => {
     const precedence = data.datasetPrecedence ?? {};
     node.appendChild(
@@ -877,7 +936,11 @@ function flywheelCard(ctx, res, reload) {
       );
     }
   });
-  for (const action of ["run", "init"]) {
+  const offer = launchOf(res, "flywheel");
+  const refused = launchRefused(offer);
+  if (refused) card.appendChild(launchNote(offer));
+  // Scaffolding only writes files, so it stays offered either way.
+  for (const action of refused ? ["init"] : ["run", "init"]) {
     const btn = el("button", {
       class: action === "run" ? "btn" : "btn btn-ghost",
       type: "button",

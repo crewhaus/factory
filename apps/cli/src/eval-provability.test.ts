@@ -180,11 +180,19 @@ describe("crewhaus eval --provability <level> (design §9.1)", () => {
       (g) => g.name === "provability.claimCoverage",
     );
     expect(coverage?.rationale).toContain("or the sample ended before the gate graded an answer");
-    // A what-if floor is recorded in the history but never becomes the baseline.
-    expect(got.stdout + got.stderr).toContain("baseline not set");
+    // It is recorded in the history. With no credentials every case errored, so
+    // it measured nothing, and that refusal is the first one it meets.
+    expect(got.stdout + got.stderr).toContain("run measured nothing — baseline not pinned");
     expect(existsSync(join(root, ".crewhaus", "evals", "index.jsonl"))).toBe(true);
     expect(existsSync(join(root, ".crewhaus", "evals", "baselines.json"))).toBe(false);
   }, 60_000);
+
+  test("a what-if floor never becomes the baseline, even when it measured something", () => {
+    // A run that reaches this needs a model, so the wiring is read: `finishEvalRun`
+    // itself holds `promote: false` to pinning nothing (eval-history.test.ts).
+    const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    expect(source).toContain("promote: promote && evalProvability === undefined");
+  });
 });
 
 // 0.8.0 §9.1 / §3 (review I39) — a block PARKED at `level: off` lowers to no

@@ -55,10 +55,11 @@
  *   regressions read as recoveries forever after. Against an existing
  *   baseline the gate verdict fails outright — an incomplete measurement
  *   cannot honestly pass a pre-declared gate.
+ * - A run in which every case errored, or that produced no verdict at all,
+ *   is recorded and never pinned on any path either, for the same reason.
  */
 import { resolve } from "node:path";
 import {
-  type BaselineEntry,
   type BaselineLineage,
   HistoryWriteError,
   type LoadedRun,
@@ -71,11 +72,12 @@ import {
   isLegacyLineage,
   lineageOfEntry,
   loadRun,
+  pinRefusal,
+  pinRun,
   readRunIndexLatest,
   recordEvalRun,
   resolveBaseline,
   runIndexEntryFromSummary,
-  setBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
 import { type GateThresholds, type GateVerdict, gate } from "@crewhaus/regression-runner";
@@ -358,13 +360,19 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
 
   const pinCurrentRun = (label: string): void => {
     // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as
-    // synthetic errors, so it is not an honest measurement of the spec:
-    // pinning it would seed every later gate with garbage (real
-    // regressions would read as recoveries against the deflated pin).
-    // Guarded HERE so every pin path — first run, new lineage, gate-pass
-    // promotion — refuses the same way.
-    if (summary.partial !== undefined) {
-      write(`[eval] partial run (budget exhausted) — baseline not pinned (${label})`);
+    // synthetic errors, and a run in which every case errored or none produced
+    // a verdict has measured nothing: pinning either would seed every later
+    // gate with garbage (real regressions would read as recoveries against the
+    // deflated pin). Asked HERE, before anything is printed about promoting, so
+    // every pin path — first run, new lineage, gate-pass promotion — refuses
+    // the same way.
+    const refusal = pinRefusal(entry);
+    if (refusal !== undefined) {
+      write(
+        refusal.code === "partial"
+          ? `[eval] partial run (budget exhausted) — baseline not pinned (${label})`
+          : `[eval] run measured nothing — baseline not pinned (${label})`,
+      );
       return;
     }
     if (!opts.promote) {
@@ -380,29 +388,10 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
         `[eval] warning: pinning a REPLAYED run (--replay-tools ${summary.config.toolRecording.dir}) as the baseline for ${specName}/${datasetName} — every tool result came from the cassette, so later LIVE runs will be gated against frozen tool output.`,
       );
     }
-    const pin: BaselineEntry = {
-      specName,
-      datasetName,
-      runId: summary.runId,
-      ...(specSource !== undefined ? { specSource } : {}),
-      outDir: absOut,
-      datasetHash: opts.datasetHash,
-      ...(gradersHash !== undefined ? { gradersHash } : {}),
-      ...(judgeModel !== undefined ? { judgeModel } : {}),
-      // C30 — additive ops fields, mirroring the index entry.
-      p95LatencyMs: summary.aggregates.p95LatencyMs,
-      ...(opts.costUsd !== undefined ? { costUsd: opts.costUsd } : {}),
-      // 0.6.0 §6.1 — the lineage this pin belongs to (also what `setBaseline`
-      // keys on) plus the routed instrument guard, copied off the index entry
-      // so the pin and the row can never disagree about which arm they are.
-      ...(entry.armId !== undefined ? { armId: entry.armId } : {}),
-      ...(entry.routing !== undefined ? { routing: entry.routing } : {}),
-      ...(entry.policyVersion !== undefined ? { policyVersion: entry.policyVersion } : {}),
-      ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
-      ts: entry.ts,
-    };
+    // `entry` is this run's index row, so the pin and the row can never
+    // disagree about which arm they are.
     try {
-      setBaseline(pin, opts.evalsDir);
+      if (!pinRun(entry, entry.ts, opts.evalsDir).ok) return;
     } catch (err) {
       if (!(err instanceof HistoryWriteError)) throw err;
       historyRefused(`baseline not set (${label})`, err);

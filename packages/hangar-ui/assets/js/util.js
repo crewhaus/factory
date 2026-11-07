@@ -63,6 +63,23 @@ export function fmtPct(rate) {
   return `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%`;
 }
 
+/** True for a run with no verdict at all: its recorded rate and score are only
+ *  the placeholders an empty aggregate defaults to. */
+export function measuredNothing(run) {
+  return run?.measuredCount === 0 || run?.sampleCount === 0;
+}
+
+/**
+ * What a run's pass rate may honestly be called. A run stopped at its budget or
+ * with no verdict at all has no rate worth printing: its 0% would read as a
+ * score.
+ */
+export function passRateWord(run) {
+  if (run?.partial === true) return "partial";
+  if (measuredNothing(run)) return "not measured";
+  return fmtPct(typeof run?.passRate === "number" ? run.passRate : null);
+}
+
 /** Format an integer count; "—" when unknown. */
 export function fmtCount(n) {
   return typeof n === "number" && Number.isFinite(n) ? String(n) : "—";
@@ -249,11 +266,11 @@ export function oldestCachedAt(rows) {
  */
 export function evalHealth(lastEval) {
   if (!lastEval || typeof lastEval !== "object") return { state: "none", label: "no evals" };
-  const rate = typeof lastEval.passRate === "number" ? lastEval.passRate : null;
-  const pct = rate !== null ? fmtPct(rate) : "—";
-  if (lastEval.healthy === true) return { state: "pass", label: pct };
-  if (lastEval.healthy === false) return { state: "fail", label: pct };
-  return { state: "unknown", label: pct };
+  const label = passRateWord(lastEval);
+  if (measuredNothing(lastEval)) return { state: "unknown", label };
+  if (lastEval.healthy === true) return { state: "pass", label };
+  if (lastEval.healthy === false) return { state: "fail", label };
+  return { state: "unknown", label };
 }
 
 /** True when a Library row warrants a "needs attention" flag in M1 terms. */
@@ -313,6 +330,22 @@ export function deriveSmartGroups(rows, nowMs) {
 }
 
 /**
+ * What an empty eval history says, from the `evals` payload. A history nobody
+ * could read is not an empty one. An offered launch names its exact command; on
+ * a harness that cannot run one, the note says why, with the command that does
+ * apply if there is one.
+ */
+export function notMeasuredCopy(evals) {
+  if (typeof evals?.unreadable === "string") return { message: evals.unreadable, verb: null };
+  const launch = evals?.launch && typeof evals.launch === "object" ? evals.launch : {};
+  const note = launch.offered !== true && typeof launch.note === "string" ? launch.note : "";
+  return {
+    message: note === "" ? "Not measured yet." : `Not measured yet. ${note}`,
+    verb: typeof launch.verb === "string" ? launch.verb : null,
+  };
+}
+
+/**
  * Map the server's `HarnessHealth` detail field (registered / pinnedEnvs /
  * evalHealthy / evalNote / openIncidents / hasAudit) into the Overview
  * health checklist: `[{ state, label, reason }]` with dot states matching
@@ -331,7 +364,14 @@ export function healthChecks(health) {
       reason: pins.length > 0 ? `pinned envs: ${pins.join(", ")}` : "",
     });
   }
-  if (typeof health.evalHealthy === "boolean") {
+  if (health.evalState === "not_measured") {
+    // Nobody has measured this: not a pass, and not a fault.
+    checks.push({
+      state: "off",
+      label: "evals not measured",
+      reason: typeof health.evalNote === "string" ? health.evalNote : "",
+    });
+  } else if (typeof health.evalHealthy === "boolean") {
     checks.push({
       state: health.evalHealthy ? "ok" : "bad",
       label: health.evalHealthy ? "evals healthy" : "eval regression",

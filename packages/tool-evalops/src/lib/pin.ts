@@ -14,12 +14,11 @@
  * key and silently clobber a sibling's pin. The requested lineage is therefore
  * checked against the run's own and a mismatch is refused, not reconciled.
  *
- * The second rule is the one `crewhaus eval` already enforces on every pin
- * path: a budget-aborted PARTIAL run is never pinned. Its unexecuted samples
- * were recorded as failures, so a baseline seeded from it makes every later
- * regression read as a recovery. The rule lives inside `finishEvalRun`'s
- * private pin helper rather than in an exported predicate, so it is restated
- * here — deliberately, and named as a mirror rather than an invention.
+ * The second rule holds on every pin path: a run that did not measure the spec
+ * is never pinned. That is a budget-aborted PARTIAL run (its unexecuted samples
+ * were recorded as failures), one in which every case errored, and one with no
+ * verdict at all. `@crewhaus/eval-report`'s `pinRefusal` owns the rule, and this
+ * plan and its commit both go through it.
  */
 import * as path from "node:path";
 import {
@@ -34,8 +33,8 @@ import {
   baselineKey,
   baselineKeyFor,
   clearBaseline,
-  lineageOfEntry,
-  setBaseline,
+  pinFromIndexEntry,
+  pinRun,
 } from "@crewhaus/eval-report";
 import { probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
 import { type SafePath, workspaceRoot } from "../paths";
@@ -71,30 +70,6 @@ export type PinPlan = {
   /** True when committing this plan changes the file. */
   readonly changes: boolean;
 };
-
-/** Build the pin a run would get, from the run's OWN recorded columns. */
-export function pinFor(row: RunIndexEntry): BaselineEntry {
-  return {
-    specName: row.specName,
-    datasetName: row.datasetName,
-    runId: row.runId,
-    ...(row.specSource !== undefined ? { specSource: row.specSource } : {}),
-    outDir: row.outDir,
-    datasetHash: row.datasetHash,
-    ...(row.gradersHash !== undefined ? { gradersHash: row.gradersHash } : {}),
-    ...(row.judgeModel !== undefined ? { judgeModel: row.judgeModel } : {}),
-    ...(row.p95LatencyMs !== undefined ? { p95LatencyMs: row.p95LatencyMs } : {}),
-    ...(row.costUsd !== undefined ? { costUsd: row.costUsd } : {}),
-    ...(row.armId !== undefined ? { armId: row.armId } : {}),
-    ...(row.routing !== undefined ? { routing: row.routing } : {}),
-    ...(row.policyVersion !== undefined ? { policyVersion: row.policyVersion } : {}),
-    ...(row.armsDigest !== undefined ? { armsDigest: row.armsDigest } : {}),
-    // The run's OWN timestamp, not the clock. `finishEvalRun` pins the same
-    // field the same way, and a result that moves because it was computed
-    // twice is not a result.
-    ts: row.ts,
-  };
-}
 
 /** The instrument fields a re-pin would change, for the warning. */
 function instrumentMoves(previous: BaselineEntry, next: BaselineEntry): string[] {
@@ -217,27 +192,16 @@ export function planPin(input: PlanInput): Loaded<PinPlan> {
       "set needs a runId that appears in the run index — the pin's outDir and instrument hashes are copied from that row, and inventing them would pin a run nobody can verify",
     );
   }
-  // THE lineage check. The run's own recorded lineage decides which key it may
-  // be pinned under; the caller's spec/dataset/arm strings only select which
-  // lineage is being operated on.
-  const rowKey = baselineKeyFor(lineageOfEntry(row));
-  if (rowKey !== key) {
-    return fail(
-      "bad-input",
-      `run ${row.runId} belongs to lineage ${rowKey}, not ${key} — pinning it here would overwrite a different lineage's baseline with a run that did not measure it`,
-    );
-  }
-  // NEW-HUNT-3, mirrored from `finishEvalRun`'s pin path: a budget-aborted run
-  // recorded its unexecuted samples as synthetic failures.
-  if (row.partial === true) {
-    return fail(
-      "bad-input",
-      `run ${row.runId} is a partial (budget-aborted) run — its unexecuted samples were recorded as failures, so a baseline seeded from it would make every later regression read as a recovery. crewhaus eval refuses to pin one on every path; so does this.`,
-    );
-  }
+  // THE lineage check and the measurement check, both `pinRefusal`'s. The run's
+  // own recorded lineage decides which key it may be pinned under; the caller's
+  // spec/dataset/arm strings only select which lineage is being operated on.
+  // The pin carries the run's OWN timestamp, not the clock: a result that moves
+  // because it was computed twice is not a result.
+  const pinned = pinFromIndexEntry(row, row.ts, { lineageKey: key });
+  if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
   const verified = verifyRunDir(row);
   if (!verified.ok) return verified;
-  const next = pinFor(row);
+  const next = pinned.pin;
   if (row.replayed === true) {
     warnings.push(
       `run ${row.runId} replayed every tool result from a cassette — pinning it gates later LIVE runs against frozen tool output`,
@@ -330,6 +294,7 @@ export function commitPin(
   plan: PinPlan,
   dir: SafePath,
   dirRel: string,
+  row?: RunIndexEntry,
 ): Loaded<true> {
   const again = containedDir(toolName, dirRel);
   if (!again.ok) return again;
@@ -340,8 +305,10 @@ export function commitPin(
     );
   }
   try {
-    if (plan.action === "set" && plan.next !== undefined) setBaseline(plan.next, dir.real);
-    else if (plan.action === "clear" && plan.previous !== undefined) {
+    if (plan.action === "set" && plan.next !== undefined && row !== undefined) {
+      const pinned = pinRun(row, row.ts, dir.real, { lineageKey: plan.key });
+      if (!pinned.ok) return fail("bad-input", pinned.refusal.reason);
+    } else if (plan.action === "clear" && plan.previous !== undefined) {
       clearBaseline(plan.key, dir.real);
     }
   } catch (err) {

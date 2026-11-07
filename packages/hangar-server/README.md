@@ -19,7 +19,7 @@ wrappers that were frozen ahead of its handlers (see *M3* under Routes):
 | wake / drain / status, the four-lane timeline's *phase* | `crewhaus.control.v1` (`@crewhaus/gateway-protocol/control`) |
 | the approvals inbox | `@crewhaus/session-store`'s `PendingApprovalStore` |
 | the review queue | `@crewhaus/feedback-distill` + the adjudicating `FeedbackRecord` path `crewhaus rate --adjudicate` uses |
-| eval baseline re-pin | `@crewhaus/eval-report`'s `setBaseline` |
+| eval baseline re-pin | `@crewhaus/eval-report`'s `pinRun` |
 | session pinning | `.crewhaus/retention.json` (validated with the enforcers' own loader) |
 
 **One state tree, two heads.** Everything the console drives lives under

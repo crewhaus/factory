@@ -7,7 +7,7 @@
  * arrays, because an optimally-running harness has an empty feed by design.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ADVISOR_JOB_ARGV,
@@ -28,9 +28,24 @@ const CLEAN: AdvisorInputs = {
   preflight: { items: [] },
   specUnreadable: false,
   specIssues: [],
-  evalHealth: { healthy: true, note: "at baseline" },
+  evalHealth: { state: "healthy", note: "at baseline" },
   evalRuns: 3,
+  evalsUnreadable: false,
   baselinePinned: true,
+  offers: {
+    eval: {
+      offered: true,
+      shapeOk: true,
+      note: null,
+      verb: "crewhaus eval crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+    },
+    optimize: {
+      offered: true,
+      shapeOk: true,
+      note: null,
+      verb: "crewhaus optimize crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
+    },
+  },
   openIncidents: 0,
   procState: "running",
   pendingApprovals: 0,
@@ -64,7 +79,7 @@ describe("deriveAdvisorItems (pure)", () => {
           },
         ],
       },
-      evalHealth: { healthy: false, note: "0.4 < 0.7 baseline" },
+      evalHealth: { state: "regressed", note: "0.4 < 0.7 baseline" },
       adviceProposals: 2,
     });
     expect(items.map((i) => i.severity)).toEqual(["critical", "warn", "suggestion"]);
@@ -118,7 +133,7 @@ describe("deriveAdvisorItems (pure)", () => {
   test("a regression below baseline proposes the optimize loop", () => {
     const items = deriveAdvisorItems({
       ...CLEAN,
-      evalHealth: { healthy: false, note: "0.4 < 0.7 baseline" },
+      evalHealth: { state: "regressed", note: "0.4 < 0.7 baseline" },
     });
     expect(items).toHaveLength(1);
     expect(items[0]?.id).toBe("eval-below-baseline");
@@ -147,6 +162,66 @@ describe("deriveAdvisorItems (pure)", () => {
     expect(unpinned.map((i) => i.id)).toEqual(["evals-no-baseline"]);
   });
 
+  test("a job that cannot run here becomes a link carrying the reason, never a job", () => {
+    const compile = "crewhaus compile crewhaus.yaml --with-eval-harness";
+    const note = "Checks for this harness type run inside its compiled test bundle.";
+    const none = deriveAdvisorItems({
+      ...CLEAN,
+      evalRuns: 0,
+      baselinePinned: false,
+      offers: {
+        ...CLEAN.offers,
+        eval: { offered: false, shapeOk: false, note, verb: compile },
+      },
+    });
+    expect(none[0]?.id).toBe("evals-none");
+    expect(none[0]?.action).toEqual({
+      kind: "link",
+      label: "Open evals",
+      cliTwin: compile,
+      jobKind: null,
+    });
+    expect(none[0]?.guidance).toBe(note);
+
+    const optimizeNote = "No checks yet: add eval/graders.yaml.";
+    const regressed = deriveAdvisorItems({
+      ...CLEAN,
+      evalHealth: { state: "regressed", note: "0.4 < 0.7 baseline" },
+      offers: {
+        ...CLEAN.offers,
+        optimize: { offered: false, shapeOk: true, note: optimizeNote, verb: null },
+      },
+    });
+    expect(regressed[0]?.id).toBe("eval-below-baseline");
+    expect(regressed[0]?.action?.kind).toBe("link");
+    expect(regressed[0]?.action?.jobKind).toBeNull();
+    expect(regressed[0]?.guidance).toBe(optimizeNote);
+  });
+
+  test("not measured is not a regression", () => {
+    const items = deriveAdvisorItems({
+      ...CLEAN,
+      evalHealth: { state: "not_measured", note: "the latest run measured nothing" },
+    });
+    expect(items.map((i) => i.id)).not.toContain("eval-below-baseline");
+  });
+
+  test("an unreadable history is not an empty one, so neither ladder rung fires", () => {
+    const none = deriveAdvisorItems({
+      ...CLEAN,
+      evalRuns: 0,
+      baselinePinned: false,
+      evalsUnreadable: true,
+    });
+    expect(none.map((i) => i.id)).not.toContain("evals-none");
+    const unpinned = deriveAdvisorItems({
+      ...CLEAN,
+      baselinePinned: false,
+      evalsUnreadable: true,
+    });
+    expect(unpinned.map((i) => i.id)).not.toContain("evals-no-baseline");
+  });
+
   test("supervision states: crash-looping is critical, parked routes to approvals", () => {
     expect(
       deriveAdvisorItems({ ...CLEAN, procState: "crash-looping" }).map((i) => [
@@ -165,7 +240,7 @@ describe("deriveAdvisorItems (pure)", () => {
 // ---------------------------------------------------------------------------
 
 function advisorHarness(t: TestServer): string {
-  return makeFixtureHarness(join(t.harnessesRoot, "advised"), {
+  const dir = makeFixtureHarness(join(t.harnessesRoot, "advised"), {
     specName: "advised",
     // An eval history BELOW its pinned baseline, so the feed has a warn item
     // whose quick action queues the optimize loop.
@@ -206,6 +281,11 @@ function advisorHarness(t: TestServer): string {
       },
     },
   });
+  // The quick action can only queue what the harness can run.
+  mkdirSync(join(dir, "eval"), { recursive: true });
+  writeFileSync(join(dir, "eval", "dataset.jsonl"), '{"id":"a","input":"x"}\n');
+  writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+  return dir;
 }
 
 async function registered(t: TestServer): Promise<string> {
@@ -404,6 +484,37 @@ const arm = (band: string, model: string, meanReward: number, n: number) => ({
   n,
   meanReward,
   shadow: band.startsWith("shadow:"),
+});
+
+describe("an issue that asks for a job this harness cannot run", () => {
+  test("answers 409 with the reason before anything is written", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "issues"), { specName: "issues" });
+      const { body } = await t.api("/api/harnesses", {
+        method: "POST",
+        body: JSON.stringify({ dir }),
+      });
+      const id = (body["entry"] as { id: string }).id;
+      for (const kind of ["eval", "optimize"]) {
+        const refused = await t.api(`/api/h/${id}/advisor/issues`, {
+          method: "POST",
+          body: JSON.stringify({ title: "answers drift", kind }),
+        });
+        expect(refused.status).toBe(409);
+        expect(String(refused.body["error"])).toContain("No test cases yet");
+      }
+      expect(existsSync(join(dir, ".crewhaus", "advisor", "issues.jsonl"))).toBe(false);
+      // A note queues nothing, so it needs nothing.
+      const note = await t.api(`/api/h/${id}/advisor/issues`, {
+        method: "POST",
+        body: JSON.stringify({ title: "answers drift", kind: "note" }),
+      });
+      expect(note.status).toBe(200);
+    } finally {
+      await t.stop();
+    }
+  });
 });
 
 describe("deriveAdvisorItems — routing (0.6.0 §8.3)", () => {
@@ -657,5 +768,145 @@ describe("the closed job vocabulary and the report kinds", () => {
       "routing",
       "hybrid",
     ]);
+  });
+});
+
+describe("the advisor's real wiring, over the routes", () => {
+  type Feed = { items: Array<{ id: string; action: Record<string, unknown>; guidance: string }> };
+  const COMPILE = "crewhaus compile crewhaus.yaml --with-eval-harness";
+
+  const bare = async (t: TestServer, target?: string): Promise<{ id: string; dir: string }> => {
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wired"), {
+      specName: "wired",
+      ...(target !== undefined ? { target } : {}),
+    });
+    const { body } = await t.api("/api/harnesses", {
+      method: "POST",
+      body: JSON.stringify({ dir }),
+    });
+    return { id: (body["entry"] as { id: string }).id, dir };
+  };
+  const seedInputs = (dir: string): void => {
+    mkdirSync(join(dir, "eval"), { recursive: true });
+    writeFileSync(join(dir, "eval", "dataset.jsonl"), '{"id":"a","input":"x"}\n');
+    writeFileSync(join(dir, "eval", "graders.yaml"), "graders: []\n");
+  };
+  const feedOf = async (t: TestServer, id: string): Promise<Feed> =>
+    (await t.api(`/api/h/${id}/advisor`)).body as unknown as Feed;
+  const queued = async (t: TestServer): Promise<Array<{ kind: string; argv?: string[] }>> => {
+    const jobs = (await t.api("/api/jobs")).body;
+    return (jobs["running"] as Array<{ kind: string }>).concat(
+      jobs["pending"] as Array<{ kind: string }>,
+    );
+  };
+
+  test("with no inputs, 'no eval signal' links out, and acting on it queues nothing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const { id } = await bare(t);
+      const item = (await feedOf(t, id)).items.find((i) => i.id === "evals-none");
+      expect(item?.action["kind"]).toBe("link");
+      expect(item?.guidance).toContain("add eval/dataset.jsonl");
+
+      const acted = await t.api(`/api/h/${id}/advisor/evals-none/act`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect(acted.status).toBe(200);
+      expect(acted.body["job"]).toBeNull();
+      expect(await queued(t)).toEqual([]);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("with its inputs, the same item queues the eval they make possible", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const { id, dir } = await bare(t);
+      seedInputs(dir);
+      const item = (await feedOf(t, id)).items.find((i) => i.id === "evals-none");
+      expect(item?.action).toMatchObject({ kind: "job", jobKind: "eval" });
+
+      await t.api(`/api/h/${id}/advisor/evals-none/act`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect((await queued(t)).map((j) => j.kind)).toEqual(["eval"]);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a shape that cannot run an eval links out, whatever is on disk", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const { id, dir } = await bare(t, "workflow");
+      seedInputs(dir);
+      const item = (await feedOf(t, id)).items.find((i) => i.id === "evals-none");
+      expect(item?.action).toMatchObject({ kind: "link", cliTwin: COMPILE });
+      await t.api(`/api/h/${id}/advisor/evals-none/act`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect(await queued(t)).toEqual([]);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a regression with nothing to optimize against links out, and queues nothing", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = advisorHarness(t);
+      rmSync(join(dir, "eval"), { recursive: true });
+      const { body } = await t.api("/api/harnesses", {
+        method: "POST",
+        body: JSON.stringify({ dir }),
+      });
+      const id = (body["entry"] as { id: string }).id;
+      const item = (await feedOf(t, id)).items.find((i) => i.id === "eval-below-baseline");
+      expect(item?.action["kind"]).toBe("link");
+      await t.api(`/api/h/${id}/advisor/eval-below-baseline/act`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      expect(await queued(t)).toEqual([]);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a history nobody can read is not 'no eval signal'", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const { id, dir } = await bare(t);
+      expect((await feedOf(t, id)).items.map((i) => i.id)).toContain("evals-none");
+      mkdirSync(join(dir, ".crewhaus", "evals", "index.jsonl"), { recursive: true });
+      expect((await feedOf(t, id)).items.map((i) => i.id)).not.toContain("evals-none");
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the trend's command is one this harness can run", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const channel = await bare(t, "channel");
+      const trend = (await t.api(`/api/h/${channel.id}/advisor/trend`)).body;
+      expect(trend["verb"]).toBe(COMPILE);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the trend names no command on a command-line harness with no inputs", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const { id } = await bare(t);
+      expect((await t.api(`/api/h/${id}/advisor/trend`)).body["verb"]).toBeNull();
+    } finally {
+      await t.stop();
+    }
   });
 });
