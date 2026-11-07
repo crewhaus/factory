@@ -1,0 +1,29 @@
+{
+  "name": "service-fakes",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback fakes of the services a harness talks to, for tests. Never published.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/service-fakes"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

@@ -283,6 +283,8 @@
     { "path": "./packages/harness-supervisor" },
     { "path": "./packages/hangar-ui" },
     { "path": "./packages/hangar-server" },
+    { "path": "./packages/hangar-e2e" },
+    { "path": "./packages/service-fakes" },
     { "path": "./packages/service-setup" },
     { "path": "./packages/dataset-ops" },
     { "path": "./packages/eval-ops" },

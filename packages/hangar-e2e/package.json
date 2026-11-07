@@ -1,0 +1,37 @@
+{
+  "name": "hangar-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser journeys over the real Hangar console, the accessibility toolkit, and the seeded fleet. Never published.",
+  "scripts": {
+    "test": "bun test src/unit",
+    "test:browser": "bun test ./src/journeys/suite.ts",
+    "bench": "bun src/perf/bench.ts"
+  },
+  "devDependencies": {
+    "@crewhaus/hangar-server": "workspace:*",
+    "@crewhaus/hangar-ui": "workspace:*",
+    "@crewhaus/harness-registry": "workspace:*",
+    "@crewhaus/memory-store": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/wiki-store": "workspace:*",
+    "axe-core": "4.14.0",
+    "playwright": "1.59.1",
+    "service-fakes": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/hangar-e2e"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

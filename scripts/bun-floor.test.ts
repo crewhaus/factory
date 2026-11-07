@@ -105,9 +105,9 @@ describe("the Bun floor is stated once and held everywhere", () => {
       }
     }
     expect(bad).toEqual([]);
-    expect(pins).toBe(9);
-    // ci (3 jobs), release (3), smoke-runtime (1) pin it exactly.
-    expect(exact).toBe(7);
+    expect(pins).toBe(13);
+    // ci (7 jobs), release (3), smoke-runtime (1) pin it exactly.
+    expect(exact).toBe(11);
   });
 
   test("every install doc that names a minimum Bun names the floor", () => {
