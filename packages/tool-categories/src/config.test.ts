@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { BUILTIN_TOOLS, TOOL_BOOT_REGISTRARS } from "./builtins";
 import {
+  type ToolConfigInit,
   applyToolConfig,
   chainBootConfig,
   checkCandidateToolConfigs,
@@ -8,6 +12,7 @@ import {
   malformedToolConfigRefs,
   planChainInits,
   planToolConfigInits,
+  renderToolConfigEnvGate,
   renderToolConfigInit,
   resolveToolConfigEnv,
   toolConfigBlockFor,
@@ -512,6 +517,193 @@ describe("$VAR references", () => {
       /tool_config\.fetch\.allowed_origins\[0\] reads \$ORIGIN .* compile without --emit-as cf-worker/,
     );
   });
+});
+
+describe("a daemon shape's check of the variables its blocks read", () => {
+  const httpInit = (config: unknown, where = "tool_config.http"): ToolConfigInit => ({
+    key: "http",
+    package: "@crewhaus/tool-http",
+    initSymbol: "registerHttpConfig",
+    config,
+    where,
+  });
+
+  /** What a check line writes: its `write(…)` argument, parsed, without the newline it ends in. */
+  function written(line: string | undefined): string {
+    const head = "process.stderr.write(";
+    const tail = "); process.exit(2); }";
+    const start = (line ?? "").indexOf(head);
+    const end = (line ?? "").lastIndexOf(tail);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const text = JSON.parse((line ?? "").slice(start + head.length, end)) as string;
+    expect(text.endsWith("\n")).toBe(true);
+    return text.slice(0, -1);
+  }
+
+  test("the check prints the very sentence the registration throws", () => {
+    const block = {
+      allowed_origins: ["$TOOL_GATE_ORIGIN"],
+      nested: { "odd key": "$TOOL_GATE_RPC" },
+    };
+    let thrown: unknown;
+    try {
+      resolveToolConfigEnv(block, "tool_config.http", {});
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(BuiltinToolError);
+    const [lines = []] = renderToolConfigEnvGate([httpInit(block)]);
+    expect(lines).toHaveLength(2);
+    expect(written(lines[0])).toBe((thrown as Error).message);
+    // The second variable is checked the same way, at its own path.
+    expect(() =>
+      resolveToolConfigEnv(block, "tool_config.http", { TOOL_GATE_ORIGIN: "https://o.invalid" }),
+    ).toThrow(written(lines[1]));
+  });
+
+  test("the exact line, for a chain RPC URL and for a tool_config block", () => {
+    const chains = {
+      chains: [
+        {
+          id: "ethereum-mainnet",
+          rpcUrls: [{ kind: "env" as const, name: "ETH_RPC" }],
+          rpcPolicy: "single" as const,
+          finality: { kind: "confirmations" as const, count: 12 },
+          reorgTolerant: false,
+        },
+      ],
+    };
+    expect(renderToolConfigEnvGate(planChainInits(["evmCall"], chains))).toEqual([
+      [
+        'if (!process.env["ETH_RPC"]) { process.stderr.write("chains[0].rpcUrls[0] reads $ETH_RPC, but ETH_RPC is not set. Set ETH_RPC in the environment the harness starts in.\\n"); process.exit(2); }',
+      ],
+    ]);
+    expect(renderToolConfigEnvGate([httpInit({ allowed_origins: ["$ORIGIN"] })])).toEqual([
+      [
+        'if (!process.env["ORIGIN"]) { process.stderr.write("tool_config.http.allowed_origins[0] reads $ORIGIN, but ORIGIN is not set. Set ORIGIN in the environment the harness starts in.\\n"); process.exit(2); }',
+      ],
+    ]);
+  });
+
+  test("a quoted key in the path is escaped, so the line still parses", () => {
+    const [line] = renderToolConfigEnvGate([httpInit({ nested: { 'odd "key"': "$A" } })]).flat();
+    expect(written(line)).toStartWith('tool_config.http.nested["odd \\"key\\""] reads $A,');
+    // Parsed as a bundle's TypeScript, never run.
+    const parse = (source: string) => new Bun.Transpiler({ loader: "ts" }).transformSync(source);
+    expect(() => parse(line ?? "")).not.toThrow();
+    expect(() => parse(`process.stderr.write("${written(line)}");`)).toThrow();
+  });
+
+  const literal = httpInit({ allowed_origins: ["https://a.example"] }, "tool_config.literal");
+  const readsA = httpInit({ allowed_origins: ["$A"] });
+  const readsBThenA = {
+    ...httpInit({ url: "$B", again: "$A" }, "tool_config.fetch"),
+    initSymbol: "registerFetchConfig",
+  };
+
+  test("each variable is checked once, just before the first registration that reads it", () => {
+    // Per registration, the paths its checks name.
+    const paths = (plan: ReadonlyArray<ToolConfigInit>) =>
+      renderToolConfigEnvGate(plan).map((lines) =>
+        lines.map((l) => written(l).split(" reads ")[0]),
+      );
+    // A registration that reads nothing gets no check, and runs ahead of the
+    // checks of the ones after it.
+    expect(paths([literal, readsA, readsBThenA])).toEqual([
+      [],
+      ["tool_config.http.allowed_origins[0]"],
+      ["tool_config.fetch.url"],
+    ]);
+    // Read twice, by two registrations or at two paths of one: checked once, at the first.
+    expect(paths([readsA, httpInit({ again: "$A" }, "tool_config.other")])).toEqual([
+      ["tool_config.http.allowed_origins[0]"],
+      [],
+    ]);
+    expect(paths([httpInit({ first: "$A", second: ["$A"] })])).toEqual([
+      ["tool_config.http.first"],
+    ]);
+    // No reference, no check: such a bundle keeps its bytes.
+    expect(renderToolConfigEnvGate([literal])).toEqual([[]]);
+    expect(renderToolConfigEnvGate([])).toEqual([]);
+  });
+
+  test("the boot stops where the registration reading the variable would have thrown, naming the same", () => {
+    const plan = [literal, readsA, readsBThenA];
+    /** The registration a boot stops before, and what it says: the throw, as the bundle ran without a check. */
+    const thrown = (env: Record<string, string>) => {
+      for (const [at, init] of plan.entries()) {
+        try {
+          resolveToolConfigEnv(init.config, init.where, env);
+        } catch (err) {
+          return { at, says: (err as Error).message };
+        }
+      }
+      return undefined;
+    };
+    /** The same, from the checks: the first one whose variable is unset or empty. */
+    const checked = (env: Record<string, string>) => {
+      for (const [at, lines] of renderToolConfigEnvGate(plan).entries()) {
+        for (const line of lines) {
+          const says = written(line);
+          const name = says.match(/ reads \$([A-Z_][A-Z0-9_]*),/)?.[1] ?? "";
+          expect(name).not.toBe("");
+          if (!env[name]) return { at, says };
+        }
+      }
+      return undefined;
+    };
+    const envs = [{}, { A: "a" }, { A: "" }, { B: "b" }, { A: "a", B: "" }, { A: "a", B: "b" }];
+    for (const env of envs) {
+      expect({ env, stop: checked(env) }).toEqual({ env, stop: thrown(env) });
+    }
+    // Not vacuous: unset A stops before the second registration, after the first ran.
+    expect(checked({})?.at).toBe(1);
+    expect(checked({ A: "a" })?.at).toBe(2);
+    expect(checked({ A: "a", B: "b" })).toBeUndefined();
+  });
+
+  test("the lines run: an unset or empty variable exits 2 naming it, a set one passes", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "crewhaus-tool-env-check-"));
+    const run = async (lines: ReadonlyArray<string>, env: Record<string, string>) => {
+      const proc = Bun.spawn([process.execPath, "-e", lines.join("\n")], {
+        cwd,
+        env: { PATH: process.env["PATH"] ?? "", ...env },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      return { exitCode, stdout, stderr };
+    };
+    try {
+      const one = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A"] })]).flat();
+      expect(await run(one, {})).toEqual({
+        exitCode: 2,
+        stdout: "",
+        stderr:
+          "tool_config.http.allowed_origins[0] reads $A, but A is not set. Set A in the environment the harness starts in.\n",
+      });
+      expect((await run(one, { A: "" })).exitCode).toBe(2);
+      expect(await run(one, { A: "https://origin.example.invalid" })).toEqual({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      });
+      const two = renderToolConfigEnvGate([httpInit({ allowed_origins: ["$A", "$B"] })]).flat();
+      const onlyB = await run(two, { A: "https://origin.example.invalid" });
+      expect(onlyB.exitCode).toBe(2);
+      expect(onlyB.stderr).toStartWith(
+        "tool_config.http.allowed_origins[1] reads $B, but B is not set.",
+      );
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    // Four bun subprocesses: slow on CI runners.
+  }, 20_000);
 });
 
 describe("the chain blocks", () => {

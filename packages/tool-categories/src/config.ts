@@ -14,7 +14,12 @@
  *
  * A string value written as `$UPPER_SNAKE` is read from the environment when
  * the bundle starts, never compiled in, the way `mcp_servers` env values
- * work. A value read that way is never repeated in an error.
+ * work. A value read that way is never repeated in an error. A daemon shape's
+ * bundle (channel, managed, crew) checks each variable its blocks read just
+ * before the registration that reads it, and an unset one stops the boot there
+ * with exit 2 and one line naming it ({@link renderToolConfigEnvGate}). A crew
+ * does this role by role: each role checks its variables before its own
+ * registrations.
  *
  * Pure functions over data, except {@link applyToolConfig}, which calls the
  * registrar it is handed. Nothing here imports a tool package.
@@ -680,6 +685,11 @@ function originProblem(entry: unknown, httpsOnly: boolean): string | undefined {
 /** An environment to read references from: `process.env`, or a test's map. */
 export type ToolConfigEnv = Readonly<Record<string, string | undefined>>;
 
+/** The sentence an unset `$VAR` stops a boot with: thrown by {@link resolveToolConfigEnv}, printed by a daemon's boot check. */
+function unsetToolConfigEnvMessage(path: string, name: string): string {
+  return `${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.`;
+}
+
 /**
  * Replace every `$VAR` string in a block with the variable's value. Throws
  * `BuiltinToolError` naming the variable (never a value) when one is unset or
@@ -700,9 +710,7 @@ export function resolveToolConfigEnv(
       if (name === undefined) return node;
       const read = env[name];
       if (read === undefined || read === "") {
-        throw new BuiltinToolError(
-          `${path} reads $${name}, but ${name} is not set. Set ${name} in the environment the harness starts in.`,
-        );
+        throw new BuiltinToolError(unsetToolConfigEnvMessage(path, name));
       }
       secrets.push({ name, value: read });
       return read;
@@ -764,6 +772,50 @@ export function renderToolConfigInit(init: ToolConfigInit): {
     line: `applyToolConfig(${init.initSymbol}, ${json}, ${JSON.stringify(init.where)}, process.env);`,
     readsEnv: true,
   };
+}
+
+/**
+ * The checks a daemon shape's bundle runs among its registrations: one list
+ * per registration of `plan`, in order, to run just before it. A list holds a
+ * statement for each variable its block reads that no earlier registration
+ * read, naming the first place it is read. An unset or empty variable prints
+ * the sentence {@link resolveToolConfigEnv} throws and exits 2, as the
+ * daemons' other boot gates do (a channel's missing secrets, a crew's empty
+ * stdin), instead of exiting 1 with an uncaught error's stack.
+ *
+ * So the boot stops where the registration reading the variable would have
+ * thrown, naming the same variable at the same path. The registrations ahead
+ * of it run as they always have, and one that refuses its block at boot still
+ * stops the boot with its own error. Every list is empty when no block reads
+ * a variable, so such a bundle keeps its bytes.
+ *
+ * `plan` is one resolve's. A crew resolves each role on its own, so each role
+ * module checks only its own variables, ahead of its own registrations. The
+ * modules load one after another, so when a later role's check stops the boot,
+ * an earlier role's registrations have already run.
+ *
+ * Plain code with no import, on purpose: a compiled bundle runs the
+ * `@crewhaus` packages of the version that compiled it, so a check inside a
+ * package would reach bundles only once that version is published, and a new
+ * import would break them. Written into the bundle, it needs nothing new from
+ * any package.
+ */
+export function renderToolConfigEnvGate(
+  plan: ReadonlyArray<ToolConfigInit>,
+): ReadonlyArray<ReadonlyArray<string>> {
+  const named = new Set<string>();
+  return plan.map((init) => {
+    const lines: string[] = [];
+    for (const { path, name } of toolConfigEnvRefs(init.config, init.where)) {
+      if (named.has(name)) continue;
+      named.add(name);
+      const sentence = JSON.stringify(`${unsetToolConfigEnvMessage(path, name)}\n`);
+      lines.push(
+        `if (!process.env[${JSON.stringify(name)}]) { process.stderr.write(${sentence}); process.exit(2); }`,
+      );
+    }
+    return lines;
+  });
 }
 
 // ---------------------------------------------------------------------------

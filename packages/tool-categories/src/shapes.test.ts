@@ -316,3 +316,110 @@ describe("resolveBuiltinTools", () => {
     expect(r.unwired).toEqual(["gitStatus", "myCustom"]);
   });
 });
+
+describe("a daemon shape checks each variable its blocks read just before the registration that reads it", () => {
+  // The shapes whose bundle boots from daemon.ts and carries a tool catalog.
+  const DAEMON_SHAPES = ["channel", "managed", "crew"] as const;
+  const READS_ORIGIN = [
+    { tools: ["httpRequest"], toolConfigs: { http: { allowed_origins: ["$ORIGIN"] } } },
+  ];
+  const CHECK =
+    'if (!process.env["ORIGIN"]) { process.stderr.write("tool_config.http.allowed_origins[0] reads $ORIGIN, but ORIGIN is not set. Set ORIGIN in the environment the harness starts in.\\n"); process.exit(2); }';
+  const REGISTRATION =
+    'applyToolConfig(registerHttpConfig, {"allowed_origins":["$ORIGIN"]}, "tool_config.http", process.env);';
+
+  test("channel, managed and crew check the variable, then register as before", () => {
+    const cli = resolveBuiltinTools("cli", READS_ORIGIN);
+    expect(cli.inits).toEqual([REGISTRATION]);
+    for (const shape of DAEMON_SHAPES) {
+      const r = resolveBuiltinTools(shape, READS_ORIGIN);
+      expect({ shape, inits: r.inits }).toEqual({ shape, inits: [CHECK, REGISTRATION] });
+      // The check imports nothing.
+      expect({ shape, imports: r.imports }).toEqual({ shape, imports: cli.imports });
+    }
+  });
+
+  test("a registration ahead of the first read runs before the check, as it always has", () => {
+    const IMAGE = 'registerImageGenerationConfig({"model":"gpt-image-1"});';
+    const blocks = {
+      http: { allowed_origins: ["$ORIGIN"] },
+      imageGenerate: { model: "gpt-image-1" },
+    };
+    for (const shape of DAEMON_SHAPES) {
+      // The site's tool order is the registration order.
+      const imageFirst = resolveBuiltinTools(shape, [
+        { tools: ["imageGenerate", "httpRequest"], toolConfigs: blocks },
+      ]);
+      expect({ shape, inits: imageFirst.inits }).toEqual({
+        shape,
+        inits: [IMAGE, CHECK, REGISTRATION],
+      });
+      const httpFirst = resolveBuiltinTools(shape, [
+        { tools: ["httpRequest", "imageGenerate"], toolConfigs: blocks },
+      ]);
+      expect({ shape, inits: httpFirst.inits }).toEqual({
+        shape,
+        inits: [CHECK, REGISTRATION, IMAGE],
+      });
+    }
+    // A variable read again later is not checked again; a new one is checked
+    // just before the registration that first reads it.
+    const both = resolveBuiltinTools("managed", [
+      {
+        tools: ["httpRequest", "imageGenerate"],
+        toolConfigs: {
+          http: { allowed_origins: ["$ORIGIN"] },
+          imageGenerate: { openaiBaseUrl: "$ORIGIN", model: "$IMAGE_MODEL" },
+        },
+      },
+    ]);
+    expect(both.inits).toEqual([
+      CHECK,
+      REGISTRATION,
+      'if (!process.env["IMAGE_MODEL"]) { process.stderr.write("tool_config.imageGenerate.model reads $IMAGE_MODEL, but IMAGE_MODEL is not set. Set IMAGE_MODEL in the environment the harness starts in.\\n"); process.exit(2); }',
+      'applyToolConfig(registerImageGenerationConfig, {"openaiBaseUrl":"$ORIGIN","model":"$IMAGE_MODEL"}, "tool_config.imageGenerate", process.env);',
+    ]);
+  });
+
+  test("every other shape, and a daemon shape that reads no variable, is unchanged", () => {
+    const others = SHAPES.filter(
+      (s) =>
+        SHAPE_TOOL_PROFILES[s].runtime === "host" &&
+        !(DAEMON_SHAPES as ReadonlyArray<string>).includes(s),
+    );
+    expect(others.sort()).toEqual([
+      "batch",
+      "browser",
+      "cli",
+      "eval",
+      "graph",
+      "research",
+      "workflow",
+    ]);
+    for (const shape of others) {
+      const { inits } = resolveBuiltinTools(shape, READS_ORIGIN);
+      expect({ shape, inits }).toEqual({ shape, inits: [REGISTRATION] });
+    }
+    const literal = [
+      { tools: ["httpRequest"], toolConfigs: { http: { allowed_origins: ["https://a.test"] } } },
+    ];
+    const cli = resolveBuiltinTools("cli", literal);
+    expect(cli.inits).toEqual(['registerHttpConfig({"allowed_origins":["https://a.test"]});']);
+    for (const shape of DAEMON_SHAPES) {
+      const r = resolveBuiltinTools(shape, literal);
+      expect({ shape, inits: r.inits, imports: r.imports }).toEqual({
+        shape,
+        inits: cli.inits,
+        imports: cli.imports,
+      });
+    }
+  });
+
+  test("the shapes that check are exactly channel, crew and managed", () => {
+    expect(SHAPES.filter((s) => SHAPE_TOOL_PROFILES[s].daemonEntry === true).sort()).toEqual([
+      "channel",
+      "crew",
+      "managed",
+    ]);
+  });
+});

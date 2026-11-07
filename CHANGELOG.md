@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Changes that can affect a harness without opting in.** No spec has to turn
 these on: they reach every harness that uses what each one names.
 
+- **A daemon stops on an unset tool-config variable with exit 2.** After a
+  recompile, a `channel`, `managed` or `crew` daemon whose `tool_config` or
+  `chains` block reads an unset variable exits 2 with one line naming the
+  variable, where it exited 1. Supervision still counts it as a crash, and its
+  status reads "crashed (exit 2)" instead of "unclassified failure".
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what
