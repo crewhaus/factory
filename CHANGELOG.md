@@ -151,6 +151,11 @@ these on: they reach every harness that uses what each one names.
   wrote: a grader's correction and other runtime-authored turns stay out of it.
   Recompile a daemon to pick this up.
 
+- **`crewhaus serve --mcp --sse` listens on this computer only.** The server
+  binds `127.0.0.1` and answers a request whose `Host`, and `Origin` if it sends
+  one, name this computer. To reach it from another machine, use an SSH tunnel,
+  or a channel bundle's `/mcp`, which takes a bearer.
+
 ## [0.8.0] - 2026-10-25
 
 **Answers that carry their proof.** A spec can now require evidence for what
