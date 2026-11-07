@@ -39,7 +39,17 @@ export type OpenSessionOptions = {
   readonly theme?: "dark" | "light";
   /** Sees every response from before sign-in, which a listener added later would miss. */
   readonly onResponse?: (response: Response) => void;
+  /**
+   * Statuses this journey answers itself with `page.route` (a refusal, a
+   * conflict), each for one exact path. The browser logs "Failed to load
+   * resource" for them, and that line is the journey's own doing, so it is
+   * excused for that path and that status only. A 4xx only: a 5xx is always
+   * a failure, whoever produced it.
+   */
+  readonly expectedStatuses?: readonly ExpectedStatus[];
 };
+
+export type ExpectedStatus = { readonly pathname: string; readonly status: number };
 
 export type Session = {
   readonly page: Page;
@@ -80,21 +90,35 @@ export async function closeSharedBrowser(): Promise<void> {
 /**
  * Whether a console error is a failure, and why. One thing is not: the
  * browser's "Failed to load resource" for an `/api/*` 404, because 404 is how
- * the client learns something is absent, and absence is not an error. Anything
- * else is, including a 404 for an asset and any other status from the API.
+ * the client learns something is absent, and absence is not an error. Nor is
+ * that line for a status the journey answered itself (`expected`), on exactly
+ * that path. Anything else is, including a 404 for an asset and any other
+ * status from the API.
  */
-export function consoleErrorReason(text: string, locationUrl: string): string | null {
+export function consoleErrorReason(
+  text: string,
+  locationUrl: string,
+  expected: readonly ExpectedStatus[] = [],
+): string | null {
   let pathname = "";
   try {
     pathname = new URL(locationUrl).pathname;
   } catch {
     // No usable location: nothing to excuse it with.
   }
-  const isApi404 =
-    text.startsWith("Failed to load resource") &&
-    text.includes("status of 404") &&
-    pathname.startsWith("/api/");
-  return isApi404 ? null : `${text} (${locationUrl})`;
+  const failedLoad = text.startsWith("Failed to load resource");
+  const isApi404 = failedLoad && text.includes("status of 404") && pathname.startsWith("/api/");
+  const isExpected =
+    failedLoad &&
+    pathname !== "" &&
+    expected.some(
+      (e) =>
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.pathname === pathname &&
+        text.includes(`status of ${e.status}`),
+    );
+  return isApi404 || isExpected ? null : `${text} (${locationUrl})`;
 }
 
 const spentBootPaths = new WeakSet<object>();
@@ -186,7 +210,11 @@ export async function openSession(
   });
   page.on("console", (message) => {
     if (message.type() !== "error") return;
-    const reason = consoleErrorReason(message.text(), message.location().url);
+    const reason = consoleErrorReason(
+      message.text(),
+      message.location().url,
+      opts.expectedStatuses ?? [],
+    );
     if (reason !== null) record("console-error", reason);
   });
   page.on("pageerror", (error) => {

@@ -1,6 +1,8 @@
 /**
- * The report-only accessibility baseline: its format, its diff, and its checks.
- * A later gate reads this exact format.
+ * The accessibility report and its committed baseline: the format, the diff,
+ * and the checks. The gate (`gate.ts`) reads this same format: a gated
+ * screen's rows must be empty, and every other row is reported against the
+ * baseline and never fails.
  */
 import { AXE_TAGS } from "./axe";
 
@@ -85,7 +87,7 @@ export type BaselineDiff = {
   readonly gone: readonly string[];
 };
 
-/** Compare a report with the baseline. Report only: nothing here is ever fatal. */
+/** Compare a report with the baseline. Nothing here is fatal: the gate decides. */
 export function diffAgainstBaseline(baseline: AxeReport, report: AxeReport): BaselineDiff {
   const diff = {
     new: [] as string[],
@@ -126,8 +128,15 @@ export function reportTotals(report: AxeReport): Readonly<Record<string, number>
   return Object.fromEntries(Object.entries(totals).sort(([a], [b]) => (a < b ? -1 : 1)));
 }
 
-/** The diff as markdown, for a CI step summary. */
-export function diffMarkdown(diff: BaselineDiff, report: AxeReport): string {
+/** What the gate found, for the summary's heading. */
+export type GateSummary = {
+  readonly gated: number;
+  readonly failures: number;
+  readonly missing: number;
+};
+
+/** The diff as markdown, for a CI step summary, headed by the gate's result. */
+export function diffMarkdown(diff: BaselineDiff, report: AxeReport, gate?: GateSummary): string {
   const section = (title: string, lines: readonly string[]): string =>
     lines.length === 0
       ? ""
@@ -135,8 +144,16 @@ export function diffMarkdown(diff: BaselineDiff, report: AxeReport): string {
   const totals = Object.entries(reportTotals(report))
     .map(([rule, count]) => `\`${rule}\` ${count}`)
     .join(", ");
+  const verdict =
+    gate === undefined
+      ? ""
+      : gate.failures === 0 && gate.missing === 0
+        ? `**Gate passed:** ${gate.gated} gated screens have no violation in either theme at either width.\n\n`
+        : `**Gate failed:** ${gate.failures} violation(s) and ${gate.missing} missing row(s) on the ${gate.gated} gated screens.\n\n`;
   return [
-    "## Accessibility report (never fails the build)\n",
+    "## Accessibility gate and report\n",
+    verdict,
+    "Rows for screens outside the gate are reported against the baseline and never fail the build.\n",
     `${Object.keys(report.rows).length} rows. Nodes by rule: ${totals === "" ? "none" : totals}.\n`,
     section("New against the baseline", diff.new),
     section("Increased", diff.increased),

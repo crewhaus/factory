@@ -2,9 +2,17 @@
 import type { Page } from "playwright";
 import { ariaSnapshot } from "../a11y/aria";
 import { AXE_TAGS, runAxe } from "../a11y/axe";
+import { type AxeReport, rowKey } from "../a11y/baseline";
 import type { A11yFinding } from "../a11y/finding";
 import { focusObscuredFinding } from "../a11y/focus-obscured";
-import { escapeFinding, focusVisibleFinding, keyboardTrapFinding } from "../a11y/keyboard";
+import { GATE_THEMES, GATE_WIDTHS, gateVerdict } from "../a11y/gate";
+import {
+  dialogContainmentFinding,
+  escapeFinding,
+  focusTour,
+  focusVisibleFinding,
+  keyboardTrapFinding,
+} from "../a11y/keyboard";
 import { reducedMotionFindings } from "../a11y/reduced-motion";
 import { REFLOW_WIDTH, reflowFinding } from "../a11y/reflow";
 import { textSpacingFindings } from "../a11y/text-spacing";
@@ -123,6 +131,48 @@ const PAGES = {
   "blocked-inline": {
     html: plantedHtml("<main><h1>Plant</h1></main><script>globalThis.__planted = 1</script>"),
   },
+  "tour-no-ring": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button class="wide">One</button> <button class="wide bare">Two</button></main>`,
+      sheet,
+    ),
+  },
+  "translucent-ring": {
+    html: plantedHtml(
+      `<main class="dark"><h1>Clean</h1><button class="wash">On a dark page</button></main>`,
+      sheet,
+    ),
+  },
+  "dialog-modal": {
+    html: plantedHtml(
+      `<main><h1>Clean</h1><button class="wide">Behind</button>
+       <dialog id="modal" aria-label="Plant"><button class="wide">One</button> <button class="wide">Two</button></dialog></main>`,
+      `${sheet}${code}`,
+    ),
+  },
+  "dialog-leaky": {
+    html: plantedHtml(
+      `<main><h1>Plant</h1><button class="wide">Behind</button>
+       <dialog id="leaky" aria-label="Plant"><button class="wide">One</button> <button class="wide">Two</button></dialog></main>`,
+      `${sheet}${code}`,
+    ),
+  },
+  "motion-attr": {
+    html: plantedHtml(
+      `<main><h1>Clean</h1><div class="attr-gated">Spin</div></main>`,
+      sheet,
+    ).replace('<html lang="en">', '<html lang="en" data-motion="reduce">'),
+  },
+  "motion-attr-missing": {
+    html: plantedHtml(`<main><h1>Plant</h1><div class="attr-gated">Spin</div></main>`, sheet),
+  },
+  "spacing-exempt": {
+    html: plantedHtml(
+      `<main><h1>Clean</h1><span class="sr-only">Words for a screen reader only, longer than one pixel</span>
+       <label>Value <input class="narrow-input" value="a value much longer than the field shows"></label></main>`,
+      sheet,
+    ),
+  },
 } as const;
 
 const ASSETS = {
@@ -151,6 +201,13 @@ const ASSETS = {
     }
     .cover { position: fixed; top: 0; left: 0; right: 0; height: 120px; background: rgb(200, 200, 200); }
     .under { margin-top: 20px; }
+    .dark { background: rgb(10, 13, 15); color: rgb(232, 239, 233); padding: 8px; }
+    .wash { background: rgba(46, 204, 139, 0.12); color: rgb(46, 204, 139); border: 1px solid rgb(46, 204, 139); min-height: 24px; }
+    .wash:focus-visible { outline: 2px solid rgb(46, 204, 139); outline-offset: 2px; }
+    .attr-gated { animation: spin 4s linear infinite; }
+    :root[data-motion="reduce"] .attr-gated { animation: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+    .narrow-input { width: 60px; }
   `),
   "/assets/plant.js": js(`
     const trap = document.getElementById("trap");
@@ -167,6 +224,9 @@ const ASSETS = {
         document.getElementById("cycle-first")?.focus();
       });
     }
+    document.getElementById("modal")?.showModal();
+    // Opened without showModal: nothing holds focus inside it.
+    document.getElementById("leaky")?.show();
     const open = document.getElementById("open");
     const overlay = document.getElementById("overlay");
     if (open !== null && overlay !== null) {
@@ -349,6 +409,84 @@ export const a11ySelfTest: Journey = {
       "focus-obscured",
     );
     expectNothing("focusObscuredFinding", [(await clean(focusFirst)).result]);
+
+    // focus tour: every stop judged, and a trap at the end
+    expectRule(
+      "focusTour",
+      (await onPage("tour-no-ring", focusTour)).result.findings,
+      "focus-not-visible",
+    );
+    expectRule(
+      "focusTour",
+      (await onPage("covered-focus", focusTour)).result.findings,
+      "focus-obscured",
+    );
+    expectRule("focusTour", (await onPage("trap", focusTour)).result.findings, "keyboard-trap");
+    const toured = (await clean(focusTour)).result;
+    expectNothing("focusTour", toured.findings);
+    if (toured.reached < 2)
+      fail("focusTour", `reached ${toured.reached} controls on the clean page`);
+    // A wash is read over what is behind it, not over white.
+    expectNothing("focusVisibleFinding on translucent-ring", [
+      (await onPage("translucent-ring", focusVisibleFinding)).result,
+    ]);
+    expectNothing(
+      "focusTour on translucent-ring",
+      (await onPage("translucent-ring", focusTour)).result.findings,
+    );
+
+    // dialog containment
+    expectRule(
+      "dialogContainmentFinding",
+      [(await onPage("dialog-leaky", (page) => dialogContainmentFinding(page, "#leaky"))).result],
+      "focus-escapes-dialog",
+    );
+    expectNothing("dialogContainmentFinding", [
+      (await onPage("dialog-modal", (page) => dialogContainmentFinding(page, "#modal"))).result,
+    ]);
+
+    // reduced motion from a page's own switch, with the media query left alone
+    const ownSwitch = async (page: Page) => {
+      await page.emulateMedia({ reducedMotion: "no-preference" });
+      return reducedMotionFindings(page, { emulate: false });
+    };
+    expectRule(
+      "reducedMotionFindings({ emulate: false })",
+      (await onPage("motion-attr-missing", ownSwitch)).result,
+      "motion-not-reduced",
+    );
+    // A rule only the media query would apply does not pass here.
+    expectRule(
+      "reducedMotionFindings({ emulate: false })",
+      (await onPage("gated-animation", ownSwitch)).result,
+      "motion-not-reduced",
+    );
+    expectNothing(
+      "reducedMotionFindings({ emulate: false })",
+      (await onPage("motion-attr", ownSwitch)).result,
+    );
+
+    // text spacing exempts a screen-reader-only box and a field's own scroll
+    expectNothing(
+      "textSpacingFindings",
+      (await onPage("spacing-exempt", textSpacingFindings)).result,
+    );
+
+    // the gate fails on axe's findings, and passes a clean page
+    const asReport = (violations: Readonly<Record<string, number>>): AxeReport => {
+      const rows: Record<string, Readonly<Record<string, number>>> = {};
+      for (const theme of GATE_THEMES) {
+        for (const width of GATE_WIDTHS) rows[rowKey("#/plant", theme, width)] = violations;
+      }
+      return { schema: 1, axe: "planted", tags: [...AXE_TAGS], rows };
+    };
+    const failing = gateVerdict(asReport(planted.violations), ["#/plant"]);
+    if (failing.failures.length === 0)
+      fail("gateVerdict", "passed axe's findings on the planted page");
+    const passing = gateVerdict(asReport(quiet.violations), ["#/plant"]);
+    if (passing.failures.length > 0 || passing.missing.length > 0) {
+      fail("gateVerdict", `failed the clean page: ${JSON.stringify(passing)}`);
+    }
 
     // ARIA snapshots
     const aria = (page: Page) => ariaSnapshot(page);

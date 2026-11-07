@@ -1,6 +1,7 @@
 /** Keyboard operation: a visible focus, no trap, and Escape that gives focus back. */
 import type { Page } from "playwright";
 import type { A11yFinding } from "./finding";
+import { focusObscuredFinding } from "./focus-obscured";
 
 /** The computed focus indicator of whatever holds focus. */
 type FocusStyle = {
@@ -133,7 +134,14 @@ export function focusStyleFinding(style: FocusStyle): A11yFinding | undefined {
  */
 export async function focusVisibleFinding(page: Page): Promise<A11yFinding | undefined> {
   await page.keyboard.press("Tab");
-  const style = await page.evaluate((): FocusStyle | null => {
+  const style = await readFocusStyle(page);
+  if (style === null) return { rule: "focus-undetermined", detail: "Tab reached no control" };
+  return focusStyleFinding(style);
+}
+
+/** The focus indicator of whatever holds focus now, or null for nothing. */
+async function readFocusStyle(page: Page): Promise<FocusStyle | null> {
+  return await page.evaluate((): FocusStyle | null => {
     const active = document.activeElement;
     if (!(active instanceof HTMLElement) || active === document.body) return null;
     // A ring that eases in would otherwise be read partway.
@@ -144,29 +152,48 @@ export async function focusVisibleFinding(page: Page): Promise<A11yFinding | und
       return getComputedStyle(node);
     };
     const computed = finished(active);
-    let background = "rgba(0, 0, 0, 0)";
-    for (let node: Element | null = active; node !== null; node = node.parentElement) {
-      const color = getComputedStyle(node).backgroundColor;
-      if (color !== "rgba(0, 0, 0, 0)" && color !== "transparent") {
-        background = color;
-        break;
+    // The background the ring is seen against: the element's own, and, while
+    // that is translucent, what shows through it from the ancestors behind,
+    // down to the first opaque one (white past the root). A wash read on its
+    // own over white is not what anyone sees on a dark page.
+    const layers: Array<[number, number, number, number]> = [];
+    // Chrome reports `color-mix()` results as `color(srgb r g b / a)`, in 0–1.
+    const channels = (color: string): [number, number, number, number] | null => {
+      const rgb = /^rgba?\(([\d.]+)[ ,]+([\d.]+)[ ,]+([\d.]+)(?:[ ,/]+([\d.]+))?\)$/.exec(color);
+      if (rgb !== null) {
+        return [Number(rgb[1]), Number(rgb[2]), Number(rgb[3]), Number(rgb[4] ?? 1)];
       }
+      const srgb = /^color\(srgb ([\d.]+) ([\d.]+) ([\d.]+)(?: \/ ([\d.]+))?\)$/.exec(color);
+      if (srgb !== null) {
+        const c = (v: string | undefined): number => Number(v) * 255;
+        return [c(srgb[1]), c(srgb[2]), c(srgb[3]), Number(srgb[4] ?? 1)];
+      }
+      return null;
+    };
+    for (let node: Element | null = active; node !== null; node = node.parentElement) {
+      const layer = channels(getComputedStyle(node).backgroundColor);
+      if (layer === null || layer[3] === 0) continue;
+      layers.push(layer);
+      if (layer[3] >= 1) break;
     }
+    let shown: [number, number, number] = [255, 255, 255];
+    for (const [r, g, b, a] of layers.reverse()) {
+      shown = [r * a + shown[0] * (1 - a), g * a + shown[1] * (1 - a), b * a + shown[2] * (1 - a)];
+    }
+    const background = `rgb(${shown.map((c) => Math.round(c)).join(", ")})`;
     const focused = {
       tag: active.tagName.toLowerCase(),
       outlineStyle: computed.outlineStyle,
       outlineWidth: Number.parseFloat(computed.outlineWidth) || 0,
       outlineColor: computed.outlineColor,
       boxShadow: computed.boxShadow,
-      background: background === "rgba(0, 0, 0, 0)" ? "rgb(255, 255, 255)" : background,
+      background,
     };
     active.blur();
     const unfocusedBoxShadow = finished(active).boxShadow;
     active.focus();
     return { ...focused, unfocusedBoxShadow };
   });
-  if (style === null) return { rule: "focus-undetermined", detail: "Tab reached no control" };
-  return focusStyleFinding(style);
 }
 
 /** Everything that can be a tab stop. The walk below judges which really are. */
@@ -193,12 +220,9 @@ export function trapVerdict(
   return { rule: "keyboard-trap", detail: `Tab reached ${reached} of ${stops} controls` };
 }
 
-/**
- * Tab through the page until focus leaves it or comes round again. A negative
- * tabindex is no stop, and a radio group is one stop, however many buttons it has.
- */
-export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | undefined> {
-  const stops = await page.evaluate((selector) => {
+/** How many Tab stops the page has: a negative tabindex is none, a radio group one. */
+async function countTabStops(page: Page): Promise<number> {
+  return await page.evaluate((selector) => {
     const groups = new Set<string>();
     let count = 0;
     for (const node of document.querySelectorAll<HTMLElement>(selector)) {
@@ -215,6 +239,26 @@ export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | und
     }
     return count;
   }, TAB_STOP_SELECTOR);
+}
+
+/** Who holds focus, as `<tag> #index`, or null for nothing on the page. */
+async function activeId(page: Page, press: number): Promise<string | null> {
+  return await page.evaluate((count) => {
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    if (active === null || active === document.body) return null;
+    const id = `<${active.tagName.toLowerCase()}> #${[...document.querySelectorAll("*")].indexOf(active)}`;
+    // Tab moves on inside a frame while the frame still holds focus out here.
+    return active.tagName === "IFRAME" ? `${id} press ${count}` : id;
+  }, press);
+}
+
+/**
+ * Tab through the page until focus leaves it or comes round again. A negative
+ * tabindex is no stop, and a radio group is one stop, however many buttons it has.
+ */
+export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | undefined> {
+  const stops = await countTabStops(page);
   if (stops === 0) return undefined;
   await page.evaluate(() => {
     (document.activeElement as HTMLElement | null)?.blur?.();
@@ -225,14 +269,7 @@ export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | und
   // A bound, not an expectation: a scrollable region can be a stop the count missed.
   for (let press = 0; press < stops * 2 + 4; press++) {
     await page.keyboard.press("Tab");
-    const here = await page.evaluate((count) => {
-      let active = document.activeElement;
-      while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
-      if (active === null || active === document.body) return null;
-      const id = `<${active.tagName.toLowerCase()}> #${[...document.querySelectorAll("*")].indexOf(active)}`;
-      // Tab moves on inside a frame while the frame still holds focus out here.
-      return active.tagName === "IFRAME" ? `${id} press ${count}` : id;
-    }, press);
+    const here = await activeId(page, press);
     visited.push(here);
     if (here === null ? seen.size > 0 : seen.has(here)) break;
     if (here !== null) seen.add(here);
@@ -240,17 +277,108 @@ export async function keyboardTrapFinding(page: Page): Promise<A11yFinding | und
   return trapVerdict(visited, stops);
 }
 
+export type FocusTour = {
+  readonly findings: readonly A11yFinding[];
+  /** Tab stops the page counted, and distinct controls Tab reached. */
+  readonly stops: number;
+  readonly reached: number;
+};
+
 /**
- * Open something with `trigger`, press Escape, and report if it stayed open or
- * focus did not come back to what opened it.
+ * Tab through the whole page once, the way {@link keyboardTrapFinding} walks
+ * it, and judge every stop on the way: a control whose focus cannot be seen
+ * ({@link focusStyleFinding}), one hidden under something fixed
+ * ({@link focusObscuredFinding}), and, at the end, a trap ({@link trapVerdict}).
+ * Each finding names the control it is about.
+ */
+export async function focusTour(page: Page): Promise<FocusTour> {
+  const stops = await countTabStops(page);
+  if (stops === 0) return { findings: [], stops: 0, reached: 0 };
+  await page.evaluate(() => {
+    (document.activeElement as HTMLElement | null)?.blur?.();
+  });
+  const findings: A11yFinding[] = [];
+  const visited: (string | null)[] = [];
+  const seen = new Set<string>();
+  for (let press = 0; press < stops * 2 + 4; press++) {
+    await page.keyboard.press("Tab");
+    const here = await activeId(page, press);
+    visited.push(here);
+    if (here === null ? seen.size > 0 : seen.has(here)) break;
+    if (here === null) continue;
+    seen.add(here);
+    const name = await page.evaluate(() => {
+      const active = document.activeElement as HTMLElement | null;
+      const text = (active?.getAttribute("aria-label") ?? active?.textContent ?? "").trim();
+      return text.slice(0, 40);
+    });
+    const style = await readFocusStyle(page);
+    const ring = style === null ? undefined : focusStyleFinding(style);
+    if (ring !== undefined)
+      findings.push({ rule: ring.rule, detail: `${ring.detail} (“${name}”)` });
+    const covered = await focusObscuredFinding(page);
+    if (covered !== undefined) {
+      findings.push({ rule: covered.rule, detail: `${covered.detail} (“${name}”)` });
+    }
+  }
+  const trap = trapVerdict(visited, stops);
+  if (trap !== undefined) findings.push(trap);
+  return { findings, stops, reached: seen.size };
+}
+
+/**
+ * Tab past the end of an open dialog, again and again, and report the first
+ * element OUTSIDE it that takes focus. Focus passing through `<body>` (or the
+ * browser's own controls) on the way round is no finding: only a control of
+ * the page behind is.
+ */
+export async function dialogContainmentFinding(
+  page: Page,
+  dialog: string,
+): Promise<A11yFinding | undefined> {
+  const inside = await page.locator(dialog).evaluate((node) => {
+    const selector =
+      "a[href], button:not([disabled]), input:not([disabled]), select, textarea, summary, [tabindex]:not([tabindex='-1'])";
+    return node.querySelectorAll(selector).length;
+  });
+  if (!(await page.locator(dialog).isVisible())) {
+    return { rule: "containment-undetermined", detail: `${dialog} is not open` };
+  }
+  for (let press = 0; press < inside * 2 + 4; press++) {
+    await page.keyboard.press("Tab");
+    const escaped = await page.locator(dialog).evaluate((node) => {
+      const active = document.activeElement;
+      if (active === null || active === document.body || node.contains(active)) return null;
+      return `<${active.tagName.toLowerCase()}> ${(active.textContent ?? "").trim().slice(0, 40)}`;
+    });
+    if (escaped !== null) {
+      return { rule: "focus-escapes-dialog", detail: `Tab left ${dialog} for ${escaped}` };
+    }
+  }
+  return undefined;
+}
+
+/** How long an overlay that opens after a request may take to appear. */
+const OVERLAY_WAIT_MS = 5_000;
+
+/**
+ * Open something with `trigger` (Enter, or `opts.key`), press Escape, and
+ * report if it stayed open or focus did not come back to what opened it. An
+ * overlay that opens after a request is waited for.
  */
 export async function escapeFinding(
   page: Page,
   trigger: string,
   overlay: string,
+  opts: { readonly key?: string } = {},
 ): Promise<A11yFinding | undefined> {
   await page.locator(trigger).focus();
-  await page.keyboard.press("Enter");
+  await page.keyboard.press(opts.key ?? "Enter");
+  await page
+    .locator(overlay)
+    .first()
+    .waitFor({ state: "visible", timeout: OVERLAY_WAIT_MS })
+    .catch(() => undefined);
   if (!(await page.locator(overlay).isVisible())) {
     return { rule: "escape-undetermined", detail: `${trigger} did not open ${overlay}` };
   }

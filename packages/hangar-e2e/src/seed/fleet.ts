@@ -8,7 +8,7 @@
  * it, and each such place says so below.
  */
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { feedbackRecord, logLine, makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
@@ -38,7 +38,21 @@ export type SeedFleetOptions = {
   /** Added to every harness's spec and `.env`. */
   readonly specExtra?: string;
   readonly envLines?: readonly string[];
+  /**
+   * Seed what the accessibility journeys need on screen: three pending
+   * approvals (a keyboard tour spends two grants and needs one left to hold
+   * focus), an open review item, an eval history below its pinned baseline
+   * (the charts, the trend, an Advisor item to explain), and a spec registry
+   * with one archived version (the version dialogs open from its row). Off
+   * by default, so every other journey's fleet is unchanged.
+   */
+  readonly rich?: boolean;
 };
+
+/** The tools the rich seed's approvals ask for, in order. */
+export const RICH_APPROVAL_TOOLS = ["Bash", "SendMessage", "Fetch"] as const;
+/** The archived spec version the rich seed registers. */
+export const RICH_SPEC_VERSION = "1.0.0";
 
 export type SeededHarness = {
   readonly id: string;
@@ -48,7 +62,94 @@ export type SeededHarness = {
   readonly sessionIds: readonly string[];
   readonly wikiSlug: string;
   readonly runId: string;
+  /** The rich seed's pending approval ids, oldest first; empty otherwise. */
+  readonly approvalIds: readonly string[];
+  /** The rich seed's open review item id, or null. */
+  readonly reviewId: string | null;
 };
+
+const DAY_MS = 86_400_000;
+
+/** The rich seed's records for one harness, as `makeFixtureHarness` options. */
+function richRecords(
+  seed: string,
+  target: string,
+  specName: string,
+  sessionId: string,
+  runId: string,
+  now: number,
+  model: string,
+) {
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const approvalIds = RICH_APPROVAL_TOOLS.map(
+    (_tool, i) => `appr_${hexFor(seed, target, "approval", String(i))}`,
+  );
+  const approvals = RICH_APPROVAL_TOOLS.map((toolName, i) => ({
+    id: approvalIds[i],
+    toolName,
+    inputHash: `hash-${hexFor(seed, target, "approval-input", String(i))}`,
+    input:
+      toolName === "Bash"
+        ? { command: "ls -la" }
+        : toolName === "SendMessage"
+          ? { channel: "ops", text: "ship it" }
+          : { url: "https://example.invalid/status" },
+    runId,
+    sessionId,
+    surface: "daemon",
+    createdAt: iso(now - (3 - i) * 60_000),
+  }));
+  const reviewId = `rev_rater_disagreement_${sessionId}_t1`;
+  const reviewQueue = [
+    {
+      schemaVersion: 1,
+      id: reviewId,
+      kind: "rater_disagreement",
+      sourceRef: { sessionId, turn: 1 },
+      ts: iso(now - 60_000),
+      status: "open",
+      context: "split verdict — a: up, b: down",
+    },
+  ];
+  // Newest last, and the newest below the pinned baseline, so the Advisor
+  // has an eval item whose quick action queues the optimize loop.
+  const rates = [0.9, 0.7, 0.4];
+  const evalRunIds = rates.map((_rate, i) => `run_${hexFor(seed, target, "eval", String(i))}`);
+  const evalIndex = rates.map((passRate, i) => ({
+    runId: evalRunIds[i],
+    specName,
+    specHash: "h",
+    datasetName: "smoke",
+    datasetHash: "d",
+    passRate,
+    meanScore: passRate,
+    sampleCount: 2,
+    ts: iso(now - (rates.length - i) * DAY_MS),
+    outDir: "/gone",
+  }));
+  const baselines = {
+    [`${specName}::smoke`]: {
+      specName,
+      datasetName: "smoke",
+      runId: evalRunIds[0],
+      outDir: "/gone",
+      datasetHash: "d",
+      ts: iso(now - rates.length * DAY_MS),
+    },
+  };
+  const specRegistry = {
+    dirName: specName,
+    manifest: { versions: [RICH_SPEC_VERSION], pins: {} },
+    versions: {
+      [RICH_SPEC_VERSION]: `name: ${specName}\ntarget: ${target}\nagent:\n  model: ${model}\n`,
+    },
+  };
+  return {
+    approvalIds,
+    reviewId,
+    options: { approvals, reviewQueue, evalIndex, baselines, specRegistry },
+  };
+}
 
 export type Fleet = {
   readonly dir: string;
@@ -89,7 +190,12 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
     const model = "claude-opus-5";
 
     mkdirSync(harnessDir, { recursive: true });
+    const rich =
+      opts.rich === true
+        ? richRecords(opts.seed, target, specName, sessionId, runId, opts.now, model)
+        : null;
     makeFixtureHarness(harnessDir, {
+      ...(rich !== null ? rich.options : {}),
       specName,
       target,
       model,
@@ -153,6 +259,13 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       goals: `goals:\n  - ${JSON.stringify(untrusted("Answer every question."))}\n`,
     });
 
+    if (rich !== null) {
+      // The Advisor's eval action can only queue what the harness can run.
+      mkdirSync(join(harnessDir, "eval"), { recursive: true });
+      writeFileSync(join(harnessDir, "eval", "dataset.jsonl"), '{"id":"a","input":"x"}\n');
+      writeFileSync(join(harnessDir, "eval", "graders.yaml"), "graders: []\n");
+    }
+
     const sessions = createSessionStore({
       rootDir: join(harnessDir, ".crewhaus", "sessions"),
       now: nowDate,
@@ -195,6 +308,8 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       sessionIds: [sessionId],
       wikiSlug,
       runId,
+      approvalIds: rich?.approvalIds ?? [],
+      reviewId: rich?.reviewId ?? null,
     });
   }
 
