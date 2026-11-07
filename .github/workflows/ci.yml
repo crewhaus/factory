@@ -169,7 +169,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Test the process layer + the manager server
-        run: bun --filter '@crewhaus/harness-supervisor' --filter '@crewhaus/hangar-server' test
+        run: bun --filter '@crewhaus/harness-supervisor' --filter '@crewhaus/hangar-server' --filter '@crewhaus/control-records' test
 
   # reliability#7 — the tool packages that shell out to OS programs, on
   # Windows. `ci` runs them on ubuntu only, while tool-desktop ships

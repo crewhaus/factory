@@ -47,8 +47,9 @@ by the other, and neither needs the other running.
   deletes expired transcripts as a side-effect). The approvals inbox folds
   `approvals.jsonl` for the same reason: `PendingApprovalStore.list()`
   COMPACTS the file, and a polled inbox must not rewrite an operator's
-  ledger. Regression tests browse both repeatedly and assert every file
-  survives byte-identical.
+  ledger. It reads through `@crewhaus/control-records`' tail reader, so a
+  large file shows its newest records. Regression tests browse both
+  repeatedly and assert every file survives byte-identical.
 - **Credentials never render** — env handling reports KEY presence
   booleans only; the spec view masks credential values (spec-patch
   `isCredentialKey`/`maskCredentialTokens`); transcripts, preflight

@@ -1,0 +1,91 @@
+/**
+ * Keyed digests. A plain sha256 of a short tool input can be guessed, so the digests
+ * that tie a record to an action are HMAC-SHA256 under the harness's own key. Joins
+ * between stored digests still work; a guess cannot be tested without the key.
+ *
+ * The digest format is a pin: stored digests join forever. Its label keeps two purposes
+ * from joining, and the JSON array keeps `("a", ["bc"])` apart from `("ab", ["c"])`.
+ */
+import { dirname } from "node:path";
+import { ensureDirContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { decodeStrict, readRecordFile } from "./io";
+import { controlPaths } from "./paths";
+
+const KEY_BYTES = 32;
+const KEY_FILE_RE = /^[0-9a-f]{64}\n$/;
+const KEY_FILE_BYTES = 65;
+
+export type DigestKeyRead =
+  | { readonly state: "absent" }
+  | { readonly state: "present"; readonly hmac: CryptoKey }
+  | { readonly state: "unreadable"; readonly reason: string };
+
+function importHmac(raw: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
+function hexOf(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * The harness's digest key, read. Creates nothing.
+ *
+ * First consumer: the decision log, which joins records by keyed digest.
+ */
+export async function readDigestKey(harnessDir: string): Promise<DigestKeyRead> {
+  const rel = controlPaths(harnessDir).digestKeyFile;
+  const read = readRecordFile(harnessDir, rel, KEY_FILE_BYTES);
+  if (!read.ok) {
+    return read.code === "not-found"
+      ? { state: "absent" }
+      : { state: "unreadable", reason: read.reason };
+  }
+  const text = read.truncated ? undefined : decodeStrict(read.bytes);
+  if (text === undefined || !KEY_FILE_RE.test(text)) {
+    return { state: "unreadable", reason: `${rel} is not a digest key file` };
+  }
+  return { state: "present", hmac: await importHmac(Buffer.from(text.trim(), "hex")) };
+}
+
+/**
+ * The harness's digest key, created by the first writer that needs it. Publishing is
+ * exclusive, so a racing creator reads the winner's key. An unreadable existing key is
+ * refused, never replaced: replacing it would break every stored join.
+ *
+ * First consumer: the decision log.
+ */
+export async function ensureDigestKey(
+  harnessDir: string,
+): Promise<Exclude<DigestKeyRead, { readonly state: "absent" }>> {
+  const existing = await readDigestKey(harnessDir);
+  if (existing.state !== "absent") return existing;
+  const rel = controlPaths(harnessDir).digestKeyFile;
+  const dir = ensureDirContained(harnessDir, dirname(rel), { mode: 0o700 });
+  if (!dir.ok) return { state: "unreadable", reason: dir.reason };
+  const raw = crypto.getRandomValues(new Uint8Array(KEY_BYTES));
+  const written = writeFileSafe(harnessDir, rel, `${hexOf(raw)}\n`, {
+    overwrite: false,
+    mode: 0o600,
+  });
+  if (written.ok) return { state: "present", hmac: await importHmac(raw) };
+  if (written.code !== "exists") return { state: "unreadable", reason: written.reason };
+  const winner = await readDigestKey(harnessDir);
+  return winner.state === "absent"
+    ? { state: "unreadable", reason: `${rel} disappeared while it was being created` }
+    : winner;
+}
+
+/**
+ * HMAC-SHA256, lowercase hex, over the UTF-8 of `JSON.stringify([label, ...parts])`.
+ *
+ * First consumer: the decision log, including an unlinked actor's `local:#<digest>`.
+ */
+export async function keyedDigest(
+  key: CryptoKey,
+  label: string,
+  parts: readonly string[],
+): Promise<string> {
+  const body = new TextEncoder().encode(JSON.stringify([label, ...parts]));
+  return hexOf(new Uint8Array(await crypto.subtle.sign("HMAC", key, body)));
+}
