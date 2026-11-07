@@ -656,16 +656,28 @@ describe("the overview's eval trend", () => {
   const PARTIAL = { passRate: 0.25, sampleCount: 4, partial: true };
   const pathOf = (card: FakeNode): string | undefined => card.all("path")[0]?.attrs["d"];
 
+  // Changed deliberately: the trend is now a chart with a text summary and a
+  // data table, so the card's text carries the measured rates too ("100%"
+  // holds "0%"). What these hold is the same: the headline does not read
+  // 0% or 25%, and the run that has no rate reads "unknown", never 0%.
+  const headline = (card: FakeNode): string =>
+    (card.all("span").find((s: FakeNode) => s.classes.has("stat-num")) as FakeNode).textContent;
+  const cells = (card: FakeNode): string[] => card.all("td").map((td: FakeNode) => td.textContent);
+
   test("a newest run that measured nothing is not a 0% headline", () => {
     const card = overview.evalTrendCard({ runs: [NOTHING, measured(1), measured(0.5)] });
     expect(card.textContent).toContain("not measured latest run");
-    expect(card.textContent).not.toContain("0%");
+    expect(headline(card)).not.toContain("0%");
+    expect(cells(card)).not.toContain("0%");
+    expect(cells(card)).toContain("unknown");
   });
 
   test("a stopped run says partial", () => {
     const card = overview.evalTrendCard({ runs: [PARTIAL, measured(1), measured(0.5)] });
     expect(card.textContent).toContain("partial latest run");
-    expect(card.textContent).not.toContain("25%");
+    expect(headline(card)).not.toContain("25%");
+    expect(cells(card)).not.toContain("25%");
+    expect(cells(card)).toContain("unknown");
   });
 
   test("neither one is plotted", () => {

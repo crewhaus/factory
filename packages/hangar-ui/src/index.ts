@@ -31,10 +31,23 @@ import keysJs from "../assets/js/keys.js" with { type: "text" };
 import markdownJs from "../assets/js/markdown.js" with { type: "text" };
 import notifyJs from "../assets/js/notify.js" with { type: "text" };
 import omniboxJs from "../assets/js/omnibox.js" with { type: "text" };
+import prefsJs from "../assets/js/prefs.js" with { type: "text" };
 import routerJs from "../assets/js/router.js" with { type: "text" };
 import routesJs from "../assets/js/routes.js" with { type: "text" };
 import shapesJs from "../assets/js/shapes.js" with { type: "text" };
 import supervisionJs from "../assets/js/supervision.js" with { type: "text" };
+import chartUiJs from "../assets/js/ui/chart.js" with { type: "text" };
+import conflictUiJs from "../assets/js/ui/conflict.js" with { type: "text" };
+import dialogUiJs from "../assets/js/ui/dialog.js" with { type: "text" };
+import draftUiJs from "../assets/js/ui/draft.js" with { type: "text" };
+import emptyUiJs from "../assets/js/ui/empty.js" with { type: "text" };
+import keyedUiJs from "../assets/js/ui/keyed.js" with { type: "text" };
+import listboxUiJs from "../assets/js/ui/listbox.js" with { type: "text" };
+import liveUiJs from "../assets/js/ui/live.js" with { type: "text" };
+import panelsUiJs from "../assets/js/ui/panels.js" with { type: "text" };
+import timeUiJs from "../assets/js/ui/time.js" with { type: "text" };
+import toggleUiJs from "../assets/js/ui/toggle.js" with { type: "text" };
+import tooltipUiJs from "../assets/js/ui/tooltip.js" with { type: "text" };
 import utilJs from "../assets/js/util.js" with { type: "text" };
 import activityViewJs from "../assets/js/views/activity.js" with { type: "text" };
 import advisorViewJs from "../assets/js/views/advisor.js" with { type: "text" };
@@ -117,10 +130,23 @@ export const hangarAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
   "/assets/js/notify.js": asset(notifyJs, "notify.js"),
   "/assets/js/omnibox.js": asset(omniboxJs, "omnibox.js"),
+  "/assets/js/prefs.js": asset(prefsJs, "prefs.js"),
   "/assets/js/router.js": asset(routerJs, "router.js"),
   "/assets/js/routes.js": asset(routesJs, "routes.js"),
   "/assets/js/shapes.js": asset(shapesJs, "shapes.js"),
   "/assets/js/supervision.js": asset(supervisionJs, "supervision.js"),
+  "/assets/js/ui/chart.js": asset(chartUiJs, "chart.js"),
+  "/assets/js/ui/conflict.js": asset(conflictUiJs, "conflict.js"),
+  "/assets/js/ui/dialog.js": asset(dialogUiJs, "dialog.js"),
+  "/assets/js/ui/draft.js": asset(draftUiJs, "draft.js"),
+  "/assets/js/ui/empty.js": asset(emptyUiJs, "empty.js"),
+  "/assets/js/ui/keyed.js": asset(keyedUiJs, "keyed.js"),
+  "/assets/js/ui/listbox.js": asset(listboxUiJs, "listbox.js"),
+  "/assets/js/ui/live.js": asset(liveUiJs, "live.js"),
+  "/assets/js/ui/panels.js": asset(panelsUiJs, "panels.js"),
+  "/assets/js/ui/time.js": asset(timeUiJs, "time.js"),
+  "/assets/js/ui/toggle.js": asset(toggleUiJs, "toggle.js"),
+  "/assets/js/ui/tooltip.js": asset(tooltipUiJs, "tooltip.js"),
   "/assets/js/util.js": asset(utilJs, "util.js"),
   "/assets/js/views/activity.js": asset(activityViewJs, "activity.js"),
   "/assets/js/views/advisor.js": asset(advisorViewJs, "advisor.js"),

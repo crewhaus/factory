@@ -147,7 +147,9 @@ export function timelineLine(entry) {
 function shareBar(share) {
   const pct = Math.max(0, Math.min(1, share)) * 100;
   return el("div", { class: "meter" }, [
-    el("div", { class: "meter-fill", style: `width:${pct.toFixed(1)}%` }),
+    // An object style goes through the CSSOM; a style string is an attribute,
+    // which a strict style policy blocks.
+    el("div", { class: "meter-fill", style: { width: `${pct.toFixed(1)}%` } }),
   ]);
 }
 

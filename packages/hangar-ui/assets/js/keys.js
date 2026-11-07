@@ -1,12 +1,12 @@
 /**
  * HM-190 — keyboard triage, at the APP level.
  *
- * The inbox half of this item shipped with M2: `triageKey` in
- * `supervision.js` owns j/k movement, the one-key verdicts, the `.` row menu
- * and the `?` bindings sheet inside the approvals and review lists, and
- * `views/inbox.js` mounts it. M4 adds the layer above that — ⌘K, Escape, and
- * a bindings sheet that works on screens with no inbox on them — and, more
- * importantly, decides WHO owns a key when both layers want it.
+ * The inbox half lives in `supervision.js` (`triageKey`: j/k movement, the
+ * choose-then-Enter verdicts, the `.` row menu and the `?` inbox help) and is
+ * mounted by `views/inbox.js` on the LIST, so its keys work only while the
+ * list has focus (WCAG 2.1.4). This is the layer above that — ⌘K, `/`,
+ * Escape, and a bindings sheet that works everywhere — and, more
+ * importantly, it decides WHO owns a key when both layers want it.
  *
  * The whole decision is one pure reducer, {@link globalKey}, so the answer
  * to "does `?` open the global sheet or the inbox's?" is a unit test rather
@@ -14,60 +14,78 @@
  *
  * THE OWNERSHIP RULES, in the order they apply:
  *
+ *   0. While a dialog this reducer does not own is open (a typed
+ *      confirmation, a spec dialog), no shortcut claims anything: `/`, `?`
+ *      and ⌘K would stack a second overlay on a half-typed confirmation, and
+ *      Escape is the dialog's own way out.
  *   1. A key pressed inside an INPUT, TEXTAREA or contenteditable belongs to
  *      the field — an operator typing a spec edit must never have a modal
  *      stolen out from under them by a shortcut. There is exactly ONE
- *      exception, and it is the omnibox's own input: the overlay focuses it
- *      the instant it opens, so from that instant every key arrives with
- *      `inField: true`. Bailing unconditionally would make Escape and the
- *      ⌘K toggle unreachable and turn a keyboard feature into a keyboard
- *      TRAP — the only way out a mouse click on the backdrop. So while the
- *      omnibox is open, the two keys that CLOSE it are claimed even in a
- *      field, and nothing else is: typing a query still belongs to the
- *      field.
- *   2. ⌘K / Ctrl-K opens the omnibox from anywhere else, and toggles it
+ *      exception, and it is the command menu's own input: the overlay
+ *      focuses it the instant it opens, so from that instant every key
+ *      arrives with `inField: true`. Bailing unconditionally would make
+ *      Escape and the ⌘K toggle unreachable and turn a keyboard feature into
+ *      a keyboard TRAP. So while the menu is open, the two keys that CLOSE
+ *      it are claimed even in a field, and nothing else is.
+ *   2. ⌘K / Ctrl-K opens the command menu from anywhere else, and toggles it
  *      closed when it is already open.
- *   3. While the omnibox is OPEN it owns every key: the list beneath it must
- *      not scroll while a query is being typed.
- *   4. Escape closes the topmost overlay — omnibox first, then the sheet.
- *   5. `?` toggles the bindings sheet, but ONLY when no inbox is mounted;
- *      an inbox already binds `?` for its own sheet, and two sheets opening
- *      on one keypress is the bug this rule exists to prevent.
+ *   3. While the command menu is OPEN it owns every key: the list beneath it
+ *      must not scroll while a query is being typed.
+ *   4. Escape closes the topmost overlay — the menu first, then the sheet.
+ *   5. With single-key shortcuts off (Readability), no character key is
+ *      claimed — not here, and not in an inbox. Arrows, Enter, Escape and
+ *      every button still work.
+ *   6. `/` opens the command menu.
+ *   7. `?` toggles the bindings sheet, except while focus is inside an inbox
+ *      list, whose own help it opens instead; two sheets opening on one
+ *      keypress is the bug this rule exists to prevent.
  *
  * Nothing here touches `document`; the caller normalizes a KeyboardEvent
- * with {@link keyShape} and applies the returned effect.
+ * with {@link keyShape}, adds `dialogOpen`, and applies the returned effect.
  */
 
 /** The global bindings, as data — the sheet renders from this list. */
 export const GLOBAL_BINDINGS = [
-  { keys: "⌘K / Ctrl-K", does: "open the omnibox (harnesses, sessions, wiki, runs, actions)" },
-  { keys: "?", does: "show or hide this bindings sheet" },
-  { keys: "Esc", does: "close the omnibox, then this sheet" },
+  { keys: "⌘K / Ctrl-K", does: "open or close the command menu" },
+  { keys: "/", does: "open the command menu (not while typing)" },
+  { keys: "?", does: "show or hide this list" },
+  { keys: "Esc", does: "close the top overlay" },
 ];
 
 /** The inbox bindings, repeated in the global sheet so one overlay answers
- *  "what can I press here?" wherever it is opened. */
+ *  "what can I press here?" wherever it is opened. A letter only CHOOSES a
+ *  verdict; Enter confirms it. */
 export const INBOX_BINDINGS = [
   { keys: "j / ↓", does: "move down a row" },
   { keys: "k / ↑", does: "move up a row" },
-  { keys: "g / d", does: "grant or deny (approvals inbox)" },
-  { keys: "u / d / p / f", does: "up, down, pass or fail (review queue)" },
+  { keys: "g / d", does: "choose grant or deny, then Enter (approvals inbox)" },
+  { keys: "u / d / p / f", does: "choose up, down, pass or fail, then Enter (review queue)" },
+  { keys: "Enter", does: "confirm the choice, or open the row" },
+  { keys: "Esc", does: "cancel the choice" },
   { keys: ".", does: "open the row menu" },
-  { keys: "?", does: "show the inbox's own bindings" },
+  { keys: "?", does: "show the inbox's own keys" },
 ];
 
 /** Fields that own their keystrokes. */
 const FIELD_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
 
-/** The omnibox chord, in both flavours. */
+/** The command menu chord, in both flavours. */
 function isOmniChord(k) {
   return (k.meta === true || k.ctrl === true) && (k.key === "k" || k.key === "K");
+}
+
+/** A key that types one character (`?`, `/`, a letter) — what Readability's
+ *  "Single-key shortcuts: Off" turns off. */
+export function isCharacterKey(key) {
+  return typeof key === "string" && [...key].length === 1 && key !== " ";
 }
 
 /**
  * Normalize a KeyboardEvent into the plain record the reducer takes. Pure
  * apart from reading the event; kept here so tests describe key presses as
- * data rather than constructing DOM events.
+ * data rather than constructing DOM events. `inboxFocused` is read off the
+ * event, never kept in state: a re-render can remove the focused row with no
+ * focusout, and only the event knows where focus is now.
  */
 export function keyShape(event) {
   const target = event?.target ?? null;
@@ -79,12 +97,13 @@ export function keyShape(event) {
     alt: event?.altKey === true,
     shift: event?.shiftKey === true,
     inField: FIELD_TAGS.has(tag) || target?.isContentEditable === true,
+    inboxFocused: typeof target?.closest === "function" && target.closest("[data-triage]") !== null,
   };
 }
 
 /** The initial overlay state. */
 export function initialKeyState() {
-  return { omniboxOpen: false, sheetOpen: false, inboxMounted: false };
+  return { omniboxOpen: false, sheetOpen: false, inboxMounted: false, singleKeys: true };
 }
 
 /**
@@ -95,21 +114,32 @@ export function initialKeyState() {
  *                 "close-sheet" | null`;
  *   - `claimed` — true when the app handled the key and the caller should
  *                 `preventDefault()`. A key the app did NOT claim must fall
- *                 through untouched, which is what lets the inbox reducer
- *                 keep working on the same screen.
+ *                 through untouched, which is what lets the inbox list and an
+ *                 open dialog keep their own keys.
  */
 export function globalKey(state, shape) {
   const s = { ...initialKeyState(), ...(state && typeof state === "object" ? state : {}) };
-  const k = { key: "", meta: false, ctrl: false, alt: false, inField: false, ...(shape ?? {}) };
+  const k = {
+    key: "",
+    meta: false,
+    ctrl: false,
+    alt: false,
+    inField: false,
+    inboxFocused: false,
+    dialogOpen: false,
+    ...(shape ?? {}),
+  };
   const keep = { state: s, effect: null, claimed: false };
 
+  // 0. A dialog this reducer does not own keeps every key.
+  if (k.dialogOpen === true) return keep;
+
   // 1. A field owns its keys — including ⌘K — except the two that close an
-  //    open omnibox. The overlay focuses its own input, so without this
-  //    exception it would swallow both of its own exits.
+  //    open command menu.
   const closesOmnibox = s.omniboxOpen && (k.key === "Escape" || isOmniChord(k));
   if (k.inField && !closesOmnibox) return keep;
 
-  // 2. ⌘K / Ctrl-K toggles the omnibox.
+  // 2. ⌘K / Ctrl-K toggles the command menu.
   if (isOmniChord(k)) {
     return s.omniboxOpen
       ? { state: { ...s, omniboxOpen: false }, effect: "close-omnibox", claimed: true }
@@ -122,8 +152,7 @@ export function globalKey(state, shape) {
   // Any other modifier chord belongs to the browser (⌘R, ⌘L, ⌘T…).
   if (k.meta || k.ctrl || k.alt) return keep;
 
-  // 3. While the omnibox is open it owns everything except Escape, which
-  //    rule 4 handles.
+  // 3. While the menu is open it owns everything except Escape.
   if (s.omniboxOpen) {
     if (k.key === "Escape") {
       return { state: { ...s, omniboxOpen: false }, effect: "close-omnibox", claimed: true };
@@ -138,9 +167,21 @@ export function globalKey(state, shape) {
       : keep;
   }
 
-  // 5. `?` is the inbox's when an inbox is mounted.
+  // 5. Single-key shortcuts off: no character key is anyone's.
+  if (s.singleKeys === false && isCharacterKey(k.key)) return keep;
+
+  // 6. `/` opens the command menu.
+  if (k.key === "/") {
+    return {
+      state: { ...s, omniboxOpen: true, sheetOpen: false },
+      effect: "open-omnibox",
+      claimed: true,
+    };
+  }
+
+  // 7. `?` is the inbox's while focus is in an inbox list.
   if (k.key === "?") {
-    if (s.inboxMounted) return keep;
+    if (k.inboxFocused) return keep;
     return { state: { ...s, sheetOpen: !s.sheetOpen }, effect: "toggle-sheet", claimed: true };
   }
 

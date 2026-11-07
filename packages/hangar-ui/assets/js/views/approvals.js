@@ -6,17 +6,19 @@
  * way out, and nothing else): an approver cannot judge a call they cannot
  * see, so the tool input renders in full rather than as a hash or a summary.
  *
- * Triage is keyboard-first — j/k to move, g/d to grant/deny, `.` for the row
- * menu, `?` for the bindings — because an inbox with twenty parked calls is
- * a keyboard task. Granting a request whose run PARKED also resumes it: the
+ * Triage is keyboard-first while the list has focus — j/k to move, g or d to
+ * choose grant or deny and Enter to confirm, `.` for the row menu, `?` for
+ * the keys — because an inbox with twenty parked calls is a keyboard task. Granting a request whose run PARKED also resumes it: the
  * row says so, because "what happens after I click" is the question an
  * approver actually has.
  */
 
 import { api } from "../api.js";
-import { clear, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
+import { clear, dot, el, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { APPROVAL_KEYS, approvalRow } from "../supervision.js";
+import { emptyFor } from "../ui/empty.js";
+import { toggleBtn } from "../ui/toggle.js";
 import { actionTwin, gatedBtn } from "./control.js";
 import { mountTriage } from "./inbox.js";
 
@@ -51,11 +53,10 @@ async function draw(host, showSettled) {
     el("div", { class: "toolbar" }, [
       el("span", { class: "rollup", text: `${pending} pending · ${rows.length} shown` }),
       el("span", { class: "spacer" }),
-      el("button", {
-        class: `btn btn-ghost${showSettled ? " active" : ""}`,
-        type: "button",
-        text: showSettled ? "Showing settled too" : "Show settled",
-        onClick: () => draw(host, !showSettled),
+      toggleBtn({
+        label: "Show settled",
+        pressed: showSettled,
+        onToggle: (next) => draw(host, next),
       }),
     ]),
   );
@@ -69,17 +70,24 @@ async function draw(host, showSettled) {
   }
   if (rows.length === 0) {
     host.appendChild(
-      emptyState(
-        showSettled ? "No approvals recorded on this fleet" : "Nothing waiting for a decision",
-        "crewhaus approvals list",
-      ),
+      emptyFor({
+        cause: "no-data",
+        detail: showSettled
+          ? "No approvals are recorded on this fleet."
+          : "Nothing is waiting for a decision. A tool call that needs a person parks here.",
+        verb: "crewhaus approvals list",
+      }),
     );
     return;
   }
   mountTriage(host, rows, {
+    name: "approvals",
+    label: "Approvals",
     keys: APPROVAL_KEYS,
     reload,
     render: approvalCard,
+    rowLabel: (row) => `${row.toolName} for ${row.specName}, ${row.status}`,
+    prompt: (row, action) => `${action === "grant" ? "Grant" : "Deny"} ${row.toolName}?`,
     perform: decide,
   });
 }
@@ -100,56 +108,48 @@ async function decide(row, action, reload) {
   reload();
 }
 
-function approvalCard(row, index, state, redraw, reload) {
-  const selected = state.index === index;
+/** One row's content. The triage shell owns the row itself (its selection,
+ *  its Tab stop, the armed prompt); a decision goes through `perform`, so
+ *  the shell can keep the selection across the reload it causes. */
+function approvalCard(row, { perform }) {
   const gate = { enabled: row.pending, reason: `already ${row.status}` };
-  return el(
-    "section",
-    {
-      class: `card inbox-card${selected ? " selected" : ""}`,
-      "aria-current": selected ? "true" : null,
-      onClick: () => {
-        if (!selected) redraw({ ...state, index });
-      },
-    },
-    [
-      el("div", { class: "inbox-head" }, [
-        dot(row.dot, row.status),
-        el("span", { class: "chip chip-tool", text: row.toolName }),
-        el("a", { class: "name-link", href: hrefHarness(row.harnessId), text: row.specName }),
-        el("span", { class: "chip", text: row.surface }),
-        el("span", { class: "muted", text: row.age }),
-      ]),
-      // Verbatim (already masked) — the whole point of an approval screen.
-      jsonPre(row.input),
-      row.parkedRun !== null
-        ? el("div", { class: "muted reason" }, [
-            el("span", { text: "parked run " }),
-            el("a", {
-              class: "mono",
-              href: hrefHarness(row.harnessId, "runs", row.parkedRun.runId),
-              text: row.parkedRun.runId,
-            }),
-            el("span", { text: " · session " }),
-            el("a", {
-              class: "mono",
-              href: hrefHarness(row.harnessId, "sessions", row.parkedRun.sessionId),
-              text: row.parkedRun.sessionId,
-            }),
-          ])
-        : null,
-      row.resumeNote !== null ? el("div", { class: "muted reason", text: row.resumeNote }) : null,
-      row.decidedBy !== null
-        ? el("div", { class: "muted reason", text: `decided by ${row.decidedBy}` })
-        : null,
-      el("div", { class: "inbox-actions" }, [
-        gatedBtn("Grant", gate, () => decide(row, "grant", reload), "btn btn-primary"),
-        gatedBtn("Deny", gate, () => decide(row, "deny", reload), "btn btn-danger"),
-      ]),
-      el("div", { class: "inbox-twins" }, [
-        actionTwin("grant", { id: row.id }),
-        actionTwin("deny", { id: row.id }),
-      ]),
-    ],
-  );
+  return [
+    el("div", { class: "inbox-head" }, [
+      dot(row.dot, row.status),
+      el("span", { class: "chip chip-tool", text: row.toolName }),
+      el("a", { class: "name-link", href: hrefHarness(row.harnessId), text: row.specName }),
+      el("span", { class: "chip", text: row.surface }),
+      el("span", { class: "muted", text: row.age }),
+    ]),
+    // Verbatim (already masked) — the whole point of an approval screen.
+    jsonPre(row.input),
+    row.parkedRun !== null
+      ? el("div", { class: "muted reason" }, [
+          el("span", { text: "parked run " }),
+          el("a", {
+            class: "mono",
+            href: hrefHarness(row.harnessId, "runs", row.parkedRun.runId),
+            text: row.parkedRun.runId,
+          }),
+          el("span", { text: " · session " }),
+          el("a", {
+            class: "mono",
+            href: hrefHarness(row.harnessId, "sessions", row.parkedRun.sessionId),
+            text: row.parkedRun.sessionId,
+          }),
+        ])
+      : null,
+    row.resumeNote !== null ? el("div", { class: "muted reason", text: row.resumeNote }) : null,
+    row.decidedBy !== null
+      ? el("div", { class: "muted reason", text: `decided by ${row.decidedBy}` })
+      : null,
+    el("div", { class: "inbox-actions" }, [
+      gatedBtn("Grant", gate, () => perform("grant"), "btn btn-primary"),
+      gatedBtn("Deny", gate, () => perform("deny"), "btn btn-danger"),
+    ]),
+    el("div", { class: "inbox-twins" }, [
+      actionTwin("grant", { id: row.id }),
+      actionTwin("deny", { id: row.id }),
+    ]),
+  ];
 }

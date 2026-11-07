@@ -776,7 +776,7 @@ describe("SSE parsing + the run feed", () => {
 });
 
 describe("triage keyboard reducer", () => {
-  const start = { index: 0, count: 3, menuOpen: false, helpOpen: false };
+  const start = { index: 0, count: 3, menuOpen: false, helpOpen: false, armed: null };
 
   test("j and k move and clamp at both ends", () => {
     let state = start;
@@ -796,19 +796,65 @@ describe("triage keyboard reducer", () => {
     expect(sup.triageKey({ ...start, index: 2 }, "ArrowUp").state.index).toBe(1);
   });
 
-  test("g and d emit grant/deny effects for the selected row", () => {
+  // A verdict takes two keys: a letter only arms it, and Enter on the row
+  // decides. One key that decides is the hazard this rule exists to remove.
+  test("g and d only ARM a verdict for the selected row; neither decides", () => {
     const moved = sup.triageKey(start, "j").state;
-    expect(sup.triageKey(moved, "g").effect).toEqual({ action: "grant", index: 1 });
-    expect(sup.triageKey(moved, "d").effect).toEqual({ action: "deny", index: 1 });
+    for (const [key, action] of [
+      ["g", "grant"],
+      ["d", "deny"],
+    ]) {
+      const r = sup.triageKey(moved, key);
+      expect(r.effect).toBeNull();
+      expect(r.follow).toBeNull();
+      expect(r.state.armed).toEqual({ action, index: 1 });
+    }
+  });
+
+  test("Enter on an armed row returns the decision, once, and disarms", () => {
+    const armed = sup.triageKey(sup.triageKey(start, "j").state, "g").state;
+    const decided = sup.triageKey(armed, "Enter");
+    expect(decided.effect).toEqual({ action: "grant", index: 1 });
+    expect(decided.state.armed).toBeNull();
+    // A second Enter is not a second grant: it opens the row instead.
+    const again = sup.triageKey(decided.state, "Enter");
+    expect(again.effect).toBeNull();
+    expect(again.follow).toBe(1);
+  });
+
+  test("Enter with nothing armed is no decision: the view opens the row", () => {
+    const r = sup.triageKey({ ...start, index: 2 }, "Enter");
+    expect(r.effect).toBeNull();
+    expect(r.follow).toBe(2);
+    expect(r.state).toEqual({ ...start, index: 2 });
+  });
+
+  test("Escape, moving and the row menu each disarm", () => {
+    const armed = sup.triageKey(start, "d").state;
+    expect(armed.armed).toEqual({ action: "deny", index: 0 });
+    expect(sup.triageKey(armed, "Escape").state.armed).toBeNull();
+    expect(sup.triageKey(armed, "j").state.armed).toBeNull();
+    expect(sup.triageKey(armed, "k").state.armed).toBeNull();
+    expect(sup.triageKey(armed, ".").state.armed).toBeNull();
+    // …and a disarmed Enter decides nothing.
+    expect(sup.triageKey(sup.triageKey(armed, "Escape").state, "Enter").effect).toBeNull();
   });
 
   test("the review map rebinds the same reducer to its own verdicts", () => {
-    const keyed = (key: string) => sup.triageKey(start, key, sup.REVIEW_KEYS).effect;
-    expect(keyed("u")).toEqual({ action: "up", index: 0 });
-    expect(keyed("d")).toEqual({ action: "down", index: 0 });
-    expect(keyed("p")).toEqual({ action: "pass", index: 0 });
-    expect(keyed("f")).toEqual({ action: "fail", index: 0 });
-    expect(keyed("g")).toBeNull(); // grant is not a review verdict
+    const armedBy = (key: string) => sup.triageKey(start, key, sup.REVIEW_KEYS).state.armed;
+    expect(armedBy("u")).toEqual({ action: "up", index: 0 });
+    expect(armedBy("d")).toEqual({ action: "down", index: 0 });
+    expect(armedBy("p")).toEqual({ action: "pass", index: 0 });
+    expect(armedBy("f")).toEqual({ action: "fail", index: 0 });
+    expect(armedBy("g")).toBeNull(); // grant is not a review verdict
+    const armed = sup.triageKey(start, "p", sup.REVIEW_KEYS).state;
+    expect(sup.triageKey(armed, "Enter", sup.REVIEW_KEYS).effect).toEqual({
+      action: "pass",
+      index: 0,
+    });
+    for (const key of ["u", "d", "p", "f"]) {
+      expect(sup.triageKey(start, key, sup.REVIEW_KEYS).effect).toBeNull();
+    }
   });
 
   test(". toggles the row menu, ? the bindings, Escape closes both", () => {
@@ -825,9 +871,11 @@ describe("triage keyboard reducer", () => {
     expect(sup.triageKey(open, "j").state.menuOpen).toBe(false);
   });
 
-  test("an empty inbox emits no effect and never leaves index 0", () => {
-    const empty = { index: 0, count: 0, menuOpen: false, helpOpen: false };
+  test("an empty inbox arms nothing, decides nothing, opens nothing and never leaves index 0", () => {
+    const empty = { index: 0, count: 0, menuOpen: false, helpOpen: false, armed: null };
     expect(sup.triageKey(empty, "g").effect).toBeNull();
+    expect(sup.triageKey(empty, "g").state.armed).toBeNull();
+    expect(sup.triageKey(empty, "Enter")).toEqual({ state: empty, effect: null, follow: null });
     expect(sup.triageKey(empty, "j").state.index).toBe(0);
   });
 
@@ -835,16 +883,29 @@ describe("triage keyboard reducer", () => {
     expect(sup.triageKey(start, "f").effect).toBeNull();
     expect(sup.isTriageKey("f")).toBe(false);
     expect(sup.isTriageKey("f", sup.REVIEW_KEYS)).toBe(true);
-    for (const key of ["j", "k", "ArrowUp", "ArrowDown", ".", "?", "Escape", "g", "d"]) {
+    for (const key of ["j", "k", "ArrowUp", "ArrowDown", ".", "?", "Escape", "Enter", "g", "d"]) {
       expect(`${key}:${sup.isTriageKey(key)}`).toBe(`${key}:true`);
     }
   });
 
+  test("with single-key shortcuts off, no character key is the inbox's", () => {
+    for (const key of ["j", "k", ".", "?", "g", "d"]) {
+      expect(`${key}:${sup.isTriageKey(key, sup.APPROVAL_KEYS, false)}`).toBe(`${key}:false`);
+    }
+    for (const key of ["ArrowUp", "ArrowDown", "Enter", "Escape"]) {
+      expect(`${key}:${sup.isTriageKey(key, sup.APPROVAL_KEYS, false)}`).toBe(`${key}:true`);
+    }
+  });
+
   test("the help sheet lists movement, the actions, and the meta keys", () => {
-    const help = sup.keyHelp(sup.APPROVAL_KEYS).map((b: { key: string }) => b.key);
+    const rows = sup.keyHelp(sup.APPROVAL_KEYS) as Array<{ key: string; does: string }>;
+    const help = rows.map((b) => b.key);
     expect(help).toContain("j / ↓");
     expect(help).toContain("g");
+    expect(help).toContain("Enter");
     expect(help).toContain("?");
+    // The help says a letter chooses and Enter confirms; it never says a key decides.
+    expect(rows.find((b) => b.key === "g")?.does).toBe("choose grant, then Enter");
   });
 });
 

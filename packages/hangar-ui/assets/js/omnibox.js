@@ -1,16 +1,23 @@
 /**
- * HM-189 — the ⌘K overlay.
+ * HM-189 — the ⌘K command menu.
  *
  * A text field, a ranked result list, and — kept visually and behaviourally
  * separate — the ACTIONS the server proposed for the query. Navigation
- * results are links: pressing Enter on one goes somewhere. Actions are not:
- * an action needs a second, explicit confirm before the console calls the
- * ordinary route, and the row shows the exact CLI command it will run first.
+ * results go somewhere on Enter. Actions do not: Enter (or a click) on an
+ * action only ARMS it, opening a confirm row outside the list that shows the
+ * exact CLI command, and nothing runs until "Run it" is pressed.
  *
- * That split is the point. An omnibox that can start a daemon on Enter is a
+ * That split is the point. A menu that can start a daemon on Enter is a
  * loaded gun on the keyboard; one that can only ever propose, and shows its
  * CLI twin while proposing, is a faster way to do the thing you were going
  * to do anyway.
+ *
+ * It is a combobox (`ui/listbox.js`): focus stays in the field, the list is
+ * a listbox of options only (an option may hold no button), and
+ * `aria-activedescendant` follows the arrows. The empty and no-match words
+ * sit outside the listbox, in a status line. The whole menu is one native
+ * dialog (`ui/dialog.js`), so the page behind is inert and focus returns to
+ * whatever opened it.
  *
  * The index itself lives server-side and is built lazily (nothing is
  * indexed until the first query), so opening this overlay on a hundred-
@@ -18,8 +25,10 @@
  */
 
 import { api } from "./api.js";
-import { clear, el, emptyState, toast } from "./dom.js";
+import { el, emptyState, toast } from "./dom.js";
 import { ROUTES } from "./routes.js";
+import { openDialog } from "./ui/dialog.js";
+import { comboboxKey, wireCombobox } from "./ui/listbox.js";
 
 /** Debounce for keystroke → request. Short enough to feel live, long enough
  *  that a fast typist issues one request per word, not per letter. */
@@ -54,55 +63,122 @@ const ACTION_EXECUTORS = {
   procDrain: (id) => api.procDrain(id),
 };
 
+let menuCount = 0;
+
 /**
- * Mount the overlay. Returns `{ close }`; the caller (app.js) owns when it
+ * Open the menu. Returns `{ close }`; the caller (app.js) owns when it
  * opens, because ⌘K ownership is decided by the `keys.js` reducer.
  */
-export function openOmnibox(host, opts = {}) {
-  const onClose = opts.onClose ?? (() => {});
-  const backdrop = el("div", { class: "omni-backdrop", role: "presentation" });
+export function openOmnibox(opts = {}) {
+  const onClose = typeof opts.onClose === "function" ? opts.onClose : () => {};
+  menuCount += 1;
+  const prefix = `omni-${menuCount}`;
   const input = el("input", {
     class: "omni-input",
     type: "search",
     placeholder: "Search harnesses, sessions, wiki, runs… or type “start <harness>”",
-    "aria-label": "search the fleet",
+    "aria-label": "Search the fleet",
     autocomplete: "off",
     spellcheck: "false",
   });
-  const listNode = el("div", { class: "omni-list", role: "listbox" });
+  const listNode = el("div", { class: "omni-list", id: `${prefix}-list`, "aria-label": "Results" });
+  const status = el("div", { class: "omni-status", role: "status" });
+  const confirmRow = el("div", {
+    class: "omni-confirm-row",
+    role: "group",
+    "aria-label": "Confirm this action",
+    tabindex: "-1",
+    hidden: true,
+  });
   const hint = el("div", { class: "omni-hint muted" }, [
     el("span", { text: "Enter opens · actions ask first · Esc closes" }),
   ]);
-  const panel = el(
-    "div",
-    { class: "omni-panel", role: "dialog", "aria-modal": "true", "aria-label": "omnibox" },
-    [input, listNode, hint],
-  );
-  backdrop.appendChild(panel);
-  host.appendChild(backdrop);
+  const combo = wireCombobox(input, listNode);
 
   let rows = [];
-  let cursor = 0;
+  let cursor = -1;
+  let armed = null;
   let seq = 0;
   let timer = null;
-  let pendingConfirm = null;
 
-  const close = () => {
-    if (timer !== null) clearTimeout(timer);
-    backdrop.remove();
-    onClose();
+  const dialog = openDialog({
+    title: "Search the fleet",
+    titleHidden: true,
+    className: "omni-panel",
+    dataset: { keyOwned: "" },
+    dismissOnBackdrop: true,
+    initialFocus: input,
+    body: [input, listNode, status, confirmRow, hint],
+    onClose: () => {
+      if (timer !== null) clearTimeout(timer);
+      onClose();
+    },
+  });
+  const close = () => dialog.close();
+
+  const optionId = (index) => `${prefix}-opt-${index}`;
+
+  const showStatus = (node) => {
+    status.replaceChildren(...(node === null ? [] : [node]));
   };
 
-  backdrop.addEventListener("click", (event) => {
-    if (event.target === backdrop) close();
+  const disarm = () => {
+    armed = null;
+    confirmRow.hidden = true;
+    confirmRow.replaceChildren();
+  };
+
+  const arm = (index) => {
+    const row = rows[index];
+    if (row === undefined) return;
+    armed = index;
+    const runnable = canRunAction(row.route);
+    const run = el("button", {
+      class: "btn btn-danger",
+      type: "button",
+      text: "Run it",
+      disabled: !runnable,
+      onClick: () => runAction(row),
+    });
+    const cancel = el("button", {
+      class: "btn btn-ghost",
+      type: "button",
+      text: "Cancel",
+      onClick: () => {
+        disarm();
+        input.focus();
+      },
+    });
+    confirmRow.replaceChildren(
+      el("strong", { text: `${row.title}?` }),
+      row.cliTwin !== "" ? el("code", { class: "omni-twin mono", text: row.cliTwin }) : null,
+      runnable
+        ? null
+        : el("span", { class: "muted", text: `this build cannot run “${row.route}” from here` }),
+      run,
+      cancel,
+    );
+    confirmRow.hidden = false;
+    confirmRow.focus();
+  };
+
+  // Escape on the confirm row cancels the action, not the whole menu.
+  confirmRow.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    disarm();
+    input.focus();
   });
 
-  const draw = () => {
-    clear(listNode);
+  const paint = () => {
+    listNode.replaceChildren(...rows.map((row, i) => rowNode(row, i)));
+    combo.setExpanded(rows.length > 0);
+    combo.setActive(cursor >= 0 && cursor < rows.length ? optionId(cursor) : null);
     if (rows.length === 0) {
-      listNode.appendChild(
+      showStatus(
         input.value.trim() === ""
-          ? el("div", { class: "empty" }, [
+          ? el("div", null, [
               el("div", { class: "empty-msg", text: "Type to search the fleet" }),
               el("div", {
                 class: "empty-verb muted",
@@ -111,82 +187,59 @@ export function openOmnibox(host, opts = {}) {
             ])
           : emptyState(`Nothing matches “${input.value.trim()}”`, "crewhaus harness list"),
       );
+    } else showStatus(null);
+  };
+
+  const go = (index) => {
+    const row = rows[index];
+    if (row === undefined) return;
+    if (row.kind === "action") {
+      arm(index);
       return;
     }
-    rows.forEach((row, i) => listNode.appendChild(rowNode(row, i)));
+    close();
+    window.location.hash = row.href.startsWith("#") ? row.href.slice(1) : row.href;
   };
 
   const rowNode = (row, index) => {
     const selected = index === cursor;
     const chip = el("span", { class: "omni-kind", text: KIND_LABEL[row.kind] ?? row.kind });
-    if (row.kind === "action") {
-      const confirming = pendingConfirm === row.id;
-      const node = el(
-        "div",
-        {
-          class: `omni-row omni-action${selected ? " selected" : ""}`,
-          role: "option",
-          "aria-selected": selected ? "true" : "false",
-        },
-        [
-          chip,
-          el("span", { class: "omni-title", text: row.title }),
-          el("code", { class: "omni-twin mono", text: row.cliTwin }),
-          confirming
-            ? el("span", { class: "omni-confirm" }, [
-                el("button", {
-                  class: "btn btn-danger",
-                  type: "button",
-                  text: "Run it",
-                  onClick: () => runAction(row),
-                }),
-                el("button", {
-                  class: "btn btn-ghost",
-                  type: "button",
-                  text: "Cancel",
-                  onClick: () => {
-                    pendingConfirm = null;
-                    draw();
-                  },
-                }),
-              ])
-            : el("button", {
-                class: "btn",
-                type: "button",
-                text: "Confirm…",
-                onClick: () => {
-                  pendingConfirm = row.id;
-                  draw();
-                },
-              }),
-        ],
-      );
-      return node;
-    }
+    const children =
+      row.kind === "action"
+        ? [
+            chip,
+            el("span", { class: "omni-title", text: row.title }),
+            el("code", { class: "omni-twin mono", text: row.cliTwin }),
+          ]
+        : [
+            chip,
+            el("span", { class: "omni-title", text: row.title }),
+            el("span", { class: "omni-sub muted", text: row.subtitle }),
+          ];
     return el(
-      "a",
+      "div",
       {
-        class: `omni-row${selected ? " selected" : ""}`,
+        class: `omni-row${row.kind === "action" ? " omni-action" : ""}${selected ? " selected" : ""}`,
         role: "option",
+        id: optionId(index),
         "aria-selected": selected ? "true" : "false",
-        href: row.href,
-        onClick: () => close(),
+        onClick: () => {
+          cursor = index;
+          paint();
+          go(index);
+        },
       },
-      [
-        chip,
-        el("span", { class: "omni-title", text: row.title }),
-        el("span", { class: "omni-sub muted", text: row.subtitle }),
-      ],
+      children,
     );
   };
 
   const runAction = async (row) => {
     const executor = ACTION_EXECUTORS[row.route];
     if (executor === undefined) {
-      toast(`This build cannot run “${row.route}” from the omnibox`, "error");
+      toast(`This build cannot run “${row.route}” from the command menu`, "error");
       return;
     }
-    pendingConfirm = null;
+    disarm();
     try {
       const res = await executor(row.params?.id);
       // The process routes answer a typed refusal as a BODY; surface it.
@@ -206,7 +259,9 @@ export function openOmnibox(host, opts = {}) {
     const mine = ++seq;
     if (query === "") {
       rows = [];
-      draw();
+      cursor = -1;
+      disarm();
+      paint();
       return;
     }
     let payload = null;
@@ -215,7 +270,9 @@ export function openOmnibox(host, opts = {}) {
     } catch (err) {
       if (mine !== seq) return;
       rows = [];
-      clear(listNode).appendChild(
+      cursor = -1;
+      paint();
+      showStatus(
         emptyState(
           `Search failed: ${err instanceof Error ? err.message : String(err)}`,
           "crewhaus harness list",
@@ -225,9 +282,9 @@ export function openOmnibox(host, opts = {}) {
     }
     if (mine !== seq) return; // a newer keystroke already answered
     rows = omniRows(payload);
-    cursor = 0;
-    pendingConfirm = null;
-    draw();
+    cursor = rows.length > 0 ? 0 : -1;
+    disarm();
+    paint();
   };
 
   input.addEventListener("input", () => {
@@ -236,35 +293,37 @@ export function openOmnibox(host, opts = {}) {
   });
 
   input.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowDown" || (event.key === "n" && event.ctrlKey)) {
-      event.preventDefault();
-      cursor = rows.length === 0 ? 0 : Math.min(cursor + 1, rows.length - 1);
-      draw();
+    const key =
+      event.ctrlKey && event.key === "n"
+        ? "ArrowDown"
+        : event.ctrlKey && event.key === "p"
+          ? "ArrowUp"
+          : event.key;
+    if (!["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(key)) return;
+    if (key === "Escape" && armed === null) return; // the menu itself closes
+    const result = comboboxKey(
+      { count: rows.length, cursor, kinds: rows.map((r) => r.kind), armed },
+      key,
+    );
+    if (result.effect === null) return;
+    event.preventDefault();
+    if (result.effect === "disarm") {
+      event.stopPropagation();
+      disarm();
       return;
     }
-    if (event.key === "ArrowUp" || (event.key === "p" && event.ctrlKey)) {
-      event.preventDefault();
-      cursor = Math.max(cursor - 1, 0);
-      draw();
+    cursor = result.state.cursor;
+    if (result.effect === "move") {
+      disarm();
+      paint();
+      document.getElementById(optionId(cursor))?.scrollIntoView({ block: "nearest" });
       return;
     }
-    if (event.key === "Enter") {
-      const row = rows[cursor];
-      if (row === undefined) return;
-      event.preventDefault();
-      // Enter NEVER runs an action: it asks. Navigation rows go.
-      if (row.kind === "action") {
-        pendingConfirm = row.id;
-        draw();
-        return;
-      }
-      window.location.hash = row.href.startsWith("#") ? row.href.slice(1) : row.href;
-      close();
-    }
+    // Enter NEVER runs an action: it asks. Navigation rows go.
+    go(result.index);
   });
 
-  input.focus();
-  draw();
+  paint();
   return { close };
 }
 

@@ -1032,35 +1032,47 @@ export const APPROVAL_KEYS = { g: "grant", d: "deny" };
 /** Review-queue action keys — the verdicts the server accepts. */
 export const REVIEW_KEYS = { u: "up", d: "down", p: "pass", f: "fail" };
 
-/** The bindings help sheet, rendered by `?`. */
+/** The bindings help sheet, rendered by `?`. A letter only chooses; Enter
+ *  confirms. */
 export function keyHelp(actionKeys) {
   const keys = actionKeys && typeof actionKeys === "object" ? actionKeys : {};
   return [
     { key: "j / ↓", does: "next row" },
     { key: "k / ↑", does: "previous row" },
-    ...Object.entries(keys).map(([key, action]) => ({ key, does: action })),
+    ...Object.entries(keys).map(([key, action]) => ({ key, does: `choose ${action}, then Enter` })),
+    { key: "Enter", does: "confirm the choice, or open the row" },
     { key: ".", does: "row menu" },
     { key: "?", does: "this list" },
-    { key: "esc", does: "close menus" },
+    { key: "esc", does: "cancel the choice, close menus" },
   ];
 }
 
-/** Navigation keys the triage reducer owns (everything else falls through
- *  to the browser — an inbox must not swallow ⌘F). */
-const TRIAGE_NAV_KEYS = new Set(["j", "k", "ArrowDown", "ArrowUp", ".", "?", "Escape"]);
+/** Keys the triage reducer owns (everything else falls through to the
+ *  browser — an inbox must not swallow ⌘F). */
+const TRIAGE_NAV_KEYS = new Set(["j", "k", "ArrowDown", "ArrowUp", ".", "?", "Escape", "Enter"]);
 
-/** True when the reducer would act on this key — the view's "should I
- *  preventDefault?" test, kept here so it cannot drift from the reducer. */
-export function isTriageKey(key, actionKeys = APPROVAL_KEYS) {
+/**
+ * True when the reducer would act on this key — the view's "should I
+ * preventDefault?" test, kept here so it cannot drift from the reducer.
+ * With `singleKeys` false (Readability), no character key is the inbox's:
+ * the arrows, Enter, Escape and the row's own buttons still work.
+ */
+export function isTriageKey(key, actionKeys = APPROVAL_KEYS, singleKeys = true) {
+  if (singleKeys === false && typeof key === "string" && [...key].length === 1) return false;
   if (TRIAGE_NAV_KEYS.has(key)) return true;
   const map = actionKeys && typeof actionKeys === "object" ? actionKeys : {};
   return Object.prototype.hasOwnProperty.call(map, key);
 }
 
 /**
- * The triage keyboard reducer. Pure: `(state, key) → { state, effect }`,
- * where `effect` is the action a row asked for (the view performs it). Both
- * inboxes share it; only the action-key map differs.
+ * The triage keyboard reducer. Pure: `(state, key) → { state, effect,
+ * follow }`. Both inboxes share it; only the action-key map differs.
+ *
+ * A verdict takes TWO keys. A letter (`g`, `d`, …) only ARMS it — the state
+ * says `armed: { action, index }` and the view asks "Grant Bash? Enter
+ * confirms, Esc cancels." — and Enter returns the `effect` the view
+ * performs. Escape, moving, or opening the menu disarms. Enter with nothing
+ * armed is no decision at all: it returns `follow`, the row the view opens.
  */
 export function triageKey(state, key, actionKeys = APPROVAL_KEYS) {
   const s = {
@@ -1068,28 +1080,40 @@ export function triageKey(state, key, actionKeys = APPROVAL_KEYS) {
     count: 0,
     menuOpen: false,
     helpOpen: false,
+    armed: null,
     ...(state && typeof state === "object" ? state : {}),
   };
   const clamp = (i) => (s.count <= 0 ? 0 : Math.min(Math.max(i, 0), s.count - 1));
-  const next = (patch) => ({ state: { ...s, ...patch }, effect: null });
+  const next = (patch) => ({ state: { ...s, ...patch }, effect: null, follow: null });
   switch (key) {
     case "j":
     case "ArrowDown":
-      return next({ index: clamp(s.index + 1), menuOpen: false });
+      return next({ index: clamp(s.index + 1), menuOpen: false, armed: null });
     case "k":
     case "ArrowUp":
-      return next({ index: clamp(s.index - 1), menuOpen: false });
+      return next({ index: clamp(s.index - 1), menuOpen: false, armed: null });
     case ".":
-      return next({ menuOpen: !s.menuOpen });
+      return next({ menuOpen: !s.menuOpen, armed: null });
     case "?":
       return next({ helpOpen: !s.helpOpen });
     case "Escape":
-      return next({ menuOpen: false, helpOpen: false });
+      return next({ menuOpen: false, helpOpen: false, armed: null });
+    case "Enter": {
+      if (s.count <= 0) return { state: s, effect: null, follow: null };
+      if (s.armed !== null && typeof s.armed === "object") {
+        return {
+          state: { ...s, armed: null, menuOpen: false },
+          effect: { action: s.armed.action, index: clamp(s.armed.index) },
+          follow: null,
+        };
+      }
+      return { state: s, effect: null, follow: clamp(s.index) };
+    }
     default: {
       const map = actionKeys && typeof actionKeys === "object" ? actionKeys : {};
-      const action = map[key];
-      if (action === undefined || s.count <= 0) return { state: s, effect: null };
-      return { state: { ...s, menuOpen: false }, effect: { action, index: clamp(s.index) } };
+      const action = Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+      if (action === undefined || s.count <= 0) return { state: s, effect: null, follow: null };
+      return next({ menuOpen: false, armed: { action, index: clamp(s.index) } });
     }
   }
 }

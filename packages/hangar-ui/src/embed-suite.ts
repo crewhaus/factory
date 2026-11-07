@@ -289,6 +289,47 @@ describe("js module hygiene", () => {
     expect(orphans).toEqual([]);
   });
 
+  /** The modules whose body contains `needle`, sorted. */
+  const holders = (needle: string | RegExp): string[] =>
+    jsEntries
+      .filter(([, entry]) =>
+        typeof needle === "string" ? entry.body.includes(needle) : needle.test(entry.body),
+      )
+      .map(([key]) => key)
+      .sort();
+
+  test("every overlay is the one dialog primitive: no second modal can come back", () => {
+    // The scan must have something to scan, or every "nowhere" below holds.
+    expect(jsEntries.length).toBeGreaterThanOrEqual(60);
+    expect(holders(/el\(\s*"dialog"/)).toEqual(["/assets/js/ui/dialog.js"]);
+    expect(holders('role: "dialog"')).toEqual([]);
+    expect(holders("modal-backdrop")).toEqual([]);
+    expect(holders(".showModal(")).toEqual(["/assets/js/ui/dialog.js"]);
+  });
+
+  test("one assertive region, in the live-region module, and no other alert", () => {
+    expect(holders('role: "alert"')).toEqual(["/assets/js/ui/live.js"]);
+    expect(holders('"aria-live": "assertive"')).toEqual(["/assets/js/ui/live.js"]);
+  });
+
+  test("the only key listener on the document is the app's: inbox keys belong to their list", () => {
+    expect(holders('document.addEventListener("keydown"')).toEqual(["/assets/js/app.js"]);
+    expect(holders(/(window|globalThis)\.addEventListener\("keydown"/)).toEqual([]);
+  });
+
+  test("no module passes a style string, which a strict style policy would block", () => {
+    const strings = holders(/style:\s*["'`]/);
+    expect(strings).toEqual([]);
+    // …and the components do set styles, through objects, so the scan can see them.
+    expect(holders(/style: shapeAccentVars\(/).length).toBeGreaterThanOrEqual(3);
+  });
+
+  test("no interaction needs dragging (WCAG 2.5.7): nothing can be dragged at all", () => {
+    expect(holders("draggable")).toEqual([]);
+    expect(holders("dragstart")).toEqual([]);
+    expect(holders("pointerdown")).toEqual([]);
+  });
+
   test("browser modules never import bun/node builtins", () => {
     for (const [key, entry] of jsEntries) {
       expect(`${key}:${/from\s+["'](?:bun|node:)/.test(entry.body)}`).toBe(`${key}:false`);

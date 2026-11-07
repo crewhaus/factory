@@ -21,7 +21,7 @@
 import { api, streamRunEvents } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, jsonPre, skeleton, toast } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { shapeAccent, shapeLabel } from "../shapes.js";
+import { shapeAccentVars, shapeLabel } from "../shapes.js";
 import {
   failureBoard,
   ledgerExit,
@@ -29,7 +29,9 @@ import {
   runHud,
   runLedgerRow,
   sseFrameToFeed,
+  uptimeLabel,
 } from "../supervision.js";
+import { timeEl } from "../ui/time.js";
 import { dirTail, fmtUsd, normalizeRows } from "../util.js";
 import { actionTwin } from "./control.js";
 import { renderJobs } from "./jobs.js";
@@ -288,7 +290,8 @@ function boardRow(feedRow, proc, nowMs, reload) {
       el("div", { class: "name-line" }, [
         el("span", {
           class: "shape-badge",
-          style: { "--accent": shapeAccent(feedRow.target) },
+          "data-shape-accent": "",
+          style: shapeAccentVars(feedRow.target),
           text: shapeLabel(feedRow.target),
         }),
         el("a", { class: "name-link", href: hrefHarness(feedRow.id, "runs"), text: name }),
@@ -308,7 +311,14 @@ function boardRow(feedRow, proc, nowMs, reload) {
       row.draining ? el("span", { class: "chip chip-warn", text: "draining" }) : null,
     ]),
     el("td", { class: "num", text: row.pid === null ? "—" : String(row.pid) }),
-    el("td", { class: "num", text: cold ? "…" : row.uptime }),
+    // A running process's uptime keeps counting, from the shared ticker.
+    el("td", { class: "num" }, [
+      cold
+        ? "…"
+        : typeof proc?.startedAt === "string" && row.uptime !== "—"
+          ? timeEl(proc.startedAt, { format: (iso, nowMs) => uptimeLabel(iso, nowMs) })
+          : row.uptime,
+    ]),
     el("td", { class: "num" }, [
       el("span", { text: String(row.restartsInWindow) }),
       row.restart !== null ? el("div", { class: "chip chip-warn", text: row.restart.label }) : null,

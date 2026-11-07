@@ -27,6 +27,15 @@ import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
 import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
 import {
+  applyPrefs,
+  applyTheme,
+  readPrefs,
+  readTheme,
+  requestFocus,
+  writePrefs,
+  writeTheme,
+} from "./prefs.js";
+import {
   hrefGlobal,
   hrefHarness,
   hrefLibrary,
@@ -34,8 +43,11 @@ import {
   startRouter,
   tabAvailability,
 } from "./router.js";
-import { shapeAccent, shapeLabel } from "./shapes.js";
+import { shapeAccentVars, shapeLabel } from "./shapes.js";
 import { procRow } from "./supervision.js";
+import { openDialog } from "./ui/dialog.js";
+import { installLive } from "./ui/live.js";
+import { dismissTooltip, installTooltips } from "./ui/tooltip.js";
 import { renderActivity } from "./views/activity.js";
 import { renderAdvisor, renderAdvisorBoard } from "./views/advisor.js";
 import { renderApprovals } from "./views/approvals.js";
@@ -67,7 +79,6 @@ import { renderSpec } from "./views/spec.js";
 import { renderThredz, renderThredzGlobal } from "./views/thredz.js";
 import { renderTokenScreen } from "./views/token.js";
 
-const THEME_KEY = "hangar.theme";
 const TAB_LABELS = {
   overview: "Overview",
   advisor: "Advisor",
@@ -109,6 +120,7 @@ let viewRoot = null;
 let footRoot = null;
 let navRoot = null;
 let bannerRoot = null;
+let firstRunRoot = null;
 let dispatchSeq = 0;
 let navCounts = {};
 // M4 (HM-190): overlay ownership. `inboxMounted` is set per navigation so
@@ -116,7 +128,7 @@ let navCounts = {};
 // the app's sheet everywhere else.
 let keyState = initialKeyState();
 let omnibox = null;
-let sheetNode = null;
+let sheet = null;
 let notificationsStarted = false;
 
 /** Move a `#t=<token>` fragment into sessionStorage and off the URL. */
@@ -133,28 +145,80 @@ function bootstrapToken() {
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/`);
 }
 
-function applyTheme(theme) {
-  document.documentElement.dataset.theme = theme === "light" ? "light" : "dark";
-}
-
+/** Theme and Readability go on the root before the first paint, so nothing
+ *  draws once in the wrong size or colours. The record lives in prefs.js,
+ *  where the Settings screen can reach it too. */
 function initTheme() {
-  let stored = null;
-  try {
-    stored = localStorage.getItem(THEME_KEY);
-  } catch {
-    // storage unavailable — default applies
-  }
-  applyTheme(stored === "light" ? "light" : "dark");
+  applyTheme(document.documentElement, readTheme());
+  applyPrefs(document.documentElement, readPrefs());
 }
 
 function toggleTheme() {
   const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-  applyTheme(next);
-  try {
-    localStorage.setItem(THEME_KEY, next);
-  } catch {
-    // fine — the toggle just won't persist
-  }
+  applyTheme(document.documentElement, writeTheme(next));
+}
+
+/**
+ * The skip link: the first stop on every page. This is a hash router, so
+ * `href="#view"` would navigate to "Nothing at this address"; it moves focus
+ * to the main region instead and leaves the address alone.
+ */
+function skipLink() {
+  return el("a", {
+    class: "skip-link",
+    href: "#view",
+    text: "Skip to content",
+    onClick: (event) => {
+      event.preventDefault();
+      if (viewRoot !== null) viewRoot.focus();
+    },
+  });
+}
+
+/**
+ * The first-run card, asked once per device: an offer to adjust Readability,
+ * with no question about why anyone might want to. Either answer puts it
+ * away for good.
+ */
+function mountFirstRun(slot) {
+  clear(slot);
+  if (readPrefs().firstRunDone) return;
+  const answer = () => {
+    writePrefs({ firstRunDone: true });
+    clear(slot);
+  };
+  const adjust = el("button", {
+    class: "btn btn-primary",
+    type: "button",
+    text: "Adjust",
+    onClick: () => {
+      answer();
+      const first = document.querySelector("#readability input:checked");
+      if (parseRoute(window.location.hash).view === "settings" && first instanceof HTMLElement) {
+        first.focus();
+      } else {
+        // Settings takes the request once it has drawn the card.
+        requestFocus("readability");
+        window.location.hash = hrefGlobal("settings");
+      }
+    },
+  });
+  const later = el("button", {
+    class: "btn btn-ghost",
+    type: "button",
+    text: "Not now",
+    onClick: () => {
+      answer();
+      if (viewRoot !== null) viewRoot.focus();
+    },
+  });
+  slot.appendChild(
+    el("section", { class: "card firstrun", "aria-label": "Readability" }, [
+      el("p", { text: "Make this easier to read: text size, motion and contrast." }),
+      adjust,
+      later,
+    ]),
+  );
 }
 
 function renderShell(appRoot) {
@@ -189,14 +253,19 @@ function renderShell(appRoot) {
     themeBtn,
   ]);
   bannerRoot = el("div", { class: "banner-slot", id: "banners" });
-  viewRoot = el("main", { class: "view", id: "view" });
+  // Its own slot: the read-only banner clears `bannerRoot` when it loads.
+  firstRunRoot = el("div", { class: "firstrun-slot", id: "first-run" });
+  viewRoot = el("main", { class: "view", id: "view", tabindex: "-1" });
   footRoot = el("footer", { class: "app-foot", id: "foot" }, [
     el("span", { class: "muted", text: "every action shows the CLI command it runs" }),
   ]);
+  appRoot.appendChild(skipLink());
   appRoot.appendChild(header);
   appRoot.appendChild(bannerRoot);
+  appRoot.appendChild(firstRunRoot);
   appRoot.appendChild(viewRoot);
   appRoot.appendChild(footRoot);
+  mountFirstRun(firstRunRoot);
   drawNav(parseRoute(window.location.hash));
   loadVersion();
   loadNavCounts();
@@ -524,21 +593,25 @@ function harnessHeader(detail, route, ctx) {
   const target = targetOf(detail);
   const dir = String(entry.dir ?? "");
   const missing = detail.missing === true || typeof entry.missingSince === "string";
-  const head = el("div", { class: "h-head", style: { "--accent": shapeAccent(target) } }, [
-    el("div", { class: "h-title" }, [
-      el("span", { class: "shape-badge", text: shapeLabel(target) }),
-      el("h2", { text: name }),
-      missing ? dot("bad", "directory missing") : null,
-    ]),
-    dir !== ""
-      ? el("div", { class: "h-dir" }, [
-          el("span", { class: "mono muted", title: dir, text: dir }),
-          copyBtn(dir, "copy"),
-        ])
-      : null,
-    badgeStrip(detail.badges),
-    supervisionStrip(ctx),
-  ]);
+  const head = el(
+    "div",
+    { class: "h-head", "data-shape-accent": "", style: shapeAccentVars(target) },
+    [
+      el("div", { class: "h-title" }, [
+        el("span", { class: "shape-badge", text: shapeLabel(target) }),
+        el("h2", { text: name }),
+        missing ? dot("bad", "directory missing") : null,
+      ]),
+      dir !== ""
+        ? el("div", { class: "h-dir" }, [
+            el("span", { class: "mono muted", title: dir, text: dir }),
+            copyBtn(dir, "copy"),
+          ])
+        : null,
+      badgeStrip(detail.badges),
+      supervisionStrip(ctx),
+    ],
+  );
   return head;
 }
 
@@ -640,14 +713,25 @@ function renderError(root, err) {
 /**
  * HM-190 — the app-level keyboard layer.
  *
- * One listener, one pure reducer (`keys.js`). It claims ⌘K, Escape and — on
- * screens with no inbox — `?`, and it claims NOTHING else, so the inbox
- * triage reducer that shipped with M2 keeps receiving j/k/g/d untouched on
- * the two screens that mount it.
+ * One listener, one pure reducer (`keys.js`). It claims ⌘K, `/`, Escape and —
+ * outside an inbox list — `?`, and it claims NOTHING else, so an inbox list
+ * keeps its own keys while it has focus. Two facts are read here, per key,
+ * because only the document knows them: whether a dialog the reducer does
+ * not own is open (then no shortcut may stack a second overlay on it), and
+ * whether single-key shortcuts are on (Readability).
+ *
+ * Escape closes an open tooltip first and claims nothing else, so a tooltip
+ * inside a dialog never takes the dialog with it.
  */
 function installKeyboard() {
   document.addEventListener("keydown", (event) => {
-    const { state, effect, claimed } = globalKey(keyState, keyShape(event));
+    if (event.key === "Escape" && dismissTooltip()) {
+      event.preventDefault();
+      return;
+    }
+    const dialogOpen = document.querySelector("dialog[open]:not([data-key-owned])") !== null;
+    keyState = { ...keyState, singleKeys: readPrefs().singleKeys };
+    const { state, effect, claimed } = globalKey(keyState, { ...keyShape(event), dialogOpen });
     keyState = state;
     if (claimed) event.preventDefault();
     if (effect === "open-omnibox") openOverlay();
@@ -661,7 +745,7 @@ function openOverlay() {
   if (omnibox !== null) return;
   keyState = { ...keyState, omniboxOpen: true, sheetOpen: false };
   drawSheet();
-  omnibox = openOmnibox(document.body, {
+  omnibox = openOmnibox({
     onClose: () => {
       omnibox = null;
       keyState = { ...keyState, omniboxOpen: false };
@@ -671,58 +755,74 @@ function openOverlay() {
 
 function closeOverlay() {
   if (omnibox === null) return;
-  omnibox.close();
+  const open = omnibox;
   omnibox = null;
+  open.close();
 }
 
 /** The `?` bindings overlay. Rendered from `bindingSheet()` so the list and
- *  the reducer can never disagree about what a key does. */
+ *  the reducer can never disagree about what a key does. It follows
+ *  `keyState.sheetOpen`: open when it says open, closed when it does not. A
+ *  sheet closed by its own Escape or backdrop tells the state through
+ *  `onClose`, the way the command menu does. */
 function drawSheet() {
-  if (sheetNode !== null) {
-    sheetNode.remove();
-    sheetNode = null;
-  }
-  if (!keyState.sheetOpen) return;
-  sheetNode = el(
-    "div",
-    {
-      class: "sheet-backdrop",
-      role: "dialog",
-      "aria-modal": "true",
-      "aria-label": "keyboard bindings",
-    },
-    [
-      el("div", { class: "card sheet" }, [
-        el("h3", { class: "card-title", text: "Keyboard" }),
-        ...bindingSheet(keyState.inboxMounted).flatMap((group) => [
-          el("h4", { class: "sheet-section", text: group.section }),
-          el(
-            "ul",
-            { class: "check-list" },
-            group.bindings.map((b) =>
-              el("li", null, [
-                el("kbd", { class: "mono", text: b.keys }),
-                el("span", { text: ` — ${b.does}` }),
-              ]),
-            ),
-          ),
-        ]),
-        el("p", { class: "muted small", text: "Esc closes." }),
-      ]),
-    ],
-  );
-  sheetNode.addEventListener("click", (event) => {
-    if (event.target === sheetNode) {
-      keyState = { ...keyState, sheetOpen: false };
-      drawSheet();
+  if (!keyState.sheetOpen) {
+    if (sheet !== null) {
+      const open = sheet;
+      sheet = null;
+      open.close();
     }
+    return;
+  }
+  if (sheet !== null) return;
+  sheet = openDialog({
+    title: "Keyboard",
+    className: "modal card sheet",
+    dataset: { keyOwned: "" },
+    dismissOnBackdrop: true,
+    initialFocus: "heading",
+    body: [
+      ...bindingSheet(keyState.inboxMounted).flatMap((group) => [
+        el("h3", { class: "sheet-section", text: group.section }),
+        el(
+          "ul",
+          { class: "check-list" },
+          group.bindings.map((b) =>
+            el("li", null, [
+              el("kbd", { class: "mono", text: b.keys }),
+              el("span", { text: ` — ${b.does}` }),
+            ]),
+          ),
+        ),
+      ]),
+      el("p", {
+        class: "muted small",
+        text: "Inbox keys work while the list has focus. Single-key shortcuts can be turned off in Settings.",
+      }),
+    ],
+    actions: [
+      el("button", {
+        class: "btn btn-ghost",
+        type: "button",
+        text: "Close",
+        onClick: () => {
+          keyState = { ...keyState, sheetOpen: false };
+          drawSheet();
+        },
+      }),
+    ],
+    onClose: () => {
+      sheet = null;
+      keyState = { ...keyState, sheetOpen: false };
+    },
   });
-  document.body.appendChild(sheetNode);
 }
 
 function boot() {
   bootstrapToken();
   initTheme();
+  installLive();
+  installTooltips();
   const appRoot = document.getElementById("app");
   renderShell(appRoot);
   onUnauthorized(() => {

@@ -6,11 +6,15 @@
  * strings computed by pure helpers.
  *
  * Only function BODIES touch `document`; importing the module outside a
- * browser is safe (the test suite imports it to assert exports).
+ * browser is safe (the test suite imports it to assert exports). That is
+ * also what makes the import cycle with `ui/live.js` and `ui/time.js` safe:
+ * they import `el` from here, and neither side builds a node or registers a
+ * listener at import time.
  */
 
 import { parseMarkdown } from "./markdown.js";
-import { fmtRelativeTime } from "./util.js";
+import { announce, liveHost, politenessFor } from "./ui/live.js";
+import { timeEl } from "./ui/time.js";
 
 const SVGNS = "http://www.w3.org/2000/svg";
 
@@ -96,6 +100,32 @@ export function dot(state, label) {
 }
 
 /**
+ * A state as a word in a badge, with its mark beside it: "Selected",
+ * "Armed", a severity. The word is the message; the mark only repeats it.
+ * state: "ok" | "warn" | "bad" | "info" | "off"
+ */
+export function statusBadge(state, word) {
+  const tone = ["ok", "warn", "bad", "info"].includes(state) ? state : "off";
+  return el("span", { class: `status-badge status-badge-${tone}` }, [
+    el("span", { class: "dot", "aria-hidden": "true" }),
+    el("span", { text: String(word ?? "") }),
+  ]);
+}
+
+/**
+ * A container that scrolls sideways (a wide table) and can be reached and
+ * scrolled from the keyboard: a named region in the Tab order. The page
+ * itself never scrolls sideways; the region does.
+ */
+export function scrollRegion(label, child) {
+  return el(
+    "div",
+    { class: "table-scroll", tabindex: "0", role: "region", "aria-label": String(label) },
+    child,
+  );
+}
+
+/**
  * Standard empty state. "Absence is not an error": a 404/empty payload
  * renders as "nothing yet" and names the CLI verb that creates the data.
  */
@@ -115,30 +145,59 @@ export function skeleton(lines = 3) {
   return wrap;
 }
 
-/** "as of 3m ago" chip for cached figures (honest-latency invariant). */
+/** "as of 3m ago" chip for cached figures (honest-latency invariant). The
+ *  time inside is a `<time datetime>` the shared ticker keeps current. */
 export function asOf(cachedAtIso) {
-  if (!cachedAtIso) return null;
-  return el("span", {
-    class: "asof",
-    title: cachedAtIso,
-    text: `as of ${fmtRelativeTime(cachedAtIso, Date.now())}`,
-  });
+  if (typeof cachedAtIso !== "string" || cachedAtIso === "") return null;
+  return el("span", { class: "asof" }, ["as of ", timeEl(cachedAtIso)]);
 }
+
+/** How long an information toast stays, unless it is being read. */
+const INFO_TOAST_MS = 6000;
 
 /**
  * Error/notice toast — the "no write ever fails silently" affordance. One
- * toast at a time (a newer message replaces the older); auto-dismisses, and
- * `role="alert"` makes screen readers announce it.
+ * toast at a time (a newer message replaces the older).
+ *
+ * The words are SPOKEN through the live regions: information politely,
+ * errors assertively (`ui/live.js`). The box itself is not a live region, so
+ * nothing is read twice. An error stays until it is dismissed; information
+ * leaves after a few seconds, and holds while the pointer is over it or it
+ * has focus. Both have a close button.
  */
 export function toast(message, kind = "error") {
   for (const old of document.querySelectorAll(".toast")) old.remove();
-  const node = el("div", {
-    class: `toast toast-${kind === "error" ? "error" : "info"}`,
-    role: "alert",
-    text: message,
+  const isError = kind === "error";
+  const close = el("button", {
+    class: "btn btn-ghost toast-close",
+    type: "button",
+    "aria-label": "Dismiss this message",
+    text: "×",
   });
-  document.body.appendChild(node);
-  setTimeout(() => node.remove(), 6000);
+  const node = el("div", { class: `toast toast-${isError ? "error" : "info"}` }, [
+    el("span", { class: "toast-text", text: String(message ?? "") }),
+    close,
+  ]);
+  close.addEventListener("click", () => node.remove());
+  liveHost().appendChild(node);
+  announce(String(message ?? ""), {
+    assertive: politenessFor(isError ? "error" : "info") === "assertive",
+  });
+  if (!isError) {
+    let timer = null;
+    const arm = () => {
+      if (timer === null) timer = setTimeout(() => node.remove(), INFO_TOAST_MS);
+    };
+    const hold = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    node.addEventListener("mouseenter", hold);
+    node.addEventListener("mouseleave", arm);
+    node.addEventListener("focusin", hold);
+    node.addEventListener("focusout", arm);
+    arm();
+  }
   return node;
 }
 
@@ -205,29 +264,29 @@ export function copyBtn(value, label = "copy") {
 }
 
 /**
- * Attach a rich hover tooltip. The text rides a `data-tip` attribute the
- * stylesheet renders via `attr()` — always text, never markup, so the
- * injection ban holds — with the native `title` kept as the fallback for
- * assistive tech and anything that never hovers. Returns the node.
+ * Attach a tooltip. The text rides a `data-tip` attribute; the one tooltip
+ * element (`ui/tooltip.js`) shows it on hover AND on focus, describes the
+ * control with it while open, and closes on Escape. It is always text,
+ * never markup, so the injection ban holds. Put it on something that takes
+ * focus — a button, a link, a field — or a keyboard never reaches it.
+ * Returns the node.
  */
 export function withTip(node, tipText) {
   const value = String(tipText ?? "");
   if (value === "") return node;
-  node.classList.add("has-tip");
   node.dataset.tip = value;
-  if (!node.getAttribute("title")) node.setAttribute("title", value);
   return node;
 }
 
-/** A small "?" affordance carrying only its tooltip — guidance on rows where
- *  a whole sentence inline would drown the content. Keyboard-focusable, so
- *  the tip is reachable without a pointer. */
+/** A small "?" button carrying only its tooltip — guidance on rows where a
+ *  whole sentence inline would drown the content. A button, so the tip is
+ *  reachable by keyboard; a 24px target around a small mark. */
 export function tipIcon(tipText) {
   return withTip(
-    el("span", {
+    el("button", {
       class: "tip-icon",
-      tabindex: "0",
-      "aria-label": String(tipText ?? ""),
+      type: "button",
+      "aria-label": "What this means",
       text: "?",
     }),
     tipText,
@@ -244,7 +303,7 @@ export function collapsible(summaryChildren, bodyChildren, open = false) {
 
 /** Line-numbered read-only code view (one div per line, all textContent). */
 export function numberedCode(source, label = "code") {
-  const wrap = el("div", { class: "codeview", role: "region", "aria-label": label });
+  const wrap = el("div", { class: "codeview", role: "region", "aria-label": label, tabindex: "0" });
   const lines = String(source ?? "").split("\n");
   for (let i = 0; i < lines.length; i += 1) {
     wrap.appendChild(
@@ -265,7 +324,9 @@ export function jsonPre(value) {
   } catch {
     body = String(value);
   }
-  return el("pre", { class: "rawjson", text: body });
+  // In the Tab order: a long line scrolls sideways, and a keyboard has to
+  // be able to reach what is past the edge.
+  return el("pre", { class: "rawjson", tabindex: "0", text: body });
 }
 
 /** Render parsed markdown tokens (see markdown.js) into a container div. */
@@ -286,7 +347,9 @@ export function mdBlocks(source) {
         ),
       );
     } else if (block.type === "code") {
-      wrap.appendChild(el("pre", { class: "mdcode" }, [el("code", { text: block.text })]));
+      wrap.appendChild(
+        el("pre", { class: "mdcode", tabindex: "0" }, [el("code", { text: block.text })]),
+      );
     }
   }
   return wrap;
