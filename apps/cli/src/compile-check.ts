@@ -189,6 +189,16 @@ export const BOOT_GATE_PATTERNS: ReadonlyArray<{
     gate: "MCP server credentials",
     needs: "the MCP server credentials the spec declares",
   },
+  // Tool config env refs: a `$VAR` in a `tool_config` or `chains` block is read
+  // when the bundle starts (@crewhaus/tool-categories). A daemon shape stops on
+  // an unset one with exit 2 and one line naming it; the other shapes stop with
+  // the registration's BuiltinToolError, which carries the same sentence (exit 1).
+  // The check boots credential-free by design, so this is a credential gate.
+  {
+    pattern: /reads \$\S+, but \S+ is not set/,
+    gate: "tool config env refs",
+    needs: "the env vars the spec's tool_config and chains blocks read",
+  },
   // crew daemon reads its kickoff input from stdin.
   { pattern: /no input on stdin/, gate: "stdin input", needs: "input on stdin" },
   // voice daemon's v0 headless smoke path.

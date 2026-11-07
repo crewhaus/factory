@@ -16,10 +16,12 @@
  * what was found: the roots the runtime protects in a run without the block,
  * every tool that checks its own writes against them, every WebFetch header
  * line 0.7.x did not print, every block the edge says it does not run
- * besides `provability:` itself, and every kind of spelling FactCrossCheck
- * no longer reads the way 0.7.x did. A change reverted or scoped to the
- * block stops being found, and a new root, tool, header line, edge warning
- * or verdict that moved fails until the notes name it. Each scan also
+ * besides `provability:` itself, every kind of spelling FactCrossCheck
+ * no longer reads the way 0.7.x did, and every shape whose daemon stops on an
+ * unset tool-config variable with an exit code of its own, with that code. A
+ * change reverted or scoped to the block stops being found, and a new root,
+ * tool, header line, edge warning, verdict that moved or stopping shape fails
+ * until the notes name it. Each scan also
  * asserts it found something, so a scan that silently matches nothing fails
  * too.
  *
@@ -38,6 +40,11 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
+import {
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  resolveBuiltinTools,
+} from "../packages/tool-categories/src/index";
 import { factCrossCheck } from "../packages/tool-verify/src/index";
 
 const ROOT = dirname(import.meta.dir);
@@ -587,6 +594,31 @@ describe("the release notes name every change a harness without provability: see
       .filter((p) => p !== "provability")
       .filter((p) => !edge.some((b) => b.includes(`\`${p}:\``)));
     expect(unnamed).toEqual([]);
+  });
+
+  test("an unset tool-config variable: every daemon shape that stops on it is named, with the exit code", () => {
+    // A block reading a variable, on every shape that registers tools at its
+    // own boot. A shape whose inits hold a check of the variable exits with
+    // that check's code, where it exited 1 before recompiling.
+    const reads = [
+      { tools: ["httpRequest"], toolConfigs: { http: { allowed_origins: ["$ORIGIN"] } } },
+    ];
+    const hostShapes = Object.keys(SHAPE_TOOL_PROFILES).filter(
+      (shape) => SHAPE_TOOL_PROFILES[shape as ToolShape].runtime === "host",
+    );
+    const found = hostShapes.flatMap((shape) => {
+      const line = resolveBuiltinTools(shape as ToolShape, reads).inits.find((init) =>
+        init.startsWith('if (!process.env["ORIGIN"])'),
+      );
+      if (line === undefined) return [];
+      return [{ shape, exit: line.match(/process\.exit\((\d+)\); \}$/)?.[1] }];
+    });
+    expect(found.length).toBeGreaterThan(0);
+    // Named in a later list, since 0.8.0 did not ship it.
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullet = later.find((b) => b.includes("`tool_config`") && b.includes("`chains`")) ?? "";
+    expect(found.filter(({ shape }) => !bullet.includes(`\`${shape}\``))).toEqual([]);
+    expect(found.filter(({ exit }) => !bullet.includes(`exits ${exit} `))).toEqual([]);
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {
