@@ -185,13 +185,13 @@
       "color-contrast": 27
     },
     "#/h/:id/inspect|dark|320": {
-      "color-contrast": 27
+      "color-contrast": 25
     },
     "#/h/:id/inspect|light|1280": {
       "color-contrast": 29
     },
     "#/h/:id/inspect|light|320": {
-      "color-contrast": 29
+      "color-contrast": 27
     },
     "#/h/:id/memory|dark|1280": {
       "color-contrast": 16,
@@ -231,10 +231,10 @@
       "scrollable-region-focusable": 1
     },
     "#/h/:id/overview|light|1280": {
-      "color-contrast": 36
+      "color-contrast": 35
     },
     "#/h/:id/overview|light|320": {
-      "color-contrast": 36,
+      "color-contrast": 35,
       "scrollable-region-focusable": 1
     },
     "#/h/:id/panes|dark|1280": {
@@ -257,10 +257,10 @@
       "scrollable-region-focusable": 1
     },
     "#/h/:id/runs|light|1280": {
-      "color-contrast": 13
+      "color-contrast": 12
     },
     "#/h/:id/runs|light|320": {
-      "color-contrast": 13,
+      "color-contrast": 12,
       "scrollable-region-focusable": 1
     },
     "#/h/:id/schedulers|dark|1280": {
@@ -276,10 +276,10 @@
       "color-contrast": 17
     },
     "#/h/:id/security|dark|1280": {
-      "color-contrast": 24
+      "color-contrast": 23
     },
     "#/h/:id/security|dark|320": {
-      "color-contrast": 24
+      "color-contrast": 23
     },
     "#/h/:id/security|light|1280": {
       "color-contrast": 38
@@ -362,11 +362,11 @@
       "scrollable-region-focusable": 1
     },
     "#/runs|light|1280": {
-      "color-contrast": 20,
+      "color-contrast": 19,
       "scrollable-region-focusable": 1
     },
     "#/runs|light|320": {
-      "color-contrast": 20,
+      "color-contrast": 19,
       "scrollable-region-focusable": 1
     },
     "#/settings|dark|1280": {
