@@ -9,8 +9,12 @@
  * under test.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import * as fabric from "../assets/js/views/memory-fabric.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import * as overview from "../assets/js/views/overview.js";
 
 const DAY = 86_400_000;
 
@@ -227,5 +231,179 @@ describe("the view module's own hygiene", () => {
     // promise the stores cannot keep.
     expect(source.includes('text: "Delete"')).toBe(false);
     expect(source.includes("Permanently")).toBe(false);
+  });
+});
+
+describe("editorGate", () => {
+  const article = { body: "the body", title: "A title", version: 2, truncated: false };
+
+  test("a new article has nothing to lose", () => {
+    expect(fabric.editorGate({ existing: false, article: null })).toEqual({
+      canSave: true,
+      status: null,
+      why: null,
+    });
+  });
+
+  test("an article that failed to load cannot be saved over", () => {
+    const gate = fabric.editorGate({ existing: true, article: null });
+    expect(gate.canSave).toBe(false);
+    expect(gate.status).toBe("couldn't load");
+    expect(gate.why).toBe(
+      "Couldn't load this article, so it can't be edited here. Reload and try again.",
+    );
+    expect(fabric.editorGate({ existing: true, article: { title: "no body" } }).canSave).toBe(
+      false,
+    );
+  });
+
+  test("a cut-off read cannot be saved back", () => {
+    const gate = fabric.editorGate({ existing: true, article: { ...article, truncated: true } });
+    expect(gate.canSave).toBe(false);
+    expect(gate.status).toBe("too long");
+    expect(gate.why).toBe("This article is too long to edit here.");
+  });
+
+  const hiddenText = {
+    canSave: false,
+    status: "hidden text",
+    why: "Part of this article is hidden because it looks like a credential or matches one of this harness's settings, so it is read-only here.",
+  };
+
+  test("a masked span in the body or the title cannot be saved back", () => {
+    expect(
+      fabric.editorGate({ existing: true, article: { ...article, body: "key sk-***" } }),
+    ).toEqual(hiddenText);
+    expect(
+      fabric.editorGate({ existing: true, article: { ...article, title: "key sk-***" } }),
+    ).toEqual(hiddenText);
+  });
+
+  test("an env value served as its name cannot be saved back", () => {
+    for (const span of ["«BOT_TOKEN»", "«_x1»", "«ProgramFiles(x86)»", "«BASH_FUNC_x%%»"]) {
+      expect(
+        fabric.editorGate({ existing: true, article: { ...article, body: `use ${span} now` } }),
+      ).toEqual(hiddenText);
+      expect(
+        fabric.editorGate({ existing: true, article: { ...article, title: `use ${span}` } }),
+      ).toEqual(hiddenText);
+    }
+  });
+
+  test("a quotation in spaced guillemets is ordinary text", () => {
+    const body = "Elle a dit « bonjour » et «\u00a0merci\u00a0».";
+    expect(fabric.editorGate({ existing: true, article: { ...article, body } }).canSave).toBe(true);
+  });
+
+  test("a whole, unmasked read can be saved", () => {
+    expect(fabric.editorGate({ existing: true, article })).toEqual({
+      canSave: true,
+      status: null,
+      why: null,
+    });
+  });
+});
+
+describe("wikiControls", () => {
+  test("a local wiki keeps the editor and every row verb", () => {
+    expect(fabric.wikiControls("local")).toEqual({
+      editor: true,
+      rowEdit: true,
+      rowArchive: true,
+      notice: null,
+    });
+  });
+
+  test("a Thredz wiki gets the notice in their place", () => {
+    expect(fabric.wikiControls("thredz")).toEqual({
+      editor: false,
+      rowEdit: false,
+      rowArchive: false,
+      notice: "thredz",
+    });
+  });
+
+  test("an unknown owner is not treated as local, nor is a missing answer", () => {
+    for (const authority of ["unknown", undefined]) {
+      expect(fabric.wikiControls(authority)).toEqual({
+        editor: false,
+        rowEdit: false,
+        rowArchive: false,
+        notice: "unknown",
+      });
+    }
+  });
+});
+
+describe("wikiNoticeCopy", () => {
+  test("rows on a Thredz harness are called local copies, and the link stays", () => {
+    const copy = fabric.wikiNoticeCopy("thredz", true);
+    expect(copy.sentence).toBe("This harness keeps its wiki in Thredz.");
+    expect(copy.rowsLine).toBe("Articles listed here are local copies, not the Thredz wiki.");
+    expect(copy.linksToThredz).toBe(true);
+  });
+
+  test("with no rows there is nothing to explain", () => {
+    expect(fabric.wikiNoticeCopy("thredz", false).rowsLine).toBe(null);
+    expect(fabric.wikiNoticeCopy("unknown", false).rowsLine).toBe(null);
+  });
+
+  test("an unknown owner says what the rows are and links nowhere", () => {
+    const copy = fabric.wikiNoticeCopy("unknown", true);
+    expect(copy.rowsLine).toBe("Articles listed here come from this harness's local store.");
+    expect(copy.linksToThredz).toBe(false);
+  });
+});
+
+describe("the memory screens' layout at narrow widths", () => {
+  const css = readFileSync(join(import.meta.dir, "..", "assets", "hangar.css"), "utf8");
+  const rule = (selector: string): string => {
+    const start = css.indexOf(`\n${selector} {`);
+    expect(start).toBeGreaterThan(-1);
+    return css.slice(start, css.indexOf("}", start));
+  };
+
+  test("the bars that carry their fields and buttons wrap", () => {
+    expect(rule(".filter-bar")).toContain("flex-wrap: wrap");
+    expect(rule(".editor-actions")).toContain("flex-wrap: wrap");
+  });
+
+  test("the page header wraps, and an action never demands more than its card", () => {
+    expect(rule(".app-header")).toContain("flex-wrap: wrap");
+    expect(rule(".job-action")).toContain("max-width: 100%");
+  });
+});
+
+describe("factCountLabel", () => {
+  test("a count nobody could take is unknown, and zero is a count", () => {
+    expect(overview.factCountLabel(null)).toBe("unknown");
+    expect(overview.factCountLabel(0)).toBe("0");
+    expect(overview.factCountLabel(12)).toBe("12");
+  });
+});
+
+describe("the memory screens name only commands that run", () => {
+  const VIEWS = join(import.meta.dir, "..", "assets", "js", "views");
+  const source = ["memory.js", "memory-fabric.js", "overview.js"]
+    .map((name) => readFileSync(join(VIEWS, name), "utf8"))
+    .join("\n");
+
+  test("no command that never existed, and no dream verb without its spec", () => {
+    for (const fake of [
+      "crewhaus remember",
+      "crewhaus wiki write",
+      "crewhaus /focus",
+      "crewhaus run (then",
+      "crewhaus run (the agent",
+      '"crewhaus dream run"',
+      '"crewhaus dream init"',
+    ]) {
+      expect(`${fake}: ${source.includes(fake)}`).toBe(`${fake}: false`);
+    }
+  });
+
+  test("the scan read the real views", () => {
+    expect(source.split("crewhaus dream run crewhaus.yaml").length - 1).toBe(1);
+    expect(source.split("crewhaus watchme start").length - 1).toBeGreaterThan(0);
   });
 });

@@ -37,6 +37,7 @@ import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { resolveInside } from "./safety";
 import { resolveSessionRoot } from "./sessions";
+import { liveWikiSegments } from "./store-layout";
 
 /** What an omnibox row IS — the kind drives its icon and its deep link. */
 export const OMNI_KINDS = [
@@ -308,10 +309,12 @@ const mtimeOf = (path: string | undefined): number => {
  */
 export function harnessIndexToken(dir: string): string {
   const crewhaus = join(dir, ".crewhaus");
+  const wikiStore = liveWikiSegments(dir);
   const parts = [
     mtimeOf(join(dir, "crewhaus.yaml")),
     mtimeOf(resolveSessionRoot(dir).root),
     mtimeOf(join(crewhaus, "wiki", "articles")),
+    mtimeOf(wikiStore && resolveInside(dir, [...wikiStore, "articles"])),
     mtimeOf(join(crewhaus, "memories")),
     mtimeOf(join(crewhaus, "datasets")),
     mtimeOf(join(crewhaus, "evals")),
@@ -378,7 +381,8 @@ export function buildHarnessEntries(harness: IndexHarness): readonly OmniEntry[]
   }
 
   // Wiki article slugs (titles, not bodies — see the module docblock).
-  const wikiDir = resolveInside(dir, [".crewhaus", "wiki", "articles"]);
+  const wikiStore = liveWikiSegments(dir);
+  const wikiDir = wikiStore && resolveInside(dir, [...wikiStore, "articles"]);
   for (const name of listSafe(wikiDir)) {
     if (!name.endsWith(".md")) continue;
     const slug = name.slice(0, -3);

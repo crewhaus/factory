@@ -305,14 +305,14 @@ describe("facts browser", () => {
     expect(String(leaky["text"])).toContain("***");
   });
 
-  test("a missing store is an empty state naming the verb, never an error", async () => {
+  test("a missing store is an empty state, never an error, and names no command", async () => {
     const t = boot();
     const id = await register(t, makeFixtureHarness(join(t.harnessesRoot, "bare"), {}));
     const { status, body } = await t.api(`/api/h/${id}/memory/facts/nothing`);
     expect(status).toBe(200);
     expect(body["present"]).toBe(false);
     expect(body["items"]).toEqual([]);
-    expect(body["verb"]).toBe("crewhaus memory remember");
+    expect(body["verb"]).toBeNull();
   });
 });
 
