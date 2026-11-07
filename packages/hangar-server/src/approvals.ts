@@ -26,6 +26,7 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { APPROVAL_ID_RE } from "@crewhaus/control-contract";
 import {
   type ApprovalDecision,
   type PendingApproval,
@@ -37,7 +38,7 @@ import { resolveContained } from "./safety";
 import { resolveSessionRoot } from "./sessions";
 
 export const APPROVALS_FILENAME = "approvals.jsonl";
-export const APPROVAL_ID_RE = /^appr_[0-9a-f]{16}$/;
+export { APPROVAL_ID_RE };
 
 export function isApprovalId(id: string): boolean {
   return APPROVAL_ID_RE.test(id);

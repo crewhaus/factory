@@ -60,14 +60,13 @@
  */
 import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
+import { SESSION_ID_RE } from "@crewhaus/control-contract";
 import { shellQuote } from "@crewhaus/harness-supervisor";
 import { SAFE_SEGMENT_RE } from "./constants";
 import { readHarnessEnvFiles } from "./env-file";
 import { readTextCapped } from "./jsonl";
 import { isSafePathSegment, resolveContained, resolveInside } from "./safety";
 
-/** The session-id shape the proofs tree is keyed by (provability's store rule). */
-const SESSION_ID_RE = /^sess_[0-9a-f]{16}$/;
 /** A research run's id (citation-tracker's `newRunId`): its report bundle's key. */
 const RESEARCH_RUN_RE = /^run_[0-9a-f]{16}$/;
 /** A bundle file: `turn-<n>.json`, a retry's `turn-<n>.<k>.json` (provability's store rule). */

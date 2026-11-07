@@ -32,6 +32,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
+import { COMMAND_KINDS, OPERATIONS, renderTwin } from "@crewhaus/control-contract";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { MAX_FACT_FILE_BYTES } from "./constants";
 import { makeFixtureHarness } from "./fixture";
@@ -55,6 +56,8 @@ const CLI_SRC = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
  *   · memory, wiki, knowledge, dream, migrate, watchme — the dispatch in
  *     `apps/cli/src/index.ts`, with one flag schema per noun
  *     (`arg-schemas.ts`, `DREAM_CLI_SCHEMA` in `dream-cli.ts`).
+ *   · approvals — `APPROVALS_SCHEMA` in `apps/cli/src/arg-schemas.ts`, one flag
+ *     list across its verbs, and the action list in `apps/cli/src/index.ts`.
  *
  * Flags are listed per verb because `parseVerbArgs` THROWS on any flag
  * outside the verb's own spec — an unknown flag is not ignored, it is a
@@ -84,6 +87,7 @@ const WATCHME_FLAGS = [
   "forget",
   "help",
 ];
+const APPROVALS_FLAGS = ["dir", "by", "once", "always", "json", "help"];
 
 const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
   harness: {
@@ -126,6 +130,12 @@ const CLI_DISPATCH: Readonly<Record<string, Readonly<Record<string, readonly str
     intents: WATCHME_FLAGS,
     synthesize: WATCHME_FLAGS,
     publish: WATCHME_FLAGS,
+  },
+  approvals: {
+    list: APPROVALS_FLAGS,
+    show: APPROVALS_FLAGS,
+    grant: APPROVALS_FLAGS,
+    deny: APPROVALS_FLAGS,
   },
 };
 
@@ -254,6 +264,21 @@ describe("the dispatch table matches the CLI", () => {
     // …and accepts the forms the screens show.
     expect(rejectionReason("crewhaus memory list --spec fabric")).toBeNull();
     expect(rejectionReason("crewhaus dream init crewhaus.yaml")).toBeNull();
+  });
+
+  test("the approvals verbs and flags are the ones the CLI declares", () => {
+    const schemas = readFileSync(join(CLI_SRC, "arg-schemas.ts"), "utf8");
+    expect(schemaFlags(schemas, "APPROVALS_SCHEMA")).toEqual(APPROVALS_FLAGS);
+
+    const entry = readFileSync(join(CLI_SRC, "index.ts"), "utf8");
+    const actions = entry.match(
+      /!isHelp && !\["", ([^\]]+)\]\.includes\(action\)[^\n]*\n\s*die\(`approvals/,
+    );
+    expect(actions?.[1]).toBeDefined();
+    const verbs = [...(actions?.[1] ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
+    expect(verbs).toEqual(
+      Object.keys(CLI_DISPATCH["approvals"] as Record<string, readonly string[]>),
+    );
   });
 
   test("the checker actually rejects the two commands that shipped", () => {
@@ -392,4 +417,46 @@ describe("every twin this server proposes would run if pasted", () => {
       await t.stop();
     }
   }, 20_000);
+});
+
+describe("every twin the contract declares would run if pasted", () => {
+  const SAMPLES = [
+    {
+      hrn: "hrn_0123456789abcdef",
+      appr: "appr_0123456789abcdef",
+      dir: "/srv/poly",
+      choice: "grant",
+    },
+    {
+      hrn: "hrn_0123456789abcdef",
+      appr: "appr_0123456789abcdef",
+      dir: "/srv/poly",
+      choice: "deny",
+    },
+  ];
+
+  test("operations and command kinds, both choices", () => {
+    const twins = [
+      ...OPERATIONS.map((op) => [op.id, op.cliTwin] as const),
+      ...Object.values(COMMAND_KINDS).map((kind) => [kind.id, kind.cliTwin] as const),
+    ];
+    let checked = 0;
+    for (const [id, twin] of twins) {
+      if (twin === null) continue;
+      for (const sample of SAMPLES) {
+        const rendered = renderTwin(twin, sample);
+        if (!("argv" in rendered)) throw new Error(`${id}: ${JSON.stringify(rendered)}`);
+        expectRunnable(id, `crewhaus ${rendered.argv.join(" ")}`);
+        checked++;
+      }
+    }
+    // Eight operation twins and five command kinds, each rendered twice.
+    expect(checked).toBeGreaterThanOrEqual(26);
+  });
+
+  test("the checker refuses a verb the CLI does not have", () => {
+    expect(rejectionReason("crewhaus approvals supersede appr_x")).toContain(
+      'unknown approvals verb "supersede"',
+    );
+  });
 });
