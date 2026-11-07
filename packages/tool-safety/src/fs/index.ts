@@ -24,6 +24,8 @@
  *   judged from where the rename will put it; no content budget.
  * - {@link probeKind} / {@link assertRegularFile}: what a path is, without
  *   opening it.
+ * - {@link homeHeldBy}: the home directory a directory is equal to or an
+ *   ancestor of, with links followed.
  * - {@link protectedRootsOf} / {@link protectedRootHolding} /
  *   {@link protectedRootBeneath}: the run's own record (session logs,
  *   spilled tool results, proof bundles) and the files that control it (the
@@ -50,6 +52,7 @@ export {
   SafeFsError,
 } from "./failure";
 export { type FileKind, fileKind } from "../streams/file";
+export { homeHeldBy } from "./home";
 export { type KindProbe, assertRegularFile, probeKind } from "./kind";
 export {
   type Contained,

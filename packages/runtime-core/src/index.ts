@@ -187,6 +187,7 @@ import { executeTool, operativeValuesFor, preparePermissionSubject } from "@crew
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
+import { homeHeldBy } from "@crewhaus/tool-safety/fs";
 import {
   AUXILIARY_MODEL_ROLES,
   type CostAccrualEvent,
@@ -3542,6 +3543,15 @@ function reportToolLimits(verdict: ToolLimitVerdict): void {
   }
 }
 
+/** One `[workspace]` line on stderr when the working directory holds the home directory, once per process. */
+function reportWorkspaceHoldsHome(): void {
+  const cwd = process.cwd();
+  if (homeHeldBy(cwd, process.env) === undefined) return;
+  const line = `this harness runs in ${cwd}, which holds your home directory. A harness's tools work inside its directory, so give it a directory of its own.`;
+  for (const fresh of unreportedToolLimitLines([line]))
+    process.stderr.write(`[workspace] ${fresh}\n`);
+}
+
 /**
  * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
  * set. First-party `base` tools WIN any name collision, so an activated plugin
@@ -4148,6 +4158,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       "runChatLoop: `sideCalls.committee` is legal in singleTurn mode only (a workflow step, a graph node, a crew role) — a REPL or per-message turn is one the user is waiting on",
     );
   }
+  reportWorkspaceHoldsHome();
   const sessionRootDir = resolveSessionRootDir(opts.sessionRootDir);
   // 0.8.0 (design §1 principle 1, §5.2) — the session logs, the spilled
   // tool results and the proof bundles this run's gates read as evidence: no

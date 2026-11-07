@@ -356,7 +356,9 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
       detail:
         item.remediation !== undefined ? `${item.message} — ${item.remediation}` : item.message,
       explain:
-        "this is the Start gate's own refusal set: a daemon started anyway would exit on boot, so nothing runs until it clears",
+        item.area === "workspace"
+          ? "a harness's tools work inside its directory, so a harness gets a directory of its own; Start anyway runs it where it is, for that start"
+          : "this is the Start gate's own refusal set: a daemon started anyway would exit on boot, so nothing runs until it clears",
       guidance:
         item.remediation ?? `fix it on the ${screen} tab — the same finding gates every start`,
       screen,

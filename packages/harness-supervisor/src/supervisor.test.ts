@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_CODES } from "@crewhaus/errors";
 import { buildReport } from "@crewhaus/preflight";
-import type { GateDecision } from "./gate";
+import type { GateDecision, GateOptions } from "./gate";
 import { createPortLedger } from "./ports";
 import type { PrepareOutcome, PrepareRunner } from "./prepare";
 import type { ProcessOps } from "./process-ops";
@@ -67,7 +67,7 @@ type Harness = {
 };
 
 type SetupOptions = {
-  gate?: () => Promise<GateDecision>;
+  gate?: (options: GateOptions) => Promise<GateDecision>;
   env?: string;
   maxRestarts?: number;
   ports?: ReturnType<typeof createPortLedger>;
@@ -954,6 +954,27 @@ describe("a start that cannot launch", () => {
     // "already-running", so a state we enter must be one we can leave.
     expect(h.supervisor.snapshot().state).not.toBe("starting");
     expect(readStartLock(h.dir)).toBeUndefined();
+  });
+
+  test("an acknowledgement lasts one start: the automatic restart asks the gate again", async () => {
+    const seen: GateOptions[] = [];
+    const h = setup("channel", {
+      gate: async (options) => {
+        seen.push(options);
+        if (options.acknowledge !== undefined) return allowGate();
+        return { ...(await allowGate()), allowed: false };
+      },
+    });
+    expect((await h.supervisor.start({ acknowledge: ["x"] })).ok).toBe(true);
+    h.ops.last()?.exit(EXIT_CODES.tool);
+    await tick();
+    expect(h.supervisor.snapshot().state).toBe("crashed");
+    h.clock.advance(500);
+    await tick();
+    await h.supervisor.idle();
+    expect(seen).toEqual([{ acknowledge: ["x"] }, {}]);
+    expect(h.ops.children).toHaveLength(1);
+    expect(h.supervisor.snapshot().state).toBe("stopped");
   });
 });
 
