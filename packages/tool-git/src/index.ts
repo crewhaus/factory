@@ -27,6 +27,7 @@ import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
+  protectedRootBeneath,
   protectedRootHolding,
   protectedRootsOf,
   protectedWriteRefusal,
@@ -1325,15 +1326,21 @@ export const gitApplyPatch: RegisteredTool = buildTool({
             checkedOnly,
             wouldApply: false,
             reason:
-              "GitApplyPatch: the patch names more files than could be checked against the run's own record (session logs, spilled tool results, proof bundles). Nothing was applied. Apply it in smaller patches.",
+              "GitApplyPatch: the patch names more files than could be checked against the run's own record (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Hangar's directory). Nothing was applied. Apply it in smaller patches.",
           });
         }
         named.push(...numstatPaths(listed.stdout));
       }
       const hit = named.find((name) =>
-        [repo.root, repo.cwd].some(
-          (base) => protectedRootHolding(nodePath.resolve(base, name), roots) !== undefined,
-        ),
+        [repo.root, repo.cwd].some((base) => {
+          // A name above a root decides what the root is, so it counts as one
+          // inside it.
+          const at = nodePath.resolve(base, name);
+          return (
+            protectedRootHolding(at, roots) !== undefined ||
+            protectedRootBeneath(at, roots) !== undefined
+          );
+        }),
       );
       if (hit !== undefined) {
         return json({

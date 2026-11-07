@@ -35,9 +35,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
@@ -147,6 +147,40 @@ const bullets = defaultOnBullets(changelog);
 const notes = bullets.join("\n");
 /** Every later release's list alone: where a root or tool 0.8.0 did not ship must be named. */
 const laterNotes = defaultOnBullets(changelog, LATER_HEADINGS).join("\n");
+
+/**
+ * `path` with every link on its existing part followed, the way
+ * runtime-core's `runtimeStateRoots` spells a root it was handed.
+ */
+function followedPath(path: string): string {
+  const rest: string[] = [];
+  let head = path;
+  for (;;) {
+    try {
+      return rest.reduceRight((built, name) => join(built, name), realpathSync(head));
+    } catch {
+      if (dirname(head) === head) return path;
+      rest.push(basename(head));
+      head = dirname(head);
+    }
+  }
+}
+
+/**
+ * How the roots found differ from the roots expected, each expected root
+ * counted in every spelling (as given, and with links followed): what was
+ * found and not expected, and what was expected and not found.
+ */
+function rootsDiffer(
+  found: readonly string[],
+  expected: readonly string[],
+): { readonly unexpected: string[]; readonly missing: string[] } {
+  const spelled = new Set(expected.flatMap((root) => [root, followedPath(root)]));
+  return {
+    unexpected: [...new Set(found)].filter((root) => !spelled.has(root)).sort(),
+    missing: [...spelled].filter((root) => !found.includes(root)).sort(),
+  };
+}
 
 /** Workspace source files (tracked or new, never dist or a test) that contain `needle`. */
 function sourcesContaining(needle: string): string[] {
@@ -548,6 +582,54 @@ describe("the release notes name every change a harness without provability: see
     expect(floor).toContain("`RunCommand`");
   });
 
+  test("the runtime-state floor: Hangar's directory is every root the environment names, and the default", () => {
+    // Each variable names a root of its own, outside the workspace, so the
+    // roots the run protects there are exactly Hangar's. The expected set is
+    // written out here, not read from the code that makes it: a root added
+    // there fails this until the notes and this list name it.
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-home-")));
+    try {
+      for (const dir of ["ws", "hangar", "registry"]) mkdirSync(join(base, dir));
+      const ws = join(base, "ws");
+      const env = {
+        CREWHAUS_HANGAR_ROOT: join(base, "hangar"),
+        CREWHAUS_REGISTRY_ROOT: join(base, "registry"),
+      };
+      const outside = runtimeStateRoots(undefined, undefined, ws, env).filter((root) => {
+        const rel = relative(ws, root);
+        return isAbsolute(root) && (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+      });
+      const expected = [
+        join(base, "hangar"),
+        join(base, "registry", "hangar"),
+        join(homedir(), ".crewhaus", "hangar"),
+      ];
+      expect(rootsDiffer(outside, expected)).toEqual({ unexpected: [], missing: [] });
+      // The comparison reports a root nobody listed, and one that went missing.
+      expect(rootsDiffer([...outside, join(base, "planted")], expected)).toEqual({
+        unexpected: [join(base, "planted")],
+        missing: [],
+      });
+      expect(
+        rootsDiffer(
+          outside.filter((root) => root !== join(base, "hangar")),
+          expected,
+        ).missing,
+      ).toEqual([join(base, "hangar")]);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+    // The bullet that names every workspace root names these too.
+    const cwd = join(tmpdir(), "crewhaus-default-on-changes");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {})
+      .filter((root) => !isAbsolute(root))
+      .map((root) => root.split(sep).join("/"));
+    const floor = bullets.find((b) => roots.every((root) => b.includes(`\`${root}\``))) ?? "";
+    for (const name of ["~/.crewhaus/hangar", "CREWHAUS_HANGAR_ROOT", "CREWHAUS_REGISTRY_ROOT"]) {
+      expect({ name, named: floor.includes(`\`${name}\``) }).toEqual({ name, named: true });
+    }
+  });
+
   test("every tool that refuses a write into those roots on its own is named", () => {
     // Each `protectedRootsOf(ctx)` call is a tool checking its own targets
     // against the roots on its bridge — in every permission mode, bypass
@@ -565,9 +647,10 @@ describe("the release notes name every change a harness without provability: see
     }
     expect(unattributed).toEqual([]);
     // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx),
-    // GitApplyPatch (tool-git), StateImport (tool-state) and StoreMigrate
-    // (tool-lifecycle) today.
-    expect(tools.size).toBe(7);
+    // GitApplyPatch (tool-git), StateImport (tool-state), StoreMigrate
+    // (tool-lifecycle), EmitTraceEvent (tool-obs) and DatasetPut (tool-dataset)
+    // today.
+    expect(tools.size).toBe(9);
     const unnamed = unlisted(tools, notes, { shipped: SHIPPED_TOOLS, laterNotes }).sort();
     expect(unnamed).toEqual([]);
   });

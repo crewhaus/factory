@@ -347,7 +347,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * only operative fields relocate names no record, so `buildTool` refuses
  * it: its store is where it acts, declared without `relocates` — and with
  * `beneath` when it reads or writes what is inside (StateExport, which
- * dumps every file under its `stateDir`).
+ * dumps every file under its `stateDir`). The runtime-state floor reads a
+ * relocating path as any path it writes, unless it lies in the run's record or
+ * the tool reads it whole.
  *
  * `env`, for a `command` only, names a top-level field holding the
  * variables the call sets in the child's environment, a map of names to

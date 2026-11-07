@@ -14,6 +14,7 @@
     { "path": "../egress-classifier" },
     { "path": "../errors" },
     { "path": "../event-log" },
+    { "path": "../harness-registry" },
     { "path": "../hooks-engine" },
     { "path": "../logging" },
     { "path": "../model-plan" },

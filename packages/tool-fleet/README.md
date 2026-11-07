@@ -12,6 +12,9 @@ hooks that wrap a start.
 | `CliVersionPin` | which CLI each harness would run, which one built its bundle | `harness-supervisor` (`resolveCrewhausBin`, the bundle stamp) |
 | `HooksManage` | list / set / remove the manager hooks in `.crewhaus/settings.json` | `harness-supervisor` (`parseManagerHook`, `readManagerSettings`) |
 
+On the harness it runs in, `HooksManage` is refused by the runtime-state floor, `list` included
+(the tool is not read-only); it manages other harnesses as before.
+
 ## These tools are thin on purpose
 
 Everything they enforce belongs to a package they depend on. The registry file is written by
@@ -120,8 +123,10 @@ path so one harness cannot be counted twice in the version roll-up.
 
 The exception is deliberate and no input can move it. The two machine-wide files —
 `<registryRoot>/harnesses.json` and `<hangarRoot>/jobs.jsonl` — are resolved from the environment
-(`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`), because a registry that only ever saw the
-current workspace would not be a registry. Their absolute paths are reported in every result.
+(`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`) by `@crewhaus/harness-registry`'s
+`resolveRegistryRoot` and `resolveHangarRoot`, the resolvers the CLI uses, because a registry that
+only ever saw the current workspace would not be a registry. Their absolute paths are reported in
+every result.
 
 `CompileBundle` executes `crewhaus compile`. The binary comes from the supervisor's own resolver —
 harness-local `node_modules/.bin/crewhaus` first, then `PATH` — and a binary that resolves OUTSIDE

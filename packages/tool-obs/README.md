@@ -223,6 +223,12 @@ that would hide the carrier. An empty `runId` is no attribution either, because
 `runIdOf` reads ids back through a non-empty check and every reader that filters
 by run would disagree with a result that reported one.
 
+**They will not append to the runtime's other files through a link.** A session
+log that a link leads into a root on the tool's bridge (the files that control
+a run, or the record under another name) is refused in every permission mode,
+and nothing is written. A log named inside its own directory stays that
+directory's, however an operator has linked it.
+
 **They will not silently complete somebody else's half-written line.** A
 transcript cut short by a killed process ends mid-line. `EmitTraceEvent` reads
 the last byte before appending and starts with a newline when it has to, so the

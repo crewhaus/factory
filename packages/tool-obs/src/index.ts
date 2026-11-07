@@ -43,7 +43,13 @@ import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } fr
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
-import { appendContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import {
+  appendContained,
+  protectedRootLinkedInto,
+  protectedRootsOf,
+  protectedWriteRefusal,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { budgetCheck as budgetCheckFn } from "./lib/budget";
 import { costReport as costReportFn } from "./lib/cost";
@@ -1032,6 +1038,12 @@ export const emitTraceEvent: RegisteredTool = buildTool({
     } catch (err) {
       if (err instanceof ToolPermissionError) return err.message;
       throw err;
+    }
+    // The floor reads the directory the call names. The line lands where the
+    // log resolves, and the files that control a run are not a log's to reach.
+    const roots = protectedRootsOf(ctx);
+    if (protectedRootLinkedInto(target.abs, target.real, roots, workspaceRoot()) !== undefined) {
+      return protectedWriteRefusal("EmitTraceEvent", `the session log "${shown}"`);
     }
 
     let size: number | undefined;
