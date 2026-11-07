@@ -9,6 +9,7 @@
     { "path": "../memory-store" },
     { "path": "../wiki-store" },
     { "path": "../continuity-store" },
+    { "path": "../control-contract" },
     { "path": "../watchme-store" },
     { "path": "../dataset-registry" },
     { "path": "../audit-log" },

@@ -49,6 +49,7 @@
  */
 import { appendFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { SESSION_ID_RE as SESSION_ID_SHAPE } from "@crewhaus/control-contract";
 import { createFileBackedRegistry } from "@crewhaus/dataset-registry";
 import {
   type RunIndexEntry,
@@ -1567,8 +1568,6 @@ export const experimentRecord: M3Handler = (ctx) => {
  *     to write, and inventing a session id would corrupt the corpus.
  */
 const ANNOTATION_SINK = "hangar-annotations";
-
-const SESSION_ID_SHAPE = /^sess_[0-9a-f]{16}$/;
 
 /**
  * `POST /api/h/:id/evals/:runId/:sampleId/annotate` — annotate one sample.

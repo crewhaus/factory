@@ -298,6 +298,7 @@
     { "path": "./packages/sandbox-image-z3" },
     { "path": "./packages/sandbox-image-lean4" },
     { "path": "./packages/grader-provability" },
+    { "path": "./packages/control-contract" },
     { "path": "./apps/cli" }
   ]
 }

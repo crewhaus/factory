@@ -1,0 +1,40 @@
+import { API_ONLY, NO_VERB, READ } from "./shared.js";
+
+export const META_OPERATIONS = [
+  {
+    ...READ,
+    id: "meta.discover",
+    method: "GET",
+    path: "/api/v1",
+    permission: "public",
+    request: "noBody",
+    response: "discovery",
+    cliTwin: null,
+    noTwinReason: API_ONLY,
+    qualifiers: [],
+  },
+  {
+    ...READ,
+    id: "me.get",
+    method: "GET",
+    path: "/api/v1/me",
+    permission: "authenticated",
+    request: "noBody",
+    response: "me",
+    cliTwin: null,
+    noTwinReason: API_ONLY,
+    qualifiers: [],
+  },
+  {
+    ...READ,
+    id: "refs.resolve",
+    method: "GET",
+    path: "/api/v1/refs/{ref}",
+    permission: "authenticated",
+    request: "noBody",
+    response: "refResolved",
+    cliTwin: null,
+    noTwinReason: NO_VERB,
+    qualifiers: ["view-target"],
+  },
+] as const;
