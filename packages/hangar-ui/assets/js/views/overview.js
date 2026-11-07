@@ -101,11 +101,16 @@ function evalTrendCard(evals) {
   return card("Eval trend", children);
 }
 
+/** A fact count for the Overview. null means a store was too large to count. */
+export function factCountLabel(n) {
+  return n === null ? "unknown" : fmtCount(n);
+}
+
 function memoryCard(detail) {
   // The detail payload carries small counts only: { facts, articles }.
   const mem = detail?.memory && typeof detail.memory === "object" ? detail.memory : null;
   if (mem === null) {
-    return card("Memory fabric", emptyState("No memory data yet", "crewhaus remember"));
+    return card("Memory fabric", emptyState("No memory data yet"));
   }
   const mini = (label, value) =>
     el("div", { class: "mini" }, [
@@ -115,7 +120,7 @@ function memoryCard(detail) {
   return card(
     "Memory fabric",
     el("div", { class: "mini-row" }, [
-      mini("live facts", fmtCount(mem.facts)),
+      mini("live facts", factCountLabel(mem.facts)),
       mini("wiki articles", fmtCount(mem.articles)),
     ]),
   );

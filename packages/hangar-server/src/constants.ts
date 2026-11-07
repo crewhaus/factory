@@ -43,6 +43,13 @@ export const MAX_JSONL_LINES = 5000;
  *  partial line is dropped rather than parsed torn. */
 export const MAX_JSONL_BYTES = 8 * 1024 * 1024;
 
+/**
+ * Cap on a fact store read whole. A fact's status can be decided by a
+ * tombstone on the file's last line, so the fold reads all of it or, past
+ * this size, answers that it did not.
+ */
+export const MAX_FACT_FILE_BYTES = 64 * 1024 * 1024;
+
 /** Cap on raw lines returned by the `?raw=1` transcript escape hatch. */
 export const MAX_RAW_LINES = 1000;
 

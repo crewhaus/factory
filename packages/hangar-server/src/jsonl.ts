@@ -3,6 +3,9 @@
  * touches an append-only log. Absolutely no store-library `list()` calls
  * here: raw reads have no eviction or compaction side-effects, which is the
  * non-eviction guarantee the sessions browser is built on.
+ *
+ * Most readers want the head window (`readJsonlCapped`). A reader whose answer
+ * depends on every line (`readJsonlWhole`) gets all of the file or none of it.
  */
 import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
@@ -89,4 +92,43 @@ export function readJsonlCapped(
     }
   }
   return { objects, rawLines, truncated: byteTruncated || lineTruncated, lineCount, tornCount };
+}
+
+export type JsonlWholeRead = {
+  /** Parsed objects, in file order, unparseable lines skipped. */
+  readonly objects: readonly unknown[];
+  /** Lines that failed to parse (torn/garbage). */
+  readonly tornCount: number;
+  /** True when the file is over the cap, in which case nothing was read. */
+  readonly tooLarge: boolean;
+};
+
+/**
+ * Parse a whole JSONL file, or refuse. The size is checked before any byte is
+ * read, so a file over `maxBytes` costs one `stat`; a file at exactly the cap
+ * is read. A missing or unreadable file reads as empty.
+ */
+export function readJsonlWhole(path: string, maxBytes: number): JsonlWholeRead {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return { objects: [], tornCount: 0, tooLarge: false };
+  }
+  if (size > maxBytes) return { objects: [], tornCount: 0, tooLarge: true };
+  const { text, truncated } = readTextCapped(path, maxBytes);
+  // It grew past the cap between the two stats: a partial fold is the one
+  // answer this reader exists not to give.
+  if (truncated) return { objects: [], tornCount: 0, tooLarge: true };
+  const objects: unknown[] = [];
+  let tornCount = 0;
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      objects.push(JSON.parse(line));
+    } catch {
+      tornCount += 1;
+    }
+  }
+  return { objects, tornCount, tooLarge: false };
 }
