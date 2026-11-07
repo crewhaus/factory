@@ -33,6 +33,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
+import {
+  APPROVAL_ID_RE as APPROVAL_ID_REGEX,
+  SESSION_ID_RE as ID_REGEX,
+} from "@crewhaus/control-contract";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 import {
@@ -44,9 +48,10 @@ import {
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 
+export { APPROVAL_ID_RE, SESSION_ID_RE } from "@crewhaus/control-contract";
+
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 export const DEFAULT_TTL_DAYS = 30;
-const ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const MS_PER_DAY = 86_400_000;
 
 export type Session = {
@@ -889,7 +894,6 @@ export interface PendingApprovalStore {
 }
 
 export const DEFAULT_APPROVALS_FILENAME = "approvals.jsonl";
-const APPROVAL_ID_REGEX = /^appr_[0-9a-f]{16}$/;
 
 /**
  * Stable canonical JSON — object keys sorted recursively — so a tool input

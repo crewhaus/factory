@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*"
