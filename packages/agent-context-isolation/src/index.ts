@@ -535,12 +535,12 @@ export type RuntimeBridge = ParentRunHandle & {
   /**
    * 0.8.0 (design §1 principle 1, §5.2) — the run's runtime-state roots:
    * its session logs, spilled tool results and proof bundles, and the files
-   * that control it (the harness's run files and settings, Hangar's
-   * directory), every way the runtime spells them (runtime-core's
-   * `runtimeStateRoots`). The permission
+   * that control it (the harness's run files, settings, gate records and
+   * environment files, Hangar's directory), every way the runtime spells them
+   * (runtime-core's `runtimeStateRoots`). The permission
    * floor denies a call that names a path inside one; a tool that writes
    * beneath a directory it names (CopyPath, MovePath, RemovePath,
-   * ArchiveExtract, GitApplyPatch) reads them here to refuse a write that
+   * ArchiveExtract, GitApplyPatch, SpecPin, DeployRollback) reads them here to refuse a write that
    * would land in one through a name the floor never sees
    * (`@crewhaus/tool-safety/fs` `protectedRootsOf`). Optional — a bridge
    * built elsewhere carries none, and the tools then rely on the floor.

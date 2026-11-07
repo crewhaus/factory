@@ -606,6 +606,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const focusWrite: RegisteredTool = buildTool({
     name: "FocusWrite",
+    operativeArgs: [],
     description:
       "Replace the persisted focus body (current objective + next actions). This is the hot loop — keep it current and short (capped at focusMaxChars). Requirements are appended via the ledger, not here.",
     inputSchema: focusWriteSchema,
@@ -643,6 +644,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const planUpdate: RegisteredTool = buildTool({
     name: "PlanUpdate",
+    operativeArgs: [],
     description: PLAN_UPDATE_DESCRIPTION[proofMode],
     inputSchema: planUpdateSchema,
     destructive: true, // audit-and-allow (§7.4): a judge call per routine plan update would drown the loop
@@ -711,6 +713,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const planComplete: RegisteredTool = buildTool({
     name: "PlanComplete",
+    operativeArgs: [],
     description: PLAN_COMPLETE_DESCRIPTION[proofMode],
     inputSchema: planCompleteSchema,
     destructive: true,
@@ -824,6 +827,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const goalWrite: RegisteredTool = buildTool({
     name: "GoalWrite",
+    operativeArgs: [],
     description: GOAL_WRITE_DESCRIPTION[proofMode],
     inputSchema: goalWriteSchema,
     destructive: true,
@@ -849,6 +853,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const goalUpdate: RegisteredTool = buildTool({
     name: "GoalUpdate",
+    operativeArgs: [],
     description: GOAL_UPDATE_DESCRIPTION[proofMode],
     inputSchema: goalUpdateSchema,
     destructive: true,
@@ -946,6 +951,7 @@ export function createPlanTools(opts: CreatePlanToolsOptions): PlanToolBundle {
 
   const memoryClear: RegisteredTool = buildTool({
     name: "MemoryClear",
+    operativeArgs: [],
     description:
       "Clear continuity state (focus | plans | goals | all). Files move to .crewhaus/trash/<ts>/ and can be restored — nothing is hard-deleted. Destructive: requires a justification.",
     inputSchema: memoryClearSchema,

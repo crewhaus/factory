@@ -99,6 +99,7 @@ const scrollSchema = z
 export function createClickTool(opts: CreateMouseKeyboardToolsOptions): RegisteredTool {
   return buildTool({
     name: "Click",
+    operativeArgs: [],
     description:
       "Click at viewport pixel coordinates (x, y). Defaults to left button. Use FindElement(description) to get coordinates from a natural-language target. DESTRUCTIVE: requires explicit alwaysAllow rule.",
     inputSchema: clickSchema,
@@ -123,6 +124,7 @@ export function createClickTool(opts: CreateMouseKeyboardToolsOptions): Register
 export function createTypeTool(opts: CreateMouseKeyboardToolsOptions): RegisteredTool {
   return buildTool({
     name: "Type",
+    operativeArgs: [],
     description:
       "Type text at the focused input. Click an input first to focus it. DESTRUCTIVE: requires explicit alwaysAllow rule.",
     inputSchema: typeSchema,
@@ -146,6 +148,7 @@ export function createTypeTool(opts: CreateMouseKeyboardToolsOptions): Registere
 export function createKeyTool(opts: CreateMouseKeyboardToolsOptions): RegisteredTool {
   return buildTool({
     name: "Key",
+    operativeArgs: [],
     description:
       "Press a single key or combo (e.g. 'Enter', 'Tab', 'Control+a'). Uses Playwright's key naming. DESTRUCTIVE: requires explicit alwaysAllow rule.",
     inputSchema: keySchema,
@@ -169,6 +172,7 @@ export function createKeyTool(opts: CreateMouseKeyboardToolsOptions): Registered
 export function createScrollTool(opts: CreateMouseKeyboardToolsOptions): RegisteredTool {
   return buildTool({
     name: "Scroll",
+    operativeArgs: [],
     description:
       "Scroll by pixel deltas. Positive dy scrolls down. DESTRUCTIVE: requires explicit alwaysAllow rule.",
     inputSchema: scrollSchema,

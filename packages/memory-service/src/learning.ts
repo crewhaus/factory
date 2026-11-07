@@ -360,6 +360,7 @@ export function createExamTool(opts: CreateExamToolOptions): RegisteredTool {
   const exam = opts.learning.exam;
   return buildTool({
     name: "run_exam",
+    operativeArgs: [],
     description:
       "Run the competency exam configured for this harness (learning.exam): every dataset question is answered from the wiki in a fresh session and graded by the configured graders. Failed samples are logged as knowledge gaps automatically. Returns the pass rate and every failed item verbatim.",
     inputSchema: runExamInput,

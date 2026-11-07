@@ -86,7 +86,7 @@ import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
 import { type RegistryAdapter, createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { openForReadSync, protectedRootsOf, protectedWriteRefusal } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   AUDIT_LOG_UNAVAILABLE,
@@ -106,6 +106,7 @@ import {
   predictRegistration,
   probeTenantOverlay,
   probeVersion,
+  protectedRootOfSpec,
   readManifest,
   reservedRegistryRoot,
   resolveName,
@@ -186,6 +187,7 @@ function open(
   registryDirRel: string | undefined,
   knownVersions: ReadonlyArray<string>,
   tenant: string | undefined,
+  protectedRoots: readonly string[],
 ): Loaded<Opened> {
   const name = resolveName(rawName);
   if (!name.ok) return name;
@@ -209,6 +211,17 @@ function open(
     }
     const tenantPaths = containTenantPaths(tool, root.value, tenant, name.value.registryName);
     if (tenantPaths !== undefined) return tenantPaths;
+  }
+  const held = protectedRootOfSpec(
+    tool,
+    root.value,
+    name.value.registryName,
+    knownVersions,
+    tenant,
+    protectedRoots,
+  );
+  if (held !== undefined) {
+    return fail("refused", protectedWriteRefusal(tool, `spec "${render(rawName)}"`));
   }
   return {
     ok: true,
@@ -437,7 +450,7 @@ export const specPin: RegisteredTool = buildTool({
   // kept nowhere. Declared destructive so the floor treats it that way.
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "SpecPin";
     const dryRun = input.dryRun ?? false;
     const repin = input.repin ?? false;
@@ -477,7 +490,14 @@ export const specPin: RegisteredTool = buildTool({
     // Contain the root and the leaves. The version files are not known yet, so
     // this first pass contains what does not depend on them; the manifest read
     // below then yields the version list and the set is re-contained in full.
-    const first = open(tool, input.name, input.registryDir, [], input.tenant);
+    const first = open(
+      tool,
+      input.name,
+      input.registryDir,
+      [],
+      input.tenant,
+      protectedRootsOf(ctx),
+    );
     if (!first.ok) return refusal(tool, first.code, first.reason);
 
     const manifestState = await readManifest(
@@ -504,6 +524,7 @@ export const specPin: RegisteredTool = buildTool({
       input.registryDir,
       [...versions, candidate],
       input.tenant,
+      protectedRootsOf(ctx),
     );
     if (!opened.ok) return refusal(tool, opened.code, opened.reason);
     const { registry, name, rootAbs, rootRel } = opened.value;
@@ -928,7 +949,7 @@ export const deployRollback: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "DeployRollback";
     const dryRun = input.dryRun ?? true;
 
@@ -946,7 +967,14 @@ export const deployRollback: RegisteredTool = buildTool({
     }
 
     // First pass with no version files; the manifest read yields the list.
-    const first = open(tool, input.name, input.registryDir, [], input.tenant);
+    const first = open(
+      tool,
+      input.name,
+      input.registryDir,
+      [],
+      input.tenant,
+      protectedRootsOf(ctx),
+    );
     if (!first.ok) return refusal(tool, first.code, first.reason);
     const manifestState = await readManifest(
       first.value.registry,
@@ -971,7 +999,14 @@ export const deployRollback: RegisteredTool = buildTool({
     }
     const versions = manifestState.manifest.versions;
 
-    const opened = open(tool, input.name, input.registryDir, versions, input.tenant);
+    const opened = open(
+      tool,
+      input.name,
+      input.registryDir,
+      versions,
+      input.tenant,
+      protectedRootsOf(ctx),
+    );
     if (!opened.ok) return refusal(tool, opened.code, opened.reason);
     const { registry, name, rootRel } = opened.value;
 

@@ -401,7 +401,7 @@ export const kvSet: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badNamespace = validateName("namespace", input.namespace);
     if (badNamespace !== undefined) return badNamespace;
     const badKey = validateKey("key", input.key);
@@ -416,7 +416,7 @@ export const kvSet: RegisteredTool = stateTool({
       return "ttlSeconds needs `now`: expiry is computed from the instant you supply, never from the system clock";
     }
 
-    const root = stateRoot("KvSet", input.stateDir);
+    const root = stateRoot("KvSet", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath(
       "KvSet",
       root,
@@ -554,13 +554,13 @@ export const kvDelete: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badNamespace = validateName("namespace", input.namespace);
     if (badNamespace !== undefined) return badNamespace;
     const badKey = validateKey("key", input.key);
     if (badKey !== undefined) return badKey;
 
-    const root = stateRoot("KvDelete", input.stateDir);
+    const root = stateRoot("KvDelete", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath(
       "KvDelete",
       root,
@@ -714,14 +714,14 @@ export const counterIncrement: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badName = validateName("name", input.name);
     if (badName !== undefined) return badName;
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
     const by = input.by ?? 1;
 
-    const root = stateRoot("CounterIncrement", input.stateDir);
+    const root = stateRoot("CounterIncrement", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath(
       "CounterIncrement",
       root,
@@ -885,7 +885,7 @@ export const checkpointSave: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badName = validateName("name", input.name);
     if (badName !== undefined) return badName;
     if (input.data === undefined) {
@@ -896,7 +896,7 @@ export const checkpointSave: RegisteredTool = stateTool({
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
 
-    const root = stateRoot("CheckpointSave", input.stateDir);
+    const root = stateRoot("CheckpointSave", input.stateDir, protectedRootsOf(ctx));
     const folder = encodeSegment(input.name);
     const dir = statePath("CheckpointSave", root, CHECKPOINT_DIR, folder);
 
@@ -1087,7 +1087,7 @@ export const journalAppend: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badName = validateName("stream", input.stream);
     if (badName !== undefined) return badName;
     const tooBig = sizeGuard("entry", input.entry);
@@ -1095,7 +1095,7 @@ export const journalAppend: RegisteredTool = stateTool({
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
 
-    const root = stateRoot("JournalAppend", input.stateDir);
+    const root = stateRoot("JournalAppend", input.stateDir, protectedRootsOf(ctx));
     const result = await appendSequenced(
       "JournalAppend",
       root,
@@ -1203,7 +1203,7 @@ export const blackboardPost: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badTopic = validateName("topic", input.topic);
     if (badTopic !== undefined) return badTopic;
     const badAuthor = validateKey("author", input.author, 64);
@@ -1211,7 +1211,7 @@ export const blackboardPost: RegisteredTool = stateTool({
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
 
-    const root = stateRoot("BlackboardPost", input.stateDir);
+    const root = stateRoot("BlackboardPost", input.stateDir, protectedRootsOf(ctx));
     const result = await appendSequenced(
       "BlackboardPost",
       root,
@@ -1356,13 +1356,13 @@ export const noteWrite: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badId = validateKey("id", input.id, 200);
     if (badId !== undefined) return badId;
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
 
-    const root = stateRoot("NoteWrite", input.stateDir);
+    const root = stateRoot("NoteWrite", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath("NoteWrite", root, NOTE_DIR, `${encodeSegment(input.id)}.json`);
     const rel = relativeToRoot(root, abs);
 
@@ -1535,7 +1535,7 @@ export const indexBuild: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badName = validateName("name", input.name);
     if (badName !== undefined) return badName;
     const now = parseNow(input.now);
@@ -1582,7 +1582,7 @@ export const indexBuild: RegisteredTool = stateTool({
     }
 
     const index = buildIndex(docs);
-    const root = stateRoot("IndexBuild", input.stateDir);
+    const root = stateRoot("IndexBuild", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath("IndexBuild", root, INDEX_DIR, `${encodeSegment(input.name)}.json`);
     // Serialise first and check the size: `IndexSearch` reads with a cap, so
     // an index written over it would be built successfully and then be
@@ -1957,7 +1957,7 @@ export const dedupeMark: RegisteredTool = stateTool({
     stateDir: stateDirField,
   }),
   destructive: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const badScope = validateName("scope", input.scope);
     if (badScope !== undefined) return badScope;
     const badId = validateKey("id", input.id);
@@ -1965,7 +1965,7 @@ export const dedupeMark: RegisteredTool = stateTool({
     const now = parseNow(input.now);
     if (now.error !== undefined) return now.error;
 
-    const root = stateRoot("DedupeMark", input.stateDir);
+    const root = stateRoot("DedupeMark", input.stateDir, protectedRootsOf(ctx));
     const abs = statePath(
       "DedupeMark",
       root,

@@ -99,6 +99,7 @@ import {
   protectedRootHolding,
   protectedRootsOf,
   protectedWriteRefusal,
+  rootsBesideStore,
 } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
@@ -433,9 +434,17 @@ export const datasetPut: RegisteredTool = buildTool({
     const opened = openRoot(toolName, input.registryDir);
     if (!opened.ok) return opened.message;
     const { root, registry } = opened.value;
-    // The version lands in `<registry>/<name>`, wherever that resolves.
+    // The version lands in `<registry>/<name>`, wherever that resolves. The
+    // default registry is this tool's own store, which it adds to in its own
+    // format; every other root holds.
     const dataset = join(root.safe.abs, input.name);
-    if (protectedRootHolding(dataset, protectedRootsOf(ctx), workspaceRoot()) !== undefined) {
+    const cwd = workspaceRoot();
+    const roots = protectedRootsOf(ctx);
+    const others =
+      protectedRootHolding(root.safe.abs, [DEFAULT_REGISTRY_REL], cwd) !== undefined
+        ? rootsBesideStore(DEFAULT_REGISTRY_REL, roots, cwd)
+        : roots;
+    if (protectedRootHolding(dataset, others, cwd) !== undefined) {
       return protectedWriteRefusal(toolName, `dataset "${renderGiven(input.name)}"`);
     }
 

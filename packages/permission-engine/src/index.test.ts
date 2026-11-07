@@ -522,7 +522,7 @@ describe("0.8.0 — the runtime-state floor (protectedRoots)", () => {
     });
     expect(above.decision).toBe("deny");
     expect(above.reason).toBe(
-      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files and settings, Hangar's directory) — no rule can allow that",
+      "`ArchiveExtract` is not read-only and acts on everything beneath `.crewhaus`, where the runtime keeps its own record of the run (session logs, spilled tool results, proof bundles) or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory) — no rule can allow that",
     );
   });
 
@@ -826,7 +826,7 @@ describe("the runtime-state floor: the files that control a run, one root an exa
   ];
   const RECORD = "where the runtime keeps its own record of the run";
   const CONTROL =
-    "or the files that control it (the harness's run files and settings, Hangar's directory) — no rule can allow that";
+    "or the files that control it (the harness's run files, settings, gate records and environment files, Hangar's directory) — no rule can allow that";
   type Value = NonNullable<ToolCallContext["operativeValues"]>[number];
   const writing = (name: string, value: Value, toolName = "Write"): ToolCallContext => ({
     toolName,

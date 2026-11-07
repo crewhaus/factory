@@ -770,6 +770,7 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
 
   return buildTool({
     name: "Task",
+    operativeArgs: [],
     description,
     inputSchema: taskInputSchema,
     concurrencySafe: true,

@@ -1,7 +1,8 @@
 /**
  * The runtime-state roots a run hands the floor (`runtimeStateRoots`): the
- * run's record, the files that control the run, and Hangar's directory, each
- * spelled absolute, with links followed and workspace-relative.
+ * run's record, the files that control the run, the records its gates keep, its
+ * environment files and start config, and Hangar's directory and registry file,
+ * each spelled absolute, with links followed and workspace-relative.
  *
  * Every case runs against a realpath'd temp working directory and passes an
  * explicit environment, so neither the machine's variables nor its real
@@ -13,7 +14,13 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { buildTenant } from "@crewhaus/tenancy";
-import { relocatingFieldLeftOut, runtimeRecordRoots, runtimeStateRoots } from "./state-roots";
+import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
+import {
+  declaredEnvFiles,
+  relocatingFieldLeftOut,
+  runtimeRecordRoots,
+  runtimeStateRoots,
+} from "./state-roots";
 
 const TMP: string[] = [];
 afterAll(() => {
@@ -30,7 +37,36 @@ const RECORD = [
   join(".crewhaus", "tool-results"),
   join(".crewhaus", "proofs"),
 ];
-const CONTROL = [join(".crewhaus", "run"), join(".crewhaus", "settings.json")];
+const GATE_RECORDS = [
+  "approvals",
+  "environments.json",
+  "graders",
+  "judge-calibration.json",
+  "evals",
+  "datasets",
+  "retention.json",
+  "audit",
+  "graphs",
+  "advice",
+].map((name) => join(".crewhaus", name));
+const ENV_FILES = [
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.development.local",
+  ".env.production",
+  ".env.production.local",
+  ".env.test",
+  ".env.test.local",
+];
+const START_CONFIG = ["bunfig.toml", ".npmrc"];
+const CONTROL = [
+  join(".crewhaus", "run"),
+  join(".crewhaus", "settings.json"),
+  ...GATE_RECORDS,
+  ...ENV_FILES,
+  ...START_CONFIG,
+];
 
 /** The default Hangar root, and its spelling with links followed as far as it exists. */
 const DEFAULT_HOME = join(homedir(), ".crewhaus", "hangar");
@@ -47,7 +83,15 @@ function followedOf(path: string): string {
     }
   }
 }
-const DEFAULT_SPELLINGS = [...new Set([DEFAULT_HOME, followedOf(DEFAULT_HOME)])];
+const DEFAULT_REGISTRY = join(homedir(), ".crewhaus", "harnesses.json");
+const DEFAULT_SPELLINGS = [
+  ...new Set([
+    DEFAULT_HOME,
+    followedOf(DEFAULT_HOME),
+    DEFAULT_REGISTRY,
+    followedOf(DEFAULT_REGISTRY),
+  ]),
+];
 
 /** Run `body` with `process.env` carrying `vars`, then put every one back as it was. */
 function withProcessEnv<T>(vars: Readonly<Record<string, string>>, body: () => T): T {
@@ -133,6 +177,223 @@ describe("the files that control the run", () => {
   });
 });
 
+describe("what a harness's gates read, its environment files and its start config", () => {
+  test("a neighbour of an exact file, and a file in a subdirectory, are no roots", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    for (const name of [
+      join(".crewhaus", "approvals.jsonl"),
+      join(".crewhaus", "environments.json.bak"),
+      join(".crewhaus", "retention.json.bak"),
+      join(".crewhaus", "graders.yaml"),
+      join(".crewhaus", "advice.md"),
+      ".env.example",
+      ".env.sample",
+      ".envrc",
+      ".environment",
+      join("sub", ".env"),
+      "bunfig.toml.bak",
+      ".npmrc.bak",
+    ]) {
+      expect({ name, relative: roots.includes(name) }).toEqual({ name, relative: false });
+      expect({ name, absolute: roots.includes(join(cwd, name)) }).toEqual({
+        name,
+        absolute: false,
+      });
+      expect({ name, held: protectedRootHolding(name, roots, cwd) }).toEqual({
+        name,
+        held: undefined,
+      });
+    }
+  });
+
+  test("a directory and an exact file each hold what lies under them", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    for (const [path, root] of [
+      [join(".crewhaus", "graders", "x", "index.ts"), join(".crewhaus", "graders")],
+      [join(".crewhaus", "approvals", "s__prod.json"), join(".crewhaus", "approvals")],
+      [join(".env", "x"), ".env"],
+    ] as const) {
+      const held = protectedRootHolding(path, roots, cwd);
+      expect({ path, held: held === root || held === join(cwd, root) }).toEqual({
+        path,
+        held: true,
+      });
+    }
+  });
+});
+
+describe("a managed run's tenants root", () => {
+  test("is protected whole when the tenant has buildTenant's shape", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    for (const rel of [join(".crewhaus", "tenants"), join("live", "tenants")]) {
+      const tenant = buildTenant("acme", { tenantsRoot: join(cwd, rel) });
+      const roots = runtimeStateRoots(tenant.sessionRoot, tenant, cwd, {});
+      expect(roots).toContain(join(cwd, rel));
+      expect(roots).toContain(rel);
+      // The whole root, not only this tenant's part of it.
+      expect(protectedRootHolding(join(rel, "other", "sessions", "x"), roots, cwd)).toBeDefined();
+      // The roots a tool's own store may lie in stay this tenant's alone.
+      expect(runtimeRecordRoots(tenant.sessionRoot, tenant, cwd)).not.toContain(rel);
+    }
+  });
+
+  test("outside the working directory it is spelled absolute alone", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const tenants = tempDir("crewhaus-state-roots-tenants-");
+    const tenant = buildTenant("acme", { tenantsRoot: tenants });
+    const roots = runtimeStateRoots(tenant.sessionRoot, tenant, cwd, {});
+    expect(roots).toContain(tenants);
+    expect(roots.filter((root) => !isAbsolute(root) && root.startsWith(".."))).toEqual([]);
+  });
+
+  test("an override moves the session root, and its parent is no tenants root", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const tenants = join(cwd, "live", "tenants");
+    for (const sessionRoot of [
+      // `.crewhaus` itself would be the parent of the parent of this one.
+      join(cwd, ".crewhaus", "acme", "logs"),
+      join(cwd, ".crewhaus", "sessions"),
+      join(cwd, "acme", "sessions", "deep"),
+    ]) {
+      const tenant = buildTenant("acme", {
+        tenantsRoot: tenants,
+        overrides: { acme: { sessionRoot } },
+      });
+      const roots = runtimeStateRoots(tenant.sessionRoot, tenant, cwd, {});
+      expect({ sessionRoot, walled: roots.includes(tenants) }).toEqual({
+        sessionRoot,
+        walled: false,
+      });
+      expect({ sessionRoot, walled: roots.includes(".crewhaus") }).toEqual({
+        sessionRoot,
+        walled: false,
+      });
+      expect({ sessionRoot, walled: roots.includes(join(cwd, "acme")) }).toEqual({
+        sessionRoot,
+        walled: false,
+      });
+    }
+  });
+
+  test("one that holds the working directory is left to the rules", () => {
+    const tenants = tempDir("crewhaus-state-roots-tenants-");
+    const cwd = join(tenants, "acme", "work");
+    mkdirSync(cwd, { recursive: true });
+    const tenant = buildTenant("acme", { tenantsRoot: tenants });
+    expect(runtimeStateRoots(tenant.sessionRoot, tenant, cwd, {})).not.toContain(tenants);
+    // The same for an override of the same shape, whose parent's parent is the workspace.
+    const here = tempDir("crewhaus-state-roots-");
+    const shaped = buildTenant("acme", {
+      overrides: { acme: { sessionRoot: join(here, "acme", "sessions") } },
+    });
+    const roots = runtimeStateRoots(shaped.sessionRoot, shaped, here, {});
+    expect(roots).not.toContain(here);
+    expect(protectedRootHolding("notes.md", roots, here)).toBeUndefined();
+  });
+
+  test("no tenant, no root", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    expect(runtimeStateRoots(undefined, undefined, cwd, {})).not.toContain(
+      join(".crewhaus", "tenants"),
+    );
+  });
+});
+
+describe("the approvals file beside session logs", () => {
+  const APPROVALS = "approvals.jsonl";
+
+  test("a default run adds nothing, and a session root elsewhere holds it already", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const elsewhere = tempDir("crewhaus-state-roots-sessions-");
+    for (const sessionRootDir of [undefined, elsewhere, join(cwd, "logs")]) {
+      const roots = runtimeStateRoots(sessionRootDir, undefined, cwd, {});
+      expect({ sessionRootDir, named: roots.filter((r) => r.endsWith(APPROVALS)) }).toEqual({
+        sessionRootDir,
+        named: [],
+      });
+    }
+  });
+
+  test("a session root that holds the working directory keeps that one file", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const here = runtimeStateRoots(cwd, undefined, cwd, {});
+    expect(here).toContain(join(cwd, APPROVALS));
+    expect(here).toContain(APPROVALS);
+    expect(here).not.toContain(cwd);
+    // A relative setting resolves the same way.
+    expect(runtimeStateRoots(".", undefined, cwd, {})).toContain(join(cwd, APPROVALS));
+
+    const above = runtimeStateRoots(dirname(cwd), undefined, cwd, {});
+    expect(above).toContain(join(dirname(cwd), APPROVALS));
+    expect(above).not.toContain(dirname(cwd));
+    expect(above).not.toContain(APPROVALS);
+  });
+});
+
+describe("the files manager.envFiles declares", () => {
+  const withSettings = (body: string): string => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    mkdirSync(join(cwd, ".crewhaus"));
+    writeFileSync(join(cwd, ".crewhaus", "settings.json"), body);
+    return cwd;
+  };
+
+  test("each is protected, resolved against the working directory, and trimmed", () => {
+    const elsewhere = join(tempDir("crewhaus-state-roots-shared-"), "fleet.env");
+    const cwd = withSettings(
+      JSON.stringify({
+        manager: { envFiles: ["config/shared.env", `  ${elsewhere} `, "../sibling.env"] },
+      }),
+    );
+    expect(declaredEnvFiles(cwd)).toEqual([
+      join(cwd, "config", "shared.env"),
+      elsewhere,
+      join(dirname(cwd), "sibling.env"),
+    ]);
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    expect(roots).toContain(join(cwd, "config", "shared.env"));
+    expect(roots).toContain(join("config", "shared.env"));
+    expect(roots).toContain(elsewhere);
+    expect(roots).toContain(join(dirname(cwd), "sibling.env"));
+  });
+
+  test("a missing or malformed file, and a key or entry of the wrong type, read as nothing", () => {
+    expect(declaredEnvFiles(tempDir("crewhaus-state-roots-"))).toEqual([]);
+    for (const body of [
+      "{not json",
+      "null",
+      "[]",
+      '"text"',
+      "{}",
+      '{"manager":null}',
+      '{"manager":[]}',
+      '{"manager":"x"}',
+      '{"manager":{}}',
+      '{"manager":{"envFiles":"x.env"}}',
+      '{"manager":{"envFiles":{"0":"x.env"}}}',
+      '{"manager":{"envFiles":[1,null,{},[],"","   "]}}',
+    ]) {
+      expect({ body, files: declaredEnvFiles(withSettings(body)) }).toEqual({ body, files: [] });
+    }
+  });
+
+  test("one bad entry leaves the entries around it", () => {
+    const cwd = withSettings('{"manager":{"envFiles":["a.env",3,"b.env"]}}');
+    expect(declaredEnvFiles(cwd)).toEqual([join(cwd, "a.env"), join(cwd, "b.env")]);
+  });
+
+  test("a declared `.` or `..` cannot wall off the working directory", () => {
+    const cwd = withSettings('{"manager":{"envFiles":[".","..","kept.env"]}}');
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    expect(roots).not.toContain(cwd);
+    expect(roots).not.toContain(dirname(cwd));
+    expect(roots).toContain(join(cwd, "kept.env"));
+    expect(protectedRootHolding("notes.md", roots, cwd)).toBeUndefined();
+  });
+});
+
 describe("Hangar's directory", () => {
   test("every root both variables name is protected, and the default always", () => {
     const cwd = tempDir("crewhaus-state-roots-");
@@ -142,9 +403,22 @@ describe("Hangar's directory", () => {
       CREWHAUS_HANGAR_ROOT: hangar,
       CREWHAUS_REGISTRY_ROOT: registry,
     });
-    for (const root of [hangar, join(registry, "hangar"), ...DEFAULT_SPELLINGS]) {
+    for (const root of [
+      hangar,
+      join(registry, "hangar"),
+      join(registry, "harnesses.json"),
+      ...DEFAULT_SPELLINGS,
+    ]) {
       expect({ root, present: roots.includes(root) }).toEqual({ root, present: true });
     }
+  });
+
+  test("a registry root that holds the working directory protects its one file, not the directory", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, { CREWHAUS_REGISTRY_ROOT: cwd });
+    expect(roots).toContain(join(cwd, "harnesses.json"));
+    expect(roots).toContain("harnesses.json");
+    expect(roots).not.toContain(cwd);
   });
 
   test("a control file behind an operator's link has a workspace-relative name of its own", () => {
@@ -283,9 +557,23 @@ describe("runtimeRecordRoots and the store a relocating field names", () => {
     expect(out(LOG, { dir: ".crewhaus/sessions/../run" })).toBe(false);
     expect(out(STORE, {})).toBe(false);
     expect(out(STORE, { stateDir: "my/state" })).toBe(false);
+    // The record is a log field's own, and no other field's.
+    for (const rel of RECORD) expect(out(STORE, { stateDir: rel })).toBe(false);
+    expect(out(STORE, { stateDir: ".crewhaus/sessions/sub" })).toBe(false);
     expect(out(LOG, "not an object")).toBe(true);
     expect(out(LOG, { dir: "" })).toBe(false);
     expect(out(LOG, { dir: ["a"] })).toBe(false);
+  });
+
+  test("a log's field keeps its place when the run has moved the session directory", () => {
+    const cwd = tempDir("crewhaus-state-roots-");
+    const moved = join(cwd, "live", "sessions");
+    const record = runtimeRecordRoots(moved, undefined, cwd);
+    const all = runtimeStateRoots(moved, undefined, cwd, {});
+    expect(relocatingFieldLeftOut(LOG, { dir: "live/sessions" }, record, all, cwd)).toBe(true);
+    expect(relocatingFieldLeftOut(STORE, { stateDir: "live/sessions" }, record, all, cwd)).toBe(
+      false,
+    );
   });
 
   test("a store in the record that also lies in Hangar's directory is read", () => {
@@ -305,6 +593,88 @@ describe("runtimeRecordRoots and the store a relocating field names", () => {
     expect(relocatingFieldLeftOut(LOG, { dir: ".crewhaus/sessions/away" }, record, all, cwd)).toBe(
       false,
     );
+  });
+
+  describe("the gate record that is a field's own store", () => {
+    const DATASETS = { field: "registryDir", kind: "path", default: ".crewhaus/datasets" };
+    const EVALS = { field: "evalsDir", kind: "path", default: ".crewhaus/evals" };
+    const roots = (cwd: string, env: Record<string, string> = {}) => ({
+      record: runtimeRecordRoots(undefined, undefined, cwd),
+      all: runtimeStateRoots(undefined, undefined, cwd, env),
+    });
+
+    test("is left out at its default and named, and it stays a root for everything else", () => {
+      const cwd = tempDir("crewhaus-state-roots-");
+      const { record, all } = roots(cwd);
+      const out = (arg: typeof DATASETS, input: unknown) =>
+        relocatingFieldLeftOut(arg, input, record, all, cwd);
+      expect(all).toContain(join(".crewhaus", "datasets"));
+      expect(all).toContain(join(".crewhaus", "evals"));
+      expect(out(DATASETS, {})).toBe(true);
+      expect(out(DATASETS, { registryDir: ".crewhaus/datasets" })).toBe(true);
+      // Its own store is the one gate record: the record's roots are not it.
+      for (const rel of RECORD) expect(out(DATASETS, { registryDir: rel })).toBe(false);
+      expect(out(DATASETS, { registryDir: ".crewhaus/datasets/sub" })).toBe(true);
+      expect(out(DATASETS, { registryDir: join(cwd, ".crewhaus", "datasets") })).toBe(true);
+      expect(out(EVALS, {})).toBe(true);
+      expect(out(EVALS, { evalsDir: ".crewhaus/evals" })).toBe(true);
+      // Anywhere else the field is read as any path is.
+      expect(out(DATASETS, { registryDir: "my/reg" })).toBe(false);
+      expect(out(DATASETS, { registryDir: ".crewhaus" })).toBe(false);
+      for (const dir of [
+        ".crewhaus/evals",
+        ".crewhaus/approvals",
+        ".crewhaus/graders",
+        ".crewhaus/run",
+        ".crewhaus/settings.json",
+        ".env",
+        ".crewhaus/datasets/../approvals",
+      ]) {
+        expect({ dir, out: out(DATASETS, { registryDir: dir }) }).toEqual({ dir, out: false });
+      }
+      expect(out(EVALS, { evalsDir: ".crewhaus/datasets" })).toBe(false);
+    });
+
+    test("no other field's default makes a gate record its store", () => {
+      const cwd = tempDir("crewhaus-state-roots-");
+      const { record, all } = roots(cwd);
+      const out = (arg: typeof STORE, input: unknown) =>
+        relocatingFieldLeftOut(arg, input, record, all, cwd);
+      expect(out(STORE, { stateDir: ".crewhaus/datasets" })).toBe(false);
+      expect(out(STORE, { stateDir: ".crewhaus/evals" })).toBe(false);
+      // A default that is a gate record and no tool's store is read too.
+      const graders = { field: "dir", kind: "path", default: ".crewhaus/graders" };
+      expect(out(graders, {})).toBe(false);
+    });
+
+    test("with Hangar's directory holding the working directory, its default is read", () => {
+      const cwd = tempDir("crewhaus-state-roots-");
+      const { record, all } = roots(cwd, { CREWHAUS_HANGAR_ROOT: cwd });
+      expect(relocatingFieldLeftOut(DATASETS, {}, record, all, cwd)).toBe(false);
+    });
+
+    test("a link at the store into another root is read, and an operator's link above it is not", () => {
+      const cwd = tempDir("crewhaus-state-roots-");
+      mkdirSync(join(cwd, ".crewhaus", "run"), { recursive: true });
+      symlinkSync("run", join(cwd, ".crewhaus", "datasets"));
+      const linked = roots(cwd);
+      expect(relocatingFieldLeftOut(DATASETS, {}, linked.record, linked.all, cwd)).toBe(false);
+
+      const parent = tempDir("crewhaus-state-roots-");
+      mkdirSync(join(parent, "data", "crew"), { recursive: true });
+      symlinkSync(join("data", "crew"), join(parent, ".crewhaus"));
+      const above = roots(parent);
+      expect(relocatingFieldLeftOut(DATASETS, {}, above.record, above.all, parent)).toBe(true);
+      expect(
+        relocatingFieldLeftOut(
+          DATASETS,
+          { registryDir: "data/crew/approvals" },
+          above.record,
+          above.all,
+          parent,
+        ),
+      ).toBe(false);
+    });
   });
 
   test("a store the tool reads whole, a service, and a nested field", () => {

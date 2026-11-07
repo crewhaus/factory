@@ -59,6 +59,11 @@ import {
 } from "@crewhaus/routing-store";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  protectedRootLinkedInto,
+  protectedRootsOf,
+  protectedWriteRefusal,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   DEFAULT_EXPERIMENTS_DIR,
@@ -136,7 +141,7 @@ import {
   tallyWindows,
   turnId,
 } from "./lib/watchme";
-import type { SafePath } from "./paths";
+import { type SafePath, workspaceRoot } from "./paths";
 
 // ---------------------------------------------------------------------------
 // shared plumbing
@@ -743,7 +748,7 @@ export const experimentLedger: RegisteredTool = buildTool({
   }),
   destructive: true,
   requireJustification: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const tool = "ExperimentLedger";
     const dryRun = input.dryRun ?? true;
     const limit = input.limit ?? DEFAULT_LIMIT;
@@ -957,6 +962,26 @@ export const experimentLedger: RegisteredTool = buildTool({
         targets.value.map((n) => `${n}.jsonl`),
       );
       if (targetEscape !== undefined) return refusal(tool, targetEscape.code, targetEscape.reason);
+      // The floor reads the directories the call names. A ledger lands where its
+      // own name resolves, and the line follows a link there.
+      for (const n of targets.value) {
+        const ledger = contain(tool, path.join(expRel, `${n}.jsonl`));
+        if (
+          ledger.ok &&
+          protectedRootLinkedInto(
+            ledger.value.abs,
+            ledger.value.real,
+            protectedRootsOf(ctx),
+            workspaceRoot(),
+          ) !== undefined
+        ) {
+          return refusal(
+            tool,
+            "refused",
+            protectedWriteRefusal(tool, `the ledger "${renderPath(`${n}.jsonl`)}"`),
+          );
+        }
+      }
       if (dryRun) {
         return json({
           tool,

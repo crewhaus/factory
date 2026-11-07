@@ -14,6 +14,7 @@
  */
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { REGISTRY_FILENAME } from "./doc.js";
 import { resolveRegistryRoot } from "./registry.js";
 
 /**
@@ -47,4 +48,21 @@ export function hangarStateRoots(
     join(homedir(), ".crewhaus", "hangar"),
   ];
   return [...new Set(roots.map((root) => resolve(root)))];
+}
+
+/**
+ * The registry files `env` can name, absolute and without repeats:
+ * `<registryRoot>/harnesses.json`, and `~/.crewhaus/harnesses.json` always. The
+ * runtime-state floor protects each, so `CREWHAUS_REGISTRY_ROOT` adds a
+ * protected file and never takes the default's protection away. No link is
+ * followed here: the runtime adds the other spellings of each.
+ */
+export function registryStateFiles(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string[] {
+  const files = [
+    join(resolveRegistryRoot(env), REGISTRY_FILENAME),
+    join(homedir(), ".crewhaus", REGISTRY_FILENAME),
+  ];
+  return [...new Set(files.map((file) => resolve(file)))];
 }
