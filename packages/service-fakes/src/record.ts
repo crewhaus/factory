@@ -7,8 +7,17 @@
 
 /** Header names a recording never keeps, whatever their value. */
 const DROPPED_HEADER = /^(authorization|x-api-key|cookie|set-cookie)$/i;
-/** A key name whose string or object value is replaced in a recorded body. */
-const CREDENTIAL_KEY = /key|token|secret|password/i;
+/**
+ * A name holding any of these anywhere is treated as a credential. This is wider
+ * than the product's classifier on purpose: a recording only has to err towards
+ * losing a field, and a test that wants one back can read it from another name.
+ */
+const CREDENTIAL_WORDS = ["key", "token", "secret", "password"];
+
+const namesCredential = (name: string): boolean => {
+  const lower = name.toLowerCase();
+  return CREDENTIAL_WORDS.some((word) => lower.includes(word));
+};
 
 export const MASKED = "[masked]";
 
@@ -16,7 +25,7 @@ export const MASKED = "[masked]";
 export function maskHeaders(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, value] of headers.entries()) {
-    if (DROPPED_HEADER.test(name) || CREDENTIAL_KEY.test(name)) continue;
+    if (DROPPED_HEADER.test(name) || namesCredential(name)) continue;
     out[name] = value;
   }
   return out;
@@ -33,7 +42,7 @@ export function maskBody(value: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(value)) {
     const keep = typeof inner === "number" || typeof inner === "boolean" || inner === null;
-    out[key] = CREDENTIAL_KEY.test(key) && !keep ? MASKED : maskBody(inner);
+    out[key] = namesCredential(key) && !keep ? MASKED : maskBody(inner);
   }
   return out;
 }
