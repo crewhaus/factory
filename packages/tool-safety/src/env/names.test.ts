@@ -185,6 +185,8 @@ describe("looksLikePastedSecret", () => {
  * a package can switch to it without losing a name. The sweep finds the
  * copies by SHAPE, not from a list, and pins how many it finds: a new copy
  * fails this test until it is either checked here or replaced by an import.
+ * `packages/service-fakes/src/record.ts` is not a copy to keep in step: it masks a
+ * test recording in a package with no dependencies, and its own test pins its words.
  */
 describe("isCredentialShapedName covers every other copy in the repo", () => {
   const repoRoot = join(import.meta.dir, "..", "..", "..", "..");

@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"]
+  },
+  "references": [
+    { "path": "../hangar-server" },
+    { "path": "../hangar-ui" },
+    { "path": "../harness-registry" },
+    { "path": "../memory-store" },
+    { "path": "../service-fakes" },
+    { "path": "../session-store" },
+    { "path": "../wiki-store" }
+  ],
+  "include": ["src/**/*"]
+}

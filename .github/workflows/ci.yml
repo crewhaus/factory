@@ -208,3 +208,192 @@ jobs:
 
       - name: Test the OS-backed tool packages
         run: bun --filter '@crewhaus/tool-desktop' --filter '@crewhaus/tool-proc' --filter '@crewhaus/tool-cron' --filter '@crewhaus/tool-host' --filter '@crewhaus/tool-hostfs' --filter '@crewhaus/tool-pkgmgr' --filter '@crewhaus/tool-safety' test
+
+  # The console in a real browser, against a seeded fleet, on every change.
+  #
+  # Three shards run beside `ci`, each budgeted inside its time, because every merge
+  # costs the slower of `ci` and these. All three need ubuntu-24.04: the pinned
+  # Playwright refuses to install chromium on ubuntu-latest (see smoke-runtime.yml).
+  # They take no secret, so a fork's pull request runs all of them. What they upload
+  # holds only runtime-made test values on dead loopback ports.
+  #
+  # The sweep's skip is safe to require: a job skipped by its `if` reports success.
+  # But so does a job skipped because something it needs failed, so the check to
+  # require is the `ui-e2e` aggregate at the end, never a shard.
+  ui-e2e-scope:
+    name: ui-e2e scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      axe: ${{ steps.scope.outputs.axe }}
+    steps:
+      # On a pull request the checkout is the merge commit, so its first parent's
+      # diff is exactly what the pull request changes.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The same pin as `ci`; see `ci` for why.
+          bun-version: "1.3.14"
+      - name: Decide whether the accessibility sweep runs
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        # --no-renames lists both sides of a move, so a file moved out of the console
+        # still counts. -z stops git quoting an odd path past the prefix check. A
+        # failed diff reaches the script as empty stdin, and that runs the sweep.
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --name-only --no-renames -z HEAD^1 HEAD | bun scripts/ui-e2e-scope.ts
+          else
+            echo "axe=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ui-e2e-smoke:
+    name: ui-e2e console smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The same pin as `ci`; see `ci` for why.
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('package.json') }}
+      # Both halves, as smoke-runtime.yml explains: the package from the install
+      # above, and the matching browser from here.
+      - name: Install Playwright chromium
+        run: |
+          bun -e 'await import("playwright")' || {
+            echo "::error title=playwright package missing::playwright must resolve from node_modules for the chromium driver — restore the root devDependency (installing only the browser binaries is not enough)"
+            exit 1
+          }
+          bunx playwright install --with-deps chromium
+      - name: Run the journeys
+        env:
+          HANGAR_E2E_SHARD: smoke
+          HANGAR_E2E_ARTIFACTS: ${{ runner.temp }}/hangar-e2e
+        run: bun run --cwd packages/hangar-e2e test:browser
+      - name: Upload traces and reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ui-e2e-smoke
+          path: ${{ runner.temp }}/hangar-e2e
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ui-e2e-axe:
+    name: ui-e2e axe sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: ui-e2e-scope
+    # !cancelled() removes the implicit success(), so a failed scope job runs the
+    # sweep instead of skipping into a false green.
+    if: ${{ !cancelled() && (needs.ui-e2e-scope.result != 'success' || needs.ui-e2e-scope.outputs.axe != 'false') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The same pin as `ci`; see `ci` for why.
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: Install Playwright chromium
+        run: |
+          bun -e 'await import("playwright")' || {
+            echo "::error title=playwright package missing::playwright must resolve from node_modules for the chromium driver — restore the root devDependency (installing only the browser binaries is not enough)"
+            exit 1
+          }
+          bunx playwright install --with-deps chromium
+      - name: Run the journeys
+        env:
+          HANGAR_E2E_SHARD: axe
+          HANGAR_E2E_ARTIFACTS: ${{ runner.temp }}/hangar-e2e
+        run: bun run --cwd packages/hangar-e2e test:browser
+      - name: Upload traces and reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ui-e2e-axe
+          path: ${{ runner.temp }}/hangar-e2e
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ui-e2e-system:
+    name: ui-e2e system journeys
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The same pin as `ci`; see `ci` for why.
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: Install Playwright chromium
+        run: |
+          bun -e 'await import("playwright")' || {
+            echo "::error title=playwright package missing::playwright must resolve from node_modules for the chromium driver — restore the root devDependency (installing only the browser binaries is not enough)"
+            exit 1
+          }
+          bunx playwright install --with-deps chromium
+      - name: Run the journeys
+        env:
+          HANGAR_E2E_SHARD: system
+          HANGAR_E2E_ARTIFACTS: ${{ runner.temp }}/hangar-e2e
+        run: bun run --cwd packages/hangar-e2e test:browser
+      - name: Upload traces and reports
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ui-e2e-system
+          path: ${{ runner.temp }}/hangar-e2e
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The one check name the ruleset can require; never rename it. A shard skipped
+  # because something it needs failed also reads as success, so only this job can
+  # say whether they all really passed.
+  ui-e2e:
+    name: ui-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    needs: [ui-e2e-scope, ui-e2e-smoke, ui-e2e-axe, ui-e2e-system]
+    if: always()
+    steps:
+      - name: Every shard passed, or the sweep had nothing to look at
+        env:
+          SMOKE: ${{ needs.ui-e2e-smoke.result }}
+          AXE: ${{ needs.ui-e2e-axe.result }}
+          SYSTEM: ${{ needs.ui-e2e-system.result }}
+        run: |
+          status=0
+          if [ "$SMOKE" != "success" ]; then
+            echo "console smoke: $SMOKE"
+            status=1
+          fi
+          if [ "$SYSTEM" != "success" ]; then
+            echo "system journeys: $SYSTEM"
+            status=1
+          fi
+          if [ "$AXE" != "success" ] && [ "$AXE" != "skipped" ]; then
+            echo "axe sweep: $AXE"
+            status=1
+          fi
+          exit "$status"

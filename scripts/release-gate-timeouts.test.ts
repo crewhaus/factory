@@ -38,6 +38,7 @@ test("every job a release waits on has a timeout", () => {
     }
   }
   expect(unbounded).toEqual([]);
-  // ci, windows-supervision, windows-tools and smoke-runtime.
-  expect(jobs).toBe(4);
+  // ci, windows-supervision, windows-tools, the five ui-e2e jobs (its scope job,
+  // three shards and the aggregate) and smoke-runtime.
+  expect(jobs).toBe(9);
 });
