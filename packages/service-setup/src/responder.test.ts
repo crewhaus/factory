@@ -13,7 +13,12 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { request } from "node:http";
-import { type Server as NetServer, createServer as createNetServer } from "node:net";
+import {
+  type Server as NetServer,
+  type Socket,
+  createConnection,
+  createServer as createNetServer,
+} from "node:net";
 import { type Responder, portInUse, readChallenge, startResponder } from "./responder";
 
 /** Responders and throwaway sockets opened by a test, torn down after it. */
@@ -55,6 +60,20 @@ function closeNetServer(server: NetServer): Promise<void> {
   return new Promise((done) => {
     if (!server.listening) return done();
     server.close(() => done());
+  });
+}
+
+/** A raw TCP client, for a request `fetch` will not leave unfinished. */
+function connectTo(port: number): Promise<Socket> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const socket = createConnection({ port, host: "127.0.0.1" });
+    socket.once("connect", () => {
+      socket.off("error", rejectPromise);
+      // The listener ends this connection in the test; the reset is expected.
+      socket.on("error", () => {});
+      resolvePromise(socket);
+    });
+    socket.once("error", rejectPromise);
   });
 }
 
@@ -253,35 +272,106 @@ describe("startResponder — the OAuth callback", () => {
     );
   });
 
-  test("refuses a callback whose state does not match, with 400", async () => {
+  test("ignores a callback whose state does not match, with 400, and keeps waiting", async () => {
     const port = await freePort();
     const responder = await start({ port, expectedState: "expected-state" });
     const pending = settle(responder.waitForCode(2000));
 
     const res = await fetch(
-      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=xyz&state=wrong-state`,
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=stray&state=wrong-state`,
     );
 
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain("Unexpected callback");
+    const page = await res.text();
+    expect(page).toContain("Unexpected callback");
+    expect(page).toContain("This request was ignored.");
+    const [first] = responder.events;
+    expect(first?.kind).toBe("oauth-error");
+    if (first?.kind === "oauth-error") expect(first.error).toMatch(/state mismatch/i);
 
-    const result = await pending;
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.message).toMatch(/state mismatch/i);
-    expect(responder.events[0]?.kind).toBe("oauth-error");
+    // A wait settles once, so the real code arriving here shows it was still open.
+    const good = await fetch(
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=real&state=expected-state`,
+    );
+    expect(good.status).toBe(200);
+    expect(await pending).toEqual({ ok: true, value: "real" });
   });
 
-  test("refuses a callback with no state at all when one was expected", async () => {
+  test("ignores a callback with no state at all when one was expected", async () => {
     const port = await freePort();
     const responder = await start({ port, expectedState: "expected-state" });
     const pending = settle(responder.waitForCode(2000));
 
-    const res = await fetch(`http://127.0.0.1:${port}/crewhaus/oauth/callback?code=xyz`);
+    const res = await fetch(`http://127.0.0.1:${port}/crewhaus/oauth/callback?code=stray`);
     expect(res.status).toBe(400);
+    expect(await res.text()).toContain("Unexpected callback");
+
+    const good = await fetch(
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=real&state=expected-state`,
+    );
+    expect(good.status).toBe(200);
+    expect(await pending).toEqual({ ok: true, value: "real" });
+  });
+
+  test("?error= without the state is ignored: the wait stays open for the real callback", async () => {
+    const port = await freePort();
+    const responder = await start({ port, expectedState: "expected-state" });
+    const pending = settle(responder.waitForCode(2000));
+
+    const res = await fetch(`http://127.0.0.1:${port}/crewhaus/oauth/callback?error=x`);
+    expect(res.status).toBe(400);
+    const page = await res.text();
+    expect(page).toContain("Unexpected callback");
+    expect(page).not.toContain("Install declined");
+
+    const good = await fetch(
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=real&state=expected-state`,
+    );
+    expect(good.status).toBe(200);
+    expect(await pending).toEqual({ ok: true, value: "real" });
+  });
+
+  test("?error=access_denied with the right state ends the install as declined", async () => {
+    const port = await freePort();
+    const responder = await start({ port, expectedState: "expected-state" });
+    const pending = settle(responder.waitForCode(2000));
+
+    const res = await fetch(
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?error=access_denied&state=expected-state`,
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("Install declined");
 
     const result = await pending;
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.message).toMatch(/state mismatch/i);
+    if (!result.ok) expect(result.error.message).toMatch(/access_denied.*declined/);
+  });
+
+  test("a request that fails the state check before the wait begins leaves it open", async () => {
+    const port = await freePort();
+    const responder = await start({ port, expectedState: "expected-state" });
+
+    const res = await fetch(`http://127.0.0.1:${port}/crewhaus/oauth/callback?error=x&state=wrong`);
+    expect(res.status).toBe(400);
+
+    const pending = settle(responder.waitForCode(2000));
+    const good = await fetch(
+      `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=real&state=expected-state`,
+    );
+    expect(good.status).toBe(200);
+    expect(await pending).toEqual({ ok: true, value: "real" });
+  });
+
+  test("three wrong-state requests leave one oauth-error event", async () => {
+    const port = await freePort();
+    const responder = await start({ port, expectedState: "expected-state" });
+
+    for (const query of ["code=a&state=wrong", "error=x", "state=also-wrong"]) {
+      const res = await fetch(`http://127.0.0.1:${port}/crewhaus/oauth/callback?${query}`);
+      expect(res.status).toBe(400);
+    }
+
+    expect(responder.events.map((e) => e.kind)).toEqual(["oauth-error"]);
   });
 
   test("rejects on ?error=access_denied and answers 400", async () => {
@@ -394,6 +484,51 @@ describe("startResponder — the port itself", () => {
     await responder.stop();
     expect(await portInUse(port, "127.0.0.1", 300)).toBe(false);
   });
+
+  // Each one is a request whose body is still arriving when the install finishes.
+  const unfinishedRequests: readonly (readonly [string, string])[] = [
+    ["a declared length", "Content-Length: 1000\r\n\r\n{"],
+    ["a chunked body", "Transfer-Encoding: chunked\r\n\r\n1\r\n{\r\n"],
+    ["a 100-continue request", "Content-Length: 1000\r\nExpect: 100-continue\r\n\r\n"],
+  ];
+
+  for (const [name, tail] of unfinishedRequests) {
+    // Declared deadline: the race below runs to its 10 s limit when stop() does not resolve.
+    test(`stop() resolves with ${name} still arriving, once the install has finished`, async () => {
+      const port = await freePort();
+      const responder = await startResponder({ port, expectedState: "expected-state" });
+      const pending = settle(responder.waitForCode(2000));
+      const client = await connectTo(port);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        client.write(`POST /slack/events HTTP/1.1\r\nHost: 127.0.0.1\r\n${tail}`);
+        // Time for the listener to read the headers and begin waiting on the body.
+        await new Promise((r) => setTimeout(r, 50));
+
+        const good = await fetch(
+          `http://127.0.0.1:${port}/crewhaus/oauth/callback?code=real&state=expected-state`,
+        );
+        expect(good.status).toBe(200);
+        expect(await pending).toEqual({ ok: true, value: "real" });
+
+        const limit = new Promise<"open">((done) => {
+          timer = setTimeout(() => done("open"), 10_000);
+        });
+        const outcome = await Promise.race([
+          responder.stop().then(() => "stopped" as const),
+          limit,
+        ]);
+        expect(outcome).toBe("stopped");
+
+        const reclaimed = await listenOn(port);
+        openServers.push(reclaimed);
+        expect(reclaimed.listening).toBe(true);
+      } finally {
+        clearTimeout(timer);
+        client.destroy();
+      }
+    }, 20_000);
+  }
 });
 
 describe("regression — an aborted request must not kill the run", () => {
