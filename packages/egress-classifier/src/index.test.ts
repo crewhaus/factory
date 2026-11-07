@@ -206,6 +206,43 @@ describe("classifyEgress", () => {
   });
 });
 
+describe("classifyEgress — the value of a NAME=value line", () => {
+  // Secret-shaped values are built from parts at runtime.
+  const pairs = [
+    ["GITHUB_PAT", `${"gh"}${"p_"}${"a1B2c3D4".repeat(4)}`],
+    ["STRIPE", `${"sk_"}${"live_"}${"e5F6g7H8".repeat(3)}`],
+    ["AWS_ACCESS_KEY_ID", `${"AK"}${"IA"}${"QWERTY234567ASDF"}`],
+    ["GH_APP_PEM", `${"MI"}${"IE"}${"vQIBADANBgkqhkiG9w0BAQEFAASC"}`],
+    ["ANTHROPIC_API_KEY", `${"sk-"}${"ant-"}${"i9J0k1L2".repeat(3)}`],
+  ] as const;
+
+  for (const [name, value] of pairs) {
+    test(`${name}: the value alone is refused at a model-chosen destination`, async () => {
+      const ctx = createRunContext();
+      tagContent(ctx, `# from the file\n${name}=${value}\nDEBUG=1\n`, "tool");
+      const result = await classifyEgress(JSON.stringify({ body: value }), ctx, {
+        sinkId: "send",
+        sinkScope: "external-dynamic",
+      });
+      expect(result.verdict).toBe("block");
+      expect(result.originsFound).toEqual(["tool"]);
+      expect(result.matchCount).toBeGreaterThan(0);
+    });
+  }
+
+  test("the value alone records a warning at a configured sink", async () => {
+    const [name, value] = pairs[0];
+    const ctx = createRunContext();
+    tagContent(ctx, `${name}=${value}`, "tool");
+    const result = await classifyEgress(`text with ${value} inside`, ctx, {
+      sinkId: "send",
+      sinkScope: "external-configured",
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.originsFound).toEqual(["tool"]);
+  });
+});
+
 describe("MIN_MATCH_LENGTH constant", () => {
   test("is 8 — parity with run-context's MIN_TOKEN_TAG_LENGTH (audit R2)", () => {
     expect(MIN_MATCH_LENGTH).toBe(8);

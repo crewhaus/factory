@@ -49,6 +49,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { cfWorkerUnwiredBlockWarnings } from "../packages/compiler/src/index";
+import { classifyEgress } from "../packages/egress-classifier/src/index";
 import { lookupBaseline } from "../packages/eval-report/src/index";
 import { openHangarRegistry } from "../packages/harness-registry/src/index";
 import {
@@ -57,6 +58,7 @@ import {
   emptyRuleSet,
   evaluateWithReason,
 } from "../packages/permission-engine/src/index";
+import { createRunContext, tagContent } from "../packages/run-context/src/index";
 import { runtimeStateRoots } from "../packages/runtime-core/src/state-roots";
 import { buildBinary } from "../packages/single-binary-cli/src/index";
 import { OPTIMIZER_REFUSED_LEAVES } from "../packages/spec-patch/src/index";
@@ -807,16 +809,23 @@ describe("the release notes name every change a harness without provability: see
     // included — and the tool is the one whose `name:` precedes the call.
     const tools = new Set<string>();
     const unattributed: string[] = [];
+    // `stateTool` wraps every tool in tool-state, so its one call speaks for
+    // all of them, ahead of any `name:`. A later bullet names them together.
+    let wrapperCalls = 0;
     for (const file of sourcesContaining("protectedRootsOf(")) {
       const text = readFileSync(join(ROOT, file), "utf8");
       const names = [...text.matchAll(/\bname: "([A-Z][A-Za-z0-9]*)"/g)];
+      const wrapper = text.indexOf("function stateTool<");
       for (const call of text.matchAll(/(?<!function )\bprotectedRootsOf\(/g)) {
         const owner = names.filter((m) => (m.index ?? 0) < (call.index ?? 0)).at(-1);
-        if (owner?.[1] === undefined) unattributed.push(`${file}@${call.index}`);
-        else tools.add(owner[1]);
+        if (owner?.[1] !== undefined) tools.add(owner[1]);
+        else if (wrapper > -1 && wrapper < (call.index ?? 0)) wrapperCalls += 1;
+        else unattributed.push(`${file}@${call.index}`);
       }
     }
     expect(unattributed).toEqual([]);
+    expect(wrapperCalls).toBe(1);
+    expect(defaultOnBullets(changelog, LATER_HEADINGS).join("\n")).toContain("State tools");
     // CopyPath, MovePath, RemovePath, ArchiveExtract (tool-fsx), GitApplyPatch,
     // GitSwitch, GitCherryPick, GitStashPush, GitStashPop (tool-git), StateImport
     // and the nine tools that keep a store through it (tool-state), StoreMigrate,
@@ -1002,6 +1011,87 @@ describe("the release notes name every change a harness without provability: see
     );
     expect(added.length).toBeGreaterThan(0);
     expect(unlisted(added, notes, { shipped: [], laterNotes })).toEqual([]);
+  });
+
+  test("the egress check's lineage: a `NAME=value` value, a replayed tool result and a grant are found, and named", async () => {
+    // The value of an upper-case line, tagged on its own by the real tagger and
+    // refused by the real classifier. Built from parts at runtime.
+    const value = `${"gh"}${"p_"}${"a1B2c3D4".repeat(4)}`;
+    const ctx = createRunContext();
+    tagContent(ctx, `GITHUB_PAT=${value}`, "tool");
+    const egress = await classifyEgress(value, ctx, {
+      sinkId: "send",
+      sinkScope: "external-dynamic",
+      bypassCache: true,
+    });
+    expect(egress.verdict).toBe("block");
+    expect(egress.originsFound).toEqual(["tool"]);
+
+    // The resume tags what it replays: found in the function that does it,
+    // and the run calls that function on what it replayed.
+    const runtime = readFileSync(join(ROOT, "packages/runtime-core/src/index.ts"), "utf8");
+    const start = runtime.indexOf("function tagReplayedToolResults(");
+    expect(start).toBeGreaterThan(-1);
+    const end = runtime.indexOf("\n}\n", start);
+    expect(end).toBeGreaterThan(start);
+    const replay = runtime.slice(start, end);
+    expect(replay).toContain('"tool_result"');
+    expect(replay).toContain('tagContent(runContext, text, "tool")');
+    expect(runtime).toContain("tagReplayedToolResults(runContext, resumedMessages)");
+
+    // A grant is spent after the egress check and the rate gate, whose
+    // refusal lets it go unspent.
+    const spend = runtime.indexOf("await heldGrant?.spend();");
+    expect(spend).toBeGreaterThan(-1);
+    const screen = runtime.lastIndexOf("classifyEgress(payload, runContext", spend);
+    expect(screen).toBeGreaterThan(-1);
+    const rated = runtime.indexOf("[rate-limited]", screen);
+    expect(rated).toBeGreaterThan(screen);
+    expect(rated).toBeLessThan(spend);
+    const rateRefusal = runtime.slice(runtime.lastIndexOf("} catch (err) {", rated), rated);
+    expect(rateRefusal).toContain("heldGrant?.release();");
+    // Between the two, a call under a parked approval's grant turns a block
+    // into a warn that names the approval, and nothing else does.
+    const gate = runtime.slice(screen, spend);
+    expect(gate).toContain('classified.verdict === "block" && heldGrant !== undefined');
+    expect(gate).toContain('{ ...classified, verdict: "warn" }');
+    expect(gate).toContain("approvalId: approvedOver");
+    expect(gate.split('verdict: "warn"')).toHaveLength(2);
+    // A call a rule allows holds the grant a person gave for it too, as the
+    // ask branch does: an always-allow grant saves such a rule beside itself.
+    const allowed = runtime.indexOf("const holdRuleAllowedGrant = async (): Promise<void> => {");
+    expect(allowed).toBeGreaterThan(-1);
+    expect(allowed).toBeLessThan(screen);
+    const allowedBranch = runtime.slice(allowed, runtime.indexOf("if (!approved) {", allowed));
+    expect(allowedBranch).toContain('if (decision !== "allow" || approvals === undefined) return;');
+    expect(allowedBranch).toContain("landsWhereApproved(grant, gateView)");
+    expect(allowedBranch).toContain("!grantsInFlight.has(grant.id)");
+    expect(allowedBranch).toContain("heldGrant = holdGrant(grant, approvals.store);");
+    // It reads the store only for a call the egress check would refuse, once
+    // the verdict is in and before a block can become a warn.
+    expect(runtime.split("holdRuleAllowedGrant").length - 1).toBe(2);
+    const lookup = gate.indexOf(
+      'if (classified.verdict === "block" && heldGrant === undefined) {\n        await holdRuleAllowedGrant();',
+    );
+    expect(lookup).toBeGreaterThan(-1);
+    expect(lookup).toBeLessThan(gate.indexOf("const approvedOver ="));
+    // The ask branch and this one: the only two places a grant is held.
+    expect(runtime.split("holdGrant(").length - 1).toBe(2);
+
+    // Named in a later list, since 0.8.0 did not ship it.
+    const later = defaultOnBullets(changelog, LATER_HEADINGS);
+    const bullets = later.filter((b) => b.includes("resumed") && b.includes("`NAME=value`"));
+    expect(bullets.length).toBe(1);
+    for (const named of [
+      "goes out as approved",
+      "repeats the approved input",
+      "a warning that names the approval",
+      "every other call in the run",
+      "a tool's rate limit",
+      "`GitApplyPatch`",
+    ]) {
+      expect(bullets[0]).toContain(named);
+    }
   });
 
   test("FactCrossCheck: every kind of spelling whose verdict moved since 0.7.x is named", async () => {

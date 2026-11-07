@@ -149,7 +149,12 @@ import {
   shadowLaneQuality,
   shadowRouteKey,
 } from "@crewhaus/routing-store";
-import { type RunContext, createRunContext, tagContent } from "@crewhaus/run-context";
+import {
+  DATA_LINEAGE_CAP,
+  type RunContext,
+  createRunContext,
+  tagContent,
+} from "@crewhaus/run-context";
 import {
   type ApprovalPlace,
   type PendingApproval,
@@ -1064,6 +1069,15 @@ export function sanitizeOrphanToolUses(messages: ReadonlyArray<Anthropic.Message
 }
 
 /**
+ * A line the runtime wrote to a session log: `appendEvent`'s version and an
+ * object payload. The readers that rebuild a run count only these, so anything
+ * else in the file changes nothing about the replay.
+ */
+function isRuntimeLogLine(ev: { readonly version?: unknown; readonly payload?: unknown }): boolean {
+  return ev.version === 1 && typeof ev.payload === "object" && ev.payload !== null;
+}
+
+/**
  * Walk an `EventLog` and reconstruct the SDK message history. Only
  * `user_message` and `assistant_message` events contribute — `tool_use`
  * and `tool_result` events are audit-only because the same data already
@@ -1086,6 +1100,7 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
   // surface user/assistant events at depth 0.
   let depth = 0;
   for await (const ev of log.read()) {
+    if (!isRuntimeLogLine(ev)) continue;
     if (ev.kind === "a2a_turn_start" || ev.kind === "sub_agent_start") {
       depth += 1;
       continue;
@@ -1129,6 +1144,49 @@ export async function replayMessageHistory(log: EventLog): Promise<Anthropic.Mes
   // following `tool_result`; replaying it verbatim would 400 the first resumed
   // request. Drop such orphans so `--resume` self-heals. No-op on healthy logs.
   return sanitizeOrphanToolUses(messages).messages;
+}
+
+/**
+ * The egress check reads a run's lineage, and a run resumed from its log should
+ * read the same lineage it had. Each tool result is tagged at `tool`, including
+ * one from a tool that sets `classifyOutput: false`, so a verbatim copy of it
+ * meets the egress check as a tool result does within one run. Oldest first, so
+ * the lineage cap keeps the newest, and only the newest `DATA_LINEAGE_CAP`
+ * results, since a long session replays its whole history; a result gives at
+ * least one piece unless it is too short to match. What the caller tagged
+ * before the run, such as the message that started it, is newer than anything
+ * replayed and stays newest.
+ */
+function tagReplayedToolResults(
+  runContext: RunContext,
+  messages: ReadonlyArray<Anthropic.MessageParam>,
+): void {
+  const replayed: string[] = [];
+  for (const message of messages) {
+    if (message.role !== "user" || typeof message.content === "string") continue;
+    for (const block of message.content) {
+      if (block.type !== "tool_result") continue;
+      const content = block.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : (content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("\n");
+      if (text.length > 0) replayed.push(text);
+    }
+  }
+  const held = [...(runContext.dataLineage ?? [])];
+  for (const text of replayed.slice(-DATA_LINEAGE_CAP)) tagContent(runContext, text, "tool");
+  const lineage = runContext.dataLineage;
+  if (lineage === undefined) return;
+  for (const [piece, origin] of held) {
+    lineage.delete(piece);
+    lineage.set(piece, origin);
+  }
+  while (lineage.size > DATA_LINEAGE_CAP) {
+    const oldest = lineage.keys().next().value;
+    if (oldest === undefined) break;
+    lineage.delete(oldest);
+  }
 }
 
 /**
@@ -2197,9 +2255,10 @@ export type RunChatLoopOptions = {
    *    in-run ledger ({@link CONTINUITY_LEDGER_MAX_CHARS} cap, oldest-first
    *    eviction), which re-injects on every model call — the user's answer
    *    survives any number of compactions regardless of summary quality.
-   *    Evicted assistant text and tool findings are also persisted as
-   *    `context_evicted` events (episodic externalization for a later
-   *    recall integration). `--resume` rebuilds the ledger from the logged
+   *    Evicted assistant text, tool findings and runtime-authored turns
+   *    (logged `synthetic: true`) are also persisted as `context_evicted`
+   *    events (episodic externalization for a later recall integration) and
+   *    stay out of the ledger. `--resume` rebuilds the ledger from the logged
    *    events. The autocompact summarizer's prompt receives the ledger text
    *    as an anchor, but nothing depends on the summary being right.
    *  - `onHandoff` fires ONCE at teardown (the same finally slot as
@@ -4634,6 +4693,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // must not be mistaken for this context's previous one.
     let nestDepth = 0;
     for await (const ev of replayLog.read()) {
+      if (!isRuntimeLogLine(ev)) continue;
       if (ev.kind === "a2a_turn_start" || ev.kind === "sub_agent_start") {
         nestDepth += 1;
         continue;
@@ -4671,7 +4731,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // NOTE: the ledger seed below deliberately keeps its pre-#405 behaviour
       // (no depth filter) — the guard above applies to `toolset` only.
       if (!wantLedger || ev.kind !== "context_evicted") continue;
-      const p = ev.payload as { role?: unknown; text?: unknown; turnNumber?: unknown };
+      const p = ev.payload as {
+        role?: unknown;
+        text?: unknown;
+        turnNumber?: unknown;
+        synthetic?: unknown;
+      };
+      if (p.synthetic === true) continue;
       if (p.role === "user" && typeof p.text === "string") {
         resumedLedgerSeed.push({
           role: "user",
@@ -4714,6 +4780,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           return createRunContext({ runId, sessionId, eventBus });
         })()
       : createRunContext({ sessionId }));
+  if (resumedMessages !== undefined) tagReplayedToolResults(runContext, resumedMessages);
 
   // G01 — surface the max-tokens lift once, at boot (see `effectiveMaxTokens`).
   if (effectiveMaxTokens !== maxTokens) {
@@ -5394,8 +5461,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // -------------------------------------------------------------------------
   const continuity = opts.continuity;
   const continuityLedgerEnabled = continuity !== undefined && continuity.ledger !== false;
-  // The in-run requirements ledger: evicted USER messages, oldest-first,
-  // verbatim. `ledgerTruncated` flags that oldest entries were dropped at
+  // The in-run requirements ledger: evicted USER messages the runtime did not
+  // write, oldest-first, verbatim. `ledgerTruncated` flags that oldest entries were dropped at
   // the CONTINUITY_LEDGER_MAX_CHARS cap so the rendered block says so.
   const ledgerEntries: ContinuityLedgerEntry[] = [];
   let ledgerTruncated = false;
@@ -5434,20 +5501,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
    * text-bearing record is appended verbatim to the session event log as
    * `context_evicted` (zero model trust — the recall integration comes in a
    * later PR); user records additionally fold into the in-run ledger for
-   * per-call reinjection.
+   * per-call reinjection. A turn the runtime wrote (a grader's correction, a
+   * retry or loop nudge) is logged with `synthetic: true` and stays out of the
+   * ledger.
    */
   const externalizeEvicted = async (
     evicted: ReadonlyArray<Anthropic.MessageParam>,
   ): Promise<void> => {
     if (!continuityLedgerEnabled) return;
     for (const message of evicted) {
+      const runtimeAuthored = isSyntheticMessage(message);
       for (const entry of extractEvictedEntries(message)) {
         await logEvent("context_evicted", {
           role: entry.role,
           text: entry.text,
           ...(entry.turnNumber !== undefined ? { turnNumber: entry.turnNumber } : {}),
+          ...(runtimeAuthored ? { synthetic: true } : {}),
         });
-        if (entry.role === "user") foldLedgerEntry(entry);
+        if (entry.role === "user" && !runtimeAuthored) foldLedgerEntry(entry);
       }
     }
   };
@@ -5848,6 +5919,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // #400 — approval ids this RUN has already replayed. Claimed synchronously
   // so two concurrent tool calls cannot both spend one one-shot grant.
   const replayedApprovalIds = new Set<string>();
+  // Grants an approved call holds between the gate that honoured them and the
+  // last gate that can still refuse it, the rate gate, after which it spends
+  // them. A parallel call must not run under one meanwhile, as a spent grant
+  // would not let it.
+  const grantsInFlight = new Set<string>();
   const justificationInjectedTools: ReadonlySet<string> = new Set(
     advertisedTools
       .filter(({ advertised }) => advertised.justificationInjected)
@@ -6633,6 +6709,31 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     });
     let approved = decision === "allow";
     let denialMessage: string | undefined;
+    // The store grant this call runs under, spent once it has passed every
+    // check below that can refuse it; `release` lets it go unspent.
+    let heldGrant:
+      | { approvalId: string; spend: () => Promise<void>; release: () => void }
+      | undefined;
+    // Held synchronously, so a parallel identical call cannot run under it too.
+    const holdGrant = (
+      grant: PendingApproval,
+      store: Pick<PendingApprovalStore, "persist">,
+    ): NonNullable<typeof heldGrant> => {
+      grantsInFlight.add(grant.id);
+      return {
+        approvalId: grant.id,
+        spend: async () => {
+          await store.persist({ ...grant, consumedAt: new Date().toISOString() });
+          grantsInFlight.delete(grant.id);
+        },
+        // A refused call can be retried, and the same refusal answers it
+        // without a new card for the operator.
+        release: () => {
+          grantsInFlight.delete(grant.id);
+          replayedApprovalIds.delete(grant.id);
+        },
+      };
+    };
     if (decision === "deny") {
       denialMessage = decisionDetails.reason ?? "tool denied by permission policy";
     } else if (decision === "ask") {
@@ -6683,6 +6784,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           movedFrom = existing;
           existing = await findApprovalForPlace(approvals.store, approvalKeys, gateView);
         }
+        if (existing?.decision === "grant" && grantsInFlight.has(existing.id)) existing = null;
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
         //
         // A grant is keyed on whole-input equality, which silently assumes the
@@ -6723,7 +6825,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // 0.7.1 — and bound like the exact match: the APPROVED input must
           // still land where it did when the operator approved it. Read here,
           // once, and re-checked against policy below from this same reading.
-          if (replay !== undefined && !replayedApprovalIds.has(replay.id)) {
+          if (
+            replay !== undefined &&
+            !replayedApprovalIds.has(replay.id) &&
+            !grantsInFlight.has(replay.id)
+          ) {
             const replayView = placeRecordingCanonicalizer();
             const subjectOfReplay = preparePermissionSubject(
               tool,
@@ -6831,12 +6937,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           }
           if (approved) {
             // Consume only once the call is really going to run: a replay the
-            // policy or a hook then refused must leave the operator's grant
-            // unspent, or they have to approve the same action twice.
-            await approvals.store.persist({
-              ...existing,
-              consumedAt: new Date().toISOString(),
-            });
+            // policy or a hook then refused, and a call the justification
+            // check below refuses, must leave the operator's grant unspent, or
+            // they have to approve the same action twice. The egress check
+            // records a match on this call and lets it go out as approved.
+            // Held synchronously, as the replay claim above is held.
+            heldGrant = holdGrant(existing, approvals.store);
           }
           if (replayedFrom !== undefined && approved) {
             bus.publish({
@@ -6959,6 +7065,48 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ...callAttribution,
       });
     }
+    /**
+     * A call a rule allows may be the one a person approved on a parked
+     * approval: `--always` and Slack's "Always allow" save a settings rule
+     * beside the grant, and that rule decides the resumed call before the
+     * store is asked. The grant for this exact call, made where it lands and
+     * not yet spent, is held as the ask branch holds it, so the call goes out
+     * as approved and the grant is spent once. Any later call under the rule
+     * alone meets every check as any call does. The egress check asks for it
+     * only when its verdict for the call is `block`, where a held grant changes
+     * the outcome. A lookup that fails finds no grant: the call meets the
+     * egress check as any call a rule allows does.
+     */
+    const holdRuleAllowedGrant = async (): Promise<void> => {
+      if (decision !== "allow" || approvals === undefined) return;
+      let grant: PendingApproval | null = null;
+      try {
+        grant = await approvals.store.get(tu.name, hashApprovalInput(tu.name, operativeInput));
+        const legacyToolName = legacyMcpToolName(tu.name);
+        if (grant === null && legacyToolName !== undefined) {
+          grant = await approvals.store.get(
+            legacyToolName,
+            hashApprovalInput(legacyToolName, operativeInput),
+          );
+        }
+      } catch (err) {
+        runContext.logger.warn("approval lookup failed", {
+          toolUseId: tu.id,
+          toolName: tu.name,
+          error: (err as Error).message,
+        });
+        grant = null;
+      }
+      if (
+        grant !== null &&
+        grant.decision === "grant" &&
+        grant.consumedAt === undefined &&
+        !grantsInFlight.has(grant.id) &&
+        landsWhereApproved(grant, gateView)
+      ) {
+        heldGrant = holdGrant(grant, approvals.store);
+      }
+    };
     if (!approved) {
       return finish({
         type: "tool_result",
@@ -7047,6 +7195,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       }
       if (!verdict.allow) {
+        heldGrant?.release();
         return finish({
           type: "tool_result",
           tool_use_id: tu.id,
@@ -7072,7 +7221,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // tools this is what `executeTool` actually transmits to the sink.
       const payload = JSON.stringify(operativeInput ?? null);
       const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name, tool);
-      const egress = await classifyEgress(payload, runContext, {
+      const classified = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
         sinkScope,
         // FR-006: forward the caller-selected matcher when present. Absent
@@ -7081,6 +7230,24 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // below are byte-for-byte unchanged.
         ...(opts.egressMatcher !== undefined ? { matcher: opts.egressMatcher } : {}),
       });
+      // An ordinary call, whose verdict is `pass` or `warn`, reads no approval.
+      if (classified.verdict === "block" && heldGrant === undefined) {
+        await holdRuleAllowedGrant();
+      }
+      // A call that runs under a grant a person gave on a parked approval goes
+      // out as approved: for this call alone a `block` is a `warn`, and its
+      // records name the approval. A live approval, and every other call in the
+      // run, keep the policy's verdict.
+      const approvedOver =
+        classified.verdict === "block" && heldGrant !== undefined
+          ? heldGrant.approvalId
+          : undefined;
+      const egress: typeof classified =
+        approvedOver !== undefined ? { ...classified, verdict: "warn" } : classified;
+      const approvedReason =
+        approvedOver !== undefined
+          ? `approval ${approvedOver} granted by a person: sent as approved`
+          : undefined;
       const egressOutcome =
         egress.verdict === "pass"
           ? "egress-passed"
@@ -7094,7 +7261,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         decision: egress.verdict === "block" ? "deny" : "allow",
         mode: permissionMode,
         outcome: egressOutcome,
-        ...(egress.originsFound.length > 0 ? { reason: `egress: ${summarizeEgress(egress)}` } : {}),
+        ...(egress.originsFound.length > 0
+          ? {
+              reason: `egress: ${summarizeEgress(egress)}${
+                approvedReason !== undefined ? `; ${approvedReason}` : ""
+              }`,
+            }
+          : {}),
         ...callAttribution,
       });
       if (egress.verdict !== "pass") {
@@ -7104,6 +7277,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           verdict: egress.verdict satisfies EgressVerdict,
           originsFound: egress.originsFound,
           matchCount: egress.matchCount,
+          ...(approvedOver !== undefined ? { approvalId: approvedOver } : {}),
         });
         // Item 20 — emit the durable `egress_decision` audit record for every
         // non-pass verdict so egress history is triageable offline (the
@@ -7124,6 +7298,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 verdict: egress.verdict,
                 originsFound: egress.originsFound,
                 matchCount: egress.matchCount,
+                ...(approvedOver !== undefined
+                  ? { approvalId: approvedOver, reason: approvedReason }
+                  : {}),
               },
             });
           } catch (err) {
@@ -7136,6 +7313,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       }
       if (egress.verdict === "block") {
+        heldGrant?.release();
         return finish({
           type: "tool_result",
           tool_use_id: tu.id,
@@ -7171,6 +7349,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           await toolRateLimiter.acquire([{ dimension: "tool", id: tu.name }], 1);
         }
       } catch (err) {
+        heldGrant?.release();
         runContext.logger.warn("tool rate limit exhausted", {
           toolUseId: tu.id,
           toolName: tu.name,
@@ -7184,6 +7363,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         });
       }
     }
+
+    // The call has passed every gate that can refuse it, so the grant it runs
+    // under is spent here; a call a gate above refused left it unspent.
+    await heldGrant?.spend();
 
     const toolAbort = turnAbort.child();
     // Build the bridge for this call. Built on EVERY run (#160 follow-up):

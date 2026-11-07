@@ -1621,6 +1621,29 @@ function escapingSymlink(
 }
 
 /**
+ * The first symbolic link a patch creates whose target lies in one of the run's
+ * protected roots, or `undefined`. A later write through it would land in the
+ * run's own record while naming a path outside it. The link's location is read
+ * from the repository's top and from cwd alike, as the names above are.
+ */
+function symlinkIntoProtectedRoot(
+  patchText: string,
+  repo: { readonly root: string; readonly cwd: string },
+  strip: number,
+  roots: readonly string[],
+): string | undefined {
+  for (const link of symlinksCreatedByPatch(patchText, strip)) {
+    if (link.target === "") continue;
+    for (const base of [repo.root, repo.cwd]) {
+      const parent = nodePath.dirname(nodePath.resolve(base, link.path));
+      const target = nodePath.resolve(realOrUndefined(parent) ?? parent, link.target);
+      if (protectedRootHolding(target, roots) !== undefined) return link.path;
+    }
+  }
+  return undefined;
+}
+
+/**
  * The paths `git apply --numstat -z` names: one `added\tdeleted\tpath` record
  * per file, NUL-terminated (a rename names its new path forward, its old one
  * under `-R`).
@@ -1756,6 +1779,15 @@ export const gitApplyPatch: RegisteredTool = buildTool({
           checkedOnly,
           wouldApply: false,
           reason: protectedWriteRefusal("GitApplyPatch", `the patch's ${hit}`),
+        });
+      }
+      const linked = symlinkIntoProtectedRoot(input.patch, repo, input.strip ?? 1, roots);
+      if (linked !== undefined) {
+        return json({
+          applied: false,
+          checkedOnly,
+          wouldApply: false,
+          reason: protectedWriteRefusal("GitApplyPatch", `the patch's link ${linked}`),
         });
       }
     }
