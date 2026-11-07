@@ -125,6 +125,13 @@ Paths a STORE hands back are contained too: `CliVersionPin` re-contains every re
 opening a spec or a bundle under it and reports the rest as skipped, and rows are deduped by real
 path so one harness cannot be counted twice in the version roll-up.
 
+A row that a store hands back is treated the same way. `HarnessRegister` relocates or removes a row,
+or sets its `hidden`, `groups`, `group` or `order`, only when the row's directory, resolved through
+its symlinks, is inside the workspace or is gone, and a dry run answers the same as the real call.
+Any other row is the operator's, and the refusal names the verb: `crewhaus harness relocate`,
+`crewhaus harness remove`, `crewhaus harness group`, or the Library in `crewhaus hangar` for
+`hidden`. `tags`, `notes` and `pinned` work on every row.
+
 The exception is deliberate and no input can move it. The two machine-wide files —
 `<registryRoot>/harnesses.json` and `<hangarRoot>/jobs.jsonl` — are resolved from the environment
 (`CREWHAUS_REGISTRY_ROOT`, `CREWHAUS_HANGAR_ROOT`) by `@crewhaus/harness-registry`'s
