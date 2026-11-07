@@ -94,10 +94,10 @@ import {
   specBlock,
   specScalar,
 } from "./memory-ops";
-import { readSpecYaml } from "./schedulers";
 import {
   WIKI_STORE_PROBE,
   type WikiAuthority,
+  readHarnessSpec,
   wikiAuthorityOf,
   wikiIndexArticles,
 } from "./store-layout";
@@ -367,7 +367,7 @@ function wikiRows(ctx: M3Context, target: WikiTarget, nowMs: number): WikiRow[] 
  * is explicitly disabled), so the presence of one counts.
  */
 function sourcesRequired(ctx: M3Context): boolean {
-  const yamlText = readSpecYaml(harnessDirOf(ctx));
+  const yamlText = readHarnessSpec(harnessDirOf(ctx)) ?? "";
   const wiki = specBlock(yamlText, ["memory", "wiki"]);
   if (wiki !== undefined && specScalar(wiki, "requireSources") === "true") return true;
   const learning = specBlock(yamlText, ["learning"]);
@@ -856,7 +856,7 @@ export const wikiReflect: M3Handler = (ctx) => {
     return true;
   });
 
-  const dream = specBlock(readSpecYaml(harnessDirOf(ctx)), ["memory", "dream"]);
+  const dream = specBlock(readHarnessSpec(harnessDirOf(ctx)) ?? "", ["memory", "dream"]);
   const cadence = dream === undefined ? undefined : specScalar(dream, "every");
   const cadenceMs = parseDurationMs(cadence);
   // Never finer than a day: the maintenance pass is a daily-or-slower habit,

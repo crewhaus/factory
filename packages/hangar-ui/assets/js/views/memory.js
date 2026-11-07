@@ -116,17 +116,20 @@ function wikiCard(data, ctx) {
   // Articles are slugs (the on-disk authority); titles come from the
   // tolerant index.json cache when it has them.
   const slugs = Array.isArray(data?.articles) ? data.articles.map(String) : [];
+  const notice =
+    data?.authority === "thredz" || data?.authority === "unknown"
+      ? wikiNotice(data.authority, ctx.id, slugs.length > 0)
+      : null;
   if (slugs.length === 0) {
     return card(
       "Wiki",
-      data?.authority === "thredz" || data?.authority === "unknown"
-        ? wikiNotice(data.authority, ctx.id)
-        : emptyState("No articles yet. The harness writes them as it works, or add one here."),
+      notice ??
+        emptyState("No articles yet. The harness writes them as it works, or add one here."),
     );
   }
   const index = data?.index && typeof data.index === "object" ? data.index : {};
-  return card(
-    "Wiki",
+  return card("Wiki", [
+    notice,
     el(
       "ul",
       { class: "wiki-list" },
@@ -144,7 +147,7 @@ function wikiCard(data, ctx) {
         ]);
       }),
     ),
-  );
+  ]);
 }
 
 async function renderWikiArticle(root, ctx, slug) {

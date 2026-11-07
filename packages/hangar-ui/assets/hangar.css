@@ -115,6 +115,7 @@ code,
 
 .app-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding: 10px 18px;
@@ -189,7 +190,8 @@ code,
 .btn:hover {
   border-color: var(--accent);
 }
-.btn:disabled {
+.btn:disabled,
+.btn[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
 }
@@ -979,8 +981,20 @@ tr.deflated td {
 
 .filter-bar {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin: 8px 0;
+}
+.filter-bar .chip {
+  white-space: normal;
+}
+.filter-bar .field,
+.editor-actions .field {
+  min-width: 0;
+}
+.filter-bar .field .input,
+.editor-actions .field .input {
+  max-width: 100%;
 }
 
 .baseline-star {
@@ -1029,6 +1043,10 @@ tr.deflated td {
   flex: 0 0 110px;
   color: var(--ink-3);
   font-size: 12px;
+}
+.kv-v {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .wiki-article h2 {
   margin-top: 0;
@@ -1090,7 +1108,11 @@ tr.deflated td {
 
 .editor-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+.editor-body {
+  font-size: 13.5px;
 }
 .foot-version {
   white-space: nowrap;
@@ -1350,7 +1372,8 @@ tr.deflated td {
   display: inline-flex;
   flex-direction: column;
   gap: 2px;
-  min-width: 220px;
+  min-width: min(220px, 100%);
+  max-width: 100%;
 }
 /* Inside a dense table the twin must not widen the row — it scrolls itself. */
 .fleet .job-action {

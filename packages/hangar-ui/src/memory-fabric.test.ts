@@ -240,6 +240,7 @@ describe("editorGate", () => {
   test("a new article has nothing to lose", () => {
     expect(fabric.editorGate({ existing: false, article: null })).toEqual({
       canSave: true,
+      status: null,
       why: null,
     });
   });
@@ -247,6 +248,7 @@ describe("editorGate", () => {
   test("an article that failed to load cannot be saved over", () => {
     const gate = fabric.editorGate({ existing: true, article: null });
     expect(gate.canSave).toBe(false);
+    expect(gate.status).toBe("couldn't load");
     expect(gate.why).toBe(
       "Couldn't load this article, so it can't be edited here. Reload and try again.",
     );
@@ -258,21 +260,47 @@ describe("editorGate", () => {
   test("a cut-off read cannot be saved back", () => {
     const gate = fabric.editorGate({ existing: true, article: { ...article, truncated: true } });
     expect(gate.canSave).toBe(false);
+    expect(gate.status).toBe("too long");
     expect(gate.why).toBe("This article is too long to edit here.");
   });
 
+  const hiddenText = {
+    canSave: false,
+    status: "hidden text",
+    why: "Part of this article is hidden because it looks like a credential or matches one of this harness's settings, so it is read-only here.",
+  };
+
   test("a masked span in the body or the title cannot be saved back", () => {
-    const why = "This article contains text that looks like a credential, so it is read-only here.";
     expect(
       fabric.editorGate({ existing: true, article: { ...article, body: "key sk-***" } }),
-    ).toEqual({ canSave: false, why });
+    ).toEqual(hiddenText);
     expect(
       fabric.editorGate({ existing: true, article: { ...article, title: "key sk-***" } }),
-    ).toEqual({ canSave: false, why });
+    ).toEqual(hiddenText);
+  });
+
+  test("an env value served as its name cannot be saved back", () => {
+    for (const span of ["«BOT_TOKEN»", "«_x1»", "«ProgramFiles(x86)»", "«BASH_FUNC_x%%»"]) {
+      expect(
+        fabric.editorGate({ existing: true, article: { ...article, body: `use ${span} now` } }),
+      ).toEqual(hiddenText);
+      expect(
+        fabric.editorGate({ existing: true, article: { ...article, title: `use ${span}` } }),
+      ).toEqual(hiddenText);
+    }
+  });
+
+  test("a quotation in spaced guillemets is ordinary text", () => {
+    const body = "Elle a dit « bonjour » et «\u00a0merci\u00a0».";
+    expect(fabric.editorGate({ existing: true, article: { ...article, body } }).canSave).toBe(true);
   });
 
   test("a whole, unmasked read can be saved", () => {
-    expect(fabric.editorGate({ existing: true, article })).toEqual({ canSave: true, why: null });
+    expect(fabric.editorGate({ existing: true, article })).toEqual({
+      canSave: true,
+      status: null,
+      why: null,
+    });
   });
 });
 
@@ -304,6 +332,45 @@ describe("wikiControls", () => {
         notice: "unknown",
       });
     }
+  });
+});
+
+describe("wikiNoticeCopy", () => {
+  test("rows on a Thredz harness are called local copies, and the link stays", () => {
+    const copy = fabric.wikiNoticeCopy("thredz", true);
+    expect(copy.sentence).toBe("This harness keeps its wiki in Thredz.");
+    expect(copy.rowsLine).toBe("Articles listed here are local copies, not the Thredz wiki.");
+    expect(copy.linksToThredz).toBe(true);
+  });
+
+  test("with no rows there is nothing to explain", () => {
+    expect(fabric.wikiNoticeCopy("thredz", false).rowsLine).toBe(null);
+    expect(fabric.wikiNoticeCopy("unknown", false).rowsLine).toBe(null);
+  });
+
+  test("an unknown owner says what the rows are and links nowhere", () => {
+    const copy = fabric.wikiNoticeCopy("unknown", true);
+    expect(copy.rowsLine).toBe("Articles listed here come from this harness's local store.");
+    expect(copy.linksToThredz).toBe(false);
+  });
+});
+
+describe("the memory screens' layout at narrow widths", () => {
+  const css = readFileSync(join(import.meta.dir, "..", "assets", "hangar.css"), "utf8");
+  const rule = (selector: string): string => {
+    const start = css.indexOf(`\n${selector} {`);
+    expect(start).toBeGreaterThan(-1);
+    return css.slice(start, css.indexOf("}", start));
+  };
+
+  test("the bars that carry their fields and buttons wrap", () => {
+    expect(rule(".filter-bar")).toContain("flex-wrap: wrap");
+    expect(rule(".editor-actions")).toContain("flex-wrap: wrap");
+  });
+
+  test("the page header wraps, and an action never demands more than its card", () => {
+    expect(rule(".app-header")).toContain("flex-wrap: wrap");
+    expect(rule(".job-action")).toContain("max-width: 100%");
   });
 });
 

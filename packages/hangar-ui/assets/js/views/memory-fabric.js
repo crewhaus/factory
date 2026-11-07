@@ -63,6 +63,14 @@ const DAY_MS = 86_400_000;
  *  not safe to write back — the mask would replace what it hid. */
 const MASK_MARK = "***";
 
+/**
+ * What the harness env scrubber leaves behind: a value from the harness's env,
+ * secret or not, served as its variable's name in guillemets. Any name without
+ * a space counts, because an inherited variable can be `ProgramFiles(x86)`.
+ * A real `«word»` also matches, and refusing that costs only an edit here.
+ */
+const SCRUB_MARK = /«[^«»\s]+»/;
+
 /** Human TTL countdown for a fact. Null when the fact has no expiry. */
 export function ttlLabel(expiresInMs) {
   if (typeof expiresInMs !== "number") return null;
@@ -97,28 +105,31 @@ export function costSummary(analytics) {
 
 /**
  * What the editor may do with an article it tried to open. A body it could not
- * load in full must not be saved back: an empty box, a cut-off read or a masked
- * span would each replace what is on disk.
+ * load in full must not be saved back: an empty box, a cut-off read or hidden
+ * text would each replace what is on disk.
  */
 export function editorGate({ existing, article }) {
-  if (existing !== true) return { canSave: true, why: null };
+  if (existing !== true) return { canSave: true, status: null, why: null };
   if (article === null || typeof article !== "object" || typeof article.body !== "string") {
     return {
       canSave: false,
+      status: "couldn't load",
       why: "Couldn't load this article, so it can't be edited here. Reload and try again.",
     };
   }
   if (article.truncated === true) {
-    return { canSave: false, why: "This article is too long to edit here." };
+    return { canSave: false, status: "too long", why: "This article is too long to edit here." };
   }
   const title = typeof article.title === "string" ? article.title : "";
-  if (article.body.includes(MASK_MARK) || title.includes(MASK_MARK)) {
+  const hidden = (text) => text.includes(MASK_MARK) || SCRUB_MARK.test(text);
+  if (hidden(article.body) || hidden(title)) {
     return {
       canSave: false,
-      why: "This article contains text that looks like a credential, so it is read-only here.",
+      status: "hidden text",
+      why: "Part of this article is hidden because it looks like a credential or matches one of this harness's settings, so it is read-only here.",
     };
   }
-  return { canSave: true, why: null };
+  return { canSave: true, status: null, why: null };
 }
 
 /**
@@ -133,6 +144,27 @@ export function wikiControls(authority) {
     rowEdit: local,
     rowArchive: local,
     notice: local ? null : authority === "thredz" ? "thredz" : "unknown",
+  };
+}
+
+/**
+ * What a harness whose wiki is not local says about it. `rowsLine` is for when
+ * local rows are on screen too, so they are not taken for the wiki itself.
+ */
+export function wikiNoticeCopy(authority, hasRows) {
+  const thredz = authority === "thredz";
+  return {
+    tone: thredz ? "off" : "warn",
+    status: thredz ? "kept in Thredz" : "can't tell",
+    sentence: thredz
+      ? "This harness keeps its wiki in Thredz."
+      : "Can't read this harness's spec, so its wiki can't be changed from here.",
+    rowsLine: !hasRows
+      ? null
+      : thredz
+        ? "Articles listed here are local copies, not the Thredz wiki."
+        : "Articles listed here come from this harness's local store.",
+    linksToThredz: thredz,
   };
 }
 
@@ -281,17 +313,13 @@ function empty(payload, fallback) {
 }
 
 /** Why this harness's wiki can't be edited here, and where it can. */
-export function wikiNotice(authority, harnessId) {
-  const thredz = authority === "thredz";
+export function wikiNotice(authority, harnessId, hasRows = false) {
+  const copy = wikiNoticeCopy(authority, hasRows);
   return el("div", { class: "gated" }, [
-    dot(thredz ? "off" : "warn", thredz ? "kept in Thredz" : "can't tell"),
-    el("span", {
-      class: "muted gated-why",
-      text: thredz
-        ? "This harness keeps its wiki in Thredz."
-        : "Can't read this harness's spec, so its wiki can't be changed from here.",
-    }),
-    thredz
+    dot(copy.tone, copy.status),
+    el("span", { class: "muted gated-why", text: copy.sentence }),
+    copy.rowsLine === null ? null : el("span", { class: "muted gated-why", text: copy.rowsLine }),
+    copy.linksToThredz
       ? el("a", { href: hrefHarness(harnessId, "thredz"), text: "Open the Thredz wiki" })
       : null,
   ]);
@@ -991,11 +1019,11 @@ async function drawReflect(host, ctx, reload, state) {
 
   const filters = data.filters && typeof data.filters === "object" ? data.filters : {};
   const controls = wikiControls(data.authority);
-  const notice = controls.notice === null ? null : wikiNotice(data.authority, ctx.id);
   const noRows = (Array.isArray(data.articles) ? data.articles : []).length === 0;
+  const notice = controls.notice === null ? null : wikiNotice(data.authority, ctx.id, !noRows);
   // With nothing to list the notice stands in for the empty state, so its
   // sentence does not print twice. A filter that hid the rows still says so.
-  const noticeInQueue = notice !== null && noRows && data.reason !== "filtered";
+  const noticeIsEnough = notice !== null && noRows && data.reason !== "filtered";
   const tagInput = field("tags (comma separated)", { value: state.tags });
   const qInput = field("search", { value: state.q });
   const statusSelect = el(
@@ -1015,6 +1043,7 @@ async function drawReflect(host, ctx, reload, state) {
 
   host.appendChild(
     card("REFLECT queue", [
+      notice,
       el("p", {
         class: "muted",
         text: `stale-first over ${String(data.total ?? 0)} article(s); the threshold comes from ${String(data.thresholdSource ?? "the default")}`,
@@ -1022,7 +1051,7 @@ async function drawReflect(host, ctx, reload, state) {
       el("div", { class: "filter-bar" }, [
         tagInput.node,
         qInput.node,
-        statusSelect,
+        el("label", { class: "field" }, [el("span", { text: "status" }), statusSelect]),
         apply,
         data.sourcesGate === true
           ? el("span", {
@@ -1034,8 +1063,8 @@ async function drawReflect(host, ctx, reload, state) {
           : null,
         dot(Number(data.stale ?? 0) > 0 ? "warn" : "ok", `${fmtCount(data.stale ?? 0)} stale`),
       ]),
-      noticeInQueue
-        ? notice
+      noticeIsEnough
+        ? null
         : noRows
           ? empty(data, "No wiki articles yet")
           : reflectTable(data, ctx, host, reload, state, controls),
@@ -1050,7 +1079,6 @@ async function drawReflect(host, ctx, reload, state) {
     ]),
   );
   if (controls.editor) host.appendChild(editorCard(ctx, host, reload, state, null));
-  else if (!noticeInQueue) host.appendChild(card("Editing", notice));
 }
 
 function reflectTable(data, ctx, host, reload, state, controls) {
@@ -1148,16 +1176,28 @@ function archiveButton(ctx, host, reload, state, row) {
  * re-read-then-reapply contract, identical for the local and Thredz
  * backends.
  */
+let editorCount = 0;
+
 function editorCard(ctx, host, reload, state, row) {
   const slugField = field("slug", {
     value: row ? String(row.slug) : "",
     placeholder: "kebab-case-slug",
   });
   const titleField = field("title", { value: row ? String(row.title ?? "") : "" });
-  const area = el("textarea", { class: "input", rows: "12", spellcheck: "false" });
+  editorCount += 1;
+  // Why Save is held. Announced when it changes, and read with the fields it
+  // describes, so a keyboard or screen reader user gets the reason too.
+  const guardId = `wiki-editor-guard-${editorCount}`;
+  const guard = el("div", { id: guardId, role: "status" });
+  const area = el("textarea", {
+    class: "input editor-body",
+    rows: "12",
+    spellcheck: "false",
+    "aria-describedby": guardId,
+  });
   const versionLabel = el("span", { class: "muted" });
-  const guard = el("div");
-  const status = el("div");
+  const status = el("div", { role: "status" });
+  const conflict = el("div");
   const expected = { version: row ? Number(row.version ?? 0) : 0 };
 
   const setVersion = (v) => {
@@ -1167,24 +1207,51 @@ function editorCard(ctx, host, reload, state, row) {
   };
   setVersion(row ? Number(row.version ?? 0) : 0);
 
-  const save = el("button", { class: "btn btn-primary", type: "button", text: "Save" });
+  // Held with aria-disabled rather than `disabled`: Save stays in the Tab order
+  // and describes why, and a click says so instead of doing nothing.
+  const save = el("button", {
+    class: "btn btn-primary",
+    type: "button",
+    text: "Save",
+    "aria-describedby": guardId,
+  });
+  let heldBecause = null;
+  let conflictActions = null;
+
+  const holdEditor = (why) => {
+    heldBecause = why;
+    if (why === null) save.removeAttribute("aria-disabled");
+    else save.setAttribute("aria-disabled", "true");
+    const readOnly = why !== null;
+    area.readOnly = readOnly;
+    titleField.input.readOnly = readOnly;
+    slugField.input.readOnly = readOnly;
+  };
 
   const applyGate = (gate) => {
-    save.disabled = !gate.canSave;
+    holdEditor(gate.why);
+    area.removeAttribute("aria-busy");
     clear(guard);
     if (gate.canSave) return;
+    // A retry goes through the same hold, so there is nothing left to offer.
+    conflictActions?.remove();
+    conflictActions = null;
     guard.appendChild(
       el("div", { class: "gated" }, [
-        dot("warn", "read-only here"),
+        dot("warn", gate.status),
         el("span", { class: "muted gated-why", text: gate.why }),
       ]),
     );
   };
 
   if (row) {
-    // Nothing to save until the load settles: a click during it would write
-    // whatever is in the box over the article.
-    save.disabled = true;
+    // Nothing to save or type until the load settles: a click during it would
+    // write whatever is in the box over the article, and the load would replace
+    // anything typed.
+    holdEditor("Loading this article…");
+    area.setAttribute("aria-busy", "true");
+    guard.appendChild(el("span", { class: "muted", text: "Loading this article…" }));
+    const titleBeforeLoad = titleField.input.value;
     // Body, title and version come from ONE read, not the row the queue was
     // painted from. A write landing between two reads would otherwise save an
     // old body as the newest.
@@ -1196,14 +1263,20 @@ function editorCard(ctx, host, reload, state, row) {
         article = null;
       }
       if (article !== null && typeof article.body === "string") {
-        area.value = article.body;
-        if (typeof article.title === "string") titleField.input.value = article.title;
+        if (area.value === "") area.value = article.body;
+        if (typeof article.title === "string" && titleField.input.value === titleBeforeLoad) {
+          titleField.input.value = article.title;
+        }
         if (typeof article.version === "number") setVersion(article.version);
       }
       applyGate(editorGate({ existing: true, article }));
     })();
   }
   save.addEventListener("click", () => {
+    if (heldBecause !== null) {
+      toast(heldBecause);
+      return;
+    }
     const slug = slugField.input.value.trim();
     if (slug === "") {
       toast("a slug is required");
@@ -1223,6 +1296,8 @@ function editorCard(ctx, host, reload, state, row) {
         ),
       (res) => {
         clear(status);
+        clear(conflict);
+        conflictActions = null;
         if (!res.ok) return;
         const outcome = writeOutcome(res.body);
         if (outcome.kind === "ok") {
@@ -1248,7 +1323,7 @@ function editorCard(ctx, host, reload, state, row) {
         );
         if (outcome.kind === "stale") {
           const diff = String(res.body?.diff ?? "");
-          if (diff !== "") status.appendChild(el("pre", { class: "rawjson", text: diff }));
+          if (diff !== "") conflict.appendChild(el("pre", { class: "rawjson", text: diff }));
           const retry = el("button", {
             class: "btn",
             type: "button",
@@ -1264,12 +1339,20 @@ function editorCard(ctx, host, reload, state, row) {
             text: "Load what is on disk now",
           });
           takeTheirs.addEventListener("click", () => {
-            // `current` is the same masked, capped read as the first load.
-            area.value = outcome.currentBody ?? "";
+            // `current` is the same masked, capped read as the first load, so
+            // it passes the same gate BEFORE it may replace the draft.
+            const gate = editorGate({ existing: true, article: res.body?.current ?? null });
+            if (!gate.canSave) {
+              applyGate({ ...gate, why: `${gate.why} Your draft is still here to copy.` });
+              area.focus();
+              return;
+            }
+            area.value = outcome.currentBody;
             setVersion(outcome.retryVersion);
-            applyGate(editorGate({ existing: true, article: res.body?.current ?? null }));
+            applyGate(gate);
           });
-          status.appendChild(el("div", { class: "editor-actions" }, [takeTheirs, retry]));
+          conflictActions = el("div", { class: "editor-actions" }, [takeTheirs, retry]);
+          conflict.appendChild(conflictActions);
         }
       },
     );
@@ -1289,7 +1372,7 @@ function editorCard(ctx, host, reload, state, row) {
         ])
       : null,
     el("div", { class: "editor-actions" }, [slugField.node, titleField.node, versionLabel]),
-    area,
+    el("label", { class: "field" }, [el("span", { text: "article text" }), area]),
     guard,
     el("div", { class: "editor-actions" }, [
       save,
@@ -1299,6 +1382,7 @@ function editorCard(ctx, host, reload, state, row) {
       }),
     ]),
     status,
+    conflict,
     signals,
   ]);
 }

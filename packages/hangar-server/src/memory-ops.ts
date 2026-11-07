@@ -457,6 +457,18 @@ export type FoldedFacts = {
   readonly sweepable: { readonly rows: readonly SweepableFact[]; readonly total: number | null };
 };
 
+/** The furthest epoch-ms value from zero that a `Date` can hold. */
+const MAX_DATE_MS = 8.64e15;
+
+/** A fact's `expiresAt`, or null when no `Date` can hold it (`1e30`, or `1e400`
+ *  which parses as Infinity). One bad line must neither take the whole read
+ *  down, because `toISOString` throws on it, nor mark its fact expired. */
+function expiryOf(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= MAX_DATE_MS
+    ? value
+    : null;
+}
+
 function isFactEntry(line: RawFactLine): line is RawFactLine & { id: string; text: string } {
   return (
     line.tombstone === undefined && typeof line.id === "string" && typeof line.text === "string"
@@ -514,7 +526,7 @@ export function foldFacts(
     if (!isFactEntry(line)) continue;
     entryIndex += 1;
     const tomb = supersedes.get(line.id);
-    const expiresAt = typeof line.expiresAt === "number" ? line.expiresAt : null;
+    const expiresAt = expiryOf(line.expiresAt);
     let status: FactRow["status"] = "live";
     if (tomb !== undefined || typeof line.supersededBy === "string") status = "superseded";
     else if (expired.has(line.id) || (expiresAt !== null && expiresAt <= nowMs)) status = "expired";

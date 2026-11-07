@@ -23,6 +23,8 @@ import {
 import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
 import { createWikiStore, parseArticle } from "@crewhaus/wiki-store";
+// @ts-expect-error — hand-written browser JS: the exact file the browser loads
+import { editorGate } from "../../hangar-ui/assets/js/views/memory-fabric.js";
 import { harnessActivity } from "./activity";
 import { MAX_FACT_FILE_BYTES, MAX_MEMORY_ITEMS, MAX_TEXT_BYTES } from "./constants";
 import { makeFixtureHarness } from "./fixture";
@@ -262,6 +264,59 @@ describe("the editor round trip", () => {
     expect(String(read.body["body"])).not.toContain(secret);
     expect(String(read.body["body"])).toContain("***");
   });
+
+  // The value has no credential shape, so only the env scrubber touches it. The
+  // editor's gate is run on what the route served, so the scrubber's form and
+  // the gate's pattern cannot drift apart.
+  const plainValue = ["plain", "opaque", "value", "1234"].join("");
+
+  async function articleHoldingEnvValue(t: TestServer) {
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "scrubbed"), {
+      specName: "scrubbed",
+      envLines: [`BOT_TOKEN=${plainValue}`],
+    });
+    await wikiStore(dir, "scrubbed").write({
+      slug: "held",
+      title: "Held",
+      body: `The current value is ${plainValue} until Friday.`,
+    });
+    return { dir, id: await register(t, dir) };
+  }
+
+  test("an env value is served as its name, and the editor will not save that", async () => {
+    const t = boot();
+    const { id } = await articleHoldingEnvValue(t);
+    const read = await t.api(`/api/h/${id}/memory/wiki/held`);
+    expect(read.body["body"]).toBe("The current value is «BOT_TOKEN» until Friday.");
+    const gate = editorGate({ existing: true, article: read.body });
+    expect(gate.canSave).toBe(false);
+    expect(gate.status).toBe("hidden text");
+  });
+
+  test("so is the current article a stale save answers with", async () => {
+    const t = boot();
+    const { id } = await articleHoldingEnvValue(t);
+    const stale = await t.api(`/api/h/${id}/memory/wiki/held`, {
+      method: "PUT",
+      body: JSON.stringify({ body: "my draft", title: "Held", expectedVersion: 99 }),
+    });
+    expect(stale.body["code"]).toBe("stale_article_version");
+    const current = stale.body["current"] as Record<string, unknown>;
+    expect(current["body"]).toBe("The current value is «BOT_TOKEN» until Friday.");
+    expect(editorGate({ existing: true, article: current }).canSave).toBe(false);
+  });
+
+  test("a body the scrubber did not touch can be saved", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "clean"), {
+      specName: "clean",
+      envLines: [`BOT_TOKEN=${plainValue}`],
+    });
+    await wikiStore(dir, "clean").write({ slug: "fine", title: "Fine", body: "Nothing hidden." });
+    const id = await register(t, dir);
+    const read = await t.api(`/api/h/${id}/memory/wiki/fine`);
+    expect(editorGate({ existing: true, article: read.body }).canSave).toBe(true);
+  });
 });
 
 describe("a tree holding both layouts", () => {
@@ -446,6 +501,62 @@ describe("the whole file decides a fact's status", () => {
     expect(folded.items.map((i) => i.id)).toEqual([fact(1)["id"], fact(2)["id"]] as string[]);
     expect(folded.truncated).toBe(false);
     expect(folded.counts?.total).toBe(2);
+  });
+});
+
+describe("an expiry no date can hold", () => {
+  // Written by hand: `1e400` only exists as JSON text, and parses as Infinity.
+  const badLines = ["1e30", "-1e30", "1e400"].map(
+    (raw, i) => `{"id":"bad_${i}","text":"bad ${i}","expiresAt":${raw}}`,
+  );
+  const seed = (path: string): void => {
+    const good = `${JSON.stringify(fact(1))}\n`;
+    writeFileSync(path, `${badLines.join("\n")}\n${good}`);
+  };
+
+  test("is no expiry: the fold neither throws nor calls it expired", () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "dates"), { specName: "dates" });
+    mkdirSync(factsDir(dir), { recursive: true });
+    const path = join(factsDir(dir), "dates.jsonl");
+    seed(path);
+    const folded = foldFacts(path, NOW);
+    expect(folded.counts).toEqual({ live: 4, superseded: 0, expired: 0, total: 4 });
+    expect(folded.sweepable.total).toBe(0);
+    const bad = folded.items.filter((row) => row.id.startsWith("bad_"));
+    expect(bad.length).toBe(3);
+    for (const row of bad) {
+      expect(row.status).toBe("live");
+      expect(row.expiresAt).toBe(null);
+      expect(row.expiresInMs).toBe(null);
+    }
+    expect(foldFactsFile(path, "dates", NOW).live).toBe(4);
+  });
+
+  test("the edge of the range is still a date", () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "edge"), { specName: "edge" });
+    mkdirSync(factsDir(dir), { recursive: true });
+    const path = join(factsDir(dir), "edge.jsonl");
+    writeFileSync(path, `{"id":"far","text":"far","expiresAt":8.64e15}\n`);
+    expect(foldFacts(path, NOW).items[0]?.expiresAt).toBe(new Date(8.64e15).toISOString());
+  });
+
+  test("the harness page and both fact routes still answer", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "pages"), { specName: "pages" });
+    mkdirSync(factsDir(dir), { recursive: true });
+    seed(join(factsDir(dir), "pages.jsonl"));
+    const id = await register(t, dir);
+    for (const route of [
+      `/api/h/${id}`,
+      `/api/h/${id}/memory/facts`,
+      `/api/h/${id}/memory/facts/pages`,
+    ]) {
+      expect((await t.api(route)).status).toBe(200);
+    }
+    const detail = await t.api(`/api/h/${id}`);
+    expect((detail.body["memory"] as Record<string, unknown>)["facts"]).toBe(4);
   });
 });
 
@@ -733,6 +844,34 @@ describe("a Thredz-backed wiki is edited in Thredz", () => {
     const res = await put(t, id, "kept");
     expect(res.status).toBe(200);
     expect(res.body["version"]).toBe(2);
+  });
+
+  test("a crewhaus.yml spec is read for the sources gate and the stale threshold", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "ymlgate"), {
+      specName: "ymlgate",
+      specExtra: "memory:\n  wiki:\n    requireSources: true\n  dream:\n    every: 7d\n",
+    });
+    await wikiStore(dir, "ymlgate").write({ slug: "kept", title: "Kept", body: "kept body" });
+    const id = await register(t, dir);
+    const yaml = await t.api(`/api/h/${id}/memory/wiki/kept`, {
+      method: "PUT",
+      body: JSON.stringify({ body: "no sources here", title: "Kept", expectedVersion: 1 }),
+    });
+    expect(yaml.body["code"]).toBe("missing_sources");
+
+    renameSync(join(dir, "crewhaus.yaml"), join(dir, "crewhaus.yml"));
+    const yml = await t.api(`/api/h/${id}/memory/wiki/kept`, {
+      method: "PUT",
+      body: JSON.stringify({ body: "no sources here", title: "Kept", expectedVersion: 1 }),
+    });
+    expect(yml.body["code"]).toBe("missing_sources");
+    const onDisk = join(dir, ".crewhaus", "wiki", "ymlgate", "articles", "kept.md");
+    expect(parseArticle(readFileSync(onDisk, "utf8")).body).toBe("kept body");
+    const reflectOnYml = await t.api(`/api/h/${id}/memory/reflect`);
+    expect(reflectOnYml.body["sourcesGate"]).toBe(true);
+    expect(reflectOnYml.body["thresholdSource"]).toBe("memory.dream.every");
+    expect(reflectOnYml.body["thresholdMs"]).toBe(7 * DAY);
   });
 
   test("no spec: refused with its own message, on a harness holding a store", async () => {
