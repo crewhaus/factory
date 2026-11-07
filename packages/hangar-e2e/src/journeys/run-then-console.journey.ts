@@ -3,6 +3,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
+import { SESSION_ID_RE } from "@crewhaus/session-store";
 import { fakeModel } from "service-fakes";
 import { harnessRoute } from "../console-routes";
 import { childEnv, runCrewhaus, spawnHangar } from "../system";
@@ -32,8 +33,9 @@ export const runThenConsole: Journey = {
 
     const sessionDir = join(harnessDir, ".crewhaus", "sessions");
     const sessionIds = readdirSync(sessionDir)
-      .filter((name) => /^sess_[0-9a-f]+\.json$/.test(name))
-      .map((name) => name.slice(0, -".json".length));
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -".json".length))
+      .filter((name) => SESSION_ID_RE.test(name));
     if (sessionIds.length !== 1 || sessionIds[0] === undefined) {
       throw new Error(`crewhaus run left these sessions: [${sessionIds}]`);
     }
